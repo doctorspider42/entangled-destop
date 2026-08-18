@@ -30,9 +30,25 @@ impl Vcpu {
         let fd = vm.create_vcpu(u64::from(index))?;
         let mut cpuid = kvm.get_supported_cpuid(256)?;
         for entry in cpuid.as_mut_slice() {
-            // Leaf 1 ECX bit 31: tell the guest it runs under a hypervisor.
-            if entry.function == 1 && entry.index == 0 {
-                entry.ecx |= 1 << 31;
+            match entry.function {
+                // Leaf 1: ECX bit 31 tells the guest it runs under a
+                // hypervisor; EBX[31:24] is the *initial APIC ID*, which
+                // KVM_GET_SUPPORTED_CPUID leaves at the value of whichever
+                // host CPU serviced the ioctl. Left alone, every vCPU claims
+                // the host's APIC ID: guest code that compares the CPUID
+                // identity against the local APIC's own ID then decides it is
+                // running on an unknown processor. EDK2's `GetBspNumber()`
+                // does exactly that and asserts (UEFI-1802); Linux is more
+                // forgiving but no more correct.
+                1 if entry.index == 0 => {
+                    entry.ecx |= 1 << 31;
+                    entry.ebx = (entry.ebx & 0x00ff_ffff) | (index << 24);
+                }
+                // Leaves 0xB (extended topology) and 0x1F (V2 extended
+                // topology) report the 32-bit x2APIC ID in EDX, with the same
+                // problem and the same fix.
+                0xb | 0x1f => entry.edx = index,
+                _ => {}
             }
         }
         fd.set_cpuid2(&cpuid)?;

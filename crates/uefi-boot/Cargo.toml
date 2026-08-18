@@ -1,0 +1,23 @@
+[package]
+name = "uefi-boot"
+description = "UEFI firmware boot: PVH entry and reset-vector ROM placement (EPIC 18)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+machine-x86.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-loader.workspace = true
+vm-memory.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+vmm-core.workspace = true
+
+[lints]
+workspace = true

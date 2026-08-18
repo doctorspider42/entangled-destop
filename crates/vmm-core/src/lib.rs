@@ -36,4 +36,4 @@ pub use hypervisor::{HostCapabilities, Hypervisor, MIN_KVM_API_VERSION};
 #[cfg(target_os = "linux")]
 pub use vcpu::{spawn_vcpus, Vcpu, VcpuThreads};
 #[cfg(target_os = "linux")]
-pub use vm::Vm;
+pub use vm::{RomRegion, Vm};

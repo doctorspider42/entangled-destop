@@ -1,0 +1,19 @@
+# Boots a UEFI firmware instead of a kernel (EPIC 18, docs/adr/0003-uefi-firmware.md):
+#   bash guest/firmware/build-cloudhv.sh
+#   cargo run -p entangled -- run --headless examples/uefi-firmware.toml
+#
+# CLOUDHV.fd is a PVH ELF, so it is loaded into guest RAM and entered in 32-bit
+# protected mode. A flash-image firmware (plain OVMF-style) would instead be
+# mapped as a ROM ending at 4 GiB and entered through the reset vector — the
+# same profile shape, decided by the image itself.
+#
+# Phase 1 scope: the firmware talks on ttyS0. It cannot boot a guest yet — that
+# needs virtio-pci and ACPI (see the ADR's gap map), because CloudHv ships no
+# virtio-mmio driver at all.
+name = "uefi-firmware"
+memory_mib = 2048
+vcpus = 1
+
+[boot]
+mode = "uefi"
+firmware = "artifacts/firmware/CLOUDHV.fd"

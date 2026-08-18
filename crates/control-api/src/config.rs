@@ -31,18 +31,49 @@ pub struct VmConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum BootMode {
-    /// Direct bzImage + initramfs load — the only MVP mode.
+    /// Direct bzImage + initramfs load — the MVP mode (ADR-0001 §3).
     DirectLinux,
+    /// Boot a UEFI firmware image, which then finds its own bootloader
+    /// (EPIC 18, [ADR-0003](../../docs/adr/0003-uefi-firmware.md)).
+    Uefi,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BootSection {
     pub mode: BootMode,
-    pub kernel: PathBuf,
+    /// `direct-linux` only: the kernel `bzImage` the host loads itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<PathBuf>,
+    /// `direct-linux` only: initramfs loaded after the kernel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initramfs: Option<PathBuf>,
+    /// `uefi` only: the firmware image (a PVH ELF such as `CLOUDHV.fd`, or a
+    /// flash image entered through the reset vector).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<PathBuf>,
+    /// Kernel command line. Meaningless in `uefi` mode — the firmware and the
+    /// guest bootloader own the command line there.
     #[serde(default)]
     pub cmdline: String,
+}
+
+impl BootSection {
+    /// The kernel image, for `direct-linux` profiles. Validation guarantees it
+    /// is present in that mode; this accessor keeps the error typed for
+    /// callers that build a `BootSection` by hand.
+    pub fn require_kernel(&self) -> Result<&PathBuf, ConfigError> {
+        self.kernel.as_ref().ok_or_else(|| {
+            ConfigError::Invalid("boot.kernel is required for mode = \"direct-linux\"".into())
+        })
+    }
+
+    /// The firmware image, for `uefi` profiles.
+    pub fn require_firmware(&self) -> Result<&PathBuf, ConfigError> {
+        self.firmware.as_ref().ok_or_else(|| {
+            ConfigError::Invalid("boot.firmware is required for mode = \"uefi\"".into())
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,6 +144,31 @@ impl VmConfig {
         if self.display.width == 0 || self.display.height == 0 {
             return err("display dimensions must be non-zero".into());
         }
+        // Per-mode boot keys: reject the *wrong* key instead of ignoring it,
+        // so a profile that names a kernel under mode = "uefi" fails loudly
+        // rather than booting something the author did not ask for.
+        match self.boot.mode {
+            BootMode::DirectLinux => {
+                if self.boot.kernel.is_none() {
+                    return err("boot.kernel is required for mode = \"direct-linux\"".into());
+                }
+                if self.boot.firmware.is_some() {
+                    return err("boot.firmware is only valid for mode = \"uefi\"; \
+                         direct-linux boots without firmware"
+                        .into());
+                }
+            }
+            BootMode::Uefi => {
+                if self.boot.firmware.is_none() {
+                    return err("boot.firmware is required for mode = \"uefi\"".into());
+                }
+                if self.boot.kernel.is_some() || self.boot.initramfs.is_some() {
+                    return err("boot.kernel/boot.initramfs are only valid for mode = \
+                         \"direct-linux\"; in uefi mode the firmware loads the guest"
+                        .into());
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -152,6 +208,10 @@ scale = 1.0
         let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
         assert_eq!(cfg.name, "debian-demo");
         assert_eq!(cfg.boot.mode, BootMode::DirectLinux);
+        assert_eq!(
+            cfg.boot.require_kernel().unwrap(),
+            &PathBuf::from("artifacts/bootstrap/vmlinuz")
+        );
         assert_eq!(cfg.disks.len(), 1);
         assert!(cfg.disks[0].writable);
         assert_eq!(cfg.network.as_ref().unwrap().interface, "entangled0");
@@ -174,6 +234,80 @@ kernel = "vmlinuz"
         assert_eq!(cfg.display, DisplaySection::default());
         assert!(cfg.disks.is_empty());
         assert!(cfg.network.is_none());
+    }
+
+    /// EPIC 18 / ADR-0003: a UEFI profile names a firmware image and no kernel.
+    const UEFI_EXAMPLE: &str = r#"
+name = "ubuntu-uefi"
+memory_mib = 4096
+vcpus = 2
+
+[boot]
+mode = "uefi"
+firmware = "artifacts/firmware/CLOUDHV.fd"
+
+[[disk]]
+path = "images/ubuntu.raw"
+writable = true
+"#;
+
+    #[test]
+    fn parses_uefi_profile() {
+        let cfg = VmConfig::from_toml(UEFI_EXAMPLE).unwrap();
+        assert_eq!(cfg.boot.mode, BootMode::Uefi);
+        assert_eq!(
+            cfg.boot.require_firmware().unwrap(),
+            &PathBuf::from("artifacts/firmware/CLOUDHV.fd")
+        );
+        assert!(cfg.boot.kernel.is_none());
+        assert!(cfg.boot.require_kernel().is_err());
+    }
+
+    #[test]
+    fn boot_keys_must_match_the_mode() {
+        // uefi without firmware
+        let no_fw = UEFI_EXAMPLE.replace(r#"firmware = "artifacts/firmware/CLOUDHV.fd""#, "");
+        assert!(matches!(
+            VmConfig::from_toml(&no_fw),
+            Err(ConfigError::Invalid(_))
+        ));
+        // uefi *and* a kernel: ambiguous, refuse it
+        let both = UEFI_EXAMPLE.replace(
+            r#"mode = "uefi""#,
+            "mode = \"uefi\"\nkernel = \"artifacts/bootstrap/vmlinuz\"",
+        );
+        assert!(matches!(
+            VmConfig::from_toml(&both),
+            Err(ConfigError::Invalid(_))
+        ));
+        // direct-linux with a firmware key
+        let stray = BACKLOG_EXAMPLE.replace(
+            r#"mode = "direct-linux""#,
+            "mode = \"direct-linux\"\nfirmware = \"CLOUDHV.fd\"",
+        );
+        assert!(matches!(
+            VmConfig::from_toml(&stray),
+            Err(ConfigError::Invalid(_))
+        ));
+        // direct-linux without a kernel
+        let no_kernel = BACKLOG_EXAMPLE.replace(r#"kernel = "artifacts/bootstrap/vmlinuz""#, "");
+        assert!(matches!(
+            VmConfig::from_toml(&no_kernel),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    /// A UEFI profile has no `kernel`; the serializer must not choke on the
+    /// `None` (bare `Option` in a TOML table is an error without `skip`).
+    #[test]
+    fn uefi_profile_round_trips_through_toml() {
+        let cfg = VmConfig::from_toml(UEFI_EXAMPLE).unwrap();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !text.contains("kernel"),
+            "unexpected kernel key in:\n{text}"
+        );
+        assert_eq!(VmConfig::from_toml(&text).unwrap(), cfg);
     }
 
     #[test]

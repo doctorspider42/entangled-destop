@@ -11,6 +11,7 @@ members = [
     "crates/vmm-core",
     "crates/machine-x86",
     "crates/linux-boot",
+    "crates/uefi-boot",
     "crates/virtio-core",
     "crates/virtio-block",
     "crates/virtio-net",
@@ -40,6 +41,7 @@ publish = false
 vmm-core = { path = "crates/vmm-core", version = "0.1.0" }
 machine-x86 = { path = "crates/machine-x86", version = "0.1.0" }
 linux-boot = { path = "crates/linux-boot", version = "0.1.0" }
+uefi-boot = { path = "crates/uefi-boot", version = "0.1.0" }
 virtio-core = { path = "crates/virtio-core", version = "0.1.0" }
 virtio-block = { path = "crates/virtio-block", version = "0.1.0" }
 virtio-net = { path = "crates/virtio-net", version = "0.1.0" }
