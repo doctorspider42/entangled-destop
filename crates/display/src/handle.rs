@@ -215,9 +215,57 @@ impl DisplayHandle {
     }
 }
 
+/// The device-facing contract `virtio-gpu` drives (backlog EPIC 8): the GPU
+/// device only ever sees these three methods, which is what keeps `virtio-gpu`
+/// free of any dependency on `winit`, `wgpu` — or this crate.
+impl virtio_gpu::ScanoutSink for DisplayHandle {
+    fn resolution(&self) -> (u32, u32) {
+        DisplayHandle::resolution(self)
+    }
+
+    fn set_resolution(&self, width: u32, height: u32) -> Result<(), virtio_gpu::SinkError> {
+        DisplayHandle::set_resolution(self, width, height).map_err(sink_error)
+    }
+
+    fn update_scanout(
+        &self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Result<(), virtio_gpu::SinkError> {
+        DisplayHandle::update_scanout(self, x, y, width, height, data).map_err(sink_error)
+    }
+}
+
+/// A display rejection as the GPU device sees it: a message it turns into
+/// `VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER`. The typed [`DisplayError`] stays on
+/// this side of the seam.
+fn sink_error(error: DisplayError) -> virtio_gpu::SinkError {
+    virtio_gpu::SinkError::new(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use virtio_gpu::ScanoutSink;
+
+    #[test]
+    fn the_handle_is_a_scanout_sink() {
+        let handle = DisplayHandle::detached(4, 2).expect("detached handle");
+        let sink: &dyn ScanoutSink = &handle;
+        assert_eq!(sink.resolution(), (4, 2));
+        sink.update_scanout(0, 0, 1, 1, &[1, 2, 3, 4])
+            .expect("in-bounds update");
+        let error = sink
+            .update_scanout(9, 9, 1, 1, &[1, 2, 3, 4])
+            .expect_err("out-of-bounds update is refused");
+        assert!(error.to_string().contains("9"), "{error}");
+        sink.set_resolution(8, 8).expect("resolution change");
+        assert_eq!(sink.resolution(), (8, 8));
+        assert!(sink.set_resolution(0, 8).is_err());
+    }
 
     #[test]
     fn detached_handle_accepts_updates_and_screenshots() {

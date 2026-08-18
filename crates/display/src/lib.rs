@@ -71,8 +71,9 @@ pub use viewport::{letterbox, DisplayConfig, Viewport};
 /// guest cannot make the host allocate an absurd framebuffer.
 pub const MAX_SCANOUT_PIXELS: u64 = virtio_gpu::MAX_RESOURCE_PIXELS;
 
-/// The pixel format of the scanout texture, matching the only format the guest
-/// gets ([`virtio_gpu::FORMAT_B8G8R8A8_UNORM`]) so pixels are copied verbatim.
+/// The pixel format of the scanout texture, matching the only byte layout the
+/// guest gets ([`virtio_gpu::FORMAT_B8G8R8A8_UNORM`] and its alpha-less twin
+/// [`virtio_gpu::FORMAT_B8G8R8X8_UNORM`]) so pixels are copied verbatim.
 pub const SCANOUT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
 #[cfg(test)]
@@ -81,7 +82,14 @@ mod tests {
 
     #[test]
     fn scanout_format_matches_the_guest_format() {
-        assert_eq!(virtio_gpu::FORMAT_B8G8R8A8_UNORM, 2);
+        // Both accepted guest formats are 32-bit B, G, R, A/X in that byte
+        // order, which is exactly `Bgra8Unorm`.
+        assert!(virtio_gpu::is_supported_format(
+            virtio_gpu::FORMAT_B8G8R8A8_UNORM
+        ));
+        assert!(virtio_gpu::is_supported_format(
+            virtio_gpu::FORMAT_B8G8R8X8_UNORM
+        ));
         assert_eq!(SCANOUT_TEXTURE_FORMAT, wgpu::TextureFormat::Bgra8Unorm);
         assert_eq!(
             SCANOUT_TEXTURE_FORMAT.block_copy_size(None),
