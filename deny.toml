@@ -15,12 +15,21 @@ allow = [
     "Unicode-DFS-2016",
     "CC0-1.0",
     "0BSD",
+    # Mozilla's CA root store as shipped by `webpki-roots` (pulled in by the
+    # rustls-based HTTP client in `debian-media`). CDLA-Permissive-2.0 is a
+    # permissive *data* licence with no share-alike or copyleft obligation —
+    # version 2.0 dropped the 1.0 reciprocity clause — so it satisfies the
+    # "no copyleft in host code" rule (ADR-0001).
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The internal `vmhost` crates are path dependencies and are never published,
+# so `{ path = "…" }` without a version requirement is intentional.
+allow-wildcard-paths = true
 # QEMU must never appear, in any form (ADR-0001).
 deny = []
 

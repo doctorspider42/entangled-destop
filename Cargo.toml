@@ -22,6 +22,10 @@ edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://example.invalid/vmhost"
+# Internal crates are never published; this also tells `cargo deny` that the
+# version-less `{ path = … }` dependencies between them are intentional
+# (`bans.allow-wildcard-paths` only applies to unpublished crates).
+publish = false
 
 [workspace.dependencies]
 # internal crates (version present so `cargo deny` wildcard ban is satisfied)
@@ -75,6 +79,12 @@ wgpu = { version = "26", default-features = false, features = [
 ] }
 pollster = "0.4"
 png = "0.18"
+
+# Media downloader (EPIC 6). rustls-only HTTP (no OpenSSL linkage) and rpgp for
+# OpenPGP — never sequoia-openpgp, which is LGPL (see deny.toml).
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+pgp = { version = "0.17", default-features = false }
+rand = "0.8"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

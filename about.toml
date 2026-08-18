@@ -11,4 +11,6 @@ accepted = [
     "Unicode-DFS-2016",
     "CC0-1.0",
     "0BSD",
+    # Mozilla CA root store data shipped by `webpki-roots` (see deny.toml).
+    "CDLA-Permissive-2.0",
 ]
