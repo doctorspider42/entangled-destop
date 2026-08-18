@@ -35,6 +35,9 @@ deny = []
 
 [advisories]
 yanked = "deny"
+# Fail only when a crate WE depend on directly is unmaintained; transitive
+# unmaintained advisories (e.g. ttf-parser via winit's font stack) warn.
+unmaintained = "workspace"
 ignore = [
     # Marvin Attack on the `rsa` crate (pulled in by rpgp in debian-media).
     # The timing side channel needs an attacker who can measure our *private*
