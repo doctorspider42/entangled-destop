@@ -10,6 +10,11 @@ license.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 virtio-core.workspace = true
+virtio-queue.workspace = true
+vm-memory.workspace = true
+
+[dev-dependencies]
+virtio-core = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

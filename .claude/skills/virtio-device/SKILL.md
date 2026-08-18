@@ -43,6 +43,11 @@ shared safety live in `crates/virtio-core`; one crate per device.
   `virtio_core::mmio::cmdline_clause`.
 - Queue notify: register an `ioeventfd` on `slot_base + QUEUE_NOTIFY` so the
   guest write doesn't take a full VM exit round-trip through the vCPU thread.
+  **Not done yet (MVP-307):** `MmioTransport::queue_notify` currently runs the
+  device inline on the vCPU thread that took the MMIO exit. The single entry
+  point and `DeviceResources` are already shaped so the switch to an eventfd
+  plus a per-device worker thread needs no interface change — see the TODO in
+  `virtio_core::transport`.
 - Interrupts: `irqfd` bound to the device's GSI; set `INTERRUPT_STATUS`
   bit `INT_VRING` before signaling, clear on `INTERRUPT_ACK` write.
 - Feature negotiation is 2×32-bit windows selected by `DEVICE_FEATURES_SEL` /
