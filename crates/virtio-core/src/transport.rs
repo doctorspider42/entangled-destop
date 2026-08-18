@@ -12,23 +12,32 @@
 //! # Threading
 //!
 //! One `MmioTransport` is shared (behind a `Mutex`) by every vCPU thread,
-//! because any vCPU can take an MMIO exit into the slot. All register handling
-//! and — for now — all queue processing therefore runs on the vCPU thread that
-//! took the exit.
+//! because any vCPU can take an MMIO exit into the slot, **and** by the
+//! device's queue worker thread (see below).
 //!
-//! # TODO (MVP-307): ioeventfd for QUEUE_NOTIFY
+//! # QUEUE_NOTIFY offload (MVP-307)
 //!
-//! `QUEUE_NOTIFY` is currently handled synchronously from the vCPU exit path:
-//! the guest write becomes a `KVM_EXIT_MMIO`, the vCPU thread runs the device
-//! and only then re-enters the guest. That is correct but costs a full exit
-//! round-trip per kick, and it serialises device I/O with guest execution.
-//! The planned fix is to register an `ioeventfd` on
-//! `slot_base + QUEUE_NOTIFY` so KVM signals an eventfd without leaving the
-//! kernel, and to move queue processing onto a per-device worker thread that
-//! epolls it. Nothing in this module's interface has to change for that:
-//! [`MmioTransport::queue_notify`] is already the single entry point, and
-//! [`crate::DeviceResources`] already hands the device everything it needs to
-//! run off-thread.
+//! A guest kick is a write of the queue index to `slot_base + QUEUE_NOTIFY`.
+//! Handled from the MMIO exit path it costs a full `KVM_EXIT_MMIO` round-trip
+//! and runs the whole device — file I/O, TAP writes, pixel blits — on the vCPU
+//! thread, stalling guest execution for the duration.
+//!
+//! The host can therefore *offload* a queue's notification: the machine layer
+//! registers a host notification primitive (on Linux an `EventFd` bound to KVM
+//! as an **ioeventfd** with a 4-byte datamatch on the queue index) and runs
+//! [`MmioTransport::queue_notify`] from a per-device worker thread instead.
+//! KVM then completes the guest write inside the kernel and the vCPU never
+//! leaves the guest.
+//!
+//! This module stays host-agnostic (ADR-0002): it only records *which* queues
+//! are offloaded, via [`MmioTransport::offload_queue_notify`], so that
+//! [`MmioTransport::write`] can drop a `QUEUE_NOTIFY` write that the host
+//! primitive already owns instead of running the device twice. All eventfd,
+//! epoll and KVM plumbing lives in `machine_x86::notify`.
+//!
+//! Offloading is a property of the host wiring, not of the guest, so it
+//! survives [`MmioTransport::reset`] — a driver that resets and re-initialises
+//! the device keeps being served by the same worker thread.
 
 use std::sync::Arc;
 
@@ -81,6 +90,11 @@ pub struct MmioTransport {
     queues: Vec<QueueConfig>,
     queue_sel: u32,
 
+    /// One flag per queue: true when a host notification primitive (ioeventfd)
+    /// owns this queue's `QUEUE_NOTIFY` writes, so the register path must not
+    /// run the device itself. Host wiring, not guest state — survives `reset`.
+    notify_offloaded: Vec<bool>,
+
     status: u32,
     activated: bool,
 }
@@ -114,7 +128,8 @@ impl MmioTransport {
                 });
             }
         }
-        let queues = max_sizes.iter().copied().map(QueueConfig::new).collect();
+        let queues: Vec<QueueConfig> = max_sizes.iter().copied().map(QueueConfig::new).collect();
+        let notify_offloaded = vec![false; queues.len()];
 
         Ok(Self {
             slot,
@@ -128,6 +143,7 @@ impl MmioTransport {
             driver_features_sel: 0,
             queues,
             queue_sel: 0,
+            notify_offloaded,
             status: 0,
             activated: false,
         })
@@ -156,6 +172,46 @@ impl MmioTransport {
     /// The device behind this slot, for inspection (tests, `entangled doctor`).
     pub fn device(&self) -> &dyn VirtioDevice {
         self.device.as_ref()
+    }
+
+    /// Number of virtqueues this slot exposes. The host uses it to decide how
+    /// many notification primitives to create (MVP-307).
+    pub fn num_queues(&self) -> usize {
+        self.queues.len()
+    }
+
+    /// Hands ownership of queue `index`'s `QUEUE_NOTIFY` writes to a host
+    /// notification primitive: from now on the register path drops those writes
+    /// (KVM normally swallows them anyway) and the host is expected to call
+    /// [`Self::queue_notify`] from its worker thread instead.
+    ///
+    /// Returns false when this device has no such queue, so the host can fall
+    /// back to the synchronous path instead of silently losing kicks.
+    pub fn offload_queue_notify(&mut self, index: u16) -> bool {
+        match self.notify_offloaded.get_mut(usize::from(index)) {
+            Some(flag) => {
+                *flag = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Gives queue `index`'s `QUEUE_NOTIFY` writes back to the register path,
+    /// used when the host tears its notification primitive down again.
+    pub fn restore_queue_notify(&mut self, index: u16) {
+        if let Some(flag) = self.notify_offloaded.get_mut(usize::from(index)) {
+            *flag = false;
+        }
+    }
+
+    /// Whether queue `index`'s kicks arrive out-of-band (ioeventfd) rather than
+    /// through an MMIO exit.
+    pub fn is_queue_notify_offloaded(&self, index: u16) -> bool {
+        self.notify_offloaded
+            .get(usize::from(index))
+            .copied()
+            .unwrap_or(false)
     }
 
     // ---------------------------------------------------------------- reads
@@ -264,7 +320,7 @@ impl MmioTransport {
             mmio::QUEUE_SEL => self.queue_sel = value,
             mmio::QUEUE_NUM => self.write_queue_num(value),
             mmio::QUEUE_READY => self.write_queue_ready(value),
-            mmio::QUEUE_NOTIFY => self.queue_notify(value),
+            mmio::QUEUE_NOTIFY => self.queue_notify_from_register(value),
             mmio::INTERRUPT_ACK => self.interrupt.ack(value),
             mmio::STATUS => self.write_status(value),
             mmio::QUEUE_DESC_LOW
@@ -355,9 +411,37 @@ impl MmioTransport {
         }
     }
 
-    /// Handles a `QUEUE_NOTIFY` write. Runs the device inline on the vCPU
-    /// thread for now — see the ioeventfd TODO in the module docs (MVP-307).
-    fn queue_notify(&mut self, value: u32) {
+    /// `QUEUE_NOTIFY` write that arrived through an MMIO exit.
+    ///
+    /// When the queue's kicks are offloaded to a host primitive the write is
+    /// dropped: KVM normally completes it in the kernel, so reaching userspace
+    /// at all means either the datamatch did not apply (a bogus queue index) or
+    /// the guest wrote a width KVM does not match on. Running the device here
+    /// too would double-process the ring, so the offloaded queue's worker stays
+    /// the only caller. Everything else runs inline on the vCPU thread, which
+    /// is also the whole synchronous fallback path.
+    fn queue_notify_from_register(&mut self, value: u32) {
+        if let Ok(index) = u16::try_from(value) {
+            if self.is_queue_notify_offloaded(index) {
+                tracing::debug!(
+                    slot = self.slot,
+                    device = ?self.device_type,
+                    queue = index,
+                    "dropping QUEUE_NOTIFY register write for an offloaded queue"
+                );
+                return;
+            }
+        }
+        self.queue_notify(value);
+    }
+
+    /// Runs the device for the queue named by a `QUEUE_NOTIFY` value.
+    ///
+    /// The single entry point for kicks, whichever way they arrive: the vCPU
+    /// exit path calls it for non-offloaded queues, the device's worker thread
+    /// calls it when its ioeventfd fires (MVP-307). `value` is the raw register
+    /// value, i.e. still guest-controlled and validated here.
+    pub fn queue_notify(&mut self, value: u32) {
         if !self.activated {
             tracing::warn!(
                 slot = self.slot,
@@ -520,6 +604,10 @@ impl MmioTransport {
 
     /// Full device reset (MVP-303): everything returns to the state a freshly
     /// constructed transport is in, so a driver can start bring-up again.
+    ///
+    /// `notify_offloaded` is deliberately *not* cleared: it describes host
+    /// wiring (which queue has an ioeventfd behind it), not guest state, and the
+    /// same worker thread keeps serving the device across the reset.
     pub fn reset(&mut self) {
         self.device.reset();
         for queue in &mut self.queues {
@@ -589,12 +677,18 @@ impl MmioTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::device::DeviceError;
     use crate::testing::{self, SplitRing, TestIrqLine};
 
     const FEATURE_A: u64 = 1 << 3;
     const FEATURE_HIGH: u64 = 1 << 40;
+
+    /// Queue indices the device was notified about, observable from outside the
+    /// boxed `dyn VirtioDevice` the transport owns.
+    type NotifyLog = Arc<Mutex<Vec<u16>>>;
 
     /// A device that records what the transport did to it.
     struct TestDevice {
@@ -607,7 +701,7 @@ mod tests {
         acked: Option<u64>,
         activations: usize,
         resets: usize,
-        notifies: Vec<u16>,
+        notifies: NotifyLog,
         activated_queues: usize,
     }
 
@@ -623,7 +717,7 @@ mod tests {
                 acked: None,
                 activations: 0,
                 resets: 0,
-                notifies: Vec::new(),
+                notifies: NotifyLog::default(),
                 activated_queues: 0,
             }
         }
@@ -683,7 +777,9 @@ mod tests {
         }
 
         fn notify(&mut self, queue_index: u16) -> Result<(), DeviceError> {
-            self.notifies.push(queue_index);
+            if let Ok(mut log) = self.notifies.lock() {
+                log.push(queue_index);
+            }
             if self.fail_notify {
                 return Err(DeviceError::Backend("test notify failure".into()));
             }
@@ -707,6 +803,22 @@ mod tests {
 
     fn transport() -> (MmioTransport, Arc<TestIrqLine>) {
         transport_with(TestDevice::default())
+    }
+
+    /// A transport plus a handle on the queue indices its device is notified
+    /// about — the offload tests need to see through the `Box<dyn VirtioDevice>`.
+    fn transport_with_notify_log() -> (MmioTransport, NotifyLog) {
+        let log = NotifyLog::default();
+        let device = TestDevice {
+            notifies: Arc::clone(&log),
+            ..Default::default()
+        };
+        let (transport, _) = transport_with(device);
+        (transport, log)
+    }
+
+    fn notified(log: &NotifyLog) -> Vec<u16> {
+        log.lock().map(|l| l.clone()).unwrap_or_default()
     }
 
     fn read32(t: &mut MmioTransport, offset: u64) -> u32 {
@@ -1044,6 +1156,78 @@ mod tests {
         // Out-of-range queue indices are dropped without touching the device.
         write32(&mut t, mmio::QUEUE_NOTIFY, 1);
         write32(&mut t, mmio::QUEUE_NOTIFY, 0xffff_ffff);
+        assert_eq!(t.status() & status::DEVICE_NEEDS_RESET, 0);
+    }
+
+    // ----------------------------------------------- notify offload (MVP-307)
+
+    #[test]
+    fn offloaded_queue_ignores_register_writes_but_serves_worker_calls() {
+        let (mut t, log) = transport_with_notify_log();
+        let ring = SplitRing::layout(0x1000, 16);
+        bring_up(&mut t, &ring);
+
+        assert!(t.offload_queue_notify(0));
+        assert!(t.is_queue_notify_offloaded(0));
+
+        // The register path must not run the device any more…
+        write32(&mut t, mmio::QUEUE_NOTIFY, 0);
+        assert_eq!(notified(&log), Vec::<u16>::new());
+
+        // …but the worker's direct call still does.
+        t.queue_notify(0);
+        assert_eq!(notified(&log), vec![0]);
+
+        // Handing the queue back restores the synchronous path.
+        t.restore_queue_notify(0);
+        assert!(!t.is_queue_notify_offloaded(0));
+        write32(&mut t, mmio::QUEUE_NOTIFY, 0);
+        assert_eq!(notified(&log), vec![0, 0]);
+    }
+
+    #[test]
+    fn offloading_a_queue_the_device_lacks_is_refused() {
+        let (mut t, _) = transport();
+        assert_eq!(t.num_queues(), 1);
+        assert!(!t.offload_queue_notify(1));
+        assert!(!t.offload_queue_notify(u16::MAX));
+        assert!(!t.is_queue_notify_offloaded(1));
+    }
+
+    #[test]
+    fn offload_survives_a_device_reset() {
+        let (mut t, log) = transport_with_notify_log();
+        let ring = SplitRing::layout(0x1000, 16);
+        bring_up(&mut t, &ring);
+        assert!(t.offload_queue_notify(0));
+
+        write32(&mut t, mmio::STATUS, 0);
+        assert_eq!(t.status(), 0);
+        // Host wiring is untouched by the guest-driven reset, so the worker
+        // keeps being the only thing that may run the device.
+        assert!(t.is_queue_notify_offloaded(0));
+
+        bring_up(&mut t, &ring);
+        write32(&mut t, mmio::QUEUE_NOTIFY, 0);
+        assert_eq!(notified(&log), Vec::<u16>::new());
+        t.queue_notify(0);
+        assert_eq!(notified(&log), vec![0]);
+    }
+
+    /// Out-of-range indices reach the inline path even for an offloaded device
+    /// (KVM's datamatch only swallows the exact queue index), and are dropped
+    /// there without touching the device.
+    #[test]
+    fn bogus_notify_values_stay_harmless_when_offloaded() {
+        let (mut t, log) = transport_with_notify_log();
+        let ring = SplitRing::layout(0x1000, 16);
+        bring_up(&mut t, &ring);
+        assert!(t.offload_queue_notify(0));
+
+        for value in [1u32, 0xffff, 0xffff_ffff, 0x1_0000] {
+            write32(&mut t, mmio::QUEUE_NOTIFY, value);
+        }
+        assert_eq!(notified(&log), Vec::<u16>::new());
         assert_eq!(t.status() & status::DEVICE_NEEDS_RESET, 0);
     }
 

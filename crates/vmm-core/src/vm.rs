@@ -1,6 +1,8 @@
 //! VM assembly: memory registration, in-kernel IRQ chip/PIT and vCPU
 //! creation (backlog MVP-102/103/106).
 
+use std::sync::Arc;
+
 use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY};
 use kvm_ioctls::VmFd;
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
@@ -18,14 +20,17 @@ pub struct MachineConfig {
 /// A configured (not yet running) virtual machine: guest memory registered,
 /// in-kernel IRQ chip and PIT created, vCPUs created with CPUID set.
 pub struct Vm {
-    fd: VmFd,
+    /// Shared because device plumbing outlives the borrow: an ioeventfd or
+    /// irqfd registration must be undone through the same VM fd when the
+    /// device shuts down (MVP-307), long after `Vm::new` returned.
+    fd: Arc<VmFd>,
     memory: GuestMem,
     vcpus: Vec<Vcpu>,
 }
 
 impl Vm {
     pub fn new(hv: &Hypervisor, cfg: &MachineConfig) -> Result<Self, VmmError> {
-        let fd = hv.kvm().create_vm()?;
+        let fd = Arc::new(hv.kvm().create_vm()?);
         let memory = create_guest_memory(cfg.memory_mib << 20)?;
         register_memory(&fd, &memory)?;
 
@@ -50,6 +55,12 @@ impl Vm {
 
     pub fn fd(&self) -> &VmFd {
         &self.fd
+    }
+
+    /// A shared handle on the VM fd, for host plumbing that must survive
+    /// beyond a borrow of the `Vm` (ioeventfd/irqfd teardown).
+    pub fn fd_shared(&self) -> Arc<VmFd> {
+        Arc::clone(&self.fd)
     }
 
     /// Moves the vCPUs out for running (each vCPU is owned by exactly one

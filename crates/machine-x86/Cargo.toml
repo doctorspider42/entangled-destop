@@ -19,5 +19,9 @@ vmm-sys-util.workspace = true
 vmm-core.workspace = true
 virtio-core.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Split-ring helpers for the queue-notify integration test.
+virtio-core = { workspace = true, features = ["test-utils"] }
+
 [lints]
 workspace = true
