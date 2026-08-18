@@ -62,22 +62,30 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         .name
         .clone()
         .unwrap_or_else(|| stem_of(&args.disk, "debian"));
-    let preseed = match (&args.preseed, args.auto) {
-        (Some(path), _) => Some(std::fs::read(path).map_err(|e| {
-            format!("cannot read preseed {}: {e}", path.display())
-        })?),
-        (None, true) => Some(AUTO_PRESEED.as_bytes().to_vec()),
-        (None, false) => None,
-    };
-    let (initramfs, cmdline) = match &preseed {
-        Some(content) => {
-            let path = preseeded_initrd(&initrd, content, &args.disk)?;
-            (path, auto_cmdline(&vm_name))
+    // A preseed is ALWAYS appended to the initrd: at minimum it carries the
+    // virtio_mmio modprobe (see EARLY_MODPROBE_PRESEED — the d-i kernel
+    // command line parser cannot carry values with spaces, so early_command
+    // must ride in a preseed file). Interactive installs get only that line.
+    let (preseed, automated) = match (&args.preseed, args.auto) {
+        (Some(path), _) => {
+            let mut content = std::fs::read(path)
+                .map_err(|e| format!("cannot read preseed {}: {e}", path.display()))?;
+            if !content
+                .windows(b"preseed/early_command".len())
+                .any(|w| w == b"preseed/early_command")
+            {
+                content.extend_from_slice(EARLY_MODPROBE_PRESEED.as_bytes());
+            }
+            (content, true)
         }
-        None => (
-            initrd.clone(),
-            "console=ttyS0 panic=1 reboot=k".to_string(),
-        ),
+        (None, true) => (AUTO_PRESEED.as_bytes().to_vec(), true),
+        (None, false) => (EARLY_MODPROBE_PRESEED.as_bytes().to_vec(), false),
+    };
+    let initramfs = preseeded_initrd(&initrd, &preseed, &args.disk)?;
+    let cmdline = if automated {
+        auto_cmdline(&vm_name)
+    } else {
+        "console=ttyS0 panic=1 reboot=k".to_string()
     };
 
     // 4. The installer VM: target disk as /dev/vda, network, window unless
@@ -183,6 +191,16 @@ fn stem_of(disk: &Path, fallback: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| fallback.to_string())
 }
+
+/// Debian ships virtio_mmio as a module, and nothing autoloads it on x86 —
+/// there is no discoverable bus, devices are announced on the command line.
+/// Without this, d-i's hardware detection finds no NIC and no disk. It must
+/// live in a preseed file: d-i's /proc/cmdline parser cannot carry values
+/// with spaces, quoted or not. Appended to custom preseeds that lack their
+/// own early_command (a custom early_command must include the modprobe).
+const EARLY_MODPROBE_PRESEED: &str =
+    "\n# added by entangled install: virtio_mmio never autoloads on x86\n\
+     d-i preseed/early_command string modprobe virtio_mmio\n";
 
 /// d-i automation command line: priority critical + static netcfg (the host
 /// TAP has no DHCP), with initrd preseeding picking up /preseed.cfg.
