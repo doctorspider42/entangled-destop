@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vmm-core",
+    "crates/machine-x86",
+    "crates/linux-boot",
+    "crates/virtio-core",
+    "crates/virtio-block",
+    "crates/virtio-net",
+    "crates/virtio-gpu",
+    "crates/virtio-input",
+    "crates/display",
+    "crates/debian-media",
+    "crates/control-api",
+    "apps/vmhost-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://example.invalid/vmhost"
+
+[workspace.dependencies]
+# internal crates
+vmm-core = { path = "crates/vmm-core" }
+machine-x86 = { path = "crates/machine-x86" }
+linux-boot = { path = "crates/linux-boot" }
+virtio-core = { path = "crates/virtio-core" }
+virtio-block = { path = "crates/virtio-block" }
+virtio-net = { path = "crates/virtio-net" }
+virtio-gpu = { path = "crates/virtio-gpu" }
+virtio-input = { path = "crates/virtio-input" }
+display = { path = "crates/display" }
+debian-media = { path = "crates/debian-media" }
+control-api = { path = "crates/control-api" }
+
+# rust-vmm (Linux-only, gate behind cfg(target_os = "linux"))
+kvm-ioctls = "0.24"
+kvm-bindings = "0.14"
+vm-memory = { version = "0.17", features = ["backend-mmap"] }
+linux-loader = { version = "0.14", features = ["bzimage", "elf"] }
+vmm-sys-util = "0.15"
+virtio-queue = "0.17"
+vm-superio = "0.9"
+
+# general
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+hex = "0.4"
+libc = "0.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "thin"
+panic = "abort"

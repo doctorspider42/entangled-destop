@@ -1,0 +1,23 @@
+# Example VM configuration for `vmhost run` (see crates/control-api).
+name = "debian-demo"
+memory_mib = 2048
+vcpus = 2
+
+[boot]
+mode = "direct-linux"
+kernel = "artifacts/bootstrap/vmlinuz"
+initramfs = "artifacts/bootstrap/initrd.img"
+cmdline = "console=ttyS0 root=/dev/vda1 rw"
+
+[[disk]]
+path = "images/debian.raw"
+writable = true
+
+[network]
+backend = "tap"
+interface = "vmhost0"
+
+[display]
+width = 1920
+height = 1080
+scale = 1.0

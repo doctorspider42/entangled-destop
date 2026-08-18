@@ -1,0 +1,32 @@
+# cargo-deny configuration (backlog MVP-003).
+# Hard rule: the host binary ships no copyleft code. GPL/AGPL/LGPL/MPL and
+# friends are blocked outright; only permissive licenses are allowed.
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "0BSD",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# QEMU must never appear, in any form (ADR-0001).
+deny = []
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

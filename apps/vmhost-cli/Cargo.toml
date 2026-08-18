@@ -1,0 +1,23 @@
+[package]
+name = "vmhost-cli"
+description = "The vmhost command-line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vmhost"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+control-api.workspace = true
+debian-media.workspace = true
+vmm-core.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build-test:
+    name: Build, lint and test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        # KVM-dependent tests self-skip when /dev/kvm is absent on the runner.
+        run: cargo test --workspace
+
+  license-audit:
+    name: License audit (MVP-003)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+
+  third-party-report:
+    name: THIRD_PARTY_LICENSES + SBOM (MVP-006)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tooling
+        run: cargo install cargo-about cargo-cyclonedx --locked
+      - name: Generate license report
+        run: cargo about generate about.hbs -o THIRD_PARTY_LICENSES.html
+      - name: Generate SBOM
+        run: cargo cyclonedx --format json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compliance
+          path: |
+            THIRD_PARTY_LICENSES.html
+            **/*.cdx.json

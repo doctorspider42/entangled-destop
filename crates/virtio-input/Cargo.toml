@@ -1,0 +1,14 @@
+[package]
+name = "virtio-input"
+description = "virtio-input keyboard and absolute pointer devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+virtio-core.workspace = true
+
+[lints]
+workspace = true

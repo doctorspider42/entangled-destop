@@ -1,0 +1,17 @@
+[package]
+name = "display"
+description = "Host window (winit) and renderer (wgpu) presenting the guest scanout"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+# winit/wgpu enter here with EPIC 7; kept out until the first window lands so
+# the workspace builds stay fast.
+
+[lints]
+workspace = true

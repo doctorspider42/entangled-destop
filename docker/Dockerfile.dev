@@ -1,0 +1,22 @@
+# Reproducible build/test environment for VMHost.
+#
+# Build:  docker build -f docker/Dockerfile.dev -t vmhost-dev .
+# Test:   docker run --rm -v "$PWD:/src" -w /src vmhost-dev cargo test --workspace
+# With KVM (running the VMM itself needs the host's /dev/kvm):
+#         docker run --rm --device /dev/kvm -v "$PWD:/src" -w /src vmhost-dev \
+#             cargo test --workspace
+#
+# Note for Windows: Docker Desktop runs inside WSL2, so this is the same
+# kernel as `wsl -d Ubuntu` — the container only adds reproducibility.
+
+FROM rust:1-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        # winit/wgpu build deps arrive with EPIC 7 (libxkbcommon, wayland) \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup component add clippy rustfmt \
+    && cargo install cargo-deny --locked
+
+WORKDIR /src

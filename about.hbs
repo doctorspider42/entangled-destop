@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VMHost third-party licenses</title>
+<h1>Third-party licenses</h1>
+{{#each licenses}}
+<h2>{{name}} ({{id}})</h2>
+<ul>{{#each used_by}}<li>{{crate.name}} {{crate.version}}</li>{{/each}}</ul>
+<pre>{{text}}</pre>
+{{/each}}

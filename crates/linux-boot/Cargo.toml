@@ -1,0 +1,18 @@
+[package]
+name = "linux-boot"
+description = "Direct bzImage + initramfs boot via the Linux x86 boot protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+machine-x86.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-loader.workspace = true
+vm-memory.workspace = true
+
+[lints]
+workspace = true

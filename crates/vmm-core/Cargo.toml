@@ -1,0 +1,20 @@
+[package]
+name = "vmm-core"
+description = "KVM handle, guest memory and VM lifecycle for VMHost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls.workspace = true
+kvm-bindings.workspace = true
+vm-memory.workspace = true
+vmm-sys-util.workspace = true
+
+[lints]
+workspace = true

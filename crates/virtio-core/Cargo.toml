@@ -1,0 +1,19 @@
+[package]
+name = "virtio-core"
+description = "virtio-mmio transport, virtqueue safety and the VirtioDevice trait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+virtio-queue.workspace = true
+vm-memory.workspace = true
+vmm-sys-util.workspace = true
+
+[lints]
+workspace = true

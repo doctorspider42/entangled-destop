@@ -1,0 +1,18 @@
+[package]
+name = "machine-x86"
+description = "x86-64 machine model: guest memory layout, E820, vCPU setup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls.workspace = true
+kvm-bindings.workspace = true
+vm-memory.workspace = true
+
+[lints]
+workspace = true
