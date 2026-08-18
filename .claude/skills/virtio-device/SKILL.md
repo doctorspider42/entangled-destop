@@ -63,9 +63,18 @@ shared safety live in `crates/virtio-core`; one crate per device.
   bytes with num_buffers when MRG_RXBUF — MVP negotiates **no offloads, no
   mergeable buffers, no multiqueue**: correct first, fast later. MAC from
   `virtio_net::MacAddr::derive(vm_name)` unless pinned in config.
-- **gpu** (EPIC 8): 2D command constants in `virtio_gpu::cmd`/`resp`. Only
-  `FORMAT_B8G8R8A8_UNORM`. controlq + cursorq. Every rect through
-  `Rect::fits_within` before any copy.
+- **gpu** (EPIC 8): wire format in `virtio_gpu::protocol` (constants, `CtrlHdr`,
+  one struct per command, lengths asserted at compile time), host resources in
+  `virtio_gpu::resource`, device in `virtio_gpu::device`. Only the two
+  32-bit BGRA layouts (`FORMAT_B8G8R8A8_UNORM` = ARGB8888,
+  `FORMAT_B8G8R8X8_UNORM` = XRGB8888, which is what Linux actually sends) —
+  check with `is_supported_format`. controlq processes commands, cursorq is
+  drained and ignored (MVP-812). Every rect through `Rect::fits_within` before
+  any copy; every guest page read via `resource::read_backing`, which
+  pre-validates the whole span so a rejected transfer changes nothing.
+  The device reaches the window through the `virtio_gpu::ScanoutSink` trait
+  (`GpuDevice::new(display_handle)`) — `display` depends on `virtio-gpu`, never
+  the other way round.
 - **input** (EPIC 9): event model in `virtio_input` (`ev`, `abs`, `btn`,
   `InputEvent`). Absolute pointer: window coords →
   `InputEvent::abs_from_window` (0..=32767). Every batch ends with

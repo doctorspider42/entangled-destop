@@ -11,6 +11,18 @@ publish.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 virtio-core.workspace = true
+virtio-queue.workspace = true
+vm-memory.workspace = true
+
+[dev-dependencies]
+virtio-core = { workspace = true, features = ["test-utils"] }
+# Dev-only cycle: `display` depends on this crate for the pixel format and
+# `Rect`, and the end-to-end tests drive a real `DisplayHandle::detached`
+# scanout. Cargo allows cycles through dev-dependencies, and nothing in the
+# shipped `virtio-gpu` library links against `display` — the device talks to
+# the host through the [`ScanoutSink`] trait.
+display.workspace = true
+png.workspace = true
 
 [lints]
 workspace = true

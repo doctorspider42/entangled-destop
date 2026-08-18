@@ -17,7 +17,11 @@ permissive; some wgpu backends pull extra deps).
   `None` for zero-sized (minimized) windows — renderer skips presenting then
   (MVP-705/706 groundwork, tested).
 - `display::DisplayConfig` mirrors the `[display]` section of the VM config.
-- Guest side constants live in `virtio-gpu` (`FORMAT_B8G8R8A8_UNORM`) and
+- `DisplayHandle` implements `virtio_gpu::ScanoutSink`, which is the whole of
+  what the GPU device sees (`resolution`, `set_resolution`, `update_scanout`);
+  `DisplayHandle::detached(w, h)` is the windowless version used by tests.
+- Guest side constants live in `virtio-gpu` (`FORMAT_B8G8R8A8_UNORM` /
+  `FORMAT_B8G8R8X8_UNORM`, both 4-byte BGRA) and
   `virtio-input` (`InputEvent::abs_from_window` for pointer scaling).
 
 ## Architecture

@@ -3532,9 +3532,13 @@ dependencies = [
 name = "virtio-gpu"
 version = "0.1.0"
 dependencies = [
+ "display",
+ "png",
  "thiserror 2.0.20",
  "tracing",
  "virtio-core",
+ "virtio-queue",
+ "vm-memory 0.17.2",
 ]
 
 [[package]]
