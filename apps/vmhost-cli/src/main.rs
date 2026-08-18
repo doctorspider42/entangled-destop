@@ -2,6 +2,7 @@
 
 mod disk;
 mod doctor;
+mod fetch;
 #[cfg(target_os = "linux")]
 mod run_vm;
 
@@ -33,15 +34,23 @@ enum Command {
 }
 
 #[derive(Args)]
-struct FetchArgs {
+pub struct FetchArgs {
     /// Distribution to fetch (only "debian").
     distro: String,
     #[arg(long, default_value = "stable")]
     channel: String,
     #[arg(long, default_value = "amd64")]
     arch: String,
+    /// One of text-netboot, gtk-netboot, netinst-iso.
     #[arg(long, default_value = "gtk-netboot")]
     variant: String,
+    /// Re-check the signed checksum file even when the cache already holds a
+    /// verified copy (this is how a new point release is picked up).
+    #[arg(long)]
+    refresh: bool,
+    /// Never access the network: use the verified cache or fail.
+    #[arg(long, conflicts_with = "refresh")]
+    offline: bool,
 }
 
 #[derive(Subcommand)]
@@ -90,10 +99,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Doctor => doctor::run(),
-        Command::Fetch(args) => Err(format!(
-            "fetch {} --channel {} --variant {} is not implemented yet (backlog EPIC 6)",
-            args.distro, args.channel, args.variant
-        )),
+        Command::Fetch(args) => fetch::run(&args),
         Command::Install(args) => Err(format!(
             "install {} --disk {} is not implemented yet (backlog EPIC 10)",
             args.distro,

@@ -2,3 +2,10 @@
 *.png binary
 *.raw binary
 *.iso binary
+
+# Cryptographically load-bearing bytes: the pinned OpenPGP keys are checked
+# against hardcoded fingerprints, and the committed Debian checksum fixture is
+# covered by a real detached signature. Any EOL rewriting would invalidate both,
+# so keep them byte-exact.
+crates/debian-media/keys/*.asc -text
+crates/debian-media/tests/fixtures/** -text

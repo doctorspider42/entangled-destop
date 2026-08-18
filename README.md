@@ -22,6 +22,22 @@ Early scaffolding. See [docs/adr/0001-mvp-architecture.md](docs/adr/0001-mvp-arc
 for the architecture and [vmhost-mvp-backlog.md](vmhost-mvp-backlog.md) for the
 full backlog (Polish).
 
+`vmhost fetch` works today (EPIC 6): it resolves the current Debian stable
+release from signed metadata, verifies it against OpenPGP keys pinned in
+`crates/debian-media/keys/`, streams the artifacts with resumable downloads and
+writes a provenance manifest next to each one.
+
+```bash
+vmhost fetch debian --channel stable --arch amd64 --variant gtk-netboot
+vmhost fetch debian --variant netinst-iso --refresh   # re-check the signed sums
+vmhost fetch debian --variant text-netboot --offline  # verified cache only
+```
+
+Media lands in `$XDG_CACHE_HOME/vmhost/media/<version>/<arch>-<variant>/`. A
+second run over an intact cache performs no network access at all; nothing is
+marked ready before both its OpenPGP signature and its digest check pass, and a
+failed check removes the partial file.
+
 ## Requirements
 
 - Linux x86-64 host with KVM (`/dev/kvm`)
