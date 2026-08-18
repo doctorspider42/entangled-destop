@@ -95,6 +95,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 let spec = launcher::install_spec(
                     &std::path::PathBuf::from(&cli_label),
                     &settings.vm_dir,
+                    settings.child_cwd(),
                     &machine,
                 );
                 egui::Frame::new()

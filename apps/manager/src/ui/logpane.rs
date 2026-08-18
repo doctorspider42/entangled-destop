@@ -67,11 +67,22 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                         {
                             actions.push(Action::CopyProfilePath(path));
                         }
-                        ui.label(ui::faint(&task.command_line))
-                            .on_hover_text(&task.command_line);
                     }
                 });
             });
+
+            // The command line gets its own row and is truncated: a full
+            // `entangled install …` invocation is far wider than the pane and
+            // used to collide with the controls above.
+            if let Some(task) = log_selected.and_then(|id| supervisor.task(id)) {
+                ui.add_space(2.0);
+                ui.add(
+                    egui::Label::new(ui::faint(&task.command_line))
+                        .truncate()
+                        .selectable(false),
+                )
+                .on_hover_text(&task.command_line);
+            }
 
             ui.add_space(8.0);
 

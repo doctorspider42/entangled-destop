@@ -49,12 +49,7 @@ pub fn show(ctx: &egui::Context, toasts: &[Toast], actions: &mut Vec<Action>) {
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
-                            ui.label(
-                                RichText::new(glyph(toast.level))
-                                    .color(tint.gamma_multiply(alpha))
-                                    .size(13.0)
-                                    .strong(),
-                            );
+                            marker(ui, toast.level, tint, alpha);
                             ui.label(
                                 RichText::new(&toast.text)
                                     .color(theme::TEXT.gamma_multiply(alpha))
@@ -81,11 +76,33 @@ fn tint(level: ToastLevel) -> egui::Color32 {
     }
 }
 
-fn glyph(level: ToastLevel) -> &'static str {
+/// Severity marker, painted rather than typed: the bundled fonts have no glyph
+/// for a check mark, and a tofu box next to "deleted …" is not reassuring.
+/// A ring for information, a filled disc for success, a bar for a warning and a
+/// cross for an error — legible at 10 px, no font involved.
+fn marker(ui: &mut egui::Ui, level: ToastLevel, tint: egui::Color32, alpha: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let color = tint.gamma_multiply(alpha);
+    let center = rect.center();
     match level {
-        ToastLevel::Info => "·",
-        ToastLevel::Success => "✓",
-        ToastLevel::Warn => "!",
-        ToastLevel::Error => "×",
+        ToastLevel::Info => {
+            painter.circle_stroke(center, 4.0, egui::Stroke::new(1.6_f32, color));
+        }
+        ToastLevel::Success => {
+            painter.circle_filled(center, 4.0, color);
+        }
+        ToastLevel::Warn => {
+            painter.line_segment(
+                [center - Vec2::new(0.0, 4.5), center + Vec2::new(0.0, 1.0)],
+                egui::Stroke::new(2.0_f32, color),
+            );
+            painter.circle_filled(center + Vec2::new(0.0, 4.0), 1.2, color);
+        }
+        ToastLevel::Error => {
+            for d in [Vec2::new(3.2, 3.2), Vec2::new(3.2, -3.2)] {
+                painter.line_segment([center - d, center + d], egui::Stroke::new(1.8_f32, color));
+            }
+        }
     }
 }

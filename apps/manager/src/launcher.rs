@@ -85,7 +85,12 @@ impl NewMachine {
 ///
 /// The installer VM gets at least 1536 MiB — Debian's installer needs it even
 /// when the finished machine is meant to be smaller.
-pub fn install_spec(cli: &Path, vm_dir: &Path, machine: &NewMachine) -> TaskSpec {
+///
+/// `cwd` is the working directory the child runs in, and it matters: the CLI
+/// resolves the bootstrap kernel as the relative `artifacts/bootstrap/vmlinuz`,
+/// and writes that same relative path into the profile it generates. Disk and
+/// profile paths passed here are absolute, so they are unaffected.
+pub fn install_spec(cli: &Path, vm_dir: &Path, cwd: PathBuf, machine: &NewMachine) -> TaskSpec {
     let mut args = vec![
         "install".to_string(),
         "debian".to_string(),
@@ -112,7 +117,7 @@ pub fn install_spec(cli: &Path, vm_dir: &Path, machine: &NewMachine) -> TaskSpec
         vm: machine.name.clone(),
         program: cli.to_path_buf(),
         args,
-        cwd: vm_dir.to_path_buf(),
+        cwd,
         log_path: vm_dir.join(format!("{}-install.log", machine.name)),
     }
 }
@@ -130,12 +135,13 @@ pub fn run_spec(cli: &Path, vm: &VmEntry, cwd: PathBuf, vm_dir: &Path) -> TaskSp
     }
 }
 
-/// `entangled install` runs with the VM directory as its working directory, so
-/// a profile written by it uses relative paths for the bootstrap kernel. That
-/// only resolves if the kernel is reachable from the child's cwd — surfaced as
-/// a warning in the UI before an install starts.
+/// The bootstrap kernel every VM boots from, relative to the child's working
+/// directory. `entangled install` refuses to start without it and profiles
+/// reference it by this relative path, so the UI checks for it up front.
+pub const BOOTSTRAP_KERNEL: &str = "artifacts/bootstrap/vmlinuz";
+
 pub fn bootstrap_kernel_missing(cwd: &Path) -> bool {
-    !cwd.join("artifacts/bootstrap/vmlinuz").is_file()
+    !cwd.join(BOOTSTRAP_KERNEL).is_file()
 }
 
 #[cfg(test)]
@@ -158,11 +164,12 @@ mod tests {
     fn install_arguments_match_the_cli_surface() {
         let cli = PathBuf::from("/usr/bin/entangled");
         let vm_dir = Path::new("/vms");
-        let spec = install_spec(&cli, vm_dir, &machine());
+        let spec = install_spec(&cli, vm_dir, PathBuf::from("/srv/entangled"), &machine());
 
         assert_eq!(spec.kind, TaskKind::Install);
         assert_eq!(spec.vm, "demo");
-        assert_eq!(spec.cwd, vm_dir);
+        // The child runs where the bootstrap kernel is, not in the VM directory.
+        assert_eq!(spec.cwd, Path::new("/srv/entangled"));
         assert_eq!(spec.log_path, Path::new("/vms/demo-install.log"));
         let line = spec.command_line();
         for needle in [
@@ -186,7 +193,7 @@ mod tests {
         m.memory_mib = 512;
         m.automated = false;
         m.headless = true;
-        let line = install_spec(&cli, Path::new("/vms"), &m).command_line();
+        let line = install_spec(&cli, Path::new("/vms"), PathBuf::from("/srv"), &m).command_line();
         assert!(line.contains("--memory-mib 1536"), "{line}");
         assert!(line.contains("--headless"), "{line}");
         assert!(!line.contains("--auto"), "{line}");

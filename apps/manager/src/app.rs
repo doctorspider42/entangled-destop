@@ -423,9 +423,15 @@ impl ManagerApp {
                     self.finish_install(&vm);
                 }
                 (TaskKind::Install, _, true) => {
+                    // The CLI treats a signalled installer as a clean exit and
+                    // then inspects the disk, so an abort can still leave a
+                    // half-installed image — and even a profile — behind.
                     self.toast(
                         ToastLevel::Warn,
-                        format!("installation of '{vm}' was aborted"),
+                        format!(
+                            "installation of '{vm}' was aborted — its partial disk (and any \
+                             profile the CLI already wrote) are still there; Delete removes them"
+                        ),
                     );
                     self.pending.retain(|p| p.name != vm);
                 }
@@ -601,7 +607,18 @@ impl ManagerApp {
             return;
         };
 
-        let spec = launcher::install_spec(&cli, &self.settings.vm_dir, &machine);
+        let cwd = self.settings.child_cwd();
+        if launcher::bootstrap_kernel_missing(&cwd) {
+            if let Modal::Wizard(state) = &mut self.modal {
+                state.error = Some(format!(
+                    "no {} under {} — the installer boots the project kernel from there                      (build it with guest/bootstrap-kernel/build.sh, or point Settings ▸                      working directory at a tree that has it)",
+                    launcher::BOOTSTRAP_KERNEL,
+                    cwd.display()
+                ));
+            }
+            return;
+        }
+        let spec = launcher::install_spec(&cli, &self.settings.vm_dir, cwd, &machine);
         match self.supervisor.spawn(spec) {
             Ok(id) => {
                 self.pending.push(PendingInstall {
