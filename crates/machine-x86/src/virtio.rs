@@ -78,6 +78,24 @@ pub enum VirtioAttachError {
 /// have configured the pin level-triggered, this is where de-assertion
 /// (`KVM_IRQ_LINE` pairs or a resample eventfd) would go; verifying that needs
 /// a real kernel, which is the bootstrap-kernel work item, not this one.
+///
+/// # Known defect: interrupts are lost when the guest has no MADT/MP table
+///
+/// Measured while adding the MVP-307 boot benchmark: booting the bootstrap
+/// kernel with a virtio-blk disk stalls on the *first* disk read in roughly one
+/// boot in three, on both the synchronous and the ioeventfd notify path, so this
+/// predates MVP-307. At the stall the device has completed the request and
+/// `INTERRUPT_STATUS` still reads `INT_VRING`, i.e. the guest never ran its
+/// handler: the injection was lost, not the kick.
+///
+/// The machine model publishes neither an MP table nor ACPI tables, so the guest
+/// reports "ACPI MADT or MP tables are not detected" and "Switch to virtual wire
+/// mode", i.e. it takes IRQ 5 through the 8259 as ExtINT instead of through the
+/// IOAPIC. The fix is to give the guest a real interrupt topology (MP table or
+/// MADT) the way other KVM VMMs do; until then the `[[disk]]` boot path is
+/// unreliable on this machine model. Reproduce with
+/// `cargo test -p boot-tests --test repeat_boot -- --ignored --nocapture` and
+/// `ENTANGLED_BOOT_DISK=1`.
 struct IrqFdLine {
     event: EventFd,
 }

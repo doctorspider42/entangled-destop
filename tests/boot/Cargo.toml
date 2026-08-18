@@ -1,0 +1,23 @@
+[package]
+name = "boot-tests"
+description = "Boot integration tests: repeated-boot endurance and queue-notify benchmarking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Nothing here is shipped; the crate exists so the boot harness can be shared
+# between the endurance test (MVP-1403) and the queue-notify benchmark
+# (MVP-307) without any production crate dev-depending on all of them.
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vmm-core.workspace = true
+machine-x86.workspace = true
+linux-boot.workspace = true
+virtio-core.workspace = true
+virtio-block.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

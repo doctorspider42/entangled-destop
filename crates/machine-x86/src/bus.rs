@@ -35,6 +35,13 @@ impl MachineBus {
             virtio: Arc::new(virtio),
         }
     }
+
+    /// The virtio-mmio window behind this bus, for inspection: `entangled
+    /// doctor`, and test harnesses that want to report device state when a guest
+    /// stops making progress.
+    pub fn virtio(&self) -> &VirtioMmioBus {
+        &self.virtio
+    }
 }
 
 impl ExitHandler for MachineBus {
