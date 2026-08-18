@@ -1,0 +1,67 @@
+# cargo-fuzz targets (backlog MVP-1402).
+#
+# Deliberately its own workspace (`[workspace]` below) and listed in the root
+# manifest's `exclude`, so `cargo build/test/clippy --workspace` never tries to
+# build it: libfuzzer-sys needs a nightly toolchain and `-Zsanitizer`, which the
+# pinned stable toolchain does not have.
+#
+#   rustup toolchain install nightly
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run chain_walk -- -max_total_time=120
+#
+# See .claude/skills/vm-testing/SKILL.md for the full command list.
+
+[package]
+name = "entangled-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+virtio-core = { path = "../crates/virtio-core", features = ["test-utils"] }
+vm-memory = { version = "0.17", features = ["backend-mmap"] }
+virtio-block = { path = "../crates/virtio-block" }
+debian-media = { path = "../crates/debian-media" }
+
+[[bin]]
+name = "chain_walk"
+path = "fuzz_targets/chain_walk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mmio_transport"
+path = "fuzz_targets/mmio_transport.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "debian_sums"
+path = "fuzz_targets/debian_sums.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blk_request"
+path = "fuzz_targets/blk_request.rs"
+test = false
+doc = false
+bench = false
+
+# Fuzzing wants optimised code with debug assertions left on: an overflow or a
+# broken invariant should abort rather than wrap silently.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true

@@ -77,7 +77,7 @@ pub const MAX_COMMAND_BYTES: usize =
 
 /// Hard bound on how many chains one notification processes, so a guest that
 /// keeps refilling the ring from another vCPU cannot pin this thread forever.
-const CHAINS_PER_NOTIFY: usize = 4 * MAX_QUEUE_SIZE as usize;
+pub const CHAINS_PER_NOTIFY: usize = 4 * MAX_QUEUE_SIZE as usize;
 
 /// What the guest bound to scanout 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -897,6 +897,48 @@ mod tests {
             MAX_COMMAND_BYTES,
             AttachBacking::LEN + MAX_BACKING_ENTRIES as usize * MEM_ENTRY_LEN
         );
+    }
+
+    /// MVP-1407: the staging buffer a guest can make the host allocate for one
+    /// command is capped, and the cap is enforced *before* the copy — a chain
+    /// whose readable segments add up past it fails without ever growing `out`
+    /// to the requested size.
+    #[test]
+    fn gather_request_refuses_a_chain_over_the_command_cap() {
+        let mem = virtio_core::testing::guest_memory(0x1_0000);
+        // One page of guest memory, referenced over and over: the guest controls
+        // the segment count, not how much memory it actually owns.
+        let per_segment = 0x1000u32;
+        let segments: Vec<Segment> = (0..=(MAX_COMMAND_BYTES / per_segment as usize))
+            .map(|_| Segment {
+                addr: 0,
+                len: per_segment,
+                writable: false,
+            })
+            .collect();
+        let mut out = Vec::new();
+        let error = gather_request(&mem, &segments, &mut out)
+            .expect_err("a chain over the command cap must be refused");
+        assert!(matches!(error, CommandError::RequestTooLarge(_)), "{error}");
+        assert!(
+            out.len() <= MAX_COMMAND_BYTES,
+            "the staging buffer grew to {} bytes despite the cap",
+            out.len()
+        );
+
+        // Exactly at the cap still works, so the bound is not off by one.
+        let mut out = Vec::new();
+        let exact = [Segment {
+            addr: 0,
+            len: u32::try_from(MAX_COMMAND_BYTES).expect("cap fits in u32"),
+            writable: false,
+        }];
+        // The read itself fails (guest memory is smaller than the cap), but it
+        // must fail as an unreadable buffer, not as a size violation.
+        match gather_request(&mem, &exact, &mut out) {
+            Ok(()) | Err(CommandError::Unreadable { .. }) => (),
+            Err(other) => panic!("a request exactly at the cap must not be too large: {other}"),
+        }
     }
 
     #[test]

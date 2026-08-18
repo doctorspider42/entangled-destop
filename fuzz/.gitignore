@@ -1,0 +1,7 @@
+# cargo-fuzz build output and findings. The seed corpora under corpus/ are
+# committed on purpose (they are the malicious-guest cases from the unit tests);
+# everything libFuzzer generates on top of them is not.
+target/
+artifacts/
+coverage/
+corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*

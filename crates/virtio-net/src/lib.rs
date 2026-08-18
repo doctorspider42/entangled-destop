@@ -48,7 +48,10 @@ pub mod frame;
 pub mod tap;
 
 pub use backend::{NetBackend, NetError, Readiness};
-pub use device::{NetDevice, NetStats, FEATURES, NUM_QUEUES, RX_QUEUE, TX_QUEUE, VIRTIO_NET_F_MAC};
+pub use device::{
+    NetDevice, NetStats, CHAINS_PER_NOTIFY, FEATURES, NUM_QUEUES, RX_QUEUE, TX_QUEUE,
+    VIRTIO_NET_F_MAC,
+};
 pub use frame::{
     validate_rx_frame, validate_tx_buffer, FrameError, NetHeader, ETH_HEADER_LEN, MAX_BUFFER_LEN,
     MAX_FRAME_LEN, MTU, VIRTIO_NET_HDR_LEN,

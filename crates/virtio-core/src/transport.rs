@@ -486,6 +486,33 @@ impl MmioTransport {
             self.reset();
             return;
         }
+        // Reserved bits are dropped before anything looks at the value, so the
+        // register the guest reads back never contains a bit the spec does not
+        // define. A write of *only* reserved bits is not a reset request — it is
+        // simply meaningless, so it is ignored rather than masked down to 0.
+        let value = match value & status::KNOWN {
+            0 => {
+                tracing::warn!(
+                    slot = self.slot,
+                    device = ?self.device_type,
+                    requested = format_args!("{value:#x}"),
+                    "ignoring device status write with no known bits"
+                );
+                return;
+            }
+            masked => {
+                if masked != value {
+                    tracing::warn!(
+                        slot = self.slot,
+                        device = ?self.device_type,
+                        requested = format_args!("{value:#x}"),
+                        kept = format_args!("{masked:#x}"),
+                        "dropping reserved bits from a device status write"
+                    );
+                }
+                masked
+            }
+        };
         if !status::write_is_valid(self.status, value) {
             tracing::warn!(
                 slot = self.slot,
@@ -990,6 +1017,45 @@ mod tests {
         write32(&mut t, mmio::STATUS, status::ACKNOWLEDGE | status::DRIVER);
         write32(&mut t, mmio::STATUS, status::DRIVER);
         assert_eq!(t.status(), status::ACKNOWLEDGE | status::DRIVER);
+    }
+
+    /// Regression for the MVP-1402 transport fuzz finding: a status write with
+    /// reserved bits set used to store them verbatim, so `STATUS` read back
+    /// values the spec does not define (e.g. `0x101`).
+    #[test]
+    fn reserved_status_bits_are_dropped_not_stored() {
+        let (mut t, _) = transport();
+        write32(&mut t, mmio::STATUS, status::ACKNOWLEDGE | 0x100);
+        assert_eq!(t.status(), status::ACKNOWLEDGE);
+        assert_eq!(t.status() & !status::KNOWN, 0);
+
+        // A write of only reserved bits changes nothing — in particular it is
+        // not treated as the "write 0 = reset" case.
+        write32(&mut t, mmio::STATUS, status::ACKNOWLEDGE | status::DRIVER);
+        write32(&mut t, mmio::STATUS, 0xffff_ff00);
+        assert_eq!(t.status(), status::ACKNOWLEDGE | status::DRIVER);
+
+        // Bring-up still completes with reserved bits riding along.
+        let ring = SplitRing::layout(0x1000, 16);
+        write32(&mut t, mmio::DRIVER_FEATURES_SEL, 1);
+        write32(
+            &mut t,
+            mmio::DRIVER_FEATURES,
+            (VIRTIO_F_VERSION_1 >> 32) as u32,
+        );
+        write32(
+            &mut t,
+            mmio::STATUS,
+            status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | 0x200,
+        );
+        program_ring(&mut t, &ring);
+        write32(
+            &mut t,
+            mmio::STATUS,
+            status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK | 0x400,
+        );
+        assert!(t.is_activated());
+        assert_eq!(t.status() & !status::KNOWN, 0);
     }
 
     #[test]

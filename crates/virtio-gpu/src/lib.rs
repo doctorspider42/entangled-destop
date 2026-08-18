@@ -70,7 +70,10 @@ pub mod protocol;
 pub mod resource;
 pub mod sink;
 
-pub use device::{GpuDevice, CONTROL_QUEUE, CURSOR_QUEUE, NUM_CAPSETS, NUM_QUEUES, NUM_SCANOUTS};
+pub use device::{
+    GpuDevice, CHAINS_PER_NOTIFY, CONTROL_QUEUE, CURSOR_QUEUE, MAX_COMMAND_BYTES, NUM_CAPSETS,
+    NUM_QUEUES, NUM_SCANOUTS,
+};
 pub use error::CommandError;
 pub use protocol::{cmd, resp, CtrlHdr, Rect, FLAG_FENCE, FLAG_INFO_RING_IDX};
 pub use resource::{Resource, ResourceTable};

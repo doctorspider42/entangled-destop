@@ -1,0 +1,8 @@
+Origin: Debian
+Suite: stable
+Version: 13.6
+Codename: trixie
+MD5Sum:
+ 3f9227b1aa510c20408dc34132c2df9e  1959586 contrib/Contents-all
+SHA256:
+ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb    80699 main/installer-amd64/current/images/SHA256SUMS

@@ -7,6 +7,11 @@ pub const FEATURES_OK: u32 = 8;
 pub const DEVICE_NEEDS_RESET: u32 = 64;
 pub const FAILED: u32 = 128;
 
+/// Every bit the spec defines. Everything else is reserved, and a guest write
+/// carrying reserved bits must not leave them in the register the guest reads
+/// back (found by the MVP-1402 transport fuzz target).
+pub const KNOWN: u32 = ACKNOWLEDGE | DRIVER | DRIVER_OK | FEATURES_OK | DEVICE_NEEDS_RESET | FAILED;
+
 /// Checks that a guest status write only adds bits in the legal order
 /// (ACKNOWLEDGE → DRIVER → FEATURES_OK → DRIVER_OK). Writing 0 requests a
 /// device reset and is always legal.

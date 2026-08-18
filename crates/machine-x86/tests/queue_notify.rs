@@ -323,3 +323,60 @@ fn every_device_gets_its_own_worker_and_none_leaks() {
         );
     }
 }
+
+/// MVP-1407: the bus refuses more devices than it has mmio slots and IOAPIC
+/// pins for, before touching KVM at all.
+#[test]
+fn attaching_more_devices_than_slots_is_refused() {
+    let Some(vm) = vm() else { return };
+    let mem = Arc::new(vm.memory().clone());
+    let devices: Vec<Box<dyn VirtioDevice>> = (0..machine_x86::virtio::MAX_VIRTIO_SLOTS + 1)
+        .map(|_| Box::new(CountingDevice::new(1).0) as Box<dyn VirtioDevice>)
+        .collect();
+
+    match VirtioMmioBus::attach_with(vm.fd_shared(), mem, devices, QueueNotifyMode::Ioeventfd) {
+        Err(machine_x86::virtio::VirtioAttachError::TooManySlots { count }) => {
+            assert_eq!(count, machine_x86::virtio::MAX_VIRTIO_SLOTS + 1);
+        }
+        Err(other) => panic!("wrong error for too many devices: {other}"),
+        Ok(_) => panic!("one device past the slot count must be refused"),
+    }
+}
+
+/// MVP-1407: a device with more queues than the offload cap gets exactly the cap
+/// offloaded, and every queue beyond it keeps the synchronous path — so the
+/// number of host eventfds one device can demand is bounded.
+#[test]
+fn queue_notify_offload_is_capped_per_device() {
+    let Some(vm) = vm() else { return };
+    let mem = Arc::new(vm.memory().clone());
+    let cap = machine_x86::notify::MAX_OFFLOADED_QUEUES;
+    let (device, _) = CountingDevice::new(cap + 4);
+
+    let bus = VirtioMmioBus::attach_with(
+        vm.fd_shared(),
+        mem,
+        vec![Box::new(device)],
+        QueueNotifyMode::Ioeventfd,
+    )
+    .expect("a many-queued device still attaches");
+
+    let slot = &bus.slots()[0];
+    let offloaded = slot
+        .notifier()
+        .expect("the first queues are offloaded")
+        .offloaded_queues();
+    assert_eq!(offloaded.len(), cap, "offload must stop at the cap");
+
+    let t = slot.transport.lock().expect("transport lock");
+    for queue in 0..u16::try_from(cap).expect("cap fits") {
+        assert!(t.is_queue_notify_offloaded(queue));
+    }
+    for queue in cap..cap + 4 {
+        let queue = u16::try_from(queue).expect("queue index fits");
+        assert!(
+            !t.is_queue_notify_offloaded(queue),
+            "queue {queue} beyond the cap must keep the synchronous path"
+        );
+    }
+}
