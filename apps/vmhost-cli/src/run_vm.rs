@@ -1,8 +1,10 @@
 //! `vmhost run` — boots a direct-linux VM to the serial console with its
-//! virtio-mmio devices attached (backlog MVP-1202; display and the remaining
-//! device epics plug in here as they land).
+//! virtio-mmio devices attached (backlog MVP-1202..1206; display and the
+//! remaining device epics plug in here as they land).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use control_api::VmConfig;
 use machine_x86::boot as x86_boot;
@@ -10,9 +12,45 @@ use machine_x86::bus::MachineBus;
 use machine_x86::serial::SerialConsole;
 use machine_x86::virtio::VirtioMmioBus;
 use virtio_core::VirtioDevice;
-use vmm_core::{spawn_vcpus, Hypervisor, MachineConfig, RunOutcome, Vm};
+use vmm_core::{spawn_vcpus, Hypervisor, MachineConfig, RunOutcome, Vm, VmState};
+
+/// Set by the SIGINT/SIGTERM handler; the run loop polls it (MVP-1204).
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_termination_signal(_signum: libc::c_int) {
+    // Async-signal-safe: a relaxed atomic store and nothing else.
+    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Installs SIGINT/SIGTERM handlers that request a clean VM stop instead of
+/// killing the process mid-I/O.
+fn install_signal_handlers() -> Result<(), String> {
+    // SAFETY: sigaction with a handler that only stores an atomic; the
+    // zeroed sigaction is a valid "no flags, empty mask" configuration.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        // sa_sigaction is declared as usize in libc; the cast is the API.
+        #[allow(clippy::fn_to_numeric_cast_any)]
+        {
+            action.sa_sigaction = on_termination_signal as usize;
+        }
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            if libc::sigaction(sig, &action, std::ptr::null_mut()) != 0 {
+                return Err(format!(
+                    "failed to install handler for signal {sig}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 pub fn run(cfg: VmConfig) -> Result<(), String> {
+    let span = tracing::info_span!("vm", id = %cfg.name);
+    let _guard = span.enter();
+    install_signal_handlers()?;
+
     let hv = Hypervisor::open().map_err(|e| e.to_string())?;
     let machine = MachineConfig {
         memory_mib: cfg.memory_mib,
@@ -66,18 +104,52 @@ pub fn run(cfg: VmConfig) -> Result<(), String> {
         }
     }
 
-    tracing::info!(vm = %cfg.name, entry = format_args!("{:#x}", loaded.entry), "starting VM");
-    let threads = spawn_vcpus(vcpus, |_| Box::new(bus.clone())).map_err(|e| e.to_string())?;
-    let outcomes = threads.join();
+    // Lifecycle (MVP-1203): Created -> Running -> Stopping -> Stopped, any
+    // vCPU error -> Crashed. Transitions are validated by VmState itself.
+    let mut state = VmState::Created;
+    tracing::info!(entry = format_args!("{:#x}", loaded.entry), state = ?state, "VM created");
 
+    let threads = spawn_vcpus(vcpus, |_| Box::new(bus.clone())).map_err(|e| e.to_string())?;
+    state = state
+        .transition(VmState::Running)
+        .map_err(|e| e.to_string())?;
+    tracing::info!(state = ?state, "VM running");
+
+    let outcomes = threads.join_or_stop(
+        || SHUTDOWN_REQUESTED.load(Ordering::Relaxed),
+        Duration::from_millis(50),
+    );
+    state = state
+        .transition(VmState::Stopping)
+        .map_err(|e| e.to_string())?;
+    if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+        tracing::info!("termination signal received, VM stopped");
+    }
+
+    let mut failure = None;
     for (i, outcome) in outcomes.iter().enumerate() {
         match outcome {
             Ok(RunOutcome::Shutdown) => tracing::info!(vcpu = i, "guest shut down"),
             Ok(o) => tracing::info!(vcpu = i, outcome = ?o, "vCPU finished"),
-            Err(e) => return Err(format!("vCPU {i} failed: {e}")),
+            Err(e) => {
+                tracing::error!(vcpu = i, error = %e, "vCPU failed");
+                failure = Some(format!("vCPU {i} failed: {e}"));
+            }
         }
     }
-    Ok(())
+    state = state
+        .transition(if failure.is_some() {
+            VmState::Crashed
+        } else {
+            VmState::Stopped
+        })
+        .map_err(|e| e.to_string())?;
+    tracing::info!(state = ?state, "VM finished");
+
+    match failure {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
 }
 
 /// Appends the `virtio_mmio.device=` clauses to the configured kernel command

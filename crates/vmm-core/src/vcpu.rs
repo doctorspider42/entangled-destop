@@ -155,6 +155,26 @@ impl VcpuThreads {
     pub fn join(self) -> Vec<Result<RunOutcome, VmmError>> {
         self.handles.into_iter().map(join_outcome).collect()
     }
+
+    /// Waits until every vCPU ends on its own **or** `should_stop` returns
+    /// true (e.g. SIGINT was received, or the window was closed), polling at
+    /// `poll` intervals. Either way all threads are joined before returning
+    /// (backlog MVP-1204/1208 groundwork).
+    pub fn join_or_stop(
+        self,
+        should_stop: impl Fn() -> bool,
+        poll: std::time::Duration,
+    ) -> Vec<Result<RunOutcome, VmmError>> {
+        loop {
+            if self.handles.iter().all(|h| h.is_finished()) {
+                return self.join();
+            }
+            if should_stop() {
+                return self.stop();
+            }
+            std::thread::sleep(poll);
+        }
+    }
 }
 
 fn join_outcome(handle: JoinHandle<Result<RunOutcome, VmmError>>) -> Result<RunOutcome, VmmError> {

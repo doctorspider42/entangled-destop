@@ -3599,6 +3599,7 @@ dependencies = [
  "clap",
  "control-api",
  "debian-media",
+ "libc",
  "linux-boot",
  "machine-x86",
  "thiserror 2.0.20",
