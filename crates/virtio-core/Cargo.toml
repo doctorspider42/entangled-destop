@@ -6,14 +6,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Split-ring building helpers (`testing`) for device crates' unit tests.
+# Never enable in a shipping build: the helpers panic on host mistakes.
+test-utils = []
+
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
+# Portable: `virtio-queue` is pure Rust and `vm-memory`'s mmap backend covers
+# unix and windows, so the transport, queues and all their tests build
+# everywhere. Only the `IrqLine` implementation (eventfd + KVM irqfd, in
+# `machine-x86`) is Linux-specific.
 virtio-queue.workspace = true
 vm-memory.workspace = true
-vmm-sys-util.workspace = true
 
 [lints]
 workspace = true

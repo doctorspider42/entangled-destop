@@ -307,6 +307,8 @@ dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
  "thiserror",
+ "tracing",
+ "virtio-core",
  "vm-memory 0.17.2",
  "vm-superio",
  "vmm-core",
@@ -655,6 +657,8 @@ dependencies = [
  "thiserror",
  "tracing",
  "virtio-core",
+ "virtio-queue",
+ "vm-memory 0.17.2",
 ]
 
 [[package]]
@@ -665,7 +669,6 @@ dependencies = [
  "tracing",
  "virtio-queue",
  "vm-memory 0.17.2",
- "vmm-sys-util",
 ]
 
 [[package]]
@@ -747,6 +750,8 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
+ "virtio-block",
+ "virtio-core",
  "vmm-core",
 ]
 

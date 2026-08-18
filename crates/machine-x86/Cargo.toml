@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-ioctls.workspace = true
@@ -16,6 +17,7 @@ vm-memory.workspace = true
 vm-superio.workspace = true
 vmm-sys-util.workspace = true
 vmm-core.workspace = true
+virtio-core.workspace = true
 
 [lints]
 workspace = true

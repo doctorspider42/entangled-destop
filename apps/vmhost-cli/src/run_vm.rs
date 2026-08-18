@@ -1,11 +1,15 @@
-//! `vmhost run` — boots a direct-linux VM to the serial console
-//! (backlog MVP-1202; display and virtio devices attach here as their
-//! epics land).
+//! `vmhost run` — boots a direct-linux VM to the serial console with its
+//! virtio-mmio devices attached (backlog MVP-1202; display and the remaining
+//! device epics plug in here as they land).
+
+use std::sync::Arc;
 
 use control_api::VmConfig;
 use machine_x86::boot as x86_boot;
 use machine_x86::bus::MachineBus;
 use machine_x86::serial::SerialConsole;
+use machine_x86::virtio::VirtioMmioBus;
+use virtio_core::VirtioDevice;
 use vmm_core::{spawn_vcpus, Hypervisor, MachineConfig, RunOutcome, Vm};
 
 pub fn run(cfg: VmConfig) -> Result<(), String> {
@@ -18,12 +22,35 @@ pub fn run(cfg: VmConfig) -> Result<(), String> {
 
     let serial =
         SerialConsole::new(vm.fd(), Box::new(std::io::stdout())).map_err(|e| e.to_string())?;
-    let bus = MachineBus::new(serial);
+
+    // One virtio-blk device per [[disk]] entry, in configuration order: the
+    // guest kernel probes virtio-mmio devices in command-line order, so the
+    // first disk becomes /dev/vda, the second /dev/vdb (MVP-407).
+    let mut devices: Vec<Box<dyn VirtioDevice>> = Vec::with_capacity(cfg.disks.len());
+    for disk in &cfg.disks {
+        let device = virtio_block::BlockDevice::open(&disk.path, disk.writable)
+            .map_err(|e| format!("cannot attach disk {}: {e}", disk.path.display()))?;
+        tracing::info!(
+            path = %disk.path.display(),
+            writable = disk.writable,
+            capacity_sectors = device.capacity_sectors(),
+            "attaching virtio-blk device"
+        );
+        devices.push(Box::new(device));
+    }
+
+    // Guest memory is shared with the devices; cloning a `GuestMemoryMmap`
+    // shares the underlying regions rather than copying them.
+    let mem = Arc::new(vm.memory().clone());
+    let virtio =
+        VirtioMmioBus::attach(vm.fd(), Arc::clone(&mem), devices).map_err(|e| e.to_string())?;
+    let cmdline = extend_cmdline(&cfg.boot.cmdline, &virtio.cmdline_clauses());
+    let bus = MachineBus::with_virtio(serial, virtio);
 
     let boot = linux_boot::BootConfig {
         kernel: cfg.boot.kernel.clone(),
         initramfs: cfg.boot.initramfs.clone(),
-        cmdline: cfg.boot.cmdline.clone(),
+        cmdline,
     };
     let loaded = linux_boot::load(vm.memory(), &boot, machine.memory_mib << 20)
         .map_err(|e| e.to_string())?;
@@ -51,4 +78,41 @@ pub fn run(cfg: VmConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Appends the `virtio_mmio.device=` clauses to the configured kernel command
+/// line. There is no PCI bus to enumerate, so this is the only way the guest
+/// learns where its devices are.
+fn extend_cmdline(configured: &str, clauses: &str) -> String {
+    let configured = configured.trim();
+    if clauses.is_empty() {
+        return configured.to_string();
+    }
+    if configured.is_empty() {
+        return clauses.to_string();
+    }
+    format!("{configured} {clauses}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extend_cmdline;
+
+    #[test]
+    fn clauses_are_appended_once_and_separated() {
+        assert_eq!(
+            extend_cmdline(
+                "console=ttyS0 root=/dev/vda1",
+                "virtio_mmio.device=4K@0xd0000000:5"
+            ),
+            "console=ttyS0 root=/dev/vda1 virtio_mmio.device=4K@0xd0000000:5"
+        );
+    }
+
+    #[test]
+    fn handles_empty_inputs() {
+        assert_eq!(extend_cmdline("  console=ttyS0 ", ""), "console=ttyS0");
+        assert_eq!(extend_cmdline("", "a=1"), "a=1");
+        assert_eq!(extend_cmdline("", ""), "");
+    }
 }

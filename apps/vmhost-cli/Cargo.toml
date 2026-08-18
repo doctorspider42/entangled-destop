@@ -22,6 +22,8 @@ vmm-core.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 machine-x86.workspace = true
 linux-boot.workspace = true
+virtio-core.workspace = true
+virtio-block.workspace = true
 
 [lints]
 workspace = true
