@@ -25,6 +25,7 @@ machine-x86.workspace = true
 linux-boot.workspace = true
 virtio-core.workspace = true
 virtio-block.workspace = true
+virtio-net.workspace = true
 libc.workspace = true
 
 [lints]

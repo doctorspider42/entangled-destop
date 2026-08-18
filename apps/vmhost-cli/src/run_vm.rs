@@ -75,6 +75,20 @@ pub fn run(cfg: VmConfig) -> Result<(), String> {
         devices.push(Box::new(device));
     }
 
+    // virtio-net from the [network] section (MVP-505); the TAP interface must
+    // already exist (scripts/setup-tap.sh) — vmhost itself never needs
+    // CAP_NET_ADMIN, only the one-time setup does.
+    if let Some(net) = &cfg.network {
+        let backend = virtio_net::TapBackend::open(&net.interface)
+            .map_err(|e| format!("cannot open TAP '{}': {e}", net.interface))?;
+        let mac = match &net.mac {
+            Some(text) => parse_mac(text)?,
+            None => virtio_net::MacAddr::derive(&cfg.name),
+        };
+        tracing::info!(interface = %net.interface, mac = %mac, "attaching virtio-net device");
+        devices.push(Box::new(virtio_net::NetDevice::new(backend, mac)));
+    }
+
     // Guest memory is shared with the devices; cloning a `GuestMemoryMmap`
     // shares the underlying regions rather than copying them.
     let mem = Arc::new(vm.memory().clone());
@@ -148,6 +162,25 @@ pub fn run(cfg: VmConfig) -> Result<(), String> {
         Some(message) => Err(message),
         None => Ok(()),
     }
+}
+
+/// Parses a "52:00:ab:01:02:03"-style MAC from the VM config.
+fn parse_mac(text: &str) -> Result<virtio_net::MacAddr, String> {
+    let mut bytes = [0u8; 6];
+    let mut count = 0;
+    for (i, part) in text.split(':').enumerate() {
+        if i >= 6 {
+            count = 7;
+            break;
+        }
+        bytes[i] =
+            u8::from_str_radix(part, 16).map_err(|_| format!("invalid MAC address '{text}'"))?;
+        count = i + 1;
+    }
+    if count != 6 {
+        return Err(format!("invalid MAC address '{text}': expected 6 octets"));
+    }
+    Ok(virtio_net::MacAddr(bytes))
 }
 
 /// Appends the `virtio_mmio.device=` clauses to the configured kernel command

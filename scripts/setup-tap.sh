@@ -34,7 +34,10 @@
 set -euo pipefail
 
 IFACE=vmhost0
-OWNER=${SUDO_USER:-$(id -un)}
+# TAP owner: SUDO_USER when invoked via sudo; overridable with VMHOST_TAP_OWNER
+# for environments without sudo context (e.g. `wsl -u root -- …`, where
+# defaulting to root would leave the unprivileged VMM unable to attach).
+OWNER=${VMHOST_TAP_OWNER:-${SUDO_USER:-$(id -un)}}
 HOST_IP=192.168.73.1/24
 SUBNET=
 UPLINK=

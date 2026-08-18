@@ -3609,6 +3609,7 @@ dependencies = [
  "tracing-subscriber",
  "virtio-block",
  "virtio-core",
+ "virtio-net",
  "vmm-core",
 ]
 
