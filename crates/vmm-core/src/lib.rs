@@ -6,6 +6,7 @@
 //! development OS.
 
 mod error;
+pub mod hv;
 mod state;
 
 #[cfg(target_os = "linux")]

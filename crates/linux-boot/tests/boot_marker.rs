@@ -88,8 +88,8 @@ fn debian_kernel_boots_to_ready_marker() {
 
     let mut vcpus = vm.take_vcpus();
     let vcpu = &mut vcpus[0];
-    x86_boot::setup_long_mode_sregs(vm.memory(), vcpu.fd()).unwrap();
-    x86_boot::setup_boot_regs(vcpu.fd(), loaded.entry, loaded.boot_params_addr).unwrap();
+    x86_boot::setup_long_mode_sregs(vm.memory(), vcpu).unwrap();
+    x86_boot::setup_boot_regs(vcpu, loaded.entry, loaded.boot_params_addr).unwrap();
 
     let threads = spawn_vcpus(vcpus, |_| Box::new(bus.clone())).unwrap();
 

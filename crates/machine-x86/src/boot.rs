@@ -2,10 +2,9 @@
 //! (backlog MVP-105): boot GDT, identity-map page tables, control registers
 //! and the initial general-purpose registers per the Linux boot protocol.
 
-use kvm_bindings::{kvm_regs, kvm_segment};
-use kvm_ioctls::VcpuFd;
 use thiserror::Error;
 use vm_memory::{Bytes, GuestAddress, GuestMemory};
+use vmm_core::hv::{HvError, VcpuRegisters, X86Registers, X86Segment, X86SpecialRegisters};
 
 use crate::layout;
 
@@ -14,8 +13,8 @@ pub enum BootSetupError {
     #[error("failed to write boot structures to guest memory: {0}")]
     GuestMemory(String),
 
-    #[error("KVM register setup failed: {0}")]
-    Kvm(#[from] kvm_ioctls::Error),
+    #[error("register setup failed: {0}")]
+    Registers(#[from] HvError),
 }
 
 // Page table entry flags.
@@ -53,10 +52,10 @@ const BOOT_GDT: [u64; 4] = [
     gdt_entry(0x808b, 0, 0xfffff), // TSS (64-bit available)
 ];
 
-fn segment_from_gdt(entry: u64, table_index: u8) -> kvm_segment {
+fn segment_from_gdt(entry: u64, table_index: u8) -> X86Segment {
     let g = ((entry >> 55) & 1) as u8;
     let raw_limit = (((entry >> 32) & 0x000f_0000) | (entry & 0xffff)) as u32;
-    kvm_segment {
+    X86Segment {
         base: ((entry >> 16) & 0x00ff_ffff) | (((entry >> 56) & 0xff) << 24),
         limit: if g == 0 {
             raw_limit
@@ -73,7 +72,6 @@ fn segment_from_gdt(entry: u64, table_index: u8) -> kvm_segment {
         g,
         avl: ((entry >> 52) & 1) as u8,
         unusable: 0,
-        padding: 0,
     }
 }
 
@@ -109,9 +107,12 @@ pub fn setup_page_tables<M: GuestMemory>(mem: &M) -> Result<(), BootSetupError> 
 /// Writes the boot GDT/IDT into guest memory and configures the vCPU's
 /// segment and control registers for 64-bit (long mode) execution with
 /// paging enabled.
-pub fn setup_long_mode_sregs<M: GuestMemory>(mem: &M, vcpu: &VcpuFd) -> Result<(), BootSetupError> {
+pub fn setup_long_mode_sregs<M: GuestMemory>(
+    mem: &M,
+    vcpu: &dyn VcpuRegisters,
+) -> Result<(), BootSetupError> {
     let gm = |e: vm_memory::GuestMemoryError| BootSetupError::GuestMemory(e.to_string());
-    let mut sregs = vcpu.get_sregs()?;
+    let mut sregs: X86SpecialRegisters = vcpu.get_special_registers()?;
 
     for (i, entry) in BOOT_GDT.iter().enumerate() {
         mem.write_obj(*entry, GuestAddress(layout::BOOT_GDT_START + i as u64 * 8))
@@ -141,7 +142,7 @@ pub fn setup_long_mode_sregs<M: GuestMemory>(mem: &M, vcpu: &VcpuFd) -> Result<(
     sregs.cr0 |= CR0_PE | CR0_MP | CR0_ET | CR0_NE | CR0_WP | CR0_AM | CR0_PG;
     sregs.efer |= EFER_LME | EFER_LMA;
 
-    vcpu.set_sregs(&sregs)?;
+    vcpu.set_special_registers(&sregs)?;
     Ok(())
 }
 
@@ -149,11 +150,11 @@ pub fn setup_long_mode_sregs<M: GuestMemory>(mem: &M, vcpu: &VcpuFd) -> Result<(
 /// `rip` at the entry, `rsi` pointing at `boot_params`, per the Linux x86
 /// boot protocol.
 pub fn setup_boot_regs(
-    vcpu: &VcpuFd,
+    vcpu: &dyn VcpuRegisters,
     entry_point: u64,
     boot_params: u64,
 ) -> Result<(), BootSetupError> {
-    let regs = kvm_regs {
+    let regs = X86Registers {
         rflags: 2, // reserved bit 1 must be set
         rip: entry_point,
         rsp: layout::BOOT_STACK_POINTER,
@@ -161,7 +162,7 @@ pub fn setup_boot_regs(
         rsi: boot_params,
         ..Default::default()
     };
-    vcpu.set_regs(&regs)?;
+    vcpu.set_registers(&regs)?;
     Ok(())
 }
 

@@ -8,6 +8,9 @@ use std::thread::JoinHandle;
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vmm_sys_util::signal::{register_signal_handler, Killable};
 
+use crate::hv::{
+    HvError, VcpuRegisters, X86DescriptorTable, X86Registers, X86Segment, X86SpecialRegisters,
+};
 use crate::VmmError;
 
 /// RT signal used to kick vCPU threads out of KVM_RUN.
@@ -62,7 +65,164 @@ impl Vcpu {
     pub fn fd(&self) -> &VcpuFd {
         &self.fd
     }
+}
 
+// ---- hypervisor-neutral register access (WHP-1701, ADR-0002) --------------
+
+fn seg_to_kvm(seg: &X86Segment) -> kvm_bindings::kvm_segment {
+    kvm_bindings::kvm_segment {
+        base: seg.base,
+        limit: seg.limit,
+        selector: seg.selector,
+        type_: seg.type_,
+        present: seg.present,
+        dpl: seg.dpl,
+        db: seg.db,
+        s: seg.s,
+        l: seg.l,
+        g: seg.g,
+        avl: seg.avl,
+        unusable: seg.unusable,
+        padding: 0,
+    }
+}
+
+fn seg_from_kvm(seg: &kvm_bindings::kvm_segment) -> X86Segment {
+    X86Segment {
+        base: seg.base,
+        limit: seg.limit,
+        selector: seg.selector,
+        type_: seg.type_,
+        present: seg.present,
+        dpl: seg.dpl,
+        db: seg.db,
+        s: seg.s,
+        l: seg.l,
+        g: seg.g,
+        avl: seg.avl,
+        unusable: seg.unusable,
+    }
+}
+
+impl VcpuRegisters for Vcpu {
+    fn get_registers(&self) -> Result<X86Registers, HvError> {
+        let r = self
+            .fd
+            .get_regs()
+            .map_err(|e| HvError::Registers(e.to_string()))?;
+        Ok(X86Registers {
+            rax: r.rax,
+            rbx: r.rbx,
+            rcx: r.rcx,
+            rdx: r.rdx,
+            rsi: r.rsi,
+            rdi: r.rdi,
+            rsp: r.rsp,
+            rbp: r.rbp,
+            r8: r.r8,
+            r9: r.r9,
+            r10: r.r10,
+            r11: r.r11,
+            r12: r.r12,
+            r13: r.r13,
+            r14: r.r14,
+            r15: r.r15,
+            rip: r.rip,
+            rflags: r.rflags,
+        })
+    }
+
+    fn set_registers(&self, regs: &X86Registers) -> Result<(), HvError> {
+        let r = kvm_bindings::kvm_regs {
+            rax: regs.rax,
+            rbx: regs.rbx,
+            rcx: regs.rcx,
+            rdx: regs.rdx,
+            rsi: regs.rsi,
+            rdi: regs.rdi,
+            rsp: regs.rsp,
+            rbp: regs.rbp,
+            r8: regs.r8,
+            r9: regs.r9,
+            r10: regs.r10,
+            r11: regs.r11,
+            r12: regs.r12,
+            r13: regs.r13,
+            r14: regs.r14,
+            r15: regs.r15,
+            rip: regs.rip,
+            rflags: regs.rflags,
+        };
+        self.fd
+            .set_regs(&r)
+            .map_err(|e| HvError::Registers(e.to_string()))
+    }
+
+    fn get_special_registers(&self) -> Result<X86SpecialRegisters, HvError> {
+        let s = self
+            .fd
+            .get_sregs()
+            .map_err(|e| HvError::Registers(e.to_string()))?;
+        Ok(X86SpecialRegisters {
+            cs: seg_from_kvm(&s.cs),
+            ds: seg_from_kvm(&s.ds),
+            es: seg_from_kvm(&s.es),
+            fs: seg_from_kvm(&s.fs),
+            gs: seg_from_kvm(&s.gs),
+            ss: seg_from_kvm(&s.ss),
+            tr: seg_from_kvm(&s.tr),
+            ldt: seg_from_kvm(&s.ldt),
+            gdt: X86DescriptorTable {
+                base: s.gdt.base,
+                limit: s.gdt.limit,
+            },
+            idt: X86DescriptorTable {
+                base: s.idt.base,
+                limit: s.idt.limit,
+            },
+            cr0: s.cr0,
+            cr2: s.cr2,
+            cr3: s.cr3,
+            cr4: s.cr4,
+            cr8: s.cr8,
+            efer: s.efer,
+            apic_base: s.apic_base,
+        })
+    }
+
+    fn set_special_registers(&self, sregs: &X86SpecialRegisters) -> Result<(), HvError> {
+        // Read-modify-write: kvm_sregs carries the pending-interrupt bitmap,
+        // which must survive untouched.
+        let mut s = self
+            .fd
+            .get_sregs()
+            .map_err(|e| HvError::Registers(e.to_string()))?;
+        s.cs = seg_to_kvm(&sregs.cs);
+        s.ds = seg_to_kvm(&sregs.ds);
+        s.es = seg_to_kvm(&sregs.es);
+        s.fs = seg_to_kvm(&sregs.fs);
+        s.gs = seg_to_kvm(&sregs.gs);
+        s.ss = seg_to_kvm(&sregs.ss);
+        s.tr = seg_to_kvm(&sregs.tr);
+        s.ldt = seg_to_kvm(&sregs.ldt);
+        s.gdt.base = sregs.gdt.base;
+        s.gdt.limit = sregs.gdt.limit;
+        s.idt.base = sregs.idt.base;
+        s.idt.limit = sregs.idt.limit;
+        s.cr0 = sregs.cr0;
+        s.cr2 = sregs.cr2;
+        s.cr3 = sregs.cr3;
+        s.cr4 = sregs.cr4;
+        s.cr8 = sregs.cr8;
+        s.efer = sregs.efer;
+        s.apic_base = sregs.apic_base;
+        self.fd
+            .set_sregs(&s)
+            .map_err(|e| HvError::Registers(e.to_string()))
+    }
+}
+
+impl Vcpu {
     /// Runs the vCPU until the guest halts, shuts down, `running` turns
     /// false, or an unrecoverable error occurs. Every error carries the vCPU
     /// index and a readable message — a vCPU fault must never appear as an

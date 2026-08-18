@@ -224,9 +224,9 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
 
     let vcpus = vm.take_vcpus();
     for vcpu in &vcpus {
-        x86_boot::setup_long_mode_sregs(vm.memory(), vcpu.fd()).map_err(|e| e.to_string())?;
+        x86_boot::setup_long_mode_sregs(vm.memory(), vcpu).map_err(|e| e.to_string())?;
         if vcpu.index == 0 {
-            x86_boot::setup_boot_regs(vcpu.fd(), loaded.entry, loaded.boot_params_addr)
+            x86_boot::setup_boot_regs(vcpu, loaded.entry, loaded.boot_params_addr)
                 .map_err(|e| e.to_string())?;
         }
     }

@@ -54,10 +54,10 @@ fn vcpu_enters_long_mode_and_runs_64bit_code() {
         .unwrap();
 
     let mut vcpu = vm.take_vcpus().remove(0);
-    boot::setup_long_mode_sregs(vm.memory(), vcpu.fd()).unwrap();
+    boot::setup_long_mode_sregs(vm.memory(), &vcpu).unwrap();
     // Pass a boot_params address with a recognizable low byte.
     boot::setup_boot_regs(
-        vcpu.fd(),
+        &vcpu,
         layout::HIGH_RAM_START,
         layout::ZERO_PAGE_START | 0x5a,
     )
