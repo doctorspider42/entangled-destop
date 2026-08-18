@@ -22,6 +22,20 @@ pub const PML4_START: u64 = 0x0000_9000;
 pub const PDPTE_START: u64 = 0x0000_a000;
 pub const PD_START: u64 = 0x0000_b000;
 
+/// Intel MP floating pointer + configuration table, in the classic BIOS scan
+/// window (Linux probes 0xF0000..0xFFFFF for "_MP_"). Gives the guest a real
+/// interrupt topology so device IRQs route through the IOAPIC instead of the
+/// 8259 virtual-wire fallback, where irqfd edge injections are intermittently
+/// lost.
+pub const MPTABLE_START: u64 = 0x000f_0000;
+
+/// Physical address of the local APIC (architectural default).
+pub const LAPIC_ADDR: u32 = 0xfee0_0000;
+
+/// Physical address of the IOAPIC (architectural default; KVM's in-kernel
+/// IOAPIC lives here).
+pub const IOAPIC_ADDR: u32 = 0xfec0_0000;
+
 /// Conventional "high memory" start (1 MiB); the kernel is loaded above this.
 pub const HIGH_RAM_START: u64 = 0x0010_0000;
 

@@ -73,6 +73,7 @@ fn debian_kernel_boots_to_ready_marker() {
         vcpu_count: 1,
     };
     let mut vm = Vm::new(&hv, &machine).unwrap();
+    machine_x86::mptable::write(vm.memory(), machine.vcpu_count).unwrap();
 
     let capture = Capture::default();
     let serial = SerialConsole::new(vm.fd(), Box::new(capture.clone())).unwrap();

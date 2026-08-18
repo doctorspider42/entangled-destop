@@ -86,6 +86,11 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     };
     let mut vm = Vm::new(&hv, &machine).map_err(|e| e.to_string())?;
 
+    // Interrupt topology: without an MP table the guest never programs the
+    // IOAPIC and irqfd injections are intermittently lost (stalled first
+    // virtio-blk read with INT_VRING left pending).
+    machine_x86::mptable::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
+
     let serial =
         SerialConsole::new(vm.fd(), Box::new(std::io::stdout())).map_err(|e| e.to_string())?;
 

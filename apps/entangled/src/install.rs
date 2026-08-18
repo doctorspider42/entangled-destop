@@ -114,7 +114,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
 
     tracing::info!(
         vm = %cfg.name,
-        auto = preseed.is_some(),
+        auto = automated,
         "starting the installer; it reboots when done (Ctrl+Alt+Q / Ctrl+C aborts)"
     );
     let run_result = crate::run_vm::run(cfg, args.headless);
