@@ -23,6 +23,9 @@ mod vcpu;
 #[cfg(target_os = "linux")]
 mod vm;
 
+#[cfg(windows)]
+pub mod whp;
+
 pub use error::VmmError;
 pub use hv::{ExitHandler, MachineConfig, RunOutcome};
 pub use memory::{create_guest_memory, GuestMem};
