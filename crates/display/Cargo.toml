@@ -6,12 +6,28 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Client-side window decorations on Wayland compositors that do not provide
+# server-side ones (GNOME). Off by default because it pulls
+# sctk-adwaita -> ab_glyph -> ttf-parser, and ttf-parser carries an
+# "unmaintained" RUSTSEC advisory (RUSTSEC-2026-0192) that would make
+# `cargo deny check advisories` fail. WSLg, KDE and X11 draw the frame
+# themselves, so the default build is decorated there anyway.
+wayland-csd = ["winit/wayland-csd-adwaita"]
+
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+virtio-input.workspace = true
+virtio-gpu.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+png.workspace = true
 
-# winit/wgpu enter here with EPIC 7; kept out until the first window lands so
-# the workspace builds stay fast.
+[dev-dependencies]
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
