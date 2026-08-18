@@ -8,7 +8,7 @@ use crate::discovery::{format_bytes, VmEntry};
 use crate::theme;
 use crate::ui;
 
-const CARD_HEIGHT: f32 = 196.0;
+const CARD_HEIGHT: f32 = 214.0;
 
 pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
     let time = ctx.input(|i| i.time);
@@ -134,6 +134,7 @@ fn vm_card(
             }
             let path = vm.profile_path.display().to_string();
             ui.label(ui::faint(shorten(&path, 46))).on_hover_text(&path);
+            ui.add_space(6.0);
 
             ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                 ui.horizontal(|ui| {

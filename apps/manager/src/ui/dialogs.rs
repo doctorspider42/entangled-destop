@@ -165,7 +165,13 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                     ui.add(
                         egui::TextEdit::singleline(&mut state.typed)
                             .desired_width(f32::INFINITY)
-                            .hint_text(state.name.clone()),
+                            // Explicitly faint: a placeholder that reads like
+                            // real input is how people delete the wrong VM.
+                            .hint_text(
+                                RichText::new(state.name.clone())
+                                    .color(theme::TEXT_FAINT)
+                                    .italics(),
+                            ),
                     );
                     if let Some(error) = &state.error {
                         ui.add_space(8.0);

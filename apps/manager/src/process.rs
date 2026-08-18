@@ -90,19 +90,64 @@ pub struct LogLine {
     pub text: String,
 }
 
+/// Where the ANSI filter is when a chunk boundary splits an escape sequence.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Ansi {
+    #[default]
+    Text,
+    /// Saw ESC, waiting for the sequence introducer.
+    Escape,
+    /// Inside a CSI sequence (`ESC [ … final-byte`).
+    Csi,
+    /// Inside an OSC string (`ESC ] … BEL | ESC \`).
+    Osc,
+}
+
 #[derive(Debug, Default)]
 struct LogBuffer {
     lines: VecDeque<LogLine>,
     dropped: usize,
     partial: String,
+    ansi: Ansi,
 }
 
 impl LogBuffer {
+    /// Appends child output, splitting lines and dropping ANSI escapes. The CLI
+    /// colours its `tracing` output and the guest kernel adds its own sequences;
+    /// egui has no terminal emulator, so the codes would show up as `[2m` litter.
     fn push_chunk(&mut self, chunk: &str) {
         for ch in chunk.chars() {
+            match self.ansi {
+                Ansi::Escape => {
+                    self.ansi = match ch {
+                        '[' => Ansi::Csi,
+                        ']' => Ansi::Osc,
+                        // Two-character sequences (ESC c, ESC =, …) end here.
+                        _ => Ansi::Text,
+                    };
+                    continue;
+                }
+                Ansi::Csi => {
+                    // Parameter and intermediate bytes, then a final byte in 0x40..=0x7E.
+                    if ('\x40'..='\x7e').contains(&ch) {
+                        self.ansi = Ansi::Text;
+                    }
+                    continue;
+                }
+                Ansi::Osc => {
+                    if ch == '\x07' || ch == '\x1b' {
+                        self.ansi = Ansi::Text;
+                    }
+                    continue;
+                }
+                Ansi::Text => {}
+            }
             match ch {
+                '\x1b' => self.ansi = Ansi::Escape,
                 '\n' => self.flush_partial(),
                 '\r' => {}
+                // Other C0 controls carry no meaning in a plain log view.
+                ch if ch.is_control() && ch != '\t' => {}
                 ch => self.partial.push(ch),
             }
         }
@@ -297,17 +342,18 @@ impl Supervisor {
             source,
         })?;
 
-        let child = Command::new(&spec.program)
+        let mut command = Command::new(&spec.program);
+        command
             .args(&spec.args)
             .current_dir(&spec.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log_err))
-            .spawn()
-            .map_err(|source| ProcessError::Spawn {
-                program: spec.program.display().to_string(),
-                source,
-            })?;
+            .stderr(Stdio::from(log_err));
+        detach_process_group(&mut command);
+        let child = command.spawn().map_err(|source| ProcessError::Spawn {
+            program: spec.program.display().to_string(),
+            source,
+        })?;
 
         let shared = Arc::new(Shared {
             state: Mutex::new(TaskState::Running),
@@ -484,9 +530,34 @@ fn drain_log(reader: &mut Option<File>, shared: &Shared) -> bool {
     produced
 }
 
-/// The single OS-specific function in the crate (ADR-0002): Unix gets SIGTERM
-/// so `entangled run` can shut the VM down cleanly; Windows has no signals, so
-/// `TerminateProcess` via `Child::kill` is the only option.
+/// Puts the child in its own process group so a signal aimed at the manager
+/// never reaches a running VM.
+///
+/// Without this, a child inherits the manager's group and dies with it whenever
+/// something signals the whole group — closing the terminal that started the
+/// manager (SIGHUP), Ctrl+C, or a supervisor killing the job. Verified the hard
+/// way: killing the manager's process group took a running VM down with it.
+#[cfg(unix)]
+fn detach_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    // 0 = "new group with the child's pid as leader".
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn detach_process_group(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+    // CREATE_NEW_PROCESS_GROUP — the Windows equivalent: console control events
+    // sent to the manager's group stop at the child.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn detach_process_group(_command: &mut Command) {}
+
+/// Unix gets SIGTERM so `entangled run` can shut the VM down cleanly; Windows
+/// has no signals, so `TerminateProcess` via `Child::kill` is the only option.
 #[cfg(unix)]
 fn request_stop(child: &mut Child) -> std::io::Result<()> {
     let pid = child.id() as libc::pid_t;
@@ -570,6 +641,34 @@ mod tests {
         log.push_chunk("ond\n");
         assert_eq!(log.lines[1].text, "second");
         assert!(log.partial.is_empty());
+    }
+
+    #[test]
+    fn log_buffer_strips_ansi_colour_codes() {
+        let mut log = LogBuffer::default();
+        // Exactly what `tracing` writes for one CLI line.
+        log.push_chunk(
+            "\u{1b}[2m2026-08-18T22:31:12.670801Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
+             \u{1b}[2mentangled::run_vm\u{1b}[0m\u{1b}[2m:\u{1b}[0m attaching virtio-blk\n",
+        );
+        assert_eq!(
+            log.lines[0].text,
+            "2026-08-18T22:31:12.670801Z  INFO entangled::run_vm: attaching virtio-blk"
+        );
+    }
+
+    #[test]
+    fn log_buffer_handles_escapes_split_across_chunks() {
+        let mut log = LogBuffer::default();
+        log.push_chunk("red \u{1b}");
+        log.push_chunk("[31");
+        log.push_chunk("merror\u{1b}[0m done\n");
+        assert_eq!(log.lines[0].text, "red error done");
+
+        // OSC title sequences (BEL- and ST-terminated) vanish too.
+        let mut log = LogBuffer::default();
+        log.push_chunk("a\u{1b}]0;title\u{7}b\n");
+        assert_eq!(log.lines[0].text, "ab");
     }
 
     #[test]
@@ -658,6 +757,45 @@ mod tests {
         // The log file survives for post-mortem inspection.
         let on_disk = std::fs::read_to_string(dir.join("echoer.log")).expect("log file");
         assert!(on_disk.contains("hello world"));
+    }
+
+    /// The manager must be able to exit without taking VMs with it, so children
+    /// live in their own process group (see `detach_process_group`).
+    #[cfg(unix)]
+    #[test]
+    fn children_run_in_their_own_process_group() {
+        let dir = temp_dir("proc-group");
+        let mut sup = Supervisor::new(no_waker());
+        // `sh -c 'echo $$ …'` prints the child's pid; its process group must
+        // equal that pid rather than the test runner's group.
+        let id = sup
+            .spawn(spec(
+                &dir,
+                "grouped",
+                "/bin/sh",
+                &["-c", "ps -o pgid= -p $$"],
+            ))
+            .expect("spawn");
+        wait_until(
+            || {
+                sup.task(id)
+                    .is_some_and(|t| matches!(t.state(), TaskState::Finished(_)))
+            },
+            "child exit",
+        );
+
+        let (lines, _) = sup.task(id).expect("task").log_tail(10);
+        let reported: i32 = lines
+            .iter()
+            .filter_map(|l| l.trim().parse::<i32>().ok())
+            .next_back()
+            .expect("child printed its process group");
+        // SAFETY: getpgrp takes no arguments and cannot fail.
+        let ours = unsafe { libc::getpgrp() };
+        assert_ne!(
+            reported, ours,
+            "child shares the manager's process group; a group kill would take VMs down"
+        );
     }
 
     #[cfg(unix)]

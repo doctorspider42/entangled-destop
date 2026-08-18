@@ -66,7 +66,10 @@ pub fn install(ctx: &egui::Context) {
 
     let mut visuals = Visuals::dark();
     visuals.dark_mode = true;
-    visuals.override_text_color = Some(TEXT);
+    // No `override_text_color`: it would also repaint hint text and disabled
+    // labels in full-strength body colour. The body colour comes from
+    // `widgets.noninteractive.fg_stroke` below, and egui derives its weak
+    // variants from it.
     visuals.panel_fill = BG_DEEP;
     visuals.window_fill = BG_PANEL;
     visuals.faint_bg_color = Color32::from_rgb(0x0e, 0x14, 0x27);
@@ -99,7 +102,8 @@ pub fn install(ctx: &egui::Context) {
     w.noninteractive.bg_fill = CARD;
     w.noninteractive.weak_bg_fill = CARD;
     w.noninteractive.bg_stroke = Stroke::new(1.0_f32, STROKE);
-    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_DIM);
+    // Body text colour, and the base egui greys out for hints and disabled bits.
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     w.noninteractive.corner_radius = CornerRadius::same(CONTROL_RADIUS);
 
     w.inactive.bg_fill = Color32::from_rgb(0x16, 0x1f, 0x38);

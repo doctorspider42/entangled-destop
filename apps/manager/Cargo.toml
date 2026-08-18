@@ -17,6 +17,16 @@ eframe.workspace = true
 # Present only to align naga's feature set across the two wgpu majors in the
 # workspace — see the comment in the root Cargo.toml.
 naga.workspace = true
+# eframe's `wgpu` feature pulls wgpu in without any backend (backends only come
+# with eframe's `default` feature, which would also drag in glow). Declaring
+# wgpu here selects the same backend set `crates/display` uses; not used in code.
+# NOTE: version 25 on purpose — that is the major egui-wgpu 0.32 links against.
+wgpu = { version = "25", default-features = false, features = [
+    "wgsl",
+    "vulkan",
+    "gles",
+    "dx12",
+] }
 clap.workspace = true
 serde.workspace = true
 toml.workspace = true

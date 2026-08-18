@@ -157,15 +157,17 @@ pub fn chip(ui: &mut Ui, text: &str, tint: Color32) {
     let size = galley.size() + Vec2::new(16.0, 8.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter();
+    // A hint of the tint over the card surface, with the label carrying the
+    // colour — filled chips would fight the cards for attention.
     painter.rect_filled(
         rect,
         CornerRadius::same(9),
-        tint.gamma_multiply(0.10).to_opaque().gamma_multiply(0.55),
+        theme::mix(theme::CARD, tint, 0.16),
     );
     painter.rect_stroke(
         rect,
         CornerRadius::same(9),
-        Stroke::new(1.0_f32, tint.gamma_multiply(0.35)),
+        Stroke::new(1.0_f32, tint.gamma_multiply(0.30)),
         StrokeKind::Inside,
     );
     painter.galley(

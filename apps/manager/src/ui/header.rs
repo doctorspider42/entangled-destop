@@ -18,6 +18,7 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                 .inner_margin(egui::Margin::symmetric(22, 12)),
         )
         .show(ctx, |ui| {
+            let panel = ui.max_rect();
             ui.horizontal(|ui| {
                 // The mark, drawn by the painter — no assets involved.
                 let (mark_rect, _) =
@@ -81,23 +82,19 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                     });
                 });
             });
-        });
 
-    // A hairline of the accent gradient under the header, tying the two halves
-    // of the palette together.
-    let screen = ctx.screen_rect();
-    let line = Rect::from_min_size(
-        egui::pos2(screen.left(), 83.0),
-        Vec2::new(screen.width(), 1.5),
-    );
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::new("header-hairline"),
-    ));
-    theme::gradient_rect(
-        &painter,
-        line,
-        theme::CYAN.gamma_multiply(0.55),
-        theme::VIOLET.gamma_multiply(0.55),
-    );
+            // A hairline of the accent gradient along the bottom edge, tying
+            // the two halves of the palette together. Painted inside the panel
+            // so modals and popups still sit above it.
+            let line = Rect::from_min_size(
+                egui::pos2(panel.left() - 22.0, panel.bottom() + 10.5),
+                Vec2::new(panel.width() + 44.0, 1.5),
+            );
+            theme::gradient_rect(
+                ui.painter(),
+                line,
+                theme::CYAN.gamma_multiply(0.55),
+                theme::VIOLET.gamma_multiply(0.55),
+            );
+        });
 }

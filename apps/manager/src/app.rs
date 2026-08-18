@@ -33,19 +33,31 @@ pub struct Startup {
 }
 
 pub fn launch(startup: Startup) -> Result<(), String> {
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1240.0, 800.0])
             .with_min_inner_size([880.0, 560.0])
-            .with_title("Entangled Desktop")
+            .with_title("Entangled Manager")
             .with_app_id("entangled-manager"),
         ..Default::default()
     };
 
+    // Debug builds of wgpu validate indirect draw calls with a compute shader
+    // that software GL stacks (llvmpipe under WSLg, plain GLES) cannot compile —
+    // the device is then lost before the first frame. egui issues no indirect
+    // draws at all, so the check is dropped rather than worked around with an
+    // environment variable.
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        setup
+            .instance_descriptor
+            .flags
+            .remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+    }
+
     // The renderer is wgpu: the only backend feature this crate enables, and
     // the same stack `crates/display` already uses.
     eframe::run_native(
-        "Entangled Desktop",
+        "Entangled Manager",
         options,
         Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
