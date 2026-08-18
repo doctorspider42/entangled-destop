@@ -57,6 +57,25 @@ sha2 = "0.10"
 hex = "0.4"
 libc = "0.2"
 
+# host display (EPIC 7) — portable, built on Windows and Linux alike.
+# wgpu is pinned to 26 because 30 raises the MSRV above workspace rust-version.
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+] }
+wgpu = { version = "26", default-features = false, features = [
+    "std",
+    "wgsl",
+    "vulkan",
+    "gles",
+    "dx12",
+    "parking_lot",
+] }
+pollster = "0.4"
+png = "0.18"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

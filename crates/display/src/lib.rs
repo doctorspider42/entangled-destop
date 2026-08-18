@@ -1,99 +1,92 @@
-//! Host presentation (backlog EPIC 7): one `winit` window per VM, a `wgpu`
-//! texture holding the guest scanout, scaling with preserved aspect ratio.
+//! Host presentation and input capture (backlog EPIC 7, host half of EPIC 9).
 //!
-//! Current state: the viewport math the renderer will use. Window and GPU
-//! init land with EPIC 7 (winit/wgpu are added to this crate then).
+//! One [`DisplayHost`] owns one `winit` window, one `wgpu` device and one
+//! `Bgra8Unorm` texture holding the guest scanout. Device threads never touch
+//! that state: they publish pixels through a [`DisplayHandle`] and consume
+//! captured input from an [`InputQueue`].
+//!
+//! ```text
+//!  virtio-gpu thread            main thread (event loop)
+//!  ────────────────────         ─────────────────────────────────────────────
+//!  update_scanout(rect) ──▶ Scanout mirror (BGRA + dirty rect)
+//!                  wake ──▶ RedrawRequested ─▶ write_texture(dirty rect)
+//!                                            ─▶ draw into letterbox(viewport)
+//!  virtio-input thread
+//!  ────────────────────
+//!  InputQueue::drain()   ◀── winit key/pointer events (SYN_REPORT batches)
+//!  ControlQueue::drain() ◀── Ctrl+Alt+G / Ctrl+Alt+Q (never sent to the guest)
+//! ```
+//!
+//! # Layout
+//!
+//! - [`viewport`]: pure geometry — [`letterbox`], [`Viewport`], [`DisplayConfig`].
+//! - [`scanout`]: the CPU-side BGRA mirror, dirty rects and PNG screenshots.
+//! - `renderer` (private): the `wgpu` surface, scanout texture and pipeline.
+//! - [`input`]: winit events → [`virtio_input::InputEvent`] batches.
+//! - [`keymap`]: winit physical key → Linux `KEY_*` table (MVP-902).
+//!
+//! # Manual verification
+//!
+//! Everything except the window itself is unit-tested headlessly; the windowed
+//! path has to be looked at. Under WSL with WSLg (or any Linux desktop):
+//!
+//! ```bash
+//! # animated 1920x1080 test pattern driven only through the public API
+//! cargo run --release -p display --example demo
+//!
+//! # force a backend if the default pick misbehaves (llvmpipe/lavapipe on WSLg)
+//! WGPU_BACKEND=vulkan cargo run --release -p display --example demo
+//! WGPU_BACKEND=gl     cargo run --release -p display --example demo
+//!
+//! # see the per-second FPS / copy statistics (MVP-708)
+//! RUST_LOG=display=debug cargo run --release -p display --example demo
+//! ```
+//!
+//! In the demo window: resize it (the image stays 16:9 with black bars),
+//! minimize and restore it (presenting stops and resumes), press `S` for a PNG
+//! screenshot, `R` to cycle the guest resolution, `Ctrl+Alt+G` to toggle the
+//! pointer grab and `Ctrl+Alt+Q` to quit.
 
-/// Display configuration from the VM config file.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DisplayConfig {
-    pub width: u32,
-    pub height: u32,
-    pub scale: f32,
-}
+#![deny(missing_docs)]
 
-impl Default for DisplayConfig {
-    fn default() -> Self {
-        Self {
-            width: 1920,
-            height: 1080,
-            scale: 1.0,
-        }
-    }
-}
+mod error;
+mod handle;
+mod host;
+pub mod input;
+pub mod keymap;
+mod renderer;
+pub mod scanout;
+mod sync;
+pub mod viewport;
 
-/// Where the guest image lands inside the host window: letterboxed, centered,
-/// aspect ratio preserved (backlog MVP-705).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Viewport {
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-}
+pub use error::DisplayError;
+pub use handle::DisplayHandle;
+pub use host::DisplayHost;
+pub use input::{ControlEvent, ControlQueue, InputCapture, InputQueue, KeyOutcome};
+pub use renderer::FrameStats;
+pub use scanout::{Scanout, ScanoutStats, SharedScanout};
+pub use viewport::{letterbox, DisplayConfig, Viewport};
 
-/// Computes the letterboxed viewport for a `guest_w`×`guest_h` scanout in a
-/// `win_w`×`win_h` window. Returns None while the window is zero-sized
-/// (minimized), which the renderer treats as "skip presenting".
-pub fn letterbox(guest_w: u32, guest_h: u32, win_w: u32, win_h: u32) -> Option<Viewport> {
-    if guest_w == 0 || guest_h == 0 || win_w == 0 || win_h == 0 {
-        return None;
-    }
-    // Compare aspect ratios via cross-multiplication to stay in integers.
-    let fit_to_width =
-        u64::from(win_w) * u64::from(guest_h) <= u64::from(win_h) * u64::from(guest_w);
-    let (width, height) = if fit_to_width {
-        let h = (u64::from(win_w) * u64::from(guest_h) / u64::from(guest_w)) as u32;
-        (win_w, h.max(1))
-    } else {
-        let w = (u64::from(win_h) * u64::from(guest_w) / u64::from(guest_h)) as u32;
-        (w.max(1), win_h)
-    };
-    Some(Viewport {
-        x: (win_w - width) / 2,
-        y: (win_h - height) / 2,
-        width,
-        height,
-    })
-}
+/// Upper bound on one scanout, shared with `virtio-gpu`'s resource limit: a
+/// guest cannot make the host allocate an absurd framebuffer.
+pub const MAX_SCANOUT_PIXELS: u64 = virtio_gpu::MAX_RESOURCE_PIXELS;
+
+/// The pixel format of the scanout texture, matching the only format the guest
+/// gets ([`virtio_gpu::FORMAT_B8G8R8A8_UNORM`]) so pixels are copied verbatim.
+pub const SCANOUT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn exact_fit_fills_window() {
-        let v = letterbox(1920, 1080, 1920, 1080).unwrap();
+    fn scanout_format_matches_the_guest_format() {
+        assert_eq!(virtio_gpu::FORMAT_B8G8R8A8_UNORM, 2);
+        assert_eq!(SCANOUT_TEXTURE_FORMAT, wgpu::TextureFormat::Bgra8Unorm);
         assert_eq!(
-            v,
-            Viewport {
-                x: 0,
-                y: 0,
-                width: 1920,
-                height: 1080
-            }
+            SCANOUT_TEXTURE_FORMAT.block_copy_size(None),
+            Some(virtio_gpu::BYTES_PER_PIXEL),
+            "a guest pixel and a texel must be the same 4 bytes"
         );
-    }
-
-    #[test]
-    fn wider_window_pillarboxes() {
-        let v = letterbox(1920, 1080, 2560, 1080).unwrap();
-        assert_eq!(v.height, 1080);
-        assert_eq!(v.width, 1920);
-        assert_eq!(v.x, 320);
-        assert_eq!(v.y, 0);
-    }
-
-    #[test]
-    fn taller_window_letterboxes() {
-        let v = letterbox(1920, 1080, 1920, 1440).unwrap();
-        assert_eq!(v.width, 1920);
-        assert_eq!(v.height, 1080);
-        assert_eq!(v.y, 180);
-    }
-
-    #[test]
-    fn minimized_window_skips() {
-        assert_eq!(letterbox(1920, 1080, 0, 0), None);
     }
 }
