@@ -202,18 +202,22 @@ recording as confirmed rather than theorised:
   `SmbiosPlatformDxe` likewise fails `Not Found` (no SMBIOS entry point at
   `CLOUDHV_SMBIOS_ADDRESS`, `0xf0000`).
 
-### Still missing — the phase 2/3 gap map
+### The gap map
 
-Established from the sources, in the order the firmware will hit them:
+Established from the sources, in the order the firmware hits them. "Status" is
+as of the bring-up run above.
 
-| Gap | Why the firmware needs it | Where |
-|---|---|---|
-| **PCI host bridge at 00:00.0 with device ID `0x0d57`** | `PlatformPei` does `PciRead16 (OVMF_HOSTBRIDGE_DID)` over ports `0xcf8/0xcfc` and switches on the result; `CLOUDHV_DEVICE_ID = 0x0d57` (`OvmfPkg/Include/IndustryStandard/CloudHv.h`). Anything else reaches `default:` → `DEBUG_ERROR "Unknown Host Bridge Device ID"` → `ASSERT (FALSE)` | `OvmfPkg/Library/PlatformInitLib/Platform.c:365` |
-| **ACPI tables + `rsdp_paddr`** | `AcpiPlatformDxe` installs the VMM's tables when the host bridge is CloudHv; the MADT is how the firmware learns the CPU topology. In PVH the RSDP address arrives in `hvm_start_info.rsdp_paddr` — we currently pass 0 | `OvmfPkg/AcpiPlatformDxe/AcpiPlatform.c:38` |
-| **virtio over PCI** | CloudHv's FDF ships `VirtioPciDeviceDxe`, `Virtio10Dxe`, `VirtioBlkDxe`, `VirtioScsiDxe`, `VirtioNetDxe` — and **no** virtio-MMIO driver at all. Our only transport today is virtio-mmio (ADR-0001 §4). So UEFI-1803 ("boot an Ubuntu ISO from a read-only virtio-blk") is blocked on the post-MVP virtio-pci work, not on firmware | `OvmfPkg/CloudHv/CloudHvX64.fdf:225–235` |
-| **Writable pflash / NVRAM** | The variable store sits at `VARS_OFFSET = 0` of the flash device, `VARS_SIZE = 0x84000`. Phase 1 maps the ROM read-only, so `KVM_MEM_READONLY` turns firmware writes into MMIO exits that the bus drops: variables silently do not persist. A real pflash device (status/command state machine, write buffering, a separate NVRAM file per VM) is the follow-up. Note this affects the reset-vector path only — the PVH path loads into RAM and is writable by construction | `OvmfPkg/Include/Fdf/OvmfPkgDefines.fdf.inc`, `CloudHvDefines.fdf.inc` |
-| **ACPI PM timer at 0x0608, shutdown at 0x0600** | `AcpiTimerLib` uses `CLOUDHV_ACPI_TIMER_IO_ADDRESS`; the firmware stalls on it during DXE | `OvmfPkg/Include/IndustryStandard/CloudHv.h` |
-| **MMIO hole agreement** | The firmware hard-codes the CloudHv 32-bit aperture as `0xc000_0000 + 0x3800_0000`. Our `layout::MMIO_HOLE_START` is already `0xc000_0000` and the virtio window at `0xd000_0000` sits inside it, so this one is free — but it pins the layout | `OvmfPkg/Library/PlatformInitLib/MemDetect.c:61` |
+| Gap | Status | Why the firmware needs it | Where |
+|---|---|---|---|
+| **PCI host bridge at 00:00.0 with device ID `0x0d57`** | **closed** — `machine_x86::platform::PciConfigSpace` | `PlatformPei` does `PciRead16 (OVMF_HOSTBRIDGE_DID)` over ports `0xcf8/0xcfc` and switches on the result; `CLOUDHV_DEVICE_ID = 0x0d57` (`OvmfPkg/Include/IndustryStandard/CloudHv.h`). Anything else reaches `default:` → `DEBUG_ERROR "Unknown Host Bridge Device ID"` → `ASSERT (FALSE)` | `OvmfPkg/Library/PlatformInitLib/Platform.c:365` |
+| **ACPI PM timer at 0x0608** | **closed** — `machine_x86::platform::AcpiPmTimer` | `AcpiTimerLib` reads `CLOUDHV_ACPI_TIMER_IO_ADDRESS` directly, and `MicroSecondDelay()` spins on it | `OvmfPkg/Include/IndustryStandard/CloudHv.h` |
+| **RTC/CMOS at 0x70/0x71** | **closed** — `machine_x86::rtc` | `PcatRealTimeClockRuntimeDxe` backs `EFI_RUNTIME_SERVICES.GetTime()`; `PcRtcInit()` returns `EFI_DEVICE_ERROR` without a clock whose UIP is clear and VRT set | `PcAtChipsetPkg/PcatRealTimeClockRuntimeDxe/PcRtc.c` |
+| **Per-vCPU APIC id in CPUID** | **closed** — `vmm_core::Vcpu::new` | Not a device: `KVM_GET_SUPPORTED_CPUID` leaks the host CPU's APIC id into leaf 1 `EBX[31:24]`, so `GetBspNumber()` cannot match the BSP against the MP hand-off HOB | `UefiCpuPkg/Library/MpInitLib/MpLib.c:1971` |
+| **virtio over PCI** | **open — the phase 3 blocker** | CloudHv's FDF ships `VirtioPciDeviceDxe`, `Virtio10Dxe`, `VirtioBlkDxe`, `VirtioScsiDxe`, `VirtioNetDxe` — and **no** virtio-MMIO driver at all. Our only transport today is virtio-mmio (ADR-0001 §4). So UEFI-1803 ("boot an Ubuntu ISO from a read-only virtio-blk") is blocked on the post-MVP virtio-pci work, not on firmware. `PciBusDxe` already enumerates our bridge and finds nothing behind it | `OvmfPkg/CloudHv/CloudHvX64.fdf:225–235` |
+| **ACPI tables + `rsdp_paddr`** | **open** | `AcpiPlatformDxe` installs the VMM's tables when the host bridge is CloudHv; the MADT is how the firmware learns the CPU topology (today it logs `PlatformMaxCpuCountInitialization: boot CPU count unavailable` and assumes 254). In PVH the RSDP address arrives in `hvm_start_info.rsdp_paddr`, which `uefi_boot::pvh` currently sets to 0. Needed for SMP, for `SmbiosPlatformDxe`, and for a guest OS to see the machine properly | `OvmfPkg/AcpiPlatformDxe/AcpiPlatform.c:38` |
+| **Writable pflash / NVRAM** | **open** | The variable store sits at `VARS_OFFSET = 0` of the flash device, `VARS_SIZE = 0x84000`. Observed: `QemuFlashDetected => No` → `EmuVariableFvbRuntimeDxe` takes over and variables live in RAM, so `BootOrder`, `Boot####` and SecureBoot state are lost on every stop. A real pflash device (status/command state machine, write buffering, an NVRAM file per VM) is the follow-up. Note the PVH path loads the image into RAM, which is writable by construction — the read-only ROM slot only constrains the reset-vector path | `OvmfPkg/Include/Fdf/OvmfPkgDefines.fdf.inc`, `CloudHvDefines.fdf.inc` |
+| **ACPI shutdown port 0x0600** | **open** | `CLOUDHV_ACPI_SHUTDOWN_IO_ADDRESS`: how a guest asks to power off. Without it the VM can only be stopped from the host | `OvmfPkg/Include/IndustryStandard/CloudHv.h` |
+| **MMIO hole agreement** | **free** | The firmware hard-codes the CloudHv 32-bit aperture as `0xc000_0000 + 0x3800_0000`. Our `layout::MMIO_HOLE_START` is already `0xc000_0000` and the virtio window at `0xd000_0000` sits inside it — but it pins the layout | `OvmfPkg/Library/PlatformInitLib/MemDetect.c:61` |
 
 ## Consequences
 
