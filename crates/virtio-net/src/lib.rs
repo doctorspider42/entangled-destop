@@ -1,8 +1,61 @@
-//! virtio-net device (backlog EPIC 5).
+//! virtio-net device with a TAP backend (backlog EPIC 5).
 //!
-//! Current state: MAC address model (MVP-504). TX/RX queues and the TAP
-//! backend land with the mmio transport. Offloads and multiqueue stay off in
-//! the MVP — correct first, fast later.
+//! Four layers, mirroring `virtio-block`:
+//!
+//! * [`frame`] — the virtio-net header and every pure frame check (portable,
+//!   where most of the unit tests live),
+//! * [`backend`] — the [`NetBackend`] contract the device drives, plus its
+//!   typed errors,
+//! * [`tap`] — the Linux TAP backend (`/dev/net/tun` + `TUNSETIFF`),
+//! * [`device`] — [`NetDevice`], the `virtio_core::VirtioDevice`
+//!   implementation, its RX worker thread and its counters.
+//!
+//! Nothing in this crate knows about virtio-mmio: the device sees queues,
+//! features and config space only, so the post-MVP virtio-pci transport can
+//! drive it unchanged.
+//!
+//! # Using it from a VM builder
+//!
+//! ```no_run
+//! # #[cfg(target_os = "linux")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use virtio_net::{MacAddr, NetDevice, TapBackend};
+//!
+//! // The TAP interface is set up once by the host administrator; see
+//! // `scripts/setup-tap.sh` and the CAP_NET_ADMIN notes in `virtio_net::tap`.
+//! let backend = TapBackend::open("vmhost0")?;
+//! let mac = MacAddr::derive("debian-demo"); // stable per VM name
+//! let device = NetDevice::new(backend, mac);
+//!
+//! // …then hand `Box::new(device)` to `virtio_core::MmioTransport::new`.
+//! # let _ = device;
+//! # Ok(()) }
+//! # #[cfg(not(target_os = "linux"))] fn main() {}
+//! ```
+//!
+//! Queue order is fixed by the spec and by [`device::RX_QUEUE`] /
+//! [`device::TX_QUEUE`]: queue 0 receives, queue 1 transmits. The device starts
+//! its RX worker thread on activation and joins it on reset or drop, so a VM
+//! that shuts down leaves no thread and no open TAP descriptor behind.
+//! [`NetDevice::stats`] exposes per-direction counters, including one counter
+//! per drop reason, for `vmhost doctor` and for tests.
+
+pub mod backend;
+pub mod device;
+pub mod frame;
+
+#[cfg(target_os = "linux")]
+pub mod tap;
+
+pub use backend::{NetBackend, NetError, Readiness};
+pub use device::{NetDevice, NetStats, FEATURES, NUM_QUEUES, RX_QUEUE, TX_QUEUE, VIRTIO_NET_F_MAC};
+pub use frame::{
+    validate_rx_frame, validate_tx_buffer, FrameError, NetHeader, ETH_HEADER_LEN, MAX_BUFFER_LEN,
+    MAX_FRAME_LEN, MTU, VIRTIO_NET_HDR_LEN,
+};
+
+#[cfg(target_os = "linux")]
+pub use tap::TapBackend;
 
 /// A guest MAC address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

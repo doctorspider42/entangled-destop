@@ -11,10 +11,17 @@ publish.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 virtio-core.workspace = true
+# Portable: the device, its RX worker and every frame check build anywhere.
+# Only the TAP backend is Linux-only (see the target section below).
+virtio-queue.workspace = true
+vm-memory.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 vmm-sys-util.workspace = true
+
+[dev-dependencies]
+virtio-core = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true
