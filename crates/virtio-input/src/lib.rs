@@ -2,8 +2,59 @@
 //! (tablet-style, so the guest cursor tracks the host window 1:1 without
 //! pointer grabs).
 //!
-//! Current state: the Linux input event model the devices will emit. Device
-//! queues and host keycode mapping (winit → evdev) land with the transport.
+//! Two things live here:
+//!
+//! * the Linux input event model the devices emit ([`InputEvent`] plus the
+//!   [`ev`], [`key`], [`btn`], [`abs`], [`rel`] and [`rep`] code modules), which
+//!   the host capture side (`display`) also uses;
+//! * the [`InputDevice`] implementation of `virtio_core::VirtioDevice`, its
+//!   configuration space ([`config`]) and the host-side event sink
+//!   ([`InputHandle`]).
+//!
+//! # Integrator contract (MVP-901, wired up on `main`)
+//!
+//! One `InputDevice` per profile, each in its own virtio-mmio slot, plus one
+//! [`InputHandle`] per device kept on the host side:
+//!
+//! ```no_run
+//! use virtio_input::{split_batch, InputDevice};
+//!
+//! // Construction: two devices, two mmio slots.
+//! let keyboard = InputDevice::keyboard();
+//! let tablet = InputDevice::absolute_pointer();
+//! // Host-side sinks, cheap to clone and `Send + Sync`; keep these before the
+//! // devices are handed to `MmioTransport::new`, which takes ownership.
+//! let keys = keyboard.handle();
+//! let pointer = tablet.handle();
+//!
+//! // Event pump: `display::InputQueue::drain_batches()` produces
+//! // SYN_REPORT-terminated batches. A batch may mix keyboard and pointer
+//! // events (focus loss releases held keys *and* mouse buttons at once), so
+//! // route per event, never per batch.
+//! # let captured: Vec<Vec<virtio_input::InputEvent>> = Vec::new();
+//! for batch in captured {
+//!     let split = split_batch(&batch);
+//!     if let Err(error) = keys.push(&split.keyboard) {
+//!         tracing::warn!(%error, "keyboard event delivery failed");
+//!     }
+//!     if let Err(error) = pointer.push(&split.pointer) {
+//!         tracing::warn!(%error, "pointer event delivery failed");
+//!     }
+//! }
+//! ```
+//!
+//! [`InputHandle::push`] delivers straight into the guest's event queue when
+//! buffers are available, so the host does not have to wait for a guest kick.
+//! Events pushed before the driver sets `DRIVER_OK` are dropped, and events
+//! pushed while the guest is not refilling the queue are buffered up to
+//! [`MAX_PENDING_EVENTS`] (drop-oldest beyond that, counted in
+//! [`EventStats`]).
+
+pub mod config;
+pub mod device;
+
+pub use config::{DevIds, Profile, Selection};
+pub use device::{BufferError, EventStats, InputDevice, InputHandle, MAX_PENDING_EVENTS};
 
 /// Linux input event types (`EV_*` from `linux/input-event-codes.h`).
 pub mod ev {
@@ -11,6 +62,26 @@ pub mod ev {
     pub const KEY: u16 = 0x01;
     pub const REL: u16 = 0x02;
     pub const ABS: u16 = 0x03;
+    pub const MSC: u16 = 0x04;
+    pub const SW: u16 = 0x05;
+    pub const LED: u16 = 0x11;
+    pub const SND: u16 = 0x12;
+    pub const REP: u16 = 0x14;
+    /// One past the highest event type (`EV_CNT`).
+    pub const CNT: u16 = 0x20;
+}
+
+/// Keyboard key codes (`KEY_*`) the devices need by name. The keyboard profile
+/// advertises the whole low range, so only the outliers are listed.
+pub mod key {
+    /// `KEY_RESERVED`: never sent, never advertised.
+    pub const RESERVED: u16 = 0;
+    /// Highest key code the keyboard profile advertises from the dense low
+    /// range (`display`'s keymap stays inside it apart from [`SELECT`]).
+    pub const DENSE_MAX: u16 = 255;
+    /// `KEY_SELECT`, the one code `display`'s keymap emits above
+    /// [`DENSE_MAX`].
+    pub const SELECT: u16 = 353;
 }
 
 /// Absolute axes for the pointer device.
@@ -19,11 +90,30 @@ pub mod abs {
     pub const Y: u16 = 0x01;
 }
 
-/// Mouse buttons (`BTN_*`).
+/// Relative axes; the absolute pointer still needs them for the scroll wheel.
+pub mod rel {
+    /// `REL_HWHEEL` — horizontal scroll, in notches.
+    pub const HWHEEL: u16 = 0x06;
+    /// `REL_WHEEL` — vertical scroll, in notches.
+    pub const WHEEL: u16 = 0x08;
+}
+
+/// Mouse buttons (`BTN_*`). Linux carries these in the `EV_KEY` code space.
 pub mod btn {
     pub const LEFT: u16 = 0x110;
     pub const RIGHT: u16 = 0x111;
     pub const MIDDLE: u16 = 0x112;
+    /// `BTN_SIDE` — winit's `MouseButton::Back`.
+    pub const SIDE: u16 = 0x113;
+    /// `BTN_EXTRA` — winit's `MouseButton::Forward`.
+    pub const EXTRA: u16 = 0x114;
+}
+
+/// Auto-repeat parameters (`REP_*`). The guest's input core owns repeat
+/// generation; the keyboard only advertises that it supports it.
+pub mod rep {
+    pub const DELAY: u16 = 0x00;
+    pub const PERIOD: u16 = 0x01;
 }
 
 /// Range advertised for ABS_X/ABS_Y; host window coordinates are rescaled
@@ -40,6 +130,10 @@ pub struct InputEvent {
 }
 
 impl InputEvent {
+    /// Size of `struct virtio_input_event` on the wire: `type` (2) + `code` (2)
+    /// + `value` (4). One event per descriptor chain, per the spec.
+    pub const WIRE_SIZE: usize = 8;
+
     pub const SYN_REPORT: InputEvent = InputEvent {
         event_type: ev::SYN,
         code: 0,
@@ -60,6 +154,72 @@ impl InputEvent {
             value,
         }
     }
+
+    /// The guest-visible byte representation (little-endian, as the spec
+    /// requires for the modern interface).
+    pub fn to_le_bytes(self) -> [u8; Self::WIRE_SIZE] {
+        let mut bytes = [0u8; Self::WIRE_SIZE];
+        bytes[0..2].copy_from_slice(&self.event_type.to_le_bytes());
+        bytes[2..4].copy_from_slice(&self.code.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.value.to_le_bytes());
+        bytes
+    }
+
+    /// Parses one wire event, as found in a status-queue buffer. Every bit
+    /// pattern is a valid event, so this cannot fail.
+    pub fn from_le_bytes(bytes: [u8; Self::WIRE_SIZE]) -> Self {
+        InputEvent {
+            event_type: u16::from_le_bytes([bytes[0], bytes[1]]),
+            code: u16::from_le_bytes([bytes[2], bytes[3]]),
+            value: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        }
+    }
+
+    /// True for the `SYN_REPORT` that terminates every batch (MVP-905).
+    pub fn is_syn_report(self) -> bool {
+        self.event_type == ev::SYN && self.code == 0
+    }
+}
+
+/// One captured batch, routed to the devices that advertise its events.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SplitBatch {
+    /// Events for the [`Profile::Keyboard`] device, `SYN_REPORT`-terminated.
+    pub keyboard: Vec<InputEvent>,
+    /// Events for the [`Profile::AbsolutePointer`] device,
+    /// `SYN_REPORT`-terminated.
+    pub pointer: Vec<InputEvent>,
+}
+
+/// Routes one host batch to the two devices, per event.
+///
+/// A batch is *not* uniform: `display` releases held keys and held mouse
+/// buttons in a single batch when the window loses focus (MVP-906), and Linux
+/// carries both in the `EV_KEY` code space. Routing whole batches would give
+/// one device events it never advertised — and lose the other device's
+/// key-ups. So each event goes to whichever profile advertises its
+/// `(type, code)` pair ([`Profile::accepts`]), and each non-empty half is
+/// terminated with its own `SYN_REPORT` so the guest sees complete reports.
+pub fn split_batch(batch: &[InputEvent]) -> SplitBatch {
+    let mut split = SplitBatch::default();
+    for &event in batch {
+        if event.event_type == ev::SYN {
+            continue;
+        }
+        if Profile::Keyboard.accepts(event) {
+            split.keyboard.push(event);
+        }
+        if Profile::AbsolutePointer.accepts(event) {
+            split.pointer.push(event);
+        }
+    }
+    if !split.keyboard.is_empty() {
+        split.keyboard.push(InputEvent::SYN_REPORT);
+    }
+    if !split.pointer.is_empty() {
+        split.pointer.push(InputEvent::SYN_REPORT);
+    }
+    split
 }
 
 #[cfg(test)]
@@ -84,5 +244,182 @@ mod tests {
             ABS_AXIS_MAX
         );
         assert_eq!(InputEvent::abs_from_window(abs::X, 10.0, 0.0).value, 0);
+    }
+
+    #[test]
+    fn wire_format_is_little_endian() {
+        let event = InputEvent {
+            event_type: ev::KEY,
+            code: 30,
+            value: 1,
+        };
+        assert_eq!(
+            event.to_le_bytes(),
+            [0x01, 0x00, 0x1e, 0x00, 0x01, 0x00, 0x00, 0x00]
+        );
+        // ABS_Y at the top of the axis range: 0x7fff.
+        let event = InputEvent {
+            event_type: ev::ABS,
+            code: abs::Y,
+            value: ABS_AXIS_MAX,
+        };
+        assert_eq!(
+            event.to_le_bytes(),
+            [0x03, 0x00, 0x01, 0x00, 0xff, 0x7f, 0x00, 0x00]
+        );
+        // A wheel notch backwards is a two's-complement -1.
+        let event = InputEvent {
+            event_type: ev::REL,
+            code: rel::WHEEL,
+            value: (-1i32) as u32,
+        };
+        assert_eq!(
+            event.to_le_bytes(),
+            [0x02, 0x00, 0x08, 0x00, 0xff, 0xff, 0xff, 0xff]
+        );
+        assert_eq!(InputEvent::SYN_REPORT.to_le_bytes(), [0u8; 8]);
+    }
+
+    #[test]
+    fn wire_format_round_trips() {
+        for event in [
+            InputEvent::SYN_REPORT,
+            InputEvent {
+                event_type: ev::KEY,
+                code: btn::LEFT,
+                value: 1,
+            },
+            InputEvent {
+                event_type: ev::LED,
+                code: 1,
+                value: u32::MAX,
+            },
+            InputEvent {
+                event_type: u16::MAX,
+                code: u16::MAX,
+                value: u32::MAX,
+            },
+        ] {
+            assert_eq!(InputEvent::from_le_bytes(event.to_le_bytes()), event);
+        }
+    }
+
+    #[test]
+    fn syn_report_is_recognised() {
+        assert!(InputEvent::SYN_REPORT.is_syn_report());
+        assert!(!InputEvent {
+            event_type: ev::KEY,
+            code: 30,
+            value: 1
+        }
+        .is_syn_report());
+    }
+
+    #[test]
+    fn split_batch_sends_keys_to_the_keyboard_and_pointer_events_to_the_tablet() {
+        let batch = vec![
+            InputEvent {
+                event_type: ev::KEY,
+                code: 30,
+                value: 1,
+            },
+            InputEvent::SYN_REPORT,
+        ];
+        let split = split_batch(&batch);
+        assert_eq!(split.keyboard, batch);
+        assert!(split.pointer.is_empty());
+
+        let batch = vec![
+            InputEvent::abs_from_window(abs::X, 10.0, 100.0),
+            InputEvent::abs_from_window(abs::Y, 20.0, 100.0),
+            InputEvent::SYN_REPORT,
+        ];
+        let split = split_batch(&batch);
+        assert!(split.keyboard.is_empty());
+        assert_eq!(split.pointer, batch);
+    }
+
+    #[test]
+    fn split_batch_separates_a_mixed_release_all_batch() {
+        // What `display` emits on focus loss: held keys and held mouse buttons
+        // in one batch (MVP-906).
+        let up = |code| InputEvent {
+            event_type: ev::KEY,
+            code,
+            value: 0,
+        };
+        let batch = vec![
+            up(29),
+            up(30),
+            up(btn::LEFT),
+            up(btn::EXTRA),
+            InputEvent::SYN_REPORT,
+        ];
+        let split = split_batch(&batch);
+        assert_eq!(
+            split.keyboard,
+            vec![up(29), up(30), InputEvent::SYN_REPORT],
+            "the keyboard must still see its own key-ups"
+        );
+        assert_eq!(
+            split.pointer,
+            vec![up(btn::LEFT), up(btn::EXTRA), InputEvent::SYN_REPORT]
+        );
+    }
+
+    #[test]
+    fn split_batch_drops_events_neither_device_advertises() {
+        let batch = vec![
+            InputEvent {
+                event_type: ev::MSC,
+                code: 4,
+                value: 7,
+            },
+            InputEvent {
+                event_type: ev::KEY,
+                code: 900,
+                value: 1,
+            },
+            InputEvent {
+                event_type: ev::KEY,
+                code: key::RESERVED,
+                value: 1,
+            },
+            InputEvent::SYN_REPORT,
+        ];
+        let split = split_batch(&batch);
+        assert!(split.keyboard.is_empty());
+        assert!(split.pointer.is_empty());
+
+        // A SYN-only batch produces nothing at all.
+        assert_eq!(
+            split_batch(&[InputEvent::SYN_REPORT]),
+            SplitBatch::default()
+        );
+        assert_eq!(split_batch(&[]), SplitBatch::default());
+    }
+
+    #[test]
+    fn split_batch_routes_the_wheel_to_the_pointer() {
+        let batch = vec![
+            InputEvent {
+                event_type: ev::REL,
+                code: rel::WHEEL,
+                value: 1,
+            },
+            InputEvent {
+                event_type: ev::REL,
+                code: rel::HWHEEL,
+                value: (-2i32) as u32,
+            },
+            InputEvent::SYN_REPORT,
+        ];
+        let split = split_batch(&batch);
+        assert!(split.keyboard.is_empty());
+        assert_eq!(split.pointer.len(), 3);
+        assert_eq!(
+            *split.pointer.last().expect("terminated"),
+            InputEvent::SYN_REPORT
+        );
     }
 }
