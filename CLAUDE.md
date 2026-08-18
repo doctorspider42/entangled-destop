@@ -6,8 +6,9 @@ No QEMU. MVP goal: install and run Debian stable in a 1920×1080 window with
 treat as guidance, not contract): [entangled-mvp-backlog.md](entangled-mvp-backlog.md).
 Architecture decisions: [docs/adr/0001-mvp-architecture.md](docs/adr/0001-mvp-architecture.md),
 [docs/adr/0002-linux-first-whp-ready.md](docs/adr/0002-linux-first-whp-ready.md)
-(portability rules that keep a native Windows/WHP port cheap — read before
-adding OS-specific code or interrupt plumbing).
+(portability rules that keep the native Windows/WHP port cheap, plus its
+amendments recording what the port has actually delivered — read before adding
+OS-specific code or interrupt plumbing).
 
 ## Build and test
 
@@ -23,11 +24,30 @@ wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace
 - `cargo fmt --all` — before finishing any change
 - `cargo deny check` — license gate (blocks GPL/AGPL/LGPL); runs in CI
 
+`vmm-core` (both hypervisor backends), `machine-x86`, `linux-boot`,
+`control-api` and `debian-media` also build and test **natively on Windows** —
+that is where the WHP backend is exercised (EPIC 17). Run both hosts when
+touching any of them:
+
+```powershell
+$env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\entangled-target-whp"
+cargo test -p vmm-core -p machine-x86 -p linux-boot -p control-api
+cargo clippy -p vmm-core -p machine-x86 -p linux-boot -p control-api --all-targets -- -D warnings
+```
+
+The `virtio-*` crates and `display` do not build on Windows yet: upstream
+`virtio-queue` pulls `vm-memory` with default features, re-enabling the
+unix-only `rawfd` feature (see ADR-0002). Nothing in this repo can subtract it.
+
+WHP tests need the "Windows Hypervisor Platform" optional feature (admin +
+reboot); without it they self-skip with a hint, like the KVM tests without
+`/dev/kvm`.
+
 ## Workspace map
 
 | Crate | Owns | Backlog |
 |---|---|---|
-| `crates/vmm-core` | KVM handle, guest memory, vCPU lifecycle, VM state machine | EPIC 1 |
+| `crates/vmm-core` | Hypervisor backends (KVM, WHP), guest memory, vCPU lifecycle, VM state machine | EPIC 1/17 |
 | `crates/machine-x86` | x86-64 machine model: memory layout, E820, CPUID, GDT, IRQ chip | EPIC 1/2 |
 | `crates/linux-boot` | Direct bzImage+initramfs boot, boot_params, cmdline | EPIC 2 |
 | `crates/virtio-core` | virtio-mmio transport, virtqueues, `VirtioDevice` trait | EPIC 3 |
@@ -43,9 +63,9 @@ wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace
 ## Skills
 
 Task-focused guides for working in this repo live in `.claude/skills/`:
-`kvm-machine`, `linux-direct-boot`, `virtio-device`, `debian-media`,
-`host-display`, `vm-testing`. Load the matching skill before working on that
-subsystem.
+`kvm-machine`, `whp-backend`, `linux-direct-boot`, `virtio-device`,
+`debian-media`, `host-display`, `vm-testing`. Load the matching skill before
+working on that subsystem.
 
 ## Hard rules
 
@@ -58,8 +78,18 @@ subsystem.
   GPL/AGPL/LGPL are blocked (guest-side content is unaffected).
 - **Keep the core portable.** Linux-only code (`kvm-*`, TAP, eventfd) stays
   behind `#[cfg(target_os = "linux")]` and
-  `[target.'cfg(target_os = "linux")'.dependencies]`. Protocol constants,
-  parsing, validation and config logic must build and test everywhere.
+  `[target.'cfg(target_os = "linux")'.dependencies]`; the WHP backend and the
+  `windows` crate stay behind `#[cfg(windows)]` and
+  `[target.'cfg(windows)'.dependencies]`. Protocol constants, parsing,
+  validation and config logic must build and test everywhere. Guest memory is
+  portable — never add a second guest-memory type.
+- **Hypervisors talk through `vmm_core::hv`.** Machine and device code uses the
+  neutral register structs, `ExitHandler` and `RunOutcome`; a `kvm_bindings` or
+  `WHV_*` type outside `vmm-core` is a bug. Neither backend's public API may
+  change to suit the other.
+- **Every `unsafe` block carries a `// SAFETY:` comment** saying why the
+  pointer is valid and which union arm is live (`undocumented_unsafe_blocks` is
+  `deny`). FFI-ness alone is not a justification.
 - **Devices are transport-agnostic.** Implement against `VirtioDevice` +
   queues, not against virtio-mmio specifics — virtio-pci arrives post-MVP.
 - **No QEMU anywhere** — not as a process, dependency or linked library.
