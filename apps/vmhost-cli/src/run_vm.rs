@@ -44,7 +44,37 @@ fn install_signal_handlers() -> Result<(), String> {
     Ok(())
 }
 
-pub fn run(cfg: VmConfig) -> Result<(), String> {
+/// The VM's presentation surface: a real window when the host has one, the
+/// windowless scanout otherwise (headless CI, --headless).
+enum Presentation {
+    Windowed(Box<display::DisplayHost>),
+    Headless(display::DisplayHandle),
+}
+
+fn open_presentation(cfg: &VmConfig, headless: bool) -> Result<Presentation, String> {
+    let display_cfg = display::DisplayConfig {
+        width: cfg.display.width,
+        height: cfg.display.height,
+        scale: cfg.display.scale,
+    };
+    if !headless {
+        match display::DisplayHost::new(display_cfg) {
+            Ok(host) => {
+                return Ok(Presentation::Windowed(Box::new(
+                    host.with_title(format!("VMHost — {}", cfg.name)),
+                )))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot open a window, falling back to headless");
+            }
+        }
+    }
+    display::DisplayHandle::detached(cfg.display.width, cfg.display.height)
+        .map(Presentation::Headless)
+        .map_err(|e| e.to_string())
+}
+
+pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     let span = tracing::info_span!("vm", id = %cfg.name);
     let _guard = span.enter();
     install_signal_handlers()?;
@@ -89,6 +119,25 @@ pub fn run(cfg: VmConfig) -> Result<(), String> {
         devices.push(Box::new(virtio_net::NetDevice::new(backend, mac)));
     }
 
+    // Presentation + virtio-gpu (EPIC 7/8): the device pushes scanout pixels
+    // into the display handle; with a window they appear on screen, headless
+    // they are still screenshot-able.
+    let presentation = open_presentation(&cfg, headless)?;
+    let display_handle = match &presentation {
+        Presentation::Windowed(host) => host.handle(),
+        Presentation::Headless(handle) => handle.clone(),
+    };
+    devices.push(Box::new(virtio_gpu::GpuDevice::new(display_handle.clone())));
+
+    // virtio-input keyboard + tablet (EPIC 9); handles stay on the host side
+    // and are fed from the window's input capture.
+    let keyboard = virtio_input::InputDevice::keyboard();
+    let tablet = virtio_input::InputDevice::absolute_pointer();
+    let keyboard_sink = keyboard.handle();
+    let tablet_sink = tablet.handle();
+    devices.push(Box::new(keyboard));
+    devices.push(Box::new(tablet));
+
     // Guest memory is shared with the devices; cloning a `GuestMemoryMmap`
     // shares the underlying regions rather than copying them.
     let mem = Arc::new(vm.memory().clone());
@@ -127,10 +176,70 @@ pub fn run(cfg: VmConfig) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     tracing::info!(state = ?state, "VM running");
 
-    let outcomes = threads.join_or_stop(
-        || SHUTDOWN_REQUESTED.load(Ordering::Relaxed),
-        Duration::from_millis(50),
-    );
+    let outcomes = match presentation {
+        Presentation::Headless(_) => threads.join_or_stop(
+            || SHUTDOWN_REQUESTED.load(Ordering::Relaxed),
+            Duration::from_millis(50),
+        ),
+        Presentation::Windowed(host) => {
+            // The winit event loop must own the main thread; VM supervision
+            // and the input pump move to worker threads. Ctrl+Alt+Q and the
+            // window close button request shutdown like SIGINT does.
+            let input_queue = host.input_queue();
+            let control_queue = host.control_queue();
+            let pump = std::thread::spawn(move || {
+                while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    for batch in input_queue.drain_batches() {
+                        let split = virtio_input::split_batch(&batch);
+                        if let Err(e) = keyboard_sink.push(&split.keyboard) {
+                            tracing::warn!(error = %e, "keyboard event delivery failed");
+                        }
+                        if let Err(e) = tablet_sink.push(&split.pointer) {
+                            tracing::warn!(error = %e, "pointer event delivery failed");
+                        }
+                    }
+                    for event in control_queue.drain() {
+                        match event {
+                            display::ControlEvent::QuitRequested
+                            | display::ControlEvent::WindowCloseRequested => {
+                                tracing::info!(?event, "shutdown requested from the window");
+                                SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+                            }
+                            display::ControlEvent::GrabToggled(grabbed) => {
+                                tracing::info!(grabbed, "input grab toggled");
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(4));
+                }
+            });
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            let supervisor_handle = display_handle.clone();
+            let supervisor = std::thread::spawn(move || {
+                let outcomes = threads.join_or_stop(
+                    || SHUTDOWN_REQUESTED.load(Ordering::Relaxed),
+                    Duration::from_millis(50),
+                );
+                // The guest ended (or was stopped): close the window so the
+                // event loop below returns.
+                SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+                supervisor_handle.shutdown();
+                let _ = tx.send(outcomes);
+            });
+
+            if let Err(e) = host.run() {
+                tracing::error!(error = %e, "display event loop failed");
+                SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+            }
+            let outcomes = rx
+                .recv()
+                .map_err(|_| "vCPU supervisor thread disappeared".to_string())?;
+            let _ = supervisor.join();
+            let _ = pump.join();
+            outcomes
+        }
+    };
     state = state
         .transition(VmState::Stopping)
         .map_err(|e| e.to_string())?;

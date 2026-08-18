@@ -39,6 +39,16 @@ pub const QUEUE_DRIVER_HIGH: u64 = 0x094;
 pub const QUEUE_DEVICE_LOW: u64 = 0x0a0;
 pub const QUEUE_DEVICE_HIGH: u64 = 0x0a4;
 
+// Shared-memory region registers (spec 4.2.2). VMHost exposes no shared
+// memory regions; per spec, reads of SHM_LEN for a non-existent region must
+// return all-ones (a zero would look like a real zero-length region at
+// address 0 — Linux virtio_gpu then tries to reserve it and fails its probe).
+pub const SHM_SEL: u64 = 0x0ac;
+pub const SHM_LEN_LOW: u64 = 0x0b0;
+pub const SHM_LEN_HIGH: u64 = 0x0b4;
+pub const SHM_BASE_LOW: u64 = 0x0b8;
+pub const SHM_BASE_HIGH: u64 = 0x0bc;
+
 /// Start of the device-specific configuration space.
 pub const CONFIG_SPACE: u64 = 0x100;
 

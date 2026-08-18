@@ -26,6 +26,9 @@ linux-boot.workspace = true
 virtio-core.workspace = true
 virtio-block.workspace = true
 virtio-net.workspace = true
+virtio-gpu.workspace = true
+virtio-input.workspace = true
+display.workspace = true
 libc.workspace = true
 
 [lints]

@@ -28,7 +28,13 @@ enum Command {
     /// Boot the installer against a target disk.
     Install(InstallArgs),
     /// Run a VM from a TOML configuration file.
-    Run { config: PathBuf },
+    Run {
+        config: PathBuf,
+        /// Do not open a window; the VM still runs with an off-screen
+        /// scanout (serial console remains on stdout).
+        #[arg(long)]
+        headless: bool,
+    },
     /// Check host prerequisites (KVM, capabilities, graphics backend).
     Doctor,
 }
@@ -105,16 +111,17 @@ fn run(cli: Cli) -> Result<(), String> {
             args.distro,
             args.disk.display()
         )),
-        Command::Run { config } => {
+        Command::Run { config, headless } => {
             let text = std::fs::read_to_string(&config)
                 .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
             let cfg = control_api::VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
             #[cfg(target_os = "linux")]
             {
-                run_vm::run(cfg)
+                run_vm::run(cfg, headless)
             }
             #[cfg(not(target_os = "linux"))]
             {
+                let _ = headless;
                 Err(format!(
                     "config '{}' is valid, but running VMs requires a Linux host with KVM \
                      (on Windows use WSL2)",

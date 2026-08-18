@@ -215,6 +215,11 @@ impl MmioTransport {
             mmio::INTERRUPT_STATUS => self.interrupt.status(),
             mmio::STATUS => self.status,
             mmio::CONFIG_GENERATION => self.interrupt.generation(),
+            // No shared-memory regions: length reads all-ones per spec so
+            // drivers recognize "no such region" (base likewise).
+            mmio::SHM_LEN_LOW | mmio::SHM_LEN_HIGH | mmio::SHM_BASE_LOW | mmio::SHM_BASE_HIGH => {
+                u32::MAX
+            }
             _ => {
                 tracing::debug!(
                     slot = self.slot,
