@@ -58,12 +58,98 @@ unit tests live with their crates.
 - Sources: `guest/test-rootfs/init-rs` (static musl init), built by
   `scripts/build-test-initramfs.sh`; kernel via `scripts/fetch-test-kernel.sh`.
 
+## Endurance: the 100-boot test (MVP-1403)
+
+`tests/boot` is a workspace member holding a shared headless boot harness
+(`boot_tests::boot_once`: kernel + initramfs, optional virtio-blk disk, chosen
+queue-notify mode, serial capture, time to the ready marker) plus two
+`#[ignore]`d tests built on it.
+
+```bash
+# 100 sequential boots; ~4 s each, so ~7 minutes.
+cargo test -p boot-tests --test repeat_boot -- --ignored --nocapture
+```
+
+It asserts that the host process does not grow — file-descriptor count and
+thread count *identical* to the settled baseline (taken after five warm-up
+boots), RSS within 32 MiB — and that every boot reaches `VMHOST_GUEST_READY`.
+The leak assertions run first, so a run with stalls still reports them.
+
+**Current result (100 boots, no virtio devices): 73/100 reached the marker; fds
+and threads exactly flat, RSS 4080 → 4124 KiB.** So nothing leaks, but the
+100/100 acceptance criterion is not met: about a quarter of boots stall at
+exactly `Run /init as init process` — the first userspace write to the
+interrupt-driven 8250 tty (`printk` before it uses the polled path) — waiting for
+a transmitter-empty interrupt on IRQ 4 that never arrives. With a disk attached
+the same defect stalls the first disk read with `INTERRUPT_STATUS` still reading
+`INT_VRING`. Root cause: no MP table or MADT, so Linux uses virtual-wire ExtINT
+through the 8259 instead of the IOAPIC. See the `IrqFdLine` docs in
+`machine_x86::virtio`. Do not "fix" this by loosening the test.
+
+Knobs:
+
+- `ENTANGLED_BOOT_ITERATIONS=<n>` — shorten the run while iterating.
+- `ENTANGLED_BOOT_DEADLINE_SECS=<n>` — per-boot deadline (default 30; a healthy
+  boot takes ~4 s, so 20 keeps a stall-heavy run quick).
+- `ENTANGLED_BOOT_DISK=1` — attach a scratch virtio-blk disk.
+- `ENTANGLED_SCRATCH_DIR=<dir>` — where scratch images go. On the Windows
+  development host this **must** be a native Linux path (`$HOME/…`): the drvfs
+  mount holding the repository cannot create sparse files.
+- `ENTANGLED_QUEUE_NOTIFY=sync` — run everything on the pre-MVP-307
+  synchronous notify path.
+
+The queue-notify measurement uses the same harness:
+
+```bash
+cargo test -p boot-tests --test notify_bench -- --ignored --nocapture
+```
+
 ## Fuzzing (MVP-1402)
 
-- `cargo fuzz` targets under `fuzz/fuzz_targets/`, starting with the
-  descriptor-chain parser and `debian-media::parse_sums`. Fuzz targets build
-  the corpus from the malicious-guest unit tests. Not part of default CI —
-  scheduled job with a time box.
+`cargo-fuzz` targets live under `fuzz/`, which is its own workspace and is listed
+in the root manifest's `exclude`: libfuzzer needs nightly and `-Zsanitizer`, so
+`cargo test --workspace` must never try to build it.
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz
+
+# Build all four targets.
+cargo +nightly fuzz build --target-dir "$HOME/entangled-fuzz-target"
+
+# Run one, time-boxed (the whole suite: chain_walk, mmio_transport,
+# debian_sums, blk_request).
+cargo +nightly fuzz run chain_walk --target-dir "$HOME/entangled-fuzz-target"     -- -max_total_time=240 -rss_limit_mb=4096
+
+# Reproduce and minimise a finding.
+cargo +nightly fuzz run  blk_request fuzz/artifacts/blk_request/crash-<hash>
+cargo +nightly fuzz tmin blk_request fuzz/artifacts/blk_request/crash-<hash>
+```
+
+`--target-dir` outside the repository matters on the Windows host: D: is nearly
+full and the fuzz build is large.
+
+| Target | Covers |
+|---|---|
+| `chain_walk` | `virtio_core::chain::walk` / `split_rw` over a guest-programmed ring in a small `GuestMemoryMmap` |
+| `mmio_transport` | arbitrary register read/write storms of any width against a mock device, with status/interrupt invariants checked after every operation |
+| `debian_sums` | `parse_sums`, `Release::parse` and the ISO-name/version helpers |
+| `blk_request` | virtio-blk header parsing, `validate_range`, `sector_offset`, `total_len` |
+
+Rules that keep the targets useful:
+
+- Seed corpora under `fuzz/corpus/<target>/` come from the malicious-guest unit
+  tests (looped chains, `next` past the ring, indirect descriptors, oversized
+  lengths, truncated digests, the register bring-up sequence) and are committed;
+  libFuzzer's own additions are gitignored.
+- Every crash that gets fixed leaves a named regression seed in the corpus
+  **and** a unit test in the crate that owns the code — the fuzz target is not
+  the regression test.
+- Assert invariants, not just absence of panics: an accepted value must satisfy
+  what the caller downstream relies on (the payload cap, the sector range, the
+  status-bit set). Both findings so far came from such an assertion, not from a
+  crash.
+- Not part of default CI: a scheduled, time-boxed job.
 
 ## Invariants every test run enforces
 

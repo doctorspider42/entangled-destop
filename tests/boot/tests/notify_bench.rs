@@ -15,6 +15,21 @@
 //! On the Windows development host the scratch image must live on a native
 //! Linux filesystem (`ENTANGLED_SCRATCH_DIR`, default `/tmp/entangled-bench`):
 //! the drvfs mount holding the repository cannot create sparse files.
+//!
+//! # Measured (WSL2 on Hyper-V, 1 vCPU, 256 MiB, 64 MiB raw disk on ext4)
+//!
+//! ```text
+//!                              boot to marker     48 MiB sequential read
+//! synchronous (vCPU inline)     3951 / 4292 ms    238601 / 209157 KiB/s
+//! ioeventfd + worker thread     3964 / 4791 ms    290840 / 242128 KiB/s
+//! ```
+//!
+//! Two runs, medians of five boots each. Boot time is unchanged: a boot spends
+//! its time in kernel init and issues only a handful of kicks, and the spread
+//! between the two runs (3.9 s vs 4.3 s for the *same* mode) is larger than the
+//! difference between the modes. Guest I/O throughput is where the offload pays
+//! off: **+22% and +16%** on the two runs, from not stalling the vCPU for the
+//! duration of every disk request.
 
 #![cfg(target_os = "linux")]
 

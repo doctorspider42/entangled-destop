@@ -41,6 +41,7 @@
 //! down.
 
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -152,9 +153,11 @@ pub struct DeviceNotifier {
     vm: Arc<VmFd>,
     events: Vec<QueueEvent>,
     kill: EventFd,
-    /// `None` once the worker has been joined, which makes `shutdown`
-    /// idempotent (it is called explicitly and again from `Drop`).
+    /// `None` before the worker starts and again once it has been joined.
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Set by the first [`Self::shutdown`], which makes it idempotent: it is
+    /// called explicitly on VM stop and again from `Drop`.
+    torn_down: AtomicBool,
 }
 
 impl DeviceNotifier {
@@ -185,19 +188,46 @@ impl DeviceNotifier {
             t.num_queues().min(MAX_OFFLOADED_QUEUES)
         };
 
-        let mut events = Vec::with_capacity(queue_count);
+        // Built empty first so that *every* early return from here on drops a
+        // `DeviceNotifier` that owns whatever was registered so far, and its
+        // `Drop` deassigns it. Registering an ioeventfd and then bailing out
+        // without deassigning would leave KVM swallowing that queue's kicks for
+        // the lifetime of the VM fd, which wedges the device silently.
+        let kill = EventFd::new(EFD_NONBLOCK).map_err(|source| NotifyError::EventFd {
+            slot,
+            queue: u16::MAX,
+            source,
+        })?;
+        let mut notifier = Self {
+            slot,
+            vm,
+            events: Vec::with_capacity(queue_count),
+            kill,
+            worker: Mutex::new(None),
+            torn_down: AtomicBool::new(false),
+        };
+
         for index in 0..queue_count {
             // `queue_count` is capped at MAX_OFFLOADED_QUEUES, so this fits.
             let queue = u16::try_from(index).unwrap_or(u16::MAX);
-            let event = EventFd::new(EFD_NONBLOCK).map_err(|source| NotifyError::EventFd {
-                slot,
-                queue,
-                source,
-            })?;
+            let event = match EventFd::new(EFD_NONBLOCK) {
+                Ok(event) => event,
+                Err(source) => {
+                    notifier.restore_transport(transport);
+                    return Err(NotifyError::EventFd {
+                        slot,
+                        queue,
+                        source,
+                    });
+                }
+            };
             // Datamatch on the queue index makes KVM swallow exactly the kicks
             // for this queue: a write of any other value still exits to
             // userspace, where the transport drops it as an unknown queue.
-            if let Err(error) = vm.register_ioevent(&event, &addr, u32::from(queue)) {
+            if let Err(error) = notifier
+                .vm
+                .register_ioevent(&event, &addr, u32::from(queue))
+            {
                 tracing::warn!(
                     slot,
                     queue,
@@ -217,35 +247,29 @@ impl DeviceNotifier {
             if !accepted {
                 // Nothing would ever call the device for this queue, so the
                 // registration must go — a swallowed kick would wedge the ring.
-                let _ = vm.unregister_ioevent(&event, &addr, u32::from(queue));
+                let _ = notifier
+                    .vm
+                    .unregister_ioevent(&event, &addr, u32::from(queue));
                 continue;
             }
-            events.push(QueueEvent {
+            notifier.events.push(QueueEvent {
                 index: queue,
                 addr,
                 event,
             });
         }
 
-        if events.is_empty() {
+        if notifier.events.is_empty() {
             return Ok(None);
         }
 
-        let kill = EventFd::new(EFD_NONBLOCK).map_err(|source| NotifyError::EventFd {
-            slot,
-            queue: u16::MAX,
-            source,
-        })?;
-        let notifier = Self {
-            slot,
-            vm,
-            events,
-            kill,
-            worker: Mutex::new(None),
+        let handle = match notifier.spawn_worker(Arc::clone(transport)) {
+            Ok(handle) => handle,
+            Err(error) => {
+                notifier.restore_transport(transport);
+                return Err(error);
+            }
         };
-        // From here on failures must not leak the registrations: `notifier`
-        // owns them and its `Drop` deassigns them.
-        let handle = notifier.spawn_worker(Arc::clone(transport))?;
         if let Ok(mut slot_handle) = notifier.worker.lock() {
             *slot_handle = Some(handle);
         }
@@ -256,6 +280,17 @@ impl DeviceNotifier {
             "queue notify offloaded to ioeventfds"
         );
         Ok(Some(notifier))
+    }
+
+    /// Hands every queue this notifier claimed back to the transport's register
+    /// path. Used when setting the offload up fails half way: the queues must not
+    /// be left believing a worker will serve them.
+    fn restore_transport(&self, transport: &Arc<Mutex<MmioTransport>>) {
+        if let Ok(mut t) = transport.lock() {
+            for queue in &self.events {
+                t.restore_queue_notify(queue.index);
+            }
+        }
     }
 
     /// Queue indices this notifier serves.
@@ -323,10 +358,14 @@ impl DeviceNotifier {
             .map_err(|source| NotifyError::Spawn { slot, source })
     }
 
-    /// Stops the worker and deassigns every ioeventfd. Idempotent.
+    /// Stops the worker and deassigns every ioeventfd. Idempotent, and correct
+    /// even when no worker was ever started (a half-built notifier still owns
+    /// registrations that must go back).
     pub fn shutdown(&self) {
-        let handle = self.worker.lock().ok().and_then(|mut h| h.take());
-        if let Some(handle) = handle {
+        if self.torn_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(handle) = self.worker.lock().ok().and_then(|mut h| h.take()) {
             if let Err(error) = self.kill.write(1) {
                 tracing::error!(
                     slot = self.slot,
@@ -340,25 +379,25 @@ impl DeviceNotifier {
                 // unwind through the VM teardown path.
                 tracing::error!(slot = self.slot, "queue worker thread panicked");
             }
-            for queue in &self.events {
-                if let Err(error) =
-                    self.vm
-                        .unregister_ioevent(&queue.event, &queue.addr, u32::from(queue.index))
-                {
-                    tracing::warn!(
-                        slot = self.slot,
-                        queue = queue.index,
-                        %error,
-                        "failed to deassign the queue-notify ioeventfd"
-                    );
-                }
-            }
-            tracing::debug!(
-                slot = self.slot,
-                queues = self.events.len(),
-                "queue worker stopped and ioeventfds deassigned"
-            );
         }
+        for queue in &self.events {
+            if let Err(error) =
+                self.vm
+                    .unregister_ioevent(&queue.event, &queue.addr, u32::from(queue.index))
+            {
+                tracing::warn!(
+                    slot = self.slot,
+                    queue = queue.index,
+                    %error,
+                    "failed to deassign the queue-notify ioeventfd"
+                );
+            }
+        }
+        tracing::debug!(
+            slot = self.slot,
+            queues = self.events.len(),
+            "queue worker stopped and ioeventfds deassigned"
+        );
     }
 }
 

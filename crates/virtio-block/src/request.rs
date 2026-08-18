@@ -154,6 +154,18 @@ pub fn validate_range(capacity_sectors: u64, sector: u64, len: u64) -> Result<()
             capacity: capacity_sectors,
         });
     }
+    // The backend turns the accepted sector into a byte offset and reads
+    // `len` bytes from there, so both must be representable. A real
+    // `capacity_sectors` comes from a file size and can never be large enough
+    // for this to trigger — but the check belongs here rather than in the
+    // caller's head (MVP-1402 fuzz finding).
+    sector_offset(sector)?
+        .checked_add(len)
+        .ok_or(BlockError::OutOfRange {
+            sector,
+            len,
+            capacity: capacity_sectors,
+        })?;
     Ok(())
 }
 
@@ -294,5 +306,28 @@ mod tests {
             validate_range(8, 4, 8 * SECTOR_SIZE),
             Err(BlockError::OutOfRange { .. })
         ));
+    }
+
+    /// Second MVP-1402 fuzz finding of the same shape: a sector whose *byte*
+    /// offset overflows used to pass `validate_range` whenever the caller also
+    /// claimed a capacity large enough to contain it, leaving `sector_offset` to
+    /// fail afterwards. No real image can be that big, but the helper must not
+    /// depend on its caller for that.
+    #[test]
+    fn validate_range_rejects_sectors_whose_byte_offset_overflows() {
+        let absurd = u64::MAX / 8;
+        assert!(matches!(
+            validate_range(u64::MAX, absurd, 0),
+            Err(BlockError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            validate_range(u64::MAX, u64::MAX, SECTOR_SIZE),
+            Err(BlockError::OutOfRange { .. })
+        ));
+        // The largest sector whose offset still fits is accepted, and its offset
+        // is exactly what the backend will use.
+        let last = u64::MAX / SECTOR_SIZE;
+        assert!(validate_range(u64::MAX, last, 0).is_ok());
+        assert!(sector_offset(last).is_ok());
     }
 }
