@@ -47,6 +47,22 @@ rewrite**, and pins down the rules that keep it that way.
    - No dependency that is Linux-only *by license or design* may become
      load-bearing above `vmm-core`.
 
+## Amendment (2026-08-19): first native Windows build findings
+
+Measured with the x86_64-pc-windows-gnu toolchain on the dev machine:
+
+- `control-api` and `debian-media` compile natively today, unchanged.
+- Everything touching guest memory fails on one dependency: **`vm-memory`'s
+  mmap backend is unix-only** in current releases (0.17/0.18). The vm-memory
+  *traits* are portable; only the backing implementation is not. The WHP
+  port therefore includes a `GuestMemoryWindows` region type
+  (VirtualAlloc-backed, implementing `GuestMemory`/`GuestMemoryRegion`) plus
+  a small alias switch in vmm-core (`GuestMem` becomes per-OS).
+- `display` is blocked only transitively (it imports two format constants
+  from virtio-gpu); if needed it can be decoupled in minutes.
+- The register seam from WHP-1701 (`vmm_core::hv`) is in place: machine
+  setup code no longer touches kvm_bindings.
+
 ## Consequences
 
 - The MVP pays a small ongoing tax (trait indirection for interrupts, target
