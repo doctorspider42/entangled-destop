@@ -271,7 +271,7 @@ fn key_batch(code: u16, value: u32) -> Vec<InputEvent> {
 #[test]
 fn keyboard_config_space_probes_as_a_keyboard() {
     let mut h = Harness::keyboard();
-    assert_eq!(h.probe(VIRTIO_INPUT_CFG_ID_NAME, 0), b"VMHost Keyboard");
+    assert_eq!(h.probe(VIRTIO_INPUT_CFG_ID_NAME, 0), b"Entangled Keyboard");
     assert_eq!(
         h.probe(VIRTIO_INPUT_CFG_ID_DEVIDS, 0),
         vec![0x06, 0x00, 0x4d, 0x56, 0x01, 0x00, 0x01, 0x00]
@@ -315,7 +315,7 @@ fn keyboard_config_space_probes_as_a_keyboard() {
 #[test]
 fn tablet_config_space_probes_as_an_absolute_pointer() {
     let mut h = Harness::tablet();
-    assert_eq!(h.probe(VIRTIO_INPUT_CFG_ID_NAME, 0), b"VMHost Tablet");
+    assert_eq!(h.probe(VIRTIO_INPUT_CFG_ID_NAME, 0), b"Entangled Tablet");
     assert_eq!(
         h.probe(VIRTIO_INPUT_CFG_ID_DEVIDS, 0),
         vec![0x06, 0x00, 0x4d, 0x56, 0x02, 0x00, 0x01, 0x00]
@@ -900,7 +900,7 @@ fn a_notify_for_a_queue_the_device_does_not_have_is_ignored() {
 fn config_space_writes_cannot_forge_a_payload() {
     let mut h = Harness::keyboard();
     // Select the name, then try to overwrite size and payload.
-    assert_eq!(h.probe(VIRTIO_INPUT_CFG_ID_NAME, 0), b"VMHost Keyboard");
+    assert_eq!(h.probe(VIRTIO_INPUT_CFG_ID_NAME, 0), b"Entangled Keyboard");
     h.transport
         .write(mmio::CONFIG_SPACE + config::SIZE, &[0x7f]);
     h.transport
@@ -911,11 +911,11 @@ fn config_space_writes_cannot_forge_a_payload() {
     let mut size = [0u8; 1];
     h.transport
         .read(mmio::CONFIG_SPACE + config::SIZE, &mut size);
-    assert_eq!(size[0], 15);
-    let mut payload = [0u8; 15];
+    assert_eq!(size[0], 18);
+    let mut payload = [0u8; 18];
     h.transport
         .read(mmio::CONFIG_SPACE + config::PAYLOAD, &mut payload);
-    assert_eq!(&payload, b"VMHost Keyboard");
+    assert_eq!(&payload, b"Entangled Keyboard");
 
     // Reads far past the config space are zeroes, not a panic.
     let mut far = [0xffu8; 8];

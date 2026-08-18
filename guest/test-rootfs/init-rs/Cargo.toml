@@ -3,7 +3,7 @@
 # x86_64-unknown-linux-musl by scripts/build-test-initramfs.sh.
 
 [package]
-name = "vmhost-test-init"
+name = "entangled-test-init"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"

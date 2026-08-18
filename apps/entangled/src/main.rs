@@ -1,4 +1,4 @@
-//! `vmhost` — the CLI control surface for the VMHost VMM.
+//! `entangled` — the CLI control surface for the Entangled Desktop VMM.
 
 mod disk;
 mod doctor;
@@ -12,7 +12,11 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "vmhost", version, about = "A small VMM for Linux x86-64 hosts")]
+#[command(
+    name = "entangled",
+    version,
+    about = "Entangled Desktop — a small VMM for Linux x86-64 hosts"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

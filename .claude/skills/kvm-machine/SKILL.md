@@ -1,6 +1,6 @@
 ---
 name: kvm-machine
-description: Implementing the KVM machine layer of VMHost — VM/vCPU creation, memory registration, register/CPUID setup, the KVM_RUN loop and VM exits (backlog EPIC 1, crates vmm-core and machine-x86). Load before any work touching kvm-ioctls/kvm-bindings.
+description: Implementing the KVM machine layer of Entangled Desktop — VM/vCPU creation, memory registration, register/CPUID setup, the KVM_RUN loop and VM exits (backlog EPIC 1, crates vmm-core and machine-x86). Load before any work touching kvm-ioctls/kvm-bindings.
 ---
 
 # KVM machine layer

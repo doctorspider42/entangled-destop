@@ -58,7 +58,7 @@ use crate::MacAddr;
 /// `VIRTIO_NET_F_MAC`: the config space carries a valid MAC address.
 pub const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 
-/// The complete feature set VMHost's virtio-net offers.
+/// The complete feature set Entangled Desktop's virtio-net offers.
 ///
 /// Deliberately minimal (MVP-502): no checksum or segmentation offloads, no
 /// mergeable RX buffers, no control queue, no multiqueue, no announced status
@@ -77,7 +77,7 @@ pub const NUM_QUEUES: usize = 2;
 static QUEUE_MAX_SIZES: [u16; NUM_QUEUES] = [MAX_QUEUE_SIZE, MAX_QUEUE_SIZE];
 
 /// Guest-visible config space: just the 6-byte MAC. `status`, `max_virtqueue_
-/// pairs` and `mtu` all belong to features VMHost does not offer, so a
+/// pairs` and `mtu` all belong to features Entangled Desktop does not offer, so a
 /// conforming driver never reads past byte 5.
 const CONFIG_LEN: usize = 6;
 
@@ -94,7 +94,7 @@ const RX_POLL_TICK: Duration = Duration::from_millis(100);
 /// flag. Bounds shutdown latency under a flood of incoming traffic.
 const RX_FRAMES_PER_WAKE: usize = 64;
 
-/// Counters for `vmhost doctor`, logs and tests. Every drop reason is separate:
+/// Counters for `entangled doctor`, logs and tests. Every drop reason is separate:
 /// "the guest posted no RX buffers" and "the guest's RX buffer was too small"
 /// are very different bugs.
 #[derive(Debug, Default)]
@@ -226,7 +226,7 @@ impl NetDevice {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use virtio_net::TapBackend;
     ///
-    /// let device = NetDevice::new(TapBackend::open("vmhost0")?, MacAddr::derive("debian-demo"));
+    /// let device = NetDevice::new(TapBackend::open("entangled0")?, MacAddr::derive("debian-demo"));
     /// # Ok(()) }
     /// # #[cfg(not(target_os = "linux"))] fn main() {}
     /// ```
@@ -254,7 +254,7 @@ impl NetDevice {
         self.mac
     }
 
-    /// Label of the host backend, e.g. `tap:vmhost0`.
+    /// Label of the host backend, e.g. `tap:entangled0`.
     pub fn backend_name(&self) -> &str {
         self.backend.name()
     }
@@ -794,7 +794,7 @@ impl VirtioDevice for NetDevice {
             stop: Arc::clone(&stop),
         };
         let thread = std::thread::Builder::new()
-            .name("vmhost-net-rx".to_owned())
+            .name("entangled-net-rx".to_owned())
             .spawn(move || rx_loop(context))
             .map_err(|error| {
                 DeviceError::Backend(format!("cannot spawn the virtio-net RX worker: {error}"))
@@ -888,7 +888,7 @@ mod tests {
         let device = device();
         assert_eq!(device.device_features(), FEATURES);
         assert_eq!(device.device_features(), VIRTIO_F_VERSION_1 | (1 << 5));
-        // Every feature VMHost must NOT offer in the MVP.
+        // Every feature Entangled Desktop must NOT offer in the MVP.
         for (bit, name) in [
             (0u64, "CSUM"),
             (1, "GUEST_CSUM"),

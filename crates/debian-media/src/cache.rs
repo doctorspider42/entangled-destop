@@ -1,7 +1,7 @@
 //! Media cache layout (MVP-609).
 //!
 //! ```text
-//! $XDG_CACHE_HOME/vmhost/media/<version>/<arch>-<variant>/<file>
+//! $XDG_CACHE_HOME/entangled/media/<version>/<arch>-<variant>/<file>
 //!                                       /<file>.manifest.toml
 //! ```
 //!
@@ -29,21 +29,21 @@ pub const MANIFEST_SUFFIX: &str = ".manifest.toml";
 /// Suffix of an in-progress download.
 pub const PARTIAL_SUFFIX: &str = ".part";
 
-/// Root of the media cache: `<cache>/vmhost/media`.
+/// Root of the media cache: `<cache>/entangled/media`.
 #[derive(Debug, Clone)]
 pub struct MediaCache {
     root: PathBuf,
 }
 
 impl MediaCache {
-    /// Resolves `$XDG_CACHE_HOME/vmhost/media`, falling back to
-    /// `$HOME/.cache/vmhost/media`.
+    /// Resolves `$XDG_CACHE_HOME/entangled/media`, falling back to
+    /// `$HOME/.cache/entangled/media`.
     ///
     /// On Windows (where this crate still has to build and be testable) the
     /// fallback uses `%LOCALAPPDATA%`, then `%USERPROFILE%\.cache`.
     pub fn discover() -> Result<Self, MediaError> {
         let base = cache_base().ok_or(MediaError::NoCacheDir)?;
-        Ok(Self::with_root(base.join("vmhost").join("media")))
+        Ok(Self::with_root(base.join("entangled").join("media")))
     }
 
     /// An explicit root — used by tests and by a future `--cache-dir` flag.
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn layout_separates_variants_within_a_version() {
-        let cache = MediaCache::with_root("/cache/vmhost/media");
+        let cache = MediaCache::with_root("/cache/entangled/media");
         let text = cache.artifact_path("13.6", Arch::Amd64, InstallerVariant::TextNetboot, "linux");
         let gtk = cache.artifact_path("13.6", Arch::Amd64, InstallerVariant::GtkNetboot, "linux");
         assert_ne!(text, gtk);
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn purge_is_idempotent_on_missing_files() {
-        let dir = std::env::temp_dir().join(format!("vmhost-purge-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("entangled-purge-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let artifact = dir.join("linux");
         purge(&artifact); // nothing there yet

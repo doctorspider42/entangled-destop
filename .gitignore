@@ -8,4 +8,4 @@
 .idea/
 guest/test-rootfs/init-rs/target/
 guest/bootstrap-initramfs/init-rs/target/
-vmhost-screenshot-*.png
+entangled-screenshot-*.png

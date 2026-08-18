@@ -13,7 +13,7 @@ members = [
     "crates/display",
     "crates/debian-media",
     "crates/control-api",
-    "apps/vmhost-cli",
+    "apps/entangled",
 ]
 
 [workspace.package]
@@ -21,7 +21,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://example.invalid/vmhost"
+repository = "https://example.invalid/entangled"
 # Internal crates are never published; this also tells `cargo deny` that the
 # version-less `{ path = … }` dependencies between them are intentional
 # (`bans.allow-wildcard-paths` only applies to unpublished crates).

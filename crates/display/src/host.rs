@@ -55,7 +55,7 @@ impl DisplayHost {
             Arc::new(Mutex::new(Scanout::new(config.width, config.height)?));
         Ok(Self {
             config,
-            title: "VMHost".to_owned(),
+            title: "Entangled Desktop".to_owned(),
             scanout,
             events: InputQueue::new(),
             control: ControlQueue::new(),
@@ -64,7 +64,7 @@ impl DisplayHost {
         })
     }
 
-    /// Overrides the window title (usually `vmhost: <vm id>`).
+    /// Overrides the window title (usually `entangled: <vm id>`).
     #[must_use]
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();

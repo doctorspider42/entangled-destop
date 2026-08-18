@@ -39,10 +39,10 @@ pub use queue::{QueueConfig, QueueError};
 pub use transport::{MmioTransport, TransportError};
 
 /// VirtIO feature bit: the device conforms to the modern (v1.0+) spec.
-/// Mandatory for every VMHost device — we do not implement legacy mode.
+/// Mandatory for every Entangled Desktop device — we do not implement legacy mode.
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
-/// Maximum queue size any VMHost device advertises. Bounded so a guest
+/// Maximum queue size any Entangled Desktop device advertises. Bounded so a guest
 /// cannot make the host allocate unbounded ring bookkeeping.
 pub const MAX_QUEUE_SIZE: u16 = 256;
 

@@ -1,6 +1,6 @@
 # Boots the test artifacts to the serial console on stdout:
 #   scripts/fetch-test-kernel.sh && scripts/build-test-initramfs.sh
-#   cargo run -p vmhost-cli -- run examples/boot-test.toml
+#   cargo run -p entangled -- run examples/boot-test.toml
 name = "boot-test"
 memory_mib = 256
 vcpus = 1

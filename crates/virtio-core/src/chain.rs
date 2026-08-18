@@ -1,7 +1,7 @@
 //! Virtqueue descriptor-chain safety (backlog MVP-304/308/309).
 //!
 //! The wire format comes from the `virtio-queue` crate (`RawDescriptor` /
-//! `desc::split::Descriptor`); this module owns the VMHost policy on top of
+//! `desc::split::Descriptor`); this module owns the Entangled Desktop policy on top of
 //! it:
 //!
 //! * every chain walk is bounded ([`MAX_DESC_CHAIN_LEN`]) so a malicious guest
@@ -10,7 +10,7 @@
 //! * every descriptor-table read goes through `vm-memory`'s checked API, so a
 //!   descriptor table pointing outside guest RAM fails the request instead of
 //!   dereferencing a bad host address,
-//! * indirect descriptors are rejected outright — VMHost does not offer
+//! * indirect descriptors are rejected outright — Entangled Desktop does not offer
 //!   `VIRTIO_F_INDIRECT_DESC`, so a chain using them is a protocol violation.
 
 use thiserror::Error;

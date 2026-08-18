@@ -177,7 +177,7 @@ impl Keyring {
     }
 
     /// Lower-case hex fingerprints of every certificate in this keyring,
-    /// primary keys only. Exposed for `vmhost doctor`-style reporting and for
+    /// primary keys only. Exposed for `entangled doctor`-style reporting and for
     /// the pinning test.
     pub fn fingerprints(&self) -> Result<Vec<String>, MediaError> {
         Ok(self

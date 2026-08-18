@@ -3,18 +3,18 @@
 //!
 //! Everything here is portable and side-effect free: it is the layer the bulk
 //! of the unit tests live in, and the layer that decides whether a
-//! guest-supplied buffer is a frame VMHost is willing to hand to the host
+//! guest-supplied buffer is a frame Entangled Desktop is willing to hand to the host
 //! network stack.
 //!
 //! # Header size
 //!
 //! `struct virtio_net_hdr` is 10 bytes; `struct virtio_net_hdr_mrg_rxbuf`
-//! appends a `num_buffers` field for a total of 12. VMHost does **not** offer
+//! appends a `num_buffers` field for a total of 12. Entangled Desktop does **not** offer
 //! `VIRTIO_NET_F_MRG_RXBUF`, but the header is still 12 bytes long, because
 //! under `VIRTIO_F_VERSION_1` the driver uses the larger layout regardless —
 //! Linux' `virtio_net.c` picks `sizeof(struct virtio_net_hdr_mrg_rxbuf)` when
 //! *either* `MRG_RXBUF` or `VERSION_1` is negotiated. The trailing
-//! `num_buffers` field is simply unused; VMHost writes it as zero on RX and
+//! `num_buffers` field is simply unused; Entangled Desktop writes it as zero on RX and
 //! ignores it on TX.
 //!
 //! # Frame cap
@@ -33,18 +33,18 @@ pub const VIRTIO_NET_HDR_LEN: usize = 12;
 /// Length of an Ethernet II header (destination, source, ethertype).
 pub const ETH_HEADER_LEN: usize = 14;
 
-/// Guest MTU VMHost assumes. Not advertised (`VIRTIO_NET_F_MTU` is not
+/// Guest MTU Entangled Desktop assumes. Not advertised (`VIRTIO_NET_F_MTU` is not
 /// offered), so this is purely the host-side cap.
 pub const MTU: usize = 1500;
 
-/// Largest frame VMHost moves in either direction.
+/// Largest frame Entangled Desktop moves in either direction.
 pub const MAX_FRAME_LEN: usize = ETH_HEADER_LEN + MTU;
 
 /// Largest header+frame buffer, i.e. the cap on one descriptor chain's payload.
 pub const MAX_BUFFER_LEN: usize = VIRTIO_NET_HDR_LEN + MAX_FRAME_LEN;
 
 /// `VIRTIO_NET_HDR_GSO_NONE`: no segmentation offload requested. The only
-/// value VMHost accepts, since no GSO feature is negotiated.
+/// value Entangled Desktop accepts, since no GSO feature is negotiated.
 pub const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
 
 /// Reasons a guest-supplied TX chain is not a frame we can transmit.
@@ -84,7 +84,7 @@ pub struct NetHeader {
     pub gso_size: u16,
     pub csum_start: u16,
     pub csum_offset: u16,
-    /// Only meaningful with `VIRTIO_NET_F_MRG_RXBUF`, which VMHost does not
+    /// Only meaningful with `VIRTIO_NET_F_MRG_RXBUF`, which Entangled Desktop does not
     /// offer. Always written as 0 on RX, ignored on TX.
     pub num_buffers: u16,
 }
@@ -124,7 +124,7 @@ impl NetHeader {
         self.flags != 0 || self.gso_type != VIRTIO_NET_HDR_GSO_NONE
     }
 
-    /// The header VMHost prepends to every received frame: all zeroes, so
+    /// The header Entangled Desktop prepends to every received frame: all zeroes, so
     /// no offload flag is claimed and `num_buffers` is 0.
     pub const fn rx() -> [u8; VIRTIO_NET_HDR_LEN] {
         [0u8; VIRTIO_NET_HDR_LEN]

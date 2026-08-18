@@ -1,6 +1,6 @@
 ---
 name: virtio-device
-description: Implementing virtio devices and the virtio-mmio transport for VMHost — virtqueues, feature negotiation, irqfd/ioeventfd, and the untrusted-guest safety rules (backlog EPICs 3, 4, 5, 8, 9; crates virtio-core, virtio-block, virtio-net, virtio-gpu, virtio-input). Load before any virtio work.
+description: Implementing virtio devices and the virtio-mmio transport for Entangled Desktop — virtqueues, feature negotiation, irqfd/ioeventfd, and the untrusted-guest safety rules (backlog EPICs 3, 4, 5, 8, 9; crates virtio-core, virtio-block, virtio-net, virtio-gpu, virtio-input). Load before any virtio work.
 ---
 
 # VirtIO devices
@@ -16,7 +16,7 @@ shared safety live in `crates/virtio-core`; one crate per device.
 - Modern interface only: `VIRTIO_F_VERSION_1` is mandatory, no legacy mode,
   mmio `VERSION = 2`. Register offsets are in `virtio_core::mmio` — use the
   constants, never magic numbers.
-- Ring parsing comes from the `virtio-queue` crate; VMHost policy on top of
+- Ring parsing comes from the `virtio-queue` crate; Entangled Desktop policy on top of
   it lives in `virtio_core::chain`.
 
 ## Untrusted-guest rules (non-negotiable, from CLAUDE.md)

@@ -76,7 +76,7 @@ impl Default for UreqTransport {
 impl UreqTransport {
     pub fn new() -> Self {
         let config = ureq::Agent::config_builder()
-            .user_agent(concat!("vmhost/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("entangled/", env!("CARGO_PKG_VERSION")))
             // Debian mirrors redirect (deb.debian.org → a CDN node); allow a
             // handful of hops but not an unbounded chain.
             .max_redirects(8)

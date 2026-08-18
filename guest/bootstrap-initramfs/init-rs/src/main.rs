@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 const ROOT_WAIT: Duration = Duration::from_secs(10);
 
 fn main() {
-    println!("vmhost-bootstrap: init starting");
+    println!("entangled-bootstrap: init starting");
     mount_pseudo();
 
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
@@ -30,15 +30,15 @@ fn main() {
     let writable = cmdline.split_ascii_whitespace().any(|w| w == "rw");
 
     let device = resolve_root(&root).unwrap_or_else(|| {
-        eprintln!("vmhost-bootstrap: cannot resolve root '{root}'");
+        eprintln!("entangled-bootstrap: cannot resolve root '{root}'");
         list_block_devices();
         die("root filesystem not found");
     });
 
-    println!("vmhost-bootstrap: mounting {device} as {fstype} (rw={writable})");
+    println!("entangled-bootstrap: mounting {device} as {fstype} (rw={writable})");
     let flags = if writable { 0 } else { libc::MS_RDONLY };
     if mount(&device, "/newroot", &fstype, flags).is_err() {
-        eprintln!("vmhost-bootstrap: mounting {device} failed: {}", errno());
+        eprintln!("entangled-bootstrap: mounting {device} failed: {}", errno());
         list_block_devices();
         die("cannot mount root filesystem");
     }
@@ -47,7 +47,7 @@ fn main() {
         die(&format!("{init} does not exist on {device}"));
     }
 
-    println!("vmhost-bootstrap: switching root to {device}, init {init}");
+    println!("entangled-bootstrap: switching root to {device}, init {init}");
     switch_root("/newroot", &init);
 }
 
@@ -129,7 +129,7 @@ fn read_ext4_uuid(dev: &str) -> Option<String> {
 }
 
 fn list_block_devices() {
-    eprintln!("vmhost-bootstrap: available block devices:");
+    eprintln!("entangled-bootstrap: available block devices:");
     if let Ok(entries) = std::fs::read_dir("/dev") {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -202,7 +202,7 @@ fn errno() -> i32 {
 /// fault the host reports as a clean shutdown (this machine has no ACPI
 /// power-off). MVP-1106: the error must be readable on the serial console.
 fn die(message: &str) -> ! {
-    eprintln!("vmhost-bootstrap: FATAL: {message}");
+    eprintln!("entangled-bootstrap: FATAL: {message}");
     // Drain the serial console before rebooting: the lean bootstrap kernel
     // triple-faults almost instantly, and interrupt-driven UART TX still in
     // flight would be lost (observed: diagnostics truncated at reboot).

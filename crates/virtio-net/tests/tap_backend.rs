@@ -7,7 +7,7 @@
 //! pair and moves one frame each way:
 //!
 //! ```text
-//!   host stack  ──AF_PACKET send──▶ vmhostnetN ──▶ /dev/net/tun fd
+//!   host stack  ──AF_PACKET send──▶ entanglednetN ──▶ /dev/net/tun fd
 //!                                                      │  RX worker
 //!                                                      ▼
 //!                                              RX virtqueue + interrupt
@@ -15,7 +15,7 @@
 //!   TX virtqueue ──notify──▶ device ──write──▶ /dev/net/tun fd
 //!                                                      │
 //!                                                      ▼
-//!   host stack  ◀──AF_PACKET recv── vmhostnetN ◀───────┘
+//!   host stack  ◀──AF_PACKET recv── entanglednetN ◀───────┘
 //! ```
 //!
 //! So it proves what no in-process fake can: the `TUNSETIFF` attach, the
@@ -456,7 +456,7 @@ fn tap_and_socket(ifname: &str) -> Option<(TapBackend, PacketSocket)> {
 
 #[test]
 fn frames_travel_both_ways_over_a_real_tap_interface() {
-    let ifname = "vmhostnet0";
+    let ifname = "entanglednet0";
     let Some((tap, socket)) = tap_and_socket(ifname) else {
         return;
     };
@@ -532,7 +532,7 @@ fn frames_travel_both_ways_over_a_real_tap_interface() {
 
 #[test]
 fn closing_the_vm_frees_the_tap_interface() {
-    let ifname = "vmhostnet1";
+    let ifname = "entanglednet1";
     let Some((tap, _socket)) = tap_and_socket(ifname) else {
         return;
     };

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Reproducible bootstrap-kernel build (backlog MVP-1101/1102).
 #
-# Builds a pinned Linux kernel with all VMHost virtio drivers built in and
+# Builds a pinned Linux kernel with all Entangled Desktop virtio drivers built in and
 # copies the bzImage to artifacts/bootstrap/vmlinuz. Run inside WSL/Linux:
 #   bash guest/bootstrap-kernel/build.sh
 #
-# The build tree lives in the native Linux filesystem (~/.cache/vmhost-kernel)
+# The build tree lives in the native Linux filesystem (~/.cache/entangled-kernel)
 # because compiling on /mnt/* (9p) is an order of magnitude slower.
 set -euo pipefail
 
@@ -13,8 +13,8 @@ KERNEL_VERSION="${KERNEL_VERSION:-6.12.9}"
 KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz"
 
 repo="$(cd "$(dirname "$0")/../.." && pwd)"
-fragment="$repo/guest/bootstrap-kernel/vmhost.config"
-workdir="${VMHOST_KERNEL_WORKDIR:-$HOME/.cache/vmhost-kernel}"
+fragment="$repo/guest/bootstrap-kernel/entangled.config"
+workdir="${ENTANGLED_KERNEL_WORKDIR:-$HOME/.cache/entangled-kernel}"
 src="$workdir/linux-$KERNEL_VERSION"
 
 mkdir -p "$workdir"
@@ -26,7 +26,7 @@ fi
 
 cd "$src"
 make -s defconfig kvm_guest.config
-# Apply the VMHost fragment and resolve dependencies.
+# Apply the Entangled Desktop fragment and resolve dependencies.
 while read -r line; do
     case "$line" in
         CONFIG_*=y) ./scripts/config --enable  "${line%%=*}" ;;

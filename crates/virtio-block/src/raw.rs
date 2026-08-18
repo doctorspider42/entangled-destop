@@ -145,7 +145,7 @@ mod tests {
     use super::*;
 
     fn temp_image(name: &str, sectors: u64) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("vmhost-blk-tests");
+        let dir = std::env::temp_dir().join("entangled-blk-tests");
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join(name);
         let _ = std::fs::remove_file(&path);
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn misaligned_and_empty_images_are_rejected() {
-        let dir = std::env::temp_dir().join("vmhost-blk-tests");
+        let dir = std::env::temp_dir().join("entangled-blk-tests");
         std::fs::create_dir_all(&dir).expect("temp dir");
 
         let odd = dir.join("odd.raw");

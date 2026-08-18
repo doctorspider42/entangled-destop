@@ -32,7 +32,7 @@ impl std::str::FromStr for Arch {
     }
 }
 
-/// Installer flavors supported by `vmhost fetch debian --variant …`.
+/// Installer flavors supported by `entangled fetch debian --variant …`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallerVariant {
     /// Text-mode netboot: rescue mode and the simplest integration tests.
@@ -142,7 +142,7 @@ impl TrustRoot {
 }
 
 /// A distribution source that can name its artifact URLs. Debian stable is
-/// the only implementation in the MVP; the trait keeps `vmhost fetch`
+/// the only implementation in the MVP; the trait keeps `entangled fetch`
 /// distro-agnostic for later.
 pub trait MediaSource {
     /// Base URL of the directory holding `kind` for `variant`.
@@ -161,7 +161,7 @@ pub trait MediaSource {
     /// (the netinst ISO).
     fn sums_path(&self, variant: InstallerVariant, kind: MediaKind) -> Option<String>;
 
-    /// The artifacts `vmhost fetch --variant <variant>` must produce, in order.
+    /// The artifacts `entangled fetch --variant <variant>` must produce, in order.
     fn artifacts(&self, variant: InstallerVariant) -> &'static [MediaKind];
 }
 

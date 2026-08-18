@@ -14,7 +14,7 @@
 //! - resizing keeps the 16:9 image centered with black letterbox bars, scaled
 //!   with linear filtering;
 //! - minimizing stops presenting and restoring resumes it without artifacts;
-//! - `S` writes `vmhost-screenshot-<frame>.png` next to the working directory;
+//! - `S` writes `entangled-screenshot-<frame>.png` next to the working directory;
 //! - `R` cycles the guest resolution (1920x1080 → 1280x720 → 800x600);
 //! - `Ctrl+Alt+G` toggles the pointer grab, `Ctrl+Alt+Q` quits — neither is
 //!   visible in the drained guest input stream;
@@ -46,7 +46,8 @@ fn main() -> Result<(), display::DisplayError> {
         )
         .init();
 
-    let host = DisplayHost::new(DisplayConfig::default())?.with_title("VMHost display demo");
+    let host =
+        DisplayHost::new(DisplayConfig::default())?.with_title("Entangled Desktop display demo");
     let handle = host.handle();
     let input = host.input_queue();
     let control = host.control_queue();
@@ -96,7 +97,7 @@ fn guest_thread(
                 match event.code {
                     KEY_S => {
                         screenshots += 1;
-                        let path = format!("vmhost-screenshot-{screenshots:03}.png");
+                        let path = format!("entangled-screenshot-{screenshots:03}.png");
                         match handle.screenshot(&path) {
                             Ok(()) => tracing::info!(path, "screenshot saved"),
                             Err(err) => tracing::error!(%err, "screenshot failed"),

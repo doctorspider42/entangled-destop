@@ -45,7 +45,7 @@ use crate::{GuestMem, MAX_QUEUE_SIZE, VIRTIO_F_VERSION_1};
 pub enum TransportError {
     #[error(
         "device type {device_type:?} does not offer VIRTIO_F_VERSION_1; \
-         VMHost implements the modern interface only"
+         Entangled Desktop implements the modern interface only"
     )]
     MissingVersion1 { device_type: DeviceType },
 
@@ -153,7 +153,7 @@ impl MmioTransport {
         self.interrupt.status()
     }
 
-    /// The device behind this slot, for inspection (tests, `vmhost doctor`).
+    /// The device behind this slot, for inspection (tests, `entangled doctor`).
     pub fn device(&self) -> &dyn VirtioDevice {
         self.device.as_ref()
     }

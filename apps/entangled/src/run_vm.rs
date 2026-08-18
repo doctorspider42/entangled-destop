@@ -1,4 +1,4 @@
-//! `vmhost run` — boots a direct-linux VM to the serial console with its
+//! `entangled run` — boots a direct-linux VM to the serial console with its
 //! virtio-mmio devices attached (backlog MVP-1202..1206; display and the
 //! remaining device epics plug in here as they land).
 
@@ -61,7 +61,7 @@ fn open_presentation(cfg: &VmConfig, headless: bool) -> Result<Presentation, Str
         match display::DisplayHost::new(display_cfg) {
             Ok(host) => {
                 return Ok(Presentation::Windowed(Box::new(
-                    host.with_title(format!("VMHost — {}", cfg.name)),
+                    host.with_title(format!("Entangled Desktop — {}", cfg.name)),
                 )))
             }
             Err(e) => {
@@ -106,7 +106,7 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     }
 
     // virtio-net from the [network] section (MVP-505); the TAP interface must
-    // already exist (scripts/setup-tap.sh) — vmhost itself never needs
+    // already exist (scripts/setup-tap.sh) — entangled itself never needs
     // CAP_NET_ADMIN, only the one-time setup does.
     if let Some(net) = &cfg.network {
         let backend = virtio_net::TapBackend::open(&net.interface)

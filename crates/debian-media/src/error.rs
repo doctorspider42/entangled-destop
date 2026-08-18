@@ -8,7 +8,7 @@ use crate::http::TransportError;
 use crate::release::ReleaseError;
 use crate::sums::SumsError;
 
-/// Everything that can go wrong between "user typed `vmhost fetch`" and
+/// Everything that can go wrong between "user typed `entangled fetch`" and
 /// "verified artifact plus manifest sits in the cache".
 #[derive(Debug, Error)]
 pub enum MediaError {

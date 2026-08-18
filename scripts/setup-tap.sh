@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host network setup for VMHost's virtio-net device (backlog MVP-506/507).
+# Host network setup for Entangled Desktop's virtio-net device (backlog MVP-506/507).
 #
 # Creates a persistent TAP interface owned by an unprivileged user, gives it a
 # host-side address and connects the VM either to a NAT gateway (default) or to
@@ -9,17 +9,17 @@
 # ===================================
 # Attaching to a TAP interface with TUNSETIFF needs CAP_NET_ADMIN *only when the
 # interface does not exist yet*. Creating it here once, owned by the user who
-# will run `vmhost`, means the VMM itself runs unprivileged for the whole life of
+# will run `entangled`, means the VMM itself runs unprivileged for the whole life of
 # the VM — the MVP's security posture: no capabilities on the process that talks
 # to an untrusted guest.
 #
 # This script therefore needs root (or CAP_NET_ADMIN, and CAP_NET_RAW-equivalent
-# privileges for nftables/iptables). `vmhost run` does not.
+# privileges for nftables/iptables). `entangled run` does not.
 #
 # USAGE
 # =====
-#   sudo scripts/setup-tap.sh                        # vmhost0, NAT, current user
-#   sudo scripts/setup-tap.sh --iface vmhost1 --user alice
+#   sudo scripts/setup-tap.sh                        # entangled0, NAT, current user
+#   sudo scripts/setup-tap.sh --iface entangled1 --user alice
 #   sudo scripts/setup-tap.sh --bridge br0           # bridge instead of NAT
 #   sudo scripts/setup-tap.sh --down                 # tear it all down
 #   scripts/setup-tap.sh --dnsmasq                   # print a DHCP snippet
@@ -33,11 +33,11 @@
 # the boot integration tests) needs such a server on the host side.
 set -euo pipefail
 
-IFACE=vmhost0
-# TAP owner: SUDO_USER when invoked via sudo; overridable with VMHOST_TAP_OWNER
+IFACE=entangled0
+# TAP owner: SUDO_USER when invoked via sudo; overridable with ENTANGLED_TAP_OWNER
 # for environments without sudo context (e.g. `wsl -u root -- …`, where
 # defaulting to root would leave the unprivileged VMM unable to attach).
-OWNER=${VMHOST_TAP_OWNER:-${SUDO_USER:-$(id -un)}}
+OWNER=${ENTANGLED_TAP_OWNER:-${SUDO_USER:-$(id -un)}}
 HOST_IP=192.168.73.1/24
 SUBNET=
 UPLINK=
@@ -102,8 +102,8 @@ default_uplink() {
 if [ "$ACTION" = dnsmasq ]; then
     cat <<EOF
 # Optional: serve DHCP + DNS to the VM on $IFACE (install the 'dnsmasq' package).
-# Write this to /etc/dnsmasq.d/vmhost-$IFACE.conf and restart dnsmasq, or run it
-# in the foreground as shown at the bottom. Not required by \`vmhost run\`: a
+# Write this to /etc/dnsmasq.d/entangled-$IFACE.conf and restart dnsmasq, or run it
+# in the foreground as shown at the bottom. Not required by \`entangled run\`: a
 # statically configured guest works just as well.
 interface=$IFACE
 bind-interfaces
@@ -112,8 +112,8 @@ dhcp-range=${ADDR%.*}.50,${ADDR%.*}.150,12h
 dhcp-option=option:router,$ADDR
 dhcp-option=option:dns-server,$ADDR
 # No DNS forwarding surprises: answer only for the VM subnet.
-domain=vmhost.invalid
-local=/vmhost.invalid/
+domain=entangled.invalid
+local=/entangled.invalid/
 
 # Foreground equivalent, handy for a one-off boot test with ip=dhcp:
 #   sudo dnsmasq --no-daemon --interface=$IFACE --bind-interfaces \\
@@ -127,9 +127,9 @@ fi
 
 if [ "$ACTION" = down ]; then
     need_root
-    if have nft && nft list table inet vmhost >/dev/null 2>&1; then
-        nft delete table inet vmhost
-        echo "removed nftables table inet vmhost"
+    if have nft && nft list table inet entangled >/dev/null 2>&1; then
+        nft delete table inet entangled
+        echo "removed nftables table inet entangled"
     fi
     if have iptables; then
         UPLINK=${UPLINK:-$(default_uplink || true)}
@@ -174,7 +174,7 @@ if [ -n "$BRIDGE" ]; then
     ip link set "$IFACE" master "$BRIDGE"
     echo "attached $IFACE to bridge $BRIDGE"
     echo
-    echo "Run the VM as $OWNER with:  vmhost run --net-tap $IFACE"
+    echo "Run the VM as $OWNER with:  entangled run --net-tap $IFACE"
     exit 0
 fi
 
@@ -196,9 +196,9 @@ echo "enabled net.ipv4.ip_forward"
 if have nft; then
     # A dedicated table so teardown is a single `nft delete table` and nothing
     # this script did can disturb another tool's ruleset.
-    nft list table inet vmhost >/dev/null 2>&1 && nft delete table inet vmhost
+    nft list table inet entangled >/dev/null 2>&1 && nft delete table inet entangled
     nft -f - <<EOF
-table inet vmhost {
+table inet entangled {
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
         ip saddr $SUBNET oifname != "$IFACE" masquerade
@@ -210,7 +210,7 @@ table inet vmhost {
     }
 }
 EOF
-    echo "installed nftables table inet vmhost (NAT $SUBNET -> $UPLINK)"
+    echo "installed nftables table inet entangled (NAT $SUBNET -> $UPLINK)"
 elif have iptables; then
     iptables -t nat -C POSTROUTING -s "$SUBNET" ! -o "$IFACE" -j MASQUERADE 2>/dev/null ||
         iptables -t nat -A POSTROUTING -s "$SUBNET" ! -o "$IFACE" -j MASQUERADE
@@ -232,7 +232,7 @@ TAP $IFACE is ready.
   guest subnet : $SUBNET   (gateway $ADDR)
   owner        : $OWNER    (may attach without CAP_NET_ADMIN)
 
-Run the VM as $OWNER with:  vmhost run --net-tap $IFACE
+Run the VM as $OWNER with:  entangled run --net-tap $IFACE
 Guest static configuration:  address ${ADDR%.*}.2/$PREFIX, gateway $ADDR
 For DHCP instead:            scripts/setup-tap.sh --iface $IFACE --dnsmasq
 Tear everything down with:   sudo scripts/setup-tap.sh --iface $IFACE --down

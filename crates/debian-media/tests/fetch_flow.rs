@@ -1,4 +1,4 @@
-//! The `vmhost fetch` flow against fixture transports (EPIC 6 acceptance
+//! The `entangled fetch` flow against fixture transports (EPIC 6 acceptance
 //! criteria), all offline.
 //!
 //! Covered here:
@@ -578,7 +578,7 @@ fn a_short_transfer_without_content_length_fails_the_digest_check_and_purges() {
 
 // ------------------------------------------------------------------- cache
 
-/// MVP-609 / backlog: `vmhost fetch` twice means one download.
+/// MVP-609 / backlog: `entangled fetch` twice means one download.
 #[test]
 fn a_second_run_is_served_from_the_cache_with_zero_network_access() {
     let key = TestKey::generate("archive <a@example.invalid>");

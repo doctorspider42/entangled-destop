@@ -1,4 +1,4 @@
-//! The `vmhost run <file>.toml` configuration format (backlog MVP-1201).
+//! The `entangled run <file>.toml` configuration format (backlog MVP-1201).
 
 use std::path::PathBuf;
 
@@ -139,7 +139,7 @@ writable = true
 
 [network]
 backend = "tap"
-interface = "vmhost0"
+interface = "entangled0"
 
 [display]
 width = 1920
@@ -154,7 +154,7 @@ scale = 1.0
         assert_eq!(cfg.boot.mode, BootMode::DirectLinux);
         assert_eq!(cfg.disks.len(), 1);
         assert!(cfg.disks[0].writable);
-        assert_eq!(cfg.network.as_ref().unwrap().interface, "vmhost0");
+        assert_eq!(cfg.network.as_ref().unwrap().interface, "entangled0");
         assert_eq!(cfg.display.width, 1920);
     }
 

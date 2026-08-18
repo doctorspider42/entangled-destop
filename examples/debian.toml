@@ -1,4 +1,4 @@
-# Example VM configuration for `vmhost run` (see crates/control-api).
+# Example VM configuration for `entangled run` (see crates/control-api).
 name = "debian-demo"
 memory_mib = 2048
 vcpus = 2
@@ -15,7 +15,7 @@ writable = true
 
 [network]
 backend = "tap"
-interface = "vmhost0"
+interface = "entangled0"
 
 [display]
 width = 1920

@@ -23,7 +23,7 @@
 //!
 //! // The TAP interface is set up once by the host administrator; see
 //! // `scripts/setup-tap.sh` and the CAP_NET_ADMIN notes in `virtio_net::tap`.
-//! let backend = TapBackend::open("vmhost0")?;
+//! let backend = TapBackend::open("entangled0")?;
 //! let mac = MacAddr::derive("debian-demo"); // stable per VM name
 //! let device = NetDevice::new(backend, mac);
 //!
@@ -38,7 +38,7 @@
 //! its RX worker thread on activation and joins it on reset or drop, so a VM
 //! that shuts down leaves no thread and no open TAP descriptor behind.
 //! [`NetDevice::stats`] exposes per-direction counters, including one counter
-//! per drop reason, for `vmhost doctor` and for tests.
+//! per drop reason, for `entangled doctor` and for tests.
 
 pub mod backend;
 pub mod device;

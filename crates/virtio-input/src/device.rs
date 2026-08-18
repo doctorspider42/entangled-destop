@@ -110,7 +110,7 @@ pub enum BufferError {
     Unwritable { addr: u64, reason: String },
 }
 
-/// Counters for diagnostics (`vmhost doctor`, the periodic MVP-708 log record).
+/// Counters for diagnostics (`entangled doctor`, the periodic MVP-708 log record).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EventStats {
     /// Events accepted into the pending ring.
@@ -741,8 +741,8 @@ mod tests {
         assert_eq!(device.queue_max_sizes(), &[QUEUE_SIZE, QUEUE_SIZE]);
         assert_eq!(device.num_queues(), 2);
         assert_eq!(device.device_features(), VIRTIO_F_VERSION_1);
-        assert_eq!(device.name(), "VMHost Keyboard");
-        assert_eq!(InputDevice::absolute_pointer().name(), "VMHost Tablet");
+        assert_eq!(device.name(), "Entangled Keyboard");
+        assert_eq!(InputDevice::absolute_pointer().name(), "Entangled Tablet");
     }
 
     #[test]
@@ -780,7 +780,7 @@ mod tests {
         device.write_config(config::SELECT, &[config::VIRTIO_INPUT_CFG_ID_NAME]);
         assert_eq!(device.selected(), (config::VIRTIO_INPUT_CFG_ID_NAME, 0));
         let header = read_config(&device, 0, 3);
-        assert_eq!(header, vec![config::VIRTIO_INPUT_CFG_ID_NAME, 0, 15]);
+        assert_eq!(header, vec![config::VIRTIO_INPUT_CFG_ID_NAME, 0, 18]);
 
         // A one-byte write to subsel only touches subsel.
         device.write_config(config::SUBSEL, &[0x2a]);
@@ -802,7 +802,7 @@ mod tests {
         // reserved[5] at offsets 3..8.
         assert_eq!(read_config(&device, 3, 5), vec![0u8; 5]);
         // The payload past `size` is zero…
-        let tail = read_config(&device, config::PAYLOAD + 15, 16);
+        let tail = read_config(&device, config::PAYLOAD + 18, 16);
         assert_eq!(tail, vec![0u8; 16]);
         // …and so is everything past the config space, at any width.
         for offset in [config::CONFIG_LEN, config::CONFIG_LEN + 0x400, u64::MAX - 8] {
@@ -850,10 +850,10 @@ mod tests {
         device.write_config(3, &[0xff; 5]);
         device.write_config(config::CONFIG_LEN + 8, &[0xff; 4]);
 
-        assert_eq!(read_config(&device, config::SIZE, 1), vec![15]);
+        assert_eq!(read_config(&device, config::SIZE, 1), vec![18]);
         assert_eq!(
-            read_config(&device, config::PAYLOAD, 15),
-            b"VMHost Keyboard".to_vec()
+            read_config(&device, config::PAYLOAD, 18),
+            b"Entangled Keyboard".to_vec()
         );
         assert_eq!(read_config(&device, 3, 5), vec![0u8; 5]);
     }
@@ -863,7 +863,7 @@ mod tests {
         let mut device = InputDevice::keyboard();
         assert_eq!(
             probe(&mut device, config::VIRTIO_INPUT_CFG_ID_NAME, 0),
-            b"VMHost Keyboard".to_vec()
+            b"Entangled Keyboard".to_vec()
         );
         assert_eq!(
             probe(&mut device, config::VIRTIO_INPUT_CFG_ID_DEVIDS, 0),
@@ -894,7 +894,7 @@ mod tests {
         let mut device = InputDevice::absolute_pointer();
         assert_eq!(
             probe(&mut device, config::VIRTIO_INPUT_CFG_ID_NAME, 0),
-            b"VMHost Tablet".to_vec()
+            b"Entangled Tablet".to_vec()
         );
         assert_eq!(
             probe(&mut device, config::VIRTIO_INPUT_CFG_ID_DEVIDS, 0),
@@ -1012,7 +1012,7 @@ mod tests {
         let device = InputDevice::keyboard();
         let handle = device.handle();
         let text = format!("{handle:?}");
-        assert!(text.contains("VMHost Keyboard"));
+        assert!(text.contains("Entangled Keyboard"));
         assert!(format!("{device:?}").contains("Keyboard"));
     }
 

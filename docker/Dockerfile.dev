@@ -1,9 +1,9 @@
-# Reproducible build/test environment for VMHost.
+# Reproducible build/test environment for Entangled Desktop.
 #
-# Build:  docker build -f docker/Dockerfile.dev -t vmhost-dev .
-# Test:   docker run --rm -v "$PWD:/src" -w /src vmhost-dev cargo test --workspace
+# Build:  docker build -f docker/Dockerfile.dev -t entangled-dev .
+# Test:   docker run --rm -v "$PWD:/src" -w /src entangled-dev cargo test --workspace
 # With KVM (running the VMM itself needs the host's /dev/kvm):
-#         docker run --rm --device /dev/kvm -v "$PWD:/src" -w /src vmhost-dev \
+#         docker run --rm --device /dev/kvm -v "$PWD:/src" -w /src entangled-dev \
 #             cargo test --workspace
 #
 # Note for Windows: Docker Desktop runs inside WSL2, so this is the same

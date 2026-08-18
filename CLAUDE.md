@@ -1,9 +1,9 @@
-# VMHost
+# Entangled Desktop
 
 A small VMM for Linux x86-64 hosts, written in Rust on KVM + rust-vmm crates.
 No QEMU. MVP goal: install and run Debian stable in a 1920×1080 window with
 2D graphics (`virtio-gpu`), input and networking. Product backlog (in Polish,
-treat as guidance, not contract): [vmhost-mvp-backlog.md](vmhost-mvp-backlog.md).
+treat as guidance, not contract): [entangled-mvp-backlog.md](entangled-mvp-backlog.md).
 Architecture decisions: [docs/adr/0001-mvp-architecture.md](docs/adr/0001-mvp-architecture.md),
 [docs/adr/0002-linux-first-whp-ready.md](docs/adr/0002-linux-first-whp-ready.md)
 (portability rules that keep a native Windows/WHP port cheap — read before
@@ -38,7 +38,7 @@ wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace
 | `crates/display` | winit window, wgpu renderer, host input capture | EPIC 7 |
 | `crates/debian-media` | Debian download, PGP+SHA-512 verification, cache, manifests | EPIC 6 |
 | `crates/control-api` | VM config model (TOML), lifecycle API for CLI/GUI | EPIC 12 |
-| `apps/vmhost-cli` | `vmhost` binary: fetch/disk/install/run/doctor | EPIC 10/12 |
+| `apps/entangled` | `entangled` binary: fetch/disk/install/run/doctor | EPIC 10/12 |
 
 ## Skills
 

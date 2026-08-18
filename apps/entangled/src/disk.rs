@@ -1,4 +1,4 @@
-//! `vmhost disk create` — sparse RAW image creation (backlog MVP-409/1001).
+//! `entangled disk create` — sparse RAW image creation (backlog MVP-409/1001).
 
 use std::io;
 use std::path::Path;
@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn creates_sparse_and_refuses_overwrite() {
-        let dir = std::env::temp_dir().join("vmhost-disk-test");
+        let dir = std::env::temp_dir().join("entangled-disk-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.raw");
         let _ = std::fs::remove_file(&path);

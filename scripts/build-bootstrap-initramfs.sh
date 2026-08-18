@@ -12,7 +12,7 @@ cargo build --quiet --release --target x86_64-unknown-linux-musl \
 mkdir -p artifacts/bootstrap
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-cp guest/bootstrap-initramfs/init-rs/target/x86_64-unknown-linux-musl/release/vmhost-bootstrap-init "$stage/init"
+cp guest/bootstrap-initramfs/init-rs/target/x86_64-unknown-linux-musl/release/entangled-bootstrap-init "$stage/init"
 (cd "$stage" && echo init | cpio -o -H newc --quiet | gzip -9) \
     > artifacts/bootstrap/initrd.img
 echo "wrote artifacts/bootstrap/initrd.img ($(stat -c%s artifacts/bootstrap/initrd.img) bytes)"

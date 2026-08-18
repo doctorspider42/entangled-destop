@@ -27,7 +27,7 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# The internal `vmhost` crates are path dependencies and are never published,
+# The internal `entangled` crates are path dependencies and are never published,
 # so `{ path = "…" }` without a version requirement is intentional.
 allow-wildcard-paths = true
 # QEMU must never appear, in any form (ADR-0001).

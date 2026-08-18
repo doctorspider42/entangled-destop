@@ -89,7 +89,7 @@ pub enum Readiness {
 /// synchronised or, like a TAP file descriptor, safe to read and write from two
 /// threads at once.
 pub trait NetBackend: Send + Sync {
-    /// Short label for log records, e.g. `tap:vmhost0`.
+    /// Short label for log records, e.g. `tap:entangled0`.
     fn name(&self) -> &str;
 
     /// Sends one frame (no virtio-net header) to the host.

@@ -1,6 +1,6 @@
 [package]
 name = "vmm-core"
-description = "KVM handle, guest memory and VM lifecycle for VMHost"
+description = "KVM handle, guest memory and VM lifecycle for Entangled Desktop"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

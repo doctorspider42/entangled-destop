@@ -1,7 +1,7 @@
 //! Direct Linux boot (backlog EPIC 2): loading a `bzImage` and initramfs into
 //! guest memory, building `boot_params` + E820 and pointing vCPU0 at the
 //! kernel's 64-bit entry point. The heavy lifting will use the `linux-loader`
-//! crate; this crate owns the VMHost-specific policy around it.
+//! crate; this crate owns the Entangled Desktop-specific policy around it.
 
 use std::path::PathBuf;
 

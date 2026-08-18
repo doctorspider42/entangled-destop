@@ -1,10 +1,10 @@
-//! `vmhost doctor` — host prerequisite checks (backlog MVP-005).
+//! `entangled doctor` — host prerequisite checks (backlog MVP-005).
 
 #[cfg(target_os = "linux")]
 pub fn run() -> Result<(), String> {
     use vmm_core::Hypervisor;
 
-    println!("vmhost doctor");
+    println!("entangled doctor");
     if !std::path::Path::new("/dev/kvm").exists() {
         return Err(
             "/dev/kvm not found — KVM is unavailable (kernel module missing or no \
@@ -37,5 +37,5 @@ pub fn run() -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn run() -> Result<(), String> {
-    Err("vmhost requires a Linux host with KVM; on Windows use WSL2".into())
+    Err("entangled requires a Linux host with KVM; on Windows use WSL2".into())
 }

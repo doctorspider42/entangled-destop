@@ -16,7 +16,7 @@ const SUMS: &[u8] = b"aa  debian-13.6.0-amd64-netinst.iso\n";
 
 #[test]
 fn a_good_signature_from_a_pinned_key_is_accepted() {
-    let key = TestKey::generate("VMHost test <test@example.invalid>");
+    let key = TestKey::generate("Entangled Desktop test <test@example.invalid>");
     let keyring = key.keyring("test");
     let signature = key.detached_sign(SUMS);
 
@@ -33,7 +33,7 @@ fn a_good_signature_from_a_pinned_key_is_accepted() {
 
 #[test]
 fn a_signature_over_different_data_is_rejected() {
-    let key = TestKey::generate("VMHost test <test@example.invalid>");
+    let key = TestKey::generate("Entangled Desktop test <test@example.invalid>");
     let keyring = key.keyring("test");
     let signature = key.detached_sign(SUMS);
 
@@ -55,7 +55,7 @@ fn a_signature_from_a_key_outside_the_keyring_is_rejected() {
 
 #[test]
 fn a_flipped_bit_in_the_signature_is_rejected() {
-    let key = TestKey::generate("VMHost test <test@example.invalid>");
+    let key = TestKey::generate("Entangled Desktop test <test@example.invalid>");
     let keyring = key.keyring("test");
     let mut signature = key.detached_sign(SUMS);
     // Corrupt a byte in the middle of the base64 payload.
@@ -71,7 +71,7 @@ fn a_flipped_bit_in_the_signature_is_rejected() {
 /// substituted key.
 #[test]
 fn a_key_that_does_not_match_its_pinned_fingerprint_makes_the_keyring_unusable() {
-    let key = TestKey::generate("VMHost test <test@example.invalid>");
+    let key = TestKey::generate("Entangled Desktop test <test@example.invalid>");
     let wrong = "0".repeat(40);
     let keyring = key.keyring_pinning("test", &wrong);
     let signature = key.detached_sign(SUMS);

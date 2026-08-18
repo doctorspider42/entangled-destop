@@ -319,7 +319,7 @@ pub struct TempDir {
 impl TempDir {
     pub fn new(tag: &str) -> Self {
         let unique = format!(
-            "vmhost-{tag}-{}-{:?}",
+            "entangled-{tag}-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

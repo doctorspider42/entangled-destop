@@ -1,4 +1,4 @@
-//! The `vmhost fetch` flow (MVP-602/603/604/606/607/608/609/610).
+//! The `entangled fetch` flow (MVP-602/603/604/606/607/608/609/610).
 //!
 //! # Order of operations is the security property
 //!
@@ -95,7 +95,7 @@ impl Provenance {
     }
 }
 
-/// Result of `vmhost fetch debian --variant …`.
+/// Result of `entangled fetch debian --variant …`.
 #[derive(Debug, Clone)]
 pub struct FetchReport {
     /// Version discovered from signed metadata — never pinned in code.

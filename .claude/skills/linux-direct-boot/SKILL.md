@@ -42,7 +42,7 @@ Compose lines programmatically; never concatenate strings at call sites.
 
 - 16550 UART from the `vm-superio` crate at ISA `0x3f8`, IRQ 4, wired through
   `KVM_EXIT_IO` port handling.
-- Output goes to a pluggable sink: stdout for `vmhost run`, a capture buffer
+- Output goes to a pluggable sink: stdout for `entangled run`, a capture buffer
   for tests. The capture path is what boot tests scan for markers.
 
 ## Boot tests (MVP-207/208)

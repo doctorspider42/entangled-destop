@@ -1,12 +1,12 @@
-# ADR-0001: VMHost MVP architecture and scope
+# ADR-0001: Entangled Desktop MVP architecture and scope
 
 - Status: accepted
 - Date: 2026-08-18
-- Backlog: [vmhost-mvp-backlog.md](../../vmhost-mvp-backlog.md) (MVP-001)
+- Backlog: [entangled-mvp-backlog.md](../../entangled-mvp-backlog.md) (MVP-001)
 
 ## Context
 
-VMHost is a small, self-contained Virtual Machine Monitor for Linux x86-64 hosts.
+Entangled Desktop is a small, self-contained Virtual Machine Monitor for Linux x86-64 hosts.
 The MVP must install and run Debian stable (currently Trixie) in a window with
 1920×1080 2D graphics, keyboard/mouse input and networking — without using QEMU
 as a process or library, and without shipping copyleft code in the host binary.
@@ -17,7 +17,7 @@ as a process or library, and without shipping copyleft code in the host binary.
    using rust-vmm ecosystem crates (`kvm-ioctls`, `kvm-bindings`, `vm-memory`,
    `linux-loader`, `vmm-sys-util`, `virtio-queue`, `vm-superio`). QEMU is neither
    a runtime dependency nor a linked library.
-2. **Control surface.** The first control surface is a CLI (`vmhost`). The
+2. **Control surface.** The first control surface is a CLI (`entangled`). The
    Avalonia/.NET GUI is explicitly out of MVP scope; the `control-api` crate keeps
    the machine-facing model separate from the CLI so a GUI can attach later.
 3. **No BIOS/UEFI in MVP.** Guests boot via the Linux x86 boot protocol (direct
@@ -56,7 +56,7 @@ as a process or library, and without shipping copyleft code in the host binary.
 
 Cargo workspace: `crates/{vmm-core, machine-x86, linux-boot, virtio-core,
 virtio-block, virtio-net, virtio-gpu, virtio-input, display, debian-media,
-control-api}` plus `apps/vmhost-cli`, `guest/` (bootstrap kernel/initramfs,
+control-api}` plus `apps/entangled`, `guest/` (bootstrap kernel/initramfs,
 test rootfs) and `tests/` (boot, installer, graphical).
 
 Crates keep host-OS-specific code behind `#[cfg(target_os = "linux")]` and

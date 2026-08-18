@@ -483,7 +483,7 @@ fn init_backend(window: &Arc<Window>, backends: wgpu::Backends) -> Result<Gpu, D
     let info = adapter.get_info();
 
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("vmhost-display"),
+        label: Some("entangled-display"),
         required_features: wgpu::Features::empty(),
         required_limits: adapter.limits(),
         ..Default::default()

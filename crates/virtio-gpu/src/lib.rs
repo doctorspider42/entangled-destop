@@ -37,7 +37,7 @@
 //! # }
 //! ```
 //!
-//! The device is deliberately *not* wired into `apps/vmhost-cli` here: the
+//! The device is deliberately *not* wired into `apps/entangled` here: the
 //! run-a-VM path (window on the main thread, device on a worker) lands with the
 //! VM assembly work. `DisplayHandle::detached(width, height)` gives a windowless
 //! sink, which is how the end-to-end tests in `tests/gpu_queue.rs` assert real

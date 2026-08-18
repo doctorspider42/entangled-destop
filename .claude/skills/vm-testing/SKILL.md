@@ -1,6 +1,6 @@
 ---
 name: vm-testing
-description: Testing strategy for VMHost — unit/malicious-guest tests, boot-to-marker integration tests, 100-boot and soak runs, fuzzing, screenshot comparison, and how to run KVM tests in WSL/CI (backlog EPIC 14 + per-epic acceptance criteria). Load when writing or running tests.
+description: Testing strategy for Entangled Desktop — unit/malicious-guest tests, boot-to-marker integration tests, 100-boot and soak runs, fuzzing, screenshot comparison, and how to run KVM tests in WSL/CI (backlog EPIC 14 + per-epic acceptance criteria). Load when writing or running tests.
 ---
 
 # VM testing

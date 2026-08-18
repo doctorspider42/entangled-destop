@@ -30,7 +30,7 @@ rewrite**, and pins down the rules that keep it that way.
    |---|---|
    | `virtio-core` + device crates (blk, gpu, input, net protocol) | None — transport- and OS-agnostic by rule; `Interrupt` already abstracts the delivery mechanism |
    | `display` (winit/wgpu) | None — builds on Windows today (native DX12/Vulkan instead of WSLg's llvmpipe) |
-   | `debian-media`, `control-api`, `vmhost-cli` | None — pure Rust + rustls, no OS gates |
+   | `debian-media`, `control-api`, `entangled` | None — pure Rust + rustls, no OS gates |
    | `vmm-core` | A second hypervisor backend behind a trait: partition/vCPU creation, `WHvMapGpaRange`, register/CPUID setup, run-loop exit translation (~1–2 weeks) |
    | Interrupt chip + PIT | The real gap: KVM gives us an in-kernel PIC/IOAPIC/PIT; WHP provides only the local APIC, so PIC/IOAPIC routing and the PIT must be emulated in userspace, as QEMU/WHPX does (~1–2 weeks) |
    | Networking | TAP does not exist on Windows and wintun/tap-windows6 are GPL (blocked). The plan is a user-mode NAT (slirp-like) backend on `smoltcp` (0BSD) — which also gives rootless networking on Linux (~2–3 weeks) |

@@ -49,7 +49,7 @@ pub const VIRTIO_INPUT_CFG_UNSET: u8 = 0x00;
 /// `VIRTIO_INPUT_CFG_ID_NAME`: the device name string.
 pub const VIRTIO_INPUT_CFG_ID_NAME: u8 = 0x01;
 /// `VIRTIO_INPUT_CFG_ID_SERIAL`: serial number string. Not implemented —
-/// VMHost input devices have no meaningful serial, so this reads `size = 0`.
+/// Entangled Desktop input devices have no meaningful serial, so this reads `size = 0`.
 ///
 /// Note for readers coming from the backlog: 0x02 is the *serial*, not the
 /// device ids. `virtio_input.h` orders them `ID_NAME = 1, ID_SERIAL = 2,
@@ -73,7 +73,7 @@ pub const ABS_INFO_LEN: usize = 20;
 
 /// `BUS_VIRTUAL` from `linux/input.h`: these devices are not on any real bus.
 pub const BUS_VIRTUAL: u16 = 0x06;
-/// Vendor id VMHost claims for its input devices. There is no registry for
+/// Vendor id Entangled Desktop claims for its input devices. There is no registry for
 /// `BUS_VIRTUAL` ids; this is "VM" in ASCII, matching
 /// `virtio_core::mmio::VMHOST_VENDOR_ID`.
 pub const VMHOST_INPUT_VENDOR: u16 = 0x564d;
@@ -137,8 +137,8 @@ impl Profile {
     /// `/proc/bus/input/devices`.
     pub const fn name(self) -> &'static str {
         match self {
-            Profile::Keyboard => "VMHost Keyboard",
-            Profile::AbsolutePointer => "VMHost Tablet",
+            Profile::Keyboard => "Entangled Keyboard",
+            Profile::AbsolutePointer => "Entangled Tablet",
         }
     }
 
@@ -342,18 +342,18 @@ mod tests {
     #[test]
     fn name_selector_returns_the_device_name_without_a_nul() {
         let keyboard = selection(Profile::Keyboard, VIRTIO_INPUT_CFG_ID_NAME, 0);
-        assert_eq!(keyboard.payload(), b"VMHost Keyboard");
-        assert_eq!(keyboard.size(), 15);
+        assert_eq!(keyboard.payload(), b"Entangled Keyboard");
+        assert_eq!(keyboard.size(), 18);
 
         let tablet = selection(Profile::AbsolutePointer, VIRTIO_INPUT_CFG_ID_NAME, 0);
-        assert_eq!(tablet.payload(), b"VMHost Tablet");
-        assert_eq!(tablet.size(), 13);
+        assert_eq!(tablet.payload(), b"Entangled Tablet");
+        assert_eq!(tablet.size(), 16);
 
         // subsel is irrelevant for the name and must not change the answer.
         for subsel in [0u8, 1, 0x11, 0xff] {
             assert_eq!(
                 selection(Profile::Keyboard, VIRTIO_INPUT_CFG_ID_NAME, subsel).payload(),
-                b"VMHost Keyboard"
+                b"Entangled Keyboard"
             );
         }
     }

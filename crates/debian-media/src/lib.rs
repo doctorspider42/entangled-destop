@@ -59,7 +59,7 @@ pub use sums::{
     SumsEntry, SumsError,
 };
 
-/// Convenience entry point for `vmhost fetch debian` (MVP-1201).
+/// Convenience entry point for `entangled fetch debian` (MVP-1201).
 ///
 /// Validates the user-facing strings, resolves the cache location from the
 /// environment and runs the full verified fetch against the real network.

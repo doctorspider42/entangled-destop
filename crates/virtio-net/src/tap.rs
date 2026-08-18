@@ -9,10 +9,10 @@
 //!
 //! `TUNSETIFF` needs `CAP_NET_ADMIN` **when it has to create** the interface.
 //! It does *not* when the interface already exists and is owned by the calling
-//! user, which is the deployment VMHost targets: an administrator runs
+//! user, which is the deployment Entangled Desktop targets: an administrator runs
 //! `scripts/setup-tap.sh --user "$USER"` once (that script also does the
-//! bridging/NAT and IP forwarding), and from then on `vmhost run` attaches to
-//! `vmhost0` unprivileged. `vmhost doctor` reports which of the two situations
+//! bridging/NAT and IP forwarding), and from then on `entangled run` attaches to
+//! `entangled0` unprivileged. `entangled doctor` reports which of the two situations
 //! it is in.
 //!
 //! # Lifetime
@@ -40,7 +40,7 @@ const TUN_PATH: &str = "/dev/net/tun";
 pub const MAX_IFNAME_LEN: usize = 16;
 
 /// The `ifreq` union is 24 bytes wide (`struct ifmap` is the largest member);
-/// VMHost only ever writes its first two bytes, `ifru_flags`.
+/// Entangled Desktop only ever writes its first two bytes, `ifru_flags`.
 const IFREQ_UNION_LEN: usize = 24;
 
 // `TUNSETIFF` = `_IOW('T', 202, int)`, from `linux/if_tun.h`.
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn interface_names_are_validated() {
-        for good in ["vmhost0", "tap0", "a", "eth-test123456"] {
+        for good in ["entangled0", "tap0", "a", "eth-test123456"] {
             assert!(validate_ifname(good).is_ok(), "{good} must be accepted");
         }
         for bad in [
@@ -300,9 +300,9 @@ mod tests {
     #[test]
     fn ifreq_has_the_kernel_layout() {
         assert_eq!(std::mem::size_of::<IfReq>(), 40);
-        let req = IfReq::new("vmhost0", 0x0002 | 0x1000);
-        assert_eq!(&req.ifr_name[..7], b"vmhost0");
-        assert_eq!(req.ifr_name[7], 0, "name must be NUL terminated");
+        let req = IfReq::new("entangled0", 0x0002 | 0x1000);
+        assert_eq!(&req.ifr_name[..10], b"entangled0");
+        assert_eq!(req.ifr_name[10], 0, "name must be NUL terminated");
         assert_eq!(
             i16::from_ne_bytes([req.ifr_ifru[0], req.ifr_ifru[1]]),
             0x1002
@@ -331,10 +331,10 @@ mod tests {
             eprintln!("skipping: {TUN_PATH} is absent (no TUN/TAP support in this kernel)");
             return;
         }
-        match TapBackend::open("vmhostunit0") {
+        match TapBackend::open("entangledunit0") {
             Ok(tap) => {
-                assert_eq!(tap.ifname(), "vmhostunit0");
-                assert_eq!(tap.name(), "tap:vmhostunit0");
+                assert_eq!(tap.ifname(), "entangledunit0");
+                assert_eq!(tap.name(), "tap:entangledunit0");
                 // Nothing is pending on a fresh interface.
                 assert_eq!(
                     tap.wait_readable(Duration::from_millis(10)).ok(),

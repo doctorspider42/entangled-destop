@@ -1,4 +1,4 @@
-//! `vmhost fetch` — download and verify installer media (backlog EPIC 6/12).
+//! `entangled fetch` — download and verify installer media (backlog EPIC 6/12).
 //!
 //! All the work lives in the `debian-media` crate; this module only turns its
 //! [`FetchReport`] into something readable on a terminal. The important thing it

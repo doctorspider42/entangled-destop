@@ -186,7 +186,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         &self.display
     }
 
-    /// Number of live 2D resources (diagnostics, `vmhost doctor`).
+    /// Number of live 2D resources (diagnostics, `entangled doctor`).
     pub fn resource_count(&self) -> usize {
         self.resources.len()
     }

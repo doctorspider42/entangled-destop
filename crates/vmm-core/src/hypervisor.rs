@@ -7,7 +7,7 @@ use crate::VmmError;
 /// Minimum stable KVM API version; constant since Linux 2.6.
 pub const MIN_KVM_API_VERSION: i32 = 12;
 
-/// Capabilities VMHost cannot run without. Checked once at startup so device
+/// Capabilities Entangled Desktop cannot run without. Checked once at startup so device
 /// code can rely on them unconditionally.
 const REQUIRED_CAPS: &[(Cap, &str)] = &[
     (Cap::UserMemory, "KVM_CAP_USER_MEMORY"),
@@ -18,7 +18,7 @@ const REQUIRED_CAPS: &[(Cap, &str)] = &[
     (Cap::ImmediateExit, "KVM_CAP_IMMEDIATE_EXIT"),
 ];
 
-/// Snapshot of what the host's KVM offers, for `vmhost doctor` (MVP-005).
+/// Snapshot of what the host's KVM offers, for `entangled doctor` (MVP-005).
 #[derive(Debug, Clone)]
 pub struct HostCapabilities {
     pub api_version: i32,
@@ -61,7 +61,7 @@ impl Hypervisor {
     }
 
     /// Probes host capabilities without failing on missing ones; used by
-    /// `vmhost doctor` to print a diagnosis instead of an error.
+    /// `entangled doctor` to print a diagnosis instead of an error.
     pub fn probe() -> Result<HostCapabilities, VmmError> {
         let kvm = Kvm::new().map_err(|e| VmmError::KvmOpen(e.into()))?;
         let missing = REQUIRED_CAPS
@@ -88,7 +88,7 @@ mod tests {
 
     /// Requires a usable /dev/kvm; skips (with a note) where it is absent or
     /// not accessible (CI without nested virt, user not in the `kvm` group —
-    /// `vmhost doctor` is the tool that *diagnoses* those states).
+    /// `entangled doctor` is the tool that *diagnoses* those states).
     #[test]
     fn open_validates_api_and_caps() {
         if !std::path::Path::new("/dev/kvm").exists() {

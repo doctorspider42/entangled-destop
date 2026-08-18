@@ -1,4 +1,4 @@
-//! Guest physical memory layout for the VMHost x86-64 machine.
+//! Guest physical memory layout for the Entangled Desktop x86-64 machine.
 //!
 //! Addresses follow the Linux x86 boot protocol conventions used by other
 //! rust-vmm based VMMs so a stock `bzImage` boots without firmware.

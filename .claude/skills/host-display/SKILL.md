@@ -58,7 +58,7 @@ permissive; some wgpu backends pull extra deps).
 
 - Keep all geometry/mapping logic as pure functions (like `letterbox`) with
   unit tests; the windowed path cannot run headless in CI.
-- `vmhost` screenshot support (MVP-707): copy the scanout texture to a
+- `entangled` screenshot support (MVP-707): copy the scanout texture to a
   buffer and encode PNG — this is also how graphical acceptance tests
   compare against golden images (see vm-testing skill).
 - FPS/copy statistics behind a debug overlay or periodic `tracing` event

@@ -1,12 +1,12 @@
 ---
 name: debian-media
-description: The Debian downloader — channel/version resolution, OpenPGP + SHA-512 verification chain, cache and provenance manifests (backlog EPIC 6, crate debian-media). Load before working on vmhost fetch or media verification.
+description: The Debian downloader — channel/version resolution, OpenPGP + SHA-512 verification chain, cache and provenance manifests (backlog EPIC 6, crate debian-media). Load before working on entangled fetch or media verification.
 ---
 
 # Debian media handling
 
 Scope: backlog EPIC 6 (MVP-601…611), crate `crates/debian-media`, surfaced as
-`vmhost fetch`.
+`entangled fetch`.
 
 ## Existing pieces
 
@@ -77,12 +77,12 @@ key pinned before it becomes `stable`; the CD keys are long-lived.
   interruption; hash state cannot resume across runs, so re-hash the existing
   prefix on resume. Downloads land in `<file>.part` and are renamed only after
   the digest check.
-- Cache layout: `$XDG_CACHE_HOME/vmhost/media/<version>/<arch>-<variant>/<file>`
+- Cache layout: `$XDG_CACHE_HOME/entangled/media/<version>/<arch>-<variant>/<file>`
   plus `<file>.manifest.toml`. The `<arch>-<variant>` component is not
   decoration: text and GTK netboot both publish files called `linux` and
   `initrd.gz` with *different* initrds, so a flat per-version directory would
   serve the wrong image.
-- Re-fetch is a no-op when the manifest verifies (`vmhost fetch` twice = one
+- Re-fetch is a no-op when the manifest verifies (`entangled fetch` twice = one
   download, and in fact zero network access). `--refresh` forces revalidation
   against the signed root, `--offline` forbids the network entirely.
 - Discovery must pick the plain `debian-<ver>-<arch>-netinst.iso`, not

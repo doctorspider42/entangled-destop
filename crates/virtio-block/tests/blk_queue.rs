@@ -43,7 +43,7 @@ const T_GET_ID: u32 = 8;
 static NEXT_IMAGE: AtomicUsize = AtomicUsize::new(0);
 
 fn temp_image(sectors: u64) -> PathBuf {
-    let dir = std::env::temp_dir().join("vmhost-blk-queue-tests");
+    let dir = std::env::temp_dir().join("entangled-blk-queue-tests");
     std::fs::create_dir_all(&dir).expect("temp dir");
     let id = NEXT_IMAGE.fetch_add(1, Ordering::AcqRel);
     let path = dir.join(format!("img-{}-{id}.raw", std::process::id()));

@@ -12,7 +12,7 @@ cargo build --quiet --release --target x86_64-unknown-linux-musl \
 mkdir -p artifacts/tests
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-cp guest/test-rootfs/init-rs/target/x86_64-unknown-linux-musl/release/vmhost-test-init "$stage/init"
+cp guest/test-rootfs/init-rs/target/x86_64-unknown-linux-musl/release/entangled-test-init "$stage/init"
 (cd "$stage" && echo init | cpio -o -H newc --quiet | gzip -9) \
     > artifacts/tests/test-initramfs.cpio.gz
 
