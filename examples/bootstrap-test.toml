@@ -1,0 +1,13 @@
+# Boots the bootstrap kernel + initramfs (EPIC 11 artifacts):
+#   bash guest/bootstrap-kernel/build.sh && bash scripts/build-bootstrap-initramfs.sh
+# Without a [[disk]] this exercises the missing-rootfs diagnostic (MVP-1106);
+# point [[disk]] at an installed image to switch_root into it.
+name = "bootstrap-test"
+memory_mib = 512
+vcpus = 1
+
+[boot]
+mode = "direct-linux"
+kernel = "artifacts/bootstrap/vmlinuz"
+initramfs = "artifacts/bootstrap/initrd.img"
+cmdline = "console=ttyS0 earlyprintk=serial panic=1 reboot=k root=/dev/vda1"

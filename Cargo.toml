@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["guest/test-rootfs/init-rs"]
+exclude = ["guest/test-rootfs/init-rs", "guest/bootstrap-initramfs/init-rs"]
 members = [
     "crates/vmm-core",
     "crates/machine-x86",

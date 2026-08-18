@@ -9,8 +9,10 @@ fn main() {
     // halts the vCPU forever. With `reboot=k` the kernel's restart chain ends
     // in a triple fault, which reaches the host as KVM_EXIT_SHUTDOWN and
     // terminates the VM cleanly.
-    // SAFETY: plain syscalls; as PID 1 we hold CAP_SYS_BOOT.
+    // SAFETY: plain syscalls; as PID 1 we hold CAP_SYS_BOOT. tcdrain flushes
+    // the serial console before the reboot triple-faults the machine.
     unsafe {
+        libc::tcdrain(1);
         libc::sync();
         libc::reboot(libc::LINUX_REBOOT_CMD_RESTART);
     }
