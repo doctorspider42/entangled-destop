@@ -121,6 +121,7 @@ impl DisplayHost {
             occluded: false,
             grabbed: false,
             cursor_visible: true,
+            applied_title: String::new(),
             fullscreen: false,
             mode: ScaleMode::default(),
             reporter: StatsReporter::default(),
@@ -153,6 +154,13 @@ struct App {
     grabbed: bool,
     /// Cursor visibility actually applied to the window (WIN-1501).
     cursor_visible: bool,
+    /// Title text actually applied to the window.
+    ///
+    /// Every `set_title` is an X11/Wayland round trip, and winit's X11 backend
+    /// `expect()`s on it — with `panic = "abort"` in the release profile a
+    /// hiccup on that connection would take the *guest* down with the window.
+    /// So the title is only ever pushed when the text really changed.
+    applied_title: String,
     /// Borderless-fullscreen state (WIN-1504).
     fullscreen: bool,
     /// Fit or 1:1 (WIN-1503/1504).
@@ -190,8 +198,9 @@ impl App {
         // WIN-1503: free manual resizing, with a floor that keeps the letterboxed
         // image usable and a maximized start when the guest is as big as the
         // screen.
+        self.applied_title = self.window_title();
         let attributes = Window::default_attributes()
-            .with_title(self.window_title())
+            .with_title(self.applied_title.clone())
             .with_inner_size(winit::dpi::LogicalSize::new(initial.width, initial.height))
             .with_min_inner_size(winit::dpi::LogicalSize::new(
                 ux::MIN_WINDOW_WIDTH,
@@ -227,12 +236,16 @@ impl App {
     }
 
     /// Refreshes the title in place. Called only when the state behind it
-    /// changes, never per frame — `set_title` is a round trip to the compositor.
-    fn update_title(&self) {
+    /// changes, never per frame, and a no-op when the text is already there.
+    fn update_title(&mut self) {
         let title = self.window_title();
+        if title == self.applied_title {
+            return;
+        }
         if let Some(window) = self.window.as_ref() {
             window.set_title(&title);
         }
+        self.applied_title = title;
     }
 
     /// Physical window size, or `None` before the window exists.

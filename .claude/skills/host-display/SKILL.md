@@ -116,6 +116,11 @@ Rules to keep when extending this:
 - Reserved shortcuts must also work while ungrabbed (`Ctrl+Alt+Q` on a window
   the user has not clicked into yet), which is why key tracking cannot be gated
   on the grab — only *forwarding* is.
+- **winit's X11 backend `expect()`s on most requests** (`set_title` among them)
+  and the release profile is `panic = "abort"`, so a broken X connection kills
+  the process — and with it the guest. Talk to the window as little as possible:
+  title and cursor updates are deduplicated against the applied state, and
+  nothing window-related runs per frame. Do not add per-frame `set_*` calls.
 - `write_texture` rows must respect 256-byte `bytes_per_row` alignment for
   buffer-to-texture copies — `write_texture` from CPU memory handles padding
   internally, buffer copies do not.
