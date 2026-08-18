@@ -22,9 +22,10 @@ use crate::disk;
 use crate::diskfs;
 use crate::InstallArgs;
 
-/// Static guest address matching scripts/setup-tap.sh's 172.30.0.1/24 host side.
-const GUEST_IP: &str = "172.30.0.2";
-const GUEST_GATEWAY: &str = "172.30.0.1";
+/// Static guest address matching scripts/setup-tap.sh's defaults
+/// (host side 192.168.73.1/24).
+const GUEST_IP: &str = "192.168.73.2";
+const GUEST_GATEWAY: &str = "192.168.73.1";
 const GUEST_NETMASK: &str = "255.255.255.0";
 const GUEST_DNS: &str = "1.1.1.1";
 
@@ -238,6 +239,21 @@ fn preseeded_initrd(base_initrd: &Path, preseed: &[u8], disk: &Path) -> Result<P
 
     let mut archive = Vec::new();
     write_newc_entry(&mut archive, "preseed.cfg", preseed, 0o100_644);
+    // Payload files for late_command: shipped as-is so no shell escaping ever
+    // crosses the debconf boundary (see assets/preseed/auto-weston.cfg).
+    write_newc_dir(&mut archive, "entangled");
+    write_newc_entry(
+        &mut archive,
+        "entangled/autologin.conf",
+        include_bytes!("../../../assets/preseed/autologin.conf"),
+        0o100_644,
+    );
+    write_newc_entry(
+        &mut archive,
+        "entangled/weston-profile.sh",
+        include_bytes!("../../../assets/preseed/weston-profile.sh"),
+        0o100_644,
+    );
     write_newc_trailer(&mut archive);
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -279,6 +295,10 @@ fn write_newc_entry(out: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) {
     pad4(out);
     out.extend_from_slice(data);
     pad4(out);
+}
+
+fn write_newc_dir(out: &mut Vec<u8>, name: &str) {
+    write_newc_entry(out, name, &[], 0o040_755);
 }
 
 fn write_newc_trailer(out: &mut Vec<u8>) {
@@ -348,8 +368,8 @@ mod tests {
             "auto=true",
             "priority=critical",
             "netcfg/disable_autoconfig=true",
-            "netcfg/get_ipaddress=172.30.0.2",
-            "netcfg/get_gateway=172.30.0.1",
+            "netcfg/get_ipaddress=192.168.73.2",
+            "netcfg/get_gateway=192.168.73.1",
             "console=ttyS0",
         ] {
             assert!(c.contains(needle), "missing {needle} in: {c}");

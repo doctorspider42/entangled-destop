@@ -205,6 +205,11 @@ table inet entangled {
     }
     chain forward {
         type filter hook forward priority filter; policy accept;
+        # MSS clamp to path MTU: the guest sees MTU 1500 on the TAP, but the
+        # uplink can be smaller (WSL2 eth0 is 1472); without clamping, bulk
+        # TCP from the internet stalls mid-transfer (observed: d-i dying on
+        # "Downloading Release files" and blaming the mirror).
+        tcp flags syn tcp option maxseg size set rt mtu
         iifname "$IFACE" oifname "$UPLINK" accept
         iifname "$UPLINK" oifname "$IFACE" ct state established,related accept
     }
