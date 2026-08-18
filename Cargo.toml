@@ -24,18 +24,18 @@ license = "Apache-2.0"
 repository = "https://example.invalid/vmhost"
 
 [workspace.dependencies]
-# internal crates
-vmm-core = { path = "crates/vmm-core" }
-machine-x86 = { path = "crates/machine-x86" }
-linux-boot = { path = "crates/linux-boot" }
-virtio-core = { path = "crates/virtio-core" }
-virtio-block = { path = "crates/virtio-block" }
-virtio-net = { path = "crates/virtio-net" }
-virtio-gpu = { path = "crates/virtio-gpu" }
-virtio-input = { path = "crates/virtio-input" }
-display = { path = "crates/display" }
-debian-media = { path = "crates/debian-media" }
-control-api = { path = "crates/control-api" }
+# internal crates (version present so `cargo deny` wildcard ban is satisfied)
+vmm-core = { path = "crates/vmm-core", version = "0.1.0" }
+machine-x86 = { path = "crates/machine-x86", version = "0.1.0" }
+linux-boot = { path = "crates/linux-boot", version = "0.1.0" }
+virtio-core = { path = "crates/virtio-core", version = "0.1.0" }
+virtio-block = { path = "crates/virtio-block", version = "0.1.0" }
+virtio-net = { path = "crates/virtio-net", version = "0.1.0" }
+virtio-gpu = { path = "crates/virtio-gpu", version = "0.1.0" }
+virtio-input = { path = "crates/virtio-input", version = "0.1.0" }
+display = { path = "crates/display", version = "0.1.0" }
+debian-media = { path = "crates/debian-media", version = "0.1.0" }
+control-api = { path = "crates/control-api", version = "0.1.0" }
 
 # rust-vmm (Linux-only, gate behind cfg(target_os = "linux"))
 kvm-ioctls = "0.24"

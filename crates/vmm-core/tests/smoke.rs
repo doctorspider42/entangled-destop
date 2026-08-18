@@ -54,6 +54,13 @@ fn load_real_mode(vm: &mut Vm, code: &[u8]) -> vmm_core::Vcpu {
     let mut sregs = vcpu.fd().get_sregs().unwrap();
     sregs.cs.base = 0;
     sregs.cs.selector = 0;
+    // IDT limit 0: any exception (the final ud2) escalates straight to a
+    // triple fault => deterministic KVM_EXIT_SHUTDOWN. With the default
+    // real-mode limit of 0xffff, vector 6 would be read from zeroed guest
+    // memory and the guest would slide through zeros forever instead of
+    // shutting down.
+    sregs.idt.base = 0;
+    sregs.idt.limit = 0;
     vcpu.fd().set_sregs(&sregs).unwrap();
     let mut regs = vcpu.fd().get_regs().unwrap();
     regs.rip = CODE_ADDR;
