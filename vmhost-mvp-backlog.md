@@ -675,6 +675,53 @@ Pierwszy efekt „własny host odpala Linuksa” powinien pojawić się po okoł
 
 ---
 
+# 8a. Backlog post-MVP (dopisane 2026-08-18 po dowiezieniu MVP)
+
+## EPIC 15 — Okno VM: kursor i skalowanie
+
+| ID | Zadanie | Priorytet |
+|---|---|---:|
+| WIN-1501 | Ukrywanie kursora hosta nad ekranem gościa przy aktywnym grabie | P0 |
+| WIN-1502 | Ctrl+Alt zwraca kursor (zwalnia grab); klik w obraz gościa przywraca grab | P0 |
+| WIN-1503 | Swobodne ręczne skalowanie okna (resize z zachowaniem letterboxa) | P0 |
+| WIN-1504 | Pełny ekran (F11) i tryb 1:1 | P1 |
+
+## EPIC 16 — Menedżer GUI (natywny, bez Electrona)
+
+Elegancki, nowoczesny, lekko futurystyczny UI nawiązujący do mechaniki
+kwantowej (motyw splątania). Stack: egui/eframe na wgpu — natywnie, wydajnie.
+
+| ID | Zadanie | Priorytet |
+|---|---|---:|
+| GUI-1601 | Aplikacja `entangled-manager`: lista maszyn (profil + status) | P0 |
+| GUI-1602 | Kreator nowej maszyny (nazwa/RAM/vCPU/dysk) z automatyczną instalacją | P0 |
+| GUI-1603 | Start/Stop maszyny (proces potomny `entangled run`) | P0 |
+| GUI-1604 | Usuwanie maszyny (dysk + profil) z potwierdzeniem | P0 |
+| GUI-1605 | Podgląd logu instalacji/konsoli w UI | P1 |
+| GUI-1606 | Motyw "quantum": ciemny, akcenty cyan/fiolet, subtelne animacje | P0 |
+
+## EPIC 17 — Natywny host Windows (WHP)
+
+Zgodnie z ADR-0002: drugi backend hypervisora za traitem.
+
+| ID | Zadanie | Priorytet |
+|---|---|---:|
+| WHP-1701 | Trait `Hypervisor/Vm/Vcpu` w vmm-core; backend KVM za nim | P0 |
+| WHP-1702 | Backend WHP: partycja, pamięć, vCPU, pętla run, exity IO/MMIO | P0 |
+| WHP-1703 | Userspace PIC/IOAPIC/PIT (WHP daje tylko lokalny APIC) | P0 |
+| WHP-1704 | Sieć user-mode (smoltcp NAT) — bez TAP, bez GPL | P0 |
+| WHP-1705 | Budowa i testy na Windows (toolchain gnu, CI matrix) | P0 |
+
+## EPIC 18 — UEFI i akceleracja GPU
+
+| ID | Zadanie | Priorytet |
+|---|---|---:|
+| UEFI-1801 | Urządzenie pflash + mapowanie firmware w pamięci gościa | P0 |
+| UEFI-1802 | Firmware EDK2 (wariant CloudHv-style, virtio-mmio) — build + boot | P0 |
+| UEFI-1803 | Boot ISO Ubuntu przez UEFI (virtio-blk read-only jako nośnik) | P0 |
+| UEFI-1804 | Instalacja i boot Ubuntu end-to-end | P0 |
+| GPU-18xx | VirGL/Rutabaga wg istniejącej sekcji 7 (GPU-001..012) | P1 |
+
 # 9. Następna faza po MVP
 
 Najbardziej logiczny kolejny etap:
