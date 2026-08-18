@@ -1,0 +1,12 @@
+# Boots the test artifacts to the serial console on stdout:
+#   scripts/fetch-test-kernel.sh && scripts/build-test-initramfs.sh
+#   cargo run -p vmhost-cli -- run examples/boot-test.toml
+name = "boot-test"
+memory_mib = 256
+vcpus = 1
+
+[boot]
+mode = "direct-linux"
+kernel = "artifacts/tests/vmlinuz"
+initramfs = "artifacts/tests/test-initramfs.cpio.gz"
+cmdline = "console=ttyS0 earlyprintk=serial panic=1 reboot=k"

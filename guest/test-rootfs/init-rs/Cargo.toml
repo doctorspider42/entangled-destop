@@ -1,0 +1,18 @@
+# Standalone project (excluded from the workspace): the tiny static /init
+# for test initramfs images (backlog MVP-207). Built for
+# x86_64-unknown-linux-musl by scripts/build-test-initramfs.sh.
+
+[package]
+name = "vmhost-test-init"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

@@ -13,8 +13,8 @@ thiserror.workspace = true
 kvm-ioctls.workspace = true
 kvm-bindings.workspace = true
 vm-memory.workspace = true
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+vm-superio.workspace = true
+vmm-sys-util.workspace = true
 vmm-core.workspace = true
 
 [lints]

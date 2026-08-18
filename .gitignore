@@ -1,9 +1,9 @@
 /target
 **/*.rs.bk
-Cargo.lock.orig
 /artifacts
 /images
 *.raw
 *.iso
 .vscode/
 .idea/
+guest/test-rootfs/init-rs/target/

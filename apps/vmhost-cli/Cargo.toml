@@ -19,5 +19,9 @@ control-api.workspace = true
 debian-media.workspace = true
 vmm-core.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+machine-x86.workspace = true
+linux-boot.workspace = true
+
 [lints]
 workspace = true

@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["guest/test-rootfs/init-rs"]
 members = [
     "crates/vmm-core",
     "crates/machine-x86",
@@ -43,7 +44,7 @@ vm-memory = { version = "0.17", features = ["backend-mmap"] }
 linux-loader = { version = "0.14", features = ["bzimage", "elf"] }
 vmm-sys-util = "0.15"
 virtio-queue = "0.17"
-vm-superio = "0.9"
+vm-superio = "0.8"
 
 # general
 thiserror = "2"

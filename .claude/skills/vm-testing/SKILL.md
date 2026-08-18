@@ -51,8 +51,12 @@ unit tests live with their crates.
 - The minimal test initramfs `/init` prints the ready marker, optionally
   runs a scripted probe (mount `/dev/vda`, `evtest`, DHCP check), prints a
   per-check `VMHOST_TEST_OK <name>` / `VMHOST_TEST_FAIL <name>` line, then
-  powers off. Test harnesses parse only these markers — never scrape free-form
-  kernel output.
+  calls `reboot(RESTART)` — NOT power-off: the machine has no ACPI, so
+  power-off halts forever, while restart (with `reboot=k`) ends in a triple
+  fault that reaches the host as a clean KVM_EXIT_SHUTDOWN. Test harnesses
+  parse only these markers — never scrape free-form kernel output.
+- Sources: `guest/test-rootfs/init-rs` (static musl init), built by
+  `scripts/build-test-initramfs.sh`; kernel via `scripts/fetch-test-kernel.sh`.
 
 ## Fuzzing (MVP-1402)
 

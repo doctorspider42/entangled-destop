@@ -2,6 +2,8 @@
 
 mod disk;
 mod doctor;
+#[cfg(target_os = "linux")]
+mod run_vm;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -101,10 +103,18 @@ fn run(cli: Cli) -> Result<(), String> {
             let text = std::fs::read_to_string(&config)
                 .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
             let cfg = control_api::VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
-            Err(format!(
-                "config '{}' is valid, but running VMs is not implemented yet (backlog EPIC 1/2)",
-                cfg.name
-            ))
+            #[cfg(target_os = "linux")]
+            {
+                run_vm::run(cfg)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(format!(
+                    "config '{}' is valid, but running VMs requires a Linux host with KVM \
+                     (on Windows use WSL2)",
+                    cfg.name
+                ))
+            }
         }
     }
 }

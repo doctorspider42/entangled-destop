@@ -282,6 +282,7 @@ dependencies = [
  "machine-x86",
  "thiserror",
  "vm-memory 0.17.2",
+ "vmm-core",
 ]
 
 [[package]]
@@ -307,7 +308,9 @@ dependencies = [
  "kvm-ioctls",
  "thiserror",
  "vm-memory 0.17.2",
+ "vm-superio",
  "vmm-core",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -727,12 +730,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vm-superio"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69c376a9b84afdf97bddd2628096cf3554208b2a676cf06b4532e0f433a54e02"
+
+[[package]]
 name = "vmhost-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
  "control-api",
  "debian-media",
+ "linux-boot",
+ "machine-x86",
  "thiserror",
  "tracing",
  "tracing-subscriber",
