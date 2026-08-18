@@ -704,13 +704,28 @@ kwantowej (motyw splątania). Stack: egui/eframe na wgpu — natywnie, wydajnie.
 
 Zgodnie z ADR-0002: drugi backend hypervisora za traitem.
 
-| ID | Zadanie | Priorytet |
-|---|---|---:|
-| WHP-1701 | Trait `Hypervisor/Vm/Vcpu` w vmm-core; backend KVM za nim | P0 |
-| WHP-1702 | Backend WHP: partycja, pamięć, vCPU, pętla run, exity IO/MMIO | P0 |
-| WHP-1703 | Userspace PIC/IOAPIC/PIT (WHP daje tylko lokalny APIC) | P0 |
-| WHP-1704 | Sieć user-mode (smoltcp NAT) — bez TAP, bez GPL | P0 |
-| WHP-1705 | Budowa i testy na Windows (toolchain gnu, CI matrix) | P0 |
+| ID | Zadanie | Priorytet | Status |
+|---|---|---:|---|
+| WHP-1701 | Trait `Hypervisor/Vm/Vcpu` w vmm-core; backend KVM za nim | P0 | zrobione |
+| WHP-1702 | Backend WHP: partycja, pamięć, vCPU, pętla run, exity IO/MMIO | P0 | zrobione poza MMIO (patrz niżej) |
+| WHP-1703 | Userspace PIC/IOAPIC/PIT (WHP daje tylko lokalny APIC) | P0 | |
+| WHP-1704 | Sieć user-mode (smoltcp NAT) — bez TAP, bez GPL | P0 | |
+| WHP-1705 | Budowa i testy na Windows (toolchain gnu, CI matrix) | P0 | testy lokalnie zielone; brak joba w CI |
+
+Faza 1 (WHP-1701 + WHP-1702) działa na sprzęcie: gość w trybie rzeczywistym
+wykonuje kod, `out` trafia do `ExitHandler`, 100 cykli create/destroy nie
+przecieka. Pamięć gościa jest już przenośna — `vm-memory` ma backend na
+Windows (VirtualAlloc), blokowała tylko domyślna cecha `rawfd`.
+
+MMIO zostaje na fazę 2: exit `WHvRunVpExitReasonMemoryAccess` nie podaje ani
+szerokości dostępu, ani danych, więc virtio-mmio wymaga emulatora instrukcji
+WHP (`WHvEmulatorTryMmioEmulation`). Szczegóły i pełna lista fazy 2:
+`.claude/skills/whp-backend/SKILL.md`.
+
+Blokada przed fazą 2: `virtio-queue` 0.17 zależy od `vm-memory` bez
+`default-features = false`, więc włącza uniksową cechę `rawfd` w całym grafie i
+skrzynki `virtio-*` oraz `display` nie budują się na Windows. Cechy Cargo są
+addytywne — nie da się tego wyłączyć u nas (patrz ADR-0002).
 
 ## EPIC 18 — UEFI i akceleracja GPU
 

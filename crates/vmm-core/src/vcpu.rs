@@ -9,37 +9,14 @@ use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vmm_sys_util::signal::{register_signal_handler, Killable};
 
 use crate::hv::{
-    HvError, VcpuRegisters, X86DescriptorTable, X86Registers, X86Segment, X86SpecialRegisters,
+    ExitHandler, HvError, RunOutcome, VcpuRegisters, X86DescriptorTable, X86Registers, X86Segment,
+    X86SpecialRegisters,
 };
 use crate::VmmError;
 
 /// RT signal used to kick vCPU threads out of KVM_RUN.
 fn kick_signal() -> i32 {
     libc::SIGRTMIN()
-}
-
-/// How a vCPU's run loop ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunOutcome {
-    /// KVM_EXIT_HLT reached userspace. Note: with the in-kernel irqchip the
-    /// kernel emulates HLT internally (the vCPU blocks waiting for an
-    /// interrupt), so this exit only surfaces on machines without it. Test
-    /// guests signal completion via triple fault ([`RunOutcome::Shutdown`])
-    /// instead.
-    Halted,
-    /// Guest requested shutdown (triple fault / KVM_EXIT_SHUTDOWN).
-    Shutdown,
-    /// The host asked the loop to stop.
-    Stopped,
-}
-
-/// Where VM exits are dispatched. The device bus implements this; tests use
-/// small recording handlers.
-pub trait ExitHandler: Send {
-    fn io_out(&mut self, port: u16, data: &[u8]);
-    fn io_in(&mut self, port: u16, data: &mut [u8]);
-    fn mmio_write(&mut self, addr: u64, data: &[u8]);
-    fn mmio_read(&mut self, addr: u64, data: &mut [u8]);
 }
 
 /// One virtual CPU. All KVM vCPU ioctls must come from the owning thread.

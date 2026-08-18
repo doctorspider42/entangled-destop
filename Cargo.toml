@@ -52,7 +52,15 @@ control-api = { path = "crates/control-api", version = "0.1.0" }
 # rust-vmm (Linux-only, gate behind cfg(target_os = "linux"))
 kvm-ioctls = "0.24"
 kvm-bindings = "0.14"
-vm-memory = { version = "0.17", features = ["backend-mmap"] }
+# vm-memory is PORTABLE (EPIC 17 / ADR-0002): its `backend-mmap` region type
+# is VirtualAlloc-backed on Windows and mmap-backed on unix. The default
+# `rawfd` feature is what is unix-only — upstream even has a
+# `compile_error!("rawfd feature is not supported on Windows targets!")` — and
+# nothing in this workspace uses the fd-based `ReadVolatile`/`WriteVolatile`
+# impls it provides, so it stays off everywhere.
+vm-memory = { version = "0.17", default-features = false, features = [
+    "backend-mmap",
+] }
 linux-loader = { version = "0.14", features = ["bzimage", "elf"] }
 vmm-sys-util = "0.15"
 virtio-queue = "0.17"
@@ -106,6 +114,11 @@ eframe = { version = "0.32", default-features = false, features = [
     "x11",
     "wayland",
 ] }
+=======
+# Native Windows host (EPIC 17, ADR-0002). Microsoft's official bindings,
+# MIT OR Apache-2.0; only ever referenced from
+# `[target.'cfg(windows)'.dependencies]`.
+windows = { version = "0.62", default-features = false }
 
 # Installer mode (EPIC 10): gzip for the preseed initrd append.
 flate2 = "1"

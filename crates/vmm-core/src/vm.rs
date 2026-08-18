@@ -7,15 +7,9 @@ use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_
 use kvm_ioctls::VmFd;
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
 
+use crate::hv::MachineConfig;
 use crate::memory::{create_guest_memory, GuestMem};
 use crate::{Hypervisor, Vcpu, VmmError};
-
-/// Hardware shape of a VM, independent of what it boots.
-#[derive(Debug, Clone, Copy)]
-pub struct MachineConfig {
-    pub memory_mib: u64,
-    pub vcpu_count: u32,
-}
 
 /// A configured (not yet running) virtual machine: guest memory registered,
 /// in-kernel IRQ chip and PIT created, vCPUs created with CPUID set.
