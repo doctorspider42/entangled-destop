@@ -39,13 +39,14 @@ wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace
 | `crates/debian-media` | Debian download, PGP+SHA-512 verification, cache, manifests | EPIC 6 |
 | `crates/control-api` | VM config model (TOML), lifecycle API for CLI/GUI | EPIC 12 |
 | `apps/entangled` | `entangled` binary: fetch/disk/install/run/doctor | EPIC 10/12 |
+| `apps/manager` | `entangled-manager`: native egui GUI, drives the CLI as child processes | EPIC 16 |
 
 ## Skills
 
 Task-focused guides for working in this repo live in `.claude/skills/`:
 `kvm-machine`, `linux-direct-boot`, `virtio-device`, `debian-media`,
-`host-display`, `vm-testing`. Load the matching skill before working on that
-subsystem.
+`host-display`, `vm-testing`, `gui-manager`. Load the matching skill before
+working on that subsystem.
 
 ## Hard rules
 

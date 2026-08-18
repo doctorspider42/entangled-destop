@@ -38,6 +38,40 @@ second run over an intact cache performs no network access at all; nothing is
 marked ready before both its OpenPGP signature and its digest check pass, and a
 failed check removes the partial file.
 
+## Desktop manager (GUI)
+
+`entangled-manager` is a native desktop front end for the same flows — no
+Electron, no browser: egui/eframe rendering through wgpu, the stack the VM
+window already uses.
+
+```bash
+cargo build --workspace     # puts entangled and entangled-manager side by side
+entangled-manager           # or: entangled-manager --vm-dir ~/vms
+```
+
+It scans a VM directory (default `~/entangled-vms`, changeable in Settings and
+persisted to `~/.config/entangled/manager.toml`) and shows a card per profile
+with its memory, vCPUs, resolution, network interface, image size and how much
+of it is actually allocated on disk. From there:
+
+- **Start / Stop** — `entangled run <profile>` as a tracked child process; the
+  VM opens its own window, Stop sends a termination signal so the guest shuts
+  down cleanly. Closing the manager leaves running VMs alone; they are not its
+  children's keeper, only their launcher.
+- **New machine** — a wizard for name, memory, vCPUs, disk size and installer
+  variant that runs `entangled install debian --auto` and streams the installer
+  console into the log pane while a card tracks it as *Installing*.
+- **Delete** — refuses while the machine is busy, then asks for the name to be
+  typed out; disks that live outside the VM directory are left alone.
+- **Console** — the child's stdout/stderr is written to
+  `<vm-dir>/<name>-{run,install}.log` and tailed live in the UI, so a failure
+  leaves both an on-screen explanation and a file to inspect. Common causes
+  (a TAP already held by another VM, no `/dev/kvm`, a missing bootstrap kernel)
+  are recognised and explained in one sentence.
+
+The manager itself is host-agnostic: it builds on Windows as well, where the
+stop signal falls back to terminating the process.
+
 ## Requirements
 
 - Linux x86-64 host with KVM (`/dev/kvm`)
@@ -52,6 +86,7 @@ Development on Windows works through WSL2 (Ubuntu), which exposes a real
 - `crates/` — VMM libraries (KVM core, machine model, direct Linux boot,
   virtio transport and devices, display, Debian media handling, control API)
 - `apps/entangled` — the `entangled` binary
+- `apps/manager` — `entangled-manager`, the native desktop GUI
 - `guest/` — bootstrap kernel/initramfs configs and test rootfs
 - `tests/` — boot, installer and graphical integration tests
 
