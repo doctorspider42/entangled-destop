@@ -3,6 +3,9 @@
 
 pub mod layout;
 
+#[cfg(target_os = "linux")]
+pub mod boot;
+
 /// E820 memory range types as defined by the BIOS/ACPI interface and consumed
 /// by the Linux boot protocol's `boot_params.e820_table`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

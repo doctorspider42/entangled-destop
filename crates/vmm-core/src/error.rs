@@ -12,6 +12,10 @@ pub enum VmmError {
     #[error("required KVM capability missing: {0}")]
     MissingCapability(&'static str),
 
+    #[cfg(target_os = "linux")]
+    #[error("KVM operation failed: {0}")]
+    Kvm(#[from] kvm_ioctls::Error),
+
     #[error("guest memory setup failed: {0}")]
     GuestMemory(String),
 

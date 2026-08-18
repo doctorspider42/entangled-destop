@@ -14,5 +14,8 @@ kvm-ioctls.workspace = true
 kvm-bindings.workspace = true
 vm-memory.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+vmm-core.workspace = true
+
 [lints]
 workspace = true

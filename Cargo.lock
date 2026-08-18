@@ -307,6 +307,7 @@ dependencies = [
  "kvm-ioctls",
  "thiserror",
  "vm-memory 0.17.2",
+ "vmm-core",
 ]
 
 [[package]]
@@ -744,6 +745,7 @@ version = "0.1.0"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
+ "libc",
  "thiserror",
  "tracing",
  "vm-memory 0.17.2",

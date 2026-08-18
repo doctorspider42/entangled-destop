@@ -10,9 +10,21 @@ mod state;
 
 #[cfg(target_os = "linux")]
 mod hypervisor;
+#[cfg(target_os = "linux")]
+mod memory;
+#[cfg(target_os = "linux")]
+mod vcpu;
+#[cfg(target_os = "linux")]
+mod vm;
 
 pub use error::VmmError;
 pub use state::{VmState, VmStateError};
 
 #[cfg(target_os = "linux")]
 pub use hypervisor::{HostCapabilities, Hypervisor, MIN_KVM_API_VERSION};
+#[cfg(target_os = "linux")]
+pub use memory::{create_guest_memory, GuestMem};
+#[cfg(target_os = "linux")]
+pub use vcpu::{spawn_vcpus, ExitHandler, RunOutcome, Vcpu, VcpuThreads};
+#[cfg(target_os = "linux")]
+pub use vm::{MachineConfig, Vm};

@@ -6,6 +6,22 @@
 /// Start of the Extended BIOS Data Area; usable low RAM ends here.
 pub const EBDA_START: u64 = 0x0009_fc00;
 
+/// Boot GDT written by the host before starting vCPU0 in long mode.
+pub const BOOT_GDT_START: u64 = 0x0000_0500;
+
+/// Boot IDT (a single zeroed entry — interrupts are off until the kernel
+/// installs its own).
+pub const BOOT_IDT_START: u64 = 0x0000_0520;
+
+/// Initial stack pointer for the 64-bit kernel entry.
+pub const BOOT_STACK_POINTER: u64 = 0x0000_8ff0;
+
+/// Identity-map page tables built by the host: PML4, one PDPT and four page
+/// directories (2 MiB pages covering the first 4 GiB).
+pub const PML4_START: u64 = 0x0000_9000;
+pub const PDPTE_START: u64 = 0x0000_a000;
+pub const PD_START: u64 = 0x0000_b000;
+
 /// Conventional "high memory" start (1 MiB); the kernel is loaded above this.
 pub const HIGH_RAM_START: u64 = 0x0010_0000;
 
