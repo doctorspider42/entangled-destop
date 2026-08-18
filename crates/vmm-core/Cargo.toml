@@ -10,13 +10,20 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+# Portable: the mmap backend is VirtualAlloc-backed on Windows (see the
+# workspace manifest and ADR-0002).
+vm-memory.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-ioctls.workspace = true
 kvm-bindings.workspace = true
-vm-memory.workspace = true
 vmm-sys-util.workspace = true
 libc.workspace = true
+
+# Windows Hypervisor Platform backend (EPIC 17). `windows` is Microsoft's
+# official binding crate, MIT OR Apache-2.0.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Hypervisor"] }
 
 [lints]
 workspace = true

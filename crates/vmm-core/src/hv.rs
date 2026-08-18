@@ -12,6 +12,14 @@
 
 use thiserror::Error;
 
+/// Hardware shape of a VM, independent of what it boots and of which
+/// hypervisor runs it.
+#[derive(Debug, Clone, Copy)]
+pub struct MachineConfig {
+    pub memory_mib: u64,
+    pub vcpu_count: u32,
+}
+
 /// General-purpose register state for an x86-64 vCPU, hypervisor-neutral.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct X86Registers {
@@ -123,10 +131,38 @@ pub enum VcpuEvent<'a> {
     Interrupted,
 }
 
+/// How a vCPU's run loop ended, hypervisor-neutral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The guest executed `hlt` and the exit reached userspace.
+    ///
+    /// KVM with an in-kernel irqchip emulates `hlt` in the kernel (the vCPU
+    /// blocks waiting for an interrupt), so this outcome only surfaces there
+    /// on machines without it; WHP always reports
+    /// `WHvRunVpExitReasonX64Halt` while local APIC emulation is off. Test
+    /// guests therefore accept either this or [`RunOutcome::Shutdown`].
+    Halted,
+    /// The guest asked to shut down: a triple fault (`KVM_EXIT_SHUTDOWN`), or
+    /// WHP's `UnrecoverableException`/`InvalidVpRegisterValue`.
+    Shutdown,
+    /// The host asked the loop to stop.
+    Stopped,
+}
+
+/// Where VM exits are dispatched. The device bus implements this; tests use
+/// small recording handlers. Shared by both backends.
+pub trait ExitHandler: Send {
+    fn io_out(&mut self, port: u16, data: &[u8]);
+    fn io_in(&mut self, port: u16, data: &mut [u8]);
+    fn mmio_write(&mut self, addr: u64, data: &[u8]);
+    fn mmio_read(&mut self, addr: u64, data: &mut [u8]);
+}
+
 /// Register-level access to one virtual CPU, implemented per hypervisor.
 ///
-/// The KVM implementation lives on [`crate::Vcpu`]; the WHP one arrives with
-/// EPIC 17. Machine setup code (machine-x86) must go through this trait.
+/// The KVM implementation lives on `crate::Vcpu`, the WHP one on
+/// `crate::whp::WhpVcpu`. Machine setup code (machine-x86) must go through
+/// this trait.
 pub trait VcpuRegisters {
     fn get_registers(&self) -> Result<X86Registers, HvError>;
     fn set_registers(&self, regs: &X86Registers) -> Result<(), HvError>;
