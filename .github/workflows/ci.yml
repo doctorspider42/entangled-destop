@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check licenses bans sources
+          command: check
 
   third-party-report:
     name: THIRD_PARTY_LICENSES + SBOM (MVP-006)
