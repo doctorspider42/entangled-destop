@@ -1,0 +1,45 @@
+[package]
+name = "entangled-manager"
+description = "Native desktop manager for Entangled Desktop virtual machines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "entangled-manager"
+path = "src/main.rs"
+
+[dependencies]
+egui.workspace = true
+eframe.workspace = true
+# Present only to align naga's feature set across the two wgpu majors in the
+# workspace — see the comment in the root Cargo.toml.
+naga.workspace = true
+# eframe's `wgpu` feature pulls wgpu in without any backend (backends only come
+# with eframe's `default` feature, which would also drag in glow). Declaring
+# wgpu here selects the same backend set `crates/display` uses; not used in code.
+# NOTE: version 25 on purpose — that is the major egui-wgpu 0.32 links against.
+wgpu = { version = "25", default-features = false, features = [
+    "wgsl",
+    "vulkan",
+    "gles",
+    "dx12",
+] }
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+png.workspace = true
+control-api.workspace = true
+
+# Only for the SIGTERM path of `stop`; every other process operation goes
+# through portable `std::process` (see ADR-0002 — this crate builds on Windows).
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true
