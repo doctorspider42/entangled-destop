@@ -20,6 +20,7 @@ members = [
     "crates/debian-media",
     "crates/control-api",
     "apps/entangled",
+    "apps/manager",
     "tests/boot",
 ]
 
@@ -86,6 +87,25 @@ wgpu = { version = "26", default-features = false, features = [
 ] }
 pollster = "0.4"
 png = "0.18"
+
+# Native GUI manager (EPIC 16). egui/eframe are MIT OR Apache-2.0 and ride the
+# wgpu backend the workspace already ships. Pinned to the 0.32 series: it is
+# the last one whose MSRV (1.85) still matches `workspace.package.rust-version`
+# (0.33 needs 1.88, 0.36 needs 1.95).
+egui = { version = "0.32", default-features = false }
+# Feature-unification fixup, not used in code: eframe 0.32 rides wgpu 25 while
+# `display` rides wgpu 26, so naga 25 and naga 26 share one `codespan-reporting`
+# 0.12. naga 25 asks for its `termcolor` feature, and naga 26 picks its
+# diagnostics writer type by *its own* feature flags — without this line naga 26
+# compiles the no-termcolor path against a termcolor-enabled dependency and
+# fails. Drop it when both crates agree on one wgpu major.
+naga = { version = "26", features = ["termcolor"] }
+eframe = { version = "0.32", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "x11",
+    "wayland",
+] }
 
 # Installer mode (EPIC 10): gzip for the preseed initrd append.
 flate2 = "1"

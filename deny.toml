@@ -24,6 +24,30 @@ allow = [
 ]
 confidence-threshold = 0.9
 
+# Per-crate exceptions (EPIC 16, the egui/eframe GUI tree). Each is permissive
+# and none carries a copyleft obligation on our code; they are scoped to the
+# exact crate rather than allowed workspace-wide.
+[[licenses.exceptions]]
+# egui's bundled UI fonts (Ubuntu Light, Hack, Noto Emoji) as *data*. OFL-1.1
+# and the Ubuntu Font Licence govern the font files: they forbid selling the
+# fonts alone and require derivative *fonts* to keep the licence, but place no
+# condition on the program that renders them, so the "no copyleft in host code"
+# rule (ADR-0001) still holds. We ship the fonts unmodified.
+name = "epaint_default_fonts"
+allow = ["OFL-1.1", "Ubuntu-font-1.0"]
+
+[[licenses.exceptions]]
+# Windows clipboard backend behind `arboard` (used by egui-winit, and only
+# compiled for windows targets). BSL-1.0 is OSI-approved, permissive and has no
+# reciprocity clause; it requires the notice only in source distributions.
+name = "clipboard-win"
+allow = ["BSL-1.0"]
+
+[[licenses.exceptions]]
+# Dependency of clipboard-win, same licence and same reasoning.
+name = "error-code"
+allow = ["BSL-1.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
@@ -41,6 +65,12 @@ ignore = [
     # RSA operations; debian-media only VERIFIES signatures with public keys —
     # no private-key RSA runs in this codebase. Revisit when rpgp bumps `rsa`.
     "RUSTSEC-2023-0071",
+    # `ttf-parser` is unmaintained (not a vulnerability) and reaches us through
+    # ab_glyph → epaint, i.e. the GUI text rasteriser. It only ever parses the
+    # fonts egui bundles with itself — no guest- or network-supplied font data —
+    # and no upgrade exists while egui uses ab_glyph. Revisit when egui moves to
+    # a maintained parser (skrifa).
+    "RUSTSEC-2026-0192",
 ]
 
 [sources]
