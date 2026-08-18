@@ -18,8 +18,8 @@ use debian_media::{FetchOptions, FetchReport, MediaKind};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
-use crate::diskfs;
 use crate::disk;
+use crate::diskfs;
 use crate::InstallArgs;
 
 /// Static guest address matching scripts/setup-tap.sh's 172.30.0.1/24 host side.
@@ -31,6 +31,9 @@ const GUEST_DNS: &str = "1.1.1.1";
 /// The maintained automated profile (EPIC 13). Compiled in so `--auto` works
 /// from any working directory.
 const AUTO_PRESEED: &str = include_str!("../../../assets/preseed/auto-weston.cfg");
+
+/// The project kernel that boots both installer and installed system.
+const BOOTSTRAP_KERNEL: &str = "artifacts/bootstrap/vmlinuz";
 
 pub fn run(args: &InstallArgs) -> Result<(), String> {
     if !args.distro.eq_ignore_ascii_case("debian") {
@@ -46,8 +49,19 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         FetchOptions::default(),
     )
     .map_err(|e| format!("cannot obtain installer media: {e}"))?;
-    let kernel = artifact_path(&report, MediaKind::Kernel)?;
     let initrd = artifact_path(&report, MediaKind::Initrd)?;
+    // The installer RUNS ON THE BOOTSTRAP KERNEL, not the fetched d-i kernel:
+    // Debian builds virtio_mmio without cmdline-device support, so their
+    // kernel cannot see our devices. The fetched kernel stays verified in the
+    // cache (useful for ISO flows post-MVP).
+    let kernel = PathBuf::from(BOOTSTRAP_KERNEL);
+    if !kernel.exists() {
+        return Err(format!(
+            "bootstrap kernel {BOOTSTRAP_KERNEL} not found — build it with \
+             `bash guest/bootstrap-kernel/build.sh` (the Debian installer kernel \
+             cannot drive virtio-mmio devices)"
+        ));
+    }
     tracing::info!(version = %report.version, variant = %args.variant, "installer media ready");
 
     // 2. Target disk (MVP-1001/1006).
@@ -71,15 +85,15 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             let mut content = std::fs::read(path)
                 .map_err(|e| format!("cannot read preseed {}: {e}", path.display()))?;
             if !content
-                .windows(b"preseed/early_command".len())
-                .any(|w| w == b"preseed/early_command")
+                .windows(b"anna/no_kernel_modules".len())
+                .any(|w| w == b"anna/no_kernel_modules")
             {
-                content.extend_from_slice(EARLY_MODPROBE_PRESEED.as_bytes());
+                content.extend_from_slice(KERNEL_COMPAT_PRESEED.as_bytes());
             }
             (content, true)
         }
         (None, true) => (AUTO_PRESEED.as_bytes().to_vec(), true),
-        (None, false) => (EARLY_MODPROBE_PRESEED.as_bytes().to_vec(), false),
+        (None, false) => (KERNEL_COMPAT_PRESEED.as_bytes().to_vec(), false),
     };
     let initramfs = preseeded_initrd(&initrd, &preseed, &args.disk)?;
     let cmdline = if automated {
@@ -159,9 +173,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         }),
         display: DisplaySection::default(),
     };
-    let profile_path = args
-        .disk
-        .with_file_name(format!("{vm_name}.toml"));
+    let profile_path = args.disk.with_file_name(format!("{vm_name}.toml"));
     let text = toml::to_string_pretty(&profile).map_err(|e| e.to_string())?;
     std::fs::write(&profile_path, text)
         .map_err(|e| format!("cannot write {}: {e}", profile_path.display()))?;
@@ -192,15 +204,18 @@ fn stem_of(disk: &Path, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-/// Debian ships virtio_mmio as a module, and nothing autoloads it on x86 —
-/// there is no discoverable bus, devices are announced on the command line.
-/// Without this, d-i's hardware detection finds no NIC and no disk. It must
-/// live in a preseed file: d-i's /proc/cmdline parser cannot carry values
-/// with spaces, quoted or not. Appended to custom preseeds that lack their
-/// own early_command (a custom early_command must include the modprobe).
-const EARLY_MODPROBE_PRESEED: &str =
-    "\n# added by entangled install: virtio_mmio never autoloads on x86\n\
-     d-i preseed/early_command string modprobe virtio_mmio\n";
+/// Compatibility preseed for running d-i on the bootstrap kernel: Debian's
+/// own installer kernel builds virtio_mmio without cmdline-device support
+/// (verified: `modinfo -p` on the d-i module lists no parameters), so the
+/// installer must run on our kernel with virtio built in. The d-i initrd
+/// then carries no modules for the running kernel version, and the target
+/// kernel cannot be derived from `uname -r` — both preseeded away here.
+/// Appended to every initrd (interactive installs included) and to custom
+/// preseeds that do not set the keys themselves.
+const KERNEL_COMPAT_PRESEED: &str =
+    "\n# added by entangled install: d-i runs on the Entangled bootstrap kernel\n\
+     d-i anna/no_kernel_modules boolean true\n\
+     d-i base-installer/kernel/image string linux-image-amd64\n";
 
 /// d-i automation command line: priority critical + static netcfg (the host
 /// TAP has no DHCP), with initrd preseeding picking up /preseed.cfg.
@@ -217,11 +232,7 @@ fn auto_cmdline(hostname: &str) -> String {
 /// Appends `/preseed.cfg` to the installer initrd as a gzip-compressed cpio
 /// archive; the kernel concatenates initramfs segments, and d-i loads
 /// /preseed.cfg automatically (initrd preseeding).
-fn preseeded_initrd(
-    base_initrd: &Path,
-    preseed: &[u8],
-    disk: &Path,
-) -> Result<PathBuf, String> {
+fn preseeded_initrd(base_initrd: &Path, preseed: &[u8], disk: &Path) -> Result<PathBuf, String> {
     let mut image = std::fs::read(base_initrd)
         .map_err(|e| format!("cannot read initrd {}: {e}", base_initrd.display()))?;
 
@@ -236,10 +247,7 @@ fn preseeded_initrd(
         .map(|gz| image.extend_from_slice(&gz))
         .map_err(|e| format!("cannot compress preseed archive: {e}"))?;
 
-    let out = disk.with_file_name(format!(
-        "{}.install-initrd.img",
-        stem_of(disk, "install")
-    ));
+    let out = disk.with_file_name(format!("{}.install-initrd.img", stem_of(disk, "install")));
     std::fs::write(&out, image).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
     Ok(out)
 }

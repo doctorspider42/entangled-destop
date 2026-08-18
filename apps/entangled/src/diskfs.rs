@@ -60,8 +60,8 @@ pub fn parse_mbr(sector0: &[u8; 512]) -> Result<Vec<Partition>, DiskFsError> {
     }
     let mut parts = Vec::new();
     for i in 0..4 {
-        let entry = &sector0[PARTITION_TABLE_OFFSET + i * PARTITION_ENTRY_LEN..]
-            [..PARTITION_ENTRY_LEN];
+        let entry =
+            &sector0[PARTITION_TABLE_OFFSET + i * PARTITION_ENTRY_LEN..][..PARTITION_ENTRY_LEN];
         let type_byte = entry[4];
         if type_byte == 0 {
             continue;
@@ -208,9 +208,11 @@ mod tests {
         // ext4 superblock at partition start (LBA 4 => byte 2048) + 1024.
         let sb_at = 4 * 512 + 1024;
         f.set_len(4 * 512 + 64 * 512).unwrap();
-        f.seek(SeekFrom::Start(sb_at + EXT4_MAGIC_OFFSET as u64)).unwrap();
+        f.seek(SeekFrom::Start(sb_at + EXT4_MAGIC_OFFSET as u64))
+            .unwrap();
         f.write_all(&[0x53, 0xef]).unwrap();
-        f.seek(SeekFrom::Start(sb_at + EXT4_UUID_OFFSET as u64)).unwrap();
+        f.seek(SeekFrom::Start(sb_at + EXT4_UUID_OFFSET as u64))
+            .unwrap();
         f.write_all(&[
             0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
             0xaa, 0xbb,
@@ -227,7 +229,10 @@ mod tests {
     #[test]
     fn uninstalled_disk_is_a_readable_error() {
         let path = temp_disk("blank");
-        std::fs::File::create(&path).unwrap().set_len(1 << 20).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
         assert!(matches!(
             find_installed_root(&path),
             Err(DiskFsError::NoMbr)

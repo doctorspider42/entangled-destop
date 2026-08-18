@@ -184,6 +184,10 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
         vcpu_count: spec.vcpus,
     };
     let mut vm = Vm::new(&hv, &machine).map_err(|e| e.to_string())?;
+    // Interrupt topology (the fix this harness's 100-boot test exists to
+    // verify): route device IRQs through the IOAPIC instead of the 8259
+    // virtual-wire fallback, where irqfd edges were lost ~1 boot in 3.
+    machine_x86::mptable::write(vm.memory(), machine.vcpu_count).map_err(|e| e.to_string())?;
 
     let capture = Capture::default();
     let serial =

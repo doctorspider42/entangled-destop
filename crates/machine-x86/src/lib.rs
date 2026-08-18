@@ -6,9 +6,9 @@ pub mod layout;
 #[cfg(target_os = "linux")]
 pub mod boot;
 #[cfg(target_os = "linux")]
-pub mod mptable;
-#[cfg(target_os = "linux")]
 pub mod bus;
+#[cfg(target_os = "linux")]
+pub mod mptable;
 #[cfg(target_os = "linux")]
 pub mod notify;
 #[cfg(target_os = "linux")]

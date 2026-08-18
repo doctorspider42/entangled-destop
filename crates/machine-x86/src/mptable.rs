@@ -97,7 +97,7 @@ fn build(vcpu_count: u32) -> Vec<u8> {
         let mut e = [0u8; 8];
         e[0] = 0x03; // type: I/O interrupt
         e[1] = 0x00; // INT (vectored)
-        // flags 0: polarity/trigger conform to the ISA bus (edge, high)
+                     // flags 0: polarity/trigger conform to the ISA bus (edge, high)
         e[4] = 0; // source bus: ISA
         e[5] = irq;
         e[6] = ioapic_id;
