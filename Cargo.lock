@@ -3556,6 +3556,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "virtio-core",
+ "virtio-queue",
+ "vm-memory 0.17.2",
  "vmm-sys-util",
 ]
 

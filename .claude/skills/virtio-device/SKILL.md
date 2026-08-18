@@ -59,10 +59,18 @@ shared safety live in `crates/virtio-core`; one crate per device.
 - **blk** (EPIC 4): request = header (type/reserved/sector) + data + status
   byte. Types in `virtio_block::RequestType`; status `S_OK/S_IOERR/S_UNSUPP`.
   Unknown type → `S_UNSUPP`, out-of-range → `S_IOERR` (test exists).
-- **net** (EPIC 5): TX before RX (easier to debug); `virtio_net_hdr` is 12
-  bytes with num_buffers when MRG_RXBUF — MVP negotiates **no offloads, no
-  mergeable buffers, no multiqueue**: correct first, fast later. MAC from
-  `virtio_net::MacAddr::derive(vm_name)` unless pinned in config.
+- **net** (EPIC 5): queue 0 = RX, queue 1 = TX. `virtio_net_hdr` is **12 bytes
+  under `VIRTIO_F_VERSION_1` even without MRG_RXBUF** — Linux' `virtio_net.c`
+  uses `sizeof(virtio_net_hdr_mrg_rxbuf)` for any modern device, so the unused
+  `num_buffers` field is present and must be written as 0 on RX. MVP negotiates
+  `VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC` and nothing else: **no offloads, no
+  mergeable buffers, no multiqueue** — correct first, fast later. Frames are
+  capped at `virtio_net::MAX_FRAME_LEN` (1514). MAC from
+  `virtio_net::MacAddr::derive(vm_name)` unless pinned in config. RX is
+  host-driven, so the device owns a worker thread per activation
+  (`activate` spawns, `reset`/`drop` stops, wakes and joins it); the TAP
+  interface comes from `scripts/setup-tap.sh`, which pre-creates it owned by
+  the VMM's user so `vmhost run` needs no CAP_NET_ADMIN.
 - **gpu** (EPIC 8): 2D command constants in `virtio_gpu::cmd`/`resp`. Only
   `FORMAT_B8G8R8A8_UNORM`. controlq + cursorq. Every rect through
   `Rect::fits_within` before any copy.
