@@ -29,11 +29,9 @@ fn install_signal_handlers() -> Result<(), String> {
     // zeroed sigaction is a valid "no flags, empty mask" configuration.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
-        // sa_sigaction is declared as usize in libc; the cast is the API.
-        #[allow(clippy::fn_to_numeric_cast_any)]
-        {
-            action.sa_sigaction = on_termination_signal as usize;
-        }
+        // sa_sigaction is declared as usize in libc; cast via a pointer to
+        // satisfy both rustc's function_casts_as_integer and clippy.
+        action.sa_sigaction = on_termination_signal as *const () as usize;
         for sig in [libc::SIGINT, libc::SIGTERM] {
             if libc::sigaction(sig, &action, std::ptr::null_mut()) != 0 {
                 return Err(format!(
