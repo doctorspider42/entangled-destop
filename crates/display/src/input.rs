@@ -431,6 +431,10 @@ impl InputCapture {
         // Reserved shortcuts are recognised *before* the key joins `held`, so
         // the modifier test only ever looks at the modifiers.
         if let Some(action) = self.reserved_shortcut(code) {
+            // A reserved key is still "another key pressed in between", so the
+            // modifier release that inevitably follows `Ctrl+Alt+O` (or F11 held
+            // together with the modifiers) must not also release the grab.
+            self.modifiers_clean = false;
             tracing::debug!(?action, ?code, "reserved shortcut consumed by the host");
             return KeyOutcome::Reserved(action);
         }
@@ -1036,6 +1040,38 @@ mod tests {
         );
         assert!(c.grabbed());
         assert!(c.control().drain().is_empty());
+    }
+
+    #[test]
+    fn a_reserved_third_key_also_keeps_the_grab() {
+        // Regression (found under WSLg): `Ctrl+Alt+O` toggled the scale mode and
+        // then the modifier release dropped the grab as a side effect.
+        for third in [KeyCode::KeyO, KeyCode::F11] {
+            let mut c = grabbed_capture();
+            hold_ctrl_alt(&mut c);
+            assert!(matches!(press(&mut c, third), KeyOutcome::Reserved(_)));
+            assert_eq!(release(&mut c, KeyCode::AltLeft), KeyOutcome::Forwarded(56));
+            assert!(c.grabbed(), "{third:?} must not release the grab");
+            assert_eq!(
+                release(&mut c, KeyCode::ControlLeft),
+                KeyOutcome::Forwarded(29)
+            );
+            assert!(c.grabbed());
+        }
+    }
+
+    #[test]
+    fn ctrl_alt_g_engaging_the_grab_survives_the_modifier_release() {
+        let mut c = capture();
+        hold_ctrl_alt(&mut c);
+        assert_eq!(
+            press(&mut c, KeyCode::KeyG),
+            KeyOutcome::Reserved(WindowAction::SetGrab(true))
+        );
+        // The user now lets go of Ctrl+Alt: the grab they just asked for stays.
+        assert_eq!(release(&mut c, KeyCode::AltLeft), KeyOutcome::Ignored);
+        assert_eq!(release(&mut c, KeyCode::ControlLeft), KeyOutcome::Ignored);
+        assert!(c.grabbed());
     }
 
     #[test]

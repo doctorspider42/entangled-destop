@@ -362,7 +362,9 @@ impl App {
         self.cursor_visible = visible;
         if let Some(window) = self.window.as_ref() {
             window.set_cursor_visible(visible);
-            tracing::trace!(visible, "host cursor visibility changed");
+            // Low frequency (only when crossing the image edge or changing the
+            // grab), and the first thing to check when WIN-1501 misbehaves.
+            tracing::debug!(visible, "host cursor visibility changed");
         }
     }
 
