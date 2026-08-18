@@ -60,9 +60,16 @@ fn open_presentation(cfg: &VmConfig, headless: bool) -> Result<Presentation, Str
     if !headless {
         match display::DisplayHost::new(display_cfg) {
             Ok(host) => {
+                // Window UX (EPIC 15): input goes to the guest only while the
+                // grab is active, so the shortcuts have to be discoverable —
+                // the title bar repeats the important half of this.
+                tracing::info!(
+                    "window controls: click the image to grab input, Ctrl+Alt releases it, \
+                     Ctrl+Alt+G toggles, F11 fullscreen, Ctrl+Alt+O 1:1, Ctrl+Alt+Q shuts down"
+                );
                 return Ok(Presentation::Windowed(Box::new(
                     host.with_title(format!("Entangled Desktop — {}", cfg.name)),
-                )))
+                )));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "cannot open a window, falling back to headless");

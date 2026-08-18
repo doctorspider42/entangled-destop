@@ -239,6 +239,12 @@ impl Renderer {
             tracing::debug!("window has zero area; presenting suspended");
             return;
         }
+        // Idempotent: a rapid resize drag delivers many `Resized` events, and
+        // reconfiguring the surface for a size it already has costs a swapchain
+        // rebuild for nothing (WIN-1503).
+        if self.configured && self.config.width == width && self.config.height == height {
+            return;
+        }
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);

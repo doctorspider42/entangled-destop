@@ -12,12 +12,22 @@
 //!
 //! - the gradient scrolls and the frame counter ticks (partial updates land);
 //! - resizing keeps the 16:9 image centered with black letterbox bars, scaled
-//!   with linear filtering;
+//!   with linear filtering, and cannot go below 640x360;
 //! - minimizing stops presenting and restoring resumes it without artifacts;
-//! - `S` writes `entangled-screenshot-<frame>.png` next to the working directory;
-//! - `R` cycles the guest resolution (1920x1080 → 1280x720 → 800x600);
-//! - `Ctrl+Alt+G` toggles the pointer grab, `Ctrl+Alt+Q` quits — neither is
-//!   visible in the drained guest input stream;
+//! - the title says `[click to grab input]` and no keystroke reaches the "guest"
+//!   until you click on the image; then it says
+//!   `[input grabbed, Ctrl+Alt releases]` and the host cursor disappears over
+//!   the image but comes back over the black bars (WIN-1501);
+//! - `Ctrl+Alt` (nothing else in between) releases the grab and the cursor;
+//!   `Ctrl+Alt+G` toggles it explicitly (WIN-1502);
+//! - while grabbed: `S` writes `entangled-screenshot-<frame>.png` into the
+//!   working directory, `R` cycles the guest resolution
+//!   (1920x1080 → 1280x720 → 800x600), `Esc` quits;
+//! - `F11` toggles borderless fullscreen and `Ctrl+Alt+O` toggles 1:1 pixel mode
+//!   (title gains ` — 1:1`); neither appears in the guest input stream
+//!   (WIN-1504);
+//! - `Ctrl+Alt+Q` quits — like the other reserved shortcuts it never shows up in
+//!   the drained guest input stream;
 //! - FPS and copy statistics appear once per second on `display=info`.
 //!
 //! `expect()` at init time is deliberate and confined to this binary; the
@@ -48,6 +58,10 @@ fn main() -> Result<(), display::DisplayError> {
 
     let host =
         DisplayHost::new(DisplayConfig::default())?.with_title("Entangled Desktop display demo");
+    tracing::info!(
+        "click the image to grab input; Ctrl+Alt releases it, F11 fullscreen, \
+         Ctrl+Alt+O 1:1, Ctrl+Alt+Q quits"
+    );
     let handle = host.handle();
     let input = host.input_queue();
     let control = host.control_queue();

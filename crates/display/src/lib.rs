@@ -20,10 +20,33 @@
 //! # Layout
 //!
 //! - [`viewport`]: pure geometry — [`letterbox`], [`Viewport`], [`DisplayConfig`].
+//! - [`ux`]: window UX policy — [`ScaleMode`], cursor visibility, title text,
+//!   initial geometry (EPIC 15).
 //! - [`scanout`]: the CPU-side BGRA mirror, dirty rects and PNG screenshots.
 //! - `renderer` (private): the `wgpu` surface, scanout texture and pipeline.
-//! - [`input`]: winit events → [`virtio_input::InputEvent`] batches.
+//! - [`input`]: winit events → [`virtio_input::InputEvent`] batches, plus the
+//!   grab state machine and reserved shortcuts.
 //! - [`keymap`]: winit physical key → Linux `KEY_*` table (MVP-902).
+//!
+//! # Window UX (backlog EPIC 15)
+//!
+//! Host input reaches the guest only while the *input grab* is active, so the
+//! window behaves like every other window on the desktop until the user asks
+//! otherwise:
+//!
+//! | Action | Result |
+//! |---|---|
+//! | click inside the guest image | grab input; host cursor hidden over the image |
+//! | `Ctrl+Alt` (nothing else pressed in between) | release the grab, cursor back |
+//! | `Ctrl+Alt+G` | explicit grab toggle |
+//! | `Ctrl+Alt+Q` | ask the VM to shut down |
+//! | `F11` | borderless fullscreen toggle |
+//! | `Ctrl+Alt+O` | 1:1 pixel mode toggle ([`ScaleMode`]) |
+//! | focus loss | grab released, every held key released towards the guest |
+//!
+//! The reserved shortcuts above never reach the guest; every other combination
+//! does while grabbed — including `Ctrl+Alt+F2` and friends. The window title
+//! always states which of the two input states the window is in.
 //!
 //! # Manual verification
 //!
@@ -43,9 +66,11 @@
 //! ```
 //!
 //! In the demo window: resize it (the image stays 16:9 with black bars),
-//! minimize and restore it (presenting stops and resumes), press `S` for a PNG
-//! screenshot, `R` to cycle the guest resolution, `Ctrl+Alt+G` to toggle the
-//! pointer grab and `Ctrl+Alt+Q` to quit.
+//! minimize and restore it (presenting stops and resumes), then click the image
+//! to grab input — only then do the guest-side keys work: `S` for a PNG
+//! screenshot, `R` to cycle the guest resolution. `Ctrl+Alt` releases the grab,
+//! `Ctrl+Alt+G` toggles it, `F11` goes fullscreen, `Ctrl+Alt+O` switches to 1:1
+//! and `Ctrl+Alt+Q` quits.
 
 #![deny(missing_docs)]
 
@@ -57,14 +82,16 @@ pub mod keymap;
 mod renderer;
 pub mod scanout;
 mod sync;
+pub mod ux;
 pub mod viewport;
 
 pub use error::DisplayError;
 pub use handle::DisplayHandle;
 pub use host::DisplayHost;
-pub use input::{ControlEvent, ControlQueue, InputCapture, InputQueue, KeyOutcome};
+pub use input::{ControlEvent, ControlQueue, InputCapture, InputQueue, KeyOutcome, WindowAction};
 pub use renderer::FrameStats;
 pub use scanout::{Scanout, ScanoutStats, SharedScanout};
+pub use ux::{viewport_for, ScaleMode, WindowStatus};
 pub use viewport::{letterbox, DisplayConfig, Viewport};
 
 /// Upper bound on one scanout, shared with `virtio-gpu`'s resource limit: a

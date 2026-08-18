@@ -11,13 +11,17 @@ use std::sync::{Arc, Mutex};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{CursorGrabMode, Window, WindowId};
+use winit::monitor::MonitorHandle;
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use crate::handle::{HostEvent, Waker};
-use crate::input::{ControlEvent, ControlQueue, InputCapture, InputQueue, KeyOutcome};
+use crate::input::{
+    ControlEvent, ControlQueue, InputCapture, InputQueue, KeyOutcome, WindowAction,
+};
 use crate::renderer::{FrameStats, Renderer, StatsReporter};
 use crate::scanout::{lock_scanout, Scanout, SharedScanout};
-use crate::{letterbox, DisplayConfig, DisplayError, DisplayHandle, Viewport};
+use crate::ux::{self, ScaleMode, WindowStatus};
+use crate::{DisplayConfig, DisplayError, DisplayHandle, Viewport};
 
 /// One window presenting one guest scanout.
 ///
@@ -116,6 +120,10 @@ impl DisplayHost {
             viewport: None,
             occluded: false,
             grabbed: false,
+            cursor_visible: true,
+            applied_title: String::new(),
+            fullscreen: false,
+            mode: ScaleMode::default(),
             reporter: StatsReporter::default(),
             fatal: None,
         };
@@ -144,6 +152,19 @@ struct App {
     /// Grab state actually applied to the window, so a repeated request (focus
     /// loss while already ungrabbed) is a no-op.
     grabbed: bool,
+    /// Cursor visibility actually applied to the window (WIN-1501).
+    cursor_visible: bool,
+    /// Title text actually applied to the window.
+    ///
+    /// Every `set_title` is an X11/Wayland round trip, and winit's X11 backend
+    /// `expect()`s on it — with `panic = "abort"` in the release profile a
+    /// hiccup on that connection would take the *guest* down with the window.
+    /// So the title is only ever pushed when the text really changed.
+    applied_title: String,
+    /// Borderless-fullscreen state (WIN-1504).
+    fullscreen: bool,
+    /// Fit or 1:1 (WIN-1503/1504).
+    mode: ScaleMode,
     reporter: StatsReporter,
     fatal: Option<DisplayError>,
 }
@@ -161,9 +182,32 @@ impl App {
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), DisplayError> {
         let (width, height) = self.config.initial_window_size();
+        let monitor = monitor_logical_size(
+            event_loop
+                .primary_monitor()
+                .or_else(|| event_loop.available_monitors().next()),
+        );
+        let initial = ux::initial_window(width, height, monitor);
+        tracing::debug!(
+            requested = format_args!("{width}x{height}"),
+            monitor = ?monitor,
+            opening = format_args!("{}x{}", initial.width, initial.height),
+            maximized = initial.maximized,
+            "choosing the initial window geometry"
+        );
+        // WIN-1503: free manual resizing, with a floor that keeps the letterboxed
+        // image usable and a maximized start when the guest is as big as the
+        // screen.
+        self.applied_title = self.window_title();
         let attributes = Window::default_attributes()
-            .with_title(self.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(width, height));
+            .with_title(self.applied_title.clone())
+            .with_inner_size(winit::dpi::LogicalSize::new(initial.width, initial.height))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(
+                ux::MIN_WINDOW_WIDTH,
+                ux::MIN_WINDOW_HEIGHT,
+            ))
+            .with_resizable(true)
+            .with_maximized(initial.maximized);
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
         tracing::info!(
@@ -173,15 +217,35 @@ impl App {
             "window created"
         );
         let renderer = Renderer::new(Arc::clone(&window), self.guest_size.0, self.guest_size.1)?;
-        self.viewport = letterbox(
-            self.guest_size.0,
-            self.guest_size.1,
-            size.width,
-            size.height,
-        );
         self.window = Some(window);
         self.renderer = Some(renderer);
+        self.recompute_viewport();
         Ok(())
+    }
+
+    /// The title the window should currently carry (WIN-1502): the VM's own
+    /// title plus what the user needs to know about the input state.
+    fn window_title(&self) -> String {
+        ux::window_title(
+            &self.title,
+            WindowStatus {
+                grabbed: self.grabbed,
+                mode: self.mode,
+            },
+        )
+    }
+
+    /// Refreshes the title in place. Called only when the state behind it
+    /// changes, never per frame, and a no-op when the text is already there.
+    fn update_title(&mut self) {
+        let title = self.window_title();
+        if title == self.applied_title {
+            return;
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.set_title(&title);
+        }
+        self.applied_title = title;
     }
 
     /// Physical window size, or `None` before the window exists.
@@ -190,11 +254,16 @@ impl App {
         Some((size.width, size.height))
     }
 
+    /// Recomputes the viewport for the current window size and scale mode, and
+    /// tells the input capture about it — pointer mapping and the cursor policy
+    /// must not lag a resize by one motion event.
     fn recompute_viewport(&mut self) {
         self.viewport = match self.window_size() {
-            Some((w, h)) => letterbox(self.guest_size.0, self.guest_size.1, w, h),
+            Some((w, h)) => ux::viewport_for(self.mode, self.guest_size.0, self.guest_size.1, w, h),
             None => None,
         };
+        self.capture.set_viewport(self.viewport);
+        self.sync_cursor();
     }
 
     /// Uploads the dirty rect and presents (backlog MVP-704/705/706).
@@ -202,6 +271,15 @@ impl App {
         self.waker.clear();
         if self.renderer.is_none() {
             return;
+        }
+        // WIN-1503: during a rapid drag winit can deliver several `Resized`
+        // events between two frames, and a surface configured for a size the
+        // window no longer has presents a stretched or clipped frame. Asking the
+        // renderer to match the *current* size right before drawing costs
+        // nothing when it already does.
+        if let (Some((win_w, win_h)), Some(renderer)) = (self.window_size(), self.renderer.as_mut())
+        {
+            renderer.resize(win_w, win_h);
         }
         // The guest may have changed resolution since the last frame. The lock
         // is held only for the upload (a `memcpy` into a staging buffer).
@@ -221,13 +299,20 @@ impl App {
         let Some((win_w, win_h)) = self.window_size() else {
             return;
         };
-        // `letterbox` returns None for a zero-sized (minimized) window: nothing
-        // to present, and the dirty rect stays accumulated for the next frame.
-        let Some(viewport) = letterbox(guest_size.0, guest_size.1, win_w, win_h) else {
+        // `viewport_for` returns None for a zero-sized (minimized) window:
+        // nothing to present, and the dirty rect stays accumulated for the next
+        // frame.
+        let Some(viewport) = ux::viewport_for(self.mode, guest_size.0, guest_size.1, win_w, win_h)
+        else {
             self.viewport = None;
+            self.capture.set_viewport(None);
             return;
         };
-        self.viewport = Some(viewport);
+        if self.viewport != Some(viewport) {
+            self.viewport = Some(viewport);
+            self.capture.set_viewport(self.viewport);
+            self.sync_cursor();
+        }
         let outcome = match self.renderer.as_mut() {
             Some(renderer) => renderer.render(viewport),
             None => return,
@@ -241,22 +326,28 @@ impl App {
         self.reporter.maybe_report(stats, input);
     }
 
-    /// Applies a reserved shortcut's effect to the window (backlog MVP-907).
-    fn apply_control(&mut self, event: ControlEvent) {
-        match event {
-            ControlEvent::GrabToggled(grabbed) => self.set_grab(grabbed),
-            ControlEvent::QuitRequested => {
+    /// Applies a reserved shortcut's effect to the window (backlog MVP-907,
+    /// WIN-1501/1502/1504). The [`InputCapture`] already updated its own state
+    /// and queued whatever the VM supervisor needs to hear about.
+    fn apply_action(&mut self, action: WindowAction) {
+        match action {
+            WindowAction::SetGrab(grabbed) => self.set_grab(grabbed),
+            WindowAction::Quit => {
                 tracing::info!("Ctrl+Alt+Q: quit requested; the VM supervisor decides");
             }
-            ControlEvent::WindowCloseRequested => {}
+            WindowAction::ToggleFullscreen => self.toggle_fullscreen(),
+            WindowAction::ToggleScaleMode => self.toggle_scale_mode(),
         }
     }
 
     fn set_grab(&mut self, grabbed: bool) {
         if self.grabbed == grabbed {
+            self.sync_cursor();
             return;
         }
         self.grabbed = grabbed;
+        self.update_title();
+        self.sync_cursor();
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -270,8 +361,51 @@ impl App {
             // absolute positions, so this is a warning, not a failure.
             tracing::warn!(%err, grabbed, "compositor refused the pointer grab");
         }
-        window.set_cursor_visible(!grabbed);
         tracing::info!(grabbed, "pointer grab toggled");
+    }
+
+    /// Mirrors the cursor policy onto the window (WIN-1501). Cheap enough to call
+    /// after every pointer event: it only talks to winit when the decision
+    /// actually flipped.
+    fn sync_cursor(&mut self) {
+        let visible = self.capture.cursor_visible();
+        if visible == self.cursor_visible {
+            return;
+        }
+        self.cursor_visible = visible;
+        if let Some(window) = self.window.as_ref() {
+            window.set_cursor_visible(visible);
+            // Low frequency (only when crossing the image edge or changing the
+            // grab), and the first thing to check when WIN-1501 misbehaves.
+            tracing::debug!(visible, "host cursor visibility changed");
+        }
+    }
+
+    /// `F11`: borderless fullscreen on the window's current monitor (WIN-1504).
+    fn toggle_fullscreen(&mut self) {
+        self.fullscreen = !self.fullscreen;
+        let fullscreen = self.fullscreen;
+        if let Some(window) = self.window.as_ref() {
+            // `Borderless(None)` means "the monitor this window is on", which is
+            // what the user expects on a multi-head desktop.
+            window.set_fullscreen(fullscreen.then(|| Fullscreen::Borderless(None)));
+            window.request_redraw();
+        }
+        tracing::info!(fullscreen, "fullscreen toggled");
+        // The compositor answers with a Resized event, which recomputes the
+        // viewport; do it now too so nothing depends on that arriving.
+        self.recompute_viewport();
+    }
+
+    /// `Ctrl+Alt+O`: switch between letterboxed scaling and 1:1 (WIN-1504).
+    fn toggle_scale_mode(&mut self) {
+        self.mode = self.mode.toggled();
+        tracing::info!(mode = ?self.mode, "scale mode toggled");
+        self.recompute_viewport();
+        self.update_title();
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
     }
 
     /// Statistics snapshot, used by the demo and future diagnostics.
@@ -281,6 +415,20 @@ impl App {
             .map(Renderer::stats)
             .unwrap_or_default()
     }
+}
+
+/// A monitor's size in *logical* pixels, to compare against the configured
+/// window size (which is also logical). `None` when winit cannot name a monitor,
+/// as happens on some remote/headless compositors.
+fn monitor_logical_size(monitor: Option<MonitorHandle>) -> Option<(u32, u32)> {
+    let monitor = monitor?;
+    let size = monitor.size();
+    let scale = monitor.scale_factor();
+    if !scale.is_finite() || scale <= 0.0 {
+        return Some((size.width, size.height));
+    }
+    let logical: winit::dpi::LogicalSize<f64> = size.to_logical(scale);
+    Some((logical.width.round() as u32, logical.height.round() as u32))
 }
 
 impl ApplicationHandler<HostEvent> for App {
@@ -374,16 +522,29 @@ impl ApplicationHandler<HostEvent> for App {
                 let outcome = self
                     .capture
                     .on_key(event.physical_key, event.state, event.repeat);
-                if let KeyOutcome::Reserved(control) = outcome {
-                    self.apply_control(control);
+                if let KeyOutcome::Reserved(action) = outcome {
+                    self.apply_action(action);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.capture
                     .on_pointer(self.viewport, position.x, position.y);
+                self.sync_cursor();
+            }
+            WindowEvent::CursorEntered { .. } => {
+                self.capture.on_pointer_in_window(true);
+                self.sync_cursor();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.capture.on_pointer_in_window(false);
+                self.sync_cursor();
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                self.capture.on_button(button, state);
+                // A click on the guest image engages the grab (WIN-1502).
+                if let KeyOutcome::Reserved(action) = self.capture.on_button(button, state) {
+                    self.apply_action(action);
+                }
+                self.sync_cursor();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.capture.on_wheel(delta);
@@ -393,6 +554,7 @@ impl ApplicationHandler<HostEvent> for App {
                 if !focused {
                     self.set_grab(false);
                 }
+                self.sync_cursor();
             }
             _ => {}
         }
