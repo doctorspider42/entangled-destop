@@ -49,7 +49,7 @@ const CONFIG_LEN: usize = 8;
 /// Hard bound on how many chains one notification may process, so a guest that
 /// keeps refilling the available ring from another vCPU cannot pin this thread
 /// forever. Leftover work is picked up by the next notification.
-const CHAINS_PER_NOTIFY: usize = 4 * MAX_QUEUE_SIZE as usize;
+pub const CHAINS_PER_NOTIFY: usize = 4 * MAX_QUEUE_SIZE as usize;
 
 /// A virtio-blk device backed by a RAW image file.
 pub struct BlockDevice {

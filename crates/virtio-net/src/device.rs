@@ -84,7 +84,7 @@ const CONFIG_LEN: usize = 6;
 /// Hard bound on chains processed per TX notification, so a guest refilling the
 /// available ring from another vCPU cannot pin this thread forever. Leftovers
 /// are picked up by the next notification.
-const CHAINS_PER_NOTIFY: usize = 4 * MAX_QUEUE_SIZE as usize;
+pub const CHAINS_PER_NOTIFY: usize = 4 * MAX_QUEUE_SIZE as usize;
 
 /// How long the RX worker blocks in one `wait_readable` call. Only a fallback:
 /// [`NetBackend::wake`] normally ends the wait immediately on shutdown.

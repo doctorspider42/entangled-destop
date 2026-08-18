@@ -2,6 +2,12 @@
 //! `vmm_core::ExitHandler` for the vCPU run loop. Routes the serial console on
 //! the legacy COM1 ports and the virtio-mmio window (EPIC 3) by address;
 //! everything else floats high on reads, like unclaimed ISA lines.
+//!
+//! `QUEUE_NOTIFY` writes for queues whose kicks are offloaded to an ioeventfd
+//! (MVP-307) normally never reach this handler — KVM completes them in the
+//! kernel. The ones that do (a datamatch miss, i.e. a queue index the device
+//! does not have) still take this path, where `MmioTransport::write` drops them
+//! instead of running the device a second time; see `crate::notify`.
 
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +34,13 @@ impl MachineBus {
             serial: Arc::new(Mutex::new(serial)),
             virtio: Arc::new(virtio),
         }
+    }
+
+    /// The virtio-mmio window behind this bus, for inspection: `entangled
+    /// doctor`, and test harnesses that want to report device state when a guest
+    /// stops making progress.
+    pub fn virtio(&self) -> &VirtioMmioBus {
+        &self.virtio
     }
 }
 

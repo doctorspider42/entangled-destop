@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-exclude = ["guest/test-rootfs/init-rs", "guest/bootstrap-initramfs/init-rs"]
+exclude = [
+    "guest/test-rootfs/init-rs",
+    "guest/bootstrap-initramfs/init-rs",
+    # cargo-fuzz targets: nightly-only (libfuzzer-sys + -Zsanitizer), own
+    # workspace, never part of `cargo test --workspace`. See fuzz/README.md.
+    "fuzz",
+]
 members = [
     "crates/vmm-core",
     "crates/machine-x86",
@@ -14,6 +20,7 @@ members = [
     "crates/debian-media",
     "crates/control-api",
     "apps/entangled",
+    "tests/boot",
 ]
 
 [workspace.package]

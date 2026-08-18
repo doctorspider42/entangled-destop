@@ -10,6 +10,8 @@ pub mod mptable;
 #[cfg(target_os = "linux")]
 pub mod bus;
 #[cfg(target_os = "linux")]
+pub mod notify;
+#[cfg(target_os = "linux")]
 pub mod serial;
 #[cfg(target_os = "linux")]
 pub mod virtio;

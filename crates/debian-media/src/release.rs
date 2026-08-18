@@ -121,6 +121,13 @@ impl Release {
             };
             let value = value.trim();
             in_sha256 = field == "SHA256";
+            // An empty value is a *missing* field, not a field whose value is
+            // the empty string: `Some("")` would otherwise reach the provenance
+            // manifest and the netboot version discovery as a real answer
+            // (found by the MVP-1402 release-parser fuzz target).
+            if value.is_empty() {
+                continue;
+            }
             match field {
                 "Suite" => suite = Some(value.to_string()),
                 "Codename" => codename = Some(value.to_string()),

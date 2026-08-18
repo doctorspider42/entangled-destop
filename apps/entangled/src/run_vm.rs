@@ -146,8 +146,10 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     // Guest memory is shared with the devices; cloning a `GuestMemoryMmap`
     // shares the underlying regions rather than copying them.
     let mem = Arc::new(vm.memory().clone());
-    let virtio =
-        VirtioMmioBus::attach(vm.fd(), Arc::clone(&mem), devices).map_err(|e| e.to_string())?;
+    // MVP-307: the bus needs a shared VM fd so it can deassign the queue-notify
+    // ioeventfds again when it is dropped, after this borrow of `vm` is gone.
+    let virtio = VirtioMmioBus::attach(vm.fd_shared(), Arc::clone(&mem), devices)
+        .map_err(|e| e.to_string())?;
     let cmdline = extend_cmdline(&cfg.boot.cmdline, &virtio.cmdline_clauses());
     let bus = MachineBus::with_virtio(serial, virtio);
 

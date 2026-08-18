@@ -841,3 +841,82 @@ fn raw_disk_can_be_attached_directly() {
     let (status, back) = h.read_sectors(0, 512);
     assert_eq!((status, back), (S_OK, vec![0x5au8; 512]));
 }
+
+/// MVP-1407: how much work one notification can be made to do is bounded.
+///
+/// Two independent bounds cover this. `virtio-queue` refuses a ring whose
+/// available count exceeds the queue size, so a guest cannot simply jump
+/// `avail_idx` far ahead; and `virtio_block::CHAINS_PER_NOTIFY` caps the drain
+/// loop for the remaining case, a guest refilling the ring from another vCPU
+/// while the device drains it. The budget must be at least a full ring, or a
+/// legitimate driver's chains would be deferred for no reason.
+#[test]
+fn one_notification_is_bounded_and_never_truncates_a_full_ring() {
+    assert!(
+        virtio_block::CHAINS_PER_NOTIFY >= usize::from(virtio_core::MAX_QUEUE_SIZE),
+        "the per-notify budget must cover a full ring"
+    );
+
+    let mut h = Harness::new(true);
+    h.write_header(BUF_BASE, T_IN, 0);
+
+    // A guest claiming far more available chains than the ring can hold is
+    // rejected outright: nothing is served, and the device is not broken by it.
+    h.submit(&[
+        (BUF_BASE, 16, 0),
+        (BUF_BASE + 0x100, 512, VIRTQ_DESC_F_WRITE),
+        (BUF_BASE + 0x400, 1, VIRTQ_DESC_F_WRITE),
+    ]);
+    for slot in 0..RING_SIZE {
+        h.ring.set_avail_entry(&h.mem, slot, 0);
+    }
+    h.ring.set_avail_idx(&h.mem, RING_SIZE + 1);
+    h.notify();
+    assert_eq!(
+        h.ring.used_idx(&h.mem),
+        0,
+        "an available count above the queue size must be refused, not served"
+    );
+    assert_eq!(
+        h.transport.status() & status::DEVICE_NEEDS_RESET,
+        0,
+        "a bogus available index is guest input, not a device failure"
+    );
+
+    // A ring filled to capacity with real chains, on the other hand, is drained
+    // completely by a single kick: 16 descriptors make five 3-descriptor
+    // requests, each with its own header, data buffer and status byte.
+    let mut h = Harness::new(true);
+    let chains = 5u16;
+    for chain in 0..chains {
+        let base = BUF_BASE + u64::from(chain) * 0x1000;
+        let first = chain * 3;
+        h.write_header(base, T_IN, 0);
+        h.ring
+            .write_desc(&h.mem, first, base, 16, VIRTQ_DESC_F_NEXT, first + 1);
+        h.ring.write_desc(
+            &h.mem,
+            first + 1,
+            base + 0x100,
+            512,
+            VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT,
+            first + 2,
+        );
+        h.ring
+            .write_desc(&h.mem, first + 2, base + 0x400, 1, VIRTQ_DESC_F_WRITE, 0);
+        h.ring.set_avail_entry(&h.mem, chain, first);
+    }
+    h.ring.set_avail_idx(&h.mem, chains);
+    h.notify();
+    assert_eq!(
+        h.ring.used_idx(&h.mem),
+        chains,
+        "one kick must drain every chain the driver published"
+    );
+    for slot in 0..chains {
+        let (_, len) = h.ring.used_elem(&h.mem, slot);
+        assert_eq!(len, 513, "each request writes 512 data bytes plus a status");
+    }
+    // One interrupt for the whole batch, not one per chain.
+    assert_eq!(h.irq.count(), 1);
+}

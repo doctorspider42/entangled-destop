@@ -17,8 +17,8 @@ pub mod raw;
 pub mod request;
 
 pub use device::{
-    BlockDevice, MAX_DATA_SEGMENTS, MAX_REQUEST_SECTORS, NUM_QUEUES, VIRTIO_BLK_F_FLUSH,
-    VIRTIO_BLK_F_RO,
+    BlockDevice, CHAINS_PER_NOTIFY, MAX_DATA_SEGMENTS, MAX_REQUEST_SECTORS, NUM_QUEUES,
+    VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO,
 };
 pub use raw::RawDisk;
 pub use request::{
