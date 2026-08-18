@@ -1,8 +1,11 @@
 //! `entangled` — the CLI control surface for the Entangled Desktop VMM.
 
 mod disk;
+mod diskfs;
 mod doctor;
 mod fetch;
+#[cfg(target_os = "linux")]
+mod install;
 #[cfg(target_os = "linux")]
 mod run_vm;
 
@@ -75,13 +78,36 @@ enum DiskCommand {
 }
 
 #[derive(Args)]
-struct InstallArgs {
+pub struct InstallArgs {
     /// Distribution to install (only "debian").
-    distro: String,
+    pub distro: String,
+    /// Target RAW disk image; created if missing.
     #[arg(long)]
-    disk: PathBuf,
+    pub disk: PathBuf,
     #[arg(long, default_value = "gtk-netboot")]
-    variant: String,
+    pub variant: String,
+    /// Fully automated installation with the built-in Weston test profile
+    /// (assets/preseed/auto-weston.cfg).
+    #[arg(long)]
+    pub auto: bool,
+    /// Custom preseed file appended to the installer initrd.
+    #[arg(long, conflicts_with = "auto")]
+    pub preseed: Option<PathBuf>,
+    /// Size for a newly created disk (e.g. 16G).
+    #[arg(long, default_value = "16G")]
+    pub size: String,
+    /// Installer VM memory in MiB.
+    #[arg(long, default_value_t = 1536)]
+    pub memory_mib: u64,
+    /// Host TAP interface (see scripts/setup-tap.sh).
+    #[arg(long, default_value = "entangled0")]
+    pub interface: String,
+    /// VM/profile name (defaults to the disk file stem).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Run without a window (serial console only).
+    #[arg(long)]
+    pub headless: bool,
 }
 
 fn main() -> ExitCode {
@@ -110,11 +136,20 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Doctor => doctor::run(),
         Command::Fetch(args) => fetch::run(&args),
-        Command::Install(args) => Err(format!(
-            "install {} --disk {} is not implemented yet (backlog EPIC 10)",
-            args.distro,
-            args.disk.display()
-        )),
+        Command::Install(args) => {
+            #[cfg(target_os = "linux")]
+            {
+                install::run(&args)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(format!(
+                    "install {} --disk {} requires a Linux host with KVM (on Windows use WSL2)",
+                    args.distro,
+                    args.disk.display()
+                ))
+            }
+        }
         Command::Run { config, headless } => {
             let text = std::fs::read_to_string(&config)
                 .map_err(|e| format!("cannot read {}: {e}", config.display()))?;

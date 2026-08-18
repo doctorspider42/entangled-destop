@@ -80,6 +80,9 @@ wgpu = { version = "26", default-features = false, features = [
 pollster = "0.4"
 png = "0.18"
 
+# Installer mode (EPIC 10): gzip for the preseed initrd append.
+flate2 = "1"
+
 # Media downloader (EPIC 6). rustls-only HTTP (no OpenSSL linkage) and rpgp for
 # OpenPGP — never sequoia-openpgp, which is LGPL (see deny.toml).
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
