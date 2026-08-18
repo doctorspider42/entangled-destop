@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use vmm_core::ExitHandler;
 
+use crate::platform::FirmwarePlatform;
 use crate::serial::SerialConsole;
 use crate::virtio::VirtioMmioBus;
 
@@ -20,6 +21,10 @@ use crate::virtio::VirtioMmioBus;
 pub struct MachineBus {
     serial: Arc<Mutex<SerialConsole>>,
     virtio: Arc<VirtioMmioBus>,
+    /// PCI configuration space + ACPI PM timer, present only for UEFI boots
+    /// (EPIC 18). A direct-Linux guest must keep seeing exactly the machine it
+    /// saw before: no host bridge to enumerate, no extra claimed ports.
+    platform: Option<Arc<Mutex<FirmwarePlatform>>>,
 }
 
 impl MachineBus {
@@ -33,7 +38,16 @@ impl MachineBus {
         Self {
             serial: Arc::new(Mutex::new(serial)),
             virtio: Arc::new(virtio),
+            platform: None,
         }
+    }
+
+    /// Adds the firmware-facing platform devices (UEFI-1802). Without these an
+    /// EDK2 CloudHv firmware asserts in SEC on the host bridge device ID and,
+    /// past that, spins forever in `MicroSecondDelay()`.
+    pub fn with_firmware_platform(mut self) -> Self {
+        self.platform = Some(Arc::new(Mutex::new(FirmwarePlatform::new())));
+        self
     }
 
     /// The virtio-mmio window behind this bus, for inspection: `entangled
@@ -52,6 +66,20 @@ impl ExitHandler for MachineBus {
                     serial.io_write(port, byte);
                 }
             }
+            return;
+        }
+        if let Some(platform) = &self.platform {
+            if FirmwarePlatform::contains(port) {
+                match platform.lock() {
+                    Ok(mut platform) => {
+                        platform.io_write(port, data);
+                    }
+                    Err(_) => tracing::error!(
+                        port = format_args!("{port:#x}"),
+                        "platform lock is poisoned; dropping guest write"
+                    ),
+                }
+            }
         }
     }
 
@@ -62,6 +90,15 @@ impl ExitHandler for MachineBus {
                     *byte = serial.io_read(port);
                 }
                 return;
+            }
+        }
+        if let Some(platform) = &self.platform {
+            if FirmwarePlatform::contains(port) {
+                if let Ok(mut platform) = platform.lock() {
+                    if platform.io_read(port, data) {
+                        return;
+                    }
+                }
             }
         }
         data.fill(0xff);

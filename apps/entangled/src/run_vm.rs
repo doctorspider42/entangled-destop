@@ -158,7 +158,13 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     let virtio = VirtioMmioBus::attach(vm.fd_shared(), Arc::clone(&mem), devices)
         .map_err(|e| e.to_string())?;
     let cmdline = extend_cmdline(&cfg.boot.cmdline, &virtio.cmdline_clauses());
-    let bus = MachineBus::with_virtio(serial, virtio);
+    let bus = match cfg.boot.mode {
+        BootMode::DirectLinux => MachineBus::with_virtio(serial, virtio),
+        // A UEFI firmware probes the PCI host bridge and the ACPI PM timer
+        // before it does anything else (EPIC 18); a direct-Linux guest must not
+        // suddenly find a host bridge where there was none.
+        BootMode::Uefi => MachineBus::with_virtio(serial, virtio).with_firmware_platform(),
+    };
 
     // Boot mode dispatch (EPIC 18 / ADR-0003). Everything above this point —
     // memory, IRQ chip, serial, the whole virtio window — is identical for both

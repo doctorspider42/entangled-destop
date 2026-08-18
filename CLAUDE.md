@@ -7,7 +7,10 @@ treat as guidance, not contract): [entangled-mvp-backlog.md](entangled-mvp-backl
 Architecture decisions: [docs/adr/0001-mvp-architecture.md](docs/adr/0001-mvp-architecture.md),
 [docs/adr/0002-linux-first-whp-ready.md](docs/adr/0002-linux-first-whp-ready.md)
 (portability rules that keep a native Windows/WHP port cheap — read before
-adding OS-specific code or interrupt plumbing).
+adding OS-specific code or interrupt plumbing),
+[docs/adr/0003-uefi-firmware.md](docs/adr/0003-uefi-firmware.md) (which UEFI
+firmware, how it is entered, and what the machine still owes it — read before
+touching boot modes or firmware-facing platform devices).
 
 ## Build and test
 
@@ -30,6 +33,7 @@ wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace
 | `crates/vmm-core` | KVM handle, guest memory, vCPU lifecycle, VM state machine | EPIC 1 |
 | `crates/machine-x86` | x86-64 machine model: memory layout, E820, CPUID, GDT, IRQ chip | EPIC 1/2 |
 | `crates/linux-boot` | Direct bzImage+initramfs boot, boot_params, cmdline | EPIC 2 |
+| `crates/uefi-boot` | UEFI firmware boot: PVH entry, reset-vector ROM placement | EPIC 18 |
 | `crates/virtio-core` | virtio-mmio transport, virtqueues, `VirtioDevice` trait | EPIC 3 |
 | `crates/virtio-block` | virtio-blk device, RAW file backend | EPIC 4 |
 | `crates/virtio-net` | virtio-net device, TAP backend | EPIC 5 |

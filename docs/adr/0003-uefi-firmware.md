@@ -174,6 +174,34 @@ the "end at 4 GiB" placement rule guarantees.
 (`crates/uefi-boot/tests/reset_vector.rs` asserts the reset state rather than
 trusting this paragraph.)
 
+### Measured during bring-up (2026-08-19)
+
+The gap map below was written from the sources *before* the firmware ran. What
+the firmware then actually did, in order, with the machine feature each step
+required:
+
+| # | Serial output | Machine feature added |
+|---|---|---|
+| 1 | `AcpiTimerLibConstructor: Unknown Host Bridge Device ID: 0xFFFF` / `ASSERT [SecMain] BaseRomAcpiTimerLib.c(65)` | PCI configuration space on `0xcf8`/`0xcfc` with a `0x8086:0x0d57` host bridge at `00:00.0` (`machine_x86::platform`) |
+| 2 | reached PEI, `PlatformMiscInitialization: Cloud Hypervisor is done.`, RAM sized from our PVH memmap | the ACPI PM timer at `0x0608` (`InternalAcpiGetTimerTick()` is a bare `IoRead32` there, and `MicroSecondDelay()` spins on it) |
+| 3 | `ASSERT [CpuDxe] MpLib.c(1971)` in `GetBspNumber()` | **a real bug in our VMM, not a missing device**: `KVM_GET_SUPPORTED_CPUID` reports the *host* CPU's APIC ID in CPUID leaf 1 `EBX[31:24]` and leaves the topology leaves' x2APIC ID alone, so every vCPU claimed APIC id `0x0a` while its local APIC said `0`. `vmm_core::Vcpu::new` now writes the vCPU index into leaf 1 `EBX[31:24]` and leaves `0xB`/`0x1F` `EDX`, as every rust-vmm VMM must |
+| 4 | `ASSERT_EFI_ERROR (Status = Device Error)` / `ASSERT [PcRtc] PcRtcEntry.c(181)` | an MC146818 RTC/CMOS at `0x70`/`0x71` (`machine_x86::rtc`) — `EFI_RUNTIME_SERVICES.GetTime()` has no other source, and `RtcWaitToUpdate()` times out without it |
+| 5 | **full boot to the UEFI Boot Manager**: DXE dispatch, `PciBus: Discovered PCI @ [00\|00\|00] [VID = 0x8086, DID = 0xD57]`, console terminal modes, `BdsDxe` load-option dump with *BootManagerMenuApp*, *EFI Firmware Setup*, *EFI Internal Shell*, then `BdsDxe: No bootable option or device was found.` | — nothing; this is the expected end of phase 1 |
+
+Two of the predicted gaps showed up verbatim in that run and are worth
+recording as confirmed rather than theorised:
+
+- `QEMU Flash: Attempting flash detection at 4FFFD0` → `QemuFlashDetected => FD
+  behaves as RAM` → `QEMU flash was not detected. Writable FVB is not being
+  installed.` The firmware then falls back to `EmuVariableFvbRuntimeDxe`
+  ("EMU Variable FVB: Using pre-reserved block at 7FF7C000"), so UEFI variables
+  work but live only in RAM. Persisting them is the pflash/NVRAM item below.
+- `QemuFwCfgAcpiPlatform` loads and parks in
+  `AcpiPlatformEntryPoint: waiting for root bridges to be connected` — it has
+  neither fw_cfg nor a non-zero `rsdp_paddr`, so no ACPI tables are installed.
+  `SmbiosPlatformDxe` likewise fails `Not Found` (no SMBIOS entry point at
+  `CLOUDHV_SMBIOS_ADDRESS`, `0xf0000`).
+
 ### Still missing — the phase 2/3 gap map
 
 Established from the sources, in the order the firmware will hit them:

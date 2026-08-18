@@ -2,6 +2,8 @@
 //! vCPU register/CPUID/GDT setup (backlog EPIC 1/2).
 
 pub mod layout;
+pub mod platform;
+pub mod rtc;
 
 #[cfg(target_os = "linux")]
 pub mod boot;

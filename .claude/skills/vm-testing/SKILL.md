@@ -104,6 +104,49 @@ The queue-notify measurement uses the same harness:
 cargo test -p boot-tests --test notify_bench -- --ignored --nocapture
 ```
 
+## UEFI firmware tests (EPIC 18)
+
+Three layers, matching the tiers above. Boot mode is a config choice, so the
+existing device/serial tests are unaffected by any of it.
+
+1. **Portable** (`crates/uefi-boot`, tier 1): firmware-image classification
+   (PVH ELF vs flash blob, with truncated/absurd headers), reset-vector ROM
+   placement arithmetic, and the `hvm_start_info`/`hvm_memmap_table_entry` byte
+   layout. Two of these encode invariants worth keeping honest — a 4 MiB ROM
+   must land at `0xffc0_0000` (OVMF's own `FW_BASE_ADDRESS`), and no `e820_map`
+   entry may ever overlap the ROM window.
+2. **Machine devices** (`machine_x86::platform`, `machine_x86::rtc`, tier 1):
+   the host bridge must answer `0x8086:0x0d57` to a 16-bit read at `00:00.0`
+   offset 2, the ACPI PM timer must advance, the RTC must report a valid BCD
+   date with UIP clear and VRT set, and port `0x70` must read back. Each of
+   these was a firmware assert before it was a test — see the bring-up table in
+   [ADR-0003](../../../docs/adr/0003-uefi-firmware.md).
+3. **KVM** (`crates/uefi-boot/tests/reset_vector.rs`, tier 3): maps a fake ROM
+   whose last 16 bytes hold `mov al,0x42; out 0x10,al; mov al,0x43; out 0x10,al;
+   jmp $`, then runs the vCPU **without setting a single register** and asserts
+   the two port writes arrive. This is the only test of the claim the whole
+   reset-vector mode rests on: a fresh KVM vCPU already *is* the architectural
+   reset state (`CS.base 0xffff_0000`, `IP 0xfff0`, PE clear), so the first
+   fetch lands at `0xffff_fff0` inside the ROM. Use `jmp $`, not `ud2`: an
+   exception would depend on the IDT, and this test must not touch the very
+   state it is verifying.
+   `crates/vmm-core/tests/cpuid.rs` guards the related trap — each vCPU must
+   report *its own* index as the initial APIC ID, not the host CPU's.
+
+Manual firmware bring-up (needs `bash guest/firmware/build-cloudhv.sh` once,
+~2.5 min, ~2 GiB of EDK2 checkout in `~/.cache/entangled-edk2`):
+
+```bash
+cargo run -p entangled -- run --headless examples/uefi-firmware.toml
+```
+
+A DEBUG-build EDK2 is extremely chatty on ttyS0, and that log *is* the
+diagnostic tool: read it forwards, and treat the first `ASSERT [Phase]
+File.c(line)` as the next required machine feature rather than as a firmware
+bug. A healthy run today ends at `BdsDxe: No bootable option or device was
+found.` — the firmware works; it has no media it can see, because CloudHv ships
+no virtio-mmio driver and we have no virtio-pci (ADR-0003 phase 3).
+
 ## Fuzzing (MVP-1402)
 
 `cargo-fuzz` targets live under `fuzz/`, which is its own workspace and is listed
