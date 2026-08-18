@@ -49,6 +49,34 @@ pub const CMDLINE_START: u64 = 0x0002_0000;
 /// this is plenty and keeps the layout simple).
 pub const CMDLINE_MAX_LEN: usize = 2048;
 
+// ---- UEFI boot (EPIC 18, ADR-0003) ---------------------------------------
+
+/// Guest physical address of the PVH `hvm_start_info` structure handed to a
+/// firmware in `%ebx`. Lives in low RAM that neither the firmware image
+/// (loaded at 1 MiB and up) nor the SEC/PEI temporary RAM (inside the
+/// firmware's own MEMFD, at 8 MiB and up) touches.
+pub const PVH_START_INFO_START: u64 = 0x0000_1000;
+
+/// Guest physical address of the `hvm_memmap_table_entry` array that
+/// `hvm_start_info.memmap_paddr` points at.
+pub const PVH_MEMMAP_START: u64 = 0x0000_2000;
+
+/// Guest physical address of the NUL-terminated PVH command line.
+pub const PVH_CMDLINE_START: u64 = 0x0000_3000;
+
+/// Cap on the PVH memory map, so the array cannot run out of its page.
+/// One `hvm_memmap_table_entry` is 24 bytes: 128 entries is 3 KiB.
+pub const PVH_MEMMAP_MAX_ENTRIES: usize = 128;
+
+/// One past the end of the 32-bit physical address space. A reset-vector
+/// firmware ROM is placed so that its last byte is at `TOP_OF_32BIT - 1`,
+/// which puts the architectural reset vector (`0xffff_fff0`) inside it.
+pub const TOP_OF_32BIT: u64 = 0x1_0000_0000;
+
+/// Where a reset-mode vCPU takes its first instruction fetch: `CS.base`
+/// `0xffff_0000` + `IP` `0xfff0`. Firmware ROM placement must cover it.
+pub const RESET_VECTOR: u64 = 0xffff_fff0;
+
 /// Start of the 32-bit MMIO hole. RAM must not be mapped at or above this
 /// until high-RAM support lands; virtio-mmio windows and the future PCI hole
 /// live here.

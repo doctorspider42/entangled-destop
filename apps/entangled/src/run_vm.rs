@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use control_api::VmConfig;
+use control_api::{BootMode, VmConfig};
 use machine_x86::boot as x86_boot;
 use machine_x86::bus::MachineBus;
 use machine_x86::serial::SerialConsole;
@@ -160,29 +160,46 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     let cmdline = extend_cmdline(&cfg.boot.cmdline, &virtio.cmdline_clauses());
     let bus = MachineBus::with_virtio(serial, virtio);
 
-    let boot = linux_boot::BootConfig {
-        kernel: cfg.boot.kernel.clone(),
-        initramfs: cfg.boot.initramfs.clone(),
-        cmdline,
-    };
-    let loaded = linux_boot::load(vm.memory(), &boot, machine.memory_mib << 20)
-        .map_err(|e| e.to_string())?;
-
-    let vcpus = vm.take_vcpus();
-    for vcpu in &vcpus {
-        x86_boot::setup_long_mode_sregs(vm.memory(), vcpu).map_err(|e| e.to_string())?;
-        if vcpu.index == 0 {
-            // Only the boot CPU starts at the kernel entry; the others wait
-            // for INIT/SIPI from the guest.
-            x86_boot::setup_boot_regs(vcpu, loaded.entry, loaded.boot_params_addr)
-                .map_err(|e| e.to_string())?;
+    // Boot mode dispatch (EPIC 18 / ADR-0003). Everything above this point —
+    // memory, IRQ chip, serial, the whole virtio window — is identical for both
+    // modes; only how the vCPU starts differs.
+    let mem_size = machine.memory_mib << 20;
+    let entry = match cfg.boot.mode {
+        BootMode::DirectLinux => {
+            let boot = linux_boot::BootConfig {
+                kernel: cfg
+                    .boot
+                    .require_kernel()
+                    .map_err(|e| e.to_string())?
+                    .clone(),
+                initramfs: cfg.boot.initramfs.clone(),
+                cmdline,
+            };
+            let loaded =
+                linux_boot::load(vm.memory(), &boot, mem_size).map_err(|e| e.to_string())?;
+            let vcpus = vm.take_vcpus();
+            for vcpu in &vcpus {
+                x86_boot::setup_long_mode_sregs(vm.memory(), vcpu).map_err(|e| e.to_string())?;
+                if vcpu.index == 0 {
+                    // Only the boot CPU starts at the kernel entry; the others
+                    // wait for INIT/SIPI from the guest.
+                    x86_boot::setup_boot_regs(vcpu, loaded.entry, loaded.boot_params_addr)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            BootEntry {
+                vcpus,
+                entry: loaded.entry,
+            }
         }
-    }
+        BootMode::Uefi => start_uefi(&mut vm, &cfg, mem_size)?,
+    };
+    let (vcpus, entry_addr) = (entry.vcpus, entry.entry);
 
     // Lifecycle (MVP-1203): Created -> Running -> Stopping -> Stopped, any
     // vCPU error -> Crashed. Transitions are validated by VmState itself.
     let mut state = VmState::Created;
-    tracing::info!(entry = format_args!("{:#x}", loaded.entry), state = ?state, "VM created");
+    tracing::info!(entry = format_args!("{entry_addr:#x}"), mode = ?cfg.boot.mode, state = ?state, "VM created");
 
     let threads = spawn_vcpus(vcpus, |_| Box::new(bus.clone())).map_err(|e| e.to_string())?;
     state = state
@@ -284,6 +301,74 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     match failure {
         Some(message) => Err(message),
         None => Ok(()),
+    }
+}
+
+/// The vCPUs, taken out of the VM and started, plus where vCPU0 begins
+/// executing (for the log line).
+struct BootEntry {
+    vcpus: Vec<vmm_core::Vcpu>,
+    entry: u64,
+}
+
+/// Boots a UEFI firmware (EPIC 18, ADR-0003).
+///
+/// Two shapes, decided by the image itself:
+///
+/// * a PVH ELF (EDK2 CloudHv, rust-hypervisor-firmware) is loaded into guest
+///   RAM and entered in 32-bit protected mode with `%ebx` at the
+///   `hvm_start_info`;
+/// * anything else is a flash image, mapped as a read-only ROM ending at 4 GiB,
+///   and the vCPUs are left in the state KVM created them in — which *is* the
+///   architectural reset state (`CS.base 0xffff_0000`, `IP 0xfff0`), so the
+///   first instruction fetch lands at `0xffff_fff0` inside the ROM.
+fn start_uefi(vm: &mut vmm_core::Vm, cfg: &VmConfig, mem_size: u64) -> Result<BootEntry, String> {
+    let path = cfg.boot.require_firmware().map_err(|e| e.to_string())?;
+    let image = uefi_boot::FirmwareImage::read(path).map_err(|e| e.to_string())?;
+    tracing::info!(
+        firmware = %path.display(),
+        bytes = image.len(),
+        kind = ?image.kind(),
+        "loading UEFI firmware"
+    );
+
+    match image.kind() {
+        uefi_boot::FirmwareKind::PvhElf { .. } => {
+            let boot =
+                uefi_boot::load_pvh(vm.memory(), &image, mem_size).map_err(|e| e.to_string())?;
+            let vcpus = vm.take_vcpus();
+            for vcpu in &vcpus {
+                x86_boot::setup_pvh_sregs(vm.memory(), vcpu).map_err(|e| e.to_string())?;
+                if vcpu.index == 0 {
+                    x86_boot::setup_pvh_regs(vcpu, boot.entry, boot.start_info_addr)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(BootEntry {
+                vcpus,
+                entry: boot.entry,
+            })
+        }
+        uefi_boot::FirmwareKind::ResetVector => {
+            let placement =
+                uefi_boot::rom::place_at_top_of_32bit(image.len()).map_err(|e| e.to_string())?;
+            let rom = vm
+                .map_rom(placement.guest_addr, image.bytes())
+                .map_err(|e| e.to_string())?;
+            tracing::info!(
+                addr = format_args!("{:#x}", rom.guest_addr),
+                end = format_args!("{:#x}", rom.guest_addr + rom.len),
+                read_only = rom.read_only,
+                "firmware ROM mapped; vCPUs stay in the architectural reset state"
+            );
+            // Deliberately no register setup: KVM_CREATE_VCPU already leaves
+            // the vCPU in the reset state (verified in
+            // crates/uefi-boot/tests/reset_vector.rs).
+            Ok(BootEntry {
+                vcpus: vm.take_vcpus(),
+                entry: machine_x86::layout::RESET_VECTOR,
+            })
+        }
     }
 }
 

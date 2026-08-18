@@ -28,4 +28,4 @@ pub use memory::{create_guest_memory, GuestMem};
 #[cfg(target_os = "linux")]
 pub use vcpu::{spawn_vcpus, ExitHandler, RunOutcome, Vcpu, VcpuThreads};
 #[cfg(target_os = "linux")]
-pub use vm::{MachineConfig, Vm};
+pub use vm::{MachineConfig, RomRegion, Vm};
