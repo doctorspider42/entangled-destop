@@ -35,6 +35,13 @@ deny = []
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # Marvin Attack on the `rsa` crate (pulled in by rpgp in debian-media).
+    # The timing side channel needs an attacker who can measure our *private*
+    # RSA operations; debian-media only VERIFIES signatures with public keys —
+    # no private-key RSA runs in this codebase. Revisit when rpgp bumps `rsa`.
+    "RUSTSEC-2023-0071",
+]
 
 [sources]
 unknown-registry = "deny"
