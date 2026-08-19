@@ -38,9 +38,9 @@ cargo test -p vmm-core -p machine-x86 -p linux-boot -p control-api
 cargo clippy -p vmm-core -p machine-x86 -p linux-boot -p control-api --all-targets -- -D warnings
 ```
 
-The `virtio-*` crates and `display` do not build on Windows yet: upstream
-`virtio-queue` pulls `vm-memory` with default features, re-enabling the
-unix-only `rawfd` feature (see ADR-0002). Nothing in this repo can subtract it.
+The `virtio-*` crates and `display` also build natively on Windows since the
+vendored `third_party/virtio-queue` patch (see its VENDORED.md and ADR-0002)
+removed the unix-only `rawfd` feature from the graph.
 
 WHP tests need the "Windows Hypervisor Platform" optional feature (admin +
 reboot); without it they self-skip with a hint, like the KVM tests without
