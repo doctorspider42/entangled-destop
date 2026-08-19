@@ -1,12 +1,23 @@
-//! `entangled install` — the installer mode (backlog EPIC 10).
+//! `entangled install` — the installer mode (backlog EPIC 10, UEFI-1804).
 //!
-//! Boots the verified Debian installer against a target RAW disk, with the
-//! full device set (window, GPU, input, net). In `--auto` mode a preseed
-//! file is appended to the installer initrd (gzip-concatenated cpio, which
-//! the kernel treats as one initramfs) and the network is configured
-//! statically on the kernel command line — the host TAP has no DHCP server.
-//! After the installer's final reboot the disk is inspected (MBR + ext4
-//! UUID) and a ready-to-run VM profile is written next to it (MVP-1008/1009).
+//! Two distributions, two entirely different mechanisms, one command:
+//!
+//! * **Debian** boots the verified d-i installer directly (`mode =
+//!   "direct-linux"`) against a target RAW disk with the full device set. In
+//!   `--auto` mode a preseed file is appended to the installer initrd
+//!   (gzip-concatenated cpio, which the kernel treats as one initramfs) and the
+//!   network is configured statically on the kernel command line — the host TAP
+//!   has no DHCP server. Afterwards the disk is inspected (MBR + ext4 UUID) and
+//!   a ready-to-run profile is written next to it (MVP-1008/1009).
+//! * **Ubuntu** boots the verified live-server ISO through UEFI firmware
+//!   (`mode = "uefi"`, virtio-pci), which is the only way to end up with a
+//!   GPT + ESP the firmware can boot afterwards. subiquity is automated with an
+//!   autoinstall configuration on a cloud-init NoCloud seed volume, and the one
+//!   thing a seed cannot carry — the word `autoinstall` on the kernel command
+//!   line, without which the installer stops for a confirmation — is typed into
+//!   GRUB over the serial console. The install ends with an ACPI poweroff, the
+//!   disk is inspected (GPT + ESP + root) and the profile that boots the
+//!   *installed* system through its persisted NVRAM boot entry is written.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -38,8 +49,14 @@ const AUTO_PRESEED: &str = include_str!("../../../assets/preseed/auto-weston.cfg
 const BOOTSTRAP_KERNEL: &str = "artifacts/bootstrap/vmlinuz";
 
 pub fn run(args: &InstallArgs) -> Result<(), String> {
+    if args.distro.eq_ignore_ascii_case("ubuntu") {
+        return crate::install_ubuntu::run(args);
+    }
     if !args.distro.eq_ignore_ascii_case("debian") {
-        return Err(format!("unknown distro '{}': only debian", args.distro));
+        return Err(format!(
+            "unknown distro '{}': expected debian or ubuntu",
+            args.distro
+        ));
     }
 
     // 1. Verified installer media (cache-first; EPIC 6 owns the trust chain).
@@ -118,6 +135,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             kernel: Some(kernel),
             initramfs: Some(initramfs.clone()),
             firmware: None,
+            nvram: None,
             cmdline,
         },
         disks: vec![DiskSection {
@@ -168,6 +186,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             kernel: Some(PathBuf::from("artifacts/bootstrap/vmlinuz")),
             initramfs: Some(PathBuf::from("artifacts/bootstrap/initrd.img")),
             firmware: None,
+            nvram: None,
             cmdline: format!("console=ttyS0 root=UUID={} rw", root.uuid),
         },
         disks: vec![DiskSection {

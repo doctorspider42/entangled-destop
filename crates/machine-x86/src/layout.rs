@@ -136,6 +136,60 @@ pub const TOP_OF_32BIT: u64 = 0x1_0000_0000;
 /// `0xffff_0000` + `IP` `0xfff0`. Firmware ROM placement must cover it.
 pub const RESET_VECTOR: u64 = 0xffff_fff0;
 
+// ---- pflash / NVRAM (UEFI-1804) -------------------------------------------
+//
+// The window of the emulated CFI flash device (`crate::pflash`) that backs the
+// UEFI non-volatile variable store. **These numbers are a contract with the
+// firmware build**: `guest/firmware/build-cloudhv.sh` overrides
+// `PcdOvmfFdBaseAddress` and `PcdOvmfFlashNvStorageVariableBase` to
+// [`PFLASH_BASE`], and if the two disagree the firmware probes an address
+// nothing decodes, concludes "FD behaves as RAM", and quietly goes back to
+// RAM-only variables — a failure whose only symptom is an installed guest that
+// stops booting after its second restart.
+//
+//   0xffc0_0000 .. 0xffc4_0000   variable store   (PcdFlashNvStorageVariableSize)
+//   0xffc4_0000 .. 0xffc4_1000   event log
+//   0xffc4_1000 .. 0xffc4_2000   fault-tolerant-write working block
+//   0xffc4_2000 .. 0xffc8_4000   fault-tolerant-write spare blocks
+//   0xffc8_4000 .. 0x1_0000_0000 decoded, unbacked: reads as erased flash
+//
+// Why here: the same address `OvmfPkg/OvmfPkgX64` uses for its 4 MiB flash, so
+// the window ends exactly at 4 GiB, and it is clear of the IOAPIC
+// ([`IOAPIC_ADDR`]), the LAPIC ([`LAPIC_ADDR`]) and the `0xc000_0000 +
+// 0x3800_0000` MMIO hole EDK2's CloudHv platform hard-codes.
+//
+// Note the deliberate overlap with the *reset-vector* ROM placement: a 4 MiB
+// flash image mapped by `uefi_boot::rom::place_at_top_of_32bit` lands here too.
+// The two modes are mutually exclusive — a reset-vector firmware image *is* its
+// own flash, PVH firmware is loaded into RAM and needs this device — and
+// `apps/entangled` refuses the combination rather than mapping both.
+
+/// Guest physical base of the pflash window.
+pub const PFLASH_BASE: u64 = 0xffc0_0000;
+
+/// Size of the decoded pflash window: `PcdOvmfFirmwareFdSize`, 4 MiB, ending at
+/// 4 GiB. The firmware adds exactly this range to the GCD as runtime MMIO, so
+/// the device answers reads across all of it.
+pub const PFLASH_WINDOW_SIZE: u64 = 0x0040_0000;
+
+/// Live variable store size (`PcdFlashNvStorageVariableSize`, `VARS_LIVE_SIZE`).
+pub const PFLASH_VARSTORE_SIZE: u64 = 0x0004_0000;
+
+/// Event log block (`PcdOvmfFlashNvStorageEventLogSize`).
+pub const PFLASH_EVENT_LOG_SIZE: u64 = 0x0000_1000;
+
+/// Fault-tolerant-write working block (`PcdFlashNvStorageFtwWorkingSize`).
+pub const PFLASH_FTW_WORKING_SIZE: u64 = 0x0000_1000;
+
+/// Fault-tolerant-write spare blocks (`PcdFlashNvStorageFtwSpareSize`,
+/// `VARS_SPARE_SIZE`).
+pub const PFLASH_FTW_SPARE_SIZE: u64 = 0x0004_2000;
+
+/// Bytes actually persisted per VM: `VARS_SIZE` from `CloudHvDefines.fdf.inc`,
+/// i.e. the four regions above. This is the size of the NVRAM file.
+pub const PFLASH_NVRAM_SIZE: u64 =
+    PFLASH_VARSTORE_SIZE + PFLASH_EVENT_LOG_SIZE + PFLASH_FTW_WORKING_SIZE + PFLASH_FTW_SPARE_SIZE;
+
 /// Start of the 32-bit MMIO hole. RAM must not be mapped at or above this
 /// until high-RAM support lands; the PCI BAR aperture and the virtio-mmio
 /// windows live here.

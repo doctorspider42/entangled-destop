@@ -1,0 +1,123 @@
+#cloud-config
+# Unattended Ubuntu Server installation for Entangled Desktop (backlog
+# UEFI-1804). Delivered to the subiquity installer as cloud-init user-data on a
+# small ISO9660 volume labelled CIDATA (a NoCloud seed — see
+# apps/entangled/src/seed.rs), which the installer VM sees as its third
+# virtio-blk device.
+#
+# ## Why this shape
+#
+# * The autoinstall directives sit under a top-level `autoinstall:` key inside a
+#   `#cloud-config` document. That is the required form when the config arrives
+#   as cloud-init user-data; a bare `version: 1` document is only valid as
+#   `autoinstall.yaml` on the installation medium, which is read-only verified
+#   media here.
+# * `interactive-sections` is absent, so every section is automated. It does
+#   *not* remove the "Continue with autoinstall?" confirmation — nothing in this
+#   file can, because subiquity gates that on the word `autoinstall` being
+#   present in /proc/cmdline. `entangled install ubuntu` puts it there by typing
+#   the boot command into GRUB over the serial console (see install.rs).
+# * The install is **offline**: no network is configured, `apt` gets one mirror
+#   candidate and no geoip lookup, and every optional package source that would
+#   reach the internet is switched off. Everything installed comes from the
+#   ISO's own pool.
+#
+# The hostname placeholder @HOSTNAME@ is substituted by the CLI.
+
+autoinstall:
+  version: 1
+
+  # Never fetch a newer installer snap: that is a network round trip before the
+  # install can even start, and it would silently change the installer this
+  # profile was tested against.
+  refresh-installer:
+    update: false
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  timezone: Etc/UTC
+
+  # No NIC at all. An empty netplan is valid and means "configure nothing",
+  # which is what an offline install wants; the installed system can be given a
+  # network later through the VM profile's [network] section.
+  network:
+    version: 2
+    ethernets: {}
+
+  # Offline apt: one plain mirror candidate (which will fail fast), no geoip
+  # request, and the documented fallback. `fallback` is set explicitly because
+  # subiquity's own documentation and its code disagree about the default.
+  apt:
+    geoip: false
+    preserve_sources_list: false
+    fallback: offline-install
+    mirror-selection:
+      primary:
+        - uri: "http://archive.ubuntu.com/ubuntu"
+
+  # Nothing that needs the network or a vendor archive.
+  source:
+    id: ubuntu-server-minimal
+    search_drivers: false
+  drivers:
+    install: false
+  codecs:
+    install: false
+  oem:
+    install: false
+  kernel-crash-dumps:
+    enabled: false
+  ssh:
+    install-server: false
+  snaps: []
+
+  # GPT with an EFI System Partition and a root filesystem, on the *first*
+  # virtio disk. The ISO is /dev/vdb and the seed is /dev/vdc, so the match is
+  # by path rather than by size: a `size: largest` match would be correct today
+  # and wrong the moment someone installs onto a disk smaller than the ISO.
+  #
+  # Whether this produces an ESP or a BIOS boot partition is decided by the
+  # firmware the installer booted under, not by anything in this file — which is
+  # why the installer VM boots through EDK2 and not through a direct kernel load.
+  storage:
+    layout:
+      name: direct
+      match:
+        path: /dev/vda
+
+  identity:
+    realname: Entangled
+    username: entangled
+    # SHA-512 crypt of "entangled" (openssl passwd -6 -salt entangled0seed).
+    # A demo credential for a throwaway VM, deliberately written down here
+    # rather than hidden: this profile is for automated boot tests.
+    password: "$6$entangled0seed$bT7xSYZVhNBFpEbtY2oAblEwSEksNuxBzAR9uMlGvF/Am7Xk57rlH.Sr6eVuvZM4ePjO968h1NJrBI8Usw14m."
+    hostname: "@HOSTNAME@"
+
+  # The installed system must talk on ttyS0: that is the only channel through
+  # which `entangled run` can show that the *installed* Ubuntu booted, and there
+  # is no autoinstall key for the target's kernel command line. `late-commands`
+  # run in the installer with the target mounted at /target, so GRUB's defaults
+  # are edited there and update-grub is run inside the target.
+  #
+  # GRUB_TERMINAL/GRUB_SERIAL_COMMAND put the *boot menu* on the serial line as
+  # well, so a failure to load the kernel is visible instead of silent.
+  late-commands:
+    - sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/d;/^GRUB_TERMINAL/d;/^GRUB_SERIAL_COMMAND/d' /target/etc/default/grub
+    - >-
+      printf '%s\n'
+      'GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8"'
+      'GRUB_TERMINAL="serial console"'
+      'GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"'
+      'GRUB_TIMEOUT=3'
+      'GRUB_TIMEOUT_STYLE=menu'
+      >> /target/etc/default/grub
+    - curtin in-target -- update-grub
+
+  # Power off rather than reboot when the install finishes: an orderly systemd
+  # poweroff writes S5 to the ACPI PM1a control register, which this machine
+  # latches (machine_x86::acpi::pm) and reports as RunOutcome::Shutdown. That is
+  # how `entangled install` knows the installation is over — a reboot would
+  # instead start the installer again from the still-attached ISO.
+  shutdown: poweroff

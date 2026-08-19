@@ -8,6 +8,7 @@ pub mod irqchip;
 pub mod layout;
 pub mod mptable;
 pub mod pci;
+pub mod pflash;
 pub mod platform;
 pub mod rtc;
 pub mod serial;

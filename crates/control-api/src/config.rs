@@ -111,6 +111,19 @@ pub struct BootSection {
     /// flash image entered through the reset vector).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firmware: Option<PathBuf>,
+    /// `uefi` only: the VM's non-volatile UEFI variable store (UEFI-1804).
+    ///
+    /// One file per VM, created erased on first use and then owned by the guest
+    /// firmware: `BootOrder`, the `Boot####` entries `grub-install` writes, and
+    /// (if the firmware is built with secure boot) the key database. Without it
+    /// the firmware keeps variables in RAM and an installed system loses its
+    /// boot entry every time the VM stops — which is why `entangled install`
+    /// always writes this key for a UEFI profile.
+    ///
+    /// The firmware image itself stays shared and pristine: it is never written
+    /// through this path (see `machine_x86::pflash`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvram: Option<PathBuf>,
     /// Kernel command line. Meaningless in `uefi` mode — the firmware and the
     /// guest bootloader own the command line there.
     #[serde(default)]
@@ -132,6 +145,22 @@ impl BootSection {
         self.firmware.as_ref().ok_or_else(|| {
             ConfigError::Invalid("boot.firmware is required for mode = \"uefi\"".into())
         })
+    }
+}
+
+impl Default for BootSection {
+    /// A direct-Linux section with nothing chosen yet. Exists so that adding a
+    /// key to this struct does not have to be threaded through every caller
+    /// that builds one by hand (`entangled install` builds four).
+    fn default() -> Self {
+        Self {
+            mode: BootMode::DirectLinux,
+            kernel: None,
+            initramfs: None,
+            firmware: None,
+            nvram: None,
+            cmdline: String::new(),
+        }
     }
 }
 
@@ -215,6 +244,11 @@ impl VmConfig {
                 if self.boot.firmware.is_some() {
                     return err("boot.firmware is only valid for mode = \"uefi\"; \
                          direct-linux boots without firmware"
+                        .into());
+                }
+                if self.boot.nvram.is_some() {
+                    return err("boot.nvram is only valid for mode = \"uefi\"; \
+                         a direct-linux guest has no UEFI variables to store"
                         .into());
                 }
             }
@@ -530,6 +564,40 @@ firmware = "artifacts/firmware/CLOUDHV.fd"
             &UBUNTU_ISO_EXAMPLE.replace("memory_mib = 2560", "memory_mib = 3073")
         )
         .is_err());
+    }
+
+    /// UEFI-1804: the profile `entangled install ubuntu` writes names an NVRAM
+    /// file, and that key must round-trip and stay uefi-only.
+    #[test]
+    fn the_nvram_key_is_uefi_only_and_round_trips() {
+        let with_nvram = UBUNTU_ISO_EXAMPLE.replace(
+            r#"firmware = "artifacts/firmware/CLOUDHV.fd""#,
+            "firmware = \"artifacts/firmware/CLOUDHV.fd\"\nnvram = \"/vms/ubuntu.nvram\"",
+        );
+        let cfg = VmConfig::from_toml(&with_nvram).unwrap();
+        assert_eq!(cfg.boot.nvram, Some(PathBuf::from("/vms/ubuntu.nvram")));
+        assert_eq!(
+            VmConfig::from_toml(&toml::to_string_pretty(&cfg).unwrap()).unwrap(),
+            cfg
+        );
+
+        // Absent is fine — that is a firmware boot with RAM-only variables.
+        assert_eq!(
+            VmConfig::from_toml(UBUNTU_ISO_EXAMPLE).unwrap().boot.nvram,
+            None
+        );
+
+        // On direct-linux it is a mistake worth naming: nothing would ever read
+        // the file, so a profile that names one is not describing what it thinks.
+        let stray = BACKLOG_EXAMPLE.replace(
+            r#"mode = "direct-linux""#,
+            "mode = \"direct-linux\"\nnvram = \"/vms/x.nvram\"",
+        );
+        let error = VmConfig::from_toml(&stray).expect_err("nvram on direct-linux must be refused");
+        let ConfigError::Invalid(message) = error else {
+            panic!("expected a validation error, got {error:?}");
+        };
+        assert!(message.contains("boot.nvram"), "{message}");
     }
 
     #[test]

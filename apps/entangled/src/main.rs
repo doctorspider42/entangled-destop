@@ -10,7 +10,10 @@ mod fetch;
 #[cfg(target_os = "linux")]
 mod install;
 #[cfg(target_os = "linux")]
+mod install_ubuntu;
+#[cfg(target_os = "linux")]
 mod run_vm;
+mod seed;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -82,7 +85,8 @@ enum DiskCommand {
 
 #[derive(Args)]
 pub struct InstallArgs {
-    /// Distribution to install (only "debian").
+    /// Distribution to install: "debian" (d-i, direct kernel boot) or "ubuntu"
+    /// (live-server ISO through UEFI, unattended autoinstall).
     pub distro: String,
     /// Target RAW disk image; created if missing.
     #[arg(long)]
@@ -93,9 +97,23 @@ pub struct InstallArgs {
     /// (assets/preseed/auto-weston.cfg).
     #[arg(long)]
     pub auto: bool,
-    /// Custom preseed file appended to the installer initrd.
+    /// Custom preseed file appended to the installer initrd (Debian only).
     #[arg(long, conflicts_with = "auto")]
     pub preseed: Option<PathBuf>,
+    /// Custom autoinstall configuration for Ubuntu: a `#cloud-config` document
+    /// whose `autoinstall:` key holds subiquity's directives. Placed on the
+    /// NoCloud seed volume in place of the built-in profile
+    /// (assets/autoinstall/ubuntu-server.yaml).
+    #[arg(long, conflicts_with = "preseed")]
+    pub autoinstall: Option<PathBuf>,
+    /// Installer ISO (Ubuntu only). Defaults to the newest release verified into
+    /// the cache by scripts/fetch-ubuntu-iso.sh.
+    #[arg(long)]
+    pub iso: Option<PathBuf>,
+    /// UEFI firmware image (Ubuntu only). Defaults to
+    /// artifacts/firmware/CLOUDHV.fd.
+    #[arg(long)]
+    pub firmware: Option<PathBuf>,
     /// Size for a newly created disk (e.g. 16G).
     #[arg(long, default_value = "16G")]
     pub size: String,

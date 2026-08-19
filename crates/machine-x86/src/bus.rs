@@ -35,6 +35,7 @@ use vmm_core::ExitHandler;
 
 use crate::acpi::AcpiPmBlock;
 use crate::irqchip::UserspaceIrqChip;
+use crate::pflash::Pflash;
 use crate::platform::FirmwarePlatform;
 use crate::serial::SerialConsole;
 use crate::virtio::VirtioMmioBus;
@@ -67,6 +68,11 @@ pub struct MachineBus {
     /// no extra claimed ports. (When the real PCI bus is present it owns the
     /// configuration ports; the ACPI PM registers live in `acpi_pm` for both.)
     platform: Option<Arc<Mutex<FirmwarePlatform>>>,
+    /// The CFI flash device backing the UEFI variable store (UEFI-1804),
+    /// present only for a UEFI boot with an NVRAM file. `None` leaves the
+    /// window at 4 GiB − 4 MiB undecoded, which is what every boot before this
+    /// existed saw — and what a direct-Linux guest must keep seeing.
+    pflash: Option<Arc<Mutex<Pflash>>>,
 }
 
 impl MachineBus {
@@ -80,6 +86,7 @@ impl MachineBus {
             acpi_pm: Arc::new(AcpiPmBlock::new()),
             irqchip: None,
             platform: None,
+            pflash: None,
         }
     }
 
@@ -130,6 +137,33 @@ impl MachineBus {
     pub fn with_firmware_platform(mut self) -> Self {
         self.platform = Some(Arc::new(Mutex::new(FirmwarePlatform::new())));
         self
+    }
+
+    /// Attaches the UEFI variable store's flash device (UEFI-1804).
+    ///
+    /// Only meaningful together with [`Self::with_firmware_platform`]: it is the
+    /// firmware that speaks the CFI command set, and a direct-Linux guest never
+    /// touches the window.
+    pub fn with_pflash(mut self, pflash: Arc<Mutex<Pflash>>) -> Self {
+        self.pflash = Some(pflash);
+        self
+    }
+
+    /// The flash device behind this bus, if any — for reporting what the
+    /// firmware actually wrote (`Pflash::stats`).
+    pub fn pflash(&self) -> Option<&Arc<Mutex<Pflash>>> {
+        self.pflash.as_ref()
+    }
+
+    /// Queues bytes on the serial console's receive path, as if they had been
+    /// typed on it (UEFI-1804: this is how the installer's kernel command line
+    /// is edited in GRUB, and the only guest-input channel both EDK2 and GRUB
+    /// listen to — neither has a virtio-input driver).
+    pub fn push_serial_input(&self, bytes: &[u8]) {
+        match self.serial.lock() {
+            Ok(mut serial) => serial.push_input(bytes),
+            Err(_) => tracing::error!("serial lock is poisoned; dropping host input"),
+        }
     }
 
     /// The virtio-mmio window behind this bus, for inspection: `entangled
@@ -229,6 +263,19 @@ impl ExitHandler for MachineBus {
     }
 
     fn mmio_write(&mut self, addr: u64, data: &[u8]) {
+        if let Some(pflash) = &self.pflash {
+            match pflash.lock() {
+                Ok(mut flash) if flash.contains(addr) => {
+                    flash.mmio_write(addr, data);
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => tracing::error!(
+                    addr = format_args!("{addr:#x}"),
+                    "pflash lock is poisoned; dropping guest write"
+                ),
+            }
+        }
         if let Some(irqchip) = &self.irqchip {
             if UserspaceIrqChip::claims_mmio(addr) {
                 irqchip.mmio_write(addr, data);
@@ -264,6 +311,19 @@ impl ExitHandler for MachineBus {
 
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]) {
         data.fill(0);
+        if let Some(pflash) = &self.pflash {
+            match pflash.lock() {
+                Ok(mut flash) if flash.contains(addr) => {
+                    flash.mmio_read(addr, data);
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => tracing::error!(
+                    addr = format_args!("{addr:#x}"),
+                    "pflash lock is poisoned; reading zeroes"
+                ),
+            }
+        }
         if let Some(irqchip) = &self.irqchip {
             if UserspaceIrqChip::claims_mmio(addr) {
                 irqchip.mmio_read(addr, data);

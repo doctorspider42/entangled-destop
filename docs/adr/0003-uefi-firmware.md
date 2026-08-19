@@ -1,9 +1,10 @@
 # ADR-0003: UEFI firmware for Entangled Desktop — EDK2 CloudHv, entered via PVH
 
-- Status: proposed
+- Status: accepted — all four phases have run on hardware (UEFI-1801…1804)
 - Date: 2026-08-19
 - Backlog: EPIC 18 (UEFI-1801 pflash/firmware mapping, UEFI-1802 firmware
-  build+boot, UEFI-1803 boot an installer ISO)
+  build+boot, UEFI-1803 boot an installer ISO, UEFI-1804 install and boot
+  Ubuntu end to end)
 - Extends: [ADR-0001](0001-mvp-architecture.md) (§3 "No BIOS/UEFI in MVP")
 - Sources: `edk2-stable202602` (commit `b7a715f7c03c`), checked out and built
   locally; Xen `docs/misc/pvh.pandoc` and
@@ -226,7 +227,7 @@ as of the bring-up run above.
 | **Per-vCPU APIC id in CPUID** | **closed** — `vmm_core::Vcpu::new` | Not a device: `KVM_GET_SUPPORTED_CPUID` leaks the host CPU's APIC id into leaf 1 `EBX[31:24]`, so `GetBspNumber()` cannot match the BSP against the MP hand-off HOB | `UefiCpuPkg/Library/MpInitLib/MpLib.c:1971` |
 | **virtio over PCI** | **closed** — `machine_x86::{pci,virtio_pci}` + `virtio_core::pci` | CloudHv's FDF ships `VirtioPciDeviceDxe`, `Virtio10Dxe`, `VirtioBlkDxe`, `VirtioScsiDxe`, `VirtioNetDxe` — and **no** virtio-MMIO driver at all, so UEFI-1803 needed the transport before it needed anything else. It now enumerates all five functions and binds both disks. Three further gaps had to close before that worked; see "Phase 3" below | `OvmfPkg/CloudHv/CloudHvX64.fdf:225–235` |
 | **ACPI tables + `rsdp_paddr`** | **closed** — `machine_x86::acpi` + `uefi_boot::load_pvh` | `InstallCloudHvTables()` dereferences `hvm_start_info.rsdp_paddr`, walks the XSDT installing every table it lists, then installs the DSDT from the FADT's `X_DSDT`; a zero (or unsigned) RSDP made it return `EFI_NOT_FOUND`. Now: RSDP/XSDT/FADT/FACS/MADT/DSDT at `0xe0000`, and `OnRootBridgesConnected: … installing ACPI tables` with no failure status. **Correction to the prediction:** the MADT is *not* how this firmware counts CPUs — `PlatformMaxCpuCountInitialization()` reads fw_cfg only, so `boot CPU count unavailable` is still logged and still harmless; the real count comes from `MpInitLib`'s INIT-SIPI sweep (`MpInitLib: Find 2 processors in system`), which needs the per-vCPU APIC id fix, not a table. The tables matter for the guest OS, and for `poweroff` | `OvmfPkg/AcpiPlatformDxe/CloudHvAcpi.c`, `.claude/skills/acpi-machine/SKILL.md` |
-| **Writable pflash / NVRAM** | **open — and now measured to be survivable** | The variable store sits at `VARS_OFFSET = 0` of the flash device, `VARS_SIZE = 0x84000`. Observed: `QemuFlashDetected => No` → `EmuVariableFvbRuntimeDxe` takes over and variables live in RAM, so `BootOrder`, `Boot####` and SecureBoot state are lost on every stop. **This does not block an ISO boot**, which is why phase 3 landed without it: with no `BootOrder` variable, `BdsDxe` falls back to enumerating removable media and synthesises `Boot0003 "UEFI Misc Device 2"` for the ISO's ESP, taking the `\EFI\BOOT\BOOTX64.EFI` path — exactly the behaviour a first boot from installation media needs. It *does* block UEFI-1804: an installed Ubuntu writes a `Boot0000` entry pointing at `\EFI\ubuntu\shimx64.efi` and that entry will not survive the VM stopping, so the installed system boots only as long as the removable-media fallback also finds it. A real pflash device (status/command state machine, write buffering, an NVRAM file per VM) is the follow-up. Note the PVH path loads the image into RAM, which is writable by construction — the read-only ROM slot only constrains the reset-vector path | `OvmfPkg/Include/Fdf/OvmfPkgDefines.fdf.inc`, `CloudHvDefines.fdf.inc` |
+| **Writable pflash / NVRAM** | **closed** — `machine_x86::pflash` + a two-line firmware build override | Was: `QemuFlashDetected => No` → `EmuVariableFvbRuntimeDxe`, variables in RAM, `BootOrder`/`Boot####` lost on every stop. That did not block an ISO boot (with no `BootOrder`, `BdsDxe` enumerates removable media and synthesises an entry for the ISO's ESP — exactly what a first boot from installation media needs) and it did block UEFI-1804, where the installed system is reached through the `Boot####` entry `grub-install` writes and nothing else. Now: an emulated CFI-01 device at `0xffc0_0000`, backed by a per-VM NVRAM file. **The prediction in this row was wrong about where the store is**, and the correction is the whole story of phase 4 below: CloudHv declares *no* varstore region at all, and the flash PCDs point at `FW_BASE_ADDRESS = 0x004FFFD0`, which is inside the loaded image and *is* the PVH entry point. Nothing could be emulated there | `OvmfPkg/CloudHv/CloudHvDefines.fdf.inc`, `OvmfPkg/QemuFlashFvbServicesRuntimeDxe/QemuFlash.c`, `guest/firmware/build-cloudhv.sh` |
 | **ACPI shutdown port 0x0600** | **closed** — `machine_x86::acpi::pm` | `CLOUDHV_ACPI_SHUTDOWN_IO_ADDRESS` is the ACPI 5.0 `SLEEP_CONTROL_REG`, and for a CloudHv host bridge `ResetShutdown()` is `IoWrite8 (0x600, 5 << 2 \| 1 << 5)`. It is now one register of a 16-byte PM block that also carries PM1a_EVT/CNT (the register Linux uses instead), the PM timer and GPE0; either sleep register latches a request that `ExitHandler::shutdown_requested` turns into `RunOutcome::Shutdown` | `OvmfPkg/Library/ResetSystemLib/DxeResetShutdown.c` |
 | **MMIO hole agreement** | **free, but no longer free of consequences** | The firmware hard-codes the CloudHv 32-bit aperture as `0xc000_0000 + 0x3800_0000`. Our `layout::MMIO_HOLE_START` is already `0xc000_0000` and the virtio window at `0xd000_0000` sits inside it — but `PciBusDxe` *allocates* out of that aperture rather than accepting what it finds, so "agreement" turned out to mean the machine must decode the whole advertised window, not just its own slots. See phase 3 gap 2 | `OvmfPkg/Library/PlatformInitLib/MemDetect.c:61` |
 
@@ -282,10 +283,148 @@ Two further observations from the same run, recorded so nobody re-derives them:
   `grub.cfg` on a volume we control; neither is needed to *see* the installer,
   which draws on the scanout.
 
-### What UEFI-1804 (install to disk) still needs
+### Phase 4 (2026-08-19): Ubuntu installs, and the installed system boots
 
-- **Writable pflash / NVRAM.** The one hard blocker: without it the installed
-  system's `Boot0000` entry does not survive a stop. See the gap-map row.
+`entangled install ubuntu --disk … --auto --headless` now completes unattended,
+and `entangled run` of the profile it writes boots the *installed* system to a
+login prompt. Two problems had to be solved, and neither was the one this ADR
+predicted.
+
+#### The variable store does not exist where the PCDs say it does
+
+The gap-map row above assumed CloudHv's flash simply needed a device behind it.
+It does not have a flash region at all. Read out of the pinned tree:
+
+- `CloudHvX64.fdf` declares three regions — a 4 KiB PVH ELF header at offset 0,
+  `FVMAIN_COMPACT` at `0x1000`, `SECFV` at `0x3CC000` — and **no**
+  `!include OvmfPkg/Include/Fdf/VarStore.fdf.inc`. The `VARS_*` defines are
+  inherited boilerplate; nothing consumes them. Where OvmfPkgX64 keeps a
+  pre-formatted variable store, CloudHv has the ELF header and 0x83000 bytes of
+  `0xFF` padding.
+- `CloudHvDefines.fdf.inc` sets `FW_BASE_ADDRESS = 0x004FFFD0` and derives
+  `PcdOvmfFdBaseAddress` and `PcdOvmfFlashNvStorageVariableBase` from it. That
+  address is **not** where the image is loaded — the hard-coded PVH ELF header
+  says `paddr 0x00100000` — it is not page aligned, and it *is* the PVH entry
+  point: `0x100000 + 0x3FFFD0`, the first instruction the firmware executes.
+  So `QemuFlashDetected()` probes guest RAM the firmware is running from, reads
+  back what it wrote, and reports `FD behaves as RAM`.
+
+Which rules out emulating flash at the address the firmware asks for: an MMIO
+region cannot be the instruction-fetch target of the entry point, and the 4 MiB
+from `0x004FFFD0` overlaps both the loaded image and the PEI/DXE working memory
+at `0x800000`. This is the "(b)" case — the firmware genuinely cannot use a
+flash varstore as built — so the build moves the two PCDs that say *where the
+flash is* to `0xFFC00000`, the address OvmfPkgX64 uses, where a 4 MiB window
+ends exactly at 4 GiB and clears the MMIO hole, the IOAPIC and the LAPIC.
+Everything else follows: the event-log, FTW-working and FTW-spare bases are
+computed from the variable base inside the FDF.
+
+Deliberately *not* changed: `FW_BASE_ADDRESS`, `FW_SIZE` and the `[FD.CLOUDHV]`
+layout (so the image keeps its shape and the hard-coded ELF header still
+describes it), `PcdCfvBase`/`PcdBfvBase` (confidential-computing measurement
+inputs, which point into the image, not the store), and
+`PcdOvmfFirmwareFdSize` (what bounds `QemuFlashWrite` and the GCD range).
+`build --pcd` was tried first and is silently ignored for these — the FDF's own
+`SET` wins, and the build does not even re-run AutoGen — so the two lines are
+edited with an asserted pre-image and the built value is read back out of
+`AutoGen.h` afterwards. That check matters because the failure mode is silent:
+a firmware probing an address nothing decodes just goes back to RAM variables.
+
+Three device details were measured rather than reasoned about, each one a boot
+that ended badly first:
+
+| Symptom | Cause |
+|---|---|
+| `QemuFlashDetected => FD behaves as RAM` with a device present | clear-status (`0x50`) must return to *read-array* mode, not stay in status mode |
+| `QemuFlashDetected` fell through all three verdicts | the cleared status register must read `0x00`. `pflash_cfi01` starts at zero and sets the ready bit only when an operation completes; a device answering `0x80` there is dismissed as none of RAM, ROM or flash |
+| `ASSERT [VariableRuntimeDxe] VariableNonVolatile.c(228): VariableStore->Size == VariableStoreLength` | a fresh store cannot be blank flash. `FvbInitialize` rewrites a missing *FV* header, but nothing writes the `VARIABLE_STORE_HEADER` behind it — on QEMU it arrives pre-formatted inside the flash image. The host now generates the same empty-but-formatted store (`pflash::pristine_varstore`) rather than vendoring one |
+
+Evidence, two boots against one NVRAM file
+(`tests/boot/tests/uefi_nvram.rs`):
+
+```
+QEMU Flash: Attempting flash detection at FFC00010
+QemuFlashDetected => FD behaves as FLASH, writable
+Installing QEMU flash FVB
+Disabling EMU Variable FVB since flash variables appear to be supported.
+  Boot0000/0001/0002 + BootOrder   3423 bytes programmed, 0 blocks erased
+-- VM stopped, VM restarted --
+  the same options, read back              1538 bytes programmed
+```
+
+#### `autoinstall` has to reach the kernel command line, which lives on read-only media
+
+subiquity finds a cloud-init NoCloud seed by itself (a volume labelled `CIDATA`
+holding `user-data`/`meta-data`), but it will not act on an autoinstall
+configuration unattended unless the word `autoinstall` is in `/proc/cmdline`.
+That is one unconditional check in the installer; no key in the configuration
+file changes it, `interactive-sections: []` included. And the command line comes
+from the ISO's own `grub.cfg`.
+
+Both documented ways out were rejected: repacking the ISO throws away the
+provenance that is the whole point of the verified fetch, and booting
+`casper/vmlinuz` directly (what the upstream quickstart does under QEMU) means
+the installer does not see firmware — so subiquity makes a BIOS boot partition
+instead of an ESP, and the result is a disk this VMM cannot boot at all.
+
+So the installer's command line is typed into GRUB over the serial console,
+which is what the documentation tells a person to do. It works because of a
+constraint recorded in phase 3 as a limitation: CloudHv ships no `VirtioGpuDxe`,
+so the firmware's console *is* ttyS0 — and GRUB, running on the EFI console,
+reads the same UART. `MachineBus::push_serial_input` reaches both.
+
+```
+grub> echo entangled: root=$root prefix=$prefix
+entangled: root=hd1 prefix=(hd1)/boot/grub
+grub> linux /casper/vmlinuz autoinstall console=ttyS0,115200n8 ---
+grub> initrd /casper/initrd
+grub> boot
+```
+
+Each line is sent only after GRUB has printed a fresh prompt, so the exchange is
+self-synchronising and legible in the transcript. No `search` is needed: GRUB
+read its menu from `($root)/boot/grub/grub.cfg` on the ISO9660 filesystem, so
+`$root` already is the installer volume. The same command line carries
+`console=ttyS0`, which is the difference between an install that can be
+diagnosed and one that runs blind.
+
+#### What the run looks like
+
+```
+wrote the cloud-init NoCloud seed volume     bytes=65536 label=CIDATA
+UEFI variable store ready                    bytes=540672 fresh=true
+GRUB menu is up; opening its command line
+typing into GRUB × 4
+subiquity/load_autoinstall_config … cmd-install … curtin in-target -- update-grub
+[  288.4] reboot: Power down
+guest requested ACPI S5 (soft off)           via="PM1a_CNT"
+UEFI variable store written by the firmware  programmed_bytes=5328
+installation detected                        esp=1 root=2 root_uuid=…
+```
+
+and then, from the profile that was written:
+
+```
+Boot0006: Ubuntu                             0x0001
+FSOpen: Open '\EFI\ubuntu\shimx64.efi' Success
+BdsDxe: starting Boot0006 "Ubuntu" from HD(1,GPT,…)/\EFI\ubuntu\shimx64.efi
+GNU GRUB  version 2.14 → Booting initrd of Ubuntu 26.04 LTS
+Welcome to Ubuntu 26.04 LTS!
+[  OK  ] Started serial-getty@ttyS0.service - Serial Getty on ttyS0.
+```
+
+`Boot0006 "Ubuntu"` is the whole point of the pflash device: it is the entry
+`grub-install` wrote through the CFI device on the previous boot, read back out
+of a file.
+
+One more defect surfaced here and is worth keeping: after `reboot: Power down`,
+**126 seconds** passed before the run loop noticed. A powered-off guest sits in
+HLT and gives KVM no reason to exit, so the vCPU threads — which check
+`ExitHandler::shutdown_requested` after each exit — never ran the check.
+`apps/entangled` now watches the same latch from the supervisor loop.
+
+### What is still missing after UEFI-1804
+
 - **An ACPI `_PRT`** under `\_SB.PCI0`, with level-triggered `INTA#` (an irqfd
   pair or a resample eventfd) instead of an edge on an ISA pin. The current
   arrangement works because Linux falls back to `interrupt_line` and warns
@@ -320,3 +459,29 @@ Two further observations from the same run, recorded so nobody re-derives them:
 - Choosing PVH over the reset vector means we never emulate a CMOS, an RTC
   memory-sizing convention or fw_cfg — the "No QEMU anywhere" rule survives
   contact with UEFI.
+- **A VM now has state outside its disk.** `[boot] nvram` is a second per-VM
+  file, and it is not optional for an installed UEFI guest: delete it and the
+  machine boots to "no bootable option" with a perfectly good disk attached.
+  Snapshots, cloning and `entangled disk` grew a second thing to copy, and the
+  GUI's "delete machine" grew a second thing to remove.
+- **The firmware build is no longer stock.** Two `SET` lines in
+  `CloudHvDefines.fdf.inc` are rewritten before `build`, with an asserted
+  pre-image and a post-build check of the compiled PCD, and the provenance file
+  records the flash base. `ENTANGLED_FW_PFLASH=0` builds upstream's own
+  firmware, which is what every UEFI-1801…1803 measurement was taken on and what
+  `tests/boot/tests/uefi_nvram.rs` correctly fails against. Bumping `EDK2_TAG`
+  onto a tree where those lines moved is a loud error rather than a firmware with
+  RAM-only variables.
+- **"No QEMU anywhere" is about the *process*, not the register conventions.**
+  This device is deliberately bug-compatible with `pflash_cfi01`, because that is
+  what OVMF's flash driver was written against: programs overwrite rather than
+  AND, the cleared status is zero, and `0x50` returns to read-array mode. Where a
+  real chip and QEMU differ, QEMU wins. Nothing links against QEMU, no QEMU
+  process runs, and no fw_cfg exists — but a firmware written for one VMM carries
+  that VMM's conventions with it, and pretending otherwise costs boots.
+- **The install path depends on a firmware-visible console.** Typing the
+  installer's command line into GRUB works only because the firmware and the
+  bootloader share the UART. A future `VirtioGpuDxe` (or any firmware with a GOP)
+  would make GRUB draw on the scanout instead, and the serial exchange would have
+  to become a virtio-input one. The mechanism is deliberately small and in one
+  place (`install_ubuntu::GrubScript`) for exactly that reason.
