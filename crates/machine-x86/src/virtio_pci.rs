@@ -48,27 +48,19 @@ use virtio_core::interrupt::{InterruptError, IrqLine};
 use virtio_core::pci as vpci;
 use virtio_core::transport::TransportError;
 use virtio_core::{GuestMem, PciTransport, VirtioDevice};
-use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
+use crate::irqfd::{IrqFdError, IrqFdLine};
 use crate::layout;
 use crate::notify::{DeviceNotifier, NotifyAddressing, NotifyError, QueueNotifyMode};
 use crate::pci::{ConfigSpace, PciError, PciRoot};
 
 #[derive(Debug, Error)]
 pub enum VirtioPciAttachError {
-    #[error("failed to create the interrupt eventfd for PCI slot {slot}: {source}")]
-    EventFd {
+    #[error("failed to wire the interrupt line for PCI slot {slot}: {source}")]
+    Irq {
         slot: usize,
         #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to register the irqfd for PCI slot {slot} (GSI {gsi}): {source}")]
-    Irqfd {
-        slot: usize,
-        gsi: u32,
-        #[source]
-        source: kvm_ioctls::Error,
+        source: IrqFdError,
     },
 
     #[error("PCI slot {slot}: {source}")]
@@ -89,15 +81,16 @@ pub enum VirtioPciAttachError {
     Notify(#[from] NotifyError),
 }
 
-/// A device's INTx line: an `EventFd` registered with KVM as an irqfd, gated on
-/// the guest not having set `INTX_DISABLE`.
+/// A device's INTx line: a host interrupt line gated on the guest not having
+/// set `INTX_DISABLE`.
 ///
-/// Triggering injects the interrupt entirely inside the kernel. See the module
-/// docs for why this is an edge on an ISA-style pin rather than a level-triggered
-/// `INTA#`, and `crate::virtio::IrqFdLine` for the interrupt-topology defect both
-/// buses share.
+/// The inner line is a KVM irqfd today ([`crate::irqfd::IrqFdLine`]), so
+/// triggering injects the interrupt entirely inside the kernel; it is an
+/// `Arc<dyn IrqLine>` so the WHP IOAPIC line slots in unchanged when virtio
+/// reaches Windows (EPIC 17 phase 3). See the module docs for why this is an
+/// edge on an ISA-style pin rather than a level-triggered `INTA#`.
 pub struct IntxLine {
-    event: EventFd,
+    line: Arc<dyn IrqLine>,
     /// Mirrors the command register's `INTX_DISABLE` bit, maintained by the
     /// config space. Checked on every injection rather than snapshotted, because
     /// a driver may disable INTx at any time — while switching to polling, or on
@@ -113,9 +106,7 @@ impl IrqLine for IntxLine {
             tracing::trace!("INTx is disabled by the guest; not raising the line");
             return Ok(());
         }
-        self.event
-            .write(1)
-            .map_err(|e| InterruptError::Signal(e.to_string()))
+        self.line.trigger()
     }
 }
 
@@ -192,16 +183,14 @@ impl VirtioPciBus {
             let bar_base = layout::pci_bar_slot(slot as u64);
             let gsi = layout::PCI_FIRST_IRQ + slot as u32;
 
-            let event = EventFd::new(EFD_NONBLOCK)
-                .map_err(|source| VirtioPciAttachError::EventFd { slot, source })?;
-            vm.register_irqfd(&event, gsi)
-                .map_err(|source| VirtioPciAttachError::Irqfd { slot, gsi, source })?;
+            let irqfd = IrqFdLine::new(&vm, gsi)
+                .map_err(|source| VirtioPciAttachError::Irq { slot, source })?;
 
             // The config space is built first so its INTx flag can gate the
             // line the transport is about to be handed.
             let config = bus.build_config_space(slot, bar_base, gsi, device.as_ref())?;
             let line = Arc::new(IntxLine {
-                event,
+                line: Arc::new(irqfd),
                 enabled: config.intx_flag(),
             });
 

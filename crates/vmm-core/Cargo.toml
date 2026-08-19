@@ -23,7 +23,21 @@ libc.workspace = true
 # Windows Hypervisor Platform backend (EPIC 17). `windows` is Microsoft's
 # official binding crate, MIT OR Apache-2.0.
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_System_Hypervisor"] }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Hypervisor",
+] }
+
+# The WHP boot test (`tests/whp_boot.rs`) drives the real machine model: MP
+# table, ACPI tables, the userspace irqchip, the 16550 and the bzImage loader.
+# That is a dependency *cycle* through dev-dependencies — machine-x86 depends on
+# vmm-core — which cargo permits precisely because a dev-dependency never enters
+# the library's own build graph. The alternative would be a separate test crate
+# that exists only to hold one file; the acceptance criterion names
+# `cargo test -p vmm-core --test whp_boot`, so the test lives here.
+[target.'cfg(windows)'.dev-dependencies]
+machine-x86.workspace = true
+linux-boot.workspace = true
 
 [lints]
 workspace = true

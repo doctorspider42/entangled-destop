@@ -6,16 +6,30 @@
 //!
 //! | `WHV_RUN_VP_EXIT_REASON` | This backend |
 //! |---|---|
-//! | `X64Halt` | [`RunOutcome::Halted`] |
-//! | `X64IoPortAccess` | [`ExitHandler::io_out`] / [`ExitHandler::io_in`], then RIP advanced by the exit context's instruction length |
-//! | `MemoryAccess` | decoded into an error today — see [`WhpVcpu::run_loop`] |
+//! | `X64Halt` | wait on the partition's [`HaltGate`] and re-enter, or [`RunOutcome::Halted`] when there is no local APIC to wake the CPU |
+//! | `X64IoPortAccess` | [`ExitHandler::io_out`] / [`ExitHandler::io_in`], then RIP advanced by the exit context's instruction length; string/`REP` forms go through the instruction emulator |
+//! | `MemoryAccess` | `WHvEmulatorTryMmioEmulation`, whose callbacks reach [`ExitHandler::mmio_read`]/[`ExitHandler::mmio_write`] |
+//! | `X64Cpuid` | this machine's CPUID policy applied on top of WHP's default result, then RIP advanced |
 //! | `UnrecoverableException`, `InvalidVpRegisterValue` | [`RunOutcome::Shutdown`] (the triple-fault equivalent) |
 //! | `Canceled` | re-check the stop flag, then re-enter or return [`RunOutcome::Stopped`] |
 //! | `None` | re-enter (WHP reports it for internal reschedules) |
 //! | everything else | [`VmmError::WhpUnsupportedExit`] naming the reason |
 //!
 //! Unlike KVM, WHP never advances RIP for us and never decodes the faulting
-//! instruction; the backend is responsible for both.
+//! instruction; the backend is responsible for both. (The one exception is the
+//! instruction emulator, which advances RIP itself through the register-write
+//! callback — see [`crate::whp::emulator`].)
+//!
+//! # `hlt` is an idle loop, not an ending
+//!
+//! KVM with an in-kernel irqchip absorbs `hlt` in the kernel; WHP always reports
+//! it. A Linux guest executes `hlt` on every trip through `default_idle()`, so a
+//! run loop that returned on the first one would stop the guest a few
+//! milliseconds into boot, and one that re-entered immediately would spin a host
+//! core. With local APIC emulation on, the loop therefore waits on the
+//! partition's [`HaltGate`] — bumped by every `WHvRequestInterrupt` — and then
+//! re-enters. With it off (the phase-1 smoke guests) nothing can ever wake the
+//! CPU, so `hlt` really is the end and [`RunOutcome::Halted`] is right.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,15 +39,19 @@ use windows::Win32::System::Hypervisor::{
     WHvCancelRunVirtualProcessor, WHvDeleteVirtualProcessor, WHvGetVirtualProcessorRegisters,
     WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
     WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonNone,
-    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonX64Halt,
-    WHvRunVpExitReasonX64IoPortAccess, WHvSetVirtualProcessorRegisters, WHvX64RegisterApicBase,
-    WHvX64RegisterRax, WHvX64RegisterRip, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
+    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonX64Cpuid,
+    WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess, WHvSetVirtualProcessorRegisters,
+    WHvX64RegisterApicBase, WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx,
+    WHvX64RegisterRdx, WHvX64RegisterRip, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
     WHV_RUN_VP_EXIT_CONTEXT,
 };
 
 use crate::hv::{
     ExitHandler, HvError, RunOutcome, VcpuRegisters, X86Registers, X86SpecialRegisters,
 };
+use crate::whp::cpuid::{CpuidPolicy, CpuidResult};
+use crate::whp::emulator::Emulator;
+use crate::whp::interrupt::{HaltGate, HALT_POLL};
 use crate::whp::partition::{create_virtual_processor, whp_err, Partition};
 use crate::whp::regs::{
     gp_from_values, gp_values, sreg_from_values, sreg_values, zeroed_value, Aligned16, GP_NAMES,
@@ -49,12 +67,19 @@ use crate::VmmError;
 pub struct WhpVcpu {
     pub index: u32,
     partition: Arc<Partition>,
+    /// This machine's CPUID policy, applied to the `X64Cpuid` exits the
+    /// partition's exit list produces.
+    cpuid: CpuidPolicy,
 }
 
 impl WhpVcpu {
     pub(super) fn new(partition: Arc<Partition>, index: u32) -> Result<Self, VmmError> {
         create_virtual_processor(partition.handle(), index)?;
-        Ok(Self { index, partition })
+        Ok(Self {
+            index,
+            partition,
+            cpuid: CpuidPolicy::new(index),
+        })
     }
 
     /// A handle another thread can use to kick this vCPU out of
@@ -230,20 +255,12 @@ impl IoAccessInfo {
 }
 
 impl WhpVcpu {
-    /// Runs the vCPU until the guest halts, shuts down, `running` turns false,
-    /// or an unrecoverable error occurs. Every error carries the vCPU index and
-    /// a readable message, matching the KVM backend's contract.
+    /// Runs the vCPU until the guest shuts down, `running` turns false, or an
+    /// unrecoverable error occurs. Every error carries the vCPU index and a
+    /// readable message, matching the KVM backend's contract.
     ///
-    /// MMIO (`WHvRunVpExitReasonMemoryAccess`) is decoded but not yet
-    /// dispatched to [`ExitHandler`]: WHP's exit record gives the guest
-    /// physical address and the raw instruction bytes but neither the access
-    /// width nor the data, so emulating it needs an instruction decoder. The
-    /// intended fix is WHP's own `WHvEmulatorTryMmioEmulation`
-    /// (WinHvEmulation.dll), whose callbacks map onto
-    /// [`ExitHandler::mmio_read`]/[`ExitHandler::mmio_write`] directly — EPIC
-    /// 17 phase 2. Until then such an exit is reported as
-    /// [`VmmError::WhpUnsupportedExit`] with the GPA, so a misconfigured
-    /// device window is diagnosable rather than silent.
+    /// See the module docs for the full exit table, and for why `hlt` is an idle
+    /// wait rather than an ending once local APIC emulation is on.
     // `WHvRunVpExitReason*` are `WHV_RUN_VP_EXIT_REASON(i32)` newtype constants
     // from the `windows` crate, so matching on them trips
     // `non_upper_case_globals`; matching on `.0` integers instead would throw
@@ -254,15 +271,41 @@ impl WhpVcpu {
         handler: &mut dyn ExitHandler,
         running: &AtomicBool,
     ) -> Result<RunOutcome, VmmError> {
+        // Created on the first exit that needs decoding, so a guest that only
+        // does simple port I/O never loads winhvemulation.dll.
+        let mut emulator: Option<Emulator> = None;
+        let gate: Option<&Arc<HaltGate>> = self
+            .partition
+            .options()
+            .local_apic
+            .then(|| self.partition.halt_gate());
+
         while running.load(Ordering::Acquire) {
+            // Snapshot the interrupt epoch *before* entering the guest: an
+            // injection that lands between `hlt` executing and the exit being
+            // observed must not be slept through.
+            let epoch = gate.map_or(0, |gate| gate.epoch());
             let exit = self.run_once()?;
             match exit.ExitReason {
-                WHvRunVpExitReasonX64Halt => return Ok(RunOutcome::Halted),
+                WHvRunVpExitReasonX64Halt => match gate {
+                    // Nothing can wake a CPU without a local APIC, so `hlt`
+                    // really is the end (the phase-1 smoke guests rely on this).
+                    None => return Ok(RunOutcome::Halted),
+                    Some(gate) => {
+                        gate.wait_since(epoch, HALT_POLL);
+                        continue;
+                    }
+                },
                 // WHP's triple-fault equivalents.
                 WHvRunVpExitReasonUnrecoverableException
                 | WHvRunVpExitReasonInvalidVpRegisterValue => return Ok(RunOutcome::Shutdown),
-                WHvRunVpExitReasonX64IoPortAccess => self.handle_io(&exit, handler)?,
-                WHvRunVpExitReasonMemoryAccess => return Err(self.mmio_deferred(&exit)),
+                WHvRunVpExitReasonX64IoPortAccess => {
+                    self.handle_io(&exit, handler, &mut emulator)?
+                }
+                WHvRunVpExitReasonMemoryAccess => {
+                    self.handle_mmio(&exit, handler, &mut emulator)?
+                }
+                WHvRunVpExitReasonX64Cpuid => self.handle_cpuid(&exit)?,
                 // Kicked by `WHvCancelRunVirtualProcessor`, or an internal
                 // reschedule: re-check the stop flag and continue.
                 WHvRunVpExitReasonCanceled | WHvRunVpExitReasonNone => continue,
@@ -281,6 +324,17 @@ impl WhpVcpu {
             }
         }
         Ok(RunOutcome::Stopped)
+    }
+
+    /// Lazily creates the instruction emulator. One per run loop, kept for its
+    /// lifetime: `WHvEmulatorCreateEmulator` is not free and MMIO exits come in
+    /// bursts.
+    fn emulator<'a>(&self, slot: &'a mut Option<Emulator>) -> Result<&'a Emulator, VmmError> {
+        if slot.is_none() {
+            *slot = Some(Emulator::new()?);
+        }
+        slot.as_ref()
+            .ok_or_else(|| self.fail("the WHP instruction emulator vanished after creation".into()))
     }
 
     fn run_once(&self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, VmmError> {
@@ -323,15 +377,16 @@ impl WhpVcpu {
     /// past the instruction (WHP does not do it for us) and, for `IN`, write
     /// the result back into RAX.
     ///
-    /// String and repeated port I/O (`INS`/`OUTS`, `REP` prefix) is not
-    /// emulated: those need the memory-side decode that
-    /// `WHvEmulatorTryIoEmulation` provides (EPIC 17 phase 2). Nothing in the
-    /// MVP device set issues them — the serial port, the debug port and virtio
-    /// notifications are all single-width `IN`/`OUT`.
+    /// String and repeated port I/O (`INS`/`OUTS`, `REP` prefix) needs the same
+    /// decode MMIO does, so it goes through `WHvEmulatorTryIoEmulation`. Nothing
+    /// in the MVP device set issues them — the serial port, the debug port and
+    /// virtio notifications are all single-width `IN`/`OUT` — but a guest is
+    /// untrusted and may.
     fn handle_io(
         &self,
         exit: &WHV_RUN_VP_EXIT_CONTEXT,
         handler: &mut dyn ExitHandler,
+        emulator: &mut Option<Emulator>,
     ) -> Result<(), VmmError> {
         // SAFETY: `ExitReason == WHvRunVpExitReasonX64IoPortAccess` selects the
         // `IoPortAccess` arm of the exit context union, per WinHvPlatform docs.
@@ -342,11 +397,13 @@ impl WhpVcpu {
         let info = IoAccessInfo::decode(unsafe { io.AccessInfo.AsUINT32 });
 
         if info.string_op || info.rep_prefix {
-            return Err(VmmError::WhpUnsupportedExit(format!(
-                "string/repeated port I/O on port {:#06x} (rip {:#x}): needs \
-                 WHvEmulatorTryIoEmulation — EPIC 17 phase 2",
-                io.PortNumber, exit.VpContext.Rip
-            )));
+            return self.emulator(emulator)?.emulate_io(
+                self.partition.handle(),
+                self.index,
+                handler,
+                &exit.VpContext,
+                &io,
+            );
         }
         if !matches!(info.access_size, 1 | 2 | 4) {
             return Err(VmmError::WhpUnsupportedExit(format!(
@@ -384,7 +441,24 @@ impl WhpVcpu {
         self.set_raw(&names[..count], &values.0[..count])
     }
 
-    fn mmio_deferred(&self, exit: &WHV_RUN_VP_EXIT_CONTEXT) -> VmmError {
+    /// Completes an MMIO access through WHP's instruction emulator.
+    ///
+    /// WHP's exit record carries the guest physical address, the access type and
+    /// the raw instruction bytes — no width, no data, and RIP not advanced — so
+    /// the only way to serve it is to decode the instruction. The emulator's
+    /// memory callback lands on [`ExitHandler::mmio_read`]/
+    /// [`ExitHandler::mmio_write`] and its register-write callback advances RIP.
+    ///
+    /// An **execute** fault is not MMIO: the guest jumped into an unmapped page,
+    /// which the emulator cannot help with and which means the machine (or the
+    /// guest) is broken. It is reported rather than emulated, with the GPA, so a
+    /// bad jump target is diagnosable instead of looping.
+    fn handle_mmio(
+        &self,
+        exit: &WHV_RUN_VP_EXIT_CONTEXT,
+        handler: &mut dyn ExitHandler,
+        emulator: &mut Option<Emulator>,
+    ) -> Result<(), VmmError> {
         // SAFETY: `ExitReason == WHvRunVpExitReasonMemoryAccess` selects the
         // `MemoryAccess` arm of the exit context union.
         let access = unsafe { exit.Anonymous.MemoryAccess };
@@ -392,23 +466,65 @@ impl WhpVcpu {
         // bitfield struct (`AccessType:2, GpaUnmapped:1, GvaValid:1`) and
         // `AsUINT32: u32`.
         let info = unsafe { access.AccessInfo.AsUINT32 };
-        let kind = match info & 0x3 {
-            0 => "read",
-            1 => "write",
-            2 => "execute",
-            _ => "unknown",
-        };
-        VmmError::WhpUnsupportedExit(format!(
-            "MMIO {kind} at gpa {:#x} (rip {:#x}, {} instruction bytes, gpa_unmapped={}): WHP \
-             reports neither access width nor data, so this needs the WinHvEmulation decoder \
-             (WHvEmulatorTryMmioEmulation) — EPIC 17 phase 2 / WHP-1703",
-            access.Gpa,
-            exit.VpContext.Rip,
-            access.InstructionByteCount,
-            info & (1 << 2) != 0,
-        ))
+        if info & 0x3 == MEMORY_ACCESS_EXECUTE {
+            return Err(VmmError::WhpUnsupportedExit(format!(
+                "the guest tried to execute from gpa {:#x} (rip {:#x}), which is not mapped as \
+                 RAM and is not a device window",
+                access.Gpa, exit.VpContext.Rip
+            )));
+        }
+        self.emulator(emulator)?.emulate_mmio(
+            self.partition.handle(),
+            self.index,
+            handler,
+            &exit.VpContext,
+            &access,
+        )
+    }
+
+    /// Answers a `cpuid` the partition's exit list trapped, by applying this
+    /// machine's policy to the result WHP would have returned.
+    ///
+    /// WHP does not write the output registers for an intercepted `cpuid`, and it
+    /// does not advance RIP; both are done here.
+    fn handle_cpuid(&self, exit: &WHV_RUN_VP_EXIT_CONTEXT) -> Result<(), VmmError> {
+        // SAFETY: `ExitReason == WHvRunVpExitReasonX64Cpuid` selects the
+        // `CpuidAccess` arm of the exit context union.
+        let access = unsafe { exit.Anonymous.CpuidAccess };
+        let result = self.cpuid.apply(
+            access.Rax as u32,
+            access.Rcx as u32,
+            CpuidResult {
+                eax: access.DefaultResultRax as u32,
+                ebx: access.DefaultResultRbx as u32,
+                ecx: access.DefaultResultRcx as u32,
+                edx: access.DefaultResultRdx as u32,
+            },
+        );
+        // `cpuid` zero-extends into the 64-bit registers, so writing the 32-bit
+        // values as `u64` is exactly the architectural result.
+        let names = [
+            WHvX64RegisterRip,
+            WHvX64RegisterRax,
+            WHvX64RegisterRbx,
+            WHvX64RegisterRcx,
+            WHvX64RegisterRdx,
+        ];
+        let mut values = Aligned16([zeroed_value(); 5]);
+        values.0[0].Reg64 = exit
+            .VpContext
+            .Rip
+            .wrapping_add(Self::instruction_length(exit));
+        values.0[1].Reg64 = u64::from(result.eax);
+        values.0[2].Reg64 = u64::from(result.ebx);
+        values.0[3].Reg64 = u64::from(result.ecx);
+        values.0[4].Reg64 = u64::from(result.edx);
+        self.set_raw(&names, &values.0)
     }
 }
+
+/// `WHV_MEMORY_ACCESS_INFO::AccessType`: 0 read, 1 write, 2 execute.
+const MEMORY_ACCESS_EXECUTE: u32 = 2;
 
 /// Lets another thread kick a running vCPU out of `WHvRunVirtualProcessor`.
 ///
@@ -424,7 +540,14 @@ pub struct VcpuCanceller {
 impl VcpuCanceller {
     /// Requests that the vCPU's current (or next) run be interrupted; the run
     /// then returns `WHvRunVpExitReasonCanceled`.
+    ///
+    /// Also wakes the vCPU if it is *halted*, which is not the same state: a
+    /// halted vCPU is not inside `WHvRunVirtualProcessor` at all, so cancelling
+    /// only arms the next entry. Without the wake it would sit out the rest of its
+    /// [`HALT_POLL`] window before noticing, and `stop()` would spin cancelling at
+    /// it the whole time.
     pub fn cancel(&self) -> Result<(), VmmError> {
+        self.partition.halt_gate().notify();
         // SAFETY: the partition is kept alive by our `Arc` and `index` names a
         // VP created on it. `WHvCancelRunVirtualProcessor` is documented to be
         // callable from any thread; `flags` must be 0.

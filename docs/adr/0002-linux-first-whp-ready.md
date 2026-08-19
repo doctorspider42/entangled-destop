@@ -124,6 +124,88 @@ Dependency added: `windows` 0.62 (Microsoft, MIT OR Apache-2.0), feature
 `Win32_System_Hypervisor`, only under `[target.'cfg(windows)'.dependencies]`.
 `cargo deny check` passes.
 
+## Amendment (2026-08-19, phase 2): a Linux guest boots on WHP
+
+WHP-1703 is done. `cargo test -p vmm-core --test whp_boot` boots
+`artifacts/bootstrap/vmlinuz` with the marker initramfs to
+`VMHOST_GUEST_READY` on Windows, headless, in ~3.5 s (debug build), and tears
+down cleanly. Design detail lives in `.claude/skills/whp-backend/SKILL.md`; this
+records what the ADR itself has to change its mind about.
+
+**The userspace irqchip is machine code, not backend code.** The phase-1
+assessment called PIC/IOAPIC/PIT "the WHP gap", which invited putting them in
+`vmm-core::whp`. They are in `machine-x86::irqchip` instead, portable and
+unit-tested on both hosts, because a redirection table, a counter driven by a
+clock and an 8259 register file are the machine's devices — the same category as
+the 16550 beside them. Exactly one step is genuinely hypervisor-specific: handing
+a decoded interrupt message to a local APIC. That is now a one-method seam,
+`vmm_core::hv::InterruptDelivery`, which **KVM deliberately does not implement**
+(its IOAPIC is in the kernel and irqfds reach it without userspace). The rule in
+the Decision section — "interrupt delivery is always behind a trait" — therefore
+gains a second trait, at the other end of the same path.
+
+**The seam that was declared unnecessary was necessary after all.** `hv.rs` said
+the seam needed nothing for interrupts because `virtio_core::Interrupt`/`IrqLine`
+and the serial trigger already abstracted delivery. Half true: those cover the
+*device* side. The serial console's trigger was not abstract at all — it held an
+`EventFd` and registered its own irqfd — so it now holds an `Arc<dyn IrqLine>`,
+the trait virtio devices already used, with the eventfd path moved intact into
+`machine_x86::irqfd::IrqFdLine`. The Linux behaviour is unchanged;
+`IrqLine::trigger` is the non-blocking edge `EventFd::write(1)` was.
+
+**`hlt` means something different on the two backends.** KVM with an in-kernel
+irqchip emulates `hlt` in the kernel — the vCPU blocks inside `KVM_RUN` and
+userspace never sees it. WHP always reports it, and a Linux guest executes `hlt`
+on every trip through `default_idle()`. So the WHP run loop treats `hlt` as an
+idle wait on a `HaltGate` bumped by every injection, not as an outcome. It
+reports `RunOutcome::Halted` only when local APIC emulation is off, where nothing
+could ever wake the CPU — which is the phase-1 behaviour the real-mode smoke
+guests depend on, and why the new capabilities are opt-in through `WhpOptions`
+rather than switched on for everyone.
+
+**A guest must not be told it is on Hyper-V.** A WHP partition runs on Hyper-V,
+and the hypervisor CPUID leaves can carry the `"Microsoft Hv"` signature. A Linux
+guest that sees it starts using Hyper-V synthetic MSRs and enlightenments a WHP
+exo-partition does not implement. The backend zeroes leaf `0x4000_0000` while
+keeping the hypervisor-present bit (parity with KVM), so the guest finds no
+hypervisor interface and takes the architectural paths — TSC and the 8254, no
+kvmclock, no Hyper-V clocksource. This is the one place the two backends'
+guest-visible CPUID legitimately differs, and it is deliberate.
+
+Two further platform facts, both measured:
+
+- **`CpuidResultList` is the wrong API for editing a leaf.** It takes *complete*
+  results and there is no call that reports what WHP would otherwise have
+  returned, so using it means inventing every bit of a leaf including the feature
+  bits WHP masks for its own reasons. `CpuidExitList` +
+  `ExtendedVmExits.X64CpuidExit` produces an exit whose context carries
+  `DefaultResultRax..Rdx`, which makes the policy a *diff* — the same shape as the
+  KVM path's edit of `KVM_GET_SUPPORTED_CPUID`.
+- **`WHvEmulatorTryMmioEmulation` refuses 16-bit real mode**, failing with
+  `internal emulation failure` (status `0x2`) without ever invoking a callback.
+  Long mode works. Not a problem for a Linux or UEFI guest, but it does mean the
+  emulator cannot be smoke-tested with a real-mode guest the way the port-I/O
+  path is.
+
+The 16-byte alignment rule from phase 1 extends further than stated: it also
+applies to the register-value buffer **WHP hands us** in the emulator's register
+callbacks, which has no alignment guarantee of its own. Both callbacks stage
+through an over-aligned buffer.
+
+`third_party/linux-loader` joins `third_party/virtio-queue`: the same
+`default-features = false` on `vm-memory` one crate further along the graph
+(see its VENDORED.md). With `rawfd` off, `File` has no `ReadVolatile` impl, so
+`linux_boot::load` reads the image through a `Cursor<Vec<u8>>` — portable, and one
+transient copy the initramfs path already paid. One upstream rust-vmm PR would
+retire both vendored copies.
+
+Native Windows status after phase 2: `vmm-core`, `machine-x86`, `linux-boot`,
+`control-api`, `debian-media`, the `virtio-*` crates and `display` all build and
+test. What is still Linux-only above `vmm-core` is the *device wiring* —
+`machine_x86::irqfd`, `notify`, `virtio`, `virtio_pci` — because irqfds and
+ioeventfds are KVM concepts; attaching the same devices through the userspace
+irqchip is phase 3.
+
 ## Consequences
 
 - The MVP pays a small ongoing tax (trait indirection for interrupts, target

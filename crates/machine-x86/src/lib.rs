@@ -2,21 +2,28 @@
 //! vCPU register/CPUID/GDT setup (backlog EPIC 1/2).
 
 pub mod acpi;
+pub mod boot;
+pub mod bus;
+pub mod irqchip;
 pub mod layout;
+pub mod mptable;
 pub mod pci;
 pub mod platform;
 pub mod rtc;
+pub mod serial;
 
+/// KVM-specific device plumbing: irqfd interrupt lines, ioeventfd queue-notify
+/// offload and the virtio buses built on them.
+///
+/// The devices themselves are portable; what is not is the *wiring*. An irqfd
+/// and an ioeventfd are KVM concepts, so on Windows the same devices attach
+/// through [`irqchip`] and (from EPIC 17 phase 3) a WHP doorbell instead. Until
+/// that lands, a WHP machine carries the serial console and the platform
+/// devices but no virtio bus.
 #[cfg(target_os = "linux")]
-pub mod boot;
-#[cfg(target_os = "linux")]
-pub mod bus;
-#[cfg(target_os = "linux")]
-pub mod mptable;
+pub mod irqfd;
 #[cfg(target_os = "linux")]
 pub mod notify;
-#[cfg(target_os = "linux")]
-pub mod serial;
 #[cfg(target_os = "linux")]
 pub mod virtio;
 #[cfg(target_os = "linux")]

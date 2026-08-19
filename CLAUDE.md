@@ -29,8 +29,8 @@ wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace
 
 `vmm-core` (both hypervisor backends), `machine-x86`, `linux-boot`,
 `control-api` and `debian-media` also build and test **natively on Windows** —
-that is where the WHP backend is exercised (EPIC 17). Run both hosts when
-touching any of them:
+that is where the WHP backend is exercised (EPIC 17), including a full
+boot-to-marker of a real Linux guest. Run both hosts when touching any of them:
 
 ```powershell
 $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\entangled-target-whp"
@@ -38,20 +38,22 @@ cargo test -p vmm-core -p machine-x86 -p linux-boot -p control-api
 cargo clippy -p vmm-core -p machine-x86 -p linux-boot -p control-api --all-targets -- -D warnings
 ```
 
-The `virtio-*` crates and `display` also build natively on Windows since the
-vendored `third_party/virtio-queue` patch (see its VENDORED.md and ADR-0002)
-removed the unix-only `rawfd` feature from the graph.
+The `virtio-*` crates and `display` also build natively on Windows. Two vendored,
+minimally patched crates in `third_party/` (`virtio-queue`, `linux-loader` — see
+their VENDORED.md and ADR-0002) take the unix-only `vm-memory` `rawfd` feature
+back out of the graph; cargo features are additive, so nothing else could.
 
 WHP tests need the "Windows Hypervisor Platform" optional feature (admin +
 reboot); without it they self-skip with a hint, like the KVM tests without
-`/dev/kvm`.
+`/dev/kvm`. `cargo test -p vmm-core --test whp_boot` additionally needs the
+kernel and initramfs artifacts, and self-skips without them.
 
 ## Workspace map
 
 | Crate | Owns | Backlog |
 |---|---|---|
 | `crates/vmm-core` | Hypervisor backends (KVM, WHP), guest memory, vCPU lifecycle, VM state machine | EPIC 1/17 |
-| `crates/machine-x86` | x86-64 machine model: memory layout, E820, CPUID, GDT, IRQ chip, ACPI/MP tables, PCI root bus | EPIC 1/2/19 |
+| `crates/machine-x86` | x86-64 machine model: memory layout, E820, CPUID, GDT, ACPI/MP tables, PCI root bus, and the userspace 8259/8254/IOAPIC for hosts whose hypervisor has none | EPIC 1/2/17/19 |
 | `crates/linux-boot` | Direct bzImage+initramfs boot, boot_params, cmdline | EPIC 2 |
 | `crates/uefi-boot` | UEFI firmware boot: PVH entry, reset-vector ROM placement | EPIC 18 |
 | `crates/virtio-core` | virtio-mmio **and** virtio-pci transports, virtqueues, `VirtioDevice` trait | EPIC 3/19 |
@@ -89,9 +91,11 @@ Load the matching skill before working on that subsystem.
   validation and config logic must build and test everywhere. Guest memory is
   portable — never add a second guest-memory type.
 - **Hypervisors talk through `vmm_core::hv`.** Machine and device code uses the
-  neutral register structs, `ExitHandler` and `RunOutcome`; a `kvm_bindings` or
-  `WHV_*` type outside `vmm-core` is a bug. Neither backend's public API may
-  change to suit the other.
+  neutral register structs, `ExitHandler`, `RunOutcome` and `InterruptDelivery`;
+  a `kvm_bindings` or `WHV_*` type outside `vmm-core` is a bug. Neither backend's
+  public API may change to suit the other — a capability only one host needs is
+  an *additive* option (`WhpOptions`) or a trait the other simply does not
+  implement, never a changed signature.
 - **Every `unsafe` block carries a `// SAFETY:` comment** saying why the
   pointer is valid and which union arm is live (`undocumented_unsafe_blocks` is
   `deny`). FFI-ness alone is not a justification.

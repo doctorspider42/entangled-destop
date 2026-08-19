@@ -10,8 +10,9 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 machine-x86.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
+# Portable: `linux-loader` parses a bzImage and writes `boot_params` through
+# `vm-memory`, with no host syscalls of its own, so the loader works on both
+# hosts (ADR-0002).
 linux-loader.workspace = true
 vm-memory.workspace = true
 

@@ -1,7 +1,7 @@
 //! Loading a bzImage + initramfs + cmdline into guest memory and building
 //! `boot_params` with the E820 map (backlog MVP-201..204).
 
-use std::fs::File;
+use std::io::Cursor;
 
 use linux_loader::bootparam::{boot_e820_entry, boot_params};
 use linux_loader::cmdline::Cmdline;
@@ -43,14 +43,21 @@ pub fn load<M: GuestMemory>(
 ) -> Result<LoadedKernel, BootError> {
     cfg.validate()?;
 
-    let mut kernel_file = File::open(&cfg.kernel).map_err(|e| BootError::Load {
+    // Read the image into memory rather than handing `BzImage::load` the `File`.
+    // `KernelLoader::load` wants `Read + ReadVolatile + Seek`, and vm-memory only
+    // implements `ReadVolatile` for `File` behind its unix-only `rawfd` feature —
+    // the feature ADR-0002 keeps switched off workspace-wide so the virtio crates
+    // and this one build natively on Windows. `Cursor<Vec<u8>>` satisfies all
+    // three portably, at the cost of one transient copy of a kernel image
+    // (single-digit MiB), which the initramfs path already pays anyway.
+    let image = std::fs::read(&cfg.kernel).map_err(|e| BootError::Load {
         what: "kernel",
         message: format!("{}: {e}", cfg.kernel.display()),
     })?;
     let loaded = BzImage::load(
         mem,
         None,
-        &mut kernel_file,
+        &mut Cursor::new(image),
         Some(GuestAddress(layout::HIGH_RAM_START)),
     )
     .map_err(|e| load_err("kernel")(&e))?;

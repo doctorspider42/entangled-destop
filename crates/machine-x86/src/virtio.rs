@@ -19,11 +19,10 @@ use std::sync::{Arc, Mutex};
 
 use kvm_ioctls::VmFd;
 use thiserror::Error;
-use virtio_core::interrupt::{InterruptError, IrqLine};
 use virtio_core::transport::TransportError;
 use virtio_core::{mmio, GuestMem, MmioTransport, VirtioDevice};
-use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
+use crate::irqfd::{IrqFdError, IrqFdLine};
 use crate::layout;
 use crate::notify::{DeviceNotifier, NotifyAddressing, NotifyError, QueueNotifyMode};
 
@@ -43,19 +42,11 @@ pub enum VirtioAttachError {
     )]
     TooManySlots { count: usize },
 
-    #[error("failed to create the interrupt eventfd for virtio slot {slot}: {source}")]
-    EventFd {
+    #[error("failed to wire the interrupt line for virtio slot {slot}: {source}")]
+    Irq {
         slot: usize,
         #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to register the irqfd for virtio slot {slot} (GSI {gsi}): {source}")]
-    Irqfd {
-        slot: usize,
-        gsi: u32,
-        #[source]
-        source: kvm_ioctls::Error,
+        source: IrqFdError,
     },
 
     #[error("virtio slot {slot}: {source}")]
@@ -67,45 +58,6 @@ pub enum VirtioAttachError {
 
     #[error(transparent)]
     Notify(#[from] NotifyError),
-}
-
-/// An `EventFd` registered with KVM as an irqfd for one device's GSI.
-/// Triggering it injects the interrupt entirely inside the kernel.
-///
-/// The GSIs live on the in-kernel IOAPIC's ISA-compatible pins, which default
-/// to edge triggering — writing the eventfd produces one edge per used-buffer
-/// batch, matching what other mmio-based VMMs do. If a guest ever turns out to
-/// have configured the pin level-triggered, this is where de-assertion
-/// (`KVM_IRQ_LINE` pairs or a resample eventfd) would go; verifying that needs
-/// a real kernel, which is the bootstrap-kernel work item, not this one.
-///
-/// # Known defect: interrupts are lost when the guest has no MADT/MP table
-///
-/// Measured while adding the MVP-307 boot benchmark: booting the bootstrap
-/// kernel with a virtio-blk disk stalls on the *first* disk read in roughly one
-/// boot in three, on both the synchronous and the ioeventfd notify path, so this
-/// predates MVP-307. At the stall the device has completed the request and
-/// `INTERRUPT_STATUS` still reads `INT_VRING`, i.e. the guest never ran its
-/// handler: the injection was lost, not the kick.
-///
-/// The machine model publishes neither an MP table nor ACPI tables, so the guest
-/// reports "ACPI MADT or MP tables are not detected" and "Switch to virtual wire
-/// mode", i.e. it takes IRQ 5 through the 8259 as ExtINT instead of through the
-/// IOAPIC. The fix is to give the guest a real interrupt topology (MP table or
-/// MADT) the way other KVM VMMs do; until then the `[[disk]]` boot path is
-/// unreliable on this machine model. Reproduce with
-/// `cargo test -p boot-tests --test repeat_boot -- --ignored --nocapture` and
-/// `ENTANGLED_BOOT_DISK=1`.
-struct IrqFdLine {
-    event: EventFd,
-}
-
-impl IrqLine for IrqFdLine {
-    fn trigger(&self) -> Result<(), InterruptError> {
-        self.event
-            .write(1)
-            .map_err(|e| InterruptError::Signal(e.to_string()))
-    }
 }
 
 /// One attached virtio-mmio device.
@@ -183,19 +135,12 @@ impl VirtioMmioBus {
             let base = layout::virtio_mmio_slot(slot as u64);
             let gsi = layout::VIRTIO_MMIO_FIRST_IRQ + slot as u32;
 
-            let event = EventFd::new(EFD_NONBLOCK)
-                .map_err(|source| VirtioAttachError::EventFd { slot, source })?;
-            vm.register_irqfd(&event, gsi)
-                .map_err(|source| VirtioAttachError::Irqfd { slot, gsi, source })?;
+            let line = IrqFdLine::new(&vm, gsi)
+                .map_err(|source| VirtioAttachError::Irq { slot, source })?;
 
             let device_type = device.device_type();
-            let transport = MmioTransport::new(
-                slot,
-                device,
-                Arc::clone(&mem),
-                Arc::new(IrqFdLine { event }),
-            )
-            .map_err(|source| VirtioAttachError::Transport { slot, source })?;
+            let transport = MmioTransport::new(slot, device, Arc::clone(&mem), Arc::new(line))
+                .map_err(|source| VirtioAttachError::Transport { slot, source })?;
             let transport = Arc::new(Mutex::new(transport));
 
             let notifier = if mode.is_offloaded() {
