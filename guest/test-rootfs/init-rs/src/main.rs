@@ -166,7 +166,11 @@ fn mount(source: &str, target: &str, fstype: &str) {
 /// configuration space, and a `driver` symlink means a driver claimed it.
 ///
 /// One line, machine-readable, like every other probe:
-/// `VMHOST_TEST_OK pciscan functions=2 virtio=1 bound=1 devices=8086:0d57/060000,1af4:1042/018000:virtio-pci`
+/// `VMHOST_TEST_OK pciscan functions=2 virtio=1 bound=1 msix=2 devices=8086:0d57/060000,1af4:1042/018000:virtio-pci`
+///
+/// `msix` is the total number of message vectors the kernel allocated across the
+/// virtio functions (`msi_irqs/`, which exists only when MSI or MSI-X is enabled).
+/// Zero means every function is on INTx.
 fn pci_scan() {
     let root = Path::new("/sys/bus/pci/devices");
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -187,6 +191,7 @@ fn pci_scan() {
     let mut functions = 0usize;
     let mut virtio = 0usize;
     let mut bound = 0usize;
+    let mut msix = 0usize;
     for address in addresses.iter().take(MAX_SCANNED_FUNCTIONS) {
         let dir = root.join(address);
         let field = |name: &str| {
@@ -200,6 +205,15 @@ fn pci_scan() {
         let is_virtio = vendor == "1af4";
         if is_virtio {
             virtio += 1;
+            // `msi_irqs/` exists, with one entry per allocated vector, exactly
+            // when the kernel has MSI or MSI-X enabled on the function. Counting
+            // the entries is the guest saying "I am using N message vectors on
+            // this device", which no interrupt count can tell you.
+            let vectors = std::fs::read_dir(dir.join("msi_irqs"))
+                .map(|entries| entries.flatten().count())
+                .unwrap_or(0);
+            msix += vectors;
+            println!("entangled-pciscan: {address} msi_irqs={vectors}");
             // Which IRQ the kernel settled on for this function. Worth reporting
             // on its own: x86 without ACPI cannot *route* a PCI interrupt, so it
             // logs "probably buggy MP table" and keeps the line the host wrote
@@ -231,9 +245,41 @@ fn pci_scan() {
         return;
     }
     println!(
-        "VMHOST_TEST_OK pciscan functions={functions} virtio={virtio} bound={bound} devices={}",
+        "VMHOST_TEST_OK pciscan functions={functions} virtio={virtio} bound={bound} \
+         msix={msix} devices={}",
         described.join(",")
     );
+}
+
+/// What `/proc/interrupts` says about the virtio devices' interrupt lines.
+struct VirtioIrqs {
+    /// Interrupts delivered across every virtio line.
+    total: u64,
+    /// One entry per virtio line: `(name, controller)`, e.g.
+    /// `("virtio0-req.0", "PCI-MSIX-0000:00:01.0")` or `("virtio0", "IO-APIC")`.
+    lines: Vec<(String, String)>,
+}
+
+impl VirtioIrqs {
+    /// How the interrupts are being delivered, from the controller column — the
+    /// one place the guest states it outright.
+    fn mode(&self) -> &'static str {
+        if self.lines.is_empty() {
+            "none"
+        } else if self.lines.iter().any(|(_, c)| c.contains("PCI-MSI")) {
+            "msix"
+        } else {
+            "intx"
+        }
+    }
+
+    fn names(&self) -> String {
+        self.lines
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 /// Interrupts delivered to virtio devices so far, from `/proc/interrupts`.
@@ -244,30 +290,54 @@ fn pci_scan() {
 /// something else wakes it — so "the read succeeded" is not evidence that the
 /// interrupt path works. A count that climbs with the request count is.
 ///
+/// The controller column is reported too, because with MSI-X there is a second
+/// question of the same kind: the read succeeding, and even a climbing count, does
+/// not say *which* mechanism carried it. `PCI-MSIX-…` in that column does.
+///
 /// Returns `None` when `/proc/interrupts` has no virtio line at all, which is
 /// itself the interesting answer: the driver never registered a handler.
-fn virtio_interrupts() -> Option<u64> {
+fn virtio_interrupts() -> Option<VirtioIrqs> {
     let text = std::fs::read_to_string("/proc/interrupts").ok()?;
-    let mut total = 0u64;
-    let mut found = false;
+    let mut irqs = VirtioIrqs {
+        total: 0,
+        lines: Vec::new(),
+    };
     for line in text.lines() {
-        // "  5:        142   IO-APIC   5-edge      virtio0"
-        let Some((counts, description)) = line.rsplit_once("  ") else {
+        // "  5:   142    IO-APIC   5-edge   virtio0", or under MSI-X
+        // " 24:   512    PCI-MSIX-0000:00:01.0   1-edge   virtio0-req.0".
+        // Everything after the "n:" label is per-CPU counts, then the controller,
+        // then the trigger, then the device name.
+        let Some((_, rest)) = line.split_once(':') else {
             continue;
         };
-        if !description.trim().starts_with("virtio") {
+        let fields: Vec<&str> = rest.split_ascii_whitespace().collect();
+        let Some(name) = fields.last() else {
+            continue;
+        };
+        if !name.starts_with("virtio") {
             continue;
         }
-        found = true;
-        // Everything between the "n:" label and the controller name is per-CPU
-        // counts; sum whatever parses.
-        for field in counts.split_ascii_whitespace() {
-            if let Ok(count) = field.parse::<u64>() {
-                total = total.saturating_add(count);
-            }
+        let counts = fields
+            .iter()
+            .take_while(|f| f.parse::<u64>().is_ok())
+            .filter_map(|f| f.parse::<u64>().ok());
+        for count in counts {
+            irqs.total = irqs.total.saturating_add(count);
+        }
+        let controller = fields
+            .iter()
+            .find(|f| f.parse::<u64>().is_err())
+            .copied()
+            .unwrap_or("?");
+        // Echoed verbatim so the serial log is itself the evidence, next to the
+        // one machine-readable line the harness parses.
+        println!("entangled-irq: {}", line.trim());
+        irqs.lines.push((name.to_string(), controller.to_string()));
+        if irqs.lines.len() >= MAX_SCANNED_FUNCTIONS {
+            break;
         }
     }
-    found.then_some(total)
+    (!irqs.lines.is_empty()).then_some(irqs)
 }
 
 /// Sequentially reads `mib` MiB from /dev/vda and reports the rate, plus how
@@ -298,13 +368,19 @@ fn blk_bench(mib: u64) {
     }
     let ms = started.elapsed().as_millis().max(1);
     let kib_per_s = read_total / 1024 * 1000 / ms as u64;
+    let after = virtio_interrupts();
     // -1 distinguishes "no virtio interrupt line exists" from "zero interrupts
     // on the line that does", which are different failures.
-    let irqs = match (before, virtio_interrupts()) {
-        (Some(before), Some(after)) => (after.saturating_sub(before)) as i64,
+    let irqs = match (&before, &after) {
+        (Some(before), Some(after)) => after.total.saturating_sub(before.total) as i64,
         _ => -1,
     };
+    let (mode, names) = match &after {
+        Some(after) => (after.mode(), after.names()),
+        None => ("none", String::new()),
+    };
     println!(
-        "VMHOST_TEST_OK blkbench bytes={read_total} ms={ms} kib_per_s={kib_per_s} irqs={irqs}"
+        "VMHOST_TEST_OK blkbench bytes={read_total} ms={ms} kib_per_s={kib_per_s} \
+         irqs={irqs} irqmode={mode} irqnames={names}"
     );
 }
