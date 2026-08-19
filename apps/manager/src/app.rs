@@ -141,6 +141,25 @@ pub struct EditVmState {
     pub error: Option<String>,
 }
 
+/// What the move worker thread reports back to the modal.
+pub enum MoveEvent {
+    /// `(data bytes copied, data bytes total)` — allocated data, not apparent.
+    Progress(u64, u64),
+    Done(Box<Result<disk_image::MoveOutcome, String>>),
+}
+
+/// "Move disk to another drive" dialog state.
+pub struct MoveDiskState {
+    pub row: discovery::DiskRow,
+    /// Destination directory as typed.
+    pub dest: String,
+    pub error: Option<String>,
+    /// `(copied, total)` while the worker runs.
+    pub progress: Option<(u64, u64)>,
+    pub running: bool,
+    pub events: Option<mpsc::Receiver<MoveEvent>>,
+}
+
 /// Delete confirmation state (GUI-1604).
 pub struct DeleteState {
     pub name: String,
@@ -167,6 +186,7 @@ pub enum Modal {
     DeleteDisk(DeleteDiskState),
     AttachDisk(AttachDiskState),
     EditVm(EditVmState),
+    MoveDisk(MoveDiskState),
 }
 
 impl Modal {
@@ -216,6 +236,9 @@ pub enum Action {
     // ---- VM editor ---------------------------------------------------------
     AskEditVm(String),
     SubmitEditVm,
+    // ---- Move to another drive ----------------------------------------------
+    AskMoveDisk(PathBuf),
+    SubmitMoveDisk,
 }
 
 /// A VM being installed that has no profile on disk yet, so it still gets a
@@ -1157,6 +1180,156 @@ impl ManagerApp {
         }
     }
 
+    // ---- Move to another drive -------------------------------------------
+
+    fn ask_move_disk(&mut self, path: &Path) {
+        let Some(row) = self.disk_row(path).cloned() else {
+            self.toast(ToastLevel::Error, "that disk is gone from the list");
+            return;
+        };
+        if self.disk_busy(&row) {
+            self.toast(
+                ToastLevel::Warn,
+                "a VM using this disk is running — stop it first",
+            );
+            return;
+        }
+        self.modal = Modal::MoveDisk(MoveDiskState {
+            row,
+            dest: String::new(),
+            error: None,
+            progress: None,
+            running: false,
+            events: None,
+        });
+    }
+
+    fn submit_move_disk(&mut self) {
+        let Modal::MoveDisk(state) = &self.modal else {
+            return;
+        };
+        if state.running {
+            return;
+        }
+        let row = state.row.clone();
+        let dest_text = state.dest.trim().to_string();
+        let fail = |app: &mut Self, message: String| {
+            if let Modal::MoveDisk(state) = &mut app.modal {
+                state.error = Some(message);
+            }
+        };
+        if dest_text.is_empty() {
+            fail(self, "name a destination directory".into());
+            return;
+        }
+        // The VM could have started between opening the dialog and Move.
+        if self.disk_busy(&row) {
+            fail(
+                self,
+                "a VM using this disk is running — stop it first".into(),
+            );
+            return;
+        }
+        // Every profile that references the disk gets rewritten — the
+        // attachments the scan found, deduplicated.
+        let mut profiles: Vec<PathBuf> = Vec::new();
+        for attachment in &row.attachments {
+            if !profiles.contains(&attachment.profile) {
+                profiles.push(attachment.profile.clone());
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<MoveEvent>();
+        let waker = Arc::clone(&self.waker);
+        let disk = row.path.clone();
+        let dest = PathBuf::from(&dest_text);
+        let builder = std::thread::Builder::new().name("disk-move".to_string());
+        let spawned = builder.spawn(move || {
+            let progress_tx = tx.clone();
+            let progress_waker = Arc::clone(&waker);
+            // Throttle to whole-percent changes: a 100 GiB image would
+            // otherwise send one message per MiB.
+            let mut last_percent = u64::MAX;
+            let mut progress = move |done: u64, total: u64| {
+                let percent = (done * 100).checked_div(total).unwrap_or(100);
+                if percent != last_percent {
+                    last_percent = percent;
+                    let _ = progress_tx.send(MoveEvent::Progress(done, total));
+                    progress_waker();
+                }
+            };
+            let result = disk_image::move_disk(&disk, &dest, &profiles, &mut progress)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(MoveEvent::Done(Box::new(result)));
+            waker();
+        });
+        match spawned {
+            Ok(_) => {
+                if let Modal::MoveDisk(state) = &mut self.modal {
+                    state.running = true;
+                    state.error = None;
+                    state.progress = Some((0, 0));
+                    state.events = Some(rx);
+                }
+            }
+            Err(e) => fail(self, format!("cannot start the move worker: {e}")),
+        }
+    }
+
+    /// Drains the move worker's channel; called once per frame.
+    fn collect_move_events(&mut self) {
+        let Modal::MoveDisk(state) = &mut self.modal else {
+            return;
+        };
+        let Some(events) = &state.events else { return };
+        let mut finished: Option<Result<disk_image::MoveOutcome, String>> = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                MoveEvent::Progress(done, total) => state.progress = Some((done, total)),
+                MoveEvent::Done(result) => finished = Some(*result),
+            }
+        }
+        match finished {
+            None => {}
+            Some(Ok(outcome)) => {
+                let mut message = format!(
+                    "moved {} — {} of data copied and verified",
+                    outcome
+                        .moved
+                        .first()
+                        .map(|(_, to)| to.display().to_string())
+                        .unwrap_or_default(),
+                    discovery::format_bytes(outcome.data_bytes),
+                );
+                if !outcome.updated_profiles.is_empty() {
+                    message.push_str(&format!(
+                        "; {} profile(s) updated",
+                        outcome.updated_profiles.len()
+                    ));
+                }
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, message);
+                for leftover in outcome.leftover_sources {
+                    self.toast(
+                        ToastLevel::Warn,
+                        format!(
+                            "could not delete the source {} — the verified copy is in place, \
+                             remove the leftover by hand",
+                            leftover.display()
+                        ),
+                    );
+                }
+                self.request_scan(true);
+            }
+            Some(Err(message)) => {
+                state.running = false;
+                state.events = None;
+                state.progress = None;
+                state.error = Some(message);
+            }
+        }
+    }
+
     fn reveal_disk(&mut self, path: &Path) {
         match reveal_in_file_manager(path) {
             Ok(()) => {}
@@ -1184,7 +1357,13 @@ impl ManagerApp {
                 }
             }
             Action::OpenWizard => self.open_wizard(),
-            Action::CloseModal => self.modal = Modal::None,
+            Action::CloseModal => {
+                // A move in flight owns its modal: the copy is running on the
+                // worker and closing the dialog would orphan its progress.
+                if !matches!(&self.modal, Modal::MoveDisk(state) if state.running) {
+                    self.modal = Modal::None;
+                }
+            }
             Action::SubmitWizard => self.submit_wizard(),
             Action::OpenSettings => self.open_settings(),
             Action::SaveSettings => self.save_settings(),
@@ -1237,6 +1416,8 @@ impl ManagerApp {
             Action::RevealDisk(path) => self.reveal_disk(&path),
             Action::AskEditVm(name) => self.ask_edit_vm(&name),
             Action::SubmitEditVm => self.submit_edit_vm(),
+            Action::AskMoveDisk(path) => self.ask_move_disk(&path),
+            Action::SubmitMoveDisk => self.submit_move_disk(),
         }
     }
 
@@ -1344,6 +1525,7 @@ impl eframe::App for ManagerApp {
         self.collect_scan();
         self.collect_task_results();
         self.collect_update_events();
+        self.collect_move_events();
         self.supervisor.prune(12);
         self.ensure_log_selection();
         self.expire_toasts(ctx.input(|i| i.time));

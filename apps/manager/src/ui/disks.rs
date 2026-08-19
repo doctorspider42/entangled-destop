@@ -196,6 +196,17 @@ fn disk_row(ui: &mut egui::Ui, app: &ManagerApp, row: &DiskRow, actions: &mut Ve
                     {
                         actions.push(Action::AskDeleteDisk(row.path.clone()));
                     }
+                    if ui::ghost_button(ui, "Move…", row.exists && !busy, theme::VIOLET)
+                        .on_hover_text(if busy {
+                            "Stop the machine first"
+                        } else {
+                            "Relocate the image (and its .nvram sidecar) to another \
+                             directory or drive — sparse-preserving, verified"
+                        })
+                        .clicked()
+                    {
+                        actions.push(Action::AskMoveDisk(row.path.clone()));
+                    }
                     if ui::ghost_button(ui, "Attach…", row.exists, theme::CYAN)
                         .on_hover_text("Add this image to a stopped machine's profile")
                         .clicked()

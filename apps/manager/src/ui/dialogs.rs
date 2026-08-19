@@ -442,6 +442,13 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             600.0,
             |ui| edit_vm_body(ui, state, actions),
         ),
+        Modal::MoveDisk(state) => frame(
+            ctx,
+            "move-disk",
+            &format!("Move {}", state.row.file_name),
+            520.0,
+            |ui| move_disk_body(ui, state, actions),
+        ),
     };
 
     if closed {
@@ -634,6 +641,148 @@ fn edit_vm_body(ui: &mut egui::Ui, state: &mut crate::app::EditVmState, actions:
             actions.push(Action::SubmitEditVm);
         }
         if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+            actions.push(Action::CloseModal);
+        }
+    });
+}
+
+/// The move-to-another-drive dialog: destination, the space arithmetic
+/// (allocated data vs worst-case apparent size vs free space), a gradient
+/// progress bar while the worker copies, and the safety story spelled out.
+fn move_disk_body(
+    ui: &mut egui::Ui,
+    state: &mut crate::app::MoveDiskState,
+    actions: &mut Vec<Action>,
+) {
+    ui.label(ui::dim(
+        "Copies the image sparse-preserving (only allocated data travels), verifies the \
+         copy against the source, updates every referencing profile, and only then \
+         deletes the original. A failure at any step leaves everything as it was.",
+    ));
+    ui.add_space(12.0);
+
+    ui.label(ui::faint(format!("− {}", state.row.path.display())));
+    if state.row.nvram {
+        ui.label(ui::faint(format!(
+            "− {}  (moves along)",
+            disk_image::nvram_sidecar_path(&state.row.path).display()
+        )));
+    }
+    for attachment in &state.row.attachments {
+        ui.label(ui::faint(format!(
+            "profile of '{}' will be updated",
+            attachment.vm
+        )));
+    }
+    ui.add_space(12.0);
+
+    ui.label(ui::faint("DESTINATION DIRECTORY"));
+    ui.add_enabled(
+        !state.running,
+        egui::TextEdit::singleline(&mut state.dest)
+            .desired_width(f32::INFINITY)
+            .hint_text(if cfg!(windows) {
+                "E:\\vm-storage"
+            } else {
+                "/mnt/bigdrive/vms"
+            }),
+    );
+
+    // The space arithmetic, live: what the copy writes now (allocated data)
+    // and what the guest may grow into later (apparent size).
+    let bill = disk_image::relocate::copy_bill(&state.row.path);
+    let dest = state.dest.trim();
+    let space = (!dest.is_empty())
+        .then(|| disk_image::disk_space(std::path::Path::new(dest)))
+        .flatten();
+    if let Some((data, apparent)) = bill {
+        ui.add_space(4.0);
+        ui.label(ui::faint(format!(
+            "copies {} of data · image can grow to {}",
+            format_bytes(data),
+            format_bytes(apparent)
+        )));
+        if let Some((free, _total)) = space {
+            if free < data {
+                ui.label(
+                    RichText::new(format!(
+                        "{} free at the destination — not enough for the data itself",
+                        format_bytes(free)
+                    ))
+                    .color(theme::ERR)
+                    .size(12.5),
+                );
+            } else if free < apparent {
+                ui.label(
+                    RichText::new(format!(
+                        "{} free at the destination — enough for the data, but less than \
+                         the image's full {} (the guest can outgrow the drive later)",
+                        format_bytes(free),
+                        format_bytes(apparent)
+                    ))
+                    .color(theme::WARN)
+                    .size(12.5),
+                );
+            } else {
+                ui.label(ui::faint(format!(
+                    "{} free at the destination",
+                    format_bytes(free)
+                )));
+            }
+        }
+    }
+
+    // Progress: a gradient fill over the inset track, plus the byte counter.
+    if let Some((done, total)) = state.progress {
+        ui.add_space(12.0);
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 14.0), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, egui::CornerRadius::same(7), theme::INSET);
+        let fraction = if total == 0 {
+            0.0
+        } else {
+            (done as f32 / total as f32).clamp(0.0, 1.0)
+        };
+        if fraction > 0.0 {
+            let fill = egui::Rect::from_min_size(
+                rect.min,
+                Vec2::new(rect.width() * fraction, rect.height()),
+            );
+            theme::gradient_rect(
+                painter,
+                fill,
+                theme::CYAN.gamma_multiply(0.9),
+                theme::VIOLET.gamma_multiply(0.9),
+            );
+        }
+        ui.label(ui::faint(format!(
+            "copied {} / {}",
+            format_bytes(done),
+            format_bytes(total)
+        )));
+    }
+
+    if let Some(error) = &state.error {
+        ui.add_space(8.0);
+        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+    }
+
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        let ready = !state.running && !dest.is_empty();
+        let label = if state.running { "Moving…" } else { "Move" };
+        if ui::ghost_button(ui, label, ready, theme::VIOLET).clicked() {
+            actions.push(Action::SubmitMoveDisk);
+        }
+        if ui::ghost_button(ui, "Cancel", !state.running, theme::TEXT_DIM)
+            .on_hover_text(if state.running {
+                "The copy is running; it finishes or rolls back on its own"
+            } else {
+                "Close without moving anything"
+            })
+            .clicked()
+        {
             actions.push(Action::CloseModal);
         }
     });
