@@ -9,7 +9,8 @@
 
 #![cfg(target_os = "linux")]
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use vm_memory::{Bytes, GuestAddress};
 use vmm_core::{spawn_vcpus, ExitHandler, Hypervisor, MachineConfig, RunOutcome, Vm};
@@ -109,6 +110,87 @@ fn running_guest_can_be_stopped() {
 
     assert_eq!(outcomes.len(), 1);
     assert_eq!(*outcomes[0].as_ref().unwrap(), RunOutcome::Stopped);
+}
+
+/// A device that latches "the guest asked to power off", shaped like
+/// `machine_x86::acpi::pm::AcpiPmBlock` (which is the real one; vmm-core cannot
+/// depend on machine-x86).
+#[derive(Default)]
+struct ShutdownDevice {
+    latch: Arc<AtomicBool>,
+}
+
+impl ExitHandler for ShutdownDevice {
+    fn io_out(&mut self, port: u16, data: &[u8]) {
+        // The ACPI sleep control register write EDK2 and ACPICA both end at:
+        // SLP_TYP = 5 (S5) with SLP_EN.
+        if port == 0x0600 && data.first() == Some(&((5 << 2) | (1 << 5))) {
+            self.latch.store(true, Ordering::Release);
+        }
+    }
+    fn io_in(&mut self, _port: u16, data: &mut [u8]) {
+        data.fill(0xff);
+    }
+    fn mmio_write(&mut self, _addr: u64, _data: &[u8]) {}
+    fn mmio_read(&mut self, _addr: u64, data: &mut [u8]) {
+        data.fill(0);
+    }
+    fn shutdown_requested(&self) -> bool {
+        self.latch.load(Ordering::Acquire)
+    }
+}
+
+/// `ExitHandler::shutdown_requested` must end the run loop: after an ACPI S5
+/// write the guest spins in a dead loop and never exits again, so the latch is
+/// the *only* thing that can stop the VM. Uses `join_or_stop` with a deadline so
+/// a regression fails the test instead of hanging it.
+#[test]
+fn acpi_style_shutdown_request_ends_the_run_loop() {
+    let Some(hv) = hypervisor_or_skip() else {
+        return;
+    };
+    let cfg = MachineConfig {
+        memory_mib: 16,
+        vcpu_count: 1,
+    };
+    let mut vm = Vm::new(&hv, &cfg).unwrap();
+    // mov al, 0x34 ; mov dx, 0x600 ; out dx, al ; jmp $
+    let vcpu = load_real_mode(
+        &mut vm,
+        &[
+            0xb0,
+            (5 << 2) | (1 << 5),
+            0xba,
+            0x00,
+            0x06,
+            0xee,
+            0xeb,
+            0xfe,
+        ],
+    );
+
+    let latch = Arc::new(AtomicBool::new(false));
+    let device_latch = Arc::clone(&latch);
+    let threads = spawn_vcpus(vec![vcpu], move |_| {
+        Box::new(ShutdownDevice {
+            latch: Arc::clone(&device_latch),
+        })
+    })
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let outcomes = threads.join_or_stop(
+        || std::time::Instant::now() > deadline,
+        std::time::Duration::from_millis(2),
+    );
+
+    assert!(latch.load(Ordering::Acquire), "the guest never wrote 0x600");
+    assert_eq!(
+        *outcomes[0].as_ref().unwrap(),
+        RunOutcome::Shutdown,
+        "the run loop must report Shutdown, not Stopped (which means the \
+         deadline expired and the latch was ignored)"
+    );
 }
 
 /// EPIC 1 acceptance: the VMM can create and destroy VMs a hundred times

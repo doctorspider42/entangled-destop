@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use vmm_core::ExitHandler;
 
+use crate::acpi::AcpiPmBlock;
 use crate::platform::FirmwarePlatform;
 use crate::serial::SerialConsole;
 use crate::virtio::VirtioMmioBus;
@@ -21,9 +22,17 @@ use crate::virtio::VirtioMmioBus;
 pub struct MachineBus {
     serial: Arc<Mutex<SerialConsole>>,
     virtio: Arc<VirtioMmioBus>,
-    /// PCI configuration space + ACPI PM timer, present only for UEFI boots
-    /// (EPIC 18). A direct-Linux guest must keep seeing exactly the machine it
-    /// saw before: no host bridge to enumerate, no extra claimed ports.
+    /// The ACPI fixed-feature registers (0x600..0x610), in **both** boot modes:
+    /// the FADT `machine_x86::acpi` publishes names these ports for a
+    /// direct-Linux guest exactly as it does for a firmware. An S5 write here is
+    /// what `ExitHandler::shutdown_requested` reports.
+    ///
+    /// Behind an `Arc` with interior mutability rather than a `Mutex<…>` field,
+    /// so the shutdown check on the hot exit path takes no lock.
+    acpi_pm: Arc<AcpiPmBlock>,
+    /// PCI configuration space + RTC, present only for UEFI boots (EPIC 18). A
+    /// direct-Linux guest must keep seeing exactly the machine it saw before:
+    /// no host bridge to enumerate, no extra claimed ports.
     platform: Option<Arc<Mutex<FirmwarePlatform>>>,
 }
 
@@ -38,8 +47,15 @@ impl MachineBus {
         Self {
             serial: Arc::new(Mutex::new(serial)),
             virtio: Arc::new(virtio),
+            acpi_pm: Arc::new(AcpiPmBlock::new()),
             platform: None,
         }
+    }
+
+    /// The ACPI PM register block behind this bus, for `entangled doctor` and
+    /// for a host-initiated shutdown path that wants to observe the same latch.
+    pub fn acpi_pm(&self) -> &Arc<AcpiPmBlock> {
+        &self.acpi_pm
     }
 
     /// Adds the firmware-facing platform devices (UEFI-1802). Without these an
@@ -68,6 +84,10 @@ impl ExitHandler for MachineBus {
             }
             return;
         }
+        if AcpiPmBlock::contains(port) {
+            self.acpi_pm.io_write(port, data);
+            return;
+        }
         if let Some(platform) = &self.platform {
             if FirmwarePlatform::contains(port) {
                 match platform.lock() {
@@ -91,6 +111,10 @@ impl ExitHandler for MachineBus {
                 }
                 return;
             }
+        }
+        if AcpiPmBlock::contains(port) {
+            self.acpi_pm.io_read(port, data);
+            return;
         }
         if let Some(platform) = &self.platform {
             if FirmwarePlatform::contains(port) {
@@ -131,5 +155,12 @@ impl ExitHandler for MachineBus {
                 "virtio-mmio transport lock is poisoned; reading zeroes"
             ),
         }
+    }
+
+    /// An ACPI S5 write on the PM block ends the VM. Every vCPU's handler is a
+    /// clone of this bus and shares the same latch, so whichever vCPU exits
+    /// next stops too.
+    fn shutdown_requested(&self) -> bool {
+        self.acpi_pm.is_shutdown_requested()
     }
 }

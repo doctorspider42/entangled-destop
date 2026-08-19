@@ -156,6 +156,21 @@ pub trait ExitHandler: Send {
     fn io_in(&mut self, port: u16, data: &mut [u8]);
     fn mmio_write(&mut self, addr: u64, data: &[u8]);
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]);
+
+    /// True once a device has asked the machine to power off — today only the
+    /// ACPI PM block (`machine_x86::acpi::pm`), when the guest writes
+    /// `SLP_TYP = S5` with `SLP_EN`.
+    ///
+    /// Both run loops check this after every dispatched exit and return
+    /// [`RunOutcome::Shutdown`], which is how an ACPI `poweroff` ends a VM
+    /// without the run loop knowing what ACPI is. The default is `false`, so a
+    /// handler that has no such device (the test recorders) needs no code.
+    ///
+    /// Must not block: it is called on the vCPU thread between guest exits, and
+    /// the flag it reads is shared by every vCPU's handler clone.
+    fn shutdown_requested(&self) -> bool {
+        false
+    }
 }
 
 /// Register-level access to one virtual CPU, implemented per hypervisor.

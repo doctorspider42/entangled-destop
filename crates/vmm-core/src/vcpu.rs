@@ -251,6 +251,14 @@ impl Vcpu {
                 Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => continue,
                 Err(e) => return Err(fail(format!("KVM_RUN failed: {e}"))),
             }
+            // A device may have latched a power-off request while handling that
+            // exit (the ACPI PM block does, on an S5 write). The guest is
+            // spinning in `CpuDeadLoop()`/`hlt` by now and will never exit
+            // again on its own, so this is the only place the request can be
+            // noticed.
+            if handler.shutdown_requested() {
+                return Ok(RunOutcome::Shutdown);
+            }
         }
         Ok(RunOutcome::Stopped)
     }
