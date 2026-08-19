@@ -1,23 +1,89 @@
 ---
 name: virtio-device
-description: Implementing virtio devices and the virtio-mmio transport for Entangled Desktop — virtqueues, feature negotiation, irqfd/ioeventfd, and the untrusted-guest safety rules (backlog EPICs 3, 4, 5, 8, 9; crates virtio-core, virtio-block, virtio-net, virtio-gpu, virtio-input). Load before any virtio work.
+description: Implementing virtio devices and both virtio transports (mmio and pci) for Entangled Desktop — virtqueues, feature negotiation, PCI config space, irqfd/ioeventfd, and the untrusted-guest safety rules (backlog EPICs 3, 4, 5, 8, 9, 19; crates virtio-core, virtio-block, virtio-net, virtio-gpu, virtio-input). Load before any virtio work.
 ---
 
 # VirtIO devices
 
-Scope: the transport (EPIC 3) and every device crate. The transport and
-shared safety live in `crates/virtio-core`; one crate per device.
+Scope: both transports (EPIC 3, EPIC 19) and every device crate. The
+transports and shared safety live in `crates/virtio-core`; one crate per device.
 
 ## Architecture contract
 
 - Devices implement `virtio_core::VirtioDevice` and see **queues, features,
-  config space** — never transport registers. The mmio transport (and the
-  post-MVP pci transport) owns registers, status and queue plumbing.
+  config space** — never transport registers. A transport owns registers,
+  status and queue plumbing. This is not aspirational: adding virtio-pci
+  changed `virtio-core` and the machine's bus wiring and **no device crate at
+  all**. Keep it that way — a device that needs to know its transport is a
+  design bug, and a trait change to accommodate one needs a hard justification.
+- The shared half of a transport is `virtio_core::state::TransportState`:
+  feature negotiation, the device-status state machine, per-queue
+  `QueueConfig`, activation, reset, `DEVICE_NEEDS_RESET`, notify-offload
+  bookkeeping. **A transport module is only an address decoder.** If you find
+  yourself adding state-machine logic to `transport.rs` or `pci.rs`, it belongs
+  in `state.rs` instead.
 - Modern interface only: `VIRTIO_F_VERSION_1` is mandatory, no legacy mode,
-  mmio `VERSION = 2`. Register offsets are in `virtio_core::mmio` — use the
+  mmio `VERSION = 2`, PCI revision ≥ 1 with no legacy I/O BAR. Register offsets
+  are in `virtio_core::mmio` and `virtio_core::pci::common` — use the
   constants, never magic numbers.
 - Ring parsing comes from the `virtio-queue` crate; Entangled Desktop policy on top of
   it lives in `virtio_core::chain`.
+
+## The two transports
+
+Chosen per VM by `transport = "mmio" | "pci"` in the profile (default `mmio`);
+one is attached and the other stays empty. Their address ranges are disjoint, so
+`MachineBus` can route both unconditionally.
+
+| | virtio-mmio (EPIC 3) | virtio-pci (EPIC 19) |
+|---|---|---|
+| Module | `virtio_core::transport` | `virtio_core::pci` |
+| Machine bus | `machine_x86::virtio` | `machine_x86::virtio_pci` + `machine_x86::pci` |
+| Discovery | `virtio_mmio.device=4K@base:irq` on the cmdline; nothing enumerates | guest walks bus 0; nothing on the cmdline |
+| Probe order → device names | cmdline clause order | PCI device number (dense from `00:01.0`) |
+| Register window | one 4 KiB slot from `layout::virtio_mmio_slot(n)` | one 16 KiB memory BAR from `layout::pci_bar_slot(n)`, found via the capability list |
+| Access widths | 32-bit aligned only | 1/2/4/8 bytes, per field |
+| Config access | none (the window *is* the device) | mechanism #1 on `0xcf8`/`0xcfc`; no ECAM (needs an ACPI MCFG we do not publish) |
+| Queue kick | `QUEUE_NOTIFY`, queue index in the value | notification area, `notify_off_multiplier = 4`, queue index in the **address** |
+| ioeventfd | one shared address + 4-byte datamatch on the index | one address per queue, **no datamatch** (so any write width works) |
+| Interrupt | single IRQ, `INTERRUPT_STATUS` + write-to-`INTERRUPT_ACK` | INTx, ISR byte, **read-to-clear**; `INTX_DISABLE` honoured |
+| Guest kernel needs | `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` | `CONFIG_PCI` + `CONFIG_VIRTIO_PCI` |
+| UEFI | unusable — EDK2 CloudHv ships no virtio-MMIO driver | **required** for an ISO boot (ADR-0003) |
+
+Both use `virtio_core::LineInterrupt` unchanged: the ISR bits and the mmio
+`INTERRUPT_STATUS` bits are the same two bits in the same positions.
+
+### virtio-pci BAR layout
+
+One BAR, four page-aligned regions, published as four vendor-specific PCI
+capability records (`pci::capability_records`). Page-sized so a region could
+later get its own KVM slot without anything moving.
+
+| Structure | `cfg_type` | BAR offset | Length |
+|---|---:|---:|---:|
+| common configuration | 1 | `0x0000` | `0x1000` (60 bytes used) |
+| ISR status | 3 | `0x1000` | `0x1000` (1 byte) |
+| notification area | 2 | `0x2000` | `0x1000` (one dword per queue) |
+| device configuration | 4 | `0x3000` | `0x1000` |
+
+Identity: vendor `0x1af4`, device `0x1040 + virtio type`, revision 1, subsystem
+vendor `0x1af4` (Linux reads the virtio vendor id from *that* field), INTA#.
+`pci::device_id` and `pci::class_code` are free functions because the machine
+builds a device's config space before its transport exists and the two must
+agree.
+
+### Known INTx limitation
+
+The machine publishes ISA interrupt sources in its MP table, not PCI ones, so
+Linux logs `can't find IRQ for PCI INT A; probably buggy MP table` and then keeps
+the GSI the host wrote into `interrupt_line`. That works — the acceptance boot
+asserts both the GSI and a non-zero interrupt count — but it means:
+
+- pins are **never shared** (one device per pin, bounded by `MAX_PCI_DEVICES`),
+  because the injection is an edge through an irqfd, not a level-triggered
+  `INTA#` that the ISR read would deassert;
+- publishing PCI interrupt routing (MP table entries, or an ACPI MADT + `_PRT`)
+  is the clean fix, and MSI-X would make the question disappear.
 
 ## Untrusted-guest rules (non-negotiable, from CLAUDE.md)
 
@@ -62,6 +128,11 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_net::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick | same shape as the blk budget test |
 | `machine_x86::virtio::MAX_VIRTIO_SLOTS` | 8 | devices on the mmio bus (IOAPIC pins) | `queue_notify::attaching_more_devices_than_slots_is_refused` |
 | `machine_x86::notify::MAX_OFFLOADED_QUEUES` | 16 | ioeventfds and epoll slots one device may demand | `queue_notify::queue_notify_offload_is_capped_per_device` |
+| `virtio_core::pci::MAX_NOTIFY_QUEUES` | 1024 | *derived* (notify region ÷ multiplier); queues a device may expose on pci, since each needs its own notification address | `virtio_core::pci::tests::a_device_with_more_queues_than_notify_slots_is_refused` |
+| `virtio_core::pci::VIRTIO_PCI_BAR_SIZE` | 16 KiB | guest-addressable register space per pci device; every capability's `offset + length` must fit | `virtio_core::pci::tests::capability_records_describe_the_real_bar_layout`, `regions_do_not_overlap_and_the_common_struct_fits` |
+| `machine_x86::pci::MAX_PCI_DEVICES` | 9 | config spaces, BAR windows and IOAPIC pins on the root bus (8 devices + the host bridge) | `machine_x86::pci::tests::the_bus_is_bounded` |
+| `machine_x86::layout::PCI_MMIO_SLOTS` | 8 | 16 KiB aperture slots at `0xc000_0000`; one per device, and `locate_mmio` decodes nothing outside the aperture | `machine_x86::pci::tests::{addresses_outside_the_aperture_are_never_claimed, a_bar_moved_out_of_the_aperture_decodes_nothing}` |
+| `machine_x86::pci::reg::SIZE` | 256 | one function's config space; capability records are refused rather than truncated when they would run past it | `machine_x86::pci::tests::capability_space_is_bounded` |
 | `machine_x86::serial::RX_CAPACITY` (private) | 4096 | buffered guest serial input | `machine_x86::serial::tests::rx_overrun_is_bounded` |
 | `display::MAX_PENDING_BATCHES` / `MAX_PENDING_CONTROL` | 256 / 64 | un-drained host input batches / control events | `display::input::tests::{queue_drops_the_oldest_batch_when_the_guest_stalls, control_queue_is_bounded}` |
 
@@ -71,7 +142,7 @@ ring whose available count exceeds the queue size (so a guest cannot jump
 pixel buffer is allocated with `try_reserve_exact`, so a cap the host cannot
 satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
 
-## Transport implementation notes (MVP-301…307)
+## virtio-mmio implementation notes (MVP-301…307)
 
 - One 4 KiB mmio slot per device from `machine_x86::layout::virtio_mmio_slot(n)`,
   IRQs from `VIRTIO_MMIO_FIRST_IRQ + n`, announced to the guest via
@@ -104,6 +175,30 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
 - Feature negotiation is 2×32-bit windows selected by `DEVICE_FEATURES_SEL` /
   `DRIVER_FEATURES_SEL`; reject FEATURES_OK (leave the bit unset) when the
   driver subset is unacceptable (`ack_features` returning false).
+
+## virtio-pci implementation notes (EPIC 19)
+
+- `machine_x86::pci` is **portable** — no KVM, no eventfds, no virtio types — so
+  the whole config-space model is unit-testable on Windows too. Keep it that
+  way; the Linux-only half (irqfds, ioeventfds, the transports) is
+  `machine_x86::virtio_pci`.
+- Config space is `[u32; 64]` plus a parallel **write mask**. Read-only-ness is
+  therefore a property of the data, not of a match arm, and sub-dword accesses
+  and capability walks fall out for free. To add a writable field, widen its
+  mask; never special-case a write.
+- BAR sizing needs no special code: the guest owns exactly the address bits
+  `!(size - 1)`, so writing all-ones reads back the size mask. `size` must be a
+  power of two and `base` naturally aligned — both checked, both host errors.
+- `locate_mmio` refuses anything outside `layout::PCI_MMIO_BASE..PCI_MMIO_END`
+  **and** anything while the command register's memory-enable bit is clear. A
+  guest that moves a BAR elsewhere simply stops being decoded; it can never make
+  the machine dispatch a foreign address into a device.
+- The queue-notify offload (`machine_x86::notify`) is generic over the transport.
+  To add a third transport, implement `QueueNotifyTarget` and pick a
+  `NotifyAddressing` — do not fork the worker loop.
+- MSI-X is **absent, not partial**: no capability at all. If you add it, the
+  capability must be complete, the vector fields must stop reading
+  `VIRTIO_MSI_NO_VECTOR`, and `LineInterrupt` needs a per-vector sibling.
 
 ## Per-device references
 
@@ -141,3 +236,12 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
   top with `cargo-fuzz` targets under `fuzz/`).
 - Kernel-facing verification happens in WSL: boot a test initramfs with the
   device on the cmdline and probe from the guest (see vm-testing skill).
+- **A change to shared transport state must be exercised on both transports.**
+  `virtio-block` is the reference pair: `tests/blk_queue.rs` (mmio) and
+  `tests/blk_pci.rs` (pci) drive the same untouched device. The boot harness takes
+  `BootSpec::transport`, and `repeat_boot` takes `ENTANGLED_BOOT_TRANSPORT=pci`,
+  so endurance and leak accounting cover both buses too.
+- For the pci transport, "the read succeeded" is **not** evidence that
+  interrupts work — a driver finds used buffers whenever anything else wakes it.
+  The guest probe reports `irqs=` from `/proc/interrupts` for exactly this
+  reason; assert on it.

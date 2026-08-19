@@ -41,8 +41,10 @@ mkdir -p "$repo/artifacts/bootstrap"
 cp arch/x86/boot/bzImage "$repo/artifacts/bootstrap/vmlinuz"
 echo "wrote artifacts/bootstrap/vmlinuz (kernel $KERNEL_VERSION, $(stat -c%s "$repo/artifacts/bootstrap/vmlinuz") bytes)"
 
-# Sanity: confirm the fragment stuck.
-for opt in VIRTIO_MMIO VIRTIO_BLK VIRTIO_NET VIRTIO_INPUT DRM_VIRTIO_GPU; do
+# Sanity: confirm the fragment stuck. Both transports are checked — a kernel
+# without VIRTIO_PCI boots fine and then finds no devices at all on a
+# `transport = "pci"` VM, which is a confusing way to discover a missing option.
+for opt in VIRTIO_MMIO PCI VIRTIO_PCI VIRTIO_BLK VIRTIO_NET VIRTIO_INPUT DRM_VIRTIO_GPU; do
     grep -q "^CONFIG_${opt}=y" .config || { echo "ERROR: CONFIG_${opt} not builtin" >&2; exit 1; }
 done
-echo "config sanity: all virtio drivers builtin"
+echo "config sanity: both virtio transports and all drivers builtin"
