@@ -149,10 +149,10 @@ pub const MMIO_HOLE_START: u64 = 0xc000_0000;
 // ---- PCI BAR aperture (EPIC 19, virtio-pci) -------------------------------
 //
 // The host assigns each device an *initial* BAR from a fixed window at the
-// bottom of the MMIO hole, one 16 KiB slot per device:
+// bottom of the MMIO hole, one 32 KiB slot per device:
 //
-//   0xc000_0000 .. 0xc002_0000   initial BAR assignment (8 slots × 16 KiB)
-//   0xc002_0000 .. 0xd000_0000   room for the guest to re-assign into
+//   0xc000_0000 .. 0xc004_0000   initial BAR assignment (8 slots × 32 KiB)
+//   0xc004_0000 .. 0xd000_0000   room for the guest to re-assign into
 //   0xd000_0000 .. 0xd000_8000   virtio-mmio slots (8 × 4 KiB)
 //
 // The two transports never overlap even though only one is ever active for a
@@ -174,15 +174,19 @@ pub const PCI_MMIO_BASE: u64 = MMIO_HOLE_START;
 /// `virtio_core::pci::VIRTIO_PCI_BAR_SIZE`; asserted in
 /// `crate::virtio_pci::tests::the_bar_slot_size_matches_the_transport`.
 ///
-/// A BAR must be naturally aligned to its own size, which 16 KiB slots starting
-/// at a 16 KiB-aligned base are.
-pub const PCI_MMIO_SLOT_SIZE: u64 = 0x4000;
+/// A BAR must be naturally aligned to its own size, which 32 KiB slots starting
+/// at a 32 KiB-aligned base are.
+///
+/// 32 KiB and not 16 KiB since MSI-X: the table and the PBA take a page each at
+/// the top of the same BAR (`virtio_core::pci`), and the BAR sizing protocol can
+/// only express a power of two.
+pub const PCI_MMIO_SLOT_SIZE: u64 = 0x8000;
 
 /// How many PCI devices the initial assignment covers. Matches
 /// `crate::pci::MAX_PCI_DEVICES`.
 pub const PCI_MMIO_SLOTS: u64 = 8;
 
-/// One past the end of the *initial* BAR assignment — 8 slots, 128 KiB.
+/// One past the end of the *initial* BAR assignment — 8 slots, 256 KiB.
 ///
 /// Not the same thing as [`PCI_MMIO_END`]: this is where the host's own slots
 /// stop, and it is what `pci_bar_slot` is bounded by.

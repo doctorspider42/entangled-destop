@@ -23,6 +23,8 @@ pub mod serial;
 #[cfg(target_os = "linux")]
 pub mod irqfd;
 #[cfg(target_os = "linux")]
+pub mod msi;
+#[cfg(target_os = "linux")]
 pub mod notify;
 #[cfg(target_os = "linux")]
 pub mod virtio;

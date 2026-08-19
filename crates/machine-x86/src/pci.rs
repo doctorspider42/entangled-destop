@@ -45,7 +45,10 @@
 //! * an address with the enable bit clear, or naming any bus/device/function
 //!   that does not exist, reads back all-ones ("no device") and swallows writes;
 //! * writes go through a per-dword write mask, so a guest can never change an
-//!   identity register, a class code, a capability record or the header type;
+//!   identity register, a class code or the header type. A capability record is
+//!   read-only unless its owner asked for specific bits to be writable
+//!   ([`ConfigSpace::add_capability_writable`] — MSI-X's enable and function-mask
+//!   bits, and nothing else in the same halfword);
 //! * BAR writes are masked to the BAR's own size, which *is* the sizing
 //!   protocol and keeps every window naturally aligned. A guest may move a BAR
 //!   anywhere inside the aperture the DSDT advertises — every UEFI firmware
@@ -60,7 +63,7 @@
 //! half — irqfds, ioeventfds and the transports themselves — lives in
 //! [`crate::virtio_pci`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -209,6 +212,12 @@ pub struct ConfigSpace {
     /// raises the interrupt line so it can honour the bit without reaching back
     /// into the config space.
     intx_enabled: Arc<AtomicBool>,
+    /// Registers whose value is published to whatever sits behind this config
+    /// space, refreshed after every guest write (see [`Self::mirror_dword`]).
+    ///
+    /// One entry per *distinct* register, so the list is bounded by
+    /// [`reg::DWORDS`] and, in practice, holds one: the MSI-X message control.
+    mirrors: Vec<(u8, Arc<AtomicU32>)>,
 }
 
 impl ConfigSpace {
@@ -221,6 +230,7 @@ impl ConfigSpace {
             next_capability: reg::FIRST_CAPABILITY,
             last_capability: None,
             intx_enabled: Arc::new(AtomicBool::new(true)),
+            mirrors: Vec::new(),
         };
         space.set(reg::ID, u32::from(vendor_id) | (u32::from(device_id) << 16));
         // The class code occupies bits 31:8 and the revision bits 7:0.
@@ -329,13 +339,37 @@ impl ConfigSpace {
         self
     }
 
-    /// Appends one capability record and links it into the list.
+    /// Appends one read-only capability record and links it into the list.
     ///
     /// `record[0]` is the capability id and `record[1]` its `cap_next` byte,
     /// which this function owns: the caller leaves it at 0 and the list is built
     /// here, so a record's content stays the caller's business (for virtio: which
     /// BAR, which offset, which length) and the *list* stays the bus's.
-    pub fn add_capability(&mut self, record: &[u8]) -> Result<(), PciError> {
+    ///
+    /// Returns the byte offset the record landed at, which is what the caller
+    /// needs to [`mirror_dword`](Self::mirror_dword) a register inside it.
+    pub fn add_capability(&mut self, record: &[u8]) -> Result<u8, PciError> {
+        self.add_capability_writable(record, &[])
+    }
+
+    /// [`Self::add_capability`] with a per-dword write mask, for a capability
+    /// whose registers the guest may change.
+    ///
+    /// `write_mask[n]` is the mask for the record's *n*-th dword; dwords beyond
+    /// the end of the slice stay read-only. That is how MSI-X gets in: its
+    /// message control register holds the enable and function-mask bits a driver
+    /// writes, while the table size in the same halfword must stay read-only —
+    /// a guest that could widen the table would be describing entries the host
+    /// never allocated.
+    ///
+    /// The mask is applied to whole dwords of the *header*, so a record must be
+    /// dword-aligned for it to line up. Every record placed here is: lengths are
+    /// rounded up to a dword and the list starts at [`reg::FIRST_CAPABILITY`].
+    pub fn add_capability_writable(
+        &mut self,
+        record: &[u8],
+        write_mask: &[u32],
+    ) -> Result<u8, PciError> {
         if record.len() < 2 {
             return Err(PciError::CapabilityTooShort);
         }
@@ -352,6 +386,14 @@ impl ConfigSpace {
         for (i, byte) in record.iter().enumerate() {
             self.write_masked_byte(at + i, *byte, true);
         }
+        // The mask goes down *after* the bytes: `write_masked_byte(host)` writes
+        // through any mask, but a later guest write must see the final one.
+        for (dword, mask) in write_mask.iter().enumerate() {
+            // `at + len <= reg::SIZE` (checked above) bounds this; `set_mask`
+            // ignores an out-of-range register either way.
+            let register = u8::try_from(at + dword * 4).unwrap_or(u8::MAX);
+            self.set_mask(register, *mask);
+        }
         // Link the previous record to this one, or publish the list head.
         match self.last_capability {
             Some(previous) => {
@@ -365,10 +407,37 @@ impl ConfigSpace {
                 self.set(reg::COMMAND, status);
             }
         }
-        self.last_capability = Some(self.next_capability);
+        let placed = self.next_capability;
+        self.last_capability = Some(placed);
         // `len <= free` and `at + free == reg::SIZE`, so this stays in range.
         self.next_capability = u8::try_from(at + len).unwrap_or(u8::MAX);
-        Ok(())
+        Ok(placed)
+    }
+
+    /// Publishes the dword at `register` into `handle`, refreshed after every
+    /// guest write to it. `handle` is seeded with the register's current value.
+    ///
+    /// The generic form of what [`Self::intx_flag`] does for one bit, and it
+    /// exists for the same reason: a register the *guest* owns has to reach the
+    /// host object whose behaviour it changes, without that object reaching back
+    /// into a configuration space guarded by the bus lock. MSI-X's message
+    /// control is the case in point — the transport must know, on every interrupt
+    /// it delivers, whether the driver has MSI-X enabled or the function masked.
+    ///
+    /// The handle comes from the caller rather than from here so that the object
+    /// whose behaviour the register controls owns it; and it is a bare
+    /// `AtomicU32`, because this module publishes a dword and stays ignorant of
+    /// what its bits mean (interpreting them is `virtio_core::msix`'s job).
+    ///
+    /// Mirroring the same register twice replaces the handle, so the list is
+    /// bounded by the number of dwords in the header.
+    pub fn mirror_dword(&mut self, register: u8, handle: Arc<AtomicU32>) {
+        let register = register & 0xfc;
+        handle.store(self.get(register), Ordering::Release);
+        match self.mirrors.iter_mut().find(|(r, _)| *r == register) {
+            Some(slot) => slot.1 = handle,
+            None => self.mirrors.push((register, handle)),
+        }
     }
 
     // -------------------------------------------------------------- state
@@ -441,8 +510,12 @@ impl ConfigSpace {
     /// Writes `data` into the selected dword starting `byte_offset` bytes into
     /// it. Bytes that fall outside the dword, and bits the write mask does not
     /// allow, are dropped.
-    pub fn write_dword_bytes(&mut self, register: u8, byte_offset: usize, data: &[u8]) {
-        let base = usize::from(register & 0xfc);
+    ///
+    /// Returns true when the write changed a [mirrored](Self::mirror_dword)
+    /// register, so the caller can tell whoever holds that mirror to act on it.
+    pub fn write_dword_bytes(&mut self, register: u8, byte_offset: usize, data: &[u8]) -> bool {
+        let register = register & 0xfc;
+        let base = usize::from(register);
         for (i, byte) in data.iter().enumerate() {
             let within = byte_offset + i;
             if within >= 4 {
@@ -452,12 +525,20 @@ impl ConfigSpace {
             self.write_masked_byte(base + within, *byte, false);
         }
         // A command-register write may have changed INTx enablement.
-        if register & 0xfc == reg::COMMAND {
+        if register == reg::COMMAND {
             self.intx_enabled.store(
                 self.command() & command::INTX_DISABLE == 0,
                 Ordering::Release,
             );
         }
+        let value = self.get(register);
+        let mut changed = false;
+        for (mirrored, handle) in &self.mirrors {
+            if *mirrored == register && handle.swap(value, Ordering::AcqRel) != value {
+                changed = true;
+            }
+        }
+        changed
     }
 
     // ------------------------------------------------------------- helpers
@@ -502,14 +583,34 @@ impl ConfigSpace {
 
 // ---- the root bus ---------------------------------------------------------
 
-/// A guest configuration write changed which guest physical addresses a function
-/// decodes: some BAR moved, changed size, or its memory-space enable flipped.
+/// What a guest configuration write changed, beyond the register itself.
 ///
 /// The `owner` token is the one the caller passed to [`PciRoot::attach`], so the
-/// host can find whatever sits behind that config space and re-point it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DecodeChanged {
-    pub owner: usize,
+/// host can find whatever sits behind that configuration space and act on it.
+/// Both flags are things the host **must** act on:
+///
+/// * `decode_changed` — a BAR moved, changed size, or its memory-space enable
+///   flipped, so anything wired to a fixed guest physical address inside that
+///   window (a KVM ioeventfd above all) is now pointing at an address the device
+///   no longer answers on;
+/// * `mirror_changed` — a [mirrored](ConfigSpace::mirror_dword) register changed
+///   value. For virtio that is the MSI-X message control: enabling MSI-X or
+///   clearing the function mask makes every interrupt the PBA remembers
+///   deliverable at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConfigWrite {
+    /// The function's owner token, when it has one. `None` for the host bridge,
+    /// which is a configuration space and nothing else.
+    pub owner: Option<usize>,
+    pub decode_changed: bool,
+    pub mirror_changed: bool,
+}
+
+impl ConfigWrite {
+    /// Whether anything at all behind the configuration space needs attention.
+    pub fn needs_attention(&self) -> bool {
+        self.owner.is_some() && (self.decode_changed || self.mirror_changed)
+    }
 }
 
 /// A decoded `CONFIG_ADDRESS`.
@@ -659,13 +760,12 @@ impl PciRoot {
 
     /// Guest write to a configuration port.
     ///
-    /// Returns [`DecodeChanged`] when the write moved, resized, enabled or
-    /// disabled a function's BAR windows. The host **must** act on that: anything
-    /// it wired to a fixed guest physical address — a KVM ioeventfd above all —
-    /// is now pointing at an address the device no longer answers on. See
-    /// [`crate::virtio_pci::VirtioPciBus::io_write`].
-    #[must_use = "a moved BAR strands every ioeventfd registered inside it"]
-    pub fn io_write(&mut self, port: u16, data: &[u8]) -> Option<DecodeChanged> {
+    /// Returns a [`ConfigWrite`] describing what else the write changed — see
+    /// there for why the host must act on each flag, and
+    /// [`crate::virtio_pci::VirtioPciBus::io_write`] for how it does.
+    #[must_use = "a moved BAR strands every ioeventfd registered inside it, and a \
+                  changed MSI-X control register may have released pending vectors"]
+    pub fn io_write(&mut self, port: u16, data: &[u8]) -> ConfigWrite {
         let offset = usize::from(port.wrapping_sub(CONFIG_ADDRESS_PORT));
         if offset < 4 {
             let mut bytes = self.address.to_le_bytes();
@@ -675,22 +775,27 @@ impl PciRoot {
                 }
             }
             self.address = u32::from_le_bytes(bytes);
-            return None;
+            return ConfigWrite::default();
         }
-        let target = self.decode()?;
+        let Some(target) = self.decode() else {
+            return ConfigWrite::default();
+        };
         let within = offset & 0x3;
-        let function = self.function_mut(&target)?;
+        let Some(function) = self.function_mut(&target) else {
+            return ConfigWrite::default();
+        };
         // Only a function with an owner has anything behind it to be stranded;
         // the host bridge is a config space and nothing else.
         let owner = function.owner;
         let before = function.config.decode_state();
-        function
+        let mirror_changed = function
             .config
             .write_dword_bytes(target.register, within, data);
         let after = function.config.decode_state();
-        match owner {
-            Some(owner) if before != after => Some(DecodeChanged { owner }),
-            _ => None,
+        ConfigWrite {
+            owner,
+            decode_changed: before != after,
+            mirror_changed,
         }
     }
 
