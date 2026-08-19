@@ -11,6 +11,7 @@ mod diagnose;
 mod discovery;
 mod launcher;
 mod logo;
+mod metrics;
 mod process;
 mod settings;
 mod theme;

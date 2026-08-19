@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::discovery::{self, Scan, VmEntry};
 use crate::launcher::{self, NewMachine};
+use crate::metrics;
 use crate::process::{Supervisor, TaskId, TaskKind};
 use crate::settings::{self, Settings};
 use crate::theme;
@@ -265,6 +266,9 @@ pub struct ManagerApp {
     pub scan: Scan,
     pub scan_error: Option<String>,
     pub supervisor: Supervisor,
+    /// Live host/VM numbers from the metrics sampler thread, refreshed ~1/s.
+    pub stats: metrics::Snapshot,
+    metrics: metrics::Metrics,
     pub pending: Vec<PendingInstall>,
     pub toasts: Vec<Toast>,
     pub modal: Modal,
@@ -339,6 +343,8 @@ impl ManagerApp {
             scan: Scan::default(),
             scan_error: None,
             supervisor: Supervisor::new(Arc::clone(&waker)),
+            stats: metrics::Snapshot::default(),
+            metrics: metrics::Metrics::spawn(Arc::clone(&waker)),
             pending: Vec::new(),
             toasts: Vec::new(),
             modal: Modal::None,
@@ -1280,6 +1286,19 @@ impl eframe::App for ManagerApp {
         self.supervisor.prune(12);
         self.ensure_log_selection();
         self.expire_toasts(ctx.input(|i| i.time));
+
+        // Tell the sampler what to measure, take its latest answer. Both are
+        // one mutex swap; the sampling itself lives on the metrics thread.
+        let targets: Vec<(String, u32)> = self
+            .supervisor
+            .tasks()
+            .iter()
+            .filter(|t| t.is_active())
+            .map(|t| (t.vm.clone(), t.pid))
+            .collect();
+        self.metrics
+            .set_targets(targets, self.settings.vm_dir.clone());
+        self.stats = self.metrics.snapshot();
 
         let mut actions = Vec::new();
         ui::header::show(ctx, self, &mut actions);

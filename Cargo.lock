@@ -1403,6 +1403,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "wgpu 25.0.2",
+ "windows 0.62.2",
 ]
 
 [[package]]

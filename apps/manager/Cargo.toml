@@ -41,10 +41,21 @@ png.workspace = true
 control-api.workspace = true
 disk-image.workspace = true
 
-# Only for the SIGTERM path of `stop`; every other process operation goes
-# through portable `std::process` (see ADR-0002 — this crate builds on Windows).
+# SIGTERM for `stop`, sysconf/statm for the metrics sampler; every other
+# process operation goes through portable `std::process` (see ADR-0002 — this
+# crate builds on Windows).
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+# The metrics sampler's four Windows syscalls (process times, working set,
+# system times, memory status). Same crate and license the WHP backend uses.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [lints]
 workspace = true

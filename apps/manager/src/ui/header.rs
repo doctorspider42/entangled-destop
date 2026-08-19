@@ -103,6 +103,31 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                             )));
                             ui.label(ui::faint(app.settings.vm_dir.display().to_string()))
                                 .on_hover_text("Change it in Settings");
+                            // The host's own numbers, refreshed by the metrics
+                            // thread; absent values simply do not print.
+                            let host = &app.stats.host;
+                            let mut bits: Vec<String> = Vec::new();
+                            if let Some(cpu) = host.cpu_percent {
+                                bits.push(format!("host CPU {cpu:.0}%"));
+                            }
+                            if let (Some(total), Some(available)) =
+                                (host.mem_total, host.mem_available)
+                            {
+                                bits.push(format!(
+                                    "RAM {} / {}",
+                                    crate::discovery::format_bytes(total.saturating_sub(available)),
+                                    crate::discovery::format_bytes(total)
+                                ));
+                            }
+                            if let Some((free, _total)) = host.vm_dir_space {
+                                bits.push(format!("{} free", crate::discovery::format_bytes(free)));
+                            }
+                            if !bits.is_empty() {
+                                ui.label(ui::faint(bits.join(" · "))).on_hover_text(
+                                    "Host CPU, physical RAM in use, and free space \
+                                         on the VM directory's volume",
+                                );
+                            }
                         });
                     });
                 });
