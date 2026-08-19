@@ -23,9 +23,11 @@
 //! one behaves exactly as this bus always did — the ports stay unclaimed and
 //! float high.
 //!
-//! The virtio buses are the mirror image: their wiring is irqfds and ioeventfds,
-//! so they are Linux-only until EPIC 17 phase 3 attaches the same devices through
-//! the userspace irqchip.
+//! The **virtio-mmio** window is on this bus on both hosts since EPIC 17 phase 3:
+//! `VirtioMmioBus::attach_userspace` wires the same devices to IOAPIC pins with
+//! synchronous queue kicks, so the routing below is unconditional. The **PCI**
+//! bus is still Linux-only — its notification area follows a guest-programmable
+//! BAR through ioeventfd rebasing, which has no WHP peer yet.
 
 use std::sync::{Arc, Mutex};
 
@@ -35,7 +37,6 @@ use crate::acpi::AcpiPmBlock;
 use crate::irqchip::UserspaceIrqChip;
 use crate::platform::FirmwarePlatform;
 use crate::serial::SerialConsole;
-#[cfg(target_os = "linux")]
 use crate::virtio::VirtioMmioBus;
 #[cfg(target_os = "linux")]
 use crate::virtio_pci::VirtioPciBus;
@@ -43,7 +44,6 @@ use crate::virtio_pci::VirtioPciBus;
 #[derive(Clone)]
 pub struct MachineBus {
     serial: Arc<Mutex<SerialConsole>>,
-    #[cfg(target_os = "linux")]
     virtio: Arc<VirtioMmioBus>,
     /// The PCI root bus and the virtio devices on it, present when the VM uses
     /// the pci transport. `None` leaves the machine exactly as it was before
@@ -74,7 +74,6 @@ impl MachineBus {
     pub fn new(serial: SerialConsole) -> Self {
         Self {
             serial: Arc::new(Mutex::new(serial)),
-            #[cfg(target_os = "linux")]
             virtio: Arc::new(VirtioMmioBus::empty()),
             #[cfg(target_os = "linux")]
             pci: None,
@@ -85,7 +84,6 @@ impl MachineBus {
     }
 
     /// A machine with the serial console plus an attached virtio-mmio window.
-    #[cfg(target_os = "linux")]
     pub fn with_virtio(serial: SerialConsole, virtio: VirtioMmioBus) -> Self {
         Self {
             virtio: Arc::new(virtio),
@@ -137,7 +135,6 @@ impl MachineBus {
     /// The virtio-mmio window behind this bus, for inspection: `entangled
     /// doctor`, and test harnesses that want to report device state when a guest
     /// stops making progress.
-    #[cfg(target_os = "linux")]
     pub fn virtio(&self) -> &VirtioMmioBus {
         &self.virtio
     }
@@ -238,28 +235,26 @@ impl ExitHandler for MachineBus {
                 return;
             }
         }
-        #[cfg(target_os = "linux")]
-        {
-            if let Some((slot, offset)) = self.virtio.locate(addr) {
-                match slot.transport.lock() {
-                    Ok(mut transport) => transport.write(offset, data),
-                    // Poisoning means a host-side panic already happened
-                    // elsewhere; a guest write must not turn that into a second
-                    // panic.
-                    Err(_) => tracing::error!(
-                        addr = format_args!("{addr:#x}"),
-                        "virtio-mmio transport lock is poisoned; dropping guest write"
-                    ),
-                }
-                return;
+        if let Some((slot, offset)) = self.virtio.locate(addr) {
+            match slot.transport.lock() {
+                Ok(mut transport) => transport.write(offset, data),
+                // Poisoning means a host-side panic already happened
+                // elsewhere; a guest write must not turn that into a second
+                // panic.
+                Err(_) => tracing::error!(
+                    addr = format_args!("{addr:#x}"),
+                    "virtio-mmio transport lock is poisoned; dropping guest write"
+                ),
             }
-            if let Some(pci) = &self.pci {
-                // Undecoded addresses (a BAR the driver has not enabled, or one
-                // it has moved out of the aperture) are dropped inside the bus.
-                pci.mmio_write(addr, data);
-            }
+            return;
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "linux")]
+        if let Some(pci) = &self.pci {
+            // Undecoded addresses (a BAR the driver has not enabled, or one it
+            // has moved out of the aperture) are dropped inside the bus.
+            pci.mmio_write(addr, data);
+            return;
+        }
         tracing::debug!(
             addr = format_args!("{addr:#x}"),
             bytes = data.len(),
@@ -275,23 +270,21 @@ impl ExitHandler for MachineBus {
                 return;
             }
         }
-        #[cfg(target_os = "linux")]
-        {
-            if let Some((slot, offset)) = self.virtio.locate(addr) {
-                match slot.transport.lock() {
-                    Ok(mut transport) => transport.read(offset, data),
-                    Err(_) => tracing::error!(
-                        addr = format_args!("{addr:#x}"),
-                        "virtio-mmio transport lock is poisoned; reading zeroes"
-                    ),
-                }
-                return;
+        if let Some((slot, offset)) = self.virtio.locate(addr) {
+            match slot.transport.lock() {
+                Ok(mut transport) => transport.read(offset, data),
+                Err(_) => tracing::error!(
+                    addr = format_args!("{addr:#x}"),
+                    "virtio-mmio transport lock is poisoned; reading zeroes"
+                ),
             }
-            if let Some(pci) = &self.pci {
-                pci.mmio_read(addr, data);
-            }
+            return;
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "linux")]
+        if let Some(pci) = &self.pci {
+            pci.mmio_read(addr, data);
+            return;
+        }
         tracing::debug!(
             addr = format_args!("{addr:#x}"),
             bytes = data.len(),

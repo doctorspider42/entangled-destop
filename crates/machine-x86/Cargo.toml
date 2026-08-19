@@ -23,8 +23,9 @@ kvm-ioctls.workspace = true
 kvm-bindings.workspace = true
 vmm-sys-util.workspace = true
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-# Split-ring helpers for the queue-notify integration test.
+[dev-dependencies]
+# Split-ring and guest-memory helpers, used by the queue-notify integration test
+# (Linux) and by the portable `virtio` unit tests (both hosts).
 virtio-core = { workspace = true, features = ["test-utils"] }
 
 [lints]

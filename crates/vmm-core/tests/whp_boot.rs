@@ -18,10 +18,8 @@
 
 #![cfg(windows)]
 
-use std::io::Write;
-use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use linux_boot::{BootConfig, GUEST_READY_MARKER};
@@ -32,85 +30,8 @@ use machine_x86::serial::SerialConsole;
 use vmm_core::whp::{WhpHypervisor, WhpOptions, WhpPartition, WHP_ENABLE_HINT};
 use vmm_core::{MachineConfig, RunOutcome};
 
-/// How long the guest gets to reach the marker.
-///
-/// Generous next to the KVM test's 60 s: a WHP guest takes every `hlt` and every
-/// MMIO access through userspace, and the run is a debug build.
-const BOOT_DEADLINE: Duration = Duration::from_secs(120);
-
-const MACHINE: MachineConfig = MachineConfig {
-    memory_mib: 512,
-    vcpu_count: 1,
-};
-
-/// Serialises against WHP's one-mapped-partition-per-process limit, exactly as
-/// `whp_smoke.rs` does (see its module docs). Separate binaries do not share a
-/// process, but a future second test in this file would.
-fn whp_guard() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Capture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Ok(mut inner) = self.0.lock() {
-            inner.extend_from_slice(buf);
-        }
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Capture {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().map(|v| v.clone()).unwrap_or_default()).into_owned()
-    }
-}
-
-fn artifact(relative: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../artifacts")
-        .join(relative);
-    path.exists().then_some(path)
-}
-
-/// The bootstrap kernel if it is built, otherwise the Debian netboot kernel.
-fn kernel() -> Option<(PathBuf, &'static str)> {
-    artifact("bootstrap/vmlinuz")
-        .map(|p| (p, "bootstrap"))
-        .or_else(|| artifact("tests/vmlinuz").map(|p| (p, "debian-netboot")))
-}
-
-/// The last `lines` lines of the serial log, for a failure message that is
-/// readable rather than a wall of boot output.
-fn tail(text: &str, lines: usize) -> String {
-    let all: Vec<&str> = text.lines().collect();
-    all[all.len().saturating_sub(lines)..].join("\n")
-}
-
-/// Writes the whole serial log to `$ENTANGLED_WHP_BOOT_LOG` when it is set.
-///
-/// A passing boot is not the same as a *clean* boot: the interesting lines are
-/// the ones about TSC calibration, the APIC timer and `check_timer()`, and they
-/// scroll past long before the marker. Keeping the whole log a single environment
-/// variable away is what makes the next question about this machine answerable
-/// without editing the test.
-fn dump_log(text: &str) {
-    let Ok(path) = std::env::var("ENTANGLED_WHP_BOOT_LOG") else {
-        return;
-    };
-    match std::fs::write(&path, text) {
-        Ok(()) => eprintln!("wrote the serial log to {path}"),
-        Err(e) => eprintln!("could not write the serial log to {path}: {e}"),
-    }
-}
+mod whp_common;
+use whp_common::{artifact, dump_log, kernel, tail, whp_guard, Capture, BOOT_DEADLINE, MACHINE};
 
 /// EPIC 17 phase 2 acceptance: a Linux guest boots to `VMHOST_GUEST_READY`
 /// natively on Windows, and the VM tears down cleanly afterwards.

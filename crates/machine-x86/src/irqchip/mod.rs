@@ -69,6 +69,9 @@ pub enum IrqChipError {
 
     #[error("failed to start the PIT timer thread: {0}")]
     TimerThread(#[source] std::io::Error),
+
+    #[error("virtio slot {0} has no IOAPIC pin assigned (see layout::VIRTIO_IRQS)")]
+    NoSuchVirtioSlot(usize),
 }
 
 /// The machine's userspace interrupt controllers, as one attachable unit.
@@ -125,6 +128,26 @@ impl UserspaceIrqChip {
             Ok(line) => line,
             Err(_) => unreachable!("SERIAL_PIN is within the IOAPIC's pin count"),
         }
+    }
+
+    /// The interrupt line for virtio-mmio (or virtio-pci) slot `slot`: IOAPIC pin
+    /// [`crate::layout::virtio_irq`].
+    ///
+    /// This is the WHP peer of `crate::irqfd::IrqFdLine`, and the reason
+    /// `virtio::VirtioMmioBus::attach_userspace` needs no WHP knowledge: both are
+    /// an `Arc<dyn IrqLine>`, and the transport that takes one cannot tell whether
+    /// triggering it writes an eventfd the kernel drains or walks a
+    /// redirection table in this process.
+    ///
+    /// The pin table is not contiguous — pins 8 (RTC) and 13 (ACPI SCI) belong to
+    /// this machine's own devices — so the mapping goes through `layout`, which is
+    /// the same table both transports and the MP table use.
+    pub fn virtio_line(&self, slot: usize) -> Result<Arc<dyn IrqLine>, IrqChipError> {
+        let gsi = crate::layout::virtio_irq(slot).ok_or(IrqChipError::NoSuchVirtioSlot(slot))?;
+        // Every entry of `VIRTIO_IRQS` is a small ISA-range pin, so the cast
+        // cannot fail; treated as "no such slot" rather than unwrapped.
+        let pin = u8::try_from(gsi).map_err(|_| IrqChipError::NoSuchVirtioSlot(slot))?;
+        Ok(self.ioapic.line(pin)?)
     }
 
     /// True when `port` belongs to one of the chips.

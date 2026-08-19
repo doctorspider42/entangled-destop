@@ -14,16 +14,36 @@
 //!
 //! Queue kicks are offloaded to ioeventfds and per-device worker threads by
 //! default; see [`crate::notify`] (backlog MVP-307).
+//!
+//! # Two hosts, one bus
+//!
+//! Everything above is host-neutral: the addresses come from [`crate::layout`],
+//! the transport from `virtio_core`, and a device's interrupt is an
+//! `Arc<dyn IrqLine>` that cannot tell an irqfd from an IOAPIC redirection-table
+//! lookup. Only the two *wiring* primitives differ, so there are two
+//! constructors:
+//!
+//! * [`VirtioMmioBus::attach`] / [`VirtioMmioBus::attach_with`] — KVM: an irqfd
+//!   per device and (by default) an ioeventfd per queue.
+//! * [`VirtioMmioBus::attach_userspace`] — a host with no in-kernel irqchip
+//!   (WHP): lines come from [`crate::irqchip::UserspaceIrqChip`]'s IOAPIC and
+//!   every kick runs inline on the vCPU thread.
 
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "linux")]
 use kvm_ioctls::VmFd;
 use thiserror::Error;
+use virtio_core::device::DeviceType;
+use virtio_core::interrupt::IrqLine;
 use virtio_core::transport::TransportError;
 use virtio_core::{mmio, GuestMem, MmioTransport, VirtioDevice};
 
+use crate::irqchip::{IrqChipError, UserspaceIrqChip};
+#[cfg(target_os = "linux")]
 use crate::irqfd::{IrqFdError, IrqFdLine};
 use crate::layout;
+#[cfg(target_os = "linux")]
 use crate::notify::{DeviceNotifier, NotifyAddressing, NotifyError, QueueNotifyMode};
 
 /// Maximum number of virtio-mmio devices.
@@ -42,11 +62,19 @@ pub enum VirtioAttachError {
     )]
     TooManySlots { count: usize },
 
+    #[cfg(target_os = "linux")]
     #[error("failed to wire the interrupt line for virtio slot {slot}: {source}")]
     Irq {
         slot: usize,
         #[source]
         source: IrqFdError,
+    },
+
+    #[error("failed to wire the IOAPIC line for virtio slot {slot}: {source}")]
+    IrqChip {
+        slot: usize,
+        #[source]
+        source: IrqChipError,
     },
 
     #[error("virtio slot {slot}: {source}")]
@@ -56,6 +84,7 @@ pub enum VirtioAttachError {
         source: TransportError,
     },
 
+    #[cfg(target_os = "linux")]
     #[error(transparent)]
     Notify(#[from] NotifyError),
 }
@@ -71,11 +100,13 @@ pub struct VirtioMmioSlot {
     pub transport: Arc<Mutex<MmioTransport>>,
     /// Present when this device's queue kicks are served by ioeventfds and a
     /// worker thread (MVP-307); `None` means every kick runs inline on the vCPU.
+    #[cfg(target_os = "linux")]
     notifier: Option<DeviceNotifier<MmioTransport>>,
 }
 
 impl VirtioMmioSlot {
     /// The queue-notify offload for this device, if it has one.
+    #[cfg(target_os = "linux")]
     pub fn notifier(&self) -> Option<&DeviceNotifier<MmioTransport>> {
         self.notifier.as_ref()
     }
@@ -85,7 +116,42 @@ impl VirtioMmioSlot {
 /// clauses that announce it.
 pub struct VirtioMmioBus {
     slots: Vec<VirtioMmioSlot>,
+    #[cfg(target_os = "linux")]
     mode: QueueNotifyMode,
+}
+
+/// Slot placement: the mmio window base and the IOAPIC pin for slot `index`.
+///
+/// Pure arithmetic over [`crate::layout`], shared by both constructors so a
+/// device lands in the same place — and on the same pin — whichever host wired
+/// it. The pin table is shorter than the slot count is bounded by, so an
+/// out-of-range slot is reported here rather than producing a device on a pin
+/// nothing routes.
+fn placement(index: usize) -> Result<(u64, u32), VirtioAttachError> {
+    let base = layout::virtio_mmio_slot(index as u64);
+    // Not `first + index`: the pins that skips are ones this machine's own
+    // legacy devices own (see `layout::VIRTIO_IRQS`).
+    let gsi =
+        layout::virtio_irq(index).ok_or(VirtioAttachError::TooManySlots { count: index + 1 })?;
+    Ok((base, gsi))
+}
+
+/// Wraps `device` in a transport bound to `line`, reporting its type for the log
+/// record the callers write.
+fn transport_for(
+    index: usize,
+    device: Box<dyn VirtioDevice>,
+    mem: Arc<GuestMem>,
+    line: Arc<dyn IrqLine>,
+) -> Result<(DeviceType, Arc<Mutex<MmioTransport>>), VirtioAttachError> {
+    let device_type = device.device_type();
+    let transport = MmioTransport::new(index, device, mem, line).map_err(|source| {
+        VirtioAttachError::Transport {
+            slot: index,
+            source,
+        }
+    })?;
+    Ok((device_type, Arc::new(Mutex::new(transport))))
 }
 
 impl VirtioMmioBus {
@@ -93,8 +159,61 @@ impl VirtioMmioBus {
     pub fn empty() -> Self {
         Self {
             slots: Vec::new(),
+            #[cfg(target_os = "linux")]
             mode: QueueNotifyMode::Synchronous,
         }
+    }
+
+    /// Places `devices` in consecutive mmio slots on a host whose hypervisor has
+    /// **no in-kernel interrupt controllers** — WHP (backlog WHP-1703).
+    ///
+    /// The difference from [`Self::attach_with`] is only the two host primitives:
+    ///
+    /// * the interrupt line is [`crate::irqchip::UserspaceIrqChip::virtio_line`],
+    ///   an IOAPIC redirection-table lookup followed by one `WHvRequestInterrupt`,
+    ///   instead of an irqfd. Both are an `Arc<dyn IrqLine>`, so the transport and
+    ///   the device cannot tell which they got;
+    /// * there is no ioeventfd, so every `QUEUE_NOTIFY` write stays a full VM exit
+    ///   and the device runs **inline on the vCPU thread** that took it. That is
+    ///   [`QueueNotifyMode::Synchronous`], which the KVM path has always supported
+    ///   as a fallback — correct, just serialised against guest execution.
+    ///
+    /// Portable on purpose: it compiles and is exercised on Linux too, which is
+    /// what keeps the unit tests for it running in CI on both hosts.
+    pub fn attach_userspace(
+        mem: Arc<GuestMem>,
+        devices: Vec<Box<dyn VirtioDevice>>,
+        irqchip: &UserspaceIrqChip,
+    ) -> Result<Self, VirtioAttachError> {
+        if devices.len() > MAX_VIRTIO_SLOTS {
+            return Err(VirtioAttachError::TooManySlots {
+                count: devices.len(),
+            });
+        }
+        let mut bus = Self::empty();
+        bus.slots.reserve(devices.len());
+        for (slot, device) in devices.into_iter().enumerate() {
+            let (base, gsi) = placement(slot)?;
+            let line = irqchip
+                .virtio_line(slot)
+                .map_err(|source| VirtioAttachError::IrqChip { slot, source })?;
+            let (device_type, transport) = transport_for(slot, device, Arc::clone(&mem), line)?;
+            tracing::info!(
+                slot,
+                device = ?device_type,
+                base = format_args!("{base:#x}"),
+                irq = gsi,
+                "attached virtio-mmio device on the userspace irqchip (synchronous kicks)"
+            );
+            bus.slots.push(VirtioMmioSlot {
+                base,
+                irq: gsi,
+                transport,
+                #[cfg(target_os = "linux")]
+                notifier: None,
+            });
+        }
+        Ok(bus)
     }
 
     /// Places `devices` in consecutive mmio slots, registering one irqfd per
@@ -105,6 +224,7 @@ impl VirtioMmioBus {
     /// The notification mode comes from [`QueueNotifyMode::from_env`], so a host
     /// where the offload misbehaves can be put back on the synchronous path
     /// without a rebuild; [`Self::attach_with`] pins it explicitly.
+    #[cfg(target_os = "linux")]
     pub fn attach(
         vm: Arc<VmFd>,
         mem: Arc<GuestMem>,
@@ -114,6 +234,7 @@ impl VirtioMmioBus {
     }
 
     /// [`Self::attach`] with an explicit queue-notify mode (benchmarks, tests).
+    #[cfg(target_os = "linux")]
     pub fn attach_with(
         vm: Arc<VmFd>,
         mem: Arc<GuestMem>,
@@ -132,20 +253,11 @@ impl VirtioMmioBus {
             mode,
         };
         for (slot, device) in devices.into_iter().enumerate() {
-            let base = layout::virtio_mmio_slot(slot as u64);
-            // Not `first + slot`: the pins that skips are ones this machine's own
-            // legacy devices own (see `layout::VIRTIO_IRQS`). The slot count is
-            // already bounded above, so the table always has an entry.
-            let gsi = layout::virtio_irq(slot)
-                .ok_or(VirtioAttachError::TooManySlots { count: slot + 1 })?;
-
+            let (base, gsi) = placement(slot)?;
             let line = IrqFdLine::new(&vm, gsi)
                 .map_err(|source| VirtioAttachError::Irq { slot, source })?;
-
-            let device_type = device.device_type();
-            let transport = MmioTransport::new(slot, device, Arc::clone(&mem), Arc::new(line))
-                .map_err(|source| VirtioAttachError::Transport { slot, source })?;
-            let transport = Arc::new(Mutex::new(transport));
+            let (device_type, transport) =
+                transport_for(slot, device, Arc::clone(&mem), Arc::new(line))?;
 
             let notifier = if mode.is_offloaded() {
                 // All of a device's queues share one QUEUE_NOTIFY register, so
@@ -185,6 +297,7 @@ impl VirtioMmioBus {
     }
 
     /// How queue kicks reach the devices on this bus.
+    #[cfg(target_os = "linux")]
     pub fn notify_mode(&self) -> QueueNotifyMode {
         self.mode
     }
@@ -193,8 +306,10 @@ impl VirtioMmioBus {
     ///
     /// Idempotent, and also run from `Drop`, so "closing the VM leaves no
     /// device threads behind" holds even on an error path that never gets here
-    /// (EPIC 14 acceptance criterion).
+    /// (EPIC 14 acceptance criterion). A bus whose kicks are synchronous owns no
+    /// threads and no registrations, so there is nothing to undo.
     pub fn shutdown(&self) {
+        #[cfg(target_os = "linux")]
         for slot in &self.slots {
             if let Some(notifier) = &slot.notifier {
                 notifier.shutdown();
@@ -230,6 +345,180 @@ impl Drop for VirtioMmioBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::irqchip::UserspaceIrqChip;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use virtio_core::{DeviceType, VIRTIO_F_VERSION_1};
+    use vmm_core::hv::{HvError, InterruptDelivery, InterruptRequest};
+
+    /// Counts `InterruptDelivery::request` calls and remembers the last vector,
+    /// standing in for WHP's local APIC. The IOAPIC above it is the real thing.
+    #[derive(Default)]
+    struct Counting {
+        calls: AtomicU32,
+        last_vector: AtomicU32,
+    }
+
+    impl InterruptDelivery for Counting {
+        fn request(&self, interrupt: &InterruptRequest) -> Result<(), HvError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.last_vector
+                .store(u32::from(interrupt.vector), Ordering::Release);
+            Ok(())
+        }
+    }
+
+    /// A device that exists only to be placed in a slot and asked what it is.
+    struct IdentityOnly(DeviceType);
+
+    impl VirtioDevice for IdentityOnly {
+        fn device_type(&self) -> DeviceType {
+            self.0
+        }
+        fn queue_max_sizes(&self) -> &[u16] {
+            &[256]
+        }
+        fn device_features(&self) -> u64 {
+            VIRTIO_F_VERSION_1
+        }
+        fn ack_features(&mut self, _negotiated: u64) -> bool {
+            true
+        }
+        fn read_config(&self, _offset: u64, _data: &mut [u8]) {}
+        fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
+        fn activate(
+            &mut self,
+            _resources: virtio_core::DeviceResources,
+        ) -> Result<(), virtio_core::DeviceError> {
+            Ok(())
+        }
+        fn notify(&mut self, _queue_index: u16) -> Result<(), virtio_core::DeviceError> {
+            Ok(())
+        }
+        fn reset(&mut self) {}
+    }
+
+    fn chip(delivery: Arc<Counting>) -> Arc<UserspaceIrqChip> {
+        UserspaceIrqChip::new(delivery, 1).expect("userspace irqchip")
+    }
+
+    fn devices(count: usize) -> Vec<Box<dyn VirtioDevice>> {
+        (0..count)
+            .map(|_| Box::new(IdentityOnly(DeviceType::Block)) as Box<dyn VirtioDevice>)
+            .collect()
+    }
+
+    fn memory() -> Arc<GuestMem> {
+        Arc::new(virtio_core::testing::guest_memory(1 << 20))
+    }
+
+    /// The userspace-irqchip attach path must place devices exactly where the KVM
+    /// one does — same window, same pin, same clause order — or a WHP guest and a
+    /// KVM guest see two different machines from the same configuration.
+    #[test]
+    fn attach_userspace_places_devices_where_the_kvm_path_does() {
+        let chip = chip(Arc::new(Counting::default()));
+        let bus = VirtioMmioBus::attach_userspace(memory(), devices(3), &chip)
+            .expect("attach on the userspace irqchip");
+
+        assert_eq!(bus.slots().len(), 3);
+        for (index, slot) in bus.slots().iter().enumerate() {
+            assert_eq!(slot.base, layout::virtio_mmio_slot(index as u64));
+            assert_eq!(Some(slot.irq), layout::virtio_irq(index));
+            // The pins the table skips are the RTC's and the SCI's; a device must
+            // never land on one.
+            assert_ne!(slot.irq, 8);
+            assert_ne!(slot.irq, layout::ACPI_SCI_GSI);
+        }
+        assert_eq!(
+            bus.cmdline_clauses(),
+            format!(
+                "{} {} {}",
+                mmio::cmdline_clause(layout::virtio_mmio_slot(0), layout::VIRTIO_IRQS[0]),
+                mmio::cmdline_clause(layout::virtio_mmio_slot(1), layout::VIRTIO_IRQS[1]),
+                mmio::cmdline_clause(layout::virtio_mmio_slot(2), layout::VIRTIO_IRQS[2]),
+            )
+        );
+    }
+
+    /// The whole dispatch path a WHP MMIO exit takes: the instruction emulator's
+    /// memory callback lands on `ExitHandler::mmio_read`/`mmio_write`, which is
+    /// `MachineBus`, which decodes the address to a slot and a register offset.
+    /// Asserted here rather than in the WHP backend because everything from the
+    /// callback inwards is portable — and so is testable on both hosts.
+    #[test]
+    fn the_bus_dispatches_the_virtio_window_to_the_right_slot() {
+        use crate::bus::MachineBus;
+        use crate::serial::SerialConsole;
+        use vmm_core::ExitHandler;
+
+        let chip = chip(Arc::new(Counting::default()));
+        let bus = VirtioMmioBus::attach_userspace(memory(), devices(2), &chip)
+            .expect("attach on the userspace irqchip");
+        let serial = SerialConsole::with_trigger(chip.serial_line(), Box::new(std::io::sink()));
+        let mut bus = MachineBus::with_virtio(serial, bus).with_irqchip(Arc::clone(&chip));
+
+        let mut word = [0u8; 4];
+        for slot in 0..2u64 {
+            let base = layout::virtio_mmio_slot(slot);
+            bus.mmio_read(base + mmio::MAGIC_VALUE, &mut word);
+            assert_eq!(u32::from_le_bytes(word), mmio::MAGIC, "slot {slot} magic");
+            bus.mmio_read(base + mmio::VERSION_REG, &mut word);
+            assert_eq!(u32::from_le_bytes(word), mmio::VERSION);
+            bus.mmio_read(base + mmio::DEVICE_ID, &mut word);
+            assert_eq!(u32::from_le_bytes(word), DeviceType::Block.id());
+        }
+
+        // A slot the bus does not have reads as zeroes rather than reaching a
+        // neighbour's registers.
+        bus.mmio_read(layout::virtio_mmio_slot(4) + mmio::MAGIC_VALUE, &mut word);
+        assert_eq!(u32::from_le_bytes(word), 0);
+        // The IOAPIC's own page must still win over the virtio window: the two
+        // are far apart, but the ordering inside the bus is what enforces it.
+        bus.mmio_read(u64::from(layout::IOAPIC_ADDR), &mut word);
+        assert_ne!(u32::from_le_bytes(word), mmio::MAGIC);
+    }
+
+    /// A device's interrupt line on this host is an IOAPIC pin, and raising it
+    /// must produce exactly one delivered message carrying the vector the *guest*
+    /// programmed into the redirection entry for that pin.
+    ///
+    /// This is the WHP peer of "an irqfd write injects the GSI", and the reason
+    /// the transport can take either without knowing which.
+    #[test]
+    fn a_device_line_delivers_the_vector_the_guest_programmed() {
+        let delivery = Arc::new(Counting::default());
+        let chip = chip(Arc::clone(&delivery));
+        let _bus = VirtioMmioBus::attach_userspace(memory(), devices(1), &chip)
+            .expect("attach on the userspace irqchip");
+
+        // What Linux does when it requests the IRQ: select the low half of the
+        // redirection entry for the pin and write vector, unmasked.
+        let pin = u32::from(u8::try_from(layout::VIRTIO_IRQS[0]).unwrap());
+        let base = u64::from(layout::IOAPIC_ADDR);
+        chip.mmio_write(base, &(0x10 + 2 * pin).to_le_bytes());
+        chip.mmio_write(base + 0x10, &0x43u32.to_le_bytes());
+
+        let before = chip.ioapic().delivered();
+        chip.virtio_line(0)
+            .expect("slot 0 has a pin")
+            .trigger()
+            .expect("delivery succeeds");
+        assert_eq!(chip.ioapic().delivered(), before + 1);
+        assert_eq!(delivery.last_vector.load(Ordering::Acquire), 0x43);
+    }
+
+    /// More devices than there are pins must be refused rather than silently
+    /// dropped or stacked onto one pin.
+    #[test]
+    fn more_devices_than_slots_is_refused() {
+        let chip = chip(Arc::new(Counting::default()));
+        let attached =
+            VirtioMmioBus::attach_userspace(memory(), devices(MAX_VIRTIO_SLOTS + 1), &chip);
+        let Err(error) = attached else {
+            panic!("nine devices must not fit in {MAX_VIRTIO_SLOTS} slots");
+        };
+        assert!(matches!(error, VirtioAttachError::TooManySlots { count } if count == 9));
+    }
 
     #[test]
     fn empty_bus_decodes_nothing() {
