@@ -1,0 +1,88 @@
+#cloud-config
+# Unattended Ubuntu **Desktop** installation for Entangled Desktop (the wave-G
+# cdrom stretch goal). Same shape and same reasoning as ubuntu-server.yaml —
+# read that file's comments first; only the differences are annotated here.
+#
+# Use it with the Desktop ISO:
+#
+#   iso=$(bash scripts/fetch-ubuntu-iso.sh desktop)
+#   cargo run -p entangled -- install ubuntu \
+#       --disk ~/entangled-vms/desktop.raw --size 24G --memory-mib 4096 \
+#       --iso "$iso" --autoinstall assets/autoinstall/ubuntu-desktop.yaml
+#
+# The Desktop ISO's installer has been subiquity underneath since 23.04, so it
+# reads the same autoinstall document from the same NoCloud seed volume, gated
+# by the same `autoinstall` word the install command types into GRUB.
+
+autoinstall:
+  version: 1
+
+  refresh-installer:
+    update: false
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  timezone: Etc/UTC
+
+  network:
+    version: 2
+    ethernets: {}
+
+  apt:
+    geoip: false
+    preserve_sources_list: false
+    fallback: offline-install
+    mirror-selection:
+      primary:
+        - uri: "http://archive.ubuntu.com/ubuntu"
+
+  # The one line that makes this the *desktop* profile: the Desktop ISO's
+  # install sources are `ubuntu-desktop-minimal` (its default) and
+  # `ubuntu-desktop` (read out of the ISO's casper/install-sources.yaml).
+  # Minimal keeps the unpack at ~3.4 GiB instead of ~4.9 GiB and still boots
+  # to GDM and a full GNOME session.
+  source:
+    id: ubuntu-desktop-minimal
+    search_drivers: false
+  drivers:
+    install: false
+  codecs:
+    install: false
+  oem:
+    install: false
+  kernel-crash-dumps:
+    enabled: false
+  snaps: []
+
+  storage:
+    layout:
+      name: direct
+      match:
+        path: /dev/vda
+
+  identity:
+    realname: Entangled
+    username: entangled
+    # SHA-512 crypt of "entangled" — the same demo credential as the server
+    # profile, for the same reason: this is a throwaway test VM.
+    password: "$6$entangled0seed$bT7xSYZVhNBFpEbtY2oAblEwSEksNuxBzAR9uMlGvF/Am7Xk57rlH.Sr6eVuvZM4ePjO968h1NJrBI8Usw14m."
+    hostname: "@HOSTNAME@"
+
+  # The installed *desktop* boots to GDM on the scanout, so the serial console
+  # is pure diagnostics here — but it is exactly as load-bearing as on the
+  # server: it is the only channel through which an unattended run can prove
+  # the installed system booted at all.
+  late-commands:
+    - sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/d;/^GRUB_TERMINAL/d;/^GRUB_SERIAL_COMMAND/d' /target/etc/default/grub
+    - >-
+      printf '%s\n'
+      'GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8"'
+      'GRUB_TERMINAL="serial console"'
+      'GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"'
+      'GRUB_TIMEOUT=3'
+      'GRUB_TIMEOUT_STYLE=menu'
+      >> /target/etc/default/grub
+    - curtin in-target -- update-grub
+
+  shutdown: poweroff

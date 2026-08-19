@@ -31,18 +31,41 @@ use crate::VmmError;
 /// what the "guest is untrusted" hard rule requires.
 pub type GuestMem = GuestMemoryMmap;
 
-/// Allocates guest RAM as a single region starting at guest physical 0. MVP
-/// guests stay below the 32-bit MMIO hole, so one region suffices; the E820
-/// map (machine-x86) is what tells the guest which parts are usable.
+/// Where RAM stops on its way up the 32-bit address space: the PC-convention
+/// MMIO hole. A guest bigger than this gets the remainder as a second region
+/// at [`HIGH_RAM_START`].
+///
+/// This is a deliberate copy of `machine_x86::layout::MMIO_HOLE_START` —
+/// vmm-core does not depend on the machine crate (the dependency points the
+/// other way), so machine-x86 carries the test that keeps the two numbers
+/// equal (`layout_agrees_with_vmm_core_memory_split`).
+pub const LOW_RAM_END: u64 = 0xc000_0000;
+
+/// Where RAM resumes above the hole: 4 GiB, one past the 32-bit space. The
+/// hole between [`LOW_RAM_END`] and here belongs to MMIO (PCI BARs, the
+/// virtio-mmio window, LAPIC/IOAPIC, the pflash window) and is never RAM.
+pub const HIGH_RAM_START: u64 = 0x1_0000_0000;
+
+/// Allocates guest RAM starting at guest physical 0, split around the 32-bit
+/// MMIO hole in the PC convention: one region up to [`LOW_RAM_END`], and —
+/// for guests bigger than that — a second region from [`HIGH_RAM_START`] up.
+/// The E820 map (machine-x86) tells the guest the same shape.
 pub fn create_guest_memory(mem_size_bytes: u64) -> Result<GuestMem, VmmError> {
     if mem_size_bytes == 0 {
         return Err(VmmError::GuestMemory("guest memory size is zero".into()));
     }
-    let size = usize::try_from(mem_size_bytes).map_err(|_| {
-        VmmError::GuestMemory(format!("guest memory size {mem_size_bytes} overflows"))
-    })?;
-    GuestMem::from_ranges(&[(GuestAddress(0), size)])
-        .map_err(|e| VmmError::GuestMemory(e.to_string()))
+    let to_usize = |bytes: u64| {
+        usize::try_from(bytes)
+            .map_err(|_| VmmError::GuestMemory(format!("guest memory size {bytes} overflows")))
+    };
+    let mut ranges = vec![(GuestAddress(0), to_usize(mem_size_bytes.min(LOW_RAM_END))?)];
+    if mem_size_bytes > LOW_RAM_END {
+        ranges.push((
+            GuestAddress(HIGH_RAM_START),
+            to_usize(mem_size_bytes - LOW_RAM_END)?,
+        ));
+    }
+    GuestMem::from_ranges(&ranges).map_err(|e| VmmError::GuestMemory(e.to_string()))
 }
 
 #[cfg(test)]
@@ -116,6 +139,50 @@ mod tests {
         assert_eq!(mem.read_obj::<u8>(GuestAddress(2 * MIB - 1)).unwrap(), 0x5a);
         assert!(mem.write_obj(0u8, GuestAddress(2 * MIB)).is_err());
         assert!(mem.read_slice(&mut buf, GuestAddress(2 * MIB - 2)).is_err());
+    }
+
+    /// A guest bigger than the 32-bit MMIO hole gets exactly two regions: low
+    /// RAM stopping at the hole, and the remainder at 4 GiB — the same shape
+    /// `machine_x86::e820_map` publishes and both hypervisors' register loops
+    /// map region by region.
+    #[test]
+    fn big_guests_split_around_the_mmio_hole() {
+        let mem = create_guest_memory(4096 * MIB).unwrap();
+        assert_eq!(mem.num_regions(), 2);
+        let low = mem.find_region(GuestAddress(0)).expect("low region");
+        assert_eq!(low.start_addr().raw_value(), 0);
+        assert_eq!(low.len(), LOW_RAM_END);
+        let high = mem
+            .find_region(GuestAddress(HIGH_RAM_START))
+            .expect("high region");
+        assert_eq!(high.start_addr().raw_value(), HIGH_RAM_START);
+        assert_eq!(high.len(), 4096 * MIB - LOW_RAM_END);
+        assert_eq!(
+            mem.last_addr().raw_value(),
+            HIGH_RAM_START + (4096 * MIB - LOW_RAM_END) - 1
+        );
+        // The hole itself is not guest memory: a checked access there fails.
+        assert!(mem.find_region(GuestAddress(LOW_RAM_END)).is_none());
+        assert!(mem
+            .write_obj(0u8, GuestAddress(LOW_RAM_END + 0x1000))
+            .is_err());
+        // But both sides of it are writable through the checked APIs.
+        mem.write_obj(0xa5u8, GuestAddress(LOW_RAM_END - 1))
+            .unwrap();
+        mem.write_obj(0x5au8, GuestAddress(HIGH_RAM_START)).unwrap();
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(HIGH_RAM_START)).unwrap(),
+            0x5a
+        );
+    }
+
+    /// Exactly at the boundary stays a single region — the split must not
+    /// manufacture an empty second region.
+    #[test]
+    fn a_guest_exactly_at_the_hole_is_one_region() {
+        let mem = create_guest_memory(LOW_RAM_END).unwrap();
+        assert_eq!(mem.num_regions(), 1);
+        assert_eq!(mem.last_addr().raw_value(), LOW_RAM_END - 1);
     }
 
     /// Repeated create/drop must not leak the backing allocation — 64 × 32 MiB

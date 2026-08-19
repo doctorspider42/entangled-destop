@@ -31,7 +31,7 @@ pub use hv::{
     DestinationMode, ExitHandler, InterruptDelivery, InterruptKind, InterruptRequest,
     MachineConfig, RunOutcome, TriggerMode,
 };
-pub use memory::{create_guest_memory, GuestMem};
+pub use memory::{create_guest_memory, GuestMem, HIGH_RAM_START, LOW_RAM_END};
 pub use state::{VmState, VmStateError};
 
 #[cfg(target_os = "linux")]

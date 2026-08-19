@@ -65,6 +65,7 @@
 //! * no `panic!`, `unwrap()` or `expect()` on a guest-controlled path.
 
 pub mod device;
+pub mod edid;
 pub mod error;
 pub mod protocol;
 pub mod resource;
@@ -99,6 +100,16 @@ pub const FORMAT_B8G8R8X8_UNORM: u32 = 2;
 
 /// Bytes per pixel for both accepted formats.
 pub const BYTES_PER_PIXEL: u32 = 4;
+
+/// `VIRTIO_GPU_F_EDID` (MVP-811): the device answers `GET_EDID` with a valid
+/// EDID block ([`edid`]). Offered because GNOME/mutter sizes and names its
+/// outputs from it; harmless to a driver that ignores it.
+pub const VIRTIO_GPU_F_EDID: u64 = 1 << 1;
+
+/// Largest cursor image `UPDATE_CURSOR` accepts, per axis. The spec's cursors
+/// are 64×64; four times that leaves room for HiDPI cursors while still
+/// bounding the host copy a guest can demand to 256 KiB.
+pub const MAX_CURSOR_DIM: u32 = 256;
 
 /// True for the pixel formats `RESOURCE_CREATE_2D` accepts (MVP-809). Anything
 /// else is answered with `ERR_INVALID_PARAMETER`.

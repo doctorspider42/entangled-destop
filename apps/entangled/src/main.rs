@@ -56,6 +56,18 @@ enum Command {
         /// scanout (serial console remains on stdout).
         #[arg(long)]
         headless: bool,
+        /// Attach an ISO read-only as the last virtio-blk device and let the
+        /// firmware boot it (uefi mode only). Overrides the profile's [cdrom].
+        #[arg(long)]
+        cdrom: Option<PathBuf>,
+        /// Debug: write a PNG of the scanout N seconds after the VM starts
+        /// (best effort — nothing is written if the VM stops first).
+        #[arg(long, value_name = "SECS")]
+        screenshot_after: Option<u64>,
+        /// Where --screenshot-after writes its PNG. Defaults to
+        /// entangled-screenshot-<name>.png in the working directory.
+        #[arg(long, requires = "screenshot_after")]
+        screenshot: Option<PathBuf>,
     },
     /// Check host prerequisites (KVM, capabilities, graphics backend).
     Doctor,
@@ -180,17 +192,35 @@ fn run(cli: Cli) -> Result<(), String> {
                 ))
             }
         }
-        Command::Run { config, headless } => {
+        Command::Run {
+            config,
+            headless,
+            cdrom,
+            screenshot_after,
+            screenshot,
+        } => {
             let text = std::fs::read_to_string(&config)
                 .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
-            let cfg = control_api::VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
+            let mut cfg = control_api::VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
+            if let Some(iso) = cdrom {
+                if !iso.is_file() {
+                    return Err(format!("--cdrom {}: not a file", iso.display()));
+                }
+                cfg.set_cdrom(iso).map_err(|e| e.to_string())?;
+            }
             #[cfg(any(target_os = "linux", windows))]
             {
-                run_vm::run(cfg, headless)
+                let shot = screenshot_after.map(|secs| run_vm::ScreenshotRequest {
+                    after: std::time::Duration::from_secs(secs),
+                    path: screenshot.unwrap_or_else(|| {
+                        PathBuf::from(format!("entangled-screenshot-{}.png", cfg.name))
+                    }),
+                });
+                run_vm::run(cfg, headless, shot)
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {
-                let _ = headless;
+                let _ = (headless, screenshot_after, screenshot);
                 Err(format!(
                     "config '{}' is valid, but running VMs requires a Linux host with KVM \
                      or a Windows host with the Windows Hypervisor Platform",

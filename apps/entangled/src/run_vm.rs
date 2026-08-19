@@ -199,7 +199,7 @@ fn build_devices(
     keyboard_sink: &mut Option<virtio_input::InputHandle>,
     tablet_sink: &mut Option<virtio_input::InputHandle>,
 ) -> Result<BuiltDevices, String> {
-    let mut devices: Vec<Box<dyn VirtioDevice>> = Vec::with_capacity(cfg.disks.len() + 4);
+    let mut devices: Vec<Box<dyn VirtioDevice>> = Vec::with_capacity(cfg.disks.len() + 5);
     for disk in &cfg.disks {
         let device = virtio_block::BlockDevice::open(&disk.path, disk.writable)
             .map_err(|e| format!("cannot attach disk {}: {e}", disk.path.display()))?;
@@ -208,6 +208,20 @@ fn build_devices(
             writable = disk.writable,
             capacity_sectors = device.capacity_sectors(),
             "attaching virtio-blk device"
+        );
+        devices.push(Box::new(device));
+    }
+
+    // The CD-ROM, always read-only and always *after* the disks, so adding one
+    // to an existing profile never renames /dev/vda (config validation already
+    // pinned this to uefi + pci, where the firmware enumerates it itself).
+    if let Some(cdrom) = &cfg.cdrom {
+        let device = virtio_block::BlockDevice::open(&cdrom.path, false)
+            .map_err(|e| format!("cannot attach cdrom {}: {e}", cdrom.path.display()))?;
+        tracing::info!(
+            path = %cdrom.path.display(),
+            capacity_sectors = device.capacity_sectors(),
+            "attaching virtio-blk cdrom (read-only)"
         );
         devices.push(Box::new(device));
     }
@@ -276,14 +290,37 @@ fn build_devices(
     })
 }
 
-pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
-    run_with(cfg, headless, None).map(|_| ())
+/// A debug screenshot: write the scanout as PNG `after` this much VM runtime,
+/// then refresh the same file every [`SCREENSHOT_REFRESH`] until the VM stops
+/// — so a slow graphical boot can be watched from outside by re-reading one
+/// path.
+///
+/// Best effort by design — the timer thread is detached, so a VM that stops
+/// before the first write simply never produces the file. It exists to give an
+/// unattended run (`--headless` on a CI box, a GNOME boot someone wants
+/// evidence of) an artifact without instrumenting the guest.
+#[derive(Debug, Clone)]
+pub struct ScreenshotRequest {
+    pub after: Duration,
+    pub path: PathBuf,
+}
+
+/// How often the debug screenshot is refreshed after its first write.
+const SCREENSHOT_REFRESH: Duration = Duration::from_secs(20);
+
+pub fn run(
+    cfg: VmConfig,
+    headless: bool,
+    screenshot: Option<ScreenshotRequest>,
+) -> Result<(), String> {
+    run_with(cfg, headless, None, screenshot).map(|_| ())
 }
 
 pub fn run_with(
     cfg: VmConfig,
     headless: bool,
     automation: Option<Automation>,
+    screenshot: Option<ScreenshotRequest>,
 ) -> Result<RunReport, String> {
     let span = tracing::info_span!("vm", id = %cfg.name);
     let _guard = span.enter();
@@ -325,6 +362,30 @@ pub fn run_with(
         (Some(k), Some(t)) => (k, t),
         _ => return Err("input devices were not built".into()),
     };
+
+    // The debug screenshot timer (--screenshot-after). Detached on purpose:
+    // waiting for it would hold a finished VM open for the rest of the timer.
+    if let Some(request) = screenshot {
+        let handle = display_handle.clone();
+        std::thread::Builder::new()
+            .name("screenshot-timer".into())
+            .spawn(move || {
+                std::thread::sleep(request.after);
+                loop {
+                    match handle.screenshot(&request.path) {
+                        Ok(()) => {
+                            tracing::info!(path = %request.path.display(), "debug screenshot written")
+                        }
+                        Err(e) => {
+                            tracing::warn!(path = %request.path.display(), error = %e,
+                                "debug screenshot failed")
+                        }
+                    }
+                    std::thread::sleep(SCREENSHOT_REFRESH);
+                }
+            })
+            .map_err(|e| format!("cannot spawn the screenshot timer: {e}"))?;
+    }
 
     // The UEFI variable store (UEFI-1804). Opened before the bus so the bus can
     // carry it, and before the firmware is loaded so a bad NVRAM path fails
@@ -980,24 +1041,25 @@ fn extend_cmdline(configured: &str, clauses: &str) -> String {
 mod tests {
     use super::{direct_linux_cmdline, extend_cmdline};
 
-    /// `control_api` bounds `memory_mib` so a too-large guest is a typed config
-    /// error, but it deliberately does not depend on the machine crate — so the
-    /// number it uses is a copy, and this is the only place that sees both.
-    /// Without it, a change to the memory layout would silently turn a rejected
-    /// config back into a panic inside `machine_x86::e820_map`.
+    /// `control_api` bounds `memory_mib` but deliberately does not depend on
+    /// the machine crate, so this is the place that sees both: the largest
+    /// allowed guest must actually build an E820 map, and — since the high-RAM
+    /// split — one that puts everything above the 32-bit MMIO hole at 4 GiB
+    /// rather than on top of the hole.
     #[test]
-    fn the_config_memory_ceiling_is_the_machines_mmio_hole() {
-        assert_eq!(
-            control_api::MAX_MEMORY_MIB << 20,
-            machine_x86::layout::MMIO_HOLE_START,
-            "control_api::MAX_MEMORY_MIB and machine_x86::layout::MMIO_HOLE_START disagree"
-        );
-        // And the largest allowed guest really does build an E820 map.
-        let map = machine_x86::e820_map(control_api::MAX_MEMORY_MIB << 20);
-        assert_eq!(
-            map.iter().map(|e| e.size).sum::<u64>(),
-            control_api::MAX_MEMORY_MIB << 20
-        );
+    fn the_largest_allowed_guest_builds_a_valid_e820_map() {
+        let bytes = control_api::MAX_MEMORY_MIB << 20;
+        let map = machine_x86::e820_map(bytes);
+        assert_eq!(map.iter().map(|e| e.size).sum::<u64>(), bytes);
+        for e in &map {
+            let end = e.addr + e.size;
+            assert!(
+                end <= machine_x86::layout::MMIO_HOLE_START
+                    || e.addr >= machine_x86::layout::TOP_OF_32BIT,
+                "{:#x}..{end:#x} intrudes into the MMIO hole",
+                e.addr
+            );
+        }
     }
 
     #[test]

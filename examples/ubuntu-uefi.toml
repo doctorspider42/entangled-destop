@@ -41,10 +41,14 @@
 # every write request in software, so neither a firmware bug nor a malicious
 # guest can scribble on verified media.
 #
-# 2560 MiB is a deliberate ceiling-adjacent choice: subiquity wants ~2 GiB, and
-# this machine's RAM stops at the 32-bit MMIO hole (3072 MiB) until the high-RAM
-# split lands, so 4096 is not available to ask for — `entangled run` says so
-# instead of asserting deep inside the E820 builder.
+# 2560 MiB: subiquity wants ~2 GiB and gains nothing from more. (Bigger guests
+# are legal — RAM above the 32-bit MMIO hole continues at 4 GiB since the
+# high-RAM split; examples/ubuntu-desktop-live.toml uses 4096.)
+#
+# Since the [cdrom] section exists, the read-only-ISO-as-a-disk pattern below
+# can also be written as `[cdrom] path = "..."` — or supplied per run with
+# `entangled run --cdrom <iso>` and no media in the profile at all. This file
+# keeps the explicit pair because the device *order* matters to an install.
 name = "ubuntu-uefi"
 memory_mib = 2560
 vcpus = 2

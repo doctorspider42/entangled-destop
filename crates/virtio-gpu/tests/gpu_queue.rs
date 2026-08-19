@@ -563,9 +563,15 @@ fn advertises_the_gpu_identity_features_and_config_space() {
     let mut h = Harness::new(64, 64);
     let features = h.device_features();
     assert_ne!(features & VIRTIO_F_VERSION_1, 0);
+    assert_ne!(
+        features & virtio_gpu::VIRTIO_GPU_F_EDID,
+        0,
+        "EDID is offered (MVP-811): GNOME/mutter builds its outputs from it"
+    );
     assert_eq!(
-        features, VIRTIO_F_VERSION_1,
-        "MVP offers no VIRGL, no EDID, no blob resources"
+        features,
+        VIRTIO_F_VERSION_1 | virtio_gpu::VIRTIO_GPU_F_EDID,
+        "no VIRGL (3D is post-MVP), no blob resources"
     );
 
     let [events_read, events_clear, num_scanouts, num_capsets] = h.config();
@@ -920,25 +926,147 @@ fn detach_and_unref_tear_the_resource_down() {
     assert_ok(&h.run(&create_2d(1, FORMAT_B8G8R8X8_UNORM, SIDE, SIDE)));
 }
 
-#[test]
-fn cursor_queue_chains_are_returned_without_a_response() {
-    // MVP-812 is not implemented, but the buffers must come back: Linux sleeps
-    // on a full cursor queue.
-    let mut h = Harness::new(16, 16);
-    let update_cursor = Request::new(cmd::UPDATE_CURSOR).u32(0).u32(0);
-    h.write_mem(REQ_ADDR, update_cursor.bytes());
-    let cursor = h.cursor;
-    let len = u32::try_from(update_cursor.len()).expect("small");
-    h.submit(&cursor, &[(REQ_ADDR, len, 0)]);
-    h.notify(1);
+/// A well-formed `virtio_gpu_update_cursor` for either cursor command.
+fn cursor_command(kind: u32, x: u32, y: u32, resource_id: u32, hot: (u32, u32)) -> Request {
+    Request::new(kind)
+        .u32(0) // pos.scanout_id
+        .u32(x)
+        .u32(y)
+        .u32(0) // pos.padding
+        .u32(resource_id)
+        .u32(hot.0)
+        .u32(hot.1)
+        .u32(0) // padding
+}
 
-    let (head, used_len) = h.last_used(&cursor);
-    assert_eq!(head, 0);
-    assert_eq!(used_len, 0, "cursor commands carry no response payload");
-    assert_eq!(h.transport.status() & status::DEVICE_NEEDS_RESET, 0);
+impl Harness {
+    /// Submits one chain on the cursor queue (no device-writable part — that
+    /// is how Linux submits cursor commands) and asserts it comes back with a
+    /// zero used length and a healthy device.
+    fn run_cursor(&mut self, request: &Request) {
+        self.write_mem(REQ_ADDR, request.bytes());
+        let cursor = self.cursor;
+        let len = u32::try_from(request.len()).expect("small");
+        self.submit(&cursor, &[(REQ_ADDR, len, 0)]);
+        self.notify(1);
+        let (head, used_len) = self.last_used(&cursor);
+        assert_eq!(head, 0);
+        assert_eq!(used_len, 0, "cursor commands carry no response payload");
+        assert_eq!(self.transport.status() & status::DEVICE_NEEDS_RESET, 0);
+    }
+}
+
+#[test]
+fn cursor_queue_chains_are_returned_even_when_malformed() {
+    // A truncated cursor command is dropped, but the buffers must come back:
+    // Linux sleeps on a full cursor queue.
+    let mut h = Harness::new(16, 16);
+    let truncated = Request::new(cmd::UPDATE_CURSOR).u32(0).u32(0);
+    h.run_cursor(&truncated);
 
     // The control queue is unaffected.
     assert_eq!(h.run(&get_display_info()).kind(), resp::OK_DISPLAY_INFO);
+}
+
+#[test]
+fn the_cursor_plane_is_composited_moved_and_hidden() {
+    // MVP-812: a 2x2 opaque red cursor over a blue 16x16 scanout.
+    let mut h = Harness::new(16, 16);
+    h.fill_backing(FB_ADDR, 16, 16, BLUE_BGRA);
+    h.setup_scanout(1, 16, 16, FB_ADDR);
+    assert_ok(&h.run(&transfer_to_host(1, rect(0, 0, 16, 16), 0)));
+    assert_ok(&h.run(&resource_flush(1, rect(0, 0, 16, 16))));
+
+    // The cursor image is its own 2D resource; ARGB (B8G8R8A8) with a=0xff is
+    // premultiplied opaque red.
+    let cursor_fb = FB_ADDR + 0x4000;
+    assert_ok(&h.run(&create_2d(2, FORMAT_B8G8R8A8_UNORM, 2, 2)));
+    h.fill_backing(cursor_fb, 2, 2, RED_BGRA);
+    assert_ok(&h.run(&attach_backing(2, &[(cursor_fb, 2 * 2 * 4)])));
+    assert_ok(&h.run(&transfer_to_host(2, rect(0, 0, 2, 2), 0)));
+
+    // Show it with the hotspot (1,1) landing on (8,8): the image's top-left
+    // pixel is at (7,7).
+    h.run_cursor(&cursor_command(cmd::UPDATE_CURSOR, 8, 8, 2, (1, 1)));
+    let shot = h.screenshot();
+    assert_eq!(shot.px(7, 7), RED_RGBA, "cursor pixel");
+    assert_eq!(shot.px(8, 8), RED_RGBA, "hotspot pixel");
+    assert_eq!(shot.px(0, 0), BLUE_RGBA, "base pixels are untouched");
+    assert_eq!(shot.px(9, 9), BLUE_RGBA, "past the 2x2 image");
+
+    // Move it to the top-left corner: the old position is restored from the
+    // guest pixels, and the clip handles the hotspot hanging off the edge.
+    h.run_cursor(&cursor_command(cmd::MOVE_CURSOR, 0, 0, 0, (0, 0)));
+    let shot = h.screenshot();
+    assert_eq!(shot.px(0, 0), RED_RGBA, "cursor followed the move");
+    assert_eq!(shot.px(8, 8), BLUE_RGBA, "old position restored");
+
+    // Resource 0 hides the plane.
+    h.run_cursor(&cursor_command(cmd::UPDATE_CURSOR, 0, 0, 0, (0, 0)));
+    let shot = h.screenshot();
+    assert_eq!(shot.px(0, 0), BLUE_RGBA, "cursor hidden");
+
+    // And the guest's own framebuffer was never written to compose any of it.
+    assert_eq!(h.read_mem(FB_ADDR, 4), BLUE_BGRA.to_vec());
+}
+
+#[test]
+fn bogus_cursor_commands_are_dropped_without_breaking_the_device() {
+    let mut h = Harness::new(16, 16);
+    h.fill_backing(FB_ADDR, 16, 16, GREEN_BGRA);
+    h.setup_scanout(1, 16, 16, FB_ADDR);
+    assert_ok(&h.run(&transfer_to_host(1, rect(0, 0, 16, 16), 0)));
+    assert_ok(&h.run(&resource_flush(1, rect(0, 0, 16, 16))));
+
+    // Unknown resource, bogus scanout, and an image over the cursor cap: each
+    // is dropped, the chain comes back, nothing shows.
+    h.run_cursor(&cursor_command(cmd::UPDATE_CURSOR, 4, 4, 99, (0, 0)));
+    let huge = virtio_gpu::MAX_CURSOR_DIM + 4;
+    assert_ok(&h.run(&create_2d(3, FORMAT_B8G8R8A8_UNORM, huge, 4)));
+    h.run_cursor(&cursor_command(cmd::UPDATE_CURSOR, 4, 4, 3, (0, 0)));
+    let mut bad_scanout = cursor_command(cmd::UPDATE_CURSOR, 4, 4, 1, (0, 0));
+    bad_scanout.0[CTRL_HDR_LEN..CTRL_HDR_LEN + 4].copy_from_slice(&7u32.to_le_bytes());
+    h.run_cursor(&bad_scanout);
+
+    let shot = h.screenshot();
+    assert_eq!(shot.px(4, 4), GREEN_RGBA, "no cursor was composited");
+    // The control queue still works.
+    assert_eq!(h.run(&get_display_info()).kind(), resp::OK_DISPLAY_INFO);
+}
+
+#[test]
+fn get_edid_returns_a_valid_block_for_the_scanout() {
+    let mut h = Harness::new(1920, 1080);
+    let request = Request::new(cmd::GET_EDID).u32(0).u32(0);
+    let response = h.run_with_capacity(&request, 2048);
+    assert_eq!(response.kind(), resp::OK_EDID);
+    assert_eq!(
+        response.used_len as usize,
+        CTRL_HDR_LEN + 8 + 1024,
+        "struct virtio_gpu_resp_edid is 1056 bytes"
+    );
+    let body = response.body();
+    let size = u32::from_le_bytes(body[0..4].try_into().expect("4 bytes"));
+    assert_eq!(size, 128, "one EDID base block");
+    let edid = &body[8..8 + 128];
+    assert_eq!(
+        &edid[0..8],
+        &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]
+    );
+    let sum: u8 = edid.iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+    assert_eq!(sum, 0, "EDID checksum");
+    // The preferred detailed timing carries the scanout resolution.
+    let d = &edid[54..72];
+    let h_active = u32::from(d[2]) | ((u32::from(d[4]) >> 4) << 8);
+    let v_active = u32::from(d[5]) | ((u32::from(d[7]) >> 4) << 8);
+    assert_eq!((h_active, v_active), (1920, 1080));
+
+    // A scanout the device does not have.
+    let request = Request::new(cmd::GET_EDID).u32(5).u32(0);
+    assert_err(
+        &h.run_with_capacity(&request, 2048),
+        resp::ERR_INVALID_SCANOUT_ID,
+    );
 }
 
 #[test]

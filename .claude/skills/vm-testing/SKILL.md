@@ -271,6 +271,36 @@ Or drive it by hand, which is the same machine with a window:
 cargo run -p entangled -- run examples/ubuntu-uefi.toml   # edit the disk paths first
 ```
 
+## Booting any ISO generically (`--cdrom`), and the GNOME desktop
+
+```bash
+iso=$(bash scripts/fetch-ubuntu-iso.sh desktop)     # ~6 GiB, verified
+cargo run -p entangled -- run --cdrom "$iso" examples/ubuntu-desktop-live.toml
+```
+
+`--cdrom <iso>` (or a `[cdrom] path = "..."` section) attaches the ISO
+read-only as the *last* virtio-blk device and lets the firmware boot it —
+UEFI-1803's machinery as one flag, no hand-written `[[disk]]` pair. It is
+refused outside `mode = "uefi"` + `transport = "pci"` at config time.
+The desktop profile is 4096 MiB (the high-RAM split: RAM above the 32-bit MMIO
+hole continues at 4 GiB) and reaches the GNOME live session in a few minutes of
+llvmpipe; `--screenshot-after N` writes the scanout as PNG after N seconds and
+refreshes it every 20 s, which is how an unattended graphical boot is watched.
+
+Two `#[ignore]`d tests pin this path:
+
+- `cargo test -p entangled --test cdrom_boot -- --ignored --nocapture` — the
+  CLI plumbing: a diskless UEFI profile + `--cdrom` reaches GRUB (~1 min, uses
+  the newest cached ISO, either variant).
+- `cargo test -p boot-tests --test desktop_gnome -- --ignored --nocapture` —
+  the Desktop ISO to GNOME: types `console=ttyS0` into GRUB (the install
+  command's trick) so the *guest kernel's* log is assertable — `smp: Brought
+  up 1 node, 4 CPUs` in the UEFI run path, `virtio_gpu` bound, systemd reaching
+  the graphical target. `ENTANGLED_DESKTOP_SHOT=<png>` +
+  `ENTANGLED_DESKTOP_LINGER=<secs>` capture the desktop itself. GNOME needs the
+  cursor plane (mutter's pointer lives on it) and EDID, both in `virtio-gpu`
+  since MVP-811/812.
+
 ## Installing Ubuntu, and booting what was installed (UEFI-1804)
 
 ```bash

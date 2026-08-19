@@ -31,13 +31,14 @@ pub mod cmd {
     pub const RESOURCE_ATTACH_BACKING: u32 = 0x0106;
     pub const RESOURCE_DETACH_BACKING: u32 = 0x0107;
 
-    /// `VIRTIO_GPU_CMD_GET_EDID` — needs `VIRTIO_GPU_F_EDID`, which the MVP
-    /// does not offer (MVP-811, P1). Listed so the dispatcher can log it by
-    /// name when a curious driver tries anyway.
+    /// `VIRTIO_GPU_CMD_GET_EDID` — gated on `VIRTIO_GPU_F_EDID` (MVP-811),
+    /// which the device offers: GNOME/mutter sizes and names its outputs from
+    /// the EDID when the driver has one.
     pub const GET_EDID: u32 = 0x010a;
 
-    /// Cursor-queue commands (MVP-812, P1). The cursor queue is drained but
-    /// the commands are not acted upon yet.
+    /// Cursor-queue commands (MVP-812): the hardware-cursor plane. mutter
+    /// composites the pointer onto this plane, so a device that drains and
+    /// ignores these shows a desktop with an invisible pointer.
     pub const UPDATE_CURSOR: u32 = 0x0300;
     pub const MOVE_CURSOR: u32 = 0x0301;
 }
@@ -46,6 +47,7 @@ pub mod cmd {
 pub mod resp {
     pub const OK_NODATA: u32 = 0x1100;
     pub const OK_DISPLAY_INFO: u32 = 0x1101;
+    pub const OK_EDID: u32 = 0x1104;
     pub const ERR_UNSPEC: u32 = 0x1200;
     pub const ERR_OUT_OF_MEMORY: u32 = 0x1201;
     pub const ERR_INVALID_SCANOUT_ID: u32 = 0x1202;
@@ -73,6 +75,13 @@ pub const MEM_ENTRY_LEN: usize = 16;
 /// Length of `struct virtio_gpu_config`.
 pub const CONFIG_LEN: usize = 16;
 
+/// Length of the EDID blob in `struct virtio_gpu_resp_edid` — always 1024 on
+/// the wire, however much of it the actual EDID uses.
+pub const EDID_BLOB_LEN: usize = 1024;
+/// Length of the `struct virtio_gpu_resp_edid` body (after the header):
+/// `size`, `padding`, then the fixed blob.
+pub const EDID_BODY_LEN: usize = 8 + EDID_BLOB_LEN;
+
 // Compile-time layout gate: a typo in the constants above would silently
 // mis-parse every guest command.
 const _: () = {
@@ -87,6 +96,9 @@ const _: () = {
     assert!(ResourceFlush::LEN == 48);
     assert!(TransferToHost2d::LEN == 56);
     assert!(AttachBacking::LEN == 32);
+    assert!(GetEdid::LEN == 32);
+    assert!(CtrlHdr::LEN + EDID_BODY_LEN == 1056);
+    assert!(UpdateCursor::LEN == 56);
 };
 
 // ------------------------------------------------------------ byte helpers
@@ -475,6 +487,65 @@ impl MemEntry {
     }
 }
 
+/// `struct virtio_gpu_get_edid` (MVP-811): which scanout's EDID is wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GetEdid {
+    pub scanout: u32,
+}
+
+impl GetEdid {
+    /// Wire length including the header (`scanout` + `padding`).
+    pub const LEN: usize = CTRL_HDR_LEN + 8;
+
+    /// Parses the command from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        Some(Self {
+            scanout: le32(bytes, CTRL_HDR_LEN),
+        })
+    }
+}
+
+/// `struct virtio_gpu_update_cursor` (MVP-812) — the layout of both cursor
+/// commands. `UPDATE_CURSOR` uses every field; `MOVE_CURSOR` only `pos`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateCursor {
+    /// `pos.scanout_id`.
+    pub scanout_id: u32,
+    /// Cursor position on the scanout, in scanout coordinates. Unsigned on the
+    /// wire (`le32`); the hotspot subtraction that can go negative is the
+    /// host's to do, in wider arithmetic.
+    pub x: u32,
+    pub y: u32,
+    /// The 2D resource holding the cursor image, or 0 to hide the cursor.
+    pub resource_id: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+}
+
+impl UpdateCursor {
+    /// Wire length including the header: `virtio_gpu_cursor_pos` (16) +
+    /// `resource_id`, `hot_x`, `hot_y`, `padding`.
+    pub const LEN: usize = CTRL_HDR_LEN + 16 + 16;
+
+    /// Parses the command from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        Some(Self {
+            scanout_id: le32(bytes, CTRL_HDR_LEN),
+            x: le32(bytes, CTRL_HDR_LEN + 4),
+            y: le32(bytes, CTRL_HDR_LEN + 8),
+            resource_id: le32(bytes, CTRL_HDR_LEN + 16),
+            hot_x: le32(bytes, CTRL_HDR_LEN + 20),
+            hot_y: le32(bytes, CTRL_HDR_LEN + 24),
+        })
+    }
+}
+
 // ---------------------------------------------------------------- responses
 
 /// One entry of the `GET_DISPLAY_INFO` reply (`struct
@@ -497,6 +568,18 @@ pub fn display_info_body(modes: &[DisplayOne]) -> [u8; DISPLAY_INFO_BODY_LEN] {
         put32(&mut out, at + RECT_LEN, u32::from(mode.enabled));
         put32(&mut out, at + RECT_LEN + 4, mode.flags);
     }
+    out
+}
+
+/// Encodes the body of `struct virtio_gpu_resp_edid`: the actual EDID bytes at
+/// the front of the fixed 1024-byte blob, `size` saying how many are real.
+/// EDID data longer than the blob is truncated to it (cannot happen with the
+/// one 128-byte block [`crate::edid`] builds, but this function must not).
+pub fn edid_body(edid: &[u8]) -> Box<[u8; EDID_BODY_LEN]> {
+    let mut out = Box::new([0u8; EDID_BODY_LEN]);
+    let len = edid.len().min(EDID_BLOB_LEN);
+    put32(&mut out[..], 0, len as u32);
+    out[8..8 + len].copy_from_slice(&edid[..len]);
     out
 }
 
@@ -782,6 +865,44 @@ mod tests {
         // More modes than the wire array holds are ignored, not overflowed.
         let many = vec![DisplayOne::default(); MAX_SCANOUTS + 4];
         assert_eq!(display_info_body(&many).len(), DISPLAY_INFO_BODY_LEN);
+    }
+
+    #[test]
+    fn cursor_and_edid_commands_parse_field_by_field() {
+        // struct virtio_gpu_update_cursor, spec 5.7.6.10.
+        let mut buf = vec![0u8; UpdateCursor::LEN];
+        put32(&mut buf, CTRL_HDR_LEN, 0); // pos.scanout_id
+        put32(&mut buf, CTRL_HDR_LEN + 4, 640); // pos.x
+        put32(&mut buf, CTRL_HDR_LEN + 8, 360); // pos.y
+        put32(&mut buf, CTRL_HDR_LEN + 16, 7); // resource_id
+        put32(&mut buf, CTRL_HDR_LEN + 20, 3); // hot_x
+        put32(&mut buf, CTRL_HDR_LEN + 24, 5); // hot_y
+        let cmd = UpdateCursor::parse(&buf).expect("parses");
+        assert_eq!(cmd.scanout_id, 0);
+        assert_eq!((cmd.x, cmd.y), (640, 360));
+        assert_eq!(cmd.resource_id, 7);
+        assert_eq!((cmd.hot_x, cmd.hot_y), (3, 5));
+        assert_eq!(UpdateCursor::parse(&buf[..UpdateCursor::LEN - 1]), None);
+
+        let mut buf = vec![0u8; GetEdid::LEN];
+        put32(&mut buf, CTRL_HDR_LEN, 0);
+        assert_eq!(GetEdid::parse(&buf), Some(GetEdid { scanout: 0 }));
+        assert_eq!(GetEdid::parse(&buf[..GetEdid::LEN - 1]), None);
+    }
+
+    #[test]
+    fn edid_body_carries_the_size_and_pads_the_blob() {
+        let edid = [0xabu8; 128];
+        let body = edid_body(&edid);
+        assert_eq!(body.len(), EDID_BODY_LEN);
+        assert_eq!(le32(&body[..], 0), 128, "size");
+        assert_eq!(le32(&body[..], 4), 0, "padding");
+        assert_eq!(&body[8..8 + 128], &edid[..]);
+        assert!(body[8 + 128..].iter().all(|b| *b == 0), "blob tail is zero");
+        // Oversized input is truncated to the wire blob, never overflowed.
+        let huge = vec![1u8; EDID_BLOB_LEN + 512];
+        let body = edid_body(&huge);
+        assert_eq!(le32(&body[..], 0), EDID_BLOB_LEN as u32);
     }
 
     #[test]

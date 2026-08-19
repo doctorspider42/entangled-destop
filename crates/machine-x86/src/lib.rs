@@ -70,22 +70,21 @@ pub struct E820Entry {
 /// Builds the guest E820 map for a VM with `mem_size` bytes of RAM.
 ///
 /// Layout follows the PC convention: usable low memory below the EBDA, a
-/// reserved hole between 640 KiB and 1 MiB (VGA/BIOS shadow), then usable RAM
-/// from 1 MiB up to `mem_size`. RAM above 4 GiB (when `mem_size` crosses the
-/// 32-bit MMIO hole) is not implemented yet — MVP guests fit below 3 GiB.
+/// reserved hole between 640 KiB and 1 MiB (VGA/BIOS shadow), usable RAM from
+/// 1 MiB up to at most the 32-bit MMIO hole ([`layout::MMIO_HOLE_START`]) —
+/// and, for guests bigger than that, the remainder as high RAM starting at
+/// 4 GiB ([`layout::TOP_OF_32BIT`]). The hole itself is never RAM: the PCI
+/// aperture, the virtio-mmio window, LAPIC/IOAPIC and the pflash window live
+/// there, and `vmm_core::create_guest_memory` allocates the same two-region
+/// shape (the cross-check test is below).
 ///
 /// The reserved hole is split so the ACPI tables
 /// ([`layout::ACPI_TABLES_START`]) get their own ACPI-reclaimable entry. They
 /// would already be protected by the surrounding reserved range; the separate
 /// entry is what tells a guest OS *why* the range is special.
 pub fn e820_map(mem_size: u64) -> Vec<E820Entry> {
-    assert!(
-        mem_size <= layout::MMIO_HOLE_START,
-        "guests larger than {} bytes need a high-RAM split (post-MVP)",
-        layout::MMIO_HOLE_START
-    );
     let acpi_end = layout::ACPI_TABLES_START + layout::ACPI_TABLES_SIZE;
-    vec![
+    let mut map = vec![
         E820Entry {
             addr: 0,
             size: layout::EBDA_START,
@@ -108,10 +107,18 @@ pub fn e820_map(mem_size: u64) -> Vec<E820Entry> {
         },
         E820Entry {
             addr: layout::HIGH_RAM_START,
-            size: mem_size - layout::HIGH_RAM_START,
+            size: mem_size.min(layout::MMIO_HOLE_START) - layout::HIGH_RAM_START,
             kind: E820Type::Ram,
         },
-    ]
+    ];
+    if mem_size > layout::MMIO_HOLE_START {
+        map.push(E820Entry {
+            addr: layout::TOP_OF_32BIT,
+            size: mem_size - layout::MMIO_HOLE_START,
+            kind: E820Type::Ram,
+        });
+    }
+    map
 }
 
 #[cfg(test)]
@@ -128,6 +135,65 @@ mod tests {
             cursor += e.size;
         }
         assert_eq!(cursor, mem);
+    }
+
+    /// A guest bigger than the hole splits: low RAM stops exactly at the hole,
+    /// high RAM starts exactly at 4 GiB, nothing is described in between, and
+    /// the total mapped bytes still equal the requested size.
+    #[test]
+    fn big_guests_get_a_high_ram_entry_above_4_gib() {
+        let mem = 6 * 1024 * 1024 * 1024u64; // 6 GiB
+        let map = e820_map(mem);
+        let mut cursor = 0u64;
+        for e in &map {
+            assert!(e.addr >= cursor, "overlap at {:#x}", e.addr);
+            // The only permitted gap is the MMIO hole itself.
+            if e.addr != cursor {
+                assert_eq!(cursor, layout::MMIO_HOLE_START, "gap below the hole");
+                assert_eq!(e.addr, layout::TOP_OF_32BIT, "high RAM must start at 4 GiB");
+            }
+            cursor = e.addr + e.size;
+        }
+        assert_eq!(
+            map.iter().map(|e| e.size).sum::<u64>(),
+            mem,
+            "every requested byte must be described"
+        );
+        let high = map.last().expect("entries");
+        assert_eq!(high.kind, E820Type::Ram);
+        assert_eq!(high.addr, layout::TOP_OF_32BIT);
+        assert_eq!(high.size, mem - layout::MMIO_HOLE_START);
+        // And nothing — RAM or otherwise — is described inside the hole.
+        for e in &map {
+            let end = e.addr + e.size;
+            assert!(
+                end <= layout::MMIO_HOLE_START || e.addr >= layout::TOP_OF_32BIT,
+                "{:#x}..{end:#x} intrudes into the MMIO hole",
+                e.addr
+            );
+        }
+    }
+
+    /// A guest exactly at the hole stays below it — no empty high entry.
+    #[test]
+    fn a_guest_exactly_at_the_hole_has_no_high_entry() {
+        let map = e820_map(layout::MMIO_HOLE_START);
+        assert!(map
+            .iter()
+            .all(|e| e.addr + e.size <= layout::MMIO_HOLE_START));
+        assert_eq!(
+            map.iter().map(|e| e.size).sum::<u64>(),
+            layout::MMIO_HOLE_START
+        );
+    }
+
+    /// vmm-core allocates guest memory in the same two-region shape this map
+    /// describes, from its own copies of the two boundary constants (it must
+    /// not depend on this crate). This is the test that keeps them equal.
+    #[test]
+    fn layout_agrees_with_vmm_core_memory_split() {
+        assert_eq!(vmm_core::LOW_RAM_END, layout::MMIO_HOLE_START);
+        assert_eq!(vmm_core::HIGH_RAM_START, layout::TOP_OF_32BIT);
     }
 
     #[test]

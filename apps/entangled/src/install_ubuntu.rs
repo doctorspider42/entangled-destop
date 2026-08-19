@@ -55,13 +55,15 @@ use crate::InstallArgs;
 /// The firmware built by `guest/firmware/build-cloudhv.sh`.
 const FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
 
-/// Installer VM size. subiquity wants ~2 GiB; this machine's RAM stops at the
-/// 32-bit MMIO hole (3072 MiB), so 2560 is the same generous-but-legal choice
-/// `examples/ubuntu-uefi.toml` documents.
+/// Installer VM size. subiquity wants ~2 GiB; 2560 is the generous choice
+/// `examples/ubuntu-uefi.toml` documents. (Guests above 3072 MiB are legal
+/// since the high-RAM split, but the text installer gains nothing from more.)
 const INSTALLER_MEMORY_MIB: u64 = 2560;
 
-/// What the installed system gets. Less than the installer needs: nothing is
-/// unpacking a 1.2 GiB squashfs any more.
+/// What the installed system gets when `--memory-mib` was left at its default.
+/// Less than the installer needs: nothing is unpacking a 1.2 GiB squashfs any
+/// more. An explicit `--memory-mib` above this carries through to the written
+/// profile — a desktop install sized at 4096 must not boot into 2048.
 const INSTALLED_MEMORY_MIB: u64 = 2048;
 
 pub fn run(args: &InstallArgs) -> Result<(), String> {
@@ -181,6 +183,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         .into_iter()
         .flatten()
         .collect(),
+        cdrom: None,
         network: None,
         display: DisplaySection {
             width: 1280,
@@ -210,6 +213,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             script: Box::new(move |log| script.step(log)),
             transcript: Some(transcript.clone()),
         }),
+        None,
     )
     .map_err(|e| format!("installer VM failed: {e}"))?;
 
@@ -256,7 +260,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     //    key that makes this profile work more than once.
     let profile = VmConfig {
         name: vm_name.clone(),
-        memory_mib: INSTALLED_MEMORY_MIB,
+        memory_mib: args.memory_mib.max(INSTALLED_MEMORY_MIB),
         vcpus: 2,
         transport: VirtioTransport::Pci,
         boot: BootSection {
@@ -269,6 +273,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             path: args.disk.clone(),
             writable: true,
         }],
+        cdrom: None,
         network: None,
         display: DisplaySection {
             width: 1280,
@@ -321,8 +326,9 @@ const INSTALL_MARKERS: &[&str] = &[
 
 /// GRUB's menu, drawn on ttyS0 by the EFI console. Waiting for the *entry* text
 /// rather than for the version banner means the menu is really up and a
-/// keystroke will be seen.
-const MENU_MARKER: &str = "Try or Install Ubuntu Server";
+/// keystroke will be seen. Without "Server", because the Desktop ISO's entry is
+/// "Try or Install Ubuntu" — this prefix matches both variants' menus.
+const MENU_MARKER: &str = "Try or Install Ubuntu";
 
 /// GRUB's command-line prompt. One appears after `c`, and one after every
 /// command completes — which is exactly the acknowledgement each line needs.
