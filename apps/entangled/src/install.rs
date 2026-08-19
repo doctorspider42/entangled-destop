@@ -31,8 +31,8 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 
 use crate::disk;
-use crate::diskfs;
 use crate::InstallArgs;
+use disk_image as diskfs;
 
 /// Static guest address matching scripts/setup-tap.sh's defaults
 /// (host side 192.168.73.1/24).

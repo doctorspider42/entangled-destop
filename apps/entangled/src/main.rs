@@ -1,10 +1,6 @@
 //! `entangled` — the CLI control surface for the Entangled Desktop VMM.
 
 mod disk;
-/// MBR and ext4 parsing, used only by `install`, which is Linux-only: on Windows
-/// the whole module is dead code and `-D warnings` says so.
-#[cfg(target_os = "linux")]
-mod diskfs;
 mod doctor;
 mod fetch;
 #[cfg(target_os = "linux")]
@@ -102,6 +98,39 @@ enum DiskCommand {
         #[arg(long)]
         size: String,
     },
+    /// Report sizes (apparent vs on-disk), partition table, filesystems and
+    /// the .nvram sidecar of a disk image.
+    Inspect {
+        path: PathBuf,
+        /// Machine-readable JSON instead of the human rendering.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Grow a disk image (sparse). Shrinking is refused — it would destroy
+    /// guest data at the end of the image.
+    Resize {
+        path: PathBuf,
+        /// New size such as 48G; must be at least the current size.
+        #[arg(long)]
+        size: String,
+    },
+    /// Remove a disk image and its .nvram sidecar. Refuses while a VM profile
+    /// (next to the disk, or in the manager's VM directory) references it.
+    Rm {
+        path: PathBuf,
+        /// Remove even while profiles still reference the disk.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Move a disk image (and its .nvram sidecar) to another directory or
+    /// drive: sparse-preserving, verified before the source is deleted, and
+    /// referencing profiles are updated.
+    Move {
+        path: PathBuf,
+        /// Destination directory (created if missing).
+        #[arg(long)]
+        to: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -170,12 +199,13 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
-        Command::Disk(DiskCommand::Create { path, size }) => {
-            let bytes = disk::parse_size(&size).map_err(|e| e.to_string())?;
-            disk::create_raw(&path, bytes).map_err(|e| e.to_string())?;
-            println!("created {} ({} bytes, sparse)", path.display(), bytes);
-            Ok(())
-        }
+        Command::Disk(command) => match command {
+            DiskCommand::Create { path, size } => disk::create(&path, &size),
+            DiskCommand::Inspect { path, json } => disk::inspect(&path, json),
+            DiskCommand::Resize { path, size } => disk::resize(&path, &size),
+            DiskCommand::Rm { path, force } => disk::rm(&path, force),
+            DiskCommand::Move { path, to } => disk::mv(&path, &to),
+        },
         Command::Doctor => doctor::run(),
         Command::Fetch(args) => fetch::run(&args),
         Command::Install(args) => {

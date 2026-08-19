@@ -18,6 +18,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 control-api.workspace = true
 debian-media.workspace = true
+disk-image.workspace = true
 vmm-core.workspace = true
 
 # The run path (run_vm.rs) is portable across the two hypervisor hosts; these

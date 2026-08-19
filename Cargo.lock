@@ -1047,6 +1047,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-image"
+version = "0.2.0"
+dependencies = [
+ "control-api",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "toml",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1348,6 +1363,7 @@ dependencies = [
  "clap",
  "control-api",
  "debian-media",
+ "disk-image",
  "display",
  "flate2",
  "libc",

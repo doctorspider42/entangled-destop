@@ -1,15 +1,12 @@
-//! Post-install disk inspection (backlog MVP-1008/1009, UEFI-1804): find the
-//! installed root partition in the RAW image and read its ext4 UUID, so the
-//! generated VM profile can boot with `root=UUID=…`, and — for a UEFI install —
-//! prove the disk really carries a GPT with an EFI System Partition.
+//! Partition-table and filesystem-probe parsing for RAW disk images: the MBR
+//! (what the Debian preseed installer writes), the GPT (what the Ubuntu
+//! autoinstall path writes, UEFI-1804), and the ext4 superblock probe that
+//! turns "a partition" into "the installed root" (MVP-1008/1009).
 //!
-//! Two partitioning schemes, because the two installers produce different
-//! disks: the Debian preseed path (`mode = "direct-linux"`) writes an MBR with a
-//! type-0x83 root, and the Ubuntu autoinstall path (`mode = "uefi"`) writes a
-//! GPT with an ESP plus a Linux filesystem. [`find_installed_root`] reads the
-//! first, [`find_uefi_install`] the second, and each refuses the other's disk by
-//! name rather than by looking corrupt; the two share nothing beyond the ext4
-//! superblock read.
+//! Besides the two install-verification entry points ([`find_installed_root`],
+//! [`find_uefi_install`]) this module exposes the neutral
+//! [`read_partition_table`], which reports whatever table a disk carries — the
+//! basis of `entangled disk inspect` and the manager's Disks view.
 //!
 //! # Everything here is untrusted input
 //!
@@ -29,16 +26,18 @@ use std::path::Path;
 use thiserror::Error;
 
 pub const SECTOR: u64 = 512;
-const MBR_SIGNATURE_OFFSET: usize = 510;
-const PARTITION_TABLE_OFFSET: usize = 446;
-const PARTITION_ENTRY_LEN: usize = 16;
-const TYPE_LINUX: u8 = 0x83;
-const TYPE_GPT_PROTECTIVE: u8 = 0xee;
+pub(crate) const MBR_SIGNATURE_OFFSET: usize = 510;
+pub(crate) const PARTITION_TABLE_OFFSET: usize = 446;
+pub(crate) const PARTITION_ENTRY_LEN: usize = 16;
+pub(crate) const TYPE_LINUX: u8 = 0x83;
+pub(crate) const TYPE_GPT_PROTECTIVE: u8 = 0xee;
 
 // ext4 superblock lives 1024 bytes into the partition.
-const EXT4_SUPERBLOCK_OFFSET: u64 = 1024;
-const EXT4_MAGIC_OFFSET: usize = 0x38;
-const EXT4_UUID_OFFSET: usize = 0x68;
+pub(crate) const EXT4_SUPERBLOCK_OFFSET: u64 = 1024;
+pub(crate) const EXT4_MAGIC_OFFSET: usize = 0x38;
+pub(crate) const EXT4_UUID_OFFSET: usize = 0x68;
+/// `s_volume_name`: 16 bytes, NUL-padded.
+pub(crate) const EXT4_LABEL_OFFSET: usize = 0x78;
 
 #[derive(Debug, Error)]
 pub enum DiskFsError {
@@ -161,6 +160,22 @@ pub fn parse_mbr(sector0: &[u8; 512]) -> Result<Vec<Partition>, DiskFsError> {
     Ok(parts)
 }
 
+/// Human name of an MBR partition type byte — reporting only, never policy.
+pub fn mbr_type_name(type_byte: u8) -> &'static str {
+    match type_byte {
+        0x01 | 0x04 | 0x06 | 0x0e => "FAT",
+        0x05 | 0x0f => "extended",
+        0x07 => "NTFS/exFAT",
+        0x0b | 0x0c => "FAT32",
+        0x82 => "Linux swap",
+        0x83 => "Linux",
+        0x8e => "Linux LVM",
+        0xee => "GPT protective",
+        0xef => "EFI system (FAT)",
+        _ => "unknown",
+    }
+}
+
 /// Result of a successful post-install inspection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledRoot {
@@ -222,7 +237,7 @@ pub fn find_installed_root(disk: &Path) -> Result<InstalledRoot, DiskFsError> {
 /// the last two big-endian ("mixed endian"). Stored as the raw 16 bytes so that
 /// comparisons never depend on getting that mixture right twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Guid([u8; 16]);
+pub struct Guid(pub(crate) [u8; 16]);
 
 impl Guid {
     /// The registry form: `C12A7328-F81F-11D2-BA4B-00A0C93EC93B`.
@@ -294,8 +309,45 @@ pub const LINUX_ROOT_X64_TYPE: Guid = Guid::from_parts(
     [0x96, 0xe7, 0xfb, 0xca, 0xf9, 0x84, 0xb7, 0x09],
 );
 
-const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
-const GPT_REVISION_1_0: u32 = 0x0001_0000;
+/// Linux swap.
+pub const LINUX_SWAP_TYPE: Guid = Guid::from_parts(
+    0x0657_fd6d,
+    0xa4ab,
+    0x43c4,
+    [0x84, 0xe5, 0x09, 0x33, 0xc8, 0x4b, 0x4f, 0x4f],
+);
+
+/// BIOS boot partition ("Hah!IdontNeedEFI"), what grub's MBR-on-GPT uses.
+pub const BIOS_BOOT_TYPE: Guid = Guid::from_parts(
+    0x2168_6148,
+    0x6449,
+    0x6e6f,
+    [0x74, 0x4e, 0x65, 0x65, 0x64, 0x45, 0x46, 0x49],
+);
+
+/// Microsoft basic data (NTFS/exFAT/FAT on a GPT disk).
+pub const MS_BASIC_DATA_TYPE: Guid = Guid::from_parts(
+    0xebd0_a0a2,
+    0xb9e5,
+    0x4433,
+    [0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7],
+);
+
+/// Human name of a GPT partition type GUID — reporting only, never policy.
+pub fn gpt_type_name(type_guid: &Guid) -> &'static str {
+    match *type_guid {
+        t if t == ESP_TYPE => "EFI System",
+        t if t == LINUX_FS_TYPE => "Linux filesystem",
+        t if t == LINUX_ROOT_X64_TYPE => "Linux root (x86-64)",
+        t if t == LINUX_SWAP_TYPE => "Linux swap",
+        t if t == BIOS_BOOT_TYPE => "BIOS boot",
+        t if t == MS_BASIC_DATA_TYPE => "Microsoft basic data",
+        _ => "unknown",
+    }
+}
+
+pub(crate) const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
+pub(crate) const GPT_REVISION_1_0: u32 = 0x0001_0000;
 const GPT_HEADER_MIN: u32 = 92;
 const GPT_HEADER_CRC_OFFSET: usize = 16;
 
@@ -304,9 +356,9 @@ const GPT_HEADER_CRC_OFFSET: usize = 16;
 /// bytes); real disks use exactly that. 512 entries of at most 4 KiB is 2 MiB,
 /// which is generous by two orders of magnitude and still a fixed ceiling — a
 /// header claiming `0xffff_ffff` entries must not become a 512 GiB `Vec`.
-const GPT_MAX_ENTRIES: u32 = 512;
-const GPT_MAX_ENTRY_SIZE: u32 = 4096;
-const GPT_MIN_ENTRY_SIZE: u32 = 128;
+pub(crate) const GPT_MAX_ENTRIES: u32 = 512;
+pub(crate) const GPT_MAX_ENTRY_SIZE: u32 = 4096;
+pub(crate) const GPT_MIN_ENTRY_SIZE: u32 = 128;
 
 /// The GPT header fields this project uses. Field names follow UEFI 2.10 §5.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,7 +443,9 @@ pub fn find_uefi_install(disk: &Path) -> Result<UefiInstall, DiskFsError> {
     read_uefi_install(&mut file)
 }
 
-fn read_uefi_install<R: Read + Seek>(reader: &mut R) -> Result<UefiInstall, DiskFsError> {
+pub(crate) fn read_uefi_install<R: Read + Seek>(
+    reader: &mut R,
+) -> Result<UefiInstall, DiskFsError> {
     let image_len = reader.seek(SeekFrom::End(0))?;
     let (header, partitions) = read_gpt(reader, image_len)?;
 
@@ -425,6 +479,57 @@ fn read_uefi_install<R: Read + Seek>(reader: &mut R) -> Result<UefiInstall, Disk
         root,
         root_uuid,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Neutral table reading (disk inspect / the manager's Disks view)
+// ---------------------------------------------------------------------------
+
+/// Whatever partitioning a disk image carries.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionTable {
+    /// No table at all — a blank (freshly created) image.
+    Empty,
+    /// A classic MBR with at least one used primary entry.
+    Mbr(Vec<Partition>),
+    /// A GPT (validated: signature, both CRCs, bounds, no overlaps).
+    Gpt {
+        header: GptHeader,
+        partitions: Vec<GptPartition>,
+    },
+}
+
+/// Reads whichever partition table `disk` carries. A blank image is
+/// [`PartitionTable::Empty`], not an error; a *corrupt* GPT is still refused
+/// with the same typed errors the install verifiers raise — inspection must
+/// not "best effort" a table whose checksums fail.
+pub fn read_partition_table(disk: &Path) -> Result<PartitionTable, DiskFsError> {
+    let mut file = std::fs::File::open(disk)?;
+    let image_len = file.metadata()?.len();
+    read_partition_table_from(&mut file, image_len)
+}
+
+/// [`read_partition_table`] over any reader (tests use in-memory images).
+pub fn read_partition_table_from<R: Read + Seek>(
+    reader: &mut R,
+    image_len: u64,
+) -> Result<PartitionTable, DiskFsError> {
+    if image_len < SECTOR {
+        return Ok(PartitionTable::Empty);
+    }
+    let mut sector0 = [0u8; 512];
+    reader.seek(SeekFrom::Start(0))?;
+    reader.read_exact(&mut sector0)?;
+    match parse_mbr(&sector0) {
+        Ok(parts) if parts.is_empty() => Ok(PartitionTable::Empty),
+        Ok(parts) => Ok(PartitionTable::Mbr(parts)),
+        Err(DiskFsError::NoMbr) => Ok(PartitionTable::Empty),
+        Err(DiskFsError::Gpt) => {
+            let (header, partitions) = read_gpt(reader, image_len)?;
+            Ok(PartitionTable::Gpt { header, partitions })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Parses the primary GPT header at LBA 1 and its entry array.
@@ -613,7 +718,7 @@ fn le64(bytes: &[u8], at: usize) -> u64 {
 /// module must build on every host (the compression crate that could provide one
 /// is Linux-only here), and a checksum used to *reject* untrusted input is worth
 /// having a local test for.
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &byte in data {
         crc ^= u32::from(byte);
@@ -626,12 +731,22 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// Reads the ext4 UUID of the filesystem starting at `partition_offset`, or
-/// None when there is no ext4 magic there.
-fn ext4_uuid<R: Read + Seek>(
+/// What an ext4 superblock probe reports (all of it guest data).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ext4Info {
+    /// Lower-case hyphenated filesystem UUID.
+    pub uuid: String,
+    /// `s_volume_name`, when set (lossily decoded, NUL-trimmed).
+    pub label: Option<String>,
+}
+
+/// Probes for an ext4 superblock at `partition_offset` and reports its UUID
+/// and volume label. `Ok(None)` when there is no ext4 magic there (or the
+/// image is too short — an uninstalled disk, not an error).
+pub fn ext4_info<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
-) -> Result<Option<String>, DiskFsError> {
+) -> Result<Option<Ext4Info>, DiskFsError> {
     let Some(sb_offset) = partition_offset.checked_add(EXT4_SUPERBLOCK_OFFSET) else {
         return Ok(None);
     };
@@ -644,30 +759,34 @@ fn ext4_uuid<R: Read + Seek>(
         return Ok(None);
     }
     let u = &sb[EXT4_UUID_OFFSET..EXT4_UUID_OFFSET + 16];
-    Ok(Some(format!(
+    let uuid = format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13],
         u[14], u[15]
-    )))
+    );
+    let raw_label = &sb[EXT4_LABEL_OFFSET..EXT4_LABEL_OFFSET + 16];
+    let end = raw_label.iter().position(|&b| b == 0).unwrap_or(16);
+    let label = String::from_utf8_lossy(&raw_label[..end]).into_owned();
+    Ok(Some(Ext4Info {
+        uuid,
+        label: (!label.is_empty()).then_some(label),
+    }))
+}
+
+/// Reads the ext4 UUID of the filesystem starting at `partition_offset`, or
+/// None when there is no ext4 magic there.
+fn ext4_uuid<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Result<Option<String>, DiskFsError> {
+    Ok(ext4_info(reader, partition_offset)?.map(|info| info.uuid))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::{mbr_with, temp_disk, GptBuilder};
     use std::io::Write;
-
-    fn mbr_with(entries: &[(usize, u8, u32, u32)]) -> [u8; 512] {
-        let mut s = [0u8; 512];
-        s[510] = 0x55;
-        s[511] = 0xaa;
-        for &(slot, type_byte, start, sectors) in entries {
-            let base = PARTITION_TABLE_OFFSET + slot * PARTITION_ENTRY_LEN;
-            s[base + 4] = type_byte;
-            s[base + 8..base + 12].copy_from_slice(&start.to_le_bytes());
-            s[base + 12..base + 16].copy_from_slice(&sectors.to_le_bytes());
-        }
-        s
-    }
 
     #[test]
     fn parses_a_typical_debian_layout() {
@@ -685,12 +804,6 @@ mod tests {
         assert!(matches!(parse_mbr(&[0u8; 512]), Err(DiskFsError::NoMbr)));
         let gpt = mbr_with(&[(0, TYPE_GPT_PROTECTIVE, 1, 100)]);
         assert!(matches!(parse_mbr(&gpt), Err(DiskFsError::Gpt)));
-    }
-
-    fn temp_disk(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("entangled-diskfs-tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(format!("{name}-{}.raw", std::process::id()))
     }
 
     #[test]
@@ -712,11 +825,28 @@ mod tests {
             0xaa, 0xbb,
         ])
         .unwrap();
+        // A volume label too, for the ext4_info probe.
+        f.seek(SeekFrom::Start(sb_at + EXT4_LABEL_OFFSET as u64))
+            .unwrap();
+        f.write_all(b"rootfs\0").unwrap();
         drop(f);
 
         let root = find_installed_root(&path).unwrap();
         assert_eq!(root.partition, 1);
         assert_eq!(root.uuid, "deadbeef-0011-2233-4455-66778899aabb");
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let info = ext4_info(&mut file, 4 * 512).unwrap().expect("ext4");
+        assert_eq!(info.label.as_deref(), Some("rootfs"));
+
+        // The neutral reader sees the same MBR.
+        match read_partition_table(&path).unwrap() {
+            PartitionTable::Mbr(parts) => {
+                assert_eq!(parts.len(), 1);
+                assert_eq!(parts[0].type_byte, 0x83);
+            }
+            other => panic!("expected an MBR, got {other:?}"),
+        }
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -731,6 +861,17 @@ mod tests {
             find_installed_root(&path),
             Err(DiskFsError::NoMbr)
         ));
+        // The neutral reader reports Empty rather than an error: a fresh image
+        // is a normal thing to inspect.
+        assert_eq!(read_partition_table(&path).unwrap(), PartitionTable::Empty);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_zero_length_image_is_empty_not_an_io_error() {
+        let path = temp_disk("zero");
+        std::fs::File::create(&path).unwrap();
+        assert_eq!(read_partition_table(&path).unwrap(), PartitionTable::Empty);
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -785,123 +926,29 @@ mod tests {
         assert!(Guid([0; 16]).is_zero());
     }
 
-    /// A GPT image built the way an installer builds one: protective MBR,
-    /// header at LBA 1, 128 entries of 128 bytes at LBA 2, both CRCs correct.
-    struct GptBuilder {
-        sectors: u64,
-        entries: Vec<(Guid, u64, u64, &'static str)>,
-        entry_count: u32,
-        entry_size: u32,
-        entry_lba: u64,
-        break_header_crc: bool,
-        break_entries_crc: bool,
-    }
-
-    impl GptBuilder {
-        fn new(sectors: u64) -> Self {
-            Self {
-                sectors,
-                entries: Vec::new(),
-                entry_count: 128,
-                entry_size: 128,
-                entry_lba: 2,
-                break_header_crc: false,
-                break_entries_crc: false,
-            }
-        }
-
-        fn part(mut self, type_guid: Guid, first: u64, last: u64, name: &'static str) -> Self {
-            self.entries.push((type_guid, first, last, name));
-            self
-        }
-
-        /// A finished Ubuntu-style layout: 1 MiB ESP then the rest as root.
-        fn ubuntu_layout(self) -> Self {
-            let last = self.sectors - 34;
-            self.part(ESP_TYPE, 2048, 4095, "EFI System Partition")
-                .part(LINUX_FS_TYPE, 4096, last, "")
-        }
-
-        fn image(&self) -> Vec<u8> {
-            let mut image = vec![0u8; (self.sectors * SECTOR) as usize];
-            // Protective MBR.
-            image[MBR_SIGNATURE_OFFSET] = 0x55;
-            image[MBR_SIGNATURE_OFFSET + 1] = 0xaa;
-            image[PARTITION_TABLE_OFFSET + 4] = TYPE_GPT_PROTECTIVE;
-
-            // Entry array. The builder's own arithmetic is saturating because
-            // the adversarial cases below set these fields to values whose
-            // product does not fit in 32 bits — the *parser* must refuse them,
-            // so the fixture must be able to express them.
-            let array_len = usize::try_from(
-                u64::from(self.entry_count)
-                    .saturating_mul(u64::from(self.entry_size))
-                    .min(1 << 20),
-            )
-            .unwrap_or(1 << 20);
-            let mut array = vec![0u8; array_len];
-            for (i, (type_guid, first, last, name)) in self.entries.iter().enumerate() {
-                let at = i * self.entry_size as usize;
-                // A deliberately absurd entry_size can push an entry out of the
-                // clamped fixture; the parser refuses those shapes long before
-                // it reads an entry, so there is nothing to plant.
-                if at + 128 > array.len() {
-                    break;
-                }
-                array[at..at + 16].copy_from_slice(&type_guid.0);
-                // Unique GUID: any non-zero value.
-                array[at + 16..at + 32].copy_from_slice(&[(i as u8) + 1; 16]);
-                array[at + 32..at + 40].copy_from_slice(&first.to_le_bytes());
-                array[at + 40..at + 48].copy_from_slice(&last.to_le_bytes());
-                for (u, unit) in name.encode_utf16().enumerate().take(36) {
-                    let n = at + 56 + u * 2;
-                    array[n..n + 2].copy_from_slice(&unit.to_le_bytes());
-                }
-            }
-            let mut entries_crc = crc32(&array);
-            if self.break_entries_crc {
-                entries_crc ^= 0xffff_ffff;
-            }
-            let array_at =
-                usize::try_from(self.entry_lba.saturating_mul(SECTOR)).unwrap_or(usize::MAX);
-            if array_at.saturating_add(array_len) <= image.len() {
-                image[array_at..array_at + array_len].copy_from_slice(&array);
-            }
-
-            // Header.
-            let mut header = vec![0u8; 92];
-            header[..8].copy_from_slice(GPT_SIGNATURE);
-            header[8..12].copy_from_slice(&GPT_REVISION_1_0.to_le_bytes());
-            header[12..16].copy_from_slice(&92u32.to_le_bytes());
-            header[24..32].copy_from_slice(&1u64.to_le_bytes()); // MyLBA
-            header[32..40].copy_from_slice(&(self.sectors - 1).to_le_bytes()); // AlternateLBA
-            header[40..48].copy_from_slice(&34u64.to_le_bytes()); // FirstUsableLBA
-            header[48..56].copy_from_slice(&(self.sectors - 34).to_le_bytes());
-            header[56..72].copy_from_slice(&[0xab; 16]); // DiskGUID
-            header[72..80].copy_from_slice(&self.entry_lba.to_le_bytes());
-            header[80..84].copy_from_slice(&self.entry_count.to_le_bytes());
-            header[84..88].copy_from_slice(&self.entry_size.to_le_bytes());
-            header[88..92].copy_from_slice(&entries_crc.to_le_bytes());
-            let mut header_crc = crc32(&header);
-            if self.break_header_crc {
-                header_crc ^= 0xffff_ffff;
-            }
-            header[16..20].copy_from_slice(&header_crc.to_le_bytes());
-            image[SECTOR as usize..SECTOR as usize + header.len()].copy_from_slice(&header);
-            image
-        }
-
-        /// The image with an ext4 superblock planted at the start of the
-        /// partition whose 1-based index is `index`.
-        fn with_ext4(self, index: usize, uuid: [u8; 16]) -> Vec<u8> {
-            let mut image = self.image();
-            let (_, first, _, _) = self.entries[index - 1];
-            let sb = (first * SECTOR + EXT4_SUPERBLOCK_OFFSET) as usize;
-            image[sb + EXT4_MAGIC_OFFSET] = 0x53;
-            image[sb + EXT4_MAGIC_OFFSET + 1] = 0xef;
-            image[sb + EXT4_UUID_OFFSET..sb + EXT4_UUID_OFFSET + 16].copy_from_slice(&uuid);
-            image
-        }
+    #[test]
+    fn type_names_cover_the_installer_layouts() {
+        assert_eq!(mbr_type_name(0x83), "Linux");
+        assert_eq!(mbr_type_name(0x82), "Linux swap");
+        assert_eq!(mbr_type_name(0x05), "extended");
+        assert_eq!(mbr_type_name(0x42), "unknown");
+        assert_eq!(gpt_type_name(&ESP_TYPE), "EFI System");
+        assert_eq!(gpt_type_name(&LINUX_FS_TYPE), "Linux filesystem");
+        assert_eq!(gpt_type_name(&LINUX_SWAP_TYPE), "Linux swap");
+        assert_eq!(gpt_type_name(&Guid([0x42; 16])), "unknown");
+        // The registry strings of the added GUIDs, straight from the spec.
+        assert_eq!(
+            LINUX_SWAP_TYPE.to_string(),
+            "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F"
+        );
+        assert_eq!(
+            BIOS_BOOT_TYPE.to_string(),
+            "21686148-6449-6E6F-744E-656564454649"
+        );
+        assert_eq!(
+            MS_BASIC_DATA_TYPE.to_string(),
+            "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"
+        );
     }
 
     fn inspect_bytes(bytes: &[u8]) -> Result<UefiInstall, DiskFsError> {
@@ -936,6 +983,17 @@ mod tests {
             Some("12345678-9abc-def0-1122-334455667788")
         );
         assert_eq!(install.disk_guid.to_string().len(), 36);
+
+        // The neutral reader reports the same two partitions.
+        let mut cursor = std::io::Cursor::new(image.clone());
+        match read_partition_table_from(&mut cursor, image.len() as u64).unwrap() {
+            PartitionTable::Gpt { header, partitions } => {
+                assert_eq!(partitions.len(), 2);
+                assert_eq!(partitions[0].type_guid, ESP_TYPE);
+                assert_eq!(header.disk_guid.to_string().len(), 36);
+            }
+            other => panic!("expected a GPT, got {other:?}"),
+        }
     }
 
     /// Each reader must refuse the other's disk, and say which kind it found —
@@ -944,10 +1002,7 @@ mod tests {
     /// corruption.
     #[test]
     fn the_two_readers_refuse_each_others_disks() {
-        let dir = std::env::temp_dir().join("entangled-diskfs-tests");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let gpt_path = dir.join(format!("gpt-{}.raw", std::process::id()));
+        let gpt_path = temp_disk("dispatch-gpt");
         std::fs::write(
             &gpt_path,
             GptBuilder::new(TEST_SECTORS)
@@ -1054,6 +1109,14 @@ mod tests {
         broken.break_header_crc = true;
         assert!(matches!(
             inspect_bytes(&broken.image()),
+            Err(DiskFsError::GptHeaderCrc { .. })
+        ));
+        // The neutral reader refuses it just the same — inspection is not a
+        // "best effort" path.
+        let broken_image = broken.image();
+        let mut cursor = std::io::Cursor::new(broken_image.clone());
+        assert!(matches!(
+            read_partition_table_from(&mut cursor, broken_image.len() as u64),
             Err(DiskFsError::GptHeaderCrc { .. })
         ));
 
@@ -1222,10 +1285,10 @@ mod tests {
     fn partition_names_are_decoded_defensively() {
         assert_eq!(utf16_name(&[]), "");
         let mut bytes = Vec::new();
-        for unit in "boot ✓".encode_utf16() {
+        for unit in "boot \u{2713}".encode_utf16() {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
-        assert_eq!(utf16_name(&bytes), "boot ✓");
+        assert_eq!(utf16_name(&bytes), "boot \u{2713}");
         // Unpaired high surrogate, then a NUL: lossy, and it terminates.
         assert_eq!(
             utf16_name(&[0x00, 0xd8, 0x00, 0x00, 0x41, 0x00])

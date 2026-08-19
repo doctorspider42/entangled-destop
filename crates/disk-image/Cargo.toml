@@ -1,0 +1,35 @@
+[package]
+name = "disk-image"
+description = "RAW disk image toolkit: MBR/GPT/ext4 inspection, sparse-aware create/resize/move, profile reference scanning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+control-api.workspace = true
+
+# statvfs for the free-space check; SEEK_DATA/SEEK_HOLE for the sparse copy.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Allocated size (GetCompressedFileSizeW), free space (GetDiskFreeSpaceExW),
+# sparse files (FSCTL_SET_SPARSE) and allocated-range enumeration
+# (FSCTL_QUERY_ALLOCATED_RANGES) on NTFS.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+
+[lints]
+workspace = true

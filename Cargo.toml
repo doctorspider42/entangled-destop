@@ -24,6 +24,7 @@ members = [
     "crates/display",
     "crates/debian-media",
     "crates/control-api",
+    "crates/disk-image",
     "apps/entangled",
     "apps/manager",
     "tests/boot",
@@ -54,6 +55,7 @@ virtio-input = { path = "crates/virtio-input", version = "0.2.0" }
 display = { path = "crates/display", version = "0.2.0" }
 debian-media = { path = "crates/debian-media", version = "0.2.0" }
 control-api = { path = "crates/control-api", version = "0.2.0" }
+disk-image = { path = "crates/disk-image", version = "0.2.0" }
 
 # rust-vmm (Linux-only, gate behind cfg(target_os = "linux"))
 kvm-ioctls = "0.24"
