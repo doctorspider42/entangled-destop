@@ -82,6 +82,40 @@ pub enum CommandError {
 
     #[error("scanout mode {width}x{height} cannot be encoded as an EDID timing")]
     UnencodableMode { width: u32, height: u32 },
+
+    // ------------------------------------------------- 3D (GPU-002…GPU-008)
+    #[error("no such rendering context: {0}")]
+    UnknownContext(u32),
+
+    #[error("rendering context {0} already exists (or id 0 was used)")]
+    BadContextId(u32),
+
+    #[error("host rendering-context limit reached")]
+    TooManyContexts,
+
+    #[error("context type {0} is not supported (classic virgl only)")]
+    UnsupportedContextType(u32),
+
+    #[error("no such capset: id {id} version {version}")]
+    UnknownCapset { id: u32, version: u32 },
+
+    #[error("3D resource geometry is empty or beyond the host limits")]
+    BadGeometry3d,
+
+    #[error("box {b:?} does not fit level {level} of the resource")]
+    BoxOutOfBounds {
+        b: crate::protocol::Box3d,
+        level: u32,
+    },
+
+    #[error("malformed 3D command stream: {0}")]
+    InvalidStream(&'static str),
+
+    #[error("3D command stream of {0} bytes exceeds the submit limit")]
+    StreamTooLarge(usize),
+
+    #[error("the host renderer rejected the command: {0}")]
+    Renderer(String),
 }
 
 impl CommandError {
@@ -102,15 +136,25 @@ impl CommandError {
             | Self::Unreadable { .. }
             | Self::Display(_)
             | Self::CursorTooLarge { .. }
-            | Self::UnencodableMode { .. } => resp::ERR_INVALID_PARAMETER,
+            | Self::UnencodableMode { .. }
+            | Self::UnsupportedContextType(_)
+            | Self::UnknownCapset { .. }
+            | Self::BadGeometry3d
+            | Self::BoxOutOfBounds { .. }
+            | Self::InvalidStream(_)
+            | Self::StreamTooLarge(_) => resp::ERR_INVALID_PARAMETER,
 
             Self::ZeroResourceId | Self::UnknownResource(_) | Self::DuplicateResource(_) => {
                 resp::ERR_INVALID_RESOURCE_ID
             }
 
+            Self::UnknownContext(_) | Self::BadContextId(_) | Self::TooManyContexts => {
+                resp::ERR_INVALID_CONTEXT_ID
+            }
+
             Self::UnknownScanout(_) => resp::ERR_INVALID_SCANOUT_ID,
             Self::OutOfMemory => resp::ERR_OUT_OF_MEMORY,
-            Self::UnsupportedCommand(_) => resp::ERR_UNSPEC,
+            Self::UnsupportedCommand(_) | Self::Renderer(_) => resp::ERR_UNSPEC,
         }
     }
 }

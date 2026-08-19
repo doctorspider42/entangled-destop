@@ -46,13 +46,15 @@ use vm_memory::{Bytes, GuestAddress};
 
 use crate::error::CommandError;
 use crate::protocol::{
-    cmd, config_bytes, display_info_body, edid_body, resp, AttachBacking, CtrlHdr, DisplayOne,
-    GetEdid, MemEntry, Rect, ResourceCreate2d, ResourceFlush, ResourceUnref, SetScanout,
-    TransferToHost2d, UpdateCursor, CONFIG_LEN, MEM_ENTRY_LEN,
+    capset_info_body, cmd, config_bytes, display_info_body, edid_body, resp, AttachBacking,
+    CmdSubmit3d, CtrlHdr, CtxCreate, CtxResource, DisplayOne, GetCapset, GetCapsetInfo, GetEdid,
+    MemEntry, Rect, ResourceCreate2d, ResourceCreate3d, ResourceFlush, ResourceUnref, SetScanout,
+    Transfer3d, TransferToHost2d, UpdateCursor, CONFIG_LEN, MEM_ENTRY_LEN,
 };
+use crate::renderer::{Gpu3d, Renderer3d, MAX_SUBMIT_BYTES};
 use crate::resource::{ResourceTable, MAX_BACKING_ENTRIES};
 use crate::sink::ScanoutSink;
-use crate::{MAX_CURSOR_DIM, VIRTIO_GPU_F_EDID};
+use crate::{MAX_CURSOR_DIM, VIRTIO_GPU_F_EDID, VIRTIO_GPU_F_VIRGL};
 
 /// controlq and cursorq, in queue order (spec section 5.7.2).
 pub const NUM_QUEUES: usize = 2;
@@ -66,15 +68,24 @@ static QUEUE_MAX_SIZES: [u16; NUM_QUEUES] = [MAX_QUEUE_SIZE, MAX_QUEUE_SIZE];
 /// Scanouts (virtual displays) the device exposes. One window, one scanout.
 pub const NUM_SCANOUTS: u32 = 1;
 
-/// Capability sets. Zero: no VirGL/3D in the MVP, so the guest never asks for
-/// `GET_CAPSET_INFO`.
+/// Capability sets in 2D mode. Zero: without a renderer the guest never asks
+/// for `GET_CAPSET_INFO`. With one, the count comes from [`Gpu3d`].
 pub const NUM_CAPSETS: u32 = 0;
 
-/// Largest command the device will gather, i.e. an attach-backing carrying the
-/// maximum entry count. Bounds the staging buffer a guest can make the host
-/// allocate (~256 KiB).
+/// Largest command the 2D device will gather, i.e. an attach-backing carrying
+/// the maximum entry count. Bounds the staging buffer a guest can make the
+/// host allocate (~256 KiB).
 pub const MAX_COMMAND_BYTES: usize =
     AttachBacking::LEN + MAX_BACKING_ENTRIES as usize * MEM_ENTRY_LEN;
+
+/// Largest command with a 3D renderer attached: a `SUBMIT_3D` carrying the
+/// full stream budget ([`MAX_SUBMIT_BYTES`]). Still a named, tested bound —
+/// just a bigger one, because command streams dwarf backing lists.
+pub const MAX_COMMAND_BYTES_3D: usize = CmdSubmit3d::LEN + MAX_SUBMIT_BYTES;
+
+// The 3D cap must never regress below the 2D one, or attach-backing commands
+// would start failing the moment a renderer is attached.
+const _: () = assert!(MAX_COMMAND_BYTES_3D > MAX_COMMAND_BYTES);
 
 /// Hard bound on how many chains one notification processes, so a guest that
 /// keeps refilling the ring from another vCPU cannot pin this thread forever.
@@ -86,6 +97,9 @@ struct ScanoutBinding {
     resource_id: u32,
     /// Region of the resource the scanout shows; its size is the guest mode.
     rect: Rect,
+    /// Whether the resource lives in the 3D renderer (flushes read back
+    /// through it) or in the host 2D table.
+    three_d: bool,
 }
 
 /// One control-command result: a response code plus an optional body.
@@ -125,6 +139,9 @@ impl Reply {
 pub struct GpuDevice<S: ScanoutSink> {
     display: S,
     resources: ResourceTable,
+    /// The 3D half (ADR-0004): validation front + host renderer. `None` in
+    /// the 2D-only device, and then no 3D feature or command exists.
+    three_d: Option<Gpu3d>,
     scanout: Option<ScanoutBinding>,
     /// `events_read` of `struct virtio_gpu_config`. Nothing raises events in
     /// the MVP (they are for hot-plugged displays / EDID changes), so this
@@ -166,11 +183,12 @@ impl<S: ScanoutSink> GpuDevice<S> {
         Self {
             display,
             resources: ResourceTable::new(),
+            three_d: None,
             scanout: None,
             events_read: 0,
             // EDID (MVP-811) because GNOME/mutter builds its outputs from it;
-            // still no VIRGL (3D is post-MVP) and no resource UUID / blob
-            // resources.
+            // no resource UUID / blob resources. VIRGL is added by
+            // [`Self::with_renderer`] only.
             features: VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID,
             acked_features: 0,
             req_buf: Vec::new(),
@@ -181,6 +199,35 @@ impl<S: ScanoutSink> GpuDevice<S> {
             cursor: None,
             interrupt: None,
         }
+    }
+
+    /// Builds the device with a host 3D renderer attached (ADR-0004): offers
+    /// `VIRTIO_GPU_F_VIRGL`, serves the renderer's capsets and accepts the 3D
+    /// command set. `renderer` must actually render — hosts without one use
+    /// [`Self::new`] so the guest stays on its own software GL.
+    pub fn with_renderer(display: S, renderer: Box<dyn Renderer3d>) -> Self {
+        let mut device = Self::new(display);
+        device.features |= VIRTIO_GPU_F_VIRGL;
+        device.three_d = Some(Gpu3d::new(renderer));
+        device
+    }
+
+    /// Largest command this device gathers — the 3D bound when a renderer is
+    /// attached ([`MAX_COMMAND_BYTES_3D`]), the 2D one otherwise.
+    fn max_command_bytes(&self) -> usize {
+        if self.three_d.is_some() {
+            MAX_COMMAND_BYTES_3D
+        } else {
+            MAX_COMMAND_BYTES
+        }
+    }
+
+    /// The 3D validation front, or the in-band error every 3D command gets on
+    /// a 2D-only device.
+    fn three_d_mut(&mut self, kind: u32) -> Result<&mut Gpu3d, CommandError> {
+        self.three_d
+            .as_mut()
+            .ok_or(CommandError::UnsupportedCommand(kind))
     }
 
     /// The host display this device presents to.
@@ -314,7 +361,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         };
         let mut request = std::mem::take(&mut self.req_buf);
         request.clear();
-        let gathered = gather_request(mem, readable, &mut request);
+        let gathered = gather_request(mem, readable, &mut request, self.max_command_bytes());
         let result = gathered
             .and_then(|()| {
                 CtrlHdr::parse(&request).ok_or(CommandError::Truncated {
@@ -349,11 +396,19 @@ impl<S: ScanoutSink> GpuDevice<S> {
             tracing::debug!("virtio-gpu cursor hidden");
             return Ok(());
         }
-        let resource = self
-            .resources
-            .get(cursor.resource_id)
-            .ok_or(CommandError::UnknownResource(cursor.resource_id))?;
-        let (width, height) = (resource.width(), resource.height());
+        // Either half may own the cursor image (in virgl mode the guest
+        // kernel creates it through RESOURCE_CREATE_3D like everything else).
+        let (width, height, three_d) = match self.resources.get(cursor.resource_id) {
+            Some(resource) => (resource.width(), resource.height(), false),
+            None => {
+                let desc = self
+                    .three_d
+                    .as_ref()
+                    .and_then(|gpu| gpu.desc(cursor.resource_id))
+                    .ok_or(CommandError::UnknownResource(cursor.resource_id))?;
+                (desc.width, desc.height, true)
+            }
+        };
         if width == 0 || height == 0 || width > MAX_CURSOR_DIM || height > MAX_CURSOR_DIM {
             return Err(CommandError::CursorTooLarge { width, height });
         }
@@ -366,9 +421,25 @@ impl<S: ScanoutSink> GpuDevice<S> {
             height,
         };
         let mut scratch = std::mem::take(&mut self.flush_buf);
-        let outcome = match resource.rect_bytes(full, &mut scratch) {
-            Some(pixels) => self
-                .display
+        let pixels =
+            if three_d {
+                self.three_d_mut(cmd::UPDATE_CURSOR)
+                    .and_then(|gpu| gpu.read_rect_bgra(cursor.resource_id, full, &mut scratch))
+                    .map(|()| scratch.as_slice())
+            } else {
+                match self.resources.get(cursor.resource_id) {
+                    Some(resource) => resource.rect_bytes(full, &mut scratch).ok_or(
+                        CommandError::RectOutOfBounds {
+                            rect: full,
+                            width,
+                            height,
+                        },
+                    ),
+                    None => Err(CommandError::UnknownResource(cursor.resource_id)),
+                }
+            };
+        let outcome = pixels.and_then(|pixels| {
+            self.display
                 .set_cursor(
                     width,
                     height,
@@ -378,13 +449,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
                     cursor.y,
                     pixels,
                 )
-                .map_err(|error| CommandError::Display(error.to_string())),
-            None => Err(CommandError::RectOutOfBounds {
-                rect: full,
-                width,
-                height,
-            }),
-        };
+                .map_err(|error| CommandError::Display(error.to_string()))
+        });
         self.flush_buf = scratch;
         outcome?;
         tracing::debug!(
@@ -416,7 +482,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
     /// Never returns an error: see the module-level failure policy.
     fn handle_command(
         &mut self,
-        mem: &GuestMem,
+        mem: &Arc<GuestMem>,
         desc_table: u64,
         queue_size: u16,
         head: u16,
@@ -450,7 +516,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // mutably; always put back.
         let mut request = std::mem::take(&mut self.req_buf);
         request.clear();
-        let gathered = gather_request(mem, readable, &mut request);
+        let gathered = gather_request(mem, readable, &mut request, self.max_command_bytes());
         let (resp_hdr, body) = match gathered.and_then(|()| {
             CtrlHdr::parse(&request).ok_or(CommandError::Truncated {
                 kind: 0,
@@ -498,7 +564,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
 
     /// Routes one parsed command and turns a [`CommandError`] into the
     /// in-band response code.
-    fn dispatch(&mut self, mem: &GuestMem, hdr: &CtrlHdr, buf: &[u8]) -> Reply {
+    fn dispatch(&mut self, mem: &Arc<GuestMem>, hdr: &CtrlHdr, buf: &[u8]) -> Reply {
         let result = match hdr.kind {
             cmd::GET_DISPLAY_INFO => self.get_display_info(),
             cmd::GET_EDID => self.get_edid(buf),
@@ -507,8 +573,35 @@ impl<S: ScanoutSink> GpuDevice<S> {
             cmd::SET_SCANOUT => self.set_scanout(buf),
             cmd::RESOURCE_FLUSH => self.resource_flush(buf),
             cmd::TRANSFER_TO_HOST_2D => self.transfer_to_host_2d(mem, buf),
-            cmd::RESOURCE_ATTACH_BACKING => self.attach_backing(buf),
+            cmd::RESOURCE_ATTACH_BACKING => self.attach_backing(mem, buf),
             cmd::RESOURCE_DETACH_BACKING => self.detach_backing(buf),
+            // The 3D set (ADR-0004). On a 2D-only device these are unknown
+            // commands — ERR_UNSPEC *before* any body parsing, so a truncated
+            // 3D command on a 2D device is still "unsupported", not "invalid".
+            kind @ (cmd::GET_CAPSET_INFO
+            | cmd::GET_CAPSET
+            | cmd::CTX_CREATE
+            | cmd::CTX_DESTROY
+            | cmd::CTX_ATTACH_RESOURCE
+            | cmd::CTX_DETACH_RESOURCE
+            | cmd::RESOURCE_CREATE_3D
+            | cmd::TRANSFER_TO_HOST_3D
+            | cmd::TRANSFER_FROM_HOST_3D
+            | cmd::SUBMIT_3D)
+                if self.three_d.is_none() =>
+            {
+                Err(CommandError::UnsupportedCommand(kind))
+            }
+            cmd::GET_CAPSET_INFO => self.get_capset_info(buf),
+            cmd::GET_CAPSET => self.get_capset(buf),
+            cmd::CTX_CREATE => self.ctx_create(hdr, buf),
+            cmd::CTX_DESTROY => self.ctx_destroy(hdr),
+            cmd::CTX_ATTACH_RESOURCE => self.ctx_resource(hdr, buf, true),
+            cmd::CTX_DETACH_RESOURCE => self.ctx_resource(hdr, buf, false),
+            cmd::RESOURCE_CREATE_3D => self.resource_create_3d(buf),
+            cmd::TRANSFER_TO_HOST_3D => self.transfer_3d(hdr, buf, true),
+            cmd::TRANSFER_FROM_HOST_3D => self.transfer_3d(hdr, buf, false),
+            cmd::SUBMIT_3D => self.submit_3d(hdr, buf),
             other => Err(CommandError::UnsupportedCommand(other)),
         };
         match result {
@@ -583,11 +676,20 @@ impl<S: ScanoutSink> GpuDevice<S> {
     }
 
     /// `RESOURCE_UNREF` (MVP-808): drops the resource, its backing list and the
-    /// scanout binding if it pointed here.
+    /// scanout binding if it pointed here. Routed to whichever half — 2D
+    /// table or 3D renderer — owns the id.
     fn resource_unref(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
         let cmd = ResourceUnref::parse(buf)
             .ok_or_else(|| truncated(cmd::RESOURCE_UNREF, buf.len(), ResourceUnref::LEN))?;
-        self.resources.remove(cmd.resource_id)?;
+        if cmd.resource_id == 0 {
+            return Err(CommandError::ZeroResourceId);
+        }
+        match self.three_d.as_mut() {
+            Some(gpu) if gpu.owns(cmd.resource_id) => gpu.resource_unref(cmd.resource_id)?,
+            _ => {
+                self.resources.remove(cmd.resource_id)?;
+            }
+        }
         if self
             .scanout
             .is_some_and(|s| s.resource_id == cmd.resource_id)
@@ -608,7 +710,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
     /// may attach pages it is about to make valid, and a bad page must fail the
     /// transfer that touches it, not the attach. Only the entry count and the
     /// command length are validated, both before anything is allocated.
-    fn attach_backing(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
+    fn attach_backing(&mut self, mem: &Arc<GuestMem>, buf: &[u8]) -> Result<Reply, CommandError> {
         let fixed = AttachBacking::parse(buf).ok_or_else(|| {
             truncated(cmd::RESOURCE_ATTACH_BACKING, buf.len(), AttachBacking::LEN)
         })?;
@@ -626,7 +728,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if buf.len() < expected {
             return Err(truncated(cmd::RESOURCE_ATTACH_BACKING, buf.len(), expected));
         }
-        if self.resources.get(fixed.resource_id).is_none() {
+        let owned_3d = self
+            .three_d
+            .as_ref()
+            .is_some_and(|gpu| gpu.owns(fixed.resource_id));
+        if !owned_3d && self.resources.get(fixed.resource_id).is_none() {
             return Err(CommandError::UnknownResource(fixed.resource_id));
         }
 
@@ -638,6 +744,17 @@ impl<S: ScanoutSink> GpuDevice<S> {
             let entry = MemEntry::parse_at(buf, index)
                 .ok_or_else(|| truncated(cmd::RESOURCE_ATTACH_BACKING, buf.len(), expected))?;
             entries.push(entry);
+        }
+
+        if owned_3d {
+            self.three_d_mut(cmd::RESOURCE_ATTACH_BACKING)?
+                .attach_backing(fixed.resource_id, mem, &entries)?;
+            tracing::debug!(
+                resource = fixed.resource_id,
+                entries = fixed.nr_entries,
+                "virtio-gpu 3D backing attached"
+            );
+            return Ok(Reply::ok());
         }
 
         let resource = self
@@ -669,6 +786,13 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if cmd.resource_id == 0 {
             return Err(CommandError::ZeroResourceId);
         }
+        if let Some(gpu) = self.three_d.as_mut() {
+            if gpu.owns(cmd.resource_id) {
+                gpu.detach_backing(cmd.resource_id)?;
+                tracing::debug!(resource = cmd.resource_id, "virtio-gpu 3D backing detached");
+                return Ok(Reply::ok());
+            }
+        }
         self.resources
             .get_mut(cmd.resource_id)
             .ok_or(CommandError::UnknownResource(cmd.resource_id))?
@@ -694,15 +818,25 @@ impl<S: ScanoutSink> GpuDevice<S> {
             return Ok(Reply::ok());
         }
 
-        let resource = self
-            .resources
-            .get(cmd.resource_id)
-            .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
-        if !cmd.rect.fits_within(resource.width(), resource.height()) {
+        // Either half may own the resource; in virgl mode even the plain
+        // framebuffer is a renderer resource (the guest kernel creates all
+        // its objects through RESOURCE_CREATE_3D once the feature is on).
+        let (width, height, three_d) = match self.resources.get(cmd.resource_id) {
+            Some(resource) => (resource.width(), resource.height(), false),
+            None => {
+                let desc = self
+                    .three_d
+                    .as_ref()
+                    .and_then(|gpu| gpu.desc(cmd.resource_id))
+                    .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
+                (desc.width, desc.height, true)
+            }
+        };
+        if !cmd.rect.fits_within(width, height) {
             return Err(CommandError::RectOutOfBounds {
                 rect: cmd.rect,
-                width: resource.width(),
-                height: resource.height(),
+                width,
+                height,
             });
         }
 
@@ -714,12 +848,14 @@ impl<S: ScanoutSink> GpuDevice<S> {
         self.scanout = Some(ScanoutBinding {
             resource_id: cmd.resource_id,
             rect: cmd.rect,
+            three_d,
         });
         tracing::info!(
             scanout = cmd.scanout_id,
             resource = cmd.resource_id,
             width = cmd.rect.width,
             height = cmd.rect.height,
+            three_d,
             "virtio-gpu scanout set"
         );
         Ok(Reply::ok())
@@ -759,16 +895,24 @@ impl<S: ScanoutSink> GpuDevice<S> {
             return Err(CommandError::ZeroResourceId);
         }
         // Unknown ids are still an error — that is how a guest notices it
-        // flushed something it had already unref'd.
-        let resource = self
-            .resources
-            .get(cmd.resource_id)
-            .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
-        if !cmd.rect.fits_within(resource.width(), resource.height()) {
+        // flushed something it had already unref'd. Either half may own the
+        // resource (see `set_scanout`).
+        let (width, height, three_d) = match self.resources.get(cmd.resource_id) {
+            Some(resource) => (resource.width(), resource.height(), false),
+            None => {
+                let desc = self
+                    .three_d
+                    .as_ref()
+                    .and_then(|gpu| gpu.desc(cmd.resource_id))
+                    .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
+                (desc.width, desc.height, true)
+            }
+        };
+        if !cmd.rect.fits_within(width, height) {
             return Err(CommandError::RectOutOfBounds {
                 rect: cmd.rect,
-                width: resource.width(),
-                height: resource.height(),
+                width,
+                height,
             });
         }
 
@@ -793,24 +937,181 @@ impl<S: ScanoutSink> GpuDevice<S> {
         let dst_x = clip.x - scanout.rect.x;
         let dst_y = clip.y - scanout.rect.y;
 
-        let pixels = resource.rect_bytes(clip, &mut self.flush_buf).ok_or(
-            CommandError::RectOutOfBounds {
-                rect: clip,
-                width: resource.width(),
-                height: resource.height(),
-            },
-        )?;
-        self.display
-            .update_scanout(dst_x, dst_y, clip.width, clip.height, pixels)
-            .map_err(|error| CommandError::Display(error.to_string()))?;
+        if three_d {
+            // GPU-010: the rendered pixels live in the host renderer; read
+            // the dirty rect back as BGRA and push it down the same sink.
+            let mut scratch = std::mem::take(&mut self.flush_buf);
+            let read = self
+                .three_d_mut(cmd::RESOURCE_FLUSH)
+                .and_then(|gpu| gpu.read_rect_bgra(cmd.resource_id, clip, &mut scratch));
+            let outcome = read.and_then(|()| {
+                self.display
+                    .update_scanout(dst_x, dst_y, clip.width, clip.height, &scratch)
+                    .map_err(|error| CommandError::Display(error.to_string()))
+            });
+            self.flush_buf = scratch;
+            outcome?;
+        } else {
+            let resource = self
+                .resources
+                .get(cmd.resource_id)
+                .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
+            let pixels = resource.rect_bytes(clip, &mut self.flush_buf).ok_or(
+                CommandError::RectOutOfBounds {
+                    rect: clip,
+                    width,
+                    height,
+                },
+            )?;
+            self.display
+                .update_scanout(dst_x, dst_y, clip.width, clip.height, pixels)
+                .map_err(|error| CommandError::Display(error.to_string()))?;
+        }
         tracing::trace!(
             resource = cmd.resource_id,
             x = dst_x,
             y = dst_y,
             width = clip.width,
             height = clip.height,
+            three_d,
             "virtio-gpu flush"
         );
+        Ok(Reply::ok())
+    }
+
+    // ------------------------------------------------ 3D commands (ADR-0004)
+
+    /// `GET_CAPSET_INFO` (GPU-003). An index past `num_capsets` answers OK
+    /// with a zeroed body (id 0 = "no capset"), matching QEMU — the driver
+    /// probes indices in order and stops on the zeros.
+    fn get_capset_info(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
+        let cmd = GetCapsetInfo::parse(buf)
+            .ok_or_else(|| truncated(cmd::GET_CAPSET_INFO, buf.len(), GetCapsetInfo::LEN))?;
+        let gpu = self.three_d_mut(cmd::GET_CAPSET_INFO)?;
+        let body = match gpu.capset_info(cmd.capset_index) {
+            Some(info) => capset_info_body(info.id, info.max_version, info.max_size),
+            None => capset_info_body(0, 0, 0),
+        };
+        Ok(Reply {
+            code: resp::OK_CAPSET_INFO,
+            body: body.to_vec(),
+        })
+    }
+
+    /// `GET_CAPSET` (GPU-003): the renderer's capability blob.
+    fn get_capset(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
+        let cmd = GetCapset::parse(buf)
+            .ok_or_else(|| truncated(cmd::GET_CAPSET, buf.len(), GetCapset::LEN))?;
+        let gpu = self.three_d_mut(cmd::GET_CAPSET)?;
+        let body = gpu.capset(cmd.capset_id, cmd.capset_version)?;
+        tracing::debug!(
+            capset = cmd.capset_id,
+            version = cmd.capset_version,
+            bytes = body.len(),
+            "virtio-gpu GET_CAPSET"
+        );
+        Ok(Reply {
+            code: resp::OK_CAPSET,
+            body,
+        })
+    }
+
+    /// `CTX_CREATE` (GPU-004): the context id is the header's `ctx_id`.
+    fn ctx_create(&mut self, hdr: &CtrlHdr, buf: &[u8]) -> Result<Reply, CommandError> {
+        let cmd = CtxCreate::parse(buf)
+            .ok_or_else(|| truncated(cmd::CTX_CREATE, buf.len(), CtxCreate::LEN))?;
+        let name = cmd.name();
+        let ctx_id = hdr.ctx_id;
+        self.three_d_mut(cmd::CTX_CREATE)?
+            .ctx_create(ctx_id, cmd.context_init, &name)?;
+        tracing::debug!(ctx = ctx_id, name, "virtio-gpu 3D context created");
+        Ok(Reply::ok())
+    }
+
+    /// `CTX_DESTROY` (GPU-004).
+    fn ctx_destroy(&mut self, hdr: &CtrlHdr) -> Result<Reply, CommandError> {
+        let ctx_id = hdr.ctx_id;
+        self.three_d_mut(cmd::CTX_DESTROY)?.ctx_destroy(ctx_id)?;
+        tracing::debug!(ctx = ctx_id, "virtio-gpu 3D context destroyed");
+        Ok(Reply::ok())
+    }
+
+    /// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` (GPU-006).
+    fn ctx_resource(
+        &mut self,
+        hdr: &CtrlHdr,
+        buf: &[u8],
+        attach: bool,
+    ) -> Result<Reply, CommandError> {
+        let kind = if attach {
+            cmd::CTX_ATTACH_RESOURCE
+        } else {
+            cmd::CTX_DETACH_RESOURCE
+        };
+        let cmd =
+            CtxResource::parse(buf).ok_or_else(|| truncated(kind, buf.len(), CtxResource::LEN))?;
+        let ctx_id = hdr.ctx_id;
+        self.three_d_mut(kind)?
+            .ctx_resource(ctx_id, cmd.resource_id, attach)?;
+        Ok(Reply::ok())
+    }
+
+    /// `RESOURCE_CREATE_3D` (GPU-005). Ids share one namespace with the 2D
+    /// table, so a clash there is a duplicate even before the 3D front looks.
+    fn resource_create_3d(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
+        let cmd = ResourceCreate3d::parse(buf)
+            .ok_or_else(|| truncated(cmd::RESOURCE_CREATE_3D, buf.len(), ResourceCreate3d::LEN))?;
+        if self.resources.get(cmd.resource_id).is_some() {
+            return Err(CommandError::DuplicateResource(cmd.resource_id));
+        }
+        self.three_d_mut(cmd::RESOURCE_CREATE_3D)?
+            .resource_create(&cmd)?;
+        tracing::debug!(
+            resource = cmd.resource_id,
+            target = cmd.target,
+            format = cmd.format,
+            width = cmd.width,
+            height = cmd.height,
+            depth = cmd.depth,
+            "virtio-gpu 3D resource created"
+        );
+        Ok(Reply::ok())
+    }
+
+    /// `TRANSFER_TO_HOST_3D` / `TRANSFER_FROM_HOST_3D` (GPU-008).
+    fn transfer_3d(
+        &mut self,
+        hdr: &CtrlHdr,
+        buf: &[u8],
+        to_host: bool,
+    ) -> Result<Reply, CommandError> {
+        let kind = if to_host {
+            cmd::TRANSFER_TO_HOST_3D
+        } else {
+            cmd::TRANSFER_FROM_HOST_3D
+        };
+        let cmd =
+            Transfer3d::parse(buf).ok_or_else(|| truncated(kind, buf.len(), Transfer3d::LEN))?;
+        if cmd.resource_id == 0 {
+            return Err(CommandError::ZeroResourceId);
+        }
+        let ctx_id = hdr.ctx_id;
+        self.three_d_mut(kind)?.transfer(ctx_id, &cmd, to_host)?;
+        Ok(Reply::ok())
+    }
+
+    /// `SUBMIT_3D` (GPU-007): the command stream follows the fixed part in
+    /// the same gathered buffer.
+    fn submit_3d(&mut self, hdr: &CtrlHdr, buf: &[u8]) -> Result<Reply, CommandError> {
+        let cmd = CmdSubmit3d::parse(buf)
+            .ok_or_else(|| truncated(cmd::SUBMIT_3D, buf.len(), CmdSubmit3d::LEN))?;
+        let declared = cmd.size as usize;
+        let stream = buf
+            .get(CmdSubmit3d::LEN..CmdSubmit3d::LEN.saturating_add(declared))
+            .ok_or_else(|| truncated(cmd::SUBMIT_3D, buf.len(), CmdSubmit3d::LEN + declared))?;
+        let ctx_id = hdr.ctx_id;
+        self.three_d_mut(cmd::SUBMIT_3D)?.submit(ctx_id, stream)?;
+        tracing::trace!(ctx = ctx_id, bytes = declared, "virtio-gpu 3D submit");
         Ok(Reply::ok())
     }
 }
@@ -826,13 +1127,14 @@ fn truncated(kind: u32, len: usize, expected: usize) -> CommandError {
 
 /// Copies the device-readable part of a chain into `out`.
 ///
-/// Bounded by [`MAX_COMMAND_BYTES`] and read through checked `vm-memory` calls,
-/// so neither an enormous chain nor a buffer outside guest RAM can hurt the
-/// host.
+/// Bounded by `cap` ([`MAX_COMMAND_BYTES`], or [`MAX_COMMAND_BYTES_3D`] with a
+/// renderer attached) and read through checked `vm-memory` calls, so neither
+/// an enormous chain nor a buffer outside guest RAM can hurt the host.
 fn gather_request(
     mem: &GuestMem,
     segments: &[Segment],
     out: &mut Vec<u8>,
+    cap: usize,
 ) -> Result<(), CommandError> {
     for segment in segments {
         let len = segment.len as usize;
@@ -840,7 +1142,7 @@ fn gather_request(
             continue;
         }
         let total = out.len().saturating_add(len);
-        if total > MAX_COMMAND_BYTES {
+        if total > cap {
             return Err(CommandError::RequestTooLarge(total as u64));
         }
         let start = out.len();
@@ -933,7 +1235,11 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        let config = config_bytes(self.events_read, NUM_SCANOUTS, NUM_CAPSETS);
+        let num_capsets = self
+            .three_d
+            .as_ref()
+            .map_or(NUM_CAPSETS, |gpu| gpu.num_capsets());
+        let config = config_bytes(self.events_read, NUM_SCANOUTS, num_capsets);
         debug_assert_eq!(config.len(), CONFIG_LEN);
         for (i, byte) in data.iter_mut().enumerate() {
             let index = offset.saturating_add(i as u64);
@@ -1009,6 +1315,13 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         // The host keeps showing the last frame until the driver comes back and
         // programs a new scanout; dropping the resources here is what frees the
         // (guest-triggered) host allocations.
+        //
+        // Order matters: the renderer goes first, because a renderer may hold
+        // host pointers into guest memory (virgl iovecs) and must drop them
+        // before this device lets go of its `Arc<GuestMem>`.
+        if let Some(gpu) = self.three_d.as_mut() {
+            gpu.reset();
+        }
         self.control = None;
         self.cursor = None;
         self.mem = None;
@@ -1057,7 +1370,7 @@ mod tests {
             })
             .collect();
         let mut out = Vec::new();
-        let error = gather_request(&mem, &segments, &mut out)
+        let error = gather_request(&mem, &segments, &mut out, MAX_COMMAND_BYTES)
             .expect_err("a chain over the command cap must be refused");
         assert!(matches!(error, CommandError::RequestTooLarge(_)), "{error}");
         assert!(
@@ -1075,10 +1388,68 @@ mod tests {
         }];
         // The read itself fails (guest memory is smaller than the cap), but it
         // must fail as an unreadable buffer, not as a size violation.
-        match gather_request(&mem, &exact, &mut out) {
+        match gather_request(&mem, &exact, &mut out, MAX_COMMAND_BYTES) {
             Ok(()) | Err(CommandError::Unreadable { .. }) => (),
             Err(other) => panic!("a request exactly at the cap must not be too large: {other}"),
         }
+    }
+
+    /// The 3D bound is the submit budget plus the fixed part, and a device
+    /// with a renderer gathers up to it while the 2D device keeps the small
+    /// cap.
+    #[test]
+    fn the_3d_command_cap_covers_a_full_submit_and_nothing_more() {
+        assert_eq!(
+            MAX_COMMAND_BYTES_3D,
+            CmdSubmit3d::LEN + crate::renderer::MAX_SUBMIT_BYTES
+        );
+
+        struct NoSink;
+        impl crate::sink::ScanoutSink for NoSink {
+            fn resolution(&self) -> (u32, u32) {
+                (64, 64)
+            }
+            fn set_resolution(&self, _: u32, _: u32) -> Result<(), crate::sink::SinkError> {
+                Ok(())
+            }
+            fn update_scanout(
+                &self,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: &[u8],
+            ) -> Result<(), crate::sink::SinkError> {
+                Ok(())
+            }
+            fn set_cursor(
+                &self,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: &[u8],
+            ) -> Result<(), crate::sink::SinkError> {
+                Ok(())
+            }
+            fn move_cursor(&self, _: u32, _: u32) -> Result<(), crate::sink::SinkError> {
+                Ok(())
+            }
+            fn hide_cursor(&self) -> Result<(), crate::sink::SinkError> {
+                Ok(())
+            }
+        }
+
+        let two_d = GpuDevice::new(NoSink);
+        assert_eq!(two_d.max_command_bytes(), MAX_COMMAND_BYTES);
+        assert_eq!(two_d.device_features() & crate::VIRTIO_GPU_F_VIRGL, 0);
+
+        let three_d =
+            GpuDevice::with_renderer(NoSink, Box::new(crate::null_renderer::NullRenderer::new()));
+        assert_eq!(three_d.max_command_bytes(), MAX_COMMAND_BYTES_3D);
+        assert_ne!(three_d.device_features() & crate::VIRTIO_GPU_F_VIRGL, 0);
     }
 
     #[test]

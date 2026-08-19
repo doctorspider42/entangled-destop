@@ -14,6 +14,11 @@ virtio-core.workspace = true
 virtio-queue.workspace = true
 vm-memory.workspace = true
 
+# The real 3D renderer (ADR-0004) dlopens libvirglrenderer at runtime; the
+# loader itself is the only build-time dependency, and only on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading.workspace = true
+
 [dev-dependencies]
 virtio-core = { workspace = true, features = ["test-utils"] }
 # Dev-only cycle: `display` depends on this crate for the pixel format and

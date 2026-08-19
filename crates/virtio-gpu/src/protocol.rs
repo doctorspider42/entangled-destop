@@ -36,22 +36,42 @@ pub mod cmd {
     /// the EDID when the driver has one.
     pub const GET_EDID: u32 = 0x010a;
 
+    /// Capability sets (GPU-003) — usable without 3D per spec, but only
+    /// meaningful once `num_capsets > 0`, which this device ties to a
+    /// [`crate::renderer::Renderer3d`] being attached.
+    pub const GET_CAPSET_INFO: u32 = 0x0108;
+    pub const GET_CAPSET: u32 = 0x0109;
+
     /// Cursor-queue commands (MVP-812): the hardware-cursor plane. mutter
     /// composites the pointer onto this plane, so a device that drains and
     /// ignores these shows a desktop with an invisible pointer.
     pub const UPDATE_CURSOR: u32 = 0x0300;
     pub const MOVE_CURSOR: u32 = 0x0301;
+
+    /// 3D commands (GPU-004…GPU-008), valid only when `VIRTIO_GPU_F_VIRGL`
+    /// was negotiated.
+    pub const CTX_CREATE: u32 = 0x0200;
+    pub const CTX_DESTROY: u32 = 0x0201;
+    pub const CTX_ATTACH_RESOURCE: u32 = 0x0202;
+    pub const CTX_DETACH_RESOURCE: u32 = 0x0203;
+    pub const RESOURCE_CREATE_3D: u32 = 0x0204;
+    pub const TRANSFER_TO_HOST_3D: u32 = 0x0205;
+    pub const TRANSFER_FROM_HOST_3D: u32 = 0x0206;
+    pub const SUBMIT_3D: u32 = 0x0207;
 }
 
 /// Response types (`VIRTIO_GPU_RESP_*`).
 pub mod resp {
     pub const OK_NODATA: u32 = 0x1100;
     pub const OK_DISPLAY_INFO: u32 = 0x1101;
+    pub const OK_CAPSET_INFO: u32 = 0x1102;
+    pub const OK_CAPSET: u32 = 0x1103;
     pub const OK_EDID: u32 = 0x1104;
     pub const ERR_UNSPEC: u32 = 0x1200;
     pub const ERR_OUT_OF_MEMORY: u32 = 0x1201;
     pub const ERR_INVALID_SCANOUT_ID: u32 = 0x1202;
     pub const ERR_INVALID_RESOURCE_ID: u32 = 0x1203;
+    pub const ERR_INVALID_CONTEXT_ID: u32 = 0x1204;
     pub const ERR_INVALID_PARAMETER: u32 = 0x1205;
 }
 
@@ -99,6 +119,14 @@ const _: () = {
     assert!(GetEdid::LEN == 32);
     assert!(CtrlHdr::LEN + EDID_BODY_LEN == 1056);
     assert!(UpdateCursor::LEN == 56);
+    assert!(GetCapsetInfo::LEN == 32);
+    assert!(CtrlHdr::LEN + CAPSET_INFO_BODY_LEN == 40);
+    assert!(GetCapset::LEN == 32);
+    assert!(CtxCreate::LEN == 96);
+    assert!(CtxResource::LEN == 32);
+    assert!(ResourceCreate3d::LEN == 72);
+    assert!(Transfer3d::LEN == 72);
+    assert!(CmdSubmit3d::LEN == 32);
 };
 
 // ------------------------------------------------------------ byte helpers
@@ -546,6 +574,266 @@ impl UpdateCursor {
     }
 }
 
+// ------------------------------------------------------------- 3D commands
+
+/// Length of the `struct virtio_gpu_resp_capset_info` body (after the header).
+pub const CAPSET_INFO_BODY_LEN: usize = 16;
+
+/// `struct virtio_gpu_get_capset_info` (GPU-003): which capset slot
+/// (`0..num_capsets`) the driver wants described.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GetCapsetInfo {
+    pub capset_index: u32,
+}
+
+impl GetCapsetInfo {
+    /// Wire length including the header (`capset_index` + `padding`).
+    pub const LEN: usize = CTRL_HDR_LEN + 8;
+
+    /// Parses the command from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        Some(Self {
+            capset_index: le32(bytes, CTRL_HDR_LEN),
+        })
+    }
+}
+
+/// Encodes the body of `struct virtio_gpu_resp_capset_info`:
+/// `capset_id`, `capset_max_version`, `capset_max_size`, `padding`.
+pub fn capset_info_body(id: u32, max_version: u32, max_size: u32) -> [u8; CAPSET_INFO_BODY_LEN] {
+    let mut out = [0u8; CAPSET_INFO_BODY_LEN];
+    put32(&mut out, 0, id);
+    put32(&mut out, 4, max_version);
+    put32(&mut out, 8, max_size);
+    out
+}
+
+/// `struct virtio_gpu_get_capset` (GPU-003): fetch one capset blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GetCapset {
+    pub capset_id: u32,
+    pub capset_version: u32,
+}
+
+impl GetCapset {
+    /// Wire length including the header.
+    pub const LEN: usize = CTRL_HDR_LEN + 8;
+
+    /// Parses the command from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        Some(Self {
+            capset_id: le32(bytes, CTRL_HDR_LEN),
+            capset_version: le32(bytes, CTRL_HDR_LEN + 4),
+        })
+    }
+}
+
+/// `struct virtio_gpu_ctx_create` (GPU-004). The context id itself travels in
+/// the *header*'s `ctx_id`; the body carries a debug name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CtxCreate {
+    /// Meaningful bytes of `debug_name` (clamped to the 64-byte field).
+    pub nlen: u32,
+    /// `context_init` in newer specs (capset id for non-virgl context types);
+    /// zero for classic virgl, and the only value phase 1 accepts.
+    pub context_init: u32,
+    pub debug_name: [u8; 64],
+}
+
+impl CtxCreate {
+    /// Wire length including the header: `nlen` + `context_init` + 64 name
+    /// bytes.
+    pub const LEN: usize = CTRL_HDR_LEN + 8 + 64;
+
+    /// Parses the command from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        let mut debug_name = [0u8; 64];
+        debug_name.copy_from_slice(bytes.get(CTRL_HDR_LEN + 8..CTRL_HDR_LEN + 8 + 64)?);
+        Some(Self {
+            nlen: le32(bytes, CTRL_HDR_LEN),
+            context_init: le32(bytes, CTRL_HDR_LEN + 4),
+            debug_name,
+        })
+    }
+
+    /// The debug name as UTF-8 (lossy, control characters stripped), clamped
+    /// to `nlen` and the field size. Guest-supplied, so never trusted for
+    /// anything but logging.
+    pub fn name(&self) -> String {
+        let len = (self.nlen as usize).min(self.debug_name.len());
+        let raw = &self.debug_name[..len];
+        let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+        String::from_utf8_lossy(&raw[..end])
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect()
+    }
+}
+
+/// `struct virtio_gpu_ctx_resource` (GPU-006) — the body of both
+/// `CTX_ATTACH_RESOURCE` and `CTX_DETACH_RESOURCE`; the context is the
+/// header's `ctx_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CtxResource {
+    pub resource_id: u32,
+}
+
+impl CtxResource {
+    /// Wire length including the header (`resource_id` + `padding`).
+    pub const LEN: usize = CTRL_HDR_LEN + 8;
+
+    /// Parses the command from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        Some(Self {
+            resource_id: le32(bytes, CTRL_HDR_LEN),
+        })
+    }
+}
+
+/// `struct virtio_gpu_resource_create_3d` (GPU-005). Targets, formats and
+/// bind flags are Gallium enums the renderer interprets; the device only
+/// bounds the geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResourceCreate3d {
+    pub resource_id: u32,
+    pub target: u32,
+    pub format: u32,
+    pub bind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub array_size: u32,
+    pub last_level: u32,
+    pub nr_samples: u32,
+    pub flags: u32,
+}
+
+impl ResourceCreate3d {
+    /// Wire length including the header (11 fields + `padding`).
+    pub const LEN: usize = CTRL_HDR_LEN + 48;
+
+    /// Parses the command from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        let at = |i: usize| le32(bytes, CTRL_HDR_LEN + i * 4);
+        Some(Self {
+            resource_id: at(0),
+            target: at(1),
+            format: at(2),
+            bind: at(3),
+            width: at(4),
+            height: at(5),
+            depth: at(6),
+            array_size: at(7),
+            last_level: at(8),
+            nr_samples: at(9),
+            flags: at(10),
+        })
+    }
+}
+
+/// `struct virtio_gpu_box` — a 3D region in resource coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Box3d {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+    pub w: u32,
+    pub h: u32,
+    pub d: u32,
+}
+
+impl Box3d {
+    /// Wire length of `struct virtio_gpu_box`.
+    pub const LEN: usize = 24;
+
+    /// Parses a box at `at`. `None` when the buffer is too short.
+    pub fn parse(bytes: &[u8], at: usize) -> Option<Self> {
+        if bytes.len() < at.checked_add(Self::LEN)? {
+            return None;
+        }
+        Some(Self {
+            x: le32(bytes, at),
+            y: le32(bytes, at + 4),
+            z: le32(bytes, at + 8),
+            w: le32(bytes, at + 12),
+            h: le32(bytes, at + 16),
+            d: le32(bytes, at + 20),
+        })
+    }
+}
+
+/// `struct virtio_gpu_transfer_host_3d` (GPU-008) — the layout of both
+/// `TRANSFER_TO_HOST_3D` and `TRANSFER_FROM_HOST_3D`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Transfer3d {
+    pub region: Box3d,
+    pub offset: u64,
+    pub resource_id: u32,
+    pub level: u32,
+    pub stride: u32,
+    pub layer_stride: u32,
+}
+
+impl Transfer3d {
+    /// Wire length including the header.
+    pub const LEN: usize = CTRL_HDR_LEN + Box3d::LEN + 24;
+
+    /// Parses the command from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        let base = CTRL_HDR_LEN + Box3d::LEN;
+        Some(Self {
+            region: Box3d::parse(bytes, CTRL_HDR_LEN)?,
+            offset: le64(bytes, base),
+            resource_id: le32(bytes, base + 8),
+            level: le32(bytes, base + 12),
+            stride: le32(bytes, base + 16),
+            layer_stride: le32(bytes, base + 20),
+        })
+    }
+}
+
+/// Fixed part of `struct virtio_gpu_cmd_submit` (GPU-007): `size` bytes of
+/// renderer command stream follow it in the same readable chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CmdSubmit3d {
+    /// Guest-declared byte length of the command stream — validated against
+    /// what the chain actually carried before anything is dispatched.
+    pub size: u32,
+}
+
+impl CmdSubmit3d {
+    /// Wire length of the fixed part, header included (`size` + `padding`).
+    pub const LEN: usize = CTRL_HDR_LEN + 8;
+
+    /// Parses the fixed part from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        Some(Self {
+            size: le32(bytes, CTRL_HDR_LEN),
+        })
+    }
+}
+
 // ---------------------------------------------------------------- responses
 
 /// One entry of the `GET_DISPLAY_INFO` reply (`struct
@@ -912,6 +1200,118 @@ mod tests {
         assert_eq!(le32(&cfg, 4), 0, "events_clear always reads zero");
         assert_eq!(le32(&cfg, 8), 1, "num_scanouts");
         assert_eq!(le32(&cfg, 12), 0, "num_capsets");
+    }
+
+    /// Sizes of the 3D command set, straight from `virtio_gpu.h`.
+    #[test]
+    fn three_d_wire_lengths_match_the_spec() {
+        assert_eq!(GetCapsetInfo::LEN, 32);
+        assert_eq!(CtrlHdr::LEN + CAPSET_INFO_BODY_LEN, 40);
+        assert_eq!(GetCapset::LEN, 32);
+        assert_eq!(CtxCreate::LEN, 96);
+        assert_eq!(CtxResource::LEN, 32);
+        assert_eq!(ResourceCreate3d::LEN, 72);
+        assert_eq!(Box3d::LEN, 24);
+        assert_eq!(Transfer3d::LEN, 72);
+        assert_eq!(CmdSubmit3d::LEN, 32);
+    }
+
+    #[test]
+    fn three_d_commands_parse_field_by_field_and_reject_truncation() {
+        // RESOURCE_CREATE_3D with every field distinct.
+        let mut buf = vec![0u8; ResourceCreate3d::LEN];
+        for (i, value) in (1u32..=11).enumerate() {
+            put32(&mut buf, CTRL_HDR_LEN + i * 4, value * 10);
+        }
+        let cmd = ResourceCreate3d::parse(&buf).expect("parses");
+        assert_eq!(cmd.resource_id, 10);
+        assert_eq!(cmd.target, 20);
+        assert_eq!(cmd.format, 30);
+        assert_eq!(cmd.bind, 40);
+        assert_eq!((cmd.width, cmd.height, cmd.depth), (50, 60, 70));
+        assert_eq!((cmd.array_size, cmd.last_level), (80, 90));
+        assert_eq!((cmd.nr_samples, cmd.flags), (100, 110));
+        assert_eq!(ResourceCreate3d::parse(&buf[..buf.len() - 1]), None);
+
+        // TRANSFER_TO_HOST_3D: box, then offset/id/level/strides.
+        let mut buf = vec![0u8; Transfer3d::LEN];
+        for (i, value) in (1u32..=6).enumerate() {
+            put32(&mut buf, CTRL_HDR_LEN + i * 4, value);
+        }
+        put64(&mut buf, CTRL_HDR_LEN + Box3d::LEN, 0xdead_beef_0000);
+        put32(&mut buf, CTRL_HDR_LEN + Box3d::LEN + 8, 7);
+        put32(&mut buf, CTRL_HDR_LEN + Box3d::LEN + 12, 1);
+        put32(&mut buf, CTRL_HDR_LEN + Box3d::LEN + 16, 4096);
+        put32(&mut buf, CTRL_HDR_LEN + Box3d::LEN + 20, 8192);
+        let cmd = Transfer3d::parse(&buf).expect("parses");
+        assert_eq!(
+            cmd.region,
+            Box3d {
+                x: 1,
+                y: 2,
+                z: 3,
+                w: 4,
+                h: 5,
+                d: 6
+            }
+        );
+        assert_eq!(cmd.offset, 0xdead_beef_0000);
+        assert_eq!(cmd.resource_id, 7);
+        assert_eq!(cmd.level, 1);
+        assert_eq!((cmd.stride, cmd.layer_stride), (4096, 8192));
+        assert_eq!(Transfer3d::parse(&buf[..Transfer3d::LEN - 1]), None);
+
+        // The small fixed-shape ones.
+        let mut buf = vec![0u8; 96];
+        put32(&mut buf, CTRL_HDR_LEN, 3);
+        assert_eq!(
+            GetCapsetInfo::parse(&buf),
+            Some(GetCapsetInfo { capset_index: 3 })
+        );
+        put32(&mut buf, CTRL_HDR_LEN + 4, 2);
+        assert_eq!(
+            GetCapset::parse(&buf),
+            Some(GetCapset {
+                capset_id: 3,
+                capset_version: 2
+            })
+        );
+        assert_eq!(
+            CtxResource::parse(&buf),
+            Some(CtxResource { resource_id: 3 })
+        );
+        assert_eq!(CmdSubmit3d::parse(&buf), Some(CmdSubmit3d { size: 3 }));
+        assert_eq!(GetCapsetInfo::parse(&buf[..31]), None);
+        assert_eq!(CmdSubmit3d::parse(&buf[..31]), None);
+        assert_eq!(Box3d::parse(&buf, usize::MAX), None);
+    }
+
+    #[test]
+    fn ctx_create_name_is_clamped_and_sanitised() {
+        let mut buf = vec![0u8; CtxCreate::LEN];
+        put32(&mut buf, CTRL_HDR_LEN, 5); // nlen
+        buf[CTRL_HDR_LEN + 8..CTRL_HDR_LEN + 8 + 7].copy_from_slice(b"mutter\n");
+        let cmd = CtxCreate::parse(&buf).expect("parses");
+        assert_eq!(cmd.nlen, 5);
+        assert_eq!(cmd.name(), "mutte", "clamped to nlen");
+
+        // nlen beyond the field is clamped to the field, embedded NUL stops
+        // the name, control characters never reach a log line.
+        put32(&mut buf, CTRL_HDR_LEN, u32::MAX);
+        buf[CTRL_HDR_LEN + 8 + 7] = 0;
+        let cmd = CtxCreate::parse(&buf).expect("parses");
+        assert_eq!(cmd.name(), "mutter");
+        assert_eq!(CtxCreate::parse(&buf[..CtxCreate::LEN - 1]), None);
+    }
+
+    #[test]
+    fn capset_info_body_layout() {
+        let body = capset_info_body(2, 1, 696);
+        assert_eq!(body.len(), CAPSET_INFO_BODY_LEN);
+        assert_eq!(le32(&body, 0), 2, "capset_id");
+        assert_eq!(le32(&body, 4), 1, "capset_max_version");
+        assert_eq!(le32(&body, 8), 696, "capset_max_size");
+        assert_eq!(le32(&body, 12), 0, "padding");
     }
 
     #[test]
