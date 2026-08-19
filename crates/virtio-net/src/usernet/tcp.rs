@@ -689,26 +689,41 @@ mod tests {
         peer.send(false, true, false, &[]);
         let _ = peer.poll();
 
-        // The host connect runs on its own thread, so give it a few passes.
+        // The host connect runs on its own thread; `accept` waits for it.
         let (mut stream, _) = listener.accept().expect("the NAT connects to the listener");
-        for _ in 0..50 {
-            peer.send(false, true, false, b"GET / HTTP/1.0\r\n\r\n");
-            if !peer.poll().is_empty() {
-                break;
-            }
-        }
+        peer.send(false, true, false, b"GET / HTTP/1.0\r\n\r\n");
 
-        // guest -> host
+        // guest -> host. The NAT has to be *polled* for the bytes to move: the copy
+        // out of smoltcp's buffer into the host socket happens in `service_flows`,
+        // and the flow only has a stream once a poll has collected the connect. So
+        // this reads and polls in the same loop instead of blocking on the read —
+        // blocking on it means nothing ever copies, which is the shape of a real
+        // deadlock and not just a slow test.
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_millis(20)))
             .expect("a read timeout can be set");
-        let mut request = [0u8; 64];
-        let read = stream.read(&mut request).expect("the request arrives");
-        assert!(read > 0);
+        let mut request = Vec::new();
+        for _ in 0..200 {
+            let _ = peer.poll();
+            let mut chunk = [0u8; 64];
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    request.extend_from_slice(&chunk[..read]);
+                    break;
+                }
+                // A read timeout is `TimedOut` on Windows and `WouldBlock` on unix.
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(error) => panic!("reading the guest's request failed: {error}"),
+            }
+            // Keep the guest's side acknowledging, so smoltcp keeps the flow alive.
+            peer.send(false, true, false, &[]);
+        }
         assert!(
-            request[..read].starts_with(b"GET / HTTP/1.0"),
+            request.starts_with(b"GET / HTTP/1.0"),
             "the guest's bytes must arrive unaltered: {:?}",
-            &request[..read]
+            String::from_utf8_lossy(&request)
         );
 
         // host -> guest

@@ -1,6 +1,9 @@
 //! `entangled` — the CLI control surface for the Entangled Desktop VMM.
 
 mod disk;
+/// MBR and ext4 parsing, used only by `install`, which is Linux-only: on Windows
+/// the whole module is dead code and `-D warnings` says so.
+#[cfg(target_os = "linux")]
 mod diskfs;
 mod doctor;
 mod fetch;
