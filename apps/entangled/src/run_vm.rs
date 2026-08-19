@@ -98,6 +98,10 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     // IOAPIC and irqfd injections are intermittently lost (stalled first
     // virtio-blk read with INT_VRING left pending).
     machine_x86::mptable::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
+    // ACPI tables alongside the MP table: MADT/FADT/DSDT give the guest SMP
+    // topology, the PM block and a real S5 poweroff; Linux prefers them and
+    // falls back to the MP table when absent.
+    machine_x86::acpi::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
 
     let serial =
         SerialConsole::new(vm.fd(), Box::new(std::io::stdout())).map_err(|e| e.to_string())?;
