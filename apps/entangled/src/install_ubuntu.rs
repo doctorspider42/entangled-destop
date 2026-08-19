@@ -60,8 +60,10 @@ const FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
 /// since the high-RAM split, but the text installer gains nothing from more.)
 const INSTALLER_MEMORY_MIB: u64 = 2560;
 
-/// What the installed system gets. Less than the installer needs: nothing is
-/// unpacking a 1.2 GiB squashfs any more.
+/// What the installed system gets when `--memory-mib` was left at its default.
+/// Less than the installer needs: nothing is unpacking a 1.2 GiB squashfs any
+/// more. An explicit `--memory-mib` above this carries through to the written
+/// profile — a desktop install sized at 4096 must not boot into 2048.
 const INSTALLED_MEMORY_MIB: u64 = 2048;
 
 pub fn run(args: &InstallArgs) -> Result<(), String> {
@@ -258,7 +260,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     //    key that makes this profile work more than once.
     let profile = VmConfig {
         name: vm_name.clone(),
-        memory_mib: INSTALLED_MEMORY_MIB,
+        memory_mib: args.memory_mib.max(INSTALLED_MEMORY_MIB),
         vcpus: 2,
         transport: VirtioTransport::Pci,
         boot: BootSection {
