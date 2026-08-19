@@ -181,6 +181,10 @@ existing device/serial tests are unaffected by any of it.
    without the firmware artifact. This is the automated version of the manual
    bring-up below; run it after any change to the machine's firmware-facing
    devices or to the ACPI tables.
+5. **KVM, the whole ISO boot chain** (`tests/boot/tests/uefi_iso.rs`, tier 4,
+   `#[ignore]`d): see below. This is the one that would have caught all four of
+   ADR-0003's phase-3 gaps, and the one to run before claiming any change to
+   PCI, interrupts or the block device is safe.
 
 Manual firmware bring-up (needs `bash guest/firmware/build-cloudhv.sh` once,
 ~2.5 min, ~2 GiB of EDK2 checkout in `~/.cache/entangled-edk2`):
@@ -192,9 +196,74 @@ cargo run -p entangled -- run --headless examples/uefi-firmware.toml
 A DEBUG-build EDK2 is extremely chatty on ttyS0, and that log *is* the
 diagnostic tool: read it forwards, and treat the first `ASSERT [Phase]
 File.c(line)` as the next required machine feature rather than as a firmware
-bug. A healthy run today ends at `BdsDxe: No bootable option or device was
-found.` — the firmware works; it has no media it can see, because CloudHv ships
-no virtio-mmio driver and we have no virtio-pci (ADR-0003 phase 3).
+bug. That profile has no disks, so a healthy run ends at `BdsDxe: No bootable
+option or device was found.` — the firmware works and has nothing to boot.
+
+## Booting an installer ISO (UEFI-1803)
+
+```bash
+bash guest/firmware/build-cloudhv.sh          # once, ~2.5 min
+bash scripts/fetch-ubuntu-iso.sh              # once, ~2.9 GiB, GPG + SHA-256 verified
+cargo test -p boot-tests --test uefi_iso -- --ignored --nocapture
+```
+
+`tests/boot/tests/uefi_iso.rs` boots the real firmware with the real ISO on a
+read-only virtio-blk over PCI and asserts the *chain*, in the order the log
+produces it: no firmware `ASSERT`; `FSOpen: Open '\EFI\BOOT\BOOTX64.EFI'
+Success` **and** `BdsDxe: starting Boot…` (opening proves the GPT + FAT ESP of an
+isohybrid image were read, starting proves `LoadImage` succeeded — a broken image
+logs only the first); the device path pinned to `Pci(0x2,0x0)/HD(2,GPT`, so it
+cannot pass on a target disk that happened to be bootable; GRUB's banner *and*
+one of the ISO's own menu entries; then `ExitBootServices`. ~35 s.
+
+It self-skips without `/dev/kvm`, without the firmware, or without an ISO — found
+via `$ENTANGLED_UBUNTU_ISO` or the newest release in the fetch script's cache.
+
+**Where the assertions stop, and why.** The kernel boots with the *ISO's* command
+line, which has no `console=` clause, so nothing Linux prints reaches ttyS0.
+Everything after the hand-off is on the virtio-gpu scanout — and CloudHv ships no
+`VirtioGpuDxe`, so the scanout is dark until Linux's own driver binds. To see the
+installer:
+
+```bash
+ENTANGLED_UEFI_ISO_LINGER=120 \
+ENTANGLED_UEFI_ISO_SHOT=$HOME/installer.png \
+  cargo test -p boot-tests --test uefi_iso -- --ignored --nocapture
+```
+
+`LINGER` keeps the guest running that many seconds past the hand-off; `SHOT`
+writes the scanout as PNG. A healthy run produces subiquity's language-selection
+screen at 1280×800. Asserting on those pixels is screenshot comparison
+(MVP-1405) and belongs in the graphical tier, not here.
+
+Or drive it by hand, which is the same machine with a window:
+
+```bash
+cargo run -p entangled -- run examples/ubuntu-uefi.toml   # edit the disk paths first
+```
+
+### Reading the host log, not just the guest's
+
+The `entangled run` log is half the diagnostic, because the failures in this area
+show up as devices that never come up rather than as errors:
+
+```
+attached virtio-pci device slot=3 device=Input address=00:04.0 bar=0xc000c000 irq=9
+virtio-input ready device="Entangled Keyboard" profile=Keyboard
+virtio device activated transport="virtio-pci" slot=3 device=Input queues=2
+```
+
+Every attached device must reach `virtio device activated`. Two lines mean a gap:
+
+- `driver gave up on this device (FAILED)` — the guest's probe failed. If it is
+  *some* devices and not all, suspect the interrupt line: compare `irq=` against
+  what legacy devices own (`layout::VIRTIO_IRQS` exists because pin 8 is the
+  RTC's). The trick that found that one is worth reusing — **make the pin the
+  variable**: add a disk to shift every later device up one slot and see whether
+  the failure follows the pin or the device.
+- `queue notify before DRIVER_OK, ignoring` naming a device that is not the one
+  you were watching — a kick reached the wrong device's ioeventfd, i.e. a BAR
+  moved and the registration did not follow it (`DeviceNotifier::rebase`).
 
 ## Fuzzing (MVP-1402)
 

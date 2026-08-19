@@ -13,9 +13,9 @@
 //!
 //! Configuration access goes through the two legacy I/O ports — `0xcf8`
 //! `CONFIG_ADDRESS`, `0xcfc` `CONFIG_DATA` — and *only* those. There is no
-//! ECAM/MMCONFIG window, because publishing one needs an ACPI MCFG table and
-//! this machine publishes no ACPI tables at all yet. Both consumers are fine
-//! with that:
+//! ECAM/MMCONFIG window: publishing one needs an ACPI MCFG table, and
+//! `crate::acpi` deliberately publishes RSDP/XSDT/FADT/FACS/MADT/DSDT and no
+//! more. Both consumers are fine with that:
 //!
 //! * Linux's `pci_legacy_init` probes conf1 by writing `0x8000_0000` to `0xcf8`
 //!   and requiring it to read back unchanged, then runs `pci_sanity_check`,
@@ -47,10 +47,12 @@
 //! * writes go through a per-dword write mask, so a guest can never change an
 //!   identity register, a class code, a capability record or the header type;
 //! * BAR writes are masked to the BAR's own size, which *is* the sizing
-//!   protocol and also means a guest cannot place a window at an arbitrary
-//!   address — [`PciRoot::locate_mmio`] additionally refuses to decode anything
-//!   outside the host's aperture, so a BAR pointed somewhere else simply
-//!   receives nothing;
+//!   protocol and keeps every window naturally aligned. A guest may move a BAR
+//!   anywhere inside the aperture the DSDT advertises — every UEFI firmware
+//!   re-allocates resources, so it must be able to — but
+//!   [`PciRoot::locate_mmio`] refuses to decode anything *outside* that
+//!   aperture, so a BAR parked over guest RAM, the LAPIC/IOAPIC or the
+//!   virtio-mmio window shadows nothing and simply receives nothing;
 //! * this module never allocates on a guest access.
 //!
 //! It is portable on purpose (ADR-0002): no KVM, no eventfds, no virtio types,
