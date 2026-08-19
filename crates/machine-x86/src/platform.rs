@@ -13,7 +13,10 @@
 //! * **The ACPI power-management timer** at `CLOUDHV_ACPI_TIMER_IO_ADDRESS`
 //!   (`0x0608`). For a CloudHv platform `InternalAcpiGetTimerTick()` is a plain
 //!   `IoRead32 (0x608)`, and `MicroSecondDelay()` spins on it — a constant
-//!   value there is an unbreakable hang, not a slow boot.
+//!   value there is an unbreakable hang, not a slow boot. That timer has since
+//!   moved into [`crate::acpi::pm::AcpiPmBlock`] along with the rest of the ACPI
+//!   PM register block, because a direct-Linux guest now gets a FADT and needs
+//!   it too.
 //!
 //! This is emphatically **not** a PCI bus: there is exactly one device, it has
 //! no BARs, and configuration writes are dropped. A real bus (and virtio-pci
@@ -21,8 +24,6 @@
 //!
 //! Enabled only for `BootMode::Uefi`, so a direct-Linux guest sees exactly the
 //! machine it saw before this module existed.
-
-use std::time::Instant;
 
 // ---- PCI configuration space --------------------------------------------
 
@@ -152,65 +153,17 @@ impl PciConfigSpace {
 }
 
 // ---- ACPI power-management timer ----------------------------------------
-
-/// `CLOUDHV_ACPI_TIMER_IO_ADDRESS`.
-pub const ACPI_PM_TIMER_PORT: u16 = 0x0608;
-
-/// The architectural ACPI PM timer frequency, 3.579545 MHz.
-pub const ACPI_PM_TIMER_HZ: u64 = 3_579_545;
-
-/// Width of the counter. ACPI allows 24 or 32 bits; 24 is the conservative
-/// choice and what firmware assumes when the FADT says nothing.
-const ACPI_PM_TIMER_MASK: u32 = 0x00ff_ffff;
-
-/// A free-running ACPI power-management timer, derived from host monotonic
-/// time. Read-only: the guest cannot set it, only observe it advance.
-#[derive(Debug)]
-pub struct AcpiPmTimer {
-    origin: Instant,
-}
-
-impl Default for AcpiPmTimer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AcpiPmTimer {
-    pub fn new() -> Self {
-        Self {
-            origin: Instant::now(),
-        }
-    }
-
-    pub fn contains(port: u16) -> bool {
-        (ACPI_PM_TIMER_PORT..ACPI_PM_TIMER_PORT + 4).contains(&port)
-    }
-
-    /// Ticks since the VM started, wrapped to the counter width.
-    pub fn ticks(&self) -> u32 {
-        let micros = self.origin.elapsed().as_micros();
-        // 3.579545 ticks per microsecond, in integer arithmetic. u128 keeps the
-        // product exact for any plausible uptime; the mask does the wrapping,
-        // which is what a real 24-bit counter does too.
-        let ticks = micros.saturating_mul(u128::from(ACPI_PM_TIMER_HZ)) / 1_000_000;
-        (ticks as u32) & ACPI_PM_TIMER_MASK
-    }
-
-    pub fn io_read(&self, port: u16, data: &mut [u8]) {
-        let within = usize::from(port - ACPI_PM_TIMER_PORT);
-        let bytes = self.ticks().to_le_bytes();
-        for (i, byte) in data.iter_mut().enumerate() {
-            *byte = bytes.get(within + i).copied().unwrap_or(0);
-        }
-    }
-}
+//
+// Moved out: the PM timer at `CLOUDHV_ACPI_TIMER_IO_ADDRESS` is now one register
+// of `crate::acpi::pm::AcpiPmBlock`, which owns the whole 0x600..0x610 block and
+// is present in *both* boot modes — the FADT declares it to direct-Linux guests
+// too, so it can no longer be a UEFI-only device. `AcpiPmTimer` itself still
+// exists, in `crate::acpi::pm`.
 
 /// The firmware-facing platform devices, enabled for UEFI boots only.
 #[derive(Debug, Default)]
 pub struct FirmwarePlatform {
     pub pci: PciConfigSpace,
-    pub timer: AcpiPmTimer,
     /// The RTC/CMOS: `EFI_RUNTIME_SERVICES.GetTime()` has nowhere else to come
     /// from, and `PcRtcInit()` fails its entry point without it.
     pub rtc: crate::rtc::Rtc,
@@ -220,26 +173,19 @@ impl FirmwarePlatform {
     pub fn new() -> Self {
         Self {
             pci: PciConfigSpace::new(),
-            timer: AcpiPmTimer::new(),
             rtc: crate::rtc::Rtc::new(),
         }
     }
 
     /// True when `port` belongs to one of these devices.
     pub fn contains(port: u16) -> bool {
-        PciConfigSpace::contains(port)
-            || AcpiPmTimer::contains(port)
-            || crate::rtc::Rtc::contains(port)
+        PciConfigSpace::contains(port) || crate::rtc::Rtc::contains(port)
     }
 
     /// Returns true when the read was handled.
     pub fn io_read(&mut self, port: u16, data: &mut [u8]) -> bool {
         if PciConfigSpace::contains(port) {
             self.pci.io_read(port, data);
-            return true;
-        }
-        if AcpiPmTimer::contains(port) {
-            self.timer.io_read(port, data);
             return true;
         }
         if crate::rtc::Rtc::contains(port) {
@@ -259,9 +205,7 @@ impl FirmwarePlatform {
             self.rtc.io_write(port, data);
             return true;
         }
-        // The PM timer is read-only; swallow writes rather than letting them
-        // float off to an unclaimed port.
-        AcpiPmTimer::contains(port)
+        false
     }
 }
 
@@ -366,9 +310,12 @@ mod tests {
         assert!(FirmwarePlatform::contains(0xcfc));
         assert!(FirmwarePlatform::contains(0xcff));
         assert!(!FirmwarePlatform::contains(0xd00));
-        assert!(FirmwarePlatform::contains(0x608));
-        assert!(FirmwarePlatform::contains(0x60b));
-        assert!(!FirmwarePlatform::contains(0x60c));
+        // The ACPI PM block (0x600..0x610) belongs to `crate::acpi::pm` now, in
+        // both boot modes; this device must not claim any of it.
+        for port in 0x600..=0x60fu16 {
+            assert!(!FirmwarePlatform::contains(port), "port {port:#x}");
+            assert!(crate::acpi::AcpiPmBlock::contains(port));
+        }
         assert!(FirmwarePlatform::contains(0x70));
         assert!(FirmwarePlatform::contains(0x71));
         assert!(!FirmwarePlatform::contains(0x72));
@@ -380,36 +327,5 @@ mod tests {
         }
     }
 
-    /// `MicroSecondDelay()` spins until the timer has advanced far enough — a
-    /// stuck counter hangs the firmware forever, so this is load-bearing.
-    #[test]
-    fn acpi_pm_timer_advances_monotonically() {
-        let timer = AcpiPmTimer::new();
-        let first = timer.ticks();
-        let mut last = first;
-        let deadline = Instant::now() + std::time::Duration::from_millis(50);
-        while Instant::now() < deadline {
-            let now = timer.ticks();
-            assert!(now >= last, "timer went backwards: {last} -> {now}");
-            last = now;
-        }
-        assert!(
-            last > first,
-            "timer did not advance in 50 ms (expected ~{} ticks)",
-            ACPI_PM_TIMER_HZ / 20
-        );
-        // Never wider than 24 bits.
-        assert_eq!(last & !0x00ff_ffff, 0);
-    }
-
-    #[test]
-    fn acpi_pm_timer_supports_partial_reads() {
-        let timer = AcpiPmTimer::new();
-        let mut dword = [0u8; 4];
-        timer.io_read(ACPI_PM_TIMER_PORT, &mut dword);
-        assert_eq!(dword[3], 0, "24-bit counter: top byte is always zero");
-        let mut byte = [0xffu8; 1];
-        timer.io_read(ACPI_PM_TIMER_PORT + 3, &mut byte);
-        assert_eq!(byte[0], 0);
-    }
+    // The PM timer's own tests moved with it, to `crate::acpi::pm`.
 }

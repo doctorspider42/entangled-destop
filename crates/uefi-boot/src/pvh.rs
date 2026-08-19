@@ -31,6 +31,11 @@ pub const MEMMAP_ENTRY_SIZE: usize = 24;
 /// `XEN_HVM_MEMMAP_TYPE_*`.
 pub const XEN_HVM_MEMMAP_TYPE_RAM: u32 = 1;
 pub const XEN_HVM_MEMMAP_TYPE_RESERVED: u32 = 2;
+/// ACPI reclaimable — where the ACPI tables live. EDK2 ignores every entry that
+/// is not `XEN_HVM_MEMMAP_TYPE_RAM` (`PlatformScanE820Pvh()` filters on it), so
+/// this is documentation for the firmware rather than instruction; the tables
+/// stay intact because the range is also outside every RAM entry.
+pub const XEN_HVM_MEMMAP_TYPE_ACPI: u32 = 3;
 
 /// One `hvm_memmap_table_entry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +112,7 @@ pub fn memmap_for(mem_size: u64) -> Vec<MemmapEntry> {
             kind: match e.kind {
                 E820Type::Ram => XEN_HVM_MEMMAP_TYPE_RAM,
                 E820Type::Reserved => XEN_HVM_MEMMAP_TYPE_RESERVED,
+                E820Type::AcpiReclaim => XEN_HVM_MEMMAP_TYPE_ACPI,
             },
         })
         .collect()

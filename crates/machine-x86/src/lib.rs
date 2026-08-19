@@ -1,6 +1,7 @@
 //! x86-64 machine model: guest physical memory layout, E820 map and (soon)
 //! vCPU register/CPUID/GDT setup (backlog EPIC 1/2).
 
+pub mod acpi;
 pub mod layout;
 pub mod platform;
 pub mod rtc;
@@ -25,6 +26,11 @@ pub mod virtio;
 pub enum E820Type {
     Ram = 1,
     Reserved = 2,
+    /// ACPI reclaimable: the ACPI tables live here. Linux keeps this out of
+    /// memblock (`e820__memblock_setup` only adds RAM), so nothing allocates
+    /// over the tables before ACPICA has copied them, and userspace can still
+    /// see the range as reclaimable.
+    AcpiReclaim = 3,
 }
 
 /// One guest physical address range for the E820 map.
@@ -41,12 +47,18 @@ pub struct E820Entry {
 /// reserved hole between 640 KiB and 1 MiB (VGA/BIOS shadow), then usable RAM
 /// from 1 MiB up to `mem_size`. RAM above 4 GiB (when `mem_size` crosses the
 /// 32-bit MMIO hole) is not implemented yet — MVP guests fit below 3 GiB.
+///
+/// The reserved hole is split so the ACPI tables
+/// ([`layout::ACPI_TABLES_START`]) get their own ACPI-reclaimable entry. They
+/// would already be protected by the surrounding reserved range; the separate
+/// entry is what tells a guest OS *why* the range is special.
 pub fn e820_map(mem_size: u64) -> Vec<E820Entry> {
     assert!(
         mem_size <= layout::MMIO_HOLE_START,
         "guests larger than {} bytes need a high-RAM split (post-MVP)",
         layout::MMIO_HOLE_START
     );
+    let acpi_end = layout::ACPI_TABLES_START + layout::ACPI_TABLES_SIZE;
     vec![
         E820Entry {
             addr: 0,
@@ -55,7 +67,17 @@ pub fn e820_map(mem_size: u64) -> Vec<E820Entry> {
         },
         E820Entry {
             addr: layout::EBDA_START,
-            size: layout::HIGH_RAM_START - layout::EBDA_START,
+            size: layout::ACPI_TABLES_START - layout::EBDA_START,
+            kind: E820Type::Reserved,
+        },
+        E820Entry {
+            addr: layout::ACPI_TABLES_START,
+            size: layout::ACPI_TABLES_SIZE,
+            kind: E820Type::AcpiReclaim,
+        },
+        E820Entry {
+            addr: acpi_end,
+            size: layout::HIGH_RAM_START - acpi_end,
             kind: E820Type::Reserved,
         },
         E820Entry {
@@ -87,5 +109,42 @@ mod tests {
         let map = e820_map(512 * 1024 * 1024);
         assert_eq!(map[1].kind, E820Type::Reserved);
         assert_eq!(map[1].addr, layout::EBDA_START);
+    }
+
+    /// The ACPI tables must be described as ACPI-reclaimable, not as RAM: on
+    /// the reclaimable type Linux keeps the range out of memblock entirely.
+    #[test]
+    fn acpi_region_is_reclaimable_and_covers_the_tables() {
+        let map = e820_map(512 * 1024 * 1024);
+        let acpi = map
+            .iter()
+            .find(|e| e.kind == E820Type::AcpiReclaim)
+            .expect("no ACPI entry in the E820 map");
+        assert_eq!(acpi.addr, layout::ACPI_TABLES_START);
+        assert_eq!(acpi.size, layout::ACPI_TABLES_SIZE);
+        assert!(
+            acpi.addr + acpi.size <= layout::MPTABLE_START,
+            "the ACPI region must not swallow the MP table"
+        );
+        assert!(
+            acpi.addr >= layout::EBDA_START && acpi.addr + acpi.size <= layout::HIGH_RAM_START,
+            "the ACPI region must stay inside the low reserved hole"
+        );
+        // Exactly one RAM entry below the EBDA and one above 1 MiB; the ACPI
+        // split must not have produced a RAM hole.
+        assert_eq!(map.iter().filter(|e| e.kind == E820Type::Ram).count(), 2);
+    }
+
+    /// A DSDT `_CRS` that overlapped the virtio-mmio window would make Linux
+    /// refuse the platform devices; the two windows are disjoint by definition.
+    #[test]
+    fn pci_hole_does_not_overlap_the_virtio_window() {
+        const {
+            assert!(
+                layout::PCI_MMIO_HOLE_BASE + layout::PCI_MMIO_HOLE_SIZE <= layout::VIRTIO_MMIO_BASE
+            );
+            assert!(layout::PCI_MMIO_HOLE_BASE >= layout::MMIO_HOLE_START);
+            assert!(layout::PCI_MMIO_HOLE_SIZE > 0);
+        }
     }
 }

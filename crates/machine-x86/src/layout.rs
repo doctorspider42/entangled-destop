@@ -29,6 +29,65 @@ pub const PD_START: u64 = 0x0000_b000;
 /// lost.
 pub const MPTABLE_START: u64 = 0x000f_0000;
 
+/// ACPI tables (RSDP, XSDT, FADT, FACS, MADT, DSDT), packed from this address
+/// upwards. Deliberately inside the classic BIOS ROM window, immediately below
+/// the MP table:
+///
+/// * the whole 0x9fc00..0x100000 range is already reserved in our E820 map, so
+///   no guest allocator can land on it (the region itself is additionally
+///   published as ACPI-reclaimable — see [`crate::E820Type::AcpiReclaim`]);
+/// * `0xe0000..0xfffff` is the legacy RSDP scan window, so a guest or firmware
+///   that ignores the hand-off pointer still finds the tables;
+/// * EDK2 marks `0xa0000..0xfffff` as MMIO rather than system memory
+///   (`PlatformAddIoMemoryRangeHob`), so DXE never allocates over them.
+///
+/// Both boot paths also hand the RSDP address over explicitly:
+/// `boot_params.acpi_rsdp_addr` (direct Linux) and `hvm_start_info.rsdp_paddr`
+/// (PVH/UEFI, ADR-0003).
+pub const ACPI_TABLES_START: u64 = 0x000e_0000;
+
+/// Size of the ACPI region: everything from [`ACPI_TABLES_START`] up to the MP
+/// table. 64 KiB is ~4x what the largest table set (254 vCPUs) needs.
+pub const ACPI_TABLES_SIZE: u64 = MPTABLE_START - ACPI_TABLES_START;
+
+/// Guest physical address of the RSDP — the one ACPI address the boot paths
+/// need to know, since every other table hangs off the XSDT.
+pub const ACPI_RSDP_START: u64 = ACPI_TABLES_START;
+
+// ---- ACPI PM register block (port I/O) -----------------------------------
+//
+// One 16-byte block of legacy-ACPI fixed-feature registers, described by the
+// FADT and implemented by `crate::acpi::pm::AcpiPmBlock`. Two addresses in it
+// are not ours to choose: EDK2's CloudHv platform hard-codes the sleep control
+// register at 0x600 (`CLOUDHV_ACPI_SHUTDOWN_IO_ADDRESS`) and the PM timer at
+// 0x608 (`CLOUDHV_ACPI_TIMER_IO_ADDRESS`); everything else is packed around
+// them.
+//
+// | Port          | Width | Register              | FADT field                |
+// |---------------|-------|-----------------------|---------------------------|
+// | 0x600         | 1     | SLEEP_CONTROL         | `SLEEP_CONTROL_REG`       |
+// | 0x601         | 1     | SLEEP_STATUS          | `SLEEP_STATUS_REG`        |
+// | 0x602..0x603  | 2     | PM1a_STS              | `PM1a_EVT_BLK` (+0)       |
+// | 0x604..0x605  | 2     | PM1a_EN               | `PM1a_EVT_BLK` (+2)       |
+// | 0x606..0x607  | 2     | PM1a_CNT              | `PM1a_CNT_BLK`            |
+// | 0x608..0x60b  | 4     | PM timer (24-bit)     | `PM_TMR_BLK`              |
+// | 0x60c..0x60f  | 4     | GPE0_STS + GPE0_EN    | `GPE0_BLK`                |
+
+/// Base of the ACPI PM register block. Pinned by EDK2: for a CloudHv host
+/// bridge `ResetShutdown()` writes `SLP_TYP=5 | SLP_EN` to exactly this port.
+pub const ACPI_PM_BASE: u16 = 0x0600;
+
+/// Size of the ACPI PM register block.
+pub const ACPI_PM_SIZE: u16 = 0x10;
+
+/// GSI reserved for the ACPI System Control Interrupt (FADT `SCI_INT`).
+///
+/// Not 9, the PC convention: GSIs 5..=12 belong to the virtio-mmio slots
+/// (`VIRTIO_MMIO_FIRST_IRQ` + `MAX_VIRTIO_SLOTS`), and sharing a level-triggered
+/// SCI with an edge-triggered virtio line would be a real bug. 13 is the old
+/// coprocessor-error line, which this machine has no use for.
+pub const ACPI_SCI_GSI: u32 = 13;
+
 /// Physical address of the local APIC (architectural default).
 pub const LAPIC_ADDR: u32 = 0xfee0_0000;
 
@@ -81,6 +140,20 @@ pub const RESET_VECTOR: u64 = 0xffff_fff0;
 /// until high-RAM support lands; virtio-mmio windows and the future PCI hole
 /// live here.
 pub const MMIO_HOLE_START: u64 = 0xc000_0000;
+
+/// The 32-bit MMIO aperture behind the PCI host bridge, as published in the
+/// DSDT's `\_SB.PCI0._CRS` (`crate::acpi`).
+///
+/// Deliberately stops below [`VIRTIO_MMIO_BASE`]: a PCI root bridge window that
+/// swallowed the virtio-mmio slots would make Linux refuse the platform
+/// devices' `request_mem_region`. The PCI bus itself (EPIC 19) is being built
+/// in parallel — these two constants are the coordination point; move the
+/// window, not the DSDT.
+pub const PCI_MMIO_HOLE_BASE: u64 = MMIO_HOLE_START;
+
+/// Size of [`PCI_MMIO_HOLE_BASE`]: 256 MiB, ending one byte below
+/// [`VIRTIO_MMIO_BASE`].
+pub const PCI_MMIO_HOLE_SIZE: u64 = VIRTIO_MMIO_BASE - PCI_MMIO_HOLE_BASE;
 
 /// Base of the virtio-mmio device window region.
 pub const VIRTIO_MMIO_BASE: u64 = 0xd000_0000;
