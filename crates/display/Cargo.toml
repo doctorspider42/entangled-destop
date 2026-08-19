@@ -8,13 +8,18 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = []
+default = ["wayland-csd"]
 # Client-side window decorations on Wayland compositors that do not provide
-# server-side ones (GNOME). Off by default because it pulls
-# sctk-adwaita -> ab_glyph -> ttf-parser, and ttf-parser carries an
-# "unmaintained" RUSTSEC advisory (RUSTSEC-2026-0192) that would make
-# `cargo deny check advisories` fail. WSLg, KDE and X11 draw the frame
-# themselves, so the default build is decorated there anyway.
+# server-side ones. GNOME *and WSLg* are in that group: WSLg's Weston
+# advertises no zxdg_decoration_manager_v1, so without this feature winit
+# falls back to sctk's FallbackFrame — "the default ugly frame" — whose close
+# button is a plain grey square and whose resize border is 4 invisible pixels
+# (the EPIC 15 demo bugs). On by default; the pulled tree
+# (sctk-adwaita -> ab_glyph -> ttf-parser) is permissively licensed, already
+# in the workspace graph via the manager's egui-winit, and ttf-parser's
+# "unmaintained" advisory (RUSTSEC-2026-0192) is transitive-only and ignored
+# in deny.toml. Linux-target-only in winit's manifest, so the Windows build
+# is unaffected.
 wayland-csd = ["winit/wayland-csd-adwaita"]
 
 [dependencies]
