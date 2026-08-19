@@ -13,6 +13,12 @@
 # reports "virgl", not "llvmpipe". Linux-only for now — the renderer speaks
 # EGL; a host where it cannot initialize fails the run with a clear message
 # rather than silently booting 2D.
+#
+# Under WSLg specifically, jammy's mesa D3D12 driver has a NULL gallium hook
+# that sustained GNOME compositing eventually hits (ADR-0004 amendment). If
+# the VM dies after a minute or two of desktop use there, run with
+# LIBGL_ALWAYS_SOFTWARE=1 to put the *host* renderer on llvmpipe — the guest
+# still sees virgl. Native Linux hosts with real DRI drivers are unaffected.
 name = "ubuntu-desktop-virgl"
 memory_mib = 4096
 vcpus = 4

@@ -218,7 +218,26 @@ Phase 1 landed the same day; three FFI facts worth keeping:
 Measured in WSL (D3D12 / AMD Radeon PRO): init reports GL 4.2 core, capsets
 VIRGL v1 (308 B) and VIRGL2 v2 (696 B); the `virgl_host.rs` integration test
 round-trips guest pages → iovec → GL texture → BGRA readback in ~0.5 s
-including EGL bring-up. The `gpu_3d_commands` fuzz target ran clean.
+including EGL bring-up. The `gpu_3d_commands` fuzz target ran clean
+(4.65M executions).
+
+**Guest acceptance** (`boot-tests/virgl_gnome.rs`): the Ubuntu 26.04 Desktop
+live session negotiates `+virgl`, reads both capsets, reaches
+graphical.target in 67–98 s (llvmpipe needed several minutes), and an EGL
+probe typed into a `systemd.debug_shell` reports `GL_RENDERER = virgl` from
+inside the guest.
+
+**Known limitation of the WSLg host GL (not of this design):** after 1–3
+minutes of sustained GNOME compositing on the D3D12-backed host GL, a submit
+dereferences a NULL gallium hook inside jammy's mesa 23.2 megadriver
+(backtraced: `virgl_renderer_submit_cmd` → vrend → `swrast_dri.so` → call to
+0x0) and takes the process down. Our validation front is not implicated —
+the stream is structurally valid GL work the host driver mishandles. On this
+host, `LIBGL_ALWAYS_SOFTWARE=1` moves the renderer onto host llvmpipe, which
+is stable (still reported as `virgl` in the guest, still off the guest's
+CPUs' critical path, but no GPU win). Native Linux hosts with real DRI
+drivers do not share this failure mode; renderer-crash *containment*
+(GPU-012) is phase-2 work either way.
 
 ## Consequences
 
