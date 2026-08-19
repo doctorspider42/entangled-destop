@@ -22,7 +22,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # Pinned Inno Setup 7 (the .iss is written for it). Bump deliberately.
-  INNO_SETUP_URL: https://files.jrsoftware.org/is/7/innosetup-7.1.0.exe
+  # Official binaries live on the issrc GitHub releases; files.jrsoftware.org
+  # only carries the .issig signatures.
+  INNO_SETUP_URL: https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe
 
 jobs:
   windows-installer:
