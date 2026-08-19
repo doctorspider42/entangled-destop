@@ -172,9 +172,12 @@ mod tests {
         assert_eq!(spec.cwd, Path::new("/srv/entangled"));
         assert_eq!(spec.log_path, Path::new("/vms/demo-install.log"));
         let line = spec.command_line();
+        // The disk path goes through Path::join, so the separator is the
+        // host's — build the expected fragment the same way.
+        let disk_arg = format!("--disk {}", vm_dir.join("demo.raw").display());
         for needle in [
             "install debian",
-            "--disk /vms/demo.raw",
+            disk_arg.as_str(),
             "--size 20G",
             "--variant text-netboot",
             "--memory-mib 4096",
