@@ -258,6 +258,20 @@ impl MsixState {
         }
     }
 
+    /// Claims vector `vector`'s pending bit and returns the message to send, if
+    /// the vector is pending *and* now deliverable (it exists and is unmasked).
+    ///
+    /// Claim-and-return in one step under the caller's lock is what makes draining
+    /// the PBA race-free: whoever clears the bit owns the delivery.
+    fn take_pending(&mut self, vector: u16) -> Option<MsiMessage> {
+        let entry = *self.entries.get(usize::from(vector))?;
+        if entry.is_masked() || !self.is_pending(vector) {
+            return None;
+        }
+        self.set_pending(vector, false);
+        Some(entry.message())
+    }
+
     /// One byte of the PBA as the guest sees it. Out-of-range reads are zero.
     fn pba_byte(&self, offset: u64) -> u8 {
         let word = usize::try_from(offset / 8).unwrap_or(usize::MAX);
@@ -492,6 +506,7 @@ impl MsixInterrupt {
         }
         let entry_index = usize::try_from(offset / MSIX_ENTRY_SIZE).unwrap_or(usize::MAX);
         let first_dword = ((offset % MSIX_ENTRY_SIZE) / 4) as usize;
+        let function_masked = self.is_function_masked();
         let mut deliver = None;
         self.with_state("table write", |s| {
             let Some(entry) = s.entries.get_mut(entry_index) else {
@@ -503,16 +518,17 @@ impl MsixInterrupt {
                 entry.set_dword(first_dword + i, value);
             }
             // Unmasking a vector with a pending request must send it now (PCI
-            // 3.0 §6.8.3.5); the pending bit is cleared by the send, not by the
-            // write, so a failed delivery is not silently forgotten.
+            // 3.0 §6.8.3.5). The pending bit is taken *here*, under the same lock
+            // as the mask bit that released it, so two threads racing to drain the
+            // same vector cannot both send it.
             let unmasked = was_masked && !entry.is_masked();
             let vector = u16::try_from(entry_index).unwrap_or(u16::MAX);
-            if unmasked && s.is_pending(vector) {
-                deliver = Some(vector);
+            if unmasked && !function_masked {
+                deliver = s.take_pending(vector);
             }
         });
-        if let Some(vector) = deliver {
-            self.deliver_pending(vector);
+        if let Some(message) = deliver {
+            self.send(message, "unmasked");
         }
     }
 
@@ -527,21 +543,23 @@ impl MsixInterrupt {
         if !self.is_enabled() || self.is_function_masked() {
             return;
         }
-        let pending = self
-            .with_state("pending scan", |s| {
+        // Collected under one lock, and *claimed* while collecting: a concurrent
+        // signal on the same vector then finds the bit clear and sends its own
+        // message rather than duplicating this one. Bounded by the table size.
+        let messages = self
+            .with_state("pending drain", |s| {
                 let mut out = Vec::new();
                 for index in 0..s.entries.len() {
                     let vector = u16::try_from(index).unwrap_or(u16::MAX);
-                    let masked = s.entries.get(index).is_some_and(|e| e.is_masked());
-                    if !masked && s.is_pending(vector) {
-                        out.push(vector);
+                    if let Some(message) = s.take_pending(vector) {
+                        out.push(message);
                     }
                 }
                 out
             })
             .unwrap_or_default();
-        for vector in pending {
-            self.deliver_pending(vector);
+        for message in messages {
+            self.send(message, "pending");
         }
     }
 
@@ -602,12 +620,12 @@ impl MsixInterrupt {
         }
     }
 
-    /// Delivers a vector the PBA had remembered, logging a failure rather than
-    /// propagating it: the caller is a register write or a config-space write,
-    /// neither of which has anywhere to report an interrupt failure to.
-    fn deliver_pending(&self, vector: u16) {
-        if let Err(error) = self.deliver(vector, "pending") {
-            tracing::error!(vector, %error, "failed to deliver a pending MSI-X vector");
+    /// Sends a message the PBA had remembered, logging a failure rather than
+    /// propagating it: the caller is a table write or a config-space write, neither
+    /// of which has anywhere to report an interrupt failure to.
+    fn send(&self, message: MsiMessage, what: &'static str) {
+        if let Err(error) = self.sink.send(message) {
+            tracing::error!(what, %error, "failed to deliver a pending MSI-X message");
         }
     }
 }
