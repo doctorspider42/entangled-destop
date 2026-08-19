@@ -77,6 +77,29 @@ pub fn viewport_for(
     letterbox(guest_w, guest_h, win_w, win_h)
 }
 
+/// Physical pixels from the window edge inside which the host cursor stays
+/// visible even while grabbed (WIN-1501).
+///
+/// The cursor image is a property of the *pointer*, and once the pointer
+/// crosses from the guest image onto the window's CSD frame there is no
+/// reliable way to change it any more (winit defers `set_cursor` until the
+/// pointer is back over the content, and on theme-less hosts — stock WSL —
+/// the frame cannot set its own either). So the switch back to the visible
+/// arrow must happen *before* the crossing: the outer margin of the window is
+/// a "cursor visible" zone. The guest cursor sits under the host one there,
+/// which is the cheaper cosmetic cost.
+pub const CURSOR_EDGE_MARGIN: f64 = 16.0;
+
+/// True when a window position is within [`CURSOR_EDGE_MARGIN`] of any window
+/// edge — where the host cursor must stay visible so it survives onto the
+/// decorations (see the constant's docs).
+pub fn near_window_edge(x: f64, y: f64, win_w: u32, win_h: u32) -> bool {
+    x < CURSOR_EDGE_MARGIN
+        || y < CURSOR_EDGE_MARGIN
+        || x > f64::from(win_w) - CURSOR_EDGE_MARGIN
+        || y > f64::from(win_h) - CURSOR_EDGE_MARGIN
+}
+
 /// Whether the *host* cursor should be visible (WIN-1501).
 ///
 /// The guest draws its own pointer (Weston does), so two cursors would chase
@@ -244,6 +267,19 @@ mod tests {
         assert!(cursor_visible(true, false), "over the letterbox bars");
         assert!(cursor_visible(false, true), "grab released");
         assert!(cursor_visible(false, false));
+    }
+
+    #[test]
+    fn the_window_edge_margin_is_detected_on_all_four_sides() {
+        let (w, h) = (1920, 1080);
+        assert!(!near_window_edge(960.0, 540.0, w, h), "window center");
+        assert!(near_window_edge(2.0, 540.0, w, h), "left");
+        assert!(near_window_edge(960.0, 2.0, w, h), "top");
+        assert!(near_window_edge(1918.0, 540.0, w, h), "right");
+        assert!(near_window_edge(960.0, 1078.0, w, h), "bottom");
+        // Just inside the margin boundary.
+        assert!(near_window_edge(CURSOR_EDGE_MARGIN - 1.0, 540.0, w, h));
+        assert!(!near_window_edge(CURSOR_EDGE_MARGIN + 1.0, 540.0, w, h));
     }
 
     #[test]

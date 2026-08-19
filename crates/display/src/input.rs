@@ -322,6 +322,9 @@ pub struct InputCapture {
     /// the guest cursor without waiting for the next motion event.
     pointer: Option<(f64, f64)>,
     viewport: Option<Viewport>,
+    /// Physical window size, for the edge margin of the cursor policy
+    /// ([`crate::ux::near_window_edge`]); `None` before the window exists.
+    window_size: Option<(u32, u32)>,
     /// Whether the pointer is inside the window at all (`CursorEntered`/`Left`).
     pointer_in_window: bool,
     vertical: WheelAccumulator,
@@ -343,6 +346,7 @@ impl InputCapture {
             modifiers_clean: false,
             pointer: None,
             viewport: None,
+            window_size: None,
             pointer_in_window: false,
             vertical: WheelAccumulator::default(),
             horizontal: WheelAccumulator::default(),
@@ -385,15 +389,26 @@ impl InputCapture {
         self.unmapped
     }
 
-    /// True when the last known pointer position lies on the guest image (not on
-    /// a letterbox bar) and the pointer is inside the window.
+    /// True when the last known pointer position lies on the guest image (not
+    /// on a letterbox bar, and not within the window-edge margin) and the
+    /// pointer is inside the window.
+    ///
+    /// The edge margin keeps the host cursor visible just before it crosses
+    /// onto the window decorations, because after the crossing it can no
+    /// longer be changed — see [`crate::ux::CURSOR_EDGE_MARGIN`].
     pub fn pointer_over_guest(&self) -> bool {
         if !self.pointer_in_window {
             return false;
         }
-        match (self.pointer, self.viewport) {
-            (Some((x, y)), Some(viewport)) => viewport.contains(x, y),
-            _ => false,
+        let (Some((x, y)), Some(viewport)) = (self.pointer, self.viewport) else {
+            return false;
+        };
+        if !viewport.contains(x, y) {
+            return false;
+        }
+        match self.window_size {
+            Some((w, h)) => !crate::ux::near_window_edge(x, y, w, h),
+            None => true,
         }
     }
 
@@ -407,6 +422,12 @@ impl InputCapture {
     /// and scale-mode changes, without waiting for the next motion event.
     pub fn set_viewport(&mut self, viewport: Option<Viewport>) {
         self.viewport = viewport;
+    }
+
+    /// Keeps the physical window size used by the cursor policy's edge margin
+    /// current; `None` while the window does not exist.
+    pub fn set_window_size(&mut self, size: Option<(u32, u32)>) {
+        self.window_size = size;
     }
 
     /// Handles one keyboard event. `repeat` is winit's auto-repeat flag: the
@@ -1262,6 +1283,38 @@ mod tests {
         hold_ctrl_alt(&mut c);
         release(&mut c, KeyCode::AltLeft);
         assert!(c.cursor_visible());
+    }
+
+    #[test]
+    fn the_cursor_stays_visible_within_the_window_edge_margin() {
+        let mut c = grabbed_capture();
+        // A viewport that fills the whole window: the guest image touches every
+        // window edge, as a maximized fit-mode window does.
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: 2120,
+            height: 1080,
+        };
+        c.set_window_size(Some((2120, 1080)));
+        c.on_pointer(Some(viewport), 1060.0, 540.0);
+        assert!(!c.cursor_visible(), "window center: hidden as before");
+        // Approaching the top edge (towards the CSD titlebar): the cursor must
+        // come back *before* it crosses onto the frame, where it can no longer
+        // be changed (WSLg).
+        c.on_pointer(Some(viewport), 1060.0, 4.0);
+        assert!(c.cursor_visible(), "top margin");
+        c.on_pointer(Some(viewport), 4.0, 540.0);
+        assert!(c.cursor_visible(), "left margin");
+        c.on_pointer(Some(viewport), 2116.0, 540.0);
+        assert!(c.cursor_visible(), "right margin");
+        c.on_pointer(Some(viewport), 1060.0, 1076.0);
+        assert!(c.cursor_visible(), "bottom margin");
+        // Without a known window size the policy falls back to the viewport
+        // alone (headless tests, no window yet).
+        c.set_window_size(None);
+        c.on_pointer(Some(viewport), 1060.0, 4.0);
+        assert!(!c.cursor_visible());
     }
 
     #[test]

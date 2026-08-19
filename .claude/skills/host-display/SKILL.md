@@ -159,6 +159,32 @@ that shaped the code, all verified against WSLg's protocol stream
   own cursor. `host.rs` hides the pointer on Wayland by setting a fully
   transparent 8×8 `CustomCursor` instead (ordinary cursor-image path, honoured
   everywhere); other platforms keep `set_cursor_visible`.
+- **Named cursors can be silent no-ops.** `CursorIcon::*` needs an XCursor
+  theme; a stock WSL root ships none (`/usr/share/icons/*/cursors` is empty),
+  so `set_cursor(CursorIcon::Default)` sends nothing, and the CSD frame's own
+  resize/arrow cursors don't work either. Consequences the code handles:
+  the *visible* state is a bundled arrow image (`ARROW_PIXELS` in `host.rs`),
+  set once at window creation (WSLg's RDP client keeps the last pointer
+  *across windows*, so a hidden cursor from a previous run haunts new ones)
+  and re-set whenever the policy flips to visible.
+- **The cursor image cannot be changed while the pointer is over the CSD
+  frame** (winit defers `set_cursor` until the pointer is back over the
+  content, and a theme-less frame can't set its own), and Weston carries the
+  current image across same-client surface crossings. So the flip back to the
+  visible arrow must happen *before* the crossing:
+  `ux::CURSOR_EDGE_MARGIN` keeps the outer 16 px of the window a
+  "cursor visible" zone (`InputCapture::pointer_over_guest`). A fast flick can
+  still skip the margin and carry the transparent cursor onto the titlebar —
+  wiggling back over the image repairs it; nothing more can be done app-side.
+- **WSLg's pointer confinement is a mirage**: `zwp_pointer_constraints_v1` is
+  advertised and `confine_pointer` is accepted, but no `confined` event ever
+  arrives — the pointer is never actually confined, so the grab cannot rely
+  on it (the code already treats it as best-effort).
+- **Do not SIGKILL/SIGTERM a windowed VM under WSLg if avoidable**: abruptly
+  disconnecting a client that holds a pending pointer constraint has crashed
+  WSLg's Weston in testing, taking every other WSLg window with it (our VM
+  supervision survives this: broken pipe → event loop error → clean VM stop
+  with NVRAM written). Prefer the window's close button / Ctrl+Alt+Q.
 - **Input cannot be injected into WSLg windows from Windows automation**:
   `msrdc.exe` runs with UIAccess, so UIPI silently drops `SendInput` /
   `mouse_event` from normal processes. Manual testing needs a human hand (or a
