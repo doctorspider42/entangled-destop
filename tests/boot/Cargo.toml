@@ -18,6 +18,9 @@ vmm-core.workspace = true
 control-api.workspace = true
 machine-x86.workspace = true
 linux-boot.workspace = true
+# For the UEFI+ACPI boot test: the firmware path has no shared harness (it
+# boots a firmware, not a kernel), but it belongs with the other real-VM tests.
+uefi-boot.workspace = true
 virtio-core.workspace = true
 virtio-block.workspace = true
 tracing.workspace = true

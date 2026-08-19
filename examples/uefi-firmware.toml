@@ -7,9 +7,15 @@
 # mapped as a ROM ending at 4 GiB and entered through the reset vector — the
 # same profile shape, decided by the image itself.
 #
-# Phase 1 scope: the firmware talks on ttyS0. It cannot boot a guest yet — that
-# needs virtio-pci and ACPI (see the ADR's gap map), because CloudHv ships no
-# virtio-mmio driver at all.
+# Phase 2 scope: the firmware talks on ttyS0 and installs the machine's ACPI
+# tables (handed over in hvm_start_info.rsdp_paddr). It still cannot boot a
+# guest — that needs virtio-pci (see the ADR's gap map), because CloudHv ships
+# no virtio-mmio driver at all.
+#
+# NOTE: `entangled run` does not publish the ACPI tables yet — one call to
+# machine_x86::acpi::write next to mptable::write in apps/entangled/src/run_vm.rs
+# (see .claude/skills/acpi-machine/SKILL.md). Until that lands, the automated
+# path is `cargo test -p boot-tests --test uefi_acpi -- --nocapture`.
 name = "uefi-firmware"
 memory_mib = 2048
 vcpus = 1

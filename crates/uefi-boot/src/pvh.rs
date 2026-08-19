@@ -31,6 +31,11 @@ pub const MEMMAP_ENTRY_SIZE: usize = 24;
 /// `XEN_HVM_MEMMAP_TYPE_*`.
 pub const XEN_HVM_MEMMAP_TYPE_RAM: u32 = 1;
 pub const XEN_HVM_MEMMAP_TYPE_RESERVED: u32 = 2;
+/// ACPI reclaimable — where the ACPI tables live. EDK2 ignores every entry that
+/// is not `XEN_HVM_MEMMAP_TYPE_RAM` (`PlatformScanE820Pvh()` filters on it), so
+/// this is documentation for the firmware rather than instruction; the tables
+/// stay intact because the range is also outside every RAM entry.
+pub const XEN_HVM_MEMMAP_TYPE_ACPI: u32 = 3;
 
 /// One `hvm_memmap_table_entry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,9 +58,14 @@ impl MemmapEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartInfo {
     pub cmdline_paddr: u64,
-    /// Physical address of the ACPI RSDP, or 0 when the VMM provides no ACPI
-    /// tables. Zero is honest, not a placeholder: EDK2's `AcpiPlatformDxe`
-    /// simply installs nothing, which is the phase-2 gap in ADR-0003.
+    /// Physical address of the ACPI RSDP — `machine_x86::layout::ACPI_RSDP_START`
+    /// in practice, since `machine_x86::acpi` puts the tables there.
+    ///
+    /// EDK2's `InstallCloudHvTables()` dereferences this pointer, walks the XSDT
+    /// installing every table it lists, then installs the DSDT from the FADT's
+    /// `X_DSDT`. A zero — or an address whose RSDP fails its signature and
+    /// checksum check — makes it return `EFI_NOT_FOUND` and install nothing,
+    /// which was ADR-0003's phase-2 gap.
     pub rsdp_paddr: u64,
     pub memmap_paddr: u64,
     pub memmap_entries: u32,
@@ -107,6 +117,7 @@ pub fn memmap_for(mem_size: u64) -> Vec<MemmapEntry> {
             kind: match e.kind {
                 E820Type::Ram => XEN_HVM_MEMMAP_TYPE_RAM,
                 E820Type::Reserved => XEN_HVM_MEMMAP_TYPE_RESERVED,
+                E820Type::AcpiReclaim => XEN_HVM_MEMMAP_TYPE_ACPI,
             },
         })
         .collect()

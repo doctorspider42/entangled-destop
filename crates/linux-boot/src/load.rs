@@ -88,7 +88,20 @@ pub fn load<M: GuestMemory>(
         params.hdr.ramdisk_size = data.len() as u32;
     }
 
-    // E820 memory map.
+    // Where the ACPI tables are (`machine_x86::acpi`). Handing the RSDP address
+    // over in `boot_params` is the modern boot-protocol way and saves the kernel
+    // the legacy EBDA/0xE0000 scan; `acpi_os_get_root_pointer()` prefers it.
+    //
+    // Advertised unconditionally, whether or not the machine actually published
+    // the tables: `machine_x86::acpi::write` is a separate call, and if it was
+    // not made the region is zeroed, the RSDP signature check fails and the
+    // guest falls back to the MP table. Advertising garbage is not a risk — an
+    // unsigned RSDP is rejected, not misread.
+    params.acpi_rsdp_addr = layout::ACPI_RSDP_START;
+
+    // E820 memory map. Includes the ACPI region as ACPI-reclaimable, which is
+    // what keeps Linux from allocating over the tables (`e820__memblock_setup`
+    // only adds RAM ranges to memblock).
     let e820 = machine_x86::e820_map(mem_size);
     for (i, entry) in e820.iter().enumerate() {
         params.e820_table[i] = boot_e820_entry {

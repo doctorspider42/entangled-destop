@@ -15,6 +15,10 @@
 //!                               guest-side evidence for the virtio-pci
 //!                               transport (EPIC 19). There is no `lspci` in this
 //!                               initramfs, so it reads sysfs directly.
+//!   `entangled.poweroff=1`      power the machine off through ACPI instead of
+//!                               rebooting: proves the FADT, the DSDT's `\_S5`
+//!                               and the host's ACPI PM block agree. Opt-in,
+//!                               because every other test wants the reboot path.
 
 use std::ffi::CString;
 use std::io::Read;
@@ -53,10 +57,15 @@ fn main() {
         blk_bench(mib.min(MAX_BENCH_MIB));
     }
 
-    // Restart, not power-off: the MVP machine has no ACPI, so power-off just
-    // halts the vCPU forever. With `reboot=k` the kernel's restart chain ends
-    // in a triple fault, which reaches the host as KVM_EXIT_SHUTDOWN and
-    // terminates the VM cleanly.
+    if param(&cmdline, "entangled.poweroff=").as_deref() == Some("1") {
+        acpi_power_off();
+    }
+
+    // Restart, not power-off, by default: the reboot path works on every
+    // machine we boot, ACPI or not. With `reboot=k` the kernel's restart chain
+    // ends in a triple fault, which reaches the host as KVM_EXIT_SHUTDOWN and
+    // terminates the VM cleanly. `entangled.poweroff=1` takes the ACPI route
+    // instead.
     // SAFETY: plain syscalls; as PID 1 we hold CAP_SYS_BOOT. tcdrain flushes
     // the serial console before the reboot triple-faults the machine.
     unsafe {
@@ -69,6 +78,50 @@ fn main() {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
+}
+
+/// Asks the kernel to power the machine off through ACPI and reports what
+/// happened on the way in.
+///
+/// `reboot(LINUX_REBOOT_CMD_POWER_OFF)` only reaches the ACPI path if
+/// `acpi_sleep_init()` registered a power-off handler, which needs a FADT *and*
+/// a `\_S5` package in the DSDT. When it did not, the kernel prints
+/// "Power off not available" (older kernels) or halts, and the syscall returns
+/// here — so a returning syscall is a real failure, not a race.
+fn acpi_power_off() {
+    // Which ACPI tables the guest actually parsed, straight from the kernel —
+    // stronger evidence than a dmesg line, and it names them.
+    mount("sysfs", "/sys", "sysfs");
+    let mut tables: Vec<String> = std::fs::read_dir("/sys/firmware/acpi/tables")
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name != "data" && name != "dynamic")
+                .collect()
+        })
+        .unwrap_or_default();
+    tables.sort();
+    // What the host harness greps for. Printed before the syscall, because
+    // afterwards there is no userspace left to print anything.
+    println!(
+        "VMHOST_TEST_OK poweroff via=acpi-s5 tables={}",
+        if tables.is_empty() {
+            "none".to_string()
+        } else {
+            tables.join(",")
+        }
+    );
+    // SAFETY: plain syscalls; as PID 1 we hold CAP_SYS_BOOT. tcdrain flushes the
+    // serial console first, because an ACPI power-off stops the machine between
+    // one instruction and the next.
+    unsafe {
+        libc::tcdrain(1);
+        libc::sync();
+        libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+    }
+    // Only reachable if the kernel had no way to power off.
+    println!("VMHOST_TEST_FAIL poweroff kernel-refused-power-off");
 }
 
 /// Value of a `key=` parameter on the kernel command line.

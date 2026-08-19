@@ -388,6 +388,7 @@ dependencies = [
  "linux-boot",
  "machine-x86",
  "tracing",
+ "uefi-boot",
  "virtio-block",
  "virtio-core",
  "vmm-core",

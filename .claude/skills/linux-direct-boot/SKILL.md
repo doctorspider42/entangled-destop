@@ -24,9 +24,12 @@ Use the `linux-loader` crate (already a workspace dependency, feature
    `boot_params.hdr.cmd_line_ptr`.
 4. Zero page at `layout::ZERO_PAGE_START`: `boot_params` with
    `type_of_loader = 0xff`, E820 entries from `machine_x86::e820_map()`,
-   initrd fields, and the setup header copied back from the load result
-   (`linux-loader` has `configure_64bit_entry` helpers under
-   `loader::x86_64` — prefer them).
+   `acpi_rsdp_addr = layout::ACPI_RSDP_START`, initrd fields, and the setup
+   header copied back from the load result (`linux-loader` has
+   `configure_64bit_entry` helpers under `loader::x86_64` — prefer them).
+   The ACPI tables themselves are *not* written here: the machine publishes them
+   with `machine_x86::acpi::write` next to `mptable::write`, and this path only
+   advertises where they are (see the `acpi-machine` skill).
 5. vCPU0 starts in 64-bit mode at `bzimage_entry` with `rsi` = zero page GPA
    (see kvm-machine skill for the register/paging setup).
 

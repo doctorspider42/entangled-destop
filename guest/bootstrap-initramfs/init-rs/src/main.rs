@@ -199,8 +199,11 @@ fn errno() -> i32 {
 }
 
 /// Prints the diagnostic and terminates the VM: restart ends in a triple
-/// fault the host reports as a clean shutdown (this machine has no ACPI
-/// power-off). MVP-1106: the error must be readable on the serial console.
+/// fault the host reports as a clean shutdown. (The machine does have an ACPI
+/// power-off now, but restart works with or without ACPI and does not depend on
+/// the DSDT having been parsed — which is exactly the situation a fatal
+/// bootstrap error may be in.) MVP-1106: the error must be readable on the
+/// serial console.
 fn die(message: &str) -> ! {
     eprintln!("entangled-bootstrap: FATAL: {message}");
     // Drain the serial console before rebooting: the lean bootstrap kernel

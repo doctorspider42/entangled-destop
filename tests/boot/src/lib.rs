@@ -22,6 +22,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::cell::Cell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -59,6 +60,11 @@ pub struct BootSpec {
     /// Keep the guest running past the ready marker until this string appears
     /// (a probe's `VMHOST_TEST_OK`/`FAIL` line) or the deadline expires.
     pub await_marker: Option<String>,
+    /// Let the guest end the VM itself instead of stopping it from the host:
+    /// wait until every vCPU thread has finished (or the deadline expires) and
+    /// report what ended it. This is what distinguishes an ACPI power-off from
+    /// "the harness gave up" — see [`BootOutcome::ended_by_guest`].
+    pub await_exit: bool,
     pub notify: QueueNotifyMode,
     /// Which virtio transport the devices sit on. `Mmio` is the default, so an
     /// existing test keeps booting the machine it always booted.
@@ -77,6 +83,7 @@ impl BootSpec {
             vcpus: 1,
             extra_cmdline: String::new(),
             await_marker: None,
+            await_exit: false,
             // Honours ENTANGLED_QUEUE_NOTIFY like the real binary does, so a
             // whole test run can be flipped to the synchronous path from the
             // environment; benchmarks override it per boot.
@@ -93,6 +100,24 @@ impl BootSpec {
             existing => format!("{existing} entangled.blkbench={mib}"),
         };
         self.await_marker = Some("blkbench".into());
+        self
+    }
+
+    /// Requests the guest's ACPI power-off probe: the init calls
+    /// `reboot(LINUX_REBOOT_CMD_POWER_OFF)`, which only ends the VM if the FADT,
+    /// the DSDT's `\_S5` and the ACPI PM block all work. The harness then waits
+    /// for the VM to end *itself*.
+    pub fn with_poweroff_probe(mut self) -> Self {
+        self.extra_cmdline = match self.extra_cmdline.trim() {
+            "" => "entangled.poweroff=1".into(),
+            existing => format!("{existing} entangled.poweroff=1"),
+        };
+        self.await_exit = true;
+        self
+    }
+
+    pub fn with_vcpus(mut self, vcpus: u32) -> Self {
+        self.vcpus = vcpus;
         self
     }
 
@@ -141,6 +166,18 @@ pub struct BootOutcome {
 impl BootOutcome {
     pub fn reached_ready(&self) -> bool {
         self.time_to_ready.is_some()
+    }
+
+    /// True when every vCPU ended because the *guest* stopped
+    /// ([`RunOutcome::Shutdown`]) rather than because the harness asked it to
+    /// ([`RunOutcome::Stopped`]). An ACPI power-off, a triple-fault reboot and a
+    /// `hlt` all count; the harness giving up does not.
+    pub fn ended_by_guest(&self) -> bool {
+        !self.vcpu_outcomes.is_empty()
+            && self
+                .vcpu_outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, Ok(RunOutcome::Shutdown) | Ok(RunOutcome::Halted)))
     }
 
     /// Extracts a `VMHOST_TEST_OK <name> key=value …` probe line's fields.
@@ -215,6 +252,10 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
     // verify): route device IRQs through the IOAPIC instead of the 8259
     // virtual-wire fallback, where irqfd edges were lost ~1 boot in 3.
     machine_x86::mptable::write(vm.memory(), machine.vcpu_count).map_err(|e| e.to_string())?;
+    // ACPI tables (RSDP..DSDT). Published alongside the MP table, not instead of
+    // it: Linux prefers the MADT, the MP table stays the `acpi=off` fallback.
+    // `linux_boot::load` points `boot_params.acpi_rsdp_addr` at the RSDP.
+    machine_x86::acpi::write(vm.memory(), machine.vcpu_count).map_err(|e| e.to_string())?;
 
     let capture = Capture::default();
     let serial =
@@ -277,35 +318,42 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
     let run_started = Instant::now();
     let threads = spawn_vcpus(vcpus, |_| Box::new(bus.clone())).map_err(|e| e.to_string())?;
 
-    let mut time_to_ready = None;
-    let mut panicked = false;
-    while run_started.elapsed() < spec.deadline {
-        let text = capture.text();
-        if time_to_ready.is_none() && text.contains(GUEST_READY_MARKER) {
-            time_to_ready = Some(run_started.elapsed());
-            if spec.await_marker.is_none() {
-                break;
+    // `join_or_stop` returns as soon as every vCPU has ended on its own — the
+    // test initramfs reboots itself after the marker, which reaches the host as
+    // KVM_EXIT_SHUTDOWN, and an ACPI power-off arrives the same way — or as soon
+    // as this predicate says the harness has seen enough.
+    let time_to_ready = Cell::new(None);
+    let panicked = Cell::new(false);
+    let vcpu_outcomes = threads.join_or_stop(
+        || {
+            let text = capture.text();
+            if time_to_ready.get().is_none() && text.contains(GUEST_READY_MARKER) {
+                time_to_ready.set(Some(run_started.elapsed()));
+                if spec.await_marker.is_none() && !spec.await_exit {
+                    return true;
+                }
             }
-        }
-        if let Some(probe) = &spec.await_marker {
-            // Either outcome line ends the wait; the test decides what a FAIL
-            // means for it. The whole line must have arrived — stopping the VM
-            // mid-line would truncate the very numbers we came for.
-            if complete_line_with(&text, &format!("VMHOST_TEST_OK {probe} "))
-                || complete_line_with(&text, &format!("VMHOST_TEST_FAIL {probe} "))
-            {
-                break;
+            if let Some(probe) = &spec.await_marker {
+                // Either outcome line ends the wait; the test decides what a
+                // FAIL means for it. The whole line must have arrived — stopping
+                // the VM mid-line would truncate the very numbers we came for.
+                if !spec.await_exit
+                    && (complete_line_with(&text, &format!("VMHOST_TEST_OK {probe} "))
+                        || complete_line_with(&text, &format!("VMHOST_TEST_FAIL {probe} ")))
+                {
+                    return true;
+                }
             }
-        }
-        if text.contains(PANIC_MARKER) {
-            panicked = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    // The test initramfs reboots itself after the marker, which reaches the host
-    // as KVM_EXIT_SHUTDOWN; `stop` joins whether or not that already happened.
-    let vcpu_outcomes = threads.stop();
+            if text.contains(PANIC_MARKER) {
+                panicked.set(true);
+                return true;
+            }
+            run_started.elapsed() >= spec.deadline
+        },
+        Duration::from_millis(2),
+    );
+    let time_to_ready = time_to_ready.get();
+    let panicked = panicked.get();
 
     let mut serial = capture.text();
     if time_to_ready.is_none() {

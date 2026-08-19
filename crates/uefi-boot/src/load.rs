@@ -95,8 +95,17 @@ pub fn load_pvh<M: GuestMemory>(
 
     let start_info = pvh::StartInfo {
         cmdline_paddr: layout::PVH_CMDLINE_START,
-        // No ACPI tables yet — see ADR-0003's phase 2 gap map.
-        rsdp_paddr: 0,
+        // Where `machine_x86::acpi` puts the RSDP. EDK2's `InstallCloudHvTables`
+        // reads this pointer, walks the XSDT installing every table it lists,
+        // then installs the DSDT from the FADT's X_DSDT — so a zero here is
+        // exactly the "InstallAcpiTables: Not Found" of ADR-0003's phase 2 gap
+        // map, and a wrong-but-non-zero value would be caught by the RSDP
+        // signature/checksum before anything is installed.
+        //
+        // Advertised whether or not `acpi::write` was called (that is the
+        // machine's job, next to `mptable::write`): the firmware validates the
+        // structure it finds, and a zeroed region fails that validation.
+        rsdp_paddr: layout::ACPI_RSDP_START,
         memmap_paddr: layout::PVH_MEMMAP_START,
         memmap_entries: entries.len() as u32,
     };

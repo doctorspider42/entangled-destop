@@ -51,10 +51,17 @@ unit tests live with their crates.
 - The minimal test initramfs `/init` prints the ready marker, optionally
   runs a scripted probe (mount `/dev/vda`, `evtest`, DHCP check), prints a
   per-check `VMHOST_TEST_OK <name>` / `VMHOST_TEST_FAIL <name>` line, then
-  calls `reboot(RESTART)` — NOT power-off: the machine has no ACPI, so
-  power-off halts forever, while restart (with `reboot=k`) ends in a triple
-  fault that reaches the host as a clean KVM_EXIT_SHUTDOWN. Test harnesses
-  parse only these markers — never scrape free-form kernel output.
+  calls `reboot(RESTART)`: with `reboot=k` that ends in a triple fault which
+  reaches the host as a clean KVM_EXIT_SHUTDOWN, and it works on every machine
+  we boot. Test harnesses parse only these markers — never scrape free-form
+  kernel output.
+- `entangled.poweroff=1` switches the exit to `reboot(POWER_OFF)`, i.e. the ACPI
+  S5 path, and makes the probe report which tables the guest found in
+  `/sys/firmware/acpi/tables`. Opt-in on purpose: it exercises the FADT, the
+  DSDT's `\_S5` and the host's ACPI PM block, which is a different claim from
+  "the guest booted". Pair it with `BootSpec::with_poweroff_probe()`, which
+  waits for the *guest* to end the VM (`BootOutcome::ended_by_guest`) instead of
+  stopping it from the host — otherwise a broken S5 path looks like a pass.
 - Sources: `guest/test-rootfs/init-rs` (static musl init), built by
   `scripts/build-test-initramfs.sh`; kernel via `scripts/fetch-test-kernel.sh`.
 
@@ -75,16 +82,22 @@ thread count *identical* to the settled baseline (taken after five warm-up
 boots), RSS within 32 MiB — and that every boot reaches `VMHOST_GUEST_READY`.
 The leak assertions run first, so a run with stalls still reports them.
 
-**Current result (100 boots, no virtio devices): 73/100 reached the marker; fds
-and threads exactly flat, RSS 4080 → 4124 KiB.** So nothing leaks, but the
-100/100 acceptance criterion is not met: about a quarter of boots stall at
-exactly `Run /init as init process` — the first userspace write to the
-interrupt-driven 8250 tty (`printk` before it uses the polled path) — waiting for
-a transmitter-empty interrupt on IRQ 4 that never arrives. With a disk attached
-the same defect stalls the first disk read with `INTERRUPT_STATUS` still reading
-`INT_VRING`. Root cause: no MP table or MADT, so Linux uses virtual-wire ExtINT
-through the 8259 instead of the IOAPIC. See the `IrqFdLine` docs in
-`machine_x86::virtio`. Do not "fix" this by loosening the test.
+**Original result (100 boots, before any interrupt topology existed): 73/100
+reached the marker; fds and threads exactly flat, RSS 4080 → 4124 KiB.** Nothing
+leaked, but about a quarter of boots stalled at exactly `Run /init as init
+process` — the first userspace write to the interrupt-driven 8250 tty (`printk`
+before it uses the polled path) — waiting for a transmitter-empty interrupt on
+IRQ 4 that never arrived. With a disk attached the same defect stalled the first
+disk read with `INTERRUPT_STATUS` still reading `INT_VRING`. Root cause: no MP
+table or MADT, so Linux used virtual-wire ExtINT through the 8259 instead of the
+IOAPIC. See the `IrqFdLine` docs in `machine_x86::virtio`. Do not "fix" this by
+loosening the test.
+
+**After the MP table and the MADT (25 boots with a virtio-blk disk):
+25/25 reached the marker, 3677/4056/5124 ms min/median/max, fds and threads flat,
+RSS 4244 → 4272 KiB.** Interrupts now route through the IOAPIC from the MADT
+(`ACPI: Using ACPI (MADT) for SMP configuration information`); re-run the full
+100 before claiming EPIC 14's acceptance number.
 
 Knobs:
 
@@ -102,6 +115,34 @@ The queue-notify measurement uses the same harness:
 
 ```bash
 cargo test -p boot-tests --test notify_bench -- --ignored --nocapture
+```
+
+## ACPI tests
+
+Details and the expected serial output are in the `acpi-machine` skill; what
+matters here is the shape of the coverage.
+
+- **Tier 1** (`machine_x86::acpi`, 30 tests): per-table length/checksum/field
+  checks, the two power-off writes, write-1-to-clear register semantics, and
+  bounds on guest accesses to the PM block. Runs on Windows too.
+- **Tier 1, external** (`crates/machine-x86/tests/acpi_dump.rs`, `#[ignore]`d):
+  dumps the tables so `iasl -d` can decode them. An AML change is not reviewed
+  until its disassembly has been read.
+- **Tier 3** (`vmm-core/tests/smoke.rs`): a real guest writes S5 to `0x600` and
+  then spins forever, so only `ExitHandler::shutdown_requested` can end the run
+  loop. Bounded with `join_or_stop`, so a regression fails instead of hanging.
+- **Tier 4** (`tests/boot/tests/acpi.rs`, 4 tests): the guest kernel must find
+  our tables and use the MADT for SMP, a 2-vCPU guest must see 2 CPUs, `acpi=off`
+  must still boot through the MP table, and `poweroff` must end the VM through
+  ACPI. `--nocapture` prints every ACPI/APIC line the guest produced, which is
+  the evidence for any claim about this area.
+- **Tier 4** (`tests/boot/tests/uefi_acpi.rs`): EDK2 CloudHv must install our
+  tables (`OnRootBridgesConnected` prints `InstallAcpiTables: <status>` only on
+  failure) and find the right number of CPUs.
+
+```bash
+cargo test -p boot-tests --test acpi -- --test-threads=1 --nocapture
+cargo test -p boot-tests --test uefi_acpi -- --nocapture
 ```
 
 ## UEFI firmware tests (EPIC 18)
@@ -131,7 +172,15 @@ existing device/serial tests are unaffected by any of it.
    exception would depend on the IDT, and this test must not touch the very
    state it is verifying.
    `crates/vmm-core/tests/cpuid.rs` guards the related trap — each vCPU must
-   report *its own* index as the initial APIC ID, not the host CPU's.
+   report *its own* index as the initial APIC ID, not the host CPU's, in **every**
+   leaf that carries one (1, `0xb`, `0x1f`, `0x8000_001e`, `0x8000_0026`; Linux
+   prefers `0x8000_001e` on AMD hosts).
+4. **KVM, full firmware boot** (`tests/boot/tests/uefi_acpi.rs`, tier 4): boots
+   the real `artifacts/firmware/CLOUDHV.fd` to the Boot Manager and asserts on
+   its log — ACPI tables installed, CPU count right, no `ASSERT`. Self-skips
+   without the firmware artifact. This is the automated version of the manual
+   bring-up below; run it after any change to the machine's firmware-facing
+   devices or to the ACPI tables.
 
 Manual firmware bring-up (needs `bash guest/firmware/build-cloudhv.sh` once,
 ~2.5 min, ~2 GiB of EDK2 checkout in `~/.cache/entangled-edk2`):

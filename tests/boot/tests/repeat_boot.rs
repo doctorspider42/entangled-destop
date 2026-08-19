@@ -45,11 +45,18 @@
 //! the same defect shows up on the first disk read, with the device's
 //! `INTERRUPT_STATUS` still reading `INT_VRING`.
 //!
-//! The machine model publishes neither an MP table nor ACPI tables, so Linux
-//! reports "ACPI MADT or MP tables are not detected" and switches to virtual-wire
-//! mode: every interrupt, serial included, goes through the 8259 as ExtINT
-//! instead of through the in-kernel IOAPIC. Giving the guest a real interrupt
-//! topology is the fix; see the `IrqFdLine` docs in `machine_x86::virtio`.
+//! At the time of that measurement the machine model published neither an MP
+//! table nor ACPI tables, so Linux reported "ACPI MADT or MP tables are not
+//! detected" and switched to virtual-wire mode: every interrupt, serial
+//! included, went through the 8259 as ExtINT instead of through the in-kernel
+//! IOAPIC. Giving the guest a real interrupt topology was the fix; see the
+//! `IrqFdLine` docs in `machine_x86::virtio`.
+//!
+//! Both tables are published now (`machine_x86::mptable` and
+//! `machine_x86::acpi`), and Linux takes the IOAPIC path from the MADT. Latest
+//! measurement, 25 iterations with a virtio-blk disk: **25/25 reached the
+//! marker**, 3677/4056/5124 ms min/median/max, fds and threads flat, RSS
+//! 4244 → 4272 KiB. The full 100 has not been re-run since.
 //!
 //! The assertions are deliberately left strict — 100/100 boots is EPIC 14's
 //! acceptance criterion, and this test is the gate for it. The leak assertions run

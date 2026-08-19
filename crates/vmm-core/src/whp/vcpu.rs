@@ -273,6 +273,12 @@ impl WhpVcpu {
                     )))
                 }
             }
+            // Same check as the KVM loop: a device (the ACPI PM block) may have
+            // latched a power-off request while handling that exit, and the
+            // guest will not exit again on its own afterwards.
+            if handler.shutdown_requested() {
+                return Ok(RunOutcome::Shutdown);
+            }
         }
         Ok(RunOutcome::Stopped)
     }

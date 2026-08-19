@@ -46,8 +46,9 @@ const REG_A: u8 = 0x0a;
 const REG_B: u8 = 0x0b;
 const REG_C: u8 = 0x0c;
 const REG_D: u8 = 0x0d;
-/// De-facto standard century register (as used by ACPI's FADT century field).
-const REG_CENTURY: u8 = 0x32;
+/// De-facto standard century register (as used by ACPI's FADT century field —
+/// `crate::acpi` publishes this index there, so the two cannot drift).
+pub const REG_CENTURY: u8 = 0x32;
 
 /// Register B bits.
 const REG_B_DSE: u8 = 1 << 0; // daylight saving enable
