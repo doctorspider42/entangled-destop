@@ -189,6 +189,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             width: 1280,
             height: 800,
             scale: 1.0,
+            virgl: false,
         },
     };
 
@@ -279,6 +280,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             width: 1280,
             height: 800,
             scale: 1.0,
+            virgl: false,
         },
     };
     let profile_path = args.disk.with_file_name(format!("{vm_name}.toml"));

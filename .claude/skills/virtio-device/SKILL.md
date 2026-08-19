@@ -161,7 +161,13 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_gpu::resource::MAX_TOTAL_RESOURCE_PIXELS` | 8× the above | pixels across all live resources | `virtio_gpu::resource::tests::resource_count_and_total_pixels_are_capped`, `gpu_queue::too_many_resources_run_out_of_host_memory_cleanly` |
 | `virtio_gpu::resource::MAX_RESOURCES` | 64 | live host resources | same tests |
 | `virtio_gpu::resource::MAX_BACKING_ENTRIES` | 16384 | entries in one attach-backing list | `gpu_queue::transfers_without_backing_or_with_short_backing_are_rejected` |
-| `virtio_gpu::MAX_COMMAND_BYTES` | ≈256 KiB | bytes gathered for one controlq command | `virtio_gpu::device::tests::gather_request_refuses_a_chain_over_the_command_cap`, `gpu_queue::oversized_commands_are_rejected_without_staging_them` |
+| `virtio_gpu::MAX_COMMAND_BYTES` | ≈256 KiB | bytes gathered for one controlq command (2D-only device) | `virtio_gpu::device::tests::gather_request_refuses_a_chain_over_the_command_cap`, `gpu_queue::oversized_commands_are_rejected_without_staging_them` |
+| `virtio_gpu::MAX_COMMAND_BYTES_3D` | 1 MiB + 32 B | gather cap with a 3D renderer attached (a full `SUBMIT_3D`) | `virtio_gpu::device::tests::the_3d_command_cap_covers_a_full_submit_and_nothing_more`, `gpu_3d::a_malicious_3d_guest_is_answered_in_band` |
+| `virtio_gpu::renderer::MAX_SUBMIT_BYTES` | 1 MiB | one `SUBMIT_3D` command stream | `gpu_3d::a_malicious_3d_guest_is_answered_in_band`, `null_renderer::tests::the_validation_front_rejects_what_the_spec_says_it_must` |
+| `virtio_gpu::renderer::MAX_CONTEXTS` | 128 | live 3D rendering contexts | `null_renderer::tests::the_context_and_resource_caps_hold` |
+| `virtio_gpu::renderer::MAX_3D_RESOURCES` | 16384 | live 3D resources | same test |
+| `virtio_gpu::renderer::MAX_TOTAL_3D_ELEMENTS` | 2³⁰ | width×height×depth×layers summed over live 3D resources (bytes-per-element is the renderer's) | same test (asserts the budget is exact) |
+| `virtio_gpu::renderer::MAX_3D_WIDTH` / `MAX_3D_DIM` / `MAX_3D_ARRAY` / `MAX_3D_LAST_LEVEL` / `MAX_3D_SAMPLES` | 2²⁸ / 16384 / 2048 / 15 / 32 | per-axis geometry of one `RESOURCE_CREATE_3D` | `gpu_3d::a_malicious_3d_guest_is_answered_in_band` |
 | `virtio_gpu::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick (controlq and cursorq) | same shape as the blk budget test |
 | `virtio_input::MAX_PENDING_EVENTS` | 1024 | host-buffered input events while the guest is not draining (oldest dropped) | `input_queue::a_starved_queue_buffers_events_up_to_the_bound_and_drops_the_oldest` |
 | `virtio_input::config::PAYLOAD_MAX` | 128 | config-space payload bytes | `virtio_input::config::tests::{bitmap_drops_codes_beyond_the_payload, from_slice_truncates_at_the_payload_size}` |
@@ -267,6 +273,24 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
   The device reaches the window through the `virtio_gpu::ScanoutSink` trait
   (`GpuDevice::new(display_handle)`) — `display` depends on `virtio-gpu`, never
   the other way round.
+  **3D (ADR-0004, GPU-002…012):** `GpuDevice::with_renderer` adds
+  `VIRTIO_GPU_F_VIRGL`, capsets and the 3D command set. All decode/validation
+  is portable (`virtio_gpu::renderer::Gpu3d` — bounded id tables, per-mip box
+  checks, the `SUBMIT_3D` length walk); the host renderer sits behind the
+  `Renderer3d` trait: `NullRenderer` (portable, tests/fuzzing) and
+  `virtio_gpu::virgl::VirglRenderer` (Linux; dlopens libvirglrenderer at
+  runtime, EGL surfaceless, lazy init on the worker thread because EGL is
+  thread-affine, guest resets deferred to the next worker-thread call, iovec
+  arrays + an `Arc<GuestMem>` owned for as long as the C side holds the
+  pointers, never `virgl_renderer_cleanup`/dlclose — mesa TLS destructors
+  SIGSEGV). In virgl mode the guest kernel creates *every* object through
+  `RESOURCE_CREATE_3D`, so scanout/cursor/attach/unref route by which table
+  owns the id; flushes read back through `Renderer3d::read_rect_bgra` into
+  the same `ScanoutSink`. Fences complete synchronously (phase 1). Enable per
+  VM with `[display] virgl = true`. Tests: `tests/gpu_3d.rs` (transport-level,
+  any OS), `tests/virgl_host.rs` (real GL, self-skips),
+  `boot-tests/virgl_gnome.rs` (GNOME live on virgl, `--ignored`), fuzz target
+  `gpu_3d_commands`.
 - **input** (EPIC 9): event model in `virtio_input` (`ev`, `abs`, `btn`,
   `InputEvent`). Absolute pointer: window coords →
   `InputEvent::abs_from_window` (0..=32767). Every batch ends with

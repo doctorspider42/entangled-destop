@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "debian-media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "pgp",
@@ -673,6 +673,7 @@ dependencies = [
  "libfuzzer-sys",
  "virtio-block",
  "virtio-core",
+ "virtio-gpu",
  "vm-memory 0.17.2",
 ]
 
@@ -988,6 +989,16 @@ checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
 dependencies = [
  "arbitrary",
  "cc",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
 ]
 
 [[package]]
@@ -1981,7 +1992,7 @@ checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
 
 [[package]]
 name = "virtio-block"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
  "tracing",
@@ -1992,10 +2003,22 @@ dependencies = [
 
 [[package]]
 name = "virtio-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
  "tracing",
+ "virtio-queue",
+ "vm-memory 0.17.2",
+]
+
+[[package]]
+name = "virtio-gpu"
+version = "0.2.0"
+dependencies = [
+ "libloading",
+ "thiserror",
+ "tracing",
+ "virtio-core",
  "virtio-queue",
  "vm-memory 0.17.2",
 ]

@@ -4435,6 +4435,7 @@ name = "virtio-gpu"
 version = "0.2.0"
 dependencies = [
  "display",
+ "libloading",
  "png",
  "thiserror 2.0.20",
  "tracing",

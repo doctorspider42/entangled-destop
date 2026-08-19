@@ -67,16 +67,22 @@
 pub mod device;
 pub mod edid;
 pub mod error;
+pub mod null_renderer;
 pub mod protocol;
+pub mod renderer;
 pub mod resource;
 pub mod sink;
+#[cfg(target_os = "linux")]
+pub mod virgl;
 
 pub use device::{
-    GpuDevice, CHAINS_PER_NOTIFY, CONTROL_QUEUE, CURSOR_QUEUE, MAX_COMMAND_BYTES, NUM_CAPSETS,
-    NUM_QUEUES, NUM_SCANOUTS,
+    GpuDevice, CHAINS_PER_NOTIFY, CONTROL_QUEUE, CURSOR_QUEUE, MAX_COMMAND_BYTES,
+    MAX_COMMAND_BYTES_3D, NUM_CAPSETS, NUM_QUEUES, NUM_SCANOUTS,
 };
 pub use error::CommandError;
+pub use null_renderer::NullRenderer;
 pub use protocol::{cmd, resp, CtrlHdr, Rect, FLAG_FENCE, FLAG_INFO_RING_IDX};
+pub use renderer::{CapsetInfo, Gpu3d, Renderer3d};
 pub use resource::{Resource, ResourceTable};
 pub use sink::{ScanoutSink, SinkError};
 
@@ -100,6 +106,13 @@ pub const FORMAT_B8G8R8X8_UNORM: u32 = 2;
 
 /// Bytes per pixel for both accepted formats.
 pub const BYTES_PER_PIXEL: u32 = 4;
+
+/// `VIRTIO_GPU_F_VIRGL` (GPU-002): the device executes 3D commands through a
+/// host renderer (ADR-0004). Offered only when [`GpuDevice::with_renderer`]
+/// attached one — a guest seeing this bit switches its whole mesa stack onto
+/// the virgl driver, so offering it without a working renderer would be worse
+/// than 2D.
+pub const VIRTIO_GPU_F_VIRGL: u64 = 1 << 0;
 
 /// `VIRTIO_GPU_F_EDID` (MVP-811): the device answers `GET_EDID` with a valid
 /// EDID block ([`edid`]). Offered because GNOME/mutter sizes and names its

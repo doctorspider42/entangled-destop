@@ -1,6 +1,6 @@
 [package]
 name = "virtio-gpu"
-description = "virtio-gpu 2D device (scanout, transfer, flush)"
+description = "virtio-gpu device: 2D scanout plus VirGL 3D behind a renderer trait"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,11 @@ tracing.workspace = true
 virtio-core.workspace = true
 virtio-queue.workspace = true
 vm-memory.workspace = true
+
+# The real 3D renderer (ADR-0004) dlopens libvirglrenderer at runtime; the
+# loader itself is the only build-time dependency, and only on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading.workspace = true
 
 [dev-dependencies]
 virtio-core = { workspace = true, features = ["test-utils"] }

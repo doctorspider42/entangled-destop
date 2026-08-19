@@ -361,6 +361,46 @@ pub fn read_backing(
     })
 }
 
+/// Writes `src` into the scattered backing store starting at linear offset
+/// `offset` — the reverse of [`read_backing`], used by `TRANSFER_FROM_HOST_3D`
+/// (the guest reading rendered pixels back).
+///
+/// The same two-pass discipline: every chunk is checked against guest RAM
+/// before anything is written, so a rejected transfer writes nothing.
+pub fn write_backing(
+    mem: &GuestMem,
+    entries: &[MemEntry],
+    offset: u64,
+    src: &[u8],
+) -> Result<(), CommandError> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    walk_backing(entries, offset, src.len(), |addr, len, _at| {
+        if mem.check_range(GuestAddress(addr), len) {
+            Ok(())
+        } else {
+            Err(CommandError::Unreadable {
+                addr,
+                reason: format!("{len} bytes from here are not guest RAM"),
+            })
+        }
+    })?;
+    walk_backing(entries, offset, src.len(), |addr, len, at| {
+        let chunk = src
+            .get(at..at.saturating_add(len))
+            .ok_or(CommandError::Unreadable {
+                addr,
+                reason: "backing chunk does not fit the source".into(),
+            })?;
+        mem.write_slice(chunk, GuestAddress(addr))
+            .map_err(|error| CommandError::Unreadable {
+                addr,
+                reason: error.to_string(),
+            })
+    })
+}
+
 /// Every live resource, keyed by the guest-chosen resource id.
 #[derive(Debug, Default)]
 pub struct ResourceTable {

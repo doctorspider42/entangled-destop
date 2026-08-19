@@ -247,6 +247,10 @@ pub struct DisplaySection {
     pub width: u32,
     pub height: u32,
     pub scale: f32,
+    /// 3D acceleration (ADR-0004): offer `VIRTIO_GPU_F_VIRGL` backed by a
+    /// host virglrenderer. Off by default; a host that cannot bring the
+    /// renderer up fails `entangled run` rather than silently booting 2D.
+    pub virgl: bool,
 }
 
 impl Default for DisplaySection {
@@ -255,6 +259,7 @@ impl Default for DisplaySection {
             width: 1920,
             height: 1080,
             scale: 1.0,
+            virgl: false,
         }
     }
 }

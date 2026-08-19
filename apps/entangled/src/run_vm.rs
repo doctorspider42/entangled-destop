@@ -273,8 +273,34 @@ fn build_devices(
 
     // Presentation + virtio-gpu (EPIC 7/8): the device pushes scanout pixels
     // into the display handle; with a window they appear on screen, headless
-    // they are still screenshot-able.
-    devices.push(Box::new(virtio_gpu::GpuDevice::new(display_handle)));
+    // they are still screenshot-able. With `[display] virgl = true`
+    // (ADR-0004) the device additionally executes 3D command streams through
+    // the host's virglrenderer — or the run fails, loudly: a profile that
+    // asked for 3D and silently got llvmpipe is the bug the option exists to
+    // fix.
+    if cfg.display.virgl {
+        #[cfg(target_os = "linux")]
+        {
+            let renderer = virtio_gpu::virgl::VirglRenderer::load()
+                .map_err(|e| format!("[display] virgl = true, but {e}"))?;
+            tracing::info!("attaching virtio-gpu with the virgl 3D renderer");
+            devices.push(Box::new(virtio_gpu::GpuDevice::with_renderer(
+                display_handle,
+                Box::new(renderer),
+            )));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(
+                "[display] virgl = true is Linux-only for now: the host renderer \
+                 (virglrenderer) speaks EGL. See docs/adr/0004-virtio-gpu-3d.md \
+                 for the Windows plan, or drop the option to run with 2D"
+                    .into(),
+            );
+        }
+    } else {
+        devices.push(Box::new(virtio_gpu::GpuDevice::new(display_handle)));
+    }
 
     // virtio-input keyboard + tablet (EPIC 9); handles stay on the host side
     // and are fed from the window's input capture.

@@ -29,6 +29,7 @@ arbitrary = { version = "1", features = ["derive"] }
 virtio-core = { path = "../crates/virtio-core", features = ["test-utils"] }
 vm-memory = { version = "0.17", features = ["backend-mmap"] }
 virtio-block = { path = "../crates/virtio-block" }
+virtio-gpu = { path = "../crates/virtio-gpu" }
 debian-media = { path = "../crates/debian-media" }
 
 [[bin]]
@@ -55,6 +56,13 @@ bench = false
 [[bin]]
 name = "blk_request"
 path = "fuzz_targets/blk_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gpu_3d_commands"
+path = "fuzz_targets/gpu_3d_commands.rs"
 test = false
 doc = false
 bench = false
