@@ -181,7 +181,11 @@ impl VirtioMmioBus {
         };
         for (slot, device) in devices.into_iter().enumerate() {
             let base = layout::virtio_mmio_slot(slot as u64);
-            let gsi = layout::VIRTIO_MMIO_FIRST_IRQ + slot as u32;
+            // Not `first + slot`: the pins that skips are ones this machine's own
+            // legacy devices own (see `layout::VIRTIO_IRQS`). The slot count is
+            // already bounded above, so the table always has an entry.
+            let gsi = layout::virtio_irq(slot)
+                .ok_or(VirtioAttachError::TooManySlots { count: slot + 1 })?;
 
             let event = EventFd::new(EFD_NONBLOCK)
                 .map_err(|source| VirtioAttachError::EventFd { slot, source })?;
@@ -297,7 +301,7 @@ mod tests {
             .map(|n| {
                 (
                     layout::virtio_mmio_slot(n as u64),
-                    layout::VIRTIO_MMIO_FIRST_IRQ + n as u32,
+                    layout::virtio_irq(n).expect("fewer slots than the pin table holds"),
                 )
             })
             .collect()
@@ -311,7 +315,7 @@ mod tests {
             slots[1].0,
             layout::VIRTIO_MMIO_BASE + layout::VIRTIO_MMIO_SLOT_SIZE
         );
-        assert_eq!(slots[2].1, layout::VIRTIO_MMIO_FIRST_IRQ + 2);
+        assert_eq!(slots[2].1, layout::VIRTIO_IRQS[2]);
         // Every slot stays inside the 32-bit MMIO hole and clear of RAM.
         for (base, _) in &slots {
             assert!(*base >= layout::MMIO_HOLE_START);
@@ -329,9 +333,9 @@ mod tests {
             format!(
                 "virtio_mmio.device=4K@{:#x}:{} virtio_mmio.device=4K@{:#x}:{}",
                 layout::VIRTIO_MMIO_BASE,
-                layout::VIRTIO_MMIO_FIRST_IRQ,
+                layout::VIRTIO_IRQS[0],
                 layout::VIRTIO_MMIO_BASE + layout::VIRTIO_MMIO_SLOT_SIZE,
-                layout::VIRTIO_MMIO_FIRST_IRQ + 1
+                layout::VIRTIO_IRQS[1]
             )
         );
     }

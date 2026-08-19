@@ -190,7 +190,13 @@ impl VirtioPciBus {
         };
         for (slot, device) in devices.into_iter().enumerate() {
             let bar_base = layout::pci_bar_slot(slot as u64);
-            let gsi = layout::PCI_FIRST_IRQ + slot as u32;
+            // Not `first + slot`: the pins that skips are ones this machine's own
+            // legacy devices own — pin 8 is the RTC, which Linux will not share,
+            // and pin 13 is the ACPI SCI (see `layout::VIRTIO_IRQS`).
+            let gsi = layout::virtio_irq(slot).ok_or(VirtioPciAttachError::Bus {
+                slot,
+                source: PciError::BusFull,
+            })?;
 
             let event = EventFd::new(EFD_NONBLOCK)
                 .map_err(|source| VirtioPciAttachError::EventFd { slot, source })?;

@@ -82,10 +82,10 @@ pub const ACPI_PM_SIZE: u16 = 0x10;
 
 /// GSI reserved for the ACPI System Control Interrupt (FADT `SCI_INT`).
 ///
-/// Not 9, the PC convention: GSIs 5..=12 belong to the virtio-mmio slots
-/// (`VIRTIO_MMIO_FIRST_IRQ` + `MAX_VIRTIO_SLOTS`), and sharing a level-triggered
-/// SCI with an edge-triggered virtio line would be a real bug. 13 is the old
-/// coprocessor-error line, which this machine has no use for.
+/// Not 9, the PC convention: 9 is one of the pins [`VIRTIO_IRQS`] hands to
+/// devices, and sharing a level-triggered SCI with an edge-triggered virtio line
+/// would be a real bug. 13 is the old coprocessor-error line, which this machine
+/// has no use for.
 pub const ACPI_SCI_GSI: u32 = 13;
 
 /// Physical address of the local APIC (architectural default).
@@ -206,13 +206,13 @@ pub const PCI_MMIO_END: u64 = PCI_MMIO_HOLE_BASE + PCI_MMIO_HOLE_SIZE;
 
 /// First IRQ (GSI on the in-kernel IOAPIC) handed to a PCI device's INTx line.
 ///
-/// Deliberately the same pins as [`VIRTIO_MMIO_FIRST_IRQ`]: a VM runs one virtio
-/// transport, never both, so the pins cannot collide. Keeping them identical
-/// also means the MP table's ISA IRQ routing (`crate::mptable`) already covers
-/// the PCI devices — without ACPI or a `$PIR` table, Linux takes a PCI device's
-/// IRQ straight from its `interrupt_line` config register, so the pin it ends up
-/// requesting has to be one the MP table routes to the IOAPIC.
-pub const PCI_FIRST_IRQ: u32 = VIRTIO_MMIO_FIRST_IRQ;
+/// Deliberately the same pins as the virtio-mmio slots use ([`VIRTIO_IRQS`]): a
+/// VM runs one virtio transport, never both, so the pins cannot collide. Sharing
+/// the list also means the MP table's ISA IRQ routing (`crate::mptable`) already
+/// covers the PCI devices — without a `_PRT` or a `$PIR` table, Linux takes a PCI
+/// device's IRQ straight from its `interrupt_line` config register, so the pin it
+/// ends up requesting has to be one the MP table routes to the IOAPIC.
+pub const PCI_FIRST_IRQ: u32 = VIRTIO_IRQS[0];
 
 /// Guest physical base address of the BAR window for PCI slot `n`.
 pub const fn pci_bar_slot(n: u64) -> u64 {
@@ -239,9 +239,49 @@ pub const VIRTIO_MMIO_BASE: u64 = 0xd000_0000;
 /// Size of each virtio-mmio device slot (one 4 KiB page).
 pub const VIRTIO_MMIO_SLOT_SIZE: u64 = 0x1000;
 
-/// First IRQ number handed to virtio-mmio devices (GSI on the in-kernel
-/// IOAPIC). Legacy devices (serial) use the classic ISA IRQs below this.
-pub const VIRTIO_MMIO_FIRST_IRQ: u32 = 5;
+/// First IRQ number handed to virtio devices (GSI on the in-kernel IOAPIC).
+/// Legacy devices (serial) use the classic ISA IRQs below this.
+///
+/// Kept as its own name because it is what a single-device VM gets, which is
+/// what most tests assert; the full assignment is [`VIRTIO_IRQS`].
+pub const VIRTIO_MMIO_FIRST_IRQ: u32 = VIRTIO_IRQS[0];
+
+/// IOAPIC pins handed to virtio devices, in slot order — **not** a contiguous
+/// range, on purpose.
+///
+/// Both transports take a device's line from here. Assignment used to be
+/// `first + slot`, i.e. 5..=12, which quietly collided with two pins this
+/// machine's *own* legacy devices already own:
+///
+/// * **8 — the MC146818 RTC** (`crate::rtc`). Linux registers `rtc_cmos` on IRQ 8
+///   and does not share it, so a virtio device on pin 8 gets `-EBUSY` out of
+///   `request_irq` (both transports ask for `IRQF_SHARED`) and its probe ends in
+///   `VIRTIO_CONFIG_S_FAILED`;
+/// * **13 — the ACPI SCI** ([`ACPI_SCI_GSI`]), level-triggered where a virtio line
+///   is an edge.
+///
+/// This was measured, not reasoned about. Booting the Ubuntu installer with five
+/// devices left exactly one dead — the keyboard, on pin 8. Adding a third disk to
+/// shift every later device up one slot moved the failure to the *GPU*, which had
+/// inherited pin 8, and let both input devices bind: the fault followed the pin,
+/// not the device.
+///
+/// 6 (floppy), 7 (LPT), 12 (PS/2 aux) and 14 (IDE) are safe here because this
+/// machine emulates none of those controllers, and the FADT's `IAPC_BOOT_ARCH`
+/// already tells the guest so (`LEGACY_DEVICES` and `8042` both clear). 4 is the
+/// UART, 0/1/2 are the timer, keyboard and cascade.
+///
+/// Eight entries, matching `virtio::MAX_VIRTIO_SLOTS` and [`PCI_MMIO_SLOTS`].
+pub const VIRTIO_IRQS: [u32; PCI_MMIO_SLOTS as usize] = [5, 6, 7, 9, 10, 11, 12, 14];
+
+/// The IOAPIC pin for virtio slot `n`, or `None` when there is no such slot.
+pub const fn virtio_irq(n: usize) -> Option<u32> {
+    if n < VIRTIO_IRQS.len() {
+        Some(VIRTIO_IRQS[n])
+    } else {
+        None
+    }
+}
 
 /// Returns the guest physical base address of virtio-mmio slot `n`.
 pub const fn virtio_mmio_slot(n: u64) -> u64 {
