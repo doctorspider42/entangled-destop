@@ -472,7 +472,9 @@ struct WaylandCursors {
 
 /// The classic left-pointer, one row per line: `B` black, `W` white outline,
 /// space transparent. Drawn here so showing the cursor never depends on the
-/// host's cursor-theme installation.
+/// host's cursor-theme installation. Only the Wayland path renders it, but the
+/// image is checked by the unit tests on every host.
+#[cfg(any(target_os = "linux", test))]
 const ARROW_PIXELS: [&str; 19] = [
     "W           ",
     "WW          ",
@@ -496,6 +498,7 @@ const ARROW_PIXELS: [&str; 19] = [
 ];
 
 /// Renders [`ARROW_PIXELS`] as RGBA bytes plus its width and height.
+#[cfg(any(target_os = "linux", test))]
 fn arrow_rgba() -> (Vec<u8>, u16, u16) {
     let height = ARROW_PIXELS.len() as u16;
     let width = ARROW_PIXELS[0].len() as u16;
