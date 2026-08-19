@@ -1,0 +1,37 @@
+# The virtio-pci transport (EPIC 19) instead of virtio-mmio.
+#
+#   bash guest/bootstrap-kernel/build.sh   # needs CONFIG_VIRTIO_PCI=y
+#   bash scripts/build-test-initramfs.sh
+#   truncate -s 64M /tmp/pci-scratch.raw
+#   cargo run -p entangled -- run examples/pci-transport.toml
+#
+# `transport` is the only difference from a virtio-mmio profile — devices are
+# transport-agnostic, so the [[disk]], [network] and [display] sections mean
+# exactly the same thing either way. Two consequences to be aware of:
+#
+#   * there are no `virtio_mmio.device=` clauses on the command line. The guest
+#     enumerates the PCI bus instead, which is why the disk below still shows up
+#     as /dev/vda without anything telling the kernel where to look;
+#   * the guest kernel needs CONFIG_VIRTIO_PCI (and CONFIG_PCI, and conf1
+#     access, which x86_64 defconfig gives you). A kernel with only
+#     CONFIG_VIRTIO_MMIO will boot and find no devices at all.
+#
+# Omitting `transport` means "mmio", so every profile written before this
+# existed keeps describing the machine it always described.
+name = "pci-transport"
+memory_mib = 256
+vcpus = 1
+transport = "pci"
+
+[boot]
+mode = "direct-linux"
+kernel = "artifacts/bootstrap/vmlinuz"
+initramfs = "artifacts/tests/test-initramfs.cpio.gz"
+# `entangled.pciscan=1` makes the test initramfs dump what it enumerated on the
+# PCI bus; `entangled.blkbench=8` reads 8 MiB from /dev/vda, which is the proof
+# that the whole path — enumeration, BAR programming, virtqueues, INTx — works.
+cmdline = "console=ttyS0 earlyprintk=serial panic=1 reboot=k entangled.pciscan=1 entangled.blkbench=8"
+
+[[disk]]
+path = "/tmp/pci-scratch.raw"
+writable = true

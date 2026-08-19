@@ -5,5 +5,5 @@ mod config;
 
 pub use config::{
     BootMode, BootSection, ConfigError, DiskSection, DisplaySection, NetworkBackend,
-    NetworkSection, VmConfig,
+    NetworkSection, VirtioTransport, VmConfig,
 };

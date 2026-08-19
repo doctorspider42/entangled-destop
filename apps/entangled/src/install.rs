@@ -12,7 +12,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use control_api::{
-    BootMode, BootSection, DiskSection, DisplaySection, NetworkBackend, NetworkSection, VmConfig,
+    BootMode, BootSection, DiskSection, DisplaySection, NetworkBackend, NetworkSection,
+    VirtioTransport, VmConfig,
 };
 use debian_media::{FetchOptions, FetchReport, MediaKind};
 use flate2::write::GzEncoder;
@@ -109,6 +110,9 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         name: format!("{vm_name}-install"),
         memory_mib: args.memory_mib,
         vcpus: 2,
+        // The installer boots the same direct-Linux path the MVP has always
+        // used, so it keeps the transport that path was built around.
+        transport: VirtioTransport::default(),
         boot: BootSection {
             mode: BootMode::DirectLinux,
             kernel: Some(kernel),
@@ -158,6 +162,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         name: vm_name.clone(),
         memory_mib: 2048,
         vcpus: 2,
+        transport: VirtioTransport::default(),
         boot: BootSection {
             mode: BootMode::DirectLinux,
             kernel: Some(PathBuf::from("artifacts/bootstrap/vmlinuz")),

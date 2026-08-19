@@ -20,12 +20,55 @@ pub struct VmConfig {
     pub name: String,
     pub memory_mib: u64,
     pub vcpus: u32,
+    /// Which virtio transport the VM's devices sit on. Defaults to `mmio`, so
+    /// every profile written before the pci transport existed still describes
+    /// exactly the machine it used to.
+    #[serde(default)]
+    pub transport: VirtioTransport,
     pub boot: BootSection,
     #[serde(default, rename = "disk")]
     pub disks: Vec<DiskSection>,
     pub network: Option<NetworkSection>,
     #[serde(default)]
     pub display: DisplaySection,
+}
+
+/// The virtio transport a VM's devices are attached to (EPIC 3 / EPIC 19).
+///
+/// Devices themselves are transport-agnostic, so this changes only how the guest
+/// *finds* them — and how much of the guest has to cooperate:
+///
+/// * `mmio` needs `virtio_mmio.device=` clauses on the kernel command line and a
+///   kernel built with `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES`. Nothing enumerates:
+///   the host tells the guest where to look. This is the MVP default and what
+///   every existing profile means.
+/// * `pci` needs nothing on the command line — the guest walks the bus — but does
+///   need `CONFIG_VIRTIO_PCI`. It is the only transport a UEFI firmware can use:
+///   EDK2's CloudHv build ships `VirtioPciDeviceDxe` and no virtio-MMIO driver at
+///   all (ADR-0003), so booting an installer ISO requires it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum VirtioTransport {
+    /// virtio-mmio slots announced on the kernel command line.
+    #[default]
+    Mmio,
+    /// virtio-pci functions on the PCI root bus.
+    Pci,
+}
+
+impl VirtioTransport {
+    pub fn is_pci(self) -> bool {
+        matches!(self, Self::Pci)
+    }
+}
+
+impl std::fmt::Display for VirtioTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mmio => f.write_str("mmio"),
+            Self::Pci => f.write_str("pci"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,6 +259,36 @@ scale = 1.0
         assert!(cfg.disks[0].writable);
         assert_eq!(cfg.network.as_ref().unwrap().interface, "entangled0");
         assert_eq!(cfg.display.width, 1920);
+    }
+
+    /// A profile written before the pci transport existed must keep meaning
+    /// exactly what it meant: virtio-mmio.
+    #[test]
+    fn the_transport_defaults_to_mmio() {
+        let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
+        assert_eq!(cfg.transport, VirtioTransport::Mmio);
+        assert!(!cfg.transport.is_pci());
+    }
+
+    #[test]
+    fn the_transport_can_be_selected_and_round_trips() {
+        let pci = BACKLOG_EXAMPLE.replace("vcpus = 2", "vcpus = 2\ntransport = \"pci\"");
+        let cfg = VmConfig::from_toml(&pci).unwrap();
+        assert_eq!(cfg.transport, VirtioTransport::Pci);
+        assert!(cfg.transport.is_pci());
+        assert_eq!(cfg.transport.to_string(), "pci");
+        assert_eq!(
+            VmConfig::from_toml(&toml::to_string_pretty(&cfg).unwrap()).unwrap(),
+            cfg
+        );
+
+        // A typo is a hard error rather than a silent fall back to mmio: a VM
+        // whose devices the guest cannot find looks like a device bug.
+        let typo = BACKLOG_EXAMPLE.replace("vcpus = 2", "vcpus = 2\ntransport = \"pcie\"");
+        assert!(matches!(
+            VmConfig::from_toml(&typo),
+            Err(ConfigError::Parse(_))
+        ));
     }
 
     #[test]
