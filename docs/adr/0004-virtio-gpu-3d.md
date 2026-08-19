@@ -193,6 +193,33 @@ is real.
   and outlives the attachment; addresses are translated through checked
   `vm-memory` (`get_slice`), so an entry outside guest RAM fails the attach.
 
+## Amendment (2026-08-19): what the implementation found
+
+Phase 1 landed the same day; three FFI facts worth keeping:
+
+1. **virglrenderer stores the pointers it is given at init.** Both the cookie
+   and the `virgl_renderer_callbacks` struct are retained by address (QEMU
+   keeps a `static` for the same reason). A stack-local callbacks struct
+   SIGSEGVs later; ours are boxed inside `VirglRenderer` and leaked on drop,
+   because of the next point.
+2. **Never `virgl_renderer_cleanup`, never dlclose.** Cleanup terminates EGL,
+   which unloads mesa's driver while mesa worker threads still hold TLS
+   destructors — an observed SIGSEGV in `__nptl_deallocate_tsd` at thread
+   exit under WSLg's d3d12 driver. The library handle is `ManuallyDrop`, the
+   initialized state lives for the process (exactly what QEMU/crosvm do), and
+   one process gets at most one initialized renderer, ever.
+3. **Thread affinity is real but manageable.** EGL contexts bind to the
+   calling thread, so `virgl_renderer_init` runs lazily on the device worker
+   thread's first command, and a guest device reset (which arrives on a vCPU
+   thread as an MMIO status write) only *marks* the renderer; the actual
+   `virgl_renderer_reset` runs before the next worker-thread command, with
+   freed iovec arrays parked in a graveyard until then.
+
+Measured in WSL (D3D12 / AMD Radeon PRO): init reports GL 4.2 core, capsets
+VIRGL v1 (308 B) and VIRGL2 v2 (696 B); the `virgl_host.rs` integration test
+round-trips guest pages → iovec → GL texture → BGRA readback in ~0.5 s
+including EGL bring-up. The `gpu_3d_commands` fuzz target ran clean.
+
 ## Consequences
 
 - Ubuntu/Debian guests get `glxinfo: virgl` with **zero guest-side setup**;

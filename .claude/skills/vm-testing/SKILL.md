@@ -410,11 +410,11 @@ in the root manifest's `exclude`: libfuzzer needs nightly and `-Zsanitizer`, so
 rustup toolchain install nightly
 cargo install cargo-fuzz
 
-# Build all four targets.
+# Build all five targets.
 cargo +nightly fuzz build --target-dir "$HOME/entangled-fuzz-target"
 
 # Run one, time-boxed (the whole suite: chain_walk, mmio_transport,
-# debian_sums, blk_request).
+# debian_sums, blk_request, gpu_3d_commands).
 cargo +nightly fuzz run chain_walk --target-dir "$HOME/entangled-fuzz-target"     -- -max_total_time=240 -rss_limit_mb=4096
 
 # Reproduce and minimise a finding.
@@ -431,6 +431,7 @@ full and the fuzz build is large.
 | `mmio_transport` | arbitrary register read/write storms of any width against a mock device, with status/interrupt invariants checked after every operation |
 | `debian_sums` | `parse_sums`, `Release::parse` and the ISO-name/version helpers |
 | `blk_request` | virtio-blk header parsing, `validate_range`, `sector_offset`, `total_len` |
+| `gpu_3d_commands` | `virtio_gpu::renderer::validate_stream` on raw bytes, plus arbitrary 3D command sequences (contexts, creates, backing, transfers, submits, readback) through `Gpu3d` + `NullRenderer` with real guest memory |
 
 Rules that keep the targets useful:
 

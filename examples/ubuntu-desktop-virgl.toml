@@ -1,0 +1,29 @@
+# The Ubuntu Desktop live session with **3D acceleration** (ADR-0004): the
+# same boot as ubuntu-desktop-live.toml, but the virtio-gpu device offers
+# VIRTIO_GPU_F_VIRGL backed by the host's virglrenderer — so the guest's mesa
+# stack (and GNOME/mutter with it) renders on the virgl driver against the
+# host GPU instead of llvmpipe on guest CPUs.
+#
+#   sudo apt-get install libvirglrenderer1                # the host renderer
+#   bash guest/firmware/build-cloudhv.sh                  # once
+#   iso=$(bash scripts/fetch-ubuntu-iso.sh desktop)       # once
+#   cargo run -p entangled -- run --cdrom "$iso" examples/ubuntu-desktop-virgl.toml
+#
+# Verify from inside the guest: `glxinfo -B | grep renderer` (or eglinfo)
+# reports "virgl", not "llvmpipe". Linux-only for now — the renderer speaks
+# EGL; a host where it cannot initialize fails the run with a clear message
+# rather than silently booting 2D.
+name = "ubuntu-desktop-virgl"
+memory_mib = 4096
+vcpus = 4
+transport = "pci"
+
+[boot]
+mode = "uefi"
+firmware = "artifacts/firmware/CLOUDHV.fd"
+
+[display]
+width = 1920
+height = 1080
+scale = 1.0
+virgl = true

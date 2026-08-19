@@ -1,6 +1,6 @@
 [package]
 name = "virtio-gpu"
-description = "virtio-gpu 2D device (scanout, transfer, flush)"
+description = "virtio-gpu device: 2D scanout plus VirGL 3D behind a renderer trait"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

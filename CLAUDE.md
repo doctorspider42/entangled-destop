@@ -62,7 +62,7 @@ kernel and initramfs artifacts, and self-skips without them.
 | `crates/virtio-core` | virtio-mmio **and** virtio-pci transports, virtqueues, `VirtioDevice` trait | EPIC 3/19 |
 | `crates/virtio-block` | virtio-blk device, RAW file backend | EPIC 4 |
 | `crates/virtio-net` | virtio-net device, TAP backend | EPIC 5 |
-| `crates/virtio-gpu` | virtio-gpu 2D device | EPIC 8 |
+| `crates/virtio-gpu` | virtio-gpu device: 2D scanout + VirGL 3D (`Renderer3d` trait, null renderer everywhere, virglrenderer dlopen'd on Linux — ADR-0004) | EPIC 8, GPU-001..012 |
 | `crates/virtio-input` | keyboard + absolute pointer devices | EPIC 9 |
 | `crates/display` | winit window, wgpu renderer, host input capture | EPIC 7 |
 | `crates/debian-media` | Debian download, PGP+SHA-512 verification, cache, manifests | EPIC 6 |
