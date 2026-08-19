@@ -58,9 +58,14 @@ impl MemmapEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartInfo {
     pub cmdline_paddr: u64,
-    /// Physical address of the ACPI RSDP, or 0 when the VMM provides no ACPI
-    /// tables. Zero is honest, not a placeholder: EDK2's `AcpiPlatformDxe`
-    /// simply installs nothing, which is the phase-2 gap in ADR-0003.
+    /// Physical address of the ACPI RSDP — `machine_x86::layout::ACPI_RSDP_START`
+    /// in practice, since `machine_x86::acpi` puts the tables there.
+    ///
+    /// EDK2's `InstallCloudHvTables()` dereferences this pointer, walks the XSDT
+    /// installing every table it lists, then installs the DSDT from the FADT's
+    /// `X_DSDT`. A zero — or an address whose RSDP fails its signature and
+    /// checksum check — makes it return `EFI_NOT_FOUND` and install nothing,
+    /// which was ADR-0003's phase-2 gap.
     pub rsdp_paddr: u64,
     pub memmap_paddr: u64,
     pub memmap_entries: u32,
