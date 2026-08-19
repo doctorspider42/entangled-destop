@@ -76,6 +76,10 @@ fn assert_terminal(outcome: RunOutcome) {
 #[derive(Default)]
 struct Recorder {
     io_writes: Vec<(u16, Vec<u8>)>,
+    mmio_writes: Vec<(u64, Vec<u8>)>,
+    mmio_reads: Vec<(u64, usize)>,
+    /// What `mmio_read` answers with, LSB first.
+    mmio_answer: u8,
 }
 
 impl ExitHandler for Recorder {
@@ -85,9 +89,12 @@ impl ExitHandler for Recorder {
     fn io_in(&mut self, _port: u16, data: &mut [u8]) {
         data.fill(0xff);
     }
-    fn mmio_write(&mut self, _addr: u64, _data: &[u8]) {}
-    fn mmio_read(&mut self, _addr: u64, data: &mut [u8]) {
-        data.fill(0);
+    fn mmio_write(&mut self, addr: u64, data: &[u8]) {
+        self.mmio_writes.push((addr, data.to_vec()));
+    }
+    fn mmio_read(&mut self, addr: u64, data: &mut [u8]) {
+        self.mmio_reads.push((addr, data.len()));
+        data.fill(self.mmio_answer);
     }
 }
 
@@ -253,6 +260,84 @@ fn word_wide_port_write_reports_two_bytes() {
     let outcome = vcpu.run_loop(&mut rec, &running).unwrap();
 
     assert_eq!(rec.io_writes, vec![(0x20, vec![0xef, 0xbe])]);
+    assert_terminal(outcome);
+}
+
+/// MMIO through WHP's instruction emulator (WHP-1703).
+///
+/// This is the exit KVM hands us fully decoded and WHP does not: the exit record
+/// carries a GPA and raw instruction bytes, so `WHvEmulatorTryMmioEmulation` has
+/// to decode the access, call back for the data and advance RIP itself. Three
+/// things are asserted at once, because each fails differently:
+///
+/// * the *address* reaching [`ExitHandler`] (a decode bug puts it elsewhere),
+/// * the *width* — 4 bytes for a `mov dword` (WHP's exit reports no width at all,
+///   so a wrong one means the emulator's `AccessSize` is being ignored),
+/// * that RIP advanced, proven by the guest reaching `hlt` at all rather than
+///   faulting on the same instruction forever.
+///
+/// # Why this guest is in long mode when every other smoke guest is real-mode
+///
+/// **`WHvEmulatorTryMmioEmulation` refuses 16-bit real mode.** The same test
+/// written as a real-mode guest reaching linear `0x100000` through `ES = 0xffff`
+/// fails with `internal emulation failure` (status `0x2`) — the decoder never
+/// calls back at all. So the guest is put in long mode through the same
+/// `machine_x86::boot` path the real boot uses, which is the mode the emulator is
+/// actually needed in.
+#[test]
+fn mmio_is_emulated_and_reaches_the_exit_handler() {
+    let _guard = whp_guard();
+    let Some(hv) = hypervisor_or_skip() else {
+        return;
+    };
+    let mut partition = WhpPartition::new(&hv, &SMOKE_CONFIG).unwrap();
+
+    // mov eax, 0xdeadbeef   b8 ef be ad de
+    // mov edx, 0xd0000000   ba 00 00 00 d0   (zero-extends into RDX)
+    // mov [rdx], eax        89 02            -> 4-byte write to the virtio window
+    // mov ecx, [rdx]        8b 0a            -> 4-byte read from the same place
+    // mov eax, ecx          89 c8
+    // out 0x11, al          e6 11            -> echo the low byte back to the host
+    // hlt                   f4
+    const CODE: &[u8] = &[
+        0xb8, 0xef, 0xbe, 0xad, 0xde, 0xba, 0x00, 0x00, 0x00, 0xd0, 0x89, 0x02, 0x8b, 0x0a, 0x89,
+        0xc8, 0xe6, 0x11, 0xf4,
+    ];
+    partition
+        .memory()
+        .write_slice(CODE, GuestAddress(CODE_ADDR))
+        .expect("guest RAM must accept the code blob");
+
+    let mut vcpus = partition.take_vcpus();
+    let mut vcpu = vcpus.remove(0);
+    // The real boot path, unchanged: boot GDT, identity-mapped page tables,
+    // CR0/CR4/EFER for 64-bit execution.
+    machine_x86::boot::setup_long_mode_sregs(partition.memory(), &vcpu).unwrap();
+    let mut regs = vcpu.get_registers().unwrap();
+    regs.rip = CODE_ADDR;
+    regs.rflags = 2;
+    vcpu.set_registers(&regs).unwrap();
+
+    let mut rec = Recorder {
+        mmio_answer: 0x5a,
+        ..Default::default()
+    };
+    let running = AtomicBool::new(true);
+    let outcome = vcpu.run_loop(&mut rec, &running).unwrap();
+
+    // The address is `machine_x86::layout::VIRTIO_MMIO_BASE`: inside the 32-bit
+    // MMIO hole, so far above the 16 MiB of mapped RAM.
+    assert_eq!(
+        rec.mmio_writes,
+        vec![(0xd000_0000, vec![0xef, 0xbe, 0xad, 0xde])],
+        "a `mov dword` must arrive as a 4-byte write at the faulting GPA"
+    );
+    assert_eq!(rec.mmio_reads, vec![(0xd000_0000, 4)]);
+    assert_eq!(
+        rec.io_writes,
+        vec![(0x11, vec![0x5a])],
+        "the value the handler returned must land in ECX/EAX"
+    );
     assert_terminal(outcome);
 }
 

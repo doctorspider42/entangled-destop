@@ -4420,6 +4420,8 @@ dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
+ "linux-boot",
+ "machine-x86",
  "thiserror 2.0.20",
  "tracing",
  "vm-memory 0.17.2",
