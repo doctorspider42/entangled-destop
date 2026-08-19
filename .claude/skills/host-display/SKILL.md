@@ -124,5 +124,74 @@ Rules to keep when extending this:
 - `write_texture` rows must respect 256-byte `bytes_per_row` alignment for
   buffer-to-texture copies — `write_texture` from CPU memory handles padding
   internally, buffer copies do not.
-- Wayland vs X11 differences (decorations, scale factors) — trust winit,
-  don't special-case; HiDPI: window inner size is physical pixels.
+- Wayland vs X11 differences (scale factors) — trust winit, don't
+  special-case; HiDPI: window inner size is physical pixels. Decorations and
+  the cursor are the exceptions — see the next section.
+
+## Wayland/WSLg: decorations, cursor, resize (learned fixing the EPIC 15 demo bugs)
+
+WSLg is Weston with an RDP/RAIL backend: every Wayland window becomes a real
+Windows window (class `RAIL_WINDOW`) mirrored over RDP by `msrdc.exe`. Facts
+that shaped the code, all verified against WSLg's protocol stream
+(`WAYLAND_DEBUG=1` + a screenshot of the real header):
+
+- **WSLg offers no server-side decorations.** Its Weston does not advertise
+  `zxdg_decoration_manager_v1` (neither does GNOME), so winit must draw CSD.
+  Without the `wayland-csd-adwaita` winit feature that means sctk's
+  `FallbackFrame` — self-described "default ugly frame": grey square buttons
+  (the close button has no ✕), no title text, and a 4 px invisible resize
+  border. The display crate therefore ships `default = ["wayland-csd"]`; the
+  sctk-adwaita → ab_glyph → ttf-parser tree is permissive and deny-clean, and
+  winit only pulls it on Linux targets, so Windows builds are untouched.
+- **A maximized Wayland window cannot be resized** — no resize edges exist, by
+  design. `ux::initial_window` opens maximized whenever the guest is as big as
+  the monitor (the 1920×1080 default on a 1920×1080 screen), so the *only* way
+  to free the window is the CSD restore button — which the FallbackFrame drew
+  as an anonymous grey square. That, plus the 4 px border afterwards, was the
+  whole of "the window cannot be resized" from the demo.
+- **Resizing the RAIL window from the Windows side does not work**: a
+  `MoveWindow`/`SetWindowPos` on the mirrored HWND changes the local window but
+  Weston never sends the client a new configure — the content desyncs and
+  pointer routing breaks. Do not "fix" window size by poking the Windows HWND.
+- **WSLg ignores the null cursor.** `set_cursor_visible(false)` on Wayland is
+  `wl_pointer.set_cursor(nil)`; the app emits it correctly on grab, but the RDP
+  side never hides the Windows arrow, which then rides on top of the guest's
+  own cursor. `host.rs` hides the pointer on Wayland by setting a fully
+  transparent 8×8 `CustomCursor` instead (ordinary cursor-image path, honoured
+  everywhere); other platforms keep `set_cursor_visible`.
+- **Named cursors can be silent no-ops.** `CursorIcon::*` needs an XCursor
+  theme; a stock WSL root ships none (`/usr/share/icons/*/cursors` is empty),
+  so `set_cursor(CursorIcon::Default)` sends nothing, and the CSD frame's own
+  resize/arrow cursors don't work either. Consequences the code handles:
+  the *visible* state is a bundled arrow image (`ARROW_PIXELS` in `host.rs`),
+  set once at window creation (WSLg's RDP client keeps the last pointer
+  *across windows*, so a hidden cursor from a previous run haunts new ones)
+  and re-set whenever the policy flips to visible.
+- **The cursor image cannot be changed while the pointer is over the CSD
+  frame** (winit defers `set_cursor` until the pointer is back over the
+  content, and a theme-less frame can't set its own), and Weston carries the
+  current image across same-client surface crossings. So the flip back to the
+  visible arrow must happen *before* the crossing:
+  `ux::CURSOR_EDGE_MARGIN` keeps the outer 16 px of the window a
+  "cursor visible" zone (`InputCapture::pointer_over_guest`). A fast flick can
+  still skip the margin and carry the transparent cursor onto the titlebar —
+  wiggling back over the image repairs it; nothing more can be done app-side.
+- **WSLg's pointer confinement is a mirage**: `zwp_pointer_constraints_v1` is
+  advertised and `confine_pointer` is accepted, but no `confined` event ever
+  arrives — the pointer is never actually confined, so the grab cannot rely
+  on it (the code already treats it as best-effort).
+- **Do not SIGKILL/SIGTERM a windowed VM under WSLg if avoidable**: abruptly
+  disconnecting a client that holds a pending pointer constraint has crashed
+  WSLg's Weston in testing, taking every other WSLg window with it (our VM
+  supervision survives this: broken pipe → event loop error → clean VM stop
+  with NVRAM written). Prefer the window's close button / Ctrl+Alt+Q.
+- **Input cannot be injected into WSLg windows from Windows automation**:
+  `msrdc.exe` runs with UIAccess, so UIPI silently drops `SendInput` /
+  `mouse_event` from normal processes. Manual testing needs a human hand (or a
+  nested wlroots compositor with `zwlr_virtual_pointer`, which WSL's stock
+  image does not ship). Protocol logging with `WAYLAND_DEBUG=1` is the
+  reliable observability tool.
+- The CSD frame is subsurfaces *around* the main surface: `GetWindowRect` on
+  the RAIL window covers only the content; the header lives above it on
+  screen. Coordinate math in host-side tooling must not assume the rect
+  includes the titlebar.
