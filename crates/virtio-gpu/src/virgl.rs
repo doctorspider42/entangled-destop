@@ -210,6 +210,10 @@ pub struct VirglRenderer {
     /// init (QEMU keeps a static for the same reason), so this must live
     /// exactly as long as the initialized library state.
     callbacks: Box<Callbacks>,
+    /// The thread `virgl_renderer_init` ran on — the only thread whose EGL
+    /// binding lets teardown calls execute GL. `Drop` on any other thread
+    /// leaks instead of calling into the library (see `Drop`).
+    init_thread: Option<std::thread::ThreadId>,
 }
 
 // SAFETY: the renderer is moved to the device worker thread once and used
@@ -281,10 +285,34 @@ impl VirglRenderer {
             _lib: std::mem::ManuallyDrop::new(lib),
         };
 
+        // Capset versions/sizes are static tables in the library — readable
+        // *before* init, which matters: the guest kernel reads `num_capsets`
+        // from config space long before the first 3D command triggers EGL
+        // bring-up, and a device that says 0 there leaves the whole guest
+        // mesa stack capability-blind (observed: GNOME booted but every
+        // format probe misfired).
+        let mut capsets = Vec::new();
+        for id in [CAPSET_VIRGL, CAPSET_VIRGL2] {
+            let (mut max_version, mut max_size) = (0u32, 0u32);
+            // SAFETY: out-pointers to locals, valid for the call; this entry
+            // point only reads static size tables (verified pre-init).
+            unsafe { (api.get_cap_set)(id, &mut max_version, &mut max_size) };
+            if max_size > 0 {
+                capsets.push(CapsetInfo {
+                    id,
+                    max_version,
+                    max_size,
+                });
+            }
+        }
+        if capsets.is_empty() {
+            return Err("virglrenderer reports no capability sets".into());
+        }
+
         Ok(Self {
             api,
             state: State::Loaded,
-            capsets: Vec::new(),
+            capsets,
             resources: HashMap::new(),
             contexts: Vec::new(),
             graveyard: Vec::new(),
@@ -300,6 +328,7 @@ impl VirglRenderer {
                 make_current: None,
                 get_drm_fd: None,
             }),
+            init_thread: None,
         })
     }
 
@@ -333,18 +362,7 @@ impl VirglRenderer {
                         "virgl_renderer_init failed ({rc}): no usable EGL/GL on this host"
                     )));
                 }
-                for id in [CAPSET_VIRGL, CAPSET_VIRGL2] {
-                    let (mut max_version, mut max_size) = (0u32, 0u32);
-                    // SAFETY: out-pointers to locals, valid for the call.
-                    unsafe { (self.api.get_cap_set)(id, &mut max_version, &mut max_size) };
-                    if max_size > 0 {
-                        self.capsets.push(CapsetInfo {
-                            id,
-                            max_version,
-                            max_size,
-                        });
-                    }
-                }
+                self.init_thread = Some(std::thread::current().id());
                 tracing::info!(capsets = self.capsets.len(), "virglrenderer initialized");
                 self.state = State::Ready;
                 Ok(())
@@ -738,15 +756,42 @@ impl Drop for VirglRenderer {
         let ids: Vec<u32> = self.resources.keys().copied().collect();
         match self.state {
             State::Ready | State::NeedsReset => {
-                for id in ids {
-                    self.detach_iov(id);
-                    // SAFETY: plain id of a resource this renderer created.
-                    unsafe { (self.api.resource_unref)(id) };
+                // EGL is bound to the init thread; teardown GL calls from any
+                // other thread run without a current context (observed
+                // SIGSEGV in the d3d12 driver). A cross-thread drop therefore
+                // leaks the library-held resources — the process is on its
+                // way out whenever a VM's device tree is dropped, and the
+                // renderer is process-global either way.
+                let same_thread = self.init_thread == Some(std::thread::current().id());
+                if same_thread {
+                    for id in ids {
+                        self.detach_iov(id);
+                        // SAFETY: plain id of a resource this renderer
+                        // created, called on the EGL-owning thread.
+                        unsafe { (self.api.resource_unref)(id) };
+                    }
+                    // SAFETY: frees every context/resource the library still
+                    // holds; our graveyard arrays outlive this call.
+                    unsafe { (self.api.reset)() };
+                    self.graveyard.clear();
+                } else {
+                    tracing::debug!(
+                        "virglrenderer dropped off its EGL thread; leaving the \
+                         library state to the process teardown"
+                    );
+                    // The library may still hold every attachment's iovec
+                    // array pointer — those allocations must outlive us too.
+                    for id in ids {
+                        if let Some(state) = self.resources.get_mut(&id) {
+                            if let Some(attachment) = state.attachment.take() {
+                                self.graveyard.push(attachment);
+                            }
+                        }
+                    }
+                    for attachment in self.graveyard.drain(..) {
+                        std::mem::forget(attachment);
+                    }
                 }
-                // SAFETY: frees every context/resource the library still
-                // holds; our graveyard arrays outlive this call.
-                unsafe { (self.api.reset)() };
-                self.graveyard.clear();
                 // The initialized library keeps the cookie and callbacks
                 // pointers forever — so they must live forever (a few dozen
                 // bytes, once per process).
