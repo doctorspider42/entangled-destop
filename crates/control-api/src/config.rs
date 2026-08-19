@@ -17,18 +17,18 @@ pub enum ConfigError {
 /// Smallest guest this machine is willing to build.
 pub const MIN_MEMORY_MIB: u64 = 128;
 
-/// Largest guest this machine can currently build.
+/// Largest guest this machine is willing to build: 64 GiB.
 ///
-/// 3072 MiB is `machine_x86::layout::MMIO_HOLE_START` (`0xc000_0000`) expressed
-/// in MiB: RAM stops where the 32-bit MMIO hole starts, and the high-RAM split
-/// that would let a guest continue above 4 GiB is post-MVP. `machine_x86`
-/// asserts the same bound when it builds the E820 map, so without this check a
-/// perfectly well-formed profile reaches that assert and the process *panics* —
-/// which is not how this project reports a bad config.
+/// RAM up to 3072 MiB (`machine_x86::layout::MMIO_HOLE_START`) sits below the
+/// 32-bit MMIO hole; anything above that continues at 4 GiB as a second memory
+/// region (the high-RAM split — `vmm_core::create_guest_memory` and
+/// `machine_x86::e820_map` agree on the shape). The 64 GiB ceiling is a sanity
+/// bound, not an architectural one: a typo'd `memory_mib` should be a typed
+/// config error before it becomes a 2 TiB `mmap`.
 ///
-/// `apps/entangled` has the test that keeps the two numbers equal; control-api
-/// deliberately does not depend on the machine crate.
-pub const MAX_MEMORY_MIB: u64 = 3072;
+/// `apps/entangled` has the test that keeps this consistent with the machine
+/// crate; control-api deliberately does not depend on it.
+pub const MAX_MEMORY_MIB: u64 = 65536;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -281,8 +281,7 @@ impl VmConfig {
         }
         if !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&self.memory_mib) {
             return err(format!(
-                "memory_mib {} outside supported range {MIN_MEMORY_MIB}..={MAX_MEMORY_MIB} \
-                 (RAM stops at the 32-bit MMIO hole; the high-RAM split is post-MVP)",
+                "memory_mib {} outside supported range {MIN_MEMORY_MIB}..={MAX_MEMORY_MIB}",
                 self.memory_mib
             ));
         }
@@ -638,28 +637,28 @@ firmware = "artifacts/firmware/CLOUDHV.fd"
         assert_eq!(cfg.transport, VirtioTransport::Mmio);
     }
 
-    /// A guest larger than the 32-bit MMIO hole makes `machine_x86::e820_map`
-    /// assert. That must be a typed config error here, not a panic three crates
-    /// away — the bound is checked at the only place a human typed the number.
+    /// Guests above 3 GiB are legal since the high-RAM split (the machine
+    /// continues RAM at 4 GiB); the ceiling is a sanity bound at 64 GiB, and it
+    /// must stay a typed config error, not a panic three crates away.
     #[test]
-    fn memory_stops_at_the_mmio_hole() {
-        assert_eq!(MAX_MEMORY_MIB, 3072, "3 GiB, i.e. MMIO_HOLE_START in MiB");
-        let too_big = UBUNTU_ISO_EXAMPLE.replace("memory_mib = 2560", "memory_mib = 4096");
-        let error = VmConfig::from_toml(&too_big).expect_err("4 GiB must be refused");
+    fn memory_bounds_allow_the_high_ram_split_and_stop_at_the_sanity_cap() {
+        assert_eq!(MAX_MEMORY_MIB, 65536, "64 GiB sanity bound");
+        // The GNOME-desktop-sized guest that motivated the split.
+        assert!(VmConfig::from_toml(
+            &UBUNTU_ISO_EXAMPLE.replace("memory_mib = 2560", "memory_mib = 4096")
+        )
+        .is_ok());
+        // Exactly at the bound is fine; one MiB over is not.
+        assert!(VmConfig::from_toml(
+            &UBUNTU_ISO_EXAMPLE.replace("memory_mib = 2560", "memory_mib = 65536")
+        )
+        .is_ok());
+        let too_big = UBUNTU_ISO_EXAMPLE.replace("memory_mib = 2560", "memory_mib = 65537");
+        let error = VmConfig::from_toml(&too_big).expect_err("65 GiB must be refused");
         let ConfigError::Invalid(message) = error else {
             panic!("expected a validation error, got {error:?}");
         };
-        assert!(message.contains("MMIO hole"), "{message}");
-
-        // Exactly at the bound is fine; one MiB over is not.
-        assert!(VmConfig::from_toml(
-            &UBUNTU_ISO_EXAMPLE.replace("memory_mib = 2560", "memory_mib = 3072")
-        )
-        .is_ok());
-        assert!(VmConfig::from_toml(
-            &UBUNTU_ISO_EXAMPLE.replace("memory_mib = 2560", "memory_mib = 3073")
-        )
-        .is_err());
+        assert!(message.contains("supported range"), "{message}");
     }
 
     /// The cdrom section: a UEFI profile with `[cdrom]` and no disks at all is

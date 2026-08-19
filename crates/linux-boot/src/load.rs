@@ -132,7 +132,9 @@ pub fn load<M: GuestMemory>(
 }
 
 /// Picks the highest page-aligned address where the initramfs fits below
-/// both the setup header's `initrd_addr_max` and the end of RAM, and above
+/// the setup header's `initrd_addr_max`, below the end of *low* RAM (a guest
+/// bigger than the 32-bit MMIO hole continues at 4 GiB, but the initramfs must
+/// stay 32-bit addressable — `initrd_addr_max` itself is a `u32`), and above
 /// the loaded kernel.
 fn initramfs_address(
     hdr: &linux_loader::bootparam::setup_header,
@@ -140,7 +142,8 @@ fn initramfs_address(
     initramfs_size: u64,
     kernel_end: u64,
 ) -> Result<u64, BootError> {
-    let ceiling = u64::from(hdr.initrd_addr_max).min(mem_size.saturating_sub(1));
+    let low_ram_end = mem_size.min(layout::MMIO_HOLE_START);
+    let ceiling = u64::from(hdr.initrd_addr_max).min(low_ram_end.saturating_sub(1));
     let addr = (ceiling + 1)
         .checked_sub(initramfs_size)
         .map(|a| a & !0xfff)

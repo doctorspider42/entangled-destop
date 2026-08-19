@@ -1032,24 +1032,25 @@ fn extend_cmdline(configured: &str, clauses: &str) -> String {
 mod tests {
     use super::{direct_linux_cmdline, extend_cmdline};
 
-    /// `control_api` bounds `memory_mib` so a too-large guest is a typed config
-    /// error, but it deliberately does not depend on the machine crate — so the
-    /// number it uses is a copy, and this is the only place that sees both.
-    /// Without it, a change to the memory layout would silently turn a rejected
-    /// config back into a panic inside `machine_x86::e820_map`.
+    /// `control_api` bounds `memory_mib` but deliberately does not depend on
+    /// the machine crate, so this is the place that sees both: the largest
+    /// allowed guest must actually build an E820 map, and — since the high-RAM
+    /// split — one that puts everything above the 32-bit MMIO hole at 4 GiB
+    /// rather than on top of the hole.
     #[test]
-    fn the_config_memory_ceiling_is_the_machines_mmio_hole() {
-        assert_eq!(
-            control_api::MAX_MEMORY_MIB << 20,
-            machine_x86::layout::MMIO_HOLE_START,
-            "control_api::MAX_MEMORY_MIB and machine_x86::layout::MMIO_HOLE_START disagree"
-        );
-        // And the largest allowed guest really does build an E820 map.
-        let map = machine_x86::e820_map(control_api::MAX_MEMORY_MIB << 20);
-        assert_eq!(
-            map.iter().map(|e| e.size).sum::<u64>(),
-            control_api::MAX_MEMORY_MIB << 20
-        );
+    fn the_largest_allowed_guest_builds_a_valid_e820_map() {
+        let bytes = control_api::MAX_MEMORY_MIB << 20;
+        let map = machine_x86::e820_map(bytes);
+        assert_eq!(map.iter().map(|e| e.size).sum::<u64>(), bytes);
+        for e in &map {
+            let end = e.addr + e.size;
+            assert!(
+                end <= machine_x86::layout::MMIO_HOLE_START
+                    || e.addr >= machine_x86::layout::TOP_OF_32BIT,
+                "{:#x}..{end:#x} intrudes into the MMIO hole",
+                e.addr
+            );
+        }
     }
 
     #[test]

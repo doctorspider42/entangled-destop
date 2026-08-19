@@ -149,13 +149,16 @@ mod tests {
         }
     }
 
-    /// The ROM is not RAM: no E820 entry may overlap it, and it must sit above
-    /// the MMIO hole where RAM is forbidden anyway.
+    /// The ROM is not RAM: no E820 entry may overlap it. RAM either stays below
+    /// the MMIO hole or (the high-RAM split) starts at 4 GiB — and the ROM
+    /// lives entirely *inside* the 32-bit space, ending exactly at 4 GiB, so
+    /// even a huge guest's high RAM begins where the ROM stops.
     #[test]
     fn rom_is_never_ram() {
         let p = place_at_top_of_32bit(4 << 20).unwrap();
         assert!(p.guest_addr >= layout::MMIO_HOLE_START);
-        for mem_mib in [128u64, 512, 2048, 3072] {
+        assert_eq!(p.end(), layout::TOP_OF_32BIT);
+        for mem_mib in [128u64, 512, 2048, 3072, 4096, 8192] {
             let mem = mem_mib << 20;
             for e in e820_map(mem) {
                 let overlaps = e.addr < p.end() && p.guest_addr < e.addr + e.size;
@@ -165,7 +168,10 @@ mod tests {
                     e.kind, e.addr, e.size, p.guest_addr
                 );
                 if e.kind == E820Type::Ram {
-                    assert!(e.addr + e.size <= layout::MMIO_HOLE_START);
+                    assert!(
+                        e.addr + e.size <= layout::MMIO_HOLE_START
+                            || e.addr >= layout::TOP_OF_32BIT
+                    );
                 }
             }
         }

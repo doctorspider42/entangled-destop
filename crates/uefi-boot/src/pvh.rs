@@ -107,7 +107,9 @@ pub fn encode_memmap(entries: &[MemmapEntry]) -> Result<Vec<u8>, FirmwareError> 
 /// Builds the PVH memory map for a VM with `mem_size` bytes of RAM, from the
 /// same E820 map the direct-Linux path uses — so the two boot modes cannot
 /// disagree about where RAM is. The firmware ROM window is not in it, by
-/// construction: `e820_map` never describes anything at or above the MMIO hole.
+/// construction: `e820_map` describes nothing between the MMIO hole and
+/// 4 GiB, and a guest big enough for the high-RAM split continues at exactly
+/// 4 GiB — where the ROM window ends.
 pub fn memmap_for(mem_size: u64) -> Vec<MemmapEntry> {
     machine_x86::e820_map(mem_size)
         .into_iter()
