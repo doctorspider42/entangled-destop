@@ -2,7 +2,8 @@
 
 - Status: proposed
 - Date: 2026-08-19
-- Backlog: EPIC 18 (UEFI-1801 pflash/firmware mapping, UEFI-1802 firmware build+boot)
+- Backlog: EPIC 18 (UEFI-1801 pflash/firmware mapping, UEFI-1802 firmware
+  build+boot, UEFI-1803 boot an installer ISO)
 - Extends: [ADR-0001](0001-mvp-architecture.md) (§3 "No BIOS/UEFI in MVP")
 - Sources: `edk2-stable202602` (commit `b7a715f7c03c`), checked out and built
   locally; Xen `docs/misc/pvh.pandoc` and
@@ -134,7 +135,9 @@ first hard rule is "No QEMU anywhere". Rejected on principle and on cost.
    `XEN_HVM_MEMMAP_TYPE_RAM` entry.
 5. **Phase 1 (this change) succeeds when the firmware talks on ttyS0.** Full
    ISO boot is phases 2–3; the gaps are enumerated below rather than guessed
-   at later.
+   at later. Both have since landed — phase 2 is the ACPI tables, phase 3 is
+   UEFI-1803 — and what each actually cost is recorded under "Measured during
+   bring-up".
 
 ## What our machine must provide
 
@@ -221,11 +224,77 @@ as of the bring-up run above.
 | **ACPI PM timer at 0x0608** | **closed** — `machine_x86::platform::AcpiPmTimer` | `AcpiTimerLib` reads `CLOUDHV_ACPI_TIMER_IO_ADDRESS` directly, and `MicroSecondDelay()` spins on it | `OvmfPkg/Include/IndustryStandard/CloudHv.h` |
 | **RTC/CMOS at 0x70/0x71** | **closed** — `machine_x86::rtc` | `PcatRealTimeClockRuntimeDxe` backs `EFI_RUNTIME_SERVICES.GetTime()`; `PcRtcInit()` returns `EFI_DEVICE_ERROR` without a clock whose UIP is clear and VRT set | `PcAtChipsetPkg/PcatRealTimeClockRuntimeDxe/PcRtc.c` |
 | **Per-vCPU APIC id in CPUID** | **closed** — `vmm_core::Vcpu::new` | Not a device: `KVM_GET_SUPPORTED_CPUID` leaks the host CPU's APIC id into leaf 1 `EBX[31:24]`, so `GetBspNumber()` cannot match the BSP against the MP hand-off HOB | `UefiCpuPkg/Library/MpInitLib/MpLib.c:1971` |
-| **virtio over PCI** | **open — the phase 3 blocker** | CloudHv's FDF ships `VirtioPciDeviceDxe`, `Virtio10Dxe`, `VirtioBlkDxe`, `VirtioScsiDxe`, `VirtioNetDxe` — and **no** virtio-MMIO driver at all. Our only transport today is virtio-mmio (ADR-0001 §4). So UEFI-1803 ("boot an Ubuntu ISO from a read-only virtio-blk") is blocked on the post-MVP virtio-pci work, not on firmware. `PciBusDxe` already enumerates our bridge and finds nothing behind it | `OvmfPkg/CloudHv/CloudHvX64.fdf:225–235` |
+| **virtio over PCI** | **closed** — `machine_x86::{pci,virtio_pci}` + `virtio_core::pci` | CloudHv's FDF ships `VirtioPciDeviceDxe`, `Virtio10Dxe`, `VirtioBlkDxe`, `VirtioScsiDxe`, `VirtioNetDxe` — and **no** virtio-MMIO driver at all, so UEFI-1803 needed the transport before it needed anything else. It now enumerates all five functions and binds both disks. Three further gaps had to close before that worked; see "Phase 3" below | `OvmfPkg/CloudHv/CloudHvX64.fdf:225–235` |
 | **ACPI tables + `rsdp_paddr`** | **closed** — `machine_x86::acpi` + `uefi_boot::load_pvh` | `InstallCloudHvTables()` dereferences `hvm_start_info.rsdp_paddr`, walks the XSDT installing every table it lists, then installs the DSDT from the FADT's `X_DSDT`; a zero (or unsigned) RSDP made it return `EFI_NOT_FOUND`. Now: RSDP/XSDT/FADT/FACS/MADT/DSDT at `0xe0000`, and `OnRootBridgesConnected: … installing ACPI tables` with no failure status. **Correction to the prediction:** the MADT is *not* how this firmware counts CPUs — `PlatformMaxCpuCountInitialization()` reads fw_cfg only, so `boot CPU count unavailable` is still logged and still harmless; the real count comes from `MpInitLib`'s INIT-SIPI sweep (`MpInitLib: Find 2 processors in system`), which needs the per-vCPU APIC id fix, not a table. The tables matter for the guest OS, and for `poweroff` | `OvmfPkg/AcpiPlatformDxe/CloudHvAcpi.c`, `.claude/skills/acpi-machine/SKILL.md` |
-| **Writable pflash / NVRAM** | **open** | The variable store sits at `VARS_OFFSET = 0` of the flash device, `VARS_SIZE = 0x84000`. Observed: `QemuFlashDetected => No` → `EmuVariableFvbRuntimeDxe` takes over and variables live in RAM, so `BootOrder`, `Boot####` and SecureBoot state are lost on every stop. A real pflash device (status/command state machine, write buffering, an NVRAM file per VM) is the follow-up. Note the PVH path loads the image into RAM, which is writable by construction — the read-only ROM slot only constrains the reset-vector path | `OvmfPkg/Include/Fdf/OvmfPkgDefines.fdf.inc`, `CloudHvDefines.fdf.inc` |
+| **Writable pflash / NVRAM** | **open — and now measured to be survivable** | The variable store sits at `VARS_OFFSET = 0` of the flash device, `VARS_SIZE = 0x84000`. Observed: `QemuFlashDetected => No` → `EmuVariableFvbRuntimeDxe` takes over and variables live in RAM, so `BootOrder`, `Boot####` and SecureBoot state are lost on every stop. **This does not block an ISO boot**, which is why phase 3 landed without it: with no `BootOrder` variable, `BdsDxe` falls back to enumerating removable media and synthesises `Boot0003 "UEFI Misc Device 2"` for the ISO's ESP, taking the `\EFI\BOOT\BOOTX64.EFI` path — exactly the behaviour a first boot from installation media needs. It *does* block UEFI-1804: an installed Ubuntu writes a `Boot0000` entry pointing at `\EFI\ubuntu\shimx64.efi` and that entry will not survive the VM stopping, so the installed system boots only as long as the removable-media fallback also finds it. A real pflash device (status/command state machine, write buffering, an NVRAM file per VM) is the follow-up. Note the PVH path loads the image into RAM, which is writable by construction — the read-only ROM slot only constrains the reset-vector path | `OvmfPkg/Include/Fdf/OvmfPkgDefines.fdf.inc`, `CloudHvDefines.fdf.inc` |
 | **ACPI shutdown port 0x0600** | **closed** — `machine_x86::acpi::pm` | `CLOUDHV_ACPI_SHUTDOWN_IO_ADDRESS` is the ACPI 5.0 `SLEEP_CONTROL_REG`, and for a CloudHv host bridge `ResetShutdown()` is `IoWrite8 (0x600, 5 << 2 \| 1 << 5)`. It is now one register of a 16-byte PM block that also carries PM1a_EVT/CNT (the register Linux uses instead), the PM timer and GPE0; either sleep register latches a request that `ExitHandler::shutdown_requested` turns into `RunOutcome::Shutdown` | `OvmfPkg/Library/ResetSystemLib/DxeResetShutdown.c` |
-| **MMIO hole agreement** | **free** | The firmware hard-codes the CloudHv 32-bit aperture as `0xc000_0000 + 0x3800_0000`. Our `layout::MMIO_HOLE_START` is already `0xc000_0000` and the virtio window at `0xd000_0000` sits inside it — but it pins the layout | `OvmfPkg/Library/PlatformInitLib/MemDetect.c:61` |
+| **MMIO hole agreement** | **free, but no longer free of consequences** | The firmware hard-codes the CloudHv 32-bit aperture as `0xc000_0000 + 0x3800_0000`. Our `layout::MMIO_HOLE_START` is already `0xc000_0000` and the virtio window at `0xd000_0000` sits inside it — but `PciBusDxe` *allocates* out of that aperture rather than accepting what it finds, so "agreement" turned out to mean the machine must decode the whole advertised window, not just its own slots. See phase 3 gap 2 | `OvmfPkg/Library/PlatformInitLib/MemDetect.c:61` |
+
+### Phase 3 (2026-08-19): the Ubuntu ISO boots to the installer
+
+Where the chain got to, from the same DEBUG serial log the earlier phases were
+debugged on:
+
+```
+PciBus: Discovered PCI @ [00|01|00]  [VID = 0x1AF4, DID = 0x1042]     (target disk)
+PciBus: Discovered PCI @ [00|02|00]  [VID = 0x1AF4, DID = 0x1042]     (installer ISO)
+Found Mass Storage device: PciRoot(0x0)/Pci(0x2,0x0)
+VirtioBlkInit: LbaSize=0x200[B] NumBlocks=0x56FB24[Lba]               (5700388 sectors)
+FSOpen: Open '\EFI\BOOT\BOOTX64.EFI' Success
+BdsDxe: starting Boot0003 "UEFI Misc Device 2" from PciRoot(0x0)/Pci(0x2,0x0)
+FSOpen: Open '\EFI\BOOT\grubx64.efi' Success
+GNU GRUB  version 2.14   →   *Try or Install Ubuntu Server
+MpInitChangeApLoopCallback() done!                                    (ExitBootServices)
+```
+
+and then, on the virtio-gpu scanout, subiquity's language-selection screen.
+`tests/boot/tests/uefi_iso.rs` is the automated form of that log;
+`ENTANGLED_UEFI_ISO_LINGER` + `ENTANGLED_UEFI_ISO_SHOT` reproduce the
+screenshot.
+
+Four gaps had to close between "the firmware enumerates our disks" and that.
+None of them were in the firmware, and — this is the point worth keeping — none
+of them were visible to any Linux-only test, because in each case Linux either
+does not exercise the register or is more forgiving than EDK2:
+
+| # | Symptom | Gap | Why Linux never caught it |
+|---|---|---|---|
+| 1 | `PciBusDxe` prints the disks, `VirtioBlkDxe` never binds, no boot media, nothing in the log says why | **PCI subsystem device id was 0.** `Virtio10BindingSupported` requires `Pci.Device.SubsystemID >= 0x40` (spec 1.2 §4.1.2.1 asks a non-transitional device for exactly that; QEMU writes `0x40`) | Linux's `vp_modern_probe` reads the subsystem *vendor* and ignores the device half entirely |
+| 2 | `VirtioBlkInit` reports the right capacity, then the first queue kick wakes an *unrelated* device's worker (`queue notify before DRIVER_OK, ignoring  slot=4 device=Input`) and the disk waits forever | **Queue-notify ioeventfds must follow BAR0.** `PciBusDxe` reassigns every BAR during resource allocation — measured: it hands out our own aperture slots *in reverse device order* — and the notification area moves with the BAR. `machine_x86::notify::DeviceNotifier::rebase` plus `VirtioPciBus::reconcile_notify` re-point them; `PciRoot::io_write` now returns a `#[must_use] DecodeChanged`. `PCI_MMIO_END` also widened from the 8 host slots (128 KiB) to the 256 MiB the DSDT already advertises, because a 1 MiB allocation only fitted in 128 KiB by luck of having five devices | Linux claims a BAR it finds already programmed and leaves it where it is |
+| 3 | Kernel boots, then **every** virtio probe ends in `driver gave up on this device (FAILED)` — no disks, no GPU, no input | **`interrupt_line` must be read-only.** `PciBusDxe` writes `PCI_INT_LINE_UNKNOWN` (`0xff`) and then `0` to offset `0x3c`, expecting a platform driver to fill in the routed value; there is no such driver here because there is no PIRQ router. Linux reads `0xff` → "not connected" (PCI 3.0 §6.2.4), finds no `_PRT` under `\_SB.PCI0` either, sets `IRQ_NOTCONNECTED`, and `vp_find_vqs_intx`'s `request_irq` fails | Under direct-Linux nothing writes the register, so the host's value was still there to fall back on |
+| 4 | Four of five devices bind; one — whichever holds IOAPIC pin 8 — does not | **Pin 8 is the RTC's.** `machine_x86::rtc` exists because UEFI-1802 needed `GetTime()`; Linux registers `rtc_cmos` on IRQ 8 and will not share it, so `request_irq(8, …, IRQF_SHARED)` returns `-EBUSY`. `layout::VIRTIO_IRQS` is now an explicit non-contiguous table, `[5, 6, 7, 9, 10, 11, 12, 14]`, shared by both transports | The virtio-pci acceptance boot attaches one device, which gets pin 5. A five-device mmio boot has the same latent defect and is fixed by the same table |
+
+Diagnosis method for #4 is worth copying: rather than reasoning about which
+driver owns IRQ 8, the *pin* was made the variable. Adding a third disk shifted
+every later device up one slot, the failure moved to the GPU (which inherited
+pin 8) and both input devices bound. The fault followed the pin, not the device.
+
+Two further observations from the same run, recorded so nobody re-derives them:
+
+- **CloudHv ships no `VirtioGpuDxe`**, so there is no GOP for our virtio-gpu and
+  the firmware and GRUB are visible *only* on ttyS0. The scanout stays dark until
+  Linux's own `virtio_gpu` driver binds. The MVP premise that "the window is the
+  display" holds for the guest OS and not for the firmware — which is also why
+  the boot test asserts on serial and screenshots separately.
+- **The kernel's command line comes from the ISO** and carries no `console=`
+  clause, so nothing Linux prints reaches ttyS0. Injecting one needs either an
+  interactive GRUB edit (the virtio keyboard now works, so this is possible) or a
+  `grub.cfg` on a volume we control; neither is needed to *see* the installer,
+  which draws on the scanout.
+
+### What UEFI-1804 (install to disk) still needs
+
+- **Writable pflash / NVRAM.** The one hard blocker: without it the installed
+  system's `Boot0000` entry does not survive a stop. See the gap-map row.
+- **An ACPI `_PRT`** under `\_SB.PCI0`, with level-triggered `INTA#` (an irqfd
+  pair or a resample eventfd) instead of an edge on an ISA pin. The current
+  arrangement works because Linux falls back to `interrupt_line` and warns
+  `PCI INT A: no GSI - using ISA IRQ 5`; it caps us at one device per pin and
+  will not survive a guest that trusts ACPI over the register.
+- **MSI-X**, which would retire the whole INTx question — and gaps 3 and 4 with
+  it — rather than working around it twice.
+- **SMBIOS**, still `Not Found` at `CLOUDHV_SMBIOS_ADDRESS` (`0xf0000`). Harmless
+  so far; `dmidecode` and some installer hardware detection want it.
 
 ## Consequences
 
@@ -239,7 +308,15 @@ as of the bring-up run above.
 - **UEFI-1803/1804 depend on virtio-pci**, which was already the top item of
   "next phase after MVP" in the backlog. This ADR upgrades that from
   "logical next step" to a hard prerequisite: no PCI bus, no ISO boot,
-  regardless of which of the two firmwares we pick.
+  regardless of which of the two firmwares we pick. *Borne out:* the transport
+  landed first and UEFI-1803 then needed four further machine fixes on top of
+  it, all of them PCI-adjacent.
+- **A second, more demanding consumer changes what "the transport works" means.**
+  Every one of phase 3's four gaps was a register Linux does not read, does not
+  write, or is more forgiving about. Two of them (`interrupt_line`, pin 8) are
+  latent in the virtio-mmio path as well and were only found because EDK2 hit
+  them first. The lesson for the remaining device work is that "Linux boots" is a
+  necessary and distinctly insufficient acceptance criterion.
 - Choosing PVH over the reset vector means we never emulate a CMOS, an RTC
   memory-sizing convention or fw_cfg — the "No QEMU anywhere" rule survives
   contact with UEFI.

@@ -367,6 +367,60 @@ fn advertises_capacity_and_features() {
     assert_ne!(h.device_features() & VIRTIO_F_VERSION_1, 0);
 }
 
+/// A read-only device — the shape an installer ISO is attached in
+/// (`examples/ubuntu-uefi.toml`, `writable = false`) — must refuse writes over
+/// the wire, not merely decline to advertise that it accepts them.
+///
+/// Both halves matter and neither implies the other:
+///
+/// * `VIRTIO_BLK_F_RO` is *advice*. A well-behaved driver reads it and mounts
+///   read-only; nothing stops a broken or hostile one from sending `T_OUT`
+///   anyway, and a firmware doing its own partition-table fixups is not a
+///   hypothetical hostile driver.
+/// * so the request itself is failed in band with `S_IOERR`, before the backend
+///   is asked, and the file on disk is unchanged. Verified against the *bytes*,
+///   because "the status byte said no" and "nothing was written" are different
+///   claims — this is media whose SHA-256 we checked against a signed manifest,
+///   and silently modifying it would invalidate that.
+///
+/// Reads keep working throughout, which is the whole point of attaching it.
+#[test]
+fn a_read_only_device_advertises_and_enforces_read_only() {
+    let mut h = Harness::new(false);
+    assert_ne!(
+        h.device_features() & virtio_block::VIRTIO_BLK_F_RO,
+        0,
+        "a read-only image must offer VIRTIO_BLK_F_RO"
+    );
+
+    let before = std::fs::read(&h.path).expect("read the backing image");
+    let payload = vec![0xa5u8; 512];
+    assert_eq!(
+        h.write_sectors(4, &payload),
+        S_IOERR,
+        "a write to a read-only device must fail in band"
+    );
+    // Sector 0 too: a partition-table rewrite is the write that would actually
+    // happen, and it must fail exactly the same way.
+    assert_eq!(h.write_sectors(0, &payload), S_IOERR);
+    // FLUSH is not an error — it is a no-op on media that cannot be dirty — so a
+    // driver that flushes on unmount does not see a spurious failure.
+    let status_addr = BUF_BASE + 0x800;
+    assert_eq!(h.run_request(T_FLUSH, 0, &[], status_addr).0, S_OK);
+
+    assert_eq!(
+        std::fs::read(&h.path).expect("re-read the backing image"),
+        before,
+        "the backing image must be byte-for-byte unchanged"
+    );
+
+    // And it is still a usable disk.
+    assert_eq!(h.capacity_from_config(), DISK_SECTORS);
+    let (status, data) = h.read_sectors(4, 512);
+    assert_eq!(status, S_OK, "reads must still work");
+    assert_eq!(data, vec![0u8; 512]);
+}
+
 #[test]
 fn write_then_read_round_trip() {
     let mut h = Harness::new(true);

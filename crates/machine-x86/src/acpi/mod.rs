@@ -826,17 +826,17 @@ mod tests {
                 MADT_INTI_ACTIVE_HIGH_LEVEL
             )));
             const {
-                assert!(
-                    layout::ACPI_SCI_GSI >= layout::VIRTIO_MMIO_FIRST_IRQ + MAX_VIRTIO_SLOTS,
-                    "the SCI must not share a GSI with a virtio-mmio slot"
-                )
+                let mut n = 0;
+                while n < layout::VIRTIO_IRQS.len() {
+                    assert!(
+                        layout::VIRTIO_IRQS[n] != layout::ACPI_SCI_GSI,
+                        "the SCI must not share a GSI with a virtio slot"
+                    );
+                    n += 1;
+                }
             };
         }
     }
-
-    /// `virtio::MAX_VIRTIO_SLOTS` lives in a Linux-only module; mirrored here so
-    /// the GSI assertion above also runs on the Windows host.
-    const MAX_VIRTIO_SLOTS: u32 = 8;
 
     #[test]
     fn dsdt_carries_a_real_s5_package_and_a_pci_root_bridge() {

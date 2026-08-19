@@ -385,12 +385,15 @@ name = "boot-tests"
 version = "0.1.0"
 dependencies = [
  "control-api",
+ "display",
  "linux-boot",
  "machine-x86",
  "tracing",
  "uefi-boot",
  "virtio-block",
  "virtio-core",
+ "virtio-gpu",
+ "virtio-input",
  "vmm-core",
 ]
 

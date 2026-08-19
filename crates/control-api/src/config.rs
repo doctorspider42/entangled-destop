@@ -14,6 +14,22 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+/// Smallest guest this machine is willing to build.
+pub const MIN_MEMORY_MIB: u64 = 128;
+
+/// Largest guest this machine can currently build.
+///
+/// 3072 MiB is `machine_x86::layout::MMIO_HOLE_START` (`0xc000_0000`) expressed
+/// in MiB: RAM stops where the 32-bit MMIO hole starts, and the high-RAM split
+/// that would let a guest continue above 4 GiB is post-MVP. `machine_x86`
+/// asserts the same bound when it builds the E820 map, so without this check a
+/// perfectly well-formed profile reaches that assert and the process *panics* —
+/// which is not how this project reports a bad config.
+///
+/// `apps/entangled` has the test that keeps the two numbers equal; control-api
+/// deliberately does not depend on the machine crate.
+pub const MAX_MEMORY_MIB: u64 = 3072;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VmConfig {
@@ -172,9 +188,10 @@ impl VmConfig {
         if self.name.is_empty() {
             return err("name must not be empty".into());
         }
-        if !(128..=65536).contains(&self.memory_mib) {
+        if !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&self.memory_mib) {
             return err(format!(
-                "memory_mib {} outside supported range 128..=65536",
+                "memory_mib {} outside supported range {MIN_MEMORY_MIB}..={MAX_MEMORY_MIB} \
+                 (RAM stops at the 32-bit MMIO hole; the high-RAM split is post-MVP)",
                 self.memory_mib
             ));
         }
@@ -209,6 +226,23 @@ impl VmConfig {
                     return err("boot.kernel/boot.initramfs are only valid for mode = \
                          \"direct-linux\"; in uefi mode the firmware loads the guest"
                         .into());
+                }
+                // A UEFI firmware cannot see a virtio-mmio device at all: EDK2's
+                // CloudHv build ships VirtioPciDeviceDxe/Virtio10Dxe/VirtioBlkDxe
+                // and no virtio-MMIO driver (ADR-0003). The combination is not
+                // "slower" or "less featured", it is a firmware that boots
+                // perfectly and then reports "No bootable option or device was
+                // found" — which reads like a bug in the media, the ISO or the
+                // block device, and sends the reader looking in four wrong
+                // places. Refuse it while we still know why.
+                if !self.transport.is_pci() && !self.disks.is_empty() {
+                    return err(format!(
+                        "mode = \"uefi\" needs transport = \"pci\": a UEFI firmware has no \
+                         virtio-mmio driver, so the {} configured disk(s) would be invisible \
+                         to it and the boot would end at \"No bootable option or device was \
+                         found\"",
+                        self.disks.len()
+                    ));
                 }
             }
         }
@@ -312,8 +346,9 @@ kernel = "vmlinuz"
     /// EPIC 18 / ADR-0003: a UEFI profile names a firmware image and no kernel.
     const UEFI_EXAMPLE: &str = r#"
 name = "ubuntu-uefi"
-memory_mib = 4096
+memory_mib = 2560
 vcpus = 2
+transport = "pci"
 
 [boot]
 mode = "uefi"
@@ -381,6 +416,120 @@ writable = true
             "unexpected kernel key in:\n{text}"
         );
         assert_eq!(VmConfig::from_toml(&text).unwrap(), cfg);
+    }
+
+    /// UEFI-1803: the ISO boot profile — firmware, the pci transport, a writable
+    /// target as `/dev/vda` and the installer ISO read-only as `/dev/vdb`.
+    const UBUNTU_ISO_EXAMPLE: &str = r#"
+name = "ubuntu-uefi"
+memory_mib = 2560
+vcpus = 2
+transport = "pci"
+
+[boot]
+mode = "uefi"
+firmware = "artifacts/firmware/CLOUDHV.fd"
+
+[[disk]]
+path = "/home/you/entangled-vms/ubuntu.raw"
+writable = true
+
+[[disk]]
+path = "/home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-live-server-amd64.iso"
+writable = false
+"#;
+
+    #[test]
+    fn parses_the_ubuntu_iso_profile() {
+        let cfg = VmConfig::from_toml(UBUNTU_ISO_EXAMPLE).unwrap();
+        assert_eq!(cfg.boot.mode, BootMode::Uefi);
+        assert!(cfg.transport.is_pci());
+        // Disk order is device order: 00:01.0 is /dev/vda, 00:02.0 is /dev/vdb.
+        assert_eq!(cfg.disks.len(), 2);
+        assert!(cfg.disks[0].writable, "the install target must be writable");
+        assert!(
+            !cfg.disks[1].writable,
+            "the installer ISO must be attached read-only"
+        );
+        assert_eq!(
+            VmConfig::from_toml(&toml::to_string_pretty(&cfg).unwrap()).unwrap(),
+            cfg
+        );
+    }
+
+    /// `writable` defaults to false, so an ISO section that simply omits the key
+    /// is read-only rather than accidentally writable. This is the direction a
+    /// default must fail in.
+    #[test]
+    fn a_disk_without_writable_is_read_only() {
+        let cfg = VmConfig::from_toml(
+            &UBUNTU_ISO_EXAMPLE.replace("writable = false", "# no writable key here"),
+        )
+        .unwrap();
+        assert!(!cfg.disks[1].writable);
+    }
+
+    /// A UEFI profile with disks on virtio-mmio describes a machine whose
+    /// firmware cannot see its own boot media (ADR-0003: CloudHv ships no
+    /// virtio-MMIO driver). Refused at parse time, because the symptom — "No
+    /// bootable option or device was found" — looks like a media problem.
+    #[test]
+    fn uefi_with_disks_requires_the_pci_transport() {
+        let mmio = UBUNTU_ISO_EXAMPLE.replace("transport = \"pci\"", "");
+        let error = VmConfig::from_toml(&mmio).expect_err("mmio + uefi + disks must be refused");
+        let ConfigError::Invalid(message) = error else {
+            panic!("expected a validation error, got {error:?}");
+        };
+        assert!(message.contains("transport = \"pci\""), "{message}");
+
+        // Explicit mmio is refused the same way as the default.
+        assert!(matches!(
+            VmConfig::from_toml(&UBUNTU_ISO_EXAMPLE.replace("\"pci\"", "\"mmio\"")),
+            Err(ConfigError::Invalid(_))
+        ));
+
+        // But a firmware-only profile — no disks at all, which is how the
+        // firmware bring-up boots to the Boot Manager (examples/uefi-firmware.toml)
+        // — stays valid on the default transport: there is no media for the
+        // missing driver to miss.
+        let cfg = VmConfig::from_toml(
+            r#"
+name = "uefi-firmware"
+memory_mib = 2048
+vcpus = 1
+
+[boot]
+mode = "uefi"
+firmware = "artifacts/firmware/CLOUDHV.fd"
+"#,
+        )
+        .expect("a diskless uefi profile is valid on mmio");
+        assert!(cfg.disks.is_empty());
+        assert_eq!(cfg.transport, VirtioTransport::Mmio);
+    }
+
+    /// A guest larger than the 32-bit MMIO hole makes `machine_x86::e820_map`
+    /// assert. That must be a typed config error here, not a panic three crates
+    /// away — the bound is checked at the only place a human typed the number.
+    #[test]
+    fn memory_stops_at_the_mmio_hole() {
+        assert_eq!(MAX_MEMORY_MIB, 3072, "3 GiB, i.e. MMIO_HOLE_START in MiB");
+        let too_big = UBUNTU_ISO_EXAMPLE.replace("memory_mib = 2560", "memory_mib = 4096");
+        let error = VmConfig::from_toml(&too_big).expect_err("4 GiB must be refused");
+        let ConfigError::Invalid(message) = error else {
+            panic!("expected a validation error, got {error:?}");
+        };
+        assert!(message.contains("MMIO hole"), "{message}");
+
+        // Exactly at the bound is fine; one MiB over is not.
+        assert!(VmConfig::from_toml(
+            &UBUNTU_ISO_EXAMPLE.replace("memory_mib = 2560", "memory_mib = 3072")
+        )
+        .is_ok());
+        assert!(VmConfig::from_toml(
+            &UBUNTU_ISO_EXAMPLE.replace("memory_mib = 2560", "memory_mib = 3073")
+        )
+        .is_err());
     }
 
     #[test]

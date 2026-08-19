@@ -255,12 +255,30 @@ impl TransportState {
                 self.driver_features =
                     (self.driver_features & 0x0000_0000_ffff_ffff) | (u64::from(value) << 32)
             }
+            // Not a warning, and not a guest bug: since Linux 6.14 the modern
+            // virtio-pci driver carries a 128-bit feature word
+            // (`VIRTIO_FEATURES_DWORDS == 4`) and `vp_modern_set_extended_features`
+            // walks selectors 0..=3 unconditionally, writing zeroes into the
+            // windows it has nothing to put in. Ubuntu 26.04's kernel does this
+            // for every device on every boot, so warning about it buries the
+            // things worth reading in a boot log. Dropping the write is the
+            // right answer — we offer no feature above bit 63, so there is
+            // nothing for the driver to accept up there — and a *non-zero* write
+            // to a window we do not implement is still worth a line.
+            sel if value == 0 => tracing::trace!(
+                transport = self.kind,
+                slot = self.slot,
+                device = ?self.device_type,
+                sel,
+                "driver cleared an extended feature window this device does not offer"
+            ),
             sel => tracing::warn!(
                 transport = self.kind,
                 slot = self.slot,
                 device = ?self.device_type,
                 sel,
-                "ignoring driver-features write with an out-of-range selector"
+                value = format_args!("{value:#x}"),
+                "ignoring a non-zero driver-features write with an out-of-range selector"
             ),
         }
     }

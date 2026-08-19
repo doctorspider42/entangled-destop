@@ -139,6 +139,28 @@ impl NotifyAddressing {
     fn is_datamatched(self) -> bool {
         matches!(self, Self::SharedWithDatamatch { .. })
     }
+
+    /// The same addressing moved to a new base.
+    ///
+    /// Only [`Self::PerQueue`] can move, and only because a PCI BAR is *guest*
+    /// programmable: a virtio-mmio slot lives at a host constant that nothing in
+    /// the guest can change, so rebasing one is a host bug rather than a
+    /// situation to handle.
+    fn with_base(self, base: u64) -> Self {
+        match self {
+            Self::SharedWithDatamatch { .. } => self,
+            Self::PerQueue { stride, .. } => Self::PerQueue { base, stride },
+        }
+    }
+
+    /// The base a rebase would replace, for comparing "where the registrations
+    /// are" against "where the BAR now decodes".
+    pub fn base(self) -> u64 {
+        match self {
+            Self::SharedWithDatamatch { addr } => addr,
+            Self::PerQueue { base, .. } => base,
+        }
+    }
 }
 
 /// Upper bound on queues we will offload per device.
@@ -229,11 +251,46 @@ pub enum NotifyError {
     },
 }
 
-/// One queue's ioeventfd registration, kept so it can be deassigned again.
+/// One queue's eventfd. The *address* it is registered at is not here: on
+/// virtio-pci that address follows a guest-programmable BAR, so it lives in
+/// [`Registration`] where it can change without disturbing the fds the worker
+/// thread is already epolling.
 struct QueueEvent {
     index: u16,
-    addr: IoEventAddress,
     event: EventFd,
+}
+
+/// Where a device's queue eventfds are registered with KVM *right now*.
+///
+/// Separate from the eventfds themselves because it moves. On virtio-pci the
+/// notification area is at `BAR0 + 0x2000`, and BAR0 is whatever the guest last
+/// wrote — EDK2's `PciBusDxe` reassigns every BAR during resource allocation, so
+/// a registration made at attach time is at the wrong address by the time any
+/// driver kicks a queue.
+struct Registration {
+    /// `None` when nothing is registered: either the offload has been taken down,
+    /// or every registration was refused (in which case the queues are back on
+    /// the synchronous path and a later rebase may pick them up).
+    addressing: Option<NotifyAddressing>,
+    /// Bit *n* set means `events[n]`'s eventfd is registered at `addressing` and
+    /// the transport has been told that queue is offloaded.
+    ///
+    /// A bitmask rather than a list so reconciling costs no allocation on a path
+    /// a guest can drive (one config-space write per reconcile).
+    mask: u16,
+}
+
+impl Registration {
+    const fn none() -> Self {
+        Self {
+            addressing: None,
+            mask: 0,
+        }
+    }
+
+    fn holds(&self, position: usize) -> bool {
+        position < MAX_OFFLOADED_QUEUES && self.mask & (1u16 << position) != 0
+    }
 }
 
 /// The host side of one device's offloaded queue notifications: the eventfds,
@@ -245,8 +302,15 @@ struct QueueEvent {
 pub struct DeviceNotifier<T: QueueNotifyTarget> {
     slot: usize,
     vm: Arc<VmFd>,
-    addressing: NotifyAddressing,
+    /// The *shape* of this device's addressing — datamatched or per-queue, and
+    /// with what stride. Fixed at attach: only the base moves.
+    shape: NotifyAddressing,
+    /// The eventfds and the worker thread: fixed for the notifier's lifetime.
     events: Vec<QueueEvent>,
+    /// The KVM registrations: guest-movable, hence the `Mutex`. Any vCPU thread
+    /// can take the configuration-space exit that moves a BAR, so this is
+    /// reached through `&self`.
+    registration: Mutex<Registration>,
     kill: EventFd,
     /// `None` before the worker starts and again once it has been joined.
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -262,11 +326,12 @@ impl<T: QueueNotifyTarget> DeviceNotifier<T> {
     /// Offloads every queue of the device in `slot` whose ioeventfd could be
     /// registered, and starts the worker thread that serves them.
     ///
-    /// Returns `Ok(None)` when nothing could be offloaded (no queues, or every
-    /// registration was refused by the kernel) — the caller then simply keeps
-    /// the synchronous path. Queues that fail individually are left on the
-    /// synchronous path too; only queues this call reports as offloaded to the
-    /// transport are served by the worker, so a kick can never be lost.
+    /// Returns `Ok(None)` when there is nothing to offload — a device with no
+    /// queues — and the caller simply keeps the synchronous path. A notifier is
+    /// returned even if *no* registration succeeded: on virtio-pci the addresses
+    /// move, so "refused today" is not "refused forever" (see [`Self::rebase`]).
+    /// Only queues actually registered are reported to the transport as
+    /// offloaded, so a kick can never be lost to a worker that will not run.
     pub fn attach(
         vm: Arc<VmFd>,
         slot: usize,
@@ -282,6 +347,9 @@ impl<T: QueueNotifyTarget> DeviceNotifier<T> {
             };
             t.num_queues().min(MAX_OFFLOADED_QUEUES)
         };
+        if queue_count == 0 {
+            return Ok(None);
+        }
 
         // Built empty first so that *every* early return from here on drops a
         // `DeviceNotifier` that owns whatever was registered so far, and its
@@ -296,8 +364,9 @@ impl<T: QueueNotifyTarget> DeviceNotifier<T> {
         let mut notifier = Self {
             slot,
             vm,
-            addressing,
+            shape: addressing,
             events: Vec::with_capacity(queue_count),
+            registration: Mutex::new(Registration::none()),
             kill,
             worker: Mutex::new(None),
             torn_down: AtomicBool::new(false),
@@ -307,124 +376,220 @@ impl<T: QueueNotifyTarget> DeviceNotifier<T> {
         for index in 0..queue_count {
             // `queue_count` is capped at MAX_OFFLOADED_QUEUES, so this fits.
             let queue = u16::try_from(index).unwrap_or(u16::MAX);
-            let event = match EventFd::new(EFD_NONBLOCK) {
-                Ok(event) => event,
-                Err(source) => {
-                    notifier.restore_transport(transport);
-                    return Err(NotifyError::EventFd {
-                        slot,
-                        queue,
-                        source,
-                    });
-                }
-            };
-            let notify_addr = addressing.addr_of(queue);
-            let addr = IoEventAddress::Mmio(notify_addr);
-            // With a shared address the datamatch on the queue index makes KVM
-            // swallow exactly this queue's kicks; a write of any other value
-            // still exits to userspace, where the transport drops it as an
-            // unknown queue. With a per-queue address the address itself says
-            // which queue it is, so no datamatch — and therefore no width
-            // sensitivity — is needed.
-            let registered = if addressing.is_datamatched() {
-                notifier
-                    .vm
-                    .register_ioevent(&event, &addr, u32::from(queue))
-            } else {
-                notifier.vm.register_ioevent(&event, &addr, NoDatamatch)
-            };
-            if let Err(error) = registered {
-                tracing::warn!(
-                    slot,
-                    queue,
-                    addr = format_args!("{notify_addr:#x}"),
-                    %error,
-                    "ioeventfd registration refused; this queue keeps the synchronous notify path"
-                );
-                continue;
-            }
-            let accepted = match transport.lock() {
-                Ok(mut t) => t.offload_queue_notify(queue),
-                Err(_) => {
-                    tracing::error!(slot, queue, "transport lock poisoned; skipping offload");
-                    false
-                }
-            };
-            if !accepted {
-                // Nothing would ever call the device for this queue, so the
-                // registration must go — a swallowed kick would wedge the ring.
-                Self::deassign(&notifier.vm, addressing, queue, &event, &addr);
-                continue;
-            }
+            let event = EventFd::new(EFD_NONBLOCK).map_err(|source| NotifyError::EventFd {
+                slot,
+                queue,
+                source,
+            })?;
             notifier.events.push(QueueEvent {
                 index: queue,
-                addr,
                 event,
             });
         }
 
-        if notifier.events.is_empty() {
-            return Ok(None);
-        }
-
-        let handle = match notifier.spawn_worker(Arc::clone(transport)) {
-            Ok(handle) => handle,
-            Err(error) => {
-                notifier.restore_transport(transport);
-                return Err(error);
-            }
-        };
+        // The worker exists before any registration does, so a kick can never
+        // arrive on an eventfd nobody is watching.
+        let handle = notifier.spawn_worker(Arc::clone(transport))?;
         if let Ok(mut slot_handle) = notifier.worker.lock() {
             *slot_handle = Some(handle);
         }
+
+        let registered = notifier.rebase(addressing.base(), transport);
         tracing::info!(
             transport = T::transport_name(),
             slot,
-            queues = notifier.events.len(),
+            queues = registered,
+            of = queue_count,
             ?addressing,
             "queue notify offloaded to ioeventfds"
         );
         Ok(Some(notifier))
     }
 
-    /// Removes one queue's ioeventfd registration, with the same datamatch it
-    /// was registered with — KVM matches registrations on the whole tuple, so a
-    /// mismatched deassign silently leaves the kernel swallowing kicks.
-    fn deassign(
-        vm: &VmFd,
-        addressing: NotifyAddressing,
-        queue: u16,
-        event: &EventFd,
-        addr: &IoEventAddress,
-    ) {
-        let result = if addressing.is_datamatched() {
-            vm.unregister_ioevent(event, addr, u32::from(queue))
-        } else {
-            vm.unregister_ioevent(event, addr, NoDatamatch)
+    /// Points this device's queue eventfds at `base`, moving them if they are
+    /// somewhere else. Returns how many queues are registered afterwards.
+    ///
+    /// This exists because a **PCI BAR belongs to the guest**. The notification
+    /// area sits at `BAR0 + 0x2000`, and EDK2's `PciBusDxe` reassigns every BAR
+    /// during resource allocation — on this machine it hands out exactly our own
+    /// aperture slots in reverse order, so every device's kicks land on a
+    /// *different* device's ioeventfd. The symptom is not a crash: the firmware
+    /// reads a disk's capacity correctly (that is plain MMIO, which the config
+    /// space decodes wherever the BAR now points), kicks its request queue, and
+    /// the log shows some unrelated device logging "queue notify before
+    /// DRIVER_OK, ignoring" while the disk waits forever.
+    ///
+    /// Rules, in the order they matter:
+    ///
+    /// * a queue is reported to the transport as offloaded **only** while its
+    ///   eventfd is registered. Deassign first, tell the transport second — never
+    ///   the other way round, or a kick in the gap is dropped by both paths;
+    /// * a refused registration is not fatal. The queue goes back to the
+    ///   synchronous MMIO path, which still works, and the next rebase retries
+    ///   it. That is what makes a *permutation* of BAR addresses resolvable at
+    ///   all: the first device to move collides with a stale registration, keeps
+    ///   the synchronous path for a moment, and is picked up once the other
+    ///   device has moved away (see `VirtioPciBus::reconcile_notify`).
+    pub fn rebase(&self, base: u64, transport: &Arc<Mutex<T>>) -> usize {
+        if self.torn_down.load(Ordering::Acquire) {
+            return 0;
+        }
+        let addressing = self.shape.with_base(base);
+        let Ok(mut registration) = self.registration.lock() else {
+            tracing::error!(slot = self.slot, "registration lock poisoned; not rebasing");
+            return 0;
         };
-        if let Err(error) = result {
+        if registration.addressing == Some(addressing) {
+            return registration.mask.count_ones() as usize;
+        }
+        self.unregister_locked(&mut registration, transport);
+
+        let mut mask = 0u16;
+        for (position, queue) in self.events.iter().enumerate() {
+            if self.register_one(addressing, queue) && self.mark_offloaded(transport, queue.index) {
+                mask |= 1u16 << position;
+            } else {
+                // Either KVM refused the address or the transport refused the
+                // queue; both mean nothing would serve a kick here, so the
+                // registration must not stay.
+                self.deassign_one(addressing, queue);
+            }
+        }
+        let count = mask.count_ones() as usize;
+        registration.mask = mask;
+        registration.addressing = (mask != 0).then_some(addressing);
+        if count < self.events.len() {
             tracing::warn!(
-                queue,
-                %error,
-                "failed to deassign a queue-notify ioeventfd"
+                transport = T::transport_name(),
+                slot = self.slot,
+                registered = count,
+                of = self.events.len(),
+                base = format_args!("{:#x}", addressing.base()),
+                "some queues could not be offloaded at this address and keep the \
+                 synchronous notify path"
             );
+        } else {
+            tracing::debug!(
+                transport = T::transport_name(),
+                slot = self.slot,
+                queues = count,
+                base = format_args!("{:#x}", addressing.base()),
+                "queue-notify ioeventfds now registered"
+            );
+        }
+        count
+    }
+
+    /// Where the registrations currently sit, or `None` when none do.
+    pub fn notify_base(&self) -> Option<u64> {
+        self.registration
+            .lock()
+            .ok()
+            .and_then(|r| r.addressing)
+            .map(|a| a.base())
+    }
+
+    /// Deassigns everything and puts every queue back on the synchronous path.
+    pub fn unregister(&self, transport: &Arc<Mutex<T>>) {
+        if let Ok(mut registration) = self.registration.lock() {
+            self.unregister_locked(&mut registration, transport);
         }
     }
 
-    /// Hands every queue this notifier claimed back to the transport's register
-    /// path. Used when setting the offload up fails half way: the queues must not
-    /// be left believing a worker will serve them.
-    fn restore_transport(&self, transport: &Arc<Mutex<T>>) {
-        if let Ok(mut t) = transport.lock() {
-            for queue in &self.events {
+    fn unregister_locked(&self, registration: &mut Registration, transport: &Arc<Mutex<T>>) {
+        let Some(addressing) = registration.addressing.take() else {
+            registration.mask = 0;
+            return;
+        };
+        for (position, queue) in self.events.iter().enumerate() {
+            if !registration.holds(position) {
+                continue;
+            }
+            self.deassign_one(addressing, queue);
+            if let Ok(mut t) = transport.lock() {
                 t.restore_queue_notify(queue.index);
+            }
+        }
+        registration.mask = 0;
+    }
+
+    /// Registers one queue's eventfd. `false` means KVM refused it — most often
+    /// because a stale registration from another device still owns the address.
+    fn register_one(&self, addressing: NotifyAddressing, queue: &QueueEvent) -> bool {
+        let notify_addr = addressing.addr_of(queue.index);
+        let addr = IoEventAddress::Mmio(notify_addr);
+        // With a shared address the datamatch on the queue index makes KVM
+        // swallow exactly this queue's kicks; a write of any other value still
+        // exits to userspace, where the transport drops it as an unknown queue.
+        // With a per-queue address the address itself says which queue it is, so
+        // no datamatch — and therefore no width sensitivity — is needed.
+        let result = if addressing.is_datamatched() {
+            self.vm
+                .register_ioevent(&queue.event, &addr, u32::from(queue.index))
+        } else {
+            self.vm.register_ioevent(&queue.event, &addr, NoDatamatch)
+        };
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    slot = self.slot,
+                    queue = queue.index,
+                    addr = format_args!("{notify_addr:#x}"),
+                    %error,
+                    "ioeventfd registration refused; this queue keeps the synchronous notify path"
+                );
+                false
             }
         }
     }
 
-    /// Queue indices this notifier serves.
+    fn mark_offloaded(&self, transport: &Arc<Mutex<T>>, queue: u16) -> bool {
+        match transport.lock() {
+            Ok(mut t) => t.offload_queue_notify(queue),
+            Err(_) => {
+                tracing::error!(
+                    slot = self.slot,
+                    queue,
+                    "transport lock poisoned; skipping offload"
+                );
+                false
+            }
+        }
+    }
+
+    /// Removes one queue's ioeventfd registration, with the same datamatch it
+    /// was registered with — KVM matches registrations on the whole tuple, so a
+    /// mismatched deassign silently leaves the kernel swallowing kicks.
+    fn deassign_one(&self, addressing: NotifyAddressing, queue: &QueueEvent) {
+        let addr = IoEventAddress::Mmio(addressing.addr_of(queue.index));
+        let result = if addressing.is_datamatched() {
+            self.vm
+                .unregister_ioevent(&queue.event, &addr, u32::from(queue.index))
+        } else {
+            self.vm.unregister_ioevent(&queue.event, &addr, NoDatamatch)
+        };
+        if let Err(error) = result {
+            tracing::debug!(
+                slot = self.slot,
+                queue = queue.index,
+                %error,
+                "deassigning a queue-notify ioeventfd failed (it may never have been registered)"
+            );
+        }
+    }
+
+    /// Queue indices this notifier currently serves.
     pub fn offloaded_queues(&self) -> Vec<u16> {
-        self.events.iter().map(|e| e.index).collect()
+        let Ok(registration) = self.registration.lock() else {
+            return Vec::new();
+        };
+        self.events
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| registration.holds(*position))
+            .map(|(_, e)| e.index)
+            .collect()
     }
 
     /// Test/diagnostic hook: signals queue `index`'s eventfd exactly as KVM
@@ -506,14 +671,17 @@ impl<T: QueueNotifyTarget> DeviceNotifier<T> {
                 tracing::error!(slot = self.slot, "queue worker thread panicked");
             }
         }
-        for queue in &self.events {
-            Self::deassign(
-                &self.vm,
-                self.addressing,
-                queue.index,
-                &queue.event,
-                &queue.addr,
-            );
+        // Deassign wherever the registrations *currently* are, which after a
+        // guest BAR reassignment is not where `attach` put them.
+        if let Ok(mut registration) = self.registration.lock() {
+            if let Some(addressing) = registration.addressing.take() {
+                for (position, queue) in self.events.iter().enumerate() {
+                    if registration.holds(position) {
+                        self.deassign_one(addressing, queue);
+                    }
+                }
+            }
+            registration.mask = 0;
         }
         tracing::debug!(
             slot = self.slot,
