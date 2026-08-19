@@ -239,6 +239,14 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             ui.add_space(14.0);
 
             ui.checkbox(&mut form.headless_install, "Install headless by default");
+            ui.checkbox(
+                &mut form.check_updates_on_startup,
+                "Check for updates on startup",
+            )
+            .on_hover_text(
+                "Asks the GitHub Releases API once when the manager opens \
+                 (background thread; offline is silently fine)",
+            );
 
             ui.add_space(16.0);
             ui.horizontal(|ui| {

@@ -50,6 +50,10 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
 
 fn banners(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
     let mut any = false;
+    if let Some(update) = &app.update {
+        any = true;
+        update_banner(ui, app, update, actions);
+    }
     if let Some(warning) = &app.startup_warning {
         any = true;
         ui::banner(ui, theme::WARN, warning, None);
@@ -71,6 +75,75 @@ fn banners(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
     if any {
         ui.add_space(12.0);
     }
+}
+
+/// The non-intrusive "a newer version exists" notice (quantum theme): a card
+/// surface with the cyan→violet hairline, the version pair, one accent action
+/// and a quiet Skip. It never opens on its own and never blocks anything.
+fn update_banner(
+    ui: &mut egui::Ui,
+    app: &ManagerApp,
+    update: &crate::update::UpdateInfo,
+    actions: &mut Vec<Action>,
+) {
+    egui::Frame::new()
+        .fill(theme::mix(theme::CARD, theme::CYAN, 0.05))
+        .stroke(egui::Stroke::new(1.0_f32, theme::STROKE_STRONG))
+        .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            // The entanglement hairline along the top edge marks this as a
+            // product message, not an error.
+            let bar = egui::Rect::from_min_size(
+                ui.max_rect().left_top() - Vec2::new(0.0, 8.0),
+                Vec2::new(ui.available_width(), 2.0),
+            );
+            theme::gradient_rect(
+                ui.painter(),
+                bar,
+                theme::CYAN.gamma_multiply(0.8),
+                theme::VIOLET.gamma_multiply(0.8),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
+                    RichText::new(format!("Entangled Desktop v{}", update.version))
+                        .color(theme::TEXT)
+                        .strong()
+                        .size(13.5),
+                );
+                ui.label(ui::dim(format!(
+                    "is available — this is v{}",
+                    crate::VERSION
+                )));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui::ghost_button(ui, "Skip", !app.update_downloading, theme::TEXT_DIM)
+                        .clicked()
+                    {
+                        actions.push(Action::DismissUpdate);
+                    }
+                    let installable = cfg!(windows) && update.installer_url.is_some();
+                    if installable {
+                        let label = if app.update_downloading {
+                            "Downloading…"
+                        } else {
+                            "Download & install"
+                        };
+                        if ui::ghost_button(ui, label, !app.update_downloading, theme::CYAN)
+                            .on_hover_text(
+                                "Saves the installer to Downloads and starts it; \
+                                 it upgrades this installation in place",
+                            )
+                            .clicked()
+                        {
+                            actions.push(Action::InstallUpdate);
+                        }
+                    } else if ui::ghost_button(ui, "Release page", true, theme::CYAN).clicked() {
+                        actions.push(Action::OpenReleasePage);
+                    }
+                });
+            });
+        });
 }
 
 fn vm_card(
