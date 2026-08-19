@@ -12,7 +12,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::monitor::MonitorHandle;
-use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
+use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Fullscreen, Window, WindowId};
 
 use crate::handle::{HostEvent, Waker};
 use crate::input::{
@@ -121,6 +121,7 @@ impl DisplayHost {
             occluded: false,
             grabbed: false,
             cursor_visible: true,
+            hidden_cursor: None,
             applied_title: String::new(),
             fullscreen: false,
             mode: ScaleMode::default(),
@@ -154,6 +155,16 @@ struct App {
     grabbed: bool,
     /// Cursor visibility actually applied to the window (WIN-1501).
     cursor_visible: bool,
+    /// A fully transparent cursor image, created once with the window; `Some`
+    /// only on Wayland.
+    ///
+    /// Hiding the cursor there cannot use `set_cursor_visible(false)`: winit
+    /// maps it to `wl_pointer.set_cursor(nil)`, and WSLg's RDP-backed Weston
+    /// does not forward the null cursor to the Windows side — the host arrow
+    /// keeps hovering over the guest's own pointer (the EPIC 15 demo bug).
+    /// Showing a real cursor whose every pixel is transparent takes the
+    /// ordinary cursor-image path, which every compositor honours.
+    hidden_cursor: Option<CustomCursor>,
     /// Title text actually applied to the window.
     ///
     /// Every `set_title` is an X11/Wayland round trip, and winit's X11 backend
@@ -209,6 +220,7 @@ impl App {
             .with_resizable(true)
             .with_maximized(initial.maximized);
         let window = Arc::new(event_loop.create_window(attributes)?);
+        self.hidden_cursor = transparent_cursor(event_loop);
         let size = window.inner_size();
         tracing::info!(
             width = size.width,
@@ -367,18 +379,27 @@ impl App {
     /// Mirrors the cursor policy onto the window (WIN-1501). Cheap enough to call
     /// after every pointer event: it only talks to winit when the decision
     /// actually flipped.
+    ///
+    /// On Wayland "hidden" means the transparent [`Self::hidden_cursor`] rather
+    /// than `set_cursor_visible(false)` — see the field's docs for the WSLg
+    /// story. Everywhere else the plain visibility flag works and is kept.
     fn sync_cursor(&mut self) {
         let visible = self.capture.cursor_visible();
         if visible == self.cursor_visible {
             return;
         }
         self.cursor_visible = visible;
-        if let Some(window) = self.window.as_ref() {
-            window.set_cursor_visible(visible);
-            // Low frequency (only when crossing the image edge or changing the
-            // grab), and the first thing to check when WIN-1501 misbehaves.
-            tracing::debug!(visible, "host cursor visibility changed");
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        match (&self.hidden_cursor, visible) {
+            (Some(hidden), false) => window.set_cursor(hidden.clone()),
+            (Some(_), true) => window.set_cursor(CursorIcon::Default),
+            (None, _) => window.set_cursor_visible(visible),
         }
+        // Low frequency (only when crossing the image edge or changing the
+        // grab), and the first thing to check when WIN-1501 misbehaves.
+        tracing::debug!(visible, "host cursor visibility changed");
     }
 
     /// `F11`: borderless fullscreen on the window's current monitor (WIN-1504).
@@ -415,6 +436,38 @@ impl App {
             .map(Renderer::stats)
             .unwrap_or_default()
     }
+}
+
+/// A fully transparent 8×8 cursor for hiding the pointer on Wayland, where
+/// `set_cursor_visible(false)` becomes `wl_pointer.set_cursor(nil)` and WSLg's
+/// RDP-backed Weston drops the null cursor on the floor (WIN-1501). A real
+/// cursor surface whose pixels are all transparent goes down the ordinary
+/// cursor-image path instead. 8×8 rather than 1×1 because tiny buffers have
+/// historically upset compositors; the cost is 256 bytes, once.
+///
+/// `None` off Wayland (and if the compositor refuses the cursor allocation),
+/// which sends [`App::sync_cursor`] back to `set_cursor_visible` — correct on
+/// Windows, macOS and X11, where the flag works.
+#[cfg(target_os = "linux")]
+fn transparent_cursor(event_loop: &ActiveEventLoop) -> Option<CustomCursor> {
+    use winit::platform::wayland::ActiveEventLoopExtWayland;
+    if !event_loop.is_wayland() {
+        return None;
+    }
+    let source = match CustomCursor::from_rgba(vec![0u8; 8 * 8 * 4], 8, 8, 0, 0) {
+        Ok(source) => source,
+        Err(err) => {
+            tracing::warn!(%err, "cannot build the transparent cursor; falling back to set_cursor_visible");
+            return None;
+        }
+    };
+    Some(event_loop.create_custom_cursor(source))
+}
+
+/// Non-Linux hosts: the plain visibility flag works everywhere winit runs there.
+#[cfg(not(target_os = "linux"))]
+fn transparent_cursor(_event_loop: &ActiveEventLoop) -> Option<CustomCursor> {
+    None
 }
 
 /// A monitor's size in *logical* pixels, to compare against the configured
