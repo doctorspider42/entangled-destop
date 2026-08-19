@@ -178,8 +178,13 @@ mod tests {
     #[test]
     fn a_guest_exactly_at_the_hole_has_no_high_entry() {
         let map = e820_map(layout::MMIO_HOLE_START);
-        assert!(map.iter().all(|e| e.addr + e.size <= layout::MMIO_HOLE_START));
-        assert_eq!(map.iter().map(|e| e.size).sum::<u64>(), layout::MMIO_HOLE_START);
+        assert!(map
+            .iter()
+            .all(|e| e.addr + e.size <= layout::MMIO_HOLE_START));
+        assert_eq!(
+            map.iter().map(|e| e.size).sum::<u64>(),
+            layout::MMIO_HOLE_START
+        );
     }
 
     /// vmm-core allocates guest memory in the same two-region shape this map

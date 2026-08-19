@@ -291,7 +291,13 @@ impl<S: ScanoutSink> GpuDevice<S> {
 
     /// One cursor-queue chain: gather, parse, act. All failure paths log and
     /// return — the cursor protocol has no response channel.
-    fn handle_cursor_command(&mut self, mem: &GuestMem, desc_table: u64, queue_size: u16, head: u16) {
+    fn handle_cursor_command(
+        &mut self,
+        mem: &GuestMem,
+        desc_table: u64,
+        queue_size: u16,
+        head: u16,
+    ) {
         let segments = match chain::walk(mem, desc_table, queue_size, head) {
             Ok(segments) => segments,
             Err(error) => {
@@ -546,8 +552,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
     /// `GET_EDID` (MVP-811): a valid EDID 1.4 block whose preferred detailed
     /// timing is the current scanout resolution.
     fn get_edid(&self, buf: &[u8]) -> Result<Reply, CommandError> {
-        let cmd = GetEdid::parse(buf)
-            .ok_or_else(|| truncated(cmd::GET_EDID, buf.len(), GetEdid::LEN))?;
+        let cmd =
+            GetEdid::parse(buf).ok_or_else(|| truncated(cmd::GET_EDID, buf.len(), GetEdid::LEN))?;
         if cmd.scanout >= NUM_SCANOUTS {
             return Err(CommandError::UnknownScanout(cmd.scanout));
         }

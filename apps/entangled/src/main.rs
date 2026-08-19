@@ -212,11 +212,9 @@ fn run(cli: Cli) -> Result<(), String> {
             {
                 let shot = screenshot_after.map(|secs| run_vm::ScreenshotRequest {
                     after: std::time::Duration::from_secs(secs),
-                    path: screenshot
-                        .unwrap_or_else(|| PathBuf::from(format!(
-                            "entangled-screenshot-{}.png",
-                            cfg.name
-                        ))),
+                    path: screenshot.unwrap_or_else(|| {
+                        PathBuf::from(format!("entangled-screenshot-{}.png", cfg.name))
+                    }),
                 });
                 run_vm::run(cfg, headless, shot)
             }

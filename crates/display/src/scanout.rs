@@ -704,7 +704,10 @@ mod tests {
         let image = vec![0u8; 16];
         assert!(s.set_cursor(0, 2, 0, 0, 0, 0, &image).is_err());
         assert!(s.set_cursor(2, 0, 0, 0, 0, 0, &image).is_err());
-        assert!(s.set_cursor(2, 2, 0, 0, 0, 0, &image[..8]).is_err(), "short data");
+        assert!(
+            s.set_cursor(2, 2, 0, 0, 0, 0, &image[..8]).is_err(),
+            "short data"
+        );
         assert!(
             s.set_cursor(4096, 4096, 0, 0, 0, 0, &image).is_err(),
             "over the plane cap"

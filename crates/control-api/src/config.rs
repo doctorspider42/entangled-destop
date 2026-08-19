@@ -720,10 +720,8 @@ path = "/home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-desktop-amd64.iso"
 
         // On direct-linux the section is a category error, and the message says
         // what to use instead.
-        let direct = BACKLOG_EXAMPLE.replace(
-            "[network]",
-            "[cdrom]\npath = \"/isos/x.iso\"\n\n[network]",
-        );
+        let direct =
+            BACKLOG_EXAMPLE.replace("[network]", "[cdrom]\npath = \"/isos/x.iso\"\n\n[network]");
         let error = VmConfig::from_toml(&direct).expect_err("cdrom on direct-linux");
         let ConfigError::Invalid(message) = error else {
             panic!("expected a validation error, got {error:?}");
@@ -739,10 +737,16 @@ path = "/home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-desktop-amd64.iso"
     fn set_cdrom_revalidates_the_modified_profile() {
         let mut cfg = VmConfig::from_toml(UEFI_EXAMPLE).unwrap();
         cfg.set_cdrom(PathBuf::from("/isos/x.iso")).unwrap();
-        assert_eq!(cfg.cdrom.as_ref().unwrap().path, PathBuf::from("/isos/x.iso"));
+        assert_eq!(
+            cfg.cdrom.as_ref().unwrap().path,
+            PathBuf::from("/isos/x.iso")
+        );
         // Replacing an existing cdrom is allowed — the flag wins.
         cfg.set_cdrom(PathBuf::from("/isos/y.iso")).unwrap();
-        assert_eq!(cfg.cdrom.as_ref().unwrap().path, PathBuf::from("/isos/y.iso"));
+        assert_eq!(
+            cfg.cdrom.as_ref().unwrap().path,
+            PathBuf::from("/isos/y.iso")
+        );
 
         let mut direct = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
         let error = direct

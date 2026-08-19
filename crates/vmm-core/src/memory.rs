@@ -167,9 +167,13 @@ mod tests {
             .write_obj(0u8, GuestAddress(LOW_RAM_END + 0x1000))
             .is_err());
         // But both sides of it are writable through the checked APIs.
-        mem.write_obj(0xa5u8, GuestAddress(LOW_RAM_END - 1)).unwrap();
+        mem.write_obj(0xa5u8, GuestAddress(LOW_RAM_END - 1))
+            .unwrap();
         mem.write_obj(0x5au8, GuestAddress(HIGH_RAM_START)).unwrap();
-        assert_eq!(mem.read_obj::<u8>(GuestAddress(HIGH_RAM_START)).unwrap(), 0x5a);
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(HIGH_RAM_START)).unwrap(),
+            0x5a
+        );
     }
 
     /// Exactly at the boundary stays a single region — the split must not

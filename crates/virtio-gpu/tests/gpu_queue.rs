@@ -1049,7 +1049,10 @@ fn get_edid_returns_a_valid_block_for_the_scanout() {
     let size = u32::from_le_bytes(body[0..4].try_into().expect("4 bytes"));
     assert_eq!(size, 128, "one EDID base block");
     let edid = &body[8..8 + 128];
-    assert_eq!(&edid[0..8], &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+    assert_eq!(
+        &edid[0..8],
+        &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]
+    );
     let sum: u8 = edid.iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
     assert_eq!(sum, 0, "EDID checksum");
     // The preferred detailed timing carries the scanout resolution.
