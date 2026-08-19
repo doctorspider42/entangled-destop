@@ -85,6 +85,32 @@ pub const VIRTIO_PCI_REVISION: u8 = 1;
 /// PCI subsystem vendor id. Linux reads the virtio *vendor* id from this field.
 pub const VIRTIO_PCI_SUBSYSTEM_VENDOR_ID: u16 = 0x1af4;
 
+/// PCI subsystem *device* id.
+///
+/// Spec 1.2 §4.1.2.1: a transitional device must put the virtio device id here
+/// (that is how a legacy driver identifies it), and a non-transitional one
+/// "SHOULD have a PCI Subsystem Device ID of 0x40 or higher" — a value chosen to
+/// be outside the legacy device-id space so the two cannot be confused.
+///
+/// Not cosmetic, and not optional in practice: EDK2's `Virtio10Dxe` refuses to
+/// bind a device whose subsystem id is below `0x40`
+/// (`OvmfPkg/Virtio10Dxe/Virtio10.c`, `Virtio10BindingSupported`):
+///
+/// ```text
+/// if ((Pci.Hdr.VendorId == VIRTIO_VENDOR_ID) &&
+///     (Pci.Hdr.DeviceId >= 0x1040) && (Pci.Hdr.DeviceId <= 0x107F) &&
+///     (Pci.Hdr.RevisionID >= 0x01) &&
+///     (Pci.Device.SubsystemID >= 0x40) &&
+///     ((Pci.Hdr.Status & EFI_PCI_STATUS_CAPABILITY) != 0))
+/// ```
+///
+/// With a zero here the firmware enumerates the function, prints it from
+/// `PciBusDxe` and then never produces a `VIRTIO_DEVICE_PROTOCOL` for it, so
+/// `VirtioBlkDxe` has nothing to attach to and there is no boot media. Linux
+/// does not look at this field at all, which is why the mistake survived the
+/// virtio-pci acceptance boot. QEMU writes the same `0x40`.
+pub const VIRTIO_PCI_SUBSYSTEM_DEVICE_ID: u16 = 0x40;
+
 /// Written into the PCI `interrupt_pin` register: INTA#. Nonzero is what tells a
 /// driver the device has a legacy interrupt at all.
 pub const VIRTIO_PCI_INTERRUPT_PIN: u8 = 1;

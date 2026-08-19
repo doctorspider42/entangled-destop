@@ -199,7 +199,7 @@ impl VirtioPciBus {
 
             // The config space is built first so its INTx flag can gate the
             // line the transport is about to be handed.
-            let config = bus.build_config_space(slot, bar_base, gsi, device.as_ref())?;
+            let config = Self::build_config_space(slot, bar_base, gsi, device.as_ref())?;
             let line = Arc::new(IntxLine {
                 event,
                 enabled: config.intx_flag(),
@@ -262,8 +262,11 @@ impl VirtioPciBus {
     ///
     /// The identity comes from the transport module rather than from here — the
     /// bus knows about type-0 headers, not about virtio.
+    ///
+    /// Deliberately an associated function: it needs no bus state, and that is
+    /// what lets the tests below check the bytes a firmware matches on without
+    /// KVM, an eventfd or a real device.
     fn build_config_space(
-        &self,
         slot: usize,
         bar_base: u64,
         gsi: u32,
@@ -286,8 +289,13 @@ impl VirtioPciBus {
             vpci::class_code(device.device_type()),
             vpci::VIRTIO_PCI_REVISION,
         )
-        // Linux reads the virtio *vendor* id out of the PCI subsystem vendor.
-        .with_subsystem(vpci::VIRTIO_PCI_SUBSYSTEM_VENDOR_ID, 0)
+        // Linux reads the virtio *vendor* id out of the PCI subsystem vendor;
+        // EDK2's Virtio10Dxe refuses anything with a subsystem *device* id below
+        // 0x40, which is what the spec asks a non-transitional device to publish.
+        .with_subsystem(
+            vpci::VIRTIO_PCI_SUBSYSTEM_VENDOR_ID,
+            vpci::VIRTIO_PCI_SUBSYSTEM_DEVICE_ID,
+        )
         .with_memory_bar(vpci::VIRTIO_PCI_BAR_INDEX, base, size)
         .map_err(bus_error)?
         .with_interrupt(
@@ -459,6 +467,109 @@ mod tests {
         let mut id = [0u8; 4];
         bus.io_read(pci::CONFIG_DATA_PORT, &mut id);
         assert_eq!(u32::from_le_bytes(id) & 0xffff, 0x8086);
+    }
+
+    /// A device that exists only to be asked what it is.
+    struct IdentityOnly(virtio_core::DeviceType);
+
+    impl VirtioDevice for IdentityOnly {
+        fn device_type(&self) -> virtio_core::DeviceType {
+            self.0
+        }
+        fn queue_max_sizes(&self) -> &[u16] {
+            &[256]
+        }
+        fn device_features(&self) -> u64 {
+            virtio_core::VIRTIO_F_VERSION_1
+        }
+        fn ack_features(&mut self, _negotiated: u64) -> bool {
+            true
+        }
+        fn read_config(&self, _offset: u64, _data: &mut [u8]) {}
+        fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
+        fn activate(
+            &mut self,
+            _resources: virtio_core::DeviceResources,
+        ) -> Result<(), virtio_core::DeviceError> {
+            Ok(())
+        }
+        fn notify(&mut self, _queue_index: u16) -> Result<(), virtio_core::DeviceError> {
+            Ok(())
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// Everything EDK2's `Virtio10Dxe` gates on, read back out of the
+    /// configuration space the bus actually builds
+    /// (`OvmfPkg/Virtio10Dxe/Virtio10.c`, `Virtio10BindingSupported`):
+    /// vendor `0x1af4`, device id in `0x1040..=0x107f`, revision ≥ 1,
+    /// **subsystem device id ≥ 0x40**, and the capability-list status bit.
+    ///
+    /// The subsystem id was `0` until UEFI-1803 and is the whole reason the
+    /// firmware enumerated our disks and then refused to drive them. Linux never
+    /// reads that field, so no Linux boot test could have caught it — hence this
+    /// one asserts the firmware's condition literally.
+    #[test]
+    fn the_config_space_satisfies_edk2s_virtio10_binding() {
+        for kind in [
+            virtio_core::DeviceType::Block,
+            virtio_core::DeviceType::Net,
+            virtio_core::DeviceType::Gpu,
+            virtio_core::DeviceType::Input,
+        ] {
+            let device = IdentityOnly(kind);
+            let config = VirtioPciBus::build_config_space(
+                0,
+                layout::pci_bar_slot(0),
+                layout::PCI_FIRST_IRQ,
+                &device,
+            )
+            .expect("the host's own aperture and GSI are valid");
+
+            let id = config.read_dword(pci::reg::ID);
+            assert_eq!(
+                id & 0xffff,
+                u32::from(vpci::VIRTIO_PCI_VENDOR_ID),
+                "{kind:?}"
+            );
+            let device_id = id >> 16;
+            assert!(
+                (0x1040..=0x107f).contains(&device_id),
+                "{kind:?} device id {device_id:#x} outside the modern virtio range"
+            );
+
+            let revision = config.read_dword(pci::reg::CLASS_REVISION) & 0xff;
+            assert!(
+                revision >= 1,
+                "{kind:?} revision {revision} is transitional"
+            );
+
+            let subsystem = config.read_dword(pci::reg::SUBSYSTEM);
+            assert_eq!(
+                subsystem & 0xffff,
+                u32::from(vpci::VIRTIO_PCI_SUBSYSTEM_VENDOR_ID),
+                "{kind:?} subsystem vendor (Linux reads the virtio vendor here)"
+            );
+            let subsystem_device = subsystem >> 16;
+            assert!(
+                subsystem_device >= 0x40,
+                "{kind:?} subsystem device id {subsystem_device:#x} < 0x40: \
+                 Virtio10Dxe will not bind this device"
+            );
+
+            // `EFI_PCI_STATUS_CAPABILITY`, without which the firmware never
+            // walks the list that locates the four virtio structures.
+            assert_ne!(config.status() & (1 << 4), 0, "{kind:?} capability bit");
+            assert_eq!(config.read_dword(pci::reg::CAP_POINTER) & 0xff, 0x40);
+
+            // INTA#, so a driver believes there is a legacy interrupt at all.
+            let interrupt = config.read_dword(pci::reg::INTERRUPT);
+            assert_eq!(
+                (interrupt >> 8) & 0xff,
+                u32::from(vpci::VIRTIO_PCI_INTERRUPT_PIN)
+            );
+            assert_eq!(interrupt & 0xff, layout::PCI_FIRST_IRQ);
+        }
     }
 
     /// A read of an unclaimed BAR address must not touch a transport at all —
