@@ -14,10 +14,37 @@ Scope: backlog EPIC 17 (WHP-1701…1705), ADR-0002. Two crates:
 - `crates/machine-x86/src/irqchip/` — the userspace 8259/8254/IOAPIC. **Not**
   Windows-gated: see [Where the irqchip lives](#where-the-irqchip-lives-and-why).
 
-Tests: `crates/vmm-core/tests/whp_smoke.rs` (8) and
-`crates/vmm-core/tests/whp_boot.rs` (2).
+Tests: `crates/vmm-core/tests/` — `whp_smoke.rs` (8), `whp_boot.rs` (2),
+`whp_virtio_blk.rs` (1), `whp_smp.rs` (1), with the shared plumbing in
+`whp_common/`. Every one self-skips when WHP is off or the guest artifacts are
+missing. The portable halves are unit-tested in `machine-x86` and `virtio-net` and
+run on both hosts.
 
-## Status: phase 2 is done — Linux boots
+## Status: phase 3 is done — virtio, SMP and user-mode networking
+
+On Windows, natively, in a debug build:
+
+| What | Evidence |
+|---|---|
+| Linux boots to the marker | 3.4 s, `cargo test -p vmm-core --test whp_boot` |
+| virtio-blk on virtio-mmio | 8 MiB off `/dev/vda` in 28 ms = **292571 KiB/s**, 65 interrupts on the virtio line (`--test whp_virtio_blk`) |
+| 2 vCPUs | `smpboot: Total of 2 processors activated` (`--test whp_smp`) |
+| user-mode networking | portable, 30 unit tests on both hosts; not yet wired into a Windows boot |
+
+The three findings that cost the time, each one the opposite of what the plan
+said:
+
+1. **The virtio-mmio bus was never Windows-specific** — only its two wiring
+   primitives were. `VirtioMmioBus::attach_userspace` takes the line from
+   `UserspaceIrqChip::virtio_line` and leaves kicks synchronous; `virtio.rs`
+   moved out of the Linux gate and the unit tests now run on both hosts. See
+   [virtio on Windows](#virtio-on-windows).
+2. **SMP needs no INIT/SIPI code, and the trap breaks it.** See
+   [SMP](#smp-the-trap-is-the-bug).
+3. **`set_any_ip` needs a default route** or smoltcp silently drops the guest's
+   SYN. See `virtio_net::usernet::tcp`.
+
+## Status: phase 2 — Linux boots
 
 `cargo test -p vmm-core --test whp_boot` boots the bootstrap kernel with the
 marker initramfs to `VMHOST_GUEST_READY` on Windows, headless, in about 3.5 s in
@@ -47,25 +74,28 @@ Not done — see [Phase 3](#phase-3-what-is-still-missing).
 
 ```powershell
 $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\entangled-target-whp"
-cargo test -p vmm-core -p machine-x86 -p linux-boot
-cargo clippy -p vmm-core -p machine-x86 -p linux-boot --all-targets -- -D warnings
+cargo test -p vmm-core -p machine-x86 -p linux-boot -p virtio-net
+cargo clippy -p vmm-core -p machine-x86 -p linux-boot -p virtio-net --all-targets -- -D warnings
 # the whole serial log of a boot, for diagnosing anything timer- or APIC-shaped
 $env:ENTANGLED_WHP_BOOT_LOG = "$env:TEMP\whpboot.log"
 cargo test -p vmm-core --test whp_boot -- --nocapture
+# every exit reason and RIP, for a guest that stopped making progress
+$env:ENTANGLED_WHP_TRACE_EXITS = "1"
 ```
 
 Host `x86_64-pc-windows-gnu` works; no MSVC toolchain needed. Linux must stay
 green in the same change — run the WSL regression too (see CLAUDE.md).
 
-The boot test needs `artifacts/bootstrap/vmlinuz` (or `artifacts/tests/vmlinuz`
-as a fallback) and `artifacts/tests/test-initramfs.cpio.gz`. Those are built by
+The boot tests need `artifacts/bootstrap/vmlinuz` (or `artifacts/tests/vmlinuz`
+as a fallback) and `artifacts/tests/test-initramfs.cpio.gz`; `whp_virtio_blk`
+also needs a raw disk image at `artifacts/tests/test-root.raw`. Those are built by
 Linux-side scripts; copying them in from another checkout is fine.
 
-**The whole workspace builds natively now**, including the `virtio-*` crates and
+**The whole workspace builds natively**, including the `virtio-*` crates and
 `display`, thanks to two vendored patches in `third_party/` (see their
-VENDORED.md). What is still Linux-only above `vmm-core` is device *wiring* —
-`machine_x86::irqfd`, `notify`, `virtio`, `virtio_pci` — because irqfds and
-ioeventfds are KVM concepts.
+VENDORED.md). What is still Linux-only above `vmm-core` is `machine_x86::irqfd`,
+`notify` and `virtio_pci` — irqfds and ioeventfds are KVM concepts. `virtio.rs` is
+**not** on that list any more: see [virtio on Windows](#virtio-on-windows).
 
 WHP needs the **"Windows Hypervisor Platform"** optional feature (admin +
 reboot; `dism /Online /Enable-Feature /FeatureName:HypervisorPlatform`). It
@@ -153,6 +183,9 @@ what most of this machine's lines are.
 | `UnrecoverableException`, `InvalidVpRegisterValue` | `RunOutcome::Shutdown` — the triple-fault equivalent |
 | `Canceled`, `None` | re-check the stop flag, then re-enter or `RunOutcome::Stopped` |
 | anything else | `VmmError::Vcpu` naming the reason and RIP |
+
+Deliberately **not** handled, because WHP does it better itself:
+`X64ApicInitSipiTrap` — see [SMP](#smp-the-trap-is-the-bug).
 
 Two things KVM does for us that **WHP does not**:
 
@@ -402,44 +435,93 @@ accessors expect. The boot log's two `unchecked MSR access error` lines
 - **The `windows` crate constants are `WHV_*(i32)` newtypes**, so matching on
   them needs `#[allow(non_upper_case_globals)]` (CI runs `-D warnings`).
 
-## Phase 3: what is still missing
+## virtio on Windows
 
-In dependency order:
+`VirtioMmioBus` has two constructors and one body. `attach`/`attach_with` are the
+KVM ones (irqfd per device, ioeventfd per queue); `attach_userspace(mem, devices,
+&irqchip)` is the other host's, and everything else — `layout` addresses,
+`MmioTransport`, `cmdline_clauses`, `locate` — is shared. `bus.rs` routes the
+virtio window unconditionally now.
 
-1. **virtio on Windows.** The device crates and both transports already build
-   natively; what does not is the *attach* path. `machine_x86::virtio` and
-   `virtio_pci` take a `VmFd`, create an `EventFd` per device for the irqfd and
-   (by default) one ioeventfd per queue. On WHP the interrupt line is already
-   solved — `irqchip.ioapic().line(layout::VIRTIO_MMIO_FIRST_IRQ as u8 + slot)`
-   is an `Arc<dyn IrqLine>` the transport takes unchanged. The queue-*kick* side
-   is the open question: there is no ioeventfd, so either every kick runs inline
-   on the vCPU thread (`QueueNotifyMode::Synchronous`, which already exists and
-   is correct, just slower) or it goes through `WHvSetVirtualProcessorNotification`
-   /doorbell (`WHV_DOORBELL_MATCH_DATA` is in the binding). Start synchronous;
-   measure before adding doorbells. Concretely: split the KVM-specific halves of
-   `virtio.rs`/`virtio_pci.rs`/`notify.rs` out of the address decoding and
-   cmdline generation, which are already portable, and un-gate the two virtio
-   fields in `bus.rs`.
-2. **SMP.** One vCPU today. An AP is started by INIT/SIPI, which needs
-   `ExtendedVmExits.X64ApicInitSipiExitTrap` and a handler that puts the target
-   VP at the SIPI vector. The CPUID policy is already per-vCPU and the MP
-   table/MADT already describe *n* CPUs, so this is the WHP half only.
-3. **Networking (WHP-1704).** No TAP on Windows, and wintun/tap-windows6 are
-   GPL (blocked by `cargo deny`). Plan unchanged: user-mode NAT on `smoltcp`
-   (0BSD), which also buys rootless networking on Linux.
-4. **The GUI/CLI run path.** `apps/entangled`'s `run` and `control-api`'s
-   lifecycle still assume KVM. The seam is ready; what is needed is a backend
-   choice at VM construction and an `entangled doctor` arm reporting
-   `WhpCapabilities` (which already exists and is unused). Remember the
+```rust
+let irqchip = UserspaceIrqChip::new(partition.interrupt_delivery(), cfg.vcpu_count)?;
+let mem = Arc::new(partition.memory().clone());
+let virtio = VirtioMmioBus::attach_userspace(mem, devices, &irqchip)?;
+let clauses = virtio.cmdline_clauses();           // goes on the kernel cmdline
+let bus = MachineBus::with_virtio(serial, virtio).with_irqchip(Arc::clone(&irqchip));
+```
+
+Two things to know:
+
+- **Kicks are synchronous, and that is fine so far.** There is no ioeventfd, so a
+  `QUEUE_NOTIFY` write is a full exit *plus* instruction emulation, and the device
+  then runs on the vCPU thread. Measured: 292571 KiB/s on a virtio-blk sequential
+  read, debug build. A doorbell
+  (`WHvRegisterPartitionDoorbellEvent`/`WHV_DOORBELL_MATCH_DATA`, both in the
+  binding) would remove the emulation and the serialisation, but nothing yet needs
+  it. Re-take the number with `--test whp_virtio_blk -- --nocapture` before
+  deciding otherwise.
+- **virtio-pci is still Linux-only.** Not for want of a transport — that builds
+  natively — but because its notification area sits at a *guest-programmable* BAR
+  and the host side follows it by re-registering ioeventfds
+  (`notify::DeviceNotifier::rebase`). With synchronous kicks there is nothing to
+  rebase, so the WHP path needs `virtio_pci.rs` split the way `virtio.rs` was.
+
+## SMP: the trap is the bug
+
+`vcpu_count` above one works with **no INIT/SIPI code at all**. WHP's xAPIC
+emulation models an application processor's wait-for-startup state itself: create
+*n* VPs, run every one, and each AP blocks *inside* `WHvRunVirtualProcessor` until
+the guest's SIPI arrives — the same shape as a KVM AP blocking inside `KVM_RUN`.
+WHP applies the INIT and the SIPI and the run call returns with the AP in the
+kernel's trampoline.
+
+`WHV_EXTENDED_VM_EXITS.X64ApicInitSipiExitTrap` (bit 6) **replaces** that handling
+rather than observing it. Arm it and you get the exit with the raw ICR, and the
+target VP stays in its wait-for-startup state: writing its `CS` and `RIP` by hand
+does not make it runnable, its run call keeps blocking, and the guest boots
+happily on one CPU and prints `CPU1 failed to report alive state` ten seconds
+later.
+
+The one rule for callers: **an AP must be left in the reset state WHP created it
+in.** `machine_x86::boot::setup_long_mode_sregs` is for the bootstrap processor
+only. The KVM path hands it to every vCPU because KVM's INIT discards it; WHP has
+no INIT of its own to discard anything.
+
+### Diagnosing a stalled vCPU
+
+Both of these came out of the SMP work and are the first two things to reach for:
+
+- `WhpPartition::processor_summary(index)` — `rip`, `rsp`, `cs`, `cr0`, `cr3`,
+  `cr4`, `efer` and the decoded mode (real/protected/long) for any VP, from any
+  thread. It is what showed VP 1 holding exactly the `CS` the host had written
+  with `RIP` still 0.
+- `$ENTANGLED_WHP_TRACE_EXITS=1` — every exit reason and RIP, one line each. One
+  `Canceled` for a whole boot means WHP is blocking inside the run call, which no
+  serial log can tell you.
+
+## Phase 4: what is still missing
+
+1. **The GUI/CLI run path on Windows.** `apps/entangled`'s `run` and
+   `control-api`'s lifecycle still assume KVM. `doctor` has its WHP arm; what is
+   left is a backend choice at VM construction. Remember the
    one-mapped-partition-per-process limit: the manager must spawn one process per
    VM on Windows.
-5. **UEFI on WHP.** `uefi-boot` is portable and `setup_pvh_sregs` goes through
-   the same seam, so this may already work; nobody has tried. Reset-vector ROM
+2. **Wiring `usernet` into a boot.** The backend is done and unit-tested on both
+   hosts, but nothing attaches it yet, and the in-guest half of the acceptance is
+   blocked on the guest artifacts: the test initramfs has no DHCP client, and the
+   bootstrap kernel has no `CONFIG_IP_PNP_DHCP`, so a guest cannot configure itself
+   from it. Either add `CONFIG_IP_PNP` + `CONFIG_IP_PNP_DHCP` to
+   `guest/bootstrap-kernel/entangled.config` (then `ip=dhcp` on the cmdline is the
+   whole client), or add a probe to `guest/test-rootfs/init-rs`.
+   `UserNetBackend::static_ip_cmdline` is the no-DHCP path in the meantime.
+3. **virtio-pci on WHP**, see above.
+4. **UEFI on WHP.** `uefi-boot` is portable and `setup_pvh_sregs` goes through the
+   same seam, so this may already work; nobody has tried. Reset-vector ROM
    placement needs a second `WHvMapGpaRange` below 4 GiB.
-6. **CI (WHP-1705).** A `windows-latest` matrix job can build, clippy and run
-   the non-WHP tests; GitHub's runners have no nested virtualisation, so the WHP
-   tests will self-skip there — which is exactly why they self-skip rather than
-   fail.
+5. **CI (WHP-1705).** A `windows-latest` matrix job can build, clippy and run the
+   non-WHP tests; GitHub's runners have no nested virtualisation, so the WHP tests
+   self-skip there — which is exactly why they self-skip rather than fail.
 
 ## Hard rules that apply here
 
