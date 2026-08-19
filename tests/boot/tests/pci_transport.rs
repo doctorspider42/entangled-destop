@@ -1,0 +1,296 @@
+//! The virtio-pci acceptance boot (EPIC 19).
+//!
+//! Unit tests can prove that a register answers what the spec says it should.
+//! They cannot prove that a real guest kernel, given nothing but a PCI bus, finds
+//! a disk on it — which is the entire claim of this transport. That needs a real
+//! kernel, and this is it.
+//!
+//! What makes the boot meaningful is what is *absent*: there is no
+//! `virtio_mmio.device=` clause on the command line (the harness `debug_assert`s
+//! that), so the guest has no idea any device exists until it walks the bus
+//! itself. Everything the tests below check is therefore downstream of real
+//! enumeration:
+//!
+//! 1. configuration mechanism #1 answers, so Linux believes in bus 0 at all;
+//! 2. the host bridge and the virtio function are enumerated with the vendor,
+//!    device and class the host published;
+//! 3. `virtio-pci` binds to the function — i.e. the capability list walk found a
+//!    common-configuration structure, and the modern driver claimed the device
+//!    rather than "leaving for legacy driver";
+//! 4. feature negotiation, queue programming and BAR-window dispatch all worked,
+//!    because `/dev/vda` exists;
+//! 5. **the queues and INTx actually work end to end**, because the guest reads
+//!    megabytes off that disk *and counts the interrupts it took to do it*. The
+//!    byte count alone would not prove this: a driver whose interrupts are lost
+//!    still finishes a read eventually, because it notices used buffers the next
+//!    time anything else wakes it. A climbing interrupt count is the evidence.
+//!
+//! # The one wart, and why it is not a bug
+//!
+//! The guest logs
+//!
+//! ```text
+//! virtio-pci 0000:00:01.0: can't find IRQ for PCI INT A; probably buggy MP table
+//! ```
+//!
+//! and it is right: the MP table publishes ISA interrupt sources, not PCI ones,
+//! so `pcibios_lookup_irq` finds no routing entry. Linux then keeps the line the
+//! host wrote into the `interrupt_line` configuration register, which is GSI 5 —
+//! `assert`ed below via the guest's own `/sys/.../irq`, because "it happens to
+//! work" and "it is guaranteed to work" are different things and only one of them
+//! survives a kernel upgrade. Publishing real PCI interrupt entries in the MP
+//! table (or an ACPI MADT + `_PRT`) would remove the warning; it is a follow-up,
+//! not a prerequisite, and it touches the interrupt topology every existing mmio
+//! boot depends on.
+//!
+//! Self-skips without `/dev/kvm` or the guest artifacts, like every other boot
+//! test. `scripts/fetch-test-kernel.sh` will not do here — the *bootstrap* kernel
+//! is the one with a config we control, so `guest/bootstrap-kernel/build.sh` is
+//! required.
+
+#![cfg(target_os = "linux")]
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use boot_tests::{artifact, boot_once, kvm_available, make_raw_disk, test_initramfs, BootSpec};
+use control_api::VirtioTransport;
+
+/// Megabytes the guest reads off the PCI disk. Enough to be many requests rather
+/// than one lucky one, small enough to keep the test quick.
+const BENCH_MIB: u64 = 8;
+
+/// Scratch image size, comfortably above [`BENCH_MIB`].
+const DISK_MIB: u64 = 64;
+
+fn deadline() -> Duration {
+    let secs = std::env::var("ENTANGLED_BOOT_DEADLINE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60u64)
+        .clamp(5, 600);
+    Duration::from_secs(secs)
+}
+
+/// The bootstrap kernel, plus a note about why the fetched Debian kernel is not
+/// a substitute.
+fn bootstrap_kernel() -> Option<PathBuf> {
+    match artifact("bootstrap/vmlinuz") {
+        Some(kernel) => Some(kernel),
+        None => {
+            eprintln!(
+                "skipping: artifacts/bootstrap/vmlinuz is missing — run \
+                 guest/bootstrap-kernel/build.sh (this test needs CONFIG_VIRTIO_PCI, \
+                 which only the bootstrap kernel's config guarantees)"
+            );
+            None
+        }
+    }
+}
+
+fn scratch_disk(name: &str) -> Option<PathBuf> {
+    // The repository lives on a drvfs mount on this project's development host,
+    // which cannot create sparse files; scratch images go somewhere native.
+    let dir =
+        std::env::var("ENTANGLED_SCRATCH_DIR").unwrap_or_else(|_| "/tmp/entangled-bench".into());
+    let path = PathBuf::from(dir).join(name);
+    match make_raw_disk(&path, DISK_MIB) {
+        Ok(()) => Some(path),
+        Err(error) => {
+            eprintln!("skipping: no scratch disk ({error})");
+            None
+        }
+    }
+}
+
+/// Boots with a virtio-blk disk on PCI and asks the guest both questions at
+/// once: what did you enumerate, and can you read the disk?
+fn pci_boot(name: &str) -> Option<boot_tests::BootOutcome> {
+    let kernel = bootstrap_kernel()?;
+    let initramfs = test_initramfs().or_else(|| {
+        eprintln!("skipping: run scripts/build-test-initramfs.sh");
+        None
+    })?;
+    let disk = scratch_disk(name)?;
+
+    let mut spec = BootSpec::new(kernel, initramfs)
+        .with_transport(VirtioTransport::Pci)
+        .with_disk(disk)
+        .with_blk_bench(BENCH_MIB);
+    // Both probes run; the block one is the last to print, so waiting for it
+    // waits for both.
+    spec.extra_cmdline = format!("{} entangled.pciscan=1", spec.extra_cmdline);
+    spec.deadline = deadline();
+
+    match boot_once(&spec) {
+        Ok(outcome) => Some(outcome),
+        Err(error) => panic!("pci boot failed: {error}"),
+    }
+}
+
+/// THE acceptance test: a guest that was told nothing finds its disk on the PCI
+/// bus and reads from it.
+#[test]
+fn a_guest_enumerates_the_pci_bus_and_reads_its_disk() {
+    if !kvm_available() {
+        return;
+    }
+    let Some(outcome) = pci_boot("pci-acceptance.raw") else {
+        return;
+    };
+    // Print it unconditionally: this log is the evidence, whether or not the
+    // assertions below are happy with it.
+    println!("--- guest serial ---\n{}\n--- end ---", outcome.serial);
+
+    assert!(
+        outcome.reached_ready(),
+        "guest never reached the ready marker"
+    );
+
+    // ---- (1)(2) the bus was enumerated ---------------------------------------
+    let scan = outcome
+        .probe("pciscan")
+        .expect("guest must report its PCI enumeration");
+    let field = |key: &str| {
+        scan.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    let devices = field("devices");
+    assert_eq!(
+        field("functions"),
+        "2",
+        "expected the host bridge and one virtio function; got {devices}"
+    );
+    assert_eq!(field("virtio"), "1", "one virtio function: {devices}");
+
+    // The host bridge, with the class Linux's pci_sanity_check accepts a bus on.
+    assert!(
+        devices.contains("8086:0d57/060000"),
+        "host bridge missing or misdescribed: {devices}"
+    );
+    // The virtio-blk function: vendor 0x1af4, modern device id 0x1040 + 2, and
+    // the mass-storage class that makes lspci name it something true.
+    assert!(
+        devices.contains("1af4:1042/018000"),
+        "virtio-blk function missing or misdescribed: {devices}"
+    );
+
+    // ---- (3) the modern driver bound ----------------------------------------
+    assert_eq!(
+        field("bound"),
+        "1",
+        "virtio-pci did not claim the function: {devices}"
+    );
+    assert!(
+        devices.contains(":virtio-pci"),
+        "the function is bound, but not by virtio-pci: {devices}"
+    );
+
+    // ---- (4)(5) the device actually works ----------------------------------
+    let bytes = outcome
+        .probe_value("blkbench", "bytes")
+        .expect("guest must report reading /dev/vda — no /dev/vda means the probe failed");
+    assert_eq!(
+        bytes,
+        BENCH_MIB << 20,
+        "guest read {bytes} bytes of the {BENCH_MIB} MiB it was asked for"
+    );
+
+    // ---- INTx really delivered ----------------------------------------------
+    //
+    // The interesting failure this catches: with no ACPI and no PCI routing in
+    // the MP table, Linux warns "can't find IRQ for PCI INT A" and could plausibly
+    // fall through to `dev->irq = 0`. The read would still complete — a driver
+    // finds used buffers whenever anything wakes it — so only the interrupt count
+    // separates "INTx works" from "INTx is silently dead".
+    let irqs = outcome
+        .probe_value("blkbench", "irqs")
+        .expect("guest must report its virtio interrupt count");
+    assert!(
+        irqs > 0,
+        "no interrupts reached the guest: the read completed by luck, not by INTx \
+         (irqs={irqs}; -1 means /proc/interrupts had no virtio line at all, i.e. \
+         the driver never registered a handler)"
+    );
+
+    // …and on the line the host published, not some fallback.
+    let expected_irq = machine_x86::layout::PCI_FIRST_IRQ;
+    assert!(
+        outcome.serial.contains(&format!(
+            "entangled-pciscan: 0000:00:01.0 irq={expected_irq}"
+        )),
+        "the guest did not settle on GSI {expected_irq}, the line the host wrote \
+         into interrupt_line; serial log above"
+    );
+
+    let ms = outcome.probe_value("blkbench", "ms").unwrap_or(0);
+    println!(
+        "read {bytes} bytes over virtio-pci in {ms} ms with {irqs} device interrupts; \
+         boot to ready in {:?}",
+        outcome.time_to_ready
+    );
+
+    // Nothing on the command line told the guest where to look.
+    assert!(
+        !outcome.serial.contains("virtio_mmio.device"),
+        "the kernel command line announced mmio slots; this was not a pci boot"
+    );
+}
+
+/// The same disk, the same guest, on both transports — so a difference in
+/// behaviour is attributable to the transport and nothing else.
+///
+/// `#[ignore]`d because it boots twice; the acceptance test above is the one CI
+/// needs.
+#[test]
+#[ignore = "boots twice: run when changing either transport"]
+fn both_transports_serve_the_same_disk() {
+    if !kvm_available() {
+        return;
+    }
+    let Some(pci) = pci_boot("pci-compare.raw") else {
+        return;
+    };
+    let Some(kernel) = bootstrap_kernel() else {
+        return;
+    };
+    let Some(initramfs) = test_initramfs() else {
+        return;
+    };
+    let Some(disk) = scratch_disk("mmio-compare.raw") else {
+        return;
+    };
+    let mut mmio = BootSpec::new(kernel, initramfs)
+        .with_transport(VirtioTransport::Mmio)
+        .with_disk(disk)
+        .with_blk_bench(BENCH_MIB);
+    mmio.deadline = deadline();
+    let mmio = boot_once(&mmio).expect("mmio boot");
+
+    for (name, outcome) in [("pci", &pci), ("mmio", &mmio)] {
+        assert!(outcome.reached_ready(), "{name}: no ready marker");
+        assert_eq!(
+            outcome.probe_value("blkbench", "bytes"),
+            Some(BENCH_MIB << 20),
+            "{name}: guest did not read the whole disk range"
+        );
+        assert!(
+            outcome.probe_value("blkbench", "irqs").unwrap_or(0) > 0,
+            "{name}: the read completed without any device interrupts"
+        );
+        println!(
+            "{name}: ready in {:?}, read {BENCH_MIB} MiB in {} ms with {} interrupts",
+            outcome.time_to_ready,
+            outcome.probe_value("blkbench", "ms").unwrap_or(0),
+            outcome.probe_value("blkbench", "irqs").unwrap_or(0)
+        );
+    }
+    // Only the mmio boot has cmdline clauses; only the pci boot enumerates.
+    assert!(pci.probe("pciscan").is_some());
+    assert!(
+        mmio.serial.contains("virtio_mmio.device"),
+        "the mmio boot must still announce its slots"
+    );
+}

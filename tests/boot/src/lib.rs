@@ -9,6 +9,12 @@
 //! * `tests/notify_bench.rs` — MVP-307: the same boot with queue kicks handled
 //!   synchronously on the vCPU thread versus offloaded to ioeventfds plus
 //!   per-device worker threads.
+//! * `tests/pci_transport.rs` — EPIC 19: the acceptance boot for virtio-pci, with
+//!   no `virtio_mmio.device=` clause anywhere on the command line.
+//!
+//! [`BootSpec::transport`] selects the virtio transport, so any test built on the
+//! harness can be run either way — which is the point: a transport that only the
+//! transport's own test exercises is a transport nobody trusts.
 //!
 //! Everything self-skips when `/dev/kvm` or the guest artifacts are missing, so
 //! a machine without KVM still runs the rest of the suite (vm-testing skill,
@@ -21,12 +27,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use control_api::VirtioTransport;
 use linux_boot::{BootConfig, GUEST_READY_MARKER};
 use machine_x86::boot as x86_boot;
 use machine_x86::bus::MachineBus;
 use machine_x86::notify::QueueNotifyMode;
 use machine_x86::serial::SerialConsole;
 use machine_x86::virtio::VirtioMmioBus;
+use machine_x86::virtio_pci::VirtioPciBus;
 use virtio_core::VirtioDevice;
 use vmm_core::{spawn_vcpus, Hypervisor, MachineConfig, RunOutcome, Vm, VmmError};
 
@@ -52,6 +60,9 @@ pub struct BootSpec {
     /// (a probe's `VMHOST_TEST_OK`/`FAIL` line) or the deadline expires.
     pub await_marker: Option<String>,
     pub notify: QueueNotifyMode,
+    /// Which virtio transport the devices sit on. `Mmio` is the default, so an
+    /// existing test keeps booting the machine it always booted.
+    pub transport: VirtioTransport,
     pub deadline: Duration,
 }
 
@@ -70,6 +81,7 @@ impl BootSpec {
             // whole test run can be flipped to the synchronous path from the
             // environment; benchmarks override it per boot.
             notify: QueueNotifyMode::from_env(),
+            transport: VirtioTransport::default(),
             deadline: DEFAULT_DEADLINE,
         }
     }
@@ -96,6 +108,21 @@ impl BootSpec {
 
     pub fn with_extra_cmdline(mut self, extra: impl Into<String>) -> Self {
         self.extra_cmdline = extra.into();
+        self
+    }
+
+    pub fn with_transport(mut self, transport: VirtioTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Requests the guest's PCI enumeration report and waits for its result line.
+    pub fn with_pci_scan(mut self) -> Self {
+        self.extra_cmdline = match self.extra_cmdline.trim() {
+            "" => "entangled.pciscan=1".to_string(),
+            existing => format!("{existing} entangled.pciscan=1"),
+        };
+        self.await_marker = Some("pciscan".into());
         self
     }
 }
@@ -201,9 +228,22 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
     }
 
     let mem = Arc::new(vm.memory().clone());
-    let virtio = VirtioMmioBus::attach_with(vm.fd_shared(), mem, devices, spec.notify)
-        .map_err(|e| e.to_string())?;
-    let clauses = virtio.cmdline_clauses();
+    // Exactly one transport, chosen by the spec. On pci there are no cmdline
+    // clauses at all — the guest enumerates the bus — which is also what makes
+    // the acceptance test meaningful: nothing tells the kernel where to look.
+    let (bus, clauses) = match spec.transport {
+        VirtioTransport::Mmio => {
+            let virtio = VirtioMmioBus::attach_with(vm.fd_shared(), mem, devices, spec.notify)
+                .map_err(|e| e.to_string())?;
+            let clauses = virtio.cmdline_clauses();
+            (MachineBus::with_virtio(serial, virtio), clauses)
+        }
+        VirtioTransport::Pci => {
+            let pci = VirtioPciBus::attach_with(vm.fd_shared(), mem, devices, spec.notify)
+                .map_err(|e| e.to_string())?;
+            (MachineBus::with_virtio_pci(serial, pci), String::new())
+        }
+    };
 
     let mut cmdline = String::from("console=ttyS0 earlyprintk=serial panic=1 reboot=k");
     for extra in [spec.extra_cmdline.trim(), clauses.trim()] {
@@ -212,7 +252,10 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
             cmdline.push_str(extra);
         }
     }
-    let bus = MachineBus::with_virtio(serial, virtio);
+    debug_assert!(
+        !spec.transport.is_pci() || !cmdline.contains("virtio_mmio.device"),
+        "a pci boot must not announce mmio slots: {cmdline}"
+    );
 
     let boot = BootConfig {
         kernel: spec.kernel.clone(),
@@ -284,23 +327,49 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
 }
 
 /// One line per virtio slot describing what the host side believes: device
-/// status word, whether it is activated, and the pending `INTERRUPT_STATUS`
-/// bits. A stalled guest with `INTERRUPT_STATUS` still non-zero means the device
-/// answered and the interrupt was never acknowledged.
+/// status word, whether it is activated, and the pending interrupt bits. A
+/// stalled guest with a non-zero interrupt status means the device answered and
+/// the interrupt was never acknowledged.
+///
+/// Covers both transports, because "the guest stopped making progress" is exactly
+/// when you need to know which one it was talking to.
 fn device_state(bus: &MachineBus) -> String {
     let mut out = String::from("\n--- host device state at stall ---\n");
     for (index, slot) in bus.virtio().slots().iter().enumerate() {
         match slot.transport.lock() {
             Ok(t) => out.push_str(&format!(
-                "slot {index}: device={:?} status={:#04x} activated={} interrupt_status={:#x} \
-                 offloaded_queues={:?}\n",
+                "mmio slot {index}: device={:?} status={:#04x} activated={} \
+                 interrupt_status={:#x} offloaded_queues={:?}\n",
                 t.device_type(),
                 t.status(),
                 t.is_activated(),
                 t.interrupt_status(),
                 slot.notifier().map(|n| n.offloaded_queues()),
             )),
-            Err(_) => out.push_str(&format!("slot {index}: transport lock poisoned\n")),
+            Err(_) => out.push_str(&format!("mmio slot {index}: transport lock poisoned\n")),
+        }
+    }
+    for (index, slot) in bus
+        .pci()
+        .map(|p| p.slots())
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        match slot.transport.lock() {
+            Ok(t) => out.push_str(&format!(
+                "pci 00:{:02x}.0 (slot {index}): device={:?} bar={:#x} irq={} status={:#04x} \
+                 activated={} isr={:#x} offloaded_queues={:?}\n",
+                slot.device_number,
+                t.device_type(),
+                slot.bar_base,
+                slot.irq,
+                t.status(),
+                t.is_activated(),
+                t.interrupt_status(),
+                slot.notifier().map(|n| n.offloaded_queues()),
+            )),
+            Err(_) => out.push_str(&format!("pci slot {index}: transport lock poisoned\n")),
         }
     }
     out.push_str("---\n");
