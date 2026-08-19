@@ -155,6 +155,17 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     devices.push(Box::new(keyboard));
     devices.push(Box::new(tablet));
 
+    // The UEFI variable store (UEFI-1804). Opened before the bus so the bus can
+    // carry it, and before the firmware is loaded so a bad NVRAM path fails
+    // before the VM starts rather than mid-boot.
+    let pflash = match (cfg.boot.mode, &cfg.boot.nvram) {
+        (BootMode::Uefi, Some(path)) => Some(Arc::new(std::sync::Mutex::new(
+            machine_x86::pflash::Pflash::open(path)
+                .map_err(|e| format!("cannot open the UEFI variable store: {e}"))?,
+        ))),
+        (BootMode::DirectLinux, _) | (_, None) => None,
+    };
+
     // Guest memory is shared with the devices; cloning a `GuestMemoryMmap`
     // shares the underlying regions rather than copying them.
     let mem = Arc::new(vm.memory().clone());
@@ -186,6 +197,10 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     let bus = match cfg.boot.mode {
         BootMode::DirectLinux => bus,
         BootMode::Uefi => bus.with_firmware_platform(),
+    };
+    let bus = match &pflash {
+        Some(flash) => bus.with_pflash(Arc::clone(flash)),
+        None => bus,
     };
 
     // Boot mode dispatch (EPIC 18 / ADR-0003). Everything above this point —
@@ -306,6 +321,22 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
         tracing::info!("termination signal received, VM stopped");
     }
 
+    if let Some(flash) = &pflash {
+        match flash.lock() {
+            Ok(flash) => {
+                let stats = flash.stats();
+                tracing::info!(
+                    programmed_bytes = stats.programmed_bytes,
+                    erased_blocks = stats.erased_blocks,
+                    refused = stats.refused_programs,
+                    store_errors = stats.store_errors,
+                    "UEFI variable store written by the firmware"
+                );
+            }
+            Err(_) => tracing::error!("pflash lock is poisoned; no variable-store report"),
+        }
+    }
+
     let mut failure = None;
     for (i, outcome) in outcomes.iter().enumerate() {
         match outcome {
@@ -378,6 +409,12 @@ fn start_uefi(vm: &mut vmm_core::Vm, cfg: &VmConfig, mem_size: u64) -> Result<Bo
             })
         }
         uefi_boot::FirmwareKind::ResetVector => {
+            if cfg.boot.nvram.is_some() {
+                return Err(
+                    "boot.nvram cannot be used with a reset-vector firmware image: that                      image *is* its own flash and is mapped over the same window as the                      pflash device (machine_x86::layout::PFLASH_BASE). Drop boot.nvram,                      or use a PVH firmware such as CLOUDHV.fd"
+                        .to_string(),
+                );
+            }
             let placement =
                 uefi_boot::rom::place_at_top_of_32bit(image.len()).map_err(|e| e.to_string())?;
             let rom = vm

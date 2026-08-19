@@ -118,6 +118,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             kernel: Some(kernel),
             initramfs: Some(initramfs.clone()),
             firmware: None,
+            nvram: None,
             cmdline,
         },
         disks: vec![DiskSection {
@@ -168,6 +169,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             kernel: Some(PathBuf::from("artifacts/bootstrap/vmlinuz")),
             initramfs: Some(PathBuf::from("artifacts/bootstrap/initrd.img")),
             firmware: None,
+            nvram: None,
             cmdline: format!("console=ttyS0 root=UUID={} rw", root.uuid),
         },
         disks: vec![DiskSection {
