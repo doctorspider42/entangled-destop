@@ -51,7 +51,7 @@ reboot); without it they self-skip with a hint, like the KVM tests without
 | Crate | Owns | Backlog |
 |---|---|---|
 | `crates/vmm-core` | Hypervisor backends (KVM, WHP), guest memory, vCPU lifecycle, VM state machine | EPIC 1/17 |
-| `crates/machine-x86` | x86-64 machine model: memory layout, E820, CPUID, GDT, IRQ chip | EPIC 1/2 |
+| `crates/machine-x86` | x86-64 machine model: memory layout, E820, CPUID, GDT, IRQ chip, ACPI/MP tables | EPIC 1/2 |
 | `crates/linux-boot` | Direct bzImage+initramfs boot, boot_params, cmdline | EPIC 2 |
 | `crates/uefi-boot` | UEFI firmware boot: PVH entry, reset-vector ROM placement | EPIC 18 |
 | `crates/virtio-core` | virtio-mmio transport, virtqueues, `VirtioDevice` trait | EPIC 3 |
@@ -68,10 +68,9 @@ reboot); without it they self-skip with a hint, like the KVM tests without
 ## Skills
 
 Task-focused guides for working in this repo live in `.claude/skills/`:
-`kvm-machine`, `whp-backend`, `linux-direct-boot`, `virtio-device`,
-`debian-media`, `host-display`, `vm-testing`, `gui-manager`. Load the matching
-skill before
-working on that subsystem.
+`kvm-machine`, `whp-backend`, `linux-direct-boot`, `acpi-machine`,
+`virtio-device`, `debian-media`, `host-display`, `vm-testing`, `gui-manager`.
+Load the matching skill before working on that subsystem.
 
 ## Hard rules
 
