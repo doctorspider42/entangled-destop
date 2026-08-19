@@ -22,22 +22,49 @@
 //!
 //! # Interrupts
 //!
+//! Every function is wired for **both** mechanisms and the driver picks.
+//!
+//! ## MSI-X — the default, and what a Linux guest actually uses
+//!
+//! The function publishes an MSI-X capability with `queues + 1` vectors, its table
+//! and PBA in the same BAR (`virtio_core::msix`), and delivers through
+//! [`crate::msi::KvmMsiSink`]: one `KVM_SIGNAL_MSI` per interrupt, carrying the
+//! address and data the driver programmed. No pin, no routing, nothing for a
+//! firmware to clobber. The capability is omitted only when the host cannot
+//! deliver MSI at all ([`crate::msi::KvmMsiSink::is_supported`]) or when
+//! [`PciInterruptMode::IntxOnly`] is asked for.
+//!
+//! Two guest-owned registers therefore have to reach the transport, and both do it
+//! without this module interpreting them: the message control register through
+//! [`crate::pci::ConfigSpace::mirror_dword`], and a *change* to it through
+//! [`Self::io_write`](VirtioPciBus::io_write), which tells the transport to release
+//! anything the pending-bit array remembers.
+//!
+//! ## INTx — the fallback, and where a driver starts and ends
+//!
 //! One IOAPIC pin per device, from [`layout::PCI_FIRST_IRQ`], published to the
 //! guest in the `interrupt_line` config register and raised through a KVM irqfd
 //! — the same mechanism, and the same known limitation, as the mmio bus: the
 //! injection is an **edge** on an ISA-style pin, not a level-triggered PCI
-//! `INTA#`. Two consequences, both deliberate:
+//! `INTA#`. Three consequences, all deliberate, and all of which MSI-X retires:
 //!
 //! * pins are never shared. One device per pin means the ISR byte does not have
 //!   to deassert anything, which an edge injection could not model anyway.
 //!   [`crate::pci::MAX_PCI_DEVICES`] and the pin space bound each other.
-//! * `INTX_DISABLE` in the command register is honoured: [`IntxLine`] checks the
-//!   flag the config space maintains, so `pci_intx(dev, 0)` really does stop the
-//!   injections instead of leaving the guest with spurious interrupts.
+//! * `interrupt_line` is read-only, because EDK2's `PciBusDxe` scribbles over it
+//!   and this machine has no platform driver that could put the real value back
+//!   (see [`crate::pci::ConfigSpace::with_interrupt`]).
+//! * without ACPI `_PRT` or a `$PIR` table Linux takes a PCI device's IRQ straight
+//!   from `interrupt_line` and warns about a buggy MP table; `crate::mptable`
+//!   routes those ISA pins to the IOAPIC, and that pairing is the only reason it
+//!   works.
 //!
-//! Without ACPI or a `$PIR` table Linux takes a PCI device's IRQ straight from
-//! `interrupt_line`, and `crate::mptable` routes those ISA pins to the IOAPIC —
-//! that pairing is what makes INTx work here at all.
+//! INTx stays wired for every function, and must: it is where a driver starts,
+//! where it stays if MSI-X allocation fails, and where an unbind
+//! (`pci_free_irq_vectors`) puts it back. `INTX_DISABLE` is honoured too —
+//! [`IntxLine`] checks the flag the config space maintains, so `pci_intx(dev, 0)`
+//! really does stop the injections — and while MSI-X is enabled the transport
+//! never raises the line at all (`virtio_core::msix`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,8 +78,10 @@ use virtio_core::{GuestMem, PciTransport, VirtioDevice};
 
 use crate::irqfd::{IrqFdError, IrqFdLine};
 use crate::layout;
+use crate::msi::KvmMsiSink;
 use crate::notify::{DeviceNotifier, NotifyAddressing, NotifyError, QueueNotifyMode};
 use crate::pci::{ConfigSpace, PciError, PciRoot};
+use virtio_core::msix;
 
 #[derive(Debug, Error)]
 pub enum VirtioPciAttachError {
@@ -79,6 +108,65 @@ pub enum VirtioPciAttachError {
 
     #[error(transparent)]
     Notify(#[from] NotifyError),
+}
+
+/// Environment variable that forces an interrupt mode, for the INTx regression
+/// boot and for working around a host where MSI delivery misbehaves.
+pub const PCI_INTERRUPT_MODE_ENV: &str = "ENTANGLED_PCI_MSIX";
+
+/// Which interrupt mechanisms a virtio-pci function publishes.
+///
+/// Not "which one it uses": a function with MSI-X still has its INTx line, and
+/// the driver decides per bring-up. This only says whether the MSI-X capability
+/// is there to be found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PciInterruptMode {
+    /// Publish the MSI-X capability alongside INTx (the default).
+    #[default]
+    Msix,
+    /// Publish no MSI-X capability, so the driver has nothing but INTx — the
+    /// state every virtio-pci boot was in before MSI-X existed, kept so the INTx
+    /// path stays a tested path rather than a plausible one.
+    IntxOnly,
+}
+
+impl PciInterruptMode {
+    /// Reads [`PCI_INTERRUPT_MODE_ENV`]; anything unrecognised keeps the default.
+    pub fn from_env() -> Self {
+        match std::env::var(PCI_INTERRUPT_MODE_ENV) {
+            Ok(value) => Self::parse(&value).unwrap_or_else(|| {
+                tracing::warn!(
+                    var = PCI_INTERRUPT_MODE_ENV,
+                    value = %value,
+                    "unrecognised virtio-pci interrupt mode, using the default"
+                );
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Parses the accepted spellings; `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if ["1", "on", "yes", "msix"]
+            .iter()
+            .any(|v| value.eq_ignore_ascii_case(v))
+        {
+            Some(Self::Msix)
+        } else if ["0", "off", "no", "intx"]
+            .iter()
+            .any(|v| value.eq_ignore_ascii_case(v))
+        {
+            Some(Self::IntxOnly)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_msix(self) -> bool {
+        matches!(self, Self::Msix)
+    }
 }
 
 /// A device's INTx line: a host interrupt line gated on the guest not having
@@ -116,8 +204,12 @@ pub struct VirtioPciSlot {
     pub device_number: u8,
     /// Guest physical base of the device's BAR window, as the host assigned it.
     pub bar_base: u64,
-    /// GSI the device's INTx line is wired to.
+    /// GSI the device's INTx line is wired to. Still wired under MSI-X: it is the
+    /// fallback the driver starts on and returns to.
     pub irq: u32,
+    /// MSI-X vectors this function publishes (`queues + 1`), or 0 when it
+    /// publishes no MSI-X capability at all.
+    pub msix_vectors: u16,
     /// The transport, shared with every vCPU thread that may take an exit into
     /// the BAR and with the device's queue worker thread.
     pub transport: Arc<Mutex<PciTransport>>,
@@ -142,6 +234,7 @@ pub struct VirtioPciBus {
     root: Mutex<PciRoot>,
     slots: Vec<VirtioPciSlot>,
     mode: QueueNotifyMode,
+    interrupts: PciInterruptMode,
 }
 
 impl VirtioPciBus {
@@ -151,12 +244,13 @@ impl VirtioPciBus {
             root: Mutex::new(PciRoot::new()),
             slots: Vec::new(),
             mode: QueueNotifyMode::Synchronous,
+            interrupts: PciInterruptMode::default(),
         }
     }
 
     /// Places `devices` on consecutive PCI device numbers starting at `00:01.0`,
-    /// registering one irqfd per device and (by default) one queue-notify
-    /// ioeventfd per queue.
+    /// registering one irqfd per device, an MSI-X capability where the host can
+    /// deliver MSI, and (by default) one queue-notify ioeventfd per queue.
     pub fn attach(
         vm: Arc<VmFd>,
         mem: Arc<GuestMem>,
@@ -172,12 +266,46 @@ impl VirtioPciBus {
         devices: Vec<Box<dyn VirtioDevice>>,
         mode: QueueNotifyMode,
     ) -> Result<Self, VirtioPciAttachError> {
+        Self::attach_with_interrupts(vm, mem, devices, mode, PciInterruptMode::from_env())
+    }
+
+    /// [`Self::attach_with`] with an explicit interrupt mode as well, which is how
+    /// the INTx acceptance boot keeps testing INTx now that a Linux guest would
+    /// otherwise always choose MSI-X.
+    pub fn attach_with_interrupts(
+        vm: Arc<VmFd>,
+        mem: Arc<GuestMem>,
+        devices: Vec<Box<dyn VirtioDevice>>,
+        mode: QueueNotifyMode,
+        interrupts: PciInterruptMode,
+    ) -> Result<Self, VirtioPciAttachError> {
+        // One probe for the whole bus: whether a function publishes MSI-X must be
+        // settled before any driver can walk the capability list, and a capability
+        // whose interrupts silently vanish is worse than no capability.
+        let msi = match (interrupts.is_msix(), KvmMsiSink::is_supported(&vm)) {
+            (true, true) => Some(Arc::new(KvmMsiSink::new(Arc::clone(&vm)))),
+            (true, false) => {
+                tracing::warn!(
+                    "this host has no KVM_CAP_SIGNAL_MSI; virtio-pci functions will \
+                     publish no MSI-X capability and drivers will use INTx"
+                );
+                None
+            }
+            (false, _) => {
+                tracing::info!(
+                    var = PCI_INTERRUPT_MODE_ENV,
+                    "MSI-X disabled by request; virtio-pci functions are INTx only"
+                );
+                None
+            }
+        };
         // Built up as we go so that an error part way through drops the slots
         // already created, which stops their workers and deassigns their fds.
         let mut bus = Self {
             root: Mutex::new(PciRoot::new()),
             slots: Vec::with_capacity(devices.len()),
             mode,
+            interrupts,
         };
         for (slot, device) in devices.into_iter().enumerate() {
             let bar_base = layout::pci_bar_slot(slot as u64);
@@ -192,17 +320,52 @@ impl VirtioPciBus {
             let irqfd = IrqFdLine::new(&vm, gsi)
                 .map_err(|source| VirtioPciAttachError::Irq { slot, source })?;
 
+            // How many MSI-X vectors this function needs: one per queue plus one
+            // for configuration changes. A device with more queues than the table
+            // region can hold gets no capability rather than a table too small for
+            // its own queues — INTx still works, and the warning says why.
+            let queues = device.queue_max_sizes().len();
+            let table_size = msi.as_ref().and_then(|_| {
+                msix::table_size_for(queues).or_else(|| {
+                    tracing::warn!(
+                        slot,
+                        queues,
+                        max = msix::MAX_MSIX_VECTORS,
+                        "device has too many queues for an MSI-X table; publishing INTx only"
+                    );
+                    None
+                })
+            });
+
             // The config space is built first so its INTx flag can gate the
             // line the transport is about to be handed.
-            let config = Self::build_config_space(slot, bar_base, gsi, device.as_ref())?;
+            let (mut config, msix_cap_at) =
+                Self::build_config_space(slot, bar_base, gsi, device.as_ref(), table_size)?;
             let line = Arc::new(IntxLine {
                 line: Arc::new(irqfd),
                 enabled: config.intx_flag(),
             });
 
             let device_type = device.device_type();
-            let transport = PciTransport::new(slot, device, Arc::clone(&mem), line)
-                .map_err(|source| VirtioPciAttachError::Transport { slot, source })?;
+            let transport = match (&msi, table_size) {
+                (Some(sink), Some(_)) => PciTransport::with_msix(
+                    slot,
+                    device,
+                    Arc::clone(&mem),
+                    line,
+                    Arc::clone(sink) as Arc<_>,
+                ),
+                _ => PciTransport::new(slot, device, Arc::clone(&mem), line),
+            }
+            .map_err(|source| VirtioPciAttachError::Transport { slot, source })?;
+
+            // The transport owns the message-control value it reads on every
+            // interrupt; the config space keeps it up to date with what the guest
+            // wrote. Nothing here interprets the bits.
+            if let (Some(at), Some(handle)) = (msix_cap_at, transport.msix_control_handle()) {
+                config.mirror_dword(at, handle);
+            }
+            let msix_vectors = transport.msix_table_size();
             let transport = Arc::new(Mutex::new(transport));
 
             let device_number = match bus.root.lock() {
@@ -237,6 +400,7 @@ impl VirtioPciBus {
                 address = format_args!("00:{device_number:02x}.0"),
                 bar = format_args!("{bar_base:#x}"),
                 irq = gsi,
+                msix_vectors,
                 offloaded_queues = notifier.as_ref().map_or(0, |n| n.offloaded_queues().len()),
                 "attached virtio-pci device"
             );
@@ -244,6 +408,7 @@ impl VirtioPciBus {
                 device_number,
                 bar_base,
                 irq: gsi,
+                msix_vectors,
                 transport,
                 notifier,
             });
@@ -252,8 +417,12 @@ impl VirtioPciBus {
     }
 
     /// Builds one device's PCI configuration space: the modern virtio identity,
-    /// the single memory BAR the host has reserved for it, its INTx line, and the
-    /// four capability records that tell a driver where everything is.
+    /// the single memory BAR the host has reserved for it, its INTx line, the four
+    /// capability records that tell a driver where everything is, and — when
+    /// `msix_table_size` is given — an MSI-X capability.
+    ///
+    /// Returns the configuration space and the byte offset the MSI-X record landed
+    /// at, which is the register whose value has to reach the transport.
     ///
     /// The identity comes from the transport module rather than from here — the
     /// bus knows about type-0 headers, not about virtio.
@@ -266,7 +435,8 @@ impl VirtioPciBus {
         bar_base: u64,
         gsi: u32,
         device: &dyn VirtioDevice,
-    ) -> Result<ConfigSpace, VirtioPciAttachError> {
+        msix_table_size: Option<u16>,
+    ) -> Result<(ConfigSpace, Option<u8>), VirtioPciAttachError> {
         let bus_error = |source| VirtioPciAttachError::Bus { slot, source };
         // The aperture and the BAR size are both host constants far below 4 GiB,
         // and the GSI is one of a handful of low pins.
@@ -300,7 +470,24 @@ impl VirtioPciBus {
         for record in vpci::capability_records() {
             config.add_capability(&record).map_err(bus_error)?;
         }
-        Ok(config)
+        // MSI-X last, so the four virtio records keep the offsets every existing
+        // test and log line names — and COMMON_CFG stays the list head, which is
+        // what decides whether Linux's modern driver binds at all.
+        let msix_cap_at = match msix_table_size {
+            Some(table_size) => Some(
+                config
+                    .add_capability_writable(
+                        &msix::capability_record(table_size),
+                        // Only the enable and function-mask bits of message
+                        // control are the guest's; the table size in the same
+                        // halfword must stay read-only.
+                        &[msix::MSIX_CONTROL_WRITE_MASK],
+                    )
+                    .map_err(bus_error)?,
+            ),
+            None => None,
+        };
+        Ok((config, msix_cap_at))
     }
 
     pub fn slots(&self) -> &[VirtioPciSlot] {
@@ -314,6 +501,11 @@ impl VirtioPciBus {
     /// How queue kicks reach the devices on this bus.
     pub fn notify_mode(&self) -> QueueNotifyMode {
         self.mode
+    }
+
+    /// Which interrupt mechanisms the functions on this bus publish.
+    pub fn interrupt_mode(&self) -> PciInterruptMode {
+        self.interrupts
     }
 
     /// Stops every queue worker thread and deassigns their ioeventfds.
@@ -351,11 +543,16 @@ impl VirtioPciBus {
 
     /// Guest write to `0xcf8`/`0xcfc`.
     ///
-    /// A write that moves a BAR window is not just a register update: the queue
-    /// notification area moves with it, and the KVM ioeventfds registered inside
-    /// it must follow — see [`Self::reconcile_notify`].
+    /// Two kinds of write are more than a register update:
+    ///
+    /// * one that moves a BAR window moves the queue notification area with it,
+    ///   and the KVM ioeventfds registered inside it must follow — see
+    ///   [`Self::reconcile_notify`];
+    /// * one that changes the MSI-X message control register may have made
+    ///   everything the pending-bit array remembers deliverable (enabling MSI-X,
+    ///   or clearing the function mask), which only the transport can act on.
     pub fn io_write(&self, port: u16, data: &[u8]) {
-        let changed = match self.root.lock() {
+        let write = match self.root.lock() {
             Ok(mut root) => root.io_write(port, data),
             Err(_) => {
                 tracing::error!(
@@ -365,11 +562,37 @@ impl VirtioPciBus {
                 return;
             }
         };
-        // The root lock is released before reconciling: `reconcile_notify` takes
-        // it again to read the new windows, and it must not be held while the
-        // transport locks are taken (the queue workers hold those).
-        if changed.is_some() {
+        // The root lock is released before either follow-up: `reconcile_notify`
+        // takes it again to read the new windows, and neither may hold it while a
+        // transport lock is taken (the queue workers hold those).
+        if write.decode_changed {
             self.reconcile_notify();
+        }
+        if write.mirror_changed {
+            if let Some(owner) = write.owner {
+                self.msix_control_changed(owner);
+            }
+        }
+    }
+
+    /// Tells one function's transport that its MSI-X message control register
+    /// changed value.
+    ///
+    /// The transport decides what that means; this only delivers the news, which is
+    /// what keeps [`crate::pci`] ignorant of MSI-X semantics.
+    fn msix_control_changed(&self, owner: usize) {
+        let Some(slot) = self.slots.get(owner) else {
+            return;
+        };
+        match slot.transport.lock() {
+            Ok(transport) => transport.msix_control_changed(),
+            // A dropped notification here costs at most one delayed interrupt,
+            // which the next signal on that vector delivers; taking the VM down
+            // over it would cost the whole guest.
+            Err(_) => tracing::error!(
+                slot = owner,
+                "virtio-pci transport lock is poisoned; not releasing pending MSI-X vectors"
+            ),
         }
     }
 
@@ -585,13 +808,7 @@ mod tests {
             virtio_core::DeviceType::Input,
         ] {
             let device = IdentityOnly(kind);
-            let config = VirtioPciBus::build_config_space(
-                0,
-                layout::pci_bar_slot(0),
-                layout::PCI_FIRST_IRQ,
-                &device,
-            )
-            .expect("the host's own aperture and GSI are valid");
+            let (config, _) = config_space_of(&device, None);
 
             let id = config.read_dword(pci::reg::ID);
             assert_eq!(
@@ -637,6 +854,246 @@ mod tests {
             );
             assert_eq!(interrupt & 0xff, layout::PCI_FIRST_IRQ);
         }
+    }
+
+    /// One device's configuration space as the bus would build it, with or without
+    /// an MSI-X capability, plus where that capability landed.
+    fn config_space_of(
+        device: &dyn VirtioDevice,
+        msix_table_size: Option<u16>,
+    ) -> (ConfigSpace, Option<u8>) {
+        VirtioPciBus::build_config_space(
+            0,
+            layout::pci_bar_slot(0),
+            layout::PCI_FIRST_IRQ,
+            device,
+            msix_table_size,
+        )
+        .expect("the host's own aperture and GSI are valid")
+    }
+
+    /// Walks the capability list the way a driver does — head from
+    /// `CAP_POINTER`, then `cap_next` until 0 — and returns `(id, offset)` pairs.
+    fn capability_list(config: &ConfigSpace) -> Vec<(u8, u8)> {
+        let mut out = Vec::new();
+        let mut at = (config.read_dword(pci::reg::CAP_POINTER) & 0xff) as u8;
+        // Bounded by the header: a list that does not terminate must not hang a
+        // test any more than it may hang a guest.
+        while at >= pci::reg::FIRST_CAPABILITY && out.len() < pci::reg::DWORDS {
+            let dword = config.read_dword(at);
+            let shift = (at % 4) * 8;
+            let id = (dword >> shift) as u8;
+            let next = (dword >> (shift + 8)) as u8;
+            out.push((id, at));
+            if next == 0 {
+                break;
+            }
+            at = next;
+        }
+        out
+    }
+
+    /// The MSI-X capability a driver finds: id `0x11`, the right table size, and
+    /// table/PBA pointing at the BAR regions the transport actually decodes.
+    #[test]
+    fn the_msix_capability_describes_the_transports_own_regions() {
+        let device = IdentityOnly(virtio_core::DeviceType::Block);
+        let (config, at) = config_space_of(&device, Some(2));
+        let at = at.expect("an MSI-X capability was requested");
+
+        let list = capability_list(&config);
+        assert_eq!(
+            list.len(),
+            5,
+            "four virtio structure locators plus MSI-X: {list:?}"
+        );
+        assert_eq!(list[0].0, 0x09, "COMMON_CFG must stay the list head");
+        assert_eq!(
+            list.last().copied(),
+            Some((msix::PCI_CAP_ID_MSIX, at)),
+            "MSI-X is last: {list:?}"
+        );
+
+        // Message control: table size - 1 in bits 10:0, disabled and unmasked.
+        let control = (config.read_dword(at + 2) >> 16) as u16;
+        assert_eq!(control & msix::MSIX_CTRL_TABLE_SIZE_MASK, 1, "two vectors");
+        assert_eq!(control & msix::MSIX_CTRL_ENABLE, 0);
+        assert_eq!(control & msix::MSIX_CTRL_FUNCTION_MASK, 0);
+
+        // Table and PBA: BIR 0, i.e. the one BAR, at the offsets the transport
+        // decodes. If these two ever disagree, a driver programs a table nothing
+        // reads and gets no interrupts at all.
+        let table = config.read_dword(at + 4);
+        let pba = config.read_dword(at + 8);
+        assert_eq!(
+            u64::from(table & 0x7),
+            u64::from(vpci::VIRTIO_PCI_BAR_INDEX)
+        );
+        assert_eq!(u64::from(pba & 0x7), u64::from(vpci::VIRTIO_PCI_BAR_INDEX));
+        assert_eq!(u64::from(table & !0x7), vpci::MSIX_TABLE_OFFSET);
+        assert_eq!(u64::from(pba & !0x7), vpci::MSIX_PBA_OFFSET);
+    }
+
+    /// Only the enable and function-mask bits are the guest's. A guest that could
+    /// write the table size would be describing entries the host never allocated.
+    #[test]
+    fn a_guest_may_write_the_msix_enable_bits_and_nothing_else_in_that_dword() {
+        let device = IdentityOnly(virtio_core::DeviceType::Block);
+        let (mut config, at) = config_space_of(&device, Some(3));
+        let at = at.expect("an MSI-X capability was requested");
+        let control = |c: &ConfigSpace| (c.read_dword(at + 2) >> 16) as u16;
+        assert_eq!(control(&config) & msix::MSIX_CTRL_TABLE_SIZE_MASK, 2);
+
+        // `pci_msix_clear_and_set_ctrl` writes the halfword at cap + 2.
+        let mirror = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        config.mirror_dword(at, Arc::clone(&mirror));
+        let changed = config.write_dword_bytes(at, 2, &msix::MSIX_CTRL_ENABLE.to_le_bytes());
+        assert!(changed, "a mirrored register changed");
+        assert_ne!(control(&config) & msix::MSIX_CTRL_ENABLE, 0);
+        assert_eq!(
+            control(&config) & msix::MSIX_CTRL_TABLE_SIZE_MASK,
+            2,
+            "the table size is read-only"
+        );
+        // …and the transport sees it, without this module interpreting the bits.
+        assert_eq!(
+            (mirror.load(Ordering::Acquire) >> 16) as u16 & msix::MSIX_CTRL_ENABLE,
+            msix::MSIX_CTRL_ENABLE
+        );
+
+        // Writing every bit of the dword changes only those two.
+        let before = config.read_dword(at);
+        let _ = config.write_dword_bytes(at, 0, &0xffff_ffffu32.to_le_bytes());
+        let after = config.read_dword(at);
+        assert_eq!(
+            after & !msix::MSIX_CONTROL_WRITE_MASK,
+            before & !msix::MSIX_CONTROL_WRITE_MASK,
+            "the capability id, next pointer and table size are read-only"
+        );
+        assert_eq!(control(&config) & msix::MSIX_CTRL_TABLE_SIZE_MASK, 2);
+        assert_ne!(control(&config) & msix::MSIX_CTRL_FUNCTION_MASK, 0);
+
+        // A write that changes nothing reports nothing, so the bus does not go
+        // looking for pending vectors on every unrelated configuration access.
+        assert!(!config.write_dword_bytes(pci::reg::HEADER_TYPE, 0, &[0x10]));
+    }
+
+    /// Without MSI-X the configuration space is byte for byte what it was before
+    /// MSI-X existed: four capabilities, no fifth record, nothing writable added.
+    #[test]
+    fn an_intx_only_function_publishes_no_msix_capability() {
+        let device = IdentityOnly(virtio_core::DeviceType::Block);
+        let (config, at) = config_space_of(&device, None);
+        assert_eq!(at, None);
+        let list = capability_list(&config);
+        assert_eq!(
+            list.len(),
+            4,
+            "the four virtio structure locators: {list:?}"
+        );
+        assert!(
+            !list.iter().any(|(id, _)| *id == msix::PCI_CAP_ID_MSIX),
+            "no MSI-X record: {list:?}"
+        );
+    }
+
+    /// **Every** region of the BAR follows the guest when it moves the BAR —
+    /// including the two MSI-X ones — and nothing is left decoding at the old
+    /// address.
+    ///
+    /// EDK2's `PciBusDxe` reassigns every BAR during resource allocation, so this
+    /// is not a hypothetical. The queue-notification area needs host help to
+    /// follow (its ioeventfds are registered at absolute addresses:
+    /// `DeviceNotifier::rebase`, driven by `reconcile_notify` from the same
+    /// `bar_window_of` this test reads). The MSI-X table and PBA need none — they
+    /// are decoded through `locate_mmio` on every access — and this test is what
+    /// says so rather than leaving it to be assumed.
+    #[test]
+    fn every_bar_region_including_msix_follows_a_guest_bar_move() {
+        let device = IdentityOnly(virtio_core::DeviceType::Block);
+        let (config, _) = config_space_of(&device, Some(2));
+        let mut root = PciRoot::new();
+        assert_eq!(root.attach(config, 0), Ok(1));
+
+        let select = |root: &mut PciRoot, register: u8| {
+            let address = 0x8000_0000u32 | (1 << 11) | u32::from(register & 0xfc);
+            let _ = root.io_write(pci::CONFIG_ADDRESS_PORT, &address.to_le_bytes());
+        };
+        let write32 = |root: &mut PciRoot, register: u8, value: u32| {
+            select(root, register);
+            let _ = root.io_write(pci::CONFIG_DATA_PORT, &value.to_le_bytes());
+        };
+
+        write32(
+            &mut root,
+            pci::reg::COMMAND,
+            u32::from(crate::pci::command::MEMORY_SPACE),
+        );
+        let regions = [
+            ("common cfg", vpci::COMMON_CFG_OFFSET),
+            ("notify", vpci::NOTIFY_CFG_OFFSET),
+            ("device cfg", vpci::DEVICE_CFG_OFFSET),
+            ("msix table", vpci::MSIX_TABLE_OFFSET),
+            ("msix pba", vpci::MSIX_PBA_OFFSET),
+            ("last byte", vpci::VIRTIO_PCI_BAR_SIZE - 1),
+        ];
+
+        // Somewhere else in the aperture — the reverse-order slot `PciBusDxe`
+        // would hand out.
+        let moved = layout::pci_bar_slot(layout::PCI_MMIO_SLOTS - 1);
+        for (from, to) in [(layout::pci_bar_slot(0), moved), (moved, moved)] {
+            if from != to {
+                write32(
+                    &mut root,
+                    pci::reg::BAR0,
+                    u32::try_from(to).expect("the aperture is below 4 GiB"),
+                );
+            }
+            for (name, offset) in regions {
+                assert_eq!(
+                    root.locate_mmio(to + offset),
+                    Some((0, vpci::VIRTIO_PCI_BAR_INDEX, offset)),
+                    "{name} must decode at the BAR's current base"
+                );
+            }
+            if from != to {
+                assert_eq!(
+                    root.locate_mmio(from + vpci::MSIX_TABLE_OFFSET),
+                    None,
+                    "the MSI-X table must not still answer at the old base"
+                );
+            }
+        }
+        // And the notify base the bus would rebase the ioeventfds to is derived
+        // from the same window, so the two cannot drift apart.
+        assert_eq!(
+            root.bar_window_of(0, vpci::VIRTIO_PCI_BAR_INDEX),
+            Some((moved, vpci::VIRTIO_PCI_BAR_SIZE))
+        );
+    }
+
+    #[test]
+    fn interrupt_mode_parsing_accepts_the_documented_spellings() {
+        for on in ["1", "on", "ON", " msix ", "yes"] {
+            assert_eq!(
+                PciInterruptMode::parse(on),
+                Some(PciInterruptMode::Msix),
+                "{on}"
+            );
+        }
+        for off in ["0", "off", "OFF", "intx", "no"] {
+            assert_eq!(
+                PciInterruptMode::parse(off),
+                Some(PciInterruptMode::IntxOnly),
+                "{off}"
+            );
+        }
+        assert_eq!(PciInterruptMode::parse("maybe"), None);
+        assert_eq!(PciInterruptMode::parse(""), None);
+        assert!(
+            PciInterruptMode::default().is_msix(),
+            "MSI-X is the default"
+        );
     }
 
     /// A read of an unclaimed BAR address must not touch a transport at all —

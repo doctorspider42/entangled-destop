@@ -19,29 +19,29 @@
 //!    rather than "leaving for legacy driver";
 //! 4. feature negotiation, queue programming and BAR-window dispatch all worked,
 //!    because `/dev/vda` exists;
-//! 5. **the queues and INTx actually work end to end**, because the guest reads
-//!    megabytes off that disk *and counts the interrupts it took to do it*. The
-//!    byte count alone would not prove this: a driver whose interrupts are lost
-//!    still finishes a read eventually, because it notices used buffers the next
-//!    time anything else wakes it. A climbing interrupt count is the evidence.
+//! 5. **the queues and the interrupts actually work end to end**, because the
+//!    guest reads megabytes off that disk *and counts the interrupts it took to do
+//!    it*. The byte count alone would not prove this: a driver whose interrupts
+//!    are lost still finishes a read eventually, because it notices used buffers
+//!    the next time anything else wakes it. A climbing interrupt count is the
+//!    evidence.
 //!
-//! # The one wart, and why it is not a bug
+//! # Two boots, one per interrupt mechanism
 //!
-//! The guest logs
+//! Since MSI-X exists, a Linux guest offered it will never choose INTx — so there
+//! are two acceptance boots rather than one, and the INTx one has to *ask* for an
+//! INTx-only function ([`PciInterruptMode::IntxOnly`]).
 //!
-//! ```text
-//! virtio-pci 0000:00:01.0: can't find IRQ for PCI INT A; probably buggy MP table
-//! ```
+//! Both matter. MSI-X is what a real VM uses. INTx is what a driver uses before it
+//! enables MSI-X, what it falls back to when `pci_alloc_irq_vectors` fails, what
+//! an unbind returns to, and what a host without `KVM_CAP_SIGNAL_MSI` gets — so it
+//! is not a legacy path, it is the floor.
 //!
-//! and it is right: the MP table publishes ISA interrupt sources, not PCI ones,
-//! so `pcibios_lookup_irq` finds no routing entry. Linux then keeps the line the
-//! host wrote into the `interrupt_line` configuration register, which is GSI 5 —
-//! `assert`ed below via the guest's own `/sys/.../irq`, because "it happens to
-//! work" and "it is guaranteed to work" are different things and only one of them
-//! survives a kernel upgrade. Publishing real PCI interrupt entries in the MP
-//! table (or an ACPI MADT + `_PRT`) would remove the warning; it is a follow-up,
-//! not a prerequisite, and it touches the interrupt topology every existing mmio
-//! boot depends on.
+//! For MSI-X the interrupt count is not enough on its own: every other symptom of
+//! a working device is identical on INTx, so the MSI-X boot also checks that the
+//! kernel allocated message vectors (`msi_irqs/`), that `/proc/interrupts` names
+//! `PCI-MSIX-…` as the controller, and that the lines are the per-source
+//! `virtio0-config` / `virtio0-req.0` rather than one shared vector.
 //!
 //! Self-skips without `/dev/kvm` or the guest artifacts, like every other boot
 //! test. `scripts/fetch-test-kernel.sh` will not do here — the *bootstrap* kernel
@@ -55,6 +55,7 @@ use std::time::Duration;
 
 use boot_tests::{artifact, boot_once, kvm_available, make_raw_disk, test_initramfs, BootSpec};
 use control_api::VirtioTransport;
+use machine_x86::virtio_pci::PciInterruptMode;
 
 /// Megabytes the guest reads off the PCI disk. Enough to be many requests rather
 /// than one lucky one, small enough to keep the test quick.
@@ -106,6 +107,10 @@ fn scratch_disk(name: &str) -> Option<PathBuf> {
 /// Boots with a virtio-blk disk on PCI and asks the guest both questions at
 /// once: what did you enumerate, and can you read the disk?
 fn pci_boot(name: &str) -> Option<boot_tests::BootOutcome> {
+    pci_boot_with(name, PciInterruptMode::default())
+}
+
+fn pci_boot_with(name: &str, interrupts: PciInterruptMode) -> Option<boot_tests::BootOutcome> {
     let kernel = bootstrap_kernel()?;
     let initramfs = test_initramfs().or_else(|| {
         eprintln!("skipping: run scripts/build-test-initramfs.sh");
@@ -115,6 +120,7 @@ fn pci_boot(name: &str) -> Option<boot_tests::BootOutcome> {
 
     let mut spec = BootSpec::new(kernel, initramfs)
         .with_transport(VirtioTransport::Pci)
+        .with_pci_interrupts(interrupts)
         .with_disk(disk)
         .with_blk_bench(BENCH_MIB);
     // Both probes run; the block one is the last to print, so waiting for it
@@ -128,16 +134,13 @@ fn pci_boot(name: &str) -> Option<boot_tests::BootOutcome> {
     }
 }
 
-/// THE acceptance test: a guest that was told nothing finds its disk on the PCI
-/// bus and reads from it.
-#[test]
-fn a_guest_enumerates_the_pci_bus_and_reads_its_disk() {
-    if !kvm_available() {
-        return;
-    }
-    let Some(outcome) = pci_boot("pci-acceptance.raw") else {
-        return;
-    };
+/// What every pci boot must show, whichever interrupt mechanism it used: the bus
+/// was enumerated, the modern driver bound, and the disk was read in full.
+///
+/// Returns the number of interrupts the guest counted while reading, which is the
+/// part each caller then asserts *about* — the count alone cannot say which
+/// mechanism carried them.
+fn assert_bus_enumerated_and_disk_read(outcome: &boot_tests::BootOutcome) -> u64 {
     // Print it unconditionally: this log is the evidence, whether or not the
     // assertions below are happy with it.
     println!("--- guest serial ---\n{}\n--- end ---", outcome.serial);
@@ -188,7 +191,7 @@ fn a_guest_enumerates_the_pci_bus_and_reads_its_disk() {
         "the function is bound, but not by virtio-pci: {devices}"
     );
 
-    // ---- (4)(5) the device actually works ----------------------------------
+    // ---- (4) the device actually works --------------------------------------
     let bytes = outcome
         .probe_value("blkbench", "bytes")
         .expect("guest must report reading /dev/vda — no /dev/vda means the probe failed");
@@ -198,22 +201,152 @@ fn a_guest_enumerates_the_pci_bus_and_reads_its_disk() {
         "guest read {bytes} bytes of the {BENCH_MIB} MiB it was asked for"
     );
 
-    // ---- INTx really delivered ----------------------------------------------
+    // Nothing on the command line told the guest where to look.
+    assert!(
+        !outcome.serial.contains("virtio_mmio.device"),
+        "the kernel command line announced mmio slots; this was not a pci boot"
+    );
+
+    // ---- (5) interrupts were delivered at all -------------------------------
     //
-    // The interesting failure this catches: with no ACPI and no PCI routing in
-    // the MP table, Linux warns "can't find IRQ for PCI INT A" and could plausibly
-    // fall through to `dev->irq = 0`. The read would still complete — a driver
-    // finds used buffers whenever anything wakes it — so only the interrupt count
-    // separates "INTx works" from "INTx is silently dead".
+    // The read completing is not evidence: a driver finds used buffers whenever
+    // anything else wakes it, so a device whose interrupts are all lost still
+    // finishes eventually. Only a climbing count separates "the interrupt path
+    // works" from "the interrupt path is silently dead".
     let irqs = outcome
         .probe_value("blkbench", "irqs")
         .expect("guest must report its virtio interrupt count");
     assert!(
         irqs > 0,
-        "no interrupts reached the guest: the read completed by luck, not by INTx \
+        "no interrupts reached the guest: the read completed by luck \
          (irqs={irqs}; -1 means /proc/interrupts had no virtio line at all, i.e. \
          the driver never registered a handler)"
     );
+    irqs
+}
+
+/// One field of the guest's `blkbench` line, as a string.
+fn blkbench_field(outcome: &boot_tests::BootOutcome, key: &str) -> String {
+    outcome
+        .probe("blkbench")
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+        .unwrap_or_default()
+}
+
+/// THE acceptance test: a guest that was told nothing finds its disk on the PCI
+/// bus, reads from it, and takes its completion interrupts **as MSI-X messages**.
+///
+/// The last part is the one MSI-X adds, and it needs its own evidence, because
+/// every other symptom of a working device is identical on INTx. Three
+/// independent things have to agree:
+///
+/// * `/sys/bus/pci/devices/0000:00:01.0/msi_irqs` exists with one entry per
+///   vector, which the kernel creates only once it has enabled MSI or MSI-X on
+///   the function;
+/// * the controller column of `/proc/interrupts` reads `PCI-MSIX-0000:00:01.0`
+///   rather than `IO-APIC`;
+/// * the lines are named `virtio0-config` and `virtio0-req.0`, i.e. the driver
+///   really took *per-source* vectors rather than one shared one.
+///
+/// And the interrupt count still has to climb, so this is not merely a device
+/// that negotiated MSI-X and then relied on luck.
+#[test]
+fn a_guest_enumerates_the_pci_bus_and_takes_its_interrupts_over_msix() {
+    if !kvm_available() {
+        return;
+    }
+    let Some(outcome) = pci_boot("pci-acceptance-msix.raw") else {
+        return;
+    };
+    let irqs = assert_bus_enumerated_and_disk_read(&outcome);
+
+    // Two vectors: one for the request queue, one for configuration changes.
+    let vectors = outcome
+        .probe_value("pciscan", "msix")
+        .expect("guest must report how many message vectors it allocated");
+    assert_eq!(
+        vectors, 2,
+        "expected one vector per queue plus one for config changes; the guest \
+         allocated {vectors} (0 means the kernel never enabled MSI-X — either the \
+         capability was not found or pci_alloc_irq_vectors failed)"
+    );
+
+    let mode = blkbench_field(&outcome, "irqmode");
+    assert_eq!(
+        mode, "msix",
+        "the guest's interrupts were delivered by {mode:?}, not MSI-X; the \
+         controller column of /proc/interrupts is echoed in the serial log above"
+    );
+
+    // Per-source vectors, not one shared one. `virtio0-req.0` is virtio-blk's
+    // request queue and `virtio0-config` the config-change source; both names come
+    // from the driver, so seeing them means the driver, not just the device, is in
+    // per-queue MSI-X mode.
+    let names = blkbench_field(&outcome, "irqnames");
+    for expected in ["virtio0-config", "virtio0-req.0"] {
+        assert!(
+            names.contains(expected),
+            "expected an MSI-X line named {expected}; the guest reported {names:?}"
+        );
+    }
+
+    // The INTx pin must have carried nothing: under MSI-X the transport never
+    // raises the line, so no virtio line may sit on the IOAPIC.
+    assert!(
+        !names.is_empty() && !outcome.serial.contains("IO-APIC   5-edge      virtio"),
+        "a virtio interrupt line is still on the IOAPIC pin; serial log above"
+    );
+
+    let ms = outcome.probe_value("blkbench", "ms").unwrap_or(0);
+    println!(
+        "read {} bytes over virtio-pci with MSI-X in {ms} ms, {irqs} messages on \
+         {vectors} vectors ({names}); boot to ready in {:?}",
+        BENCH_MIB << 20,
+        outcome.time_to_ready
+    );
+}
+
+/// The INTx acceptance boot, unchanged in substance from before MSI-X existed and
+/// kept for exactly that reason.
+///
+/// A Linux guest offered MSI-X will never choose INTx, so without
+/// [`PciInterruptMode::IntxOnly`] this path would simply stop being tested — and
+/// it is not dead code: it is what a driver uses before it enables MSI-X, what it
+/// falls back to if `pci_alloc_irq_vectors` fails, what an unbind returns to, and
+/// what a host without `KVM_CAP_SIGNAL_MSI` gets.
+///
+/// The wart it documents is also still real. The guest logs
+///
+/// ```text
+/// virtio-pci 0000:00:01.0: can't find IRQ for PCI INT A; probably buggy MP table
+/// ```
+///
+/// because the MP table publishes ISA interrupt sources and the DSDT has no
+/// `_PRT`, so `pcibios_lookup_irq` finds no routing entry and Linux keeps the line
+/// the host wrote into `interrupt_line`. That line is asserted below via the
+/// guest's own `/sys/.../irq`, because "it happens to work" and "it is guaranteed
+/// to work" are different things and only one of them survives a kernel upgrade.
+#[test]
+fn an_intx_only_function_still_serves_its_disk_on_the_line_the_host_published() {
+    if !kvm_available() {
+        return;
+    }
+    let Some(outcome) = pci_boot_with("pci-acceptance-intx.raw", PciInterruptMode::IntxOnly) else {
+        return;
+    };
+    let irqs = assert_bus_enumerated_and_disk_read(&outcome);
+
+    // No MSI-X capability was published, so the kernel cannot have enabled it.
+    assert_eq!(
+        outcome.probe_value("pciscan", "msix"),
+        Some(0),
+        "an INTx-only function must expose no message vectors at all"
+    );
+    let mode = blkbench_field(&outcome, "irqmode");
+    assert_eq!(mode, "intx", "expected an IO-APIC line, got {mode:?}");
 
     // …and on the line the host published, not some fallback.
     let expected_irq = machine_x86::layout::PCI_FIRST_IRQ;
@@ -227,15 +360,10 @@ fn a_guest_enumerates_the_pci_bus_and_reads_its_disk() {
 
     let ms = outcome.probe_value("blkbench", "ms").unwrap_or(0);
     println!(
-        "read {bytes} bytes over virtio-pci in {ms} ms with {irqs} device interrupts; \
-         boot to ready in {:?}",
+        "read {} bytes over virtio-pci with INTx in {ms} ms with {irqs} interrupts \
+         on GSI {expected_irq}; boot to ready in {:?}",
+        BENCH_MIB << 20,
         outcome.time_to_ready
-    );
-
-    // Nothing on the command line told the guest where to look.
-    assert!(
-        !outcome.serial.contains("virtio_mmio.device"),
-        "the kernel command line announced mmio slots; this was not a pci boot"
     );
 }
 

@@ -41,23 +41,26 @@ one is attached and the other stays empty. Their address ranges are disjoint, so
 | Machine bus | `machine_x86::virtio` | `machine_x86::virtio_pci` + `machine_x86::pci` |
 | Discovery | `virtio_mmio.device=4K@base:irq` on the cmdline; nothing enumerates | guest walks bus 0; nothing on the cmdline |
 | Probe order → device names | cmdline clause order | PCI device number (dense from `00:01.0`) |
-| Register window | one 4 KiB slot from `layout::virtio_mmio_slot(n)` | one 16 KiB memory BAR from `layout::pci_bar_slot(n)`, found via the capability list |
+| Register window | one 4 KiB slot from `layout::virtio_mmio_slot(n)` | one 32 KiB memory BAR from `layout::pci_bar_slot(n)`, found via the capability list |
 | Access widths | 32-bit aligned only | 1/2/4/8 bytes, per field |
 | Config access | none (the window *is* the device) | mechanism #1 on `0xcf8`/`0xcfc`; no ECAM (needs an ACPI MCFG we do not publish) |
 | Queue kick | `QUEUE_NOTIFY`, queue index in the value | notification area, `notify_off_multiplier = 4`, queue index in the **address** |
 | ioeventfd | one shared address + 4-byte datamatch on the index | one address per queue, **no datamatch** (so any write width works) |
-| Interrupt | single IRQ, `INTERRUPT_STATUS` + write-to-`INTERRUPT_ACK` | INTx, ISR byte, **read-to-clear**; `INTX_DISABLE` honoured |
+| Interrupt | single IRQ, `INTERRUPT_STATUS` + write-to-`INTERRUPT_ACK` | **MSI-X** (`queues + 1` vectors) with INTx underneath it; the driver picks |
 | Guest kernel needs | `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` | `CONFIG_PCI` + `CONFIG_VIRTIO_PCI` |
 | UEFI | unusable — EDK2 CloudHv ships no virtio-MMIO driver | **required** for an ISO boot (ADR-0003) |
 
-Both use `virtio_core::LineInterrupt` unchanged: the ISR bits and the mmio
-`INTERRUPT_STATUS` bits are the same two bits in the same positions.
+Both use `virtio_core::LineInterrupt` for their single-line path: the ISR bits and
+the mmio `INTERRUPT_STATUS` bits are the same two bits in the same positions. On
+pci that object is wrapped by `virtio_core::msix::MsixInterrupt`, which delivers
+an MSI instead whenever the driver has MSI-X enabled — see "Interrupts" below.
 
 ### virtio-pci BAR layout
 
-One BAR, four page-aligned regions, published as four vendor-specific PCI
-capability records (`pci::capability_records`). Page-sized so a region could
-later get its own KVM slot without anything moving.
+One BAR, six page-aligned regions. The first four are published as
+vendor-specific PCI capability records (`pci::capability_records`), the last two
+through the MSI-X capability (`msix::capability_record`). Page-sized so a region
+could later get its own KVM slot without anything moving.
 
 | Structure | `cfg_type` | BAR offset | Length |
 |---|---:|---:|---:|
@@ -65,6 +68,15 @@ later get its own KVM slot without anything moving.
 | ISR status | 3 | `0x1000` | `0x1000` (1 byte) |
 | notification area | 2 | `0x2000` | `0x1000` (one dword per queue) |
 | device configuration | 4 | `0x3000` | `0x1000` |
+| MSI-X table | — | `0x4000` | `0x1000` (16 B × 256 vectors) |
+| MSI-X PBA | — | `0x5000` | `0x1000` (one bit per vector) |
+
+`VIRTIO_PCI_BAR_SIZE` is therefore **32 KiB** (the next power of two; the sizing
+protocol cannot express 24 KiB), and `layout::PCI_MMIO_SLOT_SIZE` must equal it.
+One BAR rather than two on purpose: the aperture allocator, the DSDT `_CRS`,
+`locate_mmio` and the ioeventfd rebase are all written around one window per
+function, and a second window would double what the rebase has to converge on
+while EDK2 permutes BARs.
 
 Identity: vendor `0x1af4`, device `0x1040 + virtio type`, revision 1, subsystem
 vendor `0x1af4` (Linux reads the virtio vendor id from *that* field), INTA#.
@@ -72,18 +84,47 @@ vendor `0x1af4` (Linux reads the virtio vendor id from *that* field), INTA#.
 builds a device's config space before its transport exists and the two must
 agree.
 
-### Known INTx limitation
+### Interrupts on virtio-pci: MSI-X, with INTx underneath
 
-The machine publishes ISA interrupt sources in its MP table, not PCI ones, so
-Linux logs `can't find IRQ for PCI INT A; probably buggy MP table` and then keeps
-the GSI the host wrote into `interrupt_line`. That works — the acceptance boot
-asserts both the GSI and a non-zero interrupt count — but it means:
+Every function publishes **both**, and the driver picks. One
+`msix::MsixInterrupt` serves both and decides **per signal** from the message
+control register the guest last wrote, because a driver moves between them:
+Linux tries per-queue MSI-X vectors, then a shared vector, then INTx, and
+`pci_free_irq_vectors` on an unbind puts the function back on INTx — all while
+the device holds one `Arc<dyn Interrupt>` for its whole life.
 
-- pins are **never shared** (one device per pin, bounded by `MAX_PCI_DEVICES`),
-  because the injection is an edge through an irqfd, not a level-triggered
-  `INTA#` that the ISR read would deassert;
-- publishing PCI interrupt routing (MP table entries, or an ACPI MADT + `_PRT`)
-  is the clean fix, and MSI-X would make the question disappear.
+- **MSI-X** (`crates/virtio-core/src/msix.rs`): `queues + 1` vectors, table and
+  PBA in the BAR, delivery through `virtio_core::MsiSink` — an (address, data)
+  pair, implemented on Linux by `machine_x86::msi::KvmMsiSink` over
+  `KVM_SIGNAL_MSI`. Under MSI-X the ISR byte is unused (spec 4.1.4.5) and the
+  INTx line is never raised. Vector assignment is the two common-config registers
+  (`queue_msix_vector` per selected queue, `config_msix_vector`); an out-of-range
+  request reads back `VIRTIO_MSI_NO_VECTOR`, which is the spec's own way of
+  saying "refused".
+  - Two guest-owned registers reach the transport without `machine_x86::pci`
+    interpreting them: message control via `ConfigSpace::mirror_dword`, and a
+    *change* to it via `ConfigWrite::mirror_changed` →
+    `PciTransport::msix_control_changed`, which releases anything the PBA holds.
+  - `KVM_SIGNAL_MSI` was chosen over irqfd + `KVM_SET_GSI_ROUTING` because every
+    device here is a userspace thread that already holds the message: same one
+    syscall, no GSI allocator, no routing table to rebuild on every guest table
+    write, and no need for virtio-core to know what a vector *means*. The
+    argument is written out in `machine_x86::msi`'s module docs; revisit it only
+    if something kernel-side (vhost) ever needs to signal.
+- **INTx**: one IOAPIC pin per device, an edge through a KVM irqfd, ISR byte
+  read-to-clear, `INTX_DISABLE` honoured. Not a legacy path — it is where a
+  driver starts, falls back to, and returns to, and what a host without
+  `KVM_CAP_SIGNAL_MSI` or `ENTANGLED_PCI_MSIX=off` gets. Its three costs are
+  still real and MSI-X retires all three: pins are **never shared** (one device
+  per pin, bounded by `MAX_PCI_DEVICES`), `interrupt_line` had to be made
+  read-only because `PciBusDxe` scribbles on it, and the guest logs
+  `can't find IRQ for PCI INT A` because we publish ISA interrupt sources and no
+  `_PRT`. A `_PRT` in the DSDT is still the clean fix *for INTx*; MSI-X means
+  nothing depends on it any more.
+
+Because a Linux guest offered MSI-X never chooses INTx, the INTx path is kept
+tested by asking for it: `PciInterruptMode::IntxOnly` (or
+`ENTANGLED_PCI_MSIX=off`). `tests/boot/tests/pci_transport.rs` boots both.
 
 ## Untrusted-guest rules (non-negotiable, from CLAUDE.md)
 
@@ -129,9 +170,10 @@ you add a device: a bound without an enforcing test is not done.
 | `machine_x86::virtio::MAX_VIRTIO_SLOTS` | 8 | devices on the mmio bus (IOAPIC pins) | `queue_notify::attaching_more_devices_than_slots_is_refused` |
 | `machine_x86::notify::MAX_OFFLOADED_QUEUES` | 16 | ioeventfds and epoll slots one device may demand | `queue_notify::queue_notify_offload_is_capped_per_device` |
 | `virtio_core::pci::MAX_NOTIFY_QUEUES` | 1024 | *derived* (notify region ÷ multiplier); queues a device may expose on pci, since each needs its own notification address | `virtio_core::pci::tests::a_device_with_more_queues_than_notify_slots_is_refused` |
-| `virtio_core::pci::VIRTIO_PCI_BAR_SIZE` | 16 KiB | guest-addressable register space per pci device; every capability's `offset + length` must fit | `virtio_core::pci::tests::capability_records_describe_the_real_bar_layout`, `regions_do_not_overlap_and_the_common_struct_fits` |
+| `virtio_core::pci::VIRTIO_PCI_BAR_SIZE` | 32 KiB | guest-addressable register space per pci device; every capability's `offset + length` must fit | `virtio_core::pci::tests::capability_records_describe_the_real_bar_layout`, `regions_do_not_overlap_and_the_common_struct_fits` |
+| `virtio_core::msix::MAX_MSIX_VECTORS` | 256 | *derived* (table region ÷ 16 B); vectors one function may publish, so `queues + 1` must fit or the transport refuses the device | `virtio_core::msix::tests::table_size_for_*`, `virtio_core::pci::tests::a_device_with_more_queues_than_msix_vectors_is_refused` |
 | `machine_x86::pci::MAX_PCI_DEVICES` | 9 | config spaces, BAR windows and IOAPIC pins on the root bus (8 devices + the host bridge) | `machine_x86::pci::tests::the_bus_is_bounded` |
-| `machine_x86::layout::PCI_MMIO_SLOTS` | 8 | 16 KiB aperture slots at `0xc000_0000`; one per device, and `locate_mmio` decodes nothing outside the aperture | `machine_x86::pci::tests::{addresses_outside_the_aperture_are_never_claimed, a_bar_moved_out_of_the_aperture_decodes_nothing}` |
+| `machine_x86::layout::PCI_MMIO_SLOTS` | 8 | 32 KiB aperture slots at `0xc000_0000`; one per device, and `locate_mmio` decodes nothing outside the aperture | `machine_x86::pci::tests::{addresses_outside_the_aperture_are_never_claimed, a_bar_moved_out_of_the_aperture_decodes_nothing}` |
 | `machine_x86::pci::reg::SIZE` | 256 | one function's config space; capability records are refused rather than truncated when they would run past it | `machine_x86::pci::tests::capability_space_is_bounded` |
 | `machine_x86::serial::RX_CAPACITY` (private) | 4096 | buffered guest serial input | `machine_x86::serial::tests::rx_overrun_is_bounded` |
 | `display::MAX_PENDING_BATCHES` / `MAX_PENDING_CONTROL` | 256 / 64 | un-drained host input batches / control events | `display::input::tests::{queue_drops_the_oldest_batch_when_the_guest_stalls, control_queue_is_bounded}` |
@@ -196,9 +238,13 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
 - The queue-notify offload (`machine_x86::notify`) is generic over the transport.
   To add a third transport, implement `QueueNotifyTarget` and pick a
   `NotifyAddressing` — do not fork the worker loop.
-- MSI-X is **absent, not partial**: no capability at all. If you add it, the
-  capability must be complete, the vector fields must stop reading
-  `VIRTIO_MSI_NO_VECTOR`, and `LineInterrupt` needs a per-vector sibling.
+- MSI-X is **complete**, not partial: capability, table, PBA, per-vector masks,
+  function mask, real vector assignment, and `LineInterrupt`'s per-vector sibling
+  (`msix::MsixInterrupt`). See "Interrupts on virtio-pci" above. Two rules if you
+  touch it: `machine_x86::pci` must stay ignorant of what MSI-X *means* (it
+  publishes a dword and a write mask, nothing more), and the guest-facing
+  decisions — is MSI-X enabled, is this vector masked — must be read at signal
+  time rather than cached at activation, because Linux toggles them mid-probe.
 
 ## Per-device references
 
@@ -245,3 +291,10 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
   interrupts work — a driver finds used buffers whenever anything else wakes it.
   The guest probe reports `irqs=` from `/proc/interrupts` for exactly this
   reason; assert on it.
+- And with MSI-X, a climbing `irqs=` is **not** evidence that *MSI-X* worked:
+  every other symptom is identical on INTx. The probe also reports `irqmode=`
+  (the `/proc/interrupts` controller column), `irqnames=` (per-source
+  `virtio0-config` / `virtio0-req.0` vs a shared `virtio0`) and `msix=` (entries
+  in sysfs `msi_irqs/`, which exist only once the kernel enabled MSI-X). Assert
+  on all three, and boot the INTx variant too — `PciInterruptMode::IntxOnly`,
+  because a guest offered MSI-X will never pick INTx on its own.

@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use crate::device::{DeviceResources, DeviceType, VirtioDevice};
-use crate::interrupt::{Interrupt, IrqLine, LineInterrupt};
+use crate::interrupt::{IrqLine, LineInterrupt, TransportInterrupt};
 use crate::queue::QueueConfig;
 use crate::status;
 use crate::transport::TransportError;
@@ -38,7 +38,11 @@ pub struct TransportState {
     device: Box<dyn VirtioDevice>,
     device_type: DeviceType,
     mem: Arc<GuestMem>,
-    interrupt: Arc<LineInterrupt>,
+    /// How this device tells its driver something happened. A
+    /// [`LineInterrupt`] for virtio-mmio and for virtio-pci without MSI-X, a
+    /// [`MsixInterrupt`](crate::pci::MsixInterrupt) for virtio-pci with it.
+    /// Nothing in this module can tell the difference, which is the point.
+    interrupt: Arc<dyn TransportInterrupt>,
 
     /// Cached because the offered feature set cannot change at runtime.
     device_features: u64,
@@ -71,6 +75,23 @@ impl TransportState {
         mem: Arc<GuestMem>,
         line: Arc<dyn IrqLine>,
     ) -> Result<Self, TransportError> {
+        Self::new_with_interrupt(kind, slot, device, mem, Arc::new(LineInterrupt::new(line)))
+    }
+
+    /// [`Self::new`] with an interrupt object built by the caller.
+    ///
+    /// virtio-pci uses it to install a [`MsixInterrupt`](crate::pci::MsixInterrupt),
+    /// which needs a host MSI sink and a table size this module has no business
+    /// knowing about. Everything downstream — negotiation, status, activation,
+    /// reset — is identical, and virtio-mmio still goes through [`Self::new`]
+    /// unchanged.
+    pub fn new_with_interrupt(
+        kind: &'static str,
+        slot: usize,
+        device: Box<dyn VirtioDevice>,
+        mem: Arc<GuestMem>,
+        interrupt: Arc<dyn TransportInterrupt>,
+    ) -> Result<Self, TransportError> {
         let device_type = device.device_type();
         let device_features = device.device_features();
         if device_features & VIRTIO_F_VERSION_1 == 0 {
@@ -98,7 +119,7 @@ impl TransportState {
             device,
             device_type,
             mem,
-            interrupt: Arc::new(LineInterrupt::new(line)),
+            interrupt,
             device_features,
             device_features_sel: 0,
             driver_features: 0,
@@ -135,7 +156,7 @@ impl TransportState {
     }
 
     /// The shared interrupt object, for the transport's acknowledge path.
-    pub fn interrupt(&self) -> &Arc<LineInterrupt> {
+    pub fn interrupt(&self) -> &Arc<dyn TransportInterrupt> {
         &self.interrupt
     }
 
@@ -558,7 +579,7 @@ impl TransportState {
         let resources = DeviceResources {
             mem: Arc::clone(&self.mem),
             queues,
-            interrupt: Arc::clone(&self.interrupt) as Arc<dyn Interrupt>,
+            interrupt: Arc::clone(&self.interrupt).as_interrupt(),
         };
         match self.device.activate(resources) {
             Ok(()) => {

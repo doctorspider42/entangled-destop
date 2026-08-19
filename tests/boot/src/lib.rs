@@ -35,7 +35,7 @@ use machine_x86::bus::MachineBus;
 use machine_x86::notify::QueueNotifyMode;
 use machine_x86::serial::SerialConsole;
 use machine_x86::virtio::VirtioMmioBus;
-use machine_x86::virtio_pci::VirtioPciBus;
+use machine_x86::virtio_pci::{PciInterruptMode, VirtioPciBus};
 use virtio_core::VirtioDevice;
 use vmm_core::{spawn_vcpus, Hypervisor, MachineConfig, RunOutcome, Vm, VmmError};
 
@@ -69,6 +69,13 @@ pub struct BootSpec {
     /// Which virtio transport the devices sit on. `Mmio` is the default, so an
     /// existing test keeps booting the machine it always booted.
     pub transport: VirtioTransport,
+    /// Which interrupt mechanisms the pci functions publish. Ignored on mmio.
+    ///
+    /// Defaults to MSI-X, which is what a real VM does and therefore what most
+    /// tests should exercise; the INTx acceptance boot asks for
+    /// [`PciInterruptMode::IntxOnly`] explicitly, because a Linux guest offered
+    /// MSI-X will never choose INTx and the path would stop being tested.
+    pub pci_interrupts: PciInterruptMode,
     pub deadline: Duration,
 }
 
@@ -89,6 +96,7 @@ impl BootSpec {
             // environment; benchmarks override it per boot.
             notify: QueueNotifyMode::from_env(),
             transport: VirtioTransport::default(),
+            pci_interrupts: PciInterruptMode::default(),
             deadline: DEFAULT_DEADLINE,
         }
     }
@@ -138,6 +146,13 @@ impl BootSpec {
 
     pub fn with_transport(mut self, transport: VirtioTransport) -> Self {
         self.transport = transport;
+        self
+    }
+
+    /// Which interrupt mechanisms the pci functions publish; see
+    /// [`Self::pci_interrupts`].
+    pub fn with_pci_interrupts(mut self, interrupts: PciInterruptMode) -> Self {
+        self.pci_interrupts = interrupts;
         self
     }
 
@@ -280,8 +295,14 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
             (MachineBus::with_virtio(serial, virtio), clauses)
         }
         VirtioTransport::Pci => {
-            let pci = VirtioPciBus::attach_with(vm.fd_shared(), mem, devices, spec.notify)
-                .map_err(|e| e.to_string())?;
+            let pci = VirtioPciBus::attach_with_interrupts(
+                vm.fd_shared(),
+                mem,
+                devices,
+                spec.notify,
+                spec.pci_interrupts,
+            )
+            .map_err(|e| e.to_string())?;
             (MachineBus::with_virtio_pci(serial, pci), String::new())
         }
     };

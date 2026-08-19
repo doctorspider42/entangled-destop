@@ -7,11 +7,12 @@
 //! errors, which is why nothing outside `#[cfg(test)]` may call it.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use vm_memory::{Bytes, GuestAddress};
 
 use crate::chain::DESC_SIZE;
-use crate::interrupt::{Interrupt, InterruptError, IrqLine};
+use crate::interrupt::{Interrupt, InterruptError, IrqLine, MsiMessage, MsiSink};
 use crate::queue::QueueConfig;
 use crate::GuestMem;
 
@@ -205,6 +206,55 @@ impl IrqLine for TestIrqLine {
         self.count.fetch_add(1, Ordering::AcqRel);
         if self.fail {
             return Err(InterruptError::Signal("test line always fails".into()));
+        }
+        Ok(())
+    }
+}
+
+/// An [`MsiSink`] that records the messages a device sent instead of handing
+/// them to KVM.
+///
+/// The MSI-X counterpart of [`TestIrqLine`], and the reason a test can assert on
+/// the exact `(address, data)` pair the *guest* programmed: with INTx all a test
+/// can count is edges, whereas an MSI message says which vector fired.
+#[derive(Debug, Default)]
+pub struct TestMsiSink {
+    sent: Mutex<Vec<MsiMessage>>,
+    fail: bool,
+}
+
+impl TestMsiSink {
+    /// A sink whose `send` always fails, to test error propagation.
+    pub fn failing() -> Self {
+        Self {
+            sent: Mutex::new(Vec::new()),
+            fail: true,
+        }
+    }
+
+    /// Every message sent so far, in order.
+    pub fn sent(&self) -> Vec<MsiMessage> {
+        self.sent.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    pub fn count(&self) -> usize {
+        self.sent.lock().map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// The `data` half of every message sent, which is what identifies the
+    /// vector a driver would see.
+    pub fn data(&self) -> Vec<u32> {
+        self.sent().iter().map(|m| m.data).collect()
+    }
+}
+
+impl MsiSink for TestMsiSink {
+    fn send(&self, message: MsiMessage) -> Result<(), InterruptError> {
+        if self.fail {
+            return Err(InterruptError::Signal("test sink always fails".into()));
+        }
+        if let Ok(mut sent) = self.sent.lock() {
+            sent.push(message);
         }
         Ok(())
     }

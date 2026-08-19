@@ -21,8 +21,9 @@
 //!   no transitional device id, so a legacy-only driver simply does not bind.
 //!   `VIRTIO_F_VERSION_1` is mandatory (enforced by [`TransportState::new`]).
 //! * Everything the driver touches lives in **one 32-bit memory BAR**
-//!   ([`VIRTIO_PCI_BAR_INDEX`], [`VIRTIO_PCI_BAR_SIZE`]), split into four
-//!   page-aligned structures found through the PCI capability list:
+//!   ([`VIRTIO_PCI_BAR_INDEX`], [`VIRTIO_PCI_BAR_SIZE`]), split into six
+//!   page-aligned regions. The first four are found through the virtio
+//!   capability list, the last two through the MSI-X capability:
 //!
 //!   | Structure | `cfg_type` | BAR offset | Length | Notes |
 //!   |---|---:|---:|---:|---|
@@ -30,27 +31,44 @@
 //!   | ISR status | 3 | `0x1000` | `0x1000` | 1 byte, read-to-clear |
 //!   | notification area | 2 | `0x2000` | `0x1000` | multiplier 4 → one dword per queue |
 //!   | device configuration | 4 | `0x3000` | `0x1000` | passed to the device |
+//!   | MSI-X table | — | `0x4000` | `0x1000` | 16 bytes per vector, 256 vectors |
+//!   | MSI-X PBA | — | `0x5000` | `0x1000` | one pending bit per vector |
 //!
 //!   Page-aligned and page-sized so each region could later be given its own
-//!   KVM memory slot or ioeventfd granularity without moving anything.
+//!   KVM memory slot or ioeventfd granularity without moving anything, and
+//!   [`VIRTIO_PCI_BAR_SIZE`] is the next power of two above them (the BAR sizing
+//!   protocol cannot express anything else), which leaves `0x6000..0x8000`
+//!   decoding nothing.
 //!
-//! # Interrupts: INTx, not MSI-X
+//! # Interrupts: MSI-X, with INTx underneath it
 //!
-//! The device advertises **no MSI-X capability**, so the driver uses the legacy
-//! INTx path: the ISR byte tells it *why* the line was raised and reading the
-//! byte acknowledges it. [`LineInterrupt`](crate::LineInterrupt) already
-//! implements exactly that word — bit 0 "a queue has used buffers", bit 1
-//! "config space changed" — and the ordering it guarantees is the one INTx
-//! needs: the bit is set *before* the line is raised, so a driver that takes the
-//! interrupt and reads the ISR can never see 0.
+//! The device publishes **both** mechanisms and the driver picks. Linux tries
+//! MSI-X first and INTx only if that fails; EDK2 polls and uses neither.
 //!
-//! On this machine the line itself is an edge injected through a KVM irqfd on an
-//! ISA-style IOAPIC pin (`machine_x86::pci`), not a real level-triggered PCI
-//! `INTA#`: the ISR byte is therefore *not* what deasserts the line, and a
-//! shared pin would lose interrupts. One device per pin keeps that honest; the
-//! machine enforces it. MSI-X would remove the whole question and is the obvious
-//! follow-up — but a half-built MSI-X capability is worse than none, so there is
-//! none.
+//! * **MSI-X** ([`crate::msix`]): one vector per virtqueue plus one for
+//!   configuration changes. A signal becomes one MSI message — the (address,
+//!   data) pair the guest wrote into the table entry — handed to the host through
+//!   [`MsiSink`](crate::interrupt::MsiSink). No line, no pin, no routing, and the
+//!   ISR byte is unused (spec 4.1.4.5).
+//! * **INTx** ([`LineInterrupt`](crate::LineInterrupt)): the ISR byte tells the
+//!   driver *why* the line was raised and reading it acknowledges. The bit is set
+//!   *before* the line is raised, so a driver that takes the interrupt and reads
+//!   the ISR can never see 0.
+//!
+//! One [`MsixInterrupt`](crate::msix::MsixInterrupt) serves both and decides per
+//! signal, from the message-control register the guest last wrote — because a
+//! driver moves between them (Linux's probe tries per-queue MSI-X vectors, then a
+//! shared vector, then INTx, and an unbind puts the function back on INTx) while
+//! the device on the other side holds one `Arc<dyn Interrupt>` for its whole
+//! life.
+//!
+//! What INTx still costs, and what MSI-X retires: on this machine an INTx
+//! injection is an **edge** through a KVM irqfd on an ISA-style IOAPIC pin
+//! (`machine_x86::virtio_pci`), not a level-triggered `INTA#`. So the ISR read is
+//! not what deasserts the line, pins can never be shared (one device per pin),
+//! and `interrupt_line` had to be made read-only because EDK2 scribbles on it.
+//! Every one of those disappears under MSI-X: the message carries its own
+//! destination and vector, so there is nothing to share, route or clobber.
 //!
 //! # Untrusted guest
 //!
@@ -62,10 +80,12 @@
 //! Queue geometry is validated by [`crate::QueueConfig::build`] at activation,
 //! exactly as on mmio.
 
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 use crate::device::{DeviceType, VirtioDevice};
-use crate::interrupt::IrqLine;
+use crate::interrupt::{IrqLine, LineInterrupt, MsiSink};
+use crate::msix::{self, MsixInterrupt, MAX_MSIX_VECTORS};
 use crate::state::TransportState;
 use crate::transport::TransportError;
 use crate::GuestMem;
@@ -120,9 +140,22 @@ pub const VIRTIO_PCI_INTERRUPT_PIN: u8 = 1;
 /// Index of the single memory BAR every structure lives in.
 pub const VIRTIO_PCI_BAR_INDEX: u8 = 0;
 
-/// Size of that BAR: four 4 KiB regions. A power of two, as the BAR sizing
-/// protocol requires.
-pub const VIRTIO_PCI_BAR_SIZE: u64 = 0x4000;
+/// Size of that BAR: six 4 KiB regions rounded up to a power of two, as the BAR
+/// sizing protocol requires. `0x6000..0x8000` therefore decodes nothing.
+///
+/// # Why one BAR and not two
+///
+/// The MSI-X table and PBA could have gone in a BAR of their own (the capability
+/// names a BAR index per structure, so nothing in the spec objects). They did not,
+/// because every consumer of "where does this device decode" is written around one
+/// window per function: the host's aperture allocator
+/// ([`machine_x86::layout::pci_bar_slot`](../../machine_x86/layout/fn.pci_bar_slot.html)),
+/// the DSDT `_CRS` that publishes the aperture, `VirtioPciBus::locate`, and above
+/// all the ioeventfd rebase machinery — EDK2's `PciBusDxe` reassigns every BAR
+/// during resource allocation, and a second BAR would double the number of moving
+/// windows the rebase has to converge on for no benefit. Growing the one window
+/// from 16 KiB to 32 KiB costs 128 KiB of a 256 MiB aperture.
+pub const VIRTIO_PCI_BAR_SIZE: u64 = 0x8000;
 
 /// Offset and length of the common configuration structure inside the BAR.
 pub const COMMON_CFG_OFFSET: u64 = 0x0000;
@@ -147,6 +180,18 @@ pub const NOTIFY_OFF_MULTIPLIER: u32 = 4;
 /// Offset and length of the device-specific configuration structure.
 pub const DEVICE_CFG_OFFSET: u64 = 0x3000;
 pub const DEVICE_CFG_LEN: u64 = 0x1000;
+
+/// Offset and length of the MSI-X table (see [`crate::msix`]).
+///
+/// A page of its own, and one the PBA does not share: PCI 3.0 §6.8.2 asks for
+/// exactly that so a system can map the table to a driver without also exposing
+/// the pending bits.
+pub const MSIX_TABLE_OFFSET: u64 = 0x4000;
+pub const MSIX_TABLE_LEN: u64 = 0x1000;
+
+/// Offset and length of the MSI-X pending-bit array.
+pub const MSIX_PBA_OFFSET: u64 = 0x5000;
+pub const MSIX_PBA_LEN: u64 = 0x1000;
 
 /// Most virtqueues a device may expose on this transport: the notification area
 /// must hold one [`NOTIFY_OFF_MULTIPLIER`]-sized slot per queue.
@@ -265,8 +310,9 @@ pub mod common {
     pub const SIZE: usize = 0x3c;
 }
 
-/// "No MSI-X vector" — what both vector fields always read, because this device
-/// publishes no MSI-X capability.
+/// "No MSI-X vector": what both vector fields read when no vector is assigned,
+/// what a driver writes to unassign one, and what the device reports back when it
+/// cannot honour an assignment (spec 4.1.4.3).
 pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
 
 // ------------------------------------------------------------- the ISR status
@@ -313,10 +359,17 @@ pub fn class_code(device_type: DeviceType) -> u32 {
 /// [`capability_records`]. This type owns only what lives inside the BAR.
 pub struct PciTransport {
     state: TransportState,
+    /// The MSI-X half, when this function publishes the capability. `None` means
+    /// an INTx-only function: the two vector registers then read
+    /// [`VIRTIO_MSI_NO_VECTOR`] whatever a driver writes, and the table and PBA
+    /// regions decode nothing — which is what the spec requires of a device
+    /// without the capability, and what the machine builds when the host cannot
+    /// deliver MSI at all.
+    msix: Option<Arc<MsixInterrupt>>,
 }
 
 impl PciTransport {
-    /// Wires `device` onto the PCI bus as device number `slot`.
+    /// Wires `device` onto the PCI bus as device number `slot`, **INTx only**.
     ///
     /// Fails when the device violates the transport contract (no
     /// `VIRTIO_F_VERSION_1`, no queues, a bad advertised queue size) or exposes
@@ -328,7 +381,53 @@ impl PciTransport {
         mem: Arc<GuestMem>,
         line: Arc<dyn IrqLine>,
     ) -> Result<Self, TransportError> {
-        let state = TransportState::new("virtio-pci", slot, device, mem, line)?;
+        let interrupt = Arc::new(LineInterrupt::new(line));
+        let state = Self::build_state(slot, device, mem, interrupt)?;
+        Ok(Self { state, msix: None })
+    }
+
+    /// [`Self::new`] with MSI-X: the function publishes the capability, and every
+    /// signal goes to the vector the driver assigned as long as it has enabled
+    /// MSI-X (see [`crate::msix`]).
+    ///
+    /// `line` is still required — it is the INTx fallback the driver lands on
+    /// before it enables MSI-X, if it enables MSI-X, and again after an unbind.
+    /// `sink` is the host MSI mechanism.
+    ///
+    /// Fails additionally when the device has more queues than the MSI-X table
+    /// region can hold vectors for; again a host-side refusal, and a loud one,
+    /// because silently publishing a table too small for the queues would leave
+    /// some queue permanently unable to interrupt.
+    pub fn with_msix(
+        slot: usize,
+        device: Box<dyn VirtioDevice>,
+        mem: Arc<GuestMem>,
+        line: Arc<dyn IrqLine>,
+        sink: Arc<dyn MsiSink>,
+    ) -> Result<Self, TransportError> {
+        let device_type = device.device_type();
+        let queues = device.queue_max_sizes().len();
+        let table_size =
+            msix::table_size_for(queues).ok_or(TransportError::TooManyQueuesForMsix {
+                device_type,
+                queues,
+                max: MAX_MSIX_VECTORS,
+            })?;
+        let interrupt = Arc::new(MsixInterrupt::new(line, sink, table_size, queues));
+        let state = Self::build_state(slot, device, mem, Arc::clone(&interrupt) as Arc<_>)?;
+        Ok(Self {
+            state,
+            msix: Some(interrupt),
+        })
+    }
+
+    fn build_state(
+        slot: usize,
+        device: Box<dyn VirtioDevice>,
+        mem: Arc<GuestMem>,
+        interrupt: Arc<dyn crate::interrupt::TransportInterrupt>,
+    ) -> Result<TransportState, TransportError> {
+        let state = TransportState::new_with_interrupt("virtio-pci", slot, device, mem, interrupt)?;
         if state.num_queues() > MAX_NOTIFY_QUEUES {
             return Err(TransportError::TooManyQueuesForNotify {
                 device_type: state.device_type(),
@@ -336,7 +435,41 @@ impl PciTransport {
                 max: MAX_NOTIFY_QUEUES,
             });
         }
-        Ok(Self { state })
+        Ok(state)
+    }
+
+    // -------------------------------------------------------------- MSI-X
+
+    /// The MSI-X state of this function, or `None` for an INTx-only one.
+    pub fn msix(&self) -> Option<&Arc<MsixInterrupt>> {
+        self.msix.as_ref()
+    }
+
+    /// Number of MSI-X vectors this function publishes: `queues + 1`, or 0 when
+    /// it publishes no capability.
+    pub fn msix_table_size(&self) -> u16 {
+        self.msix.as_ref().map_or(0, |m| m.table_size())
+    }
+
+    /// The handle the machine's configuration space mirrors the MSI-X
+    /// capability's first dword into, so this transport sees the driver's
+    /// enable/function-mask writes without the PCI bus knowing what they mean.
+    pub fn msix_control_handle(&self) -> Option<Arc<AtomicU32>> {
+        self.msix.as_ref().map(|m| m.control_handle())
+    }
+
+    /// Whether the driver currently has MSI-X enabled.
+    pub fn msix_enabled(&self) -> bool {
+        self.msix.as_ref().is_some_and(|m| m.is_enabled())
+    }
+
+    /// Called by the machine after a configuration write changed the MSI-X
+    /// message control register: enabling MSI-X or clearing the function mask
+    /// makes everything the PBA remembers deliverable at once.
+    pub fn msix_control_changed(&self) {
+        if let Some(msix) = &self.msix {
+            msix.flush_pending();
+        }
     }
 
     // ------------------------------------------------------- PCI identity
@@ -435,6 +568,19 @@ impl PciTransport {
             self.state.read_config(within, data);
             return;
         }
+        // Without the capability neither region is described to anyone, so they
+        // are simply unclaimed BAR space (handled below) rather than a table
+        // nothing maintains.
+        if let Some(msix) = &self.msix {
+            if let Some(within) = region_offset(offset, MSIX_TABLE_OFFSET, MSIX_TABLE_LEN) {
+                msix.read_table(within, data);
+                return;
+            }
+            if let Some(within) = region_offset(offset, MSIX_PBA_OFFSET, MSIX_PBA_LEN) {
+                msix.read_pba(within, data);
+                return;
+            }
+        }
         // The notification area is write-only, and so is everything else in the
         // BAR that no capability points at.
         if region_offset(offset, NOTIFY_CFG_OFFSET, NOTIFY_CFG_LEN).is_none() {
@@ -460,6 +606,24 @@ impl PciTransport {
         if let Some(within) = region_offset(offset, DEVICE_CFG_OFFSET, DEVICE_CFG_LEN) {
             self.state.write_config(within, data);
             return;
+        }
+        if let Some(msix) = &self.msix {
+            if let Some(within) = region_offset(offset, MSIX_TABLE_OFFSET, MSIX_TABLE_LEN) {
+                msix.write_table(within, data);
+                return;
+            }
+            if region_offset(offset, MSIX_PBA_OFFSET, MSIX_PBA_LEN).is_some() {
+                // The PBA is read-only (PCI 3.0 §6.8.2.10): a guest may neither
+                // forge a pending interrupt nor drop one. Only a delivery clears
+                // a bit.
+                tracing::debug!(
+                    slot = self.state.slot(),
+                    device = ?self.state.device_type(),
+                    offset,
+                    "ignoring write to the read-only MSI-X pending-bit array"
+                );
+                return;
+            }
         }
         // The ISR is read-to-clear; a write to it means nothing.
         tracing::debug!(
@@ -539,7 +703,11 @@ impl PciTransport {
         );
         put(
             common::CONFIG_MSIX_VECTOR,
-            &VIRTIO_MSI_NO_VECTOR.to_le_bytes(),
+            &self
+                .msix
+                .as_ref()
+                .map_or(VIRTIO_MSI_NO_VECTOR, |m| m.config_vector())
+                .to_le_bytes(),
         );
         let num_queues = u16::try_from(self.state.num_queues()).unwrap_or(u16::MAX);
         put(common::NUM_QUEUES, &num_queues.to_le_bytes());
@@ -557,9 +725,15 @@ impl PciTransport {
             common::QUEUE_SIZE,
             &queue.map_or(0u16, |q| q.size()).to_le_bytes(),
         );
+        // Per *selected* queue, and NO_VECTOR for a selector that names no queue
+        // — the same "this queue does not exist" answer queue_size gives.
         put(
             common::QUEUE_MSIX_VECTOR,
-            &VIRTIO_MSI_NO_VECTOR.to_le_bytes(),
+            &match (&self.msix, queue.is_some()) {
+                (Some(msix), true) => msix.queue_vector(queue_sel),
+                _ => VIRTIO_MSI_NO_VECTOR,
+            }
+            .to_le_bytes(),
         );
         put(
             common::QUEUE_ENABLE,
@@ -622,18 +796,8 @@ impl PciTransport {
             (common::QUEUE_DEVICE_HIGH, 4) => {
                 self.write_queue_address_high(common::QUEUE_DEVICE, value as u32)
             }
-            // Both vector fields are meaningless without an MSI-X capability,
-            // and the spec forbids writing them in that case. They read back
-            // VIRTIO_MSI_NO_VECTOR whatever happens here.
-            (common::CONFIG_MSIX_VECTOR, 2) | (common::QUEUE_MSIX_VECTOR, 2) => {
-                tracing::warn!(
-                    slot = self.state.slot(),
-                    device = ?self.state.device_type(),
-                    offset,
-                    value,
-                    "ignoring MSI-X vector write: this device publishes no MSI-X capability"
-                );
-            }
+            (common::CONFIG_MSIX_VECTOR, 2) => self.write_config_vector(value as u16),
+            (common::QUEUE_MSIX_VECTOR, 2) => self.write_queue_vector(value as u16),
             (common::QUEUE_RESET, 2) => tracing::warn!(
                 slot = self.state.slot(),
                 device = ?self.state.device_type(),
@@ -650,6 +814,65 @@ impl PciTransport {
                  or at an unsupported width"
             ),
         }
+    }
+
+    /// Guest write to `config_msix_vector`.
+    ///
+    /// Without the capability the field is meaningless and the spec forbids
+    /// writing it; the write is dropped and the register keeps reading
+    /// [`VIRTIO_MSI_NO_VECTOR`], which is what tells a driver the assignment did
+    /// not take.
+    fn write_config_vector(&mut self, vector: u16) {
+        let Some(msix) = &self.msix else {
+            tracing::warn!(
+                slot = self.state.slot(),
+                device = ?self.state.device_type(),
+                vector,
+                "ignoring config_msix_vector write: this device publishes no MSI-X capability"
+            );
+            return;
+        };
+        let accepted = msix.set_config_vector(vector);
+        tracing::debug!(
+            slot = self.state.slot(),
+            device = ?self.state.device_type(),
+            requested = vector,
+            accepted,
+            "config_msix_vector"
+        );
+    }
+
+    /// Guest write to `queue_msix_vector`, for the queue the driver has selected.
+    fn write_queue_vector(&mut self, vector: u16) {
+        let Some(msix) = &self.msix else {
+            tracing::warn!(
+                slot = self.state.slot(),
+                device = ?self.state.device_type(),
+                vector,
+                "ignoring queue_msix_vector write: this device publishes no MSI-X capability"
+            );
+            return;
+        };
+        // A selector that names no queue is dropped rather than indexing
+        // anything, exactly as every other per-queue register handles it.
+        let Ok(queue) = u16::try_from(self.state.queue_sel()) else {
+            tracing::warn!(
+                slot = self.state.slot(),
+                device = ?self.state.device_type(),
+                queue_sel = self.state.queue_sel(),
+                "ignoring queue_msix_vector write with an out-of-range queue selector"
+            );
+            return;
+        };
+        let accepted = msix.set_queue_vector(queue, vector);
+        tracing::debug!(
+            slot = self.state.slot(),
+            device = ?self.state.device_type(),
+            queue,
+            requested = vector,
+            accepted,
+            "queue_msix_vector"
+        );
     }
 
     fn write_queue_address(&mut self, field: u64, low: u32, high: Option<u32>) {
@@ -717,8 +940,8 @@ fn copy_from_snapshot(snapshot: &[u8], within: u64, data: &mut [u8]) {
 mod tests {
     use super::*;
     use crate::device::{DeviceError, DeviceResources};
-    use crate::interrupt::Interrupt;
-    use crate::testing::{self, SplitRing, TestIrqLine};
+    use crate::msix::{MSIX_CTRL_ENABLE, MSIX_CTRL_FUNCTION_MASK, MSIX_ENTRY_SIZE};
+    use crate::testing::{self, SplitRing, TestIrqLine, TestMsiSink};
     use crate::{mmio, status, VIRTIO_F_VERSION_1};
     use std::sync::Mutex;
 
@@ -798,6 +1021,56 @@ mod tests {
 
     fn transport() -> (PciTransport, Arc<TestIrqLine>, NotifyLog) {
         transport_with(TestDevice::default())
+    }
+
+    /// A transport that publishes the MSI-X capability, plus the two host
+    /// mechanisms behind it so a test can see which one a signal took.
+    struct MsixFixture {
+        t: PciTransport,
+        line: Arc<TestIrqLine>,
+        sink: Arc<TestMsiSink>,
+        log: NotifyLog,
+    }
+
+    fn msix_transport_with(device: TestDevice) -> MsixFixture {
+        let log = Arc::clone(&device.notifies);
+        let line = Arc::new(TestIrqLine::default());
+        let sink = Arc::new(TestMsiSink::default());
+        let mem = Arc::new(testing::guest_memory(0x2_0000));
+        let t = PciTransport::with_msix(0, Box::new(device), mem, line.clone(), sink.clone())
+            .expect("test device satisfies the transport contract");
+        MsixFixture { t, line, sink, log }
+    }
+
+    fn msix_transport() -> MsixFixture {
+        msix_transport_with(TestDevice::default())
+    }
+
+    /// BAR offset of table entry `vector`'s dword `dword`.
+    fn table_at(vector: u64, dword: u64) -> u64 {
+        MSIX_TABLE_OFFSET + vector * MSIX_ENTRY_SIZE + dword * 4
+    }
+
+    /// Programs one table entry through the BAR, the way a driver's `writel`s do,
+    /// and leaves it unmasked.
+    fn program_vector(t: &mut PciTransport, vector: u64, address: u64, data: u32) {
+        write(t, table_at(vector, 0), 4, address & 0xffff_ffff);
+        write(t, table_at(vector, 1), 4, address >> 32);
+        write(t, table_at(vector, 2), 4, u64::from(data));
+        write(t, table_at(vector, 3), 4, 0);
+    }
+
+    /// What a guest configuration write to the MSI-X message control register
+    /// does: the machine's PCI bus mirrors the capability's first dword into this
+    /// handle (see `machine_x86::pci::ConfigSpace::mirror_dword`).
+    fn set_msix_control(t: &PciTransport, control: u16) {
+        t.msix_control_handle()
+            .expect("the fixture publishes MSI-X")
+            .store(
+                u32::from(control) << (crate::msix::MSIX_CONTROL_OFFSET as u32 * 8),
+                std::sync::atomic::Ordering::Release,
+            );
+        t.msix_control_changed();
     }
 
     fn read(t: &mut PciTransport, offset: u64, len: usize) -> u64 {
@@ -900,6 +1173,8 @@ mod tests {
             (ISR_CFG_OFFSET, ISR_CFG_LEN),
             (NOTIFY_CFG_OFFSET, NOTIFY_CFG_LEN),
             (DEVICE_CFG_OFFSET, DEVICE_CFG_LEN),
+            (MSIX_TABLE_OFFSET, MSIX_TABLE_LEN),
+            (MSIX_PBA_OFFSET, MSIX_PBA_LEN),
         ];
         for (i, (base, len)) in regions.iter().enumerate() {
             for (other_base, other_len) in regions.iter().skip(i + 1) {
@@ -1477,6 +1752,292 @@ mod tests {
         // Nothing above disturbed the state machine.
         assert_eq!(t.status(), 0);
         assert!(!t.is_activated());
+    }
+
+    // ---------------------------------------------------------------- MSI-X
+
+    /// The vector registers are read-write once the capability exists, and the
+    /// device answers an impossible request with NO_VECTOR rather than silently
+    /// accepting it (spec 4.1.4.3).
+    #[test]
+    fn the_vector_registers_round_trip_per_queue_and_refuse_out_of_range() {
+        let mut f = msix_transport_with(TestDevice {
+            queue_sizes: vec![16, 16],
+            ..Default::default()
+        });
+        assert_eq!(f.t.msix_table_size(), 3, "two queues plus config");
+
+        // Untouched, both read NO_VECTOR.
+        let no_vector = u64::from(VIRTIO_MSI_NO_VECTOR);
+        assert_eq!(read(&mut f.t, common::CONFIG_MSIX_VECTOR, 2), no_vector);
+        assert_eq!(read(&mut f.t, common::QUEUE_MSIX_VECTOR, 2), no_vector);
+
+        write(&mut f.t, common::CONFIG_MSIX_VECTOR, 2, 0);
+        write(&mut f.t, common::QUEUE_SELECT, 2, 0);
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 2, 1);
+        write(&mut f.t, common::QUEUE_SELECT, 2, 1);
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 2, 2);
+
+        assert_eq!(read(&mut f.t, common::CONFIG_MSIX_VECTOR, 2), 0);
+        assert_eq!(read(&mut f.t, common::QUEUE_MSIX_VECTOR, 2), 2);
+        write(&mut f.t, common::QUEUE_SELECT, 2, 0);
+        assert_eq!(read(&mut f.t, common::QUEUE_MSIX_VECTOR, 2), 1);
+
+        // Vector 3 does not exist in a three-entry table.
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 2, 3);
+        assert_eq!(read(&mut f.t, common::QUEUE_MSIX_VECTOR, 2), no_vector);
+        // NO_VECTOR is a legal write: "stop interrupting me for this source".
+        write(&mut f.t, common::CONFIG_MSIX_VECTOR, 2, no_vector);
+        assert_eq!(read(&mut f.t, common::CONFIG_MSIX_VECTOR, 2), no_vector);
+
+        // A selector naming no queue reads NO_VECTOR and swallows the write, the
+        // same answer queue_size gives for a queue that does not exist.
+        write(&mut f.t, common::QUEUE_SELECT, 2, 99);
+        assert_eq!(read(&mut f.t, common::QUEUE_MSIX_VECTOR, 2), no_vector);
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 2, 1);
+        write(&mut f.t, common::QUEUE_SELECT, 2, 1);
+        assert_eq!(
+            read(&mut f.t, common::QUEUE_MSIX_VECTOR, 2),
+            2,
+            "undisturbed"
+        );
+
+        // Only a 2-byte access is a vector register.
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 1, 0);
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 4, 0);
+        assert_eq!(read(&mut f.t, common::QUEUE_MSIX_VECTOR, 2), 2);
+    }
+
+    /// Without the capability the registers stay hard-wired to NO_VECTOR, which
+    /// is what the spec requires of a device that has no MSI-X, and the table and
+    /// PBA regions are simply unclaimed BAR space.
+    #[test]
+    fn an_intx_only_function_has_no_vectors_table_or_pba() {
+        let (mut t, _, _) = transport();
+        assert_eq!(t.msix_table_size(), 0);
+        assert!(t.msix().is_none());
+        assert!(t.msix_control_handle().is_none());
+        assert!(!t.msix_enabled());
+        t.msix_control_changed(); // a no-op, not a panic
+
+        write(&mut t, common::CONFIG_MSIX_VECTOR, 2, 0);
+        write(&mut t, common::QUEUE_MSIX_VECTOR, 2, 0);
+        let no_vector = u64::from(VIRTIO_MSI_NO_VECTOR);
+        assert_eq!(read(&mut t, common::CONFIG_MSIX_VECTOR, 2), no_vector);
+        assert_eq!(read(&mut t, common::QUEUE_MSIX_VECTOR, 2), no_vector);
+
+        for offset in [MSIX_TABLE_OFFSET, MSIX_PBA_OFFSET] {
+            let mut data = [0xffu8; 8];
+            t.write_bar(offset, &0xdead_beefu32.to_le_bytes());
+            t.read_bar(offset, &mut data);
+            assert_eq!(data, [0u8; 8], "region at {offset:#x} must be inert");
+        }
+    }
+
+    /// The table is programmed through the BAR — an ioremapped MMIO region, which
+    /// is exactly how Linux's `msix_map_region` reaches it — and reads back
+    /// verbatim.
+    #[test]
+    fn the_table_is_written_and_read_back_through_the_bar() {
+        let mut f = msix_transport();
+        program_vector(&mut f.t, 1, 0x0000_0001_fee0_2000, 0x4021);
+
+        assert_eq!(read(&mut f.t, table_at(1, 0), 4), 0xfee0_2000);
+        assert_eq!(read(&mut f.t, table_at(1, 1), 4), 1);
+        assert_eq!(read(&mut f.t, table_at(1, 2), 4), 0x4021);
+        assert_eq!(read(&mut f.t, table_at(1, 3), 4), 0, "unmasked");
+        // Entry 0 was untouched and is still in its reset state: masked.
+        assert_eq!(read(&mut f.t, table_at(0, 3), 4), 1);
+        assert_eq!(read(&mut f.t, table_at(0, 0), 4), 0);
+        // Sub-dword reads slice the entry, as any MMIO read may.
+        assert_eq!(read(&mut f.t, table_at(1, 0) + 1, 2), 0xe020);
+    }
+
+    /// The whole point: a device signal becomes one MSI message carrying the
+    /// address and data *the guest* programmed, and the INTx line stays quiet.
+    #[test]
+    fn a_used_buffer_signal_becomes_the_msi_the_driver_asked_for() {
+        let mut f = msix_transport();
+        let ring = SplitRing::layout(0x1000, 16);
+        bring_up(&mut f.t, &ring);
+        program_vector(&mut f.t, 1, 0xfee0_2000, 0x4021);
+        write(&mut f.t, common::QUEUE_SELECT, 2, 0);
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 2, 1);
+        set_msix_control(&f.t, MSIX_CTRL_ENABLE);
+        assert!(f.t.msix_enabled());
+
+        assert!(f.t.state.interrupt().signal_used_queue(0).is_ok());
+        assert_eq!(
+            f.sink.sent(),
+            vec![crate::MsiMessage {
+                address: 0xfee0_2000,
+                data: 0x4021
+            }]
+        );
+        assert_eq!(f.line.count(), 0, "INTx must not be raised under MSI-X");
+        // The ISR is unused under MSI-X (spec 4.1.4.5), so it reads 0 rather than
+        // a bit no driver will ever acknowledge.
+        assert_eq!(read(&mut f.t, ISR_CFG_OFFSET, 1), 0);
+        assert_eq!(f.t.interrupt_status(), 0);
+    }
+
+    /// The same function on INTx: with the capability present but disabled, every
+    /// signal takes the line and sets the ISR. This is the state Linux's probe
+    /// starts in, and where `pci_free_irq_vectors` puts it back.
+    #[test]
+    fn with_msix_disabled_the_same_function_still_uses_intx() {
+        let mut f = msix_transport();
+        let ring = SplitRing::layout(0x1000, 16);
+        bring_up(&mut f.t, &ring);
+        program_vector(&mut f.t, 1, 0xfee0_2000, 0x4021);
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 2, 1);
+
+        assert!(f.t.state.interrupt().signal_used_queue(0).is_ok());
+        assert_eq!(f.sink.count(), 0);
+        assert_eq!(f.line.count(), 1);
+        assert_eq!(read(&mut f.t, ISR_CFG_OFFSET, 1), u64::from(ISR_QUEUE));
+
+        // …and enabling MSI-X moves the next signal across without the device
+        // being told anything.
+        set_msix_control(&f.t, MSIX_CTRL_ENABLE);
+        assert!(f.t.state.interrupt().signal_used_queue(0).is_ok());
+        assert_eq!(f.sink.count(), 1);
+        assert_eq!(f.line.count(), 1);
+    }
+
+    /// A masked vector records its request in the PBA, the guest can read it, and
+    /// clearing the mask through the table delivers it.
+    #[test]
+    fn masking_through_the_table_moves_interrupts_into_the_pba() {
+        let mut f = msix_transport();
+        let ring = SplitRing::layout(0x1000, 16);
+        bring_up(&mut f.t, &ring);
+        program_vector(&mut f.t, 1, 0xfee0_2000, 0x4021);
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 2, 1);
+        set_msix_control(&f.t, MSIX_CTRL_ENABLE);
+        // `pci_msix_mask_irq`: set bit 0 of vector_control.
+        write(&mut f.t, table_at(1, 3), 4, 1);
+
+        assert!(f.t.state.interrupt().signal_used_queue(0).is_ok());
+        assert_eq!(f.sink.count(), 0);
+        assert_eq!(read(&mut f.t, MSIX_PBA_OFFSET, 8), 1 << 1);
+
+        write(&mut f.t, table_at(1, 3), 4, 0);
+        assert_eq!(f.sink.count(), 1, "unmasking delivered the pending vector");
+        assert_eq!(read(&mut f.t, MSIX_PBA_OFFSET, 8), 0);
+    }
+
+    /// The function mask is a *configuration space* bit, so the machine tells the
+    /// transport when it changed; clearing it drains the PBA.
+    #[test]
+    fn the_function_mask_is_honoured_and_drained_from_config_space() {
+        let mut f = msix_transport();
+        let ring = SplitRing::layout(0x1000, 16);
+        bring_up(&mut f.t, &ring);
+        program_vector(&mut f.t, 1, 0xfee0_2000, 0x4021);
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 2, 1);
+        set_msix_control(&f.t, MSIX_CTRL_ENABLE | MSIX_CTRL_FUNCTION_MASK);
+
+        assert!(f.t.state.interrupt().signal_used_queue(0).is_ok());
+        assert_eq!(f.sink.count(), 0);
+        assert_eq!(read(&mut f.t, MSIX_PBA_OFFSET, 8), 1 << 1);
+
+        set_msix_control(&f.t, MSIX_CTRL_ENABLE);
+        assert_eq!(f.sink.count(), 1);
+        assert_eq!(read(&mut f.t, MSIX_PBA_OFFSET, 8), 0);
+    }
+
+    /// A device reset drops the vector assignments (a driver re-programs them on
+    /// the next bring-up) and empties the PBA, but the table entries and the
+    /// enable bit are PCI function state and survive.
+    #[test]
+    fn a_device_reset_clears_the_vector_registers_but_not_the_table() {
+        let mut f = msix_transport();
+        let ring = SplitRing::layout(0x1000, 16);
+        bring_up(&mut f.t, &ring);
+        program_vector(&mut f.t, 1, 0xfee0_2000, 0x4021);
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 2, 1);
+        write(&mut f.t, common::CONFIG_MSIX_VECTOR, 2, 0);
+        set_msix_control(&f.t, MSIX_CTRL_ENABLE);
+
+        write(&mut f.t, common::DEVICE_STATUS, 1, 0);
+        let no_vector = u64::from(VIRTIO_MSI_NO_VECTOR);
+        write(&mut f.t, common::QUEUE_SELECT, 2, 0);
+        assert_eq!(read(&mut f.t, common::QUEUE_MSIX_VECTOR, 2), no_vector);
+        assert_eq!(read(&mut f.t, common::CONFIG_MSIX_VECTOR, 2), no_vector);
+        assert_eq!(read(&mut f.t, table_at(1, 2), 4), 0x4021);
+        assert!(f.t.msix_enabled());
+
+        // And a fresh bring-up works, with new vectors.
+        bring_up(&mut f.t, &ring);
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 2, 1);
+        assert!(f.t.state.interrupt().signal_used_queue(0).is_ok());
+        assert_eq!(f.sink.count(), 1);
+        assert!(
+            notified(&f.log).is_empty(),
+            "no queue was kicked in this test"
+        );
+    }
+
+    /// Malicious table and PBA traffic: out-of-range offsets, odd widths, and
+    /// writes to the read-only pending bits.
+    #[test]
+    fn table_and_pba_writes_from_a_hostile_guest_are_bounded() {
+        let mut f = msix_transport();
+        let ring = SplitRing::layout(0x1000, 16);
+        bring_up(&mut f.t, &ring);
+        program_vector(&mut f.t, 1, 0xfee0_2000, 0x4021);
+        write(&mut f.t, common::QUEUE_MSIX_VECTOR, 2, 1);
+        set_msix_control(&f.t, MSIX_CTRL_ENABLE | MSIX_CTRL_FUNCTION_MASK);
+        assert!(f.t.state.interrupt().signal_used_queue(0).is_ok());
+
+        // Writes beyond the last entry, and to the last dword of the region,
+        // change nothing (the table has three entries).
+        for offset in [
+            MSIX_TABLE_OFFSET + 3 * MSIX_ENTRY_SIZE,
+            MSIX_TABLE_OFFSET + MSIX_TABLE_LEN - 4,
+        ] {
+            write(&mut f.t, offset, 4, 0xffff_ffff);
+        }
+        // Misaligned and odd-width writes are dropped whole.
+        write(&mut f.t, table_at(1, 0) + 1, 4, 0xffff_ffff);
+        write(&mut f.t, table_at(1, 0), 1, 0xff);
+        write(&mut f.t, table_at(1, 2), 2, 0xffff);
+        assert_eq!(read(&mut f.t, table_at(1, 0), 4), 0xfee0_2000);
+        assert_eq!(read(&mut f.t, table_at(1, 2), 4), 0x4021);
+
+        // The PBA is read-only: the pending bit cannot be forged or cleared.
+        write(&mut f.t, MSIX_PBA_OFFSET, 8, 0);
+        write(&mut f.t, MSIX_PBA_OFFSET, 4, 0xffff_ffff);
+        write(&mut f.t, MSIX_PBA_OFFSET + 4, 4, 0xffff_ffff);
+        assert_eq!(read(&mut f.t, MSIX_PBA_OFFSET, 8), 1 << 1);
+        assert_eq!(
+            f.sink.count(),
+            0,
+            "and nothing was delivered by a PBA write"
+        );
+
+        // Nothing above disturbed the device.
+        assert!(f.t.is_activated());
+        assert_eq!(f.t.status() & status::DEVICE_NEEDS_RESET, 0);
+    }
+
+    /// A device with more queues than the table region can hold vectors for is a
+    /// host bug and is refused rather than published with a table too small for
+    /// its own queues.
+    #[test]
+    fn a_device_with_more_queues_than_msix_vectors_is_refused() {
+        let device = TestDevice {
+            queue_sizes: vec![16; usize::from(MAX_MSIX_VECTORS)],
+            ..Default::default()
+        };
+        let line = Arc::new(TestIrqLine::default());
+        let sink = Arc::new(TestMsiSink::default());
+        let mem = Arc::new(testing::guest_memory(0x1000));
+        assert!(matches!(
+            PciTransport::with_msix(0, Box::new(device), mem, line, sink),
+            Err(TransportError::TooManyQueuesForMsix { .. })
+        ));
     }
 
     /// A read whose width runs off the end of a region must not pull bytes out

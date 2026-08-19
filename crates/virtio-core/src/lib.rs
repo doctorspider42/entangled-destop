@@ -18,9 +18,12 @@
 //!                                       TransportState  ->  VirtioDevice
 //!                                (features/status/queues)   (queues, config)
 //!                                            |                   |
-//!                                       LineInterrupt  <----------+
-//!                                            |            signal_used_queue
-//!                                         IrqLine (irqfd on Linux)
+//!                                    TransportInterrupt <---------+
+//!                                     /            \      signal_used_queue
+//!                          LineInterrupt         MsixInterrupt
+//!                                |                /        \
+//!                     IrqLine (irqfd)      IrqLine      MsiSink
+//!                                          (INTx fallback)  (KVM_SIGNAL_MSI)
 //! ```
 //!
 //! [`TransportState`] is the single copy of the parts both transports share:
@@ -36,6 +39,7 @@ pub mod chain;
 pub mod device;
 pub mod interrupt;
 pub mod mmio;
+pub mod msix;
 pub mod pci;
 pub mod queue;
 pub mod state;
@@ -47,7 +51,10 @@ pub mod testing;
 
 pub use chain::{ChainError, ChainWalkGuard, Segment, MAX_DESC_CHAIN_LEN};
 pub use device::{DeviceError, DeviceResources, DeviceType, VirtioDevice};
-pub use interrupt::{Interrupt, InterruptError, IrqLine, LineInterrupt};
+pub use interrupt::{
+    Interrupt, InterruptError, IrqLine, LineInterrupt, MsiMessage, MsiSink, TransportInterrupt,
+};
+pub use msix::{MsixInterrupt, MAX_MSIX_VECTORS};
 pub use pci::{PciTransport, VIRTIO_PCI_BAR_SIZE};
 pub use queue::{QueueConfig, QueueError};
 pub use state::TransportState;
