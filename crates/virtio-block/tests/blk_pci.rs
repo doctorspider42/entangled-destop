@@ -29,8 +29,9 @@ use std::sync::Arc;
 
 use virtio_block::{BlockDevice, SECTOR_SIZE, S_IOERR, S_OK, S_UNSUPP};
 use virtio_core::chain::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+use virtio_core::msix;
 use virtio_core::pci::{self, common};
-use virtio_core::testing::{guest_memory, SplitRing, TestIrqLine};
+use virtio_core::testing::{guest_memory, SplitRing, TestIrqLine, TestMsiSink};
 use virtio_core::{status, GuestMem, PciTransport, VIRTIO_F_VERSION_1};
 use vm_memory::{Bytes, GuestAddress};
 
@@ -45,6 +46,12 @@ const DISK_SECTORS: u64 = 32;
 const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
+
+/// The MSI-X message a guest on x86 programs: the local APIC's default physical
+/// address, and a data word whose low byte is the interrupt vector.
+const MSI_ADDRESS: u64 = 0xfee0_0000;
+const MSI_DATA_CONFIG: u32 = 0x4030;
+const MSI_DATA_QUEUE: u32 = 0x4031;
 
 static NEXT_IMAGE: AtomicUsize = AtomicUsize::new(0);
 
@@ -69,6 +76,9 @@ struct Harness {
     ring: SplitRing,
     transport: PciTransport,
     irq: Arc<TestIrqLine>,
+    /// The host MSI mechanism, for a function that publishes MSI-X. `None` for an
+    /// INTx-only one, which is what most tests here use.
+    sink: Option<Arc<TestMsiSink>>,
     path: PathBuf,
 }
 
@@ -77,6 +87,36 @@ impl Harness {
         let path = temp_image(DISK_SECTORS);
         let device = BlockDevice::open(&path, writable).expect("open image");
         Self::around(device, path)
+    }
+
+    /// The same device on a function that publishes MSI-X, brought up with one
+    /// vector for the request queue and one for configuration changes — which is
+    /// exactly what Linux's `vp_find_vqs_msix` asks for.
+    fn new_msix(writable: bool) -> Self {
+        let path = temp_image(DISK_SECTORS);
+        let device = BlockDevice::open(&path, writable).expect("open image");
+        let mem = Arc::new(guest_memory(MEM_SIZE));
+        let irq = Arc::new(TestIrqLine::default());
+        let sink = Arc::new(TestMsiSink::default());
+        let transport = PciTransport::with_msix(
+            0,
+            Box::new(device),
+            Arc::clone(&mem),
+            irq.clone(),
+            sink.clone(),
+        )
+        .expect("transport accepts the device");
+        let mut harness = Harness {
+            mem,
+            ring: SplitRing::layout(RING_BASE, RING_SIZE),
+            transport,
+            irq,
+            sink: Some(sink),
+            path,
+        };
+        harness.bring_up();
+        harness.enable_msix();
+        harness
     }
 
     fn around(device: BlockDevice, path: PathBuf) -> Self {
@@ -89,10 +129,73 @@ impl Harness {
             ring: SplitRing::layout(RING_BASE, RING_SIZE),
             transport,
             irq,
+            sink: None,
             path,
         };
         harness.bring_up();
         harness
+    }
+
+    // ---------------------------------------------------------------- MSI-X
+
+    /// BAR offset of table entry `vector`'s dword `dword`.
+    fn table_at(vector: u64, dword: u64) -> u64 {
+        pci::MSIX_TABLE_OFFSET + vector * msix::MSIX_ENTRY_SIZE + dword * 4
+    }
+
+    /// Programs one table entry through the BAR and leaves it unmasked, the way a
+    /// driver's four `writel`s into the ioremapped table do.
+    fn program_vector(&mut self, vector: u64, address: u64, data: u32) {
+        self.write(Self::table_at(vector, 0), 4, address & 0xffff_ffff);
+        self.write(Self::table_at(vector, 1), 4, address >> 32);
+        self.write(Self::table_at(vector, 2), 4, u64::from(data));
+        self.write(Self::table_at(vector, 3), 4, 0);
+    }
+
+    /// Masks or unmasks one vector, as `pci_msix_mask_irq` does.
+    fn set_vector_mask(&mut self, vector: u64, masked: bool) {
+        self.write(Self::table_at(vector, 3), 4, u64::from(masked));
+    }
+
+    /// What the machine's configuration space does when the guest writes the
+    /// MSI-X message control register: publish the dword, then tell the transport
+    /// it changed (`VirtioPciBus::io_write`).
+    fn write_msix_control(&mut self, control: u16) {
+        let handle = self
+            .transport
+            .msix_control_handle()
+            .expect("this function publishes MSI-X");
+        handle.store(
+            u32::from(control) << (msix::MSIX_CONTROL_OFFSET as u32 * 8),
+            Ordering::Release,
+        );
+        self.transport.msix_control_changed();
+    }
+
+    /// Assigns vector 0 to configuration changes and vector 1 to the request
+    /// queue, programs both, and enables MSI-X.
+    fn enable_msix(&mut self) {
+        assert_eq!(self.transport.msix_table_size(), 2, "one queue plus config");
+        self.program_vector(0, MSI_ADDRESS, MSI_DATA_CONFIG);
+        self.program_vector(1, MSI_ADDRESS, MSI_DATA_QUEUE);
+        self.write(common::CONFIG_MSIX_VECTOR, 2, 0);
+        self.write(common::QUEUE_SELECT, 2, 0);
+        self.write(common::QUEUE_MSIX_VECTOR, 2, 1);
+        assert_eq!(self.read(common::CONFIG_MSIX_VECTOR, 2), 0);
+        assert_eq!(self.read(common::QUEUE_MSIX_VECTOR, 2), 1);
+        self.write_msix_control(msix::MSIX_CTRL_ENABLE);
+        assert!(self.transport.msix_enabled());
+    }
+
+    /// Messages delivered so far, by their `data` field — which is what tells a
+    /// driver which vector fired.
+    fn msi_data(&self) -> Vec<u32> {
+        self.sink.as_ref().map(|s| s.data()).unwrap_or_default()
+    }
+
+    /// The pending-bit array as the guest reads it.
+    fn pba(&mut self) -> u64 {
+        self.read(pci::MSIX_PBA_OFFSET, 8)
     }
 
     // ------------------------------------------------------------ registers
@@ -760,4 +863,225 @@ fn out_of_bounds_and_odd_width_register_accesses_are_inert() {
     // And after all of that the device still serves a real request.
     let (status, _) = h.read_sectors(0, 512);
     assert_eq!(status, S_OK);
+}
+
+// ============================================================== MSI-X (EPIC 19)
+//
+// The same untouched `BlockDevice`, on a function that publishes MSI-X. If these
+// round trips match the INTx ones above, then the interrupt mechanism really is
+// the only thing that changed — which is the same claim the two transports make
+// about each other, one level down.
+
+/// The end-to-end claim: a real disk read completes, and the completion arrives
+/// as the **MSI the driver programmed** rather than as an INTx edge.
+#[test]
+fn a_read_over_msix_completes_and_delivers_the_queues_own_vector() {
+    let mut h = Harness::new_msix(true);
+    let payload: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(h.write_sectors(1, &payload), S_OK);
+    let before = h.msi_data().len();
+
+    let (status, data) = h.read_sectors(1, 512);
+    assert_eq!(status, S_OK);
+    assert_eq!(data, payload, "the data must be the data");
+
+    // Exactly one message, on the request queue's vector and nowhere else.
+    assert_eq!(
+        &h.msi_data()[before..],
+        &[MSI_DATA_QUEUE],
+        "the completion must arrive on the queue vector, not the config one"
+    );
+    assert_eq!(
+        h.sink
+            .as_ref()
+            .expect("msix harness")
+            .sent()
+            .last()
+            .copied(),
+        Some(virtio_core::MsiMessage {
+            address: MSI_ADDRESS,
+            data: MSI_DATA_QUEUE
+        })
+    );
+    // No INTx edge, and the ISR is unused under MSI-X (spec 4.1.4.5) — a driver
+    // that read it would find nothing to acknowledge, which is correct.
+    assert_eq!(h.irq.count(), 0, "INTx must stay silent while MSI-X is on");
+    assert_eq!(h.take_isr(), 0);
+    assert_eq!(h.pba(), 0, "nothing was left pending");
+}
+
+/// Several requests in a row: one message each, all on the same vector, and the
+/// device stays live. The INTx equivalent counts edges; this counts messages.
+#[test]
+fn every_completion_is_its_own_message() {
+    let mut h = Harness::new_msix(true);
+    let before = h.msi_data().len();
+    for sector in 0..4u64 {
+        assert_eq!(h.read_sectors(sector, 512).0, S_OK);
+    }
+    assert_eq!(
+        h.msi_data()[before..].to_vec(),
+        vec![MSI_DATA_QUEUE; 4],
+        "one message per completion, all on the queue's vector"
+    );
+    assert_eq!(h.irq.count(), 0);
+}
+
+/// A masked vector must not interrupt, and must not lose the interrupt either:
+/// the request completes, the pending bit records that the device wanted
+/// attention, and unmasking through the table delivers it.
+#[test]
+fn a_masked_vector_holds_the_completion_in_the_pba_until_it_is_unmasked() {
+    let mut h = Harness::new_msix(true);
+    let before = h.msi_data().len();
+    h.set_vector_mask(1, true);
+
+    // The data is available regardless — masking an interrupt does not stop a
+    // device, which is exactly why a driver may poll while masked.
+    let (status, _) = h.read_sectors(0, 512);
+    assert_eq!(status, S_OK);
+    assert_eq!(h.msi_data().len(), before, "no message while masked");
+    assert_eq!(h.pba(), 1 << 1, "the pending bit names the masked vector");
+
+    h.set_vector_mask(1, false);
+    assert_eq!(&h.msi_data()[before..], &[MSI_DATA_QUEUE]);
+    assert_eq!(h.pba(), 0);
+    assert_eq!(h.irq.count(), 0, "and never as an INTx edge");
+}
+
+/// The function mask is a configuration-space bit rather than a table one, so it
+/// takes the other route into the transport — and coalesces: MSI-X has one
+/// pending bit per vector, not a counter, so several completions under the mask
+/// release as one message.
+#[test]
+fn the_function_mask_coalesces_pending_completions_into_one_message() {
+    let mut h = Harness::new_msix(true);
+    let before = h.msi_data().len();
+    h.write_msix_control(msix::MSIX_CTRL_ENABLE | msix::MSIX_CTRL_FUNCTION_MASK);
+
+    for sector in 0..3u64 {
+        assert_eq!(h.read_sectors(sector, 512).0, S_OK);
+    }
+    assert_eq!(h.msi_data().len(), before);
+    assert_eq!(h.pba(), 1 << 1);
+
+    h.write_msix_control(msix::MSIX_CTRL_ENABLE);
+    assert_eq!(
+        &h.msi_data()[before..],
+        &[MSI_DATA_QUEUE],
+        "one pending bit, one message"
+    );
+    assert_eq!(h.pba(), 0);
+}
+
+/// Disabling MSI-X mid-life must put the function back on INTx, which is what
+/// `pci_free_irq_vectors` does on an unbind — and the device must not notice.
+#[test]
+fn disabling_msix_returns_the_function_to_intx() {
+    let mut h = Harness::new_msix(true);
+    let before = h.msi_data().len();
+    h.write_msix_control(0);
+    assert!(!h.transport.msix_enabled());
+
+    assert_eq!(h.read_sectors(0, 512).0, S_OK);
+    assert_eq!(h.msi_data().len(), before, "no MSI once disabled");
+    assert_eq!(h.irq.count(), 1, "the INTx line carried it instead");
+    assert_eq!(h.take_isr(), 1, "and the ISR says why");
+
+    // Back to MSI-X, without re-programming anything: the table survived.
+    h.write_msix_control(msix::MSIX_CTRL_ENABLE);
+    assert_eq!(h.read_sectors(0, 512).0, S_OK);
+    assert_eq!(&h.msi_data()[before..], &[MSI_DATA_QUEUE]);
+    assert_eq!(h.irq.count(), 1, "no second edge");
+}
+
+/// A driver that assigns no vector to the request queue gets no interrupts, and
+/// that is not a device failure: it is what `VIRTIO_MSI_NO_VECTOR` means. The
+/// request still completes, which is how a polling driver works.
+#[test]
+fn a_queue_with_no_vector_completes_requests_without_interrupting() {
+    let mut h = Harness::new_msix(true);
+    let before = h.msi_data().len();
+    h.write(common::QUEUE_SELECT, 2, 0);
+    h.write(
+        common::QUEUE_MSIX_VECTOR,
+        2,
+        u64::from(pci::VIRTIO_MSI_NO_VECTOR),
+    );
+    assert_eq!(
+        h.read(common::QUEUE_MSIX_VECTOR, 2),
+        u64::from(pci::VIRTIO_MSI_NO_VECTOR)
+    );
+
+    assert_eq!(h.read_sectors(0, 512).0, S_OK);
+    assert_eq!(h.msi_data().len(), before);
+    assert_eq!(h.irq.count(), 0, "and no INTx fallback per source either");
+    assert_eq!(h.pba(), 0, "nothing pending: there is no vector to pend");
+}
+
+/// A hostile driver aiming a vector register outside the table, or writing the
+/// table where there is no entry, may not take the device down — and the register
+/// must report the refusal so the driver knows.
+#[test]
+fn hostile_vector_and_table_traffic_leaves_the_device_serving_requests() {
+    let mut h = Harness::new_msix(true);
+    for vector in [2u64, 3, 0xff, 0xfffe] {
+        h.write(common::QUEUE_SELECT, 2, 0);
+        h.write(common::QUEUE_MSIX_VECTOR, 2, vector);
+        assert_eq!(
+            h.read(common::QUEUE_MSIX_VECTOR, 2),
+            u64::from(pci::VIRTIO_MSI_NO_VECTOR),
+            "vector {vector} does not exist and must read back as refused"
+        );
+        h.write(common::CONFIG_MSIX_VECTOR, 2, vector);
+        assert_eq!(
+            h.read(common::CONFIG_MSIX_VECTOR, 2),
+            u64::from(pci::VIRTIO_MSI_NO_VECTOR)
+        );
+    }
+    // Table and PBA traffic at every offset and width, in and out of range.
+    for offset in (pci::MSIX_TABLE_OFFSET..pci::MSIX_PBA_OFFSET + pci::MSIX_PBA_LEN).step_by(0x1ff)
+    {
+        for len in [1usize, 2, 4, 8] {
+            let mut data = vec![0xffu8; len];
+            h.transport.read_bar(offset, &mut data);
+            h.transport.write_bar(offset, &vec![0xffu8; len]);
+        }
+    }
+    assert!(h.transport.is_activated(), "device must still be live");
+
+    // Re-programmed properly, it interrupts again — so none of the above left
+    // the MSI-X state wedged.
+    h.program_vector(1, MSI_ADDRESS, MSI_DATA_QUEUE);
+    h.write(common::QUEUE_SELECT, 2, 0);
+    h.write(common::QUEUE_MSIX_VECTOR, 2, 1);
+    let before = h.msi_data().len();
+    assert_eq!(h.read_sectors(0, 512).0, S_OK);
+    assert_eq!(&h.msi_data()[before..], &[MSI_DATA_QUEUE]);
+}
+
+/// A device reset drops the vector assignments, so a driver that resets and
+/// brings the device up again has to assign them afresh — and can.
+#[test]
+fn a_reset_drops_the_vectors_and_a_second_bring_up_restores_them() {
+    let mut h = Harness::new_msix(true);
+    h.set_status(0);
+    assert!(!h.transport.is_activated());
+    h.write(common::QUEUE_SELECT, 2, 0);
+    assert_eq!(
+        h.read(common::QUEUE_MSIX_VECTOR, 2),
+        u64::from(pci::VIRTIO_MSI_NO_VECTOR),
+        "a reset unassigns every vector"
+    );
+    // The table entry itself is PCI function state and survives the reset.
+    assert_eq!(
+        h.read(Harness::table_at(1, 2), 4),
+        u64::from(MSI_DATA_QUEUE)
+    );
+
+    h.bring_up();
+    h.enable_msix();
+    let before = h.msi_data().len();
+    assert_eq!(h.read_sectors(0, 512).0, S_OK);
+    assert_eq!(&h.msi_data()[before..], &[MSI_DATA_QUEUE]);
 }

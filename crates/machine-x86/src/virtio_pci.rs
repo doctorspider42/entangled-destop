@@ -997,6 +997,81 @@ mod tests {
         );
     }
 
+    /// **Every** region of the BAR follows the guest when it moves the BAR —
+    /// including the two MSI-X ones — and nothing is left decoding at the old
+    /// address.
+    ///
+    /// EDK2's `PciBusDxe` reassigns every BAR during resource allocation, so this
+    /// is not a hypothetical. The queue-notification area needs host help to
+    /// follow (its ioeventfds are registered at absolute addresses:
+    /// `DeviceNotifier::rebase`, driven by `reconcile_notify` from the same
+    /// `bar_window_of` this test reads). The MSI-X table and PBA need none — they
+    /// are decoded through `locate_mmio` on every access — and this test is what
+    /// says so rather than leaving it to be assumed.
+    #[test]
+    fn every_bar_region_including_msix_follows_a_guest_bar_move() {
+        let device = IdentityOnly(virtio_core::DeviceType::Block);
+        let (config, _) = config_space_of(&device, Some(2));
+        let mut root = PciRoot::new();
+        assert_eq!(root.attach(config, 0), Ok(1));
+
+        let select = |root: &mut PciRoot, register: u8| {
+            let address = 0x8000_0000u32 | (1 << 11) | u32::from(register & 0xfc);
+            let _ = root.io_write(pci::CONFIG_ADDRESS_PORT, &address.to_le_bytes());
+        };
+        let write32 = |root: &mut PciRoot, register: u8, value: u32| {
+            select(root, register);
+            let _ = root.io_write(pci::CONFIG_DATA_PORT, &value.to_le_bytes());
+        };
+
+        write32(
+            &mut root,
+            pci::reg::COMMAND,
+            u32::from(crate::pci::command::MEMORY_SPACE),
+        );
+        let regions = [
+            ("common cfg", vpci::COMMON_CFG_OFFSET),
+            ("notify", vpci::NOTIFY_CFG_OFFSET),
+            ("device cfg", vpci::DEVICE_CFG_OFFSET),
+            ("msix table", vpci::MSIX_TABLE_OFFSET),
+            ("msix pba", vpci::MSIX_PBA_OFFSET),
+            ("last byte", vpci::VIRTIO_PCI_BAR_SIZE - 1),
+        ];
+
+        // Somewhere else in the aperture — the reverse-order slot `PciBusDxe`
+        // would hand out.
+        let moved = layout::pci_bar_slot(layout::PCI_MMIO_SLOTS - 1);
+        for (from, to) in [(layout::pci_bar_slot(0), moved), (moved, moved)] {
+            if from != to {
+                write32(
+                    &mut root,
+                    pci::reg::BAR0,
+                    u32::try_from(to).expect("the aperture is below 4 GiB"),
+                );
+            }
+            for (name, offset) in regions {
+                assert_eq!(
+                    root.locate_mmio(to + offset),
+                    Some((0, vpci::VIRTIO_PCI_BAR_INDEX, offset)),
+                    "{name} must decode at the BAR's current base"
+                );
+            }
+            if from != to {
+                assert_eq!(
+                    root.locate_mmio(from + vpci::MSIX_TABLE_OFFSET),
+                    None,
+                    "the MSI-X table must not still answer at the old base"
+                );
+            }
+        }
+        // And the notify base the bus would rebase the ioeventfds to is derived
+        // from the same window, so the two cannot drift apart.
+        assert_eq!(
+            root.bar_window_of(0, vpci::VIRTIO_PCI_BAR_INDEX),
+            Some((moved, vpci::VIRTIO_PCI_BAR_SIZE))
+        );
+    }
+
     #[test]
     fn interrupt_mode_parsing_accepts_the_documented_spellings() {
         for on in ["1", "on", "ON", " msix ", "yes"] {
