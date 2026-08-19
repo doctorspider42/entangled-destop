@@ -1,0 +1,91 @@
+name: Release
+
+# Every push to main becomes a GitHub Release carrying the Windows installer.
+# The version is MAJOR.MINOR from [workspace.package] in Cargo.toml with the
+# workflow run number as PATCH (e.g. 0.2.137) — monotonically increasing, so
+# the manager's update check can compare it against the running build.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+# One release at a time: overlapping pushes to main queue up instead of racing
+# each other's tag creation and asset upload. Runs are not cancelled — every
+# push still gets its release, in order.
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned Inno Setup 7 (the .iss is written for it). Bump deliberately.
+  INNO_SETUP_URL: https://files.jrsoftware.org/is/7/innosetup-7.1.0.exe
+
+jobs:
+  windows-installer:
+    name: Windows installer + GitHub Release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compute the release version
+        id: version
+        shell: pwsh
+        run: |
+          # MAJOR.MINOR come from the workspace version; PATCH is the run
+          # number, so every push to main yields a strictly newer release.
+          $m = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(\d+)\.(\d+)\.\d+"')[0]
+          if (-not $m) { throw "workspace version not found in Cargo.toml" }
+          $version = "{0}.{1}.{2}" -f $m.Matches[0].Groups[1].Value,
+                                      $m.Matches[0].Groups[2].Value,
+                                      "${{ github.run_number }}"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "release version: $version"
+
+      - name: Build release binaries
+        env:
+          # build.rs stamps this into both binaries: --version output, the
+          # manager's window title and its update check all report it.
+          ENTANGLED_VERSION: ${{ steps.version.outputs.version }}
+        run: cargo build --release -p entangled -p entangled-manager
+
+      - name: Install Inno Setup 7 (pinned)
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'innosetup-installer.exe'
+          Invoke-WebRequest -Uri $env:INNO_SETUP_URL -OutFile $exe
+          Start-Process -Wait -FilePath $exe -ArgumentList `
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/ALLUSERS'
+          $iscc = "$env:ProgramFiles\Inno Setup 7\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC not found at $iscc" }
+
+      - name: Compile the installer
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Inno Setup 7\ISCC.exe" `
+            "/DAppVersion=${{ steps.version.outputs.version }}" `
+            "/DBinDir=$PWD\target\release" `
+            installer\entangled.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+      - name: Publish the GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          # A real release marked latest (not draft, not prerelease): the
+          # manager's update check reads /releases/latest.
+          gh release create "v$v" `
+            --title "Entangled Desktop v$v" `
+            --generate-notes `
+            --latest `
+            "installer/Output/entangled-desktop-$v-setup.exe"
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
