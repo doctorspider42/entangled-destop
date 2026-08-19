@@ -1,21 +1,34 @@
-//! Host-side `QUEUE_NOTIFY` offload for virtio-mmio devices (backlog MVP-307).
+//! Host-side queue-notify offload, for both virtio transports (backlog MVP-307,
+//! extended to virtio-pci in EPIC 19).
 //!
-//! A guest kick is a 4-byte write of the queue index to
-//! `slot_base + virtio_core::mmio::QUEUE_NOTIFY`. Served from the MMIO exit path
-//! it costs a `KVM_EXIT_MMIO` round-trip *and* runs the device — disk I/O, TAP
-//! writes, scanout blits — on the vCPU thread, which cannot re-enter the guest
-//! until the device is done.
+//! A guest kick is a write to a transport-defined address. Served from the MMIO
+//! exit path it costs a `KVM_EXIT_MMIO` round-trip *and* runs the device — disk
+//! I/O, TAP writes, scanout blits — on the vCPU thread, which cannot re-enter
+//! the guest until the device is done.
 //!
 //! This module removes both costs:
 //!
 //! * one `EventFd` per (device, queue) is registered with KVM as an
-//!   **ioeventfd** on that address with a 4-byte **datamatch** on the queue
-//!   index, so KVM completes the guest write inside the kernel and signals the
-//!   eventfd instead of exiting to userspace;
+//!   **ioeventfd**, so KVM completes the guest write inside the kernel and
+//!   signals the eventfd instead of exiting to userspace;
 //! * one **worker thread per device** epolls its queue eventfds plus a kill
-//!   eventfd and calls [`MmioTransport::queue_notify`] under the same
-//!   `Arc<Mutex<MmioTransport>>` the vCPUs use for register access, so device
-//!   work runs concurrently with guest execution.
+//!   eventfd and calls [`QueueNotifyTarget::queue_notify`] under the same
+//!   `Arc<Mutex<T>>` the vCPUs use for register access, so device work runs
+//!   concurrently with guest execution.
+//!
+//! # The two addressing schemes
+//!
+//! The transports disagree about *where* a kick lands, and only about that, so
+//! [`NotifyAddressing`] is the whole difference:
+//!
+//! * **virtio-mmio** has one `QUEUE_NOTIFY` register for every queue and the
+//!   queue index is the written value, so all queues share one address and KVM
+//!   is given a 4-byte **datamatch** on the index. A write of any other value
+//!   still exits to userspace, where the transport drops it as an unknown queue.
+//! * **virtio-pci** has a notification *area* with a `notify_off_multiplier`, so
+//!   every queue has its own address and **no datamatch is needed** — which is
+//!   strictly better: a kick of any width (Linux writes 2 bytes, some drivers 4)
+//!   is completed in the kernel, whereas a datamatch is width-sensitive.
 //!
 //! Everything KVM-specific stays here, in the Linux-gated machine layer
 //! (ADR-0002): `virtio-core` only learns *that* a queue is offloaded, through
@@ -45,11 +58,88 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use kvm_ioctls::{IoEventAddress, VmFd};
+use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
 use thiserror::Error;
-use virtio_core::{mmio, MmioTransport};
+use virtio_core::{MmioTransport, PciTransport};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
+
+/// What the offload needs from a transport: how many queues it has, and the two
+/// halves of handing a queue's kicks over to a host primitive.
+///
+/// Implemented for both transports; nothing else in this module knows which one
+/// it is serving.
+pub trait QueueNotifyTarget: Send + 'static {
+    fn num_queues(&self) -> usize;
+    fn offload_queue_notify(&mut self, index: u16) -> bool;
+    fn restore_queue_notify(&mut self, index: u16);
+    fn queue_notify(&mut self, value: u32);
+    /// Transport name, for log records.
+    fn transport_name() -> &'static str;
+}
+
+impl QueueNotifyTarget for MmioTransport {
+    fn num_queues(&self) -> usize {
+        self.num_queues()
+    }
+    fn offload_queue_notify(&mut self, index: u16) -> bool {
+        self.offload_queue_notify(index)
+    }
+    fn restore_queue_notify(&mut self, index: u16) {
+        self.restore_queue_notify(index)
+    }
+    fn queue_notify(&mut self, value: u32) {
+        self.queue_notify(value)
+    }
+    fn transport_name() -> &'static str {
+        "virtio-mmio"
+    }
+}
+
+impl QueueNotifyTarget for PciTransport {
+    fn num_queues(&self) -> usize {
+        self.num_queues()
+    }
+    fn offload_queue_notify(&mut self, index: u16) -> bool {
+        self.offload_queue_notify(index)
+    }
+    fn restore_queue_notify(&mut self, index: u16) {
+        self.restore_queue_notify(index)
+    }
+    fn queue_notify(&mut self, value: u32) {
+        self.queue_notify(value)
+    }
+    fn transport_name() -> &'static str {
+        "virtio-pci"
+    }
+}
+
+/// Where a transport's queue kicks land in the guest's address space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyAddressing {
+    /// Every queue kicks the same address and identifies itself by the value it
+    /// writes: KVM matches on the queue index (virtio-mmio's `QUEUE_NOTIFY`).
+    SharedWithDatamatch { addr: u64 },
+    /// Queue *n* kicks `base + n * stride`, so the address alone identifies it
+    /// and no datamatch is required (virtio-pci's notification area).
+    PerQueue { base: u64, stride: u64 },
+}
+
+impl NotifyAddressing {
+    /// Guest physical address queue `index` is kicked at.
+    fn addr_of(self, index: u16) -> u64 {
+        match self {
+            Self::SharedWithDatamatch { addr } => addr,
+            Self::PerQueue { base, stride } => {
+                base.saturating_add(u64::from(index).saturating_mul(stride))
+            }
+        }
+    }
+
+    fn is_datamatched(self) -> bool {
+        matches!(self, Self::SharedWithDatamatch { .. })
+    }
+}
 
 /// Upper bound on queues we will offload per device.
 ///
@@ -148,9 +238,14 @@ struct QueueEvent {
 
 /// The host side of one device's offloaded queue notifications: the eventfds,
 /// their KVM registrations and the worker thread draining them.
-pub struct DeviceNotifier {
+///
+/// Generic over the transport so there is one implementation of the offload
+/// rather than one per transport; everything transport-specific is
+/// [`NotifyAddressing`] plus the [`QueueNotifyTarget`] impl.
+pub struct DeviceNotifier<T: QueueNotifyTarget> {
     slot: usize,
     vm: Arc<VmFd>,
+    addressing: NotifyAddressing,
     events: Vec<QueueEvent>,
     kill: EventFd,
     /// `None` before the worker starts and again once it has been joined.
@@ -158,9 +253,12 @@ pub struct DeviceNotifier {
     /// Set by the first [`Self::shutdown`], which makes it idempotent: it is
     /// called explicitly on VM stop and again from `Drop`.
     torn_down: AtomicBool,
+    /// A notifier never stores a `T`; the parameter only selects whose
+    /// `queue_notify` the worker calls.
+    _target: std::marker::PhantomData<fn() -> T>,
 }
 
-impl DeviceNotifier {
+impl<T: QueueNotifyTarget> DeviceNotifier<T> {
     /// Offloads every queue of the device in `slot` whose ioeventfd could be
     /// registered, and starts the worker thread that serves them.
     ///
@@ -172,12 +270,9 @@ impl DeviceNotifier {
     pub fn attach(
         vm: Arc<VmFd>,
         slot: usize,
-        base: u64,
-        transport: &Arc<Mutex<MmioTransport>>,
+        addressing: NotifyAddressing,
+        transport: &Arc<Mutex<T>>,
     ) -> Result<Option<Self>, NotifyError> {
-        let notify_addr = base.saturating_add(mmio::QUEUE_NOTIFY);
-        let addr = IoEventAddress::Mmio(notify_addr);
-
         // The transport lock is held only for the bookkeeping, never across the
         // thread spawn: the worker takes the same lock.
         let queue_count = {
@@ -201,10 +296,12 @@ impl DeviceNotifier {
         let mut notifier = Self {
             slot,
             vm,
+            addressing,
             events: Vec::with_capacity(queue_count),
             kill,
             worker: Mutex::new(None),
             torn_down: AtomicBool::new(false),
+            _target: std::marker::PhantomData,
         };
 
         for index in 0..queue_count {
@@ -221,13 +318,22 @@ impl DeviceNotifier {
                     });
                 }
             };
-            // Datamatch on the queue index makes KVM swallow exactly the kicks
-            // for this queue: a write of any other value still exits to
-            // userspace, where the transport drops it as an unknown queue.
-            if let Err(error) = notifier
-                .vm
-                .register_ioevent(&event, &addr, u32::from(queue))
-            {
+            let notify_addr = addressing.addr_of(queue);
+            let addr = IoEventAddress::Mmio(notify_addr);
+            // With a shared address the datamatch on the queue index makes KVM
+            // swallow exactly this queue's kicks; a write of any other value
+            // still exits to userspace, where the transport drops it as an
+            // unknown queue. With a per-queue address the address itself says
+            // which queue it is, so no datamatch — and therefore no width
+            // sensitivity — is needed.
+            let registered = if addressing.is_datamatched() {
+                notifier
+                    .vm
+                    .register_ioevent(&event, &addr, u32::from(queue))
+            } else {
+                notifier.vm.register_ioevent(&event, &addr, NoDatamatch)
+            };
+            if let Err(error) = registered {
                 tracing::warn!(
                     slot,
                     queue,
@@ -247,9 +353,7 @@ impl DeviceNotifier {
             if !accepted {
                 // Nothing would ever call the device for this queue, so the
                 // registration must go — a swallowed kick would wedge the ring.
-                let _ = notifier
-                    .vm
-                    .unregister_ioevent(&event, &addr, u32::from(queue));
+                Self::deassign(&notifier.vm, addressing, queue, &event, &addr);
                 continue;
             }
             notifier.events.push(QueueEvent {
@@ -274,18 +378,43 @@ impl DeviceNotifier {
             *slot_handle = Some(handle);
         }
         tracing::info!(
+            transport = T::transport_name(),
             slot,
             queues = notifier.events.len(),
-            addr = format_args!("{notify_addr:#x}"),
+            ?addressing,
             "queue notify offloaded to ioeventfds"
         );
         Ok(Some(notifier))
     }
 
+    /// Removes one queue's ioeventfd registration, with the same datamatch it
+    /// was registered with — KVM matches registrations on the whole tuple, so a
+    /// mismatched deassign silently leaves the kernel swallowing kicks.
+    fn deassign(
+        vm: &VmFd,
+        addressing: NotifyAddressing,
+        queue: u16,
+        event: &EventFd,
+        addr: &IoEventAddress,
+    ) {
+        let result = if addressing.is_datamatched() {
+            vm.unregister_ioevent(event, addr, u32::from(queue))
+        } else {
+            vm.unregister_ioevent(event, addr, NoDatamatch)
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                queue,
+                %error,
+                "failed to deassign a queue-notify ioeventfd"
+            );
+        }
+    }
+
     /// Hands every queue this notifier claimed back to the transport's register
     /// path. Used when setting the offload up fails half way: the queues must not
     /// be left believing a worker will serve them.
-    fn restore_transport(&self, transport: &Arc<Mutex<MmioTransport>>) {
+    fn restore_transport(&self, transport: &Arc<Mutex<T>>) {
         if let Ok(mut t) = transport.lock() {
             for queue in &self.events {
                 t.restore_queue_notify(queue.index);
@@ -310,10 +439,7 @@ impl DeviceNotifier {
         }
     }
 
-    fn spawn_worker(
-        &self,
-        transport: Arc<Mutex<MmioTransport>>,
-    ) -> Result<JoinHandle<()>, NotifyError> {
+    fn spawn_worker(&self, transport: Arc<Mutex<T>>) -> Result<JoinHandle<()>, NotifyError> {
         let epoll = Epoll::new().map_err(|source| NotifyError::Epoll {
             slot: self.slot,
             source,
@@ -381,17 +507,13 @@ impl DeviceNotifier {
             }
         }
         for queue in &self.events {
-            if let Err(error) =
-                self.vm
-                    .unregister_ioevent(&queue.event, &queue.addr, u32::from(queue.index))
-            {
-                tracing::warn!(
-                    slot = self.slot,
-                    queue = queue.index,
-                    %error,
-                    "failed to deassign the queue-notify ioeventfd"
-                );
-            }
+            Self::deassign(
+                &self.vm,
+                self.addressing,
+                queue.index,
+                &queue.event,
+                &queue.addr,
+            );
         }
         tracing::debug!(
             slot = self.slot,
@@ -401,7 +523,7 @@ impl DeviceNotifier {
     }
 }
 
-impl Drop for DeviceNotifier {
+impl<T: QueueNotifyTarget> Drop for DeviceNotifier<T> {
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -415,11 +537,11 @@ impl Drop for DeviceNotifier {
 /// that reports a host-level failure makes the transport set
 /// `DEVICE_NEEDS_RESET` — the worker keeps serving the remaining queues either
 /// way, because a stopped worker would silently wedge the VM.
-fn worker_loop(
+fn worker_loop<T: QueueNotifyTarget>(
     slot: usize,
     epoll: Epoll,
     queues: Vec<(u16, EventFd)>,
-    transport: Arc<Mutex<MmioTransport>>,
+    transport: Arc<Mutex<T>>,
 ) {
     // One slot per registered fd (queues + kill) so a single wait drains them.
     let mut ready = vec![EpollEvent::default(); queues.len() + 1];
@@ -459,9 +581,10 @@ fn worker_loop(
             match transport.lock() {
                 Ok(mut t) => t.queue_notify(u32::from(*index)),
                 Err(_) => tracing::error!(
+                    transport = T::transport_name(),
                     slot,
                     queue = index,
-                    "virtio-mmio transport lock is poisoned; dropping queue notification"
+                    "transport lock is poisoned; dropping queue notification"
                 ),
             }
         }

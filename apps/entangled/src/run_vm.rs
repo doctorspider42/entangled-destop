@@ -6,11 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use control_api::{BootMode, VmConfig};
+use control_api::{BootMode, VirtioTransport, VmConfig};
 use machine_x86::boot as x86_boot;
 use machine_x86::bus::MachineBus;
 use machine_x86::serial::SerialConsole;
 use machine_x86::virtio::VirtioMmioBus;
+use machine_x86::virtio_pci::VirtioPciBus;
 use virtio_core::VirtioDevice;
 use vmm_core::{spawn_vcpus, Hypervisor, MachineConfig, RunOutcome, Vm, VmState};
 
@@ -153,17 +154,34 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     // Guest memory is shared with the devices; cloning a `GuestMemoryMmap`
     // shares the underlying regions rather than copying them.
     let mem = Arc::new(vm.memory().clone());
-    // MVP-307: the bus needs a shared VM fd so it can deassign the queue-notify
+    // MVP-307: a bus needs a shared VM fd so it can deassign the queue-notify
     // ioeventfds again when it is dropped, after this borrow of `vm` is gone.
-    let virtio = VirtioMmioBus::attach(vm.fd_shared(), Arc::clone(&mem), devices)
-        .map_err(|e| e.to_string())?;
-    let cmdline = extend_cmdline(&cfg.boot.cmdline, &virtio.cmdline_clauses());
+    //
+    // Exactly one transport is attached (EPIC 19). On mmio the guest is *told*
+    // where its devices are, through `virtio_mmio.device=` clauses; on pci it
+    // enumerates them itself and the command line stays as configured.
+    tracing::info!(transport = %cfg.transport, devices = devices.len(), "attaching virtio devices");
+    let (bus, cmdline) = match cfg.transport {
+        VirtioTransport::Mmio => {
+            let virtio = VirtioMmioBus::attach(vm.fd_shared(), Arc::clone(&mem), devices)
+                .map_err(|e| e.to_string())?;
+            let cmdline = extend_cmdline(&cfg.boot.cmdline, &virtio.cmdline_clauses());
+            (MachineBus::with_virtio(serial, virtio), cmdline)
+        }
+        VirtioTransport::Pci => {
+            let pci = VirtioPciBus::attach(vm.fd_shared(), Arc::clone(&mem), devices)
+                .map_err(|e| e.to_string())?;
+            let cmdline = cfg.boot.cmdline.trim().to_string();
+            (MachineBus::with_virtio_pci(serial, pci), cmdline)
+        }
+    };
+    // A UEFI firmware probes the ACPI PM timer and the RTC before it does
+    // anything else (EPIC 18); a direct-Linux guest must not suddenly find them
+    // where there were none. The PCI configuration ports are the real bus's when
+    // the pci transport is in use, and the firmware stub's otherwise.
     let bus = match cfg.boot.mode {
-        BootMode::DirectLinux => MachineBus::with_virtio(serial, virtio),
-        // A UEFI firmware probes the PCI host bridge and the ACPI PM timer
-        // before it does anything else (EPIC 18); a direct-Linux guest must not
-        // suddenly find a host bridge where there was none.
-        BootMode::Uefi => MachineBus::with_virtio(serial, virtio).with_firmware_platform(),
+        BootMode::DirectLinux => bus,
+        BootMode::Uefi => bus.with_firmware_platform(),
     };
 
     // Boot mode dispatch (EPIC 18 / ADR-0003). Everything above this point —

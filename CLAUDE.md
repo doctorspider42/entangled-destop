@@ -51,10 +51,10 @@ reboot); without it they self-skip with a hint, like the KVM tests without
 | Crate | Owns | Backlog |
 |---|---|---|
 | `crates/vmm-core` | Hypervisor backends (KVM, WHP), guest memory, vCPU lifecycle, VM state machine | EPIC 1/17 |
-| `crates/machine-x86` | x86-64 machine model: memory layout, E820, CPUID, GDT, IRQ chip | EPIC 1/2 |
+| `crates/machine-x86` | x86-64 machine model: memory layout, E820, CPUID, GDT, IRQ chip, PCI root bus | EPIC 1/2/19 |
 | `crates/linux-boot` | Direct bzImage+initramfs boot, boot_params, cmdline | EPIC 2 |
 | `crates/uefi-boot` | UEFI firmware boot: PVH entry, reset-vector ROM placement | EPIC 18 |
-| `crates/virtio-core` | virtio-mmio transport, virtqueues, `VirtioDevice` trait | EPIC 3 |
+| `crates/virtio-core` | virtio-mmio **and** virtio-pci transports, virtqueues, `VirtioDevice` trait | EPIC 3/19 |
 | `crates/virtio-block` | virtio-blk device, RAW file backend | EPIC 4 |
 | `crates/virtio-net` | virtio-net device, TAP backend | EPIC 5 |
 | `crates/virtio-gpu` | virtio-gpu 2D device | EPIC 8 |
@@ -97,7 +97,11 @@ working on that subsystem.
   pointer is valid and which union arm is live (`undocumented_unsafe_blocks` is
   `deny`). FFI-ness alone is not a justification.
 - **Devices are transport-agnostic.** Implement against `VirtioDevice` +
-  queues, not against virtio-mmio specifics — virtio-pci arrives post-MVP.
+  queues, never against a transport's registers. Both virtio-mmio and virtio-pci
+  exist (`transport = "mmio" | "pci"` per VM, default mmio); adding the second
+  one touched no device crate, which is the standard to hold. The half the
+  transports share lives in `virtio_core::state::TransportState` — a transport
+  module is only an address decoder.
 - **No QEMU anywhere** — not as a process, dependency or linked library.
 - Errors are typed (`thiserror`) per crate; logging via `tracing` with the VM
   id in the span.

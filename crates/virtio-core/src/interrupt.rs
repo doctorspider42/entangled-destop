@@ -3,14 +3,23 @@
 //! Two layers, so devices stay transport-agnostic:
 //!
 //! * [`Interrupt`] is what a device sees — "tell the driver queue *n* has used
-//!   buffers" / "tell the driver the config space changed". virtio-pci will
-//!   provide an MSI-X backed implementation of the same trait.
+//!   buffers" / "tell the driver the config space changed". An MSI-X backed
+//!   implementation of the same trait would slot in here without a device
+//!   noticing.
 //! * [`IrqLine`] is the host mechanism that actually raises the line. On Linux
 //!   `machine-x86` implements it with an `EventFd` registered as a KVM irqfd,
 //!   so signalling never round-trips through userspace. Tests use counters.
 //!
-//! [`MmioInterrupt`] glues the two together and owns the shared state the
-//! `INTERRUPT_STATUS` / `INTERRUPT_ACK` / `CONFIG_GENERATION` registers expose.
+//! [`LineInterrupt`] glues the two together and owns the shared state a
+//! single-line (INTx-style) transport exposes: the pending-bit word, its
+//! acknowledge semantics and the config generation counter.
+//!
+//! **Both transports use it unchanged.** virtio-mmio serves the word through
+//! `INTERRUPT_STATUS` (write-to-ack via `INTERRUPT_ACK`), virtio-pci through
+//! the ISR byte in its BAR (read-to-clear); the two bit positions are
+//! identical — `INT_VRING`/[`crate::pci::ISR_QUEUE`] is bit 0 and
+//! `INT_CONFIG`/[`crate::pci::ISR_CONFIG`] is bit 1 (asserted in
+//! `pci::tests::isr_bits_match_the_mmio_interrupt_word`).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -48,13 +57,13 @@ pub trait Interrupt: Send + Sync {
 /// Shared (`Arc`) between the transport — which serves register reads and the
 /// `INTERRUPT_ACK` writes — and the device, which only ever signals. All state
 /// is atomic because the two can sit on different vCPU threads.
-pub struct MmioInterrupt {
+pub struct LineInterrupt {
     status: AtomicU32,
     generation: AtomicU32,
     line: Arc<dyn IrqLine>,
 }
 
-impl MmioInterrupt {
+impl LineInterrupt {
     pub fn new(line: Arc<dyn IrqLine>) -> Self {
         Self {
             status: AtomicU32::new(0),
@@ -85,13 +94,24 @@ impl MmioInterrupt {
         self.status.store(0, Ordering::Release);
     }
 
+    /// Returns the pending bits and clears them in one atomic step.
+    ///
+    /// This is virtio-pci's ISR semantics (spec 1.2 §4.1.4.5: "reading from
+    /// this register resets it to 0"); virtio-mmio uses [`Self::status`] plus
+    /// [`Self::ack`] instead. Atomic because a device thread may set a bit
+    /// between the read and the clear, and that interrupt must not be lost —
+    /// with `swap` it stays pending for the next read instead.
+    pub fn take_status(&self) -> u32 {
+        self.status.swap(0, Ordering::AcqRel)
+    }
+
     fn raise(&self, bit: u32) -> Result<(), InterruptError> {
         self.status.fetch_or(bit, Ordering::AcqRel);
         self.line.trigger()
     }
 }
 
-impl Interrupt for MmioInterrupt {
+impl Interrupt for LineInterrupt {
     fn signal_used_queue(&self, _queue_index: u16) -> Result<(), InterruptError> {
         // virtio-mmio has a single interrupt line shared by all queues; the
         // driver scans every queue after INT_VRING. (virtio-pci with MSI-X
@@ -113,7 +133,7 @@ mod tests {
     #[test]
     fn used_buffer_sets_vring_bit_and_raises_the_line() {
         let line = Arc::new(TestIrqLine::default());
-        let irq = MmioInterrupt::new(line.clone());
+        let irq = LineInterrupt::new(line.clone());
 
         assert_eq!(irq.status(), 0);
         assert!(irq.signal_used_queue(0).is_ok());
@@ -124,7 +144,7 @@ mod tests {
     #[test]
     fn config_change_bumps_the_generation() {
         let line = Arc::new(TestIrqLine::default());
-        let irq = MmioInterrupt::new(line);
+        let irq = LineInterrupt::new(line);
 
         assert_eq!(irq.generation(), 0);
         assert!(irq.signal_config_change().is_ok());
@@ -135,7 +155,7 @@ mod tests {
     #[test]
     fn ack_clears_only_acknowledged_known_bits() {
         let line = Arc::new(TestIrqLine::default());
-        let irq = MmioInterrupt::new(line);
+        let irq = LineInterrupt::new(line);
         assert!(irq.signal_used_queue(0).is_ok());
         assert!(irq.signal_config_change().is_ok());
         assert_eq!(irq.status(), INT_VRING | INT_CONFIG);
@@ -154,7 +174,7 @@ mod tests {
     #[test]
     fn signal_failure_propagates_but_status_stays_set() {
         let line = Arc::new(TestIrqLine::failing());
-        let irq = MmioInterrupt::new(line);
+        let irq = LineInterrupt::new(line);
         assert!(irq.signal_used_queue(0).is_err());
         assert_eq!(irq.status(), INT_VRING);
     }

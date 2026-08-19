@@ -19,7 +19,11 @@
 //! Knobs: `ENTANGLED_BOOT_ITERATIONS=<n>` shortens the run while iterating,
 //! `ENTANGLED_BOOT_DEADLINE_SECS=<n>` shortens the per-boot deadline,
 //! `ENTANGLED_BOOT_DISK=1` attaches a scratch virtio-blk disk (image location
-//! from `ENTANGLED_SCRATCH_DIR`, which must be a native Linux path).
+//! from `ENTANGLED_SCRATCH_DIR`, which must be a native Linux path),
+//! `ENTANGLED_BOOT_TRANSPORT=pci` runs the whole endurance loop over virtio-pci
+//! instead of virtio-mmio (EPIC 19) — which is the point of making the transport
+//! a harness parameter: a leaked irqfd, ioeventfd or worker thread on the newer
+//! bus shows up in exactly the same accounting.
 //!
 //! # The leak half passes; the 100/100 half does not, and that is the finding
 //!
@@ -60,6 +64,7 @@ use boot_tests::{
     boot_artifacts, boot_once, kvm_available, make_raw_disk, open_fds, rss_kib, thread_count,
     BootSpec,
 };
+use control_api::VirtioTransport;
 
 /// EPIC 14's acceptance number.
 const DEFAULT_ITERATIONS: usize = 100;
@@ -94,6 +99,19 @@ fn deadline() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Which transport to boot. Defaults to mmio, so an unqualified run still
+/// measures what this test has always measured.
+fn transport() -> VirtioTransport {
+    match std::env::var("ENTANGLED_BOOT_TRANSPORT").as_deref() {
+        Ok("pci") => VirtioTransport::Pci,
+        Ok(other) if !other.is_empty() && other != "mmio" => {
+            eprintln!("unrecognised ENTANGLED_BOOT_TRANSPORT '{other}'; using mmio");
+            VirtioTransport::Mmio
+        }
+        _ => VirtioTransport::Mmio,
+    }
+}
+
 fn scratch_disk() -> Option<PathBuf> {
     if std::env::var("ENTANGLED_BOOT_DISK").is_err() {
         return None;
@@ -120,8 +138,12 @@ fn hundred_sequential_boots_leak_nothing() {
         return;
     };
     let total = iterations();
-    let mut spec = BootSpec::new(kernel, initramfs);
+    let mut spec = BootSpec::new(kernel, initramfs).with_transport(transport());
     spec.deadline = deadline();
+    println!(
+        "booting {total} times over the {} transport",
+        spec.transport
+    );
     if let Some(disk) = scratch_disk() {
         spec = spec.with_disk(disk);
     }

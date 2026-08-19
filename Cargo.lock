@@ -384,6 +384,7 @@ dependencies = [
 name = "boot-tests"
 version = "0.1.0"
 dependencies = [
+ "control-api",
  "linux-boot",
  "machine-x86",
  "tracing",

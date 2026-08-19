@@ -13,6 +13,9 @@ publish.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 vmm-core.workspace = true
+# For `VirtioTransport`: the harness picks the transport with the same type the
+# CLI parses out of a VM profile, so a boot test cannot drift from a real run.
+control-api.workspace = true
 machine-x86.workspace = true
 linux-boot.workspace = true
 virtio-core.workspace = true

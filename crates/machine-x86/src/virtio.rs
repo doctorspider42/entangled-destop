@@ -25,7 +25,7 @@ use virtio_core::{mmio, GuestMem, MmioTransport, VirtioDevice};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
 use crate::layout;
-use crate::notify::{DeviceNotifier, NotifyError, QueueNotifyMode};
+use crate::notify::{DeviceNotifier, NotifyAddressing, NotifyError, QueueNotifyMode};
 
 /// Maximum number of virtio-mmio devices.
 ///
@@ -119,12 +119,12 @@ pub struct VirtioMmioSlot {
     pub transport: Arc<Mutex<MmioTransport>>,
     /// Present when this device's queue kicks are served by ioeventfds and a
     /// worker thread (MVP-307); `None` means every kick runs inline on the vCPU.
-    notifier: Option<DeviceNotifier>,
+    notifier: Option<DeviceNotifier<MmioTransport>>,
 }
 
 impl VirtioMmioSlot {
     /// The queue-notify offload for this device, if it has one.
-    pub fn notifier(&self) -> Option<&DeviceNotifier> {
+    pub fn notifier(&self) -> Option<&DeviceNotifier<MmioTransport>> {
         self.notifier.as_ref()
     }
 }
@@ -199,7 +199,12 @@ impl VirtioMmioBus {
             let transport = Arc::new(Mutex::new(transport));
 
             let notifier = if mode.is_offloaded() {
-                DeviceNotifier::attach(Arc::clone(&vm), slot, base, &transport)?
+                // All of a device's queues share one QUEUE_NOTIFY register, so
+                // KVM tells them apart by a datamatch on the queue index.
+                let addressing = NotifyAddressing::SharedWithDatamatch {
+                    addr: base.saturating_add(mmio::QUEUE_NOTIFY),
+                };
+                DeviceNotifier::attach(Arc::clone(&vm), slot, addressing, &transport)?
             } else {
                 None
             };
