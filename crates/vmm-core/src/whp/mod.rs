@@ -50,4 +50,4 @@ mod vcpu;
 pub use cpuid::{CpuidPolicy, CpuidResult, CPUID_EXIT_LEAVES};
 pub use interrupt::{HaltGate, WhpInterruptDelivery, HALT_POLL};
 pub use partition::{WhpCapabilities, WhpHypervisor, WhpOptions, WhpPartition, WHP_ENABLE_HINT};
-pub use vcpu::{spawn_vcpus, VcpuCanceller, WhpVcpu, WhpVcpuThreads};
+pub use vcpu::{spawn_vcpus, VcpuCanceller, WhpVcpu, WhpVcpuThreads, TRACE_EXITS_ENV};

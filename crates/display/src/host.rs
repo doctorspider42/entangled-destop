@@ -388,7 +388,7 @@ impl App {
         if let Some(window) = self.window.as_ref() {
             // `Borderless(None)` means "the monitor this window is on", which is
             // what the user expects on a multi-head desktop.
-            window.set_fullscreen(fullscreen.then(|| Fullscreen::Borderless(None)));
+            window.set_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
             window.request_redraw();
         }
         tracing::info!(fullscreen, "fullscreen toggled");

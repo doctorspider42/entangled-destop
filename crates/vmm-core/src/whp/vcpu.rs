@@ -42,8 +42,8 @@ use windows::Win32::System::Hypervisor::{
     WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonX64Cpuid,
     WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess, WHvSetVirtualProcessorRegisters,
     WHvX64RegisterApicBase, WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx,
-    WHvX64RegisterRdx, WHvX64RegisterRip, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
-    WHV_RUN_VP_EXIT_CONTEXT,
+    WHvX64RegisterRdx, WHvX64RegisterRip, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME,
+    WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
 };
 
 use crate::hv::{
@@ -133,19 +133,7 @@ impl WhpVcpu {
         values: &mut [WHV_REGISTER_VALUE],
     ) -> Result<(), VmmError> {
         let count = self.batch_count(names, values.as_ptr(), values.len())?;
-        // SAFETY: both pointers are to live slices of exactly `count` elements
-        // (checked equal above), the value buffer is 16-byte aligned as WHP
-        // requires, and WHP writes exactly `count` values.
-        unsafe {
-            WHvGetVirtualProcessorRegisters(
-                self.partition.handle(),
-                self.index,
-                names.as_ptr(),
-                count,
-                values.as_mut_ptr(),
-            )
-        }
-        .map_err(|e| whp_err("WHvGetVirtualProcessorRegisters", e))
+        get_regs_raw(self.partition.handle(), self.index, names, values, count)
     }
 
     /// Writes an arbitrary register batch.
@@ -155,20 +143,46 @@ impl WhpVcpu {
         values: &[WHV_REGISTER_VALUE],
     ) -> Result<(), VmmError> {
         let count = self.batch_count(names, values.as_ptr(), values.len())?;
-        // SAFETY: both pointers are to live slices of exactly `count` elements
-        // (checked equal above) and the value buffer is 16-byte aligned as WHP
-        // requires; WHP only reads them.
-        unsafe {
-            WHvSetVirtualProcessorRegisters(
-                self.partition.handle(),
-                self.index,
-                names.as_ptr(),
-                count,
-                values.as_ptr(),
-            )
-        }
-        .map_err(|e| whp_err("WHvSetVirtualProcessorRegisters", e))
+        set_regs_raw(self.partition.handle(), self.index, names, values, count)
     }
+}
+
+/// Reads `count` registers of VP `index`.
+///
+/// Free rather than a method because one caller is not the VP itself:
+/// [`crate::whp::WhpPartition::processor_summary`] reports any VP's state for
+/// diagnostics, from whichever thread is asking. The alignment and length checks
+/// stay with the callers, which know their own buffers —
+/// [`WhpVcpu::batch_count`] for a vCPU, an `Aligned16` fixed array there.
+pub(super) fn get_regs_raw(
+    handle: WHV_PARTITION_HANDLE,
+    index: u32,
+    names: &[WHV_REGISTER_NAME],
+    values: &mut [WHV_REGISTER_VALUE],
+    count: u32,
+) -> Result<(), VmmError> {
+    // SAFETY: both pointers are to live slices of at least `count` elements, the
+    // value buffer is 16-byte aligned as WHP requires (`Aligned16` at every call
+    // site), and WHP writes exactly `count` values into it.
+    unsafe {
+        WHvGetVirtualProcessorRegisters(handle, index, names.as_ptr(), count, values.as_mut_ptr())
+    }
+    .map_err(|e| whp_err("WHvGetVirtualProcessorRegisters", e))
+}
+
+/// Writes `count` registers of VP `index`. See [`get_regs_raw`].
+pub(super) fn set_regs_raw(
+    handle: WHV_PARTITION_HANDLE,
+    index: u32,
+    names: &[WHV_REGISTER_NAME],
+    values: &[WHV_REGISTER_VALUE],
+    count: u32,
+) -> Result<(), VmmError> {
+    // SAFETY: as `get_regs_raw`, except that WHP only reads the value buffer.
+    unsafe {
+        WHvSetVirtualProcessorRegisters(handle, index, names.as_ptr(), count, values.as_ptr())
+    }
+    .map_err(|e| whp_err("WHvSetVirtualProcessorRegisters", e))
 }
 
 impl Drop for WhpVcpu {
@@ -274,6 +288,13 @@ impl WhpVcpu {
         // Created on the first exit that needs decoding, so a guest that only
         // does simple port I/O never loads winhvemulation.dll.
         let mut emulator: Option<Emulator> = None;
+        // One env read per run loop, not per exit: `$ENTANGLED_WHP_TRACE_EXITS`
+        // prints every exit reason and RIP, which is the only way to tell "the
+        // guest is spinning on an exit we mishandle" from "WHP is blocking inside
+        // the run call" — the two look identical from a serial log, and telling
+        // them apart is what identified WHP's own INIT/SIPI handling (see
+        // `WhpPartition`'s SMP notes).
+        let trace_exits = std::env::var_os(TRACE_EXITS_ENV).is_some();
         let gate: Option<&Arc<HaltGate>> = self
             .partition
             .options()
@@ -286,6 +307,12 @@ impl WhpVcpu {
             // observed must not be slept through.
             let epoch = gate.map_or(0, |gate| gate.epoch());
             let exit = self.run_once()?;
+            if trace_exits {
+                eprintln!(
+                    "vp{} exit={} rip={:#x}",
+                    self.index, exit.ExitReason.0, exit.VpContext.Rip
+                );
+            }
             match exit.ExitReason {
                 WHvRunVpExitReasonX64Halt => match gate {
                     // Nothing can wake a CPU without a local APIC, so `hlt`
@@ -522,6 +549,9 @@ impl WhpVcpu {
         self.set_raw(&names, &values.0)
     }
 }
+
+/// Environment variable that turns on per-exit tracing in the run loop.
+pub const TRACE_EXITS_ENV: &str = "ENTANGLED_WHP_TRACE_EXITS";
 
 /// `WHV_MEMORY_ACCESS_INFO::AccessType`: 0 read, 1 write, 2 execute.
 const MEMORY_ACCESS_EXECUTE: u32 = 2;

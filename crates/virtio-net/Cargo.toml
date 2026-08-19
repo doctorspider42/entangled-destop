@@ -15,6 +15,11 @@ virtio-core.workspace = true
 # Only the TAP backend is Linux-only (see the target section below).
 virtio-queue.workspace = true
 vm-memory.workspace = true
+# The user-mode network backend (`usernet`): smoltcp supplies the checked wire
+# codecs (Ethernet, ARP, IPv4, UDP, ICMP, DHCP) and the TCP state machine. Both
+# hosts use it — it is the only option on Windows and the rootless option on
+# Linux.
+smoltcp.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

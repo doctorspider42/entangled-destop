@@ -580,6 +580,10 @@ fn request_stop(child: &mut Child) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Every test that spawns a child is `cfg(unix)` (it needs a POSIX shell and
+    // signals), so its helpers are too — otherwise a Windows build sees them as
+    // dead, which `-D warnings` refuses.
+    #[cfg(unix)]
     use std::path::Path;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -592,6 +596,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {

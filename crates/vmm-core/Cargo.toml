@@ -38,6 +38,11 @@ windows = { workspace = true, features = [
 [target.'cfg(windows)'.dev-dependencies]
 machine-x86.workspace = true
 linux-boot.workspace = true
+# `tests/whp_virtio_blk.rs` (WHP-1703) attaches a real virtio-blk device to the
+# virtio-mmio window, which is the whole point of the test: the device crates are
+# portable, so the acceptance boot uses the same ones the KVM path does.
+virtio-core.workspace = true
+virtio-block.workspace = true
 
 [lints]
 workspace = true

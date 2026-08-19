@@ -12,22 +12,26 @@ pub mod platform;
 pub mod rtc;
 pub mod serial;
 
-/// KVM-specific device plumbing: irqfd interrupt lines, ioeventfd queue-notify
-/// offload and the virtio buses built on them.
+/// The virtio-mmio window: address decoding, slot placement and the guest
+/// cmdline clauses that announce it — **portable** since EPIC 17 phase 3.
 ///
-/// The devices themselves are portable; what is not is the *wiring*. An irqfd
-/// and an ioeventfd are KVM concepts, so on Windows the same devices attach
-/// through [`irqchip`] and (from EPIC 17 phase 3) a WHP doorbell instead. Until
-/// that lands, a WHP machine carries the serial console and the platform
-/// devices but no virtio bus.
+/// A device's *wiring* used to be what pinned this to Linux: an irqfd and an
+/// ioeventfd are KVM concepts. The interrupt half is solved by [`irqchip`], whose
+/// `IoApicLine` is the same `virtio_core::interrupt::IrqLine` an irqfd is, so
+/// [`virtio::VirtioMmioBus::attach_userspace`] attaches the same devices on a host
+/// with no in-kernel irqchip. The kick half has no WHP equivalent yet, so those
+/// machines run every queue notification inline on the vCPU thread (see
+/// [`virtio::VirtioMmioBus::attach_userspace`] for the measured cost).
+pub mod virtio;
+
+/// KVM-specific device plumbing: irqfd interrupt lines, ioeventfd queue-notify
+/// offload and the PCI bus built on them.
 #[cfg(target_os = "linux")]
 pub mod irqfd;
 #[cfg(target_os = "linux")]
 pub mod msi;
 #[cfg(target_os = "linux")]
 pub mod notify;
-#[cfg(target_os = "linux")]
-pub mod virtio;
 #[cfg(target_os = "linux")]
 pub mod virtio_pci;
 
