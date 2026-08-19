@@ -559,7 +559,6 @@ fn cpu_name(cpu: u32) -> String {
 /// advertise [`layout::ACPI_RSDP_START`], so a machine that forgets this call
 /// leaves a zeroed region there, the RSDP signature check fails and the guest
 /// falls back to the MP table instead of reading garbage.
-#[cfg(target_os = "linux")]
 pub fn write<M: vm_memory::GuestMemory>(mem: &M, vcpu_count: u32) -> Result<u64, AcpiError> {
     use vm_memory::{Bytes, GuestAddress};
 

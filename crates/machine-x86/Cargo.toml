@@ -10,14 +10,18 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+# Portable, on both hosts (ADR-0002): the memory layout, E820, MP table, ACPI
+# tables, long-mode boot setup, the 16550 and the userspace irqchip build and
+# test on Windows too, because none of them touch a hypervisor API directly —
+# they go through `vmm_core::hv` and `virtio_core::interrupt`.
+vm-memory.workspace = true
+vmm-core.workspace = true
+virtio-core.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-ioctls.workspace = true
 kvm-bindings.workspace = true
-vm-memory.workspace = true
 vmm-sys-util.workspace = true
-vmm-core.workspace = true
-virtio-core.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # Split-ring helpers for the queue-notify integration test.

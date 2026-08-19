@@ -27,7 +27,10 @@ mod vm;
 pub mod whp;
 
 pub use error::VmmError;
-pub use hv::{ExitHandler, MachineConfig, RunOutcome};
+pub use hv::{
+    DestinationMode, ExitHandler, InterruptDelivery, InterruptKind, InterruptRequest,
+    MachineConfig, RunOutcome, TriggerMode,
+};
 pub use memory::{create_guest_memory, GuestMem};
 pub use state::{VmState, VmStateError};
 

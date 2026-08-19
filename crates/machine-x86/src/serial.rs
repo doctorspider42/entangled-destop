@@ -11,13 +11,24 @@
 //! Emulated subset: everything Linux's 8250 driver touches — THR/RBR,
 //! IER/IIR, LCR (incl. DLAB divisor latch), MCR, LSR, MSR, SCR. FCR writes
 //! are accepted and ignored (we report FIFOs enabled via IIR).
+//!
+//! # The interrupt trigger is a seam, not an eventfd
+//!
+//! The UART raises IRQ 4 through an [`IrqLine`], the same one-method trait
+//! virtio devices use. On Linux that is an `EventFd` registered as a KVM irqfd
+//! ([`crate::irqfd::IrqFdLine`]); on Windows it is
+//! [`crate::irqchip::ioapic::IoApicLine`], which runs the redirection-table
+//! lookup in userspace and asks WHP's local APIC to deliver the message
+//! (EPIC 17 / WHP-1703). The UART cannot tell the difference and its behaviour
+//! is identical on both: `IrqLine::trigger` is a non-blocking edge, exactly what
+//! `EventFd::write(1)` was.
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::Arc;
 
-use kvm_ioctls::VmFd;
 use thiserror::Error;
-use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
+use virtio_core::interrupt::IrqLine;
 
 /// COM1.
 pub const SERIAL_PORT_BASE: u16 = 0x3f8;
@@ -62,16 +73,17 @@ const MSR_STATIC: u8 = 0xb0;
 
 #[derive(Debug, Error)]
 pub enum SerialError {
-    #[error("failed to create serial interrupt eventfd: {0}")]
-    EventFd(#[source] std::io::Error),
-
-    #[error("failed to register serial irqfd: {0}")]
-    Irqfd(#[source] kvm_ioctls::Error),
+    /// Wiring the UART's interrupt line to the VM failed. Only the KVM
+    /// constructor can produce this; a userspace irqchip line needs no host
+    /// resource, so `with_trigger` is infallible.
+    #[cfg(target_os = "linux")]
+    #[error("failed to wire the serial interrupt line: {0}")]
+    Irq(#[from] crate::irqfd::IrqFdError),
 }
 
 /// The guest-visible UART plus its host output sink.
 pub struct SerialConsole {
-    interrupt: EventFd,
+    interrupt: Arc<dyn IrqLine>,
     out: Box<dyn Write + Send>,
     rx: VecDeque<u8>,
     ier: u8,
@@ -86,16 +98,17 @@ pub struct SerialConsole {
 }
 
 impl SerialConsole {
-    /// Creates the UART and wires its interrupt line to the VM's IRQ 4.
-    pub fn new(vm: &VmFd, out: Box<dyn Write + Send>) -> Result<Self, SerialError> {
-        let interrupt = EventFd::new(EFD_NONBLOCK).map_err(SerialError::EventFd)?;
-        vm.register_irqfd(&interrupt, SERIAL_IRQ)
-            .map_err(SerialError::Irqfd)?;
-        Ok(Self::with_trigger(interrupt, out))
+    /// Creates the UART and wires its interrupt line to the VM's IRQ 4 through
+    /// a KVM irqfd.
+    #[cfg(target_os = "linux")]
+    pub fn new(vm: &kvm_ioctls::VmFd, out: Box<dyn Write + Send>) -> Result<Self, SerialError> {
+        let line = crate::irqfd::IrqFdLine::new(vm, SERIAL_IRQ)?;
+        Ok(Self::with_trigger(Arc::new(line), out))
     }
 
-    /// Test constructor: no VM wiring, interrupts observable via the eventfd.
-    pub fn with_trigger(interrupt: EventFd, out: Box<dyn Write + Send>) -> Self {
+    /// Creates the UART on an arbitrary interrupt line: the WHP machine's
+    /// IOAPIC pin 4, or a counting line in tests.
+    pub fn with_trigger(interrupt: Arc<dyn IrqLine>, out: Box<dyn Write + Send>) -> Self {
         Self {
             interrupt,
             out,
@@ -147,7 +160,9 @@ impl SerialConsole {
     /// "none", and every state change re-arms the pulse here.
     fn update_interrupt(&mut self) {
         if self.current_source() != IIR_NONE {
-            let _ = self.interrupt.write(1);
+            if let Err(e) = self.interrupt.trigger() {
+                tracing::warn!(error = %e, "raising the serial interrupt line failed");
+            }
         }
     }
 
@@ -236,15 +251,30 @@ mod tests {
         }
     }
 
-    fn uart() -> (SerialConsole, EventFd, Sink) {
-        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
-        let sink = Sink::default();
-        let uart = SerialConsole::with_trigger(evt.try_clone().unwrap(), Box::new(sink.clone()));
-        (uart, evt, sink)
+    /// Counts edges, the portable stand-in for reading the irqfd: the UART's
+    /// contract is "one non-blocking pulse per new interrupt condition", which
+    /// is observable without an eventfd.
+    #[derive(Default)]
+    struct CountingLine(std::sync::atomic::AtomicU32);
+
+    impl IrqLine for CountingLine {
+        fn trigger(&self) -> Result<(), virtio_core::interrupt::InterruptError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
+        }
     }
 
-    fn fired(evt: &EventFd) -> bool {
-        evt.read().is_ok() // nonblocking: Err when no pulses
+    fn uart() -> (SerialConsole, Arc<CountingLine>, Sink) {
+        let line = Arc::new(CountingLine::default());
+        let sink = Sink::default();
+        let uart = SerialConsole::with_trigger(line.clone(), Box::new(sink.clone()));
+        (uart, line, sink)
+    }
+
+    /// Drains the pulses recorded so far, mirroring the old nonblocking
+    /// `EventFd::read`: true when at least one arrived since the last call.
+    fn fired(line: &CountingLine) -> bool {
+        line.0.swap(0, std::sync::atomic::Ordering::AcqRel) > 0
     }
 
     #[test]

@@ -6,9 +6,13 @@
 //! policy) must never touch `kvm_bindings` types directly, or the WHP port
 //! turns back into a rewrite.
 //!
-//! Deliberately small: this seam covers what the machine model actually
-//! uses. Interrupt delivery already goes through `virtio_core::Interrupt`/
-//! `IrqLine` and the serial trigger, so it needs no new abstraction here.
+//! Deliberately small: this seam covers what the machine model actually uses.
+//! Device-side interrupt *signalling* goes through `virtio_core::Interrupt`/
+//! `IrqLine`, which needs no abstraction here; what does need one is the last
+//! hop — asking the CPU's local APIC to deliver an interrupt message. KVM has an
+//! in-kernel IOAPIC that does it for us, WHP has only the local APIC, so
+//! [`InterruptDelivery`] is the seam a userspace IOAPIC
+//! (`machine_x86::irqchip`) delivers through.
 
 use thiserror::Error;
 
@@ -97,6 +101,70 @@ pub enum HvError {
 
     #[error("hypervisor run failed: {0}")]
     Run(String),
+
+    #[error("interrupt delivery failed: {0}")]
+    Interrupt(String),
+}
+
+// ---- interrupt delivery (WHP-1703) ---------------------------------------
+
+/// How a local APIC selects the target CPU of an interrupt message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DestinationMode {
+    /// `destination` is an APIC id.
+    #[default]
+    Physical,
+    /// `destination` is a logical-destination bitmask.
+    Logical,
+}
+
+/// Trigger mode of an interrupt message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TriggerMode {
+    #[default]
+    Edge,
+    Level,
+}
+
+/// The delivery modes an interrupt controller may ask for. Only the ones an
+/// IOAPIC redirection entry can legitimately carry towards a local APIC and that
+/// both backends can express; SMI/INIT/ExtINT are deliberately absent — see
+/// `machine_x86::irqchip::ioapic` for what it does with those instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InterruptKind {
+    /// Deliver `vector` to the destination(s).
+    #[default]
+    Fixed,
+    /// Deliver `vector` to the lowest-priority CPU among the destination(s).
+    LowestPriority,
+    /// Non-maskable interrupt; `vector` is ignored.
+    Nmi,
+}
+
+/// One interrupt message, hypervisor-neutral: exactly the fields an IOAPIC
+/// redirection-table entry contributes to the APIC bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InterruptRequest {
+    pub vector: u8,
+    pub destination: u32,
+    pub kind: InterruptKind,
+    pub destination_mode: DestinationMode,
+    pub trigger: TriggerMode,
+}
+
+/// The hypervisor's ability to inject an interrupt into a guest local APIC.
+///
+/// Implemented by the WHP backend (`crate::whp`) over `WHvRequestInterrupt`, and
+/// consumed by `machine_x86::irqchip::ioapic::IoApic`. **KVM does not implement
+/// it**: there the IOAPIC lives in the kernel and irqfds reach it without
+/// userspace, so an implementation would be dead weight. Keeping the trait here
+/// rather than in the WHP module is what lets the IOAPIC model — a pure
+/// redirection-table decoder — be portable and unit-tested on both hosts.
+///
+/// Implementations must be cheap, non-blocking and callable from any thread: the
+/// callers are vCPU threads inside an exit and the PIT's timer thread.
+pub trait InterruptDelivery: Send + Sync {
+    fn request(&self, interrupt: &InterruptRequest) -> Result<(), HvError>;
 }
 
 /// What a single step of guest execution produced, hypervisor-neutral.
