@@ -19,6 +19,8 @@ app.rs       ManagerApp (eframe::App): state, Action loop, frame layout
   theme.rs   every colour, radius and font size in the product
   logo.rs    procedural mark + install spinner (egui painter, no assets)
 settings.rs  ~/.config/entangled/manager.toml, typed load/save
+update.rs    startup update check (GitHub /releases/latest) + installer
+             download/launch, both on background threads; banner in cards.rs
 discovery.rs VM directory scan through control-api, delete plan + guards
 launcher.rs  locating the CLI, building install/run argument vectors
 process.rs   Supervisor: children, log tailing, stop/kill, state machine
@@ -135,7 +137,8 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
   quickest way to review a visual change without a human at the keyboard.
 - The UI itself has no automated tests. To exercise it end to end, drive the
   real window from the Windows side: `EnumWindows` for
-  `"Entangled Manager*"`, `SetCursorPos`+`mouse_event` for clicks at fractions
+  `"Entangled Desktop*"` (the title carries the injected version, e.g.
+  "Entangled Desktop v0.2.17"), `SetCursorPos`+`mouse_event` for clicks at fractions
   of the client rect, `CopyFromScreen` for shots (call `SetProcessDPIAware`
   first, or you capture a scaled crop).
 - Only one VM can hold the TAP. A second Start fails fast; `diagnose::explain`

@@ -9,3 +9,5 @@
 guest/test-rootfs/init-rs/target/
 guest/bootstrap-initramfs/init-rs/target/
 entangled-screenshot-*.png
+# ISCC output (release.yml compiles the installer here)
+/installer/Output/
