@@ -49,10 +49,18 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 ui.add_space(14.0);
 
                 slider_row(ui, "MEMORY", |ui| {
+                    // The ceiling is the machine's, not a taste: guest RAM stops
+                    // at the 32-bit MMIO hole until the high-RAM split lands, and
+                    // `control_api` refuses a larger profile. A slider that can
+                    // reach 16 GiB only lets someone build a VM that will not
+                    // start.
                     ui.add(
-                        egui::Slider::new(&mut state.machine.memory_mib, 512..=16384)
-                            .step_by(256.0)
-                            .suffix(" MiB"),
+                        egui::Slider::new(
+                            &mut state.machine.memory_mib,
+                            512..=control_api::MAX_MEMORY_MIB,
+                        )
+                        .step_by(256.0)
+                        .suffix(" MiB"),
                     );
                 });
                 slider_row(ui, "vCPUs", |ui| {

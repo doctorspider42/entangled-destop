@@ -437,6 +437,26 @@ fn extend_cmdline(configured: &str, clauses: &str) -> String {
 mod tests {
     use super::extend_cmdline;
 
+    /// `control_api` bounds `memory_mib` so a too-large guest is a typed config
+    /// error, but it deliberately does not depend on the machine crate — so the
+    /// number it uses is a copy, and this is the only place that sees both.
+    /// Without it, a change to the memory layout would silently turn a rejected
+    /// config back into a panic inside `machine_x86::e820_map`.
+    #[test]
+    fn the_config_memory_ceiling_is_the_machines_mmio_hole() {
+        assert_eq!(
+            control_api::MAX_MEMORY_MIB << 20,
+            machine_x86::layout::MMIO_HOLE_START,
+            "control_api::MAX_MEMORY_MIB and machine_x86::layout::MMIO_HOLE_START disagree"
+        );
+        // And the largest allowed guest really does build an E820 map.
+        let map = machine_x86::e820_map(control_api::MAX_MEMORY_MIB << 20);
+        assert_eq!(
+            map.iter().map(|e| e.size).sum::<u64>(),
+            control_api::MAX_MEMORY_MIB << 20
+        );
+    }
+
     #[test]
     fn clauses_are_appended_once_and_separated() {
         assert_eq!(

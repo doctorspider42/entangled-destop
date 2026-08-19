@@ -92,10 +92,23 @@ impl Settings {
                 })
             }
         };
-        toml::from_str(&text).map_err(|source| SettingsError::Parse {
+        let mut settings: Self = toml::from_str(&text).map_err(|source| SettingsError::Parse {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        // A settings file written before the memory ceiling existed (or by hand)
+        // could name a guest size `control_api` now refuses. Clamping the wizard
+        // *default* is the friendly half of that rule: the user gets the largest
+        // VM this machine can build instead of a create button that fails.
+        if settings.default_memory_mib > control_api::MAX_MEMORY_MIB {
+            tracing::warn!(
+                configured = settings.default_memory_mib,
+                max = control_api::MAX_MEMORY_MIB,
+                "default_memory_mib exceeds what the machine can build; clamping"
+            );
+            settings.default_memory_mib = control_api::MAX_MEMORY_MIB;
+        }
+        Ok(settings)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), SettingsError> {
@@ -178,7 +191,7 @@ mod tests {
             entangled_binary: Some(PathBuf::from("/opt/entangled/bin/entangled")),
             work_dir: Some(PathBuf::from("/srv")),
             headless_install: true,
-            default_memory_mib: 4096,
+            default_memory_mib: 3072,
             default_vcpus: 4,
             default_disk_gib: 40,
             default_variant: "gtk-netboot".into(),
@@ -187,6 +200,25 @@ mod tests {
         settings.save_to(&path).expect("save");
         let back = Settings::load_from(&path).expect("load");
         assert_eq!(settings, back);
+    }
+
+    /// A settings file naming more RAM than the machine can build must not turn
+    /// the wizard into a create button that fails: the default is clamped to what
+    /// `control_api` will accept.
+    #[test]
+    fn an_oversized_memory_default_is_clamped_on_load() {
+        let dir = temp_dir("settings-clamp");
+        let path = dir.join("manager.toml");
+        let settings = Settings {
+            default_memory_mib: control_api::MAX_MEMORY_MIB * 4,
+            ..Settings::default()
+        };
+        settings.save_to(&path).expect("save");
+        let back = Settings::load_from(&path).expect("load");
+        assert_eq!(back.default_memory_mib, control_api::MAX_MEMORY_MIB);
+        // Everything else survives untouched.
+        assert_eq!(back.default_vcpus, settings.default_vcpus);
+        assert_eq!(back.vm_dir, settings.vm_dir);
     }
 
     #[test]

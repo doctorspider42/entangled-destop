@@ -482,10 +482,10 @@ interface = "entangled0"
     fn apply_resources_rewrites_only_memory_and_vcpus() {
         let dir = temp_dir("apply-resources");
         let profile = write_vm(&dir, "resized", 128);
-        apply_resources(&profile, 6144, 6).expect("apply");
+        apply_resources(&profile, 3072, 6).expect("apply");
 
         let entry = load_profile(&profile, None).expect("reload");
-        assert_eq!(entry.memory_mib, 6144);
+        assert_eq!(entry.memory_mib, 3072);
         assert_eq!(entry.vcpus, 6);
         let text = std::fs::read_to_string(&profile).expect("read");
         assert!(
