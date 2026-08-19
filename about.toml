@@ -13,4 +13,11 @@ accepted = [
     "0BSD",
     # Mozilla CA root store data shipped by `webpki-roots` (see deny.toml).
     "CDLA-Permissive-2.0",
+    # The egui/eframe GUI tree (see the scoped exceptions in deny.toml):
+    # BSL-1.0 for clipboard-win/error-code (permissive, no reciprocity);
+    # OFL-1.1 + Ubuntu-font-1.0 govern egui's bundled FONT DATA only and put
+    # no conditions on the program rendering them.
+    "BSL-1.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
