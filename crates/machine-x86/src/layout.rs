@@ -78,9 +78,63 @@ pub const TOP_OF_32BIT: u64 = 0x1_0000_0000;
 pub const RESET_VECTOR: u64 = 0xffff_fff0;
 
 /// Start of the 32-bit MMIO hole. RAM must not be mapped at or above this
-/// until high-RAM support lands; virtio-mmio windows and the future PCI hole
-/// live here.
+/// until high-RAM support lands; the PCI BAR aperture and the virtio-mmio
+/// windows live here.
+///
+/// The value is also pinned from the outside: EDK2's CloudHv platform
+/// hard-codes its 32-bit aperture as `0xc000_0000 + 0x3800_0000`
+/// (ADR-0003, "MMIO hole agreement"), so everything below must stay inside
+/// `0xc000_0000..0xf800_0000`.
 pub const MMIO_HOLE_START: u64 = 0xc000_0000;
+
+// ---- PCI BAR aperture (EPIC 19, virtio-pci) -------------------------------
+//
+// The host assigns BARs itself, from a fixed window at the bottom of the MMIO
+// hole. Fixed rather than dynamically allocated because there is no ACPI `_CRS`
+// and no MCFG to publish a movable aperture through: a guest that re-assigns
+// these BARs would have nothing to re-assign them *from*, so both Linux (which
+// keeps a BIOS-assigned BAR it can claim) and EDK2 (whose `PciBusDxe` finds the
+// BARs already programmed) simply use what they find.
+//
+//   0xc000_0000 .. 0xc002_0000   PCI BAR aperture (8 slots × 16 KiB)
+//   0xc002_0000 .. 0xd000_0000   free
+//   0xd000_0000 .. 0xd000_8000   virtio-mmio slots (8 × 4 KiB)
+//
+// The two transports therefore never overlap even though only one is ever
+// active for a given VM.
+
+/// Base of the host-assigned PCI BAR aperture.
+pub const PCI_MMIO_BASE: u64 = MMIO_HOLE_START;
+
+/// Size of one device's BAR window. Must equal
+/// `virtio_core::pci::VIRTIO_PCI_BAR_SIZE`; asserted in
+/// `crate::virtio_pci::tests::the_bar_slot_size_matches_the_transport`.
+///
+/// A BAR must be naturally aligned to its own size, which 16 KiB slots starting
+/// at a 16 KiB-aligned base are.
+pub const PCI_MMIO_SLOT_SIZE: u64 = 0x4000;
+
+/// How many PCI devices the aperture holds. Matches
+/// `crate::pci::MAX_PCI_DEVICES`.
+pub const PCI_MMIO_SLOTS: u64 = 8;
+
+/// One past the end of the PCI BAR aperture.
+pub const PCI_MMIO_END: u64 = PCI_MMIO_BASE + PCI_MMIO_SLOTS * PCI_MMIO_SLOT_SIZE;
+
+/// First IRQ (GSI on the in-kernel IOAPIC) handed to a PCI device's INTx line.
+///
+/// Deliberately the same pins as [`VIRTIO_MMIO_FIRST_IRQ`]: a VM runs one virtio
+/// transport, never both, so the pins cannot collide. Keeping them identical
+/// also means the MP table's ISA IRQ routing (`crate::mptable`) already covers
+/// the PCI devices — without ACPI or a `$PIR` table, Linux takes a PCI device's
+/// IRQ straight from its `interrupt_line` config register, so the pin it ends up
+/// requesting has to be one the MP table routes to the IOAPIC.
+pub const PCI_FIRST_IRQ: u32 = VIRTIO_MMIO_FIRST_IRQ;
+
+/// Guest physical base address of the BAR window for PCI slot `n`.
+pub const fn pci_bar_slot(n: u64) -> u64 {
+    PCI_MMIO_BASE + n * PCI_MMIO_SLOT_SIZE
+}
 
 /// Base of the virtio-mmio device window region.
 pub const VIRTIO_MMIO_BASE: u64 = 0xd000_0000;

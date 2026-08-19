@@ -250,6 +250,32 @@ pub const ISR_QUEUE: u8 = 1 << 0;
 /// ISR bit: the device configuration changed.
 pub const ISR_CONFIG: u8 = 1 << 1;
 
+/// PCI device id for a virtio device type: `0x1040 + type`.
+///
+/// A free function because the machine builds a device's configuration space
+/// *before* its transport exists, and both must agree.
+pub fn device_id(device_type: DeviceType) -> u16 {
+    // Every `DeviceType` id is far below 0x1000, so this cannot overflow;
+    // saturating rather than wrapping keeps that true if one ever grows.
+    VIRTIO_PCI_DEVICE_ID_BASE.saturating_add(device_type.id() as u16)
+}
+
+/// PCI class code register value for a virtio device type: base class in bits
+/// 31:24, sub class in 23:16, programming interface in 15:8. The revision
+/// occupies bits 7:0 of the same dword and is added by the PCI layer.
+///
+/// Chosen so `lspci` names the device something recognisable; no driver binds on
+/// it — Linux and EDK2 both match on vendor/device id.
+pub fn class_code(device_type: DeviceType) -> u32 {
+    let (base, sub): (u32, u32) = match device_type {
+        DeviceType::Net => (0x02, 0x00),   // network / ethernet
+        DeviceType::Block => (0x01, 0x80), // mass storage / other
+        DeviceType::Gpu => (0x03, 0x80),   // display / other
+        DeviceType::Input => (0x09, 0x80), // input device / other
+    };
+    (base << 24) | (sub << 16)
+}
+
 // ----------------------------------------------------------------- the device
 
 /// One modern virtio PCI function: the BAR register file plus the device behind
@@ -291,25 +317,12 @@ impl PciTransport {
 
     /// PCI device id: `0x1040 + virtio device type`.
     pub fn device_id(&self) -> u16 {
-        // Every `DeviceType` id is far below 0x1000, so this cannot overflow;
-        // saturating rather than wrapping keeps that true if one ever grows.
-        VIRTIO_PCI_DEVICE_ID_BASE.saturating_add(self.state.device_type().id() as u16)
+        device_id(self.state.device_type())
     }
 
-    /// PCI class code register value: base class, subclass and programming
-    /// interface in bits 23:0 (the revision occupies bits 7:0 of the same dword
-    /// and is added by the PCI layer).
-    ///
-    /// Chosen so `lspci` names the device something recognisable; no driver
-    /// binds on it — Linux and EDK2 both match on vendor/device id.
+    /// PCI class code register value for this device; see [`class_code`].
     pub fn class_code(&self) -> u32 {
-        let (base, sub): (u32, u32) = match self.state.device_type() {
-            DeviceType::Net => (0x02, 0x00),   // network / ethernet
-            DeviceType::Block => (0x01, 0x80), // mass storage / other
-            DeviceType::Gpu => (0x03, 0x80),   // display / other
-            DeviceType::Input => (0x09, 0x80), // input device / other
-        };
-        (base << 16) | (sub << 8)
+        class_code(self.state.device_type())
     }
 
     // ---------------------------------------------------------- accessors
@@ -808,7 +821,7 @@ mod tests {
                 ..Default::default()
             });
             let class = t.class_code();
-            assert_ne!(class >> 16, 0, "{kind:?} must have a base class");
+            assert_ne!(class >> 24, 0, "{kind:?} must have a base class");
             // The revision byte lives in the low 8 bits of the same dword and
             // is the PCI layer's business, so it must be clear here.
             assert_eq!(class & 0xff, 0);

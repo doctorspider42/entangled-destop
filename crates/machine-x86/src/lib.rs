@@ -2,6 +2,7 @@
 //! vCPU register/CPUID/GDT setup (backlog EPIC 1/2).
 
 pub mod layout;
+pub mod pci;
 pub mod platform;
 pub mod rtc;
 
@@ -17,6 +18,8 @@ pub mod notify;
 pub mod serial;
 #[cfg(target_os = "linux")]
 pub mod virtio;
+#[cfg(target_os = "linux")]
+pub mod virtio_pci;
 
 /// E820 memory range types as defined by the BIOS/ACPI interface and consumed
 /// by the Linux boot protocol's `boot_params.e820_table`.
