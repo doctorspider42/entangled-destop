@@ -11,8 +11,9 @@ publish.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 machine-x86.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
+# Portable since EPIC 17: the vendored linux-loader keeps vm-memory's unix-only
+# `rawfd` feature out of the graph (see third_party/*/VENDORED.md), so the PVH
+# loader builds natively on Windows exactly as `linux-boot` does.
 linux-loader.workspace = true
 vm-memory.workspace = true
 

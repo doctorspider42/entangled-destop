@@ -25,10 +25,8 @@ pub mod image;
 pub mod pvh;
 pub mod rom;
 
-#[cfg(target_os = "linux")]
 mod load;
 
-#[cfg(target_os = "linux")]
 pub use load::{load_pvh, PvhBoot};
 
 pub use image::{FirmwareImage, FirmwareKind};

@@ -342,7 +342,12 @@ impl VcpuThreads {
             if self.handles.iter().all(|h| h.is_finished()) {
                 return self.join();
             }
-            if should_stop() {
+            // One finished vCPU means the VM is over: no run loop returns while
+            // its guest is healthy, and a multi-CPU guest that triple-faults on
+            // the BSP leaves its APs parked inside the hypervisor forever —
+            // waiting for *all* of them would hang the supervisor on a machine
+            // that is already dead (measured with `reboot=k` on 2 vCPUs).
+            if should_stop() || self.handles.iter().any(|h| h.is_finished()) {
                 return self.stop();
             }
             std::thread::sleep(poll);

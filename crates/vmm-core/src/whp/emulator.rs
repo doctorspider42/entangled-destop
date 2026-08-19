@@ -22,7 +22,7 @@
 //!
 //! | Callback | What we do |
 //! |---|---|
-//! | `WHvEmulatorMemoryCallback` | `ExitHandler::mmio_read` / `mmio_write` — the point of the exercise |
+//! | `WHvEmulatorMemoryCallback` | guest RAM served directly (the emulator routes **every** memory operand through here, not just the faulting one — see [`EmulatorContext::memory`]), device windows to `ExitHandler::mmio_read` / `mmio_write` |
 //! | `WHvEmulatorIoPortCallback` | `ExitHandler::io_in` / `io_out`, for the string-I/O path |
 //! | `WHvEmulatorGetVirtualProcessorRegisters` | `WHvGetVirtualProcessorRegisters` on this vCPU |
 //! | `WHvEmulatorSetVirtualProcessorRegisters` | `WHvSetVirtualProcessorRegisters` — this is also how **RIP gets advanced**, by the emulator, not by us |
@@ -46,6 +46,7 @@
 
 use core::ffi::c_void;
 
+use vm_memory::{Bytes, GuestAddress};
 use windows::core::HRESULT;
 use windows::Win32::Foundation::{E_FAIL, S_OK};
 use windows::Win32::System::Hypervisor::{
@@ -59,6 +60,7 @@ use windows::Win32::System::Hypervisor::{
 };
 
 use crate::hv::ExitHandler;
+use crate::memory::GuestMem;
 use crate::whp::partition::whp_err;
 use crate::whp::regs::{zeroed_value, Aligned16};
 use crate::VmmError;
@@ -83,6 +85,14 @@ struct EmulatorContext<'a> {
     partition: windows::Win32::System::Hypervisor::WHV_PARTITION_HANDLE,
     vp_index: u32,
     handler: &'a mut dyn ExitHandler,
+    /// Guest RAM, because the emulator routes **every** memory operand through
+    /// the memory callback — not just the device one that faulted. A
+    /// memory-to-memory instruction with one MMIO operand (the firmware's
+    /// `CopyMem` out of the pflash window is `rep movs`) therefore asks us to
+    /// serve its RAM side too, and dropping those accesses on the device bus
+    /// silently corrupts the copy (measured: EDK2's variable store came back
+    /// all zeroes and the firmware reported its own NVRAM volume corrupt).
+    memory: &'a GuestMem,
 }
 
 /// Reconstructs the context WHP is handing back.
@@ -113,10 +123,21 @@ unsafe extern "system" fn memory_callback(
     if size == 0 || size > MAX_ACCESS_SIZE {
         return E_FAIL;
     }
+    // RAM first, devices second. The GPA is guest-controlled, but it never
+    // indexes anything here: `read_slice`/`write_slice` are vm-memory's checked
+    // accessors, and an address outside every RAM region falls through to the
+    // device bus exactly as the non-emulated exit path would take it.
+    let gpa = GuestAddress(access.GpaAddress);
     if access.Direction == DIRECTION_READ {
-        ctx.handler
-            .mmio_read(access.GpaAddress, &mut access.Data[..size]);
-    } else {
+        if ctx
+            .memory
+            .read_slice(&mut access.Data[..size], gpa)
+            .is_err()
+        {
+            ctx.handler
+                .mmio_read(access.GpaAddress, &mut access.Data[..size]);
+        }
+    } else if ctx.memory.write_slice(&access.Data[..size], gpa).is_err() {
         ctx.handler
             .mmio_write(access.GpaAddress, &access.Data[..size]);
     }
@@ -347,11 +368,13 @@ impl Emulator {
 
     /// Decodes and completes the faulting MMIO instruction, dispatching the
     /// access to `handler` and letting the emulator advance RIP.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn emulate_mmio(
         &self,
         partition: windows::Win32::System::Hypervisor::WHV_PARTITION_HANDLE,
         vp_index: u32,
         handler: &mut dyn ExitHandler,
+        memory: &GuestMem,
         vp_context: &WHV_VP_EXIT_CONTEXT,
         access: &WHV_MEMORY_ACCESS_CONTEXT,
     ) -> Result<(), VmmError> {
@@ -359,6 +382,7 @@ impl Emulator {
             partition,
             vp_index,
             handler,
+            memory,
         };
         // SAFETY: `self.handle` is a live emulator, `&mut ctx` outlives the call
         // and is the pointer every callback reconstructs, and both context
@@ -381,6 +405,7 @@ impl Emulator {
         partition: windows::Win32::System::Hypervisor::WHV_PARTITION_HANDLE,
         vp_index: u32,
         handler: &mut dyn ExitHandler,
+        memory: &GuestMem,
         vp_context: &WHV_VP_EXIT_CONTEXT,
         access: &WHV_X64_IO_PORT_ACCESS_CONTEXT,
     ) -> Result<(), VmmError> {
@@ -388,6 +413,7 @@ impl Emulator {
             partition,
             vp_index,
             handler,
+            memory,
         };
         // SAFETY: as `emulate_mmio`.
         let status = unsafe {
