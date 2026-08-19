@@ -46,12 +46,13 @@ use vm_memory::{Bytes, GuestAddress};
 
 use crate::error::CommandError;
 use crate::protocol::{
-    cmd, config_bytes, display_info_body, resp, AttachBacking, CtrlHdr, DisplayOne, MemEntry, Rect,
-    ResourceCreate2d, ResourceFlush, ResourceUnref, SetScanout, TransferToHost2d, CONFIG_LEN,
-    MEM_ENTRY_LEN,
+    cmd, config_bytes, display_info_body, edid_body, resp, AttachBacking, CtrlHdr, DisplayOne,
+    GetEdid, MemEntry, Rect, ResourceCreate2d, ResourceFlush, ResourceUnref, SetScanout,
+    TransferToHost2d, UpdateCursor, CONFIG_LEN, MEM_ENTRY_LEN,
 };
 use crate::resource::{ResourceTable, MAX_BACKING_ENTRIES};
 use crate::sink::ScanoutSink;
+use crate::{MAX_CURSOR_DIM, VIRTIO_GPU_F_EDID};
 
 /// controlq and cursorq, in queue order (spec section 5.7.2).
 pub const NUM_QUEUES: usize = 2;
@@ -135,7 +136,7 @@ pub struct GpuDevice<S: ScanoutSink> {
     req_buf: Vec<u8>,
     /// Staging buffer for a gathered partial-width flush rect.
     flush_buf: Vec<u8>,
-    /// Cursor-queue commands drained and ignored so far (MVP-812).
+    /// Cursor-queue commands processed so far (MVP-812), for diagnostics.
     cursor_commands: u64,
 
     // Set on activate(), cleared on reset().
@@ -167,9 +168,10 @@ impl<S: ScanoutSink> GpuDevice<S> {
             resources: ResourceTable::new(),
             scanout: None,
             events_read: 0,
-            // No VIRTIO_GPU_F_* features in the MVP: no VIRGL (3D is post-MVP),
-            // no EDID (MVP-811), no resource UUID / blob resources.
-            features: VIRTIO_F_VERSION_1,
+            // EDID (MVP-811) because GNOME/mutter builds its outputs from it;
+            // still no VIRGL (3D is post-MVP) and no resource UUID / blob
+            // resources.
+            features: VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID,
             acked_features: 0,
             req_buf: Vec::new(),
             flush_buf: Vec::new(),
@@ -247,16 +249,15 @@ impl<S: ScanoutSink> GpuDevice<S> {
         Ok(())
     }
 
-    /// Drains the cursor queue without acting on it.
+    /// Drains the cursor queue, acting on each command (MVP-812).
     ///
-    /// TODO(MVP-812, P1): hardware cursor. `UPDATE_CURSOR`/`MOVE_CURSOR` carry
-    /// no response payload (the driver never reads one back), but the chains
-    /// *must* be returned to the used ring: Linux' `virtio_gpu_queue_cursor`
+    /// `UPDATE_CURSOR`/`MOVE_CURSOR` carry no response payload (Linux'
+    /// `virtio_gpu_queue_cursor` submits them with no device-writable buffer at
+    /// all), but the chains *must* be returned to the used ring: the driver
     /// sleeps on `vq->num_free` when the queue fills up, so a device that
     /// silently kept the buffers would hang the guest's cursor updates for
-    /// good. Until the cursor is implemented the guest sees a device that
-    /// accepts cursor commands and draws nothing — the pointer is still visible
-    /// because the guest composites it into the scanout.
+    /// good. A malformed cursor command is therefore logged and dropped — there
+    /// is nowhere to answer it — and never fails the device.
     fn drain_cursor(
         &mut self,
         queue: &mut Queue,
@@ -268,6 +269,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             .pop_descriptor_chain(Arc::clone(mem))
             .map(|chain| chain.head_index())
         {
+            self.handle_cursor_command(mem, queue.desc_table(), queue.size(), head);
             queue
                 .add_used(mem.as_ref(), head, 0)
                 .map_err(|e| DeviceError::Queue(e.to_string()))?;
@@ -277,16 +279,129 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 break;
             }
         }
-        if served > 0 {
-            tracing::trace!(served, "ignored virtio-gpu cursor commands (MVP-812)");
-            if queue
+        if served > 0
+            && queue
                 .needs_notification(mem.as_ref())
                 .map_err(|e| DeviceError::Queue(e.to_string()))?
-            {
-                interrupt.signal_used_queue(CURSOR_QUEUE)?;
-            }
+        {
+            interrupt.signal_used_queue(CURSOR_QUEUE)?;
         }
         Ok(())
+    }
+
+    /// One cursor-queue chain: gather, parse, act. All failure paths log and
+    /// return — the cursor protocol has no response channel.
+    fn handle_cursor_command(&mut self, mem: &GuestMem, desc_table: u64, queue_size: u16, head: u16) {
+        let segments = match chain::walk(mem, desc_table, queue_size, head) {
+            Ok(segments) => segments,
+            Err(error) => {
+                tracing::warn!(head, %error, "dropping malformed virtio-gpu cursor chain");
+                return;
+            }
+        };
+        let readable = match chain::split_rw(&segments) {
+            Ok((readable, _)) => readable,
+            Err(error) => {
+                tracing::warn!(head, %error, "dropping virtio-gpu cursor chain");
+                return;
+            }
+        };
+        let mut request = std::mem::take(&mut self.req_buf);
+        request.clear();
+        let gathered = gather_request(mem, readable, &mut request);
+        let result = gathered
+            .and_then(|()| {
+                CtrlHdr::parse(&request).ok_or(CommandError::Truncated {
+                    kind: 0,
+                    len: request.len(),
+                    expected: CtrlHdr::LEN,
+                })
+            })
+            .and_then(|hdr| match hdr.kind {
+                cmd::UPDATE_CURSOR => self.update_cursor(&request),
+                cmd::MOVE_CURSOR => self.move_cursor(&request),
+                other => Err(CommandError::UnsupportedCommand(other)),
+            });
+        if let Err(error) = result {
+            tracing::warn!(head, %error, "virtio-gpu cursor command rejected");
+        }
+        self.req_buf = request;
+    }
+
+    /// `UPDATE_CURSOR`: replace the cursor plane's image from a 2D resource
+    /// (or hide the plane when the resource id is 0), then position it.
+    fn update_cursor(&mut self, buf: &[u8]) -> Result<(), CommandError> {
+        let cursor = UpdateCursor::parse(buf)
+            .ok_or_else(|| truncated(cmd::UPDATE_CURSOR, buf.len(), UpdateCursor::LEN))?;
+        if cursor.scanout_id >= NUM_SCANOUTS {
+            return Err(CommandError::UnknownScanout(cursor.scanout_id));
+        }
+        if cursor.resource_id == 0 {
+            self.display
+                .hide_cursor()
+                .map_err(|error| CommandError::Display(error.to_string()))?;
+            tracing::debug!("virtio-gpu cursor hidden");
+            return Ok(());
+        }
+        let resource = self
+            .resources
+            .get(cursor.resource_id)
+            .ok_or(CommandError::UnknownResource(cursor.resource_id))?;
+        let (width, height) = (resource.width(), resource.height());
+        if width == 0 || height == 0 || width > MAX_CURSOR_DIM || height > MAX_CURSOR_DIM {
+            return Err(CommandError::CursorTooLarge { width, height });
+        }
+        // The whole resource is the cursor image; the guest transferred its
+        // pixels into it (fenced) before submitting this command.
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let mut scratch = std::mem::take(&mut self.flush_buf);
+        let outcome = match resource.rect_bytes(full, &mut scratch) {
+            Some(pixels) => self
+                .display
+                .set_cursor(
+                    width,
+                    height,
+                    cursor.hot_x,
+                    cursor.hot_y,
+                    cursor.x,
+                    cursor.y,
+                    pixels,
+                )
+                .map_err(|error| CommandError::Display(error.to_string())),
+            None => Err(CommandError::RectOutOfBounds {
+                rect: full,
+                width,
+                height,
+            }),
+        };
+        self.flush_buf = scratch;
+        outcome?;
+        tracing::debug!(
+            resource = cursor.resource_id,
+            width,
+            height,
+            x = cursor.x,
+            y = cursor.y,
+            "virtio-gpu cursor updated"
+        );
+        Ok(())
+    }
+
+    /// `MOVE_CURSOR`: reposition the plane without touching its image.
+    fn move_cursor(&mut self, buf: &[u8]) -> Result<(), CommandError> {
+        let cursor = UpdateCursor::parse(buf)
+            .ok_or_else(|| truncated(cmd::MOVE_CURSOR, buf.len(), UpdateCursor::LEN))?;
+        if cursor.scanout_id >= NUM_SCANOUTS {
+            return Err(CommandError::UnknownScanout(cursor.scanout_id));
+        }
+        self.display
+            .move_cursor(cursor.x, cursor.y)
+            .map_err(|error| CommandError::Display(error.to_string()))
     }
 
     /// Handles one control chain. Returns the number of bytes written into
@@ -380,6 +495,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
     fn dispatch(&mut self, mem: &GuestMem, hdr: &CtrlHdr, buf: &[u8]) -> Reply {
         let result = match hdr.kind {
             cmd::GET_DISPLAY_INFO => self.get_display_info(),
+            cmd::GET_EDID => self.get_edid(buf),
             cmd::RESOURCE_CREATE_2D => self.resource_create_2d(buf),
             cmd::RESOURCE_UNREF => self.resource_unref(buf),
             cmd::SET_SCANOUT => self.set_scanout(buf),
@@ -424,6 +540,24 @@ impl<S: ScanoutSink> GpuDevice<S> {
         Ok(Reply {
             code: resp::OK_DISPLAY_INFO,
             body: display_info_body(&modes).to_vec(),
+        })
+    }
+
+    /// `GET_EDID` (MVP-811): a valid EDID 1.4 block whose preferred detailed
+    /// timing is the current scanout resolution.
+    fn get_edid(&self, buf: &[u8]) -> Result<Reply, CommandError> {
+        let cmd = GetEdid::parse(buf)
+            .ok_or_else(|| truncated(cmd::GET_EDID, buf.len(), GetEdid::LEN))?;
+        if cmd.scanout >= NUM_SCANOUTS {
+            return Err(CommandError::UnknownScanout(cmd.scanout));
+        }
+        let (width, height) = self.display.resolution();
+        let block = crate::edid::edid_block(width, height)
+            .ok_or(CommandError::UnencodableMode { width, height })?;
+        tracing::debug!(width, height, "virtio-gpu GET_EDID");
+        Ok(Reply {
+            code: resp::OK_EDID,
+            body: edid_body(&block).to_vec(),
         })
     }
 

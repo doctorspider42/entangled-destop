@@ -35,6 +35,46 @@ pub struct ScanoutStats {
     pub resolutions: u64,
 }
 
+/// The guest's hardware-cursor plane (MVP-812): a small premultiplied-BGRA
+/// image composited over the scanout at present time, never written into the
+/// guest-pixel mirror — so a cursor move costs two small dirty rects, not a
+/// stale saved-under-region.
+#[derive(Debug, Clone)]
+struct CursorPlane {
+    width: u32,
+    height: u32,
+    /// `width * height * 4` bytes, BGRA, premultiplied alpha (the DRM
+    /// cursor-plane convention Linux' virtio_gpu driver follows).
+    pixels: Vec<u8>,
+    /// Top-left corner in scanout coordinates: hotspot position minus the
+    /// hotspot offset, so it can be negative when the pointer hugs an edge.
+    x: i64,
+    y: i64,
+    hot_x: u32,
+    hot_y: u32,
+}
+
+impl CursorPlane {
+    /// The plane clipped to a `w`×`h` scanout, or `None` when it is entirely
+    /// off screen.
+    fn clipped_rect(&self, w: u32, h: u32) -> Option<Rect> {
+        let x0 = self.x.max(0);
+        let y0 = self.y.max(0);
+        let x1 = (self.x + i64::from(self.width)).min(i64::from(w));
+        let y1 = (self.y + i64::from(self.height)).min(i64::from(h));
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+        // All four values are in 0..=u32::MAX after the clamps above.
+        Some(Rect {
+            x: x0 as u32,
+            y: y0 as u32,
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        })
+    }
+}
+
 /// The host copy of one guest scanout.
 #[derive(Debug)]
 pub struct Scanout {
@@ -46,6 +86,8 @@ pub struct Scanout {
     dirty: Option<Rect>,
     /// Bumped on every resolution change so the renderer knows to reallocate.
     generation: u64,
+    /// The cursor plane, when the guest is showing one.
+    cursor: Option<CursorPlane>,
     stats: ScanoutStats,
 }
 
@@ -64,6 +106,7 @@ impl Scanout {
                 height,
             }),
             generation: 0,
+            cursor: None,
             stats: ScanoutStats::default(),
         })
     }
@@ -199,6 +242,141 @@ impl Scanout {
     /// Takes the accumulated dirty rect, leaving the scanout clean.
     pub fn take_dirty(&mut self) -> Option<Rect> {
         self.dirty.take()
+    }
+
+    // ---------------------------------------------------- the cursor plane
+
+    /// Shows (or replaces) the cursor plane (MVP-812). `data` is tightly
+    /// packed premultiplied BGRA; extra trailing bytes are ignored. The
+    /// hotspot lands on scanout position (`x`, `y`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_cursor(
+        &mut self,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        x: u32,
+        y: u32,
+        data: &[u8],
+    ) -> Result<(), DisplayError> {
+        // The device already bounds cursor geometry; this re-check keeps the
+        // display safe on its own terms (it is a public API).
+        if width == 0
+            || height == 0
+            || u64::from(width) * u64::from(height) > crate::MAX_CURSOR_PIXELS
+        {
+            return Err(DisplayError::InvalidResolution { width, height });
+        }
+        let needed = width as usize * height as usize * BPP;
+        if data.len() < needed {
+            return Err(DisplayError::ShortPixelData {
+                expected: needed,
+                actual: data.len(),
+            });
+        }
+        self.dirty_under_cursor();
+        self.cursor = Some(CursorPlane {
+            width,
+            height,
+            pixels: data[..needed].to_vec(),
+            x: i64::from(x) - i64::from(hot_x),
+            y: i64::from(y) - i64::from(hot_y),
+            hot_x,
+            hot_y,
+        });
+        self.dirty_under_cursor();
+        Ok(())
+    }
+
+    /// Moves the cursor plane's hotspot to (`x`, `y`). A move with no plane
+    /// shown is a no-op (the guest moves a hidden cursor freely).
+    pub fn move_cursor(&mut self, x: u32, y: u32) {
+        self.dirty_under_cursor();
+        if let Some(cursor) = &mut self.cursor {
+            cursor.x = i64::from(x) - i64::from(cursor.hot_x);
+            cursor.y = i64::from(y) - i64::from(cursor.hot_y);
+        }
+        self.dirty_under_cursor();
+    }
+
+    /// Hides the cursor plane.
+    pub fn hide_cursor(&mut self) {
+        self.dirty_under_cursor();
+        self.cursor = None;
+    }
+
+    /// Whether a cursor plane is currently shown.
+    pub fn cursor_visible(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    /// The visible part of the cursor composited over the guest pixels:
+    /// the clipped scanout rect it covers, and that rect's pixels with the
+    /// cursor blended in (premultiplied source-over). `None` when no cursor is
+    /// shown or it is entirely off screen.
+    ///
+    /// The guest-pixel mirror itself is never touched: the renderer uploads
+    /// this block *after* the dirty base rect, and screenshots apply it onto
+    /// their copy, so the plane behaves like the hardware overlay it models.
+    pub fn cursor_overlay(&self) -> Option<(Rect, Vec<u8>)> {
+        let cursor = self.cursor.as_ref()?;
+        let rect = cursor.clipped_rect(self.width, self.height)?;
+        let mut out = vec![0u8; rect.width as usize * rect.height as usize * BPP];
+        let stride = self.stride();
+        for row in 0..rect.height as usize {
+            let src_start = (rect.y as usize + row) * stride + rect.x as usize * BPP;
+            let dst_start = row * rect.width as usize * BPP;
+            let width_bytes = rect.width as usize * BPP;
+            let (Some(src), Some(dst)) = (
+                self.pixels.get(src_start..src_start + width_bytes),
+                out.get_mut(dst_start..dst_start + width_bytes),
+            ) else {
+                // Unreachable given clipped_rect; still no panic.
+                return None;
+            };
+            dst.copy_from_slice(src);
+        }
+        // Blend the overlapping part of the cursor image. The offsets of the
+        // clipped rect inside the cursor image are non-negative by clipping.
+        let cur_x0 = (i64::from(rect.x) - cursor.x) as usize;
+        let cur_y0 = (i64::from(rect.y) - cursor.y) as usize;
+        for row in 0..rect.height as usize {
+            for col in 0..rect.width as usize {
+                let src_at = ((cur_y0 + row) * cursor.width as usize + cur_x0 + col) * BPP;
+                let dst_at = (row * rect.width as usize + col) * BPP;
+                let (Some(src), Some(dst)) = (
+                    cursor.pixels.get(src_at..src_at + BPP),
+                    out.get_mut(dst_at..dst_at + BPP),
+                ) else {
+                    return None;
+                };
+                let alpha = u16::from(src[3]);
+                for channel in 0..BPP {
+                    // Premultiplied source-over: dst = src + dst * (255 - a).
+                    let blended = u16::from(src[channel])
+                        + (u16::from(dst[channel]) * (255 - alpha) + 127) / 255;
+                    dst[channel] = blended.min(255) as u8;
+                }
+            }
+        }
+        Some((rect, out))
+    }
+
+    /// Marks the scanout area under the cursor dirty, so the renderer restores
+    /// the base pixels there when the cursor moves away or changes shape.
+    fn dirty_under_cursor(&mut self) {
+        let Some(rect) = self
+            .cursor
+            .as_ref()
+            .and_then(|c| c.clipped_rect(self.width, self.height))
+        else {
+            return;
+        };
+        self.dirty = Some(match self.dirty {
+            Some(existing) => union(existing, rect),
+            None => rect,
+        });
     }
 
     /// Marks the whole scanout dirty (used after a texture reallocation).
@@ -451,6 +629,87 @@ mod tests {
         .join();
         assert!(shared.is_poisoned());
         assert_eq!(lock_scanout(&shared).size(), (2, 2));
+    }
+
+    /// One opaque premultiplied-BGRA pixel.
+    fn cursor_px(bgra: [u8; 4]) -> Vec<u8> {
+        bgra.to_vec()
+    }
+
+    #[test]
+    fn cursor_overlay_composites_over_the_base_without_touching_it() {
+        let mut s = Scanout::new(4, 4).unwrap();
+        s.fill([10, 20, 30, 0xff]);
+        let _ = s.take_dirty();
+
+        // Opaque red 1x1 cursor at (2,1), hotspot 0.
+        s.set_cursor(1, 1, 0, 0, 2, 1, &cursor_px([0, 0, 0xff, 0xff]))
+            .unwrap();
+        let (rect, pixels) = s.cursor_overlay().expect("visible cursor");
+        assert_eq!((rect.x, rect.y, rect.width, rect.height), (2, 1, 1, 1));
+        assert_eq!(pixels, vec![0, 0, 0xff, 0xff]);
+        // The base mirror still holds the guest pixels underneath.
+        assert_eq!(pixel(&s, 2, 1), [10, 20, 30, 0xff]);
+        // Showing the cursor dirtied its rect so the renderer redraws there.
+        assert_eq!(
+            s.take_dirty(),
+            Some(Rect {
+                x: 2,
+                y: 1,
+                width: 1,
+                height: 1
+            })
+        );
+
+        // 50% premultiplied gray over the base blends both halves.
+        s.set_cursor(1, 1, 0, 0, 0, 0, &cursor_px([0x40, 0x40, 0x40, 0x80]))
+            .unwrap();
+        let (_, pixels) = s.cursor_overlay().expect("visible cursor");
+        // dst = src + base * (255-128)/255: 0x40 + round(10*127/255) = 0x45 …
+        assert_eq!(pixels[0], 0x40 + ((10 * 127 + 127) / 255) as u8);
+        assert_eq!(pixels[3], 0x80 + ((255 * 127 + 127) / 255) as u8);
+    }
+
+    #[test]
+    fn cursor_moves_mark_both_positions_dirty_and_clip_at_edges() {
+        let mut s = Scanout::new(8, 8).unwrap();
+        let _ = s.take_dirty();
+        let image = vec![0xffu8; 2 * 2 * 4];
+        // Hotspot (1,1) at (0,0): the image's top-left hangs off screen.
+        s.set_cursor(2, 2, 1, 1, 0, 0, &image).unwrap();
+        let (rect, pixels) = s.cursor_overlay().expect("clipped but visible");
+        assert_eq!((rect.x, rect.y, rect.width, rect.height), (0, 0, 1, 1));
+        assert_eq!(pixels.len(), 4);
+
+        let _ = s.take_dirty();
+        s.move_cursor(6, 6);
+        // The dirty union covers the vacated corner and the new position.
+        let dirty = s.take_dirty().expect("move dirties");
+        assert_eq!((dirty.x, dirty.y), (0, 0));
+        assert!(dirty.width >= 7 && dirty.height >= 7, "{dirty:?}");
+        let (rect, _) = s.cursor_overlay().expect("visible");
+        assert_eq!((rect.x, rect.y, rect.width, rect.height), (5, 5, 2, 2));
+
+        // Entirely off screen: no overlay, and hiding cleans up.
+        s.move_cursor(20, 20);
+        assert!(s.cursor_overlay().is_none());
+        s.hide_cursor();
+        assert!(!s.cursor_visible());
+        assert!(s.cursor_overlay().is_none());
+    }
+
+    #[test]
+    fn absurd_cursors_are_refused() {
+        let mut s = Scanout::new(8, 8).unwrap();
+        let image = vec![0u8; 16];
+        assert!(s.set_cursor(0, 2, 0, 0, 0, 0, &image).is_err());
+        assert!(s.set_cursor(2, 0, 0, 0, 0, 0, &image).is_err());
+        assert!(s.set_cursor(2, 2, 0, 0, 0, 0, &image[..8]).is_err(), "short data");
+        assert!(
+            s.set_cursor(4096, 4096, 0, 0, 0, 0, &image).is_err(),
+            "over the plane cap"
+        );
+        assert!(!s.cursor_visible());
     }
 
     #[test]

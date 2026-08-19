@@ -72,6 +72,33 @@ pub trait ScanoutSink: Send {
         height: u32,
         data: &[u8],
     ) -> Result<(), SinkError>;
+
+    /// Shows (or replaces) the hardware-cursor plane (MVP-812): a
+    /// `width`×`height` BGRA image with its hotspot at (`hot_x`, `hot_y`),
+    /// positioned so the hotspot lands on (`x`, `y`) of the scanout. The image
+    /// alpha is premultiplied (the DRM cursor-plane convention, which is what
+    /// Linux' virtio_gpu driver puts in the cursor resource).
+    ///
+    /// The device has already bounded the image ([`crate::MAX_CURSOR_DIM`]) and
+    /// validated `data`'s length; the host clips the position, which may hang
+    /// off any scanout edge.
+    #[allow(clippy::too_many_arguments)]
+    fn set_cursor(
+        &self,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        x: u32,
+        y: u32,
+        data: &[u8],
+    ) -> Result<(), SinkError>;
+
+    /// Moves the cursor plane's hotspot to (`x`, `y`) of the scanout.
+    fn move_cursor(&self, x: u32, y: u32) -> Result<(), SinkError>;
+
+    /// Hides the cursor plane (`UPDATE_CURSOR` with resource 0).
+    fn hide_cursor(&self) -> Result<(), SinkError>;
 }
 
 /// Blanket forwarding so a device can be handed `&`-shared or boxed sinks.
@@ -93,6 +120,27 @@ impl<S: ScanoutSink + ?Sized> ScanoutSink for Box<S> {
         data: &[u8],
     ) -> Result<(), SinkError> {
         (**self).update_scanout(x, y, width, height, data)
+    }
+
+    fn set_cursor(
+        &self,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        x: u32,
+        y: u32,
+        data: &[u8],
+    ) -> Result<(), SinkError> {
+        (**self).set_cursor(width, height, hot_x, hot_y, x, y, data)
+    }
+
+    fn move_cursor(&self, x: u32, y: u32) -> Result<(), SinkError> {
+        (**self).move_cursor(x, y)
+    }
+
+    fn hide_cursor(&self) -> Result<(), SinkError> {
+        (**self).hide_cursor()
     }
 }
 
@@ -121,6 +169,27 @@ mod tests {
         ) -> Result<(), SinkError> {
             Ok(())
         }
+
+        fn set_cursor(
+            &self,
+            _width: u32,
+            _height: u32,
+            _hot_x: u32,
+            _hot_y: u32,
+            _x: u32,
+            _y: u32,
+            _data: &[u8],
+        ) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn move_cursor(&self, _x: u32, _y: u32) -> Result<(), SinkError> {
+            Err(SinkError::new("no cursor plane"))
+        }
+
+        fn hide_cursor(&self) -> Result<(), SinkError> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -130,5 +199,9 @@ mod tests {
         assert!(sink.update_scanout(0, 0, 1, 1, &[0; 4]).is_ok());
         let error = sink.set_resolution(1, 1).expect_err("Nothing refuses");
         assert_eq!(error.to_string(), "fixed size");
+        assert!(sink.set_cursor(1, 1, 0, 0, 0, 0, &[0; 4]).is_ok());
+        let error = sink.move_cursor(1, 1).expect_err("Nothing refuses");
+        assert_eq!(error.to_string(), "no cursor plane");
+        assert!(sink.hide_cursor().is_ok());
     }
 }

@@ -98,6 +98,11 @@ pub use viewport::{letterbox, DisplayConfig, Viewport};
 /// guest cannot make the host allocate an absurd framebuffer.
 pub const MAX_SCANOUT_PIXELS: u64 = virtio_gpu::MAX_RESOURCE_PIXELS;
 
+/// Largest cursor plane the scanout will composite, matching what the GPU
+/// device accepts ([`virtio_gpu::MAX_CURSOR_DIM`] per axis).
+pub const MAX_CURSOR_PIXELS: u64 =
+    (virtio_gpu::MAX_CURSOR_DIM as u64) * (virtio_gpu::MAX_CURSOR_DIM as u64);
+
 /// The pixel format of the scanout texture, matching the only byte layout the
 /// guest gets ([`virtio_gpu::FORMAT_B8G8R8A8_UNORM`] and its alpha-less twin
 /// [`virtio_gpu::FORMAT_B8G8R8X8_UNORM`]) so pixels are copied verbatim.

@@ -201,16 +201,59 @@ impl DisplayHandle {
         Arc::clone(&self.scanout)
     }
 
-    /// Detached copy of the current scanout; the lock is released before the
-    /// caller does anything slow with it.
+    /// Shows or replaces the cursor plane (MVP-812); see
+    /// [`Scanout::set_cursor`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_cursor(
+        &self,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        x: u32,
+        y: u32,
+        data: &[u8],
+    ) -> Result<(), DisplayError> {
+        {
+            let mut scanout = lock_scanout(&self.scanout);
+            scanout.set_cursor(width, height, hot_x, hot_y, x, y, data)?;
+        }
+        self.waker.wake();
+        Ok(())
+    }
+
+    /// Moves the cursor plane's hotspot.
+    pub fn move_cursor(&self, x: u32, y: u32) {
+        {
+            let mut scanout = lock_scanout(&self.scanout);
+            scanout.move_cursor(x, y);
+        }
+        self.waker.wake();
+    }
+
+    /// Hides the cursor plane.
+    pub fn hide_cursor(&self) {
+        {
+            let mut scanout = lock_scanout(&self.scanout);
+            scanout.hide_cursor();
+        }
+        self.waker.wake();
+    }
+
+    /// Detached copy of the current scanout with the cursor plane composited
+    /// in — screenshots must show what the window shows; the lock is released
+    /// before the caller does anything slow with it.
     fn snapshot(&self) -> Result<Scanout, DisplayError> {
-        let (width, height, pixels) = {
+        let (width, height, pixels, overlay) = {
             let scanout = lock_scanout(&self.scanout);
             let (w, h) = scanout.size();
-            (w, h, scanout.pixels().to_vec())
+            (w, h, scanout.pixels().to_vec(), scanout.cursor_overlay())
         };
         let mut snapshot = Scanout::new(width, height)?;
         snapshot.update(0, 0, width, height, &pixels)?;
+        if let Some((rect, composited)) = overlay {
+            snapshot.update(rect.x, rect.y, rect.width, rect.height, &composited)?;
+        }
         Ok(snapshot)
     }
 }
@@ -236,6 +279,29 @@ impl virtio_gpu::ScanoutSink for DisplayHandle {
         data: &[u8],
     ) -> Result<(), virtio_gpu::SinkError> {
         DisplayHandle::update_scanout(self, x, y, width, height, data).map_err(sink_error)
+    }
+
+    fn set_cursor(
+        &self,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        x: u32,
+        y: u32,
+        data: &[u8],
+    ) -> Result<(), virtio_gpu::SinkError> {
+        DisplayHandle::set_cursor(self, width, height, hot_x, hot_y, x, y, data).map_err(sink_error)
+    }
+
+    fn move_cursor(&self, x: u32, y: u32) -> Result<(), virtio_gpu::SinkError> {
+        DisplayHandle::move_cursor(self, x, y);
+        Ok(())
+    }
+
+    fn hide_cursor(&self) -> Result<(), virtio_gpu::SinkError> {
+        DisplayHandle::hide_cursor(self);
+        Ok(())
     }
 }
 

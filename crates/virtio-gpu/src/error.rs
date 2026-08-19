@@ -72,6 +72,16 @@ pub enum CommandError {
 
     #[error("command {0:#06x} is not implemented")]
     UnsupportedCommand(u32),
+
+    #[error(
+        "cursor image {width}x{height} is empty or exceeds the \
+         {max}x{max} cursor plane limit",
+        max = crate::MAX_CURSOR_DIM
+    )]
+    CursorTooLarge { width: u32, height: u32 },
+
+    #[error("scanout mode {width}x{height} cannot be encoded as an EDID timing")]
+    UnencodableMode { width: u32, height: u32 },
 }
 
 impl CommandError {
@@ -90,7 +100,9 @@ impl CommandError {
             | Self::RequestTooLarge(_)
             | Self::NoEntries
             | Self::Unreadable { .. }
-            | Self::Display(_) => resp::ERR_INVALID_PARAMETER,
+            | Self::Display(_)
+            | Self::CursorTooLarge { .. }
+            | Self::UnencodableMode { .. } => resp::ERR_INVALID_PARAMETER,
 
             Self::ZeroResourceId | Self::UnknownResource(_) | Self::DuplicateResource(_) => {
                 resp::ERR_INVALID_RESOURCE_ID
