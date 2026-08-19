@@ -172,19 +172,53 @@ pub struct DiskSection {
     pub writable: bool,
 }
 
+/// How the guest's virtio-net device reaches a real network (EPIC 5, WHP-1704).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum NetworkBackend {
+    /// A host TAP interface (`scripts/setup-tap.sh`). Linux only — Windows has
+    /// no TAP, and the drivers that would provide one are GPL (ADR-0002); the
+    /// run path reports that rather than this crate, which validates the same
+    /// config on every host.
     Tap,
+    /// User-mode NAT inside the `entangled` process (smoltcp): DHCP, DNS relay
+    /// and outbound TCP with no host interface, no `CAP_NET_ADMIN` and no
+    /// administrator. The only backend on Windows, and the rootless option on
+    /// Linux.
+    Usernet,
+}
+
+impl std::fmt::Display for NetworkBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tap => f.write_str("tap"),
+            Self::Usernet => f.write_str("usernet"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkSection {
     pub backend: NetworkBackend,
-    pub interface: String,
+    /// The host TAP interface. Required by `backend = "tap"`, meaningless (and
+    /// therefore refused) for `backend = "usernet"`, whose segment lives inside
+    /// the process and touches no host interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
     /// Optional fixed MAC ("52:00:…"); derived from the VM name when absent.
     pub mac: Option<String>,
+}
+
+impl NetworkSection {
+    /// The TAP interface name, for `backend = "tap"` callers. Validation
+    /// guarantees it is present for that backend; this accessor keeps the error
+    /// typed for callers that build a section by hand.
+    pub fn require_interface(&self) -> Result<&str, ConfigError> {
+        self.interface.as_deref().ok_or_else(|| {
+            ConfigError::Invalid("network.interface is required for backend = \"tap\"".into())
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -232,6 +266,27 @@ impl VmConfig {
         }
         if self.display.width == 0 || self.display.height == 0 {
             return err("display dimensions must be non-zero".into());
+        }
+        // Per-backend network keys, same policy as the boot section: the wrong
+        // key is refused rather than ignored, so a profile that names a TAP
+        // interface under backend = "usernet" fails loudly instead of quietly
+        // not using the interface its author configured.
+        if let Some(network) = &self.network {
+            match network.backend {
+                NetworkBackend::Tap => {
+                    if network.interface.is_none() {
+                        return err("network.interface is required for backend = \"tap\"".into());
+                    }
+                }
+                NetworkBackend::Usernet => {
+                    if network.interface.is_some() {
+                        return err("network.interface is only valid for backend = \"tap\"; \
+                             the usernet segment lives inside the entangled process and uses \
+                             no host interface"
+                            .into());
+                    }
+                }
+            }
         }
         // Per-mode boot keys: reject the *wrong* key instead of ignoring it,
         // so a profile that names a kernel under mode = "uefi" fails loudly
@@ -325,7 +380,10 @@ scale = 1.0
         );
         assert_eq!(cfg.disks.len(), 1);
         assert!(cfg.disks[0].writable);
-        assert_eq!(cfg.network.as_ref().unwrap().interface, "entangled0");
+        assert_eq!(
+            cfg.network.as_ref().unwrap().interface.as_deref(),
+            Some("entangled0")
+        );
         assert_eq!(cfg.display.width, 1920);
     }
 
@@ -598,6 +656,54 @@ firmware = "artifacts/firmware/CLOUDHV.fd"
             panic!("expected a validation error, got {error:?}");
         };
         assert!(message.contains("boot.nvram"), "{message}");
+    }
+
+    /// WHP-1704: the user-mode NAT backend is a first-class config choice, and
+    /// the section round-trips without an interface key.
+    #[test]
+    fn usernet_is_a_backend_and_needs_no_interface() {
+        let usernet = BACKLOG_EXAMPLE.replace(
+            "backend = \"tap\"\ninterface = \"entangled0\"",
+            "backend = \"usernet\"",
+        );
+        let cfg = VmConfig::from_toml(&usernet).unwrap();
+        let network = cfg.network.as_ref().unwrap();
+        assert_eq!(network.backend, NetworkBackend::Usernet);
+        assert_eq!(network.interface, None);
+        assert!(network.require_interface().is_err());
+        assert_eq!(network.backend.to_string(), "usernet");
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!text.contains("interface"), "no interface key in:\n{text}");
+        assert_eq!(VmConfig::from_toml(&text).unwrap(), cfg);
+    }
+
+    /// The wrong network key for the backend is refused, in both directions —
+    /// same policy as the boot section's per-mode keys.
+    #[test]
+    fn network_keys_must_match_the_backend() {
+        // usernet with a TAP interface: the author configured something the
+        // backend would silently ignore.
+        let stray = BACKLOG_EXAMPLE.replace("backend = \"tap\"", "backend = \"usernet\"");
+        let error = VmConfig::from_toml(&stray).expect_err("usernet + interface must be refused");
+        let ConfigError::Invalid(message) = error else {
+            panic!("expected a validation error, got {error:?}");
+        };
+        assert!(message.contains("usernet"), "{message}");
+
+        // tap without an interface: nothing to open.
+        let missing = BACKLOG_EXAMPLE.replace("interface = \"entangled0\"", "");
+        let error = VmConfig::from_toml(&missing).expect_err("tap without interface");
+        let ConfigError::Invalid(message) = error else {
+            panic!("expected a validation error, got {error:?}");
+        };
+        assert!(message.contains("network.interface"), "{message}");
+
+        // The tap example still parses and still names its interface.
+        let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
+        assert_eq!(
+            cfg.network.as_ref().unwrap().require_interface().unwrap(),
+            "entangled0"
+        );
     }
 
     #[test]
