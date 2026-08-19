@@ -154,7 +154,7 @@ fn entry_from_config(path: &Path, cfg: &VmConfig, work_dir: Option<&Path>) -> Vm
         memory_mib: cfg.memory_mib,
         vcpus: cfg.vcpus,
         display: (cfg.display.width, cfg.display.height),
-        network_interface: cfg.network.as_ref().map(|n| n.interface.clone()),
+        network_interface: cfg.network.as_ref().and_then(|n| n.interface.clone()),
         disks,
     }
 }

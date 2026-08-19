@@ -1,0 +1,32 @@
+# `entangled run`, natively on a Windows host, through the Windows Hypervisor
+# Platform (EPIC 17 phase 4):
+#
+#   cargo run -p entangled -- run examples\windows-whp.toml
+#
+# The profile shape is exactly the Linux one — same keys, same devices, same
+# window. The one Windows-specific choice is the network backend: there is no
+# TAP on Windows (and the drivers that would provide one are GPL), so the
+# user-mode NAT carries the traffic — DHCP, DNS relay and outbound TCP from
+# inside the `entangled` process, no administrator required. `usernet` works on
+# Linux too, as the rootless option.
+#
+# Artifacts: scripts/fetch-test-kernel.sh + scripts/build-test-initramfs.sh (in
+# WSL), or copy artifacts/ from a Linux checkout. The test guest prints
+# VMHOST_GUEST_READY and reboots; point [boot] at the bootstrap initramfs and
+# add a [[disk]] to switch_root into an installed image instead.
+name = "whp-bootstrap"
+memory_mib = 512
+vcpus = 2
+
+[boot]
+mode = "direct-linux"
+kernel = "artifacts/bootstrap/vmlinuz"
+initramfs = "artifacts/tests/test-initramfs.cpio.gz"
+# `entangled.poweroff=1`: end the run through ACPI S5, which both hosts turn
+# into a clean stop. The test suite's usual `reboot=k` triple fault is *not* a
+# way to end a WHP VM — WHP's local APIC emulation absorbs the reset instead of
+# reporting an exit, and the vCPU parks forever (see the whp-backend skill).
+cmdline = "console=ttyS0 earlyprintk=serial panic=1 reboot=k entangled.poweroff=1"
+
+[network]
+backend = "usernet"

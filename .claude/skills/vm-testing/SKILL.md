@@ -37,11 +37,17 @@ unit tests live with their crates.
 
 ## Running
 
-- Local (Windows host): everything through WSL —
-  `wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace"`.
-  WSL2 exposes `/dev/kvm`; the dev user must be in the `kvm` group.
+- Local (Windows host): the KVM side through WSL —
+  `wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace"`
+  (WSL2 exposes `/dev/kvm`; the dev user must be in the `kvm` group) — and the
+  WHP side natively: `cargo test --workspace` in PowerShell runs the whole
+  suite including the `whp_*` acceptance boots (`whp_boot`, `whp_virtio_blk`,
+  `whp_virtio_pci`, `whp_smp`, `whp_usernet`, `whp_uefi`), each self-skipping
+  without the optional feature or the artifacts.
 - CI: standard GitHub runners now expose `/dev/kvm` on Linux; tier 3-4 tests
-  run there, tiers 5-6 are scheduled jobs.
+  run there, tiers 5-6 are scheduled jobs. The `windows-latest` job builds,
+  lints and tests the workspace and asserts the `whp_*` self-skip path stays a
+  loud, working path (no WHP on GitHub's runners).
 - Docker: `docker run --device /dev/kvm …` (see `docker/Dockerfile.dev`).
 
 ## Guest test images
@@ -62,6 +68,15 @@ unit tests live with their crates.
   "the guest booted". Pair it with `BootSpec::with_poweroff_probe()`, which
   waits for the *guest* to end the VM (`BootOutcome::ended_by_guest`) instead of
   stopping it from the host — otherwise a broken S5 path looks like a pass.
+  **On WHP it is the only guest-initiated ending**: the `reboot=k` triple fault
+  that cleanly stops a KVM VM parks a WHP vCPU with no exit at all (see the
+  whp-backend skill), so a WHP run that waits for the guest must use S5.
+- `entangled.netprobe=<ip>/<prefix>,<gateway>,<host>:<port>` configures eth0
+  statically (ioctls — no DHCP client exists in this initramfs), opens a TCP
+  connection to `<host>:<port>` and requires its greeting echoed back — the
+  guest half of the user-mode-NAT acceptance
+  (`crates/vmm-core/tests/whp_usernet.rs`). TX alone is a SYN; only the echo
+  proves RX delivery.
 - Sources: `guest/test-rootfs/init-rs` (static musl init), built by
   `scripts/build-test-initramfs.sh`; kernel via `scripts/fetch-test-kernel.sh`.
 

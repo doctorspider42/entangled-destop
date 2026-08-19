@@ -1,8 +1,8 @@
 //! WHP partition lifecycle and guest memory mapping (backlog WHP-1702).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use vm_memory::{Address, GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
+use vm_memory::{Address, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, MmapRegion};
 use windows::Win32::System::Hypervisor::{
     WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeProcessorVendor, WHvCreatePartition,
     WHvCreateVirtualProcessor, WHvDeletePartition, WHvGetCapability, WHvMapGpaRange,
@@ -195,6 +195,24 @@ pub struct Partition {
     halt_gate: Arc<HaltGate>,
     /// Number of virtual processors, fixed before `WHvSetupPartition`.
     vcpu_count: u32,
+    /// Firmware ROM mappings (EPIC 18): the WHP peer of [`crate::Vm`]'s ROM
+    /// slots. Deliberately *not* part of `memory` — a ROM is not guest RAM and
+    /// must never show up in a memory map. Held here so the host mapping
+    /// outlives every hypervisor reference: `Drop::drop` runs
+    /// `WHvDeletePartition` before the struct's fields are dropped, so the
+    /// backing store is released only after the GPA mappings are gone. Behind a
+    /// `Mutex` because mapping happens through the `Arc` every vCPU shares.
+    roms: Mutex<Vec<WhpRom>>,
+}
+
+/// A firmware image mapped into the partition outside guest RAM.
+struct WhpRom {
+    /// The host mapping backing the range. Never read from Rust again — WHP
+    /// holds the only live reference — but dropping it would unmap memory the
+    /// guest is executing from, so it stays owned by the `Partition`.
+    _mapping: MmapRegion<()>,
+    guest_addr: u64,
+    len: u64,
 }
 
 impl Partition {
@@ -329,6 +347,7 @@ impl WhpPartition {
             options,
             halt_gate: Arc::new(HaltGate::default()),
             vcpu_count: cfg.vcpu_count,
+            roms: Mutex::new(Vec::new()),
         });
 
         set_processor_count(handle, cfg.vcpu_count)?;
@@ -441,6 +460,87 @@ impl WhpPartition {
     /// interrupt (a stop request).
     pub fn halt_gate(&self) -> Arc<HaltGate> {
         Arc::clone(self.partition.halt_gate())
+    }
+
+    /// Maps a firmware image at `guest_addr` as its own GPA range, outside guest
+    /// RAM (backlog UEFI-1801, the WHP peer of [`crate::Vm::map_rom`]). The image
+    /// is copied into a fresh anonymous mapping, so the caller's buffer is free
+    /// afterwards.
+    ///
+    /// Mapped **read + execute, no write**: a guest write faults out as a
+    /// `MemoryAccess` exit, goes through the instruction emulator to
+    /// `ExitHandler::mmio_write`, and the machine bus drops it — the same
+    /// "firmware variable writes are discarded" semantics the KVM path gets from
+    /// `KVM_MEM_READONLY`.
+    ///
+    /// `guest_addr + len` may exceed the RAM size; that is the point — a
+    /// reset-vector firmware ROM lives at the top of the 32-bit address space,
+    /// far above any guest RAM region.
+    pub fn map_rom(&mut self, guest_addr: u64, image: &[u8]) -> Result<(), VmmError> {
+        if image.is_empty() {
+            return Err(VmmError::GuestMemory("firmware image is empty".into()));
+        }
+        let page = 0x1000usize;
+        if guest_addr % page as u64 != 0 || image.len() % page != 0 {
+            return Err(VmmError::GuestMemory(format!(
+                "firmware ROM must be page aligned in address and size \
+                 (got {guest_addr:#x} + {:#x})",
+                image.len()
+            )));
+        }
+        let mut roms = self
+            .partition
+            .roms
+            .lock()
+            .map_err(|_| VmmError::GuestMemory("the ROM table lock is poisoned".into()))?;
+        if roms.iter().any(|r| {
+            let new_end = guest_addr.saturating_add(image.len() as u64);
+            let end = r.guest_addr.saturating_add(r.len);
+            guest_addr < end && r.guest_addr < new_end
+        }) {
+            return Err(VmmError::GuestMemory(format!(
+                "a firmware ROM is already mapped over {guest_addr:#x}"
+            )));
+        }
+
+        let mapping = MmapRegion::<()>::new(image.len())
+            .map_err(|e| VmmError::GuestMemory(format!("cannot map firmware ROM: {e}")))?;
+        // SAFETY: `MmapRegion::new(len)` returned a private anonymous mapping of
+        // exactly `len` bytes that nothing else references yet, and
+        // `image.len() == len`. Source and destination cannot overlap: the
+        // destination is a brand-new mapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(image.as_ptr(), mapping.as_ptr(), image.len());
+        }
+
+        // SAFETY: `mapping` is a live, page-aligned host allocation of exactly
+        // `image.len()` bytes, owned by the partition's ROM table from the push
+        // below onward and therefore alive until after `WHvDeletePartition`
+        // (`Partition::drop` deletes the partition before its fields drop). The
+        // GPA range does not overlap another ROM (checked above); overlapping
+        // guest RAM is the caller's contract, as it is for the KVM slots.
+        unsafe {
+            WHvMapGpaRange(
+                self.partition.handle,
+                mapping.as_ptr().cast::<core::ffi::c_void>(),
+                guest_addr,
+                image.len() as u64,
+                WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute,
+            )
+        }
+        .map_err(|e| whp_err("WHvMapGpaRange(rom)", e))?;
+
+        roms.push(WhpRom {
+            _mapping: mapping,
+            guest_addr,
+            len: image.len() as u64,
+        });
+        tracing::info!(
+            addr = format_args!("{guest_addr:#x}"),
+            len = image.len(),
+            "mapped firmware ROM (read+execute)"
+        );
+        Ok(())
     }
 
     /// Moves the vCPUs out for running. Each vCPU is owned by exactly one

@@ -65,31 +65,66 @@
 //! [`IntxLine`] checks the flag the config space maintains, so `pci_intx(dev, 0)`
 //! really does stop the injections — and while MSI-X is enabled the transport
 //! never raises the line at all (`virtio_core::msix`).
+//!
+//! # Two hosts, one bus (EPIC 17 phase 4)
+//!
+//! The same split [`crate::virtio::VirtioMmioBus`] got in phase 3, one transport
+//! later. Everything above is host-neutral — the config space, the BAR decode,
+//! the capability records, the MSI-X table semantics — and only the three wiring
+//! primitives differ:
+//!
+//! * [`VirtioPciBus::attach`] / [`VirtioPciBus::attach_with`] — KVM: an irqfd per
+//!   INTx line, `KVM_SIGNAL_MSI` per MSI-X message, an ioeventfd per queue.
+//! * [`VirtioPciBus::attach_userspace`] — a host with no in-kernel irqchip (WHP):
+//!   INTx through [`crate::irqchip::UserspaceIrqChip`]'s IOAPIC, MSI-X through
+//!   [`crate::msi::UserspaceMsiSink`] (the architectural decode plus one
+//!   `InterruptDelivery::request`), and every kick inline on the vCPU thread.
+//!
+//! The rebasing dance [`VirtioPciBus::reconcile_notify`] does for KVM does not
+//! exist on the userspace path, and not because it is unfinished: with no
+//! ioeventfds there is nothing registered at an absolute address. A kick is an
+//! MMIO exit decoded through [`crate::pci::PciRoot::locate_mmio`] against the
+//! BAR's *current* base on every access, so the notification area follows a BAR
+//! move by construction.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "linux")]
 use kvm_ioctls::VmFd;
 use thiserror::Error;
-use virtio_core::interrupt::{InterruptError, IrqLine};
+use virtio_core::interrupt::{InterruptError, IrqLine, MsiSink};
 use virtio_core::pci as vpci;
 use virtio_core::transport::TransportError;
 use virtio_core::{GuestMem, PciTransport, VirtioDevice};
 
+use crate::irqchip::{IrqChipError, UserspaceIrqChip};
+#[cfg(target_os = "linux")]
 use crate::irqfd::{IrqFdError, IrqFdLine};
 use crate::layout;
+#[cfg(target_os = "linux")]
 use crate::msi::KvmMsiSink;
+use crate::msi::UserspaceMsiSink;
+#[cfg(target_os = "linux")]
 use crate::notify::{DeviceNotifier, NotifyAddressing, NotifyError, QueueNotifyMode};
 use crate::pci::{ConfigSpace, PciError, PciRoot};
 use virtio_core::msix;
 
 #[derive(Debug, Error)]
 pub enum VirtioPciAttachError {
+    #[cfg(target_os = "linux")]
     #[error("failed to wire the interrupt line for PCI slot {slot}: {source}")]
     Irq {
         slot: usize,
         #[source]
         source: IrqFdError,
+    },
+
+    #[error("failed to wire the IOAPIC line for PCI slot {slot}: {source}")]
+    IrqChip {
+        slot: usize,
+        #[source]
+        source: IrqChipError,
     },
 
     #[error("PCI slot {slot}: {source}")]
@@ -106,6 +141,7 @@ pub enum VirtioPciAttachError {
         source: PciError,
     },
 
+    #[cfg(target_os = "linux")]
     #[error(transparent)]
     Notify(#[from] NotifyError),
 }
@@ -215,11 +251,13 @@ pub struct VirtioPciSlot {
     pub transport: Arc<Mutex<PciTransport>>,
     /// Present when this device's queue kicks are served by ioeventfds and a
     /// worker thread; `None` means every kick runs inline on the vCPU.
+    #[cfg(target_os = "linux")]
     notifier: Option<DeviceNotifier<PciTransport>>,
 }
 
 impl VirtioPciSlot {
     /// The queue-notify offload for this device, if it has one.
+    #[cfg(target_os = "linux")]
     pub fn notifier(&self) -> Option<&DeviceNotifier<PciTransport>> {
         self.notifier.as_ref()
     }
@@ -233,8 +271,18 @@ pub struct VirtioPciBus {
     /// even a read mutates, and any vCPU can make one.
     root: Mutex<PciRoot>,
     slots: Vec<VirtioPciSlot>,
+    #[cfg(target_os = "linux")]
     mode: QueueNotifyMode,
     interrupts: PciInterruptMode,
+}
+
+/// One function's host-neutral pieces, built by [`VirtioPciBus::attach_function`]
+/// and wired to a host by whichever constructor called it.
+struct BuiltFunction {
+    device_number: u8,
+    msix_vectors: u16,
+    device_type: virtio_core::DeviceType,
+    transport: Arc<Mutex<PciTransport>>,
 }
 
 impl VirtioPciBus {
@@ -243,6 +291,7 @@ impl VirtioPciBus {
         Self {
             root: Mutex::new(PciRoot::new()),
             slots: Vec::new(),
+            #[cfg(target_os = "linux")]
             mode: QueueNotifyMode::Synchronous,
             interrupts: PciInterruptMode::default(),
         }
@@ -251,6 +300,7 @@ impl VirtioPciBus {
     /// Places `devices` on consecutive PCI device numbers starting at `00:01.0`,
     /// registering one irqfd per device, an MSI-X capability where the host can
     /// deliver MSI, and (by default) one queue-notify ioeventfd per queue.
+    #[cfg(target_os = "linux")]
     pub fn attach(
         vm: Arc<VmFd>,
         mem: Arc<GuestMem>,
@@ -260,6 +310,7 @@ impl VirtioPciBus {
     }
 
     /// [`Self::attach`] with an explicit queue-notify mode (benchmarks, tests).
+    #[cfg(target_os = "linux")]
     pub fn attach_with(
         vm: Arc<VmFd>,
         mem: Arc<GuestMem>,
@@ -272,6 +323,7 @@ impl VirtioPciBus {
     /// [`Self::attach_with`] with an explicit interrupt mode as well, which is how
     /// the INTx acceptance boot keeps testing INTx now that a Linux guest would
     /// otherwise always choose MSI-X.
+    #[cfg(target_os = "linux")]
     pub fn attach_with_interrupts(
         vm: Arc<VmFd>,
         mem: Arc<GuestMem>,
@@ -282,23 +334,24 @@ impl VirtioPciBus {
         // One probe for the whole bus: whether a function publishes MSI-X must be
         // settled before any driver can walk the capability list, and a capability
         // whose interrupts silently vanish is worse than no capability.
-        let msi = match (interrupts.is_msix(), KvmMsiSink::is_supported(&vm)) {
-            (true, true) => Some(Arc::new(KvmMsiSink::new(Arc::clone(&vm)))),
-            (true, false) => {
-                tracing::warn!(
-                    "this host has no KVM_CAP_SIGNAL_MSI; virtio-pci functions will \
+        let msi: Option<Arc<dyn MsiSink>> =
+            match (interrupts.is_msix(), KvmMsiSink::is_supported(&vm)) {
+                (true, true) => Some(Arc::new(KvmMsiSink::new(Arc::clone(&vm)))),
+                (true, false) => {
+                    tracing::warn!(
+                        "this host has no KVM_CAP_SIGNAL_MSI; virtio-pci functions will \
                      publish no MSI-X capability and drivers will use INTx"
-                );
-                None
-            }
-            (false, _) => {
-                tracing::info!(
-                    var = PCI_INTERRUPT_MODE_ENV,
-                    "MSI-X disabled by request; virtio-pci functions are INTx only"
-                );
-                None
-            }
-        };
+                    );
+                    None
+                }
+                (false, _) => {
+                    tracing::info!(
+                        var = PCI_INTERRUPT_MODE_ENV,
+                        "MSI-X disabled by request; virtio-pci functions are INTx only"
+                    );
+                    None
+                }
+            };
         // Built up as we go so that an error part way through drops the slots
         // already created, which stops their workers and deassigns their fds.
         let mut bus = Self {
@@ -320,67 +373,15 @@ impl VirtioPciBus {
             let irqfd = IrqFdLine::new(&vm, gsi)
                 .map_err(|source| VirtioPciAttachError::Irq { slot, source })?;
 
-            // How many MSI-X vectors this function needs: one per queue plus one
-            // for configuration changes. A device with more queues than the table
-            // region can hold gets no capability rather than a table too small for
-            // its own queues — INTx still works, and the warning says why.
-            let queues = device.queue_max_sizes().len();
-            let table_size = msi.as_ref().and_then(|_| {
-                msix::table_size_for(queues).or_else(|| {
-                    tracing::warn!(
-                        slot,
-                        queues,
-                        max = msix::MAX_MSIX_VECTORS,
-                        "device has too many queues for an MSI-X table; publishing INTx only"
-                    );
-                    None
-                })
-            });
-
-            // The config space is built first so its INTx flag can gate the
-            // line the transport is about to be handed.
-            let (mut config, msix_cap_at) =
-                Self::build_config_space(slot, bar_base, gsi, device.as_ref(), table_size)?;
-            let line = Arc::new(IntxLine {
-                line: Arc::new(irqfd),
-                enabled: config.intx_flag(),
-            });
-
-            let device_type = device.device_type();
-            let transport = match (&msi, table_size) {
-                (Some(sink), Some(_)) => PciTransport::with_msix(
-                    slot,
-                    device,
-                    Arc::clone(&mem),
-                    line,
-                    Arc::clone(sink) as Arc<_>,
-                ),
-                _ => PciTransport::new(slot, device, Arc::clone(&mem), line),
-            }
-            .map_err(|source| VirtioPciAttachError::Transport { slot, source })?;
-
-            // The transport owns the message-control value it reads on every
-            // interrupt; the config space keeps it up to date with what the guest
-            // wrote. Nothing here interprets the bits.
-            if let (Some(at), Some(handle)) = (msix_cap_at, transport.msix_control_handle()) {
-                config.mirror_dword(at, handle);
-            }
-            let msix_vectors = transport.msix_table_size();
-            let transport = Arc::new(Mutex::new(transport));
-
-            let device_number = match bus.root.lock() {
-                Ok(mut root) => root
-                    .attach(config, slot)
-                    .map_err(|source| VirtioPciAttachError::Bus { slot, source })?,
-                // Only reachable if a previous panic poisoned it, which cannot
-                // have happened yet: nothing else holds this lock during setup.
-                Err(_) => {
-                    return Err(VirtioPciAttachError::Bus {
-                        slot,
-                        source: PciError::BusFull,
-                    })
-                }
-            };
+            let built = bus.attach_function(
+                slot,
+                device,
+                &mem,
+                Arc::new(irqfd),
+                msi.clone(),
+                bar_base,
+                gsi,
+            )?;
 
             let notifier = if mode.is_offloaded() {
                 // Every queue has its own notification address, so the offload
@@ -389,31 +390,188 @@ impl VirtioPciBus {
                     base: bar_base.saturating_add(vpci::NOTIFY_CFG_OFFSET),
                     stride: u64::from(vpci::NOTIFY_OFF_MULTIPLIER),
                 };
-                DeviceNotifier::attach(Arc::clone(&vm), slot, addressing, &transport)?
+                DeviceNotifier::attach(Arc::clone(&vm), slot, addressing, &built.transport)?
             } else {
                 None
             };
 
             tracing::info!(
                 slot,
-                device = ?device_type,
-                address = format_args!("00:{device_number:02x}.0"),
+                device = ?built.device_type,
+                address = format_args!("00:{:02x}.0", built.device_number),
                 bar = format_args!("{bar_base:#x}"),
                 irq = gsi,
-                msix_vectors,
+                msix_vectors = built.msix_vectors,
                 offloaded_queues = notifier.as_ref().map_or(0, |n| n.offloaded_queues().len()),
                 "attached virtio-pci device"
             );
             bus.slots.push(VirtioPciSlot {
-                device_number,
+                device_number: built.device_number,
                 bar_base,
                 irq: gsi,
-                msix_vectors,
-                transport,
+                msix_vectors: built.msix_vectors,
+                transport: built.transport,
                 notifier,
             });
         }
         Ok(bus)
+    }
+
+    /// Places `devices` on consecutive PCI device numbers on a host whose
+    /// hypervisor has **no in-kernel interrupt controllers** — WHP (EPIC 17
+    /// phase 4). The PCI peer of
+    /// [`crate::virtio::VirtioMmioBus::attach_userspace`], differing from
+    /// [`Self::attach_with_interrupts`] in exactly the three host primitives:
+    ///
+    /// * INTx lines come from the [`UserspaceIrqChip`]'s IOAPIC instead of
+    ///   irqfds — same `Arc<dyn IrqLine>`, same pins, same `interrupt_line`
+    ///   register value;
+    /// * MSI-X messages go through [`UserspaceMsiSink`] — the architectural
+    ///   address/data decode plus one `InterruptDelivery::request` — instead of
+    ///   `KVM_SIGNAL_MSI`. Same capability bytes, same table semantics;
+    /// * there is no ioeventfd, so every kick is a full exit served inline on
+    ///   the vCPU thread — and *because* every kick is decoded against the
+    ///   BAR's current base ([`crate::pci::PciRoot::locate_mmio`]), the
+    ///   ioeventfd rebasing dance does not exist here rather than being missed.
+    ///
+    /// Portable on purpose: it compiles and is exercised on Linux too, which is
+    /// what keeps its unit tests running in CI on both hosts.
+    pub fn attach_userspace(
+        mem: Arc<GuestMem>,
+        devices: Vec<Box<dyn VirtioDevice>>,
+        irqchip: &UserspaceIrqChip,
+        interrupts: PciInterruptMode,
+    ) -> Result<Self, VirtioPciAttachError> {
+        let msi: Option<Arc<dyn MsiSink>> = if interrupts.is_msix() {
+            Some(Arc::new(UserspaceMsiSink::new(
+                irqchip.interrupt_delivery(),
+            )))
+        } else {
+            tracing::info!(
+                var = PCI_INTERRUPT_MODE_ENV,
+                "MSI-X disabled by request; virtio-pci functions are INTx only"
+            );
+            None
+        };
+        let mut bus = Self {
+            root: Mutex::new(PciRoot::new()),
+            slots: Vec::with_capacity(devices.len()),
+            #[cfg(target_os = "linux")]
+            mode: QueueNotifyMode::Synchronous,
+            interrupts,
+        };
+        for (slot, device) in devices.into_iter().enumerate() {
+            let bar_base = layout::pci_bar_slot(slot as u64);
+            let gsi = layout::virtio_irq(slot).ok_or(VirtioPciAttachError::Bus {
+                slot,
+                source: PciError::BusFull,
+            })?;
+            let line = irqchip
+                .virtio_line(slot)
+                .map_err(|source| VirtioPciAttachError::IrqChip { slot, source })?;
+
+            let built =
+                bus.attach_function(slot, device, &mem, line, msi.clone(), bar_base, gsi)?;
+            tracing::info!(
+                slot,
+                device = ?built.device_type,
+                address = format_args!("00:{:02x}.0", built.device_number),
+                bar = format_args!("{bar_base:#x}"),
+                irq = gsi,
+                msix_vectors = built.msix_vectors,
+                "attached virtio-pci device on the userspace irqchip (synchronous kicks)"
+            );
+            bus.slots.push(VirtioPciSlot {
+                device_number: built.device_number,
+                bar_base,
+                irq: gsi,
+                msix_vectors: built.msix_vectors,
+                transport: built.transport,
+                #[cfg(target_os = "linux")]
+                notifier: None,
+            });
+        }
+        Ok(bus)
+    }
+
+    /// Builds and attaches one function's host-neutral pieces: the MSI-X table
+    /// size, the configuration space, the [`IntxLine`] gate, the transport and
+    /// the config-space attachment to the root. Shared by both constructors so
+    /// a function's guest-visible identity cannot depend on which host wired it.
+    #[allow(clippy::too_many_arguments)]
+    fn attach_function(
+        &mut self,
+        slot: usize,
+        device: Box<dyn VirtioDevice>,
+        mem: &Arc<GuestMem>,
+        inner_line: Arc<dyn IrqLine>,
+        msi: Option<Arc<dyn MsiSink>>,
+        bar_base: u64,
+        gsi: u32,
+    ) -> Result<BuiltFunction, VirtioPciAttachError> {
+        // How many MSI-X vectors this function needs: one per queue plus one
+        // for configuration changes. A device with more queues than the table
+        // region can hold gets no capability rather than a table too small for
+        // its own queues — INTx still works, and the warning says why.
+        let queues = device.queue_max_sizes().len();
+        let table_size = msi.as_ref().and_then(|_| {
+            msix::table_size_for(queues).or_else(|| {
+                tracing::warn!(
+                    slot,
+                    queues,
+                    max = msix::MAX_MSIX_VECTORS,
+                    "device has too many queues for an MSI-X table; publishing INTx only"
+                );
+                None
+            })
+        });
+
+        // The config space is built first so its INTx flag can gate the
+        // line the transport is about to be handed.
+        let (mut config, msix_cap_at) =
+            Self::build_config_space(slot, bar_base, gsi, device.as_ref(), table_size)?;
+        let line = Arc::new(IntxLine {
+            line: inner_line,
+            enabled: config.intx_flag(),
+        });
+
+        let device_type = device.device_type();
+        let transport = match (msi, table_size) {
+            (Some(sink), Some(_)) => {
+                PciTransport::with_msix(slot, device, Arc::clone(mem), line, sink)
+            }
+            _ => PciTransport::new(slot, device, Arc::clone(mem), line),
+        }
+        .map_err(|source| VirtioPciAttachError::Transport { slot, source })?;
+
+        // The transport owns the message-control value it reads on every
+        // interrupt; the config space keeps it up to date with what the guest
+        // wrote. Nothing here interprets the bits.
+        if let (Some(at), Some(handle)) = (msix_cap_at, transport.msix_control_handle()) {
+            config.mirror_dword(at, handle);
+        }
+        let msix_vectors = transport.msix_table_size();
+        let transport = Arc::new(Mutex::new(transport));
+
+        let device_number = match self.root.lock() {
+            Ok(mut root) => root
+                .attach(config, slot)
+                .map_err(|source| VirtioPciAttachError::Bus { slot, source })?,
+            // Only reachable if a previous panic poisoned it, which cannot
+            // have happened yet: nothing else holds this lock during setup.
+            Err(_) => {
+                return Err(VirtioPciAttachError::Bus {
+                    slot,
+                    source: PciError::BusFull,
+                })
+            }
+        };
+        Ok(BuiltFunction {
+            device_number,
+            msix_vectors,
+            device_type,
+            transport,
+        })
     }
 
     /// Builds one device's PCI configuration space: the modern virtio identity,
@@ -499,6 +657,7 @@ impl VirtioPciBus {
     }
 
     /// How queue kicks reach the devices on this bus.
+    #[cfg(target_os = "linux")]
     pub fn notify_mode(&self) -> QueueNotifyMode {
         self.mode
     }
@@ -511,8 +670,11 @@ impl VirtioPciBus {
     /// Stops every queue worker thread and deassigns their ioeventfds.
     ///
     /// Idempotent, and also run from `Drop`, so "closing the VM leaves no device
-    /// threads behind" holds even on an error path that never gets here.
+    /// threads behind" holds even on an error path that never gets here. A bus
+    /// whose kicks are synchronous owns no threads and no registrations, so
+    /// there is nothing to undo.
     pub fn shutdown(&self) {
+        #[cfg(target_os = "linux")]
         for slot in &self.slots {
             if let Some(notifier) = &slot.notifier {
                 notifier.shutdown();
@@ -564,7 +726,10 @@ impl VirtioPciBus {
         };
         // The root lock is released before either follow-up: `reconcile_notify`
         // takes it again to read the new windows, and neither may hold it while a
-        // transport lock is taken (the queue workers hold those).
+        // transport lock is taken (the queue workers hold those). On the
+        // userspace path a decode change needs no follow-up at all: nothing is
+        // registered at an absolute address, so there is nothing to move.
+        #[cfg(target_os = "linux")]
         if write.decode_changed {
             self.reconcile_notify();
         }
@@ -610,6 +775,7 @@ impl VirtioPciBus {
     /// [`crate::pci::MAX_PCI_DEVICES`] slots × [`vpci::MAX_NOTIFY_QUEUES`]-capped
     /// queues, no allocation per slot, and it converges because each device's BAR
     /// only moves when the guest moves it.
+    #[cfg(target_os = "linux")]
     fn reconcile_notify(&self) {
         // One pass to release addresses that are no longer ours, then one to
         // claim the new ones — in that order, or two devices swapping windows

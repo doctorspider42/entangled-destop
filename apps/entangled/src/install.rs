@@ -144,7 +144,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         }],
         network: Some(NetworkSection {
             backend: NetworkBackend::Tap,
-            interface: args.interface.clone(),
+            interface: Some(args.interface.clone()),
             mac: None,
         }),
         display: DisplaySection::default(),
@@ -195,7 +195,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         }],
         network: Some(NetworkSection {
             backend: NetworkBackend::Tap,
-            interface: args.interface.clone(),
+            interface: Some(args.interface.clone()),
             mac: None,
         }),
         display: DisplaySection::default(),

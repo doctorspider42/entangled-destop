@@ -19,11 +19,18 @@
 //!                               rebooting: proves the FADT, the DSDT's `\_S5`
 //!                               and the host's ACPI PM block agree. Opt-in,
 //!                               because every other test wants the reboot path.
+//!   `entangled.netprobe=<ip>/<prefix>,<gateway>,<host>:<port>`
+//!                               configures eth0 statically (this initramfs has
+//!                               no DHCP client), opens a TCP connection to
+//!                               `<host>:<port>` and expects its greeting echoed
+//!                               back — the guest-side evidence for a virtio-net
+//!                               backend (WHP-1704: the user-mode NAT).
 
 use std::ffi::CString;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Read size for the block probe; large enough to keep the ring busy, small
 /// enough that a 64 MiB image still produces many requests.
@@ -55,6 +62,9 @@ fn main() {
     if let Some(mib) = param(&cmdline, "entangled.blkbench=").and_then(|v| v.parse::<u64>().ok()) {
         mount("devtmpfs", "/dev", "devtmpfs");
         blk_bench(mib.min(MAX_BENCH_MIB));
+    }
+    if let Some(spec) = param(&cmdline, "entangled.netprobe=") {
+        net_probe(&spec);
     }
 
     if param(&cmdline, "entangled.poweroff=").as_deref() == Some("1") {
@@ -122,6 +132,168 @@ fn acpi_power_off() {
     }
     // Only reachable if the kernel had no way to power off.
     println!("VMHOST_TEST_FAIL poweroff kernel-refused-power-off");
+}
+
+/// Proves the virtio-net path end to end: configures `eth0` statically,
+/// connects out over TCP and expects the greeting echoed back.
+///
+/// `spec` is `<ip>/<prefix>,<gateway>,<host>:<port>`. Static configuration
+/// rather than DHCP because this initramfs has no DHCP client and the bootstrap
+/// kernel no `CONFIG_IP_PNP` — the ioctls below *are* the whole network stack
+/// setup, which also keeps the probe's evidence about the datapath rather than
+/// about a client implementation.
+///
+/// The echo matters: a SYN alone proves the guest's TX path, but only bytes
+/// coming *back* prove RX delivery — frames queued by the host, an RX interrupt
+/// raised, buffers completed.
+fn net_probe(spec: &str) {
+    let fail = |why: String| println!("VMHOST_TEST_FAIL netprobe {why}");
+    let Some((address, rest)) = spec.split_once(',') else {
+        return fail("malformed-spec".into());
+    };
+    let Some((gateway, target)) = rest.split_once(',') else {
+        return fail("malformed-spec".into());
+    };
+    let Some((ip, prefix)) = address.split_once('/') else {
+        return fail("malformed-address".into());
+    };
+    let (Ok(ip), Ok(prefix), Ok(gateway)) = (
+        ip.parse::<Ipv4Addr>(),
+        prefix.parse::<u32>(),
+        gateway.parse::<Ipv4Addr>(),
+    ) else {
+        return fail("malformed-address".into());
+    };
+    let Ok(SocketAddr::V4(target)) = target.parse::<SocketAddr>() else {
+        return fail("malformed-target".into());
+    };
+    let netmask = Ipv4Addr::from(u32::MAX.checked_shl(32 - prefix.min(32)).unwrap_or(0));
+
+    if let Err(why) = configure_eth0(ip, netmask, gateway) {
+        return fail(why);
+    }
+
+    let started = Instant::now();
+    let mut stream = match TcpStream::connect_timeout(&SocketAddr::V4(target), CONNECT_TIMEOUT) {
+        Ok(stream) => stream,
+        Err(e) => return fail(format!("connect-{target}:{e}")),
+    };
+    let greeting = b"ENTANGLED_NETPROBE ping\n";
+    if let Err(e) = stream.write_all(greeting) {
+        return fail(format!("send:{e}"));
+    }
+    let _ = stream.set_read_timeout(Some(CONNECT_TIMEOUT));
+    let mut echoed = Vec::new();
+    let mut buf = [0u8; 64];
+    while echoed.len() < greeting.len() {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => echoed.extend_from_slice(&buf[..n]),
+            Err(e) => return fail(format!("recv:{e}")),
+        }
+    }
+    if !echoed.starts_with(greeting) {
+        return fail(format!(
+            "echo-mismatch:{}",
+            String::from_utf8_lossy(&echoed).trim()
+        ));
+    }
+    println!(
+        "VMHOST_TEST_OK netprobe ip={ip}/{prefix} gw={gateway} target={target} \
+         echoed={} ms={}",
+        echoed.len(),
+        started.elapsed().as_millis()
+    );
+}
+
+/// How long the network probe waits for a connect and for the echo.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Brings `eth0` up with a static address and a default route, through the
+/// classic SIOCSIF*/SIOCADDRT ioctls — the smallest network configuration that
+/// exists on every Linux, no netlink library required.
+fn configure_eth0(ip: Ipv4Addr, netmask: Ipv4Addr, gateway: Ipv4Addr) -> Result<(), String> {
+    // SAFETY: a plain socket() call; the fd is closed below.
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err(format!("socket:{}", std::io::Error::last_os_error()));
+    }
+    // Everything below returns through here, so the fd cannot leak.
+    let result = configure_eth0_on(sock, ip, netmask, gateway);
+    // SAFETY: closing the fd opened above, exactly once.
+    unsafe { libc::close(sock) };
+    result
+}
+
+/// A `sockaddr` holding an IPv4 address, as the ifreq/rtentry ioctls want it.
+fn inet_sockaddr(addr: Ipv4Addr) -> libc::sockaddr {
+    let sin = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(addr.octets()),
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: sockaddr_in is the AF_INET arm of sockaddr; both are plain,
+    // same-size C structs and every byte of the source is initialised.
+    unsafe { std::mem::transmute(sin) }
+}
+
+fn configure_eth0_on(
+    sock: libc::c_int,
+    ip: Ipv4Addr,
+    netmask: Ipv4Addr,
+    gateway: Ipv4Addr,
+) -> Result<(), String> {
+    const NAME: &[u8] = b"eth0\0";
+    // SAFETY: ifreq is a plain C struct for which zero is a valid pattern.
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (dst, src) in ifr.ifr_name.iter_mut().zip(NAME) {
+        *dst = *src as libc::c_char;
+    }
+
+    // The SIOC* constants are `c_ulong` while musl's `ioctl` takes a `c_int`
+    // request; the values are small, so the cast is lossless on both ABIs.
+    fn apply(
+        sock: libc::c_int,
+        ifr: &mut libc::ifreq,
+        request: libc::c_ulong,
+        what: &str,
+    ) -> Result<(), String> {
+        // SAFETY: `ifr` is a live, fully initialised ifreq and `request` is one
+        // of the SIOCSIF* codes that read exactly one ifreq.
+        if unsafe { libc::ioctl(sock, request as libc::Ioctl, ifr) } < 0 {
+            return Err(format!("{what}:{}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    ifr.ifr_ifru.ifru_addr = inet_sockaddr(ip);
+    apply(sock, &mut ifr, libc::SIOCSIFADDR, "set-address")?;
+    ifr.ifr_ifru.ifru_addr = inet_sockaddr(netmask);
+    apply(sock, &mut ifr, libc::SIOCSIFNETMASK, "set-netmask")?;
+    ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+    apply(sock, &mut ifr, libc::SIOCSIFFLAGS, "link-up")?;
+
+    // The default route through the gateway: what turns "the segment" into
+    // "everywhere", and the counterpart of the `set_any_ip` finding on the host
+    // side — without a route the guest's stack refuses the connect locally.
+    // SAFETY: rtentry is a plain C struct for which zero is a valid pattern.
+    let mut route: libc::rtentry = unsafe { std::mem::zeroed() };
+    route.rt_dst = inet_sockaddr(Ipv4Addr::UNSPECIFIED);
+    route.rt_genmask = inet_sockaddr(Ipv4Addr::UNSPECIFIED);
+    route.rt_gateway = inet_sockaddr(gateway);
+    route.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
+    // SAFETY: `route` is a live, fully initialised rtentry and SIOCADDRT reads
+    // exactly one.
+    if unsafe { libc::ioctl(sock, libc::SIOCADDRT as libc::Ioctl, &mut route) } < 0 {
+        return Err(format!(
+            "add-default-route:{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 /// Value of a `key=` parameter on the kernel command line.

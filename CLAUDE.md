@@ -15,8 +15,10 @@ touching boot modes or firmware-facing platform devices).
 
 ## Build and test
 
-The full VMM only builds on Linux. On this Windows machine use WSL Ubuntu
-(has `/dev/kvm` via nested virtualization) or the Dockerfile:
+Two supported hosts since EPIC 17 phase 4: Linux/KVM (the MVP target, incl.
+`entangled install`) and Windows/WHP (`entangled run`, `doctor`, the manager).
+On this Windows machine the Linux side runs in WSL Ubuntu (has `/dev/kvm` via
+nested virtualization) or the Dockerfile:
 
 ```bash
 wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace"
@@ -27,21 +29,22 @@ wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace
 - `cargo fmt --all` — before finishing any change
 - `cargo deny check` — license gate (blocks GPL/AGPL/LGPL); runs in CI
 
-`vmm-core` (both hypervisor backends), `machine-x86`, `linux-boot`,
-`control-api` and `debian-media` also build and test **natively on Windows** —
-that is where the WHP backend is exercised (EPIC 17), including a full
-boot-to-marker of a real Linux guest. Run both hosts when touching any of them:
+The **whole workspace builds and tests natively on Windows** too — that is
+where the WHP backend is exercised (EPIC 17), including `entangled run` of a
+real Linux guest with the window, virtio-pci + MSI-X, user-mode networking and
+UEFI with persistent NVRAM. Run both hosts for any change:
 
 ```powershell
 $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\entangled-target-whp"
-cargo test -p vmm-core -p machine-x86 -p linux-boot -p control-api
-cargo clippy -p vmm-core -p machine-x86 -p linux-boot -p control-api --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo run -p entangled -- run --headless examples\windows-whp.toml
 ```
 
-The `virtio-*` crates and `display` also build natively on Windows. Two vendored,
-minimally patched crates in `third_party/` (`virtio-queue`, `linux-loader` — see
-their VENDORED.md and ADR-0002) take the unix-only `vm-memory` `rawfd` feature
-back out of the graph; cargo features are additive, so nothing else could.
+Two vendored, minimally patched crates in `third_party/` (`virtio-queue`,
+`linux-loader` — see their VENDORED.md and ADR-0002) take the unix-only
+`vm-memory` `rawfd` feature back out of the graph; cargo features are additive,
+so nothing else could.
 
 WHP tests need the "Windows Hypervisor Platform" optional feature (admin +
 reboot); without it they self-skip with a hint, like the KVM tests without

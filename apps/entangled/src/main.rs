@@ -11,8 +11,13 @@ mod fetch;
 mod install;
 #[cfg(target_os = "linux")]
 mod install_ubuntu;
-#[cfg(target_os = "linux")]
+/// The run path exists wherever a hypervisor backend does (KVM or WHP); any
+/// other OS still gets config validation and a typed refusal.
+#[cfg(any(target_os = "linux", windows))]
 mod run_vm;
+/// The cloud-init NoCloud seed builder, used only by `install` (Linux): on
+/// Windows the whole module is dead code and `-D warnings` says so.
+#[cfg(target_os = "linux")]
 mod seed;
 
 use std::path::PathBuf;
@@ -179,16 +184,16 @@ fn run(cli: Cli) -> Result<(), String> {
             let text = std::fs::read_to_string(&config)
                 .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
             let cfg = control_api::VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             {
                 run_vm::run(cfg, headless)
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", windows)))]
             {
                 let _ = headless;
                 Err(format!(
                     "config '{}' is valid, but running VMs requires a Linux host with KVM \
-                     (on Windows use WSL2)",
+                     or a Windows host with the Windows Hypervisor Platform",
                     cfg.name
                 ))
             }

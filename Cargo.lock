@@ -1364,6 +1364,7 @@ dependencies = [
  "virtio-input",
  "virtio-net",
  "vmm-core",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -4509,8 +4510,10 @@ dependencies = [
  "machine-x86",
  "thiserror 2.0.20",
  "tracing",
+ "uefi-boot",
  "virtio-block",
  "virtio-core",
+ "virtio-net",
  "vm-memory 0.17.2",
  "vmm-sys-util",
  "windows 0.62.2",

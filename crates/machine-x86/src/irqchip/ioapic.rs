@@ -167,6 +167,13 @@ impl IoApic {
         self.delivered.load(Ordering::Acquire)
     }
 
+    /// The hypervisor delivery this IOAPIC injects through, shared with the MSI
+    /// path (`crate::msi::UserspaceMsiSink`) — which bypasses the redirection
+    /// table entirely, because an MSI message carries its own routing.
+    pub fn interrupt_delivery(&self) -> Arc<dyn InterruptDelivery> {
+        Arc::clone(&self.delivery)
+    }
+
     /// Asserts `pin` as an edge: deliver now, or latch if the pin is masked.
     ///
     /// Never fails towards the caller for a masked or unroutable pin — that is

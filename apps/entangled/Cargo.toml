@@ -20,7 +20,9 @@ control-api.workspace = true
 debian-media.workspace = true
 vmm-core.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# The run path (run_vm.rs) is portable across the two hypervisor hosts; these
+# are its machine, device and presentation crates, every one of which builds
+# natively on Windows too (ADR-0002).
 machine-x86.workspace = true
 linux-boot.workspace = true
 uefi-boot.workspace = true
@@ -30,9 +32,17 @@ virtio-net.workspace = true
 virtio-gpu.workspace = true
 virtio-input.workspace = true
 display.workspace = true
+
+# `install` (d-i / subiquity flows) stays Linux-only for now.
+[target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 flate2.workspace = true
 toml.workspace = true
+
+# Ctrl+C handling for the run path (`SetConsoleCtrlHandler`); same crate and
+# license the WHP backend already uses.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Console"] }
 
 [lints]
 workspace = true

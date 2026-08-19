@@ -29,6 +29,38 @@ jobs:
         # KVM-dependent tests self-skip when /dev/kvm is absent on the runner.
         run: cargo test --workspace
 
+  build-test-windows:
+    name: Build, lint and test (Windows, EPIC 17)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        # The whole workspace builds natively on Windows (ADR-0002). The whp_*
+        # acceptance tests need the "Windows Hypervisor Platform" optional
+        # feature and the guest artifacts, neither of which a GitHub runner has:
+        # they self-skip, exactly like the KVM tests without /dev/kvm.
+        run: cargo test --workspace
+      - name: WHP acceptance tests self-skip cleanly
+        # The self-skip path is a contract, not an accident: a broken probe
+        # would either fail loudly here or silently stop covering real hosts.
+        # This asserts the test *ran*, printed its skip diagnosis, and passed.
+        shell: pwsh
+        run: |
+          $out = cargo test -p vmm-core --test whp_boot -- --nocapture 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { throw "whp_boot failed instead of self-skipping" }
+          if ($out -notmatch "skipping:") {
+            throw "expected the WHP boot test to report its self-skip on a runner without WHP"
+          }
+
   license-audit:
     name: License audit (MVP-003)
     runs-on: ubuntu-latest
