@@ -18,6 +18,7 @@ use crate::process::{Supervisor, TaskId, TaskKind};
 use crate::settings::{self, Settings};
 use crate::theme;
 use crate::ui;
+use crate::update::{self, UpdateInfo};
 use crate::ScreenshotView;
 
 /// How often the VM directory is re-scanned while the window is open.
@@ -32,12 +33,18 @@ pub struct Startup {
     pub screenshot_view: ScreenshotView,
 }
 
+/// Window title: the product name with the injected build version, e.g.
+/// "Entangled Desktop v0.2.17".
+pub fn window_title() -> String {
+    format!("Entangled Desktop v{}", crate::VERSION)
+}
+
 pub fn launch(startup: Startup) -> Result<(), String> {
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1240.0, 800.0])
             .with_min_inner_size([880.0, 560.0])
-            .with_title("Entangled Manager")
+            .with_title(window_title())
             .with_app_id("entangled-manager"),
         ..Default::default()
     };
@@ -57,7 +64,7 @@ pub fn launch(startup: Startup) -> Result<(), String> {
     // The renderer is wgpu: the only backend feature this crate enables, and
     // the same stack `crates/display` already uses.
     eframe::run_native(
-        "Entangled Manager",
+        "entangled-manager",
         options,
         Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
@@ -110,6 +117,7 @@ pub struct SettingsForm {
     pub entangled_binary: String,
     pub work_dir: String,
     pub headless_install: bool,
+    pub check_updates_on_startup: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -143,6 +151,12 @@ pub enum Action {
     SelectLog(TaskId),
     ToggleLogPane,
     DismissToast(usize),
+    /// Download the new installer and launch it (Windows).
+    InstallUpdate,
+    /// Open the release page in the browser (hosts without the installer).
+    OpenReleasePage,
+    /// Hide the update banner for this session.
+    DismissUpdate,
 }
 
 /// A VM being installed that has no profile on disk yet, so it still gets a
@@ -208,6 +222,14 @@ pub struct ManagerApp {
     pub log_open: bool,
     pub log_selected: Option<TaskId>,
     pub log_follow: bool,
+    /// A newer release the banner offers; `None` means none found (yet) or
+    /// dismissed.
+    pub update: Option<UpdateInfo>,
+    /// True while the installer asset is being downloaded on its thread.
+    pub update_downloading: bool,
+    update_check: Option<mpsc::Receiver<UpdateInfo>>,
+    update_download: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    waker: crate::process::Waker,
     scanner: Scanner,
     last_scan: Instant,
     screenshot: Option<ScreenshotJob>,
@@ -249,6 +271,16 @@ impl ManagerApp {
             settings.entangled_binary = Some(cli);
         }
 
+        // The startup update check (opt-out via Settings): one background
+        // thread, one optional message, silence on any failure. Screenshot
+        // runs are development renders — no network there.
+        let update_check = (settings.check_updates_on_startup && startup.screenshot.is_none())
+            .then(|| {
+                update::Version::parse(crate::VERSION)
+                    .map(|current| update::spawn_check(current, Arc::clone(&waker)))
+            })
+            .flatten();
+
         let mut app = Self {
             cli: launcher::locate_cli(&settings).map_err(|e| e.to_string()),
             settings,
@@ -263,6 +295,11 @@ impl ManagerApp {
             log_open: false,
             log_selected: None,
             log_follow: true,
+            update: None,
+            update_downloading: false,
+            update_check,
+            update_download: None,
+            waker: Arc::clone(&waker),
             scanner: Scanner::spawn(waker),
             last_scan: Instant::now() - SCAN_INTERVAL,
             screenshot: startup.screenshot.map(|path| ScreenshotJob {
@@ -350,6 +387,58 @@ impl ManagerApp {
         "debian-new".to_string()
     }
 
+    /// Collects the update-check and update-download answers; both channels
+    /// deliver at most one message.
+    fn collect_update_events(&mut self) {
+        if let Some(rx) = &self.update_check {
+            if let Ok(info) = rx.try_recv() {
+                self.update = Some(info);
+                self.update_check = None;
+            }
+        }
+        if let Some(rx) = &self.update_download {
+            if let Ok(result) = rx.try_recv() {
+                self.update_downloading = false;
+                self.update_download = None;
+                match result {
+                    Ok(path) => {
+                        self.update = None;
+                        self.toast(
+                            ToastLevel::Success,
+                            format!(
+                                "installer saved to {} and launched — it takes over from here",
+                                path.display()
+                            ),
+                        );
+                    }
+                    Err(e) => self.toast(ToastLevel::Error, format!("update failed: {e}")),
+                }
+            }
+        }
+    }
+
+    fn install_update(&mut self) {
+        if self.update_downloading {
+            return;
+        }
+        let Some(info) = self.update.clone() else {
+            return;
+        };
+        if info.installer_url.is_none() {
+            // Banner offers the release page in this case; belt and braces.
+            self.toast(
+                ToastLevel::Warn,
+                "this release has no installer asset — use the release page",
+            );
+            return;
+        }
+        self.update_downloading = true;
+        self.update_download = Some(update::spawn_download_and_launch(
+            info,
+            Arc::clone(&self.waker),
+        ));
+    }
+
     fn open_settings(&mut self) {
         self.modal = Modal::Settings(SettingsForm {
             vm_dir: self.settings.vm_dir.display().to_string(),
@@ -366,6 +455,7 @@ impl ManagerApp {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             headless_install: self.settings.headless_install,
+            check_updates_on_startup: self.settings.check_updates_on_startup,
         });
     }
 
@@ -711,6 +801,7 @@ impl ManagerApp {
         self.settings.entangled_binary = optional(&form.entangled_binary);
         self.settings.work_dir = optional(&form.work_dir);
         self.settings.headless_install = form.headless_install;
+        self.settings.check_updates_on_startup = form.check_updates_on_startup;
 
         match &self.settings_path {
             Some(path) => match self.settings.save_to(path) {
@@ -769,6 +860,18 @@ impl ManagerApp {
                 if index < self.toasts.len() {
                     self.toasts.remove(index);
                 }
+            }
+            Action::InstallUpdate => self.install_update(),
+            Action::OpenReleasePage => {
+                if let Some(info) = &self.update {
+                    ctx.open_url(egui::OpenUrl::new_tab(info.page_url.clone()));
+                }
+            }
+            Action::DismissUpdate => {
+                // For this session only: the check runs once per startup, so
+                // the banner returns on the next launch while the version is
+                // still newer.
+                self.update = None;
             }
         }
     }
@@ -876,6 +979,7 @@ impl eframe::App for ManagerApp {
         self.request_scan(false);
         self.collect_scan();
         self.collect_task_results();
+        self.collect_update_events();
         self.supervisor.prune(12);
         self.ensure_log_selection();
         self.expire_toasts(ctx.input(|i| i.time));

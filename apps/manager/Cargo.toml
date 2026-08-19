@@ -29,7 +29,11 @@ wgpu = { version = "25", default-features = false, features = [
 ] }
 clap.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
+# Update check against the GitHub Releases API (EPIC 12 follow-up): the same
+# rustls-only HTTP client debian-media already ships, same workspace version.
+ureq.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

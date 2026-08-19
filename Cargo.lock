@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "boot-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "control-api",
  "display",
@@ -687,7 +687,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "control-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "debian-media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "pgp",
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "display"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "png",
  "pollster",
@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "entangled"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "control-api",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "entangled-manager"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "control-api",
@@ -1378,10 +1378,12 @@ dependencies = [
  "naga 26.0.0",
  "png",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "wgpu 25.0.2",
 ]
 
@@ -2251,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "linux-boot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "linux-loader",
  "machine-x86",
@@ -2308,7 +2310,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "machine-x86"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -4280,7 +4282,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "uefi-boot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "linux-loader",
  "machine-x86",
@@ -4408,7 +4410,7 @@ checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
 
 [[package]]
 name = "virtio-block"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.20",
  "tracing",
@@ -4419,7 +4421,7 @@ dependencies = [
 
 [[package]]
 name = "virtio-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.20",
  "tracing",
@@ -4429,7 +4431,7 @@ dependencies = [
 
 [[package]]
 name = "virtio-gpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "display",
  "png",
@@ -4442,7 +4444,7 @@ dependencies = [
 
 [[package]]
 name = "virtio-input"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.20",
  "tracing",
@@ -4453,7 +4455,7 @@ dependencies = [
 
 [[package]]
 name = "virtio-net"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "smoltcp",
@@ -4498,7 +4500,7 @@ dependencies = [
 
 [[package]]
 name = "vmm-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",

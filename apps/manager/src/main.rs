@@ -15,16 +15,21 @@ mod process;
 mod settings;
 mod theme;
 mod ui;
+mod update;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
 
+/// The version stamped into this build: the release pipeline's
+/// `ENTANGLED_VERSION` when set, the workspace version otherwise (build.rs).
+pub const VERSION: &str = env!("ENTANGLED_VERSION");
+
 #[derive(Parser)]
 #[command(
     name = "entangled-manager",
-    version,
+    version = VERSION,
     about = "Entangled Desktop — native VM manager"
 )]
 struct Cli {

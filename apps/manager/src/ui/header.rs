@@ -28,12 +28,23 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                 ui.add_space(6.0);
                 ui.vertical(|ui| {
                     ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("ENTANGLED")
-                            .size(24.0)
-                            .color(theme::TEXT)
-                            .strong(),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("ENTANGLED")
+                                .size(24.0)
+                                .color(theme::TEXT)
+                                .strong(),
+                        );
+                        // The injected build version, part of the brand row
+                        // ("Entangled Desktop v…", same string as the window
+                        // title carries).
+                        ui.label(
+                            RichText::new(format!("v{}", crate::VERSION))
+                                .size(12.5)
+                                .color(theme::accent(0.35)),
+                        );
+                    });
                     ui.label(
                         RichText::new("desktop virtual machines")
                             .size(12.0)

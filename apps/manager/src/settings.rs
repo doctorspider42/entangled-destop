@@ -55,6 +55,10 @@ pub struct Settings {
     /// Pass `--headless` to `entangled install` by default (no installer
     /// window; the log pane still shows the serial console).
     pub headless_install: bool,
+    /// Ask the GitHub Releases API for a newer version once, on startup
+    /// (background thread; failures are silent). Default on, and the check is
+    /// skipped entirely when this is off.
+    pub check_updates_on_startup: bool,
     /// Wizard defaults.
     pub default_memory_mib: u64,
     pub default_vcpus: u32,
@@ -69,6 +73,7 @@ impl Default for Settings {
             entangled_binary: None,
             work_dir: None,
             headless_install: false,
+            check_updates_on_startup: true,
             default_memory_mib: 2048,
             default_vcpus: 2,
             default_disk_gib: 16,
@@ -191,6 +196,7 @@ mod tests {
             entangled_binary: Some(PathBuf::from("/opt/entangled/bin/entangled")),
             work_dir: Some(PathBuf::from("/srv")),
             headless_install: true,
+            check_updates_on_startup: false,
             default_memory_mib: 3072,
             default_vcpus: 4,
             default_disk_gib: 40,
@@ -238,6 +244,25 @@ mod tests {
         assert_eq!(loaded.vm_dir, PathBuf::from("/tmp/only-this"));
         assert_eq!(loaded.default_vcpus, Settings::default().default_vcpus);
         assert_eq!(loaded.default_variant, Settings::default().default_variant);
+        // A settings file written before the update check existed keeps the
+        // check ON — the toggle is opt-out, not opt-in.
+        assert!(loaded.check_updates_on_startup);
+    }
+
+    /// The "check for updates on startup" switch persists in both positions.
+    #[test]
+    fn the_update_check_toggle_round_trips() {
+        let dir = temp_dir("settings-updates-toggle");
+        let path = dir.join("manager.toml");
+        for enabled in [false, true] {
+            let settings = Settings {
+                check_updates_on_startup: enabled,
+                ..Settings::default()
+            };
+            settings.save_to(&path).expect("save");
+            let back = Settings::load_from(&path).expect("load");
+            assert_eq!(back.check_updates_on_startup, enabled);
+        }
     }
 
     #[test]

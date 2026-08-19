@@ -20,10 +20,14 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+/// The version stamped into this build: the release pipeline's
+/// `ENTANGLED_VERSION` when set, the workspace version otherwise (build.rs).
+const VERSION: &str = env!("ENTANGLED_VERSION");
+
 #[derive(Parser)]
 #[command(
     name = "entangled",
-    version,
+    version = VERSION,
     about = "Entangled Desktop — a small VMM for Linux x86-64 hosts"
 )]
 struct Cli {
