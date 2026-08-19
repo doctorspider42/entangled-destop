@@ -1,0 +1,36 @@
+# Boots the official Ubuntu **Desktop** ISO to the GNOME live session, in the
+# window, at 1920x1080 (the wave-G cdrom deliverable; EPIC 8's acceptance run):
+#
+#   bash guest/firmware/build-cloudhv.sh              # ~2.5 min, once
+#   iso=$(bash scripts/fetch-ubuntu-iso.sh desktop)   # ~6 GiB, verified, once
+#   cargo run -p entangled -- run --cdrom "$iso" examples/ubuntu-desktop-live.toml
+#
+# EDK2 boots the ISO's ESP, GRUB's 30 s menu counts down on ttyS0 (CloudHv has
+# no GOP, so nothing is on the window until Linux's own virtio_gpu driver
+# binds), then the kernel takes the scanout and GNOME Shell appears — llvmpipe
+# software rendering, so give it a few minutes to the "Welcome to Ubuntu"
+# installer window. The GNOME session needs what this profile provides and the
+# server profile does not:
+#
+# * 4096 MiB — RAM above the 32-bit MMIO hole continues at 4 GiB (the high-RAM
+#   split); the live squashfs plus GNOME genuinely does not fit in 3 GiB.
+# * The virtio-gpu cursor plane (mutter puts the pointer on it — with the old
+#   drained-and-ignored cursor queue the desktop had an invisible pointer) and
+#   EDID (mutter names and sizes its outputs from it).
+#
+# There is no disk and no [cdrom] here on purpose: the medium comes from
+# --cdrom, so one profile boots any live ISO. Add a writable [[disk]] if you
+# want the live session's installer to have something to install onto.
+name = "ubuntu-desktop-live"
+memory_mib = 4096
+vcpus = 4
+transport = "pci"
+
+[boot]
+mode = "uefi"
+firmware = "artifacts/firmware/CLOUDHV.fd"
+
+[display]
+width = 1920
+height = 1080
+scale = 1.0

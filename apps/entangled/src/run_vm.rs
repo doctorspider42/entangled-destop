@@ -290,17 +290,23 @@ fn build_devices(
     })
 }
 
-/// A debug screenshot: write the scanout as PNG `after` this much VM runtime.
+/// A debug screenshot: write the scanout as PNG `after` this much VM runtime,
+/// then refresh the same file every [`SCREENSHOT_REFRESH`] until the VM stops
+/// — so a slow graphical boot can be watched from outside by re-reading one
+/// path.
 ///
 /// Best effort by design — the timer thread is detached, so a VM that stops
-/// first simply never produces the file. It exists to give an unattended run
-/// (`--headless` on a CI box, a GNOME boot someone wants evidence of) one
-/// artifact without instrumenting the guest.
+/// before the first write simply never produces the file. It exists to give an
+/// unattended run (`--headless` on a CI box, a GNOME boot someone wants
+/// evidence of) an artifact without instrumenting the guest.
 #[derive(Debug, Clone)]
 pub struct ScreenshotRequest {
     pub after: Duration,
     pub path: PathBuf,
 }
+
+/// How often the debug screenshot is refreshed after its first write.
+const SCREENSHOT_REFRESH: Duration = Duration::from_secs(20);
 
 pub fn run(
     cfg: VmConfig,
@@ -365,14 +371,17 @@ pub fn run_with(
             .name("screenshot-timer".into())
             .spawn(move || {
                 std::thread::sleep(request.after);
-                match handle.screenshot(&request.path) {
-                    Ok(()) => {
-                        tracing::info!(path = %request.path.display(), "debug screenshot written")
+                loop {
+                    match handle.screenshot(&request.path) {
+                        Ok(()) => {
+                            tracing::info!(path = %request.path.display(), "debug screenshot written")
+                        }
+                        Err(e) => {
+                            tracing::warn!(path = %request.path.display(), error = %e,
+                                "debug screenshot failed")
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(path = %request.path.display(), error = %e,
-                            "debug screenshot failed")
-                    }
+                    std::thread::sleep(SCREENSHOT_REFRESH);
                 }
             })
             .map_err(|e| format!("cannot spawn the screenshot timer: {e}"))?;

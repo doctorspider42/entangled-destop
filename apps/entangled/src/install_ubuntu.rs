@@ -55,9 +55,9 @@ use crate::InstallArgs;
 /// The firmware built by `guest/firmware/build-cloudhv.sh`.
 const FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
 
-/// Installer VM size. subiquity wants ~2 GiB; this machine's RAM stops at the
-/// 32-bit MMIO hole (3072 MiB), so 2560 is the same generous-but-legal choice
-/// `examples/ubuntu-uefi.toml` documents.
+/// Installer VM size. subiquity wants ~2 GiB; 2560 is the generous choice
+/// `examples/ubuntu-uefi.toml` documents. (Guests above 3072 MiB are legal
+/// since the high-RAM split, but the text installer gains nothing from more.)
 const INSTALLER_MEMORY_MIB: u64 = 2560;
 
 /// What the installed system gets. Less than the installer needs: nothing is
@@ -324,8 +324,9 @@ const INSTALL_MARKERS: &[&str] = &[
 
 /// GRUB's menu, drawn on ttyS0 by the EFI console. Waiting for the *entry* text
 /// rather than for the version banner means the menu is really up and a
-/// keystroke will be seen.
-const MENU_MARKER: &str = "Try or Install Ubuntu Server";
+/// keystroke will be seen. Without "Server", because the Desktop ISO's entry is
+/// "Try or Install Ubuntu" — this prefix matches both variants' menus.
+const MENU_MARKER: &str = "Try or Install Ubuntu";
 
 /// GRUB's command-line prompt. One appears after `c`, and one after every
 /// command completes — which is exactly the acknowledgement each line needs.
