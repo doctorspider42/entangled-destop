@@ -44,6 +44,13 @@ pub struct VmConfig {
     pub boot: BootSection,
     #[serde(default, rename = "disk")]
     pub disks: Vec<DiskSection>,
+    /// Optional installer/live medium (an ISO), attached read-only as the last
+    /// virtio-blk device — after every `[[disk]]`, so it never shifts the disks'
+    /// guest-visible names. `uefi` mode only: the point of a CD-ROM is that the
+    /// *firmware* boots it, and a direct-linux guest that merely wants the ISO's
+    /// bytes should say what it means with a read-only `[[disk]]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdrom: Option<CdromSection>,
     pub network: Option<NetworkSection>,
     #[serde(default)]
     pub display: DisplaySection,
@@ -172,6 +179,19 @@ pub struct DiskSection {
     pub writable: bool,
 }
 
+/// `[cdrom]` — one optional installer/live medium (UEFI-1803's machinery as a
+/// first-class config key rather than a hand-written `[[disk]]` pair).
+///
+/// Always read-only — there is deliberately no `writable` key to get wrong: the
+/// medium's value is that its provenance was verified
+/// (`scripts/fetch-ubuntu-iso.sh`), and a VMM that can scribble on it destroys
+/// exactly that.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CdromSection {
+    pub path: PathBuf,
+}
+
 /// How the guest's virtio-net device reaches a real network (EPIC 5, WHP-1704).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -246,6 +266,14 @@ impl VmConfig {
         Ok(cfg)
     }
 
+    /// Attaches (or replaces) the CD-ROM after parsing — the `--cdrom <iso>`
+    /// path. Re-runs validation, because the combination rules (uefi mode, the
+    /// pci transport) apply to the modified profile, not the one on disk.
+    pub fn set_cdrom(&mut self, path: PathBuf) -> Result<(), ConfigError> {
+        self.cdrom = Some(CdromSection { path });
+        self.validate()
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let err = |m: String| Err(ConfigError::Invalid(m));
         if self.name.is_empty() {
@@ -293,6 +321,13 @@ impl VmConfig {
         // rather than booting something the author did not ask for.
         match self.boot.mode {
             BootMode::DirectLinux => {
+                if self.cdrom.is_some() {
+                    return err("cdrom is only valid for mode = \"uefi\": booting a CD-ROM \
+                         means the firmware finds its bootloader, which direct-linux skips. \
+                         To hand a direct-linux guest the ISO's bytes, use a [[disk]] with \
+                         writable = false"
+                        .into());
+                }
                 if self.boot.kernel.is_none() {
                     return err("boot.kernel is required for mode = \"direct-linux\"".into());
                 }
@@ -324,13 +359,16 @@ impl VmConfig {
                 // found" — which reads like a bug in the media, the ISO or the
                 // block device, and sends the reader looking in four wrong
                 // places. Refuse it while we still know why.
-                if !self.transport.is_pci() && !self.disks.is_empty() {
+                if !self.transport.is_pci() && (!self.disks.is_empty() || self.cdrom.is_some()) {
+                    let media = match (self.disks.len(), self.cdrom.is_some()) {
+                        (0, _) => "the configured cdrom".to_string(),
+                        (n, true) => format!("the {n} configured disk(s) and the cdrom"),
+                        (n, false) => format!("the {n} configured disk(s)"),
+                    };
                     return err(format!(
                         "mode = \"uefi\" needs transport = \"pci\": a UEFI firmware has no \
-                         virtio-mmio driver, so the {} configured disk(s) would be invisible \
-                         to it and the boot would end at \"No bootable option or device was \
-                         found\"",
-                        self.disks.len()
+                         virtio-mmio driver, so {media} would be invisible to it and the \
+                         boot would end at \"No bootable option or device was found\""
                     ));
                 }
             }
@@ -622,6 +660,96 @@ firmware = "artifacts/firmware/CLOUDHV.fd"
             &UBUNTU_ISO_EXAMPLE.replace("memory_mib = 2560", "memory_mib = 3073")
         )
         .is_err());
+    }
+
+    /// The cdrom section: a UEFI profile with `[cdrom]` and no disks at all is
+    /// the generic "boot this ISO" machine (`entangled run --cdrom`).
+    const CDROM_EXAMPLE: &str = r#"
+name = "iso-boot"
+memory_mib = 2560
+vcpus = 2
+transport = "pci"
+
+[boot]
+mode = "uefi"
+firmware = "artifacts/firmware/CLOUDHV.fd"
+
+[cdrom]
+path = "/home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-desktop-amd64.iso"
+"#;
+
+    #[test]
+    fn a_cdrom_profile_parses_and_round_trips() {
+        let cfg = VmConfig::from_toml(CDROM_EXAMPLE).unwrap();
+        assert_eq!(cfg.boot.mode, BootMode::Uefi);
+        assert!(cfg.disks.is_empty());
+        let cdrom = cfg.cdrom.as_ref().expect("cdrom section");
+        assert!(cdrom.path.to_string_lossy().ends_with(".iso"));
+        assert_eq!(
+            VmConfig::from_toml(&toml::to_string_pretty(&cfg).unwrap()).unwrap(),
+            cfg
+        );
+        // And a profile without one serializes without the key.
+        let plain = VmConfig::from_toml(UEFI_EXAMPLE).unwrap();
+        assert!(plain.cdrom.is_none());
+        let text = toml::to_string_pretty(&plain).unwrap();
+        assert!(!text.contains("cdrom"), "stray cdrom key in:\n{text}");
+    }
+
+    /// There is no `writable` key to get wrong: a cdrom section that tries to
+    /// name one is refused at parse time (`deny_unknown_fields`).
+    #[test]
+    fn a_cdrom_cannot_be_made_writable() {
+        let with_writable = CDROM_EXAMPLE.replace("[cdrom]", "[cdrom]\nwritable = true");
+        assert!(matches!(
+            VmConfig::from_toml(&with_writable),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    /// The same transport rule the disks obey: firmware cannot see virtio-mmio,
+    /// so a cdrom on the default transport would boot to "no bootable option".
+    #[test]
+    fn a_cdrom_requires_uefi_and_the_pci_transport() {
+        let mmio = CDROM_EXAMPLE.replace("transport = \"pci\"", "");
+        let error = VmConfig::from_toml(&mmio).expect_err("mmio + cdrom must be refused");
+        let ConfigError::Invalid(message) = error else {
+            panic!("expected a validation error, got {error:?}");
+        };
+        assert!(message.contains("transport = \"pci\""), "{message}");
+        assert!(message.contains("cdrom"), "{message}");
+
+        // On direct-linux the section is a category error, and the message says
+        // what to use instead.
+        let direct = BACKLOG_EXAMPLE.replace(
+            "[network]",
+            "[cdrom]\npath = \"/isos/x.iso\"\n\n[network]",
+        );
+        let error = VmConfig::from_toml(&direct).expect_err("cdrom on direct-linux");
+        let ConfigError::Invalid(message) = error else {
+            panic!("expected a validation error, got {error:?}");
+        };
+        assert!(message.contains("uefi"), "{message}");
+        assert!(message.contains("[[disk]]"), "{message}");
+    }
+
+    /// `set_cdrom` is the `--cdrom <iso>` path: it must re-validate, so a flag
+    /// added to a profile the combination rules refuse fails like the profile
+    /// would, not at boot time.
+    #[test]
+    fn set_cdrom_revalidates_the_modified_profile() {
+        let mut cfg = VmConfig::from_toml(UEFI_EXAMPLE).unwrap();
+        cfg.set_cdrom(PathBuf::from("/isos/x.iso")).unwrap();
+        assert_eq!(cfg.cdrom.as_ref().unwrap().path, PathBuf::from("/isos/x.iso"));
+        // Replacing an existing cdrom is allowed — the flag wins.
+        cfg.set_cdrom(PathBuf::from("/isos/y.iso")).unwrap();
+        assert_eq!(cfg.cdrom.as_ref().unwrap().path, PathBuf::from("/isos/y.iso"));
+
+        let mut direct = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
+        let error = direct
+            .set_cdrom(PathBuf::from("/isos/x.iso"))
+            .expect_err("cdrom on a direct-linux profile");
+        assert!(matches!(error, ConfigError::Invalid(_)), "{error}");
     }
 
     /// UEFI-1804: the profile `entangled install ubuntu` writes names an NVRAM

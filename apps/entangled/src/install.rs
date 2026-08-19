@@ -142,6 +142,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             path: args.disk.clone(),
             writable: true,
         }],
+        cdrom: None,
         network: Some(NetworkSection {
             backend: NetworkBackend::Tap,
             interface: Some(args.interface.clone()),
@@ -155,7 +156,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         auto = automated,
         "starting the installer; it reboots when done (Ctrl+Alt+Q / Ctrl+C aborts)"
     );
-    let run_result = crate::run_vm::run(cfg, args.headless);
+    let run_result = crate::run_vm::run(cfg, args.headless, None);
     // Keep the derived initrd for debugging on failure; remove it on success.
     match &run_result {
         Ok(()) => {
@@ -193,6 +194,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             path: args.disk.clone(),
             writable: true,
         }],
+        cdrom: None,
         network: Some(NetworkSection {
             backend: NetworkBackend::Tap,
             interface: Some(args.interface.clone()),

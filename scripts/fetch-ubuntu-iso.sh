@@ -3,6 +3,8 @@
 # UEFI boot path (backlog UEFI-1803, docs/adr/0003-uefi-firmware.md).
 #
 #   bash scripts/fetch-ubuntu-iso.sh            # pinned LTS, live-server, amd64
+#   bash scripts/fetch-ubuntu-iso.sh desktop    # the Desktop ISO (~6 GiB), same
+#                                               # trust chain, same cache
 #   UBUNTU_RELEASE=24.04.4 bash scripts/fetch-ubuntu-iso.sh
 #   UBUNTU_VARIANT=desktop bash scripts/fetch-ubuntu-iso.sh
 #
@@ -37,8 +39,13 @@ set -euo pipefail
 UBUNTU_RELEASE="${UBUNTU_RELEASE:-26.04}"
 # `live-server` is the subiquity installer — the UEFI-1803 target. `desktop` is
 # the same trust chain and the same ISO shape (isohybrid, GPT, an ESP with
-# \EFI\BOOT\BOOTX64.EFI), just larger.
-UBUNTU_VARIANT="${UBUNTU_VARIANT:-live-server}"
+# \EFI\BOOT\BOOTX64.EFI), just larger. The first argument (if any) wins over
+# the environment: `fetch-ubuntu-iso.sh desktop`.
+UBUNTU_VARIANT="${1:-${UBUNTU_VARIANT:-live-server}}"
+case "$UBUNTU_VARIANT" in
+    live-server|desktop) ;;
+    *) echo "ERROR: unknown variant '$UBUNTU_VARIANT' (use live-server or desktop)" >&2; exit 1 ;;
+esac
 UBUNTU_ARCH="${UBUNTU_ARCH:-amd64}"
 BASE_URL="${UBUNTU_BASE_URL:-https://releases.ubuntu.com}"
 

@@ -181,6 +181,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         .into_iter()
         .flatten()
         .collect(),
+        cdrom: None,
         network: None,
         display: DisplaySection {
             width: 1280,
@@ -210,6 +211,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             script: Box::new(move |log| script.step(log)),
             transcript: Some(transcript.clone()),
         }),
+        None,
     )
     .map_err(|e| format!("installer VM failed: {e}"))?;
 
@@ -269,6 +271,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             path: args.disk.clone(),
             writable: true,
         }],
+        cdrom: None,
         network: None,
         display: DisplaySection {
             width: 1280,
