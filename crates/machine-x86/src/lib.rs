@@ -25,15 +25,24 @@ pub mod serial;
 /// [`virtio::VirtioMmioBus::attach_userspace`] for the measured cost).
 pub mod virtio;
 
-/// KVM-specific device plumbing: irqfd interrupt lines, ioeventfd queue-notify
-/// offload and the PCI bus built on them.
+/// KVM-specific device plumbing: irqfd interrupt lines and the ioeventfd
+/// queue-notify offload.
 #[cfg(target_os = "linux")]
 pub mod irqfd;
 #[cfg(target_os = "linux")]
-pub mod msi;
-#[cfg(target_os = "linux")]
 pub mod notify;
-#[cfg(target_os = "linux")]
+
+/// MSI delivery — **portable** since EPIC 17 phase 4: the architectural
+/// address/data decode and the [`msi::UserspaceMsiSink`] built on it are pure
+/// machine code; only [`msi::KvmMsiSink`] (`KVM_SIGNAL_MSI`) stays Linux-gated
+/// inside the module.
+pub mod msi;
+
+/// The PCI bus carrying virtio functions — **portable** since EPIC 17 phase 4,
+/// by the same split [`virtio`] got in phase 3: `attach` keeps the KVM wiring
+/// (irqfds, `KVM_SIGNAL_MSI`, ioeventfds), `attach_userspace` wires the same
+/// functions through [`irqchip::UserspaceIrqChip`] and [`msi::UserspaceMsiSink`]
+/// with synchronous queue kicks.
 pub mod virtio_pci;
 
 /// E820 memory range types as defined by the BIOS/ACPI interface and consumed

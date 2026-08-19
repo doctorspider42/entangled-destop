@@ -23,11 +23,11 @@
 //! one behaves exactly as this bus always did — the ports stay unclaimed and
 //! float high.
 //!
-//! The **virtio-mmio** window is on this bus on both hosts since EPIC 17 phase 3:
-//! `VirtioMmioBus::attach_userspace` wires the same devices to IOAPIC pins with
-//! synchronous queue kicks, so the routing below is unconditional. The **PCI**
-//! bus is still Linux-only — its notification area follows a guest-programmable
-//! BAR through ioeventfd rebasing, which has no WHP peer yet.
+//! Both virtio transports are on this bus on both hosts: the **virtio-mmio**
+//! window since EPIC 17 phase 3 (`VirtioMmioBus::attach_userspace`), the **PCI**
+//! bus since phase 4 (`VirtioPciBus::attach_userspace` — IOAPIC INTx lines, the
+//! userspace MSI sink, synchronous kicks that follow a BAR move by construction
+//! because every access is decoded against the BAR's current base).
 
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +39,6 @@ use crate::pflash::Pflash;
 use crate::platform::FirmwarePlatform;
 use crate::serial::SerialConsole;
 use crate::virtio::VirtioMmioBus;
-#[cfg(target_os = "linux")]
 use crate::virtio_pci::VirtioPciBus;
 
 #[derive(Clone)]
@@ -49,7 +48,6 @@ pub struct MachineBus {
     /// The PCI root bus and the virtio devices on it, present when the VM uses
     /// the pci transport. `None` leaves the machine exactly as it was before
     /// EPIC 19: an mmio-transport guest must not suddenly find a PCI bus.
-    #[cfg(target_os = "linux")]
     pci: Option<Arc<VirtioPciBus>>,
     /// The ACPI fixed-feature registers (0x600..0x610), in **both** boot modes:
     /// the FADT `machine_x86::acpi` publishes names these ports for a
@@ -81,7 +79,6 @@ impl MachineBus {
         Self {
             serial: Arc::new(Mutex::new(serial)),
             virtio: Arc::new(VirtioMmioBus::empty()),
-            #[cfg(target_os = "linux")]
             pci: None,
             acpi_pm: Arc::new(AcpiPmBlock::new()),
             irqchip: None,
@@ -100,7 +97,6 @@ impl MachineBus {
 
     /// A machine with the serial console plus a PCI bus carrying the virtio
     /// devices (EPIC 19). The virtio-mmio window stays empty.
-    #[cfg(target_os = "linux")]
     pub fn with_virtio_pci(serial: SerialConsole, pci: VirtioPciBus) -> Self {
         Self {
             pci: Some(Arc::new(pci)),
@@ -174,7 +170,6 @@ impl MachineBus {
     }
 
     /// The PCI bus behind this machine, if the VM uses the pci transport.
-    #[cfg(target_os = "linux")]
     pub fn pci(&self) -> Option<&VirtioPciBus> {
         self.pci.as_deref()
     }
@@ -202,7 +197,6 @@ impl ExitHandler for MachineBus {
         }
         // The real PCI bus takes the configuration ports ahead of the firmware
         // stub, which models the same host bridge but no devices.
-        #[cfg(target_os = "linux")]
         if let Some(pci) = &self.pci {
             if VirtioPciBus::claims_port(port) {
                 pci.io_write(port, data);
@@ -243,7 +237,6 @@ impl ExitHandler for MachineBus {
                 return;
             }
         }
-        #[cfg(target_os = "linux")]
         if let Some(pci) = &self.pci {
             if VirtioPciBus::claims_port(port) {
                 pci.io_read(port, data);
@@ -295,7 +288,6 @@ impl ExitHandler for MachineBus {
             }
             return;
         }
-        #[cfg(target_os = "linux")]
         if let Some(pci) = &self.pci {
             // Undecoded addresses (a BAR the driver has not enabled, or one it
             // has moved out of the aperture) are dropped inside the bus.
@@ -340,7 +332,6 @@ impl ExitHandler for MachineBus {
             }
             return;
         }
-        #[cfg(target_os = "linux")]
         if let Some(pci) = &self.pci {
             pci.mmio_read(addr, data);
             return;

@@ -120,6 +120,13 @@ impl UserspaceIrqChip {
         &self.pit
     }
 
+    /// The hypervisor delivery behind this chip set, for the one consumer that
+    /// injects *around* the IOAPIC rather than through a pin: the MSI sink
+    /// (`crate::msi::UserspaceMsiSink`), whose messages carry their own routing.
+    pub fn interrupt_delivery(&self) -> Arc<dyn InterruptDelivery> {
+        self.ioapic.interrupt_delivery()
+    }
+
     /// The interrupt line for the serial console: IOAPIC pin [`SERIAL_PIN`].
     pub fn serial_line(&self) -> Arc<dyn IrqLine> {
         // `SERIAL_PIN` is a compile-time constant below `REDIRECTION_ENTRIES`, so

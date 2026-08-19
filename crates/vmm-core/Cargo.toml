@@ -41,8 +41,13 @@ linux-boot.workspace = true
 # `tests/whp_virtio_blk.rs` (WHP-1703) attaches a real virtio-blk device to the
 # virtio-mmio window, which is the whole point of the test: the device crates are
 # portable, so the acceptance boot uses the same ones the KVM path does.
+# `tests/whp_virtio_pci.rs` (phase 4) does the same over the PCI transport, and
+# `tests/whp_usernet.rs` attaches the smoltcp user-mode NAT; `tests/whp_uefi.rs`
+# boots the CloudHv firmware through `uefi-boot`.
 virtio-core.workspace = true
 virtio-block.workspace = true
+virtio-net.workspace = true
+uefi-boot.workspace = true
 
 [lints]
 workspace = true
