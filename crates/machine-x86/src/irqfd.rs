@@ -43,10 +43,8 @@ impl IrqFdLine {
     /// Creates a non-blocking eventfd and registers it with `vm` as the irqfd
     /// for `gsi`.
     pub fn new(vm: &VmFd, gsi: u32) -> Result<Self, IrqFdError> {
-        let event = EventFd::new(EFD_NONBLOCK).map_err(|source| IrqFdError::EventFd {
-            gsi,
-            source: std::io::Error::from(source),
-        })?;
+        let event =
+            EventFd::new(EFD_NONBLOCK).map_err(|source| IrqFdError::EventFd { gsi, source })?;
         vm.register_irqfd(&event, gsi)
             .map_err(|source| IrqFdError::Register { gsi, source })?;
         Ok(Self { event })
