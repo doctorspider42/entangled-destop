@@ -355,13 +355,85 @@ impl VirtioPciBus {
     }
 
     /// Guest write to `0xcf8`/`0xcfc`.
+    ///
+    /// A write that moves a BAR window is not just a register update: the queue
+    /// notification area moves with it, and the KVM ioeventfds registered inside
+    /// it must follow — see [`Self::reconcile_notify`].
     pub fn io_write(&self, port: u16, data: &[u8]) {
-        match self.root.lock() {
+        let changed = match self.root.lock() {
             Ok(mut root) => root.io_write(port, data),
-            Err(_) => tracing::error!(
-                port = format_args!("{port:#x}"),
-                "PCI root lock is poisoned; dropping guest write"
-            ),
+            Err(_) => {
+                tracing::error!(
+                    port = format_args!("{port:#x}"),
+                    "PCI root lock is poisoned; dropping guest write"
+                );
+                return;
+            }
+        };
+        // The root lock is released before reconciling: `reconcile_notify` takes
+        // it again to read the new windows, and it must not be held while the
+        // transport locks are taken (the queue workers hold those).
+        if changed.is_some() {
+            self.reconcile_notify();
+        }
+    }
+
+    /// Re-points every device's queue-notify ioeventfds at wherever its BAR now
+    /// decodes.
+    ///
+    /// Called after any configuration write that changed *some* function's decode
+    /// state, and deliberately over **all** slots rather than just the one that
+    /// changed. That is what makes a permutation of BAR addresses resolvable:
+    /// EDK2's `PciBusDxe` hands out our own aperture slots in reverse order, so
+    /// the first device to be enabled wants an address a *different* device's
+    /// stale registration still owns. KVM refuses that registration, the queue
+    /// stays on the synchronous path for the moment, and this sweep picks it up
+    /// as soon as the other device has moved away. Bounded work: at most
+    /// [`crate::pci::MAX_PCI_DEVICES`] slots × [`vpci::MAX_NOTIFY_QUEUES`]-capped
+    /// queues, no allocation per slot, and it converges because each device's BAR
+    /// only moves when the guest moves it.
+    fn reconcile_notify(&self) {
+        // One pass to release addresses that are no longer ours, then one to
+        // claim the new ones — in that order, or two devices swapping windows
+        // could never both succeed.
+        let mut targets = [None; crate::pci::MAX_PCI_DEVICES];
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(target) = targets.get_mut(index) else {
+                break;
+            };
+            let window = match self.root.lock() {
+                Ok(root) => root.bar_window_of(index, vpci::VIRTIO_PCI_BAR_INDEX),
+                Err(_) => {
+                    tracing::error!("PCI root lock is poisoned; not reconciling notify addresses");
+                    return;
+                }
+            };
+            let Some(notifier) = slot.notifier() else {
+                continue;
+            };
+            match window {
+                // The BAR decodes somewhere; that is where the kicks will land.
+                Some((bar_base, _)) => {
+                    let notify_base = bar_base.saturating_add(vpci::NOTIFY_CFG_OFFSET);
+                    if notifier.notify_base() != Some(notify_base) {
+                        notifier.unregister(&slot.transport);
+                        *target = Some(notify_base);
+                    }
+                }
+                // Memory decoding is off, or the BAR is parked at 0. Nothing can
+                // reach the device through MMIO either way, so the registrations
+                // are released — keeping them would let a later device's kicks be
+                // swallowed by this one's stale address.
+                None => notifier.unregister(&slot.transport),
+            }
+        }
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(Some(notify_base)) = targets.get(index).copied() else {
+                continue;
+            };
+            if let Some(notifier) = slot.notifier() {
+                notifier.rebase(notify_base, &slot.transport);
+            }
         }
     }
 

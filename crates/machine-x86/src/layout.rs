@@ -148,21 +148,26 @@ pub const MMIO_HOLE_START: u64 = 0xc000_0000;
 
 // ---- PCI BAR aperture (EPIC 19, virtio-pci) -------------------------------
 //
-// The host assigns BARs itself, from a fixed window at the bottom of the MMIO
-// hole. Fixed rather than dynamically allocated because there is no ACPI `_CRS`
-// and no MCFG to publish a movable aperture through: a guest that re-assigns
-// these BARs would have nothing to re-assign them *from*, so both Linux (which
-// keeps a BIOS-assigned BAR it can claim) and EDK2 (whose `PciBusDxe` finds the
-// BARs already programmed) simply use what they find.
+// The host assigns each device an *initial* BAR from a fixed window at the
+// bottom of the MMIO hole, one 16 KiB slot per device:
 //
-//   0xc000_0000 .. 0xc002_0000   PCI BAR aperture (8 slots × 16 KiB)
-//   0xc002_0000 .. 0xd000_0000   free
+//   0xc000_0000 .. 0xc002_0000   initial BAR assignment (8 slots × 16 KiB)
+//   0xc002_0000 .. 0xd000_0000   room for the guest to re-assign into
 //   0xd000_0000 .. 0xd000_8000   virtio-mmio slots (8 × 4 KiB)
 //
-// The two transports therefore never overlap even though only one is ever
-// active for a given VM.
+// The two transports never overlap even though only one is ever active for a
+// given VM.
+//
+// **The initial assignment is a starting point, not the truth.** It was written
+// as one when Linux was the only consumer — Linux claims a BAR it finds already
+// programmed and leaves it there. EDK2 does not: `PciBusDxe` runs a full
+// resource allocation and reassigns every BAR (measured on this machine: it
+// hands out these very slots, in reverse device order). So the decode window
+// below has to cover everywhere the guest may legitimately put a BAR, and
+// anything the host wired to a BAR-relative address has to follow it
+// (`crate::notify::DeviceNotifier::rebase`).
 
-/// Base of the host-assigned PCI BAR aperture.
+/// Base of the host's initial PCI BAR assignment, and of the decoded aperture.
 pub const PCI_MMIO_BASE: u64 = MMIO_HOLE_START;
 
 /// Size of one device's BAR window. Must equal
@@ -173,12 +178,31 @@ pub const PCI_MMIO_BASE: u64 = MMIO_HOLE_START;
 /// at a 16 KiB-aligned base are.
 pub const PCI_MMIO_SLOT_SIZE: u64 = 0x4000;
 
-/// How many PCI devices the aperture holds. Matches
+/// How many PCI devices the initial assignment covers. Matches
 /// `crate::pci::MAX_PCI_DEVICES`.
 pub const PCI_MMIO_SLOTS: u64 = 8;
 
-/// One past the end of the PCI BAR aperture.
-pub const PCI_MMIO_END: u64 = PCI_MMIO_BASE + PCI_MMIO_SLOTS * PCI_MMIO_SLOT_SIZE;
+/// One past the end of the *initial* BAR assignment — 8 slots, 128 KiB.
+///
+/// Not the same thing as [`PCI_MMIO_END`]: this is where the host's own slots
+/// stop, and it is what `pci_bar_slot` is bounded by.
+pub const PCI_MMIO_SLOTS_END: u64 = PCI_MMIO_BASE + PCI_MMIO_SLOTS * PCI_MMIO_SLOT_SIZE;
+
+/// One past the end of the **decoded** PCI BAR aperture: a BAR anywhere in here
+/// is honoured, a BAR outside it decodes nothing.
+///
+/// This is the same window the DSDT publishes to the guest in
+/// `\_SB.PCI0._CRS` ([`PCI_MMIO_HOLE_BASE`] + [`PCI_MMIO_HOLE_SIZE`]), which is
+/// the only aperture we have told anyone about, and it is a subset of the
+/// `0xc000_0000 + 0x3800_0000` EDK2's CloudHv platform hard-codes. So a guest
+/// that re-allocates resources — every UEFI firmware does — has 256 MiB of room
+/// and cannot land somewhere the host then silently drops.
+///
+/// The bound is what keeps a *malicious* guest honest: a BAR parked over guest
+/// RAM, over the LAPIC/IOAPIC, or over the virtio-mmio window is refused rather
+/// than shadowing them, because [`crate::pci::PciRoot::locate_mmio`] checks this
+/// range before it looks at any BAR.
+pub const PCI_MMIO_END: u64 = PCI_MMIO_HOLE_BASE + PCI_MMIO_HOLE_SIZE;
 
 /// First IRQ (GSI on the in-kernel IOAPIC) handed to a PCI device's INTx line.
 ///

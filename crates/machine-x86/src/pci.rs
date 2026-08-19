@@ -293,14 +293,37 @@ impl ConfigSpace {
         Ok(self)
     }
 
-    /// Sets `interrupt_pin` (read-only; nonzero means "this device has a legacy
-    /// interrupt") and `interrupt_line`, the GSI the host has wired it to.
+    /// Sets `interrupt_pin` (nonzero means "this device has a legacy interrupt")
+    /// and `interrupt_line`, the GSI the host has wired it to. **Both are
+    /// read-only to the guest.**
     ///
-    /// `interrupt_line` stays writable, because that is what a real BIOS-assigned
-    /// line is — but nothing in the host reads it back: the line is host wiring.
+    /// On real hardware `interrupt_line` is writable, because a real BIOS routes
+    /// `INTA#` through a PIRQ router and then records where it landed. This
+    /// machine has no router: each device's line is a fixed IOAPIC pin chosen by
+    /// [`crate::virtio_pci`] and injected through a KVM irqfd, so the register
+    /// describes wiring nothing in the guest can change. Letting a guest write it
+    /// only lets the guest lie to itself.
+    ///
+    /// That is not hypothetical. EDK2's `PciBusDxe` clobbers the register twice
+    /// during enumeration — `PciDeviceSupport.c` writes `PCI_INT_LINE_UNKNOWN`
+    /// (`0xff`) and `PciEnumeratorSupport.c` writes `0` — on the assumption that
+    /// a platform driver will program the real value afterwards. Ours cannot,
+    /// because there is nothing to program. Linux then reads the clobbered value
+    /// and, finding no `_PRT` under `\_SB.PCI0` either, gives up on the line:
+    /// `0xff` means "not connected" (PCI 3.0 §6.2.4), so `acpi_pci_irq_enable()`
+    /// sets `IRQ_NOTCONNECTED` and `vp_find_vqs_intx()`'s `request_irq` fails —
+    /// every virtio device's probe ends in `VIRTIO_CONFIG_S_FAILED`, which is
+    /// exactly what booting an Ubuntu ISO looked like before this became
+    /// read-only. With the register preserved, Linux logs `PCI INT A: no GSI -
+    /// using ISA IRQ 5` and proceeds, and the ISA pin it then requests is one the
+    /// MP table and the MADT already route to the IOAPIC as an edge — which is
+    /// the shape our irqfd injection actually is.
+    ///
+    /// A `_PRT` in the DSDT is the properly furnished answer and belongs in the
+    /// same change as level-triggered `INTA#` support; see ADR-0003.
     pub fn with_interrupt(mut self, pin: u8, line: u8) -> Self {
         self.set(reg::INTERRUPT, u32::from(line) | (u32::from(pin) << 8));
-        self.set_mask(reg::INTERRUPT, 0x0000_00ff);
+        // Mask left at 0: the whole dword is read-only.
         self
     }
 
@@ -375,6 +398,22 @@ impl ConfigSpace {
     /// interrupt line.
     pub fn intx_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.intx_enabled)
+    }
+
+    /// Everything that decides which addresses this function claims: the six BAR
+    /// registers and whether memory decoding is on.
+    ///
+    /// Compared before and after a guest write to tell "the guest moved a window"
+    /// from "the guest scribbled on the latency timer". Cheap, `Copy`, and
+    /// allocation-free, because it is computed twice per configuration write.
+    fn decode_state(&self) -> ([u32; 6], bool) {
+        let mut bars = [0u32; 6];
+        for (index, slot) in bars.iter_mut().enumerate() {
+            // `index < 6`, so `BAR0 + index * 4` stays inside the header.
+            let register = reg::BAR0.saturating_add((index as u8).saturating_mul(4));
+            *slot = self.get(register);
+        }
+        (bars, self.memory_enabled())
     }
 
     /// The window BAR `index` currently decodes, or `None` when the BAR does
@@ -460,6 +499,16 @@ impl ConfigSpace {
 }
 
 // ---- the root bus ---------------------------------------------------------
+
+/// A guest configuration write changed which guest physical addresses a function
+/// decodes: some BAR moved, changed size, or its memory-space enable flipped.
+///
+/// The `owner` token is the one the caller passed to [`PciRoot::attach`], so the
+/// host can find whatever sits behind that config space and re-point it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeChanged {
+    pub owner: usize,
+}
 
 /// A decoded `CONFIG_ADDRESS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,7 +656,14 @@ impl PciRoot {
     }
 
     /// Guest write to a configuration port.
-    pub fn io_write(&mut self, port: u16, data: &[u8]) {
+    ///
+    /// Returns [`DecodeChanged`] when the write moved, resized, enabled or
+    /// disabled a function's BAR windows. The host **must** act on that: anything
+    /// it wired to a fixed guest physical address — a KVM ioeventfd above all —
+    /// is now pointing at an address the device no longer answers on. See
+    /// [`crate::virtio_pci::VirtioPciBus::io_write`].
+    #[must_use = "a moved BAR strands every ioeventfd registered inside it"]
+    pub fn io_write(&mut self, port: u16, data: &[u8]) -> Option<DecodeChanged> {
         let offset = usize::from(port.wrapping_sub(CONFIG_ADDRESS_PORT));
         if offset < 4 {
             let mut bytes = self.address.to_le_bytes();
@@ -617,17 +673,29 @@ impl PciRoot {
                 }
             }
             self.address = u32::from_le_bytes(bytes);
-            return;
+            return None;
         }
-        let Some(target) = self.decode() else {
-            return;
-        };
+        let target = self.decode()?;
         let within = offset & 0x3;
-        if let Some(function) = self.function_mut(&target) {
-            function
-                .config
-                .write_dword_bytes(target.register, within, data);
+        let function = self.function_mut(&target)?;
+        // Only a function with an owner has anything behind it to be stranded;
+        // the host bridge is a config space and nothing else.
+        let owner = function.owner;
+        let before = function.config.decode_state();
+        function
+            .config
+            .write_dword_bytes(target.register, within, data);
+        let after = function.config.decode_state();
+        match owner {
+            Some(owner) if before != after => Some(DecodeChanged { owner }),
+            _ => None,
         }
+    }
+
+    /// The window BAR `bar` of the function tagged `owner` decodes, or `None`
+    /// when it decodes nothing (see [`ConfigSpace::bar_window`]).
+    pub fn bar_window_of(&self, owner: usize, bar: u8) -> Option<(u64, u64)> {
+        self.config_of(owner)?.bar_window(bar)
     }
 
     /// Decodes a guest physical address into the function that claims it.
@@ -698,7 +766,7 @@ mod tests {
             | (u32::from(dev) << 11)
             | (u32::from(func) << 8)
             | u32::from(reg & 0xfc);
-        root.io_write(CONFIG_ADDRESS_PORT, &address.to_le_bytes());
+        let _ = root.io_write(CONFIG_ADDRESS_PORT, &address.to_le_bytes());
     }
 
     fn read32(root: &PciRoot) -> u32 {
@@ -714,7 +782,7 @@ mod tests {
 
     fn cfg_write32(root: &mut PciRoot, dev: u8, reg: u8, value: u32) {
         select(root, 0, dev, 0, reg);
-        root.io_write(CONFIG_DATA_PORT, &value.to_le_bytes());
+        let _ = root.io_write(CONFIG_DATA_PORT, &value.to_le_bytes());
     }
 
     // ------------------------------------------ configuration mechanism #1
@@ -725,15 +793,15 @@ mod tests {
     #[test]
     fn the_config_address_latch_reads_back_verbatim() {
         let mut root = PciRoot::new();
-        root.io_write(CONFIG_ADDRESS_PORT, &CONFIG_ADDRESS_ENABLE.to_le_bytes());
+        let _ = root.io_write(CONFIG_ADDRESS_PORT, &CONFIG_ADDRESS_ENABLE.to_le_bytes());
         let mut data = [0u8; 4];
         root.io_read(CONFIG_ADDRESS_PORT, &mut data);
         assert_eq!(u32::from_le_bytes(data), CONFIG_ADDRESS_ENABLE);
 
         // Byte-wise writes compose the same latch, and the low two bits of the
         // register field stay out of the decode.
-        root.io_write(CONFIG_ADDRESS_PORT, &[0x03]);
-        root.io_write(CONFIG_ADDRESS_PORT + 3, &[0x80]);
+        let _ = root.io_write(CONFIG_ADDRESS_PORT, &[0x03]);
+        let _ = root.io_write(CONFIG_ADDRESS_PORT + 3, &[0x80]);
         root.io_read(CONFIG_ADDRESS_PORT, &mut data);
         assert_eq!(u32::from_le_bytes(data), 0x8000_0003);
         assert_eq!(root.decode().expect("enabled").register, 0);
@@ -742,10 +810,10 @@ mod tests {
     #[test]
     fn a_disabled_address_decodes_nothing() {
         let mut root = root_with_one_device();
-        root.io_write(CONFIG_ADDRESS_PORT, &0u32.to_le_bytes());
+        let _ = root.io_write(CONFIG_ADDRESS_PORT, &0u32.to_le_bytes());
         assert_eq!(read32(&root), NO_DEVICE);
         // …and a write through it must not reach any device.
-        root.io_write(CONFIG_DATA_PORT, &0xffff_ffffu32.to_le_bytes());
+        let _ = root.io_write(CONFIG_DATA_PORT, &0xffff_ffffu32.to_le_bytes());
         assert_eq!(cfg_read32(&mut root, 1, reg::ID), 0x1042_1af4);
     }
 
@@ -809,7 +877,7 @@ mod tests {
         }
         // Byte-wise attempts at the same thing.
         select(&mut root, 0, 1, 0, reg::ID);
-        root.io_write(CONFIG_DATA_PORT + 1, &[0xff]);
+        let _ = root.io_write(CONFIG_DATA_PORT + 1, &[0xff]);
         assert_eq!(cfg_read32(&mut root, 1, reg::ID), 0x1042_1af4);
         // Header type stays 0 even though the bytes below it are writable.
         cfg_write32(&mut root, 1, reg::HEADER_TYPE, 0xffff_ffff);
@@ -963,17 +1031,35 @@ mod tests {
         assert!(flag.load(Ordering::Acquire));
     }
 
+    /// `interrupt_line` is host wiring, so nothing the guest writes may change
+    /// it. EDK2's `PciBusDxe` writes `0xff` (`PCI_INT_LINE_UNKNOWN`) and then `0`
+    /// during enumeration, expecting a platform driver to fill in the routed
+    /// value afterwards; there is no such driver here because there is no PIRQ
+    /// router. Letting those writes stick left Linux with `IRQ_NOTCONNECTED` and
+    /// every virtio probe ending in `VIRTIO_CONFIG_S_FAILED`.
     #[test]
     fn the_interrupt_register_publishes_the_pin_and_the_line() {
         let mut root = root_with_one_device();
         let value = cfg_read32(&mut root, 1, reg::INTERRUPT);
         assert_eq!(value & 0xff, 5, "interrupt_line: the host's GSI");
         assert_eq!((value >> 8) & 0xff, 1, "interrupt_pin: INTA#");
-        // The pin is read-only; the line is a BIOS-assigned scratch byte.
-        cfg_write32(&mut root, 1, reg::INTERRUPT, 0xffff_ffff);
-        let value = cfg_read32(&mut root, 1, reg::INTERRUPT);
-        assert_eq!(value & 0xff, 0xff);
-        assert_eq!((value >> 8) & 0xff, 1, "pin must not change");
+
+        // Both of EDK2's clobbers, and a full-dword write, leave it alone.
+        for clobber in [0xffff_ffffu32, 0x0000_0000, 0x0000_00ff] {
+            cfg_write32(&mut root, 1, reg::INTERRUPT, clobber);
+            let value = cfg_read32(&mut root, 1, reg::INTERRUPT);
+            assert_eq!(value & 0xff, 5, "line survives a write of {clobber:#x}");
+            assert_eq!(
+                (value >> 8) & 0xff,
+                1,
+                "pin survives a write of {clobber:#x}"
+            );
+        }
+        // A byte write to just the line register is refused too, which is the
+        // width PciBusDxe actually uses (`EfiPciIoWidthUint8` at 0x3c).
+        select(&mut root, 0, 1, 0, reg::INTERRUPT);
+        let _ = root.io_write(CONFIG_DATA_PORT, &[0xff]);
+        assert_eq!(cfg_read32(&mut root, 1, reg::INTERRUPT) & 0xff, 5);
     }
 
     // ------------------------------------------------------- capability list
