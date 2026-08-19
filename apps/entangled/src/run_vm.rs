@@ -2,8 +2,9 @@
 //! virtio-mmio devices attached (backlog MVP-1202..1206; display and the
 //! remaining device epics plug in here as they land).
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use control_api::{BootMode, VirtioTransport, VmConfig};
@@ -82,7 +83,73 @@ fn open_presentation(cfg: &VmConfig, headless: bool) -> Result<Presentation, Str
         .map_err(|e| e.to_string())
 }
 
+/// A host-side script: given everything the guest has printed on ttyS0 so far,
+/// the bytes to type back at it (or `None` to keep waiting).
+pub type SerialScript = Box<dyn FnMut(&str) -> Option<Vec<u8>> + Send>;
+
+/// A host-side script driving the guest's serial console (UEFI-1804).
+///
+/// The one guest-input channel that both EDK2 and GRUB listen to is the 16550:
+/// neither has a virtio-input driver, and the firmware's console *is* ttyS0 on
+/// this machine (CloudHv ships no `VirtioGpuDxe`, so there is no GOP either).
+/// So an unattended install that has to change the installer's kernel command
+/// line — because `autoinstall` must be on it and the command line lives on
+/// read-only media — types the boot commands into GRUB exactly as a person
+/// would, and watches the echo to know it worked.
+pub struct Automation {
+    /// Called with everything the guest has written to ttyS0 so far, on every
+    /// supervision tick (~50 ms). Returns bytes to type, or `None` to wait.
+    /// The closure keeps its own progress state.
+    pub script: SerialScript,
+    /// Where to write the serial transcript when the VM stops. The install flow
+    /// keeps it as the evidence for what the installer did.
+    pub transcript: Option<PathBuf>,
+}
+
+/// How a run ended, for callers that need to tell "the guest finished" from
+/// "we stopped it" — `entangled install` decides whether an installation
+/// completed on exactly that difference.
+#[derive(Debug, Clone, Default)]
+pub struct RunReport {
+    /// A vCPU ended with [`RunOutcome::Shutdown`]: the guest asked to power off
+    /// (ACPI S5) rather than being stopped from the host.
+    pub guest_shutdown: bool,
+    /// Everything the guest wrote to ttyS0, when an [`Automation`] was attached
+    /// (which is what makes the serial console observable to the host).
+    pub serial: Option<String>,
+}
+
+/// Serial output that goes to the terminal *and* into a buffer the host can
+/// read. Only used when an [`Automation`] is attached: an ordinary run must not
+/// grow a copy of the guest's console in memory.
+#[derive(Clone)]
+struct Tee {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for Tee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut inner) = self.buffer.lock() {
+            inner.extend_from_slice(buf);
+        }
+        let _ = std::io::stdout().write_all(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout().flush()
+    }
+}
+
 pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
+    run_with(cfg, headless, None).map(|_| ())
+}
+
+pub fn run_with(
+    cfg: VmConfig,
+    headless: bool,
+    automation: Option<Automation>,
+) -> Result<RunReport, String> {
     let span = tracing::info_span!("vm", id = %cfg.name);
     let _guard = span.enter();
     install_signal_handlers()?;
@@ -103,8 +170,19 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     // falls back to the MP table when absent.
     machine_x86::acpi::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
 
-    let serial =
-        SerialConsole::new(vm.fd(), Box::new(std::io::stdout())).map_err(|e| e.to_string())?;
+    // With an automation script attached the console has to be readable by the
+    // host as well as by the person watching, so it is tee'd into a buffer.
+    let transcript = automation.as_ref().and_then(|a| a.transcript.clone());
+    let captured: Option<Arc<Mutex<Vec<u8>>>> = automation
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(Vec::new())));
+    let out: Box<dyn std::io::Write + Send> = match &captured {
+        Some(buffer) => Box::new(Tee {
+            buffer: Arc::clone(buffer),
+        }),
+        None => Box::new(std::io::stdout()),
+    };
+    let serial = SerialConsole::new(vm.fd(), out).map_err(|e| e.to_string())?;
 
     // One virtio-blk device per [[disk]] entry, in configuration order: the
     // guest kernel probes virtio-mmio devices in command-line order, so the
@@ -250,11 +328,37 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     tracing::info!(state = ?state, "VM running");
 
+    // One predicate for both presentations: stop when asked, and on every tick
+    // give the automation script a chance to look at the console and type.
+    // `join_or_stop` wants `Fn`, so the script's state lives behind a mutex —
+    // it is also called from the supervisor thread in the windowed case.
+    let script = automation.map(|a| Mutex::new(a.script));
+    let console = captured.clone();
+    let script_bus = bus.clone();
+    // The ACPI S5 latch, watched from *here* as well as by the vCPU threads.
+    // A vCPU only notices it on its next exit, and a guest that has just powered
+    // off has no reason to produce one: measured on an Ubuntu install, 126
+    // seconds passed between `reboot: Power down` and the run loop noticing.
+    // Nothing was wrong — the guest was in HLT and KVM was handling it in the
+    // kernel — but "the installer finished" must not take two minutes to observe.
+    let power = Arc::clone(bus.acpi_pm());
+    let should_stop = move || {
+        if let (Some(script), Some(console)) = (&script, &console) {
+            let text = console
+                .lock()
+                .map(|buf| String::from_utf8_lossy(&buf).into_owned())
+                .unwrap_or_default();
+            if let Ok(mut script) = script.lock() {
+                if let Some(keys) = script(&text) {
+                    script_bus.push_serial_input(&keys);
+                }
+            }
+        }
+        SHUTDOWN_REQUESTED.load(Ordering::Relaxed) || power.is_shutdown_requested()
+    };
+
     let outcomes = match presentation {
-        Presentation::Headless(_) => threads.join_or_stop(
-            || SHUTDOWN_REQUESTED.load(Ordering::Relaxed),
-            Duration::from_millis(50),
-        ),
+        Presentation::Headless(_) => threads.join_or_stop(&should_stop, Duration::from_millis(50)),
         Presentation::Windowed(host) => {
             // The winit event loop must own the main thread; VM supervision
             // and the input pump move to worker threads. Ctrl+Alt+Q and the
@@ -291,10 +395,7 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
             let (tx, rx) = std::sync::mpsc::channel();
             let supervisor_handle = display_handle.clone();
             let supervisor = std::thread::spawn(move || {
-                let outcomes = threads.join_or_stop(
-                    || SHUTDOWN_REQUESTED.load(Ordering::Relaxed),
-                    Duration::from_millis(50),
-                );
+                let outcomes = threads.join_or_stop(&should_stop, Duration::from_millis(50));
                 // The guest ended (or was stopped): close the window so the
                 // event loop below returns.
                 SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
@@ -338,9 +439,19 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
     }
 
     let mut failure = None;
+    let mut report = RunReport {
+        // The guest asked to power off, whether or not a vCPU got as far as
+        // reporting it: the latch is the guest's request, `RunOutcome::Shutdown`
+        // is one way of hearing about it.
+        guest_shutdown: bus.acpi_pm().is_shutdown_requested(),
+        ..RunReport::default()
+    };
     for (i, outcome) in outcomes.iter().enumerate() {
         match outcome {
-            Ok(RunOutcome::Shutdown) => tracing::info!(vcpu = i, "guest shut down"),
+            Ok(RunOutcome::Shutdown) => {
+                report.guest_shutdown = true;
+                tracing::info!(vcpu = i, "guest shut down");
+            }
             Ok(o) => tracing::info!(vcpu = i, outcome = ?o, "vCPU finished"),
             Err(e) => {
                 tracing::error!(vcpu = i, error = %e, "vCPU failed");
@@ -357,9 +468,26 @@ pub fn run(cfg: VmConfig, headless: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     tracing::info!(state = ?state, "VM finished");
 
+    if let Some(console) = &captured {
+        let text = console
+            .lock()
+            .map(|buf| String::from_utf8_lossy(&buf).into_owned())
+            .unwrap_or_default();
+        if let Some(path) = &transcript {
+            // Best effort: a missing transcript must not fail a finished install,
+            // but it is worth a warning because it is the run's only evidence.
+            if let Err(e) = std::fs::write(path, &text) {
+                tracing::warn!(path = %path.display(), error = %e, "cannot write the serial transcript");
+            } else {
+                tracing::info!(path = %path.display(), bytes = text.len(), "serial transcript written");
+            }
+        }
+        report.serial = Some(text);
+    }
+
     match failure {
         Some(message) => Err(message),
-        None => Ok(()),
+        None => Ok(report),
     }
 }
 
