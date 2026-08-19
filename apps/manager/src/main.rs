@@ -53,6 +53,7 @@ enum ScreenshotView {
     Main,
     Wizard,
     Settings,
+    Disks,
 }
 
 fn main() -> ExitCode {

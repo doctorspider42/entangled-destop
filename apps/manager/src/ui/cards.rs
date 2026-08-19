@@ -48,7 +48,9 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
         });
 }
 
-fn banners(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
+/// The persistent notices (update, startup warning, scan errors, missing CLI).
+/// Shared with the Disks view, which shows the same product state.
+pub(crate) fn banners(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
     let mut any = false;
     if let Some(update) = &app.update {
         any = true;

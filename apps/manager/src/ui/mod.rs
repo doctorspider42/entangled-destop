@@ -3,6 +3,7 @@
 
 pub mod cards;
 pub mod dialogs;
+pub mod disks;
 pub mod header;
 pub mod logpane;
 pub mod toasts;

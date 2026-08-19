@@ -39,6 +39,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 png.workspace = true
 control-api.workspace = true
+disk-image.workspace = true
 
 # Only for the SIGTERM path of `stop`; every other process operation goes
 # through portable `std::process` (see ADR-0002 — this crate builds on Windows).

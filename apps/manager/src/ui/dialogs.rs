@@ -17,6 +17,8 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
         modal,
         settings,
         cli,
+        scan,
+        supervisor,
         ..
     } = app;
 
@@ -252,6 +254,181 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             ui.horizontal(|ui| {
                 if ui::primary_button(ui, "Save").clicked() {
                     actions.push(Action::SaveSettings);
+                }
+                if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+                    actions.push(Action::CloseModal);
+                }
+            });
+        }),
+        Modal::CreateDisk(state) => frame(ctx, "create-disk", "New disk", 470.0, |ui| {
+            ui.label(ui::dim(
+                "A sparse RAW image: it occupies almost no space until the guest writes to it.",
+            ));
+            ui.add_space(14.0);
+
+            ui.label(ui::faint("NAME"));
+            ui.add(
+                egui::TextEdit::singleline(&mut state.name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("disk-1"),
+            );
+            ui.label(ui::faint(format!(
+                "file {}",
+                settings
+                    .vm_dir
+                    .join(format!("{}.raw", state.name.trim()))
+                    .display()
+            )));
+            ui.add_space(12.0);
+
+            ui.label(ui::faint("SIZE"));
+            ui.add(
+                egui::TextEdit::singleline(&mut state.size)
+                    .desired_width(120.0)
+                    .hint_text("32G"),
+            );
+            // Live validation through the same parser the CLI uses.
+            match disk_image::parse_size(state.size.trim()) {
+                Ok(bytes) => {
+                    ui.label(ui::faint(format!(
+                        "= {} ({bytes} bytes)",
+                        format_bytes(bytes)
+                    )));
+                }
+                Err(e) => {
+                    ui.label(RichText::new(e.to_string()).color(theme::WARN).size(11.5));
+                }
+            }
+
+            if let Some(error) = &state.error {
+                ui.add_space(10.0);
+                ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+            }
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if ui::primary_button(ui, "Create disk").clicked() {
+                    actions.push(Action::SubmitCreateDisk);
+                }
+                if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+                    actions.push(Action::CloseModal);
+                }
+            });
+        }),
+        Modal::DeleteDisk(state) => frame(
+            ctx,
+            "delete-disk",
+            &format!("Delete {}", state.row.file_name),
+            470.0,
+            |ui| {
+                ui.label(
+                    RichText::new("This removes the image file permanently.")
+                        .color(theme::TEXT)
+                        .size(13.0),
+                );
+                ui.add_space(12.0);
+                ui.label(ui::faint(format!(
+                    "− {}  ({})",
+                    state.row.path.display(),
+                    format_bytes(state.row.apparent_bytes)
+                )));
+                if state.row.nvram {
+                    ui.label(ui::faint(format!(
+                        "− {}  (UEFI variable store — deleted with the disk)",
+                        disk_image::nvram_sidecar_path(&state.row.path).display()
+                    )));
+                }
+                if !state.row.attachments.is_empty() {
+                    ui.add_space(8.0);
+                    let vms: Vec<&str> = state
+                        .row
+                        .attachments
+                        .iter()
+                        .map(|a| a.vm.as_str())
+                        .collect();
+                    ui.label(
+                        RichText::new(format!(
+                            "Still attached to {} — detach it there first",
+                            vms.join(", ")
+                        ))
+                        .color(theme::WARN)
+                        .size(12.5),
+                    );
+                }
+                if let Some(error) = &state.error {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+                }
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    let deletable = state.row.attachments.is_empty();
+                    if ui::ghost_button(ui, "Delete permanently", deletable, theme::ERR).clicked() {
+                        actions.push(Action::ConfirmDeleteDisk);
+                    }
+                    if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+                        actions.push(Action::CloseModal);
+                    }
+                });
+            },
+        ),
+        Modal::AttachDisk(state) => frame(ctx, "attach-disk", "Attach disk", 470.0, |ui| {
+            ui.label(ui::dim(format!(
+                "Adds {} as a writable [[disk]] to a machine's profile.",
+                state.disk.display()
+            )));
+            ui.add_space(12.0);
+
+            let attached: Vec<&str> = scan
+                .disks
+                .iter()
+                .find(|d| d.path == state.disk)
+                .map(|d| d.attachments.iter().map(|a| a.vm.as_str()).collect())
+                .unwrap_or_default();
+            let candidates: Vec<&str> = scan
+                .vms
+                .iter()
+                .filter(|vm| !attached.contains(&vm.name.as_str()) && !supervisor.is_busy(&vm.name))
+                .map(|vm| vm.name.as_str())
+                .collect();
+
+            if candidates.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "No machine can take it: every machine is running, already \
+                         attached, or none exists yet",
+                    )
+                    .color(theme::WARN)
+                    .size(12.5),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(ui::faint("MACHINE"));
+                    ui.add_space(8.0);
+                    egui::ComboBox::from_id_salt("attach-target")
+                        .selected_text(state.selected.clone().unwrap_or_else(|| "—".into()))
+                        .show_ui(ui, |ui| {
+                            for name in &candidates {
+                                ui.selectable_value(
+                                    &mut state.selected,
+                                    Some((*name).to_string()),
+                                    *name,
+                                );
+                            }
+                        });
+                });
+                ui.label(ui::faint(
+                    "Running machines are not offered — stop them first",
+                ));
+            }
+
+            if let Some(error) = &state.error {
+                ui.add_space(8.0);
+                ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+            }
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                let ready = state.selected.is_some() && !candidates.is_empty();
+                if ui::ghost_button(ui, "Attach", ready, theme::CYAN).clicked() {
+                    actions.push(Action::SubmitAttachDisk);
                 }
                 if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
                     actions.push(Action::CloseModal);

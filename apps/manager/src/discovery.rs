@@ -1,10 +1,17 @@
 //! VM discovery: turn a directory of `*.toml` profiles into cards the UI can
-//! draw, and delete a VM again (profile + disks) with guards.
+//! draw, list every disk image those profiles (or the directory) hold, and
+//! delete/rewire them again with guards.
+//!
+//! All disk knowledge (sizes, partition tables, sidecars) comes from the
+//! shared `disk-image` crate — the same code `entangled disk` runs, linked
+//! rather than shelled out to.
 
 use std::path::{Path, PathBuf};
 
-use control_api::VmConfig;
+use control_api::{DiskSection, VmConfig};
 use thiserror::Error;
+
+pub use disk_image::format_bytes;
 
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
@@ -41,6 +48,8 @@ pub struct DiskInfo {
     /// directory and then the profile directory.
     pub resolved: PathBuf,
     pub exists: bool,
+    /// The `writable` flag of the `[[disk]]` entry.
+    pub writable: bool,
     /// Nominal image size (`metadata.len()`).
     pub size_bytes: u64,
     /// Blocks actually allocated — RAW images are sparse, so this is usually
@@ -85,6 +94,9 @@ pub struct ScanProblem {
 pub struct Scan {
     pub vms: Vec<VmEntry>,
     pub problems: Vec<ScanProblem>,
+    /// Every disk the profiles reference plus every loose `*.raw` in the VM
+    /// directory (the Disks view).
+    pub disks: Vec<DiskRow>,
 }
 
 /// Scans `vm_dir` for VM profiles. A single broken profile never fails the
@@ -119,6 +131,7 @@ pub fn scan(vm_dir: &Path, work_dir: Option<&Path>) -> Result<Scan, DiscoveryErr
 
     scan.vms.sort_by(|a, b| a.name.cmp(&b.name));
     scan.problems.sort_by(|a, b| a.path.cmp(&b.path));
+    scan.disks = disk_rows(&scan.vms, vm_dir);
     Ok(scan)
 }
 
@@ -141,8 +154,12 @@ fn entry_from_config(path: &Path, cfg: &VmConfig, work_dir: Option<&Path>) -> Vm
             DiskInfo {
                 declared: disk.path.clone(),
                 exists: meta.is_some(),
+                writable: disk.writable,
                 size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                allocated_bytes: meta.as_ref().and_then(allocated_bytes),
+                allocated_bytes: meta
+                    .is_some()
+                    .then(|| disk_image::allocated_bytes(&resolved))
+                    .flatten(),
                 resolved,
             }
         })
@@ -176,19 +193,6 @@ fn resolve(path: &Path, work_dir: Option<&Path>, profile_dir: Option<&Path>) -> 
         Some(base) => base.join(path),
         None => path.to_path_buf(),
     }
-}
-
-/// Allocated size in bytes. Unix reports 512-byte blocks; other platforms have
-/// no portable equivalent, so the UI just omits the number there.
-#[cfg(unix)]
-fn allocated_bytes(meta: &std::fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt as _;
-    Some(meta.blocks().saturating_mul(512))
-}
-
-#[cfg(not(unix))]
-fn allocated_bytes(_meta: &std::fs::Metadata) -> Option<u64> {
-    None
 }
 
 /// Files a delete would remove, in order. Disks outside the VM directory are
@@ -266,22 +270,163 @@ pub fn apply_resources(profile: &Path, memory_mib: u64, vcpus: u32) -> Result<()
     std::fs::write(profile, out).map_err(|e| e.to_string())
 }
 
-/// Binary-prefix formatting for the card labels.
-pub fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
+// ---------------------------------------------------------------------------
+// The Disks view: rows, attach/detach
+// ---------------------------------------------------------------------------
+
+/// One profile that attaches a disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskAttachment {
+    pub vm: String,
+    pub profile: PathBuf,
+    /// The `[[disk]]` path exactly as written in the profile — the key a
+    /// detach uses, so rewrites never guess at path equivalence.
+    pub declared: PathBuf,
+    pub writable: bool,
+}
+
+/// One row of the Disks view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskRow {
+    /// Resolved path (absolute wherever the profile allowed resolving it).
+    pub path: PathBuf,
+    pub file_name: String,
+    pub exists: bool,
+    pub apparent_bytes: u64,
+    pub allocated_bytes: Option<u64>,
+    /// VMs whose profiles attach this disk.
+    pub attachments: Vec<DiskAttachment>,
+    /// A `.nvram` UEFI variable-store sidecar sits next to the image.
+    pub nvram: bool,
+    /// Partition summary from `disk-image` — or why inspection refused the
+    /// image (a corrupt table is worth surfacing, not hiding).
+    pub summary: Result<String, String>,
+}
+
+/// Builds the Disks view rows: every disk the profiles reference, plus every
+/// loose `*.raw` in the VM directory nothing references (installer leftovers,
+/// hand-made images). ISOs attached via `[cdrom]` are media, not disks — they
+/// stay out.
+pub fn disk_rows(vms: &[VmEntry], vm_dir: &Path) -> Vec<DiskRow> {
+    let mut rows: Vec<DiskRow> = Vec::new();
+    // Identity for dedup: canonical where possible, the resolved path itself
+    // otherwise (a missing disk cannot be canonicalized).
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let identity = |path: &Path| -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    };
+
+    for vm in vms {
+        for disk in &vm.disks {
+            let id = identity(&disk.resolved);
+            let attachment = DiskAttachment {
+                vm: vm.name.clone(),
+                profile: vm.profile_path.clone(),
+                declared: disk.declared.clone(),
+                writable: disk.writable,
+            };
+            if let Some(at) = seen.iter().position(|s| *s == id) {
+                rows[at].attachments.push(attachment);
+                continue;
+            }
+            seen.push(id);
+            rows.push(row_for(&disk.resolved, vec![attachment]));
+        }
     }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else if value >= 100.0 {
-        format!("{value:.0} {}", UNITS[unit])
+
+    // Loose *.raw files in the VM directory.
+    if let Ok(entries) = std::fs::read_dir(vm_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "raw") {
+                continue;
+            }
+            let id = identity(&path);
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            rows.push(row_for(&path, Vec::new()));
+        }
+    }
+
+    rows.sort_by(|a, b| a.file_name.cmp(&b.file_name).then(a.path.cmp(&b.path)));
+    rows
+}
+
+fn row_for(path: &Path, attachments: Vec<DiskAttachment>) -> DiskRow {
+    let meta = std::fs::metadata(path).ok();
+    let exists = meta.is_some();
+    let summary = if exists {
+        disk_image::inspect_disk(path)
+            .map(|report| report.partition_summary())
+            .map_err(|e| e.to_string())
     } else {
-        format!("{value:.1} {}", UNITS[unit])
+        Err("the image file is missing".to_string())
+    };
+    DiskRow {
+        file_name: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+        exists,
+        apparent_bytes: meta.map(|m| m.len()).unwrap_or(0),
+        allocated_bytes: exists.then(|| disk_image::allocated_bytes(path)).flatten(),
+        attachments,
+        nvram: disk_image::existing_nvram_sidecar(path).is_some(),
+        summary,
+        path: path.to_path_buf(),
     }
+}
+
+/// Attaches `disk` to the profile as a writable `[[disk]]`, through
+/// `control-api` types (parse → mutate → re-validate → write; never a string
+/// edit). Refuses a duplicate attachment.
+pub fn attach_disk(profile: &Path, disk: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(profile).map_err(|e| e.to_string())?;
+    let mut cfg = VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
+    let profile_dir = profile.parent().map(Path::to_path_buf);
+    let duplicate = cfg
+        .disks
+        .iter()
+        .any(|d| d.path == disk || resolve(&d.path, None, profile_dir.as_deref()) == disk);
+    if duplicate {
+        return Err(format!(
+            "{} is already attached to '{}'",
+            disk.display(),
+            cfg.name
+        ));
+    }
+    cfg.disks.push(DiskSection {
+        path: disk.to_path_buf(),
+        writable: true,
+    });
+    write_validated(profile, &cfg)
+}
+
+/// Removes the `[[disk]]` entry whose path is exactly `declared` (the string
+/// the profile carries, resolved-agnostic).
+pub fn detach_disk(profile: &Path, declared: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(profile).map_err(|e| e.to_string())?;
+    let mut cfg = VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
+    let before = cfg.disks.len();
+    cfg.disks.retain(|d| d.path != declared);
+    if cfg.disks.len() == before {
+        return Err(format!(
+            "'{}' has no disk entry {}",
+            cfg.name,
+            declared.display()
+        ));
+    }
+    write_validated(profile, &cfg)
+}
+
+/// Serializes and **re-validates** a config before it replaces a working
+/// profile — a mutation that control-api would refuse must never reach disk.
+fn write_validated(profile: &Path, cfg: &VmConfig) -> Result<(), String> {
+    let out = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    VmConfig::from_toml(&out).map_err(|e| format!("the change is invalid: {e}"))?;
+    std::fs::write(profile, out).map_err(|e| e.to_string())
 }
 
 /// Names must be safe as both a file stem and a VM/hostname.
@@ -493,6 +638,94 @@ interface = "entangled0"
             "boot section preserved"
         );
         assert!(text.contains("entangled0"), "network section preserved");
+    }
+
+    #[test]
+    fn disk_rows_merge_profile_disks_and_loose_raws() {
+        let dir = temp_dir("disk-rows");
+        write_vm(&dir, "alpha", 4096);
+        std::fs::write(dir.join("alpha.nvram"), b"vars").expect("nvram");
+        std::fs::write(dir.join("loose.raw"), vec![0u8; 2048]).expect("loose");
+        std::fs::write(dir.join("notes.txt"), "ignored").expect("txt");
+
+        let scan = scan(&dir, None).expect("scan");
+        assert_eq!(scan.disks.len(), 2, "{:?}", scan.disks);
+
+        let alpha = scan
+            .disks
+            .iter()
+            .find(|d| d.file_name == "alpha.raw")
+            .expect("alpha row");
+        assert!(alpha.exists);
+        assert!(alpha.nvram, "sidecar badge");
+        assert_eq!(alpha.apparent_bytes, 4096);
+        assert_eq!(alpha.attachments.len(), 1);
+        assert_eq!(alpha.attachments[0].vm, "alpha");
+        assert!(alpha.attachments[0].writable);
+        // A blank image is a summary, not an error.
+        assert_eq!(alpha.summary.as_deref(), Ok("blank — no partition table"));
+
+        let loose = scan
+            .disks
+            .iter()
+            .find(|d| d.file_name == "loose.raw")
+            .expect("loose row");
+        assert!(loose.attachments.is_empty());
+        assert!(!loose.nvram);
+    }
+
+    #[test]
+    fn a_disk_shared_by_two_vms_is_one_row_with_two_attachments() {
+        let dir = temp_dir("disk-rows-shared");
+        let disk = dir.join("shared.raw");
+        std::fs::write(&disk, vec![0u8; 1024]).expect("disk");
+        for name in ["one", "two"] {
+            std::fs::write(
+                dir.join(format!("{name}.toml")),
+                PROFILE
+                    .replace("{NAME}", name)
+                    .replace("{DISK}", &disk.display().to_string().replace('\\', "\\\\")),
+            )
+            .expect("profile");
+        }
+
+        let scan = scan(&dir, None).expect("scan");
+        assert_eq!(scan.disks.len(), 1, "{:?}", scan.disks);
+        let vms: Vec<_> = scan.disks[0]
+            .attachments
+            .iter()
+            .map(|a| a.vm.as_str())
+            .collect();
+        assert_eq!(vms, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn attach_and_detach_rewrite_the_profile_through_control_api() {
+        let dir = temp_dir("attach-detach");
+        let profile = write_vm(&dir, "editable", 1024);
+        let extra = dir.join("extra.raw");
+        std::fs::write(&extra, vec![0u8; 512]).expect("extra disk");
+
+        attach_disk(&profile, &extra).expect("attach");
+        let entry = load_profile(&profile, None).expect("reload");
+        assert_eq!(entry.disks.len(), 2);
+        assert_eq!(entry.disks[1].declared, extra);
+        assert!(entry.disks[1].writable, "attached disks default writable");
+        // The rest of the profile survived the rewrite.
+        let text = std::fs::read_to_string(&profile).expect("read");
+        assert!(text.contains("root=UUID=deadbeef"), "boot section kept");
+
+        // Attaching the same disk again is refused.
+        let error = attach_disk(&profile, &extra).expect_err("duplicate");
+        assert!(error.contains("already attached"), "{error}");
+
+        detach_disk(&profile, &extra).expect("detach");
+        let entry = load_profile(&profile, None).expect("reload");
+        assert_eq!(entry.disks.len(), 1);
+
+        // Detaching a path the profile does not carry is a readable error.
+        let error = detach_disk(&profile, &extra).expect_err("unknown");
+        assert!(error.contains("no disk entry"), "{error}");
     }
 
     #[test]

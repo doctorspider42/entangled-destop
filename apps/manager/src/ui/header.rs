@@ -52,6 +52,20 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                     );
                 });
 
+                // View tabs: Machines / Disks. The active one carries the
+                // accent, the other stays quiet.
+                ui.add_space(18.0);
+                for (label, view) in [
+                    ("Machines", crate::app::View::Machines),
+                    ("Disks", crate::app::View::Disks),
+                ] {
+                    let active = app.view == view;
+                    let tint = if active { theme::CYAN } else { theme::TEXT_DIM };
+                    if ui::ghost_button(ui, label, true, tint).clicked() && !active {
+                        actions.push(Action::SwitchView(view));
+                    }
+                }
+
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui::primary_button(ui, "+  New machine").clicked() {
                         actions.push(Action::OpenWizard);
