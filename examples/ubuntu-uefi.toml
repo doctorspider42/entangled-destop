@@ -1,0 +1,65 @@
+# Boots an official Ubuntu Server installer ISO through UEFI (UEFI-1803,
+# docs/adr/0003-uefi-firmware.md):
+#
+#   bash guest/firmware/build-cloudhv.sh          # ~2.5 min, once
+#   iso=$(bash scripts/fetch-ubuntu-iso.sh)       # ~2.9 GiB, verified, once
+#   truncate -s 20G ~/entangled-vms/ubuntu.raw    # the install target
+#   cargo run -p entangled -- run examples/ubuntu-uefi.toml
+#
+# Edit the two disk paths below to match your machine: `iso` must be the path
+# `fetch-ubuntu-iso.sh` printed, and the target image must live on a native
+# Linux filesystem (a drvfs mount cannot create sparse files).
+#
+# ## Why every key here is what it is
+#
+# `mode = "uefi"` loads CLOUDHV.fd as a PVH ELF and enters it in 32-bit
+# protected mode; the firmware then finds its own bootloader. There is no
+# `kernel` and no `cmdline` — in this mode GRUB owns the command line, which is
+# the entire point of having firmware.
+#
+# `transport = "pci"` is **mandatory**, not a preference. EDK2's CloudHv build
+# ships VirtioPciDeviceDxe/Virtio10Dxe/VirtioBlkDxe and *no* virtio-MMIO driver
+# at all, so on the mmio transport the firmware boots fine and then finds no
+# media whatsoever. `entangled run` refuses the combination rather than letting
+# you watch a healthy firmware fail to boot.
+#
+# The disks are ordered the way the backlog asks for: the install target is
+# /dev/vda (PCI 00:01.0) and the installer ISO is /dev/vdb (00:02.0). Device
+# numbers are dense from 00:01.0 in configuration order, so this ordering is the
+# file's, not an accident.
+#
+# `writable = false` on the ISO is enforced twice over: the file is opened
+# without write access *and* the device advertises VIRTIO_BLK_F_RO and fails
+# every write request in software, so neither a firmware bug nor a malicious
+# guest can scribble on verified media.
+#
+# 2560 MiB is a deliberate ceiling-adjacent choice: subiquity wants ~2 GiB, and
+# this machine's RAM stops at the 32-bit MMIO hole (3072 MiB) until the high-RAM
+# split lands, so 4096 is not available to ask for — `entangled run` says so
+# instead of asserting deep inside the E820 builder.
+name = "ubuntu-uefi"
+memory_mib = 2560
+vcpus = 2
+transport = "pci"
+
+[boot]
+mode = "uefi"
+firmware = "artifacts/firmware/CLOUDHV.fd"
+
+# /dev/vda — the install target. 20 GiB sparse is plenty for a server install.
+[[disk]]
+path = "/home/you/entangled-vms/ubuntu.raw"
+writable = true
+
+# /dev/vdb — the installer ISO, read-only.
+[[disk]]
+path = "/home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-live-server-amd64.iso"
+writable = false
+
+# The installer's display. subiquity draws its TUI on whichever console the
+# kernel gives it; with a virtio-gpu scanout that is the window, so this is
+# where you actually drive the install.
+[display]
+width = 1280
+height = 800
+scale = 1.0
