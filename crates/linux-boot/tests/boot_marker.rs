@@ -74,6 +74,8 @@ fn debian_kernel_boots_to_ready_marker() {
     };
     let mut vm = Vm::new(&hv, &machine).unwrap();
     machine_x86::mptable::write(vm.memory(), machine.vcpu_count).unwrap();
+    // ACPI tables; `linux_boot::load` points boot_params.acpi_rsdp_addr at them.
+    machine_x86::acpi::write(vm.memory(), machine.vcpu_count).unwrap();
 
     let capture = Capture::default();
     let serial = SerialConsole::new(vm.fd(), Box::new(capture.clone())).unwrap();
@@ -109,9 +111,19 @@ fn debian_kernel_boots_to_ready_marker() {
     }
     let _ = threads.stop();
 
+    let text = capture.text();
     assert!(
         ready,
-        "no {GUEST_READY_MARKER} within {BOOT_DEADLINE:?}; serial log:\n{}",
-        capture.text()
+        "no {GUEST_READY_MARKER} within {BOOT_DEADLINE:?}; serial log:\n{text}"
+    );
+    // The tables must have been *used*, not merely written: with an MADT the
+    // kernel never prints the MP-table fallback line.
+    assert!(
+        !text.contains("ACPI MADT or MP tables are not detected"),
+        "the kernel found neither ACPI nor MP tables; serial log:\n{text}"
+    );
+    assert!(
+        text.contains("ACPI: RSDP") || text.contains("ACPI: XSDT"),
+        "no sign the kernel parsed our ACPI tables; serial log:\n{text}"
     );
 }

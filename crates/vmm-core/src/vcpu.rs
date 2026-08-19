@@ -44,10 +44,22 @@ impl Vcpu {
                     entry.ecx |= 1 << 31;
                     entry.ebx = (entry.ebx & 0x00ff_ffff) | (index << 24);
                 }
-                // Leaves 0xB (extended topology) and 0x1F (V2 extended
-                // topology) report the 32-bit x2APIC ID in EDX, with the same
-                // problem and the same fix.
-                0xb | 0x1f => entry.edx = index,
+                // Leaves 0xB (extended topology), 0x1F (V2 extended topology)
+                // and 0x8000_0026 (AMD extended CPU topology) report the
+                // 32-bit x2APIC ID in EDX, with the same problem and the same
+                // fix.
+                0xb | 0x1f | 0x8000_0026 => entry.edx = index,
+                // Leaf 0x8000_001E EAX is AMD's *extended APIC id*, and on an
+                // AMD host it is the value Linux ends up trusting: with
+                // TOPOEXT present, `parse_8000_001e()` overwrites the
+                // initial APIC id it took from leaf 1 with this one. Left at
+                // KVM's default every vCPU claimed id 0, and a 2-vCPU guest
+                // logged `[Firmware Bug]: CPU 1: APIC ID mismatch. CPUID:
+                // 0x0000 APIC: 0x0001` — the same class of bug as leaf 1, on
+                // the leaf that wins. EBX/ECX (core id, node id) are left
+                // alone: this machine has no topology to describe beyond
+                // "n independent CPUs".
+                0x8000_001e => entry.eax = index,
                 _ => {}
             }
         }

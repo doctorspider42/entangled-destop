@@ -337,8 +337,22 @@ const FADT_SLP_BUTTON: u32 = 1 << 5;
 const FADT_FIX_RTC: u32 = 1 << 6;
 
 /// FADT `IAPC_BOOT_ARCH` (ACPI 6.5 table 5.11).
+///
+/// Only `VGA_NOT_PRESENT` is set. Deliberately *not* set:
+///
+/// * `MSI_NOT_SUPPORTED` (bit 3) — true today (there is no PCI device with an
+///   MSI capability) but it makes Linux print "ACPI FADT declares the system
+///   doesn't support MSI, so disable it" and disable MSI globally, which would
+///   silently defeat the first virtio-pci device with MSI-X (EPIC 19). An
+///   absent capability already means no MSI; a global veto is a trap.
+/// * `CMOS_RTC_NOT_PRESENT` (bit 5) — the UEFI machine *has* an MC146818 at
+///   0x70/0x71 (`crate::rtc`). A direct-Linux guest does not, and setting the
+///   bit there would save the ~1.4 s `rtc_cmos` probe timeout; that needs the
+///   FADT to know the boot mode, which is a follow-up (see the acpi-machine
+///   skill).
+/// * `LEGACY_DEVICES` (bit 0) and `8042` (bit 1) — no ISA bus behind the
+///   IOAPIC's ISA IRQs beyond the UART, and no PS/2 controller.
 const IAPC_VGA_NOT_PRESENT: u16 = 1 << 2;
-const IAPC_MSI_NOT_SUPPORTED: u16 = 1 << 3;
 
 /// The Fixed ACPI Description Table: where the ACPI PM register block is, and
 /// where the DSDT and FACS are.
@@ -370,10 +384,7 @@ fn fadt(facs_addr: u64, dsdt_addr: u64) -> Vec<u8> {
     put(96, &0x0fffu16.to_le_bytes()); // P_LVL2_LAT
     put(98, &0x0fffu16.to_le_bytes()); // P_LVL3_LAT
     put(108, &[crate::rtc::REG_CENTURY]); // CENTURY
-    put(
-        109,
-        &(IAPC_VGA_NOT_PRESENT | IAPC_MSI_NOT_SUPPORTED).to_le_bytes(),
-    );
+    put(109, &IAPC_VGA_NOT_PRESENT.to_le_bytes());
     put(
         112,
         &(FADT_WBINVD
@@ -670,6 +681,22 @@ mod tests {
         assert_eq!(fadt[91], 4, "PM_TMR_LEN");
         assert_eq!(fadt[92], 4, "GPE0_BLK_LEN");
         assert_eq!(&fadt[268..276], HYPERVISOR_ID);
+
+        // IAPC_BOOT_ARCH: no VGA, but MSI must NOT be vetoed — a set bit 3 makes
+        // Linux disable MSI for the whole machine, which would silently break
+        // the first virtio-pci device with MSI-X.
+        assert_eq!(u16_at(fadt, 109) & (1 << 2), 1 << 2, "VGA_NOT_PRESENT");
+        assert_eq!(
+            u16_at(fadt, 109) & (1 << 3),
+            0,
+            "MSI_NOT_SUPPORTED must stay clear (EPIC 19 needs MSI-X)"
+        );
+        assert_eq!(
+            u16_at(fadt, 109) & (1 << 5),
+            0,
+            "the UEFI machine has a CMOS RTC, so CMOS_RTC_NOT_PRESENT is wrong"
+        );
+        assert_eq!(fadt[108], crate::rtc::REG_CENTURY, "CENTURY index");
 
         // We advertise a 24-bit PM timer, which is what platform.rs implements.
         assert_eq!(u32_at(fadt, 112) & (1 << 8), 0, "TMR_VAL_EXT must be clear");
