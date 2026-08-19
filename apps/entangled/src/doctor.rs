@@ -81,7 +81,10 @@ pub fn run() -> Result<(), String> {
     println!("                    (no ioeventfd on WHP; measured at ~285 MiB/s on virtio-blk)");
     println!("  virtio-pci      : not yet — its notification area follows a guest-programmable");
     println!("                    BAR, which needs the ioeventfd rebasing KVM has");
-    println!("  networking      : no TAP on Windows; user-mode NAT is the plan (WHP-1704)");
+    println!("  networking      : user-mode NAT in this process — DHCP, DNS and outbound TCP,");
+    println!("                    no TAP and no administrator (there is no TAP on Windows, and");
+    println!("                    the drivers that provide one are GPL). Not yet wired into");
+    println!("                    the Windows run path.");
     println!("  VMs per process : 1 — WHP maps guest memory for one partition per process,");
     println!("                    so a second VM needs a second `entangled` process");
     println!("host looks ready to run VMs");
@@ -90,7 +93,9 @@ pub fn run() -> Result<(), String> {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 pub fn run() -> Result<(), String> {
-    Err("entangled needs a Linux host with KVM or a Windows host with the Windows \
+    Err(
+        "entangled needs a Linux host with KVM or a Windows host with the Windows \
          Hypervisor Platform"
-        .into())
+            .into(),
+    )
 }

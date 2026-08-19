@@ -7,6 +7,10 @@
 //! * [`backend`] — the [`NetBackend`] contract the device drives, plus its
 //!   typed errors,
 //! * [`tap`] — the Linux TAP backend (`/dev/net/tun` + `TUNSETIFF`),
+//! * [`usernet`] — the **portable** user-mode NAT: a router, a DHCP server, a DNS
+//!   relay and TCP translated to host sockets, all in this process and needing no
+//!   privileges. The only networking available on Windows (no TAP, and the drivers
+//!   that provide one are GPL) and the rootless option on Linux,
 //! * [`device`] — [`NetDevice`], the `virtio_core::VirtioDevice`
 //!   implementation, its RX worker thread and its counters.
 //!
@@ -43,6 +47,7 @@
 pub mod backend;
 pub mod device;
 pub mod frame;
+pub mod usernet;
 
 #[cfg(target_os = "linux")]
 pub mod tap;
@@ -56,6 +61,7 @@ pub use frame::{
     validate_rx_frame, validate_tx_buffer, FrameError, NetHeader, ETH_HEADER_LEN, MAX_BUFFER_LEN,
     MAX_FRAME_LEN, MTU, VIRTIO_NET_HDR_LEN,
 };
+pub use usernet::{UserNetBackend, UserNetConfig, UserNetStats};
 
 #[cfg(target_os = "linux")]
 pub use tap::TapBackend;

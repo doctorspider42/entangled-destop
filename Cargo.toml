@@ -71,6 +71,20 @@ linux-loader = { version = "0.14", features = ["bzimage", "elf"] }
 vmm-sys-util = "0.15"
 virtio-queue = "0.17"
 vm-superio = "0.8"
+# User-mode networking (EPIC 17 phase 3 / WHP-1704). 0BSD, which `cargo deny`
+# already allows. PORTABLE, and deliberately so: it is the only networking story
+# on Windows (no TAP, and wintun/tap-windows6 are GPL) *and* the rootless one on
+# Linux. Default features are off because they include `phy-raw_socket` and
+# `phy-tuntap_interface`, which are unix-only and which this crate does not use —
+# the host side of the NAT is `std::net`, not a smoltcp PHY.
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-tcp",
+] }
 
 # general
 thiserror = "2"
