@@ -185,6 +185,20 @@ existing device/serial tests are unaffected by any of it.
    `#[ignore]`d): see below. This is the one that would have caught all four of
    ADR-0003's phase-3 gaps, and the one to run before claiming any change to
    PCI, interrupts or the block device is safe.
+6. **KVM, persistent UEFI variables** (`tests/boot/tests/uefi_nvram.rs`, tier 4,
+   *not* ignored — it needs only the firmware and ~10 s): boots the firmware
+   **twice against one NVRAM file** and asserts the flash device is accepted
+   (`QemuFlashDetected => FD behaves as FLASH, writable`), the RAM-backed store
+   stands down (`Disabling EMU Variable FVB …`), `BootOrder`/`Boot0000` end up in
+   the *file*, and the second boot **reuses** them (zero blocks erased, fewer
+   bytes programmed). Run it after any change to `machine_x86::pflash`, to
+   `layout::PFLASH_*`, or to `guest/firmware/build-cloudhv.sh` — those three have
+   to agree, and when they do not the only symptom is an installed guest that
+   stops booting after its second start. A firmware built with
+   `ENTANGLED_FW_PFLASH=0` fails this test, which is the intended behaviour.
+7. **The whole install** (`apps/entangled/tests/ubuntu_install.rs`, tier 4,
+   `#[ignore]`d): `entangled install ubuntu` and then `entangled run` of the
+   profile it wrote. See "Installing Ubuntu" below.
 
 Manual firmware bring-up (needs `bash guest/firmware/build-cloudhv.sh` once,
 ~2.5 min, ~2 GiB of EDK2 checkout in `~/.cache/entangled-edk2`):
@@ -241,6 +255,82 @@ Or drive it by hand, which is the same machine with a window:
 ```bash
 cargo run -p entangled -- run examples/ubuntu-uefi.toml   # edit the disk paths first
 ```
+
+## Installing Ubuntu, and booting what was installed (UEFI-1804)
+
+```bash
+bash guest/firmware/build-cloudhv.sh          # once, ~2.5 min
+bash scripts/fetch-ubuntu-iso.sh              # once, ~2.9 GiB, verified
+cargo run -p entangled -- install ubuntu --disk ~/entangled-vms/ubuntu.raw \
+    --size 20G --auto --headless              # unattended
+cargo run -p entangled -- run --headless ~/entangled-vms/ubuntu.toml
+```
+
+Measured on the development host (16 threads, KVM in WSL2): **4m39s** for the
+install, ~2.5 min from `entangled run` to `ubuntu login:` (most of it cloud-init
+generating SSH host keys on first boot). The automated form of both halves is
+`cargo test -p entangled --test ubuntu_install -- --ignored --nocapture`.
+
+**Three files come out of an install, and all three matter:**
+
+| File | What breaks without it |
+|---|---|
+| `<name>.toml` | nothing to run |
+| `<name>.nvram` | the firmware boots to "no bootable option" with a perfectly good disk attached: the `Boot####` entry pointing at the installed bootloader lives here, not on the disk |
+| `<name>-install.log` | the only account of what the installer did — subiquity's own log, captured off ttyS0 |
+
+`<name>-seed.iso` is kept too; it is the cloud-init NoCloud volume (label
+`CIDATA`) the install was driven by, and re-running the install regenerates it.
+
+### Reading the install transcript
+
+Four things to look for, in order. Each one failing points somewhere specific:
+
+```
+entangled: root=hd1 prefix=(hd1)/boot/grub          GRUB's command line answered
+linux /casper/vmlinuz autoinstall console=ttyS0…    the typed command line
+subiquity/load_autoinstall_config                   the seed was found and read
+reboot: Power down                                  an orderly ACPI S5 finish
+```
+
+- **No `entangled: root=…`** — the keystrokes never reached GRUB. The host types
+  on the *serial console*, which works only because CloudHv has no GOP and both
+  the firmware and GRUB use the UART (ADR-0003 phase 4). Check whether the menu
+  marker (`Try or Install Ubuntu Server`) appeared at all.
+- **No `subiquity/load_autoinstall_config`** — the seed volume was not found. It
+  must be ISO9660, labelled `CIDATA`, with `user-data` *and* `meta-data` at its
+  root; cloud-init requires both files and matches only `CIDATA`/`cidata`.
+- **`Continue with autoinstall?`** — `autoinstall` did not reach `/proc/cmdline`,
+  so the installer is waiting for a human. This is the failure the whole typing
+  mechanism exists to prevent; nothing in the autoinstall file can fix it.
+- **No `reboot: Power down`** — the install did not finish. Everything before the
+  last `start:` line in the transcript did.
+
+The echo of the typed lines is interleaved with cursor-positioning escapes (GRUB
+redraws per character), so grep for the *kernel's* view of it — `Command line:`,
+or the `autoinstall console=ttyS0` substring — rather than for a clean line.
+
+### Booting the installed system
+
+```
+BdsDxe: starting Boot0006 "Ubuntu" from HD(1,GPT,…)/\EFI\ubuntu\shimx64.efi
+GNU GRUB  version 2.14
+Welcome to Ubuntu 26.04 LTS!
+[  OK  ] Started serial-getty@ttyS0.service - Serial Getty on ttyS0.
+ubuntu login:
+```
+
+`Boot0006 "Ubuntu"` is the evidence that the NVRAM store worked: it is the entry
+`grub-install` wrote through the emulated flash device during the install, read
+back out of a file by a different VM. If instead you see
+`Boot#### "UEFI Misc Device"`, the firmware fell back to enumerating removable
+media — the boot may still work, and the variable store did not.
+
+The installed system talks on ttyS0 because the autoinstall profile's
+`late-commands` put `console=ttyS0,115200n8` in `/etc/default/grub` and ran
+`update-grub`; there is no autoinstall key for the target's kernel command line.
+GRUB's own menu is on the serial line for the same reason, which is how a failure
+to load the kernel stays visible.
 
 ### Reading the host log, not just the guest's
 

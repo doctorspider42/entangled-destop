@@ -729,13 +729,41 @@ addytywne — nie da się tego wyłączyć u nas (patrz ADR-0002).
 
 ## EPIC 18 — UEFI i akceleracja GPU
 
-| ID | Zadanie | Priorytet |
-|---|---|---:|
-| UEFI-1801 | Urządzenie pflash + mapowanie firmware w pamięci gościa | P0 |
-| UEFI-1802 | Firmware EDK2 (wariant CloudHv-style, virtio-mmio) — build + boot | P0 |
-| UEFI-1803 | Boot ISO Ubuntu przez UEFI (virtio-blk read-only jako nośnik) | P0 |
-| UEFI-1804 | Instalacja i boot Ubuntu end-to-end | P0 |
-| GPU-18xx | VirGL/Rutabaga wg istniejącej sekcji 7 (GPU-001..012) | P1 |
+| ID | Zadanie | Priorytet | Status |
+|---|---|---:|---|
+| UEFI-1801 | Urządzenie pflash + mapowanie firmware w pamięci gościa | P0 | zrobione |
+| UEFI-1802 | Firmware EDK2 (wariant CloudHv-style, virtio-mmio) — build + boot | P0 | zrobione |
+| UEFI-1803 | Boot ISO Ubuntu przez UEFI (virtio-blk read-only jako nośnik) | P0 | zrobione |
+| UEFI-1804 | Instalacja i boot Ubuntu end-to-end | P0 | zrobione |
+| GPU-18xx | VirGL/Rutabaga wg istniejącej sekcji 7 (GPU-001..012) | P1 | |
+
+Cztery fazy, wszystkie zmierzone na sprzęcie — szczegóły w
+[ADR-0003](docs/adr/0003-uefi-firmware.md):
+
+1. **UEFI-1801/1802**: EDK2 `OvmfPkg/CloudHv` wchodzi przez PVH (nie przez reset
+   vector — obraz jest ELF-em ładowanym pod 1 MiB) i dochodzi do UEFI Boot
+   Managera. Kosztowało to cztery urządzenia (PCI host bridge `0x8086:0x0d57`,
+   ACPI PM timer, RTC/CMOS, tablice ACPI) i jedną prawdziwą poprawkę w VMM:
+   CPUID musi podawać APIC ID *tego* vCPU, a nie hosta.
+2. **UEFI-1803**: ISO Ubuntu (weryfikowane GPG + SHA-256) bootuje przez
+   shim → GRUB → kernel do ekranu instalatora na virtio-gpu. Wymagało
+   virtio-pci; potem czterech poprawek, których żaden test z Linuksem nie
+   złapał (subsystem device id ≥ 0x40, ioeventfd wędrujące za BAR-em,
+   `interrupt_line` tylko do odczytu, pin 8 należy do RTC).
+3. **UEFI-1804** (ta faza): `entangled install ubuntu --auto` instaluje
+   bezobsługowo w ~5 min, a `entangled run` bootuje **zainstalowany** system do
+   `ubuntu login:`. Dwa mechanizmy:
+   - **pflash/NVRAM** (`machine_x86::pflash`): CloudHv nie ma w ogóle regionu
+     varstore, a jego PCD-y wskazują na `0x004FFFD0` — adres *wewnątrz*
+     ładowanego obrazu, będący punktem wejścia PVH. Build przestawia dwa PCD-y
+     na `0xFFC00000`, gdzie host emuluje układ CFI-01 z plikiem NVRAM na VM. Bez
+     tego wpis `Boot####` od `grub-install` ginie przy każdym zatrzymaniu VM.
+   - **autoinstall**: konfiguracja jedzie na trzecim wolumenie virtio-blk
+     (ISO9660, etykieta `CIDATA` — seed NoCloud dla cloud-inita), a słowo
+     `autoinstall` — którego seed nie może przenieść, bo subiquity czyta je z
+     `/proc/cmdline`, a linia poleceń leży na tylko-do-odczytu nośniku — jest
+     **wpisywane do GRUB-a po konsoli szeregowej**, dokładnie tak jak zrobiłby
+     to człowiek.
 
 # 9. Następna faza po MVP
 

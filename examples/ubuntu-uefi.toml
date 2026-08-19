@@ -6,6 +6,14 @@
 #   truncate -s 20G ~/entangled-vms/ubuntu.raw    # the install target
 #   cargo run -p entangled -- run examples/ubuntu-uefi.toml
 #
+# This profile drives the installer **by hand**, on the window and on the serial
+# console. For the unattended install — and for the profile that boots the
+# result, which is examples/ubuntu-installed.toml — use the install command
+# instead, which also generates the autoinstall seed volume and types the
+# installer's kernel command line into GRUB (UEFI-1804):
+#
+#   entangled install ubuntu --disk ~/entangled-vms/ubuntu.raw --size 20G --auto
+#
 # Edit the two disk paths below to match your machine: `iso` must be the path
 # `fetch-ubuntu-iso.sh` printed, and the target image must live on a native
 # Linux filesystem (a drvfs mount cannot create sparse files).
@@ -45,6 +53,14 @@ transport = "pci"
 [boot]
 mode = "uefi"
 firmware = "artifacts/firmware/CLOUDHV.fd"
+# The VM's non-volatile UEFI variable store, created erased on first use
+# (machine_x86::pflash). Optional for *this* profile — booting installation
+# media only needs the firmware's removable-media fallback — and not optional
+# once something is installed, because the installed system is reached through a
+# Boot#### variable that lives in here. Uncomment it if you intend to install
+# from this profile by hand, or the entry `grub-install` writes will be gone the
+# moment the VM stops.
+# nvram = "/home/you/entangled-vms/ubuntu.nvram"
 
 # /dev/vda — the install target. 20 GiB sparse is plenty for a server install.
 [[disk]]

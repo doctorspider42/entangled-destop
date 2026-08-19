@@ -1,0 +1,60 @@
+# An *installed* Ubuntu, booted the way a real machine boots (UEFI-1804,
+# docs/adr/0003-uefi-firmware.md).
+#
+# This is the profile shape `entangled install ubuntu` writes next to the disk;
+# copy it only if you are describing an installation by hand. The normal route:
+#
+#   bash guest/firmware/build-cloudhv.sh
+#   bash scripts/fetch-ubuntu-iso.sh
+#   entangled install ubuntu --disk ~/entangled-vms/ubuntu.raw --size 20G --auto
+#   entangled run ~/entangled-vms/ubuntu.toml
+#
+# ## The difference from examples/ubuntu-uefi.toml
+#
+# No ISO and no seed volume: there is nothing left to install from. Just the
+# target disk — and the NVRAM store, which is the key that makes this profile
+# work at all.
+#
+# ## Why `nvram` is not optional
+#
+# Nothing on the disk says "boot me". The installer ran `grub-install`, which
+# wrote an EFI boot variable — `Boot0006 "Ubuntu"` pointing at
+# \EFI\ubuntu\shimx64.efi on the ESP — into the firmware's non-volatile variable
+# store. That store is this file, backed by an emulated CFI flash device at
+# 0xffc00000 (machine_x86::pflash). Delete it, or leave the key out, and the
+# firmware boots to "No bootable option or device was found" with a perfectly
+# good Ubuntu sitting on /dev/vda.
+#
+# The firmware image itself stays shared and pristine — it is never written
+# through this path — so many VMs can name the same CLOUDHV.fd and each keeps
+# its own variables. One NVRAM file per VM, never shared: it holds that VM's
+# boot order, and (with a secure-boot firmware) its key database.
+#
+# ## Why the console is a serial line
+#
+# The install put `console=ttyS0,115200n8` on the installed system's kernel
+# command line and pointed GRUB's own menu at the same UART, so the whole boot
+# chain — firmware, GRUB, kernel, systemd, `ubuntu login:` — is readable on
+# stdout. The virtio-gpu window shows tty1, which is where you actually log in.
+name = "ubuntu"
+memory_mib = 2048
+vcpus = 2
+# Mandatory in uefi mode: EDK2's CloudHv build has no virtio-mmio driver at all,
+# so on any other transport the firmware would find no disk to boot.
+transport = "pci"
+
+[boot]
+mode = "uefi"
+firmware = "artifacts/firmware/CLOUDHV.fd"
+nvram = "/home/you/entangled-vms/ubuntu.nvram"
+
+# /dev/vda — the installed system. The ESP is partition 1, the root filesystem
+# partition 2 (subiquity's `direct` layout under UEFI).
+[[disk]]
+path = "/home/you/entangled-vms/ubuntu.raw"
+writable = true
+
+[display]
+width = 1280
+height = 800
+scale = 1.0
