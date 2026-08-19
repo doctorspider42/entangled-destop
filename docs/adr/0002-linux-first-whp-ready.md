@@ -206,6 +206,59 @@ test. What is still Linux-only above `vmm-core` is the *device wiring* —
 ioeventfds are KVM concepts; attaching the same devices through the userspace
 irqchip is phase 3.
 
+## Amendment (2026-08-19, phase 4): `entangled run` is native on Windows
+
+EPIC 17 is product-complete: `entangled run <profile>` works natively on a
+Windows host — window, virtio-gpu scanout, input, disks on either transport,
+user-mode networking, UEFI firmware with persistent NVRAM, ACPI S5 shutdown.
+The measured evidence and the phase list live in
+`.claude/skills/whp-backend/SKILL.md`; this records what the ADR has to change
+its mind about, and the two platform facts that cost the time.
+
+**The run path splits per host exactly once.** `apps/entangled`'s `run_vm`
+keeps one shared body — config, devices, presentation, supervision, reporting —
+and one per-OS `host::start()` doing machine assembly. The differences inside
+it are the ones this ADR already predicted (in-kernel chips vs.
+`machine_x86::irqchip`, irqfd/ioeventfd vs. synchronous kicks, `sigaction` vs.
+`SetConsoleCtrlHandler`) plus one it did not: **register setup is BSP-only on
+WHP** in every boot mode, because WHP has no INIT of its own to discard host
+writes and an AP touched by the host never leaves wait-for-startup.
+
+**virtio-pci needed no ioeventfd substitute, and MSI-X needed no WHP MSI API.**
+The phase-3 assessment ("its notification area follows a guest-programmable BAR,
+which needs the ioeventfd rebasing KVM has") dissolved rather than got solved:
+with synchronous kicks every notify is decoded against the BAR's *current* base
+by `PciRoot::locate_mmio`, so there is nothing registered at an absolute address
+and nothing to rebase. MSI-X delivery is `machine_x86::msi::decode_msi_message`
+— the architectural address/data decode, portable and unit-tested on both hosts
+— feeding the same `InterruptDelivery` seam the IOAPIC uses. `virtio_core::msix`
+still only knows how to produce a message (the phase-3 rule held).
+
+**The instruction emulator serves guest RAM, not just devices.** WHP's emulator
+routes *every* memory operand of a faulting instruction through the memory
+callback — not only the device window that faulted. The firmware's `CopyMem`
+out of the pflash window is `rep movs` from MMIO into RAM, and a callback that
+only knew devices silently dropped the RAM half: EDK2 copied its own variable
+store as zeroes and reported the NVRAM volume corrupt. The callback now serves
+RAM-backed GPAs from `GuestMem` (checked accessors) and falls through to the
+device bus for the rest. No Linux boot could have caught this — a kernel never
+points a memory-to-memory instruction at a device window.
+
+**`reboot=k` is not a way to end a WHP VM.** The test guests' triple-fault
+ending (`reboot(RESTART)` with `reboot=k`) reaches KVM as `KVM_EXIT_SHUTDOWN`;
+WHP with local APIC emulation absorbs the reset instead of reporting an exit,
+and the vCPU parks. Guest-initiated shutdown on WHP is the ACPI S5 path, which
+both hosts already turn into a clean stop through the PM-block latch. Related
+and fixed on both backends: `join_or_stop` now stops the remaining vCPUs as
+soon as *any* vCPU thread finishes — no run loop returns while its guest is
+healthy, and waiting for a triple-faulted BSP's parked APs hung the supervisor
+on a machine that was already dead.
+
+What phase 4 delivered, against this ADR's original port-surface table: every
+row is closed. The one behavioural difference that remains product-visible is
+the one-mapped-partition-per-process limit, which `entangled-manager` already
+respects by driving one CLI process per VM.
+
 ## Consequences
 
 - The MVP pays a small ongoing tax (trait indirection for interrupts, target

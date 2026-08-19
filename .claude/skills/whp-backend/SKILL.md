@@ -5,31 +5,44 @@ description: Implementing the native Windows host backend of Entangled Desktop o
 
 # WHP backend
 
-Scope: backlog EPIC 17 (WHP-1701…1705), ADR-0002. Two crates:
+Scope: backlog EPIC 17 (WHP-1701…1705), ADR-0002. Three places:
 
 - `crates/vmm-core/src/whp/` — everything WHP-specific: `partition.rs`,
   `vcpu.rs`, `regs.rs`, `interrupt.rs`, `emulator.rs`, `cpuid.rs`. All behind
   `#[cfg(windows)]`; the `windows` crate is declared only under
   `[target.'cfg(windows)'.dependencies]`.
-- `crates/machine-x86/src/irqchip/` — the userspace 8259/8254/IOAPIC. **Not**
-  Windows-gated: see [Where the irqchip lives](#where-the-irqchip-lives-and-why).
+- `crates/machine-x86/src/irqchip/` — the userspace 8259/8254/IOAPIC — and
+  `machine-x86/src/msi.rs` — the portable MSI decode + `UserspaceMsiSink`.
+  **Not** Windows-gated: see [Where the irqchip lives](#where-the-irqchip-lives-and-why).
+- `apps/entangled/src/run_vm.rs` — the product wiring: one shared run body, one
+  per-OS `host::start()` doing machine assembly.
 
 Tests: `crates/vmm-core/tests/` — `whp_smoke.rs` (8), `whp_boot.rs` (2),
-`whp_virtio_blk.rs` (1), `whp_smp.rs` (1), with the shared plumbing in
+`whp_virtio_blk.rs` (1), `whp_smp.rs` (1), `whp_virtio_pci.rs` (1),
+`whp_usernet.rs` (1), `whp_uefi.rs` (1), with the shared plumbing in
 `whp_common/`. Every one self-skips when WHP is off or the guest artifacts are
 missing. The portable halves are unit-tested in `machine-x86` and `virtio-net` and
 run on both hosts.
 
-## Status: phase 3 is done — virtio, SMP and user-mode networking
+## Status: phase 4 is done — `entangled run` is native on Windows
 
-On Windows, natively, in a debug build:
+On Windows, natively, in a debug build (2026-08-19):
+
+| What | Evidence |
+|---|---|
+| `entangled run examples\windows-whp.toml` | window created (wgpu on Vulkan), boot to the marker in ~4 s, guest ends via ACPI S5, `VM finished state=Stopped`, exit 0; `--headless` likewise |
+| virtio-pci + MSI-X | 8 MiB off `/dev/vda` in 30 ms = **273066 KiB/s**, `irqmode=msix`, pciscan `virtio=1 bound=1 msix=2` (`--test whp_virtio_pci`) |
+| user-mode networking, in-guest | static-configured eth0 through the NAT to a host TCP listener and the echo back; `tcp_flows=1` on the host side (`--test whp_usernet`, the guest half is `entangled.netprobe=`) |
+| UEFI + NVRAM | CloudHv boots to the Boot Manager twice against one NVRAM file: first boot programs 3423 bytes, second reuses them (1538 programmed, 0 erased) — the same numbers as the KVM run (`--test whp_uefi`) |
+
+## Status: phase 3 — virtio, SMP and user-mode networking
 
 | What | Evidence |
 |---|---|
 | Linux boots to the marker | 3.4 s, `cargo test -p vmm-core --test whp_boot` |
 | virtio-blk on virtio-mmio | 8 MiB off `/dev/vda` in 28 ms = **292571 KiB/s**, 65 interrupts on the virtio line (`--test whp_virtio_blk`) |
 | 2 vCPUs | `smpboot: Total of 2 processors activated` (`--test whp_smp`) |
-| user-mode networking | portable, 30 unit tests on both hosts; not yet wired into a Windows boot |
+| user-mode networking | portable, 30 unit tests on both hosts |
 
 The three findings that cost the time, each one the opposite of what the plan
 said:
@@ -74,8 +87,10 @@ Not done — see [Phase 3](#phase-3-what-is-still-missing).
 
 ```powershell
 $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\entangled-target-whp"
-cargo test -p vmm-core -p machine-x86 -p linux-boot -p virtio-net
-cargo clippy -p vmm-core -p machine-x86 -p linux-boot -p virtio-net --all-targets -- -D warnings
+cargo test --workspace          # the whole workspace builds and tests natively
+cargo clippy --workspace --all-targets -- -D warnings
+# the product path itself:
+cargo run -p entangled -- run --headless examples\windows-whp.toml
 # the whole serial log of a boot, for diagnosing anything timer- or APIC-shaped
 $env:ENTANGLED_WHP_BOOT_LOG = "$env:TEMP\whpboot.log"
 cargo test -p vmm-core --test whp_boot -- --nocapture
@@ -93,9 +108,10 @@ Linux-side scripts; copying them in from another checkout is fine.
 
 **The whole workspace builds natively**, including the `virtio-*` crates and
 `display`, thanks to two vendored patches in `third_party/` (see their
-VENDORED.md). What is still Linux-only above `vmm-core` is `machine_x86::irqfd`,
-`notify` and `virtio_pci` — irqfds and ioeventfds are KVM concepts. `virtio.rs` is
-**not** on that list any more: see [virtio on Windows](#virtio-on-windows).
+VENDORED.md). What is still Linux-only above `vmm-core` is `machine_x86::irqfd`
+and `notify` — irqfds and ioeventfds are KVM concepts. `virtio.rs` and
+`virtio_pci.rs` are **not** on that list any more: see
+[virtio on Windows](#virtio-on-windows).
 
 WHP needs the **"Windows Hypervisor Platform"** optional feature (admin +
 reboot; `dism /Online /Enable-Feature /FeatureName:HypervisorPlatform`). It
@@ -434,6 +450,25 @@ accessors expect. The boot log's two `unchecked MSR access error` lines
   both orderings structural rather than a convention to remember.
 - **The `windows` crate constants are `WHV_*(i32)` newtypes**, so matching on
   them needs `#[allow(non_upper_case_globals)]` (CI runs `-D warnings`).
+- **The emulator routes *every* memory operand through the memory callback**,
+  not just the device window that faulted. A memory-to-memory instruction with
+  one MMIO operand — EDK2's `CopyMem` out of the pflash window is `rep movs` —
+  asks the callback to serve its guest-RAM side too, and a callback that only
+  dispatches to the device bus silently drops those accesses. Measured symptom:
+  the firmware copied its own variable store as zeroes and reported
+  `Firmware Volume for Variable Store is corrupted`. The callback serves
+  RAM-backed GPAs from `GuestMem` first (checked accessors) and falls through
+  to `ExitHandler` for the rest. No Linux guest ever hit this: kernels do not
+  point memory-to-memory instructions at device windows.
+- **A triple fault does not end a WHP VM with local APIC emulation on.** KVM
+  reports `KVM_EXIT_SHUTDOWN`; WHP absorbs the reset and the VP parks inside
+  `WHvRunVirtualProcessor` with no exit at all — `reboot=k` (the test guests'
+  default ending) therefore hangs a WHP run that waits for the guest. End WHP
+  guests through ACPI S5 (`entangled.poweroff=1` for the test initramfs), which
+  both hosts turn into a clean stop through the PM-block latch. Related fix in
+  both backends' `join_or_stop`: one finished vCPU now stops the rest — a
+  multi-CPU guest that triple-faults on the BSP leaves its APs parked forever,
+  and no run loop returns while its guest is healthy.
 
 ## virtio on Windows
 
@@ -461,11 +496,16 @@ Two things to know:
   binding) would remove the emulation and the serialisation, but nothing yet needs
   it. Re-take the number with `--test whp_virtio_blk -- --nocapture` before
   deciding otherwise.
-- **virtio-pci is still Linux-only.** Not for want of a transport — that builds
-  natively — but because its notification area sits at a *guest-programmable* BAR
-  and the host side follows it by re-registering ioeventfds
-  (`notify::DeviceNotifier::rebase`). With synchronous kicks there is nothing to
-  rebase, so the WHP path needs `virtio_pci.rs` split the way `virtio.rs` was.
+- **virtio-pci got the same split in phase 4** — `VirtioPciBus::attach_userspace`
+  next to the KVM `attach`, sharing one `attach_function` body. The rebasing
+  problem *dissolved* rather than got solved: with synchronous kicks nothing is
+  registered at an absolute address, and every access is decoded against the
+  BAR's current base by `PciRoot::locate_mmio`, so a guest moving a BAR needs no
+  host follow-up at all. MSI-X delivery is the portable
+  `machine_x86::msi::decode_msi_message` (Intel SDM address/data layout, unit
+  tests on both hosts) feeding `InterruptDelivery` — the same seam the IOAPIC
+  uses, one `WHvRequestInterrupt` per message, which also bumps the `HaltGate`.
+  Acceptance: `--test whp_virtio_pci` (pciscan + blkbench with `irqmode=msix`).
 
 ## SMP: the trap is the bug
 
@@ -500,28 +540,45 @@ Both of these came out of the SMP work and are the first two things to reach for
   `Canceled` for a whole boot means WHP is blocking inside the run call, which no
   serial log can tell you.
 
-## Phase 4: what is still missing
+## Phase 4: what it delivered, and what remains
 
-1. **The GUI/CLI run path on Windows.** `apps/entangled`'s `run` and
-   `control-api`'s lifecycle still assume KVM. `doctor` has its WHP arm; what is
-   left is a backend choice at VM construction. Remember the
-   one-mapped-partition-per-process limit: the manager must spawn one process per
-   VM on Windows.
-2. **Wiring `usernet` into a boot.** The backend is done and unit-tested on both
-   hosts, but nothing attaches it yet, and the in-guest half of the acceptance is
-   blocked on the guest artifacts: the test initramfs has no DHCP client, and the
-   bootstrap kernel has no `CONFIG_IP_PNP_DHCP`, so a guest cannot configure itself
-   from it. Either add `CONFIG_IP_PNP` + `CONFIG_IP_PNP_DHCP` to
-   `guest/bootstrap-kernel/entangled.config` (then `ip=dhcp` on the cmdline is the
-   whole client), or add a probe to `guest/test-rootfs/init-rs`.
-   `UserNetBackend::static_ip_cmdline` is the no-DHCP path in the meantime.
-3. **virtio-pci on WHP**, see above.
-4. **UEFI on WHP.** `uefi-boot` is portable and `setup_pvh_sregs` goes through the
-   same seam, so this may already work; nobody has tried. Reset-vector ROM
-   placement needs a second `WHvMapGpaRange` below 4 GiB.
-5. **CI (WHP-1705).** A `windows-latest` matrix job can build, clippy and run the
-   non-WHP tests; GitHub's runners have no nested virtualisation, so the WHP tests
-   self-skip there — which is exactly why they self-skip rather than fail.
+All five phase-4 items are done:
+
+1. **The run path** — `apps/entangled/src/run_vm.rs` has one shared body and a
+   per-OS `host` module; `entangled run` (windowed and `--headless`) works
+   natively, ends via ACPI S5 or Ctrl+C (`SetConsoleCtrlHandler`), and the
+   manager needs nothing new — it already drives one CLI process per VM, which
+   is what the one-mapped-partition-per-process limit demands. **Register setup
+   is BSP-only on WHP in every boot mode** (direct-Linux *and* PVH): the AP rule
+   from phase 3 applies to `setup_pvh_sregs` too.
+2. **usernet in a boot** — `[network] backend = "usernet"` (control-api), wired
+   in `run_vm` with `static_ip_cmdline()` appended for direct-Linux guests (the
+   bootstrap kernel carries `CONFIG_IP_PNP`, so `ip=` is the whole client). The
+   in-guest acceptance is `entangled.netprobe=<ip>/<prefix>,<gw>,<host>:<port>`
+   in the test initramfs: static ioctl config, TCP out through the NAT, echo
+   verified byte for byte (`--test whp_usernet`).
+3. **virtio-pci + MSI-X** — see [virtio on Windows](#virtio-on-windows).
+4. **UEFI** — worked through the same seams once two real bugs fell (see the
+   traps below: the emulator's RAM operands, and `map_rom`). CloudHv boots to
+   the Boot Manager and the NVRAM persistence numbers match the KVM run
+   (`--test whp_uefi`). Reset-vector images get `WhpPartition::map_rom`
+   (read+execute mapping; guest writes fault into the bus and are dropped, the
+   same semantics as `KVM_MEM_READONLY`).
+5. **CI (WHP-1705)** — a `windows-latest` job builds, clippys and tests the
+   whole workspace, and asserts that `whp_boot` *self-skips with its hint*
+   rather than failing on a runner without WHP.
+
+Still open after phase 4:
+
+- **guest → host file of record for reboots:** `reboot=k`'s triple fault ends a
+  KVM VM (`KVM_EXIT_SHUTDOWN`) but not a WHP one — see the traps below. Guests
+  should power off via ACPI S5 on both hosts; a real reboot (restart the same
+  VM) is unimplemented on both.
+- **DHCP in the test guest** — the netprobe configures itself statically;
+  `ip=dhcp` against the usernet DHCP server would exercise that server from a
+  real kernel (it is unit-tested today).
+- **The doorbell optimisation** for synchronous kicks, if a measurement ever
+  demands it.
 
 ## Hard rules that apply here
 
