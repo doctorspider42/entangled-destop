@@ -4385,8 +4385,6 @@ dependencies = [
 [[package]]
 name = "virtio-queue"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e358084f32ed165fddb41d98ff1b7ff3c08b9611d8d6114a1b422e2e85688baf"
 dependencies = [
  "libc",
  "log",

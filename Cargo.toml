@@ -6,6 +6,9 @@ exclude = [
     # cargo-fuzz targets: nightly-only (libfuzzer-sys + -Zsanitizer), own
     # workspace, never part of `cargo test --workspace`. See fuzz/README.md.
     "fuzz",
+    # Vendored, patched copy of a published crate (see its VENDORED.md);
+    # consumed via [patch.crates-io], not as a member.
+    "third_party/virtio-queue",
 ]
 members = [
     "crates/vmm-core",
@@ -140,3 +143,8 @@ undocumented_unsafe_blocks = "deny"
 [profile.release]
 lto = "thin"
 panic = "abort"
+
+# Local, minimally-patched copies of published crates. Each carries a
+# VENDORED.md with provenance and the exact change; drop when upstreamed.
+[patch.crates-io]
+virtio-queue = { path = "third_party/virtio-queue" }

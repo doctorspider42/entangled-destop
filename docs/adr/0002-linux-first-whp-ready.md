@@ -92,10 +92,11 @@ still do not, for a reason worth recording because we cannot fix it
 locally: **`virtio-queue` 0.17 depends on `vm-memory` without
 `default-features = false`**, so it re-enables `rawfd` for the whole
 dependency graph and the `compile_error!` fires again. Cargo features are
-additive, so no manifest edit on our side can subtract it. Options when
-this becomes load-bearing (it blocks WHP-1703 onward): upstream a
-`default-features = false` PR to rust-vmm, vendor a patched
-`virtio-queue`, or use `[patch.crates-io]` against a fork.
+additive, so no manifest edit on our side can subtract it. Resolved on
+2026-08-19 (user's call): a vendored, minimally-patched copy lives in
+third_party/virtio-queue (see its VENDORED.md), wired via [patch.crates-io].
+With it, the whole virtio stack and `display` compile natively on Windows;
+an upstream rust-vmm PR remains the endgame.
 
 What phase 1 delivered, against the port surface table above:
 
