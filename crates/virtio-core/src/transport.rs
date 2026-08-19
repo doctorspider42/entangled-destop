@@ -54,9 +54,9 @@ use crate::MAX_QUEUE_SIZE;
 /// Ways a device can fail a transport's contract.
 ///
 /// Shared by both transports: every variant but
-/// [`Self::TooManyQueuesForNotify`] applies to virtio-mmio and virtio-pci
-/// alike, and all of them are raised at VM construction time, never by guest
-/// input.
+/// [`Self::TooManyQueuesForNotify`] and [`Self::TooManyQueuesForMsix`] applies
+/// to virtio-mmio and virtio-pci alike, and all of them are raised at VM
+/// construction time, never by guest input.
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error(
@@ -86,6 +86,16 @@ pub enum TransportError {
         device_type: DeviceType,
         queues: usize,
         max: usize,
+    },
+
+    #[error(
+        "device type {device_type:?} exposes {queues} virtqueues, which needs \
+         {queues} + 1 MSI-X vectors; the MSI-X table region holds at most {max}"
+    )]
+    TooManyQueuesForMsix {
+        device_type: DeviceType,
+        queues: usize,
+        max: u16,
     },
 }
 

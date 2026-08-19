@@ -9,10 +9,24 @@
 //! * [`IrqLine`] is the host mechanism that actually raises the line. On Linux
 //!   `machine-x86` implements it with an `EventFd` registered as a KVM irqfd,
 //!   so signalling never round-trips through userspace. Tests use counters.
+//! * [`MsiSink`] is the same idea one step further along: the host mechanism
+//!   that delivers one **MSI message** — an (address, data) pair the device
+//!   would have written to memory on real hardware. It is what
+//!   [`MsixInterrupt`](crate::pci::MsixInterrupt) signals through, and it is
+//!   deliberately neutral: no GSI, no eventfd, no `kvm_msi`, so the KVM
+//!   implementation (`machine_x86::msi`) and a future WHP one differ only in
+//!   what they do with those two numbers.
 //!
-//! [`LineInterrupt`] glues the two together and owns the shared state a
+//! [`LineInterrupt`] glues the first two together and owns the shared state a
 //! single-line (INTx-style) transport exposes: the pending-bit word, its
 //! acknowledge semantics and the config generation counter.
+//!
+//! [`TransportInterrupt`] is the seam between a transport and whichever of the
+//! two it was built with. A transport needs more than [`Interrupt`]: it serves
+//! the pending-bit word to the guest and acknowledges it. Both
+//! [`LineInterrupt`] and [`MsixInterrupt`](crate::pci::MsixInterrupt) implement
+//! it, which is what lets `virtio-pci` swap in the MSI-X capable object without
+//! `TransportState` — or virtio-mmio — knowing that MSI-X exists.
 //!
 //! **Both transports use it unchanged.** virtio-mmio serves the word through
 //! `INTERRUPT_STATUS` (write-to-ack via `INTERRUPT_ACK`), virtio-pci through
@@ -42,6 +56,39 @@ pub trait IrqLine: Send + Sync {
     fn trigger(&self) -> Result<(), InterruptError>;
 }
 
+/// One MSI (message signalled interrupt) message: the address a device would
+/// have written on real hardware, and the data it would have written there.
+///
+/// Both halves are **guest-programmed** — they come straight out of the MSI-X
+/// table the driver wrote — so nothing here may be used as a host address. It is
+/// a message handed to the host's interrupt controller, which decodes it against
+/// the *guest's* local APICs exactly as it would decode a write from a real
+/// device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MsiMessage {
+    /// Full 64-bit message address (`address_lo` plus `address_hi` from the
+    /// table entry). On x86 the low bits carry the destination APIC id and the
+    /// redirection/destination-mode flags.
+    pub address: u64,
+    /// Message data: vector, delivery mode, trigger mode.
+    pub data: u32,
+}
+
+/// The host mechanism that delivers an [`MsiMessage`].
+///
+/// The MSI counterpart of [`IrqLine`], and deliberately just as narrow: an
+/// address/data pair in, an interrupt in the guest out. On Linux
+/// `machine_x86::msi::KvmMsiSink` hands it to `KVM_SIGNAL_MSI`, which walks the
+/// in-kernel local APICs; a WHP host would decode it and call
+/// `vmm_core::hv::InterruptDelivery` instead. Neither type appears here
+/// (ADR-0002).
+///
+/// Implementations must be non-blocking: this is called from a device's queue
+/// worker thread and, for a synchronous kick, from a vCPU thread.
+pub trait MsiSink: Send + Sync {
+    fn send(&self, message: MsiMessage) -> Result<(), InterruptError>;
+}
+
 /// What a device uses to notify its driver. Transport-agnostic on purpose.
 pub trait Interrupt: Send + Sync {
     /// A used buffer was added to `queue_index`.
@@ -49,6 +96,41 @@ pub trait Interrupt: Send + Sync {
 
     /// The device configuration space changed.
     fn signal_config_change(&self) -> Result<(), InterruptError>;
+}
+
+/// What a *transport* needs from its interrupt object, on top of what a device
+/// needs ([`Interrupt`]).
+///
+/// A transport does two things a device never does: it serves the pending-bit
+/// word to the guest (virtio-mmio's `INTERRUPT_STATUS`, virtio-pci's ISR byte)
+/// and it acknowledges it. Both [`LineInterrupt`] and
+/// [`MsixInterrupt`](crate::pci::MsixInterrupt) implement this, which is the
+/// whole reason `TransportState` — and therefore virtio-mmio — needs no
+/// knowledge of MSI-X: it stores an `Arc<dyn TransportInterrupt>` and cannot
+/// tell which one it has.
+pub trait TransportInterrupt: Interrupt {
+    /// The pending-interrupt word without clearing it.
+    fn status(&self) -> u32;
+
+    /// Clears the acknowledged bits (virtio-mmio's `INTERRUPT_ACK`).
+    fn ack(&self, bits: u32);
+
+    /// Device reset: nothing is pending any more.
+    fn clear(&self);
+
+    /// Returns the pending bits and clears them atomically (virtio-pci's
+    /// read-to-clear ISR).
+    fn take_status(&self) -> u32;
+
+    /// The `config_generation` counter.
+    fn generation(&self) -> u32;
+
+    /// Upcast to the device-facing half, for [`crate::DeviceResources`].
+    ///
+    /// Written out rather than relying on `Arc<dyn Sub> -> Arc<dyn Super>`
+    /// coercion so the crate keeps building on toolchains without trait
+    /// upcasting.
+    fn as_interrupt(self: Arc<Self>) -> Arc<dyn Interrupt>;
 }
 
 /// The virtio-mmio interrupt: the guest-visible `INTERRUPT_STATUS` word and
@@ -105,9 +187,41 @@ impl LineInterrupt {
         self.status.swap(0, Ordering::AcqRel)
     }
 
+    /// Bumps `config_generation` without raising anything.
+    ///
+    /// The generation is a *read protocol* for the config space — a driver reads
+    /// it, reads the config, reads it again — not an interrupt mechanism, so it
+    /// has to advance on every config change whichever way the driver is told
+    /// about it. [`MsixInterrupt`](crate::pci::MsixInterrupt) calls this and then
+    /// sends an MSI instead of raising the line.
+    pub fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     fn raise(&self, bit: u32) -> Result<(), InterruptError> {
         self.status.fetch_or(bit, Ordering::AcqRel);
         self.line.trigger()
+    }
+}
+
+impl TransportInterrupt for LineInterrupt {
+    fn status(&self) -> u32 {
+        Self::status(self)
+    }
+    fn ack(&self, bits: u32) {
+        Self::ack(self, bits)
+    }
+    fn clear(&self) {
+        Self::clear(self)
+    }
+    fn take_status(&self) -> u32 {
+        Self::take_status(self)
+    }
+    fn generation(&self) -> u32 {
+        Self::generation(self)
+    }
+    fn as_interrupt(self: Arc<Self>) -> Arc<dyn Interrupt> {
+        self
     }
 }
 
