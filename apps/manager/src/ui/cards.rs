@@ -240,6 +240,16 @@ fn vm_card(
                             }
                         }
                     }
+                    if ui::ghost_button(ui, "Edit", status == Status::Stopped, theme::VIOLET)
+                        .on_hover_text(if status == Status::Stopped {
+                            "Memory, vCPUs, boot, network, disks, display"
+                        } else {
+                            "Stop the machine first"
+                        })
+                        .clicked()
+                    {
+                        actions.push(Action::AskEditVm(vm.name.clone()));
+                    }
                     if ui::ghost_button(ui, "Delete", status == Status::Stopped, theme::ERR)
                         .on_hover_text(if status == Status::Stopped {
                             "Remove the profile and its disk"

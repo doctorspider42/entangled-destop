@@ -9,6 +9,7 @@
 mod app;
 mod diagnose;
 mod discovery;
+mod editor;
 mod launcher;
 mod logo;
 mod metrics;

@@ -135,6 +135,12 @@ pub struct AttachDiskState {
     pub error: Option<String>,
 }
 
+/// Edit-VM dialog state: the form plus its inline error.
+pub struct EditVmState {
+    pub form: crate::editor::EditForm,
+    pub error: Option<String>,
+}
+
 /// Delete confirmation state (GUI-1604).
 pub struct DeleteState {
     pub name: String,
@@ -160,6 +166,7 @@ pub enum Modal {
     CreateDisk(CreateDiskState),
     DeleteDisk(DeleteDiskState),
     AttachDisk(AttachDiskState),
+    EditVm(EditVmState),
 }
 
 impl Modal {
@@ -206,6 +213,9 @@ pub enum Action {
     },
     /// Open the host file manager with the disk selected (explorer/xdg-open).
     RevealDisk(PathBuf),
+    // ---- VM editor ---------------------------------------------------------
+    AskEditVm(String),
+    SubmitEditVm,
 }
 
 /// A VM being installed that has no profile on disk yet, so it still gets a
@@ -1098,6 +1108,55 @@ impl ManagerApp {
         }
     }
 
+    // ---- VM editor ------------------------------------------------------
+
+    fn ask_edit_vm(&mut self, name: &str) {
+        if self.supervisor.is_busy(name) {
+            self.toast(
+                ToastLevel::Warn,
+                format!("'{name}' is busy — stop it before editing"),
+            );
+            return;
+        }
+        let Some(vm) = self.vm(name) else {
+            self.toast(ToastLevel::Error, format!("'{name}' is gone from disk"));
+            return;
+        };
+        match crate::editor::EditForm::from_profile(&vm.profile_path.clone()) {
+            Ok(form) => self.modal = Modal::EditVm(EditVmState { form, error: None }),
+            Err(e) => self.toast(
+                ToastLevel::Error,
+                format!("cannot open '{name}' for editing: {e}"),
+            ),
+        }
+    }
+
+    fn submit_edit_vm(&mut self) {
+        let Modal::EditVm(state) = &self.modal else {
+            return;
+        };
+        let name = state.form.name.clone();
+        // The VM could have been started from outside between open and save.
+        if self.supervisor.is_busy(&name) {
+            if let Modal::EditVm(state) = &mut self.modal {
+                state.error = Some(format!("'{name}' is running — stop it first"));
+            }
+            return;
+        }
+        match state.form.save() {
+            Ok(()) => {
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, format!("saved '{name}'"));
+                self.request_scan(true);
+            }
+            Err(e) => {
+                if let Modal::EditVm(state) = &mut self.modal {
+                    state.error = Some(e);
+                }
+            }
+        }
+    }
+
     fn reveal_disk(&mut self, path: &Path) {
         match reveal_in_file_manager(path) {
             Ok(()) => {}
@@ -1176,6 +1235,8 @@ impl ManagerApp {
                 declared,
             } => self.detach_disk(&vm, &profile, &declared),
             Action::RevealDisk(path) => self.reveal_disk(&path),
+            Action::AskEditVm(name) => self.ask_edit_vm(&name),
+            Action::SubmitEditVm => self.submit_edit_vm(),
         }
     }
 

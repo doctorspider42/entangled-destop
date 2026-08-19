@@ -435,6 +435,13 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 }
             });
         }),
+        Modal::EditVm(state) => frame(
+            ctx,
+            "edit-vm",
+            &format!("Edit {}", state.form.name),
+            600.0,
+            |ui| edit_vm_body(ui, state, actions),
+        ),
     };
 
     if closed {
@@ -443,6 +450,210 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         actions.push(Action::CloseModal);
     }
+}
+
+/// The Edit-VM form body. Every field writes into [`crate::editor::EditForm`];
+/// Save runs control-api validation and shows its message inline. Scrollable —
+/// a UEFI profile with several disks outgrows any fixed height.
+fn edit_vm_body(ui: &mut egui::Ui, state: &mut crate::app::EditVmState, actions: &mut Vec<Action>) {
+    use crate::editor::NetworkChoice;
+    use control_api::{BootMode, VirtioTransport};
+
+    let form = &mut state.form;
+    egui::ScrollArea::vertical()
+        .max_height(460.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            // Resources.
+            slider_row(ui, "MEMORY", |ui| {
+                ui.add(
+                    egui::Slider::new(&mut form.memory_mib, 128..=control_api::MAX_MEMORY_MIB)
+                        .step_by(128.0)
+                        .suffix(" MiB"),
+                );
+            });
+            slider_row(ui, "vCPUs", |ui| {
+                ui.add(egui::Slider::new(&mut form.vcpus, 1..=64));
+            });
+            ui.add_space(10.0);
+
+            // Transport + boot mode.
+            ui.horizontal(|ui| {
+                ui.label(ui::faint("TRANSPORT"));
+                ui.add_space(8.0);
+                egui::ComboBox::from_id_salt("edit-transport")
+                    .selected_text(form.transport.to_string())
+                    .show_ui(ui, |ui| {
+                        for t in [VirtioTransport::Mmio, VirtioTransport::Pci] {
+                            ui.selectable_value(&mut form.transport, t, t.to_string());
+                        }
+                    });
+                ui.add_space(14.0);
+                ui.label(ui::faint("BOOT"));
+                ui.add_space(8.0);
+                egui::ComboBox::from_id_salt("edit-boot-mode")
+                    .selected_text(match form.boot_mode {
+                        BootMode::DirectLinux => "direct-linux",
+                        BootMode::Uefi => "uefi",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut form.boot_mode,
+                            BootMode::DirectLinux,
+                            "direct-linux",
+                        );
+                        ui.selectable_value(&mut form.boot_mode, BootMode::Uefi, "uefi");
+                    });
+            });
+            ui.add_space(8.0);
+
+            match form.boot_mode {
+                BootMode::DirectLinux => {
+                    text_row(
+                        ui,
+                        "KERNEL",
+                        &mut form.kernel,
+                        "artifacts/bootstrap/vmlinuz",
+                    );
+                    text_row(
+                        ui,
+                        "INITRAMFS",
+                        &mut form.initramfs,
+                        "artifacts/bootstrap/initrd.img (optional)",
+                    );
+                    text_row(ui, "CMDLINE", &mut form.cmdline, "console=ttyS0 …");
+                }
+                BootMode::Uefi => {
+                    text_row(
+                        ui,
+                        "FIRMWARE",
+                        &mut form.firmware,
+                        "artifacts/firmware/CLOUDHV.fd",
+                    );
+                    text_row(ui, "NVRAM", &mut form.nvram, "<vm>.nvram (optional)");
+                    text_row(ui, "CDROM", &mut form.cdrom, "installer .iso (optional)");
+                }
+            }
+            ui.add_space(10.0);
+
+            // Network.
+            ui.horizontal(|ui| {
+                ui.label(ui::faint("NETWORK"));
+                ui.add_space(8.0);
+                egui::ComboBox::from_id_salt("edit-network")
+                    .selected_text(form.network.label())
+                    .show_ui(ui, |ui| {
+                        for choice in NetworkChoice::ALL {
+                            ui.selectable_value(&mut form.network, choice, choice.label());
+                        }
+                    });
+            });
+            if form.network == NetworkChoice::Tap {
+                text_row(ui, "INTERFACE", &mut form.interface, "entangled0");
+            }
+            if form.network != NetworkChoice::None {
+                text_row(
+                    ui,
+                    "MAC",
+                    &mut form.mac,
+                    "52:00:… (optional, derived from the name)",
+                );
+            }
+            ui.add_space(10.0);
+
+            // Display.
+            ui.horizontal(|ui| {
+                ui.label(ui::faint("DISPLAY"));
+                ui.add_space(8.0);
+                ui.add(egui::DragValue::new(&mut form.display_width).range(320..=7680));
+                ui.label(ui::faint("×"));
+                ui.add(egui::DragValue::new(&mut form.display_height).range(200..=4320));
+                ui.add_space(12.0);
+                ui.checkbox(&mut form.virgl, "VirGL 3D").on_hover_text(
+                    "Offer VIRTIO_GPU_F_VIRGL backed by the host virglrenderer \
+                     (Linux hosts; the run fails rather than silently booting 2D)",
+                );
+            });
+            ui.add_space(10.0);
+
+            // Disks: order is guest device order (/dev/vda, /dev/vdb, …).
+            ui.label(ui::faint("DISKS (order = /dev/vda, /dev/vdb, …)"));
+            let mut remove: Option<usize> = None;
+            for (i, disk) in form.disks.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(ui::dim(format!("{}", i + 1)));
+                    ui.label(
+                        RichText::new(disk.path.display().to_string())
+                            .color(theme::TEXT)
+                            .size(12.5),
+                    );
+                    ui.checkbox(&mut disk.writable, "writable");
+                    if ui::ghost_button(ui, "Remove", true, theme::WARN).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                form.disks.remove(i);
+            }
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.add_disk)
+                        .desired_width(360.0)
+                        .hint_text("path/to/image.raw"),
+                );
+                let path = form.add_disk.trim().to_string();
+                if ui::ghost_button(ui, "Add disk", !path.is_empty(), theme::CYAN).clicked() {
+                    form.disks.push(control_api::DiskSection {
+                        path: std::path::PathBuf::from(path),
+                        writable: true,
+                    });
+                    form.add_disk.clear();
+                }
+            });
+        });
+
+    // Validation preview: run control-api's rules live, so the message sits
+    // under the form before Save is even pressed.
+    let preview = state.form.to_config();
+    if let Err(message) = &preview {
+        ui.add_space(8.0);
+        ui.label(RichText::new(message).color(theme::ERR).size(12.5));
+    } else if let Some(error) = &state.error {
+        ui.add_space(8.0);
+        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+    }
+
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        let savable = preview.is_ok() && state.form.dirty();
+        if ui::ghost_button(ui, "Save", savable, theme::CYAN)
+            .on_hover_text("Rewrites the profile through control-api types")
+            .clicked()
+        {
+            actions.push(Action::SubmitEditVm);
+        }
+        if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+            actions.push(Action::CloseModal);
+        }
+    });
+}
+
+fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new(78.0, 20.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.label(ui::faint(label));
+            },
+        );
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(f32::INFINITY)
+                .hint_text(hint),
+        );
+    });
 }
 
 fn slider_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
