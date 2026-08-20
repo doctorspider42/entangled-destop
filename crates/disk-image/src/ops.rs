@@ -174,6 +174,280 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Thin-provisioning reclaim: hole punching and zeroing
+// ---------------------------------------------------------------------------
+//
+// A sparse RAW image only ever grows: `create_raw` allocates nothing and the
+// guest's writes fill it in. Getting space *back* needs the host to deallocate
+// the ranges the guest has stopped using, which is what the virtio-blk
+// `DISCARD` / `WRITE_ZEROES` commands ask for (the guest side of that is
+// `fstrim`, or a mount with `discard`).
+//
+// Two host mechanisms, one meaning:
+//
+// * Linux `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)` — drops the
+//   range's blocks, keeps the file length, and guarantees the range reads back
+//   as zeros.
+// * Windows `FSCTL_SET_ZERO_DATA` on a **sparse** file — deallocates the whole
+//   clusters inside the range and zeroes the partial ones at either end. On a
+//   file that is not sparse the same call writes zeros without deallocating,
+//   which is exactly the "keep the blocks provisioned" variant.
+//
+// Both can fail on a filesystem that has no holes to give (FAT, drvfs, an
+// exotic filter). Correctness must not depend on them, so the split is:
+// [`write_zeroes`] falls back to writing real zeros and therefore *always*
+// leaves zeros behind, while [`punch_hole`] is allowed to report
+// [`PunchOutcome::Unsupported`] and change nothing — a discard is a hint, and
+// the spec lets a device ignore it.
+
+/// Which mechanism actually served a [`punch_hole`] or [`write_zeroes`] call.
+///
+/// Worth logging once per backing file: it is the difference between a guest
+/// `fstrim` that reclaims host space and one that only looks like it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PunchOutcome {
+    /// The filesystem deallocated the range. The host got the space back and
+    /// the range reads back as zeros.
+    Deallocated,
+    /// Real zeros were written. No space is reclaimed, but the range reads back
+    /// as zeros — all that `WRITE_ZEROES` promises.
+    Zeroed,
+    /// The filesystem cannot punch holes here and nothing was changed. Only a
+    /// discard may legally end this way.
+    Unsupported,
+}
+
+impl PunchOutcome {
+    /// A short label for log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PunchOutcome::Deallocated => "deallocated",
+            PunchOutcome::Zeroed => "zero-filled",
+            PunchOutcome::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Chunk used by the zero-writing fallback. Fixed and small on purpose: the
+/// range a guest may ask to zero is bounded by the device, but the *host*
+/// memory it costs must not depend on that bound at all.
+const ZERO_CHUNK: usize = 64 << 10;
+
+/// Deallocates `len` bytes at `offset` in `file`, keeping the file length.
+///
+/// Never writes: on a filesystem that cannot punch holes this reports
+/// [`PunchOutcome::Unsupported`] and leaves the range exactly as it was. The
+/// caller decides whether that is acceptable — it is for `DISCARD`, it is not
+/// for `WRITE_ZEROES` (use [`write_zeroes`] there).
+///
+/// A zero-length range is a no-op and reports [`PunchOutcome::Zeroed`], since
+/// an empty range trivially already reads as zeros.
+pub fn punch_hole(file: &File, offset: u64, len: u64) -> io::Result<PunchOutcome> {
+    if len == 0 {
+        return Ok(PunchOutcome::Zeroed);
+    }
+    // `offset + len` must be expressible for every backend below. The device
+    // has already checked the range against the image, but this function is
+    // public and must not depend on its caller for that.
+    offset
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "punch range overflows u64"))?;
+    punch_hole_impl(file, offset, len)
+}
+
+/// Makes `len` bytes at `offset` read back as zeros, deallocating them when
+/// `may_unmap` is set and the filesystem can.
+///
+/// **Always leaves zeros** — that is the `VIRTIO_BLK_T_WRITE_ZEROES` contract,
+/// so a filesystem without holes gets the zero-writing fallback rather than an
+/// error. `may_unmap` false skips punching entirely: the guest asked for the
+/// blocks to stay provisioned.
+pub fn write_zeroes(
+    file: &File,
+    offset: u64,
+    len: u64,
+    may_unmap: bool,
+) -> io::Result<PunchOutcome> {
+    if len == 0 {
+        return Ok(PunchOutcome::Zeroed);
+    }
+    offset
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "zero range overflows u64"))?;
+    if may_unmap {
+        // Both backends guarantee a punched range reads back as zeros, so a
+        // successful punch satisfies WRITE_ZEROES outright.
+        match punch_hole_impl(file, offset, len) {
+            Ok(PunchOutcome::Unsupported) => {}
+            Ok(other) => return Ok(other),
+            // A punch that fails for any other reason must not cost us the
+            // zeroing guarantee: fall through and write them.
+            Err(_) => {}
+        }
+    }
+    zero_fill(file, offset, len)?;
+    Ok(PunchOutcome::Zeroed)
+}
+
+/// Writes `len` real zero bytes at `offset`, in [`ZERO_CHUNK`] pieces.
+///
+/// Positional throughout, so it never disturbs a cursor another handle shares
+/// and can never extend the file past `offset + len`.
+fn zero_fill(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    let zeros = [0u8; ZERO_CHUNK];
+    let mut done = 0u64;
+    while done < len {
+        let chunk = usize::try_from((len - done).min(ZERO_CHUNK as u64)).unwrap_or(ZERO_CHUNK);
+        positional_write_all(file, &zeros[..chunk], offset.saturating_add(done))?;
+        done += chunk as u64;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn positional_write_all(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn positional_write_all(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt as _;
+    let mut done = 0usize;
+    while done < buf.len() {
+        let written = file.seek_write(&buf[done..], offset.saturating_add(done as u64))?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "zero-fill wrote nothing",
+            ));
+        }
+        done += written;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn positional_write_all(_file: &File, _buf: &[u8], _offset: u64) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no positional write on this platform",
+    ))
+}
+
+/// `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
+///
+/// `EOPNOTSUPP`/`ENOSYS` is the kernel saying this filesystem has no holes to
+/// give. `EINVAL` is folded in with them: a few filesystems answer an
+/// unsupported mode combination that way, and being wrong about it only costs
+/// `WRITE_ZEROES` the zero-writing path — correctness is unaffected either way.
+#[cfg(target_os = "linux")]
+fn punch_hole_impl(file: &File, offset: u64, len: u64) -> io::Result<PunchOutcome> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let (Ok(off), Ok(count)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len)) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "punch range does not fit an off_t",
+        ));
+    };
+    // SAFETY: `fd` belongs to the live `File` borrowed for this call and no
+    // memory crosses the boundary — fallocate takes integers only. The mode is
+    // the documented "deallocate, keep the length" combination, so the file's
+    // size cannot change under any other holder of the same file.
+    let rc = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            off,
+            count,
+        )
+    };
+    if rc == 0 {
+        return Ok(PunchOutcome::Deallocated);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL) => Ok(PunchOutcome::Unsupported),
+        _ => Err(error),
+    }
+}
+
+/// No `fallocate` outside Linux; the caller's zero-fill fallback covers it.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn punch_hole_impl(_file: &File, _offset: u64, _len: u64) -> io::Result<PunchOutcome> {
+    Ok(PunchOutcome::Unsupported)
+}
+
+/// `FSCTL_SET_ZERO_DATA`, after making sure the file carries the sparse
+/// attribute — without it NTFS zeroes the range but keeps every cluster
+/// allocated, which is a correct `WRITE_ZEROES` and a useless `DISCARD`.
+#[cfg(windows)]
+fn punch_hole_impl(file: &File, offset: u64, len: u64) -> io::Result<PunchOutcome> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, HANDLE, WIN32_ERROR,
+    };
+    use windows::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
+    use windows::Win32::System::IO::DeviceIoControl;
+
+    let (Ok(start), Ok(end)) = (
+        i64::try_from(offset),
+        i64::try_from(offset.saturating_add(len)),
+    ) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "zero range does not fit a LARGE_INTEGER",
+        ));
+    };
+    // Idempotent, and cheap next to the ioctl. An image from `create_raw` is
+    // already sparse; one restored from a backup, copied by Explorer or made by
+    // an older build is not — and a guest fstrim is exactly the moment we would
+    // like it to be.
+    let _ = mark_sparse(file);
+
+    let request = FILE_ZERO_DATA_INFORMATION {
+        FileOffset: start,
+        BeyondFinalZero: end,
+    };
+    let mut returned = 0u32;
+    // SAFETY: the handle belongs to the live `File` borrowed for this call; the
+    // input buffer is one initialised FILE_ZERO_DATA_INFORMATION described by
+    // its own `size_of`, this FSCTL takes no output buffer, and `returned` is a
+    // valid out-pointer — all of them live for the whole call.
+    let result = unsafe {
+        DeviceIoControl(
+            HANDLE(file.as_raw_handle()),
+            FSCTL_SET_ZERO_DATA,
+            Some(&request as *const _ as *const std::ffi::c_void),
+            std::mem::size_of::<FILE_ZERO_DATA_INFORMATION>() as u32,
+            None,
+            0,
+            Some(&mut returned),
+            None,
+        )
+    };
+    match result {
+        Ok(()) => Ok(PunchOutcome::Deallocated),
+        Err(e) => {
+            let unsupported = [ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED]
+                .iter()
+                .any(|code: &WIN32_ERROR| e.code() == code.to_hresult());
+            if unsupported {
+                Ok(PunchOutcome::Unsupported)
+            } else {
+                Err(io::Error::other(e.message()))
+            }
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn punch_hole_impl(_file: &File, _offset: u64, _len: u64) -> io::Result<PunchOutcome> {
+    Ok(PunchOutcome::Unsupported)
+}
+
+// ---------------------------------------------------------------------------
 // Platform pieces
 // ---------------------------------------------------------------------------
 
@@ -465,6 +739,164 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.0 KiB");
         assert_eq!(format_bytes(16 * 1024 * 1024 * 1024), "16.0 GiB");
         assert_eq!(format_bytes(700 * 1024 * 1024), "700 MiB");
+    }
+
+    // -------------------------------------------------- hole punch / zeroing
+
+    /// Creates a sparse image and fills `data_bytes` at the front with a
+    /// recognisable pattern, so a punch can be seen in both the content and
+    /// the allocated size.
+    fn filled_image(dir: &Path, name: &str, apparent: u64, data_bytes: u64) -> PathBuf {
+        let path = dir.join(name);
+        let _ = std::fs::remove_file(&path);
+        create_raw(&path, apparent).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let chunk = vec![0xa5u8; 64 << 10];
+        let mut written = 0u64;
+        while written < data_bytes {
+            let n = ((data_bytes - written) as usize).min(chunk.len());
+            positional_write_all(&file, &chunk[..n], written).unwrap();
+            written += n as u64;
+        }
+        file.sync_all().unwrap();
+        path
+    }
+
+    fn read_range(path: &Path, offset: u64, len: usize) -> Vec<u8> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut f = File::open(path).unwrap();
+        f.seek(SeekFrom::Start(offset)).unwrap();
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf).unwrap();
+        buf
+    }
+
+    /// The acceptance for the host half: a punched range reads back as zeros,
+    /// the file keeps its length, and where the filesystem supports holes the
+    /// allocated size actually drops. This is the same mechanism a guest
+    /// `fstrim` drives through virtio-blk DISCARD.
+    #[test]
+    fn punching_a_hole_reclaims_space_and_reads_back_as_zeros() {
+        let dir = temp_dir("ops-punch");
+        // 8 MiB of real data at the front of a 16 MiB image.
+        let path = filled_image(&dir, "punch.raw", 16 << 20, 8 << 20);
+        let before = allocated_bytes(&path);
+        assert_eq!(read_range(&path, 4 << 20, 16), [0xa5u8; 16]);
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        // Punch the middle 4 MiB, leaving 2 MiB of data on either side.
+        let outcome = punch_hole(&file, 2 << 20, 4 << 20).unwrap();
+        drop(file);
+
+        // Length never changes: FALLOC_FL_KEEP_SIZE / FSCTL_SET_ZERO_DATA.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 16 << 20);
+        match outcome {
+            PunchOutcome::Deallocated => {
+                // The hole reads as zeros...
+                assert_eq!(read_range(&path, 2 << 20, 4096), vec![0u8; 4096]);
+                assert_eq!(read_range(&path, (6 << 20) - 4096, 4096), vec![0u8; 4096]);
+                // ...the data around it survived...
+                assert_eq!(read_range(&path, 0, 16), [0xa5u8; 16]);
+                assert_eq!(read_range(&path, 6 << 20, 16), [0xa5u8; 16]);
+                // ...and the host got the space back.
+                if let (Some(before), Some(after)) = (before, allocated_bytes(&path)) {
+                    assert!(
+                        after + (3 << 20) <= before,
+                        "punching 4 MiB should reclaim it: {before} -> {after}"
+                    );
+                }
+            }
+            PunchOutcome::Unsupported => {
+                // Legal: a discard is a hint. Nothing may have changed.
+                assert_eq!(read_range(&path, 2 << 20, 16), [0xa5u8; 16]);
+            }
+            PunchOutcome::Zeroed => panic!("punch_hole must never write zeros itself"),
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `WRITE_ZEROES` has no escape hatch: whatever the filesystem can do, the
+    /// range must read back as zeros afterwards.
+    #[test]
+    fn write_zeroes_always_leaves_zeros_whichever_path_it_takes() {
+        let dir = temp_dir("ops-zeroes");
+        let path = filled_image(&dir, "zeroes.raw", 4 << 20, 4 << 20);
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        // With unmap: may deallocate, must still read as zeros.
+        let unmapped = write_zeroes(&file, 1 << 20, 1 << 20, true).unwrap();
+        assert_ne!(
+            unmapped,
+            PunchOutcome::Unsupported,
+            "write_zeroes must never give up: it can always write zeros"
+        );
+        // Without unmap: the guest wants the blocks kept, so zeros are written.
+        let kept = write_zeroes(&file, 3 << 20, 512 << 10, false).unwrap();
+        assert_eq!(kept, PunchOutcome::Zeroed);
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4 << 20);
+        assert_eq!(read_range(&path, 1 << 20, 8192), vec![0u8; 8192]);
+        assert_eq!(read_range(&path, (2 << 20) - 8192, 8192), vec![0u8; 8192]);
+        assert_eq!(read_range(&path, 3 << 20, 8192), vec![0u8; 8192]);
+        // Untouched data on both sides of both ranges.
+        assert_eq!(read_range(&path, 0, 16), [0xa5u8; 16]);
+        assert_eq!(read_range(&path, 2 << 20, 16), [0xa5u8; 16]);
+        assert_eq!(read_range(&path, (3 << 20) + (512 << 10), 16), [0xa5u8; 16]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Sub-sector, unaligned and boundary ranges: the device lets the guest ask
+    /// for any 512-byte multiple, and the filesystem's own granularity is
+    /// coarser. Whatever gets deallocated, the *content* must be exact — a
+    /// punch that zeroed one byte too many would silently corrupt a guest
+    /// filesystem.
+    #[test]
+    fn unaligned_ranges_zero_exactly_what_was_asked_for() {
+        let dir = temp_dir("ops-unaligned");
+        let path = filled_image(&dir, "unaligned.raw", 1 << 20, 1 << 20);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+        // One sector in the middle of a 4 KiB cluster, and a range straddling
+        // two clusters.
+        write_zeroes(&file, 4096 + 512, 512, true).unwrap();
+        write_zeroes(&file, (64 << 10) - 512, 1024, true).unwrap();
+        // A zero-length range is a no-op, not an error.
+        assert_eq!(
+            write_zeroes(&file, 8192, 0, true).unwrap(),
+            PunchOutcome::Zeroed
+        );
+        assert_eq!(punch_hole(&file, 8192, 0).unwrap(), PunchOutcome::Zeroed);
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert_eq!(read_range(&path, 4096, 512), [0xa5u8; 512]);
+        assert_eq!(read_range(&path, 4096 + 512, 512), vec![0u8; 512]);
+        assert_eq!(read_range(&path, 4096 + 1024, 512), [0xa5u8; 512]);
+        assert_eq!(read_range(&path, (64 << 10) - 1024, 512), [0xa5u8; 512]);
+        assert_eq!(read_range(&path, (64 << 10) - 512, 1024), vec![0u8; 1024]);
+        assert_eq!(read_range(&path, (64 << 10) + 512, 512), [0xa5u8; 512]);
+        // Nothing was written where nothing was asked for.
+        assert_eq!(read_range(&path, 8192, 512), [0xa5u8; 512]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A range whose end overflows `u64` is rejected before any syscall — the
+    /// public helpers must not lean on the device having checked first.
+    #[test]
+    fn overflowing_ranges_are_refused_not_wrapped() {
+        let dir = temp_dir("ops-overflow");
+        let path = filled_image(&dir, "overflow.raw", 512 << 10, 4096);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(punch_hole(&file, u64::MAX, 512).is_err());
+        assert!(write_zeroes(&file, u64::MAX - 1, 4, true).is_err());
+        assert!(write_zeroes(&file, u64::MAX, 1, false).is_err());
+        // The file is untouched.
+        drop(file);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 512 << 10);
+        assert_eq!(read_range(&path, 0, 16), [0xa5u8; 16]);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
