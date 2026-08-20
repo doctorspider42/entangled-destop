@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use crate::device::{DeviceResources, DeviceType, VirtioDevice};
+use crate::device::{DeviceResources, DeviceType, ShmRegion, VirtioDevice};
 use crate::interrupt::{IrqLine, LineInterrupt, TransportInterrupt};
 use crate::queue::QueueConfig;
 use crate::quiesce::Quiesce;
@@ -53,6 +53,20 @@ pub struct TransportState {
 
     queues: Vec<QueueConfig>,
     queue_sel: u32,
+
+    /// Shared-memory regions the device exposes, read once at construction
+    /// because a device's region list is fixed for its life (VEN-2001). Empty
+    /// for every device that has none, which is all of them today except a
+    /// virtio-gpu whose renderer owns a host-visible window.
+    shm_regions: Vec<ShmRegion>,
+    /// `SHM_SEL` on virtio-mmio: which region the next `SHM_LEN`/`SHM_BASE`
+    /// read describes. Guest state, so it resets with everything else.
+    shm_sel: u32,
+    /// Where the host actually placed each region, keyed by `shmid`. Filled in
+    /// by the machine layer once it has an address; a region with no base is
+    /// reported to the guest as *absent*, because telling a driver about a
+    /// window that decodes nothing is worse than telling it there is none.
+    shm_bases: Vec<(u8, u64)>,
 
     /// One flag per queue: true when a host notification primitive (ioeventfd)
     /// owns this queue's notifications, so the register path must not run the
@@ -119,6 +133,15 @@ impl TransportState {
         }
         let queues: Vec<QueueConfig> = max_sizes.iter().copied().map(QueueConfig::new).collect();
         let notify_offloaded = vec![false; queues.len()];
+        let device_shm_regions = device.shm_regions();
+        for region in &device_shm_regions {
+            if region.len == 0 {
+                return Err(TransportError::InvalidShmRegion {
+                    device_type,
+                    id: region.id,
+                });
+            }
+        }
 
         Ok(Self {
             kind,
@@ -133,6 +156,9 @@ impl TransportState {
             driver_features_sel: 0,
             queues,
             queue_sel: 0,
+            shm_regions: device_shm_regions,
+            shm_sel: 0,
+            shm_bases: Vec::new(),
             notify_offloaded,
             quiesce: Quiesce::new(),
             status: 0,
@@ -329,6 +355,46 @@ impl TransportState {
 
     pub fn queue_sel(&self) -> u32 {
         self.queue_sel
+    }
+
+    // ------------------------------------ shared-memory regions (VEN-2001)
+
+    /// The device's shared-memory regions, in the order it declared them.
+    pub fn shm_regions(&self) -> &[ShmRegion] {
+        &self.shm_regions
+    }
+
+    /// Records where the host mapped region `id`. Called by the machine layer
+    /// after it has allocated the window; until then the region reads as
+    /// absent to the guest.
+    pub fn set_shm_base(&mut self, id: u8, base: u64) {
+        match self.shm_bases.iter_mut().find(|(slot, _)| *slot == id) {
+            Some(slot) => slot.1 = base,
+            None => self.shm_bases.push((id, base)),
+        }
+    }
+
+    /// Where region `id` was placed, if anywhere.
+    pub fn shm_base(&self, id: u8) -> Option<u64> {
+        self.shm_bases
+            .iter()
+            .find(|(slot, _)| *slot == id)
+            .map(|(_, base)| *base)
+    }
+
+    /// `SHM_SEL` (virtio-mmio only).
+    pub fn set_shm_sel(&mut self, value: u32) {
+        self.shm_sel = value;
+    }
+
+    /// The region `SHM_SEL` currently selects *and* the host has placed, or
+    /// `None` — which the transport reports as all-ones, the spec's "no such
+    /// region".
+    pub fn selected_shm(&self) -> Option<(ShmRegion, u64)> {
+        let id = u8::try_from(self.shm_sel).ok()?;
+        let region = *self.shm_regions.iter().find(|r| r.id == id)?;
+        let base = self.shm_base(id)?;
+        Some((region, base))
     }
 
     pub fn set_queue_sel(&mut self, value: u32) {
@@ -642,6 +708,7 @@ impl TransportState {
         self.driver_features = 0;
         self.driver_features_sel = 0;
         self.queue_sel = 0;
+        self.shm_sel = 0;
         self.status = 0;
         self.activated = false;
         self.interrupt.clear();

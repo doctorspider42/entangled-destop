@@ -107,6 +107,31 @@ impl From<crate::queue::QueueError> for DeviceError {
     }
 }
 
+/// One shared-memory region a device exposes to its driver (VirtIO spec 1.2
+/// §4.1.4.7 for PCI, §4.2.2 for MMIO) — backlog VEN-2001.
+///
+/// A shared-memory region is a window of *host* memory the guest maps
+/// directly, which is how virtio-gpu's host-visible blob resources
+/// (`RESOURCE_MAP_BLOB`) reach a guest at all: the guest gets an address
+/// range, not a copy. It is deliberately a plain `{id, len}` pair here —
+/// *where* the window lands is the transport's and the machine layer's
+/// business (a BAR offset on PCI, a guest-physical base on MMIO), and a device
+/// must never learn either.
+///
+/// A device that returns none of these keeps the pre-existing, spec-mandated
+/// "no such region" behaviour on both transports: MMIO reads all-ones for
+/// `SHM_LEN`/`SHM_BASE`, PCI publishes no shared-memory capability. That
+/// distinction is load-bearing — Linux' `virtio_gpu` treats a zero-length
+/// region at address 0 as *present* and fails its probe on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShmRegion {
+    /// `shmid`: the selector the driver uses to ask about this region.
+    /// Device-specific (virtio-gpu's host-visible region is 1).
+    pub id: u8,
+    /// Length of the window in bytes. Never zero for a region that exists.
+    pub len: u64,
+}
+
 /// A host-side wakeup a device may hold to ask for service from the
 /// transport's worker context (ADR-0004 phase 2, real fences).
 ///
@@ -272,6 +297,17 @@ pub trait VirtioDevice: Send {
     /// use one must keep a synchronous fallback for when none arrives.
     fn set_host_waker(&mut self, waker: std::sync::Arc<dyn HostWaker>) {
         let _ = waker;
+    }
+
+    /// Shared-memory regions this device exposes ([`ShmRegion`], VEN-2001).
+    ///
+    /// The default is none, which is what every device except virtio-gpu with
+    /// a host-visible renderer returns — and what keeps both transports'
+    /// absent-region behaviour byte-identical to what they did before regions
+    /// existed. Constant for the life of the device: the transport reads it
+    /// once when it publishes its capability list.
+    fn shm_regions(&self) -> Vec<ShmRegion> {
+        Vec::new()
     }
 }
 
