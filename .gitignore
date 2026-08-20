@@ -11,3 +11,14 @@ guest/bootstrap-initramfs/init-rs/target/
 entangled-screenshot-*.png
 # ISCC output (release.yml compiles the installer here)
 /installer/Output/
+
+# Local acceptance evidence (install/run transcripts, screenshots)
+install-*.log
+run-*.log
+usernet-*.log
+# Any distro, and any mangled spelling of the path: `--screenshot D:.png`
+# through a shell that eats backslashes lands as `D:ab.png` in the working
+# directory, which is how one of these got staged twice.
+*-installed-boot.png
+win-tests.txt
+win-clippy.txt

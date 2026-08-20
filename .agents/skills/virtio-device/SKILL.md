@@ -294,6 +294,15 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
   bytes with num_buffers when MRG_RXBUF — MVP negotiates **no offloads, no
   mergeable buffers, no multiqueue**: correct first, fast later. MAC from
   `virtio_net::MacAddr::derive(vm_name)` unless pinned in config.
+  Two backends behind `NetBackend`: `tap` (Linux) and `usernet`, the in-process
+  smoltcp NAT that is the only one on Windows. **The NAT's close path needs a
+  workload that closes thousands of connections before you can call it done** —
+  it leaked one flow per completed download until a real `entangled install
+  debian` found it (stalled after exactly `MAX_FLOWS` udebs), because a guest
+  that closes first leaves smoltcp in `CloseWait`, which `is_open()` still
+  reports as open. `usernet::tcp::service_flows` propagates the guest's FIN as
+  `Shutdown::Write` on the host stream; a unit test that closes both halves at
+  once cannot see that class of bug.
 - **gpu** (EPIC 8): wire format in `virtio_gpu::protocol` (constants, `CtrlHdr`,
   one struct per command, lengths asserted at compile time), host resources in
   `virtio_gpu::resource`, device in `virtio_gpu::device`. Only the two

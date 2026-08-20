@@ -9,7 +9,8 @@
 //! plumbing* delivers the same machine, because the flag re-validates the
 //! profile, appends the device after the disks and enforces read-only.
 //!
-//! `#[ignore]`d: needs `/dev/kvm`, the firmware build and a verified Ubuntu ISO
+//! `#[ignore]`d: needs a hypervisor (`/dev/kvm` or WHP), the firmware build and
+//! a verified Ubuntu ISO
 //! (either variant — the test takes the newest in the cache), ~1 minute.
 //!
 //! ```bash
@@ -18,11 +19,14 @@
 //! cargo test -p entangled --test cdrom_boot -- --ignored --nocapture
 //! ```
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", windows))]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+mod common;
+use common::read_transcript;
 
 /// The CLI under test, as cargo built it.
 const BIN: &str = env!("CARGO_BIN_EXE_entangled");
@@ -42,7 +46,11 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn kvm_available() -> bool {
+/// `/dev/kvm` on Linux, the Windows Hypervisor Platform on Windows: the CLI
+/// runs a UEFI guest on either host (EPIC 17 phase 4), so this test does too,
+/// and it skips rather than fails where neither is available.
+#[cfg(target_os = "linux")]
+fn hypervisor_available() -> bool {
     match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -56,15 +64,32 @@ fn kvm_available() -> bool {
     }
 }
 
+#[cfg(windows)]
+fn hypervisor_available() -> bool {
+    match vmm_core::whp::WhpHypervisor::probe() {
+        Ok(caps) if caps.is_runnable() => true,
+        Ok(_) => {
+            eprintln!("skipping: {}", vmm_core::whp::WHP_ENABLE_HINT);
+            false
+        }
+        Err(e) => {
+            eprintln!("skipping: cannot query the Windows Hypervisor Platform: {e}");
+            false
+        }
+    }
+}
+
 /// The newest verified ISO in the fetch script's cache, or
 /// `$ENTANGLED_UBUNTU_ISO`.
 fn cached_iso() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ENTANGLED_UBUNTU_ISO").map(PathBuf::from) {
         return path.is_file().then_some(path);
     }
+    // The project-wide cache resolution, so this finds the same ISO
+    // `entangled install ubuntu` would on either host.
     let cache = match std::env::var_os("ENTANGLED_CACHE") {
         Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME")?).join(".cache/entangled"),
+        None => debian_media::cache_root()?,
     };
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(cache.join("ubuntu"))
         .ok()?
@@ -86,7 +111,7 @@ fn cached_iso() -> Option<PathBuf> {
 #[test]
 #[ignore = "boots a real ISO: needs KVM, the firmware and a verified Ubuntu ISO"]
 fn an_arbitrary_iso_boots_to_its_bootloader_via_cdrom() {
-    if !kvm_available() {
+    if !hypervisor_available() {
         return;
     }
     let root = repo_root();
@@ -142,7 +167,7 @@ height = 800
     let started = Instant::now();
     let mut seen = false;
     while started.elapsed() < DEADLINE {
-        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let text = read_transcript(&log);
         if text.contains(GRUB_BANNER) {
             seen = true;
             break;
@@ -154,7 +179,7 @@ height = 800
     }
     let _ = child.kill();
     let _ = child.wait();
-    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let text = read_transcript(&log);
     let _ = std::fs::remove_file(&log);
     let _ = std::fs::remove_file(&profile_path);
 

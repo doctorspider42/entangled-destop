@@ -27,6 +27,25 @@ unit tests live with their crates.
    deadline; kernel panic string → immediate failure with the full serial
    log in the failure message. No marker within the deadline → failure, not
    a hang.
+
+   **A serial transcript is neither UTF-8 nor plain text**, and both halves of
+   that have cost a full acceptance run on this project. Read it through
+   `apps/entangled/tests/common::read_transcript`, or the same two lines:
+
+   - `std::fs::read` + `String::from_utf8_lossy`, never `read_to_string`. An
+     installed Ubuntu sets up its console font by writing every code point from
+     0x00 to 0xFF, so the log stops being valid UTF-8 partway through;
+     `read_to_string(..).unwrap_or_default()` turns that into an **empty**
+     transcript, and a marker poll over an empty transcript can only time out.
+     It did — for the whole six-minute deadline, on a login prompt that had been
+     printed at 136 s of guest uptime, and the failure it finally reported named
+     an unrelated component.
+   - **Strip the ANSI escapes before matching.** systemd colours the
+     distribution name, so what is on the wire is
+     `ESC[0;1;39mWelcome to ESC[0mESC[1mUbuntu 26.04 LTS`, and
+     `contains("Welcome to Ubuntu")` can never match. A marker split by an
+     escape sequence is not a marker — pick uncoloured markers where you can,
+     and strip where you cannot.
 5. **Endurance** (MVP-1403/1404): 100 sequential boots and the 8-hour soak
    are `#[ignore]`d tests invoked explicitly (nightly CI / manual), never in
    the default suite.

@@ -26,6 +26,7 @@ pub fn scan() -> Scan {
             vcpus: 8,
             display: (2560, 1440),
             network_interface: Some("usernet".into()),
+            uefi: false,
             disks: vec![disk_info(&nebula_disk, 64 * GIB, 18 * GIB)],
         },
         VmEntry {
@@ -35,6 +36,9 @@ pub fn scan() -> Scan {
             vcpus: 4,
             display: (1920, 1080),
             network_interface: Some("entangled0".into()),
+            // An installed Ubuntu boots through the firmware, so the mock has
+            // one of each — the run pre-flight warns per boot mode.
+            uefi: true,
             disks: vec![disk_info(&ubuntu_disk, 32 * GIB, 9 * GIB)],
         },
         VmEntry {
@@ -44,6 +48,7 @@ pub fn scan() -> Scan {
             vcpus: 2,
             display: (1280, 800),
             network_interface: None,
+            uefi: false,
             disks: Vec::new(),
         },
     ];

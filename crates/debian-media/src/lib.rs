@@ -39,7 +39,9 @@ mod rfc3339;
 mod source;
 mod sums;
 
-pub use cache::{manifest_path, partial_path, purge, MediaCache, MANIFEST_SUFFIX, PARTIAL_SUFFIX};
+pub use cache::{
+    cache_root, manifest_path, partial_path, purge, MediaCache, MANIFEST_SUFFIX, PARTIAL_SUFFIX,
+};
 pub use digest::{DigestAlgo, Hasher};
 pub use error::MediaError;
 pub use fetch::{

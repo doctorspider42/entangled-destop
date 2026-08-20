@@ -558,7 +558,7 @@ impl ManagerApp {
                 disk_gib: self.settings.default_disk_gib,
                 disk_path: String::new(),
                 disk_mode: launcher::DiskMode::CreateNew,
-                family: launcher::GuestFamily::Debian,
+                family: launcher::GuestFamily::default_for_host(),
                 iso_path: String::new(),
                 variant: self.settings.default_variant.clone(),
                 automated: true,
@@ -569,9 +569,16 @@ impl ManagerApp {
         });
     }
 
+    /// A free name for a new machine, prefixed with the distribution the wizard
+    /// opens on — `ubuntu-1` on Windows, `debian-1` on Linux. The name becomes
+    /// the disk, the profile and the hostname, so suggesting the wrong distro's
+    /// name is a label that outlives the wizard.
     fn suggest_name(&self) -> String {
         for n in 1..=99 {
-            let candidate = format!("debian-{n}");
+            let candidate = format!(
+                "{}-{n}",
+                launcher::GuestFamily::default_for_host().cli_name()
+            );
             let taken = self.vm(&candidate).is_some()
                 || self.pending.iter().any(|p| p.name == candidate)
                 || self
@@ -583,7 +590,10 @@ impl ManagerApp {
                 return candidate;
             }
         }
-        "debian-new".to_string()
+        format!(
+            "{}-new",
+            launcher::GuestFamily::default_for_host().cli_name()
+        )
     }
 
     /// Collects the update-check and update-download answers; both channels
@@ -843,12 +853,21 @@ impl ManagerApp {
         let Some(cli) = self.cli_path() else { return };
 
         let cwd = self.settings.child_cwd();
-        if launcher::bootstrap_kernel_missing(&cwd) {
+        // Whichever artifact *this* profile boots from. A UEFI profile (every
+        // Ubuntu install) needs the firmware and has no use for a bootstrap
+        // kernel, so warning about the kernel there is noise that trains people
+        // to ignore the warning that matters.
+        let artifact = if vm.uefi {
+            launcher::UEFI_FIRMWARE
+        } else {
+            launcher::BOOTSTRAP_KERNEL
+        };
+        if !cwd.join(artifact).is_file() {
             self.toast(
                 ToastLevel::Warn,
                 format!(
-                    "no artifacts/bootstrap/vmlinuz under {} — a profile with relative \
-                     kernel paths will fail to boot (Settings ▸ working directory)",
+                    "no {artifact} under {} — a profile with relative boot paths will \
+                     fail to start (Settings ▸ working directory)",
                     cwd.display()
                 ),
             );
@@ -963,26 +982,12 @@ impl ManagerApp {
         };
 
         let cwd = self.settings.child_cwd();
-        if machine.family == launcher::GuestFamily::Debian
-            && launcher::bootstrap_kernel_missing(&cwd)
-        {
+        // Per distribution: Ubuntu needs the UEFI firmware, Debian the bootstrap
+        // kernel. Checking only the kernel used to make the Ubuntu install — the
+        // one that works on Windows — unreachable there.
+        if let Some(message) = launcher::missing_install_artifact(&cwd, machine.family) {
             if let Modal::Wizard(state) = &mut self.modal {
-                state.error = Some(format!(
-                    "no {} under {} — build it with guest/bootstrap-kernel/build.sh, or point Settings ▸ working directory at a prepared tree",
-                    launcher::BOOTSTRAP_KERNEL,
-                    cwd.display()
-                ));
-            }
-            return;
-        }
-        if machine.family == launcher::GuestFamily::Ubuntu
-            && !cwd.join("artifacts/firmware/CLOUDHV.fd").is_file()
-        {
-            if let Modal::Wizard(state) = &mut self.modal {
-                state.error = Some(format!(
-                    "no artifacts/firmware/CLOUDHV.fd under {} — build the UEFI firmware or point Settings ▸ working directory at a prepared tree",
-                    cwd.display()
-                ));
+                state.error = Some(message);
             }
             return;
         }

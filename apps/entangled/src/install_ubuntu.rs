@@ -42,11 +42,13 @@
 //! anything at all is known about the install afterwards: the ISO's own command
 //! line has no `console=` clause, so without this the installer would run blind.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use control_api::{BootMode, BootSection, DiskSection, DisplaySection, VirtioTransport, VmConfig};
 
 use crate::disk;
+use crate::install::{target_disk, vm_name};
+use crate::paths;
 use crate::run_vm::{self, Automation};
 use crate::seed;
 use crate::InstallArgs;
@@ -99,15 +101,14 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         })?,
     };
 
-    // 3. Target disk.
-    let vm_name = args
-        .name
-        .clone()
-        .unwrap_or_else(|| stem_of(&args.disk, "ubuntu"));
-    if !args.disk.exists() {
+    // 3. Target disk. `--disk` when given, otherwise the manager's VM
+    //    directory, so both surfaces list the same machines.
+    let vm_name = vm_name(args);
+    let target = target_disk(args)?;
+    if !target.exists() {
         let bytes = disk::parse_size(&args.size).map_err(|e| e.to_string())?;
-        disk::create_raw(&args.disk, bytes).map_err(|e| e.to_string())?;
-        tracing::info!(disk = %args.disk.display(), bytes, "created target disk");
+        disk::create_raw(&target, bytes).map_err(|e| e.to_string())?;
+        tracing::info!(disk = %target.display(), bytes, "created target disk");
     }
 
     // 4. The autoinstall seed. Written next to the disk so a failed install can
@@ -129,7 +130,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     let seed = if automated {
         let user_data = seed::user_data(&vm_name, args.autoinstall.as_deref())
             .map_err(|e| format!("cannot build the autoinstall configuration: {e}"))?;
-        let seed_path = args.disk.with_file_name(format!("{vm_name}-seed.iso"));
+        let seed_path = target.with_file_name(format!("{vm_name}-seed.iso"));
         Some(
             seed::write(&seed_path, &user_data, &format!("entangled-{vm_name}"))
                 .map_err(|e| e.to_string())?,
@@ -146,7 +147,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     //    install still holds that install's Boot#### entry, and an installer
     //    that then failed halfway would leave a profile whose first boot lands
     //    on a partition that no longer exists.
-    let nvram = args.disk.with_file_name(format!("{vm_name}.nvram"));
+    let nvram = target.with_file_name(format!("{vm_name}.nvram"));
     if nvram.exists() {
         std::fs::remove_file(&nvram)
             .map_err(|e| format!("cannot replace {}: {e}", nvram.display()))?;
@@ -168,7 +169,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         },
         disks: [
             Some(DiskSection {
-                path: args.disk.clone(),
+                path: target.clone(),
                 writable: true,
             }),
             Some(DiskSection {
@@ -194,7 +195,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         },
     };
 
-    let transcript = args.disk.with_file_name(format!("{vm_name}-install.log"));
+    let transcript = target.with_file_name(format!("{vm_name}-install.log"));
     tracing::info!(
         vm = %cfg.name,
         iso = %iso.display(),
@@ -239,11 +240,11 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     }
 
     // 8. What is actually on the disk (UEFI-1804: GPT, an ESP, a root).
-    let install = diskfs::find_uefi_install(&args.disk).map_err(|e| {
+    let install = diskfs::find_uefi_install(&target).map_err(|e| {
         format!(
             "the installer powered off but {} does not look installed: {e}\n\
              Last lines of {}:\n{}",
-            args.disk.display(),
+            target.display(),
             transcript.display(),
             tail(&log, 25)
         )
@@ -272,7 +273,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             ..BootSection::default()
         },
         disks: vec![DiskSection {
-            path: args.disk.clone(),
+            path: target.clone(),
             writable: true,
         }],
         cdrom: None,
@@ -285,7 +286,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             virgl_isolation: control_api::VirglIsolation::default(),
         },
     };
-    let profile_path = args.disk.with_file_name(format!("{vm_name}.toml"));
+    let profile_path = target.with_file_name(format!("{vm_name}.toml"));
     let text = toml::to_string_pretty(&profile).map_err(|e| e.to_string())?;
     std::fs::write(&profile_path, text)
         .map_err(|e| format!("cannot write {}: {e}", profile_path.display()))?;
@@ -415,34 +416,13 @@ impl Default for GrubScript {
 // ---------------------------------------------------------------------------
 
 /// The newest ISO `scripts/fetch-ubuntu-iso.sh` has verified into the cache.
+///
+/// The cache directory is [`crate::paths::ubuntu_cache_dir`], which is the same
+/// one `entangled fetch` and the shell script use on this host — on Windows
+/// `%LOCALAPPDATA%\entangled\ubuntu`, where a `HOME`-only resolution would have
+/// found nothing and said "no ISO in the cache" next to a full cache.
 fn cached_iso() -> Option<PathBuf> {
-    let cache = match std::env::var_os("ENTANGLED_CACHE") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME")?).join(".cache/entangled"),
-    };
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(cache.join("ubuntu"))
-        .ok()?
-        .filter_map(Result::ok)
-        .flat_map(|release| {
-            std::fs::read_dir(release.path())
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .map(|f| f.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "iso"))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    // Sorted, so a machine holding several releases picks the newest name.
-    candidates.sort();
-    candidates.pop()
-}
-
-fn stem_of(disk: &Path, fallback: &str) -> String {
-    disk.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| fallback.to_string())
+    paths::newest_iso(&paths::ubuntu_cache_dir().ok()?)
 }
 
 /// The last `lines` non-empty lines of a transcript, for an error message.

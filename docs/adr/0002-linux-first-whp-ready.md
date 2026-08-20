@@ -259,6 +259,124 @@ row is closed. The one behavioural difference that remains product-visible is
 the one-mapped-partition-per-process limit, which `entangled-manager` already
 respects by driving one CLI process per VM.
 
+## Amendment (2026-08-20, phase 5): `entangled install` is native on Windows
+
+`entangled install ubuntu --auto --headless` completes on a plain Windows host
+and the disk it produces boots — measured on this machine, debug build:
+**4 min 27 s** from the command to `installed: GPT with an ESP on /dev/vda1
+(953 MiB) and root on /dev/vda2 (ext4 UUID …)`, ending in the guest's own ACPI
+S5 and a written profile whose paths are Windows paths. The port surface table
+at the top of this ADR is now closed for the *whole* product surface, not just
+`run`.
+
+**Almost nothing had to be replaced, because almost nothing was Linux-specific.**
+The gate said "requires a Linux host with KVM (on Windows use WSL2)"; behind it
+were three files whose content is *logic over bytes* — the newc cpio the d-i
+preseed rides in, the ISO9660 NoCloud seed, the GRUB-over-serial typing, the
+partition-table inspection, the profile writer. None of it mounts anything: the
+installer writes the disk from inside the guest, and the host only ever *reads*
+partition tables (`crates/disk-image`, portable since the disk-management work).
+So the change is a `#[cfg]` widening plus two honest per-host decisions, in the
+same shape `run_vm` uses — one shared body, the differences named in one place:
+
+| | Linux (KVM) | Windows (WHP) |
+|---|---|---|
+| `install --network` default | `tap` | `usernet` |
+| `--network tap` | the host interface | typed refusal naming `--network usernet` |
+| Debian bootstrap kernel | `guest/bootstrap-kernel/build.sh` | no cross build; copy `artifacts/bootstrap/` in, or install Ubuntu |
+| Everything else | identical | identical |
+
+**The riskiest thing about the port turned out not to exist.** The plan named
+the installer's networking as the highest-risk item — d-i and subiquity both
+want a mirror, and on Windows that means the smoltcp NAT rather than TAP. But
+the Ubuntu path is *deliberately offline* (`assets/autoinstall/ubuntu-server.yaml`:
+one mirror candidate, no geoip, `fallback: offline-install`, everything installed
+out of the ISO's own pool), so the install that matters on Windows never touches
+the network at all. Networking is on the Debian d-i path's critical path only,
+where the preseed is given a static address — and where usernet's numbers now
+come from `virtio_net::UserNetConfig` itself rather than being repeated in the
+installer, so the `[network]` section and the `netcfg/get_ipaddress=` clause
+cannot drift apart.
+
+**But it did hide a real bug, and only a real installer could find it.** The
+Debian netboot path is the first thing this project has ever run over usernet
+that opens *hundreds* of connections, and it stalled at "Loading additional
+components" after exactly 64 udebs with `refusing a guest connection: the NAT is
+at its flow limit`. The NAT was leaking a flow per completed download: a guest
+that closes its half first — every HTTP client — leaves smoltcp in `CloseWait`,
+where `is_open()` is still true, so the retirement test never fired and nothing
+shut the host stream's write half, so the remote never sent the EOF that would
+have finished the close. `MAX_FLOWS` was doing its job; what it bounded was a
+leak. With the half-close propagated, the same install walks straight past
+"Detecting hardware" into `debootstrap`. Two lessons worth keeping: a
+user-mode NAT's *close* path needs a workload that closes thousands of
+connections before it can be called done, and the unit tests that covered this
+module all closed both halves at once, which is the one case that never leaks.
+
+**And the d-i path needed two endings fixed, both of them "the installer stops
+and nobody is typing".** d-i ends by *rebooting*, which on WHP is not an ending
+at all — the triple fault is absorbed and the vCPU parks — so the automated
+profile now sets `debian-installer/exit/poweroff`, the ACPI S5 ending both
+backends already latch. And `apt-setup` selects the security suite by default,
+scans `security.debian.org`, and on a failed scan raises a *critical-priority
+note* with a `<Continue>` button that `priority=critical` does not skip and no
+other preseed key answers; the Ubuntu path has a serial automation script that
+could press Enter, the Debian path does not. Selecting no apt services removes
+the scan. Neither is Windows-specific in principle — both are "the host must be
+able to tell a finished install from a waiting one", which is the same
+requirement the Ubuntu path met with `shutdown: poweroff` from the start.
+
+Kernel-level DHCP through the NAT is now evidenced too — `ip=dhcp` on a real
+guest, answered by `granted the guest a DHCP lease ip=192.168.74.15` on the
+host and `IP-Config: Got DHCP answer from 192.168.74.1` in the guest — which
+closes the phase-4 open item that DHCP had only ever been unit-tested. It took
+a two-line change to make askable: a profile's own `ip=` clause now wins over
+the backend's appended one, because the kernel honours the last one it is given.
+
+**Two path facts that a Linux-first codebase gets wrong, both now tested.**
+The cache root was resolved as `$HOME/.cache/entangled` with no Windows
+fallback, so a Windows host with a full 2.9 GiB ISO cache reported "no Ubuntu
+ISO in the cache"; `debian_media::cache_root` is now the one resolution both the
+media cache and the ISO lookup use (`%LOCALAPPDATA%\entangled` when there is no
+`HOME`), asserted for both hosts' environments on both hosts. And `--disk` is
+now optional, defaulting into the *manager's* VM directory
+(`disk_image::refs::manager_vm_dir`, `%USERPROFILE%\entangled-vms`), because two
+defaults would have meant two halves of one VM collection.
+
+One product decision recorded rather than made silently: an Ubuntu install still
+writes a profile with **no `[network]` section**, matching the offline install it
+came from. The cost is visible in the boot log — `systemd-networkd-wait-online`
+and `cloud-init-network` each wait out their timeout before the login prompt,
+on both hosts. Attaching a NIC means also giving the installed system a netplan
+that expects one, which is a change to the autoinstall profile both hosts share,
+so it is left as a follow-up rather than smuggled into the port.
+
+### Addendum (same day, after merging main): the acceptance runs itself now
+
+The phase-5 numbers above were measured by hand, because
+`tests/ubuntu_install.rs` — the acceptance criterion as a test — could not pass
+on Windows for a reason that had nothing to do with the port: it read the serial
+transcript with `read_to_string`, which fails on the byte range an installed
+Ubuntu writes while setting up its console font, and matched a marker systemd
+splits with a colour escape. Both are fixed (see the vm-testing skill), and the
+test now passes unattended on this Windows host:
+
+| | |
+|---|---|
+| install | **189 s** (`--auto --headless`, 12 GiB target, debug build), ending `installed: GPT with an ESP on /dev/vda1 (572 MiB) and root on /dev/vda2 (ext4 UUID 40589fc3-…)` |
+| the ending | `guest requested ACPI S5 (soft off) via="PM1a_CNT"` → `UEFI variable store written by the firmware programmed_bytes=5328` |
+| the installed system | `BdsDxe: starting Boot0006 "Ubuntu"` off the persisted NVRAM entry → shim → `GNU GRUB version 2.14` → `Welcome to Ubuntu 26.04 LTS!` → `Started serial-getty@ttyS0.service` → `e2e-ubuntu login:` |
+| total | 332 s for install *and* boot-what-was-installed |
+
+So the acceptance is a command on either host rather than a procedure:
+`cargo test -p entangled --test ubuntu_install -- --ignored`. The hand-measured
+4 min 27 s and this 189 s are the same install on the same machine; the
+difference is load, not a change.
+
+The `[network]`-less profile's cost is still there and still visible in that
+transcript: `systemd-networkd-wait-online` and `cloud-init-network` each wait out
+about two minutes before the login prompt, which is most of the boot half.
+
 ## Consequences
 
 - The MVP pays a small ongoing tax (trait indirection for interrupts, target

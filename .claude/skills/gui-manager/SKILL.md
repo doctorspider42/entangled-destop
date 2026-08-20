@@ -65,9 +65,24 @@ Ubuntu through the verified cache or an explicit local `--iso`. Storage is an
 explicit choice between a new sparse RAW image and an existing image in the VM
 directory; the latter is never recreated or truncated.
 
+Which family the wizard *opens* on is per host: `GuestFamily::default_for_host()`
+is Ubuntu on Windows and Debian on Linux, because the Debian path boots the
+project's bootstrap kernel and that is a Linux kernel build with no cross build.
+`suggest_name` uses the same answer, so a fresh wizard on Windows proposes
+`ubuntu-1` — the name becomes the disk, the profile and the hostname, so the
+wrong distro's name outlives the wizard. Pre-flight is per family too
+(`launcher::missing_install_artifact`): the UEFI firmware for Ubuntu, the
+bootstrap kernel for Debian. Gating both on the kernel is what once made the
+only installer that works on Windows unreachable there.
+
 The resulting `entangled install <debian|ubuntu> --disk <path> --size <n>G
---variant <v> --memory-mib <max(1536, m)> --name <name> [--iso <path>] [--auto]
-[--headless]` is spawned with the configured working directory. The CLI writes
+[--variant <v>] --memory-mib <max(1536, m)> --name <name> [--iso <path>]
+[--auto] [--headless]` is spawned with the configured working directory.
+`--variant` is Debian-only — `install ubuntu` ignores the flag, and a setting
+that does nothing on the reviewed command line is worse than an absent one.
+`--network` is never passed either: the CLI's per-host default (TAP on Linux,
+usernet on Windows) is right on both hosts and a pinned GUI value would be wrong
+on one. The CLI writes
 the profile itself, but hardcodes its resource defaults, so on success the
 manager stamps the wizard's memory/vCPU choice onto the profile
 (`discovery::apply_resources`). While the install runs the VM has no profile

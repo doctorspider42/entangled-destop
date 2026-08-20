@@ -51,7 +51,7 @@
 //!   here goes through `smoltcp::wire`'s checked accessors.
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpStream};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -148,6 +148,11 @@ struct Flow {
     /// The host end has returned end-of-file; the guest gets a FIN once its own
     /// pending data has been handed over.
     host_eof: bool,
+    /// The guest has sent its FIN and the host stream's write half has been shut
+    /// down in response. One bit, because `shutdown` must happen exactly once:
+    /// the socket stays in `CloseWait` until *we* close our half, so the
+    /// condition that detects it stays true for as long as the flow lives.
+    guest_eof: bool,
 }
 
 /// The NAT: one smoltcp interface, one socket per guest connection.
@@ -321,6 +326,7 @@ impl TcpNat {
             stream: None,
             started: StdInstant::now(),
             host_eof: false,
+            guest_eof: false,
         });
         true
     }
@@ -435,12 +441,37 @@ impl TcpNat {
                 }
             }
 
+            // The guest closed its half (its FIN arrived, so smoltcp is in
+            // CloseWait): shut down the host stream's *write* half so the remote
+            // sees the end of the request, and keep pumping the other direction
+            // until it answers with its own EOF.
+            //
+            // Without this the flow leaks. Every HTTP client closes first, so the
+            // socket sits in CloseWait forever — `is_open()` is still true there
+            // — the retirement test below never fires, and the 64 flow slots fill
+            // up. Measured: `debian-installer` retrieving its udebs over usernet
+            // stalls at "Loading additional components" after exactly 64
+            // downloads, with `refusing a guest connection: the NAT is at its
+            // flow limit` on the host side. `CloseWait` specifically, not
+            // `!may_recv()`: that is also false during the handshake, and
+            // shutting the host write half there would truncate the request
+            // before it was sent.
+            if !flow.guest_eof && socket.state() == tcp::State::CloseWait {
+                flow.guest_eof = true;
+                if let Err(error) = stream.shutdown(Shutdown::Write) {
+                    // Not fatal: an already-dead stream means the flow is about
+                    // to be retired anyway, through host_eof or the RST.
+                    tracing::debug!(remote = %flow.remote, %error, "host shutdown failed");
+                    flow.host_eof = true;
+                }
+            }
             // The host end is done and everything it sent has been handed to the
             // guest: close our half, which sends the FIN.
             if flow.host_eof && socket.send_queue() == 0 && socket.may_send() {
                 socket.close();
             }
-            // The guest closed its half: stop reading from it, and let the host know.
+            // Both halves are done: smoltcp reports Closed or TimeWait, neither of
+            // which is `is_open()`, and the flow's slot goes back.
             if !socket.may_recv() && !socket.is_open() {
                 finished.push(index);
             }
@@ -750,6 +781,97 @@ mod tests {
             String::from_utf8_lossy(&received)
         );
         assert_eq!(peer.nat.flow_count(), 1, "the flow is still open");
+    }
+
+    /// **The flow leak that stalled an installer.** A guest that closes its half
+    /// first — which is what every HTTP client does — must get its slot back.
+    ///
+    /// Before the half-close was propagated, the socket stayed in `CloseWait`
+    /// forever: `is_open()` is true there, so the retirement test never fired and
+    /// nothing ever shut the host stream's write half, so the host never sent its
+    /// own EOF either. The 64 slots then filled up one download at a time.
+    /// Measured on a real install: `debian-installer` retrieving its udebs over
+    /// usernet stalled at "Loading additional components" with
+    /// `refusing a guest connection: the NAT is at its flow limit` on the host.
+    #[test]
+    fn a_guest_that_closes_first_gets_its_flow_slot_back() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a local listener");
+        let remote = match listener.local_addr().expect("the listener has an address") {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => unreachable!("bound to an IPv4 address"),
+        };
+
+        let mut peer = GuestPeer::new(TcpNat::new_allowing_host_local(config()), remote, 41100);
+        peer.send(true, false, false, &[]);
+        let _ = peer.poll();
+        peer.send(false, true, false, &[]);
+        let _ = peer.poll();
+        let (mut stream, _) = listener.accept().expect("the NAT connects to the listener");
+
+        // One request, then the guest closes its half — FIN, the way a client that
+        // sent `Connection: close` does.
+        peer.send(false, true, false, b"GET / HTTP/1.0\r\n\r\n");
+        for _ in 0..50 {
+            let _ = peer.poll();
+        }
+        peer.send(false, true, true, &[]);
+
+        // The host must see EOF on its read side: that is the half-close arriving,
+        // and it is what a real server waits for before answering.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("a read timeout can be set");
+        let mut host_saw_eof = false;
+        let mut request = Vec::new();
+        for _ in 0..400 {
+            let _ = peer.poll();
+            let mut chunk = [0u8; 128];
+            match stream.read(&mut chunk) {
+                Ok(0) => {
+                    host_saw_eof = true;
+                    break;
+                }
+                Ok(read) => request.extend_from_slice(&chunk[..read]),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(error) => panic!("reading the guest's request failed: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            request.starts_with(b"GET / HTTP/1.0"),
+            "the request must arrive before the FIN is propagated: {:?}",
+            String::from_utf8_lossy(&request)
+        );
+        assert!(
+            host_saw_eof,
+            "the guest's FIN must reach the host as end-of-file"
+        );
+
+        // The host answers and closes too; the flow must then be retired rather
+        // than sitting in CloseWait forever.
+        stream
+            .write_all(b"HTTP/1.0 200 OK\r\n\r\nbye")
+            .expect("reply");
+        stream.flush().expect("flush");
+        drop(stream);
+        for _ in 0..400 {
+            let _ = peer.poll();
+            if peer.nat.flow_count() == 0 {
+                break;
+            }
+            // The guest keeps acknowledging, which is what lets smoltcp finish the
+            // close handshake it started.
+            peer.send(false, true, false, &[]);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            peer.nat.flow_count(),
+            0,
+            "a closed connection must not hold a flow slot"
+        );
     }
 
     /// Whatever smoltcp emits must come back out as a frame the guest's device

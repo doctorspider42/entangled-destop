@@ -34,11 +34,16 @@ virtio-gpu.workspace = true
 virtio-input.workspace = true
 display.workspace = true
 
-# `install` (d-i / subiquity flows) stays Linux-only for now.
-[target.'cfg(target_os = "linux")'.dependencies]
-libc.workspace = true
+# The installer's two file formats — gzip-concatenated cpio for the d-i preseed,
+# TOML for the profile it writes — are pure byte logic and are needed on both
+# hosts since `install` stopped being Linux-only (EPIC 17 phase 5).
 flate2.workspace = true
 toml.workspace = true
+
+# `sigaction` for the run path's SIGINT/SIGTERM handler; Windows uses
+# `SetConsoleCtrlHandler` below.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 # Ctrl+C handling for the run path (`SetConsoleCtrlHandler`); same crate and
 # license the WHP backend already uses.

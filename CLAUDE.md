@@ -15,10 +15,12 @@ touching boot modes or firmware-facing platform devices).
 
 ## Build and test
 
-Two supported hosts since EPIC 17 phase 4: Linux/KVM (the MVP target, incl.
-`entangled install`) and Windows/WHP (`entangled run`, `doctor`, the manager).
-On this Windows machine the Linux side runs in WSL Ubuntu (has `/dev/kvm` via
-nested virtualization) or the Dockerfile:
+Two supported hosts, and since EPIC 17 phase 5 the same command set on both:
+Linux/KVM (the MVP target) and Windows/WHP both run `entangled install`, `run`,
+`doctor` and the manager. `install ubuntu` is the portable path (UEFI + verified
+ISO, offline); `install debian` additionally needs the bootstrap kernel, which
+only builds on Linux. On this Windows machine the Linux side runs in WSL Ubuntu
+(has `/dev/kvm` via nested virtualization) or the Dockerfile:
 
 ```bash
 wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace"
