@@ -8,7 +8,7 @@ use crate::discovery::{format_bytes, VmEntry};
 use crate::theme;
 use crate::ui;
 
-const CARD_HEIGHT: f32 = 214.0;
+const CARD_HEIGHT: f32 = 232.0;
 
 pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
     let time = ctx.input(|i| i.time);
@@ -48,7 +48,9 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
         });
 }
 
-fn banners(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
+/// The persistent notices (update, startup warning, scan errors, missing CLI).
+/// Shared with the Disks view, which shows the same product state.
+pub(crate) fn banners(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
     let mut any = false;
     if let Some(update) = &app.update {
         any = true;
@@ -207,6 +209,7 @@ fn vm_card(
             }
             let path = vm.profile_path.display().to_string();
             ui.label(ui::faint(shorten(&path, 46))).on_hover_text(&path);
+            live_stats_line(ui, app, vm, status, accent_at);
             ui.add_space(6.0);
 
             ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
@@ -236,6 +239,16 @@ fn vm_card(
                                 actions.push(Action::Stop(vm.name.clone()));
                             }
                         }
+                    }
+                    if ui::ghost_button(ui, "Edit", status == Status::Stopped, theme::VIOLET)
+                        .on_hover_text(if status == Status::Stopped {
+                            "Memory, vCPUs, boot, network, disks, display"
+                        } else {
+                            "Stop the machine first"
+                        })
+                        .clicked()
+                    {
+                        actions.push(Action::AskEditVm(vm.name.clone()));
                     }
                     if ui::ghost_button(ui, "Delete", status == Status::Stopped, theme::ERR)
                         .on_hover_text(if status == Status::Stopped {
@@ -268,6 +281,60 @@ fn vm_card(
             });
         },
     );
+}
+
+/// One quiet line of live numbers for an active machine: uptime, CPU (of the
+/// `entangled run` child — the guest lives inside it), resident RAM, and a
+/// sparkline of the last minute and a half. Numbers the sampler cannot answer
+/// simply stay away.
+fn live_stats_line(
+    ui: &mut egui::Ui,
+    app: &ManagerApp,
+    vm: &VmEntry,
+    status: Status,
+    accent_at: f32,
+) {
+    if !matches!(
+        status,
+        Status::Running | Status::Installing | Status::Stopping
+    ) {
+        return;
+    }
+    let Some(task) = app.supervisor.active_task(&vm.name) else {
+        return;
+    };
+    let mut parts = vec![format!(
+        "up {}",
+        crate::metrics::format_uptime(task.started_at.elapsed())
+    )];
+    let stats = app.stats.vms.get(&vm.name);
+    if let Some(stats) = stats {
+        if let Some(cpu) = stats.cpu_percent {
+            parts.push(format!("CPU {cpu:.0}%"));
+        }
+        if let Some(rss) = stats.rss_bytes {
+            parts.push(format!("{} RAM", format_bytes(rss)));
+        }
+    }
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.label(
+            RichText::new(parts.join(" · "))
+                .color(theme::accent(accent_at))
+                .size(12.0),
+        );
+        if let Some(stats) = stats {
+            if stats.history.len() >= 2 {
+                ui::sparkline(
+                    ui,
+                    &stats.history,
+                    Vec2::new(76.0, 15.0),
+                    theme::accent(accent_at),
+                );
+            }
+        }
+    });
 }
 
 fn pending_card(

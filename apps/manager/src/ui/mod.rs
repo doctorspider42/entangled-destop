@@ -3,6 +3,7 @@
 
 pub mod cards;
 pub mod dialogs;
+pub mod disks;
 pub mod header;
 pub mod logpane;
 pub mod toasts;
@@ -175,6 +176,34 @@ pub fn chip(ui: &mut Ui, text: &str, tint: Color32) {
         galley,
         Color32::TRANSPARENT,
     );
+}
+
+/// A tiny CPU sparkline: the last ~90 one-second samples as a polyline on an
+/// inset chip. Scale is anchored at 100% and grows with the peak, so a
+/// multi-vCPU guest (top-style, >100%) never clips.
+pub fn sparkline(ui: &mut Ui, values: &[f32], size: Vec2, tint: Color32) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(4),
+        theme::INSET.gamma_multiply(0.85),
+    );
+    if values.len() < 2 {
+        return;
+    }
+    let max = values.iter().copied().fold(100.0_f32, f32::max);
+    let n = values.len();
+    let points: Vec<egui::Pos2> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let x = rect.left() + 1.0 + (rect.width() - 2.0) * i as f32 / (n - 1) as f32;
+            let y = rect.bottom() - 1.5 - (v / max).clamp(0.0, 1.0) * (rect.height() - 3.0);
+            egui::pos2(x, y)
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, Stroke::new(1.3_f32, tint)));
 }
 
 /// Full-width notice with an optional action button; returns true when clicked.

@@ -47,10 +47,10 @@ use std::path::{Path, PathBuf};
 use control_api::{BootMode, BootSection, DiskSection, DisplaySection, VirtioTransport, VmConfig};
 
 use crate::disk;
-use crate::diskfs;
 use crate::run_vm::{self, Automation};
 use crate::seed;
 use crate::InstallArgs;
+use disk_image as diskfs;
 
 /// The firmware built by `guest/firmware/build-cloudhv.sh`.
 const FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";

@@ -9,8 +9,10 @@
 mod app;
 mod diagnose;
 mod discovery;
+mod editor;
 mod launcher;
 mod logo;
+mod metrics;
 mod process;
 mod settings;
 mod theme;
@@ -53,6 +55,7 @@ enum ScreenshotView {
     Main,
     Wizard,
     Settings,
+    Disks,
 }
 
 fn main() -> ExitCode {

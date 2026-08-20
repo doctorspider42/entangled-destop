@@ -7,13 +7,14 @@
 //! - UI code produces [`Action`]s, `ManagerApp::apply` is the only place that
 //!   mutates state or touches the filesystem.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::discovery::{self, Scan, VmEntry};
 use crate::launcher::{self, NewMachine};
+use crate::metrics;
 use crate::process::{Supervisor, TaskId, TaskKind};
 use crate::settings::{self, Settings};
 use crate::theme;
@@ -98,10 +99,65 @@ impl Toast {
     }
 }
 
+/// Which main surface the central panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum View {
+    #[default]
+    Machines,
+    Disks,
+}
+
 /// Wizard state (GUI-1602).
 pub struct WizardState {
     pub machine: NewMachine,
     pub error: Option<String>,
+}
+
+/// "New disk" dialog state.
+pub struct CreateDiskState {
+    pub name: String,
+    /// Size as typed ("32G", "512M", plain bytes) — validated by the same
+    /// `disk-image` parser the CLI uses.
+    pub size: String,
+    pub error: Option<String>,
+}
+
+/// Disk delete confirmation state.
+pub struct DeleteDiskState {
+    pub row: discovery::DiskRow,
+    pub error: Option<String>,
+}
+
+/// "Attach to VM" dialog state.
+pub struct AttachDiskState {
+    pub disk: PathBuf,
+    pub selected: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Edit-VM dialog state: the form plus its inline error.
+pub struct EditVmState {
+    pub form: crate::editor::EditForm,
+    pub error: Option<String>,
+}
+
+/// What the move worker thread reports back to the modal.
+pub enum MoveEvent {
+    /// `(data bytes copied, data bytes total)` — allocated data, not apparent.
+    Progress(u64, u64),
+    Done(Box<Result<disk_image::MoveOutcome, String>>),
+}
+
+/// "Move disk to another drive" dialog state.
+pub struct MoveDiskState {
+    pub row: discovery::DiskRow,
+    /// Destination directory as typed.
+    pub dest: String,
+    pub error: Option<String>,
+    /// `(copied, total)` while the worker runs.
+    pub progress: Option<(u64, u64)>,
+    pub running: bool,
+    pub events: Option<mpsc::Receiver<MoveEvent>>,
 }
 
 /// Delete confirmation state (GUI-1604).
@@ -126,6 +182,11 @@ pub enum Modal {
     Wizard(WizardState),
     Delete(DeleteState),
     Settings(SettingsForm),
+    CreateDisk(CreateDiskState),
+    DeleteDisk(DeleteDiskState),
+    AttachDisk(AttachDiskState),
+    EditVm(EditVmState),
+    MoveDisk(MoveDiskState),
 }
 
 impl Modal {
@@ -157,6 +218,27 @@ pub enum Action {
     OpenReleasePage,
     /// Hide the update banner for this session.
     DismissUpdate,
+    // ---- Disks view -------------------------------------------------------
+    SwitchView(View),
+    OpenCreateDisk,
+    SubmitCreateDisk,
+    AskDeleteDisk(PathBuf),
+    ConfirmDeleteDisk,
+    OpenAttachDisk(PathBuf),
+    SubmitAttachDisk,
+    DetachDisk {
+        vm: String,
+        profile: PathBuf,
+        declared: PathBuf,
+    },
+    /// Open the host file manager with the disk selected (explorer/xdg-open).
+    RevealDisk(PathBuf),
+    // ---- VM editor ---------------------------------------------------------
+    AskEditVm(String),
+    SubmitEditVm,
+    // ---- Move to another drive ----------------------------------------------
+    AskMoveDisk(PathBuf),
+    SubmitMoveDisk,
 }
 
 /// A VM being installed that has no profile on disk yet, so it still gets a
@@ -208,6 +290,7 @@ impl Scanner {
 }
 
 pub struct ManagerApp {
+    pub view: View,
     pub settings: Settings,
     pub settings_path: Option<PathBuf>,
     /// Non-fatal startup problem (unreadable settings file) shown as a banner.
@@ -216,6 +299,9 @@ pub struct ManagerApp {
     pub scan: Scan,
     pub scan_error: Option<String>,
     pub supervisor: Supervisor,
+    /// Live host/VM numbers from the metrics sampler thread, refreshed ~1/s.
+    pub stats: metrics::Snapshot,
+    metrics: metrics::Metrics,
     pub pending: Vec<PendingInstall>,
     pub toasts: Vec<Toast>,
     pub modal: Modal,
@@ -282,6 +368,7 @@ impl ManagerApp {
             .flatten();
 
         let mut app = Self {
+            view: View::default(),
             cli: launcher::locate_cli(&settings).map_err(|e| e.to_string()),
             settings,
             settings_path,
@@ -289,6 +376,8 @@ impl ManagerApp {
             scan: Scan::default(),
             scan_error: None,
             supervisor: Supervisor::new(Arc::clone(&waker)),
+            stats: metrics::Snapshot::default(),
+            metrics: metrics::Metrics::spawn(Arc::clone(&waker)),
             pending: Vec::new(),
             toasts: Vec::new(),
             modal: Modal::None,
@@ -312,6 +401,7 @@ impl ManagerApp {
         match startup.screenshot_view {
             ScreenshotView::Wizard => app.open_wizard(),
             ScreenshotView::Settings => app.open_settings(),
+            ScreenshotView::Disks => app.view = View::Disks,
             ScreenshotView::Main => {}
         }
         app
@@ -821,6 +911,435 @@ impl ManagerApp {
         self.request_scan(true);
     }
 
+    // ---- Disks view ---------------------------------------------------
+
+    pub fn disk_row(&self, path: &Path) -> Option<&discovery::DiskRow> {
+        self.scan.disks.iter().find(|d| d.path == *path)
+    }
+
+    /// True while any VM attached to the disk is running or installing — every
+    /// mutation of the disk is refused then.
+    pub fn disk_busy(&self, row: &discovery::DiskRow) -> bool {
+        row.attachments
+            .iter()
+            .any(|a| self.supervisor.is_busy(&a.vm))
+    }
+
+    fn open_create_disk(&mut self) {
+        // Suggest a free file name, the same way the wizard suggests VM names.
+        let mut name = "disk-1".to_string();
+        for n in 1..=99 {
+            let candidate = format!("disk-{n}");
+            if !self
+                .settings
+                .vm_dir
+                .join(format!("{candidate}.raw"))
+                .exists()
+            {
+                name = candidate;
+                break;
+            }
+        }
+        self.modal = Modal::CreateDisk(CreateDiskState {
+            name,
+            size: format!("{}G", self.settings.default_disk_gib),
+            error: None,
+        });
+    }
+
+    fn submit_create_disk(&mut self) {
+        let Modal::CreateDisk(state) = &mut self.modal else {
+            return;
+        };
+        let name = state.name.trim().to_string();
+        if let Err(e) = discovery::validate_name(&name) {
+            state.error = Some(e);
+            return;
+        }
+        let bytes = match disk_image::parse_size(state.size.trim()) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                state.error = Some(e.to_string());
+                return;
+            }
+        };
+        let path = self.settings.vm_dir.join(format!("{name}.raw"));
+        if let Err(e) = std::fs::create_dir_all(&self.settings.vm_dir) {
+            if let Modal::CreateDisk(state) = &mut self.modal {
+                state.error = Some(format!(
+                    "cannot create {}: {e}",
+                    self.settings.vm_dir.display()
+                ));
+            }
+            return;
+        }
+        match disk_image::create_raw(&path, bytes) {
+            Ok(()) => {
+                self.modal = Modal::None;
+                self.toast(
+                    ToastLevel::Success,
+                    format!(
+                        "created {} ({}, sparse)",
+                        path.display(),
+                        discovery::format_bytes(bytes)
+                    ),
+                );
+                self.request_scan(true);
+            }
+            Err(e) => {
+                if let Modal::CreateDisk(state) = &mut self.modal {
+                    state.error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    fn ask_delete_disk(&mut self, path: &Path) {
+        let Some(row) = self.disk_row(path).cloned() else {
+            self.toast(ToastLevel::Error, "that disk is gone from the list");
+            return;
+        };
+        if self.disk_busy(&row) {
+            self.toast(
+                ToastLevel::Warn,
+                "a VM using this disk is running — stop it first",
+            );
+            return;
+        }
+        self.modal = Modal::DeleteDisk(DeleteDiskState { row, error: None });
+    }
+
+    fn confirm_delete_disk(&mut self) {
+        let Modal::DeleteDisk(state) = &self.modal else {
+            return;
+        };
+        let row = state.row.clone();
+        if self.disk_busy(&row) {
+            if let Modal::DeleteDisk(state) = &mut self.modal {
+                state.error = Some("a VM using this disk is running — stop it first".into());
+            }
+            return;
+        }
+        if !row.attachments.is_empty() {
+            if let Modal::DeleteDisk(state) = &mut self.modal {
+                state.error = Some(
+                    "the disk is still attached to a VM profile — detach it there first".into(),
+                );
+            }
+            return;
+        }
+        // The reference scan inside remove_disk re-checks the VM directory, so
+        // a profile written since the last scan still blocks the delete.
+        match disk_image::remove_disk(
+            &row.path,
+            false,
+            std::slice::from_ref(&self.settings.vm_dir),
+        ) {
+            Ok(outcome) => {
+                self.modal = Modal::None;
+                let removed_nvram = outcome.removed.len() > 1;
+                self.toast(
+                    ToastLevel::Success,
+                    if removed_nvram {
+                        format!("deleted {} and its .nvram sidecar", row.path.display())
+                    } else {
+                        format!("deleted {}", row.path.display())
+                    },
+                );
+                self.request_scan(true);
+            }
+            Err(e) => {
+                if let Modal::DeleteDisk(state) = &mut self.modal {
+                    state.error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    fn open_attach_disk(&mut self, path: &Path) {
+        let Some(row) = self.disk_row(path) else {
+            self.toast(ToastLevel::Error, "that disk is gone from the list");
+            return;
+        };
+        let attached: Vec<&str> = row.attachments.iter().map(|a| a.vm.as_str()).collect();
+        // Candidates: stopped VMs not already attached to this disk.
+        let first_free = self
+            .scan
+            .vms
+            .iter()
+            .find(|vm| !attached.contains(&vm.name.as_str()) && !self.supervisor.is_busy(&vm.name))
+            .map(|vm| vm.name.clone());
+        self.modal = Modal::AttachDisk(AttachDiskState {
+            disk: path.to_path_buf(),
+            selected: first_free,
+            error: None,
+        });
+    }
+
+    fn submit_attach_disk(&mut self) {
+        let Modal::AttachDisk(state) = &self.modal else {
+            return;
+        };
+        let disk = state.disk.clone();
+        let Some(vm_name) = state.selected.clone() else {
+            if let Modal::AttachDisk(state) = &mut self.modal {
+                state.error = Some("pick a machine to attach to".into());
+            }
+            return;
+        };
+        let error = if self.supervisor.is_busy(&vm_name) {
+            Some(format!("'{vm_name}' is running — stop it first"))
+        } else if let Some(vm) = self.vm(&vm_name) {
+            discovery::attach_disk(&vm.profile_path.clone(), &disk).err()
+        } else {
+            Some(format!("'{vm_name}' is gone from disk"))
+        };
+        match error {
+            None => {
+                self.modal = Modal::None;
+                self.toast(
+                    ToastLevel::Success,
+                    format!("attached {} to '{vm_name}'", disk.display()),
+                );
+                self.request_scan(true);
+            }
+            Some(message) => {
+                if let Modal::AttachDisk(state) = &mut self.modal {
+                    state.error = Some(message);
+                }
+            }
+        }
+    }
+
+    fn detach_disk(&mut self, vm: &str, profile: &Path, declared: &Path) {
+        if self.supervisor.is_busy(vm) {
+            self.toast(
+                ToastLevel::Warn,
+                format!("'{vm}' is running — stop it before detaching its disk"),
+            );
+            return;
+        }
+        match discovery::detach_disk(profile, declared) {
+            Ok(()) => {
+                self.toast(
+                    ToastLevel::Success,
+                    format!("detached {} from '{vm}'", declared.display()),
+                );
+                self.request_scan(true);
+            }
+            Err(e) => self.toast(ToastLevel::Error, e),
+        }
+    }
+
+    // ---- VM editor ------------------------------------------------------
+
+    fn ask_edit_vm(&mut self, name: &str) {
+        if self.supervisor.is_busy(name) {
+            self.toast(
+                ToastLevel::Warn,
+                format!("'{name}' is busy — stop it before editing"),
+            );
+            return;
+        }
+        let Some(vm) = self.vm(name) else {
+            self.toast(ToastLevel::Error, format!("'{name}' is gone from disk"));
+            return;
+        };
+        match crate::editor::EditForm::from_profile(&vm.profile_path.clone()) {
+            Ok(form) => self.modal = Modal::EditVm(EditVmState { form, error: None }),
+            Err(e) => self.toast(
+                ToastLevel::Error,
+                format!("cannot open '{name}' for editing: {e}"),
+            ),
+        }
+    }
+
+    fn submit_edit_vm(&mut self) {
+        let Modal::EditVm(state) = &self.modal else {
+            return;
+        };
+        let name = state.form.name.clone();
+        // The VM could have been started from outside between open and save.
+        if self.supervisor.is_busy(&name) {
+            if let Modal::EditVm(state) = &mut self.modal {
+                state.error = Some(format!("'{name}' is running — stop it first"));
+            }
+            return;
+        }
+        match state.form.save() {
+            Ok(()) => {
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, format!("saved '{name}'"));
+                self.request_scan(true);
+            }
+            Err(e) => {
+                if let Modal::EditVm(state) = &mut self.modal {
+                    state.error = Some(e);
+                }
+            }
+        }
+    }
+
+    // ---- Move to another drive -------------------------------------------
+
+    fn ask_move_disk(&mut self, path: &Path) {
+        let Some(row) = self.disk_row(path).cloned() else {
+            self.toast(ToastLevel::Error, "that disk is gone from the list");
+            return;
+        };
+        if self.disk_busy(&row) {
+            self.toast(
+                ToastLevel::Warn,
+                "a VM using this disk is running — stop it first",
+            );
+            return;
+        }
+        self.modal = Modal::MoveDisk(MoveDiskState {
+            row,
+            dest: String::new(),
+            error: None,
+            progress: None,
+            running: false,
+            events: None,
+        });
+    }
+
+    fn submit_move_disk(&mut self) {
+        let Modal::MoveDisk(state) = &self.modal else {
+            return;
+        };
+        if state.running {
+            return;
+        }
+        let row = state.row.clone();
+        let dest_text = state.dest.trim().to_string();
+        let fail = |app: &mut Self, message: String| {
+            if let Modal::MoveDisk(state) = &mut app.modal {
+                state.error = Some(message);
+            }
+        };
+        if dest_text.is_empty() {
+            fail(self, "name a destination directory".into());
+            return;
+        }
+        // The VM could have started between opening the dialog and Move.
+        if self.disk_busy(&row) {
+            fail(
+                self,
+                "a VM using this disk is running — stop it first".into(),
+            );
+            return;
+        }
+        // Every profile that references the disk gets rewritten — the
+        // attachments the scan found, deduplicated.
+        let mut profiles: Vec<PathBuf> = Vec::new();
+        for attachment in &row.attachments {
+            if !profiles.contains(&attachment.profile) {
+                profiles.push(attachment.profile.clone());
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<MoveEvent>();
+        let waker = Arc::clone(&self.waker);
+        let disk = row.path.clone();
+        let dest = PathBuf::from(&dest_text);
+        let builder = std::thread::Builder::new().name("disk-move".to_string());
+        let spawned = builder.spawn(move || {
+            let progress_tx = tx.clone();
+            let progress_waker = Arc::clone(&waker);
+            // Throttle to whole-percent changes: a 100 GiB image would
+            // otherwise send one message per MiB.
+            let mut last_percent = u64::MAX;
+            let mut progress = move |done: u64, total: u64| {
+                let percent = (done * 100).checked_div(total).unwrap_or(100);
+                if percent != last_percent {
+                    last_percent = percent;
+                    let _ = progress_tx.send(MoveEvent::Progress(done, total));
+                    progress_waker();
+                }
+            };
+            let result = disk_image::move_disk(&disk, &dest, &profiles, &mut progress)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(MoveEvent::Done(Box::new(result)));
+            waker();
+        });
+        match spawned {
+            Ok(_) => {
+                if let Modal::MoveDisk(state) = &mut self.modal {
+                    state.running = true;
+                    state.error = None;
+                    state.progress = Some((0, 0));
+                    state.events = Some(rx);
+                }
+            }
+            Err(e) => fail(self, format!("cannot start the move worker: {e}")),
+        }
+    }
+
+    /// Drains the move worker's channel; called once per frame.
+    fn collect_move_events(&mut self) {
+        let Modal::MoveDisk(state) = &mut self.modal else {
+            return;
+        };
+        let Some(events) = &state.events else { return };
+        let mut finished: Option<Result<disk_image::MoveOutcome, String>> = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                MoveEvent::Progress(done, total) => state.progress = Some((done, total)),
+                MoveEvent::Done(result) => finished = Some(*result),
+            }
+        }
+        match finished {
+            None => {}
+            Some(Ok(outcome)) => {
+                let mut message = format!(
+                    "moved {} — {} of data copied and verified",
+                    outcome
+                        .moved
+                        .first()
+                        .map(|(_, to)| to.display().to_string())
+                        .unwrap_or_default(),
+                    discovery::format_bytes(outcome.data_bytes),
+                );
+                if !outcome.updated_profiles.is_empty() {
+                    message.push_str(&format!(
+                        "; {} profile(s) updated",
+                        outcome.updated_profiles.len()
+                    ));
+                }
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, message);
+                for leftover in outcome.leftover_sources {
+                    self.toast(
+                        ToastLevel::Warn,
+                        format!(
+                            "could not delete the source {} — the verified copy is in place, \
+                             remove the leftover by hand",
+                            leftover.display()
+                        ),
+                    );
+                }
+                self.request_scan(true);
+            }
+            Some(Err(message)) => {
+                state.running = false;
+                state.events = None;
+                state.progress = None;
+                state.error = Some(message);
+            }
+        }
+    }
+
+    fn reveal_disk(&mut self, path: &Path) {
+        match reveal_in_file_manager(path) {
+            Ok(()) => {}
+            Err(e) => self.toast(
+                ToastLevel::Error,
+                format!("cannot open the file manager: {e}"),
+            ),
+        }
+    }
+
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Refresh => self.request_scan(true),
@@ -838,7 +1357,13 @@ impl ManagerApp {
                 }
             }
             Action::OpenWizard => self.open_wizard(),
-            Action::CloseModal => self.modal = Modal::None,
+            Action::CloseModal => {
+                // A move in flight owns its modal: the copy is running on the
+                // worker and closing the dialog would orphan its progress.
+                if !matches!(&self.modal, Modal::MoveDisk(state) if state.running) {
+                    self.modal = Modal::None;
+                }
+            }
             Action::SubmitWizard => self.submit_wizard(),
             Action::OpenSettings => self.open_settings(),
             Action::SaveSettings => self.save_settings(),
@@ -873,6 +1398,26 @@ impl ManagerApp {
                 // still newer.
                 self.update = None;
             }
+            Action::SwitchView(view) => {
+                self.view = view;
+                self.request_scan(true);
+            }
+            Action::OpenCreateDisk => self.open_create_disk(),
+            Action::SubmitCreateDisk => self.submit_create_disk(),
+            Action::AskDeleteDisk(path) => self.ask_delete_disk(&path),
+            Action::ConfirmDeleteDisk => self.confirm_delete_disk(),
+            Action::OpenAttachDisk(path) => self.open_attach_disk(&path),
+            Action::SubmitAttachDisk => self.submit_attach_disk(),
+            Action::DetachDisk {
+                vm,
+                profile,
+                declared,
+            } => self.detach_disk(&vm, &profile, &declared),
+            Action::RevealDisk(path) => self.reveal_disk(&path),
+            Action::AskEditVm(name) => self.ask_edit_vm(&name),
+            Action::SubmitEditVm => self.submit_edit_vm(),
+            Action::AskMoveDisk(path) => self.ask_move_disk(&path),
+            Action::SubmitMoveDisk => self.submit_move_disk(),
         }
     }
 
@@ -980,16 +1525,33 @@ impl eframe::App for ManagerApp {
         self.collect_scan();
         self.collect_task_results();
         self.collect_update_events();
+        self.collect_move_events();
         self.supervisor.prune(12);
         self.ensure_log_selection();
         self.expire_toasts(ctx.input(|i| i.time));
+
+        // Tell the sampler what to measure, take its latest answer. Both are
+        // one mutex swap; the sampling itself lives on the metrics thread.
+        let targets: Vec<(String, u32)> = self
+            .supervisor
+            .tasks()
+            .iter()
+            .filter(|t| t.is_active())
+            .map(|t| (t.vm.clone(), t.pid))
+            .collect();
+        self.metrics
+            .set_targets(targets, self.settings.vm_dir.clone());
+        self.stats = self.metrics.snapshot();
 
         let mut actions = Vec::new();
         ui::header::show(ctx, self, &mut actions);
         if self.log_open {
             ui::logpane::show(ctx, self, &mut actions);
         }
-        ui::cards::show(ctx, self, &mut actions);
+        match self.view {
+            View::Machines => ui::cards::show(ctx, self, &mut actions),
+            View::Disks => ui::disks::show(ctx, self, &mut actions),
+        }
         ui::dialogs::show(ctx, self, &mut actions);
         ui::toasts::show(ctx, &self.toasts, &mut actions);
 
@@ -1000,6 +1562,43 @@ impl eframe::App for ManagerApp {
         self.handle_screenshot(ctx);
         // The logo and the status indicators are always in motion.
         ctx.request_repaint_after(FRAME_INTERVAL);
+    }
+}
+
+/// Opens the platform file manager with `path` selected (or its directory
+/// shown). Fire and forget: the child is the user's file manager, not ours.
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // `/select,` highlights the file itself; the comma is part of the flag.
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = path;
+        Err("no file manager integration on this platform".to_string())
     }
 }
 

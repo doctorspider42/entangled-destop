@@ -17,6 +17,8 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
         modal,
         settings,
         cli,
+        scan,
+        supervisor,
         ..
     } = app;
 
@@ -258,6 +260,195 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 }
             });
         }),
+        Modal::CreateDisk(state) => frame(ctx, "create-disk", "New disk", 470.0, |ui| {
+            ui.label(ui::dim(
+                "A sparse RAW image: it occupies almost no space until the guest writes to it.",
+            ));
+            ui.add_space(14.0);
+
+            ui.label(ui::faint("NAME"));
+            ui.add(
+                egui::TextEdit::singleline(&mut state.name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("disk-1"),
+            );
+            ui.label(ui::faint(format!(
+                "file {}",
+                settings
+                    .vm_dir
+                    .join(format!("{}.raw", state.name.trim()))
+                    .display()
+            )));
+            ui.add_space(12.0);
+
+            ui.label(ui::faint("SIZE"));
+            ui.add(
+                egui::TextEdit::singleline(&mut state.size)
+                    .desired_width(120.0)
+                    .hint_text("32G"),
+            );
+            // Live validation through the same parser the CLI uses.
+            match disk_image::parse_size(state.size.trim()) {
+                Ok(bytes) => {
+                    ui.label(ui::faint(format!(
+                        "= {} ({bytes} bytes)",
+                        format_bytes(bytes)
+                    )));
+                }
+                Err(e) => {
+                    ui.label(RichText::new(e.to_string()).color(theme::WARN).size(11.5));
+                }
+            }
+
+            if let Some(error) = &state.error {
+                ui.add_space(10.0);
+                ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+            }
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if ui::primary_button(ui, "Create disk").clicked() {
+                    actions.push(Action::SubmitCreateDisk);
+                }
+                if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+                    actions.push(Action::CloseModal);
+                }
+            });
+        }),
+        Modal::DeleteDisk(state) => frame(
+            ctx,
+            "delete-disk",
+            &format!("Delete {}", state.row.file_name),
+            470.0,
+            |ui| {
+                ui.label(
+                    RichText::new("This removes the image file permanently.")
+                        .color(theme::TEXT)
+                        .size(13.0),
+                );
+                ui.add_space(12.0);
+                ui.label(ui::faint(format!(
+                    "− {}  ({})",
+                    state.row.path.display(),
+                    format_bytes(state.row.apparent_bytes)
+                )));
+                if state.row.nvram {
+                    ui.label(ui::faint(format!(
+                        "− {}  (UEFI variable store — deleted with the disk)",
+                        disk_image::nvram_sidecar_path(&state.row.path).display()
+                    )));
+                }
+                if !state.row.attachments.is_empty() {
+                    ui.add_space(8.0);
+                    let vms: Vec<&str> = state
+                        .row
+                        .attachments
+                        .iter()
+                        .map(|a| a.vm.as_str())
+                        .collect();
+                    ui.label(
+                        RichText::new(format!(
+                            "Still attached to {} — detach it there first",
+                            vms.join(", ")
+                        ))
+                        .color(theme::WARN)
+                        .size(12.5),
+                    );
+                }
+                if let Some(error) = &state.error {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+                }
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    let deletable = state.row.attachments.is_empty();
+                    if ui::ghost_button(ui, "Delete permanently", deletable, theme::ERR).clicked() {
+                        actions.push(Action::ConfirmDeleteDisk);
+                    }
+                    if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+                        actions.push(Action::CloseModal);
+                    }
+                });
+            },
+        ),
+        Modal::AttachDisk(state) => frame(ctx, "attach-disk", "Attach disk", 470.0, |ui| {
+            ui.label(ui::dim(format!(
+                "Adds {} as a writable [[disk]] to a machine's profile.",
+                state.disk.display()
+            )));
+            ui.add_space(12.0);
+
+            let attached: Vec<&str> = scan
+                .disks
+                .iter()
+                .find(|d| d.path == state.disk)
+                .map(|d| d.attachments.iter().map(|a| a.vm.as_str()).collect())
+                .unwrap_or_default();
+            let candidates: Vec<&str> = scan
+                .vms
+                .iter()
+                .filter(|vm| !attached.contains(&vm.name.as_str()) && !supervisor.is_busy(&vm.name))
+                .map(|vm| vm.name.as_str())
+                .collect();
+
+            if candidates.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "No machine can take it: every machine is running, already \
+                         attached, or none exists yet",
+                    )
+                    .color(theme::WARN)
+                    .size(12.5),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(ui::faint("MACHINE"));
+                    ui.add_space(8.0);
+                    egui::ComboBox::from_id_salt("attach-target")
+                        .selected_text(state.selected.clone().unwrap_or_else(|| "—".into()))
+                        .show_ui(ui, |ui| {
+                            for name in &candidates {
+                                ui.selectable_value(
+                                    &mut state.selected,
+                                    Some((*name).to_string()),
+                                    *name,
+                                );
+                            }
+                        });
+                });
+                ui.label(ui::faint(
+                    "Running machines are not offered — stop them first",
+                ));
+            }
+
+            if let Some(error) = &state.error {
+                ui.add_space(8.0);
+                ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+            }
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                let ready = state.selected.is_some() && !candidates.is_empty();
+                if ui::ghost_button(ui, "Attach", ready, theme::CYAN).clicked() {
+                    actions.push(Action::SubmitAttachDisk);
+                }
+                if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+                    actions.push(Action::CloseModal);
+                }
+            });
+        }),
+        Modal::EditVm(state) => frame(
+            ctx,
+            "edit-vm",
+            &format!("Edit {}", state.form.name),
+            600.0,
+            |ui| edit_vm_body(ui, state, actions),
+        ),
+        Modal::MoveDisk(state) => frame(
+            ctx,
+            "move-disk",
+            &format!("Move {}", state.row.file_name),
+            520.0,
+            |ui| move_disk_body(ui, state, actions),
+        ),
     };
 
     if closed {
@@ -266,6 +457,352 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         actions.push(Action::CloseModal);
     }
+}
+
+/// The Edit-VM form body. Every field writes into [`crate::editor::EditForm`];
+/// Save runs control-api validation and shows its message inline. Scrollable —
+/// a UEFI profile with several disks outgrows any fixed height.
+fn edit_vm_body(ui: &mut egui::Ui, state: &mut crate::app::EditVmState, actions: &mut Vec<Action>) {
+    use crate::editor::NetworkChoice;
+    use control_api::{BootMode, VirtioTransport};
+
+    let form = &mut state.form;
+    egui::ScrollArea::vertical()
+        .max_height(460.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            // Resources.
+            slider_row(ui, "MEMORY", |ui| {
+                ui.add(
+                    egui::Slider::new(&mut form.memory_mib, 128..=control_api::MAX_MEMORY_MIB)
+                        .step_by(128.0)
+                        .suffix(" MiB"),
+                );
+            });
+            slider_row(ui, "vCPUs", |ui| {
+                ui.add(egui::Slider::new(&mut form.vcpus, 1..=64));
+            });
+            ui.add_space(10.0);
+
+            // Transport + boot mode.
+            ui.horizontal(|ui| {
+                ui.label(ui::faint("TRANSPORT"));
+                ui.add_space(8.0);
+                egui::ComboBox::from_id_salt("edit-transport")
+                    .selected_text(form.transport.to_string())
+                    .show_ui(ui, |ui| {
+                        for t in [VirtioTransport::Mmio, VirtioTransport::Pci] {
+                            ui.selectable_value(&mut form.transport, t, t.to_string());
+                        }
+                    });
+                ui.add_space(14.0);
+                ui.label(ui::faint("BOOT"));
+                ui.add_space(8.0);
+                egui::ComboBox::from_id_salt("edit-boot-mode")
+                    .selected_text(match form.boot_mode {
+                        BootMode::DirectLinux => "direct-linux",
+                        BootMode::Uefi => "uefi",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut form.boot_mode,
+                            BootMode::DirectLinux,
+                            "direct-linux",
+                        );
+                        ui.selectable_value(&mut form.boot_mode, BootMode::Uefi, "uefi");
+                    });
+            });
+            ui.add_space(8.0);
+
+            match form.boot_mode {
+                BootMode::DirectLinux => {
+                    text_row(
+                        ui,
+                        "KERNEL",
+                        &mut form.kernel,
+                        "artifacts/bootstrap/vmlinuz",
+                    );
+                    text_row(
+                        ui,
+                        "INITRAMFS",
+                        &mut form.initramfs,
+                        "artifacts/bootstrap/initrd.img (optional)",
+                    );
+                    text_row(ui, "CMDLINE", &mut form.cmdline, "console=ttyS0 …");
+                }
+                BootMode::Uefi => {
+                    text_row(
+                        ui,
+                        "FIRMWARE",
+                        &mut form.firmware,
+                        "artifacts/firmware/CLOUDHV.fd",
+                    );
+                    text_row(ui, "NVRAM", &mut form.nvram, "<vm>.nvram (optional)");
+                    text_row(ui, "CDROM", &mut form.cdrom, "installer .iso (optional)");
+                }
+            }
+            ui.add_space(10.0);
+
+            // Network.
+            ui.horizontal(|ui| {
+                ui.label(ui::faint("NETWORK"));
+                ui.add_space(8.0);
+                egui::ComboBox::from_id_salt("edit-network")
+                    .selected_text(form.network.label())
+                    .show_ui(ui, |ui| {
+                        for choice in NetworkChoice::ALL {
+                            ui.selectable_value(&mut form.network, choice, choice.label());
+                        }
+                    });
+            });
+            if form.network == NetworkChoice::Tap {
+                text_row(ui, "INTERFACE", &mut form.interface, "entangled0");
+            }
+            if form.network != NetworkChoice::None {
+                text_row(
+                    ui,
+                    "MAC",
+                    &mut form.mac,
+                    "52:00:… (optional, derived from the name)",
+                );
+            }
+            ui.add_space(10.0);
+
+            // Display.
+            ui.horizontal(|ui| {
+                ui.label(ui::faint("DISPLAY"));
+                ui.add_space(8.0);
+                ui.add(egui::DragValue::new(&mut form.display_width).range(320..=7680));
+                ui.label(ui::faint("×"));
+                ui.add(egui::DragValue::new(&mut form.display_height).range(200..=4320));
+                ui.add_space(12.0);
+                ui.checkbox(&mut form.virgl, "VirGL 3D").on_hover_text(
+                    "Offer VIRTIO_GPU_F_VIRGL backed by the host virglrenderer \
+                     (Linux hosts; the run fails rather than silently booting 2D)",
+                );
+            });
+            ui.add_space(10.0);
+
+            // Disks: order is guest device order (/dev/vda, /dev/vdb, …).
+            ui.label(ui::faint("DISKS (order = /dev/vda, /dev/vdb, …)"));
+            let mut remove: Option<usize> = None;
+            for (i, disk) in form.disks.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(ui::dim(format!("{}", i + 1)));
+                    ui.label(
+                        RichText::new(disk.path.display().to_string())
+                            .color(theme::TEXT)
+                            .size(12.5),
+                    );
+                    ui.checkbox(&mut disk.writable, "writable");
+                    if ui::ghost_button(ui, "Remove", true, theme::WARN).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                form.disks.remove(i);
+            }
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.add_disk)
+                        .desired_width(360.0)
+                        .hint_text("path/to/image.raw"),
+                );
+                let path = form.add_disk.trim().to_string();
+                if ui::ghost_button(ui, "Add disk", !path.is_empty(), theme::CYAN).clicked() {
+                    form.disks.push(control_api::DiskSection {
+                        path: std::path::PathBuf::from(path),
+                        writable: true,
+                    });
+                    form.add_disk.clear();
+                }
+            });
+        });
+
+    // Validation preview: run control-api's rules live, so the message sits
+    // under the form before Save is even pressed.
+    let preview = state.form.to_config();
+    if let Err(message) = &preview {
+        ui.add_space(8.0);
+        ui.label(RichText::new(message).color(theme::ERR).size(12.5));
+    } else if let Some(error) = &state.error {
+        ui.add_space(8.0);
+        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+    }
+
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        let savable = preview.is_ok() && state.form.dirty();
+        if ui::ghost_button(ui, "Save", savable, theme::CYAN)
+            .on_hover_text("Rewrites the profile through control-api types")
+            .clicked()
+        {
+            actions.push(Action::SubmitEditVm);
+        }
+        if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+            actions.push(Action::CloseModal);
+        }
+    });
+}
+
+/// The move-to-another-drive dialog: destination, the space arithmetic
+/// (allocated data vs worst-case apparent size vs free space), a gradient
+/// progress bar while the worker copies, and the safety story spelled out.
+fn move_disk_body(
+    ui: &mut egui::Ui,
+    state: &mut crate::app::MoveDiskState,
+    actions: &mut Vec<Action>,
+) {
+    ui.label(ui::dim(
+        "Copies the image sparse-preserving (only allocated data travels), verifies the \
+         copy against the source, updates every referencing profile, and only then \
+         deletes the original. A failure at any step leaves everything as it was.",
+    ));
+    ui.add_space(12.0);
+
+    ui.label(ui::faint(format!("− {}", state.row.path.display())));
+    if state.row.nvram {
+        ui.label(ui::faint(format!(
+            "− {}  (moves along)",
+            disk_image::nvram_sidecar_path(&state.row.path).display()
+        )));
+    }
+    for attachment in &state.row.attachments {
+        ui.label(ui::faint(format!(
+            "profile of '{}' will be updated",
+            attachment.vm
+        )));
+    }
+    ui.add_space(12.0);
+
+    ui.label(ui::faint("DESTINATION DIRECTORY"));
+    ui.add_enabled(
+        !state.running,
+        egui::TextEdit::singleline(&mut state.dest)
+            .desired_width(f32::INFINITY)
+            .hint_text(if cfg!(windows) {
+                "E:\\vm-storage"
+            } else {
+                "/mnt/bigdrive/vms"
+            }),
+    );
+
+    // The space arithmetic, live: what the copy writes now (allocated data)
+    // and what the guest may grow into later (apparent size).
+    let bill = disk_image::relocate::copy_bill(&state.row.path);
+    let dest = state.dest.trim();
+    let space = (!dest.is_empty())
+        .then(|| disk_image::disk_space(std::path::Path::new(dest)))
+        .flatten();
+    if let Some((data, apparent)) = bill {
+        ui.add_space(4.0);
+        ui.label(ui::faint(format!(
+            "copies {} of data · image can grow to {}",
+            format_bytes(data),
+            format_bytes(apparent)
+        )));
+        if let Some((free, _total)) = space {
+            if free < data {
+                ui.label(
+                    RichText::new(format!(
+                        "{} free at the destination — not enough for the data itself",
+                        format_bytes(free)
+                    ))
+                    .color(theme::ERR)
+                    .size(12.5),
+                );
+            } else if free < apparent {
+                ui.label(
+                    RichText::new(format!(
+                        "{} free at the destination — enough for the data, but less than \
+                         the image's full {} (the guest can outgrow the drive later)",
+                        format_bytes(free),
+                        format_bytes(apparent)
+                    ))
+                    .color(theme::WARN)
+                    .size(12.5),
+                );
+            } else {
+                ui.label(ui::faint(format!(
+                    "{} free at the destination",
+                    format_bytes(free)
+                )));
+            }
+        }
+    }
+
+    // Progress: a gradient fill over the inset track, plus the byte counter.
+    if let Some((done, total)) = state.progress {
+        ui.add_space(12.0);
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 14.0), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, egui::CornerRadius::same(7), theme::INSET);
+        let fraction = if total == 0 {
+            0.0
+        } else {
+            (done as f32 / total as f32).clamp(0.0, 1.0)
+        };
+        if fraction > 0.0 {
+            let fill = egui::Rect::from_min_size(
+                rect.min,
+                Vec2::new(rect.width() * fraction, rect.height()),
+            );
+            theme::gradient_rect(
+                painter,
+                fill,
+                theme::CYAN.gamma_multiply(0.9),
+                theme::VIOLET.gamma_multiply(0.9),
+            );
+        }
+        ui.label(ui::faint(format!(
+            "copied {} / {}",
+            format_bytes(done),
+            format_bytes(total)
+        )));
+    }
+
+    if let Some(error) = &state.error {
+        ui.add_space(8.0);
+        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+    }
+
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        let ready = !state.running && !dest.is_empty();
+        let label = if state.running { "Moving…" } else { "Move" };
+        if ui::ghost_button(ui, label, ready, theme::VIOLET).clicked() {
+            actions.push(Action::SubmitMoveDisk);
+        }
+        if ui::ghost_button(ui, "Cancel", !state.running, theme::TEXT_DIM)
+            .on_hover_text(if state.running {
+                "The copy is running; it finishes or rolls back on its own"
+            } else {
+                "Close without moving anything"
+            })
+            .clicked()
+        {
+            actions.push(Action::CloseModal);
+        }
+    });
+}
+
+fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new(78.0, 20.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.label(ui::faint(label));
+            },
+        );
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(f32::INFINITY)
+                .hint_text(hint),
+        );
+    });
 }
 
 fn slider_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {

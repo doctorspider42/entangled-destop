@@ -223,6 +223,8 @@ pub struct Task {
     pub id: TaskId,
     pub kind: TaskKind,
     pub vm: String,
+    /// OS pid of the child — what the metrics sampler measures.
+    pub pid: u32,
     pub log_path: PathBuf,
     pub command_line: String,
     pub started_at: Instant,
@@ -368,6 +370,7 @@ impl Supervisor {
             id,
             kind: spec.kind,
             vm: spec.vm.clone(),
+            pid: child.id(),
             log_path: spec.log_path.clone(),
             command_line: spec.command_line(),
             started_at: Instant::now(),
