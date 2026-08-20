@@ -167,6 +167,10 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_gpu::renderer::MAX_CONTEXTS` | 128 | live 3D rendering contexts | `null_renderer::tests::the_context_and_resource_caps_hold` |
 | `virtio_gpu::renderer::MAX_3D_RESOURCES` | 16384 | live 3D resources | same test |
 | `virtio_gpu::renderer::MAX_TOTAL_3D_ELEMENTS` | 2³⁰ | width×height×depth×layers summed over live 3D resources (bytes-per-element is the renderer's) | same test (asserts the budget is exact) |
+| `virtio_gpu::fence::MAX_PENDING_FENCES` | 64 | fenced responses (and therefore descriptor chains) the device holds for host fences; past it a fence completes synchronously | `fence::tests::the_cap_holds_and_returns_the_payload`, `gpu_fence::the_pending_fence_table_is_capped_and_never_wedges_the_device` |
+| `virtio_gpu::device::FENCE_TIMEOUT` | 2 s | how long a deferred response waits before the watchdog answers it anyway | `gpu_fence::a_fence_that_never_retires_is_completed_by_the_watchdog` |
+| `virtio_gpu::remote::MAX_FRAME_BYTES` | 40 MiB | bytes in one message either way across the renderer-process boundary, refused *before* reserving | `remote::tests::an_oversized_length_header_is_refused_before_allocating`, fuzz target `gpu_remote_protocol` |
+| `virtio_gpu::remote::protocol::REMOTE_XFER_WINDOW` / `REMOTE_MAX_BACKING` | 8 MiB / 64 MiB | backing bytes per transfer across that boundary / shadow backing per resource | `gpu_remote::the_isolated_renderer_serves_the_whole_3d_path` (round trip), server-side refusal |
 | `virtio_gpu::renderer::MAX_3D_WIDTH` / `MAX_3D_DIM` / `MAX_3D_ARRAY` / `MAX_3D_LAST_LEVEL` / `MAX_3D_SAMPLES` | 2²⁸ / 16384 / 2048 / 15 / 32 | per-axis geometry of one `RESOURCE_CREATE_3D` | `gpu_3d::a_malicious_3d_guest_is_answered_in_band` |
 | `virtio_gpu::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick (controlq and cursorq) | same shape as the blk budget test |
 | `virtio_input::MAX_PENDING_EVENTS` | 1024 | host-buffered input events while the guest is not draining (oldest dropped) | `input_queue::a_starved_queue_buffers_events_up_to_the_bound_and_drops_the_oldest` |
@@ -291,11 +295,45 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
   half can serve (`CTX_ATTACH_RESOURCE` has no renderer handle for a 2D id)
   completes after validation instead of being refused (ADR-0004's 2026-08-20
   amendment); flushes read back through `Renderer3d::read_rect_bgra` into
-  the same `ScanoutSink`. Fences complete synchronously (phase 1). Enable per
-  VM with `[display] virgl = true`. Tests: `tests/gpu_3d.rs` (transport-level,
-  any OS), `tests/virgl_host.rs` (real GL, self-skips),
-  `boot-tests/virgl_gnome.rs` (GNOME live on virgl, `--ignored`), fuzz target
-  `gpu_3d_commands`.
+  the same `ScanoutSink` — **packed into the caller's buffer** with an explicit
+  stride (phase 2; the phase-1 full-frame shadow got partial rects wrong).
+  Enable per VM with `[display] virgl = true`.
+
+  **Phase 2 (ADR-0004's 2026-08-20 amendments), three things to know:**
+  - **Fences are real.** A fenced `SUBMIT_3D`/`TRANSFER_*_3D` keeps its chain
+    out of the used ring until the host fence retires. Completion has to happen
+    on the device's worker thread (EGL is thread-affine), so the renderer asks
+    to be *called* via `virtio_core::HostWaker` — implemented in
+    `machine_x86::notify` as a write to **queue 0's existing eventfd**, i.e. a
+    wake is an ordinary `queue_notify(0)`. `DeferredWaker` covers the ordering
+    (the device is inside its transport before the worker exists). Bounds that
+    are load-bearing: `MAX_PENDING_FENCES` (64, checked *before* asking the
+    renderer for a fence), a 2 s watchdog (`FENCE_TIMEOUT`) so a stalled host
+    never becomes a stalled guest, immediate answers for failed fenced
+    commands, and a reset that drops everything held. `ENTANGLED_GPU_FENCES=sync`
+    forces phase 1 back for a measurement.
+  - **The renderer runs in another process by default** (`[display]
+    virgl_isolation = "process"`, GPU-012). `virtio_gpu::remote` is the whole
+    story: a portable protocol (builds/tests on Windows too), a client that
+    turns any wire failure into a dead renderer, and a helper (`entangled
+    gpu-renderer`, socket on stdin). **The helper never sees a guest address** —
+    the client ships bytes it read through `vm-memory` and the helper keeps a
+    per-resource shadow `GuestMem` region. When it dies the device releases
+    every held response as `ERR_UNSPEC`, drops the renderer, refuses 3D in band,
+    keeps 2D working, and *then* raises `DEVICE_NEEDS_RESET`.
+  - **The device measures frame pacing** (`virtio_gpu::pacing`): a
+    `RESOURCE_FLUSH` on the scanout resource is a guest present, so flush
+    intervals are the host's frame clock, logged every 120 frames with the
+    fence statistics. Use it for any GPU before/after.
+
+  Tests: `tests/gpu_3d.rs` (transport-level, any OS), `tests/gpu_fence.rs`
+  (deferral, cap, watchdog, reset, renderer death — any OS),
+  `tests/gpu_remote.rs` (a real helper process, including `SIGKILL` under
+  load — unix), `tests/virgl_host.rs` + `virgl_fence_host.rs` +
+  `virgl_scanout_host.rs` (real GL, one binary each because virglrenderer is a
+  process singleton, all self-skipping), `boot-tests/virgl_gnome.rs` (GNOME
+  live on virgl, `--ignored`), fuzz targets `gpu_3d_commands` (now including
+  the fence surface) and `gpu_remote_protocol`.
 - **input** (EPIC 9): event model in `virtio_input` (`ev`, `abs`, `btn`,
   `InputEvent`). Absolute pointer: window coords →
   `InputEvent::abs_from_window` (0..=32767). Every batch ends with

@@ -16,6 +16,24 @@ mod run_vm;
 #[cfg(target_os = "linux")]
 mod seed;
 
+/// The isolated-renderer helper (ADR-0004 GPU-012). Linux-only, like the
+/// renderer it hosts.
+#[cfg(target_os = "linux")]
+mod gpu_renderer {
+    /// Loads virglrenderer and serves the renderer protocol on stdin until the
+    /// VMM hangs up.
+    ///
+    /// Failing here is how a `virgl = true` profile finds out it cannot have
+    /// 3D: the client turns this message into the `entangled run` error, so
+    /// nothing ever silently falls back to software GL (ADR-0004 §7).
+    pub fn serve() -> Result<(), String> {
+        let renderer = virtio_gpu::virgl::VirglRenderer::load()
+            .map_err(|e| format!("cannot start the 3D renderer: {e}"))?;
+        virtio_gpu::remote::serve_stdin(Box::new(renderer))
+            .map_err(|e| format!("the 3D renderer session ended badly: {e}"))
+    }
+}
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -67,6 +85,15 @@ enum Command {
     },
     /// Check host prerequisites (KVM, capabilities, graphics backend).
     Doctor,
+    /// Serve the 3D renderer protocol on stdin (ADR-0004 GPU-012).
+    ///
+    /// Not for interactive use: `entangled run` starts this on itself so that
+    /// virglrenderer — and the host GL driver it loads — lives in a process
+    /// whose crash degrades the VM to 2D instead of killing it. Hidden,
+    /// because a human typing it gets a process that reads a binary protocol
+    /// from a terminal.
+    #[command(hide = true)]
+    GpuRenderer,
 }
 
 #[derive(Args)]
@@ -207,6 +234,16 @@ fn run(cli: Cli) -> Result<(), String> {
             DiskCommand::Move { path, to } => disk::mv(&path, &to),
         },
         Command::Doctor => doctor::run(),
+        Command::GpuRenderer => {
+            #[cfg(target_os = "linux")]
+            {
+                gpu_renderer::serve()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err("the isolated 3D renderer is Linux-only for now (ADR-0004 §6)".to_string())
+            }
+        }
         Command::Fetch(args) => fetch::run(&args),
         Command::Install(args) => {
             #[cfg(target_os = "linux")]

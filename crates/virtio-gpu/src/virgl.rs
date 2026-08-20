@@ -32,17 +32,20 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 
 use virtio_core::GuestMem;
 
+use virtio_core::HostWaker;
+
 use crate::error::CommandError;
 use crate::protocol::{MemEntry, Rect, ResourceCreate3d, Transfer3d};
-use crate::renderer::{CapsetInfo, Renderer3d};
+use crate::renderer::{CapsetInfo, FenceOutcome, Renderer3d};
 use crate::MAX_RESOURCE_PIXELS;
 
 /// `VIRGL_RENDERER_USE_EGL`.
@@ -106,10 +109,48 @@ struct Callbacks {
     get_drm_fd: Option<extern "C" fn(*mut c_void) -> c_int>,
 }
 
-/// Fences are synchronous in phase 1 (ADR-0004 §4): commands complete before
-/// their response is written, so the callback only exists because the ABI
-/// requires it.
-extern "C" fn write_fence(_cookie: *mut c_void, _fence: u32) {}
+/// The init cookie: what the library hands back to every callback.
+///
+/// Its *address* is registered with virglrenderer at init and retained for
+/// the life of the process (see the module docs), so the box is leaked on
+/// drop and the callback may always dereference it.
+struct Cookie {
+    /// Recognizable in a debugger ("virg"); the library only round-trips the
+    /// pointer.
+    _magic: u32,
+    /// Host fence ids the library has retired, in retirement order, waiting
+    /// to be collected by [`VirglRenderer::poll_fences`].
+    ///
+    /// A `Mutex` because the pointer is shared with C: in practice
+    /// `write_fence` only ever runs on the thread inside
+    /// `virgl_renderer_poll` (our worker), so it is uncontended.
+    retired: Mutex<Vec<u32>>,
+}
+
+/// `virgl_renderer_callbacks::write_fence` — the library telling us a fence
+/// retired (ADR-0004 phase 2).
+///
+/// Called from inside `virgl_renderer_poll`, i.e. synchronously on the device
+/// worker thread, so all this does is append the id for the caller to pick
+/// up. Nothing here may panic: it is a C callback frame.
+extern "C" fn write_fence(cookie: *mut c_void, fence: u32) {
+    if cookie.is_null() {
+        return;
+    }
+    // SAFETY: the pointer is the `Cookie` box registered at
+    // `virgl_renderer_init`, which is leaked rather than freed (see `Drop`),
+    // so it is still live whenever the library calls back. The library never
+    // hands this pointer to anything else and we only take a shared
+    // reference.
+    let cookie = unsafe { &*cookie.cast::<Cookie>() };
+    if let Ok(mut retired) = cookie.retired.lock() {
+        // Bound the list the same way the device bounds its fence table: a
+        // runaway host cannot make this grow without limit.
+        if retired.len() < crate::fence::MAX_PENDING_FENCES * 4 {
+            retired.push(fence);
+        }
+    }
+}
 
 /// The resolved entry points of the 0.9 API.
 ///
@@ -151,6 +192,14 @@ struct Api {
         c_int,
     ) -> c_int,
     submit_cmd: unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int,
+    /// `virgl_renderer_create_fence(client_fence_id, ctx_id)` — phase 2.
+    create_fence: unsafe extern "C" fn(c_int, u32) -> c_int,
+    /// `virgl_renderer_poll()`: retires finished fences, calling `write_fence`
+    /// for each, synchronously on the calling thread.
+    poll: unsafe extern "C" fn(),
+    /// `virgl_renderer_get_poll_fd()`: an fd that becomes readable when the
+    /// library has fence work, or -1 on a host whose GL stack offers none.
+    get_poll_fd: unsafe extern "C" fn() -> c_int,
     // ManuallyDrop = the library is never dlclose'd. Unloading a GL stack at
     // runtime is famously unsafe: mesa's driver threads leave TLS destructors
     // behind and `virgl_renderer_cleanup` + dlclose segfault at thread exit
@@ -175,9 +224,6 @@ struct ResourceState {
     width: u32,
     height: u32,
     attachment: Option<Attachment>,
-    /// Full-frame BGRA shadow for scanout/cursor readback, allocated on first
-    /// read (only presented resources ever get one).
-    shadow: Vec<u8>,
 }
 
 /// What phase of life the process-global library is in.
@@ -189,6 +235,99 @@ enum State {
     /// A device reset arrived (possibly from a vCPU thread);
     /// `virgl_renderer_reset` runs before the next command.
     NeedsReset,
+}
+
+/// How often the fence monitor asks the device to poll while host fences are
+/// outstanding.
+///
+/// QEMU's equivalent timer runs at 10 ms; that is a quarter of a frame at
+/// 60 Hz, which shows up as visible jitter. 1 ms costs one cheap
+/// `virgl_renderer_poll` (a `glClientWaitSync(0)` scan of the fence list) per
+/// millisecond *only while something is in flight*, and idles completely
+/// otherwise.
+const FENCE_TICK: Duration = Duration::from_millis(1);
+
+/// How long the monitor sleeps when nothing is outstanding, as a backstop in
+/// case an `unpark` is ever missed.
+const FENCE_IDLE: Duration = Duration::from_millis(100);
+
+/// State shared with the fence-monitor thread (ADR-0004 phase 2).
+struct MonitorState {
+    /// Host fences the *device* is still waiting for. Set from the worker
+    /// thread; read by the monitor to decide whether to keep ticking.
+    outstanding: AtomicUsize,
+    stop: AtomicBool,
+    waker: Arc<dyn HostWaker>,
+}
+
+/// The thread that turns "the host GPU finished" into a device notification.
+///
+/// It never touches the library itself — GL is thread-affine, so *polling*
+/// must happen on the worker thread. All it does is wake the worker while
+/// fences are outstanding; the worker then calls `poll_fences`, which is
+/// where `virgl_renderer_poll` actually runs.
+struct FenceMonitor {
+    state: Arc<MonitorState>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl FenceMonitor {
+    fn spawn(waker: Arc<dyn HostWaker>) -> Option<Self> {
+        let state = Arc::new(MonitorState {
+            outstanding: AtomicUsize::new(0),
+            stop: AtomicBool::new(false),
+            waker,
+        });
+        let worker_state = Arc::clone(&state);
+        match std::thread::Builder::new()
+            .name("virgl-fence".into())
+            .spawn(move || monitor_loop(worker_state))
+        {
+            Ok(thread) => Some(Self { state, thread }),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not start the virgl fence monitor; fences stay synchronous"
+                );
+                None
+            }
+        }
+    }
+
+    /// Tells the monitor how many fences the device is waiting for, waking it
+    /// if it was idle.
+    fn set_outstanding(&self, count: usize) {
+        let previous = self.state.outstanding.swap(count, Ordering::Release);
+        if previous == 0 && count > 0 {
+            self.thread.thread().unpark();
+        }
+    }
+}
+
+impl Drop for FenceMonitor {
+    fn drop(&mut self) {
+        self.state.stop.store(true, Ordering::Release);
+        self.thread.thread().unpark();
+        // Not joined: the monitor only sleeps and wakes, and a `VirglRenderer`
+        // is dropped either at VM teardown (where a 1 ms straggler is
+        // irrelevant) or on the worker thread it must not block.
+    }
+}
+
+fn monitor_loop(state: Arc<MonitorState>) {
+    while !state.stop.load(Ordering::Acquire) {
+        if state.outstanding.load(Ordering::Acquire) == 0 {
+            std::thread::park_timeout(FENCE_IDLE);
+            continue;
+        }
+        std::thread::park_timeout(FENCE_TICK);
+        if state.stop.load(Ordering::Acquire) {
+            return;
+        }
+        if state.outstanding.load(Ordering::Acquire) > 0 {
+            state.waker.wake();
+        }
+    }
 }
 
 /// [`Renderer3d`] on libvirglrenderer. See the module docs.
@@ -204,8 +343,20 @@ pub struct VirglRenderer {
     /// Dword staging for submits (virglrenderer reads u32s; the gathered
     /// request buffer is byte-aligned).
     submit_buf: Vec<u32>,
-    /// The init cookie; its address is registered with the library.
-    cookie: Box<u32>,
+    /// The init cookie; its address is registered with the library, which is
+    /// also how `write_fence` finds the retired-fence list.
+    cookie: Box<Cookie>,
+    /// The fence monitor, once a host waker has been installed and the thread
+    /// started. `None` means fences complete synchronously (phase 1).
+    monitor: Option<FenceMonitor>,
+    /// `virgl_renderer_get_poll_fd()` as reported after init: >= 0 means the
+    /// host GL stack has a real fence-completion fd. Recorded for the log and
+    /// for `entangled doctor`; the monitor ticks either way, because polling
+    /// itself has to happen on the worker thread.
+    poll_fd: c_int,
+    /// Host fences created but not yet reported retired — diagnostics, and
+    /// what tells the monitor whether to keep ticking.
+    fences_in_flight: usize,
     /// The callbacks struct. The library stores the *pointer* it was given at
     /// init (QEMU keeps a static for the same reason), so this must live
     /// exactly as long as the initialized library state.
@@ -282,6 +433,9 @@ impl VirglRenderer {
             transfer_write_iov: sym!("virgl_renderer_transfer_write_iov"),
             transfer_read_iov: sym!("virgl_renderer_transfer_read_iov"),
             submit_cmd: sym!("virgl_renderer_submit_cmd"),
+            create_fence: sym!("virgl_renderer_create_fence"),
+            poll: sym!("virgl_renderer_poll"),
+            get_poll_fd: sym!("virgl_renderer_get_poll_fd"),
             _lib: std::mem::ManuallyDrop::new(lib),
         };
 
@@ -317,9 +471,13 @@ impl VirglRenderer {
             contexts: Vec::new(),
             graveyard: Vec::new(),
             submit_buf: Vec::new(),
-            // A recognizable pattern ("virg") should the cookie surface in a
-            // debugger; the library only round-trips the pointer.
-            cookie: Box::new(0x7669_7267),
+            cookie: Box::new(Cookie {
+                _magic: 0x7669_7267,
+                retired: Mutex::new(Vec::new()),
+            }),
+            monitor: None,
+            poll_fd: -1,
+            fences_in_flight: 0,
             callbacks: Box::new(Callbacks {
                 version: 1,
                 write_fence: Some(write_fence),
@@ -339,7 +497,7 @@ impl VirglRenderer {
         match self.state {
             State::Ready => Ok(()),
             State::Loaded => {
-                let cookie = std::ptr::from_mut::<u32>(&mut *self.cookie).cast::<c_void>();
+                let cookie = std::ptr::from_mut::<Cookie>(&mut *self.cookie).cast::<c_void>();
                 let callbacks = std::ptr::from_mut::<Callbacks>(&mut *self.callbacks);
                 // Surfaceless EGL first (headless, WSLg — the probed
                 // configuration); GLES as the fallback for hosts whose EGL
@@ -363,7 +521,16 @@ impl VirglRenderer {
                     )));
                 }
                 self.init_thread = Some(std::thread::current().id());
-                tracing::info!(capsets = self.capsets.len(), "virglrenderer initialized");
+                // SAFETY: no arguments; valid only after a successful init,
+                // which is where we are. -1 means this host's GL stack has no
+                // fence-completion fd (WSLg's d3d12 driver does not).
+                self.poll_fd = unsafe { (self.api.get_poll_fd)() };
+                tracing::info!(
+                    capsets = self.capsets.len(),
+                    poll_fd = self.poll_fd,
+                    async_fences = self.monitor.is_some(),
+                    "virglrenderer initialized"
+                );
                 self.state = State::Ready;
                 Ok(())
             }
@@ -659,21 +826,27 @@ impl Renderer3d for VirglRenderer {
             .get_mut(&resource_id)
             .ok_or(CommandError::UnknownResource(resource_id))?;
         let (width, height) = (state.width, state.height);
-        // Only plausibly-presentable resources get a shadow (a flush of a
-        // 16k×16k texture must not allocate a gigabyte).
+        // Only plausibly-presentable resources are read back (a flush of a
+        // 16k x 16k texture must not allocate a gigabyte).
         if u64::from(width) * u64::from(height) > MAX_RESOURCE_PIXELS {
             return Err(CommandError::OutOfMemory);
         }
-        let stride = width as usize * 4;
-        let frame = stride * height as usize;
-        if state.shadow.len() != frame {
-            state.shadow.clear();
-            state
-                .shadow
-                .try_reserve_exact(frame)
-                .map_err(|_| CommandError::OutOfMemory)?;
-            state.shadow.resize(frame, 0);
-        }
+
+        // Phase 2: read the dirty rect **straight into the caller's packed
+        // buffer** with an explicit row stride, instead of phase 1's
+        // full-frame shadow plus a row-by-row repack. That removes one CPU
+        // copy of every flushed rect and the frame-sized host allocation
+        // (7.9 MiB at 1080p) from the present path — the part of the
+        // zero-copy story a host without dmabuf can still have (ADR-0004
+        // phase 2's scanout amendment).
+        let row_bytes = usize::try_from(u64::from(rect.width) * 4).unwrap_or(usize::MAX);
+        let frame = row_bytes
+            .checked_mul(usize::try_from(rect.height).unwrap_or(usize::MAX))
+            .ok_or(CommandError::OutOfMemory)?;
+        out.clear();
+        out.try_reserve_exact(frame)
+            .map_err(|_| CommandError::OutOfMemory)?;
+        out.resize(frame, 0);
 
         let mut region = VirglBox {
             x: rect.x,
@@ -683,46 +856,84 @@ impl Renderer3d for VirglRenderer {
             h: rect.height,
             d: 1,
         };
-        let offset = u64::from(rect.y) * stride as u64 + u64::from(rect.x) * 4;
         let mut iov = Iovec {
-            iov_base: state.shadow.as_mut_ptr().cast(),
-            iov_len: state.shadow.len(),
+            iov_base: out.as_mut_ptr().cast(),
+            iov_len: out.len(),
         };
-        // SAFETY: the iovec covers the whole `frame`-byte shadow buffer;
-        // `offset` + the rect rows at `stride` stay inside it because `rect`
-        // fits `width`×`height` (validated by the caller). The library
-        // finishes writing before returning.
+        let stride = u32::try_from(row_bytes).map_err(|_| CommandError::OutOfMemory)?;
+        // SAFETY: the iovec covers exactly the `frame` bytes of `out`, which
+        // is what a `rect.height` x `stride` readback writes, and `rect` was
+        // bounds-checked against the resource geometry by the caller
+        // (`Gpu3d::read_rect_bgra`). The library finishes writing before it
+        // returns and keeps no pointer.
         let rc = unsafe {
             (self.api.transfer_read_iov)(
                 resource_id,
                 0, // ctx 0: the resource itself, not a GL context's view
                 0, // level
-                0, // stride 0 = the resource's own row stride (our layout)
+                stride,
                 0, // layer_stride
                 &mut region,
-                offset,
+                0, // offset into the destination
                 &mut iov,
                 1,
             )
         };
         if rc != 0 {
+            out.clear();
             return Err(CommandError::Renderer(format!("read scanout: {rc}")));
         }
-
-        // Pack the rect rows out of the full-frame layout.
-        let row_bytes = rect.width as usize * 4;
-        out.clear();
-        out.try_reserve_exact(row_bytes * rect.height as usize)
-            .map_err(|_| CommandError::OutOfMemory)?;
-        for row in 0..rect.height as usize {
-            let start = (rect.y as usize + row) * stride + rect.x as usize * 4;
-            let src = state
-                .shadow
-                .get(start..start + row_bytes)
-                .ok_or(CommandError::OutOfMemory)?;
-            out.extend_from_slice(src);
-        }
         Ok(())
+    }
+
+    fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
+        // One monitor per renderer; a second install (there is none today)
+        // would replace it.
+        self.monitor = FenceMonitor::spawn(waker);
+    }
+
+    fn create_fence(&mut self, ctx_id: u32, fence_id: u32) -> Result<FenceOutcome, CommandError> {
+        self.ensure_ready()?;
+        // Without a monitor nothing would ever ask us to poll, so a deferred
+        // response could never complete: stay on phase 1's synchronous model.
+        // This is also the WSLg-without-a-waker and the `ENTANGLED_QUEUE_NOTIFY=sync`
+        // case.
+        let Some(monitor) = self.monitor.as_ref() else {
+            return Ok(FenceOutcome::Signalled);
+        };
+        // SAFETY: plain scalars. The fence id is the guest's, truncated to the
+        // library's int; the context was validated live by `Gpu3d`.
+        let rc = unsafe { (self.api.create_fence)(fence_id as c_int, ctx_id) };
+        if rc != 0 {
+            return Err(CommandError::Renderer(format!("create_fence: {rc}")));
+        }
+        self.fences_in_flight = self.fences_in_flight.saturating_add(1);
+        monitor.set_outstanding(self.fences_in_flight);
+        Ok(FenceOutcome::Pending)
+    }
+
+    fn poll_fences(&mut self, still_pending: usize) -> Vec<u32> {
+        if !matches!(self.state, State::Ready) || self.monitor.is_none() {
+            return Vec::new();
+        }
+        // SAFETY: no arguments. Runs `write_fence` for every retired fence,
+        // synchronously on this (the EGL-owning worker) thread — which is the
+        // only thread allowed to touch GL, and the reason polling cannot live
+        // in the monitor thread.
+        unsafe { (self.api.poll)() };
+        let retired = match self.cookie.retired.lock() {
+            Ok(mut list) => std::mem::take(&mut *list),
+            Err(_) => Vec::new(),
+        };
+        // The device is the authority on what is still awaited (its watchdog
+        // may have given up on a fence the library still owes us), so its
+        // count — minus whatever this call just retired — is what the monitor
+        // is told.
+        self.fences_in_flight = still_pending.saturating_sub(retired.len());
+        if let Some(monitor) = self.monitor.as_ref() {
+            monitor.set_outstanding(self.fences_in_flight);
+        }
+        retired
     }
 
     fn reset(&mut self) {
@@ -738,6 +949,16 @@ impl Renderer3d for VirglRenderer {
         }
         self.resources.clear();
         self.contexts.clear();
+        // Fences belong to contexts that are about to stop existing; the
+        // device drops its pending responses in the same reset, so nothing is
+        // waiting for these any more.
+        self.fences_in_flight = 0;
+        if let Ok(mut retired) = self.cookie.retired.lock() {
+            retired.clear();
+        }
+        if let Some(monitor) = self.monitor.as_ref() {
+            monitor.set_outstanding(0);
+        }
         if matches!(self.state, State::Ready) {
             self.state = State::NeedsReset;
         }
@@ -807,7 +1028,14 @@ impl Drop for VirglRenderer {
                     }),
                 );
                 std::mem::forget(callbacks);
-                std::mem::forget(std::mem::replace(&mut self.cookie, Box::new(0)));
+                let cookie = std::mem::replace(
+                    &mut self.cookie,
+                    Box::new(Cookie {
+                        _magic: 0,
+                        retired: Mutex::new(Vec::new()),
+                    }),
+                );
+                std::mem::forget(cookie);
                 // RENDERER_LIVE stays true: re-initializing without cleanup
                 // would leak an EGL display per cycle.
             }

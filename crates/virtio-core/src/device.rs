@@ -99,6 +99,110 @@ impl From<crate::queue::QueueError> for DeviceError {
     }
 }
 
+/// A host-side wakeup a device may hold to ask for service from the
+/// transport's worker context (ADR-0004 phase 2, real fences).
+///
+/// Some devices finish work asynchronously on the host — a GPU renderer
+/// retiring a fence after the command that created it was already answered
+/// pending. The completion must run where every other device call runs (the
+/// queue worker's `notify` path), so the device cannot act on it directly
+/// from the host thread that observed it; instead it calls [`Self::wake`],
+/// and the machine layer arranges for the device's **queue 0** to be
+/// notified from its ordinary worker context, exactly as if the guest had
+/// kicked it (a spurious queue-0 notify is harmless by construction — every
+/// device drains an empty ring as a no-op).
+///
+/// Portable by design: the trait carries no fd. The Linux machine layer
+/// implements it as an eventfd write into the device's queue-notify worker;
+/// a host (or notify mode) with no worker simply never installs a waker, and
+/// [`VirtioDevice::set_host_waker`]'s default keeps such devices on their
+/// synchronous paths.
+pub trait HostWaker: Send + Sync {
+    /// Requests a queue-0 `notify` from the device's worker context. Must be
+    /// cheap, non-blocking and callable from any thread.
+    fn wake(&self);
+}
+
+/// A [`HostWaker`] that can be handed to a device **before** the host
+/// primitive that serves it exists.
+///
+/// The ordering problem it solves: a device is moved into its transport
+/// before the queue-notify worker (which owns the eventfds a wake writes to)
+/// is built around that transport. So the machine layer installs one of these
+/// while it still holds the device, then fills in the real waker once the
+/// worker is up — and a wake that arrives in the gap is remembered and
+/// delivered by [`Self::install`] instead of being lost.
+///
+/// A `DeferredWaker` that is never filled in is inert, which is exactly what
+/// a host with no worker thread needs: the device sees a waker it can hold,
+/// its wakes go nowhere, and every path that depends on one must therefore
+/// keep a synchronous fallback (`Renderer3d::create_fence` returning
+/// `Signalled`).
+#[derive(Default)]
+pub struct DeferredWaker {
+    inner: std::sync::Mutex<Option<std::sync::Arc<dyn HostWaker>>>,
+    /// A wake that arrived before (or without) an installed waker.
+    missed: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for DeferredWaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredWaker")
+            .field(
+                "installed",
+                &self.inner.lock().map(|w| w.is_some()).unwrap_or(false),
+            )
+            .finish()
+    }
+}
+
+impl DeferredWaker {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// Points this waker at the real one. Any wake that happened before now
+    /// is delivered immediately, so a completion can never be dropped just
+    /// because it raced the host wiring.
+    pub fn install(&self, waker: std::sync::Arc<dyn HostWaker>) {
+        let missed = self.missed.swap(false, std::sync::atomic::Ordering::AcqRel);
+        match self.inner.lock() {
+            Ok(mut slot) => *slot = Some(std::sync::Arc::clone(&waker)),
+            Err(_) => {
+                tracing::error!("host waker slot is poisoned; wakeups will be dropped");
+                return;
+            }
+        }
+        if missed {
+            waker.wake();
+        }
+    }
+
+    /// True once a real waker is behind this one — i.e. a `wake` will reach a
+    /// worker thread.
+    pub fn is_live(&self) -> bool {
+        self.inner.lock().map(|w| w.is_some()).unwrap_or(false)
+    }
+}
+
+impl HostWaker for DeferredWaker {
+    fn wake(&self) {
+        // Cloned out from under the lock: `wake` may be called from any
+        // thread, and the real waker's own `wake` must not run with our lock
+        // held (it writes an eventfd, which can block on a full counter).
+        let waker = match self.inner.lock() {
+            Ok(slot) => slot.as_ref().map(std::sync::Arc::clone),
+            Err(_) => None,
+        };
+        match waker {
+            Some(waker) => waker.wake(),
+            None => self
+                .missed
+                .store(true, std::sync::atomic::Ordering::Release),
+        }
+    }
+}
+
 /// Contract between the transport (`virtio-mmio` today, virtio-pci later)
 /// and a device implementation.
 ///
@@ -151,6 +255,16 @@ pub trait VirtioDevice: Send {
     /// Device reset: drop in-flight work, release queue state, return to the
     /// pre-ACKNOWLEDGE state. Must be infallible.
     fn reset(&mut self);
+
+    /// Hands the device a [`HostWaker`] it may use to request service from
+    /// its worker context (see the trait docs). Called at most once, before
+    /// the device is attached to a transport, and only on hosts whose notify
+    /// mode runs a worker. The default ignores it — a device with no
+    /// asynchronous host work needs nothing here, and a device that *would*
+    /// use one must keep a synchronous fallback for when none arrives.
+    fn set_host_waker(&mut self, waker: std::sync::Arc<dyn HostWaker>) {
+        let _ = waker;
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +277,80 @@ mod tests {
         assert_eq!(DeviceType::Block.id(), 2);
         assert_eq!(DeviceType::Gpu.id(), 16);
         assert_eq!(DeviceType::Input.id(), 18);
+    }
+
+    #[derive(Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    impl HostWaker for Counting {
+        fn wake(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl Counting {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    /// The whole point of [`DeferredWaker`]: a wake that happens before the
+    /// host wiring exists is delivered when it appears, not dropped — a lost
+    /// wakeup is a device that never completes what it deferred.
+    #[test]
+    fn a_wake_before_installation_is_delivered_on_installation() {
+        let deferred = DeferredWaker::new();
+        assert!(!deferred.is_live());
+        deferred.wake();
+        deferred.wake(); // Coalesces: one wakeup is enough to make a poll run.
+
+        let real = std::sync::Arc::new(Counting::default());
+        deferred.install(std::sync::Arc::clone(&real) as std::sync::Arc<dyn HostWaker>);
+        assert!(deferred.is_live());
+        assert_eq!(
+            real.count(),
+            1,
+            "the missed wake was delivered exactly once"
+        );
+
+        deferred.wake();
+        assert_eq!(real.count(), 2, "later wakes pass straight through");
+    }
+
+    /// A never-installed waker is inert — which is what a host with no queue
+    /// worker gets, and why every user needs a synchronous fallback.
+    #[test]
+    fn a_never_installed_waker_is_inert_but_safe() {
+        let deferred = DeferredWaker::new();
+        for _ in 0..100 {
+            deferred.wake();
+        }
+        assert!(!deferred.is_live());
+        // Installing later still delivers exactly one wake.
+        let real = std::sync::Arc::new(Counting::default());
+        deferred.install(std::sync::Arc::clone(&real) as std::sync::Arc<dyn HostWaker>);
+        assert_eq!(real.count(), 1);
+    }
+
+    /// Wakes from other threads are the normal case (a renderer's monitor
+    /// thread), so the waker must be `Send + Sync` and usable concurrently.
+    #[test]
+    fn wakes_from_many_threads_all_arrive() {
+        let deferred = DeferredWaker::new();
+        let real = std::sync::Arc::new(Counting::default());
+        deferred.install(std::sync::Arc::clone(&real) as std::sync::Arc<dyn HostWaker>);
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            let waker = std::sync::Arc::clone(&deferred);
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..250 {
+                    waker.wake();
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("waker thread");
+        }
+        assert_eq!(real.count(), 1000);
     }
 }
