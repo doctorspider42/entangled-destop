@@ -59,6 +59,9 @@ pub struct Settings {
     /// (background thread; failures are silent). Default on, and the check is
     /// skipped entirely when this is off.
     pub check_updates_on_startup: bool,
+    /// Ambient motion, hover easing and live status pulses. Turning it off also
+    /// drops the manager from a 25 FPS idle repaint loop to event-driven draws.
+    pub animations_enabled: bool,
     /// Wizard defaults.
     pub default_memory_mib: u64,
     pub default_vcpus: u32,
@@ -74,6 +77,7 @@ impl Default for Settings {
             work_dir: None,
             headless_install: false,
             check_updates_on_startup: true,
+            animations_enabled: true,
             default_memory_mib: 2048,
             default_vcpus: 2,
             default_disk_gib: 16,
@@ -197,6 +201,7 @@ mod tests {
             work_dir: Some(PathBuf::from("/srv")),
             headless_install: true,
             check_updates_on_startup: false,
+            animations_enabled: false,
             default_memory_mib: 3072,
             default_vcpus: 4,
             default_disk_gib: 40,
@@ -262,6 +267,23 @@ mod tests {
             settings.save_to(&path).expect("save");
             let back = Settings::load_from(&path).expect("load");
             assert_eq!(back.check_updates_on_startup, enabled);
+        }
+    }
+
+    #[test]
+    fn the_animation_toggle_round_trips() {
+        let dir = temp_dir("settings-motion-toggle");
+        let path = dir.join("manager.toml");
+        for enabled in [false, true] {
+            let settings = Settings {
+                animations_enabled: enabled,
+                ..Settings::default()
+            };
+            settings.save_to(&path).expect("save");
+            assert_eq!(
+                Settings::load_from(&path).unwrap().animations_enabled,
+                enabled
+            );
         }
     }
 

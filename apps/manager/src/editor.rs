@@ -70,13 +70,52 @@ impl EditForm {
     pub fn from_profile(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let cfg = VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
+        Ok(Self::from_config(path.to_path_buf(), cfg))
+    }
+
+    /// A valid, editable profile that never needs to exist on disk. `--mock`
+    /// uses it to exercise every editor section without touching user data.
+    pub fn mock(name: &str) -> Result<Self, String> {
+        let text = format!(
+            r#"
+name = {name:?}
+memory_mib = 4096
+vcpus = 4
+transport = "pci"
+
+[boot]
+mode = "uefi"
+firmware = "artifacts/firmware/CLOUDHV.fd"
+nvram = "mock-vms/{name}.nvram"
+
+[[disk]]
+path = "mock-vms/{name}.raw"
+writable = true
+
+[network]
+backend = "usernet"
+
+[display]
+width = 1920
+height = 1080
+virgl = true
+"#
+        );
+        let cfg = VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
+        Ok(Self::from_config(
+            PathBuf::from(format!("mock-vms/{name}.toml")),
+            cfg,
+        ))
+    }
+
+    fn from_config(profile_path: PathBuf, cfg: VmConfig) -> Self {
         let text_of = |p: &Option<PathBuf>| {
             p.as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default()
         };
-        Ok(Self {
-            profile_path: path.to_path_buf(),
+        Self {
+            profile_path,
             name: cfg.name.clone(),
             memory_mib: cfg.memory_mib,
             vcpus: cfg.vcpus,
@@ -113,7 +152,7 @@ impl EditForm {
             disks: cfg.disks.clone(),
             add_disk: String::new(),
             base: cfg,
-        })
+        }
     }
 
     /// The form applied to the original config. Every rule `control-api`
@@ -225,6 +264,15 @@ interface = "entangled0"
         assert!(!form.virgl);
         assert_eq!(form.disks.len(), 1);
         assert!(!form.dirty(), "an untouched form is clean");
+    }
+
+    #[test]
+    fn mock_profile_is_valid_without_a_file() {
+        let form = EditForm::mock("preview").expect("mock");
+        assert_eq!(form.name, "preview");
+        assert_eq!(form.boot_mode, BootMode::Uefi);
+        assert!(form.to_config().is_ok());
+        assert!(!form.profile_path.exists());
     }
 
     #[test]

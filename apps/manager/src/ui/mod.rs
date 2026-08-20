@@ -25,9 +25,7 @@ fn accent_button(ui: &mut Ui, text: &str, gradient_at: f32, fg: Color32) -> Resp
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
     let size = galley.size() + Vec2::new(30.0, 15.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    let t = ui
-        .ctx()
-        .animate_bool_with_time(response.id.with("hot"), response.hovered(), 0.14);
+    let t = theme::animate_bool(ui.ctx(), response.id.with("hot"), response.hovered(), 0.14);
     let radius = CornerRadius::same(theme::CONTROL_RADIUS);
     let painter = ui.painter();
     // Glow first, then the body: the accent slides along the cyan→violet ramp
@@ -60,7 +58,8 @@ pub fn ghost_button(ui: &mut Ui, text: &str, enabled: bool, tint: Color32) -> Re
         Sense::hover()
     };
     let (rect, response) = ui.allocate_exact_size(size, sense);
-    let t = ui.ctx().animate_bool_with_time(
+    let t = theme::animate_bool(
+        ui.ctx(),
         response.id.with("hot"),
         enabled && response.hovered(),
         0.14,
@@ -97,9 +96,7 @@ pub fn card<R>(
 ) -> (R, Response) {
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     let hovered = ui.rect_contains_pointer(rect);
-    let t = ui
-        .ctx()
-        .animate_bool_with_time(id.with("hover"), hovered, 0.18);
+    let t = theme::animate_bool(ui.ctx(), id.with("hover"), hovered, 0.18);
 
     let radius = CornerRadius::same(theme::CARD_RADIUS);
     let painter = ui.painter();
@@ -131,14 +128,12 @@ pub fn card<R>(
         theme::VIOLET.gamma_multiply(0.35 + 0.65 * t),
     );
 
-    let inner = ui
-        .scope_builder(
-            UiBuilder::new()
-                .max_rect(rect.shrink(15.0))
-                .layout(Layout::top_down(Align::Min)),
-            |ui| add(ui, t),
-        )
-        .inner;
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .max_rect(rect.shrink(15.0))
+            .layout(Layout::top_down(Align::Min)),
+    );
+    let inner = add(&mut child, t);
     (inner, response)
 }
 

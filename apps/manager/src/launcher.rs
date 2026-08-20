@@ -59,6 +59,36 @@ fn search_path(binary: &str) -> Option<PathBuf> {
 /// The installer variants `entangled install --variant` accepts.
 pub const VARIANTS: [&str; 3] = ["text-netboot", "gtk-netboot", "netinst-iso"];
 
+/// Installation family exposed by the human-facing wizard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestFamily {
+    Debian,
+    Ubuntu,
+}
+
+impl GuestFamily {
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::Debian => "debian",
+            Self::Ubuntu => "ubuntu",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Debian => "Debian",
+            Self::Ubuntu => "Ubuntu",
+        }
+    }
+}
+
+/// Whether the installer receives a fresh sparse disk or an existing image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskMode {
+    CreateNew,
+    UseExisting,
+}
+
 /// Everything the wizard collects (GUI-1602).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewMachine {
@@ -66,6 +96,12 @@ pub struct NewMachine {
     pub memory_mib: u64,
     pub vcpus: u32,
     pub disk_gib: u64,
+    /// Empty means `<name>.raw` inside the manager's VM directory.
+    pub disk_path: String,
+    pub disk_mode: DiskMode,
+    pub family: GuestFamily,
+    /// Optional local Ubuntu installer ISO. Empty uses the verified cache.
+    pub iso_path: String,
     pub variant: String,
     pub automated: bool,
     pub headless: bool,
@@ -73,11 +109,16 @@ pub struct NewMachine {
 
 impl NewMachine {
     pub fn disk_path(&self, vm_dir: &Path) -> PathBuf {
-        vm_dir.join(format!("{}.raw", self.name))
-    }
-
-    pub fn profile_path(&self, vm_dir: &Path) -> PathBuf {
-        vm_dir.join(format!("{}.toml", self.name))
+        let configured = self.disk_path.trim();
+        if configured.is_empty() {
+            return vm_dir.join(format!("{}.raw", self.name));
+        }
+        let path = PathBuf::from(configured);
+        if path.is_absolute() {
+            path
+        } else {
+            vm_dir.join(path)
+        }
     }
 }
 
@@ -93,7 +134,7 @@ impl NewMachine {
 pub fn install_spec(cli: &Path, vm_dir: &Path, cwd: PathBuf, machine: &NewMachine) -> TaskSpec {
     let mut args = vec![
         "install".to_string(),
-        "debian".to_string(),
+        machine.family.cli_name().to_string(),
         "--disk".to_string(),
         machine.disk_path(vm_dir).display().to_string(),
         "--size".to_string(),
@@ -105,6 +146,10 @@ pub fn install_spec(cli: &Path, vm_dir: &Path, cwd: PathBuf, machine: &NewMachin
         "--name".to_string(),
         machine.name.clone(),
     ];
+    if machine.family == GuestFamily::Ubuntu && !machine.iso_path.trim().is_empty() {
+        args.push("--iso".to_string());
+        args.push(machine.iso_path.trim().to_string());
+    }
     if machine.automated {
         args.push("--auto".to_string());
     }
@@ -154,6 +199,10 @@ mod tests {
             memory_mib: 4096,
             vcpus: 4,
             disk_gib: 20,
+            disk_path: String::new(),
+            disk_mode: DiskMode::CreateNew,
+            family: GuestFamily::Debian,
+            iso_path: String::new(),
             variant: "text-netboot".into(),
             automated: true,
             headless: false,
@@ -200,6 +249,28 @@ mod tests {
         assert!(line.contains("--memory-mib 1536"), "{line}");
         assert!(line.contains("--headless"), "{line}");
         assert!(!line.contains("--auto"), "{line}");
+    }
+
+    #[test]
+    fn ubuntu_local_iso_and_existing_disk_reach_the_cli() {
+        let mut m = machine();
+        m.family = GuestFamily::Ubuntu;
+        m.iso_path = "/isos/ubuntu.iso".into();
+        m.disk_mode = DiskMode::UseExisting;
+        m.disk_path = "kept.raw".into();
+        let line = install_spec(
+            Path::new("entangled"),
+            Path::new("/vms"),
+            PathBuf::from("/srv"),
+            &m,
+        )
+        .command_line();
+        assert!(line.contains("install ubuntu"), "{line}");
+        assert!(line.contains("--iso /isos/ubuntu.iso"), "{line}");
+        assert!(
+            line.contains(&Path::new("/vms").join("kept.raw").display().to_string()),
+            "{line}"
+        );
     }
 
     #[test]
