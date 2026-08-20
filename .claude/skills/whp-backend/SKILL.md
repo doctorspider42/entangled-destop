@@ -667,7 +667,7 @@ exactly as WHP created it or the guest's INIT/SIPI never makes it runnable, and
 re-creating it is the only way back to that state after a boot has used it.
 Safe only at a lifecycle checkpoint, where nothing is inside
 `WHvRunVirtualProcessor` for that index, and it runs on the owning thread.
-Measured: **6.7 ms** for a full machine reset, against KVM's 80 ms.
+Measured: **7-8 ms** for a full machine reset, against KVM's 62-66 ms.
 
 **`reboot=k` now works, and this is the host where that matters most.** Phase 4
 recorded that a triple fault is absorbed by WHP with local APIC emulation on and
@@ -688,5 +688,9 @@ so the top of the run loop is already a clean stop point. The KVM loop's
 the partition's halt gate as well as cancelling a run, which is exactly what a
 barrier needs from both states.
 
-Acceptance: `cargo test -p vmm-core --test whp_lifecycle` — pause (97 µs to
-acknowledge), resume, host reset twice, and a guest-initiated reboot.
+Acceptance: `cargo test -p vmm-core --test whp_lifecycle` — pause (95 µs to
+acknowledge), resume, host reset twice, and a guest-initiated reboot. And
+end-to-end, on this host: `cargo test -p entangled --test guest_reboot --
+--ignored` reboots an installed Ubuntu twice through its own firmware in 414 s,
+each one arriving as `0xcf9 cold reset` and coming back through
+`BdsDxe: starting Boot0006 "Ubuntu"`.

@@ -155,6 +155,7 @@ ever be taken at, and a resumed guest finds descriptors it never posted.
 | pflash (UEFI NVRAM) | not touched | **only the CFI command state machine**. The contents are the non-volatile variable store, and a UEFI VM boots the `Boot####` entry that lives in it |
 | virtio-gpu / renderer threads | fence completions wake through the (gated) queue worker; the display reads the host scanout, never guest memory | with the device |
 | user-mode NAT threads | host sockets only; frames sit in a bounded host queue until the gated receive worker moves them | backend kept; the device's rings are reset |
+| the window's input pump | takes a pass with `try_enter` and **drops** what it drained if the gate is closed — parking it would deliver a burst of stale keystrokes on resume, and pushing an event writes the guest's event ring | nothing: the events are gone with the boot |
 
 Two details of the gate are load-bearing rather than decorative.
 
@@ -237,8 +238,9 @@ Debug builds, on the development machine.
 
 | | KVM (WSL Ubuntu) | WHP (native Windows) |
 |---|---|---|
-| pause acknowledged | 180 µs | 97 µs |
-| full in-place reset | 80 ms | 6.7 ms |
+| pause acknowledged | 132 µs | 95 µs |
+| full in-place reset | 62-66 ms | 7-8 ms |
+| an installed Ubuntu rebooting itself, three boots | 467 s | 414 s |
 | repeated guest reboots | 42 in 90 s (`examples/boot-test.toml`), no leaked thread or fd | — |
 
 WHP's reset is an order of magnitude faster because deleting and re-creating a
@@ -274,6 +276,11 @@ reboot is the same five lines with `resets=2`, and a third login prompt follows
 it. A reset that had wiped the variable store would have booted to the EFI
 shell instead, which is why the boot-manager count is the assertion and not the
 login count.
+
+**WHP does the same, in 414 s**, through the same five lines and the same
+`0xcf9 cold reset` — which is the result this ADR is proudest of, because
+ADR-0002 phase 4 had recorded a guest reboot as something that could not reach
+a WHP host at all.
 
 ## What this still needs to become suspend/restore
 

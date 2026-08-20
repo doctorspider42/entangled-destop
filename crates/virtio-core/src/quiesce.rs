@@ -172,6 +172,24 @@ impl Quiesce {
         }
     }
 
+    /// A [`Pass`] if the VM is running, `None` if it is paused. **Never
+    /// blocks.**
+    ///
+    /// For a producer that would rather drop its input than deliver a burst of
+    /// it on resume: the host's input pump, whose events are keystrokes and
+    /// pointer motion from a window nobody is looking at while the VM is
+    /// frozen. Parking that thread would be worse than dropping, and writing
+    /// the guest's event ring is exactly what a pause forbids.
+    #[must_use]
+    pub fn try_enter(&self) -> Option<Pass<'_>> {
+        // Claim first, check second, for the reason `wait_while_paused` does.
+        let pass = self.pass();
+        if self.is_paused() {
+            return None;
+        }
+        Some(pass)
+    }
+
     fn pass(&self) -> Pass<'_> {
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         Pass(self)

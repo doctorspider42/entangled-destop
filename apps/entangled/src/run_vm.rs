@@ -575,6 +575,7 @@ impl LifecycleSupervisor {
         operation: impl FnOnce() -> Result<(), vmm_core::LifecycleError>,
         after: impl FnOnce() -> Option<VmState>,
     ) {
+        let before = Self::read(vm_state);
         Self::advance(vm_state, during);
         match operation() {
             Ok(()) => {
@@ -584,11 +585,22 @@ impl LifecycleSupervisor {
             }
             Err(error) => {
                 tracing::error!(%error, "lifecycle request failed");
-                // A failed reset leaves the VM stopping (the seam refuses to
-                // re-enter a half-reset machine); a failed pause left it
-                // running. Either way the run loop below observes the truth
-                // through the vCPU threads, so nothing is forced here.
+                // Put the state back, or the machine would go on claiming to be
+                // `Paused` while its vCPUs run — a failed pause is not a pause.
+                // A failed *reset* has left the seam in `Stopping` and the VM
+                // about to die; restoring `Running` here is still right, because
+                // `Running -> Stopping` is exactly the transition the shutdown
+                // path below is about to make. Where the way back is not legal,
+                // `advance` refuses and says so rather than inventing one.
+                Self::advance(vm_state, before);
             }
+        }
+    }
+
+    fn read(vm_state: &Mutex<VmState>) -> VmState {
+        match vm_state.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
         }
     }
 
@@ -597,6 +609,9 @@ impl LifecycleSupervisor {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if *guard == to {
+            return;
+        }
         match guard.transition(to) {
             Ok(next) => {
                 *guard = next;
@@ -745,6 +760,7 @@ pub fn run_with(
     })?;
     let bus = started.bus;
     let threads = started.threads;
+    let quiesce = started.quiesce;
 
     // Lifecycle (MVP-1203, ADR-0005): Created -> Running -> Stopping -> Stopped,
     // with Running <-> Paused and Running -> Resetting -> Running in between,
@@ -817,7 +833,7 @@ pub fn run_with(
             let input_queue = host.input_queue();
             let control_queue = host.control_queue();
             let pump_requests = Arc::clone(&requests);
-            let pump_lifecycle = Arc::clone(&lifecycle);
+            let pump_quiesce = Arc::clone(&quiesce);
             let pump = std::thread::spawn(move || {
                 while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
                     // A paused VM must not accumulate a burst of input to
@@ -825,14 +841,20 @@ pub fn run_with(
                     // event ring — which is precisely what a pause forbids
                     // (ADR-0005). The events are dropped rather than queued: the
                     // window is not grabbed while frozen anyway.
-                    if pump_lifecycle.is_paused() {
+                    //
+                    // A pass rather than a flag check, and held across the
+                    // pushes: a pause that landed between the check and the push
+                    // would otherwise be told the machine was quiet while this
+                    // thread was writing to it. Control events are still read —
+                    // they are how the VM gets un-paused.
+                    let Some(pass) = pump_quiesce.try_enter() else {
                         input_queue.drain_batches();
                         for event in control_queue.drain() {
                             note_control_event(event, &pump_requests);
                         }
                         std::thread::sleep(Duration::from_millis(20));
                         continue;
-                    }
+                    };
                     for batch in input_queue.drain_batches() {
                         let split = virtio_input::split_batch(&batch);
                         if let Err(e) = keyboard_sink.push(&split.keyboard) {
@@ -845,6 +867,7 @@ pub fn run_with(
                     for event in control_queue.drain() {
                         note_control_event(event, &pump_requests);
                     }
+                    drop(pass);
                     std::thread::sleep(Duration::from_millis(4));
                 }
             });
@@ -1226,6 +1249,9 @@ mod host {
     pub(super) struct Started {
         pub bus: MachineBus,
         pub threads: Threads,
+        /// The VM's pause gate (ADR-0005), so the host's input pump can decline
+        /// to write the guest's event ring while the VM is frozen.
+        pub quiesce: Arc<virtio_core::Quiesce>,
         /// Where vCPU0 begins executing, for the log line.
         pub entry: u64,
         /// The VM object owns guest RAM and the firmware ROM mappings; it must
@@ -1337,7 +1363,7 @@ mod host {
         lifecycle.attach_machine(Arc::new(VmMachine {
             bus: bus.clone(),
             mem: Arc::clone(&mem),
-            quiesce,
+            quiesce: Arc::clone(&quiesce),
             vcpus: cfg.vcpus,
             plan,
             entry: Mutex::new(entry),
@@ -1348,6 +1374,7 @@ mod host {
         Ok(Started {
             bus,
             threads,
+            quiesce,
             entry: entry.entry,
             _vm: vm,
         })
@@ -1417,6 +1444,8 @@ mod host {
     pub(super) struct Started {
         pub bus: MachineBus,
         pub threads: Threads,
+        /// The VM's pause gate (ADR-0005); see the KVM module's `Started`.
+        pub quiesce: Arc<virtio_core::Quiesce>,
         pub entry: u64,
         /// The partition owns guest RAM and the firmware ROM mappings; it must
         /// outlive the vCPU threads, so the caller holds it until they join.
@@ -1518,7 +1547,7 @@ mod host {
         lifecycle.attach_machine(Arc::new(VmMachine {
             bus: bus.clone(),
             mem: Arc::clone(&mem),
-            quiesce,
+            quiesce: Arc::clone(&quiesce),
             vcpus: cfg.vcpus,
             plan,
             entry: Mutex::new(entry),
@@ -1529,6 +1558,7 @@ mod host {
         Ok(Started {
             bus,
             threads,
+            quiesce,
             entry: entry.entry,
             _vm: vm,
         })
