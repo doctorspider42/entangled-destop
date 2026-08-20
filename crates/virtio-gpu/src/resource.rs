@@ -114,6 +114,15 @@ impl Resource {
         &self.pixels
     }
 
+    /// The attached backing entries, in order.
+    ///
+    /// Only a snapshot needs the list itself (ADR-0006): it is what lets a
+    /// restored resource re-read its pixels out of guest memory instead of
+    /// carrying them in the file.
+    pub fn backing(&self) -> &[MemEntry] {
+        &self.backing
+    }
+
     /// Number of attached backing entries.
     pub fn backing_entries(&self) -> usize {
         self.backing.len()
@@ -426,6 +435,14 @@ impl ResourceTable {
     /// Total pixels held by all live resources.
     pub fn total_pixels(&self) -> u64 {
         self.total_pixels
+    }
+
+    /// Every live resource, in no particular order.
+    ///
+    /// The order does not matter to a snapshot: each record carries its own id,
+    /// and `create` places it back under that id.
+    pub fn iter(&self) -> impl Iterator<Item = &Resource> {
+        self.resources.values()
     }
 
     pub fn get(&self, id: u32) -> Option<&Resource> {

@@ -579,23 +579,40 @@ impl TransportState {
     }
 
     fn activate(&mut self) {
+        if let Err(error) = self.activate_at(&[]) {
+            tracing::error!(
+                transport = self.kind,
+                slot = self.slot,
+                device = ?self.device_type,
+                %error,
+                "device did not activate"
+            );
+            self.needs_reset();
+        }
+    }
+
+    /// Builds the queues and hands them to the device, optionally putting each
+    /// one back at a saved position (ADR-0006).
+    ///
+    /// `positions` is empty on the ordinary bring-up path, where a freshly
+    /// programmed ring starts at zero and the guest's own `avail.idx` is zero
+    /// too. On a restore it carries what the device reported at save time, and
+    /// the positions go in **before** the device sees the queues — a device
+    /// that starts serving on activation must not first serve the chains it had
+    /// already consumed.
+    fn activate_at(&mut self, positions: &[crate::save::QueuePosition]) -> Result<(), String> {
+        use virtio_queue::QueueT as _;
+
         let mut queues = Vec::with_capacity(self.queues.len());
         for (index, config) in self.queues.iter().enumerate() {
-            match config.build(&self.mem) {
-                Ok(queue) => queues.push(queue),
-                Err(error) => {
-                    tracing::error!(
-                        transport = self.kind,
-                        slot = self.slot,
-                        device = ?self.device_type,
-                        queue = index,
-                        %error,
-                        "driver programmed an unusable virtqueue; not activating"
-                    );
-                    self.needs_reset();
-                    return;
-                }
+            let mut queue = config
+                .build(&self.mem)
+                .map_err(|e| format!("queue {index}: {e}"))?;
+            if let Some(position) = positions.get(index) {
+                queue.set_next_avail(position.next_avail);
+                queue.set_next_used(position.next_used);
             }
+            queues.push(queue);
         }
         let resources = DeviceResources {
             mem: Arc::clone(&self.mem),
@@ -603,28 +620,17 @@ impl TransportState {
             interrupt: Arc::clone(&self.interrupt).as_interrupt(),
             quiesce: Arc::clone(&self.quiesce),
         };
-        match self.device.activate(resources) {
-            Ok(()) => {
-                self.activated = true;
-                tracing::info!(
-                    transport = self.kind,
-                    slot = self.slot,
-                    device = ?self.device_type,
-                    queues = self.queues.len(),
-                    "virtio device activated"
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    transport = self.kind,
-                    slot = self.slot,
-                    device = ?self.device_type,
-                    %error,
-                    "device refused activation"
-                );
-                self.needs_reset();
-            }
-        }
+        self.device.activate(resources).map_err(|e| e.to_string())?;
+        self.activated = true;
+        tracing::info!(
+            transport = self.kind,
+            slot = self.slot,
+            device = ?self.device_type,
+            queues = self.queues.len(),
+            restored = !positions.is_empty(),
+            "virtio device activated"
+        );
+        Ok(())
     }
 
     /// Full device reset (MVP-303): everything returns to the state a freshly
@@ -659,6 +665,128 @@ impl TransportState {
     pub fn power_on_reset(&mut self) {
         self.reset();
         self.interrupt.power_on_reset();
+    }
+
+    // --------------------------------------------------- suspend and restore
+
+    /// Everything this slot is, for a snapshot (ADR-0006).
+    ///
+    /// Called with the VM paused, so nothing is mid-request and the queue
+    /// positions the device reports are stable. What comes out is exactly what
+    /// `power_on_reset` would have thrown away, plus the two things it
+    /// deliberately keeps (`config_generation` and the MSI-X table) — a
+    /// restore has to put those back too, because the guest never saw them go.
+    ///
+    /// What is **not** in here: `notify_offloaded` and the pause gate. Both are
+    /// host wiring, rebuilt around the restored transport by whoever attaches
+    /// it, exactly as a reset rebuilds them.
+    pub fn save(&self) -> crate::save::TransportSaveState {
+        let positions = self.device.queue_positions();
+        crate::save::TransportSaveState {
+            device_type: self.device_type.id(),
+            device_features: self.device_features,
+            device_features_sel: self.device_features_sel,
+            driver_features: self.driver_features,
+            driver_features_sel: self.driver_features_sel,
+            queue_sel: self.queue_sel,
+            status: self.status,
+            activated: self.activated,
+            queues: self
+                .queues
+                .iter()
+                .enumerate()
+                .map(|(index, config)| {
+                    config.to_state(positions.get(index).copied().unwrap_or_default())
+                })
+                .collect(),
+            interrupt: self.interrupt.save_interrupt(),
+            device: self.device.save_device(),
+        }
+    }
+
+    /// Puts a saved slot back.
+    ///
+    /// The order is the order the guest did it in, because that is the only
+    /// order the device is written to accept:
+    ///
+    /// 1. **Refuse a slot that is not this one.** A different device type or a
+    ///    different offered feature set means the guest negotiated against a
+    ///    machine this build did not rebuild, and everything after this point
+    ///    would be a plausible-looking lie.
+    /// 2. **Features before status.** `ack_features` is how the device learns
+    ///    what it may do; a device activated before it knew would serve the
+    ///    wrong ring layout.
+    /// 3. **Queues, then activation.** The geometry goes back into the
+    ///    `QueueConfig`s and is validated by the same `build` the guest's own
+    ///    `DRIVER_OK` goes through — a snapshot with an out-of-bounds ring is
+    ///    refused here, not trusted because it came from a file.
+    /// 4. **The interrupt last**, so a pending bit restored into the ISR is not
+    ///    cleared by the activation above it.
+    pub fn load(
+        &mut self,
+        state: &crate::save::TransportSaveState,
+    ) -> Result<(), crate::save::StateError> {
+        use crate::save::StateError;
+
+        if state.device_type != self.device_type.id() {
+            return Err(StateError::DeviceType {
+                snapshot: state.device_type,
+                current: self.device_type.id(),
+            });
+        }
+        if state.device_features != self.device_features {
+            return Err(StateError::DeviceFeatures {
+                snapshot: state.device_features,
+                current: self.device_features,
+            });
+        }
+        if state.queues.len() != self.queues.len() {
+            return Err(StateError::QueueCount {
+                snapshot: state.queues.len(),
+                current: self.queues.len(),
+            });
+        }
+
+        self.device_features_sel = state.device_features_sel;
+        self.driver_features = state.driver_features;
+        self.driver_features_sel = state.driver_features_sel;
+        self.queue_sel = state.queue_sel;
+        self.status = state.status;
+        self.activated = false;
+
+        for (config, saved) in self.queues.iter_mut().zip(&state.queues) {
+            config.load_state(saved);
+        }
+
+        if state.status & status::FEATURES_OK != 0 {
+            let negotiated = self.driver_features & self.device_features;
+            if !self.device.ack_features(negotiated) {
+                return Err(StateError::Device(format!(
+                    "the device now vetoes the feature set {negotiated:#x} the guest negotiated"
+                )));
+            }
+        }
+
+        if state.activated {
+            let positions: Vec<crate::save::QueuePosition> =
+                state.queues.iter().map(|q| q.position).collect();
+            self.activate_at(&positions).map_err(StateError::Activate)?;
+        }
+
+        self.device
+            .load_device(&state.device)
+            .map_err(|e| StateError::Device(e.to_string()))?;
+
+        self.interrupt.load_interrupt(&state.interrupt)?;
+        tracing::info!(
+            transport = self.kind,
+            slot = self.slot,
+            device = ?self.device_type,
+            status = format_args!("{:#x}", self.status),
+            activated = self.activated,
+            "virtio slot restored from a snapshot"
+        );
+        Ok(())
     }
 
     /// Tells the driver the device is broken and must be reset. The config

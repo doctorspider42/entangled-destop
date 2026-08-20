@@ -9,7 +9,7 @@ use kvm_bindings::{
 use kvm_ioctls::{Cap, VmFd};
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, MmapRegion};
 
-use crate::hv::MachineConfig;
+use crate::hv::{GuestClock, HvError, MachineConfig, VmClockState};
 use crate::memory::{create_guest_memory, GuestMem};
 use crate::{Hypervisor, Vcpu, VmmError};
 
@@ -172,6 +172,57 @@ impl Vm {
     /// thread; KVM requires vCPU ioctls to come from that thread).
     pub fn take_vcpus(&mut self) -> Vec<Vcpu> {
         std::mem::take(&mut self.vcpus)
+    }
+
+    /// A handle on this VM's paravirtual clock (ADR-0006).
+    ///
+    /// Handed out as a neutral `GuestClock` rather than as the VM fd, so the
+    /// machine layer can hold it without holding a `kvm_ioctls` type
+    /// (ADR-0002). Shared, because it outlives every borrow of the `Vm`: a
+    /// suspend reads it long after assembly is done.
+    pub fn clock(&self) -> Arc<dyn GuestClock> {
+        Arc::new(KvmGuestClock {
+            fd: Arc::clone(&self.fd),
+        })
+    }
+}
+
+/// `KVM_GET_CLOCK`/`KVM_SET_CLOCK` behind the neutral trait.
+///
+/// Whether the guest *uses* the paravirtual clock is its own business; the VM
+/// has one either way, and putting it back is what keeps a restored guest from
+/// seeing time jump by however long the snapshot sat on disk.
+struct KvmGuestClock {
+    fd: Arc<VmFd>,
+}
+
+impl GuestClock for KvmGuestClock {
+    fn save_clock(&self) -> Result<VmClockState, HvError> {
+        let clock = self
+            .fd
+            .get_clock()
+            .map_err(|e| HvError::Registers(format!("KVM_GET_CLOCK failed: {e}")))?;
+        Ok(VmClockState {
+            clock_ns: clock.clock,
+            flags: clock.flags,
+            realtime_ns: clock.realtime,
+            host_tsc: clock.host_tsc,
+        })
+    }
+
+    fn load_clock(&self, state: &VmClockState) -> Result<(), HvError> {
+        // Only the clock value goes back. `KVM_CLOCK_REALTIME`/`_HOST_TSC` are
+        // *output* flags describing what the read reported, and handing them to
+        // `KVM_SET_CLOCK` would ask the kernel to interpret host readings from
+        // another moment (on another machine, in the general case) as if they
+        // were current.
+        let clock = kvm_bindings::kvm_clock_data {
+            clock: state.clock_ns,
+            ..Default::default()
+        };
+        self.fd
+            .set_clock(&clock)
+            .map_err(|e| HvError::Registers(format!("KVM_SET_CLOCK failed: {e}")))
     }
 }
 

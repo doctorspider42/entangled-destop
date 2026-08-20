@@ -215,6 +215,122 @@ impl MachineBus {
         }
     }
 
+    /// Everything on this bus, for a snapshot (ADR-0006).
+    ///
+    /// The mirror image of [`Self::reset_devices`], device for device. Called
+    /// with every vCPU parked and the host workers quiesced, so it may take any
+    /// lock and what it reads is a single consistent instant.
+    ///
+    /// What is deliberately **not** in it is the same list `reset_devices`
+    /// deliberately does not touch: the pflash contents (the NVRAM file is the
+    /// store), the serial console's output sink and interrupt line, the IOAPIC
+    /// id, and the host-side diagnostic counters. All of them are the host's,
+    /// rebuilt by whoever assembles the machine the snapshot is loaded into.
+    pub fn save_state(&self) -> crate::state::MachineState {
+        let mut virtio = self.virtio.save_state();
+        let mut pci_root = None;
+        if let Some(pci) = &self.pci {
+            virtio = pci.save_state();
+            pci_root = pci.save_config();
+        }
+        crate::state::MachineState {
+            serial: match self.serial.lock() {
+                Ok(serial) => serial.save_state(),
+                Err(_) => {
+                    tracing::error!("serial lock is poisoned; saving a power-on UART");
+                    crate::state::SavedSerial::default()
+                }
+            },
+            acpi_pm: self.acpi_pm.save_state(),
+            reset: self.reset.save_state(),
+            platform: self
+                .platform
+                .as_ref()
+                .map(|platform| match platform.lock() {
+                    Ok(platform) => platform.save_state(),
+                    Err(_) => {
+                        tracing::error!("platform lock is poisoned; saving a power-on RTC");
+                        crate::state::SavedPlatform::default()
+                    }
+                }),
+            pflash: self.pflash.as_ref().map(|pflash| match pflash.lock() {
+                Ok(pflash) => pflash.save_state(),
+                Err(_) => {
+                    tracing::error!("pflash lock is poisoned; saving a read-array flash");
+                    crate::state::SavedPflash::default()
+                }
+            }),
+            pci_root,
+            irqchip: self.irqchip.as_ref().map(|chip| chip.save_state()),
+            virtio,
+        }
+    }
+
+    /// Puts it all back.
+    ///
+    /// The order is the reverse of the reset order, and for the mirror-image
+    /// reason. A reset masks the interrupt sources **first**, so nothing can
+    /// deliver into a CPU with no IDT; a restore programs them **last**, so
+    /// nothing can deliver while the devices behind them are still half the
+    /// power-on machine. In between, the devices go back in bus order, and the
+    /// virtio transports go last of those because restoring one re-activates
+    /// it — which means it may start serving its queues immediately.
+    ///
+    /// A machine whose *shape* differs from the snapshot's is refused rather
+    /// than partially loaded: a missing pflash, a different number of virtio
+    /// slots, a PCI bus that is not there. The caller has already compared the
+    /// configuration fingerprints, so reaching one of these is a bug in this
+    /// build rather than a user error — but the check is cheap and the failure
+    /// it prevents is a silently wrong guest.
+    pub fn load_state(
+        &self,
+        state: &crate::state::MachineState,
+    ) -> Result<(), crate::state::StateError> {
+        use crate::state::require_same_presence;
+
+        require_same_presence(
+            "firmware platform",
+            state.platform.as_ref(),
+            self.platform.is_some(),
+        )?;
+        require_same_presence("pflash", state.pflash.as_ref(), self.pflash.is_some())?;
+        require_same_presence("PCI bus", state.pci_root.as_ref(), self.pci.is_some())?;
+        require_same_presence(
+            "userspace interrupt chip",
+            state.irqchip.as_ref(),
+            self.irqchip.is_some(),
+        )?;
+
+        match self.serial.lock() {
+            Ok(mut serial) => serial.load_state(&state.serial),
+            Err(_) => return Err(crate::state::StateError::Poisoned("the 16550")),
+        }
+        if let (Some(platform), Some(saved)) = (&self.platform, &state.platform) {
+            match platform.lock() {
+                Ok(mut platform) => platform.load_state(saved)?,
+                Err(_) => return Err(crate::state::StateError::Poisoned("the firmware platform")),
+            }
+        }
+        if let (Some(pflash), Some(saved)) = (&self.pflash, &state.pflash) {
+            match pflash.lock() {
+                Ok(mut pflash) => pflash.load_state(saved)?,
+                Err(_) => return Err(crate::state::StateError::Poisoned("the pflash device")),
+            }
+        }
+        self.acpi_pm.load_state(&state.acpi_pm);
+        self.reset.load_state(&state.reset);
+
+        match (&self.pci, &state.pci_root) {
+            (Some(pci), Some(config)) => pci.load_state(config, &state.virtio)?,
+            _ => self.virtio.load_state(&state.virtio)?,
+        }
+
+        if let (Some(chip), Some(saved)) = (&self.irqchip, &state.irqchip) {
+            chip.load_state(saved)?;
+        }
+        Ok(())
+    }
+
     /// Every device on this bus back to its power-on state (ADR-0005).
     ///
     /// Called with every vCPU parked and the host workers quiesced, so it may

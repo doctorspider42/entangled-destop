@@ -172,6 +172,36 @@ impl UserspaceIrqChip {
         }
     }
 
+    /// All three chips, for a snapshot (ADR-0006).
+    pub fn save_state(&self) -> crate::state::SavedIrqChip {
+        crate::state::SavedIrqChip {
+            pic: match self.pic.lock() {
+                Ok(pic) => pic.save_state(),
+                Err(_) => {
+                    tracing::error!("8259 lock is poisoned; saving a power-on PIC");
+                    crate::state::SavedPic::default()
+                }
+            },
+            pit: self.pit.save_state(),
+            ioapic: self.ioapic.save_state(),
+        }
+    }
+
+    /// Puts them back, in the order a reset uses for the same reason: the
+    /// IOAPIC first, so nothing the PIT or the PIC restores can deliver into a
+    /// table that is still half the previous machine's.
+    pub fn load_state(
+        &self,
+        state: &crate::state::SavedIrqChip,
+    ) -> Result<(), crate::state::StateError> {
+        self.ioapic.load_state(&state.ioapic)?;
+        self.pit.load_state(&state.pit)?;
+        match self.pic.lock() {
+            Ok(mut pic) => pic.load_state(&state.pic),
+            Err(_) => Err(crate::state::StateError::Poisoned("the 8259 pair")),
+        }
+    }
+
     /// Stops or restarts interrupt delivery from the machine's own timer while
     /// the VM is paused (ADR-0005). Devices need no equivalent: nothing else
     /// here raises a line on its own.

@@ -13,6 +13,18 @@ pub enum VmState {
     /// Reachable only from `Running`, and only back to `Running` (resume, or a
     /// reset — which always ends running) or on to `Stopping`.
     Paused,
+    /// A suspend is in flight: the vCPUs are parked, their state has been read
+    /// and the machine is being written to a file (ADR-0006).
+    ///
+    /// A state of its own rather than a flavour of `Paused`, because it is the
+    /// one long-running lifecycle operation — a desktop-sized guest takes
+    /// seconds — and a GUI that cannot tell "frozen" from "being written to
+    /// disk" would show a Resume button that must not be pressed.
+    Suspending,
+    /// The snapshot is on disk and the vCPUs are still parked. The VM is about
+    /// to be torn down; it is never resumed from here in the same process,
+    /// because a suspended VM's whole point is that the *file* is the VM now.
+    Suspended,
     /// A reset is in flight: the vCPUs are parked, devices are going back to
     /// their power-on state and the boot images are being reloaded. Ends in
     /// `Running` when the machine restarted, `Crashed` when it could not
@@ -44,7 +56,13 @@ impl VmState {
     /// ```text
     ///   Running <-> Paused          pause / resume
     ///   Running  -> Resetting -> Running   reset (also from Paused)
+    ///   Paused   -> Suspending -> Suspended -> Stopping   save (ADR-0006)
     /// ```
+    ///
+    /// The suspend arm is one-way on purpose. A snapshot is taken *because* the
+    /// VM is about to stop existing in this process; letting `Suspended` go
+    /// back to `Running` would leave two live copies of the same machine — the
+    /// file and the process — both convinced they own the same disks.
     ///
     /// A paused or resetting VM can still be stopped: neither is a state a
     /// shutdown has to wait out.
@@ -59,6 +77,11 @@ impl VmState {
                 | (Running, Paused)
                 | (Paused, Running)
                 | (Paused, Stopping)
+                | (Running, Suspending)
+                | (Paused, Suspending)
+                | (Suspending, Suspended)
+                | (Suspending, Paused)
+                | (Suspended, Stopping)
                 | (Running, Resetting)
                 | (Paused, Resetting)
                 | (Resetting, Running)
@@ -98,7 +121,7 @@ mod tests {
     #[test]
     fn any_state_can_crash() {
         for s in [
-            Created, Running, Paused, Resetting, Stopping, Stopped, Crashed,
+            Created, Running, Paused, Suspending, Suspended, Resetting, Stopping, Stopped, Crashed,
         ] {
             assert!(s.transition(Crashed).is_ok());
         }
@@ -124,6 +147,30 @@ mod tests {
         let s = s.transition(Running).unwrap();
         assert_eq!(s, Running);
         assert!(Paused.transition(Stopping).is_ok());
+    }
+
+    /// Suspend is a one-way arm: a VM whose state is on disk is torn down, not
+    /// resumed in place — two live copies of one machine would both believe
+    /// they own its disks. A *failed* suspend goes back to `Paused`, which is
+    /// where the seam actually leaves it.
+    #[test]
+    fn suspend_is_one_way_and_ends_in_stopping() {
+        let s = Running.transition(Suspending).unwrap();
+        assert!(Paused.transition(Suspending).is_ok());
+        assert!(s.transition(Paused).is_ok(), "a failed suspend holds");
+        let s = s.transition(Suspended).unwrap();
+        assert!(!s.is_terminal());
+        assert!(
+            s.transition(Running).is_err(),
+            "a suspended VM does not resume"
+        );
+        assert!(s.transition(Paused).is_err());
+        assert!(s.transition(Resetting).is_err());
+        let s = s.transition(Stopping).unwrap();
+        assert_eq!(s.transition(Stopped).unwrap(), Stopped);
+        // And a VM that never ran cannot be suspended.
+        assert!(Created.transition(Suspending).is_err());
+        assert!(Stopped.transition(Suspending).is_err());
     }
 
     /// A reset is a state of its own, entered from either running state and

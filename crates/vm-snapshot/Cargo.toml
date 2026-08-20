@@ -1,0 +1,28 @@
+[package]
+name = "vm-snapshot"
+description = "Versioned VM snapshot container: CPU, device and guest-memory state on disk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+# The state this crate encodes lives with the things that own it: the neutral
+# CPU state in vmm-core, the transport state in virtio-core, the machine's
+# device state in machine-x86. Nothing below depends on this crate, so the
+# codec never becomes a dependency of the hypervisor seam.
+vmm-core.workspace = true
+virtio-core.workspace = true
+machine-x86.workspace = true
+control-api.workspace = true
+# The hole-aware file helpers (sparse marking, allocated size) the memory dump
+# reuses rather than reimplementing.
+disk-image.workspace = true
+vm-memory.workspace = true
+
+[lints]
+workspace = true

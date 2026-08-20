@@ -264,6 +264,47 @@ pub trait VirtioDevice: Send {
     /// pre-ACKNOWLEDGE state. Must be infallible.
     fn reset(&mut self);
 
+    /// Where this device has got to in each of its queues, in queue order
+    /// (ADR-0006).
+    ///
+    /// Read while the VM is paused, so the answer is stable. The default is
+    /// empty, which a transport reads as "this device keeps no position" and
+    /// which is correct for a device that is not activated.
+    ///
+    /// A device that holds queues **must** implement this. The positions cannot
+    /// be recomputed from guest memory for a device that holds a descriptor
+    /// chain across a host fence, and a restored guest whose device forgot its
+    /// position hands the same buffers out twice.
+    fn queue_positions(&self) -> Vec<crate::save::QueuePosition> {
+        Vec::new()
+    }
+
+    /// Whatever this device owns beyond its queues, in its own encoding.
+    ///
+    /// Empty for a device whose entire state is its queues and its config
+    /// space — virtio-blk once quiesced, virtio-input. Not empty for
+    /// virtio-gpu, whose host resources have to be rebuilt.
+    fn save_device(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Puts [`Self::save_device`]'s bytes back, after the transport has
+    /// re-activated the device.
+    ///
+    /// Must treat the bytes as untrusted: they come out of a file. A device
+    /// that cannot make sense of them returns an error, and the restore is
+    /// refused rather than half-applied.
+    fn load_device(&mut self, bytes: &[u8]) -> Result<(), DeviceError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        Err(DeviceError::Backend(format!(
+            "{:?} has no saved state, but the snapshot carries {} bytes for it",
+            self.device_type(),
+            bytes.len()
+        )))
+    }
+
     /// Hands the device a [`HostWaker`] it may use to request service from
     /// its worker context (see the trait docs). Called at most once, before
     /// the device is attached to a transport, and only on hosts whose notify

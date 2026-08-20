@@ -13,6 +13,7 @@ exclude = [
 ]
 members = [
     "crates/vmm-core",
+    "crates/vm-snapshot",
     "crates/machine-x86",
     "crates/linux-boot",
     "crates/uefi-boot",
@@ -44,6 +45,7 @@ publish = false
 [workspace.dependencies]
 # internal crates (version present so `cargo deny` wildcard ban is satisfied)
 vmm-core = { path = "crates/vmm-core", version = "0.2.0" }
+vm-snapshot = { path = "crates/vm-snapshot", version = "0.2.0" }
 machine-x86 = { path = "crates/machine-x86", version = "0.2.0" }
 linux-boot = { path = "crates/linux-boot", version = "0.2.0" }
 uefi-boot = { path = "crates/uefi-boot", version = "0.2.0" }

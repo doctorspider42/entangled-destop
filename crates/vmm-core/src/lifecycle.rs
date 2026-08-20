@@ -50,11 +50,12 @@
 //! ([`Lifecycle::request_guest_reset`]) and *driven* by the supervisor, which
 //! is the same thread that drives a reset asked for from the window.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::hv::{HvError, VcpuRegisters};
+use crate::hv::{HvError, VcpuRegisters, X86CpuState};
 
 /// How long a lifecycle operation waits for the vCPUs to acknowledge before it
 /// gives up and puts the VM back the way it found it.
@@ -104,6 +105,9 @@ pub enum LifecycleError {
 
     #[error("machine reset failed: {0}")]
     Reset(String),
+
+    #[error("reading the vCPU state failed: {0}")]
+    Save(String),
 
     #[error("the VM is stopping")]
     Stopping,
@@ -162,6 +166,34 @@ pub trait ResettableVcpu: VcpuRegisters {
     /// or an enabled APIC timer from the previous boot cannot survive into the
     /// next one.
     fn reset_arch_state(&mut self, is_boot_cpu: bool) -> Result<(), HvError>;
+
+    /// Everything this vCPU is, for a snapshot (ADR-0006).
+    ///
+    /// Called from [`Lifecycle::capture_cpus`] while the vCPU is parked, on its
+    /// own thread — which is where it has to happen: the `Vcpu` was *moved into*
+    /// that thread when the VM started, so no other thread has a handle to it,
+    /// and KVM wants its vCPU ioctls from the owning thread anyway.
+    ///
+    /// Defaults to a refusal so a backend that cannot snapshot yet keeps
+    /// compiling, and so the small test doubles in this module do not have to
+    /// pretend they are CPUs (ADR-0002: additive, never a changed signature).
+    fn save_cpu_state(&self) -> Result<X86CpuState, HvError> {
+        Err(HvError::Registers(
+            "this hypervisor backend cannot snapshot a vCPU".into(),
+        ))
+    }
+
+    /// Puts a snapshotted state back.
+    ///
+    /// Called at *restore*, before the vCPU thread exists, so it is the one
+    /// half of the pair that does not go through the lifecycle. The order
+    /// inside an implementation matters and is documented there.
+    fn load_cpu_state(&mut self, state: &X86CpuState) -> Result<(), HvError> {
+        let _ = state;
+        Err(HvError::Registers(
+            "this hypervisor backend cannot restore a vCPU".into(),
+        ))
+    }
 }
 
 /// What the machine above the hypervisor contributes to a pause or a reset.
@@ -186,6 +218,22 @@ pub trait MachineLifecycle: Send + Sync {
     /// previous boot. Called on that vCPU's own thread, after
     /// [`ResettableVcpu::reset_arch_state`].
     fn reset_vcpu(&self, index: u32, vcpu: &dyn VcpuRegisters) -> Result<(), String>;
+
+    /// Write the whole machine — guest memory, every device, and the `cpus`
+    /// the lifecycle has already collected — to `path` (ADR-0006).
+    ///
+    /// Called with every vCPU parked and the host workers quiesced, on the
+    /// requesting thread, exactly like [`Self::reset_machine`]. Returns a
+    /// one-line summary for the log and the control channel; the snapshot
+    /// *format* is deliberately not this crate's business, which is why this is
+    /// a string and not a report type.
+    ///
+    /// The default refuses, so a machine that has no snapshot support — a test
+    /// harness, an embedder — is not forced to grow one.
+    fn save_machine(&self, cpus: &[X86CpuState], path: &Path) -> Result<String, String> {
+        let _ = (cpus, path);
+        Err("this machine cannot be suspended".into())
+    }
 }
 
 /// Internal phase of the rendezvous. `RunState` is the public projection.
@@ -197,6 +245,10 @@ enum Phase {
     ParkReset,
     ResetMachine,
     ResetVcpus,
+    /// Every vCPU is parked and each is reading its own architectural state
+    /// into the shared slots (ADR-0006). Reached only from `HeldPause` and
+    /// returning to it, so a capture cannot be confused with a resume.
+    SaveVcpus,
     Stop,
 }
 
@@ -205,7 +257,7 @@ impl Phase {
         match self {
             Phase::Run => RunState::Running,
             Phase::ParkPause => RunState::Pausing,
-            Phase::HeldPause => RunState::Paused,
+            Phase::HeldPause | Phase::SaveVcpus => RunState::Paused,
             Phase::ParkReset | Phase::ResetMachine | Phase::ResetVcpus => RunState::Resetting,
             Phase::Stop => RunState::Stopping,
         }
@@ -215,7 +267,11 @@ impl Phase {
     fn parks_vcpus(self) -> bool {
         matches!(
             self,
-            Phase::ParkPause | Phase::HeldPause | Phase::ParkReset | Phase::ResetMachine
+            Phase::ParkPause
+                | Phase::HeldPause
+                | Phase::ParkReset
+                | Phase::ResetMachine
+                | Phase::SaveVcpus
         )
     }
 }
@@ -227,6 +283,13 @@ struct Inner {
     arrived: Vec<bool>,
     /// One slot per vCPU: has it finished its own half of the current reset?
     reset_done: Vec<bool>,
+    /// One slot per vCPU: the architectural state it read at the last
+    /// [`Lifecycle::capture_cpus`], or `None` if it has not reported yet
+    /// (ADR-0006). Reused for the save barrier the way `reset_done` is for the
+    /// reset one.
+    saved: Vec<Option<X86CpuState>>,
+    /// The first error any vCPU hit while reading its own state.
+    save_error: Option<String>,
     /// One slot per vCPU: has its run loop ended for good? A finished vCPU can
     /// never park again, so it is excluded from every barrier — otherwise a
     /// guest that halted one CPU would make pause time out.
@@ -259,6 +322,14 @@ impl Inner {
 
     fn reset_count(&self) -> u32 {
         self.count(&self.reset_done)
+    }
+
+    fn saved_count(&self) -> u32 {
+        self.saved
+            .iter()
+            .zip(&self.finished)
+            .filter(|(slot, &done)| slot.is_some() || done)
+            .count() as u32
     }
 
     fn clear_barrier(&mut self) {
@@ -304,6 +375,8 @@ impl Lifecycle {
                 phase: Phase::Run,
                 arrived: vec![false; n],
                 reset_done: vec![false; n],
+                saved: (0..n).map(|_| None).collect(),
+                save_error: None,
                 finished: vec![false; n],
                 reset_error: None,
                 guest_reset: false,
@@ -422,6 +495,65 @@ impl Lifecycle {
         Ok(())
     }
 
+    /// Reads every vCPU's full architectural state, with the VM held paused
+    /// (ADR-0006).
+    ///
+    /// The VM **must already be paused**: this is the second barrier of a
+    /// suspend, not a way to peek at a running guest. The vCPUs are parked and
+    /// the host workers quiesced, so what comes back is one consistent picture
+    /// of the machine rather than a set of readings taken at different
+    /// instants.
+    ///
+    /// The capture runs on each vCPU's own thread, for the same reason the
+    /// per-vCPU half of a reset does: the `Vcpu` was moved into that thread
+    /// when the VM started and no other thread has a handle to it.
+    ///
+    /// The VM is still paused when this returns, whether it succeeded or not —
+    /// the caller decides whether to write a file, resume, or stop.
+    pub fn capture_cpus(&self) -> Result<Vec<X86CpuState>, LifecycleError> {
+        {
+            let mut inner = self.lock();
+            match inner.phase {
+                Phase::HeldPause => {}
+                Phase::Stop => return Err(LifecycleError::Stopping),
+                other => {
+                    return Err(LifecycleError::WrongState {
+                        what: "capture the vCPU state",
+                        state: other.state(),
+                    })
+                }
+            }
+            inner.save_error = None;
+            for slot in &mut inner.saved {
+                *slot = None;
+            }
+            inner.phase = Phase::SaveVcpus;
+            self.attention.store(true, Ordering::Release);
+        }
+        self.changed.notify_all();
+        let waited = self.await_barrier("report their state", Inner::saved_count);
+        // Back to a plain hold either way: a failed capture must not leave the
+        // VM in a phase nothing else understands.
+        {
+            let mut inner = self.lock();
+            if inner.phase == Phase::SaveVcpus {
+                inner.phase = Phase::HeldPause;
+            }
+        }
+        self.changed.notify_all();
+        waited?;
+
+        let mut inner = self.lock();
+        if let Some(error) = inner.save_error.take() {
+            return Err(LifecycleError::Save(error));
+        }
+        let mut states: Vec<X86CpuState> =
+            inner.saved.iter_mut().filter_map(Option::take).collect();
+        drop(inner);
+        states.sort_by_key(|state| state.index);
+        Ok(states)
+    }
+
     /// Resets the VM in place: every vCPU parks, the machine returns to its
     /// power-on state, the boot images go back into guest memory, every vCPU is
     /// put back at the first instruction — and the VM runs again.
@@ -502,6 +634,33 @@ impl Lifecycle {
         let count = self.resets.fetch_add(1, Ordering::AcqRel) + 1;
         tracing::info!(resets = count, "VM reset complete; guest restarted");
         Ok(())
+    }
+
+    /// Suspends the VM to `path`: pause, capture every vCPU, and hand the
+    /// machine the collected state to write (ADR-0006).
+    ///
+    /// The VM is left **paused** on success — a suspended VM is a frozen one
+    /// whose state also happens to be on disk, and what happens next (stop the
+    /// process, resume it anyway) is the caller's decision, not this seam's.
+    /// On failure it is left paused too, for the same reason a failed reset
+    /// does not resume: whatever went wrong, running on is the one option that
+    /// cannot be reasoned about.
+    pub fn save(&self, path: &Path) -> Result<String, LifecycleError> {
+        let machine = self.machine().ok_or(LifecycleError::NoMachine)?;
+        self.pause()?;
+        let cpus = self.capture_cpus()?;
+        if cpus.len() as u32 != self.vcpus {
+            return Err(LifecycleError::Save(format!(
+                "only {} of {} vCPUs reported their state; a snapshot missing a CPU would                  restore a guest with one fewer",
+                cpus.len(),
+                self.vcpus
+            )));
+        }
+        let summary = machine
+            .save_machine(&cpus, path)
+            .map_err(LifecycleError::Save)?;
+        tracing::info!(path = %path.display(), "VM suspended");
+        Ok(summary)
     }
 
     /// Releases every parked vCPU and marks the VM as stopping, so a paused VM
@@ -586,6 +745,46 @@ impl Lifecycle {
                     inner = self.wait(inner);
                 }
                 Phase::HeldPause | Phase::ResetMachine => inner = self.wait(inner),
+                Phase::SaveVcpus => {
+                    if inner.saved.get(slot).map(Option::is_none).unwrap_or(false) {
+                        drop(inner);
+                        // Reading the whole architectural state can take a
+                        // millisecond of ioctls; doing it outside the lock keeps
+                        // an SMP guest's vCPUs capturing in parallel.
+                        let outcome = vcpu.save_cpu_state();
+                        inner = self.lock();
+                        match outcome {
+                            Ok(state) => {
+                                if let Some(sink) = inner.saved.get_mut(slot) {
+                                    *sink = Some(state);
+                                }
+                            }
+                            Err(error) => {
+                                let message = format!("vCPU {index}: {error}");
+                                inner.save_error.get_or_insert(message);
+                                // Report *something*, or the barrier waits out
+                                // its whole timeout for a vCPU that already
+                                // failed. The error is what the caller sees.
+                                if let Some(sink) = inner.saved.get_mut(slot) {
+                                    *sink = Some(X86CpuState {
+                                        index,
+                                        registers: Default::default(),
+                                        special_registers: Default::default(),
+                                        msrs: Vec::new(),
+                                        xcr0: 0,
+                                        xsave: Default::default(),
+                                        lapic: Default::default(),
+                                        mp_state: Default::default(),
+                                        events: Default::default(),
+                                        debug_registers: Default::default(),
+                                    });
+                                }
+                            }
+                        }
+                        self.changed.notify_all();
+                    }
+                    inner = self.wait(inner);
+                }
                 Phase::ResetVcpus => {
                     if !inner.reset_done.get(slot).copied().unwrap_or(true) {
                         let machine = self.machine();
@@ -769,6 +968,9 @@ mod tests {
         index: u32,
         ticks: Arc<AtomicU64>,
         arch_resets: Arc<AtomicU32>,
+        /// Makes `save_cpu_state` fail, so the capture's error path is a test
+        /// rather than a hope.
+        save_fails: Arc<AtomicBool>,
     }
 
     impl VcpuRegisters for FakeVcpu {
@@ -790,6 +992,29 @@ mod tests {
         fn reset_arch_state(&mut self, _is_boot_cpu: bool) -> Result<(), HvError> {
             self.arch_resets.fetch_add(1, Ordering::AcqRel);
             Ok(())
+        }
+
+        /// Enough of a CPU to be identifiable: the tick counter goes into
+        /// `rax`, so a test can tell whose state it got.
+        fn save_cpu_state(&self) -> Result<X86CpuState, HvError> {
+            if self.save_fails.load(Ordering::Acquire) {
+                return Err(HvError::Registers("no CPU here".into()));
+            }
+            Ok(X86CpuState {
+                index: self.index,
+                registers: X86Registers {
+                    rax: self.ticks.load(Ordering::Acquire),
+                    ..X86Registers::default()
+                },
+                special_registers: X86SpecialRegisters::default(),
+                msrs: Vec::new(),
+                xcr0: 1,
+                xsave: Default::default(),
+                lapic: Default::default(),
+                mp_state: Default::default(),
+                events: Default::default(),
+                debug_registers: Default::default(),
+            })
         }
     }
 
@@ -849,6 +1074,18 @@ mod tests {
         Vec<Arc<AtomicU64>>,
         Arc<AtomicU32>,
     ) {
+        spawn_fake_vcpus_with(lifecycle, n, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn spawn_fake_vcpus_with(
+        lifecycle: &Arc<Lifecycle>,
+        n: u32,
+        save_fails: Arc<AtomicBool>,
+    ) -> (
+        Vec<std::thread::JoinHandle<()>>,
+        Vec<Arc<AtomicU64>>,
+        Arc<AtomicU32>,
+    ) {
         let kicks = Arc::new(AtomicU32::new(0));
         let mut ticks = Vec::new();
         let mut handles = Vec::new();
@@ -861,6 +1098,7 @@ mod tests {
                 index,
                 ticks: Arc::clone(&counter),
                 arch_resets: Arc::new(AtomicU32::new(0)),
+                save_fails: Arc::clone(&save_fails),
             };
             handles.push(std::thread::spawn(move || loop {
                 if lifecycle.checkpoint(vcpu.index, &mut vcpu) == Checkpoint::Stopped {
@@ -1110,5 +1348,94 @@ mod tests {
         lifecycle.pause().expect("pause");
         stop(&lifecycle, handles); // joins: would hang if the hold survived
         assert_eq!(lifecycle.state(), RunState::Stopping);
+    }
+    /// The suspend barrier: with the VM paused, every vCPU reports its own
+    /// state from its own thread, in index order, and the VM is still paused
+    /// afterwards.
+    #[test]
+    fn capture_reads_every_vcpu_and_leaves_the_vm_paused() {
+        let lifecycle = Lifecycle::new(3);
+        lifecycle.attach_machine(Arc::new(RecordingMachine::default()));
+        let (handles, ticks, _) = spawn_fake_vcpus(&lifecycle, 3);
+        while ticks.iter().any(|t| t.load(Ordering::Acquire) == 0) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        lifecycle.pause().expect("pause");
+
+        let states = lifecycle.capture_cpus().expect("capture");
+        assert_eq!(states.len(), 3);
+        for (index, state) in states.iter().enumerate() {
+            assert_eq!(state.index, index as u32);
+            assert_eq!(
+                state.registers.rax,
+                ticks[index].load(Ordering::Acquire),
+                "vCPU {index} reported someone else's state"
+            );
+        }
+        assert_eq!(lifecycle.state(), RunState::Paused);
+
+        // And the VM still resumes: a capture is a read, not a lifecycle move.
+        lifecycle.resume().expect("resume");
+        assert_eq!(lifecycle.state(), RunState::Running);
+        stop(&lifecycle, handles);
+    }
+
+    /// Capturing a *running* VM is refused. A snapshot taken while the guest
+    /// executes is a picture of a machine that never existed.
+    #[test]
+    fn capturing_a_running_vm_is_refused() {
+        let lifecycle = Lifecycle::new(1);
+        let (handles, _, _) = spawn_fake_vcpus(&lifecycle, 1);
+        let err = lifecycle.capture_cpus().unwrap_err();
+        assert!(matches!(err, LifecycleError::WrongState { .. }), "{err}");
+        stop(&lifecycle, handles);
+    }
+
+    /// A vCPU that cannot report its state fails the whole capture rather than
+    /// producing a snapshot with a hole in it — and the VM is still paused and
+    /// resumable afterwards.
+    #[test]
+    fn a_failing_vcpu_fails_the_whole_capture() {
+        let lifecycle = Lifecycle::new(2);
+        let fail = Arc::new(AtomicBool::new(true));
+        let (handles, _, _) = spawn_fake_vcpus_with(&lifecycle, 2, Arc::clone(&fail));
+        lifecycle.pause().expect("pause");
+        let err = lifecycle.capture_cpus().unwrap_err();
+        assert!(matches!(err, LifecycleError::Save(_)), "{err}");
+        assert_eq!(lifecycle.state(), RunState::Paused);
+
+        fail.store(false, Ordering::Release);
+        assert_eq!(lifecycle.capture_cpus().expect("retry").len(), 2);
+        lifecycle.resume().expect("resume");
+        stop(&lifecycle, handles);
+    }
+
+    /// `save` without a machine is refused before anything is paused, the same
+    /// way `reset` is.
+    #[test]
+    fn saving_without_a_machine_is_refused() {
+        let lifecycle = Lifecycle::new(1);
+        let (handles, _, _) = spawn_fake_vcpus(&lifecycle, 1);
+        let err = lifecycle
+            .save(std::path::Path::new("unused.esnap"))
+            .unwrap_err();
+        assert!(matches!(err, LifecycleError::NoMachine), "{err}");
+        assert_eq!(lifecycle.state(), RunState::Running);
+        stop(&lifecycle, handles);
+    }
+
+    /// A machine that has no snapshot support says so, and leaves the VM
+    /// paused rather than half-suspended.
+    #[test]
+    fn a_machine_that_cannot_be_suspended_says_so() {
+        let lifecycle = Lifecycle::new(1);
+        lifecycle.attach_machine(Arc::new(RecordingMachine::default()));
+        let (handles, _, _) = spawn_fake_vcpus(&lifecycle, 1);
+        let err = lifecycle
+            .save(std::path::Path::new("unused.esnap"))
+            .unwrap_err();
+        assert!(matches!(err, LifecycleError::Save(_)), "{err}");
+        assert_eq!(lifecycle.state(), RunState::Paused);
+        stop(&lifecycle, handles);
     }
 }

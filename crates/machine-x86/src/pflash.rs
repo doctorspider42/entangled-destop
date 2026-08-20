@@ -477,6 +477,48 @@ impl Pflash {
         self.status = 0;
     }
 
+    /// The command state machine, for a snapshot (ADR-0006).
+    ///
+    /// The **contents are not here**, and must not be: they are the UEFI
+    /// variable store, they live in the NVRAM file, and the file is what the
+    /// restored machine opens. Carrying them in the snapshot as well would give
+    /// a restore two sources of truth for the same bytes and no rule for which
+    /// one wins.
+    pub fn save_state(&self) -> crate::state::SavedPflash {
+        crate::state::SavedPflash {
+            command: match self.state {
+                State::ReadArray => 0,
+                State::ReadStatus => 1,
+                State::Program => 2,
+                State::Erase => 3,
+            },
+            status: self.status,
+        }
+    }
+
+    /// Puts it back. An unknown command code is refused rather than guessed: a
+    /// flash that wrongly believes it is mid-program answers the firmware's
+    /// next write with data.
+    pub fn load_state(
+        &mut self,
+        state: &crate::state::SavedPflash,
+    ) -> Result<(), crate::state::StateError> {
+        self.state = match state.command {
+            0 => State::ReadArray,
+            1 => State::ReadStatus,
+            2 => State::Program,
+            3 => State::Erase,
+            other => {
+                return Err(crate::state::StateError::BadValue {
+                    what: "pflash command state",
+                    value: u64::from(other),
+                })
+            }
+        };
+        self.status = state.status;
+        Ok(())
+    }
+
     /// True when `addr` is inside the decoded window.
     pub fn contains(&self, addr: u64) -> bool {
         addr >= self.base && addr - self.base < self.window

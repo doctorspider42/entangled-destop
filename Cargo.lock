@@ -4521,6 +4521,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vm-snapshot"
+version = "0.2.0"
+dependencies = [
+ "control-api",
+ "disk-image",
+ "machine-x86",
+ "sha2",
+ "thiserror 2.0.20",
+ "tracing",
+ "virtio-core",
+ "vm-memory 0.17.2",
+ "vmm-core",
+]
+
+[[package]]
 name = "vmm-core"
 version = "0.2.0"
 dependencies = [

@@ -30,7 +30,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::layout;
 
@@ -177,6 +177,24 @@ impl AcpiPmTimer {
         }
     }
 
+    /// Re-anchors the counter so it reads `ticks` right now (ADR-0006).
+    ///
+    /// A restored VM's `Instant::now()` has nothing to do with the origin the
+    /// snapshot was taken against, so the *reading* is what is carried and the
+    /// origin is derived from it. A firmware that was 3 ms into a
+    /// `MicroSecondDelay()` comes back 3 ms into it, rather than at zero (which
+    /// would double its delay) or at some unrelated value (which would end it).
+    pub fn restore(&self, ticks: u32) {
+        let elapsed_us =
+            u64::from(ticks & ACPI_PM_TIMER_MASK) * 1_000_000 / ACPI_PM_TIMER_HZ;
+        let now = Instant::now();
+        let mut state = self.state();
+        state.origin = now
+            .checked_sub(Duration::from_micros(elapsed_us))
+            .unwrap_or(now);
+        state.paused_at = None;
+    }
+
     /// Machine reset: the counter starts from zero, running.
     pub fn reset(&self) {
         let mut state = self.state();
@@ -258,6 +276,44 @@ impl AcpiPmBlock {
         self.shutdown.store(false, Ordering::Release);
         self.timer.reset();
         *self.regs() = PmRegisters::default();
+    }
+
+    /// Everything in this block, for a snapshot (ADR-0006).
+    pub fn save_state(&self) -> crate::state::SavedAcpiPm {
+        let regs = self.regs();
+        crate::state::SavedAcpiPm {
+            pm1a_sts: regs.pm1a_sts,
+            pm1a_en: regs.pm1a_en,
+            pm1a_cnt: regs.pm1a_cnt,
+            gpe0_sts: regs.gpe0_sts,
+            gpe0_en: regs.gpe0_en,
+            sleep_control: regs.sleep_control,
+            sleep_status: regs.sleep_status,
+            timer_ticks: self.timer.ticks(),
+            shutdown_requested: self.is_shutdown_requested(),
+        }
+    }
+
+    /// Puts it back, PM timer included.
+    ///
+    /// The shutdown latch is restored too. It is only ever set by a guest that
+    /// has already written `SLP_TYP = S5`, so a snapshot taken in that window
+    /// is of a VM that was on its way to powering off; dropping the latch would
+    /// resume a machine that had already been told to stop.
+    pub fn load_state(&self, state: &crate::state::SavedAcpiPm) {
+        {
+            let mut regs = self.regs();
+            regs.pm1a_sts = state.pm1a_sts;
+            regs.pm1a_en = state.pm1a_en;
+            regs.pm1a_cnt = state.pm1a_cnt;
+            regs.gpe0_sts = state.gpe0_sts;
+            regs.gpe0_en = state.gpe0_en;
+            regs.sleep_control = state.sleep_control;
+            regs.sleep_status = state.sleep_status;
+        }
+        self.timer.restore(state.timer_ticks);
+        self.shutdown
+            .store(state.shutdown_requested, Ordering::Release);
     }
 
     /// Freezes the PM timer while the VM is paused (ADR-0005).
