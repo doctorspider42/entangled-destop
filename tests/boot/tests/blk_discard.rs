@@ -178,8 +178,8 @@ fn a_guest_fstrim_gives_the_host_its_disk_space_back() {
     );
     assert!(
         grown >= empty + MIN_GROWTH,
-        "the guest's {} MiB fill only grew the image from {} to {} — nothing to reclaim;          serial tail:
-{}",
+        "the guest's {} MiB fill only grew the image from {} to {} — nothing to reclaim; \
+         serial tail:\n{}",
         FILL_MIB,
         format_bytes(empty),
         format_bytes(grown),

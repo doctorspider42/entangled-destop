@@ -118,7 +118,8 @@ pub enum BlockError {
     ReclaimTooLarge { num_sectors: u32, max: u32 },
 
     #[error(
-        "discard/write-zeroes payload of {0} bytes is not a whole number of          {DISCARD_SEGMENT_LEN}-byte segments"
+        "discard/write-zeroes payload of {0} bytes is not a whole number of \
+         {DISCARD_SEGMENT_LEN}-byte segments"
     )]
     BadSegmentArray(u64),
 
