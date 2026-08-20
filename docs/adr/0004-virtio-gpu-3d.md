@@ -193,6 +193,36 @@ is real.
   and outlives the attachment; addresses are translated through checked
   `vm-memory` (`get_slice`), so an entry outside guest RAM fails the attach.
 
+## Amendment (2026-08-20): the id namespace stays mixed in virgl mode
+
+Phase 1 assumed the guest kernel creates *every* object through
+`RESOURCE_CREATE_3D` once `VIRGL` is negotiated. The boot log says otherwise:
+Ubuntu 26.04's `virtio_gpu` still creates its own dumb/console framebuffer with
+**`RESOURCE_CREATE_2D`** (observed: resource 2, `B8G8R8X8_UNORM`, 1920×1080,
+right before `fb0: virtio_gpudrmfb frame buffer device`), and then —
+`virtio_gpu_gem_object_open`/`_close` — **attaches it to the DRM client's 3D
+context and detaches it again**. So on a virgl device both halves of the one id
+namespace are live at the same time.
+
+Consequences, all of them "route by which table owns the id" (the rule the rest
+of the device already followed):
+
+- `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` must accept a **2D-owned** id.
+  QEMU and crosvm accept it because they keep a single table — QEMU's virgl path
+  even re-creates 2D resources inside virglrenderer
+  (`virgl_cmd_create_resource_2d`: target 2, depth 1, array 1,
+  `BIND_RENDER_TARGET`). We keep the 2D table as it is and answer the attach
+  after validating the context and the id, without calling the renderer: it has
+  no handle for that resource, and the guest never names a 2D resource inside a
+  `SUBMIT_3D` stream — it reaches it through `TRANSFER_TO_HOST_2D` /
+  `SET_SCANOUT` / `RESOURCE_FLUSH`, which route by ownership too.
+- Refusing it (which phase 1 did, with `ERR_INVALID_RESOURCE_ID`) is *visible*:
+  the guest's `virtio_gpu_dequeue_ctrl_func` logs
+  `*ERROR* response 0x1203 (command 0x202)` and again for `0x203` on every
+  virgl boot. Nothing else broke — the console framebuffer works because it
+  never needed the renderer — but a spec-faithful device answers OK, and
+  `boot-tests/virgl_gnome.rs` now asserts the pair is absent.
+
 ## Amendment (2026-08-19): what the implementation found
 
 Phase 1 landed the same day; three FFI facts worth keeping:

@@ -9,6 +9,10 @@
 //!   (a 2D device logs `-virgl`);
 //! * systemd reaching the graphical target — GNOME starts against the 3D
 //!   device;
+//! * **no** `virtio_gpu_dequeue_ctrl_func` error responses for
+//!   `CTX_ATTACH/DETACH_RESOURCE` — the kernel attaches its 2D-created console
+//!   framebuffer to a 3D context, and a device that refuses that logs a DRM
+//!   error pair on every virgl boot (GPU-006);
 //! * the renderer string, read from *inside the guest*: the kernel command
 //!   line gets `systemd.debug_shell=ttyS0`, and once the desktop is up the
 //!   test types a python-ctypes EGL probe into that root shell. The reply
@@ -350,6 +354,24 @@ fn the_desktop_session_runs_on_virgl_not_llvmpipe() {
     assert!(
         log.contains(GRAPHICAL_MARKER),
         "systemd never reached the graphical target within {DEADLINE:?}"
+    );
+    // GPU-006: the kernel attaches its own 2D-created console framebuffer to
+    // the DRM client's 3D context and detaches it again while fb0 is set up. A
+    // device that refuses those (ERR_INVALID_RESOURCE_ID, because the id lives
+    // in the 2D table and not in the renderer) makes the guest driver log this
+    // error pair on every single virgl boot.
+    let attach_errors: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            line.contains("*ERROR* response")
+                && (line.contains("(command 0x202)") || line.contains("(command 0x203)"))
+        })
+        .map(str::trim)
+        .collect();
+    assert!(
+        attach_errors.is_empty(),
+        "the guest logged CTX_ATTACH/DETACH_RESOURCE failures:\n{}",
+        attach_errors.join("\n")
     );
     let renderer_line = log
         .lines()
