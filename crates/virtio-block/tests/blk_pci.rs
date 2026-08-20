@@ -27,7 +27,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use virtio_block::{BlockDevice, SECTOR_SIZE, S_IOERR, S_OK, S_UNSUPP};
+use virtio_block::device::{VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_WRITE_ZEROES};
+use virtio_block::{
+    BlockDevice, DISCARD_SECTOR_ALIGNMENT, MAX_DISCARD_SECTORS, MAX_DISCARD_SEG,
+    MAX_WRITE_ZEROES_SECTORS, SECTOR_SIZE, S_IOERR, S_OK, S_UNSUPP, WRITE_ZEROES_FLAG_UNMAP,
+    WRITE_ZEROES_MAY_UNMAP,
+};
 use virtio_core::chain::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use virtio_core::msix;
 use virtio_core::pci::{self, common};
@@ -46,6 +51,8 @@ const DISK_SECTORS: u64 = 32;
 const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
+const T_DISCARD: u32 = 11;
+const T_WRITE_ZEROES: u32 = 13;
 
 /// The MSI-X message a guest on x86 programs: the local APIC's default physical
 /// address, and a data word whose low byte is the interrupt vector.
@@ -84,7 +91,11 @@ struct Harness {
 
 impl Harness {
     fn new(writable: bool) -> Self {
-        let path = temp_image(DISK_SECTORS);
+        Self::with_sectors(writable, DISK_SECTORS)
+    }
+
+    fn with_sectors(writable: bool, sectors: u64) -> Self {
+        let path = temp_image(sectors);
         let device = BlockDevice::open(&path, writable).expect("open image");
         Self::around(device, path)
     }
@@ -282,6 +293,22 @@ impl Harness {
         let mut raw = [0u8; 8];
         self.transport.read_bar(pci::DEVICE_CFG_OFFSET, &mut raw);
         u64::from_le_bytes(raw)
+    }
+
+    /// A 32-bit device-config field, read at its natural width the way
+    /// `virtio_cread` does.
+    fn device_config32(&mut self, offset: u64) -> u32 {
+        let mut raw = [0u8; 4];
+        self.transport
+            .read_bar(pci::DEVICE_CFG_OFFSET + offset, &mut raw);
+        u32::from_le_bytes(raw)
+    }
+
+    fn device_config8(&mut self, offset: u64) -> u8 {
+        let mut raw = [0u8; 1];
+        self.transport
+            .read_bar(pci::DEVICE_CFG_OFFSET + offset, &mut raw);
+        raw[0]
     }
 
     /// A kick, the way the driver does it: a 16-bit write of the queue index to
@@ -1084,4 +1111,102 @@ fn a_reset_drops_the_vectors_and_a_second_bring_up_restores_them() {
     let before = h.msi_data().len();
     assert_eq!(h.read_sectors(0, 512).0, S_OK);
     assert_eq!(&h.msi_data()[before..], &[MSI_DATA_QUEUE]);
+}
+
+// ====================================================== discard / write-zeroes
+//
+// The device is the same object as in the mmio suite, so the interesting part
+// here is the *config space*: virtio-pci lets a driver read these fields at
+// 1/2/4/8-byte widths from a BAR offset, where mmio only ever does aligned
+// 32-bit reads. A field that decoded correctly on one and not the other would
+// hand the guest a limit we do not enforce.
+
+#[test]
+fn the_reclaim_config_fields_decode_at_every_width_a_driver_uses() {
+    let mut h = Harness::new(true);
+    let features = h.device_features();
+    assert_ne!(features & VIRTIO_BLK_F_DISCARD, 0);
+    assert_ne!(features & VIRTIO_BLK_F_WRITE_ZEROES, 0);
+
+    assert_eq!(h.device_config32(36), MAX_DISCARD_SECTORS);
+    assert_eq!(h.device_config32(40), MAX_DISCARD_SEG);
+    assert_eq!(h.device_config32(44), DISCARD_SECTOR_ALIGNMENT);
+    assert_eq!(h.device_config32(48), MAX_WRITE_ZEROES_SECTORS);
+    assert_eq!(h.device_config32(52), MAX_DISCARD_SEG);
+    assert_eq!(h.device_config8(56), WRITE_ZEROES_MAY_UNMAP);
+
+    // Byte-wise, the same field must read the same value — this is the decode
+    // that only pci exercises.
+    let expected = MAX_DISCARD_SECTORS.to_le_bytes();
+    for (i, want) in expected.iter().enumerate() {
+        assert_eq!(h.device_config8(36 + i as u64), *want, "byte {i}");
+    }
+    // A 16-bit read of the low half, and an 8-byte read spanning two fields.
+    let mut half = [0u8; 2];
+    h.transport.read_bar(pci::DEVICE_CFG_OFFSET + 36, &mut half);
+    assert_eq!(
+        u16::from_le_bytes(half),
+        (MAX_DISCARD_SECTORS & 0xffff) as u16
+    );
+    let mut pair = [0u8; 8];
+    h.transport.read_bar(pci::DEVICE_CFG_OFFSET + 36, &mut pair);
+    assert_eq!(
+        u64::from_le_bytes(pair),
+        u64::from(MAX_DISCARD_SECTORS) | (u64::from(MAX_DISCARD_SEG) << 32)
+    );
+}
+
+#[test]
+fn discard_and_write_zeroes_round_trip_over_pci() {
+    let mut h = Harness::with_sectors(true, 8 * 1024);
+    let payload = vec![0xc3u8; 64 << 10];
+    for piece in 0..8u64 {
+        assert_eq!(h.write_sectors(piece * 128, &payload), S_OK);
+    }
+    let before = disk_image::allocated_bytes(&h.path).expect("allocated size");
+
+    // One discard of the whole 1 MiB, one write-zeroes with unmap, and a
+    // malformed one in between: all three answered in band.
+    let array = BUF_BASE + 0x10000;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&2048u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    h.write_mem(array, &bytes);
+    let status_addr = BUF_BASE + 0x800;
+    let (status, used) = h.run_request(T_DISCARD, 0, &[(array, 16, false)], status_addr);
+    assert_eq!(status, S_OK);
+    assert_eq!(used, 1);
+
+    // Reserved flag bits: unsupported, over pci exactly as over mmio.
+    let mut bad = bytes.clone();
+    bad[12..16].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+    h.write_mem(array, &bad);
+    let (status, _) = h.run_request(T_WRITE_ZEROES, 0, &[(array, 16, false)], status_addr);
+    assert_eq!(status, S_UNSUPP);
+
+    // Write-zeroes with unmap over the second half.
+    let mut zeroes = Vec::new();
+    zeroes.extend_from_slice(&2048u64.to_le_bytes());
+    zeroes.extend_from_slice(&2048u32.to_le_bytes());
+    zeroes.extend_from_slice(&WRITE_ZEROES_FLAG_UNMAP.to_le_bytes());
+    h.write_mem(array, &zeroes);
+    let (status, _) = h.run_request(T_WRITE_ZEROES, 0, &[(array, 16, false)], status_addr);
+    assert_eq!(status, S_OK);
+
+    let after = disk_image::allocated_bytes(&h.path).expect("allocated size");
+    assert!(
+        after <= before,
+        "reclaim must never grow the image: {before} -> {after}"
+    );
+    for piece in 0..8u64 {
+        let (status, data) = h.read_sectors(piece * 128, 512);
+        assert_eq!(status, S_OK);
+        assert_eq!(
+            data,
+            vec![0u8; 512],
+            "sectors from {} kept data",
+            piece * 128
+        );
+    }
 }

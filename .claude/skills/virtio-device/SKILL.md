@@ -157,6 +157,9 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_block::MAX_REQUEST_BYTES` | 4 MiB | bytes staged for one disk request | `virtio_block::request::tests::{total_len_caps_oversized_requests, validate_range_enforces_the_payload_cap_on_its_own}`, `blk_queue::oversized_requests_are_rejected` |
 | `virtio_block::MAX_DATA_SEGMENTS` | 126 | *derived* (`MAX_DESC_CHAIN_LEN - 2`); reported to callers, enforced by the chain walk | the chain-walk tests above |
 | `virtio_block::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick | `blk_queue::one_notification_is_bounded_and_never_truncates_a_full_ring` |
+| `virtio_block::MAX_DISCARD_SEG` | 256 | segments in one DISCARD / WRITE_ZEROES array (also the guest-visible `max_discard_seg`); `MAX_DISCARD_ARRAY_BYTES` is the derived 4 KiB staging bound | `virtio_block::request::tests::the_segment_array_length_must_describe_whole_segments_and_not_too_many`, `blk_queue::a_malformed_segment_array_is_unsupported_and_too_many_segments_is_an_io_error` |
+| `virtio_block::MAX_DISCARD_SECTORS` | 2Mi (1 GiB) | sectors one discard segment may cover — one punch syscall regardless of size | `virtio_block::request::tests::the_per_command_maximum_is_enforced_and_differs_by_command`, `blk_queue::out_of_range_and_oversized_segments_are_io_errors` |
+| `virtio_block::MAX_WRITE_ZEROES_SECTORS` | 64Ki (32 MiB) | sectors one write-zeroes segment may cover; **tighter than discard on purpose** — the zero-writing fallback has to write every byte | same tests |
 | `virtio_gpu::MAX_RESOURCE_PIXELS` | 4096×2304 | pixels in one 2D resource | `gpu_queue::zero_sized_oversized_and_duplicate_resources_are_rejected` |
 | `virtio_gpu::resource::MAX_TOTAL_RESOURCE_PIXELS` | 8× the above | pixels across all live resources | `virtio_gpu::resource::tests::resource_count_and_total_pixels_are_capped`, `gpu_queue::too_many_resources_run_out_of_host_memory_cleanly` |
 | `virtio_gpu::resource::MAX_RESOURCES` | 64 | live host resources | same tests |
@@ -261,6 +264,32 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
 - **blk** (EPIC 4): request = header (type/reserved/sector) + data + status
   byte. Types in `virtio_block::RequestType`; status `S_OK/S_IOERR/S_UNSUPP`.
   Unknown type → `S_UNSUPP`, out-of-range → `S_IOERR` (test exists).
+  **Thin-provisioning reclaim** (`VIRTIO_BLK_F_DISCARD` bit 13,
+  `VIRTIO_BLK_F_WRITE_ZEROES` bit 14) is on by default for every writable disk
+  and withheld for read-only ones, so a guest `fstrim` gives host disk space
+  back. Three things to know before touching it:
+  - The config space is now the spec's **fixed 60-byte layout**, not just
+    `capacity`: the discard fields sit at offsets 36–56, so everything in front
+    of them is published as zero. Build it in `BlockDevice::config_space`, never
+    by special-casing an offset, and keep the published limits equal to the
+    constants `DiscardSegment::validate` enforces — a number we advertise and
+    then refuse makes a well-behaved driver look malicious.
+  - The **segment array** is a second untrusted surface on top of the header:
+    `segment_count` checks the array's shape (whole 16-byte segments, at most
+    `MAX_DISCARD_SEG`) and `DiscardSegment::validate` checks each range
+    (reserved flag bits refused, `unmap` refused on a discard, per-command
+    maximum, overflow-safe capacity check, representable byte offset *and* end).
+    Protocol misuse answers `S_UNSUPP`, a limit or geometry violation `S_IOERR`.
+    Validation runs over the **whole array before anything is punched**, so one
+    poisoned segment costs the guest the request and nothing else — the property
+    `blk_queue::one_bad_segment_makes_the_whole_request_a_no_op` exists to keep.
+  - The host half is `disk_image::{punch_hole, write_zeroes}` (Linux
+    `fallocate(PUNCH_HOLE|KEEP_SIZE)`, Windows `FSCTL_SET_ZERO_DATA` on a sparse
+    file). `punch_hole` may report `Unsupported` and change nothing — legal for a
+    discard hint; `write_zeroes` never can, because zeros are a promise, so it
+    falls back to writing them. `RawDisk` logs which mechanism it got **once per
+    disk**, not per request. `ENTANGLED_BLK_DISCARD=off` withholds both features,
+    which is how the before/after measurement is taken.
 - **net** (EPIC 5): TX before RX (easier to debug); `virtio_net_hdr` is 12
   bytes with num_buffers when MRG_RXBUF — MVP negotiates **no offloads, no
   mergeable buffers, no multiqueue**: correct first, fast later. MAC from

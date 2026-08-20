@@ -15,6 +15,12 @@
 //!                               guest-side evidence for the virtio-pci
 //!                               transport (EPIC 19). There is no `lspci` in this
 //!                               initramfs, so it reads sysfs directly.
+//!   `entangled.trim=<mib>`      fills `<mib>` MiB on `/dev/vda`, frees it and
+//!                               asks the kernel to give the space back
+//!                               (`FITRIM` on a mounted ext4, or `BLKDISCARD`
+//!                               where ext4 is not built in) — the guest half of
+//!                               the virtio-blk DISCARD acceptance; the host
+//!                               measures the image's allocated size either side.
 //!   `entangled.poweroff=1`      power the machine off through ACPI instead of
 //!                               rebooting: proves the FADT, the DSDT's `\_S5`
 //!                               and the host's ACPI PM block agree. Opt-in,
@@ -29,6 +35,7 @@
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::os::fd::AsRawFd as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -43,6 +50,20 @@ const MAX_BENCH_MIB: u64 = 4096;
 /// Cap on the PCI functions the scan reports, so a machine that grows a bus full
 /// of devices cannot turn one probe line into an unbounded one.
 const MAX_SCANNED_FUNCTIONS: usize = 16;
+
+/// `FITRIM` — `_IOWR('X', 121, struct fstrim_range)`, the ioctl `fstrim(8)`
+/// issues on a mount point. Spelled out because `libc` does not export it; the
+/// cast is because `libc::Ioctl` is `i32` on musl and `u64` on glibc, and the
+/// bit pattern is what the kernel compares.
+const FITRIM: libc::Ioctl = 0xc018_5879u32 as libc::Ioctl;
+
+/// `BLKDISCARD` — `_IO(0x12, 119)`, the ioctl `blkdiscard(8)` issues on a block
+/// device.
+const BLKDISCARD: libc::Ioctl = 0x1277u32 as libc::Ioctl;
+
+/// How long the trim probe waits for `/dev/vda` to be created. virtio-blk
+/// probes asynchronously, so PID 1 can win the race on a fast boot.
+const DEVICE_WAIT: Duration = Duration::from_secs(5);
 
 fn main() {
     // The marker must match linux_boot::GUEST_READY_MARKER. Printed before any
@@ -62,6 +83,11 @@ fn main() {
     if let Some(mib) = param(&cmdline, "entangled.blkbench=").and_then(|v| v.parse::<u64>().ok()) {
         mount("devtmpfs", "/dev", "devtmpfs");
         blk_bench(mib.min(MAX_BENCH_MIB));
+    }
+    if let Some(mib) = param(&cmdline, "entangled.trim=").and_then(|v| v.parse::<u64>().ok()) {
+        mount("devtmpfs", "/dev", "devtmpfs");
+        mount("sysfs", "/sys", "sysfs");
+        trim_probe(mib);
     }
     if let Some(spec) = param(&cmdline, "entangled.netprobe=") {
         net_probe(&spec);
@@ -326,6 +352,261 @@ fn mount(source: &str, target: &str, fstype: &str) {
             std::ptr::null(),
         );
     }
+}
+
+/// Drives the guest kernel's own discard path against `/dev/vda` and reports
+/// what it managed to give back — the guest half of the thin-provisioning
+/// acceptance (`VIRTIO_BLK_F_DISCARD`).
+///
+/// Two routes, in order of how much they prove:
+///
+/// 1. **`FITRIM`** — mount the ext4 filesystem the host put on the disk, fill a
+///    file with `mib` MiB, delete it, then run the same `FITRIM` ioctl that
+///    `fstrim(8)` runs. That is the real production path: ext4 walks its block
+///    groups, calls `blkdev_issue_discard` for the free extents, and the block
+///    layer turns those into `VIRTIO_BLK_T_DISCARD` requests.
+/// 2. **`BLKDISCARD`** — used when the mount fails, which it will on a kernel
+///    that has ext4 as a module (the Debian installer kernel does). Writes the
+///    same `mib` MiB straight to the device, then discards that range with the
+///    ioctl `blkdiscard(8)` uses. One layer shallower, and it exercises the same
+///    `blkdev_issue_discard` → virtio-blk path with the same guest-supplied
+///    ranges.
+///
+/// Either way the host measures the image's allocated size before and after, so
+/// the number that matters is not printed here at all — this only has to make
+/// the guest really ask.
+fn trim_probe(mib: u64) {
+    let fail = |why: String| println!("VMHOST_TEST_FAIL trim {why}");
+    let bytes = mib.min(MAX_BENCH_MIB).saturating_mul(1 << 20);
+    if bytes == 0 {
+        return fail("nothing-to-fill".into());
+    }
+
+    // The device node appears when virtio-blk finishes probing, which can be
+    // after PID 1 starts. Wait for it rather than racing it.
+    if let Err(why) = wait_for_device(Path::new("/dev/vda")) {
+        return fail(why);
+    }
+
+    // What the block layer thinks the device can discard: straight from sysfs,
+    // so the config-space fields the device published are visible in the report
+    // rather than assumed.
+    let limits = discard_limits();
+
+    match fitrim_route(bytes) {
+        Ok(trimmed) => println!(
+            "VMHOST_TEST_OK trim path=fitrim filled={bytes} trimmed={trimmed} {limits}"
+        ),
+        // The device refused the trim, or the filesystem could not run it. The
+        // filesystem is intact and must stay that way: falling back to a raw
+        // BLKDISCARD here would write straight over it, and a later boot of the
+        // same image would then have no filesystem left to trim. This branch is
+        // exactly what the host's "reclaim withheld" phase expects to see.
+        Err(TrimFailure::Refused(why)) => fail(format!("fitrim={why}")),
+        // No ext4 in this kernel at all, so there was never a filesystem to
+        // damage: drive the block device's own discard instead.
+        Err(TrimFailure::NoFilesystem(why)) => match blkdiscard_route(bytes) {
+            Ok(discarded) => println!(
+                "VMHOST_TEST_OK trim path=blkdiscard filled={bytes} trimmed={discarded} \
+                 fitrim={why} {limits}"
+            ),
+            Err(second) => fail(format!("fitrim={why} blkdiscard={second}")),
+        },
+    }
+}
+
+/// Why the `FITRIM` route produced no number — and, crucially, whether a
+/// filesystem exists that a fallback would destroy.
+enum TrimFailure {
+    /// The device could not be mounted as ext4, so there is nothing to lose.
+    NoFilesystem(String),
+    /// A filesystem is there; the fill, the unlink or the ioctl failed.
+    Refused(String),
+}
+
+/// Waits up to [`DEVICE_WAIT`] for a device node to appear, reporting what /dev
+/// did contain if it never does — a missing `/dev/vda` and a `/dev` that was
+/// never populated are different failures.
+fn wait_for_device(path: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + DEVICE_WAIT;
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            let mut seen: Vec<String> = std::fs::read_dir("/dev")
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .take(24)
+                        .collect()
+                })
+                .unwrap_or_default();
+            seen.sort();
+            return Err(format!(
+                "no-{} dev-has={}",
+                path.display(),
+                if seen.is_empty() {
+                    "nothing".into()
+                } else {
+                    seen.join(",")
+                }
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// `/sys/block/vda/queue/discard_*`, as the guest kernel derived them from the
+/// device's config space. `discard_granularity` of 0 means the kernel does not
+/// believe the device can discard at all, which is the failure this reports
+/// rather than hides.
+fn discard_limits() -> String {
+    let read = |name: &str| {
+        std::fs::read_to_string(format!("/sys/block/vda/queue/{name}"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "?".into())
+    };
+    format!(
+        "granularity={} max_discard={} max_write_zeroes={}",
+        read("discard_granularity"),
+        read("discard_max_bytes"),
+        read("write_zeroes_max_bytes")
+    )
+}
+
+/// Route 1: a real filesystem, a real `fstrim`.
+fn fitrim_route(bytes: u64) -> Result<u64, TrimFailure> {
+    let _ = std::fs::create_dir_all("/mnt");
+    let (Ok(source), Ok(target), Ok(fstype)) = (
+        CString::new("/dev/vda"),
+        CString::new("/mnt"),
+        CString::new("ext4"),
+    ) else {
+        return Err(TrimFailure::NoFilesystem("bad-strings".into()));
+    };
+    // SAFETY: three valid NUL-terminated strings that outlive the call, no
+    // flags and a null options pointer — the ordinary way to mount a block
+    // device.
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        // ENODEV here means the kernel has no ext4 at all (it is a module in
+        // the Debian installer kernel), which is worth saying out loud rather
+        // than leaving as a bare errno.
+        return Err(TrimFailure::NoFilesystem(format!(
+            "mount-errno-{}-fs[{}]",
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or_default(),
+            std::fs::read_to_string("/proc/filesystems")
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| !line.starts_with("nodev"))
+                .map(|line| line.trim().to_string())
+                .collect::<Vec<_>>()
+                .join("+")
+        )));
+    }
+
+    // Fill, sync, delete, sync: the blocks have to have really been allocated
+    // and really been freed before FITRIM can hand them back.
+    let path = Path::new("/mnt/fill.bin");
+    if let Err(e) = fill_file(path, bytes) {
+        let _ = std::fs::remove_file(path);
+        return Err(TrimFailure::Refused(format!("fill:{e}")));
+    }
+    if let Err(e) = std::fs::remove_file(path) {
+        return Err(TrimFailure::Refused(format!("unlink:{e}")));
+    }
+    // SAFETY: no arguments, no memory; flushes the ext4 journal so the freed
+    // extents are visible to the FITRIM walk.
+    unsafe { libc::sync() };
+
+    let dir = std::fs::File::open("/mnt")
+        .map_err(|e| TrimFailure::Refused(format!("open-mnt:{e}")))?;
+    // struct fstrim_range { __u64 start; __u64 len; __u64 minlen; }
+    let mut range: [u64; 3] = [0, u64::MAX, 0];
+    // SAFETY: `dir` is a live directory fd on the mounted filesystem and
+    // `range` is a valid, fully initialised 24-byte fstrim_range for the
+    // duration of the call — exactly what FITRIM reads and writes back.
+    let rc = unsafe { libc::ioctl(dir.as_raw_fd(), FITRIM, &mut range) };
+    if rc != 0 {
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or_default();
+        // Unmount either way: the filesystem must survive a refused trim
+        // untouched, because the host boots this same image again.
+        if let Ok(target) = CString::new("/mnt") {
+            // SAFETY: one valid NUL-terminated path that outlives the call.
+            unsafe { libc::umount(target.as_ptr()) };
+        }
+        return Err(TrimFailure::Refused(format!("fitrim-errno-{errno}")));
+    }
+    // FITRIM writes the number of bytes trimmed back into `len`.
+    let trimmed = range[1];
+    // Unmount so the host sees a clean filesystem afterwards.
+    if let Ok(target) = CString::new("/mnt") {
+        // SAFETY: one valid NUL-terminated path that outlives the call.
+        unsafe { libc::umount(target.as_ptr()) };
+    }
+    Ok(trimmed)
+}
+
+/// Route 2: no filesystem, the raw block-device discard `blkdiscard(8)` uses.
+fn blkdiscard_route(bytes: u64) -> Result<u64, String> {
+    let mut device = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/vda")
+        .map_err(|e| format!("open:{e}"))?;
+    let chunk = vec![0xa5u8; CHUNK];
+    let mut written = 0u64;
+    while written < bytes {
+        let n = ((bytes - written) as usize).min(chunk.len());
+        device
+            .write_all(&chunk[..n])
+            .map_err(|e| format!("write:{e}"))?;
+        written += n as u64;
+    }
+    device.sync_all().map_err(|e| format!("sync:{e}"))?;
+
+    // BLKDISCARD takes { u64 start; u64 len; }.
+    let range: [u64; 2] = [0, bytes];
+    // SAFETY: `device` is a live block-device fd opened for writing and `range`
+    // is a valid, fully initialised 16-byte argument for the duration of the
+    // call. The range is inside the device: the write above succeeded over
+    // exactly it.
+    let rc = unsafe { libc::ioctl(device.as_raw_fd(), BLKDISCARD, &range) };
+    if rc != 0 {
+        return Err(format!(
+            "errno-{}",
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or_default()
+        ));
+    }
+    device.sync_all().map_err(|e| format!("post-sync:{e}"))?;
+    Ok(bytes)
+}
+
+/// Writes `bytes` bytes of recognisable data to `path` and fsyncs it, so the
+/// filesystem really has allocated blocks to free afterwards.
+fn fill_file(path: &Path, bytes: u64) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    let chunk = vec![0x5au8; CHUNK];
+    let mut written = 0u64;
+    while written < bytes {
+        let n = ((bytes - written) as usize).min(chunk.len());
+        file.write_all(&chunk[..n])?;
+        written += n as u64;
+    }
+    file.sync_all()
 }
 
 /// Reports what the kernel found on the PCI bus, and how much of it bound to a

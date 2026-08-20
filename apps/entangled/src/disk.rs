@@ -145,6 +145,10 @@ pub fn mv(path: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Below this, the gap between apparent and allocated is not worth a paragraph
+/// of advice — a fresh or tiny image has nothing to reclaim.
+const RECLAIM_HINT_THRESHOLD: u64 = 256 << 20;
+
 /// The human-readable `disk inspect` rendering.
 fn render_report(report: &DiskReport) -> String {
     use std::fmt::Write as _;
@@ -163,6 +167,28 @@ fn render_report(report: &DiskReport) -> String {
         None => size.push_str(" · on-disk size unavailable"),
     }
     let _ = writeln!(out, "  size:   {size}");
+
+    // The two numbers above only ever converge, never diverge, by themselves: a
+    // sparse image grows as the guest writes and nothing shrinks it again unless
+    // the guest hands the blocks back. The device offers VIRTIO_BLK_F_DISCARD, so
+    // it can — but only when something inside asks. Worth saying wherever the
+    // gap is big enough to be worth reclaiming.
+    if let Some(allocated) = report.allocated_bytes {
+        if allocated > RECLAIM_HINT_THRESHOLD {
+            let _ = writeln!(
+                out,
+                "  reclaim: run `fstrim -av` in the guest (or mount it with `discard`) to hand"
+            );
+            let _ = writeln!(
+                out,
+                "           unused blocks back to the host: the image then takes less room on"
+            );
+            let _ = writeln!(
+                out,
+                "           disk, without ever looking smaller to the guest"
+            );
+        }
+    }
 
     let table = match (&report.table, &report.disk_guid) {
         (disk_image::TableKind::Gpt, Some(guid)) => format!("GPT (disk GUID {guid})"),
@@ -245,6 +271,9 @@ mod tests {
         assert!(text.contains("x.nvram"), "{text}");
         assert!(text.contains("EFI System"), "{text}");
         assert!(text.contains("LBA 2048+2048"), "{text}");
+        // 4 GiB allocated out of 16 GiB apparent: worth telling the user how to
+        // get some of it back.
+        assert!(text.contains("fstrim"), "{text}");
     }
 
     #[test]
@@ -263,5 +292,7 @@ mod tests {
         assert!(text.contains("partitions: none"), "{text}");
         assert!(text.contains("on-disk size unavailable"), "{text}");
         assert!(text.contains("no .nvram sidecar"), "{text}");
+        // Nothing is allocated, so there is nothing to reclaim and no advice.
+        assert!(!text.contains("fstrim"), "{text}");
     }
 }

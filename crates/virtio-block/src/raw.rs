@@ -8,7 +8,25 @@
 use std::fs::File;
 use std::path::Path;
 
+use disk_image::PunchOutcome;
+
 use crate::request::{BlockError, SECTOR_SIZE};
+
+/// Which of the two reclaim commands a log line is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimKind {
+    Discard,
+    WriteZeroes,
+}
+
+impl ReclaimKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReclaimKind::Discard => "discard",
+            ReclaimKind::WriteZeroes => "write-zeroes",
+        }
+    }
+}
 
 /// An opened RAW disk image.
 #[derive(Debug)]
@@ -16,6 +34,10 @@ pub struct RawDisk {
     file: File,
     capacity_sectors: u64,
     read_only: bool,
+    /// Set once the reclaim mechanism has been reported for each command, so a
+    /// guest `fstrim` produces one log line rather than one per range.
+    discard_logged: bool,
+    write_zeroes_logged: bool,
 }
 
 impl RawDisk {
@@ -50,6 +72,8 @@ impl RawDisk {
             file,
             capacity_sectors: len / SECTOR_SIZE,
             read_only: !writable,
+            discard_logged: false,
+            write_zeroes_logged: false,
         })
     }
 
@@ -73,6 +97,8 @@ impl RawDisk {
             file,
             capacity_sectors: len / SECTOR_SIZE,
             read_only: !writable,
+            discard_logged: false,
+            write_zeroes_logged: false,
         })
     }
 
@@ -97,6 +123,76 @@ impl RawDisk {
         }
         positional_write(&mut self.file, buf, offset)
             .map_err(|source| BlockError::Io { offset, source })
+    }
+
+    /// `VIRTIO_BLK_T_DISCARD`: the guest has stopped needing these bytes, so
+    /// give them back to the host filesystem.
+    ///
+    /// A discard is a hint. Where the filesystem cannot punch holes this
+    /// changes nothing and still reports success, which the spec allows and the
+    /// guest cannot tell apart from a device that reclaimed nothing useful. The
+    /// one thing it must never do is *pretend* — hence the log line naming the
+    /// mechanism, once per disk.
+    pub fn discard(&mut self, offset: u64, len: u64) -> Result<(), BlockError> {
+        if self.read_only {
+            return Err(BlockError::ReadOnly);
+        }
+        let outcome = disk_image::punch_hole(&self.file, offset, len).map_err(|source| {
+            BlockError::Discard {
+                offset,
+                len,
+                source,
+            }
+        })?;
+        self.report(ReclaimKind::Discard, outcome);
+        Ok(())
+    }
+
+    /// `VIRTIO_BLK_T_WRITE_ZEROES`: these bytes must read back as zeros
+    /// afterwards, whatever the host filesystem can or cannot deallocate.
+    ///
+    /// `unmap` is the guest's permission to reclaim the space as well; without
+    /// it the blocks stay provisioned and real zeros are written.
+    pub fn write_zeroes(&mut self, offset: u64, len: u64, unmap: bool) -> Result<(), BlockError> {
+        if self.read_only {
+            return Err(BlockError::ReadOnly);
+        }
+        let outcome =
+            disk_image::write_zeroes(&self.file, offset, len, unmap).map_err(|source| {
+                BlockError::Discard {
+                    offset,
+                    len,
+                    source,
+                }
+            })?;
+        self.report(ReclaimKind::WriteZeroes, outcome);
+        Ok(())
+    }
+
+    /// Logs the mechanism the host actually used — once per disk per command,
+    /// not once per request: on a busy `fstrim` this is thousands of calls.
+    fn report(&mut self, kind: ReclaimKind, outcome: PunchOutcome) {
+        let logged = match kind {
+            ReclaimKind::Discard => &mut self.discard_logged,
+            ReclaimKind::WriteZeroes => &mut self.write_zeroes_logged,
+        };
+        if *logged {
+            return;
+        }
+        *logged = true;
+        let command = kind.as_str();
+        match outcome {
+            PunchOutcome::Unsupported => tracing::warn!(
+                command,
+                "host filesystem cannot punch holes; discards will not reclaim space \
+                 (move the image to ext4/xfs/btrfs or NTFS to get reclaim)"
+            ),
+            other => tracing::info!(
+                command,
+                mechanism = other.as_str(),
+                "virtio-blk reclaim path chosen"
+            ),
+        }
     }
 
     /// `VIRTIO_BLK_T_FLUSH`: guarantee everything written so far is on stable

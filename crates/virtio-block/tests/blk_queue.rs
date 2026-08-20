@@ -12,15 +12,22 @@
 //!   read-only rejection, reset survival, two coexisting devices;
 //! * "malicious guest": looped chains, indices past the ring, buffers outside
 //!   guest RAM, zero-length and oversized requests, out-of-range sectors,
-//!   missing status bytes, indirect descriptors. None of them may panic.
+//!   missing status bytes, indirect descriptors, and every shape of malformed
+//!   DISCARD / WRITE_ZEROES segment array. None of them may panic.
 
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use virtio_block::device::{VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO};
-use virtio_block::{BlockDevice, RawDisk, SECTOR_SIZE, S_IOERR, S_OK, S_UNSUPP};
+use virtio_block::device::{
+    VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_F_WRITE_ZEROES,
+};
+use virtio_block::{
+    BlockDevice, RawDisk, DISCARD_SECTOR_ALIGNMENT, MAX_DISCARD_SECTORS, MAX_DISCARD_SEG,
+    MAX_WRITE_ZEROES_SECTORS, SECTOR_SIZE, S_IOERR, S_OK, S_UNSUPP, WRITE_ZEROES_FLAG_UNMAP,
+    WRITE_ZEROES_MAY_UNMAP,
+};
 use virtio_core::chain::{VIRTQ_DESC_F_INDIRECT, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use virtio_core::status;
 use virtio_core::testing::{guest_memory, SplitRing, TestIrqLine};
@@ -32,6 +39,9 @@ const RING_BASE: u64 = 0x1000;
 const RING_SIZE: u16 = 16;
 /// Scratch guest buffers live well clear of the ring.
 const BUF_BASE: u64 = 0x8000;
+/// Where the reclaim tests lay out their segment arrays (clear of BUF_BASE's
+/// own scratch range, which reaches 0x8000 + 0x4000).
+const ARRAY_BASE: u64 = BUF_BASE + 0x20000;
 const DISK_SECTORS: u64 = 32;
 
 /// virtio-blk request types, as the guest writes them.
@@ -39,6 +49,10 @@ const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
 const T_GET_ID: u32 = 8;
+const T_DISCARD: u32 = 11;
+const T_WRITE_ZEROES: u32 = 13;
+/// `VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP`, as the guest writes it.
+const UNMAP: u32 = WRITE_ZEROES_FLAG_UNMAP;
 
 static NEXT_IMAGE: AtomicUsize = AtomicUsize::new(0);
 
@@ -77,6 +91,26 @@ impl Harness {
         Self::around(device, path)
     }
 
+    /// A writable disk whose *driver* refuses to negotiate `deny`, so the
+    /// device sees those features un-acked even though it offered them.
+    fn denying(deny: u64) -> Self {
+        let path = temp_image(DISK_SECTORS);
+        let device = BlockDevice::open(&path, true).expect("open image");
+        let mem = Arc::new(guest_memory(MEM_SIZE));
+        let irq = Arc::new(TestIrqLine::default());
+        let transport = MmioTransport::new(0, Box::new(device), Arc::clone(&mem), irq.clone())
+            .expect("transport accepts the device");
+        let mut harness = Harness {
+            mem,
+            ring: SplitRing::layout(RING_BASE, RING_SIZE),
+            transport,
+            irq,
+            path,
+        };
+        harness.bring_up_denying(deny);
+        harness
+    }
+
     fn around(device: BlockDevice, path: PathBuf) -> Self {
         let mem = Arc::new(guest_memory(MEM_SIZE));
         let irq = Arc::new(TestIrqLine::default());
@@ -108,14 +142,20 @@ impl Harness {
     /// Full driver bring-up: read the offered features, accept all of them,
     /// program the ring, set DRIVER_OK.
     fn bring_up(&mut self) {
+        self.bring_up_denying(0);
+    }
+
+    /// Same, with `deny` masked out of what the driver writes back — the way a
+    /// guest kernel without the feature behaves.
+    fn bring_up_denying(&mut self, deny: u64) {
         assert_eq!(self.read32(mmio::MAGIC_VALUE), mmio::MAGIC);
         assert_eq!(self.read32(mmio::VERSION_REG), 2);
         assert_eq!(self.read32(mmio::DEVICE_ID), 2, "virtio-blk device id");
 
         self.write32(mmio::DEVICE_FEATURES_SEL, 0);
-        let low = self.read32(mmio::DEVICE_FEATURES);
+        let low = self.read32(mmio::DEVICE_FEATURES) & !(deny as u32);
         self.write32(mmio::DEVICE_FEATURES_SEL, 1);
-        let high = self.read32(mmio::DEVICE_FEATURES);
+        let high = self.read32(mmio::DEVICE_FEATURES) & !((deny >> 32) as u32);
 
         self.write32(mmio::STATUS, status::ACKNOWLEDGE);
         self.write32(mmio::STATUS, status::ACKNOWLEDGE | status::DRIVER);
@@ -157,6 +197,20 @@ impl Harness {
         self.write32(mmio::DEVICE_FEATURES_SEL, 1);
         let high = u64::from(self.read32(mmio::DEVICE_FEATURES));
         low | (high << 32)
+    }
+
+    /// A 32-bit config-space field at `offset` inside
+    /// `struct virtio_blk_config`.
+    fn config32(&mut self, offset: u64) -> u32 {
+        let mut raw = [0u8; 4];
+        self.transport.read(mmio::CONFIG_SPACE + offset, &mut raw);
+        u32::from_le_bytes(raw)
+    }
+
+    fn config8(&mut self, offset: u64) -> u8 {
+        let mut raw = [0u8; 1];
+        self.transport.read(mmio::CONFIG_SPACE + offset, &mut raw);
+        raw[0]
     }
 
     fn capacity_from_config(&mut self) -> u64 {
@@ -919,4 +973,410 @@ fn one_notification_is_bounded_and_never_truncates_a_full_ring() {
     }
     // One interrupt for the whole batch, not one per chain.
     assert_eq!(h.irq.count(), 1);
+}
+
+// ====================================================== discard / write-zeroes
+//
+// The reclaim commands are the one place where a guest hands the device a whole
+// *array* of ranges, so there are two attack surfaces rather than one: the
+// array's shape and each range inside it. Every test below asserts the status
+// byte the spec asks for and, where it matters, that the image did not change.
+
+/// Writes `segments` as a `struct virtio_blk_discard_write_zeroes` array and
+/// runs one reclaim request over it. Returns `(status, used_len)`.
+fn run_reclaim(h: &mut Harness, kind: u32, segments: &[(u64, u32, u32)]) -> (u8, u32) {
+    let array = ARRAY_BASE;
+    let mut bytes = Vec::with_capacity(segments.len() * 16);
+    for &(sector, num_sectors, flags) in segments {
+        bytes.extend_from_slice(&sector.to_le_bytes());
+        bytes.extend_from_slice(&num_sectors.to_le_bytes());
+        bytes.extend_from_slice(&flags.to_le_bytes());
+    }
+    h.write_mem(array, &bytes);
+    let len = u32::try_from(bytes.len()).expect("test arrays stay small");
+    let status_addr = BUF_BASE + 0x800;
+    h.run_request(kind, 0, &[(array, len, false)], status_addr)
+}
+
+/// Fills `sectors` sectors from `first` with `byte`, in request-sized pieces.
+fn fill(h: &mut Harness, first: u64, sectors: u64, byte: u8) {
+    // 128 sectors = 64 KiB per request, which keeps the scratch buffers clear
+    // of ARRAY_BASE.
+    const PIECE: u64 = 128;
+    let mut at = first;
+    while at < first + sectors {
+        let this = PIECE.min(first + sectors - at);
+        let payload = vec![byte; (this * SECTOR_SIZE) as usize];
+        assert_eq!(h.write_sectors(at, &payload), S_OK);
+        at += this;
+    }
+}
+
+/// Reads `sectors` sectors from `first` back through the device and asserts
+/// every byte is zero.
+fn assert_reads_zero(h: &mut Harness, first: u64, sectors: u64) {
+    const PIECE: u64 = 128;
+    let mut at = first;
+    while at < first + sectors {
+        let this = PIECE.min(first + sectors - at);
+        let (status, data) = h.read_sectors(at, (this * SECTOR_SIZE) as usize);
+        assert_eq!(status, S_OK);
+        assert!(
+            data.iter().all(|&b| b == 0),
+            "sector {at} did not read back as zeros"
+        );
+        at += this;
+    }
+}
+
+#[test]
+fn reclaim_features_and_their_limits_are_advertised() {
+    let mut h = Harness::new(true);
+    let features = h.device_features();
+    assert_ne!(features & VIRTIO_BLK_F_DISCARD, 0);
+    assert_ne!(features & VIRTIO_BLK_F_WRITE_ZEROES, 0);
+
+    // The config fields the spec requires for each feature, at their spec
+    // offsets, carrying exactly the constants validation enforces.
+    assert_eq!(h.config32(36), MAX_DISCARD_SECTORS, "max_discard_sectors");
+    assert_eq!(h.config32(40), MAX_DISCARD_SEG, "max_discard_seg");
+    assert_eq!(
+        h.config32(44),
+        DISCARD_SECTOR_ALIGNMENT,
+        "discard_sector_alignment"
+    );
+    assert_eq!(
+        h.config32(48),
+        MAX_WRITE_ZEROES_SECTORS,
+        "max_write_zeroes_sectors"
+    );
+    assert_eq!(h.config32(52), MAX_DISCARD_SEG, "max_write_zeroes_seg");
+    assert_eq!(
+        h.config8(56),
+        WRITE_ZEROES_MAY_UNMAP,
+        "write_zeroes_may_unmap"
+    );
+    // Capacity is still where it always was, and the fields belonging to
+    // features we do not offer read back as zero.
+    assert_eq!(h.capacity_from_config(), DISK_SECTORS);
+    for offset in [8u64, 12, 16, 20, 24, 28, 32, 34, 57, 58, 59] {
+        assert_eq!(h.config8(offset), 0, "offset {offset} must read as zero");
+    }
+}
+
+/// The acceptance in miniature: sectors the guest gives back stop occupying
+/// host disk space, and read back as zeros afterwards. This is exactly what a
+/// guest `fstrim` drives.
+#[test]
+fn discard_reclaims_host_space_and_the_range_reads_back_as_zeros() {
+    // 8 MiB image, 4 MiB of real data in the middle of it.
+    let mut h = Harness::with_sectors(true, 16 * 1024);
+    fill(&mut h, 2048, 8192, 0x5a);
+    let before = disk_image::allocated_bytes(&h.path).expect("host reports allocated size");
+    assert!(
+        before >= 4 << 20,
+        "the fill should have allocated 4 MiB, got {before}"
+    );
+
+    let (status, used) = run_reclaim(&mut h, T_DISCARD, &[(2048, 8192, 0)]);
+    assert_eq!(status, S_OK);
+    assert_eq!(used, 1, "a discard writes nothing but its status byte");
+
+    let after = disk_image::allocated_bytes(&h.path).expect("host reports allocated size");
+    assert!(
+        after + (3 << 20) <= before,
+        "discarding 4 MiB must give it back: {before} -> {after}"
+    );
+    assert_eq!(
+        std::fs::metadata(&h.path).expect("image").len(),
+        16 * 1024 * SECTOR_SIZE,
+        "reclaim must never change the image size"
+    );
+    assert_reads_zero(&mut h, 2048, 8192);
+}
+
+#[test]
+fn write_zeroes_zeroes_the_range_with_and_without_unmap() {
+    let mut h = Harness::with_sectors(true, 4 * 1024);
+    fill(&mut h, 0, 4 * 1024, 0xa5);
+
+    // With unmap the device may deallocate; without it the blocks stay.
+    assert_eq!(
+        run_reclaim(&mut h, T_WRITE_ZEROES, &[(0, 512, UNMAP)]).0,
+        S_OK
+    );
+    assert_eq!(
+        run_reclaim(&mut h, T_WRITE_ZEROES, &[(1024, 512, 0)]).0,
+        S_OK
+    );
+
+    assert_reads_zero(&mut h, 0, 512);
+    assert_reads_zero(&mut h, 1024, 512);
+    // Everything either side is untouched.
+    for sector in [512u64, 1023, 1536, 4095] {
+        let (status, data) = h.read_sectors(sector, 512);
+        assert_eq!(status, S_OK);
+        assert_eq!(data, vec![0xa5u8; 512], "sector {sector} was damaged");
+    }
+}
+
+#[test]
+fn every_segment_of_a_multi_segment_request_is_applied() {
+    let mut h = Harness::with_sectors(true, 4 * 1024);
+    fill(&mut h, 0, 4 * 1024, 0x33);
+
+    let segments: Vec<(u64, u32, u32)> = (0..16).map(|i| (i * 128, 8, 0)).collect();
+    assert_eq!(run_reclaim(&mut h, T_DISCARD, &segments).0, S_OK);
+    for i in 0..16u64 {
+        assert_reads_zero(&mut h, i * 128, 8);
+        // The sector after each discarded range still has its data.
+        let (status, data) = h.read_sectors(i * 128 + 8, 512);
+        assert_eq!(status, S_OK);
+        assert_eq!(data, vec![0x33u8; 512]);
+    }
+}
+
+#[test]
+fn a_read_only_disk_offers_neither_reclaim_feature_and_refuses_both_commands() {
+    let mut h = Harness::new(false);
+    let features = h.device_features();
+    assert_ne!(features & VIRTIO_BLK_F_RO, 0);
+    assert_eq!(features & VIRTIO_BLK_F_DISCARD, 0);
+    assert_eq!(features & VIRTIO_BLK_F_WRITE_ZEROES, 0);
+    // And the whole config tail is zero, since neither feature is offered.
+    for offset in 36u64..60 {
+        assert_eq!(h.config8(offset), 0, "offset {offset}");
+    }
+    // A driver that sends them anyway is told the request is not supported:
+    // it never negotiated the feature.
+    assert_eq!(run_reclaim(&mut h, T_DISCARD, &[(0, 8, 0)]).0, S_UNSUPP);
+    assert_eq!(
+        run_reclaim(&mut h, T_WRITE_ZEROES, &[(0, 8, UNMAP)]).0,
+        S_UNSUPP
+    );
+}
+
+/// A writable disk whose driver did *not* negotiate the features must be
+/// refused too — offering a feature is not the same as it being live.
+#[test]
+fn reclaim_without_negotiating_the_feature_is_unsupported() {
+    let mut h = Harness::denying(VIRTIO_BLK_F_DISCARD | VIRTIO_BLK_F_WRITE_ZEROES);
+    fill(&mut h, 0, 32, 0x77);
+    assert_eq!(run_reclaim(&mut h, T_DISCARD, &[(0, 8, 0)]).0, S_UNSUPP);
+    assert_eq!(
+        run_reclaim(&mut h, T_WRITE_ZEROES, &[(0, 8, 0)]).0,
+        S_UNSUPP
+    );
+    // Nothing was touched.
+    let (status, data) = h.read_sectors(0, 512);
+    assert_eq!(status, S_OK);
+    assert_eq!(data, vec![0x77u8; 512]);
+}
+
+// ------------------------------------------------------------ malicious guest
+
+#[test]
+fn reserved_flag_bits_and_a_misplaced_unmap_bit_are_unsupported() {
+    let mut h = Harness::with_sectors(true, 1024);
+    fill(&mut h, 0, 1024, 0x11);
+
+    for flags in [2u32, 4, 0x8000_0000, u32::MAX] {
+        assert_eq!(
+            run_reclaim(&mut h, T_DISCARD, &[(0, 8, flags)]).0,
+            S_UNSUPP,
+            "discard flags {flags:#x}"
+        );
+        assert_eq!(
+            run_reclaim(&mut h, T_WRITE_ZEROES, &[(0, 8, flags)]).0,
+            S_UNSUPP,
+            "write-zeroes flags {flags:#x}"
+        );
+    }
+    // `unmap` is defined for write-zeroes only.
+    assert_eq!(run_reclaim(&mut h, T_DISCARD, &[(0, 8, UNMAP)]).0, S_UNSUPP);
+
+    // Every one of those refusals left the image alone.
+    let (status, data) = h.read_sectors(0, 512);
+    assert_eq!(status, S_OK);
+    assert_eq!(data, vec![0x11u8; 512]);
+}
+
+#[test]
+fn out_of_range_and_oversized_segments_are_io_errors() {
+    let mut h = Harness::with_sectors(true, 1024);
+    fill(&mut h, 0, 1024, 0x22);
+
+    let cases: &[(u64, u32)] = &[
+        (1024, 8),                     // starts at the end of the disk
+        (1020, 8),                     // ends past it
+        (0, u32::MAX),                 // absurd length
+        (u64::MAX, 8),                 // start overflows the addition
+        (u64::MAX - 3, 8),             // end wraps
+        (0, MAX_DISCARD_SECTORS + 1),  // above the advertised per-segment max
+        (0, MAX_WRITE_ZEROES_SECTORS), // fits the disk? no: 64Ki sectors > 1024
+    ];
+    for &(sector, num_sectors) in cases {
+        assert_eq!(
+            run_reclaim(&mut h, T_DISCARD, &[(sector, num_sectors, 0)]).0,
+            S_IOERR,
+            "sector {sector} + {num_sectors} sectors"
+        );
+    }
+    assert_eq!(
+        run_reclaim(
+            &mut h,
+            T_WRITE_ZEROES,
+            &[(0, MAX_WRITE_ZEROES_SECTORS + 1, 0)]
+        )
+        .0,
+        S_IOERR
+    );
+    let (status, data) = h.read_sectors(0, 512);
+    assert_eq!(status, S_OK);
+    assert_eq!(data, vec![0x22u8; 512]);
+}
+
+/// Validation runs over the *whole* array before anything is punched, so one
+/// poisoned segment among good ones costs the guest the request and nothing
+/// else. A device that applied segments as it parsed them would fail this.
+#[test]
+fn one_bad_segment_makes_the_whole_request_a_no_op() {
+    let mut h = Harness::with_sectors(true, 1024);
+    fill(&mut h, 0, 1024, 0x44);
+
+    let mut segments: Vec<(u64, u32, u32)> = (0..8).map(|i| (i * 64, 8, 0)).collect();
+    segments.push((1024, 8, 0)); // past the end of the disk
+    assert_eq!(run_reclaim(&mut h, T_DISCARD, &segments).0, S_IOERR);
+
+    // Not one of the eight legal ranges was applied.
+    for i in 0..8u64 {
+        let (status, data) = h.read_sectors(i * 64, 512);
+        assert_eq!(status, S_OK);
+        assert_eq!(data, vec![0x44u8; 512], "segment {i} was applied anyway");
+    }
+}
+
+#[test]
+fn a_malformed_segment_array_is_unsupported_and_too_many_segments_is_an_io_error() {
+    let mut h = Harness::with_sectors(true, 1024);
+    let status_addr = BUF_BASE + 0x800;
+
+    // Lengths that are not a whole number of 16-byte segments, and an empty
+    // payload: the driver got the wire format wrong.
+    for len in [1u32, 8, 15, 17, 31] {
+        h.write_mem(ARRAY_BASE, &vec![0u8; len as usize]);
+        let (status, _) = h.run_request(T_DISCARD, 0, &[(ARRAY_BASE, len, false)], status_addr);
+        assert_eq!(status, S_UNSUPP, "a {len}-byte segment array");
+    }
+    // No device-readable payload at all: same answer.
+    let (status, _) = h.run_request(T_DISCARD, 0, &[], status_addr);
+    assert_eq!(status, S_UNSUPP);
+    // A device-writable "array" is not readable payload either.
+    let (status, _) = h.run_request(T_DISCARD, 0, &[(ARRAY_BASE, 16, true)], status_addr);
+    assert_eq!(status, S_UNSUPP);
+
+    // One segment more than advertised is a limit violation, not a malformed
+    // request.
+    let over = (MAX_DISCARD_SEG + 1) as usize;
+    h.write_mem(ARRAY_BASE, &vec![0u8; over * 16]);
+    let len = u32::try_from(over * 16).expect("fits");
+    let (status, _) = h.run_request(T_DISCARD, 0, &[(ARRAY_BASE, len, false)], status_addr);
+    assert_eq!(status, S_IOERR);
+
+    // Exactly the advertised maximum is accepted (all zero-length segments, so
+    // it is a legal no-op).
+    let max = MAX_DISCARD_SEG as usize;
+    h.write_mem(ARRAY_BASE, &vec![0u8; max * 16]);
+    let len = u32::try_from(max * 16).expect("fits");
+    let (status, _) = h.run_request(T_DISCARD, 0, &[(ARRAY_BASE, len, false)], status_addr);
+    assert_eq!(status, S_OK);
+}
+
+#[test]
+fn a_segment_array_outside_guest_memory_is_an_io_error() {
+    let mut h = Harness::with_sectors(true, 1024);
+    let status_addr = BUF_BASE + 0x800;
+    for addr in [MEM_SIZE, MEM_SIZE - 8, u64::MAX - 15] {
+        let (status, _) = h.run_request(T_DISCARD, 0, &[(addr, 16, false)], status_addr);
+        assert_eq!(status, S_IOERR, "array at {addr:#x}");
+    }
+}
+
+/// A segment array split across several descriptors, including a zero-length
+/// one, still describes the same segments — the device concatenates the
+/// device-readable payload rather than assuming one buffer.
+#[test]
+fn a_segment_array_split_across_descriptors_is_reassembled() {
+    let mut h = Harness::with_sectors(true, 1024);
+    fill(&mut h, 0, 1024, 0x66);
+
+    let mut bytes = Vec::new();
+    for (sector, num_sectors) in [(0u64, 8u32), (64, 8)] {
+        bytes.extend_from_slice(&sector.to_le_bytes());
+        bytes.extend_from_slice(&num_sectors.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+    }
+    // Split mid-segment on purpose: 12 + 0 + 20 bytes.
+    h.write_mem(ARRAY_BASE, &bytes[..12]);
+    h.write_mem(ARRAY_BASE + 0x100, &bytes[12..]);
+    let status_addr = BUF_BASE + 0x800;
+    let (status, _) = h.run_request(
+        T_DISCARD,
+        0,
+        &[
+            (ARRAY_BASE, 12, false),
+            (ARRAY_BASE + 0x200, 0, false),
+            (ARRAY_BASE + 0x100, 20, false),
+        ],
+        status_addr,
+    );
+    assert_eq!(status, S_OK);
+    assert_reads_zero(&mut h, 0, 8);
+    assert_reads_zero(&mut h, 64, 8);
+    let (status, data) = h.read_sectors(8, 512);
+    assert_eq!(status, S_OK);
+    assert_eq!(data, vec![0x66u8; 512]);
+}
+
+/// Zero-sector segments are legal no-ops, at any sector the disk contains — and
+/// at its very end, which is the one place an off-by-one would show.
+#[test]
+fn zero_length_segments_are_harmless_no_ops() {
+    let mut h = Harness::with_sectors(true, 1024);
+    fill(&mut h, 0, 1024, 0x88);
+    assert_eq!(
+        run_reclaim(&mut h, T_DISCARD, &[(0, 0, 0), (512, 0, 0), (1024, 0, 0)]).0,
+        S_OK
+    );
+    assert_eq!(
+        run_reclaim(&mut h, T_WRITE_ZEROES, &[(1024, 0, UNMAP)]).0,
+        S_OK
+    );
+    let (status, data) = h.read_sectors(0, 512);
+    assert_eq!(status, S_OK);
+    assert_eq!(data, vec![0x88u8; 512]);
+    // One sector past the end is still refused, zero-length or not.
+    assert_eq!(run_reclaim(&mut h, T_DISCARD, &[(1025, 0, 0)]).0, S_IOERR);
+}
+
+/// Reclaim survives a device reset: the features are re-offered, the limits are
+/// the same, and the commands still work after bring-up number two.
+#[test]
+fn reclaim_survives_a_device_reset() {
+    let mut h = Harness::with_sectors(true, 1024);
+    fill(&mut h, 0, 1024, 0x99);
+    assert_eq!(run_reclaim(&mut h, T_DISCARD, &[(0, 8, 0)]).0, S_OK);
+
+    h.write32(mmio::STATUS, 0);
+    assert!(!h.transport.is_activated());
+    h.bring_up();
+
+    assert_ne!(h.device_features() & VIRTIO_BLK_F_DISCARD, 0);
+    assert_eq!(h.config32(36), MAX_DISCARD_SECTORS);
+    assert_eq!(
+        run_reclaim(&mut h, T_WRITE_ZEROES, &[(64, 8, UNMAP)]).0,
+        S_OK
+    );
+    assert_reads_zero(&mut h, 0, 8);
+    assert_reads_zero(&mut h, 64, 8);
 }
