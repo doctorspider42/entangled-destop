@@ -3,17 +3,18 @@
 mod disk;
 mod doctor;
 mod fetch;
-#[cfg(target_os = "linux")]
+/// `install` and `run` exist wherever a hypervisor backend does (KVM or WHP);
+/// any other OS still gets config validation and a typed refusal. The installer
+/// itself is portable — it drives the same `run_vm` both hosts share, and every
+/// file it produces (preseed cpio, NoCloud seed, profile) is logic over bytes.
+#[cfg(any(target_os = "linux", windows))]
 mod install;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod install_ubuntu;
-/// The run path exists wherever a hypervisor backend does (KVM or WHP); any
-/// other OS still gets config validation and a typed refusal.
+mod paths;
 #[cfg(any(target_os = "linux", windows))]
 mod run_vm;
-/// The cloud-init NoCloud seed builder, used only by `install` (Linux): on
-/// Windows the whole module is dead code and `-D warnings` says so.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod seed;
 
 use std::path::PathBuf;
@@ -24,6 +25,17 @@ use clap::{Args, Parser, Subcommand};
 /// The version stamped into this build: the release pipeline's
 /// `ENTANGLED_VERSION` when set, the workspace version otherwise (build.rs).
 const VERSION: &str = env!("ENTANGLED_VERSION");
+
+/// `install --network`'s default: a host TAP on Linux (which is what every
+/// existing script and profile expects), the in-process user-mode NAT on
+/// Windows, which has no TAP and no GPL-free driver that could give it one
+/// (ADR-0002). Declared here rather than in `install` because clap needs it on
+/// every host, including one with no hypervisor backend at all.
+pub const DEFAULT_NETWORK: &str = if cfg!(target_os = "linux") {
+    "tap"
+} else {
+    "usernet"
+};
 
 #[derive(Parser)]
 #[command(
@@ -138,9 +150,12 @@ pub struct InstallArgs {
     /// Distribution to install: "debian" (d-i, direct kernel boot) or "ubuntu"
     /// (live-server ISO through UEFI, unattended autoinstall).
     pub distro: String,
-    /// Target RAW disk image; created if missing.
+    /// Target RAW disk image; created if missing. Defaults to
+    /// <vm dir>/<name>.raw, where the VM directory is the manager's
+    /// (~/entangled-vms, %USERPROFILE%\entangled-vms on Windows, or whatever
+    /// its manager.toml says) so both surfaces list the same machines.
     #[arg(long)]
-    pub disk: PathBuf,
+    pub disk: Option<PathBuf>,
     #[arg(long, default_value = "gtk-netboot")]
     pub variant: String,
     /// Fully automated installation with the built-in Weston test profile
@@ -170,9 +185,15 @@ pub struct InstallArgs {
     /// Installer VM memory in MiB.
     #[arg(long, default_value_t = 1536)]
     pub memory_mib: u64,
-    /// Host TAP interface (see scripts/setup-tap.sh).
+    /// Host TAP interface (see scripts/setup-tap.sh), for --network tap.
     #[arg(long, default_value = "entangled0")]
     pub interface: String,
+    /// Installer network: "tap" (a host interface, Linux only), "usernet"
+    /// (user-mode NAT inside this process — no host setup, no administrator) or
+    /// "none" (offline; Ubuntu installs offline anyway). Defaults to tap on
+    /// Linux and usernet on Windows, which has no TAP.
+    #[arg(long, default_value = DEFAULT_NETWORK)]
+    pub network: String,
     /// VM/profile name (defaults to the disk file stem).
     #[arg(long)]
     pub name: Option<String>,
@@ -209,16 +230,16 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Doctor => doctor::run(),
         Command::Fetch(args) => fetch::run(&args),
         Command::Install(args) => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             {
                 install::run(&args)
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", windows)))]
             {
                 Err(format!(
-                    "install {} --disk {} requires a Linux host with KVM (on Windows use WSL2)",
-                    args.distro,
-                    args.disk.display()
+                    "install {} needs a Linux host with KVM or a Windows host with the \
+                     Windows Hypervisor Platform",
+                    args.distro
                 ))
             }
         }

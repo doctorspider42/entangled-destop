@@ -628,13 +628,36 @@ mod host_api {
 
     /// The command line a direct-Linux guest boots with: the profile's own,
     /// plus whatever the network backend asked for, plus the transport clauses.
+    ///
+    /// A profile that spells out its own `ip=` wins. The backend's clause is a
+    /// convenience for a guest that was told nothing, and the kernel takes the
+    /// *last* `ip=` it is given — so appending ours would silently override the
+    /// author's, and `ip=dhcp` (the one way to exercise the usernet DHCP server
+    /// from a real kernel) could never be asked for.
     pub(super) fn direct_linux_cmdline(
         configured: &str,
         net_cmdline: Option<&str>,
         transport_clauses: &str,
     ) -> String {
-        let with_net = extend_cmdline(configured, net_cmdline.unwrap_or(""));
+        let net = match net_cmdline {
+            Some(_) if names_clause(configured, "ip=") => {
+                tracing::info!(
+                    "the profile's command line configures the network itself; leaving the \
+                     backend's ip= clause off"
+                );
+                None
+            }
+            other => other,
+        };
+        let with_net = extend_cmdline(configured, net.unwrap_or(""));
         extend_cmdline(&with_net, transport_clauses)
+    }
+
+    /// Whether `cmdline` already carries a clause with this prefix. Split on
+    /// whitespace rather than searched as a substring: `panic=1 nfsrootdebug`
+    /// must not look like it carries `ip=`.
+    fn names_clause(cmdline: &str, prefix: &str) -> bool {
+        cmdline.split_whitespace().any(|c| c.starts_with(prefix))
     }
 }
 
@@ -1122,6 +1145,30 @@ mod tests {
         assert_eq!(
             direct_linux_cmdline("console=ttyS0", None, ""),
             "console=ttyS0"
+        );
+    }
+
+    /// A profile that configures the network itself keeps its own clause: the
+    /// kernel honours the last `ip=` it is handed, so appending the backend's
+    /// would quietly overrule the author — and `ip=dhcp`, the only way to make a
+    /// real kernel talk to the usernet DHCP server, could never be asked for.
+    #[test]
+    fn the_profiles_own_ip_clause_wins() {
+        let backend = Some("ip=192.168.74.15::192.168.74.1:255.255.255.0::eth0:off:192.168.74.1");
+        assert_eq!(
+            direct_linux_cmdline(
+                "console=ttyS0 ip=dhcp",
+                backend,
+                "virtio_mmio.device=4K@0xd0:5"
+            ),
+            "console=ttyS0 ip=dhcp virtio_mmio.device=4K@0xd0:5"
+        );
+        // A clause that merely *contains* "ip=" is not one: `nfsrootdebug` and
+        // `noip=` style words must not suppress the backend's configuration.
+        let with_lookalike = direct_linux_cmdline("console=ttyS0 nfsrootdebug", backend, "");
+        assert!(
+            with_lookalike.contains("ip=192.168.74.15"),
+            "{with_lookalike}"
         );
     }
 }
