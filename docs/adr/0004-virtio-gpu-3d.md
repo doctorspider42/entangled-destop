@@ -539,3 +539,33 @@ drivers do not share this failure mode; renderer-crash *containment*
   phase 1 does not use — and receives Ubuntu security maintenance. When we
   need newer (Venus), we build virglrenderer ourselves and the dlopen keeps
   that invisible to the crate graph.
+
+## Amendment, 2026-08-20 — Venus is the Windows answer, and it is an epic
+
+Phase 1 rejected Venus because it needed blob resources and a shared-memory
+region the transport does not have, plus a host Vulkan ICD that WSL's dzn was
+not. That reasoning stands for *phase 1*; it is not a verdict on Windows.
+
+Recorded now because the question came up as "can WHP do 3D at all": yes, and
+WHP has nothing to do with it. The hypervisor virtualises CPU and memory. What
+blocks 3D on Windows is the host renderer — `virglrenderer` speaks EGL, which
+Windows does not provide. Everything on our side of that line is already
+portable: the command decoder, the `Renderer3d` trait and phase 2's
+out-of-process renderer protocol all build and test on Windows.
+
+Three ways to fill the gap, all licence-clean:
+
+1. **virglrenderer on ANGLE** (BSD) — the short path, no changes to our code,
+   prior art in crosvm; but it stacks a GL→D3D translation under our VIRGL→GL
+   translation, and requires building a Linux-centric C library for Windows.
+2. **Venus** — the guest's Mesa venus driver against the host's native Vulkan.
+   First-class on Windows, and on Linux hosts with a real DRM node; one
+   implementation serves both hosts, which is ADR-0002's rule applied to
+   graphics. Cost: `VIRTIO_GPU_F_RESOURCE_BLOB` and a shared-memory region on
+   both transports.
+3. **gfxstream** (Apache-2.0) — supports Windows, does GLES and Vulkan; slots
+   behind the same trait if Venus proves harder than expected.
+
+Decision: **Venus is the target** (backlog EPIC 20), ANGLE stays as the
+fallback if blob resources turn out to be the wrong hill. Either way the C
+library is loaded at runtime, never linked, exactly as phase 1 established.

@@ -765,6 +765,42 @@ Cztery fazy, wszystkie zmierzone na sprzęcie — szczegóły w
      **wpisywane do GRUB-a po konsoli szeregowej**, dokładnie tak jak zrobiłby
      to człowiek.
 
+## EPIC 20 — Venus: przekazywanie Vulkana (3D na obu hostach)
+
+| ID | Zadanie | Priorytet | Status |
+|---|---|---:|---|
+| VEN-2001 | `VIRTIO_GPU_F_RESOURCE_BLOB` + region pamięci współdzielonej na transporcie (mmio i pci) | P0 | |
+| VEN-2002 | Capset `VIRTIO_GPU_CAPSET_VENUS`, negocjacja i kontekst typu venus | P0 | |
+| VEN-2003 | Dekoder protokołu venus za istniejącym traitem `Renderer3d` (host: natywny Vulkan) | P0 | |
+| VEN-2004 | Izolacja renderera na Windowsie: `CreateProcess` + para uchwytów pod ten sam protokół co na Linuksie | P0 | |
+| VEN-2005 | Blob scanout bez kopii (dmabuf na Linuksie, pamięć współdzielona/`ID3D12Resource` na Windowsie) | P1 | |
+| VEN-2006 | Akceptacja: GNOME i `vkcube`/`vulkaninfo` w gościu na obu hostach, pomiar klatek przed/po | P0 | |
+| VEN-2007 | Fuzzing protokołu venus i limity zasobów (gość jest wrogi) | P0 | |
+
+Dlaczego Venus, a nie ANGLE — decyzja do zapisania w aneksie do
+[ADR-0004](docs/adr/0004-virtio-gpu-3d.md) przy starcie epiku:
+
+- **WHP nie jest tu przeszkodą.** Hypervisor wirtualizuje CPU i pamięć; 3D na
+  Windowsie blokuje wyłącznie brak *hosta renderera* — `virglrenderer` mówi
+  przez EGL, którego Windows nie ma. Urządzenie, protokół izolacji renderera i
+  trait `Renderer3d` są już przenośne i testowane na Windowsie (faza 2), więc
+  brakuje jednej implementacji po drugiej stronie szwu.
+- **ANGLE (BSD) byłby skrótem**: `virglrenderer` na EGL/GLES nad D3D11, zero
+  zmian w naszym kodzie, prior art w crosvm. Ale to warstwa tłumacząca GL→D3D
+  *pod* warstwą tłumaczącą VIRGL→GL, plus zbudowanie linuksocentrycznej
+  biblioteki C pod Windows — dług, który zostaje na zawsze.
+- **Venus idzie z prądem**: gość używa sterownika venus z Mesy, my dekodujemy
+  protokół na natywny Vulkan hosta — pierwszoklasowy na Windowsie i na Linuksie
+  z prawdziwym `/dev/dri`. Ta sama implementacja obsługuje oba hosty, co jest
+  regułą z ADR-0002 zastosowaną do grafiki.
+- **Cena jest znana**: blob resources wymagają regionu pamięci współdzielonej,
+  którego transport dziś nie ma (odnotowane w ADR-0004 jako powód odrzucenia
+  Venusa w fazie 1). To jest ten epik, nie łatka.
+- Warunek brzegowy: bez copyleftu. Venus/`virglrenderer` MIT, gfxstream
+  Apache-2.0, ANGLE BSD-3 — wszystkie przechodzą bramkę `cargo deny`, ale
+  biblioteka C dalej wchodzi przez `dlopen`/`LoadLibrary`, nigdy przez linker
+  (reguła z ADR-0004).
+
 # 9. Następna faza po MVP
 
 Najbardziej logiczny kolejny etap:
