@@ -15,14 +15,17 @@
 //! thread, so the egui frame loop never blocks.
 
 mod app;
+mod backend;
 mod console;
 mod diagnose;
 mod discovery;
 mod editor;
+mod hostcheck;
 mod launcher;
 mod logo;
 mod metrics;
 mod mock;
+mod picker;
 mod process;
 mod settings;
 mod theme;
@@ -70,7 +73,13 @@ enum ScreenshotView {
     Wizard,
     Settings,
     Disks,
+    /// The machine editor, on each of its sections — one surface per section,
+    /// because that is how the panels are actually reviewed.
     Editor,
+    EditorBoot,
+    EditorNetwork,
+    EditorStorage,
+    Diagnostics,
 }
 
 fn main() -> ExitCode {

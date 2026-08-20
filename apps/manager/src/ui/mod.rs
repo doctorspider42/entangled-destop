@@ -2,6 +2,7 @@
 //! sink for [`crate::app::Action`]s — no view mutates the world directly.
 
 pub mod cards;
+pub mod diagnostics;
 pub mod dialogs;
 pub mod disks;
 pub mod header;
@@ -135,6 +136,206 @@ pub fn card<R>(
     );
     let inner = add(&mut child, t);
     (inner, response)
+}
+
+// ---------------------------------------------------------------------------
+// Form rows
+// ---------------------------------------------------------------------------
+//
+// Two conventions live in this section, and every form in the product follows
+// them because every form goes through these three functions:
+//
+// 1. **The explanation is a tooltip, not body text.** A visible sentence under
+//    each field turns a short form into a wall of prose that experienced users
+//    read past and new users still do not read. The label stays short; the
+//    sentence that teaches ("NVRAM — this machine's own UEFI settings…") hangs
+//    off the label on hover. When a control is disabled, the same tooltip
+//    carries the reason.
+// 2. **One label column, one field width.** Stacked rows share
+//    [`FORM_LABEL_W`] and reserve [`FORM_TRAIL_W`] for a trailing button
+//    whether or not the row has one, so the text boxes form a straight edge and
+//    the Browse buttons line up under each other. Alignment is a property of
+//    the helper; a call site cannot drift out of it by adding a space.
+
+/// Width of the label column shared by every stacked form row.
+pub const FORM_LABEL_W: f32 = 112.0;
+/// Width reserved at the end of every row for its trailing control. Reserved
+/// even when a row has none — that is what keeps the field edges straight.
+pub const FORM_TRAIL_W: f32 = 84.0;
+/// Height of a row's label cell, so labels sit on the field's centre line.
+const FORM_ROW_H: f32 = 22.0;
+/// The difference between the width a `ComboBox` is *given* and the width it
+/// then draws: it lays the arrow out inside that budget and comes back about
+/// eleven pixels narrower. Measured, not guessed — a combo and a text field in
+/// consecutive rows have to end on the same pixel.
+const COMBO_SHRINK: f32 = 8.5;
+
+/// The width to hand a [`egui::ComboBox`] so it fills a row's field column
+/// exactly. Alignment lives in the helper, never in a call site's arithmetic.
+pub fn combo_width(field_w: f32) -> f32 {
+    (field_w + COMBO_SHRINK).max(80.0)
+}
+
+/// Pins the row width for every form row in this container, for this frame.
+///
+/// Without it each row measures `available_width()` for itself — and a
+/// container grows as wrapped notes are added to it, so row three ends up a few
+/// pixels wider than row one and the column of text boxes visibly staircases.
+/// Measuring once, before any row, is what makes the right-hand edges straight
+/// no matter what is rendered between them.
+///
+/// Call it at the top of every form section. It is idempotent and costs one
+/// memory write.
+pub fn form_scope(ui: &mut Ui) {
+    let width = ui.available_width();
+    let id = form_width_id(ui);
+    ui.data_mut(|data| data.insert_temp(id, width));
+}
+
+fn form_width_id(ui: &Ui) -> egui::Id {
+    ui.id().with("entangled-form-width")
+}
+
+fn row_width(ui: &Ui) -> f32 {
+    let id = form_width_id(ui);
+    ui.data(|data| data.get_temp::<f32>(id))
+        .unwrap_or_else(|| ui.available_width())
+}
+
+/// One labelled row: the label column, then the caller's widget, sized to the
+/// shared field width handed to the closure.
+///
+/// `tooltip` is the user-facing explanation. Pass `""` only when the label is
+/// genuinely self-explanatory; anything with jargon in it gets a sentence.
+pub fn form_row<R>(
+    ui: &mut Ui,
+    label: &str,
+    tooltip: &str,
+    add: impl FnOnce(&mut Ui, f32) -> R,
+) -> R {
+    let gap = ui.spacing().item_spacing.x;
+    let field_w = (row_width(ui) - FORM_LABEL_W - FORM_TRAIL_W - 2.0 * gap).max(140.0);
+    ui.horizontal(|ui| {
+        form_label(ui, label, tooltip);
+        add(ui, field_w)
+    })
+    .inner
+}
+
+/// The label cell: **exactly** [`FORM_LABEL_W`] wide whatever the label says,
+/// vertically centred, and the hover target for the explanation.
+///
+/// `allocate_exact_size` rather than a laid-out child, because a long label in
+/// a stretchy cell is precisely how a column of fields drifts out of
+/// alignment — "MACHINES IN" is wider than "RUNS ON", and one row would start
+/// further right than the next. The label truncates instead.
+///
+/// A tooltip nobody knows about is not documentation, so a row that has one
+/// shows a quiet `?` and the whole cell is the hover target.
+fn form_label(ui: &mut Ui, label: &str, tooltip: &str) {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(FORM_LABEL_W, FORM_ROW_H), Sense::hover());
+    let mut cell = ui.new_child(
+        UiBuilder::new()
+            .max_rect(rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    cell.spacing_mut().item_spacing.x = 4.0;
+    cell.add(egui::Label::new(faint(label)).selectable(false).truncate());
+    if !tooltip.is_empty() {
+        cell.add(
+            egui::Label::new(
+                RichText::new("?")
+                    .size(10.0)
+                    .color(theme::CYAN_DEEP)
+                    .monospace(),
+            )
+            .selectable(false),
+        );
+        response.on_hover_text(tooltip);
+    }
+}
+
+/// A row holding one path: text field, Browse button, and (optionally) a status
+/// note underneath, indented to the field column.
+///
+/// Returns `true` on the frame the Browse button was clicked; the caller turns
+/// that into a picker [`crate::app::Action`], because views never act.
+pub fn path_row(
+    ui: &mut Ui,
+    label: &str,
+    tooltip: &str,
+    value: &mut String,
+    hint: &str,
+    enabled: bool,
+) -> bool {
+    form_row(ui, label, tooltip, |ui, field_w| {
+        ui.add_enabled(
+            enabled,
+            egui::TextEdit::singleline(value)
+                .desired_width(field_w)
+                .hint_text(RichText::new(hint).color(theme::TEXT_FAINT).italics()),
+        );
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(FORM_TRAIL_W, FORM_ROW_H), Sense::hover());
+        let mut browse = ui.new_child(
+            UiBuilder::new()
+                .max_rect(rect)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        ghost_button(&mut browse, "Browse…", enabled, theme::CYAN)
+            .on_hover_text("Pick the file from your computer instead of typing its path")
+            .clicked()
+    })
+}
+
+/// A note under a form row, indented to the field column so it reads as
+/// belonging to the field above it rather than to the form, and bounded by the
+/// same field width so a long path cannot widen the form.
+pub fn form_note(ui: &mut Ui, text: RichText) {
+    let gap = ui.spacing().item_spacing.x;
+    let width = (row_width(ui) - FORM_LABEL_W - gap).max(140.0);
+    ui.horizontal(|ui| {
+        ui.add_space(FORM_LABEL_W);
+        ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.set_max_width(width);
+            ui.add(egui::Label::new(text).selectable(false).wrap());
+        });
+    });
+}
+
+/// "✓ found (4.0 MiB)" / "not there yet" for a path field, as a [`form_note`].
+///
+/// `resolved` is the path actually checked — a profile may hold a relative path
+/// that resolves against the working directory, and a badge that did not say
+/// *which* file it looked at would be worse than no badge.
+pub fn path_status_note(ui: &mut Ui, resolved: &std::path::Path, missing_hint: &str) {
+    if let Ok(meta) = std::fs::metadata(resolved) {
+        form_note(
+            ui,
+            RichText::new(format!(
+                "found: {}  ({})",
+                resolved.display(),
+                crate::discovery::format_bytes(meta.len())
+            ))
+            .color(theme::OK)
+            .size(11.0),
+        );
+    } else {
+        form_note(
+            ui,
+            RichText::new(format!("not found: {}", resolved.display()))
+                .color(theme::WARN)
+                .size(11.0),
+        );
+        if !missing_hint.is_empty() {
+            form_note(
+                ui,
+                RichText::new(missing_hint)
+                    .color(theme::TEXT_FAINT)
+                    .size(11.0),
+            );
+        }
+    }
 }
 
 /// Dim caption text.

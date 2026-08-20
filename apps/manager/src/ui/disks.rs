@@ -197,6 +197,18 @@ fn disk_row(ui: &mut egui::Ui, app: &ManagerApp, row: &DiskRow, actions: &mut Ve
                     {
                         actions.push(Action::AskDeleteDisk(row.path.clone()));
                     }
+                    if ui::ghost_button(ui, "Grow…", row.exists && !busy, theme::CYAN)
+                        .on_hover_text(if busy {
+                            "Stop the machine first"
+                        } else {
+                            "Make the disk look larger to the guest. Sparse, so nothing is \
+                             written now; shrinking is never offered because it would \
+                             destroy data."
+                        })
+                        .clicked()
+                    {
+                        actions.push(Action::AskResizeDisk(row.path.clone()));
+                    }
                     if ui::ghost_button(ui, "Move…", row.exists && !busy, theme::VIOLET)
                         .on_hover_text(if busy {
                             "Stop the machine first"

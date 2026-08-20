@@ -1,6 +1,6 @@
 ---
 name: virtio-device
-description: Implementing virtio devices and both virtio transports (mmio and pci) for Entangled Desktop — virtqueues, feature negotiation, PCI config space, irqfd/ioeventfd, and the untrusted-guest safety rules (backlog EPICs 3, 4, 5, 8, 9, 19; crates virtio-core, virtio-block, virtio-net, virtio-gpu, virtio-input). Load before any virtio work.
+description: Implementing virtio devices and both virtio transports (mmio and pci) for Entangled Desktop — virtqueues, feature negotiation, PCI config space, irqfd/ioeventfd, and the untrusted-guest safety rules (backlog EPICs 3, 4, 5, 8, 9, 19, 21; crates virtio-core, virtio-block, virtio-net, virtio-gpu, virtio-input, virtio-sound). Load before any virtio work.
 ---
 
 # VirtIO devices
@@ -175,15 +175,33 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_gpu::remote::MAX_FRAME_BYTES` | 40 MiB | bytes in one message either way across the renderer-process boundary, refused *before* reserving | `remote::tests::an_oversized_length_header_is_refused_before_allocating`, fuzz target `gpu_remote_protocol` |
 | `virtio_gpu::remote::protocol::REMOTE_XFER_WINDOW` / `REMOTE_MAX_BACKING` | 8 MiB / 64 MiB | backing bytes per transfer across that boundary / shadow backing per resource | `gpu_remote::the_isolated_renderer_serves_the_whole_3d_path` (round trip), server-side refusal |
 | `virtio_gpu::renderer::MAX_3D_WIDTH` / `MAX_3D_DIM` / `MAX_3D_ARRAY` / `MAX_3D_LAST_LEVEL` / `MAX_3D_SAMPLES` | 2²⁸ / 16384 / 2048 / 15 / 32 | per-axis geometry of one `RESOURCE_CREATE_3D` | `gpu_3d::a_malicious_3d_guest_is_answered_in_band` |
+| `virtio_gpu::blob::MAX_BLOB_RESOURCES` | 4096 | live blob resources (VEN-2001) | `blob::tests::the_resource_count_and_byte_budgets_hold`, fuzz target `gpu_blob` |
+| `virtio_gpu::blob::MAX_BLOB_BYTES` | 1 GiB | size of one blob; also the size the helper re-checks on its own side | `blob::tests::sizes_must_be_whole_pages_inside_the_budget`, `gpu_blob::a_malicious_blob_guest_is_answered_in_band` |
+| `virtio_gpu::blob::MAX_TOTAL_BLOB_BYTES` | 4 GiB | bytes promised across every live blob | `blob::tests::the_resource_count_and_byte_budgets_hold` (asserts the budget is exact) |
+| `virtio_gpu::blob::MAX_BLOB_ENTRIES` | 16384 | page-list entries in one `RESOURCE_CREATE_BLOB` | `gpu_blob::a_malicious_blob_guest_is_answered_in_band` (a lying `nr_entries` and an overflowing one) |
+| `virtio_gpu::blob::MAX_HOST_VISIBLE_MAPPINGS` | 4096 | live mappings the host-visible window tracks | fuzz target `gpu_blob` |
+| `virtio_gpu::blob::BLOB_PAGE_SIZE` | 4096 | granularity every blob size and map offset must be a multiple of | `blob::tests::window_reservations_cannot_overlap_or_run_off_the_end` |
+| `virtio_gpu::MAX_COMMAND_BYTES_BLOB` | 256 KiB + 56 B | gather cap once blob resources are offered — 24 bytes above the 2D cap, because a full-length `RESOURCE_CREATE_BLOB` really is 24 bytes longer than a full-length attach-backing | `virtio_gpu::device::tests::command_buffer_bound_matches_the_entry_limit` (compile-time `assert!`s in `device.rs`) |
 | `virtio_gpu::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick (controlq and cursorq) | same shape as the blk budget test |
 | `virtio_input::MAX_PENDING_EVENTS` | 1024 | host-buffered input events while the guest is not draining (oldest dropped) | `input_queue::a_starved_queue_buffers_events_up_to_the_bound_and_drops_the_oldest` |
 | `virtio_input::config::PAYLOAD_MAX` | 128 | config-space payload bytes | `virtio_input::config::tests::{bitmap_drops_codes_beyond_the_payload, from_slice_truncates_at_the_payload_size}` |
 | `virtio_net::MAX_FRAME_LEN` / `MAX_BUFFER_LEN` | 1514 / 1526 | bytes staged per frame, either direction | `net_queue::{tx_oversized_frames_are_dropped, an_oversized_host_frame_is_dropped_before_the_ring, rx_chain_too_small_for_the_frame_drops_it}` |
 | `virtio_net::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick | same shape as the blk budget test |
+| `virtio_sound::stream::MIN_PERIOD_BYTES` / `MAX_PERIOD_BYTES` | 64 / 64 KiB | one PCM period, and therefore the payload of one playback message | `virtio_sound::stream::tests::period_and_buffer_geometry_is_bounded_and_never_divides_by_zero`, `snd_queue::set_params_refuses_everything_the_device_never_advertised` |
+| `virtio_sound::stream::MAX_BUFFER_BYTES` | 1 MiB | the host PCM ring a guest can make the device allocate (`buffer_bytes` + one period of slack) | same tests, plus `virtio_sound::device::tests::the_ring_capacity_follows_the_negotiated_buffer` |
+| `virtio_sound::stream::MIN_PERIODS` / `MAX_PERIODS` | 2 / 1024 | periods one buffer may be divided into — the buffer must be a whole number of them | same tests |
+| `virtio_sound::stream::MAX_CHANNELS` | 2 | channels one stream may carry (what the chmap describes) | `virtio_sound::stream::tests::channel_counts_are_bounded_by_what_the_chmap_describes` |
+| `virtio_sound::stream::STREAMS` / `JACKS` / `CHMAPS` | 1 / 1 / 1 | items the config space advertises; every id and every `*_INFO` range is checked against these | `snd_queue::info_queries_outside_the_advertised_range_or_with_the_wrong_record_size_are_refused` |
+| `virtio_sound::MAX_CONTROL_MSG_BYTES` | 4 KiB | bytes gathered for one control message, refused *before* reading | `snd_queue::malformed_descriptor_chains_are_dropped_without_taking_the_device_down` |
+| `virtio_sound::MAX_XFER_BYTES` | 4 B + 64 KiB | bytes gathered for one playback message (header + a period) | same test, fuzz target `snd_device` |
+| `virtio_sound::MAX_PENDING_PERIODS` | 256 | playback messages held un-retired | `snd_queue::flooding_the_ring_beyond_the_negotiated_buffer_is_an_io_error` |
+| `virtio_sound::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick, on every queue | same shape as the blk budget test |
+| `virtio_sound::MAX_RECORDING_BYTES` | 16 MiB | bytes a `RecordingSink` keeps before it plays on without storing | `virtio_sound::backend::tests::a_recording_is_capped_rather_than_unbounded` |
 | `machine_x86::virtio::MAX_VIRTIO_SLOTS` | 8 | devices on the mmio bus (IOAPIC pins) | `queue_notify::attaching_more_devices_than_slots_is_refused` |
 | `machine_x86::notify::MAX_OFFLOADED_QUEUES` | 16 | ioeventfds and epoll slots one device may demand | `queue_notify::queue_notify_offload_is_capped_per_device` |
 | `virtio_core::pci::MAX_NOTIFY_QUEUES` | 1024 | *derived* (notify region ÷ multiplier); queues a device may expose on pci, since each needs its own notification address | `virtio_core::pci::tests::a_device_with_more_queues_than_notify_slots_is_refused` |
 | `virtio_core::pci::VIRTIO_PCI_BAR_SIZE` | 32 KiB | guest-addressable register space per pci device; every capability's `offset + length` must fit | `virtio_core::pci::tests::capability_records_describe_the_real_bar_layout`, `regions_do_not_overlap_and_the_common_struct_fits` |
+| `virtio_core::ShmRegion::len` | non-zero | a declared shared-memory region must have a length; zero is refused at construction because "present with length 0" is the state the all-ones convention exists to avoid | `virtio_core::transport::tests::a_zero_length_shm_region_is_refused` |
 | `virtio_core::msix::MAX_MSIX_VECTORS` | 256 | *derived* (table region ÷ 16 B); vectors one function may publish, so `queues + 1` must fit or the transport refuses the device | `virtio_core::msix::tests::table_size_for_*`, `virtio_core::pci::tests::a_device_with_more_queues_than_msix_vectors_is_refused` |
 | `machine_x86::pci::MAX_PCI_DEVICES` | 9 | config spaces, BAR windows and IOAPIC pins on the root bus (8 devices + the host bridge) | `machine_x86::pci::tests::the_bus_is_bounded` |
 | `machine_x86::layout::PCI_MMIO_SLOTS` | 8 | 32 KiB aperture slots at `0xc000_0000`; one per device, and `locate_mmio` decodes nothing outside the aperture | `machine_x86::pci::tests::{addresses_outside_the_aperture_are_never_claimed, a_bar_moved_out_of_the_aperture_decodes_nothing}` |
@@ -258,6 +276,57 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
   publishes a dword and a write mask, nothing more), and the guest-facing
   decisions — is MSI-X enabled, is this vector masked — must be read at signal
   time rather than cached at activation, because Linux toggles them mid-probe.
+
+## Shared-memory regions and blob resources (EPIC 20, VEN-2001)
+
+A shared-memory region is a window of **host** memory the guest maps directly.
+virtio-gpu needs one for host-visible blob resources, which is the reason Venus
+was out of reach in ADR-0004 phase 1. The plumbing is deliberately inert unless
+a device asks for it:
+
+- A device declares regions with `VirtioDevice::shm_regions() -> Vec<ShmRegion>`
+  (`{id, len}`, default empty). It never learns *where* the window lands — that
+  is the transport's and the machine layer's business.
+- **mmio**: `SHM_SEL` selects by `shmid`; `SHM_LEN_LOW/HIGH` and
+  `SHM_BASE_LOW/HIGH` answer for a region that is declared **and** placed
+  (`MmioTransport::set_shm_base(id, gpa)`). Everything else reads **all-ones**.
+  Preserve that exactly: a zero looks to Linux' `virtio_gpu` like a present
+  zero-length region at address 0, it tries to reserve it, and the probe fails.
+  Two tests pin it (`a_device_without_shm_regions_still_reads_all_ones`,
+  `a_declared_shm_region_answers_only_after_the_host_places_it`).
+- **pci**: `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` (`cfg_type` 8) as a
+  `virtio_pci_cap64` — 24 bytes, offset and length split across two field pairs
+  — in `VIRTIO_PCI_SHM_BAR_INDEX` (**2**, not the register BAR: BAR 0 is a
+  32 KiB 32-bit window sized to the register file and a host-visible region is
+  hundreds of megabytes and wants to be 64-bit prefetchable). Build the records
+  with `pci::shm_capability_records(&placements)`; `pci::place_shm_regions`
+  packs them page-aligned and refuses a set that does not fit.
+  **The machine layer must allocate that second BAR before any of this is
+  published** — a capability pointing at a BAR nothing decodes is worse than no
+  capability.
+
+Blob resources themselves (`virtio_gpu::blob`) are the device half:
+
+- Three memory types. `BLOB_MEM_GUEST` is guest pages and needs no renderer at
+  all (it is the venus command ring); `BLOB_MEM_HOST3D` is a renderer
+  allocation named by `blob_id`; `BLOB_MEM_HOST3D_GUEST` is both. Unknown types
+  and unknown flag bits are **refused, never ignored** — ignoring a "use" flag
+  hands the guest a resource that silently cannot do what it asked for.
+- The blob table is a *third* owner in the one id namespace. Every existing
+  command routes by ownership (the rule ADR-0004's mixed-namespace amendment
+  established): attach/detach-backing and `TRANSFER_*_3D` are refused for a
+  blob, `CTX_ATTACH_RESOURCE` is accepted, `SET_SCANOUT` is refused in favour of
+  `SET_SCANOUT_BLOB`, and `RESOURCE_UNREF` releases a window span the guest
+  forgot to unmap.
+- `RESOURCE_MAP_BLOB` carries the sharpest guest value in the epic: an offset
+  into a *host* mapping. `HostVisibleWindow::reserve` checks it in u64 against
+  the window length, the page grid and **both** neighbouring mappings before
+  the renderer sees it, and the caller rolls the reservation back if the
+  renderer refuses. Never let a reservation outlive a failed map.
+- Feature bits follow capability, not hope: `VIRTIO_GPU_F_RESOURCE_BLOB` and
+  `VIRTIO_GPU_F_CONTEXT_INIT` are offered only when the attached renderer's
+  `BlobSupport` / capsets justify them, so a virgl-only host is byte-identical
+  to before.
 
 ## Per-device references
 
@@ -372,6 +441,51 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
   process singleton, all self-skipping), `boot-tests/virgl_gnome.rs` (GNOME
   live on virgl, `--ignored`), fuzz targets `gpu_3d_commands` (now including
   the fence surface) and `gpu_remote_protocol`.
+- **snd** (EPIC 21, GAME-2102): wire format in `virtio_sound::protocol` (mirrors
+  `linux/virtio_snd.h`, lengths asserted at compile time), bounds and the
+  lifecycle state machine in `virtio_sound::stream`, the device and its pump
+  thread in `virtio_sound::device`. Four queues, as the spec mandates: control,
+  event, TX, RX. Five things to know before touching it:
+  - **Completion is the pacing.** The driver puts one message per period on TX
+    and treats the used ring as the hardware pointer, so a message may only be
+    retired once the host sink has actually *consumed* its audio. Retire on copy
+    and the guest believes an hour played in a microsecond. This is why a
+    **pump thread** owns the TX queue (`Arc<Mutex<Inner>>`, virtio-net's receive
+    worker is the pattern) and takes the pause gate before it touches guest
+    memory. No `HostWaker`: unlike a GPU fence, nothing foreign has to tell us
+    the audio finished — this thread measured it.
+  - **A software sink must keep time.** `NullSink`/`RecordingSink` sleep through
+    `backend::Pacer` rather than accepting instantly; a sink with zero latency
+    is not a sound card, and every completion would fire at once. `unpaced()`
+    exists for tests and fuzzing only.
+  - **The advertised set is short on purpose**: one output stream, `S16`,
+    44100/48000 Hz, 1–2 channels, no PCM features. A guest's own ALSA converts
+    anything else, and every extra format is more host code on an untrusted
+    path. Requests are checked against `SUPPORTED_FORMATS`/`SUPPORTED_RATES`,
+    never against what the guest claims we said.
+  - **Status mapping is load-bearing**: `BAD_MSG` for protocol misuse (an id
+    outside the config space, a command in the wrong state, a payload that
+    contradicts the negotiated geometry), `NOT_SUPP` for a well-formed ask we
+    never offered (format, rate, channel count, buffer size, `JACK_REMAP`),
+    `IO_ERR` only for a genuine host-side or ring-full condition. A driver that
+    gets the two confused debugs the wrong half of its stack.
+  - **The host sink is behind `AudioSink`, built by a `SinkFactory` *on the pump
+    thread*** — WASAPI's COM objects and ALSA's handle both belong to one
+    thread, and a device reset has to be able to get its audio back. Linux is
+    `libasound` **`dlopen`ed, never linked** (LGPL; `cargo deny` gates the
+    graph — ADR-0004's virglrenderer arrangement, reasoning in
+    `virtio_sound::alsa`'s module docs); Windows is WASAPI shared mode with
+    `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`, so the audio
+    engine resamples and we ship no converter.
+  Capture (RX) is a documented phase 2: no input stream is advertised, so a
+  conforming driver never posts there, and one that does is answered
+  `NOT_SUPP` in band. Underruns are counted and logged once a second, never
+  allowed to wedge the device — the pump writes silence and carries on.
+  Tests: `tests/snd_queue.rs` (mmio, including a 440 Hz tone asserted
+  byte-for-byte with no underruns and provably paced completion),
+  `tests/snd_pci.rs` (the same untouched device over pci), fuzz targets
+  `snd_control` (parsers, bounds, lifecycle) and `snd_device` (arbitrary chains
+  through a live transport).
 - **input** (EPIC 9): event model in `virtio_input` (`ev`, `abs`, `btn`,
   `InputEvent`). Absolute pointer: window coords →
   `InputEvent::abs_from_window` (0..=32767). Every batch ends with
@@ -422,8 +536,10 @@ obligations:
    at the top of the loop, *before* any device lock — and **hold the pass for as
    long as the work lasts**. Closing the gate only stops work that has not
    started; a pause is not acknowledged until every pass is dropped, which is
-   what makes "paused" true of guest memory and not only of the guest. Only virtio-net needs it today (its receive worker writes
-   arriving frames straight into the RX ring on its own schedule). A device whose
+   what makes "paused" true of guest memory and not only of the guest. Two
+   devices need it today: virtio-net (its receive worker writes arriving frames
+   straight into the RX ring on its own schedule) and virtio-snd (its pump
+   thread retires playback messages on the host's audio clock). A device whose
    work all happens inside `notify()` needs nothing: it is already on a parked
    vCPU thread, or behind a queue worker that took the gate for it.
 
@@ -476,11 +592,25 @@ fn load_device(&mut self, bytes: &[u8]) -> Result<(), DeviceError>
   which are a copy of guest pages the snapshot already carries, and which the
   restore re-derives by re-running the transfer. Eight megabytes per resource
   saved, several times over.
-- **Say so when something cannot come back.** virtio-net's NAT flows and
-  virtio-gpu's 3D contexts are gone by construction. The network is left to the
-  guest's TCP stack to notice (what a laptop suspend does); the GPU raises
+- **Say so when something cannot come back.** virtio-net's NAT flows,
+  virtio-snd's host sink, and virtio-gpu's 3D contexts and blob resources are
+  gone by construction. The network and the audio are left to the guest to
+  notice (what a laptop suspend does to them); the GPU raises
   `DEVICE_NEEDS_RESET` through the same path GPU-012 uses for a crashed
-  renderer. Neither silently pretends.
+  renderer. None of them silently pretends.
+- **A device's own state has its own version, and so does the section around
+  it.** Adding a field is a bump: `virtio` went to 2 when `SHM_SEL` and the
+  host's shared-memory placement joined it, and virtio-gpu's blob went to 2 when
+  the scanout source became three-way. Defaulting a missing field would restore
+  a guest whose driver had selected a region into one that had not, so the old
+  snapshot is refused by number instead — `SectionVersion` names the section and
+  both versions.
+- **Guest-visible state the *host* chose still needs recording.** A
+  shared-memory region's base is placed by the machine, not the guest — but the
+  guest read it out of the registers and its mappings point at it. It is saved
+  not to be restored but so a machine that placed the window elsewhere is a
+  refusal. The same reasoning applies to anything else the host hands the guest
+  as an address.
 
 There is a fourth obligation that is not the device's but is worth knowing about
 when a resumed guest misbehaves: on **KVM** the 8259s, IOAPIC and 8254 are in

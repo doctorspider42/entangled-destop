@@ -116,6 +116,22 @@ Rules that follow — and note how narrow your mandate is:
 - One WHP VM per process on Windows (hypervisor limit); `entangled run` is
   one process per VM by design.
 
+- **Never boot two VMs on one writable disk image.** The demo images in
+  `~/entangled-vms` are shared machine state, and a second VM started on a disk
+  another VM already has mounted read/write corrupts the guest filesystem —
+  this happened on 2026-08-21 to `desktop.raw` when two agents each wanted a
+  GNOME guest. Before starting a VM, check what is already running
+  (`wsl -d Ubuntu -e bash -lc "pgrep -a entangled"`) and if the disk you want is
+  in use, work on **your own sparse copy** instead:
+
+  ```bash
+  cp --sparse=always ~/entangled-vms/desktop.raw ~/entangled-vms/<task>-desktop.raw
+  cp ~/entangled-vms/desktop.nvram ~/entangled-vms/<task>-desktop.nvram
+  ```
+
+  Copy the `.nvram` sidecar too — it holds the UEFI boot entry, and a copy
+  without it boots to the EFI shell. Delete your copy when you are done.
+
 ## Artifacts are gitignored and go stale
 
 `artifacts/` (test kernel, initramfs, firmware) is built per-checkout, not

@@ -101,6 +101,19 @@ pub struct TransportSaveState {
     pub driver_features: u64,
     pub driver_features_sel: u32,
     pub queue_sel: u32,
+    /// `SHM_SEL` (VEN-2001): which shared-memory region the next `SHM_LEN` /
+    /// `SHM_BASE` read describes. Guest state — a `reset` clears it — so a
+    /// driver suspended between selecting a region and reading its base must
+    /// find the selector where it left it.
+    pub shm_sel: u32,
+    /// Where the **host** placed each shared-memory region, by `shmid`.
+    ///
+    /// Not guest state, and not restored from here: the machine that loads the
+    /// snapshot places its own window. It is recorded so that a machine which
+    /// placed it *somewhere else* is a named refusal rather than a guest whose
+    /// blob mappings point at nothing. Empty on every VM today, because nothing
+    /// in `machine-x86` has an address to hand out yet.
+    pub shm_bases: Vec<(u8, u64)>,
     pub status: u32,
     pub activated: bool,
     pub queues: Vec<QueueState>,
@@ -131,6 +144,16 @@ pub enum StateError {
 
     #[error("snapshot slot has {snapshot} MSI-X vectors, this function has {current}")]
     MsixTableSize { snapshot: usize, current: usize },
+
+    #[error(
+        "snapshot slot had shared-memory region {id} at {snapshot:#x}, this machine placed it at \
+         {current}; the guest's mappings point at the first address"
+    )]
+    ShmBase {
+        id: u8,
+        snapshot: u64,
+        current: String,
+    },
 
     #[error("the device refused its saved state: {0}")]
     Device(String),

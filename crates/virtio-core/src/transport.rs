@@ -69,6 +69,12 @@ pub enum TransportError {
     NoQueues { device_type: DeviceType },
 
     #[error(
+        "device type {device_type:?} declares shared-memory region {id} with zero length; \
+         a region that exists must have a length (VEN-2001)"
+    )]
+    InvalidShmRegion { device_type: DeviceType, id: u8 },
+
+    #[error(
         "device type {device_type:?} declares queue {index} with max size {max_size}; \
          must be a non-zero power of two, at most {MAX_QUEUE_SIZE}"
     )]
@@ -177,6 +183,21 @@ impl MmioTransport {
         self.state.is_queue_notify_offloaded(index)
     }
 
+    /// Shared-memory regions the device behind this slot declares (VEN-2001).
+    pub fn shm_regions(&self) -> &[crate::ShmRegion] {
+        self.state.shm_regions()
+    }
+
+    /// Tells the transport where the host placed shared-memory region `id`, as
+    /// a guest-physical address.
+    ///
+    /// Until this is called the region reads as absent — which is the correct,
+    /// and the *safe*, answer: a driver told about a window that decodes
+    /// nothing would fault on its first access to it.
+    pub fn set_shm_base(&mut self, id: u8, base: u64) {
+        self.state.set_shm_base(id, base);
+    }
+
     // ---------------------------------------------------------------- reads
 
     /// Guest read at `offset` inside the slot.
@@ -222,10 +243,23 @@ impl MmioTransport {
             mmio::INTERRUPT_STATUS => self.state.interrupt_status(),
             mmio::STATUS => self.state.status(),
             mmio::CONFIG_GENERATION => self.state.interrupt().generation(),
-            // No shared-memory regions: length reads all-ones per spec so
-            // drivers recognize "no such region" (base likewise).
+            // Shared-memory regions (VEN-2001). A region the device declared
+            // *and* the host placed answers with its real length and base;
+            // everything else keeps the pre-existing behaviour — all-ones per
+            // spec, so drivers recognize "no such region". That distinction is
+            // not cosmetic: a zero here looks to Linux' virtio_gpu like a real
+            // zero-length region at address 0, which it then tries to reserve
+            // and fails its probe on.
             mmio::SHM_LEN_LOW | mmio::SHM_LEN_HIGH | mmio::SHM_BASE_LOW | mmio::SHM_BASE_HIGH => {
-                u32::MAX
+                match self.state.selected_shm() {
+                    Some((region, base)) => match offset {
+                        mmio::SHM_LEN_LOW => region.len as u32,
+                        mmio::SHM_LEN_HIGH => (region.len >> 32) as u32,
+                        mmio::SHM_BASE_LOW => base as u32,
+                        _ => (base >> 32) as u32,
+                    },
+                    None => u32::MAX,
+                }
             }
             _ => {
                 tracing::debug!(
@@ -269,6 +303,7 @@ impl MmioTransport {
             mmio::DRIVER_FEATURES => self.state.write_driver_features(value),
             mmio::DRIVER_FEATURES_SEL => self.state.set_driver_features_sel(value),
             mmio::QUEUE_SEL => self.state.set_queue_sel(value),
+            mmio::SHM_SEL => self.state.set_shm_sel(value),
             mmio::QUEUE_NUM => self.write_queue_num(value),
             mmio::QUEUE_READY => self
                 .state
@@ -362,7 +397,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::device::{DeviceError, DeviceResources};
+    use crate::device::{DeviceError, DeviceResources, ShmRegion};
     use crate::testing::{self, SplitRing, TestIrqLine};
     use crate::{status, VIRTIO_F_VERSION_1};
 
@@ -376,6 +411,7 @@ mod tests {
     /// A device that records what the transport did to it.
     struct TestDevice {
         queue_sizes: Vec<u16>,
+        shm: Vec<ShmRegion>,
         features: u64,
         veto_features: bool,
         fail_activate: bool,
@@ -392,6 +428,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 queue_sizes: vec![16],
+                shm: Vec::new(),
                 features: VIRTIO_F_VERSION_1 | FEATURE_A | FEATURE_HIGH,
                 veto_features: false,
                 fail_activate: false,
@@ -425,6 +462,10 @@ mod tests {
             }
             self.acked = Some(negotiated);
             true
+        }
+
+        fn shm_regions(&self) -> Vec<ShmRegion> {
+            self.shm.clone()
         }
 
         fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -486,6 +527,119 @@ mod tests {
 
     fn transport() -> (MmioTransport, Arc<TestIrqLine>) {
         transport_with(TestDevice::default())
+    }
+
+    /// Reads a 32-bit register.
+    fn reg(transport: &mut MmioTransport, offset: u64) -> u32 {
+        let mut raw = [0u8; 4];
+        transport.read(offset, &mut raw);
+        u32::from_le_bytes(raw)
+    }
+
+    fn write_reg(transport: &mut MmioTransport, offset: u64, value: u32) {
+        transport.write(offset, &value.to_le_bytes());
+    }
+
+    /// The behaviour that was a real bug fix once and must not regress: a
+    /// device with **no** shared-memory regions answers all-ones for every
+    /// selector, so Linux' virtio_gpu sees "no such region" instead of a
+    /// zero-length region at address 0 (VEN-2001 preserves this exactly).
+    #[test]
+    fn a_device_without_shm_regions_still_reads_all_ones() {
+        let (mut transport, _) = transport();
+        assert!(transport.shm_regions().is_empty());
+        for sel in [0u32, 1, 2, 255, u32::MAX] {
+            write_reg(&mut transport, mmio::SHM_SEL, sel);
+            for offset in [
+                mmio::SHM_LEN_LOW,
+                mmio::SHM_LEN_HIGH,
+                mmio::SHM_BASE_LOW,
+                mmio::SHM_BASE_HIGH,
+            ] {
+                assert_eq!(reg(&mut transport, offset), u32::MAX, "sel {sel}");
+            }
+        }
+    }
+
+    /// A declared region answers with its real length and base — but only once
+    /// the host has actually placed it. Before that it is still absent, because
+    /// a driver told about a window that decodes nothing would fault on it.
+    #[test]
+    fn a_declared_shm_region_answers_only_after_the_host_places_it() {
+        let device = TestDevice {
+            shm: vec![ShmRegion {
+                id: 1,
+                len: 0x1_0000_0000,
+            }],
+            ..Default::default()
+        };
+        let (mut transport, _) = transport_with(device);
+        assert_eq!(transport.shm_regions().len(), 1);
+
+        write_reg(&mut transport, mmio::SHM_SEL, 1);
+        assert_eq!(
+            reg(&mut transport, mmio::SHM_LEN_LOW),
+            u32::MAX,
+            "unplaced regions stay absent"
+        );
+
+        transport.set_shm_base(1, 0x8_0000_0000);
+        assert_eq!(reg(&mut transport, mmio::SHM_LEN_LOW), 0);
+        assert_eq!(reg(&mut transport, mmio::SHM_LEN_HIGH), 1);
+        assert_eq!(reg(&mut transport, mmio::SHM_BASE_LOW), 0);
+        assert_eq!(reg(&mut transport, mmio::SHM_BASE_HIGH), 8);
+
+        // Every other selector is still absent, including ones a hostile
+        // driver picks to probe past the end of our list.
+        for sel in [0u32, 2, 255, 256, 0x1_0000, u32::MAX] {
+            write_reg(&mut transport, mmio::SHM_SEL, sel);
+            assert_eq!(
+                reg(&mut transport, mmio::SHM_LEN_LOW),
+                u32::MAX,
+                "sel {sel}"
+            );
+            assert_eq!(
+                reg(&mut transport, mmio::SHM_BASE_HIGH),
+                u32::MAX,
+                "sel {sel}"
+            );
+        }
+    }
+
+    /// `SHM_SEL` is guest state, so a device reset puts it back to 0 with
+    /// everything else — while the *placement* is host wiring and survives,
+    /// exactly like `notify_offloaded`.
+    #[test]
+    fn a_reset_clears_the_shm_selector_but_not_the_placement() {
+        let device = TestDevice {
+            shm: vec![ShmRegion { id: 0, len: 4096 }],
+            ..Default::default()
+        };
+        let (mut transport, _) = transport_with(device);
+        transport.set_shm_base(0, 0x1000_0000);
+        write_reg(&mut transport, mmio::SHM_SEL, 7);
+        assert_eq!(reg(&mut transport, mmio::SHM_LEN_LOW), u32::MAX);
+        transport.reset();
+        // Selector back to 0, which is region 0 — placed, so it answers.
+        assert_eq!(reg(&mut transport, mmio::SHM_LEN_LOW), 4096);
+        assert_eq!(reg(&mut transport, mmio::SHM_BASE_LOW), 0x1000_0000);
+    }
+
+    /// A zero-length region is a host bug the transport refuses at
+    /// construction, because "present with length 0" is exactly the state the
+    /// all-ones convention exists to avoid.
+    #[test]
+    fn a_zero_length_shm_region_is_refused() {
+        let line = Arc::new(TestIrqLine::default());
+        let mem = Arc::new(testing::guest_memory(0x2_0000));
+        let device = TestDevice {
+            shm: vec![ShmRegion { id: 3, len: 0 }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            MmioTransport::new(0, Box::new(device), mem, line),
+            Err(TransportError::InvalidShmRegion { id: 3, .. })
+        ));
     }
 
     /// A transport plus a handle on the queue indices its device is notified

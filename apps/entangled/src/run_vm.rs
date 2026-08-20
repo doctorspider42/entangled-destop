@@ -352,6 +352,29 @@ fn build_devices(
     *tablet_sink = Some(tablet.handle());
     devices.push(Box::new(keyboard));
     devices.push(Box::new(tablet));
+
+    // virtio-snd (GAME-2102), deliberately last: device order is guest-visible
+    // naming, so a card added after the input devices never renames /dev/vda
+    // nor shifts a PCI device number in a profile that already existed.
+    if cfg.sound.enabled {
+        let choice = match cfg.sound.backend {
+            control_api::SoundBackend::Auto => virtio_sound::SinkChoice::Auto,
+            control_api::SoundBackend::Null => virtio_sound::SinkChoice::Null,
+            control_api::SoundBackend::Alsa => virtio_sound::SinkChoice::Alsa,
+            control_api::SoundBackend::Wasapi => virtio_sound::SinkChoice::Wasapi,
+        };
+        // `auto` never fails — a machine with no speakers still boots — but an
+        // explicit backend that is not there fails the run rather than
+        // silently playing into nothing, exactly as `[display] virgl` does.
+        let (sink, factory) = virtio_sound::open_sink(choice)
+            .map_err(|e| format!("[sound] backend = \"{}\": {e}", cfg.sound.backend))?;
+        tracing::info!(
+            %sink,
+            requested = %cfg.sound.backend,
+            "attaching virtio-snd device"
+        );
+        devices.push(Box::new(virtio_sound::SoundDevice::new(sink, factory)));
+    }
     Ok(BuiltDevices {
         devices,
         net_cmdline,

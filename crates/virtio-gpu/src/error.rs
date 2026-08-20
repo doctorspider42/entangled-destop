@@ -116,6 +116,45 @@ pub enum CommandError {
 
     #[error("the host renderer rejected the command: {0}")]
     Renderer(String),
+
+    // ------------------------------------------ blob resources (VEN-2001)
+    #[error("blob memory type {0} is not supported by this host renderer")]
+    UnsupportedBlobMem(u32),
+
+    #[error("blob memory type {blob_mem} rejected: {reason}")]
+    BadBlobMem { blob_mem: u32, reason: &'static str },
+
+    #[error("blob flags {0:#010x} contain a bit this device does not implement")]
+    BadBlobFlags(u32),
+
+    #[error("blob size {0} is zero, not a whole number of pages, or beyond the host limit")]
+    BadBlobSize(u64),
+
+    #[error(
+        "this host has no virtio-gpu shared-memory window, so a blob cannot be \
+         mapped into the guest"
+    )]
+    NoHostVisibleWindow,
+
+    #[error(
+        "blob mapping at offset {offset:#x} of {size} bytes does not fit the shared-memory window"
+    )]
+    BadBlobMapping { offset: u64, size: u64 },
+
+    #[error("blob mapping at offset {offset:#x} of {size} bytes overlaps a live mapping")]
+    BlobMappingOverlap { offset: u64, size: u64 },
+
+    #[error("blob {0} was not created with VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE")]
+    BlobNotMappable(u32),
+
+    #[error("blob {0} is already mapped into the shared-memory window")]
+    BlobAlreadyMapped(u32),
+
+    #[error("blob {0} is not mapped")]
+    BlobNotMapped(u32),
+
+    #[error("resource {0} is a blob and does not support this command")]
+    NotABlobCommand(u32),
 }
 
 impl CommandError {
@@ -142,11 +181,24 @@ impl CommandError {
             | Self::BadGeometry3d
             | Self::BoxOutOfBounds { .. }
             | Self::InvalidStream(_)
-            | Self::StreamTooLarge(_) => resp::ERR_INVALID_PARAMETER,
+            | Self::StreamTooLarge(_)
+            // Blob (VEN-2001): every one of these is the guest handing the
+            // device a parameter it cannot honour — a bad size, a bad flag, a
+            // mapping that does not fit. The two id-shaped ones are below.
+            | Self::UnsupportedBlobMem(_)
+            | Self::BadBlobMem { .. }
+            | Self::BadBlobFlags(_)
+            | Self::BadBlobSize(_)
+            | Self::BadBlobMapping { .. }
+            | Self::BlobMappingOverlap { .. } => resp::ERR_INVALID_PARAMETER,
 
-            Self::ZeroResourceId | Self::UnknownResource(_) | Self::DuplicateResource(_) => {
-                resp::ERR_INVALID_RESOURCE_ID
-            }
+            Self::ZeroResourceId
+            | Self::UnknownResource(_)
+            | Self::DuplicateResource(_)
+            | Self::BlobNotMappable(_)
+            | Self::BlobAlreadyMapped(_)
+            | Self::BlobNotMapped(_)
+            | Self::NotABlobCommand(_) => resp::ERR_INVALID_RESOURCE_ID,
 
             Self::UnknownContext(_) | Self::BadContextId(_) | Self::TooManyContexts => {
                 resp::ERR_INVALID_CONTEXT_ID
@@ -154,7 +206,12 @@ impl CommandError {
 
             Self::UnknownScanout(_) => resp::ERR_INVALID_SCANOUT_ID,
             Self::OutOfMemory => resp::ERR_OUT_OF_MEMORY,
-            Self::UnsupportedCommand(_) | Self::Renderer(_) => resp::ERR_UNSPEC,
+            // "This host cannot do that at all" is not a bad parameter — it is
+            // an unspecified failure, and the guest's right answer is to stop
+            // asking rather than to retry with different numbers.
+            Self::UnsupportedCommand(_) | Self::Renderer(_) | Self::NoHostVisibleWindow => {
+                resp::ERR_UNSPEC
+            }
         }
     }
 }

@@ -213,11 +213,30 @@ pub const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
 pub const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 pub const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 pub const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+/// `VIRTIO_PCI_CAP_PCI_CFG` (5) and `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` (8).
+/// Only the latter is published, and only by a device that declares a region.
+pub const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u8 = 8;
 
 /// Length of a `struct virtio_pci_cap`.
 pub const VIRTIO_PCI_CAP_LEN: u8 = 16;
 /// Length of a `struct virtio_pci_notify_cap` (the above plus the multiplier).
 pub const VIRTIO_PCI_NOTIFY_CAP_LEN: u8 = 20;
+/// Length of a `struct virtio_pci_cap64` (the above plus the high halves of
+/// offset and length) — what a shared-memory region has to use, because a
+/// host-visible window is routinely larger than 4 GiB (spec 4.1.4.7).
+pub const VIRTIO_PCI_CAP64_LEN: u8 = 24;
+
+/// BAR index the shared-memory regions live in (VEN-2001).
+///
+/// **Not** [`VIRTIO_PCI_BAR_INDEX`]: BAR 0 is a 32 KiB 32-bit window sized to
+/// the register file, and a host-visible blob window is hundreds of megabytes
+/// and wants to be 64-bit prefetchable. They cannot share. Publishing a
+/// shared-memory capability therefore requires the machine layer to have
+/// allocated this second BAR — which is why
+/// [`shm_capability_records`] takes the placements as an argument instead of
+/// inventing them: a capability pointing at a BAR nothing decodes is worse
+/// than no capability at all.
+pub const VIRTIO_PCI_SHM_BAR_INDEX: u8 = 2;
 
 /// Encodes one `struct virtio_pci_cap` (spec 4.1.4).
 ///
@@ -274,6 +293,93 @@ pub fn capability_records() -> Vec<Vec<u8>> {
             None,
         ),
     ]
+}
+
+/// Where the host put one shared-memory region inside
+/// [`VIRTIO_PCI_SHM_BAR_INDEX`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShmPlacement {
+    /// `shmid`, echoed in the capability's `id` byte so the driver can match
+    /// it against what the device documents.
+    pub id: u8,
+    /// Byte offset inside the shared-memory BAR.
+    pub offset: u64,
+    /// Length of the region.
+    pub len: u64,
+}
+
+/// Encodes one `struct virtio_pci_cap64` for a shared-memory region
+/// (spec 4.1.4.7, VEN-2001).
+///
+/// The layout is a `virtio_pci_cap` whose `offset`/`length` carry the low 32
+/// bits, followed by `offset_hi`/`length_hi`. Splitting a 64-bit value across
+/// two non-adjacent field pairs is not our idea; it is what the spec froze so
+/// that `cap64` stays a superset of `cap`.
+fn encode_cap64(cfg_type: u8, id: u8, bar: u8, offset: u64, length: u64) -> Vec<u8> {
+    let mut record = Vec::with_capacity(usize::from(VIRTIO_PCI_CAP64_LEN));
+    record.push(PCI_CAP_ID_VNDR);
+    record.push(0); // cap_next, patched by the PCI layer
+    record.push(VIRTIO_PCI_CAP64_LEN);
+    record.push(cfg_type);
+    record.push(bar);
+    record.push(id);
+    record.extend_from_slice(&[0, 0]); // padding
+    record.extend_from_slice(&(offset as u32).to_le_bytes());
+    record.extend_from_slice(&(length as u32).to_le_bytes());
+    record.extend_from_slice(&((offset >> 32) as u32).to_le_bytes());
+    record.extend_from_slice(&((length >> 32) as u32).to_le_bytes());
+    record
+}
+
+/// The shared-memory capability records for `placements`, to be appended to
+/// [`capability_records`] by whoever builds the configuration space.
+///
+/// An empty slice gives an empty vector, which is why a device with no regions
+/// produces byte-identical configuration space to the one it produced before
+/// shared memory existed.
+pub fn shm_capability_records(placements: &[ShmPlacement]) -> Vec<Vec<u8>> {
+    placements
+        .iter()
+        .map(|p| {
+            encode_cap64(
+                VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
+                p.id,
+                VIRTIO_PCI_SHM_BAR_INDEX,
+                p.offset,
+                p.len,
+            )
+        })
+        .collect()
+}
+
+/// Lays the device's regions out back to back in the shared-memory BAR,
+/// starting at offset 0 and rounded up to `alignment` — the placement a
+/// machine layer wants unless it has a reason to do something cleverer.
+///
+/// Returns `None` if the regions do not fit in `bar_size`, which is a host
+/// configuration error, not a guest one.
+pub fn place_shm_regions(
+    regions: &[crate::ShmRegion],
+    bar_size: u64,
+    alignment: u64,
+) -> Option<Vec<ShmPlacement>> {
+    let alignment = alignment.max(1);
+    let mut at = 0u64;
+    let mut out = Vec::with_capacity(regions.len());
+    for region in regions {
+        let end = at.checked_add(region.len)?;
+        if end > bar_size {
+            return None;
+        }
+        out.push(ShmPlacement {
+            id: region.id,
+            offset: at,
+            len: region.len,
+        });
+        // Round the next start up to the alignment.
+        at = end.checked_add(alignment - 1)? / alignment * alignment;
+    }
+    Some(out)
 }
 
 // ------------------------------------------------------ common configuration
@@ -344,6 +450,7 @@ pub fn class_code(device_type: DeviceType) -> u32 {
         DeviceType::Block => (0x01, 0x80), // mass storage / other
         DeviceType::Gpu => (0x03, 0x80),   // display / other
         DeviceType::Input => (0x09, 0x80), // input device / other
+        DeviceType::Sound => (0x04, 0x01), // multimedia / audio device
     };
     (base << 24) | (sub << 16)
 }
@@ -528,6 +635,20 @@ impl PciTransport {
 
     pub fn is_queue_notify_offloaded(&self, index: u16) -> bool {
         self.state.is_queue_notify_offloaded(index)
+    }
+
+    /// Shared-memory regions this function's device declares (VEN-2001). The
+    /// machine layer turns these into [`ShmPlacement`]s and capability
+    /// records; the transport itself only carries them.
+    pub fn shm_regions(&self) -> &[crate::ShmRegion] {
+        self.state.shm_regions()
+    }
+
+    /// Records where region `id` landed. On PCI the value is BAR-relative and
+    /// only used for diagnostics — the driver finds the window through the
+    /// capability and the BAR, not through a register.
+    pub fn set_shm_base(&mut self, id: u8, base: u64) {
+        self.state.set_shm_base(id, base);
     }
 
     /// Runs the device for queue `value`. The single entry point for kicks,
@@ -1159,6 +1280,71 @@ mod tests {
     /// The capability list is how the driver finds anything at all: the offsets,
     /// lengths, BAR index and the notify multiplier must be exactly what this
     /// transport then decodes.
+    #[test]
+    fn a_device_with_no_shm_regions_publishes_no_shm_capability() {
+        // The whole point of making this opt-in: a device that declares
+        // nothing produces byte-identical configuration space to the one it
+        // produced before shared memory existed (VEN-2001).
+        assert!(shm_capability_records(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_shared_memory_capability_is_a_cap64_in_its_own_bar() {
+        let regions = [
+            crate::ShmRegion {
+                id: 1,
+                len: 8 << 30,
+            },
+            crate::ShmRegion { id: 2, len: 4096 },
+        ];
+        let bar_size = 16u64 << 30;
+        let placements =
+            place_shm_regions(&regions, bar_size, 4096).expect("both regions fit the BAR");
+        assert_eq!(placements[0].offset, 0);
+        assert_eq!(placements[1].offset, 8 << 30, "packed, page-aligned");
+
+        let records = shm_capability_records(&placements);
+        assert_eq!(records.len(), 2);
+        for (record, placement) in records.iter().zip(placements.iter()) {
+            assert_eq!(record[0], PCI_CAP_ID_VNDR);
+            assert_eq!(record[1], 0, "cap_next is the PCI layer's to patch");
+            assert_eq!(record[2], VIRTIO_PCI_CAP64_LEN);
+            assert_eq!(record.len(), usize::from(VIRTIO_PCI_CAP64_LEN));
+            assert_eq!(record[3], VIRTIO_PCI_CAP_SHARED_MEMORY_CFG);
+            assert_eq!(
+                record[4], VIRTIO_PCI_SHM_BAR_INDEX,
+                "never the register BAR: a 32 KiB 32-bit window cannot hold a                  host-visible blob region"
+            );
+            assert_eq!(record[5], placement.id, "id carries the shmid");
+            let dword = |at: usize| {
+                u32::from_le_bytes([record[at], record[at + 1], record[at + 2], record[at + 3]])
+            };
+            let offset = u64::from(dword(8)) | u64::from(dword(16)) << 32;
+            let length = u64::from(dword(12)) | u64::from(dword(20)) << 32;
+            assert_eq!(offset, placement.offset);
+            assert_eq!(length, placement.len);
+            assert!(offset + length <= bar_size);
+        }
+        // The 8 GiB region is the reason this has to be a cap64 at all: its
+        // length does not fit the 32-bit field of a plain virtio_pci_cap.
+        assert!(placements[0].len > u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn regions_that_do_not_fit_the_shm_bar_are_refused() {
+        let regions = [crate::ShmRegion {
+            id: 1,
+            len: 2 << 30,
+        }];
+        assert!(place_shm_regions(&regions, 1 << 30, 4096).is_none());
+        // …and an overflowing length cannot wrap into a "fitting" placement.
+        let evil = [crate::ShmRegion {
+            id: 1,
+            len: u64::MAX,
+        }];
+        assert!(place_shm_regions(&evil, u64::MAX, 4096).is_none());
+    }
+
     #[test]
     fn capability_records_describe_the_real_bar_layout() {
         let records = capability_records();

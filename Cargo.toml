@@ -22,6 +22,7 @@ members = [
     "crates/virtio-net",
     "crates/virtio-gpu",
     "crates/virtio-input",
+    "crates/virtio-sound",
     "crates/display",
     "crates/debian-media",
     "crates/control-api",
@@ -54,6 +55,7 @@ virtio-block = { path = "crates/virtio-block", version = "0.2.0" }
 virtio-net = { path = "crates/virtio-net", version = "0.2.0" }
 virtio-gpu = { path = "crates/virtio-gpu", version = "0.2.0" }
 virtio-input = { path = "crates/virtio-input", version = "0.2.0" }
+virtio-sound = { path = "crates/virtio-sound", version = "0.2.0" }
 display = { path = "crates/display", version = "0.2.0" }
 debian-media = { path = "crates/debian-media", version = "0.2.0" }
 control-api = { path = "crates/control-api", version = "0.2.0" }
@@ -142,6 +144,15 @@ eframe = { version = "0.32", default-features = false, features = [
     "default_fonts",
     "wgpu",
     "x11",
+    "wayland",
+] }
+# Native file/folder pickers for the manager. MIT, and the Linux backend is
+# deliberately the **XDG desktop portal** (`xdg-portal` → pollster + ashpd/zbus,
+# all permissive) rather than rfd's `gtk3` backend, which would link GTK — an
+# LGPL library — into a host binary that must stay copyleft-free (ADR-0001).
+# `wayland` only lets the dialog take a parent surface handle.
+rfd = { version = "0.17", default-features = false, features = [
+    "xdg-portal",
     "wayland",
 ] }
 

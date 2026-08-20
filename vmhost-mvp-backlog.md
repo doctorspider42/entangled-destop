@@ -769,13 +769,13 @@ Cztery fazy, wszystkie zmierzone na sprzęcie — szczegóły w
 
 | ID | Zadanie | Priorytet | Status |
 |---|---|---:|---|
-| VEN-2001 | `VIRTIO_GPU_F_RESOURCE_BLOB` + region pamięci współdzielonej na transporcie (mmio i pci) | P0 | |
-| VEN-2002 | Capset `VIRTIO_GPU_CAPSET_VENUS`, negocjacja i kontekst typu venus | P0 | |
-| VEN-2003 | Dekoder protokołu venus za istniejącym traitem `Renderer3d` (host: natywny Vulkan) | P0 | |
+| VEN-2001 | `VIRTIO_GPU_F_RESOURCE_BLOB` + region pamięci współdzielonej na transporcie (mmio i pci) | P0 | zrobione po stronie urządzenia i transportów; okno **zadeklarowane, ale jeszcze nie podparte** — brakuje BAR-a/GPA w `machine-x86` (patrz aneks do ADR-0004 z 2026-08-21) |
+| VEN-2002 | Capset `VIRTIO_GPU_CAPSET_VENUS`, negocjacja i kontekst typu venus | P0 | zrobione (`VIRTIO_GPU_F_CONTEXT_INIT` + capset 4; `NullRenderer::with_venus` jako loopback) |
+| VEN-2003 | Dekoder protokołu venus za istniejącym traitem `Renderer3d` (host: natywny Vulkan) | P0 | tylko sonda: `virgl.rs` wykrywa punkty wejścia venus przy `dlopen`; jammy ma 0.9.1, jedyny host-owy ICD to lavapipe (CPU) |
 | VEN-2004 | Izolacja renderera na Windowsie: `CreateProcess` + para uchwytów pod ten sam protokół co na Linuksie | P0 | |
 | VEN-2005 | Blob scanout bez kopii (dmabuf na Linuksie, pamięć współdzielona/`ID3D12Resource` na Windowsie) | P1 | |
 | VEN-2006 | Akceptacja: GNOME i `vkcube`/`vulkaninfo` w gościu na obu hostach, pomiar klatek przed/po | P0 | |
-| VEN-2007 | Fuzzing protokołu venus i limity zasobów (gość jest wrogi) | P0 | |
+| VEN-2007 | Fuzzing protokołu venus i limity zasobów (gość jest wrogi) | P0 | cel `gpu_blob` (blob + okno pamięci współdzielonej) |
 
 Dlaczego Venus, a nie ANGLE — decyzja do zapisania w aneksie do
 [ADR-0004](docs/adr/0004-virtio-gpu-3d.md) przy starcie epiku:
@@ -815,7 +815,7 @@ linuksowy).
 | ID | Zadanie | Priorytet | Status |
 |---|---|---:|---|
 | GAME-2101 | Scanout bez kopii (zależy od VEN-2005 / GPU-fazy 3) — dziś każda klatka jedzie GPU→RAM→GPU, ~500 MB/s przy 1080p60 | P0 | |
-| GAME-2102 | `virtio-sound` (PCM playback, potem capture) + backend hosta: PipeWire/ALSA na Linuksie, WASAPI na Windowsie | P0 | |
+| GAME-2102 | `virtio-sound` (PCM playback, potem capture) + backend hosta: PipeWire/ALSA na Linuksie, WASAPI na Windowsie | P0 | playback zrobiony (`crates/virtio-sound`, `[sound] enabled`); ALSA przez `dlopen` (licencja — patrz `src/alsa.rs`), WASAPI shared mode; capture = faza 2 |
 | GAME-2103 | Venus (EPIC 20) jako ścieżka dla Vulkana/Protona | P0 | |
 | GAME-2104 | Pad: `virtio-input` z osiową mapą kontrolera + przechwytywanie z hosta (XInput/evdev), hotplug | P1 | |
 | GAME-2105 | Pacing klatek i vsync zamiast wyścigu: prezentacja związana z fence'em gościa, pomiar 1%/0.1% low | P1 | |

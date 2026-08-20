@@ -45,20 +45,25 @@ use virtio_core::{GuestMem, MAX_QUEUE_SIZE, VIRTIO_F_VERSION_1};
 use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress};
 
+use crate::blob::{BlobSupport, BlobTable, MAX_BLOB_ENTRIES};
 use crate::error::CommandError;
 use crate::fence::{FenceQueue, MAX_PENDING_FENCES};
 use crate::pacing::FramePacing;
 use crate::protocol::{
-    capset_info_body, cmd, config_bytes, display_info_body, edid_body, resp, AttachBacking,
-    CmdSubmit3d, CtrlHdr, CtxCreate, CtxResource, DisplayOne, GetCapset, GetCapsetInfo, GetEdid,
-    MemEntry, Rect, ResourceCreate2d, ResourceCreate3d, ResourceFlush, ResourceUnref, SetScanout,
-    Transfer3d, TransferToHost2d, UpdateCursor, CONFIG_LEN, MEM_ENTRY_LEN,
+    capset_info_body, cmd, config_bytes, display_info_body, edid_body, map_info_body, resp,
+    AttachBacking, CmdSubmit3d, CtrlHdr, CtxCreate, CtxResource, DisplayOne, GetCapset,
+    GetCapsetInfo, GetEdid, MemEntry, Rect, ResourceCreate2d, ResourceCreate3d, ResourceCreateBlob,
+    ResourceFlush, ResourceMapBlob, ResourceUnref, SetScanout, SetScanoutBlob, Transfer3d,
+    TransferToHost2d, UpdateCursor, BLOB_MEM_GUEST, CONFIG_LEN, MEM_ENTRY_LEN,
 };
 use crate::renderer::FenceOutcome;
 use crate::renderer::{Gpu3d, Renderer3d, MAX_SUBMIT_BYTES};
 use crate::resource::{ResourceTable, MAX_BACKING_ENTRIES};
 use crate::sink::ScanoutSink;
-use crate::{MAX_CURSOR_DIM, VIRTIO_GPU_F_EDID, VIRTIO_GPU_F_VIRGL};
+use crate::{
+    MAX_CURSOR_DIM, VIRTIO_GPU_F_CONTEXT_INIT, VIRTIO_GPU_F_EDID, VIRTIO_GPU_F_RESOURCE_BLOB,
+    VIRTIO_GPU_F_VIRGL,
+};
 
 /// controlq and cursorq, in queue order (spec section 5.7.2).
 pub const NUM_QUEUES: usize = 2;
@@ -71,6 +76,11 @@ static QUEUE_MAX_SIZES: [u16; NUM_QUEUES] = [MAX_QUEUE_SIZE, MAX_QUEUE_SIZE];
 
 /// Scanouts (virtual displays) the device exposes. One window, one scanout.
 pub const NUM_SCANOUTS: u32 = 1;
+
+/// `VIRTIO_GPU_SHM_ID_HOST_VISIBLE`: the shared-memory region id blob
+/// mappings land in (VEN-2001). The spec reserves 0 for "undefined", so
+/// host-visible is 1.
+pub const VIRTIO_GPU_SHM_ID_HOST_VISIBLE: u8 = 1;
 
 /// Capability sets in 2D mode. Zero: without a renderer the guest never asks
 /// for `GET_CAPSET_INFO`. With one, the count comes from [`Gpu3d`].
@@ -87,9 +97,23 @@ pub const MAX_COMMAND_BYTES: usize =
 /// just a bigger one, because command streams dwarf backing lists.
 pub const MAX_COMMAND_BYTES_3D: usize = CmdSubmit3d::LEN + MAX_SUBMIT_BYTES;
 
+/// Largest command once blob resources are offered: a `RESOURCE_CREATE_BLOB`
+/// carrying the maximum page list (VEN-2001).
+///
+/// It is 24 bytes longer than the 2D attach-backing bound — the fixed part of
+/// a create-blob is bigger — which is exactly why it is its own constant
+/// rather than a reuse: a device that offered blob and kept
+/// [`MAX_COMMAND_BYTES`] would reject a *legal* maximum-length command by 24
+/// bytes, which is the kind of off-by-one that only shows up under a real
+/// guest.
+pub const MAX_COMMAND_BYTES_BLOB: usize =
+    ResourceCreateBlob::LEN + MAX_BLOB_ENTRIES as usize * MEM_ENTRY_LEN;
+
 // The 3D cap must never regress below the 2D one, or attach-backing commands
 // would start failing the moment a renderer is attached.
 const _: () = assert!(MAX_COMMAND_BYTES_3D > MAX_COMMAND_BYTES);
+const _: () = assert!(MAX_COMMAND_BYTES_BLOB > MAX_COMMAND_BYTES);
+const _: () = assert!(MAX_COMMAND_BYTES_3D > MAX_COMMAND_BYTES_BLOB);
 
 /// Hard bound on how many chains one notification processes, so a guest that
 /// keeps refilling the ring from another vCPU cannot pin this thread forever.
@@ -233,15 +257,41 @@ impl FenceStats {
     }
 }
 
+/// Where the pixels of a bound scanout actually live — which decides how
+/// `RESOURCE_FLUSH` gets at them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanoutSource {
+    /// The host 2D table's image.
+    TwoD,
+    /// The 3D renderer (flushes read back through it).
+    ThreeD,
+    /// A blob resource (VEN-2001): the pixels are guest pages, and the layout
+    /// came from `SET_SCANOUT_BLOB` rather than from a resource's own
+    /// geometry — the blob has none.
+    Blob {
+        /// Bytes per row, guest-declared and validated against the mode.
+        stride: u32,
+        /// Byte offset of the plane inside the blob.
+        offset: u32,
+    },
+}
+
 /// What the guest bound to scanout 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScanoutBinding {
     resource_id: u32,
     /// Region of the resource the scanout shows; its size is the guest mode.
     rect: Rect,
-    /// Whether the resource lives in the 3D renderer (flushes read back
-    /// through it) or in the host 2D table.
-    three_d: bool,
+    /// Which half of the device owns the pixels.
+    source: ScanoutSource,
+}
+
+impl ScanoutBinding {
+    /// Whether the 3D renderer owns this binding — the question GPU-012's
+    /// degrade path asks.
+    fn is_three_d(&self) -> bool {
+        matches!(self.source, ScanoutSource::ThreeD)
+    }
 }
 
 /// One control-command result: a response code plus an optional body.
@@ -284,6 +334,13 @@ pub struct GpuDevice<S: ScanoutSink> {
     /// The 3D half (ADR-0004): validation front + host renderer. `None` in
     /// the 2D-only device, and then no 3D feature or command exists.
     three_d: Option<Gpu3d>,
+    /// Blob resources (VEN-2001). Always present so the routing code has one
+    /// shape; empty and inert unless the renderer declared blob support, and
+    /// then `VIRTIO_GPU_F_RESOURCE_BLOB` is not offered either.
+    blobs: BlobTable,
+    /// What the renderer said it can do with blobs, cached so the hot path
+    /// does not go through the trait object per command.
+    blob_support: BlobSupport,
     scanout: Option<ScanoutBinding>,
     /// `events_read` of `struct virtio_gpu_config`. Nothing raises events in
     /// the MVP (they are for hot-plugged displays / EDID changes), so this
@@ -353,6 +410,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
             display,
             resources: ResourceTable::new(),
             three_d: None,
+            blobs: BlobTable::new(0),
+            blob_support: BlobSupport::NONE,
             scanout: None,
             events_read: 0,
             // EDID (MVP-811) because GNOME/mutter builds its outputs from it;
@@ -387,18 +446,77 @@ impl<S: ScanoutSink> GpuDevice<S> {
     pub fn with_renderer(display: S, renderer: Box<dyn Renderer3d>) -> Self {
         let mut device = Self::new(display);
         device.features |= VIRTIO_GPU_F_VIRGL;
-        device.three_d = Some(Gpu3d::new(renderer));
+        let gpu = Gpu3d::new(renderer);
+
+        // VEN-2001: blob resources are offered only when the renderer can
+        // actually serve them. A guest that negotiates the bit and then gets
+        // ERR_UNSPEC for every create is worse off than one that never saw it.
+        let support = gpu.blob_support();
+        if support.any() {
+            device.features |= VIRTIO_GPU_F_RESOURCE_BLOB;
+            device.blobs = BlobTable::new(support.host_visible_bytes.unwrap_or(0));
+        }
+        device.blob_support = support;
+
+        // VEN-2002: `context_init` is only meaningful when there is a context
+        // type beyond classic virgl to select.
+        if gpu.has_context_types() {
+            device.features |= VIRTIO_GPU_F_CONTEXT_INIT;
+        }
+        tracing::info!(
+            blob_guest = support.guest,
+            blob_host3d = support.host3d,
+            host_visible_bytes = support.host_visible_bytes.unwrap_or(0),
+            venus = gpu.serves_venus(),
+            capsets = gpu.num_capsets(),
+            "virtio-gpu 3D renderer attached"
+        );
+        device.three_d = Some(gpu);
         device
     }
 
     /// Largest command this device gathers — the 3D bound when a renderer is
-    /// attached ([`MAX_COMMAND_BYTES_3D`]), the 2D one otherwise.
+    /// attached ([`MAX_COMMAND_BYTES_3D`]), the blob bound when blobs are
+    /// offered without one, the 2D bound otherwise.
     fn max_command_bytes(&self) -> usize {
         if self.three_d.is_some() {
             MAX_COMMAND_BYTES_3D
+        } else if self.blob_support.any() {
+            MAX_COMMAND_BYTES_BLOB
         } else {
             MAX_COMMAND_BYTES
         }
+    }
+
+    /// The blob half, or the in-band error every blob command gets on a device
+    /// that never offered [`VIRTIO_GPU_F_RESOURCE_BLOB`].
+    fn blobs_mut(&mut self, kind: u32) -> Result<&mut BlobTable, CommandError> {
+        if !self.blob_support.any() {
+            return Err(CommandError::UnsupportedCommand(kind));
+        }
+        Ok(&mut self.blobs)
+    }
+
+    /// Live blob resources (diagnostics, tests).
+    pub fn blob_count(&self) -> usize {
+        self.blobs.len()
+    }
+
+    /// Bytes promised across every live blob.
+    pub fn blob_bytes(&self) -> u64 {
+        self.blobs.total_bytes()
+    }
+
+    /// The device's shared-memory region, as the transport must publish it
+    /// (VEN-2001): `None` when this device has no host-visible window, which
+    /// is what keeps the region absent — and both transports' absent-region
+    /// behaviour intact — on every host that cannot back one.
+    pub fn shm_region(&self) -> Option<virtio_core::ShmRegion> {
+        let len = self.blob_support.host_visible_bytes?;
+        Some(virtio_core::ShmRegion {
+            id: VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
+            len,
+        })
     }
 
     /// The 3D validation front, or the in-band error every 3D command gets on
@@ -506,7 +624,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if self.restored_3d_lost && !self.restored_3d_reported {
             self.restored_3d_reported = true;
             return Err(DeviceError::Backend(
-                "this VM was restored from a snapshot; the guest's 3D contexts could not be                  restored and the device must be re-initialised"
+                "this VM was restored from a snapshot; the guest's host-side GPU state (3D                  contexts, blob resources) could not be restored and the device must be                  re-initialised"
                     .into(),
             ));
         }
@@ -1004,7 +1122,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // Dropping the renderer releases the host GL state (and, for an
         // isolated renderer, the dead worker's socket).
         self.three_d = None;
-        if self.scanout.is_some_and(|s| s.three_d) {
+        if self.scanout.is_some_and(|s| s.is_three_d()) {
             tracing::warn!("the scanout was a renderer resource; the window keeps its last frame");
             self.scanout = None;
         }
@@ -1066,6 +1184,21 @@ impl<S: ScanoutSink> GpuDevice<S> {
             cmd::TRANSFER_TO_HOST_2D => self.transfer_to_host_2d(mem, buf),
             cmd::RESOURCE_ATTACH_BACKING => self.attach_backing(mem, buf),
             cmd::RESOURCE_DETACH_BACKING => self.detach_backing(buf),
+            // Blob resources (VEN-2001). Like the 3D set, these are unknown
+            // commands *before* any body parsing on a device that never
+            // offered the feature.
+            kind @ (cmd::RESOURCE_CREATE_BLOB
+            | cmd::SET_SCANOUT_BLOB
+            | cmd::RESOURCE_MAP_BLOB
+            | cmd::RESOURCE_UNMAP_BLOB)
+                if !self.blob_support.any() =>
+            {
+                Err(CommandError::UnsupportedCommand(kind))
+            }
+            cmd::RESOURCE_CREATE_BLOB => self.resource_create_blob(mem, buf),
+            cmd::SET_SCANOUT_BLOB => self.set_scanout_blob(buf),
+            cmd::RESOURCE_MAP_BLOB => self.resource_map_blob(buf),
+            cmd::RESOURCE_UNMAP_BLOB => self.resource_unmap_blob(buf),
             // The 3D set (ADR-0004). On a 2D-only device these are unknown
             // commands — ERR_UNSPEC *before* any body parsing, so a truncated
             // 3D command on a 2D device is still "unsupported", not "invalid".
@@ -1155,6 +1288,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
     fn resource_create_2d(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
         let cmd = ResourceCreate2d::parse(buf)
             .ok_or_else(|| truncated(cmd::RESOURCE_CREATE_2D, buf.len(), ResourceCreate2d::LEN))?;
+        if self.blobs.owns(cmd.resource_id) {
+            return Err(CommandError::DuplicateResource(cmd.resource_id));
+        }
         self.resources
             .create(cmd.resource_id, cmd.format, cmd.width, cmd.height)?;
         tracing::debug!(
@@ -1175,10 +1311,22 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if cmd.resource_id == 0 {
             return Err(CommandError::ZeroResourceId);
         }
-        match self.three_d.as_mut() {
-            Some(gpu) if gpu.owns(cmd.resource_id) => gpu.resource_unref(cmd.resource_id)?,
-            _ => {
-                self.resources.remove(cmd.resource_id)?;
+        if self.blobs.owns(cmd.resource_id) {
+            // Unref of a mapped blob has to tear the host mapping down too;
+            // the table reports whether there was one.
+            let was_mapped_at = self.blobs.remove(cmd.resource_id)?;
+            if let Some(gpu) = self.three_d.as_mut() {
+                if let Some(offset) = was_mapped_at {
+                    gpu.unmap_blob(cmd.resource_id, offset);
+                }
+                gpu.destroy_blob(cmd.resource_id);
+            }
+        } else {
+            match self.three_d.as_mut() {
+                Some(gpu) if gpu.owns(cmd.resource_id) => gpu.resource_unref(cmd.resource_id)?,
+                _ => {
+                    self.resources.remove(cmd.resource_id)?;
+                }
             }
         }
         if self
@@ -1218,6 +1366,12 @@ impl<S: ScanoutSink> GpuDevice<S> {
             .ok_or(CommandError::TooManyEntries(fixed.nr_entries))?;
         if buf.len() < expected {
             return Err(truncated(cmd::RESOURCE_ATTACH_BACKING, buf.len(), expected));
+        }
+        // A blob's pages are fixed at RESOURCE_CREATE_BLOB time and the
+        // device sized every bound around them, so re-pointing them later is
+        // refused rather than quietly honoured (VEN-2001).
+        if self.blobs.owns(fixed.resource_id) {
+            return Err(CommandError::NotABlobCommand(fixed.resource_id));
         }
         let owned_3d = self
             .three_d
@@ -1277,6 +1431,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if cmd.resource_id == 0 {
             return Err(CommandError::ZeroResourceId);
         }
+        if self.blobs.owns(cmd.resource_id) {
+            return Err(CommandError::NotABlobCommand(cmd.resource_id));
+        }
         if let Some(gpu) = self.three_d.as_mut() {
             if gpu.owns(cmd.resource_id) {
                 gpu.detach_backing(cmd.resource_id)?;
@@ -1314,15 +1471,22 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // the kernel keeps creating its own dumb/console framebuffer with
         // RESOURCE_CREATE_2D (observed on Ubuntu 26.04: fb0 is a 1920x1080
         // B8G8R8X8 2D resource on a device advertising +virgl).
-        let (width, height, three_d) = match self.resources.get(cmd.resource_id) {
-            Some(resource) => (resource.width(), resource.height(), false),
+        // A blob has no geometry, so it can only be bound with
+        // `SET_SCANOUT_BLOB`, which carries the layout the plain command
+        // lacks. Refusing here (rather than falling through to "unknown
+        // resource") tells the guest which of its two mistakes it made.
+        if self.blobs.owns(cmd.resource_id) {
+            return Err(CommandError::NotABlobCommand(cmd.resource_id));
+        }
+        let (width, height, source) = match self.resources.get(cmd.resource_id) {
+            Some(resource) => (resource.width(), resource.height(), ScanoutSource::TwoD),
             None => {
                 let desc = self
                     .three_d
                     .as_ref()
                     .and_then(|gpu| gpu.desc(cmd.resource_id))
                     .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
-                (desc.width, desc.height, true)
+                (desc.width, desc.height, ScanoutSource::ThreeD)
             }
         };
         if !cmd.rect.fits_within(width, height) {
@@ -1332,23 +1496,34 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 height,
             });
         }
+        self.bind_scanout(cmd.scanout_id, cmd.resource_id, cmd.rect, source)
+    }
 
-        if self.display.resolution() != (cmd.rect.width, cmd.rect.height) {
+    /// Shared tail of `SET_SCANOUT` and `SET_SCANOUT_BLOB`: resize the host
+    /// window to the guest's mode and record the binding.
+    fn bind_scanout(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        rect: Rect,
+        source: ScanoutSource,
+    ) -> Result<Reply, CommandError> {
+        if self.display.resolution() != (rect.width, rect.height) {
             self.display
-                .set_resolution(cmd.rect.width, cmd.rect.height)
+                .set_resolution(rect.width, rect.height)
                 .map_err(|error| CommandError::Display(error.to_string()))?;
         }
         self.scanout = Some(ScanoutBinding {
-            resource_id: cmd.resource_id,
-            rect: cmd.rect,
-            three_d,
+            resource_id,
+            rect,
+            source,
         });
         tracing::info!(
-            scanout = cmd.scanout_id,
-            resource = cmd.resource_id,
-            width = cmd.rect.width,
-            height = cmd.rect.height,
-            three_d,
+            scanout = scanout_id,
+            resource = resource_id,
+            width = rect.width,
+            height = rect.height,
+            source = ?source,
             "virtio-gpu scanout set"
         );
         Ok(Reply::ok())
@@ -1418,15 +1593,29 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // Unknown ids are still an error — that is how a guest notices it
         // flushed something it had already unref'd. Either half may own the
         // resource (see `set_scanout`).
-        let (width, height, three_d) = match self.resources.get(cmd.resource_id) {
-            Some(resource) => (resource.width(), resource.height(), false),
-            None => {
-                let desc = self
-                    .three_d
-                    .as_ref()
-                    .and_then(|gpu| gpu.desc(cmd.resource_id))
-                    .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
-                (desc.width, desc.height, true)
+        // A blob has no geometry of its own: the only rect it can be flushed
+        // against is the one `SET_SCANOUT_BLOB` declared for it.
+        let (width, height, three_d) = if self.blobs.owns(cmd.resource_id) {
+            match self.scanout {
+                Some(s) if s.resource_id == cmd.resource_id => {
+                    (s.rect.x + s.rect.width, s.rect.y + s.rect.height, false)
+                }
+                // Not the bound scanout: nothing to present, and no geometry
+                // to bounds-check against. Same "offscreen flush" no-op the
+                // 2D path takes below.
+                _ => return Ok(Reply::ok()),
+            }
+        } else {
+            match self.resources.get(cmd.resource_id) {
+                Some(resource) => (resource.width(), resource.height(), false),
+                None => {
+                    let desc = self
+                        .three_d
+                        .as_ref()
+                        .and_then(|gpu| gpu.desc(cmd.resource_id))
+                        .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
+                    (desc.width, desc.height, true)
+                }
             }
         };
         if !cmd.rect.fits_within(width, height) {
@@ -1463,7 +1652,22 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // the frame interval, because the interval alone cannot say whether a
         // slow frame is the guest's doing or ours (ADR-0004 phase 2).
         let service_start = Instant::now();
-        if three_d {
+        if let ScanoutSource::Blob { stride, offset } = scanout.source {
+            // VEN-2001: the pixels are guest pages. Gather the clipped rows
+            // out of the blob's backing list — through the same checked
+            // `vm-memory` path every other guest read uses — and push them
+            // down the sink.
+            let mut scratch = std::mem::take(&mut self.flush_buf);
+            let outcome = self
+                .read_blob_rect(cmd.resource_id, clip, stride, offset, &mut scratch)
+                .and_then(|()| {
+                    self.display
+                        .update_scanout(dst_x, dst_y, clip.width, clip.height, &scratch)
+                        .map_err(|error| CommandError::Display(error.to_string()))
+                });
+            self.flush_buf = scratch;
+            outcome?;
+        } else if three_d {
             // GPU-010: the rendered pixels live in the host renderer; read
             // the dirty rect back as BGRA and push it down the same sink.
             let mut scratch = std::mem::take(&mut self.flush_buf);
@@ -1620,7 +1824,12 @@ impl<S: ScanoutSink> GpuDevice<S> {
         }
         let ctx_id = hdr.ctx_id;
         // Looked up before the 3D front is borrowed; a 2D id is never an index.
-        let owned_2d = self.resources.get(cmd.resource_id).is_some();
+        // A *blob* id belongs here too and takes the same path: venus attaches
+        // its ring blob to its context, and the renderer has no 3D handle for
+        // it, exactly like the kernel's 2D console framebuffer (ADR-0004's
+        // mixed-namespace amendment).
+        let owned_2d =
+            self.resources.get(cmd.resource_id).is_some() || self.blobs.owns(cmd.resource_id);
         let gpu = self.three_d_mut(kind)?;
         if owned_2d {
             if !gpu.has_context(ctx_id) {
@@ -1644,7 +1853,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
     fn resource_create_3d(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
         let cmd = ResourceCreate3d::parse(buf)
             .ok_or_else(|| truncated(cmd::RESOURCE_CREATE_3D, buf.len(), ResourceCreate3d::LEN))?;
-        if self.resources.get(cmd.resource_id).is_some() {
+        if self.resources.get(cmd.resource_id).is_some() || self.blobs.owns(cmd.resource_id) {
             return Err(CommandError::DuplicateResource(cmd.resource_id));
         }
         self.three_d_mut(cmd::RESOURCE_CREATE_3D)?
@@ -1678,6 +1887,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if cmd.resource_id == 0 {
             return Err(CommandError::ZeroResourceId);
         }
+        if self.blobs.owns(cmd.resource_id) {
+            // TRANSFER_*_3D names a box in a resource's geometry; a blob has
+            // none. Venus moves blob bytes through its own ring instead.
+            return Err(CommandError::NotABlobCommand(cmd.resource_id));
+        }
         let ctx_id = hdr.ctx_id;
         self.three_d_mut(kind)?.transfer(ctx_id, &cmd, to_host)?;
         Ok(Reply::ok())
@@ -1696,6 +1910,276 @@ impl<S: ScanoutSink> GpuDevice<S> {
         self.three_d_mut(cmd::SUBMIT_3D)?.submit(ctx_id, stream)?;
         tracing::trace!(ctx = ctx_id, bytes = declared, "virtio-gpu 3D submit");
         Ok(Reply::ok())
+    }
+
+    // ------------------------------------- blob resources (EPIC 20/VEN-2001)
+
+    /// `RESOURCE_CREATE_BLOB`.
+    ///
+    /// Everything here is guest-chosen: the id, the memory type, the flags,
+    /// the entry count, every entry, the size and the `blob_id`. The order is
+    /// deliberate — parse and bound the *count* before touching the trailing
+    /// entries, validate the whole shape before allocating the entry vector,
+    /// and call the renderer only once nothing can still fail on our side, so
+    /// a rejection never leaves a half-created blob in either table.
+    fn resource_create_blob(
+        &mut self,
+        mem: &Arc<GuestMem>,
+        buf: &[u8],
+    ) -> Result<Reply, CommandError> {
+        let kind = cmd::RESOURCE_CREATE_BLOB;
+        let args = ResourceCreateBlob::parse(buf)
+            .ok_or_else(|| truncated(kind, buf.len(), ResourceCreateBlob::LEN))?;
+        if args.nr_entries > MAX_BLOB_ENTRIES {
+            return Err(CommandError::TooManyEntries(args.nr_entries));
+        }
+        let expected = ResourceCreateBlob::total_len(args.nr_entries)
+            .ok_or(CommandError::TooManyEntries(args.nr_entries))?;
+        if buf.len() < expected {
+            return Err(truncated(kind, buf.len(), expected));
+        }
+        // One id namespace across all three tables (the ADR's routing rule).
+        if self.resources.get(args.resource_id).is_some()
+            || self
+                .three_d
+                .as_ref()
+                .is_some_and(|gpu| gpu.owns(args.resource_id))
+        {
+            return Err(CommandError::DuplicateResource(args.resource_id));
+        }
+
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(usize::try_from(args.nr_entries).unwrap_or(0))
+            .map_err(|_| CommandError::OutOfMemory)?;
+        for index in 0..args.nr_entries {
+            let entry = ResourceCreateBlob::entry_at(buf, index)
+                .ok_or_else(|| truncated(kind, buf.len(), expected))?;
+            entries.push(entry);
+        }
+
+        let support = self.blob_support;
+        let backing_len = self.blobs.validate(&args, support, &entries)?;
+        // A guest-memory blob is bookkeeping only: the pages are the guest's,
+        // and putting them in front of the host renderer would hand a C
+        // library guest pointers for no reason at all.
+        if args.blob_mem != BLOB_MEM_GUEST {
+            self.three_d_mut(kind)?.create_blob(&args, mem, &entries)?;
+        }
+        self.blobs.insert(&args, &entries, backing_len)?;
+        tracing::debug!(
+            resource = args.resource_id,
+            blob_mem = args.blob_mem,
+            blob_flags = format_args!("{:#x}", args.blob_flags),
+            blob_id = args.blob_id,
+            size = args.size,
+            entries = args.nr_entries,
+            "virtio-gpu blob resource created"
+        );
+        Ok(Reply::ok())
+    }
+
+    /// `RESOURCE_MAP_BLOB`: place the blob's host memory in the device's
+    /// shared-memory region at a guest-chosen offset.
+    ///
+    /// The guest names the offset into a *host* mapping, which makes this the
+    /// sharpest guest-controlled value in the epic. It is validated against
+    /// the window length, the page grid and every live mapping
+    /// ([`crate::blob::HostVisibleWindow`]) before the renderer is asked to
+    /// back it, and rolled back if the renderer refuses.
+    fn resource_map_blob(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
+        let kind = cmd::RESOURCE_MAP_BLOB;
+        let cmd = ResourceMapBlob::parse(buf)
+            .ok_or_else(|| truncated(kind, buf.len(), ResourceMapBlob::LEN))?;
+        if cmd.resource_id == 0 {
+            return Err(CommandError::ZeroResourceId);
+        }
+        let size = self
+            .blobs_mut(kind)?
+            .reserve_mapping(cmd.resource_id, cmd.offset)?;
+        let mapping = match self
+            .three_d
+            .as_mut()
+            .ok_or(CommandError::NoHostVisibleWindow)
+            .and_then(|gpu| gpu.map_blob(cmd.resource_id, cmd.offset, size))
+        {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                // The window reservation must not outlive the failed map, or
+                // the guest loses that span of the window for ever.
+                self.blobs.unreserve(cmd.resource_id, cmd.offset);
+                return Err(error);
+            }
+        };
+        self.blobs.commit_mapping(cmd.resource_id, cmd.offset);
+        tracing::debug!(
+            resource = cmd.resource_id,
+            offset = format_args!("{:#x}", cmd.offset),
+            size,
+            map_info = mapping.wire(),
+            "virtio-gpu blob mapped into the shared-memory region"
+        );
+        Ok(Reply {
+            code: resp::OK_MAP_INFO,
+            body: map_info_body(mapping.wire()).to_vec(),
+        })
+    }
+
+    /// `RESOURCE_UNMAP_BLOB`. Same wire layout as unref.
+    fn resource_unmap_blob(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
+        let kind = cmd::RESOURCE_UNMAP_BLOB;
+        let cmd = ResourceUnref::parse(buf)
+            .ok_or_else(|| truncated(kind, buf.len(), ResourceUnref::LEN))?;
+        if cmd.resource_id == 0 {
+            return Err(CommandError::ZeroResourceId);
+        }
+        let offset = self.blobs_mut(kind)?.unmap(cmd.resource_id)?;
+        if let Some(gpu) = self.three_d.as_mut() {
+            gpu.unmap_blob(cmd.resource_id, offset);
+        }
+        tracing::debug!(
+            resource = cmd.resource_id,
+            offset = format_args!("{offset:#x}"),
+            "virtio-gpu blob unmapped"
+        );
+        Ok(Reply::ok())
+    }
+
+    /// `SET_SCANOUT_BLOB`: bind a guest-memory blob to scanout 0.
+    ///
+    /// This is the one blob command with a *format*, because a blob has none
+    /// of its own — the guest declares width, height, format and per-plane
+    /// strides here. Only single-plane BGRA is accepted (the same two layouts
+    /// the 2D path takes), and only for a blob whose bytes are guest pages:
+    /// presenting a host3d blob would need the zero-copy export this host
+    /// cannot do (ADR-0004 phase 2's dmabuf probe), and pretending otherwise
+    /// would show the guest a black screen instead of an error.
+    fn set_scanout_blob(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
+        let kind = cmd::SET_SCANOUT_BLOB;
+        let cmd = SetScanoutBlob::parse(buf)
+            .ok_or_else(|| truncated(kind, buf.len(), SetScanoutBlob::LEN))?;
+        if cmd.scanout_id >= NUM_SCANOUTS {
+            return Err(CommandError::UnknownScanout(cmd.scanout_id));
+        }
+        if cmd.resource_id == 0 {
+            if self.scanout.take().is_some() {
+                tracing::info!(scanout = cmd.scanout_id, "virtio-gpu scanout disabled");
+            }
+            return Ok(Reply::ok());
+        }
+        if !crate::is_supported_format(cmd.format) {
+            return Err(CommandError::UnsupportedFormat(cmd.format));
+        }
+        // Planes 1..3 belong to planar YUV formats we do not accept; a
+        // non-zero stride there means the guest thinks it bound something we
+        // did not.
+        if cmd.strides[1..].iter().any(|s| *s != 0) || cmd.offsets[1..].iter().any(|o| *o != 0) {
+            return Err(CommandError::UnsupportedFormat(cmd.format));
+        }
+        let blob = self
+            .blobs_mut(kind)?
+            .get(cmd.resource_id)
+            .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
+        if blob.blob_mem() != BLOB_MEM_GUEST {
+            return Err(CommandError::BadBlobMem {
+                blob_mem: blob.blob_mem(),
+                reason: "only a guest-memory blob can be scanned out on this host",
+            });
+        }
+        let backing_len = blob.backing_len();
+
+        if !cmd.rect.fits_within(cmd.width, cmd.height) {
+            return Err(CommandError::RectOutOfBounds {
+                rect: cmd.rect,
+                width: cmd.width,
+                height: cmd.height,
+            });
+        }
+        // The stride must hold a row, and the whole declared image must fit
+        // inside the pages the blob actually has. All of it in u64.
+        let min_stride = u64::from(cmd.width) * u64::from(crate::BYTES_PER_PIXEL);
+        let stride = u64::from(cmd.strides[0]);
+        if stride < min_stride {
+            return Err(CommandError::BadGeometry {
+                width: cmd.width,
+                height: cmd.height,
+            });
+        }
+        let needed = u64::from(cmd.offsets[0])
+            .checked_add(stride.saturating_mul(u64::from(cmd.height)))
+            .ok_or(CommandError::BadGeometry {
+                width: cmd.width,
+                height: cmd.height,
+            })?;
+        if needed > backing_len {
+            return Err(CommandError::ShortBacking {
+                need: needed,
+                have: backing_len,
+            });
+        }
+
+        self.bind_scanout(
+            cmd.scanout_id,
+            cmd.resource_id,
+            cmd.rect,
+            ScanoutSource::Blob {
+                stride: cmd.strides[0],
+                offset: cmd.offsets[0],
+            },
+        )
+    }
+
+    /// Gathers `rect` out of a blob's guest pages as packed BGRA rows.
+    ///
+    /// The layout was validated at `SET_SCANOUT_BLOB` time against the blob's
+    /// backing length, so the arithmetic here cannot run past it — but it is
+    /// still done in `u64` and the read still goes through the checked
+    /// `vm-memory` path, because "validated earlier" is not a reason to skip a
+    /// bound on a guest-controlled value.
+    fn read_blob_rect(
+        &self,
+        resource_id: u32,
+        rect: Rect,
+        stride: u32,
+        plane_offset: u32,
+        out: &mut Vec<u8>,
+    ) -> Result<(), CommandError> {
+        let mem = self
+            .mem
+            .as_ref()
+            .ok_or(CommandError::UnknownResource(resource_id))?;
+        let blob = self
+            .blobs
+            .get(resource_id)
+            .ok_or(CommandError::UnknownResource(resource_id))?;
+        let bpp = u64::from(crate::BYTES_PER_PIXEL);
+        let row_bytes =
+            usize::try_from(u64::from(rect.width) * bpp).map_err(|_| CommandError::OutOfMemory)?;
+        let total = row_bytes
+            .checked_mul(usize::try_from(rect.height).unwrap_or(usize::MAX))
+            .ok_or(CommandError::OutOfMemory)?;
+        out.clear();
+        out.try_reserve(total)
+            .map_err(|_| CommandError::OutOfMemory)?;
+        out.resize(total, 0);
+        let backing = blob.backing();
+        for row in 0..u64::from(rect.height) {
+            let offset = u64::from(plane_offset)
+                .checked_add((u64::from(rect.y) + row).saturating_mul(u64::from(stride)))
+                .and_then(|at| at.checked_add(u64::from(rect.x) * bpp))
+                .ok_or(CommandError::ShortBacking {
+                    need: u64::MAX,
+                    have: blob.backing_len(),
+                })?;
+            let start = usize::try_from(row)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(row_bytes);
+            let dst = out
+                .get_mut(start..start.saturating_add(row_bytes))
+                .ok_or(CommandError::OutOfMemory)?;
+            crate::resource::read_backing(mem, backing, offset, dst)?;
+        }
+        Ok(())
     }
 }
 
@@ -1894,6 +2378,10 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         }
     }
 
+    fn shm_regions(&self) -> Vec<virtio_core::ShmRegion> {
+        self.shm_region().into_iter().collect()
+    }
+
     fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
         // The renderer is the only thing here with asynchronous host work; it
         // decides whether the waker is usable (and therefore whether fences
@@ -1931,6 +2419,14 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
     /// has since detached. It is still recorded, so its id stays valid, and it
     /// comes back black — which is what the guest's next `TRANSFER_TO_HOST_2D`
     /// will overwrite anyway.
+    ///
+    /// **Blob resources are counted, not described** (VEN-2001). A blob is a
+    /// host-visible mapping into a shared-memory window this process owns, and
+    /// a `HOST3D` one's bytes never left the renderer at all — there is nothing
+    /// a restore could put back and nothing useful to write down. They are
+    /// treated exactly like 3D contexts: the count goes in the file, and a
+    /// restored device that finds a non-zero one tells the driver to start
+    /// again.
     fn save_device(&self) -> Vec<u8> {
         let state = crate::save::GpuState {
             events_read: self.events_read,
@@ -1939,6 +2435,7 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
                 .as_ref()
                 .map(|gpu| gpu.context_count() as u32)
                 .unwrap_or(0),
+            live_blobs: self.blobs.len() as u32,
             resources: self
                 .resources
                 .iter()
@@ -1953,7 +2450,13 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
             scanout: self.scanout.map(|s| crate::save::SavedScanout {
                 resource_id: s.resource_id,
                 rect: s.rect,
-                three_d: s.three_d,
+                source: match s.source {
+                    ScanoutSource::TwoD => crate::save::SavedScanoutSource::TwoD,
+                    ScanoutSource::ThreeD => crate::save::SavedScanoutSource::ThreeD,
+                    ScanoutSource::Blob { stride, offset } => {
+                        crate::save::SavedScanoutSource::Blob { stride, offset }
+                    }
+                },
             }),
         };
         state.encode()
@@ -2037,11 +2540,13 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
 
         let mut shown = false;
         if let Some(saved) = state.scanout {
-            if saved.three_d {
+            if saved.source.is_host_owned() {
                 tracing::warn!(
                     resource = saved.resource_id,
-                    "the suspended guest was scanning out a 3D resource; the window keeps its \
-                     initial frame until the driver programs a new scanout"
+                    source = ?saved.source,
+                    "the suspended guest was scanning out a resource whose pixels live on the \
+                     host; the window keeps its initial frame until the driver programs a new \
+                     scanout"
                 );
             } else if self.resources.get(saved.resource_id).is_some() {
                 if self.display.resolution() != (saved.rect.width, saved.rect.height) {
@@ -2052,23 +2557,27 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
                 self.scanout = Some(ScanoutBinding {
                     resource_id: saved.resource_id,
                     rect: saved.rect,
-                    three_d: false,
+                    source: ScanoutSource::TwoD,
                 });
                 shown = self.present_whole_scanout();
             }
         }
 
-        if state.live_3d_contexts > 0 {
+        if state.live_3d_contexts > 0 || state.live_blobs > 0 {
             // Nothing in virglrenderer, or in GL, hands a live rendering
-            // context back in a form another process could reload. The driver
-            // is told to start again — the same signal, and the same recovery,
-            // as a renderer that crashed (ADR-0004 GPU-012).
+            // context back in a form another process could reload; and a blob
+            // is a mapping into a host-visible window this process did not
+            // exist to make (VEN-2001). The driver is told to start again — the
+            // same signal, and the same recovery, as a renderer that crashed
+            // (ADR-0004 GPU-012).
             self.restored_3d_lost = true;
             self.restored_3d_reported = false;
             tracing::warn!(
                 contexts = state.live_3d_contexts,
-                "the suspended guest had 3D contexts open; they cannot be restored, so the \
-                 driver will be told the device needs a reset"
+                blobs = state.live_blobs,
+                "the suspended guest had host-side GPU state open (3D contexts, blob \
+                 resources); it cannot be restored, so the driver will be told the device \
+                 needs a reset"
             );
         }
 
@@ -2114,6 +2623,7 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         self.events_read = 0;
         self.scanout = None;
         self.resources.clear();
+        self.blobs.clear();
         self.req_buf = Vec::new();
         self.flush_buf = Vec::new();
         // The driver has done what it was told; the restore's warning is spent.

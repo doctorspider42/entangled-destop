@@ -52,9 +52,14 @@ fuzz_target!(|input: Input| {
                 RequestType::Out => 1,
                 RequestType::Flush => 4,
                 RequestType::GetId => 8,
+                RequestType::Discard => 11,
+                RequestType::WriteZeroes => 13,
             }
         ),
-        None => assert!(!matches!(header.raw_type, 0 | 1 | 4 | 8)),
+        // Every code the parser accepts must appear above; anything else must
+        // be rejected. Adding a request type without touching this list is
+        // what broke the target, so keep the two halves in step.
+        None => assert!(!matches!(header.raw_type, 0 | 1 | 4 | 8 | 11 | 13)),
     }
 
     // Guest-chosen sector plus guest-chosen length against guest-chosen

@@ -97,7 +97,8 @@ other way, it says what a suspend has to write down:
 
 | Device | Saved | Restored |
 |---|---|---|
-| `virtio_core::TransportState` | features (offered *and* negotiated) and their selectors, status, activation, per-queue geometry, `config_generation`, the ISR | features re-acknowledged, queues rebuilt through the same `build` the guest's own `DRIVER_OK` goes through, then the device re-activated |
+| `virtio_core::TransportState` | features (offered *and* negotiated) and their selectors, status, activation, per-queue geometry, `SHM_SEL`, `config_generation`, the ISR | features re-acknowledged, queues rebuilt through the same `build` the guest's own `DRIVER_OK` goes through, then the device re-activated |
+| shared-memory placement (VEN-2001) | where the **host** put each region, by `shmid` | *not* restored — the new machine places its own window. Recorded only so that a machine which placed it somewhere else is a named refusal, because the guest read that base out of the registers and its blob mappings point at it |
 | virtqueue positions | the device's `next_avail`/`next_used` | applied to the rebuilt queues **before** the device sees them |
 | MSI-X | message control, the table, the PBA, config and per-queue vectors | all of it; nothing pending is delivered — the guest unmasking a vector is what sends it |
 | PCI configuration space | all 64 dwords of every function, plus the latched `CONFIG_ADDRESS` | written back and everything derived from it re-published (the INTx flag, the mirrored MSI-X control), then the queue-notify ioeventfds re-based around the restored BARs |
@@ -107,6 +108,7 @@ other way, it says what a suspend has to write down:
 | RTC | index latch and CMOS bytes | both |
 | ACPI PM block | the registers, the timer's reading, the shutdown latch | the timer re-anchored to the new epoch, the latch restored |
 | pflash | the CFI command state machine only | the same; the contents are the NVRAM file, which the restored machine opens |
+| virtio-snd | all four queues' positions (control, event, TX, RX) and the guest's stream state | both. The **host sink** is not saved: the WASAPI or ALSA device this process opened is gone, and a stream that was mid-playback resumes with a gap — what a real machine's suspend does to it |
 | reset controls | the latches, including "the guest asked to reboot" | both — a guest that asked and was suspended before being served is still owed its reboot |
 
 Three per-device answers are worth stating outright.
@@ -127,7 +129,7 @@ and its TCP stack notices in the ordinary way, with a retransmit that is never
 answered. That is precisely what a laptop's own suspend does to it. Resetting
 the interface toward the guest would be a bigger lie, not a smaller one.
 
-**virtio-gpu's 2D half comes back; the 3D half cannot.** A 2D resource is a host
+**virtio-gpu's 2D half comes back; the host-owned halves cannot.** A 2D resource is a host
 BGRA buffer plus the list of **guest** pages the driver attached to it — and the
 snapshot already carries those pages in full. So the pixels are not saved at
 all: the resource table records identity, geometry and backing list, and the
@@ -136,9 +138,17 @@ that is eight megabytes saved per resource, several times over, and it is the
 difference between a resumed desktop and a black window. A 3D resource is a
 texture inside the host GL driver, reached through virglrenderer, and a
 rendering *context* is a live command-stream state machine; nothing hands either
-back. So a guest that had contexts open is told its device needs a reset when it
-resumes — the same signal, and the same recovery path, GPU-012 already uses when
+back. Neither does a **blob resource** (VEN-2001): it is a mapping into a
+host-visible window this process did not exist to make, and a `HOST3D` blob's
+bytes never left the renderer at all. Both are therefore *counted* rather than
+described — there is nothing useful to write down, only the driver can make them
+again — and a guest that had either open is told its device needs a reset when
+it resumes, the same signal and the same recovery path GPU-012 already uses when
 the isolated renderer crashes.
+
+The scanout binding follows the same three-way split: a 2D source is rebound and
+pushed to the window, a 3D or blob source is not, and the window keeps its
+initial frame until the driver programs a new one.
 
 ### 3. The chips that were not there
 
@@ -210,6 +220,8 @@ host that lost power, and handed over by someone else. So:
 | truncated, or an index that points outside the file | a cut-short copy |
 | section digest mismatch | a torn memory section reads as plausible pages |
 | unknown section kind | state the guest expects and would silently not get |
+| a **section version** that is not this build's | a section whose *shape* changed. Venus phase 1 bumped `virtio` to 2 (`SHM_SEL` and the host's region placement) and the virtio-gpu blob to 2 (the scanout's source became three-way, blob resources joined the table); a version-1 snapshot has neither, and defaulting them would restore a guest whose driver had selected a region into one that had not. The message names the section and both versions |
+| a shared-memory region the host placed elsewhere | the guest's blob mappings point at the address it read from the registers |
 | trailing bytes in a section | written by a build that put more in it |
 | a count or length that cannot fit | nothing is ever allocated on an unchecked number |
 | vCPU count, memory size, transport, boot mode, device list/order | a guest whose `/dev/vda` is now somebody else's disk |
@@ -371,20 +383,25 @@ but able to run its whole shutdown path.
 
 ## What a resumed guest still gets wrong
 
-1. **Wall-clock time jumps.** The RTC is derived from the host clock, so a guest
+1. **The host audio sink restarts.** A virtio-snd stream that was mid-playback
+   resumes with a gap: the device this process had open is gone and a new one
+   starts wherever it starts. The guest's stream state comes back, so it plays
+   on rather than stalling.
+2. **Wall-clock time jumps.** The RTC is derived from the host clock, so a guest
    suspended for an hour resumes an hour behind and corrects itself through NTP.
    Correct for a laptop, wrong for a VM that was supposed to be frozen, and the
    right answer differs per use — it needs a policy, not a patch. (ADR-0005 left
    the same debt for pause.)
-2. **The paravirtual clock is restored on KVM and absent on WHP.** A WHP guest
+3. **The paravirtual clock is restored on KVM and absent on WHP.** A WHP guest
    using an invariant TSC comes back consistently; there is no equivalent of
    `KVM_SET_CLOCK` to put a kvmclock back, and no kvmclock in that partition to
    put back.
-3. **Network connections die.** By construction; see §2.
-4. **3D contexts die.** By construction; see §2. The guest is told, which is more
-   than a silent failure, but a compositor that does not act on
-   `DEVICE_NEEDS_RESET` will need restarting.
-5. **The 2D resource restore has not been watched on a full desktop.** It is
+4. **Network connections die.** By construction; see §2.
+5. **3D contexts and blob resources die.** By construction; see §2. The guest is
+   told, which is more than a silent failure, but a compositor that does not act
+   on `DEVICE_NEEDS_RESET` will need restarting. A guest scanning out of a blob
+   keeps the window's initial frame until it programs a new scanout.
+6. **The 2D resource restore has not been watched on a full desktop.** It is
    exercised by the acceptance guests' framebuffer console (the resource table
    comes back with its pixels, `restored=1 blank=0 presented=true`) and by unit
    tests over a scattered 2048-page backing list — but a GNOME session's
@@ -392,16 +409,16 @@ but able to run its whole shutdown path.
    put a suspended one back and looked at the screen.
    `entangled resume --screenshot-after` exists to make that a one-command
    check; it needs a desktop image that is not in use by anything else.
-6. **Host input queued while the VM was frozen is dropped**, as it is by a pause.
-7. **Dirty-page tracking is not implemented.** Every suspend writes every
+7. **Host input queued while the VM was frozen is dropped**, as it is by a pause.
+8. **Dirty-page tracking is not implemented.** Every suspend writes every
    non-zero page. `KVM_GET_DIRTY_LOG` and `MEM_WRITE_WATCH` are what would turn a
    repeated suspend of the same VM into an incremental one; the alias in
    `vmm_core::memory` exists for exactly that divergence.
-8. **The snapshot is not compressed** and not encrypted. A desktop guest's file
+9. **The snapshot is not compressed** and not encrypted. A desktop guest's file
    is the size of its touched RAM.
-9. **`Suspended` never goes back to `Running` in the same process.** Resuming is
+10. **`Suspended` never goes back to `Running` in the same process.** Resuming is
    always a new process. Nothing needs it to be otherwise today, but a manager
    that wanted a "hibernate and wake" button inside one process would.
-10. **A snapshot pins its disks by size and mtime.** A filesystem with coarse or
+11. **A snapshot pins its disks by size and mtime.** A filesystem with coarse or
    absent mtimes (some network mounts) weakens the check to size alone, and the
    code says so rather than pretending otherwise.

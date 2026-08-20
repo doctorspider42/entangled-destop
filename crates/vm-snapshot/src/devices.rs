@@ -24,7 +24,14 @@ use crate::error::Result;
 use crate::error::SnapshotError;
 
 /// Version of the virtio section's encoding.
-pub const VIRTIO_VERSION: u32 = 1;
+///
+/// **2** since Venus phase 1 (VEN-2001) added `SHM_SEL` and the host's
+/// shared-memory placement to the state a transport owns. A version-1 snapshot
+/// has neither, and rather than defaulting them — which would restore a guest
+/// whose driver had selected a region into one that had not — it is refused by
+/// number: `SectionVersion` names both versions and the section they disagree
+/// about.
+pub const VIRTIO_VERSION: u32 = 2;
 /// Version of the 16550 section's encoding.
 pub const SERIAL_VERSION: u32 = 1;
 /// Version of the firmware-platform section's encoding.
@@ -44,6 +51,9 @@ pub const RESET_VERSION: u32 = 1;
 const MAX_QUEUES: usize = 64;
 /// MSI-X vectors one function may publish.
 const MAX_VECTORS: usize = 2048;
+/// Shared-memory regions one device may declare. The spec's `shmid` is a byte
+/// and virtio-gpu declares one; this is the bound, not the expectation.
+const MAX_SHM_REGIONS: usize = 256;
 /// Bytes of device-specific state one device may carry (virtio-gpu's resource
 /// table is the largest, and it is kilobytes).
 const MAX_DEVICE_BLOB: usize = 4 << 20;
@@ -167,9 +177,14 @@ pub fn encode_virtio(state: &TransportSaveState) -> Vec<u8> {
         .u64(state.driver_features)
         .u32(state.driver_features_sel)
         .u32(state.queue_sel)
+        .u32(state.shm_sel)
         .u32(state.status)
         .bool(state.activated)
-        .count(state.queues.len());
+        .count(state.shm_bases.len());
+    for (id, base) in &state.shm_bases {
+        w.u8(*id).u64(*base);
+    }
+    w.count(state.queues.len());
     for queue in &state.queues {
         put_queue(&mut w, queue);
     }
@@ -187,8 +202,14 @@ pub fn decode_virtio(bytes: &[u8]) -> Result<TransportSaveState> {
     let driver_features = r.u64("driver features")?;
     let driver_features_sel = r.u32("driver features selector")?;
     let queue_sel = r.u32("queue selector")?;
+    let shm_sel = r.u32("shm selector")?;
     let status = r.u32("device status")?;
     let activated = r.bool("activated")?;
+    let shm_count = r.count("shared-memory regions", MAX_SHM_REGIONS, 9)?;
+    let mut shm_bases = Vec::with_capacity(shm_count);
+    for _ in 0..shm_count {
+        shm_bases.push((r.u8("shm id")?, r.u64("shm base")?));
+    }
     let count = r.count("queues", MAX_QUEUES, 29)?;
     let mut queues = Vec::with_capacity(count);
     for _ in 0..count {
@@ -204,6 +225,8 @@ pub fn decode_virtio(bytes: &[u8]) -> Result<TransportSaveState> {
         driver_features,
         driver_features_sel,
         queue_sel,
+        shm_sel,
+        shm_bases,
         status,
         activated,
         queues,
@@ -666,6 +689,8 @@ mod tests {
             driver_features: 0x1_0000_0005,
             driver_features_sel: 0,
             queue_sel: 0,
+            shm_sel: 1,
+            shm_bases: vec![(1, 0x4_0000_0000)],
             status: 0x0f,
             activated: true,
             queues: vec![QueueState {
@@ -800,6 +825,16 @@ mod tests {
         assert_eq!(decode_virtio(&encode_virtio(&state)).unwrap(), state);
     }
 
+    /// A slot with no shared-memory regions — every device but virtio-gpu —
+    /// round trips with an empty list rather than an absent one.
+    #[test]
+    fn a_virtio_slot_without_shared_memory_round_trips() {
+        let mut state = sample_virtio();
+        state.shm_sel = 0;
+        state.shm_bases = Vec::new();
+        assert_eq!(decode_virtio(&encode_virtio(&state)).unwrap(), state);
+    }
+
     #[test]
     fn a_virtio_slot_without_msix_round_trips() {
         let mut state = sample_virtio();
@@ -927,6 +962,26 @@ mod tests {
             .u64(0)
             .u32(0)
             .u64(0)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .bool(false)
+            .u64(0)
+            .u64(u64::MAX);
+        let err = decode_virtio(&w.into_bytes()).unwrap_err();
+        assert!(matches!(err, SnapshotError::TooLarge { .. }), "{err}");
+    }
+
+    /// The same rule for the shared-memory list, which is new in version 2.
+    #[test]
+    fn an_absurd_shared_memory_count_is_refused() {
+        let mut w = Writer::new();
+        w.u32(2)
+            .u64(0)
+            .u32(0)
+            .u64(0)
+            .u32(0)
             .u32(0)
             .u32(0)
             .u32(0)

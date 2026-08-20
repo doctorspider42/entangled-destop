@@ -649,6 +649,25 @@ fn detach_process_group(command: &mut Command) {
 #[cfg(not(any(unix, windows)))]
 fn detach_process_group(_command: &mut Command) {}
 
+/// Keeps a short-lived helper child (`entangled --version`, `entangled doctor`)
+/// from flashing a console window on Windows.
+///
+/// Separate from [`detach_process_group`] because these children are *not*
+/// detached: they are read to completion and their output is the whole point,
+/// so they should die with the manager rather than outlive it.
+pub fn quiet_command(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
+
 /// Unix gets SIGTERM so `entangled run` can shut the VM down cleanly; Windows
 /// has no signals, so `TerminateProcess` via `Child::kill` is the only option.
 #[cfg(unix)]

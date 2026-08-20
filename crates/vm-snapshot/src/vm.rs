@@ -345,7 +345,7 @@ pub fn inspect(path: &Path) -> Result<SnapshotInfo> {
 
 #[cfg(test)]
 mod tests {
-    use machine_x86::state::{SavedAcpiPm, SavedResetControl, SavedSerial};
+    use machine_x86::state::{SavedAcpiPm, SavedResetControl, SavedSerial, SavedVirtioSlot};
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
     use vmm_core::hv::{
         BlobFormat, MpState, X86DebugRegisters, X86Msr, X86OpaqueState, X86PendingEvents,
@@ -371,7 +371,12 @@ mod tests {
             memory_bytes: 4 << 20,
             transport: "pci".into(),
             boot_mode: "direct-linux".into(),
-            devices: Vec::new(),
+            // The one slot `machine_state` puts on the bus; the shape and the
+            // machine have to agree or the restore refuses, which is the point.
+            devices: vec![DeviceSlot {
+                device_type: 2,
+                slot: 0,
+            }],
         }
     }
 
@@ -419,7 +424,61 @@ mod tests {
                 ..SavedAcpiPm::default()
             },
             reset: SavedResetControl::default(),
+            // One virtio slot, so the section-version refusals below have a
+            // section to refuse.
+            virtio: vec![SavedVirtioSlot {
+                slot: 0,
+                state: virtio_core::TransportSaveState {
+                    device_type: 2,
+                    device_features: 1 << 32,
+                    status: 0x0f,
+                    ..Default::default()
+                },
+            }],
             ..MachineState::default()
+        }
+    }
+
+    /// Rewrites one section's recorded version in the index and re-digests it,
+    /// so the resulting file is internally consistent and fails for the reason
+    /// under test rather than as a checksum error.
+    fn retag_section(bytes: &mut [u8], kind: SectionKind, version: u32) {
+        use sha2::{Digest, Sha256};
+        let index_at = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+        let index_len = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+        let count = u64::from_le_bytes(bytes[index_at..index_at + 8].try_into().unwrap()) as usize;
+        let mut patched = false;
+        for i in 0..count {
+            let at = index_at + 8 + i * 64;
+            let found = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            if found == kind_code(kind) {
+                bytes[at + 4..at + 8].copy_from_slice(&version.to_le_bytes());
+                patched = true;
+            }
+        }
+        assert!(patched, "no {kind:?} section to retag");
+        let digest = Sha256::digest(&bytes[index_at..index_at + index_len]);
+        bytes[40..72].copy_from_slice(&digest);
+    }
+
+    /// The index's own encoding of a section kind, mirrored here because the
+    /// real one is private — and deliberately so: a test that could not tell
+    /// them apart would not be testing the format.
+    fn kind_code(kind: SectionKind) -> u32 {
+        match kind {
+            SectionKind::Metadata => 1,
+            SectionKind::Cpu => 2,
+            SectionKind::Clock => 3,
+            SectionKind::Memory => 4,
+            SectionKind::IrqChip => 5,
+            SectionKind::Serial => 6,
+            SectionKind::Platform => 7,
+            SectionKind::AcpiPm => 8,
+            SectionKind::Pflash => 9,
+            SectionKind::PciRoot => 10,
+            SectionKind::Virtio => 11,
+            SectionKind::ResetControl => 12,
+            SectionKind::HostIrqChip => 13,
         }
     }
 
@@ -469,6 +528,7 @@ mod tests {
 
         let target = memory(4 << 20);
         let restored = restore(&path, &target, &shape()).expect("restore");
+        assert_eq!(restored.machine.virtio.len(), 1);
         assert_eq!(restored.cpus.len(), 1);
         assert_eq!(restored.cpus[0].registers.rip, 0xffff_ffff_8100_0000);
         assert_eq!(restored.cpus[0].msr(0xc000_0080), Some(0xd01));
@@ -533,13 +593,82 @@ mod tests {
             "{err}"
         );
 
+        // A different device in the same slot: the guest's `/dev/vda` would be
+        // somebody else's device.
         let mut moved = shape();
         moved.devices = vec![DeviceSlot {
-            device_type: 2,
+            device_type: 16,
             slot: 0,
         }];
         let err = restore(&path, &target, &moved).unwrap_err();
-        assert!(matches!(&err, SnapshotError::Mismatch { .. }), "{err}");
+        assert!(
+            matches!(&err, SnapshotError::Mismatch { field, .. } if field == "device 0"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The version bump refuses, by number and by section.** A snapshot
+    /// written before Venus phase 1 has a virtio section that predates
+    /// `SHM_SEL` and the host's shared-memory placement; defaulting them would
+    /// restore a guest whose driver had selected a region into one that had
+    /// not. The refusal says which section and both versions.
+    #[test]
+    fn a_section_from_before_a_version_bump_is_refused_by_number() {
+        let dir = temp_dir("version");
+        let path = dir.join("vm.esnap");
+        let source = memory(4 << 20);
+        write_sample(&path, &source, Vec::new());
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        retag_section(&mut bytes, SectionKind::Virtio, 1);
+        let old = dir.join("old.esnap");
+        std::fs::write(&old, &bytes).unwrap();
+
+        let target = memory(4 << 20);
+        let err = restore(&old, &target, &shape()).unwrap_err();
+        match &err {
+            SnapshotError::SectionVersion {
+                section,
+                found,
+                expected,
+            } => {
+                assert_eq!(*section, "virtio");
+                assert_eq!(*found, 1);
+                assert_eq!(*expected, devices::VIRTIO_VERSION);
+            }
+            other => panic!("expected a section-version refusal, got {other}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("virtio"), "{text}");
+        assert!(text.contains("version 1"), "{text}");
+        // And nothing was written: the refusal comes before guest memory.
+        let mut byte = [0xffu8; 1];
+        target.read_slice(&mut byte, GuestAddress(0)).unwrap();
+        assert_eq!(byte, [0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same for a CPU section, so the mechanism is not a virtio special
+    /// case.
+    #[test]
+    fn a_cpu_section_from_a_future_build_is_refused_too() {
+        let dir = temp_dir("cpuver");
+        let path = dir.join("vm.esnap");
+        let source = memory(4 << 20);
+        write_sample(&path, &source, Vec::new());
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        retag_section(&mut bytes, SectionKind::Cpu, cpu::CPU_VERSION + 1);
+        let newer = dir.join("newer.esnap");
+        std::fs::write(&newer, &bytes).unwrap();
+
+        let target = memory(4 << 20);
+        let err = restore(&newer, &target, &shape()).unwrap_err();
+        assert!(
+            matches!(&err, SnapshotError::SectionVersion { section, .. } if *section == "cpu"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
