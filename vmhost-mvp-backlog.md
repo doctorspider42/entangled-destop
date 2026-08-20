@@ -801,6 +801,42 @@ Dlaczego Venus, a nie ANGLE — decyzja do zapisania w aneksie do
   biblioteka C dalej wchodzi przez `dlopen`/`LoadLibrary`, nigdy przez linker
   (reguła z ADR-0004).
 
+## EPIC 21 — Gaming-ready: gra w oknie bez GPU passthrough
+
+Cel: uruchomić w gościu grę i **normalnie w nią zagrać** — 1080p/60 w tytułach
+indie, sprzed dekady, emulatorach i sporej części biblioteki Protona. Bez
+passthroughu, bo passthrough oddaje kartę wyłącznie jednej maszynie i wyklucza
+zwykłe używanie hosta. Świadomie **poza zakresem**: gry z antycheatem jądrowym
+(EAC/BattlEye wykrywają maszyny wirtualne — to bariera polityczna, nie
+techniczna), AAA na wysokich detalach, ray tracing, gry DX12 w gościu Windows
+(brak dojrzałych sterowników virtio-gpu dla Windows — nasza droga to gość
+linuksowy).
+
+| ID | Zadanie | Priorytet | Status |
+|---|---|---:|---|
+| GAME-2101 | Scanout bez kopii (zależy od VEN-2005 / GPU-fazy 3) — dziś każda klatka jedzie GPU→RAM→GPU, ~500 MB/s przy 1080p60 | P0 | |
+| GAME-2102 | `virtio-sound` (PCM playback, potem capture) + backend hosta: PipeWire/ALSA na Linuksie, WASAPI na Windowsie | P0 | |
+| GAME-2103 | Venus (EPIC 20) jako ścieżka dla Vulkana/Protona | P0 | |
+| GAME-2104 | Pad: `virtio-input` z osiową mapą kontrolera + przechwytywanie z hosta (XInput/evdev), hotplug | P1 | |
+| GAME-2105 | Pacing klatek i vsync zamiast wyścigu: prezentacja związana z fence'em gościa, pomiar 1%/0.1% low | P1 | |
+| GAME-2106 | Przypinanie vCPU do rdzeni i duże strony pamięci (opcjonalne, mierzone — nie na wiarę) | P2 | |
+| GAME-2107 | Akceptacja: `vkmark`/`glmark2`, `vkcube`, jeden realny tytuł przez Protona; liczby przed/po dla każdego kroku wyżej | P0 | |
+
+Uwagi projektowe:
+
+- **Dźwięk jest najbardziej niedocenianą pozycją tej listy.** Gra bez dźwięku
+  nie jest grą, a `virtio-sound` to nowe urządzenie z własnym strumieniem
+  danych od niezaufanego gościa — czyli pełny rygor z sekcji „hard rules":
+  ograniczone bufory, walidacja parametrów formatu, brak paniki na ścieżce
+  gościa, fuzzing.
+- **Mierzyć, nie wierzyć.** Każda pozycja wchodzi z liczbą przed i po; przy
+  narzucie rzędu kilkunastu procent łatwo „zoptymalizować" coś, co nie było
+  wąskim gardłem (faza 2 VirGL-a pokazała to dosłownie: ścieżka hosta zajmowała
+  6% budżetu klatki, więc readback nie był tym, co ograniczało gościa do 30 fps
+  — GAME-2105 ma najpierw wyjaśnić tamto 30 fps).
+- Kolejność wynikowa: Venus → zero-copy → dźwięk → pad → pacing. Dźwięk może
+  iść równolegle, bo nie dotyka GPU.
+
 # 9. Następna faza po MVP
 
 Najbardziej logiczny kolejny etap:
