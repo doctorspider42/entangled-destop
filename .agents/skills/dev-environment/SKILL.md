@@ -124,7 +124,12 @@ times:
 
 - After merging or editing anything under `guest/test-rootfs/`, rebuild:
   `bash scripts/build-test-initramfs.sh` — or the boot tests run the OLD
-  initramfs and fail (or silently skip new probes).
+  initramfs and fail (or silently skip new probes). Until 2026-08-20 the
+  script itself could hand you a stale one: cargo honours `CARGO_TARGET_DIR`,
+  which everyone here sets, but the script copied the init binary from the
+  crate's own `target/`. It now resolves the real output path and refuses to
+  package an init older than its sources — if you see that refusal, your
+  build failed, it did not.
 - The UEFI firmware comes from `bash guest/firmware/build-cloudhv.sh`
   (~2.5 min, pinned EDK2, pflash PCDs asserted). A fresh checkout or a new
   worktree has NO firmware — `run` with UEFI boot fails with "cannot read
