@@ -27,7 +27,9 @@ use crate::protocol::{MemEntry, Rect, ResourceCreate3d, Transfer3d};
 use crate::renderer::{CapsetInfo, FenceOutcome, Renderer3d};
 use crate::resource::{read_backing, write_backing};
 
-use super::protocol::{Reply, Request, REMOTE_MAX_BACKING, REMOTE_XFER_WINDOW, VERSION};
+use super::protocol::{
+    Reply, Request, REMOTE_MAX_BACKING, REMOTE_MAX_TOTAL_SHADOW, REMOTE_XFER_WINDOW, VERSION,
+};
 use super::{read_frame, write_frame, WireError};
 
 /// How long the client waits for the helper's handshake before giving up.
@@ -414,8 +416,24 @@ impl Renderer3d for RemoteRenderer {
         let len = entries
             .iter()
             .fold(0u64, |sum, e| sum.saturating_add(u64::from(e.length)));
-        if len > REMOTE_MAX_BACKING {
+        // Both bounds are checked here as well as in the helper: the guest
+        // gets a clean ERR_OUT_OF_MEMORY instead of a renderer error string,
+        // and nothing crosses the wire that is going to be refused anyway.
+        // (The helper checks too, because it does not trust us either.)
+        let held: u64 = self
+            .resources
+            .iter()
+            .filter(|(id, _)| **id != resource_id)
+            .map(|(_, resource)| resource.len)
+            .sum();
+        if len > REMOTE_MAX_BACKING || held.saturating_add(len) > REMOTE_MAX_TOTAL_SHADOW {
             // Honest refusal: the isolated renderer really cannot shadow it.
+            tracing::warn!(
+                resource_id,
+                len,
+                held,
+                "attach refused: over the isolated renderer's shadow-backing budget"
+            );
             return Err(CommandError::OutOfMemory);
         }
         self.call_ok(&Request::AttachBacking { resource_id, len })?;

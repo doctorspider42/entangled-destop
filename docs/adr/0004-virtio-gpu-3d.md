@@ -279,6 +279,13 @@ The demonstration is a test, not a story: `gpu_remote.rs` spawns a real helper
 process, drives 3D through it, `SIGKILL`s it mid-flight, and asserts the device
 survives, releases what it held, refuses 3D in band and still serves 2D.
 
+One bound isolation *adds*, and therefore has to name: a shadow backing is host
+memory the in-process renderer would never have allocated (there, a backing is
+guest RAM the guest already paid for). `REMOTE_MAX_BACKING` (64 MiB) bounds one
+resource and `REMOTE_MAX_TOTAL_SHADOW` (512 MiB) bounds all of them together;
+both are checked on *both* sides — the client so the guest gets a clean
+`ERR_OUT_OF_MEMORY`, the helper because it does not trust the VMM either.
+
 ## Amendment (2026-08-20): phase 2 — real fences
 
 Phase 1's decision 4 (synchronous fences) is replaced. A fenced command whose
@@ -365,9 +372,57 @@ A `RESOURCE_FLUSH` on the scanout resource *is* a guest present, which makes the
 device the only place in the system that sees every frame. `virtio_gpu::pacing`
 turns those intervals into a host-side frame clock (mean/min/max, late frames
 past a 20 ms budget, idle gaps excluded) and logs it every 120 frames next to
-the fence statistics. No guest agent, no instrumented mutter, and the same
-numbers are comparable across a 2D device, a synchronous-fence virgl device and
-an asynchronous-fence one.
+the fence statistics **and the device's own service time** — how long the flush
+path itself took. The interval alone cannot attribute a slow frame; the pair
+can. No guest agent, no instrumented mutter, and the numbers are comparable
+across a 2D device, a synchronous-fence virgl device and an asynchronous-fence
+one.
+
+### Measured: the Ubuntu 26.04 Desktop live session, 1920×1080, 4 vCPUs
+
+Five headless runs on WSLg (D3D12 / AMD Radeon PRO), ~4 minutes each, GNOME
+compositing throughout; each figure is the mean of the per-120-frame windows
+(3 000–3 700 frames per run).
+
+| run | fences | renderer | frame interval | fps | worst window | device service time |
+|---|---|---|---:|---:|---:|---:|
+| A | synchronous (phase 1) | in-process | 33.6 ms | 29.8 | 36.8 ms (98.7 ms max) | — |
+| B | deferred (phase 2) | in-process | 33.5 ms | 29.9 | 34.5 ms (51.6 ms max) | — |
+| C | deferred (phase 2) | **isolated process** | 33.4 ms | 29.9 | 34.6 ms (51.3 ms max) | — |
+| D | deferred | in-process | 33.4 ms | 29.9 | — | **1.9 ms** (max 5–8 ms) |
+| E | — (2D device) | none | 33.5 ms | 29.9 | — | **1.8 ms** (max 3–5 ms) |
+
+Boot to the first scanout flip: 36–41 s, run-to-run noise larger than the
+difference between modes. Three conclusions, and the third is the useful one:
+
+1. **Process isolation is free on this workload.** 33.4 ms isolated versus
+   33.5 ms in-process — below the run-to-run spread. The extra copy per flush
+   and per transfer does not show up against a 33 ms frame, which is what
+   justifies making isolation the default rather than an opt-in.
+2. **Real fences change nothing here, and that is not a bug — it is what the
+   guest asks for.** `fence_deferred` is **0** across every run: the only
+   command GNOME-on-virgl fences is `RESOURCE_FLUSH` (the kernel's
+   `virtio_gpu_primary_plane_update` attaches the plane's out-fence there),
+   and mesa's virgl driver does not request out-fences on its submits in this
+   session. `RESOURCE_FLUSH` is deliberately *not* deferred: its readback is
+   synchronous, so the work really is finished when the response is written,
+   and holding it would add latency for nothing. The tail did improve
+   (worst-window 36.8 → 34.5 ms, worst single interval 98.7 → 51.6 ms), which
+   is the deferral machinery not being in the way rather than it being used.
+   The deferral path is exercised instead by `gpu_fence.rs` and by a real host
+   fence in `virgl_fence_host.rs`.
+3. **The host presentation path is 6 % of a frame.** 1.9 ms of 33.4 ms, and a
+   2D device with no GPU at all measures the same 1.8 ms / 33.5 ms — so the
+   readback is *not* what caps this guest at 30 fps, and neither is virgl. That
+   retires the urgency of dmabuf zero-copy on this host (which, per the probe
+   above, is not implementable here anyway) and points the next investigation
+   at the guest: a compositor that lands on exactly half of the EDID's 60 Hz
+   is missing a deadline of its own, not ours.
+
+Where phase 2's fences *will* matter is phase 3: the moment a scanout flush
+stops being a synchronous readback (zero-copy, where the frame is done when the
+GPU says so) the flush fence becomes the right thing to defer — and the
+machinery for it is now in place and tested.
 
 ## Amendment (2026-08-20): the id namespace stays mixed in virgl mode
 

@@ -105,6 +105,58 @@ pub const CHAINS_PER_NOTIFY: usize = 4 * MAX_QUEUE_SIZE as usize;
 /// is always a host fault worth logging.
 pub const FENCE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Environment variable that forces a fence mode, for the phase-2 before/after
+/// measurement and for a host where deferral misbehaves. Read by the app
+/// layer (`entangled run`), the same way `ENTANGLED_QUEUE_NOTIFY` is.
+pub const FENCE_MODE_ENV: &str = "ENTANGLED_GPU_FENCES";
+
+/// Whether fenced responses may be deferred (ADR-0004 phase 2) or complete as
+/// soon as the command executes (phase 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FenceMode {
+    /// Hold the response until the host fence retires — the default, and the
+    /// whole point of phase 2.
+    #[default]
+    Deferred,
+    /// Answer immediately, as phase 1 did. Spec-legal (the command *has*
+    /// executed), it just gives the guest no pipelining — which is exactly
+    /// what makes it the baseline to measure against.
+    Synchronous,
+}
+
+impl FenceMode {
+    /// Reads [`FENCE_MODE_ENV`]; anything unrecognised keeps the default.
+    pub fn from_env() -> Self {
+        match std::env::var(FENCE_MODE_ENV) {
+            Ok(value) => Self::parse(&value).unwrap_or_else(|| {
+                tracing::warn!(
+                    var = FENCE_MODE_ENV,
+                    value = %value,
+                    "unrecognised virtio-gpu fence mode, using the default"
+                );
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Parses the accepted spellings; `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("deferred") || value.eq_ignore_ascii_case("async") {
+            Some(Self::Deferred)
+        } else if value.eq_ignore_ascii_case("sync") || value.eq_ignore_ascii_case("synchronous") {
+            Some(Self::Synchronous)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_deferred(self) -> bool {
+        matches!(self, Self::Deferred)
+    }
+}
+
 /// The 3D commands whose fences are worth deferring: the ones that put work
 /// on the host GL timeline.
 ///
@@ -253,6 +305,8 @@ pub struct GpuDevice<S: ScanoutSink> {
     /// Watchdog deadline for a deferred response ([`FENCE_TIMEOUT`] unless
     /// [`GpuDevice::set_fence_timeout`] changed it).
     fence_timeout: Duration,
+    /// Whether fenced responses may be held back at all.
+    fence_mode: FenceMode,
     /// Set when the host renderer has been found dead and the device has
     /// degraded to 2D (GPU-012).
     renderer_lost: bool,
@@ -306,6 +360,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             pending_fences: FenceQueue::new(),
             fence_stats: FenceStats::default(),
             fence_timeout: FENCE_TIMEOUT,
+            fence_mode: FenceMode::default(),
             renderer_lost: false,
             renderer_loss_reported: false,
             pacing: FramePacing::new(),
@@ -760,6 +815,13 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if !hdr.wants_fence() || !FENCED_3D_COMMANDS.contains(&hdr.kind) {
             return None;
         }
+        if !self.fence_mode.is_deferred() {
+            // Phase 1 on purpose (the measurement baseline): the command has
+            // executed, so the response goes out now and no host fence is
+            // created at all.
+            self.fence_stats.synchronous = self.fence_stats.synchronous.saturating_add(1);
+            return None;
+        }
         // Errors are answered at once, with the fence echoed exactly as
         // phase 1 did.
         if code >= resp::ERR_UNSPEC {
@@ -947,6 +1009,15 @@ impl<S: ScanoutSink> GpuDevice<S> {
     /// (GPU-012).
     pub fn renderer_lost(&self) -> bool {
         self.renderer_lost
+    }
+
+    /// Chooses whether fenced responses are deferred (phase 2) or answered
+    /// immediately (phase 1).
+    ///
+    /// `entangled run` sets this from [`FENCE_MODE_ENV`], which is how the
+    /// phase-2 before/after measurement is taken on one binary.
+    pub fn set_fence_mode(&mut self, mode: FenceMode) {
+        self.fence_mode = mode;
     }
 
     /// Overrides the fence watchdog deadline (default [`FENCE_TIMEOUT`]).
@@ -1340,6 +1411,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
         let dst_x = clip.x - scanout.rect.x;
         let dst_y = clip.y - scanout.rect.y;
 
+        // How long the device itself spends presenting this rect: the readback
+        // out of the renderer plus the push into the sink. Reported next to
+        // the frame interval, because the interval alone cannot say whether a
+        // slow frame is the guest's doing or ours (ADR-0004 phase 2).
+        let service_start = Instant::now();
         if three_d {
             // GPU-010: the rendered pixels live in the host renderer; read
             // the dirty rect back as BGRA and push it down the same sink.
@@ -1370,6 +1446,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 .update_scanout(dst_x, dst_y, clip.width, clip.height, pixels)
                 .map_err(|error| CommandError::Display(error.to_string()))?;
         }
+        self.pacing.record_service(service_start.elapsed());
         tracing::trace!(
             resource = cmd.resource_id,
             x = dst_x,
@@ -1390,6 +1467,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 max_ms = report.max_us as f64 / 1000.0,
                 late = report.late,
                 idle_gaps = report.idle_gaps,
+                service_mean_ms = report.service_mean_us as f64 / 1000.0,
+                service_max_ms = report.service_max_us as f64 / 1000.0,
                 fence_deferred = fences.deferred,
                 fence_mean_wait_us = fences.mean_wait_us(),
                 fence_max_wait_us = fences.wait_us_max,

@@ -35,7 +35,7 @@ use virtio_core::GuestMem;
 use crate::protocol::{MemEntry, Rect};
 use crate::renderer::{FenceOutcome, Renderer3d};
 
-use super::protocol::{Reply, Request, REMOTE_MAX_BACKING, VERSION};
+use super::protocol::{Reply, Request, REMOTE_MAX_BACKING, REMOTE_MAX_TOTAL_SHADOW, VERSION};
 use super::{read_frame, write_frame, WireError};
 
 /// One resource's host-side stand-in for the guest backing: a private
@@ -173,7 +173,23 @@ fn handle(
             if len > REMOTE_MAX_BACKING {
                 return error(format!(
                     "backing of {len} bytes exceeds the isolated renderer's {REMOTE_MAX_BACKING} \
-                     byte limit"
+                     byte per-resource limit"
+                ));
+            }
+            // The total budget, which is the bound isolation actually needs:
+            // every shadow is host memory the in-process renderer would never
+            // have allocated (there a backing is guest RAM). Re-attaching the
+            // same resource replaces its shadow, so its old size does not
+            // count against the budget.
+            let held: u64 = shadows
+                .iter()
+                .filter(|(id, _)| **id != resource_id)
+                .map(|(_, shadow)| shadow.len)
+                .sum();
+            if held.saturating_add(len) > REMOTE_MAX_TOTAL_SHADOW {
+                return error(format!(
+                    "backing of {len} bytes would put the isolated renderer over its \
+                     {REMOTE_MAX_TOTAL_SHADOW}-byte total shadow budget ({held} already held)"
                 ));
             }
             let shadow = match Shadow::new(len) {

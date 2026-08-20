@@ -55,6 +55,20 @@ pub const REMOTE_XFER_WINDOW: usize = 8 << 20;
 /// the isolated renderer really cannot hold it.
 pub const REMOTE_MAX_BACKING: u64 = 64 << 20;
 
+/// Largest total of all shadow backings the helper holds at once.
+///
+/// The shadow is the one place isolation *adds* host memory: in-process, a
+/// resource's backing is guest RAM the guest already paid for, while here the
+/// helper holds a copy. Without a total bound a guest could attach thousands
+/// of resources and make the helper commit unbounded memory — so the same
+/// MVP-1407 rule applies as everywhere else, and an attach past the budget is
+/// refused in band (`ERR_OUT_OF_MEMORY`).
+///
+/// 512 MiB is far above what a composited desktop attaches (mesa's buffers
+/// are small; the framebuffer goes through the 2D path) and far below what
+/// would hurt a host running a 4 GiB VM.
+pub const REMOTE_MAX_TOTAL_SHADOW: u64 = 512 << 20;
+
 /// Message tags. Explicit values because this is a wire format between two
 /// processes that may be different builds during a rolling upgrade — a
 /// reordered enum must not silently become a different command.
@@ -194,6 +208,15 @@ pub enum CodecError {
     TooLarge(usize),
     /// A string field was not UTF-8.
     BadString,
+    /// A field held a value this format does not produce — a boolean byte
+    /// other than 0 or 1.
+    ///
+    /// Both ends of this protocol are ours, so the strict reading is the
+    /// useful one: it makes the encoding canonical (every message has exactly
+    /// one byte sequence), which is what lets the fuzzer assert that decode
+    /// and encode are inverses. The fuzzer found this: `pending: 10` and
+    /// `pending: 1` both meant "true" and re-encoded differently.
+    NonCanonical,
 }
 
 impl std::fmt::Display for CodecError {
@@ -203,6 +226,7 @@ impl std::fmt::Display for CodecError {
             Self::Truncated => write!(f, "message payload is truncated"),
             Self::TooLarge(len) => write!(f, "message payload of {len} bytes is too large"),
             Self::BadString => write!(f, "message contains a non-UTF-8 string"),
+            Self::NonCanonical => write!(f, "message contains a non-canonical field value"),
         }
     }
 }
@@ -589,7 +613,11 @@ impl Reply {
                 Self::Capsets(capsets)
             }
             tag::FENCE => Self::Fence {
-                pending: r.u8()? != 0,
+                pending: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(CodecError::NonCanonical),
+                },
             },
             tag::FENCES => {
                 let count = r.u32()? as usize;
@@ -796,6 +824,26 @@ mod tests {
         assert_eq!(
             Request::decode(tag::POLL_FENCES, &extra),
             Err(CodecError::Truncated)
+        );
+
+        // A boolean byte that is neither 0 nor 1: the encoding is canonical,
+        // so this is refused rather than read as "true" (found by the
+        // gpu_remote_protocol fuzz target).
+        assert_eq!(
+            Reply::decode(tag::FENCE, &[2]),
+            Err(CodecError::NonCanonical)
+        );
+        assert_eq!(
+            Reply::decode(tag::FENCE, &[0xff]),
+            Err(CodecError::NonCanonical)
+        );
+        assert_eq!(
+            Reply::decode(tag::FENCE, &[1]),
+            Ok(Reply::Fence { pending: true })
+        );
+        assert_eq!(
+            Reply::decode(tag::FENCE, &[0]),
+            Ok(Reply::Fence { pending: false })
         );
 
         // Non-UTF-8 context name.

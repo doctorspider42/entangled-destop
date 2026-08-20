@@ -47,6 +47,16 @@ pub struct PacingReport {
     pub late: u64,
     /// Gaps over [`IDLE_GAP`], excluded from the statistics above.
     pub idle_gaps: u64,
+    /// Mean time the *device* spent serving a flush — the readback out of the
+    /// renderer plus the push into the scanout sink — in microseconds.
+    ///
+    /// This is the attribution the frame interval alone cannot give: an
+    /// interval of 33 ms with a 2 ms service time is a guest that paces
+    /// itself, while 33 ms with a 20 ms service time is a host presentation
+    /// path that cannot keep up (and therefore the thing zero-copy scanout
+    /// would fix).
+    pub service_mean_us: u64,
+    pub service_max_us: u64,
 }
 
 impl PacingReport {
@@ -70,6 +80,9 @@ pub struct FramePacing {
     max_us: u64,
     late: u64,
     idle_gaps: u64,
+    service_count: u64,
+    service_sum_us: u64,
+    service_max_us: u64,
     /// Frames recorded since the last report, including the ones whose
     /// interval was an idle gap — so a report always covers `REPORT_EVERY`
     /// presents even when some of them were not frames.
@@ -82,6 +95,14 @@ pub struct FramePacing {
 impl FramePacing {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records how long the device spent serving one flush.
+    pub fn record_service(&mut self, taken: Duration) {
+        let us = u64::try_from(taken.as_micros()).unwrap_or(u64::MAX);
+        self.service_count = self.service_count.saturating_add(1);
+        self.service_sum_us = self.service_sum_us.saturating_add(us);
+        self.service_max_us = self.service_max_us.max(us);
     }
 
     /// Records a present at `now`, returning a report every [`REPORT_EVERY`]
@@ -121,6 +142,9 @@ impl FramePacing {
         self.max_us = 0;
         self.late = 0;
         self.idle_gaps = 0;
+        self.service_count = 0;
+        self.service_sum_us = 0;
+        self.service_max_us = 0;
         report
     }
 
@@ -136,6 +160,14 @@ impl FramePacing {
             max_us: self.max_us,
             late: self.late,
             idle_gaps: self.idle_gaps,
+            // A window can hold presents whose service time was never
+            // recorded (a flush of an offscreen resource), so the divisor is
+            // its own count and may be zero.
+            service_mean_us: self
+                .service_sum_us
+                .checked_div(self.service_count)
+                .unwrap_or(0),
+            service_max_us: self.service_max_us,
         })
     }
 
@@ -190,6 +222,21 @@ mod tests {
         assert_eq!(report.max_us, 50_000);
     }
 
+    /// Service time is averaged over the flushes in the window, and a window
+    /// with no flushes reports zero rather than dividing by zero.
+    #[test]
+    fn service_time_is_reported_per_window() {
+        let base = Instant::now();
+        let mut pacing = FramePacing::new();
+        pacing.record(base);
+        pacing.record_service(Duration::from_micros(1_000));
+        pacing.record(at(base, 16));
+        pacing.record_service(Duration::from_micros(3_000));
+        let report = pacing.report().expect("an interval was recorded");
+        assert_eq!(report.service_mean_us, 2_000);
+        assert_eq!(report.service_max_us, 3_000);
+    }
+
     #[test]
     fn a_single_present_has_no_intervals_and_never_divides_by_zero() {
         let mut pacing = FramePacing::new();
@@ -203,6 +250,8 @@ mod tests {
                 max_us: 0,
                 late: 0,
                 idle_gaps: 0,
+                service_mean_us: 0,
+                service_max_us: 0,
             }
             .fps(),
             0.0

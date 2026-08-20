@@ -67,6 +67,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "gpu_remote_protocol"
+path = "fuzz_targets/gpu_remote_protocol.rs"
+test = false
+doc = false
+bench = false
+
 # Fuzzing wants optimised code with debug assertions left on: an overflow or a
 # broken invariant should abort rather than wrap silently.
 [profile.release]

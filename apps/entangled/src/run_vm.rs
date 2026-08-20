@@ -305,10 +305,18 @@ fn build_devices(
                     Box::new(renderer)
                 }
             };
-            devices.push(Box::new(virtio_gpu::GpuDevice::with_renderer(
-                display_handle,
-                renderer,
-            )));
+            let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, renderer);
+            // Phase 1's synchronous fences on request, which is how the
+            // before/after measurement is taken (ADR-0004 phase 2).
+            let fences = virtio_gpu::FenceMode::from_env();
+            if !fences.is_deferred() {
+                tracing::warn!(
+                    var = virtio_gpu::FENCE_MODE_ENV,
+                    "virtio-gpu fences forced synchronous: the guest gets no host/guest                      pipelining (this is the phase-1 baseline)"
+                );
+            }
+            gpu.set_fence_mode(fences);
+            devices.push(Box::new(gpu));
         }
         #[cfg(not(target_os = "linux"))]
         {
