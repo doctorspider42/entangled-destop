@@ -815,7 +815,7 @@ linuksowy).
 | ID | Zadanie | Priorytet | Status |
 |---|---|---:|---|
 | GAME-2101 | Scanout bez kopii (zależy od VEN-2005 / GPU-fazy 3) — dziś każda klatka jedzie GPU→RAM→GPU, ~500 MB/s przy 1080p60 | P0 | |
-| GAME-2102 | `virtio-sound` (PCM playback, potem capture) + backend hosta: PipeWire/ALSA na Linuksie, WASAPI na Windowsie | P0 | |
+| GAME-2102 | `virtio-sound` (PCM playback, potem capture) + backend hosta: PipeWire/ALSA na Linuksie, WASAPI na Windowsie | P0 | playback zrobiony (`crates/virtio-sound`, `[sound] enabled`); ALSA przez `dlopen` (licencja — patrz `src/alsa.rs`), WASAPI shared mode; capture = faza 2 |
 | GAME-2103 | Venus (EPIC 20) jako ścieżka dla Vulkana/Protona | P0 | |
 | GAME-2104 | Pad: `virtio-input` z osiową mapą kontrolera + przechwytywanie z hosta (XInput/evdev), hotplug | P1 | |
 | GAME-2105 | Pacing klatek i vsync zamiast wyścigu: prezentacja związana z fence'em gościa, pomiar 1%/0.1% low | P1 | |

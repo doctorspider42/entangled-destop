@@ -44,7 +44,10 @@
 
 use std::path::PathBuf;
 
-use control_api::{BootMode, BootSection, DiskSection, DisplaySection, VirtioTransport, VmConfig};
+use control_api::{
+    BootMode, BootSection, DiskSection, DisplaySection, SoundBackend, SoundSection,
+    VirtioTransport, VmConfig,
+};
 
 use crate::disk;
 use crate::install::{target_disk, vm_name};
@@ -193,6 +196,9 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             virgl: false,
             virgl_isolation: control_api::VirglIsolation::default(),
         },
+        // The installer has nothing to say; the *installed* profile below is
+        // where the card belongs.
+        sound: SoundSection::default(),
     };
 
     let transcript = target.with_file_name(format!("{vm_name}-install.log"));
@@ -287,6 +293,13 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             scale: 1.0,
             virgl: false,
             virgl_isolation: control_api::VirglIsolation::default(),
+        },
+        // A desktop with no sound is not a desktop (GAME-2102). `auto` never
+        // fails a run: a host with no audio device gets a card that plays into
+        // silence, and the guest still enumerates one.
+        sound: SoundSection {
+            enabled: true,
+            backend: SoundBackend::Auto,
         },
     };
     let profile_path = target.with_file_name(format!("{vm_name}.toml"));

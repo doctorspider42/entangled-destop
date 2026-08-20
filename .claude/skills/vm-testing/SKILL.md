@@ -488,6 +488,8 @@ full and the fuzz build is large.
 | `blk_request` | virtio-blk header parsing, `validate_range`, `sector_offset`, `total_len` |
 | `blk_discard` | the DISCARD / WRITE_ZEROES segment array: `segment_count` on the array's shape, `DiscardSegment::parse`/`validate` on each range, for both commands. Asserts what the host then relies on — an accepted range is inside the disk, its byte offset *and* end are representable, `unmap` only for write-zeroes, only the one defined flag bit ever accepted |
 | `gpu_3d_commands` | `virtio_gpu::renderer::validate_stream` on raw bytes, plus arbitrary 3D command sequences (contexts, creates, backing, transfers, submits, readback) through `Gpu3d` + `NullRenderer` with real guest memory |
+| `snd_control` | the virtio-snd parsers and bounds on raw bytes: `QueryInfo`/`ItemHdr`/`RawSetParams` round trips, `stream::validate_params`, `validate_xfer` and the lifecycle. Asserts that an *accepted* SET_PARAMS is inside every advertised set and every named bound, and that a refusal is `BAD_MSG` or `NOT_SUPP` and never `OK`/`IO_ERR` |
+| `snd_device` | a brought-up `SoundDevice` with a live pump thread behind a real `MmioTransport`, fed descriptor chains of arbitrary shape (any lengths, any addresses, readable/writable in any order, indirect flags) on all four queues, interleaved with resets. Asserts no panic, no `DEVICE_NEEDS_RESET` from guest input, and no used entry claiming more bytes than the guest offered |
 
 Rules that keep the targets useful:
 

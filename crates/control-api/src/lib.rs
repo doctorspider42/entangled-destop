@@ -5,5 +5,6 @@ mod config;
 
 pub use config::{
     BootMode, BootSection, CdromSection, ConfigError, DiskSection, DisplaySection, NetworkBackend,
-    NetworkSection, VirglIsolation, VirtioTransport, VmConfig, MAX_MEMORY_MIB, MIN_MEMORY_MIB,
+    NetworkSection, SoundBackend, SoundSection, VirglIsolation, VirtioTransport, VmConfig,
+    MAX_MEMORY_MIB, MIN_MEMORY_MIB,
 };

@@ -54,6 +54,10 @@ pub struct VmConfig {
     pub network: Option<NetworkSection>,
     #[serde(default)]
     pub display: DisplaySection,
+    /// The guest's sound card (backlog GAME-2102). Off by default — see
+    /// [`SoundSection`].
+    #[serde(default)]
+    pub sound: SoundSection,
 }
 
 /// The virtio transport a VM's devices are attached to (EPIC 3 / EPIC 19).
@@ -293,6 +297,76 @@ impl Default for DisplaySection {
     }
 }
 
+/// Which host audio backend a VM's virtio-snd device plays into.
+///
+/// `control-api` only parses the word; which backends exist on this host, and
+/// what to do when the chosen one does not, is `virtio_sound::open_sink`'s
+/// business — this crate validates the same profile on every OS.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SoundBackend {
+    /// The host's native backend if it is there, silence if it is not. Audio
+    /// is never a reason a VM fails to boot.
+    #[default]
+    Auto,
+    /// Silence, paced like a sound card. What a headless or CI run wants: the
+    /// guest still enumerates a working card.
+    Null,
+    /// ALSA (Linux hosts). Reached by runtime `dlopen`, never linked — see
+    /// `virtio_sound::alsa` for why. Fails loudly if libasound is missing.
+    Alsa,
+    /// WASAPI in shared mode (Windows hosts). Fails loudly if the machine has
+    /// no default render endpoint.
+    Wasapi,
+}
+
+impl std::fmt::Display for SoundBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Null => "null",
+            Self::Alsa => "alsa",
+            Self::Wasapi => "wasapi",
+        })
+    }
+}
+
+/// `[sound]` — a virtio-snd playback device for the guest (GAME-2102).
+///
+/// **Off by default**, for two reasons that are worth stating rather than
+/// rediscovering. First, the card is attached *after* every other device, so
+/// turning it on never renames `/dev/vda` or shifts a PCI device number — but
+/// it does consume one of the eight slots on either bus
+/// (`machine_x86::virtio::MAX_VIRTIO_SLOTS`, `machine_x86::pci::MAX_PCI_DEVICES`),
+/// and a profile with several disks plus a CD-ROM is already close. Second, an
+/// existing profile must keep describing exactly the machine it used to.
+///
+/// Enable it explicitly, the way `[display] virgl` is enabled:
+///
+/// ```toml
+/// [sound]
+/// enabled = true
+/// # backend = "auto"   # auto | null | alsa | wasapi
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct SoundSection {
+    pub enabled: bool,
+    /// Which host sink the device plays into. Meaningless while `enabled` is
+    /// false, and therefore not refused there: a profile may keep its chosen
+    /// backend across an on/off toggle.
+    pub backend: SoundBackend,
+}
+
+impl Default for SoundSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: SoundBackend::Auto,
+        }
+    }
+}
+
 impl VmConfig {
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
         let cfg: VmConfig = toml::from_str(s)?;
@@ -456,6 +530,58 @@ scale = 1.0
             Some("entangled0")
         );
         assert_eq!(cfg.display.width, 1920);
+    }
+
+    /// A profile written before virtio-snd existed must keep describing
+    /// exactly the machine it used to: no sound card.
+    #[test]
+    fn sound_is_off_unless_a_profile_asks_for_it() {
+        let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
+        assert!(!cfg.sound.enabled);
+        assert_eq!(cfg.sound.backend, SoundBackend::Auto);
+    }
+
+    #[test]
+    fn the_sound_section_parses_round_trips_and_refuses_typos() {
+        let text = BACKLOG_EXAMPLE.to_string() + "\n[sound]\nenabled = true\nbackend = \"null\"\n";
+        let cfg = VmConfig::from_toml(&text).unwrap();
+        assert!(cfg.sound.enabled);
+        assert_eq!(cfg.sound.backend, SoundBackend::Null);
+        assert_eq!(cfg.sound.backend.to_string(), "null");
+        assert_eq!(
+            VmConfig::from_toml(&toml::to_string_pretty(&cfg).unwrap()).unwrap(),
+            cfg
+        );
+
+        // Every backend word the runtime knows must parse here too, or a
+        // profile the GUI writes is unreadable by the CLI.
+        for (word, expected) in [
+            ("auto", SoundBackend::Auto),
+            ("null", SoundBackend::Null),
+            ("alsa", SoundBackend::Alsa),
+            ("wasapi", SoundBackend::Wasapi),
+        ] {
+            let text =
+                format!("{BACKLOG_EXAMPLE}\n[sound]\nenabled = true\nbackend = \"{word}\"\n");
+            assert_eq!(
+                VmConfig::from_toml(&text).unwrap().sound.backend,
+                expected,
+                "backend = {word}"
+            );
+        }
+
+        // A typo is a hard error, not a silent fall back to auto: a VM that
+        // quietly plays into nothing is the failure this catches.
+        let typo = BACKLOG_EXAMPLE.to_string() + "\n[sound]\nbackend = \"pulse\"\n";
+        assert!(matches!(
+            VmConfig::from_toml(&typo),
+            Err(ConfigError::Parse(_))
+        ));
+        let unknown = BACKLOG_EXAMPLE.to_string() + "\n[sound]\nvolume = 11\n";
+        assert!(matches!(
+            VmConfig::from_toml(&unknown),
+            Err(ConfigError::Parse(_))
+        ));
     }
 
     /// A profile written before the pci transport existed must keep meaning
