@@ -11,3 +11,9 @@ guest/bootstrap-initramfs/init-rs/target/
 entangled-screenshot-*.png
 # ISCC output (release.yml compiles the installer here)
 /installer/Output/
+
+# Local acceptance evidence (install/run transcripts, screenshots)
+install-*.log
+run-*.log
+usernet-*.log
+ubuntu-installed-boot.png
