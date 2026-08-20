@@ -34,6 +34,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::read_transcript;
+
 /// The CLI under test, as cargo built it.
 const BIN: &str = env!("CARGO_BIN_EXE_entangled");
 
@@ -129,22 +132,6 @@ fn cached_iso_exists() -> bool {
             })
         })
         .unwrap_or(false)
-}
-
-/// Reads a serial transcript that is **not** guaranteed to be UTF-8.
-///
-/// A guest console is a byte stream, and an installed Ubuntu proves it: setting
-/// up the console font writes every code point from 0x00 to 0xFF, so the log
-/// carries a run of bare high bytes. `read_to_string` fails on that, and the
-/// `unwrap_or_default()` it was written with turned the failure into an *empty*
-/// transcript — so the boot marker could never be found and this test sat out
-/// its whole six-minute deadline before reporting a login prompt that had
-/// already been printed. Lossy is right here: the assertions look for ASCII
-/// markers, and a replacement character in the surrounding noise costs nothing.
-fn read_transcript(path: &Path) -> String {
-    std::fs::read(path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
 }
 
 /// Runs `entangled` to completion with a deadline, returning its combined
