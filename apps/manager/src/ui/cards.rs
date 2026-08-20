@@ -72,7 +72,7 @@ fn dashboard_heading(ui: &mut egui::Ui, app: &ManagerApp) {
                 .scan
                 .vms
                 .iter()
-                .filter(|vm| app.supervisor.is_busy(&vm.name))
+                .filter(|vm| app.is_busy(&vm.name))
                 .count();
             ui::chip(ui, &format!("{active} active"), theme::OK);
             ui::chip(ui, &format!("{} total", app.scan.vms.len()), theme::CYAN);

@@ -162,7 +162,7 @@ fn disk_row(ui: &mut egui::Ui, app: &ManagerApp, row: &DiskRow, actions: &mut Ve
                 } else {
                     for attachment in &row.attachments {
                         let mode = if attachment.writable { "rw" } else { "ro" };
-                        let running = app.supervisor.is_busy(&attachment.vm);
+                        let running = app.is_busy(&attachment.vm);
                         ui::chip(
                             ui,
                             &format!("{} ({mode})", attachment.vm),

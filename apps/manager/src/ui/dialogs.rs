@@ -660,7 +660,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             ctx,
             "edit-vm",
             &format!("Edit {}", state.form.name),
-            600.0,
+            760.0,
             |ui| edit_vm_body(ui, state, actions),
         ),
         Modal::MoveDisk(state) => frame(
@@ -680,169 +680,84 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
     }
 }
 
-/// The Edit-VM form body. Every field writes into [`crate::editor::EditForm`];
-/// Save runs control-api validation and shows its message inline. Scrollable —
-/// a UEFI profile with several disks outgrows any fixed height.
+/// The Edit-VM form body. The left-hand cards are intentionally navigation,
+/// not separate save boundaries: changing one area keeps all unsaved edits and
+/// Save validates and writes the complete profile.
 fn edit_vm_body(ui: &mut egui::Ui, state: &mut crate::app::EditVmState, actions: &mut Vec<Action>) {
-    use crate::editor::NetworkChoice;
-    use control_api::{BootMode, VirtioTransport};
+    use crate::app::EditVmSection;
 
-    let form = &mut state.form;
-    egui::ScrollArea::vertical()
-        .max_height(460.0)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            // Resources.
-            slider_row(ui, "MEMORY", |ui| {
-                ui.add(
-                    egui::Slider::new(&mut form.memory_mib, 128..=control_api::MAX_MEMORY_MIB)
-                        .step_by(128.0)
-                        .suffix(" MiB"),
-                );
-            });
-            slider_row(ui, "vCPUs", |ui| {
-                ui.add(egui::Slider::new(&mut form.vcpus, 1..=64));
-            });
-            ui.add_space(10.0);
-
-            // Transport + boot mode.
-            ui.horizontal(|ui| {
-                ui.label(ui::faint("TRANSPORT"));
-                ui.add_space(8.0);
-                egui::ComboBox::from_id_salt("edit-transport")
-                    .selected_text(form.transport.to_string())
-                    .show_ui(ui, |ui| {
-                        for t in [VirtioTransport::Mmio, VirtioTransport::Pci] {
-                            ui.selectable_value(&mut form.transport, t, t.to_string());
-                        }
-                    });
-                ui.add_space(14.0);
-                ui.label(ui::faint("BOOT"));
-                ui.add_space(8.0);
-                egui::ComboBox::from_id_salt("edit-boot-mode")
-                    .selected_text(match form.boot_mode {
-                        BootMode::DirectLinux => "direct-linux",
-                        BootMode::Uefi => "uefi",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut form.boot_mode,
-                            BootMode::DirectLinux,
-                            "direct-linux",
-                        );
-                        ui.selectable_value(&mut form.boot_mode, BootMode::Uefi, "uefi");
-                    });
-            });
-            ui.add_space(8.0);
-
-            match form.boot_mode {
-                BootMode::DirectLinux => {
-                    text_row(
-                        ui,
-                        "KERNEL",
-                        &mut form.kernel,
-                        "artifacts/bootstrap/vmlinuz",
-                    );
-                    text_row(
-                        ui,
-                        "INITRAMFS",
-                        &mut form.initramfs,
-                        "artifacts/bootstrap/initrd.img (optional)",
-                    );
-                    text_row(ui, "CMDLINE", &mut form.cmdline, "console=ttyS0 …");
+    let mut selected = state.section;
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(184.0);
+            ui.label(ui::faint("MACHINE SETTINGS"));
+            ui.add_space(7.0);
+            for (section, title, detail, tint) in [
+                (
+                    EditVmSection::Hardware,
+                    "Hardware",
+                    "Memory, processors, transport",
+                    theme::CYAN,
+                ),
+                (
+                    EditVmSection::BootMedia,
+                    "Boot & media",
+                    "UEFI, Linux kernel, ISO",
+                    theme::VIOLET,
+                ),
+                (
+                    EditVmSection::NetworkDisplay,
+                    "Network & display",
+                    "Connectivity, resolution, 3D",
+                    theme::OK,
+                ),
+                (
+                    EditVmSection::Storage,
+                    "Storage",
+                    "Virtual disks and boot order",
+                    theme::WARN,
+                ),
+            ] {
+                if edit_section_card(ui, title, detail, selected == section, tint).clicked() {
+                    selected = section;
                 }
-                BootMode::Uefi => {
-                    text_row(
-                        ui,
-                        "FIRMWARE",
-                        &mut form.firmware,
-                        "artifacts/firmware/CLOUDHV.fd",
-                    );
-                    text_row(ui, "NVRAM", &mut form.nvram, "<vm>.nvram (optional)");
-                    text_row(ui, "CDROM", &mut form.cdrom, "installer .iso (optional)");
-                }
-            }
-            ui.add_space(10.0);
-
-            // Network.
-            ui.horizontal(|ui| {
-                ui.label(ui::faint("NETWORK"));
                 ui.add_space(8.0);
-                egui::ComboBox::from_id_salt("edit-network")
-                    .selected_text(form.network.label())
-                    .show_ui(ui, |ui| {
-                        for choice in NetworkChoice::ALL {
-                            ui.selectable_value(&mut form.network, choice, choice.label());
-                        }
-                    });
-            });
-            if form.network == NetworkChoice::Tap {
-                text_row(ui, "INTERFACE", &mut form.interface, "entangled0");
             }
-            if form.network != NetworkChoice::None {
-                text_row(
-                    ui,
-                    "MAC",
-                    &mut form.mac,
-                    "52:00:… (optional, derived from the name)",
-                );
-            }
-            ui.add_space(10.0);
-
-            // Display.
-            ui.horizontal(|ui| {
-                ui.label(ui::faint("DISPLAY"));
-                ui.add_space(8.0);
-                ui.add(egui::DragValue::new(&mut form.display_width).range(320..=7680));
-                ui.label(ui::faint("×"));
-                ui.add(egui::DragValue::new(&mut form.display_height).range(200..=4320));
-                ui.add_space(12.0);
-                ui.checkbox(&mut form.virgl, "VirGL 3D").on_hover_text(
-                    "Offer VIRTIO_GPU_F_VIRGL backed by the host virglrenderer \
-                     (Linux hosts; the run fails rather than silently booting 2D)",
-                );
-            });
-            ui.add_space(10.0);
-
-            // Disks: order is guest device order (/dev/vda, /dev/vdb, …).
-            ui.label(ui::faint("DISKS (order = /dev/vda, /dev/vdb, …)"));
-            let mut remove: Option<usize> = None;
-            for (i, disk) in form.disks.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(ui::dim(format!("{}", i + 1)));
-                    ui.label(
-                        RichText::new(disk.path.display().to_string())
-                            .color(theme::TEXT)
-                            .size(12.5),
-                    );
-                    ui.checkbox(&mut disk.writable, "writable");
-                    if ui::ghost_button(ui, "Remove", true, theme::WARN).clicked() {
-                        remove = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = remove {
-                form.disks.remove(i);
-            }
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut form.add_disk)
-                        .desired_width(360.0)
-                        .hint_text("path/to/image.raw"),
-                );
-                let path = form.add_disk.trim().to_string();
-                if ui::ghost_button(ui, "Add disk", !path.is_empty(), theme::CYAN).clicked() {
-                    form.disks.push(control_api::DiskSection {
-                        path: std::path::PathBuf::from(path),
-                        writable: true,
-                    });
-                    form.add_disk.clear();
-                }
-            });
         });
 
-    // Validation preview: run control-api's rules live, so the message sits
-    // under the form before Save is even pressed.
+        ui.add_space(10.0);
+        let (rule, _) = ui.allocate_exact_size(Vec2::new(1.0, 352.0), egui::Sense::hover());
+        ui.painter().vline(
+            rule.center().x,
+            rule.y_range(),
+            egui::Stroke::new(1.0_f32, theme::STROKE),
+        );
+        ui.add_space(10.0);
+
+        egui::Frame::new()
+            .fill(theme::mix(theme::CARD, theme::BG_PANEL, 0.38))
+            .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+            .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
+            .inner_margin(egui::Margin::same(18))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    // Frame::show inherits the surrounding horizontal layout;
+                    // this explicit column keeps fields vertical and bounded.
+                    ui.set_width(500.0);
+                    ui.set_min_height(316.0);
+                    match selected {
+                        EditVmSection::Hardware => edit_hardware(ui, &mut state.form),
+                        EditVmSection::BootMedia => edit_boot_media(ui, &mut state.form),
+                        EditVmSection::NetworkDisplay => {
+                            edit_network_display(ui, &mut state.form);
+                        }
+                        EditVmSection::Storage => edit_storage(ui, &mut state.form),
+                    }
+                });
+            });
+    });
+    state.section = selected;
+
     let preview = state.form.to_config();
     if let Err(message) = &preview {
         ui.add_space(8.0);
@@ -855,14 +770,297 @@ fn edit_vm_body(ui: &mut egui::Ui, state: &mut crate::app::EditVmState, actions:
     ui.add_space(14.0);
     ui.horizontal(|ui| {
         let savable = preview.is_ok() && state.form.dirty();
-        if ui::ghost_button(ui, "Save", savable, theme::CYAN)
-            .on_hover_text("Rewrites the profile through control-api types")
+        if ui::ghost_button(ui, "Save changes", savable, theme::CYAN)
+            .on_hover_text("Validates and saves every section")
             .clicked()
         {
             actions.push(Action::SubmitEditVm);
         }
         if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
             actions.push(Action::CloseModal);
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(ui::faint("All sections are saved together"));
+        });
+    });
+}
+
+fn edit_section_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    detail: &str,
+    selected: bool,
+    tint: egui::Color32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(184.0, 58.0), egui::Sense::click());
+    let hover = theme::animate_bool(
+        ui.ctx(),
+        response.id.with("edit-section-hover"),
+        response.hovered(),
+        0.14,
+    );
+    let fill_strength = if selected { 0.14 } else { 0.025 + hover * 0.06 };
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same(theme::CONTROL_RADIUS),
+        theme::mix(theme::CARD, tint, fill_strength),
+    );
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::same(theme::CONTROL_RADIUS),
+        egui::Stroke::new(
+            if selected { 1.5_f32 } else { 1.0_f32 },
+            if selected {
+                tint.gamma_multiply(0.82)
+            } else {
+                theme::mix(theme::STROKE, tint, hover * 0.38)
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    if selected {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                rect.left_top() + Vec2::new(0.0, theme::CONTROL_RADIUS as f32),
+                Vec2::new(3.0, rect.height() - 2.0 * theme::CONTROL_RADIUS as f32),
+            ),
+            egui::CornerRadius::same(2),
+            tint,
+        );
+    }
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(Vec2::new(12.0, 9.0)))
+            .layout(Layout::top_down(Align::Min)),
+    );
+    child.add(
+        egui::Label::new(
+            RichText::new(title)
+                .size(13.5)
+                .color(if selected {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_DIM
+                })
+                .strong(),
+        )
+        .selectable(false),
+    );
+    child.add_space(2.0);
+    child.add(
+        egui::Label::new(RichText::new(detail).size(10.5).color(theme::TEXT_FAINT))
+            .selectable(false),
+    );
+    if ui.rect_contains_pointer(rect) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn edit_panel_heading(ui: &mut egui::Ui, title: &str, detail: &str) {
+    ui.label(RichText::new(title).size(19.0).color(theme::TEXT).strong());
+    ui.add_space(2.0);
+    ui.label(RichText::new(detail).size(12.5).color(theme::TEXT_DIM));
+    ui.add_space(18.0);
+}
+
+fn edit_hardware(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
+    use control_api::VirtioTransport;
+
+    edit_panel_heading(
+        ui,
+        "Hardware",
+        "Choose the resources this machine may use on the host.",
+    );
+    slider_row(ui, "MEMORY", |ui| {
+        ui.add(
+            egui::Slider::new(&mut form.memory_mib, 128..=control_api::MAX_MEMORY_MIB)
+                .step_by(128.0)
+                .suffix(" MiB"),
+        );
+    });
+    ui.add_space(8.0);
+    slider_row(ui, "vCPUs", |ui| {
+        ui.add(egui::Slider::new(&mut form.vcpus, 1..=64));
+    });
+    ui.add_space(20.0);
+    ui.label(ui::faint("DEVICE TRANSPORT"));
+    ui.add_space(5.0);
+    egui::ComboBox::from_id_salt("edit-transport")
+        .selected_text(form.transport.to_string())
+        .width(200.0)
+        .show_ui(ui, |ui| {
+            for transport in [VirtioTransport::Mmio, VirtioTransport::Pci] {
+                ui.selectable_value(&mut form.transport, transport, transport.to_string());
+            }
+        });
+    ui.add_space(6.0);
+    ui.label(ui::faint(
+        "PCI is the familiar desktop default; MMIO is useful for lean direct-boot setups.",
+    ));
+}
+
+fn edit_boot_media(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
+    use control_api::BootMode;
+
+    edit_panel_heading(
+        ui,
+        "Boot & media",
+        "Select how the guest starts and which installer media it sees.",
+    );
+    ui.horizontal(|ui| {
+        ui.label(ui::faint("BOOT METHOD"));
+        ui.add_space(8.0);
+        egui::ComboBox::from_id_salt("edit-boot-mode")
+            .selected_text(match form.boot_mode {
+                BootMode::DirectLinux => "Direct Linux",
+                BootMode::Uefi => "UEFI firmware",
+            })
+            .width(200.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut form.boot_mode, BootMode::DirectLinux, "Direct Linux");
+                ui.selectable_value(&mut form.boot_mode, BootMode::Uefi, "UEFI firmware");
+            });
+    });
+    ui.add_space(16.0);
+    match form.boot_mode {
+        BootMode::DirectLinux => {
+            text_row(
+                ui,
+                "KERNEL",
+                &mut form.kernel,
+                "artifacts/bootstrap/vmlinuz",
+            );
+            ui.add_space(6.0);
+            text_row(
+                ui,
+                "INITRAMFS",
+                &mut form.initramfs,
+                "artifacts/bootstrap/initrd.img (optional)",
+            );
+            ui.add_space(6.0);
+            text_row(ui, "CMDLINE", &mut form.cmdline, "console=ttyS0 …");
+        }
+        BootMode::Uefi => {
+            text_row(
+                ui,
+                "FIRMWARE",
+                &mut form.firmware,
+                "artifacts/firmware/CLOUDHV.fd",
+            );
+            ui.add_space(6.0);
+            text_row(ui, "NVRAM", &mut form.nvram, "<vm>.nvram (optional)");
+            ui.add_space(6.0);
+            text_row(ui, "CD-ROM", &mut form.cdrom, "installer .iso (optional)");
+        }
+    }
+}
+
+fn edit_network_display(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
+    use crate::editor::NetworkChoice;
+    edit_panel_heading(
+        ui,
+        "Network & display",
+        "Connect the guest and choose how its desktop is presented.",
+    );
+    ui.horizontal(|ui| {
+        ui.label(ui::faint("NETWORK"));
+        ui.add_space(8.0);
+        egui::ComboBox::from_id_salt("edit-network")
+            .selected_text(form.network.label())
+            .width(200.0)
+            .show_ui(ui, |ui| {
+                for choice in NetworkChoice::ALL {
+                    ui.selectable_value(&mut form.network, choice, choice.label());
+                }
+            });
+    });
+    if form.network == NetworkChoice::Tap {
+        ui.add_space(8.0);
+        text_row(ui, "INTERFACE", &mut form.interface, "entangled0");
+    }
+    if form.network != NetworkChoice::None {
+        ui.add_space(8.0);
+        text_row(
+            ui,
+            "MAC",
+            &mut form.mac,
+            "52:00:… (optional, derived from the name)",
+        );
+    }
+    ui.add_space(22.0);
+    ui.label(ui::faint("VIRTUAL DISPLAY"));
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add(egui::DragValue::new(&mut form.display_width).range(320..=7680));
+        ui.label(ui::faint("×"));
+        ui.add(egui::DragValue::new(&mut form.display_height).range(200..=4320));
+        ui.add_space(12.0);
+        ui.checkbox(&mut form.virgl, "VirGL 3D").on_hover_text(
+            "Offer VIRTIO_GPU_F_VIRGL backed by the host virglrenderer \
+             (Linux hosts; the run fails rather than silently booting 2D)",
+        );
+    });
+}
+
+fn edit_storage(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
+    edit_panel_heading(
+        ui,
+        "Storage",
+        "Disks are exposed in this order as /dev/vda, /dev/vdb, and so on.",
+    );
+    egui::ScrollArea::vertical()
+        .id_salt("edit-storage-list")
+        .max_height(176.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            let mut remove = None;
+            for (index, disk) in form.disks.iter_mut().enumerate() {
+                egui::Frame::new()
+                    .fill(theme::INSET)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                    .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
+                    .inner_margin(egui::Margin::symmetric(11, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui::chip(
+                                ui,
+                                &format!("vd{}", (b'a' + index as u8) as char),
+                                theme::VIOLET,
+                            );
+                            let path = disk.path.display().to_string();
+                            ui.label(RichText::new(&path).color(theme::TEXT).size(12.0))
+                                .on_hover_text(path);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui::ghost_button(ui, "Remove", true, theme::WARN).clicked() {
+                                    remove = Some(index);
+                                }
+                                ui.checkbox(&mut disk.writable, "Writable");
+                            });
+                        });
+                    });
+                ui.add_space(7.0);
+            }
+            if let Some(index) = remove {
+                form.disks.remove(index);
+            }
+        });
+    ui.add_space(12.0);
+    ui.label(ui::faint("ATTACH AN EXISTING DISK IMAGE"));
+    ui.add_space(5.0);
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut form.add_disk)
+                .desired_width(f32::INFINITY)
+                .hint_text("path/to/image.raw"),
+        );
+        let path = form.add_disk.trim().to_string();
+        if ui::ghost_button(ui, "Add disk", !path.is_empty(), theme::CYAN).clicked() {
+            form.disks.push(control_api::DiskSection {
+                path: std::path::PathBuf::from(path),
+                writable: true,
+            });
+            form.add_disk.clear();
         }
     });
 }

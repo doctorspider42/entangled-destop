@@ -2,7 +2,7 @@
 
 use egui::{Align, Layout, Rect, RichText, Stroke, StrokeKind, Vec2};
 
-use crate::app::{Action, ManagerApp};
+use crate::app::{Action, ManagerApp, RefreshState};
 use crate::logo;
 use crate::theme;
 use crate::ui;
@@ -55,6 +55,9 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                     }
                     if ui::ghost_button(ui, "Settings", true, theme::TEXT_DIM).clicked() {
                         actions.push(Action::OpenSettings);
+                    }
+                    if app.mock_mode {
+                        ui::chip(ui, "MOCK DATA", theme::WARN);
                     }
                     ui.add_space(8.0);
                     ui.label(
@@ -137,6 +140,8 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
             };
             let activity_tint = if app.supervisor.any_active() {
                 theme::CYAN
+            } else if app.mock_mode {
+                theme::VIOLET
             } else {
                 theme::OK
             };
@@ -151,12 +156,30 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
             {
                 actions.push(Action::ToggleLogPane);
             }
+            let (refresh_title, refresh_detail, refresh_active, refresh_tint) =
+                match app.refresh_state() {
+                    RefreshState::Idle => (
+                        "Refresh",
+                        "Scan the machine library now",
+                        false,
+                        theme::TEXT_DIM,
+                    ),
+                    RefreshState::Scanning => (
+                        "Refreshing…",
+                        "Looking for machine changes",
+                        true,
+                        theme::CYAN,
+                    ),
+                    RefreshState::Complete => {
+                        ("Up to date", "Machine library refreshed", true, theme::OK)
+                    }
+                };
             if nav_item(
                 ui,
-                "Refresh",
-                "Scan the machine library now",
-                false,
-                theme::TEXT_DIM,
+                refresh_title,
+                refresh_detail,
+                refresh_active,
+                refresh_tint,
             )
             .clicked()
             {
@@ -179,7 +202,7 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                                     .scan
                                     .vms
                                     .iter()
-                                    .filter(|vm| app.supervisor.is_busy(&vm.name))
+                                    .filter(|vm| app.is_busy(&vm.name))
                                     .count();
                                 ui.label(
                                     RichText::new("HOST STATUS")
@@ -242,7 +265,7 @@ fn nav_item(
     tint: egui::Color32,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 54.0), egui::Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 64.0), egui::Sense::click());
     let hover = theme::animate_bool(
         ui.ctx(),
         response.id.with("nav-hover"),
@@ -273,7 +296,7 @@ fn nav_item(
     );
     if active {
         ui.painter().rect_filled(
-            Rect::from_min_size(rect.left_top() + Vec2::new(0.0, 10.0), Vec2::new(2.0, 34.0)),
+            Rect::from_min_size(rect.left_top() + Vec2::new(0.0, 12.0), Vec2::new(2.0, 40.0)),
             egui::CornerRadius::same(1),
             tint,
         );
@@ -283,12 +306,22 @@ fn nav_item(
             .max_rect(rect.shrink2(Vec2::new(12.0, 8.0)))
             .layout(Layout::top_down(Align::Min)),
     );
-    child.label(
-        RichText::new(title)
-            .size(13.5)
-            .color(if active { theme::TEXT } else { theme::TEXT_DIM })
-            .strong(),
+    child.add(
+        egui::Label::new(
+            RichText::new(title)
+                .size(13.5)
+                .color(if active { theme::TEXT } else { theme::TEXT_DIM })
+                .strong(),
+        )
+        .selectable(false),
     );
-    child.label(RichText::new(detail).size(10.5).color(theme::TEXT_FAINT));
+    child.add(
+        egui::Label::new(RichText::new(detail).size(10.5).color(theme::TEXT_FAINT))
+            .selectable(false)
+            .wrap(),
+    );
+    if ui.rect_contains_pointer(rect) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     response
 }

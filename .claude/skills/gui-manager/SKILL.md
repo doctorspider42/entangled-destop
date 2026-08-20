@@ -13,7 +13,7 @@ the GUI can do, and a GUI crash can never take a guest down.
 ## Architecture
 
 ```
-main.rs      CLI flags (--vm-dir, --entangled, --screenshot[-view]) + tracing
+main.rs      CLI flags (--vm-dir, --entangled, --mock, --screenshot[-view]) + tracing
 app.rs       ManagerApp (eframe::App): state, Action loop, frame layout
   ui/        views: top bar + side navigation, cards, guided wizard/dialogs,
              activity pane and toasts
@@ -96,12 +96,13 @@ All in `theme.rs`; views never invent a colour.
   only; rounded gradients would need clipping).
 - Motion goes through `theme::animate_bool` / `theme::animation_time`: card
   hover (180 ms fill/border lift), button hover (140 ms glow + accent slide),
-  the subtle grid scan, a breathing halo on Running, a blinking dot on
-  Stopping, and the entangled-particle spinner while installing
+  the subtle grid scan and eight-node background field, a breathing halo on
+  Running, a blinking dot on Stopping, and the entangled-particle spinner while installing
   (`logo::paint_particle_spinner`). The persisted **Interface motion** setting
-  disables all of it. Enabled mode repaints every 40 ms; disabled mode uses a
-  one-second heartbeat for stats/toast expiry and otherwise remains event
-  driven. Do not bypass these theme helpers with direct egui animations.
+  disables all of it. Enabled mode repaints every 40 ms while the window is
+  focused; an unfocused or motion-disabled window uses a one-second heartbeat
+  for stats/toast expiry and otherwise remains event driven. Do not bypass
+  these theme helpers with direct egui animations.
 - `logo.rs` owns both the painter mark and `app_icon()`. The latter rasterises
   the same two-loop geometry once at startup for the native window/taskbar
   icon, avoiding platform-specific bitmap assets.
@@ -145,7 +146,26 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
 
 - `--vm-dir <dir>` / `--entangled <path>` override the saved settings for one
   run; the Settings panel persists them.
-- `--screenshot <png> [--screenshot-view main|wizard|settings]` renders a few
+- `--mock` starts the complete UI with deterministic in-memory machines,
+  disks, statuses and host metrics. It does not load saved settings, scan a VM
+  directory, start the metrics worker or invoke `entangled`; mutating buttons
+  only update the fixture or show a toast. A `MOCK DATA` chip stays visible in
+  the header so screenshots cannot be confused with a real host. Use it for
+  ordinary button/layout work instead of preparing profiles or launching a VM:
+
+  ```powershell
+  $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\entangled-target-gui"
+  cargo run -p entangled-manager -- --mock
+  ```
+
+- Combine mock mode with the screenshot surfaces for unattended visual QA:
+
+  ```powershell
+  cargo run -p entangled-manager -- --mock --screenshot .\manager.png --screenshot-view main
+  cargo run -p entangled-manager -- --mock --screenshot .\editor.png --screenshot-view editor
+  ```
+
+- `--screenshot <png> [--screenshot-view main|wizard|settings|disks|editor]` renders a few
   frames, saves a PNG through `ViewportCommand::Screenshot` and exits — the
   quickest way to review a visual change without a human at the keyboard.
 - The UI itself has no automated tests. To exercise it end to end, drive the

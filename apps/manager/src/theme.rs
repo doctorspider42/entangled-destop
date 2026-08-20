@@ -68,8 +68,10 @@ pub fn animate_bool(ctx: &egui::Context, id: egui::Id, target: bool, seconds: f3
     }
 }
 
-/// Sparse technical grid plus one low-contrast scan line. It is deliberately
-/// painter-only: no texture uploads, shaders or allocations that survive a frame.
+/// Sparse technical grid with a tiny procedural "entanglement field". It is
+/// deliberately painter-only: no textures, shaders, particle state or heap
+/// allocations that survive a frame. Eight nodes and twelve links are enough
+/// to make the page feel alive without competing with the machine cards.
 pub fn paint_backdrop(ui: &egui::Ui) {
     let rect = ui.max_rect();
     let painter = ui.painter();
@@ -93,6 +95,44 @@ pub fn paint_backdrop(ui: &egui::Ui) {
             rect.top() + travel,
             Stroke::new(1.0_f32, CYAN.gamma_multiply(0.055)),
         );
+
+        const NODE_COUNT: usize = 8;
+        let mut nodes = [rect.center(); NODE_COUNT];
+        for (index, node) in nodes.iter_mut().enumerate() {
+            let seed = index as f32;
+            let base_x = (0.11 + seed * 0.137).fract();
+            let base_y = (0.18 + seed * 0.223).fract();
+            let drift_x = (time * (0.055 + seed * 0.002) + seed * 1.71).sin() * 0.045;
+            let drift_y = (time * (0.042 + seed * 0.003) + seed * 2.37).cos() * 0.055;
+            *node = egui::pos2(
+                rect.left() + rect.width() * (base_x + drift_x).clamp(0.04, 0.96),
+                rect.top() + rect.height() * (base_y + drift_y).clamp(0.05, 0.95),
+            );
+        }
+
+        for index in 0..NODE_COUNT {
+            let next = (index + 1) % NODE_COUNT;
+            painter.line_segment(
+                [nodes[index], nodes[next]],
+                Stroke::new(
+                    0.7_f32,
+                    accent(index as f32 / NODE_COUNT as f32).gamma_multiply(0.045),
+                ),
+            );
+            if index % 2 == 0 {
+                let cross = (index + 3) % NODE_COUNT;
+                painter.line_segment(
+                    [nodes[index], nodes[cross]],
+                    Stroke::new(0.6_f32, VIOLET.gamma_multiply(0.032)),
+                );
+            }
+        }
+        for (index, node) in nodes.into_iter().enumerate() {
+            let pulse = 0.72 + 0.28 * (time * 0.8 + index as f32).sin().abs();
+            let color = accent(index as f32 / NODE_COUNT as f32);
+            painter.circle_filled(node, 5.0, color.gamma_multiply(0.025 * pulse));
+            painter.circle_filled(node, 1.15, color.gamma_multiply(0.18 * pulse));
+        }
     }
 }
 
