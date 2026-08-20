@@ -583,8 +583,18 @@ impl Renderer3d for VirglRenderer {
         Ok(blob)
     }
 
-    fn ctx_create(&mut self, ctx_id: u32, name: &str) -> Result<(), CommandError> {
+    fn ctx_create(&mut self, ctx_id: u32, capset_id: u32, name: &str) -> Result<(), CommandError> {
         self.ensure_ready()?;
+        // Pinned virglrenderer 0.9 has only `virgl_renderer_context_create`,
+        // which always makes a classic virgl context; selecting a context type
+        // needs `virgl_renderer_context_create_with_flags` from 0.10+
+        // (VEN-2003). `Gpu3d` will already have refused a capset this renderer
+        // does not advertise, and 0.9 advertises only VIRGL/VIRGL2 — this is
+        // the belt to that braces, so a future capset added here cannot
+        // silently become a virgl context.
+        if capset_id != 0 {
+            return Err(CommandError::UnsupportedContextType(capset_id));
+        }
         let name = CString::new(name).unwrap_or_default();
         let bytes = name.as_bytes();
         // SAFETY: `name` is a NUL-terminated buffer of `bytes.len()` visible

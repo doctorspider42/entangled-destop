@@ -64,6 +64,7 @@
 //!   with `try_reserve`, so a greedy guest gets `ERR_OUT_OF_MEMORY`;
 //! * no `panic!`, `unwrap()` or `expect()` on a guest-controlled path.
 
+pub mod blob;
 pub mod device;
 pub mod edid;
 pub mod error;
@@ -78,6 +79,10 @@ pub mod sink;
 #[cfg(target_os = "linux")]
 pub mod virgl;
 
+pub use blob::{
+    BlobMapping, BlobSupport, BlobTable, HostVisibleWindow, BLOB_PAGE_SIZE, MAX_BLOB_BYTES,
+    MAX_BLOB_ENTRIES, MAX_BLOB_RESOURCES, MAX_HOST_VISIBLE_MAPPINGS, MAX_TOTAL_BLOB_BYTES,
+};
 pub use device::{
     FenceMode, FenceStats, GpuDevice, CHAINS_PER_NOTIFY, CONTROL_QUEUE, CURSOR_QUEUE,
     FENCE_MODE_ENV, FENCE_TIMEOUT, MAX_COMMAND_BYTES, MAX_COMMAND_BYTES_3D, NUM_CAPSETS,
@@ -124,6 +129,41 @@ pub const VIRTIO_GPU_F_VIRGL: u64 = 1 << 0;
 /// EDID block ([`edid`]). Offered because GNOME/mutter sizes and names its
 /// outputs from it; harmless to a driver that ignores it.
 pub const VIRTIO_GPU_F_EDID: u64 = 1 << 1;
+
+/// `VIRTIO_GPU_F_RESOURCE_UUID` (bit 2) — **not** offered. Named so the
+/// numbering of the two bits below is checkable against the spec.
+pub const VIRTIO_GPU_F_RESOURCE_UUID: u64 = 1 << 2;
+
+/// `VIRTIO_GPU_F_RESOURCE_BLOB` (VEN-2001): the device accepts
+/// `RESOURCE_CREATE_BLOB` and friends — untyped memory objects whose contents
+/// the device does not interpret, which is how Venus moves its command ring
+/// and its Vulkan allocations. Offered only when the attached renderer
+/// declares blob support ([`renderer::Renderer3d::blob_mem_types`]).
+pub const VIRTIO_GPU_F_RESOURCE_BLOB: u64 = 1 << 3;
+
+/// `VIRTIO_GPU_F_CONTEXT_INIT` (VEN-2002): `CTX_CREATE`'s `context_init`
+/// selects a *context type* by capset id, which is the only way a guest can
+/// ask for a Venus context rather than a virgl one. Mesa's venus driver
+/// refuses to load without it (`VIRTGPU_PARAM_CONTEXT_INIT`). Offered when the
+/// renderer serves more than the classic virgl capsets.
+pub const VIRTIO_GPU_F_CONTEXT_INIT: u64 = 1 << 4;
+
+/// `VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK`: the low byte of `context_init` is
+/// the capset id naming the context type; every other bit is reserved and must
+/// be zero.
+pub const CONTEXT_INIT_CAPSET_ID_MASK: u32 = 0x0000_00ff;
+
+/// `VIRTIO_GPU_CAPSET_VIRGL`: classic virgl (Gallium command streams).
+pub const CAPSET_VIRGL: u32 = 1;
+/// `VIRTIO_GPU_CAPSET_VIRGL2`: virgl with the v2 capability blob.
+pub const CAPSET_VIRGL2: u32 = 2;
+/// `VIRTIO_GPU_CAPSET_GFXSTREAM`: not served.
+pub const CAPSET_GFXSTREAM: u32 = 3;
+/// `VIRTIO_GPU_CAPSET_VENUS` (VEN-2002): the guest's mesa `venus` driver
+/// encodes Vulkan against this capset and creates a venus-typed context.
+pub const CAPSET_VENUS: u32 = 4;
+/// `VIRTIO_GPU_CAPSET_CROSS_DOMAIN`: not served.
+pub const CAPSET_CROSS_DOMAIN: u32 = 5;
 
 /// Largest cursor image `UPDATE_CURSOR` accepts, per axis. The spec's cursors
 /// are 64×64; four times that leaves room for HiDPI cursors while still

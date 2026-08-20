@@ -29,7 +29,8 @@
 //! backing. The isolated process therefore has no window onto guest RAM, which
 //! is the security half of the containment story.
 
-use crate::protocol::{Box3d, ResourceCreate3d, Transfer3d};
+use crate::blob::BlobSupport;
+use crate::protocol::{Box3d, ResourceCreate3d, ResourceCreateBlob, Transfer3d};
 use crate::renderer::CapsetInfo;
 
 /// Largest payload either side will send or accept in one frame.
@@ -90,6 +91,12 @@ pub mod tag {
     pub const RESET: u8 = 0x0f;
     pub const CREATE_FENCE: u8 = 0x10;
     pub const POLL_FENCES: u8 = 0x11;
+    // Blob resources (VEN-2001), protocol version 2.
+    pub const CREATE_BLOB: u8 = 0x12;
+    pub const DESTROY_BLOB: u8 = 0x13;
+    pub const MAP_BLOB: u8 = 0x14;
+    pub const UNMAP_BLOB: u8 = 0x15;
+    pub const BLOB_SUPPORT: u8 = 0x16;
 
     // Replies.
     pub const OK: u8 = 0x80;
@@ -98,11 +105,22 @@ pub mod tag {
     pub const FENCE: u8 = 0x83;
     pub const FENCES: u8 = 0x84;
     pub const ERROR: u8 = 0x85;
+    /// Reply to [`super::Request::MapBlob`]: the caching the guest must use.
+    pub const MAPPING: u8 = 0x86;
+    /// Reply to [`super::Request::BlobSupport`].
+    pub const BLOB_SUPPORT_REPLY: u8 = 0x87;
 }
 
 /// Protocol version, exchanged in [`Request::Hello`]. A mismatch fails the
 /// handshake instead of misparsing later.
-pub const VERSION: u32 = 1;
+///
+/// Bumped to 2 by VEN-2001: `CtxCreate` grew a `capset_id` and four blob
+/// messages appeared. There is deliberately no compatibility shim — the VMM
+/// and its helper are the same build, `entangled gpu-renderer` is spawned from
+/// the running binary's own path, and a mismatch is a packaging bug that
+/// should fail loudly at handshake rather than quietly at the first venus
+/// context.
+pub const VERSION: u32 = 2;
 
 /// A request from the VMM to the renderer process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +136,8 @@ pub enum Request {
     },
     CtxCreate {
         ctx_id: u32,
+        /// Context type as a capset id, 0 for classic virgl (VEN-2002).
+        capset_id: u32,
         name: String,
     },
     CtxDestroy {
@@ -176,6 +196,30 @@ pub enum Request {
         fence_id: u32,
     },
     PollFences,
+
+    // ------------------------------------ blob resources (VEN-2001)
+    /// Create a host-side blob. Guest-memory blobs never cross this boundary:
+    /// they are guest pages the device tracks itself, and the isolated helper
+    /// has no window onto guest RAM by construction (GPU-012).
+    CreateBlob(ResourceCreateBlob),
+    DestroyBlob {
+        resource_id: u32,
+    },
+    /// Back `size` bytes of the shared-memory window at `offset` with this
+    /// blob's host memory.
+    MapBlob {
+        resource_id: u32,
+        offset: u64,
+        size: u64,
+    },
+    UnmapBlob {
+        resource_id: u32,
+        offset: u64,
+    },
+    /// Asked once, right after the handshake: what the helper's renderer can
+    /// do with blobs. The device needs the answer *before* it decides which
+    /// feature bits to offer, and the client cannot guess it.
+    BlobSupport,
 }
 
 /// A reply from the renderer process.
@@ -191,6 +235,12 @@ pub enum Reply {
     Fence {
         pending: bool,
     },
+    /// The caching a mapped blob must be accessed with (VEN-2001).
+    Mapping {
+        map_info: u32,
+    },
+    /// What the helper's renderer can do with blobs (VEN-2001).
+    BlobSupport(BlobSupport),
     /// Host fences that have retired, oldest first.
     Fences(Vec<u32>),
     /// The renderer refused this command; the device answers the guest in band.
@@ -269,6 +319,14 @@ impl Writer {
             .u32(x.level)
             .u32(x.stride)
             .u32(x.layer_stride)
+    }
+    fn create_blob(&mut self, c: &ResourceCreateBlob) -> &mut Self {
+        self.u32(c.resource_id)
+            .u32(c.blob_mem)
+            .u32(c.blob_flags)
+            .u32(c.nr_entries)
+            .u64(c.blob_id)
+            .u64(c.size)
     }
     fn create(&mut self, c: &ResourceCreate3d) -> &mut Self {
         self.u32(c.resource_id)
@@ -359,6 +417,16 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn create_blob(&mut self) -> Result<ResourceCreateBlob, CodecError> {
+        Ok(ResourceCreateBlob {
+            resource_id: self.u32()?,
+            blob_mem: self.u32()?,
+            blob_flags: self.u32()?,
+            nr_entries: self.u32()?,
+            blob_id: self.u64()?,
+            size: self.u64()?,
+        })
+    }
     fn create(&mut self) -> Result<ResourceCreate3d, CodecError> {
         Ok(ResourceCreate3d {
             resource_id: self.u32()?,
@@ -397,6 +465,11 @@ impl Request {
             Self::Reset => tag::RESET,
             Self::CreateFence { .. } => tag::CREATE_FENCE,
             Self::PollFences => tag::POLL_FENCES,
+            Self::CreateBlob(_) => tag::CREATE_BLOB,
+            Self::DestroyBlob { .. } => tag::DESTROY_BLOB,
+            Self::MapBlob { .. } => tag::MAP_BLOB,
+            Self::UnmapBlob { .. } => tag::UNMAP_BLOB,
+            Self::BlobSupport => tag::BLOB_SUPPORT,
         }
     }
 
@@ -410,8 +483,12 @@ impl Request {
             Self::Capset { id, version } => {
                 w.u32(*id).u32(*version);
             }
-            Self::CtxCreate { ctx_id, name } => {
-                w.u32(*ctx_id).bytes(name.as_bytes());
+            Self::CtxCreate {
+                ctx_id,
+                capset_id,
+                name,
+            } => {
+                w.u32(*ctx_id).u32(*capset_id).bytes(name.as_bytes());
             }
             Self::CtxDestroy { ctx_id } => {
                 w.u32(*ctx_id);
@@ -471,6 +548,26 @@ impl Request {
                 w.u32(*ctx_id).u32(*fence_id);
             }
             Self::PollFences => (),
+            Self::CreateBlob(args) => {
+                w.create_blob(args);
+            }
+            Self::DestroyBlob { resource_id } => {
+                w.u32(*resource_id);
+            }
+            Self::MapBlob {
+                resource_id,
+                offset,
+                size,
+            } => {
+                w.u32(*resource_id).u64(*offset).u64(*size);
+            }
+            Self::UnmapBlob {
+                resource_id,
+                offset,
+            } => {
+                w.u32(*resource_id).u64(*offset);
+            }
+            Self::BlobSupport => (),
         }
         w.0
     }
@@ -487,6 +584,7 @@ impl Request {
             },
             tag::CTX_CREATE => Self::CtxCreate {
                 ctx_id: r.u32()?,
+                capset_id: r.u32()?,
                 name: r.string()?,
             },
             tag::CTX_DESTROY => Self::CtxDestroy { ctx_id: r.u32()? },
@@ -538,6 +636,20 @@ impl Request {
                 fence_id: r.u32()?,
             },
             tag::POLL_FENCES => Self::PollFences,
+            tag::CREATE_BLOB => Self::CreateBlob(r.create_blob()?),
+            tag::DESTROY_BLOB => Self::DestroyBlob {
+                resource_id: r.u32()?,
+            },
+            tag::MAP_BLOB => Self::MapBlob {
+                resource_id: r.u32()?,
+                offset: r.u64()?,
+                size: r.u64()?,
+            },
+            tag::UNMAP_BLOB => Self::UnmapBlob {
+                resource_id: r.u32()?,
+                offset: r.u64()?,
+            },
+            tag::BLOB_SUPPORT => Self::BlobSupport,
             other => return Err(CodecError::UnknownTag(other)),
         };
         if r.at != payload.len() {
@@ -555,6 +667,8 @@ impl Reply {
             Self::Capsets(_) => tag::CAPSETS,
             Self::Fence { .. } => tag::FENCE,
             Self::Fences(_) => tag::FENCES,
+            Self::Mapping { .. } => tag::MAPPING,
+            Self::BlobSupport(_) => tag::BLOB_SUPPORT_REPLY,
             Self::Error(_) => tag::ERROR,
         }
     }
@@ -582,6 +696,14 @@ impl Reply {
                 for id in ids {
                     w.u32(*id);
                 }
+            }
+            Self::Mapping { map_info } => {
+                w.u32(*map_info);
+            }
+            Self::BlobSupport(support) => {
+                w.u8(u8::from(support.guest))
+                    .u8(u8::from(support.host3d))
+                    .u64(support.host_visible_bytes.unwrap_or(0));
             }
             Self::Error(message) => {
                 w.bytes(message.as_bytes());
@@ -611,6 +733,25 @@ impl Reply {
                     });
                 }
                 Self::Capsets(capsets)
+            }
+            tag::MAPPING => Self::Mapping { map_info: r.u32()? },
+            tag::BLOB_SUPPORT_REPLY => {
+                let flag = |v: u8| match v {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(CodecError::NonCanonical),
+                };
+                let guest = flag(r.u8()?)?;
+                let host3d = flag(r.u8()?)?;
+                let bytes = r.u64()?;
+                Self::BlobSupport(BlobSupport {
+                    guest,
+                    host3d,
+                    // Zero means "no window", which is how `None` is encoded;
+                    // there is no such thing as a zero-length window, so the
+                    // mapping is canonical in both directions.
+                    host_visible_bytes: (bytes != 0).then_some(bytes),
+                })
             }
             tag::FENCE => Self::Fence {
                 pending: match r.u8()? {
@@ -699,7 +840,13 @@ mod tests {
             Request::Capset { id: 2, version: 2 },
             Request::CtxCreate {
                 ctx_id: 3,
+                capset_id: 0,
                 name: "glxgears".into(),
+            },
+            Request::CtxCreate {
+                ctx_id: 4,
+                capset_id: crate::CAPSET_VENUS,
+                name: "vkcube".into(),
             },
             Request::CtxDestroy { ctx_id: 3 },
             Request::ResourceCreate(sample_create()),
@@ -746,6 +893,26 @@ mod tests {
                 fence_id: 0x4242,
             },
             Request::PollFences,
+            // Blob resources (VEN-2001).
+            Request::CreateBlob(ResourceCreateBlob {
+                resource_id: 9,
+                blob_mem: crate::protocol::BLOB_MEM_HOST3D,
+                blob_flags: crate::protocol::BLOB_FLAG_USE_MAPPABLE,
+                nr_entries: 0,
+                blob_id: 0xdead_beef_cafe,
+                size: 1 << 20,
+            }),
+            Request::DestroyBlob { resource_id: 9 },
+            Request::MapBlob {
+                resource_id: 9,
+                offset: 0x1_0000,
+                size: 1 << 20,
+            },
+            Request::UnmapBlob {
+                resource_id: 9,
+                offset: 0x1_0000,
+            },
+            Request::BlobSupport,
         ] {
             round_trip_request(request);
         }
@@ -775,6 +942,15 @@ mod tests {
             Reply::Fences(vec![1, 2, 3]),
             Reply::Fences(Vec::new()),
             Reply::Error("no such context".into()),
+            Reply::Mapping {
+                map_info: crate::protocol::MAP_CACHE_WC,
+            },
+            Reply::BlobSupport(BlobSupport::NONE),
+            Reply::BlobSupport(BlobSupport {
+                guest: true,
+                host3d: true,
+                host_visible_bytes: Some(8 << 30),
+            }),
         ] {
             round_trip_reply(reply);
         }
@@ -846,8 +1022,9 @@ mod tests {
             Ok(Reply::Fence { pending: false })
         );
 
-        // Non-UTF-8 context name.
+        // Non-UTF-8 context name (ctx_id, capset_id, length, bytes).
         let mut bad = 1u32.to_le_bytes().to_vec();
+        bad.extend_from_slice(&0u32.to_le_bytes());
         bad.extend_from_slice(&2u32.to_le_bytes());
         bad.extend_from_slice(&[0xff, 0xfe]);
         assert_eq!(

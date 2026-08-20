@@ -42,6 +42,18 @@ pub mod cmd {
     pub const GET_CAPSET_INFO: u32 = 0x0108;
     pub const GET_CAPSET: u32 = 0x0109;
 
+    /// Blob resources (EPIC 20 / VEN-2001), gated on
+    /// [`crate::VIRTIO_GPU_F_RESOURCE_BLOB`].
+    ///
+    /// Note the split: the *create* and *scanout* halves were added to the 2D
+    /// command block (they work on a device with no 3D at all, for a
+    /// guest-memory blob), while map/unmap live in the 3D block because only a
+    /// host-side allocation can be mapped. That is the spec's numbering, not
+    /// ours — `RESOURCE_MAP_BLOB` really is `0x0208`, immediately after
+    /// `SUBMIT_3D`.
+    pub const RESOURCE_CREATE_BLOB: u32 = 0x010c;
+    pub const SET_SCANOUT_BLOB: u32 = 0x010d;
+
     /// Cursor-queue commands (MVP-812): the hardware-cursor plane. mutter
     /// composites the pointer onto this plane, so a device that drains and
     /// ignores these shows a desktop with an invisible pointer.
@@ -58,6 +70,11 @@ pub mod cmd {
     pub const TRANSFER_TO_HOST_3D: u32 = 0x0205;
     pub const TRANSFER_FROM_HOST_3D: u32 = 0x0206;
     pub const SUBMIT_3D: u32 = 0x0207;
+
+    /// Blob map/unmap (VEN-2001): puts a host-side blob allocation into the
+    /// device's shared-memory region so the guest can `mmap` it.
+    pub const RESOURCE_MAP_BLOB: u32 = 0x0208;
+    pub const RESOURCE_UNMAP_BLOB: u32 = 0x0209;
 }
 
 /// Response types (`VIRTIO_GPU_RESP_*`).
@@ -67,6 +84,12 @@ pub mod resp {
     pub const OK_CAPSET_INFO: u32 = 0x1102;
     pub const OK_CAPSET: u32 = 0x1103;
     pub const OK_EDID: u32 = 0x1104;
+    /// `VIRTIO_GPU_RESP_OK_RESOURCE_UUID` — not served (we do not offer
+    /// `VIRTIO_GPU_F_RESOURCE_UUID`); listed so the numbering of the next one
+    /// is checkable against the spec.
+    pub const OK_RESOURCE_UUID: u32 = 0x1105;
+    /// `VIRTIO_GPU_RESP_OK_MAP_INFO`: the reply to `RESOURCE_MAP_BLOB`.
+    pub const OK_MAP_INFO: u32 = 0x1106;
     pub const ERR_UNSPEC: u32 = 0x1200;
     pub const ERR_OUT_OF_MEMORY: u32 = 0x1201;
     pub const ERR_INVALID_SCANOUT_ID: u32 = 0x1202;
@@ -127,6 +150,11 @@ const _: () = {
     assert!(ResourceCreate3d::LEN == 72);
     assert!(Transfer3d::LEN == 72);
     assert!(CmdSubmit3d::LEN == 32);
+    // Blob resources (VEN-2001), against `include/uapi/linux/virtio_gpu.h`.
+    assert!(ResourceCreateBlob::LEN == 56);
+    assert!(ResourceMapBlob::LEN == 40);
+    assert!(CtrlHdr::LEN + MAP_INFO_BODY_LEN == 32);
+    assert!(SetScanoutBlob::LEN == 96);
 };
 
 // ------------------------------------------------------------ byte helpers
@@ -499,12 +527,10 @@ impl MemEntry {
     /// Wire length of one entry.
     pub const LEN: usize = MEM_ENTRY_LEN;
 
-    /// Parses entry `index` of an attach-backing command buffer.
-    pub fn parse_at(bytes: &[u8], index: u32) -> Option<Self> {
-        let at = usize::try_from(index)
-            .ok()?
-            .checked_mul(Self::LEN)?
-            .checked_add(AttachBacking::LEN)?;
+    /// Parses one entry at byte offset `at`. `None` when the buffer is too
+    /// short; `at` is host-computed, but the *length* it is checked against is
+    /// guest-controlled, so the addition is checked.
+    pub fn parse(bytes: &[u8], at: usize) -> Option<Self> {
         if bytes.len() < at.checked_add(Self::LEN)? {
             return None;
         }
@@ -512,6 +538,15 @@ impl MemEntry {
             addr: le64(bytes, at),
             length: le32(bytes, at + 8),
         })
+    }
+
+    /// Parses entry `index` of an attach-backing command buffer.
+    pub fn parse_at(bytes: &[u8], index: u32) -> Option<Self> {
+        let at = usize::try_from(index)
+            .ok()?
+            .checked_mul(Self::LEN)?
+            .checked_add(AttachBacking::LEN)?;
+        Self::parse(bytes, at)
     }
 }
 
@@ -830,6 +865,177 @@ impl CmdSubmit3d {
         }
         Some(Self {
             size: le32(bytes, CTRL_HDR_LEN),
+        })
+    }
+}
+
+// ----------------------------------------------------------- blob resources
+
+/// `VIRTIO_GPU_BLOB_MEM_GUEST`: the blob *is* the guest pages listed in the
+/// create command. No host allocation, no renderer involvement — this is what
+/// mesa's venus driver uses for its command ring and reply shmem.
+pub const BLOB_MEM_GUEST: u32 = 0x0001;
+/// `VIRTIO_GPU_BLOB_MEM_HOST3D`: the blob is a host allocation the renderer
+/// already made, named by `blob_id`; the guest supplies no pages.
+pub const BLOB_MEM_HOST3D: u32 = 0x0002;
+/// `VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST`: a host allocation *plus* guest pages
+/// that shadow it (transfers move between the two).
+pub const BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
+
+/// `VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE`: the guest intends to
+/// `RESOURCE_MAP_BLOB` this resource into the shared-memory region.
+pub const BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
+/// `VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE`: the blob may be exported to another
+/// context.
+pub const BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
+/// `VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE`: the blob may be exported to
+/// another *device* (dmabuf). Refused — we have no cross-device export.
+pub const BLOB_FLAG_USE_CROSS_DEVICE: u32 = 0x0004;
+
+/// Every flag bit the device understands; anything outside this mask is a
+/// guest error rather than something to ignore, because ignoring an unknown
+/// "use" flag hands the guest a resource that cannot do what it asked for.
+pub const BLOB_FLAG_MASK: u32 =
+    BLOB_FLAG_USE_MAPPABLE | BLOB_FLAG_USE_SHAREABLE | BLOB_FLAG_USE_CROSS_DEVICE;
+
+/// `VIRTIO_GPU_MAP_CACHE_*`, the low nibble of `virtio_gpu_resp_map_info`'s
+/// `map_info`.
+pub const MAP_CACHE_MASK: u32 = 0x0f;
+pub const MAP_CACHE_NONE: u32 = 0x00;
+pub const MAP_CACHE_CACHED: u32 = 0x01;
+pub const MAP_CACHE_UNCACHED: u32 = 0x02;
+pub const MAP_CACHE_WC: u32 = 0x03;
+
+/// Length of the `struct virtio_gpu_resp_map_info` body (after the header):
+/// `map_info` + `padding`.
+pub const MAP_INFO_BODY_LEN: usize = 8;
+
+/// `struct virtio_gpu_resource_create_blob` (VEN-2001). `nr_entries`
+/// `struct virtio_gpu_mem_entry`s follow the fixed part in the same readable
+/// chain, exactly like `RESOURCE_ATTACH_BACKING`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResourceCreateBlob {
+    pub resource_id: u32,
+    pub blob_mem: u32,
+    pub blob_flags: u32,
+    pub nr_entries: u32,
+    /// Renderer-side name of an existing host allocation, for the `HOST3D`
+    /// memory types. Meaningless (and required to be ignored) for `GUEST`.
+    pub blob_id: u64,
+    /// Size of the mapping the guest will make, in bytes.
+    pub size: u64,
+}
+
+impl ResourceCreateBlob {
+    /// Wire length of the fixed part, header included.
+    pub const LEN: usize = CTRL_HDR_LEN + 32;
+
+    /// Parses the fixed part from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        Some(Self {
+            resource_id: le32(bytes, CTRL_HDR_LEN),
+            blob_mem: le32(bytes, CTRL_HDR_LEN + 4),
+            blob_flags: le32(bytes, CTRL_HDR_LEN + 8),
+            nr_entries: le32(bytes, CTRL_HDR_LEN + 12),
+            blob_id: le64(bytes, CTRL_HDR_LEN + 16),
+            size: le64(bytes, CTRL_HDR_LEN + 24),
+        })
+    }
+
+    /// Total command length for `nr_entries` trailing mem entries, or `None`
+    /// on overflow — the same guest-controlled multiplication
+    /// [`AttachBacking::total_len`] guards, and for the same reason.
+    pub fn total_len(nr_entries: u32) -> Option<usize> {
+        let entries = usize::try_from(nr_entries).ok()?;
+        entries
+            .checked_mul(MEM_ENTRY_LEN)
+            .and_then(|bytes| bytes.checked_add(Self::LEN))
+    }
+
+    /// Parses trailing mem entry `index` (0-based), which starts right after
+    /// the fixed part.
+    pub fn entry_at(bytes: &[u8], index: u32) -> Option<MemEntry> {
+        let at = Self::LEN.checked_add(usize::try_from(index).ok()?.checked_mul(MEM_ENTRY_LEN)?)?;
+        MemEntry::parse(bytes, at)
+    }
+}
+
+/// `struct virtio_gpu_resource_map_blob` (VEN-2001): put this blob's host
+/// allocation at `offset` inside the device's shared-memory region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResourceMapBlob {
+    pub resource_id: u32,
+    pub offset: u64,
+}
+
+impl ResourceMapBlob {
+    /// Wire length including the header (`resource_id`, `padding`, `offset`).
+    pub const LEN: usize = CTRL_HDR_LEN + 16;
+
+    /// Parses the command from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        Some(Self {
+            resource_id: le32(bytes, CTRL_HDR_LEN),
+            offset: le64(bytes, CTRL_HDR_LEN + 8),
+        })
+    }
+}
+
+/// Encodes the body of `struct virtio_gpu_resp_map_info`.
+pub fn map_info_body(map_info: u32) -> [u8; MAP_INFO_BODY_LEN] {
+    let mut out = [0u8; MAP_INFO_BODY_LEN];
+    put32(&mut out, 0, map_info);
+    out
+}
+
+/// `struct virtio_gpu_set_scanout_blob` (VEN-2001 / VEN-2005): binds a blob
+/// resource to a scanout, carrying the format and per-plane strides the blob
+/// itself does not describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SetScanoutBlob {
+    pub rect: Rect,
+    pub scanout_id: u32,
+    pub resource_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub strides: [u32; 4],
+    pub offsets: [u32; 4],
+}
+
+impl SetScanoutBlob {
+    /// Wire length including the header.
+    pub const LEN: usize = CTRL_HDR_LEN + RECT_LEN + 24 + 16 + 16;
+
+    /// Parses the command from a full command buffer (header included).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::LEN {
+            return None;
+        }
+        let base = CTRL_HDR_LEN + RECT_LEN;
+        let mut strides = [0u32; 4];
+        let mut offsets = [0u32; 4];
+        for (plane, slot) in strides.iter_mut().enumerate() {
+            *slot = le32(bytes, base + 24 + plane * 4);
+        }
+        for (plane, slot) in offsets.iter_mut().enumerate() {
+            *slot = le32(bytes, base + 40 + plane * 4);
+        }
+        Some(Self {
+            rect: Rect::parse(bytes, CTRL_HDR_LEN)?,
+            scanout_id: le32(bytes, base),
+            resource_id: le32(bytes, base + 4),
+            width: le32(bytes, base + 8),
+            height: le32(bytes, base + 12),
+            format: le32(bytes, base + 16),
+            strides,
+            offsets,
         })
     }
 }
