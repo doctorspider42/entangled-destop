@@ -351,6 +351,32 @@ on both hosts. Attaching a NIC means also giving the installed system a netplan
 that expects one, which is a change to the autoinstall profile both hosts share,
 so it is left as a follow-up rather than smuggled into the port.
 
+### Addendum (same day, after merging main): the acceptance runs itself now
+
+The phase-5 numbers above were measured by hand, because
+`tests/ubuntu_install.rs` — the acceptance criterion as a test — could not pass
+on Windows for a reason that had nothing to do with the port: it read the serial
+transcript with `read_to_string`, which fails on the byte range an installed
+Ubuntu writes while setting up its console font, and matched a marker systemd
+splits with a colour escape. Both are fixed (see the vm-testing skill), and the
+test now passes unattended on this Windows host:
+
+| | |
+|---|---|
+| install | **189 s** (`--auto --headless`, 12 GiB target, debug build), ending `installed: GPT with an ESP on /dev/vda1 (572 MiB) and root on /dev/vda2 (ext4 UUID 40589fc3-…)` |
+| the ending | `guest requested ACPI S5 (soft off) via="PM1a_CNT"` → `UEFI variable store written by the firmware programmed_bytes=5328` |
+| the installed system | `BdsDxe: starting Boot0006 "Ubuntu"` off the persisted NVRAM entry → shim → `GNU GRUB version 2.14` → `Welcome to Ubuntu 26.04 LTS!` → `Started serial-getty@ttyS0.service` → `e2e-ubuntu login:` |
+| total | 332 s for install *and* boot-what-was-installed |
+
+So the acceptance is a command on either host rather than a procedure:
+`cargo test -p entangled --test ubuntu_install -- --ignored`. The hand-measured
+4 min 27 s and this 189 s are the same install on the same machine; the
+difference is load, not a change.
+
+The `[network]`-less profile's cost is still there and still visible in that
+transcript: `systemd-networkd-wait-online` and `cloud-init-network` each wait out
+about two minutes before the login prompt, which is most of the boot half.
+
 ## Consequences
 
 - The MVP pays a small ongoing tax (trait indirection for interrupts, target

@@ -48,6 +48,16 @@ debug build, no WSL involved (2026-08-20):
 | NVRAM | `UEFI variable store written by the firmware programmed_bytes=5328 erased_blocks=0 refused=0 store_errors=0` |
 | the installed disk | `entangled run <vm>.toml` boots it: EDK2 → the `Boot####` entry grub-install wrote → GRUB's menu on ttyS0 → systemd → login prompt |
 
+All of that is now the unattended
+`cargo test -p entangled --test ubuntu_install -- --ignored`, green on this host
+(install 189 s, install + boot-what-was-installed 332 s) rather than a procedure
+someone follows. It could not pass here before, for a reason unrelated to the
+port — it read the serial transcript with `read_to_string`, which fails on the
+0x00..0xFF range an installed Ubuntu writes while setting up its console font,
+and matched a marker systemd splits with a colour escape. If you are writing a
+boot-to-marker test, read the serial-transcript rules in the vm-testing skill
+first; they cost two full acceptance runs to learn.
+
 Nothing in the installer is Windows-specific. What made it Linux-only was a
 `#[cfg]`, a `$HOME`-only cache lookup and a TAP default; details and the
 reasoning are in ADR-0002's phase-5 amendment. Two things worth knowing here:
