@@ -16,14 +16,19 @@ the GUI can do, and a GUI crash can never take a guest down.
 main.rs      CLI flags (--vm-dir, --entangled, --mock, --screenshot[-view]) + tracing
 app.rs       ManagerApp (eframe::App): state, Action loop, frame layout
   ui/        views: top bar + side navigation, cards, guided wizard/dialogs,
-             activity pane and toasts
+             Disks, Diagnostics, activity pane and toasts
   theme.rs   every colour, radius and font size in the product
   logo.rs    procedural mark + install spinner (egui painter, no assets)
 settings.rs  ~/.config/entangled/manager.toml, typed load/save
 update.rs    startup update check (GitHub /releases/latest) + installer
              download/launch, both on background threads; banner in cards.rs
 discovery.rs VM directory scan through control-api, delete plan + guards
-launcher.rs  locating the CLI, building install/run argument vectors
+launcher.rs  finding the engine (path + origin + version), Runner, install/run
+             argument vectors
+backend.rs   where a machine runs (native vs WSL), the capability matrix and
+             Windows→WSL path translation — pure logic, tests on both hosts
+picker.rs    native file/folder dialogs, off-thread (rfd, XDG portal on Linux)
+hostcheck.rs `entangled doctor` on a worker thread, parsed into coloured rows
 process.rs   Supervisor: children, log tailing, stop/kill, state machine
 diagnose.rs  CLI failure output -> one actionable sentence
 ```
@@ -57,7 +62,30 @@ Two rules keep it honest:
   shows Stopped while the VM runs, and Start then fails with the busy-TAP
   message. Adoption would need a pid file plus a portable liveness check.
 
-### Install flow (GUI-1602)
+#### The engine is resolved, never requested
+
+`launcher::locate_engine` returns the path **and how it was found**
+(`Chosen` / `BesideManager` / `OnPath`), and a background probe fills in
+`--version`. Settings shows one status line — "Engine: entangled 0.2.0 — next to
+the manager  [ready]" — and the override lives under **Advanced and
+diagnostics**, collapsed. A GUI user must never be asked for a path the
+application can work out.
+
+When resolution fails it is a *problem with a fix button*, not an empty field:
+the banner's action opens the file picker directly and applies the answer
+immediately (`collect_picker` special-cases `EngineBinary` because there is no
+form open to hold it).
+
+## Diagnostics (`hostcheck.rs` + `ui/diagnostics.rs`)
+
+The panel is `entangled doctor`, run on a worker thread and rendered: `MISSING`
+lines in the warning colour, the instruction that follows each one in the quiet
+one. It does **not** reimplement the checks — `doctor` already knows them per
+host, and two copies would drift. It also carries the engine card and the
+backend/capability summary. `--mock` shows `hostcheck::mock_report()` (a healthy
+host with one missing artifact) so screenshots are identical everywhere.
+
+## Install flow (GUI-1602)
 
 The four-stage wizard collects system/media, name/resources, storage and a
 review before it launches anything. It supports Debian's verified variants and
@@ -87,6 +115,86 @@ the profile itself, but hardcodes its resource defaults, so on success the
 manager stamps the wizard's memory/vCPU choice onto the profile
 (`discovery::apply_resources`). While the install runs the VM has no profile
 yet, so `PendingInstall` gives it a card with the Installing badge.
+
+## Form conventions — read before adding any field
+
+The GUI is the product; the CLI is the engine underneath it. Two rules follow,
+and both are enforced by helpers in `ui/mod.rs` rather than by discipline at the
+call site. Do not hand-roll a labelled row.
+
+### 1. The explanation is a tooltip, not body text
+
+**User-facing explanation goes in a tooltip; the form stays uncluttered.**
+Every piece of jargon the product exposes — firmware, NVRAM, VirGL, transport,
+network backend, cdrom, the backend choice — gets a short label and a sentence
+that teaches, hanging off the label on hover. A paragraph of helper text under
+every field turns a five-field form into a wall of prose that experienced users
+skim past and new users still do not read.
+
+- `ui::form_row(ui, LABEL, tooltip, |ui, field_w| …)` — the label cell is the
+  hover target and shows a quiet `?` when a tooltip exists.
+- A **disabled** control puts its reason in the tooltip too, and a short version
+  inline. `backend::Block { short, long }` carries both: `short` sits under the
+  control, `long` is the tooltip. Do not paste the long one inline.
+- `ui::form_note` is for *state*, not explanation — "not found: …", "= 32 GiB",
+  "used by ubuntu-lab". If a note is teaching, it belongs in the tooltip.
+
+### 2. One label column, one field width
+
+`FORM_LABEL_W` (label cell, exact width — long labels truncate rather than push
+the field right) and `FORM_TRAIL_W` (reserved for a Browse button whether or not
+the row has one). Stacked rows therefore line up on both edges.
+
+- Call **`ui::form_scope(ui)` once at the top of every form section.** Without
+  it each row measures `available_width()` for itself, and the container grows
+  as wrapped notes are added to it — row three ends up eight pixels wider than
+  row one and the column visibly staircases. That bug was real and is invisible
+  until you measure the PNG. `edit_panel_heading` calls it for the editor
+  sections; the wizard, Settings and the disk dialogs call it themselves.
+- A `ComboBox` draws ~8.5 px narrower than the width it is given. Pass
+  `ui::combo_width(field_w)`, never `field_w`, or combos and text fields end on
+  different pixels.
+- Paths use `ui::path_row`, which is `form_row` + text field + Browse and
+  returns `true` on click; the caller pushes `Action::PickPath(target)`.
+
+### 3. No path is typed unless the user wants to type it
+
+Every path in the product has a native picker (`picker.rs`, `rfd`), and the text
+field stays as the editable fallback. Rules:
+
+- The dialog **never** runs on the egui thread — `picker::open` spawns a thread
+  and the answer arrives through the waker/channel pattern.
+- One dialog at a time (`ManagerApp::picker`), because they are OS-modal anyway.
+- `picker::spec` is the one table of title/kind/filter per target: add a
+  `PickTarget` there and the filter cannot be wrong at the call site.
+- `--mock` intercepts `Action::PickPath` and toasts instead: a screenshot run
+  must never stop on a modal dialog.
+- On Linux rfd is built against the **XDG portal**, never `gtk3` — GTK is LGPL
+  and this binary carries no copyleft (ADR-0001, `deny.toml`).
+
+## Where a machine runs (`backend.rs`)
+
+On Windows the manager offers two hypervisors: **Windows (WHP)**, running
+`entangled.exe` natively, and **WSL (KVM)**, running the Linux build through
+`wsl.exe -d <distro> --cd <windows cwd> -e <linux entangled> …`.
+
+- The choice is **manager state, not profile state** (`Settings::vm_backends`,
+  keyed by VM name). The same profile is meant to boot on either host (ADR-0002);
+  writing the backend into it would make the file host-specific.
+- Every path argument goes through `Runner::path_arg`, which is identity
+  natively and `backend::to_wsl_path` under WSL (`D:\vms\x.toml` →
+  `/mnt/d/vms/x.toml`). A UNC or relative path is **refused when the spec is
+  built**, with the fix in the message — never discovered inside the engine.
+- `backend::reachability` also warns (does not refuse) when a machine lives on a
+  Windows drive: drvfs has no sparse files, so a 16 GiB image really occupies
+  16 GiB.
+- The control pipe survives `wsl.exe`, so Pause and Restart still work. The
+  window does not come up on the Windows desktop — WSLg opens its own.
+- **Capabilities follow the kernel, not the host.** `Backend::virgl_block`,
+  `tap_block` and `debian_install_block` are the single source of truth for
+  "this fails at boot"; the editor and the wizard grey the control out and show
+  `.short`, and the same check runs again at submit time in case the setting
+  changed underneath the form.
 
 ## Theme tokens (GUI-1606)
 
@@ -180,9 +288,15 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
   cargo run -p entangled-manager -- --mock --screenshot .\editor.png --screenshot-view editor
   ```
 
-- `--screenshot <png> [--screenshot-view main|wizard|settings|disks|editor]` renders a few
-  frames, saves a PNG through `ViewportCommand::Screenshot` and exits — the
-  quickest way to review a visual change without a human at the keyboard.
+- `--screenshot <png> [--screenshot-view <surface>]` renders a few frames, saves
+  a PNG through `ViewportCommand::Screenshot` and exits — the quickest way to
+  review a visual change without a human at the keyboard. Surfaces:
+  `main`, `wizard`, `settings`, `disks`, `diagnostics`, and one per editor
+  section: `editor` (Hardware), `editor-boot`, `editor-network`,
+  `editor-storage`. **Every new surface gets one**, or it cannot be reviewed.
+- Alignment regressions do not survive a look at the pixels but do survive a
+  glance at the window. When touching form layout, measure: crop the PNG and
+  compare the right-hand edge of each field (PIL is available on this machine).
 - The UI itself has no automated tests. To exercise it end to end, drive the
   real window from the Windows side: `EnumWindows` for
   `"Entangled Desktop*"` (the title carries the injected version, e.g.
