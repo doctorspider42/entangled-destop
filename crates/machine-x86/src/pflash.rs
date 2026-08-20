@@ -462,6 +462,21 @@ impl Pflash {
         ))
     }
 
+    /// Machine reset (ADR-0005): the CFI **command state machine** goes back to
+    /// read-array with a clear status register, and nothing else changes.
+    ///
+    /// This is the device whose reset most obviously must not be a `Default`:
+    /// `nvram` is the persisted UEFI variable store, and the whole reason a
+    /// rebooted UEFI VM lands back at the same boot entry is that it survives.
+    /// What must *not* survive is a half-finished program or block-erase
+    /// command sequence — the firmware that starts again will issue its own
+    /// read-array first, but a machine that only works because the guest is
+    /// well-behaved is not a machine.
+    pub fn reset(&mut self) {
+        self.state = State::ReadArray;
+        self.status = 0;
+    }
+
     /// True when `addr` is inside the decoded window.
     pub fn contains(&self, addr: u64) -> bool {
         addr >= self.base && addr - self.base < self.window

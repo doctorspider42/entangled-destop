@@ -72,3 +72,39 @@ handle, guest memory, vCPU threads, lifecycle) and `crates/machine-x86`
 - The PIT/IRQ chip must exist before vCPUs, or `KVM_CREATE_PIT2` fails.
 - Do not use `KVM_GET_SUPPORTED_CPUID` results unfiltered — mask out features
   we cannot honor (x2apic is fine to keep; PMU, nested virt leaves are not).
+
+## Resetting a vCPU in place (ADR-0005)
+
+KVM has no "reset this vCPU" ioctl, so `ResettableVcpu::reset_arch_state` writes
+the state out by hand, in this order and for these reasons:
+
+1. **`KVM_SET_VCPU_EVENTS`** with the exception/interrupt/NMI fields cleared. An
+   injected interrupt left over from the guest that just died would be delivered
+   into the new boot's first instructions.
+2. **`KVM_SET_LAPIC`** with a power-on register page (id, version 0x14, DFR all
+   ones, SVR 0xFF, every LVT masked). This is the one most easily skipped and
+   most expensive to skip: a rebooted guest with the previous kernel's APIC timer
+   still armed takes an interrupt a few hundred instructions in, before it has an
+   IDT, and triple-faults.
+3. **sregs then regs** to the architectural reset values. `apic_base` is forced
+   back to `0xfee0_0000 | EN` (xAPIC): a guest that moved the APIC or enabled
+   x2APIC must not hand that to the next boot. Note that
+   `machine_x86::boot::setup_long_mode_sregs` *ORs* into `cr0`/`cr4`/`efer`, so a
+   stale `CR4.LA57` would otherwise survive into a 4-level page table.
+4. **`KVM_SET_MP_STATE`**: `RUNNABLE` for the boot CPU, `UNINITIALIZED` for every
+   application processor — exactly where `KVM_CREATE_VCPU` left it. The new
+   kernel's INIT/SIPI sweep then brings the AP up the way the first boot did, and
+   KVM performs the real INIT reset itself.
+
+Two traps around it:
+
+- **Flush the pending userspace-I/O completion before rewriting registers.** KVM
+  keeps it in the `kvm_run` mapping between an exit and the next `KVM_RUN`, and
+  applies it at the top of that call *ahead of* the `immediate_exit` check — so
+  one run with `set_kvm_immediate_exit(1)` retires it and returns `EINTR`. A
+  multi-fragment MMIO access can produce one more exit while doing so, which is
+  why the flush dispatches to the handler and is bounded.
+- **Never re-enter a vCPU that reported `KVM_EXIT_SHUTDOWN`.** The next
+  `KVM_RUN` answers `KVM_EXIT_INTERNAL_ERROR`. It has to park until the reset
+  arrives (or, for an application processor, indefinitely — see the reset matrix
+  in ADR-0005 for why an AP's triple fault must not restart the machine).

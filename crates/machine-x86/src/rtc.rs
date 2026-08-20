@@ -156,6 +156,17 @@ impl Rtc {
         port == RTC_INDEX_PORT || port == RTC_DATA_PORT
     }
 
+    /// Machine reset (ADR-0005): the index latch and the CMOS register file
+    /// back to power-on, with the same clock behind them.
+    ///
+    /// A real machine's CMOS is battery-backed and survives a reboot, but every
+    /// byte of ours is either synthesised from the host clock on read or was
+    /// written by the firmware that is about to run again — so a clean slate is
+    /// both simpler and closer to what the next boot expects to find.
+    pub fn reset(&mut self) {
+        *self = Self::with_clock(self.now);
+    }
+
     fn register(&self) -> u8 {
         self.index & INDEX_MASK
     }

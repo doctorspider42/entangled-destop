@@ -2,6 +2,10 @@
 #   bash guest/bootstrap-kernel/build.sh && bash scripts/build-bootstrap-initramfs.sh
 # Without a [[disk]] this exercises the missing-rootfs diagnostic (MVP-1106);
 # point [[disk]] at an installed image to switch_root into it.
+#
+# `reboot=k` reboots the VM in place since ADR-0005 rather than ending it, so a
+# guest that gives up and restarts will keep restarting; Ctrl+C or Ctrl+Alt+Q
+# stops the run.
 name = "bootstrap-test"
 memory_mib = 512
 vcpus = 1

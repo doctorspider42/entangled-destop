@@ -11,6 +11,8 @@
 //!   per-device worker threads.
 //! * `tests/pci_transport.rs` — EPIC 19: the acceptance boot for virtio-pci, with
 //!   no `virtio_mmio.device=` clause anywhere on the command line.
+//! * `tests/lifecycle.rs` — ADR-0005: pause, resume and reboot-in-place, using
+//!   [`boot_once_driven`] to act on the VM while its vCPUs are running.
 //!
 //! [`BootSpec::transport`] selects the virtio transport, so any test built on the
 //! harness can be run either way — which is the point: a transport that only the
@@ -28,6 +30,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use control_api::VirtioTransport;
 use linux_boot::{BootConfig, GUEST_READY_MARKER};
 use machine_x86::boot as x86_boot;
@@ -36,8 +40,12 @@ use machine_x86::notify::QueueNotifyMode;
 use machine_x86::serial::SerialConsole;
 use machine_x86::virtio::VirtioMmioBus;
 use machine_x86::virtio_pci::{PciInterruptMode, VirtioPciBus};
-use virtio_core::VirtioDevice;
-use vmm_core::{spawn_vcpus, Hypervisor, MachineConfig, RunOutcome, Vm, VmmError};
+use virtio_core::{Quiesce, VirtioDevice};
+use vmm_core::hv::VcpuRegisters;
+use vmm_core::{
+    spawn_vcpus_with, Hypervisor, Lifecycle, MachineConfig, MachineLifecycle, RunOutcome, Vm,
+    VmmError,
+};
 
 /// Kernel panic banner: seeing it means the boot failed, no point in waiting.
 const PANIC_MARKER: &str = "Kernel panic - not syncing";
@@ -263,11 +271,125 @@ impl Capture {
     }
 }
 
+/// The machine behind the harness's lifecycle seam (ADR-0005).
+///
+/// A second, much smaller implementation of `MachineLifecycle` than the one in
+/// `entangled run` — deliberately: a seam only one caller can implement is not
+/// a seam. This one knows the harness only ever boots a direct-Linux guest, so
+/// the boot plan is a single `BootConfig`.
+struct TestMachine {
+    bus: MachineBus,
+    mem: Arc<vmm_core::GuestMem>,
+    quiesce: Arc<Quiesce>,
+    vcpus: u32,
+    boot: BootConfig,
+    mem_size: u64,
+    entry: Mutex<(u64, u64)>,
+}
+
+impl MachineLifecycle for TestMachine {
+    fn quiesce(&self) {
+        self.quiesce.pause();
+        self.bus.set_paused(true);
+        self.quiesce.wait_until_idle(Duration::from_secs(5));
+    }
+
+    fn unquiesce(&self) {
+        self.bus.set_paused(false);
+        self.quiesce.resume();
+    }
+
+    fn reset_machine(&self) -> Result<(), String> {
+        self.bus.reset_devices();
+        machine_x86::mptable::write(self.mem.as_ref(), self.vcpus).map_err(|e| e.to_string())?;
+        machine_x86::acpi::write(self.mem.as_ref(), self.vcpus).map_err(|e| e.to_string())?;
+        let loaded = linux_boot::load(self.mem.as_ref(), &self.boot, self.mem_size)
+            .map_err(|e| e.to_string())?;
+        match self.entry.lock() {
+            Ok(mut slot) => *slot = (loaded.entry, loaded.boot_params_addr),
+            Err(poisoned) => *poisoned.into_inner() = (loaded.entry, loaded.boot_params_addr),
+        }
+        Ok(())
+    }
+
+    fn reset_vcpu(&self, index: u32, vcpu: &dyn VcpuRegisters) -> Result<(), String> {
+        if index != 0 {
+            return Ok(());
+        }
+        let (entry, boot_params) = match self.entry.lock() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        x86_boot::setup_long_mode_sregs(self.mem.as_ref(), vcpu).map_err(|e| e.to_string())?;
+        x86_boot::setup_boot_regs(vcpu, entry, boot_params).map_err(|e| e.to_string())
+    }
+}
+
+/// A running VM, as a [`Driver`] sees it: the lifecycle seam plus the serial
+/// console, and a way to say "I have seen enough".
+pub struct VmHandle {
+    pub lifecycle: Arc<Lifecycle>,
+    capture: Capture,
+    done: Arc<AtomicBool>,
+}
+
+impl VmHandle {
+    /// Everything the guest has printed so far.
+    pub fn serial(&self) -> String {
+        self.capture.text()
+    }
+
+    /// How many times `needle` appears on the console. The reboot tests count
+    /// ready markers with it: "the guest came back" is exactly "the marker
+    /// appeared again".
+    pub fn count(&self, needle: &str) -> usize {
+        self.capture.text().matches(needle).count()
+    }
+
+    /// Waits until `needle` has appeared at least `times` times, or the timeout
+    /// expires. Returns how many were seen.
+    pub fn wait_for(&self, needle: &str, times: usize, timeout: Duration) -> usize {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let seen = self.count(needle);
+            if seen >= times || Instant::now() >= deadline {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Ends the boot: the supervisor stops the vCPUs and `boot_once_driven`
+    /// returns.
+    pub fn finish(&self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
+
+/// What a test does to a running VM. Runs on its own thread while the vCPUs
+/// execute, and must call [`VmHandle::finish`] when it is done (or let the
+/// deadline expire).
+pub type Driver = Box<dyn FnOnce(VmHandle) + Send>;
+
 /// Boots once and returns when the guest reached the marker, shut down on its
 /// own, or the deadline expired. All threads are joined and every device fd is
 /// released before returning, which is what makes the endurance test's fd/RSS
 /// accounting meaningful.
 pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
+    boot_once_driven(spec, None)
+}
+
+/// [`boot_once`] with a [`Driver`] pausing, resuming or resetting the VM while
+/// it runs (ADR-0005).
+///
+/// With a driver attached the VM also gains a lifecycle seam, which changes one
+/// thing about the guest as well as about the host: a guest reset (`reboot=k`
+/// pulses the keyboard controller, an ACPI reboot writes 0xCF9) becomes an
+/// in-place reboot instead of the end of the VM. That is what makes the
+/// guest-reboot test possible, and why `boot_once` deliberately does *not*
+/// attach one — every existing test depends on the test guest's reboot ending
+/// the run.
+pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOutcome, String> {
     let started = Instant::now();
     let hv = Hypervisor::open().map_err(|e| e.to_string())?;
     let machine = MachineConfig {
@@ -296,20 +418,22 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
     }
 
     let mem = Arc::new(vm.memory().clone());
+    let quiesce = Quiesce::new();
     // Exactly one transport, chosen by the spec. On pci there are no cmdline
     // clauses at all — the guest enumerates the bus — which is also what makes
     // the acceptance test meaningful: nothing tells the kernel where to look.
     let (bus, clauses) = match spec.transport {
         VirtioTransport::Mmio => {
-            let virtio = VirtioMmioBus::attach_with(vm.fd_shared(), mem, devices, spec.notify)
-                .map_err(|e| e.to_string())?;
+            let virtio =
+                VirtioMmioBus::attach_with(vm.fd_shared(), Arc::clone(&mem), devices, spec.notify)
+                    .map_err(|e| e.to_string())?;
             let clauses = virtio.cmdline_clauses();
             (MachineBus::with_virtio(serial, virtio), clauses)
         }
         VirtioTransport::Pci => {
             let pci = VirtioPciBus::attach_with_interrupts(
                 vm.fd_shared(),
-                mem,
+                Arc::clone(&mem),
                 devices,
                 spec.notify,
                 spec.pci_interrupts,
@@ -349,7 +473,61 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
     }
 
     let run_started = Instant::now();
-    let threads = spawn_vcpus(vcpus, |_| Box::new(bus.clone())).map_err(|e| e.to_string())?;
+    // A lifecycle seam only when a driver asked for one: attaching a machine is
+    // what turns a guest reset into a reboot, and every other test in this
+    // harness relies on the test guest's reboot ending the run.
+    let lifecycle = Lifecycle::new(machine.vcpu_count);
+    let done = Arc::new(AtomicBool::new(false));
+    let driver_thread = match drive {
+        Some(drive) => {
+            bus.set_quiesce(Arc::clone(&quiesce));
+            lifecycle.attach_machine(Arc::new(TestMachine {
+                bus: bus.clone(),
+                mem: Arc::clone(&mem),
+                quiesce,
+                vcpus: machine.vcpu_count,
+                boot,
+                mem_size: machine.memory_mib << 20,
+                entry: Mutex::new((loaded.entry, loaded.boot_params_addr)),
+            }));
+            let handle = VmHandle {
+                lifecycle: Arc::clone(&lifecycle),
+                capture: capture.clone(),
+                done: Arc::clone(&done),
+            };
+            // Runs while the vCPUs do: everything a driver does blocks until
+            // the vCPUs acknowledge, so it cannot live in the poll predicate.
+            Some(std::thread::spawn(move || drive(handle)))
+        }
+        None => None,
+    };
+    // The harness's own lifecycle supervisor, the same shape `entangled run`
+    // has: the thread that turns a *guest* reset request (a 0xCF9 write, the
+    // keyboard-controller pulse, a triple fault) into the reset itself. Without
+    // one, a guest that reboots itself simply waits for ever.
+    let supervisor_stop = Arc::new(AtomicBool::new(false));
+    let supervisor = driver_thread.is_some().then(|| {
+        let lifecycle = Arc::clone(&lifecycle);
+        let stop = Arc::clone(&supervisor_stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if lifecycle.take_guest_reset() {
+                    if let Err(error) = lifecycle.reset() {
+                        eprintln!("harness: guest-requested reset failed: {error}");
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    });
+    let driven = driver_thread.is_some();
+    let threads = spawn_vcpus_with(
+        vcpus,
+        |_| Box::new(bus.clone()),
+        driven.then(|| Arc::clone(&lifecycle)),
+    )
+    .map_err(|e| e.to_string())?;
 
     // `join_or_stop` returns as soon as every vCPU has ended on its own — the
     // test initramfs reboots itself after the marker, which reaches the host as
@@ -362,7 +540,10 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
             let text = capture.text();
             if time_to_ready.get().is_none() && text.contains(GUEST_READY_MARKER) {
                 time_to_ready.set(Some(run_started.elapsed()));
-                if spec.await_marker.is_none() && !spec.await_exit {
+                // A driven boot is never ended by the marker: the driver is
+                // about to pause, resume or reboot the guest, and every one of
+                // those happens *after* it becomes ready (ADR-0005).
+                if spec.await_marker.is_none() && !spec.await_exit && !driven {
                     return true;
                 }
             }
@@ -381,12 +562,23 @@ pub fn boot_once(spec: &BootSpec) -> Result<BootOutcome, String> {
                 panicked.set(true);
                 return true;
             }
-            run_started.elapsed() >= spec.deadline
+            done.load(Ordering::Acquire) || run_started.elapsed() >= spec.deadline
         },
         Duration::from_millis(2),
     );
     let time_to_ready = time_to_ready.get();
     let panicked = panicked.get();
+    supervisor_stop.store(true, Ordering::Release);
+    if let Some(handle) = supervisor {
+        let _ = handle.join();
+    }
+    if let Some(handle) = driver_thread {
+        // The vCPUs have stopped, so a driver still blocked inside a lifecycle
+        // call has been released by `stop()` and this cannot hang.
+        if handle.join().is_err() {
+            return Err("the lifecycle driver panicked".into());
+        }
+    }
 
     let mut serial = capture.text();
     if time_to_ready.is_none() {

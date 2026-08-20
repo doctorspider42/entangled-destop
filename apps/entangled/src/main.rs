@@ -101,6 +101,14 @@ enum Command {
         /// entangled-screenshot-<name>.png in the working directory.
         #[arg(long, requires = "screenshot_after")]
         screenshot: Option<PathBuf>,
+        /// Read lifecycle commands from stdin, one per line: `pause`,
+        /// `resume`, `reset`, `type <text>`, `status` (ADR-0005).
+        ///
+        /// For a program driving this VM — `entangled-manager` uses it for the
+        /// Pause and Restart buttons. The window's Ctrl+Alt+P and Ctrl+Alt+R
+        /// do the same thing for a person, and need no flag.
+        #[arg(long)]
+        control_stdin: bool,
     },
     /// Check host prerequisites (KVM, capabilities, graphics backend).
     Doctor,
@@ -293,6 +301,7 @@ fn run(cli: Cli) -> Result<(), String> {
             cdrom,
             screenshot_after,
             screenshot,
+            control_stdin,
         } => {
             let text = std::fs::read_to_string(&config)
                 .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
@@ -311,11 +320,11 @@ fn run(cli: Cli) -> Result<(), String> {
                         PathBuf::from(format!("entangled-screenshot-{}.png", cfg.name))
                     }),
                 });
-                run_vm::run(cfg, headless, shot)
+                run_vm::run_with(cfg, headless, None, shot, control_stdin).map(|_| ())
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {
-                let _ = (headless, screenshot_after, screenshot);
+                let _ = (headless, screenshot_after, screenshot, control_stdin);
                 Err(format!(
                     "config '{}' is valid, but running VMs requires a Linux host with KVM \
                      or a Windows host with the Windows Hypervisor Platform",

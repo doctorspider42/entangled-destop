@@ -128,6 +128,25 @@ impl SerialConsole {
         (SERIAL_PORT_BASE..=SERIAL_PORT_LAST).contains(&port)
     }
 
+    /// Machine reset (ADR-0005): the 16550 back to its power-on register file,
+    /// with nothing queued towards the guest.
+    ///
+    /// The *host* halves are deliberately kept: the output sink is where the
+    /// console is being watched, and the interrupt line is machine wiring, not
+    /// device state. Dropping the receive queue is the point — bytes a person
+    /// typed at the old boot's login prompt must not arrive in the firmware of
+    /// the new one.
+    pub fn reset(&mut self) {
+        self.rx.clear();
+        self.ier = 0;
+        self.lcr = 0;
+        self.mcr = 0x08;
+        self.scr = 0;
+        self.dll = 0x0c;
+        self.dlh = 0;
+        self.thre_pending = false;
+    }
+
     /// Queues guest-bound input (host keyboard → guest console).
     pub fn push_input(&mut self, data: &[u8]) {
         for &b in data {

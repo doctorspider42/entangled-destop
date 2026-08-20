@@ -365,6 +365,9 @@ impl App {
             WindowAction::Quit => {
                 tracing::info!("Ctrl+Alt+Q: quit requested; the VM supervisor decides");
             }
+            WindowAction::Lifecycle => {
+                tracing::debug!("lifecycle shortcut queued for the VM supervisor");
+            }
             WindowAction::ToggleFullscreen => self.toggle_fullscreen(),
             WindowAction::ToggleScaleMode => self.toggle_scale_mode(),
         }

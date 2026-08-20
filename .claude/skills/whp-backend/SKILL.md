@@ -653,3 +653,44 @@ Still open after phase 4:
   new machine devices under `machine_x86::`, never changes to `Vcpu`/`Vm`
   signatures. `WhpPartition::new` keeps the phase-1 behaviour so phase-1 tests
   keep passing unchanged.
+
+## Pause and reset on WHP (ADR-0005)
+
+**Resetting a virtual processor is `WHvDeleteVirtualProcessor` +
+`WHvCreateVirtualProcessor`.** There is no reset call, but there is something
+better: a VP that `WHvCreateVirtualProcessor` just made *is* in the
+architectural reset state, including the parts no public register exposes — the
+local APIC, and an application processor's wait-for-startup suspension. That
+last one is the whole reason the KVM approach (write the state back by hand)
+cannot be used here: this skill's SMP section records that an AP must be left
+exactly as WHP created it or the guest's INIT/SIPI never makes it runnable, and
+re-creating it is the only way back to that state after a boot has used it.
+Safe only at a lifecycle checkpoint, where nothing is inside
+`WHvRunVirtualProcessor` for that index, and it runs on the owning thread.
+Measured: **7-8 ms** for a full machine reset, against KVM's 62-66 ms.
+
+**`reboot=k` now works, and this is the host where that matters most.** Phase 4
+recorded that a triple fault is absorbed by WHP with local APIC emulation on and
+the vCPU simply parks, so guest-initiated shutdown had to be the ACPI S5 path.
+That is still true of the *triple fault* — but a guest never starts there. It
+walks a ladder (ACPI reset register, then the keyboard controller, then 0xCF9,
+then the triple fault), and `machine_x86::reset` implements every earlier rung.
+So `reboot=k` pulses port 0x64, the machine latches it, and the VM reboots. The
+profiles and tests that avoid `reboot=k` for the old reason can stop.
+
+**No pending-exit flush is needed here.** This backend completes every exit
+before the run call returns — it advances RIP itself, the hypervisor does not —
+so the top of the run loop is already a clean stop point. The KVM loop's
+`immediate_exit` dance has no WHP equivalent because it has no WHP problem.
+
+**A canceller *is* the kick.** `VcpuCanceller` implements
+`vmm_core::lifecycle::VcpuKick` directly: it already wakes a halted vCPU through
+the partition's halt gate as well as cancelling a run, which is exactly what a
+barrier needs from both states.
+
+Acceptance: `cargo test -p vmm-core --test whp_lifecycle` — pause (95 µs to
+acknowledge), resume, host reset twice, and a guest-initiated reboot. And
+end-to-end, on this host: `cargo test -p entangled --test guest_reboot --
+--ignored` reboots an installed Ubuntu twice through its own firmware in 414 s,
+each one arriving as `0xcf9 cold reset` and coming back through
+`BdsDxe: starting Boot0006 "Ubuntu"`.

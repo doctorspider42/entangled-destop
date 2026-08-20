@@ -218,6 +218,15 @@ pub struct ConfigSpace {
     /// One entry per *distinct* register, so the list is bounded by
     /// [`reg::DWORDS`] and, in practice, holds one: the MSI-X message control.
     mirrors: Vec<(u8, Arc<AtomicU32>)>,
+    /// The register file as the host finished building it, taken by
+    /// [`Self::seal`] and restored by [`Self::reset`] (ADR-0005).
+    ///
+    /// A snapshot rather than a field-by-field reset because *every* guest-
+    /// writable register has to go back: the command register (or the rebooted
+    /// firmware finds memory decoding already on for a BAR it has not placed),
+    /// the BAR addresses themselves, the MSI-X message control, the cache-line
+    /// and latency scratch. Enumerating them by hand is how one gets forgotten.
+    power_on: [u32; reg::DWORDS],
 }
 
 impl ConfigSpace {
@@ -231,6 +240,7 @@ impl ConfigSpace {
             last_capability: None,
             intx_enabled: Arc::new(AtomicBool::new(true)),
             mirrors: Vec::new(),
+            power_on: [0; reg::DWORDS],
         };
         space.set(reg::ID, u32::from(vendor_id) | (u32::from(device_id) << 16));
         // The class code occupies bits 31:8 and the revision bits 7:0.
@@ -437,6 +447,31 @@ impl ConfigSpace {
         match self.mirrors.iter_mut().find(|(r, _)| *r == register) {
             Some(slot) => slot.1 = handle,
             None => self.mirrors.push((register, handle)),
+        }
+    }
+
+    // ---------------------------------------------------------- power-on
+
+    /// Records the current register file as this function's power-on state
+    /// (ADR-0005). Called by [`PciRoot::attach`] once the host has finished
+    /// building the config space, so nothing has to remember to.
+    pub fn seal(&mut self) {
+        self.power_on = self.regs;
+    }
+
+    /// Machine reset: the register file back to what [`Self::seal`] captured,
+    /// and everything published from it re-published.
+    ///
+    /// The write *mask* and the capability list are untouched: they are the
+    /// function's shape, decided by the host, not state a guest can move.
+    pub fn reset(&mut self) {
+        self.regs = self.power_on;
+        self.intx_enabled.store(
+            self.command() & command::INTX_DISABLE == 0,
+            Ordering::Release,
+        );
+        for (register, handle) in &self.mirrors {
+            handle.store(self.regs[Self::index(*register)], Ordering::Release);
         }
     }
 
@@ -654,13 +689,29 @@ impl Default for PciRoot {
 impl PciRoot {
     /// A bus with only the host bridge on it.
     pub fn new() -> Self {
+        let mut config = ConfigSpace::host_bridge();
+        config.seal();
         Self {
             address: 0,
             functions: vec![PciFunction {
                 device: HOST_BRIDGE_DEVICE,
-                config: ConfigSpace::host_bridge(),
+                config,
                 owner: None,
             }],
+        }
+    }
+
+    /// Machine reset (ADR-0005): the latched configuration address and every
+    /// function's configuration space back to power-on.
+    ///
+    /// Only the bus's own state — the transports behind the functions are reset
+    /// by whoever owns them (`VirtioPciBus::reset`), because a config space
+    /// knows nothing about what sits behind it and this module keeps it that
+    /// way.
+    pub fn reset(&mut self) {
+        self.address = 0;
+        for function in &mut self.functions {
+            function.config.reset();
         }
     }
 
@@ -671,10 +722,13 @@ impl PciRoot {
 
     /// Adds `config` as the next device number, tagged with `owner`. Returns the
     /// device number it landed on.
-    pub fn attach(&mut self, config: ConfigSpace, owner: usize) -> Result<u8, PciError> {
+    pub fn attach(&mut self, mut config: ConfigSpace, owner: usize) -> Result<u8, PciError> {
         if self.functions.len() >= MAX_PCI_DEVICES {
             return Err(PciError::BusFull);
         }
+        // Whatever the host built is this function's power-on state; a reset
+        // puts it back (ADR-0005).
+        config.seal();
         // Device numbers are dense from the host bridge upwards, and
         // `MAX_PCI_DEVICES` is far below the 32 a bus allows.
         let device = u8::try_from(self.functions.len()).unwrap_or(u8::MAX);

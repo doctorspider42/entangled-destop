@@ -239,6 +239,24 @@ pub trait ExitHandler: Send {
     fn shutdown_requested(&self) -> bool {
         false
     }
+
+    /// True once a device has latched a guest **reset** request — the 0xCF9
+    /// reset control register, the keyboard controller's `0xFE` pulse, or the
+    /// ACPI reset register the FADT points at
+    /// (`machine_x86::reset::ResetControl`).
+    ///
+    /// The sibling of [`Self::shutdown_requested`] and read in the same place,
+    /// but with a different ending: with a
+    /// [`Lifecycle`](crate::lifecycle::Lifecycle) that can restart the machine,
+    /// the run loop turns this into an in-place reboot; without one it is an
+    /// ending, because the guest has already jumped into its own dead loop and
+    /// will never produce another exit.
+    ///
+    /// Same contract as the shutdown latch: non-blocking, latching, shared by
+    /// every vCPU's clone of the handler.
+    fn reset_requested(&self) -> bool {
+        false
+    }
 }
 
 /// Register-level access to one virtual CPU, implemented per hypervisor.

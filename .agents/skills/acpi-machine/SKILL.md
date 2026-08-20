@@ -271,3 +271,28 @@ ACPI closes ADR-0003's phase-2 table gap, not the whole path to an installer:
   tidier answer.
 * **SMBIOS** is still missing (`CLOUDHV_SMBIOS_ADDRESS`, `0xf0000`), which is a
   separate table set with the same shape of problem.
+
+## The reset register (ADR-0005)
+
+`FADT.RESET_REG_SUP` is **set**, with `RESET_REG` = I/O 0xCF9 and `RESET_VALUE`
+= 0x0E — the same pair QEMU's q35 publishes, and the register
+`machine_x86::reset` implements.
+
+It matters more than it looks. Linux's reboot ladder starts at `BOOT_ACPI`:
+`acpi_reboot()` writes `RESET_VALUE` to `RESET_REG` if the flag is set, and does
+nothing at all if it is not. With the flag clear (as it was before), every guest
+reboot silently failed its first attempt and walked down to the keyboard
+controller, 0xCF9 and finally a triple fault — which on WHP is absorbed by the
+hypervisor and never reaches the host. Naming the register is what makes a
+reboot land on the first try, on both hosts.
+
+Nothing else in the FADT changed, and EDK2 does not use the ACPI reset path
+(`ResetSystemLib` writes 0xCF9 directly), so the two agree by construction —
+they are the same port.
+
+The **ACPI PM timer is pausable** now: `AcpiPmTimer` freezes on pause and its
+origin moves forward by the length of the pause, so a firmware spinning in
+`MicroSecondDelay()` when the VM was frozen does not come back to find its delay
+already over by minutes. On reset it starts from zero, and the S5 shutdown latch
+is cleared — a latch left set would end the VM on the next exit after a reboot,
+which looks exactly like a guest that powered off during boot.

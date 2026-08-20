@@ -103,9 +103,24 @@ const ACPI_PM_TIMER_MASK: u32 = 0x00ff_ffff;
 
 /// A free-running ACPI power-management timer, derived from host monotonic
 /// time. Read-only: the guest cannot set it, only observe it advance.
+///
+/// "Free-running" with two exceptions, both of them lifecycle operations
+/// (ADR-0005). While the VM is **paused** the counter stops, because a firmware
+/// spinning in `MicroSecondDelay()` when the pause landed must not come back to
+/// find its delay already over by minutes. On **reset** it starts from zero,
+/// because the machine did.
 #[derive(Debug)]
 pub struct AcpiPmTimer {
+    /// Guarded rather than plain: `origin` moves forward by the length of every
+    /// pause, and `frozen` holds the reading the guest sees meanwhile.
+    inner: Mutex<TimerState>,
+}
+
+#[derive(Debug)]
+struct TimerState {
     origin: Instant,
+    /// `Some(at)` while paused: when the pause began.
+    paused_at: Option<Instant>,
 }
 
 impl Default for AcpiPmTimer {
@@ -117,18 +132,56 @@ impl Default for AcpiPmTimer {
 impl AcpiPmTimer {
     pub fn new() -> Self {
         Self {
-            origin: Instant::now(),
+            inner: Mutex::new(TimerState {
+                origin: Instant::now(),
+                paused_at: None,
+            }),
         }
+    }
+
+    fn state(&self) -> MutexGuard<'_, TimerState> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Ticks since the VM started, wrapped to the counter width.
     pub fn ticks(&self) -> u32 {
-        let micros = self.origin.elapsed().as_micros();
+        let state = self.state();
+        let elapsed = match state.paused_at {
+            Some(at) => at.saturating_duration_since(state.origin),
+            None => state.origin.elapsed(),
+        };
         // 3.579545 ticks per microsecond, in integer arithmetic. u128 keeps the
         // product exact for any plausible uptime; the mask does the wrapping,
         // which is what a real 24-bit counter does too.
-        let ticks = micros.saturating_mul(u128::from(ACPI_PM_TIMER_HZ)) / 1_000_000;
+        let ticks = elapsed
+            .as_micros()
+            .saturating_mul(u128::from(ACPI_PM_TIMER_HZ))
+            / 1_000_000;
         (ticks as u32) & ACPI_PM_TIMER_MASK
+    }
+
+    /// Freezes the counter (ADR-0005). Idempotent.
+    pub fn pause(&self) {
+        let mut state = self.state();
+        if state.paused_at.is_none() {
+            state.paused_at = Some(Instant::now());
+        }
+    }
+
+    /// Restarts the counter where it stopped, by moving the origin forward by
+    /// however long the pause lasted. Idempotent.
+    pub fn resume(&self) {
+        let mut state = self.state();
+        if let Some(at) = state.paused_at.take() {
+            state.origin += at.elapsed();
+        }
+    }
+
+    /// Machine reset: the counter starts from zero, running.
+    pub fn reset(&self) {
+        let mut state = self.state();
+        state.origin = Instant::now();
+        state.paused_at = None;
     }
 }
 
@@ -193,6 +246,28 @@ impl AcpiPmBlock {
     /// strictly better than propagating a panic into a guest exit path.
     fn regs(&self) -> MutexGuard<'_, PmRegisters> {
         self.regs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Machine reset (ADR-0005): every register back to zero, the PM timer
+    /// restarted from zero, and — the one that matters — the shutdown latch
+    /// cleared.
+    ///
+    /// A latch left set would end the VM on the *next* vCPU exit after the
+    /// reboot, which looks exactly like a guest that powered off during boot.
+    pub fn reset(&self) {
+        self.shutdown.store(false, Ordering::Release);
+        self.timer.reset();
+        *self.regs() = PmRegisters::default();
+    }
+
+    /// Freezes the PM timer while the VM is paused (ADR-0005).
+    pub fn pause(&self) {
+        self.timer.pause();
+    }
+
+    /// Restarts it where it stopped.
+    pub fn resume(&self) {
+        self.timer.resume();
     }
 
     /// Guest read. `data` may be any width; bytes past the end of the register

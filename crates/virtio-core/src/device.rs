@@ -7,6 +7,7 @@ use virtio_queue::Queue;
 
 use crate::chain::ChainError;
 use crate::interrupt::{Interrupt, InterruptError};
+use crate::quiesce::Quiesce;
 use crate::GuestMem;
 
 /// VirtIO device ids used by the MVP (VirtIO spec 1.2, section 5).
@@ -47,6 +48,13 @@ pub struct DeviceResources {
 
     /// Used-buffer and config-change notifications.
     pub interrupt: Arc<dyn Interrupt>,
+
+    /// The VM's pause gate (ADR-0005). A device that runs a worker thread of
+    /// its own must call [`Quiesce::wait_while_paused`] before it touches guest
+    /// memory from that thread, or a paused VM is not actually stopped. A device
+    /// that only works inside `notify()` needs nothing: it is already on a
+    /// parked vCPU thread, or behind a queue worker that took the gate for it.
+    pub quiesce: Arc<Quiesce>,
 }
 
 impl std::fmt::Debug for DeviceResources {

@@ -197,19 +197,27 @@ pub fn install_spec(cli: &Path, vm_dir: &Path, cwd: PathBuf, machine: &NewMachin
         args,
         cwd,
         log_path: vm_dir.join(format!("{}-install.log", machine.name)),
+        control: false,
     }
 }
 
-/// `entangled run <profile>` (GUI-1603). The VM opens its own window; the
-/// manager only tracks the child.
+/// `entangled run --control-stdin <profile>` (GUI-1603). The VM opens its own
+/// window; the manager tracks the child and keeps its stdin as the lifecycle
+/// control channel, which is what the Pause and Restart buttons write to
+/// (ADR-0005).
 pub fn run_spec(cli: &Path, vm: &VmEntry, cwd: PathBuf, vm_dir: &Path) -> TaskSpec {
     TaskSpec {
         kind: TaskKind::Run,
         vm: vm.name.clone(),
         program: cli.to_path_buf(),
-        args: vec!["run".to_string(), vm.profile_path.display().to_string()],
+        args: vec![
+            "run".to_string(),
+            "--control-stdin".to_string(),
+            vm.profile_path.display().to_string(),
+        ],
         cwd,
         log_path: vm_dir.join(format!("{}-run.log", vm.name)),
+        control: true,
     }
 }
 
@@ -431,7 +439,14 @@ mod tests {
         assert_eq!(spec.kind, TaskKind::Run);
         assert_eq!(
             spec.command_line(),
-            "/usr/bin/entangled run /vms/debian-demo.toml"
+            "/usr/bin/entangled run --control-stdin /vms/debian-demo.toml"
+        );
+        // The flag and the pipe are one decision: asking the CLI to read
+        // lifecycle commands is useless unless the supervisor keeps a stdin to
+        // write them to, and vice versa (ADR-0005).
+        assert!(
+            spec.control,
+            "a run task must keep its child's stdin, or Pause and Restart have nowhere to go"
         );
         assert_eq!(spec.cwd, Path::new("/srv/entangled"));
         assert_eq!(spec.log_path, Path::new("/vms/debian-demo-run.log"));

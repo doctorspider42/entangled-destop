@@ -335,6 +335,14 @@ const FADT_PWR_BUTTON: u32 = 1 << 4;
 const FADT_SLP_BUTTON: u32 = 1 << 5;
 /// "RTC wake status is not in fixed register space" — our RTC has no alarm.
 const FADT_FIX_RTC: u32 = 1 << 6;
+/// `RESET_REG_SUP`: the `RESET_REG`/`RESET_VALUE` pair below is real.
+///
+/// Set since ADR-0005. Without it Linux's `acpi_reboot()` is a no-op and the
+/// guest walks the rest of its reboot ladder (keyboard controller, then 0xCF9,
+/// then a triple fault) before anything reaches the host — which on WHP means
+/// the last rung is absorbed by the hypervisor and the reboot never lands at
+/// all. The register named is the one `crate::reset` implements.
+const FADT_RESET_REG_SUP: u32 = 1 << 10;
 
 /// FADT `IAPC_BOOT_ARCH` (ACPI 6.5 table 5.11).
 ///
@@ -392,11 +400,17 @@ fn fadt(facs_addr: u64, dsdt_addr: u64) -> Vec<u8> {
             | FADT_P_LVL2_UP
             | FADT_PWR_BUTTON
             | FADT_SLP_BUTTON
-            | FADT_FIX_RTC)
+            | FADT_FIX_RTC
+            | FADT_RESET_REG_SUP)
             .to_le_bytes(),
     );
-    // RESET_REG (116) and RESET_VALUE (128) stay zero: FADT_RESET_REG_SUP is
-    // clear, so the guest keeps using the reboot path it uses today.
+    // RESET_REG (116) and RESET_VALUE (128): the 0xCF9 reset control register
+    // (`crate::reset`), written with a cold-reset value. This is the *first*
+    // rung of Linux's reboot ladder (`acpi_reboot()`), which is why publishing
+    // it makes a guest reboot prompt instead of a sequence of failed attempts
+    // (ADR-0005).
+    put(116, &gas_io(crate::reset::PORT_RESET_CONTROL, 8, 1));
+    put(128, &[crate::reset::ACPI_RESET_VALUE]);
     put(131, &[0]); // FADT Minor Version: 6.0
     put(132, &facs_addr.to_le_bytes()); // X_FIRMWARE_CTRL
     put(140, &dsdt_addr.to_le_bytes()); // X_DSDT

@@ -157,6 +157,28 @@ impl UserspaceIrqChip {
         Ok(self.ioapic.line(pin)?)
     }
 
+    /// Machine reset (ADR-0005): all three chips back to power-on.
+    ///
+    /// The order matters in one direction only — the IOAPIC is masked first, so
+    /// that a PIT edge racing the reset has nowhere to go. The timer thread
+    /// keeps running throughout: it is host wiring, and stopping it would mean
+    /// the next boot's `check_timer()` had no 8254 to find.
+    pub fn reset(&self) {
+        self.ioapic.reset();
+        self.pit.reset();
+        match self.pic.lock() {
+            Ok(mut pic) => pic.reset(),
+            Err(_) => tracing::error!("8259 lock is poisoned; the PIC keeps its old state"),
+        }
+    }
+
+    /// Stops or restarts interrupt delivery from the machine's own timer while
+    /// the VM is paused (ADR-0005). Devices need no equivalent: nothing else
+    /// here raises a line on its own.
+    pub fn set_paused(&self, paused: bool) {
+        self.pit.set_paused(paused);
+    }
+
     /// True when `port` belongs to one of the chips.
     pub fn claims_port(port: u16) -> bool {
         Pic8259::contains(port) || Pit::contains(port)

@@ -208,6 +208,16 @@ impl Pic8259 {
         ) || matches!(port, ELCR_MASTER | ELCR_SLAVE)
     }
 
+    /// Machine reset (ADR-0005): both chips back to the un-initialised state a
+    /// power-on 8259 pair is in, half-way through no ICW sequence.
+    ///
+    /// Cheap to get wrong in an invisible way: a guest's `init_8259A()` writes
+    /// ICW1..ICW4 in order, and a chip that thinks it is already three words
+    /// into a sequence interprets the first of those as data.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     /// Whether any line is asserted on either chip. Always false — see the
     /// module docs. Exists so a caller that wants to assert "the PIC never has
     /// anything to deliver" can, instead of taking it on trust.

@@ -257,6 +257,35 @@ fn vm_card(
                             if ui::ghost_button(ui, "Stop", true, theme::WARN).clicked() {
                                 actions.push(Action::Stop(vm.name.clone()));
                             }
+                            // Pause and Restart (ADR-0005). Only for a VM this
+                            // manager started: the control channel is a pipe to
+                            // a child, so a VM launched from a terminal has
+                            // none and the buttons say so rather than lying.
+                            let controllable = app.has_control(&vm.name);
+                            let paused = app.is_paused(&vm.name);
+                            let label = if paused { "Resume" } else { "Pause" };
+                            if ui::ghost_button(ui, label, controllable, theme::VIOLET)
+                                .on_hover_text(if !controllable {
+                                    "This VM was not started from here"
+                                } else if paused {
+                                    "Let the machine continue exactly where it stopped"
+                                } else {
+                                    "Freeze the machine; nothing in it makes progress"
+                                })
+                                .clicked()
+                            {
+                                actions.push(Action::TogglePause(vm.name.clone()));
+                            }
+                            if ui::ghost_button(ui, "Restart", controllable, theme::VIOLET)
+                                .on_hover_text(if controllable {
+                                    "Reboot the machine in place, as the guest's own Restart does"
+                                } else {
+                                    "This VM was not started from here"
+                                })
+                                .clicked()
+                            {
+                                actions.push(Action::Reset(vm.name.clone()));
+                            }
                         }
                         Status::Stopping => {
                             if ui::ghost_button(ui, "Kill", true, theme::ERR)

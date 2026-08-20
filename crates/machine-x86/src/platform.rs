@@ -76,6 +76,13 @@ impl PciConfigSpace {
         (PCI_CONFIG_ADDRESS..PCI_CONFIG_ADDRESS + 8).contains(&port)
     }
 
+    /// Machine reset (ADR-0005): the only mutable state here is the latched
+    /// `CONFIG_ADDRESS`, and a half-written one must not be inherited by the
+    /// next boot's first configuration read.
+    pub fn reset(&mut self) {
+        self.address = 0;
+    }
+
     fn decode(&self) -> Option<ConfigTarget> {
         // Bit 31 enables the mechanism; bits 1:0 of the register field are
         // always zero (accesses are dword-aligned).
@@ -180,6 +187,13 @@ impl FirmwarePlatform {
     /// True when `port` belongs to one of these devices.
     pub fn contains(port: u16) -> bool {
         PciConfigSpace::contains(port) || crate::rtc::Rtc::contains(port)
+    }
+
+    /// Machine reset (ADR-0005): both devices back to power-on, which is what
+    /// the firmware about to be re-entered expects to find.
+    pub fn reset(&mut self) {
+        self.pci.reset();
+        self.rtc.reset();
     }
 
     /// Returns true when the read was handled.

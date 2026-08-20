@@ -195,3 +195,26 @@ that shaped the code, all verified against WSLg's protocol stream
   the RAIL window covers only the content; the header lives above it on
   screen. Coordinate math in host-side tooling must not assume the rect
   includes the titlebar.
+
+## Lifecycle shortcuts (ADR-0005)
+
+Two more reserved `Ctrl+Alt` chords, alongside `G` (grab), `Q` (shut down) and
+`O` (1:1):
+
+| Shortcut | `ControlEvent` | Effect |
+|---|---|---|
+| `Ctrl+Alt+P` | `PauseToggleRequested` | freeze the VM, or let a frozen one continue |
+| `Ctrl+Alt+R` | `ResetRequested` | reboot the VM in place |
+
+Both follow the `Ctrl+Alt+Q` pattern exactly: `release_all()` first, so a guest
+that survives the request is not left holding the modifiers, then a control
+event for the supervisor. Neither is a *window* state, so the window's
+`WindowAction` for them is the inert `Lifecycle` — pausing is the VM
+supervisor's business and the window only reports the request.
+
+The one thing the display side has to do about a paused VM: **stop pushing
+input**. `run_vm`'s pump drains the input queue and drops it while
+`lifecycle.is_paused()`, because pushing an event writes the guest's event ring,
+which is precisely what a pause forbids. Dropping rather than queueing is
+deliberate — the window is not grabbed while frozen, and a burst delivered on
+resume would be worse than nothing.

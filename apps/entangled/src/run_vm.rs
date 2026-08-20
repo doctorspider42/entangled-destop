@@ -17,7 +17,18 @@
 //! | Queue kicks | ioeventfd + worker threads | inline on the vCPU thread |
 //! | AP register setup | every vCPU (KVM's INIT discards it) | **BSP only** — an AP must stay in the reset state WHP created it in |
 //! | Stop signal | SIGINT/SIGTERM via `sigaction` | Ctrl+C via `SetConsoleCtrlHandler` |
+//! | vCPU reset | architectural state written back by hand | the VP deleted and re-created |
+//! | Guest reboot arrives as | a reset register write, or a triple fault | a reset register write only — WHP absorbs the fault |
 //! | VMs per process | any | one — WHP maps guest memory for one partition per process |
+//!
+//! # Lifecycle (ADR-0005)
+//!
+//! A VM here can be frozen and rebooted in place. Everything that decides *when*
+//! is shared: [`LifecycleSupervisor`] is the one thread that turns a request —
+//! from the guest, the window's `Ctrl+Alt+P`/`Ctrl+Alt+R`, or the
+//! `--control-stdin` channel — into the operation, and [`host_api::VmMachine`]
+//! is what a pause freezes and a reset puts back. Only the two rows above
+//! differ per host.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,7 +39,7 @@ use control_api::{NetworkBackend, VmConfig};
 use machine_x86::bus::MachineBus;
 use machine_x86::pflash::Pflash;
 use virtio_core::VirtioDevice;
-use vmm_core::{MachineConfig, RunOutcome, VmState};
+use vmm_core::{Lifecycle, MachineConfig, RunOutcome, VmState};
 
 /// Set by the SIGINT/SIGTERM (Linux) or console-control (Windows) handler; the
 /// run loop polls it (MVP-1204).
@@ -104,7 +115,8 @@ fn open_presentation(cfg: &VmConfig, headless: bool) -> Result<Presentation, Str
                 // the title bar repeats the important half of this.
                 tracing::info!(
                     "window controls: click the image to grab input, Ctrl+Alt releases it, \
-                     Ctrl+Alt+G toggles, F11 fullscreen, Ctrl+Alt+O 1:1, Ctrl+Alt+Q shuts down"
+                     Ctrl+Alt+G toggles, F11 fullscreen, Ctrl+Alt+O 1:1, \
+                     Ctrl+Alt+P pauses, Ctrl+Alt+R reboots, Ctrl+Alt+Q shuts down"
                 );
                 return Ok(Presentation::Windowed(Box::new(
                     host.with_title(format!("Entangled Desktop — {}", cfg.name)),
@@ -345,6 +357,280 @@ fn build_devices(
     })
 }
 
+/// Lifecycle requests waiting to be served (ADR-0005).
+///
+/// Flags rather than a queue: pausing twice in a row is pausing once, and
+/// resetting twice in a row is resetting once. Whoever notices the request —
+/// the window's input pump, the control channel — sets a flag and carries on;
+/// the supervisor thread is the only one that blocks.
+#[derive(Debug, Default)]
+struct LifecycleRequests {
+    /// The window's `Ctrl+Alt+P`: freeze, or continue if already frozen.
+    pause_toggle: AtomicBool,
+    /// The control channel's explicit `pause` / `resume`, which a program
+    /// driving a VM wants instead of a toggle it would have to track.
+    pause: AtomicBool,
+    resume: AtomicBool,
+    reset: AtomicBool,
+}
+
+/// Records a window control event: shutdown requests are acted on immediately
+/// (a store to the same flag SIGINT sets), lifecycle requests are queued.
+fn note_control_event(event: display::ControlEvent, requests: &LifecycleRequests) {
+    match event {
+        display::ControlEvent::QuitRequested | display::ControlEvent::WindowCloseRequested => {
+            tracing::info!(?event, "shutdown requested from the window");
+            SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+        }
+        display::ControlEvent::GrabToggled(grabbed) => {
+            tracing::info!(grabbed, "input grab toggled");
+        }
+        display::ControlEvent::PauseToggleRequested => {
+            requests.pause_toggle.store(true, Ordering::Relaxed);
+        }
+        display::ControlEvent::ResetRequested => {
+            requests.reset.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Prefix every line the control channel prints, so a program driving a VM can
+/// tell its own answers apart from the guest's console — they share stdout,
+/// because the guest console *is* what `entangled run` prints.
+pub const CONTROL_PREFIX: &str = "entangled-control:";
+
+/// Reads lifecycle commands from stdin, one per line (ADR-0005).
+///
+/// The VM's control surface for a program rather than a person: the window's
+/// key bindings need someone at a keyboard, and `entangled-manager` drives the
+/// CLI as a child process whose stdin it already owns. A pipe rather than a
+/// socket because it is the one channel that exists identically on both hosts,
+/// needs no path, no permissions and no cleanup, and dies with the process it
+/// controls — which for "pause this VM" is exactly the lifetime wanted.
+///
+/// | Command | Effect |
+/// |---|---|
+/// | `pause` | freeze the VM (idempotent) |
+/// | `resume` | let it continue (idempotent) |
+/// | `reset` | reboot it in place |
+/// | `type <text>` | type `<text>` and Enter on the guest's serial console |
+/// | `status` | print the current [`RunState`](vmm_core::RunState) |
+///
+/// `type` is the same host-to-guest path the unattended installer uses to drive
+/// GRUB (`MachineBus::push_serial_input`), exposed rather than kept private:
+/// a headless VM whose console can only be watched and never answered is half a
+/// console. It is also what lets the reboot acceptance log into a guest and ask
+/// it to restart, which is the thing being tested.
+///
+/// Unknown commands are reported and ignored — never fatal. The thread is
+/// detached: it ends when stdin closes, which for a child process is when its
+/// parent goes away.
+fn spawn_control_channel(
+    bus: MachineBus,
+    requests: Arc<LifecycleRequests>,
+    lifecycle: Arc<Lifecycle>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("control".into())
+        .spawn(move || {
+            use std::io::BufRead as _;
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else { break };
+                let line = line.trim();
+                let (command, argument) = match line.split_once(char::is_whitespace) {
+                    Some((command, rest)) => (command, rest),
+                    None => (line, ""),
+                };
+                match command {
+                    "" => {}
+                    "pause" => requests.pause.store(true, Ordering::Relaxed),
+                    "resume" => requests.resume.store(true, Ordering::Relaxed),
+                    "reset" => requests.reset.store(true, Ordering::Relaxed),
+                    "type" => {
+                        // Carriage return, not newline: the guest's terminal
+                        // discipline is what turns it into one, and a bare `\n`
+                        // is not what a serial keyboard sends.
+                        let mut bytes = argument.as_bytes().to_vec();
+                        bytes.push(b'\r');
+                        bus.push_serial_input(&bytes);
+                    }
+                    "status" => {
+                        println!("{CONTROL_PREFIX} state={:?}", lifecycle.state());
+                    }
+                    other => {
+                        println!("{CONTROL_PREFIX} unknown command {other:?}");
+                        continue;
+                    }
+                }
+                if !command.is_empty() {
+                    println!("{CONTROL_PREFIX} ok {command}");
+                }
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            tracing::debug!("the control channel closed");
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "cannot start the control channel; --control-stdin is inert");
+    }
+}
+
+/// How long a pause waits for the host's device workers to finish the work
+/// they already had in hand (ADR-0005).
+///
+/// A worker that is stuck — a host disk that has stopped answering — must not
+/// be able to wedge a pause, so this is bounded and the pause proceeds with a
+/// warning. Generous next to the milliseconds a queue drain takes.
+const QUIESCE_SETTLE: Duration = Duration::from_secs(5);
+
+/// How often the supervisor looks for a lifecycle request.
+///
+/// The latency a person notices between pressing Ctrl+Alt+P and the VM
+/// freezing, and — more importantly — the delay between a guest writing its
+/// reset register and the host restarting it. Small enough that a reboot looks
+/// instant, large enough that an idle VM costs nothing.
+const LIFECYCLE_POLL: Duration = Duration::from_millis(20);
+
+/// The thread that serves lifecycle requests, and the only place `pause`,
+/// `resume` and `reset` are called from (ADR-0005).
+struct LifecycleSupervisor {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LifecycleSupervisor {
+    fn start(
+        lifecycle: Arc<Lifecycle>,
+        requests: Arc<LifecycleRequests>,
+        vm_state: Arc<Mutex<VmState>>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("lifecycle".into())
+            .spawn(move || {
+                while !flag.load(Ordering::Relaxed) && !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    // Reset wins over pause: a guest that asked to reboot while
+                    // someone was holding the pause key wants to reboot, and
+                    // `Lifecycle::reset` works from either state.
+                    let guest_asked = lifecycle.take_guest_reset();
+                    if guest_asked || requests.reset.swap(false, Ordering::Relaxed) {
+                        Self::serve(
+                            &vm_state,
+                            VmState::Resetting,
+                            || lifecycle.reset(),
+                            || Some(VmState::Running),
+                        );
+                    } else {
+                        // The window sends a toggle (it cannot know the state);
+                        // the control channel sends what it means. Both end up
+                        // here, and the toggle is resolved against the truth.
+                        let toggled = requests.pause_toggle.swap(false, Ordering::Relaxed);
+                        let paused = lifecycle.is_paused();
+                        let pause =
+                            requests.pause.swap(false, Ordering::Relaxed) || (toggled && !paused);
+                        let resume =
+                            requests.resume.swap(false, Ordering::Relaxed) || (toggled && paused);
+                        if pause {
+                            Self::serve(&vm_state, VmState::Paused, || lifecycle.pause(), || None);
+                        } else if resume {
+                            Self::serve(
+                                &vm_state,
+                                VmState::Running,
+                                || lifecycle.resume(),
+                                || None,
+                            );
+                        }
+                    }
+                    std::thread::sleep(LIFECYCLE_POLL);
+                }
+            });
+        // Not fatal — the VM runs perfectly well without one — but it is the
+        // difference between a guest's Restart rebooting and the VM stopping
+        // 30 seconds later with "no supervisor served the reset request", so it
+        // must not be silent.
+        let handle = match handle {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "cannot start the lifecycle supervisor: this VM cannot be paused or \
+                     rebooted, and a guest that asks to restart will stop instead"
+                );
+                None
+            }
+        };
+        Self { stop, handle }
+    }
+
+    /// Runs one lifecycle operation and keeps [`VmState`] honest about it.
+    ///
+    /// `during` is the state the VM is in while the operation runs, `after` the
+    /// one it settles into (`None` means "stay in `during`" — a pause holds).
+    /// A refused transition is reported rather than papered over: it would mean
+    /// the state machine and the seam disagree, which is a bug in one of them.
+    fn serve(
+        vm_state: &Mutex<VmState>,
+        during: VmState,
+        operation: impl FnOnce() -> Result<(), vmm_core::LifecycleError>,
+        after: impl FnOnce() -> Option<VmState>,
+    ) {
+        let before = Self::read(vm_state);
+        Self::advance(vm_state, during);
+        match operation() {
+            Ok(()) => {
+                if let Some(next) = after() {
+                    Self::advance(vm_state, next);
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "lifecycle request failed");
+                // Put the state back, or the machine would go on claiming to be
+                // `Paused` while its vCPUs run — a failed pause is not a pause.
+                // A failed *reset* has left the seam in `Stopping` and the VM
+                // about to die; restoring `Running` here is still right, because
+                // `Running -> Stopping` is exactly the transition the shutdown
+                // path below is about to make. Where the way back is not legal,
+                // `advance` refuses and says so rather than inventing one.
+                Self::advance(vm_state, before);
+            }
+        }
+    }
+
+    fn read(vm_state: &Mutex<VmState>) -> VmState {
+        match vm_state.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn advance(vm_state: &Mutex<VmState>, to: VmState) {
+        let mut guard = match vm_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *guard == to {
+            return;
+        }
+        match guard.transition(to) {
+            Ok(next) => {
+                *guard = next;
+                tracing::info!(state = ?next, "VM state");
+            }
+            Err(error) => tracing::error!(%error, "refusing an invalid VM state transition"),
+        }
+    }
+}
+
+impl Drop for LifecycleSupervisor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// A debug screenshot: write the scanout as PNG `after` this much VM runtime,
 /// then refresh the same file every [`SCREENSHOT_REFRESH`] until the VM stops
 /// — so a slow graphical boot can be watched from outside by re-reading one
@@ -368,18 +654,25 @@ pub fn run(
     headless: bool,
     screenshot: Option<ScreenshotRequest>,
 ) -> Result<(), String> {
-    run_with(cfg, headless, None, screenshot).map(|_| ())
+    run_with(cfg, headless, None, screenshot, false).map(|_| ())
 }
 
+/// `control_stdin` opens the lifecycle control channel on this process's stdin
+/// (ADR-0005); see [`spawn_control_channel`].
 pub fn run_with(
     cfg: VmConfig,
     headless: bool,
     automation: Option<Automation>,
     screenshot: Option<ScreenshotRequest>,
+    control_stdin: bool,
 ) -> Result<RunReport, String> {
     let span = tracing::info_span!("vm", id = %cfg.name);
     let _guard = span.enter();
     install_signal_handlers()?;
+
+    // The pause/reset seam (ADR-0005), created before the machine because the
+    // machine is attached to it and the vCPU threads are spawned with it.
+    let lifecycle = Lifecycle::new(cfg.vcpus);
 
     let machine = MachineConfig {
         memory_mib: cfg.memory_mib,
@@ -463,18 +756,44 @@ pub fn run_with(
         devices: built.devices,
         net_cmdline: built.net_cmdline,
         pflash: pflash.clone(),
+        lifecycle: Arc::clone(&lifecycle),
     })?;
     let bus = started.bus;
     let threads = started.threads;
+    let quiesce = started.quiesce;
 
-    // Lifecycle (MVP-1203): Created -> Running -> Stopping -> Stopped, any
-    // vCPU error -> Crashed. Transitions are validated by VmState itself.
+    // Lifecycle (MVP-1203, ADR-0005): Created -> Running -> Stopping -> Stopped,
+    // with Running <-> Paused and Running -> Resetting -> Running in between,
+    // and any vCPU error -> Crashed. Transitions are validated by VmState
+    // itself; the shared cell is what lets the lifecycle supervisor below drive
+    // the middle two while this thread waits for the VM to end.
     let mut state = VmState::Created;
     tracing::info!(entry = format_args!("{:#x}", started.entry), mode = ?cfg.boot.mode, state = ?state, "VM created");
     state = state
         .transition(VmState::Running)
         .map_err(|e| e.to_string())?;
     tracing::info!(state = ?state, "VM running");
+    let vm_state = Arc::new(Mutex::new(state));
+
+    // The lifecycle supervisor: the one thread that turns a *request* to pause,
+    // resume or reset into the thing itself. Requests reach it from three
+    // places — the guest (a write to a reset control, or a triple fault), the
+    // window (Ctrl+Alt+P / Ctrl+Alt+R) and, on a reset that the machine cannot
+    // serve, nowhere at all.
+    //
+    // A thread of its own rather than a branch in `should_stop` because both
+    // operations block until every vCPU has acknowledged, and the predicate
+    // `join_or_stop` polls must stay cheap: a pause that took a second would
+    // otherwise be a second in which the console script stopped being typed.
+    let requests = Arc::new(LifecycleRequests::default());
+    let supervisor = LifecycleSupervisor::start(
+        Arc::clone(&lifecycle),
+        Arc::clone(&requests),
+        Arc::clone(&vm_state),
+    );
+    if control_stdin {
+        spawn_control_channel(bus.clone(), Arc::clone(&requests), Arc::clone(&lifecycle));
+    }
 
     // One predicate for both presentations: stop when asked, and on every tick
     // give the automation script a chance to look at the console and type.
@@ -513,8 +832,29 @@ pub fn run_with(
             // window close button request shutdown like SIGINT does.
             let input_queue = host.input_queue();
             let control_queue = host.control_queue();
+            let pump_requests = Arc::clone(&requests);
+            let pump_quiesce = Arc::clone(&quiesce);
             let pump = std::thread::spawn(move || {
                 while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    // A paused VM must not accumulate a burst of input to
+                    // deliver on resume, and pushing an event writes the guest's
+                    // event ring — which is precisely what a pause forbids
+                    // (ADR-0005). The events are dropped rather than queued: the
+                    // window is not grabbed while frozen anyway.
+                    //
+                    // A pass rather than a flag check, and held across the
+                    // pushes: a pause that landed between the check and the push
+                    // would otherwise be told the machine was quiet while this
+                    // thread was writing to it. Control events are still read —
+                    // they are how the VM gets un-paused.
+                    let Some(pass) = pump_quiesce.try_enter() else {
+                        input_queue.drain_batches();
+                        for event in control_queue.drain() {
+                            note_control_event(event, &pump_requests);
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    };
                     for batch in input_queue.drain_batches() {
                         let split = virtio_input::split_batch(&batch);
                         if let Err(e) = keyboard_sink.push(&split.keyboard) {
@@ -525,24 +865,16 @@ pub fn run_with(
                         }
                     }
                     for event in control_queue.drain() {
-                        match event {
-                            display::ControlEvent::QuitRequested
-                            | display::ControlEvent::WindowCloseRequested => {
-                                tracing::info!(?event, "shutdown requested from the window");
-                                SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
-                            }
-                            display::ControlEvent::GrabToggled(grabbed) => {
-                                tracing::info!(grabbed, "input grab toggled");
-                            }
-                        }
+                        note_control_event(event, &pump_requests);
                     }
+                    drop(pass);
                     std::thread::sleep(Duration::from_millis(4));
                 }
             });
 
             let (tx, rx) = std::sync::mpsc::channel();
             let supervisor_handle = display_handle.clone();
-            let supervisor = std::thread::spawn(move || {
+            let vcpu_supervisor = std::thread::spawn(move || {
                 let outcomes = threads.join_or_stop(&should_stop, Duration::from_millis(50));
                 // The guest ended (or was stopped): close the window so the
                 // event loop below returns.
@@ -558,11 +890,19 @@ pub fn run_with(
             let outcomes = rx
                 .recv()
                 .map_err(|_| "vCPU supervisor thread disappeared".to_string())?;
-            let _ = supervisor.join();
+            let _ = vcpu_supervisor.join();
             let _ = pump.join();
             outcomes
         }
     };
+    // The lifecycle supervisor is joined before the state machine moves on, so
+    // it cannot transition underneath the shutdown path.
+    drop(supervisor);
+    state = match vm_state.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    };
+    let resets = lifecycle.resets();
     state = state
         .transition(VmState::Stopping)
         .map_err(|e| e.to_string())?;
@@ -614,7 +954,7 @@ pub fn run_with(
             VmState::Stopped
         })
         .map_err(|e| e.to_string())?;
-    tracing::info!(state = ?state, "VM finished");
+    tracing::info!(state = ?state, resets, "VM finished");
 
     if let Some(console) = &captured {
         let text = console
@@ -653,6 +993,206 @@ mod host_api {
         /// clause today); `None` when the network backend wants nothing.
         pub net_cmdline: Option<String>,
         pub pflash: Option<Arc<Mutex<Pflash>>>,
+        /// The pause/reset seam (ADR-0005). Each host attaches the assembled
+        /// machine to it and hands it to its `spawn_vcpus`.
+        pub lifecycle: Arc<Lifecycle>,
+    }
+
+    /// What has to go back into guest memory to start this VM — at boot, and
+    /// again at every reset.
+    ///
+    /// The point of naming it is that **reset re-runs exactly the boot path**.
+    /// A reboot that loaded the kernel through a second, "reset-only" code path
+    /// would be a second thing to keep correct, and the first thing to rot.
+    pub(super) enum BootPlan {
+        DirectLinux {
+            boot: linux_boot::BootConfig,
+            mem_size: u64,
+        },
+        /// A PVH ELF firmware (EDK2 CloudHv). Reloading it is what makes a UEFI
+        /// reboot land back in the firmware: it re-reads its variable store out
+        /// of pflash — which a reset deliberately does *not* clear — and runs
+        /// its boot manager again.
+        Pvh {
+            image: uefi_boot::FirmwareImage,
+            mem_size: u64,
+        },
+        /// A flash image mapped as a read-only ROM at the top of the 32-bit
+        /// address space. Nothing to reload: the ROM is a host mapping, the
+        /// guest cannot have changed it, and the architectural reset state the
+        /// vCPU is put back into already points its first fetch at it.
+        ResetVector,
+    }
+
+    /// Where a vCPU starts, and in which of the three start-of-day states.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct BootEntry {
+        pub entry: u64,
+        /// `rsi` (boot_params) for direct Linux, `rbx` (hvm_start_info) for
+        /// PVH, unused for a reset-vector ROM.
+        pub argument: u64,
+        pub kind: BootEntryKind,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BootEntryKind {
+        LongMode,
+        Pvh,
+        ResetVector,
+    }
+
+    /// Puts the boot images into guest memory and reports where execution
+    /// starts. Called once at boot and once per reset.
+    pub(super) fn load_boot(
+        mem: &vmm_core::GuestMem,
+        plan: &BootPlan,
+    ) -> Result<BootEntry, String> {
+        match plan {
+            BootPlan::DirectLinux { boot, mem_size } => {
+                let loaded = linux_boot::load(mem, boot, *mem_size).map_err(|e| e.to_string())?;
+                Ok(BootEntry {
+                    entry: loaded.entry,
+                    argument: loaded.boot_params_addr,
+                    kind: BootEntryKind::LongMode,
+                })
+            }
+            BootPlan::Pvh { image, mem_size } => {
+                let boot = uefi_boot::load_pvh(mem, image, *mem_size).map_err(|e| e.to_string())?;
+                Ok(BootEntry {
+                    entry: boot.entry,
+                    argument: boot.start_info_addr,
+                    kind: BootEntryKind::Pvh,
+                })
+            }
+            BootPlan::ResetVector => Ok(BootEntry {
+                entry: machine_x86::layout::RESET_VECTOR,
+                argument: 0,
+                kind: BootEntryKind::ResetVector,
+            }),
+        }
+    }
+
+    /// Puts one vCPU into the start-of-day state `entry` describes.
+    ///
+    /// `is_boot_cpu` decides how much: the boot CPU gets its segments *and* its
+    /// general-purpose registers, an application processor only the segments —
+    /// it is waiting for the guest's own INIT/SIPI either way.
+    pub(super) fn apply_boot_state(
+        mem: &vmm_core::GuestMem,
+        entry: &BootEntry,
+        vcpu: &dyn vmm_core::hv::VcpuRegisters,
+        is_boot_cpu: bool,
+    ) -> Result<(), String> {
+        use machine_x86::boot as x86_boot;
+        match entry.kind {
+            BootEntryKind::LongMode => {
+                x86_boot::setup_long_mode_sregs(mem, vcpu).map_err(|e| e.to_string())?;
+                if is_boot_cpu {
+                    x86_boot::setup_boot_regs(vcpu, entry.entry, entry.argument)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            BootEntryKind::Pvh => {
+                x86_boot::setup_pvh_sregs(mem, vcpu).map_err(|e| e.to_string())?;
+                if is_boot_cpu {
+                    x86_boot::setup_pvh_regs(vcpu, entry.entry, entry.argument)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            // Nothing to write: `KVM_CREATE_VCPU` / `WHvCreateVirtualProcessor`
+            // — and, after a reboot, `ResettableVcpu::reset_arch_state` — leave
+            // the vCPU in the architectural reset state, whose first fetch is
+            // already at 0xffff_fff0 inside the ROM.
+            BootEntryKind::ResetVector => {}
+        }
+        Ok(())
+    }
+
+    /// The machine behind the lifecycle seam (ADR-0005): what a pause has to
+    /// freeze, and what a reset has to put back.
+    pub(super) struct VmMachine {
+        pub bus: MachineBus,
+        pub mem: Arc<vmm_core::GuestMem>,
+        pub quiesce: Arc<virtio_core::Quiesce>,
+        pub vcpus: u32,
+        pub plan: BootPlan,
+        /// Recomputed by every reset: a reloaded kernel does not have to land
+        /// on the same entry point, and a firmware certainly does not.
+        pub entry: Mutex<BootEntry>,
+    }
+
+    impl VmMachine {
+        fn current_entry(&self) -> BootEntry {
+            match self.entry.lock() {
+                Ok(entry) => *entry,
+                Err(poisoned) => *poisoned.into_inner(),
+            }
+        }
+    }
+
+    impl vmm_core::MachineLifecycle for VmMachine {
+        /// Everything that touches guest memory without a vCPU behind it stops:
+        /// the queue workers and virtio-net's receive thread through the gate,
+        /// the 8254's timer thread and the ACPI PM timer through the bus.
+        fn quiesce(&self) {
+            self.quiesce.pause();
+            self.bus.set_paused(true);
+            // Closing the gate stops work that has not started; this waits for
+            // the work already in hand, which is what makes "paused" true of
+            // guest memory and not only of the guest.
+            self.quiesce.wait_until_idle(QUIESCE_SETTLE);
+        }
+
+        fn unquiesce(&self) {
+            self.bus.set_paused(false);
+            self.quiesce.resume();
+        }
+
+        /// Runs on the requesting thread with every vCPU parked, so it may take
+        /// any device lock and write guest memory freely.
+        ///
+        /// The order is the machine's dependency order: devices first (they are
+        /// what could still be pointing into guest RAM), then the firmware
+        /// tables, then the boot images — because `linux_boot::load` writes its
+        /// `boot_params` over the same low memory the previous guest was using.
+        fn reset_machine(&self) -> Result<(), String> {
+            self.bus.reset_devices();
+            machine_x86::mptable::write(self.mem.as_ref(), self.vcpus)
+                .map_err(|e| format!("cannot rewrite the MP table: {e}"))?;
+            machine_x86::acpi::write(self.mem.as_ref(), self.vcpus)
+                .map_err(|e| format!("cannot rewrite the ACPI tables: {e}"))?;
+            let entry = load_boot(self.mem.as_ref(), &self.plan)?;
+            match self.entry.lock() {
+                Ok(mut slot) => *slot = entry,
+                Err(poisoned) => *poisoned.into_inner() = entry,
+            }
+            tracing::info!(
+                entry = format_args!("{:#x}", entry.entry),
+                kind = ?entry.kind,
+                "machine reset: devices at power-on, tables and boot images reloaded"
+            );
+            Ok(())
+        }
+
+        /// Boot-CPU only, on **both** hosts.
+        ///
+        /// On WHP because an application processor must be left exactly as
+        /// `WHvCreateVirtualProcessor` made it or the guest's INIT/SIPI never
+        /// makes it runnable (ADR-0002 phase 4) — and `reset_arch_state` has
+        /// just re-created it precisely to get back there. On KVM because the
+        /// segment state a host writes to an AP is discarded by the INIT that
+        /// starts it anyway; the AP is back at `KVM_MP_STATE_UNINITIALIZED`,
+        /// which is where `KVM_CREATE_VCPU` left it on the first boot.
+        fn reset_vcpu(
+            &self,
+            index: u32,
+            vcpu: &dyn vmm_core::hv::VcpuRegisters,
+        ) -> Result<(), String> {
+            if index != 0 {
+                return Ok(());
+            }
+            apply_boot_state(self.mem.as_ref(), &self.current_entry(), vcpu, true)
+        }
     }
 
     /// The command line a direct-Linux guest boots with: the profile's own,
@@ -690,7 +1230,7 @@ mod host_api {
     }
 }
 
-use host_api::direct_linux_cmdline;
+use host_api::{apply_boot_state, direct_linux_cmdline, load_boot, BootPlan, VmMachine};
 
 /// KVM machine assembly (Linux): in-kernel interrupt chips, irqfd/ioeventfd
 /// device wiring, register setup on every vCPU.
@@ -698,11 +1238,10 @@ use host_api::direct_linux_cmdline;
 mod host {
     use super::*;
     use control_api::{BootMode, VirtioTransport};
-    use machine_x86::boot as x86_boot;
     use machine_x86::serial::SerialConsole;
     use machine_x86::virtio::VirtioMmioBus;
     use machine_x86::virtio_pci::VirtioPciBus;
-    use vmm_core::{spawn_vcpus, Hypervisor, Vm};
+    use vmm_core::{spawn_vcpus_with, Hypervisor, Vm};
 
     pub(super) use super::host_api::StartRequest;
     pub(super) type Threads = vmm_core::VcpuThreads;
@@ -710,6 +1249,9 @@ mod host {
     pub(super) struct Started {
         pub bus: MachineBus,
         pub threads: Threads,
+        /// The VM's pause gate (ADR-0005), so the host's input pump can decline
+        /// to write the guest's event ring while the VM is frozen.
+        pub quiesce: Arc<virtio_core::Quiesce>,
         /// Where vCPU0 begins executing, for the log line.
         pub entry: u64,
         /// The VM object owns guest RAM and the firmware ROM mappings; it must
@@ -725,7 +1267,11 @@ mod host {
             devices,
             net_cmdline,
             pflash,
+            lifecycle,
         } = request;
+        // The VM's pause gate (ADR-0005), created before the devices so every
+        // worker thread that is about to be spawned can be handed it.
+        let quiesce = virtio_core::Quiesce::new();
         let hv = Hypervisor::open().map_err(|e| e.to_string())?;
         let mut vm = Vm::new(&hv, machine).map_err(|e| e.to_string())?;
 
@@ -785,9 +1331,9 @@ mod host {
         // memory, IRQ chip, serial, the whole virtio window — is identical for both
         // modes; only how the vCPU starts differs.
         let mem_size = machine.memory_mib << 20;
-        let (vcpus, entry) = match cfg.boot.mode {
-            BootMode::DirectLinux => {
-                let boot = linux_boot::BootConfig {
+        let plan = match cfg.boot.mode {
+            BootMode::DirectLinux => BootPlan::DirectLinux {
+                boot: linux_boot::BootConfig {
                     kernel: cfg
                         .boot
                         .require_kernel()
@@ -795,32 +1341,41 @@ mod host {
                         .clone(),
                     initramfs: cfg.boot.initramfs.clone(),
                     cmdline,
-                };
-                let loaded =
-                    linux_boot::load(vm.memory(), &boot, mem_size).map_err(|e| e.to_string())?;
-                let vcpus = vm.take_vcpus();
-                for vcpu in &vcpus {
-                    // Every vCPU: KVM's INIT discards this state on the APs, so
-                    // handing it to all of them is free and keeps them uniform.
-                    x86_boot::setup_long_mode_sregs(vm.memory(), vcpu)
-                        .map_err(|e| e.to_string())?;
-                    if vcpu.index == 0 {
-                        // Only the boot CPU starts at the kernel entry; the others
-                        // wait for INIT/SIPI from the guest.
-                        x86_boot::setup_boot_regs(vcpu, loaded.entry, loaded.boot_params_addr)
-                            .map_err(|e| e.to_string())?;
-                    }
-                }
-                (vcpus, loaded.entry)
-            }
-            BootMode::Uefi => start_uefi(&mut vm, cfg, mem_size)?,
+                },
+                mem_size,
+            },
+            BootMode::Uefi => uefi_plan(&mut vm, cfg, mem_size)?,
         };
+        let entry = load_boot(vm.memory(), &plan)?;
+        let vcpus = vm.take_vcpus();
+        for vcpu in &vcpus {
+            // Every vCPU gets the segment state: KVM's INIT discards it on the
+            // APs, so handing it to all of them is free and keeps them uniform.
+            // Only the boot CPU starts at the entry point; the others wait for
+            // INIT/SIPI from the guest.
+            apply_boot_state(vm.memory(), &entry, vcpu, vcpu.index == 0)?;
+        }
 
-        let threads = spawn_vcpus(vcpus, |_| Box::new(bus.clone())).map_err(|e| e.to_string())?;
+        // The machine goes behind the lifecycle seam *before* the vCPUs start,
+        // so a guest that faults in its first microseconds is rebooted rather
+        // than reported as a shutdown (ADR-0005).
+        bus.set_quiesce(Arc::clone(&quiesce));
+        lifecycle.attach_machine(Arc::new(VmMachine {
+            bus: bus.clone(),
+            mem: Arc::clone(&mem),
+            quiesce: Arc::clone(&quiesce),
+            vcpus: cfg.vcpus,
+            plan,
+            entry: Mutex::new(entry),
+        }));
+
+        let threads = spawn_vcpus_with(vcpus, |_| Box::new(bus.clone()), Some(lifecycle))
+            .map_err(|e| e.to_string())?;
         Ok(Started {
             bus,
             threads,
-            entry,
+            quiesce,
+            entry: entry.entry,
             _vm: vm,
         })
     }
@@ -836,11 +1391,7 @@ mod host {
     ///   and the vCPUs are left in the state KVM created them in — which *is* the
     ///   architectural reset state (`CS.base 0xffff_0000`, `IP 0xfff0`), so the
     ///   first instruction fetch lands at `0xffff_fff0` inside the ROM.
-    fn start_uefi(
-        vm: &mut Vm,
-        cfg: &VmConfig,
-        mem_size: u64,
-    ) -> Result<(Vec<vmm_core::Vcpu>, u64), String> {
+    fn uefi_plan(vm: &mut Vm, cfg: &VmConfig, mem_size: u64) -> Result<BootPlan, String> {
         let path = cfg.boot.require_firmware().map_err(|e| e.to_string())?;
         let image = uefi_boot::FirmwareImage::read(path).map_err(|e| e.to_string())?;
         tracing::info!(
@@ -851,19 +1402,7 @@ mod host {
         );
 
         match image.kind() {
-            uefi_boot::FirmwareKind::PvhElf { .. } => {
-                let boot = uefi_boot::load_pvh(vm.memory(), &image, mem_size)
-                    .map_err(|e| e.to_string())?;
-                let vcpus = vm.take_vcpus();
-                for vcpu in &vcpus {
-                    x86_boot::setup_pvh_sregs(vm.memory(), vcpu).map_err(|e| e.to_string())?;
-                    if vcpu.index == 0 {
-                        x86_boot::setup_pvh_regs(vcpu, boot.entry, boot.start_info_addr)
-                            .map_err(|e| e.to_string())?;
-                    }
-                }
-                Ok((vcpus, boot.entry))
-            }
+            uefi_boot::FirmwareKind::PvhElf { .. } => Ok(BootPlan::Pvh { image, mem_size }),
             uefi_boot::FirmwareKind::ResetVector => {
                 super::refuse_nvram_with_reset_vector(cfg)?;
                 let placement = uefi_boot::rom::place_at_top_of_32bit(image.len())
@@ -879,8 +1418,9 @@ mod host {
                 );
                 // Deliberately no register setup: KVM_CREATE_VCPU already leaves
                 // the vCPU in the reset state (verified in
-                // crates/uefi-boot/tests/reset_vector.rs).
-                Ok((vm.take_vcpus(), machine_x86::layout::RESET_VECTOR))
+                // crates/uefi-boot/tests/reset_vector.rs). The mapping is a host
+                // slot the guest cannot change, so a reset reloads nothing.
+                Ok(BootPlan::ResetVector)
             }
         }
     }
@@ -892,12 +1432,11 @@ mod host {
 mod host {
     use super::*;
     use control_api::{BootMode, VirtioTransport};
-    use machine_x86::boot as x86_boot;
     use machine_x86::irqchip::UserspaceIrqChip;
     use machine_x86::serial::SerialConsole;
     use machine_x86::virtio::VirtioMmioBus;
     use machine_x86::virtio_pci::{PciInterruptMode, VirtioPciBus};
-    use vmm_core::whp::{spawn_vcpus, WhpHypervisor, WhpOptions, WhpPartition, WhpVcpu};
+    use vmm_core::whp::{spawn_vcpus_with, WhpHypervisor, WhpOptions, WhpPartition};
 
     pub(super) use super::host_api::StartRequest;
     pub(super) type Threads = vmm_core::whp::WhpVcpuThreads;
@@ -905,6 +1444,8 @@ mod host {
     pub(super) struct Started {
         pub bus: MachineBus,
         pub threads: Threads,
+        /// The VM's pause gate (ADR-0005); see the KVM module's `Started`.
+        pub quiesce: Arc<virtio_core::Quiesce>,
         pub entry: u64,
         /// The partition owns guest RAM and the firmware ROM mappings; it must
         /// outlive the vCPU threads, so the caller holds it until they join.
@@ -919,7 +1460,9 @@ mod host {
             devices,
             net_cmdline,
             pflash,
+            lifecycle,
         } = request;
+        let quiesce = virtio_core::Quiesce::new();
         let hv = WhpHypervisor::open().map_err(|e| e.to_string())?;
         // Everything a real guest needs: local APIC emulation (interrupt
         // delivery, the `hlt` idle wait) and this machine's CPUID policy. One
@@ -975,9 +1518,9 @@ mod host {
         .with_irqchip(Arc::clone(&irqchip));
 
         let mem_size = machine.memory_mib << 20;
-        let (vcpus, entry) = match cfg.boot.mode {
-            BootMode::DirectLinux => {
-                let boot = linux_boot::BootConfig {
+        let plan = match cfg.boot.mode {
+            BootMode::DirectLinux => BootPlan::DirectLinux {
+                boot: linux_boot::BootConfig {
                     kernel: cfg
                         .boot
                         .require_kernel()
@@ -985,31 +1528,38 @@ mod host {
                         .clone(),
                     initramfs: cfg.boot.initramfs.clone(),
                     cmdline,
-                };
-                let loaded =
-                    linux_boot::load(vm.memory(), &boot, mem_size).map_err(|e| e.to_string())?;
-                let vcpus = vm.take_vcpus();
-                // **Boot CPU only.** WHP has no INIT of its own to discard host
-                // register writes: an AP must be left in the reset state WHP
-                // created it in, or the guest's INIT/SIPI never makes it
-                // runnable (see `WhpPartition`'s SMP notes).
-                {
-                    let vcpu = &vcpus[0];
-                    x86_boot::setup_long_mode_sregs(vm.memory(), vcpu)
-                        .map_err(|e| e.to_string())?;
-                    x86_boot::setup_boot_regs(vcpu, loaded.entry, loaded.boot_params_addr)
-                        .map_err(|e| e.to_string())?;
-                }
-                (vcpus, loaded.entry)
-            }
-            BootMode::Uefi => start_uefi(&mut vm, cfg, mem_size)?,
+                },
+                mem_size,
+            },
+            BootMode::Uefi => uefi_plan(&mut vm, cfg, mem_size)?,
         };
+        let entry = load_boot(vm.memory(), &plan)?;
+        let vcpus = vm.take_vcpus();
+        // **Boot CPU only.** WHP has no INIT of its own to discard host
+        // register writes: an AP must be left in the reset state WHP created it
+        // in, or the guest's INIT/SIPI never makes it runnable (see
+        // `WhpPartition`'s SMP notes). The same rule governs `reset_vcpu`.
+        if let Some(vcpu) = vcpus.first() {
+            apply_boot_state(vm.memory(), &entry, vcpu, true)?;
+        }
 
-        let threads = spawn_vcpus(vcpus, |_| Box::new(bus.clone())).map_err(|e| e.to_string())?;
+        bus.set_quiesce(Arc::clone(&quiesce));
+        lifecycle.attach_machine(Arc::new(VmMachine {
+            bus: bus.clone(),
+            mem: Arc::clone(&mem),
+            quiesce: Arc::clone(&quiesce),
+            vcpus: cfg.vcpus,
+            plan,
+            entry: Mutex::new(entry),
+        }));
+
+        let threads = spawn_vcpus_with(vcpus, |_| Box::new(bus.clone()), Some(lifecycle))
+            .map_err(|e| e.to_string())?;
         Ok(Started {
             bus,
             threads,
-            entry,
+            quiesce,
+            entry: entry.entry,
             _vm: vm,
         })
     }
@@ -1019,11 +1569,7 @@ mod host {
     /// to the boot CPU only, and a reset-vector image needs *nothing* written
     /// because `WHvCreateVirtualProcessor` already leaves every VP in the
     /// architectural reset state.
-    fn start_uefi(
-        vm: &mut WhpPartition,
-        cfg: &VmConfig,
-        mem_size: u64,
-    ) -> Result<(Vec<WhpVcpu>, u64), String> {
+    fn uefi_plan(vm: &mut WhpPartition, cfg: &VmConfig, mem_size: u64) -> Result<BootPlan, String> {
         let path = cfg.boot.require_firmware().map_err(|e| e.to_string())?;
         let image = uefi_boot::FirmwareImage::read(path).map_err(|e| e.to_string())?;
         tracing::info!(
@@ -1034,21 +1580,10 @@ mod host {
         );
 
         match image.kind() {
-            uefi_boot::FirmwareKind::PvhElf { .. } => {
-                let boot = uefi_boot::load_pvh(vm.memory(), &image, mem_size)
-                    .map_err(|e| e.to_string())?;
-                let vcpus = vm.take_vcpus();
-                {
-                    // Boot CPU only — the firmware's own INIT/SIPI sweep
-                    // (`MpInitLib`) brings the APs up from the reset state WHP
-                    // models for them.
-                    let vcpu = &vcpus[0];
-                    x86_boot::setup_pvh_sregs(vm.memory(), vcpu).map_err(|e| e.to_string())?;
-                    x86_boot::setup_pvh_regs(vcpu, boot.entry, boot.start_info_addr)
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok((vcpus, boot.entry))
-            }
+            // The firmware's own INIT/SIPI sweep (`MpInitLib`) brings the APs up
+            // from the reset state WHP models for them, so only the boot CPU is
+            // ever touched — see the caller.
+            uefi_boot::FirmwareKind::PvhElf { .. } => Ok(BootPlan::Pvh { image, mem_size }),
             uefi_boot::FirmwareKind::ResetVector => {
                 super::refuse_nvram_with_reset_vector(cfg)?;
                 let placement = uefi_boot::rom::place_at_top_of_32bit(image.len())
@@ -1060,7 +1595,7 @@ mod host {
                     end = format_args!("{:#x}", placement.guest_addr + image.len()),
                     "firmware ROM mapped; vCPUs stay in the architectural reset state"
                 );
-                Ok((vm.take_vcpus(), machine_x86::layout::RESET_VECTOR))
+                Ok(BootPlan::ResetVector)
             }
         }
     }

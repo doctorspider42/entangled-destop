@@ -513,3 +513,56 @@ Rules that keep the targets useful:
   test writes, kills the process, fsck's the image).
 - A failing guest never takes the host process down: any panic in a device
   thread is a test failure by definition.
+
+## Lifecycle: pause, resume, reboot (ADR-0005)
+
+Four properties, on both hosts, all asserted through the **guest** rather than
+through host bookkeeping:
+
+| Test | Host | What it proves |
+|---|---|---|
+| `tests/boot/tests/lifecycle.rs` | KVM | pause / resume / host reset / guest reboot |
+| `crates/vmm-core/tests/whp_lifecycle.rs` | WHP | the same four, natively |
+| `apps/entangled/tests/guest_reboot.rs` | either | an installed Ubuntu reboots itself through its firmware, twice (`--ignored`) |
+
+**Measuring a pause needs the guest to be noisy.** The test guest gained
+`entangled.heartbeat=<ms>`: it prints `VMHOST_HEARTBEAT <n>` for ever and never
+returns. A stalled *console* could mean a stalled device; a stalled heartbeat
+means stalled guest code, which is the thing being asserted. It never returns so
+that the absence of a line is unambiguous, and the host decides when the VM ends.
+
+**The harness gained a `Driver`.** `boot_once_driven(&spec, Some(driver))` runs a
+callback on its own thread while the vCPUs execute — every lifecycle call blocks
+until they acknowledge, so it cannot live in the poll predicate. Two things
+change when a driver is attached, both deliberate:
+
+- the run is **not** ended by the ready marker (the driver is about to do
+  something that happens *after* the guest is ready), and
+- the VM gets a lifecycle seam, which turns a guest reset into a reboot instead
+  of the end of the run. Every other test in the harness depends on the test
+  guest's `reboot=k` ending the run, which is why the seam is opt-in per boot.
+
+The harness also runs a **supervisor** of its own, the same shape `entangled run`
+has: a guest reset is latched by whichever vCPU saw it and served by somebody
+else, and without that somebody a guest that reboots itself simply waits for
+ever. That was the first failure when the test was written.
+
+**The end-to-end one drives the CLI.** `guest_reboot.rs` spawns
+`entangled run --headless --control-stdin`, logs in over the serial console with
+`type <text>`, and runs `sudo reboot`. It counts EDK2 boot-manager runs
+(`BdsDxe: starting Boot`) to prove the *firmware* ran again off a variable store
+the reset did not clear — a reset that wiped NVRAM would boot to the EFI shell,
+which no login-prompt count would catch. It self-skips without a hypervisor, the
+CloudHv firmware or an installed profile (`$ENTANGLED_REBOOT_PROFILE`, else
+`~/entangled-vms/{e2e-ubuntu,ubuntu,desktop}.toml`).
+
+Two lessons it cost to learn, both worth keeping:
+
+- **`sudo`'s password prompt is not a stable string.** Ubuntu 26.04 asks
+  `[sudo: authenticate] Password:` where older releases said
+  `[sudo] password for x:`. Match the one word both contain, and count prompts
+  per boot rather than matching once — the console buffer still holds the
+  previous boot's.
+- **A test that takes twelve minutes must say where it got to.** Print a line per
+  step and save the whole console to a file named in the failure message; a tail
+  is never enough for a boot log.
