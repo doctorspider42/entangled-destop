@@ -108,8 +108,8 @@ impl Renderer3d for FuzzRenderer {
     fn capset(&mut self, id: u32, version: u32) -> Result<Vec<u8>, CommandError> {
         self.inner.capset(id, version)
     }
-    fn ctx_create(&mut self, ctx_id: u32, name: &str) -> Result<(), CommandError> {
-        self.inner.ctx_create(ctx_id, name)
+    fn ctx_create(&mut self, ctx_id: u32, capset_id: u32, name: &str) -> Result<(), CommandError> {
+        self.inner.ctx_create(ctx_id, capset_id, name)
     }
     fn ctx_destroy(&mut self, ctx_id: u32) {
         self.inner.ctx_destroy(ctx_id);

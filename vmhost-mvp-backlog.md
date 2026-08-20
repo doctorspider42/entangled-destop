@@ -769,13 +769,13 @@ Cztery fazy, wszystkie zmierzone na sprzęcie — szczegóły w
 
 | ID | Zadanie | Priorytet | Status |
 |---|---|---:|---|
-| VEN-2001 | `VIRTIO_GPU_F_RESOURCE_BLOB` + region pamięci współdzielonej na transporcie (mmio i pci) | P0 | |
-| VEN-2002 | Capset `VIRTIO_GPU_CAPSET_VENUS`, negocjacja i kontekst typu venus | P0 | |
-| VEN-2003 | Dekoder protokołu venus za istniejącym traitem `Renderer3d` (host: natywny Vulkan) | P0 | |
+| VEN-2001 | `VIRTIO_GPU_F_RESOURCE_BLOB` + region pamięci współdzielonej na transporcie (mmio i pci) | P0 | zrobione po stronie urządzenia i transportów; okno **zadeklarowane, ale jeszcze nie podparte** — brakuje BAR-a/GPA w `machine-x86` (patrz aneks do ADR-0004 z 2026-08-21) |
+| VEN-2002 | Capset `VIRTIO_GPU_CAPSET_VENUS`, negocjacja i kontekst typu venus | P0 | zrobione (`VIRTIO_GPU_F_CONTEXT_INIT` + capset 4; `NullRenderer::with_venus` jako loopback) |
+| VEN-2003 | Dekoder protokołu venus za istniejącym traitem `Renderer3d` (host: natywny Vulkan) | P0 | tylko sonda: `virgl.rs` wykrywa punkty wejścia venus przy `dlopen`; jammy ma 0.9.1, jedyny host-owy ICD to lavapipe (CPU) |
 | VEN-2004 | Izolacja renderera na Windowsie: `CreateProcess` + para uchwytów pod ten sam protokół co na Linuksie | P0 | |
 | VEN-2005 | Blob scanout bez kopii (dmabuf na Linuksie, pamięć współdzielona/`ID3D12Resource` na Windowsie) | P1 | |
 | VEN-2006 | Akceptacja: GNOME i `vkcube`/`vulkaninfo` w gościu na obu hostach, pomiar klatek przed/po | P0 | |
-| VEN-2007 | Fuzzing protokołu venus i limity zasobów (gość jest wrogi) | P0 | |
+| VEN-2007 | Fuzzing protokołu venus i limity zasobów (gość jest wrogi) | P0 | cel `gpu_blob` (blob + okno pamięci współdzielonej) |
 
 Dlaczego Venus, a nie ANGLE — decyzja do zapisania w aneksie do
 [ADR-0004](docs/adr/0004-virtio-gpu-3d.md) przy starcie epiku:

@@ -81,6 +81,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "gpu_blob"
+path = "fuzz_targets/gpu_blob.rs"
+test = false
+doc = false
+bench = false
+
 # Fuzzing wants optimised code with debug assertions left on: an overflow or a
 # broken invariant should abort rather than wrap silently.
 [profile.release]

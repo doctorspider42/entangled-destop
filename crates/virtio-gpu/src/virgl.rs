@@ -59,6 +59,56 @@ const USE_GLES: c_int = 1 << 4;
 const CAPSET_VIRGL: u32 = 1;
 const CAPSET_VIRGL2: u32 = 2;
 
+/// Environment variable that suppresses the Venus probe entirely, for a host
+/// whose newer virglrenderer has venus compiled in but whose Vulkan ICD is not
+/// one anybody should be rendering against.
+pub const VENUS_ENV: &str = "ENTANGLED_GPU_VENUS";
+
+/// `struct virgl_renderer_resource_create_blob_args` (virglrenderer 0.10+).
+///
+/// Laid out field-for-field against the C header. It is only ever constructed
+/// when the matching symbol resolved, i.e. when the loaded library is new
+/// enough to define this struct at all.
+#[repr(C)]
+struct CreateBlobArgs {
+    res_handle: u32,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    iovecs: *const Iovec,
+    num_iovs: u32,
+}
+
+/// The Venus-era entry points (virglrenderer 0.10+), resolved *optionally*.
+///
+/// Runtime detection, never a compile-time fork — the same discipline the
+/// whole `dlopen` design rests on (ADR-0004 §2). On jammy's 0.9.1 none of
+/// these resolve, the probe says so once at load, and the device behaves
+/// exactly as it did before Venus existed.
+struct VenusApi {
+    /// `virgl_renderer_context_create_with_flags(ctx_id, flags, nlen, name)`,
+    /// where `flags` carries the capset id that selects the context type.
+    context_create_with_flags: unsafe extern "C" fn(u32, u32, u32, *const c_char) -> c_int,
+    /// `virgl_renderer_resource_create_blob(&args)`.
+    resource_create_blob: unsafe extern "C" fn(*const CreateBlobArgs) -> c_int,
+}
+
+/// Symbols the Venus probe requires the library to have before it believes it.
+///
+/// Four, but only two are *stored* ([`VenusApi`]): `virgl_renderer_resource_map`
+/// and `..._unmap` are what a host-visible mapping would call, and there is no
+/// window to map into until the machine layer allocates one — so resolving
+/// them is evidence about the library, not a capability we can use yet
+/// (VEN-2003; see `map_blob`).
+const VENUS_SYMBOLS: [&str; 4] = [
+    "virgl_renderer_context_create_with_flags",
+    "virgl_renderer_resource_create_blob",
+    "virgl_renderer_resource_map",
+    "virgl_renderer_resource_unmap",
+];
+
 /// One process-wide renderer (the library is a singleton).
 static RENDERER_LIVE: AtomicBool = AtomicBool::new(false);
 
@@ -200,6 +250,8 @@ struct Api {
     /// `virgl_renderer_get_poll_fd()`: an fd that becomes readable when the
     /// library has fence work, or -1 on a host whose GL stack offers none.
     get_poll_fd: unsafe extern "C" fn() -> c_int,
+    /// The Venus-era entry points, when this library has them (VEN-2003).
+    venus: Option<VenusApi>,
     // ManuallyDrop = the library is never dlclose'd. Unloading a GL stack at
     // runtime is famously unsafe: mesa's driver threads leave TLS destructors
     // behind and `virgl_renderer_cleanup` + dlclose segfault at thread exit
@@ -436,8 +488,10 @@ impl VirglRenderer {
             create_fence: sym!("virgl_renderer_create_fence"),
             poll: sym!("virgl_renderer_poll"),
             get_poll_fd: sym!("virgl_renderer_get_poll_fd"),
+            venus: None,
             _lib: std::mem::ManuallyDrop::new(lib),
         };
+
 
         // Capset versions/sizes are static tables in the library — readable
         // *before* init, which matters: the guest kernel reads `num_capsets`
@@ -462,6 +516,76 @@ impl VirglRenderer {
         if capsets.is_empty() {
             return Err("virglrenderer reports no capability sets".into());
         }
+
+        // ------------------------------------------------ the Venus probe
+        //
+        // Optional symbols: resolve them all or none. A library with some but
+        // not all of them is not one we know how to drive, and half a Venus
+        // implementation is worse than none — the guest would negotiate the
+        // capset and then fail on its first allocation.
+        let mut api = api;
+        if std::env::var(VENUS_ENV).as_deref() == Ok("off") {
+            tracing::info!("{VENUS_ENV}=off: not probing virglrenderer for Venus support");
+        } else {
+            // SAFETY: same contract as `sym!` above — looked up by C name in
+            // the library just opened, transmuted to the prototypes quoted on
+            // `VenusApi`, which are the 0.10+ API.
+            let optional = |name: &str| unsafe {
+                api._lib
+                    .get::<*const c_void>(format!("{name} ").as_bytes())
+                    .ok()
+                    .map(|s| *s)
+            };
+            let found: Vec<Option<*const c_void>> =
+                VENUS_SYMBOLS.iter().map(|n| optional(n)).collect();
+            let missing: Vec<&str> = VENUS_SYMBOLS
+                .iter()
+                .zip(&found)
+                .filter(|(_, f)| f.is_none())
+                .map(|(n, _)| *n)
+                .collect();
+            let (mut venus_version, mut venus_size) = (0u32, 0u32);
+            // SAFETY: out-pointers to locals; the entry point reads static
+            // size tables and is safe before init (as for VIRGL above).
+            unsafe { (api.get_cap_set)(crate::CAPSET_VENUS, &mut venus_version, &mut venus_size) };
+
+            if missing.is_empty() && venus_size > 0 {
+                // SAFETY: every pointer resolved above is a function symbol of
+                // the prototype declared on `VenusApi`; transmuting a resolved
+                // symbol address to its declared signature is the whole point
+                // of the lookup.
+                let venus = unsafe {
+                    VenusApi {
+                        context_create_with_flags: std::mem::transmute::<
+                            *const c_void,
+                            unsafe extern "C" fn(u32, u32, u32, *const c_char) -> c_int,
+                        >(found[0].unwrap_or(std::ptr::null())),
+                        resource_create_blob: std::mem::transmute::<
+                            *const c_void,
+                            unsafe extern "C" fn(*const CreateBlobArgs) -> c_int,
+                        >(found[1].unwrap_or(std::ptr::null())),
+                    }
+                };
+                api.venus = Some(venus);
+                capsets.push(CapsetInfo {
+                    id: crate::CAPSET_VENUS,
+                    max_version: venus_version,
+                    max_size: venus_size,
+                });
+                tracing::info!(
+                    max_version = venus_version,
+                    max_size = venus_size,
+                    "virglrenderer serves the Venus capset (VEN-2003)"
+                );
+            } else {
+                tracing::info!(
+                    venus_capset_bytes = venus_size,
+                    missing = ?missing,
+                    "virglrenderer has no usable Venus support;                      3D stays classic virgl (VEN-2003)"
+                );
+            }
+        }
+        let api = api;
 
         Ok(Self {
             api,
@@ -585,26 +709,115 @@ impl Renderer3d for VirglRenderer {
 
     fn ctx_create(&mut self, ctx_id: u32, capset_id: u32, name: &str) -> Result<(), CommandError> {
         self.ensure_ready()?;
-        // Pinned virglrenderer 0.9 has only `virgl_renderer_context_create`,
-        // which always makes a classic virgl context; selecting a context type
-        // needs `virgl_renderer_context_create_with_flags` from 0.10+
-        // (VEN-2003). `Gpu3d` will already have refused a capset this renderer
-        // does not advertise, and 0.9 advertises only VIRGL/VIRGL2 — this is
-        // the belt to that braces, so a future capset added here cannot
-        // silently become a virgl context.
-        if capset_id != 0 {
-            return Err(CommandError::UnsupportedContextType(capset_id));
-        }
         let name = CString::new(name).unwrap_or_default();
         let bytes = name.as_bytes();
-        // SAFETY: `name` is a NUL-terminated buffer of `bytes.len()` visible
-        // characters, alive across the call; the library copies it.
-        let rc = unsafe { (self.api.context_create)(ctx_id, bytes.len() as u32, name.as_ptr()) };
+        // A typed context needs `virgl_renderer_context_create_with_flags`
+        // (0.10+), where `flags` *is* the capset id. Pinned 0.9 has only
+        // `virgl_renderer_context_create`, which always makes a classic virgl
+        // context — so a capset there is refused rather than silently
+        // downgraded. `Gpu3d` has already refused a capset this renderer does
+        // not advertise; this is the belt to that braces.
+        let rc = match (&self.api.venus, capset_id) {
+            (_, 0) => {
+                // SAFETY: `name` is a NUL-terminated buffer of `bytes.len()`
+                // visible characters, alive across the call; the library
+                // copies it.
+                unsafe { (self.api.context_create)(ctx_id, bytes.len() as u32, name.as_ptr()) }
+            }
+            (Some(venus), capset) => {
+                // SAFETY: same buffer contract as above; the symbol was
+                // resolved at load and its prototype is quoted on `VenusApi`.
+                unsafe {
+                    (venus.context_create_with_flags)(
+                        ctx_id,
+                        capset,
+                        bytes.len() as u32,
+                        name.as_ptr(),
+                    )
+                }
+            }
+            (None, capset) => return Err(CommandError::UnsupportedContextType(capset)),
+        };
         if rc != 0 {
             return Err(CommandError::Renderer(format!("context_create: {rc}")));
         }
         self.contexts.push(ctx_id);
         Ok(())
+    }
+
+    fn blob_support(&self) -> crate::blob::BlobSupport {
+        // VEN-2001/VEN-2003. `host_visible_bytes` is deliberately `None` even
+        // on a library that has `virgl_renderer_resource_map`: mapping a blob
+        // into the *guest* needs a shared-memory window the machine layer has
+        // to allocate and back with host pages, and neither host does that
+        // yet. Claiming a window we cannot back would fail the guest's
+        // `mmap` after it had already built a Vulkan allocation around it.
+        crate::blob::BlobSupport {
+            guest: self.api.venus.is_some(),
+            host3d: self.api.venus.is_some(),
+            host_visible_bytes: None,
+        }
+    }
+
+    fn create_blob(
+        &mut self,
+        args: &crate::protocol::ResourceCreateBlob,
+        _mem: &Arc<GuestMem>,
+        _entries: &[MemEntry],
+    ) -> Result<(), CommandError> {
+        self.ensure_ready()?;
+        let venus = self
+            .api
+            .venus
+            .as_ref()
+            .ok_or(CommandError::UnsupportedBlobMem(args.blob_mem))?;
+        // Only host-side blobs reach a renderer at all (the device keeps
+        // guest-memory blobs to itself), so there are no iovecs to pass.
+        let c_args = CreateBlobArgs {
+            res_handle: args.resource_id,
+            ctx_id: 0,
+            blob_mem: args.blob_mem,
+            blob_flags: args.blob_flags,
+            blob_id: args.blob_id,
+            size: args.size,
+            iovecs: std::ptr::null(),
+            num_iovs: 0,
+        };
+        // SAFETY: `c_args` is a live local of exactly the layout the 0.10 API
+        // declares, and the library only reads it during the call (it copies
+        // what it keeps). The null iovec pointer is legal for `num_iovs == 0`,
+        // which is what a HOST3D blob is.
+        let rc = unsafe { (venus.resource_create_blob)(&c_args) };
+        if rc != 0 {
+            return Err(CommandError::Renderer(format!(
+                "resource_create_blob: {rc}"
+            )));
+        }
+        self.resources
+            .insert(args.resource_id, ResourceState::default());
+        Ok(())
+    }
+
+    fn destroy_blob(&mut self, resource_id: u32) {
+        if self.ensure_ready().is_err() {
+            return;
+        }
+        self.resources.remove(&resource_id);
+        // SAFETY: plain id argument; the library ignores unknown ids.
+        unsafe { (self.api.resource_unref)(resource_id) };
+    }
+
+    fn map_blob(
+        &mut self,
+        _resource_id: u32,
+        _offset: u64,
+        _size: u64,
+    ) -> Result<crate::blob::BlobMapping, CommandError> {
+        // See `blob_support`: there is no window to map into yet. The FFI half
+        // (`virgl_renderer_resource_map`) is resolved and ready; what is
+        // missing is the machine layer's BAR/GPA window and the host mapping
+        // behind it.
+        Err(CommandError::NoHostVisibleWindow)
     }
 
     fn ctx_destroy(&mut self, ctx_id: u32) {

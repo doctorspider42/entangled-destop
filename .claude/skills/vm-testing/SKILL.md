@@ -469,7 +469,7 @@ cargo +nightly fuzz build --target-dir "$HOME/entangled-fuzz-target"
 
 # Run one, time-boxed (the whole suite: chain_walk, mmio_transport,
 # debian_sums, blk_request, blk_discard, gpu_3d_commands,
-# gpu_remote_protocol).
+# gpu_remote_protocol, gpu_blob).
 cargo +nightly fuzz run chain_walk --target-dir "$HOME/entangled-fuzz-target"     -- -max_total_time=240 -rss_limit_mb=4096
 
 # Reproduce and minimise a finding.
@@ -488,6 +488,7 @@ full and the fuzz build is large.
 | `blk_request` | virtio-blk header parsing, `validate_range`, `sector_offset`, `total_len` |
 | `blk_discard` | the DISCARD / WRITE_ZEROES segment array: `segment_count` on the array's shape, `DiscardSegment::parse`/`validate` on each range, for both commands. Asserts what the host then relies on — an accepted range is inside the disk, its byte offset *and* end are representable, `unmap` only for write-zeroes, only the one defined flag bit ever accepted |
 | `gpu_3d_commands` | `virtio_gpu::renderer::validate_stream` on raw bytes, plus arbitrary 3D command sequences (contexts, creates, backing, transfers, submits, readback) through `Gpu3d` + `NullRenderer` with real guest memory |
+| `gpu_blob` | the blob-resource surface (VEN-2001/2007): the three wire parsers on raw bytes including the `nr_entries` walk, then arbitrary create/map/unmap/unref against `BlobTable` with the renderer's declared support itself fuzzed. Asserts the invariants, not just absence of panic — the byte budget equals the sum of live blobs, the window holds exactly the mappings the harness believes in, every mapping is inside the window, and **no two mappings overlap**, re-derived from outside after every operation |
 
 Rules that keep the targets useful:
 
