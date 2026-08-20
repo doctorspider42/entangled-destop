@@ -355,6 +355,7 @@ impl MsixInterrupt {
         self.table_size
     }
 
+
     fn control(&self) -> u16 {
         (self.control.load(Ordering::Acquire) >> (MSIX_CONTROL_OFFSET as u32 * 8)) as u16
     }
@@ -686,6 +687,33 @@ impl TransportInterrupt for MsixInterrupt {
             })
             .unwrap_or(0);
         tracing::debug!(queues, "MSI-X vector assignments reset");
+    }
+
+    /// Machine reset (ADR-0005): what [`Self::clear`] does, plus the PCI
+    /// function state it deliberately keeps.
+    ///
+    /// After a reboot the function must look untouched: MSI-X disabled and
+    /// unmasked, every table entry back at its power-on value (address and data
+    /// zero, vector masked). Only the two guest-writable bits of the control
+    /// register are cleared — the rest of that dword is the capability's
+    /// identity (id, next pointer, table size), which the machine's
+    /// configuration space re-publishes into the same handle on its own reset.
+    fn power_on_reset(&self) {
+        TransportInterrupt::power_on_reset(&self.line);
+        self.control
+            .fetch_and(!MSIX_CONTROL_WRITE_MASK, Ordering::AcqRel);
+        self.with_state("power-on reset", |s| {
+            s.config_vector = VIRTIO_MSI_NO_VECTOR;
+            for slot in &mut s.queue_vectors {
+                *slot = VIRTIO_MSI_NO_VECTOR;
+            }
+            for word in &mut s.pending {
+                *word = 0;
+            }
+            for entry in &mut s.entries {
+                *entry = MsixEntry::default();
+            }
+        });
     }
 
     fn take_status(&self) -> u32 {

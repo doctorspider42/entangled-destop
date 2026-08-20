@@ -13,6 +13,7 @@
 
 mod error;
 pub mod hv;
+pub mod lifecycle;
 mod memory;
 mod state;
 
@@ -31,12 +32,15 @@ pub use hv::{
     DestinationMode, ExitHandler, InterruptDelivery, InterruptKind, InterruptRequest,
     MachineConfig, RunOutcome, TriggerMode,
 };
+pub use lifecycle::{
+    Checkpoint, Lifecycle, LifecycleError, MachineLifecycle, ResettableVcpu, RunState, VcpuKick,
+};
 pub use memory::{create_guest_memory, GuestMem, HIGH_RAM_START, LOW_RAM_END};
 pub use state::{VmState, VmStateError};
 
 #[cfg(target_os = "linux")]
 pub use hypervisor::{HostCapabilities, Hypervisor, MIN_KVM_API_VERSION};
 #[cfg(target_os = "linux")]
-pub use vcpu::{spawn_vcpus, Vcpu, VcpuThreads};
+pub use vcpu::{spawn_vcpus, spawn_vcpus_with, Vcpu, VcpuThreads};
 #[cfg(target_os = "linux")]
 pub use vm::{RomRegion, Vm};

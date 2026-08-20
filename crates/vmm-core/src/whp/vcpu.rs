@@ -49,6 +49,7 @@ use windows::Win32::System::Hypervisor::{
 use crate::hv::{
     ExitHandler, HvError, RunOutcome, VcpuRegisters, X86Registers, X86SpecialRegisters,
 };
+use crate::lifecycle::{Checkpoint, Lifecycle, ResettableVcpu, VcpuKick};
 use crate::whp::cpuid::{CpuidPolicy, CpuidResult};
 use crate::whp::emulator::Emulator;
 use crate::whp::interrupt::{HaltGate, HALT_POLL};
@@ -279,11 +280,33 @@ impl WhpVcpu {
     // from the `windows` crate, so matching on them trips
     // `non_upper_case_globals`; matching on `.0` integers instead would throw
     // away the only readable names we have.
-    #[allow(non_upper_case_globals)]
     pub fn run_loop(
         &mut self,
         handler: &mut dyn ExitHandler,
         running: &AtomicBool,
+    ) -> Result<RunOutcome, VmmError> {
+        self.run_loop_with(handler, running, None)
+    }
+
+    /// [`Self::run_loop`] with a [`Lifecycle`] attached (ADR-0005).
+    ///
+    /// WHP needs no equivalent of the KVM loop's pending-exit flush: every exit
+    /// is completed by this backend before the run call returns (RIP is
+    /// advanced here, not by the hypervisor), so the top of the loop is already
+    /// a clean stop point.
+    ///
+    /// It does need the *reset* half more than KVM does: with local APIC
+    /// emulation on, WHP absorbs a triple fault instead of reporting it and the
+    /// VP simply parks (ADR-0002, phase 4). So a guest reboot only ever reaches
+    /// the host here through a device — the 0xCF9 port, the keyboard-controller
+    /// pulse or the ACPI reset register — which is exactly what
+    /// [`ExitHandler::reset_requested`] reports.
+    #[allow(non_upper_case_globals)]
+    pub fn run_loop_with(
+        &mut self,
+        handler: &mut dyn ExitHandler,
+        running: &AtomicBool,
+        lifecycle: Option<&Lifecycle>,
     ) -> Result<RunOutcome, VmmError> {
         // Created on the first exit that needs decoding, so a guest that only
         // does simple port I/O never loads winhvemulation.dll.
@@ -295,13 +318,25 @@ impl WhpVcpu {
         // them apart is what identified WHP's own INIT/SIPI handling (see
         // `WhpPartition`'s SMP notes).
         let trace_exits = std::env::var_os(TRACE_EXITS_ENV).is_some();
-        let gate: Option<&Arc<HaltGate>> = self
+        // Cloned rather than borrowed: the lifecycle checkpoint below needs
+        // `&mut self`, and a borrow of the partition living across the loop
+        // would make that impossible.
+        let halt_gate: Option<Arc<HaltGate>> = self
             .partition
             .options()
             .local_apic
-            .then(|| self.partition.halt_gate());
+            .then(|| Arc::clone(self.partition.halt_gate()));
+        let gate = halt_gate.as_ref();
 
         while running.load(Ordering::Acquire) {
+            if let Some(lifecycle) = lifecycle {
+                if lifecycle.attention() {
+                    let index = self.index;
+                    if lifecycle.checkpoint(index, self) == Checkpoint::Stopped {
+                        return Ok(RunOutcome::Stopped);
+                    }
+                }
+            }
             // Snapshot the interrupt epoch *before* entering the guest: an
             // injection that lands between `hlt` executing and the exit being
             // observed must not be slept through.
@@ -348,6 +383,16 @@ impl WhpVcpu {
             // guest will not exit again on its own afterwards.
             if handler.shutdown_requested() {
                 return Ok(RunOutcome::Shutdown);
+            }
+            if handler.reset_requested() {
+                match lifecycle {
+                    Some(lifecycle) if lifecycle.can_reset() => {
+                        if !lifecycle.request_guest_reset() {
+                            return Ok(RunOutcome::Shutdown);
+                        }
+                    }
+                    _ => return Ok(RunOutcome::Shutdown),
+                }
             }
         }
         Ok(RunOutcome::Stopped)
@@ -552,6 +597,38 @@ impl WhpVcpu {
     }
 }
 
+impl ResettableVcpu for WhpVcpu {
+    /// Deletes this virtual processor and creates it again.
+    ///
+    /// WHP has no "reset a VP" call, but it has something better: a VP that
+    /// `WHvCreateVirtualProcessor` just made **is** in the architectural reset
+    /// state, including the parts no public register exposes — the local APIC,
+    /// and an application processor's wait-for-startup suspension. That last one
+    /// is the whole reason this backend cannot do what the KVM one does: the
+    /// rule recorded in ADR-0002 phase 4 is that an AP must be left exactly as
+    /// WHP created it or the guest's INIT/SIPI never makes it runnable, and
+    /// re-creating it is the only way to get back there after a boot has used
+    /// it.
+    ///
+    /// Safe at this point and only at this point: the vCPU is parked at a
+    /// lifecycle checkpoint, so nothing is inside `WHvRunVirtualProcessor` for
+    /// this index, and this runs on the thread that owns the VP.
+    fn reset_arch_state(&mut self, _is_boot_cpu: bool) -> Result<(), HvError> {
+        let handle = self.partition.handle();
+        // SAFETY: this VP was created on the partition we hold an `Arc` on, is
+        // not running (the caller parked it), and is deleted exactly once here —
+        // the `WHvCreateVirtualProcessor` immediately below restores the
+        // invariant `Drop` relies on. A failure to delete is fatal to the reset
+        // rather than ignored, because creating over a live VP would fail too.
+        unsafe { WHvDeleteVirtualProcessor(handle, self.index) }
+            .map_err(|e| HvError::Registers(format!("WHvDeleteVirtualProcessor: {e}")))?;
+        create_virtual_processor(handle, self.index)
+            .map_err(|e| HvError::Registers(e.to_string()))?;
+        self.cpuid = CpuidPolicy::new(self.index);
+        Ok(())
+    }
+}
+
 /// Environment variable that turns on per-exit tracing in the run loop.
 pub const TRACE_EXITS_ENV: &str = "ENTANGLED_WHP_TRACE_EXITS";
 
@@ -594,13 +671,36 @@ pub struct WhpVcpuThreads {
     running: Arc<AtomicBool>,
     cancellers: Vec<VcpuCanceller>,
     handles: Vec<JoinHandle<Result<RunOutcome, VmmError>>>,
+    /// Released on stop, so a *paused* VM can still be torn down (ADR-0005).
+    lifecycle: Option<Arc<Lifecycle>>,
+}
+
+/// A [`VcpuCanceller`] *is* the WHP kick: unlike KVM's signal, it is a
+/// first-class API that any thread may call, and it already wakes a halted vCPU
+/// through the partition's halt gate.
+impl VcpuKick for VcpuCanceller {
+    fn kick(&self) {
+        if let Err(error) = self.cancel() {
+            tracing::warn!(%error, "cancelling a vCPU run for a lifecycle checkpoint failed");
+        }
+    }
 }
 
 /// Spawns one thread per vCPU. `make_handler` builds the exit handler for each
 /// vCPU index (usually a clone of the device bus).
 pub fn spawn_vcpus(
     vcpus: Vec<WhpVcpu>,
+    make_handler: impl FnMut(u32) -> Box<dyn ExitHandler>,
+) -> Result<WhpVcpuThreads, VmmError> {
+    spawn_vcpus_with(vcpus, make_handler, None)
+}
+
+/// [`spawn_vcpus`] with a [`Lifecycle`] attached (ADR-0005), the WHP peer of
+/// `crate::spawn_vcpus_with`.
+pub fn spawn_vcpus_with(
+    vcpus: Vec<WhpVcpu>,
     mut make_handler: impl FnMut(u32) -> Box<dyn ExitHandler>,
+    lifecycle: Option<Arc<Lifecycle>>,
 ) -> Result<WhpVcpuThreads, VmmError> {
     let running = Arc::new(AtomicBool::new(true));
     let mut cancellers = Vec::with_capacity(vcpus.len());
@@ -608,10 +708,22 @@ pub fn spawn_vcpus(
     for mut vcpu in vcpus {
         let mut handler = make_handler(vcpu.index);
         let flag = Arc::clone(&running);
-        cancellers.push(vcpu.canceller());
+        let canceller = vcpu.canceller();
+        if let Some(lifecycle) = &lifecycle {
+            lifecycle.register_kicker(Arc::new(canceller.clone()));
+        }
+        cancellers.push(canceller);
+        let lifecycle = lifecycle.clone();
         let handle = std::thread::Builder::new()
             .name(format!("vcpu{}", vcpu.index))
-            .spawn(move || vcpu.run_loop(handler.as_mut(), &flag))
+            .spawn(move || {
+                let index = vcpu.index;
+                let outcome = vcpu.run_loop_with(handler.as_mut(), &flag, lifecycle.as_deref());
+                if let Some(lifecycle) = &lifecycle {
+                    lifecycle.vcpu_finished(index);
+                }
+                outcome
+            })
             .map_err(|e| VmmError::Vcpu {
                 index: 0,
                 message: format!("failed to spawn vCPU thread: {e}"),
@@ -622,6 +734,7 @@ pub fn spawn_vcpus(
         running,
         cancellers,
         handles,
+        lifecycle,
     })
 }
 
@@ -631,6 +744,11 @@ impl WhpVcpuThreads {
     /// (re-)entering `WHvRunVirtualProcessor`.
     pub fn stop(self) -> Vec<Result<RunOutcome, VmmError>> {
         self.running.store(false, Ordering::Release);
+        if let Some(lifecycle) = &self.lifecycle {
+            // A vCPU parked at a lifecycle checkpoint is not inside
+            // `WHvRunVirtualProcessor`, so cancelling would never move it.
+            lifecycle.shutdown();
+        }
         let cancellers = self.cancellers;
         self.handles
             .into_iter()

@@ -997,6 +997,7 @@ mod tests {
             mem: Arc::clone(&mem),
             queues: Vec::new(),
             interrupt: Arc::new(TestInterrupt::default()),
+            quiesce: virtio_core::Quiesce::new(),
         };
         assert!(matches!(
             device.activate(resources),

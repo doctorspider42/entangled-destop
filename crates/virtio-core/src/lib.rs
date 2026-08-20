@@ -41,6 +41,7 @@ pub mod interrupt;
 pub mod mmio;
 pub mod msix;
 pub mod pci;
+pub mod quiesce;
 pub mod queue;
 pub mod state;
 pub mod status;
@@ -57,6 +58,7 @@ pub use interrupt::{
     Interrupt, InterruptError, IrqLine, LineInterrupt, MsiMessage, MsiSink, TransportInterrupt,
 };
 pub use msix::{MsixInterrupt, MAX_MSIX_VECTORS};
+pub use quiesce::Quiesce;
 pub use pci::{PciTransport, VIRTIO_PCI_BAR_SIZE};
 pub use queue::{QueueConfig, QueueError};
 pub use state::TransportState;

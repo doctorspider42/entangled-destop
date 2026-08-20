@@ -122,6 +122,19 @@ pub trait TransportInterrupt: Interrupt {
     /// read-to-clear ISR).
     fn take_status(&self) -> u32;
 
+    /// **Machine** reset, as opposed to the device reset [`Self::clear`] is
+    /// (ADR-0005).
+    ///
+    /// A device reset is a driver writing 0 to `device_status`; a machine reset
+    /// is the whole function coming back from power-on, so it also drops the
+    /// state a device reset deliberately keeps — `config_generation`, and (for
+    /// MSI-X) the table and the message-control register. The default is
+    /// [`Self::clear`], which is the whole story for a transport whose only
+    /// interrupt state is the pending word.
+    fn power_on_reset(&self) {
+        self.clear();
+    }
+
     /// The `config_generation` counter.
     fn generation(&self) -> u32;
 
@@ -219,6 +232,14 @@ impl TransportInterrupt for LineInterrupt {
     }
     fn generation(&self) -> u32 {
         Self::generation(self)
+    }
+    /// The generation is monotonic across a *device* reset — a driver
+    /// re-binding must not see it go backwards mid-read — but a rebooted
+    /// machine is a fresh device, and a counter that survived would be the one
+    /// piece of the previous boot the new guest could observe.
+    fn power_on_reset(&self) {
+        self.status.store(0, Ordering::Release);
+        self.generation.store(0, Ordering::Release);
     }
     fn as_interrupt(self: Arc<Self>) -> Arc<dyn Interrupt> {
         self

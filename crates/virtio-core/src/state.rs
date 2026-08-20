@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use crate::device::{DeviceResources, DeviceType, VirtioDevice};
 use crate::interrupt::{IrqLine, LineInterrupt, TransportInterrupt};
+use crate::quiesce::Quiesce;
 use crate::queue::QueueConfig;
 use crate::status;
 use crate::transport::TransportError;
@@ -57,6 +58,12 @@ pub struct TransportState {
     /// owns this queue's notifications, so the register path must not run the
     /// device itself. Host wiring, not guest state — survives `reset`.
     notify_offloaded: Vec<bool>,
+
+    /// The pause gate handed to the device at activation, so a worker of its
+    /// own (virtio-net's receive thread) stops touching guest memory while the
+    /// VM is paused (ADR-0005). Host wiring, like `notify_offloaded`: it
+    /// survives a reset, and a machine that never pauses leaves it open.
+    quiesce: Arc<Quiesce>,
 
     status: u32,
     activated: bool,
@@ -127,9 +134,23 @@ impl TransportState {
             queues,
             queue_sel: 0,
             notify_offloaded,
+            quiesce: Quiesce::new(),
             status: 0,
             activated: false,
         })
+    }
+
+    /// Shares the VM's pause gate with this slot, so the device's own workers
+    /// park with everything else (ADR-0005). Called once by the machine while
+    /// it wires the bus; a transport that is never told keeps a private, always
+    /// open gate and behaves exactly as it did before pause existed.
+    pub fn set_quiesce(&mut self, quiesce: Arc<Quiesce>) {
+        self.quiesce = quiesce;
+    }
+
+    /// The pause gate this slot hands to its device.
+    pub fn quiesce(&self) -> &Arc<Quiesce> {
+        &self.quiesce
     }
 
     // ------------------------------------------------------------ accessors
@@ -580,6 +601,7 @@ impl TransportState {
             mem: Arc::clone(&self.mem),
             queues,
             interrupt: Arc::clone(&self.interrupt).as_interrupt(),
+            quiesce: Arc::clone(&self.quiesce),
         };
         match self.device.activate(resources) {
             Ok(()) => {
@@ -623,6 +645,20 @@ impl TransportState {
         self.status = 0;
         self.activated = false;
         self.interrupt.clear();
+    }
+
+    /// **Machine** reset (ADR-0005): [`Self::reset`] plus the interrupt state a
+    /// device reset deliberately keeps.
+    ///
+    /// The difference is [`TransportInterrupt::power_on_reset`]: after a reboot
+    /// the function must look untouched to the new guest, down to
+    /// `config_generation` and — on virtio-pci — the MSI-X table and control
+    /// register. `notify_offloaded` still survives, for the same reason it
+    /// survives a device reset: it describes the *host's* wiring, and the same
+    /// worker keeps serving the device across the reboot.
+    pub fn power_on_reset(&mut self) {
+        self.reset();
+        self.interrupt.power_on_reset();
     }
 
     /// Tells the driver the device is broken and must be reset. The config

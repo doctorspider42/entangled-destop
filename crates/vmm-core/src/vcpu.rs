@@ -1,7 +1,7 @@
 //! vCPU creation, the KVM_RUN loop and controlled stop
-//! (backlog MVP-104/107/108).
+//! (backlog MVP-104/107/108, lifecycle checkpoints per ADR-0005).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
@@ -12,6 +12,7 @@ use crate::hv::{
     ExitHandler, HvError, RunOutcome, VcpuRegisters, X86DescriptorTable, X86Registers, X86Segment,
     X86SpecialRegisters,
 };
+use crate::lifecycle::{Checkpoint, Lifecycle, ResettableVcpu, VcpuKick};
 use crate::VmmError;
 
 /// RT signal used to kick vCPU threads out of KVM_RUN.
@@ -237,14 +238,64 @@ impl Vcpu {
         handler: &mut dyn ExitHandler,
         running: &AtomicBool,
     ) -> Result<RunOutcome, VmmError> {
-        let fail = |message: String| VmmError::Vcpu {
-            index: self.index as usize,
+        self.run_loop_with(handler, running, None)
+    }
+
+    /// [`Self::run_loop`] with a [`Lifecycle`] attached (ADR-0005).
+    ///
+    /// The only difference is the checkpoint at the top of the loop and what a
+    /// guest reset means: with a lifecycle that can restart the machine, a
+    /// triple fault or a write to a reset register becomes a *reboot* instead
+    /// of the end of the VM.
+    pub fn run_loop_with(
+        &mut self,
+        handler: &mut dyn ExitHandler,
+        running: &AtomicBool,
+        lifecycle: Option<&Lifecycle>,
+    ) -> Result<RunOutcome, VmmError> {
+        let index = self.index;
+        let fail = move |message: String| VmmError::Vcpu {
+            index: index as usize,
             message,
         };
         while running.load(Ordering::Acquire) {
+            if let Some(lifecycle) = lifecycle {
+                if lifecycle.attention() {
+                    // Retire KVM's pending userspace-I/O completion *before*
+                    // parking: a reset overwrites the registers this completion
+                    // would land in, and re-entering afterwards would apply a
+                    // stale result to a freshly booted guest.
+                    self.flush_pending_exit(handler)?;
+                    if lifecycle.checkpoint(index, self) == Checkpoint::Stopped {
+                        return Ok(RunOutcome::Stopped);
+                    }
+                }
+            }
             match self.fd.run() {
                 Ok(VcpuExit::Hlt) => return Ok(RunOutcome::Halted),
-                Ok(VcpuExit::Shutdown) => return Ok(RunOutcome::Shutdown),
+                Ok(VcpuExit::Shutdown) => {
+                    // A triple fault. Which of the two things it means is
+                    // decided by what the machine latched: an ACPI S5 write is
+                    // a power-off, anything else is the last rung of Linux's
+                    // reboot ladder (`reboot=t`, or every other mechanism
+                    // having been tried).
+                    if handler.shutdown_requested() {
+                        return Ok(RunOutcome::Shutdown);
+                    }
+                    match lifecycle {
+                        Some(lifecycle) if lifecycle.can_reset() => {
+                            tracing::info!(
+                                vcpu = index,
+                                "triple fault with no power-off latched: treating it as a reboot"
+                            );
+                            if !lifecycle.request_guest_reset() {
+                                return Ok(RunOutcome::Shutdown);
+                            }
+                            continue;
+                        }
+                        _ => return Ok(RunOutcome::Shutdown),
+                    }
+                }
                 Ok(VcpuExit::IoOut(port, data)) => handler.io_out(port, data),
                 Ok(VcpuExit::IoIn(port, data)) => handler.io_in(port, data),
                 Ok(VcpuExit::MmioWrite(addr, data)) => handler.mmio_write(addr, data),
@@ -271,8 +322,265 @@ impl Vcpu {
             if handler.shutdown_requested() {
                 return Ok(RunOutcome::Shutdown);
             }
+            // The same shape for a *reset* request (0xCF9, the keyboard
+            // controller pulse, the ACPI reset register): latch it and let the
+            // supervisor drive the restart, which parks this vCPU at the
+            // checkpoint above.
+            if handler.reset_requested() {
+                match lifecycle {
+                    Some(lifecycle) if lifecycle.can_reset() => {
+                        if !lifecycle.request_guest_reset() {
+                            return Ok(RunOutcome::Shutdown);
+                        }
+                    }
+                    // No lifecycle to restart the machine: honour the request as
+                    // an ending rather than letting the guest spin forever in
+                    // the dead loop it entered after asking.
+                    _ => return Ok(RunOutcome::Shutdown),
+                }
+            }
         }
         Ok(RunOutcome::Stopped)
+    }
+
+    /// Completes whatever KVM is still holding from the last exit, so the vCPU
+    /// can be parked (and its registers rewritten) without a stale result
+    /// landing on the other side.
+    ///
+    /// KVM keeps the completion of a userspace I/O or MMIO access in the
+    /// `kvm_run` mapping between the exit and the next `KVM_RUN`, and applies it
+    /// at the top of that call — *before* it honours `immediate_exit`. So one
+    /// run with `immediate_exit` set retires it and comes straight back. A
+    /// multi-fragment MMIO access can produce one more exit while doing so,
+    /// which is why this dispatches rather than just discarding, and why the
+    /// loop is bounded: the guest is untrusted and must not be able to keep a
+    /// pause waiting.
+    fn flush_pending_exit(&mut self, handler: &mut dyn ExitHandler) -> Result<(), VmmError> {
+        const MAX_FRAGMENTS: usize = 8;
+        let index = self.index;
+        let fail = move |message: String| VmmError::Vcpu {
+            index: index as usize,
+            message,
+        };
+        self.fd.set_kvm_immediate_exit(1);
+        let mut result = Ok(());
+        for _ in 0..MAX_FRAGMENTS {
+            match self.fd.run() {
+                Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => break,
+                Ok(VcpuExit::IoOut(port, data)) => handler.io_out(port, data),
+                Ok(VcpuExit::IoIn(port, data)) => handler.io_in(port, data),
+                Ok(VcpuExit::MmioWrite(addr, data)) => handler.mmio_write(addr, data),
+                Ok(VcpuExit::MmioRead(addr, data)) => handler.mmio_read(addr, data),
+                // Anything else (a halt, a shutdown) is not a pending
+                // completion; leave it for the run loop to see again.
+                Ok(_) => break,
+                Err(e) => {
+                    result = Err(fail(format!("KVM_RUN failed while quiescing: {e}")));
+                    break;
+                }
+            }
+        }
+        self.fd.set_kvm_immediate_exit(0);
+        result
+    }
+}
+
+// ---- architectural reset (ADR-0005) ---------------------------------------
+
+/// The local APIC's power-on register page (SDM vol. 3, "Local APIC State
+/// After Power-Up or Reset"), as KVM's `kvm_lapic_state` wants it.
+///
+/// Written wholesale rather than patched, because the interesting fields are
+/// exactly the ones a running kernel changed: the LVT entries it pointed at its
+/// own vectors, the spurious-interrupt vector register it enabled, and any
+/// IRR/ISR bit left in flight. Re-entering a fresh boot with an armed APIC
+/// timer is a triple fault a few hundred instructions later, before the new
+/// kernel has an IDT.
+fn reset_lapic_state(apic_id: u32) -> kvm_bindings::kvm_lapic_state {
+    /// The register page is 1 KiB of 16-byte-spaced 32-bit registers.
+    fn put(state: &mut kvm_bindings::kvm_lapic_state, offset: usize, value: u32) {
+        for (i, byte) in value.to_le_bytes().iter().enumerate() {
+            // `regs` is `[c_char; 1024]`; every offset used here is a named
+            // architectural register well inside it.
+            if let Some(slot) = state.regs.get_mut(offset + i) {
+                *slot = *byte as std::os::raw::c_char;
+            }
+        }
+    }
+    // Reset values from the SDM: version 0x14 with 5 LVT entries, DFR all ones
+    // (flat model), SVR with the APIC software-disabled and vector 0xff, every
+    // LVT masked. Everything not named here is zero, which is the reset value.
+    const LAPIC_ID: usize = 0x20;
+    const LAPIC_VERSION: usize = 0x30;
+    const LAPIC_DFR: usize = 0xe0;
+    const LAPIC_SVR: usize = 0xf0;
+    const LVT_FIRST: usize = 0x320;
+    const LVT_LAST: usize = 0x370;
+    const LVT_MASKED: u32 = 1 << 16;
+
+    let mut state = kvm_bindings::kvm_lapic_state::default();
+    put(&mut state, LAPIC_ID, apic_id << 24);
+    put(&mut state, LAPIC_VERSION, 0x0005_0014);
+    put(&mut state, LAPIC_DFR, 0xffff_ffff);
+    put(&mut state, LAPIC_SVR, 0x0000_00ff);
+    let mut lvt = LVT_FIRST;
+    while lvt <= LVT_LAST {
+        put(&mut state, lvt, LVT_MASKED);
+        lvt += 0x10;
+    }
+    state
+}
+
+/// The x86 power-on segment/control-register state, hypervisor-neutral.
+///
+/// `apic_base` is forced back to the architectural default *in xAPIC mode*: a
+/// guest that had switched the local APIC's base, or enabled x2APIC, must not
+/// hand that on to the next boot, which expects to find the APIC where the
+/// firmware left it.
+pub(crate) fn architectural_reset_sregs(is_boot_cpu: bool) -> X86SpecialRegisters {
+    /// Present, system=1 (code/data), accessed. Type 11 = code, execute/read.
+    fn code_segment(base: u64, selector: u16) -> X86Segment {
+        X86Segment {
+            base,
+            limit: 0xffff,
+            selector,
+            type_: 0b1011,
+            present: 1,
+            s: 1,
+            ..X86Segment::default()
+        }
+    }
+    /// Type 3 = data, read/write, accessed.
+    fn data_segment() -> X86Segment {
+        X86Segment {
+            base: 0,
+            limit: 0xffff,
+            selector: 0,
+            type_: 0b0011,
+            present: 1,
+            s: 1,
+            ..X86Segment::default()
+        }
+    }
+    /// A system descriptor (`s = 0`): the TSS and the LDT at reset.
+    fn system_segment(type_: u8) -> X86Segment {
+        X86Segment {
+            base: 0,
+            limit: 0xffff,
+            selector: 0,
+            type_,
+            present: 1,
+            s: 0,
+            ..X86Segment::default()
+        }
+    }
+
+    /// `CR0` after reset: CD | NW | ET. No PE, no PG — real mode.
+    const CR0_RESET: u64 = 0x6000_0010;
+    /// `IA32_APIC_BASE`: the architectural window, enabled, xAPIC mode.
+    const APIC_BASE_ENABLE: u64 = 1 << 11;
+    const APIC_BASE_BSP: u64 = 1 << 8;
+    const APIC_DEFAULT_BASE: u64 = 0xfee0_0000;
+
+    let data = data_segment();
+    X86SpecialRegisters {
+        // The reset vector: CS.base 0xffff_0000 with IP 0xfff0 puts the first
+        // fetch at 0xffff_fff0, which is where a firmware ROM lives.
+        cs: code_segment(0xffff_0000, 0xf000),
+        ds: data,
+        es: data,
+        fs: data,
+        gs: data,
+        ss: data,
+        // Type 11 = 32-bit busy TSS, type 2 = LDT.
+        tr: system_segment(0b1011),
+        ldt: system_segment(0b0010),
+        gdt: X86DescriptorTable {
+            base: 0,
+            limit: 0xffff,
+        },
+        idt: X86DescriptorTable {
+            base: 0,
+            limit: 0xffff,
+        },
+        cr0: CR0_RESET,
+        cr2: 0,
+        cr3: 0,
+        cr4: 0,
+        cr8: 0,
+        efer: 0,
+        apic_base: APIC_DEFAULT_BASE
+            | APIC_BASE_ENABLE
+            | if is_boot_cpu { APIC_BASE_BSP } else { 0 },
+    }
+}
+
+/// The general-purpose registers after reset: everything zero except the
+/// reserved `RFLAGS` bit, `RDX` (family/model/stepping, as every x86 leaves it)
+/// and `RIP` at the reset vector offset.
+pub(crate) fn architectural_reset_regs() -> X86Registers {
+    X86Registers {
+        rdx: 0x600,
+        rflags: 2,
+        rip: 0xfff0,
+        ..X86Registers::default()
+    }
+}
+
+impl ResettableVcpu for Vcpu {
+    /// KVM has no "reset this vCPU" ioctl, so the state is written out by hand.
+    ///
+    /// Three things matter, in this order:
+    ///
+    /// 1. **Pending events go first.** An injected interrupt or a pending
+    ///    exception left over from the guest that just died would be delivered
+    ///    into the new boot's first instructions.
+    /// 2. **The local APIC.** See [`reset_lapic_state`].
+    /// 3. **Registers, then `mp_state`.** An application processor goes back to
+    ///    `KVM_MP_STATE_UNINITIALIZED` — exactly where `KVM_CREATE_VCPU` left it
+    ///    — so the new kernel's INIT/SIPI sweep brings it up the same way the
+    ///    first boot did, and KVM performs the real INIT reset itself.
+    fn reset_arch_state(&mut self, is_boot_cpu: bool) -> Result<(), HvError> {
+        let err = |what: &str, e: kvm_ioctls::Error| {
+            HvError::Registers(format!("vCPU {}: {what} failed: {e}", self.index))
+        };
+
+        let mut events = self
+            .fd
+            .get_vcpu_events()
+            .map_err(|e| err("KVM_GET_VCPU_EVENTS", e))?;
+        events.exception.injected = 0;
+        events.exception.pending = 0;
+        events.exception.has_error_code = 0;
+        events.exception.error_code = 0;
+        events.interrupt.injected = 0;
+        events.interrupt.shadow = 0;
+        events.nmi.injected = 0;
+        events.nmi.pending = 0;
+        events.nmi.masked = 0;
+        events.sipi_vector = 0;
+        self.fd
+            .set_vcpu_events(&events)
+            .map_err(|e| err("KVM_SET_VCPU_EVENTS", e))?;
+
+        self.fd
+            .set_lapic(&reset_lapic_state(self.index))
+            .map_err(|e| err("KVM_SET_LAPIC", e))?;
+
+        self.set_special_registers(&architectural_reset_sregs(is_boot_cpu))?;
+        self.set_registers(&architectural_reset_regs())?;
+
+        let mp_state = kvm_bindings::kvm_mp_state {
+            mp_state: if is_boot_cpu {
+                kvm_bindings::KVM_MP_STATE_RUNNABLE
+            } else {
+                kvm_bindings::KVM_MP_STATE_UNINITIALIZED
+            },
+        };
+        self.fd
+            .set_mp_state(mp_state)
+            .map_err(|e| err("KVM_SET_MP_STATE", e))?;
+        Ok(())
     }
 }
 
@@ -280,13 +588,55 @@ impl Vcpu {
 pub struct VcpuThreads {
     running: Arc<AtomicBool>,
     handles: Vec<JoinHandle<Result<RunOutcome, VmmError>>>,
+    /// Released on stop, so a *paused* VM can still be torn down (ADR-0005).
+    lifecycle: Option<Arc<Lifecycle>>,
+}
+
+/// Kicks one vCPU thread out of `KVM_RUN` with the RT signal, from any thread.
+///
+/// The thread publishes its own `pthread_t` on entry rather than the spawner
+/// handing one out: `vmm_sys_util`'s `Killable` lives on the `JoinHandle`, which
+/// belongs to [`VcpuThreads`], and the lifecycle needs a kick handle that
+/// outlives any borrow of it.
+struct SignalKicker {
+    thread: Arc<AtomicU64>,
+}
+
+impl VcpuKick for SignalKicker {
+    fn kick(&self) {
+        let raw = self.thread.load(Ordering::Acquire);
+        if raw == 0 {
+            // The thread has not published itself yet; the requester re-kicks.
+            return;
+        }
+        // SAFETY: `raw` is a `pthread_t` this process created, published by the
+        // thread itself and never reused (the value is only ever written once,
+        // before the thread enters its run loop). `pthread_kill` on a thread
+        // that has since exited is the one race here, and glibc handles it by
+        // returning ESRCH rather than faulting — which is why the result is
+        // discarded rather than reported.
+        unsafe {
+            libc::pthread_kill(raw as libc::pthread_t, kick_signal());
+        }
+    }
 }
 
 /// Spawns one thread per vCPU. `make_handler` builds the exit handler for
 /// each vCPU index (usually a clone of the device bus).
 pub fn spawn_vcpus(
     vcpus: Vec<Vcpu>,
+    make_handler: impl FnMut(u32) -> Box<dyn ExitHandler>,
+) -> Result<VcpuThreads, VmmError> {
+    spawn_vcpus_with(vcpus, make_handler, None)
+}
+
+/// [`spawn_vcpus`] with a [`Lifecycle`] attached (ADR-0005): the run loops gain
+/// a checkpoint, the lifecycle gains a kick handle per vCPU, and stopping the
+/// VM releases anything parked at the checkpoint.
+pub fn spawn_vcpus_with(
+    vcpus: Vec<Vcpu>,
     mut make_handler: impl FnMut(u32) -> Box<dyn ExitHandler>,
+    lifecycle: Option<Arc<Lifecycle>>,
 ) -> Result<VcpuThreads, VmmError> {
     ensure_kick_signal_handler()?;
     let running = Arc::new(AtomicBool::new(true));
@@ -294,16 +644,36 @@ pub fn spawn_vcpus(
     for mut vcpu in vcpus {
         let mut handler = make_handler(vcpu.index);
         let flag = Arc::clone(&running);
+        let lifecycle = lifecycle.clone();
+        let published = Arc::new(AtomicU64::new(0));
+        if let Some(lifecycle) = &lifecycle {
+            lifecycle.register_kicker(Arc::new(SignalKicker {
+                thread: Arc::clone(&published),
+            }));
+        }
         let handle = std::thread::Builder::new()
             .name(format!("vcpu{}", vcpu.index))
-            .spawn(move || vcpu.run_loop(handler.as_mut(), &flag))
+            .spawn(move || {
+                // SAFETY: `pthread_self` takes no arguments and cannot fail.
+                published.store(unsafe { libc::pthread_self() } as u64, Ordering::Release);
+                let index = vcpu.index;
+                let outcome = vcpu.run_loop_with(handler.as_mut(), &flag, lifecycle.as_deref());
+                if let Some(lifecycle) = &lifecycle {
+                    lifecycle.vcpu_finished(index);
+                }
+                outcome
+            })
             .map_err(|e| VmmError::Vcpu {
                 index: 0,
                 message: format!("failed to spawn vCPU thread: {e}"),
             })?;
         handles.push(handle);
     }
-    Ok(VcpuThreads { running, handles })
+    Ok(VcpuThreads {
+        running,
+        handles,
+        lifecycle,
+    })
 }
 
 impl VcpuThreads {
@@ -312,6 +682,12 @@ impl VcpuThreads {
     /// and (re-)entering KVM_RUN.
     pub fn stop(self) -> Vec<Result<RunOutcome, VmmError>> {
         self.running.store(false, Ordering::Release);
+        if let Some(lifecycle) = &self.lifecycle {
+            // A vCPU parked at a lifecycle checkpoint is not inside KVM_RUN and
+            // no amount of kicking would move it; releasing the hold is what
+            // lets a paused VM be shut down.
+            lifecycle.shutdown();
+        }
         self.handles
             .into_iter()
             .map(|handle| {

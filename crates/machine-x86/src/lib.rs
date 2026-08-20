@@ -10,6 +10,10 @@ pub mod mptable;
 pub mod pci;
 pub mod pflash;
 pub mod platform;
+
+/// The three port-I/O mechanisms a guest uses to reboot itself (ADR-0005), and
+/// the latch `vmm_core::ExitHandler::reset_requested` reports.
+pub mod reset;
 pub mod rtc;
 pub mod serial;
 
