@@ -35,6 +35,55 @@ On Windows, natively, in a debug build (2026-08-19):
 | user-mode networking, in-guest | static-configured eth0 through the NAT to a host TCP listener and the echo back; `tcp_flows=1` on the host side (`--test whp_usernet`, the guest half is `entangled.netprobe=`) |
 | UEFI + NVRAM | CloudHv boots to the Boot Manager twice against one NVRAM file: first boot programs 3423 bytes, second reuses them (1538 programmed, 0 erased) — the same numbers as the KVM run (`--test whp_uefi`) |
 
+## Status: phase 5 is done — `entangled install` is native on Windows
+
+`entangled install ubuntu --size 20G --auto --headless` on this Windows host,
+debug build, no WSL involved (2026-08-20):
+
+| What | Evidence |
+|---|---|
+| the whole install | **4 min 27 s** wall clock, `installed: GPT with an ESP on /dev/vda1 (953 MiB) and root on /dev/vda2 (ext4 UUID 153f909e-…)`, exit 0 |
+| GRUB typed at over ttyS0 | the four commands echoed in the transcript, `autoinstall` on the kernel command line, subiquity ran every section unattended |
+| the ending | `reboot: Power down` → `guest requested ACPI S5 (soft off) via="PM1a_CNT"` → `VM finished state=Stopped`; the transcript is `<vm>-install.log` (173 010 bytes) |
+| NVRAM | `UEFI variable store written by the firmware programmed_bytes=5328 erased_blocks=0 refused=0 store_errors=0` |
+| the installed disk | `entangled run <vm>.toml` boots it: EDK2 → the `Boot####` entry grub-install wrote → GRUB's menu on ttyS0 → systemd → login prompt |
+
+Nothing in the installer is Windows-specific. What made it Linux-only was a
+`#[cfg]`, a `$HOME`-only cache lookup and a TAP default; details and the
+reasoning are in ADR-0002's phase-5 amendment. Two things worth knowing here:
+
+- **The Ubuntu install is offline by design**, so the NAT is not on its critical
+  path at all. `--network` only matters for `install debian`, which is d-i and
+  downloads everything; there `usernet`'s address comes from
+  `virtio_net::UserNetConfig` so the `[network]` section and the
+  `netcfg/get_ipaddress=` clause cannot disagree.
+- **A profile's own `ip=` clause now wins** over the backend's appended one
+  (`run_vm::host_api::direct_linux_cmdline`), which is what makes `ip=dhcp`
+  askable — the one way to exercise the usernet DHCP server from a real kernel
+  rather than from unit tests. That was the open phase-4 item, and it is closed:
+
+  ```text
+  host : granted the guest a DHCP lease mac=52-8f-7b-c3-42-a3 ip=192.168.74.15
+  guest: IP-Config: Got DHCP answer from 192.168.74.1, my address is 192.168.74.15
+         device=eth0, ipaddr=192.168.74.15, mask=255.255.255.0, gw=192.168.74.1
+         nameserver0=192.168.74.1
+  ```
+
+- **The NAT leaked a flow per closed connection until now**, which nothing
+  before `install debian` opened enough connections to notice. Symptom:
+  d-i stalls at "Loading additional components" after 64 udebs with
+  `refusing a guest connection: the NAT is at its flow limit flows=64`. Cause
+  and fix in `usernet::tcp::service_flows` — the guest's FIN is propagated as
+  `Shutdown::Write` on the host stream, because `CloseWait` is `is_open()` and
+  the retirement test never fired there. If you touch that module: a test that
+  closes both halves at once cannot see this class of bug.
+
+One benign teardown noise to expect, unchanged by this work: after S5 the
+supervisor cancels the other vCPU and WHP answers
+`WHvCancelRunVirtualProcessor failed: A virtual processor with the specified
+index does not exist (0x80370307)` — the VP is already gone. It is a `WARN` on a
+VM that has already stopped cleanly.
+
 ## Status: phase 3 — virtio, SMP and user-mode networking
 
 | What | Evidence |
