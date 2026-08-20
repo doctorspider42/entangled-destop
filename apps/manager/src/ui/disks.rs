@@ -23,6 +23,7 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                 .inner_margin(egui::Margin::symmetric(22, 18)),
         )
         .show(ctx, |ui| {
+            theme::paint_backdrop(ui);
             super::cards::banners(ui, app, actions);
             toolbar(ui, app, actions);
             ui.add_space(10.0);
@@ -161,7 +162,7 @@ fn disk_row(ui: &mut egui::Ui, app: &ManagerApp, row: &DiskRow, actions: &mut Ve
                 } else {
                     for attachment in &row.attachments {
                         let mode = if attachment.writable { "rw" } else { "ro" };
-                        let running = app.supervisor.is_busy(&attachment.vm);
+                        let running = app.is_busy(&attachment.vm);
                         ui::chip(
                             ui,
                             &format!("{} ({mode})", attachment.vm),

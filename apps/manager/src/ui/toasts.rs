@@ -27,9 +27,13 @@ pub fn show(ctx: &egui::Context, toasts: &[Toast], actions: &mut Vec<Action>) {
                 } else {
                     now - toast.born
                 };
-                let alpha = (age / FADE)
-                    .min((toast.lifetime() - age) / FADE)
-                    .clamp(0.0, 1.0) as f32;
+                let alpha = if theme::motion_enabled() {
+                    (age / FADE)
+                        .min((toast.lifetime() - age) / FADE)
+                        .clamp(0.0, 1.0) as f32
+                } else {
+                    1.0
+                };
                 let tint = tint(toast.level);
 
                 let response = egui::Frame::new()

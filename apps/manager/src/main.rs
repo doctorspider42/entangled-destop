@@ -13,6 +13,7 @@ mod editor;
 mod launcher;
 mod logo;
 mod metrics;
+mod mock;
 mod process;
 mod settings;
 mod theme;
@@ -48,6 +49,10 @@ struct Cli {
     /// With --screenshot: which surface to capture.
     #[arg(long, default_value = "main")]
     screenshot_view: ScreenshotView,
+    /// Run the UI against deterministic in-memory demo data. No VM directory,
+    /// metrics sampler or entangled child process is used.
+    #[arg(long)]
+    mock: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -56,6 +61,7 @@ enum ScreenshotView {
     Wizard,
     Settings,
     Disks,
+    Editor,
 }
 
 fn main() -> ExitCode {
@@ -71,6 +77,7 @@ fn main() -> ExitCode {
         entangled: cli.entangled,
         screenshot: cli.screenshot,
         screenshot_view: cli.screenshot_view,
+        mock: cli.mock,
     }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

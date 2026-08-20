@@ -13,9 +13,10 @@ the GUI can do, and a GUI crash can never take a guest down.
 ## Architecture
 
 ```
-main.rs      CLI flags (--vm-dir, --entangled, --screenshot[-view]) + tracing
+main.rs      CLI flags (--vm-dir, --entangled, --mock, --screenshot[-view]) + tracing
 app.rs       ManagerApp (eframe::App): state, Action loop, frame layout
-  ui/        views: header, cards, dialogs (wizard/delete/settings), logpane, toasts
+  ui/        views: top bar + side navigation, cards, guided wizard/dialogs,
+             activity pane and toasts
   theme.rs   every colour, radius and font size in the product
   logo.rs    procedural mark + install spinner (egui painter, no assets)
 settings.rs  ~/.config/entangled/manager.toml, typed load/save
@@ -58,13 +59,19 @@ Two rules keep it honest:
 
 ### Install flow (GUI-1602)
 
-`entangled install debian --disk <vm-dir>/<name>.raw --size <n>G --variant <v>
---memory-mib <max(1536, m)> --name <name> [--auto] [--headless]`, spawned with
-the VM directory as its working directory. The CLI writes the profile itself,
-but hardcodes 2048 MiB / 2 vCPUs, so on success the manager stamps the wizard's
-choice onto the profile (`discovery::apply_resources`). While the install runs
-the VM has no profile yet, so `PendingInstall` gives it a card with the
-Installing badge.
+The four-stage wizard collects system/media, name/resources, storage and a
+review before it launches anything. It supports Debian's verified variants and
+Ubuntu through the verified cache or an explicit local `--iso`. Storage is an
+explicit choice between a new sparse RAW image and an existing image in the VM
+directory; the latter is never recreated or truncated.
+
+The resulting `entangled install <debian|ubuntu> --disk <path> --size <n>G
+--variant <v> --memory-mib <max(1536, m)> --name <name> [--iso <path>] [--auto]
+[--headless]` is spawned with the configured working directory. The CLI writes
+the profile itself, but hardcodes its resource defaults, so on success the
+manager stamps the wizard's memory/vCPU choice onto the profile
+(`discovery::apply_resources`). While the install runs the VM has no profile
+yet, so `PendingInstall` gives it a card with the Installing badge.
 
 ## Theme tokens (GUI-1606)
 
@@ -87,11 +94,18 @@ All in `theme.rs`; views never invent a colour.
 - `gradient_rect` is a two-triangle `Mesh` — egui has no gradient brush. Used
   for the header hairline, card top edge and modal title rule (square corners
   only; rounded gradients would need clipping).
-- Motion, all through `ctx.animate_bool_with_time` or the frame clock: card
+- Motion goes through `theme::animate_bool` / `theme::animation_time`: card
   hover (180 ms fill/border lift), button hover (140 ms glow + accent slide),
-  a breathing halo on Running, a blinking dot on Stopping, and the
-  entangled-particle spinner while installing (`logo::paint_particle_spinner`).
-  The window repaints every 40 ms because the mark is always in motion.
+  the subtle grid scan and eight-node background field, a breathing halo on
+  Running, a blinking dot on Stopping, and the entangled-particle spinner while installing
+  (`logo::paint_particle_spinner`). The persisted **Interface motion** setting
+  disables all of it. Enabled mode repaints every 40 ms while the window is
+  focused; an unfocused or motion-disabled window uses a one-second heartbeat
+  for stats/toast expiry and otherwise remains event driven. Do not bypass
+  these theme helpers with direct egui animations.
+- `logo.rs` owns both the painter mark and `app_icon()`. The latter rasterises
+  the same two-loop geometry once at startup for the native window/taskbar
+  icon, avoiding platform-specific bitmap assets.
 - Do **not** set `visuals.override_text_color`: it repaints hint text and
   disabled labels at full strength, which once made the delete dialog's
   placeholder look like typed input. Body colour comes from
@@ -132,7 +146,26 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
 
 - `--vm-dir <dir>` / `--entangled <path>` override the saved settings for one
   run; the Settings panel persists them.
-- `--screenshot <png> [--screenshot-view main|wizard|settings]` renders a few
+- `--mock` starts the complete UI with deterministic in-memory machines,
+  disks, statuses and host metrics. It does not load saved settings, scan a VM
+  directory, start the metrics worker or invoke `entangled`; mutating buttons
+  only update the fixture or show a toast. A `MOCK DATA` chip stays visible in
+  the header so screenshots cannot be confused with a real host. Use it for
+  ordinary button/layout work instead of preparing profiles or launching a VM:
+
+  ```powershell
+  $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\entangled-target-gui"
+  cargo run -p entangled-manager -- --mock
+  ```
+
+- Combine mock mode with the screenshot surfaces for unattended visual QA:
+
+  ```powershell
+  cargo run -p entangled-manager -- --mock --screenshot .\manager.png --screenshot-view main
+  cargo run -p entangled-manager -- --mock --screenshot .\editor.png --screenshot-view editor
+  ```
+
+- `--screenshot <png> [--screenshot-view main|wizard|settings|disks|editor]` renders a few
   frames, saves a PNG through `ViewportCommand::Screenshot` and exits — the
   quickest way to review a visual change without a human at the keyboard.
 - The UI itself has no automated tests. To exercise it end to end, drive the
