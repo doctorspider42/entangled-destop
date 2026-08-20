@@ -76,7 +76,10 @@ kernel and initramfs artifacts, and self-skips without them.
 Task-focused guides for working in this repo live in `.claude/skills/`:
 `kvm-machine`, `whp-backend`, `linux-direct-boot`, `acpi-machine`,
 `virtio-device`, `debian-media`, `host-display`, `vm-testing`, `gui-manager`.
-Load the matching skill before working on that subsystem.
+Load the matching skill before working on that subsystem. **Every agent loads
+`dev-environment` first** — target-dir and disk-space rules for this two-host
+machine (the WSL VHDX bloat problem), demo-VM launching, artifact rebuilds;
+`scripts/dev-clean.sh` sweeps stray build dirs.
 
 ## Hard rules
 
