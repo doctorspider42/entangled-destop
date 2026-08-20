@@ -259,6 +259,63 @@ row is closed. The one behavioural difference that remains product-visible is
 the one-mapped-partition-per-process limit, which `entangled-manager` already
 respects by driving one CLI process per VM.
 
+## Amendment (2026-08-20, phase 5): `entangled install` is native on Windows
+
+`entangled install ubuntu --auto --headless` completes on a plain Windows host
+and the disk it produces boots — measured on this machine, debug build:
+**4 min 27 s** from the command to `installed: GPT with an ESP on /dev/vda1
+(953 MiB) and root on /dev/vda2 (ext4 UUID …)`, ending in the guest's own ACPI
+S5 and a written profile whose paths are Windows paths. The port surface table
+at the top of this ADR is now closed for the *whole* product surface, not just
+`run`.
+
+**Almost nothing had to be replaced, because almost nothing was Linux-specific.**
+The gate said "requires a Linux host with KVM (on Windows use WSL2)"; behind it
+were three files whose content is *logic over bytes* — the newc cpio the d-i
+preseed rides in, the ISO9660 NoCloud seed, the GRUB-over-serial typing, the
+partition-table inspection, the profile writer. None of it mounts anything: the
+installer writes the disk from inside the guest, and the host only ever *reads*
+partition tables (`crates/disk-image`, portable since the disk-management work).
+So the change is a `#[cfg]` widening plus two honest per-host decisions, in the
+same shape `run_vm` uses — one shared body, the differences named in one place:
+
+| | Linux (KVM) | Windows (WHP) |
+|---|---|---|
+| `install --network` default | `tap` | `usernet` |
+| `--network tap` | the host interface | typed refusal naming `--network usernet` |
+| Debian bootstrap kernel | `guest/bootstrap-kernel/build.sh` | no cross build; copy `artifacts/bootstrap/` in, or install Ubuntu |
+| Everything else | identical | identical |
+
+**The riskiest thing about the port turned out not to exist.** The plan named
+the installer's networking as the highest-risk item — d-i and subiquity both
+want a mirror, and on Windows that means the smoltcp NAT rather than TAP. But
+the Ubuntu path is *deliberately offline* (`assets/autoinstall/ubuntu-server.yaml`:
+one mirror candidate, no geoip, `fallback: offline-install`, everything installed
+out of the ISO's own pool), so the install that matters on Windows never touches
+the network at all. Networking is on the Debian d-i path's critical path only,
+where the preseed is given a static address — and where usernet's numbers now
+come from `virtio_net::UserNetConfig` itself rather than being repeated in the
+installer, so the `[network]` section and the `netcfg/get_ipaddress=` clause
+cannot drift apart.
+
+**Two path facts that a Linux-first codebase gets wrong, both now tested.**
+The cache root was resolved as `$HOME/.cache/entangled` with no Windows
+fallback, so a Windows host with a full 2.9 GiB ISO cache reported "no Ubuntu
+ISO in the cache"; `debian_media::cache_root` is now the one resolution both the
+media cache and the ISO lookup use (`%LOCALAPPDATA%\entangled` when there is no
+`HOME`), asserted for both hosts' environments on both hosts. And `--disk` is
+now optional, defaulting into the *manager's* VM directory
+(`disk_image::refs::manager_vm_dir`, `%USERPROFILE%\entangled-vms`), because two
+defaults would have meant two halves of one VM collection.
+
+One product decision recorded rather than made silently: an Ubuntu install still
+writes a profile with **no `[network]` section**, matching the offline install it
+came from. The cost is visible in the boot log — `systemd-networkd-wait-online`
+and `cloud-init-network` each wait out their timeout before the login prompt,
+on both hosts. Attaching a NIC means also giving the installed system a netplan
+that expects one, which is a change to the autoinstall profile both hosts share,
+so it is left as a follow-up rather than smuggled into the port.
+
 ## Consequences
 
 - The MVP pays a small ongoing tax (trait indirection for interrupts, target
