@@ -222,7 +222,8 @@ fn a_guest_fstrim_gives_the_host_its_disk_space_back() {
     // The config fields we publish have to have become queue limits, or the
     // guest would never have issued a discard in the first place.
     assert_ne!(
-        granularity, "0",
+        granularity,
+        "0",
         "the guest kernel reported discard_granularity=0, so the config fields \
          never landed; serial tail:\n{}",
         tail(&with.serial)
