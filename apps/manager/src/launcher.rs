@@ -175,10 +175,6 @@ pub const BOOTSTRAP_KERNEL: &str = "artifacts/bootstrap/vmlinuz";
 /// child's working directory, named in the profile that comes out.
 pub const UEFI_FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
 
-pub fn bootstrap_kernel_missing(cwd: &Path) -> bool {
-    !cwd.join(BOOTSTRAP_KERNEL).is_file()
-}
-
 /// The artifact `entangled install <distro>` would fail on, if any — one message
 /// ready to show, or `None` when this host can install that distribution now.
 ///
