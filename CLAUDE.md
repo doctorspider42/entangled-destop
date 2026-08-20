@@ -71,6 +71,7 @@ kernel and initramfs artifacts, and self-skips without them.
 | `crates/virtio-net` | virtio-net device, TAP backend | EPIC 5 |
 | `crates/virtio-gpu` | virtio-gpu device: 2D scanout + VirGL 3D (`Renderer3d` trait, null renderer everywhere, virglrenderer dlopen'd on Linux — ADR-0004) | EPIC 8, GPU-001..012 |
 | `crates/virtio-input` | keyboard + absolute pointer devices | EPIC 9 |
+| `crates/virtio-sound` | virtio-snd playback: control/event/TX queues, PCM lifecycle, host sinks behind `AudioSink` (null/recording everywhere, ALSA dlopen'd on Linux, WASAPI on Windows) | EPIC 21, GAME-2102 |
 | `crates/display` | winit window, wgpu renderer, host input capture | EPIC 7 |
 | `crates/debian-media` | Debian download, PGP+SHA-512 verification, cache, manifests | EPIC 6 |
 | `crates/disk-image` | Portable disk-image logic: MBR/GPT/ext4 inspection, create/resize, sparse-preserving relocate, profile-reference guard, `.nvram` sidecar convention | — |
