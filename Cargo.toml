@@ -144,6 +144,15 @@ eframe = { version = "0.32", default-features = false, features = [
     "x11",
     "wayland",
 ] }
+# Native file/folder pickers for the manager. MIT, and the Linux backend is
+# deliberately the **XDG desktop portal** (`xdg-portal` → pollster + ashpd/zbus,
+# all permissive) rather than rfd's `gtk3` backend, which would link GTK — an
+# LGPL library — into a host binary that must stay copyleft-free (ADR-0001).
+# `wayland` only lets the dialog take a parent surface handle.
+rfd = { version = "0.17", default-features = false, features = [
+    "xdg-portal",
+    "wayland",
+] }
 
 # Native Windows host (EPIC 17, ADR-0002). Microsoft's official bindings,
 # MIT OR Apache-2.0; only ever referenced from
