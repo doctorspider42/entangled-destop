@@ -11,7 +11,12 @@ amendments recording what the port has actually delivered — read before adding
 OS-specific code or interrupt plumbing),
 [docs/adr/0003-uefi-firmware.md](docs/adr/0003-uefi-firmware.md) (which UEFI
 firmware, how it is entered, and what the machine still owes it — read before
-touching boot modes or firmware-facing platform devices).
+touching boot modes or firmware-facing platform devices),
+[docs/adr/0005-vm-lifecycle.md](docs/adr/0005-vm-lifecycle.md) (pause, resume
+and reboot-in-place: the vCPU stop protocol, what "quiesced" means per device
+class, the guest reset matrix, and the gap list for suspend/restore — read
+before adding a device, a host thread that touches guest memory, or anything
+that ends a run).
 
 ## Build and test
 
@@ -119,6 +124,11 @@ twin is updated and validated too.
   one touched no device crate, which is the standard to hold. The half the
   transports share lives in `virtio_core::state::TransportState` — a transport
   module is only an address decoder.
+- **A VM can be frozen and rebooted, so every device owes two things**
+  (ADR-0005): a `reset()` that returns it to power-on, and — if it runs a host
+  thread of its own that touches guest memory — a `virtio_core::Quiesce` wait
+  before it does, taken *outside* any device lock. A device that skips either
+  makes "paused" a lie and a reboot a haunting.
 - **No QEMU anywhere** — not as a process, dependency or linked library.
 - Errors are typed (`thiserror`) per crate; logging via `tracing` with the VM
   id in the span.

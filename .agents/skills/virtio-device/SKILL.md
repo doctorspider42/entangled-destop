@@ -403,3 +403,41 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
   in sysfs `msi_irqs/`, which exist only once the kernel enabled MSI-X). Assert
   on all three, and boot the INTx variant too — `PciInterruptMode::IntxOnly`,
   because a guest offered MSI-X will never pick INTx on its own.
+
+## Pause and reset: what every device owes the machine (ADR-0005)
+
+A VM can now be **frozen** and **rebooted in place**, so a device is not finished
+when it works — it has to survive both. Two obligations, one line each:
+
+1. **`reset()` returns the device to power-on**, infallibly. This already existed
+   as the driver-facing device reset (a write of 0 to `device_status`); a machine
+   reset calls the same path through `TransportState::power_on_reset`, which adds
+   what a device reset deliberately *keeps*: `config_generation`, and on
+   virtio-pci the MSI-X table and message-control register. A virtio device reset
+   is not a PCI function reset; a reboot is both.
+2. **A host thread of your own that touches guest memory must take the pause
+   gate first.** `DeviceResources::quiesce` is an `Arc<Quiesce>`;
+   `quiesce.wait_while_paused(|| !stop.load(..))` at the top of the loop, *before*
+   any device lock. Only virtio-net needs it today (its receive worker writes
+   arriving frames straight into the RX ring on its own schedule). A device whose
+   work all happens inside `notify()` needs nothing: it is already on a parked
+   vCPU thread, or behind a queue worker that took the gate for it.
+
+Three rules that are easy to get wrong:
+
+- **Take the gate outside the lock.** A machine reset runs *while the VM is
+  quiesced* and needs the device locks. Parking inside one deadlocks the reset
+  that is trying to shut you down.
+- **Bring your own liveness predicate, and `wake()` when you stop.** virtio-net's
+  `reset()` joins its receive worker; a gate that only opened on resume would
+  deadlock exactly that. `stop.store(true); quiesce.wake(); thread.join()`.
+- **Host wiring survives a reset.** `notify_offloaded`, the ioeventfd
+  registrations, the pause gate itself: all of it describes the *host*, not the
+  guest, and the same worker keeps serving the device across a reboot. What does
+  not survive is anything the guest programmed.
+
+On virtio-pci the bus additionally restores each function's configuration space
+from a power-on snapshot taken at attach, then **re-bases the notify
+ioeventfds** around the restored BARs (`reconcile_notify`). Miss that and the
+next boot's kicks land at an address nothing is listening to — a device that
+enumerates, negotiates and then never completes a request.

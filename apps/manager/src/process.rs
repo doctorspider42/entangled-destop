@@ -192,6 +192,9 @@ pub struct TaskSpec {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub log_path: PathBuf,
+    /// Keep the child's stdin as a pipe and use it as a lifecycle control
+    /// channel (ADR-0005). Only `entangled run --control-stdin` reads one.
+    pub control: bool,
 }
 
 impl TaskSpec {
@@ -216,6 +219,18 @@ struct Shared {
     log: Mutex<LogBuffer>,
     stop: AtomicBool,
     kill: AtomicBool,
+    /// The child's stdin, when it was started with a lifecycle control channel
+    /// (`entangled run --control-stdin`, ADR-0005). `None` for every other kind
+    /// of task, and after the child has gone.
+    control: Mutex<Option<std::process::ChildStdin>>,
+    /// Whether the manager has *asked* this VM to pause.
+    ///
+    /// Deliberately "asked", not "is": the VM can also be frozen from its own
+    /// window with Ctrl+Alt+P, and the manager would not know. Tracking the
+    /// request is what the Pause/Resume button needs and all it can honestly
+    /// claim; the VM's own idea of its state is one `status` command away for
+    /// anything that needs the truth.
+    pause_requested: AtomicBool,
 }
 
 /// A supervised child process.
@@ -255,6 +270,66 @@ impl Task {
 
     pub fn stop_requested(&self) -> bool {
         self.shared.stop.load(Ordering::Acquire)
+    }
+
+    /// Whether this VM has a lifecycle control channel (ADR-0005) — only an
+    /// `entangled run` started with `--control-stdin` does.
+    pub fn has_control(&self) -> bool {
+        self.shared
+            .control
+            .lock()
+            .is_ok_and(|control| control.is_some())
+    }
+
+    /// Whether the manager has asked this VM to pause. See
+    /// [`Shared::pause_requested`] for why this is a request and not a state.
+    pub fn pause_requested(&self) -> bool {
+        self.shared.pause_requested.load(Ordering::Acquire)
+    }
+
+    /// Freezes the VM, or lets a frozen one continue (ADR-0005).
+    ///
+    /// Returns false when there is no control channel or the write failed —
+    /// the child having exited between the click and the write, most likely,
+    /// which is a race the UI cannot avoid and must not crash on.
+    pub fn set_paused(&self, paused: bool) -> bool {
+        let command = if paused { "pause" } else { "resume" };
+        if !self.send_control(command) {
+            return false;
+        }
+        self.shared.pause_requested.store(paused, Ordering::Release);
+        true
+    }
+
+    /// Reboots the VM in place (ADR-0005): the same machine reset the guest's
+    /// own Restart performs, not a stop followed by a start.
+    pub fn reset(&self) -> bool {
+        if !self.send_control("reset") {
+            return false;
+        }
+        // A reset always leaves the VM running, whichever state it was in.
+        self.shared.pause_requested.store(false, Ordering::Release);
+        true
+    }
+
+    fn send_control(&self, command: &str) -> bool {
+        use std::io::Write as _;
+        let Ok(mut control) = self.shared.control.lock() else {
+            return false;
+        };
+        let Some(pipe) = control.as_mut() else {
+            return false;
+        };
+        match writeln!(pipe, "{command}").and_then(|()| pipe.flush()) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(vm = %self.vm, command, %error, "lifecycle command not delivered");
+                // The pipe is broken for good; drop it so the UI stops offering
+                // buttons that cannot work.
+                *control = None;
+                false
+            }
+        }
     }
 
     /// Copies the tail of the log for rendering. `partial` output (a line
@@ -348,11 +423,19 @@ impl Supervisor {
         command
             .args(&spec.args)
             .current_dir(&spec.cwd)
-            .stdin(Stdio::null())
+            // A pipe rather than nothing when the task asked for a control
+            // channel: `entangled run --control-stdin` reads lifecycle commands
+            // from it (ADR-0005), and the manager is the program on the other
+            // end. Every other task still gets nothing to read.
+            .stdin(if spec.control {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err));
         detach_process_group(&mut command);
-        let child = command.spawn().map_err(|source| ProcessError::Spawn {
+        let mut child = command.spawn().map_err(|source| ProcessError::Spawn {
             program: spec.program.display().to_string(),
             source,
         })?;
@@ -362,6 +445,8 @@ impl Supervisor {
             log: Mutex::new(LogBuffer::default()),
             stop: AtomicBool::new(false),
             kill: AtomicBool::new(false),
+            control: Mutex::new(child.stdin.take()),
+            pause_requested: AtomicBool::new(false),
         });
 
         let id = self.next_id;
@@ -625,6 +710,7 @@ mod tests {
             args: args.iter().map(|a| a.to_string()).collect(),
             cwd: dir.to_path_buf(),
             log_path: dir.join(format!("{vm}.log")),
+            control: false,
         }
     }
 
@@ -637,6 +723,7 @@ mod tests {
             args: vec!["install".into(), "--name".into(), "two words".into()],
             cwd: PathBuf::from("/tmp"),
             log_path: PathBuf::from("/tmp/demo.log"),
+            control: false,
         };
         assert_eq!(
             spec.command_line(),
@@ -706,6 +793,7 @@ mod tests {
             args: vec![],
             cwd: dir.clone(),
             log_path: dir.join("ghost.log"),
+            control: false,
         };
         assert!(matches!(sup.spawn(spec), Err(ProcessError::Spawn { .. })));
         assert!(!sup.is_busy("ghost"));
@@ -722,6 +810,7 @@ mod tests {
             args: vec![],
             cwd: dir.clone(),
             log_path: dir.join("missing-dir").join("nolog.log"),
+            control: false,
         };
         spec.args.clear();
         assert!(matches!(sup.spawn(spec), Err(ProcessError::LogFile { .. })));

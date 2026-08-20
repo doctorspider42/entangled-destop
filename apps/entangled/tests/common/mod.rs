@@ -1,8 +1,13 @@
-//! Shared by the two integration tests that drive the real CLI against a real
-//! guest (`ubuntu_install`, `cdrom_boot`): reading what a serial console wrote.
+//! Shared by the integration tests that drive the real CLI against a real guest
+//! (`ubuntu_install`, `cdrom_boot`, `guest_reboot`): reading what a serial
+//! console wrote.
 //!
-//! It is one function because both tests learned the same lesson twice, in the
-//! same afternoon, on the same host — see [`read_transcript`].
+//! It is one function because two of those tests learned the same lesson twice,
+//! in the same afternoon, on the same host — see [`read_transcript`]. The third
+//! reads the console from a pipe rather than a file and needs only
+//! [`strip_ansi`], which is why each is `allow(dead_code)`: a `tests/<dir>/mod.rs`
+//! is compiled separately into every test binary that mentions it.
+#![allow(dead_code)]
 
 use std::path::Path;
 

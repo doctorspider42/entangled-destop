@@ -274,26 +274,67 @@ impl Vcpu {
             match self.fd.run() {
                 Ok(VcpuExit::Hlt) => return Ok(RunOutcome::Halted),
                 Ok(VcpuExit::Shutdown) => {
-                    // A triple fault. Which of the two things it means is
-                    // decided by what the machine latched: an ACPI S5 write is
-                    // a power-off, anything else is the last rung of Linux's
-                    // reboot ladder (`reboot=t`, or every other mechanism
-                    // having been tried).
+                    // A triple fault. Which of the three things it means is
+                    // decided by what the machine latched and by *which* CPU
+                    // faulted:
+                    //
+                    // * an ACPI S5 write outstanding — the guest is powering off,
+                    //   and this is how it gets there;
+                    // * the boot CPU with nothing latched — the last rung of
+                    //   Linux's reboot ladder (`reboot=t`, or everything else
+                    //   having been tried), so: reboot;
+                    // * an application processor — *not* a reason to restart the
+                    //   machine. EDK2's `MpInitLib` wakes each AP with INIT/SIPI
+                    //   and carries on with however many answer ("Find 1
+                    //   processors in system"), so a machine whose AP faults
+                    //   during startup is one the firmware expects to keep
+                    //   running. Rebooting on it would turn a rare race into a
+                    //   reboot loop; ending the VM — which is what this backend
+                    //   used to do — throws away a boot that was going to
+                    //   succeed.
+                    //
+                    // In every case the vCPU must not be re-entered: KVM answers
+                    // the next `KVM_RUN` on a shut-down vCPU with
+                    // `KVM_EXIT_INTERNAL_ERROR`.
                     if handler.shutdown_requested() {
                         return Ok(RunOutcome::Shutdown);
                     }
-                    match lifecycle {
-                        Some(lifecycle) if lifecycle.can_reset() => {
+                    let can_reset = lifecycle.is_some_and(Lifecycle::can_reset);
+                    match (index, can_reset) {
+                        (_, false) => return Ok(RunOutcome::Shutdown),
+                        (0, true) => {
                             tracing::info!(
                                 vcpu = index,
-                                "triple fault with no power-off latched: treating it as a reboot"
+                                "triple fault on the boot CPU with no power-off latched:                                  treating it as a reboot"
                             );
+                            let Some(lifecycle) = lifecycle else {
+                                return Ok(RunOutcome::Shutdown);
+                            };
                             if !lifecycle.request_guest_reset() {
                                 return Ok(RunOutcome::Shutdown);
                             }
-                            continue;
+                            match park_for_reset(index, self, lifecycle, running, handler)? {
+                                Parked::Reset => continue,
+                                Parked::Stop => return Ok(RunOutcome::Stopped),
+                                Parked::GaveUp => return Ok(RunOutcome::Shutdown),
+                            }
                         }
-                        _ => return Ok(RunOutcome::Shutdown),
+                        (_, true) => {
+                            tracing::warn!(
+                                vcpu = index,
+                                "triple fault on an application processor: parking it and                                  leaving the machine running"
+                            );
+                            let Some(lifecycle) = lifecycle else {
+                                return Ok(RunOutcome::Shutdown);
+                            };
+                            // No deadline: the AP waits for a machine reset for
+                            // as long as the VM lives, and the VM is not waiting
+                            // for the AP.
+                            match park_indefinitely(index, self, lifecycle, running, handler)? {
+                                Parked::Reset => continue,
+                                _ => return Ok(RunOutcome::Stopped),
+                            }
+                        }
                     }
                 }
                 Ok(VcpuExit::IoOut(port, data)) => handler.io_out(port, data),
@@ -331,6 +372,14 @@ impl Vcpu {
                     Some(lifecycle) if lifecycle.can_reset() => {
                         if !lifecycle.request_guest_reset() {
                             return Ok(RunOutcome::Shutdown);
+                        }
+                        // The guest is in its own dead loop by now, waiting for
+                        // a reset that will never come from inside. Waiting for
+                        // the supervisor beats spinning through it.
+                        match park_for_reset(index, self, lifecycle, running, handler)? {
+                            Parked::Reset => continue,
+                            Parked::Stop => return Ok(RunOutcome::Stopped),
+                            Parked::GaveUp => return Ok(RunOutcome::Shutdown),
                         }
                     }
                     // No lifecycle to restart the machine: honour the request as
@@ -382,6 +431,83 @@ impl Vcpu {
         }
         self.fd.set_kvm_immediate_exit(0);
         result
+    }
+}
+
+// ---- parking a vCPU that must not re-enter the guest (ADR-0005) -----------
+
+/// How a park ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Parked {
+    /// The machine was reset; this vCPU is at its boot state and may run.
+    Reset,
+    /// The VM is stopping.
+    Stop,
+    /// Nobody served the reset within the deadline.
+    GaveUp,
+}
+
+/// How long a vCPU waits for the supervisor to serve a reset before giving up
+/// and ending the VM.
+///
+/// Long enough that a busy host is not mistaken for a missing supervisor, short
+/// enough that a VM whose supervisor died does not hang for ever. The guest is
+/// untrusted: a reset it asked for must not be able to wedge the host.
+const RESET_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Waits for the machine reset this vCPU has just asked for, bounded by
+/// [`RESET_WAIT`].
+fn park_for_reset(
+    index: u32,
+    vcpu: &mut Vcpu,
+    lifecycle: &Lifecycle,
+    running: &AtomicBool,
+    handler: &mut dyn ExitHandler,
+) -> Result<Parked, VmmError> {
+    park(index, vcpu, lifecycle, running, handler, Some(RESET_WAIT))
+}
+
+/// The same, without a deadline: for an application processor that faulted and
+/// is simply waiting for the machine to be reset around it, which may be never.
+fn park_indefinitely(
+    index: u32,
+    vcpu: &mut Vcpu,
+    lifecycle: &Lifecycle,
+    running: &AtomicBool,
+    handler: &mut dyn ExitHandler,
+) -> Result<Parked, VmmError> {
+    park(index, vcpu, lifecycle, running, handler, None)
+}
+
+fn park(
+    index: u32,
+    vcpu: &mut Vcpu,
+    lifecycle: &Lifecycle,
+    running: &AtomicBool,
+    handler: &mut dyn ExitHandler,
+    deadline: Option<std::time::Duration>,
+) -> Result<Parked, VmmError> {
+    let started = std::time::Instant::now();
+    loop {
+        if !running.load(Ordering::Acquire) {
+            return Ok(Parked::Stop);
+        }
+        if lifecycle.attention() {
+            vcpu.flush_pending_exit(handler)?;
+            return Ok(match lifecycle.checkpoint(index, vcpu) {
+                Checkpoint::Continue => Parked::Reset,
+                Checkpoint::Stopped => Parked::Stop,
+            });
+        }
+        if deadline.is_some_and(|limit| started.elapsed() >= limit) {
+            tracing::error!(
+                vcpu = index,
+                waited = ?started.elapsed(),
+                "no supervisor served the guest's reset request; ending the VM"
+            );
+            return Ok(Parked::GaveUp);
+        }
+        lifecycle.wait_for_attention(std::time::Duration::from_millis(20));
     }
 }
 

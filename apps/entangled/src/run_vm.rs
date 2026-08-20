@@ -347,13 +347,18 @@ fn build_devices(
 
 /// Lifecycle requests waiting to be served (ADR-0005).
 ///
-/// Two flags rather than a queue: pausing twice in a row is pausing once, and
+/// Flags rather than a queue: pausing twice in a row is pausing once, and
 /// resetting twice in a row is resetting once. Whoever notices the request —
-/// the window's input pump, an automation hook — sets a flag and carries on;
+/// the window's input pump, the control channel — sets a flag and carries on;
 /// the supervisor thread is the only one that blocks.
 #[derive(Debug, Default)]
 struct LifecycleRequests {
+    /// The window's `Ctrl+Alt+P`: freeze, or continue if already frozen.
     pause_toggle: AtomicBool,
+    /// The control channel's explicit `pause` / `resume`, which a program
+    /// driving a VM wants instead of a toggle it would have to track.
+    pause: AtomicBool,
+    resume: AtomicBool,
     reset: AtomicBool,
 }
 
@@ -374,6 +379,87 @@ fn note_control_event(event: display::ControlEvent, requests: &LifecycleRequests
         display::ControlEvent::ResetRequested => {
             requests.reset.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+/// Prefix every line the control channel prints, so a program driving a VM can
+/// tell its own answers apart from the guest's console — they share stdout,
+/// because the guest console *is* what `entangled run` prints.
+pub const CONTROL_PREFIX: &str = "entangled-control:";
+
+/// Reads lifecycle commands from stdin, one per line (ADR-0005).
+///
+/// The VM's control surface for a program rather than a person: the window's
+/// key bindings need someone at a keyboard, and `entangled-manager` drives the
+/// CLI as a child process whose stdin it already owns. A pipe rather than a
+/// socket because it is the one channel that exists identically on both hosts,
+/// needs no path, no permissions and no cleanup, and dies with the process it
+/// controls — which for "pause this VM" is exactly the lifetime wanted.
+///
+/// | Command | Effect |
+/// |---|---|
+/// | `pause` | freeze the VM (idempotent) |
+/// | `resume` | let it continue (idempotent) |
+/// | `reset` | reboot it in place |
+/// | `type <text>` | type `<text>` and Enter on the guest's serial console |
+/// | `status` | print the current [`RunState`](vmm_core::RunState) |
+///
+/// `type` is the same host-to-guest path the unattended installer uses to drive
+/// GRUB (`MachineBus::push_serial_input`), exposed rather than kept private:
+/// a headless VM whose console can only be watched and never answered is half a
+/// console. It is also what lets the reboot acceptance log into a guest and ask
+/// it to restart, which is the thing being tested.
+///
+/// Unknown commands are reported and ignored — never fatal. The thread is
+/// detached: it ends when stdin closes, which for a child process is when its
+/// parent goes away.
+fn spawn_control_channel(
+    bus: MachineBus,
+    requests: Arc<LifecycleRequests>,
+    lifecycle: Arc<Lifecycle>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("control".into())
+        .spawn(move || {
+            use std::io::BufRead as _;
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else { break };
+                let line = line.trim();
+                let (command, argument) = match line.split_once(char::is_whitespace) {
+                    Some((command, rest)) => (command, rest),
+                    None => (line, ""),
+                };
+                match command {
+                    "" => {}
+                    "pause" => requests.pause.store(true, Ordering::Relaxed),
+                    "resume" => requests.resume.store(true, Ordering::Relaxed),
+                    "reset" => requests.reset.store(true, Ordering::Relaxed),
+                    "type" => {
+                        // Carriage return, not newline: the guest's terminal
+                        // discipline is what turns it into one, and a bare `\n`
+                        // is not what a serial keyboard sends.
+                        let mut bytes = argument.as_bytes().to_vec();
+                        bytes.push(b'\r');
+                        bus.push_serial_input(&bytes);
+                    }
+                    "status" => {
+                        println!("{CONTROL_PREFIX} state={:?}", lifecycle.state());
+                    }
+                    other => {
+                        println!("{CONTROL_PREFIX} unknown command {other:?}");
+                        continue;
+                    }
+                }
+                if !command.is_empty() {
+                    println!("{CONTROL_PREFIX} ok {command}");
+                }
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            tracing::debug!("the control channel closed");
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "cannot start the control channel; --control-stdin is inert");
     }
 }
 
@@ -415,16 +501,25 @@ impl LifecycleSupervisor {
                             || lifecycle.reset(),
                             || Some(VmState::Running),
                         );
-                    } else if requests.pause_toggle.swap(false, Ordering::Relaxed) {
-                        if lifecycle.is_paused() {
+                    } else {
+                        // The window sends a toggle (it cannot know the state);
+                        // the control channel sends what it means. Both end up
+                        // here, and the toggle is resolved against the truth.
+                        let toggled = requests.pause_toggle.swap(false, Ordering::Relaxed);
+                        let paused = lifecycle.is_paused();
+                        let pause =
+                            requests.pause.swap(false, Ordering::Relaxed) || (toggled && !paused);
+                        let resume =
+                            requests.resume.swap(false, Ordering::Relaxed) || (toggled && paused);
+                        if pause {
+                            Self::serve(&vm_state, VmState::Paused, || lifecycle.pause(), || None);
+                        } else if resume {
                             Self::serve(
                                 &vm_state,
                                 VmState::Running,
                                 || lifecycle.resume(),
                                 || None,
                             );
-                        } else {
-                            Self::serve(&vm_state, VmState::Paused, || lifecycle.pause(), || None);
                         }
                     }
                     std::thread::sleep(LIFECYCLE_POLL);
@@ -510,14 +605,17 @@ pub fn run(
     headless: bool,
     screenshot: Option<ScreenshotRequest>,
 ) -> Result<(), String> {
-    run_with(cfg, headless, None, screenshot).map(|_| ())
+    run_with(cfg, headless, None, screenshot, false).map(|_| ())
 }
 
+/// `control_stdin` opens the lifecycle control channel on this process's stdin
+/// (ADR-0005); see [`spawn_control_channel`].
 pub fn run_with(
     cfg: VmConfig,
     headless: bool,
     automation: Option<Automation>,
     screenshot: Option<ScreenshotRequest>,
+    control_stdin: bool,
 ) -> Result<RunReport, String> {
     let span = tracing::info_span!("vm", id = %cfg.name);
     let _guard = span.enter();
@@ -643,6 +741,9 @@ pub fn run_with(
         Arc::clone(&requests),
         Arc::clone(&vm_state),
     );
+    if control_stdin {
+        spawn_control_channel(bus.clone(), Arc::clone(&requests), Arc::clone(&lifecycle));
+    }
 
     // One predicate for both presentations: stop when asked, and on every tick
     // give the automation script a chance to look at the console and type.

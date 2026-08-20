@@ -193,3 +193,30 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
   turns that into "the TAP interface is already held by another VM …". When
   testing against the shared `debian-demo` profile, check
   `pgrep -af "[e]ntangled run"` first — two VMs on one disk would corrupt it.
+
+## Pause and Restart: the control channel (ADR-0005)
+
+A running VM's card has **Pause/Resume** and **Restart** beside **Stop**. They
+are not a stop and a start: they reach the live VM.
+
+The mechanism is the child's stdin. `launcher::run_spec` now spawns
+`entangled run --control-stdin <profile>` and `TaskSpec::control` makes the
+supervisor keep stdin as a pipe instead of `Stdio::null()`; `Task::set_paused`
+and `Task::reset` write `pause` / `resume` / `reset` lines into it. A pipe rather
+than a socket because it is the one channel that exists identically on both
+hosts, needs no path, no permissions and no cleanup, and dies with the process it
+controls — which for "pause this VM" is exactly the lifetime wanted.
+
+Two honesty rules the UI follows, and should keep following:
+
+- **The buttons are disabled for a VM this manager did not start.** A control
+  channel is a pipe to a child; a VM launched from a terminal has none, and the
+  hover text says so rather than the button lying.
+- **`pause_requested` is a request, not a state.** The VM can also be frozen
+  from its own window with `Ctrl+Alt+P`, and the manager would not know. What the
+  flag drives is the button's label, which is all it can honestly claim. The
+  VM's own answer is one `status` command away for anything that needs the truth.
+
+`Task::send_control` drops the pipe on a write error, so a child that exited
+between the click and the write turns the buttons off instead of retrying into a
+broken pipe.

@@ -594,6 +594,27 @@ impl Lifecycle {
         }
     }
 
+    /// Blocks until something is pending, or `timeout` expires. Returns whether
+    /// there is.
+    ///
+    /// For the one vCPU state that must never re-enter the guest: a vCPU that
+    /// has just triple-faulted, or one whose guest has asked to reboot and is
+    /// now spinning in its own dead loop. Both have to *wait* for the reset the
+    /// supervisor is about to run rather than spin, and the supervisor is on
+    /// another thread.
+    pub fn wait_for_attention(&self, timeout: Duration) -> bool {
+        if self.attention() {
+            return true;
+        }
+        let inner = self.lock();
+        let _unused = self
+            .changed
+            .wait_timeout(inner, timeout)
+            .map(|(guard, _)| guard)
+            .unwrap_or_else(|poisoned| poisoned.into_inner().0);
+        self.attention()
+    }
+
     /// Marks a vCPU's run loop as ended, so no later barrier waits for it.
     pub fn vcpu_finished(&self, index: u32) {
         {

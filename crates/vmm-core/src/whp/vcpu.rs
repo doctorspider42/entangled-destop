@@ -34,6 +34,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use windows::Win32::System::Hypervisor::{
     WHvCancelRunVirtualProcessor, WHvDeleteVirtualProcessor, WHvGetVirtualProcessorRegisters,
@@ -358,9 +359,44 @@ impl WhpVcpu {
                         continue;
                     }
                 },
-                // WHP's triple-fault equivalents.
+                // WHP's triple-fault equivalents. Same policy as the KVM loop:
+                // a power-off latch wins, the boot CPU means "reboot", and an
+                // application processor parks rather than taking the machine
+                // with it — see `crate::vcpu`'s account of why. Rarer here,
+                // because with local APIC emulation on WHP absorbs most resets
+                // rather than reporting them (ADR-0002 phase 4).
                 WHvRunVpExitReasonUnrecoverableException
-                | WHvRunVpExitReasonInvalidVpRegisterValue => return Ok(RunOutcome::Shutdown),
+                | WHvRunVpExitReasonInvalidVpRegisterValue => {
+                    if handler.shutdown_requested() {
+                        return Ok(RunOutcome::Shutdown);
+                    }
+                    let can_reset = lifecycle.is_some_and(Lifecycle::can_reset);
+                    let Some(lifecycle) = lifecycle.filter(|_| can_reset) else {
+                        return Ok(RunOutcome::Shutdown);
+                    };
+                    if self.index == 0 {
+                        tracing::info!(
+                            vcpu = self.index,
+                            "unrecoverable exception on the boot CPU with no power-off latched:                              treating it as a reboot"
+                        );
+                        if !lifecycle.request_guest_reset() {
+                            return Ok(RunOutcome::Shutdown);
+                        }
+                        match park(self, lifecycle, running, Some(RESET_WAIT)) {
+                            Parked::Reset => continue,
+                            Parked::Stop => return Ok(RunOutcome::Stopped),
+                            Parked::GaveUp => return Ok(RunOutcome::Shutdown),
+                        }
+                    }
+                    tracing::warn!(
+                        vcpu = self.index,
+                        "unrecoverable exception on an application processor: parking it and                          leaving the machine running"
+                    );
+                    match park(self, lifecycle, running, None) {
+                        Parked::Reset => continue,
+                        _ => return Ok(RunOutcome::Stopped),
+                    }
+                }
                 WHvRunVpExitReasonX64IoPortAccess => {
                     self.handle_io(&exit, handler, &mut emulator)?
                 }
@@ -389,6 +425,13 @@ impl WhpVcpu {
                     Some(lifecycle) if lifecycle.can_reset() => {
                         if !lifecycle.request_guest_reset() {
                             return Ok(RunOutcome::Shutdown);
+                        }
+                        // The guest is in its own dead loop by now; wait for the
+                        // supervisor rather than spinning through it.
+                        match park(self, lifecycle, running, Some(RESET_WAIT)) {
+                            Parked::Reset => continue,
+                            Parked::Stop => return Ok(RunOutcome::Stopped),
+                            Parked::GaveUp => return Ok(RunOutcome::Shutdown),
                         }
                     }
                     _ => return Ok(RunOutcome::Shutdown),
@@ -626,6 +669,52 @@ impl ResettableVcpu for WhpVcpu {
             .map_err(|e| HvError::Registers(e.to_string()))?;
         self.cpuid = CpuidPolicy::new(self.index);
         Ok(())
+    }
+}
+
+/// How a park ended; the WHP peer of `crate::vcpu::Parked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Parked {
+    Reset,
+    Stop,
+    GaveUp,
+}
+
+/// How long a vCPU waits for the supervisor to serve a reset before giving up.
+/// The guest is untrusted: a reset it asked for must not wedge the host.
+const RESET_WAIT: Duration = Duration::from_secs(30);
+
+/// Waits for the machine reset this vCPU has asked for (or, with no deadline,
+/// for whatever reset may eventually come around a parked AP).
+fn park(
+    vcpu: &mut WhpVcpu,
+    lifecycle: &Lifecycle,
+    running: &AtomicBool,
+    deadline: Option<Duration>,
+) -> Parked {
+    let index = vcpu.index;
+    let started = Instant::now();
+    loop {
+        if !running.load(Ordering::Acquire) {
+            return Parked::Stop;
+        }
+        if lifecycle.attention() {
+            // No pending-exit flush: this backend completes every exit before
+            // the run call returns.
+            return match lifecycle.checkpoint(index, vcpu) {
+                Checkpoint::Continue => Parked::Reset,
+                Checkpoint::Stopped => Parked::Stop,
+            };
+        }
+        if deadline.is_some_and(|limit| started.elapsed() >= limit) {
+            tracing::error!(
+                vcpu = index,
+                waited = ?started.elapsed(),
+                "no supervisor served the guest's reset request; ending the VM"
+            );
+            return Parked::GaveUp;
+        }
+        lifecycle.wait_for_attention(Duration::from_millis(20));
     }
 }
 

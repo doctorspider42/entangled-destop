@@ -217,6 +217,9 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             transcript: Some(transcript.clone()),
         }),
         None,
+        // No control channel: the installer *is* the program driving this VM,
+        // from inside the same process.
+        false,
     )
     .map_err(|e| format!("installer VM failed: {e}"))?;
 
