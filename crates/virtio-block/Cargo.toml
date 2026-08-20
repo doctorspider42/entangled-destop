@@ -8,6 +8,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Hole punching / zeroing on the backing image: the host half of DISCARD and
+# WRITE_ZEROES lives in disk-image::ops, which is portable by construction.
+disk-image.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 virtio-core.workspace = true
