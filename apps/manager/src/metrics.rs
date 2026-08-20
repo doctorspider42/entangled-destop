@@ -85,6 +85,19 @@ impl Metrics {
         Self { shared }
     }
 
+    /// A sampler handle with fixed data and no worker thread. Used by the UI
+    /// mock so visual work never probes the real host.
+    pub fn fixed(snapshot: Snapshot) -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(SharedState {
+                targets: Vec::new(),
+                vm_dir: PathBuf::new(),
+                snapshot,
+                stop: true,
+            })),
+        }
+    }
+
     /// Called from the frame loop: which children to measure, and where the
     /// VM directory currently is.
     pub fn set_targets(&self, targets: Vec<(String, u32)>, vm_dir: PathBuf) {

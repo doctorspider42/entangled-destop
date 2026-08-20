@@ -83,6 +83,11 @@ Load the matching skill before working on that subsystem. **Every agent loads
 machine (the WSL VHDX bloat problem), demo-VM launching, artifact rebuilds;
 `scripts/dev-clean.sh` sweeps stray build dirs.
 
+Every skill edit must update its twin in the same change: the Claude copy under
+`.claude/skills/` and the Codex copy under `$CODEX_HOME/skills/`. Keep both
+versions materially equivalent; a skill change is incomplete until its twin is
+updated and validated too.
+
 ## Hard rules
 
 - **Guest is untrusted.** Never index host memory with raw guest-supplied

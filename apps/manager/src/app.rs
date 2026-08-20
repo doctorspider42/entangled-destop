@@ -7,6 +7,7 @@
 //! - UI code produces [`Action`]s, `ManagerApp::apply` is the only place that
 //!   mutates state or touches the filesystem.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use crate::ScreenshotView;
 
 /// How often the VM directory is re-scanned while the window is open.
 const SCAN_INTERVAL: Duration = Duration::from_millis(2500);
-/// Animation clock cadence: the logo and status indicators are always moving.
+/// Animation clock cadence when ambient motion is enabled.
 const FRAME_INTERVAL: Duration = Duration::from_millis(40);
 
 pub struct Startup {
@@ -32,6 +33,7 @@ pub struct Startup {
     pub entangled: Option<PathBuf>,
     pub screenshot: Option<PathBuf>,
     pub screenshot_view: ScreenshotView,
+    pub mock: bool,
 }
 
 /// Window title: the product name with the injected build version, e.g.
@@ -46,7 +48,8 @@ pub fn launch(startup: Startup) -> Result<(), String> {
             .with_inner_size([1240.0, 800.0])
             .with_min_inner_size([880.0, 560.0])
             .with_title(window_title())
-            .with_app_id("entangled-manager"),
+            .with_app_id("entangled-manager")
+            .with_icon(crate::logo::app_icon()),
         ..Default::default()
     };
 
@@ -107,9 +110,17 @@ pub enum View {
     Disks,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshState {
+    Idle,
+    Scanning,
+    Complete,
+}
+
 /// Wizard state (GUI-1602).
 pub struct WizardState {
     pub machine: NewMachine,
+    pub step: usize,
     pub error: Option<String>,
 }
 
@@ -138,7 +149,19 @@ pub struct AttachDiskState {
 /// Edit-VM dialog state: the form plus its inline error.
 pub struct EditVmState {
     pub form: crate::editor::EditForm,
+    pub section: EditVmSection,
     pub error: Option<String>,
+}
+
+/// The editor grows by adding a section here instead of lengthening one giant
+/// form. Only the active section is rendered; Save still validates and writes
+/// the complete profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditVmSection {
+    Hardware,
+    BootMedia,
+    NetworkDisplay,
+    Storage,
 }
 
 /// What the move worker thread reports back to the modal.
@@ -174,6 +197,7 @@ pub struct SettingsForm {
     pub work_dir: String,
     pub headless_install: bool,
     pub check_updates_on_startup: bool,
+    pub animations_enabled: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -287,9 +311,20 @@ impl Scanner {
             in_flight: false,
         }
     }
+
+    fn disabled() -> Self {
+        let (request, _request_rx) = mpsc::channel();
+        let (_result_tx, result) = mpsc::channel();
+        Self {
+            request,
+            result,
+            in_flight: false,
+        }
+    }
 }
 
 pub struct ManagerApp {
+    pub mock_mode: bool,
     pub view: View,
     pub settings: Settings,
     pub settings_path: Option<PathBuf>,
@@ -298,6 +333,7 @@ pub struct ManagerApp {
     pub cli: Result<PathBuf, String>,
     pub scan: Scan,
     pub scan_error: Option<String>,
+    mock_statuses: HashMap<String, Status>,
     pub supervisor: Supervisor,
     /// Live host/VM numbers from the metrics sampler thread, refreshed ~1/s.
     pub stats: metrics::Snapshot,
@@ -318,7 +354,10 @@ pub struct ManagerApp {
     waker: crate::process::Waker,
     scanner: Scanner,
     last_scan: Instant,
+    manual_refresh_at: Option<Instant>,
     screenshot: Option<ScreenshotJob>,
+    screenshot_view: ScreenshotView,
+    screenshot_surface_opened: bool,
     frame: u64,
 }
 
@@ -334,50 +373,86 @@ impl ManagerApp {
             Arc::new(move || ctx.request_repaint())
         };
 
-        let settings_path = settings::config_path().ok();
+        let mock_mode = startup.mock;
+        let settings_path = if mock_mode {
+            None
+        } else {
+            settings::config_path().ok()
+        };
         let mut startup_warning = None;
-        let mut settings = match &settings_path {
-            Some(path) => match Settings::load_from(path) {
-                Ok(settings) => settings,
-                Err(e) => {
-                    startup_warning = Some(format!("{e} — using defaults"));
+        let mut settings = if mock_mode {
+            Settings {
+                vm_dir: PathBuf::from("mock-vms"),
+                ..Settings::default()
+            }
+        } else {
+            match &settings_path {
+                Some(path) => match Settings::load_from(path) {
+                    Ok(settings) => settings,
+                    Err(e) => {
+                        startup_warning = Some(format!("{e} — using defaults"));
+                        Settings::default()
+                    }
+                },
+                None => {
+                    startup_warning =
+                        Some("no configuration directory; settings will not persist".to_string());
                     Settings::default()
                 }
-            },
-            None => {
-                startup_warning =
-                    Some("no configuration directory; settings will not persist".to_string());
-                Settings::default()
             }
         };
-        if let Some(dir) = startup.vm_dir {
-            settings.vm_dir = dir;
+        if !mock_mode {
+            if let Some(dir) = startup.vm_dir {
+                settings.vm_dir = dir;
+            }
         }
-        if let Some(cli) = startup.entangled {
-            settings.entangled_binary = Some(cli);
+        if !mock_mode {
+            if let Some(cli) = startup.entangled {
+                settings.entangled_binary = Some(cli);
+            }
         }
 
         // The startup update check (opt-out via Settings): one background
         // thread, one optional message, silence on any failure. Screenshot
         // runs are development renders — no network there.
-        let update_check = (settings.check_updates_on_startup && startup.screenshot.is_none())
-            .then(|| {
-                update::Version::parse(crate::VERSION)
-                    .map(|current| update::spawn_check(current, Arc::clone(&waker)))
-            })
-            .flatten();
+        let update_check =
+            (!mock_mode && settings.check_updates_on_startup && startup.screenshot.is_none())
+                .then(|| {
+                    update::Version::parse(crate::VERSION)
+                        .map(|current| update::spawn_check(current, Arc::clone(&waker)))
+                })
+                .flatten();
+
+        let scan = mock_mode.then(crate::mock::scan).unwrap_or_default();
+        let stats = mock_mode.then(crate::mock::metrics).unwrap_or_default();
+        let metrics = if mock_mode {
+            metrics::Metrics::fixed(stats.clone())
+        } else {
+            metrics::Metrics::spawn(Arc::clone(&waker))
+        };
+        let scanner = if mock_mode {
+            Scanner::disabled()
+        } else {
+            Scanner::spawn(Arc::clone(&waker))
+        };
 
         let mut app = Self {
+            mock_mode,
             view: View::default(),
-            cli: launcher::locate_cli(&settings).map_err(|e| e.to_string()),
+            cli: if mock_mode {
+                Ok(PathBuf::from("mock-entangled"))
+            } else {
+                launcher::locate_cli(&settings).map_err(|e| e.to_string())
+            },
             settings,
             settings_path,
             startup_warning,
-            scan: Scan::default(),
+            scan,
             scan_error: None,
+            mock_statuses: mock_mode.then(crate::mock::statuses).unwrap_or_default(),
             supervisor: Supervisor::new(Arc::clone(&waker)),
-            stats: metrics::Snapshot::default(),
-            metrics: metrics::Metrics::spawn(Arc::clone(&waker)),
+            stats,
+            metrics,
             pending: Vec::new(),
             toasts: Vec::new(),
             modal: Modal::None,
@@ -389,12 +464,15 @@ impl ManagerApp {
             update_check,
             update_download: None,
             waker: Arc::clone(&waker),
-            scanner: Scanner::spawn(waker),
+            scanner,
             last_scan: Instant::now() - SCAN_INTERVAL,
+            manual_refresh_at: None,
             screenshot: startup.screenshot.map(|path| ScreenshotJob {
                 path,
                 requested: false,
             }),
+            screenshot_view: startup.screenshot_view,
+            screenshot_surface_opened: false,
             frame: 0,
         };
 
@@ -402,9 +480,22 @@ impl ManagerApp {
             ScreenshotView::Wizard => app.open_wizard(),
             ScreenshotView::Settings => app.open_settings(),
             ScreenshotView::Disks => app.view = View::Disks,
-            ScreenshotView::Main => {}
+            ScreenshotView::Main | ScreenshotView::Editor => {}
         }
         app
+    }
+
+    pub fn refresh_state(&self) -> RefreshState {
+        if self.scanner.in_flight && self.manual_refresh_at.is_some() {
+            RefreshState::Scanning
+        } else if self
+            .manual_refresh_at
+            .is_some_and(|started| started.elapsed() < Duration::from_millis(1400))
+        {
+            RefreshState::Complete
+        } else {
+            RefreshState::Idle
+        }
     }
 
     pub fn toast(&mut self, level: ToastLevel, text: impl Into<String>) {
@@ -423,6 +514,9 @@ impl ManagerApp {
 
     /// Status of a VM as the cards draw it.
     pub fn status_of(&self, name: &str) -> Status {
+        if let Some(status) = self.mock_statuses.get(name) {
+            return *status;
+        }
         match self.supervisor.active_kind(name) {
             Some(TaskKind::Run) => {
                 if self
@@ -440,6 +534,16 @@ impl ManagerApp {
         }
     }
 
+    pub fn is_busy(&self, name: &str) -> bool {
+        if self.mock_mode {
+            return matches!(
+                self.status_of(name),
+                Status::Running | Status::Stopping | Status::Installing
+            );
+        }
+        self.supervisor.is_busy(name)
+    }
+
     pub fn vm(&self, name: &str) -> Option<&VmEntry> {
         self.scan.vms.iter().find(|vm| vm.name == name)
     }
@@ -449,14 +553,18 @@ impl ManagerApp {
         self.modal = Modal::Wizard(WizardState {
             machine: NewMachine {
                 name,
-                distro: launcher::DEFAULT_DISTRO.to_string(),
                 memory_mib: self.settings.default_memory_mib,
                 vcpus: self.settings.default_vcpus,
                 disk_gib: self.settings.default_disk_gib,
+                disk_path: String::new(),
+                disk_mode: launcher::DiskMode::CreateNew,
+                family: launcher::GuestFamily::default_for_host(),
+                iso_path: String::new(),
                 variant: self.settings.default_variant.clone(),
                 automated: true,
                 headless: self.settings.headless_install,
             },
+            step: 0,
             error: None,
         });
     }
@@ -467,7 +575,10 @@ impl ManagerApp {
     /// name is a label that outlives the wizard.
     fn suggest_name(&self) -> String {
         for n in 1..=99 {
-            let candidate = format!("{}-{n}", launcher::DEFAULT_DISTRO);
+            let candidate = format!(
+                "{}-{n}",
+                launcher::GuestFamily::default_for_host().cli_name()
+            );
             let taken = self.vm(&candidate).is_some()
                 || self.pending.iter().any(|p| p.name == candidate)
                 || self
@@ -479,7 +590,10 @@ impl ManagerApp {
                 return candidate;
             }
         }
-        format!("{}-new", launcher::DEFAULT_DISTRO)
+        format!(
+            "{}-new",
+            launcher::GuestFamily::default_for_host().cli_name()
+        )
     }
 
     /// Collects the update-check and update-download answers; both channels
@@ -551,10 +665,14 @@ impl ManagerApp {
                 .unwrap_or_default(),
             headless_install: self.settings.headless_install,
             check_updates_on_startup: self.settings.check_updates_on_startup,
+            animations_enabled: self.settings.animations_enabled,
         });
     }
 
     fn request_scan(&mut self, force: bool) {
+        if self.mock_mode {
+            return;
+        }
         if self.scanner.in_flight {
             return;
         }
@@ -591,6 +709,26 @@ impl ManagerApp {
         let known: Vec<String> = self.scan.vms.iter().map(|vm| vm.name.clone()).collect();
         self.pending
             .retain(|p| !(known.contains(&p.name) && !self.supervisor.is_busy(&p.name)));
+    }
+
+    fn open_screenshot_surface(&mut self) {
+        if self.screenshot_surface_opened
+            || self.screenshot.is_none()
+            || self.screenshot_view != ScreenshotView::Editor
+        {
+            return;
+        }
+        let Some(name) = self
+            .scan
+            .vms
+            .iter()
+            .find(|vm| !self.is_busy(&vm.name))
+            .map(|vm| vm.name.clone())
+        else {
+            return;
+        };
+        self.screenshot_surface_opened = true;
+        self.ask_edit_vm(&name);
     }
 
     /// Turns finished children into toasts, and finishes the install flow by
@@ -769,10 +907,52 @@ impl ManagerApp {
             return;
         }
         let profile_path = self.settings.vm_dir.join(format!("{trimmed}.toml"));
-        let disk_path = self.settings.vm_dir.join(format!("{trimmed}.raw"));
-        if profile_path.exists() || disk_path.exists() || self.vm(&trimmed).is_some() {
+        let disk_path = machine.disk_path(&self.settings.vm_dir);
+        if profile_path.exists() || self.vm(&trimmed).is_some() {
             if let Modal::Wizard(state) = &mut self.modal {
-                state.error = Some(format!("'{trimmed}' already exists in the VM directory"));
+                state.error = Some(format!("a machine named '{trimmed}' already exists"));
+            }
+            return;
+        }
+        if disk_path.parent() != Some(self.settings.vm_dir.as_path()) {
+            if let Modal::Wizard(state) = &mut self.modal {
+                state.error = Some(format!(
+                    "keep the installer disk directly in {} so the generated profile stays visible to the manager",
+                    self.settings.vm_dir.display()
+                ));
+            }
+            return;
+        }
+        match machine.disk_mode {
+            launcher::DiskMode::CreateNew if disk_path.exists() => {
+                if let Modal::Wizard(state) = &mut self.modal {
+                    state.error = Some(format!(
+                        "{} already exists — choose 'Use existing' or another file name",
+                        disk_path.display()
+                    ));
+                }
+                return;
+            }
+            launcher::DiskMode::UseExisting if !disk_path.is_file() => {
+                if let Modal::Wizard(state) = &mut self.modal {
+                    state.error = Some(format!(
+                        "existing disk {} was not found",
+                        disk_path.display()
+                    ));
+                }
+                return;
+            }
+            _ => {}
+        }
+        if machine.family == launcher::GuestFamily::Ubuntu
+            && !machine.iso_path.trim().is_empty()
+            && !Path::new(machine.iso_path.trim()).is_file()
+        {
+            if let Modal::Wizard(state) = &mut self.modal {
+                state.error = Some(format!(
+                    "installer ISO {} was not found",
+                    machine.iso_path.trim()
+                ));
             }
             return;
         }
@@ -805,7 +985,7 @@ impl ManagerApp {
         // Per distribution: Ubuntu needs the UEFI firmware, Debian the bootstrap
         // kernel. Checking only the kernel used to make the Ubuntu install — the
         // one that works on Windows — unreachable there.
-        if let Some(message) = launcher::missing_install_artifact(&cwd, &machine.distro) {
+        if let Some(message) = launcher::missing_install_artifact(&cwd, machine.family) {
             if let Modal::Wizard(state) = &mut self.modal {
                 state.error = Some(message);
             }
@@ -837,7 +1017,7 @@ impl ManagerApp {
     }
 
     fn ask_delete(&mut self, name: &str) {
-        if self.supervisor.is_busy(name) {
+        if self.is_busy(name) {
             self.toast(
                 ToastLevel::Warn,
                 format!("'{name}' is busy — stop it before deleting"),
@@ -905,6 +1085,7 @@ impl ManagerApp {
         self.settings.work_dir = optional(&form.work_dir);
         self.settings.headless_install = form.headless_install;
         self.settings.check_updates_on_startup = form.check_updates_on_startup;
+        self.settings.animations_enabled = form.animations_enabled;
 
         match &self.settings_path {
             Some(path) => match self.settings.save_to(path) {
@@ -933,9 +1114,7 @@ impl ManagerApp {
     /// True while any VM attached to the disk is running or installing — every
     /// mutation of the disk is refused then.
     pub fn disk_busy(&self, row: &discovery::DiskRow) -> bool {
-        row.attachments
-            .iter()
-            .any(|a| self.supervisor.is_busy(&a.vm))
+        row.attachments.iter().any(|a| self.is_busy(&a.vm))
     }
 
     fn open_create_disk(&mut self) {
@@ -1147,7 +1326,7 @@ impl ManagerApp {
     // ---- VM editor ------------------------------------------------------
 
     fn ask_edit_vm(&mut self, name: &str) {
-        if self.supervisor.is_busy(name) {
+        if self.is_busy(name) {
             self.toast(
                 ToastLevel::Warn,
                 format!("'{name}' is busy — stop it before editing"),
@@ -1158,8 +1337,19 @@ impl ManagerApp {
             self.toast(ToastLevel::Error, format!("'{name}' is gone from disk"));
             return;
         };
-        match crate::editor::EditForm::from_profile(&vm.profile_path.clone()) {
-            Ok(form) => self.modal = Modal::EditVm(EditVmState { form, error: None }),
+        let form = if self.mock_mode {
+            crate::editor::EditForm::mock(name)
+        } else {
+            crate::editor::EditForm::from_profile(&vm.profile_path.clone())
+        };
+        match form {
+            Ok(form) => {
+                self.modal = Modal::EditVm(EditVmState {
+                    form,
+                    section: EditVmSection::Hardware,
+                    error: None,
+                });
+            }
             Err(e) => self.toast(
                 ToastLevel::Error,
                 format!("cannot open '{name}' for editing: {e}"),
@@ -1353,9 +1543,152 @@ impl ManagerApp {
         }
     }
 
-    fn apply(&mut self, action: Action, ctx: &egui::Context) {
+    /// Handles actions that would otherwise touch the host. Navigation and
+    /// opening dialogs still use the real application paths; committing a
+    /// change is simulated in memory and acknowledged with a toast.
+    fn apply_mock(&mut self, action: &Action) -> bool {
+        if !self.mock_mode {
+            return false;
+        }
         match action {
-            Action::Refresh => self.request_scan(true),
+            Action::Refresh => {
+                self.manual_refresh_at = Some(Instant::now());
+                self.toast(ToastLevel::Success, "Mock data refreshed");
+            }
+            Action::Start(name) => {
+                self.mock_statuses.insert(name.clone(), Status::Running);
+                self.toast(ToastLevel::Success, format!("Mock: started '{name}'"));
+            }
+            Action::Stop(name) => {
+                self.mock_statuses.insert(name.clone(), Status::Stopped);
+                self.toast(ToastLevel::Info, format!("Mock: stopped '{name}'"));
+            }
+            Action::SubmitWizard => {
+                let name = match &self.modal {
+                    Modal::Wizard(state) => state.machine.name.trim().to_string(),
+                    _ => "preview-machine".into(),
+                };
+                self.modal = Modal::None;
+                self.toast(
+                    ToastLevel::Success,
+                    format!("Mock: create flow completed for '{name}'"),
+                );
+            }
+            Action::SaveSettings => {
+                if let Modal::Settings(form) = &self.modal {
+                    self.settings.animations_enabled = form.animations_enabled;
+                    self.settings.headless_install = form.headless_install;
+                    self.settings.check_updates_on_startup = form.check_updates_on_startup;
+                }
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, "Mock: settings applied for this run");
+            }
+            Action::SubmitEditVm => {
+                let result = match &self.modal {
+                    Modal::EditVm(state) => state.form.to_config(),
+                    _ => return true,
+                };
+                match result {
+                    Ok(_) => {
+                        self.modal = Modal::None;
+                        self.toast(ToastLevel::Success, "Mock: machine changes saved in memory");
+                    }
+                    Err(error) => {
+                        if let Modal::EditVm(state) = &mut self.modal {
+                            state.error = Some(error);
+                        }
+                    }
+                }
+            }
+            Action::ConfirmDelete => {
+                let Some((name, typed)) = (match &self.modal {
+                    Modal::Delete(state) => Some((state.name.clone(), state.typed.clone())),
+                    _ => None,
+                }) else {
+                    return true;
+                };
+                if typed.trim() != name {
+                    if let Modal::Delete(state) = &mut self.modal {
+                        state.error = Some(format!("type '{name}' to confirm"));
+                    }
+                    return true;
+                }
+                self.scan.vms.retain(|vm| vm.name != name);
+                for disk in &mut self.scan.disks {
+                    disk.attachments.retain(|attachment| attachment.vm != name);
+                }
+                self.mock_statuses.remove(&name);
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, format!("Mock: deleted '{name}'"));
+            }
+            Action::SubmitCreateDisk => {
+                let Some(name) = (match &self.modal {
+                    Modal::CreateDisk(state) => Some(state.name.trim().to_string()),
+                    _ => None,
+                }) else {
+                    return true;
+                };
+                let file_name = if name.ends_with(".raw") {
+                    name
+                } else {
+                    format!("{name}.raw")
+                };
+                self.scan.disks.push(discovery::DiskRow {
+                    path: PathBuf::from("mock-vms").join(&file_name),
+                    file_name,
+                    exists: true,
+                    apparent_bytes: 8 * 1024 * 1024 * 1024,
+                    allocated_bytes: Some(4 * 1024 * 1024),
+                    attachments: Vec::new(),
+                    nvram: false,
+                    summary: Ok("Empty RAW image".into()),
+                });
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, "Mock: disk added in memory");
+            }
+            Action::ConfirmDeleteDisk => {
+                let Some(path) = (match &self.modal {
+                    Modal::DeleteDisk(state) => Some(state.row.path.clone()),
+                    _ => None,
+                }) else {
+                    return true;
+                };
+                self.scan.disks.retain(|disk| disk.path != path);
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, "Mock: disk removed in memory");
+            }
+            Action::SubmitAttachDisk => {
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, "Mock: attach action accepted");
+            }
+            Action::DetachDisk { .. } => {
+                self.toast(ToastLevel::Success, "Mock: detach action accepted");
+            }
+            Action::CreateVmDir
+            | Action::RevealDisk(_)
+            | Action::AskMoveDisk(_)
+            | Action::SubmitMoveDisk
+            | Action::InstallUpdate
+            | Action::OpenReleasePage => {
+                self.toast(
+                    ToastLevel::Info,
+                    "Mock mode: host-side action received; nothing was changed",
+                );
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn apply(&mut self, action: Action, ctx: &egui::Context) {
+        if self.apply_mock(&action) {
+            return;
+        }
+        match action {
+            Action::Refresh => {
+                self.manual_refresh_at = Some(Instant::now());
+                self.request_scan(true);
+            }
             Action::CreateVmDir => {
                 let dir = self.settings.vm_dir.clone();
                 match std::fs::create_dir_all(&dir) {
@@ -1534,8 +1867,10 @@ impl eframe::App for ManagerApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame += 1;
+        theme::set_motion_enabled(self.settings.animations_enabled);
         self.request_scan(false);
         self.collect_scan();
+        self.open_screenshot_surface();
         self.collect_task_results();
         self.collect_update_events();
         self.collect_move_events();
@@ -1573,8 +1908,16 @@ impl eframe::App for ManagerApp {
         }
 
         self.handle_screenshot(ctx);
-        // The logo and the status indicators are always in motion.
-        ctx.request_repaint_after(FRAME_INTERVAL);
+        let window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        // Screenshot renders intentionally run without taking focus from the
+        // user's current window, but still need their short frame sequence.
+        if self.settings.animations_enabled && (window_focused || self.screenshot.is_some()) {
+            ctx.request_repaint_after(FRAME_INTERVAL);
+        } else {
+            // One quiet heartbeat keeps host stats, task uptime and toast
+            // expiry fresh without burning a 25 FPS idle loop.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
     }
 }
 

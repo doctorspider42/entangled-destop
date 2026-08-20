@@ -60,26 +60,65 @@ fn search_path(binary: &str) -> Option<PathBuf> {
 /// the Ubuntu path installs from a verified ISO and has no variants.
 pub const VARIANTS: [&str; 3] = ["text-netboot", "gtk-netboot", "netinst-iso"];
 
-/// The distributions `entangled install <distro>` accepts.
-pub const DISTROS: [&str; 2] = ["ubuntu", "debian"];
+/// Installation family exposed by the human-facing wizard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestFamily {
+    Debian,
+    Ubuntu,
+}
 
-/// What a new machine installs by default.
-///
-/// Ubuntu on Windows, because it is the only one that works there out of the
-/// box: it boots verified media through UEFI and installs offline, while the
-/// Debian path needs the project's own bootstrap kernel, which is a Linux kernel
-/// build that does not cross-build. Debian stays the Linux default — that is the
-/// MVP's target and what every existing profile there was installed with.
-pub const DEFAULT_DISTRO: &str = if cfg!(windows) { "ubuntu" } else { "debian" };
+impl GuestFamily {
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::Debian => "debian",
+            Self::Ubuntu => "ubuntu",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Debian => "Debian",
+            Self::Ubuntu => "Ubuntu",
+        }
+    }
+
+    /// What a new machine installs by default on *this* host.
+    ///
+    /// Ubuntu on Windows, because it is the only one that works there out of
+    /// the box: it boots verified media through UEFI and installs offline,
+    /// while the Debian path needs the project's own bootstrap kernel, which is
+    /// a Linux kernel build that does not cross-build. Debian stays the Linux
+    /// default — that is the MVP's target and what every existing profile there
+    /// was installed with.
+    pub const fn default_for_host() -> Self {
+        if cfg!(windows) {
+            Self::Ubuntu
+        } else {
+            Self::Debian
+        }
+    }
+}
+
+/// Whether the installer receives a fresh sparse disk or an existing image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskMode {
+    CreateNew,
+    UseExisting,
+}
 
 /// Everything the wizard collects (GUI-1602).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewMachine {
     pub name: String,
-    pub distro: String,
     pub memory_mib: u64,
     pub vcpus: u32,
     pub disk_gib: u64,
+    /// Empty means `<name>.raw` inside the manager's VM directory.
+    pub disk_path: String,
+    pub disk_mode: DiskMode,
+    pub family: GuestFamily,
+    /// Optional local Ubuntu installer ISO. Empty uses the verified cache.
+    pub iso_path: String,
     pub variant: String,
     pub automated: bool,
     pub headless: bool,
@@ -87,11 +126,16 @@ pub struct NewMachine {
 
 impl NewMachine {
     pub fn disk_path(&self, vm_dir: &Path) -> PathBuf {
-        vm_dir.join(format!("{}.raw", self.name))
-    }
-
-    pub fn profile_path(&self, vm_dir: &Path) -> PathBuf {
-        vm_dir.join(format!("{}.toml", self.name))
+        let configured = self.disk_path.trim();
+        if configured.is_empty() {
+            return vm_dir.join(format!("{}.raw", self.name));
+        }
+        let path = PathBuf::from(configured);
+        if path.is_absolute() {
+            path
+        } else {
+            vm_dir.join(path)
+        }
     }
 }
 
@@ -112,14 +156,9 @@ impl NewMachine {
 /// right answer (TAP on Linux, the in-process user-mode NAT on Windows), and a
 /// GUI that pinned it would be wrong on one of the two hosts.
 pub fn install_spec(cli: &Path, vm_dir: &Path, cwd: PathBuf, machine: &NewMachine) -> TaskSpec {
-    let distro = if machine.distro.trim().is_empty() {
-        DEFAULT_DISTRO.to_string()
-    } else {
-        machine.distro.trim().to_lowercase()
-    };
     let mut args = vec![
         "install".to_string(),
-        distro.clone(),
+        machine.family.cli_name().to_string(),
         "--disk".to_string(),
         machine.disk_path(vm_dir).display().to_string(),
         "--size".to_string(),
@@ -131,9 +170,17 @@ pub fn install_spec(cli: &Path, vm_dir: &Path, cwd: PathBuf, machine: &NewMachin
     ];
     // `--variant` names a Debian netboot flavour; the Ubuntu path takes an ISO
     // instead and refuses to be told about variants it has no use for.
-    if distro == "debian" {
-        args.push("--variant".to_string());
-        args.push(machine.variant.clone());
+    match machine.family {
+        GuestFamily::Debian => {
+            args.push("--variant".to_string());
+            args.push(machine.variant.clone());
+        }
+        GuestFamily::Ubuntu => {
+            if !machine.iso_path.trim().is_empty() {
+                args.push("--iso".to_string());
+                args.push(machine.iso_path.trim().to_string());
+            }
+        }
     }
     if machine.automated {
         args.push("--auto".to_string());
@@ -182,14 +229,14 @@ pub const UEFI_FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
 /// different files: an Ubuntu install has no use for the bootstrap kernel, and
 /// blocking it on a missing one (which is what the wizard used to do) makes the
 /// only installer that works on Windows unreachable there.
-pub fn missing_install_artifact(cwd: &Path, distro: &str) -> Option<String> {
-    let (artifact, hint) = match distro.trim().to_lowercase().as_str() {
-        "ubuntu" => (
+pub fn missing_install_artifact(cwd: &Path, family: GuestFamily) -> Option<String> {
+    let (artifact, hint) = match family {
+        GuestFamily::Ubuntu => (
             UEFI_FIRMWARE,
             "build it with `bash guest/firmware/build-cloudhv.sh` (~2.5 min), or point \
              Settings ▸ working directory at a tree that has it",
         ),
-        _ => (
+        GuestFamily::Debian => (
             BOOTSTRAP_KERNEL,
             "the Debian installer boots the project kernel from there (build it with \
              guest/bootstrap-kernel/build.sh on Linux, or point Settings ▸ working \
@@ -209,10 +256,13 @@ mod tests {
     fn machine() -> NewMachine {
         NewMachine {
             name: "demo".into(),
-            distro: "debian".into(),
             memory_mib: 4096,
             vcpus: 4,
             disk_gib: 20,
+            disk_path: String::new(),
+            disk_mode: DiskMode::CreateNew,
+            family: GuestFamily::Debian,
+            iso_path: String::new(),
             variant: "text-netboot".into(),
             automated: true,
             headless: false,
@@ -254,7 +304,7 @@ mod tests {
     #[test]
     fn the_ubuntu_install_names_the_distro_and_drops_the_variant() {
         let mut m = machine();
-        m.distro = "Ubuntu".into();
+        m.family = GuestFamily::Ubuntu;
         let line = install_spec(
             &PathBuf::from("entangled"),
             Path::new("/vms"),
@@ -283,16 +333,17 @@ mod tests {
         std::fs::write(dir.join(UEFI_FIRMWARE), b"fake firmware").unwrap();
 
         // Firmware present, kernel absent: Ubuntu can go, Debian cannot.
-        assert_eq!(missing_install_artifact(&dir, "ubuntu"), None);
-        let debian = missing_install_artifact(&dir, "debian").expect("no bootstrap kernel");
+        assert_eq!(missing_install_artifact(&dir, GuestFamily::Ubuntu), None);
+        let debian =
+            missing_install_artifact(&dir, GuestFamily::Debian).expect("no bootstrap kernel");
         assert!(debian.contains(BOOTSTRAP_KERNEL), "{debian}");
 
         // And the other way round.
         std::fs::create_dir_all(dir.join("artifacts/bootstrap")).unwrap();
         std::fs::write(dir.join(BOOTSTRAP_KERNEL), b"fake kernel").unwrap();
         std::fs::remove_file(dir.join(UEFI_FIRMWARE)).unwrap();
-        assert_eq!(missing_install_artifact(&dir, "debian"), None);
-        let ubuntu = missing_install_artifact(&dir, "ubuntu").expect("no firmware");
+        assert_eq!(missing_install_artifact(&dir, GuestFamily::Debian), None);
+        let ubuntu = missing_install_artifact(&dir, GuestFamily::Ubuntu).expect("no firmware");
         assert!(ubuntu.contains(UEFI_FIRMWARE), "{ubuntu}");
         assert!(ubuntu.contains("build-cloudhv.sh"), "{ubuntu}");
 
@@ -301,16 +352,14 @@ mod tests {
 
     /// The default a fresh wizard opens with: Ubuntu where Debian cannot work.
     #[test]
-    fn the_default_distro_is_the_one_this_host_can_install() {
+    fn the_default_family_is_the_one_this_host_can_install() {
+        let default = GuestFamily::default_for_host();
         assert_eq!(
-            DEFAULT_DISTRO,
+            default.cli_name(),
             if cfg!(windows) { "ubuntu" } else { "debian" }
         );
-        assert!(DISTROS.contains(&DEFAULT_DISTRO));
-        // An empty distro (an older settings file, a hand-edited state) falls
-        // back to that default rather than producing `entangled install --disk`.
         let mut m = machine();
-        m.distro = "  ".into();
+        m.family = default;
         let line = install_spec(
             &PathBuf::from("entangled"),
             Path::new("/vms"),
@@ -319,7 +368,7 @@ mod tests {
         )
         .command_line();
         assert!(
-            line.contains(&format!("install {DEFAULT_DISTRO}")),
+            line.contains(&format!("install {}", default.cli_name())),
             "{line}"
         );
     }
@@ -335,6 +384,28 @@ mod tests {
         assert!(line.contains("--memory-mib 1536"), "{line}");
         assert!(line.contains("--headless"), "{line}");
         assert!(!line.contains("--auto"), "{line}");
+    }
+
+    #[test]
+    fn ubuntu_local_iso_and_existing_disk_reach_the_cli() {
+        let mut m = machine();
+        m.family = GuestFamily::Ubuntu;
+        m.iso_path = "/isos/ubuntu.iso".into();
+        m.disk_mode = DiskMode::UseExisting;
+        m.disk_path = "kept.raw".into();
+        let line = install_spec(
+            Path::new("entangled"),
+            Path::new("/vms"),
+            PathBuf::from("/srv"),
+            &m,
+        )
+        .command_line();
+        assert!(line.contains("install ubuntu"), "{line}");
+        assert!(line.contains("--iso /isos/ubuntu.iso"), "{line}");
+        assert!(
+            line.contains(&Path::new("/vms").join("kept.raw").display().to_string()),
+            "{line}"
+        );
     }
 
     #[test]
