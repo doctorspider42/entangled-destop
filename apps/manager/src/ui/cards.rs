@@ -100,10 +100,13 @@ pub(crate) fn banners(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Act
             actions.push(Action::CreateVmDir);
         }
     }
-    if let Err(message) = &app.cli {
+    // A missing engine is a problem with a fix, not a field to fill in: the
+    // button opens the file browser straight away rather than depositing the
+    // user in a settings panel to work out what to type.
+    if let Err(message) = &app.engine {
         any = true;
-        if ui::banner(ui, theme::ERR, message, Some("Settings")) {
-            actions.push(Action::OpenSettings);
+        if ui::banner(ui, theme::ERR, message, Some("Locate it…")) {
+            actions.push(Action::PickPath(crate::picker::PickTarget::EngineBinary));
         }
     }
     if any {
@@ -222,6 +225,13 @@ fn vm_card(
                 );
                 if let Some(interface) = &vm.network_interface {
                     ui::chip(ui, interface, theme::OK);
+                }
+                // Where this machine runs, but only where there is a choice to
+                // make — on Linux the chip would say the same thing on every
+                // card, which is noise.
+                let backend = app.backend_of(&vm.name);
+                if crate::backend::Backend::Wsl.available_on_host() {
+                    ui::chip(ui, backend.label(), theme::accent(0.5));
                 }
             });
             ui.add_space(8.0);
