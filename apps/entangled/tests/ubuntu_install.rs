@@ -131,6 +131,22 @@ fn cached_iso_exists() -> bool {
         .unwrap_or(false)
 }
 
+/// Reads a serial transcript that is **not** guaranteed to be UTF-8.
+///
+/// A guest console is a byte stream, and an installed Ubuntu proves it: setting
+/// up the console font writes every code point from 0x00 to 0xFF, so the log
+/// carries a run of bare high bytes. `read_to_string` fails on that, and the
+/// `unwrap_or_default()` it was written with turned the failure into an *empty*
+/// transcript — so the boot marker could never be found and this test sat out
+/// its whole six-minute deadline before reporting a login prompt that had
+/// already been printed. Lossy is right here: the assertions look for ASCII
+/// markers, and a replacement character in the surrounding noise costs nothing.
+fn read_transcript(path: &Path) -> String {
+    std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
 /// Runs `entangled` to completion with a deadline, returning its combined
 /// output. Killed (and reported) rather than left running on timeout.
 fn run_cli(args: &[&str], deadline: Duration) -> (bool, String) {
@@ -156,7 +172,7 @@ fn run_cli(args: &[&str], deadline: Duration) -> (bool, String) {
             None => std::thread::sleep(Duration::from_millis(500)),
         }
     };
-    let output = std::fs::read_to_string(&log).unwrap_or_default();
+    let output = read_transcript(&log);
     let _ = std::fs::remove_file(&log);
     (status.is_some_and(|s| s.success()), output)
 }
@@ -177,7 +193,7 @@ fn run_until(args: &[&str], marker: &str, deadline: Duration) -> (bool, String) 
     let started = Instant::now();
     let mut seen = false;
     while started.elapsed() < deadline {
-        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let text = read_transcript(&log);
         if text.contains(marker) {
             seen = true;
             break;
@@ -189,7 +205,7 @@ fn run_until(args: &[&str], marker: &str, deadline: Duration) -> (bool, String) 
     }
     let _ = child.kill();
     let _ = child.wait();
-    let output = std::fs::read_to_string(&log).unwrap_or_default();
+    let output = read_transcript(&log);
     let _ = std::fs::remove_file(&log);
     (seen, output)
 }
@@ -276,7 +292,14 @@ fn ubuntu_installs_unattended_and_the_installed_system_boots() {
     );
 
     // The transcript is the installer's own account of what happened.
-    let installer_log = std::fs::read_to_string(&transcript).expect("the install transcript");
+    // Same byte stream, same treatment — and it must exist, unlike the two logs
+    // above which are ours to create.
+    assert!(
+        transcript.is_file(),
+        "no install transcript at {}",
+        transcript.display()
+    );
+    let installer_log = read_transcript(&transcript);
     for marker in [
         // GRUB took the typed command line, with both of its load-bearing words.
         "autoinstall console=ttyS0",

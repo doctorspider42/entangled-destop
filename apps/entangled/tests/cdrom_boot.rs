@@ -105,6 +105,17 @@ fn cached_iso() -> Option<PathBuf> {
     candidates.pop()
 }
 
+/// A guest console is a byte stream, not a `String`. `read_to_string` fails on
+/// the first non-UTF-8 byte a bootloader or a console-font setup emits, and the
+/// `unwrap_or_default()` this was written with turns that failure into an empty
+/// transcript — a marker search that can then only ever time out. Lossy: the
+/// markers are ASCII, and replacement characters in the noise cost nothing.
+fn read_transcript(path: &Path) -> String {
+    std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
 #[test]
 #[ignore = "boots a real ISO: needs KVM, the firmware and a verified Ubuntu ISO"]
 fn an_arbitrary_iso_boots_to_its_bootloader_via_cdrom() {
@@ -164,7 +175,7 @@ height = 800
     let started = Instant::now();
     let mut seen = false;
     while started.elapsed() < DEADLINE {
-        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let text = read_transcript(&log);
         if text.contains(GRUB_BANNER) {
             seen = true;
             break;
@@ -176,7 +187,7 @@ height = 800
     }
     let _ = child.kill();
     let _ = child.wait();
-    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let text = read_transcript(&log);
     let _ = std::fs::remove_file(&log);
     let _ = std::fs::remove_file(&profile_path);
 
