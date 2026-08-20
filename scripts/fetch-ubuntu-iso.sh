@@ -60,8 +60,24 @@ key_file="$repo/scripts/keys/$KEY_FILE_NAME"
 
 # Big files never live on /mnt/d: it is a drvfs mount on the development host
 # (slow, and it cannot do sparse files), and a 3 GiB ISO has no business in a
-# worktree. `~/.cache/entangled` is the same cache root `debian-media` uses.
-cache_root="${ENTANGLED_CACHE:-$HOME/.cache/entangled}"
+# worktree.
+#
+# The cache root is the one `debian_media::cache_root` resolves, in the same
+# order, because `entangled install ubuntu` looks for the ISO there and two
+# answers means two caches: $ENTANGLED_CACHE, then $XDG_CACHE_HOME/entangled,
+# then — on Windows — %LOCALAPPDATA%\entangled, else $HOME/.cache/entangled.
+# `$LOCALAPPDATA` set is the reliable "this bash runs on Windows" test: git-bash
+# and MSYS export it, WSL does not (it is not in WSLENV by default), and it is
+# there that a shell also has $HOME and would otherwise pick the unix layout.
+if [ -n "${ENTANGLED_CACHE:-}" ]; then
+    cache_root="$ENTANGLED_CACHE"
+elif [ -n "${XDG_CACHE_HOME:-}" ]; then
+    cache_root="$XDG_CACHE_HOME/entangled"
+elif [ -n "${LOCALAPPDATA:-}" ]; then
+    cache_root="$LOCALAPPDATA/entangled"
+else
+    cache_root="$HOME/.cache/entangled"
+fi
 cache="$cache_root/ubuntu/$UBUNTU_RELEASE"
 
 iso_name="ubuntu-${UBUNTU_RELEASE}-${UBUNTU_VARIANT}-${UBUNTU_ARCH}.iso"

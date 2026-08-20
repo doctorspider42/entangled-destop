@@ -36,11 +36,9 @@ pub struct MediaCache {
 }
 
 impl MediaCache {
-    /// Resolves `$XDG_CACHE_HOME/entangled/media`, falling back to
-    /// `$HOME/.cache/entangled/media`.
-    ///
-    /// On Windows (where this crate still has to build and be testable) the
-    /// fallback uses `%LOCALAPPDATA%`, then `%USERPROFILE%\.cache`.
+    /// `<cache root>/media`, where the root is [`cache_root`]:
+    /// `$XDG_CACHE_HOME/entangled` first, then `$HOME/.cache/entangled` on unix
+    /// and `%LOCALAPPDATA%\entangled` on Windows.
     pub fn discover() -> Result<Self, MediaError> {
         Ok(Self::with_root(
             cache_root().ok_or(MediaError::NoCacheDir)?.join("media"),
@@ -138,29 +136,35 @@ pub fn cache_root() -> Option<PathBuf> {
 }
 
 /// The platform's cache base, in preference order:
-/// `$XDG_CACHE_HOME`, `$HOME/.cache`, `%LOCALAPPDATA%`, `%USERPROFILE%\.cache`.
-///
-/// `HOME` before `LOCALAPPDATA` on purpose: a Windows shell that sets `HOME`
-/// (git-bash, MSYS) is a shell whose user also runs the Linux side of this
-/// project, and a single cache is better than two half-populated ones.
+/// `$XDG_CACHE_HOME`, then `%LOCALAPPDATA%` on Windows / `$HOME/.cache`
+/// elsewhere, then the other one, then `%USERPROFILE%\.cache`.
 fn cache_base() -> Option<PathBuf> {
-    resolve_cache_base(&non_empty_var)
+    resolve_cache_base(&non_empty_var, cfg!(windows))
 }
 
-/// The resolution itself, over an injected environment so both hosts' layouts
-/// are asserted on both hosts (mutating the real environment in a test would
-/// race every other test in the process).
-fn resolve_cache_base(var: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+/// The resolution itself, over an injected environment *and* an injected host, so
+/// both hosts' layouts are asserted on both hosts (mutating the real environment
+/// in a test would race every other test in the process).
+///
+/// `windows` reorders exactly one pair, and it is the pair that matters: a
+/// Windows shell can have **both** `HOME` and `LOCALAPPDATA` — git-bash, MSYS and
+/// Cygwin all export `HOME` — and taking `HOME` there would put a 2.9 GiB ISO
+/// cache in `C:\Users\ada\.cache` for a bash session and in
+/// `C:\Users\ada\AppData\Local` for the PowerShell one, which is two caches and
+/// two "no ISO found" reports for the same machine. `%LOCALAPPDATA%` is what
+/// Windows means by a cache, so on Windows it wins; `XDG_CACHE_HOME` still
+/// overrides everything, and the helper scripts honour the same order (see
+/// `scripts/fetch-ubuntu-iso.sh`).
+fn resolve_cache_base(var: &dyn Fn(&str) -> Option<String>, windows: bool) -> Option<PathBuf> {
     if let Some(dir) = var("XDG_CACHE_HOME") {
         return Some(PathBuf::from(dir));
     }
-    if let Some(home) = var("HOME") {
-        return Some(PathBuf::from(home).join(".cache"));
-    }
-    if let Some(local) = var("LOCALAPPDATA") {
-        return Some(PathBuf::from(local));
-    }
-    var("USERPROFILE").map(|p| PathBuf::from(p).join(".cache"))
+    let home = || var("HOME").map(|home| PathBuf::from(home).join(".cache"));
+    let local = || var("LOCALAPPDATA").map(PathBuf::from);
+    let first = if windows { local() } else { home() };
+    first
+        .or_else(|| if windows { home() } else { local() })
+        .or_else(|| var("USERPROFILE").map(|p| PathBuf::from(p).join(".cache")))
 }
 
 fn non_empty_var(name: &str) -> Option<String> {
@@ -210,34 +214,65 @@ mod tests {
             ("USERPROFILE", r"C:\Users\ada"),
         ]);
         assert_eq!(
-            resolve_cache_base(&windows),
+            resolve_cache_base(&windows, true),
             Some(PathBuf::from(r"C:\Users\ada\AppData\Local"))
         );
 
-        // Windows without LOCALAPPDATA (a service account): the profile's .cache.
-        let profile_only = env(&[("USERPROFILE", r"C:\Users\ada")]);
+        // The case that produced two caches for one machine: a Windows shell
+        // with BOTH set (git-bash, MSYS and Cygwin all export HOME).
+        // %LOCALAPPDATA% has to win there, or a bash session and a PowerShell
+        // session look in different places for the same 2.9 GiB ISO.
+        let both = env(&[
+            ("HOME", r"C:\Users\ada"),
+            ("LOCALAPPDATA", r"C:\Users\ada\AppData\Local"),
+        ]);
         assert_eq!(
-            resolve_cache_base(&profile_only),
+            resolve_cache_base(&both, true),
+            Some(PathBuf::from(r"C:\Users\ada\AppData\Local"))
+        );
+        // ...and the same environment on a unix host resolves the unix way.
+        assert_eq!(
+            resolve_cache_base(&both, false),
             Some(PathBuf::from(r"C:\Users\ada").join(".cache"))
         );
 
-        // Unix, and any shell that sets HOME: HOME wins over LOCALAPPDATA so a
-        // git-bash session shares the cache it already populated.
+        // Windows without LOCALAPPDATA (a service account, a stripped
+        // environment): HOME if there is one, else the profile's .cache.
+        let home_only = env(&[("HOME", r"C:\Users\ada")]);
+        assert_eq!(
+            resolve_cache_base(&home_only, true),
+            Some(PathBuf::from(r"C:\Users\ada").join(".cache"))
+        );
+        let profile_only = env(&[("USERPROFILE", r"C:\Users\ada")]);
+        assert_eq!(
+            resolve_cache_base(&profile_only, true),
+            Some(PathBuf::from(r"C:\Users\ada").join(".cache"))
+        );
+
+        // Unix: HOME, and a stray LOCALAPPDATA (WSLENV, a cross-compile shell)
+        // does not get to name the cache.
         let unix = env(&[("HOME", "/home/ada"), ("LOCALAPPDATA", r"C:\ignored")]);
         assert_eq!(
-            resolve_cache_base(&unix),
+            resolve_cache_base(&unix, false),
             Some(PathBuf::from("/home/ada").join(".cache"))
         );
 
-        // XDG_CACHE_HOME wins over everything.
-        let xdg = env(&[("XDG_CACHE_HOME", "/var/cache/x"), ("HOME", "/home/ada")]);
-        assert_eq!(
-            resolve_cache_base(&xdg),
-            Some(PathBuf::from("/var/cache/x"))
-        );
+        // XDG_CACHE_HOME wins over everything, on both hosts.
+        let xdg = env(&[
+            ("XDG_CACHE_HOME", "/var/cache/x"),
+            ("HOME", "/home/ada"),
+            ("LOCALAPPDATA", r"C:\ignored"),
+        ]);
+        for windows in [true, false] {
+            assert_eq!(
+                resolve_cache_base(&xdg, windows),
+                Some(PathBuf::from("/var/cache/x"))
+            );
+        }
 
         // Nothing set at all: no cache, and the caller must say so.
-        assert_eq!(resolve_cache_base(&env(&[])), None);
+        assert_eq!(resolve_cache_base(&env(&[]), true), None);
+        assert_eq!(resolve_cache_base(&env(&[]), false), None);
     }
 
     #[test]

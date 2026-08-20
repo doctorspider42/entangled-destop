@@ -351,6 +351,7 @@ mod tests {
             display: (1920, 1080),
             network_interface: Some("entangled0".into()),
             disks: vec![],
+            uefi: false,
         };
         let spec = run_spec(
             &PathBuf::from("/usr/bin/entangled"),

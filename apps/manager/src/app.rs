@@ -711,12 +711,21 @@ impl ManagerApp {
         let Some(cli) = self.cli_path() else { return };
 
         let cwd = self.settings.child_cwd();
-        if launcher::bootstrap_kernel_missing(&cwd) {
+        // Whichever artifact *this* profile boots from. A UEFI profile (every
+        // Ubuntu install) needs the firmware and has no use for a bootstrap
+        // kernel, so warning about the kernel there is noise that trains people
+        // to ignore the warning that matters.
+        let artifact = if vm.uefi {
+            launcher::UEFI_FIRMWARE
+        } else {
+            launcher::BOOTSTRAP_KERNEL
+        };
+        if !cwd.join(artifact).is_file() {
             self.toast(
                 ToastLevel::Warn,
                 format!(
-                    "no artifacts/bootstrap/vmlinuz under {} — a profile with relative \
-                     kernel paths will fail to boot (Settings ▸ working directory)",
+                    "no {artifact} under {} — a profile with relative boot paths will \
+                     fail to start (Settings ▸ working directory)",
                     cwd.display()
                 ),
             );

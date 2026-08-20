@@ -9,16 +9,26 @@
 //! `Boot####` entry `grub-install` wrote into NVRAM survives the VM stopping and
 //! boots the *installed* system afterwards.
 //!
-//! `#[ignore]`d: it needs `/dev/kvm`, a 4 MiB firmware build, a 2.9 GiB verified
-//! ISO, ~12 GiB of scratch disk and 10-40 minutes.
+//! Runs on **either host** (EPIC 17 phase 5): KVM on Linux, WHP on Windows. The
+//! install path is the same code on both, so the acceptance criterion is the same
+//! test — it self-skips when the hypervisor, the firmware or the ISO is missing,
+//! the way the `whp_*` and KVM tests do.
+//!
+//! `#[ignore]`d: it needs a hypervisor, a 4 MiB firmware build, a 2.9 GiB verified
+//! ISO, ~12 GiB of scratch disk and 5-40 minutes.
 //!
 //! ```bash
 //! bash guest/firmware/build-cloudhv.sh
 //! bash scripts/fetch-ubuntu-iso.sh
 //! cargo test -p entangled --test ubuntu_install -- --ignored --nocapture
 //! ```
+//!
+//! ```powershell
+//! # on Windows, with the firmware and the ISO copied/fetched in
+//! cargo test -p entangled --test ubuntu_install -- --ignored --nocapture
+//! ```
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", windows))]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -28,8 +38,9 @@ use std::time::{Duration, Instant};
 const BIN: &str = env!("CARGO_BIN_EXE_entangled");
 
 /// A full unattended install took ~7 minutes on the development machine (16
-/// threads, KVM in WSL2). The deadline is deliberately far above that: a
-/// mirror-less apt still has timeouts, and this must fail rather than hang.
+/// threads, KVM in WSL2) and 4 min 27 s natively on Windows/WHP on the same
+/// box. The deadline is deliberately far above both: a mirror-less apt still has
+/// timeouts, and this must fail rather than hang.
 const INSTALL_DEADLINE: Duration = Duration::from_secs(40 * 60);
 
 /// Boot of the installed system: firmware ~3 s, GRUB ~4 s, systemd + cloud-init
@@ -49,7 +60,12 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn kvm_available() -> bool {
+/// Whether *this* host can run a VM at all: `/dev/kvm` on Linux, the Windows
+/// Hypervisor Platform on Windows. Reported rather than asserted, because a
+/// machine without it must skip and not fail (same contract as the `whp_*`
+/// tests).
+#[cfg(target_os = "linux")]
+fn hypervisor_available() -> bool {
     match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -63,22 +79,42 @@ fn kvm_available() -> bool {
     }
 }
 
+#[cfg(windows)]
+fn hypervisor_available() -> bool {
+    match vmm_core::whp::WhpHypervisor::probe() {
+        Ok(caps) if caps.is_runnable() => true,
+        Ok(_) => {
+            eprintln!("skipping: {}", vmm_core::whp::WHP_ENABLE_HINT);
+            false
+        }
+        Err(e) => {
+            eprintln!("skipping: cannot query the Windows Hypervisor Platform: {e}");
+            false
+        }
+    }
+}
+
 /// Scratch directory: never the repository, whose drvfs mount on the
 /// development host cannot make sparse files.
 fn scratch_dir() -> Option<PathBuf> {
     let dir = match std::env::var_os("ENTANGLED_SCRATCH_DIR") {
         Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME")?).join("entangled-vms"),
+        // The same directory the CLI and the manager default to, so a test run
+        // and a hand run land in one place: ~/entangled-vms, which on Windows is
+        // %USERPROFILE%\entangled-vms.
+        None => disk_image::refs::manager_vm_dir()?,
     };
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 
 fn cached_iso_exists() -> bool {
+    // The one cache resolution the whole project shares (`debian_media`), so a
+    // host where `entangled install` *would* find the ISO does not skip here.
     let cache = match std::env::var_os("ENTANGLED_CACHE") {
         Some(dir) => PathBuf::from(dir),
-        None => match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join(".cache/entangled"),
+        None => match debian_media::cache_root() {
+            Some(root) => root,
             None => return false,
         },
     };
@@ -170,9 +206,9 @@ fn show(label: &str, log: &str, needles: &[&str]) {
 }
 
 #[test]
-#[ignore = "installs a real Ubuntu: needs KVM, the firmware, a verified ISO and ~10 minutes"]
+#[ignore = "installs a real Ubuntu: needs a hypervisor, the firmware, a verified ISO and ~10 minutes"]
 fn ubuntu_installs_unattended_and_the_installed_system_boots() {
-    if !kvm_available() {
+    if !hypervisor_available() {
         return;
     }
     let root = repo_root();

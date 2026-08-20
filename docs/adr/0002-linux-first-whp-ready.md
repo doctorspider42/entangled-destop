@@ -298,6 +298,28 @@ come from `virtio_net::UserNetConfig` itself rather than being repeated in the
 installer, so the `[network]` section and the `netcfg/get_ipaddress=` clause
 cannot drift apart.
 
+**But it did hide a real bug, and only a real installer could find it.** The
+Debian netboot path is the first thing this project has ever run over usernet
+that opens *hundreds* of connections, and it stalled at "Loading additional
+components" after exactly 64 udebs with `refusing a guest connection: the NAT is
+at its flow limit`. The NAT was leaking a flow per completed download: a guest
+that closes its half first — every HTTP client — leaves smoltcp in `CloseWait`,
+where `is_open()` is still true, so the retirement test never fired and nothing
+shut the host stream's write half, so the remote never sent the EOF that would
+have finished the close. `MAX_FLOWS` was doing its job; what it bounded was a
+leak. With the half-close propagated, the same install walks straight past
+"Detecting hardware" into `debootstrap`. Two lessons worth keeping: a
+user-mode NAT's *close* path needs a workload that closes thousands of
+connections before it can be called done, and the unit tests that covered this
+module all closed both halves at once, which is the one case that never leaks.
+
+Kernel-level DHCP through the NAT is now evidenced too — `ip=dhcp` on a real
+guest, answered by `granted the guest a DHCP lease ip=192.168.74.15` on the
+host and `IP-Config: Got DHCP answer from 192.168.74.1` in the guest — which
+closes the phase-4 open item that DHCP had only ever been unit-tested. It took
+a two-line change to make askable: a profile's own `ip=` clause now wins over
+the backend's appended one, because the kernel honours the last one it is given.
+
 **Two path facts that a Linux-first codebase gets wrong, both now tested.**
 The cache root was resolved as `$HOME/.cache/entangled` with no Windows
 fallback, so a Windows host with a full 2.9 GiB ISO cache reported "no Ubuntu

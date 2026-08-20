@@ -269,18 +269,12 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     // must ride in a preseed file). Interactive installs get only that line.
     let (preseed, automated) = match (&args.preseed, args.auto) {
         (Some(path), _) => {
-            let mut content = std::fs::read(path)
+            let content = std::fs::read(path)
                 .map_err(|e| format!("cannot read preseed {}: {e}", path.display()))?;
-            if !content
-                .windows(b"anna/no_kernel_modules".len())
-                .any(|w| w == b"anna/no_kernel_modules")
-            {
-                content.extend_from_slice(KERNEL_COMPAT_PRESEED.as_bytes());
-            }
-            (content, true)
+            (with_required_keys(content), true)
         }
-        (None, true) => (AUTO_PRESEED.as_bytes().to_vec(), true),
-        (None, false) => (KERNEL_COMPAT_PRESEED.as_bytes().to_vec(), false),
+        (None, true) => (with_required_keys(AUTO_PRESEED.as_bytes().to_vec()), true),
+        (None, false) => (with_required_keys(Vec::new()), false),
     };
     let initramfs = preseeded_initrd(&initrd, &preseed, &target)?;
     let cmdline = if automated {
@@ -318,7 +312,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     tracing::info!(
         vm = %cfg.name,
         auto = automated,
-        "starting the installer; it reboots when done (Ctrl+Alt+Q / Ctrl+C aborts)"
+        "starting the installer; it powers off when done (Ctrl+Alt+Q / Ctrl+C aborts)"
     );
     let run_result = crate::run_vm::run(cfg, args.headless, None);
     // Keep the derived initrd for debugging on failure; remove it on success.
@@ -398,6 +392,42 @@ const KERNEL_COMPAT_PRESEED: &str =
     "\n# added by entangled install: d-i runs on the Entangled bootstrap kernel\n\
      d-i anna/no_kernel_modules boolean true\n\
      d-i base-installer/kernel/image string linux-image-amd64\n";
+
+/// The other key every install needs, whoever wrote the preseed: **end by
+/// powering off, not by rebooting**.
+///
+/// `entangled install` learns that an installation finished from the guest
+/// stopping, and only one of the two endings means that on both hosts. d-i's
+/// default reboot ends in the kernel's restart chain — with `reboot=k` a triple
+/// fault — which KVM reports as a shutdown exit but which WHP's local APIC
+/// emulation *absorbs*: the vCPU parks inside `WHvRunVirtualProcessor` and the
+/// installer VM hangs forever after a perfectly good install. An ACPI S5 write
+/// is latched by `machine_x86::acpi::pm` and reported as a clean stop by both
+/// backends, which is the same contract the Ubuntu path already relies on
+/// (`shutdown: poweroff` in the autoinstall profile).
+const POWEROFF_PRESEED: &str =
+    "\n# added by entangled install: stop the VM the way both hosts can observe\n\
+     d-i debian-installer/exit/poweroff boolean true\n";
+
+/// Appends the keys an Entangled install cannot do without to a preseed —
+/// whichever of them the author did not already set. Never overrides: a preseed
+/// that names a key means it, and the check is on the key's *name*, so a
+/// deliberate `false` is left alone.
+fn with_required_keys(mut preseed: Vec<u8>) -> Vec<u8> {
+    for (key, block) in [
+        ("anna/no_kernel_modules", KERNEL_COMPAT_PRESEED),
+        ("debian-installer/exit/poweroff", POWEROFF_PRESEED),
+    ] {
+        if !contains(&preseed, key.as_bytes()) {
+            preseed.extend_from_slice(block.as_bytes());
+        }
+    }
+    preseed
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
 
 /// d-i automation command line: priority critical + static netcfg, with initrd
 /// preseeding picking up /preseed.cfg.
@@ -553,6 +583,50 @@ mod tests {
         }
     }
 
+    /// Both keys an Entangled install cannot do without, added to whatever the
+    /// author wrote — and *not* added twice, and not overriding a deliberate
+    /// setting. The poweroff key is the one that makes the Windows host able to
+    /// tell a finished install from a hung one at all.
+    #[test]
+    fn required_preseed_keys_are_added_once_and_never_override() {
+        let text = |bytes: Vec<u8>| String::from_utf8(bytes).expect("ascii preseed");
+
+        // An empty preseed (an interactive install) gets both blocks.
+        let bare = text(with_required_keys(Vec::new()));
+        assert!(
+            bare.contains("d-i anna/no_kernel_modules boolean true"),
+            "{bare}"
+        );
+        assert!(
+            bare.contains("d-i debian-installer/exit/poweroff boolean true"),
+            "{bare}"
+        );
+
+        // The compiled-in automated profile already sets both, so nothing is
+        // appended to it. This is also the assertion that keeps the asset and
+        // this module from disagreeing about the ending.
+        let auto = text(with_required_keys(AUTO_PRESEED.as_bytes().to_vec()));
+        assert_eq!(
+            auto, AUTO_PRESEED,
+            "the built-in profile needs no additions"
+        );
+        assert_eq!(
+            auto.matches("debian-installer/exit/poweroff").count(),
+            1,
+            "the poweroff key must appear exactly once"
+        );
+
+        // A custom preseed that sets one key keeps its own and gains the other.
+        let custom = text(with_required_keys(
+            b"d-i debian-installer/exit/poweroff boolean false
+"
+            .to_vec(),
+        ));
+        assert!(custom.contains("exit/poweroff boolean false"), "{custom}");
+        assert_eq!(custom.matches("exit/poweroff").count(), 1, "{custom}");
+        assert!(custom.contains("anna/no_kernel_modules"), "{custom}");
+    }
+
     #[test]
     fn auto_cmdline_preseeds_static_network() {
         let plan = net_plan("tap", "entangled0");
@@ -669,17 +743,25 @@ mod tests {
             headless: true,
         };
 
+        // A disk path in this host's spelling, with a space in it — the shape
+        // that breaks a codebase that treats paths as strings.
+        let disk = if cfg!(windows) {
+            r"D:\my vms\my vm.raw"
+        } else {
+            "/srv/my vms/my vm.raw"
+        };
+
         // --name wins; then the disk's stem, spaces and all; then the distro,
         // lower-cased (it is a file name, and `Ubuntu.raw` next to `ubuntu.toml`
         // is one machine on Windows and two on Linux).
         assert_eq!(vm_name(&args(None, Some("work"))), "work");
-        assert_eq!(vm_name(&args(Some(r"D:\vms\my vm.raw"), None)), "my vm");
+        assert_eq!(vm_name(&args(Some(disk), None)), "my vm");
         assert_eq!(vm_name(&args(None, None)), "ubuntu");
 
         // An explicit --disk is used verbatim, whatever it looks like.
         assert_eq!(
-            target_disk(&args(Some(r"D:\vms\my vm.raw"), None)).unwrap(),
-            PathBuf::from(r"D:\vms\my vm.raw")
+            target_disk(&args(Some(disk), None)).unwrap(),
+            PathBuf::from(disk)
         );
 
         // The default lands in the manager's VM directory under the VM name.

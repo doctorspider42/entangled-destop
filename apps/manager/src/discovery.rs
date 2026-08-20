@@ -67,6 +67,12 @@ pub struct VmEntry {
     pub display: (u32, u32),
     pub network_interface: Option<String>,
     pub disks: Vec<DiskInfo>,
+    /// The profile boots through UEFI firmware rather than loading a kernel
+    /// directly. Kept because the two boot modes need *different* host
+    /// artifacts present, and warning about the wrong one is worse than not
+    /// warning: an installed Ubuntu needs `artifacts/firmware/CLOUDHV.fd`, and
+    /// has no use for a bootstrap kernel.
+    pub uefi: bool,
 }
 
 impl VmEntry {
@@ -173,6 +179,7 @@ fn entry_from_config(path: &Path, cfg: &VmConfig, work_dir: Option<&Path>) -> Vm
         display: (cfg.display.width, cfg.display.height),
         network_interface: cfg.network.as_ref().and_then(|n| n.interface.clone()),
         disks,
+        uefi: matches!(cfg.boot.mode, control_api::BootMode::Uefi),
     }
 }
 

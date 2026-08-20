@@ -60,7 +60,23 @@ reasoning are in ADR-0002's phase-5 amendment. Two things worth knowing here:
 - **A profile's own `ip=` clause now wins** over the backend's appended one
   (`run_vm::host_api::direct_linux_cmdline`), which is what makes `ip=dhcp`
   askable — the one way to exercise the usernet DHCP server from a real kernel
-  rather than from unit tests. That was the open phase-4 item.
+  rather than from unit tests. That was the open phase-4 item, and it is closed:
+
+  ```text
+  host : granted the guest a DHCP lease mac=52-8f-7b-c3-42-a3 ip=192.168.74.15
+  guest: IP-Config: Got DHCP answer from 192.168.74.1, my address is 192.168.74.15
+         device=eth0, ipaddr=192.168.74.15, mask=255.255.255.0, gw=192.168.74.1
+         nameserver0=192.168.74.1
+  ```
+
+- **The NAT leaked a flow per closed connection until now**, which nothing
+  before `install debian` opened enough connections to notice. Symptom:
+  d-i stalls at "Loading additional components" after 64 udebs with
+  `refusing a guest connection: the NAT is at its flow limit flows=64`. Cause
+  and fix in `usernet::tcp::service_flows` — the guest's FIN is propagated as
+  `Shutdown::Write` on the host stream, because `CloseWait` is `is_open()` and
+  the retirement test never fired there. If you touch that module: a test that
+  closes both halves at once cannot see this class of bug.
 
 One benign teardown noise to expect, unchanged by this work: after S5 the
 supervisor cancels the other vCPU and WHP answers

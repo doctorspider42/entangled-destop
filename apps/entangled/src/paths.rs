@@ -97,46 +97,79 @@ fn non_empty_env(key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Every derived install artifact is `disk.with_file_name(...)`, so the name
-    /// the stem produces is the name a Windows path with spaces, a drive letter
-    /// and dots in the file name has to survive.
-    #[test]
-    fn stems_survive_windows_paths() {
-        assert_eq!(stem_of(Path::new(r"D:\vms\ubuntu.raw"), "x"), "ubuntu");
-        assert_eq!(
-            stem_of(Path::new(r"D:\my vms\big disk.raw"), "x"),
-            "big disk"
-        );
-        assert_eq!(stem_of(Path::new(r"C:\vms\ubuntu.2.raw"), "x"), "ubuntu.2");
-        assert_eq!(
-            stem_of(Path::new("/home/ada/vms/ubuntu.raw"), "x"),
-            "ubuntu"
-        );
-        // A bare name is its own stem; a directory-ish path falls back.
-        assert_eq!(stem_of(Path::new("ubuntu.raw"), "x"), "ubuntu");
-        assert_eq!(stem_of(Path::new(""), "fallback"), "fallback");
+    /// A directory in *this* host's spelling, with a space in it — which is the
+    /// interesting part on both hosts and the part a Linux-first codebase gets
+    /// away with ignoring.
+    fn vm_dir() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"D:\my vms")
+        } else {
+            PathBuf::from("/srv/my vms")
+        }
     }
 
-    /// The sidecars the install path writes, spelled the way the install path
-    /// spells them, against a path with a drive letter and a space in it.
+    /// Every derived install artifact is `disk.with_file_name(...)`, so whatever
+    /// the stem produces is what the profile, the NVRAM sidecar and the
+    /// transcript are called. Spaces, drive letters and dotted names all have to
+    /// survive it.
+    #[test]
+    fn stems_use_the_hosts_path_syntax() {
+        let dir = vm_dir();
+        assert_eq!(stem_of(&dir.join("ubuntu.raw"), "x"), "ubuntu");
+        assert_eq!(stem_of(&dir.join("big disk.raw"), "x"), "big disk");
+        // The *last* dot, as `with_file_name` would agree.
+        assert_eq!(stem_of(&dir.join("ubuntu.2.raw"), "x"), "ubuntu.2");
+        // A bare name is its own stem; nothing at all falls back.
+        assert_eq!(stem_of(Path::new("ubuntu.raw"), "x"), "ubuntu");
+        assert_eq!(stem_of(Path::new(""), "fallback"), "fallback");
+
+        // The host-specific halves, asserted where they are true rather than
+        // asserted everywhere and wrong on one host: a backslash is a separator
+        // on Windows and an ordinary file-name character on unix, and that is
+        // exactly the difference this module exists to keep straight.
+        #[cfg(windows)]
+        {
+            assert_eq!(stem_of(Path::new(r"D:\vms\ubuntu.raw"), "x"), "ubuntu");
+            assert_eq!(stem_of(Path::new(r"\\srv\vms\ubuntu.raw"), "x"), "ubuntu");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                stem_of(Path::new("/home/ada/vms/ubuntu.raw"), "x"),
+                "ubuntu"
+            );
+            // One file whose name happens to contain backslashes — legal here.
+            assert_eq!(
+                stem_of(Path::new(r"D:\vms\ubuntu.raw"), "x"),
+                r"D:\vms\ubuntu"
+            );
+        }
+    }
+
+    /// Every sidecar the install path writes lands in the disk's own directory,
+    /// under the disk's own name — including when that name has a space in it and
+    /// the directory is on another drive.
     #[test]
     fn sidecars_stay_beside_the_disk() {
-        let disk = Path::new(r"D:\my vms\ubuntu.raw");
-        let name = stem_of(disk, "ubuntu");
-        for (suffix, expected) in [
-            (format!("{name}.nvram"), r"D:\my vms\ubuntu.nvram"),
-            (format!("{name}.toml"), r"D:\my vms\ubuntu.toml"),
-            (format!("{name}-seed.iso"), r"D:\my vms\ubuntu-seed.iso"),
-            (
-                format!("{name}-install.log"),
-                r"D:\my vms\ubuntu-install.log",
-            ),
+        let dir = vm_dir();
+        let disk = dir.join("my vm.raw");
+        let name = stem_of(&disk, "ubuntu");
+        assert_eq!(name, "my vm");
+        for suffix in [
+            format!("{name}.nvram"),
+            format!("{name}.toml"),
+            format!("{name}-seed.iso"),
+            format!("{name}-install.log"),
+            format!("{name}.install-initrd.img"),
         ] {
             let path = disk.with_file_name(&suffix);
-            // Compared as paths, not strings: on Linux the whole thing is one
-            // file name with backslashes in it, and that is still the same file
-            // the profile would name.
-            assert_eq!(path, Path::new(expected), "{suffix}");
+            assert_eq!(path.parent(), Some(dir.as_path()), "{suffix}");
+            assert_eq!(
+                path.file_name().and_then(OsStr::to_str),
+                Some(suffix.as_str())
+            );
+            // And the same directory the disk is in, spelled the host's way.
+            assert_eq!(path, dir.join(&suffix), "{suffix}");
         }
     }
 
@@ -171,12 +204,19 @@ mod tests {
             ubuntu_cache_dir().unwrap(),
             PathBuf::from(r"D:\entangled cache").join("ubuntu")
         );
-        // An empty value is not an override: that is an unset variable spelled
-        // badly, and following it would look for the cache at the filesystem
-        // root.
-        std::env::set_var("ENTANGLED_CACHE", "");
-        assert!(cache_root().is_ok() || cache_root().is_err());
-        assert_ne!(cache_root().ok(), Some(PathBuf::new()));
+        // A whitespace-only value is not an override: that is an unset variable
+        // spelled badly, and following it would look for the cache at the
+        // filesystem root (`/ubuntu`, `\ubuntu`) and report an empty one.
+        std::env::set_var("ENTANGLED_CACHE", "   ");
+        let fallback = cache_root();
+        assert_ne!(
+            fallback.as_deref().ok(),
+            Some(std::path::Path::new("   ")),
+            "a blank ENTANGLED_CACHE must be ignored, not obeyed"
+        );
+        // ...and what it falls back to is the media cache's own root, which is
+        // the whole point of sharing one resolution.
+        assert_eq!(fallback.ok(), debian_media::cache_root());
         match previous {
             Some(value) => std::env::set_var("ENTANGLED_CACHE", value),
             None => std::env::remove_var("ENTANGLED_CACHE"),
