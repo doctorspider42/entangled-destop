@@ -391,7 +391,15 @@ fn get_pic_chip(r: &mut Reader<'_>) -> Result<SavedPicChip> {
     })
 }
 
-/// An `Option<u8>`/`Option<u16>` as a present flag plus the value.
+/// An `Option<N>` as a present flag followed by the value.
+///
+/// An **absent** option is written as a zero, and a decoder that finds a
+/// non-zero one refuses. Without that rule the encoding is not injective —
+/// `(false, 7)` and `(false, 0)` both mean `None` — and a snapshot that decoded
+/// to something which re-encodes differently is a format with two spellings for
+/// one state. That is not pedantry: `cargo fuzz run snapshot_parse` found it in
+/// under five minutes, on the 8254's half-written reload byte, by asserting
+/// exactly this round trip.
 fn put_opt_u8(w: &mut Writer, value: Option<u8>) {
     w.bool(value.is_some()).u8(value.unwrap_or(0));
 }
@@ -399,6 +407,7 @@ fn put_opt_u8(w: &mut Writer, value: Option<u8>) {
 fn get_opt_u8(r: &mut Reader<'_>, what: &'static str) -> Result<Option<u8>> {
     let present = r.bool(what)?;
     let value = r.u8(what)?;
+    absent_must_be_zero(what, present, u64::from(value))?;
     Ok(present.then_some(value))
 }
 
@@ -409,6 +418,7 @@ fn put_opt_u16(w: &mut Writer, value: Option<u16>) {
 fn get_opt_u16(r: &mut Reader<'_>, what: &'static str) -> Result<Option<u16>> {
     let present = r.bool(what)?;
     let value = r.u16(what)?;
+    absent_must_be_zero(what, present, u64::from(value))?;
     Ok(present.then_some(value))
 }
 
@@ -419,7 +429,15 @@ fn put_opt_u64(w: &mut Writer, value: Option<u64>) {
 fn get_opt_u64(r: &mut Reader<'_>, what: &'static str) -> Result<Option<u64>> {
     let present = r.bool(what)?;
     let value = r.u64(what)?;
+    absent_must_be_zero(what, present, value)?;
     Ok(present.then_some(value))
+}
+
+fn absent_must_be_zero(what: &'static str, present: bool, value: u64) -> Result<()> {
+    if !present && value != 0 {
+        return Err(crate::error::SnapshotError::BadValue { what, value });
+    }
+    Ok(())
 }
 
 /// Encodes the 8259/8254/IOAPIC set.
@@ -835,6 +853,29 @@ mod tests {
     /// One encoded section plus the decoder that must refuse every prefix of
     /// it.
     type Probe = (Vec<u8>, fn(&[u8]) -> bool);
+
+    /// The asymmetry `cargo fuzz run snapshot_parse` found: an absent option
+    /// that carries a value has two spellings, so the second one is refused.
+    #[test]
+    fn an_absent_option_carrying_a_value_is_refused() {
+        let mut chip = sample_machine().irqchip.unwrap();
+        chip.pit.channels[0].write_lo = None;
+        let mut bytes = encode_irqchip(&chip);
+        // The half-written reload byte sits right after its present flag; the
+        // encoder wrote a zero there, so flipping it makes the two disagree.
+        let at = bytes
+            .windows(2)
+            .position(|w| w == [0u8, 0u8])
+            .expect("a present-flag/value pair");
+        bytes[at + 1] = 0xff;
+        match decode_irqchip(&bytes) {
+            Err(SnapshotError::BadValue { .. }) => {}
+            // Any *other* refusal is fine too — what must not happen is a
+            // successful decode that re-encodes to different bytes.
+            Err(_) => {}
+            Ok(back) => assert_eq!(encode_irqchip(&back), bytes),
+        }
+    }
 
     #[test]
     fn every_truncation_of_every_section_is_an_error() {

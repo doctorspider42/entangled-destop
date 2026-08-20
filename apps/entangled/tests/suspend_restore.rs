@@ -297,7 +297,11 @@ fn suspend_once(scratch: &Scratch, config: &Path, snapshot: &Path) -> u64 {
     );
     vm.send("save");
     let (ok, console) = vm.wait_out();
-    assert!(ok, "the suspended VM did not exit cleanly:\n{}", tail(&console, 40));
+    assert!(
+        ok,
+        "the suspended VM did not exit cleanly:\n{}",
+        tail(&console, 40)
+    );
     assert!(
         console.contains("entangled-control: saved"),
         "no save confirmation on the control channel:\n{}",
@@ -418,7 +422,10 @@ fn refuse(scratch: &Scratch, name: &str, bytes: &[u8]) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    eprintln!("[refusal] {name}: {}", text.trim().lines().next_back().unwrap_or(""));
+    eprintln!(
+        "[refusal] {name}: {}",
+        text.trim().lines().next_back().unwrap_or("")
+    );
     text
 }
 
@@ -526,7 +533,10 @@ fn a_disk_that_changed_since_the_snapshot_is_refused() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("root.raw"), "the refusal does not name the disk:\n{text}");
+    assert!(
+        text.contains("root.raw"),
+        "the refusal does not name the disk:\n{text}"
+    );
     assert!(
         text.contains("has changed since the snapshot"),
         "the refusal does not say what happened:\n{text}"

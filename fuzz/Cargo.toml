@@ -31,6 +31,7 @@ vm-memory = { version = "0.17", features = ["backend-mmap"] }
 virtio-block = { path = "../crates/virtio-block" }
 virtio-gpu = { path = "../crates/virtio-gpu" }
 debian-media = { path = "../crates/debian-media" }
+vm-snapshot = { path = "../crates/vm-snapshot" }
 
 [[bin]]
 name = "chain_walk"
@@ -77,6 +78,13 @@ bench = false
 [[bin]]
 name = "gpu_remote_protocol"
 path = "fuzz_targets/gpu_remote_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_parse"
+path = "fuzz_targets/snapshot_parse.rs"
 test = false
 doc = false
 bench = false

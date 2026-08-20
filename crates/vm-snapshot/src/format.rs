@@ -42,8 +42,14 @@ pub const VERSION: u32 = 1;
 /// Bytes of fixed header before the first section.
 pub const HEADER_LEN: u64 = 72;
 
-/// Bytes per section-index entry.
-const INDEX_ENTRY_LEN: usize = 56;
+/// Bytes per section-index entry: kind, version, instance and a reserved word,
+/// then the offset and length, then a 32-byte digest.
+///
+/// Asserted against what the writer actually emits
+/// (`the_index_entry_length_is_the_one_the_writer_uses`) — it bounds how large
+/// an index this build will read, and a number that drifted below the real one
+/// would refuse a perfectly good snapshot with many sections.
+const INDEX_ENTRY_LEN: usize = 4 + 4 + 4 + 4 + 8 + 8 + 32;
 
 /// Sections one snapshot may carry. Far above what a real VM produces (one per
 /// vCPU, one per virtio slot, two memory regions, a dozen machine devices).
@@ -753,6 +759,21 @@ mod tests {
         }
         w.finish().unwrap();
         buf.into_inner()
+    }
+
+    /// The index bound and the index encoder must agree; see
+    /// [`INDEX_ENTRY_LEN`].
+    #[test]
+    fn the_index_entry_length_is_the_one_the_writer_uses() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = SnapshotWriter::create(&mut buf, HostKind::KvmLinux).unwrap();
+        for instance in 0..5 {
+            w.put(SectionKind::Cpu, 1, instance, b"x").unwrap();
+        }
+        w.finish().unwrap();
+        let bytes = buf.into_inner();
+        let index_len = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+        assert_eq!(index_len, 8 + 5 * INDEX_ENTRY_LEN);
     }
 
     #[test]
