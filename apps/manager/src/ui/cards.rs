@@ -8,10 +8,10 @@ use crate::discovery::{format_bytes, VmEntry};
 use crate::theme;
 use crate::ui;
 
-const CARD_HEIGHT: f32 = 232.0;
+const CARD_HEIGHT: f32 = 244.0;
 
 pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
-    let time = ctx.input(|i| i.time);
+    let time = theme::animation_time(ctx);
 
     egui::CentralPanel::default()
         .frame(
@@ -20,23 +20,29 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                 .inner_margin(egui::Margin::symmetric(22, 18)),
         )
         .show(ctx, |ui| {
+            theme::paint_backdrop(ui);
             banners(ui, app, actions);
+            dashboard_heading(ui, app);
+            ui.add_space(14.0);
 
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(16.0, 16.0);
-                        for vm in &app.scan.vms {
-                            vm_card(ui, app, vm, time, actions);
-                        }
-                        for pending in &app.pending {
-                            if app.scan.vms.iter().any(|vm| vm.name == pending.name) {
-                                continue;
+                    ui.with_layout(
+                        Layout::left_to_right(Align::Min).with_main_wrap(true),
+                        |ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(16.0, 16.0);
+                            for vm in &app.scan.vms {
+                                vm_card(ui, app, vm, time, actions);
                             }
-                            pending_card(ui, app, pending, time, actions);
-                        }
-                    });
+                            for pending in &app.pending {
+                                if app.scan.vms.iter().any(|vm| vm.name == pending.name) {
+                                    continue;
+                                }
+                                pending_card(ui, app, pending, time, actions);
+                            }
+                        },
+                    );
 
                     if app.scan.vms.is_empty() && app.pending.is_empty() {
                         empty_state(ui, app, time, actions);
@@ -46,6 +52,32 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                     }
                 });
         });
+}
+
+fn dashboard_heading(ui: &mut egui::Ui, app: &ManagerApp) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new("Machines")
+                    .size(24.0)
+                    .color(theme::TEXT)
+                    .strong(),
+            );
+            ui.label(ui::dim(
+                "Start, install and care for your virtual computers.",
+            ));
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let active = app
+                .scan
+                .vms
+                .iter()
+                .filter(|vm| app.supervisor.is_busy(&vm.name))
+                .count();
+            ui::chip(ui, &format!("{active} active"), theme::OK);
+            ui::chip(ui, &format!("{} total", app.scan.vms.len()), theme::CYAN);
+        });
+    });
 }
 
 /// The persistent notices (update, startup warning, scan errors, missing CLI).
@@ -201,7 +233,7 @@ fn vm_card(
                         .size(12.5),
                 );
             } else {
-                let mut text = format!("{} image", format_bytes(vm.size_bytes()));
+                let mut text = format!("Storage {}", format_bytes(vm.size_bytes()));
                 if let Some(allocated) = vm.allocated_bytes() {
                     text.push_str(&format!(" · {} on disk", format_bytes(allocated)));
                 }
@@ -217,7 +249,7 @@ fn vm_card(
                     ui.spacing_mut().item_spacing.x = 7.0;
                     match status {
                         Status::Stopped => {
-                            if ui::ghost_button(ui, "Start", !missing_disk, theme::OK).clicked() {
+                            if !missing_disk && ui::primary_button(ui, "Start").clicked() {
                                 actions.push(Action::Start(vm.name.clone()));
                             }
                         }
@@ -240,7 +272,7 @@ fn vm_card(
                             }
                         }
                     }
-                    if ui::ghost_button(ui, "Edit", status == Status::Stopped, theme::VIOLET)
+                    if ui::ghost_button(ui, "Configure", status == Status::Stopped, theme::VIOLET)
                         .on_hover_text(if status == Status::Stopped {
                             "Memory, vCPUs, boot, network, disks, display"
                         } else {
@@ -250,33 +282,35 @@ fn vm_card(
                     {
                         actions.push(Action::AskEditVm(vm.name.clone()));
                     }
-                    if ui::ghost_button(ui, "Delete", status == Status::Stopped, theme::ERR)
-                        .on_hover_text(if status == Status::Stopped {
-                            "Remove the profile and its disk"
-                        } else {
-                            "Stop the machine first"
-                        })
-                        .clicked()
-                    {
-                        actions.push(Action::AskDelete(vm.name.clone()));
-                    }
-                    if ui::ghost_button(ui, "Profile", true, theme::TEXT_DIM)
-                        .on_hover_text(format!("Copy {path}"))
-                        .clicked()
-                    {
-                        actions.push(Action::CopyProfilePath(path.clone()));
-                    }
-                    if let Some(task) = app
-                        .supervisor
-                        .tasks()
-                        .iter()
-                        .rev()
-                        .find(|t| t.vm == vm.name)
-                    {
-                        if ui::ghost_button(ui, "Log", true, theme::CYAN).clicked() {
-                            actions.push(Action::SelectLog(task.id));
+                    ui.menu_button("More", |ui| {
+                        if ui.button("Copy profile path").clicked() {
+                            actions.push(Action::CopyProfilePath(path.clone()));
+                            ui.close();
                         }
-                    }
+                        if let Some(task) = app
+                            .supervisor
+                            .tasks()
+                            .iter()
+                            .rev()
+                            .find(|t| t.vm == vm.name)
+                        {
+                            if ui.button("Open activity log").clicked() {
+                                actions.push(Action::SelectLog(task.id));
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                status == Status::Stopped,
+                                egui::Button::new("Delete machine"),
+                            )
+                            .clicked()
+                        {
+                            actions.push(Action::AskDelete(vm.name.clone()));
+                            ui.close();
+                        }
+                    });
                 });
             });
         },
@@ -377,15 +411,20 @@ fn pending_card(
                 );
                 ui::chip(
                     ui,
-                    &format!("{} GiB disk", pending.machine.disk_gib),
+                    &if pending.machine.disk_mode == crate::launcher::DiskMode::CreateNew {
+                        format!("{} GiB disk", pending.machine.disk_gib)
+                    } else {
+                        "existing disk".to_string()
+                    },
                     theme::TEXT_DIM,
                 );
-                ui::chip(ui, &pending.machine.variant, theme::OK);
+                ui::chip(ui, pending.machine.family.label(), theme::OK);
             });
             ui.add_space(8.0);
-            ui.label(ui::dim(
-                "Debian installer is running — the profile appears when it finishes",
-            ));
+            ui.label(ui::dim(format!(
+                "{} installer is running — this card becomes a machine when it finishes",
+                pending.machine.family.label()
+            )));
 
             ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                 ui.horizontal(|ui| {
@@ -401,7 +440,7 @@ fn pending_card(
                         .rev()
                         .find(|t| t.vm == pending.name)
                     {
-                        if ui::ghost_button(ui, "Log", true, theme::CYAN).clicked() {
+                        if ui::ghost_button(ui, "View activity", true, theme::CYAN).clicked() {
                             actions.push(Action::SelectLog(task.id));
                         }
                     }

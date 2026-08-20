@@ -24,7 +24,7 @@ use crate::ScreenshotView;
 
 /// How often the VM directory is re-scanned while the window is open.
 const SCAN_INTERVAL: Duration = Duration::from_millis(2500);
-/// Animation clock cadence: the logo and status indicators are always moving.
+/// Animation clock cadence when ambient motion is enabled.
 const FRAME_INTERVAL: Duration = Duration::from_millis(40);
 
 pub struct Startup {
@@ -46,7 +46,8 @@ pub fn launch(startup: Startup) -> Result<(), String> {
             .with_inner_size([1240.0, 800.0])
             .with_min_inner_size([880.0, 560.0])
             .with_title(window_title())
-            .with_app_id("entangled-manager"),
+            .with_app_id("entangled-manager")
+            .with_icon(crate::logo::app_icon()),
         ..Default::default()
     };
 
@@ -110,6 +111,7 @@ pub enum View {
 /// Wizard state (GUI-1602).
 pub struct WizardState {
     pub machine: NewMachine,
+    pub step: usize,
     pub error: Option<String>,
 }
 
@@ -174,6 +176,7 @@ pub struct SettingsForm {
     pub work_dir: String,
     pub headless_install: bool,
     pub check_updates_on_startup: bool,
+    pub animations_enabled: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -452,10 +455,15 @@ impl ManagerApp {
                 memory_mib: self.settings.default_memory_mib,
                 vcpus: self.settings.default_vcpus,
                 disk_gib: self.settings.default_disk_gib,
+                disk_path: String::new(),
+                disk_mode: launcher::DiskMode::CreateNew,
+                family: launcher::GuestFamily::Debian,
+                iso_path: String::new(),
                 variant: self.settings.default_variant.clone(),
                 automated: true,
                 headless: self.settings.headless_install,
             },
+            step: 0,
             error: None,
         });
     }
@@ -546,6 +554,7 @@ impl ManagerApp {
                 .unwrap_or_default(),
             headless_install: self.settings.headless_install,
             check_updates_on_startup: self.settings.check_updates_on_startup,
+            animations_enabled: self.settings.animations_enabled,
         });
     }
 
@@ -755,10 +764,52 @@ impl ManagerApp {
             return;
         }
         let profile_path = self.settings.vm_dir.join(format!("{trimmed}.toml"));
-        let disk_path = self.settings.vm_dir.join(format!("{trimmed}.raw"));
-        if profile_path.exists() || disk_path.exists() || self.vm(&trimmed).is_some() {
+        let disk_path = machine.disk_path(&self.settings.vm_dir);
+        if profile_path.exists() || self.vm(&trimmed).is_some() {
             if let Modal::Wizard(state) = &mut self.modal {
-                state.error = Some(format!("'{trimmed}' already exists in the VM directory"));
+                state.error = Some(format!("a machine named '{trimmed}' already exists"));
+            }
+            return;
+        }
+        if disk_path.parent() != Some(self.settings.vm_dir.as_path()) {
+            if let Modal::Wizard(state) = &mut self.modal {
+                state.error = Some(format!(
+                    "keep the installer disk directly in {} so the generated profile stays visible to the manager",
+                    self.settings.vm_dir.display()
+                ));
+            }
+            return;
+        }
+        match machine.disk_mode {
+            launcher::DiskMode::CreateNew if disk_path.exists() => {
+                if let Modal::Wizard(state) = &mut self.modal {
+                    state.error = Some(format!(
+                        "{} already exists — choose 'Use existing' or another file name",
+                        disk_path.display()
+                    ));
+                }
+                return;
+            }
+            launcher::DiskMode::UseExisting if !disk_path.is_file() => {
+                if let Modal::Wizard(state) = &mut self.modal {
+                    state.error = Some(format!(
+                        "existing disk {} was not found",
+                        disk_path.display()
+                    ));
+                }
+                return;
+            }
+            _ => {}
+        }
+        if machine.family == launcher::GuestFamily::Ubuntu
+            && !machine.iso_path.trim().is_empty()
+            && !Path::new(machine.iso_path.trim()).is_file()
+        {
+            if let Modal::Wizard(state) = &mut self.modal {
+                state.error = Some(format!(
+                    "installer ISO {} was not found",
+                    machine.iso_path.trim()
+                ));
             }
             return;
         }
@@ -788,11 +839,24 @@ impl ManagerApp {
         };
 
         let cwd = self.settings.child_cwd();
-        if launcher::bootstrap_kernel_missing(&cwd) {
+        if machine.family == launcher::GuestFamily::Debian
+            && launcher::bootstrap_kernel_missing(&cwd)
+        {
             if let Modal::Wizard(state) = &mut self.modal {
                 state.error = Some(format!(
-                    "no {} under {} — the installer boots the project kernel from there                      (build it with guest/bootstrap-kernel/build.sh, or point Settings ▸                      working directory at a tree that has it)",
+                    "no {} under {} — build it with guest/bootstrap-kernel/build.sh, or point Settings ▸ working directory at a prepared tree",
                     launcher::BOOTSTRAP_KERNEL,
+                    cwd.display()
+                ));
+            }
+            return;
+        }
+        if machine.family == launcher::GuestFamily::Ubuntu
+            && !cwd.join("artifacts/firmware/CLOUDHV.fd").is_file()
+        {
+            if let Modal::Wizard(state) = &mut self.modal {
+                state.error = Some(format!(
+                    "no artifacts/firmware/CLOUDHV.fd under {} — build the UEFI firmware or point Settings ▸ working directory at a prepared tree",
                     cwd.display()
                 ));
             }
@@ -892,6 +956,7 @@ impl ManagerApp {
         self.settings.work_dir = optional(&form.work_dir);
         self.settings.headless_install = form.headless_install;
         self.settings.check_updates_on_startup = form.check_updates_on_startup;
+        self.settings.animations_enabled = form.animations_enabled;
 
         match &self.settings_path {
             Some(path) => match self.settings.save_to(path) {
@@ -1521,6 +1586,7 @@ impl eframe::App for ManagerApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame += 1;
+        theme::set_motion_enabled(self.settings.animations_enabled);
         self.request_scan(false);
         self.collect_scan();
         self.collect_task_results();
@@ -1560,8 +1626,13 @@ impl eframe::App for ManagerApp {
         }
 
         self.handle_screenshot(ctx);
-        // The logo and the status indicators are always in motion.
-        ctx.request_repaint_after(FRAME_INTERVAL);
+        if self.settings.animations_enabled {
+            ctx.request_repaint_after(FRAME_INTERVAL);
+        } else {
+            // One quiet heartbeat keeps host stats, task uptime and toast
+            // expiry fresh without burning a 25 FPS idle loop.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
     }
 }
 

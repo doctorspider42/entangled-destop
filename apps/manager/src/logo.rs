@@ -1,7 +1,6 @@
-//! Vector artwork drawn with the egui painter (GUI-1606): the Entangled mark —
-//! two tilted orbit ellipses with a pair of entangled particles running along
-//! them — and the small "entangled particles" spinner used as the Installing
-//! status indicator.
+//! Resolution-free Entangled identity: two interlocked data loops, a luminous
+//! correlation bridge and a small aperture at their shared centre. The same
+//! geometry is rasterised once for the native window/taskbar icon.
 //!
 //! Everything here is procedural: no image assets, no fonts, resolution-free.
 
@@ -52,9 +51,79 @@ pub fn paint_mark(painter: &Painter, rect: Rect, time: f64, alpha: f32) {
     paint_particle(painter, a, radius * 0.115, theme::CYAN, alpha);
     paint_particle(painter, b, radius * 0.115, theme::VIOLET, alpha);
 
-    // Faint nucleus glow where the rings cross.
+    // Faint aperture where the loops cross. The diamond makes the mark read as
+    // a designed product glyph rather than another generic atom logo.
     for (r, fade) in [(radius * 0.30, 0.05), (radius * 0.16, 0.10)] {
         painter.circle_filled(center, r, fade_white(fade * alpha));
+    }
+    let d = radius * 0.105;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            center - Vec2::new(0.0, d),
+            center + Vec2::new(d, 0.0),
+            center + Vec2::new(0.0, d),
+            center - Vec2::new(d, 0.0),
+        ],
+        theme::accent(0.5).gamma_multiply(0.85 * alpha),
+        Stroke::new(radius * 0.025, fade_white(0.8 * alpha)),
+    ));
+}
+
+/// Native 64×64 taskbar/window icon generated from the same two-loop mark.
+/// This is done once at startup and keeps packaging free of platform-specific
+/// PNG/ICO drift.
+pub fn app_icon() -> egui::IconData {
+    const SIZE: u32 = 64;
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let nx = (px - 32.0) / 32.0;
+            let ny = (py - 32.0) / 32.0;
+            let edge = nx.abs().max(ny.abs());
+            let corner =
+                ((nx.abs() - 0.72).max(0.0).powi(2) + (ny.abs() - 0.72).max(0.0).powi(2)).sqrt();
+            let inside = edge <= 0.78 || corner <= 0.20;
+            if !inside {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+
+            let mut r = 7.0;
+            let mut g = 11.0;
+            let mut b = 24.0;
+            for (tilt, from, to) in [
+                (RING_TILT, theme::CYAN, theme::VIOLET_DEEP),
+                (-RING_TILT, theme::VIOLET, theme::CYAN_DEEP),
+            ] {
+                let (sin_t, cos_t) = tilt.sin_cos();
+                let xr = nx * cos_t + ny * sin_t;
+                let yr = -nx * sin_t + ny * cos_t;
+                let ring = ((xr / 0.67).powi(2) + (yr / 0.29).powi(2)).sqrt();
+                let coverage = (1.0 - (ring - 1.0).abs() / 0.065).clamp(0.0, 1.0);
+                let color = theme::mix(from, to, ((nx + 1.0) * 0.5).clamp(0.0, 1.0));
+                r += color.r() as f32 * coverage * 0.82;
+                g += color.g() as f32 * coverage * 0.82;
+                b += color.b() as f32 * coverage * 0.82;
+            }
+            let aperture = ((nx.abs() + ny.abs()) / 0.17).clamp(0.0, 1.0);
+            let core = 1.0 - aperture;
+            r += 120.0 * core;
+            g += 210.0 * core;
+            b += 255.0 * core;
+            rgba.extend_from_slice(&[
+                r.min(255.0) as u8,
+                g.min(255.0) as u8,
+                b.min(255.0) as u8,
+                255,
+            ]);
+        }
+    }
+    egui::IconData {
+        rgba,
+        width: SIZE,
+        height: SIZE,
     }
 }
 
@@ -176,5 +245,14 @@ mod tests {
         let tilted = ring_point(center, 10.0, 3.0, RING_TILT, 0.0);
         assert!((flat.y).abs() < 1e-6);
         assert!(tilted.y > 1.0, "tilted ring should lift off the axis");
+    }
+
+    #[test]
+    fn native_icon_has_the_expected_rgba_shape() {
+        let icon = app_icon();
+        assert_eq!((icon.width, icon.height), (64, 64));
+        assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+        assert_eq!(icon.rgba[3], 0, "the outer corner stays transparent");
+        assert_eq!(icon.rgba[(32 * 64 + 32) * 4 + 3], 255);
     }
 }

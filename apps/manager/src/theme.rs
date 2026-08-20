@@ -6,14 +6,17 @@
 use egui::{
     Color32, CornerRadius, FontFamily, FontId, Margin, Shadow, Stroke, TextStyle, Vec2, Visuals,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static MOTION_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Page background — deep space.
-pub const BG_DEEP: Color32 = Color32::from_rgb(0x08, 0x0b, 0x16);
+pub const BG_DEEP: Color32 = Color32::from_rgb(0x05, 0x08, 0x12);
 /// Header / footer panels, one step above the page.
-pub const BG_PANEL: Color32 = Color32::from_rgb(0x0b, 0x10, 0x21);
+pub const BG_PANEL: Color32 = Color32::from_rgb(0x09, 0x0e, 0x1b);
 /// Card surface and its hovered variant.
-pub const CARD: Color32 = Color32::from_rgb(0x11, 0x18, 0x2d);
-pub const CARD_HOVER: Color32 = Color32::from_rgb(0x17, 0x21, 0x3d);
+pub const CARD: Color32 = Color32::from_rgb(0x0e, 0x16, 0x28);
+pub const CARD_HOVER: Color32 = Color32::from_rgb(0x15, 0x22, 0x39);
 /// Inset surfaces: the log pane, text fields, code.
 pub const INSET: Color32 = Color32::from_rgb(0x06, 0x09, 0x12);
 
@@ -37,7 +40,61 @@ pub const ERR: Color32 = Color32::from_rgb(0xff, 0x5d, 0x73);
 pub const CARD_RADIUS: u8 = 14;
 pub const CONTROL_RADIUS: u8 = 9;
 /// Card size in the grid.
-pub const CARD_WIDTH: f32 = 348.0;
+pub const CARD_WIDTH: f32 = 362.0;
+
+pub fn set_motion_enabled(enabled: bool) {
+    MOTION_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn motion_enabled() -> bool {
+    MOTION_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn animation_time(ctx: &egui::Context) -> f64 {
+    if motion_enabled() {
+        ctx.input(|i| i.time)
+    } else {
+        0.0
+    }
+}
+
+pub fn animate_bool(ctx: &egui::Context, id: egui::Id, target: bool, seconds: f32) -> f32 {
+    if motion_enabled() {
+        ctx.animate_bool_with_time(id, target, seconds)
+    } else if target {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Sparse technical grid plus one low-contrast scan line. It is deliberately
+/// painter-only: no texture uploads, shaders or allocations that survive a frame.
+pub fn paint_backdrop(ui: &egui::Ui) {
+    let rect = ui.max_rect();
+    let painter = ui.painter();
+    let grid = STROKE.gamma_multiply(0.18);
+    let step = 48.0;
+    let mut x = rect.left() - rect.left().rem_euclid(step);
+    while x <= rect.right() {
+        painter.vline(x, rect.y_range(), Stroke::new(0.5_f32, grid));
+        x += step;
+    }
+    let mut y = rect.top() - rect.top().rem_euclid(step);
+    while y <= rect.bottom() {
+        painter.hline(rect.x_range(), y, Stroke::new(0.5_f32, grid));
+        y += step;
+    }
+    if motion_enabled() {
+        let time = ui.input(|i| i.time) as f32;
+        let travel = (time * 18.0).rem_euclid(rect.height() + 120.0) - 60.0;
+        painter.hline(
+            rect.x_range(),
+            rect.top() + travel,
+            Stroke::new(1.0_f32, CYAN.gamma_multiply(0.055)),
+        );
+    }
+}
 
 /// Installs the theme on a fresh egui context.
 pub fn install(ctx: &egui::Context) {

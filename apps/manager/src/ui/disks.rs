@@ -23,6 +23,7 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                 .inner_margin(egui::Margin::symmetric(22, 18)),
         )
         .show(ctx, |ui| {
+            theme::paint_backdrop(ui);
             super::cards::banners(ui, app, actions);
             toolbar(ui, app, actions);
             ui.add_space(10.0);

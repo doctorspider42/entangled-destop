@@ -29,106 +29,323 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "entangled".to_string());
-            frame(ctx, "wizard", "New machine", 470.0, |ui| {
-                ui.label(ui::dim(
-                    "The Debian installer runs in its own VM window; the manager tracks it \
-                     and streams the console into the log pane.",
-                ));
-                ui.add_space(14.0);
+            frame(ctx, "wizard", "Create a machine", 760.0, |ui| {
+                wizard_progress(ui, state.step);
+                ui.add_space(18.0);
 
-                ui.label(ui::faint("NAME"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.machine.name)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("debian-1"),
-                );
-                ui.add_space(4.0);
-                ui.label(ui::faint(format!(
-                    "profile {} · disk {}",
-                    state.machine.profile_path(&settings.vm_dir).display(),
-                    state.machine.disk_path(&settings.vm_dir).display()
-                )));
-                ui.add_space(14.0);
-
-                slider_row(ui, "MEMORY", |ui| {
-                    // The ceiling is the machine's, not a taste: guest RAM stops
-                    // at the 32-bit MMIO hole until the high-RAM split lands, and
-                    // `control_api` refuses a larger profile. A slider that can
-                    // reach 16 GiB only lets someone build a VM that will not
-                    // start.
-                    ui.add(
-                        egui::Slider::new(
-                            &mut state.machine.memory_mib,
-                            512..=control_api::MAX_MEMORY_MIB,
-                        )
-                        .step_by(256.0)
-                        .suffix(" MiB"),
-                    );
-                });
-                slider_row(ui, "vCPUs", |ui| {
-                    ui.add(egui::Slider::new(&mut state.machine.vcpus, 1..=16));
-                });
-                slider_row(ui, "DISK", |ui| {
-                    ui.add(
-                        egui::Slider::new(&mut state.machine.disk_gib, 8..=256)
-                            .step_by(2.0)
-                            .suffix(" GiB"),
-                    );
-                });
-
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(ui::faint("INSTALLER"));
-                    ui.add_space(8.0);
-                    egui::ComboBox::from_id_salt("variant")
-                        .selected_text(state.machine.variant.clone())
-                        .show_ui(ui, |ui| {
-                            for variant in VARIANTS {
-                                ui.selectable_value(
-                                    &mut state.machine.variant,
-                                    variant.to_string(),
-                                    variant,
-                                );
+                match state.step {
+                    0 => {
+                        wizard_heading(
+                            ui,
+                            "Choose an operating system",
+                            "Pick a guided installer. Entangled prepares the boot path and keeps its console attached here.",
+                        );
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            let card_width =
+                                (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
+                            if option_card(
+                                ui,
+                                card_width,
+                                "Debian",
+                                "Verified network or official installer media",
+                                state.machine.family == launcher::GuestFamily::Debian,
+                                theme::CYAN,
+                            )
+                            .clicked()
+                            {
+                                state.machine.family = launcher::GuestFamily::Debian;
+                            }
+                            if option_card(
+                                ui,
+                                card_width,
+                                "Ubuntu",
+                                "UEFI installer from cache or a local ISO",
+                                state.machine.family == launcher::GuestFamily::Ubuntu,
+                                theme::VIOLET,
+                            )
+                            .clicked()
+                            {
+                                state.machine.family = launcher::GuestFamily::Ubuntu;
                             }
                         });
-                });
-                ui.add_space(10.0);
-                ui.checkbox(&mut state.machine.automated, "Automated installation")
-                    .on_hover_text(
-                        "Preseeded Debian with the Weston desktop profile — no questions asked",
-                    );
-                ui.checkbox(&mut state.machine.headless, "Headless installer")
-                    .on_hover_text("No installer window; the serial console still streams here");
-
-                ui.add_space(12.0);
-                let machine = state.machine.clone();
-                let spec = launcher::install_spec(
-                    &std::path::PathBuf::from(&cli_label),
-                    &settings.vm_dir,
-                    settings.child_cwd(),
-                    &machine,
-                );
-                egui::Frame::new()
-                    .fill(theme::INSET)
-                    .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
-                    .inner_margin(egui::Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(spec.command_line())
-                                .monospace()
-                                .size(11.5)
-                                .color(theme::TEXT_DIM),
+                        ui.add_space(16.0);
+                        match state.machine.family {
+                            launcher::GuestFamily::Debian => {
+                                ui.label(ui::faint("INSTALLER EXPERIENCE"));
+                                egui::ComboBox::from_id_salt("variant")
+                                    .selected_text(variant_label(&state.machine.variant))
+                                    .width(320.0)
+                                    .show_ui(ui, |ui| {
+                                        for variant in VARIANTS {
+                                            ui.selectable_value(
+                                                &mut state.machine.variant,
+                                                variant.to_string(),
+                                                variant_label(variant),
+                                            );
+                                        }
+                                    });
+                                ui.label(ui::dim(match state.machine.variant.as_str() {
+                                    "text-netboot" => "Fast, keyboard-driven network installer.",
+                                    "netinst-iso" => {
+                                        "Official netinst ISO fetched and verified for you."
+                                    }
+                                    _ => "Graphical Debian installer with verified network media.",
+                                }));
+                            }
+                            launcher::GuestFamily::Ubuntu => {
+                                ui.label(ui::faint("LOCAL INSTALLER ISO (OPTIONAL)"));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut state.machine.iso_path)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text(
+                                            "Leave empty to use the newest verified cached ISO",
+                                        ),
+                                );
+                                ui.label(ui::dim(
+                                    "Paste an absolute .iso path, or leave it empty and Entangled uses its verified Ubuntu cache.",
+                                ));
+                            }
+                        }
+                    }
+                    1 => {
+                        wizard_heading(
+                            ui,
+                            "Name it and size the hardware",
+                            "Friendly defaults work well; you can tune everything again after installation.",
                         );
-                    });
+                        ui.add_space(14.0);
+                        ui.label(ui::faint("MACHINE NAME"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.machine.name)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("my-machine"),
+                        );
+                        ui.add_space(14.0);
+                        slider_row(ui, "MEMORY", |ui| {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut state.machine.memory_mib,
+                                    512..=control_api::MAX_MEMORY_MIB,
+                                )
+                                .step_by(256.0)
+                                .suffix(" MiB"),
+                            );
+                        });
+                        slider_row(ui, "PROCESSORS", |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut state.machine.vcpus, 1..=16).suffix(" vCPU"),
+                            );
+                        });
+                        ui.add_space(12.0);
+                        ui.checkbox(&mut state.machine.automated, "Install automatically")
+                            .on_hover_text("Uses Entangled's maintained unattended profile");
+                        ui.checkbox(
+                            &mut state.machine.headless,
+                            "Run installer without a window",
+                        )
+                        .on_hover_text("The serial console remains available in Activity");
+                    }
+                    2 => {
+                        wizard_heading(
+                            ui,
+                            "Choose storage",
+                            "Create a new sparse disk or install onto a RAW image already in your machine library.",
+                        );
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            let card_width =
+                                (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
+                            if option_card(
+                                ui,
+                                card_width,
+                                "Create a new disk",
+                                "Fast sparse RAW image; grows only as data is written",
+                                state.machine.disk_mode == launcher::DiskMode::CreateNew,
+                                theme::CYAN,
+                            )
+                            .clicked()
+                            {
+                                state.machine.disk_mode = launcher::DiskMode::CreateNew;
+                                state.machine.disk_path.clear();
+                            }
+                            if option_card(
+                                ui,
+                                card_width,
+                                "Use an existing disk",
+                                "Keep the data already present in a library image",
+                                state.machine.disk_mode == launcher::DiskMode::UseExisting,
+                                theme::VIOLET,
+                            )
+                            .clicked()
+                            {
+                                state.machine.disk_mode = launcher::DiskMode::UseExisting;
+                            }
+                        });
+                        ui.add_space(16.0);
+                        match state.machine.disk_mode {
+                            launcher::DiskMode::CreateNew => {
+                                ui.label(ui::faint("DISK FILE"));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut state.machine.disk_path)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text(format!("{}.raw", state.machine.name)),
+                                );
+                                ui.label(ui::faint(format!(
+                                    "Saved in {}",
+                                    settings.vm_dir.display()
+                                )));
+                                ui.add_space(12.0);
+                                slider_row(ui, "CAPACITY", |ui| {
+                                    ui.add(
+                                        egui::Slider::new(&mut state.machine.disk_gib, 8..=512)
+                                            .step_by(2.0)
+                                            .suffix(" GiB"),
+                                    );
+                                });
+                            }
+                            launcher::DiskMode::UseExisting => {
+                                ui.label(ui::faint("EXISTING RAW IMAGE"));
+                                egui::ComboBox::from_id_salt("existing-disk")
+                                    .selected_text(if state.machine.disk_path.trim().is_empty() {
+                                        "Choose a disk…".to_string()
+                                    } else {
+                                        state.machine.disk_path.clone()
+                                    })
+                                    .width(ui.available_width())
+                                    .show_ui(ui, |ui| {
+                                        for disk in scan.disks.iter().filter(|d| {
+                                            d.exists
+                                                && d.path.parent()
+                                                    == Some(settings.vm_dir.as_path())
+                                        }) {
+                                            if let Some(name) = disk.path.file_name() {
+                                                let name = name.to_string_lossy().into_owned();
+                                                ui.selectable_value(
+                                                    &mut state.machine.disk_path,
+                                                    name.clone(),
+                                                    format!(
+                                                        "{}  ·  {}",
+                                                        name,
+                                                        format_bytes(disk.apparent_bytes)
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    });
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut state.machine.disk_path)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("existing.raw"),
+                                );
+                                ui.label(ui::dim(
+                                    "Only images in the VM directory are listed; they are never truncated or recreated.",
+                                ));
+                            }
+                        }
+                    }
+                    _ => {
+                        wizard_heading(
+                            ui,
+                            "Ready to build",
+                            "Review the plan. Nothing starts until you confirm.",
+                        );
+                        ui.add_space(14.0);
+                        egui::Frame::new()
+                            .fill(theme::CARD)
+                            .stroke(egui::Stroke::new(1.0_f32, theme::STROKE_STRONG))
+                            .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
+                            .inner_margin(egui::Margin::same(16))
+                            .show(ui, |ui| {
+                                summary_row(ui, "Machine", &state.machine.name);
+                                summary_row(
+                                    ui,
+                                    "Installer",
+                                    &format!(
+                                        "{} · {}",
+                                        state.machine.family.label(),
+                                        if state.machine.automated {
+                                            "automatic"
+                                        } else {
+                                            "interactive"
+                                        }
+                                    ),
+                                );
+                                summary_row(
+                                    ui,
+                                    "Hardware",
+                                    &format!(
+                                        "{} MiB memory · {} vCPU",
+                                        state.machine.memory_mib, state.machine.vcpus
+                                    ),
+                                );
+                                let disk = state.machine.disk_path(&settings.vm_dir);
+                                summary_row(
+                                    ui,
+                                    "Storage",
+                                    &format!(
+                                        "{} · {}",
+                                        disk.display(),
+                                        if state.machine.disk_mode == launcher::DiskMode::CreateNew
+                                        {
+                                            format!(
+                                                "new {} GiB sparse disk",
+                                                state.machine.disk_gib
+                                            )
+                                        } else {
+                                            "existing disk, preserved".to_string()
+                                        }
+                                    ),
+                                );
+                                if state.machine.family == launcher::GuestFamily::Ubuntu {
+                                    summary_row(
+                                        ui,
+                                        "ISO",
+                                        if state.machine.iso_path.trim().is_empty() {
+                                            "Newest verified cached Ubuntu ISO"
+                                        } else {
+                                            state.machine.iso_path.trim()
+                                        },
+                                    );
+                                }
+                            });
+                        let spec = launcher::install_spec(
+                            &std::path::PathBuf::from(&cli_label),
+                            &settings.vm_dir,
+                            settings.child_cwd(),
+                            &state.machine,
+                        );
+                        ui.add_space(10.0);
+                        ui.collapsing("Advanced: command preview", |ui| {
+                            ui.label(
+                                RichText::new(spec.command_line())
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(theme::TEXT_DIM),
+                            );
+                        });
+                    }
+                }
 
                 if let Some(error) = &state.error {
                     ui.add_space(10.0);
                     ui.label(RichText::new(error).color(theme::ERR).size(12.5));
                 }
 
-                ui.add_space(16.0);
+                ui.add_space(20.0);
                 ui.horizontal(|ui| {
-                    if ui::primary_button(ui, "Create machine").clicked() {
+                    if state.step > 0
+                        && ui::ghost_button(ui, "Back", true, theme::TEXT_DIM).clicked()
+                    {
+                        state.step -= 1;
+                        state.error = None;
+                    }
+                    if state.step < 3 {
+                        if ui::primary_button(ui, "Continue").clicked() {
+                            state.step += 1;
+                            state.error = None;
+                        }
+                    } else if ui::primary_button(ui, "Create & install").clicked() {
                         actions.push(Action::SubmitWizard);
                     }
                     if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
@@ -249,6 +466,10 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 "Asks the GitHub Releases API once when the manager opens \
                  (background thread; offline is silently fine)",
             );
+            ui.checkbox(&mut form.animations_enabled, "Interface motion")
+                .on_hover_text(
+                    "Ambient scan, logo movement, status pulses and hover easing. Off uses an event-driven 1 FPS heartbeat.",
+                );
 
             ui.add_space(16.0);
             ui.horizontal(|ui| {
@@ -788,6 +1009,120 @@ fn move_disk_body(
     });
 }
 
+fn wizard_progress(ui: &mut egui::Ui, current: usize) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        for (index, label) in ["System", "Hardware", "Storage", "Review"]
+            .into_iter()
+            .enumerate()
+        {
+            let active = index == current;
+            let done = index < current;
+            let tint = if active {
+                theme::CYAN
+            } else if done {
+                theme::OK
+            } else {
+                theme::TEXT_FAINT
+            };
+            let marker = if done {
+                "OK".to_string()
+            } else {
+                format!("{:02}", index + 1)
+            };
+            ui.label(RichText::new(marker).monospace().color(tint).size(11.0));
+            ui.label(
+                RichText::new(label)
+                    .color(if active { theme::TEXT } else { theme::TEXT_DIM })
+                    .strong(),
+            );
+            if index < 3 {
+                ui.add_space(3.0);
+                ui.label(RichText::new("/").color(theme::STROKE_STRONG));
+            }
+        }
+    });
+}
+
+fn wizard_heading(ui: &mut egui::Ui, title: &str, detail: &str) {
+    ui.label(RichText::new(title).size(21.0).color(theme::TEXT).strong());
+    ui.add_space(3.0);
+    ui.label(RichText::new(detail).size(13.0).color(theme::TEXT_DIM));
+}
+
+fn option_card(
+    ui: &mut egui::Ui,
+    width: f32,
+    title: &str,
+    detail: &str,
+    selected: bool,
+    tint: egui::Color32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 78.0), egui::Sense::click());
+    let hover = theme::animate_bool(
+        ui.ctx(),
+        response.id.with("option-hover"),
+        response.hovered(),
+        0.14,
+    );
+    let strength = if selected { 0.16 } else { 0.05 + hover * 0.06 };
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same(theme::CONTROL_RADIUS),
+        theme::mix(theme::CARD, tint, strength),
+    );
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::same(theme::CONTROL_RADIUS),
+        egui::Stroke::new(
+            if selected { 1.5_f32 } else { 1.0_f32 },
+            if selected {
+                tint.gamma_multiply(0.9)
+            } else {
+                theme::mix(theme::STROKE, tint, hover * 0.4)
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink(13.0))
+            .layout(Layout::top_down(Align::Min)),
+    );
+    child.horizontal(|ui| {
+        ui.label(RichText::new(title).size(15.0).color(theme::TEXT).strong());
+        if selected {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new("SELECTED").monospace().size(10.0).color(tint));
+            });
+        }
+    });
+    child.add_space(5.0);
+    child.label(RichText::new(detail).size(12.0).color(theme::TEXT_DIM));
+    response
+}
+
+fn variant_label(variant: &str) -> &'static str {
+    match variant {
+        "text-netboot" => "Text installer · network",
+        "netinst-iso" => "Official netinst ISO",
+        _ => "Graphical installer · network",
+    }
+}
+
+fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new(104.0, 22.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.label(ui::faint(label.to_uppercase()));
+            },
+        );
+        ui.label(RichText::new(value).size(13.0).color(theme::TEXT));
+    });
+}
+
 fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(
@@ -843,7 +1178,7 @@ fn frame<R>(
         )
         .show(ctx, |ui| {
             ui.set_width(width);
-            let time = ui.input(|i| i.time);
+            let time = theme::animation_time(ui.ctx());
             ui.horizontal(|ui| {
                 let (mark, _) = ui.allocate_exact_size(Vec2::new(34.0, 30.0), egui::Sense::hover());
                 crate::logo::paint_mark(ui.painter(), mark, time, 0.85);
