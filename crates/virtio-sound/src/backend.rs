@@ -170,14 +170,37 @@ impl Pacer {
 /// The default on a host with no audio device, in headless runs and in every
 /// test that does not care about the samples. It is deliberately *not* a
 /// no-op: see [`Pacer`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NullSink {
     pacer: Option<Pacer>,
+    paced: bool,
+}
+
+impl Default for NullSink {
+    fn default() -> Self {
+        Self {
+            pacer: None,
+            paced: true,
+        }
+    }
 }
 
 impl NullSink {
+    /// A null sink that keeps time, like a sound card.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A null sink that accepts audio as fast as it is offered.
+    ///
+    /// For fuzzing and for tests about *what* happens rather than *when*.
+    /// Never give one to a VM: the guest would see its buffer drain at
+    /// infinite speed, which is the failure [`Pacer`] exists to prevent.
+    pub fn unpaced() -> Self {
+        Self {
+            pacer: None,
+            paced: false,
+        }
     }
 }
 
@@ -187,7 +210,7 @@ impl AudioSink for NullSink {
     }
 
     fn start(&mut self, format: StreamFormat, _period_bytes: usize) -> Result<(), AudioError> {
-        self.pacer = Some(Pacer::new(format));
+        self.pacer = self.paced.then(|| Pacer::new(format));
         Ok(())
     }
 

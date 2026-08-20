@@ -1046,40 +1046,12 @@ fn stage_xfer(
         return answer(protocol::S_BAD_MSG);
     };
     let stream_id = u32::from_le_bytes(raw);
-    if stream_id >= stream::STREAMS {
-        tracing::warn!(sink = %name, stream_id, "virtio-snd I/O for an unknown stream");
-        SoundStats::bump(&stats.rejected);
-        return answer(protocol::S_BAD_MSG);
-    }
-    if !stream.state.accepts_io() {
-        tracing::warn!(
-            sink = %name,
-            state = ?stream.state,
-            "virtio-snd I/O message for a stream that is not prepared"
-        );
-        SoundStats::bump(&stats.rejected);
-        return answer(protocol::S_BAD_MSG);
-    }
-    let Some(params) = stream.params else {
-        SoundStats::bump(&stats.rejected);
-        return answer(protocol::S_BAD_MSG);
-    };
-
     let payload = message.get(protocol::PCM_XFER_LEN..).unwrap_or(&[]);
-    let frame_bytes = params.frame_bytes() as usize;
-    if payload.is_empty()
-        || payload.len() % frame_bytes != 0
-        || payload.len() > params.period_bytes as usize
+    if let Err(error) = stream::validate_xfer(stream.state, stream.params, stream_id, payload.len())
     {
-        tracing::warn!(
-            sink = %name,
-            len = payload.len(),
-            period_bytes = params.period_bytes,
-            frame_bytes,
-            "refusing a playback payload that is empty, partial or larger than a period"
-        );
+        tracing::warn!(sink = %name, %error, "refusing a virtio-snd I/O message");
         SoundStats::bump(&stats.rejected);
-        return answer(protocol::S_BAD_MSG);
+        return answer(error.status());
     }
     if stream.pending.len() >= MAX_PENDING_PERIODS
         || stream.ring.len().saturating_add(payload.len()) > stream.ring_capacity()

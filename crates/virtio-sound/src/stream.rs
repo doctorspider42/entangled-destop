@@ -248,6 +248,80 @@ pub fn validate_params(raw: &protocol::RawSetParams) -> Result<PcmParams, ParamE
     })
 }
 
+/// Why a PCM I/O message was refused.
+///
+/// Every variant is `VIRTIO_SND_S_BAD_MSG`: each one is the driver sending a
+/// message it had the information not to send — an identifier the config space
+/// never advertised, a stream that is not prepared, or a payload that
+/// contradicts the geometry the driver itself negotiated. None of them is
+/// "we do not support that", which is what `NOT_SUPP` means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum XferError {
+    #[error("I/O for stream id {id}, outside the advertised range 0..{STREAMS}")]
+    UnknownStream { id: u32 },
+
+    #[error("I/O message for a stream that is {state:?}")]
+    NotReady { state: StreamState },
+
+    #[error("I/O message for a stream with no parameters")]
+    NotConfigured,
+
+    #[error(
+        "payload of {len} bytes is empty, not a whole number of {frame_bytes}-byte frames, \
+         or larger than the negotiated {period_bytes}-byte period"
+    )]
+    Payload {
+        len: usize,
+        frame_bytes: u32,
+        period_bytes: u32,
+    },
+}
+
+impl XferError {
+    /// The `VIRTIO_SND_S_*` code this refusal is reported with.
+    pub fn status(self) -> u32 {
+        S_BAD_MSG
+    }
+}
+
+/// Checks one playback message's header and payload length against the stream
+/// the driver configured. Pure, so the fuzz target can drive it directly.
+///
+/// Returns the parameters the caller should stage against, which is also the
+/// proof that `params` was `Some` and the payload is a whole number of frames
+/// no larger than one period.
+pub fn validate_xfer(
+    state: StreamState,
+    params: Option<PcmParams>,
+    stream_id: u32,
+    payload_len: usize,
+) -> Result<PcmParams, XferError> {
+    if stream_id >= STREAMS {
+        return Err(XferError::UnknownStream { id: stream_id });
+    }
+    if !state.accepts_io() {
+        return Err(XferError::NotReady { state });
+    }
+    let Some(params) = params else {
+        return Err(XferError::NotConfigured);
+    };
+    let frame_bytes = params.frame_bytes();
+    // `frame_bytes` is non-zero for any validated parameters (channels >= 1),
+    // but the modulus is guarded rather than assumed.
+    if payload_len == 0
+        || frame_bytes == 0
+        || payload_len % frame_bytes as usize != 0
+        || payload_len > params.period_bytes as usize
+    {
+        return Err(XferError::Payload {
+            len: payload_len,
+            frame_bytes,
+            period_bytes: params.period_bytes,
+        });
+    }
+    Ok(params)
+}
+
 /// Where a PCM stream is in its lifecycle (VirtIO spec 1.2, section 5.14.6.6).
 ///
 /// ```text
@@ -508,6 +582,88 @@ mod tests {
         ] {
             let error = transition(state, command).expect_err("illegal transition allowed");
             assert_eq!(error.status(), S_BAD_MSG, "{state:?} + {command:#x}");
+        }
+    }
+
+    /// The I/O gate: every refusal is BAD_MSG, and an accepted payload really
+    /// is a whole number of frames inside one period.
+    #[test]
+    fn io_messages_are_checked_against_the_geometry_the_driver_negotiated() {
+        let params = validate_params(&good()).expect("accepted");
+        let frame = params.frame_bytes() as usize;
+
+        assert_eq!(
+            validate_xfer(StreamState::Prepared, Some(params), 0, frame),
+            Ok(params),
+            "a prepared stream takes buffers: ALSA fills before it starts"
+        );
+        assert_eq!(
+            validate_xfer(
+                StreamState::Running,
+                Some(params),
+                0,
+                params.period_bytes as usize
+            ),
+            Ok(params)
+        );
+
+        for (state, params_in, id, len, expected) in [
+            (
+                StreamState::Running,
+                Some(params),
+                STREAMS,
+                frame,
+                XferError::UnknownStream { id: STREAMS },
+            ),
+            (
+                StreamState::Unset,
+                Some(params),
+                0,
+                frame,
+                XferError::NotReady {
+                    state: StreamState::Unset,
+                },
+            ),
+            (
+                StreamState::ParamsSet,
+                Some(params),
+                0,
+                frame,
+                XferError::NotReady {
+                    state: StreamState::ParamsSet,
+                },
+            ),
+            (
+                StreamState::Running,
+                None,
+                0,
+                frame,
+                XferError::NotConfigured,
+            ),
+        ] {
+            assert_eq!(
+                validate_xfer(state, params_in, id, len),
+                Err(expected),
+                "{state:?} {id} {len}"
+            );
+            assert_eq!(expected.status(), S_BAD_MSG);
+        }
+
+        // Empty, partial and oversized payloads.
+        for len in [
+            0,
+            1,
+            frame + 1,
+            params.period_bytes as usize + frame,
+            usize::MAX,
+        ] {
+            assert!(
+                matches!(
+                    validate_xfer(StreamState::Running, Some(params), 0, len),
+                    Err(XferError::Payload { .. })
+                ),
+                "payload of {len} bytes accepted"
+            );
         }
     }
 

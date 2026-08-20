@@ -1380,6 +1380,7 @@ dependencies = [
  "virtio-gpu",
  "virtio-input",
  "virtio-net",
+ "virtio-sound",
  "vmm-core",
  "windows 0.62.2",
 ]

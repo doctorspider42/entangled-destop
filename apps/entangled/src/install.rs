@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 use control_api::{
     BootMode, BootSection, DiskSection, DisplaySection, NetworkBackend, NetworkSection,
-    VirtioTransport, VmConfig,
+    SoundBackend, SoundSection, VirtioTransport, VmConfig,
 };
 use debian_media::{FetchOptions, FetchReport, MediaKind};
 use flate2::write::GzEncoder;
@@ -307,6 +307,9 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         cdrom: None,
         network: net.section.clone(),
         display: DisplaySection::default(),
+        // The installer has nothing to say; the *installed* profile below is
+        // where the card belongs.
+        sound: SoundSection::default(),
     };
 
     tracing::info!(
@@ -355,6 +358,13 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         cdrom: None,
         network: net.section.clone(),
         display: DisplaySection::default(),
+        // A desktop with no sound is not a desktop (GAME-2102). `auto` never
+        // fails a run: a host with no audio device gets a card that plays into
+        // silence, and the guest still enumerates one.
+        sound: SoundSection {
+            enabled: true,
+            backend: SoundBackend::Auto,
+        },
     };
     let profile_path = target.with_file_name(format!("{vm_name}.toml"));
     let text = toml::to_string_pretty(&profile).map_err(|e| e.to_string())?;

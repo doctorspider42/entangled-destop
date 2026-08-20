@@ -30,6 +30,7 @@ virtio-core = { path = "../crates/virtio-core", features = ["test-utils"] }
 vm-memory = { version = "0.17", features = ["backend-mmap"] }
 virtio-block = { path = "../crates/virtio-block" }
 virtio-gpu = { path = "../crates/virtio-gpu" }
+virtio-sound = { path = "../crates/virtio-sound" }
 debian-media = { path = "../crates/debian-media" }
 
 [[bin]]
@@ -77,6 +78,20 @@ bench = false
 [[bin]]
 name = "gpu_remote_protocol"
 path = "fuzz_targets/gpu_remote_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snd_control"
+path = "fuzz_targets/snd_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snd_device"
+path = "fuzz_targets/snd_device.rs"
 test = false
 doc = false
 bench = false
