@@ -16,8 +16,8 @@
 //!   phase := Park{Pause|Reset}         .. inside KVM_RUN / WHvRunVirtualProcessor
 //!   attention := true
 //!   kick(i) for all i, repeatedly  ->  run call returns Interrupted/Canceled
-//!                                      loop top: checkpoint()
-//!                                        flush any pending exit completion
+//!                                      loop top: attention()? flush pending exit
+//!                                      checkpoint()
 //!                                        parked += 1; notify
 //!                                        wait until phase == Run | Stop
 //!   wait until parked == live vCPUs
@@ -35,7 +35,10 @@
 //! That is what makes the stop point safe: no device is half-way through
 //! serving an MMIO access, no descriptor chain is half-walked, and the only
 //! hypervisor-side leftover — KVM's pending userspace-I/O completion — is
-//! flushed explicitly on arrival ([`ResettableVcpu::flush_pending_exit`]).
+//! flushed explicitly before the vCPU parks. That flush is the *backend's* job
+//! rather than this module's, because retiring it can produce one more exit to
+//! dispatch and the `ExitHandler` lives in the run loop; [`Lifecycle::attention`]
+//! is what tells the loop a park is imminent and the flush is worth doing.
 //!
 //! # Why the requester coordinates, not a leader vCPU
 //!
@@ -477,7 +480,16 @@ impl Lifecycle {
             .inspect_err(|_| self.abandon());
 
         let error = {
-            let inner = self.lock();
+            let mut inner = self.lock();
+            // Consume the latch *here*, not only on the way in. On an SMP guest
+            // every vCPU polls the reset registers after its own next exit, so
+            // the second one latches a request for the reboot that is already
+            // under way — after this call cleared it at the start. Left set, it
+            // would be served as a second, spurious reboot the moment the guest
+            // came back, and (being inside the storm window) would count
+            // against it. Safe to clear now: every vCPU has been parked since
+            // the barrier and none of them can have seen anything since.
+            inner.guest_reset = false;
             inner.reset_error.clone()
         };
         machine.unquiesce();
@@ -514,7 +526,7 @@ impl Lifecycle {
     /// vCPU thread or a device: the supervisor turns it into a [`Self::reset`].
     ///
     /// Returns **false** when the guest is resetting faster than it can boot —
-    /// see [`RESET_STORM_WINDOW`]. The caller then ends the VM instead, which is
+    /// see the reset-storm window below. The caller then ends the VM instead, which is
     /// the only bounded answer to a guest that faults its way straight back into
     /// the reset it just came out of.
     #[must_use]
@@ -795,6 +807,11 @@ mod tests {
         machine_resets: AtomicU32,
         vcpu_resets: AtomicU32,
         fail: AtomicBool,
+        /// Stands in for the second vCPU of an SMP guest latching a reset
+        /// request while the first one's reset is already in flight. Set from
+        /// inside `reset_machine`, which is the only deterministic way to be
+        /// *inside* a reset from a test.
+        latch_during_reset: Mutex<Option<Arc<Lifecycle>>>,
     }
 
     impl MachineLifecycle for RecordingMachine {
@@ -806,6 +823,11 @@ mod tests {
         }
         fn reset_machine(&self) -> Result<(), String> {
             self.machine_resets.fetch_add(1, Ordering::AcqRel);
+            if let Ok(latch) = self.latch_during_reset.lock() {
+                if let Some(lifecycle) = latch.as_ref() {
+                    assert!(lifecycle.request_guest_reset());
+                }
+            }
             if self.fail.load(Ordering::Acquire) {
                 return Err("device reset refused".into());
             }
@@ -1044,6 +1066,31 @@ mod tests {
             // Pretend the guest booted for longer than the window.
             lifecycle.lock().last_reset = Some(Instant::now() - RESET_STORM_WINDOW * 2);
         }
+        stop(&lifecycle, handles);
+    }
+
+    /// A reset consumes the guest's request, including one latched *while* it
+    /// was running — which on an SMP guest is the normal case, because every
+    /// vCPU polls the reset registers after its own next exit.
+    #[test]
+    fn a_reset_consumes_a_request_latched_while_it_ran() {
+        let lifecycle = Lifecycle::new(2);
+        let machine = Arc::new(RecordingMachine::default());
+        lifecycle.attach_machine(Arc::clone(&machine) as Arc<dyn MachineLifecycle>);
+        let (handles, _, _) = spawn_fake_vcpus(&lifecycle, 2);
+
+        assert!(lifecycle.request_guest_reset());
+        assert!(lifecycle.take_guest_reset());
+        // The second vCPU's latch, landing after `reset` cleared the first one
+        // and before it finished.
+        if let Ok(mut latch) = machine.latch_during_reset.lock() {
+            *latch = Some(Arc::clone(&lifecycle));
+        }
+        lifecycle.reset().expect("reset");
+        assert!(
+            !lifecycle.take_guest_reset(),
+            "the racing request survived the reset it belonged to, and would be served again"
+        );
         stop(&lifecycle, handles);
     }
 

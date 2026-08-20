@@ -661,7 +661,13 @@ impl ResettableVcpu for Vcpu {
     /// 1. **Pending events go first.** An injected interrupt or a pending
     ///    exception left over from the guest that just died would be delivered
     ///    into the new boot's first instructions.
-    /// 2. **The local APIC.** See [`reset_lapic_state`].
+    /// 2. **The local APIC**, written as a whole power-on register page rather
+    ///    than patched. The interesting fields are exactly the ones a running
+    ///    kernel changed: the LVT entries it pointed at its own vectors, the
+    ///    spurious-interrupt register it enabled, and any IRR/ISR bit left in
+    ///    flight. Re-entering a fresh boot with an armed APIC timer is a triple
+    ///    fault a few hundred instructions later, before the new kernel has an
+    ///    IDT.
     /// 3. **Registers, then `mp_state`.** An application processor goes back to
     ///    `KVM_MP_STATE_UNINITIALIZED` — exactly where `KVM_CREATE_VCPU` left it
     ///    — so the new kernel's INIT/SIPI sweep brings it up the same way the

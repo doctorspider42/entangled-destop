@@ -205,11 +205,18 @@ impl Vm {
         self.console().matches(needle).count()
     }
 
-    /// Waits until `needle` has appeared at least `times` times.
-    fn wait_for(&mut self, needle: &str, times: usize, timeout: Duration) -> bool {
+    /// Waits until `needle` has appeared **more** times than `baseline`.
+    ///
+    /// Always a baseline, never an absolute count. The console buffer holds
+    /// every boot, and a marker's total is not a per-boot number: a shell
+    /// reprints its prompt after every command, so `entangled@` reaches two
+    /// during the *first* boot, and a second boot waiting for "two" is satisfied
+    /// by history and types its next line into a login prompt. That mistake
+    /// cost a fourteen-minute run.
+    fn wait_for_more(&mut self, needle: &str, baseline: usize, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.count(needle) >= times {
+            if self.count(needle) > baseline {
                 return true;
             }
             if self.child.try_wait().ok().flatten().is_some() {
@@ -247,8 +254,13 @@ fn tail(text: &str, lines: usize) -> String {
 /// initiates the reboot through its own software stack, which is the path a
 /// person clicking Restart takes.
 fn log_in_and_reboot(vm: &mut Vm, boot: usize, user: &str, password: &str) -> Result<(), String> {
+    // The shell's own prompt: `user@host:~$`. Matching on the username avoids
+    // the many `$` that appear in a systemd boot.
+    let shell_prompt = format!("{user}@");
+
     step(boot, "waiting for a login prompt");
-    if !vm.wait_for(LOGIN_PROMPT, boot, BOOT_DEADLINE) {
+    let seen = vm.count(LOGIN_PROMPT);
+    if !vm.wait_for_more(LOGIN_PROMPT, seen, BOOT_DEADLINE) {
         return Err(format!(
             "boot {boot}: no login prompt within {BOOT_DEADLINE:?}"
         ));
@@ -257,21 +269,18 @@ fn log_in_and_reboot(vm: &mut Vm, boot: usize, user: &str, password: &str) -> Re
     // A getty that has just started can drop the first characters; a moment's
     // pause costs nothing next to an eight-minute boot.
     std::thread::sleep(Duration::from_secs(2));
+    let seen = vm.count(PASSWORD_PROMPT);
     vm.type_line(user);
-    // Each boot contributes two password prompts: the getty's, and `sudo`'s
-    // below. Counting them is how the test tells this boot's prompts from the
-    // previous boot's, which are still in the same console buffer.
-    if !vm.wait_for(PASSWORD_PROMPT, 2 * boot - 1, PROMPT_DEADLINE) {
+    if !vm.wait_for_more(PASSWORD_PROMPT, seen, PROMPT_DEADLINE) {
         return Err(format!("boot {boot}: no login password prompt"));
     }
+    let seen = vm.count(&shell_prompt);
     vm.type_line(password);
-    // The shell's own prompt: `user@host:~$`. Matching on the username avoids
-    // the many `$` that appear in a systemd boot.
-    let shell_prompt = format!("{user}@");
-    if !vm.wait_for(&shell_prompt, boot, PROMPT_DEADLINE) {
+    if !vm.wait_for_more(&shell_prompt, seen, PROMPT_DEADLINE) {
         return Err(format!("boot {boot}: never reached a shell"));
     }
     step(boot, "asking the guest to reboot");
+    let seen = vm.count(PASSWORD_PROMPT);
     vm.type_line("sudo reboot");
     // `sudo` asks unless it has been used very recently, and it does not always
     // spell the prompt the same way — Ubuntu 26.04's is
@@ -279,7 +288,7 @@ fn log_in_and_reboot(vm: &mut Vm, boot: usize, user: &str, password: &str) -> Re
     // end in the one word every such prompt contains, which is what is matched.
     // Answering a prompt that never came would type the password at a shell, so
     // this waits for the count to move rather than sending it blind.
-    if vm.wait_for(PASSWORD_PROMPT, 2 * boot, SUDO_DEADLINE) {
+    if vm.wait_for_more(PASSWORD_PROMPT, seen, SUDO_DEADLINE) {
         vm.type_line(password);
     }
     Ok(())
@@ -306,13 +315,15 @@ fn an_installed_ubuntu_reboots_itself_and_comes_back_twice() {
             break;
         }
         eprintln!(
-            "boot {boot}: asked the guest to reboot at {:?}",
+            "[guest_reboot] boot {boot}: asked the guest to reboot at {:?}",
             started.elapsed()
         );
     }
-    // The third login prompt is the evidence: it can only exist if both reboots
+    // A third login prompt is the evidence: it can only exist if both reboots
     // came all the way back.
-    let came_back = errors.is_empty() && vm.wait_for(LOGIN_PROMPT, 3, BOOT_DEADLINE);
+    let logins_before = vm.count(LOGIN_PROMPT);
+    let came_back =
+        errors.is_empty() && vm.wait_for_more(LOGIN_PROMPT, logins_before, BOOT_DEADLINE);
     let firmware_runs = vm.count(FIRMWARE_MARKER);
     let grub_runs = vm.count("GNU GRUB");
     let logins = vm.count(LOGIN_PROMPT);

@@ -529,12 +529,14 @@ fn rx_loop(ctx: RxContext) {
         // Nothing below this line may touch guest memory while the VM is
         // paused. Parking here rather than after the read is deliberate: a frame
         // already taken off the host socket would have nowhere to go.
-        if !ctx
+        let Some(_pass) = ctx
             .quiesce
             .wait_while_paused(|| !ctx.stop.load(Ordering::Acquire))
-        {
+        else {
             return;
-        }
+        };
+        // Held for the whole poll-and-deliver round below: a pause is not
+        // acknowledged while a frame is half-way into the RX ring.
         match ctx.backend.wait_readable(RX_POLL_TICK) {
             Ok(Readiness::Readable) => {}
             Ok(Readiness::TimedOut) | Ok(Readiness::WokenUp) => continue,

@@ -855,10 +855,12 @@ fn worker_loop<T: QueueNotifyTarget>(
                 Ok(gate) => Arc::clone(&gate),
                 Err(poisoned) => Arc::clone(&poisoned.into_inner()),
             };
-            if !gate.wait_while_paused(|| !stopping.load(Ordering::Acquire)) {
+            let Some(_pass) = gate.wait_while_paused(|| !stopping.load(Ordering::Acquire)) else {
                 tracing::debug!(slot, "queue worker asked to stop while the VM was paused");
                 return;
-            }
+            };
+            // `_pass` is held across the device call below, so a pause is not
+            // acknowledged until the request in hand has been served.
             match transport.lock() {
                 Ok(mut t) => t.queue_notify(u32::from(*index)),
                 Err(_) => tracing::error!(

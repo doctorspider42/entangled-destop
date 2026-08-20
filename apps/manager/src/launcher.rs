@@ -439,7 +439,14 @@ mod tests {
         assert_eq!(spec.kind, TaskKind::Run);
         assert_eq!(
             spec.command_line(),
-            "/usr/bin/entangled run /vms/debian-demo.toml"
+            "/usr/bin/entangled run --control-stdin /vms/debian-demo.toml"
+        );
+        // The flag and the pipe are one decision: asking the CLI to read
+        // lifecycle commands is useless unless the supervisor keeps a stdin to
+        // write them to, and vice versa (ADR-0005).
+        assert!(
+            spec.control,
+            "a run task must keep its child's stdin, or Pause and Restart have nowhere to go"
         );
         assert_eq!(spec.cwd, Path::new("/srv/entangled"));
         assert_eq!(spec.log_path, Path::new("/vms/debian-demo-run.log"));

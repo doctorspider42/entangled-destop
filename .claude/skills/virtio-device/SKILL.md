@@ -417,8 +417,11 @@ when it works — it has to survive both. Two obligations, one line each:
    is not a PCI function reset; a reboot is both.
 2. **A host thread of your own that touches guest memory must take the pause
    gate first.** `DeviceResources::quiesce` is an `Arc<Quiesce>`;
-   `quiesce.wait_while_paused(|| !stop.load(..))` at the top of the loop, *before*
-   any device lock. Only virtio-net needs it today (its receive worker writes
+   `let Some(_pass) = quiesce.wait_while_paused(|| !stop.load(..)) else { return }`
+   at the top of the loop, *before* any device lock — and **hold the pass for as
+   long as the work lasts**. Closing the gate only stops work that has not
+   started; a pause is not acknowledged until every pass is dropped, which is
+   what makes "paused" true of guest memory and not only of the guest. Only virtio-net needs it today (its receive worker writes
    arriving frames straight into the RX ring on its own schedule). A device whose
    work all happens inside `notify()` needs nothing: it is already on a parked
    vCPU thread, or behind a queue worker that took the gate for it.

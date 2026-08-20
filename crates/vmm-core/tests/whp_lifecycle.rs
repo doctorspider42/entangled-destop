@@ -75,6 +75,7 @@ impl MachineLifecycle for WhpMachine {
     fn quiesce(&self) {
         self.quiesce.pause();
         self.bus.set_paused(true);
+        self.quiesce.wait_until_idle(Duration::from_secs(5));
     }
 
     fn unquiesce(&self) {

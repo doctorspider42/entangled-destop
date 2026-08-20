@@ -17,7 +17,18 @@
 //! | Queue kicks | ioeventfd + worker threads | inline on the vCPU thread |
 //! | AP register setup | every vCPU (KVM's INIT discards it) | **BSP only** — an AP must stay in the reset state WHP created it in |
 //! | Stop signal | SIGINT/SIGTERM via `sigaction` | Ctrl+C via `SetConsoleCtrlHandler` |
+//! | vCPU reset | architectural state written back by hand | the VP deleted and re-created |
+//! | Guest reboot arrives as | a reset register write, or a triple fault | a reset register write only — WHP absorbs the fault |
 //! | VMs per process | any | one — WHP maps guest memory for one partition per process |
+//!
+//! # Lifecycle (ADR-0005)
+//!
+//! A VM here can be frozen and rebooted in place. Everything that decides *when*
+//! is shared: [`LifecycleSupervisor`] is the one thread that turns a request —
+//! from the guest, the window's `Ctrl+Alt+P`/`Ctrl+Alt+R`, or the
+//! `--control-stdin` channel — into the operation, and [`host_api::VmMachine`]
+//! is what a pause freezes and a reset puts back. Only the two rows above
+//! differ per host.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,7 +115,8 @@ fn open_presentation(cfg: &VmConfig, headless: bool) -> Result<Presentation, Str
                 // the title bar repeats the important half of this.
                 tracing::info!(
                     "window controls: click the image to grab input, Ctrl+Alt releases it, \
-                     Ctrl+Alt+G toggles, F11 fullscreen, Ctrl+Alt+O 1:1, Ctrl+Alt+P pauses,                      Ctrl+Alt+R reboots, Ctrl+Alt+Q shuts down"
+                     Ctrl+Alt+G toggles, F11 fullscreen, Ctrl+Alt+O 1:1, \
+                     Ctrl+Alt+P pauses, Ctrl+Alt+R reboots, Ctrl+Alt+Q shuts down"
                 );
                 return Ok(Presentation::Windowed(Box::new(
                     host.with_title(format!("Entangled Desktop — {}", cfg.name)),
@@ -463,6 +475,14 @@ fn spawn_control_channel(
     }
 }
 
+/// How long a pause waits for the host's device workers to finish the work
+/// they already had in hand (ADR-0005).
+///
+/// A worker that is stuck — a host disk that has stopped answering — must not
+/// be able to wedge a pause, so this is bounded and the pause proceeds with a
+/// warning. Generous next to the milliseconds a queue drain takes.
+const QUIESCE_SETTLE: Duration = Duration::from_secs(5);
+
 /// How often the supervisor looks for a lifecycle request.
 ///
 /// The latency a person notices between pressing Ctrl+Alt+P and the VM
@@ -524,8 +544,22 @@ impl LifecycleSupervisor {
                     }
                     std::thread::sleep(LIFECYCLE_POLL);
                 }
-            })
-            .ok();
+            });
+        // Not fatal — the VM runs perfectly well without one — but it is the
+        // difference between a guest's Restart rebooting and the VM stopping
+        // 30 seconds later with "no supervisor served the reset request", so it
+        // must not be silent.
+        let handle = match handle {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "cannot start the lifecycle supervisor: this VM cannot be paused or \
+                     rebooted, and a guest that asks to restart will stop instead"
+                );
+                None
+            }
+        };
         Self { stop, handle }
     }
 
@@ -1080,6 +1114,10 @@ mod host_api {
         fn quiesce(&self) {
             self.quiesce.pause();
             self.bus.set_paused(true);
+            // Closing the gate stops work that has not started; this waits for
+            // the work already in hand, which is what makes "paused" true of
+            // guest memory and not only of the guest.
+            self.quiesce.wait_until_idle(QUIESCE_SETTLE);
         }
 
         fn unquiesce(&self) {

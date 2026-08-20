@@ -11,6 +11,8 @@
 //!   per-device worker threads.
 //! * `tests/pci_transport.rs` — EPIC 19: the acceptance boot for virtio-pci, with
 //!   no `virtio_mmio.device=` clause anywhere on the command line.
+//! * `tests/lifecycle.rs` — ADR-0005: pause, resume and reboot-in-place, using
+//!   [`boot_once_driven`] to act on the VM while its vCPUs are running.
 //!
 //! [`BootSpec::transport`] selects the virtio transport, so any test built on the
 //! harness can be run either way — which is the point: a transport that only the
@@ -289,6 +291,7 @@ impl MachineLifecycle for TestMachine {
     fn quiesce(&self) {
         self.quiesce.pause();
         self.bus.set_paused(true);
+        self.quiesce.wait_until_idle(Duration::from_secs(5));
     }
 
     fn unquiesce(&self) {

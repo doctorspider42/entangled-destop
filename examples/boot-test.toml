@@ -1,6 +1,12 @@
 # Boots the test artifacts to the serial console on stdout:
 #   scripts/fetch-test-kernel.sh && scripts/build-test-initramfs.sh
 #   cargo run -p entangled -- run examples/boot-test.toml
+#
+# The test guest reboots itself after printing its marker, and since ADR-0005
+# that reboots the VM **in place** — so this profile loops until you stop it
+# (Ctrl+C, or Ctrl+Alt+Q in the window). Add `entangled.poweroff=1` to the
+# command line for a run that ends by itself, or `entangled.heartbeat=200` for
+# one that stays up and keeps printing, which is what the pause tests use.
 name = "boot-test"
 memory_mib = 256
 vcpus = 1

@@ -23,9 +23,15 @@ mode = "direct-linux"
 kernel = "artifacts/bootstrap/vmlinuz"
 initramfs = "artifacts/tests/test-initramfs.cpio.gz"
 # `entangled.poweroff=1`: end the run through ACPI S5, which both hosts turn
-# into a clean stop. The test suite's usual `reboot=k` triple fault is *not* a
-# way to end a WHP VM — WHP's local APIC emulation absorbs the reset instead of
-# reporting an exit, and the vCPU parks forever (see the whp-backend skill).
+# into a clean stop.
+#
+# `reboot=k` is left on the line but no longer decides anything: since ADR-0005
+# a guest reset *reboots the VM in place* rather than ending it, on both hosts —
+# the keyboard-controller pulse `reboot=k` selects is a rung of the ladder
+# `machine_x86::reset` implements, so it reaches the host even on WHP, where the
+# triple fault below it is absorbed by the hypervisor. Without the
+# `entangled.poweroff=1` this profile would simply reboot for ever, which is the
+# right behaviour for a VM and the wrong one for a smoke test.
 cmdline = "console=ttyS0 earlyprintk=serial panic=1 reboot=k entangled.poweroff=1"
 
 [network]

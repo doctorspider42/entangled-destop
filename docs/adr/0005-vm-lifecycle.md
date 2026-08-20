@@ -156,10 +156,21 @@ ever be taken at, and a resumed guest finds descriptors it never posted.
 | virtio-gpu / renderer threads | fence completions wake through the (gated) queue worker; the display reads the host scanout, never guest memory | with the device |
 | user-mode NAT threads | host sockets only; frames sit in a bounded host queue until the gated receive worker moves them | backend kept; the device's rings are reset |
 
-Each waiter on the gate brings its **own liveness predicate**, and the shutting
--down side pairs its flag with `Quiesce::wake()`. That is not decoration: a
-device reset runs on a quiesced VM, virtio-net's reset *joins* its receive
-worker, and a gate that only ever opened on resume would deadlock exactly that.
+Two details of the gate are load-bearing rather than decorative.
+
+**A worker holds a `Pass` for the work, not just for the check.** Closing the
+gate stops work that has *not started*; a pause that returned while a receive
+worker was half-way through writing a frame into the RX ring would not be a
+point anything could be snapshotted at. So `wait_while_paused` hands back an
+RAII pass, and `quiesce()` waits — bounded, `QUIESCE_SETTLE` — for every pass to
+be dropped. A worker that is stuck (a host disk that has stopped answering)
+cannot wedge a pause: the wait times out, says so, and the pause proceeds,
+because a VM that can never be frozen because one device is unwell is worse.
+
+**Each waiter brings its own liveness predicate**, and the shutting-down side
+pairs its flag with `Quiesce::wake()`. A device reset runs on a quiesced VM,
+virtio-net's reset *joins* its receive worker, and a gate that only ever opened
+on resume would deadlock exactly that.
 
 The reset order is the machine's dependency order: interrupt sources first (they
 are what could deliver into a CPU with no IDT yet), then devices, then the boot
@@ -245,7 +256,24 @@ port 0x64, an *earlier* rung than the triple fault the hypervisor absorbs.
 `apps/entangled/tests/guest_reboot.rs` is the end-to-end one: an installed
 Ubuntu, logged into over its serial console, running `sudo reboot` — twice —
 and counting EDK2 boot-manager runs to prove the firmware ran again off a
-variable store the reset did not clear.
+variable store the reset did not clear. It passes on KVM in **467 s** for three
+boots, and the console says the whole chain in five lines:
+
+```text
+[  133.402652] reboot: Restarting system
+machine_x86::reset: guest requested a machine reset via="0xcf9 cold reset (also the ACPI reset register)"
+entangled::run_vm::host_api: machine reset: devices at power-on, tables and boot images reloaded entry=0x4fffd0 kind=Pvh
+vmm_core::lifecycle: VM reset complete; guest restarted resets=1
+BdsDxe: starting Boot0006 "Ubuntu" from HD(1,GPT,33AD6DCE-...)/EFI/ubuntu/shimx64.efi
+```
+
+That is the guest's `reboot` going out through EFI `ResetSystem` to 0xCF9, the
+machine coming back **19 ms** later with the PVH firmware reloaded, and the
+firmware finding `Boot0006` in the NVRAM the reset left alone. The second
+reboot is the same five lines with `resets=2`, and a third login prompt follows
+it. A reset that had wiped the variable store would have booted to the EFI
+shell instead, which is why the boot-manager count is the assertion and not the
+login count.
 
 ## What this still needs to become suspend/restore
 
