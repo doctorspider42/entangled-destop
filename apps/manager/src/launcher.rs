@@ -56,13 +56,27 @@ fn search_path(binary: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The installer variants `entangled install --variant` accepts.
+/// The installer variants `entangled install --variant` accepts. Debian only —
+/// the Ubuntu path installs from a verified ISO and has no variants.
 pub const VARIANTS: [&str; 3] = ["text-netboot", "gtk-netboot", "netinst-iso"];
+
+/// The distributions `entangled install <distro>` accepts.
+pub const DISTROS: [&str; 2] = ["ubuntu", "debian"];
+
+/// What a new machine installs by default.
+///
+/// Ubuntu on Windows, because it is the only one that works there out of the
+/// box: it boots verified media through UEFI and installs offline, while the
+/// Debian path needs the project's own bootstrap kernel, which is a Linux kernel
+/// build that does not cross-build. Debian stays the Linux default — that is the
+/// MVP's target and what every existing profile there was installed with.
+pub const DEFAULT_DISTRO: &str = if cfg!(windows) { "ubuntu" } else { "debian" };
 
 /// Everything the wizard collects (GUI-1602).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewMachine {
     pub name: String,
+    pub distro: String,
     pub memory_mib: u64,
     pub vcpus: u32,
     pub disk_gib: u64,
@@ -81,30 +95,46 @@ impl NewMachine {
     }
 }
 
-/// `entangled install debian --disk <dir>/<name>.raw …` (GUI-1602).
+/// `entangled install <distro> --disk <dir>/<name>.raw …` (GUI-1602).
 ///
 /// The installer VM gets at least 1536 MiB — Debian's installer needs it even
-/// when the finished machine is meant to be smaller.
+/// when the finished machine is meant to be smaller. (The Ubuntu path raises its
+/// own floor to 2560 for subiquity and writes the requested size into the
+/// installed profile, so passing the user's number through is right for both.)
 ///
 /// `cwd` is the working directory the child runs in, and it matters: the CLI
-/// resolves the bootstrap kernel as the relative `artifacts/bootstrap/vmlinuz`,
-/// and writes that same relative path into the profile it generates. Disk and
-/// profile paths passed here are absolute, so they are unaffected.
+/// resolves the bootstrap kernel and the UEFI firmware as relative paths
+/// (`artifacts/bootstrap/vmlinuz`, `artifacts/firmware/CLOUDHV.fd`), and writes
+/// the firmware path into the profile it generates. Disk and profile paths passed
+/// here are absolute, so they are unaffected.
+///
+/// `--network` is deliberately not passed: the CLI's per-host default is the
+/// right answer (TAP on Linux, the in-process user-mode NAT on Windows), and a
+/// GUI that pinned it would be wrong on one of the two hosts.
 pub fn install_spec(cli: &Path, vm_dir: &Path, cwd: PathBuf, machine: &NewMachine) -> TaskSpec {
+    let distro = if machine.distro.trim().is_empty() {
+        DEFAULT_DISTRO.to_string()
+    } else {
+        machine.distro.trim().to_lowercase()
+    };
     let mut args = vec![
         "install".to_string(),
-        "debian".to_string(),
+        distro.clone(),
         "--disk".to_string(),
         machine.disk_path(vm_dir).display().to_string(),
         "--size".to_string(),
         format!("{}G", machine.disk_gib),
-        "--variant".to_string(),
-        machine.variant.clone(),
         "--memory-mib".to_string(),
         machine.memory_mib.max(1536).to_string(),
         "--name".to_string(),
         machine.name.clone(),
     ];
+    // `--variant` names a Debian netboot flavour; the Ubuntu path takes an ISO
+    // instead and refuses to be told about variants it has no use for.
+    if distro == "debian" {
+        args.push("--variant".to_string());
+        args.push(machine.variant.clone());
+    }
     if machine.automated {
         args.push("--auto".to_string());
     }
@@ -135,13 +165,45 @@ pub fn run_spec(cli: &Path, vm: &VmEntry, cwd: PathBuf, vm_dir: &Path) -> TaskSp
     }
 }
 
-/// The bootstrap kernel every VM boots from, relative to the child's working
-/// directory. `entangled install` refuses to start without it and profiles
-/// reference it by this relative path, so the UI checks for it up front.
+/// The bootstrap kernel a direct-Linux VM boots from, relative to the child's
+/// working directory. `entangled install debian` refuses to start without it and
+/// the profiles it writes reference it by this relative path, so the UI checks
+/// for it up front.
 pub const BOOTSTRAP_KERNEL: &str = "artifacts/bootstrap/vmlinuz";
+
+/// The UEFI firmware an Ubuntu install boots through, same story: relative to the
+/// child's working directory, named in the profile that comes out.
+pub const UEFI_FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
 
 pub fn bootstrap_kernel_missing(cwd: &Path) -> bool {
     !cwd.join(BOOTSTRAP_KERNEL).is_file()
+}
+
+/// The artifact `entangled install <distro>` would fail on, if any — one message
+/// ready to show, or `None` when this host can install that distribution now.
+///
+/// Per distro rather than one check for both, because the two paths need
+/// different files: an Ubuntu install has no use for the bootstrap kernel, and
+/// blocking it on a missing one (which is what the wizard used to do) makes the
+/// only installer that works on Windows unreachable there.
+pub fn missing_install_artifact(cwd: &Path, distro: &str) -> Option<String> {
+    let (artifact, hint) = match distro.trim().to_lowercase().as_str() {
+        "ubuntu" => (
+            UEFI_FIRMWARE,
+            "build it with `bash guest/firmware/build-cloudhv.sh` (~2.5 min), or point \
+             Settings ▸ working directory at a tree that has it",
+        ),
+        _ => (
+            BOOTSTRAP_KERNEL,
+            "the Debian installer boots the project kernel from there (build it with \
+             guest/bootstrap-kernel/build.sh on Linux, or point Settings ▸ working \
+             directory at a tree that has it)",
+        ),
+    };
+    if cwd.join(artifact).is_file() {
+        return None;
+    }
+    Some(format!("no {artifact} under {} — {hint}", cwd.display()))
 }
 
 #[cfg(test)]
@@ -151,6 +213,7 @@ mod tests {
     fn machine() -> NewMachine {
         NewMachine {
             name: "demo".into(),
+            distro: "debian".into(),
             memory_mib: 4096,
             vcpus: 4,
             disk_gib: 20,
@@ -187,6 +250,82 @@ mod tests {
             assert!(line.contains(needle), "missing {needle} in {line}");
         }
         assert!(!line.contains("--headless"));
+    }
+
+    /// The Ubuntu wiring: the distro reaches the command line, `--variant` does
+    /// not (the ISO path has no variants and the CLI would reject the idea), and
+    /// everything else is spelled the same way.
+    #[test]
+    fn the_ubuntu_install_names_the_distro_and_drops_the_variant() {
+        let mut m = machine();
+        m.distro = "Ubuntu".into();
+        let line = install_spec(
+            &PathBuf::from("entangled"),
+            Path::new("/vms"),
+            PathBuf::from("/srv"),
+            &m,
+        )
+        .command_line();
+        assert!(line.contains("install ubuntu"), "{line}");
+        assert!(!line.contains("--variant"), "{line}");
+        assert!(
+            line.contains("--size 20G") && line.contains("--name demo"),
+            "{line}"
+        );
+        // The network is the CLI's per-host decision, never the GUI's.
+        assert!(!line.contains("--network"), "{line}");
+    }
+
+    /// Which artifact blocks which installer. The Ubuntu path must not be gated
+    /// on the bootstrap kernel — that is what made it unreachable on Windows,
+    /// the only host where it is the *default*.
+    #[test]
+    fn each_distro_is_gated_on_its_own_artifact() {
+        let dir = std::env::temp_dir().join(format!("entangled-launcher-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("artifacts/firmware")).unwrap();
+        std::fs::write(dir.join(UEFI_FIRMWARE), b"fake firmware").unwrap();
+
+        // Firmware present, kernel absent: Ubuntu can go, Debian cannot.
+        assert_eq!(missing_install_artifact(&dir, "ubuntu"), None);
+        let debian = missing_install_artifact(&dir, "debian").expect("no bootstrap kernel");
+        assert!(debian.contains(BOOTSTRAP_KERNEL), "{debian}");
+
+        // And the other way round.
+        std::fs::create_dir_all(dir.join("artifacts/bootstrap")).unwrap();
+        std::fs::write(dir.join(BOOTSTRAP_KERNEL), b"fake kernel").unwrap();
+        std::fs::remove_file(dir.join(UEFI_FIRMWARE)).unwrap();
+        assert_eq!(missing_install_artifact(&dir, "debian"), None);
+        let ubuntu = missing_install_artifact(&dir, "ubuntu").expect("no firmware");
+        assert!(ubuntu.contains(UEFI_FIRMWARE), "{ubuntu}");
+        assert!(ubuntu.contains("build-cloudhv.sh"), "{ubuntu}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The default a fresh wizard opens with: Ubuntu where Debian cannot work.
+    #[test]
+    fn the_default_distro_is_the_one_this_host_can_install() {
+        assert_eq!(
+            DEFAULT_DISTRO,
+            if cfg!(windows) { "ubuntu" } else { "debian" }
+        );
+        assert!(DISTROS.contains(&DEFAULT_DISTRO));
+        // An empty distro (an older settings file, a hand-edited state) falls
+        // back to that default rather than producing `entangled install --disk`.
+        let mut m = machine();
+        m.distro = "  ".into();
+        let line = install_spec(
+            &PathBuf::from("entangled"),
+            Path::new("/vms"),
+            PathBuf::from("/srv"),
+            &m,
+        )
+        .command_line();
+        assert!(
+            line.contains(&format!("install {DEFAULT_DISTRO}")),
+            "{line}"
+        );
     }
 
     #[test]

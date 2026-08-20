@@ -31,10 +31,36 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 .unwrap_or_else(|_| "entangled".to_string());
             frame(ctx, "wizard", "New machine", 470.0, |ui| {
                 ui.label(ui::dim(
-                    "The Debian installer runs in its own VM window; the manager tracks it \
+                    "The installer runs in its own VM window; the manager tracks it \
                      and streams the console into the log pane.",
                 ));
                 ui.add_space(14.0);
+
+                // Distribution first: it decides which artifact has to be
+                // present, which installer the command line names, and whether
+                // the variant picker below means anything at all.
+                ui.horizontal(|ui| {
+                    ui.label(ui::faint("DISTRIBUTION"));
+                    ui.add_space(8.0);
+                    egui::ComboBox::from_id_salt("distro")
+                        .selected_text(state.machine.distro.clone())
+                        .show_ui(ui, |ui| {
+                            for distro in launcher::DISTROS {
+                                ui.selectable_value(
+                                    &mut state.machine.distro,
+                                    distro.to_string(),
+                                    distro,
+                                );
+                            }
+                        });
+                    ui.add_space(8.0);
+                    ui.label(ui::faint(if state.machine.distro == "ubuntu" {
+                        "UEFI · verified ISO · offline"
+                    } else {
+                        "d-i · netboot · needs the network"
+                    }));
+                });
+                ui.add_space(10.0);
 
                 ui.label(ui::faint("NAME"));
                 ui.add(
@@ -77,26 +103,33 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 });
 
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(ui::faint("INSTALLER"));
-                    ui.add_space(8.0);
-                    egui::ComboBox::from_id_salt("variant")
-                        .selected_text(state.machine.variant.clone())
-                        .show_ui(ui, |ui| {
-                            for variant in VARIANTS {
-                                ui.selectable_value(
-                                    &mut state.machine.variant,
-                                    variant.to_string(),
-                                    variant,
-                                );
-                            }
-                        });
+                // Debian's netboot flavour. Disabled rather than hidden for
+                // Ubuntu, so the row does not jump when the distribution
+                // changes — and so it is visible that the setting exists.
+                ui.add_enabled_ui(state.machine.distro == "debian", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(ui::faint("INSTALLER"));
+                        ui.add_space(8.0);
+                        egui::ComboBox::from_id_salt("variant")
+                            .selected_text(state.machine.variant.clone())
+                            .show_ui(ui, |ui| {
+                                for variant in VARIANTS {
+                                    ui.selectable_value(
+                                        &mut state.machine.variant,
+                                        variant.to_string(),
+                                        variant,
+                                    );
+                                }
+                            });
+                    });
                 });
                 ui.add_space(10.0);
                 ui.checkbox(&mut state.machine.automated, "Automated installation")
-                    .on_hover_text(
-                        "Preseeded Debian with the Weston desktop profile — no questions asked",
-                    );
+                    .on_hover_text(if state.machine.distro == "ubuntu" {
+                        "Ubuntu Server through subiquity's autoinstall — no questions asked"
+                    } else {
+                        "Preseeded Debian with the Weston desktop profile — no questions asked"
+                    });
                 ui.checkbox(&mut state.machine.headless, "Headless installer")
                     .on_hover_text("No installer window; the serial console still streams here");
 

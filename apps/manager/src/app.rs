@@ -449,6 +449,7 @@ impl ManagerApp {
         self.modal = Modal::Wizard(WizardState {
             machine: NewMachine {
                 name,
+                distro: launcher::DEFAULT_DISTRO.to_string(),
                 memory_mib: self.settings.default_memory_mib,
                 vcpus: self.settings.default_vcpus,
                 disk_gib: self.settings.default_disk_gib,
@@ -788,13 +789,12 @@ impl ManagerApp {
         };
 
         let cwd = self.settings.child_cwd();
-        if launcher::bootstrap_kernel_missing(&cwd) {
+        // Per distribution: Ubuntu needs the UEFI firmware, Debian the bootstrap
+        // kernel. Checking only the kernel used to make the Ubuntu install — the
+        // one that works on Windows — unreachable there.
+        if let Some(message) = launcher::missing_install_artifact(&cwd, &machine.distro) {
             if let Modal::Wizard(state) = &mut self.modal {
-                state.error = Some(format!(
-                    "no {} under {} — the installer boots the project kernel from there                      (build it with guest/bootstrap-kernel/build.sh, or point Settings ▸                      working directory at a tree that has it)",
-                    launcher::BOOTSTRAP_KERNEL,
-                    cwd.display()
-                ));
+                state.error = Some(message);
             }
             return;
         }
