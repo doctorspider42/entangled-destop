@@ -1266,7 +1266,6 @@ mod host {
 mod host {
     use super::*;
     use control_api::{BootMode, VirtioTransport};
-    use machine_x86::boot as x86_boot;
     use machine_x86::irqchip::UserspaceIrqChip;
     use machine_x86::serial::SerialConsole;
     use machine_x86::virtio::VirtioMmioBus;
