@@ -51,5 +51,12 @@ libc.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_System_Console"] }
 
+# The Fedora Live acceptance test reads back the screenshot it asked for: the
+# Live image's own command line has no `console=`, so the scanout is the only
+# evidence that a desktop came up at all. Same decoder the display crate
+# already uses to write them.
+[dev-dependencies]
+png.workspace = true
+
 [lints]
 workspace = true
