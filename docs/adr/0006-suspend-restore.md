@@ -334,11 +334,22 @@ disk /tmp/.../root.raw has changed since the snapshot was taken (size: was 83886
 ```
 
 **An installed Ubuntu is the same session afterwards** —
-`apps/entangled/tests/guest_suspend.rs`, `#[ignore]`d: it logs in over the serial
-console, records `uptime -s`, suspends mid-session, resumes, and asserts the
-same boot instant, an uptime that only moved forward, a shell `history` that
-still holds the marker it typed, no second login prompt, and a clean
-`sudo poweroff` afterwards.
+`apps/entangled/tests/guest_suspend.rs`, `#[ignore]`d. It logs in over the serial
+console, records the guest's identity, suspends mid-session, resumes, and asks
+again:
+
+```text
+boot 3fca9132-d589-40ce-bf01-11ee665bb238 -> 3fca9132-d589-40ce-bf01-11ee665bb238,
+shell pid 1171 -> 1171, uptime 133s -> 137s
+```
+
+The kernel's `boot_id` is generated once per boot and cannot coincide; the shell
+answering is the same process it was before; the monotonic clock moved forward
+by the four seconds the suspend took rather than restarting. Beside those, the
+resumed process shows **no login prompt** (the getty did not run again) and the
+shell's `history` still holds the marker typed before the suspend. Then it
+powers off through systemd and ACPI, which means the kernel is not merely alive
+but able to run its whole shutdown path.
 
 ## Consequences
 

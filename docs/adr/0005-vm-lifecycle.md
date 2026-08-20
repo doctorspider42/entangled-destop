@@ -4,6 +4,8 @@
 - Date: 2026-08-20
 - Extends: [ADR-0001](0001-mvp-architecture.md), [ADR-0002](0002-linux-first-whp-ready.md)
 - Related: [ADR-0003](0003-uefi-firmware.md) (the firmware a reboot re-enters)
+- Extended by: [ADR-0006](0006-suspend-restore.md) (suspend and restore, built on
+  this seam — see the last section)
 
 ## Context
 
@@ -283,6 +285,14 @@ ADR-0002 phase 4 had recorded a guest reboot as something that could not reach
 a WHP host at all.
 
 ## What this still needs to become suspend/restore
+
+> **Built, in [ADR-0006](0006-suspend-restore.md).** All six items below are
+> done on both hosts, and the two debts at the end of this section are recorded
+> there as known differences a resumed guest still has. The list is left as
+> written because the shape of it turned out to be right — and because one item
+> it *did not* predict cost a whole restore: on KVM the interrupt controllers
+> are in the kernel, so "every device has a save" is not the same as "every
+> piece of state has a save".
 
 The seam stops the machine and puts it back to power-on. Suspend needs it to
 stop the machine and write down *what it was*. What is missing, in the order it

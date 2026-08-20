@@ -148,6 +148,16 @@ enum Command {
         /// so Ctrl+Alt+S on a resumed VM writes back where it came from.
         #[arg(long, value_name = "FILE")]
         save_to: Option<PathBuf>,
+        /// Debug: write a PNG of the scanout N seconds after the resume.
+        ///
+        /// The cheapest way to answer "did my desktop come back?" on a headless
+        /// host: the restored virtio-gpu presents the frame the guest was
+        /// showing when it was suspended, before the guest has drawn anything.
+        #[arg(long, value_name = "SECS")]
+        screenshot_after: Option<u64>,
+        /// Where --screenshot-after writes its PNG.
+        #[arg(long, requires = "screenshot_after")]
+        screenshot: Option<PathBuf>,
     },
     /// Check host prerequisites (KVM, capabilities, graphics backend).
     Doctor,
@@ -340,7 +350,16 @@ fn run(cli: Cli) -> Result<(), String> {
             headless,
             control_stdin,
             save_to,
-        } => resume(snapshot, headless, control_stdin, save_to),
+            screenshot_after,
+            screenshot,
+        } => resume(ResumeArgs {
+            snapshot,
+            headless,
+            control_stdin,
+            save_to,
+            screenshot_after,
+            screenshot,
+        }),
         Command::Run {
             config,
             headless,
@@ -488,12 +507,24 @@ fn format_unix(seconds: i64) -> String {
 /// restore costs one file open and a sentence rather than a half-built VM. Then
 /// it re-parses the profile the snapshot carries and starts the machine that
 /// profile describes — with the snapshot loaded over it instead of a kernel.
-fn resume(
+struct ResumeArgs {
     snapshot: PathBuf,
     headless: bool,
     control_stdin: bool,
     save_to: Option<PathBuf>,
-) -> Result<(), String> {
+    screenshot_after: Option<u64>,
+    screenshot: Option<PathBuf>,
+}
+
+fn resume(args: ResumeArgs) -> Result<(), String> {
+    let ResumeArgs {
+        snapshot,
+        headless,
+        control_stdin,
+        save_to,
+        screenshot_after,
+        screenshot,
+    } = args;
     let info = snapshot::open(&snapshot)?;
     let cfg = snapshot::config_from(&info.metadata)?;
     tracing::info!(
@@ -508,12 +539,18 @@ fn resume(
     );
     #[cfg(any(target_os = "linux", windows))]
     {
+        let shot = screenshot_after.map(|secs| run_vm::ScreenshotRequest {
+            after: std::time::Duration::from_secs(secs),
+            path: screenshot.unwrap_or_else(|| {
+                PathBuf::from(format!("entangled-resume-{}.png", info.metadata.vm_name))
+            }),
+        });
         run_vm::run(
             cfg,
             run_vm::RunOptions {
                 headless,
                 control_stdin,
-                screenshot: None,
+                screenshot: shot,
                 // A resumed VM suspends back to where it came from unless told
                 // otherwise: that is what makes close-the-lid/open-the-lid a
                 // loop rather than a one-way trip.
@@ -524,7 +561,7 @@ fn resume(
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        let _ = (headless, control_stdin, save_to);
+        let _ = (headless, control_stdin, save_to, screenshot_after, screenshot);
         Err(format!(
             "snapshot of '{}' is readable, but restoring a VM requires a Linux host with KVM \
              or a Windows host with the Windows Hypervisor Platform",
