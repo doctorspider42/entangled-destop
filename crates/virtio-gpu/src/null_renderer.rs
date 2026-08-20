@@ -19,8 +19,9 @@ use std::sync::Arc;
 
 use virtio_core::GuestMem;
 
+use crate::blob::{BlobMapping, BlobSupport};
 use crate::error::CommandError;
-use crate::protocol::{MemEntry, Rect, ResourceCreate3d, Transfer3d};
+use crate::protocol::{MemEntry, Rect, ResourceCreate3d, ResourceCreateBlob, Transfer3d};
 use crate::renderer::{CapsetInfo, Renderer3d};
 use crate::resource::{read_backing, write_backing};
 
@@ -37,16 +38,43 @@ const MAX_MODEL_BYTES: u64 = 64 << 20;
 /// zeroes — parseable shape, no capabilities claimed.
 const CAPSETS: [CapsetInfo; 2] = [
     CapsetInfo {
-        id: 1, // VIRTIO_GPU_CAPSET_VIRGL
+        id: crate::CAPSET_VIRGL,
         max_version: 1,
         max_size: 308,
     },
     CapsetInfo {
-        id: 2, // VIRTIO_GPU_CAPSET_VIRGL2
+        id: crate::CAPSET_VIRGL2,
         max_version: 2,
         max_size: 696,
     },
 ];
+
+/// Capsets served in Venus mode ([`NullRenderer::with_venus`]): the virgl pair
+/// plus [`crate::CAPSET_VENUS`].
+///
+/// The venus capset blob is `struct virgl_renderer_capset_venus`, which is
+/// `{ u32 wire_format_version; u32 vk_xml_version; u32 vk_ext_command_serialization_spec_version; u32 vk_ms_command_serialization_spec_version; ... }`
+/// — 32 bytes in the versions that matter. We serve zeroes of that length: a
+/// guest that reads it sees wire format 0 and declines to use the context,
+/// which is exactly right for a renderer that cannot execute Vulkan. The point
+/// of the loopback is to prove the *plumbing* end to end, not to pretend.
+const CAPSETS_VENUS: [CapsetInfo; 3] = [
+    CAPSETS[0],
+    CAPSETS[1],
+    CapsetInfo {
+        id: crate::CAPSET_VENUS,
+        max_version: 0,
+        max_size: VENUS_CAPSET_BYTES,
+    },
+];
+
+/// Size of the venus capset blob (`struct virgl_renderer_capset_venus`).
+const VENUS_CAPSET_BYTES: u32 = 32;
+
+/// Size of the loopback host-visible window ([`NullRenderer::with_venus`]):
+/// enough that the mapping bookkeeping is exercised with realistic offsets,
+/// small enough that nothing is tempted to actually allocate it.
+pub const NULL_HOST_VISIBLE_BYTES: u64 = 256 << 20;
 
 #[derive(Debug, Default)]
 struct ModelResource {
@@ -59,6 +87,15 @@ struct ModelResource {
     mem: Option<Arc<GuestMem>>,
 }
 
+/// A blob the loopback renderer is holding on the host side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelBlob {
+    blob_mem: u32,
+    blob_id: u64,
+    size: u64,
+    mapped_at: Option<u64>,
+}
+
 /// The portable no-op renderer. See the module docs.
 #[derive(Debug, Default)]
 pub struct NullRenderer {
@@ -67,11 +104,35 @@ pub struct NullRenderer {
     /// dispatch happened without pretending to rasterize.
     submits: u64,
     commands: u64,
+    /// Venus/blob loopback mode ([`Self::with_venus`]).
+    venus: bool,
+    /// Host-side blobs, tracked so map/unmap bookkeeping is real.
+    blobs: HashMap<u32, ModelBlob>,
+    /// Contexts and the capset id each was created with, so a test can assert
+    /// a venus context really arrived as a venus context.
+    context_types: HashMap<u32, u32>,
 }
 
 impl NullRenderer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The loopback **Venus** renderer (VEN-2002/VEN-2003): advertises the
+    /// venus capset, accepts venus-typed contexts, serves all three blob
+    /// memory types and owns a host-visible window it validates mappings
+    /// against.
+    ///
+    /// It executes no Vulkan — nothing portable could. What it proves is that
+    /// every byte of the path from a guest `RESOURCE_CREATE_BLOB` /
+    /// `CTX_CREATE(venus)` / `RESOURCE_MAP_BLOB` to the renderer seam is
+    /// wired, bounded and testable on a host with no GPU at all, Windows
+    /// included.
+    pub fn with_venus() -> Self {
+        Self {
+            venus: true,
+            ..Self::default()
+        }
     }
 
     /// Streams executed so far.
@@ -82,6 +143,25 @@ impl NullRenderer {
     /// Commands decoded across all streams.
     pub fn command_count(&self) -> u64 {
         self.commands
+    }
+
+    /// Capset id context `ctx_id` was created with (0 = classic virgl).
+    pub fn context_type(&self, ctx_id: u32) -> Option<u32> {
+        self.context_types.get(&ctx_id).copied()
+    }
+
+    /// Live host-side blobs.
+    pub fn blob_count(&self) -> usize {
+        self.blobs.len()
+    }
+
+    /// `(blob_mem, blob_id, size, mapped_at)` of a host-side blob — what a
+    /// test needs to assert the create/map path carried the guest's values all
+    /// the way through the seam.
+    pub fn blob_state(&self, resource_id: u32) -> Option<(u32, u64, u64, Option<u64>)> {
+        self.blobs
+            .get(&resource_id)
+            .map(|b| (b.blob_mem, b.blob_id, b.size, b.mapped_at))
     }
 
     fn resource_mut(&mut self, id: u32) -> Result<&mut ModelResource, CommandError> {
@@ -117,22 +197,30 @@ impl NullRenderer {
 
 impl Renderer3d for NullRenderer {
     fn capsets(&self) -> &[CapsetInfo] {
-        &CAPSETS
+        if self.venus {
+            &CAPSETS_VENUS
+        } else {
+            &CAPSETS
+        }
     }
 
     fn capset(&mut self, id: u32, version: u32) -> Result<Vec<u8>, CommandError> {
-        let info = CAPSETS
+        let info = self
+            .capsets()
             .iter()
             .find(|c| c.id == id)
             .ok_or(CommandError::UnknownCapset { id, version })?;
         Ok(vec![0u8; info.max_size as usize])
     }
 
-    fn ctx_create(&mut self, _ctx_id: u32, _name: &str) -> Result<(), CommandError> {
+    fn ctx_create(&mut self, ctx_id: u32, capset_id: u32, _name: &str) -> Result<(), CommandError> {
+        self.context_types.insert(ctx_id, capset_id);
         Ok(())
     }
 
-    fn ctx_destroy(&mut self, _ctx_id: u32) {}
+    fn ctx_destroy(&mut self, ctx_id: u32) {
+        self.context_types.remove(&ctx_id);
+    }
 
     fn resource_create_3d(&mut self, args: &ResourceCreate3d) -> Result<(), CommandError> {
         let elements = u64::from(args.width)
@@ -271,6 +359,85 @@ impl Renderer3d for NullRenderer {
 
     fn reset(&mut self) {
         self.resources.clear();
+        self.blobs.clear();
+        self.context_types.clear();
+    }
+
+    // ------------------------------------- blob resources (EPIC 20/VEN-2001)
+
+    fn blob_support(&self) -> BlobSupport {
+        if self.venus {
+            BlobSupport {
+                guest: true,
+                host3d: true,
+                host_visible_bytes: Some(NULL_HOST_VISIBLE_BYTES),
+            }
+        } else {
+            BlobSupport::NONE
+        }
+    }
+
+    fn create_blob(
+        &mut self,
+        args: &ResourceCreateBlob,
+        _mem: &Arc<GuestMem>,
+        _entries: &[MemEntry],
+    ) -> Result<(), CommandError> {
+        if !self.venus {
+            return Err(CommandError::UnsupportedBlobMem(args.blob_mem));
+        }
+        // No host allocation: the loopback models a host blob as bookkeeping
+        // only, which is what keeps this testable on a host with no GPU and
+        // bounded by the device's own limits rather than by real memory.
+        self.blobs.insert(
+            args.resource_id,
+            ModelBlob {
+                blob_mem: args.blob_mem,
+                blob_id: args.blob_id,
+                size: args.size,
+                mapped_at: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn destroy_blob(&mut self, resource_id: u32) {
+        self.blobs.remove(&resource_id);
+    }
+
+    fn map_blob(
+        &mut self,
+        resource_id: u32,
+        offset: u64,
+        size: u64,
+    ) -> Result<BlobMapping, CommandError> {
+        if !self.venus {
+            return Err(CommandError::NoHostVisibleWindow);
+        }
+        let blob = self
+            .blobs
+            .get_mut(&resource_id)
+            .ok_or(CommandError::UnknownResource(resource_id))?;
+        if size != blob.size {
+            // The device computes the span from the blob's own size, so a
+            // mismatch is a host bug, not a guest one — refuse rather than
+            // map something the two sides disagree about.
+            return Err(CommandError::Renderer(format!(
+                "map of blob {resource_id} asked for {size} bytes, blob is {}",
+                blob.size
+            )));
+        }
+        blob.mapped_at = Some(offset);
+        // Plain host RAM would be cached; a real host-visible GPU heap is
+        // write-combining. The loopback holds no memory at all, so cached is
+        // the truthful answer.
+        Ok(BlobMapping::CACHED)
+    }
+
+    fn unmap_blob(&mut self, resource_id: u32, _offset: u64) {
+        if let Some(blob) = self.blobs.get_mut(&resource_id) {
+            blob.mapped_at = None;
+        }
     }
 }
 
@@ -384,10 +551,21 @@ mod tests {
             gpu.ctx_create(7, 0, "x"),
             Err(CommandError::BadContextId(7))
         ));
+        // `context_init` names a context type by capset id (VEN-2002). This
+        // renderer serves only virgl, so a venus context is refused — and so
+        // is any reserved bit outside the capset-id mask.
         assert!(matches!(
-            gpu.ctx_create(8, 1, "venus"),
-            Err(CommandError::UnsupportedContextType(1))
+            gpu.ctx_create(8, crate::CAPSET_VENUS, "venus"),
+            Err(CommandError::UnsupportedContextType(_))
         ));
+        assert!(matches!(
+            gpu.ctx_create(8, 0x0100, ""),
+            Err(CommandError::UnsupportedContextType(0x0100))
+        ));
+        // …while capset 1 (virgl) *is* advertised, so it is a legal type.
+        gpu.ctx_create(8, crate::CAPSET_VIRGL, "virgl")
+            .expect("virgl context");
+        gpu.ctx_destroy(8).expect("destroy");
         assert!(matches!(
             gpu.ctx_destroy(9),
             Err(CommandError::UnknownContext(9))

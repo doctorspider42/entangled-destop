@@ -135,10 +135,61 @@ fn handle(
             Ok(blob) => Reply::Bytes(blob),
             Err(e) => error(e),
         },
-        Request::CtxCreate { ctx_id, name } => match renderer.ctx_create(ctx_id, &name) {
+        Request::CtxCreate {
+            ctx_id,
+            capset_id,
+            name,
+        } => match renderer.ctx_create(ctx_id, capset_id, &name) {
             Ok(()) => Reply::Ok,
             Err(e) => error(e),
         },
+        // Blob resources (VEN-2001). Only host-side blobs ever arrive here —
+        // a guest-memory blob is guest pages the device keeps to itself, and
+        // the isolated helper has no window onto guest RAM by construction.
+        Request::CreateBlob(args) => {
+            // The helper does not trust the VMM either (the GPU-012 rule), so
+            // the guest-derived fields are re-checked on this side too.
+            if args.resource_id == 0 || args.size == 0 || args.size > crate::MAX_BLOB_BYTES {
+                return error(format!(
+                    "blob {} of {} bytes is outside the helper's limits",
+                    args.resource_id, args.size
+                ));
+            }
+            // The helper has no guest memory and never will (GPU-012): a
+            // host-side blob is named by `blob_id`, not by pages. A one-page
+            // placeholder keeps the trait's shape without giving the renderer
+            // anything to read.
+            let mem = match Shadow::new(4096) {
+                Ok(shadow) => shadow.mem,
+                Err(message) => return error(message),
+            };
+            match renderer.create_blob(&args, &mem, &[]) {
+                Ok(()) => Reply::Ok,
+                Err(e) => error(e),
+            }
+        }
+        Request::BlobSupport => Reply::BlobSupport(renderer.blob_support()),
+        Request::DestroyBlob { resource_id } => {
+            renderer.destroy_blob(resource_id);
+            Reply::Ok
+        }
+        Request::MapBlob {
+            resource_id,
+            offset,
+            size,
+        } => match renderer.map_blob(resource_id, offset, size) {
+            Ok(mapping) => Reply::Mapping {
+                map_info: mapping.wire(),
+            },
+            Err(e) => error(e),
+        },
+        Request::UnmapBlob {
+            resource_id,
+            offset,
+        } => {
+            renderer.unmap_blob(resource_id, offset);
+            Reply::Ok
+        }
         Request::CtxDestroy { ctx_id } => {
             renderer.ctx_destroy(ctx_id);
             Reply::Ok

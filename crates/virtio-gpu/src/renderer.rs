@@ -31,8 +31,9 @@ use std::sync::Arc;
 
 use virtio_core::{GuestMem, HostWaker};
 
+use crate::blob::{BlobMapping, BlobSupport};
 use crate::error::CommandError;
-use crate::protocol::{Box3d, MemEntry, Rect, ResourceCreate3d, Transfer3d};
+use crate::protocol::{Box3d, MemEntry, Rect, ResourceCreate3d, ResourceCreateBlob, Transfer3d};
 
 /// Most rendering contexts a guest may hold open at once. Each mesa process
 /// in the guest costs one; GNOME plus a busy desktop is a few dozen.
@@ -155,7 +156,16 @@ pub trait Renderer3d: Send {
     /// One capset blob, already bounded by the matching `max_size`.
     fn capset(&mut self, id: u32, version: u32) -> Result<Vec<u8>, CommandError>;
 
-    fn ctx_create(&mut self, ctx_id: u32, name: &str) -> Result<(), CommandError>;
+    /// Creates rendering context `ctx_id` of the type named by `capset_id`
+    /// (VEN-2002).
+    ///
+    /// `capset_id` is `0` for a classic virgl context (what `context_init = 0`
+    /// means on the wire) and otherwise one of the ids this renderer
+    /// advertises in [`Self::capsets`] — [`crate::CAPSET_VENUS`] being the one
+    /// this epic exists for. The caller has already checked that the renderer
+    /// advertises it, so an implementation only has to map it onto whatever
+    /// its backend calls a context type.
+    fn ctx_create(&mut self, ctx_id: u32, capset_id: u32, name: &str) -> Result<(), CommandError>;
 
     fn ctx_destroy(&mut self, ctx_id: u32);
 
@@ -255,6 +265,70 @@ pub trait Renderer3d: Send {
     fn export_scanout(&mut self, resource_id: u32) -> Option<ScanoutExport> {
         let _ = resource_id;
         None
+    }
+
+    // ------------------------------------- blob resources (EPIC 20/VEN-2001)
+
+    /// Which blob memory types this renderer serves, and whether it has a
+    /// host-visible window (see [`BlobSupport`]).
+    ///
+    /// The default is *none*, which is what keeps
+    /// [`crate::VIRTIO_GPU_F_RESOURCE_BLOB`] off unless a renderer opts in: a
+    /// guest that negotiates blob resources against a renderer that cannot
+    /// serve them is worse off than one that never saw the bit.
+    fn blob_support(&self) -> BlobSupport {
+        BlobSupport::NONE
+    }
+
+    /// `RESOURCE_CREATE_BLOB` for a blob the renderer must know about — the
+    /// `HOST3D` types, whose bytes are the renderer's, and `HOST3D_GUEST`,
+    /// which additionally gets the guest pages.
+    ///
+    /// A pure [`BLOB_MEM_GUEST`](crate::protocol::BLOB_MEM_GUEST) blob never
+    /// reaches here: it is guest memory the device tracks itself, and handing
+    /// it to the renderer would put guest pages in front of the C library for
+    /// no reason.
+    ///
+    /// Every field of `args` has already been bounds-checked
+    /// ([`crate::blob::BlobTable::validate`]); `entries` is empty for
+    /// `HOST3D`.
+    fn create_blob(
+        &mut self,
+        args: &ResourceCreateBlob,
+        mem: &Arc<GuestMem>,
+        entries: &[MemEntry],
+    ) -> Result<(), CommandError> {
+        let _ = (args, mem, entries);
+        Err(CommandError::UnsupportedBlobMem(args.blob_mem))
+    }
+
+    /// Drops a renderer-side blob (`RESOURCE_UNREF` on a host blob).
+    fn destroy_blob(&mut self, resource_id: u32) {
+        let _ = resource_id;
+    }
+
+    /// `RESOURCE_MAP_BLOB`: put this blob's host memory at `offset` in the
+    /// device's shared-memory window, `size` bytes long.
+    ///
+    /// The span has already been validated against the window and against
+    /// every other live mapping ([`crate::blob::HostVisibleWindow`]); what the
+    /// renderer decides is whether it can actually back it, and with what
+    /// caching. The default cannot, which is the honest answer for every
+    /// renderer that reported no `host_visible_bytes`.
+    fn map_blob(
+        &mut self,
+        resource_id: u32,
+        offset: u64,
+        size: u64,
+    ) -> Result<BlobMapping, CommandError> {
+        let _ = (resource_id, offset, size);
+        Err(CommandError::NoHostVisibleWindow)
+    }
+
+    /// `RESOURCE_UNMAP_BLOB`: tear the host mapping at `offset` down. Must be
+    /// infallible — the guest has already stopped using it.
+    fn unmap_blob(&mut self, resource_id: u32, offset: u64) {
+        let _ = (resource_id, offset);
     }
 
     // ------------------------- crash containment (ADR-0004 phase 2, GPU-012)
@@ -417,14 +491,80 @@ impl Gpu3d {
         if self.contexts.len() >= MAX_CONTEXTS {
             return Err(CommandError::TooManyContexts);
         }
-        // `context_init` selects a context type (Venus, drm) in newer specs;
-        // classic virgl is type 0 and the only one phase 1 speaks.
-        if context_init != 0 {
+        // `context_init` names the context *type* by capset id in its low byte
+        // (VEN-2002): 0 is classic virgl, `CAPSET_VENUS` is a Vulkan context.
+        // Every other bit is reserved, and a guest that sets one is confused
+        // about the protocol rather than asking for something exotic — refuse
+        // it instead of silently masking it away.
+        if context_init & !crate::CONTEXT_INIT_CAPSET_ID_MASK != 0 {
             return Err(CommandError::UnsupportedContextType(context_init));
         }
-        self.renderer.ctx_create(ctx_id, name)?;
+        let capset_id = context_init & crate::CONTEXT_INIT_CAPSET_ID_MASK;
+        // A context type is only real if the renderer serves that capset —
+        // otherwise the guest would get a context whose command encoding
+        // nothing on the host can decode.
+        if capset_id != 0 && !self.renderer.capsets().iter().any(|c| c.id == capset_id) {
+            return Err(CommandError::UnsupportedContextType(context_init));
+        }
+        self.renderer.ctx_create(ctx_id, capset_id, name)?;
         self.contexts.insert(ctx_id);
         Ok(())
+    }
+
+    /// True when the renderer advertises the Venus capset, which is what makes
+    /// [`crate::VIRTIO_GPU_F_CONTEXT_INIT`] worth offering (VEN-2002).
+    pub fn serves_venus(&self) -> bool {
+        self.renderer
+            .capsets()
+            .iter()
+            .any(|c| c.id == crate::CAPSET_VENUS)
+    }
+
+    /// Whether any context type beyond classic virgl exists, i.e. whether
+    /// `context_init` can carry anything but zero.
+    pub fn has_context_types(&self) -> bool {
+        self.renderer
+            .capsets()
+            .iter()
+            .any(|c| c.id != crate::CAPSET_VIRGL && c.id != crate::CAPSET_VIRGL2)
+    }
+
+    // ------------------------------------- blob resources (EPIC 20/VEN-2001)
+
+    /// What the host renderer can do with blob resources.
+    pub fn blob_support(&self) -> BlobSupport {
+        self.renderer.blob_support()
+    }
+
+    /// Hands a host-side blob to the renderer. Guest-only blobs never get
+    /// here — see [`Renderer3d::create_blob`].
+    pub fn create_blob(
+        &mut self,
+        args: &ResourceCreateBlob,
+        mem: &Arc<GuestMem>,
+        entries: &[MemEntry],
+    ) -> Result<(), CommandError> {
+        self.renderer.create_blob(args, mem, entries)
+    }
+
+    /// Drops a host-side blob.
+    pub fn destroy_blob(&mut self, resource_id: u32) {
+        self.renderer.destroy_blob(resource_id);
+    }
+
+    /// Asks the renderer to back a validated window span.
+    pub fn map_blob(
+        &mut self,
+        resource_id: u32,
+        offset: u64,
+        size: u64,
+    ) -> Result<BlobMapping, CommandError> {
+        self.renderer.map_blob(resource_id, offset, size)
+    }
+
+    /// Tears a host mapping down.
+    pub fn unmap_blob(&mut self, resource_id: u32, offset: u64) {
+        self.renderer.unmap_blob(resource_id, offset);
     }
 
     /// `CTX_DESTROY` (GPU-004).
