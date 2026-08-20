@@ -9,3 +9,6 @@
 # so keep them byte-exact.
 crates/debian-media/keys/*.asc -text
 crates/debian-media/tests/fixtures/** -text
+scripts/*.sh text eol=lf
+guest/**/*.sh text eol=lf
+.claude/skills/**/SKILL.md text eol=lf

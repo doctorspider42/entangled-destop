@@ -57,28 +57,49 @@ outages. The mechanics:
 - **C: hitting zero kills WSL hard**: the ext4 filesystem flips read-only
   mid-build and every running VM dies. It has happened twice in one day.
 
-Rules that follow:
+Rules that follow — and note how narrow your mandate is:
 
-1. **Target dirs are per-task and disposable.** WSL:
-   `$HOME/entangled-target-<branch>`; Windows:
-   `$env:LOCALAPPDATA\entangled-target-<branch>`. Each one grows to 5–20 GB.
-   **Delete yours (both hosts) as your last action** — a finished task that
-   leaves its target dir behind is not finished:
-   `rm -rf $HOME/entangled-target-<branch>` and
-   `rm -rf /c/Users/papaj/AppData/Local/entangled-target-<branch>` (Git Bash).
-   `scripts/dev-clean.sh` sweeps strays and shows sizes; run it if you suspect
-   previous tasks left debris.
-2. **Check before you build big.** `df -h /` inside WSL and free space on C:
+1. **Clean up after yourself, and only after yourself.** Target dirs are
+   per-task and disposable: WSL `$HOME/entangled-target-<branch>`, Windows
+   `$env:LOCALAPPDATA\entangled-target-<branch>`. Each grows to 5–20 GB.
+   **Deleting your own two dirs is your last action** — a task that leaves
+   them behind is not finished:
+
+   ```bash
+   scripts/dev-clean.sh --mine <branch>      # both hosts, your dirs only
+   ```
+
+2. **Machine-wide cleanup is the user's call, never yours.** This machine is
+   someone's working desktop: containers they need, VMs they are watching,
+   editors attached to WSL. So do not run any of these, even when disk space
+   looks scary — and especially not "helpfully" in the background:
+
+   - `wsl --shutdown` / `wsl --terminate` (kills every VM and build in WSL),
+   - stopping Docker Desktop or `com.docker.service`, `docker system prune`,
+   - VHDX compaction (`diskpart compact vdisk`),
+   - `scripts/dev-clean.sh --delete` without `--mine` (that sweeps *other*
+     tasks' dirs, including in-flight ones),
+   - killing processes you did not start — other agents' builds, the user's
+     `entangled` VMs, anything with a window.
+
+   If you genuinely cannot proceed for lack of space, delete your own dirs,
+   then **stop and say so in your report**. "I freed space by restarting X"
+   is a worse outcome than "I stopped, here is what needs freeing" — one of
+   those interrupts the user's work without asking.
+
+3. **Check before you build big.** `df -h /` inside WSL and free space on C:
    before a workspace build, a VM install, or an ISO download. **Under 10 GB
-   free on C: is a stop sign**: stop, run `scripts/dev-clean.sh`, tell the
-   user if that is not enough. Do not "just try".
-3. **VM disks live in WSL-native `~/entangled-vms`**, never on `/mnt/d`
+   free on C: is a stop sign**: run `scripts/dev-clean.sh --mine <branch>`,
+   and if that is not enough, report it — see rule 2.
+
+4. **VM disks live in WSL-native `~/entangled-vms`**, never on `/mnt/d`
    (drvfs cannot do sparse files — a 16 G sparse image allocates 16 G real).
    Media/kernel caches live in `~/.cache/entangled*`. Both are shared
-   machine state: do not delete them to free space without asking.
-4. **Do not run heavy Windows builds concurrently with WSL VM boots or
+   machine state: never delete them to free space.
+
+5. **Do not run heavy Windows builds concurrently with WSL VM boots or
    installs.** Both dig into C: at once (LOCALAPPDATA target dirs + VHDX
-   growth + WSL swap); that combination caused both crashes.
+   growth + WSL swap); that combination has cost this machine two outages.
 
 ## Running VMs and demos
 
@@ -125,6 +146,10 @@ times:
   0002 (portability seams — read before OS-specific code), 0003 (UEFI),
   0004 (3D). The subsystem skills in `.claude/skills/` carry the earned
   gotchas — load the one for the subsystem you touch; add what you learn.
-- Leave the machine as you found it: target dirs deleted, no orphan
-  `entangled` processes (`wsl -d Ubuntu -e bash -lc "pgrep -a entangled"`),
-  demo VMs shut down cleanly.
+- Leave the machine as you found it: **your** target dirs deleted, no orphan
+  `entangled` processes that **you** started
+  (`wsl -d Ubuntu -e bash -lc "pgrep -a entangled"` — but a VM you did not
+  launch belongs to the user or another agent, so leave it alone), demo VMs
+  you started shut down cleanly via Ctrl+Alt+Q / ACPI power-off. Services,
+  containers and other tasks' work are out of scope by construction: see
+  rule 2 above.

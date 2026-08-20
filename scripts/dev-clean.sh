@@ -8,12 +8,23 @@
 # VM disks (~/entangled-vms), media caches (~/.cache/entangled*), or the repo.
 #
 # Usage (from Git Bash on Windows, or from inside WSL):
-#   scripts/dev-clean.sh                          # dry run: list candidates
-#   scripts/dev-clean.sh --delete                 # actually delete
-#   scripts/dev-clean.sh --delete --keep virgl2   # keep an in-flight task's dir
-#   scripts/dev-clean.sh --sizes                  # also measure sizes (slow on
-#                                                 # Windows: MSYS du over NTFS
-#                                                 # takes minutes per GB)
+#   scripts/dev-clean.sh                       # dry run: list candidates
+#   scripts/dev-clean.sh --mine virgl2         # delete YOUR task's dirs only
+#   scripts/dev-clean.sh --delete --all        # sweep every stray (see below)
+#   scripts/dev-clean.sh --delete --all --keep virgl2   # ... but spare one
+#   scripts/dev-clean.sh --sizes               # also measure sizes (slow on
+#                                              # Windows: MSYS du over NTFS
+#                                              # takes minutes per GB)
+#
+# --mine is what an agent finishing a task should run: it removes exactly
+# entangled-target-<suffix> on both hosts and nothing else. Sweeping other
+# tasks' dirs needs the explicit --all, because a dir that looks stray may
+# belong to a build running right now.
+#
+# This script only ever removes cargo target dirs. It never stops WSL, never
+# touches Docker, never compacts the VHDX and never kills a process: those are
+# machine-wide operations that interrupt the user's work, and they are the
+# user's call (see the dev-environment skill).
 #
 # "main" and the bare "entangled-target" are kept by default: they are the
 # long-lived build caches for the checkout itself. Pass --keep <suffix> for
@@ -23,17 +34,34 @@ set -uo pipefail
 
 DELETE=0
 SIZES=0
+ALL=0
+MINE=""
 KEEP=("main")
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --delete) DELETE=1 ;;
+        --all)    ALL=1 ;;
+        --mine)   shift; MINE="${1:?--mine needs a branch suffix}"; DELETE=1 ;;
         --sizes)  SIZES=1 ;;
         --keep)   shift; KEEP+=("${1:?--keep needs a suffix}") ;;
-        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
 done
+
+if [[ $DELETE -eq 1 && -z "$MINE" && $ALL -eq 0 ]]; then
+    cat >&2 <<'MSG'
+refusing to delete without a scope.
+
+  --mine <branch>   remove only entangled-target-<branch> (what a finishing
+                    task should run)
+  --delete --all    sweep every stray dir — only when you know no other build
+                    is running; another task's dir looks exactly like a stray
+
+MSG
+    exit 2
+fi
 
 in_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
 
@@ -61,6 +89,13 @@ scan() {
     for dir in "$@"; do
         [[ -d "$dir" ]] || continue
         name="$(basename "$dir")"
+        if [[ -n "$MINE" ]]; then
+            # Scoped mode: this task's dir and nothing else.
+            [[ "$name" == "entangled-target-$MINE" ]] || continue
+            found=1
+            rm -rf "$dir" && echo "  DELETED $name"
+            continue
+        fi
         if kept "$name"; then
             echo "  keep    $name"
             continue
@@ -96,7 +131,9 @@ else
     echo
     if command -v wsl.exe >/dev/null 2>&1; then
         args=""
-        [[ $DELETE -eq 1 ]] && args="$args --delete"
+        [[ -n "$MINE" ]] && args="$args --mine $MINE"
+        [[ $DELETE -eq 1 && -z "$MINE" ]] && args="$args --delete"
+        [[ $ALL -eq 1 ]] && args="$args --all"
         [[ $SIZES -eq 1 ]] && args="$args --sizes"
         for k in "${KEEP[@]}"; do args="$args --keep $k"; done
         repo="$(cd "$(dirname "$0")/.." && pwd)"
