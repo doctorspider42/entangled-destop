@@ -272,18 +272,35 @@ them.
 
 ## Measured
 
-Debug builds unless noted, on the development machine.
+**Release builds**, on the development machine, with other VMs running on it —
+so these are ordinary numbers rather than best cases.
 
 | | KVM (WSL Ubuntu) | WHP (native Windows) |
 |---|---|---|
-| bootstrap guest, 256 MiB, 75 MiB touched — suspend | 2.9–3.5 s | 3.0 s |
-| the same, resume | 2.0 s | 2.1 s |
-| snapshot file | 75 MiB for 256 MiB of RAM (29%) | the same |
-| installed Ubuntu, 2 GiB, 2 vCPUs — suspend | see below | — |
+| **bootstrap guest** — 256 MiB, 1 vCPU, virtio-pci | | |
+| suspend (the seam's own time) | 294–380 ms | 281–333 ms |
+| resume, process start to the guest's next line | 364 ms | 207 ms |
+| memory written / guest RAM | 75.0 MiB of 256 MiB — **29.3%** | the same |
+| file on disk | 78.6 MB | the same |
+| **installed Ubuntu** — 2 GiB, 2 vCPUs, UEFI, GPT disk | | |
+| suspend (the seam's own time) | 2.76 s | — |
+| suspend, wall clock including process exit | 3.31 s | — |
+| resume, process start to the guest answering a keystroke | 5.25 s | — |
+| memory written / guest RAM | 514 MiB of 2.0 GiB — **25.1%** | — |
+| file on disk | 539.5 MB | — |
 
-The 29% figure is the bootstrap guest's, and it is *high* on purpose: that guest
-unpacks its whole initramfs into a tmpfs, so most of its RAM really is touched.
-A desktop-shaped guest is the interesting number and is recorded below.
+Two things those numbers say.
+
+**The ratio is the whole design.** A desktop-shaped guest writes a quarter of
+its RAM, and the bootstrap guest's 29% is *higher* only because it unpacks its
+entire initramfs into a tmpfs — almost all of its 256 MiB really is touched. A
+snapshot that wrote every page would be four times the size and four times the
+wait, on a guest whose interesting state is a quarter of it.
+
+**Debug builds cost an order of magnitude**, which is worth knowing before
+anyone measures the wrong binary: the same Ubuntu suspend takes 25.7 s in a
+debug build against 2.76 s in release. The zero-page scan is the hot loop and it
+is exactly the kind of code `opt-level=0` ruins.
 
 ## Acceptance
 

@@ -425,7 +425,10 @@ fn inspect_snapshot(path: &Path) -> Result<(), String> {
         meta.shape.transport,
         meta.shape.boot_mode
     );
-    println!("  file           {}", disk_image::format_bytes(info.file_bytes));
+    println!(
+        "  file           {}",
+        disk_image::format_bytes(info.file_bytes)
+    );
     match info.restorable_here {
         true => println!("  restorable     yes, on this machine"),
         false => println!(

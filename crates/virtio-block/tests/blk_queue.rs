@@ -392,10 +392,18 @@ fn nothing_is_in_flight_once_notify_returns() {
     h.notify();
 
     let used = h.ring.used_idx(&h.mem);
-    assert_eq!(used, 3, "the device left {} of 3 requests unanswered", 3 - used);
+    assert_eq!(
+        used,
+        3,
+        "the device left {} of 3 requests unanswered",
+        3 - used
+    );
     for (slot, &head) in heads.iter().enumerate() {
         let (reported, _) = h.ring.used_elem(&h.mem, slot as u16);
-        assert_eq!(reported as u16, head, "used entry {slot} names the wrong chain");
+        assert_eq!(
+            reported as u16, head,
+            "used entry {slot} names the wrong chain"
+        );
     }
 
     // The device's own position, through the same `save` a suspend uses.

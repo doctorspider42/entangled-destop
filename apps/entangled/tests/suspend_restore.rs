@@ -139,6 +139,14 @@ impl Drop for Scratch {
 }
 
 /// Writes a profile for the heartbeat guest, with an optional disk.
+///
+/// The user-mode NAT is attached on purpose even though this guest never sends
+/// a packet: virtio-net is the device whose *host* side cannot survive a
+/// suspend — its flows live in sockets the restoring process will not have — so
+/// the acceptance run should carry one across rather than leave that path to
+/// the unit tests. It needs no host privileges on either host, and it puts a
+/// device with a **worker thread of its own** in the snapshot, which is the
+/// interesting case for the pause gate.
 fn profile(scratch: &Scratch, kernel: &Path, initramfs: &Path, disk: Option<&Path>) -> PathBuf {
     let mut text = format!(
         "name = \"suspend-probe\"\n\
@@ -150,6 +158,8 @@ fn profile(scratch: &Scratch, kernel: &Path, initramfs: &Path, disk: Option<&Pat
          kernel = {kernel:?}\n\
          initramfs = {initramfs:?}\n\
          cmdline = \"console=ttyS0 panic=1 reboot=k entangled.heartbeat={HEARTBEAT_MS}\"\n\n\
+         [network]\n\
+         backend = \"usernet\"\n\n\
          [display]\n\
          width = 640\n\
          height = 480\n"
@@ -316,8 +326,16 @@ fn suspend_once(scratch: &Scratch, config: &Path, snapshot: &Path) -> u64 {
         (0..=last).collect::<Vec<_>>(),
         "the guest skipped a heartbeat before it was suspended"
     );
+    // The control channel's own summary carries the timing and the memory
+    // ratio — the numbers ADR-0006 records.
+    let summary = console
+        .lines()
+        .find(|line| line.contains("entangled-control: saved"))
+        .unwrap_or("")
+        .trim()
+        .to_string();
     eprintln!(
-        "[suspend] {} bytes, last heartbeat {last}",
+        "[suspend] {} bytes on disk, last heartbeat {last} — {summary}",
         std::fs::metadata(snapshot).map(|m| m.len()).unwrap_or(0)
     );
     last
@@ -338,10 +356,19 @@ fn a_suspended_guest_resumes_on_the_next_heartbeat() {
     let snapshot = scratch.path("vm.esnap");
     let last = suspend_once(&scratch, &config, &snapshot);
 
+    let resume_started = Instant::now();
     let mut vm = Vm::spawn(&["resume", "--headless", &snapshot.display().to_string()]);
     assert!(
-        vm.wait_for(HEARTBEAT, 3),
+        vm.wait_for(HEARTBEAT, 1),
         "the resumed guest never printed a heartbeat:\n{}",
+        tail(&vm.console(), 40)
+    );
+    // Process start to the guest's first line: machine assembly, the memory
+    // read, and the vCPU running again.
+    let to_first_beat = resume_started.elapsed();
+    assert!(
+        vm.wait_for(HEARTBEAT, 3),
+        "the resumed guest stopped after one heartbeat:\n{}",
         tail(&vm.console(), 40)
     );
     let console = vm.kill();
@@ -365,7 +392,7 @@ fn a_suspended_guest_resumes_on_the_next_heartbeat() {
         tail(&console, 40)
     );
     eprintln!(
-        "[resume] continued at {} and ran to {}",
+        "[resume] first guest line {to_first_beat:?} after launch; continued at {} and ran to {}",
         after[0],
         after.last().copied().unwrap_or(0)
     );

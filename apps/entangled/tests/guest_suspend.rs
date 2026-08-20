@@ -305,9 +305,7 @@ fn probe(vm: &mut Vm, shell_prompt: &str) -> Result<Probe, String> {
     // `SUSPEND""PROBE`, which does not match.
     let line = text
         .lines()
-        .filter(|line| line.contains(PROBE_TAG))
-        .filter(|line| !line.contains("\"\""))
-        .next_back()
+        .rfind(|line| line.contains(PROBE_TAG) && !line.contains("\"\""))
         .ok_or_else(|| format!("the guest did not answer the probe; console said:\n{text}"))?;
     let field = |key: &str| -> Option<String> {
         line.split_whitespace()
@@ -337,11 +335,7 @@ fn an_installed_ubuntu_suspends_and_resumes_as_the_same_session() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&snapshot);
-    eprintln!(
-        "suspending {} to {}",
-        profile.display(),
-        snapshot.display()
-    );
+    eprintln!("suspending {} to {}", profile.display(), snapshot.display());
     let started = Instant::now();
 
     // ---------------------------------------------------------------- run it
@@ -488,7 +482,8 @@ fn an_installed_ubuntu_suspends_and_resumes_as_the_same_session() {
         after.uptime
     );
     assert_eq!(
-        logins_after_resume, 0,
+        logins_after_resume,
+        0,
         "the resumed guest showed a login prompt, so the session did not survive; console: {}",
         saved.display()
     );
