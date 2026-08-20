@@ -18,6 +18,7 @@ pub enum DeviceType {
     Block = 2,
     Gpu = 16,
     Input = 18,
+    Sound = 25,
 }
 
 impl DeviceType {
@@ -321,6 +322,7 @@ mod tests {
         assert_eq!(DeviceType::Block.id(), 2);
         assert_eq!(DeviceType::Gpu.id(), 16);
         assert_eq!(DeviceType::Input.id(), 18);
+        assert_eq!(DeviceType::Sound.id(), 25);
     }
 
     #[derive(Default)]

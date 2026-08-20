@@ -492,7 +492,6 @@ impl VirglRenderer {
             _lib: std::mem::ManuallyDrop::new(lib),
         };
 
-
         // Capset versions/sizes are static tables in the library — readable
         // *before* init, which matters: the guest kernel reads `num_capsets`
         // from config space long before the first 3D command triggers EGL
@@ -519,70 +518,78 @@ impl VirglRenderer {
 
         // ------------------------------------------------ the Venus probe
         //
-        // Optional symbols: resolve them all or none. A library with some but
+        // Optional symbols, resolved all-or-nothing. A library with some but
         // not all of them is not one we know how to drive, and half a Venus
-        // implementation is worse than none — the guest would negotiate the
+        // implementation is worse than none: the guest would negotiate the
         // capset and then fail on its first allocation.
         let mut api = api;
         if std::env::var(VENUS_ENV).as_deref() == Ok("off") {
             tracing::info!("{VENUS_ENV}=off: not probing virglrenderer for Venus support");
         } else {
-            // SAFETY: same contract as `sym!` above — looked up by C name in
-            // the library just opened, transmuted to the prototypes quoted on
-            // `VenusApi`, which are the 0.10+ API.
-            let optional = |name: &str| unsafe {
-                api._lib
-                    .get::<*const c_void>(format!("{name} ").as_bytes())
-                    .ok()
-                    .map(|s| *s)
-            };
-            let found: Vec<Option<*const c_void>> =
-                VENUS_SYMBOLS.iter().map(|n| optional(n)).collect();
+            macro_rules! opt_sym {
+                ($ty:ty, $name:literal) => {
+                    // SAFETY: same contract as `sym!` above — looked up by C
+                    // name in the library already opened, and the declared
+                    // type is the 0.10+ prototype quoted on `VenusApi`. Unlike
+                    // `sym!` a miss is not an error: it just means this
+                    // library predates Venus.
+                    unsafe { api._lib.get::<$ty>(concat!($name, " ").as_bytes()) }
+                        .ok()
+                        .map(|symbol| *symbol)
+                };
+            }
+            let context_create_with_flags = opt_sym!(
+                unsafe extern "C" fn(u32, u32, u32, *const c_char) -> c_int,
+                "virgl_renderer_context_create_with_flags"
+            );
+            let resource_create_blob = opt_sym!(
+                unsafe extern "C" fn(*const CreateBlobArgs) -> c_int,
+                "virgl_renderer_resource_create_blob"
+            );
+            // Presence-only: see `VENUS_SYMBOLS`.
+            let resource_map = opt_sym!(*const c_void, "virgl_renderer_resource_map");
+            let resource_unmap = opt_sym!(*const c_void, "virgl_renderer_resource_unmap");
+
             let missing: Vec<&str> = VENUS_SYMBOLS
                 .iter()
-                .zip(&found)
-                .filter(|(_, f)| f.is_none())
-                .map(|(n, _)| *n)
+                .zip([
+                    context_create_with_flags.is_some(),
+                    resource_create_blob.is_some(),
+                    resource_map.is_some(),
+                    resource_unmap.is_some(),
+                ])
+                .filter(|(_, found)| !found)
+                .map(|(name, _)| *name)
                 .collect();
             let (mut venus_version, mut venus_size) = (0u32, 0u32);
             // SAFETY: out-pointers to locals; the entry point reads static
             // size tables and is safe before init (as for VIRGL above).
             unsafe { (api.get_cap_set)(crate::CAPSET_VENUS, &mut venus_version, &mut venus_size) };
 
-            if missing.is_empty() && venus_size > 0 {
-                // SAFETY: every pointer resolved above is a function symbol of
-                // the prototype declared on `VenusApi`; transmuting a resolved
-                // symbol address to its declared signature is the whole point
-                // of the lookup.
-                let venus = unsafe {
-                    VenusApi {
-                        context_create_with_flags: std::mem::transmute::<
-                            *const c_void,
-                            unsafe extern "C" fn(u32, u32, u32, *const c_char) -> c_int,
-                        >(found[0].unwrap_or(std::ptr::null())),
-                        resource_create_blob: std::mem::transmute::<
-                            *const c_void,
-                            unsafe extern "C" fn(*const CreateBlobArgs) -> c_int,
-                        >(found[1].unwrap_or(std::ptr::null())),
-                    }
-                };
-                api.venus = Some(venus);
-                capsets.push(CapsetInfo {
-                    id: crate::CAPSET_VENUS,
-                    max_version: venus_version,
-                    max_size: venus_size,
-                });
-                tracing::info!(
-                    max_version = venus_version,
-                    max_size = venus_size,
-                    "virglrenderer serves the Venus capset (VEN-2003)"
-                );
-            } else {
-                tracing::info!(
+            match (context_create_with_flags, resource_create_blob) {
+                (Some(context_create_with_flags), Some(resource_create_blob))
+                    if missing.is_empty() && venus_size > 0 =>
+                {
+                    api.venus = Some(VenusApi {
+                        context_create_with_flags,
+                        resource_create_blob,
+                    });
+                    capsets.push(CapsetInfo {
+                        id: crate::CAPSET_VENUS,
+                        max_version: venus_version,
+                        max_size: venus_size,
+                    });
+                    tracing::info!(
+                        max_version = venus_version,
+                        max_size = venus_size,
+                        "virglrenderer serves the Venus capset (VEN-2003)"
+                    );
+                }
+                _ => tracing::info!(
                     venus_capset_bytes = venus_size,
                     missing = ?missing,
-                    "virglrenderer has no usable Venus support;                      3D stays classic virgl (VEN-2003)"
-                );
+                    "virglrenderer has no usable Venus support; 3D stays classic virgl (VEN-2003)"
+                ),
             }
         }
         let api = api;

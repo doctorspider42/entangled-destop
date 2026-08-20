@@ -1,6 +1,6 @@
 ---
 name: virtio-device
-description: Implementing virtio devices and both virtio transports (mmio and pci) for Entangled Desktop — virtqueues, feature negotiation, PCI config space, irqfd/ioeventfd, and the untrusted-guest safety rules (backlog EPICs 3, 4, 5, 8, 9, 19; crates virtio-core, virtio-block, virtio-net, virtio-gpu, virtio-input). Load before any virtio work.
+description: Implementing virtio devices and both virtio transports (mmio and pci) for Entangled Desktop — virtqueues, feature negotiation, PCI config space, irqfd/ioeventfd, and the untrusted-guest safety rules (backlog EPICs 3, 4, 5, 8, 9, 19, 21; crates virtio-core, virtio-block, virtio-net, virtio-gpu, virtio-input, virtio-sound). Load before any virtio work.
 ---
 
 # VirtIO devices
@@ -187,6 +187,16 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_input::config::PAYLOAD_MAX` | 128 | config-space payload bytes | `virtio_input::config::tests::{bitmap_drops_codes_beyond_the_payload, from_slice_truncates_at_the_payload_size}` |
 | `virtio_net::MAX_FRAME_LEN` / `MAX_BUFFER_LEN` | 1514 / 1526 | bytes staged per frame, either direction | `net_queue::{tx_oversized_frames_are_dropped, an_oversized_host_frame_is_dropped_before_the_ring, rx_chain_too_small_for_the_frame_drops_it}` |
 | `virtio_net::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick | same shape as the blk budget test |
+| `virtio_sound::stream::MIN_PERIOD_BYTES` / `MAX_PERIOD_BYTES` | 64 / 64 KiB | one PCM period, and therefore the payload of one playback message | `virtio_sound::stream::tests::period_and_buffer_geometry_is_bounded_and_never_divides_by_zero`, `snd_queue::set_params_refuses_everything_the_device_never_advertised` |
+| `virtio_sound::stream::MAX_BUFFER_BYTES` | 1 MiB | the host PCM ring a guest can make the device allocate (`buffer_bytes` + one period of slack) | same tests, plus `virtio_sound::device::tests::the_ring_capacity_follows_the_negotiated_buffer` |
+| `virtio_sound::stream::MIN_PERIODS` / `MAX_PERIODS` | 2 / 1024 | periods one buffer may be divided into — the buffer must be a whole number of them | same tests |
+| `virtio_sound::stream::MAX_CHANNELS` | 2 | channels one stream may carry (what the chmap describes) | `virtio_sound::stream::tests::channel_counts_are_bounded_by_what_the_chmap_describes` |
+| `virtio_sound::stream::STREAMS` / `JACKS` / `CHMAPS` | 1 / 1 / 1 | items the config space advertises; every id and every `*_INFO` range is checked against these | `snd_queue::info_queries_outside_the_advertised_range_or_with_the_wrong_record_size_are_refused` |
+| `virtio_sound::MAX_CONTROL_MSG_BYTES` | 4 KiB | bytes gathered for one control message, refused *before* reading | `snd_queue::malformed_descriptor_chains_are_dropped_without_taking_the_device_down` |
+| `virtio_sound::MAX_XFER_BYTES` | 4 B + 64 KiB | bytes gathered for one playback message (header + a period) | same test, fuzz target `snd_device` |
+| `virtio_sound::MAX_PENDING_PERIODS` | 256 | playback messages held un-retired | `snd_queue::flooding_the_ring_beyond_the_negotiated_buffer_is_an_io_error` |
+| `virtio_sound::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick, on every queue | same shape as the blk budget test |
+| `virtio_sound::MAX_RECORDING_BYTES` | 16 MiB | bytes a `RecordingSink` keeps before it plays on without storing | `virtio_sound::backend::tests::a_recording_is_capped_rather_than_unbounded` |
 | `machine_x86::virtio::MAX_VIRTIO_SLOTS` | 8 | devices on the mmio bus (IOAPIC pins) | `queue_notify::attaching_more_devices_than_slots_is_refused` |
 | `machine_x86::notify::MAX_OFFLOADED_QUEUES` | 16 | ioeventfds and epoll slots one device may demand | `queue_notify::queue_notify_offload_is_capped_per_device` |
 | `virtio_core::pci::MAX_NOTIFY_QUEUES` | 1024 | *derived* (notify region ÷ multiplier); queues a device may expose on pci, since each needs its own notification address | `virtio_core::pci::tests::a_device_with_more_queues_than_notify_slots_is_refused` |
@@ -431,6 +441,51 @@ Blob resources themselves (`virtio_gpu::blob`) are the device half:
   process singleton, all self-skipping), `boot-tests/virgl_gnome.rs` (GNOME
   live on virgl, `--ignored`), fuzz targets `gpu_3d_commands` (now including
   the fence surface) and `gpu_remote_protocol`.
+- **snd** (EPIC 21, GAME-2102): wire format in `virtio_sound::protocol` (mirrors
+  `linux/virtio_snd.h`, lengths asserted at compile time), bounds and the
+  lifecycle state machine in `virtio_sound::stream`, the device and its pump
+  thread in `virtio_sound::device`. Four queues, as the spec mandates: control,
+  event, TX, RX. Five things to know before touching it:
+  - **Completion is the pacing.** The driver puts one message per period on TX
+    and treats the used ring as the hardware pointer, so a message may only be
+    retired once the host sink has actually *consumed* its audio. Retire on copy
+    and the guest believes an hour played in a microsecond. This is why a
+    **pump thread** owns the TX queue (`Arc<Mutex<Inner>>`, virtio-net's receive
+    worker is the pattern) and takes the pause gate before it touches guest
+    memory. No `HostWaker`: unlike a GPU fence, nothing foreign has to tell us
+    the audio finished — this thread measured it.
+  - **A software sink must keep time.** `NullSink`/`RecordingSink` sleep through
+    `backend::Pacer` rather than accepting instantly; a sink with zero latency
+    is not a sound card, and every completion would fire at once. `unpaced()`
+    exists for tests and fuzzing only.
+  - **The advertised set is short on purpose**: one output stream, `S16`,
+    44100/48000 Hz, 1–2 channels, no PCM features. A guest's own ALSA converts
+    anything else, and every extra format is more host code on an untrusted
+    path. Requests are checked against `SUPPORTED_FORMATS`/`SUPPORTED_RATES`,
+    never against what the guest claims we said.
+  - **Status mapping is load-bearing**: `BAD_MSG` for protocol misuse (an id
+    outside the config space, a command in the wrong state, a payload that
+    contradicts the negotiated geometry), `NOT_SUPP` for a well-formed ask we
+    never offered (format, rate, channel count, buffer size, `JACK_REMAP`),
+    `IO_ERR` only for a genuine host-side or ring-full condition. A driver that
+    gets the two confused debugs the wrong half of its stack.
+  - **The host sink is behind `AudioSink`, built by a `SinkFactory` *on the pump
+    thread*** — WASAPI's COM objects and ALSA's handle both belong to one
+    thread, and a device reset has to be able to get its audio back. Linux is
+    `libasound` **`dlopen`ed, never linked** (LGPL; `cargo deny` gates the
+    graph — ADR-0004's virglrenderer arrangement, reasoning in
+    `virtio_sound::alsa`'s module docs); Windows is WASAPI shared mode with
+    `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`, so the audio
+    engine resamples and we ship no converter.
+  Capture (RX) is a documented phase 2: no input stream is advertised, so a
+  conforming driver never posts there, and one that does is answered
+  `NOT_SUPP` in band. Underruns are counted and logged once a second, never
+  allowed to wedge the device — the pump writes silence and carries on.
+  Tests: `tests/snd_queue.rs` (mmio, including a 440 Hz tone asserted
+  byte-for-byte with no underruns and provably paced completion),
+  `tests/snd_pci.rs` (the same untouched device over pci), fuzz targets
+  `snd_control` (parsers, bounds, lifecycle) and `snd_device` (arbitrary chains
+  through a live transport).
 - **input** (EPIC 9): event model in `virtio_input` (`ev`, `abs`, `btn`,
   `InputEvent`). Absolute pointer: window coords →
   `InputEvent::abs_from_window` (0..=32767). Every batch ends with
@@ -480,8 +535,10 @@ when it works — it has to survive both. Two obligations, one line each:
    at the top of the loop, *before* any device lock — and **hold the pass for as
    long as the work lasts**. Closing the gate only stops work that has not
    started; a pause is not acknowledged until every pass is dropped, which is
-   what makes "paused" true of guest memory and not only of the guest. Only virtio-net needs it today (its receive worker writes
-   arriving frames straight into the RX ring on its own schedule). A device whose
+   what makes "paused" true of guest memory and not only of the guest. Two
+   devices need it today: virtio-net (its receive worker writes arriving frames
+   straight into the RX ring on its own schedule) and virtio-snd (its pump
+   thread retires playback messages on the host's audio clock). A device whose
    work all happens inside `notify()` needs nothing: it is already on a parked
    vCPU thread, or behind a queue worker that took the gate for it.
 

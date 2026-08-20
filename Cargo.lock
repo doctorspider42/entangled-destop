@@ -1391,6 +1391,7 @@ dependencies = [
  "virtio-gpu",
  "virtio-input",
  "virtio-net",
+ "virtio-sound",
  "vmm-core",
  "windows 0.62.2",
 ]
@@ -4538,6 +4539,19 @@ dependencies = [
  "virtio-bindings",
  "vm-memory 0.17.2",
  "vmm-sys-util",
+]
+
+[[package]]
+name = "virtio-sound"
+version = "0.2.0"
+dependencies = [
+ "libloading",
+ "thiserror 2.0.20",
+ "tracing",
+ "virtio-core",
+ "virtio-queue",
+ "vm-memory 0.17.2",
+ "windows 0.62.2",
 ]
 
 [[package]]

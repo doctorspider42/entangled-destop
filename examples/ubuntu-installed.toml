@@ -58,3 +58,15 @@ writable = true
 width = 1280
 height = 800
 scale = 1.0
+
+# A sound card (GAME-2102). Off unless a profile asks: the device is attached
+# after every other one, so switching it on never renames /dev/vda nor shifts a
+# PCI device number, but it does take one of the eight slots on the bus.
+#
+# `backend = "auto"` (the default) uses the host's own audio — ALSA on Linux,
+# WASAPI on Windows — and falls back to a card that plays into silence when the
+# host has none, so this key can never be the reason a VM fails to start. Name
+# a backend explicitly ("null", "alsa", "wasapi") and a host that cannot
+# provide it fails the run instead.
+[sound]
+enabled = true
