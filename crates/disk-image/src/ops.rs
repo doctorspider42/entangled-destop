@@ -790,6 +790,17 @@ mod tests {
 
         // Length never changes: FALLOC_FL_KEEP_SIZE / FSCTL_SET_ZERO_DATA.
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 16 << 20);
+        // A filesystem that kept the untouched 8 MiB tail as a hole can punch
+        // holes, so on *this* host `Unsupported` would be a regression rather
+        // than a limitation. That is what makes this a real assertion on ext4
+        // and on NTFS, and still a skip on drvfs.
+        if before.is_some_and(|allocated| allocated < 10 << 20) {
+            assert_eq!(
+                outcome,
+                PunchOutcome::Deallocated,
+                "this filesystem keeps holes, so it must be able to punch one"
+            );
+        }
         match outcome {
             PunchOutcome::Deallocated => {
                 // The hole reads as zeros...
