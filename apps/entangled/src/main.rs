@@ -66,6 +66,13 @@ struct Cli {
     command: Command,
 }
 
+/// One of these is built once per process, by `Cli::parse`, and then matched on
+/// and dropped. `InstallArgs` is the biggest by some way (twelve flags, most of
+/// them owned strings and paths) and Windows clippy notices the spread —
+/// boxing it is the usual fix, but clap's derive cannot take `Box<T>` as a
+/// variant field, and a heap allocation per process start would buy nothing
+/// anyway. Same reasoning as `entangled_manager::app::Modal`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Download and verify installer media (Debian stable).
