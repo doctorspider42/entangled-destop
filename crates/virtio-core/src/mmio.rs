@@ -39,10 +39,14 @@ pub const QUEUE_DRIVER_HIGH: u64 = 0x094;
 pub const QUEUE_DEVICE_LOW: u64 = 0x0a0;
 pub const QUEUE_DEVICE_HIGH: u64 = 0x0a4;
 
-// Shared-memory region registers (spec 4.2.2). Entangled Desktop exposes no shared
-// memory regions; per spec, reads of SHM_LEN for a non-existent region must
-// return all-ones (a zero would look like a real zero-length region at
-// address 0 — Linux virtio_gpu then tries to reserve it and fails its probe).
+// Shared-memory region registers (spec 4.2.2). `SHM_SEL` selects a region by
+// `shmid`; `SHM_LEN`/`SHM_BASE` then describe it (VEN-2001).
+//
+// Per spec, reads of SHM_LEN for a **non-existent** region must return
+// all-ones — a zero would look like a real zero-length region at address 0,
+// and Linux' virtio_gpu then tries to reserve it and fails its probe. That is
+// what a device with no regions still gets, unchanged; a device that declares
+// one gets the real values once the host has placed it.
 pub const SHM_SEL: u64 = 0x0ac;
 pub const SHM_LEN_LOW: u64 = 0x0b0;
 pub const SHM_LEN_HIGH: u64 = 0x0b4;

@@ -36,6 +36,7 @@ fn virglrenderer_round_trips_pixels_through_host_gl() {
             return;
         }
     };
+    assert_venus_probe_is_self_consistent(&renderer);
     let mut gpu = Gpu3d::new(Box::new(renderer));
     let mem = Arc::new(virtio_core::testing::guest_memory(MEM_SIZE));
 
@@ -156,4 +157,40 @@ fn virglrenderer_round_trips_pixels_through_host_gl() {
     gpu.reset();
     gpu.ctx_create(2, 0, "after-reset")
         .expect("the renderer survives a device reset");
+}
+
+/// VEN-2003's host probe, made permanent and printable: what this machine's
+/// libvirglrenderer actually offers for Venus.
+///
+/// Not an assertion about *which* answer is right — jammy's 0.9.1 has no Venus
+/// and a self-built 1.x does — but about the two answers being **consistent**:
+/// the venus capset is advertised if and only if the renderer will accept a
+/// venus-typed context and a blob, and never with a host-visible window
+/// (nothing backs one yet). Folded into the round-trip test rather than
+/// standing alone because the library is a process singleton, so two tests
+/// that both `load()` would race for it and one would always skip.
+fn assert_venus_probe_is_self_consistent(renderer: &VirglRenderer) {
+    let capsets: Vec<_> = virtio_gpu::Renderer3d::capsets(renderer).to_vec();
+    let blob = virtio_gpu::Renderer3d::blob_support(renderer);
+    let venus = capsets
+        .iter()
+        .find(|c| c.id == virtio_gpu::CAPSET_VENUS)
+        .copied();
+    eprintln!("VEN-2003 host probe: capsets={capsets:?} blob_support={blob:?}");
+
+    assert_eq!(
+        venus.is_some(),
+        blob.any(),
+        "the venus capset and blob support come from the same set of symbols;          advertising one without the other hands the guest a device it cannot use"
+    );
+    assert!(
+        blob.host_visible_bytes.is_none(),
+        "no host has a shared-memory window backed yet (VEN-2001's machine-layer half)"
+    );
+    match venus {
+        Some(info) => assert!(info.max_size > 0, "an advertised capset must have a blob"),
+        None => eprintln!(
+            "VEN-2003: this host's virglrenderer has no Venus support;              the device stays on classic virgl"
+        ),
+    }
 }

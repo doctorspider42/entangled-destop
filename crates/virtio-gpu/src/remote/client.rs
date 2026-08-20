@@ -22,8 +22,9 @@ use std::sync::Arc;
 
 use virtio_core::{GuestMem, HostWaker};
 
+use crate::blob::{BlobMapping, BlobSupport};
 use crate::error::CommandError;
-use crate::protocol::{MemEntry, Rect, ResourceCreate3d, Transfer3d};
+use crate::protocol::{MemEntry, Rect, ResourceCreate3d, ResourceCreateBlob, Transfer3d};
 use crate::renderer::{CapsetInfo, FenceOutcome, Renderer3d};
 use crate::resource::{read_backing, write_backing};
 
@@ -149,6 +150,10 @@ pub struct RemoteRenderer {
     /// Staging buffer for transfer spans, reused across calls.
     staging: Vec<u8>,
     capsets: Vec<CapsetInfo>,
+    /// What the helper's renderer can do with blobs, learned once at
+    /// handshake time (VEN-2001) — the device asks before it decides which
+    /// feature bits to offer, so it cannot be a per-command query.
+    blob_support: BlobSupport,
     resources: std::collections::HashMap<u32, RemoteResource>,
     /// Cleared the moment the helper stops answering. Everything after that
     /// fails in band and the device degrades to 2D (GPU-012).
@@ -213,6 +218,7 @@ impl RemoteRenderer {
             rx: Vec::new(),
             staging: Vec::new(),
             capsets: Vec::new(),
+            blob_support: BlobSupport::NONE,
             resources: std::collections::HashMap::new(),
             alive: true,
             monitor: None,
@@ -245,6 +251,36 @@ impl RemoteRenderer {
                 )));
             }
         }
+        // Second half of the handshake (VEN-2001): what the helper can do with
+        // blobs. Still inside the read timeout, because a helper that cannot
+        // answer this cannot answer anything. A refusal is not fatal — it just
+        // means no blob feature bit — so an error here is recorded, not
+        // propagated.
+        match renderer.call(&Request::BlobSupport) {
+            Ok(Reply::BlobSupport(support)) => {
+                tracing::info!(
+                    pid = renderer.child.id(),
+                    guest = support.guest,
+                    host3d = support.host3d,
+                    host_visible_bytes = support.host_visible_bytes.unwrap_or(0),
+                    "isolated renderer blob support"
+                );
+                renderer.blob_support = support;
+            }
+            Ok(other) => {
+                renderer.shutdown();
+                return Err(SpawnError::Handshake(format!(
+                    "the renderer process answered the blob-support query with {other:?}"
+                )));
+            }
+            Err(error) => {
+                renderer.shutdown();
+                return Err(SpawnError::Handshake(format!(
+                    "the renderer process did not answer the blob-support query: {error}"
+                )));
+            }
+        }
+
         // Handshake done: no more read timeouts. A command that takes longer
         // than a handshake is a busy GPU, not a dead helper, and the device's
         // own fence watchdog is what covers a genuinely stuck host.
@@ -370,9 +406,10 @@ impl Renderer3d for RemoteRenderer {
         self.call_bytes(&Request::Capset { id, version })
     }
 
-    fn ctx_create(&mut self, ctx_id: u32, name: &str) -> Result<(), CommandError> {
+    fn ctx_create(&mut self, ctx_id: u32, capset_id: u32, name: &str) -> Result<(), CommandError> {
         self.call_ok(&Request::CtxCreate {
             ctx_id,
+            capset_id,
             name: name.to_owned(),
         })
     }
@@ -606,5 +643,52 @@ impl Renderer3d for RemoteRenderer {
 
     fn is_alive(&self) -> bool {
         self.alive
+    }
+
+    // ------------------------------------- blob resources (EPIC 20/VEN-2001)
+
+    fn blob_support(&self) -> BlobSupport {
+        self.blob_support
+    }
+
+    fn create_blob(
+        &mut self,
+        args: &ResourceCreateBlob,
+        _mem: &Arc<GuestMem>,
+        _entries: &[MemEntry],
+    ) -> Result<(), CommandError> {
+        // Guest pages deliberately do not cross the boundary (GPU-012): the
+        // helper gets the blob's *identity* and size, never an address.
+        self.call_ok(&Request::CreateBlob(*args))
+    }
+
+    fn destroy_blob(&mut self, resource_id: u32) {
+        self.call_quiet(&Request::DestroyBlob { resource_id });
+    }
+
+    fn map_blob(
+        &mut self,
+        resource_id: u32,
+        offset: u64,
+        size: u64,
+    ) -> Result<BlobMapping, CommandError> {
+        match self.call(&Request::MapBlob {
+            resource_id,
+            offset,
+            size,
+        })? {
+            Reply::Mapping { map_info } => Ok(BlobMapping { map_info }),
+            Reply::Error(message) => Err(CommandError::Renderer(message)),
+            other => Err(CommandError::Renderer(format!(
+                "unexpected reply {other:?}"
+            ))),
+        }
+    }
+
+    fn unmap_blob(&mut self, resource_id: u32, offset: u64) {
+        self.call_quiet(&Request::UnmapBlob {
+            resource_id,
+            offset,
+        });
     }
 }

@@ -175,6 +175,13 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_gpu::remote::MAX_FRAME_BYTES` | 40 MiB | bytes in one message either way across the renderer-process boundary, refused *before* reserving | `remote::tests::an_oversized_length_header_is_refused_before_allocating`, fuzz target `gpu_remote_protocol` |
 | `virtio_gpu::remote::protocol::REMOTE_XFER_WINDOW` / `REMOTE_MAX_BACKING` | 8 MiB / 64 MiB | backing bytes per transfer across that boundary / shadow backing per resource | `gpu_remote::the_isolated_renderer_serves_the_whole_3d_path` (round trip), server-side refusal |
 | `virtio_gpu::renderer::MAX_3D_WIDTH` / `MAX_3D_DIM` / `MAX_3D_ARRAY` / `MAX_3D_LAST_LEVEL` / `MAX_3D_SAMPLES` | 2²⁸ / 16384 / 2048 / 15 / 32 | per-axis geometry of one `RESOURCE_CREATE_3D` | `gpu_3d::a_malicious_3d_guest_is_answered_in_band` |
+| `virtio_gpu::blob::MAX_BLOB_RESOURCES` | 4096 | live blob resources (VEN-2001) | `blob::tests::the_resource_count_and_byte_budgets_hold`, fuzz target `gpu_blob` |
+| `virtio_gpu::blob::MAX_BLOB_BYTES` | 1 GiB | size of one blob; also the size the helper re-checks on its own side | `blob::tests::sizes_must_be_whole_pages_inside_the_budget`, `gpu_blob::a_malicious_blob_guest_is_answered_in_band` |
+| `virtio_gpu::blob::MAX_TOTAL_BLOB_BYTES` | 4 GiB | bytes promised across every live blob | `blob::tests::the_resource_count_and_byte_budgets_hold` (asserts the budget is exact) |
+| `virtio_gpu::blob::MAX_BLOB_ENTRIES` | 16384 | page-list entries in one `RESOURCE_CREATE_BLOB` | `gpu_blob::a_malicious_blob_guest_is_answered_in_band` (a lying `nr_entries` and an overflowing one) |
+| `virtio_gpu::blob::MAX_HOST_VISIBLE_MAPPINGS` | 4096 | live mappings the host-visible window tracks | fuzz target `gpu_blob` |
+| `virtio_gpu::blob::BLOB_PAGE_SIZE` | 4096 | granularity every blob size and map offset must be a multiple of | `blob::tests::window_reservations_cannot_overlap_or_run_off_the_end` |
+| `virtio_gpu::MAX_COMMAND_BYTES_BLOB` | 256 KiB + 56 B | gather cap once blob resources are offered — 24 bytes above the 2D cap, because a full-length `RESOURCE_CREATE_BLOB` really is 24 bytes longer than a full-length attach-backing | `virtio_gpu::device::tests::command_buffer_bound_matches_the_entry_limit` (compile-time `assert!`s in `device.rs`) |
 | `virtio_gpu::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick (controlq and cursorq) | same shape as the blk budget test |
 | `virtio_input::MAX_PENDING_EVENTS` | 1024 | host-buffered input events while the guest is not draining (oldest dropped) | `input_queue::a_starved_queue_buffers_events_up_to_the_bound_and_drops_the_oldest` |
 | `virtio_input::config::PAYLOAD_MAX` | 128 | config-space payload bytes | `virtio_input::config::tests::{bitmap_drops_codes_beyond_the_payload, from_slice_truncates_at_the_payload_size}` |
@@ -194,6 +201,7 @@ you add a device: a bound without an enforcing test is not done.
 | `machine_x86::notify::MAX_OFFLOADED_QUEUES` | 16 | ioeventfds and epoll slots one device may demand | `queue_notify::queue_notify_offload_is_capped_per_device` |
 | `virtio_core::pci::MAX_NOTIFY_QUEUES` | 1024 | *derived* (notify region ÷ multiplier); queues a device may expose on pci, since each needs its own notification address | `virtio_core::pci::tests::a_device_with_more_queues_than_notify_slots_is_refused` |
 | `virtio_core::pci::VIRTIO_PCI_BAR_SIZE` | 32 KiB | guest-addressable register space per pci device; every capability's `offset + length` must fit | `virtio_core::pci::tests::capability_records_describe_the_real_bar_layout`, `regions_do_not_overlap_and_the_common_struct_fits` |
+| `virtio_core::ShmRegion::len` | non-zero | a declared shared-memory region must have a length; zero is refused at construction because "present with length 0" is the state the all-ones convention exists to avoid | `virtio_core::transport::tests::a_zero_length_shm_region_is_refused` |
 | `virtio_core::msix::MAX_MSIX_VECTORS` | 256 | *derived* (table region ÷ 16 B); vectors one function may publish, so `queues + 1` must fit or the transport refuses the device | `virtio_core::msix::tests::table_size_for_*`, `virtio_core::pci::tests::a_device_with_more_queues_than_msix_vectors_is_refused` |
 | `machine_x86::pci::MAX_PCI_DEVICES` | 9 | config spaces, BAR windows and IOAPIC pins on the root bus (8 devices + the host bridge) | `machine_x86::pci::tests::the_bus_is_bounded` |
 | `machine_x86::layout::PCI_MMIO_SLOTS` | 8 | 32 KiB aperture slots at `0xc000_0000`; one per device, and `locate_mmio` decodes nothing outside the aperture | `machine_x86::pci::tests::{addresses_outside_the_aperture_are_never_claimed, a_bar_moved_out_of_the_aperture_decodes_nothing}` |
@@ -268,6 +276,57 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
   publishes a dword and a write mask, nothing more), and the guest-facing
   decisions — is MSI-X enabled, is this vector masked — must be read at signal
   time rather than cached at activation, because Linux toggles them mid-probe.
+
+## Shared-memory regions and blob resources (EPIC 20, VEN-2001)
+
+A shared-memory region is a window of **host** memory the guest maps directly.
+virtio-gpu needs one for host-visible blob resources, which is the reason Venus
+was out of reach in ADR-0004 phase 1. The plumbing is deliberately inert unless
+a device asks for it:
+
+- A device declares regions with `VirtioDevice::shm_regions() -> Vec<ShmRegion>`
+  (`{id, len}`, default empty). It never learns *where* the window lands — that
+  is the transport's and the machine layer's business.
+- **mmio**: `SHM_SEL` selects by `shmid`; `SHM_LEN_LOW/HIGH` and
+  `SHM_BASE_LOW/HIGH` answer for a region that is declared **and** placed
+  (`MmioTransport::set_shm_base(id, gpa)`). Everything else reads **all-ones**.
+  Preserve that exactly: a zero looks to Linux' `virtio_gpu` like a present
+  zero-length region at address 0, it tries to reserve it, and the probe fails.
+  Two tests pin it (`a_device_without_shm_regions_still_reads_all_ones`,
+  `a_declared_shm_region_answers_only_after_the_host_places_it`).
+- **pci**: `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` (`cfg_type` 8) as a
+  `virtio_pci_cap64` — 24 bytes, offset and length split across two field pairs
+  — in `VIRTIO_PCI_SHM_BAR_INDEX` (**2**, not the register BAR: BAR 0 is a
+  32 KiB 32-bit window sized to the register file and a host-visible region is
+  hundreds of megabytes and wants to be 64-bit prefetchable). Build the records
+  with `pci::shm_capability_records(&placements)`; `pci::place_shm_regions`
+  packs them page-aligned and refuses a set that does not fit.
+  **The machine layer must allocate that second BAR before any of this is
+  published** — a capability pointing at a BAR nothing decodes is worse than no
+  capability.
+
+Blob resources themselves (`virtio_gpu::blob`) are the device half:
+
+- Three memory types. `BLOB_MEM_GUEST` is guest pages and needs no renderer at
+  all (it is the venus command ring); `BLOB_MEM_HOST3D` is a renderer
+  allocation named by `blob_id`; `BLOB_MEM_HOST3D_GUEST` is both. Unknown types
+  and unknown flag bits are **refused, never ignored** — ignoring a "use" flag
+  hands the guest a resource that silently cannot do what it asked for.
+- The blob table is a *third* owner in the one id namespace. Every existing
+  command routes by ownership (the rule ADR-0004's mixed-namespace amendment
+  established): attach/detach-backing and `TRANSFER_*_3D` are refused for a
+  blob, `CTX_ATTACH_RESOURCE` is accepted, `SET_SCANOUT` is refused in favour of
+  `SET_SCANOUT_BLOB`, and `RESOURCE_UNREF` releases a window span the guest
+  forgot to unmap.
+- `RESOURCE_MAP_BLOB` carries the sharpest guest value in the epic: an offset
+  into a *host* mapping. `HostVisibleWindow::reserve` checks it in u64 against
+  the window length, the page grid and **both** neighbouring mappings before
+  the renderer sees it, and the caller rolls the reservation back if the
+  renderer refuses. Never let a reservation outlive a failed map.
+- Feature bits follow capability, not hope: `VIRTIO_GPU_F_RESOURCE_BLOB` and
+  `VIRTIO_GPU_F_CONTEXT_INIT` are offered only when the attached renderer's
+  `BlobSupport` / capsets justify them, so a virgl-only host is byte-identical
+  to before.
 
 ## Per-device references
 

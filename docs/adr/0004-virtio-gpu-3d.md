@@ -569,3 +569,202 @@ Three ways to fill the gap, all licence-clean:
 Decision: **Venus is the target** (backlog EPIC 20), ANGLE stays as the
 fallback if blob resources turn out to be the wrong hill. Either way the C
 library is loaded at runtime, never linked, exactly as phase 1 established.
+
+## Amendment (2026-08-21): EPIC 20 phase 1 — blob resources and the shared-memory window
+
+Phase 1 rejected Venus for two concrete missing pieces (option (b) above):
+blob resources, and a shared-memory region the transports did not have. This
+amendment records what those cost, what they look like on each transport, and
+**exactly** where Venus stands when this phase stops.
+
+### What a blob is, and why the device has to be *less* clever
+
+A blob resource has no format, no geometry and no pixels — a size, a memory
+type, and (for two of the three types) a page list. That is not an omission in
+the spec: it is the point. Venus does not want a device that understands
+textures, because the thing being moved is a serialized Vulkan command stream
+and a `VkDeviceMemory` allocation. Everything the 2D and 3D halves do — bound a
+rect against a resource's width, size a transfer against a mip level — has no
+counterpart here.
+
+So `virtio_gpu::blob` bounds the only things it *can* bound, and refuses
+everything ambiguous:
+
+| guest value | rule |
+|---|---|
+| `blob_mem` | must be one of the three, **and** one the renderer declared |
+| `blob_flags` | unknown bits refused, not masked; `USE_CROSS_DEVICE` refused outright (no dmabuf on either host) |
+| `size` | non-zero, a whole number of 4 KiB pages, ≤ `MAX_BLOB_BYTES` (1 GiB), and the sum ≤ `MAX_TOTAL_BLOB_BYTES` (4 GiB) |
+| `nr_entries` | ≤ `MAX_BLOB_ENTRIES` (16384), and the command must actually carry that many (the multiplication is checked) |
+| page list | required for `GUEST`/`HOST3D_GUEST` and must cover `size`; **forbidden** for `HOST3D` |
+| `RESOURCE_MAP_BLOB` offset | page-aligned, `offset + size` inside the window in u64, and disjoint from every live mapping |
+
+The last row is the one that matters. It is the first time in this device that
+a guest names an offset into a **host** mapping. `HostVisibleWindow` is
+therefore a validator, not an allocator — placement is the driver's business
+(Linux' `virtio_gpu` carves the region with its own `drm_mm`) and the device's
+job is to refuse anything that would let one guest mapping alias another's host
+memory. The check is a two-neighbour test in a `BTreeMap`, and the fuzz target
+re-derives the no-overlap invariant from *outside* after every operation, so a
+bug in that test cannot hide behind itself.
+
+One deliberate asymmetry: **a guest-memory blob never reaches the renderer.**
+Its bytes are guest pages the device already tracks, and handing them to a
+`dlopen`ed C library buys nothing and widens the trust boundary. Only the two
+host3d types cross the `Renderer3d` seam, and they cross it by `blob_id` — so
+the isolated helper (GPU-012) still has no window onto guest RAM, unchanged.
+
+The blob table is a **third owner in the one id namespace**, which is the rule
+the mixed-namespace amendment above already established: route by which table
+owns the id. Attach/detach-backing and `TRANSFER_*_3D` are refused for a blob
+(a blob's pages are fixed at create time and it has no geometry to transfer
+against); `CTX_ATTACH_RESOURCE` is accepted, because Venus attaches its ring
+blob to its context exactly as the kernel attaches its 2D console framebuffer;
+`SET_SCANOUT` is refused in favour of the blob variant; and `RESOURCE_UNREF`
+releases a window span the guest forgot to unmap, because a guest is allowed to
+forget and the host must not leak it.
+
+`SET_SCANOUT_BLOB` is implemented for a guest-memory blob with a single-plane
+BGRA layout: the flush gathers rows out of the guest pages through the same
+checked `vm-memory` path everything else uses, at the stride the guest
+declared. A **host** blob is refused, because presenting one needs the
+zero-copy export this host does not have (the dmabuf probe in the phase-2
+amendment above) and a black screen is a worse answer than an error.
+
+### The shared-memory region, per transport
+
+| | virtio-mmio | virtio-pci |
+|---|---|---|
+| how the driver finds it | `SHM_SEL` selects by `shmid`, then `SHM_LEN_LOW/HIGH` + `SHM_BASE_LOW/HIGH` | `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` (`cfg_type` 8) as a `virtio_pci_cap64` |
+| record | four 32-bit registers, spec 4.2.2 | 24 bytes; offset and length split across two field pairs, spec 4.1.4.7 |
+| where the window lives | a guest-physical range the machine layer picks | **BAR 2**, a window of its own |
+| a region that does not exist | reads all-ones (unchanged) | no capability published at all (unchanged) |
+
+Two decisions worth their own sentences.
+
+**The all-ones answer is load-bearing, and was preserved byte for byte.** A read
+of `SHM_LEN` for a region that does not exist must return all-ones; returning
+zero makes Linux' `virtio_gpu` see a *present*, zero-length region at address 0,
+try to reserve it, and fail its probe. That was a real bug fix once, and it now
+has a test of its own (`a_device_without_shm_regions_still_reads_all_ones`)
+standing next to the new behaviour, so the two cannot drift apart. A
+zero-length region is refused at construction for the same reason.
+
+**On PCI it has to be a second BAR.** BAR 0 is 32 KiB, 32-bit, and sized to the
+register file; the "why one BAR and not two" argument in `pci.rs` is about the
+*register* structures and still holds. A host-visible blob window is hundreds of
+megabytes and wants to be 64-bit prefetchable, so it cannot share — and
+`virtio_pci_cap64` exists precisely because such a region's length does not fit
+a 32-bit field.
+
+**And the window is declared but not yet backed.** A region is reported to the
+guest only when the device declares it *and* the machine layer has said where it
+landed (`set_shm_base`). Nothing calls that yet, because allocating the second
+BAR — a 64-bit prefetchable aperture, a KVM memory slot / `WHvMapGpaRange` for
+the host pages behind it, the DSDT `_CRS` that publishes it, and the BAR-rebase
+machinery EDK2 forces — is `machine-x86` work, and that crate was another
+agent's this session. Until it exists, `RESOURCE_MAP_BLOB` is refused in band
+with a message saying exactly that. This ordering is the honest one: an
+unbacked window advertised to a driver is a guest that faults on its first
+`mmap`, which is strictly worse than a device that says "not here".
+
+Consequently every feature bit follows capability rather than hope.
+`VIRTIO_GPU_F_RESOURCE_BLOB` and `VIRTIO_GPU_F_CONTEXT_INIT` are offered only
+when the attached renderer's `BlobSupport` and capsets justify them, and a
+device with no region produces byte-identical registers and byte-identical PCI
+configuration space to the one it produced before any of this existed.
+
+### Where Venus actually stands
+
+Done, and tested on both hosts with no GPU at all:
+
+- `VIRTIO_GPU_F_RESOURCE_BLOB`: `RESOURCE_CREATE_BLOB` for all three memory
+  types, `RESOURCE_MAP_BLOB` / `RESOURCE_UNMAP_BLOB` against the window,
+  `SET_SCANOUT_BLOB`, and every bound in the table above;
+- `VIRTIO_GPU_F_CONTEXT_INIT` and `VIRTIO_GPU_CAPSET_VENUS`. `context_init`'s
+  low byte is a capset id naming the context *type*, honoured only for a capset
+  the renderer actually advertises — otherwise the guest would get a context
+  whose encoding nothing on the host can decode;
+- the shared-memory region on both transports;
+- `NullRenderer::with_venus()`, a portable loopback that declares the venus
+  capset and all three blob types and validates real window offsets, so the
+  whole path is exercisable — and fuzzable — on Windows;
+- the isolated-renderer protocol carries all of it (version 2): `CtxCreate` grew
+  a capset id, and there are `CreateBlob` / `DestroyBlob` / `MapBlob` /
+  `UnmapBlob` / `BlobSupport` messages.
+
+Not done, stated plainly: **Venus renders nothing.** No host in this project
+decodes a Vulkan command stream yet.
+
+### The host probe, 2026-08-21, and what it means
+
+Measured in the WSL Ubuntu 22.04 that runs all KVM work on this machine:
+
+- `/dev/dri` still does not exist; `/dev/dxg` does. No DRM render node.
+- `libvirglrenderer1` is **0.9.1** (jammy). The four Venus-era entry points —
+  `virgl_renderer_context_create_with_flags`, `..._resource_create_blob`,
+  `..._resource_map`, `..._resource_unmap` — do not resolve, and
+  `virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VENUS)` reports **0 bytes**.
+  Recorded by a test rather than by a note: `virgl_host.rs` prints
+  `capsets=[VIRGL v1 308 B, VIRGL2 v2 696 B]`, `blob_support={guest: false,
+  host3d: false, host_visible_bytes: None}`, and asserts those two answers stay
+  consistent with one another.
+- A host Vulkan ICD **does** exist, and it is not the one phase 1 assumed. Not
+  dzn: **lavapipe** (`/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`).
+  `vulkaninfo --summary` enumerates exactly one device — `llvmpipe (LLVM
+  15.0.7)`, `PHYSICAL_DEVICE_TYPE_CPU`, Vulkan 1.3, Mesa 23.2.1, conformance
+  1.3.1.1. The radeon and intel ICDs are installed and find nothing, because
+  there is no DRM node for them to open.
+- Building virglrenderer ≥ 0.10 from source *here* is blocked by the
+  environment, not by the plan: `meson`, `ninja`, `libepoxy-dev` and the Vulkan
+  headers are all absent, and **`sudo` requires a password**, so no agent can
+  install them.
+
+That changes what "get Venus working" would mean on this machine, so it is
+worth saying out loud: even with a self-built virglrenderer, the host Vulkan
+device would be **llvmpipe on the CPU**, behind a Venus decode, inside a VM —
+software Vulkan under a translation layer. That can prove *correctness* (a
+guest `vulkaninfo` enumerating a device is a real result) but it cannot produce
+a number worth putting beside the phase-2 frame table, and it would be no
+evidence at all for the claim that motivated the epic: that Venus is the right
+answer on Windows. A native Linux host with a DRM node, or the Windows/WHP host
+against its native Vulkan ICD, is where that measurement belongs.
+
+What was built for it anyway, because being ready costs nothing: the
+`VirglRenderer` wrapper **probes for the Venus entry points at `dlopen` time**
+and advertises the venus capset if and only if all four resolve *and* the
+library reports a non-zero capset size. Drop a newer `libvirglrenderer.so.1` on
+a host and Venus lights up with no rebuild — the same runtime-detection
+discipline this ADR established for the library itself, applied one level down.
+`ENTANGLED_GPU_VENUS=off` suppresses the probe for a host whose newer library
+has Venus compiled in but whose Vulkan ICD nobody should be rendering against.
+
+### Next agent starts here
+
+1. **`machine-x86`: back the window.** Allocate a 64-bit prefetchable BAR 2 for
+   a virtio-pci function whose device declares an `ShmRegion` (and a
+   guest-physical range on mmio), map host memory into it (KVM memory slot /
+   `WHvMapGpaRange`), publish it in the DSDT `_CRS`, teach the BAR-rebase path
+   about a second moving window, and call `set_shm_base`. Then append
+   `pci::shm_capability_records(&pci::place_shm_regions(...))` to
+   `build_config_space`'s capability loop — one line, deliberately left
+   uncalled. Until this exists, `RESOURCE_MAP_BLOB` cannot succeed anywhere,
+   which is the single thing blocking a host-visible Venus allocation.
+2. **A real Venus renderer (VEN-2003).** Build virglrenderer ≥ 1.0 with
+   `-Dvenus=true` on a host where `apt` is available, then fill in
+   `VirglRenderer::map_blob` with `virgl_renderer_resource_map` against the
+   window from step 1, and add `VIRGL_RENDERER_VENUS` (very likely with
+   `USE_EXTERNAL_BLOB`) to the init flags. The typed-context and create-blob FFI
+   halves are already written and behind the runtime probe.
+3. **VEN-2004 (Windows isolation).** The renderer protocol is portable and now
+   carries the blob messages; what is missing is `CreateProcess` plus a handle
+   pair where `remote::client` uses `fork`/`socketpair`.
+4. **Guest acceptance (VEN-2006)** is only meaningful after 1 and 2, and only on
+   a host with a real Vulkan device. `vulkaninfo` inside the guest is the first
+   milestone, `vkcube` the second — the same shape as `GLPROBE_RENDERER=virgl`
+   was for phase 1.
+5. The GUI's capability gate (`Backend::virgl_block`) does not know about any of
+   this. Nothing changes for the user today — blob resources are offered only
+   when a renderer declares them, and none does on this host — but when step 2
+   lands, the manager wants a "3D: Venus / VirGL / none" line rather than a
+   boolean.
