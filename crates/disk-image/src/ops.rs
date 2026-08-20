@@ -809,8 +809,16 @@ mod tests {
                 // ...the data around it survived...
                 assert_eq!(read_range(&path, 0, 16), [0xa5u8; 16]);
                 assert_eq!(read_range(&path, 6 << 20, 16), [0xa5u8; 16]);
-                // ...and the host got the space back.
+                // ...and the host got the space back. Printed as well as
+                // asserted: which mechanism a host actually has is the one
+                // thing this test knows and a reader of the log does not.
                 if let (Some(before), Some(after)) = (before, allocated_bytes(&path)) {
+                    println!(
+                        "punch_hole: 16 MiB image, 8 MiB written, 4 MiB punched: \
+                         allocated {} -> {}",
+                        format_bytes(before),
+                        format_bytes(after)
+                    );
                     assert!(
                         after + (3 << 20) <= before,
                         "punching 4 MiB should reclaim it: {before} -> {after}"
