@@ -25,6 +25,14 @@
 //!                               rebooting: proves the FADT, the DSDT's `\_S5`
 //!                               and the host's ACPI PM block agree. Opt-in,
 //!                               because every other test wants the reboot path.
+//!   `entangled.heartbeat=<ms>`  print `VMHOST_HEARTBEAT <n>` every `<ms>`
+//!                               milliseconds, for ever, instead of rebooting.
+//!                               The guest-side evidence for pause and resume
+//!                               (ADR-0005): a host that has frozen a VM can
+//!                               only prove it by the guest going quiet, and it
+//!                               has to be *guest code* that stops, not merely a
+//!                               device. Also never returns, so the host decides
+//!                               when the VM ends.
 //!   `entangled.netprobe=<ip>/<prefix>,<gateway>,<host>:<port>`
 //!                               configures eth0 statically (this initramfs has
 //!                               no DHCP client), opens a TCP connection to
@@ -97,6 +105,11 @@ fn main() {
         acpi_power_off();
     }
 
+    if let Some(period) = param(&cmdline, "entangled.heartbeat=").and_then(|v| v.parse::<u64>().ok())
+    {
+        heartbeat(period);
+    }
+
     // Restart, not power-off, by default: the reboot path works on every
     // machine we boot, ACPI or not. With `reboot=k` the kernel's restart chain
     // ends in a triple fault, which reaches the host as KVM_EXIT_SHUTDOWN and
@@ -113,6 +126,30 @@ fn main() {
     // would panic the kernel with a confusing message).
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// Prints a numbered line every `period_ms`, for ever.
+///
+/// The one probe whose *absence* is the measurement: the host pauses the VM and
+/// asserts that no further line arrives. That is why it sleeps rather than
+/// spinning (a spinning guest would still be stopped, but it would also make the
+/// host's own timing noisy) and why it never returns — a probe that ended would
+/// make "the console went quiet" ambiguous.
+///
+/// The period is clamped: the command line is host-controlled here, but the same
+/// init runs in guests booted from a profile, and a zero-millisecond heartbeat
+/// would be a serial-console flood rather than a probe.
+fn heartbeat(period_ms: u64) {
+    let period = Duration::from_millis(period_ms.clamp(10, 10_000));
+    let mut tick: u64 = 0;
+    loop {
+        println!("VMHOST_HEARTBEAT {tick}");
+        // Flushed explicitly: stdout to a serial console is line-buffered only
+        // when it is a tty, and the host is counting *arrivals*.
+        let _ = std::io::stdout().flush();
+        tick = tick.wrapping_add(1);
+        std::thread::sleep(period);
     }
 }
 
