@@ -621,33 +621,21 @@ mod tests {
     /// interface) so the message cannot rot on the host that never sees it.
     #[test]
     fn tap_is_refused_where_there_is_no_tap() {
-        match net_plan("tap", "entangled0") {
-            Ok(plan) => {
-                assert!(
-                    cfg!(target_os = "linux"),
-                    "TAP resolved on a host with none"
-                );
-                let section = plan.section.expect("a [network] section");
-                assert_eq!(section.backend, NetworkBackend::Tap);
-                assert_eq!(section.interface.as_deref(), Some("entangled0"));
-            }
-            Err(message) => {
-                assert!(
-                    !cfg!(target_os = "linux"),
-                    "TAP refused on Linux: {message}"
-                );
-                assert_eq!(message, NETWORK_TAP_UNAVAILABLE);
-                assert!(message.contains("--network usernet"));
-            }
+        let plan = net_plan("tap", "entangled0");
+        if cfg!(target_os = "linux") {
+            let section = plan
+                .expect("TAP resolves on Linux")
+                .section
+                .expect("a [network] section");
+            assert_eq!(section.backend, NetworkBackend::Tap);
+            assert_eq!(section.interface.as_deref(), Some("entangled0"));
+            assert_eq!(crate::DEFAULT_NETWORK, "tap");
+        } else {
+            let message = plan.expect_err("TAP cannot resolve on a host with no TAP");
+            assert_eq!(message, NETWORK_TAP_UNAVAILABLE);
+            assert!(message.contains("--network usernet"), "{message}");
+            assert_eq!(crate::DEFAULT_NETWORK, "usernet");
         }
-        assert_eq!(
-            crate::DEFAULT_NETWORK,
-            if cfg!(target_os = "linux") {
-                "tap"
-            } else {
-                "usernet"
-            }
-        );
     }
 
     /// An offline install has no address to preseed, and an unknown name is a
