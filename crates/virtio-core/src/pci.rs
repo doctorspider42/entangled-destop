@@ -344,6 +344,7 @@ pub fn class_code(device_type: DeviceType) -> u32 {
         DeviceType::Block => (0x01, 0x80), // mass storage / other
         DeviceType::Gpu => (0x03, 0x80),   // display / other
         DeviceType::Input => (0x09, 0x80), // input device / other
+        DeviceType::Sound => (0x04, 0x01), // multimedia / audio device
     };
     (base << 24) | (sub << 16)
 }
