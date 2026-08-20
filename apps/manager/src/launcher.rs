@@ -168,8 +168,9 @@ pub fn install_spec(cli: &Path, vm_dir: &Path, cwd: PathBuf, machine: &NewMachin
         "--name".to_string(),
         machine.name.clone(),
     ];
-    // `--variant` names a Debian netboot flavour; the Ubuntu path takes an ISO
-    // instead and refuses to be told about variants it has no use for.
+    // `--variant` names a Debian netboot flavour. The Ubuntu path takes an ISO
+    // instead and ignores the flag entirely, so passing it would put a setting
+    // on the reviewed command line that does nothing — worse than absent.
     match machine.family {
         GuestFamily::Debian => {
             args.push("--variant".to_string());
@@ -299,8 +300,9 @@ mod tests {
     }
 
     /// The Ubuntu wiring: the distro reaches the command line, `--variant` does
-    /// not (the ISO path has no variants and the CLI would reject the idea), and
-    /// everything else is spelled the same way.
+    /// not (the ISO path has no variants, and `install ubuntu` silently ignores
+    /// the flag — a no-op on the reviewed command line is a lie), and everything
+    /// else is spelled the same way.
     #[test]
     fn the_ubuntu_install_names_the_distro_and_drops_the_variant() {
         let mut m = machine();

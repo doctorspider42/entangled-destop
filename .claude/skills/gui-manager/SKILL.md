@@ -78,9 +78,11 @@ only installer that works on Windows unreachable there.
 The resulting `entangled install <debian|ubuntu> --disk <path> --size <n>G
 [--variant <v>] --memory-mib <max(1536, m)> --name <name> [--iso <path>]
 [--auto] [--headless]` is spawned with the configured working directory.
-`--variant` is Debian-only (the Ubuntu subcommand rejects it) and `--network` is
-never passed — the CLI's per-host default (TAP on Linux, usernet on Windows) is
-right on both hosts and a pinned GUI value would be wrong on one. The CLI writes
+`--variant` is Debian-only — `install ubuntu` ignores the flag, and a setting
+that does nothing on the reviewed command line is worse than an absent one.
+`--network` is never passed either: the CLI's per-host default (TAP on Linux,
+usernet on Windows) is right on both hosts and a pinned GUI value would be wrong
+on one. The CLI writes
 the profile itself, but hardcodes its resource defaults, so on success the
 manager stamps the wizard's memory/vCPU choice onto the profile
 (`discovery::apply_resources`). While the install runs the VM has no profile
