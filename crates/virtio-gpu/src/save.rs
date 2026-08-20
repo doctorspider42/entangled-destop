@@ -50,6 +50,17 @@ const MAX_RESOURCES: u32 = crate::resource::MAX_RESOURCES as u32;
 /// Same, for one resource's backing list.
 const MAX_BACKING: u32 = crate::resource::MAX_BACKING_ENTRIES;
 
+/// Bytes one backing entry costs **here**: a `u64` address and a `u32` length.
+///
+/// Deliberately not [`MemEntry::LEN`], which is 16 — the *guest's* wire format
+/// pads each entry to a 16-byte boundary, and this one does not. Using the wire
+/// size as the count check's minimum made the parser demand a third more bytes
+/// than the writer had produced, and refused every resource with a scattered
+/// backing list. It survived the small-guest test because that guest's
+/// framebuffer happened to be one contiguous entry; an installed Ubuntu's
+/// 1280x800 scanout has two thousand.
+const SAVED_ENTRY_BYTES: usize = 8 + 4;
+
 /// One 2D resource, as a snapshot records it: everything except the pixels,
 /// which are re-derived from the guest pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,7 +259,7 @@ impl GpuState {
             let format = r.u32("resource format")?;
             let width = r.u32("resource width")?;
             let height = r.u32("resource height")?;
-            let entries = r.count("backing entries", MAX_BACKING, MemEntry::LEN)?;
+            let entries = r.count("backing entries", MAX_BACKING, SAVED_ENTRY_BYTES)?;
             let mut backing = Vec::with_capacity(entries as usize);
             for _ in 0..entries {
                 backing.push(MemEntry {
@@ -334,6 +345,50 @@ mod tests {
                 three_d: false,
             }),
         }
+    }
+
+    /// The bug an installed Ubuntu found and the small guest did not: a
+    /// resource whose backing is *scattered* over many pages, which is what a
+    /// real framebuffer looks like. The count check's minimum element size has
+    /// to be the size this module writes, not the guest's padded wire size.
+    #[test]
+    fn a_scattered_backing_list_round_trips() {
+        let backing: Vec<MemEntry> = (0..2048)
+            .map(|i| MemEntry {
+                addr: 0x1_0000 + i * 4096,
+                length: 4096,
+            })
+            .collect();
+        let state = GpuState {
+            events_read: 0,
+            live_3d_contexts: 0,
+            resources: vec![SavedResource {
+                id: 1,
+                format: 2,
+                width: 1280,
+                height: 800,
+                backing,
+            }],
+            scanout: Some(SavedScanout {
+                resource_id: 1,
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1280,
+                    height: 800,
+                },
+                three_d: false,
+            }),
+        };
+        let bytes = state.encode();
+        assert_eq!(GpuState::decode(&bytes).unwrap(), state);
+        // And the encoder and the parser's own minimum agree, which is the
+        // invariant that broke.
+        assert_eq!(
+            bytes.len(),
+            16 + 20 + 2048 * SAVED_ENTRY_BYTES + 4 + 24,
+            "the encoder and SAVED_ENTRY_BYTES disagree"
+        );
     }
 
     #[test]

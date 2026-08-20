@@ -1,0 +1,371 @@
+# ADR-0006: Suspend and restore — writing a VM down, and reading it back
+
+- Status: accepted
+- Date: 2026-08-21
+- Extends: [ADR-0005](0005-vm-lifecycle.md) (the controlled stop this is built on)
+- Related: [ADR-0002](0002-linux-first-whp-ready.md) (why the CPU state is ours),
+  [ADR-0003](0003-uefi-firmware.md) (what a restored UEFI machine still owes its
+  firmware), [ADR-0004](0004-virtio-gpu-3d.md) (why the 3D half cannot come back)
+
+## Context
+
+ADR-0005 built the controlled stop: every vCPU parked at a safe point between
+two exits, every host worker quiesced, nothing writing guest memory. It ended
+with a list of what suspend would still need. This is that list, built.
+
+The thing being asked for is small to describe and unforgiving to get wrong:
+*close the lid, open it again, be where you left off.* A VM that resumes and
+then dies twenty minutes later in an unrelated place is worse than one that
+never resumed, because the failure has no path back to its cause. Almost
+everything in this ADR is a decision about **how not to lose one piece of
+state**, and the recurring theme is that the pieces which are easiest to forget
+are the ones whose absence is invisible.
+
+## Decision
+
+### 1. Full CPU state, as neutral types
+
+`vmm_core::hv` grows an `X86CpuState`: the general and special registers it
+already had, plus **MSRs**, `XCR0` and the XSAVE area, the local APIC,
+`mp_state`, pending events and the debug registers. Ours, per ADR-0002 — a
+`kvm_bindings` or `WHV_*` type outside `vmm-core` is still a bug.
+
+**The MSR list is not written down.** A snapshot that forgets one MSR is not
+slightly wrong; it is a guest that dies somewhere else. Lose `KERNEL_GS_BASE`
+and the next `swapgs` in a syscall entry lands the kernel on a null per-CPU
+base. Lose `LSTAR` and the first `syscall` after resume jumps to zero. Lose
+`PAT` and the framebuffer becomes uncacheable. None of those point back here.
+So each backend asks its hypervisor:
+
+| | KVM | WHP |
+|---|---|---|
+| MSRs | `KVM_GET_MSR_INDEX_LIST` — everything the kernel says it can save (~100 on a 6.x kernel), minus the x2APIC window, read in batches with the ones this vCPU refuses dropped one at a time | the `WHvX64Register*` name space *is* the enumeration; 30 names mapped to architectural indices, probed the same way |
+| XSAVE | `KVM_GET_XSAVE` (the fixed 4 KiB area) | `WHvGetVirtualProcessorXsaveState` |
+| Local APIC | `KVM_GET_LAPIC` (the architectural 1 KiB page) | `WHvGetVirtualProcessorInterruptControllerState` |
+| `mp_state` | `KVM_GET_MP_STATE` | `WHvRegisterInternalActivityState`'s startup-suspend bit |
+| Pending events | `KVM_GET_VCPU_EVENTS` | `WHvRegisterPendingInterruption` + `WHvRegisterInterruptState` |
+| Debug registers | `KVM_GET_DEBUGREGS` | `WHvX64RegisterDr0..7` |
+| Guest clock | `KVM_GET_CLOCK` | — (a WHP partition has no paravirtual clock) |
+| In-kernel chips | `KVM_GET_IRQCHIP` ×3 + `KVM_GET_PIT2` | — (they are in this process; see §3) |
+
+Two of those are **opaque blobs tagged with the host that produced them**, and
+that is honest rather than lazy: KVM's local-APIC page and WHP's
+interrupt-controller state describe the same hardware in formats neither one
+accepts from the other, and inventing a third would mean re-deriving one from
+the other on every save. The tag is a second lock on the same door as the file
+header's host field — even a snapshot whose header was edited cannot feed WHP's
+blob to `KVM_SET_LAPIC`.
+
+**Order matters on the way back in**, and differs per host, which is why each
+backend documents its own:
+
+- KVM: `mp_state` → local APIC → sregs/regs → `XCR0` → XSAVE → MSRs → debug
+  registers → pending events. An application processor must be put back into
+  its wait before anything else touches it; `IA32_TSC_DEADLINE` is meaningless
+  until the APIC timer it arms exists; `XCR0` decides which components the XSAVE
+  area may carry; pending events go last because everything above could clear
+  them.
+- WHP: local APIC → sregs/regs → `XCR0` → XSAVE → MSRs → debug registers →
+  activity state → pending events.
+
+#### What is deliberately skipped
+
+| Skipped | Why |
+|---|---|
+| `KVM_GET_XSAVE2`'s dynamic components (AMX tile data) | The fixed 4 KiB area covers everything up to AVX-512. This machine's CPUID offers no AMX, so there is nothing to lose today — and a snapshot whose XSAVE header *claims* a dynamic component is refused rather than truncated. |
+| Nested state (`KVM_GET_NESTED_STATE`) | The CPUID policy exposes no VMX or SVM; there is no L2. |
+| The x2APIC MSR window (`0x800..=0x8ff`) on KVM | It is the same local APIC the `KVM_GET_LAPIC` page carries. Restoring both would have the two fight. |
+| `IA32_MISC_ENABLE` on WHP | WHP has no register name for it. KVM does, and carries it. |
+| A pending exception *event* on WHP (`WHvRegisterPendingEvent`) | 128 bits with a fault parameter the neutral struct has no room for. A vCPU parked between two exits should never have one — so if one turns up the **snapshot is refused**, rather than written without it. |
+| The RTC's time of day | It is computed from the host clock on every read and has no stored form. A resumed guest sees wall-clock time that has moved on — which is what a laptop's own suspend does, and what `hwclock`/NTP exist to correct. |
+
+#### Where the capture happens
+
+On each vCPU's **own thread**, at the lifecycle checkpoint. Not an aesthetic
+choice: `spawn_vcpus` *moves* each `Vcpu` into its thread, so no other thread
+has a handle to it — and KVM wants its vCPU ioctls from the owning thread
+anyway. `Lifecycle::capture_cpus` is therefore a second barrier with the same
+shape as the reset one: phase `SaveVcpus`, every parked vCPU reads its own
+state into a shared slot, the requester waits, and the VM is still paused when
+it returns. A vCPU that cannot report fails the *whole* capture — a snapshot
+missing a CPU restores a guest with one fewer.
+
+### 2. Device state beside every `reset()`
+
+ADR-0005's table said, device by device, what goes back to power-on. Read the
+other way, it says what a suspend has to write down:
+
+| Device | Saved | Restored |
+|---|---|---|
+| `virtio_core::TransportState` | features (offered *and* negotiated) and their selectors, status, activation, per-queue geometry, `config_generation`, the ISR | features re-acknowledged, queues rebuilt through the same `build` the guest's own `DRIVER_OK` goes through, then the device re-activated |
+| virtqueue positions | the device's `next_avail`/`next_used` | applied to the rebuilt queues **before** the device sees them |
+| MSI-X | message control, the table, the PBA, config and per-queue vectors | all of it; nothing pending is delivered — the guest unmasking a vector is what sends it |
+| PCI configuration space | all 64 dwords of every function, plus the latched `CONFIG_ADDRESS` | written back and everything derived from it re-published (the INTx flag, the mirrored MSI-X control), then the queue-notify ioeventfds re-based around the restored BARs |
+| 8259 / 8254 / IOAPIC (userspace, WHP) | both chips including their ICW step, the three 8254 channels, the redirection table **and its pending-edge bits** | IOAPIC first, then the 8254 and the 8259s |
+| in-kernel chips (KVM) | `KVM_GET_IRQCHIP` ×3 and `KVM_GET_PIT2` | 8259s, 8254, then the IOAPIC — see §3 |
+| 16550 | the register file and the *unread host input* | both; the line is **not** re-raised, because the interrupt controller's own state carries whatever the guest was owed |
+| RTC | index latch and CMOS bytes | both |
+| ACPI PM block | the registers, the timer's reading, the shutdown latch | the timer re-anchored to the new epoch, the latch restored |
+| pflash | the CFI command state machine only | the same; the contents are the NVRAM file, which the restored machine opens |
+| reset controls | the latches, including "the guest asked to reboot" | both — a guest that asked and was suspended before being served is still owed its reboot |
+
+Three per-device answers are worth stating outright.
+
+**virtio-blk has no state beyond its queue.** Every request is served
+synchronously inside `notify`: the chain is walked, the file read or written,
+the used entry added and the interrupt signalled before `notify` returns. So a
+quiesced device holds nothing — there is nowhere for a request to be in flight.
+What still has to be carried is the *position*, because the guest may have
+posted requests the device has not been kicked for, and a restored device
+starting at zero would serve every completed request again.
+
+**virtio-net's flows cannot survive, and the device does not need resetting.**
+The user-mode NAT's connections live in host sockets this process no longer has;
+a TAP interface is re-opened from scratch. But the *device* — MAC, rings,
+negotiated features — restores exactly, so the guest experiences a network blip
+and its TCP stack notices in the ordinary way, with a retransmit that is never
+answered. That is precisely what a laptop's own suspend does to it. Resetting
+the interface toward the guest would be a bigger lie, not a smaller one.
+
+**virtio-gpu's 2D half comes back; the 3D half cannot.** A 2D resource is a host
+BGRA buffer plus the list of **guest** pages the driver attached to it — and the
+snapshot already carries those pages in full. So the pixels are not saved at
+all: the resource table records identity, geometry and backing list, and the
+restore re-runs the transfer the guest would have run. For a 1920×1080 desktop
+that is eight megabytes saved per resource, several times over, and it is the
+difference between a resumed desktop and a black window. A 3D resource is a
+texture inside the host GL driver, reached through virglrenderer, and a
+rendering *context* is a live command-stream state machine; nothing hands either
+back. So a guest that had contexts open is told its device needs a reset when it
+resumes — the same signal, and the same recovery path, GPU-012 already uses when
+the isolated renderer crashes.
+
+### 3. The chips that were not there
+
+The first restored guest came back, kept drawing on its GPU, and never printed
+another line.
+
+On KVM the 8259 pair, the IOAPIC and the 8254 live **in the kernel**. Nothing in
+`machine_x86::state` had ever seen them, because on that host nothing in
+userspace owns them. A VM restored with a power-on IOAPIC has every pin masked,
+so the 16550 could never interrupt again — and the GPU kept working because
+MSI-X bypasses the IOAPIC entirely and goes straight to the local APIC.
+
+That asymmetry is the whole lesson: **the two hosts do not lose the same things,
+so "every device has a save" has to be checked against the hypervisor as well as
+against the device list.** `vmm_core::hv::HostIrqChip` is the seam that closes
+it, and a snapshot that is missing the section on a host that needs one is now a
+named refusal rather than a one-way VM.
+
+### 4. Guest memory, sparsely
+
+One section per RAM region — a guest above 3 GiB has two, low RAM and the
+remainder at 4 GiB — encoded as a run of `(offset, length, bytes)` triples
+covering only the pages that are not entirely zero.
+
+This is not an optimisation. A guest is handed zero-filled RAM and touches a
+fraction of it; writing the rest would make every suspend a full-size write and
+every resume a full-size read, which is the difference between suspend being
+usable and being a feature nobody turns on. The restore side needs no special
+case: both hypervisors hand out zero-filled pages, so a page that was skipped is
+already what it was.
+
+**Runs rather than file holes.** A hole-punched file would carry the guest's
+*apparent* size even when almost none of it is allocated, and the first `cp` of
+it would expand to the full size. The run list keeps the file itself small. The
+snapshot is still marked sparse through `disk_image::ops::mark_sparse` — this
+workspace has exactly one home for hole-aware file operations and `vm-snapshot`
+adds none of its own.
+
+### 5. A versioned format, and what it refuses
+
+```text
+  0        magic "ENTGLSNP", format version, flags, host, arch,
+           index offset + length + SHA-256                       (72 bytes)
+  72       section payloads, back to back, in the order written
+  index    one 64-byte entry per section: kind, version, instance,
+           offset, length, SHA-256 of the payload
+```
+
+The index is at the end because the largest section is guest memory and it is
+streamed: one forward pass over multi-gigabyte data, then a four-field patch of
+the header. The whole file is written to `<path>.part` and renamed, so an
+interrupted suspend never leaves half a snapshot where one is supposed to be.
+
+The codec is hand-written, not `serde` on whatever structs exist — ADR-0005 asked
+for exactly that. A snapshot outlives the build that wrote it, so field order and
+field width *are* the format and have to be visible in one place; deriving them
+from Rust structs would make an innocuous field reorder a silent format change.
+
+**A snapshot is untrusted input.** It is host-side data, but it outlives its
+build, gets copied between machines, truncated by a full disk, half-synced by a
+host that lost power, and handed over by someone else. So:
+
+| Refusal | Why it exists |
+|---|---|
+| bad magic | it is not one of ours |
+| format version ≠ this build's | half a machine is worse than none |
+| unknown header flags | a newer build put something in it we would ignore |
+| foreign host / foreign arch | the CPU blobs are that hypervisor's |
+| truncated, or an index that points outside the file | a cut-short copy |
+| section digest mismatch | a torn memory section reads as plausible pages |
+| unknown section kind | state the guest expects and would silently not get |
+| trailing bytes in a section | written by a build that put more in it |
+| a count or length that cannot fit | nothing is ever allocated on an unchecked number |
+| vCPU count, memory size, transport, boot mode, device list/order | a guest whose `/dev/vda` is now somebody else's disk |
+| **a disk whose size or mtime moved** | see below |
+
+The disk refusal is the one that matters most. Restoring a guest is putting a
+live kernel back on top of storage it thinks it still owns: its page cache holds
+inodes, directory entries and journal state describing the filesystem *as it was
+at the instant of the snapshot*. Let it loose on an image that has moved on —
+mounted elsewhere, resized, restored from a backup, written by a second VM — and
+it writes its stale metadata over the new contents. So a changed disk is a
+refusal, and the refusal names the disk and what about it changed. Size and
+mtime rather than a content digest: hashing 32 GiB at both ends of every suspend
+would cost more than the snapshot, and the pair catches every accident this is
+meant to catch. Firmware, kernel and initramfs images are recorded too but are
+*advisory* — they are only re-read by a later in-place reset, and the restored
+guest is long past them.
+
+The parser has a cargo-fuzz target (`fuzz/fuzz_targets/snapshot_parse.rs`) which
+asserts no panic, no allocation driven by an unchecked length, and an **exact
+re-encode** for everything that decodes. That last property found a real bug in
+under five minutes: an absent `Option` could carry a non-zero payload, so
+`(false, 7)` and `(false, 0)` both meant `None` and the format had two spellings
+for one state.
+
+### 6. How it is reached
+
+| Surface | Suspend | Resume |
+|---|---|---|
+| the VM window | `Ctrl+Alt+S` | — (a new process, with a new window) |
+| `entangled run --control-stdin` | `save [path]` | — |
+| the command line | `run --snapshot <file>` names the target | `entangled resume <file>` |
+| `entangled-manager` | not yet wired; see below | |
+
+`Ctrl+Alt+S` joins `Ctrl+Alt+P`/`R`/`G`/`Q`/`O` and `F11`, and like them it hands
+the modifiers back to the guest first — with a stronger reason: the guest is
+about to be frozen for good and must not be left holding a key it will never see
+released.
+
+**The snapshot carries the profile it was taken from**, verbatim, so
+`entangled resume <file>` needs nothing else. A snapshot that had to be paired
+with a TOML someone might have edited in the meantime would be a snapshot with a
+second, unversioned half.
+
+`VmState` gains `Suspending` and `Suspended`, and the arm is **one-way** into
+`Stopping`. A snapshot is taken because the VM is about to stop existing in this
+process; letting `Suspended` go back to `Running` would leave two live copies of
+one machine, both convinced they own its disks. A *failed* suspend goes back to
+`Paused`, which is where the seam actually leaves it.
+
+**Restore is a boot path.** The machine is assembled exactly as a cold boot
+assembles it — same memory size, same devices in the same order, the same BAR
+assignments — and then, instead of loading a kernel or a firmware, the snapshot
+is loaded over it. Order: guest memory first (restoring a transport *activates*
+it, and activation validates the driver's rings against the memory they point
+into), then the devices, then the hypervisor's own chips, then the clock, then
+every vCPU. The MP table and the ACPI tables are **not** rewritten: they are
+already in the snapshot's memory, and the guest may have reused the pages around
+them.
+
+## Measured
+
+Debug builds unless noted, on the development machine.
+
+| | KVM (WSL Ubuntu) | WHP (native Windows) |
+|---|---|---|
+| bootstrap guest, 256 MiB, 75 MiB touched — suspend | 2.9–3.5 s | 3.0 s |
+| the same, resume | 2.0 s | 2.1 s |
+| snapshot file | 75 MiB for 256 MiB of RAM (29%) | the same |
+| installed Ubuntu, 2 GiB, 2 vCPUs — suspend | see below | — |
+
+The 29% figure is the bootstrap guest's, and it is *high* on purpose: that guest
+unpacks its whole initramfs into a tmpfs, so most of its RAM really is touched.
+A desktop-shaped guest is the interesting number and is recorded below.
+
+## Acceptance
+
+**The bootstrap guest's heartbeat continues.** `entangled.heartbeat=200` prints
+a monotonic counter from a real timer loop. Suspended after
+`VMHOST_HEARTBEAT 8`, the resumed VM's first line is:
+
+```text
+VMHOST_HEARTBEAT 9
+```
+
+— with no second `VMHOST_GUEST_READY`. A machine whose registers, MSRs or local
+APIC came back merely plausible does not carry on counting; it faults, or it
+goes quiet. The same test, the same evidence, on both hosts
+(`apps/entangled/tests/suspend_restore.rs`).
+
+**Every refusal, by name.** One snapshot, corrupted six ways, plus a disk that
+grew while the VM was suspended:
+
+```text
+not an Entangled snapshot: the file does not start with the "ENTGLSNP" magic
+snapshot is truncated: section index needs 78630318 more bytes, 39315159 are left
+snapshot format version 8 cannot be restored by this build (it writes and reads version 1)
+snapshot header carries unknown flags 0x1; it was written by a newer build
+snapshot was taken on Windows/WHP and this is Linux/KVM: a saved CPU carries that
+  hypervisor's own interrupt-controller and extended-state blobs, which the other
+  one cannot load
+snapshot section memory[0] is corrupt: its contents do not match the recorded digest
+disk /tmp/.../root.raw has changed since the snapshot was taken (size: was 8388608,
+  is 16777216); restoring onto it would corrupt the guest's filesystem
+```
+
+**An installed Ubuntu is the same session afterwards** —
+`apps/entangled/tests/guest_suspend.rs`, `#[ignore]`d: it logs in over the serial
+console, records `uptime -s`, suspends mid-session, resumes, and asserts the
+same boot instant, an uptime that only moved forward, a shell `history` that
+still holds the marker it typed, no second login prompt, and a clean
+`sudo poweroff` afterwards.
+
+## Consequences
+
+- Every new device owes the machine a third thing, beside ADR-0005's `reset()`
+  and its `Quiesce` gate: a `save`/`load` pair, and — if it holds queues — a
+  `queue_positions`. A device that skips them makes a resumed guest subtly
+  wrong, which is the hardest kind of wrong to find.
+- A snapshot is bound to its host, its build and its disks. That is three ways
+  for a file to become unusable, and all three are deliberate: the alternative
+  to each refusal is a guest that misbehaves later.
+- `entangled-manager` is not wired to this yet — the GUI is being rebuilt in
+  parallel. What it needs already exists and is documented for it:
+  `vm_snapshot::inspect(path)` reads a snapshot's name, size, host, shape, disk
+  list and "could this machine restore it?" **without touching a VM**, and the
+  `save [path]` control command plus `entangled resume` are the two child-process
+  invocations a Suspend button and a Resume button would make.
+- **A resumed guest is not identical to one that never stopped.** The honest
+  list is in the TODO below.
+
+## What a resumed guest still gets wrong
+
+1. **Wall-clock time jumps.** The RTC is derived from the host clock, so a guest
+   suspended for an hour resumes an hour behind and corrects itself through NTP.
+   Correct for a laptop, wrong for a VM that was supposed to be frozen, and the
+   right answer differs per use — it needs a policy, not a patch. (ADR-0005 left
+   the same debt for pause.)
+2. **The paravirtual clock is restored on KVM and absent on WHP.** A WHP guest
+   using an invariant TSC comes back consistently; there is no equivalent of
+   `KVM_SET_CLOCK` to put a kvmclock back, and no kvmclock in that partition to
+   put back.
+3. **Network connections die.** By construction; see §2.
+4. **3D contexts die.** By construction; see §2. The guest is told, which is more
+   than a silent failure, but a compositor that does not act on
+   `DEVICE_NEEDS_RESET` will need restarting.
+5. **Host input queued while the VM was frozen is dropped**, as it is by a pause.
+6. **Dirty-page tracking is not implemented.** Every suspend writes every
+   non-zero page. `KVM_GET_DIRTY_LOG` and `MEM_WRITE_WATCH` are what would turn a
+   repeated suspend of the same VM into an incremental one; the alias in
+   `vmm_core::memory` exists for exactly that divergence.
+7. **The snapshot is not compressed** and not encrypted. A desktop guest's file
+   is the size of its touched RAM.
+8. **`Suspended` never goes back to `Running` in the same process.** Resuming is
+   always a new process. Nothing needs it to be otherwise today, but a manager
+   that wanted a "hibernate and wake" button inside one process would.
+9. **A snapshot pins its disks by size and mtime.** A filesystem with coarse or
+   absent mtimes (some network mounts) weakens the check to size alone, and the
+   code says so rather than pretending otherwise.
