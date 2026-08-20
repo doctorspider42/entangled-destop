@@ -71,7 +71,7 @@ use std::thread::JoinHandle;
 
 use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
 use thiserror::Error;
-use virtio_core::{HostWaker, MmioTransport, PciTransport};
+use virtio_core::{HostWaker, MmioTransport, PciTransport, Quiesce};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
@@ -352,6 +352,15 @@ pub struct DeviceNotifier<T: QueueNotifyTarget> {
     /// Set by the first [`Self::shutdown`], which makes it idempotent: it is
     /// called explicitly on VM stop and again from `Drop`.
     torn_down: AtomicBool,
+    /// Shared with the worker thread so it can leave the pause gate. The kill
+    /// eventfd only wakes an `epoll_wait`; a worker parked in
+    /// [`Quiesce::wait_while_paused`] is not in one (ADR-0005).
+    stopping: Arc<AtomicBool>,
+    /// The VM's pause gate, installed after the bus is built (the worker is
+    /// already running by then) and re-read on every kick. Behind a mutex rather
+    /// than an `ArcSwap` to avoid a dependency for one pointer swap per VM;
+    /// never held across the wait.
+    quiesce_handle: Arc<Mutex<Arc<Quiesce>>>,
     /// A notifier never stores a `T`; the parameter only selects whose
     /// `queue_notify` the worker calls.
     _target: std::marker::PhantomData<fn() -> T>,
@@ -405,6 +414,8 @@ impl<T: QueueNotifyTarget> DeviceNotifier<T> {
             kill,
             worker: Mutex::new(None),
             torn_down: AtomicBool::new(false),
+            stopping: Arc::new(AtomicBool::new(false)),
+            quiesce_handle: Arc::new(Mutex::new(Quiesce::new())),
             _target: std::marker::PhantomData,
         };
 
@@ -704,10 +715,33 @@ impl<T: QueueNotifyTarget> DeviceNotifier<T> {
         }
 
         let slot = self.slot;
+        let stopping = Arc::clone(&self.stopping);
+        let quiesce = Arc::clone(&self.quiesce_handle);
         std::thread::Builder::new()
             .name(format!("virtio-q{slot}"))
-            .spawn(move || worker_loop(slot, epoll, queues, transport))
+            .spawn(move || worker_loop(slot, epoll, queues, transport, stopping, quiesce))
             .map_err(|source| NotifyError::Spawn { slot, source })
+    }
+
+    /// The pause gate this notifier's worker takes before it runs a device.
+    pub fn quiesce(&self) -> Arc<Quiesce> {
+        match self.quiesce_handle.lock() {
+            Ok(gate) => Arc::clone(&gate),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Shares the VM's pause gate with this notifier's worker (ADR-0005).
+    ///
+    /// Installed *after* attach, because the gate belongs to the VM and the
+    /// worker is already running by the time the machine has one. Until then
+    /// the notifier holds a private gate that is never closed, so a machine
+    /// that never pauses behaves exactly as it did before pause existed.
+    pub fn set_quiesce(&self, quiesce: Arc<Quiesce>) {
+        match self.quiesce_handle.lock() {
+            Ok(mut gate) => *gate = quiesce,
+            Err(poisoned) => *poisoned.into_inner() = quiesce,
+        }
     }
 
     /// Stops the worker and deassigns every ioeventfd. Idempotent, and correct
@@ -717,6 +751,10 @@ impl<T: QueueNotifyTarget> DeviceNotifier<T> {
         if self.torn_down.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Both wakeups, because the worker could be in either place: blocked in
+        // `epoll_wait` (the kill eventfd below) or parked on the pause gate.
+        self.stopping.store(true, Ordering::Release);
+        self.quiesce().wake();
         if let Some(handle) = self.worker.lock().ok().and_then(|mut h| h.take()) {
             if let Err(error) = self.kill.write(1) {
                 tracing::error!(
@@ -766,11 +804,14 @@ impl<T: QueueNotifyTarget> Drop for DeviceNotifier<T> {
 /// that reports a host-level failure makes the transport set
 /// `DEVICE_NEEDS_RESET` — the worker keeps serving the remaining queues either
 /// way, because a stopped worker would silently wedge the VM.
+#[allow(clippy::too_many_arguments)]
 fn worker_loop<T: QueueNotifyTarget>(
     slot: usize,
     epoll: Epoll,
     queues: Vec<(u16, EventFd)>,
     transport: Arc<Mutex<T>>,
+    stopping: Arc<AtomicBool>,
+    quiesce: Arc<Mutex<Arc<Quiesce>>>,
 ) {
     // One slot per registered fd (queues + kill) so a single wait drains them.
     let mut ready = vec![EpollEvent::default(); queues.len() + 1];
@@ -806,6 +847,17 @@ fn worker_loop<T: QueueNotifyTarget>(
                     tracing::error!(slot, queue = index, %error, "queue eventfd read failed");
                     continue;
                 }
+            }
+            // The pause gate, *before* the transport lock: a paused VM must
+            // make no progress, and parking while holding the lock would
+            // deadlock the machine reset that runs on a quiesced VM (ADR-0005).
+            let gate = match quiesce.lock() {
+                Ok(gate) => Arc::clone(&gate),
+                Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+            };
+            if !gate.wait_while_paused(|| !stopping.load(Ordering::Acquire)) {
+                tracing::debug!(slot, "queue worker asked to stop while the VM was paused");
+                return;
             }
             match transport.lock() {
                 Ok(mut t) => t.queue_notify(u32::from(*index)),

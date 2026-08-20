@@ -541,6 +541,19 @@ impl PciTransport {
         self.state.reset();
     }
 
+    /// Machine reset (ADR-0005): [`Self::reset`] plus the PCI function state a
+    /// device reset deliberately keeps — `config_generation`, the MSI-X table
+    /// and the message-control register. The *configuration space* around this
+    /// transport is the machine's and is reset by `machine_x86::pci::PciRoot`.
+    pub fn power_on_reset(&mut self) {
+        self.state.power_on_reset();
+    }
+
+    /// Shares the VM's pause gate with this function's device (ADR-0005).
+    pub fn set_quiesce(&mut self, quiesce: Arc<crate::quiesce::Quiesce>) {
+        self.state.set_quiesce(quiesce);
+    }
+
     // --------------------------------------------------------- BAR access
 
     /// Guest read at `offset` inside the device's BAR.

@@ -51,7 +51,7 @@
 //! once; the difference between mode 2's and mode 3's output *waveform* is not
 //! modelled, because nothing on this machine observes channel 0's pin level.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -300,6 +300,10 @@ pub struct Pit {
     /// that hangs in `check_timer()` looks completely different depending on
     /// whether this is zero.
     edges: AtomicU64,
+    /// Set while the VM is paused (ADR-0005): the timer thread keeps turning
+    /// but delivers nothing, and [`Pit::set_paused`] re-arms the schedule on the
+    /// way out.
+    paused: AtomicBool,
 }
 
 /// The PIT's time source. Real by default; a test drives it by hand so counter
@@ -343,6 +347,7 @@ impl Pit {
             irq0,
             clock,
             edges: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
         })
     }
 
@@ -355,6 +360,54 @@ impl Pit {
     /// Channel 0 output edges delivered so far.
     pub fn edges(&self) -> u64 {
         self.edges.load(Ordering::Acquire)
+    }
+
+    /// Stops or restarts channel-0 delivery while the VM is paused
+    /// (ADR-0005).
+    ///
+    /// The PIT's counter is derived from *host* time, which keeps running while
+    /// a VM is held, so an un-gated timer thread would deliver every tick the
+    /// pause was worth the instant the guest came back. (`tick`'s
+    /// `MAX_CATCHUP_EDGES` already bounds that backlog, but "bounded" is not
+    /// "none".) Resuming therefore also re-arms the next edge from the current
+    /// time rather than from where the guest left off, which is the same thing
+    /// the catch-up limiter does and the closest a free-running counter gets to
+    /// having been stopped.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+        if paused {
+            return;
+        }
+        let now = self.clock.ticks();
+        let Ok(mut state) = self.state.lock() else {
+            tracing::error!("PIT lock is poisoned; channel 0 keeps its old schedule");
+            return;
+        };
+        if state.next_edge_ticks.is_some() {
+            state.next_edge_ticks = next_edge(&state.channels[0], now);
+        }
+    }
+
+    /// True while [`Self::set_paused`] has channel-0 delivery stopped.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Machine reset (ADR-0005): the three channels back to un-programmed, the
+    /// NMI/speaker control byte cleared and no edge scheduled.
+    ///
+    /// `edges` survives: it counts what this *host* has delivered for the whole
+    /// run, and a boot test that resets in the middle still wants to know the
+    /// 8254 fired at all.
+    pub fn reset(&self) {
+        self.paused.store(false, Ordering::Release);
+        let Ok(mut state) = self.state.lock() else {
+            tracing::error!("PIT lock is poisoned; the channels stay as they were");
+            return;
+        };
+        state.channels = [Channel::new(true), Channel::new(true), Channel::new(false)];
+        state.nmi_control = 0;
+        state.next_edge_ticks = None;
     }
 
     /// Guest write. Never fails towards the guest.
@@ -421,6 +474,12 @@ impl Pit {
     /// Split out from the timer thread so the edge arithmetic is testable without
     /// waiting on a real clock.
     pub fn tick(&self) -> Option<Duration> {
+        if self.is_paused() {
+            // A paused VM makes no progress, and that has to include its
+            // timekeeping: an interrupt delivered now would sit in a parked
+            // vCPU's local APIC and fire the instant it resumed.
+            return None;
+        }
         let now = self.clock.ticks();
         let edges = {
             let Ok(mut state) = self.state.lock() else {

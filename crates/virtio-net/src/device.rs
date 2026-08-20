@@ -46,7 +46,7 @@ use std::time::Duration;
 use virtio_core::chain;
 use virtio_core::device::{DeviceError, DeviceResources, DeviceType, VirtioDevice};
 use virtio_core::interrupt::Interrupt;
-use virtio_core::{GuestMem, MAX_QUEUE_SIZE, VIRTIO_F_VERSION_1};
+use virtio_core::{GuestMem, Quiesce, MAX_QUEUE_SIZE, VIRTIO_F_VERSION_1};
 use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress};
 
@@ -180,11 +180,20 @@ struct RxContext {
     interrupt: Arc<dyn Interrupt>,
     stats: Arc<NetStats>,
     stop: Arc<AtomicBool>,
+    /// The VM's pause gate (ADR-0005). This worker is the one device thread
+    /// that writes guest memory entirely on its own schedule — a frame arrives
+    /// from the host and goes straight into the RX ring — so a paused VM is only
+    /// really stopped if it parks here.
+    quiesce: Arc<Quiesce>,
 }
 
 /// The device's handle on its RX worker.
 struct RxWorker {
     stop: Arc<AtomicBool>,
+    /// Kept so `stop_rx` can wake a worker parked on the pause gate: a device
+    /// reset happens while the VM is quiesced, and joining a parked thread
+    /// without waking it would deadlock the reset.
+    quiesce: Arc<Quiesce>,
     thread: JoinHandle<()>,
 }
 
@@ -471,6 +480,10 @@ impl NetDevice {
             return;
         };
         worker.stop.store(true, Ordering::Release);
+        // Two places it could be waiting: the backend poll, and the pause gate
+        // (a device reset runs on a quiesced VM — ADR-0005). Wake both, or the
+        // join below is a deadlock.
+        worker.quiesce.wake();
         // Break the worker out of its poll immediately; without this it would
         // notice the flag only after RX_POLL_TICK.
         if let Err(error) = self.backend.wake() {
@@ -513,6 +526,15 @@ fn rx_loop(ctx: RxContext) {
     staging[..VIRTIO_NET_HDR_LEN].copy_from_slice(&NetHeader::rx());
 
     while !ctx.stop.load(Ordering::Acquire) {
+        // Nothing below this line may touch guest memory while the VM is
+        // paused. Parking here rather than after the read is deliberate: a frame
+        // already taken off the host socket would have nowhere to go.
+        if !ctx
+            .quiesce
+            .wait_while_paused(|| !ctx.stop.load(Ordering::Acquire))
+        {
+            return;
+        }
         match ctx.backend.wait_readable(RX_POLL_TICK) {
             Ok(Readiness::Readable) => {}
             Ok(Readiness::TimedOut) | Ok(Readiness::WokenUp) => continue,
@@ -792,6 +814,7 @@ impl VirtioDevice for NetDevice {
             interrupt: Arc::clone(&resources.interrupt),
             stats: Arc::clone(&self.stats),
             stop: Arc::clone(&stop),
+            quiesce: Arc::clone(&resources.quiesce),
         };
         let thread = std::thread::Builder::new()
             .name("entangled-net-rx".to_owned())
@@ -800,7 +823,11 @@ impl VirtioDevice for NetDevice {
                 DeviceError::Backend(format!("cannot spawn the virtio-net RX worker: {error}"))
             })?;
 
-        self.rx = Some(RxWorker { stop, thread });
+        self.rx = Some(RxWorker {
+            stop,
+            quiesce: Arc::clone(&resources.quiesce),
+            thread,
+        });
         self.tx_queue = Some(tx_queue);
         self.mem = Some(resources.mem);
         self.interrupt = Some(resources.interrupt);

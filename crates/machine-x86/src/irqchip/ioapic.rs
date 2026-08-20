@@ -167,6 +167,28 @@ impl IoApic {
         self.delivered.load(Ordering::Acquire)
     }
 
+    /// Machine reset (ADR-0005): every redirection entry masked again, the
+    /// register selector at zero, and no edge remembered against a masked pin.
+    ///
+    /// The masking is the load-bearing part. A rebooted guest programs the
+    /// table from scratch, but between the reset and that programming the
+    /// devices are still there and the 16550 in particular will raise its line
+    /// the moment the firmware prints — into whatever vector the *previous*
+    /// kernel had assigned, on a CPU with no IDT for it.
+    ///
+    /// `id` is kept: it is the machine's topology (the value the MADT and MP
+    /// table publish), not guest state. So is `delivered`, which is a host-side
+    /// diagnostic counter for the whole run rather than for one boot.
+    pub fn reset(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            tracing::error!("IOAPIC lock is poisoned; the redirection table stays as it was");
+            return;
+        };
+        state.select = 0;
+        state.redirection = [RTE_RESET; REDIRECTION_ENTRIES];
+        state.pending = 0;
+    }
+
     /// The hypervisor delivery this IOAPIC injects through, shared with the MSI
     /// path (`crate::msi::UserspaceMsiSink`) — which bypasses the redirection
     /// table entirely, because an MSI message carries its own routing.

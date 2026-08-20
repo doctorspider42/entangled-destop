@@ -300,6 +300,45 @@ impl VirtioMmioBus {
         &self.slots
     }
 
+    /// Shares the VM's pause gate with every device in the window (ADR-0005).
+    pub fn set_quiesce(&self, quiesce: Arc<virtio_core::Quiesce>) {
+        for slot in &self.slots {
+            match slot.transport.lock() {
+                Ok(mut transport) => transport.set_quiesce(Arc::clone(&quiesce)),
+                Err(_) => tracing::error!(
+                    base = format_args!("{:#x}", slot.base),
+                    "virtio-mmio transport lock is poisoned; this device will not pause"
+                ),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        for slot in &self.slots {
+            if let Some(notifier) = &slot.notifier {
+                notifier.set_quiesce(Arc::clone(&quiesce));
+            }
+        }
+    }
+
+    /// Machine reset (ADR-0005): every transport and device back to power-on.
+    ///
+    /// Simpler than the PCI bus's, and for a structural reason worth recording:
+    /// a virtio-mmio slot's window is at a *fixed* address the host chose and
+    /// announced on the kernel command line, so there is no guest-movable BAR,
+    /// no configuration space and nothing for the queue-notify registrations to
+    /// follow. The whole of a slot's guest-visible state is its
+    /// `TransportState`.
+    pub fn reset(&self) {
+        for slot in &self.slots {
+            match slot.transport.lock() {
+                Ok(mut transport) => transport.power_on_reset(),
+                Err(_) => tracing::error!(
+                    base = format_args!("{:#x}", slot.base),
+                    "virtio-mmio transport lock is poisoned; this device is not reset"
+                ),
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }

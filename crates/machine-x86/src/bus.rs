@@ -37,6 +37,7 @@ use crate::acpi::AcpiPmBlock;
 use crate::irqchip::UserspaceIrqChip;
 use crate::pflash::Pflash;
 use crate::platform::FirmwarePlatform;
+use crate::reset::ResetControl;
 use crate::serial::SerialConsole;
 use crate::virtio::VirtioMmioBus;
 use crate::virtio_pci::VirtioPciBus;
@@ -71,6 +72,12 @@ pub struct MachineBus {
     /// window at 4 GiB − 4 MiB undecoded, which is what every boot before this
     /// existed saw — and what a direct-Linux guest must keep seeing.
     pflash: Option<Arc<Mutex<Pflash>>>,
+    /// The three ways a guest asks to be rebooted (ADR-0005), on both hosts and
+    /// in both boot modes — a UEFI firmware's `ResetSystem` and a Linux
+    /// `reboot(2)` land on the same register. Behind an `Arc` with interior
+    /// mutability for the same reason [`Self::acpi_pm`] is: the run loop reads
+    /// its latch after every exit and must take no lock to do it.
+    reset: Arc<ResetControl>,
 }
 
 impl MachineBus {
@@ -84,6 +91,7 @@ impl MachineBus {
             irqchip: None,
             platform: None,
             pflash: None,
+            reset: Arc::new(ResetControl::new()),
         }
     }
 
@@ -173,6 +181,83 @@ impl MachineBus {
     pub fn pci(&self) -> Option<&VirtioPciBus> {
         self.pci.as_deref()
     }
+
+    /// The machine's reset controls (ADR-0005), for the supervisor that turns a
+    /// latched guest request into an in-place reboot.
+    pub fn reset_control(&self) -> &Arc<ResetControl> {
+        &self.reset
+    }
+
+    /// Shares the VM's pause gate with every device that has a worker of its
+    /// own (ADR-0005). Called once, while the machine is being wired.
+    pub fn set_quiesce(&self, quiesce: Arc<virtio_core::Quiesce>) {
+        self.virtio.set_quiesce(Arc::clone(&quiesce));
+        if let Some(pci) = &self.pci {
+            pci.set_quiesce(quiesce);
+        }
+    }
+
+    /// Stops or restarts the machine's own sources of activity for a pause
+    /// (ADR-0005).
+    ///
+    /// The device workers are handled by the gate [`Self::set_quiesce`]
+    /// installed; what is left is the two things that run off *host* time and
+    /// would otherwise hand the resumed guest a jump: the 8254's timer thread
+    /// (on a host with a userspace irqchip) and the ACPI PM timer.
+    pub fn set_paused(&self, paused: bool) {
+        if let Some(irqchip) = &self.irqchip {
+            irqchip.set_paused(paused);
+        }
+        if paused {
+            self.acpi_pm.pause();
+        } else {
+            self.acpi_pm.resume();
+        }
+    }
+
+    /// Every device on this bus back to its power-on state (ADR-0005).
+    ///
+    /// Called with every vCPU parked and the host workers quiesced, so it may
+    /// take any device lock. The order is the one a real machine's reset line
+    /// implies: **interrupt sources first** (the chips that could deliver into a
+    /// CPU that has no IDT yet), then the devices, then the latches that say a
+    /// reset was asked for.
+    ///
+    /// What is deliberately *not* reset: the pflash **contents** (that is the
+    /// non-volatile variable store, and a UEFI VM boots the entry it holds), the
+    /// serial console's output sink and interrupt line, the IOAPIC id, and the
+    /// host-side diagnostic counters. Everything else in the table in ADR-0005.
+    pub fn reset_devices(&self) {
+        if let Some(irqchip) = &self.irqchip {
+            irqchip.reset();
+        }
+        self.virtio.reset();
+        if let Some(pci) = &self.pci {
+            pci.reset();
+        }
+        match self.serial.lock() {
+            Ok(mut serial) => serial.reset(),
+            Err(_) => tracing::error!("serial lock is poisoned; the UART is not reset"),
+        }
+        if let Some(platform) = &self.platform {
+            match platform.lock() {
+                Ok(mut platform) => platform.reset(),
+                Err(_) => {
+                    tracing::error!("platform lock is poisoned; the RTC and host bridge stay as they were")
+                }
+            }
+        }
+        if let Some(pflash) = &self.pflash {
+            match pflash.lock() {
+                Ok(mut flash) => flash.reset(),
+                Err(_) => tracing::error!(
+                    "pflash lock is poisoned; the flash command state machine is not reset"
+                ),
+            }
+        }
+        self.acpi_pm.reset();
+        self.reset.clear();
+    }
 }
 
 impl ExitHandler for MachineBus {
@@ -187,6 +272,13 @@ impl ExitHandler for MachineBus {
         }
         if AcpiPmBlock::contains(port) {
             self.acpi_pm.io_write(port, data);
+            return;
+        }
+        // Before the PCI configuration ports: 0xCF9 sits inside the 0xCF8..0xD0
+        // range the legacy configuration mechanism nominally covers, and it is a
+        // reset register on every real chipset that has both.
+        if ResetControl::claims_write(port) {
+            self.reset.io_write(port, data);
             return;
         }
         if let Some(irqchip) = &self.irqchip {
@@ -229,6 +321,12 @@ impl ExitHandler for MachineBus {
         }
         if AcpiPmBlock::contains(port) {
             self.acpi_pm.io_read(port, data);
+            return;
+        }
+        // Reads of the keyboard command port are deliberately *not* claimed —
+        // see `crate::reset` — so this is 0xCF9 only.
+        if ResetControl::claims_port(port) {
+            self.reset.io_read(port, data);
             return;
         }
         if let Some(irqchip) = &self.irqchip {
@@ -348,5 +446,11 @@ impl ExitHandler for MachineBus {
     /// next stops too.
     fn shutdown_requested(&self) -> bool {
         self.acpi_pm.is_shutdown_requested()
+    }
+
+    /// A write to one of the reset controls (`crate::reset`) reboots the VM in
+    /// place. Same shape as the shutdown latch above, and shared the same way.
+    fn reset_requested(&self) -> bool {
+        self.reset.is_reset_requested()
     }
 }

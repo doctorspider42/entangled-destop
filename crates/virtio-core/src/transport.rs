@@ -329,6 +329,18 @@ impl MmioTransport {
     pub fn reset(&mut self) {
         self.state.reset();
     }
+
+    /// Machine reset (ADR-0005): [`Self::reset`] plus the interrupt state a
+    /// device reset deliberately keeps. See
+    /// [`TransportState::power_on_reset`](crate::state::TransportState::power_on_reset).
+    pub fn power_on_reset(&mut self) {
+        self.state.power_on_reset();
+    }
+
+    /// Shares the VM's pause gate with this slot's device (ADR-0005).
+    pub fn set_quiesce(&mut self, quiesce: std::sync::Arc<crate::quiesce::Quiesce>) {
+        self.state.set_quiesce(quiesce);
+    }
 }
 
 #[cfg(test)]

@@ -657,6 +657,56 @@ impl VirtioPciBus {
         Ok((config, msix_cap_at))
     }
 
+    /// Shares the VM's pause gate with every device on the bus (ADR-0005), so a
+    /// device with a worker thread of its own parks with everything else.
+    pub fn set_quiesce(&self, quiesce: Arc<virtio_core::Quiesce>) {
+        for slot in &self.slots {
+            match slot.transport.lock() {
+                Ok(mut transport) => transport.set_quiesce(Arc::clone(&quiesce)),
+                Err(_) => tracing::error!(
+                    device = slot.device_number,
+                    "virtio-pci transport lock is poisoned; this device will not pause"
+                ),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        for slot in &self.slots {
+            if let Some(notifier) = slot.notifier() {
+                notifier.set_quiesce(Arc::clone(&quiesce));
+            }
+        }
+    }
+
+    /// Machine reset (ADR-0005): every function's configuration space back to
+    /// power-on, every transport and device back to power-on, and the
+    /// queue-notify registrations rebuilt around the BARs' restored addresses.
+    ///
+    /// That last step is the one that is easy to miss and impossible to
+    /// diagnose: an ioeventfd is registered at an *absolute* guest address
+    /// derived from wherever the previous guest's BIOS put the BAR. Reset the
+    /// config space without re-basing and the kicks of the next boot land at an
+    /// address nothing is listening to — a device that enumerates, negotiates
+    /// and then never completes a request.
+    pub fn reset(&self) {
+        for slot in &self.slots {
+            match slot.transport.lock() {
+                Ok(mut transport) => transport.power_on_reset(),
+                Err(_) => tracing::error!(
+                    device = slot.device_number,
+                    "virtio-pci transport lock is poisoned; this device is not reset"
+                ),
+            }
+        }
+        match self.root.lock() {
+            Ok(mut root) => root.reset(),
+            Err(_) => {
+                tracing::error!("PCI root lock is poisoned; configuration space is not reset")
+            }
+        }
+        #[cfg(target_os = "linux")]
+        self.reconcile_notify();
+    }
+
     pub fn slots(&self) -> &[VirtioPciSlot] {
         &self.slots
     }
