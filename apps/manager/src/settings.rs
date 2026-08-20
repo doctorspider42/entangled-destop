@@ -4,10 +4,13 @@
 //! configuration directory lives, and that is resolved from environment
 //! variables rather than a platform crate.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::backend::{Backend, DEFAULT_WSL_DISTRO};
 
 #[derive(Debug, Error)]
 pub enum SettingsError {
@@ -67,6 +70,23 @@ pub struct Settings {
     pub default_vcpus: u32,
     pub default_disk_gib: u64,
     pub default_variant: String,
+    /// Which hypervisor a new machine uses. On Linux there is only one answer;
+    /// on Windows this is the WHP-or-WSL choice.
+    pub default_backend: Backend,
+    /// Per-machine overrides of [`Self::default_backend`], keyed by VM name.
+    ///
+    /// Manager state rather than profile state on purpose: where a machine runs
+    /// is a property of *this host*, and the same profile is meant to boot on
+    /// either backend (ADR-0002). Writing it into the profile would make the
+    /// file host-specific, which is exactly what that ADR forbids.
+    pub vm_backends: BTreeMap<String, Backend>,
+    /// The WSL distribution the WSL backend talks to (`wsl -d <name>`).
+    pub wsl_distro: String,
+    /// Path to the Linux build of `entangled`, as seen *inside* WSL. `None`
+    /// means "whatever `entangled` resolves to on the WSL PATH" — which is the
+    /// honest default, because a Windows install ships no Linux binary and a
+    /// developer's build lives wherever their target directory pointed.
+    pub wsl_entangled: Option<String>,
 }
 
 impl Default for Settings {
@@ -82,6 +102,10 @@ impl Default for Settings {
             default_vcpus: 2,
             default_disk_gib: 16,
             default_variant: "text-netboot".to_string(),
+            default_backend: Backend::Native,
+            vm_backends: BTreeMap::new(),
+            wsl_distro: DEFAULT_WSL_DISTRO.to_string(),
+            wsl_entangled: None,
         }
     }
 }
@@ -141,6 +165,32 @@ impl Settings {
             .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Where a named machine runs: its own choice, else the default — and
+    /// always the native backend when the chosen one does not exist on this
+    /// host, so a settings file carried from Windows to Linux still works.
+    pub fn backend_for(&self, vm: &str) -> Backend {
+        let chosen = self
+            .vm_backends
+            .get(vm)
+            .copied()
+            .unwrap_or(self.default_backend);
+        if chosen.available_on_host() {
+            chosen
+        } else {
+            Backend::Native
+        }
+    }
+
+    /// Records a machine's backend, dropping the entry when it merely repeats
+    /// the default — the settings file should not fill up with redundant rows.
+    pub fn set_backend_for(&mut self, vm: &str, backend: Backend) {
+        if backend == self.default_backend {
+            self.vm_backends.remove(vm);
+        } else {
+            self.vm_backends.insert(vm.to_string(), backend);
+        }
     }
 }
 
@@ -206,11 +256,45 @@ mod tests {
             default_vcpus: 4,
             default_disk_gib: 40,
             default_variant: "gtk-netboot".into(),
+            default_backend: Backend::Wsl,
+            vm_backends: [("ubuntu-lab".to_string(), Backend::Native)]
+                .into_iter()
+                .collect(),
+            wsl_distro: "Debian".into(),
+            wsl_entangled: Some("/home/spider/bin/entangled".into()),
         };
 
         settings.save_to(&path).expect("save");
         let back = Settings::load_from(&path).expect("load");
         assert_eq!(settings, back);
+    }
+
+    /// The backend a machine runs on: its own entry, the default, and — on a
+    /// host where the chosen one cannot exist — the native fallback. A settings
+    /// file copied from Windows must not leave a Linux user with a "WSL"
+    /// machine that can never start.
+    #[test]
+    fn backend_resolution_falls_back_to_what_this_host_has() {
+        let mut settings = Settings {
+            default_backend: Backend::Native,
+            ..Settings::default()
+        };
+        assert_eq!(settings.backend_for("anything"), Backend::Native);
+
+        settings.set_backend_for("lab", Backend::Wsl);
+        assert_eq!(
+            settings.backend_for("lab"),
+            if cfg!(windows) {
+                Backend::Wsl
+            } else {
+                Backend::Native
+            }
+        );
+
+        // Setting a machine back to the default drops the row rather than
+        // storing a duplicate of it.
+        settings.set_backend_for("lab", Backend::Native);
+        assert!(settings.vm_backends.is_empty());
     }
 
     /// A settings file naming more RAM than the machine can build must not turn

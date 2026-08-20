@@ -133,6 +133,28 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                     .color(theme::TEXT_FAINT),
             );
             ui.add_space(8.0);
+            // Diagnostics carries the colour of the worst thing it knows: red
+            // when the engine is missing, amber while a check runs, quiet
+            // otherwise. A nav item that shouts only when something is wrong.
+            let diagnostics_tint = if app.engine.is_err() {
+                theme::ERR
+            } else if app.doctor_running {
+                theme::WARN
+            } else {
+                theme::OK
+            };
+            if nav_item(
+                ui,
+                "Diagnostics",
+                "Engine, backend and host readiness",
+                app.view == crate::app::View::Diagnostics,
+                diagnostics_tint,
+            )
+            .clicked()
+                && app.view != crate::app::View::Diagnostics
+            {
+                actions.push(Action::SwitchView(crate::app::View::Diagnostics));
+            }
             let activity = if app.log_open {
                 "Hide activity"
             } else {

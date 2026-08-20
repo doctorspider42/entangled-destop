@@ -1,21 +1,30 @@
-//! Locating the `entangled` CLI and turning UI intent into a [`TaskSpec`].
+//! Finding the Entangled engine, and turning UI intent into a [`TaskSpec`].
+//!
+//! "Engine" is what the product calls the `entangled` binary in front of a
+//! user: the manager is the application, the engine is the part that actually
+//! runs a machine. A GUI user should never have to know where it lives, so
+//! resolution happens here and the result is reported as *status*, not asked
+//! for as a setting (the override still exists, under Advanced).
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use thiserror::Error;
 
+use crate::backend::{self, Backend};
 use crate::discovery::VmEntry;
-use crate::process::{TaskKind, TaskSpec};
+use crate::process::{TaskKind, TaskSpec, Waker};
 use crate::settings::Settings;
 
 #[derive(Debug, Error)]
 pub enum LaunchError {
-    #[error("the configured entangled binary {0} does not exist")]
+    #[error("the engine you chose in Settings is not there any more: {0}")]
     OverrideMissing(PathBuf),
 
     #[error(
-        "cannot find the 'entangled' binary — put it next to entangled-manager, \
-         on PATH, or set it in Settings"
+        "the Entangled engine is missing — it normally sits next to this manager. \
+         Reinstall Entangled Desktop, or locate the file yourself under \
+         Settings ▸ Advanced."
     )]
     NotFound,
 }
@@ -26,12 +35,58 @@ const BINARY: &str = if cfg!(windows) {
     "entangled"
 };
 
+/// How the engine was found — the sentence the Settings panel shows instead of
+/// a text field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineOrigin {
+    /// An explicit path from Settings ▸ Advanced.
+    Chosen,
+    /// The normal case: shipped alongside the manager.
+    BesideManager,
+    /// Found on `PATH` — a developer checkout, usually.
+    OnPath,
+}
+
+impl EngineOrigin {
+    pub const fn label(self) -> &'static str {
+        match self {
+            EngineOrigin::Chosen => "chosen in Settings",
+            EngineOrigin::BesideManager => "next to the manager",
+            EngineOrigin::OnPath => "found on PATH",
+        }
+    }
+}
+
+/// A resolved engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Engine {
+    pub path: PathBuf,
+    pub origin: EngineOrigin,
+    /// Filled in by the background version probe; `None` until it answers.
+    pub version: Option<String>,
+}
+
+impl Engine {
+    /// The one-line status: `"entangled 0.2.0 — next to the manager"`. The tick
+    /// is added by the view, which owns the colour.
+    pub fn summary(&self) -> String {
+        match &self.version {
+            Some(version) => format!("entangled {version} — {}", self.origin.label()),
+            None => format!("entangled — {}", self.origin.label()),
+        }
+    }
+}
+
 /// Resolution order: explicit setting, the manager's own directory (that is how
-/// `cargo build` and a release tarball lay them out), then `PATH`.
-pub fn locate_cli(settings: &Settings) -> Result<PathBuf, LaunchError> {
+/// `cargo build` and a release install lay them out), then `PATH`.
+pub fn locate_engine(settings: &Settings) -> Result<Engine, LaunchError> {
     if let Some(explicit) = &settings.entangled_binary {
         return if explicit.is_file() {
-            Ok(explicit.clone())
+            Ok(Engine {
+                path: explicit.clone(),
+                origin: EngineOrigin::Chosen,
+                version: None,
+            })
         } else {
             Err(LaunchError::OverrideMissing(explicit.clone()))
         };
@@ -41,10 +96,18 @@ pub fn locate_cli(settings: &Settings) -> Result<PathBuf, LaunchError> {
             .map(Path::to_path_buf)
             .filter(|dir| dir.join(BINARY).is_file())
     }) {
-        return Ok(dir.join(BINARY));
+        return Ok(Engine {
+            path: dir.join(BINARY),
+            origin: EngineOrigin::BesideManager,
+            version: None,
+        });
     }
     if let Some(found) = search_path(BINARY) {
-        return Ok(found);
+        return Ok(Engine {
+            path: found,
+            origin: EngineOrigin::OnPath,
+            version: None,
+        });
     }
     Err(LaunchError::NotFound)
 }
@@ -54,6 +117,100 @@ fn search_path(binary: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(binary))
         .find(|candidate| candidate.is_file())
+}
+
+/// Asks the engine its version, on a worker thread.
+///
+/// One `--version` costs a process spawn; on the frame loop that is a visible
+/// hitch on a cold file cache, so it goes where every other slow thing in this
+/// crate goes. Failure is silence: an engine that cannot say its version still
+/// runs machines, and the status line simply omits the number.
+pub fn spawn_version_probe(engine: PathBuf, waker: Waker) -> mpsc::Receiver<Option<String>> {
+    let (tx, rx) = mpsc::channel();
+    let builder = std::thread::Builder::new().name("engine-version".to_string());
+    let spawned = builder.spawn(move || {
+        let mut command = std::process::Command::new(&engine);
+        command.arg("--version");
+        crate::process::quiet_command(&mut command);
+        let version = command
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| parse_version(&String::from_utf8_lossy(&out.stdout)));
+        let _ = tx.send(version);
+        waker();
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "cannot probe the engine version");
+    }
+    rx
+}
+
+/// `"entangled 0.2.0\n"` → `"0.2.0"`. Anything unexpected yields `None` rather
+/// than a half-parsed string in the status line.
+fn parse_version(output: &str) -> Option<String> {
+    output
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+        .filter(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit()))
+}
+
+/// How a child is actually started: directly, or through `wsl.exe`.
+///
+/// Built from the settings once per action, so the two spellings of "run this
+/// engine command" live in one place and every path argument goes through the
+/// same translation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Runner {
+    pub backend: Backend,
+    /// The native engine. Used directly by [`Backend::Native`]; still carried
+    /// for the WSL case so the UI can report both halves.
+    pub engine: PathBuf,
+    pub distro: String,
+    /// Path to the Linux build of `entangled` *inside* WSL. Empty means "let
+    /// the WSL PATH decide".
+    pub linux_engine: String,
+}
+
+impl Runner {
+    pub fn new(backend: Backend, engine: PathBuf, settings: &Settings) -> Self {
+        Self {
+            backend,
+            engine,
+            distro: settings.wsl_distro.clone(),
+            linux_engine: settings.wsl_entangled.clone().unwrap_or_default(),
+        }
+    }
+
+    /// A path as the engine will see it. Identity natively; `/mnt/...` under
+    /// WSL, and a typed refusal when there is no such translation.
+    pub fn path_arg(&self, path: &Path) -> Result<String, String> {
+        match self.backend {
+            Backend::Native => Ok(path.display().to_string()),
+            Backend::Wsl => backend::to_wsl_path(path).map_err(|e| e.0),
+        }
+    }
+
+    /// `(program, argv)` for `entangled doctor` — the Diagnostics panel's whole
+    /// implementation. Public because the check runs outside the supervisor:
+    /// it is not a machine, it produces output and exits.
+    pub fn doctor_command(&self, cwd: &Path) -> Result<(PathBuf, Vec<String>), String> {
+        self.command(cwd, vec!["doctor".to_string()])
+    }
+
+    /// `(program, argv)` for an engine command line.
+    fn command(&self, cwd: &Path, args: Vec<String>) -> Result<(PathBuf, Vec<String>), String> {
+        match self.backend {
+            Backend::Native => Ok((self.engine.clone(), args)),
+            Backend::Wsl => {
+                let args = backend::wsl_args(&self.distro, &self.linux_engine, Some(cwd), &args);
+                Ok((PathBuf::from(backend::WSL_PROGRAM), args))
+            }
+        }
+    }
 }
 
 /// The installer variants `entangled install --variant` accepts. Debian only —
@@ -122,6 +279,9 @@ pub struct NewMachine {
     pub variant: String,
     pub automated: bool,
     pub headless: bool,
+    /// Where this machine will run once it exists — and where its installer
+    /// runs now.
+    pub backend: Backend,
 }
 
 impl NewMachine {
@@ -149,18 +309,22 @@ impl NewMachine {
 /// `cwd` is the working directory the child runs in, and it matters: the CLI
 /// resolves the bootstrap kernel and the UEFI firmware as relative paths
 /// (`artifacts/bootstrap/vmlinuz`, `artifacts/firmware/CLOUDHV.fd`), and writes
-/// the firmware path into the profile it generates. Disk and profile paths passed
-/// here are absolute, so they are unaffected.
+/// the firmware path into the profile it generates.
 ///
 /// `--network` is deliberately not passed: the CLI's per-host default is the
 /// right answer (TAP on Linux, the in-process user-mode NAT on Windows), and a
 /// GUI that pinned it would be wrong on one of the two hosts.
-pub fn install_spec(cli: &Path, vm_dir: &Path, cwd: PathBuf, machine: &NewMachine) -> TaskSpec {
+pub fn install_spec(
+    runner: &Runner,
+    vm_dir: &Path,
+    cwd: PathBuf,
+    machine: &NewMachine,
+) -> Result<TaskSpec, String> {
     let mut args = vec![
         "install".to_string(),
         machine.family.cli_name().to_string(),
         "--disk".to_string(),
-        machine.disk_path(vm_dir).display().to_string(),
+        runner.path_arg(&machine.disk_path(vm_dir))?,
         "--size".to_string(),
         format!("{}G", machine.disk_gib),
         "--memory-mib".to_string(),
@@ -179,7 +343,7 @@ pub fn install_spec(cli: &Path, vm_dir: &Path, cwd: PathBuf, machine: &NewMachin
         GuestFamily::Ubuntu => {
             if !machine.iso_path.trim().is_empty() {
                 args.push("--iso".to_string());
-                args.push(machine.iso_path.trim().to_string());
+                args.push(runner.path_arg(Path::new(machine.iso_path.trim()))?);
             }
         }
     }
@@ -190,35 +354,48 @@ pub fn install_spec(cli: &Path, vm_dir: &Path, cwd: PathBuf, machine: &NewMachin
         args.push("--headless".to_string());
     }
 
-    TaskSpec {
+    let (program, args) = runner.command(&cwd, args)?;
+    Ok(TaskSpec {
         kind: TaskKind::Install,
         vm: machine.name.clone(),
-        program: cli.to_path_buf(),
+        program,
         args,
         cwd,
         log_path: vm_dir.join(format!("{}-install.log", machine.name)),
         control: false,
-    }
+    })
 }
 
 /// `entangled run --control-stdin <profile>` (GUI-1603). The VM opens its own
 /// window; the manager tracks the child and keeps its stdin as the lifecycle
 /// control channel, which is what the Pause and Restart buttons write to
 /// (ADR-0005).
-pub fn run_spec(cli: &Path, vm: &VmEntry, cwd: PathBuf, vm_dir: &Path) -> TaskSpec {
-    TaskSpec {
+///
+/// Under the WSL backend the same pipe still works: `wsl.exe` forwards its
+/// stdin to the Linux process, so Pause and Restart reach the guest exactly as
+/// they do natively. What differs is the window — WSLg opens it, on its own
+/// Wayland compositor.
+pub fn run_spec(
+    runner: &Runner,
+    vm: &VmEntry,
+    cwd: PathBuf,
+    vm_dir: &Path,
+) -> Result<TaskSpec, String> {
+    let args = vec![
+        "run".to_string(),
+        "--control-stdin".to_string(),
+        runner.path_arg(&vm.profile_path)?,
+    ];
+    let (program, args) = runner.command(&cwd, args)?;
+    Ok(TaskSpec {
         kind: TaskKind::Run,
         vm: vm.name.clone(),
-        program: cli.to_path_buf(),
-        args: vec![
-            "run".to_string(),
-            "--control-stdin".to_string(),
-            vm.profile_path.display().to_string(),
-        ],
+        program,
+        args,
         cwd,
         log_path: vm_dir.join(format!("{}-run.log", vm.name)),
         control: true,
-    }
+    })
 }
 
 /// The bootstrap kernel a direct-Linux VM boots from, relative to the child's
@@ -231,6 +408,17 @@ pub const BOOTSTRAP_KERNEL: &str = "artifacts/bootstrap/vmlinuz";
 /// child's working directory, named in the profile that comes out.
 pub const UEFI_FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
 
+/// How the UEFI firmware is obtained, in words a user can act on. Windows has
+/// no build for it, and saying so beats a build command that cannot run.
+pub const FIRMWARE_FIX: &str = if cfg!(windows) {
+    "The firmware is built on Linux (guest/firmware/build-cloudhv.sh) and copied in — \
+     there is no Windows build of it. Copy artifacts/firmware/CLOUDHV.fd in from a Linux \
+     checkout or a release, then choose it here."
+} else {
+    "Build it once with `bash guest/firmware/build-cloudhv.sh` (about 2.5 minutes), then \
+     choose it here."
+};
+
 /// The artifact `entangled install <distro>` would fail on, if any — one message
 /// ready to show, or `None` when this host can install that distribution now.
 ///
@@ -240,16 +428,12 @@ pub const UEFI_FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
 /// only installer that works on Windows unreachable there.
 pub fn missing_install_artifact(cwd: &Path, family: GuestFamily) -> Option<String> {
     let (artifact, hint) = match family {
-        GuestFamily::Ubuntu => (
-            UEFI_FIRMWARE,
-            "build it with `bash guest/firmware/build-cloudhv.sh` (~2.5 min), or point \
-             Settings ▸ working directory at a tree that has it",
-        ),
+        GuestFamily::Ubuntu => (UEFI_FIRMWARE, FIRMWARE_FIX),
         GuestFamily::Debian => (
             BOOTSTRAP_KERNEL,
-            "the Debian installer boots the project kernel from there (build it with \
-             guest/bootstrap-kernel/build.sh on Linux, or point Settings ▸ working \
-             directory at a tree that has it)",
+            "The Debian installer boots Entangled's own kernel from there. Build it with \
+             guest/bootstrap-kernel/build.sh on Linux, or point Settings ▸ Advanced ▸ \
+             working directory at a tree that has it.",
         ),
     };
     if cwd.join(artifact).is_file() {
@@ -275,14 +459,29 @@ mod tests {
             variant: "text-netboot".into(),
             automated: true,
             headless: false,
+            backend: Backend::Native,
+        }
+    }
+
+    fn native(engine: &str) -> Runner {
+        Runner {
+            backend: Backend::Native,
+            engine: PathBuf::from(engine),
+            distro: "Ubuntu".into(),
+            linux_engine: String::new(),
         }
     }
 
     #[test]
     fn install_arguments_match_the_cli_surface() {
-        let cli = PathBuf::from("/usr/bin/entangled");
         let vm_dir = Path::new("/vms");
-        let spec = install_spec(&cli, vm_dir, PathBuf::from("/srv/entangled"), &machine());
+        let spec = install_spec(
+            &native("/usr/bin/entangled"),
+            vm_dir,
+            PathBuf::from("/srv/entangled"),
+            &machine(),
+        )
+        .expect("spec");
 
         assert_eq!(spec.kind, TaskKind::Install);
         assert_eq!(spec.vm, "demo");
@@ -316,11 +515,12 @@ mod tests {
         let mut m = machine();
         m.family = GuestFamily::Ubuntu;
         let line = install_spec(
-            &PathBuf::from("entangled"),
+            &native("entangled"),
             Path::new("/vms"),
             PathBuf::from("/srv"),
             &m,
         )
+        .expect("spec")
         .command_line();
         assert!(line.contains("install ubuntu"), "{line}");
         assert!(!line.contains("--variant"), "{line}");
@@ -371,11 +571,12 @@ mod tests {
         let mut m = machine();
         m.family = default;
         let line = install_spec(
-            &PathBuf::from("entangled"),
+            &native("entangled"),
             Path::new("/vms"),
             PathBuf::from("/srv"),
             &m,
         )
+        .expect("spec")
         .command_line();
         assert!(
             line.contains(&format!("install {}", default.cli_name())),
@@ -385,12 +586,18 @@ mod tests {
 
     #[test]
     fn installer_memory_has_a_floor_and_headless_is_optional() {
-        let cli = PathBuf::from("entangled");
         let mut m = machine();
         m.memory_mib = 512;
         m.automated = false;
         m.headless = true;
-        let line = install_spec(&cli, Path::new("/vms"), PathBuf::from("/srv"), &m).command_line();
+        let line = install_spec(
+            &native("entangled"),
+            Path::new("/vms"),
+            PathBuf::from("/srv"),
+            &m,
+        )
+        .expect("spec")
+        .command_line();
         assert!(line.contains("--memory-mib 1536"), "{line}");
         assert!(line.contains("--headless"), "{line}");
         assert!(!line.contains("--auto"), "{line}");
@@ -404,11 +611,12 @@ mod tests {
         m.disk_mode = DiskMode::UseExisting;
         m.disk_path = "kept.raw".into();
         let line = install_spec(
-            Path::new("entangled"),
+            &native("entangled"),
             Path::new("/vms"),
             PathBuf::from("/srv"),
             &m,
         )
+        .expect("spec")
         .command_line();
         assert!(line.contains("install ubuntu"), "{line}");
         assert!(line.contains("--iso /isos/ubuntu.iso"), "{line}");
@@ -418,9 +626,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_spec_points_at_the_profile() {
-        let vm = VmEntry {
+    fn entry() -> VmEntry {
+        VmEntry {
             name: "debian-demo".into(),
             profile_path: PathBuf::from("/vms/debian-demo.toml"),
             memory_mib: 2048,
@@ -429,13 +636,18 @@ mod tests {
             network_interface: Some("entangled0".into()),
             disks: vec![],
             uefi: false,
-        };
+        }
+    }
+
+    #[test]
+    fn run_spec_points_at_the_profile() {
         let spec = run_spec(
-            &PathBuf::from("/usr/bin/entangled"),
-            &vm,
+            &native("/usr/bin/entangled"),
+            &entry(),
             PathBuf::from("/srv/entangled"),
             Path::new("/vms"),
-        );
+        )
+        .expect("spec");
         assert_eq!(spec.kind, TaskKind::Run);
         assert_eq!(
             spec.command_line(),
@@ -452,20 +664,90 @@ mod tests {
         assert_eq!(spec.log_path, Path::new("/vms/debian-demo-run.log"));
     }
 
+    /// The WSL backend: `wsl.exe` is the program, the profile path is
+    /// translated, and stdin stays a pipe so Pause and Restart still reach the
+    /// guest through `wsl.exe`.
     #[test]
-    fn explicit_binary_must_exist() {
+    fn the_wsl_backend_rewrites_the_program_and_the_paths() {
+        let runner = Runner {
+            backend: Backend::Wsl,
+            engine: PathBuf::from(r"C:\Program Files\Entangled\entangled.exe"),
+            distro: "Ubuntu".into(),
+            linux_engine: "/home/spider/target/debug/entangled".into(),
+        };
+        let mut vm = entry();
+        vm.profile_path = PathBuf::from(r"D:\entangled-vms\debian-demo.toml");
+        let spec = run_spec(
+            &runner,
+            &vm,
+            PathBuf::from(r"D:\entangled-desktop"),
+            Path::new(r"D:\entangled-vms"),
+        )
+        .expect("spec");
+
+        assert_eq!(spec.program, Path::new("wsl.exe"));
+        assert!(spec.control, "the control pipe survives wsl.exe");
+        let line = spec.command_line();
+        assert!(line.contains("-d Ubuntu"), "{line}");
+        assert!(
+            line.contains("/home/spider/target/debug/entangled"),
+            "{line}"
+        );
+        assert!(
+            line.contains("/mnt/d/entangled-vms/debian-demo.toml"),
+            "{line}"
+        );
+        // The log still lands on the Windows side, where the manager reads it.
+        assert_eq!(
+            spec.log_path,
+            Path::new(r"D:\entangled-vms").join("debian-demo-run.log")
+        );
+    }
+
+    /// A machine WSL cannot see is refused with the reason, at spec-building
+    /// time — not deep inside the engine, and not as a silent failure.
+    #[test]
+    fn an_untranslatable_path_fails_the_spec_not_the_boot() {
+        let runner = Runner {
+            backend: Backend::Wsl,
+            engine: PathBuf::from("entangled.exe"),
+            distro: "Ubuntu".into(),
+            linux_engine: String::new(),
+        };
+        let mut vm = entry();
+        vm.profile_path = PathBuf::from(r"\\nas\vms\demo.toml");
+        let error = run_spec(&runner, &vm, PathBuf::from(r"D:\x"), Path::new(r"D:\x"))
+            .expect_err("unreachable");
+        assert!(error.contains("network path"), "{error}");
+    }
+
+    #[test]
+    fn explicit_binary_must_exist_and_is_reported_as_chosen() {
         let mut settings = Settings {
             entangled_binary: Some(PathBuf::from("/definitely/not/here/entangled")),
             ..Settings::default()
         };
         assert!(matches!(
-            locate_cli(&settings),
+            locate_engine(&settings),
             Err(LaunchError::OverrideMissing(_))
         ));
 
-        // A real file is accepted as-is.
+        // A real file is accepted as-is, and the status says where it came from.
         let here = std::env::current_exe().expect("test binary path");
         settings.entangled_binary = Some(here.clone());
-        assert_eq!(locate_cli(&settings).expect("located"), here);
+        let engine = locate_engine(&settings).expect("located");
+        assert_eq!(engine.path, here);
+        assert_eq!(engine.origin, EngineOrigin::Chosen);
+        assert!(engine.summary().contains("chosen in Settings"));
+    }
+
+    #[test]
+    fn the_version_line_is_parsed_or_dropped() {
+        assert_eq!(parse_version("entangled 0.2.17\n"), Some("0.2.17".into()));
+        assert_eq!(parse_version("entangled 0.2.0"), Some("0.2.0".into()));
+        // Anything that is not "<name> <digits…>" is not a version.
+        assert_eq!(parse_version("entangled"), None);
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("bash: entangled: not found"), None);
     }
 }

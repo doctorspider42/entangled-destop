@@ -9,6 +9,8 @@ use control_api::{
     BootMode, CdromSection, NetworkBackend, NetworkSection, VirtioTransport, VmConfig,
 };
 
+use crate::backend::Backend;
+
 /// The network choice as the form shows it (a profile may have no `[network]`
 /// at all, which an `Option<NetworkSection>` models but a combo box cannot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,8 +64,48 @@ pub struct EditForm {
     pub disks: Vec<control_api::DiskSection>,
     /// Buffer for the "add disk" field.
     pub add_disk: String,
+    /// Where this machine runs. Not part of the profile — see
+    /// [`crate::settings::Settings::vm_backends`] — but edited here because it
+    /// decides which of the other fields are even available.
+    pub backend: Backend,
+    /// The backend the machine had when the form opened, so "has anything
+    /// changed?" covers the one field that is not part of the profile.
+    pub base_backend: Backend,
+    /// The working directory a launch would use, so a relative path in the form
+    /// can be resolved for the "is this file actually there?" badge. Never
+    /// written anywhere; presentation only.
+    pub work_dir: PathBuf,
     /// The untouched parse, for everything the form does not model.
     base: VmConfig,
+}
+
+impl EditForm {
+    /// A path field resolved the way the engine will resolve it: as given when
+    /// absolute, against the working directory when relative.
+    pub fn resolve(&self, value: &str) -> PathBuf {
+        let path = PathBuf::from(value.trim());
+        if path.is_absolute() {
+            path
+        } else {
+            self.work_dir.join(path)
+        }
+    }
+
+    /// The NVRAM file this machine should have if it does not name one: beside
+    /// its first disk, named after the machine. That is the convention
+    /// `disk-image` already uses for the sidecar, so the file travels with the
+    /// disk when it is moved or deleted.
+    pub fn suggested_nvram(&self) -> PathBuf {
+        match self.disks.first() {
+            Some(disk) => disk_image::nvram_sidecar_path(&disk.path),
+            None => PathBuf::from(format!("{}.nvram", self.name)),
+        }
+    }
+
+    /// The firmware every profile the installer writes points at.
+    pub fn suggested_firmware(&self) -> PathBuf {
+        PathBuf::from(crate::launcher::UEFI_FIRMWARE)
+    }
 }
 
 impl EditForm {
@@ -151,6 +193,9 @@ virgl = true
             virgl: cfg.display.virgl,
             disks: cfg.disks.clone(),
             add_disk: String::new(),
+            backend: Backend::Native,
+            base_backend: Backend::Native,
+            work_dir: PathBuf::from("."),
             base: cfg,
         }
     }
@@ -204,8 +249,12 @@ virgl = true
         std::fs::write(&self.profile_path, out).map_err(|e| e.to_string())
     }
 
-    /// True when the form currently differs from the profile on disk.
+    /// True when the form currently differs from what was loaded — profile
+    /// *or* backend, since Save writes both.
     pub fn dirty(&self) -> bool {
+        if self.backend != self.base_backend {
+            return true;
+        }
         match self.to_config() {
             Ok(cfg) => cfg != self.base,
             Err(_) => true,

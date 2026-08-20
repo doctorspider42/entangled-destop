@@ -13,9 +13,12 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::backend::{self, Backend};
 use crate::discovery::{self, Scan, VmEntry};
-use crate::launcher::{self, NewMachine};
+use crate::hostcheck;
+use crate::launcher::{self, Engine, NewMachine, Runner};
 use crate::metrics;
+use crate::picker::{self, PickTarget};
 use crate::process::{Supervisor, TaskId, TaskKind};
 use crate::settings::{self, Settings};
 use crate::theme;
@@ -108,6 +111,8 @@ pub enum View {
     #[default]
     Machines,
     Disks,
+    /// Host readiness: `entangled doctor`, rendered.
+    Diagnostics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +188,16 @@ pub struct MoveDiskState {
     pub events: Option<mpsc::Receiver<MoveEvent>>,
 }
 
+/// "Grow this disk" dialog state. Shrinking is not offered at all — the CLI
+/// refuses it because it would destroy whatever the guest put at the end of the
+/// image, and an action that can only fail does not belong in a GUI.
+pub struct ResizeDiskState {
+    pub row: discovery::DiskRow,
+    /// New size as typed, validated by the same parser the CLI uses.
+    pub size: String,
+    pub error: Option<String>,
+}
+
 /// Delete confirmation state (GUI-1604).
 pub struct DeleteState {
     pub name: String,
@@ -198,6 +213,12 @@ pub struct SettingsForm {
     pub headless_install: bool,
     pub check_updates_on_startup: bool,
     pub animations_enabled: bool,
+    pub default_backend: Backend,
+    pub wsl_distro: String,
+    pub wsl_entangled: String,
+    /// The Advanced group starts collapsed: everything inside it is something
+    /// the application already worked out for itself.
+    pub advanced_open: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -211,6 +232,7 @@ pub enum Modal {
     AttachDisk(AttachDiskState),
     EditVm(EditVmState),
     MoveDisk(MoveDiskState),
+    ResizeDisk(ResizeDiskState),
 }
 
 impl Modal {
@@ -267,6 +289,15 @@ pub enum Action {
     // ---- Move to another drive ----------------------------------------------
     AskMoveDisk(PathBuf),
     SubmitMoveDisk,
+    // ---- Paths, chosen rather than typed -------------------------------------
+    /// Open a native file/folder dialog for one field (never on this thread).
+    PickPath(PickTarget),
+    // ---- Diagnostics ----------------------------------------------------------
+    /// Run `entangled doctor` on the current backend and show the answer.
+    RunDiagnostics,
+    // ---- Storage, the rest of the CLI's disk surface ---------------------------
+    AskResizeDisk(PathBuf),
+    SubmitResizeDisk,
 }
 
 /// A VM being installed that has no profile on disk yet, so it still gets a
@@ -334,7 +365,10 @@ pub struct ManagerApp {
     pub settings_path: Option<PathBuf>,
     /// Non-fatal startup problem (unreadable settings file) shown as a banner.
     pub startup_warning: Option<String>,
-    pub cli: Result<PathBuf, String>,
+    /// The resolved engine, or why it could not be found. Reported as status —
+    /// a GUI user is never asked to type this path.
+    pub engine: Result<Engine, String>,
+    engine_version: Option<mpsc::Receiver<Option<String>>>,
     pub scan: Scan,
     pub scan_error: Option<String>,
     mock_statuses: HashMap<String, Status>,
@@ -355,6 +389,12 @@ pub struct ManagerApp {
     pub update_downloading: bool,
     update_check: Option<mpsc::Receiver<UpdateInfo>>,
     update_download: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    /// The one open file dialog, if any.
+    picker: Option<picker::Pending>,
+    /// The last `entangled doctor` answer, and whether one is in flight.
+    pub doctor: Option<hostcheck::Report>,
+    pub doctor_running: bool,
+    doctor_rx: Option<mpsc::Receiver<hostcheck::Report>>,
     waker: crate::process::Waker,
     scanner: Scanner,
     last_scan: Instant,
@@ -440,14 +480,28 @@ impl ManagerApp {
             Scanner::spawn(Arc::clone(&waker))
         };
 
+        // Resolving the engine is the application's job, not the user's: the
+        // path, how it was found, and (once the probe answers) its version all
+        // become one status line rather than a text field to fill in.
+        let engine = if mock_mode {
+            Ok(Engine {
+                path: PathBuf::from("mock-entangled"),
+                origin: launcher::EngineOrigin::BesideManager,
+                version: Some(crate::VERSION.to_string()),
+            })
+        } else {
+            launcher::locate_engine(&settings).map_err(|e| e.to_string())
+        };
+        let engine_version = (!mock_mode)
+            .then(|| engine.as_ref().ok())
+            .flatten()
+            .map(|engine| launcher::spawn_version_probe(engine.path.clone(), Arc::clone(&waker)));
+
         let mut app = Self {
             mock_mode,
             view: View::default(),
-            cli: if mock_mode {
-                Ok(PathBuf::from("mock-entangled"))
-            } else {
-                launcher::locate_cli(&settings).map_err(|e| e.to_string())
-            },
+            engine,
+            engine_version,
             settings,
             settings_path,
             startup_warning,
@@ -467,6 +521,10 @@ impl ManagerApp {
             update_downloading: false,
             update_check,
             update_download: None,
+            picker: None,
+            doctor: mock_mode.then(hostcheck::mock_report),
+            doctor_running: false,
+            doctor_rx: None,
             waker: Arc::clone(&waker),
             scanner,
             last_scan: Instant::now() - SCAN_INTERVAL,
@@ -484,7 +542,12 @@ impl ManagerApp {
             ScreenshotView::Wizard => app.open_wizard(),
             ScreenshotView::Settings => app.open_settings(),
             ScreenshotView::Disks => app.view = View::Disks,
-            ScreenshotView::Main | ScreenshotView::Editor => {}
+            ScreenshotView::Diagnostics => app.view = View::Diagnostics,
+            ScreenshotView::Main
+            | ScreenshotView::Editor
+            | ScreenshotView::EditorBoot
+            | ScreenshotView::EditorNetwork
+            | ScreenshotView::EditorStorage => {}
         }
         app
     }
@@ -567,6 +630,11 @@ impl ManagerApp {
                 variant: self.settings.default_variant.clone(),
                 automated: true,
                 headless: self.settings.headless_install,
+                backend: if self.settings.default_backend.available_on_host() {
+                    self.settings.default_backend
+                } else {
+                    Backend::Native
+                },
             },
             step: 0,
             error: None,
@@ -670,7 +738,25 @@ impl ManagerApp {
             headless_install: self.settings.headless_install,
             check_updates_on_startup: self.settings.check_updates_on_startup,
             animations_enabled: self.settings.animations_enabled,
+            default_backend: self.settings.default_backend,
+            wsl_distro: self.settings.wsl_distro.clone(),
+            wsl_entangled: self.settings.wsl_entangled.clone().unwrap_or_default(),
+            advanced_open: false,
         });
+    }
+
+    /// Writes the settings without a toast — for the changes the application
+    /// makes on the user's behalf (a machine remembering its backend), which
+    /// should not announce themselves as if the user had pressed Save.
+    fn persist_settings_quietly(&mut self) {
+        if self.mock_mode {
+            return;
+        }
+        if let Some(path) = &self.settings_path {
+            if let Err(e) = self.settings.save_to(path) {
+                tracing::warn!(error = %e, "cannot persist settings");
+            }
+        }
     }
 
     fn request_scan(&mut self, force: bool) {
@@ -716,12 +802,16 @@ impl ManagerApp {
     }
 
     fn open_screenshot_surface(&mut self) {
-        if self.screenshot_surface_opened
-            || self.screenshot.is_none()
-            || self.screenshot_view != ScreenshotView::Editor
-        {
+        if self.screenshot_surface_opened || self.screenshot.is_none() {
             return;
         }
+        let section = match self.screenshot_view {
+            ScreenshotView::Editor => EditVmSection::Hardware,
+            ScreenshotView::EditorBoot => EditVmSection::BootMedia,
+            ScreenshotView::EditorNetwork => EditVmSection::NetworkDisplay,
+            ScreenshotView::EditorStorage => EditVmSection::Storage,
+            _ => return,
+        };
         let Some(name) = self
             .scan
             .vms
@@ -733,6 +823,9 @@ impl ManagerApp {
         };
         self.screenshot_surface_opened = true;
         self.ask_edit_vm(&name);
+        if let Modal::EditVm(state) = &mut self.modal {
+            state.section = section;
+        }
     }
 
     /// Turns finished children into toasts, and finishes the install flow by
@@ -826,16 +919,55 @@ impl ManagerApp {
         self.toast(ToastLevel::Success, message);
     }
 
-    fn cli_path(&mut self) -> Option<PathBuf> {
-        self.cli = launcher::locate_cli(&self.settings).map_err(|e| e.to_string());
-        match &self.cli {
-            Ok(path) => Some(path.clone()),
+    /// Re-resolves the engine and restarts its version probe. Called whenever
+    /// something that could change the answer changes: the override, or a fix
+    /// the user just applied.
+    fn refresh_engine(&mut self) {
+        if self.mock_mode {
+            return;
+        }
+        self.engine = launcher::locate_engine(&self.settings).map_err(|e| e.to_string());
+        self.engine_version = self.engine.as_ref().ok().map(|engine| {
+            launcher::spawn_version_probe(engine.path.clone(), Arc::clone(&self.waker))
+        });
+    }
+
+    /// The version probe's single answer, folded into the engine status.
+    fn collect_engine_version(&mut self) {
+        let Some(rx) = &self.engine_version else {
+            return;
+        };
+        if let Ok(version) = rx.try_recv() {
+            self.engine_version = None;
+            if let Ok(engine) = &mut self.engine {
+                engine.version = version;
+            }
+        }
+    }
+
+    fn engine_path(&mut self) -> Option<PathBuf> {
+        self.refresh_engine();
+        match &self.engine {
+            Ok(engine) => Some(engine.path.clone()),
             Err(message) => {
                 let message = message.clone();
                 self.toast(ToastLevel::Error, message);
                 None
             }
         }
+    }
+
+    /// Where a machine runs, honouring its own choice and this host's reality.
+    pub fn backend_of(&self, vm: &str) -> Backend {
+        self.settings.backend_for(vm)
+    }
+
+    /// Everything of a machine that must be visible from its backend: the
+    /// profile and every disk it declares.
+    fn machine_paths(vm: &VmEntry) -> Vec<PathBuf> {
+        std::iter::once(vm.profile_path.clone())
+            .chain(vm.disks.iter().map(|disk| disk.resolved.clone()))
+            .collect()
     }
 
     fn start(&mut self, name: &str) {
@@ -854,7 +986,25 @@ impl ManagerApp {
             );
             return;
         }
-        let Some(cli) = self.cli_path() else { return };
+        let Some(cli) = self.engine_path() else {
+            return;
+        };
+        let chosen = self.backend_of(name);
+
+        // Everything the chosen backend must be able to see, checked here
+        // rather than discovered as a "file not found" three layers down.
+        let paths = Self::machine_paths(&vm);
+        match backend::reachability(chosen, paths.iter().map(PathBuf::as_path)) {
+            backend::Reachability::Refused(message) => {
+                self.toast(
+                    ToastLevel::Error,
+                    format!("'{name}' cannot start on {}: {message}", chosen.label()),
+                );
+                return;
+            }
+            backend::Reachability::Caveat(message) => self.toast(ToastLevel::Warn, message),
+            backend::Reachability::Fine => {}
+        }
 
         let cwd = self.settings.child_cwd();
         // Whichever artifact *this* profile boots from. A UEFI profile (every
@@ -871,16 +1021,31 @@ impl ManagerApp {
                 ToastLevel::Warn,
                 format!(
                     "no {artifact} under {} — a profile with relative boot paths will \
-                     fail to start (Settings ▸ working directory)",
+                     fail to start (Settings ▸ Advanced ▸ working directory)",
                     cwd.display()
                 ),
             );
         }
-        let spec = launcher::run_spec(&cli, &vm, cwd, &self.settings.vm_dir);
+        let runner = Runner::new(chosen, cli, &self.settings);
+        let spec = match launcher::run_spec(&runner, &vm, cwd, &self.settings.vm_dir) {
+            Ok(spec) => spec,
+            Err(message) => {
+                self.toast(ToastLevel::Error, message);
+                return;
+            }
+        };
         match self.supervisor.spawn(spec) {
             Ok(id) => {
                 self.log_selected = Some(id);
-                self.toast(ToastLevel::Success, format!("starting '{name}'"));
+                let window = if chosen == Backend::Wsl {
+                    " — its window opens through WSLg"
+                } else {
+                    ""
+                };
+                self.toast(
+                    ToastLevel::Success,
+                    format!("starting '{name}' on {}{window}", chosen.label()),
+                );
             }
             Err(e) => self.toast(ToastLevel::Error, e.to_string()),
         }
@@ -1050,12 +1215,39 @@ impl ManagerApp {
 
         let mut machine = machine;
         machine.name = trimmed.clone();
-        let Some(cli) = self.cli_path() else {
+        let Some(cli) = self.engine_path() else {
             if let Modal::Wizard(state) = &mut self.modal {
-                state.error = Some("the entangled CLI was not found (see Settings)".into());
+                state.error = Some(
+                    "the Entangled engine could not be found — see Settings ▸ Advanced".into(),
+                );
             }
             return;
         };
+
+        // The wizard already greys out an installer this backend cannot run, so
+        // this is the belt to that braces: a settings change between opening the
+        // wizard and pressing the button must not reach the engine.
+        if machine.family == launcher::GuestFamily::Debian {
+            if let Some(reason) = machine.backend.debian_install_block() {
+                if let Modal::Wizard(state) = &mut self.modal {
+                    state.error = Some(reason.long.to_string());
+                }
+                return;
+            }
+        }
+        match backend::reachability(
+            machine.backend,
+            [profile_path.as_path(), disk_path.as_path()],
+        ) {
+            backend::Reachability::Refused(message) => {
+                if let Modal::Wizard(state) = &mut self.modal {
+                    state.error = Some(message);
+                }
+                return;
+            }
+            backend::Reachability::Caveat(message) => self.toast(ToastLevel::Warn, message),
+            backend::Reachability::Fine => {}
+        }
 
         let cwd = self.settings.child_cwd();
         // Per distribution: Ubuntu needs the UEFI firmware, Debian the bootstrap
@@ -1067,7 +1259,17 @@ impl ManagerApp {
             }
             return;
         }
-        let spec = launcher::install_spec(&cli, &self.settings.vm_dir, cwd, &machine);
+        let runner = Runner::new(machine.backend, cli, &self.settings);
+        let spec = match launcher::install_spec(&runner, &self.settings.vm_dir, cwd, &machine) {
+            Ok(spec) => spec,
+            Err(message) => {
+                if let Modal::Wizard(state) = &mut self.modal {
+                    state.error = Some(message);
+                }
+                return;
+            }
+        };
+        let chosen_backend = machine.backend;
         match self.supervisor.spawn(spec) {
             Ok(id) => {
                 self.pending.push(PendingInstall {
@@ -1079,6 +1281,11 @@ impl ManagerApp {
                 self.log_selected = Some(id);
                 self.log_open = true;
                 self.modal = Modal::None;
+                // The machine keeps the backend it was installed on: an Ubuntu
+                // installed under WSL boots there again without the user having
+                // to remember which host built it.
+                self.settings.set_backend_for(&trimmed, chosen_backend);
+                self.persist_settings_quietly();
                 self.toast(
                     ToastLevel::Success,
                     format!("installing '{trimmed}' — watch the log below"),
@@ -1162,6 +1369,17 @@ impl ManagerApp {
         self.settings.headless_install = form.headless_install;
         self.settings.check_updates_on_startup = form.check_updates_on_startup;
         self.settings.animations_enabled = form.animations_enabled;
+        self.settings.default_backend = form.default_backend;
+        let distro = form.wsl_distro.trim();
+        self.settings.wsl_distro = if distro.is_empty() {
+            backend::DEFAULT_WSL_DISTRO.to_string()
+        } else {
+            distro.to_string()
+        };
+        self.settings.wsl_entangled = {
+            let value = form.wsl_entangled.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        };
 
         match &self.settings_path {
             Some(path) => match self.settings.save_to(path) {
@@ -1176,7 +1394,7 @@ impl ManagerApp {
                 "settings applied for this session only (no configuration directory)",
             ),
         }
-        self.cli = launcher::locate_cli(&self.settings).map_err(|e| e.to_string());
+        self.refresh_engine();
         self.modal = Modal::None;
         self.request_scan(true);
     }
@@ -1419,7 +1637,12 @@ impl ManagerApp {
             crate::editor::EditForm::from_profile(&vm.profile_path.clone())
         };
         match form {
-            Ok(form) => {
+            Ok(mut form) => {
+                // The backend is manager state, not profile state, so it is
+                // loaded alongside the profile rather than out of it.
+                form.backend = self.backend_of(name);
+                form.base_backend = form.backend;
+                form.work_dir = self.settings.child_cwd();
                 self.modal = Modal::EditVm(EditVmState {
                     form,
                     section: EditVmSection::Hardware,
@@ -1445,9 +1668,12 @@ impl ManagerApp {
             }
             return;
         }
+        let backend = state.form.backend;
         match state.form.save() {
             Ok(()) => {
                 self.modal = Modal::None;
+                self.settings.set_backend_for(&name, backend);
+                self.persist_settings_quietly();
                 self.toast(ToastLevel::Success, format!("saved '{name}'"));
                 self.request_scan(true);
             }
@@ -1609,6 +1835,198 @@ impl ManagerApp {
         }
     }
 
+    // ---- Paths, chosen rather than typed ----------------------------------
+
+    /// The text buffer a picked path belongs in.
+    ///
+    /// One function for both directions — the dialog reads it to decide where
+    /// to open, and writes it when the user picks — so a new picker cannot read
+    /// one field and fill in another.
+    fn picker_field(&mut self, target: PickTarget) -> Option<&mut String> {
+        match (&mut self.modal, target) {
+            (Modal::Settings(form), PickTarget::VmDir) => Some(&mut form.vm_dir),
+            (Modal::Settings(form), PickTarget::EngineBinary) => Some(&mut form.entangled_binary),
+            (Modal::Settings(form), PickTarget::WorkDir) => Some(&mut form.work_dir),
+            (Modal::Wizard(state), PickTarget::WizardIso) => Some(&mut state.machine.iso_path),
+            (Modal::Wizard(state), PickTarget::WizardDisk) => Some(&mut state.machine.disk_path),
+            (Modal::MoveDisk(state), PickTarget::MoveDestination) => Some(&mut state.dest),
+            (Modal::EditVm(state), target) => match target {
+                PickTarget::EditorKernel => Some(&mut state.form.kernel),
+                PickTarget::EditorInitramfs => Some(&mut state.form.initramfs),
+                PickTarget::EditorFirmware => Some(&mut state.form.firmware),
+                PickTarget::EditorNvram => Some(&mut state.form.nvram),
+                PickTarget::EditorCdrom => Some(&mut state.form.cdrom),
+                PickTarget::EditorAddDisk => Some(&mut state.form.add_disk),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Opens one native dialog. Never more than one: they are modal to the OS
+    /// anyway, and a queue of them would be a trap rather than a feature.
+    fn open_picker(&mut self, target: PickTarget) {
+        if self.picker.is_some() {
+            return;
+        }
+        let fallback = match target {
+            PickTarget::EngineBinary | PickTarget::WorkDir => self.settings.child_cwd(),
+            _ => self.settings.vm_dir.clone(),
+        };
+        let current = self
+            .picker_field(target)
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let start = picker::start_directory(&current, &fallback);
+        let seed = picker::file_name_of(&current);
+        match picker::open(target, Some(start), seed, Arc::clone(&self.waker)) {
+            Ok(pending) => self.picker = Some(pending),
+            Err(message) => self.toast(ToastLevel::Error, message),
+        }
+    }
+
+    /// Collects the answer, if the dialog has closed. Called once per frame;
+    /// the waker means "once per frame" is immediate rather than a heartbeat
+    /// away.
+    fn collect_picker(&mut self) {
+        let Some(pending) = &self.picker else { return };
+        let Some(answer) = pending.poll() else { return };
+        let target = pending.target;
+        self.picker = None;
+        let Some(path) = answer else { return }; // cancelled
+        let text = path.display().to_string();
+        match self.picker_field(target) {
+            Some(field) => *field = text,
+            // The engine picker is also reachable from the "engine missing"
+            // banner, where no form exists to hold the answer. Applying it
+            // straight away is the point of that button: one click, fixed.
+            None if target == PickTarget::EngineBinary => {
+                self.settings.entangled_binary = Some(path);
+                self.persist_settings_quietly();
+                self.toast(
+                    ToastLevel::Success,
+                    format!("using the Entangled engine at {text}"),
+                );
+            }
+            None => {}
+        }
+        // A new engine has to be re-resolved and re-probed straight away, so
+        // the status line answers before the user presses Save.
+        if target == PickTarget::EngineBinary {
+            self.refresh_engine();
+        }
+    }
+
+    // ---- Diagnostics -------------------------------------------------------
+
+    /// Runs `entangled doctor` for the default backend.
+    fn run_diagnostics(&mut self) {
+        if self.doctor_running {
+            return;
+        }
+        let Some(engine) = self.engine.as_ref().ok().map(|e| e.path.clone()) else {
+            self.doctor = Some(hostcheck::Report {
+                command: String::new(),
+                backend: self.settings.default_backend,
+                healthy: false,
+                lines: vec![hostcheck::Line {
+                    text: self
+                        .engine
+                        .as_ref()
+                        .err()
+                        .cloned()
+                        .unwrap_or_else(|| "the Entangled engine is missing".to_string()),
+                    level: hostcheck::Level::Failure,
+                }],
+            });
+            return;
+        };
+        let runner = Runner::new(self.settings.default_backend, engine, &self.settings);
+        self.doctor_running = true;
+        self.doctor_rx = Some(hostcheck::spawn(
+            runner,
+            self.settings.child_cwd(),
+            Arc::clone(&self.waker),
+        ));
+    }
+
+    fn collect_diagnostics(&mut self) {
+        let Some(rx) = &self.doctor_rx else { return };
+        if let Ok(report) = rx.try_recv() {
+            self.doctor_rx = None;
+            self.doctor_running = false;
+            self.doctor = Some(report);
+        }
+    }
+
+    // ---- Grow a disk -------------------------------------------------------
+
+    fn ask_resize_disk(&mut self, path: &Path) {
+        let Some(row) = self.disk_row(path).cloned() else {
+            self.toast(ToastLevel::Error, "that disk is gone from the list");
+            return;
+        };
+        if self.disk_busy(&row) {
+            self.toast(
+                ToastLevel::Warn,
+                "a VM using this disk is running — stop it first",
+            );
+            return;
+        }
+        // Seed with the current size rounded up to the next whole GiB: the
+        // dialog then only has to be nudged upward.
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let next = row.apparent_bytes.div_ceil(GIB).max(1) + 8;
+        self.modal = Modal::ResizeDisk(ResizeDiskState {
+            row,
+            size: format!("{next}G"),
+            error: None,
+        });
+    }
+
+    fn submit_resize_disk(&mut self) {
+        let Modal::ResizeDisk(state) = &self.modal else {
+            return;
+        };
+        let (path, text) = (state.row.path.clone(), state.size.trim().to_string());
+        let row = state.row.clone();
+        let fail = |app: &mut Self, message: String| {
+            if let Modal::ResizeDisk(state) = &mut app.modal {
+                state.error = Some(message);
+            }
+        };
+        if self.disk_busy(&row) {
+            fail(
+                self,
+                "a VM using this disk is running — stop it first".into(),
+            );
+            return;
+        }
+        let bytes = match disk_image::parse_size(&text) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                fail(self, e.to_string());
+                return;
+            }
+        };
+        match disk_image::resize_raw(&path, bytes) {
+            Ok(outcome) => {
+                self.modal = Modal::None;
+                self.toast(
+                    ToastLevel::Success,
+                    format!(
+                        "{} is now {} (was {}) — grow the filesystem inside the guest to use it",
+                        path.display(),
+                        discovery::format_bytes(outcome.new_bytes),
+                        discovery::format_bytes(outcome.previous_bytes)
+                    ),
+                );
+                self.request_scan(true);
+            }
+            Err(e) => fail(self, e.to_string()),
+        }
+    }
+
     fn reveal_disk(&mut self, path: &Path) {
         match reveal_in_file_manager(path) {
             Ok(()) => {}
@@ -1740,6 +2158,25 @@ impl ManagerApp {
             Action::DetachDisk { .. } => {
                 self.toast(ToastLevel::Success, "Mock: detach action accepted");
             }
+            Action::SubmitResizeDisk => {
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, "Mock: disk grown in memory");
+            }
+            Action::RunDiagnostics => {
+                // A canned report rather than a real `doctor`: mock mode never
+                // probes the host, and a screenshot must show the same panel
+                // on every machine.
+                self.doctor = Some(crate::hostcheck::mock_report());
+                self.toast(ToastLevel::Info, "Mock: showing a sample host report");
+            }
+            Action::PickPath(_) => {
+                // A native dialog is not a host *mutation*, but it is modal and
+                // unpredictable — a screenshot run must never stop on one.
+                self.toast(
+                    ToastLevel::Info,
+                    "Mock mode: the file browser is not opened; type a path instead",
+                );
+            }
             Action::CreateVmDir
             | Action::RevealDisk(_)
             | Action::AskMoveDisk(_)
@@ -1842,6 +2279,10 @@ impl ManagerApp {
             Action::SubmitEditVm => self.submit_edit_vm(),
             Action::AskMoveDisk(path) => self.ask_move_disk(&path),
             Action::SubmitMoveDisk => self.submit_move_disk(),
+            Action::PickPath(target) => self.open_picker(target),
+            Action::RunDiagnostics => self.run_diagnostics(),
+            Action::AskResizeDisk(path) => self.ask_resize_disk(&path),
+            Action::SubmitResizeDisk => self.submit_resize_disk(),
         }
     }
 
@@ -1952,6 +2393,9 @@ impl eframe::App for ManagerApp {
         self.collect_task_results();
         self.collect_update_events();
         self.collect_move_events();
+        self.collect_engine_version();
+        self.collect_picker();
+        self.collect_diagnostics();
         self.supervisor.prune(12);
         self.ensure_log_selection();
         self.expire_toasts(ctx.input(|i| i.time));
@@ -1977,6 +2421,7 @@ impl eframe::App for ManagerApp {
         match self.view {
             View::Machines => ui::cards::show(ctx, self, &mut actions),
             View::Disks => ui::disks::show(ctx, self, &mut actions),
+            View::Diagnostics => ui::diagnostics::show(ctx, self, &mut actions),
         }
         ui::dialogs::show(ctx, self, &mut actions);
         ui::toasts::show(ctx, &self.toasts, &mut actions);
