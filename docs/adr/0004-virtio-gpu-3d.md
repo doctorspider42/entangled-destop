@@ -279,6 +279,28 @@ The demonstration is a test, not a story: `gpu_remote.rs` spawns a real helper
 process, drives 3D through it, `SIGKILL`s it mid-flight, and asserts the device
 survives, releases what it held, refuses 3D in band and still serves 2D.
 
+**Demonstrated end to end** (2026-08-20, WSLg): the Ubuntu Desktop live session
+booted with `virgl_isolation = "process"`, composited on virgl at ~30 fps for a
+minute, and then its renderer process was `kill -9`'d under load. The log:
+
+```
+ERROR virtio_gpu::remote::client: the isolated 3D renderer died; the VM keeps
+      running and virtio-gpu degrades to 2D (ADR-0004 GPU-012)
+      pid=14214 status=Some(ExitStatus(unix_wait_status(9)))
+      error=the renderer process closed the connection
+ERROR virtio_gpu::device: the host 3D renderer is gone; virtio-gpu has degraded
+      to 2D for this VM … The VM itself is unaffected
+ERROR virtio_core::state: device failed to process a queue notification
+      … error=the host 3D renderer was lost; virtio-gpu degraded to 2D
+```
+
+Thirty-seven seconds later the guest had rebuilt its scanout out of
+`RESOURCE_CREATE_2D` resources (`scanout set … three_d=false`) and kept
+presenting; the VM ran on for another two and a half minutes and shut down
+cleanly on its own. A screenshot taken ~170 s *after* the kill shows a live,
+fully composited GNOME session. In-process, this same event is a SIGSEGV that
+ends the VM.
+
 One bound isolation *adds*, and therefore has to name: a shadow backing is host
 memory the in-process renderer would never have allocated (there, a backing is
 guest RAM the guest already paid for). `REMOTE_MAX_BACKING` (64 MiB) bounds one
