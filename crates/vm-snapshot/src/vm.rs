@@ -84,15 +84,31 @@ fn human(bytes: u64) -> String {
 /// it is the caller's contract, and `vmm_core::Lifecycle::save` is what
 /// establishes it.
 pub fn save<M: GuestMemory>(path: &Path, mem: &M, request: SaveRequest<'_>) -> Result<SaveReport> {
+    let partial = partial_path(path);
+    let outcome = save_partial(path, &partial, mem, request);
+    if outcome.is_err() {
+        // A failed suspend must not leave a `.part` beside the snapshot it did
+        // not replace: the next one would overwrite it anyway, but a stray file
+        // named after a VM invites somebody to try to restore it.
+        let _ = std::fs::remove_file(&partial);
+    }
+    outcome
+}
+
+fn save_partial<M: GuestMemory>(
+    path: &Path,
+    partial: &Path,
+    mem: &M,
+    request: SaveRequest<'_>,
+) -> Result<SaveReport> {
     let started = Instant::now();
     // Written beside the target and renamed at the end. A suspend that is
     // interrupted — a full disk, a killed process, a host that loses power —
     // must not leave a half-written file where a snapshot is supposed to be:
     // the digests would catch it on the way back in, but only after the user
     // had already lost the VM the file was replacing.
-    let partial = partial_path(path);
     let file =
-        std::fs::File::create(&partial).map_err(SnapshotError::io("creating the snapshot"))?;
+        std::fs::File::create(partial).map_err(SnapshotError::io("creating the snapshot"))?;
     // Best effort, and only ever a space optimisation: the memory section skips
     // zero pages outright, so the file is small either way. Marking it sparse
     // is what keeps NTFS from committing clusters for the header the writer
@@ -139,7 +155,7 @@ pub fn save<M: GuestMemory>(path: &Path, mem: &M, request: SaveRequest<'_>) -> R
     file.sync_all()
         .map_err(SnapshotError::io("making the snapshot durable"))?;
     drop(file);
-    std::fs::rename(&partial, path).map_err(SnapshotError::io("publishing the snapshot"))?;
+    std::fs::rename(partial, path).map_err(SnapshotError::io("publishing the snapshot"))?;
 
     Ok(SaveReport {
         bytes,

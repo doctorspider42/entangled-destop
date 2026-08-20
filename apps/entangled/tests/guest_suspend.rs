@@ -10,12 +10,15 @@
 //! Three things are asserted, and each one fails differently if the restore is
 //! wrong:
 //!
-//! * **The same boot.** `uptime -s` is the wall-clock instant the kernel
-//!   started, computed from the monotonic clock. If the machine had rebooted, or
-//!   if the guest's timekeeping came back wrong, this moves.
+//! * **The same boot.** `/proc/sys/kernel/random/boot_id` is a UUID the kernel
+//!   generates once per boot. It cannot coincide, and — unlike `uptime -s` — it
+//!   is not affected by the wall clock moving, which across a suspend it does by
+//!   design. `/proc/uptime` beside it proves the monotonic clock carried on
+//!   rather than restarting.
 //! * **The same login session.** The resumed console is at a *shell prompt*, not
-//!   a login prompt, and `history` still holds the marker typed before the
-//!   suspend. A guest that re-ran its getty would have neither.
+//!   a login prompt; the shell answering has the same pid; and `history` still
+//!   holds the marker typed before the suspend. A guest that re-ran its getty
+//!   would have none of the three.
 //! * **It survives.** The resumed VM is asked to power off through systemd and
 //!   ACPI, and does — which means the kernel is not merely alive but able to run
 //!   its whole shutdown path minutes after being restored.
@@ -65,6 +68,27 @@ const PASSWORD_PROMPT: &str = "assword:";
 /// Typed into the shell before the suspend, and looked for in `history` after
 /// it. The marker is deliberately not a word any boot message contains.
 const HISTORY_MARKER: &str = "ENTANGLED_SUSPEND_WITNESS_42";
+
+/// Prefix of the guest's identity line.
+///
+/// Split across a `""` in the command that produces it, so the **echo** of the
+/// command reads `SUSPEND""PROBE` and only the command's *output* reads
+/// `SUSPENDPROBE`. Without that, a reader looking for the answer finds the
+/// question first.
+const PROBE_TAG: &str = "SUSPENDPROBE";
+
+/// The command that prints it.
+///
+/// `boot_id` rather than `uptime -s`: it is a UUID the kernel generates once per
+/// boot, so it cannot coincide, and it is not affected by the wall clock moving
+/// (which it does across a suspend, by design). `/proc/uptime` beside it proves
+/// the monotonic clock carried on rather than restarting.
+const PROBE_COMMAND: &str = concat!(
+    "echo \"SUSPEND\"\"PROBE",
+    " boot=$(cat /proc/sys/kernel/random/boot_id)",
+    " up=$(cut -d\" \" -f1 /proc/uptime)",
+    " shell=$$\""
+);
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -248,8 +272,14 @@ fn log_in(vm: &mut Vm, user: &str, password: &str, shell_prompt: &str) -> Result
     Ok(())
 }
 
-/// Runs `command` in the guest's shell and returns the line that follows the
-/// echoed command — which is its output, for the one-line commands used here.
+/// Runs `command` in the guest's shell and returns everything the console
+/// gained, prompt decorations and all.
+///
+/// Deliberately *not* "the output": a modern bash wraps every prompt and every
+/// command in OSC escape sequences (Ubuntu 26.04 emits `OSC 3008` with a fresh
+/// UUID per command), so anything that tried to isolate one line would be
+/// comparing shell bookkeeping. The callers look for a tagged marker inside the
+/// text instead, which is immune to all of it.
 fn run(vm: &mut Vm, command: &str, shell_prompt: &str) -> Result<String, String> {
     let before = vm.console().len();
     let seen = vm.count(shell_prompt);
@@ -257,20 +287,40 @@ fn run(vm: &mut Vm, command: &str, shell_prompt: &str) -> Result<String, String>
     if !vm.wait_for_more(shell_prompt, seen, PROMPT_DEADLINE) {
         return Err(format!("`{command}` never came back to a prompt"));
     }
-    let tail = vm.console()[before..].to_string();
-    // The echo of the command comes first; everything between it and the next
-    // prompt is the output.
-    let after_echo = match tail.find(command) {
-        Some(at) => &tail[at + command.len()..],
-        None => &tail[..],
-    };
-    Ok(after_echo
+    Ok(vm.console()[before..].to_string())
+}
+
+/// The guest's identity: its boot id, its monotonic uptime and the pid of the
+/// shell that is answering.
+#[derive(Debug, Clone, PartialEq)]
+struct Probe {
+    boot_id: String,
+    uptime: f64,
+    shell_pid: String,
+}
+
+fn probe(vm: &mut Vm, shell_prompt: &str) -> Result<Probe, String> {
+    let text = run(vm, PROBE_COMMAND, shell_prompt)?;
+    // The *last* untagged occurrence: the echo of the command carries
+    // `SUSPEND""PROBE`, which does not match.
+    let line = text
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.contains(shell_prompt))
-        .map(str::to_string)
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .filter(|line| line.contains(PROBE_TAG))
+        .filter(|line| !line.contains("\"\""))
+        .next_back()
+        .ok_or_else(|| format!("the guest did not answer the probe; console said:\n{text}"))?;
+    let field = |key: &str| -> Option<String> {
+        line.split_whitespace()
+            .find_map(|word| word.strip_prefix(key))
+            .map(|value| value.trim_end_matches(['"', '\r']).to_string())
+    };
+    Ok(Probe {
+        boot_id: field("boot=").ok_or("no boot id in the probe line")?,
+        uptime: field("up=")
+            .and_then(|value| value.parse().ok())
+            .ok_or("no uptime in the probe line")?,
+        shell_pid: field("shell=").ok_or("no shell pid in the probe line")?,
+    })
 }
 
 /// **The acceptance.** An installed Ubuntu, suspended mid-session, comes back
@@ -311,18 +361,24 @@ fn an_installed_ubuntu_suspends_and_resumes_as_the_same_session() {
         );
     }
     step("recording the session's identity");
-    let boot_time = run(&mut vm, "uptime -s", &shell_prompt).expect("uptime -s");
-    let uptime_before = guest_uptime(&mut vm, &shell_prompt);
+    let before = match probe(&mut vm, &shell_prompt) {
+        Ok(before) => before,
+        Err(error) => {
+            let console = vm.kill();
+            panic!(
+                "{error}; console: {}",
+                save_console("probe", &console).display()
+            );
+        }
+    };
     // A command whose only purpose is to be in `history` afterwards.
     let _ = run(&mut vm, &format!("echo {HISTORY_MARKER}"), &shell_prompt);
     eprintln!(
-        "[guest_suspend] booted at {boot_time:?}, {uptime_before:.0}s of uptime, \
-         after {:?}",
+        "[guest_suspend] boot {} , {:.0}s of uptime, shell pid {}, after {:?}",
+        before.boot_id,
+        before.uptime,
+        before.shell_pid,
         started.elapsed()
-    );
-    assert!(
-        !boot_time.is_empty(),
-        "the guest did not answer `uptime -s`"
     );
 
     // -------------------------------------------------------------- suspend
@@ -380,8 +436,16 @@ fn an_installed_ubuntu_suspends_and_resumes_as_the_same_session() {
     eprintln!("[guest_suspend] the resumed guest answered in {resume_took:?}");
 
     // ----------------------------------------------------- the same session
-    let boot_time_after = run(&mut vm, "uptime -s", &shell_prompt).expect("uptime -s");
-    let uptime_after = guest_uptime(&mut vm, &shell_prompt);
+    let after = match probe(&mut vm, &shell_prompt) {
+        Ok(after) => after,
+        Err(error) => {
+            let console = vm.kill();
+            panic!(
+                "{error}; console: {}",
+                save_console("resumed-probe", &console).display()
+            );
+        }
+    };
     let history = run(&mut vm, "history 20", &shell_prompt).unwrap_or_default();
 
     // A login prompt in the *resumed* process would mean the getty ran again.
@@ -397,19 +461,31 @@ fn an_installed_ubuntu_suspends_and_resumes_as_the_same_session() {
     let saved = save_console("resumed", &console);
 
     eprintln!(
-        "[guest_suspend] boot time before {boot_time:?}, after {boot_time_after:?}; \
-         uptime {uptime_before:.0}s -> {uptime_after:.0}s; total {:?}; console: {}",
+        "[guest_suspend] boot {} -> {}, shell pid {} -> {}, uptime {:.0}s -> {:.0}s; \
+         total {:?}; console: {}",
+        before.boot_id,
+        after.boot_id,
+        before.shell_pid,
+        after.shell_pid,
+        before.uptime,
+        after.uptime,
         started.elapsed(),
         saved.display()
     );
 
     assert_eq!(
-        boot_time_after, boot_time,
-        "the resumed guest is a different boot"
+        after.boot_id, before.boot_id,
+        "the resumed guest is a different boot: its kernel generated a new boot id"
+    );
+    assert_eq!(
+        after.shell_pid, before.shell_pid,
+        "the resumed guest is answering from a different shell, so the session did not survive"
     );
     assert!(
-        uptime_after >= uptime_before,
-        "the resumed guest's uptime went backwards: {uptime_before} -> {uptime_after}"
+        after.uptime >= before.uptime,
+        "the resumed guest's monotonic clock went backwards: {} -> {}",
+        before.uptime,
+        after.uptime
     );
     assert_eq!(
         logins_after_resume, 0,
@@ -426,16 +502,4 @@ fn an_installed_ubuntu_suspends_and_resumes_as_the_same_session() {
         saved.display()
     );
     let _ = std::fs::remove_file(&snapshot);
-}
-
-/// `/proc/uptime`'s first field, in seconds.
-fn guest_uptime(vm: &mut Vm, shell_prompt: &str) -> f64 {
-    run(vm, "cat /proc/uptime", shell_prompt)
-        .ok()
-        .and_then(|line| {
-            line.split_whitespace()
-                .next()
-                .and_then(|first| first.parse::<f64>().ok())
-        })
-        .unwrap_or(0.0)
 }

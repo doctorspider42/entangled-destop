@@ -36,7 +36,7 @@ mod gpu_renderer {
     }
 }
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -117,6 +117,16 @@ enum Command {
         /// resume <file>` brings it back.
         #[arg(long, value_name = "FILE")]
         snapshot: Option<PathBuf>,
+    },
+    /// Read a snapshot file without starting anything.
+    ///
+    /// What it is of, when it was taken, how big, what it contains, which
+    /// disks it is pinned to and whether this machine could restore it. Opens
+    /// no disk and allocates no guest memory, so it answers for a snapshot from
+    /// the other hypervisor too — it says so instead of failing.
+    Snapshot {
+        /// The snapshot file.
+        snapshot: PathBuf,
     },
     /// Bring a suspended VM back from its snapshot file (ADR-0006).
     ///
@@ -324,6 +334,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 ))
             }
         }
+        Command::Snapshot { snapshot } => inspect_snapshot(&snapshot),
         Command::Resume {
             snapshot,
             headless,
@@ -387,6 +398,85 @@ fn run(cli: Cli) -> Result<(), String> {
             }
         }
     }
+}
+
+/// `entangled snapshot <file>` (ADR-0006).
+///
+/// The read-only view, and the same one `entangled-manager` gets by calling
+/// `vm_snapshot::inspect` directly: a snapshot is a file somebody may have to
+/// reason about long after the VM that made it is gone, and needing to start
+/// one to find out what is in it would be a poor answer.
+fn inspect_snapshot(path: &Path) -> Result<(), String> {
+    let info = vm_snapshot::inspect(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let meta = &info.metadata;
+    println!("{}", path.display());
+    println!("  vm             {}", meta.vm_name);
+    println!(
+        "  taken          {} (unix {})",
+        format_unix(meta.created_unix),
+        meta.created_unix
+    );
+    println!("  written by     {}", meta.writer);
+    println!("  host           {}", info.host.as_str());
+    println!(
+        "  machine        {} vCPU(s), {} of RAM, {} transport, {} boot",
+        meta.shape.vcpus,
+        disk_image::format_bytes(meta.shape.memory_bytes),
+        meta.shape.transport,
+        meta.shape.boot_mode
+    );
+    println!("  file           {}", disk_image::format_bytes(info.file_bytes));
+    match info.restorable_here {
+        true => println!("  restorable     yes, on this machine"),
+        false => println!(
+            "  restorable     no — {}",
+            info.refusal.as_deref().unwrap_or("unknown reason")
+        ),
+    }
+
+    println!("  devices        {}", meta.shape.devices.len());
+    for device in &meta.shape.devices {
+        println!(
+            "    slot {:<2}      virtio type {}",
+            device.slot, device.device_type
+        );
+    }
+    println!("  files          {}", meta.files.len());
+    for file in &meta.files {
+        // Checked live, so this doubles as "would a restore be refused today?".
+        let status = match file.check() {
+            Ok(None) => "unchanged".to_string(),
+            Ok(Some(note)) => format!("changed (advisory): {note}"),
+            Err(error) => format!("CHANGED: {error}"),
+        };
+        println!(
+            "    {:<10} {} — {}",
+            file.role.as_str(),
+            file.path.display(),
+            status
+        );
+    }
+    println!("  sections       {}", info.sections.len());
+    for section in &info.sections {
+        println!(
+            "    {:<14} [{}] {}",
+            section.kind.as_str(),
+            section.instance,
+            disk_image::format_bytes(section.bytes)
+        );
+    }
+    Ok(())
+}
+
+/// A Unix timestamp as `YYYY-MM-DD HH:MM:SS` UTC, using the same civil-date
+/// arithmetic the RTC does — no date crate in the graph, and none needed for
+/// one line of output.
+fn format_unix(seconds: i64) -> String {
+    let t = machine_x86::rtc::civil_from_unix(seconds);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
 }
 
 /// `entangled resume <file>` (ADR-0006).

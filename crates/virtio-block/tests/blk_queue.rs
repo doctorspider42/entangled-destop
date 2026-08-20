@@ -333,6 +333,94 @@ impl Drop for Harness {
 
 // ===================================================== well-behaved driver
 
+/// **virtio-blk holds nothing once it has been kicked** — the property a
+/// suspend depends on (ADR-0006).
+///
+/// Every request is served inside `notify`: the chain is walked, the file read
+/// or written, the used entry added and the interrupt signalled before it
+/// returns. So a device that has been notified has no in-flight list to drain,
+/// and a snapshot taken at that moment loses nothing.
+///
+/// Asserted as a property rather than believed as a comment, because the whole
+/// suspend design rests on it: three requests are posted at once, one kick is
+/// delivered, and afterwards the device's own position must have reached the
+/// driver's — `next_avail == avail.idx` (it consumed everything the guest
+/// posted) and `next_used == used.idx` (it completed everything it consumed).
+/// A device that had deferred any of them would fail both.
+#[test]
+fn nothing_is_in_flight_once_notify_returns() {
+    use virtio_core::QueuePosition;
+
+    let mut h = Harness::new(true);
+    // Three independent chains, posted before a single kick — the shape a busy
+    // guest produces and the one where deferral would be tempting.
+    let mut heads = Vec::new();
+    let mut next_desc = 0u16;
+    for request in 0..3u16 {
+        let header = BUF_BASE + u64::from(request) * 0x1000;
+        let data = header + 0x100;
+        let status = header + 0x400;
+        h.write_header(header, T_OUT, u64::from(request));
+        h.write_mem(data, &[0xa0 + request as u8; SECTOR_SIZE as usize]);
+        h.write_mem(status, &[0xff]);
+
+        let head = next_desc;
+        let descs = [
+            (header, 16u32, 0u16),
+            (data, SECTOR_SIZE as u32, 0),
+            (status, 1, VIRTQ_DESC_F_WRITE),
+        ];
+        for (i, &(addr, len, flags)) in descs.iter().enumerate() {
+            let index = head + i as u16;
+            let last = i == descs.len() - 1;
+            let (flags, next) = if last {
+                (flags, 0)
+            } else {
+                (flags | VIRTQ_DESC_F_NEXT, index + 1)
+            };
+            h.ring.write_desc(&h.mem, index, addr, len, flags, next);
+        }
+        h.ring.publish(&h.mem, head);
+        heads.push(head);
+        next_desc += descs.len() as u16;
+    }
+
+    let avail = h.ring.avail_idx(&h.mem);
+    assert_eq!(avail, 3, "the test posted three chains");
+
+    // One kick for all three.
+    h.notify();
+
+    let used = h.ring.used_idx(&h.mem);
+    assert_eq!(used, 3, "the device left {} of 3 requests unanswered", 3 - used);
+    for (slot, &head) in heads.iter().enumerate() {
+        let (reported, _) = h.ring.used_elem(&h.mem, slot as u16);
+        assert_eq!(reported as u16, head, "used entry {slot} names the wrong chain");
+    }
+
+    // The device's own position, through the same `save` a suspend uses.
+    let saved = h.transport.save();
+    assert_eq!(saved.queues.len(), 1, "virtio-blk has one queue");
+    assert_eq!(
+        saved.queues[0].position,
+        QueuePosition {
+            next_avail: avail,
+            next_used: used,
+        },
+        "the device is still holding chains after notify returned"
+    );
+
+    // And every status byte was written, so "completed" means completed.
+    for request in 0..3u64 {
+        let status = BUF_BASE + request * 0x1000 + 0x400;
+        assert_eq!(
+            h.read_mem(status, 1)[0],
+            S_OK,
+            "request {request} did not report a status"
+        );
+    }
+}
+
 #[test]
 fn advertises_capacity_and_features() {
     let mut h = Harness::new(true);
