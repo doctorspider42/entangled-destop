@@ -29,7 +29,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use virtio_core::GuestMem;
+use virtio_core::{GuestMem, HostWaker};
 
 use crate::error::CommandError;
 use crate::protocol::{Box3d, MemEntry, Rect, ResourceCreate3d, Transfer3d};
@@ -71,6 +71,20 @@ pub const MAX_3D_SAMPLES: u32 = 32;
 /// 4-byte formats it is ~4 GiB of host allocations. True VRAM accounting is
 /// the renderer's (GPU-012 recovery is phase 2).
 pub const MAX_TOTAL_3D_ELEMENTS: u64 = 1 << 30;
+
+/// Whether a host fence created by [`Renderer3d::create_fence`] retires
+/// later or is already past (ADR-0004 phase 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceOutcome {
+    /// The renderer completes fences synchronously (or could not create an
+    /// asynchronous one): everything the fence covers is already done, and
+    /// the device answers the command immediately — phase 1's model.
+    Signalled,
+    /// The fence will retire later; the device defers the response and
+    /// learns of retirement through [`Renderer3d::poll_fences`], woken by
+    /// the renderer via the installed [`HostWaker`].
+    Pending,
+}
 
 /// One capability set the renderer serves (`GET_CAPSET_INFO`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +200,101 @@ pub trait Renderer3d: Send {
     /// Drops every context and resource (device reset). Must be infallible
     /// and leave the renderer usable for a fresh driver.
     fn reset(&mut self);
+
+    // ------------------------------------------- fences (ADR-0004 phase 2)
+
+    /// Hands the renderer the device's [`HostWaker`], which it may use to ask
+    /// for a [`Self::poll_fences`] call from the device's worker context.
+    ///
+    /// A renderer that gets no waker (or is given one that cannot deliver)
+    /// must keep answering [`Self::create_fence`] with
+    /// [`FenceOutcome::Signalled`] — i.e. stay on phase 1's synchronous
+    /// model — because nothing would ever complete a deferred response.
+    fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
+        let _ = waker;
+    }
+
+    /// Creates host fence `fence_id` on `ctx_id`'s timeline, covering
+    /// everything submitted to that context so far.
+    ///
+    /// [`FenceOutcome::Signalled`] means the work is already done and the
+    /// device answers the command now. [`FenceOutcome::Pending`] means the
+    /// device holds the response back until the id shows up in
+    /// [`Self::poll_fences`] — so a renderer may only return `Pending` when
+    /// it can actually drive that completion (a live poll source *and* a
+    /// waker).
+    ///
+    /// The default is phase 1's behaviour: nothing is ever deferred.
+    fn create_fence(&mut self, ctx_id: u32, fence_id: u32) -> Result<FenceOutcome, CommandError> {
+        let _ = (ctx_id, fence_id);
+        Ok(FenceOutcome::Signalled)
+    }
+
+    /// Retires whatever host fences are done and returns their ids, oldest
+    /// first. Must never block.
+    ///
+    /// `still_pending` is how many fenced responses the *device* is still
+    /// holding, which is advisory: a renderer that runs a monitor thread uses
+    /// it to stop polling once nothing is waiting any more (the device is the
+    /// authority, because its watchdog may have given up on a fence the
+    /// renderer still believes in).
+    fn poll_fences(&mut self, still_pending: usize) -> Vec<u32> {
+        let _ = still_pending;
+        Vec::new()
+    }
+
+    // -------------------------------- zero-copy scanout (ADR-0004 phase 2)
+
+    /// Exports the scanout resource as a host dmabuf, when the renderer has a
+    /// real DRM device behind it and the resource is exportable.
+    ///
+    /// `None` — the default, and what every renderer on a host without
+    /// `/dev/dri` returns — means the presentation path keeps using
+    /// [`Self::read_rect_bgra`]. Runtime feature detection, never a compile
+    /// time fork (ADR-0004 phase 2).
+    fn export_scanout(&mut self, resource_id: u32) -> Option<ScanoutExport> {
+        let _ = resource_id;
+        None
+    }
+
+    // ------------------------- crash containment (ADR-0004 phase 2, GPU-012)
+
+    /// Whether the renderer is still able to execute commands.
+    ///
+    /// A renderer that isolates the host GL stack (out-of-process) reports
+    /// `false` once that isolation has been breached — its worker died — and
+    /// the device then degrades the VM to 2D instead of failing every
+    /// command forever. In-process renderers are alive until dropped.
+    fn is_alive(&self) -> bool {
+        true
+    }
+}
+
+/// A scanout resource exported for zero-copy presentation
+/// ([`Renderer3d::export_scanout`]).
+///
+/// Deliberately *not* an OS handle in the portable part of the crate: the
+/// only thing the device does with an export is hand it to the
+/// [`crate::ScanoutSink`], and the only implementation that can import one is
+/// the Linux/EGL presentation path. The handle itself travels in
+/// [`Self::dmabuf`], which is a plain file descriptor number on Linux and
+/// never constructed anywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanoutExport {
+    /// The exported dmabuf, as a raw fd. Owned by the renderer: the importer
+    /// must not close it, and it stays valid until the resource is unref'd or
+    /// re-exported.
+    pub dmabuf: i32,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per row of the exported image, which is the *host GPU's* stride
+    /// and need not equal `width * 4`.
+    pub stride: u32,
+    /// DRM `fourcc` of the exported plane (`DRM_FORMAT_XRGB8888` and
+    /// `ARGB8888` are the two the scanout path accepts).
+    pub fourcc: u32,
+    /// DRM format modifier (tiling/compression). `0` is linear.
+    pub modifier: u64,
 }
 
 /// Structural validation of a `SUBMIT_3D` stream (GPU-007).
@@ -529,6 +638,48 @@ impl Gpu3d {
             });
         }
         self.renderer.read_rect_bgra(resource_id, rect, out)
+    }
+
+    /// `VIRTIO_GPU_FLAG_FENCE` on a command that reached the renderer: create
+    /// the host fence and say whether the response may go out now
+    /// (ADR-0004 phase 2).
+    ///
+    /// The context is validated here for the same reason every other 3D
+    /// command validates it — a fence on a context the guest never created is
+    /// a guest error, not something to hand to the renderer.
+    pub fn create_fence(
+        &mut self,
+        ctx_id: u32,
+        fence_id: u32,
+    ) -> Result<FenceOutcome, CommandError> {
+        if ctx_id != 0 && !self.contexts.contains(&ctx_id) {
+            return Err(CommandError::UnknownContext(ctx_id));
+        }
+        self.renderer.create_fence(ctx_id, fence_id)
+    }
+
+    /// Host fences that have retired since the last call, oldest first.
+    pub fn poll_fences(&mut self, still_pending: usize) -> Vec<u32> {
+        self.renderer.poll_fences(still_pending)
+    }
+
+    /// Installs the device's host waker on the renderer.
+    pub fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
+        self.renderer.set_host_waker(waker);
+    }
+
+    /// Zero-copy export of a scanout resource, when the host can do it.
+    pub fn export_scanout(&mut self, resource_id: u32) -> Option<ScanoutExport> {
+        if !self.resources.contains_key(&resource_id) {
+            return None;
+        }
+        self.renderer.export_scanout(resource_id)
+    }
+
+    /// False once the host renderer has been lost (GPU-012): the device then
+    /// degrades to 2D instead of failing every 3D command for ever.
+    pub fn is_alive(&self) -> bool {
+        self.renderer.is_alive()
     }
 
     /// Device reset: drop every context and resource, renderer included.

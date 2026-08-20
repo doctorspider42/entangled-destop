@@ -36,21 +36,25 @@
 //! guest value.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use virtio_core::chain::{self, Segment};
-use virtio_core::device::{DeviceError, DeviceResources, DeviceType, VirtioDevice};
+use virtio_core::device::{DeviceError, DeviceResources, DeviceType, HostWaker, VirtioDevice};
 use virtio_core::interrupt::Interrupt;
 use virtio_core::{GuestMem, MAX_QUEUE_SIZE, VIRTIO_F_VERSION_1};
 use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress};
 
 use crate::error::CommandError;
+use crate::fence::{FenceQueue, MAX_PENDING_FENCES};
+use crate::pacing::FramePacing;
 use crate::protocol::{
     capset_info_body, cmd, config_bytes, display_info_body, edid_body, resp, AttachBacking,
     CmdSubmit3d, CtrlHdr, CtxCreate, CtxResource, DisplayOne, GetCapset, GetCapsetInfo, GetEdid,
     MemEntry, Rect, ResourceCreate2d, ResourceCreate3d, ResourceFlush, ResourceUnref, SetScanout,
     Transfer3d, TransferToHost2d, UpdateCursor, CONFIG_LEN, MEM_ENTRY_LEN,
 };
+use crate::renderer::FenceOutcome;
 use crate::renderer::{Gpu3d, Renderer3d, MAX_SUBMIT_BYTES};
 use crate::resource::{ResourceTable, MAX_BACKING_ENTRIES};
 use crate::sink::ScanoutSink;
@@ -90,6 +94,144 @@ const _: () = assert!(MAX_COMMAND_BYTES_3D > MAX_COMMAND_BYTES);
 /// Hard bound on how many chains one notification processes, so a guest that
 /// keeps refilling the ring from another vCPU cannot pin this thread forever.
 pub const CHAINS_PER_NOTIFY: usize = 4 * MAX_QUEUE_SIZE as usize;
+
+/// How long a deferred fenced response may wait for its host fence before the
+/// device gives up and answers anyway (ADR-0004 phase 2's no-wedge rule).
+///
+/// A fence that never retires means the host GL stack is wedged or gone; the
+/// guest must not inherit that. Two seconds is far past any plausible frame
+/// (a 60 Hz compositor's fences retire in ~16 ms, a heavy shader compile in
+/// tens of ms) and far below the guest's own DRM timeouts, so a timeout here
+/// is always a host fault worth logging.
+pub const FENCE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Environment variable that forces a fence mode, for the phase-2 before/after
+/// measurement and for a host where deferral misbehaves. Read by the app
+/// layer (`entangled run`), the same way `ENTANGLED_QUEUE_NOTIFY` is.
+pub const FENCE_MODE_ENV: &str = "ENTANGLED_GPU_FENCES";
+
+/// Whether fenced responses may be deferred (ADR-0004 phase 2) or complete as
+/// soon as the command executes (phase 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FenceMode {
+    /// Hold the response until the host fence retires — the default, and the
+    /// whole point of phase 2.
+    #[default]
+    Deferred,
+    /// Answer immediately, as phase 1 did. Spec-legal (the command *has*
+    /// executed), it just gives the guest no pipelining — which is exactly
+    /// what makes it the baseline to measure against.
+    Synchronous,
+}
+
+impl FenceMode {
+    /// Reads [`FENCE_MODE_ENV`]; anything unrecognised keeps the default.
+    pub fn from_env() -> Self {
+        match std::env::var(FENCE_MODE_ENV) {
+            Ok(value) => Self::parse(&value).unwrap_or_else(|| {
+                tracing::warn!(
+                    var = FENCE_MODE_ENV,
+                    value = %value,
+                    "unrecognised virtio-gpu fence mode, using the default"
+                );
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Parses the accepted spellings; `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("deferred") || value.eq_ignore_ascii_case("async") {
+            Some(Self::Deferred)
+        } else if value.eq_ignore_ascii_case("sync") || value.eq_ignore_ascii_case("synchronous") {
+            Some(Self::Synchronous)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_deferred(self) -> bool {
+        matches!(self, Self::Deferred)
+    }
+}
+
+/// The 3D commands whose fences are worth deferring: the ones that put work
+/// on the host GL timeline.
+///
+/// Everything else a guest may fence (capset queries, resource creation,
+/// scanout binding) either touches no timeline or — like `RESOURCE_FLUSH` on
+/// the readback path — already finished synchronously by the time the
+/// response is built, so deferring it would add latency and no correctness.
+const FENCED_3D_COMMANDS: [u32; 3] = [
+    cmd::SUBMIT_3D,
+    cmd::TRANSFER_TO_HOST_3D,
+    cmd::TRANSFER_FROM_HOST_3D,
+];
+
+/// What [`GpuDevice::handle_command`] did with a chain.
+enum Served {
+    /// The response is written; `.0` bytes went into the used ring.
+    Done(u32),
+    /// The response is held in [`GpuDevice::pending_fences`] until the host
+    /// fence retires, so the chain must *not* be returned to the used ring
+    /// yet.
+    Deferred,
+}
+
+/// A response waiting for its host fence (ADR-0004 phase 2).
+///
+/// It carries a *snapshot* of the chain's device-writable segments rather
+/// than re-walking the descriptor table at completion time: the guest owns
+/// that table and may have rewritten it since, and a device that answers into
+/// wherever the descriptors point *now* would let a guest redirect its own
+/// completion. The walk that produced these segments was bounded by
+/// `MAX_DESC_CHAIN_LEN`, so the snapshot is too.
+struct PendingResponse {
+    head: u16,
+    writable: Vec<Segment>,
+    hdr: CtrlHdr,
+    body: Vec<u8>,
+}
+
+/// Counters for the fence path: diagnostics, and the evidence for phase 2's
+/// before/after measurement.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FenceStats {
+    /// Fenced responses that were held back for a host fence.
+    pub deferred: u64,
+    /// Deferred responses completed by a retiring host fence.
+    pub retired: u64,
+    /// Fenced commands answered immediately because the renderer completes
+    /// fences synchronously (phase 1's model, and every 2D device).
+    pub synchronous: u64,
+    /// Fenced commands answered immediately because
+    /// [`MAX_PENDING_FENCES`] were already outstanding — the guest asked for
+    /// more in-flight fences than the host will hold.
+    pub over_cap: u64,
+    /// Deferred responses completed by [`FENCE_TIMEOUT`] instead of by a
+    /// fence. Non-zero means the host renderer stalled or died.
+    pub timed_out: u64,
+    /// Deepest the pending table has been.
+    pub peak_pending: usize,
+    /// Summed host-fence wait of every retired response, in microseconds —
+    /// with `retired`, the mean time the guest spent pipelined behind the
+    /// host GPU instead of blocked on it.
+    pub wait_us_total: u64,
+    /// Longest single host-fence wait, in microseconds.
+    pub wait_us_max: u64,
+}
+
+impl FenceStats {
+    /// Mean host-fence wait of the responses that retired, in microseconds.
+    pub fn mean_wait_us(&self) -> u64 {
+        if self.retired == 0 {
+            return 0;
+        }
+        self.wait_us_total / self.retired
+    }
+}
 
 /// What the guest bound to scanout 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +297,27 @@ pub struct GpuDevice<S: ScanoutSink> {
     flush_buf: Vec<u8>,
     /// Cursor-queue commands processed so far (MVP-812), for diagnostics.
     cursor_commands: u64,
+    /// Fenced responses held back for the host renderer (ADR-0004 phase 2).
+    /// Always empty on a 2D device and on a renderer that fences
+    /// synchronously.
+    pending_fences: FenceQueue<PendingResponse>,
+    fence_stats: FenceStats,
+    /// Watchdog deadline for a deferred response ([`FENCE_TIMEOUT`] unless
+    /// [`GpuDevice::set_fence_timeout`] changed it).
+    fence_timeout: Duration,
+    /// Whether fenced responses may be held back at all.
+    fence_mode: FenceMode,
+    /// Set when the host renderer has been found dead and the device has
+    /// degraded to 2D (GPU-012).
+    renderer_lost: bool,
+    /// Whether the driver has already been told about that loss, so
+    /// `DEVICE_NEEDS_RESET` is raised exactly once.
+    renderer_loss_reported: bool,
+    /// Frame-interval statistics of the scanout path (phase 2 measurement).
+    pacing: FramePacing,
+    /// The host waker the machine layer gave this device, kept so a renderer
+    /// attached later — and the crash-containment path — can use it.
+    waker: Option<Arc<dyn HostWaker>>,
 
     // Set on activate(), cleared on reset().
     mem: Option<Arc<GuestMem>>,
@@ -194,6 +357,14 @@ impl<S: ScanoutSink> GpuDevice<S> {
             req_buf: Vec::new(),
             flush_buf: Vec::new(),
             cursor_commands: 0,
+            pending_fences: FenceQueue::new(),
+            fence_stats: FenceStats::default(),
+            fence_timeout: FENCE_TIMEOUT,
+            fence_mode: FenceMode::default(),
+            renderer_lost: false,
+            renderer_loss_reported: false,
+            pacing: FramePacing::new(),
+            waker: None,
             mem: None,
             control: None,
             cursor: None,
@@ -266,20 +437,38 @@ impl<S: ScanoutSink> GpuDevice<S> {
     ) -> Result<(), DeviceError> {
         let desc_table = queue.desc_table();
         let queue_size = queue.size();
+        // `served` drives the interrupt (used-ring entries added); `taken`
+        // drives the budget (chains popped), and the two differ once a fenced
+        // chain is held back — a deferred chain has been taken off the
+        // available ring without being used yet.
         let mut served = 0usize;
+        let mut taken = 0usize;
+
+        // Fences first: a response the host renderer retired while the guest
+        // was busy frees a descriptor the guest may be waiting for, so
+        // completing before draining keeps the ring moving.
+        served += self.complete_fences(queue, mem)?;
 
         while let Some(head) = queue
             .pop_descriptor_chain(Arc::clone(mem))
             .map(|chain| chain.head_index())
         {
-            let written = self.handle_command(mem, desc_table, queue_size, head);
-            queue
-                .add_used(mem.as_ref(), head, written)
-                .map_err(|e| DeviceError::Queue(e.to_string()))?;
-            served += 1;
-            if served >= CHAINS_PER_NOTIFY {
+            taken += 1;
+            match self.handle_command(mem, desc_table, queue_size, head) {
+                Served::Done(written) => {
+                    queue
+                        .add_used(mem.as_ref(), head, written)
+                        .map_err(|e| DeviceError::Queue(e.to_string()))?;
+                    served += 1;
+                }
+                // The chain stays out of the used ring until its fence
+                // retires; `complete_fences` puts it back.
+                Served::Deferred => (),
+            }
+            if taken >= CHAINS_PER_NOTIFY {
                 tracing::warn!(
                     served,
+                    taken,
                     "virtio-gpu controlq notification budget exhausted; deferring the rest"
                 );
                 break;
@@ -292,6 +481,15 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 .map_err(|e| DeviceError::Queue(e.to_string()))?
         {
             interrupt.signal_used_queue(CONTROL_QUEUE)?;
+        }
+        // Reported only after the guest has its completions and its
+        // interrupt: this makes the transport set `DEVICE_NEEDS_RESET`, and a
+        // driver that acts on it must still find the chains it was owed.
+        if self.renderer_lost && !self.renderer_loss_reported {
+            self.renderer_loss_reported = true;
+            return Err(DeviceError::Backend(
+                "the host 3D renderer was lost; virtio-gpu degraded to 2D".into(),
+            ));
         }
         Ok(())
     }
@@ -476,8 +674,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
             .map_err(|error| CommandError::Display(error.to_string()))
     }
 
-    /// Handles one control chain. Returns the number of bytes written into
-    /// device-writable buffers, which is what goes into the used ring.
+    /// Handles one control chain: either writes the response (and reports how
+    /// many bytes went into the used ring) or defers it until a host fence
+    /// retires (ADR-0004 phase 2).
     ///
     /// Never returns an error: see the module-level failure policy.
     fn handle_command(
@@ -486,19 +685,19 @@ impl<S: ScanoutSink> GpuDevice<S> {
         desc_table: u64,
         queue_size: u16,
         head: u16,
-    ) -> u32 {
+    ) -> Served {
         let segments = match chain::walk(mem, desc_table, queue_size, head) {
             Ok(segments) => segments,
             Err(error) => {
                 tracing::warn!(head, %error, "dropping malformed virtio-gpu descriptor chain");
-                return 0;
+                return Served::Done(0);
             }
         };
         let (readable, writable) = match chain::split_rw(&segments) {
             Ok(split) => split,
             Err(error) => {
                 tracing::warn!(head, %error, "dropping virtio-gpu chain");
-                return 0;
+                return Served::Done(0);
             }
         };
         let capacity: u64 = writable.iter().map(|s| u64::from(s.len)).sum();
@@ -508,7 +707,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 capacity,
                 "virtio-gpu chain has no room for a response header; dropping it"
             );
-            return 0;
+            return Served::Done(0);
         }
 
         // Gather the request into the reusable staging buffer. Taken out of
@@ -517,7 +716,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         let mut request = std::mem::take(&mut self.req_buf);
         request.clear();
         let gathered = gather_request(mem, readable, &mut request, self.max_command_bytes());
-        let (resp_hdr, body) = match gathered.and_then(|()| {
+        let (resp_hdr, body, fence) = match gathered.and_then(|()| {
             CtrlHdr::parse(&request).ok_or(CommandError::Truncated {
                 kind: 0,
                 len: request.len(),
@@ -526,7 +725,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
         }) {
             Ok(hdr) => {
                 let reply = self.dispatch(mem, &hdr, &request);
-                (hdr.response(reply.code), reply.body)
+                let fence = self.fence_for(&hdr, reply.code);
+                (hdr.response(reply.code), reply.body, fence)
             }
             Err(error) => {
                 tracing::warn!(head, %error, "unusable virtio-gpu request");
@@ -537,6 +737,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
                         ..CtrlHdr::default()
                     },
                     Vec::new(),
+                    None,
                 )
             }
         };
@@ -557,9 +758,280 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 kind: resp::ERR_UNSPEC,
                 ..resp_hdr
             };
-            return write_response(mem, writable, [&hdr.to_bytes(), &[]]);
+            return Served::Done(write_response(mem, writable, [&hdr.to_bytes(), &[]]));
         }
-        write_response(mem, writable, [&resp_hdr.to_bytes(), &body])
+
+        // A host fence is outstanding for this command: hold the response
+        // until it retires (ADR-0004 phase 2). Over the cap — or with no room
+        // recorded — the response goes out now, which is phase 1's model and
+        // strictly safer than pinning more chains.
+        if let Some(fence_id) = fence {
+            let pending = PendingResponse {
+                head,
+                writable: writable.to_vec(),
+                hdr: resp_hdr,
+                body,
+            };
+            match self.pending_fences.push(fence_id, pending) {
+                Ok(()) => {
+                    self.fence_stats.deferred = self.fence_stats.deferred.saturating_add(1);
+                    self.fence_stats.peak_pending =
+                        self.fence_stats.peak_pending.max(self.pending_fences.len());
+                    tracing::trace!(
+                        head,
+                        fence = fence_id,
+                        pending = self.pending_fences.len(),
+                        "virtio-gpu response deferred until its host fence retires"
+                    );
+                    return Served::Deferred;
+                }
+                Err(pending) => {
+                    self.fence_stats.over_cap = self.fence_stats.over_cap.saturating_add(1);
+                    tracing::warn!(
+                        head,
+                        fence = fence_id,
+                        cap = MAX_PENDING_FENCES,
+                        "virtio-gpu fence table is full; answering this fence synchronously"
+                    );
+                    return Served::Done(write_response(
+                        mem,
+                        writable,
+                        [&pending.hdr.to_bytes(), &pending.body],
+                    ));
+                }
+            }
+        }
+        Served::Done(write_response(mem, writable, [&resp_hdr.to_bytes(), &body]))
+    }
+
+    /// Whether this command's response must wait for a host fence, and on
+    /// which fence id (ADR-0004 phase 2).
+    ///
+    /// `None` — answer now — for everything that is not a fenced 3D command,
+    /// for a command that failed (a fence on a rejected command has nothing
+    /// to wait for: the driver must see the error immediately), and whenever
+    /// the renderer says the fence is already signalled.
+    fn fence_for(&mut self, hdr: &CtrlHdr, code: u32) -> Option<u32> {
+        if !hdr.wants_fence() || !FENCED_3D_COMMANDS.contains(&hdr.kind) {
+            return None;
+        }
+        if !self.fence_mode.is_deferred() {
+            // Phase 1 on purpose (the measurement baseline): the command has
+            // executed, so the response goes out now and no host fence is
+            // created at all.
+            self.fence_stats.synchronous = self.fence_stats.synchronous.saturating_add(1);
+            return None;
+        }
+        // Errors are answered at once, with the fence echoed exactly as
+        // phase 1 did.
+        if code >= resp::ERR_UNSPEC {
+            return None;
+        }
+        // The cap is checked *before* the renderer is asked for a fence: a
+        // host fence nobody will wait for is pure waste (it sits in the
+        // renderer's fence list until it retires), and a guest that fences
+        // everything without collecting must fall back to phase 1's
+        // synchronous completion rather than pin more chains.
+        if self.pending_fences.is_full() {
+            self.fence_stats.over_cap = self.fence_stats.over_cap.saturating_add(1);
+            tracing::warn!(
+                cap = MAX_PENDING_FENCES,
+                kind = format_args!("{:#06x}", hdr.kind),
+                "virtio-gpu fence table is full; this fence completes synchronously"
+            );
+            return None;
+        }
+        let gpu = self.three_d.as_mut()?;
+        // The wire's fence id is 64-bit and virglrenderer's is 32-bit; the low
+        // half is what the host timeline sees. Ids are only ever *compared*,
+        // and the pending table is 64 deep, so the truncation cannot alias
+        // anything that matters.
+        let fence_id = hdr.fence_id as u32;
+        match gpu.create_fence(hdr.ctx_id, fence_id) {
+            Ok(FenceOutcome::Pending) => Some(fence_id),
+            Ok(FenceOutcome::Signalled) => {
+                self.fence_stats.synchronous = self.fence_stats.synchronous.saturating_add(1);
+                None
+            }
+            Err(error) => {
+                // A fence the renderer refused: the command itself already
+                // succeeded, so the guest gets its (immediate) completion and
+                // the host gets a log line. Failing the command here would
+                // undo work that has happened.
+                tracing::warn!(
+                    ctx = hdr.ctx_id,
+                    fence = fence_id,
+                    %error,
+                    "virtio-gpu could not create a host fence; completing synchronously"
+                );
+                self.fence_stats.synchronous = self.fence_stats.synchronous.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    /// Retires host fences and returns the chains they were holding to the
+    /// used ring. Returns how many used-ring entries were added.
+    ///
+    /// Also the watchdog: an entry older than [`FENCE_TIMEOUT`] is completed
+    /// regardless, because a host fence that never retires must not become a
+    /// guest that never wakes up.
+    fn complete_fences(
+        &mut self,
+        queue: &mut Queue,
+        mem: &Arc<GuestMem>,
+    ) -> Result<usize, DeviceError> {
+        // A renderer that has died takes precedence over anything it still
+        // owes: everything held goes back to the guest as an error (GPU-012).
+        let lost = self.degrade_if_renderer_lost();
+        if !lost.is_empty() {
+            let mut served = 0usize;
+            for entry in lost {
+                let written =
+                    write_response(mem, &entry.writable, [&entry.hdr.to_bytes(), &entry.body]);
+                queue
+                    .add_used(mem.as_ref(), entry.head, written)
+                    .map_err(|e| DeviceError::Queue(e.to_string()))?;
+                served += 1;
+            }
+            return Ok(served);
+        }
+        if self.pending_fences.is_empty() {
+            return Ok(0);
+        }
+        let pending = self.pending_fences.len();
+        let retired = match self.three_d.as_mut() {
+            Some(gpu) => gpu.poll_fences(pending),
+            None => Vec::new(),
+        };
+        let mut done: Vec<(Duration, PendingResponse)> = Vec::new();
+        for fence_id in retired {
+            done.extend(self.pending_fences.complete(fence_id));
+        }
+        self.fence_stats.retired = self.fence_stats.retired.saturating_add(done.len() as u64);
+        for (waited, _) in &done {
+            let us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX);
+            self.fence_stats.wait_us_total = self.fence_stats.wait_us_total.saturating_add(us);
+            self.fence_stats.wait_us_max = self.fence_stats.wait_us_max.max(us);
+        }
+
+        // The watchdog: everything still waiting past the deadline goes out
+        // too. Completing in submission order keeps the guest's fence
+        // timeline monotonic, which is why this drains a prefix rather than
+        // picking out individual stale entries.
+        if let Some(oldest) = self.pending_fences.oldest_age() {
+            if oldest >= self.fence_timeout {
+                let abandoned = self.pending_fences.drain_all();
+                self.fence_stats.timed_out = self
+                    .fence_stats
+                    .timed_out
+                    .saturating_add(abandoned.len() as u64);
+                tracing::warn!(
+                    entries = abandoned.len(),
+                    waited_ms = oldest.as_millis(),
+                    "host fences did not retire within the timeout; completing the \
+                     pending virtio-gpu responses anyway (the host renderer is \
+                     stalled or gone)"
+                );
+                done.extend(abandoned);
+            }
+        }
+
+        let mut served = 0usize;
+        for (waited, entry) in done {
+            let written =
+                write_response(mem, &entry.writable, [&entry.hdr.to_bytes(), &entry.body]);
+            queue
+                .add_used(mem.as_ref(), entry.head, written)
+                .map_err(|e| DeviceError::Queue(e.to_string()))?;
+            served += 1;
+            tracing::trace!(
+                head = entry.head,
+                fence = entry.hdr.fence_id,
+                waited_us = waited.as_micros(),
+                "virtio-gpu deferred response completed"
+            );
+        }
+        Ok(served)
+    }
+
+    /// GPU-012: has the host renderer stopped being usable, and if so, take
+    /// the one-time degradation.
+    ///
+    /// Everything about the failure is *reported*, never fatal: the pending
+    /// responses go back to the guest as errors (a chain the guest never gets
+    /// back is a hang), the renderer is dropped — which turns every later 3D
+    /// command into an in-band `ERR_UNSPEC` and leaves the 2D half of the
+    /// device fully working — and the caller tells the driver the device needs
+    /// a reset. The VM keeps running; the worst the guest sees is a desktop
+    /// that fell back to software GL on its next start.
+    fn degrade_if_renderer_lost(&mut self) -> Vec<PendingResponse> {
+        let alive = self.three_d.as_ref().is_none_or(|gpu| gpu.is_alive());
+        if alive || self.renderer_lost {
+            return Vec::new();
+        }
+        self.renderer_lost = true;
+        let held: Vec<PendingResponse> = self
+            .pending_fences
+            .drain_all()
+            .into_iter()
+            .map(|(_, mut entry)| {
+                // The work behind this fence did not finish and never will.
+                entry.hdr.kind = resp::ERR_UNSPEC;
+                entry.body.clear();
+                entry
+            })
+            .collect();
+        // Dropping the renderer releases the host GL state (and, for an
+        // isolated renderer, the dead worker's socket).
+        self.three_d = None;
+        if self.scanout.is_some_and(|s| s.three_d) {
+            tracing::warn!("the scanout was a renderer resource; the window keeps its last frame");
+            self.scanout = None;
+        }
+        tracing::error!(
+            released = held.len(),
+            fence_stats = ?self.fence_stats,
+            "the host 3D renderer is gone; virtio-gpu has degraded to 2D for this \
+             VM (the guest's GL stack will fall back to software rendering). The \
+             VM itself is unaffected — see ADR-0004 GPU-012"
+        );
+        held
+    }
+
+    /// Fence-path counters (`entangled doctor`, tests, the phase-2
+    /// measurement).
+    pub fn fence_stats(&self) -> FenceStats {
+        self.fence_stats
+    }
+
+    /// Whether the host renderer has been lost and the device degraded to 2D
+    /// (GPU-012).
+    pub fn renderer_lost(&self) -> bool {
+        self.renderer_lost
+    }
+
+    /// Chooses whether fenced responses are deferred (phase 2) or answered
+    /// immediately (phase 1).
+    ///
+    /// `entangled run` sets this from [`FENCE_MODE_ENV`], which is how the
+    /// phase-2 before/after measurement is taken on one binary.
+    pub fn set_fence_mode(&mut self, mode: FenceMode) {
+        self.fence_mode = mode;
+    }
+
+    /// Overrides the fence watchdog deadline (default [`FENCE_TIMEOUT`]).
+    ///
+    /// Exists for tests — a two-second wait is not something to put in a unit
+    /// test — and for a host that wants a different tolerance for its GL
+    /// stack.
+    pub fn set_fence_timeout(&mut self, timeout: Duration) {
+        self.fence_timeout = timeout;
+    }
+
+    /// Fenced responses currently held back.
+    pub fn pending_fences(&self) -> usize {
+        self.pending_fences.len()
     }
 
     /// Routes one parsed command and turns a [`CommandError`] into the
@@ -939,6 +1411,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
         let dst_x = clip.x - scanout.rect.x;
         let dst_y = clip.y - scanout.rect.y;
 
+        // How long the device itself spends presenting this rect: the readback
+        // out of the renderer plus the push into the sink. Reported next to
+        // the frame interval, because the interval alone cannot say whether a
+        // slow frame is the guest's doing or ours (ADR-0004 phase 2).
+        let service_start = Instant::now();
         if three_d {
             // GPU-010: the rendered pixels live in the host renderer; read
             // the dirty rect back as BGRA and push it down the same sink.
@@ -969,6 +1446,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 .update_scanout(dst_x, dst_y, clip.width, clip.height, pixels)
                 .map_err(|error| CommandError::Display(error.to_string()))?;
         }
+        self.pacing.record_service(service_start.elapsed());
         tracing::trace!(
             resource = cmd.resource_id,
             x = dst_x,
@@ -978,6 +1456,26 @@ impl<S: ScanoutSink> GpuDevice<S> {
             three_d,
             "virtio-gpu flush"
         );
+        // A flush of the scanout resource *is* a guest present, which makes
+        // this the host's frame clock (ADR-0004 phase 2's measurement).
+        if let Some(report) = self.pacing.record(Instant::now()) {
+            let fences = self.fence_stats;
+            tracing::info!(
+                fps = report.fps(),
+                mean_ms = report.mean_us as f64 / 1000.0,
+                min_ms = report.min_us as f64 / 1000.0,
+                max_ms = report.max_us as f64 / 1000.0,
+                late = report.late,
+                idle_gaps = report.idle_gaps,
+                service_mean_ms = report.service_mean_us as f64 / 1000.0,
+                service_max_ms = report.service_max_us as f64 / 1000.0,
+                fence_deferred = fences.deferred,
+                fence_mean_wait_us = fences.mean_wait_us(),
+                fence_max_wait_us = fences.wait_us_max,
+                fence_peak_pending = fences.peak_pending,
+                "virtio-gpu frame pacing"
+            );
+        }
         Ok(Reply::ok())
     }
 
@@ -1349,7 +1847,30 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         }
     }
 
+    fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
+        // The renderer is the only thing here with asynchronous host work; it
+        // decides whether the waker is usable (and therefore whether fences
+        // may be deferred at all — see `Renderer3d::create_fence`).
+        if let Some(gpu) = self.three_d.as_mut() {
+            gpu.set_host_waker(Arc::clone(&waker));
+        }
+        self.waker = Some(waker);
+    }
+
     fn reset(&mut self) {
+        // Fenced responses the guest will never collect: the driver is
+        // tearing the queues down, so the chains they pinned simply go away
+        // with the rest of the queue state. Dropping them before the queues
+        // is what keeps the fence table from outliving the ring it points
+        // into.
+        let abandoned = self.pending_fences.drain_all().len();
+        if abandoned > 0 {
+            tracing::info!(
+                abandoned,
+                "virtio-gpu reset dropped fenced responses that were still waiting"
+            );
+        }
+
         // The host keeps showing the last frame until the driver comes back and
         // programs a new scanout; dropping the resources here is what frees the
         // (guest-triggered) host allocations.

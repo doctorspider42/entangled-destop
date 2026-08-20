@@ -252,10 +252,15 @@ impl VirtioMmioBus {
             slots: Vec::with_capacity(devices.len()),
             mode,
         };
-        for (slot, device) in devices.into_iter().enumerate() {
+        for (slot, mut device) in devices.into_iter().enumerate() {
             let (base, gsi) = placement(slot)?;
             let line = IrqFdLine::new(&vm, gsi)
                 .map_err(|source| VirtioAttachError::Irq { slot, source })?;
+            // Handed over before the device disappears into its transport; the
+            // real waker (the worker's queue-0 eventfd) does not exist yet, so
+            // it is filled in below (see `virtio_core::DeferredWaker`).
+            let waker = virtio_core::DeferredWaker::new();
+            device.set_host_waker(Arc::clone(&waker) as Arc<dyn virtio_core::HostWaker>);
             let (device_type, transport) =
                 transport_for(slot, device, Arc::clone(&mem), Arc::new(line))?;
 
@@ -269,6 +274,9 @@ impl VirtioMmioBus {
             } else {
                 None
             };
+            if let Some(host_waker) = notifier.as_ref().and_then(|n| n.waker()) {
+                waker.install(host_waker);
+            }
 
             tracing::info!(
                 slot,

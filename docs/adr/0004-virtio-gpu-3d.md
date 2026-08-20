@@ -193,6 +193,259 @@ is real.
   and outlives the attachment; addresses are translated through checked
   `vm-memory` (`get_slice`), so an entry outside guest RAM fails the attach.
 
+## Amendment (2026-08-20): GPU-012 — renderer-crash containment
+
+### The failure model, precisely
+
+One reproducible failure drives this: after 1–3 minutes of sustained GNOME
+compositing, WSLg's jammy mesa 23.2 D3D12 megadriver dereferences a NULL
+gallium hook inside `virgl_renderer_submit_cmd` (`vrend` → `swrast_dri.so` →
+call to `0x0`). The stream is structurally valid GL work; our validation front
+is not implicated. The consequence is what matters:
+
+- it is a **SIGSEGV on the device worker thread**, inside a `dlopen`ed C
+  library, in *our* process;
+- a SIGSEGV is process-fatal, so it takes the whole VMM down — every vCPU, the
+  disk, the network, the guest's unsaved work;
+- it is *not* recoverable in place: the faulting instruction cannot be retried,
+  and the only in-process escape is a `siglongjmp` out of a signal handler,
+  which (a) is UB by Rust's rules, (b) leaves mesa's own worker threads holding
+  locks nobody will release, and (c) has to be right on the first try because
+  it only ever runs when we are already dying.
+
+The requirement therefore is not "survive the fault" but "**do not share a
+process with the thing that faults**". The renderer must be able to die without
+taking the VM with it: at worst the VM degrades to 2D/llvmpipe, the session
+lives, and the user gets a warning.
+
+### Decision: the renderer runs in a subprocess
+
+`Renderer3d` is implemented by `remote::RemoteRenderer`, which spawns a helper
+process holding the real `VirglRenderer` and talks to it over a `SocketPair`.
+Everything the C library and the host GL stack can do — segfault, abort,
+deadlock, leak an EGL display, get OOM-killed — is now confined to a process
+whose death the VMM *observes* instead of sharing.
+
+Why a subprocess rather than the alternatives:
+
+| option | verdict |
+|---|---|
+| in-process signal trap (`sigaction` + `siglongjmp` out of the FFI frame) | rejected: UB across Rust frames, leaves mesa's threads holding locks, and the recovery path is only exercised while already crashing |
+| renderer on a dedicated thread | does not help at all — a SIGSEGV is process-wide |
+| `vhost-user-gpu`-style external GPU process (crosvm/QEMU) | the right long-term shape, and this is a subset of it; the full protocol needs shared guest memory and dmabuf handoff, neither of which this host can do (see the dmabuf probe above) |
+
+**Guest memory never leaves the VMM.** The helper gets *bytes*, never guest
+physical addresses: the client reads the guest pages it needs through the
+checked `vm-memory` API and sends the span; the helper keeps a host-side
+**shadow backing** per resource and attaches *that* as the resource's iovec.
+This is a deliberate security property — the isolated process that runs
+untrusted-guest-derived GL work has no window onto guest RAM — and it is also
+what lets the design work without memfd-backed guest memory, i.e. without
+touching `vmm_core::create_guest_memory` or either hypervisor backend.
+
+The costs, stated plainly:
+
+- one extra copy per `TRANSFER_*_3D` (guest pages → staging → socket → shadow),
+  bounded by `REMOTE_XFER_WINDOW`;
+- one extra copy per scanout flush (the packed rect travels the socket);
+- ~50 µs of round-trip latency per command batch on a warm socket.
+
+For the failure it prevents — the VM dying every 1–3 minutes on this host —
+that is a trade worth making, so **process isolation is the default** on Linux
+(`[display] virgl_isolation = "process"`), with `"in-process"` available for a
+host whose GL stack is trusted and which wants the last copy back.
+
+### What the device does when the renderer dies
+
+The seam is portable and is the part that matters architecturally
+(ADR-0002: a future Windows/ANGLE renderer wants exactly the same isolation,
+with `CreateProcess` + a handle pair in place of `fork`/`socketpair`, and the
+protocol types already build and test on Windows):
+
+1. any I/O error on the socket, or the helper exiting, makes
+   `Renderer3d::is_alive()` false;
+2. the device notices on its next queue notification and **degrades to 2D
+   once**: every held fenced response is released as `ERR_UNSPEC` (a chain the
+   guest never gets back is a hang), the renderer is dropped, and a 3D-owned
+   scanout binding is released so the window keeps its last frame;
+3. later 3D commands are refused in band (`ERR_UNSPEC`), while the **2D half of
+   the device keeps working** — which is what "degrades to 2D" means in
+   practice: the guest can still put a console framebuffer on screen;
+4. the driver is told `DEVICE_NEEDS_RESET`, but only *after* the guest has its
+   completions and its interrupt;
+5. the host log says exactly what happened, at `error`, naming GPU-012.
+
+The demonstration is a test, not a story: `gpu_remote.rs` spawns a real helper
+process, drives 3D through it, `SIGKILL`s it mid-flight, and asserts the device
+survives, releases what it held, refuses 3D in band and still serves 2D.
+
+**Demonstrated end to end** (2026-08-20, WSLg): the Ubuntu Desktop live session
+booted with `virgl_isolation = "process"`, composited on virgl at ~30 fps for a
+minute, and then its renderer process was `kill -9`'d under load. The log:
+
+```
+ERROR virtio_gpu::remote::client: the isolated 3D renderer died; the VM keeps
+      running and virtio-gpu degrades to 2D (ADR-0004 GPU-012)
+      pid=14214 status=Some(ExitStatus(unix_wait_status(9)))
+      error=the renderer process closed the connection
+ERROR virtio_gpu::device: the host 3D renderer is gone; virtio-gpu has degraded
+      to 2D for this VM … The VM itself is unaffected
+ERROR virtio_core::state: device failed to process a queue notification
+      … error=the host 3D renderer was lost; virtio-gpu degraded to 2D
+```
+
+Thirty-seven seconds later the guest had rebuilt its scanout out of
+`RESOURCE_CREATE_2D` resources (`scanout set … three_d=false`) and kept
+presenting; the VM ran on for another two and a half minutes and shut down
+cleanly on its own. A screenshot taken ~170 s *after* the kill shows a live,
+fully composited GNOME session. In-process, this same event is a SIGSEGV that
+ends the VM.
+
+One bound isolation *adds*, and therefore has to name: a shadow backing is host
+memory the in-process renderer would never have allocated (there, a backing is
+guest RAM the guest already paid for). `REMOTE_MAX_BACKING` (64 MiB) bounds one
+resource and `REMOTE_MAX_TOTAL_SHADOW` (512 MiB) bounds all of them together;
+both are checked on *both* sides — the client so the guest gets a clean
+`ERR_OUT_OF_MEMORY`, the helper because it does not trust the VMM either.
+
+## Amendment (2026-08-20): phase 2 — real fences
+
+Phase 1's decision 4 (synchronous fences) is replaced. A fenced command whose
+work lands on the host GL timeline — `SUBMIT_3D`, `TRANSFER_TO_HOST_3D`,
+`TRANSFER_FROM_HOST_3D` — now keeps its descriptor chain **out of the used
+ring** until `virgl_renderer_create_fence`'s fence retires. Everything else
+(capset queries, resource creation, scanout binding, and `RESOURCE_FLUSH`,
+whose readback is synchronous by construction) still answers immediately even
+when fenced: deferring those would add latency and no correctness.
+
+The mechanism, and why it is shaped this way:
+
+- **Completion runs on the device's own worker thread.** GL is thread-affine,
+  so `virgl_renderer_poll` may only be called where EGL is current — the queue
+  worker. A renderer therefore cannot complete anything itself; it can only ask
+  to be *called*. That ask is `virtio_core::HostWaker`, and the Linux machine
+  layer implements it as a write to **queue 0's existing eventfd** — the same fd
+  KVM writes for a guest kick. A wake is thus an ordinary `queue_notify(0)`
+  from the worker: no new thread, no new epoll slot, no new state machine, and a
+  spurious queue-0 notify is a no-op for every device by construction.
+  `DeferredWaker` covers the ordering (a device is inside its transport before
+  the worker exists) by remembering a wake that arrives in the gap.
+- **A monitor thread ticks only while fences are outstanding**, at 1 ms.
+  QEMU's equivalent timer is 10 ms, a quarter of a 60 Hz frame; that is visible
+  as jitter. `virgl_renderer_get_poll_fd()` returns **-1** on WSLg's D3D12 GL
+  (no fence fd), which is why the tick — not the fd — is the load-bearing path;
+  the fd is recorded for diagnostics and for hosts that have one.
+- **Retirement completes a prefix.** Host fences retire in creation order and
+  callbacks coalesce, so reporting fence *n* completes everything submitted up
+  to *n*, oldest first — which is also what the guest's DRM fence timeline
+  requires.
+- **The guest cannot wedge the device.** `MAX_PENDING_FENCES` (64) bounds held
+  chains and is checked *before* the renderer is asked for a fence (an unwaited
+  host fence is pure waste). Past the cap a fenced command completes
+  synchronously — deliberately phase 1's behaviour rather than an in-band
+  error: it pins nothing, it cannot break a legitimately busy guest, and the
+  hazard it re-admits (a guest reusing a buffer the host GL driver is still
+  reading) is the one phase 1 shipped with. A fence that never retires is
+  completed by a **watchdog** (`FENCE_TIMEOUT`, 2 s) with a loud host warning:
+  a stalled host GL stack must not become a guest that never wakes up. A
+  *failed* fenced command answers at once — an error has nothing to wait for —
+  and a device reset releases everything held.
+
+Measured on WSLg (D3D12 / AMD Radeon PRO), `virgl_fence_host.rs`: a real
+`virgl_renderer_create_fence` on an empty submit retires in **≈2 ms** end to
+end (one monitor tick plus the poll), against a 16.7 ms frame budget.
+
+### Scanout readback, and why dmabuf zero-copy is *not* in phase 2
+
+The intended phase-2 optimization was exporting the scanout resource as a
+dmabuf and importing it into the wgpu presentation path. It is not
+implementable on either half of this host, and the probe is worth recording:
+
+- **No DRM node.** WSL's Ubuntu has no `/dev/dri` at all — only `/dev/dxg`, the
+  paravirtualized D3D12 channel. There is nothing for a dmabuf to come from.
+- **No export extension.** The surfaceless EGL display advertises
+  `EGL_KHR_fence_sync`, `EGL_KHR_wait_sync`, `EGL_MESA_drm_image` — and
+  **neither `EGL_MESA_image_dma_buf_export` nor `EGL_EXT_image_dma_buf_import`**.
+  `eglExportDMABUFImageMESA` does not exist to call.
+- **No import path either.** wgpu 26 has no safe external-memory API; importing
+  a dmabuf means `wgpu_hal` Vulkan interop (`VK_EXT_external_memory_dma_buf` +
+  `Device::texture_from_raw`), and our presentation here is wgpu-on-D3D12
+  through `/dev/dxg`, not Vulkan on a DRM node.
+
+So the phase-2 scanout work is the part that *is* available to a host like
+this: `read_rect_bgra` now reads the dirty rect **straight into the caller's
+packed buffer** with an explicit row stride, instead of phase 1's full-frame
+shadow plus a row-by-row repack. That removes one CPU copy of every flushed
+rect and a 7.9 MiB (1080p) host allocation from the present path. It also
+**fixes a latent phase-1 bug**: `virgl_renderer_transfer_read_iov` writes the
+box's rows *packed* at the given offset, so phase 1's full-frame-strided
+repack produced wrong pixels for any rect narrower than the resource — a
+partial-rect test against the real library now pins this down.
+
+The seam for a host that *does* have a DRM node is in place and feature-detected
+at runtime, never at compile time: `Renderer3d::export_scanout` returns
+`Option<ScanoutExport>` (dmabuf fd, stride, fourcc, modifier) and the default is
+`None`. Phase 3 fills in both ends — the EGL export in `virgl.rs` and a
+`wgpu_hal` import in `display` — behind that same probe.
+
+### Frame pacing is measured by the device
+
+A `RESOURCE_FLUSH` on the scanout resource *is* a guest present, which makes the
+device the only place in the system that sees every frame. `virtio_gpu::pacing`
+turns those intervals into a host-side frame clock (mean/min/max, late frames
+past a 20 ms budget, idle gaps excluded) and logs it every 120 frames next to
+the fence statistics **and the device's own service time** — how long the flush
+path itself took. The interval alone cannot attribute a slow frame; the pair
+can. No guest agent, no instrumented mutter, and the numbers are comparable
+across a 2D device, a synchronous-fence virgl device and an asynchronous-fence
+one.
+
+### Measured: the Ubuntu 26.04 Desktop live session, 1920×1080, 4 vCPUs
+
+Five headless runs on WSLg (D3D12 / AMD Radeon PRO), ~4 minutes each, GNOME
+compositing throughout; each figure is the mean of the per-120-frame windows
+(3 000–3 700 frames per run).
+
+| run | fences | renderer | frame interval | fps | worst window | device service time |
+|---|---|---|---:|---:|---:|---:|
+| A | synchronous (phase 1) | in-process | 33.6 ms | 29.8 | 36.8 ms (98.7 ms max) | — |
+| B | deferred (phase 2) | in-process | 33.5 ms | 29.9 | 34.5 ms (51.6 ms max) | — |
+| C | deferred (phase 2) | **isolated process** | 33.4 ms | 29.9 | 34.6 ms (51.3 ms max) | — |
+| D | deferred | in-process | 33.4 ms | 29.9 | — | **1.9 ms** (max 5–8 ms) |
+| E | — (2D device) | none | 33.5 ms | 29.9 | — | **1.8 ms** (max 3–5 ms) |
+
+Boot to the first scanout flip: 36–41 s, run-to-run noise larger than the
+difference between modes. Three conclusions, and the third is the useful one:
+
+1. **Process isolation is free on this workload.** 33.4 ms isolated versus
+   33.5 ms in-process — below the run-to-run spread. The extra copy per flush
+   and per transfer does not show up against a 33 ms frame, which is what
+   justifies making isolation the default rather than an opt-in.
+2. **Real fences change nothing here, and that is not a bug — it is what the
+   guest asks for.** `fence_deferred` is **0** across every run: the only
+   command GNOME-on-virgl fences is `RESOURCE_FLUSH` (the kernel's
+   `virtio_gpu_primary_plane_update` attaches the plane's out-fence there),
+   and mesa's virgl driver does not request out-fences on its submits in this
+   session. `RESOURCE_FLUSH` is deliberately *not* deferred: its readback is
+   synchronous, so the work really is finished when the response is written,
+   and holding it would add latency for nothing. The tail did improve
+   (worst-window 36.8 → 34.5 ms, worst single interval 98.7 → 51.6 ms), which
+   is the deferral machinery not being in the way rather than it being used.
+   The deferral path is exercised instead by `gpu_fence.rs` and by a real host
+   fence in `virgl_fence_host.rs`.
+3. **The host presentation path is 6 % of a frame.** 1.9 ms of 33.4 ms, and a
+   2D device with no GPU at all measures the same 1.8 ms / 33.5 ms — so the
+   readback is *not* what caps this guest at 30 fps, and neither is virgl. That
+   retires the urgency of dmabuf zero-copy on this host (which, per the probe
+   above, is not implementable here anyway) and points the next investigation
+   at the guest: a compositor that lands on exactly half of the EDID's 60 Hz
+   is missing a deadline of its own, not ours.
+
+Where phase 2's fences *will* matter is phase 3: the moment a scanout flush
+stops being a synchronous readback (zero-copy, where the frame is done when the
+GPU says so) the flush fence becomes the right thing to defer — and the
+machinery for it is now in place and tested.
+
 ## Amendment (2026-08-20): the id namespace stays mixed in virgl mode
 
 Phase 1 assumed the guest kernel creates *every* object through

@@ -67,8 +67,11 @@
 pub mod device;
 pub mod edid;
 pub mod error;
+pub mod fence;
 pub mod null_renderer;
+pub mod pacing;
 pub mod protocol;
+pub mod remote;
 pub mod renderer;
 pub mod resource;
 pub mod sink;
@@ -76,13 +79,16 @@ pub mod sink;
 pub mod virgl;
 
 pub use device::{
-    GpuDevice, CHAINS_PER_NOTIFY, CONTROL_QUEUE, CURSOR_QUEUE, MAX_COMMAND_BYTES,
-    MAX_COMMAND_BYTES_3D, NUM_CAPSETS, NUM_QUEUES, NUM_SCANOUTS,
+    FenceMode, FenceStats, GpuDevice, CHAINS_PER_NOTIFY, CONTROL_QUEUE, CURSOR_QUEUE,
+    FENCE_MODE_ENV, FENCE_TIMEOUT, MAX_COMMAND_BYTES, MAX_COMMAND_BYTES_3D, NUM_CAPSETS,
+    NUM_QUEUES, NUM_SCANOUTS,
 };
 pub use error::CommandError;
+pub use fence::{FenceQueue, MAX_PENDING_FENCES};
 pub use null_renderer::NullRenderer;
+pub use pacing::{FramePacing, PacingReport};
 pub use protocol::{cmd, resp, CtrlHdr, Rect, FLAG_FENCE, FLAG_INFO_RING_IDX};
-pub use renderer::{CapsetInfo, Gpu3d, Renderer3d};
+pub use renderer::{CapsetInfo, FenceOutcome, Gpu3d, Renderer3d, ScanoutExport};
 pub use resource::{Resource, ResourceTable};
 pub use sink::{ScanoutSink, SinkError};
 

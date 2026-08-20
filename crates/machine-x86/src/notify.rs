@@ -34,6 +34,17 @@
 //! (ADR-0002): `virtio-core` only learns *that* a queue is offloaded, through
 //! [`MmioTransport::offload_queue_notify`].
 //!
+//! # The host waker
+//!
+//! The same worker serves one more thing: a device with asynchronous *host*
+//! work (ADR-0004 phase 2's virtio-gpu fences) needs a way to be called back
+//! on its worker thread from an unrelated host thread. [`DeviceNotifier::waker`]
+//! hands out a [`HostWaker`] that writes queue 0's eventfd — the very fd KVM
+//! writes for a guest kick — so a wake becomes an ordinary `queue_notify(0)`
+//! from the worker, with no new thread, no new epoll slot and no new state
+//! machine. A spurious queue-0 notify is a no-op for every device, which is
+//! what makes reusing the kick path safe.
+//!
 //! # Fallback
 //!
 //! Offload is best-effort and per queue. If `KVM_IOEVENTFD` is unavailable or
@@ -60,7 +71,7 @@ use std::thread::JoinHandle;
 
 use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
 use thiserror::Error;
-use virtio_core::{MmioTransport, PciTransport};
+use virtio_core::{HostWaker, MmioTransport, PciTransport};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
@@ -159,6 +170,30 @@ impl NotifyAddressing {
         match self {
             Self::SharedWithDatamatch { addr } => addr,
             Self::PerQueue { base, .. } => base,
+        }
+    }
+}
+
+/// A [`HostWaker`] that kicks one queue's eventfd exactly as KVM would.
+///
+/// Cloned fd rather than a shared reference to the notifier: a waker outlives
+/// nothing in particular (a renderer's monitor thread may hold it), and it
+/// must not keep the notifier — and therefore the worker thread — alive.
+struct EventFdWaker {
+    slot: usize,
+    queue: u16,
+    event: EventFd,
+}
+
+impl HostWaker for EventFdWaker {
+    fn wake(&self) {
+        if let Err(error) = self.event.write(1) {
+            tracing::warn!(
+                slot = self.slot,
+                queue = self.queue,
+                %error,
+                "host waker could not signal the queue eventfd"
+            );
         }
     }
 }
@@ -590,6 +625,32 @@ impl<T: QueueNotifyTarget> DeviceNotifier<T> {
             .filter(|(position, _)| registration.holds(*position))
             .map(|(_, e)| e.index)
             .collect()
+    }
+
+    /// A [`HostWaker`] for this device: waking it makes the worker call
+    /// `queue_notify(0)` from its own thread.
+    ///
+    /// `None` for a device with no queues. Independent of whether queue 0's
+    /// *ioeventfd* registration succeeded — the worker epolls the fd either
+    /// way, so a device whose kicks are on the synchronous MMIO path still
+    /// gets its host-side wakeups.
+    pub fn waker(&self) -> Option<Arc<dyn HostWaker>> {
+        let queue = self.events.iter().find(|e| e.index == 0)?;
+        match queue.event.try_clone() {
+            Ok(event) => Some(Arc::new(EventFdWaker {
+                slot: self.slot,
+                queue: queue.index,
+                event,
+            })),
+            Err(error) => {
+                tracing::warn!(
+                    slot = self.slot,
+                    %error,
+                    "could not clone the queue-0 eventfd; this device gets no host waker"
+                );
+                None
+            }
+        }
     }
 
     /// Test/diagnostic hook: signals queue `index`'s eventfd exactly as KVM
