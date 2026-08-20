@@ -461,9 +461,13 @@ impl ManagerApp {
         });
     }
 
+    /// A free name for a new machine, prefixed with the distribution the wizard
+    /// opens on — `ubuntu-1` on Windows, `debian-1` on Linux. The name becomes
+    /// the disk, the profile and the hostname, so suggesting the wrong distro's
+    /// name is a label that outlives the wizard.
     fn suggest_name(&self) -> String {
         for n in 1..=99 {
-            let candidate = format!("debian-{n}");
+            let candidate = format!("{}-{n}", launcher::DEFAULT_DISTRO);
             let taken = self.vm(&candidate).is_some()
                 || self.pending.iter().any(|p| p.name == candidate)
                 || self
@@ -475,7 +479,7 @@ impl ManagerApp {
                 return candidate;
             }
         }
-        "debian-new".to_string()
+        format!("{}-new", launcher::DEFAULT_DISTRO)
     }
 
     /// Collects the update-check and update-download answers; both channels

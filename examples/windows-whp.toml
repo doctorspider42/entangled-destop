@@ -30,3 +30,11 @@ cmdline = "console=ttyS0 earlyprintk=serial panic=1 reboot=k entangled.poweroff=
 
 [network]
 backend = "usernet"
+# The backend appends its own `ip=` clause (the address its DHCP server would
+# hand out) for direct-Linux guests, so this profile needs nothing to have a
+# configured NIC. Adding `ip=dhcp` to the command line above instead makes the
+# guest kernel *ask* — a profile's own `ip=` wins over the appended one — which
+# is how the DHCP server is exercised by a real client:
+#
+#   host : granted the guest a DHCP lease mac=… ip=192.168.74.15
+#   guest: IP-Config: Got DHCP answer from 192.168.74.1, my address is 192.168.74.15
