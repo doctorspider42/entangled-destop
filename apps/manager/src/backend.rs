@@ -21,6 +21,7 @@
 
 use std::path::Path;
 
+use control_api::SoundBackend;
 use serde::{Deserialize, Serialize};
 
 /// The default WSL distribution the manager talks to. `wsl -d <name>` — the
@@ -119,6 +120,60 @@ impl Backend {
                    product cannot ship. Use \"usernet\" instead — a NAT that runs inside \
                    Entangled, needs no host setup and no administrator.",
         })
+    }
+
+    /// The host audio backend this engine can actually open: ALSA on anything
+    /// running a Linux kernel, WASAPI on Windows/WHP.
+    ///
+    /// There is no third answer and no cross-host one. `virtio_sound::open_sink`
+    /// treats a named backend as a promise — `alsa` on Windows is an error at
+    /// start, not a quiet fallback — so the editor never *offers* the other
+    /// host's word. `auto` is the option for anyone who does not care.
+    pub const fn native_sound_backend(self) -> SoundBackend {
+        if self.is_linux_kvm() {
+            SoundBackend::Alsa
+        } else {
+            SoundBackend::Wasapi
+        }
+    }
+
+    /// What the sound-output picker offers on this engine: `auto`, `null`, and
+    /// this engine's own backend — never the other host's.
+    pub const fn sound_backends(self) -> [SoundBackend; 3] {
+        [
+            SoundBackend::Auto,
+            SoundBackend::Null,
+            self.native_sound_backend(),
+        ]
+    }
+
+    /// Why a profile's chosen sound backend cannot work here, or `None`.
+    ///
+    /// The picker cannot produce one of these, but a profile can: the same
+    /// machine is meant to boot on either host (ADR-0002), and one written on
+    /// Linux may well say `alsa`. Greying the option out is not enough — the
+    /// value that is already selected has to explain itself, exactly as a
+    /// carried-over `tap` does.
+    pub fn sound_backend_block(self, chosen: SoundBackend) -> Option<Block> {
+        match (chosen, self.is_linux_kvm()) {
+            (SoundBackend::Alsa, false) => Some(Block {
+                short: "ALSA is Linux only — use \"auto\", or switch to \"WSL (KVM)\".",
+                long: "This machine asks for ALSA, which is Linux's audio system. The \
+                       Windows engine has none to open, and a machine that was promised a \
+                       specific sound output refuses to start rather than run silently \
+                       pretending. Choose \"auto\" — it takes whatever this computer has \
+                       and never stops a machine from starting — or switch this machine \
+                       to \"WSL (KVM)\".",
+            }),
+            (SoundBackend::Wasapi, true) => Some(Block {
+                short: "WASAPI is Windows only — use \"auto\" here.",
+                long: "This machine asks for WASAPI, which is Windows' audio system, and \
+                       the engine it is set to run on is Linux. Choose \"auto\" — it takes \
+                       whatever the host it lands on has, and never stops a machine from \
+                       starting.",
+            }),
+            _ => None,
+        }
     }
 
     /// Why a Debian installation cannot start here, or `None`.
