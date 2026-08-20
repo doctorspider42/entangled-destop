@@ -553,7 +553,12 @@ fn detach_process_group(command: &mut Command) {
     // CREATE_NEW_PROCESS_GROUP — the Windows equivalent: console control events
     // sent to the manager's group stop at the child.
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    // CREATE_NO_WINDOW — `entangled` is a console binary, so without this the
+    // OS opens a console window for every VM the manager starts, which is
+    // exactly the flicker a windowed app must not produce. Nothing is lost:
+    // the child's stdout and stderr are already redirected into its log file.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
 #[cfg(not(any(unix, windows)))]
