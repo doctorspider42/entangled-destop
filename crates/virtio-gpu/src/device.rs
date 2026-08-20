@@ -818,9 +818,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
             return Ok(Reply::ok());
         }
 
-        // Either half may own the resource; in virgl mode even the plain
-        // framebuffer is a renderer resource (the guest kernel creates all
-        // its objects through RESOURCE_CREATE_3D once the feature is on).
+        // Either half may own the resource, and in virgl mode both halves are
+        // live at once: mesa's buffers arrive through RESOURCE_CREATE_3D, while
+        // the kernel keeps creating its own dumb/console framebuffer with
+        // RESOURCE_CREATE_2D (observed on Ubuntu 26.04: fb0 is a 1920x1080
+        // B8G8R8X8 2D resource on a device advertising +virgl).
         let (width, height, three_d) = match self.resources.get(cmd.resource_id) {
             Some(resource) => (resource.width(), resource.height(), false),
             None => {
@@ -1037,6 +1039,24 @@ impl<S: ScanoutSink> GpuDevice<S> {
     }
 
     /// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` (GPU-006).
+    ///
+    /// **Either half of the id namespace may own the resource.** The
+    /// Linux driver attaches every object a DRM client opens to that client's
+    /// 3D context (`virtio_gpu_gem_object_open`) and detaches it on close —
+    /// *including* the objects the kernel itself created with
+    /// `RESOURCE_CREATE_2D`. A virgl boot shows exactly one such pair: the
+    /// fbdev console framebuffer (1920×1080 `B8G8R8X8_UNORM`, created 2D,
+    /// attached to context 1, then detached when the DRM client drops its
+    /// handle). QEMU and crosvm answer those with OK because they keep a
+    /// *single* resource table — QEMU's virgl path even re-creates a 2D
+    /// resource inside virglrenderer (`virgl_cmd_create_resource_2d`).
+    ///
+    /// Here the 2D table owns those ids and the renderer has no handle for
+    /// them, so the command is fully validated (context must exist, the id must
+    /// name a live resource) and then completes without calling the renderer —
+    /// there is nothing to attach on the host side, and the guest never names a
+    /// 2D resource inside a `SUBMIT_3D` stream (it reaches it through
+    /// `TRANSFER_TO_HOST_2D` / `SET_SCANOUT`, which route by ownership too).
     fn ctx_resource(
         &mut self,
         hdr: &CtrlHdr,
@@ -1050,9 +1070,27 @@ impl<S: ScanoutSink> GpuDevice<S> {
         };
         let cmd =
             CtxResource::parse(buf).ok_or_else(|| truncated(kind, buf.len(), CtxResource::LEN))?;
+        if cmd.resource_id == 0 {
+            return Err(CommandError::ZeroResourceId);
+        }
         let ctx_id = hdr.ctx_id;
-        self.three_d_mut(kind)?
-            .ctx_resource(ctx_id, cmd.resource_id, attach)?;
+        // Looked up before the 3D front is borrowed; a 2D id is never an index.
+        let owned_2d = self.resources.get(cmd.resource_id).is_some();
+        let gpu = self.three_d_mut(kind)?;
+        if owned_2d {
+            if !gpu.has_context(ctx_id) {
+                return Err(CommandError::UnknownContext(ctx_id));
+            }
+            tracing::debug!(
+                ctx = ctx_id,
+                resource = cmd.resource_id,
+                attach,
+                "virtio-gpu ctx attach/detach of a 2D-created resource: \
+                 accepted, nothing to do in the renderer"
+            );
+            return Ok(Reply::ok());
+        }
+        gpu.ctx_resource(ctx_id, cmd.resource_id, attach)?;
         Ok(Reply::ok())
     }
 

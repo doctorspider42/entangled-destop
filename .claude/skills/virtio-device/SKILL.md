@@ -283,9 +283,14 @@ satisfy becomes `ERR_OUT_OF_MEMORY` rather than an abort.
   thread-affine, guest resets deferred to the next worker-thread call, iovec
   arrays + an `Arc<GuestMem>` owned for as long as the C side holds the
   pointers, never `virgl_renderer_cleanup`/dlclose — mesa TLS destructors
-  SIGSEGV). In virgl mode the guest kernel creates *every* object through
-  `RESOURCE_CREATE_3D`, so scanout/cursor/attach/unref route by which table
-  owns the id; flushes read back through `Renderer3d::read_rect_bgra` into
+  SIGSEGV). In virgl mode **both halves of the one id namespace are live**:
+  mesa's objects arrive through `RESOURCE_CREATE_3D`, while the guest kernel
+  still creates its dumb/console framebuffer with `RESOURCE_CREATE_2D` and then
+  attaches *that* to its 3D context — so scanout/cursor/attach/detach/unref/
+  backing all route by which table owns the id, and a command that only one
+  half can serve (`CTX_ATTACH_RESOURCE` has no renderer handle for a 2D id)
+  completes after validation instead of being refused (ADR-0004's 2026-08-20
+  amendment); flushes read back through `Renderer3d::read_rect_bgra` into
   the same `ScanoutSink`. Fences complete synchronously (phase 1). Enable per
   VM with `[display] virgl = true`. Tests: `tests/gpu_3d.rs` (transport-level,
   any OS), `tests/virgl_host.rs` (real GL, self-skips),

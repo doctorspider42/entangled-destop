@@ -21,7 +21,7 @@ use virtio_core::chain::VIRTQ_DESC_F_WRITE;
 use virtio_core::testing::{guest_memory, SplitRing, TestIrqLine};
 use virtio_core::{mmio, status, GuestMem, MmioTransport};
 use virtio_gpu::protocol::{cmd, resp, Rect, CTRL_HDR_LEN};
-use virtio_gpu::renderer::MAX_SUBMIT_BYTES;
+use virtio_gpu::renderer::{Renderer3d, MAX_SUBMIT_BYTES};
 use virtio_gpu::{GpuDevice, NullRenderer, VIRTIO_GPU_F_VIRGL};
 use vm_memory::{Bytes, GuestAddress};
 
@@ -112,7 +112,9 @@ fn create_3d(id: u32, target: u32, format: u32, width: u32, height: u32, depth: 
         .u32(id)
         .u32(target)
         .u32(format)
-        .u32(1 << 18) // bind: VIRGL_BIND_SCANOUT
+        // bind: VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SCANOUT, what a guest
+        // sends for a scanout texture (virglrenderer refuses SCANOUT alone).
+        .u32((1 << 1) | (1 << 18))
         .u32(width)
         .u32(height)
         .u32(depth)
@@ -121,6 +123,17 @@ fn create_3d(id: u32, target: u32, format: u32, width: u32, height: u32, depth: 
         .u32(0) // nr_samples
         .u32(0) // flags
         .u32(0) // padding
+}
+
+/// The 2D create the *kernel* still uses in virgl mode for its dumb/console
+/// buffers — the command whose resources a 3D context must be allowed to
+/// attach.
+fn create_2d(id: u32, format: u32, width: u32, height: u32) -> Request {
+    Request::new(cmd::RESOURCE_CREATE_2D)
+        .u32(id)
+        .u32(format)
+        .u32(width)
+        .u32(height)
 }
 
 fn ctx_attach(ctx_id: u32, resource_id: u32) -> Request {
@@ -272,8 +285,14 @@ struct Harness {
 
 impl Harness {
     fn new(width: u32, height: u32) -> Self {
+        Self::with_renderer(width, height, Box::new(NullRenderer::new()))
+    }
+
+    /// The same driver-shaped harness over any [`Renderer3d`] — so the real
+    /// virglrenderer can answer the same conversation on a host that has it.
+    fn with_renderer(width: u32, height: u32, renderer: Box<dyn Renderer3d>) -> Self {
         let display = DisplayHandle::detached(width, height).expect("detached display");
-        let device = GpuDevice::with_renderer(display.clone(), Box::new(NullRenderer::new()));
+        let device = GpuDevice::with_renderer(display.clone(), renderer);
         let mem = Arc::new(guest_memory(MEM_SIZE));
         let irq = Arc::new(TestIrqLine::default());
         let transport = MmioTransport::new(0, Box::new(device), Arc::clone(&mem), irq)
@@ -600,6 +619,94 @@ fn a_malicious_3d_guest_is_answered_in_band() {
     assert_err(&h.run(&resource_unref(10)), resp::ERR_INVALID_RESOURCE_ID);
 
     assert!(!h.needs_reset(), "in-band errors never wedge the device");
+}
+
+/// GPU-006, the boot-time case: the conversation an Ubuntu guest actually has
+/// — a `RESOURCE_CREATE_2D` framebuffer attached to (and later detached from)
+/// the kernel's 3D context. Both commands must succeed: refusing them with
+/// `ERR_INVALID_RESOURCE_ID` made the guest's DRM driver log an error pair on
+/// every virgl boot, and QEMU/crosvm accept any live resource id here.
+#[test]
+fn a_2d_created_resource_attaches_to_a_3d_context() {
+    let mut h = Harness::new(1920, 1080);
+
+    // Exactly what the guest sends: the fbdev console framebuffer, created
+    // through the 2D command even though VIRGL was negotiated…
+    assert_ok(&h.run(&create_2d(2, virtio_gpu::FORMAT_B8G8R8X8_UNORM, 1920, 1080)));
+    assert_ok(&h.run(&ctx_create(1, "kernel")));
+    // …then attached to the DRM client's context and detached again.
+    assert_ok(&h.run(&ctx_attach(1, 2)));
+    assert_ok(&h.run(&ctx_detach(1, 2)));
+    // Idempotent from the device's point of view — no per-attach state to run
+    // out of, so a driver that re-opens the same object keeps working.
+    assert_ok(&h.run(&ctx_attach(1, 2)));
+    assert_ok(&h.run(&ctx_attach(1, 2)));
+
+    // Validation is unchanged: the context still has to exist, the id still
+    // has to name something live, and id 0 is still never valid.
+    assert_err(&h.run(&ctx_attach(9, 2)), resp::ERR_INVALID_CONTEXT_ID);
+    assert_err(&h.run(&ctx_detach(9, 2)), resp::ERR_INVALID_CONTEXT_ID);
+    assert_err(&h.run(&ctx_attach(1, 0)), resp::ERR_INVALID_RESOURCE_ID);
+    assert_err(&h.run(&ctx_attach(1, 77)), resp::ERR_INVALID_RESOURCE_ID);
+
+    // And the id stops being attachable the moment the guest unrefs it.
+    assert_ok(&h.run(&resource_unref(2)));
+    assert_err(&h.run(&ctx_attach(1, 2)), resp::ERR_INVALID_RESOURCE_ID);
+
+    // The 2D resource is still a 2D resource: scanout and flush keep taking
+    // the host-image path, not the renderer readback.
+    assert_ok(&h.run(&create_2d(3, virtio_gpu::FORMAT_B8G8R8X8_UNORM, 4, 4)));
+    assert_ok(&h.run(&ctx_attach(1, 3)));
+    h.write_mem(FB_ADDR, &RED_BGRA.repeat(16));
+    assert_ok(&h.run(&attach_backing(3, &[(FB_ADDR, 64)])));
+    assert_ok(
+        &h.run(
+            &Request::new(cmd::TRANSFER_TO_HOST_2D)
+                .u32(0)
+                .u32(0)
+                .u32(4)
+                .u32(4)
+                .u64(0)
+                .u32(3)
+                .u32(0),
+        ),
+    );
+    assert_ok(&h.run(&set_scanout(0, 3, rect(0, 0, 4, 4))));
+    assert_ok(&h.run(&resource_flush(3, rect(0, 0, 4, 4))));
+    assert_eq!(h.px(0, 0), RED_RGBA, "the 2D path still paints the scanout");
+
+    assert!(!h.needs_reset());
+}
+
+/// The same 2D-attach conversation against the **real** virglrenderer, so the
+/// device-side routing is proven on the host path too (GPU-006). Self-skips
+/// like `virgl_host.rs` when the library or EGL is unusable.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_2d_created_resource_attaches_to_a_real_virgl_context() {
+    let renderer = match virtio_gpu::virgl::VirglRenderer::load() {
+        Ok(renderer) => renderer,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let mut h = Harness::with_renderer(64, 64, Box::new(renderer));
+    assert_ok(&h.run(&create_2d(2, virtio_gpu::FORMAT_B8G8R8X8_UNORM, 64, 64)));
+    // The first 3D command initializes EGL; a host with the library but no
+    // usable GL is a skip, not a failure.
+    let created = h.run(&ctx_create(1, "kernel"));
+    if created.kind() != resp::OK_NODATA {
+        eprintln!("skipping: renderer loaded but EGL/GL is unusable");
+        return;
+    }
+    assert_ok(&h.run(&ctx_attach(1, 2)));
+    assert_ok(&h.run(&ctx_detach(1, 2)));
+    // A 3D resource in the same context still takes the renderer path.
+    assert_ok(&h.run(&create_3d(10, 2, 2, 4, 4, 1)));
+    assert_ok(&h.run(&ctx_attach(1, 10)));
+    assert_err(&h.run(&ctx_attach(1, 77)), resp::ERR_INVALID_RESOURCE_ID);
+    assert!(!h.needs_reset());
 }
 
 /// A device reset mid-session drops contexts and 3D resources; the driver

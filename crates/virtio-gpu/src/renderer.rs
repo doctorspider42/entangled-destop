@@ -327,7 +327,19 @@ impl Gpu3d {
         Ok(())
     }
 
-    /// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` (GPU-006).
+    /// True when `ctx_id` names a live rendering context.
+    ///
+    /// The device needs this on its own for the ids the *2D* table owns: the
+    /// guest legally attaches a `RESOURCE_CREATE_2D` resource to a 3D context
+    /// (the kernel does it for its console framebuffer), and that command still
+    /// has to be refused for a context that does not exist.
+    pub fn has_context(&self, ctx_id: u32) -> bool {
+        self.contexts.contains(&ctx_id)
+    }
+
+    /// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` (GPU-006) for the ids this
+    /// front owns. Ids owned by the device's 2D table never get here — the
+    /// device answers those itself (see `GpuDevice::ctx_resource`).
     pub fn ctx_resource(
         &mut self,
         ctx_id: u32,
