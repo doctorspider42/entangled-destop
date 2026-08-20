@@ -568,3 +568,14 @@ Two lessons it cost to learn, both worth keeping:
 - **A test that takes twelve minutes must say where it got to.** Print a line per
   step and save the whole console to a file named in the failure message; a tail
   is never enough for a boot log.
+
+### Flaky under parallel load: the UEFI boot tests
+
+`cargo test --workspace` runs boot tests concurrently with everything else, and
+the EDK2 firmware's AP sweep is timing-sensitive: under load it can report
+`MpInitLib: Find 1 processors` and the test then fails on the tables it was
+waiting for. Seen on both hosts, always green when rerun alone
+(`cargo test -p boot-tests --test uefi_acpi`). Before blaming a change, rerun
+the single test — and if you need a verdict under load, run the boot tests
+sequentially (`--test-threads=1`) rather than treating one red run as a
+regression.

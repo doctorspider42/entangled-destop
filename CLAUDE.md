@@ -3,7 +3,7 @@
 A small VMM for Linux x86-64 hosts, written in Rust on KVM + rust-vmm crates.
 No QEMU. MVP goal: install and run Debian stable in a 1920×1080 window with
 2D graphics (`virtio-gpu`), input and networking. Product backlog (in Polish,
-treat as guidance, not contract): [entangled-mvp-backlog.md](entangled-mvp-backlog.md).
+treat as guidance, not contract): [vmhost-mvp-backlog.md](vmhost-mvp-backlog.md).
 Architecture decisions: [docs/adr/0001-mvp-architecture.md](docs/adr/0001-mvp-architecture.md),
 [docs/adr/0002-linux-first-whp-ready.md](docs/adr/0002-linux-first-whp-ready.md)
 (portability rules that keep the native Windows/WHP port cheap, plus its
