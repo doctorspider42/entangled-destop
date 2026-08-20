@@ -561,7 +561,13 @@ fn resume(args: ResumeArgs) -> Result<(), String> {
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        let _ = (headless, control_stdin, save_to, screenshot_after, screenshot);
+        let _ = (
+            headless,
+            control_stdin,
+            save_to,
+            screenshot_after,
+            screenshot,
+        );
         Err(format!(
             "snapshot of '{}' is readable, but restoring a VM requires a Linux host with KVM \
              or a Windows host with the Windows Hypervisor Platform",

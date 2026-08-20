@@ -384,16 +384,24 @@ but able to run its whole shutdown path.
 4. **3D contexts die.** By construction; see §2. The guest is told, which is more
    than a silent failure, but a compositor that does not act on
    `DEVICE_NEEDS_RESET` will need restarting.
-5. **Host input queued while the VM was frozen is dropped**, as it is by a pause.
-6. **Dirty-page tracking is not implemented.** Every suspend writes every
+5. **The 2D resource restore has not been watched on a full desktop.** It is
+   exercised by the acceptance guests' framebuffer console (the resource table
+   comes back with its pixels, `restored=1 blank=0 presented=true`) and by unit
+   tests over a scattered 2048-page backing list — but a GNOME session's
+   compositor has more resources and re-draws differently, and nobody has yet
+   put a suspended one back and looked at the screen.
+   `entangled resume --screenshot-after` exists to make that a one-command
+   check; it needs a desktop image that is not in use by anything else.
+6. **Host input queued while the VM was frozen is dropped**, as it is by a pause.
+7. **Dirty-page tracking is not implemented.** Every suspend writes every
    non-zero page. `KVM_GET_DIRTY_LOG` and `MEM_WRITE_WATCH` are what would turn a
    repeated suspend of the same VM into an incremental one; the alias in
    `vmm_core::memory` exists for exactly that divergence.
-7. **The snapshot is not compressed** and not encrypted. A desktop guest's file
+8. **The snapshot is not compressed** and not encrypted. A desktop guest's file
    is the size of its touched RAM.
-8. **`Suspended` never goes back to `Running` in the same process.** Resuming is
+9. **`Suspended` never goes back to `Running` in the same process.** Resuming is
    always a new process. Nothing needs it to be otherwise today, but a manager
    that wanted a "hibernate and wake" button inside one process would.
-9. **A snapshot pins its disks by size and mtime.** A filesystem with coarse or
+10. **A snapshot pins its disks by size and mtime.** A filesystem with coarse or
    absent mtimes (some network mounts) weakens the check to size alone, and the
    code says so rather than pretending otherwise.
