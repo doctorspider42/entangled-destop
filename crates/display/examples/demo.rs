@@ -150,10 +150,12 @@ fn guest_thread(
                 ControlEvent::GrabToggled(grabbed) => {
                     tracing::info!(grabbed, "host toggled the pointer grab");
                 }
-                // This demo has no VM behind it, so there is nothing to freeze
-                // or reboot; logging them proves the shortcuts reach a
-                // supervisor at all (ADR-0005).
-                ControlEvent::PauseToggleRequested | ControlEvent::ResetRequested => {
+                // This demo has no VM behind it, so there is nothing to
+                // freeze, reboot or write to a file; logging them proves the
+                // shortcuts reach a supervisor at all (ADR-0005, ADR-0006).
+                ControlEvent::PauseToggleRequested
+                | ControlEvent::ResetRequested
+                | ControlEvent::SaveRequested => {
                     tracing::info!(?event, "lifecycle request (no VM behind this demo)");
                 }
             }

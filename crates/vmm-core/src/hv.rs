@@ -489,6 +489,53 @@ pub struct VmClockState {
     pub host_tsc: u64,
 }
 
+/// The interrupt controllers the **hypervisor** owns, where it owns any.
+///
+/// The half of the machine that `machine_x86::state` cannot see. On WHP the
+/// 8259 pair, the 8254 and the IOAPIC live in this process and are saved with
+/// every other device; on KVM they live in the kernel, behind
+/// `KVM_GET_IRQCHIP`/`KVM_GET_PIT2`, and nothing in userspace has a copy.
+///
+/// Losing them is not subtle and it is not survivable. The IOAPIC's redirection
+/// table is where the guest recorded which vector each device's line delivers;
+/// a restored VM whose IOAPIC came back at power-on has **every pin masked**,
+/// so the 16550 can never interrupt again and a guest waiting for its transmit
+/// interrupt simply stops writing. (Measured exactly that way: the first
+/// restored guest ran — its GPU kept drawing, because MSI-X bypasses the
+/// IOAPIC — and never printed another line.)
+///
+/// The contents are opaque per-chip blobs, because they are the *kernel's*
+/// structures and a snapshot is bound to the host that wrote it anyway.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostIrqChipState {
+    pub pic_master: Vec<u8>,
+    pub pic_slave: Vec<u8>,
+    pub ioapic: Vec<u8>,
+    /// The in-kernel 8254, where there is one.
+    pub pit: Vec<u8>,
+}
+
+impl HostIrqChipState {
+    /// True when the hypervisor had nothing to report.
+    pub fn is_empty(&self) -> bool {
+        self.pic_master.is_empty()
+            && self.pic_slave.is_empty()
+            && self.ioapic.is_empty()
+            && self.pit.is_empty()
+    }
+}
+
+/// The hypervisor's own interrupt controllers, where it has them.
+///
+/// A trait for the same reason [`GuestClock`] is one: the machine layer holds
+/// it without holding a backend type, and a host whose chips are in userspace
+/// (WHP) simply does not implement it — its chips are saved with the rest of
+/// the machine instead.
+pub trait HostIrqChip: Send + Sync {
+    fn save_irqchip(&self) -> Result<HostIrqChipState, HvError>;
+    fn load_irqchip(&self, state: &HostIrqChipState) -> Result<(), HvError>;
+}
+
 /// The VM-wide clock, where the hypervisor has one.
 ///
 /// A trait rather than a method on the VM object so the machine layer can hold

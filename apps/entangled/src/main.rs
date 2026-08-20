@@ -16,6 +16,7 @@ mod paths;
 mod run_vm;
 #[cfg(any(target_os = "linux", windows))]
 mod seed;
+mod snapshot;
 
 /// The isolated-renderer helper (ADR-0004 GPU-012). Linux-only, like the
 /// renderer it hosts.
@@ -102,13 +103,41 @@ enum Command {
         #[arg(long, requires = "screenshot_after")]
         screenshot: Option<PathBuf>,
         /// Read lifecycle commands from stdin, one per line: `pause`,
-        /// `resume`, `reset`, `type <text>`, `status` (ADR-0005).
+        /// `resume`, `reset`, `save [path]`, `type <text>`, `status`
+        /// (ADR-0005, ADR-0006).
         ///
         /// For a program driving this VM — `entangled-manager` uses it for the
-        /// Pause and Restart buttons. The window's Ctrl+Alt+P and Ctrl+Alt+R
-        /// do the same thing for a person, and need no flag.
+        /// Pause and Restart buttons. The window's Ctrl+Alt+P, Ctrl+Alt+R and
+        /// Ctrl+Alt+S do the same things for a person, and need no flag.
         #[arg(long)]
         control_stdin: bool,
+        /// Where Ctrl+Alt+S and a bare `save` write this VM (ADR-0006).
+        ///
+        /// Defaults to <profile-name>.esnap beside the profile. `entangled
+        /// resume <file>` brings it back.
+        #[arg(long, value_name = "FILE")]
+        snapshot: Option<PathBuf>,
+    },
+    /// Bring a suspended VM back from its snapshot file (ADR-0006).
+    ///
+    /// The snapshot carries the profile it was taken from, so this needs
+    /// nothing else. It refuses — by name — a snapshot taken on the other
+    /// hypervisor, one written by a build with a different format version, a
+    /// corrupt or truncated file, and one whose disks have changed since:
+    /// restoring a live kernel onto storage that has moved on corrupts the
+    /// guest's filesystem.
+    Resume {
+        /// The snapshot file.
+        snapshot: PathBuf,
+        #[arg(long)]
+        headless: bool,
+        /// Read lifecycle commands from stdin, as `run --control-stdin` does.
+        #[arg(long)]
+        control_stdin: bool,
+        /// Suspend again to this file. Defaults to the snapshot being resumed,
+        /// so Ctrl+Alt+S on a resumed VM writes back where it came from.
+        #[arg(long, value_name = "FILE")]
+        save_to: Option<PathBuf>,
     },
     /// Check host prerequisites (KVM, capabilities, graphics backend).
     Doctor,
@@ -295,6 +324,12 @@ fn run(cli: Cli) -> Result<(), String> {
                 ))
             }
         }
+        Command::Resume {
+            snapshot,
+            headless,
+            control_stdin,
+            save_to,
+        } => resume(snapshot, headless, control_stdin, save_to),
         Command::Run {
             config,
             headless,
@@ -302,6 +337,7 @@ fn run(cli: Cli) -> Result<(), String> {
             screenshot_after,
             screenshot,
             control_stdin,
+            snapshot,
         } => {
             let text = std::fs::read_to_string(&config)
                 .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
@@ -320,11 +356,29 @@ fn run(cli: Cli) -> Result<(), String> {
                         PathBuf::from(format!("entangled-screenshot-{}.png", cfg.name))
                     }),
                 });
-                run_vm::run_with(cfg, headless, None, shot, control_stdin).map(|_| ())
+                let snapshot = Some(
+                    snapshot.unwrap_or_else(|| crate::snapshot::default_path(&config, &cfg.name)),
+                );
+                run_vm::run(
+                    cfg,
+                    run_vm::RunOptions {
+                        headless,
+                        control_stdin,
+                        screenshot: shot,
+                        snapshot,
+                        restore: None,
+                    },
+                )
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {
-                let _ = (headless, screenshot_after, screenshot, control_stdin);
+                let _ = (
+                    headless,
+                    screenshot_after,
+                    screenshot,
+                    control_stdin,
+                    snapshot,
+                );
                 Err(format!(
                     "config '{}' is valid, but running VMs requires a Linux host with KVM \
                      or a Windows host with the Windows Hypervisor Platform",
@@ -332,5 +386,56 @@ fn run(cli: Cli) -> Result<(), String> {
                 ))
             }
         }
+    }
+}
+
+/// `entangled resume <file>` (ADR-0006).
+///
+/// Reads the snapshot's header and metadata *first*, so a file this host cannot
+/// restore costs one file open and a sentence rather than a half-built VM. Then
+/// it re-parses the profile the snapshot carries and starts the machine that
+/// profile describes — with the snapshot loaded over it instead of a kernel.
+fn resume(
+    snapshot: PathBuf,
+    headless: bool,
+    control_stdin: bool,
+    save_to: Option<PathBuf>,
+) -> Result<(), String> {
+    let info = snapshot::open(&snapshot)?;
+    let cfg = snapshot::config_from(&info.metadata)?;
+    tracing::info!(
+        vm = %info.metadata.vm_name,
+        file = %snapshot.display(),
+        bytes = info.file_bytes,
+        host = info.host.as_str(),
+        vcpus = info.metadata.shape.vcpus,
+        memory_mib = info.metadata.shape.memory_bytes >> 20,
+        writer = %info.metadata.writer,
+        "resuming a suspended VM"
+    );
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        run_vm::run(
+            cfg,
+            run_vm::RunOptions {
+                headless,
+                control_stdin,
+                screenshot: None,
+                // A resumed VM suspends back to where it came from unless told
+                // otherwise: that is what makes close-the-lid/open-the-lid a
+                // loop rather than a one-way trip.
+                snapshot: Some(save_to.unwrap_or_else(|| snapshot.clone())),
+                restore: Some(snapshot.clone()),
+            },
+        )
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = (headless, control_stdin, save_to);
+        Err(format!(
+            "snapshot of '{}' is readable, but restoring a VM requires a Linux host with KVM \
+             or a Windows host with the Windows Hypervisor Platform",
+            cfg.name
+        ))
     }
 }

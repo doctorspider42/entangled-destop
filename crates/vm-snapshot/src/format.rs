@@ -180,6 +180,10 @@ pub enum SectionKind {
     Virtio,
     /// The guest reset controls' latches.
     ResetControl,
+    /// The interrupt controllers the *hypervisor* owns — KVM's in-kernel 8259
+    /// pair, IOAPIC and 8254. Absent on a host whose chips are in userspace,
+    /// where they are in the [`SectionKind::IrqChip`] section instead.
+    HostIrqChip,
 }
 
 impl SectionKind {
@@ -197,6 +201,7 @@ impl SectionKind {
             SectionKind::PciRoot => 10,
             SectionKind::Virtio => 11,
             SectionKind::ResetControl => 12,
+            SectionKind::HostIrqChip => 13,
         }
     }
 
@@ -214,6 +219,7 @@ impl SectionKind {
             10 => SectionKind::PciRoot,
             11 => SectionKind::Virtio,
             12 => SectionKind::ResetControl,
+            13 => SectionKind::HostIrqChip,
             other => return Err(SnapshotError::UnknownSection { kind: other }),
         })
     }
@@ -232,6 +238,7 @@ impl SectionKind {
             SectionKind::PciRoot => "pci-root",
             SectionKind::Virtio => "virtio",
             SectionKind::ResetControl => "reset-control",
+            SectionKind::HostIrqChip => "host-irqchip",
         }
     }
 }
@@ -323,8 +330,13 @@ impl<W: Write + Seek> SnapshotWriter<W> {
         })
     }
 
-    /// Writes the index and the header. Returns the file's total length.
-    pub fn finish(mut self) -> Result<u64> {
+    /// Writes the index and the header, and hands the sink back.
+    ///
+    /// The sink comes back so the caller can make the file durable before
+    /// anything points at it — a snapshot that is only in the page cache when
+    /// the machine loses power is a file that passes its own digest checks and
+    /// restores a guest from half an hour ago.
+    pub fn finish(mut self) -> Result<(u64, W)> {
         let mut index = Writer::with_capacity(8 + self.index.len() * INDEX_ENTRY_LEN);
         index.count(self.index.len());
         for entry in &self.index {
@@ -365,7 +377,7 @@ impl<W: Write + Seek> SnapshotWriter<W> {
         self.out
             .flush()
             .map_err(SnapshotError::io("flushing the snapshot"))?;
-        Ok(index_offset + index.len() as u64)
+        Ok((index_offset + index.len() as u64, self.out))
     }
 }
 

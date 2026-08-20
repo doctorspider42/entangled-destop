@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use machine_x86::state::MachineState;
 use vm_memory::GuestMemory;
-use vmm_core::hv::{VmClockState, X86CpuState};
+use vmm_core::hv::{HostIrqChipState, VmClockState, X86CpuState};
 
 use crate::cpu;
 use crate::devices;
@@ -41,6 +41,8 @@ pub struct SaveRequest<'a> {
     pub cpus: &'a [X86CpuState],
     /// The VM-wide paravirtual clock, where the hypervisor has one.
     pub clock: Option<VmClockState>,
+    /// The hypervisor's own interrupt controllers, where it has them.
+    pub host_irqchip: Option<HostIrqChipState>,
     pub machine: &'a MachineState,
 }
 
@@ -83,7 +85,14 @@ fn human(bytes: u64) -> String {
 /// establishes it.
 pub fn save<M: GuestMemory>(path: &Path, mem: &M, request: SaveRequest<'_>) -> Result<SaveReport> {
     let started = Instant::now();
-    let file = std::fs::File::create(path).map_err(SnapshotError::io("creating the snapshot"))?;
+    // Written beside the target and renamed at the end. A suspend that is
+    // interrupted — a full disk, a killed process, a host that loses power —
+    // must not leave a half-written file where a snapshot is supposed to be:
+    // the digests would catch it on the way back in, but only after the user
+    // had already lost the VM the file was replacing.
+    let partial = partial_path(path);
+    let file =
+        std::fs::File::create(&partial).map_err(SnapshotError::io("creating the snapshot"))?;
     // Best effort, and only ever a space optimisation: the memory section skips
     // zero pages outright, so the file is small either way. Marking it sparse
     // is what keeps NTFS from committing clusters for the header the writer
@@ -114,11 +123,23 @@ pub fn save<M: GuestMemory>(path: &Path, mem: &M, request: SaveRequest<'_>) -> R
             &cpu::encode_clock(clock),
         )?;
     }
+    if let Some(chip) = &request.host_irqchip {
+        writer.put(
+            SectionKind::HostIrqChip,
+            cpu::HOST_IRQCHIP_VERSION,
+            0,
+            &cpu::encode_host_irqchip(chip),
+        )?;
+    }
     for (kind, version, instance, payload) in devices::encode_machine(request.machine) {
         writer.put(kind, version, instance, &payload)?;
     }
     let stats = memory::save(mem, &mut writer)?;
-    let bytes = writer.finish()?;
+    let (bytes, file) = writer.finish()?;
+    file.sync_all()
+        .map_err(SnapshotError::io("making the snapshot durable"))?;
+    drop(file);
+    std::fs::rename(&partial, path).map_err(SnapshotError::io("publishing the snapshot"))?;
 
     Ok(SaveReport {
         bytes,
@@ -129,6 +150,13 @@ pub fn save<M: GuestMemory>(path: &Path, mem: &M, request: SaveRequest<'_>) -> R
     })
 }
 
+/// Where [`save`] writes before it renames.
+fn partial_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".part");
+    std::path::PathBuf::from(name)
+}
+
 /// Everything [`restore`] hands back.
 #[derive(Debug)]
 pub struct Restored {
@@ -136,6 +164,7 @@ pub struct Restored {
     /// One per vCPU, in index order.
     pub cpus: Vec<X86CpuState>,
     pub clock: Option<VmClockState>,
+    pub host_irqchip: Option<HostIrqChipState>,
     pub machine: MachineState,
     pub memory: MemoryStats,
     /// Advisory differences that did not justify a refusal (a firmware image
@@ -209,6 +238,16 @@ pub fn restore<M: GuestMemory>(path: &Path, mem: &M, shape: &MachineShape) -> Re
         None => None,
     };
 
+    let host_irqchip = match reader.section_version(SectionKind::HostIrqChip, 0) {
+        Some(_) => {
+            reader.require_version(SectionKind::HostIrqChip, 0, cpu::HOST_IRQCHIP_VERSION)?;
+            Some(cpu::decode_host_irqchip(
+                &reader.read_section(SectionKind::HostIrqChip, 0)?,
+            )?)
+        }
+        None => None,
+    };
+
     let machine = devices::decode_machine(&mut reader)?;
     // The device list is checked against the machine as well as against the
     // metadata: the metadata says what the *profile* described, this says what
@@ -225,6 +264,7 @@ pub fn restore<M: GuestMemory>(path: &Path, mem: &M, shape: &MachineShape) -> Re
         metadata,
         cpus,
         clock,
+        host_irqchip,
         machine,
         memory,
         notes,
@@ -381,6 +421,12 @@ mod tests {
                     clock_ns: 1_234_567,
                     ..VmClockState::default()
                 }),
+                host_irqchip: Some(HostIrqChipState {
+                    pic_master: vec![1; 512],
+                    pic_slave: vec![2; 512],
+                    ioapic: vec![3; 512],
+                    pit: vec![4; 49],
+                }),
                 machine: &machine,
             },
         )
@@ -411,6 +457,9 @@ mod tests {
         assert_eq!(restored.cpus[0].registers.rip, 0xffff_ffff_8100_0000);
         assert_eq!(restored.cpus[0].msr(0xc000_0080), Some(0xd01));
         assert_eq!(restored.clock.unwrap().clock_ns, 1_234_567);
+        let chip = restored.host_irqchip.expect("the in-kernel chips");
+        assert_eq!(chip.ioapic, vec![3; 512]);
+        assert_eq!(chip.pit.len(), 49);
         assert_eq!(restored.machine.serial.rx, b"hi".to_vec());
         assert_eq!(restored.machine.acpi_pm.timer_ticks, 99);
         let mut back = [0u8; 11];
@@ -540,6 +589,7 @@ mod tests {
                 host: other,
                 cpus: &cpus,
                 clock: None,
+                host_irqchip: None,
                 machine: &machine,
             },
         )

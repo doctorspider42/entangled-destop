@@ -185,8 +185,7 @@ impl AcpiPmTimer {
     /// `MicroSecondDelay()` comes back 3 ms into it, rather than at zero (which
     /// would double its delay) or at some unrelated value (which would end it).
     pub fn restore(&self, ticks: u32) {
-        let elapsed_us =
-            u64::from(ticks & ACPI_PM_TIMER_MASK) * 1_000_000 / ACPI_PM_TIMER_HZ;
+        let elapsed_us = u64::from(ticks & ACPI_PM_TIMER_MASK) * 1_000_000 / ACPI_PM_TIMER_HZ;
         let now = Instant::now();
         let mut state = self.state();
         state.origin = now

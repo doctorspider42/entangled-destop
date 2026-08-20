@@ -30,7 +30,7 @@
 //! is what a pause freezes and a reset puts back. Only the two rows above
 //! differ per host.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,6 +39,7 @@ use control_api::{NetworkBackend, VmConfig};
 use machine_x86::bus::MachineBus;
 use machine_x86::pflash::Pflash;
 use virtio_core::VirtioDevice;
+use vmm_core::hv::{GuestClock, HostIrqChip, X86CpuState};
 use vmm_core::{Lifecycle, MachineConfig, RunOutcome, VmState};
 
 /// Set by the SIGINT/SIGTERM (Linux) or console-control (Windows) handler; the
@@ -372,11 +373,35 @@ struct LifecycleRequests {
     pause: AtomicBool,
     resume: AtomicBool,
     reset: AtomicBool,
+    /// Where to write the VM (ADR-0006). Not a flag, because a `save` names a
+    /// path and `Ctrl+Alt+S` uses the profile's default one; taking the last
+    /// request wins is right for the same reason the flags coalesce.
+    save: Mutex<Option<PathBuf>>,
+}
+
+impl LifecycleRequests {
+    fn request_save(&self, path: PathBuf) {
+        match self.save.lock() {
+            Ok(mut slot) => *slot = Some(path),
+            Err(poisoned) => *poisoned.into_inner() = Some(path),
+        }
+    }
+
+    fn take_save(&self) -> Option<PathBuf> {
+        match self.save.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+    }
 }
 
 /// Records a window control event: shutdown requests are acted on immediately
 /// (a store to the same flag SIGINT sets), lifecycle requests are queued.
-fn note_control_event(event: display::ControlEvent, requests: &LifecycleRequests) {
+fn note_control_event(
+    event: display::ControlEvent,
+    requests: &LifecycleRequests,
+    snapshot: Option<&Path>,
+) {
     match event {
         display::ControlEvent::QuitRequested | display::ControlEvent::WindowCloseRequested => {
             tracing::info!(?event, "shutdown requested from the window");
@@ -391,6 +416,18 @@ fn note_control_event(event: display::ControlEvent, requests: &LifecycleRequests
         display::ControlEvent::ResetRequested => {
             requests.reset.store(true, Ordering::Relaxed);
         }
+        display::ControlEvent::SaveRequested => match snapshot {
+            Some(path) => {
+                tracing::info!(path = %path.display(), "suspend requested from the window");
+                requests.request_save(path.to_path_buf());
+            }
+            // Reachable only from a VM started without a profile path, which
+            // `entangled run` always has. Saying so beats freezing the guest
+            // and then having nowhere to put it.
+            None => tracing::error!(
+                "Ctrl+Alt+S: this VM has no snapshot path; start it with --snapshot <file>"
+            ),
+        },
     }
 }
 
@@ -413,6 +450,7 @@ pub const CONTROL_PREFIX: &str = "entangled-control:";
 /// | `pause` | freeze the VM (idempotent) |
 /// | `resume` | let it continue (idempotent) |
 /// | `reset` | reboot it in place |
+/// | `save [path]` | suspend to `path` (or the profile's default) and exit |
 /// | `type <text>` | type `<text>` and Enter on the guest's serial console |
 /// | `status` | print the current [`RunState`](vmm_core::RunState) |
 ///
@@ -429,6 +467,7 @@ fn spawn_control_channel(
     bus: MachineBus,
     requests: Arc<LifecycleRequests>,
     lifecycle: Arc<Lifecycle>,
+    snapshot: Option<PathBuf>,
 ) {
     let spawned = std::thread::Builder::new()
         .name("control".into())
@@ -447,6 +486,22 @@ fn spawn_control_channel(
                     "pause" => requests.pause.store(true, Ordering::Relaxed),
                     "resume" => requests.resume.store(true, Ordering::Relaxed),
                     "reset" => requests.reset.store(true, Ordering::Relaxed),
+                    "save" => {
+                        let path = match argument.trim() {
+                            "" => snapshot.clone(),
+                            given => Some(PathBuf::from(given)),
+                        };
+                        match path {
+                            Some(path) => requests.request_save(path),
+                            None => {
+                                println!(
+                                    "{CONTROL_PREFIX} error save needs a path (this VM has no \
+                                     default one)"
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     "type" => {
                         // Carriage return, not newline: the guest's terminal
                         // discipline is what turns it into one, and a bare `\n`
@@ -510,6 +565,19 @@ impl LifecycleSupervisor {
             .name("lifecycle".into())
             .spawn(move || {
                 while !flag.load(Ordering::Relaxed) && !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    // Suspend wins over everything, and ends the VM (ADR-0006).
+                    // Nothing else is worth doing to a machine that is about to
+                    // stop existing in this process, and a reset served first
+                    // would put a *rebooted* guest in the file.
+                    if let Some(path) = requests.take_save() {
+                        Self::suspend(&vm_state, &lifecycle, &path);
+                        // Whether it worked or not: a failed suspend leaves the
+                        // VM paused and the user without the file they asked
+                        // for, and running on as if nothing happened would be
+                        // the one outcome nobody can act on.
+                        SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+                        return;
+                    }
                     // Reset wins over pause: a guest that asked to reboot while
                     // someone was holding the pause key wants to reboot, and
                     // `Lifecycle::reset` works from either state.
@@ -561,6 +629,32 @@ impl LifecycleSupervisor {
             }
         };
         Self { stop, handle }
+    }
+
+    /// Suspends the VM to `path` and reports what happened on stdout as well
+    /// as in the log (ADR-0006).
+    ///
+    /// On stdout because the control channel's caller is a program that asked
+    /// for this and has no other way to learn the file is complete — and
+    /// because a suspend is the one lifecycle operation whose *result* is a
+    /// thing on disk rather than a state the VM is in.
+    fn suspend(vm_state: &Mutex<VmState>, lifecycle: &Lifecycle, path: &Path) {
+        Self::advance(vm_state, VmState::Suspending);
+        match lifecycle.save(path) {
+            Ok(summary) => {
+                Self::advance(vm_state, VmState::Suspended);
+                tracing::info!(path = %path.display(), %summary, "VM suspended");
+                println!("{CONTROL_PREFIX} saved {} {summary}", path.display());
+            }
+            Err(error) => {
+                tracing::error!(path = %path.display(), %error, "suspend failed");
+                println!("{CONTROL_PREFIX} error save {error}");
+                // The seam left the VM paused; the state machine has to agree,
+                // and `Suspending -> Paused` is exactly that transition.
+                Self::advance(vm_state, VmState::Paused);
+            }
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     /// Runs one lifecycle operation and keeps [`VmState`] honest about it.
@@ -649,23 +743,46 @@ pub struct ScreenshotRequest {
 /// How often the debug screenshot is refreshed after its first write.
 const SCREENSHOT_REFRESH: Duration = Duration::from_secs(20);
 
-pub fn run(
-    cfg: VmConfig,
-    headless: bool,
-    screenshot: Option<ScreenshotRequest>,
-) -> Result<(), String> {
-    run_with(cfg, headless, None, screenshot, false).map(|_| ())
+/// Everything about *how* to run a VM that is not the VM itself.
+///
+/// A struct rather than five more parameters: the run path has grown a
+/// lifecycle control channel, a debug screenshot and now a snapshot on either
+/// end of it, and a call site that reads `run_with(cfg, false, None, None,
+/// false, None, None)` tells the reader nothing.
+#[derive(Debug, Default)]
+pub struct RunOptions {
+    /// No window; the VM still runs with an off-screen scanout.
+    pub headless: bool,
+    /// Read lifecycle commands from this process's stdin (ADR-0005).
+    pub control_stdin: bool,
+    pub screenshot: Option<ScreenshotRequest>,
+    /// Where `Ctrl+Alt+S` and a bare `save` write this VM (ADR-0006).
+    pub snapshot: Option<PathBuf>,
+    /// Start this VM **from** a snapshot instead of from its boot images.
+    ///
+    /// The machine is assembled exactly as it would be for a cold boot — same
+    /// memory size, same devices in the same order — and then, instead of
+    /// loading a kernel or a firmware, the snapshot is loaded over it.
+    pub restore: Option<PathBuf>,
 }
 
-/// `control_stdin` opens the lifecycle control channel on this process's stdin
-/// (ADR-0005); see [`spawn_control_channel`].
+pub fn run(cfg: VmConfig, options: RunOptions) -> Result<(), String> {
+    run_with(cfg, None, options).map(|_| ())
+}
+
+/// [`run`] with a host-side console script attached.
 pub fn run_with(
     cfg: VmConfig,
-    headless: bool,
     automation: Option<Automation>,
-    screenshot: Option<ScreenshotRequest>,
-    control_stdin: bool,
+    options: RunOptions,
 ) -> Result<RunReport, String> {
+    let RunOptions {
+        headless,
+        control_stdin,
+        screenshot,
+        snapshot,
+        restore,
+    } = options;
     let span = tracing::info_span!("vm", id = %cfg.name);
     let _guard = span.enter();
     install_signal_handlers()?;
@@ -757,6 +874,7 @@ pub fn run_with(
         net_cmdline: built.net_cmdline,
         pflash: pflash.clone(),
         lifecycle: Arc::clone(&lifecycle),
+        restore: restore.as_deref(),
     })?;
     let bus = started.bus;
     let threads = started.threads;
@@ -768,7 +886,13 @@ pub fn run_with(
     // itself; the shared cell is what lets the lifecycle supervisor below drive
     // the middle two while this thread waits for the VM to end.
     let mut state = VmState::Created;
-    tracing::info!(entry = format_args!("{:#x}", started.entry), mode = ?cfg.boot.mode, state = ?state, "VM created");
+    tracing::info!(
+        entry = format_args!("{:#x}", started.entry),
+        mode = ?cfg.boot.mode,
+        restored = restore.is_some(),
+        state = ?state,
+        "VM created"
+    );
     state = state
         .transition(VmState::Running)
         .map_err(|e| e.to_string())?;
@@ -792,7 +916,12 @@ pub fn run_with(
         Arc::clone(&vm_state),
     );
     if control_stdin {
-        spawn_control_channel(bus.clone(), Arc::clone(&requests), Arc::clone(&lifecycle));
+        spawn_control_channel(
+            bus.clone(),
+            Arc::clone(&requests),
+            Arc::clone(&lifecycle),
+            snapshot.clone(),
+        );
     }
 
     // One predicate for both presentations: stop when asked, and on every tick
@@ -834,6 +963,7 @@ pub fn run_with(
             let control_queue = host.control_queue();
             let pump_requests = Arc::clone(&requests);
             let pump_quiesce = Arc::clone(&quiesce);
+            let pump_snapshot = snapshot.clone();
             let pump = std::thread::spawn(move || {
                 while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
                     // A paused VM must not accumulate a burst of input to
@@ -850,7 +980,7 @@ pub fn run_with(
                     let Some(pass) = pump_quiesce.try_enter() else {
                         input_queue.drain_batches();
                         for event in control_queue.drain() {
-                            note_control_event(event, &pump_requests);
+                            note_control_event(event, &pump_requests, pump_snapshot.as_deref());
                         }
                         std::thread::sleep(Duration::from_millis(20));
                         continue;
@@ -865,7 +995,7 @@ pub fn run_with(
                         }
                     }
                     for event in control_queue.drain() {
-                        note_control_event(event, &pump_requests);
+                        note_control_event(event, &pump_requests, pump_snapshot.as_deref());
                     }
                     drop(pass);
                     std::thread::sleep(Duration::from_millis(4));
@@ -996,6 +1126,9 @@ mod host_api {
         /// The pause/reset seam (ADR-0005). Each host attaches the assembled
         /// machine to it and hands it to its `spawn_vcpus`.
         pub lifecycle: Arc<Lifecycle>,
+        /// Start this VM from a snapshot instead of from its boot images
+        /// (ADR-0006).
+        pub restore: Option<&'a Path>,
     }
 
     /// What has to go back into guest memory to start this VM — at boot, and
@@ -1108,6 +1241,23 @@ mod host_api {
         Ok(())
     }
 
+    /// The [`BootEntry`] a *restored* VM records.
+    ///
+    /// Nothing is applied from it: the vCPUs are already exactly where the
+    /// snapshot left them, which is the whole point. It exists because the
+    /// machine behind the lifecycle seam keeps one, and because a later
+    /// in-place reset recomputes it from the boot plan *before* it is used —
+    /// `reset_machine` runs `load_boot` and overwrites this. `ResetVector` is
+    /// the kind that applies nothing, which is the honest description of a
+    /// vCPU that needs nothing applied.
+    pub(super) fn restored_entry(cpus: &[X86CpuState]) -> BootEntry {
+        BootEntry {
+            entry: cpus.first().map(|c| c.registers.rip).unwrap_or(0),
+            argument: 0,
+            kind: BootEntryKind::ResetVector,
+        }
+    }
+
     /// The machine behind the lifecycle seam (ADR-0005): what a pause has to
     /// freeze, and what a reset has to put back.
     pub(super) struct VmMachine {
@@ -1119,6 +1269,16 @@ mod host_api {
         /// Recomputed by every reset: a reloaded kernel does not have to land
         /// on the same entry point, and a firmware certainly does not.
         pub entry: Mutex<BootEntry>,
+        /// The profile this VM was started from, for a snapshot's metadata and
+        /// its fingerprints (ADR-0006).
+        pub cfg: VmConfig,
+        /// The VM-wide paravirtual clock, where the hypervisor has one.
+        pub clock: Option<Arc<dyn GuestClock>>,
+        /// The hypervisor's **own** interrupt controllers, where it has them:
+        /// KVM's in-kernel 8259 pair, IOAPIC and 8254. `None` on a host whose
+        /// chips are in this process, where they are saved with the rest of the
+        /// machine.
+        pub host_irqchip: Option<Arc<dyn HostIrqChip>>,
     }
 
     impl VmMachine {
@@ -1193,6 +1353,169 @@ mod host_api {
             }
             apply_boot_state(self.mem.as_ref(), &self.current_entry(), vcpu, true)
         }
+
+        /// Writes the whole machine to `path` (ADR-0006).
+        ///
+        /// Runs on the requesting thread with every vCPU parked and every host
+        /// worker quiesced — the same contract as `reset_machine`, and the
+        /// reason the fingerprints taken here are stable: nothing is writing
+        /// the disks any more, so their size and mtime will still be what this
+        /// records when the process exits.
+        ///
+        /// The clock is read last of the small state, as close as possible to
+        /// the memory dump it will be restored alongside.
+        fn save_machine(&self, cpus: &[X86CpuState], path: &Path) -> Result<String, String> {
+            let machine = self.bus.save_state();
+            let devices = vm_snapshot::devices::device_slots(&machine);
+            let clock = match &self.clock {
+                Some(clock) => match clock.save_clock() {
+                    Ok(clock) => Some(clock),
+                    // Not fatal: a guest that does not use the paravirtual
+                    // clock is unaffected, and one that does gets a time jump
+                    // rather than no snapshot at all. Worth saying so.
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot read the guest clock; not saving it");
+                        None
+                    }
+                },
+                None => None,
+            };
+            // The one piece of state whose absence is invisible until the
+            // restored guest stops receiving interrupts, so it is a hard error
+            // rather than a warning: an IOAPIC that came back masked is a VM
+            // whose serial console, disk and network never interrupt again.
+            let host_irqchip = match &self.host_irqchip {
+                Some(chip) => Some(
+                    chip.save_irqchip()
+                        .map_err(|e| format!("cannot read the in-kernel interrupt chips: {e}"))?,
+                ),
+                None => None,
+            };
+            let report = vm_snapshot::vm::save(
+                path,
+                self.mem.as_ref(),
+                vm_snapshot::vm::SaveRequest {
+                    metadata: crate::snapshot::metadata(&self.cfg, devices),
+                    host: vm_snapshot::HostKind::current()
+                        .ok_or("this build has no hypervisor backend to snapshot")?,
+                    cpus,
+                    clock,
+                    host_irqchip,
+                    machine: &machine,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            tracing::info!(
+                path = %path.display(),
+                bytes = report.bytes,
+                allocated = ?report.allocated_bytes,
+                saved_ram = report.memory.saved_bytes,
+                total_ram = report.memory.total_bytes,
+                runs = report.memory.runs,
+                percent = format_args!("{:.1}", report.memory.percent()),
+                elapsed = ?report.elapsed,
+                "snapshot written"
+            );
+            Ok(report.summary())
+        }
+    }
+
+    /// Loads a snapshot over a machine that has been assembled but not started.
+    ///
+    /// The order is the one the machine was built in, reversed where it has to
+    /// be:
+    ///
+    /// 1. **Guest memory first**, because restoring a virtio transport
+    ///    *activates* it, and activation validates the driver's rings against
+    ///    the memory they point into. Rings that are still zeroes would be
+    ///    rejected as unusable.
+    /// 2. **The devices**, which is where the activation happens.
+    /// 3. **The clock**, so the guest's paravirtual time is back before any
+    ///    vCPU can read it.
+    ///
+    /// The vCPUs are the caller's job: the two hosts hold them differently, and
+    /// only one of them may write to an application processor.
+    pub(super) fn restore_machine(
+        path: &Path,
+        cfg: &VmConfig,
+        mem: &vmm_core::GuestMem,
+        bus: &MachineBus,
+        clock: Option<&dyn GuestClock>,
+        host_irqchip: Option<&dyn HostIrqChip>,
+    ) -> Result<Vec<X86CpuState>, String> {
+        let devices = bus_device_slots(bus);
+        let shape = crate::snapshot::shape(cfg, devices);
+        let restored = vm_snapshot::vm::restore(path, mem, &shape).map_err(|e| e.to_string())?;
+        for note in &restored.notes {
+            tracing::warn!("{note}");
+        }
+        bus.load_state(&restored.machine)
+            .map_err(|e| format!("cannot restore the machine's devices: {e}"))?;
+        // The hypervisor's own chips go back *after* the devices, so a
+        // redirection entry that is about to become live points at a device
+        // that is already there.
+        match (host_irqchip, &restored.host_irqchip) {
+            (Some(chip), Some(saved)) => chip
+                .load_irqchip(saved)
+                .map_err(|e| format!("cannot restore the in-kernel interrupt chips: {e}"))?,
+            (Some(_), None) => {
+                return Err(
+                    "this host runs its interrupt controllers in the kernel, and the \
+                            snapshot has no state for them: the restored guest would find \
+                            every IOAPIC pin masked"
+                        .into(),
+                )
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "the snapshot carries in-kernel interrupt-controller state and this \
+                            host has none to load it into"
+                        .into(),
+                )
+            }
+            (None, None) => {}
+        }
+        if let (Some(clock), Some(saved)) = (clock, restored.clock) {
+            if let Err(error) = clock.load_clock(&saved) {
+                // The guest gets a time jump; everything else is intact. That
+                // is worth a warning and not worth throwing the restore away.
+                tracing::warn!(%error, "cannot restore the guest clock");
+            }
+        }
+        tracing::info!(
+            path = %path.display(),
+            summary = %restored.summary(),
+            taken = restored.metadata.created_unix,
+            "VM restored from a snapshot"
+        );
+        Ok(restored.cpus)
+    }
+
+    /// The virtio devices on `bus`, in slot order.
+    pub(super) fn bus_device_slots(bus: &MachineBus) -> Vec<vm_snapshot::DeviceSlot> {
+        let mmio = bus.virtio().slots().iter().enumerate().map(|(i, s)| {
+            (
+                i as u32,
+                s.transport.lock().ok().map(|t| t.device_type().id()),
+            )
+        });
+        let pci = bus
+            .pci()
+            .map(|bus| bus.slots())
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    i as u32,
+                    s.transport.lock().ok().map(|t| t.device_type().id()),
+                )
+            });
+        mmio.chain(pci)
+            .filter_map(|(slot, device_type)| {
+                device_type.map(|device_type| vm_snapshot::DeviceSlot { device_type, slot })
+            })
+            .collect()
     }
 
     /// The command line a direct-Linux guest boots with: the profile's own,
@@ -1230,7 +1553,9 @@ mod host_api {
     }
 }
 
-use host_api::{apply_boot_state, direct_linux_cmdline, load_boot, BootPlan, VmMachine};
+use host_api::{
+    apply_boot_state, direct_linux_cmdline, load_boot, restored_entry, BootPlan, VmMachine,
+};
 
 /// KVM machine assembly (Linux): in-kernel interrupt chips, irqfd/ioeventfd
 /// device wiring, register setup on every vCPU.
@@ -1243,7 +1568,9 @@ mod host {
     use machine_x86::virtio_pci::VirtioPciBus;
     use vmm_core::{spawn_vcpus_with, Hypervisor, Vm};
 
+    use super::host_api::restore_machine;
     pub(super) use super::host_api::StartRequest;
+    use vmm_core::lifecycle::ResettableVcpu as _;
     pub(super) type Threads = vmm_core::VcpuThreads;
 
     pub(super) struct Started {
@@ -1268,6 +1595,7 @@ mod host {
             net_cmdline,
             pflash,
             lifecycle,
+            restore,
         } = request;
         // The VM's pause gate (ADR-0005), created before the devices so every
         // worker thread that is about to be spawned can be handed it.
@@ -1275,14 +1603,21 @@ mod host {
         let hv = Hypervisor::open().map_err(|e| e.to_string())?;
         let mut vm = Vm::new(&hv, machine).map_err(|e| e.to_string())?;
 
-        // Interrupt topology: without an MP table the guest never programs the
-        // IOAPIC and irqfd injections are intermittently lost (stalled first
-        // virtio-blk read with INT_VRING left pending).
-        machine_x86::mptable::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
-        // ACPI tables alongside the MP table: MADT/FADT/DSDT give the guest SMP
-        // topology, the PM block and a real S5 poweroff; Linux prefers them and
-        // falls back to the MP table when absent.
-        machine_x86::acpi::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
+        // A restored VM writes **none** of the firmware tables. They are
+        // already in the snapshot's guest memory, byte for byte as the running
+        // guest last saw them — and the guest may well have reused the pages
+        // around them since. Rewriting them would be the host putting its own
+        // idea of the machine on top of the guest's (ADR-0006).
+        if restore.is_none() {
+            // Interrupt topology: without an MP table the guest never programs
+            // the IOAPIC and irqfd injections are intermittently lost (a
+            // stalled first virtio-blk read with INT_VRING left pending).
+            machine_x86::mptable::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
+            // ACPI tables alongside the MP table: MADT/FADT/DSDT give the guest
+            // SMP topology, the PM block and a real S5 poweroff; Linux prefers
+            // them and falls back to the MP table when absent.
+            machine_x86::acpi::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
+        }
 
         let serial = SerialConsole::new(vm.fd(), out).map_err(|e| e.to_string())?;
 
@@ -1346,20 +1681,56 @@ mod host {
             },
             BootMode::Uefi => uefi_plan(&mut vm, cfg, mem_size)?,
         };
-        let entry = load_boot(vm.memory(), &plan)?;
-        let vcpus = vm.take_vcpus();
-        for vcpu in &vcpus {
-            // Every vCPU gets the segment state: KVM's INIT discards it on the
-            // APs, so handing it to all of them is free and keeps them uniform.
-            // Only the boot CPU starts at the entry point; the others wait for
-            // INIT/SIPI from the guest.
-            apply_boot_state(vm.memory(), &entry, vcpu, vcpu.index == 0)?;
-        }
+        // The pause gate goes in before anything can activate a device: a
+        // restore re-activates every virtio slot, and a device that started a
+        // worker without the gate would be one a pause could not stop.
+        bus.set_quiesce(Arc::clone(&quiesce));
+
+        let clock = vm.clock();
+        let host_irqchip = vm.irqchip();
+        let (entry, vcpus) = match restore {
+            None => {
+                let entry = load_boot(vm.memory(), &plan)?;
+                let vcpus = vm.take_vcpus();
+                for vcpu in &vcpus {
+                    // Every vCPU gets the segment state: KVM's INIT discards it
+                    // on the APs, so handing it to all of them is free and keeps
+                    // them uniform. Only the boot CPU starts at the entry point;
+                    // the others wait for INIT/SIPI from the guest.
+                    apply_boot_state(vm.memory(), &entry, vcpu, vcpu.index == 0)?;
+                }
+                (entry, vcpus)
+            }
+            Some(path) => {
+                let cpus = restore_machine(
+                    path,
+                    cfg,
+                    vm.memory(),
+                    &bus,
+                    Some(clock.as_ref()),
+                    Some(host_irqchip.as_ref()),
+                )?;
+                // Every vCPU, boot CPU or not: a restored application processor
+                // has to come back exactly where it was, which for one the
+                // guest had brought up means running, and for one still waiting
+                // for its INIT/SIPI means `mp_state` back at uninitialised.
+                // `load_cpu_state` carries that distinction; nothing here has to
+                // know which is which.
+                let mut vcpus = vm.take_vcpus();
+                for vcpu in vcpus.iter_mut() {
+                    let state = cpus
+                        .get(vcpu.index as usize)
+                        .ok_or_else(|| format!("the snapshot has no vCPU {}", vcpu.index))?;
+                    vcpu.load_cpu_state(state)
+                        .map_err(|e| format!("cannot restore vCPU {}: {e}", vcpu.index))?;
+                }
+                (restored_entry(&cpus), vcpus)
+            }
+        };
 
         // The machine goes behind the lifecycle seam *before* the vCPUs start,
         // so a guest that faults in its first microseconds is rebooted rather
         // than reported as a shutdown (ADR-0005).
-        bus.set_quiesce(Arc::clone(&quiesce));
         lifecycle.attach_machine(Arc::new(VmMachine {
             bus: bus.clone(),
             mem: Arc::clone(&mem),
@@ -1367,6 +1738,9 @@ mod host {
             vcpus: cfg.vcpus,
             plan,
             entry: Mutex::new(entry),
+            cfg: cfg.clone(),
+            clock: Some(clock),
+            host_irqchip: Some(host_irqchip),
         }));
 
         let threads = spawn_vcpus_with(vcpus, |_| Box::new(bus.clone()), Some(lifecycle))
@@ -1438,7 +1812,9 @@ mod host {
     use machine_x86::virtio_pci::{PciInterruptMode, VirtioPciBus};
     use vmm_core::whp::{spawn_vcpus_with, WhpHypervisor, WhpOptions, WhpPartition};
 
+    use super::host_api::restore_machine;
     pub(super) use super::host_api::StartRequest;
+    use vmm_core::lifecycle::ResettableVcpu as _;
     pub(super) type Threads = vmm_core::whp::WhpVcpuThreads;
 
     pub(super) struct Started {
@@ -1461,6 +1837,7 @@ mod host {
             net_cmdline,
             pflash,
             lifecycle,
+            restore,
         } = request;
         let quiesce = virtio_core::Quiesce::new();
         let hv = WhpHypervisor::open().map_err(|e| e.to_string())?;
@@ -1472,9 +1849,13 @@ mod host {
             .map_err(|e| e.to_string())?;
 
         // The same interrupt topology the KVM machine publishes: the guest must
-        // not be able to tell the hosts apart from the tables.
-        machine_x86::mptable::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
-        machine_x86::acpi::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
+        // not be able to tell the hosts apart from the tables. A restored VM
+        // skips them for the same reason the KVM path does — the snapshot's
+        // guest memory already holds them (ADR-0006).
+        if restore.is_none() {
+            machine_x86::mptable::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
+            machine_x86::acpi::write(vm.memory(), cfg.vcpus).map_err(|e| e.to_string())?;
+        }
 
         // WHP provides each vCPU's local APIC and nothing above it, so the
         // 8259/8254/IOAPIC live in this process (WHP-1703).
@@ -1533,17 +1914,45 @@ mod host {
             },
             BootMode::Uefi => uefi_plan(&mut vm, cfg, mem_size)?,
         };
-        let entry = load_boot(vm.memory(), &plan)?;
-        let vcpus = vm.take_vcpus();
-        // **Boot CPU only.** WHP has no INIT of its own to discard host
-        // register writes: an AP must be left in the reset state WHP created it
-        // in, or the guest's INIT/SIPI never makes it runnable (see
-        // `WhpPartition`'s SMP notes). The same rule governs `reset_vcpu`.
-        if let Some(vcpu) = vcpus.first() {
-            apply_boot_state(vm.memory(), &entry, vcpu, true)?;
-        }
-
+        // Before anything can activate a device; see the KVM path.
         bus.set_quiesce(Arc::clone(&quiesce));
+
+        let (entry, vcpus) = match restore {
+            None => {
+                let entry = load_boot(vm.memory(), &plan)?;
+                let vcpus = vm.take_vcpus();
+                // **Boot CPU only.** WHP has no INIT of its own to discard host
+                // register writes: an AP must be left in the reset state WHP
+                // created it in, or the guest's INIT/SIPI never makes it
+                // runnable (see `WhpPartition`'s SMP notes). The same rule
+                // governs `reset_vcpu`.
+                if let Some(vcpu) = vcpus.first() {
+                    apply_boot_state(vm.memory(), &entry, vcpu, true)?;
+                }
+                (entry, vcpus)
+            }
+            Some(path) => {
+                // No clock: WHP has no `KVM_SET_CLOCK` equivalent, and a
+                // partition with local APIC emulation has no paravirtual clock
+                // for the guest to have been using.
+                let cpus = restore_machine(path, cfg, vm.memory(), &bus, None, None)?;
+                // **Every** VP here, unlike the boot path. The rule that keeps
+                // an AP untouched exists so the guest's own INIT/SIPI can bring
+                // it up from WHP's reset state — but a restored AP is not being
+                // brought up, it is being put back exactly where it already
+                // was, INIT/SIPI included or long past.
+                let mut vcpus = vm.take_vcpus();
+                for vcpu in vcpus.iter_mut() {
+                    let state = cpus
+                        .get(vcpu.index as usize)
+                        .ok_or_else(|| format!("the snapshot has no vCPU {}", vcpu.index))?;
+                    vcpu.load_cpu_state(state)
+                        .map_err(|e| format!("cannot restore vCPU {}: {e}", vcpu.index))?;
+                }
+                (restored_entry(&cpus), vcpus)
+            }
+        };
+
         lifecycle.attach_machine(Arc::new(VmMachine {
             bus: bus.clone(),
             mem: Arc::clone(&mem),
@@ -1551,6 +1960,11 @@ mod host {
             vcpus: cfg.vcpus,
             plan,
             entry: Mutex::new(entry),
+            cfg: cfg.clone(),
+            clock: None,
+            // WHP's interrupt controllers are `machine_x86::irqchip`, in this
+            // process, and are saved with every other device.
+            host_irqchip: None,
         }));
 
         let threads = spawn_vcpus_with(vcpus, |_| Box::new(bus.clone()), Some(lifecycle))

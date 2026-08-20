@@ -9,7 +9,7 @@ use kvm_bindings::{
 use kvm_ioctls::{Cap, VmFd};
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, MmapRegion};
 
-use crate::hv::{GuestClock, HvError, MachineConfig, VmClockState};
+use crate::hv::{GuestClock, HostIrqChip, HostIrqChipState, HvError, MachineConfig, VmClockState};
 use crate::memory::{create_guest_memory, GuestMem};
 use crate::{Hypervisor, Vcpu, VmmError};
 
@@ -184,6 +184,161 @@ impl Vm {
         Arc::new(KvmGuestClock {
             fd: Arc::clone(&self.fd),
         })
+    }
+
+    /// A handle on this VM's **in-kernel** interrupt controllers (ADR-0006).
+    ///
+    /// The half of the machine `machine_x86` never sees on this host, and the
+    /// one whose absence from a snapshot is invisible until a restored guest
+    /// stops receiving interrupts. See [`HostIrqChipState`].
+    pub fn irqchip(&self) -> Arc<dyn HostIrqChip> {
+        Arc::new(KvmIrqChip {
+            fd: Arc::clone(&self.fd),
+        })
+    }
+}
+
+/// KVM's in-kernel interrupt controllers, behind the neutral trait.
+///
+/// Three `KVM_GET_IRQCHIP` chips (8259 master, 8259 slave, IOAPIC) and the
+/// 8254 through `KVM_GET_PIT2`. The chip blobs are the kernel's 512-byte union
+/// carried verbatim; the PIT is written out field by field, which costs a
+/// little code and saves a transmute.
+struct KvmIrqChip {
+    fd: Arc<VmFd>,
+}
+
+/// `chip_id` values `KVM_GET_IRQCHIP` accepts on x86.
+const CHIP_PIC_MASTER: u32 = 0;
+const CHIP_PIC_SLAVE: u32 = 1;
+const CHIP_IOAPIC: u32 = 2;
+
+/// The `kvm_irqchip` union is 512 bytes whichever arm the kernel filled.
+const CHIP_BYTES: usize = 512;
+
+/// One `kvm_pit_channel_state` as this build writes it: eleven fields, no
+/// padding of our own.
+const PIT_CHANNEL_BYTES: usize = 4 + 2 + 9;
+/// Three channels plus the flags word.
+const PIT_BYTES: usize = PIT_CHANNEL_BYTES * 3 + 4;
+
+impl KvmIrqChip {
+    fn chip(&self, chip_id: u32) -> Result<Vec<u8>, HvError> {
+        let mut chip = kvm_bindings::kvm_irqchip {
+            chip_id,
+            ..Default::default()
+        };
+        self.fd.get_irqchip(&mut chip).map_err(|e| {
+            HvError::Registers(format!("KVM_GET_IRQCHIP chip {chip_id} failed: {e}"))
+        })?;
+        // SAFETY: `chip.chip` is a union whose `dummy` arm is
+        // `[c_char; 512]` — the full size of the union, with no padding and no
+        // invalid bit pattern for a byte array. Reading it is therefore defined
+        // whichever arm `KVM_GET_IRQCHIP` actually filled, which is precisely
+        // why the kernel's own header declares that arm.
+        let bytes = unsafe { chip.chip.dummy };
+        Ok(bytes.iter().map(|&b| b as u8).collect())
+    }
+
+    fn set_chip(&self, chip_id: u32, bytes: &[u8]) -> Result<(), HvError> {
+        if bytes.len() != CHIP_BYTES {
+            return Err(HvError::Registers(format!(
+                "snapshot irqchip {chip_id} is {} bytes, this host wants {CHIP_BYTES}",
+                bytes.len()
+            )));
+        }
+        let mut chip = kvm_bindings::kvm_irqchip {
+            chip_id,
+            ..Default::default()
+        };
+        let mut dummy = [0 as std::os::raw::c_char; CHIP_BYTES];
+        for (slot, &byte) in dummy.iter_mut().zip(bytes) {
+            *slot = byte as std::os::raw::c_char;
+        }
+        // Writing a union field is safe; only reading one is not.
+        chip.chip.dummy = dummy;
+        self.fd
+            .set_irqchip(&chip)
+            .map_err(|e| HvError::Registers(format!("KVM_SET_IRQCHIP chip {chip_id} failed: {e}")))
+    }
+
+    fn pit(&self) -> Result<Vec<u8>, HvError> {
+        let state = self
+            .fd
+            .get_pit2()
+            .map_err(|e| HvError::Registers(format!("KVM_GET_PIT2 failed: {e}")))?;
+        let mut out = Vec::with_capacity(PIT_BYTES);
+        for channel in &state.channels {
+            out.extend_from_slice(&channel.count.to_le_bytes());
+            out.extend_from_slice(&channel.latched_count.to_le_bytes());
+            out.push(channel.count_latched);
+            out.push(channel.status_latched);
+            out.push(channel.status);
+            out.push(channel.read_state);
+            out.push(channel.write_state);
+            out.push(channel.write_latch);
+            out.push(channel.rw_mode);
+            out.push(channel.mode);
+            out.push(channel.bcd);
+        }
+        out.extend_from_slice(&state.flags.to_le_bytes());
+        debug_assert_eq!(out.len(), PIT_BYTES);
+        Ok(out)
+    }
+
+    fn set_pit(&self, bytes: &[u8]) -> Result<(), HvError> {
+        if bytes.len() != PIT_BYTES {
+            return Err(HvError::Registers(format!(
+                "snapshot 8254 state is {} bytes, this host wants {PIT_BYTES}",
+                bytes.len()
+            )));
+        }
+        let mut state = kvm_bindings::kvm_pit_state2::default();
+        let mut at = 0usize;
+        let u32_at = |bytes: &[u8], at: usize| {
+            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        };
+        for channel in state.channels.iter_mut() {
+            channel.count = u32_at(bytes, at);
+            channel.latched_count = u16::from_le_bytes([bytes[at + 4], bytes[at + 5]]);
+            channel.count_latched = bytes[at + 6];
+            channel.status_latched = bytes[at + 7];
+            channel.status = bytes[at + 8];
+            channel.read_state = bytes[at + 9];
+            channel.write_state = bytes[at + 10];
+            channel.write_latch = bytes[at + 11];
+            channel.rw_mode = bytes[at + 12];
+            channel.mode = bytes[at + 13];
+            channel.bcd = bytes[at + 14];
+            at += PIT_CHANNEL_BYTES;
+        }
+        state.flags = u32_at(bytes, at);
+        self.fd
+            .set_pit2(&state)
+            .map_err(|e| HvError::Registers(format!("KVM_SET_PIT2 failed: {e}")))
+    }
+}
+
+impl HostIrqChip for KvmIrqChip {
+    fn save_irqchip(&self) -> Result<HostIrqChipState, HvError> {
+        Ok(HostIrqChipState {
+            pic_master: self.chip(CHIP_PIC_MASTER)?,
+            pic_slave: self.chip(CHIP_PIC_SLAVE)?,
+            ioapic: self.chip(CHIP_IOAPIC)?,
+            pit: self.pit()?,
+        })
+    }
+
+    /// Puts them back, IOAPIC **last**.
+    ///
+    /// The mirror of the reset order (`machine_x86::bus::reset_devices` masks
+    /// the IOAPIC first): a restored IOAPIC is immediately able to deliver, and
+    /// the 8259 pair behind it should be back before it can.
+    fn load_irqchip(&self, state: &HostIrqChipState) -> Result<(), HvError> {
+        self.set_chip(CHIP_PIC_MASTER, &state.pic_master)?;
+        self.set_chip(CHIP_PIC_SLAVE, &state.pic_slave)?;
+        self.set_pit(&state.pit)?;
+        self.set_chip(CHIP_IOAPIC, &state.ioapic)
     }
 }
 

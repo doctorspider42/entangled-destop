@@ -314,7 +314,13 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         auto = automated,
         "starting the installer; it powers off when done (Ctrl+Alt+Q / Ctrl+C aborts)"
     );
-    let run_result = crate::run_vm::run(cfg, args.headless, None);
+    let run_result = crate::run_vm::run(
+        cfg,
+        crate::run_vm::RunOptions {
+            headless: args.headless,
+            ..Default::default()
+        },
+    );
     // Keep the derived initrd for debugging on failure; remove it on success.
     match &run_result {
         Ok(()) => {

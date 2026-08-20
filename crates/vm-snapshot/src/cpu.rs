@@ -329,6 +329,37 @@ pub fn decode(bytes: &[u8]) -> Result<X86CpuState> {
     })
 }
 
+/// Version of the host-interrupt-chip section's encoding.
+pub const HOST_IRQCHIP_VERSION: u32 = 1;
+
+/// Largest one of the hypervisor's chip blobs. KVM's `kvm_irqchip` union is
+/// 512 bytes and its 8254 state is under 100; this is room for both and a
+/// bound either way.
+const MAX_CHIP_BLOB: usize = 4096;
+
+/// Encodes the hypervisor's own interrupt controllers.
+pub fn encode_host_irqchip(state: &vmm_core::hv::HostIrqChipState) -> Vec<u8> {
+    let mut w = Writer::with_capacity(2048);
+    w.blob(&state.pic_master)
+        .blob(&state.pic_slave)
+        .blob(&state.ioapic)
+        .blob(&state.pit);
+    w.into_bytes()
+}
+
+/// Decodes them.
+pub fn decode_host_irqchip(bytes: &[u8]) -> Result<vmm_core::hv::HostIrqChipState> {
+    let mut r = Reader::new(bytes);
+    let state = vmm_core::hv::HostIrqChipState {
+        pic_master: r.blob("8259 master", MAX_CHIP_BLOB)?.to_vec(),
+        pic_slave: r.blob("8259 slave", MAX_CHIP_BLOB)?.to_vec(),
+        ioapic: r.blob("IOAPIC", MAX_CHIP_BLOB)?.to_vec(),
+        pit: r.blob("8254", MAX_CHIP_BLOB)?.to_vec(),
+    };
+    r.finish("host-irqchip section")?;
+    Ok(state)
+}
+
 /// Encodes the VM-wide clock.
 pub fn encode_clock(clock: &VmClockState) -> Vec<u8> {
     let mut w = Writer::with_capacity(32);
@@ -491,6 +522,32 @@ mod tests {
     fn an_unknown_mp_state_is_refused() {
         let err = mp_from_code(42).unwrap_err();
         assert!(matches!(err, SnapshotError::BadValue { .. }), "{err}");
+    }
+
+    #[test]
+    fn the_host_irqchip_round_trips() {
+        let state = vmm_core::hv::HostIrqChipState {
+            pic_master: vec![0x11; 512],
+            pic_slave: vec![0x22; 512],
+            ioapic: vec![0x33; 512],
+            pit: vec![0x44; 49],
+        };
+        assert_eq!(
+            decode_host_irqchip(&encode_host_irqchip(&state)).unwrap(),
+            state
+        );
+        let bytes = encode_host_irqchip(&state);
+        for cut in 0..bytes.len() {
+            assert!(decode_host_irqchip(&bytes[..cut]).is_err(), "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn an_absurd_chip_blob_is_refused() {
+        let mut w = Writer::new();
+        w.u64(u64::MAX);
+        let err = decode_host_irqchip(&w.into_bytes()).unwrap_err();
+        assert!(matches!(err, SnapshotError::TooLarge { .. }), "{err}");
     }
 
     #[test]

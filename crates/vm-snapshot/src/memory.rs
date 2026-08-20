@@ -365,7 +365,7 @@ mod tests {
         let mut buf = Cursor::new(Vec::new());
         let mut w = SnapshotWriter::create(&mut buf, HostKind::KvmLinux).unwrap();
         let stats = save(source, &mut w).unwrap();
-        let total = w.finish().unwrap();
+        let (total, _) = w.finish().unwrap();
         let bytes = buf.into_inner();
         let mut r = SnapshotReader::open(Cursor::new(&bytes)).unwrap();
         let back = restore(target, &mut r).unwrap();
