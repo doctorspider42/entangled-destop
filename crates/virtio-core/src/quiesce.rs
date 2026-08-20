@@ -154,7 +154,10 @@ mod tests {
         while work.load(Ordering::Acquire) == frozen && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(work.load(Ordering::Acquire) > frozen, "the worker did not resume");
+        assert!(
+            work.load(Ordering::Acquire) > frozen,
+            "the worker did not resume"
+        );
 
         stop.store(true, Ordering::Release);
         gate.wake();

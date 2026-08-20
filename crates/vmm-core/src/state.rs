@@ -97,7 +97,9 @@ mod tests {
 
     #[test]
     fn any_state_can_crash() {
-        for s in [Created, Running, Paused, Resetting, Stopping, Stopped, Crashed] {
+        for s in [
+            Created, Running, Paused, Resetting, Stopping, Stopped, Crashed,
+        ] {
             assert!(s.transition(Crashed).is_ok());
         }
     }

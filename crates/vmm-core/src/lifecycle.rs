@@ -94,10 +94,7 @@ pub enum LifecycleError {
     },
 
     #[error("cannot {what}: the VM is {state:?}")]
-    WrongState {
-        what: &'static str,
-        state: RunState,
-    },
+    WrongState { what: &'static str, state: RunState },
 
     #[error("no machine is attached to this lifecycle, so it cannot be reset")]
     NoMachine,
@@ -804,7 +801,11 @@ mod tests {
     fn spawn_fake_vcpus(
         lifecycle: &Arc<Lifecycle>,
         n: u32,
-    ) -> (Vec<std::thread::JoinHandle<()>>, Vec<Arc<AtomicU64>>, Arc<AtomicU32>) {
+    ) -> (
+        Vec<std::thread::JoinHandle<()>>,
+        Vec<Arc<AtomicU64>>,
+        Arc<AtomicU32>,
+    ) {
         let kicks = Arc::new(AtomicU32::new(0));
         let mut ticks = Vec::new();
         let mut handles = Vec::new();
@@ -954,10 +955,7 @@ mod tests {
     #[test]
     fn reset_without_a_machine_is_refused() {
         let lifecycle = Lifecycle::new(1);
-        assert!(matches!(
-            lifecycle.reset(),
-            Err(LifecycleError::NoMachine)
-        ));
+        assert!(matches!(lifecycle.reset(), Err(LifecycleError::NoMachine)));
     }
 
     /// A vCPU whose run loop already ended must not hold a barrier open — a

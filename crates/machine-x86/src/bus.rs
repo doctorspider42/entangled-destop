@@ -243,7 +243,9 @@ impl MachineBus {
             match platform.lock() {
                 Ok(mut platform) => platform.reset(),
                 Err(_) => {
-                    tracing::error!("platform lock is poisoned; the RTC and host bridge stay as they were")
+                    tracing::error!(
+                        "platform lock is poisoned; the RTC and host bridge stay as they were"
+                    )
                 }
             }
         }

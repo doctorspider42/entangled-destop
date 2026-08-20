@@ -23,6 +23,8 @@
 //! | `Ctrl+Alt` (released with nothing pressed in between) | release the grab |
 //! | `Ctrl+Alt+G` | toggle the grab ([`ControlEvent::GrabToggled`]) |
 //! | `Ctrl+Alt+Q` | ask the VM to shut down ([`ControlEvent::QuitRequested`]) |
+//! | `Ctrl+Alt+P` | freeze/continue the VM ([`ControlEvent::PauseToggleRequested`]) |
+//! | `Ctrl+Alt+R` | reboot the VM in place ([`ControlEvent::ResetRequested`]) |
 //! | `F11` | toggle borderless fullscreen ([`WindowAction::ToggleFullscreen`]) |
 //! | `Ctrl+Alt+O` | toggle 1:1 pixel mode ([`WindowAction::ToggleScaleMode`]) |
 //!
@@ -93,6 +95,18 @@ pub enum ControlEvent {
     QuitRequested,
     /// The window's close button was used.
     WindowCloseRequested,
+    /// `Ctrl+Alt+P`: freeze the VM, or let a frozen one continue (ADR-0005).
+    ///
+    /// A *toggle* rather than a pair, because only the supervisor knows which
+    /// state the VM is actually in — the window is one of several things that
+    /// can pause it.
+    PauseToggleRequested,
+    /// `Ctrl+Alt+R`: reboot the VM in place (ADR-0005).
+    ///
+    /// The host-initiated peer of the guest pressing Restart: same machine
+    /// reset, same process, same window — not a "reset button" that kills the
+    /// VM and starts another one.
+    ResetRequested,
 }
 
 /// A window-level effect the event loop has to apply (backlog EPIC 15).
@@ -107,6 +121,10 @@ pub enum WindowAction {
     SetGrab(bool),
     /// `Ctrl+Alt+Q`: the user asked the VM to shut down.
     Quit,
+    /// `Ctrl+Alt+P` / `Ctrl+Alt+R`: a lifecycle request the supervisor serves
+    /// (ADR-0005). The window itself does nothing but report it — pausing is
+    /// not a window state.
+    Lifecycle,
     /// `F11`: toggle borderless fullscreen (WIN-1504).
     ToggleFullscreen,
     /// `Ctrl+Alt+O`: switch between [`crate::ScaleMode`]s (WIN-1504).
@@ -720,6 +738,22 @@ impl InputCapture {
                 Some(WindowAction::Quit)
             }
             KeyCode::KeyO => Some(WindowAction::ToggleScaleMode),
+            // Pause and reset (ADR-0005). Neither collides with anything the
+            // guest is likely to want: `Ctrl+Alt+P` and `Ctrl+Alt+R` are not
+            // VT switches (those are the function keys, still forwarded), and
+            // both are consumed here so a paused guest cannot see half a
+            // chord. As with `Ctrl+Alt+Q`, the modifiers are handed back first
+            // so the guest is not left holding them across the freeze.
+            KeyCode::KeyP => {
+                self.release_all();
+                self.control.push(ControlEvent::PauseToggleRequested);
+                Some(WindowAction::Lifecycle)
+            }
+            KeyCode::KeyR => {
+                self.release_all();
+                self.control.push(ControlEvent::ResetRequested);
+                Some(WindowAction::Lifecycle)
+            }
             _ => None,
         }
     }

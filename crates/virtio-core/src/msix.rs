@@ -355,7 +355,6 @@ impl MsixInterrupt {
         self.table_size
     }
 
-
     fn control(&self) -> u16 {
         (self.control.load(Ordering::Acquire) >> (MSIX_CONTROL_OFFSET as u32 * 8)) as u16
     }

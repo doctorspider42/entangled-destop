@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use crate::device::{DeviceResources, DeviceType, VirtioDevice};
 use crate::interrupt::{IrqLine, LineInterrupt, TransportInterrupt};
-use crate::quiesce::Quiesce;
 use crate::queue::QueueConfig;
+use crate::quiesce::Quiesce;
 use crate::status;
 use crate::transport::TransportError;
 use crate::{GuestMem, MAX_QUEUE_SIZE, VIRTIO_F_VERSION_1};
