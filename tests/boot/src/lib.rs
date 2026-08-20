@@ -111,6 +111,18 @@ impl BootSpec {
         self
     }
 
+    /// Requests the guest's discard probe: fill `mib` MiB on `/dev/vda`, free
+    /// it and ask the kernel to hand the space back. The caller measures the
+    /// image's allocated size before and after — that is the evidence.
+    pub fn with_trim_probe(mut self, mib: u64) -> Self {
+        self.extra_cmdline = match self.extra_cmdline.trim() {
+            "" => format!("entangled.trim={mib}"),
+            existing => format!("{existing} entangled.trim={mib}"),
+        };
+        self.await_marker = Some("trim".into());
+        self
+    }
+
     /// Requests the guest's ACPI power-off probe: the init calls
     /// `reboot(LINUX_REBOOT_CMD_POWER_OFF)`, which only ends the VM if the FADT,
     /// the DSDT's `\_S5` and the ACPI PM block all work. The harness then waits

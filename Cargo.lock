@@ -385,6 +385,7 @@ name = "boot-tests"
 version = "0.2.0"
 dependencies = [
  "control-api",
+ "disk-image",
  "display",
  "linux-boot",
  "machine-x86",

@@ -23,6 +23,9 @@ linux-boot.workspace = true
 uefi-boot.workspace = true
 virtio-core.workspace = true
 virtio-block.workspace = true
+# `allocated_bytes` for the discard acceptance: the reclaim measurement uses the
+# product's own helper, not a second implementation of it.
+disk-image.workspace = true
 # The UEFI ISO boot test attaches the whole device set a real run does — five PCI
 # functions, five IOAPIC pins — because a reduced one is a different machine.
 virtio-gpu.workspace = true
