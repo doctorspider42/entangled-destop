@@ -71,6 +71,7 @@ pub mod fence;
 pub mod null_renderer;
 pub mod pacing;
 pub mod protocol;
+pub mod remote;
 pub mod renderer;
 pub mod resource;
 pub mod sink;

@@ -190,6 +190,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             height: 800,
             scale: 1.0,
             virgl: false,
+            virgl_isolation: control_api::VirglIsolation::default(),
         },
     };
 
@@ -281,6 +282,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             height: 800,
             scale: 1.0,
             virgl: false,
+            virgl_isolation: control_api::VirglIsolation::default(),
         },
     };
     let profile_path = args.disk.with_file_name(format!("{vm_name}.toml"));

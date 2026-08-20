@@ -241,6 +241,31 @@ impl NetworkSection {
     }
 }
 
+/// Where the host 3D renderer runs (ADR-0004's GPU-012 amendment).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum VirglIsolation {
+    /// In a dedicated child process, so a crash inside the host GL stack
+    /// degrades the VM to 2D instead of killing it. The default: the concrete
+    /// failure it prevents (WSLg's mesa D3D12 driver segfaulting after a few
+    /// minutes of compositing) takes the whole VM down otherwise.
+    #[default]
+    Process,
+    /// virglrenderer `dlopen`ed into the VMM itself — one less copy per
+    /// transfer and per flushed rect, at the price of sharing a process with
+    /// the host GL driver. For a host whose GL stack is trusted.
+    InProcess,
+}
+
+impl std::fmt::Display for VirglIsolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Process => f.write_str("process"),
+            Self::InProcess => f.write_str("in-process"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct DisplaySection {
@@ -251,6 +276,9 @@ pub struct DisplaySection {
     /// host virglrenderer. Off by default; a host that cannot bring the
     /// renderer up fails `entangled run` rather than silently booting 2D.
     pub virgl: bool,
+    /// Whether that renderer runs in its own process (GPU-012). Ignored when
+    /// `virgl` is false.
+    pub virgl_isolation: VirglIsolation,
 }
 
 impl Default for DisplaySection {
@@ -260,6 +288,7 @@ impl Default for DisplaySection {
             height: 1080,
             scale: 1.0,
             virgl: false,
+            virgl_isolation: VirglIsolation::default(),
         }
     }
 }

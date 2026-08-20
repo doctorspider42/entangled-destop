@@ -281,12 +281,33 @@ fn build_devices(
     if cfg.display.virgl {
         #[cfg(target_os = "linux")]
         {
-            let renderer = virtio_gpu::virgl::VirglRenderer::load()
-                .map_err(|e| format!("[display] virgl = true, but {e}"))?;
-            tracing::info!("attaching virtio-gpu with the virgl 3D renderer");
+            // GPU-012 (ADR-0004): by default the renderer runs in its own
+            // process, so a crash inside the host GL stack degrades this VM to
+            // 2D instead of killing it. `virgl_isolation = "in-process"` puts
+            // virglrenderer back in the VMM for a host whose GL is trusted.
+            let renderer: Box<dyn virtio_gpu::Renderer3d> = match cfg.display.virgl_isolation {
+                control_api::VirglIsolation::Process => {
+                    let renderer = virtio_gpu::remote::RemoteRenderer::spawn().map_err(|e| {
+                        format!("[display] virgl = true with process isolation, but {e}")
+                    })?;
+                    tracing::info!(
+                        pid = renderer.pid(),
+                        "attaching virtio-gpu with an isolated virgl 3D renderer"
+                    );
+                    Box::new(renderer)
+                }
+                control_api::VirglIsolation::InProcess => {
+                    let renderer = virtio_gpu::virgl::VirglRenderer::load()
+                        .map_err(|e| format!("[display] virgl = true, but {e}"))?;
+                    tracing::warn!(
+                        "attaching virtio-gpu with an in-process virgl 3D renderer: a crash                          inside the host GL driver will take this VM down (ADR-0004 GPU-012)"
+                    );
+                    Box::new(renderer)
+                }
+            };
             devices.push(Box::new(virtio_gpu::GpuDevice::with_renderer(
                 display_handle,
-                Box::new(renderer),
+                renderer,
             )));
         }
         #[cfg(not(target_os = "linux"))]
