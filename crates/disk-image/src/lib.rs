@@ -5,8 +5,9 @@
 //! * [`layout`] — MBR/GPT/ext4 parsing. **Everything a partition table says is
 //!   untrusted guest data**; see the module docs for the defensive rules.
 //! * [`ops`] — filesystem-level operations: size parsing, sparse creation,
-//!   grow-only resize, apparent-vs-allocated size, free space, the `.nvram`
-//!   sidecar convention.
+//!   grow-only resize, apparent-vs-allocated size, free space, hole punching
+//!   and zeroing (the host half of virtio-blk DISCARD / WRITE_ZEROES), the
+//!   `.nvram` sidecar convention.
 //! * [`inspect`] — one [`DiskReport`] combining the two, with JSON output for
 //!   `entangled disk inspect --json`.
 //! * [`refs`] — which VM profiles reference a disk (the `disk rm` guard).
@@ -32,7 +33,8 @@ pub use layout::{
 };
 pub use ops::{
     allocated_bytes, create_raw, disk_space, existing_nvram_sidecar, format_bytes,
-    nvram_sidecar_path, parse_size, resize_raw, DiskError, ResizeOutcome,
+    nvram_sidecar_path, parse_size, punch_hole, resize_raw, write_zeroes, DiskError, PunchOutcome,
+    ResizeOutcome,
 };
 pub use refs::{default_scan_dirs, find_references, remove_disk, ProfileRef, RemoveError};
 pub use relocate::{move_disk, MoveError, MoveOutcome};

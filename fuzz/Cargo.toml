@@ -61,6 +61,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "blk_discard"
+path = "fuzz_targets/blk_discard.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "gpu_3d_commands"
 path = "fuzz_targets/gpu_3d_commands.rs"
 test = false

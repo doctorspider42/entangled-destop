@@ -385,6 +385,7 @@ name = "boot-tests"
 version = "0.2.0"
 dependencies = [
  "control-api",
+ "disk-image",
  "display",
  "linux-boot",
  "machine-x86",
@@ -4431,6 +4432,7 @@ checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
 name = "virtio-block"
 version = "0.2.0"
 dependencies = [
+ "disk-image",
  "thiserror 2.0.20",
  "tracing",
  "virtio-core",

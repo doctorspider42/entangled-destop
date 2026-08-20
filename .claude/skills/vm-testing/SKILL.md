@@ -160,6 +160,41 @@ cargo test -p boot-tests --test acpi -- --test-threads=1 --nocapture
 cargo test -p boot-tests --test uefi_acpi -- --nocapture
 ```
 
+## Thin-provisioning reclaim (`VIRTIO_BLK_F_DISCARD`)
+
+`tests/boot/tests/blk_discard.rs` is the pattern to copy for any feature whose
+value is a **host-side effect the guest cannot report**: it boots the same guest
+twice over the same image and compares an out-of-band measurement.
+
+- Boot one sets `ENTANGLED_BLK_DISCARD=off`, so the device withholds both
+  reclaim features: the guest fills 512 MiB, frees it, asks for the space back
+  and is refused. That is the "before", and it is a *measured* before rather
+  than a remembered one.
+- Boot two runs with reclaim on and the guest's `fstrim` succeeds.
+- The verdict is `disk_image::allocated_bytes` either side — the product's own
+  helper, not a second implementation — plus an assertion that the guest's
+  `/sys/block/vda/queue/discard_*` values are the config-space numbers the device
+  published. Without that second check a green test could mean the guest never
+  asked for anything.
+
+The guest side is the test init's `entangled.trim=<mib>` probe, which prefers
+the `FITRIM` ioctl on a mounted ext4 (what `fstrim(8)` issues) and falls back to
+`BLKDISCARD` only when the kernel has no ext4 *at all*. That distinction is
+load-bearing: falling back while a filesystem is mounted would write raw over
+it, and the second boot would have nothing left to trim. It also means the
+**bootstrap kernel** (`CONFIG_EXT4_FS=y`) is what makes the real `fstrim` path
+testable — the Debian-installer test kernel has ext4 as a module, so
+`artifacts/bootstrap/vmlinuz` is tried first and the test kernel is the fallback.
+
+```bash
+bash guest/bootstrap-kernel/build.sh          # or copy an existing artifact
+cargo test -p boot-tests --test blk_discard -- --nocapture --test-threads=1
+```
+
+The image goes to `~/entangled-vms/discard-test.raw` (WSL-native): on drvfs
+(`/mnt/*`) a sparse file allocates everything up front, so the test skips there
+rather than failing on the host filesystem's behalf.
+
 ## UEFI firmware tests (EPIC 18)
 
 Three layers, matching the tiers above. Boot mode is a config choice, so the
@@ -410,11 +445,12 @@ in the root manifest's `exclude`: libfuzzer needs nightly and `-Zsanitizer`, so
 rustup toolchain install nightly
 cargo install cargo-fuzz
 
-# Build all five targets.
+# Build every target.
 cargo +nightly fuzz build --target-dir "$HOME/entangled-fuzz-target"
 
 # Run one, time-boxed (the whole suite: chain_walk, mmio_transport,
-# debian_sums, blk_request, gpu_3d_commands).
+# debian_sums, blk_request, blk_discard, gpu_3d_commands,
+# gpu_remote_protocol).
 cargo +nightly fuzz run chain_walk --target-dir "$HOME/entangled-fuzz-target"     -- -max_total_time=240 -rss_limit_mb=4096
 
 # Reproduce and minimise a finding.
@@ -431,6 +467,7 @@ full and the fuzz build is large.
 | `mmio_transport` | arbitrary register read/write storms of any width against a mock device, with status/interrupt invariants checked after every operation |
 | `debian_sums` | `parse_sums`, `Release::parse` and the ISO-name/version helpers |
 | `blk_request` | virtio-blk header parsing, `validate_range`, `sector_offset`, `total_len` |
+| `blk_discard` | the DISCARD / WRITE_ZEROES segment array: `segment_count` on the array's shape, `DiscardSegment::parse`/`validate` on each range, for both commands. Asserts what the host then relies on — an accepted range is inside the disk, its byte offset *and* end are representable, `unmap` only for write-zeroes, only the one defined flag bit ever accepted |
 | `gpu_3d_commands` | `virtio_gpu::renderer::validate_stream` on raw bytes, plus arbitrary 3D command sequences (contexts, creates, backing, transfers, submits, readback) through `Gpu3d` + `NullRenderer` with real guest memory |
 
 Rules that keep the targets useful:
