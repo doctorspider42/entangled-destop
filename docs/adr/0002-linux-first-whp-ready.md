@@ -313,6 +313,19 @@ user-mode NAT's *close* path needs a workload that closes thousands of
 connections before it can be called done, and the unit tests that covered this
 module all closed both halves at once, which is the one case that never leaks.
 
+**And the d-i path needed two endings fixed, both of them "the installer stops
+and nobody is typing".** d-i ends by *rebooting*, which on WHP is not an ending
+at all — the triple fault is absorbed and the vCPU parks — so the automated
+profile now sets `debian-installer/exit/poweroff`, the ACPI S5 ending both
+backends already latch. And `apt-setup` selects the security suite by default,
+scans `security.debian.org`, and on a failed scan raises a *critical-priority
+note* with a `<Continue>` button that `priority=critical` does not skip and no
+other preseed key answers; the Ubuntu path has a serial automation script that
+could press Enter, the Debian path does not. Selecting no apt services removes
+the scan. Neither is Windows-specific in principle — both are "the host must be
+able to tell a finished install from a waiting one", which is the same
+requirement the Ubuntu path met with `shutdown: poweroff` from the start.
+
 Kernel-level DHCP through the NAT is now evidenced too — `ip=dhcp` on a real
 guest, answered by `granted the guest a DHCP lease ip=192.168.74.15` on the
 host and `IP-Config: Got DHCP answer from 192.168.74.1` in the guest — which
