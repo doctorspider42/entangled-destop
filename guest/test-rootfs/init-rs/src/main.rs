@@ -100,6 +100,10 @@ fn main() {
     if let Some(spec) = param(&cmdline, "entangled.netprobe=") {
         net_probe(&spec);
     }
+    if let Some(expect) = param(&cmdline, "entangled.shmprobe=") {
+        mount("sysfs", "/sys", "sysfs");
+        shm_probe(&expect);
+    }
 
     if param(&cmdline, "entangled.poweroff=").as_deref() == Some("1") {
         acpi_power_off();
@@ -644,6 +648,161 @@ fn fill_file(path: &Path, bytes: u64) -> std::io::Result<()> {
         written += n as u64;
     }
     file.sync_all()
+}
+
+/// Bytes the host stamps at the start of the shared-memory window, and the
+/// guest's reply, written one page in. Both are fixed strings so the console
+/// line is readable and the host's check is exact.
+const SHM_GUEST_REPLY: &[u8] = b"GUEST-SAW-THE-WINDOW";
+
+/// Offset the guest writes its reply at: one page in, clear of whatever the
+/// host put at the start.
+const SHM_REPLY_OFFSET: u64 = 4096;
+
+/// Proves the virtio shared-memory region is real, from inside the guest
+/// (EPIC 20, VEN-2001).
+///
+/// This is the acceptance the epic asks for, and it is deliberately done
+/// *without* a virtio-gpu driver: what is being tested is the machine — a
+/// 64-bit prefetchable BAR the guest's own PCI enumeration found, inside a
+/// host-bridge window the DSDT published, backed by host pages the hypervisor
+/// mapped. So the probe uses only what the kernel exposes to userspace:
+///
+/// 1. find the virtio function that has a `resource2`;
+/// 2. read `/sys/bus/pci/devices/<addr>/resource` line 2 — start, end, flags —
+///    which is the kernel's own account of the BAR it decoded;
+/// 3. `echo 1 > enable`, which is `pci_enable_device`: it sets the
+///    memory-space bit, and *that* is what makes the host map the window. A
+///    guest that never enables the device must see nothing, which is the other
+///    half of the same claim;
+/// 4. `mmap` the BAR and read the host's bytes;
+/// 5. write a reply the host reads back after the VM ends.
+///
+/// One line, machine-readable, like every other probe:
+/// `VMHOST_TEST_OK shmprobe bar=0x140000000 size=268435456 prefetch=1 sixtyfour=1 magic=ENTANGLED-...`
+fn shm_probe(expect: &str) {
+    let fail = |why: String| println!("VMHOST_TEST_FAIL shmprobe {why}");
+    let root = Path::new("/sys/bus/pci/devices");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        fail("no-pci-bus-in-sysfs".into());
+        return;
+    };
+    let mut addresses: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    addresses.sort();
+
+    for address in addresses.iter().take(MAX_SCANNED_FUNCTIONS) {
+        let dir = root.join(address);
+        let Ok(resources) = std::fs::read_to_string(dir.join("resource")) else {
+            continue;
+        };
+        // Line index 2 is BAR 2 — the shared-memory window. Three hex fields:
+        // start, end, flags. An unassigned BAR reads as all zeroes.
+        let Some(line) = resources.lines().nth(2) else {
+            continue;
+        };
+        let fields: Vec<u64> = line
+            .split_whitespace()
+            .map(|f| u64::from_str_radix(f.trim_start_matches("0x"), 16).unwrap_or(0))
+            .collect();
+        if fields.len() != 3 || fields[0] == 0 || fields[1] <= fields[0] {
+            continue;
+        }
+        let (start, end, flags) = (fields[0], fields[1], fields[2]);
+        let size = end - start + 1;
+        // IORESOURCE_MEM_64 is 0x100000, IORESOURCE_PREFETCH is 0x2000 in the
+        // kernel's resource flags, which sysfs prints verbatim.
+        let sixtyfour = u8::from(flags & 0x0010_0000 != 0);
+        let prefetch = u8::from(flags & 0x0000_2000 != 0);
+
+        // `pci_enable_device`: this is what sets the memory-space bit, and
+        // the host maps the window only while it is set. `EBUSY` means a
+        // driver is already bound and has done it — sysfs refuses to enable
+        // a device out from under its driver — which is better evidence
+        // than success, so it is reported rather than treated as failure.
+        let driver = std::fs::read_link(dir.join("driver"))
+            .ok()
+            .and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "none".into());
+        match std::fs::write(dir.join("enable"), b"1") {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(e) => {
+                fail(format!("cannot-enable-{address}:{e}"));
+                return;
+            }
+        }
+
+        let path = dir.join("resource2");
+        let file = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(e) => {
+                fail(format!("cannot-open-resource2:{e}"));
+                return;
+            }
+        };
+        // One page is all the probe needs to see, and mapping 256 MiB of it
+        // would be a pointless demand on a 256 MiB guest.
+        let map_len = 2 * 4096usize;
+        // SAFETY: `file` is an open sysfs PCI resource file whose BAR is at
+        // least `map_len` bytes long (checked above via `size`), the length is
+        // page aligned and non-zero, and the returned pointer is only used
+        // through `map_len` bounded reads and writes below before being
+        // unmapped. A null return is checked.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED || (size as usize) < map_len {
+            fail(format!(
+                "mmap-failed:{} size={size}",
+                std::io::Error::last_os_error()
+            ));
+            return;
+        }
+        // SAFETY: `addr` is a live mapping of `map_len` bytes and both spans
+        // below are inside it (`SHM_REPLY_OFFSET + reply <= map_len`).
+        let (magic, wrote) = unsafe {
+            let mut magic = [0u8; 32];
+            std::ptr::copy_nonoverlapping(addr as *const u8, magic.as_mut_ptr(), magic.len());
+            let reply = SHM_GUEST_REPLY;
+            std::ptr::copy_nonoverlapping(
+                reply.as_ptr(),
+                (addr as *mut u8).add(SHM_REPLY_OFFSET as usize),
+                reply.len(),
+            );
+            (magic, reply.len())
+        };
+        // SAFETY: unmapping exactly the mapping created above.
+        unsafe {
+            libc::munmap(addr, map_len);
+        }
+
+        let text: String = magic
+            .iter()
+            .take_while(|b| **b != 0)
+            .map(|b| char::from(*b))
+            .filter(|c| c.is_ascii_graphic() || *c == ' ')
+            .collect();
+        if !expect.is_empty() && !text.starts_with(expect) {
+            fail(format!("magic-mismatch got={text:?} want={expect:?}"));
+            return;
+        }
+        println!(
+            "VMHOST_TEST_OK shmprobe device={address} driver={driver} bar={start:#x} size={size} \
+             prefetch={prefetch} sixtyfour={sixtyfour} wrote={wrote} magic={text}"
+        );
+        return;
+    }
+    fail("no-shared-memory-bar".into());
 }
 
 /// Reports what the kernel found on the PCI bus, and how much of it bound to a

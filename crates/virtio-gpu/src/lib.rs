@@ -87,11 +87,14 @@ pub use blob::{
 pub use device::{
     FenceMode, FenceStats, GpuDevice, CHAINS_PER_NOTIFY, CONTROL_QUEUE, CURSOR_QUEUE,
     FENCE_MODE_ENV, FENCE_TIMEOUT, MAX_COMMAND_BYTES, MAX_COMMAND_BYTES_3D, NUM_CAPSETS,
-    NUM_QUEUES, NUM_SCANOUTS,
+    NUM_QUEUES, NUM_SCANOUTS, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
 };
 pub use error::CommandError;
 pub use fence::{FenceQueue, MAX_PENDING_FENCES};
-pub use null_renderer::NullRenderer;
+pub use null_renderer::{
+    loopback_signature, NullRenderer, LOOPBACK_MAGIC, LOOPBACK_SIGNATURE_LEN,
+    NULL_HOST_VISIBLE_BYTES,
+};
 pub use pacing::{FramePacing, PacingReport};
 pub use protocol::{cmd, resp, CtrlHdr, Rect, FLAG_FENCE, FLAG_INFO_RING_IDX};
 pub use renderer::{CapsetInfo, FenceOutcome, Gpu3d, Renderer3d, ScanoutExport};
