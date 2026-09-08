@@ -370,6 +370,12 @@ pub struct GpuDevice<S: ScanoutSink> {
     /// Whether the driver has already been told about that loss, so
     /// `DEVICE_NEEDS_RESET` is raised exactly once.
     renderer_loss_reported: bool,
+    /// Set by a restore that could not bring the guest's 3D contexts back
+    /// (ADR-0006): they live inside the host GL driver and nothing hands them
+    /// over. Reported to the driver the same way a lost renderer is, and
+    /// exactly once.
+    restored_3d_lost: bool,
+    restored_3d_reported: bool,
     /// Frame-interval statistics of the scanout path (phase 2 measurement).
     pacing: FramePacing,
     /// Where `--frame-stats` mirrors those statistics as JSON, if anywhere.
@@ -427,6 +433,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
             fence_mode: FenceMode::default(),
             renderer_lost: false,
             renderer_loss_reported: false,
+            restored_3d_lost: false,
+            restored_3d_reported: false,
             pacing: FramePacing::new(),
             frame_stats: None,
             refresh_hz: crate::edid::DEFAULT_REFRESH_HZ,
@@ -614,6 +622,17 @@ impl<S: ScanoutSink> GpuDevice<S> {
             self.renderer_loss_reported = true;
             return Err(DeviceError::Backend(
                 "the host 3D renderer was lost; virtio-gpu degraded to 2D".into(),
+            ));
+        }
+        // The same signal for the same reason, from the other direction: this
+        // VM was restored from a snapshot and its 3D contexts did not survive
+        // (ADR-0006). Told after the completions, like the loss above, so a
+        // driver that acts on it still finds the chains it was owed.
+        if self.restored_3d_lost && !self.restored_3d_reported {
+            self.restored_3d_reported = true;
+            return Err(DeviceError::Backend(
+                "this VM was restored from a snapshot; the guest's host-side GPU state (3D                  contexts, blob resources) could not be restored and the device must be                  re-initialised"
+                    .into(),
             ));
         }
         Ok(())
@@ -1561,6 +1580,34 @@ impl<S: ScanoutSink> GpuDevice<S> {
         Ok(Reply::ok())
     }
 
+    /// Pushes the whole bound scanout rect to the host display.
+    ///
+    /// Used by a restore: the guest is not going to redraw a screen it thinks
+    /// it already drew, so the resumed VM would show the fresh window's blank
+    /// frame until something happened to change. Returns whether anything was
+    /// presented.
+    fn present_whole_scanout(&mut self) -> bool {
+        let Some(scanout) = self.scanout else {
+            return false;
+        };
+        let Some(resource) = self.resources.get(scanout.resource_id) else {
+            return false;
+        };
+        let mut scratch = std::mem::take(&mut self.flush_buf);
+        let presented = match resource.rect_bytes(scanout.rect, &mut scratch) {
+            Some(pixels) => self
+                .display
+                .update_scanout(0, 0, scanout.rect.width, scanout.rect.height, pixels)
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "could not present the restored scanout");
+                })
+                .is_ok(),
+            None => false,
+        };
+        self.flush_buf = scratch;
+        presented
+    }
+
     /// `TRANSFER_TO_HOST_2D` (MVP-805): guest backing pages → host image.
     fn transfer_to_host_2d(&mut self, mem: &GuestMem, buf: &[u8]) -> Result<Reply, CommandError> {
         let cmd = TransferToHost2d::parse(buf)
@@ -2415,6 +2462,205 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         self.waker = Some(waker);
     }
 
+    /// Both queues' positions, control first (ADR-0006).
+    fn queue_positions(&self) -> Vec<virtio_core::QueuePosition> {
+        use virtio_queue::QueueT as _;
+        let position = |queue: &Queue| virtio_core::QueuePosition {
+            next_avail: queue.next_avail(),
+            next_used: queue.next_used(),
+        };
+        match (&self.control, &self.cursor) {
+            (Some(control), Some(cursor)) => vec![position(control), position(cursor)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The 2D resource table, the scanout binding and how many 3D contexts the
+    /// guest had open (ADR-0006).
+    ///
+    /// The resources' **pixels are deliberately not here**. They are a copy of
+    /// guest pages the snapshot already carries in full, and re-running the
+    /// transfer on the way back in rebuilds them byte for byte — for a
+    /// 1920×1080 desktop that is eight megabytes saved per resource, several
+    /// times over.
+    ///
+    /// A resource with no backing attached is the one case where that reasoning
+    /// does not hold: its pixels came from a transfer whose source the guest
+    /// has since detached. It is still recorded, so its id stays valid, and it
+    /// comes back black — which is what the guest's next `TRANSFER_TO_HOST_2D`
+    /// will overwrite anyway.
+    ///
+    /// **Blob resources are counted, not described** (VEN-2001). A blob is a
+    /// host-visible mapping into a shared-memory window this process owns, and
+    /// a `HOST3D` one's bytes never left the renderer at all — there is nothing
+    /// a restore could put back and nothing useful to write down. They are
+    /// treated exactly like 3D contexts: the count goes in the file, and a
+    /// restored device that finds a non-zero one tells the driver to start
+    /// again.
+    fn save_device(&self) -> Vec<u8> {
+        let state = crate::save::GpuState {
+            events_read: self.events_read,
+            live_3d_contexts: self
+                .three_d
+                .as_ref()
+                .map(|gpu| gpu.context_count() as u32)
+                .unwrap_or(0),
+            live_blobs: self.blobs.len() as u32,
+            resources: self
+                .resources
+                .iter()
+                .map(|resource| crate::save::SavedResource {
+                    id: resource.id(),
+                    format: resource.format(),
+                    width: resource.width(),
+                    height: resource.height(),
+                    backing: resource.backing().to_vec(),
+                })
+                .collect(),
+            scanout: self.scanout.map(|s| crate::save::SavedScanout {
+                resource_id: s.resource_id,
+                rect: s.rect,
+                source: match s.source {
+                    ScanoutSource::TwoD => crate::save::SavedScanoutSource::TwoD,
+                    ScanoutSource::ThreeD => crate::save::SavedScanoutSource::ThreeD,
+                    ScanoutSource::Blob { stride, offset } => {
+                        crate::save::SavedScanoutSource::Blob { stride, offset }
+                    }
+                },
+            }),
+        };
+        state.encode()
+    }
+
+    /// Rebuilds the 2D table from the snapshot and the restored guest memory.
+    ///
+    /// Runs after the transport has re-activated the device, so `self.mem` is
+    /// the restored guest RAM and every backing page the guest attached is
+    /// already back where it was. Each resource is re-created, its backing
+    /// re-attached and the whole image transferred in — the same code path the
+    /// guest's own `TRANSFER_TO_HOST_2D` takes, with the same bounds checks,
+    /// because the addresses in the file are no more trustworthy than the ones
+    /// in a command.
+    ///
+    /// Then the scanout is re-bound and pushed to the window, so the resumed
+    /// VM shows the frame it was showing when it was suspended rather than
+    /// whatever the fresh display was initialised to.
+    fn load_device(&mut self, bytes: &[u8]) -> Result<(), DeviceError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let state = crate::save::GpuState::decode(bytes)
+            .map_err(|e| DeviceError::Backend(e.to_string()))?;
+        self.events_read = state.events_read;
+
+        let mem = match self.mem.clone() {
+            Some(mem) => mem,
+            None => {
+                // The device was never activated, so nothing can have been
+                // created either. A snapshot that says otherwise describes a
+                // machine this one is not.
+                if !state.resources.is_empty() {
+                    return Err(DeviceError::Backend(format!(
+                        "virtio-gpu snapshot has {} resources but the device was not activated",
+                        state.resources.len()
+                    )));
+                }
+                return Ok(());
+            }
+        };
+
+        let mut restored = 0usize;
+        let mut blank = 0usize;
+        for saved in &state.resources {
+            self.resources
+                .create(saved.id, saved.format, saved.width, saved.height)
+                .map_err(|e| DeviceError::Backend(format!("resource {}: {e}", saved.id)))?;
+            if saved.backing.is_empty() {
+                blank += 1;
+                continue;
+            }
+            let resource = self
+                .resources
+                .get_mut(saved.id)
+                .ok_or_else(|| DeviceError::Backend(format!("resource {} vanished", saved.id)))?;
+            resource.attach(saved.backing.clone());
+            let whole = Rect {
+                x: 0,
+                y: 0,
+                width: saved.width,
+                height: saved.height,
+            };
+            match resource.transfer_from_backing(mem.as_ref(), whole, 0) {
+                Ok(()) => restored += 1,
+                // A backing list the guest had attached but not yet filled is
+                // legitimate (the driver attaches before it draws), and a short
+                // one is the guest's own business. Neither is a reason to
+                // refuse the whole restore: the resource comes back black and
+                // the guest's next transfer fixes it.
+                Err(error) => {
+                    blank += 1;
+                    tracing::debug!(
+                        resource = saved.id,
+                        %error,
+                        "restored a virtio-gpu resource without its pixels"
+                    );
+                }
+            }
+        }
+
+        let mut shown = false;
+        if let Some(saved) = state.scanout {
+            if saved.source.is_host_owned() {
+                tracing::warn!(
+                    resource = saved.resource_id,
+                    source = ?saved.source,
+                    "the suspended guest was scanning out a resource whose pixels live on the \
+                     host; the window keeps its initial frame until the driver programs a new \
+                     scanout"
+                );
+            } else if self.resources.get(saved.resource_id).is_some() {
+                if self.display.resolution() != (saved.rect.width, saved.rect.height) {
+                    self.display
+                        .set_resolution(saved.rect.width, saved.rect.height)
+                        .map_err(|e| DeviceError::Backend(e.to_string()))?;
+                }
+                self.scanout = Some(ScanoutBinding {
+                    resource_id: saved.resource_id,
+                    rect: saved.rect,
+                    source: ScanoutSource::TwoD,
+                });
+                shown = self.present_whole_scanout();
+            }
+        }
+
+        if state.live_3d_contexts > 0 || state.live_blobs > 0 {
+            // Nothing in virglrenderer, or in GL, hands a live rendering
+            // context back in a form another process could reload; and a blob
+            // is a mapping into a host-visible window this process did not
+            // exist to make (VEN-2001). The driver is told to start again — the
+            // same signal, and the same recovery, as a renderer that crashed
+            // (ADR-0004 GPU-012).
+            self.restored_3d_lost = true;
+            self.restored_3d_reported = false;
+            tracing::warn!(
+                contexts = state.live_3d_contexts,
+                blobs = state.live_blobs,
+                "the suspended guest had host-side GPU state open (3D contexts, blob \
+                 resources); it cannot be restored, so the driver will be told the device \
+                 needs a reset"
+            );
+        }
+
+        tracing::info!(
+            restored,
+            blank,
+            scanout = self.scanout.map(|s| s.resource_id),
+            presented = shown,
+            "virtio-gpu restored from a snapshot"
+        );
+        Ok(())
+    }
+
     fn reset(&mut self) {
         // Fenced responses the guest will never collect: the driver is
         // tearing the queues down, so the chains they pinned simply go away
@@ -2450,6 +2696,9 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         self.blobs.clear();
         self.req_buf = Vec::new();
         self.flush_buf = Vec::new();
+        // The driver has done what it was told; the restore's warning is spent.
+        self.restored_3d_lost = false;
+        self.restored_3d_reported = false;
     }
 }
 

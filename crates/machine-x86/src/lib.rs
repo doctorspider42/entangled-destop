@@ -16,6 +16,7 @@ pub mod platform;
 pub mod reset;
 pub mod rtc;
 pub mod serial;
+pub mod state;
 
 /// The virtio-mmio window: address decoding, slot placement and the guest
 /// cmdline clauses that announce it — **portable** since EPIC 17 phase 3.

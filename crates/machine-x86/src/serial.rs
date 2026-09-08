@@ -148,6 +148,43 @@ impl SerialConsole {
     }
 
     /// Queues guest-bound input (host keyboard → guest console).
+    /// The register file and the unread host input (ADR-0006).
+    ///
+    /// The receive queue goes with it because it is guest-visible state that
+    /// nothing else holds: bytes the host typed and the guest has not read yet.
+    /// The output sink and the interrupt line do not — they are this process's
+    /// wiring, rebuilt by whoever assembles the restored machine.
+    pub fn save_state(&self) -> crate::state::SavedSerial {
+        crate::state::SavedSerial {
+            ier: self.ier,
+            lcr: self.lcr,
+            mcr: self.mcr,
+            scr: self.scr,
+            dll: self.dll,
+            dlh: self.dlh,
+            thre_pending: self.thre_pending,
+            rx: self.rx.iter().copied().collect(),
+        }
+    }
+
+    /// Puts it back.
+    ///
+    /// Deliberately does not re-raise the line for a queue that is not empty:
+    /// the interrupt controller's own state is restored beside this one, so an
+    /// interrupt the guest was already owed is already pending there. Raising
+    /// again here would deliver it twice.
+    pub fn load_state(&mut self, state: &crate::state::SavedSerial) {
+        self.ier = state.ier;
+        self.lcr = state.lcr;
+        self.mcr = state.mcr;
+        self.scr = state.scr;
+        self.dll = state.dll;
+        self.dlh = state.dlh;
+        self.thre_pending = state.thre_pending;
+        self.rx.clear();
+        self.rx.extend(state.rx.iter().copied());
+    }
+
     pub fn push_input(&mut self, data: &[u8]) {
         for &b in data {
             if self.rx.len() >= RX_CAPACITY {

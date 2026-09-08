@@ -518,10 +518,11 @@ Blob resources themselves (`virtio_gpu::blob`) are the device half:
   on all three, and boot the INTx variant too — `PciInterruptMode::IntxOnly`,
   because a guest offered MSI-X will never pick INTx on its own.
 
-## Pause and reset: what every device owes the machine (ADR-0005)
+## Pause, reset and suspend: what every device owes the machine (ADR-0005, ADR-0006)
 
-A VM can now be **frozen** and **rebooted in place**, so a device is not finished
-when it works — it has to survive both. Two obligations, one line each:
+A VM can be **frozen**, **rebooted in place** and **written to a file**, so a
+device is not finished when it works — it has to survive all three. Three
+obligations:
 
 1. **`reset()` returns the device to power-on**, infallibly. This already existed
    as the driver-facing device reset (a write of 0 to `device_status`); a machine
@@ -559,4 +560,60 @@ On virtio-pci the bus additionally restores each function's configuration space
 from a power-on snapshot taken at attach, then **re-bases the notify
 ioeventfds** around the restored BARs (`reconcile_notify`). Miss that and the
 next boot's kicks land at an address nothing is listening to — a device that
-enumerates, negotiates and then never completes a request.
+enumerates, negotiates and then never completes a request. The *restore* path
+goes through the same `reconcile_notify` for the same reason.
+
+### 3. `queue_positions`, and a `save_device`/`load_device` pair if you hold
+anything else (ADR-0006)
+
+`TransportState::save`/`load` carry everything the transport owns — features,
+status, queue geometry, the ISR, `config_generation`, the MSI-X table. What it
+cannot see is inside your device:
+
+```rust
+fn queue_positions(&self) -> Vec<virtio_core::QueuePosition>   // next_avail / next_used, in queue order
+fn save_device(&self) -> Vec<u8>                                // anything else, your encoding
+fn load_device(&mut self, bytes: &[u8]) -> Result<(), DeviceError>
+```
+
+- **A device that holds queues must implement `queue_positions`.** The positions
+  cannot be recomputed from guest memory for a device that holds a descriptor
+  chain across a host fence (virtio-gpu does), and a restored device that forgot
+  where it was hands the same buffers out twice. Empty when not activated.
+- On restore the transport applies the positions to the rebuilt queues **before**
+  `activate()`, so a device that starts serving on activation does not first
+  re-serve what it already completed.
+- `load_device`'s bytes come out of a **file**: treat them exactly like a guest
+  command. Bounds-check every length before allocating, and return an error
+  rather than half-applying. `virtio_gpu::save` is the worked example, in the
+  same explicit-`from_le_bytes` style as `virtio_gpu::protocol`.
+- **Save what the guest cannot rebuild, not what it can.** virtio-gpu records its
+  2D resources' identity, geometry and *guest backing list* — not their pixels,
+  which are a copy of guest pages the snapshot already carries, and which the
+  restore re-derives by re-running the transfer. Eight megabytes per resource
+  saved, several times over.
+- **Say so when something cannot come back.** virtio-net's NAT flows,
+  virtio-snd's host sink, and virtio-gpu's 3D contexts and blob resources are
+  gone by construction. The network and the audio are left to the guest to
+  notice (what a laptop suspend does to them); the GPU raises
+  `DEVICE_NEEDS_RESET` through the same path GPU-012 uses for a crashed
+  renderer. None of them silently pretends.
+- **A device's own state has its own version, and so does the section around
+  it.** Adding a field is a bump: `virtio` went to 2 when `SHM_SEL` and the
+  host's shared-memory placement joined it, and virtio-gpu's blob went to 2 when
+  the scanout source became three-way. Defaulting a missing field would restore
+  a guest whose driver had selected a region into one that had not, so the old
+  snapshot is refused by number instead — `SectionVersion` names the section and
+  both versions.
+- **Guest-visible state the *host* chose still needs recording.** A
+  shared-memory region's base is placed by the machine, not the guest — but the
+  guest read it out of the registers and its mappings point at it. It is saved
+  not to be restored but so a machine that placed the window elsewhere is a
+  refusal. The same reasoning applies to anything else the host hands the guest
+  as an address.
+
+There is a fourth obligation that is not the device's but is worth knowing about
+when a resumed guest misbehaves: on **KVM** the 8259s, IOAPIC and 8254 are in
+the kernel, and the snapshot carries them through `vmm_core::hv::HostIrqChip`.
+A restore that skipped them comes back with every IOAPIC pin masked — and MSI-X
+devices keep working, so the VM looks half-alive.

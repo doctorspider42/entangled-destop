@@ -339,6 +339,58 @@ impl VirtioMmioBus {
         }
     }
 
+    /// Every slot on this window, for a snapshot (ADR-0006).
+    pub fn save_state(&self) -> Vec<crate::state::SavedVirtioSlot> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.transport.lock() {
+                Ok(transport) => Some(crate::state::SavedVirtioSlot {
+                    slot: index as u32,
+                    state: transport.save(),
+                }),
+                Err(_) => {
+                    tracing::error!(
+                        base = format_args!("{:#x}", slot.base),
+                        "virtio-mmio transport lock is poisoned; this device is not saved"
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Puts them back.
+    ///
+    /// Nothing to re-base afterwards: a virtio-mmio window sits at a fixed
+    /// address the host chose and announced on the kernel command line, so the
+    /// queue-notify registrations point where they always did.
+    pub fn load_state(
+        &self,
+        saved: &[crate::state::SavedVirtioSlot],
+    ) -> Result<(), crate::state::StateError> {
+        if saved.len() != self.slots.len() {
+            return Err(crate::state::StateError::Count {
+                what: "virtio-mmio slots",
+                snapshot: saved.len(),
+                current: self.slots.len(),
+            });
+        }
+        for (index, (slot, saved)) in self.slots.iter().zip(saved).enumerate() {
+            let mut transport = slot
+                .transport
+                .lock()
+                .map_err(|_| crate::state::StateError::Poisoned("a virtio-mmio transport"))?;
+            transport
+                .load(&saved.state)
+                .map_err(|source| crate::state::StateError::Virtio {
+                    slot: index,
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }

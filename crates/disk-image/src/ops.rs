@@ -550,7 +550,7 @@ pub fn disk_space(_dir: &Path) -> Option<(u64, u64)> {
 /// Marks an open file sparse. A no-op outside Windows: unix filesystems keep
 /// holes wherever nothing was written, with no attribute involved.
 #[cfg(windows)]
-pub(crate) fn mark_sparse(file: &File) -> io::Result<()> {
+pub fn mark_sparse(file: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle as _;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Ioctl::FSCTL_SET_SPARSE;
@@ -578,7 +578,7 @@ pub(crate) fn mark_sparse(file: &File) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn mark_sparse(_file: &File) -> io::Result<()> {
+pub fn mark_sparse(_file: &File) -> io::Result<()> {
     Ok(())
 }
 

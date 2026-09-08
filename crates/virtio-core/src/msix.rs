@@ -350,6 +350,12 @@ impl MsixInterrupt {
         Arc::clone(&self.control)
     }
 
+    /// How many per-queue vector registers this function keeps.
+    pub fn queue_vector_count(&self) -> usize {
+        self.with_state("queue vector count", |s| s.queue_vectors.len())
+            .unwrap_or(0)
+    }
+
     /// Number of vectors in the table.
     pub fn table_size(&self) -> u16 {
         self.table_size
@@ -717,6 +723,96 @@ impl TransportInterrupt for MsixInterrupt {
 
     fn take_status(&self) -> u32 {
         self.line.take_status()
+    }
+
+    /// The whole guest-programmed MSI-X state, on top of the pending word and
+    /// the generation counter every transport has (ADR-0006).
+    ///
+    /// The table and the message-control register are the interesting half:
+    /// they are where the guest recorded which host address each queue's
+    /// interrupt goes to, and a restored function that forgot them would raise
+    /// nothing at all until the driver happened to re-enumerate.
+    fn save_interrupt(&self) -> crate::save::InterruptState {
+        let msix = self
+            .with_state("save", |s| crate::save::MsixState {
+                control: self.control.load(Ordering::Acquire),
+                config_vector: s.config_vector,
+                queue_vectors: s.queue_vectors.clone(),
+                entries: s
+                    .entries
+                    .iter()
+                    .map(|e| crate::save::MsixEntryState {
+                        address_lo: e.address_lo,
+                        address_hi: e.address_hi,
+                        data: e.data,
+                        vector_control: e.vector_control,
+                    })
+                    .collect(),
+                pending: s.pending.clone(),
+            })
+            .unwrap_or_default();
+        crate::save::InterruptState {
+            isr: self.line.status(),
+            generation: self.line.generation(),
+            msix: Some(msix),
+        }
+    }
+
+    /// Puts it back.
+    ///
+    /// The table size is the *function's* shape, decided by the host when the
+    /// bus was built, so a snapshot whose table is a different size is refused
+    /// rather than truncated: it describes a function this machine did not
+    /// build.
+    ///
+    /// Nothing pending is delivered here. The PBA is restored as it was, and
+    /// the guest unmasking a vector is what sends it — exactly as it would have
+    /// been without the suspend.
+    fn load_interrupt(
+        &self,
+        state: &crate::save::InterruptState,
+    ) -> Result<(), crate::save::StateError> {
+        self.line.restore(state.isr, state.generation);
+        let Some(msix) = &state.msix else {
+            // A snapshot of a function without MSI-X being loaded into one with
+            // it: the machine's shape check should have caught this first, so
+            // reaching here means the two disagree.
+            return Err(crate::save::StateError::MsixTableSize {
+                snapshot: 0,
+                current: usize::from(self.table_size),
+            });
+        };
+        if msix.entries.len() != usize::from(self.table_size) {
+            return Err(crate::save::StateError::MsixTableSize {
+                snapshot: msix.entries.len(),
+                current: usize::from(self.table_size),
+            });
+        }
+        self.control.store(msix.control, Ordering::Release);
+        self.with_state("load", |s| {
+            if msix.queue_vectors.len() == s.queue_vectors.len() {
+                s.queue_vectors.copy_from_slice(&msix.queue_vectors);
+            }
+            s.config_vector = msix.config_vector;
+            for (slot, saved) in s.entries.iter_mut().zip(&msix.entries) {
+                slot.address_lo = saved.address_lo;
+                slot.address_hi = saved.address_hi;
+                slot.data = saved.data;
+                slot.vector_control = saved.vector_control & MSIX_VECTOR_CTRL_KNOWN;
+            }
+            for (slot, saved) in s.pending.iter_mut().zip(&msix.pending) {
+                *slot = *saved;
+            }
+        });
+        if msix.queue_vectors.len() != usize::from(self.table_size)
+            && msix.queue_vectors.len() != self.queue_vector_count()
+        {
+            return Err(crate::save::StateError::QueueCount {
+                snapshot: msix.queue_vectors.len(),
+                current: self.queue_vector_count(),
+            });
+        }
+        Ok(())
     }
 
     fn generation(&self) -> u32 {

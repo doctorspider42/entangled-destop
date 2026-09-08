@@ -695,6 +695,31 @@ impl VirtioDevice for InputDevice {
         }
     }
 
+    /// Both queues' positions, `eventq` first (ADR-0006).
+    ///
+    /// Nothing else needs carrying. The host-side `pending` buffer is
+    /// deliberately dropped by a suspend the same way it is by a reset: it
+    /// holds keystrokes and pointer motion that happened *before* the guest was
+    /// frozen and were never delivered, and replaying a burst of them into a
+    /// guest that resumes minutes later would be worse than losing them.
+    fn queue_positions(&self) -> Vec<virtio_core::QueuePosition> {
+        use virtio_queue::QueueT as _;
+        let state = lock(&self.shared.state);
+        state
+            .active
+            .as_ref()
+            .map(|active| {
+                [&active.eventq, &active.statusq]
+                    .into_iter()
+                    .map(|queue| virtio_core::QueuePosition {
+                        next_avail: queue.next_avail(),
+                        next_used: queue.next_used(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn reset(&mut self) {
         let mut state = lock(&self.shared.state);
         let dropped = state.pending.len();

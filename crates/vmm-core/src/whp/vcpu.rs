@@ -127,9 +127,15 @@ impl WhpVcpu {
             .map_err(|_| self.fail(format!("register batch of {} is too large", names.len())))
     }
 
+    /// The partition this VP belongs to, for the `WHvGetVirtualProcessorState`
+    /// family (which takes a handle rather than a VP object).
+    pub(super) fn partition_handle(&self) -> WHV_PARTITION_HANDLE {
+        self.partition.handle()
+    }
+
     /// Reads an arbitrary register batch. `names` and `values` must be the same
     /// length; the caller decides which union arm each value carries.
-    fn get_raw(
+    pub(super) fn get_raw(
         &self,
         names: &[WHV_REGISTER_NAME],
         values: &mut [WHV_REGISTER_VALUE],
@@ -139,7 +145,7 @@ impl WhpVcpu {
     }
 
     /// Writes an arbitrary register batch.
-    fn set_raw(
+    pub(super) fn set_raw(
         &self,
         names: &[WHV_REGISTER_NAME],
         values: &[WHV_REGISTER_VALUE],
@@ -641,6 +647,16 @@ impl WhpVcpu {
 }
 
 impl ResettableVcpu for WhpVcpu {
+    /// See `crate::whp::snapshot`, which owns the MSR list, the ordering rules
+    /// and the blob formats on this host.
+    fn save_cpu_state(&self) -> Result<crate::hv::X86CpuState, HvError> {
+        self.snapshot()
+    }
+
+    fn load_cpu_state(&mut self, state: &crate::hv::X86CpuState) -> Result<(), HvError> {
+        self.restore(state)
+    }
+
     /// Deletes this virtual processor and creates it again.
     ///
     /// WHP has no "reset a VP" call, but it has something better: a VP that

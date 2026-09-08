@@ -694,3 +694,51 @@ end-to-end, on this host: `cargo test -p entangled --test guest_reboot --
 --ignored` reboots an installed Ubuntu twice through its own firmware in 414 s,
 each one arriving as `0xcf9 cold reset` and coming back through
 `BdsDxe: starting Boot0006 "Ubuntu"`.
+
+
+## Snapshotting a VP (ADR-0006)
+
+`WhpVcpu::snapshot`/`restore` (`crates/vmm-core/src/whp/snapshot.rs`) fill the
+same neutral `X86CpuState` the KVM backend does. What is WHP-shaped about it:
+
+- **WHP has no MSR index list.** Its enumeration *is* the `WHvX64Register*` name
+  space: an MSR WHP has no name for is one it will not hand over. The table maps
+  each name to its **architectural index**, so the snapshot says `0xc0000102`
+  rather than a WHP enum value — and the whole batch is read in one call, with a
+  per-register retry if it fails, so a partition that refuses one loses one.
+  `IA32_MISC_ENABLE` has no WHP name and is a documented gap; KVM carries it.
+- **The local APIC and the XSAVE area come through the state APIs**, not the
+  register ones: `WHvGet/SetVirtualProcessorInterruptControllerState` and
+  `WHvGet/SetVirtualProcessorXsaveState`. Both are opaque blobs, tagged with the
+  host that wrote them so neither can ever reach `KVM_SET_LAPIC`.
+- **`mp_state` is `WHvRegisterInternalActivityState`'s startup-suspend bit.** An
+  application processor still waiting for its INIT/SIPI has to come back
+  waiting; KVM's finer `InitReceived`/`SipiReceived` grain collapses onto that
+  one bit, and it collapses to the *safe* side.
+- **The event registers are read as raw `AsUINT64` and rebuilt bit for bit.**
+  The parts with no neutral home — interruption type, instruction length, the
+  nested flag — ride in `X86PendingEvents::host_event_flags`, which is exactly
+  what that field is for. The unit tests assert an exact round trip for six
+  register shapes, because an approximation here is an interrupt delivered with
+  the wrong vector.
+- **A pending exception event is refused, not dropped.**
+  `WHvRegisterPendingEvent` is 128 bits with a fault parameter this build cannot
+  carry. A VP parked between two exits should never have one; if it does, the
+  snapshot fails rather than silently losing an exception the guest is owed.
+- **Every register buffer still needs `Aligned16`**, and a `Vec` will not do it:
+  `Aligned16(Vec<T>)` aligns the *Vec struct*, not its heap buffer. The snapshot
+  path uses a fixed `Aligned16([WHV_REGISTER_VALUE; MAX_BATCH])` local and
+  slices it.
+- **Restore writes every VP, not just the boot one.** The rule that leaves an AP
+  untouched exists so the guest's own INIT/SIPI can start it from WHP's reset
+  state; a *restored* AP is not being started, it is being put back exactly where
+  it was.
+
+Nothing here is needed on the KVM side and nothing there is needed here: both
+`save_cpu_state` and `load_cpu_state` have defaults on `ResettableVcpu`, so this
+was additive (ADR-0002).
+
+Acceptance on this host: `cargo test -p entangled --test suspend_restore` —
+suspended at `VMHOST_HEARTBEAT 3`, resumed at 4, no second ready marker, and all
+six refusals named including "snapshot was taken on Linux/KVM and this is
+Windows/WHP".
