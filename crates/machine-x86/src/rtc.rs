@@ -220,6 +220,37 @@ impl Rtc {
         }
     }
 
+    /// The index latch and the CMOS bytes (ADR-0006).
+    ///
+    /// Not the time-of-day registers: those are computed from the host clock on
+    /// every read and have no stored form. A restored guest therefore sees the
+    /// real wall-clock time, which has moved on — the same thing a laptop's own
+    /// suspend does, and the reason `hwclock` exists.
+    pub fn save_state(&self) -> crate::state::SavedRtc {
+        crate::state::SavedRtc {
+            index: self.index,
+            cmos: self.cmos.to_vec(),
+        }
+    }
+
+    /// Puts it back. A snapshot whose CMOS is a different size is refused: it
+    /// describes an RTC this build did not make.
+    pub fn load_state(
+        &mut self,
+        state: &crate::state::SavedRtc,
+    ) -> Result<(), crate::state::StateError> {
+        if state.cmos.len() != self.cmos.len() {
+            return Err(crate::state::StateError::Count {
+                what: "CMOS bytes",
+                snapshot: state.cmos.len(),
+                current: self.cmos.len(),
+            });
+        }
+        self.index = state.index;
+        self.cmos.copy_from_slice(&state.cmos);
+        Ok(())
+    }
+
     pub fn io_read(&mut self, port: u16, data: &mut [u8]) {
         let value = if port == RTC_INDEX_PORT {
             // EDK2 reads this back to preserve the NMI-disable bit.

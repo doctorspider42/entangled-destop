@@ -45,6 +45,7 @@ mod emulator;
 mod interrupt;
 mod partition;
 mod regs;
+mod snapshot;
 mod vcpu;
 
 pub use cpuid::{CpuidPolicy, CpuidResult, CPUID_EXIT_LEAVES};

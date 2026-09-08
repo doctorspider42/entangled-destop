@@ -1519,6 +1519,42 @@ impl VirtioDevice for SoundDevice {
         }
     }
 
+    /// All four queues' positions, in spec order: control, event, TX, RX
+    /// (ADR-0006).
+    ///
+    /// TX is read through the handle the device keeps beside the pump's, which
+    /// is safe here and only here: this runs with the VM paused and the pump
+    /// parked on the quiesce gate, so the lock is free and the number is not
+    /// moving.
+    ///
+    /// **What a restored virtio-snd cannot bring back is the host sink.** The
+    /// WASAPI or ALSA device this process opened is gone, and a new one is
+    /// opened at whatever position the sink starts from — so a stream that was
+    /// mid-playback resumes with a gap, exactly as it would across a real
+    /// machine's suspend. The guest's *stream state* (its parameters, whether
+    /// it was started) is the device's own and comes back with the queues.
+    fn queue_positions(&self) -> Vec<virtio_core::QueuePosition> {
+        let position = |queue: &Queue| virtio_core::QueuePosition {
+            next_avail: queue.next_avail(),
+            next_used: queue.next_used(),
+        };
+        let inner = lock(&self.shared.inner);
+        match (
+            &self.control_queue,
+            &self.event_queue,
+            &inner.tx_queue,
+            &self.rx_queue,
+        ) {
+            (Some(control), Some(event), Some(tx), Some(rx)) => vec![
+                position(control),
+                position(event),
+                position(tx),
+                position(rx),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
     fn reset(&mut self) {
         // Order matters: stop the pump first so nothing touches the queues or
         // guest memory after they are dropped.

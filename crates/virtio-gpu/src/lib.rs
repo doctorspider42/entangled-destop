@@ -75,6 +75,7 @@ pub mod protocol;
 pub mod remote;
 pub mod renderer;
 pub mod resource;
+pub mod save;
 pub mod sink;
 #[cfg(target_os = "linux")]
 pub mod virgl;
@@ -95,6 +96,7 @@ pub use pacing::{FramePacing, PacingReport};
 pub use protocol::{cmd, resp, CtrlHdr, Rect, FLAG_FENCE, FLAG_INFO_RING_IDX};
 pub use renderer::{CapsetInfo, FenceOutcome, Gpu3d, Renderer3d, ScanoutExport};
 pub use resource::{Resource, ResourceTable};
+pub use save::{GpuState, GpuStateError, SavedResource, SavedScanout};
 pub use sink::{ScanoutSink, SinkError};
 
 /// `VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM` (MVP-809): 32-bit little-endian pixels in

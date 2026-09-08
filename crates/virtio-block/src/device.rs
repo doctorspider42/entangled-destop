@@ -771,6 +771,32 @@ impl VirtioDevice for BlockDevice {
         result
     }
 
+    /// virtio-blk has **no state beyond its queue** once the VM is quiesced
+    /// (ADR-0006).
+    ///
+    /// Every request is served synchronously inside `notify`: the chain is
+    /// walked, the file read or written, the used entry added and the interrupt
+    /// signalled before `notify` returns. So a paused device holds nothing —
+    /// there is no in-flight list to drain, because there is nowhere for a
+    /// request to be in flight. `crates/virtio-block/tests/blk_queue.rs`
+    /// asserts that as a property rather than as a comment.
+    ///
+    /// What still has to be carried is the *position*: the guest may have
+    /// posted requests the device has not been kicked for yet, and a restored
+    /// device that started at zero would serve every completed request again.
+    fn queue_positions(&self) -> Vec<virtio_core::QueuePosition> {
+        use virtio_queue::QueueT as _;
+        self.queue
+            .as_ref()
+            .map(|q| {
+                vec![virtio_core::QueuePosition {
+                    next_avail: q.next_avail(),
+                    next_used: q.next_used(),
+                }]
+            })
+            .unwrap_or_default()
+    }
+
     fn reset(&mut self) {
         // Data the guest believed was flushed must not be lost across a reset.
         if let Err(error) = self.disk.flush() {

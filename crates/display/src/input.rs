@@ -25,6 +25,7 @@
 //! | `Ctrl+Alt+Q` | ask the VM to shut down ([`ControlEvent::QuitRequested`]) |
 //! | `Ctrl+Alt+P` | freeze/continue the VM ([`ControlEvent::PauseToggleRequested`]) |
 //! | `Ctrl+Alt+R` | reboot the VM in place ([`ControlEvent::ResetRequested`]) |
+//! | `Ctrl+Alt+S` | suspend the VM to its snapshot file ([`ControlEvent::SaveRequested`]) |
 //! | `F11` | toggle borderless fullscreen ([`WindowAction::ToggleFullscreen`]) |
 //! | `Ctrl+Alt+O` | toggle 1:1 pixel mode ([`WindowAction::ToggleScaleMode`]) |
 //!
@@ -107,6 +108,14 @@ pub enum ControlEvent {
     /// reset, same process, same window — not a "reset button" that kills the
     /// VM and starts another one.
     ResetRequested,
+    /// `Ctrl+Alt+S`: write the whole VM to its snapshot file and stop
+    /// (ADR-0006).
+    ///
+    /// One-way, like closing a laptop lid: the VM freezes, its state goes to
+    /// the file, and the process ends. `entangled resume <file>` is how it
+    /// comes back — which is *another* process, with another window, so there
+    /// is nothing for this one to toggle back to.
+    SaveRequested,
 }
 
 /// A window-level effect the event loop has to apply (backlog EPIC 15).
@@ -121,9 +130,10 @@ pub enum WindowAction {
     SetGrab(bool),
     /// `Ctrl+Alt+Q`: the user asked the VM to shut down.
     Quit,
-    /// `Ctrl+Alt+P` / `Ctrl+Alt+R`: a lifecycle request the supervisor serves
-    /// (ADR-0005). The window itself does nothing but report it — pausing is
-    /// not a window state.
+    /// `Ctrl+Alt+P` / `Ctrl+Alt+R` / `Ctrl+Alt+S`: a lifecycle request the
+    /// supervisor serves (ADR-0005, ADR-0006). The window itself does nothing
+    /// but report it — pausing is not a window state, and neither is being
+    /// written to a file.
     Lifecycle,
     /// `F11`: toggle borderless fullscreen (WIN-1504).
     ToggleFullscreen,
@@ -752,6 +762,15 @@ impl InputCapture {
             KeyCode::KeyR => {
                 self.release_all();
                 self.control.push(ControlEvent::ResetRequested);
+                Some(WindowAction::Lifecycle)
+            }
+            // Suspend (ADR-0006). Reserved on the same terms as its neighbours
+            // and for a stronger reason: the guest is about to be frozen for
+            // good, so it must not be left holding a modifier it can never see
+            // released.
+            KeyCode::KeyS => {
+                self.release_all();
+                self.control.push(ControlEvent::SaveRequested);
                 Some(WindowAction::Lifecycle)
             }
             _ => None,

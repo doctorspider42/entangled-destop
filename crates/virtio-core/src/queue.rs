@@ -132,6 +132,35 @@ impl QueueConfig {
         set_high(&mut self.device_area, value);
     }
 
+    /// This queue's guest-programmed geometry, for a snapshot (ADR-0006).
+    ///
+    /// `max_size` is deliberately absent: it is the *device's* advertised
+    /// maximum, not guest state, and a snapshot that carried it would let a
+    /// rebuilt device silently take a different one from the file.
+    pub fn to_state(&self, position: crate::save::QueuePosition) -> crate::save::QueueState {
+        crate::save::QueueState {
+            size: self.size,
+            ready: self.ready,
+            desc_table: self.desc_table,
+            driver_area: self.driver_area,
+            device_area: self.device_area,
+            position,
+        }
+    }
+
+    /// Puts a saved geometry back.
+    ///
+    /// Nothing is validated here — this is still exactly what the guest had
+    /// written into the registers, and [`Self::build`] is where guest-programmed
+    /// geometry is checked, on the restore path as on the boot path.
+    pub fn load_state(&mut self, state: &crate::save::QueueState) {
+        self.size = state.size;
+        self.ready = state.ready;
+        self.desc_table = state.desc_table;
+        self.driver_area = state.driver_area;
+        self.device_area = state.device_area;
+    }
+
     /// Turns guest-programmed register state into a usable virtqueue.
     ///
     /// This is the single place where the guest's queue geometry is validated:

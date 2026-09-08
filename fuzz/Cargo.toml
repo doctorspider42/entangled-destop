@@ -32,6 +32,7 @@ virtio-block = { path = "../crates/virtio-block" }
 virtio-gpu = { path = "../crates/virtio-gpu" }
 virtio-sound = { path = "../crates/virtio-sound" }
 debian-media = { path = "../crates/debian-media" }
+vm-snapshot = { path = "../crates/vm-snapshot" }
 
 [[bin]]
 name = "chain_walk"
@@ -99,6 +100,13 @@ bench = false
 [[bin]]
 name = "snd_device"
 path = "fuzz_targets/snd_device.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_parse"
+path = "fuzz_targets/snapshot_parse.rs"
 test = false
 doc = false
 bench = false

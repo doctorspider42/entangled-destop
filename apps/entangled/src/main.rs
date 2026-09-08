@@ -16,6 +16,7 @@ mod paths;
 mod run_vm;
 #[cfg(any(target_os = "linux", windows))]
 mod seed;
+mod snapshot;
 
 /// The isolated-renderer helper (ADR-0004 GPU-012). Linux-only, like the
 /// renderer it hosts.
@@ -35,7 +36,7 @@ mod gpu_renderer {
     }
 }
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -102,13 +103,61 @@ enum Command {
         #[arg(long, requires = "screenshot_after")]
         screenshot: Option<PathBuf>,
         /// Read lifecycle commands from stdin, one per line: `pause`,
-        /// `resume`, `reset`, `type <text>`, `status` (ADR-0005).
+        /// `resume`, `reset`, `save [path]`, `type <text>`, `status`
+        /// (ADR-0005, ADR-0006).
         ///
         /// For a program driving this VM — `entangled-manager` uses it for the
-        /// Pause and Restart buttons. The window's Ctrl+Alt+P and Ctrl+Alt+R
-        /// do the same thing for a person, and need no flag.
+        /// Pause and Restart buttons. The window's Ctrl+Alt+P, Ctrl+Alt+R and
+        /// Ctrl+Alt+S do the same things for a person, and need no flag.
         #[arg(long)]
         control_stdin: bool,
+        /// Where Ctrl+Alt+S and a bare `save` write this VM (ADR-0006).
+        ///
+        /// Defaults to <profile-name>.esnap beside the profile. `entangled
+        /// resume <file>` brings it back.
+        #[arg(long, value_name = "FILE")]
+        snapshot: Option<PathBuf>,
+    },
+    /// Read a snapshot file without starting anything.
+    ///
+    /// What it is of, when it was taken, how big, what it contains, which
+    /// disks it is pinned to and whether this machine could restore it. Opens
+    /// no disk and allocates no guest memory, so it answers for a snapshot from
+    /// the other hypervisor too — it says so instead of failing.
+    Snapshot {
+        /// The snapshot file.
+        snapshot: PathBuf,
+    },
+    /// Bring a suspended VM back from its snapshot file (ADR-0006).
+    ///
+    /// The snapshot carries the profile it was taken from, so this needs
+    /// nothing else. It refuses — by name — a snapshot taken on the other
+    /// hypervisor, one written by a build with a different format version, a
+    /// corrupt or truncated file, and one whose disks have changed since:
+    /// restoring a live kernel onto storage that has moved on corrupts the
+    /// guest's filesystem.
+    Resume {
+        /// The snapshot file.
+        snapshot: PathBuf,
+        #[arg(long)]
+        headless: bool,
+        /// Read lifecycle commands from stdin, as `run --control-stdin` does.
+        #[arg(long)]
+        control_stdin: bool,
+        /// Suspend again to this file. Defaults to the snapshot being resumed,
+        /// so Ctrl+Alt+S on a resumed VM writes back where it came from.
+        #[arg(long, value_name = "FILE")]
+        save_to: Option<PathBuf>,
+        /// Debug: write a PNG of the scanout N seconds after the resume.
+        ///
+        /// The cheapest way to answer "did my desktop come back?" on a headless
+        /// host: the restored virtio-gpu presents the frame the guest was
+        /// showing when it was suspended, before the guest has drawn anything.
+        #[arg(long, value_name = "SECS")]
+        screenshot_after: Option<u64>,
+        /// Where --screenshot-after writes its PNG.
+        #[arg(long, requires = "screenshot_after")]
+        screenshot: Option<PathBuf>,
     },
     /// Check host prerequisites (KVM, capabilities, graphics backend).
     Doctor,
@@ -295,6 +344,22 @@ fn run(cli: Cli) -> Result<(), String> {
                 ))
             }
         }
+        Command::Snapshot { snapshot } => inspect_snapshot(&snapshot),
+        Command::Resume {
+            snapshot,
+            headless,
+            control_stdin,
+            save_to,
+            screenshot_after,
+            screenshot,
+        } => resume(ResumeArgs {
+            snapshot,
+            headless,
+            control_stdin,
+            save_to,
+            screenshot_after,
+            screenshot,
+        }),
         Command::Run {
             config,
             headless,
@@ -302,6 +367,7 @@ fn run(cli: Cli) -> Result<(), String> {
             screenshot_after,
             screenshot,
             control_stdin,
+            snapshot,
         } => {
             let text = std::fs::read_to_string(&config)
                 .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
@@ -320,11 +386,29 @@ fn run(cli: Cli) -> Result<(), String> {
                         PathBuf::from(format!("entangled-screenshot-{}.png", cfg.name))
                     }),
                 });
-                run_vm::run_with(cfg, headless, None, shot, control_stdin).map(|_| ())
+                let snapshot = Some(
+                    snapshot.unwrap_or_else(|| crate::snapshot::default_path(&config, &cfg.name)),
+                );
+                run_vm::run(
+                    cfg,
+                    run_vm::RunOptions {
+                        headless,
+                        control_stdin,
+                        screenshot: shot,
+                        snapshot,
+                        restore: None,
+                    },
+                )
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             {
-                let _ = (headless, screenshot_after, screenshot, control_stdin);
+                let _ = (
+                    headless,
+                    screenshot_after,
+                    screenshot,
+                    control_stdin,
+                    snapshot,
+                );
                 Err(format!(
                     "config '{}' is valid, but running VMs requires a Linux host with KVM \
                      or a Windows host with the Windows Hypervisor Platform",
@@ -332,5 +416,162 @@ fn run(cli: Cli) -> Result<(), String> {
                 ))
             }
         }
+    }
+}
+
+/// `entangled snapshot <file>` (ADR-0006).
+///
+/// The read-only view, and the same one `entangled-manager` gets by calling
+/// `vm_snapshot::inspect` directly: a snapshot is a file somebody may have to
+/// reason about long after the VM that made it is gone, and needing to start
+/// one to find out what is in it would be a poor answer.
+fn inspect_snapshot(path: &Path) -> Result<(), String> {
+    let info = vm_snapshot::inspect(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let meta = &info.metadata;
+    println!("{}", path.display());
+    println!("  vm             {}", meta.vm_name);
+    println!(
+        "  taken          {} (unix {})",
+        format_unix(meta.created_unix),
+        meta.created_unix
+    );
+    println!("  written by     {}", meta.writer);
+    println!("  host           {}", info.host.as_str());
+    println!(
+        "  machine        {} vCPU(s), {} of RAM, {} transport, {} boot",
+        meta.shape.vcpus,
+        disk_image::format_bytes(meta.shape.memory_bytes),
+        meta.shape.transport,
+        meta.shape.boot_mode
+    );
+    println!(
+        "  file           {}",
+        disk_image::format_bytes(info.file_bytes)
+    );
+    match info.restorable_here {
+        true => println!("  restorable     yes, on this machine"),
+        false => println!(
+            "  restorable     no — {}",
+            info.refusal.as_deref().unwrap_or("unknown reason")
+        ),
+    }
+
+    println!("  devices        {}", meta.shape.devices.len());
+    for device in &meta.shape.devices {
+        println!(
+            "    slot {:<2}      virtio type {}",
+            device.slot, device.device_type
+        );
+    }
+    println!("  files          {}", meta.files.len());
+    for file in &meta.files {
+        // Checked live, so this doubles as "would a restore be refused today?".
+        let status = match file.check() {
+            Ok(None) => "unchanged".to_string(),
+            Ok(Some(note)) => format!("changed (advisory): {note}"),
+            Err(error) => format!("CHANGED: {error}"),
+        };
+        println!(
+            "    {:<10} {} — {}",
+            file.role.as_str(),
+            file.path.display(),
+            status
+        );
+    }
+    println!("  sections       {}", info.sections.len());
+    for section in &info.sections {
+        println!(
+            "    {:<14} [{}] {}",
+            section.kind.as_str(),
+            section.instance,
+            disk_image::format_bytes(section.bytes)
+        );
+    }
+    Ok(())
+}
+
+/// A Unix timestamp as `YYYY-MM-DD HH:MM:SS` UTC, using the same civil-date
+/// arithmetic the RTC does — no date crate in the graph, and none needed for
+/// one line of output.
+fn format_unix(seconds: i64) -> String {
+    let t = machine_x86::rtc::civil_from_unix(seconds);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
+}
+
+/// `entangled resume <file>` (ADR-0006).
+///
+/// Reads the snapshot's header and metadata *first*, so a file this host cannot
+/// restore costs one file open and a sentence rather than a half-built VM. Then
+/// it re-parses the profile the snapshot carries and starts the machine that
+/// profile describes — with the snapshot loaded over it instead of a kernel.
+struct ResumeArgs {
+    snapshot: PathBuf,
+    headless: bool,
+    control_stdin: bool,
+    save_to: Option<PathBuf>,
+    screenshot_after: Option<u64>,
+    screenshot: Option<PathBuf>,
+}
+
+fn resume(args: ResumeArgs) -> Result<(), String> {
+    let ResumeArgs {
+        snapshot,
+        headless,
+        control_stdin,
+        save_to,
+        screenshot_after,
+        screenshot,
+    } = args;
+    let info = snapshot::open(&snapshot)?;
+    let cfg = snapshot::config_from(&info.metadata)?;
+    tracing::info!(
+        vm = %info.metadata.vm_name,
+        file = %snapshot.display(),
+        bytes = info.file_bytes,
+        host = info.host.as_str(),
+        vcpus = info.metadata.shape.vcpus,
+        memory_mib = info.metadata.shape.memory_bytes >> 20,
+        writer = %info.metadata.writer,
+        "resuming a suspended VM"
+    );
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        let shot = screenshot_after.map(|secs| run_vm::ScreenshotRequest {
+            after: std::time::Duration::from_secs(secs),
+            path: screenshot.unwrap_or_else(|| {
+                PathBuf::from(format!("entangled-resume-{}.png", info.metadata.vm_name))
+            }),
+        });
+        run_vm::run(
+            cfg,
+            run_vm::RunOptions {
+                headless,
+                control_stdin,
+                screenshot: shot,
+                // A resumed VM suspends back to where it came from unless told
+                // otherwise: that is what makes close-the-lid/open-the-lid a
+                // loop rather than a one-way trip.
+                snapshot: Some(save_to.unwrap_or_else(|| snapshot.clone())),
+                restore: Some(snapshot.clone()),
+            },
+        )
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = (
+            headless,
+            control_stdin,
+            save_to,
+            screenshot_after,
+            screenshot,
+        );
+        Err(format!(
+            "snapshot of '{}' is readable, but restoring a VM requires a Linux host with KVM \
+             or a Windows host with the Windows Hypervisor Platform",
+            cfg.name
+        ))
     }
 }

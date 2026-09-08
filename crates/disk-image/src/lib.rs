@@ -32,7 +32,7 @@ pub use layout::{
     ESP_TYPE, LINUX_FS_TYPE, LINUX_ROOT_X64_TYPE, SECTOR,
 };
 pub use ops::{
-    allocated_bytes, create_raw, disk_space, existing_nvram_sidecar, format_bytes,
+    allocated_bytes, create_raw, disk_space, existing_nvram_sidecar, format_bytes, mark_sparse,
     nvram_sidecar_path, parse_size, punch_hole, resize_raw, write_zeroes, DiskError, PunchOutcome,
     ResizeOutcome,
 };

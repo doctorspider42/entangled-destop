@@ -20,10 +20,50 @@ fn kick_signal() -> i32 {
     libc::SIGRTMIN()
 }
 
+/// The MSRs this kernel is prepared to save and restore, read once per process.
+///
+/// A property of the host, not of a VM or a vCPU, and the ioctl lives on the
+/// `Kvm` handle — which a running vCPU no longer has. Cached here so an SMP
+/// guest does not read the same list once per CPU, and so `Vcpu::new` keeps its
+/// signature (ADR-0006).
+///
+/// A host that refuses the ioctl leaves the list empty, which makes a snapshot
+/// carry no MSRs at all. That is worth an error line rather than silence: it is
+/// the difference between a guest that resumes and one that resumes and then
+/// dies in its next `syscall`.
+fn host_msr_index_list(kvm: &Kvm) -> Arc<[u32]> {
+    static LIST: OnceLock<Arc<[u32]>> = OnceLock::new();
+    Arc::clone(LIST.get_or_init(|| match kvm.get_msr_index_list() {
+        Ok(list) => {
+            let indices: Arc<[u32]> = list.as_slice().into();
+            tracing::debug!(
+                count = indices.len(),
+                "this kernel reports its saveable MSRs"
+            );
+            indices
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "KVM_GET_MSR_INDEX_LIST failed; a snapshot of this VM would carry no MSRs"
+            );
+            Arc::from(Vec::new())
+        }
+    }))
+}
+
 /// One virtual CPU. All KVM vCPU ioctls must come from the owning thread.
 pub struct Vcpu {
     pub index: u32,
     fd: VcpuFd,
+    /// Every MSR *this kernel* is prepared to save and restore
+    /// (`KVM_GET_MSR_INDEX_LIST`), captured once at creation because the list
+    /// is a property of the host and the ioctl is on the `Kvm` handle, which a
+    /// running vCPU no longer has (ADR-0006).
+    ///
+    /// Shared rather than copied per vCPU: it is ~100 words and identical for
+    /// every one of them.
+    msr_index_list: Arc<[u32]>,
 }
 
 impl Vcpu {
@@ -65,7 +105,16 @@ impl Vcpu {
             }
         }
         fd.set_cpuid2(&cpuid)?;
-        Ok(Self { index, fd })
+        Ok(Self {
+            index,
+            fd,
+            msr_index_list: host_msr_index_list(kvm),
+        })
+    }
+
+    /// The host's MSR save/restore list, for the snapshot path.
+    pub(crate) fn msr_index_list(&self) -> &[u32] {
+        &self.msr_index_list
     }
 
     pub fn fd(&self) -> &VcpuFd {
@@ -713,6 +762,16 @@ impl ResettableVcpu for Vcpu {
             .set_mp_state(mp_state)
             .map_err(|e| err("KVM_SET_MP_STATE", e))?;
         Ok(())
+    }
+
+    /// See `crate::snapshot_kvm`, which owns the MSR list, the ordering rules
+    /// and the blob formats.
+    fn save_cpu_state(&self) -> Result<crate::hv::X86CpuState, HvError> {
+        self.snapshot()
+    }
+
+    fn load_cpu_state(&mut self, state: &crate::hv::X86CpuState) -> Result<(), HvError> {
+        self.restore(state)
     }
 }
 

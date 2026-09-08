@@ -372,6 +372,20 @@ impl MmioTransport {
         self.state.power_on_reset();
     }
 
+    /// Everything this slot is, for a snapshot (ADR-0006).
+    pub fn save(&self) -> crate::save::TransportSaveState {
+        self.state.save()
+    }
+
+    /// Puts a saved slot back. See [`TransportState::load`] for the order and
+    /// for what a refusal means.
+    pub fn load(
+        &mut self,
+        state: &crate::save::TransportSaveState,
+    ) -> Result<(), crate::save::StateError> {
+        self.state.load(state)
+    }
+
     /// Shares the VM's pause gate with this slot's device (ADR-0005).
     pub fn set_quiesce(&mut self, quiesce: std::sync::Arc<crate::quiesce::Quiesce>) {
         self.state.set_quiesce(quiesce);

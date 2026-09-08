@@ -108,3 +108,40 @@ Two traps around it:
   `KVM_RUN` answers `KVM_EXIT_INTERNAL_ERROR`. It has to park until the reset
   arrives (or, for an application processor, indefinitely — see the reset matrix
   in ADR-0005 for why an AP's triple fault must not restart the machine).
+
+
+## Snapshotting a vCPU, and the chips that are not in userspace (ADR-0006)
+
+`Vcpu::snapshot`/`restore` (`crates/vmm-core/src/snapshot_kvm.rs`) fill the
+neutral `X86CpuState`. The rules that matter:
+
+- **Ask the kernel for the MSR list; never write one down.**
+  `KVM_GET_MSR_INDEX_LIST` is the host saying what *it* is prepared to save, and
+  it is ~100 registers on a 6.x kernel. Read in batches: `KVM_GET_MSRS` returns
+  how many entries it filled and **stops at the first one it cannot answer**, so
+  a single unsupported register would otherwise cost every register behind it.
+  Drop the offender (`rest[read]`) and carry on. The same shape on the way back,
+  with `KVM_SET_MSRS`.
+- **Skip the x2APIC window (`0x800..=0x8ff`).** It is the same local APIC the
+  `KVM_GET_LAPIC` page carries, and restoring both has them fight.
+- **Restore order is not arbitrary:** `mp_state` → `KVM_SET_LAPIC` → sregs →
+  regs → `KVM_SET_XCRS` → `KVM_SET_XSAVE` → MSRs → debug registers →
+  `KVM_SET_VCPU_EVENTS`. An AP must be back in its wait before anything touches
+  it; `IA32_TSC_DEADLINE` is meaningless before the APIC timer exists; `XCR0`
+  decides which components the XSAVE area may carry; pending events go last
+  because everything above can clear them.
+- **`KVM_SET_XSAVE` is `unsafe` in kvm-ioctls** because it can read past the
+  4 KiB `kvm_xsave` when the host task has dynamically enabled an XSTATE feature
+  through `arch_prctl`. This process never calls `arch_prctl`, and the snapshot's
+  own XSTATE header is checked for dynamic components before the call — a
+  snapshot claiming AMX is refused rather than truncated.
+
+**The trap that cost a whole restore.** On this host the 8259 pair, the IOAPIC
+and the 8254 are **in the kernel**, so `machine_x86::state` has never seen them
+and a snapshot built only from the device list is missing them entirely. A VM
+restored with a power-on IOAPIC has every pin masked: the first attempt came
+back, kept drawing frames (MSI-X goes straight to the local APIC and bypasses
+the IOAPIC) and never printed another line. `vmm_core::hv::HostIrqChip` — three
+`KVM_GET_IRQCHIP` chips and `KVM_GET_PIT2` — is the seam that carries them, and
+`Vm::irqchip()` hands it out. Restore them **after** the devices and with the
+IOAPIC last, the mirror of the reset order.

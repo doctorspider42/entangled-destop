@@ -20,6 +20,8 @@ mod state;
 #[cfg(target_os = "linux")]
 mod hypervisor;
 #[cfg(target_os = "linux")]
+mod snapshot_kvm;
+#[cfg(target_os = "linux")]
 mod vcpu;
 #[cfg(target_os = "linux")]
 mod vm;
@@ -29,8 +31,10 @@ pub mod whp;
 
 pub use error::VmmError;
 pub use hv::{
-    DestinationMode, ExitHandler, InterruptDelivery, InterruptKind, InterruptRequest,
-    MachineConfig, RunOutcome, TriggerMode,
+    BlobFormat, DestinationMode, ExitHandler, GuestClock, HostIrqChip, HostIrqChipState,
+    InterruptDelivery, InterruptKind, InterruptRequest, MachineConfig, MpState, RunOutcome,
+    TriggerMode, VmClockState, X86CpuState, X86DebugRegisters, X86Msr, X86OpaqueState,
+    X86PendingEvents,
 };
 pub use lifecycle::{
     Checkpoint, Lifecycle, LifecycleError, MachineLifecycle, ResettableVcpu, RunState, VcpuKick,

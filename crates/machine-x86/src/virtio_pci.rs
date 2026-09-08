@@ -707,6 +707,89 @@ impl VirtioPciBus {
         self.reconcile_notify();
     }
 
+    /// Every function on this bus, for a snapshot (ADR-0006).
+    ///
+    /// The configuration spaces are saved separately, by the bus's `PciRoot`
+    /// (`MachineBus::save_state` puts the two together) — the split is the same
+    /// one `reset` makes, and for the same reason: a config space knows nothing
+    /// about what sits behind it, and this module keeps it that way.
+    pub fn save_state(&self) -> Vec<crate::state::SavedVirtioSlot> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.transport.lock() {
+                Ok(transport) => Some(crate::state::SavedVirtioSlot {
+                    slot: index as u32,
+                    state: transport.save(),
+                }),
+                Err(_) => {
+                    tracing::error!(
+                        device = slot.device_number,
+                        "virtio-pci transport lock is poisoned; this device is not saved"
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// The bus's configuration spaces.
+    pub fn save_config(&self) -> Option<crate::state::SavedPciRoot> {
+        match self.root.lock() {
+            Ok(root) => Some(root.save_state()),
+            Err(_) => {
+                tracing::error!("PCI root lock is poisoned; configuration space is not saved");
+                None
+            }
+        }
+    }
+
+    /// Puts every function and every configuration space back, then re-bases
+    /// the queue-notify registrations around the restored BARs.
+    ///
+    /// That last step is the one that is easy to miss and impossible to
+    /// diagnose — exactly as in `reset`, and for exactly the same reason. An
+    /// ioeventfd is registered at an *absolute* guest address derived from
+    /// wherever the BAR happens to be; restore a config space that puts the BAR
+    /// somewhere else and the kicks of the resumed guest land at an address
+    /// nothing is listening to. The guest then looks like it enumerated and
+    /// negotiated perfectly and never completed a request again.
+    pub fn load_state(
+        &self,
+        config: &crate::state::SavedPciRoot,
+        saved: &[crate::state::SavedVirtioSlot],
+    ) -> Result<(), crate::state::StateError> {
+        if saved.len() != self.slots.len() {
+            return Err(crate::state::StateError::Count {
+                what: "virtio-pci functions",
+                snapshot: saved.len(),
+                current: self.slots.len(),
+            });
+        }
+        // Configuration space first: the transports' MSI-X capabilities read
+        // their message-control dword out of it, and a transport restored
+        // against the previous boot's control word would decide MSI-X was off.
+        match self.root.lock() {
+            Ok(mut root) => root.load_state(config)?,
+            Err(_) => return Err(crate::state::StateError::Poisoned("the PCI root bus")),
+        }
+        for (index, (slot, saved)) in self.slots.iter().zip(saved).enumerate() {
+            let mut transport = slot
+                .transport
+                .lock()
+                .map_err(|_| crate::state::StateError::Poisoned("a virtio-pci transport"))?;
+            transport
+                .load(&saved.state)
+                .map_err(|source| crate::state::StateError::Virtio {
+                    slot: index,
+                    source,
+                })?;
+        }
+        #[cfg(target_os = "linux")]
+        self.reconcile_notify();
+        Ok(())
+    }
+
     pub fn slots(&self) -> &[VirtioPciSlot] {
         &self.slots
     }

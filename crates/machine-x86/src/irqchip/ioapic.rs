@@ -189,6 +189,55 @@ impl IoApic {
         state.pending = 0;
     }
 
+    /// The guest-programmed half of this IOAPIC, for a snapshot (ADR-0006).
+    ///
+    /// The `id` is not in it: it is the machine's topology, published by the
+    /// MADT and the MP table, and a snapshot that could change it would be a
+    /// snapshot that could make the guest disagree with its own firmware
+    /// tables. Neither is `delivered`, a host-side counter for the whole run.
+    pub fn save_state(&self) -> crate::state::SavedIoApic {
+        let Ok(state) = self.state.lock() else {
+            tracing::error!("IOAPIC lock is poisoned; saving a masked table");
+            return crate::state::SavedIoApic {
+                select: 0,
+                redirection: vec![RTE_RESET; REDIRECTION_ENTRIES],
+                pending: 0,
+            };
+        };
+        crate::state::SavedIoApic {
+            select: state.select,
+            redirection: state.redirection.to_vec(),
+            pending: state.pending,
+        }
+    }
+
+    /// Puts it back.
+    ///
+    /// `pending` comes back with it: a bit there is an edge a device already
+    /// believes it delivered, owed to the guest as soon as it unmasks the pin.
+    /// Dropping it would lose an interrupt in the one way that is impossible to
+    /// diagnose afterwards — the device is waiting, the guest is idle, and
+    /// nothing in either of them is wrong.
+    pub fn load_state(
+        &self,
+        saved: &crate::state::SavedIoApic,
+    ) -> Result<(), crate::state::StateError> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err(crate::state::StateError::Poisoned("the IOAPIC"));
+        };
+        if saved.redirection.len() != state.redirection.len() {
+            return Err(crate::state::StateError::Count {
+                what: "IOAPIC redirection entries",
+                snapshot: saved.redirection.len(),
+                current: state.redirection.len(),
+            });
+        }
+        state.select = saved.select;
+        state.redirection.copy_from_slice(&saved.redirection);
+        state.pending = saved.pending;
+        Ok(())
+    }
+
     /// The hypervisor delivery this IOAPIC injects through, shared with the MSI
     /// path (`crate::msi::UserspaceMsiSink`) — which bypasses the redirection
     /// table entirely, because an MSI message carries its own routing.

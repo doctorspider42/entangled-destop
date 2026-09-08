@@ -104,6 +104,26 @@ impl ResetControl {
         Self::default()
     }
 
+    /// The latches, for a snapshot (ADR-0006).
+    ///
+    /// `requested` is carried because a guest that wrote 0xCF9 and was
+    /// suspended before the supervisor served the reboot has *asked* to
+    /// reboot, and the restored machine owes it that reboot.
+    pub fn save_state(&self) -> crate::state::SavedResetControl {
+        crate::state::SavedResetControl {
+            rcr: self.rcr.load(Ordering::Acquire),
+            requested: self.requested.load(Ordering::Acquire),
+            count: self.count.load(Ordering::Acquire),
+        }
+    }
+
+    /// Puts them back.
+    pub fn load_state(&self, state: &crate::state::SavedResetControl) {
+        self.rcr.store(state.rcr, Ordering::Release);
+        self.requested.store(state.requested, Ordering::Release);
+        self.count.store(state.count, Ordering::Release);
+    }
+
     /// True when `port` is one this block *reads and writes* — only 0xCF9. The
     /// keyboard command port is write-only here (see [`Self::claims_write`]).
     pub fn claims_port(port: u16) -> bool {

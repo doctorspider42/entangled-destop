@@ -1392,6 +1392,7 @@ dependencies = [
  "virtio-input",
  "virtio-net",
  "virtio-sound",
+ "vm-snapshot",
  "vmm-core",
  "windows 0.62.2",
 ]
@@ -4572,6 +4573,21 @@ dependencies = [
  "libc",
  "thiserror 2.0.20",
  "winapi",
+]
+
+[[package]]
+name = "vm-snapshot"
+version = "0.2.0"
+dependencies = [
+ "control-api",
+ "disk-image",
+ "machine-x86",
+ "sha2",
+ "thiserror 2.0.20",
+ "tracing",
+ "virtio-core",
+ "vm-memory 0.17.2",
+ "vmm-core",
 ]
 
 [[package]]

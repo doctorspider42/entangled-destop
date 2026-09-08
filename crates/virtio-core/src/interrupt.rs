@@ -138,6 +138,25 @@ pub trait TransportInterrupt: Interrupt {
     /// The `config_generation` counter.
     fn generation(&self) -> u32;
 
+    /// This interrupt's guest-visible state, for a snapshot (ADR-0006).
+    ///
+    /// The default covers a transport whose only interrupt state is the
+    /// pending word and the generation counter, which is virtio-mmio and
+    /// virtio-pci without MSI-X; [`crate::MsixInterrupt`] adds the table.
+    fn save_interrupt(&self) -> crate::save::InterruptState {
+        crate::save::InterruptState {
+            isr: self.status(),
+            generation: self.generation(),
+            msix: None,
+        }
+    }
+
+    /// Puts it back.
+    fn load_interrupt(
+        &self,
+        state: &crate::save::InterruptState,
+    ) -> Result<(), crate::save::StateError>;
+
     /// Upcast to the device-facing half, for [`crate::DeviceResources`].
     ///
     /// Written out rather than relying on `Arc<dyn Sub> -> Arc<dyn Super>`
@@ -200,6 +219,16 @@ impl LineInterrupt {
         self.status.swap(0, Ordering::AcqRel)
     }
 
+    /// Restores the pending word and the generation counter from a snapshot.
+    ///
+    /// No raise: the line's *level* is the interrupt controller's state, saved
+    /// with the chip, and re-triggering here would deliver a second copy of an
+    /// interrupt the restored guest is already going to see.
+    pub fn restore(&self, status: u32, generation: u32) {
+        self.status.store(status, Ordering::Release);
+        self.generation.store(generation, Ordering::Release);
+    }
+
     /// Bumps `config_generation` without raising anything.
     ///
     /// The generation is a *read protocol* for the config space — a driver reads
@@ -240,6 +269,13 @@ impl TransportInterrupt for LineInterrupt {
     fn power_on_reset(&self) {
         self.status.store(0, Ordering::Release);
         self.generation.store(0, Ordering::Release);
+    }
+    fn load_interrupt(
+        &self,
+        state: &crate::save::InterruptState,
+    ) -> Result<(), crate::save::StateError> {
+        Self::restore(self, state.isr, state.generation);
+        Ok(())
     }
     fn as_interrupt(self: Arc<Self>) -> Arc<dyn Interrupt> {
         self
