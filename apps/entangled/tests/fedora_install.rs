@@ -448,6 +448,17 @@ fn fedora_installs_unattended_and_the_installed_system_boots() {
             disk.to_str().expect("utf-8 path"),
             "--size",
             DISK_SIZE,
+            // Explicit, and the one argument this test cannot leave out.
+            // `--network` defaults to `tap` on Linux, and a TAP interface is
+            // host state somebody has to create as root (scripts/setup-tap.sh);
+            // on a machine without it the install dies half a second in with
+            // "cannot attach to TAP interface entangled0: Operation not
+            // permitted". The Ubuntu test never meets this because its
+            // installer VM has no network at all — a netinst cannot do that,
+            // every package comes over the wire. usernet is the choice that
+            // needs nothing from the host.
+            "--network",
+            "usernet",
             "--auto",
             "--headless",
         ],

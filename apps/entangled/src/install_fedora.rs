@@ -264,7 +264,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             ..Default::default()
         },
     )
-    .map_err(|e| format!("installer VM failed: {e}"))?;
+    .map_err(|e| installer_failure(&args.network, &args.interface, &e))?;
 
     // 7. Did the installation finish? The kickstart says `poweroff`, so a
     //    completed install ends as an ACPI S5 write that this machine latches —
@@ -597,6 +597,29 @@ fn cached_netinst() -> Option<PathBuf> {
     candidates.pop()
 }
 
+/// Why the installer VM never got going, with the one piece of advice that is
+/// almost always the answer on a fresh Linux host.
+///
+/// `--network` defaults to a host TAP there, and a TAP is state somebody has to
+/// create as root (`scripts/setup-tap.sh`). The Ubuntu install never meets this
+/// because its installer VM has no network at all; a netinst cannot do that, so
+/// the first thing an unprepared host sees is an opaque "Operation not
+/// permitted" half a second in. Say what to type instead of leaving the errno
+/// to be interpreted.
+fn installer_failure(network: &str, interface: &str, error: &str) -> String {
+    if network.eq_ignore_ascii_case("tap") {
+        format!(
+            "installer VM failed: {error}\n\
+             A Fedora netinst must have a network, and --network defaults to the host TAP \
+             interface '{interface}' on Linux. Either create it (bash scripts/setup-tap.sh) \
+             or pass --network usernet, which is user-mode NAT inside this process and needs \
+             no host setup at all."
+        )
+    } else {
+        format!("installer VM failed: {error}")
+    }
+}
+
 /// The last `lines` non-empty lines of a transcript, for an error message.
 fn tail(log: &str, lines: usize) -> String {
     let kept: Vec<&str> = log
@@ -779,6 +802,26 @@ mod tests {
         // A password *hash*, never a plaintext password.
         assert!(text.contains("--iscrypted --password=$6$"));
         assert!(text.contains("rootpw --lock"));
+    }
+
+    /// The TAP default is the one failure every unprepared Linux host hits, and
+    /// it hits it in the first second — so the message has to carry the fix.
+    #[test]
+    fn a_tap_installer_failure_names_the_alternative() {
+        let tap = installer_failure(
+            "tap",
+            "entangled0",
+            "cannot open TAP 'entangled0': Operation not permitted (os error 1)",
+        );
+        assert!(tap.contains("Operation not permitted"), "{tap}");
+        assert!(tap.contains("--network usernet"), "{tap}");
+        assert!(tap.contains("setup-tap.sh"), "{tap}");
+        assert!(tap.contains("entangled0"), "{tap}");
+
+        // A user who chose usernet and still failed does not need TAP advice;
+        // they need their own error and nothing on top of it.
+        let usernet = installer_failure("usernet", "entangled0", "the firmware did not load");
+        assert_eq!(usernet, "installer VM failed: the firmware did not load");
     }
 
     #[test]
