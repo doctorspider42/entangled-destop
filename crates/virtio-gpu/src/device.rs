@@ -509,6 +509,12 @@ impl<S: ScanoutSink> GpuDevice<S> {
         self.blobs.len()
     }
 
+    /// The host pages behind the host-visible window, once the machine layer
+    /// has supplied them. For tests and for `entangled doctor`.
+    pub fn shm_backing(&self) -> Option<&Arc<dyn virtio_core::ShmBacking>> {
+        self.blobs.window().backing()
+    }
+
     /// Bytes promised across every live blob.
     pub fn blob_bytes(&self) -> u64 {
         self.blobs.total_bytes()
@@ -2067,6 +2073,15 @@ impl<S: ScanoutSink> GpuDevice<S> {
         let size = self
             .blobs_mut(kind)?
             .reserve_mapping(cmd.resource_id, cmd.offset)?;
+        // The span is the guest's to read the instant the mapping exists, and
+        // the host pages behind it were last used by some other blob — or by
+        // nothing, in which case they hold whatever the allocator handed out.
+        // Clear them before anyone can look (VEN-2001 phase 2). A window with
+        // no host memory behind it is a no-op here, which is exactly phase 1.
+        if let Err(error) = self.blobs.window().clear_span(cmd.offset, size) {
+            self.blobs.unreserve(cmd.resource_id, cmd.offset);
+            return Err(error);
+        }
         let mapping = match self
             .three_d
             .as_mut()
@@ -2450,6 +2465,40 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
 
     fn shm_regions(&self) -> Vec<virtio_core::ShmRegion> {
         self.shm_region().into_iter().collect()
+    }
+
+    /// Takes the host memory the machine layer allocated for the host-visible
+    /// window (VEN-2001 phase 2).
+    ///
+    /// Until this arrives the window is a validator with nothing behind it and
+    /// `RESOURCE_MAP_BLOB` maps nothing a guest could reach — which is why the
+    /// machine publishes no shared-memory region at all in that case, rather
+    /// than pointing a driver at an address that faults.
+    fn set_shm_backing(&mut self, id: u8, backing: Arc<dyn virtio_core::ShmBacking>) {
+        if id != VIRTIO_GPU_SHM_ID_HOST_VISIBLE {
+            tracing::warn!(
+                id,
+                "virtio-gpu was offered a shared-memory region it never declared"
+            );
+            return;
+        }
+        if !self.blobs.window_mut().set_backing(Arc::clone(&backing)) {
+            return;
+        }
+        // The renderer gets it too: a real Venus renderer maps its own
+        // `VkDeviceMemory` into this window, and the loopback writes a
+        // signature into it so a guest can prove end to end that it is reading
+        // host memory the host put there. A renderer in another process
+        // (GPU-012) takes the default no-op — an `Arc` does not cross a pipe —
+        // and the device's own clear-on-map is what keeps that case honest.
+        if let Some(gpu) = self.three_d.as_mut() {
+            gpu.set_host_visible(backing);
+        }
+        tracing::info!(
+            id,
+            len = self.blobs.window().len(),
+            "virtio-gpu host-visible window is backed by host memory"
+        );
     }
 
     fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {

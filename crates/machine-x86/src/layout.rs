@@ -399,6 +399,23 @@ pub const fn pci_mmio64_end(mem_bytes: u64) -> u64 {
     pci_mmio64_base(mem_bytes) + PCI_MMIO64_SIZE
 }
 
+/// The same base, derived from the *last address* of a guest-memory object
+/// rather than from a configured size.
+///
+/// Same number by construction (`the_two_aperture_spellings_agree` proves it
+/// across every size), and it exists because half the machine has the
+/// `GuestMem` in hand and not the MiB figure — `crate::acpi::write` above all,
+/// whose seventeen callers would otherwise each have to be taught a number
+/// they do not currently hold.
+pub const fn pci_mmio64_base_above(last_addr: u64) -> u64 {
+    let top = last_addr.saturating_add(1);
+    if top > TOP_OF_32BIT {
+        top
+    } else {
+        TOP_OF_32BIT
+    }
+}
+
 /// Bump allocator for naturally aligned windows inside the 64-bit aperture.
 ///
 /// Not a fixed slot table like [`pci_bar_slot`]: a shared-memory BAR's size is
@@ -521,24 +538,80 @@ mod tests {
     /// not just the one someone tested with.
     #[test]
     fn the_aperture_never_overlaps_ram_or_anything_below_4_gib() {
-        for mib in [1u64, 512, 2048, 3072, 3073, 4096, 8192, 16384, MAX_GUEST_MIB] {
+        for mib in [
+            1u64,
+            512,
+            2048,
+            3072,
+            3073,
+            4096,
+            8192,
+            16384,
+            MAX_GUEST_MIB,
+        ] {
             let bytes = mib * MIB;
             let base = pci_mmio64_base(bytes);
             let top = top_of_ram(bytes);
-            assert!(base >= top, "{mib} MiB: aperture {base:#x} overlaps RAM ending {top:#x}");
-            assert!(base >= TOP_OF_32BIT, "{mib} MiB: aperture {base:#x} is below 4 GiB");
-            assert!(base >= PFLASH_BASE + PFLASH_WINDOW_SIZE, "{mib} MiB: aperture hits pflash");
-            assert!(base > u64::from(u32::MAX), "{mib} MiB: aperture is 32-bit addressable");
-            assert_eq!(base % 0x1000, 0, "{mib} MiB: aperture base is not page aligned");
+            assert!(
+                base >= top,
+                "{mib} MiB: aperture {base:#x} overlaps RAM ending {top:#x}"
+            );
+            assert!(
+                base >= TOP_OF_32BIT,
+                "{mib} MiB: aperture {base:#x} is below 4 GiB"
+            );
+            assert!(
+                base >= PFLASH_BASE + PFLASH_WINDOW_SIZE,
+                "{mib} MiB: aperture hits pflash"
+            );
+            assert!(
+                base > u64::from(u32::MAX),
+                "{mib} MiB: aperture is 32-bit addressable"
+            );
+            assert_eq!(
+                base % 0x1000,
+                0,
+                "{mib} MiB: aperture base is not page aligned"
+            );
             // …and the whole aperture stays inside the 2^46 physical address
             // width the firmware reports (`Pci64Size=0x3FFEC0000000`).
-            assert!(pci_mmio64_end(bytes) < 1u64 << 46, "{mib} MiB: aperture past 2^46");
+            assert!(
+                pci_mmio64_end(bytes) < 1u64 << 46,
+                "{mib} MiB: aperture past 2^46"
+            );
         }
     }
 
     /// A BAR is only decoded where it is naturally aligned, and the allocator
     /// is the only thing that guarantees that for a window whose size is not
     /// the aperture's alignment.
+    /// The two ways of asking for the aperture must never disagree: one is
+    /// what the PCI bus places BARs in, the other is what the DSDT publishes,
+    /// and a guest whose `_CRS` does not contain its own BAR does not get a
+    /// device.
+    #[test]
+    fn the_two_aperture_spellings_agree() {
+        for mib in [1u64, 512, 3071, 3072, 3073, 4096, 8192, MAX_GUEST_MIB] {
+            let bytes = mib * MIB;
+            let last = top_of_ram(bytes) - 1;
+            // For a guest below the hole the memory object's last address is
+            // `mem_bytes - 1`, not `top_of_ram - 1`; both must give 4 GiB.
+            let last_small = bytes - 1;
+            assert_eq!(
+                pci_mmio64_base_above(last),
+                pci_mmio64_base(bytes),
+                "{mib} MiB"
+            );
+            if bytes <= MMIO_HOLE_START {
+                assert_eq!(
+                    pci_mmio64_base_above(last_small),
+                    pci_mmio64_base(bytes),
+                    "{mib} MiB"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_allocator_aligns_every_window_to_its_own_size() {
         // 3073 MiB puts the top of RAM at 4 GiB + 1 MiB, which is page aligned
@@ -560,7 +633,10 @@ mod tests {
         let mut alloc = Mmio64Allocator::for_guest(2048 * MIB);
         assert!(alloc.allocate(0).is_none());
         assert!(alloc.allocate(3 << 20).is_none(), "not a power of two");
-        assert!(alloc.allocate(MAX_SHM_BAR_BYTES * 2).is_none(), "past the cap");
+        assert!(
+            alloc.allocate(MAX_SHM_BAR_BYTES * 2).is_none(),
+            "past the cap"
+        );
         for _ in 0..4 {
             alloc.allocate(MAX_SHM_BAR_BYTES).expect("fits");
         }

@@ -28,7 +28,8 @@ fn dump_tables_for_iasl() {
         .unwrap_or_else(|_| std::env::temp_dir().join("entangled-acpi"));
     std::fs::create_dir_all(&dir).expect("cannot create the dump directory");
 
-    let tables = AcpiTables::new(vcpus).expect("table generation failed");
+    let tables = AcpiTables::new(vcpus, machine_x86::layout::pci_mmio64_base(2048 << 20))
+        .expect("table generation failed");
     println!(
         "base {:#x} ({} bytes)",
         tables.base_address(),

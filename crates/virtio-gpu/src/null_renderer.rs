@@ -76,6 +76,25 @@ const VENUS_CAPSET_BYTES: u32 = 32;
 /// small enough that nothing is tempted to actually allocate it.
 pub const NULL_HOST_VISIBLE_BYTES: u64 = 256 << 20;
 
+/// Bytes the loopback writes at the start of every mapped span.
+pub const LOOPBACK_SIGNATURE_LEN: u64 = 32;
+
+/// Magic the loopback stamps into a mapped window span, so a guest reading the
+/// shared-memory region can say what it is looking at rather than "some
+/// bytes".
+pub const LOOPBACK_MAGIC: [u8; 16] = *b"ENTANGLED-VENUS_";
+
+/// `LOOPBACK_MAGIC`, then the resource id, the `blob_id` and the span length,
+/// little-endian — 32 bytes, the whole of [`LOOPBACK_SIGNATURE_LEN`].
+pub fn loopback_signature(resource_id: u32, blob_id: u64, size: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&LOOPBACK_MAGIC);
+    out[16..20].copy_from_slice(&resource_id.to_le_bytes());
+    out[20..24].copy_from_slice(&(size as u32).to_le_bytes());
+    out[24..32].copy_from_slice(&blob_id.to_le_bytes());
+    out
+}
+
 #[derive(Debug, Default)]
 struct ModelResource {
     width: u32,
@@ -97,7 +116,7 @@ struct ModelBlob {
 }
 
 /// The portable no-op renderer. See the module docs.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct NullRenderer {
     resources: HashMap<u32, ModelResource>,
     /// `SUBMIT_3D` streams executed, total commands seen — lets tests assert
@@ -111,6 +130,24 @@ pub struct NullRenderer {
     /// Contexts and the capset id each was created with, so a test can assert
     /// a venus context really arrived as a venus context.
     context_types: HashMap<u32, u32>,
+    /// The host pages behind the shared-memory window, when the machine layer
+    /// supplied any (VEN-2001 phase 2). `None` keeps the loopback exactly what
+    /// it was: bookkeeping, and nothing a guest could read.
+    host_visible: Option<Arc<dyn virtio_core::ShmBacking>>,
+}
+
+impl std::fmt::Debug for NullRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NullRenderer")
+            .field("resources", &self.resources.len())
+            .field("submits", &self.submits)
+            .field("commands", &self.commands)
+            .field("venus", &self.venus)
+            .field("blobs", &self.blobs.len())
+            .field("contexts", &self.context_types.len())
+            .field("host_visible", &self.host_visible.as_ref().map(|b| b.len()))
+            .finish()
+    }
 }
 
 impl NullRenderer {
@@ -428,16 +465,41 @@ impl Renderer3d for NullRenderer {
             )));
         }
         blob.mapped_at = Some(offset);
+        let blob_id = blob.blob_id;
+        // A real Venus renderer would put its `VkDeviceMemory` here. The
+        // loopback puts a signature instead, and that is not decoration: it is
+        // the only thing that makes "the guest can read what the host wrote"
+        // provable on a machine with no GPU, no `/dev/dri` and a CPU Vulkan
+        // ICD. A guest that maps the region and finds these bytes has proved
+        // the whole chain — BAR, aperture, hypervisor mapping, window offset —
+        // in one read.
+        if let Some(backing) = &self.host_visible {
+            if let Err(error) =
+                backing.write(offset, &loopback_signature(resource_id, blob_id, size))
+            {
+                tracing::error!(%error, "cannot write the loopback signature into the window");
+            }
+        }
         // Plain host RAM would be cached; a real host-visible GPU heap is
-        // write-combining. The loopback holds no memory at all, so cached is
-        // the truthful answer.
+        // write-combining. What is behind this window *is* plain host RAM, so
+        // cached is the truthful answer.
         Ok(BlobMapping::CACHED)
     }
 
-    fn unmap_blob(&mut self, resource_id: u32, _offset: u64) {
+    fn unmap_blob(&mut self, resource_id: u32, offset: u64) {
         if let Some(blob) = self.blobs.get_mut(&resource_id) {
             blob.mapped_at = None;
         }
+        // The signature goes with the mapping: a guest that unmaps and looks
+        // again through some other blob must not find another resource's
+        // marker still sitting there.
+        if let Some(backing) = &self.host_visible {
+            let _ = backing.fill(offset, LOOPBACK_SIGNATURE_LEN, 0);
+        }
+    }
+
+    fn set_host_visible(&mut self, backing: Arc<dyn virtio_core::ShmBacking>) {
+        self.host_visible = Some(backing);
     }
 }
 

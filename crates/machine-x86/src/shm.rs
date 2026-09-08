@@ -103,6 +103,107 @@ pub fn plan(regions: &[ShmRegion]) -> Result<(u64, Vec<ShmPlacement>), ShmLayout
     Ok((bar_size, placements))
 }
 
+/// How a bus gets host memory for the shared-memory regions its devices
+/// declare (EPIC 20, VEN-2001).
+///
+/// Borrowed for the duration of an attach and never stored, which is what lets
+/// the caller hand over a closure over its own `Vm` or `WhpPartition` without
+/// either type appearing in the machine crate — ADR-0002's seam, at the one
+/// place a machine has to name a hypervisor to get host pages.
+///
+/// Optional everywhere it appears, and `None` keeps every pre-EPIC-20 caller
+/// producing byte-identical registers and byte-identical configuration space:
+/// no BAR 2, no shared-memory capability, no `SHM_BASE`, and a device that
+/// declared a region told once, in the log, that this machine cannot back it.
+pub struct ShmSupport<'a> {
+    /// Guest RAM in bytes. Fixes the 64-bit MMIO aperture, because that
+    /// aperture begins at the top of RAM ([`layout::pci_mmio64_base`]).
+    pub mem_bytes: u64,
+    /// Allocates `len` bytes of host memory already tied to this VM's
+    /// hypervisor, unplaced.
+    #[allow(clippy::type_complexity)]
+    pub allocate: &'a dyn Fn(u64) -> Result<Arc<SharedWindow>, vmm_core::VmmError>,
+}
+
+/// Allocates and hands over the host memory behind `device`'s declared
+/// shared-memory regions, if it declared any and this machine can back them.
+///
+/// Shared by both transports, because none of it is transport knowledge: the
+/// regions come from the device, the size arithmetic is
+/// [`plan`], the address comes from the aperture allocator, and the pages come
+/// from the hypervisor through [`ShmSupport`]. What the two buses then *do*
+/// with the window differs — PCI puts it in a BAR the guest may move, mmio
+/// pins it at one address and publishes it in `SHM_BASE` — and that part stays
+/// with them.
+///
+/// Everything about this is "or nothing": a device with no regions, a machine
+/// with no [`ShmSupport`], an aperture with no room, a plan that does not fit
+/// and a failed allocation all end the same way — no window, and the device
+/// refusing the operations that would have needed one. That is phase 1's
+/// behaviour, and it is the right failure: an unbacked window advertised to a
+/// driver is a guest that faults on its first `mmap`.
+pub fn back_regions(
+    slot: usize,
+    device: &mut dyn virtio_core::VirtioDevice,
+    shm: Option<(&ShmSupport<'_>, &mut layout::Mmio64Allocator)>,
+) -> Option<Arc<ShmWindow>> {
+    let regions = device.shm_regions();
+    if regions.is_empty() {
+        return None;
+    }
+    let Some((support, aperture)) = shm else {
+        tracing::warn!(
+            slot,
+            regions = regions.len(),
+            "device declares a shared-memory region but this machine cannot back one; \
+             the region will not be published"
+        );
+        return None;
+    };
+    let (bar_size, placements) = match plan(&regions) {
+        Ok(plan) => plan,
+        Err(error) => {
+            tracing::error!(slot, %error, "cannot lay out the device's shared-memory regions");
+            return None;
+        }
+    };
+    let Some(base) = aperture.allocate(bar_size) else {
+        tracing::error!(
+            slot,
+            bar_size,
+            "the 64-bit MMIO aperture has no room for this device's shared-memory window"
+        );
+        return None;
+    };
+    let pages = match (support.allocate)(bar_size) {
+        Ok(pages) => pages,
+        Err(error) => {
+            tracing::error!(slot, bar_size, %error, "cannot allocate the shared-memory window");
+            return None;
+        }
+    };
+    let window = match ShmWindow::new(pages, bar_size, placements, base, support.mem_bytes) {
+        Ok(window) => Arc::new(window),
+        Err(error) => {
+            tracing::error!(slot, %error, "cannot build the shared-memory window");
+            return None;
+        }
+    };
+    for region in &regions {
+        if let Some(backing) = window.backing_for(region.id) {
+            device.set_shm_backing(region.id, backing);
+        }
+    }
+    tracing::info!(
+        slot,
+        at = format_args!("{base:#x}"),
+        bar_size,
+        regions = regions.len(),
+        "backed the device's shared-memory regions with host memory"
+    );
+    Some(window)
+}
+
 /// One device's shared-memory BAR: the host pages, where they are published
 /// inside the BAR, and where the BAR currently decodes.
 pub struct ShmWindow {
@@ -185,11 +286,19 @@ impl ShmWindow {
         at.checked_add(placement.offset)
     }
 
-    /// A handle the device can use to read and write the window's host pages.
-    pub fn backing(&self) -> Arc<dyn ShmBacking> {
-        Arc::new(ShmBackingHandle {
+    /// A handle the device can use to read and write region `id`'s host pages.
+    ///
+    /// Scoped to that region's span inside the BAR, not to the whole BAR: the
+    /// device validates guest offsets against the length it *declared*, so a
+    /// backing that reached past its region would turn a correct bounds check
+    /// into an incorrect one the moment a second region existed.
+    pub fn backing_for(&self, id: u8) -> Option<Arc<dyn ShmBacking>> {
+        let placement = self.placements.iter().find(|p| p.id == id)?;
+        Some(Arc::new(ShmBackingHandle {
             window: Arc::clone(&self.window),
-        })
+            offset: placement.offset,
+            len: placement.len,
+        }))
     }
 
     /// Follows the BAR: maps the window at `bar_base`, or unmaps it when the
@@ -279,26 +388,53 @@ impl ShmWindow {
     }
 }
 
-/// The device's view of the window: bounded host access, nothing else.
+/// The device's view of one region: bounded host access, nothing else.
+///
+/// Every access is checked twice — once here against the region's own span,
+/// once inside `SharedWindow` against the allocation — and the first check is
+/// the one that matters, because the offset came from the guest.
 struct ShmBackingHandle {
     window: Arc<SharedWindow>,
+    offset: u64,
+    len: u64,
+}
+
+impl ShmBackingHandle {
+    /// Translates a region-relative span into a window-relative one, refusing
+    /// anything that would leave the region. `u64` throughout: `offset` is a
+    /// guest-chosen value and `len` follows from a guest-chosen blob size.
+    fn at(&self, offset: u64, len: u64) -> Result<u64, ShmAccessError> {
+        let out_of_bounds = ShmAccessError {
+            offset,
+            len,
+            window: self.len,
+        };
+        let end = offset.checked_add(len).ok_or(out_of_bounds)?;
+        if end > self.len {
+            return Err(out_of_bounds);
+        }
+        self.offset.checked_add(offset).ok_or(out_of_bounds)
+    }
 }
 
 impl ShmBacking for ShmBackingHandle {
     fn len(&self) -> u64 {
-        self.window.len()
+        self.len
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), ShmAccessError> {
-        self.window.read(offset, buf).map_err(convert)
+        let at = self.at(offset, buf.len() as u64)?;
+        self.window.read(at, buf).map_err(convert)
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<(), ShmAccessError> {
-        self.window.write(offset, data).map_err(convert)
+        let at = self.at(offset, data.len() as u64)?;
+        self.window.write(at, data).map_err(convert)
     }
 
     fn fill(&self, offset: u64, len: u64, byte: u8) -> Result<(), ShmAccessError> {
-        self.window.fill(offset, len, byte).map_err(convert)
+        let at = self.at(offset, len)?;
+        self.window.fill(at, len, byte).map_err(convert)
     }
 }
 
@@ -306,7 +442,11 @@ impl ShmBacking for ShmBackingHandle {
 /// `vmm-core` (the dependency points the other way), so the same refusal is
 /// spelled once in each and translated here.
 fn convert(error: vmm_core::shm::ShmAccessError) -> ShmAccessError {
-    let vmm_core::shm::ShmAccessError::OutOfBounds { offset, len, window } = error;
+    let vmm_core::shm::ShmAccessError::OutOfBounds {
+        offset,
+        len,
+        window,
+    } = error;
     ShmAccessError {
         offset,
         len,
@@ -328,9 +468,8 @@ mod tests {
     fn window(bar_size: u64, regions: &[ShmRegion]) -> ShmWindow {
         let (planned, placements) = plan(regions).expect("plan");
         assert_eq!(planned, bar_size);
-        let shared = Arc::new(
-            SharedWindow::new(bar_size, Arc::new(UnmappedGpaMapper)).expect("host pages"),
-        );
+        let shared =
+            Arc::new(SharedWindow::new(bar_size, Arc::new(UnmappedGpaMapper)).expect("host pages"));
         let base = layout::Mmio64Allocator::for_guest(GUEST)
             .allocate(bar_size)
             .expect("aperture");
@@ -339,7 +478,11 @@ mod tests {
 
     #[test]
     fn a_plan_rounds_the_bar_up_to_a_power_of_two() {
-        let (size, placements) = plan(&[ShmRegion { id: 1, len: 3 << 20 }]).unwrap();
+        let (size, placements) = plan(&[ShmRegion {
+            id: 1,
+            len: 3 << 20,
+        }])
+        .unwrap();
         assert_eq!(size, 4 << 20, "a BAR size must be a power of two");
         assert_eq!(placements.len(), 1);
         assert_eq!(placements[0].offset, 0);
@@ -348,7 +491,10 @@ mod tests {
 
     #[test]
     fn a_plan_refuses_what_no_bar_could_carry() {
-        assert_eq!(plan(&[ShmRegion { id: 1, len: 0 }]), Err(ShmLayoutError::ZeroLength));
+        assert_eq!(
+            plan(&[ShmRegion { id: 1, len: 0 }]),
+            Err(ShmLayoutError::ZeroLength)
+        );
         assert!(matches!(
             plan(&[ShmRegion { id: 1, len: 4095 }]),
             Err(ShmLayoutError::Unaligned { .. })
@@ -363,7 +509,10 @@ mod tests {
         // Two regions that each fit but together do not.
         assert!(matches!(
             plan(&[
-                ShmRegion { id: 1, len: layout::MAX_SHM_BAR_BYTES },
+                ShmRegion {
+                    id: 1,
+                    len: layout::MAX_SHM_BAR_BYTES
+                },
                 ShmRegion { id: 2, len: 4096 },
             ]),
             Err(ShmLayoutError::TooLarge { .. })
@@ -372,9 +521,16 @@ mod tests {
 
     #[test]
     fn a_window_follows_its_bar_and_reports_the_region_base() {
-        let regions = [ShmRegion { id: 1, len: 256 * MIB }];
+        let regions = [ShmRegion {
+            id: 1,
+            len: 256 * MIB,
+        }];
         let w = window(256 * MIB, &regions);
-        assert_eq!(w.placed_at(), None, "unplaced until the driver enables the BAR");
+        assert_eq!(
+            w.placed_at(),
+            None,
+            "unplaced until the driver enables the BAR"
+        );
         assert_eq!(w.region_base(1), None);
 
         let base = layout::pci_mmio64_base(GUEST);
@@ -403,16 +559,16 @@ mod tests {
         let aperture = layout::pci_mmio64_base(GUEST);
 
         for evil in [
-            0,                      // guest RAM at zero
-            0x1000,                 // the boot page tables
+            0,      // guest RAM at zero
+            0x1000, // the boot page tables
             u64::from(layout::LAPIC_ADDR),
             u64::from(layout::IOAPIC_ADDR),
             layout::PFLASH_BASE,
             layout::PCI_MMIO_BASE,
             layout::VIRTIO_MMIO_BASE,
-            aperture - 0x1000,      // one page below the aperture
+            aperture - 0x1000,             // one page below the aperture
             layout::pci_mmio64_end(GUEST), // one window past the end
-            u64::MAX - 0x1000,      // wraps
+            u64::MAX - 0x1000,             // wraps
         ] {
             assert!(!w.follow(Some(evil)), "{evil:#x} must not be mapped");
             assert_eq!(w.placed_at(), None, "{evil:#x} left a mapping behind");
@@ -444,7 +600,8 @@ mod tests {
     fn the_device_backing_is_bounded_by_the_window() {
         let regions = [ShmRegion { id: 1, len: 8192 }];
         let w = window(8192, &regions);
-        let backing = w.backing();
+        let backing = w.backing_for(1).expect("region 1");
+        assert!(w.backing_for(2).is_none(), "no such region");
         assert_eq!(backing.len(), 8192);
         assert!(!backing.is_empty());
         backing.write(0, b"host-wrote-this").unwrap();
@@ -456,6 +613,38 @@ mod tests {
         backing.fill(0, 8192, 0xa5).unwrap();
         backing.read(8191, &mut buf[..1]).unwrap();
         assert_eq!(buf[0], 0xa5);
+    }
+
+    /// A second region's backing must not be able to reach the first one's
+    /// bytes — the offset a guest names is region-relative, and the device
+    /// bounds it against the length it declared.
+    #[test]
+    fn a_region_backing_cannot_reach_another_region() {
+        let regions = [
+            ShmRegion { id: 1, len: 8192 },
+            ShmRegion { id: 2, len: 4096 },
+        ];
+        let w = window(16384, &regions);
+        let first = w.backing_for(1).expect("region 1");
+        let second = w.backing_for(2).expect("region 2");
+        assert_eq!(first.len(), 8192);
+        assert_eq!(second.len(), 4096);
+
+        first.fill(0, 8192, 0x11).unwrap();
+        second.fill(0, 4096, 0x22).unwrap();
+        // Region 2 starts where region 1 ends, and neither can see the other.
+        let mut probe = [0u8; 1];
+        first.read(8191, &mut probe).unwrap();
+        assert_eq!(probe[0], 0x11);
+        second.read(0, &mut probe).unwrap();
+        assert_eq!(probe[0], 0x22);
+        assert!(
+            first.read(8192, &mut probe).is_err(),
+            "region 1 must stop at its own end"
+        );
+        assert!(second.read(4096, &mut probe).is_err());
+        assert!(second.fill(4090, 16, 0).is_err());
+        assert!(second.write(u64::MAX, b"x").is_err(), "no wrap");
     }
 
     #[test]

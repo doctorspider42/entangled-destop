@@ -108,6 +108,7 @@ use crate::msi::UserspaceMsiSink;
 #[cfg(target_os = "linux")]
 use crate::notify::{DeviceNotifier, NotifyAddressing, NotifyError, QueueNotifyMode};
 use crate::pci::{ConfigSpace, PciError, PciRoot};
+use crate::shm::ShmSupport;
 use virtio_core::msix;
 
 #[derive(Debug, Error)]
@@ -253,6 +254,12 @@ pub struct VirtioPciSlot {
     /// worker thread; `None` means every kick runs inline on the vCPU.
     #[cfg(target_os = "linux")]
     notifier: Option<DeviceNotifier<PciTransport>>,
+    /// The host memory behind this function's shared-memory regions, when it
+    /// declared any and the machine could back them (VEN-2001).
+    ///
+    /// `None` is the ordinary case and the pre-EPIC-20 behaviour: no BAR 2, no
+    /// shared-memory capability, byte-identical configuration space.
+    shm: Option<Arc<crate::shm::ShmWindow>>,
 }
 
 impl VirtioPciSlot {
@@ -283,6 +290,7 @@ struct BuiltFunction {
     msix_vectors: u16,
     device_type: virtio_core::DeviceType,
     transport: Arc<Mutex<PciTransport>>,
+    shm: Option<Arc<crate::shm::ShmWindow>>,
 }
 
 impl VirtioPciBus {
@@ -331,6 +339,23 @@ impl VirtioPciBus {
         mode: QueueNotifyMode,
         interrupts: PciInterruptMode,
     ) -> Result<Self, VirtioPciAttachError> {
+        Self::attach_with_shm(vm, mem, devices, mode, interrupts, None)
+    }
+
+    /// [`Self::attach_with_interrupts`] plus the host memory a device's
+    /// shared-memory regions need (EPIC 20, VEN-2001).
+    ///
+    /// Additive on purpose: `shm: None` is exactly the bus every caller had
+    /// before this existed, down to the bytes in configuration space.
+    #[cfg(target_os = "linux")]
+    pub fn attach_with_shm(
+        vm: Arc<VmFd>,
+        mem: Arc<GuestMem>,
+        devices: Vec<Box<dyn VirtioDevice>>,
+        mode: QueueNotifyMode,
+        interrupts: PciInterruptMode,
+        shm: Option<ShmSupport<'_>>,
+    ) -> Result<Self, VirtioPciAttachError> {
         // One probe for the whole bus: whether a function publishes MSI-X must be
         // settled before any driver can walk the capability list, and a capability
         // whose interrupts silently vanish is worse than no capability.
@@ -360,6 +385,9 @@ impl VirtioPciBus {
             mode,
             interrupts,
         };
+        let mut apertures = shm
+            .as_ref()
+            .map(|s| layout::Mmio64Allocator::for_guest(s.mem_bytes));
         for (slot, mut device) in devices.into_iter().enumerate() {
             let bar_base = layout::pci_bar_slot(slot as u64);
             // Not `first + slot`: the pins that skips are ones this machine's own
@@ -387,6 +415,7 @@ impl VirtioPciBus {
                 msi.clone(),
                 bar_base,
                 gsi,
+                shm.as_ref().zip(apertures.as_mut()),
             )?;
 
             let notifier = if mode.is_offloaded() {
@@ -421,6 +450,7 @@ impl VirtioPciBus {
                 msix_vectors: built.msix_vectors,
                 transport: built.transport,
                 notifier,
+                shm: built.shm,
             });
         }
         Ok(bus)
@@ -451,6 +481,22 @@ impl VirtioPciBus {
         irqchip: &UserspaceIrqChip,
         interrupts: PciInterruptMode,
     ) -> Result<Self, VirtioPciAttachError> {
+        Self::attach_userspace_with_shm(mem, devices, irqchip, interrupts, None)
+    }
+
+    /// [`Self::attach_userspace`] plus the host memory a device's
+    /// shared-memory regions need (EPIC 20, VEN-2001).
+    ///
+    /// The window machinery is host-neutral by construction: the only
+    /// hypervisor-specific line is inside `ShmSupport::allocate`, which the
+    /// WHP caller fills in with `WhpPartition::create_shm_window`.
+    pub fn attach_userspace_with_shm(
+        mem: Arc<GuestMem>,
+        devices: Vec<Box<dyn VirtioDevice>>,
+        irqchip: &UserspaceIrqChip,
+        interrupts: PciInterruptMode,
+        shm: Option<ShmSupport<'_>>,
+    ) -> Result<Self, VirtioPciAttachError> {
         let msi: Option<Arc<dyn MsiSink>> = if interrupts.is_msix() {
             Some(Arc::new(UserspaceMsiSink::new(
                 irqchip.interrupt_delivery(),
@@ -469,6 +515,9 @@ impl VirtioPciBus {
             mode: QueueNotifyMode::Synchronous,
             interrupts,
         };
+        let mut apertures = shm
+            .as_ref()
+            .map(|s| layout::Mmio64Allocator::for_guest(s.mem_bytes));
         for (slot, device) in devices.into_iter().enumerate() {
             let bar_base = layout::pci_bar_slot(slot as u64);
             let gsi = layout::virtio_irq(slot).ok_or(VirtioPciAttachError::Bus {
@@ -479,8 +528,16 @@ impl VirtioPciBus {
                 .virtio_line(slot)
                 .map_err(|source| VirtioPciAttachError::IrqChip { slot, source })?;
 
-            let built =
-                bus.attach_function(slot, device, &mem, line, msi.clone(), bar_base, gsi)?;
+            let built = bus.attach_function(
+                slot,
+                device,
+                &mem,
+                line,
+                msi.clone(),
+                bar_base,
+                gsi,
+                shm.as_ref().zip(apertures.as_mut()),
+            )?;
             tracing::info!(
                 slot,
                 device = ?built.device_type,
@@ -498,6 +555,7 @@ impl VirtioPciBus {
                 transport: built.transport,
                 #[cfg(target_os = "linux")]
                 notifier: None,
+                shm: built.shm,
             });
         }
         Ok(bus)
@@ -511,13 +569,18 @@ impl VirtioPciBus {
     fn attach_function(
         &mut self,
         slot: usize,
-        device: Box<dyn VirtioDevice>,
+        mut device: Box<dyn VirtioDevice>,
         mem: &Arc<GuestMem>,
         inner_line: Arc<dyn IrqLine>,
         msi: Option<Arc<dyn MsiSink>>,
         bar_base: u64,
         gsi: u32,
+        shm: Option<(&ShmSupport<'_>, &mut layout::Mmio64Allocator)>,
     ) -> Result<BuiltFunction, VirtioPciAttachError> {
+        // Before anything else, because it decides whether the configuration
+        // space grows a second BAR and a fifth virtio capability.
+        let shm = crate::shm::back_regions(slot, device.as_mut(), shm);
+
         // How many MSI-X vectors this function needs: one per queue plus one
         // for configuration changes. A device with more queues than the table
         // region can hold gets no capability rather than a table too small for
@@ -537,8 +600,14 @@ impl VirtioPciBus {
 
         // The config space is built first so its INTx flag can gate the
         // line the transport is about to be handed.
-        let (mut config, msix_cap_at) =
-            Self::build_config_space(slot, bar_base, gsi, device.as_ref(), table_size)?;
+        let (mut config, msix_cap_at) = Self::build_config_space(
+            slot,
+            bar_base,
+            gsi,
+            device.as_ref(),
+            table_size,
+            shm.as_deref(),
+        )?;
         let line = Arc::new(IntxLine {
             line: inner_line,
             enabled: config.intx_flag(),
@@ -580,6 +649,7 @@ impl VirtioPciBus {
             msix_vectors,
             device_type,
             transport,
+            shm,
         })
     }
 
@@ -603,6 +673,7 @@ impl VirtioPciBus {
         gsi: u32,
         device: &dyn VirtioDevice,
         msix_table_size: Option<u16>,
+        shm: Option<&crate::shm::ShmWindow>,
     ) -> Result<(ConfigSpace, Option<u8>), VirtioPciAttachError> {
         let bus_error = |source| VirtioPciAttachError::Bus { slot, source };
         // The aperture and the BAR size are both host constants far below 4 GiB,
@@ -634,8 +705,33 @@ impl VirtioPciBus {
             vpci::VIRTIO_PCI_INTERRUPT_PIN,
             u8::try_from(gsi).unwrap_or(u8::MAX),
         );
+        // BAR 2/3, the 64-bit prefetchable shared-memory window, when this
+        // device has one. BAR 0 cannot carry it: it is 32 KiB, 32-bit and sized
+        // to the register file (`virtio_core::pci`).
+        if let Some(shm) = shm {
+            config = config
+                .with_memory_bar64(
+                    vpci::VIRTIO_PCI_SHM_BAR_INDEX,
+                    shm.initial_base(),
+                    shm.bar_size(),
+                )
+                .map_err(bus_error)?;
+        }
         for record in vpci::capability_records() {
             config.add_capability(&record).map_err(bus_error)?;
+        }
+        // The shared-memory capabilities go after the four structure locators
+        // and before MSI-X, so COMMON_CFG stays the list head — the record
+        // Linux's `vp_modern_probe` walks the list for — and the four offsets
+        // every existing test and log line names do not move.
+        //
+        // This is the one line phase 1 deliberately left uncalled: a
+        // `virtio_pci_cap64` pointing at a BAR nothing decodes is worse than no
+        // capability at all, so it appears exactly when the window above does.
+        if let Some(shm) = shm {
+            for record in vpci::shm_capability_records(shm.placements()) {
+                config.add_capability(&record).map_err(bus_error)?;
+            }
         }
         // MSI-X last, so the four virtio records keep the offsets every existing
         // test and log line names — and COMMON_CFG stays the list head, which is
@@ -705,6 +801,12 @@ impl VirtioPciBus {
         }
         #[cfg(target_os = "linux")]
         self.reconcile_notify();
+        // A reset puts every command register back to "decodes nothing", so
+        // this takes every shared-memory window out of the guest's address
+        // space — which is exactly what a rebooting machine owes ADR-0005. A
+        // window left mapped across a reboot is host memory visible to a guest
+        // that has not yet enumerated the bus.
+        self.reconcile_shm();
     }
 
     /// Every function on this bus, for a snapshot (ADR-0006).
@@ -875,6 +977,15 @@ impl VirtioPciBus {
         if write.decode_changed {
             self.reconcile_notify();
         }
+        // Unlike the ioeventfd sweep this one runs on **both** hosts: a
+        // shared-memory window is a hypervisor mapping, not a notification
+        // address, so nothing about it follows a BAR move "by construction".
+        // EDK2 reassigns every BAR during enumeration, and a window left at the
+        // old address is host memory sitting where the guest has since put
+        // something else.
+        if write.decode_changed {
+            self.reconcile_shm();
+        }
         if write.mirror_changed {
             if let Some(owner) = write.owner {
                 self.msix_control_changed(owner);
@@ -961,6 +1072,47 @@ impl VirtioPciBus {
                 notifier.rebase(notify_base, &slot.transport);
             }
         }
+    }
+
+    /// Re-points every shared-memory window at wherever its BAR now decodes
+    /// (EPIC 20, VEN-2001).
+    ///
+    /// The same sweep-all-slots shape as [`Self::reconcile_notify`], and for
+    /// the same reason — a firmware reassigns the whole bus, so one function's
+    /// new address is another's old one — but with two differences worth
+    /// naming:
+    ///
+    /// * it runs on every host, because the mapping is a hypervisor object on
+    ///   both;
+    /// * "the BAR decodes nothing" means **unmap**, not "leave it and lose a
+    ///   kick". A window is host memory; leaving it mapped after the guest has
+    ///   disabled memory decoding, or moved the BAR somewhere this machine
+    ///   refuses to follow, is the one outcome that turns a device bug into a
+    ///   memory-safety one for the guest.
+    fn reconcile_shm(&self) {
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(shm) = &slot.shm else {
+                continue;
+            };
+            let window = match self.root.lock() {
+                Ok(root) => root.bar_window_of(index, vpci::VIRTIO_PCI_SHM_BAR_INDEX),
+                Err(_) => {
+                    tracing::error!(
+                        "PCI root lock is poisoned; not reconciling shared-memory windows"
+                    );
+                    return;
+                }
+            };
+            shm.follow(window.map(|(base, _)| base));
+        }
+    }
+
+    /// The shared-memory window of the device in `slot`, if it has one.
+    ///
+    /// For tests, for the snapshot path (which records where each region
+    /// landed — ADR-0006) and for `entangled doctor`.
+    pub fn shm_window(&self, slot: usize) -> Option<&Arc<crate::shm::ShmWindow>> {
+        self.slots.get(slot)?.shm.as_ref()
     }
 
     /// Decodes `addr` into the slot whose BAR claims it and the offset inside
@@ -1170,12 +1322,23 @@ mod tests {
         device: &dyn VirtioDevice,
         msix_table_size: Option<u16>,
     ) -> (ConfigSpace, Option<u8>) {
+        config_space_with_shm(device, msix_table_size, None)
+    }
+
+    /// The same, with a shared-memory window attached — the second BAR and the
+    /// `virtio_pci_cap64` records that go with it (EPIC 20).
+    fn config_space_with_shm(
+        device: &dyn VirtioDevice,
+        msix_table_size: Option<u16>,
+        shm: Option<&crate::shm::ShmWindow>,
+    ) -> (ConfigSpace, Option<u8>) {
         VirtioPciBus::build_config_space(
             0,
             layout::pci_bar_slot(0),
             layout::PCI_FIRST_IRQ,
             device,
             msix_table_size,
+            shm,
         )
         .expect("the host's own aperture and GSI are valid")
     }

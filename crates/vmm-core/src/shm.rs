@@ -99,7 +99,9 @@ impl HostShmRegion {
         let size = usize::try_from(len)
             .map_err(|_| VmmError::GuestMemory(format!("window of {len} bytes overflows usize")))?;
         let mapping = MmapRegion::<()>::new(size).map_err(|e| {
-            VmmError::GuestMemory(format!("cannot allocate a {len}-byte shared-memory window: {e}"))
+            VmmError::GuestMemory(format!(
+                "cannot allocate a {len}-byte shared-memory window: {e}"
+            ))
         })?;
         Ok(Self { mapping, len })
     }
@@ -156,23 +158,43 @@ impl HostShmRegion {
         let chunk = vec![byte; CHUNK.min(usize::try_from(len).unwrap_or(CHUNK))];
         let mut done = 0u64;
         while done < len {
-            let take = usize::try_from(len - done).unwrap_or(CHUNK).min(chunk.len());
+            let take = usize::try_from(len - done)
+                .unwrap_or(CHUNK)
+                .min(chunk.len());
             self.write(offset + done, &chunk[..take])?;
             done += take as u64;
         }
         Ok(())
     }
 
-    fn slice(&self, offset: u64, len: u64) -> Result<vm_memory::VolatileSlice<'_, ()>, ShmAccessError> {
-        let end = offset
-            .checked_add(len)
-            .ok_or(ShmAccessError::OutOfBounds { offset, len, window: self.len })?;
+    fn slice(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<vm_memory::VolatileSlice<'_, ()>, ShmAccessError> {
+        let end = offset.checked_add(len).ok_or(ShmAccessError::OutOfBounds {
+            offset,
+            len,
+            window: self.len,
+        })?;
         if end > self.len {
-            return Err(ShmAccessError::OutOfBounds { offset, len, window: self.len });
+            return Err(ShmAccessError::OutOfBounds {
+                offset,
+                len,
+                window: self.len,
+            });
         }
         let (offset, len) = (
-            usize::try_from(offset).map_err(|_| ShmAccessError::OutOfBounds { offset, len, window: self.len })?,
-            usize::try_from(len).map_err(|_| ShmAccessError::OutOfBounds { offset, len, window: self.len })?,
+            usize::try_from(offset).map_err(|_| ShmAccessError::OutOfBounds {
+                offset,
+                len,
+                window: self.len,
+            })?,
+            usize::try_from(len).map_err(|_| ShmAccessError::OutOfBounds {
+                offset,
+                len,
+                window: self.len,
+            })?,
         );
         self.mapping
             .get_slice(offset, len)

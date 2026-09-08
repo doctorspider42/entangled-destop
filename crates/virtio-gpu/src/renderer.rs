@@ -331,6 +331,25 @@ pub trait Renderer3d: Send {
         let _ = (resource_id, offset);
     }
 
+    /// Hands the renderer the host memory behind the device's shared-memory
+    /// window (VEN-2001 phase 2).
+    ///
+    /// This is where a real Venus renderer will put a `VkDeviceMemory`
+    /// mapping: `virgl_renderer_resource_map` returns a host pointer, and the
+    /// window offset the guest named is where it belongs. Nothing here does
+    /// that yet — the loopback writes a signature instead, so the whole path
+    /// is provable on a host with no GPU at all.
+    ///
+    /// Called at most once, before the device is activated, and only when the
+    /// machine layer could allocate the window. An **isolated** renderer
+    /// (GPU-012) takes the default: the backing is host memory in *this*
+    /// process and an `Arc` does not cross a pipe, so the helper never sees
+    /// the window and the device's own clear-on-map is what protects the
+    /// guest.
+    fn set_host_visible(&mut self, backing: Arc<dyn virtio_core::ShmBacking>) {
+        let _ = backing;
+    }
+
     // ------------------------- crash containment (ADR-0004 phase 2, GPU-012)
 
     /// Whether the renderer is still able to execute commands.
@@ -806,6 +825,12 @@ impl Gpu3d {
     /// Installs the device's host waker on the renderer.
     pub fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
         self.renderer.set_host_waker(waker);
+    }
+
+    /// Installs the shared-memory window's host pages on the renderer
+    /// (VEN-2001 phase 2).
+    pub fn set_host_visible(&mut self, backing: Arc<dyn virtio_core::ShmBacking>) {
+        self.renderer.set_host_visible(backing);
     }
 
     /// Zero-copy export of a scanout resource, when the host can do it.

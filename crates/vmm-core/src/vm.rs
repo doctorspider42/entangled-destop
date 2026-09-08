@@ -1,6 +1,7 @@
 //! VM assembly: memory registration, in-kernel IRQ chip/PIT and vCPU
 //! creation (backlog MVP-102/103/106).
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use kvm_bindings::{
@@ -37,7 +38,7 @@ pub struct Vm {
     /// formulas because the two used to be derived independently, and a ROM
     /// mapped after a window would silently have reused the window's slot —
     /// which KVM implements as "replace that mapping", not as an error.
-    next_slot: u32,
+    next_slot: AtomicU32,
 }
 
 /// A firmware image mapped into its own KVM memory slot.
@@ -70,7 +71,7 @@ impl Vm {
         for index in 0..cfg.vcpu_count {
             vcpus.push(Vcpu::new(&fd, hv.kvm(), index)?);
         }
-        let next_slot = memory.num_regions() as u32;
+        let next_slot = AtomicU32::new(memory.num_regions() as u32);
         Ok(Self {
             fd,
             memory,
@@ -130,8 +131,7 @@ impl Vm {
             std::ptr::copy_nonoverlapping(image.as_ptr(), mapping.as_ptr(), image.len());
         }
 
-        let slot = self.next_slot;
-        self.next_slot += 1;
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
         let mr = kvm_userspace_memory_region {
             slot,
             flags: if self.readonly_mem {
@@ -182,15 +182,18 @@ impl Vm {
     /// One slot per window, reserved for the life of the VM even while the
     /// window is unmapped, because KVM identifies a mapping by its slot number
     /// and reusing one would silently replace somebody else's.
-    pub fn create_shm_window(&mut self, len: u64) -> Result<Arc<SharedWindow>, VmmError> {
-        let slot = self.next_slot;
-        self.next_slot += 1;
+    pub fn create_shm_window(&self, len: u64) -> Result<Arc<SharedWindow>, VmmError> {
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
         let mapper = Arc::new(KvmGpaMapper {
             fd: Arc::clone(&self.fd),
             slot,
         });
         let window = SharedWindow::new(len, mapper)?;
-        tracing::info!(slot, len, "reserved a KVM memory slot for a shared-memory window");
+        tracing::info!(
+            slot,
+            len,
+            "reserved a KVM memory slot for a shared-memory window"
+        );
         Ok(Arc::new(window))
     }
 

@@ -229,12 +229,30 @@ impl BlobResource {
 /// what it is told is inside the window and does not collide with a live
 /// mapping. Getting that wrong would let one guest mapping alias another's
 /// host memory.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct HostVisibleWindow {
     len: u64,
     /// Offset → (length, resource id), ordered so overlap is a neighbour check
     /// rather than a scan.
     mappings: BTreeMap<u64, (u64, u32)>,
+    /// The host pages the guest actually maps, once the machine layer has
+    /// allocated them (VEN-2001 phase 2).
+    ///
+    /// `None` is phase 1: the window is a validator with nothing behind it, so
+    /// the bookkeeping is exercisable — and fuzzable — on any host, and a
+    /// machine that cannot back a window publishes no region at all. `Some` is
+    /// what makes a mapping reach a guest.
+    backing: Option<std::sync::Arc<dyn virtio_core::ShmBacking>>,
+}
+
+impl std::fmt::Debug for HostVisibleWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostVisibleWindow")
+            .field("len", &self.len)
+            .field("mappings", &self.mappings.len())
+            .field("backed", &self.backing.is_some())
+            .finish()
+    }
 }
 
 impl HostVisibleWindow {
@@ -243,7 +261,58 @@ impl HostVisibleWindow {
         Self {
             len,
             mappings: BTreeMap::new(),
+            backing: None,
         }
+    }
+
+    /// Attaches the host pages behind this window.
+    ///
+    /// Refused — and the window left unbacked — when the backing is not
+    /// exactly as long as the region the device *declared*, because that
+    /// length is the one the guest was told and the one every offset is
+    /// checked against. A backing shorter than the declaration would turn a
+    /// validated offset into an out-of-bounds host access; a longer one would
+    /// hide host memory the guest was never promised inside a region it can
+    /// map.
+    pub fn set_backing(&mut self, backing: std::sync::Arc<dyn virtio_core::ShmBacking>) -> bool {
+        if backing.len() != self.len || self.len == 0 {
+            tracing::error!(
+                declared = self.len,
+                backing = backing.len(),
+                "refusing a shared-memory backing whose length is not the declared one"
+            );
+            return false;
+        }
+        self.backing = Some(backing);
+        true
+    }
+
+    /// The host pages behind this window, if the machine could back it.
+    pub fn backing(&self) -> Option<&std::sync::Arc<dyn virtio_core::ShmBacking>> {
+        self.backing.as_ref()
+    }
+
+    /// Whether a mapping made in this window can actually reach a guest.
+    pub fn is_backed(&self) -> bool {
+        self.backing.is_some()
+    }
+
+    /// Clears `[offset, size)` so a guest never sees what the previous owner of
+    /// that span left there.
+    ///
+    /// Called on the way *in* rather than on the way out: a blob that is
+    /// unmapped and never re-mapped would otherwise leave its bytes in the
+    /// window for the next resource, and doing it on entry means a host that
+    /// crashed between the two still cannot leak. The span has already been
+    /// validated against the window and every live mapping.
+    pub fn clear_span(&self, offset: u64, size: u64) -> Result<(), CommandError> {
+        let Some(backing) = &self.backing else {
+            return Ok(());
+        };
+        backing.fill(offset, size, 0).map_err(|error| {
+            tracing::error!(%error, "cannot clear a shared-memory span for a new mapping");
+            CommandError::BadBlobMapping { offset, size }
+        })
     }
 
     /// Length of the window in bytes.
@@ -370,6 +439,12 @@ impl BlobTable {
     /// The host-visible window, for diagnostics and tests.
     pub fn window(&self) -> &HostVisibleWindow {
         &self.window
+    }
+
+    /// The host-visible window, mutably, so the machine layer's backing can be
+    /// attached after construction (VEN-2001 phase 2).
+    pub fn window_mut(&mut self) -> &mut HostVisibleWindow {
+        &mut self.window
     }
 
     /// True when `id` names a live blob.
