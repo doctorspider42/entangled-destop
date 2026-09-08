@@ -52,9 +52,13 @@
 
 pub mod config;
 pub mod device;
+pub mod gamepad;
 
 pub use config::{DevIds, Profile, Selection};
 pub use device::{BufferError, EventStats, InputDevice, InputHandle, MAX_PENDING_EVENTS};
+pub use gamepad::{
+    open_source, GamepadCapture, GamepadError, GamepadSource, PadState, SourceChoice, SourceFactory,
+};
 
 /// Linux input event types (`EV_*` from `linux/input-event-codes.h`).
 pub mod ev {
@@ -84,10 +88,26 @@ pub mod key {
     pub const SELECT: u16 = 353;
 }
 
-/// Absolute axes for the pointer device.
+/// Absolute axes (`ABS_*`). The pointer uses the first two; the gamepad uses
+/// all of them, with the codes `xpad` (the in-tree Xbox controller driver)
+/// reports — see [`Profile::Gamepad`](config::Profile::Gamepad).
 pub mod abs {
+    /// Left stick X on the gamepad, window X on the pointer.
     pub const X: u16 = 0x00;
+    /// Left stick Y on the gamepad, window Y on the pointer.
     pub const Y: u16 = 0x01;
+    /// `ABS_Z` — the **left** trigger, as `xpad` reports it.
+    pub const Z: u16 = 0x02;
+    /// `ABS_RX` — right stick X.
+    pub const RX: u16 = 0x03;
+    /// `ABS_RY` — right stick Y.
+    pub const RY: u16 = 0x04;
+    /// `ABS_RZ` — the **right** trigger.
+    pub const RZ: u16 = 0x05;
+    /// `ABS_HAT0X` — D-pad left/right, one of `-1`, `0`, `1`.
+    pub const HAT0X: u16 = 0x10;
+    /// `ABS_HAT0Y` — D-pad up/down; `-1` is *up*, following evdev convention.
+    pub const HAT0Y: u16 = 0x11;
 }
 
 /// Relative axes; the absolute pointer still needs them for the scroll wheel.
@@ -107,6 +127,43 @@ pub mod btn {
     pub const SIDE: u16 = 0x113;
     /// `BTN_EXTRA` — winit's `MouseButton::Forward`.
     pub const EXTRA: u16 = 0x114;
+
+    // ---- gamepad (`BTN_GAMEPAD` block, 0x130..=0x13e) ----
+    //
+    // Codes and names are the kernel's, so what the guest sees is what a real
+    // Xbox-shaped pad on a Linux host sees. Note the two traps `xpad` also
+    // has to live with: `BTN_NORTH` (0x133) is the *top* face button (Y on an
+    // Xbox pad) and `BTN_WEST` (0x134) is the *left* one (X) — they are not in
+    // clockwise order — and 0x132 (`BTN_C`) is deliberately skipped, because a
+    // pad that advertises it is a six-face-button pad to SDL.
+    /// `BTN_SOUTH` / `BTN_A` — the bottom face button.
+    pub const SOUTH: u16 = 0x130;
+    /// `BTN_EAST` / `BTN_B` — the right face button.
+    pub const EAST: u16 = 0x131;
+    /// `BTN_NORTH` / `BTN_Y` — the top face button.
+    pub const NORTH: u16 = 0x133;
+    /// `BTN_WEST` / `BTN_X` — the left face button.
+    pub const WEST: u16 = 0x134;
+    /// `BTN_TL` — left shoulder.
+    pub const TL: u16 = 0x136;
+    /// `BTN_TR` — right shoulder.
+    pub const TR: u16 = 0x137;
+    /// `BTN_SELECT` — "back" / "view".
+    pub const SELECT: u16 = 0x13a;
+    /// `BTN_START` — "start" / "menu".
+    pub const START: u16 = 0x13b;
+    /// `BTN_MODE` — the guide / logo button.
+    pub const MODE: u16 = 0x13c;
+    /// `BTN_THUMBL` — left stick click.
+    pub const THUMBL: u16 = 0x13d;
+    /// `BTN_THUMBR` — right stick click.
+    pub const THUMBR: u16 = 0x13e;
+
+    /// Every gamepad button, in ascending code order — the single list the
+    /// config bitmap, the host capture and the tests all read from.
+    pub const GAMEPAD: [u16; 11] = [
+        SOUTH, EAST, NORTH, WEST, TL, TR, SELECT, START, MODE, THUMBL, THUMBR,
+    ];
 }
 
 /// Auto-repeat parameters (`REP_*`). The guest's input core owns repeat
@@ -119,6 +176,39 @@ pub mod rep {
 /// Range advertised for ABS_X/ABS_Y; host window coordinates are rescaled
 /// into this range so guest position matches the window exactly (MVP-903).
 pub const ABS_AXIS_MAX: u32 = 32767;
+
+/// Axis geometry of the gamepad, byte-for-byte what the kernel's `xpad` driver
+/// publishes for an Xbox controller (GAME-2104).
+///
+/// The numbers are copied rather than invented on purpose: userspace does not
+/// read a pad's *name* to decide how to drive it, it reads these ranges. A
+/// stick that ran 0..32767 or a trigger that ran -128..127 would still be a
+/// working evdev device and SDL would still bind to it, but every guess it
+/// makes about centre, polarity and full deflection would be wrong.
+pub mod pad {
+    /// Stick minimum (`xpad`: `input_set_abs_params(..., -32768, 32767, 16, 128)`).
+    pub const STICK_MIN: i32 = -32768;
+    /// Stick maximum.
+    pub const STICK_MAX: i32 = 32767;
+    /// Stick `fuzz`: the input core swallows changes smaller than this, which
+    /// is noise filtering on real hardware and free on a synthetic pad.
+    pub const STICK_FUZZ: i32 = 16;
+    /// Stick `flat`: the **guest's** deadzone, in the guest's own units.
+    ///
+    /// This is the only deadzone in the whole path, and it is advertised
+    /// rather than applied: the host forwards raw stick values and lets
+    /// `joydev` (which honours `flat`) and SDL (which ignores it and uses its
+    /// own) each do what they already do for a real pad.
+    pub const STICK_FLAT: i32 = 128;
+    /// Trigger minimum — triggers are unipolar, exactly like XInput's `BYTE`.
+    pub const TRIGGER_MIN: i32 = 0;
+    /// Trigger maximum.
+    pub const TRIGGER_MAX: i32 = 255;
+    /// Hat minimum (left / up).
+    pub const HAT_MIN: i32 = -1;
+    /// Hat maximum (right / down).
+    pub const HAT_MAX: i32 = 1;
+}
 
 /// One event as carried in the virtio-input event queue (matches
 /// `struct virtio_input_event`: all fields little-endian on the wire).
