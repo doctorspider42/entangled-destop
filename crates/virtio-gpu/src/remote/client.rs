@@ -2,9 +2,11 @@
 //! spawn a helper process, forward validated commands to it, and treat its
 //! death as a *degradation*, never a failure of the VM.
 //!
-//! Unix-only because the transport is a `UnixStream` pair; the protocol it
-//! speaks is portable (see [`super::protocol`]), which is what keeps a future
-//! Windows/ANGLE renderer from needing a different architecture.
+//! Portable across both hosts (backlog VEN-2004). Only the *channel* differs:
+//! a `socketpair` end on Unix, a duplex named pipe on Windows
+//! ([`super::pipe_windows`]). Both are one bidirectional handle installed as
+//! the child's stdin, so everything in this file — the handshake, the shadow
+//! bookkeeping, the fence monitor, the death handling — is one implementation.
 //!
 //! # The one rule
 //!
@@ -14,9 +16,8 @@
 //! truncated reply or a helper that exits: those are the expected outcomes
 //! this module exists to survive.
 
-use std::io::{BufReader, BufWriter};
-use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
+use std::io::{BufReader, BufWriter, Read};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ use crate::resource::{read_backing, write_backing};
 use super::protocol::{
     Reply, Request, REMOTE_MAX_BACKING, REMOTE_MAX_TOTAL_SHADOW, REMOTE_XFER_WINDOW, VERSION,
 };
-use super::{read_frame, write_frame, WireError};
+use super::{protocol, read_frame, read_frame_header, read_payload, write_frame, WireError};
 
 /// How long the client waits for the helper's handshake before giving up.
 ///
@@ -48,12 +49,39 @@ const FENCE_TICK: std::time::Duration = std::time::Duration::from_millis(2);
 /// Idle sleep of the monitor when nothing is outstanding.
 const FENCE_IDLE: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The VMM's end of the channel to the helper: one bidirectional handle.
+#[cfg(unix)]
+type Channel = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type Channel = super::pipe_windows::DuplexPipe;
+
+/// Creates the channel and installs the helper's end as the child's stdin.
+///
+/// No fd/handle passing games, no filesystem path anyone else could connect
+/// to, and stdout/stderr stay inherited so the helper's own log lines land in
+/// the VMM's terminal.
+#[cfg(unix)]
+fn attach_channel(command: &mut Command) -> std::io::Result<Channel> {
+    let (ours, theirs) = Channel::pair()?;
+    command.stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+        theirs,
+    )));
+    Ok(ours)
+}
+
+#[cfg(windows)]
+fn attach_channel(command: &mut Command) -> std::io::Result<Channel> {
+    let (ours, theirs) = Channel::pair()?;
+    command.stdin(std::process::Stdio::from(theirs));
+    Ok(ours)
+}
+
 /// Why a renderer process could not be started.
 #[derive(Debug)]
 pub enum SpawnError {
     /// The helper could not be launched at all.
     Spawn(std::io::Error),
-    /// The socket pair could not be created.
+    /// The channel to it could not be created.
     Socket(std::io::Error),
     /// The helper started but the handshake failed — most often because it
     /// could not load virglrenderer, and its message says so.
@@ -143,8 +171,8 @@ impl Drop for FenceMonitor {
 /// [`Renderer3d`] backed by a renderer running in another process.
 pub struct RemoteRenderer {
     child: Child,
-    reader: BufReader<UnixStream>,
-    writer: BufWriter<UnixStream>,
+    reader: BufReader<Channel>,
+    writer: BufWriter<Channel>,
     /// Frame payload buffer, reused across calls.
     rx: Vec<u8>,
     /// Staging buffer for transfer spans, reused across calls.
@@ -188,15 +216,11 @@ impl RemoteRenderer {
     /// **stdin**. Tests use this to run a helper with a non-GL renderer, and
     /// it is the seam a future Windows implementation replaces wholesale.
     pub fn spawn_with(mut command: Command) -> Result<Self, SpawnError> {
-        let (ours, theirs) = UnixStream::pair().map_err(SpawnError::Socket)?;
-        // The helper gets its socket as stdin: no fd-passing games, no
-        // filesystem path anyone else could connect to, and stdout/stderr stay
-        // inherited so the helper's own log lines land in the VMM's terminal.
-        command.stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs)));
-        command.stdout(Stdio::inherit());
-        command.stderr(Stdio::inherit());
+        let ours = attach_channel(&mut command).map_err(SpawnError::Socket)?;
+        command.stdout(std::process::Stdio::inherit());
+        command.stderr(std::process::Stdio::inherit());
         let child = command.spawn().map_err(SpawnError::Spawn)?;
-        // The `Command` still holds the child's end of the socket pair, and
+        // The `Command` still holds the child's end of the channel, and
         // while *we* hold it open a dead child never shows up as EOF — the
         // handshake would wait out its whole timeout instead of failing at
         // once. Dropping the command closes our copy, which is what makes
@@ -309,6 +333,54 @@ impl RemoteRenderer {
                 )))
             }
         }
+    }
+
+    /// One request whose reply is bulk pixels, read into `out` in place.
+    ///
+    /// Returns `Ok(None)` when `out` holds exactly `expected` bytes of BGRA,
+    /// `Ok(Some(message))` for an in-band refusal by the renderer (the wire is
+    /// still healthy, the command is not), and `Err` only for the thing this
+    /// whole module exists for: the renderer is gone.
+    ///
+    /// A reply of the wrong *size* is in-band, not fatal: the frame was well
+    /// formed, so nothing about the stream is out of step — only that one
+    /// readback is unusable.
+    fn exchange_pixels(
+        &mut self,
+        request: &Request,
+        out: &mut Vec<u8>,
+        expected: usize,
+    ) -> Result<Option<String>, WireError> {
+        if !self.alive {
+            return Err(WireError::Closed);
+        }
+        write_frame(&mut self.writer, request.tag(), &request.encode())?;
+        let (tag, len) = read_frame_header(&mut self.reader)?;
+        if tag != protocol::tag::BYTES {
+            // Anything else is small: read it the ordinary way and let the
+            // decoder say what it was.
+            read_payload(&mut self.reader, &mut self.rx, len)?;
+            return Ok(Some(match Reply::decode(tag, &self.rx)? {
+                Reply::Error(message) => message,
+                other => format!("unexpected reply {other:?}"),
+            }));
+        }
+        // `Reply::Bytes` frames its payload with its own u32 length, which
+        // must agree with the frame's — a peer that disagrees with itself is
+        // not one to keep reading from.
+        let mut inner = [0u8; 4];
+        self.reader.read_exact(&mut inner)?;
+        let inner = u32::from_le_bytes(inner) as usize;
+        if inner + 4 != len {
+            return Err(WireError::Codec(protocol::CodecError::Truncated));
+        }
+        read_payload(&mut self.reader, out, inner)?;
+        if inner != expected {
+            return Ok(Some(format!(
+                "the renderer returned {inner} bytes for this rect, expected {expected}"
+            )));
+        }
+        Ok(None)
     }
 
     fn exchange(&mut self, request: &Request) -> Result<Reply, WireError> {
@@ -571,24 +643,28 @@ impl Renderer3d for RemoteRenderer {
         rect: Rect,
         out: &mut Vec<u8>,
     ) -> Result<(), CommandError> {
-        let pixels = self.call_bytes(&Request::ReadRect {
+        // The one reply worth a bulk path: 7.9 MiB at 1080p, once per guest
+        // present. The payload is read **straight into the caller's buffer**,
+        // which the device reuses frame to frame, so in the steady state this
+        // costs no allocation, no `memset` and no second copy (GAME-2105).
+        let request = Request::ReadRect {
             resource_id,
             x: rect.x,
             y: rect.y,
             width: rect.width,
             height: rect.height,
-        })?;
+        };
         let expected = usize::try_from(rect.pixels().saturating_mul(4)).unwrap_or(usize::MAX);
-        if pixels.len() != expected {
-            return Err(CommandError::Renderer(format!(
-                "the renderer returned {} bytes for a {}x{} rect, expected {expected}",
-                pixels.len(),
-                rect.width,
-                rect.height
-            )));
+        match self.exchange_pixels(&request, out, expected) {
+            Ok(None) => Ok(()),
+            Ok(Some(message)) => Err(CommandError::Renderer(message)),
+            Err(error) => {
+                self.mark_dead(&error);
+                Err(CommandError::Renderer(format!(
+                    "the 3D renderer process was lost: {error}"
+                )))
+            }
         }
-        *out = pixels;
-        Ok(())
     }
 
     fn reset(&mut self) {

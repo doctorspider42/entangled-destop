@@ -756,9 +756,11 @@ has Venus compiled in but whose Vulkan ICD nobody should be rendering against.
    window from step 1, and add `VIRGL_RENDERER_VENUS` (very likely with
    `USE_EXTERNAL_BLOB`) to the init flags. The typed-context and create-blob FFI
    halves are already written and behind the runtime probe.
-3. **VEN-2004 (Windows isolation).** The renderer protocol is portable and now
-   carries the blob messages; what is missing is `CreateProcess` plus a handle
-   pair where `remote::client` uses `fork`/`socketpair`.
+3. ~~**VEN-2004 (Windows isolation).**~~ Done, 2026-09-08:
+   `remote::pipe_windows::DuplexPipe` is the handle pair (a duplex named pipe,
+   installed as the child's stdin exactly as the socketpair end is), and
+   `gpu_remote.rs` runs its whole containment proof on both hosts. What Windows
+   still lacks is a *renderer* to isolate, not the isolation.
 4. **Guest acceptance (VEN-2006)** is only meaningful after 1 and 2, and only on
    a host with a real Vulkan device. `vulkaninfo` inside the guest is the first
    milestone, `vkcube` the second — the same shape as `GLPROBE_RENDERER=virgl`
@@ -768,3 +770,169 @@ has Venus compiled in but whose Vulkan ICD nobody should be rendering against.
    when a renderer declares them, and none does on this host — but when step 2
    lands, the manager wants a "3D: Venus / VirGL / none" line rather than a
    boolean.
+
+## Amendment (2026-09-08): GAME-2105 — why a guest sits at 30 fps, and what it cost
+
+Phase 2 left one number unexplained: five configurations, all landing within
+0.2 ms of a 33.4 ms frame interval, with a device that reported spending
+1.9 ms of it. This amendment answers that, and it retracts phase 2's
+conclusion — the sentence "the readback is *not* what caps this guest at
+30 fps" was drawn from a run whose host GL was not the one that ships.
+
+### The instrument first: what a frame interval is made of
+
+The device sees every present (a `RESOURCE_FLUSH` on the scanout resource),
+which makes it the only honest frame clock in the system — but an interval on
+its own cannot say *whose* millisecond it is. `virtio_gpu::pacing` now cuts
+each interval at the two boundaries the control queue can actually see:
+
+```text
+ present N-1 answered                                     present N answered
+         |---- quiet ----+-------- submit --------+---- service ----|
+                    first command of        RESOURCE_FLUSH     readback +
+                    frame N                 of frame N         sink push
+```
+
+* **quiet** — the guest asked this device for nothing. A compositor waiting on
+  a clock of its own spends its frame here.
+* **submit** — the guest was feeding the device: transfers, 3D submits, flush.
+* **service** — the device's own cost.
+
+The three sum to the interval exactly, which is what turns the attribution
+into an argument. Alongside them the report carries the 1 % and 0.1 % lows
+(mean of the slowest samples, out of a 100 µs histogram — no sample retention),
+and two counters defined against the *advertised* refresh period: `duplicate`
+(refresh slots the guest put nothing into) and `dropped` (presents superseded
+inside one slot). `entangled run --frame-stats <PATH>` mirrors the whole report
+to JSON every 120 frames, so two runs are compared with a diff rather than an
+impression.
+
+### The measurement
+
+WSLg (D3D12 / AMD Radeon PRO), an **installed** Ubuntu Desktop guest,
+1920×1080, 4 vCPUs, headless, `es2gears` animating in a small window so the
+compositor never idles. ~4.3 minutes per run. `window` is one steady
+120-frame report; `run` covers everything including boot and idle stretches.
+The machine was shared with two other agents' VMs throughout (load average 3
+to 12), so absolute numbers carry host noise — every comparison below is
+between runs taken back to back.
+
+| # | device | `refresh_hz` | run fps | window fps | window interval | quiet | submit | service | frames /4 min |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2D | 60 | 54.0 | **60.0** | **16.665 ms** | 13.3 | 2.3 | 1.1 | 12 951 |
+| 2 | 2D | 120 | 81.5 | **119.9** | **8.341 ms** | 4.4 | 2.4 | 1.5 | 21 223 |
+| 3 | virgl, isolated | 60 | 26.0 | **29.7** | **33.70 ms** | 0.1 | 4.8 | **28.8** | 6 232 |
+| 4 | virgl, in-process | 60 | 54.5 | 52.2 | 19.16 ms | 2.2 | 7.1 | 9.9 | 14 875 |
+| 5 | virgl, isolated, *after the fix below* | 60 | **50.3** | 40.6 | 24.62 ms | 0.6 | 8.4 | **15.7** | **12 468** |
+| 6 | virgl, isolated, after, 120 Hz | 120 | 52.9 | 60.4 | 16.55 ms | 0.0 | 5.3 | 11.2 | 13 194 |
+
+(Run means for the phase columns; the run-level service means are 1.3, 1.7,
+30.0, 9.2, 13.1 and 12.4 ms in the same order.)
+
+### Mechanism one: the advertised refresh is a ceiling we choose
+
+Runs 1 and 2 are the same guest, the same workload and the same device; only
+the number in the EDID differs. The guest presents at **exactly** the
+advertised period — 16.665 ms against a 16.667 ms slot, 8.341 ms against
+8.333 — with `duplicate` and `dropped` both zero, and it spends the slack
+*asleep*: 13.3 ms of quiet at 60 Hz, 4.4 ms at 120 Hz, with the work unchanged
+at ~3.5 ms. The compositor is phase-locked to the mode we advertise and will
+not present faster than it, whatever the host can do.
+
+That is a mechanism nobody had looked at: **60 Hz was a hard ceiling on the
+guest's frame rate, chosen by a constant in `edid.rs`.** Nothing here scans out
+a cable, so the honest thing is to make it a policy: `[display] refresh_hz`
+(24..=240, default 60). The default stays at what a physical monitor would
+report — a guest is entitled to be told something plausible, and 60 Hz is what
+every other VMM says — but a profile that wants a finer quantum can now have
+one, and the pacing counters follow the same value so the report stays honest.
+
+### Mechanism two: past the deadline the guest does not halve, it runs flat out
+
+The tempting story — "the guest misses a vblank and takes the next slot,
+hence exactly half" — is **wrong**, and runs 3 to 6 refute it. When the frame's
+work does not fit in a period the guest stops sleeping (quiet 0.1 ms in run 3,
+0.0 in run 6) and presents as fast as it finishes. The cadence is then the
+work, not a fraction of the refresh: 33.70, 19.16, 24.62, 16.55 ms — none of
+them a multiple of anything. And raising the advertised refresh does nothing
+for such a guest: runs 5 and 6 differ by 5 % on a doubled quantum.
+
+So phase 2's "exactly half of the EDID's 60 Hz" was a coincidence of cost, not
+a mechanism. Run 3 reproduces it — 29.7 fps, 33.70 ms — and the decomposition
+says where every millisecond went: **28.8 ms of it, 85 % of the frame, was the
+device's own scanout readback**.
+
+### What phase 2 measured, and why it read 1.9 ms
+
+Phase 2 recorded the host presentation path at 1.9 ms, 6 % of the frame, and
+concluded the readback was not the problem. `virgl_readback_host.rs` — a test
+binary that times a bare full-screen readback with no guest and no VM — shows
+why that cannot have been the shipping path:
+
+| host GL | 1920×1080 readback | 960×540 |
+|---|---:|---:|
+| WSLg D3D12 (AMD Radeon PRO), release | **16.8 ms** median (14.7 min) | 8.6 ms |
+| llvmpipe (`LIBGL_ALWAYS_SOFTWARE=1`), release | 4.8 ms | 0.9 ms |
+| WSLg D3D12, **debug build** | 351.7 ms | 88.5 ms |
+
+A 1.9 ms mean is not reachable on the D3D12 path at any rect size worth
+flushing; it is a host-llvmpipe run with small damage. That is a plausible
+thing for those runs to have been — this host's D3D12 mesa segfaults after
+1–3 minutes of compositing, and `LIBGL_ALWAYS_SOFTWARE=1` is the documented way
+to survive a four-minute measurement. The lesson is procedural and worth more
+than the number: **a performance figure has to record which renderer produced
+it**, or the next reader draws exactly the wrong conclusion from it. (The third
+row is the other half of that rule: `read_rect_bgra` is 20× slower unoptimised,
+so a debug-build measurement of this path means nothing at all.) The
+`virgl_readback_host` timings are printed, never asserted — a shared developer
+machine under another agent's build would fail a threshold for reasons that
+have nothing to do with this code.
+
+There is no partial-rect saving hiding here either: `pixels_mean` is 2 073 600
+in *every* run, 2D and 3D alike. The guest double-buffers, so the framebuffer
+changes every frame, so `drm_atomic_helper_damage_merged` widens the damage to
+the whole plane. Every present is a full-screen flush by construction.
+
+### The fix: the isolated readback was paying for four copies of the screen
+
+Run 3 against run 4 says process isolation cost **20.8 ms per frame** — not the
+"free" of phase 2's table, which was measured when a flush moved 1.9 ms of
+work. At 1080p the reply is 7.9 MiB, once per present, and the old path spent
+it like this: the helper allocated a fresh `Vec` for the pixels, `Reply::encode`
+copied it into a second, `frame()` copied *that* into a third, the client
+`memset` its receive buffer before reading, and `Reply::decode` copied the
+payload out into a fourth `Vec` that replaced the caller's reusable one. Four
+allocations of ~8 MiB, three copies and a `memset`, every frame.
+
+None of that is inherent to the isolation. `write_bytes_reply` now puts the
+header and the pixels on the wire straight out of the renderer's own reusable
+buffer, and the client reads the payload directly into the caller's buffer via
+`read_frame_header` + `read_payload`, which reuse an allocation rather than
+clearing it. Same bytes on the wire — a unit test asserts the two framings are
+byte-identical — and in the steady state no allocation, no `memset` and no
+second copy at all.
+
+Measured, run 3 → run 5, back to back on the same guest:
+
+* device service time **30.0 ms → 13.1 ms** (run means)
+* frames delivered in one 4-minute run **6 232 → 12 468** (exactly double)
+* run frame rate **26.0 → 50.3 fps**
+* the isolation premium over in-process **20.8 ms → 3.9 ms**
+
+— and run 5 carried a *higher* host load than run 3 (average 11 against 3), so
+the figure is if anything conservative. Process isolation is nearly free again,
+which is what lets it stay the default: the answer to GPU-012 does not have to
+cost half the frame rate.
+
+### What is left
+
+* **The readback itself is now the cap** — 13 ms of a 20 ms frame on this host.
+  That is phase 3's zero-copy scanout, which this host cannot do: no
+  `/dev/dri`, no dmabuf export extension (the phase-2 probe above). A host with
+  a DRM node is where that number moves next.
+* **`refresh_hz` helps only a guest with slack**, which today means a 2D or
+  cheap-workload guest. Once the readback is cheap enough that a 3D guest has
+  slack again, the 60 Hz ceiling becomes the binding constraint for it too.
+* The phase-2 table is left in place above rather than rewritten: it is what
+  was measured, and the interesting part of this amendment is *why* it read the
+  way it did.

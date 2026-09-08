@@ -329,6 +329,8 @@ fn build_devices(
                 );
             }
             gpu.set_fence_mode(fences);
+            gpu.set_refresh_hz(cfg.display.refresh_hz);
+            gpu.set_frame_stats(cfg.display.frame_stats.clone());
             devices.push(Box::new(gpu));
         }
         #[cfg(not(target_os = "linux"))]
@@ -341,7 +343,10 @@ fn build_devices(
             );
         }
     } else {
-        devices.push(Box::new(virtio_gpu::GpuDevice::new(display_handle)));
+        let mut gpu = virtio_gpu::GpuDevice::new(display_handle);
+        gpu.set_refresh_hz(cfg.display.refresh_hz);
+        gpu.set_frame_stats(cfg.display.frame_stats.clone());
+        devices.push(Box::new(gpu));
     }
 
     // virtio-input keyboard + tablet (EPIC 9); handles stay on the host side
