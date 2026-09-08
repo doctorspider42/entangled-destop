@@ -127,7 +127,11 @@ impl DuplexPipe {
                 FILE_FLAGS_AND_ATTRIBUTES(0),
                 None,
             )
-        }?;
+        }
+        // `windows::core::Error` is an HRESULT wrapper with no `io::Error`
+        // conversion; the thread's last-error is the same failure as a plain
+        // Win32 code, which is what an `io::Error` is made of here.
+        .map_err(|_| io::Error::last_os_error())?;
         // SAFETY: `client` came back from a successful `CreateFileW`, so it is
         // valid and unowned until this line.
         let client = unsafe { OwnedHandle::from_raw_handle(client.0 as RawHandle) };
@@ -142,7 +146,7 @@ impl DuplexPipe {
         match connected {
             Ok(()) => (),
             Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => (),
-            Err(error) => return Err(io::Error::from(error)),
+            Err(_) => return Err(io::Error::last_os_error()),
         }
 
         Ok((
@@ -173,7 +177,9 @@ impl DuplexPipe {
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         let micros = match timeout {
             None => 0,
-            Some(timeout) => u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX).max(1),
+            Some(timeout) => u64::try_from(timeout.as_micros())
+                .unwrap_or(u64::MAX)
+                .max(1),
         };
         self.timeout_us.store(micros, Ordering::Release);
         Ok(())
@@ -274,7 +280,9 @@ mod tests {
         theirs.read_exact(&mut buf).expect("read at the helper end");
         assert_eq!(&buf, b"ping");
 
-        theirs.write_all(b"pong").expect("write from the helper end");
+        theirs
+            .write_all(b"pong")
+            .expect("write from the helper end");
         let mut buf = [0u8; 4];
         ours.read_exact(&mut buf).expect("read at the VMM end");
         assert_eq!(&buf, b"pong");

@@ -316,11 +316,11 @@ impl Stats {
         if Duration::from_micros(us) > FRAME_BUDGET {
             self.late = self.late.saturating_add(1);
         }
-        if refresh_us > 0 {
-            // Rounded, so a 16.6 ms interval is one slot and a 33.3 ms one is
-            // two — the boundary case is a frame that arrived half a slot
-            // late, which is a judgement call either way.
-            let slots = (us + refresh_us / 2) / refresh_us;
+        // Rounded, so a 16.6 ms interval is one slot and a 33.3 ms one is
+        // two — the boundary case is a frame that arrived half a slot late,
+        // which is a judgement call either way. A zero refresh period
+        // disables both counters rather than dividing by it.
+        if let Some(slots) = (us + refresh_us / 2).checked_div(refresh_us) {
             match slots {
                 0 => self.dropped = self.dropped.saturating_add(1),
                 n => self.duplicate = self.duplicate.saturating_add(n - 1),

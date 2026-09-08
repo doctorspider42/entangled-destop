@@ -27,6 +27,10 @@ windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    # `ConnectNamedPipe` takes an `OVERLAPPED`, so it is gated behind the I/O
+    # feature even when — as here — the handle is synchronous and the argument
+    # is `None`.
+    "Win32_System_IO",
     "Win32_System_Pipes",
 ] }
 

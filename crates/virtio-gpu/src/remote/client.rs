@@ -63,7 +63,9 @@ type Channel = super::pipe_windows::DuplexPipe;
 #[cfg(unix)]
 fn attach_channel(command: &mut Command) -> std::io::Result<Channel> {
     let (ours, theirs) = Channel::pair()?;
-    command.stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(theirs)));
+    command.stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+        theirs,
+    )));
     Ok(ours)
 }
 

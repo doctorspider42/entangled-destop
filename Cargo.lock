@@ -4503,6 +4503,7 @@ dependencies = [
  "virtio-core",
  "virtio-queue",
  "vm-memory 0.17.2",
+ "windows 0.62.2",
 ]
 
 [[package]]
