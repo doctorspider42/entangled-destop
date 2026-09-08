@@ -1,96 +1,106 @@
 # Entangled Desktop
 
-A small, self-contained Virtual Machine Monitor (VMM) for Linux x86-64 hosts,
-written in Rust directly on KVM using [rust-vmm](https://github.com/rust-vmm)
-components. No QEMU — not as a process, not as a library.
+Run Linux in a window, on Linux or on Windows, with a virtual machine monitor
+written from scratch in Rust.
 
-MVP target flow:
+Entangled Desktop is a VMM: it builds a virtual machine on the hypervisor your
+system already has — **KVM** on Linux, the **Windows Hypervisor Platform** on
+Windows — gives it disks, a network card and a virtual GPU, and puts its screen
+in a window. It installs Debian, Ubuntu and Fedora for you, unattended, from
+media it has verified against pinned signing keys.
+
+**There is no QEMU anywhere in it** — not as a process, not as a library, not as
+a source of device models. The virtio devices, the interrupt controllers, the
+ACPI tables and the PCI bus are this project's own code. The one piece of
+outside firmware is an unmodified EDK2 `CloudHv` build, compiled from pinned
+sources by a script in this repository.
+
+- **[User guide](docs/user-guide.md)** — install, first VM, the GUI, the limits
+- **[Troubleshooting](docs/troubleshooting.md)** — the failures people actually hit
+- **[Architecture decisions](docs/adr/)** — why it is built this way
+
+## What it can do
+
+| | |
+|---|---|
+| Guests | Debian, Ubuntu Server, Ubuntu Desktop, Fedora Workstation — installed unattended from verified media |
+| Hosts | Linux with `/dev/kvm`; Windows with the Windows Hypervisor Platform, natively (not inside WSL) |
+| Boot | UEFI with a persistent variable store, or a direct Linux kernel boot with no firmware |
+| Graphics | 2D scanout in a resizable window up to 1920×1080; OpenGL through VirGL on a Linux host |
+| Devices | virtio-blk, -net, -gpu, -input, -snd over virtio-mmio or virtio-pci with MSI-X |
+| Network | a host TAP interface (Linux), or a user-mode NAT needing no administrator (both hosts) |
+| Lifecycle | pause and resume, reboot in place, suspend to a file and restore it later |
+| Interfaces | the `entangled` CLI and `entangled-manager`, a native desktop GUI |
+
+## What it is not
+
+- **Not a Windows-guest solution.** Linux guests are what is tested; assume
+  Windows guests do not work.
+- **Not a container runtime.** These are full VMs with their own kernel.
+- **Not a server product.** No daemon, no API, no clustering, no live migration.
+- **Not signed.** The Windows binaries are unsigned and no checksums are
+  published; SmartScreen will warn, and it is right to.
+- 3D is Linux-host only, there is no USB or PCI passthrough, and anti-cheat
+  games will not run. The full list is in the
+  [user guide](docs/user-guide.md#limits-in-one-place).
+
+## Install
+
+**Windows** — download `entangled-desktop-<version>-setup.exe` from
+[Releases](https://github.com/doctorspider42/entangled-destop/releases) and run
+it. It is unsigned, so SmartScreen shows "Windows protected your PC": *More
+info* → *Run anyway*, or build from source instead. You also need the *Windows
+Hypervisor Platform* optional feature (admin, one reboot).
+
+**Linux** — build it:
 
 ```bash
-entangled fetch debian --channel stable --arch amd64 --variant gtk-netboot
-entangled disk create debian.raw --size 32G
-entangled install debian --disk debian.raw
-entangled run debian.toml
+sudo apt-get install -y build-essential pkg-config curl
+cargo build --workspace --release
+bash guest/firmware/build-cloudhv.sh      # the UEFI firmware, once, ~2.5 min
+sudo usermod -aG kvm "$USER"              # then log out and back in
 ```
 
-…ending with an installed Debian stable booting into Weston in a 1920×1080
-window with working keyboard, mouse and network.
+The [user guide](docs/user-guide.md#getting-the-software) has the optional
+packages (3D, sound, TAP networking) and the Windows caveat about where the
+firmware has to live.
 
-## Status
-
-Early scaffolding. See [docs/adr/0001-mvp-architecture.md](docs/adr/0001-mvp-architecture.md)
-for the architecture and [entangled-mvp-backlog.md](entangled-mvp-backlog.md) for the
-full backlog (Polish).
-
-`entangled fetch` works today (EPIC 6): it resolves the current Debian stable
-release from signed metadata, verifies it against OpenPGP keys pinned in
-`crates/debian-media/keys/`, streams the artifacts with resumable downloads and
-writes a provenance manifest next to each one.
+## First VM
 
 ```bash
-entangled fetch debian --channel stable --arch amd64 --variant gtk-netboot
-entangled fetch debian --variant netinst-iso --refresh   # re-check the signed sums
-entangled fetch debian --variant text-netboot --offline  # verified cache only
+entangled doctor                              # can this machine run VMs?
+bash scripts/fetch-ubuntu-iso.sh              # ~2.9 GiB, signature-checked
+entangled install ubuntu --disk ~/entangled-vms/ubuntu.raw --size 20G --auto --headless
+entangled run ~/entangled-vms/ubuntu.toml
 ```
 
-Media lands in `$XDG_CACHE_HOME/entangled/media/<version>/<arch>-<variant>/`. A
-second run over an intact cache performs no network access at all; nothing is
-marked ready before both its OpenPGP signature and its digest check pass, and a
-failed check removes the partial file.
+Three to five minutes for the install, which is unattended: it creates the disk,
+generates the answer file, drives the installer over the serial console and
+waits for the guest to power itself off. It leaves an `ubuntu.toml` profile, an
+`ubuntu.nvram` UEFI variable store (keep it — without it the machine has no boot
+entry) and the installer's own transcript.
 
-## Desktop manager (GUI)
+Or press **+ Create machine** in `entangled-manager` and let the wizard do it.
 
-`entangled-manager` is a native desktop front end for the same flows — no
-Electron, no browser: egui/eframe rendering through wgpu, the stack the VM
-window already uses.
+## Development
+
+This is also a working repository. [CLAUDE.md](CLAUDE.md) is the map: the
+workspace layout, the build and test commands for both hosts, and the rules that
+keep the core portable and the guest untrusted. The
+[ADRs](docs/adr/) record the decisions and what each one cost, and
+`.claude/skills/` holds a task-focused guide per subsystem.
 
 ```bash
-cargo build --workspace     # puts entangled and entangled-manager side by side
-entangled-manager           # or: entangled-manager --vm-dir ~/vms
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+cargo deny check                     # no GPL/AGPL/LGPL in host code
 ```
 
-It scans a VM directory (default `~/entangled-vms`, changeable in Settings and
-persisted to `~/.config/entangled/manager.toml`) and shows a card per profile
-with its memory, vCPUs, resolution, network interface, image size and how much
-of it is actually allocated on disk. From there:
-
-- **Start / Stop** — `entangled run <profile>` as a tracked child process; the
-  VM opens its own window, Stop sends a termination signal so the guest shuts
-  down cleanly. Closing the manager leaves running VMs alone; they are not its
-  children's keeper, only their launcher.
-- **New machine** — a wizard for name, memory, vCPUs, disk size and installer
-  variant that runs `entangled install debian --auto` and streams the installer
-  console into the log pane while a card tracks it as *Installing*.
-- **Delete** — refuses while the machine is busy, then asks for the name to be
-  typed out; disks that live outside the VM directory are left alone.
-- **Console** — the child's stdout/stderr is written to
-  `<vm-dir>/<name>-{run,install}.log` and tailed live in the UI, so a failure
-  leaves both an on-screen explanation and a file to inspect. Common causes
-  (a TAP already held by another VM, no `/dev/kvm`, a missing bootstrap kernel)
-  are recognised and explained in one sentence.
-
-The manager itself is host-agnostic: it builds on Windows as well, where the
-stop signal falls back to terminating the process.
-
-## Requirements
-
-- Linux x86-64 host with KVM (`/dev/kvm`)
-- Rust stable toolchain
-- For networking: `CAP_NET_ADMIN` (TAP device setup)
-
-Development on Windows works through WSL2 (Ubuntu), which exposes a real
-`/dev/kvm` via nested virtualization, or via `docker/Dockerfile.dev`.
-
-## Layout
-
-- `crates/` — VMM libraries (KVM core, machine model, direct Linux boot,
-  virtio transport and devices, display, Debian media handling, control API)
-- `apps/entangled` — the `entangled` binary
-- `apps/manager` — `entangled-manager`, the native desktop GUI
-- `guest/` — bootstrap kernel/initramfs configs and test rootfs
-- `tests/` — boot, installer and graphical integration tests
+The product backlog, in Polish, is
+[vmhost-mvp-backlog.md](vmhost-mvp-backlog.md).
 
 ## License
 
 Apache-2.0. Host-side dependencies are audited in CI (`cargo deny`) to exclude
-copyleft licenses.
+copyleft licenses; guest-side content is unaffected.
