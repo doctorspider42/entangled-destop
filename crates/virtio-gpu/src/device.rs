@@ -374,6 +374,9 @@ pub struct GpuDevice<S: ScanoutSink> {
     pacing: FramePacing,
     /// Where `--frame-stats` mirrors those statistics as JSON, if anywhere.
     frame_stats: Option<std::path::PathBuf>,
+    /// The refresh rate the EDID advertises, and the period the pacing
+    /// counters are defined against (GAME-2105).
+    refresh_hz: u32,
     /// The host waker the machine layer gave this device, kept so a renderer
     /// attached later — and the crash-containment path — can use it.
     waker: Option<Arc<dyn HostWaker>>,
@@ -426,6 +429,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             renderer_loss_reported: false,
             pacing: FramePacing::new(),
             frame_stats: None,
+            refresh_hz: crate::edid::DEFAULT_REFRESH_HZ,
             waker: None,
             mem: None,
             control: None,
@@ -1158,6 +1162,28 @@ impl<S: ScanoutSink> GpuDevice<S> {
         self.frame_stats = path;
     }
 
+    /// Sets the refresh rate the EDID advertises (`[display] refresh_hz`).
+    ///
+    /// This is the guest compositor's frame quantum, not decoration: a guest
+    /// whose per-frame work overruns one advertised period presents in the
+    /// next one, so 60 Hz turns any frame costing more than 16.7 ms into
+    /// exactly 30 fps (GAME-2105 — the measurement is in ADR-0004). The same
+    /// value defines the `duplicate` and `dropped` counters, so the report
+    /// stays honest when a profile changes it.
+    ///
+    /// Out-of-range values are refused by `control_api`'s validation; a zero
+    /// here would make the EDID unencodable and `GET_EDID` answer an error, so
+    /// it is clamped to the default instead of poisoning the guest's mode
+    /// list.
+    pub fn set_refresh_hz(&mut self, refresh_hz: u32) {
+        let refresh_hz = refresh_hz.clamp(crate::edid::MIN_REFRESH_HZ, crate::edid::MAX_REFRESH_HZ);
+        self.refresh_hz = refresh_hz;
+        self.pacing.set_refresh(std::time::Duration::from_nanos(
+            1_000_000_000 / u64::from(refresh_hz),
+        ));
+        tracing::info!(refresh_hz, "virtio-gpu advertised refresh rate");
+    }
+
     /// Overrides the fence watchdog deadline (default [`FENCE_TIMEOUT`]).
     ///
     /// Exists for tests — a two-second wait is not something to put in a unit
@@ -1276,9 +1302,14 @@ impl<S: ScanoutSink> GpuDevice<S> {
             return Err(CommandError::UnknownScanout(cmd.scanout));
         }
         let (width, height) = self.display.resolution();
-        let block = crate::edid::edid_block(width, height)
+        let block = crate::edid::edid_block(width, height, self.refresh_hz)
             .ok_or(CommandError::UnencodableMode { width, height })?;
-        tracing::debug!(width, height, "virtio-gpu GET_EDID");
+        tracing::debug!(
+            width,
+            height,
+            refresh_hz = self.refresh_hz,
+            "virtio-gpu GET_EDID"
+        );
         Ok(Reply {
             code: resp::OK_EDID,
             body: edid_body(&block).to_vec(),

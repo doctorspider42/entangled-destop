@@ -14,10 +14,16 @@
 //! guest (`drm: EDID checksum is invalid`) rather than subtly.
 //!
 //! The timing numbers are CVT-reduced-blanking-shaped (a fixed 160-pixel
-//! horizontal and 45-line vertical blank at 60 Hz). Nothing scans out a real
-//! cable, so the exact porches are cosmetic — what matters is that the pixel
-//! clock stays inside the field's 655.35 MHz ceiling, which this blanking
-//! satisfies up to 8K-wide modes.
+//! horizontal and 45-line vertical blank). Nothing scans out a real cable, so
+//! the exact porches are cosmetic — what matters is that the pixel clock stays
+//! inside the field's 655.35 MHz ceiling, which this blanking satisfies up to
+//! 8K-wide modes.
+//!
+//! The **refresh rate is not cosmetic**, though it looks it: the guest's
+//! compositor schedules its frames against the number in this block, and
+//! presents in the next advertised period when a frame's work does not fit in
+//! one. That is why `[display] refresh_hz` exists and why the frame-pacing
+//! counters are defined against the same value (GAME-2105, ADR-0004).
 
 /// One EDID base block.
 pub const EDID_BLOCK_LEN: usize = 128;
@@ -32,29 +38,51 @@ const V_BLANK: u32 = 45;
 /// Vertical sync offset (front porch) and width, inside [`V_BLANK`].
 const V_SYNC_OFFSET: u32 = 3;
 const V_SYNC_WIDTH: u32 = 5;
-/// Refresh rate every mode is described at.
-const REFRESH_HZ: u32 = 60;
+
+/// The refresh rate a profile gets when it does not ask for one — what a
+/// physical monitor of this size would report, and what every other VMM
+/// advertises.
+pub const DEFAULT_REFRESH_HZ: u32 = 60;
+
+/// Bounds on the advertised refresh (`[display] refresh_hz`).
+///
+/// The floor keeps the number meaningful; the ceiling is where a 1080p mode's
+/// pixel clock starts crowding the descriptor's 655.35 MHz field
+/// (2080 × 1125 × 240 Hz = 561.6 MHz), so past it [`edid_block`] would start
+/// refusing ordinary resolutions. Both ends are checked by
+/// `control_api::VmConfig::validate` so the guest never sees a bad block.
+pub const MIN_REFRESH_HZ: u32 = 24;
+pub const MAX_REFRESH_HZ: u32 = 240;
 
 /// Largest active size a detailed timing descriptor can express: 12 bits per
 /// axis. Also comfortably past [`crate::MAX_RESOURCE_PIXELS`]'s 4096-wide cap.
 const MAX_DTD_ACTIVE: u32 = 4095;
 
 /// Builds the 128-byte EDID base block whose preferred (and only) detailed
-/// timing is `width`×`height` at 60 Hz.
+/// timing is `width`×`height` at `refresh_hz`.
+///
+/// The refresh rate is not cosmetic: nothing scans out a cable here, but the
+/// guest's compositor schedules against it. A guest whose per-frame work does
+/// not fit in one advertised period presents in the *next* one, so the
+/// advertised rate is the quantum the guest's frame rate is a fraction of
+/// (GAME-2105, ADR-0004).
 ///
 /// Returns `None` when the mode cannot be encoded: zero-sized, wider/taller
-/// than a detailed timing descriptor's 12-bit fields, or a pixel clock past
-/// the descriptor's 655.35 MHz ceiling. The device answers `ERR_UNSPEC` for
-/// those rather than shipping a corrupt block.
-pub fn edid_block(width: u32, height: u32) -> Option<[u8; EDID_BLOCK_LEN]> {
+/// than a detailed timing descriptor's 12-bit fields, a zero refresh, or a
+/// pixel clock past the descriptor's 655.35 MHz ceiling. The device answers
+/// `ERR_UNSPEC` for those rather than shipping a corrupt block.
+pub fn edid_block(width: u32, height: u32, refresh_hz: u32) -> Option<[u8; EDID_BLOCK_LEN]> {
     if width == 0 || height == 0 || width > MAX_DTD_ACTIVE || height > MAX_DTD_ACTIVE {
+        return None;
+    }
+    if refresh_hz == 0 {
         return None;
     }
     // In 10 kHz units, the descriptor's own unit. The u16 ceiling (655.35 MHz)
     // caps the total mode at ~10.9 Mpixels at 60 Hz — comfortably past 4K
     // (3840×2160 needs 529.2 MHz), refused for the degenerate extremes.
     let clock_10khz =
-        u64::from(width + H_BLANK) * u64::from(height + V_BLANK) * u64::from(REFRESH_HZ) / 10_000;
+        u64::from(width + H_BLANK) * u64::from(height + V_BLANK) * u64::from(refresh_hz) / 10_000;
     let clock_10khz = u16::try_from(clock_10khz).ok()?;
 
     let mut e = [0u8; EDID_BLOCK_LEN];
@@ -160,7 +188,20 @@ mod tests {
     use super::*;
 
     fn block(w: u32, h: u32) -> [u8; EDID_BLOCK_LEN] {
-        edid_block(w, h).expect("valid mode")
+        edid_block(w, h, DEFAULT_REFRESH_HZ).expect("valid mode")
+    }
+
+    /// Decodes a detailed timing descriptor back to (h_active, v_active, Hz).
+    fn timing(e: &[u8; EDID_BLOCK_LEN]) -> (u32, u32, u64) {
+        let d = &e[54..72];
+        let clock = u32::from(d[0]) | (u32::from(d[1]) << 8);
+        let h_active = u32::from(d[2]) | ((u32::from(d[4]) >> 4) << 8);
+        let h_blank = u32::from(d[3]) | ((u32::from(d[4]) & 0x0F) << 8);
+        let v_active = u32::from(d[5]) | ((u32::from(d[7]) >> 4) << 8);
+        let v_blank = u32::from(d[6]) | ((u32::from(d[7]) & 0x0F) << 8);
+        let refresh = u64::from(clock) * 10_000
+            / (u64::from(h_active + h_blank) * u64::from(v_active + v_blank));
+        (h_active, v_active, refresh)
     }
 
     /// The two invariants every EDID consumer checks before anything else.
@@ -185,20 +226,27 @@ mod tests {
     fn detailed_timing_encodes_the_requested_mode() {
         let e = block(1920, 1080);
         let d = &e[54..72];
-        let clock = u32::from(d[0]) | (u32::from(d[1]) << 8);
-        let h_active = u32::from(d[2]) | ((u32::from(d[4]) >> 4) << 8);
         let h_blank = u32::from(d[3]) | ((u32::from(d[4]) & 0x0F) << 8);
-        let v_active = u32::from(d[5]) | ((u32::from(d[7]) >> 4) << 8);
         let v_blank = u32::from(d[6]) | ((u32::from(d[7]) & 0x0F) << 8);
-        assert_eq!((h_active, v_active), (1920, 1080));
         assert_eq!((h_blank, v_blank), (H_BLANK, V_BLANK));
-        // 60 Hz within the 10 kHz unit's truncation (exact for 1920×1080:
-        // 2080 × 1125 × 60 = 140.40 MHz, a whole multiple of 10 kHz).
-        let refresh = u64::from(clock) * 10_000
-            / (u64::from(h_active + h_blank) * u64::from(v_active + v_blank));
-        assert_eq!(refresh, 60);
+        // 60 Hz within the 10 kHz unit's truncation (exact for 1920x1080:
+        // 2080 x 1125 x 60 = 140.40 MHz, a whole multiple of 10 kHz).
+        assert_eq!(timing(&e), (1920, 1080, 60));
         // A pixel clock of zero would be a "no descriptor" marker by accident.
-        assert!(clock > 0);
+        assert!(u32::from(d[0]) | (u32::from(d[1]) << 8) > 0);
+    }
+
+    /// The advertised refresh is what the guest's compositor schedules
+    /// against (GAME-2105), so it has to survive the descriptor's 10 kHz
+    /// quantisation exactly at the rates a profile can ask for.
+    #[test]
+    fn the_advertised_refresh_is_the_one_asked_for() {
+        for hz in [MIN_REFRESH_HZ, 30, 50, 60, 75, 120, 144, MAX_REFRESH_HZ] {
+            let e = edid_block(1920, 1080, hz).expect("1080p is encodable at every allowed rate");
+            assert_eq!(timing(&e), (1920, 1080, u64::from(hz)), "{hz} Hz");
+            let sum: u8 = e.iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+            assert_eq!(sum, 0, "{hz} Hz: checksum");
+        }
     }
 
     /// 12-bit active fields and the 655.35 MHz pixel-clock ceiling: the modes
@@ -206,18 +254,19 @@ mod tests {
     #[test]
     fn absurd_modes_are_refused_not_wrapped() {
         // 4K is the biggest mode anyone asks this device for, and it encodes.
-        assert!(edid_block(3840, 2160).is_some());
+        assert!(edid_block(3840, 2160, DEFAULT_REFRESH_HZ).is_some());
         // Wide-and-short / narrow-and-tall extremes inside the clock budget.
-        assert!(edid_block(4095, 64).is_some());
-        assert!(edid_block(64, 4095).is_some());
+        assert!(edid_block(4095, 64, DEFAULT_REFRESH_HZ).is_some());
+        assert!(edid_block(64, 4095, DEFAULT_REFRESH_HZ).is_some());
         // Past the 12-bit active fields.
-        assert!(edid_block(4096, 1080).is_none());
-        assert!(edid_block(1920, 4096).is_none());
+        assert!(edid_block(4096, 1080, DEFAULT_REFRESH_HZ).is_none());
+        assert!(edid_block(1920, 4096, DEFAULT_REFRESH_HZ).is_none());
         // Inside the fields but past the pixel-clock ceiling at 60 Hz.
-        assert!(edid_block(4095, 4095).is_none());
+        assert!(edid_block(4095, 4095, DEFAULT_REFRESH_HZ).is_none());
         // Degenerate.
-        assert!(edid_block(0, 1080).is_none());
-        assert!(edid_block(1920, 0).is_none());
+        assert!(edid_block(0, 1080, DEFAULT_REFRESH_HZ).is_none());
+        assert!(edid_block(1920, 0, DEFAULT_REFRESH_HZ).is_none());
+        assert!(edid_block(1920, 1080, 0).is_none());
     }
 
     #[test]

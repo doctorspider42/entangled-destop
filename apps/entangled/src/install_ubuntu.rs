@@ -195,6 +195,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             scale: 1.0,
             virgl: false,
             virgl_isolation: control_api::VirglIsolation::default(),
+            refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             frame_stats: None,
         },
         // The installer has nothing to say; the *installed* profile below is
@@ -294,6 +295,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             scale: 1.0,
             virgl: false,
             virgl_isolation: control_api::VirglIsolation::default(),
+            refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             frame_stats: None,
         },
         // A desktop with no sound is not a desktop (GAME-2102). `auto` never
