@@ -19,12 +19,14 @@
 //!
 //! * [`protocol`] — the wire format. **Portable**: it builds and is tested on
 //!   every host OS, because the containment architecture must not be a
-//!   Linux-shaped hole in the design (ADR-0002). A future Windows/ANGLE
-//!   renderer wants the same isolation with `CreateProcess` and a handle pair.
+//!   Linux-shaped hole in the design (ADR-0002).
 //! * [`frame`] / [`read_frame`] — the length-prefixed framing, portable and
 //!   tested over an in-memory stream.
-//! * `client` (unix) — [`RemoteRenderer`]: spawn, supervise, forward.
-//! * `server` (unix) — [`serve`]: the helper's loop, running in the child.
+//! * `client` — [`RemoteRenderer`]: spawn, supervise, forward.
+//! * `server` — [`serve`]: the helper's loop, running in the child.
+//! * `pipe_windows` — the Windows channel (VEN-2004): a duplex named pipe
+//!   where Unix uses a `socketpair`, installed as the child's stdin either
+//!   way, so nothing above the transport is host-specific.
 //!
 //! # Guest memory never crosses the boundary
 //!
@@ -40,14 +42,16 @@ use std::io::{Read, Write};
 
 pub mod protocol;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod client;
-#[cfg(unix)]
+#[cfg(windows)]
+mod pipe_windows;
+#[cfg(any(unix, windows))]
 mod server;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use client::{RemoteRenderer, SpawnError};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use server::{serve, serve_stdin};
 
 pub use protocol::{CodecError, Reply, Request, MAX_FRAME_BYTES, REMOTE_XFER_WINDOW, VERSION};

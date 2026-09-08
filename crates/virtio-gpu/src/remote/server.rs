@@ -23,9 +23,7 @@
 //! this design exists to contain.
 
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter};
-use std::os::unix::io::FromRawFd;
-use std::os::unix::net::UnixStream;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 
 use vm_memory::{Bytes, GuestAddress};
@@ -71,9 +69,13 @@ impl Shadow {
 /// only for a protocol violation — a crash of the *renderer* never comes back
 /// through here, which is the point: the process simply dies and the client
 /// notices.
-pub fn serve(stream: UnixStream, mut renderer: Box<dyn Renderer3d>) -> Result<(), WireError> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = BufWriter::new(stream);
+pub fn serve<R: Read, W: Write>(
+    rx: R,
+    tx: W,
+    mut renderer: Box<dyn Renderer3d>,
+) -> Result<(), WireError> {
+    let mut reader = BufReader::new(rx);
+    let mut writer = BufWriter::new(tx);
     let mut payload = Vec::new();
     let mut shadows: HashMap<u32, Shadow> = HashMap::new();
 
@@ -104,12 +106,28 @@ pub fn serve(stream: UnixStream, mut renderer: Box<dyn Renderer3d>) -> Result<()
 /// Serves on **stdin**, which is where [`super::RemoteRenderer`] puts the
 /// socket. This is the whole body of the helper subcommand.
 pub fn serve_stdin(renderer: Box<dyn Renderer3d>) -> Result<(), WireError> {
-    // SAFETY: fd 0 is a `UnixStream` end the parent installed as this
-    // process's stdin (`Stdio::from(socket)`), and this function is the only
-    // consumer of it — nothing else in the helper reads stdin, so taking
-    // ownership of the descriptor here cannot alias another owner.
-    let stream = unsafe { UnixStream::from_raw_fd(0) };
-    serve(stream, renderer)
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::FromRawFd;
+        use std::os::unix::net::UnixStream;
+        // SAFETY: fd 0 is a `UnixStream` end the parent installed as this
+        // process's stdin (`Stdio::from(socket)`), and this function is the
+        // only consumer of it — nothing else in the helper reads stdin, so
+        // taking ownership of the descriptor here cannot alias another owner.
+        let stream = unsafe { UnixStream::from_raw_fd(0) };
+        serve(stream.try_clone()?, stream, renderer)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle;
+        // The parent installed a *duplex* named-pipe end as this process's
+        // stdin, so the same handle is the reply path. Cloning the borrowed
+        // handle rather than taking it keeps `std`'s own stdin object valid
+        // and needs no `unsafe` at all.
+        let pipe = std::fs::File::from(std::io::stdin().as_handle().try_clone_to_owned()?);
+        let reply = pipe.try_clone()?;
+        serve(pipe, reply, renderer)
+    }
 }
 
 fn error(message: impl std::fmt::Display) -> Reply {

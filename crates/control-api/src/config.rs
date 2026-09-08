@@ -283,6 +283,11 @@ pub struct DisplaySection {
     /// Whether that renderer runs in its own process (GPU-012). Ignored when
     /// `virgl` is false.
     pub virgl_isolation: VirglIsolation,
+    /// Where the virtio-gpu device mirrors its frame statistics as JSON
+    /// (GAME-2105). `entangled run --frame-stats <PATH>` sets it; the
+    /// per-window `info` log happens either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_stats: Option<PathBuf>,
 }
 
 impl Default for DisplaySection {
@@ -293,6 +298,7 @@ impl Default for DisplaySection {
             scale: 1.0,
             virgl: false,
             virgl_isolation: VirglIsolation::default(),
+            frame_stats: None,
         }
     }
 }

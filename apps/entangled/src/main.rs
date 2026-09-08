@@ -101,6 +101,16 @@ enum Command {
         /// entangled-screenshot-<name>.png in the working directory.
         #[arg(long, requires = "screenshot_after")]
         screenshot: Option<PathBuf>,
+        /// Mirror the virtio-gpu frame statistics into a JSON file, rewritten
+        /// every 120 presented frames (GAME-2105, ADR-0004).
+        ///
+        /// Mean interval and fps, 1 % and 0.1 % lows, duplicate and dropped
+        /// frames, and the interval split into the time the guest spent
+        /// waiting, submitting and the device spent serving. The same numbers
+        /// go to the log every window with or without this flag; the file is
+        /// for comparing two runs with a diff.
+        #[arg(long, value_name = "PATH")]
+        frame_stats: Option<PathBuf>,
         /// Read lifecycle commands from stdin, one per line: `pause`,
         /// `resume`, `reset`, `type <text>`, `status` (ADR-0005).
         ///
@@ -301,11 +311,15 @@ fn run(cli: Cli) -> Result<(), String> {
             cdrom,
             screenshot_after,
             screenshot,
+            frame_stats,
             control_stdin,
         } => {
             let text = std::fs::read_to_string(&config)
                 .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
             let mut cfg = control_api::VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
+            if frame_stats.is_some() {
+                cfg.display.frame_stats = frame_stats;
+            }
             if let Some(iso) = cdrom {
                 if !iso.is_file() {
                     return Err(format!("--cdrom {}: not a file", iso.display()));

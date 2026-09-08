@@ -2,9 +2,11 @@
 //! spawn a helper process, forward validated commands to it, and treat its
 //! death as a *degradation*, never a failure of the VM.
 //!
-//! Unix-only because the transport is a `UnixStream` pair; the protocol it
-//! speaks is portable (see [`super::protocol`]), which is what keeps a future
-//! Windows/ANGLE renderer from needing a different architecture.
+//! Portable across both hosts (backlog VEN-2004). Only the *channel* differs:
+//! a `socketpair` end on Unix, a duplex named pipe on Windows
+//! ([`super::pipe_windows`]). Both are one bidirectional handle installed as
+//! the child's stdin, so everything in this file — the handshake, the shadow
+//! bookkeeping, the fence monitor, the death handling — is one implementation.
 //!
 //! # The one rule
 //!
@@ -15,8 +17,7 @@
 //! this module exists to survive.
 
 use std::io::{BufReader, BufWriter};
-use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -48,12 +49,37 @@ const FENCE_TICK: std::time::Duration = std::time::Duration::from_millis(2);
 /// Idle sleep of the monitor when nothing is outstanding.
 const FENCE_IDLE: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The VMM's end of the channel to the helper: one bidirectional handle.
+#[cfg(unix)]
+type Channel = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type Channel = super::pipe_windows::DuplexPipe;
+
+/// Creates the channel and installs the helper's end as the child's stdin.
+///
+/// No fd/handle passing games, no filesystem path anyone else could connect
+/// to, and stdout/stderr stay inherited so the helper's own log lines land in
+/// the VMM's terminal.
+#[cfg(unix)]
+fn attach_channel(command: &mut Command) -> std::io::Result<Channel> {
+    let (ours, theirs) = Channel::pair()?;
+    command.stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(theirs)));
+    Ok(ours)
+}
+
+#[cfg(windows)]
+fn attach_channel(command: &mut Command) -> std::io::Result<Channel> {
+    let (ours, theirs) = Channel::pair()?;
+    command.stdin(std::process::Stdio::from(theirs));
+    Ok(ours)
+}
+
 /// Why a renderer process could not be started.
 #[derive(Debug)]
 pub enum SpawnError {
     /// The helper could not be launched at all.
     Spawn(std::io::Error),
-    /// The socket pair could not be created.
+    /// The channel to it could not be created.
     Socket(std::io::Error),
     /// The helper started but the handshake failed — most often because it
     /// could not load virglrenderer, and its message says so.
@@ -143,8 +169,8 @@ impl Drop for FenceMonitor {
 /// [`Renderer3d`] backed by a renderer running in another process.
 pub struct RemoteRenderer {
     child: Child,
-    reader: BufReader<UnixStream>,
-    writer: BufWriter<UnixStream>,
+    reader: BufReader<Channel>,
+    writer: BufWriter<Channel>,
     /// Frame payload buffer, reused across calls.
     rx: Vec<u8>,
     /// Staging buffer for transfer spans, reused across calls.
@@ -188,15 +214,11 @@ impl RemoteRenderer {
     /// **stdin**. Tests use this to run a helper with a non-GL renderer, and
     /// it is the seam a future Windows implementation replaces wholesale.
     pub fn spawn_with(mut command: Command) -> Result<Self, SpawnError> {
-        let (ours, theirs) = UnixStream::pair().map_err(SpawnError::Socket)?;
-        // The helper gets its socket as stdin: no fd-passing games, no
-        // filesystem path anyone else could connect to, and stdout/stderr stay
-        // inherited so the helper's own log lines land in the VMM's terminal.
-        command.stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs)));
-        command.stdout(Stdio::inherit());
-        command.stderr(Stdio::inherit());
+        let ours = attach_channel(&mut command).map_err(SpawnError::Socket)?;
+        command.stdout(std::process::Stdio::inherit());
+        command.stderr(std::process::Stdio::inherit());
         let child = command.spawn().map_err(SpawnError::Spawn)?;
-        // The `Command` still holds the child's end of the socket pair, and
+        // The `Command` still holds the child's end of the channel, and
         // while *we* hold it open a dead child never shows up as EOF — the
         // handshake would wait out its whole timeout instead of failing at
         // once. Dropping the command closes our copy, which is what makes

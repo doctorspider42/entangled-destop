@@ -19,6 +19,22 @@ vm-memory.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading.workspace = true
 
+# Renderer-crash containment on Windows (VEN-2004): the helper process talks to
+# the VMM over a duplex named pipe, which has no `std` equivalent. Microsoft's
+# own binding crate, already in this workspace for the WHP backend.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+] }
+
+# `tests/gpu_remote.rs` proves the containment on Windows too, and its
+# handle-leak assertion needs the process handle count.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_System_Threading"] }
+
 [dev-dependencies]
 virtio-core = { workspace = true, features = ["test-utils"] }
 # Dev-only cycle: `display` depends on this crate for the pixel format and

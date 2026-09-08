@@ -195,6 +195,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             scale: 1.0,
             virgl: false,
             virgl_isolation: control_api::VirglIsolation::default(),
+            frame_stats: None,
         },
         // The installer has nothing to say; the *installed* profile below is
         // where the card belongs.
@@ -293,6 +294,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             scale: 1.0,
             virgl: false,
             virgl_isolation: control_api::VirglIsolation::default(),
+            frame_stats: None,
         },
         // A desktop with no sound is not a desktop (GAME-2102). `auto` never
         // fails a run: a host with no audio device gets a card that plays into
