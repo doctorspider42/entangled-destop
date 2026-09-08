@@ -105,9 +105,28 @@ Rules to keep when extending this:
   compare against golden images (see vm-testing skill).
 - FPS/copy statistics behind a debug overlay or periodic `tracing` event
   (MVP-708, P1).
+- **Frame pacing is measured by the GPU device, not by this crate**
+  (`virtio_gpu::pacing`, GAME-2105): the window presents asynchronously —
+  `update_scanout` is a `memcpy` plus a wake, and the guest never waits for it
+  — so the only place that sees every guest frame is the `RESOURCE_FLUSH` path.
+  `entangled run --frame-stats <PATH>` writes mean/fps, 1 % and 0.1 % lows,
+  duplicate and dropped slots, and the quiet/submit/service split, every 120
+  frames. Take a before *and* an after with it, back to back, and record which
+  host GL and which build profile produced them (ADR-0004's 2026-09-08
+  amendment exists because an earlier measurement did not).
 
 ## Pitfalls
 
+- **The EDID's refresh rate is a hard ceiling on the guest's frame rate, and it
+  is ours to choose.** The guest's compositor phase-locks to it: with slack in
+  the frame it *sleeps out the remainder* and presents on the period exactly
+  (measured 16.665 ms at 60 Hz, 8.341 ms at 120 Hz, zero duplicate slots), and
+  it will not present faster whatever the host can do. `[display] refresh_hz`
+  (24..=240, default 60) is that number; `virtio_gpu::edid` encodes it and the
+  pacing counters are defined against it. Past the deadline the guest does
+  *not* halve — it stops sleeping and runs work-bound, so raising `refresh_hz`
+  buys nothing for a guest that is already flat out. Check `quiet` in the frame
+  stats before reaching for the knob.
 - Don't create the wgpu device per frame or per transfer; one device+queue
   per window, staging buffers pooled.
 - A rapid resize drag delivers many `Resized` events between frames.

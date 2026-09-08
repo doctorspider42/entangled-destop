@@ -378,6 +378,11 @@ pub struct GpuDevice<S: ScanoutSink> {
     restored_3d_reported: bool,
     /// Frame-interval statistics of the scanout path (phase 2 measurement).
     pacing: FramePacing,
+    /// Where `--frame-stats` mirrors those statistics as JSON, if anywhere.
+    frame_stats: Option<std::path::PathBuf>,
+    /// The refresh rate the EDID advertises, and the period the pacing
+    /// counters are defined against (GAME-2105).
+    refresh_hz: u32,
     /// The host waker the machine layer gave this device, kept so a renderer
     /// attached later — and the crash-containment path — can use it.
     waker: Option<Arc<dyn HostWaker>>,
@@ -431,6 +436,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
             restored_3d_lost: false,
             restored_3d_reported: false,
             pacing: FramePacing::new(),
+            frame_stats: None,
+            refresh_hz: crate::edid::DEFAULT_REFRESH_HZ,
             waker: None,
             mem: None,
             control: None,
@@ -861,6 +868,10 @@ impl<S: ScanoutSink> GpuDevice<S> {
             })
         }) {
             Ok(hdr) => {
+                // One tick of the frame's command clock (GAME-2105): the
+                // first command after a present is what separates a guest
+                // that is *waiting* from one that is *working*.
+                self.pacing.note_command();
                 let reply = self.dispatch(mem, &hdr, &request);
                 let fence = self.fence_for(&hdr, reply.code);
                 (hdr.response(reply.code), reply.body, fence)
@@ -1157,6 +1168,41 @@ impl<S: ScanoutSink> GpuDevice<S> {
         self.fence_mode = mode;
     }
 
+    /// Mirrors the frame statistics into `path` as JSON, rewritten every
+    /// [`crate::pacing::REPORT_EVERY`] frames (`entangled run --frame-stats`).
+    ///
+    /// The log already carries every window; the file exists so two runs can
+    /// be compared with a diff, and so the numbers survive whatever ends the
+    /// VM — the file is always at most one report window stale.
+    pub fn set_frame_stats(&mut self, path: Option<std::path::PathBuf>) {
+        if let Some(path) = &path {
+            tracing::info!(path = %path.display(), "virtio-gpu frame statistics enabled");
+        }
+        self.frame_stats = path;
+    }
+
+    /// Sets the refresh rate the EDID advertises (`[display] refresh_hz`).
+    ///
+    /// This is the guest compositor's frame quantum, not decoration: a guest
+    /// whose per-frame work overruns one advertised period presents in the
+    /// next one, so 60 Hz turns any frame costing more than 16.7 ms into
+    /// exactly 30 fps (GAME-2105 — the measurement is in ADR-0004). The same
+    /// value defines the `duplicate` and `dropped` counters, so the report
+    /// stays honest when a profile changes it.
+    ///
+    /// Out-of-range values are refused by `control_api`'s validation; a zero
+    /// here would make the EDID unencodable and `GET_EDID` answer an error, so
+    /// it is clamped to the default instead of poisoning the guest's mode
+    /// list.
+    pub fn set_refresh_hz(&mut self, refresh_hz: u32) {
+        let refresh_hz = refresh_hz.clamp(crate::edid::MIN_REFRESH_HZ, crate::edid::MAX_REFRESH_HZ);
+        self.refresh_hz = refresh_hz;
+        self.pacing.set_refresh(std::time::Duration::from_nanos(
+            1_000_000_000 / u64::from(refresh_hz),
+        ));
+        tracing::info!(refresh_hz, "virtio-gpu advertised refresh rate");
+    }
+
     /// Overrides the fence watchdog deadline (default [`FENCE_TIMEOUT`]).
     ///
     /// Exists for tests — a two-second wait is not something to put in a unit
@@ -1275,9 +1321,14 @@ impl<S: ScanoutSink> GpuDevice<S> {
             return Err(CommandError::UnknownScanout(cmd.scanout));
         }
         let (width, height) = self.display.resolution();
-        let block = crate::edid::edid_block(width, height)
+        let block = crate::edid::edid_block(width, height, self.refresh_hz)
             .ok_or(CommandError::UnencodableMode { width, height })?;
-        tracing::debug!(width, height, "virtio-gpu GET_EDID");
+        tracing::debug!(
+            width,
+            height,
+            refresh_hz = self.refresh_hz,
+            "virtio-gpu GET_EDID"
+        );
         Ok(Reply {
             code: resp::OK_EDID,
             body: edid_body(&block).to_vec(),
@@ -1651,7 +1702,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // out of the renderer plus the push into the sink. Reported next to
         // the frame interval, because the interval alone cannot say whether a
         // slow frame is the guest's doing or ours (ADR-0004 phase 2).
-        let service_start = Instant::now();
+        self.pacing
+            .begin_flush(u64::from(clip.width) * u64::from(clip.height));
         if let ScanoutSource::Blob { stride, offset } = scanout.source {
             // VEN-2001: the pixels are guest pages. Gather the clipped rows
             // out of the blob's backing list — through the same checked
@@ -1697,7 +1749,6 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 .update_scanout(dst_x, dst_y, clip.width, clip.height, pixels)
                 .map_err(|error| CommandError::Display(error.to_string()))?;
         }
-        self.pacing.record_service(service_start.elapsed());
         tracing::trace!(
             resource = cmd.resource_id,
             x = dst_x,
@@ -1716,8 +1767,19 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 mean_ms = report.mean_us as f64 / 1000.0,
                 min_ms = report.min_us as f64 / 1000.0,
                 max_ms = report.max_us as f64 / 1000.0,
+                low_1_fps = report.low_1_fps(),
+                low_01_fps = report.low_01_fps(),
                 late = report.late,
                 idle_gaps = report.idle_gaps,
+                duplicate = report.duplicate,
+                dropped = report.dropped,
+                // The decomposition that says *whose* millisecond it is
+                // (GAME-2105): quiet + submit + service is the interval.
+                quiet_ms = report.quiet_mean_us as f64 / 1000.0,
+                quiet_max_ms = report.quiet_max_us as f64 / 1000.0,
+                submit_ms = report.submit_mean_us as f64 / 1000.0,
+                commands = report.commands_mean,
+                pixels = report.pixels_mean,
                 service_mean_ms = report.service_mean_us as f64 / 1000.0,
                 service_max_ms = report.service_max_us as f64 / 1000.0,
                 fence_deferred = fences.deferred,
@@ -1726,6 +1788,14 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 fence_peak_pending = fences.peak_pending,
                 "virtio-gpu frame pacing"
             );
+            if let Some(path) = &self.frame_stats {
+                // Best effort by design: a measurement aid must never fail a
+                // guest's frame. One warning, then it keeps trying — a full
+                // disk that clears should start working again.
+                if let Err(error) = self.pacing.write_json(path, Some(&report)) {
+                    tracing::warn!(path = %path.display(), %error, "cannot write frame statistics");
+                }
+            }
         }
         Ok(Reply::ok())
     }

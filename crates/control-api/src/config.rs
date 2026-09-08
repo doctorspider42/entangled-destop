@@ -283,7 +283,30 @@ pub struct DisplaySection {
     /// Whether that renderer runs in its own process (GPU-012). Ignored when
     /// `virgl` is false.
     pub virgl_isolation: VirglIsolation,
+    /// The refresh rate the virtual monitor's EDID advertises, in Hz
+    /// (GAME-2105).
+    ///
+    /// Not decoration: the guest's compositor schedules against it, and a
+    /// frame whose work overruns one period lands in the next one. At the
+    /// physical-monitor default of 60 Hz that turns any frame costing more
+    /// than 16.7 ms into exactly 30 fps; a virtual display has no scanout to
+    /// be honest about, so raising this makes the quantum finer. Measured
+    /// before and after in `docs/adr/0004-virtio-gpu-3d.md`.
+    pub refresh_hz: u32,
+    /// Where the virtio-gpu device mirrors its frame statistics as JSON
+    /// (GAME-2105). `entangled run --frame-stats <PATH>` sets it; the
+    /// per-window `info` log happens either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_stats: Option<PathBuf>,
 }
+
+/// Bounds on [`DisplaySection::refresh_hz`], mirroring `virtio_gpu::edid`'s
+/// own limits — this crate must validate the same profile on every host, so
+/// the numbers live here rather than behind a dependency on the device crate.
+pub const MIN_REFRESH_HZ: u32 = 24;
+pub const MAX_REFRESH_HZ: u32 = 240;
+/// What a profile that says nothing gets: what a physical monitor would.
+pub const DEFAULT_REFRESH_HZ: u32 = 60;
 
 impl Default for DisplaySection {
     fn default() -> Self {
@@ -293,6 +316,8 @@ impl Default for DisplaySection {
             scale: 1.0,
             virgl: false,
             virgl_isolation: VirglIsolation::default(),
+            refresh_hz: DEFAULT_REFRESH_HZ,
+            frame_stats: None,
         }
     }
 }
@@ -401,6 +426,12 @@ impl VmConfig {
         }
         if self.display.width == 0 || self.display.height == 0 {
             return err("display dimensions must be non-zero".into());
+        }
+        if !(MIN_REFRESH_HZ..=MAX_REFRESH_HZ).contains(&self.display.refresh_hz) {
+            return err(format!(
+                "display.refresh_hz {} outside supported range {MIN_REFRESH_HZ}..={MAX_REFRESH_HZ}",
+                self.display.refresh_hz
+            ));
         }
         // Per-backend network keys, same policy as the boot section: the wrong
         // key is refused rather than ignored, so a profile that names a TAP
