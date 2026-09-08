@@ -250,15 +250,19 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     let mut script = GrubScript::new(&media, automated);
     let report = run_vm::run_with(
         cfg,
-        args.headless,
         Some(Automation {
             script: Box::new(move |log| script.step(log)),
             transcript: Some(transcript.clone()),
         }),
-        None,
-        // No control channel: the installer *is* the program driving this VM,
-        // from inside the same process.
-        false,
+        run_vm::RunOptions {
+            headless: args.headless,
+            // No control channel: the installer *is* the program driving this
+            // VM, from inside the same process. And no snapshot: an install is
+            // not a machine anybody wants to suspend half-way through
+            // (ADR-0006) — least of all this one, whose disk is being written
+            // by an Anaconda that would not survive being resumed beside it.
+            ..Default::default()
+        },
     )
     .map_err(|e| format!("installer VM failed: {e}"))?;
 
