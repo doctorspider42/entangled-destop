@@ -96,6 +96,18 @@ unit tests live with their crates.
   guest half of the user-mode-NAT acceptance
   (`crates/vmm-core/tests/whp_usernet.rs`). TX alone is a SYN; only the echo
   proves RX delivery.
+- `entangled.padprobe=<n>` reports what the guest kernel made of the
+  virtio-input gamepad — name, `input_id`, whether `joydev` bound it and its
+  `js*` node opens, how many `KEY`/`ABS` codes the input core registered, and
+  the `EVIOCGABS` ranges — then echoes **at most** `n` events, stopping after
+  1.5 s of silence. That ceiling-plus-silence shape is the point: a host that
+  asks for more than it injects gets "and nothing after that" answered, which
+  is how `tests/boot/tests/gamepad.rs` proves an unplugged controller stops
+  producing events instead of only proving a plugged-in one starts.
+  **It needs the bootstrap kernel**: `CONFIG_INPUT_JOYDEV` is a separate symbol
+  from `CONFIG_INPUT_EVDEV` and is a module in the Debian-installer kernel, so
+  on the fallback the pad has no `js*` for a reason that is nothing to do with
+  the device. The test self-skips there.
 - Sources: `guest/test-rootfs/init-rs` (static musl init), built by
   `scripts/build-test-initramfs.sh`; kernel via `scripts/fetch-test-kernel.sh`.
 
