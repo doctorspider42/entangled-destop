@@ -16,7 +16,7 @@
 //! truncated reply or a helper that exits: those are the expected outcomes
 //! this module exists to survive.
 
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -32,7 +32,7 @@ use crate::resource::{read_backing, write_backing};
 use super::protocol::{
     Reply, Request, REMOTE_MAX_BACKING, REMOTE_MAX_TOTAL_SHADOW, REMOTE_XFER_WINDOW, VERSION,
 };
-use super::{read_frame, write_frame, WireError};
+use super::{protocol, read_frame, read_frame_header, read_payload, write_frame, WireError};
 
 /// How long the client waits for the helper's handshake before giving up.
 ///
@@ -335,6 +335,54 @@ impl RemoteRenderer {
         }
     }
 
+    /// One request whose reply is bulk pixels, read into `out` in place.
+    ///
+    /// Returns `Ok(None)` when `out` holds exactly `expected` bytes of BGRA,
+    /// `Ok(Some(message))` for an in-band refusal by the renderer (the wire is
+    /// still healthy, the command is not), and `Err` only for the thing this
+    /// whole module exists for: the renderer is gone.
+    ///
+    /// A reply of the wrong *size* is in-band, not fatal: the frame was well
+    /// formed, so nothing about the stream is out of step — only that one
+    /// readback is unusable.
+    fn exchange_pixels(
+        &mut self,
+        request: &Request,
+        out: &mut Vec<u8>,
+        expected: usize,
+    ) -> Result<Option<String>, WireError> {
+        if !self.alive {
+            return Err(WireError::Closed);
+        }
+        write_frame(&mut self.writer, request.tag(), &request.encode())?;
+        let (tag, len) = read_frame_header(&mut self.reader)?;
+        if tag != protocol::tag::BYTES {
+            // Anything else is small: read it the ordinary way and let the
+            // decoder say what it was.
+            read_payload(&mut self.reader, &mut self.rx, len)?;
+            return Ok(Some(match Reply::decode(tag, &self.rx)? {
+                Reply::Error(message) => message,
+                other => format!("unexpected reply {other:?}"),
+            }));
+        }
+        // `Reply::Bytes` frames its payload with its own u32 length, which
+        // must agree with the frame's — a peer that disagrees with itself is
+        // not one to keep reading from.
+        let mut inner = [0u8; 4];
+        self.reader.read_exact(&mut inner)?;
+        let inner = u32::from_le_bytes(inner) as usize;
+        if inner + 4 != len {
+            return Err(WireError::Codec(protocol::CodecError::Truncated));
+        }
+        read_payload(&mut self.reader, out, inner)?;
+        if inner != expected {
+            return Ok(Some(format!(
+                "the renderer returned {inner} bytes for this rect, expected {expected}"
+            )));
+        }
+        Ok(None)
+    }
+
     fn exchange(&mut self, request: &Request) -> Result<Reply, WireError> {
         write_frame(&mut self.writer, request.tag(), &request.encode())?;
         let tag = read_frame(&mut self.reader, &mut self.rx)?;
@@ -595,24 +643,28 @@ impl Renderer3d for RemoteRenderer {
         rect: Rect,
         out: &mut Vec<u8>,
     ) -> Result<(), CommandError> {
-        let pixels = self.call_bytes(&Request::ReadRect {
+        // The one reply worth a bulk path: 7.9 MiB at 1080p, once per guest
+        // present. The payload is read **straight into the caller's buffer**,
+        // which the device reuses frame to frame, so in the steady state this
+        // costs no allocation, no `memset` and no second copy (GAME-2105).
+        let request = Request::ReadRect {
             resource_id,
             x: rect.x,
             y: rect.y,
             width: rect.width,
             height: rect.height,
-        })?;
+        };
         let expected = usize::try_from(rect.pixels().saturating_mul(4)).unwrap_or(usize::MAX);
-        if pixels.len() != expected {
-            return Err(CommandError::Renderer(format!(
-                "the renderer returned {} bytes for a {}x{} rect, expected {expected}",
-                pixels.len(),
-                rect.width,
-                rect.height
-            )));
+        match self.exchange_pixels(&request, out, expected) {
+            Ok(None) => Ok(()),
+            Ok(Some(message)) => Err(CommandError::Renderer(message)),
+            Err(error) => {
+                self.mark_dead(&error);
+                Err(CommandError::Renderer(format!(
+                    "the 3D renderer process was lost: {error}"
+                )))
+            }
         }
-        *out = pixels;
-        Ok(())
     }
 
     fn reset(&mut self) {

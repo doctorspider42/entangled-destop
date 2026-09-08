@@ -431,7 +431,21 @@ Blob resources themselves (`virtio_gpu::blob`) are the device half:
   - **The device measures frame pacing** (`virtio_gpu::pacing`): a
     `RESOURCE_FLUSH` on the scanout resource is a guest present, so flush
     intervals are the host's frame clock, logged every 120 frames with the
-    fence statistics. Use it for any GPU before/after.
+    fence statistics and mirrored to JSON by `entangled run --frame-stats`.
+    Each interval is split into **quiet** (the guest asked for nothing),
+    **submit** (guest → device) and **service** (the device's own cost); the
+    three sum to the interval, which is what makes an attribution an argument.
+    Use it for any GPU before/after — and see the host-display skill for the
+    two things it has already caught.
+  - **The scanout reply is the one message worth hand-optimising.** A present
+    flushes the *whole* screen (the guest double-buffers, so DRM widens the
+    damage to the plane), which is 7.9 MiB at 1080p, once per frame, across
+    the isolation boundary. It therefore has a bulk path — `write_bytes_reply`
+    on the helper, `read_frame_header` + `read_payload` on the client — that
+    reuses buffers instead of building `Reply::Bytes` → `encode` → `frame` and
+    decoding back out. Same bytes on the wire (a unit test pins that); it was
+    worth 30 ms → 13 ms of service time per frame. If you add another
+    megabyte-scale reply, give it the same treatment and the same parity test.
 
   Tests: `tests/gpu_3d.rs` (transport-level, any OS), `tests/gpu_fence.rs`
   (deferral, cap, watchdog, reset, renderer death — any OS),

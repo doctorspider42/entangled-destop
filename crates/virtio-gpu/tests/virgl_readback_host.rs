@@ -6,12 +6,18 @@
 //!
 //! # Why this exists
 //!
-//! The frame-pacing investigation found a GNOME guest whose every frame the device
-//! served in ~90 ms, all of it inside `virgl_renderer_transfer_read_iov` on a
-//! 1920×1080 rect. Measuring that through a guest is hopeless: it needs a
-//! booted desktop, four minutes, and a quiet machine. Measuring it here needs
-//! one process and a second, and it is the number the fix has to move — so
-//! the next person changes the readback and re-runs *this*, not a VM.
+//! The frame-pacing investigation (GAME-2105) found a GNOME guest spending
+//! 85 % of every frame inside this one call — a full-screen readback out of
+//! the host GL. Measuring that through a guest is hopeless: it needs a booted
+//! desktop, four minutes and a quiet machine. Measuring it here needs one
+//! process and a second, and it is the number any fix has to move — so the
+//! next person changes the readback and re-runs *this*, not a VM.
+//!
+//! Recorded in ADR-0004, because the answer depends entirely on which host GL
+//! is behind it: 16.8 ms on WSLg's D3D12, 4.8 ms on llvmpipe
+//! (`LIBGL_ALWAYS_SOFTWARE=1`), 351.7 ms unoptimised. A performance figure for
+//! this path that does not name its renderer *and* its build profile is not a
+//! figure.
 //!
 //! It asserts only correctness (the pixels come back, and they are the ones
 //! that went in). The timing is printed, never asserted: a shared developer

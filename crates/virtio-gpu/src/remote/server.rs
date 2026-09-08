@@ -34,7 +34,7 @@ use crate::protocol::{MemEntry, Rect};
 use crate::renderer::{FenceOutcome, Renderer3d};
 
 use super::protocol::{Reply, Request, REMOTE_MAX_BACKING, REMOTE_MAX_TOTAL_SHADOW, VERSION};
-use super::{read_frame, write_frame, WireError};
+use super::{read_frame, write_bytes_reply, write_frame, WireError};
 
 /// One resource's host-side stand-in for the guest backing: a private
 /// `GuestMem` region of exactly the length the VMM reported, addressed from 0.
@@ -78,6 +78,10 @@ pub fn serve<R: Read, W: Write>(
     let mut writer = BufWriter::new(tx);
     let mut payload = Vec::new();
     let mut shadows: HashMap<u32, Shadow> = HashMap::new();
+    // The scanout readback's pixels, kept across iterations: at 1080p this is
+    // 7.9 MiB that the guest asks for on every present, and a fresh allocation
+    // per frame costs more than the readback that fills it.
+    let mut pixels = Vec::new();
 
     loop {
         let tag = match read_frame(&mut reader, &mut payload) {
@@ -98,7 +102,36 @@ pub fn serve<R: Read, W: Write>(
                 return Err(error.into());
             }
         };
-        let reply = handle(&mut renderer, &mut shadows, request);
+        // `ReadRect` is answered here rather than in `handle` for one reason:
+        // its reply is the only megabyte-scale one, it happens once per guest
+        // present, and going through `handle` would mean building a fresh
+        // `Vec` for the pixels, a second one in `Reply::encode` and a third in
+        // `frame`. Straight out of a reused buffer instead — measured at 30 ms
+        // → 15 ms of device service time per 1080p frame (GAME-2105).
+        let reply = match request {
+            Request::ReadRect {
+                resource_id,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let rect = Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                };
+                match renderer.read_rect_bgra(resource_id, rect, &mut pixels) {
+                    Ok(()) => {
+                        write_bytes_reply(&mut writer, &pixels)?;
+                        continue;
+                    }
+                    Err(e) => error(e),
+                }
+            }
+            request => handle(&mut renderer, &mut shadows, request),
+        };
         write_frame(&mut writer, reply.tag(), &reply.encode())?;
     }
 }

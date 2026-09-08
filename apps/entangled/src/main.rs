@@ -336,7 +336,13 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                Err("the isolated 3D renderer is Linux-only for now (ADR-0004 §6)".to_string())
+                // The *isolation* is portable since VEN-2004; what Windows
+                // has no answer for yet is the renderer itself, because
+                // virglrenderer speaks EGL (ADR-0004 §6).
+                Err("there is no host 3D renderer on Windows yet, so this \
+                     helper has nothing to serve (ADR-0004 §6) — the process \
+                     isolation around it is in place and tested (VEN-2004)"
+                    .to_string())
             }
         }
         Command::Fetch(args) => fetch::run(&args),

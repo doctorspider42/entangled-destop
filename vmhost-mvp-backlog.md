@@ -772,7 +772,7 @@ Cztery fazy, wszystkie zmierzone na sprzęcie — szczegóły w
 | VEN-2001 | `VIRTIO_GPU_F_RESOURCE_BLOB` + region pamięci współdzielonej na transporcie (mmio i pci) | P0 | zrobione po stronie urządzenia i transportów; okno **zadeklarowane, ale jeszcze nie podparte** — brakuje BAR-a/GPA w `machine-x86` (patrz aneks do ADR-0004 z 2026-08-21) |
 | VEN-2002 | Capset `VIRTIO_GPU_CAPSET_VENUS`, negocjacja i kontekst typu venus | P0 | zrobione (`VIRTIO_GPU_F_CONTEXT_INIT` + capset 4; `NullRenderer::with_venus` jako loopback) |
 | VEN-2003 | Dekoder protokołu venus za istniejącym traitem `Renderer3d` (host: natywny Vulkan) | P0 | tylko sonda: `virgl.rs` wykrywa punkty wejścia venus przy `dlopen`; jammy ma 0.9.1, jedyny host-owy ICD to lavapipe (CPU) |
-| VEN-2004 | Izolacja renderera na Windowsie: `CreateProcess` + para uchwytów pod ten sam protokół co na Linuksie | P0 | |
+| VEN-2004 | Izolacja renderera na Windowsie: `CreateProcess` + para uchwytów pod ten sam protokół co na Linuksie | P0 | zrobione (`remote::pipe_windows`, dupleksowy named pipe jako stdin dziecka); `gpu_remote.rs` przechodzi na obu hostach — zabity helper degraduje urządzenie do 2D, brak wycieku uchwytów. Brakuje samego *renderera* na Windowsie, nie izolacji |
 | VEN-2005 | Blob scanout bez kopii (dmabuf na Linuksie, pamięć współdzielona/`ID3D12Resource` na Windowsie) | P1 | |
 | VEN-2006 | Akceptacja: GNOME i `vkcube`/`vulkaninfo` w gościu na obu hostach, pomiar klatek przed/po | P0 | |
 | VEN-2007 | Fuzzing protokołu venus i limity zasobów (gość jest wrogi) | P0 | cel `gpu_blob` (blob + okno pamięci współdzielonej) |
@@ -818,7 +818,7 @@ linuksowy).
 | GAME-2102 | `virtio-sound` (PCM playback, potem capture) + backend hosta: PipeWire/ALSA na Linuksie, WASAPI na Windowsie | P0 | playback zrobiony (`crates/virtio-sound`, `[sound] enabled`); ALSA przez `dlopen` (licencja — patrz `src/alsa.rs`), WASAPI shared mode; capture = faza 2 |
 | GAME-2103 | Venus (EPIC 20) jako ścieżka dla Vulkana/Protona | P0 | |
 | GAME-2104 | Pad: `virtio-input` z osiową mapą kontrolera + przechwytywanie z hosta (XInput/evdev), hotplug | P1 | |
-| GAME-2105 | Pacing klatek i vsync zamiast wyścigu: prezentacja związana z fence'em gościa, pomiar 1%/0.1% low | P1 | |
+| GAME-2105 | Pacing klatek i vsync zamiast wyścigu: prezentacja związana z fence'em gościa, pomiar 1%/0.1% low | P1 | zmierzone i wyjaśnione (aneks do ADR-0004 z 2026-09-08): `--frame-stats` + rozbicie interwału na quiet/submit/service, 1%/0.1% low, duplicate/dropped; `[display] refresh_hz` (gość prezentuje dokładnie w rytmie EDID-owego odświeżania); readback w izolowanym rendererze 30 ms → 13 ms, 26 → 50 fps |
 | GAME-2106 | Przypinanie vCPU do rdzeni i duże strony pamięci (opcjonalne, mierzone — nie na wiarę) | P2 | |
 | GAME-2107 | Akceptacja: `vkmark`/`glmark2`, `vkcube`, jeden realny tytuł przez Protona; liczby przed/po dla każdego kroku wyżej | P0 | |
 
@@ -829,11 +829,12 @@ Uwagi projektowe:
   danych od niezaufanego gościa — czyli pełny rygor z sekcji „hard rules":
   ograniczone bufory, walidacja parametrów formatu, brak paniki na ścieżce
   gościa, fuzzing.
-- **Mierzyć, nie wierzyć.** Każda pozycja wchodzi z liczbą przed i po; przy
-  narzucie rzędu kilkunastu procent łatwo „zoptymalizować" coś, co nie było
-  wąskim gardłem (faza 2 VirGL-a pokazała to dosłownie: ścieżka hosta zajmowała
-  6% budżetu klatki, więc readback nie był tym, co ograniczało gościa do 30 fps
-  — GAME-2105 ma najpierw wyjaśnić tamto 30 fps).
+- **Mierzyć, nie wierzyć — i zapisywać, *czym* się mierzyło.** Faza 2 VirGL-a
+  odczytała ścieżkę hosta jako 6% budżetu klatki i uznała, że readback nie jest
+  tym, co ogranicza gościa do 30 fps. GAME-2105 pokazało coś odwrotnego: na
+  tutejszym D3D12 readback to 85% klatki, a tamte 1,9 ms pochodziło z hosta na
+  llvmpipe. Liczba wydajnościowa bez nazwy renderera i profilu builda jest
+  bezużyteczna (ten sam readback: 16,8 ms / 4,8 ms / 351,7 ms).
 - Kolejność wynikowa: Venus → zero-copy → dźwięk → pad → pacing. Dźwięk może
   iść równolegle, bo nie dotyka GPU.
 
