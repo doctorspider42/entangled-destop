@@ -951,8 +951,9 @@ mod tests {
 
         // …and the next tick drains them, so nothing was lost.
         assert!(source.read_pending());
-        // SAFETY: as above.
         poll_fd[0].revents = 0;
+        // SAFETY: as above — the same one-element array and the same live
+        // descriptor, which the adopted pad still owns.
         let ready = unsafe { libc::poll(poll_fd.as_mut_ptr(), 1, 0) };
         assert_eq!(ready, 0, "the second tick reads the remainder");
     }

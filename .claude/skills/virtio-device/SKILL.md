@@ -536,6 +536,14 @@ Blob resources themselves (`virtio_gpu::blob`) are the device half:
   `guest/bootstrap-kernel/entangled.config` now; `tests/boot/tests/gamepad.rs`
   self-skips rather than run on the Debian-installer fallback, because a
   failure there says nothing about the descriptor.
+  One wart the acceptance turned up: **the tablet is a joystick too**, so a VM
+  with both has the tablet on `js0` and the pad on `js1`.
+  `joydev_dev_is_absolute_mouse()` only excludes a device whose key set is
+  *exactly* `BTN_LEFT`/`RIGHT`/`MIDDLE`, and the tablet also carries
+  `BTN_SIDE`/`BTN_EXTRA` for winit's Back and Forward. Harmless to SDL, which
+  ignores a joystick with no `BTN_JOYSTICK`-range keys; confusing to anything
+  that opens "the first joystick" by number. Written up on
+  `Profile::AbsolutePointer`.
 
 ## Testing
 

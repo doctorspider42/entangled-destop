@@ -125,6 +125,22 @@ pub enum Profile {
     /// A tablet-style absolute pointer: `ABS_X`/`ABS_Y` over the full
     /// [`ABS_AXIS_MAX`] range, the five mouse buttons and the scroll wheels.
     ///
+    /// KNOWN WART (found by GAME-2104's boot acceptance, 2026-09-09): `joydev`
+    /// binds this device too, so a VM with both a tablet and a gamepad has the
+    /// *tablet* on `/dev/input/js0` and the pad on `js1`. `joydev_match()`
+    /// excludes an "absolute mouse", but `joydev_dev_is_absolute_mouse()`
+    /// recognises one only if its key set is **exactly**
+    /// `BTN_LEFT`/`RIGHT`/`MIDDLE` — and this profile also advertises
+    /// `BTN_SIDE`/`BTN_EXTRA`, which winit's Back and Forward need. So the
+    /// bitmap comparison fails and joydev claims it.
+    /// It is a wart and not a bug: SDL ignores a joystick with no
+    /// `BTN_JOYSTICK`-range keys, so games find the pad. What it does confuse
+    /// is anything that opens "the first joystick" by number — `jstest`, and
+    /// the older half of the Linux gaming documentation. The fix, if it is ever
+    /// worth one, is to drop `BTN_SIDE`/`BTN_EXTRA` here (two mouse buttons for
+    /// a correct classification); do not reach for `BTN_TOUCH` or `BTN_DIGI`,
+    /// which would also disqualify it and would additionally lie to libinput.
+    ///
     /// TODO(MVP-903 follow-up): consider advertising `INPUT_PROP_DIRECT` via
     /// `VIRTIO_INPUT_CFG_PROP_BITS`. It would tell libinput the surface is
     /// direct (like a touchscreen), which changes pointer-acceleration and
