@@ -642,8 +642,9 @@ scale = 1.0
         assert_eq!(cfg.display.width, 1920);
     }
 
-    /// A profile written before virtio-snd existed must keep describing
-    /// exactly the machine it used to: no sound card.
+    /// A profile written before the gamepad existed must keep describing
+    /// exactly the machine it used to: no pad, and therefore no seventh slot
+    /// taken from a VM that was counting on it.
     #[test]
     fn a_gamepad_is_off_unless_a_profile_asks_for_it() {
         let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).expect("the backlog example parses");
@@ -688,6 +689,8 @@ scale = 1.0
         assert!(VmConfig::from_toml(&unknown).is_err());
     }
 
+    /// A profile written before virtio-snd existed must keep describing
+    /// exactly the machine it used to: no sound card.
     #[test]
     fn sound_is_off_unless_a_profile_asks_for_it() {
         let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();

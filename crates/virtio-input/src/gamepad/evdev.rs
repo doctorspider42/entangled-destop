@@ -132,6 +132,45 @@ struct RawEvent {
     value: i32,
 }
 
+/// The `event*` nodes in `dir` a scan will look at: sorted, then capped at
+/// [`MAX_SCANNED_DEVICES`].
+///
+/// Sorted **before** the cap, not after. Both orders keep the bound, but only
+/// this one keeps the promise that goes with it: "player one" is the
+/// lowest-numbered pad, and a `readdir` that happened to hand back
+/// `event90..event160` first would otherwise silently pick a different
+/// controller on a machine with a lot of input devices.
+///
+/// Takes the directory as an argument so the bound is testable without a
+/// `/dev/input` full of fakes.
+fn candidate_nodes(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("event"))
+        })
+        .collect();
+    // Numeric, not lexical: `event2` comes before `event10`, which is what a
+    // human means by "the first pad" and what `readdir` order does not give.
+    nodes.sort_by_key(|path| {
+        let number = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("event"))
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        (number, path.clone())
+    });
+    nodes.truncate(MAX_SCANNED_DEVICES);
+    nodes
+}
+
 /// Reads `code`'s bit out of an evdev capability bitmap.
 fn has_bit(bitmap: &[u8], code: u16) -> bool {
     let index = usize::from(code / 8);
@@ -152,6 +191,11 @@ struct AdoptedPad {
     label: String,
     /// The evdev node number, so two identically named pads are still distinct.
     slot: u64,
+    /// `EVIOCGID`. Logged and nothing else — but "which controller did it
+    /// adopt" is the first question of every bug report about a pad, and a
+    /// bus/vendor/product triple answers it where a name like "Controller"
+    /// does not.
+    ids: InputId,
     /// `EVIOCGABS` min/max per entry of [`ANALOGUE_AXES`]; `None` for an axis
     /// the pad does not have.
     axis_range: [Option<(i32, i32)>; 6],
@@ -205,28 +249,16 @@ impl EvdevSource {
         }
         self.next_scan = Instant::now() + RESCAN_INTERVAL;
 
-        let Ok(entries) = std::fs::read_dir(INPUT_DIR) else {
-            return;
-        };
-        // Sorted, so "player one" is a stable choice rather than readdir order.
-        let mut nodes: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("event"))
-            })
-            .take(MAX_SCANNED_DEVICES)
-            .collect();
-        nodes.sort();
-
-        for path in nodes {
+        for path in candidate_nodes(Path::new(INPUT_DIR)) {
             match self.try_adopt(&path) {
                 Ok(Some(pad)) => {
                     tracing::info!(
                         path = %pad.path.display(),
                         controller = %pad.label,
+                        bus = format_args!("{:04x}", pad.ids.bustype),
+                        vendor = format_args!("{:04x}", pad.ids.vendor),
+                        product = format_args!("{:04x}", pad.ids.product),
+                        version = format_args!("{:04x}", pad.ids.version),
                         digital_triggers = pad.digital_triggers,
                         digital_dpad = pad.digital_dpad,
                         "adopted host gamepad"
@@ -304,6 +336,7 @@ impl EvdevSource {
                 name
             },
             slot,
+            ids: ioctl_input_id(raw).unwrap_or_default(),
             // `ABS_Z`/`ABS_RZ` present means analogue triggers.
             digital_triggers: axis_range[4].is_none() && axis_range[5].is_none(),
             digital_dpad: !has_bit(&axes, abs::HAT0X) && has_bit(&keys, 0x220),
@@ -568,6 +601,18 @@ fn ioctl_bytes(fd: RawFd, request: libc::Ioctl, len: usize) -> Option<Vec<u8>> {
     Some(buffer)
 }
 
+/// `EVIOCGID` into an [`InputId`].
+fn ioctl_input_id(fd: RawFd) -> Option<InputId> {
+    let mut id = InputId::default();
+    // SAFETY: `fd` is live for the call; the request is `EVIOCGID`, whose
+    // encoded size is `size_of::<InputId>()` (the same expression builds
+    // both), and the destination is one such struct in local storage.
+    // `InputId` is `#[repr(C)]` plain-old-data, so any bytes the kernel writes
+    // are valid.
+    let result = unsafe { libc::ioctl(fd, eviocgid(), std::ptr::addr_of_mut!(id)) };
+    (result >= 0).then_some(id)
+}
+
 /// `EVIOCGABS(axis)` into a [`AbsInfo`].
 fn ioctl_absinfo(fd: RawFd, axis: u16) -> Option<AbsInfo> {
     let mut info = AbsInfo::default();
@@ -612,6 +657,7 @@ mod tests {
             path: PathBuf::from("/dev/input/event7"),
             label: "Test Pad".into(),
             slot: 7,
+            ids: InputId::default(),
             axis_range: [
                 Some((-32768, 32767)),
                 Some((-32768, 32767)),
@@ -784,6 +830,133 @@ mod tests {
         assert_eq!(state.right_stick.0, 0);
     }
 
+    /// A scratch directory under `/tmp`, removed on drop.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "entangled-evdev-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("scratch directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn one_scan_looks_at_a_bounded_number_of_nodes_and_at_the_lowest_ones() {
+        let dir = ScratchDir::new("scan");
+        // Twice the bound, plus the things `/dev/input` really contains
+        // alongside the event nodes.
+        for n in 0..MAX_SCANNED_DEVICES * 2 {
+            std::fs::write(dir.0.join(format!("event{n}")), b"").expect("node");
+        }
+        for name in ["mice", "mouse0", "js0", "by-id", "by-path"] {
+            std::fs::write(dir.0.join(name), b"").expect("node");
+        }
+
+        let nodes = candidate_nodes(&dir.0);
+        assert_eq!(
+            nodes.len(),
+            MAX_SCANNED_DEVICES,
+            "a scan must be bounded however many nodes exist"
+        );
+        // Numerically lowest first, and nothing that is not an event node.
+        let names: Vec<String> = nodes
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names[0], "event0");
+        assert_eq!(names[1], "event1");
+        assert_eq!(names[9], "event9");
+        assert_eq!(names[10], "event10", "sorted numerically, not lexically");
+        assert!(names.iter().all(|n| n.starts_with("event")));
+
+        // A directory that is not there is not a panic.
+        assert!(candidate_nodes(&dir.0.join("missing")).is_empty());
+    }
+
+    #[test]
+    fn one_poll_folds_a_bounded_number_of_events_and_leaves_the_rest() {
+        // A pad reporting at a plausible rate produces eight events per tick;
+        // this one produces far more than the cap in one go, which is what a
+        // device gone mad looks like. The loop must stop, and the leftovers
+        // must still be there for the next tick rather than being dropped.
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `pipe2` writes two descriptors into a two-element array of
+        // `c_int`, which is exactly what `fds` is; the flags are valid.
+        let made = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) };
+        assert_eq!(made, 0, "pipe2: {}", std::io::Error::last_os_error());
+        // SAFETY: both descriptors were just created by `pipe2` and are owned
+        // by nothing else, so taking ownership of them here is sound.
+        let (read_end, write_end) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+
+        let events = MAX_EVENTS_PER_POLL + 40;
+        let mut bytes = Vec::with_capacity(events * std::mem::size_of::<RawEvent>());
+        for n in 0..events {
+            let event = key(btn::SOUTH, i32::from(n % 2 == 0));
+            // SAFETY: `RawEvent` is `#[repr(C)]` plain-old-data with no
+            // padding-sensitive invariants, so reading it as its own bytes is
+            // sound and is exactly the encoding the kernel uses.
+            let raw: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!(event).cast::<u8>(),
+                    std::mem::size_of::<RawEvent>(),
+                )
+            };
+            bytes.extend_from_slice(raw);
+        }
+        // A pipe holds 64 KiB by default; the payload has to fit or the
+        // non-blocking write below would short-write and test nothing.
+        assert!(bytes.len() < 64 * 1024, "payload must fit one pipe buffer");
+        // SAFETY: `write_end` is live and `bytes` is a valid slice of its own
+        // length.
+        let written = unsafe {
+            libc::write(
+                write_end.as_raw_fd(),
+                bytes.as_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+            )
+        };
+        assert_eq!(written, bytes.len() as isize, "the whole payload is queued");
+
+        let mut pad = xbox_like();
+        pad.fd = read_end;
+        let mut source = EvdevSource::new();
+        source.pad = Some(pad);
+        assert!(source.read_pending(), "a full pipe is not a disconnect");
+
+        // The cap held: there is still unread data, so the loop stopped on the
+        // bound rather than on the pipe running dry.
+        let leftover = source.pad.as_ref().expect("still adopted").fd.as_raw_fd();
+        let mut poll_fd = [libc::pollfd {
+            fd: leftover,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: one initialised `pollfd` in local storage, a matching count,
+        // and a descriptor owned by the adopted pad for the whole call.
+        let ready = unsafe { libc::poll(poll_fd.as_mut_ptr(), 1, 0) };
+        assert_eq!(ready, 1, "the events past the cap must still be readable");
+
+        // …and the next tick drains them, so nothing was lost.
+        assert!(source.read_pending());
+        // SAFETY: as above.
+        poll_fd[0].revents = 0;
+        let ready = unsafe { libc::poll(poll_fd.as_mut_ptr(), 1, 0) };
+        assert_eq!(ready, 0, "the second tick reads the remainder");
+    }
+
     #[test]
     fn probing_this_host_says_something_definite() {
         // On a machine with /dev/input this succeeds; in a container without
@@ -806,8 +979,18 @@ mod tests {
             // must at least be non-empty and the state in range.
             Poll::Connected { id, state } => {
                 assert!(!id.label.is_empty());
-                assert!(state.left_trigger <= 255);
+                // A hat is a sign: whatever range the host pad reported it in,
+                // `to_hat` must already have collapsed it to -1/0/1.
                 assert!((-1..=1).contains(&state.hat.0));
+                assert!((-1..=1).contains(&state.hat.1));
+                // And every event that state could produce is one the guest
+                // device advertises — the same invariant the pump relies on.
+                for event in state.delta(&PadState::NEUTRAL) {
+                    assert!(
+                        crate::config::Profile::Gamepad.accepts(event),
+                        "{event:?} is not on the gamepad profile"
+                    );
+                }
             }
         }
     }

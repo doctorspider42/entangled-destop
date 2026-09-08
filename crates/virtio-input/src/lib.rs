@@ -57,7 +57,8 @@ pub mod gamepad;
 pub use config::{DevIds, Profile, Selection};
 pub use device::{BufferError, EventStats, InputDevice, InputHandle, MAX_PENDING_EVENTS};
 pub use gamepad::{
-    open_source, GamepadCapture, GamepadError, GamepadSource, PadState, SourceChoice, SourceFactory,
+    open_source, GamepadCapture, GamepadError, GamepadSource, PadId, PadState, Poll, SourceChoice,
+    SourceFactory,
 };
 
 /// Linux input event types (`EV_*` from `linux/input-event-codes.h`).

@@ -38,8 +38,10 @@
 //!                               of the virtio-input descriptor — name, ids,
 //!                               whether joydev claimed it, how many buttons
 //!                               and axes it registered, and the `ABS_INFO`
-//!                               ranges it read back — then echoes the first
-//!                               `<n>` events the host injects. Two lines:
+//!                               ranges it read back — then echoes at most
+//!                               `<n>` events the host injects, stopping early
+//!                               after 1.5 s of silence so "and nothing after
+//!                               that" is answerable too. Two lines:
 //!                               `padinfo` is printed *after* the event device
 //!                               is open, which is the host's cue that
 //!                               injecting will not race the open.
@@ -89,6 +91,17 @@ const MAX_PAD_EVENTS: usize = 256;
 /// enough for a slow boot to have finished settling, short enough that a
 /// broken event path is a test failure rather than a hung run.
 const PAD_EVENT_WAIT: Duration = Duration::from_secs(15);
+
+/// How long the gamepad probe keeps listening after the last event it saw,
+/// once at least one has arrived.
+///
+/// This is what turns `entangled.padprobe=<n>` from "wait for exactly n" into
+/// "collect at most n, then prove the stream stopped". A host test that asks
+/// for more events than it injects gets the difference as evidence: a pad that
+/// spams the guest after an unplug, or repeats a report, shows up as extra
+/// entries in `seq=` instead of being invisible because the probe had already
+/// counted enough and left.
+const PAD_QUIET: Duration = Duration::from_millis(1500);
 
 /// `EVIOCGABS(axis)` = `_IOR('E', 0x40 + axis, struct input_absinfo)`, spelled
 /// out because `libc` does not export the `EVIOC*` family. 24 is
@@ -769,16 +782,33 @@ fn pad_probe(count: usize) {
         ),
         None => "absent".to_string(),
     };
+    // "joydev claimed it" is two claims, and only the second one matters to a
+    // game: the handler bound (`Handlers=` mentions a `js*`) *and* the node it
+    // promised is really there and really opens. A `js0` in that line with no
+    // openable `/dev/input/js0` behind it is what a missing devtmpfs entry or
+    // a permission problem looks like, and it is worth telling apart from
+    // joydev never having bound at all.
+    let js_node = device
+        .handlers
+        .iter()
+        .find(|handler| handler.starts_with("js"))
+        .cloned();
+    let js_open = js_node
+        .as_ref()
+        .is_some_and(|js| std::fs::File::open(format!("/dev/input/{js}")).is_ok());
     println!(
         "VMHOST_TEST_OK padinfo name={} bus={:04x} vendor={:04x} product={:04x} \
-version={:04x} node={} js={} handlers={} keys={} axes={} absx={} absz={} abshat={}",
+version={:04x} node={} js={} jsnode={} jsopen={} handlers={} keys={} axes={} \
+absx={} absz={} abshat={}",
         device.name.replace(' ', "_"),
         device.bus,
         device.vendor,
         device.product,
         device.version,
         node,
-        u8::from(device.handlers.iter().any(|h| h.starts_with("js"))),
+        u8::from(js_node.is_some()),
+        js_node.as_deref().unwrap_or("none"),
+        u8::from(js_open),
         device.handlers.join(","),
         device.key_count,
         device.abs_count,
@@ -789,9 +819,15 @@ version={:04x} node={} js={} handlers={} keys={} axes={} absx={} absz={} abshat=
 
     // …and now the round trip. Blocking reads with a deadline enforced by the
     // kernel rather than by a spin: `poll(2)` on the one descriptor.
+    //
+    // Two deadlines, because the interesting failure is not only "nothing
+    // arrived". Until the first event the probe waits [`PAD_EVENT_WAIT`], the
+    // patience a slow boot needs; after it, [`PAD_QUIET`] of silence ends the
+    // collection. So a host that asks for more events than it injects is
+    // asking "and then nothing more, yes?", and gets an answer.
     let mut seen: Vec<String> = Vec::new();
     let mut syn = 0usize;
-    let deadline = Instant::now() + PAD_EVENT_WAIT;
+    let mut deadline = Instant::now() + PAD_EVENT_WAIT;
     while seen.len() + syn < count && Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let millis = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
@@ -830,6 +866,9 @@ version={:04x} node={} js={} handlers={} keys={} axes={} absx={} absz={} abshat=
                 0x03 => seen.push(format!("a{:x}={}", event.code, event.value)),
                 other => seen.push(format!("t{other:x}c{:x}={}", event.code, event.value)),
             }
+        }
+        if records > 0 {
+            deadline = Instant::now() + PAD_QUIET;
         }
     }
     println!(
