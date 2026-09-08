@@ -42,8 +42,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use control_api::{
-    BootMode, BootSection, DiskSection, DisplaySection, NetworkBackend, NetworkSection,
-    SoundBackend, SoundSection, VirtioTransport, VmConfig,
+    BootMode, BootSection, DiskSection, DisplaySection, GamepadBackend, GamepadSection,
+    NetworkBackend, NetworkSection, SoundBackend, SoundSection, VirtioTransport, VmConfig,
 };
 use debian_media::{FetchOptions, FetchReport, MediaKind};
 use flate2::write::GzEncoder;
@@ -308,8 +308,9 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         network: net.section.clone(),
         display: DisplaySection::default(),
         // The installer has nothing to say; the *installed* profile below is
-        // where the card belongs.
+        // where the card and the pad belong.
         sound: SoundSection::default(),
+        gamepad: GamepadSection::default(),
     };
 
     tracing::info!(
@@ -370,6 +371,14 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         sound: SoundSection {
             enabled: true,
             backend: SoundBackend::Auto,
+        },
+        // …and neither is a desktop you cannot play on (GAME-2104). Same
+        // bargain as the sound card: `auto` costs a virtio slot and nothing
+        // else, a host with no controller gets a pad that never moves, and one
+        // plugged in later is picked up without restarting the VM.
+        gamepad: GamepadSection {
+            enabled: true,
+            backend: GamepadBackend::Auto,
         },
     };
     let profile_path = target.with_file_name(format!("{vm_name}.toml"));

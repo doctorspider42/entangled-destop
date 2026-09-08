@@ -58,6 +58,10 @@ pub struct VmConfig {
     /// [`SoundSection`].
     #[serde(default)]
     pub sound: SoundSection,
+    /// The guest's gamepad (backlog GAME-2104). Off by default — see
+    /// [`GamepadSection`].
+    #[serde(default)]
+    pub gamepad: GamepadSection,
 }
 
 /// The virtio transport a VM's devices are attached to (EPIC 3 / EPIC 19).
@@ -392,6 +396,81 @@ impl Default for SoundSection {
     }
 }
 
+/// Which host mechanism a VM's gamepad reads real controllers through.
+///
+/// As with [`SoundBackend`], `control-api` only parses the word; which
+/// mechanisms exist on this host is `virtio_input::gamepad::open_source`'s
+/// business, so the same profile validates on every OS.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GamepadBackend {
+    /// The host's native mechanism if this OS has one, [`Self::Null`] if not.
+    /// Never fails, and in particular never fails because no controller is
+    /// plugged in — that is what hotplug is for.
+    #[default]
+    Auto,
+    /// A pad the host never moves. The guest still enumerates a working
+    /// joystick, which is what a headless or CI run wants and what the boot
+    /// tests drive with synthetic events.
+    Null,
+    /// Linux hosts: `/dev/input/event*`, read directly.
+    Evdev,
+    /// Windows hosts: XInput. Spelled out because `kebab-case` would other-
+    /// wise make the word `x-input`, which nobody would ever type.
+    #[serde(rename = "xinput")]
+    XInput,
+}
+
+impl std::fmt::Display for GamepadBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Null => "null",
+            Self::Evdev => "evdev",
+            Self::XInput => "xinput",
+        })
+    }
+}
+
+/// `[gamepad]` — a virtio-input gamepad for the guest (GAME-2104).
+///
+/// **Off by default**, for exactly the two reasons `[sound]` is. The pad is
+/// attached last, so turning it on never renames `/dev/vda` or shifts a PCI
+/// device number — but it does take one of the eight slots on either bus
+/// (`machine_x86::virtio::MAX_VIRTIO_SLOTS`, and eight functions plus the host
+/// bridge in `machine_x86::pci::MAX_PCI_DEVICES`). And an existing profile
+/// must keep describing exactly the machine it used to.
+///
+/// The budget is now genuinely tight. A VM with one disk spends
+/// disk + gpu + keyboard + tablet = 4; a network adds a fifth, sound a sixth
+/// and this a seventh, leaving one slot for a CD-ROM *or* a second disk but
+/// not both. Anything past that is refused when the bus is built, with the
+/// count in the message.
+///
+/// ```toml
+/// [gamepad]
+/// enabled = true
+/// # backend = "auto"   # auto | null | evdev | xinput
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct GamepadSection {
+    pub enabled: bool,
+    /// Which host mechanism the pad reads. Meaningless while `enabled` is
+    /// false and therefore not refused there, so a profile may keep its chosen
+    /// backend across an on/off toggle.
+    pub backend: GamepadBackend,
+}
+
+impl Default for GamepadSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: GamepadBackend::Auto,
+        }
+    }
+}
+
 impl VmConfig {
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
         let cfg: VmConfig = toml::from_str(s)?;
@@ -565,6 +644,50 @@ scale = 1.0
 
     /// A profile written before virtio-snd existed must keep describing
     /// exactly the machine it used to: no sound card.
+    #[test]
+    fn a_gamepad_is_off_unless_a_profile_asks_for_it() {
+        let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).expect("the backlog example parses");
+        assert!(!cfg.gamepad.enabled);
+        assert_eq!(cfg.gamepad.backend, GamepadBackend::Auto);
+        // Round-trips without inventing a section.
+        let text = toml::to_string(&cfg).expect("serialises");
+        assert_eq!(
+            VmConfig::from_toml(&text).expect("round-trips").gamepad,
+            cfg.gamepad
+        );
+    }
+
+    #[test]
+    fn the_gamepad_section_parses_round_trips_and_refuses_typos() {
+        let text =
+            BACKLOG_EXAMPLE.to_string() + "\n[gamepad]\nenabled = true\nbackend = \"null\"\n";
+        let cfg = VmConfig::from_toml(&text).expect("parses");
+        assert!(cfg.gamepad.enabled);
+        assert_eq!(cfg.gamepad.backend, GamepadBackend::Null);
+        assert_eq!(cfg.gamepad.backend.to_string(), "null");
+
+        for (word, expected) in [
+            ("auto", GamepadBackend::Auto),
+            ("null", GamepadBackend::Null),
+            ("evdev", GamepadBackend::Evdev),
+            ("xinput", GamepadBackend::XInput),
+        ] {
+            let text =
+                format!("{BACKLOG_EXAMPLE}\n[gamepad]\nenabled = true\nbackend = \"{word}\"\n");
+            let cfg = VmConfig::from_toml(&text).unwrap_or_else(|e| panic!("{word}: {e}"));
+            assert_eq!(cfg.gamepad.backend, expected);
+            assert_eq!(cfg.gamepad.backend.to_string(), word);
+        }
+
+        // A backend that does not exist is a config error, not a silent
+        // fallback — the same rule `[sound]` follows.
+        let typo = BACKLOG_EXAMPLE.to_string() + "\n[gamepad]\nbackend = \"dinput\"\n";
+        assert!(VmConfig::from_toml(&typo).is_err());
+        // …and so is a field nobody implemented.
+        let unknown = BACKLOG_EXAMPLE.to_string() + "\n[gamepad]\ndeadzone = 0.2\n";
+        assert!(VmConfig::from_toml(&unknown).is_err());
+    }
+
     #[test]
     fn sound_is_off_unless_a_profile_asks_for_it() {
         let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
