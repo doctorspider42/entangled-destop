@@ -110,18 +110,45 @@ pub const CMDLINE_MAX_LEN: usize = 2048;
 
 // ---- UEFI boot (EPIC 18, ADR-0003) ---------------------------------------
 
+/// Base of the PVH hand-off block: three pages holding `hvm_start_info`, the
+/// `hvm_memmap_table_entry` array it points at, and the command line.
+///
+/// **These pages must never be describable as usable RAM.** The firmware does
+/// not copy `hvm_start_info` out at entry: EDK2's reset vector stashes the
+/// `%ebx` pointer and `AcpiPlatformDxe` dereferences it again *at the end of
+/// DXE*, once the PCI bus has been enumerated — `InstallCloudHvTables()` reads
+/// `pvh_start_info->rsdp_paddr` there and walks straight into the XSDT. So the
+/// structure has to survive the whole of PEI and DXE, and anything that
+/// scribbles the page turns that read into a wild pointer. A garbage
+/// `rsdp_paddr` is not even a page fault: a non-canonical one faults as
+/// `#GP` inside `QemuFwCfgAcpiPlatform.dll`, which is what an ADR-0003 boot
+/// looks like when this goes wrong.
+///
+/// They used to live at 0x1000..0x4000, inside the *usable* low-RAM E820 entry
+/// that starts at zero — host structures published to the guest as free memory.
+/// Here they sit in the reserved BIOS window instead, immediately below the
+/// ACPI tables ([`ACPI_TABLES_START`]), which buys the same two protections the
+/// tables get: the whole `0x9fc00..0x100000` range is `E820Type::Reserved`, and
+/// EDK2 additionally maps `0xa0000..0xfffff` as MMIO rather than system memory
+/// (`PlatformAddIoMemoryRangeHob`), so no DXE allocation can be handed a page
+/// of it.
+pub const PVH_HANDOFF_START: u64 = 0x000d_0000;
+
+/// Size of the PVH hand-off block: one page each for the start info, the
+/// memory map ([`PVH_MEMMAP_MAX_ENTRIES`] × 24 bytes = 3 KiB) and the command
+/// line.
+pub const PVH_HANDOFF_SIZE: u64 = 0x3000;
+
 /// Guest physical address of the PVH `hvm_start_info` structure handed to a
-/// firmware in `%ebx`. Lives in low RAM that neither the firmware image
-/// (loaded at 1 MiB and up) nor the SEC/PEI temporary RAM (inside the
-/// firmware's own MEMFD, at 8 MiB and up) touches.
-pub const PVH_START_INFO_START: u64 = 0x0000_1000;
+/// firmware in `%ebx`.
+pub const PVH_START_INFO_START: u64 = PVH_HANDOFF_START;
 
 /// Guest physical address of the `hvm_memmap_table_entry` array that
 /// `hvm_start_info.memmap_paddr` points at.
-pub const PVH_MEMMAP_START: u64 = 0x0000_2000;
+pub const PVH_MEMMAP_START: u64 = PVH_HANDOFF_START + 0x1000;
 
 /// Guest physical address of the NUL-terminated PVH command line.
-pub const PVH_CMDLINE_START: u64 = 0x0000_3000;
+pub const PVH_CMDLINE_START: u64 = PVH_HANDOFF_START + 0x2000;
 
 /// Cap on the PVH memory map, so the array cannot run out of its page.
 /// One `hvm_memmap_table_entry` is 24 bytes: 128 entries is 3 KiB.

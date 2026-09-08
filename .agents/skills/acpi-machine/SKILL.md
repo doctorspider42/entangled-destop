@@ -47,6 +47,32 @@ the one type Linux keeps out of memblock entirely (`e820__memblock_setup` only
 adds RAM), and an `XEN_HVM_MEMMAP_TYPE_ACPI` entry in the PVH memmap (which
 EDK2 ignores: `PlatformScanE820Pvh()` filters on RAM).
 
+### The PVH hand-off block shares the same window (ADR-0003, 2026-09-08)
+
+`hvm_start_info`, the `hvm_memmap_table_entry` array and the PVH command line
+now sit at `layout::PVH_HANDOFF_START = 0xd0000`, three pages immediately below
+the ACPI tables, for the second and third reasons above: reserved in E820, and
+MMIO as far as EDK2's DXE allocator is concerned.
+
+They have to be that durable because **EDK2 never copies them**. The reset
+vector stashes the `%ebx` pointer in `PcdXenPvhStartOfDayStructPtr`, and
+`InstallCloudHvTables()` follows it again at the *end* of DXE — after PCI
+enumeration — to read `rsdp_paddr` and walk our XSDT. At `0x1000..0x4000`,
+where they used to live, they were inside the usable low-RAM E820 entry: host
+structures advertised to the guest as free memory. When that read comes back
+corrupted the pointer is usually non-canonical, so it faults as **`#GP`, not a
+page fault**, and the boot ends with `X64 Exception Type - 0D` in
+`QemuFwCfgAcpiPlatform.dll` one line after `OnRootBridgesConnected` — a symptom
+that looks nothing like memory corruption. If you ever see that banner, dump
+`0xd0000` first.
+
+Guarded by `machine_x86::tests::the_pvh_handoff_block_is_reserved_not_ram`,
+`uefi_boot::pvh::tests::the_handoff_block_is_never_usable_ram`, and the two
+boot tests `tests/boot/tests/uefi_highmem.rs` /
+`crates/vmm-core/tests/whp_highmem.rs`, which boot a 4096 MiB guest (RAM above
+the high-RAM split — every other UEFI boot test uses 2048 MiB) and compare the
+block byte-for-byte after the run.
+
 **The FACS and the DSDT must never be listed in the XSDT.** EDK2's
 `InstallCloudHvTables()` installs every XSDT entry as a table and then installs
 the DSDT separately from the FADT's `X_DSDT`; a DSDT in the XSDT would be
