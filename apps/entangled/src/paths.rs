@@ -42,6 +42,12 @@ pub fn ubuntu_cache_dir() -> Result<PathBuf, String> {
     Ok(cache_root()?.join("ubuntu"))
 }
 
+/// Where `scripts/fetch-fedora-iso.sh` leaves verified ISOs:
+/// `<cache>/fedora/<release>/<file>.iso`.
+pub fn fedora_cache_dir() -> Result<PathBuf, String> {
+    Ok(cache_root()?.join("fedora"))
+}
+
 /// The newest verified ISO under `dir`, if any.
 ///
 /// "Newest" is by sorted path, not by mtime: a release directory is named after
@@ -203,6 +209,10 @@ mod tests {
         assert_eq!(
             ubuntu_cache_dir().unwrap(),
             PathBuf::from(r"D:\entangled cache").join("ubuntu")
+        );
+        assert_eq!(
+            fedora_cache_dir().unwrap(),
+            PathBuf::from(r"D:\entangled cache").join("fedora")
         );
         // A whitespace-only value is not an override: that is an unset variable
         // spelled badly, and following it would look for the cache at the

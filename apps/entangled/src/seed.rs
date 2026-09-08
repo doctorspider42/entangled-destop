@@ -1,4 +1,12 @@
-//! The cloud-init NoCloud seed volume (backlog UEFI-1804).
+//! The installer's configuration volume — a small ISO9660 image handed to the
+//! guest as an extra read-only virtio-blk device (backlog UEFI-1804).
+//!
+//! Two installers use it, and both find it by *filesystem label*:
+//!
+//! | Volume | Label | File | Read by |
+//! |---|---|---|---|
+//! | Ubuntu autoinstall | `CIDATA` | `user-data`, `meta-data` | cloud-init's `DataSourceNoCloud` |
+//! | Fedora kickstart | `OEMDRV` | `ks.cfg` | Anaconda's dracut module |
 //!
 //! `entangled install ubuntu` hands subiquity its autoinstall configuration on a
 //! small extra virtio-blk volume. cloud-init finds it by *filesystem label*:
@@ -43,6 +51,13 @@ const SYSTEM_AREA_SECTORS: usize = 16;
 /// `label.upper()` and `label.lower()`, and nothing in between, so a mixed-case
 /// label would silently not be a seed.
 pub const SEED_LABEL: &str = "CIDATA";
+
+/// The label Anaconda looks for. Its dracut module resolves
+/// `inst.ks=hd:LABEL=OEMDRV:/ks.cfg` through `/dev/disk/by-label/OEMDRV`, and —
+/// with no `inst.ks=` at all — auto-detects the same label and the same path
+/// (`50-kickstart-genrules.sh` in the installer initramfs). Upper case for the
+/// same reason `CIDATA` is: it is matched literally.
+pub const OEMDRV_LABEL: &str = "OEMDRV";
 
 /// Minimum image size. Nothing requires it; it keeps the volume a comfortable
 /// multiple of the 512-byte sectors virtio-blk reports and leaves room for a
@@ -97,8 +112,9 @@ const MAX_FILE_BYTES: usize = 8 * SECTOR;
 pub struct Seed {
     pub path: PathBuf,
     pub bytes: usize,
-    /// The user-data actually written (after hostname substitution).
-    pub user_data: String,
+    /// The configuration actually written, after substitution — the cloud-init
+    /// user-data for a `CIDATA` volume, the kickstart for an `OEMDRV` one.
+    pub contents: String,
 }
 
 /// Builds the autoinstall user-data for `hostname`, either from the compiled-in
@@ -126,10 +142,41 @@ pub fn user_data(hostname: &str, custom: Option<&Path>) -> Result<String, SeedEr
 /// instance id as a new instance, so a fresh install gets a fresh one.
 pub fn write(path: &Path, user_data: &str, instance_id: &str) -> Result<Seed, SeedError> {
     let meta_data = format!("instance-id: {instance_id}\nlocal-hostname: {instance_id}\n");
-    let image = build_iso9660(&[
-        ("USER-DATA.;1", user_data.as_bytes()),
-        ("META-DATA.;1", meta_data.as_bytes()),
-    ])?;
+    write_volume(
+        path,
+        SEED_LABEL,
+        &[
+            ("USER-DATA.;1", user_data.as_bytes()),
+            ("META-DATA.;1", meta_data.as_bytes()),
+        ],
+        user_data,
+    )
+}
+
+/// Writes an [`OEMDRV_LABEL`] volume carrying a single `ks.cfg`, which is what
+/// Anaconda fetches and runs.
+///
+/// The recorded identifier is `KS.CFG;1`; `isofs` presents that as `ks.cfg`,
+/// which is the name `fetch-kickstart-disk` copies out — the same translation
+/// the NoCloud names rely on, modelled in
+/// [`tests::the_names_translate_the_way_isofs_does`].
+pub fn write_kickstart(path: &Path, kickstart: &str) -> Result<Seed, SeedError> {
+    write_volume(
+        path,
+        OEMDRV_LABEL,
+        &[("KS.CFG;1", kickstart.as_bytes())],
+        kickstart,
+    )
+}
+
+/// Writes a labelled ISO9660 volume holding `files`.
+fn write_volume(
+    path: &Path,
+    label: &str,
+    files: &[(&str, &[u8])],
+    contents: &str,
+) -> Result<Seed, SeedError> {
+    let image = build_iso9660(files, label)?;
     std::fs::write(path, &image).map_err(|source| SeedError::Write {
         path: path.to_path_buf(),
         source,
@@ -137,13 +184,14 @@ pub fn write(path: &Path, user_data: &str, instance_id: &str) -> Result<Seed, Se
     tracing::info!(
         path = %path.display(),
         bytes = image.len(),
-        label = SEED_LABEL,
-        "wrote the cloud-init NoCloud seed volume"
+        label,
+        files = files.len(),
+        "wrote the installer configuration volume"
     );
     Ok(Seed {
         path: path.to_path_buf(),
         bytes: image.len(),
-        user_data: user_data.to_string(),
+        contents: contents.to_string(),
     })
 }
 
@@ -160,7 +208,7 @@ pub fn write(path: &Path, user_data: &str, instance_id: &str) -> Result<Seed, Se
 /// | 19 | type-M path table (the same, big-endian) |
 /// | 20 | root directory: `.`, `..`, then one record per file |
 /// | 21.. | file contents, one sector run each |
-fn build_iso9660(files: &[(&str, &[u8])]) -> Result<Vec<u8>, SeedError> {
+fn build_iso9660(files: &[(&str, &[u8])], label: &str) -> Result<Vec<u8>, SeedError> {
     for (_, data) in files {
         if data.len() > MAX_FILE_BYTES {
             return Err(SeedError::TooLarge {
@@ -235,7 +283,7 @@ fn build_iso9660(files: &[(&str, &[u8])]) -> Result<Vec<u8>, SeedError> {
     pvd[1..6].copy_from_slice(b"CD001"); // standard identifier — what blkid matches
     pvd[6] = 1; // version
     fill_a_chars(&mut pvd[8..40], ""); // system identifier
-    fill_a_chars(&mut pvd[40..72], SEED_LABEL); // volume identifier: the LABEL
+    fill_a_chars(&mut pvd[40..72], label); // volume identifier: the LABEL
     both_endian32(&mut pvd[80..88], total_sectors);
     both_endian16(&mut pvd[120..124], 1); // volume set size
     both_endian16(&mut pvd[124..128], 1); // volume sequence number
@@ -346,13 +394,16 @@ mod tests {
     use super::*;
 
     fn seed_image() -> Vec<u8> {
-        build_iso9660(&[
-            (
-                "USER-DATA.;1",
-                b"#cloud-config\nautoinstall:\n  version: 1\n",
-            ),
-            ("META-DATA.;1", b"instance-id: test\n"),
-        ])
+        build_iso9660(
+            &[
+                (
+                    "USER-DATA.;1",
+                    b"#cloud-config\nautoinstall:\n  version: 1\n" as &[u8],
+                ),
+                ("META-DATA.;1", b"instance-id: test\n"),
+            ],
+            SEED_LABEL,
+        )
         .unwrap()
     }
 
@@ -546,18 +597,56 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// The Fedora volume is the same image with a different label and a
+    /// different file name — and both halves matter: Anaconda resolves
+    /// `/dev/disk/by-label/OEMDRV` (so the PVD volume identifier is what finds
+    /// it at all) and then copies `/ks.cfg` off the mount.
+    #[test]
+    fn the_kickstart_volume_is_labelled_oemdrv_and_holds_ks_cfg() {
+        let dir = std::env::temp_dir().join("entangled-seed-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("oemdrv-{}.iso", std::process::id()));
+        let ks = "text\npoweroff\n%packages\n@^workstation-product-environment\n%end\n";
+        let seed = write_kickstart(&path, ks).unwrap();
+        assert_eq!(seed.contents, ks);
+
+        let image = std::fs::read(&path).unwrap();
+        assert_eq!(&image[0x8001..0x8006], b"CD001");
+        let label = &image[0x8000 + 40..0x8000 + 72];
+        assert_eq!(&label[..6], b"OEMDRV");
+        assert!(label[6..].iter().all(|&b| b == b' '));
+        // ...and nothing of the Ubuntu volume leaked into it.
+        assert!(!String::from_utf8_lossy(&image).contains("CIDATA"));
+
+        // One file, recorded as KS.CFG;1, which isofs shows as ks.cfg.
+        let root = &image[20 * SECTOR..21 * SECTOR];
+        let mut at = 0usize;
+        let mut names = Vec::new();
+        while at < root.len() && root[at] != 0 {
+            let len = root[at] as usize;
+            let record = &root[at..at + len];
+            let id_len = record[32] as usize;
+            names.push(String::from_utf8_lossy(&record[33..33 + id_len]).into_owned());
+            at += len;
+        }
+        assert_eq!(names.len(), 3, "'.', '..' and one file: {names:?}");
+        assert_eq!(names[2], "KS.CFG;1");
+        assert!(String::from_utf8_lossy(&image).contains("workstation-product-environment"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
     /// A user-data larger than the volume's file cap is a typed error rather
     /// than a corrupt image.
     #[test]
     fn an_oversized_file_is_refused() {
         let huge = vec![b'x'; MAX_FILE_BYTES + 1];
         assert!(matches!(
-            build_iso9660(&[("USER-DATA.;1", &huge)]),
+            build_iso9660(&[("USER-DATA.;1", &huge)], SEED_LABEL),
             Err(SeedError::TooLarge { .. })
         ));
         // Exactly at the cap is fine, and grows the image beyond the minimum.
         let big = vec![b'y'; MAX_FILE_BYTES];
-        let image = build_iso9660(&[("USER-DATA.;1", &big)]).unwrap();
+        let image = build_iso9660(&[("USER-DATA.;1", &big)], SEED_LABEL).unwrap();
         assert!(image.len() >= MIN_IMAGE_BYTES);
     }
 }

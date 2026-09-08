@@ -980,7 +980,7 @@ fn edit_vm_body(ui: &mut egui::Ui, state: &mut crate::app::EditVmState, actions:
                 (
                     EditVmSection::NetworkDisplay,
                     "Network & display",
-                    "Connectivity, resolution, 3D",
+                    "Connectivity, screen, 3D, sound",
                     theme::OK,
                 ),
                 (
@@ -1390,7 +1390,7 @@ fn edit_network_display(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
     edit_panel_heading(
         ui,
         "Network & display",
-        "Connect the guest and choose how its desktop is presented.",
+        "Connect the guest and choose how its desktop and its audio are presented.",
     );
 
     let tap_block = form.backend.tap_block();
@@ -1506,6 +1506,80 @@ fn edit_network_display(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
             ui,
             RichText::new(reason.short).color(theme::WARN).size(11.0),
         );
+    }
+
+    ui.add_space(12.0);
+    ui::form_row(
+        ui,
+        "SOUND",
+        "Gives the machine a sound card, so the guest can play audio out through this \
+         computer's speakers. Off by default: an existing machine keeps exactly the \
+         hardware it had.",
+        |ui, _| {
+            ui.checkbox(&mut form.sound, "Give this machine a sound card")
+                .on_hover_text(
+                    "A standard virtio sound card. The guest needs no drivers from us — \
+                     every current Linux desktop already has one.",
+                );
+        },
+    );
+    if form.sound {
+        // Only this engine's own backend is offered: `alsa` on a Windows engine
+        // (or `wasapi` on a Linux one) is not a degraded mode, it is a machine
+        // that refuses to start.
+        let sound_block = form.backend.sound_backend_block(form.sound_backend);
+        ui.add_space(6.0);
+        ui::form_row(
+            ui,
+            "PLAYS INTO",
+            "Which of this computer's audio systems the card plays into. Leave it on \
+             \"auto\" unless you have a reason: auto uses whatever the host has and never \
+             prevents a machine from starting.",
+            |ui, field_w| {
+                egui::ComboBox::from_id_salt("edit-sound-backend")
+                    .selected_text(form.sound_backend.to_string())
+                    .width(ui::combo_width(field_w))
+                    .show_ui(ui, |ui| {
+                        for choice in form.backend.sound_backends() {
+                            ui.selectable_value(
+                                &mut form.sound_backend,
+                                choice,
+                                choice.to_string(),
+                            )
+                            .on_hover_text(sound_backend_hint(choice));
+                        }
+                    });
+            },
+        );
+        if let Some(reason) = sound_block {
+            ui::form_note(
+                ui,
+                RichText::new(reason.short).color(theme::WARN).size(11.0),
+            );
+        }
+    }
+}
+
+/// One sentence per sound backend, for the hover in the picker.
+fn sound_backend_hint(backend: control_api::SoundBackend) -> &'static str {
+    use control_api::SoundBackend;
+    match backend {
+        SoundBackend::Auto => {
+            "Whatever this computer has, and silence if it has nothing. Never prevents a \
+             machine from starting."
+        }
+        SoundBackend::Null => {
+            "A card that plays into nothing. The guest still sees and uses a working sound \
+             device — useful for a machine that should stay quiet."
+        }
+        SoundBackend::Alsa => {
+            "Linux's own audio system, opened directly. Says so and stops if this computer \
+             has no ALSA."
+        }
+        SoundBackend::Wasapi => {
+            "Windows' own audio system, shared with everything else that is playing. Says \
+             so and stops if this computer has no playback device."
+        }
     }
 }
 
