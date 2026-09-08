@@ -82,6 +82,16 @@ const DISK_SIZE: &str = "24G";
 /// the hostname comes from the kickstart, which the CLI sets from the VM name.
 const LOGIN_PROMPT: &str = "login:";
 
+/// What the *installed* system's bootloader prints on the serial console.
+///
+/// Not `GNU GRUB`: that is what the installer ISO's own GRUB 2.14 says, and it
+/// is the obvious thing to assert — but the grub2 Fedora installs draws its
+/// serial menu with the shorter `GRUB version 2.12` header and never prints the
+/// GNU line at all. Asserting the wrong one failed a run whose install had
+/// worked perfectly, one line after the firmware had already been proved to
+/// load `\EFI\fedora\shimx64.efi`.
+const GRUB_BANNER: &str = "GRUB version";
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -574,7 +584,7 @@ fn fedora_installs_unattended_and_the_installed_system_boots() {
         &[
             "BdsDxe: starting Boot",
             "shimx64.efi",
-            "GNU GRUB",
+            GRUB_BANNER,
             "Fedora Linux",
             "serial-getty",
             LOGIN_PROMPT,
@@ -592,8 +602,9 @@ fn fedora_installs_unattended_and_the_installed_system_boots() {
         tail(&boot_log, 30)
     );
     assert!(
-        boot_log.contains("GNU GRUB"),
-        "the bootloader started but GRUB never printed its banner"
+        boot_log.contains(GRUB_BANNER),
+        "the bootloader started but GRUB never printed its banner:\n{}",
+        tail(&boot_log, 30)
     );
     assert!(
         boot_log.contains("Fedora Linux"),
