@@ -96,6 +96,15 @@ GRUB_TIMEOUT_STYLE=menu
 EOF
 grub2-mkconfig -o /etc/grub2-efi.cfg || grub2-mkconfig -o /boot/grub2/grub.cfg || true
 
+# Boot into the desktop. This line is not redundant with installing GNOME:
+# Anaconda decides the installed system's default systemd target from the
+# *display mode it ran in*, not from what was installed, so a `text` kickstart
+# links default.target at multi-user.target even with gdm installed and enabled.
+# Measured, not assumed — a first run of this profile installed the whole of
+# Workstation and then came up at `fedora login:` on tty1, with
+# `systemctl is-enabled gdm` reporting "enabled" the entire time.
+systemctl set-default graphical.target
+
 # Log in to GNOME without a password, so a boot test reaches a desktop rather
 # than a greeter it cannot type into. Same reason as the Debian Weston profile's
 # autologin drop-in.

@@ -764,6 +764,10 @@ mod tests {
             "autopart --type=btrfs",  // Fedora's own default layout
             "console=ttyS0,115200n8", // the installed system speaks too
             "serial-getty@ttyS0.service",
+            // Anaconda's text mode leaves default.target at multi-user even
+            // with GNOME installed and gdm enabled; without this line the
+            // install succeeds and the desktop never appears.
+            "systemctl set-default graphical.target",
             "AutomaticLogin=entangled",
         ] {
             assert!(text.contains(needle), "missing {needle}");
