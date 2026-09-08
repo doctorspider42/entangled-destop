@@ -84,6 +84,11 @@ pub struct BootSpec {
     /// [`PciInterruptMode::IntxOnly`] explicitly, because a Linux guest offered
     /// MSI-X will never choose INTx and the path would stop being tested.
     pub pci_interrupts: PciInterruptMode,
+    /// Attach a virtio-input gamepad (GAME-2104) with **no** host capture, so
+    /// the only thing that can move it is the driver's own injected events.
+    /// That is the point: the acceptance must not depend on whether the
+    /// machine running the tests has a controller plugged into it.
+    pub gamepad: bool,
     pub deadline: Duration,
 }
 
@@ -105,6 +110,7 @@ impl BootSpec {
             notify: QueueNotifyMode::from_env(),
             transport: VirtioTransport::default(),
             pci_interrupts: PciInterruptMode::default(),
+            gamepad: false,
             deadline: DEFAULT_DEADLINE,
         }
     }
@@ -173,6 +179,21 @@ impl BootSpec {
     /// [`Self::pci_interrupts`].
     pub fn with_pci_interrupts(mut self, interrupts: PciInterruptMode) -> Self {
         self.pci_interrupts = interrupts;
+        self
+    }
+
+    /// Attaches a gamepad and asks the guest to report what the kernel made of
+    /// it, then to echo the first `events` input events it receives
+    /// (GAME-2104). The driver injects those through
+    /// [`VmHandle::gamepad`] once the guest's `padinfo` line says its event
+    /// node is open.
+    pub fn with_gamepad_probe(mut self, events: usize) -> Self {
+        self.gamepad = true;
+        self.extra_cmdline = match self.extra_cmdline.trim() {
+            "" => format!("entangled.padprobe={events}"),
+            existing => format!("{existing} entangled.padprobe={events}"),
+        };
+        self.await_marker = Some("padprobe".into());
         self
     }
 
@@ -329,6 +350,10 @@ impl MachineLifecycle for TestMachine {
 /// console, and a way to say "I have seen enough".
 pub struct VmHandle {
     pub lifecycle: Arc<Lifecycle>,
+    /// The host end of the guest's gamepad, when [`BootSpec::gamepad`] asked
+    /// for one. Pushing into it is exactly what `entangled run`'s capture
+    /// thread does, minus the controller.
+    pub gamepad: Option<virtio_input::InputHandle>,
     capture: Capture,
     done: Arc<AtomicBool>,
 }
@@ -416,6 +441,13 @@ pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOu
             .map_err(|e| format!("cannot attach disk {}: {e}", disk.display()))?;
         devices.push(Box::new(device));
     }
+    // Last, as `entangled run` attaches it, so the guest sees the same machine.
+    let gamepad_sink = spec.gamepad.then(|| {
+        let device = virtio_input::InputDevice::gamepad();
+        let sink = device.handle();
+        devices.push(Box::new(device));
+        sink
+    });
 
     let mem = Arc::new(vm.memory().clone());
     let quiesce = Quiesce::new();
@@ -492,6 +524,7 @@ pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOu
             }));
             let handle = VmHandle {
                 lifecycle: Arc::clone(&lifecycle),
+                gamepad: gamepad_sink,
                 capture: capture.clone(),
                 done: Arc::clone(&done),
             };
