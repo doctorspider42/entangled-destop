@@ -51,7 +51,7 @@ What it can do today:
 |---|---|
 | Guests | Debian, Ubuntu Server, Ubuntu Desktop, Fedora Workstation — installed by the tool itself, unattended, from media it verified |
 | Boot | UEFI firmware with a persistent variable store, or a direct Linux kernel boot with no firmware at all |
-| Graphics | 2D scanout in a resizable window up to 1920×1080; 3D (OpenGL through VirGL) on a Linux host |
+| Graphics | 2D scanout in a resizable window; 1920×1080 is the size the project targets and tests. 3D (OpenGL through VirGL) on a Linux host |
 | Devices | virtio-blk, virtio-net, virtio-gpu, virtio-input (keyboard and absolute pointer), virtio-snd (playback), over virtio-mmio or virtio-pci with MSI-X |
 | Network | a host TAP interface (Linux), or a user-mode NAT that needs no administrator and no host setup (both hosts) |
 | Lifecycle | pause and resume, reboot in place, suspend to a file and restore it in a new process |
@@ -316,6 +316,19 @@ The first boot takes a couple of minutes: cloud-init generates SSH host keys,
 and a machine with no network card waits out two systemd timeouts before the
 login prompt. Add `--headless` to keep it on the terminal instead of opening a
 window.
+
+**For a desktop rather than a server**, fetch the Desktop ISO and point the same
+command at it, with room to install into and enough memory for GNOME:
+
+```bash
+iso=$(bash scripts/fetch-ubuntu-iso.sh desktop)     # ~6 GiB, same trust chain
+entangled install ubuntu --iso "$iso" --disk ~/entangled-vms/desktop.raw \
+    --size 40G --memory-mib 4096 --auto --headless
+```
+
+An explicit `--memory-mib` carries through to the installed machine's profile,
+which matters here: a desktop sized at 4096 for the install must not boot into
+the 2048 MiB default afterwards.
 
 ## Quickstart: Fedora Workstation
 
@@ -727,4 +740,6 @@ configuration:
 | `entangled run --headless <profile>` | copied from the same tests |
 | `bash guest/firmware/build-cloudhv.sh`, `scripts/fetch-ubuntu-iso.sh`, `scripts/fetch-fedora-iso.sh` | the scripts' own documented invocations; the firmware and the Ubuntu ISO were both present and used on the machine this guide was written on |
 | `entangled fetch debian …`, `install debian …` | from the CLI's help output and the Debian install path's documentation; not re-run for this guide |
+| `entangled install ubuntu --iso <desktop iso> …` | the server command with the flags the CLI documents; the Desktop variant is what `tests/boot/tests/desktop_gnome.rs` boots, but this exact line was not re-run for the guide |
 | `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All` | the standard Windows spelling of the feature this project requires; the feature is enabled on the development host |
+| the manager's views | rendered while writing this guide with `cargo run -p entangled-manager -- --mock --screenshot <png> --screenshot-view main\|wizard\|diagnostics`, and described from the pictures and the source |

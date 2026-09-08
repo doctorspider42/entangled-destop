@@ -26,7 +26,7 @@ sources by a script in this repository.
 | Guests | Debian, Ubuntu Server, Ubuntu Desktop, Fedora Workstation — installed unattended from verified media |
 | Hosts | Linux with `/dev/kvm`; Windows with the Windows Hypervisor Platform, natively (not inside WSL) |
 | Boot | UEFI with a persistent variable store, or a direct Linux kernel boot with no firmware |
-| Graphics | 2D scanout in a resizable window up to 1920×1080; OpenGL through VirGL on a Linux host |
+| Graphics | 2D scanout in a resizable window (1920×1080 is the tested target); OpenGL through VirGL on a Linux host |
 | Devices | virtio-blk, -net, -gpu, -input, -snd over virtio-mmio or virtio-pci with MSI-X |
 | Network | a host TAP interface (Linux), or a user-mode NAT needing no administrator (both hosts) |
 | Lifecycle | pause and resume, reboot in place, suspend to a file and restore it later |
