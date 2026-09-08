@@ -164,7 +164,8 @@ fn main() {
     if let Some(spec) = param(&cmdline, "entangled.netprobe=") {
         net_probe(&spec);
     }
-    if let Some(count) = param(&cmdline, "entangled.padprobe=").and_then(|v| v.parse::<usize>().ok())
+    if let Some(count) =
+        param(&cmdline, "entangled.padprobe=").and_then(|v| v.parse::<usize>().ok())
     {
         mount("devtmpfs", "/dev", "devtmpfs");
         pad_probe(count.min(MAX_PAD_EVENTS));
@@ -174,7 +175,8 @@ fn main() {
         acpi_power_off();
     }
 
-    if let Some(period) = param(&cmdline, "entangled.heartbeat=").and_then(|v| v.parse::<u64>().ok())
+    if let Some(period) =
+        param(&cmdline, "entangled.heartbeat=").and_then(|v| v.parse::<u64>().ok())
     {
         heartbeat(period);
     }
@@ -500,9 +502,9 @@ fn trim_probe(mib: u64) {
     let limits = discard_limits();
 
     match fitrim_route(bytes) {
-        Ok(trimmed) => println!(
-            "VMHOST_TEST_OK trim path=fitrim filled={bytes} trimmed={trimmed} {limits}"
-        ),
+        Ok(trimmed) => {
+            println!("VMHOST_TEST_OK trim path=fitrim filled={bytes} trimmed={trimmed} {limits}")
+        }
         // The device refused the trim, or the filesystem could not run it. The
         // filesystem is intact and must stay that way: falling back to a raw
         // BLKDISCARD here would write straight over it, and a later boot of the
@@ -635,8 +637,8 @@ fn fitrim_route(bytes: u64) -> Result<u64, TrimFailure> {
     // extents are visible to the FITRIM walk.
     unsafe { libc::sync() };
 
-    let dir = std::fs::File::open("/mnt")
-        .map_err(|e| TrimFailure::Refused(format!("open-mnt:{e}")))?;
+    let dir =
+        std::fs::File::open("/mnt").map_err(|e| TrimFailure::Refused(format!("open-mnt:{e}")))?;
     // struct fstrim_range { __u64 start; __u64 len; __u64 minlen; }
     let mut range: [u64; 3] = [0, u64::MAX, 0];
     // SAFETY: `dir` is a live directory fd on the mounted filesystem and
@@ -1062,11 +1064,7 @@ fn pci_scan() {
         // for a modern virtio function must be `virtio-pci`.
         let driver = std::fs::read_link(dir.join("driver"))
             .ok()
-            .and_then(|target| {
-                target
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-            })
+            .and_then(|target| target.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_default();
         if is_virtio && !driver.is_empty() {
             bound += 1;
