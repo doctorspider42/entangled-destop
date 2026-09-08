@@ -741,15 +741,8 @@ has Venus compiled in but whose Vulkan ICD nobody should be rendering against.
 
 ### Next agent starts here
 
-1. **`machine-x86`: back the window.** Allocate a 64-bit prefetchable BAR 2 for
-   a virtio-pci function whose device declares an `ShmRegion` (and a
-   guest-physical range on mmio), map host memory into it (KVM memory slot /
-   `WHvMapGpaRange`), publish it in the DSDT `_CRS`, teach the BAR-rebase path
-   about a second moving window, and call `set_shm_base`. Then append
-   `pci::shm_capability_records(&pci::place_shm_regions(...))` to
-   `build_config_space`'s capability loop — one line, deliberately left
-   uncalled. Until this exists, `RESOURCE_MAP_BLOB` cannot succeed anywhere,
-   which is the single thing blocking a host-visible Venus allocation.
+1. ~~**`machine-x86`: back the window.**~~ Done, 2026-09-09 — see the phase-2
+   amendment below.
 2. **A real Venus renderer (VEN-2003).** Build virglrenderer ≥ 1.0 with
    `-Dvenus=true` on a host where `apt` is available, then fill in
    `VirglRenderer::map_blob` with `virgl_renderer_resource_map` against the
@@ -770,6 +763,238 @@ has Venus compiled in but whose Vulkan ICD nobody should be rendering against.
    when a renderer declares them, and none does on this host — but when step 2
    lands, the manager wants a "3D: Venus / VirGL / none" line rather than a
    boolean.
+
+## Amendment (2026-09-09): EPIC 20 phase 2 — the shared-memory window is real
+
+Phase 1 built everything about a shared-memory region except the part that
+needs host memory: a device could declare an `ShmRegion`, both transports could
+answer for one, and `virtio_gpu::blob` could validate a mapping inside one — but
+nothing allocated or mapped the window, so `RESOURCE_MAP_BLOB` could not succeed
+anywhere and the region was never published to a guest at all. This amendment
+records what filling that in cost, and the two decisions inside it that were
+measured rather than reasoned about.
+
+### Where the window goes, and why that is not a matter of taste
+
+Four things are already above 4 GiB or bound it from below, and a fifth is
+chosen by the firmware:
+
+| what | where | why it constrains us |
+|---|---|---|
+| the 32-bit MMIO hole | `0xc000_0000..0x1_0000_0000` | PCI BARs, virtio-mmio slots, LAPIC, IOAPIC |
+| the pflash window | `0xffc0_0000..0x1_0000_0000` | ADR-0003; the UEFI variable store |
+| **high RAM** | `0x1_0000_0000 ..` **and it grows** | a guest bigger than 3 GiB gets its remainder at 4 GiB, so *any fixed constant above 4 GiB is a constant that works until someone boots a bigger VM* |
+| `Pci64Base` | chosen by EDK2 | `PciBusDxe` reassigns **every** BAR during enumeration, and a 64-bit prefetchable one lands in the firmware's own 64-bit aperture |
+
+The third row is the trap a sibling agent paid for in `fix/uefi-high-ram`, and
+the fourth is the one that decides the answer. So the fourth was measured rather
+than assumed. `tests/boot/tests/uefi_highmem.rs` on this project's pinned
+CloudHv build, 4096 MiB guest:
+
+```text
+PlatformGetFirstNonAddressCB: FirstNonAddress=0x140000000
+AddressWidthInitialization: Pci64Base=0x140000000 Pci64Size=0x3FFEC0000000
+PlatformAddHobCB: HighMemory [0x100000000, 0x140000000)
+```
+
+`Pci64Base` is **exactly** the top of RAM — no page of slack, whatever the
+vm-testing skill's prose said — and the aperture runs from there to 2^46, the
+guest's physical address width.
+
+Decision: **our aperture is the firmware's.** `layout::pci_mmio64_base(mem)`
+returns the same number EDK2 computes — `TOP_OF_32BIT + (mem - MMIO_HOLE_START)`
+for a guest above the hole, `TOP_OF_32BIT` for one below it — and the aperture
+is 4 GiB long from there. The host's initial BAR assignment, the firmware's
+reassignment and the DSDT `_CRS` then all describe one range, and a BAR that
+moves during enumeration moves *inside* something the host already decodes.
+
+The alternative, a fixed high address, was rejected for a concrete reason
+rather than a stylistic one: EDK2 allocates from `Pci64Base` upwards, and
+`Pci64Base` follows RAM, so the firmware would move the BAR straight back out
+of any fixed window we picked. Arithmetic, for the two sizes the tests cover:
+
+* 2048 MiB — no high RAM at all, top of address space 4 GiB, window at
+  `0x1_0000_0000`, aperture to `0x2_0000_0000`;
+* 4096 MiB — high RAM `0x1_0000_0000..0x1_4000_0000`, window at
+  `0x1_4000_0000`, aperture to `0x2_4000_0000`;
+* 65536 MiB (the config maximum) — window at `0x10_4000_0000`, aperture ending
+  at `0x11_4000_0000`, comfortably inside 2^46.
+
+BARs are allocated out of the aperture by a bump allocator rather than from a
+slot table (`layout::Mmio64Allocator`), because a memory BAR must be aligned to
+*its own* size and a window's size is the device's business. A 3073 MiB guest —
+top of RAM at 4 GiB + 1 MiB, page aligned and nothing else — is the case a slot
+table gets wrong, and it has a test.
+
+### Prefetchable is not decoration
+
+The BAR is 64-bit **and prefetchable**, and both halves are load-bearing at a
+different layer:
+
+* EDK2's `PciBusDxe` puts a *non*-prefetchable 64-bit BAR in the **32-bit**
+  aperture whenever it fits there. For a 256 MiB window it does not fit, and
+  enumeration fails;
+* Linux' `pci_find_parent_resource` refuses to claim a prefetchable BAR inside
+  a host-bridge window that is not itself prefetchable — it skips the window and
+  reassigns or gives up. So the DSDT's `QWordMemory` producer descriptor carries
+  caching type 3 (cacheable prefetchable), not the plain read/write the 32-bit
+  `DWordMemory` window uses.
+
+Neither of those is visible in a unit test, and both are the difference between
+a guest with a `resource2` and a guest without one.
+
+### Who owns the pages, and how they are freed
+
+`vmm_core::shm::HostShmRegion` owns one anonymous host allocation through
+`vm_memory::MmapRegion` — `mmap` on Linux, `VirtualAlloc` on Windows — so there
+is no new `unsafe` in the allocation and no second guest-memory type.
+`SharedWindow` pairs it with the hypervisor mapping and owns both: it holds at
+most one live placement, moving means unmap-then-map, and `Drop` unmaps
+**before** the pages are released. The reverse order would leave a hypervisor
+slot pointing at memory this process had returned to the allocator, which is the
+worst bug this module could have.
+
+The hypervisor half is a four-line trait, `GpaMapper`, so `machine-x86` never
+names a `kvm_bindings` or `WHV_*` type (ADR-0002):
+
+| | KVM | WHP |
+|---|---|---|
+| map | `KVM_SET_USER_MEMORY_REGION` on a slot reserved for the life of the VM | `WHvMapGpaRange` |
+| move | the same call on the same slot number, which replaces it | `WHvUnmapGpaRange` then `WHvMapGpaRange` |
+| unmap | the same call with `memory_size = 0` | `WHvUnmapGpaRange` |
+| execute | **no per-slot control** — the guest's own page tables decide, as for guest RAM | `Read \| Write`, so an instruction fetch faults |
+
+The last row is a real asymmetry and is recorded where it is true rather than
+in a note somewhere else. It is not a security difference that matters — the
+pages are the guest's own writable memory either way — but a reader comparing
+the two backends deserves to be told.
+
+`vmm_core::shm::UnmappedGpaMapper` is the third implementation: real host pages,
+no guest behind them. It is what makes the whole placement path unit-testable on
+a machine with no hypervisor, which is why `crates/machine-x86/tests/shm_bus.rs`
+runs on both hosts in a second rather than only where `/dev/kvm` exists.
+
+### The guest chooses the address, so the machine gets a veto
+
+A BAR is guest-writable. A guest can therefore point a 256 MiB prefetchable
+window at its own page tables, at the LAPIC, at the pflash window or at another
+device — and KVM and WHP would both map it there if asked. So every placement
+goes through `machine_x86::shm::ShmWindow::follow`, which maps only inside the
+aperture published in the DSDT and otherwise leaves the window **unmapped**.
+Because the aperture starts at the top of RAM, one containment test rules out
+every collision that matters at once.
+
+"Decodes nothing" always means *unmap*, never "leave it and lose something".
+That is the difference from `crate::notify`'s ioeventfd sweep, which this one
+otherwise copies: a stale ioeventfd costs a kick, a stale memory mapping is host
+pages sitting at an address the guest has since given to something else. The
+sweep therefore runs on **both** hosts, unlike the ioeventfd one, and a machine
+reset takes every window down (ADR-0005).
+
+### What the device does with it
+
+`virtio_core::ShmBacking` is the device's whole view: `len`, `read`, `write`,
+`fill`, every offset bounded in `u64`, no pointers and no hypervisor. It arrives
+through `VirtioDevice::set_shm_backing`, defaulted to a no-op, and is scoped to
+one region's span inside the BAR rather than to the BAR — so a second region can
+never be reached through the first one's offsets.
+
+Two rules follow, and both are fuzzed:
+
+* **a span handed to a guest is zeroed.** `BlobTable::reserve_mapping` clears
+  before it returns, so it is a property of the table rather than of one caller.
+  The pages were last some other blob's, and a guest must not find them;
+* **and only that span.** Clearing past either end would wipe a neighbouring
+  mapping's bytes under a guest that is using them.
+
+The loopback Venus renderer writes a 32-byte signature at the mapping offset —
+magic, resource id, size, `blob_id`. A real Venus renderer will map its own
+`VkDeviceMemory` there instead (`Renderer3d::set_host_visible` is the seam), and
+until one exists the signature is what makes "the guest reads what the host
+wrote" provable on a machine whose only Vulkan ICD is lavapipe. An **isolated**
+renderer (GPU-012) takes the default no-op: an `Arc` does not cross a pipe, the
+helper never sees the window, and the device's own clear-on-map is what keeps
+that case honest.
+
+### The evidence
+
+`tests/boot/tests/pci_shm.rs`, KVM, bootstrap kernel, no virtio-gpu driver
+interface involved — the probe goes through sysfs:
+
+```text
+VMHOST_TEST_OK shmprobe device=0000:00:01.0 driver=virtio-pci bar=0x100000000
+  size=268435456 prefetch=1 sixtyfour=1 wrote=20 magic=HOST-WROTE-THIS-FIRST
+```
+
+Both directions, and neither rests on the host's own bookkeeping: the host
+stamps a marker into the window before the vCPUs start, the guest `mmap`s
+`/sys/bus/pci/devices/0000:00:01.0/resource2` and reads it back, writes a reply
+one page in, and the test reads that reply out of the host pages after the guest
+has stopped. In between, a real Linux kernel found a BAR nothing told it about
+and claimed it inside the DSDT's prefetchable 64-bit window.
+
+`echo 1 > enable` is the step that matters and is easy to miss: it is
+`pci_enable_device`, it sets the memory-space bit, and *that* is what makes the
+host map the window. `EBUSY` there means the bound driver already did it, which
+is better evidence than success.
+
+Two boots, one number apart — 2048 MiB and 4096 MiB — which is the regression
+test for the high-RAM trap above.
+
+### Suspend and restore (ADR-0006)
+
+A host-visible mapping cannot survive a restore, and the format already had the
+hook for saying so: `TransportSaveState::shm_bases` was written in phase 1 with
+the note "empty on every VM today, because nothing in `machine-x86` has an
+address to hand out yet". It is not empty any more, on either transport — on PCI
+the driver derives the address from the BAR and never reads that field, so it is
+recorded purely for the file — and `virtio_core::StateError::ShmBase` is
+therefore a live refusal rather than dead code.
+
+The order at restore is the whole trick: configuration space first (which puts
+the BAR back), then `reconcile_shm` (which puts the host pages back at that
+address), then the transports' own `load`, which compares. A machine that would
+place the window somewhere else — a different memory size, above all, since the
+aperture follows RAM — refuses by name instead of restoring a guest whose blob
+mappings point at nothing. A window the guest had unmapped when the snapshot was
+taken records nothing at all, so it does not insist on an address the guest was
+not using.
+
+Blob *resources* are unchanged and still counted rather than described: a guest
+that had one open when it was suspended is told `DEVICE_NEEDS_RESET`, the same
+signal a crashed renderer produces.
+
+### What Venus still lacks
+
+Exactly one thing now, and it is the same one as before: **a renderer**. The
+window it was missing exists, is mapped, is bounded and is provable from inside
+a guest. Nothing on either host decodes a Vulkan command stream.
+
+### Next agent starts here
+
+1. **A real Venus renderer (VEN-2003).** Build virglrenderer ≥ 1.0 with
+   `-Dvenus=true` on a host where `apt` is available, then fill in
+   `VirglRenderer::map_blob` with `virgl_renderer_resource_map` and
+   `Renderer3d::set_host_visible` with the window it should map into, and add
+   `VIRGL_RENDERER_VENUS` (very likely with `USE_EXTERNAL_BLOB`) to the init
+   flags. The typed-context and create-blob FFI halves are already written and
+   behind the runtime probe; the window is now waiting for them.
+2. **Per-blob host mappings.** This phase maps the *whole* window as one
+   hypervisor slot and lets the device write into it. A real Venus renderer
+   wants the opposite: `virgl_renderer_resource_map` hands back a host pointer
+   per blob, and the VMM maps *that* at the guest-named offset — one slot per
+   live mapping, torn down on unmap. `GpaMapper` takes a `&HostShmRegion` today
+   and would grow a sub-range form; `HostVisibleWindow` already tracks exactly
+   the spans that would need one. Nothing above the seam changes.
+3. **Guest acceptance (VEN-2006)** is meaningful after 1, and only on a host
+   with a real Vulkan device. `vulkaninfo` inside the guest is the first
+   milestone, `vkcube` the second.
+4. **Zero-copy scanout (VEN-2005/GPU phase 3)** is still where the frame rate
+   is: GAME-2105 measured the readback at 13 ms of a 20 ms frame. Unrelated to
+   this window, and unblocked by nothing in it.
+5. The GUI's capability gate (`Backend::virgl_block`) still knows nothing about
+   any of this, and still should not until step 1 lands — blob resources are
+   offered only when a renderer declares them, and none does on this host.
 
 ## Amendment (2026-09-08): GAME-2105 — why a guest sits at 30 fps, and what it cost
 

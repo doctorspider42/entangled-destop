@@ -875,6 +875,12 @@ impl VirtioPciBus {
             Ok(mut root) => root.load_state(config)?,
             Err(_) => return Err(crate::state::StateError::Poisoned("the PCI root bus")),
         }
+        // Then the shared-memory windows, **before** the transports load: the
+        // restored BAR says where the guest last had the window, this puts the
+        // host pages back there, and the transport's own load is what then
+        // compares that address against the one in the file (ADR-0006). Doing
+        // it the other way round would make every restore refuse.
+        self.reconcile_shm();
         for (index, (slot, saved)) in self.slots.iter().zip(saved).enumerate() {
             let mut transport = slot
                 .transport
@@ -1104,6 +1110,25 @@ impl VirtioPciBus {
                 }
             };
             shm.follow(window.map(|(base, _)| base));
+            // Tell the transport where each region ended up, so a snapshot
+            // records it (ADR-0006). On this transport the *driver* never reads
+            // that number — it derives the address from the BAR — so this is
+            // bookkeeping for the file and nothing else: a restore compares the
+            // recorded base against the new machine's and refuses a window that
+            // moved, because the guest's blob mappings point at the old one.
+            let Ok(mut transport) = slot.transport.lock() else {
+                tracing::error!(
+                    slot = index,
+                    "virtio-pci transport lock is poisoned; not recording the window placement"
+                );
+                continue;
+            };
+            for placement in shm.placements() {
+                match shm.region_base(placement.id) {
+                    Some(at) => transport.set_shm_base(placement.id, at),
+                    None => transport.clear_shm_base(placement.id),
+                }
+            }
         }
     }
 

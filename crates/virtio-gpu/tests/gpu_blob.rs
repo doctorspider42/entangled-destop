@@ -29,8 +29,8 @@ use virtio_gpu::protocol::{
 };
 use virtio_gpu::renderer::Renderer3d;
 use virtio_gpu::{
-    GpuDevice, NullRenderer, CAPSET_VENUS, MAX_BLOB_BYTES, VIRTIO_GPU_F_CONTEXT_INIT,
-    VIRTIO_GPU_F_RESOURCE_BLOB, VIRTIO_GPU_F_VIRGL,
+    GpuDevice, NullRenderer, CAPSET_VENUS, LOOPBACK_MAGIC, LOOPBACK_SIGNATURE_LEN, MAX_BLOB_BYTES,
+    VIRTIO_GPU_F_CONTEXT_INIT, VIRTIO_GPU_F_RESOURCE_BLOB, VIRTIO_GPU_F_VIRGL,
 };
 use vm_memory::{Bytes, GuestAddress};
 
@@ -277,6 +277,89 @@ struct Harness {
     transport: MmioTransport,
     display: DisplayHandle,
     features: u64,
+    /// The host pages behind the shared-memory window, when this harness
+    /// backed one (VEN-2001 phase 2). Held so a test can look at the same
+    /// bytes the guest would map.
+    backing: Option<Arc<TestBacking>>,
+}
+
+/// Host memory behind the window, the shape `machine_x86::shm` supplies but
+/// with no hypervisor in it — this is a device test, not a machine test.
+///
+/// Every access is bounded in `u64` before it becomes an index, which is the
+/// same discipline the real one keeps, and the reason a test double is safe to
+/// use as the thing under test's counterparty.
+struct TestBacking {
+    bytes: std::sync::Mutex<Vec<u8>>,
+}
+
+impl TestBacking {
+    fn new(len: u64) -> Arc<Self> {
+        Arc::new(Self {
+            bytes: std::sync::Mutex::new(vec![0u8; len as usize]),
+        })
+    }
+
+    fn range(total: usize, offset: u64, len: u64) -> Option<(usize, usize)> {
+        let end = offset.checked_add(len)?;
+        if end > total as u64 {
+            return None;
+        }
+        Some((usize::try_from(offset).ok()?, usize::try_from(end).ok()?))
+    }
+
+    /// Scribbles over the whole window, so "the device cleared this span" is a
+    /// statement about memory rather than about bookkeeping.
+    fn poison(&self, byte: u8) {
+        self.bytes.lock().unwrap().fill(byte);
+    }
+
+    fn peek(&self, offset: u64, len: usize) -> Vec<u8> {
+        let bytes = self.bytes.lock().unwrap();
+        let (start, end) = Self::range(bytes.len(), offset, len as u64).expect("in bounds");
+        bytes[start..end].to_vec()
+    }
+}
+
+impl virtio_core::ShmBacking for TestBacking {
+    fn len(&self) -> u64 {
+        self.bytes.lock().unwrap().len() as u64
+    }
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), virtio_core::ShmAccessError> {
+        let bytes = self.bytes.lock().unwrap();
+        let (start, end) = Self::range(bytes.len(), offset, buf.len() as u64).ok_or(
+            virtio_core::ShmAccessError {
+                offset,
+                len: buf.len() as u64,
+                window: bytes.len() as u64,
+            },
+        )?;
+        buf.copy_from_slice(&bytes[start..end]);
+        Ok(())
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), virtio_core::ShmAccessError> {
+        let mut bytes = self.bytes.lock().unwrap();
+        let total = bytes.len();
+        let (start, end) =
+            Self::range(total, offset, data.len() as u64).ok_or(virtio_core::ShmAccessError {
+                offset,
+                len: data.len() as u64,
+                window: total as u64,
+            })?;
+        bytes[start..end].copy_from_slice(data);
+        Ok(())
+    }
+    fn fill(&self, offset: u64, len: u64, byte: u8) -> Result<(), virtio_core::ShmAccessError> {
+        let mut bytes = self.bytes.lock().unwrap();
+        let total = bytes.len();
+        let (start, end) = Self::range(total, offset, len).ok_or(virtio_core::ShmAccessError {
+            offset,
+            len,
+            window: total as u64,
+        })?;
+        bytes[start..end].fill(byte);
+        Ok(())
+    }
 }
 
 impl Harness {
@@ -290,9 +373,46 @@ impl Harness {
         Self::with_renderer(width, height, Box::new(NullRenderer::new()))
     }
 
+    /// The Venus loopback with **host memory behind its window**, which is
+    /// what a machine that can back the region gives it (VEN-2001 phase 2).
+    fn venus_backed(width: u32, height: u32) -> Self {
+        Self::build(
+            width,
+            height,
+            Box::new(NullRenderer::with_venus()),
+            Some(TestBacking::new(WINDOW)),
+        )
+    }
+
     fn with_renderer(width: u32, height: u32, renderer: Box<dyn Renderer3d>) -> Self {
+        Self::build(width, height, renderer, None)
+    }
+
+    fn build(
+        width: u32,
+        height: u32,
+        renderer: Box<dyn Renderer3d>,
+        backing: Option<Arc<TestBacking>>,
+    ) -> Self {
+        use virtio_core::VirtioDevice as _;
         let display = DisplayHandle::detached(width, height).expect("detached display");
-        let device = GpuDevice::with_renderer(display.clone(), renderer);
+        let mut device = GpuDevice::with_renderer(display.clone(), renderer);
+        if let Some(backing) = &backing {
+            // Exactly what `machine_x86::shm::back_regions` does once it has
+            // allocated the pages, and at the same point in the device's life:
+            // before it is attached to a transport.
+            assert_eq!(
+                device.shm_regions(),
+                vec![virtio_core::ShmRegion {
+                    id: virtio_gpu::VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
+                    len: WINDOW
+                }],
+                "the device must declare the region the machine is about to back"
+            );
+            device.set_shm_backing(virtio_gpu::VIRTIO_GPU_SHM_ID_HOST_VISIBLE, backing.clone());
+            assert!(device.shm_backing().is_some(), "the backing was refused");
+        }
+        let device = device;
         let mem = Arc::new(guest_memory(MEM_SIZE));
         let irq = Arc::new(TestIrqLine::default());
         let transport = MmioTransport::new(0, Box::new(device), Arc::clone(&mem), irq)
@@ -304,9 +424,15 @@ impl Harness {
             transport,
             display,
             features: 0,
+            backing,
         };
         harness.bring_up();
         harness
+    }
+
+    /// The window's host pages, for a harness that backed one.
+    fn backing(&self) -> &Arc<TestBacking> {
+        self.backing.as_ref().expect("this harness backed a window")
     }
 
     fn read32(&mut self, offset: u64) -> u32 {
@@ -988,4 +1114,153 @@ fn host3d_guest_blobs_work_and_a_reset_drops_them_all() {
     )));
     assert_eq!(h.run(&map_blob(80, 0)).kind(), resp::OK_MAP_INFO);
     assert!(!h.needs_reset());
+}
+
+// ================================================ the window, with real pages
+
+/// The whole point of phase 2, at the device's own seam: a `RESOURCE_MAP_BLOB`
+/// against a backed window reaches host memory, and the guest can see what the
+/// host put there.
+///
+/// The loopback renderer writes its signature at the mapping offset — a real
+/// Venus renderer would map a `VkDeviceMemory` there instead — so a guest that
+/// mapped this blob and read the first 32 bytes of its span would read exactly
+/// these bytes out of the shared-memory region.
+#[test]
+fn a_mapped_blob_reaches_host_memory_the_guest_can_read() {
+    let mut h = Harness::venus_backed(64, 64);
+    let offset = 8 * BLOB_PAGE_SIZE;
+    let pages = 4;
+    assert_ok(&h.run(&host_blob(9, pages)));
+    let response = h.run(&map_blob(9, offset));
+    assert_eq!(response.kind(), virtio_gpu::resp::OK_MAP_INFO);
+
+    let signature = h.backing().peek(offset, LOOPBACK_SIGNATURE_LEN as usize);
+    assert_eq!(
+        signature,
+        virtio_gpu::loopback_signature(9, 9u64 << 32, pages * BLOB_PAGE_SIZE).to_vec(),
+        "the renderer's bytes are not in the window at the offset the guest named"
+    );
+    assert_eq!(
+        &signature[..LOOPBACK_MAGIC.len()],
+        &LOOPBACK_MAGIC[..],
+        "and they start with the magic a guest probe looks for"
+    );
+
+    // Unmapping takes them away again: the next blob at this offset is a
+    // different resource and must not inherit the marker.
+    assert_ok(&h.run(&unmap_blob(9)));
+    assert!(
+        h.backing()
+            .peek(offset, LOOPBACK_SIGNATURE_LEN as usize)
+            .iter()
+            .all(|b| *b == 0),
+        "the loopback signature outlived its mapping"
+    );
+}
+
+/// A guest must never be handed a span with the previous tenant's bytes in it.
+///
+/// The span is poisoned from the host side between the two mappings, which is
+/// the strongest form of the test: it does not matter whether the first blob
+/// wrote anything, only that whatever is there is gone.
+#[test]
+fn a_mapped_span_is_cleared_before_the_guest_can_read_it() {
+    let mut h = Harness::venus_backed(64, 64);
+    let offset = 2 * BLOB_PAGE_SIZE;
+    let pages = 3;
+
+    assert_ok(&h.run(&host_blob(1, pages)));
+    assert_eq!(
+        h.run(&map_blob(1, offset)).kind(),
+        virtio_gpu::resp::OK_MAP_INFO
+    );
+    // Whatever the first tenant left behind — here, the worst case.
+    h.backing().poison(0xde);
+    assert_ok(&h.run(&unmap_blob(1)));
+    assert_ok(&h.run(&resource_unref(1)));
+
+    // A different resource takes the same span.
+    assert_ok(&h.run(&host_blob(2, pages)));
+    assert_eq!(
+        h.run(&map_blob(2, offset)).kind(),
+        virtio_gpu::resp::OK_MAP_INFO
+    );
+
+    let span = h.backing().peek(
+        offset + LOOPBACK_SIGNATURE_LEN,
+        (pages * BLOB_PAGE_SIZE - LOOPBACK_SIGNATURE_LEN) as usize,
+    );
+    assert!(
+        span.iter().all(|b| *b == 0),
+        "the new mapping can see {} poisoned bytes of the old one",
+        span.iter().filter(|b| **b != 0).count()
+    );
+    // …and only the span: the poison outside it is the host's business, not a
+    // leak, and clearing more than was asked for would be its own bug.
+    assert_eq!(
+        h.backing().peek(offset + pages * BLOB_PAGE_SIZE, 8),
+        vec![0xde; 8],
+        "the device cleared past the end of the mapping"
+    );
+    assert_eq!(
+        h.backing().peek(offset - 8, 8),
+        vec![0xde; 8],
+        "the device cleared before the start of the mapping"
+    );
+}
+
+/// A mapping that would leave the window is refused before any host memory is
+/// touched — the sharpest guest-controlled value in the epic, checked against
+/// the pages rather than against the bookkeeping.
+#[test]
+fn a_mapping_that_would_escape_the_window_touches_nothing() {
+    let mut h = Harness::venus_backed(64, 64);
+    let pages = 2;
+    assert_ok(&h.run(&host_blob(5, pages)));
+    h.backing().poison(0x77);
+
+    for offset in [
+        WINDOW,                    // exactly at the end
+        WINDOW - BLOB_PAGE_SIZE,   // one page short of what it needs
+        WINDOW + BLOB_PAGE_SIZE,   // past it
+        u64::MAX - BLOB_PAGE_SIZE, // wraps when the size is added
+        u64::MAX,
+        BLOB_PAGE_SIZE / 2, // not page aligned
+    ] {
+        let response = h.run(&map_blob(5, offset));
+        assert_ne!(
+            response.kind(),
+            virtio_gpu::resp::OK_MAP_INFO,
+            "a map at {offset:#x} of a {WINDOW}-byte window was accepted"
+        );
+    }
+    // Not one byte of the window changed.
+    assert_eq!(h.backing().peek(0, 64), vec![0x77; 64]);
+    assert_eq!(
+        h.backing().peek(WINDOW - 64, 64),
+        vec![0x77; 64],
+        "the last page of the window was written by a refused mapping"
+    );
+
+    // And a legitimate mapping still works afterwards.
+    assert_eq!(h.run(&map_blob(5, 0)).kind(), virtio_gpu::resp::OK_MAP_INFO);
+}
+
+/// A device whose window the machine could not back behaves exactly as it did
+/// in phase 1: the bookkeeping still works, and nothing reaches host memory
+/// because there is none.
+#[test]
+fn an_unbacked_window_still_maps_but_has_no_pages() {
+    let mut h = Harness::venus(64, 64);
+    assert!(
+        h.backing.is_none(),
+        "this harness must not have backed a window"
+    );
+    assert_ok(&h.run(&host_blob(3, 1)));
+    assert_eq!(
+        h.run(&map_blob(3, 0)).kind(),
+        virtio_gpu::resp::OK_MAP_INFO,
+        "the reservation is bookkeeping and works with or without pages"
+    );
 }

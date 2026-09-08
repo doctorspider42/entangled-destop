@@ -2073,15 +2073,6 @@ impl<S: ScanoutSink> GpuDevice<S> {
         let size = self
             .blobs_mut(kind)?
             .reserve_mapping(cmd.resource_id, cmd.offset)?;
-        // The span is the guest's to read the instant the mapping exists, and
-        // the host pages behind it were last used by some other blob — or by
-        // nothing, in which case they hold whatever the allocator handed out.
-        // Clear them before anyone can look (VEN-2001 phase 2). A window with
-        // no host memory behind it is a no-op here, which is exactly phase 1.
-        if let Err(error) = self.blobs.window().clear_span(cmd.offset, size) {
-            self.blobs.unreserve(cmd.resource_id, cmd.offset);
-            return Err(error);
-        }
         let mapping = match self
             .three_d
             .as_mut()

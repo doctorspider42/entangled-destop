@@ -591,6 +591,16 @@ impl BlobTable {
         }
         let size = blob.size;
         self.window.reserve(id, offset, size)?;
+        // The span is the guest's to read the moment the mapping exists, and
+        // the host pages behind it were last some other blob's. Clearing is
+        // therefore part of reserving, not something a caller may forget: a
+        // `reserve_mapping` that returned `Ok` has handed out a zeroed span.
+        // A window with no host memory behind it is a no-op here, which is
+        // exactly what phase 1 did.
+        if let Err(error) = self.window.clear_span(offset, size) {
+            self.window.release(id, offset);
+            return Err(error);
+        }
         Ok(size)
     }
 

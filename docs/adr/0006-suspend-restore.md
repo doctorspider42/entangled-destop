@@ -98,7 +98,7 @@ other way, it says what a suspend has to write down:
 | Device | Saved | Restored |
 |---|---|---|
 | `virtio_core::TransportState` | features (offered *and* negotiated) and their selectors, status, activation, per-queue geometry, `SHM_SEL`, `config_generation`, the ISR | features re-acknowledged, queues rebuilt through the same `build` the guest's own `DRIVER_OK` goes through, then the device re-activated |
-| shared-memory placement (VEN-2001) | where the **host** put each region, by `shmid` | *not* restored — the new machine places its own window. Recorded only so that a machine which placed it somewhere else is a named refusal, because the guest read that base out of the registers and its blob mappings point at it |
+| shared-memory placement (VEN-2001) | where the **host** put each region, by `shmid`, on both transports since phase 2 (on PCI the driver derives the address from BAR 2 and never reads this field — it is recorded purely for the file) | *not* restored — the new machine allocates its own host pages and maps them where the restored BAR says, in that order, and the transport's own `load` then compares. A machine that would place the window elsewhere, which for this window means a machine with a different memory size, is a named refusal: the guest's blob mappings point at the old address. A window the guest had unmapped when the snapshot was taken records nothing, so it does not insist on an address nobody was using |
 | virtqueue positions | the device's `next_avail`/`next_used` | applied to the rebuilt queues **before** the device sees them |
 | MSI-X | message control, the table, the PBA, config and per-queue vectors | all of it; nothing pending is delivered — the guest unmasking a vector is what sends it |
 | PCI configuration space | all 64 dwords of every function, plus the latched `CONFIG_ADDRESS` | written back and everything derived from it re-published (the INTx flag, the mirrored MSI-X control), then the queue-notify ioeventfds re-based around the restored BARs |
@@ -221,7 +221,7 @@ host that lost power, and handed over by someone else. So:
 | section digest mismatch | a torn memory section reads as plausible pages |
 | unknown section kind | state the guest expects and would silently not get |
 | a **section version** that is not this build's | a section whose *shape* changed. Venus phase 1 bumped `virtio` to 2 (`SHM_SEL` and the host's region placement) and the virtio-gpu blob to 2 (the scanout's source became three-way, blob resources joined the table); a version-1 snapshot has neither, and defaulting them would restore a guest whose driver had selected a region into one that had not. The message names the section and both versions |
-| a shared-memory region the host placed elsewhere | the guest's blob mappings point at the address it read from the registers |
+| a shared-memory region the host placed elsewhere | the guest's blob mappings point at the address it read from the registers. Live since VEN-2001 phase 2 (2026-09-09): the aperture starts at the top of RAM, so a restore into a differently sized guest moves the window and this is what catches it |
 | trailing bytes in a section | written by a build that put more in it |
 | a count or length that cannot fit | nothing is ever allocated on an unchecked number |
 | vCPU count, memory size, transport, boot mode, device list/order | a guest whose `/dev/vda` is now somebody else's disk |

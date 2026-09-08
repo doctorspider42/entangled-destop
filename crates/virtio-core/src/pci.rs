@@ -651,6 +651,13 @@ impl PciTransport {
         self.state.set_shm_base(id, base);
     }
 
+    /// Forgets a placement (see [`TransportState::clear_shm_base`]).
+    ///
+    /// [`TransportState`]: crate::state::TransportState
+    pub fn clear_shm_base(&mut self, id: u8) {
+        self.state.clear_shm_base(id);
+    }
+
     /// Runs the device for queue `value`. The single entry point for kicks,
     /// whichever way they arrive (register write or ioeventfd worker).
     pub fn queue_notify(&mut self, value: u32) {
