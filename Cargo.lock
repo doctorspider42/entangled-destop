@@ -404,6 +404,7 @@ dependencies = [
  "virtio-core",
  "virtio-gpu",
  "virtio-input",
+ "vm-memory 0.17.2",
  "vmm-core",
 ]
 

@@ -208,6 +208,31 @@ mod tests {
         assert_eq!(map[1].addr, layout::EBDA_START);
     }
 
+    /// The PVH hand-off block (ADR-0003) has to survive the firmware's entire
+    /// PEI and DXE — `InstallCloudHvTables()` re-reads `rsdp_paddr` out of it
+    /// after PCI enumeration — so it lives in the reserved BIOS window with the
+    /// ACPI tables, not in the usable low-RAM entry that starts at zero. Every
+    /// guest size, since the low half of the map is size-independent but the
+    /// entry list is not.
+    #[test]
+    fn the_pvh_handoff_block_is_reserved_not_ram() {
+        let block = layout::PVH_HANDOFF_START..layout::PVH_HANDOFF_START + layout::PVH_HANDOFF_SIZE;
+        assert!(block.start >= layout::EBDA_START);
+        assert!(block.end <= layout::ACPI_TABLES_START);
+        for mib in [128u64, 512, 2048, 3072, 4096, 65536] {
+            let map = e820_map(mib << 20);
+            let covering = map
+                .iter()
+                .find(|e| e.addr <= block.start && block.end <= e.addr + e.size)
+                .unwrap_or_else(|| panic!("{mib} MiB: no E820 entry covers the hand-off block"));
+            assert_eq!(
+                covering.kind,
+                E820Type::Reserved,
+                "{mib} MiB: the hand-off block must not be usable memory"
+            );
+        }
+    }
+
     /// The ACPI tables must be described as ACPI-reclaimable, not as RAM: on
     /// the reclaimable type Linux keeps the range out of memblock entirely.
     #[test]

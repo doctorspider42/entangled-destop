@@ -219,7 +219,10 @@ mod tests {
     }
 
     /// The PVH boot data must not land where the firmware itself is loaded
-    /// (CloudHv's PT_LOAD starts at 1 MiB) nor on the MP table.
+    /// (CloudHv's PT_LOAD starts at 1 MiB) nor on the MP table or the ACPI
+    /// tables — and, since the structures have to survive all of PEI and DXE
+    /// (`InstallCloudHvTables()` re-reads `rsdp_paddr` after PCI enumeration),
+    /// it must not land anywhere the memory map calls usable RAM either.
     #[test]
     fn boot_data_is_clear_of_the_firmware_and_mptable() {
         for addr in [
@@ -230,7 +233,37 @@ mod tests {
             assert!(addr >= 0x1000, "must not clobber the real-mode IVT/BDA");
             assert!(addr < layout::HIGH_RAM_START, "must stay in low RAM");
             assert!(addr < layout::MPTABLE_START);
-            assert!(addr < layout::EBDA_START);
+            assert!(
+                addr >= layout::EBDA_START,
+                "{addr:#x} is inside the usable low-RAM E820 entry"
+            );
+            assert!(
+                addr + 0x1000 <= layout::ACPI_TABLES_START,
+                "{addr:#x} runs into the ACPI tables"
+            );
+        }
+    }
+
+    /// Every byte of the hand-off block is described as reserved — not usable
+    /// RAM — in the map we hand the firmware, for every guest size. This is the
+    /// invariant whose absence turns a stray low-memory write into a `#GP` in
+    /// `AcpiPlatformDxe` half a boot later.
+    #[test]
+    fn the_handoff_block_is_never_usable_ram() {
+        let block = layout::PVH_HANDOFF_START..layout::PVH_HANDOFF_START + layout::PVH_HANDOFF_SIZE;
+        for mib in [128u64, 512, 2048, 3072, 4096, 8192, 65536] {
+            for e in memmap_for(mib << 20) {
+                if e.kind != XEN_HVM_MEMMAP_TYPE_RAM {
+                    continue;
+                }
+                let ram = e.addr..e.addr + e.size;
+                assert!(
+                    ram.end <= block.start || ram.start >= block.end,
+                    "{mib} MiB: usable RAM {:#x}..{:#x} covers the PVH hand-off block",
+                    ram.start,
+                    ram.end
+                );
+            }
         }
     }
 }

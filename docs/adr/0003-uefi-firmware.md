@@ -167,6 +167,59 @@ Plus `hvm_start_info` (version 1, magic `0x336ec578`) in guest RAM, with a
 `hvm_memmap_table_entry` array describing RAM as
 `XEN_HVM_MEMMAP_TYPE_RAM (1)`.
 
+#### The hand-off block must outlive DXE, so it is never usable RAM
+
+Amendment, 2026-09-08. The hand-off structures are not a boot-time hand-off in
+the sense the direct-Linux `boot_params` is: **EDK2 never copies them.** The
+reset vector stashes the `%ebx` pointer in one dword of its own MEMFD
+(`PcdXenPvhStartOfDayStructPtr`), and `InstallCloudHvTables()` follows that
+pointer *at the end of DXE*, after `PciBusDxe` has enumerated the bus, to read
+`hvm_start_info.rsdp_paddr` and walk our XSDT. Between PVH entry and that read
+sits the whole of PEI and DXE.
+
+So the block has to be as durable as the ACPI tables themselves, and it now
+lives next to them: `layout::PVH_HANDOFF_START = 0xd0000`, three pages —
+start info, memmap, cmdline — inside the reserved BIOS window, immediately
+below `ACPI_TABLES_START`. That window is `E820Type::Reserved` end to end, and
+EDK2 additionally publishes `0xa0000..0xfffff` as MMIO rather than system
+memory (`PlatformAddIoMemoryRangeHob`), so no DXE allocation can be handed a
+page of it.
+
+They used to sit at `0x1000..0x4000`, which is inside the *usable* low-RAM
+E820 entry that starts at zero — host structures advertised to the guest as
+free memory. Nothing in the firmware is obliged to leave them alone there, and
+the failure mode is spectacularly unhelpful: a corrupted `rsdp_paddr` is
+usually non-canonical, so the dereference raises **`#GP`, not a page fault**,
+and the boot ends with
+
+```
+!!!! X64 Exception Type - 0D(#GP - General Protection)  CPU Apic ID - 00000000 !!!!
+!!!! Find image based on IP(…) …/AcpiPlatformDxe/…/QemuFwCfgAcpiPlatform.dll !!!!
+```
+
+immediately after `OnRootBridgesConnected: … installing ACPI tables`, with no
+hint that memory was ever touched. That exact log was reported once against a
+4096 MiB guest. It was *not* reproducible — 25 boots of the reported profile
+pass, and a 3072 MiB guest has byte-identical low memory anyway
+(`3072 MiB == LOW_RAM_END`), so the split cannot be what selects it; the one
+distinguishing line in the failing log is `MpInitLib: Find 1 processors`, the
+load flake the vm-testing skill already documents. The move is therefore
+hardening against a class rather than a proven single cause, and the
+assertions that keep it honest are
+`uefi_boot::pvh::tests::the_handoff_block_is_never_usable_ram` (no memory map,
+at any guest size, calls those pages RAM) and the two boot tests below.
+
+#### Guests above the high-RAM split
+
+`tests/boot/tests/uefi_highmem.rs` and `crates/vmm-core/tests/whp_highmem.rs`
+boot the firmware with 4096 MiB — two guest-memory regions, RAM continuing at
+4 GiB — because every other UEFI boot test builds a 2048 MiB guest and so
+never exercises the shape the desktop profiles actually use. They assert that
+the firmware sees `PlatformAddHobCB: HighMemory [0x100000000, …)`, that its
+64-bit PCI aperture starts one page past the end of RAM rather than on top of
+it, that the ACPI tables install with no CPU exception, and that the PVH
+hand-off block is byte-for-byte intact when the run ends.
+
 ### For the reset-vector entry (phase 1, implemented)
 
 KVM's post-`KVM_CREATE_VCPU` vCPU state *is* the architectural reset state:
