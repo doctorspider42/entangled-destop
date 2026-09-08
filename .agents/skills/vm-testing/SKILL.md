@@ -107,7 +107,12 @@ unit tests live with their crates.
   **It needs the bootstrap kernel**: `CONFIG_INPUT_JOYDEV` is a separate symbol
   from `CONFIG_INPUT_EVDEV` and is a module in the Debian-installer kernel, so
   on the fallback the pad has no `js*` for a reason that is nothing to do with
-  the device. The test self-skips there.
+  the device. The test self-skips there — and for the harder case, a
+  `artifacts/bootstrap/vmlinuz` built *before* that option was added, the probe
+  reports `joydev=` (is the handler registered at all, from
+  `/proc/bus/input/handlers`) and the test skips only the `js*` assertions,
+  saying so. A guest probe that can distinguish "the device was refused" from
+  "the kernel cannot answer" is worth the four extra lines every time.
 - Sources: `guest/test-rootfs/init-rs` (static musl init), built by
   `scripts/build-test-initramfs.sh`; kernel via `scripts/fetch-test-kernel.sh`.
 

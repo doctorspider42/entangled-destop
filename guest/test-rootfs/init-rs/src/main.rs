@@ -796,10 +796,23 @@ fn pad_probe(count: usize) {
     let js_open = js_node
         .as_ref()
         .is_some_and(|js| std::fs::File::open(format!("/dev/input/{js}")).is_ok());
+    // Whether the *kernel* has a `joydev` handler at all, which is a different
+    // question from whether it bound to this device. `CONFIG_INPUT_JOYDEV` is a
+    // separate symbol from `CONFIG_INPUT_EVDEV` and is a module in a stock
+    // distribution kernel, so `js=0` on a kernel without it says nothing about
+    // the descriptor — and a host test that could not tell the two apart would
+    // report the wrong bug, loudly, at whoever changed the device last.
+    let joydev_present = std::fs::read_to_string("/proc/bus/input/handlers")
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            line.split_ascii_whitespace()
+                .any(|field| field == "Name=joydev")
+        });
     println!(
         "VMHOST_TEST_OK padinfo name={} bus={:04x} vendor={:04x} product={:04x} \
-version={:04x} node={} js={} jsnode={} jsopen={} handlers={} keys={} axes={} \
-absx={} absz={} abshat={}",
+version={:04x} node={} js={} jsnode={} jsopen={} joydev={} handlers={} keys={} \
+axes={} absx={} absz={} abshat={}",
         device.name.replace(' ', "_"),
         device.bus,
         device.vendor,
@@ -809,6 +822,7 @@ absx={} absz={} abshat={}",
         u8::from(js_node.is_some()),
         js_node.as_deref().unwrap_or("none"),
         u8::from(js_open),
+        u8::from(joydev_present),
         device.handlers.join(","),
         device.key_count,
         device.abs_count,
