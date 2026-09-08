@@ -190,7 +190,15 @@ than pinned.
 
 - Unlike the Ubuntu install, the Fedora one is **online**: a netinst downloads
   ~2 GiB of RPMs, so `--network none` is refused and the wall-clock time is the
-  mirror's, not the VMM's.
+  mirror's, not the VMM's. That difference has a sharp edge: `--network`
+  defaults to a host **TAP** on Linux, which is state somebody has to create as
+  root (`scripts/setup-tap.sh`). The Ubuntu install never meets it because its
+  installer VM has no network at all; the Fedora one dies half a second in with
+  `cannot attach to TAP interface entangled0: Operation not permitted`. On this
+  machine the command is therefore
+  `entangled install fedora --auto --network usernet` — user-mode NAT inside the
+  process, no host setup — and `install_fedora` now appends that advice to the
+  failure rather than leaving the bare errno.
 - Fedora's default layout roots on **btrfs**, so `find_uefi_install` returns no
   `root_uuid` — that is expected, not a failure. The ESP and the NVRAM
   `Boot####` entry are what make the disk bootable.
@@ -199,3 +207,49 @@ than pinned.
   sector 16) and decompress with `xz -dc` (netinst) or python `zstandard`
   (Live). That is how the "no anaconda module in the Live initramfs" fact above
   was established rather than guessed.
+- **Anaconda decides the installed system's default systemd target from the
+  display mode it ran in, not from what it installed.** A `text` kickstart
+  leaves `default.target -> multi-user.target` even with the whole of
+  `@^workstation-product-environment` on the disk and `gdm` enabled, so the
+  machine boots to `fedora login:` on tty1 and *nothing is ever drawn on
+  virtio-gpu*. On the serial console that is indistinguishable from success.
+  The kickstart's `%post` therefore ends with `systemctl set-default
+  graphical.target`; `/root/entangled-post.log` inside the guest records the
+  symlink being replaced, and `systemctl get-default` is how to check it after
+  the fact. This cost one whole 22-minute install to discover.
+- GDM **autologin does work** from the kickstart's `/etc/gdm/custom.conf` edit
+  (`loginctl list-sessions` shows `entangled` on `seat0`/`tty2`), but it is not
+  instantaneous: on a cold host page cache the greeter is still what is on the
+  scanout at 200 s, and the session has taken over by ~210 s on a warm one. A
+  screenshot-based assertion has to accept either — which is why
+  `fedora_install`'s threshold is "more than a text console" (200 distinct
+  colours) rather than "a wallpaper".
+
+### Measured on this machine (Fedora 44, KVM in WSL2, 2D scanout, llvmpipe)
+
+| What | Number |
+|---|---|
+| `entangled install fedora --auto --network usernet`, netinst 44-1.7, ~1900 packages | **25 min** (1502 s), ~6.3 GiB written |
+| Live ISO via `--cdrom` to a GNOME desktop | ~4 min |
+| Installed system: `<hostname> login:` on ttyS0 | 66 s warm, 169 s cold |
+| Installed system: GNOME session drawn | ~210 s |
+| Distinct colours at 1280x800: text console / GDM greeter / GNOME session | 2-4 / 865 / 40 675 |
+
+Two string traps in that boot, both of which have failed a run whose install was
+perfect:
+
+- the installed system's bootloader prints **`GRUB version 2.12`**, not
+  `GNU GRUB`. The `GNU GRUB` banner belongs to the *installer ISO's* GRUB 2.14;
+  the grub2 Fedora installs draws its serial menu with the short header and
+  never prints the GNU line;
+- the login prompt carries the *VM name*, because the CLI passes it to the
+  kickstart as the hostname — `e2e-fedora login:`, not `fedora login:`.
+
+One trap when collecting that evidence: **`--screenshot-after N` does not write
+once.** It writes at N seconds and then refreshes *the same path* every 20 s
+until the VM stops (`run_vm::SCREENSHOT_REFRESH`), so the file left behind after
+a run is whatever was on screen last — usually the shutdown console, two colours
+and no desktop. Copy the PNG the moment it appears, or stop the VM right after
+it does; the tests do the latter, and they now wait for a PNG that ends in
+`IEND` rather than for the path to exist, because the poll can otherwise catch a
+half-written frame.

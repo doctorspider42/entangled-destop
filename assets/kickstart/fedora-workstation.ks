@@ -102,12 +102,20 @@ grub2-mkconfig -o /etc/grub2-efi.cfg || grub2-mkconfig -o /boot/grub2/grub.cfg |
 # links default.target at multi-user.target even with gdm installed and enabled.
 # Measured, not assumed — a first run of this profile installed the whole of
 # Workstation and then came up at `fedora login:` on tty1, with
-# `systemctl is-enabled gdm` reporting "enabled" the entire time.
+# `systemctl is-enabled gdm` reporting "enabled" the entire time. With this line
+# the same disk boots to GDM and then to the session; `systemctl get-default`
+# says graphical.target, and /root/entangled-post.log below records the symlink
+# being replaced.
 systemctl set-default graphical.target
 
 # Log in to GNOME without a password, so a boot test reaches a desktop rather
 # than a greeter it cannot type into. Same reason as the Debian Weston profile's
 # autologin drop-in.
+# This works — `loginctl list-sessions` in the installed system shows
+# `entangled` on seat0/tty2 with nothing typed — but it is not instant: GDM's
+# greeter is what is on the scanout for the first few minutes of a cold boot,
+# and the session takes over at around 210 s on this machine. A test that
+# screenshots the installed system has to accept either.
 # GKeyFile refuses a file with two [daemon] groups, so the keys go *into* the
 # section Fedora already ships rather than after it.
 mkdir -p /etc/gdm
