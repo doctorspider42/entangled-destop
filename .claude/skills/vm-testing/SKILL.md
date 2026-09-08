@@ -491,6 +491,8 @@ full and the fuzz build is large.
 | `gpu_blob` | the blob-resource surface (VEN-2001/2007): the three wire parsers on raw bytes including the `nr_entries` walk, then arbitrary create/map/unmap/unref against `BlobTable` with the renderer's declared support itself fuzzed. Asserts the invariants, not just absence of panic — the byte budget equals the sum of live blobs, the window holds exactly the mappings the harness believes in, every mapping is inside the window, and **no two mappings overlap**, re-derived from outside after every operation |
 | `snd_control` | the virtio-snd parsers and bounds on raw bytes: `QueryInfo`/`ItemHdr`/`RawSetParams` round trips, `stream::validate_params`, `validate_xfer` and the lifecycle. Asserts that an *accepted* SET_PARAMS is inside every advertised set and every named bound, and that a refusal is `BAD_MSG` or `NOT_SUPP` and never `OK`/`IO_ERR` |
 | `snd_device` | a brought-up `SoundDevice` with a live pump thread behind a real `MmioTransport`, fed descriptor chains of arbitrary shape (any lengths, any addresses, readable/writable in any order, indirect flags) on all four queues, interleaved with resets. Asserts no panic, no `DEVICE_NEEDS_RESET` from guest input, and no used entry claiming more bytes than the guest offered |
+| `gpu_remote_protocol` | the isolated-renderer wire format, both directions, with an exact re-encode check |
+| `snapshot_parse` | the whole snapshot parser (ADR-0006): the container's header and index, every section decoder against raw bytes, **and** arbitrary bytes spliced into a well-formed container so the decoders are reached *through* the digest checks rather than around them |
 
 Rules that keep the targets useful:
 
@@ -503,9 +505,53 @@ Rules that keep the targets useful:
   the regression test.
 - Assert invariants, not just absence of panics: an accepted value must satisfy
   what the caller downstream relies on (the payload cap, the sector range, the
-  status-bit set). Both findings so far came from such an assertion, not from a
-  crash.
+  status-bit set). Every finding so far came from such an assertion, not from a
+  crash. The strongest one is **exact re-encode**: anything a decoder accepts
+  must encode back to the bytes it came from. `snapshot_parse` found a real bug
+  with it in under five minutes — an absent `Option` could carry a non-zero
+  payload, so `(false, 7)` and `(false, 0)` both decoded to `None` and the
+  format had two spellings for one state.
+- Seeding a parser's corpus from a **real artifact** beats writing one by hand.
+  `fuzz/corpus/snapshot_parse/` is every section of an actual VM's snapshot,
+  extracted by reading the container's index; the memory section is kept as a
+  64 KiB prefix so the corpus stays small.
 - Not part of default CI: a scheduled, time-boxed job.
+
+## Suspend and restore (ADR-0006)
+
+The heartbeat probe pays for itself twice. For a pause its *absence* is the
+measurement; for a suspend its **continuation** is:
+
+```text
+run:     VMHOST_HEARTBEAT 8      <- suspend here
+resume:  VMHOST_HEARTBEAT 9      <- and no second VMHOST_GUEST_READY
+```
+
+A counter that carries on with the next number cannot be faked by a machine
+that merely booted, and a restored vCPU whose registers, MSRs or local APIC came
+back approximately right does not carry on counting — it faults, or it goes
+quiet. `suspend_restore.rs` asserts the exact successor, the whole sequence
+being consecutive, and zero ready markers in the resumed process.
+
+**Test the refusals from real bytes.** One suspend, then the file corrupted six
+ways in memory and offered back to `entangled resume`: wrong magic, truncated,
+wrong format version, an unknown header flag, the other hypervisor's host code,
+and a flipped bit in the middle of the memory section. Each must fail with a
+message that says which. Plus the one that protects a filesystem: the same VM
+resumed onto its *unchanged* disk (which must work — the check is about change,
+not about having a disk) and then onto one that grew.
+
+Three things that cost time to learn:
+
+- **The GPU can keep working while the guest is dead to the world.** The first
+  restored guest drew frames and never printed a line: on KVM the IOAPIC is in
+  the kernel, the restore had not carried it, every pin came back masked — and
+  MSI-X bypasses the IOAPIC entirely. If a resumed guest looks half-alive, ask
+  which interrupt path still works.
+- **Count heartbeats, not just their presence.** "A heartbeat appeared" is
+  satisfied by a guest that rebooted and started at 0.
+- **The two hosts do not lose the same state.** A device inventory is not enough;
+  check what the *hypervisor* owns on each host as well.
 
 ## Invariants every test run enforces
 
@@ -527,6 +573,8 @@ through host bookkeeping:
 | `tests/boot/tests/lifecycle.rs` | KVM | pause / resume / host reset / guest reboot |
 | `crates/vmm-core/tests/whp_lifecycle.rs` | WHP | the same four, natively |
 | `apps/entangled/tests/guest_reboot.rs` | either | an installed Ubuntu reboots itself through its firmware, twice (`--ignored`) |
+| `apps/entangled/tests/suspend_restore.rs` | either | suspend/resume, and every refusal (ADR-0006) |
+| `apps/entangled/tests/guest_suspend.rs` | either | an installed Ubuntu is the same session after a suspend (`--ignored`) |
 
 **Measuring a pause needs the guest to be noisy.** The test guest gained
 `entangled.heartbeat=<ms>`: it prints `VMHOST_HEARTBEAT <n>` for ever and never

@@ -116,6 +116,56 @@ impl PicChip {
         }
     }
 
+    fn save_state(&self) -> crate::state::SavedPicChip {
+        crate::state::SavedPicChip {
+            imr: self.imr,
+            irr: self.irr,
+            isr: self.isr,
+            vector_base: self.vector_base,
+            cascade: self.cascade,
+            icw4: self.icw4,
+            step: match self.step {
+                InitStep::Idle => 0,
+                InitStep::Icw2 => 1,
+                InitStep::Icw3 => 2,
+                InitStep::Icw4 => 3,
+            },
+            expect_icw4: self.expect_icw4,
+            expect_icw3: self.expect_icw3,
+            read_isr: self.read_isr,
+            elcr: self.elcr,
+        }
+    }
+
+    fn load_state(
+        &mut self,
+        state: &crate::state::SavedPicChip,
+    ) -> Result<(), crate::state::StateError> {
+        self.step = match state.step {
+            0 => InitStep::Idle,
+            1 => InitStep::Icw2,
+            2 => InitStep::Icw3,
+            3 => InitStep::Icw4,
+            other => {
+                return Err(crate::state::StateError::BadValue {
+                    what: "8259 initialisation step",
+                    value: u64::from(other),
+                })
+            }
+        };
+        self.imr = state.imr;
+        self.irr = state.irr;
+        self.isr = state.isr;
+        self.vector_base = state.vector_base;
+        self.cascade = state.cascade;
+        self.icw4 = state.icw4;
+        self.expect_icw4 = state.expect_icw4;
+        self.expect_icw3 = state.expect_icw3;
+        self.read_isr = state.read_isr;
+        self.elcr = state.elcr;
+        Ok(())
+    }
+
     /// Write to the command port (`0x20` / `0xa0`).
     fn write_command(&mut self, value: u8) {
         if value & ICW1_INIT != 0 {
@@ -216,6 +266,23 @@ impl Pic8259 {
     /// into a sequence interprets the first of those as data.
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// Both chips, for a snapshot (ADR-0006).
+    pub fn save_state(&self) -> crate::state::SavedPic {
+        crate::state::SavedPic {
+            master: self.master.save_state(),
+            slave: self.slave.save_state(),
+        }
+    }
+
+    /// Puts them back.
+    pub fn load_state(
+        &mut self,
+        state: &crate::state::SavedPic,
+    ) -> Result<(), crate::state::StateError> {
+        self.master.load_state(&state.master)?;
+        self.slave.load_state(&state.slave)
     }
 
     /// Whether any line is asserted on either chip. Always false — see the

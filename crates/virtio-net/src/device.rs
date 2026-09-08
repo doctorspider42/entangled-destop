@@ -210,6 +210,10 @@ pub struct NetDevice {
 
     // Set on activate(), cleared on reset().
     mem: Option<Arc<GuestMem>>,
+    /// A second handle on the queue the RX worker owns, kept only so a snapshot
+    /// can read the worker's position in it (ADR-0006). Never locked outside a
+    /// paused VM: the worker holds it whenever a frame is landing.
+    rx_queue: Option<Arc<Mutex<Queue>>>,
     tx_queue: Option<Queue>,
     interrupt: Option<Arc<dyn Interrupt>>,
     rx: Option<RxWorker>,
@@ -252,6 +256,7 @@ impl NetDevice {
             stats: Arc::new(NetStats::default()),
             tx_buf: vec![0u8; MAX_BUFFER_LEN],
             mem: None,
+            rx_queue: None,
             tx_queue: None,
             interrupt: None,
             rx: None,
@@ -809,10 +814,12 @@ impl VirtioDevice for NetDevice {
         };
 
         let stop = Arc::new(AtomicBool::new(false));
+        let rx_shared = Arc::new(Mutex::new(rx_queue));
+        self.rx_queue = Some(Arc::clone(&rx_shared));
         let context = RxContext {
             backend: Arc::clone(&self.backend),
             mem: Arc::clone(&resources.mem),
-            queue: Arc::new(Mutex::new(rx_queue)),
+            queue: rx_shared,
             interrupt: Arc::clone(&resources.interrupt),
             stats: Arc::clone(&self.stats),
             stop: Arc::clone(&stop),
@@ -866,10 +873,37 @@ impl VirtioDevice for NetDevice {
         }
     }
 
+    /// Both queues' positions, RX first (ADR-0006).
+    ///
+    /// The RX one is the worker's, read through the handle the device keeps
+    /// beside it. Safe here and only here: this is called with the VM paused
+    /// and the worker parked on the quiesce gate, so the lock is free and the
+    /// number is not moving.
+    ///
+    /// **What a restored virtio-net cannot bring back is the network itself.**
+    /// The user-mode NAT's flows live in host sockets that this process no
+    /// longer has, and a TAP interface is re-opened from scratch. So the device
+    /// comes back exactly as the guest left it — same MAC, same rings, same
+    /// negotiated features — and every connection through it is gone, which is
+    /// precisely what a laptop's own suspend does to them. The guest's TCP
+    /// stack notices in the ordinary way: a retransmit that is never answered.
+    fn queue_positions(&self) -> Vec<virtio_core::QueuePosition> {
+        use virtio_queue::QueueT as _;
+        let position = |queue: &Queue| virtio_core::QueuePosition {
+            next_avail: queue.next_avail(),
+            next_used: queue.next_used(),
+        };
+        match (&self.rx_queue, &self.tx_queue) {
+            (Some(rx), Some(tx)) => vec![position(&lock(rx)), position(tx)],
+            _ => Vec::new(),
+        }
+    }
+
     fn reset(&mut self) {
         // Order matters: stop the worker first so nothing touches the queues or
         // guest memory after they are dropped.
         self.stop_rx();
+        self.rx_queue = None;
         self.tx_queue = None;
         self.mem = None;
         self.interrupt = None;

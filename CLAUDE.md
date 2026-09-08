@@ -16,7 +16,12 @@ touching boot modes or firmware-facing platform devices),
 and reboot-in-place: the vCPU stop protocol, what "quiesced" means per device
 class, the guest reset matrix, and the gap list for suspend/restore — read
 before adding a device, a host thread that touches guest memory, or anything
-that ends a run).
+that ends a run),
+[docs/adr/0006-suspend-restore.md](docs/adr/0006-suspend-restore.md) (writing a
+running VM to a file and reading it back: the full CPU state per host, the
+save/load pair every device owes beside its `reset()`, the snapshot format and
+every refusal it makes — read before adding a device, or anything that holds
+state a resumed guest would notice missing).
 
 ## Build and test
 
@@ -62,7 +67,8 @@ kernel and initramfs artifacts, and self-skips without them.
 
 | Crate | Owns | Backlog |
 |---|---|---|
-| `crates/vmm-core` | Hypervisor backends (KVM, WHP), guest memory, vCPU lifecycle, VM state machine | EPIC 1/17 |
+| `crates/vmm-core` | Hypervisor backends (KVM, WHP), guest memory, vCPU lifecycle, VM state machine, the neutral whole-CPU state a snapshot carries | EPIC 1/17 |
+| `crates/vm-snapshot` | The snapshot container: versioned format, per-section digests, VM/disk fingerprints and every refusal a restore makes (ADR-0006) | — |
 | `crates/machine-x86` | x86-64 machine model: memory layout, E820, CPUID, GDT, ACPI/MP tables, PCI root bus, and the userspace 8259/8254/IOAPIC for hosts whose hypervisor has none | EPIC 1/2/17/19 |
 | `crates/linux-boot` | Direct bzImage+initramfs boot, boot_params, cmdline | EPIC 2 |
 | `crates/uefi-boot` | UEFI firmware boot: PVH entry, reset-vector ROM placement | EPIC 18 |
@@ -119,6 +125,12 @@ twin is updated and validated too.
 - **Every `unsafe` block carries a `// SAFETY:` comment** saying why the
   pointer is valid and which union arm is live (`undocumented_unsafe_blocks` is
   `deny`). FFI-ness alone is not a justification.
+- **A device owes the machine three things, not one.** A `reset()` back to
+  power-on (ADR-0005), a `Quiesce` gate before any thread of its own touches
+  guest memory (ADR-0005), and a `save`/`load` pair — `queue_positions` if it
+  holds queues, `save_device`/`load_device` if it holds anything else
+  (ADR-0006). A device that skips the first makes a reboot a haunting, the
+  second makes "paused" a lie, and the third makes a resumed guest subtly wrong.
 - **Devices are transport-agnostic.** Implement against `VirtioDevice` +
   queues, never against a transport's registers. Both virtio-mmio and virtio-pci
   exist (`transport = "mmio" | "pci"` per VM, default mmio); adding the second

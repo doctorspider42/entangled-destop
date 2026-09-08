@@ -410,6 +410,91 @@ impl Pit {
         state.next_edge_ticks = None;
     }
 
+    /// The three channels and the NMI/speaker byte, for a snapshot (ADR-0006).
+    ///
+    /// Every time in here is **relative to now**. A channel is armed at an
+    /// absolute host tick count taken from an `Instant` this process owns, and
+    /// the process that restores the snapshot has a different one — so what is
+    /// written down is how long ago each channel was armed and how long until
+    /// the next edge, and the restore anchors both to its own epoch. A guest
+    /// half-way through a 10 ms tick comes back half-way through it.
+    pub fn save_state(&self) -> crate::state::SavedPit {
+        let now = self.clock.ticks();
+        let Ok(state) = self.state.lock() else {
+            tracing::error!("PIT lock is poisoned; saving an un-programmed 8254");
+            return crate::state::SavedPit::default();
+        };
+        crate::state::SavedPit {
+            channels: state
+                .channels
+                .iter()
+                .map(|channel| crate::state::SavedPitChannel {
+                    reload: channel.reload,
+                    mode: channel.mode,
+                    access: match channel.access {
+                        AccessMode::LatchCount => 0,
+                        AccessMode::LoBoth => 1,
+                        AccessMode::HiBoth => 2,
+                        AccessMode::LoThenHi => 3,
+                    },
+                    ticks_since_armed: now.saturating_sub(channel.armed_at_ticks),
+                    armed: channel.armed,
+                    write_lo: channel.write_lo,
+                    latched: channel.latched,
+                    read_hi_next: channel.read_hi_next,
+                    gate: channel.gate,
+                })
+                .collect(),
+            nmi_control: state.nmi_control,
+            ticks_to_next_edge: state.next_edge_ticks.map(|due| due.saturating_sub(now)),
+        }
+    }
+
+    /// Puts it back, anchored to this process's clock.
+    pub fn load_state(
+        &self,
+        saved: &crate::state::SavedPit,
+    ) -> Result<(), crate::state::StateError> {
+        let now = self.clock.ticks();
+        let Ok(mut state) = self.state.lock() else {
+            return Err(crate::state::StateError::Poisoned("the 8254"));
+        };
+        if saved.channels.len() != state.channels.len() {
+            return Err(crate::state::StateError::Count {
+                what: "8254 channels",
+                snapshot: saved.channels.len(),
+                current: state.channels.len(),
+            });
+        }
+        for (channel, saved) in state.channels.iter_mut().zip(&saved.channels) {
+            channel.access = match saved.access {
+                0 => AccessMode::LatchCount,
+                1 => AccessMode::LoBoth,
+                2 => AccessMode::HiBoth,
+                3 => AccessMode::LoThenHi,
+                other => {
+                    return Err(crate::state::StateError::BadValue {
+                        what: "8254 access mode",
+                        value: u64::from(other),
+                    })
+                }
+            };
+            channel.reload = saved.reload;
+            channel.mode = saved.mode;
+            channel.armed_at_ticks = now.saturating_sub(saved.ticks_since_armed);
+            channel.armed = saved.armed;
+            channel.write_lo = saved.write_lo;
+            channel.latched = saved.latched;
+            channel.read_hi_next = saved.read_hi_next;
+            channel.gate = saved.gate;
+        }
+        state.nmi_control = saved.nmi_control;
+        state.next_edge_ticks = saved
+            .ticks_to_next_edge
+            .map(|remaining| now.saturating_add(remaining));
+        Ok(())
+    }
+
     /// Guest write. Never fails towards the guest.
     pub fn io_write(&self, port: u16, value: u8) {
         let now = self.clock.ticks();

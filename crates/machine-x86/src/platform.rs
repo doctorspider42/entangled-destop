@@ -83,6 +83,16 @@ impl PciConfigSpace {
         self.address = 0;
     }
 
+    /// The latched `CONFIG_ADDRESS` (ADR-0006).
+    pub fn address(&self) -> u32 {
+        self.address
+    }
+
+    /// Puts it back.
+    pub fn set_address(&mut self, address: u32) {
+        self.address = address;
+    }
+
     fn decode(&self) -> Option<ConfigTarget> {
         // Bit 31 enables the mechanism; bits 1:0 of the register field are
         // always zero (accesses are dword-aligned).
@@ -194,6 +204,23 @@ impl FirmwarePlatform {
     pub fn reset(&mut self) {
         self.pci.reset();
         self.rtc.reset();
+    }
+
+    /// Both devices' state (ADR-0006).
+    pub fn save_state(&self) -> crate::state::SavedPlatform {
+        crate::state::SavedPlatform {
+            config_address: self.pci.address(),
+            rtc: self.rtc.save_state(),
+        }
+    }
+
+    /// Puts it back.
+    pub fn load_state(
+        &mut self,
+        state: &crate::state::SavedPlatform,
+    ) -> Result<(), crate::state::StateError> {
+        self.pci.set_address(state.config_address);
+        self.rtc.load_state(&state.rtc)
     }
 
     /// Returns true when the read was handled.

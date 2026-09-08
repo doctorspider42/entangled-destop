@@ -475,6 +475,48 @@ impl ConfigSpace {
         }
     }
 
+    /// This function's register file, for a snapshot (ADR-0006).
+    ///
+    /// The whole file, not a list of the interesting registers — the same
+    /// reasoning `seal`/`reset` already follow. Every guest-writable dword has
+    /// to come back: the command register (or the restored guest finds memory
+    /// decoding off for a BAR it placed hours ago), the BAR addresses, the
+    /// MSI-X message control, the cache-line and latency scratch. Enumerating
+    /// them by hand is how one gets forgotten.
+    ///
+    /// The write mask, the capability list and the BAR *sizes* are not in it:
+    /// they are the function's shape, decided by the host that built it, and a
+    /// snapshot that could change them would let a file redefine the hardware.
+    pub fn save_state(&self) -> Vec<u32> {
+        self.regs.to_vec()
+    }
+
+    /// Puts the register file back and re-publishes everything derived from it.
+    ///
+    /// The re-publishing is the part that is easy to miss and impossible to
+    /// diagnose: the INTx-enable flag and the mirrored MSI-X control dword are
+    /// held by *other* objects (the interrupt line, the MSI-X capability), and
+    /// a config space restored without refreshing them is a function whose
+    /// registers say one thing and whose interrupts do another.
+    pub fn load_state(&mut self, regs: &[u32]) -> Result<(), crate::state::StateError> {
+        if regs.len() != self.regs.len() {
+            return Err(crate::state::StateError::Count {
+                what: "PCI configuration dwords",
+                snapshot: regs.len(),
+                current: self.regs.len(),
+            });
+        }
+        self.regs.copy_from_slice(regs);
+        self.intx_enabled.store(
+            self.command() & command::INTX_DISABLE == 0,
+            Ordering::Release,
+        );
+        for (register, handle) in &self.mirrors {
+            handle.store(self.regs[Self::index(*register)], Ordering::Release);
+        }
+        Ok(())
+    }
+
     // -------------------------------------------------------------- state
 
     /// The command register.
@@ -713,6 +755,53 @@ impl PciRoot {
         for function in &mut self.functions {
             function.config.reset();
         }
+    }
+
+    /// The bus, for a snapshot (ADR-0006): the latched configuration address
+    /// and every function's register file, host bridge included.
+    pub fn save_state(&self) -> crate::state::SavedPciRoot {
+        crate::state::SavedPciRoot {
+            address: self.address,
+            functions: self
+                .functions
+                .iter()
+                .map(|function| crate::state::SavedPciFunction {
+                    device: function.device,
+                    regs: function.config.save_state(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Puts it back.
+    ///
+    /// The function *list* is this machine's, built from its configuration; the
+    /// snapshot only supplies the register values. A snapshot with a different
+    /// number of functions, or with them at different device numbers, describes
+    /// a different bus — and a guest restored onto one would find its
+    /// `00:01.0` is now somebody else's device.
+    pub fn load_state(
+        &mut self,
+        state: &crate::state::SavedPciRoot,
+    ) -> Result<(), crate::state::StateError> {
+        if state.functions.len() != self.functions.len() {
+            return Err(crate::state::StateError::Count {
+                what: "PCI functions",
+                snapshot: state.functions.len(),
+                current: self.functions.len(),
+            });
+        }
+        for (function, saved) in self.functions.iter_mut().zip(&state.functions) {
+            if function.device != saved.device {
+                return Err(crate::state::StateError::BadValue {
+                    what: "PCI device number",
+                    value: u64::from(saved.device),
+                });
+            }
+            function.config.load_state(&saved.regs)?;
+        }
+        self.address = state.address;
+        Ok(())
     }
 
     /// True when `port` belongs to the legacy configuration mechanism.

@@ -830,7 +830,10 @@ impl Gpu3d {
         self.total_elements = 0;
     }
 
-    /// Live contexts (diagnostics).
+    /// Live contexts — a diagnostic, and the number a suspend records: a
+    /// context is a command-stream state machine inside the host GL driver and
+    /// nothing hands one back, so a snapshot can only say how many were lost
+    /// (ADR-0006).
     pub fn context_count(&self) -> usize {
         self.contexts.len()
     }

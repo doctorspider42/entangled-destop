@@ -20,6 +20,8 @@ control-api.workspace = true
 debian-media.workspace = true
 disk-image.workspace = true
 vmm-core.workspace = true
+# The snapshot container (ADR-0006): the format, the fingerprints, the refusals.
+vm-snapshot.workspace = true
 
 # The run path (run_vm.rs) is portable across the two hypervisor hosts; these
 # are its machine, device and presentation crates, every one of which builds
