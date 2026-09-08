@@ -640,3 +640,25 @@ waiting for. Seen on both hosts, always green when rerun alone
 the single test — and if you need a verdict under load, run the boot tests
 sequentially (`--test-threads=1`) rather than treating one red run as a
 regression.
+
+### Boot the shape the profiles use, not just the small one
+
+Until 2026-09-08 every UEFI boot test built a 2048 MiB guest, so the whole
+high-RAM split — two guest-memory regions, RAM continuing at 4 GiB, a 64-bit
+PCI aperture above the top of RAM — had no boot coverage at all, while the
+desktop profiles have asked for 4096 MiB since `examples/ubuntu-desktop-live.toml`
+was written. `tests/boot/tests/uefi_highmem.rs` and its WHP twin
+`crates/vmm-core/tests/whp_highmem.rs` close that: 4096 MiB, both regions
+mapped, `PlatformAddHobCB: HighMemory` in the log, `Pci64Base` one page past
+the end of RAM, ACPI installed, no `X64 Exception`, Boot Manager reached. 1.5 s
+on KVM, 2.8 s on WHP — a size, not a duration, so there is no excuse for the
+next machine-wide constant to be tested only at 2 GiB.
+
+They also compare the PVH hand-off block byte-for-byte across the run. That is
+the assertion that turns "the firmware took a `#GP` in `AcpiPlatformDxe`" into
+a sentence: EDK2 re-reads `hvm_start_info.rsdp_paddr` out of guest memory at
+the end of DXE, so a scribbled block surfaces half a boot later as a
+non-canonical dereference with no hint of what happened (ADR-0003).
+
+Note what they deliberately do **not** assert: the firmware's CPU count. That
+is the load flake above, and a regression test must not inherit it.

@@ -10,6 +10,8 @@ mod fetch;
 #[cfg(any(target_os = "linux", windows))]
 mod install;
 #[cfg(any(target_os = "linux", windows))]
+mod install_fedora;
+#[cfg(any(target_os = "linux", windows))]
 mod install_ubuntu;
 mod paths;
 #[cfg(any(target_os = "linux", windows))]
@@ -248,8 +250,9 @@ enum DiskCommand {
 
 #[derive(Args)]
 pub struct InstallArgs {
-    /// Distribution to install: "debian" (d-i, direct kernel boot) or "ubuntu"
-    /// (live-server ISO through UEFI, unattended autoinstall).
+    /// Distribution to install: "debian" (d-i, direct kernel boot), "ubuntu"
+    /// (live-server ISO through UEFI, unattended autoinstall) or "fedora"
+    /// (Everything netinst through UEFI, unattended kickstart).
     pub distro: String,
     /// Target RAW disk image; created if missing. Defaults to
     /// <vm dir>/<name>.raw, where the VM directory is the manager's
@@ -272,11 +275,17 @@ pub struct InstallArgs {
     /// (assets/autoinstall/ubuntu-server.yaml).
     #[arg(long, conflicts_with = "preseed")]
     pub autoinstall: Option<PathBuf>,
-    /// Installer ISO (Ubuntu only). Defaults to the newest release verified into
-    /// the cache by scripts/fetch-ubuntu-iso.sh.
+    /// Custom kickstart for Fedora: Anaconda's automation language. Placed on
+    /// the OEMDRV volume in place of the built-in profile
+    /// (assets/kickstart/fedora-workstation.ks).
+    #[arg(long, conflicts_with_all = ["preseed", "autoinstall"])]
+    pub kickstart: Option<PathBuf>,
+    /// Installer ISO (Ubuntu and Fedora). Defaults to the newest release
+    /// verified into the cache by scripts/fetch-ubuntu-iso.sh or
+    /// scripts/fetch-fedora-iso.sh.
     #[arg(long)]
     pub iso: Option<PathBuf>,
-    /// UEFI firmware image (Ubuntu only). Defaults to
+    /// UEFI firmware image (Ubuntu and Fedora). Defaults to
     /// artifacts/firmware/CLOUDHV.fd.
     #[arg(long)]
     pub firmware: Option<PathBuf>,

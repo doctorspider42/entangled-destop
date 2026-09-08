@@ -28,6 +28,13 @@
 //!   network is configured statically on the kernel command line — the host TAP
 //!   has no DHCP server. Afterwards the disk is inspected (MBR + ext4 UUID) and
 //!   a ready-to-run profile is written next to it (MVP-1008/1009).
+//! * **Fedora** boots the verified Everything netinst ISO through UEFI firmware,
+//!   automated with a **kickstart** on an ISO9660 volume labelled `OEMDRV` —
+//!   Anaconda's own convention — and named explicitly as
+//!   `inst.ks=hd:LABEL=OEMDRV:/ks.cfg` on a command line typed into GRUB, so a
+//!   kickstart that fails to arrive stalls loudly instead of falling through to
+//!   an interactive installer. Unlike Ubuntu's it is an *online* install: every
+//!   package comes over the network. See [`crate::install_fedora`].
 //! * **Ubuntu** boots the verified live-server ISO through UEFI firmware
 //!   (`mode = "uefi"`, virtio-pci), which is the only way to end up with a
 //!   GPT + ESP the firmware can boot afterwards. subiquity is automated with an
@@ -87,19 +94,19 @@ pub const NETWORK_TAP_UNAVAILABLE: &str =
 /// about which segment the guest is on — the failure that produces is a d-i that
 /// downloads nothing and says only "the network is not configured".
 #[derive(Debug)]
-struct NetPlan {
-    section: Option<NetworkSection>,
+pub struct NetPlan {
+    pub section: Option<NetworkSection>,
     /// `None` for an offline install: netcfg is then told to configure nothing.
-    address: Option<NetAddress>,
+    pub address: Option<NetAddress>,
 }
 
 /// A static guest address, in netcfg's terms.
 #[derive(Debug)]
-struct NetAddress {
-    ip: String,
-    gateway: String,
-    netmask: String,
-    dns: String,
+pub struct NetAddress {
+    pub ip: String,
+    pub gateway: String,
+    pub netmask: String,
+    pub dns: String,
 }
 
 /// Resolves `--network <choice>` for this host.
@@ -109,7 +116,7 @@ struct NetAddress {
 /// negotiation from the middle of an unattended install, and for usernet the
 /// numbers come from [`virtio_net::UserNetConfig`] itself, so they cannot drift
 /// away from what the NAT would hand out.
-fn net_plan(choice: &str, interface: &str) -> Result<NetPlan, String> {
+pub fn net_plan(choice: &str, interface: &str) -> Result<NetPlan, String> {
     match choice {
         "tap" => {
             if !cfg!(target_os = "linux") {
@@ -204,9 +211,12 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     if args.distro.eq_ignore_ascii_case("ubuntu") {
         return crate::install_ubuntu::run(args);
     }
+    if args.distro.eq_ignore_ascii_case("fedora") {
+        return crate::install_fedora::run(args);
+    }
     if !args.distro.eq_ignore_ascii_case("debian") {
         return Err(format!(
-            "unknown distro '{}': expected debian or ubuntu",
+            "unknown distro '{}': expected debian, ubuntu or fedora",
             args.distro
         ));
     }
@@ -758,6 +768,7 @@ mod tests {
             auto: true,
             preseed: None,
             autoinstall: None,
+            kickstart: None,
             iso: None,
             firmware: None,
             size: "20G".into(),

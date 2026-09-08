@@ -6,7 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use control_api::{
-    BootMode, CdromSection, NetworkBackend, NetworkSection, VirtioTransport, VmConfig,
+    BootMode, CdromSection, NetworkBackend, NetworkSection, SoundBackend, SoundSection,
+    VirtioTransport, VmConfig,
 };
 
 use crate::backend::Backend;
@@ -60,6 +61,12 @@ pub struct EditForm {
     pub display_width: u32,
     pub display_height: u32,
     pub virgl: bool,
+    /// `[sound] enabled` — whether the guest gets a virtio-snd card at all.
+    pub sound: bool,
+    /// `[sound] backend`. Kept across an on/off toggle, the way the profile
+    /// keeps it: turning the card off and on again must not silently reset a
+    /// deliberate choice.
+    pub sound_backend: SoundBackend,
     /// The `[[disk]]` list, editable in place (order is guest device order).
     pub disks: Vec<control_api::DiskSection>,
     /// Buffer for the "add disk" field.
@@ -141,6 +148,9 @@ backend = "usernet"
 width = 1920
 height = 1080
 virgl = true
+
+[sound]
+enabled = true
 "#
         );
         let cfg = VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
@@ -191,6 +201,8 @@ virgl = true
             display_width: cfg.display.width,
             display_height: cfg.display.height,
             virgl: cfg.display.virgl,
+            sound: cfg.sound.enabled,
+            sound_backend: cfg.sound.backend,
             disks: cfg.disks.clone(),
             add_disk: String::new(),
             backend: Backend::Native,
@@ -236,6 +248,10 @@ virgl = true
         cfg.display.width = self.display_width;
         cfg.display.height = self.display_height;
         cfg.display.virgl = self.virgl;
+        cfg.sound = SoundSection {
+            enabled: self.sound,
+            backend: self.sound_backend,
+        };
         cfg.disks = self.disks.clone();
 
         let out = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
@@ -384,6 +400,75 @@ interface = "entangled0"
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("entangled0"));
+    }
+
+    /// A machine with no `[sound]` section must keep having none until the
+    /// editor is actually asked for a card — and once asked, the chosen output
+    /// must survive an off/on toggle rather than snapping back to `auto`.
+    #[test]
+    fn the_sound_card_is_opt_in_and_remembers_its_output() {
+        let path = temp_profile("sound");
+        let mut form = EditForm::from_profile(&path).expect("load");
+        assert!(!form.sound, "a profile with no [sound] has no card");
+        assert_eq!(form.sound_backend, SoundBackend::Auto);
+        assert!(!form.dirty());
+
+        form.sound = true;
+        form.sound_backend = SoundBackend::Null;
+        assert!(form.dirty());
+        form.save().expect("save");
+
+        let cfg = VmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).expect("reload");
+        assert!(cfg.sound.enabled);
+        assert_eq!(cfg.sound.backend, SoundBackend::Null);
+
+        // Off again: the card goes, the choice stays, and the profile still
+        // parses (`backend` is meaningless while disabled, never refused).
+        let mut form = EditForm::from_profile(&path).expect("reload");
+        form.sound = false;
+        form.save().expect("save");
+        let cfg = VmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).expect("reload");
+        assert!(!cfg.sound.enabled);
+        assert_eq!(cfg.sound.backend, SoundBackend::Null);
+    }
+
+    /// The picker never offers the other host's word, because naming it is a
+    /// refusal at start rather than a fallback — but a profile that already
+    /// names it has to explain itself instead of being silently rewritten.
+    #[test]
+    fn only_this_engines_own_sound_backend_is_offered() {
+        for backend in [Backend::Native, Backend::Wsl] {
+            let offered = backend.sound_backends();
+            assert!(offered.contains(&SoundBackend::Auto));
+            assert!(offered.contains(&SoundBackend::Null));
+            let native = backend.native_sound_backend();
+            assert_eq!(
+                native,
+                if backend.is_linux_kvm() {
+                    SoundBackend::Alsa
+                } else {
+                    SoundBackend::Wasapi
+                }
+            );
+            assert!(offered.contains(&native));
+            let foreign = if native == SoundBackend::Alsa {
+                SoundBackend::Wasapi
+            } else {
+                SoundBackend::Alsa
+            };
+            assert!(!offered.contains(&foreign), "{backend:?} offered {foreign}");
+
+            // Neither of the always-safe words is ever flagged...
+            assert!(backend.sound_backend_block(SoundBackend::Auto).is_none());
+            assert!(backend.sound_backend_block(SoundBackend::Null).is_none());
+            assert!(backend.sound_backend_block(native).is_none());
+            // ...and the foreign one always is, with a fix in the short line.
+            let reason = backend
+                .sound_backend_block(foreign)
+                .expect("the other host's backend is blocked");
+            assert!(reason.short.contains("auto"), "{}", reason.short);
+            assert!(reason.short.len() < 90, "{}", reason.short);
+        }
     }
 
     #[test]

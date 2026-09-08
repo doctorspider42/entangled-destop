@@ -404,6 +404,7 @@ dependencies = [
  "virtio-core",
  "virtio-gpu",
  "virtio-input",
+ "vm-memory 0.17.2",
  "vmm-core",
 ]
 
@@ -1381,6 +1382,7 @@ dependencies = [
  "libc",
  "linux-boot",
  "machine-x86",
+ "png",
  "thiserror 2.0.20",
  "toml",
  "tracing",
