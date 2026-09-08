@@ -59,6 +59,21 @@ const INSTALL_DEADLINE: Duration = Duration::from_secs(90 * 60);
 /// up a full Workstation.
 const BOOT_DEADLINE: Duration = Duration::from_secs(8 * 60);
 
+/// When the installed system's scanout is captured. Measured on the development
+/// machine: `fedora login:` at 66-170 s depending on how warm the host's page
+/// cache is, GDM's greeter drawn at ~200 s and the auto-logged-in GNOME session
+/// at ~210 s. Late enough to be past the greeter on a warm boot, and either one
+/// satisfies the assertion below.
+const INSTALLED_SCREENSHOT_AFTER: u64 = 240;
+
+/// How many distinct colours separate "a desktop was drawn" from "a text console
+/// was drawn", measured on this machine at 1280x800: a Linux console is **2-4**
+/// (its palette), GDM's greeter — flat background, antialiased text, one logo —
+/// is **865**, and a GNOME session with the Fedora wallpaper is **40 675**. The
+/// threshold sits far above the console and far below the greeter, because the
+/// claim being tested is "graphical, not text", not "which graphical".
+const DESKTOP_COLOURS: usize = 200;
+
 /// Target disk size. A Workstation environment is ~7 GiB installed; the file is
 /// sparse, so the headroom costs nothing until it is used.
 const DISK_SIZE: &str = "24G";
@@ -301,7 +316,7 @@ height = 800
             shot.to_str().expect("utf-8 path"),
             profile.to_str().expect("utf-8 path"),
         ],
-        |_| shot.is_file(),
+        |_| png_complete(&shot),
         LIVE_DEADLINE,
         "live",
     );
@@ -355,6 +370,19 @@ height = 800
          which is a text console or a splash screen rather than a desktop — see {}",
         shot.display()
     );
+}
+
+/// Whether `path` is a PNG that has been written all the way to its end.
+///
+/// `--screenshot-after` refreshes its file every 20 s while the VM runs, so a
+/// test that waits for the path to merely *exist* can read a frame that is still
+/// being written and panic decoding it. The `IEND` chunk is the last twelve
+/// bytes of a complete PNG, so its presence is the cheapest honest answer.
+fn png_complete(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    bytes.len() > 12 && bytes.ends_with(b"IEND\xae\x42\x60\x82")
 }
 
 /// How many distinct RGB values a PNG contains, capped so a full-colour image
@@ -504,9 +532,28 @@ fn fedora_installs_unattended_and_the_installed_system_boots() {
     );
 
     // ---- and now boot what was installed ----
+    // Two pieces of evidence, and the run waits for both: the login prompt on
+    // ttyS0 says the system came up, and the screenshot says it came up *into a
+    // desktop*. The second is not redundant — an install that produced a
+    // perfectly healthy multi-user system with GNOME on the disk and nothing
+    // ever drawn is exactly the failure the kickstart's `set-default
+    // graphical.target` exists to prevent, and it is invisible on the serial
+    // console.
+    let shot = scratch.join("e2e-fedora-installed.png");
+    let _ = std::fs::remove_file(&shot);
+    let after = INSTALLED_SCREENSHOT_AFTER.to_string();
+    let shot_path = shot.clone();
     let (saw_login, boot_log) = run_until(
-        &["run", "--headless", profile.to_str().expect("utf-8 path")],
-        |text| text.contains(LOGIN_PROMPT),
+        &[
+            "run",
+            "--headless",
+            "--screenshot-after",
+            &after,
+            "--screenshot",
+            shot.to_str().expect("utf-8 path"),
+            profile.to_str().expect("utf-8 path"),
+        ],
+        move |text| text.contains(LOGIN_PROMPT) && png_complete(&shot_path),
         BOOT_DEADLINE,
         "boot",
     );
@@ -548,7 +595,28 @@ fn fedora_installs_unattended_and_the_installed_system_boots() {
     );
     assert!(
         saw_login,
-        "no login prompt within {BOOT_DEADLINE:?}; last lines:\n{}",
+        "no login prompt and no complete screenshot within {BOOT_DEADLINE:?}; \
+         last lines:\n{}",
         tail(&boot_log, 30)
+    );
+
+    // And the desktop. GNOME's own frames, drawn on our virtio-gpu by a system
+    // this VMM installed — no guest additions anywhere in that sentence.
+    assert!(
+        boot_log.contains("virtio-gpu scanout set"),
+        "the installed system never set a scanout, so nothing was ever drawn:\n{}",
+        tail(&boot_log, 30)
+    );
+    let colours = distinct_colours(&shot);
+    println!(
+        "installed-system screenshot {} has {colours} colours",
+        shot.display()
+    );
+    assert!(
+        colours > DESKTOP_COLOURS,
+        "the scanout at {INSTALLED_SCREENSHOT_AFTER}s has only {colours} distinct \
+         colours, which is a text console rather than a graphical session — the \
+         install put GNOME on the disk but the system did not boot into it. See {}",
+        shot.display()
     );
 }
