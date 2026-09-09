@@ -206,7 +206,10 @@ a *running* VM accumulates, which is a different defect class: a leaked irqfd
 shows up in the first, a serial IRQ that stops being delivered after the
 seventy-thousandth line only in the second. The guest is the test initramfs with
 `entangled.heartbeat=<ms>`, whose one line — `VMHOST_HEARTBEAT <n>
-uptime_ms=<t>` — carries most of the measurement.
+uptime_ms=<t> tsc=<n> pm_us=<n>` — carries most of the measurement. The three
+counters are the guest's `CLOCK_MONOTONIC`, the raw TSC under it and the host's
+own monotonic clock as the guest reads it from the emulated ACPI PM timer; read
+the clock finding below before drawing any conclusion from a drift number.
 
 ```bash
 ENTANGLED_SOAK_LOG=$HOME/soak.tsv \
@@ -243,11 +246,9 @@ guest clock       7109386 ms guest vs 7200131 ms host, drift -12603 ppm (+-104 p
 console           309994 bytes total, 43.5 B per heartbeat, 1 unexpected lines
 ```
 
-(Verbatim from the run. The summary gained two fields *afterwards*, from what
-this run taught: the clocksource, and a bytes-per-heartbeat that is marginal
-rather than an average over a boot log the guest paid for once — 39 B, not 43.5.)
+(Verbatim from the run, whose summary block has since grown three fields.)
 
-Read that as four verdicts and one failure:
+Read that as four verdicts and one apparent failure:
 
 - **Nothing leaks.** Descriptors and threads are *identical* after two hours and
   7 066 heartbeats — no per-interrupt eventfd, no per-kick worker. The 316 KiB
@@ -260,86 +261,115 @@ Read that as four verdicts and one failure:
   is the assertion this test exists for, and it is the one `repeat_boot` found
   broken before the machine had an IOAPIC.
 - **No stalls.** The worst 60-second window carried 0.90 of the heartbeats its
-  length implies, and that window was heavily loaded (below).
-- **The guest says almost nothing.** One line in two hours, and it is benign:
-  `kworker/0:1 (10) used greatest stack depth: 13712 bytes left`. 43.5 B per
-  heartbeat on the wire.
-- **The guest's clock loses time, and the test fails on it.** −12 603 ppm over
-  two hours: the guest's `CLOCK_MONOTONIC` advanced 7 109 s while the host's
-  advanced 7 200 s, so **the guest lost 90.7 seconds — about 18 minutes a day.**
+  length implies.
+- **The guest says almost nothing.** One benign line in two hours.
+- **The guest's clock appeared to lose 90.7 s, and the guest was innocent.**
+  The next section is that story, because it is the most expensive lesson this
+  test has taught and the shape of it will recur.
 
-### The clock finding, and how to measure it honestly
+### The clock finding: the reference was the broken clock
 
-Two things had to be fixed before that number meant anything, and both are worth
-knowing before trusting any drift measurement here:
+Three things had to be fixed before the drift number meant anything. The first
+two are about measuring honestly; the third is about what you are measuring
+*against*, and it is the one that cost a day.
 
 1. **Date the beat you watched arrive, never the one you found.** The baseline
    used to be whichever heartbeat happened to be sitting in the transcript,
    stamped "now" although it had been printed up to one harness poll earlier.
    That fixed ~0.6 s offset is then divided by the run length, so the same
-   healthy guest read **+77 356 ppm at 10 s and +10 031 ppm at 60 s** — and the
-   same offset would be under +200 ppm across an hour. A number that fails a
-   short run, vanishes in a long one and means nothing in either.
-   `observe_next_beat` waits for the *transition*, which puts
-   the same small latency on both ends of the interval where it cancels.
+   healthy guest read **+77 356 ppm at 10 s and +10 031 ppm at 60 s**.
+   `observe_next_beat` waits for the *transition*, which puts the same small
+   latency on both ends of the interval where it cancels.
 2. **Print the error bar.** One harness poll plus one observe interval (750 ms)
    is the measurement's whole timing error: ±104 ppm over two hours, ±17 000 ppm
-   over 45 seconds. The assertion is widened by exactly that, so a smoke run of
-   this test is judged as loosely as its evidence deserves.
+   over 45 seconds. The assertion is widened by exactly that.
+3. **Check your reference before you use it.** `Instant` is `CLOCK_MONOTONIC`,
+   a free-running count of the host's own making, and it can be wrong about real
+   time with nothing to say so.
 
-With that in place the drift is real, and **it tracks host load**. Per-interval,
-from the log file:
+**On this machine it is wrong, by a lot.** Measured 2026-09-09, three ways that
+agree:
 
-| Wall-clock window | Host load average | Interval drift |
-|---|---|---|
-| first ~60 min, machine quiet | ~1–3 | −2 200 … −6 000 ppm |
-| last ~40 min, another agent fuzzing | ~18–20 | −22 000 … −25 700 ppm |
-
-So there is a floor of roughly **−5 000 ppm on an idle machine** (7 minutes a
-day) and it degrades to −2.5 % when the host is busy.
-
-**Three control runs say what it is not.** All three were launched together, so
-they saw the same (heavily loaded, ~50–65) machine, and each one removes a
-suspect:
-
-| Control | Drift |
+| Measurement | Result |
 |---|---|
-| default: `tsc` clocksource, 500 ms observer poll, 900 s | **−25 667 ppm** ±834 |
-| `ENTANGLED_SOAK_CMDLINE=clocksource=kvm-clock`, 900 s | **−25 686 ppm** ±834 |
-| `ENTANGLED_SOAK_POLL_MS=25`, 600 s | **−26 132 ppm** ±459 |
+| WSL2 `CLOCK_MONOTONIC` over a 240 s sleep, against Windows QPC | **+33 315 ppm** |
+| WSL2 `CLOCK_MONOTONIC` vs WSL2 `CLOCK_REALTIME` (hv-timesync disciplined), 120 s | **+37 889 ppm** |
+| hardware TSC over 232 s of Windows QPC time | **1 896 585 kHz** (nominal 1 896 389, +103 ppm) |
 
-- **Not the clocksource.** Forcing `kvm-clock` — the paravirtual clock whose
-  scale the host maintains — changes the number by 0.07 %. The two runs even
-  produced the same 868 heartbeats. So this is not the guest believing a wrong
-  TSC frequency, which was the first and most attractive theory (the guest does
-  take one on trust: `tsc: Detected 1896.389 MHz processor`, the host's nominal
-  base clock, with `Calibrating delay loop (skipped)` and no refinement pass,
-  and it then leaves `kvm-clock` for the raw `tsc` at 2.4 s — the report prints
-  `clocksource <name>` beside the drift because of this run).
-- **Not the harness.** Twenty times faster observation moves the number by 2 %,
-  in the *wrong* direction. The drift is in the guest's time base, not in when
-  the host notices a line.
-- **Not lost output.** Zero gaps in all three, and the delivery ratio never
-  below 0.95.
+So the TSC really does run at the 1 896.389 MHz Hyper-V advertises and
+`KVM_GET_TSC_KHZ` hands the guest (verified: a bare `KVM_CREATE_VCPU` +
+`KVM_GET_TSC_KHZ` in WSL returns `1896389`), and **WSL2's own
+`CLOCK_MONOTONIC` advances as though it were 1 835.4 MHz** — it gains 3.3 %,
+48 minutes a day. Our guest was keeping real time; the host's clock was running
+fast, and the soak was reporting the difference as the guest's fault.
 
-What is left is that **the guest's time base loses roughly the time its vCPU is
-not running**: guest `CLOCK_MONOTONIC` advanced 876.5 s while the host's
-advanced 899.6 s. That is consistent with KVM having no stable master clock on
-this host and adjusting the guest TSC per vCPU load, which is exactly the regime
-a nested host produces.
+Every control run makes sense once you see that:
 
-**Measured on KVM inside WSL2 — a nested host whose own clock is
-Hyper-V-derived — so do not carry the number to bare metal without re-measuring
-there.** The open questions, for whoever owns the time base
-(`vmm-core`, `machine-x86`): does it reproduce on a bare-metal KVM host, does it
-reproduce on WHP, and does KVM report a stable master clock here. What is *not*
-in doubt is that a guest of ours can be a percent slow while reporting a healthy
-everything-else, and that no test before this one would have noticed.
+| Control (900 s each, launched together) | Drift |
+|---|---|
+| default `tsc` clocksource | −32 032 ppm |
+| `ENTANGLED_SOAK_CMDLINE=clocksource=kvm-clock` | −32 148 ppm |
+| `ENTANGLED_SOAK_CMDLINE=clocksource=acpi_pm` | **−15 ppm** |
 
-**The soak therefore fails on this machine, on that assertion alone**, and it is
-left failing on purpose: 10 000 ppm is a generous gate that a correct guest
-clock beats by orders of magnitude, and moving it to accommodate the measurement
-would delete the finding.
+- **kvm-clock is not a second opinion.** KVM derives the pvclock scale from the
+  same `virtual_tsc_khz`, so it inherits the identical error. The earlier
+  reading of "kvm-clock agrees, therefore not a frequency problem" was exactly
+  backwards — agreement to 0.4 % is what a shared frequency looks like.
+- **`acpi_pm` agrees with the host because it *is* the host.** We synthesise
+  the PM timer from host `Instant`, so a guest using it is comparing the host's
+  clock with itself. That is what makes it the decisive control, and also why
+  it cannot be the reference: a wrong host clock is invisible to it.
+- **Not the harness.** The guest now reports the PM timer in its own heartbeat
+  (`pm_us=`), so the harness's observation latency can be measured rather than
+  argued about: guest `CLOCK_MONOTONIC` against the host clock **the guest read
+  itself** is −31 956 ppm, within 400 ppm of the number the host measured from
+  outside. Nothing is lost in the observing.
+- **Not load.** The earlier "it scales with host load, −5 000 ppm quiet to
+  −25 000 ppm at load 20" does not survive re-measurement: −32 000 ppm at a load
+  average under 3. It is a fixed frequency ratio, and the apparent correlation
+  was coincidence.
+
+**And WHP says the same thing from the other side.**
+`crates/vmm-core/tests/whp_clock.rs` boots the *same* guest on the *same*
+hardware under the other hypervisor, on a host whose clocks are sound:
+
+```text
+interval          61005 ms host, 61076 ms guest
+drift             +1160 ppm (+-3278 ppm observation error)
+cross-check       guest vs the host clock it read itself +10 ppm
+host reference    monotonic vs wall clock +170 ppm
+guest TSC         1898.571 MHz measured against host time
+```
+
+**+10 ppm** between the guest's `CLOCK_MONOTONIC` and our emulated PM timer.
+Same machine model, same TSC, same initramfs — the only thing that changed is
+whether the host could tell the time. `cargo test -p vmm-core --test whp_clock`
+runs it; 60 s by default, `ENTANGLED_WHP_CLOCK_SECS` for longer.
+
+**Verdict: not our bug, and not fixable from our side.** `KVM_SET_TSC_KHZ`
+cannot correct it even though `KVM_CAP_TSC_CONTROL` is available: KVM computes
+the hardware scaling ratio as `requested / tsc_khz` and the guest divides by
+`requested`, so both terms carry the host's own belief about `tsc_khz` and it
+cancels out. The error is in that belief, one level below anything a VMM can
+reach.
+
+**What the soak does about it:** `HOST_CLOCK_SANITY_PPM` (1 000 ppm). Each beat
+now records `SystemTime` beside `Instant`, and if the host's monotonic clock
+disagrees with its own wall clock by more than that, the host has disqualified
+itself as the reference: the guest is judged against `CLOCK_REALTIME` instead
+and the report says which reference it used and why. **The 10 000 ppm gate was
+never widened** — a correct guest beats it by orders of magnitude, and a guest
+given a wrong TSC frequency blows past it, which is still exactly what this
+assertion is for.
+
+Two rules to carry out of this:
+
+- **Any timing measurement taken inside WSL on this machine is 3.3 % fast.**
+  It is not confined to VM tests — benchmarks, timeouts and throughput numbers
+  are all affected. See the `dev-environment` skill.
+- **A measurement is worth no more than its reference.** When a number says the
+  thing under test is broken, measure the instrument before believing it. Two
+  clocks that disagree are one bug; three clocks name which.
 
 ### What it deliberately does not assert
 
