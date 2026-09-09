@@ -575,3 +575,26 @@ the VMM's side a SIPI'd AP is just a running CPU — so the answer is to remove
 the cause and make the symptom loud: `VcpuCensus` now logs
 `configured=2 started=1` at warn, and the boot tests assert the configured
 count instead of tolerating either.
+
+## Amendment, 2026-09-09 (later) — the PM timer is only as good as the host clock
+
+`AcpiPmTimer` is derived from host `Instant`, i.e. from the host's
+`CLOCK_MONOTONIC`. That is the right source and there is no better one, but it
+makes every firmware delay a hostage to a clock we do not own, and on one of the
+two development hosts that clock is wrong: **WSL2's `CLOCK_MONOTONIC` gains
+3.3 %** (it advances as though the TSC ran at 1 835.4 MHz where the hardware
+runs at 1 896.4 MHz, verified against Windows QPC and against WSL's own
+externally-disciplined `CLOCK_REALTIME`). So on that host EDK2's
+`MicroSecondDelay()` waits 3.3 % less real time than it asked for, and every
+`CheckTimeout` deadline in `MpLib.c` is 3.3 % short.
+
+Nothing to fix here — 3.3 % is far inside the margin any firmware timeout
+carries, the guest's own TSC is correct because KVM hands it the true frequency,
+and the same code on Windows/WHP measures +10 ppm between the guest's
+`CLOCK_MONOTONIC` and this timer. It is recorded because it is a *silent*
+coupling: a host clock defect reaches the guest through this register and
+through nothing else the firmware can cross-check, and the day it is 30 % rather
+than 3 % the symptom will be firmware timeouts with no other explanation. The
+full account, the measurements and the test that now notices are in the
+`vm-testing` skill under "The clock finding"; the equivalent note for anyone
+adding another host-time-derived register is in `acpi-machine`.
