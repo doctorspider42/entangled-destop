@@ -1419,6 +1419,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "vm-snapshot",
  "wgpu 25.0.2",
  "windows 0.62.2",
 ]

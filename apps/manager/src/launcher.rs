@@ -398,6 +398,45 @@ pub fn run_spec(
     })
 }
 
+/// `entangled resume --control-stdin <snapshot>` (ADR-0006): start a machine
+/// **from its saved session** instead of booting it.
+///
+/// The snapshot carries the profile it was taken from, verbatim, so this needs
+/// nothing else — not the `.toml`, which may since have been edited or deleted.
+/// That is also why `vm` is passed separately: the supervisor keys a task by
+/// machine name, and the name has to be the one the cards use, whether or not a
+/// profile of that name still exists.
+///
+/// The control channel is the same pipe a `run` gets, so a resumed machine can
+/// be paused, restarted and suspended again like any other. A bare `save` on it
+/// writes back to the file it came from, which is what makes closing and
+/// re-opening a machine a loop rather than a one-way trip.
+pub fn resume_spec(
+    runner: &Runner,
+    vm: &str,
+    snapshot: &Path,
+    cwd: PathBuf,
+    vm_dir: &Path,
+) -> Result<TaskSpec, String> {
+    let args = vec![
+        "resume".to_string(),
+        "--control-stdin".to_string(),
+        runner.path_arg(snapshot)?,
+    ];
+    let (program, args) = runner.command(&cwd, args)?;
+    Ok(TaskSpec {
+        kind: TaskKind::Run,
+        vm: vm.to_string(),
+        program,
+        args,
+        cwd,
+        // The same log a cold start writes to: for a person following a
+        // machine, "resumed" and "started" are the same event in its history.
+        log_path: vm_dir.join(format!("{vm}-run.log")),
+        control: true,
+    })
+}
+
 /// The bootstrap kernel a direct-Linux VM boots from, relative to the child's
 /// working directory. `entangled install debian` refuses to start without it and
 /// the profiles it writes reference it by this relative path, so the UI checks
@@ -632,6 +671,7 @@ mod tests {
             profile_path: PathBuf::from("/vms/debian-demo.toml"),
             memory_mib: 2048,
             vcpus: 2,
+            transport: control_api::VirtioTransport::Pci,
             display: (1920, 1080),
             network_interface: Some("entangled0".into()),
             disks: vec![],
@@ -662,6 +702,51 @@ mod tests {
         );
         assert_eq!(spec.cwd, Path::new("/srv/entangled"));
         assert_eq!(spec.log_path, Path::new("/vms/debian-demo-run.log"));
+    }
+
+    /// A resume is a start: same task kind, same log, same control pipe — and
+    /// the file it names is translated for the engine that will open it.
+    #[test]
+    fn resume_spec_starts_the_snapshot_not_the_profile() {
+        let spec = resume_spec(
+            &native("/usr/bin/entangled"),
+            "debian-demo",
+            Path::new("/vms/debian-demo.esnap"),
+            PathBuf::from("/srv/entangled"),
+            Path::new("/vms"),
+        )
+        .expect("spec");
+        assert_eq!(spec.kind, TaskKind::Run);
+        assert_eq!(
+            spec.command_line(),
+            "/usr/bin/entangled resume --control-stdin /vms/debian-demo.esnap"
+        );
+        assert!(
+            spec.control,
+            "a resumed machine must be pausable and suspendable like any other"
+        );
+        assert_eq!(spec.log_path, Path::new("/vms/debian-demo-run.log"));
+
+        let through_wsl = resume_spec(
+            &Runner {
+                backend: Backend::Wsl,
+                engine: PathBuf::from("C:/Program Files/Entangled/entangled.exe"),
+                distro: "Ubuntu".into(),
+                linux_engine: "/home/spider/entangled".into(),
+            },
+            "debian-demo",
+            Path::new("D:/vms/debian-demo.esnap"),
+            PathBuf::from("D:/entangled-desktop"),
+            Path::new("D:/vms"),
+        )
+        .expect("spec");
+        assert!(
+            through_wsl
+                .command_line()
+                .contains("/mnt/d/vms/debian-demo.esnap"),
+            "{}",
+            through_wsl.command_line()
+        );
     }
 
     /// The WSL backend: `wsl.exe` is the program, the profile path is

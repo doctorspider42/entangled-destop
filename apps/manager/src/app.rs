@@ -21,6 +21,7 @@ use crate::metrics;
 use crate::picker::{self, PickTarget};
 use crate::process::{Supervisor, TaskId, TaskKind};
 use crate::settings::{self, Settings};
+use crate::snapshots::{self, SnapshotRow, Verdict};
 use crate::theme;
 use crate::ui;
 use crate::update::{self, UpdateInfo};
@@ -111,6 +112,8 @@ pub enum View {
     #[default]
     Machines,
     Disks,
+    /// Saved sessions: every `*.esnap` in the VM directory (ADR-0006).
+    Snapshots,
     /// Host readiness: `entangled doctor`, rendered.
     Diagnostics,
 }
@@ -198,6 +201,24 @@ pub struct ResizeDiskState {
     pub error: Option<String>,
 }
 
+/// Snapshot delete confirmation state (ADR-0006).
+pub struct DeleteSnapshotState {
+    pub row: SnapshotRow,
+    pub error: Option<String>,
+}
+
+/// "Start this machine fresh even though it has a saved session" state.
+///
+/// A confirmation rather than a warning toast, because the choice is
+/// irreversible in the only way that matters: the moment the cold-booted guest
+/// writes to its disk, the saved session can no longer go back onto it. Better
+/// to throw the file away deliberately than to keep one that will refuse.
+pub struct DiscardSnapshotState {
+    pub vm: String,
+    pub row: SnapshotRow,
+    pub error: Option<String>,
+}
+
 /// Delete confirmation state (GUI-1604).
 pub struct DeleteState {
     pub name: String,
@@ -233,6 +254,8 @@ pub enum Modal {
     EditVm(EditVmState),
     MoveDisk(MoveDiskState),
     ResizeDisk(ResizeDiskState),
+    DeleteSnapshot(DeleteSnapshotState),
+    DiscardSnapshot(DiscardSnapshotState),
 }
 
 impl Modal {
@@ -256,6 +279,17 @@ pub enum Action {
     TogglePause(String),
     /// Reboot a running VM in place — the machine reset, not stop-then-start.
     Reset(String),
+    /// Write a running VM to its snapshot file and stop it (ADR-0006).
+    Suspend(String),
+    /// Start a suspended machine from its own snapshot instead of booting it.
+    ResumeVm(String),
+    /// The same, for a snapshot file that may belong to no profile here.
+    ResumeSnapshot(PathBuf),
+    AskDeleteSnapshot(PathBuf),
+    ConfirmDeleteSnapshot,
+    /// Cold-boot a suspended machine, throwing the saved session away.
+    AskDiscardSnapshot(String),
+    ConfirmDiscardSnapshot,
     AskDelete(String),
     ConfirmDelete,
     CopyProfilePath(String),
@@ -281,8 +315,8 @@ pub enum Action {
         profile: PathBuf,
         declared: PathBuf,
     },
-    /// Open the host file manager with the disk selected (explorer/xdg-open).
-    RevealDisk(PathBuf),
+    /// Open the host file manager with the file selected (explorer/xdg-open).
+    Reveal(PathBuf),
     // ---- VM editor ---------------------------------------------------------
     AskEditVm(String),
     SubmitEditVm,
@@ -542,7 +576,11 @@ impl ManagerApp {
             ScreenshotView::Wizard => app.open_wizard(),
             ScreenshotView::Settings => app.open_settings(),
             ScreenshotView::Disks => app.view = View::Disks,
+            ScreenshotView::Snapshots => app.view = View::Snapshots,
             ScreenshotView::Diagnostics => app.view = View::Diagnostics,
+            ScreenshotView::SnapshotDelete => {
+                app.view = View::Snapshots;
+            }
             ScreenshotView::Main
             | ScreenshotView::Editor
             | ScreenshotView::EditorBoot
@@ -580,24 +618,43 @@ impl ManagerApp {
     }
 
     /// Status of a VM as the cards draw it.
+    ///
+    /// Two of the five states are not properties of a process. **Suspending**
+    /// is a running child that has been told to write itself to a file and will
+    /// exit when it has; **Suspended** is the absence of a child *plus* the
+    /// presence of that file. The second one is the reason a suspended machine
+    /// still reads correctly after the manager has been closed and reopened:
+    /// unlike "running", it is a fact on disk rather than one this process was
+    /// holding in memory.
     pub fn status_of(&self, name: &str) -> Status {
-        if let Some(status) = self.mock_statuses.get(name) {
-            return *status;
+        if self
+            .supervisor
+            .active_task(name)
+            .is_some_and(|t| t.suspend_requested())
+        {
+            return Status::Suspending;
         }
-        match self.supervisor.active_kind(name) {
-            Some(TaskKind::Run) => {
-                if self
-                    .supervisor
-                    .active_task(name)
-                    .is_some_and(|t| t.stop_requested())
-                {
-                    Status::Stopping
-                } else {
-                    Status::Running
+        let base = match self.mock_statuses.get(name) {
+            Some(status) => *status,
+            None => match self.supervisor.active_kind(name) {
+                Some(TaskKind::Run) => {
+                    if self
+                        .supervisor
+                        .active_task(name)
+                        .is_some_and(|t| t.stop_requested())
+                    {
+                        Status::Stopping
+                    } else {
+                        Status::Running
+                    }
                 }
-            }
-            Some(TaskKind::Install) => Status::Installing,
-            None => Status::Stopped,
+                Some(TaskKind::Install) => Status::Installing,
+                None => Status::Stopped,
+            },
+        };
+        match base {
+            Status::Stopped if self.snapshot_for(name).is_some() => Status::Suspended,
+            other => other,
         }
     }
 
@@ -605,10 +662,35 @@ impl ManagerApp {
         if self.mock_mode {
             return matches!(
                 self.status_of(name),
-                Status::Running | Status::Stopping | Status::Installing
+                Status::Running | Status::Stopping | Status::Installing | Status::Suspending
             );
         }
         self.supervisor.is_busy(name)
+    }
+
+    /// This machine's saved session, if it has one.
+    ///
+    /// Keyed on the *conventional* path — `<name>.esnap` beside the profile,
+    /// which is where a bare `save` writes — rather than on the machine name
+    /// recorded inside every snapshot in the directory. A copy someone made by
+    /// hand is a snapshot of the same machine and belongs in the Snapshots
+    /// view, but it is not the session this machine would come back from, and a
+    /// card that offered to resume an arbitrary one of several would be
+    /// guessing.
+    pub fn snapshot_for(&self, name: &str) -> Option<&SnapshotRow> {
+        let vm = self.vm(name)?;
+        let path = snapshots::path_for(vm);
+        self.scan.snapshots.iter().find(|row| row.path == path)
+    }
+
+    /// Whether that saved session could actually be resumed, and why not.
+    pub fn snapshot_verdict(&self, row: &SnapshotRow) -> Verdict {
+        let vm_name = row.vm_name().unwrap_or_default().to_string();
+        let profile = self.vm(&vm_name);
+        // A snapshot's machine may have no profile here at all, in which case
+        // the backend it would run on is the default one — the same answer
+        // `Settings::backend_for` gives for an unknown name.
+        snapshots::verdict(row, self.backend_of(&vm_name), profile)
     }
 
     pub fn vm(&self, name: &str) -> Option<&VmEntry> {
@@ -805,6 +887,16 @@ impl ManagerApp {
         if self.screenshot_surface_opened || self.screenshot.is_none() {
             return;
         }
+        // The confirmation dialogs need a row to be about, which only exists
+        // once the first scan has produced one.
+        if self.screenshot_view == ScreenshotView::SnapshotDelete {
+            let Some(path) = self.scan.snapshots.first().map(|row| row.path.clone()) else {
+                return;
+            };
+            self.screenshot_surface_opened = true;
+            self.ask_delete_snapshot(&path);
+            return;
+        }
         let section = match self.screenshot_view {
             ScreenshotView::Editor => EditVmSection::Hardware,
             ScreenshotView::EditorBoot => EditVmSection::BootMedia,
@@ -832,6 +924,30 @@ impl ManagerApp {
     /// stamping the wizard's memory/vCPU choice onto the profile the CLI wrote.
     fn collect_task_results(&mut self) {
         for (kind, vm, outcome) in self.supervisor.drain_finished() {
+            // A suspend ends the child too, and the exit status cannot tell the
+            // two apart: the engine exits cleanly whether the snapshot was
+            // written or not (ADR-0006), because a VM that has been told to
+            // stop existing must not run on either way. The reply line it
+            // printed is the only answer, so it decides the toast.
+            if let Some(result) = self.suspend_outcome(&vm) {
+                match result {
+                    Ok(detail) => {
+                        self.toast(ToastLevel::Success, format!("'{vm}' suspended — {detail}"))
+                    }
+                    Err(reason) => {
+                        self.toast(
+                            ToastLevel::Error,
+                            format!(
+                                "'{vm}' could not be suspended: {reason}. It has stopped, and \
+                                 no saved session was written."
+                            ),
+                        );
+                        self.log_open = true;
+                    }
+                }
+                self.request_scan(true);
+                continue;
+            }
             match (kind, outcome.success, outcome.stopped_by_user) {
                 (TaskKind::Run, _, true) => {
                     self.toast(ToastLevel::Info, format!("'{vm}' stopped"));
@@ -876,6 +992,17 @@ impl ManagerApp {
             }
             self.request_scan(true);
         }
+    }
+
+    /// The engine's own answer to a suspend, for the task that just finished.
+    ///
+    /// `None` when this machine was not being suspended — and also when it was
+    /// but the reply never arrived, which is a child that died mid-save. That
+    /// falls through to the ordinary failure path, where the log is opened, and
+    /// the missing snapshot then speaks for itself.
+    fn suspend_outcome(&self, vm: &str) -> Option<Result<String, String>> {
+        let task = self.supervisor.tasks().iter().rev().find(|t| t.vm == vm)?;
+        task.suspend_requested().then(|| task.save_result())?
     }
 
     /// Reads the tail of the failed task's log and explains the usual suspects
@@ -1120,6 +1247,208 @@ impl ManagerApp {
             )
         };
         self.toast(level, text);
+    }
+
+    /// Writes a running VM to a file and stops it (ADR-0006).
+    ///
+    /// Down the same control channel Pause and Restart use, and with the same
+    /// honesty rule: a machine this manager did not start has no pipe, and the
+    /// button says so rather than pretending. What it does *not* do is wait —
+    /// a desktop-sized guest takes several seconds, and the frame loop is the
+    /// one thing that must keep moving. The card shows the elapsed time, and
+    /// the engine's own reply line, read out of the log as it goes past, is
+    /// what ends the wait.
+    fn suspend(&mut self, name: &str) {
+        let Some(task) = self.supervisor.active_task(name) else {
+            self.toast(ToastLevel::Warn, format!("'{name}' is not running"));
+            return;
+        };
+        if !task.has_control() {
+            self.toast(
+                ToastLevel::Warn,
+                format!("'{name}' has no control channel — it was not started from here"),
+            );
+            return;
+        }
+        if task.suspend_requested() {
+            return;
+        }
+        if task.suspend() {
+            self.toast(
+                ToastLevel::Info,
+                format!("suspending '{name}' — writing its memory to disk"),
+            );
+        } else {
+            self.toast(
+                ToastLevel::Error,
+                format!("could not reach '{name}' to suspend it"),
+            );
+        }
+    }
+
+    /// Starts a machine from its saved session instead of booting it.
+    fn resume_vm(&mut self, name: &str) {
+        let Some(row) = self.snapshot_for(name).cloned() else {
+            self.toast(
+                ToastLevel::Warn,
+                format!("'{name}' has no saved session to come back from"),
+            );
+            return;
+        };
+        self.resume_snapshot(&row);
+    }
+
+    /// Starts `row`, whether or not a profile of that name still exists here.
+    ///
+    /// The verdict is re-taken at the moment of the click: the Resume button is
+    /// already greyed out for a snapshot that cannot be restored, but a disk can
+    /// change between two scans and a refusal that has just become true must not
+    /// be discovered by a child process.
+    fn resume_snapshot(&mut self, row: &SnapshotRow) {
+        let Some(name) = row.vm_name().map(str::to_string) else {
+            self.toast(
+                ToastLevel::Error,
+                format!(
+                    "{} cannot be read, so there is nothing to resume",
+                    row.path.display()
+                ),
+            );
+            return;
+        };
+        if self.supervisor.is_busy(&name) {
+            self.toast(ToastLevel::Warn, format!("'{name}' is already busy"));
+            return;
+        }
+        let verdict = self.snapshot_verdict(row);
+        if let Some(reason) = verdict.blocked.first() {
+            self.toast(ToastLevel::Error, reason.clone());
+            return;
+        }
+        let Some(cli) = self.engine_path() else {
+            return;
+        };
+        let chosen = self.backend_of(&name);
+        // The snapshot file itself has to be visible from the backend, exactly
+        // as a profile and its disks do for a cold start.
+        match backend::reachability(chosen, std::iter::once(row.path.as_path())) {
+            backend::Reachability::Refused(message) => {
+                self.toast(
+                    ToastLevel::Error,
+                    format!("'{name}' cannot resume on {}: {message}", chosen.label()),
+                );
+                return;
+            }
+            backend::Reachability::Caveat(message) => self.toast(ToastLevel::Warn, message),
+            backend::Reachability::Fine => {}
+        }
+        let runner = Runner::new(chosen, cli, &self.settings);
+        let spec = match launcher::resume_spec(
+            &runner,
+            &name,
+            &row.path,
+            self.settings.child_cwd(),
+            &self.settings.vm_dir,
+        ) {
+            Ok(spec) => spec,
+            Err(message) => {
+                self.toast(ToastLevel::Error, message);
+                return;
+            }
+        };
+        match self.supervisor.spawn(spec) {
+            Ok(id) => {
+                self.log_selected = Some(id);
+                self.toast(
+                    ToastLevel::Success,
+                    format!("resuming '{name}' where it left off"),
+                );
+            }
+            Err(e) => self.toast(ToastLevel::Error, e.to_string()),
+        }
+    }
+
+    fn ask_delete_snapshot(&mut self, path: &Path) {
+        let Some(row) = self
+            .scan
+            .snapshots
+            .iter()
+            .find(|row| row.path == path)
+            .cloned()
+        else {
+            self.toast(
+                ToastLevel::Error,
+                "that saved session is gone from the list",
+            );
+            return;
+        };
+        if row.vm_name().is_some_and(|name| self.is_busy(name)) {
+            self.toast(
+                ToastLevel::Warn,
+                "that machine is busy — a snapshot must not be deleted underneath it",
+            );
+            return;
+        }
+        self.modal = Modal::DeleteSnapshot(DeleteSnapshotState { row, error: None });
+    }
+
+    fn confirm_delete_snapshot(&mut self) {
+        let Modal::DeleteSnapshot(state) = &self.modal else {
+            return;
+        };
+        let path = state.row.path.clone();
+        match remove_if_present(&path) {
+            Ok(()) => {
+                self.modal = Modal::None;
+                self.toast(
+                    ToastLevel::Success,
+                    format!("deleted the saved session {}", path.display()),
+                );
+                self.request_scan(true);
+            }
+            Err(message) => {
+                if let Modal::DeleteSnapshot(state) = &mut self.modal {
+                    state.error = Some(message);
+                }
+            }
+        }
+    }
+
+    /// "Start it fresh anyway" — the saved session goes first.
+    ///
+    /// Deleting rather than leaving it is the honest half: the cold-booted
+    /// guest writes to the disk within seconds, and from that moment the file
+    /// is one the engine would refuse. A snapshot that can only ever produce a
+    /// refusal is worse than no snapshot, because the card would go on offering
+    /// to resume it.
+    fn ask_discard_snapshot(&mut self, name: &str) {
+        let Some(row) = self.snapshot_for(name).cloned() else {
+            self.start(name);
+            return;
+        };
+        self.modal = Modal::DiscardSnapshot(DiscardSnapshotState {
+            vm: name.to_string(),
+            row,
+            error: None,
+        });
+    }
+
+    fn confirm_discard_snapshot(&mut self) {
+        let Modal::DiscardSnapshot(state) = &self.modal else {
+            return;
+        };
+        let (vm, path) = (state.vm.clone(), state.row.path.clone());
+        match remove_if_present(&path) {
+            Ok(()) => {
+                self.modal = Modal::None;
+                self.request_scan(true);
+                self.start(&vm);
+            }
+            Err(message) => {
+                if let Modal::DiscardSnapshot(state) = &mut self.modal {
+                    state.error = Some(message);
+                }
+            }
+        }
     }
 
     /// Whether the manager has asked this VM to pause — what the card's
@@ -2027,7 +2356,7 @@ impl ManagerApp {
         }
     }
 
-    fn reveal_disk(&mut self, path: &Path) {
+    fn reveal(&mut self, path: &Path) {
         match reveal_in_file_manager(path) {
             Ok(()) => {}
             Err(e) => self.toast(
@@ -2056,6 +2385,51 @@ impl ManagerApp {
             Action::Stop(name) => {
                 self.mock_statuses.insert(name.clone(), Status::Stopped);
                 self.toast(ToastLevel::Info, format!("Mock: stopped '{name}'"));
+            }
+            // Suspend and Resume move the fixture between the same two states
+            // the real ones move a machine between — a snapshot row appearing
+            // and disappearing — so the card states can be reviewed without a
+            // guest, a hypervisor or a half-gigabyte file.
+            Action::Suspend(name) => {
+                self.mock_statuses.insert(name.clone(), Status::Suspending);
+                self.toast(ToastLevel::Info, format!("Mock: suspending '{name}'"));
+            }
+            Action::ResumeVm(name) => {
+                if let Some(row) = self.snapshot_for(name).map(|row| row.path.clone()) {
+                    self.scan.snapshots.retain(|snap| snap.path != row);
+                }
+                self.mock_statuses.insert(name.clone(), Status::Running);
+                self.toast(ToastLevel::Success, format!("Mock: resumed '{name}'"));
+            }
+            Action::ResumeSnapshot(path) => {
+                let name = self
+                    .scan
+                    .snapshots
+                    .iter()
+                    .find(|row| row.path == *path)
+                    .and_then(|row| row.vm_name().map(str::to_string));
+                self.scan.snapshots.retain(|row| row.path != *path);
+                if let Some(name) = name {
+                    self.mock_statuses.insert(name.clone(), Status::Running);
+                    self.toast(ToastLevel::Success, format!("Mock: resumed '{name}'"));
+                }
+            }
+            Action::ConfirmDeleteSnapshot => {
+                if let Modal::DeleteSnapshot(state) = &self.modal {
+                    let path = state.row.path.clone();
+                    self.scan.snapshots.retain(|row| row.path != path);
+                }
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, "Mock: saved session forgotten");
+            }
+            Action::ConfirmDiscardSnapshot => {
+                if let Modal::DiscardSnapshot(state) = &self.modal {
+                    let (path, vm) = (state.row.path.clone(), state.vm.clone());
+                    self.scan.snapshots.retain(|row| row.path != path);
+                    self.mock_statuses.insert(vm, Status::Running);
+                }
+                self.modal = Modal::None;
+                self.toast(ToastLevel::Success, "Mock: started fresh in memory");
             }
             Action::SubmitWizard => {
                 let name = match &self.modal {
@@ -2178,7 +2552,7 @@ impl ManagerApp {
                 );
             }
             Action::CreateVmDir
-            | Action::RevealDisk(_)
+            | Action::Reveal(_)
             | Action::AskMoveDisk(_)
             | Action::SubmitMoveDisk
             | Action::InstallUpdate
@@ -2230,6 +2604,21 @@ impl ManagerApp {
             Action::Stop(name) => self.stop(&name),
             Action::TogglePause(name) => self.toggle_pause(&name),
             Action::Reset(name) => self.reset(&name),
+            Action::Suspend(name) => self.suspend(&name),
+            Action::ResumeVm(name) => self.resume_vm(&name),
+            Action::ResumeSnapshot(path) => {
+                match self.scan.snapshots.iter().find(|r| r.path == path).cloned() {
+                    Some(row) => self.resume_snapshot(&row),
+                    None => self.toast(
+                        ToastLevel::Error,
+                        format!("{} is gone from the list", path.display()),
+                    ),
+                }
+            }
+            Action::AskDeleteSnapshot(path) => self.ask_delete_snapshot(&path),
+            Action::ConfirmDeleteSnapshot => self.confirm_delete_snapshot(),
+            Action::AskDiscardSnapshot(name) => self.ask_discard_snapshot(&name),
+            Action::ConfirmDiscardSnapshot => self.confirm_discard_snapshot(),
             Action::AskDelete(name) => self.ask_delete(&name),
             Action::ConfirmDelete => self.confirm_delete(),
             Action::CopyProfilePath(path) => {
@@ -2274,7 +2663,7 @@ impl ManagerApp {
                 profile,
                 declared,
             } => self.detach_disk(&vm, &profile, &declared),
-            Action::RevealDisk(path) => self.reveal_disk(&path),
+            Action::Reveal(path) => self.reveal(&path),
             Action::AskEditVm(name) => self.ask_edit_vm(&name),
             Action::SubmitEditVm => self.submit_edit_vm(),
             Action::AskMoveDisk(path) => self.ask_move_disk(&path),
@@ -2350,6 +2739,11 @@ pub enum Status {
     Running,
     Stopping,
     Installing,
+    /// Writing itself to a snapshot file, on its way out (ADR-0006).
+    Suspending,
+    /// Not running, and not a plain stopped machine either: there is a file
+    /// holding everything it was in the middle of.
+    Suspended,
     Stopped,
 }
 
@@ -2359,6 +2753,8 @@ impl Status {
             Status::Running => "Running",
             Status::Stopping => "Stopping",
             Status::Installing => "Installing",
+            Status::Suspending => "Suspending",
+            Status::Suspended => "Suspended",
             Status::Stopped => "Stopped",
         }
     }
@@ -2368,7 +2764,28 @@ impl Status {
             Status::Running => theme::OK,
             Status::Stopping => theme::WARN,
             Status::Installing => theme::CYAN,
+            Status::Suspending => theme::VIOLET_DEEP,
+            Status::Suspended => theme::VIOLET,
             Status::Stopped => theme::TEXT_FAINT,
+        }
+    }
+
+    /// One sentence for the badge's hover, because three of the six states are
+    /// not obvious from their name alone.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Status::Running => "The machine is running in its own window.",
+            Status::Stopping => "Shutdown was asked for; the guest is closing down.",
+            Status::Installing => "An installer is running inside it.",
+            Status::Suspending => {
+                "Writing the machine's memory to a file. It stops when that finishes; \
+                 opening it again puts you back exactly here."
+            }
+            Status::Suspended => {
+                "Not running, but not shut down either: a saved session on disk holds \
+                 everything it had open. Resume goes back into it."
+            }
+            Status::Stopped => "Powered off. Starting it boots the guest from scratch.",
         }
     }
 }
@@ -2421,6 +2838,7 @@ impl eframe::App for ManagerApp {
         match self.view {
             View::Machines => ui::cards::show(ctx, self, &mut actions),
             View::Disks => ui::disks::show(ctx, self, &mut actions),
+            View::Snapshots => ui::snapshots::show(ctx, self, &mut actions),
             View::Diagnostics => ui::diagnostics::show(ctx, self, &mut actions),
         }
         ui::dialogs::show(ctx, self, &mut actions);
@@ -2441,6 +2859,20 @@ impl eframe::App for ManagerApp {
             // expiry fresh without burning a 25 FPS idle loop.
             ctx.request_repaint_after(Duration::from_secs(1));
         }
+    }
+}
+
+/// Deletes a file, treating "it was already gone" as success.
+///
+/// Both callers are confirmations the user has just agreed to, and a second
+/// manager (or the engine itself, resuming and re-saving) may have removed the
+/// file between the dialog opening and the button. Reporting that as a failure
+/// would leave a modal open over a state that is already what was asked for.
+fn remove_if_present(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot delete {}: {e}", path.display())),
     }
 }
 
@@ -2520,6 +2952,8 @@ mod tests {
             Status::Running,
             Status::Stopping,
             Status::Installing,
+            Status::Suspending,
+            Status::Suspended,
             Status::Stopped,
         ];
         for (i, a) in all.iter().enumerate() {

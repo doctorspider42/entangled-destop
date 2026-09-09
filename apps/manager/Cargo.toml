@@ -44,6 +44,13 @@ tracing-subscriber.workspace = true
 png.workspace = true
 control-api.workspace = true
 disk-image.workspace = true
+# Read-only: `vm_snapshot::inspect` answers what a snapshot is of, how big, from
+# which host and whether it could be restored — without a VM, a disk or a byte
+# of guest memory (ADR-0006 names this as the manager's way in). It is the one
+# exception to "the manager links no VMM code", and it is not one in spirit: no
+# hypervisor is ever opened in this process, and running a machine is still a
+# child `entangled` process and nothing else.
+vm-snapshot.workspace = true
 
 # SIGTERM for `stop`, sysconf/statm for the metrics sampler; every other
 # process operation goes through portable `std::process` (see ADR-0002 — this

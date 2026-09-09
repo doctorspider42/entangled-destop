@@ -230,7 +230,7 @@ fn disk_row(ui: &mut egui::Ui, app: &ManagerApp, row: &DiskRow, actions: &mut Ve
                         .on_hover_text("Show the file in the system file manager")
                         .clicked()
                     {
-                        actions.push(Action::RevealDisk(row.path.clone()));
+                        actions.push(Action::Reveal(row.path.clone()));
                     }
                 });
             });

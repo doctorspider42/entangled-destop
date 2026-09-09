@@ -28,6 +28,7 @@ mod mock;
 mod picker;
 mod process;
 mod settings;
+mod snapshots;
 mod theme;
 mod ui;
 mod update;
@@ -73,6 +74,9 @@ enum ScreenshotView {
     Wizard,
     Settings,
     Disks,
+    /// Saved sessions, and the confirmation that throws one away.
+    Snapshots,
+    SnapshotDelete,
     /// The machine editor, on each of its sections — one surface per section,
     /// because that is how the panels are actually reviewed.
     Editor,
