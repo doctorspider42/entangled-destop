@@ -355,15 +355,25 @@ profile has to keep describing the machine it always described:
 enabled = true
 ```
 
-or *Configure ▸ Network & display ▸ Give this machine a gamepad* in the manager.
+or *Configure ▸ Network & display ▸ Give this machine gamepads* in the manager,
+where the number of players sits next to the switch.
 Then, inside the guest:
 
 - `cat /proc/bus/input/devices` should list `Entangled Gamepad`. If it does not,
   the device was never attached — check the host's run log for
   `virtio device activated … device=Input`.
-- The pad is **not necessarily `/dev/input/js0`**: the machine's absolute
-  pointer also matches `joydev` and is attached first, so the pad may be `js1`.
-  Enumerate by name.
+- Player 1's pad is `/dev/input/js0`, player 2's is `js1`. The machine's
+  absolute pointer used to take `js0` (it matches `joydev`'s id table too, and
+  is attached first); it is now shaped so `joydev` refuses it, which is what
+  leaves `js0` to the first pad. Enumerating by name (`Entangled Gamepad`) plus
+  the `Uniq=` serial (`player-1`, `player-2`) is still the robust way to tell
+  two pads apart.
+- **No rumble, in any guest.** Linux's virtio-input driver has no
+  force-feedback support — it never asks the device about `EV_FF` and never
+  creates the kernel plumbing an effect upload needs — and the virtio-input
+  specification has no message that could carry an effect anyway. `EVIOCGBIT`
+  on the pad reports no `EV_FF`, and that is the device reporting the truth,
+  not a missing option.
 - No `/dev/input/js*` **at all**, for any device, means the guest kernel has no
   `joydev`: it is a separate config symbol from `evdev`, and a module rather
   than built in on some distribution kernels (`modprobe joydev`). The pad's

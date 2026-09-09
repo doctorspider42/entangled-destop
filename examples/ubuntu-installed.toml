@@ -87,7 +87,11 @@ enabled = true
 # The guest sees an Xbox-shaped pad on /dev/input/event* and — where the guest
 # kernel has joydev — a /dev/input/js* node, which SDL (and therefore Steam)
 # maps from its capabilities with no controller-database entry and no per-game
-# configuration. Not necessarily js0: the tablet matches joydev too and is
-# attached first, so enumerate by name.
+# configuration. Player 1 is js0: the tablet is deliberately shaped so joydev
+# leaves it alone.
+#
+# players = 2 gives the guest a second pad (js1) at the cost of one more
+# device slot, which this profile has spare only if you drop the CD-ROM.
 [gamepad]
 enabled = true
+# players = 1

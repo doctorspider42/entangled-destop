@@ -660,14 +660,47 @@ Blob resources themselves (`virtio_gpu::blob`) are the device half:
   `guest/bootstrap-kernel/entangled.config` now; `tests/boot/tests/gamepad.rs`
   self-skips rather than run on the Debian-installer fallback, because a
   failure there says nothing about the descriptor.
-  One wart the acceptance turned up: **the tablet is a joystick too**, so a VM
-  with both has the tablet on `js0` and the pad on `js1`.
-  `joydev_dev_is_absolute_mouse()` only excludes a device whose key set is
-  *exactly* `BTN_LEFT`/`RIGHT`/`MIDDLE`, and the tablet also carries
-  `BTN_SIDE`/`BTN_EXTRA` for winit's Back and Forward. Harmless to SDL, which
-  ignores a joystick with no `BTN_JOYSTICK`-range keys; confusing to anything
-  that opens "the first joystick" by number. Written up on
-  `Profile::AbsolutePointer`.
+  **Who gets `js0`, and the rule that decides it.** `joydev`'s id table claims
+  *any* `EV_ABS` device with `ABS_X`, so it claimed the tablet too and the pad
+  came second. The only escape is `joydev_dev_is_absolute_mouse()`, which is
+  three *exact* bitmap comparisons (drivers/input/joydev.c, unchanged v6.12 to
+  master): event types exactly `{SYN,KEY,ABS}` **or** `{SYN,KEY,ABS,MSC}`
+  **or** `{SYN,KEY,ABS,MSC,REL}`; absolute axes exactly `{ABS_X,ABS_Y}`; keys
+  exactly `{BTN_LEFT,BTN_RIGHT,BTN_MIDDLE}`. Note the shape of the first one:
+  **`EV_REL` is admissible only in company with `EV_MSC`**, so a pointer with a
+  scroll wheel needs both or neither. The tablet therefore advertises three
+  buttons and one `MSC_SCAN` bit it never sends, and the host's Back/Forward
+  mouse buttons went to the *keyboard* as `KEY_BACK`/`KEY_FORWARD` — codes it
+  already advertised, and the ones browsers already bind. Measured in the
+  guest, all three states: with the old capabilities the tablet took `js0`;
+  with three buttons but no `EV_MSC` it *still* took `js0` (so the obvious
+  half-fix is a dead end); with both changes it has no `js*` at all.
+  `config::joydev_would_bind` models the rule against our own bitmaps and is
+  unit-tested per profile — use it rather than rediscovering this from a boot.
+  **Two players** (`[gamepad] players = 1..=4`): one virtio-input device is one
+  evdev device, so there is no way to put two pads on one device — `players =
+  N` costs N of the eight slots on either bus, and the arithmetic is written
+  out on `control_api::GamepadSection`. The two devices are the same name and
+  the same `input_id` (as two identical controllers are) and differ only in
+  `VIRTIO_INPUT_CFG_ID_SERIAL`, which `virtio_input.c` puts in `idev->uniq`.
+  Which *host* controller is which player is decided in one portable place,
+  `gamepad::PadRoster`, shared by both backends: fill in order, never steal,
+  never promote — unplugging player 1 leaves player 2's pad where it is, and
+  the freed slot is refilled first.
+  **Rumble does not exist and cannot, yet.** Linux's `virtio_input.c` never
+  queries `EV_BITS` for `EV_FF` and never calls `input_ff_create()`, so `EV_FF`
+  is never in the guest device's `evbit`: `EVIOCSFF` fails before a game gets
+  an effect id, and an `EV_FF` write is dropped by the input core before it
+  could reach the status queue. And the spec has nowhere to upload a
+  `struct ff_effect` — the status queue carries an 8-byte type/code/value
+  triple. Both halves are asserted against a real kernel in
+  `tests/boot/tests/gamepad.rs`. Before writing a host `RumbleSink`, check
+  those two facts still hold; until they change it would be unreachable code.
+  **The status queue is the device's only inbound path** and it is entirely
+  guest-shaped: `StatusEvent::classify` is total, every kind is counted
+  (`status_events`, `status_ff`, `status_rejected`), an unreadable or
+  interleaved chain is refused *and still acked*, and nothing that arrives
+  indexes anything host-side. Fuzzed by `fuzz/fuzz_targets/input_device.rs`.
 
 ## Testing
 

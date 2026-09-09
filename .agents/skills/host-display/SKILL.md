@@ -60,6 +60,18 @@ re-check after touching features).
   `held` is what the user physically holds (maintained even while ungrabbed, so
   shortcuts stay recognisable), `guest_held` is what the guest was told is down
   (only these ever get a key-up, which is what prevents stuck modifiers).
+- **Back and Forward are keyboard codes, not mouse buttons** (`input::nav`).
+  winit's `MouseButton::Back`/`Forward` go to the guest as
+  `KEY_BACK`/`KEY_FORWARD`, not `BTN_SIDE`/`BTN_EXTRA`, and `split_batch`
+  therefore routes them to the keyboard device. The reason is not about the
+  buttons at all: `joydev` only leaves an absolute pointer alone if its key set
+  is *exactly* the three primary mouse buttons, and a tablet it binds takes
+  `/dev/input/js0` away from the gamepad. The full argument is on
+  `virtio_input::config::Profile::AbsolutePointer`; the practical rule here is
+  that **the pointer profile's key bitmap is not a place to add a button** D
+  anything new belongs on the keyboard, in the dense `KEY_*` range it already
+  advertises. (`KEY_BACK`/`KEY_FORWARD` are also what a multimedia keyboard
+  sends, so browsers and desktops bind them with no configuration.)
 
 ## Window UX and the input grab (EPIC 15)
 
