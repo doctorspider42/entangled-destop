@@ -32,10 +32,10 @@ pub mod whp;
 
 pub use error::VmmError;
 pub use hv::{
-    BlobFormat, DestinationMode, ExitHandler, GuestClock, HostIrqChip, HostIrqChipState,
-    InterruptDelivery, InterruptKind, InterruptRequest, MachineConfig, MpState, RunOutcome,
-    TriggerMode, VcpuCensus, VmClockState, X86CpuState, X86DebugRegisters, X86Msr, X86OpaqueState,
-    X86PendingEvents,
+    dirty_summary, BlobFormat, DestinationMode, DirtyLog, DirtyPages, DirtyTracking, ExitHandler,
+    GuestClock, HostIrqChip, HostIrqChipState, InterruptDelivery, InterruptKind, InterruptRequest,
+    MachineConfig, MpState, RunOutcome, TriggerMode, VcpuCensus, VmClockState, X86CpuState,
+    X86DebugRegisters, X86Msr, X86OpaqueState, X86PendingEvents, DIRTY_PAGE_SIZE,
 };
 pub use lifecycle::{
     Checkpoint, Lifecycle, LifecycleError, MachineLifecycle, ResettableVcpu, RunState, VcpuKick,

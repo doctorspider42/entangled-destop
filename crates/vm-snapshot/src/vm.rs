@@ -56,20 +56,37 @@ pub struct SaveReport {
     pub memory: MemoryStats,
     pub elapsed: Duration,
     pub vcpus: usize,
+    /// How the memory sections were stored.
+    pub codec: crate::memory::Codec,
 }
 
 impl SaveReport {
     /// The one-line summary the control channel and the log print.
     pub fn summary(&self) -> String {
         format!(
-            "{} written in {:.2?} ({} of {} guest RAM in {} runs, {} vCPUs)",
+            "{} written in {:.2?} ({} of {} guest RAM in {} runs, {}, {} vCPUs)",
             human(self.bytes),
             self.elapsed,
             human(self.memory.saved_bytes),
             human(self.memory.total_bytes),
             self.memory.runs,
+            self.packing(),
             self.vcpus
         )
+    }
+
+    /// What the codec bought, as the reader wants it: a ratio, or the codec's
+    /// name when there was nothing to pack.
+    fn packing(&self) -> String {
+        match (self.codec, self.bytes) {
+            (crate::memory::Codec::None, _) => "uncompressed".to_string(),
+            (codec, 0) => codec.as_str().to_string(),
+            (codec, bytes) => format!(
+                "{} {:.2}x",
+                codec.as_str(),
+                self.memory.saved_bytes as f64 / bytes as f64
+            ),
+        }
     }
 }
 
@@ -83,7 +100,10 @@ fn human(bytes: u64) -> String {
 /// device worker quiesced. Nothing here checks that, because nothing here can —
 /// it is the caller's contract, and `vmm_core::Lifecycle::save` is what
 /// establishes it.
-pub fn save<M: GuestMemory>(path: &Path, mem: &M, request: SaveRequest<'_>) -> Result<SaveReport> {
+pub fn save<M: GuestMemory>(path: &Path, mem: &M, request: SaveRequest<'_>) -> Result<SaveReport>
+where
+    M::R: Sync,
+{
     let partial = partial_path(path);
     let outcome = save_partial(path, &partial, mem, request);
     if outcome.is_err() {
@@ -100,7 +120,10 @@ fn save_partial<M: GuestMemory>(
     partial: &Path,
     mem: &M,
     request: SaveRequest<'_>,
-) -> Result<SaveReport> {
+) -> Result<SaveReport>
+where
+    M::R: Sync,
+{
     let started = Instant::now();
     // Written beside the target and renamed at the end. A suspend that is
     // interrupted — a full disk, a killed process, a host that loses power —
@@ -116,6 +139,7 @@ fn save_partial<M: GuestMemory>(
     // in this workspace; this crate adds none of its own.)
     let _ = disk_image::ops::mark_sparse(&file);
 
+    let options = crate::memory::SaveOptions::from_env();
     let mut writer = SnapshotWriter::create(file, request.host)?;
     writer.put(
         SectionKind::Metadata,
@@ -150,7 +174,7 @@ fn save_partial<M: GuestMemory>(
     for (kind, version, instance, payload) in devices::encode_machine(request.machine) {
         writer.put(kind, version, instance, &payload)?;
     }
-    let stats = memory::save(mem, &mut writer)?;
+    let stats = memory::save_with(mem, &mut writer, options)?;
     let (bytes, file) = writer.finish()?;
     file.sync_all()
         .map_err(SnapshotError::io("making the snapshot durable"))?;
@@ -163,6 +187,7 @@ fn save_partial<M: GuestMemory>(
         memory: stats,
         elapsed: started.elapsed(),
         vcpus: request.cpus.len(),
+        codec: options.codec,
     })
 }
 

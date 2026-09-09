@@ -625,6 +625,25 @@ fn spawn_control_channel(
 /// A worker that is stuck — a host disk that has stopped answering — must not
 /// be able to wedge a pause, so this is bounded and the pause proceeds with a
 /// warning. Generous next to the milliseconds a queue drain takes.
+/// Arms the hypervisor's guest-write log for the life of the VM (ADR-0006).
+///
+/// Off by default and deliberately an environment variable rather than a
+/// profile field: nothing in the product reads the log, because a log that
+/// cannot see this process's own writes into guest RAM cannot answer "what
+/// changed since the last snapshot" (`vmm_core::hv::DirtyTracking`). What it
+/// can answer is what the *guest* wrote and what the tracking cost it, which is
+/// what somebody re-examining that decision on another machine needs — so the
+/// instrument ships, next to `ENTANGLED_WHP_TRACE_EXITS`, rather than living
+/// only in a branch nobody can run.
+pub(crate) const TRACK_DIRTY_ENV: &str = "ENTANGLED_TRACK_DIRTY";
+
+pub(crate) fn track_dirty_requested() -> bool {
+    matches!(
+        std::env::var(TRACK_DIRTY_ENV).as_deref(),
+        Ok("1") | Ok("yes") | Ok("on") | Ok("true")
+    )
+}
+
 const QUIESCE_SETTLE: Duration = Duration::from_secs(5);
 
 /// How often the supervisor looks for a lifecycle request.
@@ -1368,6 +1387,17 @@ mod host_api {
         /// chips are in this process, where they are saved with the rest of the
         /// machine.
         pub host_irqchip: Option<Arc<dyn HostIrqChip>>,
+        /// The hypervisor's write log, armed only when
+        /// [`TRACK_DIRTY_ENV`](super::TRACK_DIRTY_ENV) asked for it.
+        ///
+        /// A measurement instrument, not part of how a snapshot is written —
+        /// ADR-0006 explains at length why a log that cannot see this process's
+        /// own writes into guest RAM is not the foundation of an incremental
+        /// snapshot. What it *is* good for is answering "how much of what the
+        /// suspend wrote had the guest actually written, and what did arming
+        /// the tracking cost the guest?", which is a question anybody
+        /// reconsidering that decision on another machine has to be able to ask.
+        pub dirty: Option<Arc<dyn vmm_core::hv::DirtyLog>>,
     }
 
     impl VmMachine {
@@ -1454,6 +1484,28 @@ mod host_api {
         /// The clock is read last of the small state, as close as possible to
         /// the memory dump it will be restored alongside.
         fn save_machine(&self, cpus: &[X86CpuState], path: &Path) -> Result<String, String> {
+            // Read before the dump, while the numbers still describe the same
+            // instant. Never fatal: this is an instrument, and a VM must not
+            // fail to suspend because one could not be read.
+            let dirty = self.dirty.as_ref().and_then(|log| match log.fetch_dirty() {
+                Ok(log) => {
+                    let (pages, bytes, total) = vmm_core::hv::dirty_summary(&log);
+                    // The number ADR-0006's argument turns on: pages this
+                    // snapshot has to carry that the hypervisor never mentioned.
+                    // A second full scan, which is why it happens only when
+                    // somebody asked for the measurement.
+                    let missed = vm_snapshot::memory::unreported(self.mem.as_ref(), &log)
+                        .inspect_err(|error| {
+                            tracing::warn!(%error, "cannot compare the write log with guest memory")
+                        })
+                        .ok();
+                    Some((pages, bytes, total, missed))
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot read the guest write log");
+                    None
+                }
+            });
             let machine = self.bus.save_state();
             let devices = vm_snapshot::devices::device_slots(&machine);
             let clock = match &self.clock {
@@ -1505,6 +1557,29 @@ mod host_api {
                 elapsed = ?report.elapsed,
                 "snapshot written"
             );
+            if let Some((pages, guest_written, total, missed)) = dirty {
+                // The gap between these two is the whole of ADR-0006's
+                // dirty-page argument, in one line: what the *guest* wrote, and
+                // what actually had to be saved. The second is larger, and the
+                // difference is this process's own writes — boot images, device
+                // completions, used rings — which no hypervisor's log reports.
+                tracing::info!(
+                    guest_written_pages = pages,
+                    guest_written = guest_written,
+                    saved = report.memory.saved_bytes,
+                    total,
+                    "guest write log at suspend"
+                );
+                if let Some(missed) = missed {
+                    tracing::info!(
+                        nonzero_pages = missed.nonzero_pages,
+                        reported_pages = missed.reported_pages,
+                        missing_pages = missed.missing_pages,
+                        missing_bytes = missed.missing_bytes,
+                        "pages this snapshot carries that the write log never reported                          (host writes: boot images, device completions, used rings)"
+                    );
+                }
+            }
             Ok(report.summary())
         }
     }
@@ -1777,6 +1852,25 @@ mod host {
 
         let clock = vm.clock();
         let host_irqchip = vm.irqchip();
+        let dirty = match super::track_dirty_requested() {
+            true => {
+                let log = vm.dirty_log();
+                match log.set_dirty_logging(true) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "guest write tracking armed (KVM_MEM_LOG_DIRTY_PAGES); the guest \
+                             takes a write-protection fault on its first write to every page"
+                        );
+                        Some(log)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot arm guest write tracking");
+                        None
+                    }
+                }
+            }
+            false => None,
+        };
         let (entry, vcpus) = match restore {
             None => {
                 let entry = load_boot(vm.memory(), &plan)?;
@@ -1830,6 +1924,7 @@ mod host {
             cfg: cfg.clone(),
             clock: Some(clock),
             host_irqchip: Some(host_irqchip),
+            dirty,
         }));
 
         let threads = spawn_vcpus_with(vcpus, |_| Box::new(bus.clone()), Some(lifecycle))
@@ -1934,8 +2029,25 @@ mod host {
         // delivery, the `hlt` idle wait) and this machine's CPUID policy. One
         // partition per process — WHP maps guest memory for a single partition,
         // which is why the manager runs one `entangled` process per VM.
-        let mut vm = WhpPartition::with_options(&hv, machine, WhpOptions::for_guest())
-            .map_err(|e| e.to_string())?;
+        // WHP decides write tracking when guest RAM is mapped, so it is a
+        // partition option rather than a switch — see `WhpOptions::track_dirty`.
+        let track_dirty = super::track_dirty_requested();
+        let options = WhpOptions {
+            track_dirty,
+            ..WhpOptions::for_guest()
+        };
+        let mut vm =
+            WhpPartition::with_options(&hv, machine, options).map_err(|e| e.to_string())?;
+        let dirty = match track_dirty {
+            true => {
+                tracing::info!(
+                    "guest write tracking armed (WHvMapGpaRangeFlagTrackDirtyPages) for the \
+                     life of this partition"
+                );
+                Some(vm.dirty_log())
+            }
+            false => None,
+        };
 
         // The same interrupt topology the KVM machine publishes: the guest must
         // not be able to tell the hosts apart from the tables. A restored VM
@@ -2054,6 +2166,7 @@ mod host {
             // WHP's interrupt controllers are `machine_x86::irqchip`, in this
             // process, and are saved with every other device.
             host_irqchip: None,
+            dirty,
         }));
 
         let threads = spawn_vcpus_with(vcpus, |_| Box::new(bus.clone()), Some(lifecycle))

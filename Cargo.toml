@@ -163,6 +163,11 @@ windows = { version = "0.62", default-features = false }
 
 # Installer mode (EPIC 10): gzip for the preseed initrd append.
 flate2 = "1"
+# Snapshot memory compression (ADR-0006). MIT, pure Rust — no C toolchain on
+# either host — and the *block* format only: the default `frame` feature drags
+# in twox-hash for a framing layer this crate does not use, because a snapshot
+# section already carries its own length and its own SHA-256.
+lz4_flex = { version = "0.14", default-features = false, features = ["std"] }
 
 # Media downloader (EPIC 6). rustls-only HTTP (no OpenSSL linkage) and rpgp for
 # OpenPGP — never sequoia-openpgp, which is LGPL (see deny.toml).

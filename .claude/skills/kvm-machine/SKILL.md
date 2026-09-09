@@ -166,3 +166,36 @@ the IOAPIC) and never printed another line. `vmm_core::hv::HostIrqChip` — thre
 `KVM_GET_IRQCHIP` chips and `KVM_GET_PIT2` — is the seam that carries them, and
 `Vm::irqchip()` hands it out. Restore them **after** the devices and with the
 IOAPIC last, the mirror of the reset order.
+
+## Tracking guest writes, and what the log misses (ADR-0006)
+
+`Vm::dirty_log()` hands out a `vmm_core::hv::DirtyLog`: `KVM_MEM_LOG_DIRTY_PAGES`
+toggled by **re-registering each RAM slot** (a `KVM_SET_USER_MEMORY_REGION` on an
+existing slot number replaces it — that is the kernel's own spelling of a flag
+change) and `KVM_GET_DIRTY_LOG` per slot to read it. The slots are kept as
+`RamSlot` copies of exactly what was registered, because a re-registration whose
+host address had drifted would silently repoint guest RAM at somebody else's
+memory.
+
+Three things to know before building on it:
+
+- **The log does not see this process's writes.** KVM write-protects the *guest's*
+  second-level page tables; a `memcpy` from the VMM into the anonymous mapping
+  those tables point at faults nothing. Boot images, virtio-blk read completions,
+  received packets, used-ring updates — none of them move a bit. That is why
+  ADR-0006 does not build an incremental snapshot on this, and
+  `crates/vmm-core/tests/dirty_log.rs` is the test that says so on both hosts.
+- **On AMD it over-reports.** Measured on this machine: a page the guest only
+  *executed* from comes back dirty. Harmless for a copier, fatal for anyone who
+  reads the log as "what the guest wrote" and reasons from the count.
+- **Reading clears.** No `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT` here, so
+  `KVM_GET_DIRTY_LOG` re-protects as it reads and a second read reports the next
+  window, not the sum. `DirtyTracking::read_clears` states it and the test checks
+  it, because a claim about a hypervisor that nothing checks quietly stops being
+  true.
+
+Arming it costs the guest a write-protection fault on its first write to every
+page — below the noise of a boot when measured (ADR-0006) — plus the cost that a
+boot cannot show: a memslot with dirty logging on cannot use huge pages, so the
+guest runs with 4 KiB second-level entries for as long as it is armed. Off by
+default; `ENTANGLED_TRACK_DIRTY=1` turns it on.

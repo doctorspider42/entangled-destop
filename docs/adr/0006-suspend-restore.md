@@ -187,6 +187,10 @@ snapshot is still marked sparse through `disk_image::ops::mark_sparse` — this
 workspace has exactly one home for hole-aware file operations and `vm-snapshot`
 adds none of its own.
 
+Since the dirty-page amendment below, the runs are scanned in place and in
+parallel and stored as LZ4 blocks; the run encoding itself is unchanged, and the
+section is at version 2.
+
 ### 5. A versioned format, and what it refuses
 
 ```text
@@ -224,6 +228,7 @@ host that lost power, and handed over by someone else. So:
 | a shared-memory region the host placed elsewhere | the guest's blob mappings point at the address it read from the registers. Live since VEN-2001 phase 2 (2026-09-09): the aperture starts at the top of RAM, so a restore into a differently sized guest moves the window and this is what catches it |
 | trailing bytes in a section | written by a build that put more in it |
 | a count or length that cannot fit | nothing is ever allocated on an unchecked number |
+| a memory **block** that is empty, over-long, of an unknown codec, or that unpacks to a different length than it claims | added with compression; see the dirty-page amendment for the full list |
 | vCPU count, memory size, transport, boot mode, device list/order | a guest whose `/dev/vda` is now somebody else's disk |
 | **a disk whose size or mtime moved** | see below |
 
@@ -405,12 +410,15 @@ but able to run its whole shutdown path.
    `entangled resume --screenshot-after` exists to make that a one-command
    check; it needs a desktop image that is not in use by anything else.
 7. **Host input queued while the VM was frozen is dropped**, as it is by a pause.
-8. **Dirty-page tracking is not implemented.** Every suspend writes every
-   non-zero page. `KVM_GET_DIRTY_LOG` and `MEM_WRITE_WATCH` are what would turn a
-   repeated suspend of the same VM into an incremental one; the alias in
-   `vmm_core::memory` exists for exactly that divergence.
-9. **The snapshot is not compressed** and not encrypted. A desktop guest's file
-   is the size of its touched RAM.
+8. **Every suspend still writes every non-zero page, on purpose.** Dirty-page
+   tracking exists (`vmm_core::hv::DirtyLog`, both hosts) and is *not* what
+   decides a snapshot's contents: neither host's log can see a write this
+   process makes into guest RAM, which on the bootstrap guest is 16.7 % of what
+   the snapshot has to carry. See the dirty-page amendment below for the
+   measurement and the decision.
+9. ~~**The snapshot is not compressed.**~~ Closed by the same amendment: memory
+   sections are LZ4 blocks, 2.2–2.3× on a real desktop guest. Still **not
+   encrypted**.
 10. **`Suspended` never goes back to `Running` in the same process.** Resuming is
    always a new process. Nothing needs it to be otherwise today, but a manager
    that wanted a "hibernate and wake" button inside one process would.
@@ -497,3 +505,243 @@ effect, whereas an audio period that was never played has had none — dropping
 it would silently lose the descriptors the guest is still waiting on.
 
 The rule this implies: **rewind only what a restore can safely do again.**
+
+## Amendment, 2026-09-09 — dirty-page tracking, and why the snapshot is still whole
+
+The TODO below opened with *"dirty-page tracking is not implemented; every
+suspend writes every non-zero page"*, and named `KVM_GET_DIRTY_LOG` and
+`MEM_WRITE_WATCH` as what would turn a repeated suspend into an incremental one.
+Both are now behind the seam. **Neither is used to decide what a snapshot
+contains**, and the reason is a measurement rather than a preference.
+
+### 1. The seam
+
+`vmm_core::hv::DirtyLog` is a peer of `GuestClock` and `HostIrqChip`: the layer
+above holds it without holding a `VmFd` or a `WHV_PARTITION_HANDLE`.
+`DirtyPages` is the portable half — one bit per 4 KiB, LSB first, with the page,
+run and byte arithmetic unit-tested on both hosts.
+
+| | KVM | WHP |
+|---|---|---|
+| arming | `KVM_MEM_LOG_DIRTY_PAGES`, set by re-registering each RAM slot — **at any time** | `WHvMapGpaRangeFlagTrackDirtyPages`, a flag on `WHvMapGpaRange` — **when the range is mapped, and never again** |
+| reading | `KVM_GET_DIRTY_LOG` per slot | `WHvQueryGpaRangeDirtyBitmap` per region |
+| reading clears | yes (no `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT` here) | yes |
+
+That first row is the asymmetry, and it is why `set_dirty_logging` is a request
+rather than a setter: WHP agrees with the answer `WhpOptions::track_dirty`
+already gave and refuses to change it, saying why. Unmapping and re-mapping
+every byte of a running guest's RAM to flip a flag is not a trade a backend
+makes on a caller's behalf, and pretending the two hosts have the same switch
+would have hidden exactly the thing a reader needs to know.
+
+### 2. What the log cannot see, and what that costs
+
+**Both hosts track the guest's writes by protecting the guest's second-level
+page tables. A write this process makes through the host allocation those tables
+point at faults neither one and is reported by neither.** Every virtio-blk read
+completion, every received packet, every used-ring update, every boot image is
+such a write. `crates/vmm-core/tests/dirty_log.rs` states it as a test on both
+hosts: arm the tracking, write two pages of guest RAM from the VMM, read back
+zero dirty pages.
+
+The log is inexact in the other direction too. On this AMD machine KVM reports a
+page the guest merely **executed** from. That direction is harmless — an
+incremental that copied it would only copy too much — but together the two mean
+the dirty log is *neither a subset nor a superset of "what changed"*.
+
+On a real guest, `ENTANGLED_TRACK_DIRTY=1` puts a number on it. The bootstrap
+guest, 256 MiB, at the moment of suspend:
+
+| | pages the snapshot must carry | of those, reported | **never reported** |
+|---|---|---|---|
+| WHP | 19 251 | 16 038 | **3 213 — 12.55 MiB, 16.7 %** |
+| KVM (AMD) | 19 253 | 19 250 | 3 — 12 KiB |
+
+The 12.55 MiB is, almost exactly, the kernel image this process loaded into
+guest RAM. An incremental snapshot built on the log would have left the guest's
+own kernel text at whatever the base happened to hold. And the two hosts
+disagreeing by three orders of magnitude on the same guest is the argument by
+itself: KVM's near-complete coverage here is an artefact of the execute
+over-report on one vendor's silicon, not a property anything may rely on.
+
+Making it sound is possible and is what QEMU does: every DMA path calls
+`memory_region_set_dirty()` by hand. That would be a **fourth thing every device
+owes the machine**, beside `reset()`, the `Quiesce` gate and the `save`/`load`
+pair — and the one whose absence is the least visible of the four. A forgotten
+`reset()` haunts a reboot; a forgotten `Quiesce` makes "paused" a lie; a
+forgotten `save` makes a resumed guest subtly wrong. A forgotten dirty report
+makes a resumed guest's **page cache** subtly wrong, which surfaces as
+filesystem corruption an hour later in a place with no path back here.
+
+### 3. So: no chain. The win goes into making one save fast
+
+The other half of the trade is what an incremental would buy. A chain is a base
+plus deltas, and:
+
+- **the dominant case gets nothing.** The first suspend of a booted guest has no
+  base. That is the suspend a desktop user actually performs;
+- **the resting state stops being one file.** `<name>.esnap` beside the profile
+  is what the manager looks for, what "Start fresh" deletes and what a bare
+  `save` overwrites — and a later save writes back to the file it was resumed
+  from, deliberately (see the manager amendment). A chain needs new names, a new
+  deletion rule, a new "which of these may I remove" question in the GUI, and a
+  restore that opens files it was not handed;
+- **it adds a refusal that cannot always be checked.** A missing base is easy; a
+  base that was *edited* between the delta being written and being read is a
+  digest away, and a base restored from a backup that is byte-identical but
+  describes a different guest is not detectable at all;
+- **it does not save space.** Base plus deltas is larger than one snapshot.
+
+So the decision is: **a snapshot stays a whole machine in one file**, and the
+effort goes where the numbers said the time actually was.
+
+### 4. Where the time was
+
+Three changes to `vm_snapshot::memory`, in the order the measurements asked for
+them:
+
+1. **Scan the guest where it lies.** The old scanner read every region into a
+   1 MiB buffer and looked for zeroes there — a full-RAM `memcpy` performed to
+   discover that three quarters of it is zero. `region_bytes` reads through the
+   bounds-checked `VolatileSlice` the region already offers. One `unsafe`, whose
+   justification is this module's existing contract: a snapshot is taken at a
+   lifecycle stop point, so nothing is writing guest memory while it is read. A
+   save taken without that guarantee was already a torn picture whichever API it
+   used; this makes the requirement explicit instead of paying for a copy that
+   hid it.
+2. **Slabs in parallel.** 4 MiB pieces to a pool of up to eight workers. The
+   workers return only the **run boundaries** — a first attempt had them return
+   the encoded bytes, and four threads came out *slower* than one, all of it in
+   the allocator. The writer emits slabs in order, so the file does not depend on
+   the thread count; `the_thread_count_does_not_change_the_file` asserts it byte
+   for byte for both codecs.
+3. **LZ4 block compression**, on the worker that scanned the slab — the one part
+   of the pipeline with cores to spare. This closes TODO 9.
+
+`ENTANGLED_SNAPSHOT_THREADS` and `ENTANGLED_SNAPSHOT_COMPRESS` exist so the
+numbers below can be reproduced, and so a host where the CPU is scarcer than the
+disk can say so.
+
+### 5. The format change, and every new refusal
+
+Only the third change touches the file. `MEMORY_VERSION` is **2**: the region
+header's reserved word became a codec, and each slab is now a block:
+
+```text
+  gpa u64 | region length u64 | page size u32 | codec u32
+  ( raw length u64 | stored length u64 | stored bytes ) *   until the section ends
+
+  a block, once decoded:
+  ( offset u64 | length u64 | length bytes ) *              until the block ends
+```
+
+Deliberately a *framing around the unchanged run encoding* rather than a new
+encoding: how a run is spelled did not change, which keeps the change — and the
+risk — in one place. A wholly zero slab writes no block at all, so an idle
+guest's snapshot is still a few hundred bytes.
+
+The parallel scan did **not** bump the version, and that is a rule worth
+stating: a version buys a refusal, and a refusal that protects nothing costs
+somebody their snapshot for no reason.
+
+New refusals, each named and each tested (`the_block_framing_refuses_by_name`):
+
+| Refusal | Why it exists |
+|---|---|
+| a memory section at version 1 | its reserved word is not a codec, and reading it as one would decode a zero as "uncompressed" and then disagree about every length |
+| an unknown codec | a future codec must be a refusal on an old build, not a mis-decode |
+| a raw block length above 64 MiB | a decoder must not allocate on somebody else's number |
+| a stored block length above that plus a megabyte | the same, for the buffer the bytes arrive in |
+| an uncompressed block whose two lengths disagree | one of them is a lie and there is no way to tell which |
+| a zero-length block | the writer never emits one, and a decoder that accepted it would make no progress |
+| bytes that are not an LZ4 block | |
+| a block that decompresses **short** of what it claims | the bytes past the end would restore as zeroes — a hole in the guest that nothing else would ever see |
+| a run header or a run that ends past the block | |
+| a run that ends past its region | already there; now checked inside the block |
+
+`fuzz/fuzz_targets/snapshot_parse.rs` grew a fourth layer for exactly this
+surface: a region header this build agrees with, and everything after it from
+the fuzzer — block lengths, codec, LZ4 payload, the run headers inside. What is
+asserted beyond "no panic" is that anything which decodes survives a re-save and
+a second restore unchanged, which is the memory section's version of the exact
+re-encode the other sections get. **165 196 runs in 241 s, no crashes.**
+
+### 6. Measured
+
+Two references, because they answer different questions.
+
+**`crates/vm-snapshot/tests/memory_bench.rs`** is the controlled one: the same
+synthetic guest, the same fill, before and after, in the same minute. It reports
+a **cold** and a **warm** pass, and the distinction turned out to matter — a
+real guest's untouched RAM is not resident in the host, so the scan takes a
+minor fault per page to read a zero, and a benchmark that discarded its first
+run would have understated the old scanner's cost by a third. Cold figures,
+release:
+
+| 2 GiB guest, 25 % touched | KVM (WSL) before | after | WHP before | after |
+|---|---|---|---|---|
+| save | 5.07 s | **844 ms** | 4.93 s | **804 ms** |
+| file | 512.3 MiB | **320.0 MiB** | 512.3 MiB | **320.0 MiB** |
+| restore | 1.19 s | 1.21 s | 765 ms | 780 ms |
+| 256 MiB guest, save | 393 ms | **129 ms** | 638 ms | **116 ms** |
+| all-zero 2 GiB, save | 1.63 s | **156 ms** | 1.68 s | **154 ms** |
+
+**The real guests** are the end-to-end confirmation, release, through
+`entangled run --control-stdin` and `entangled resume`:
+
+| | KVM before | after | WHP before | after |
+|---|---|---|---|---|
+| **bootstrap**, 256 MiB, direct Linux, virtio-pci | | | | |
+| suspend (the seam's own time) | 421 ms | **159 ms** | 270 ms | **129–164 ms** |
+| file | 78.8 MB | **47.9 MB** | 78.8 MB | **49.8 MB** |
+| **installed Ubuntu**, 2 GiB, 2 vCPUs, UEFI, GPT disk | | | | |
+| suspend | 4.13 s | **888 ms** | 5.71 s | **1.47 s** |
+| memory written | 519 MiB | 520 MiB | 511 MiB | 543 MiB |
+| file | 544 MB | **243 MB** (2.24×) | 536 MB | **248 MB** (2.30×) |
+| resume, to the guest answering | 5.26 s | 5.25 s | — | 5.26 s |
+
+Three things those numbers say.
+
+**Restore did not get faster, and did not need to.** Decompressing gives back
+what reading less costs; the resumed guest answers in the same five seconds it
+did before, of which the memory read was never the largest part.
+
+**Real guest memory compresses better than the synthetic guest does** — 2.24–2.30×
+against 1.60×. The synthetic fill is deliberately three pseudorandom bytes in
+every eight, which is closer to the pessimistic end; a real guest has text,
+page cache and zeroed structures.
+
+**The machine is shared, and one reading proves it.** An earlier KVM Ubuntu
+suspend read 2.99 s where the repeat read 888 ms; the first was taken with a
+Windows workspace build running beside it, which is the exact combination the
+`dev-environment` skill warns about. Numbers from this machine are only
+comparable against numbers taken beside them.
+
+### 7. What arming the tracking costs
+
+Boot to `VMHOST_GUEST_READY` on the bootstrap guest, which unpacks its whole
+initramfs into a tmpfs on the way there and so takes a first-write fault on
+almost every page it will ever touch:
+
+| | tracking off | tracking on |
+|---|---|---|
+| KVM | 3.68 / 3.82 / 4.41 s | 3.66 / 3.72 / 4.54 s |
+| WHP | 3.49 / 3.68 / 3.79 s | 3.44 / 3.68 / 3.69 s |
+
+Within the run-to-run spread, on both hosts: ~19 000 write-protection faults do
+not show against a three-and-a-half second boot. What a boot cannot show is the
+cost that outlives it — a KVM memslot with dirty logging on cannot use huge
+pages, so the guest runs with 4 KiB second-level entries for its whole life, and
+on WHP the flag cannot be taken back at all. Both are reasons to leave tracking
+off by default, and neither is a reason to disbelieve the table.
+
+### 8. What this changes about the resting state
+
+Nothing. A snapshot is still one file, still self-contained, still bound to its
+host, its build and its disks. `ENTANGLED_TRACK_DIRTY=1` arms the log and makes
+the suspend log say what the guest wrote against what had to be saved; nothing
+else in the product reads it. The instrument ships rather than living in a
+branch nobody can run, because the decision above is one somebody should be able
+to re-examine on another machine — on Intel, where the execute over-report does
+not happen, or on a guest whose disk is busy, where the unreported fraction will
+be larger than 16.7 %, not smaller.

@@ -779,3 +779,28 @@ Acceptance on this host: `cargo test -p entangled --test suspend_restore` —
 suspended at `VMHOST_HEARTBEAT 3`, resumed at 4, no second ready marker, and all
 six refusals named including "snapshot was taken on Linux/KVM and this is
 Windows/WHP".
+
+## Tracking guest writes: a map-time decision (ADR-0006)
+
+`WhpPartition::dirty_log()` hands out the same `vmm_core::hv::DirtyLog` the KVM
+backend does, over `WHvQueryGpaRangeDirtyBitmap`. **The asymmetry is where the
+flag lives**: WHP takes `WHvMapGpaRangeFlagTrackDirtyPages` in `WHvMapGpaRange`,
+so a partition either tracks for its whole life or never. It is therefore an
+additive `WhpOptions::track_dirty` rather than a runtime switch, and
+`set_dirty_logging` agrees with the answer that option already gave and **refuses
+to change it, saying why** — unmapping and re-mapping every byte of a running
+guest's RAM to flip a flag is not a trade this backend makes on a caller's
+behalf. KVM can toggle whenever it likes. Neither backend's signature bent to
+suit the other (ADR-0002).
+
+The thing worth knowing is the same on both hosts and is measured here rather
+than asserted: **the log does not see writes this process makes into guest RAM.**
+WHP protects the SLAT; the VMM writes the `VirtualAlloc` allocation behind it. On
+the bootstrap guest, 3213 of the 19 251 pages a snapshot has to carry — 12.55 MiB,
+essentially the kernel image the host loaded — were never reported.
+`crates/vmm-core/tests/dirty_log.rs` and `ENTANGLED_TRACK_DIRTY=1` are how that
+was established; ADR-0006's dirty-page amendment is what it decided.
+
+Unlike KVM, WHP here does **not** report a page the guest merely executed from,
+which is why the two hosts' unreported counts differ by three orders of
+magnitude on the same guest. Do not port a conclusion from one to the other.

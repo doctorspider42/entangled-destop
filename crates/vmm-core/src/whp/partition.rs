@@ -6,15 +6,16 @@ use vm_memory::{Address, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, Mm
 use windows::Win32::System::Hypervisor::{
     WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeProcessorVendor, WHvCreatePartition,
     WHvCreateVirtualProcessor, WHvDeletePartition, WHvGetCapability, WHvMapGpaRange,
-    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
-    WHvPartitionPropertyCodeCpuidExitList, WHvPartitionPropertyCodeExtendedVmExits,
-    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
-    WHvProcessorVendorAmd, WHvProcessorVendorHygon, WHvProcessorVendorIntel,
-    WHvSetPartitionProperty, WHvSetupPartition, WHvUnmapGpaRange,
-    WHvX64LocalApicEmulationModeXApic, WHV_PARTITION_HANDLE, WHV_PROCESSOR_VENDOR,
+    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagTrackDirtyPages,
+    WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidExitList,
+    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
+    WHvPartitionPropertyCodeProcessorCount, WHvProcessorVendorAmd, WHvProcessorVendorHygon,
+    WHvProcessorVendorIntel, WHvQueryGpaRangeDirtyBitmap, WHvSetPartitionProperty,
+    WHvSetupPartition, WHvUnmapGpaRange, WHvX64LocalApicEmulationModeXApic, WHV_PARTITION_HANDLE,
+    WHV_PROCESSOR_VENDOR,
 };
 
-use crate::hv::{HvError, MachineConfig};
+use crate::hv::{DirtyLog, DirtyPages, DirtyTracking, HvError, MachineConfig, DIRTY_PAGE_SIZE};
 use crate::memory::{create_guest_memory, GuestMem};
 use crate::shm::SharedWindow;
 use crate::whp::interrupt::{HaltGate, WhpInterruptDelivery};
@@ -168,6 +169,18 @@ pub struct WhpOptions {
     /// guest sees the same CPUID as the KVM guest (see
     /// [`crate::whp::CPUID_EXIT_LEAVES`]).
     pub cpuid_policy: bool,
+
+    /// Map guest RAM with `WHvMapGpaRangeFlagTrackDirtyPages`, so
+    /// `WHvQueryGpaRangeDirtyBitmap` can report what the guest wrote
+    /// (ADR-0006).
+    ///
+    /// **A map-time decision, unlike KVM's**, and that asymmetry is the point
+    /// of recording it here rather than hiding it behind a runtime toggle: WHP
+    /// takes the flag in `WHvMapGpaRange`, so turning tracking on for a running
+    /// VM would mean unmapping and re-mapping every byte of its RAM. The
+    /// neutral [`crate::hv::DirtyLog::set_dirty_logging`] therefore accepts the
+    /// answer this option already gave and refuses to change it, saying why.
+    pub track_dirty: bool,
 }
 
 impl WhpOptions {
@@ -176,6 +189,11 @@ impl WhpOptions {
         Self {
             local_apic: true,
             cpuid_policy: true,
+            // Off: a guest pays write-protection faults for it and nothing in
+            // the product reads the log (ADR-0006 says why the incremental
+            // snapshot it would serve is not built). `ENTANGLED_TRACK_DIRTY=1`
+            // turns it on for a measurement.
+            track_dirty: false,
         }
     }
 }
@@ -364,7 +382,7 @@ impl WhpPartition {
         // SAFETY: `handle` is a live partition with all properties set.
         unsafe { WHvSetupPartition(handle) }.map_err(|e| whp_err("WHvSetupPartition", e))?;
 
-        map_guest_memory(handle, partition.memory())?;
+        map_guest_memory(handle, partition.memory(), options.track_dirty)?;
 
         let mut vcpus = Vec::with_capacity(cfg.vcpu_count as usize);
         for index in 0..cfg.vcpu_count {
@@ -461,6 +479,18 @@ impl WhpPartition {
     /// interrupt (a stop request).
     pub fn halt_gate(&self) -> Arc<HaltGate> {
         Arc::clone(self.partition.halt_gate())
+    }
+
+    /// This partition's guest-RAM write log (ADR-0006), live only if the
+    /// partition was created with [`WhpOptions::track_dirty`].
+    ///
+    /// Read [`DirtyTracking::host_writes`] before building on it: WHP reports
+    /// what the *guest* wrote, and this process's own writes into guest RAM go
+    /// through the mapped host allocation and are invisible to it.
+    pub fn dirty_log(&self) -> Arc<dyn DirtyLog> {
+        Arc::new(WhpDirtyLog {
+            partition: Arc::clone(&self.partition),
+        })
     }
 
     /// Maps a firmware image at `guest_addr` as its own GPA range, outside guest
@@ -721,12 +751,20 @@ fn set_cpuid_exit_list(handle: WHV_PARTITION_HANDLE) -> Result<(), VmmError> {
 /// Maps every guest memory region read/write/execute. One region today (see
 /// [`create_guest_memory`]), but the loop mirrors the KVM memslot loop so
 /// adding the MMIO hole later is symmetric.
-fn map_guest_memory(handle: WHV_PARTITION_HANDLE, memory: &GuestMem) -> Result<(), VmmError> {
+fn map_guest_memory(
+    handle: WHV_PARTITION_HANDLE,
+    memory: &GuestMem,
+    track_dirty: bool,
+) -> Result<(), VmmError> {
     for region in memory.iter() {
         let host_addr = region
             .get_host_address(MemoryRegionAddress(0))
             .map_err(|e| VmmError::GuestMemory(e.to_string()))?;
-        let flags = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute;
+        let mut flags =
+            WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute;
+        if track_dirty {
+            flags |= WHvMapGpaRangeFlagTrackDirtyPages;
+        }
         // SAFETY: `host_addr` is the page-aligned base of a live
         // `VirtualAlloc` region of exactly `region.len()` bytes owned by
         // `memory`, which is dropped only after `WHvDeletePartition` (see
@@ -744,6 +782,93 @@ fn map_guest_memory(handle: WHV_PARTITION_HANDLE, memory: &GuestMem) -> Result<(
         .map_err(|e| whp_err("WHvMapGpaRange", e))?;
     }
     Ok(())
+}
+
+/// `WHvQueryGpaRangeDirtyBitmap` behind the neutral seam (ADR-0006).
+///
+/// The WHP peer of `crate::vm::KvmDirtyLog`, with one behavioural difference
+/// that no amount of API design can hide: **WHP decides at map time**. The
+/// tracking flag belongs to `WHvMapGpaRange`, so a partition either has it for
+/// its whole life or never; [`Self::set_dirty_logging`] therefore agrees with
+/// the answer [`WhpOptions::track_dirty`] already gave and refuses to change
+/// it, naming the reason. Unmapping and re-mapping every byte of a running
+/// guest's RAM to flip a flag is not a trade this backend makes on a caller's
+/// behalf.
+struct WhpDirtyLog {
+    partition: Arc<Partition>,
+}
+
+impl DirtyLog for WhpDirtyLog {
+    fn tracking(&self) -> DirtyTracking {
+        DirtyTracking {
+            guest_writes: true,
+            // WHP tracks writes through the SLAT. This process writes guest RAM
+            // through the `VirtualAlloc` allocation it handed to
+            // `WHvMapGpaRange`, which the SLAT never sees.
+            host_writes: false,
+            read_clears: true,
+        }
+    }
+
+    fn dirty_logging(&self) -> bool {
+        self.partition.options().track_dirty
+    }
+
+    fn set_dirty_logging(&self, on: bool) -> Result<(), HvError> {
+        if on == self.dirty_logging() {
+            return Ok(());
+        }
+        Err(HvError::Registers(format!(
+            "WHP fixes dirty-page tracking when guest RAM is mapped: this partition was \
+             created with track_dirty = {}, and turning it {} would mean unmapping and \
+             re-mapping every byte of the guest's RAM",
+            self.dirty_logging(),
+            if on { "on" } else { "off" }
+        )))
+    }
+
+    fn fetch_dirty(&self) -> Result<Vec<DirtyPages>, HvError> {
+        if !self.dirty_logging() {
+            return Err(HvError::Registers(
+                "this partition's guest RAM was not mapped with \
+                 WHvMapGpaRangeFlagTrackDirtyPages; WHP has nothing to report"
+                    .into(),
+            ));
+        }
+        let mut out = Vec::new();
+        for region in self.partition.memory().iter() {
+            let gpa = region.start_addr().raw_value();
+            let len = region.len();
+            let words = len.div_ceil(DIRTY_PAGE_SIZE).div_ceil(64);
+            let mut bits = vec![0u64; words as usize];
+            let size = u32::try_from(words * 8).map_err(|_| {
+                HvError::Registers(format!(
+                    "a {len}-byte region needs a dirty bitmap bigger than WHP's 4 GiB limit"
+                ))
+            })?;
+            // SAFETY: `bits` is a live, writable allocation of exactly `size`
+            // bytes (`words` × 8) and `size` is what WHP is told, so it writes
+            // no further. The GPA range is one whole mapped RAM region of this
+            // partition, and `partition` keeps the handle alive across the call.
+            unsafe {
+                WHvQueryGpaRangeDirtyBitmap(
+                    self.partition.handle(),
+                    gpa,
+                    len,
+                    Some(bits.as_mut_ptr()),
+                    size,
+                )
+            }
+            .map_err(|e| {
+                HvError::Registers(format!(
+                    "WHvQueryGpaRangeDirtyBitmap({gpa:#x}, {len}): {e} ({:#010x})",
+                    e.code().0 as u32
+                ))
+            })?;
+            out.push(DirtyPages::new(gpa, len, bits)?);
+        }
+        Ok(out)
+    }
 }
 
 /// Creates one virtual processor. Kept here so partition-scoped WHP calls stay

@@ -1,16 +1,20 @@
 //! VM assembly: memory registration, in-kernel IRQ chip/PIT and vCPU
 //! creation (backlog MVP-102/103/106).
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use kvm_bindings::{
-    kvm_pit_config, kvm_userspace_memory_region, KVM_MEM_READONLY, KVM_PIT_SPEAKER_DUMMY,
+    kvm_pit_config, kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
+    KVM_PIT_SPEAKER_DUMMY,
 };
 use kvm_ioctls::{Cap, VmFd};
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, MmapRegion};
 
-use crate::hv::{GuestClock, HostIrqChip, HostIrqChipState, HvError, MachineConfig, VmClockState};
+use crate::hv::{
+    DirtyLog, DirtyPages, DirtyTracking, GuestClock, HostIrqChip, HostIrqChipState, HvError,
+    MachineConfig, VmClockState,
+};
 use crate::memory::{create_guest_memory, GuestMem};
 use crate::shm::SharedWindow;
 use crate::{Hypervisor, Vcpu, VmmError};
@@ -39,6 +43,22 @@ pub struct Vm {
     /// mapped after a window would silently have reused the window's slot —
     /// which KVM implements as "replace that mapping", not as an error.
     next_slot: AtomicU32,
+    /// This VM's guest-RAM write log (ADR-0006). One per VM, not one per
+    /// caller: it remembers whether logging is on, and two handles with two
+    /// answers would let one of them turn it off under the other.
+    dirty: Arc<KvmDirtyLog>,
+}
+
+/// One registered guest-RAM memory slot, kept so it can be re-registered with
+/// different flags. Copied rather than re-derived: a slot re-registered with a
+/// host address that drifted from the original would silently repoint guest RAM
+/// at somebody else's memory.
+#[derive(Debug, Clone, Copy)]
+struct RamSlot {
+    slot: u32,
+    gpa: u64,
+    len: u64,
+    host_addr: u64,
 }
 
 /// A firmware image mapped into its own KVM memory slot.
@@ -57,7 +77,7 @@ impl Vm {
         let fd = Arc::new(hv.kvm().create_vm()?);
         let readonly_mem = hv.kvm().check_extension(Cap::ReadonlyMem);
         let memory = create_guest_memory(cfg.memory_mib << 20)?;
-        register_memory(&fd, &memory)?;
+        let ram_slots = register_memory(&fd, &memory)?;
 
         // IRQ chip and PIT must exist before vCPUs are created.
         fd.create_irq_chip()?;
@@ -72,6 +92,7 @@ impl Vm {
             vcpus.push(Vcpu::new(&fd, hv.kvm(), index)?);
         }
         let next_slot = AtomicU32::new(memory.num_regions() as u32);
+        let fd_for_dirty = Arc::clone(&fd);
         Ok(Self {
             fd,
             memory,
@@ -79,6 +100,11 @@ impl Vm {
             roms: Vec::new(),
             readonly_mem,
             next_slot,
+            dirty: Arc::new(KvmDirtyLog {
+                fd: Arc::clone(&fd_for_dirty),
+                slots: ram_slots,
+                on: AtomicBool::new(false),
+            }),
         })
     }
 
@@ -234,6 +260,16 @@ impl Vm {
         Arc::new(KvmIrqChip {
             fd: Arc::clone(&self.fd),
         })
+    }
+
+    /// This VM's guest-RAM write log (ADR-0006), off until somebody asks for
+    /// it.
+    ///
+    /// Read [`DirtyTracking::host_writes`] before building on it: KVM reports
+    /// what the *guest* wrote, and this process's own writes into guest RAM are
+    /// invisible to it.
+    pub fn dirty_log(&self) -> Arc<dyn DirtyLog> {
+        Arc::clone(&self.dirty) as Arc<dyn DirtyLog>
     }
 }
 
@@ -480,23 +516,114 @@ impl GuestClock for KvmGuestClock {
     }
 }
 
-fn register_memory(fd: &VmFd, memory: &GuestMem) -> Result<(), VmmError> {
+fn register_memory(fd: &VmFd, memory: &GuestMem) -> Result<Vec<RamSlot>, VmmError> {
+    let mut slots = Vec::new();
     for (slot, region) in memory.iter().enumerate() {
         let host_addr = region
             .get_host_address(MemoryRegionAddress(0))
             .map_err(|e| VmmError::GuestMemory(e.to_string()))?;
-        let mr = kvm_userspace_memory_region {
+        let slot = RamSlot {
             slot: slot as u32,
-            flags: 0,
-            guest_phys_addr: region.start_addr().raw_value(),
-            memory_size: region.len(),
-            userspace_addr: host_addr as u64,
+            gpa: region.start_addr().raw_value(),
+            len: region.len(),
+            host_addr: host_addr as u64,
         };
         // SAFETY: the slot maps host memory owned by `memory`, which lives in
         // the same struct as `fd` and is dropped only after the VM fd; the
         // region is a valid, page-aligned anonymous mmap of exactly
         // `memory_size` bytes.
-        unsafe { fd.set_user_memory_region(mr) }?;
+        unsafe { fd.set_user_memory_region(slot.region(0)) }?;
+        slots.push(slot);
     }
-    Ok(())
+    Ok(slots)
+}
+
+impl RamSlot {
+    fn region(&self, flags: u32) -> kvm_userspace_memory_region {
+        kvm_userspace_memory_region {
+            slot: self.slot,
+            flags,
+            guest_phys_addr: self.gpa,
+            memory_size: self.len,
+            userspace_addr: self.host_addr,
+        }
+    }
+}
+
+/// `KVM_MEM_LOG_DIRTY_PAGES` + `KVM_GET_DIRTY_LOG` behind the neutral seam
+/// (ADR-0006).
+///
+/// Logging is toggled by re-registering each RAM slot with the flag set or
+/// clear, which is the kernel's own spelling of it: a
+/// `KVM_SET_USER_MEMORY_REGION` on an existing slot number replaces that slot.
+/// Turning it **on** write-protects the guest's second-level page tables, so
+/// the guest takes a fault on the first write to every page; turning it off
+/// drops the protection again. Neither is free, and the cost is a property of
+/// the guest's write pattern rather than of this code — see ADR-0006's
+/// measurements.
+struct KvmDirtyLog {
+    fd: Arc<VmFd>,
+    slots: Vec<RamSlot>,
+    on: AtomicBool,
+}
+
+impl DirtyLog for KvmDirtyLog {
+    fn tracking(&self) -> DirtyTracking {
+        DirtyTracking {
+            guest_writes: true,
+            // KVM write-protects the *guest's* view. This process writes guest
+            // RAM through the same anonymous mmap it registered, which faults
+            // nothing and sets no bit.
+            host_writes: false,
+            // Without `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT` (which this build does
+            // not enable), `KVM_GET_DIRTY_LOG` clears the bitmap and
+            // re-protects the pages as it reads.
+            read_clears: true,
+        }
+    }
+
+    fn dirty_logging(&self) -> bool {
+        self.on.load(Ordering::Acquire)
+    }
+
+    fn set_dirty_logging(&self, on: bool) -> Result<(), HvError> {
+        if self.on.load(Ordering::Acquire) == on {
+            return Ok(());
+        }
+        let flags = if on { KVM_MEM_LOG_DIRTY_PAGES } else { 0 };
+        for slot in &self.slots {
+            // SAFETY: the slot is being re-registered with exactly the address,
+            // size and host pointer it was created with — `RamSlot` is a copy
+            // of what `register_memory` handed the kernel, and the backing
+            // `GuestMem` outlives the `Vm` that owns both. Only the flags word
+            // differs.
+            unsafe { self.fd.set_user_memory_region(slot.region(flags)) }.map_err(|e| {
+                HvError::Registers(format!(
+                    "KVM_SET_USER_MEMORY_REGION(slot {}, dirty logging {on}): {e}",
+                    slot.slot
+                ))
+            })?;
+        }
+        self.on.store(on, Ordering::Release);
+        Ok(())
+    }
+
+    fn fetch_dirty(&self) -> Result<Vec<DirtyPages>, HvError> {
+        if !self.on.load(Ordering::Acquire) {
+            return Err(HvError::Registers(
+                "dirty logging is off; KVM has nothing to report".into(),
+            ));
+        }
+        let mut out = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            let bits = self
+                .fd
+                .get_dirty_log(slot.slot, slot.len as usize)
+                .map_err(|e| {
+                    HvError::Registers(format!("KVM_GET_DIRTY_LOG(slot {}): {e}", slot.slot))
+                })?;
+            out.push(DirtyPages::new(slot.gpa, slot.len, bits)?);
+        }
+        Ok(out)
+    }
 }

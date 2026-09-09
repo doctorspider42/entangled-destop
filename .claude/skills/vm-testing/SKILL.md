@@ -844,7 +844,7 @@ full and the fuzz build is large.
 | `snd_device` | a brought-up `SoundDevice` with a live pump thread behind a real `MmioTransport`, fed descriptor chains of arbitrary shape (any lengths, any addresses, readable/writable in any order, indirect flags) on all four queues, interleaved with resets. Asserts no panic, no `DEVICE_NEEDS_RESET` from guest input, and no used entry claiming more bytes than the guest offered |
 | `gpu_remote_protocol` | the isolated-renderer wire format, both directions, with an exact re-encode check |
 | `usernet_frames` | the user-mode NAT's receive path (WHP-1704): arbitrary guest frames — raw bytes, shaped Ethernet, shaped IPv4 with the header and transport checksums fixed so the fuzzer reaches ICMP, DHCP, the DNS relay and the whole smoltcp TCP state machine — through `usernet::offline::OfflineNet`, the real router with **no host sockets** (a fuzzer that could connect would dial arbitrary internet addresses at libFuzzer speed). Asserts the flow table stays inside `MAX_FLOWS`, the guest queue inside `MAX_QUEUED_FRAMES`, and that every emitted frame is one the guest's own device would accept and claims to come from the gateway |
-| `snapshot_parse` | the whole snapshot parser (ADR-0006): the container's header and index, every section decoder against raw bytes, **and** arbitrary bytes spliced into a well-formed container so the decoders are reached *through* the digest checks rather than around them |
+| `snapshot_parse` | the whole snapshot parser (ADR-0006): the container's header and index, every section decoder against raw bytes, arbitrary bytes spliced into a well-formed container so the decoders are reached *through* the digest checks rather than around them, **and** the memory section's compressed block framing — a region header this build agrees with, then block lengths, codec and LZ4 payload from the fuzzer. That last layer asserts something stronger than "no panic": anything that decodes must survive a re-save and a second restore **unchanged**, which is the memory section's version of the exact re-encode the other sections get |
 
 Rules that keep the targets useful:
 
@@ -893,6 +893,17 @@ message that says which. Plus the one that protects a filesystem: the same VM
 resumed onto its *unchanged* disk (which must work — the check is about change,
 not about having a disk) and then onto one that grew.
 
+**A second suspend has to carry the guest's *later* memory.** The bug that shape
+of test exists for is the one a dirty-page scheme would have and a full save
+would not: a save that wrote only what some log said had changed, and missed a
+page. It does not crash — the guest comes back from the *second* file where it
+was at the *first*, or half at each. `a_second_suspend_carries_the_later_memory`
+suspends at heartbeat *a*, resumes, runs on, suspends again at *b*, and requires
+the second file to continue from `b`; it also asserts the gap is a real one
+(`b > a + 2`), because otherwise "it continued" would be true of the earlier
+file too, and that the first file still restores to `a`. It is also the only
+test that walks the manager's loop — resume, work, suspend again — end to end.
+
 Three things that cost time to learn:
 
 - **The GPU can keep working while the guest is dead to the world.** The first
@@ -904,6 +915,44 @@ Three things that cost time to learn:
   satisfied by a guest that rebooted and started at 0.
 - **The two hosts do not lose the same state.** A device inventory is not enough;
   check what the *hypervisor* owns on each host as well.
+- **The hypervisor's dirty log answers a different question than you think.**
+  `crates/vmm-core/tests/dirty_log.rs` is four short tests and one of them is the
+  whole finding: arm tracking, write two pages of guest RAM *from the VMM*, and
+  both hosts report nothing. On this AMD machine KVM also reports pages the guest
+  only executed from. Before building anything on a write log, write the test
+  that asks what it misses — `ENTANGLED_TRACK_DIRTY=1` makes a real suspend print
+  the answer for its own guest.
+
+## Benchmarking a snapshot, and what a reference is
+
+`crates/vm-snapshot/tests/memory_bench.rs` is `#[ignore]`d and allocates
+gigabytes. It exists so a change to the memory dump can be argued rather than
+asserted:
+
+```bash
+cargo test -p vm-snapshot --release --test memory_bench -- --ignored --nocapture
+ENTANGLED_SNAPSHOT_THREADS=1 ENTANGLED_SNAPSHOT_COMPRESS=0 cargo test ...   # vary one knob
+ENTANGLED_BENCH_MIB=4096 cargo test ...                                     # a bigger guest
+```
+
+Four rules it encodes, each of which cost something to learn:
+
+- **Release, always.** The zero scan is the hot loop and `opt-level=0` ruins it.
+  The test says so in its own output when it is built wrong.
+- **Report the cold pass, not only the warm one.** A real guest's untouched RAM
+  is not resident in the host — nothing has ever written it — so the scan takes a
+  minor fault per page to read a zero. That is what a suspend pays. A benchmark
+  that discards its first run understated the old scanner by a third (5.07 s cold
+  against 3.18 s warm on a 2 GiB guest).
+- **The synthetic guest's compressibility is a choice, and it is a pessimistic
+  one.** Three pseudorandom bytes in every eight give LZ4 1.6×; a real desktop
+  guest gives 2.2–2.3×. A page filled with a repeating pattern would give
+  twenty, and the number would be a fiction.
+- **Compare against a run beside it.** This machine is shared: an installed
+  Ubuntu suspend read 2.99 s with a Windows build running alongside and 888 ms
+  without. And inside WSL, `CLOCK_MONOTONIC` runs a wandering few thousand ppm
+  fast (see "The clock finding"), so an absolute Linux figure is up to ~4 % long
+  — a ratio between two runs in the same minute is not.
 
 ## Invariants every test run enforces
 
@@ -927,6 +976,8 @@ through host bookkeeping:
 | `apps/entangled/tests/guest_reboot.rs` | either | an installed Ubuntu reboots itself through its firmware, twice (`--ignored`) |
 | `apps/entangled/tests/suspend_restore.rs` | either | suspend/resume, and every refusal (ADR-0006) |
 | `apps/entangled/tests/guest_suspend.rs` | either | an installed Ubuntu is the same session after a suspend (`--ignored`) |
+| `crates/vmm-core/tests/dirty_log.rs` | either | what each hypervisor's write log does and does not see (ADR-0006) |
+| `crates/vm-snapshot/tests/memory_bench.rs` | either | what a memory dump costs, against itself (`--ignored`, **release**) |
 
 **Measuring a pause needs the guest to be noisy.** The test guest gained
 `entangled.heartbeat=<ms>`: it prints `VMHOST_HEARTBEAT <n>` for ever and never

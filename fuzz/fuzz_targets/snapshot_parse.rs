@@ -20,12 +20,23 @@
 //!   disagree writes a snapshot it cannot read back, which is the one bug that
 //!   would not show up until someone tried to resume.
 //!
-//! Three layers, because the container and the sections fail differently:
+//! Four layers, because the container and the sections fail differently:
 //! the header and index (`SnapshotReader::open`), each section decoder against
 //! the raw bytes directly (so shapes the container never happened to produce
-//! are exercised too), and finally a whole valid snapshot with the fuzzer's
-//! bytes spliced into it — which is the only way to reach the section decoders
-//! *through* the digest checks.
+//! are exercised too), a whole valid snapshot with the fuzzer's bytes spliced
+//! into it — the only way to reach the section decoders *through* the digest
+//! checks — and the **memory section**, which needs a layer of its own.
+//!
+//! Guest memory is the one section that is streamed rather than materialised,
+//! and since ADR-0006's compressed framing it is also the one that decompresses
+//! somebody else's bytes into a buffer somebody else's number sized. So
+//! `memory_section` builds a section whose region header is *correct* for a
+//! small guest and hands the fuzzer everything after it: the block lengths, the
+//! codec, the LZ4 payload and the run headers inside it. What is asserted there
+//! is no panic, no allocation the length checks did not bound, and — for
+//! anything that decodes — that saving the restored guest and restoring it
+//! again produces the same bytes, which is the memory section's version of the
+//! exact re-encode the others get.
 //!
 //! ```bash
 //! cargo +nightly fuzz run snapshot_parse -- -max_total_time=120
@@ -36,8 +47,14 @@
 use std::io::Cursor;
 
 use libfuzzer_sys::fuzz_target;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use vm_snapshot::codec::{Reader, Writer};
-use vm_snapshot::{cpu, devices, meta, SectionKind, SnapshotReader, SnapshotWriter};
+use vm_snapshot::{cpu, devices, memory, meta, SectionKind, SnapshotReader, SnapshotWriter};
+
+/// The guest the memory layer restores into. Small, because every input
+/// allocates one and the decoder's bounds are what is under test, not the
+/// allocator.
+const GUEST_BYTES: u64 = 1 << 20;
 
 /// Decodes `data` with every section decoder, and re-encodes whatever worked.
 fn every_section(data: &[u8]) {
@@ -157,6 +174,82 @@ fn walk(bytes: &[u8]) {
     let _ = reader.require_native();
 }
 
+/// A snapshot with one memory section: a region header this build agrees with,
+/// then `data` as the block stream.
+///
+/// The header has to be right or every input dies at the first comparison; the
+/// codec is taken from the fuzzer so the unknown-codec refusal and both real
+/// codecs are all reachable.
+fn memory_section(data: &[u8]) -> Vec<u8> {
+    let codec = data.first().copied().unwrap_or(1) as u32 % 4;
+    let mut buf = Cursor::new(Vec::new());
+    let Ok(mut writer) = SnapshotWriter::create(&mut buf, vm_snapshot::HostKind::KvmLinux) else {
+        return Vec::new();
+    };
+    let mut payload = Writer::new();
+    payload
+        .u64(0)
+        .u64(GUEST_BYTES)
+        .u32(memory::PAGE as u32)
+        .u32(codec);
+    let mut payload = payload.into_bytes();
+    payload.extend_from_slice(data);
+    if writer
+        .put(SectionKind::Memory, memory::MEMORY_VERSION, 0, &payload)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    if writer.finish().is_err() {
+        return Vec::new();
+    }
+    buf.into_inner()
+}
+
+fn guest() -> GuestMemoryMmap {
+    GuestMemoryMmap::from_ranges(&[(GuestAddress(0), GUEST_BYTES as usize)]).unwrap()
+}
+
+fn read_guest(mem: &GuestMemoryMmap) -> Vec<u8> {
+    let mut out = vec![0u8; GUEST_BYTES as usize];
+    mem.read_slice(&mut out, GuestAddress(0)).unwrap();
+    out
+}
+
+/// Restores `bytes` into a fresh guest and, if that worked, proves the guest
+/// survives another round trip through this build's own writer.
+fn memory_round_trip(bytes: &[u8]) {
+    let Ok(mut reader) = SnapshotReader::open(Cursor::new(bytes)) else {
+        return;
+    };
+    let first = guest();
+    if memory::restore(&first, &mut reader).is_err() {
+        return;
+    }
+    let before = read_guest(&first);
+    for codec in [memory::Codec::None, memory::Codec::Lz4Block] {
+        for workers in [1usize, 3] {
+            let mut out = Cursor::new(Vec::new());
+            let Ok(mut writer) = SnapshotWriter::create(&mut out, vm_snapshot::HostKind::KvmLinux)
+            else {
+                return;
+            };
+            let options = memory::SaveOptions { workers, codec };
+            memory::save_with(&first, &mut writer, options).expect("re-saving a restored guest");
+            writer.finish().expect("finishing a re-save");
+            let again = out.into_inner();
+            let second = guest();
+            let mut reader = SnapshotReader::open(Cursor::new(&again))
+                .expect("this build must read what it just wrote");
+            memory::restore(&second, &mut reader).expect("this build must restore its own file");
+            assert!(
+                read_guest(&second) == before,
+                "a guest that round-tripped through {codec:?} with {workers} workers changed"
+            );
+        }
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     // Layer 1: arbitrary bytes as a whole snapshot. Almost all of these are
     // refused at the magic; the interesting ones are the mutations of a real
@@ -172,6 +265,13 @@ fuzz_target!(|data: &[u8]| {
     let inside = spliced(data);
     if !inside.is_empty() {
         walk(&inside);
+    }
+
+    // Layer 4: the memory section, whose block framing decompresses the
+    // fuzzer's bytes into a buffer the fuzzer's numbers size.
+    let section = memory_section(data);
+    if !section.is_empty() {
+        memory_round_trip(&section);
     }
 
     // And the writer, so a value that round-trips cannot be one the writer
