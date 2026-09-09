@@ -84,6 +84,11 @@ pub mod key {
     /// Highest key code the keyboard profile advertises from the dense low
     /// range (`display`'s keymap stays inside it apart from [`SELECT`]).
     pub const DENSE_MAX: u16 = 255;
+    /// `KEY_BACK` — where the host's Back mouse button lands (GAME-2104
+    /// follow-up; see [`crate::btn::SIDE`] for why it is not a mouse button).
+    pub const BACK: u16 = 158;
+    /// `KEY_FORWARD` — the host's Forward mouse button.
+    pub const FORWARD: u16 = 159;
     /// `KEY_SELECT`, the one code `display`'s keymap emits above
     /// [`DENSE_MAX`].
     pub const SELECT: u16 = 353;
@@ -111,6 +116,14 @@ pub mod abs {
     pub const HAT0Y: u16 = 0x11;
 }
 
+/// Miscellaneous events (`MSC_*`).
+pub mod msc {
+    /// `MSC_SCAN` — the raw scancode behind a key. Advertised by the pointer
+    /// and never sent; see [`Profile::AbsolutePointer`](config::Profile::AbsolutePointer)
+    /// for the one reason it is there.
+    pub const SCAN: u16 = 0x04;
+}
+
 /// Relative axes; the absolute pointer still needs them for the scroll wheel.
 pub mod rel {
     /// `REL_HWHEEL` — horizontal scroll, in notches.
@@ -124,9 +137,18 @@ pub mod btn {
     pub const LEFT: u16 = 0x110;
     pub const RIGHT: u16 = 0x111;
     pub const MIDDLE: u16 = 0x112;
-    /// `BTN_SIDE` — winit's `MouseButton::Back`.
+    /// `BTN_SIDE` — deliberately **not** advertised by any profile, and kept
+    /// here so the reason is written next to the code.
+    ///
+    /// `joydev` refuses to bind an "absolute mouse", and its definition of one
+    /// (`joydev_dev_is_absolute_mouse()`) demands a key set that is *exactly*
+    /// `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE`. Advertising these two extra
+    /// buttons made the tablet a joystick, which cost the gamepad `js0`
+    /// (GAME-2104 follow-up). The host's Back/Forward mouse buttons now go to
+    /// the keyboard as `KEY_BACK`/`KEY_FORWARD`, which is what a multimedia
+    /// keyboard sends and what browsers and desktops already bind.
     pub const SIDE: u16 = 0x113;
-    /// `BTN_EXTRA` — winit's `MouseButton::Forward`.
+    /// `BTN_EXTRA` — not advertised either; see [`SIDE`].
     pub const EXTRA: u16 = 0x114;
 
     // ---- gamepad (`BTN_GAMEPAD` block, 0x130..=0x13e) ----
@@ -442,33 +464,44 @@ mod tests {
         let batch = vec![
             up(29),
             up(30),
+            up(key::BACK),
             up(btn::LEFT),
-            up(btn::EXTRA),
+            up(btn::MIDDLE),
             InputEvent::SYN_REPORT,
         ];
         let split = split_batch(&batch);
         assert_eq!(
             split.keyboard,
-            vec![up(29), up(30), InputEvent::SYN_REPORT],
-            "the keyboard must still see its own key-ups"
+            vec![up(29), up(30), up(key::BACK), InputEvent::SYN_REPORT],
+            "the keyboard must still see its own key-ups, Back among them"
         );
         assert_eq!(
             split.pointer,
-            vec![up(btn::LEFT), up(btn::EXTRA), InputEvent::SYN_REPORT]
+            vec![up(btn::LEFT), up(btn::MIDDLE), InputEvent::SYN_REPORT]
         );
     }
 
     #[test]
     fn split_batch_drops_events_neither_device_advertises() {
         let batch = vec![
+            // MSC_TIMESTAMP: the pointer advertises MSC_SCAN and nothing
+            // else, so this one still belongs to nobody.
             InputEvent {
                 event_type: ev::MSC,
-                code: 4,
+                code: 5,
                 value: 7,
             },
             InputEvent {
                 event_type: ev::KEY,
                 code: 900,
+                value: 1,
+            },
+            // BTN_SIDE: no profile advertises it any more (GAME-2104
+            // follow-up), so it must be dropped rather than delivered to a
+            // device that would never have registered the code.
+            InputEvent {
+                event_type: ev::KEY,
+                code: btn::SIDE,
                 value: 1,
             },
             InputEvent {

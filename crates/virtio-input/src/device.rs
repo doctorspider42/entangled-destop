@@ -1011,7 +1011,10 @@ mod tests {
         );
         let buttons = probe(&mut device, config::VIRTIO_INPUT_CFG_EV_BITS, ev::KEY as u8);
         assert_eq!(buttons.len(), 35);
-        assert_eq!(buttons[34], 0x1f, "BTN_LEFT = 0x110 is byte 34 bit 0");
+        assert_eq!(
+            buttons[34], 0x07,
+            "BTN_LEFT/RIGHT/MIDDLE, and deliberately nothing else"
+        );
         assert!(buttons[..34].iter().all(|&b| b == 0));
         assert_eq!(
             probe(&mut device, config::VIRTIO_INPUT_CFG_EV_BITS, ev::ABS as u8),
@@ -1162,7 +1165,7 @@ mod tests {
             code: key::SELECT,
             value: 1
         }));
-        for code in [btn::LEFT, btn::RIGHT, btn::MIDDLE, btn::SIDE, btn::EXTRA] {
+        for code in [btn::LEFT, btn::RIGHT, btn::MIDDLE] {
             let event = InputEvent {
                 event_type: ev::KEY,
                 code,
@@ -1170,6 +1173,27 @@ mod tests {
             };
             assert!(Profile::AbsolutePointer.accepts(event));
             assert!(!Profile::Keyboard.accepts(event));
+        }
+        // Back and Forward are keyboard codes now (GAME-2104 follow-up), so
+        // they land on the other device — and `BTN_SIDE`/`BTN_EXTRA` land
+        // nowhere at all.
+        for code in [key::BACK, key::FORWARD] {
+            let event = InputEvent {
+                event_type: ev::KEY,
+                code,
+                value: 1,
+            };
+            assert!(Profile::Keyboard.accepts(event));
+            assert!(!Profile::AbsolutePointer.accepts(event));
+        }
+        for code in [btn::SIDE, btn::EXTRA] {
+            let event = InputEvent {
+                event_type: ev::KEY,
+                code,
+                value: 1,
+            };
+            assert!(!Profile::Keyboard.accepts(event));
+            assert!(!Profile::AbsolutePointer.accepts(event));
         }
     }
 }

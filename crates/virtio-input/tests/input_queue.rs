@@ -325,10 +325,12 @@ fn tablet_config_space_probes_as_an_absolute_pointer() {
         vec![0x06, 0x00, 0x4d, 0x56, 0x02, 0x00, 0x01, 0x00]
     );
 
-    // BTN_LEFT = 0x110: byte 34, bit 0, through BTN_EXTRA at bit 4.
+    // BTN_LEFT = 0x110: byte 34, bit 0, through BTN_MIDDLE at bit 2 — and
+    // nothing above it, which is what keeps `joydev` off the tablet
+    // (GAME-2104 follow-up; see `config::joydev_sees_an_absolute_mouse`).
     let buttons = h.probe(VIRTIO_INPUT_CFG_EV_BITS, ev::KEY as u8);
     assert_eq!(buttons.len(), 35);
-    assert_eq!(buttons[34], 0x1f);
+    assert_eq!(buttons[34], 0x07);
     assert!(buttons[..34].iter().all(|&b| b == 0));
 
     assert_eq!(h.probe(VIRTIO_INPUT_CFG_EV_BITS, ev::ABS as u8), vec![0x03]);
@@ -337,6 +339,9 @@ fn tablet_config_space_probes_as_an_absolute_pointer() {
         h.probe(VIRTIO_INPUT_CFG_EV_BITS, ev::REL as u8),
         vec![0x40, 0x01]
     );
+    // MSC_SCAN = 4: the bit that lets the wheel above coexist with joydev's
+    // absolute-mouse rule. A non-zero size is the whole payload of the claim.
+    assert_eq!(h.probe(VIRTIO_INPUT_CFG_EV_BITS, ev::MSC as u8), vec![0x10]);
 
     for axis in [abs::X, abs::Y] {
         let info = h.probe(VIRTIO_INPUT_CFG_ABS_INFO, axis as u8);

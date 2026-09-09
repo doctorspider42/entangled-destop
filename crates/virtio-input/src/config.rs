@@ -25,7 +25,7 @@
 //! Nothing here touches guest memory or allocates per access: a read builds one
 //! stack [`Selection`] and copies out of it.
 
-use crate::{abs, btn, ev, key, pad, rel, rep, ABS_AXIS_MAX};
+use crate::{abs, btn, ev, key, msc, pad, rel, rep, ABS_AXIS_MAX};
 
 // ------------------------------------------------------------------ layout
 
@@ -123,23 +123,44 @@ pub enum Profile {
     Keyboard,
 
     /// A tablet-style absolute pointer: `ABS_X`/`ABS_Y` over the full
-    /// [`ABS_AXIS_MAX`] range, the five mouse buttons and the scroll wheels.
+    /// [`ABS_AXIS_MAX`] range, the three primary mouse buttons and the scroll
+    /// wheels.
     ///
-    /// KNOWN WART (found by GAME-2104's boot acceptance, 2026-09-09): `joydev`
-    /// binds this device too, so a VM with both a tablet and a gamepad has the
-    /// *tablet* on `/dev/input/js0` and the pad on `js1`. `joydev_match()`
-    /// excludes an "absolute mouse", but `joydev_dev_is_absolute_mouse()`
-    /// recognises one only if its key set is **exactly**
-    /// `BTN_LEFT`/`RIGHT`/`MIDDLE` — and this profile also advertises
-    /// `BTN_SIDE`/`BTN_EXTRA`, which winit's Back and Forward need. So the
-    /// bitmap comparison fails and joydev claims it.
-    /// It is a wart and not a bug: SDL ignores a joystick with no
-    /// `BTN_JOYSTICK`-range keys, so games find the pad. What it does confuse
-    /// is anything that opens "the first joystick" by number — `jstest`, and
-    /// the older half of the Linux gaming documentation. The fix, if it is ever
-    /// worth one, is to drop `BTN_SIDE`/`BTN_EXTRA` here (two mouse buttons for
-    /// a correct classification); do not reach for `BTN_TOUCH` or `BTN_DIGI`,
-    /// which would also disqualify it and would additionally lie to libinput.
+    /// # Why exactly three buttons, and why `EV_MSC`
+    ///
+    /// Until GAME-2104's follow-up this profile also advertised `BTN_SIDE` and
+    /// `BTN_EXTRA` and no `EV_MSC`, and the cost of that was **`joydev` binding
+    /// the tablet**: a VM with both a tablet and a gamepad had the *tablet* on
+    /// `/dev/input/js0` and the pad on `js1`, so anything that opens "the first
+    /// joystick" by number found a two-axis pointer.
+    ///
+    /// `joydev`'s id table matches any `EV_ABS` device with `ABS_X`, which a
+    /// tablet is; the only way out is `joydev_dev_is_absolute_mouse()`, whose
+    /// rule (drivers/input/joydev.c, unchanged from v6.12 to master) is three
+    /// *exact* bitmap comparisons:
+    ///
+    /// 1. the event types are exactly `{SYN, KEY, ABS}`, or `{SYN, KEY, ABS,
+    ///    MSC}`, or `{SYN, KEY, ABS, MSC, REL}` — note that `EV_REL` is
+    ///    admissible only **together with** `EV_MSC`;
+    /// 2. the absolute axes are exactly `{ABS_X, ABS_Y}`;
+    /// 3. the keys are exactly `{BTN_LEFT, BTN_RIGHT, BTN_MIDDLE}`.
+    ///
+    /// A scroll wheel means `EV_REL`, so this profile has to reach rule 1's
+    /// third form: hence the otherwise-pointless `EV_MSC`/`MSC_SCAN`, which a
+    /// real USB mouse carries anyway (the HID core adds it) and which the
+    /// kernel comment names the QEMU USB tablet for. And rule 3 is why the two
+    /// extra buttons had to go; the host's Back and Forward now arrive as
+    /// `KEY_BACK`/`KEY_FORWARD` on the *keyboard* device, which is what a
+    /// multimedia keyboard sends and what browsers already bind — so nothing
+    /// was lost, it moved.
+    ///
+    /// [`joydev_sees_an_absolute_mouse`] models the rule against this crate's
+    /// own bitmaps, and there is a test; change any of the three arms above and
+    /// it will tell you which one you broke.
+    ///
+    /// Do **not** reach for `BTN_TOUCH` or `BTN_DIGI` as a shortcut: they would
+    /// also keep joydev away, and would additionally lie to libinput about what
+    /// kind of surface this is.
     ///
     /// TODO(MVP-903 follow-up): consider advertising `INPUT_PROP_DIRECT` via
     /// `VIRTIO_INPUT_CFG_PROP_BITS`. It would tell libinput the surface is
@@ -164,10 +185,9 @@ pub enum Profile {
     /// * **The input core / `joydev`.** `joydev_match()` binds anything with
     ///   `EV_ABS`/`ABS_X` that is not a touchscreen, a digitiser or an
     ///   absolute mouse — so the pad turns up as `/dev/input/js*` as well as
-    ///   `/dev/input/event*`. (Note that the *tablet* profile is excluded by
-    ///   that same rule, through `BTN_LEFT`; the pad advertises no
-    ///   `BTN_MOUSE`, `BTN_TOUCH` or `BTN_DIGI`, which is what keeps the two
-    ///   apart.)
+    ///   `/dev/input/event*`. (The *tablet* profile is deliberately shaped to
+    ///   fail that same match — see [`Profile::AbsolutePointer`] — which is
+    ///   what leaves `js0` to the first pad.)
     /// * **udev.** `input_id` tags a device `ID_INPUT_JOYSTICK` when it
     ///   carries a key in the `BTN_JOYSTICK`..`BTN_DIGI` block; `BTN_SOUTH`
     ///   is in it. That tag is what gives the logged-in user an ACL on the
@@ -253,9 +273,15 @@ impl Profile {
             // Auto-repeat: the guest's input core generates the repeats, the
             // device only has to say it supports the two parameters.
             (Profile::Keyboard, ev::REP) => Selection::bitmap([rep::DELAY, rep::PERIOD]),
+            // Exactly the three primary buttons, and nothing else: see
+            // [`Profile::AbsolutePointer`] and [`joydev_sees_an_absolute_mouse`].
             (Profile::AbsolutePointer, ev::KEY) => {
-                Selection::bitmap([btn::LEFT, btn::RIGHT, btn::MIDDLE, btn::SIDE, btn::EXTRA])
+                Selection::bitmap([btn::LEFT, btn::RIGHT, btn::MIDDLE])
             }
+            // Advertised for one reason only, and never sent: joydev's
+            // absolute-mouse rule accepts `EV_REL` only in company with
+            // `EV_MSC`, so a pointer with a scroll wheel needs both or neither.
+            (Profile::AbsolutePointer, ev::MSC) => Selection::bitmap([msc::SCAN]),
             (Profile::AbsolutePointer, ev::ABS) => Selection::bitmap([abs::X, abs::Y]),
             // `display` emits both wheel axes, so both are advertised —
             // otherwise the guest silently discards horizontal scrolling.
@@ -318,6 +344,103 @@ impl Profile {
         }
         self.event_bits(event.event_type).contains(event.code)
     }
+}
+
+// ------------------------------------------------------------ joydev model
+//
+// A pure, portable model of how the guest kernel's `joydev` handler classifies
+// each profile. It exists because the classification is decided *here*, by the
+// bitmaps this module publishes, and gets its verdict a whole guest boot away —
+// so without a model, a one-bit change to a capability set is only ever caught
+// by a KVM-only acceptance test on a machine that has the bootstrap kernel.
+//
+// Everything below mirrors drivers/input/joydev.c as of v6.12 (and unchanged in
+// master). The one thing it cannot model is what the *host* does not decide:
+// which minor a bound device gets, which is registration order.
+
+/// `BTN_JOYSTICK`, the base of the joystick key block joydev's id table
+/// matches on.
+pub const BTN_JOYSTICK: u16 = 0x120;
+/// `BTN_GAMEPAD` — the same code as [`btn::SOUTH`], named as joydev names it.
+pub const BTN_GAMEPAD: u16 = 0x130;
+/// `BTN_TRIGGER_HAPPY`.
+pub const BTN_TRIGGER_HAPPY: u16 = 0x2c0;
+/// `ABS_WHEEL`, one of the four axes joydev's id table matches on.
+pub const ABS_WHEEL: u16 = 0x08;
+/// `ABS_THROTTLE`.
+pub const ABS_THROTTLE: u16 = 0x06;
+
+/// The `EV_*` types the guest driver will set for `profile`, in ascending
+/// order.
+///
+/// This is what Linux's `virtio_input.c` builds: `EV_SYN` is implicit for every
+/// input device, and every other type is set exactly when its `EV_BITS`
+/// selector answers a non-empty payload (`virtinput_cfg_bits()` returns early
+/// on `size == 0`, so an empty bitmap sets no `evbit`).
+pub fn advertised_event_types(profile: Profile) -> Vec<u16> {
+    let mut types = vec![ev::SYN];
+    types.extend((0..ev::CNT).filter(|&t| t != ev::SYN && !profile.event_bits(t).is_empty()));
+    types
+}
+
+/// The codes `profile` advertises for one event type, in ascending order.
+fn advertised_codes(profile: Profile, event_type: u16, max: u16) -> Vec<u16> {
+    let bits = profile.event_bits(event_type);
+    (0..max).filter(|&code| bits.contains(code)).collect()
+}
+
+/// Whether `joydev_dev_is_absolute_mouse()` would call this profile an
+/// absolute mouse — the *only* way an `EV_ABS`/`ABS_X` device escapes joydev.
+///
+/// The three exact bitmap comparisons, in the kernel's own order. Note the
+/// third accepted event-type set: `EV_REL` is admissible only alongside
+/// `EV_MSC`, which is the whole reason [`Profile::AbsolutePointer`] advertises
+/// one `MSC_SCAN` bit it never sends.
+pub fn joydev_sees_an_absolute_mouse(profile: Profile) -> bool {
+    let types = advertised_event_types(profile);
+    let ev_match = [
+        vec![ev::SYN, ev::KEY, ev::ABS],
+        vec![ev::SYN, ev::KEY, ev::ABS, ev::MSC],
+        vec![ev::SYN, ev::KEY, ev::ABS, ev::MSC, ev::REL],
+    ]
+    .into_iter()
+    .any(|mut accepted| {
+        accepted.sort_unstable();
+        accepted == types
+    });
+    if !ev_match {
+        return false;
+    }
+    if advertised_codes(profile, ev::ABS, 0x40) != vec![abs::X, abs::Y] {
+        return false;
+    }
+    if advertised_codes(profile, ev::KEY, 0x300) != vec![btn::LEFT, btn::RIGHT, btn::MIDDLE] {
+        return false;
+    }
+    // `BUS_AMIGA` (0x11) is the rule's one exception; ours is `BUS_VIRTUAL`.
+    profile.devids().bustype != 0x11
+}
+
+/// Whether `joydev` would bind this profile — id table, then
+/// [`joydev_sees_an_absolute_mouse`].
+///
+/// A device this returns `true` for gets a `/dev/input/js*` node; which number
+/// it gets is the order the devices were registered in, which is the order the
+/// machine attaches them.
+pub fn joydev_would_bind(profile: Profile) -> bool {
+    let has_abs = |code| profile.event_bits(ev::ABS).contains(code);
+    let has_key = |code| profile.event_bits(ev::KEY).contains(code);
+    let id_match = has_abs(abs::X)
+        || has_abs(abs::Z)
+        || has_abs(ABS_WHEEL)
+        || has_abs(ABS_THROTTLE)
+        || has_key(BTN_JOYSTICK)
+        || has_key(BTN_GAMEPAD)
+        || has_key(BTN_TRIGGER_HAPPY);
+    // `joydev_dev_is_blacklisted()` rejects accelerometers, which are
+    // recognised by `INPUT_PROP_ACCELEROMETER`; no profile publishes any
+    // `INPUT_PROP_*` at all (`VIRTIO_INPUT_CFG_PROP_BITS` answers `size = 0`).
+    id_match && !joydev_sees_an_absolute_mouse(profile)
 }
 
 /// `struct virtio_input_absinfo` on the wire.
@@ -538,7 +661,7 @@ mod tests {
             256,
             271,
             btn::LEFT,
-            btn::EXTRA,
+            btn::SIDE,
             352,
             354,
             700,
@@ -570,25 +693,49 @@ mod tests {
     // --------------------------------------------------------- pointer bits
 
     #[test]
-    fn pointer_key_bitmap_carries_exactly_the_five_buttons() {
+    fn pointer_key_bitmap_carries_exactly_the_three_primary_buttons() {
         let bits = selection(
             Profile::AbsolutePointer,
             VIRTIO_INPUT_CFG_EV_BITS,
             ev::KEY as u8,
         );
-        // BTN_LEFT = 0x110 = 272 => byte 34, bit 0; BTN_EXTRA = 0x114 => bit 4.
+        // BTN_LEFT = 0x110 = 272 => byte 34, bit 0; BTN_MIDDLE = 0x112 => bit 2.
         assert_eq!(bits.size(), 35);
         let payload = bits.payload();
         assert_eq!(&payload[..34], &[0u8; 34]);
-        assert_eq!(payload[34], 0x1f);
+        assert_eq!(payload[34], 0x07);
         assert!(bit(payload, btn::LEFT));
         assert_eq!(payload[34] & 1, 1);
-        for code in [btn::LEFT, btn::RIGHT, btn::MIDDLE, btn::SIDE, btn::EXTRA] {
+        for code in [btn::LEFT, btn::RIGHT, btn::MIDDLE] {
             assert!(bit(payload, code), "BTN code {code:#x} must be advertised");
         }
-        for code in [30u16, 0x115, 0x116, 0x10f] {
+        // The two that had to go so `joydev` would leave the tablet alone.
+        for code in [30u16, btn::SIDE, btn::EXTRA, 0x115, 0x116, 0x10f] {
             assert!(!bit(payload, code), "code {code:#x} must not be advertised");
         }
+    }
+
+    #[test]
+    fn pointer_advertises_one_msc_bit_and_nothing_it_will_ever_send() {
+        // `EV_MSC` exists on this profile purely to reach joydev's third
+        // accepted event-type set (`SYN|KEY|ABS|MSC|REL`); a scroll wheel
+        // cannot be had without it. One bit is enough — the driver sets
+        // `EV_MSC` on any non-zero size.
+        let bits = selection(
+            Profile::AbsolutePointer,
+            VIRTIO_INPUT_CFG_EV_BITS,
+            ev::MSC as u8,
+        );
+        assert_eq!(bits.size(), 1);
+        assert_eq!(bits.payload(), &[1 << msc::SCAN]);
+        // It is the only `MSC_*` code the profile will admit: nothing on the
+        // host produces one, so this is a capability, not a promise.
+        assert!(bits.contains(msc::SCAN));
+        for code in [0u16, 1, 2, 3, 5, 6, 0x20] {
+            assert!(!bits.contains(code), "MSC {code:#x} must not be advertised");
+        }
+        assert!(selection(Profile::Keyboard, VIRTIO_INPUT_CFG_EV_BITS, ev::MSC as u8).is_empty());
+        assert!(selection(Profile::Gamepad, VIRTIO_INPUT_CFG_EV_BITS, ev::MSC as u8).is_empty());
     }
 
     #[test]
@@ -649,7 +796,9 @@ mod tests {
 
     #[test]
     fn pointer_does_not_advertise_keys_or_repeat() {
-        for subsel in [ev::REP, ev::MSC, ev::LED, ev::SND, ev::SW] {
+        // `EV_MSC` is the one exception and it has its own test; everything
+        // else a pointer could plausibly claim stays absent.
+        for subsel in [ev::REP, ev::LED, ev::SND, ev::SW] {
             assert!(selection(
                 Profile::AbsolutePointer,
                 VIRTIO_INPUT_CFG_EV_BITS,
@@ -943,5 +1092,81 @@ mod tests {
         let split = crate::split_batch(&batch);
         assert!(split.keyboard.is_empty());
         assert!(split.pointer.is_empty());
+    }
+    // ------------------------------------------------------- joydev verdict
+
+    #[test]
+    fn the_driver_will_set_exactly_these_event_types() {
+        // What `virtio_input.c` ends up with in `dev->evbit`, which is the
+        // input to every classification below. `EV_SYN` is implicit; the rest
+        // are set only where the `EV_BITS` selector answers non-empty.
+        assert_eq!(
+            advertised_event_types(Profile::Keyboard),
+            vec![ev::SYN, ev::KEY, ev::REP]
+        );
+        assert_eq!(
+            advertised_event_types(Profile::AbsolutePointer),
+            vec![ev::SYN, ev::KEY, ev::REL, ev::ABS, ev::MSC]
+        );
+        assert_eq!(
+            advertised_event_types(Profile::Gamepad),
+            vec![ev::SYN, ev::KEY, ev::ABS]
+        );
+    }
+
+    #[test]
+    fn the_tablet_is_an_absolute_mouse_and_the_pad_is_a_joystick() {
+        // The whole point of the tablet's shape (GAME-2104 follow-up): joydev
+        // must refuse it, so the first pad gets `/dev/input/js0`.
+        assert!(joydev_sees_an_absolute_mouse(Profile::AbsolutePointer));
+        assert!(!joydev_would_bind(Profile::AbsolutePointer));
+
+        assert!(!joydev_sees_an_absolute_mouse(Profile::Gamepad));
+        assert!(joydev_would_bind(Profile::Gamepad));
+
+        // A keyboard was never a candidate: no absolute axes, no joystick keys.
+        assert!(!joydev_sees_an_absolute_mouse(Profile::Keyboard));
+        assert!(!joydev_would_bind(Profile::Keyboard));
+    }
+
+    #[test]
+    fn the_tablet_only_escapes_joydev_because_of_ev_msc() {
+        // A regression guard with a name: drop `EV_MSC` and the escape hatch
+        // closes again, because joydev accepts `EV_REL` only in its company.
+        // Modelled by re-running the rule on the event-type set the pointer
+        // would have without it.
+        let mut without_msc = advertised_event_types(Profile::AbsolutePointer);
+        without_msc.retain(|&t| t != ev::MSC);
+        assert_eq!(without_msc, vec![ev::SYN, ev::KEY, ev::REL, ev::ABS]);
+        for accepted in [
+            vec![ev::SYN, ev::KEY, ev::ABS],
+            vec![ev::SYN, ev::KEY, ev::ABS, ev::MSC],
+            vec![ev::SYN, ev::KEY, ev::ABS, ev::MSC, ev::REL],
+        ] {
+            let mut accepted = accepted;
+            accepted.sort_unstable();
+            assert_ne!(
+                accepted, without_msc,
+                "a wheeled pointer without EV_MSC matches none of joydev's three sets"
+            );
+        }
+    }
+
+    #[test]
+    fn every_profile_has_a_stable_joydev_verdict() {
+        // One line per profile, so a capability change that flips a verdict
+        // shows up as this test rather than as a guest boot three days later.
+        let verdicts: Vec<(&str, bool)> = Profile::ALL
+            .iter()
+            .map(|&p| (p.name(), joydev_would_bind(p)))
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                ("Entangled Keyboard", false),
+                ("Entangled Tablet", false),
+                ("Entangled Gamepad", true),
+            ]
+        );
     }
 }
