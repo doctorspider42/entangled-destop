@@ -10,12 +10,13 @@ use windows::Win32::System::Hypervisor::{
     WHvPartitionPropertyCodeCpuidExitList, WHvPartitionPropertyCodeExtendedVmExits,
     WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
     WHvProcessorVendorAmd, WHvProcessorVendorHygon, WHvProcessorVendorIntel,
-    WHvSetPartitionProperty, WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
-    WHV_PARTITION_HANDLE, WHV_PROCESSOR_VENDOR,
+    WHvSetPartitionProperty, WHvSetupPartition, WHvUnmapGpaRange,
+    WHvX64LocalApicEmulationModeXApic, WHV_PARTITION_HANDLE, WHV_PROCESSOR_VENDOR,
 };
 
-use crate::hv::MachineConfig;
+use crate::hv::{HvError, MachineConfig};
 use crate::memory::{create_guest_memory, GuestMem};
+use crate::shm::SharedWindow;
 use crate::whp::interrupt::{HaltGate, WhpInterruptDelivery};
 use crate::whp::regs::{seg_from_whp, zeroed_value, Aligned16};
 use crate::whp::vcpu::{get_regs_raw, WhpVcpu};
@@ -543,11 +544,83 @@ impl WhpPartition {
         Ok(())
     }
 
+    /// Allocates a shared-memory window of `len` bytes (EPIC 20, VEN-2001).
+    ///
+    /// The WHP twin of [`crate::Vm::create_shm_window`], and simpler: WHP
+    /// addresses a mapping by its GPA range rather than by a slot number, so
+    /// there is nothing to reserve up front and nothing to leak if the window
+    /// is never placed.
+    ///
+    /// The window comes back **unplaced** — a BAR decodes nothing until the
+    /// driver enables memory space — and is mapped read/write with **no
+    /// execute**, which is the strongest statement either host can make about
+    /// host memory that is not guest RAM.
+    pub fn create_shm_window(&self, len: u64) -> Result<Arc<SharedWindow>, VmmError> {
+        let mapper = Arc::new(WhpGpaMapper {
+            partition: Arc::clone(&self.partition),
+        });
+        let window = SharedWindow::new(len, mapper)?;
+        tracing::info!(len, "allocated a shared-memory window for this partition");
+        Ok(Arc::new(window))
+    }
+
     /// Moves the vCPUs out for running. Each vCPU is owned by exactly one
     /// thread, because WHP allows only one concurrent
     /// `WHvRunVirtualProcessor` per VP index.
     pub fn take_vcpus(&mut self) -> Vec<WhpVcpu> {
         std::mem::take(&mut self.vcpus)
+    }
+}
+
+/// WHP's half of a shared-memory window (EPIC 20, VEN-2001).
+///
+/// Holds an `Arc` on the partition rather than the bare handle, so the window
+/// cannot outlive the partition it maps into: `WHvUnmapGpaRange` on a deleted
+/// partition is a use-after-free of a kernel object, and a `SharedWindow` is
+/// dropped by whoever holds it, not by the partition.
+struct WhpGpaMapper {
+    partition: Arc<Partition>,
+}
+
+impl crate::shm::GpaMapper for WhpGpaMapper {
+    fn map(&self, gpa: u64, region: &crate::shm::HostShmRegion) -> Result<(), HvError> {
+        // SAFETY: `region` owns a live, page-aligned `VirtualAlloc` allocation
+        // of exactly `region.len()` bytes. The `SharedWindow` that owns it
+        // unmaps this range before dropping the pages, and this mapper holds an
+        // `Arc` on the partition, so the handle is live for the whole call and
+        // WHP never keeps a pointer into freed memory. Read+write and *not*
+        // execute: this is data the guest maps, never code the host offers it.
+        unsafe {
+            WHvMapGpaRange(
+                self.partition.handle,
+                region.host_addr() as *mut core::ffi::c_void,
+                gpa,
+                region.len(),
+                WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite,
+            )
+        }
+        .map_err(|e| {
+            HvError::Registers(format!(
+                "WHvMapGpaRange(shm) at {gpa:#x}: {e} ({:#010x})",
+                e.code().0 as u32
+            ))
+        })
+    }
+
+    fn unmap(&self, gpa: u64, len: u64) -> Result<(), HvError> {
+        // SAFETY: `gpa`/`len` name a range this mapper mapped and has not
+        // unmapped since (`SharedWindow` tracks exactly one live placement),
+        // and the partition handle is kept alive by the `Arc`.
+        unsafe { WHvUnmapGpaRange(self.partition.handle, gpa, len) }.map_err(|e| {
+            HvError::Registers(format!(
+                "WHvUnmapGpaRange(shm) at {gpa:#x}: {e} ({:#010x})",
+                e.code().0 as u32
+            ))
+        })
+    }
+
+    fn backend(&self) -> &'static str {
+        "whp"
     }
 }
 

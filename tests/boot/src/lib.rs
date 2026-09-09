@@ -86,6 +86,10 @@ pub struct BootSpec {
     /// [`PciInterruptMode::IntxOnly`] explicitly, because a Linux guest offered
     /// MSI-X will never choose INTx and the path would stop being tested.
     pub pci_interrupts: PciInterruptMode,
+    /// Attach a virtio-gpu whose loopback Venus renderer declares a
+    /// host-visible window, and back that window with real host memory
+    /// (EPIC 20, VEN-2001). `pci` only — an mmio guest has no BAR to enumerate.
+    pub shm_window: bool,
     /// Whether to attach a virtio-input gamepad (GAME-2104), and what drives
     /// it. Never a *real* controller: see [`GamepadAttach`].
     pub gamepad: GamepadAttach,
@@ -142,6 +146,7 @@ impl BootSpec {
             notify: QueueNotifyMode::from_env(),
             transport: VirtioTransport::default(),
             pci_interrupts: PciInterruptMode::default(),
+            shm_window: false,
             gamepad: GamepadAttach::None,
             deadline: DEFAULT_DEADLINE,
         }
@@ -267,6 +272,14 @@ pub struct BootOutcome {
     pub total: Duration,
     pub serial: String,
     pub vcpu_outcomes: Vec<Result<RunOutcome, VmmError>>,
+    /// The shared-memory window this boot backed, when the spec asked for one
+    /// (EPIC 20, VEN-2001).
+    ///
+    /// Returned so a test can read the window's host pages **after** the guest
+    /// has stopped and check what the guest wrote into them — which is the
+    /// other half of "the host wrote it and the guest read it", and the half
+    /// no serial line can prove on its own.
+    pub shm: Option<Arc<machine_x86::shm::ShmWindow>>,
 }
 
 impl BootOutcome {
@@ -508,6 +521,17 @@ pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOu
         }
     };
 
+    if spec.shm_window {
+        // A detached scanout: this boot is about the window, not about pixels,
+        // and a headless harness must not need a compositor.
+        let display = display::DisplayHandle::detached(640, 480)
+            .map_err(|e| format!("cannot create a detached scanout: {e}"))?;
+        devices.push(Box::new(virtio_gpu::GpuDevice::with_renderer(
+            display,
+            Box::new(virtio_gpu::NullRenderer::with_venus()),
+        )));
+    }
+
     let mem = Arc::new(vm.memory().clone());
     let quiesce = Quiesce::new();
     // Exactly one transport, chosen by the spec. On pci there are no cmdline
@@ -522,17 +546,39 @@ pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOu
             (MachineBus::with_virtio(serial, virtio), clauses)
         }
         VirtioTransport::Pci => {
-            let pci = VirtioPciBus::attach_with_interrupts(
+            // The window allocator borrows the VM for the length of the attach
+            // and nothing longer — `create_shm_window` takes `&self`, so the
+            // closure can go out of scope before `take_vcpus`.
+            let allocate = |len: u64| vm.create_shm_window(len);
+            let shm = spec.shm_window.then_some(machine_x86::shm::ShmSupport {
+                mem_bytes: machine.memory_mib << 20,
+                allocate: &allocate,
+            });
+            let pci = VirtioPciBus::attach_with_shm(
                 vm.fd_shared(),
                 Arc::clone(&mem),
                 devices,
                 spec.notify,
                 spec.pci_interrupts,
+                shm,
             )
             .map_err(|e| e.to_string())?;
             (MachineBus::with_virtio_pci(serial, pci), String::new())
         }
     };
+    // Kept out of the bus so the test can still read the host pages after the
+    // guest has gone; the `Arc` is what keeps the mapping alive either way.
+    let shm = bus
+        .pci()
+        .and_then(|pci| pci.shm_window(shm_slot(spec)).cloned());
+    if let Some(window) = &shm {
+        // What the guest is going to look for. Written before the vCPUs start,
+        // so the guest cannot be reading a race.
+        window
+            .backing_for(virtio_gpu::VIRTIO_GPU_SHM_ID_HOST_VISIBLE)
+            .and_then(|backing| backing.write(0, HOST_SHM_MAGIC).ok())
+            .ok_or("cannot write the host marker into the shared-memory window")?;
+    }
 
     let mut cmdline = String::from("console=ttyS0 earlyprintk=serial panic=1 reboot=k");
     for extra in [spec.extra_cmdline.trim(), clauses.trim()] {
@@ -688,7 +734,25 @@ pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOu
         total: started.elapsed(),
         serial,
         vcpu_outcomes,
+        shm,
     })
+}
+
+/// What the host stamps at offset 0 of the shared-memory window before the
+/// guest starts, and what `entangled.shmprobe=` tells the guest to expect.
+pub const HOST_SHM_MAGIC: &[u8] = b"HOST-WROTE-THIS-FIRST";
+
+/// What the guest writes back one page in, if it could reach the window.
+/// Matches `SHM_GUEST_REPLY` in the test initramfs' `/init`.
+pub const GUEST_SHM_REPLY: &[u8] = b"GUEST-SAW-THE-WINDOW";
+
+/// Offset the guest's reply lands at. Matches `SHM_REPLY_OFFSET` in `/init`.
+pub const GUEST_SHM_REPLY_OFFSET: u64 = 4096;
+
+/// Which PCI slot the GPU landed in: last, because [`boot_once_driven`] pushes
+/// it after the optional disk.
+fn shm_slot(spec: &BootSpec) -> usize {
+    usize::from(spec.disk.is_some())
 }
 
 /// One line per virtio slot describing what the host side believes: device

@@ -133,6 +133,62 @@ pub struct ShmRegion {
     pub len: u64,
 }
 
+/// A host-side access to a shared-memory region that would have left it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("shared-memory access at {offset:#x}+{len} leaves the {window}-byte window")]
+pub struct ShmAccessError {
+    pub offset: u64,
+    pub len: u64,
+    pub window: u64,
+}
+
+/// The host memory behind a [`ShmRegion`], as a device sees it (VEN-2001
+/// phase 2).
+///
+/// Declaring a region is one thing and *backing* it is another: the pages come
+/// from the machine layer, which is the only part of the system that can ask a
+/// hypervisor to put host memory into a guest's physical address space. A
+/// device is handed this trait through
+/// [`VirtioDevice::set_shm_backing`] once the window exists, and until then it
+/// must behave exactly as it did before shared memory did — which for
+/// virtio-gpu means refusing `RESOURCE_MAP_BLOB` in band.
+///
+/// Deliberately tiny, and deliberately *not* a pointer or a slice:
+///
+/// * the guest is writing these same bytes at the same time, so every access
+///   is a bounded copy through a volatile path rather than a borrow, and a
+///   device cannot accidentally hold a `&[u8]` across a guest write;
+/// * every offset is checked against the window in `u64` before it becomes an
+///   address, which is the rule for guest-controlled values and a map offset
+///   is the most guest-controlled value in the epic;
+/// * nothing about a hypervisor, a memory slot or an OS appears in it, so the
+///   device crates stay portable and the machine layer keeps the whole
+///   mapping story to itself (ADR-0002).
+pub trait ShmBacking: Send + Sync {
+    /// Length of the window in bytes. Equals the [`ShmRegion::len`] the device
+    /// declared.
+    fn len(&self) -> u64;
+
+    /// Whether the window is empty. Always false for a real backing — a
+    /// zero-length region is refused before it gets this far.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copies `buf.len()` bytes out of the window at `offset`.
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), ShmAccessError>;
+
+    /// Copies `data` into the window at `offset`.
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), ShmAccessError>;
+
+    /// Fills `[offset, offset + len)` with `byte`.
+    ///
+    /// Its own method rather than a `write` of a big buffer because the one
+    /// caller that matters — clearing a span before a guest may read it —
+    /// would otherwise allocate a copy of the span to do it.
+    fn fill(&self, offset: u64, len: u64, byte: u8) -> Result<(), ShmAccessError>;
+}
+
 /// A host-side wakeup a device may hold to ask for service from the
 /// transport's worker context (ADR-0004 phase 2, real fences).
 ///
@@ -350,6 +406,21 @@ pub trait VirtioDevice: Send {
     /// once when it publishes its capability list.
     fn shm_regions(&self) -> Vec<ShmRegion> {
         Vec::new()
+    }
+
+    /// Hands the device the host memory behind one of its [`shm_regions`], now
+    /// that the machine layer has allocated and placed it (VEN-2001 phase 2).
+    ///
+    /// Called at most once per region, before the device is attached to a
+    /// transport, and only on a machine that could actually back the window.
+    /// The default ignores it, which is what every device except virtio-gpu
+    /// wants — and what keeps a device that declared a region but got no
+    /// backing behaving exactly as it did in phase 1, refusing the operations
+    /// that would need one instead of faulting the guest.
+    ///
+    /// [`shm_regions`]: VirtioDevice::shm_regions
+    fn set_shm_backing(&mut self, id: u8, backing: std::sync::Arc<dyn ShmBacking>) {
+        let _ = (id, backing);
     }
 }
 

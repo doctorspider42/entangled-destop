@@ -639,6 +639,35 @@ Still open after phase 4:
 - **The doorbell optimisation** for synchronous kicks, if a measurement ever
   demands it.
 
+## Host memory that is not guest RAM (EPIC 20, VEN-2001)
+
+`WhpPartition::create_shm_window(len)` allocates a virtio shared-memory window
+and hands back a `vmm_core::shm::SharedWindow`, **unplaced**. The mapper behind
+it is four lines:
+
+* map — `WHvMapGpaRange(handle, host_addr, gpa, len, Read | Write)`;
+* unmap — `WHvUnmapGpaRange(handle, gpa, len)`;
+* move — the second then the first, because WHP has no "re-map" call.
+
+Three things about it are worth keeping in your head:
+
+* **No execute.** WHP can say `Read | Write` and does. KVM cannot: a memory
+  slot has no execute permission of its own, so on that host the guest's page
+  tables decide, exactly as they do for guest RAM. This is the only behavioural
+  difference between the two backends in the whole window path, and it is
+  written down in `vmm_core::vm`'s `KvmGpaMapper` as well as here.
+* **The mapper holds an `Arc<Partition>`, not the bare handle.** A
+  `SharedWindow` is dropped by whoever holds it, not by the partition, and
+  `WHvUnmapGpaRange` on a deleted partition is a use-after-free of a kernel
+  object.
+* **Unmap before free, always** — `SharedWindow::drop` guarantees it. The
+  reverse leaves WHP pointing at host memory this process has returned.
+
+Everything above the mapper is shared with KVM: the aperture arithmetic, the
+BAR-rebase sweep and the DSDT window are all in `machine-x86` and are tested on
+Windows without a hypervisor (`cargo test -p machine-x86 --test shm_bus`). The
+real thing with a real guest is `cargo test -p vmm-core --test whp_shm`.
+
 ## Hard rules that apply here
 
 - Every `unsafe` block gets a `// SAFETY:` comment

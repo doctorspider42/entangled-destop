@@ -1,6 +1,7 @@
 //! VM assembly: memory registration, in-kernel IRQ chip/PIT and vCPU
 //! creation (backlog MVP-102/103/106).
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use kvm_bindings::{
@@ -11,6 +12,7 @@ use vm_memory::{Address, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, Mm
 
 use crate::hv::{GuestClock, HostIrqChip, HostIrqChipState, HvError, MachineConfig, VmClockState};
 use crate::memory::{create_guest_memory, GuestMem};
+use crate::shm::SharedWindow;
 use crate::{Hypervisor, Vcpu, VmmError};
 
 /// A configured (not yet running) virtual machine: guest memory registered,
@@ -29,6 +31,14 @@ pub struct Vm {
     roms: Vec<RomRegion>,
     /// Whether this host's KVM can mark a memory slot read-only.
     readonly_mem: bool,
+    /// Next free `KVM_SET_USER_MEMORY_REGION` slot number.
+    ///
+    /// Guest RAM takes the first `num_regions()`; firmware ROMs and
+    /// shared-memory windows take the rest. A single counter rather than two
+    /// formulas because the two used to be derived independently, and a ROM
+    /// mapped after a window would silently have reused the window's slot —
+    /// which KVM implements as "replace that mapping", not as an error.
+    next_slot: AtomicU32,
 }
 
 /// A firmware image mapped into its own KVM memory slot.
@@ -61,12 +71,14 @@ impl Vm {
         for index in 0..cfg.vcpu_count {
             vcpus.push(Vcpu::new(&fd, hv.kvm(), index)?);
         }
+        let next_slot = AtomicU32::new(memory.num_regions() as u32);
         Ok(Self {
             fd,
             memory,
             vcpus,
             roms: Vec::new(),
             readonly_mem,
+            next_slot,
         })
     }
 
@@ -119,7 +131,7 @@ impl Vm {
             std::ptr::copy_nonoverlapping(image.as_ptr(), mapping.as_ptr(), image.len());
         }
 
-        let slot = (self.memory.num_regions() + self.roms.len()) as u32;
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
         let mr = kvm_userspace_memory_region {
             slot,
             flags: if self.readonly_mem {
@@ -156,6 +168,33 @@ impl Vm {
     /// The firmware ROMs mapped into this VM (empty for direct-Linux boots).
     pub fn roms(&self) -> &[RomRegion] {
         &self.roms
+    }
+
+    /// Allocates a shared-memory window of `len` bytes and reserves the KVM
+    /// memory slot it will live in (EPIC 20, VEN-2001).
+    ///
+    /// The window comes back **unplaced**: a virtio-pci shared-memory region
+    /// lives in a BAR, and a BAR decodes nothing until the guest's driver says
+    /// so. The machine layer maps it, moves it when a firmware reassigns the
+    /// BAR, and unmaps it when memory decoding goes away
+    /// (`machine_x86::shm`).
+    ///
+    /// One slot per window, reserved for the life of the VM even while the
+    /// window is unmapped, because KVM identifies a mapping by its slot number
+    /// and reusing one would silently replace somebody else's.
+    pub fn create_shm_window(&self, len: u64) -> Result<Arc<SharedWindow>, VmmError> {
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
+        let mapper = Arc::new(KvmGpaMapper {
+            fd: Arc::clone(&self.fd),
+            slot,
+        });
+        let window = SharedWindow::new(len, mapper)?;
+        tracing::info!(
+            slot,
+            len,
+            "reserved a KVM memory slot for a shared-memory window"
+        );
+        Ok(Arc::new(window))
     }
 
     pub fn fd(&self) -> &VmFd {
@@ -195,6 +234,66 @@ impl Vm {
         Arc::new(KvmIrqChip {
             fd: Arc::clone(&self.fd),
         })
+    }
+}
+
+/// KVM's half of a shared-memory window: one memory slot, moved by
+/// re-registering it (EPIC 20, VEN-2001).
+///
+/// KVM has no "move a slot" ioctl and needs none — `KVM_SET_USER_MEMORY_REGION`
+/// on a slot number that already exists replaces it. Deleting is the same call
+/// with `memory_size = 0`, which is the kernel's documented spelling of "this
+/// slot is gone" and the only way to stop the guest reaching the pages.
+///
+/// Note the one asymmetry with WHP, stated where it is true rather than in a
+/// comment somewhere else: a KVM memory slot has no execute permission of its
+/// own. `KVM_MEM_READONLY` exists, execute-disable does not; whether the guest
+/// may fetch instructions from the window is decided by the guest's own page
+/// tables, exactly as it is for guest RAM. WHP is told `Read | Write` and
+/// really does fault an instruction fetch. Neither is a security difference
+/// that matters — the pages are the guest's own writable memory either way —
+/// but a reader comparing the two backends deserves to be told.
+struct KvmGpaMapper {
+    fd: Arc<VmFd>,
+    slot: u32,
+}
+
+impl crate::shm::GpaMapper for KvmGpaMapper {
+    fn map(&self, gpa: u64, region: &crate::shm::HostShmRegion) -> Result<(), HvError> {
+        let mr = kvm_userspace_memory_region {
+            slot: self.slot,
+            flags: 0,
+            guest_phys_addr: gpa,
+            memory_size: region.len(),
+            userspace_addr: region.host_addr(),
+        };
+        // SAFETY: `region` owns a live, page-aligned host mapping of exactly
+        // `region.len()` bytes; the caller (`SharedWindow`) holds it for as
+        // long as this slot exists and unmaps the slot before dropping it, so
+        // KVM never holds a pointer into freed memory. The slot number is this
+        // mapper's own, reserved by `Vm::create_shm_window` and used by nothing
+        // else.
+        unsafe { self.fd.set_user_memory_region(mr) }
+            .map_err(|e| HvError::Registers(format!("KVM_SET_USER_MEMORY_REGION(shm): {e}")))
+    }
+
+    fn unmap(&self, _gpa: u64, _len: u64) -> Result<(), HvError> {
+        let mr = kvm_userspace_memory_region {
+            slot: self.slot,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: 0,
+            userspace_addr: 0,
+        };
+        // SAFETY: a zero `memory_size` deletes the slot; the kernel reads no
+        // host pointer out of this structure, so there is nothing here that
+        // could dangle.
+        unsafe { self.fd.set_user_memory_region(mr) }
+            .map_err(|e| HvError::Registers(format!("KVM_SET_USER_MEMORY_REGION(shm delete): {e}")))
+    }
+
+    fn backend(&self) -> &'static str {
+        "kvm"
     }
 }
 

@@ -15,6 +15,7 @@ mod error;
 pub mod hv;
 pub mod lifecycle;
 mod memory;
+pub mod shm;
 mod state;
 
 #[cfg(target_os = "linux")]
@@ -40,6 +41,10 @@ pub use lifecycle::{
     Checkpoint, Lifecycle, LifecycleError, MachineLifecycle, ResettableVcpu, RunState, VcpuKick,
 };
 pub use memory::{create_guest_memory, GuestMem, HIGH_RAM_START, LOW_RAM_END};
+pub use shm::{
+    GpaMapper, HostShmRegion, SharedWindow, ShmAccessError, UnmappedGpaMapper,
+    MAX_SHM_WINDOW_BYTES, SHM_PAGE_SIZE,
+};
 pub use state::{VmState, VmStateError};
 
 #[cfg(target_os = "linux")]

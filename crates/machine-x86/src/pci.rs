@@ -155,6 +155,24 @@ const STATUS_CAP_LIST: u32 = 1 << 4;
 /// back, and all four are read-only to the guest.
 const BAR_MEMORY_32_FLAGS: u32 = 0;
 
+/// The same four bits for a **64-bit prefetchable** memory BAR: bits 2:1 = 10
+/// says the address is 64 bits wide and continues in the next register, bit 3
+/// says the window may be prefetched.
+///
+/// Both halves matter, and not only to the guest kernel:
+///
+/// * **64-bit** is what lets the window live above 4 GiB at all, which it must
+///   ([`crate::layout::pci_mmio64_base`]);
+/// * **prefetchable** is what decides where a firmware puts it. EDK2's
+///   `PciBusDxe` allocates a *non*-prefetchable 64-bit BAR out of the 32-bit
+///   aperture whenever it fits there, which for a 256 MiB window means it does
+///   not fit and enumeration fails; a prefetchable one goes to `Pci64Base`.
+///   Linux is just as literal on the other side: `pci_find_parent_resource`
+///   refuses to claim a prefetchable BAR inside a host-bridge window that is
+///   not itself prefetchable, which is why the DSDT `_CRS` marks the aperture
+///   the same way (`crate::acpi`).
+const BAR_MEMORY_64_PREFETCH_FLAGS: u32 = 0b0100 | 0b1000;
+
 /// Bits of a memory BAR that hold the flags rather than the address.
 const BAR_FLAG_MASK: u32 = 0xf;
 
@@ -176,6 +194,21 @@ pub enum PciError {
     MisalignedBar { base: u32, size: u32 },
 
     #[error(
+        "64-bit BAR base {base:#x} is not aligned to its size {size:#x}; a PCI \
+         memory BAR decodes only naturally aligned windows"
+    )]
+    MisalignedBar64 { base: u64, size: u64 },
+
+    #[error("64-bit BAR size {size:#x} must be a power of two of at least 16 bytes")]
+    BadBarSize64 { size: u64 },
+
+    #[error(
+        "a 64-bit BAR occupies two registers, so index {index} would run off the \
+         end of the six-register header"
+    )]
+    Bar64NeedsAPair { index: u8 },
+
+    #[error(
         "capability record of {len} bytes does not fit: {free} bytes left in the \
          configuration header"
     )]
@@ -185,12 +218,16 @@ pub enum PciError {
     CapabilityTooShort,
 }
 
-/// One 32-bit memory BAR. The address bits the guest may program are
-/// `!(size - 1)`, kept in the register's write mask rather than duplicated here.
+/// One memory BAR. The address bits the guest may program are `!(size - 1)`,
+/// kept in the register's write mask rather than duplicated here.
 #[derive(Debug, Clone, Copy)]
 struct MemoryBar {
     /// Window size in bytes; a power of two.
-    size: u32,
+    size: u64,
+    /// `true` when the window's address is 64 bits wide and continues in the
+    /// next register — which is then not a BAR of its own but this one's high
+    /// half, and must never be enumerated as one.
+    wide: bool,
 }
 
 /// One PCI function's configuration space: a type-0 header plus its capability
@@ -305,13 +342,61 @@ impl ConfigSpace {
             return Err(PciError::MisalignedBar { base, size });
         }
         let address_mask = !(size - 1);
-        *slot = Some(MemoryBar { size });
+        *slot = Some(MemoryBar {
+            size: u64::from(size),
+            wide: false,
+        });
         let register = reg::BAR0 + index * 4;
         self.set(register, (base & address_mask) | BAR_MEMORY_32_FLAGS);
         // The guest owns the address bits; the flag bits are ours. A write of
         // all-ones therefore reads back as `address_mask | flags`, which *is*
         // the sizing protocol.
         self.set_mask(register, address_mask);
+        Ok(self)
+    }
+
+    /// Programs the BAR *pair* starting at `index` as a **64-bit prefetchable**
+    /// memory window of `size` bytes at `base` (EPIC 20, VEN-2001).
+    ///
+    /// A 64-bit BAR is two consecutive registers: the low one carries the flag
+    /// bits and address bits 31:4, the high one carries bits 63:32 and nothing
+    /// else. The pair is one window, so `index + 1` is not a BAR and is never
+    /// enumerated as one — [`Self::bar_window`] and
+    /// [`PciRoot::locate_mmio`] both skip it, which is the difference between
+    /// decoding one 256 MiB window and decoding two nonsense ones.
+    ///
+    /// The sizing protocol works exactly as it does for a 32-bit BAR, one
+    /// register at a time: the write mask is the low and high halves of
+    /// `!(size - 1)`, so a guest that writes all-ones and reads back gets the
+    /// size in the pair — which is what both EDK2's `PciBusDxe` and Linux's
+    /// `__pci_read_base` do before they place it anywhere.
+    pub fn with_memory_bar64(mut self, index: u8, base: u64, size: u64) -> Result<Self, PciError> {
+        let high = index
+            .checked_add(1)
+            .ok_or(PciError::Bar64NeedsAPair { index })?;
+        if usize::from(high) >= self.bars.len() {
+            return Err(PciError::Bar64NeedsAPair { index });
+        }
+        if size < 16 || !size.is_power_of_two() {
+            return Err(PciError::BadBarSize64 { size });
+        }
+        if base % size != 0 {
+            return Err(PciError::MisalignedBar64 { base, size });
+        }
+        let address_mask = !(size - 1);
+        // Only the low register carries a `MemoryBar`; the high one stays
+        // `None`, which is exactly what makes the enumeration skip it.
+        self.bars[usize::from(index)] = Some(MemoryBar { size, wide: true });
+        self.bars[usize::from(high)] = None;
+        let low_reg = reg::BAR0 + index * 4;
+        let high_reg = reg::BAR0 + high * 4;
+        self.set(
+            low_reg,
+            ((base & address_mask) as u32) | BAR_MEMORY_64_PREFETCH_FLAGS,
+        );
+        self.set(high_reg, ((base & address_mask) >> 32) as u32);
+        self.set_mask(low_reg, address_mask as u32);
+        self.set_mask(high_reg, (address_mask >> 32) as u32);
         Ok(self)
     }
 
@@ -571,10 +656,16 @@ impl ConfigSpace {
             return None;
         }
         let bar = (*self.bars.get(usize::from(index))?)?;
-        let base = self.get(reg::BAR0 + index * 4) & !BAR_FLAG_MASK;
+        let low = self.get(reg::BAR0 + index * 4) & !BAR_FLAG_MASK;
+        let base = match bar.wide {
+            // The high half is the *next* register in full; `index + 1` is
+            // known to exist because `with_memory_bar64` checked it.
+            true => u64::from(low) | (u64::from(self.get(reg::BAR0 + (index + 1) * 4)) << 32),
+            false => u64::from(low),
+        };
         // An unprogrammed BAR (or one the guest parked at 0) decodes nothing:
         // address 0 is guest RAM, and claiming it would shadow real memory.
-        (base != 0).then_some((u64::from(base), u64::from(bar.size)))
+        (base != 0).then_some((base, bar.size))
     }
 
     // ------------------------------------------------------------ accesses

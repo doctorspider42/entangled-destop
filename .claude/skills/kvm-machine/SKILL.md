@@ -73,6 +73,27 @@ handle, guest memory, vCPU threads, lifecycle) and `crates/machine-x86`
 - Do not use `KVM_GET_SUPPORTED_CPUID` results unfiltered — mask out features
   we cannot honor (x2apic is fine to keep; PMU, nested virt leaves are not).
 
+## Host memory that is not guest RAM (EPIC 20, VEN-2001)
+
+`Vm::create_shm_window(len)` allocates a virtio shared-memory window and
+reserves the memory slot it will live in. Notes that cost time if you rediscover
+them:
+
+* **Slot numbers are a counter now** (`Vm::next_slot`), shared by guest RAM,
+  firmware ROMs and windows. They used to be derived twice by two formulas, and
+  a ROM mapped after a window would silently have reused the window's number —
+  which KVM implements as "replace that mapping", not as an error.
+* **A window's slot is reserved for the life of the VM**, even while the window
+  is unmapped. Deleting is `KVM_SET_USER_MEMORY_REGION` with `memory_size = 0`;
+  moving is the same call on the same slot, which replaces it.
+* **There is no execute permission to give or withhold.** `KVM_MEM_READONLY`
+  exists, execute-disable does not. WHP maps the same window `Read | Write`;
+  neither is a security difference that matters, but do not write documentation
+  claiming KVM enforces it.
+* The machine layer never sees any of this: it asks
+  `vmm_core::shm::GpaMapper`, which is the ADR-0002 seam for exactly this
+  (`machine_x86::shm`).
+
 ## Resetting a vCPU in place (ADR-0005)
 
 KVM has no "reset this vCPU" ioctl, so `ResettableVcpu::reset_arch_state` writes

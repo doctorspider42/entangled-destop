@@ -255,6 +255,34 @@ pub fn dword_memory(base: u32, len: u32) -> Vec<u8> {
     out
 }
 
+/// `QWordMemory (…, base, base+len-1, 0, len)` — 46 bytes, read/write and
+/// **prefetchable** when asked (EPIC 20, VEN-2001).
+///
+/// The 64-bit twin of [`dword_memory`], and the prefetchable flag is the point
+/// of it. Linux' `pci_find_parent_resource` will not claim a prefetchable BAR
+/// inside a host-bridge window that is not itself prefetchable — it skips the
+/// window and reassigns the BAR, or gives up on the device — so a
+/// shared-memory aperture published as plain read/write memory produces a
+/// guest whose `resource2` is all zeroes and whose driver cannot map anything.
+///
+/// The caching field is bits 2:1 of the type-specific flags (ACPI 6.5 §6.4.3.5.1):
+/// 0 non-cacheable, 1 cacheable, 2 cacheable write-combining, 3 cacheable
+/// prefetchable.
+pub fn qword_memory(base: u64, len: u64, prefetchable: bool) -> Vec<u8> {
+    let mut out = vec![0x8a];
+    out.extend_from_slice(&0x002bu16.to_le_bytes()); // payload length
+    out.push(0x00); // resource type: memory
+    out.push(RES_GENERAL_FLAGS);
+    // Bit 0: read/write. Bits 2:1: caching type.
+    out.push(0x01 | if prefetchable { 3 << 1 } else { 0 });
+    out.extend_from_slice(&0u64.to_le_bytes()); // granularity
+    out.extend_from_slice(&base.to_le_bytes()); // minimum
+    out.extend_from_slice(&(base + len - 1).to_le_bytes()); // maximum
+    out.extend_from_slice(&0u64.to_le_bytes()); // translation offset
+    out.extend_from_slice(&len.to_le_bytes());
+    out
+}
+
 /// The `EndTag` every `ResourceTemplate` finishes with. Checksum 0 means "not
 /// checked", which is what every real firmware emits.
 pub fn end_tag() -> Vec<u8> {
@@ -373,5 +401,29 @@ mod tests {
         assert_eq!(max, 0xcfff_ffff);
         assert_eq!(len, 0x1000_0000);
         assert_eq!(max - min + 1, len);
+    }
+
+    /// The 64-bit aperture descriptor: the right length, an inclusive range,
+    /// and a caching field that really says "prefetchable" — the bit Linux
+    /// checks before it will claim a prefetchable BAR inside the window.
+    #[test]
+    fn qword_memory_is_inclusive_and_can_say_prefetchable() {
+        let q = qword_memory(0x1_4000_0000, 4 << 30, true);
+        assert_eq!(q.len(), 46, "0x8a + 2 length bytes + 43 of payload");
+        assert_eq!(q[0], 0x8a);
+        assert_eq!(u16::from_le_bytes(q[1..3].try_into().unwrap()), 0x2b);
+        assert_eq!(q[3], 0x00, "resource type: memory");
+        assert_eq!(q[5] & 0x01, 0x01, "read/write");
+        assert_eq!((q[5] >> 1) & 0x03, 3, "cacheable prefetchable");
+        let min = u64::from_le_bytes(q[14..22].try_into().unwrap());
+        let max = u64::from_le_bytes(q[22..30].try_into().unwrap());
+        let len = u64::from_le_bytes(q[38..46].try_into().unwrap());
+        assert_eq!(min, 0x1_4000_0000);
+        assert_eq!(max, 0x1_4000_0000 + (4u64 << 30) - 1);
+        assert_eq!(len, 4 << 30);
+        assert_eq!(max - min + 1, len);
+
+        let plain = qword_memory(0x1_4000_0000, 4 << 30, false);
+        assert_eq!((plain[5] >> 1) & 0x03, 0, "non-cacheable when not asked");
     }
 }
