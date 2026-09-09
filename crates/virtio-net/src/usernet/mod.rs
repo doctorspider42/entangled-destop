@@ -80,7 +80,7 @@ use crate::backend::{NetBackend, NetError, Readiness};
 use crate::frame::{ETH_HEADER_LEN, MAX_FRAME_LEN};
 
 pub use dhcp::{Lease, CLIENT_PORT, SERVER_PORT};
-pub use tcp::TcpNat;
+pub use tcp::{TcpNat, FLOW_IDLE_TIMEOUT, FLOW_KEEPALIVE, MAX_FLOWS};
 
 /// Frames queued for the guest before the backend starts dropping them.
 ///

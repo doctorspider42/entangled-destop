@@ -45,7 +45,7 @@ echo "wrote artifacts/bootstrap/vmlinuz (kernel $KERNEL_VERSION, $(stat -c%s "$r
 # without VIRTIO_PCI boots fine and then finds no devices at all on a
 # `transport = "pci"` VM, which is a confusing way to discover a missing option.
 for opt in VIRTIO_MMIO PCI VIRTIO_PCI VIRTIO_BLK VIRTIO_NET VIRTIO_INPUT \
-           INPUT_EVDEV INPUT_JOYDEV DRM_VIRTIO_GPU; do
+           INPUT_EVDEV INPUT_JOYDEV DRM_VIRTIO_GPU IP_PNP IP_PNP_DHCP; do
     grep -q "^CONFIG_${opt}=y" .config || { echo "ERROR: CONFIG_${opt} not builtin" >&2; exit 1; }
 done
 echo "config sanity: both virtio transports and all drivers builtin"
