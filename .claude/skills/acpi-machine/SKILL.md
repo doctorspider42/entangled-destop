@@ -124,8 +124,9 @@ Four facts that look arbitrary and are not:
   clock against host clock, both sampled inside the guest microseconds apart,
   with none of the harness's observation latency in between. Two consequences.
   The comparison **cannot** detect a host whose own clock is wrong — the WSL2
-  host's gains 3.3 %, so the PM timer we synthesise there gains it too, and a
-  guest firmware's `MicroSecondDelay()` is 3.3 % short on that host. And any
+  host's gains a wandering 0.8–3.8 %, so the PM timer we synthesise there gains
+  it too, and a guest firmware's `MicroSecondDelay()` is that much short on that
+  host. And any
   device added later that reports host time to the guest inherits both the
   usefulness and the blind spot.
 * **`SCI_EN` always reads set.** `FADT.SMI_CMD` is 0 (no SMI on this machine),

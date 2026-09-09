@@ -919,8 +919,9 @@ configuration:
     the manager did not start, because the control channel is a pipe to a child
     process. A *suspended* machine is the exception: that state is a file on
     disk, so it survives a restart of the manager.
-15. **On WSL2, the guest's clock and the host's disagree by ~3.2 %, and the
-    guest is the one that is right.** WSL2's own `CLOCK_MONOTONIC` gains ~3.3 %;
+15. **On WSL2, the guest's clock and the host's disagree by 1–4 %, and the
+    guest is the one that is right.** WSL2's own `CLOCK_MONOTONIC` runs fast by
+    a wandering amount (+3.8 % and +0.8 % ninety minutes apart);
     the guest keeps real time to about 100 ppm over two hours, on both
     hypervisors. Nothing to do about it from here, but it makes any timing
     measured inside WSL unreliable. See

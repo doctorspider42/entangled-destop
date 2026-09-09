@@ -324,10 +324,23 @@ Every control run makes sense once you see that:
   argued about: guest `CLOCK_MONOTONIC` against the host clock **the guest read
   itself** is −31 956 ppm, within 400 ppm of the number the host measured from
   outside. Nothing is lost in the observing.
-- **Not load.** The earlier "it scales with host load, −5 000 ppm quiet to
-  −25 000 ppm at load 20" does not survive re-measurement: −32 000 ppm at a load
-  average under 3. It is a fixed frequency ratio, and the apparent correlation
-  was coincidence.
+- **Not load — time.** The earlier "it scales with host load, −5 000 ppm quiet
+  to −25 000 ppm at load 20" does not survive re-measurement: −32 000 ppm at a
+  load average under 3. What actually varies is the host clock's *own* error,
+  and it **wanders**. Same machine, same WSL boot, `CLOCK_MONOTONIC` against
+  `CLOCK_REALTIME`:
+
+  | Time | Host monotonic error | Guest drift measured against it |
+  |---|---|---|
+  | 15:24 | +37 889 ppm | −32 032 ppm |
+  | 16:57 | +8 064 ppm | −9 621 ppm |
+
+  The TSC against the wall clock was 1 896.6 MHz in both (nominal 1 896.389,
+  +119 ppm), and the guest tracked it in both. A reference whose own rate moves
+  by 30 000 ppm in ninety minutes is what the old "scales with load" table was
+  really watching — the busy period simply happened to be later in the run.
+  This is also why the check has to be **per run** rather than a constant
+  written into the test.
 
 **And WHP says the same thing from the other side.**
 `crates/vmm-core/tests/whp_clock.rs` boots the *same* guest on the *same*

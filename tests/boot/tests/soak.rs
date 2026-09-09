@@ -55,14 +55,15 @@
 //!   2026-09-09 measured −12 603 ppm and short controls −32 000 ppm, on a guest
 //!   that leaked nothing, dropped no interrupt and printed one benign line.
 //!   Every suspect inside the VM was eliminated in turn and the answer was
-//!   outside it: **the WSL2 development host's own `CLOCK_MONOTONIC` gains
-//!   3.3 %**, because it advances as though the TSC ran at 1 835.4 MHz when the
-//!   hardware runs at 1 896.4 MHz. The guest, which KVM correctly tells
-//!   1 896 389 kHz, keeps real time to about 100 ppm; the *reference* was the
-//!   thing that was wrong. See [`HOST_CLOCK_SANITY_PPM`], which is how the test
-//!   now notices — it checks the host's monotonic clock against the host's wall
-//!   clock and, where they disagree, judges the guest against the wall clock
-//!   and says so. The 10 000 ppm gate was never widened.
+//!   outside it: **the WSL2 development host's own `CLOCK_MONOTONIC` runs
+//!   fast, by a wandering 0.8–3.8 %**, because it advances as though the TSC
+//!   were slower than it is (1 835.4 MHz observed against a real 1 896.4 MHz).
+//!   The guest, which KVM correctly tells 1 896 389 kHz, keeps real time to
+//!   about 100 ppm; the *reference* was the thing that was wrong, and it was
+//!   not even wrong by a constant. See [`HOST_CLOCK_SANITY_PPM`], which is how
+//!   the test now notices — it checks the host's monotonic clock against the
+//!   host's wall clock and, where they disagree, judges the guest against the
+//!   wall clock and says so. The 10 000 ppm gate was never widened.
 //!
 //!   Three counters are recorded per heartbeat so the next such finding is an
 //!   afternoon and not a day: the guest's `CLOCK_MONOTONIC`, the raw TSC under
@@ -139,9 +140,11 @@ const MAX_DRIFT_PPM: f64 = 10_000.0;
 /// clock, and on 2026-09-09 that stopped being a theoretical concern: two hours
 /// of soak on the WSL2 development host reported the guest losing 90.7 s, and
 /// the guest was **right**. WSL2's `CLOCK_MONOTONIC` advances as though the TSC
-/// ran at 1 835.4 MHz when it really runs at 1 896.4 MHz, so the host's
-/// monotonic clock gains ~3.3 % — 48 minutes a day — while its
-/// externally-disciplined `CLOCK_REALTIME` keeps real time. Every guest clock
+/// were slower than it is (1 835.4 MHz observed against a real 1 896.4 MHz), so
+/// the host's monotonic clock gains whole percent — +3.8 % and +0.8 % measured
+/// ninety minutes apart in one WSL boot — while its externally-disciplined
+/// `CLOCK_REALTIME` keeps real time. That the error *wanders* is why this is a
+/// per-run check and not a constant subtracted somewhere. Every guest clock
 /// derived from the TSC (the `tsc` clocksource and kvm-clock alike, since KVM
 /// scales the pvclock from the same frequency) then reads 3.3 % *slow* against
 /// that reference, and the only guest clock that agreed with it was

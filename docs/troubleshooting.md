@@ -307,11 +307,13 @@ not acceptable, build from source instead — see the
 This section used to say the opposite, so if you are here from an older note,
 read on.
 
-A guest of ours running on KVM inside WSL2 reports its monotonic clock about
-**3.2 % slower** than the WSL host's. The guest is keeping real time. WSL2's own
-`CLOCK_MONOTONIC` gains ~3.3 % — it advances as though the CPU's time-stamp
-counter ran at 1 835.4 MHz where the hardware actually runs at 1 896.4 MHz — so
-it is the *host* clock that is fast, by about 48 minutes a day.
+A guest of ours running on KVM inside WSL2 reports its monotonic clock some
+**1–4 % slower** than the WSL host's. The guest is keeping real time. WSL2's own
+`CLOCK_MONOTONIC` runs fast — it advances as though the CPU's time-stamp counter
+were slower than it is (1 835.4 MHz observed against a real 1 896.4 MHz) — and
+the size of the error **wanders**: +3.8 % and +0.8 % were measured ninety
+minutes apart in one WSL session. So it is the *host* clock that is fast, and by
+an amount that will not be the same when you check.
 
 How to check it yourself, on any WSL distribution, with no VM involved:
 
@@ -320,7 +322,7 @@ How to check it yourself, on any WSL distribution, with no VM involved:
 python3 -c 'import time; m=time.monotonic(); r=time.time(); time.sleep(120); print("monotonic %.3f  realtime %.3f" % (time.monotonic()-m, time.time()-r))'
 ```
 
-On an affected WSL host the monotonic figure comes back ~3 % larger. A second
+On an affected WSL host the monotonic figure comes back 1–4 % larger. A second
 check from the Windows side: time the same command with PowerShell's
 `Measure-Command` — Windows QPC agrees with WSL's wall clock, not with its
 monotonic clock.
