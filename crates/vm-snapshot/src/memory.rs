@@ -77,6 +77,7 @@ use std::sync::Mutex;
 use vm_memory::{
     Bytes, GuestAddress, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, VolatileSlice,
 };
+use vmm_core::hv::DirtyPages;
 
 use crate::codec::{Reader, Writer};
 use crate::error::{Result, SnapshotError};
@@ -657,6 +658,65 @@ where
         }
         Ok(())
     })
+}
+
+/// What a hypervisor's write log missed, measured against the pages a save
+/// actually had to write (ADR-0006).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Unreported {
+    /// Pages a save would write: not entirely zero.
+    pub nonzero_pages: u64,
+    /// Of those, the ones the hypervisor's log reported.
+    pub reported_pages: u64,
+    /// Of those, the ones it did **not**.
+    pub missing_pages: u64,
+    /// Those pages in bytes.
+    pub missing_bytes: u64,
+}
+
+/// Counts the pages a snapshot has to carry that the hypervisor's write log
+/// never mentioned.
+///
+/// The number ADR-0006's argument turns on, computed on a real guest instead of
+/// argued from first principles. Every page here is one this process wrote
+/// through the mapping that backs guest RAM — a boot image, a virtio-blk read
+/// completion, a received packet, a used-ring update — and no flag on either
+/// hypervisor would have reported it. An incremental snapshot built on the log
+/// would have left every one of them at whatever the base had.
+///
+/// A diagnostic: it walks all of guest RAM a second time, and is only reached
+/// when somebody asked for the measurement.
+pub fn unreported<M>(mem: &M, log: &[DirtyPages]) -> Result<Unreported>
+where
+    M: GuestMemory,
+{
+    let mut out = Unreported::default();
+    for region in mem.iter() {
+        let gpa = region.start_addr().0;
+        let len = region.len();
+        let mut offset = 0u64;
+        while offset < len {
+            let want = (len - offset).min(SLAB);
+            let bytes = region_bytes(region, offset, want)?;
+            let mut at = 0usize;
+            while at < bytes.len() {
+                let end = (at + PAGE as usize).min(bytes.len());
+                if !is_zero(&bytes[at..end]) {
+                    let page_gpa = gpa + offset + at as u64;
+                    out.nonzero_pages += 1;
+                    if log.iter().any(|r| r.contains_dirty_gpa(page_gpa)) {
+                        out.reported_pages += 1;
+                    } else {
+                        out.missing_pages += 1;
+                        out.missing_bytes += (end - at) as u64;
+                    }
+                }
+                at = end;
+            }
+            offset += want;
+        }
+    }
+    Ok(out)
 }
 
 /// Reads every memory section back into `mem`.
@@ -1407,6 +1467,34 @@ mod tests {
             assert_eq!(stats.saved_bytes, 0);
             assert_eq!(stats.runs, 0);
         }
+    }
+
+    /// The diagnostic that measures ADR-0006's gap: a page that is non-zero but
+    /// absent from the log is counted as missing, and one that is in the log is
+    /// not.
+    #[test]
+    fn unreported_counts_the_pages_a_log_did_not_mention() {
+        let mem = memory(1 << 20);
+        // Three non-zero pages: 0, 5 and 9.
+        for page in [0u64, 5, 9] {
+            mem.write_obj(0xa5u8, GuestAddress(page * PAGE)).unwrap();
+        }
+        // A log that saw only page 5 — which is what a hypervisor reports when
+        // the other two were written by the VMM.
+        let log = vec![DirtyPages::new(0, 1 << 20, vec![1u64 << 5; 4]).unwrap()];
+        let out = unreported(&mem, &log).unwrap();
+        assert_eq!(out.nonzero_pages, 3);
+        assert_eq!(out.reported_pages, 1);
+        assert_eq!(out.missing_pages, 2);
+        assert_eq!(out.missing_bytes, 2 * PAGE);
+
+        // An empty log misses all of them; a log that saw everything misses
+        // none.
+        let out = unreported(&mem, &[DirtyPages::clean(0, 1 << 20)]).unwrap();
+        assert_eq!((out.nonzero_pages, out.missing_pages), (3, 3));
+        let all = vec![DirtyPages::new(0, 1 << 20, vec![u64::MAX; 4]).unwrap()];
+        let out = unreported(&mem, &all).unwrap();
+        assert_eq!((out.nonzero_pages, out.missing_pages), (3, 0));
     }
 
     /// A run that spans a slab boundary is split in the file and rejoined in the

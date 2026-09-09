@@ -401,6 +401,116 @@ fn a_suspended_guest_resumes_on_the_next_heartbeat() {
     );
 }
 
+/// **The second snapshot must carry the guest's *later* memory.**
+///
+/// The bug this exists for is the one a dirty-page scheme would have and a full
+/// save would not: a second suspend that wrote only what some log said had
+/// changed, and missed a page. The symptom is not a crash — it is a guest that
+/// comes back from the *second* file where it was at the *first*, or worse,
+/// half at each.
+///
+/// So: suspend at heartbeat *a*, resume, let the counter run on, suspend again
+/// at *b*, and resume the second file. What comes out must continue from `b`,
+/// not from `a`, and the gap must be a real one — the guest has to have run
+/// long enough between the two saves that `b` is well past `a`, or "it
+/// continued" would be true of the earlier file too.
+///
+/// The heartbeat is what makes this checkable without knowing anything about
+/// the guest's memory: the counter lives in the guest's own RAM, it is written
+/// by the guest (so no host write can carry it), and it only ever goes up.
+///
+/// It also exercises the loop the manager offers — resume, work, suspend
+/// again — end to end, which nothing else here did.
+#[test]
+fn a_second_suspend_carries_the_later_memory() {
+    let Some((kernel, initramfs)) = artifacts() else {
+        return;
+    };
+    if !hypervisor_available() {
+        return;
+    }
+    let scratch = Scratch::new("later");
+    let config = profile(&scratch, &kernel, &initramfs, None);
+    let first = scratch.path("first.esnap");
+    let second = scratch.path("second.esnap");
+
+    let a = suspend_once(&scratch, &config, &first);
+
+    // Resume the first file and run on, saving to a *different* path so both
+    // snapshots survive to be compared.
+    let mut vm = Vm::spawn(&[
+        "resume",
+        "--headless",
+        "--control-stdin",
+        "--save-to",
+        &second.display().to_string(),
+        &first.display().to_string(),
+    ]);
+    // Well past the first save: enough heartbeats that no ambiguity remains
+    // about which file a resumed guest came out of.
+    assert!(
+        vm.wait_for(HEARTBEAT, HEARTBEATS_BEFORE * 3),
+        "the resumed guest did not keep counting:\n{}",
+        tail(&vm.console(), 40)
+    );
+    vm.send("save");
+    let (ok, console) = vm.wait_out();
+    assert!(
+        ok,
+        "the second suspend did not exit cleanly:\n{}",
+        tail(&console, 40)
+    );
+    let middle = heartbeats(&console);
+    let b = *middle.last().expect("heartbeats between the two saves");
+    assert!(
+        b > a + 2,
+        "the guest barely moved between the two saves ({a} then {b}), so this test \
+         would pass on a snapshot that carried the earlier memory"
+    );
+    assert!(second.is_file(), "no second snapshot");
+
+    // The moment of truth: the second file, restored.
+    let mut vm = Vm::spawn(&["resume", "--headless", &second.display().to_string()]);
+    assert!(
+        vm.wait_for(HEARTBEAT, 2),
+        "the twice-suspended guest never printed a heartbeat:\n{}",
+        tail(&vm.console(), 40)
+    );
+    let console = vm.kill();
+    let after = heartbeats(&console);
+    assert_eq!(
+        after.first().copied(),
+        Some(b + 1),
+        "the second snapshot restored the guest's memory as of the FIRST save \
+         (saved at {a}, ran to {b}, came back at {:?})",
+        after.first()
+    );
+    assert_eq!(
+        console.matches(READY).count(),
+        0,
+        "the guest booted again instead of continuing:\n{}",
+        tail(&console, 40)
+    );
+
+    // And the first file is still the first file: a second save must not have
+    // reached back into it.
+    let mut vm = Vm::spawn(&["resume", "--headless", &first.display().to_string()]);
+    assert!(
+        vm.wait_for(HEARTBEAT, 2),
+        "the first snapshot stopped working"
+    );
+    let console = vm.kill();
+    assert_eq!(
+        heartbeats(&console).first().copied(),
+        Some(a + 1),
+        "resuming the first snapshot no longer gives the guest as it was then"
+    );
+    eprintln!(
+        "[later memory] saved at {a}, ran to {b}, second file resumed at {}",
+        b + 1
+    );
+}
+
 /// Resuming twice from the same file gives the same guest twice: a snapshot is
 /// read-only, and restoring one does not consume it.
 #[test]

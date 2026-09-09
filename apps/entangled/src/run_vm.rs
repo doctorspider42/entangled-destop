@@ -1480,7 +1480,19 @@ mod host_api {
             // instant. Never fatal: this is an instrument, and a VM must not
             // fail to suspend because one could not be read.
             let dirty = self.dirty.as_ref().and_then(|log| match log.fetch_dirty() {
-                Ok(log) => Some(vmm_core::hv::dirty_summary(&log)),
+                Ok(log) => {
+                    let (pages, bytes, total) = vmm_core::hv::dirty_summary(&log);
+                    // The number ADR-0006's argument turns on: pages this
+                    // snapshot has to carry that the hypervisor never mentioned.
+                    // A second full scan, which is why it happens only when
+                    // somebody asked for the measurement.
+                    let missed = vm_snapshot::memory::unreported(self.mem.as_ref(), &log)
+                        .inspect_err(|error| {
+                            tracing::warn!(%error, "cannot compare the write log with guest memory")
+                        })
+                        .ok();
+                    Some((pages, bytes, total, missed))
+                }
                 Err(error) => {
                     tracing::warn!(%error, "cannot read the guest write log");
                     None
@@ -1537,7 +1549,7 @@ mod host_api {
                 elapsed = ?report.elapsed,
                 "snapshot written"
             );
-            if let Some((pages, guest_written, total)) = dirty {
+            if let Some((pages, guest_written, total, missed)) = dirty {
                 // The gap between these two is the whole of ADR-0006's
                 // dirty-page argument, in one line: what the *guest* wrote, and
                 // what actually had to be saved. The second is larger, and the
@@ -1550,6 +1562,15 @@ mod host_api {
                     total,
                     "guest write log at suspend"
                 );
+                if let Some(missed) = missed {
+                    tracing::info!(
+                        nonzero_pages = missed.nonzero_pages,
+                        reported_pages = missed.reported_pages,
+                        missing_pages = missed.missing_pages,
+                        missing_bytes = missed.missing_bytes,
+                        "pages this snapshot carries that the write log never reported                          (host writes: boot images, device completions, used rings)"
+                    );
+                }
             }
             Ok(report.summary())
         }
