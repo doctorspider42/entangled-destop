@@ -481,3 +481,19 @@ matter: the engine exits with status 0 either way, so the reply line is the only
 place the reason ever appears, and the manager lifts it out of the log as it
 goes past rather than scanning the tail afterwards (a desktop guest can push the
 whole log buffer through in the seconds a suspend takes).
+
+## Amendment, 2026-09-09 — virtio-snd rewinds its queue positions
+
+The device matrix says virtio-snd saves "all four queues' positions and the
+guest's stream state", which is true but hides a deliberate asymmetry worth
+recording, because the next device author will have to make the same choice.
+
+virtio-snd reports `queue_positions` **rewound by the number of un-retired
+messages**, so a restore re-delivers periods the guest had posted but the
+device had not completed. virtio-gpu does the opposite and reports the real
+position. Both are right, for opposite reasons: a GPU command in flight has
+already had its side effect on host state, so replaying it would repeat that
+effect, whereas an audio period that was never played has had none — dropping
+it would silently lose the descriptors the guest is still waiting on.
+
+The rule this implies: **rewind only what a restore can safely do again.**

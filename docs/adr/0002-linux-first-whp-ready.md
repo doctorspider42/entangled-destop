@@ -388,3 +388,27 @@ about two minutes before the login prompt, which is most of the boot half.
   reducing reliance on KVM's in-kernel devices, should that ever be wanted.
 - Requires the "Windows Hypervisor Platform" optional feature on the host;
   coexists with WSL2 (both ride Hyper-V).
+
+## Amendment, 2026-09-09 — two usernet items closed
+
+The WHP phase-4 amendment left two open questions about the user-mode NAT that
+is Windows' only network. Both are now answered, by tests rather than by
+reasoning:
+
+- **The teardown race is gone.** A host peer that wrote and closed in the same
+  breath could beat its own bytes to the guest (~1 in 4 under WHP). It no
+  longer reproduces: 250/250 clean unit exchanges and 15/15 clean real-guest
+  runs on WHP, and there is a structural reason — `close()` is gated on
+  `send_queue() == 0`, smoltcp orders the FIN behind buffered data, and a flow
+  retires only in `Closed`/`TimeWait`. The remaining loss path is an *abortive*
+  peer close, which is TCP semantics and now reaches the guest as an RST rather
+  than as silence. The test has teeth: swapping the graceful close for
+  `abort()` makes it fail.
+- **`CONFIG_IP_PNP_DHCP` was never missing.** The TODO assumed the bootstrap
+  kernel lacked it; `make defconfig` supplies it, the kernel `ip=dhcp` path is
+  now proven guest-visible on both hosts, and `build.sh` asserts the symbol so
+  it cannot quietly go.
+
+One limit is worth stating plainly because it is easy to assume otherwise:
+**usernet forwards UDP only for DHCP and DNS.** QUIC, NTP, mDNS and game
+traffic do not cross it, and a test says so.
