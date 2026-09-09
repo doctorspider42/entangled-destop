@@ -326,9 +326,18 @@ struct PmTimer {
 
 impl PmTimer {
     /// Grants this process access to the timer's four ports and takes the
-    /// first reading, or `None` where the kernel refuses (`ioperm` needs
-    /// `CONFIG_X86_IOPL_IOPERM`) — in which case the probe simply reports two
-    /// clocks instead of three.
+    /// first reading, or `None` where there is no usable timer there — in which
+    /// case the probe simply reports two clocks instead of three.
+    ///
+    /// Two ways it can be absent, and both have to be caught, because a
+    /// *plausible-looking* third clock is worse than none: the kernel may
+    /// refuse the port (`ioperm` needs `CONFIG_X86_IOPL_IOPERM`), or the
+    /// machine may not decode it, in which case the read returns all-ones
+    /// for ever and a host comparing against it would see a guest that never
+    /// gains or loses a microsecond. So the counter has to be seen *moving*.
+    /// Each `in` is a VM exit, which takes microseconds, and the counter
+    /// advances every 280 ns — two consecutive reads that agree are a dead
+    /// port, not a coincidence.
     fn open() -> Option<Self> {
         // SAFETY: `ioperm` is a plain syscall taking no pointers. It widens
         // this process's I/O permission bitmap by the four bytes of the PM
@@ -336,8 +345,12 @@ impl PmTimer {
         // built without the ioperm syscall answers ENOSYS, which is the `!= 0`
         // arm below.
         let granted = unsafe { libc::ioperm(ACPI_PM_TIMER_PORT as libc::c_ulong, 4, 1) } == 0;
-        granted.then(|| Self {
-            last: read_pm_timer(),
+        if !granted {
+            return None;
+        }
+        let first = read_pm_timer();
+        (read_pm_timer() != first).then_some(Self {
+            last: first,
             ticks: 0,
         })
     }
