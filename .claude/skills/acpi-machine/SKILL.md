@@ -237,6 +237,27 @@ iasl -d apic.dat
 the acceptance bar for a table change. `ENTANGLED_ACPI_VCPUS=<n>` changes the
 CPU count in the dump.
 
+## The 64-bit aperture in `_CRS` (EPIC 20, VEN-2001)
+
+`\_SB.PCI0._CRS` publishes **two** producer windows since the shared-memory
+window landed: the 32-bit `DWordMemory` hole, and a `QWordMemory` above RAM for
+64-bit prefetchable BARs.
+
+Two details decide whether a guest can use the second one at all:
+
+* **it is marked prefetchable** (type-specific flags `0x07`: read/write, caching
+  type 3). Linux' `pci_find_parent_resource` refuses to claim a prefetchable BAR
+  inside a window that is not, skips it, and reassigns or disables the device.
+  The 32-bit window stays plain read/write, which is correct for what lives in
+  it;
+* **its base is not a constant.** It is the top of guest RAM —
+  `layout::pci_mmio64_base(mem)`, which is also what EDK2 computes as
+  `Pci64Base` — so `acpi::write` derives it from the memory object's last
+  address (`pci_mmio64_base_above`) rather than taking a number no caller has.
+  That is why `AcpiTables::new` takes a second argument now, and why a test
+  sweeps every guest size from 1 MiB to 64 GiB asserting the two spellings
+  agree.
+
 ## Verifying against a real guest
 
 ```bash

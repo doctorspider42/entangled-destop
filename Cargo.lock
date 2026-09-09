@@ -4597,6 +4597,7 @@ dependencies = [
 name = "vmm-core"
 version = "0.2.0"
 dependencies = [
+ "display",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
@@ -4607,6 +4608,7 @@ dependencies = [
  "uefi-boot",
  "virtio-block",
  "virtio-core",
+ "virtio-gpu",
  "virtio-net",
  "vm-memory 0.17.2",
  "vmm-sys-util",

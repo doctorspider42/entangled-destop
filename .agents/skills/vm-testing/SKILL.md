@@ -637,10 +637,18 @@ PCI aperture above the top of RAM — had no boot coverage at all, while the
 desktop profiles have asked for 4096 MiB since `examples/ubuntu-desktop-live.toml`
 was written. `tests/boot/tests/uefi_highmem.rs` and its WHP twin
 `crates/vmm-core/tests/whp_highmem.rs` close that: 4096 MiB, both regions
-mapped, `PlatformAddHobCB: HighMemory` in the log, `Pci64Base` one page past
-the end of RAM, ACPI installed, no `X64 Exception`, Boot Manager reached. 1.5 s
+mapped, `PlatformAddHobCB: HighMemory` in the log, `Pci64Base` at the end of
+RAM, ACPI installed, no `X64 Exception`, Boot Manager reached. 1.5 s
 on KVM, 2.8 s on WHP — a size, not a duration, so there is no excuse for the
 next machine-wide constant to be tested only at 2 GiB.
+
+Read the numbers, not the prose: with `--nocapture` this test prints
+`PlatformGetFirstNonAddressCB: FirstNonAddress=0x140000000` and
+`AddressWidthInitialization: Pci64Base=0x140000000 Pci64Size=0x3FFEC0000000`,
+i.e. the firmware's 64-bit aperture starts at **exactly** the top of RAM and
+runs to 2^46. EPIC 20's shared-memory window is placed at the same address for
+that reason (`machine_x86::layout::pci_mmio64_base`), so if this line ever
+moves, `tests/boot/tests/pci_shm.rs` is what will notice.
 
 They also compare the PVH hand-off block byte-for-byte across the run. That is
 the assertion that turns "the firmware took a `#GP` in `AcpiPlatformDxe`" into

@@ -48,6 +48,11 @@ virtio-core.workspace = true
 virtio-block.workspace = true
 virtio-net.workspace = true
 uefi-boot.workspace = true
+# `tests/whp_shm.rs` (EPIC 20 phase 2) boots a guest with a virtio-gpu whose
+# host-visible window is backed by `WHvMapGpaRange`; the detached scanout comes
+# from `display`, so the boot needs no compositor.
+virtio-gpu.workspace = true
+display.workspace = true
 
 [lints]
 workspace = true
