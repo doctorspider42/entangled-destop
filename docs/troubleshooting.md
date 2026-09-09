@@ -59,8 +59,41 @@ file somewhere writable and set *Settings ▸ Advanced ▸ working directory* to
 parent, or give the machine an absolute `[boot] firmware` path.
 
 The same applies to the two test artifacts (`scripts/fetch-test-kernel.sh`,
-`scripts/build-test-initramfs.sh`) and to the Debian bootstrap kernel
-(`guest/bootstrap-kernel/build.sh`) — all built per checkout, none committed.
+`scripts/build-test-initramfs.sh`) — built per checkout, never committed.
+
+## `the Debian installer needs Entangled's own kernel and initramfs`
+
+```text
+error: the Debian installer needs Entangled's own kernel and initramfs, and this
+host has neither artifacts/bootstrap/ nor a verified copy in the cache.
+run `entangled fetch bootstrap-kernel` ...
+```
+
+Do what it says:
+
+```console
+$ entangled fetch bootstrap-kernel
+guest bootstrap artifacts — Linux 6.12.9 (guest-artifacts-6.12.9-1)
+  trust         : SHA-256 pinned in this build (guest/bootstrap-kernel/pinned.toml)
+```
+
+About 13 MiB, into the same cache the ISOs use, and `entangled install debian`
+finds it there with no further configuration. This is the **only** way to get
+those two files on Windows: they are a Linux kernel build and there is no cross
+build, which is why the release pipeline builds them once and every host
+downloads them. On Linux you can also build your own with
+`bash guest/bootstrap-kernel/build.sh` (~15 min the first time), and a locally
+built `artifacts/bootstrap/` always wins over a download.
+
+Two variations worth knowing:
+
+- **A download that fails the digest check is deleted**, and the error names the
+  expected and the found SHA-256. Nothing unverified is ever kept, so the fix is
+  to run it again — a truncated transfer cannot linger.
+- **`ENTANGLED_BOOTSTRAP_DIR`** points at a directory holding `vmlinuz` and
+  `initrd.img` and skips the download entirely: a mounted Linux checkout, a
+  shared drive, an internal mirror. `ENTANGLED_BOOTSTRAP_BASE_URL` relocates the
+  *download* instead, and the pinned digests are still enforced.
 
 ## `/dev/kvm not found`, or "cannot be used"
 

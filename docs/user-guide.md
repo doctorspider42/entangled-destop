@@ -179,8 +179,13 @@ fresh checkout has neither:
 ```bash
 sudo apt-get install -y build-essential uuid-dev iasl nasm python3 git
 bash guest/firmware/build-cloudhv.sh      # the UEFI firmware, ~2.5 min, once
-bash guest/bootstrap-kernel/build.sh      # only needed for `install debian`
+bash guest/bootstrap-kernel/build.sh      # only for `install debian`, ~15 min
 ```
+
+The second one is optional even on Linux: `entangled fetch bootstrap-kernel`
+downloads the same two files, prebuilt and digest-checked, in a second. It is
+the *only* way to get them on Windows — see
+"[The guest bootstrap artifacts](#the-guest-bootstrap-artifacts)" below.
 
 `build-cloudhv.sh` checks out pinned EDK2 sources into
 `~/.cache/entangled-edk2` and builds `CLOUDHV.fd` into `artifacts/firmware/`.
@@ -223,8 +228,10 @@ entangled doctor
   required caps   : all present
   install         : ubuntu — UEFI + verified ISO, offline (no mirror needed)
                     debian — d-i on the bootstrap kernel, needs the network
+                    fedora — netinst through UEFI, kickstart, needs the network
     firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB)
-    bootstrap kernel artifacts/bootstrap/vmlinuz (12.5 MiB)
+    bootstrap kernel artifacts/bootstrap/vmlinuz (12.6 MiB, from this checkout)
+    bootstrap initrd artifacts/bootstrap/initrd.img (197 KiB)
     ubuntu ISO      /home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-live-server-amd64.iso (2.7 GiB)
     VM directory    /home/you/entangled-vms (781 GiB free of 1007 GiB)
     network         --network tap by default on this host
@@ -251,13 +258,16 @@ entangled doctor
   VMs per process : 1 — WHP maps guest memory for one partition per process,
                     so a second VM needs a second `entangled` process
     firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB)
+    bootstrap kernel MISSING — needed by `install debian` only
+                    run `entangled fetch bootstrap-kernel` (~13 MiB, SHA-256 pinned), or
+                    copy an artifacts/bootstrap/ directory in from a Linux checkout (the
+                    kernel build is Linux-only and does not cross-build)
+                    pinned release: guest-artifacts-6.12.9-1 (Linux 6.12.9)
     VM directory    C:\Users\you\entangled-vms (108 GiB free of 953 GiB)
     network         --network usernet by default on this host
 host looks ready to run VMs
 ```
 
-(The `install` line lists the Ubuntu and Debian paths only; Fedora works on both
-hosts but is not yet reported there.)
 
 ## Quickstart: Ubuntu Server
 
@@ -367,14 +377,22 @@ installed system is then started through a **bootstrap kernel** this project
 builds — a small kernel plus initramfs that mounts the installed root from
 `/dev/vda` and `switch_root`s into it.
 
-That bootstrap kernel only builds on Linux, so **`install debian` is
-Linux-only**. On Windows, install Ubuntu or Fedora instead, or copy an
-`artifacts/bootstrap/` directory in from a Linux checkout.
+That bootstrap kernel is a Linux kernel build with no cross-compile, but you do
+not have to build it: it is published, and one command downloads it on either
+host.
 
 ```bash
+entangled fetch bootstrap-kernel          # ~13 MiB, SHA-256 pinned in this build
 entangled fetch debian --channel stable --arch amd64 --variant gtk-netboot
 entangled install debian --disk ~/entangled-vms/debian.raw --size 32G --auto
 entangled run ~/entangled-vms/debian.toml
+```
+
+```powershell
+# The same commands on Windows, where --network usernet is the default.
+entangled fetch bootstrap-kernel
+entangled install debian --disk C:\Users\you\entangled-vms\debian.raw --size 32G --auto
+entangled run C:\Users\you\entangled-vms\debian.toml
 ```
 
 `entangled fetch` resolves the current Debian stable release from signed
@@ -388,6 +406,41 @@ release is picked up.
 The Debian installer needs a package mirror, so this path needs working
 networking: `--network usernet` for the in-process NAT, or `--network tap` with
 a host interface created once by `scripts/setup-tap.sh`.
+
+### The guest bootstrap artifacts
+
+`entangled fetch bootstrap-kernel` downloads two files into the media cache:
+
+| File | What it is | Licence |
+|---|---|---|
+| `vmlinuz` | Linux 6.12.9, `defconfig` + `kvm_guest.config` + this project's fragment, every virtio driver built in | **GPL-2.0-only** (upstream Linux, unmodified) |
+| `initrd.img` | ~200 KiB: one static `init` that mounts the installed root from `/dev/vda` and `switch_root`s into it | this project's licence; statically linked against musl (MIT) |
+
+Neither runs on your host. They are handed to the guest, which is why the
+kernel's GPL is not a constraint on Entangled Desktop's own licensing — but
+*distributing* a compiled kernel does carry an obligation, and it is met rather
+than waved away: the release that carries `vmlinuz` also carries the exact
+upstream tarball it was built from, the `.config` it was built with, the build
+script and a `SOURCES.md` saying so. `cargo deny`, the licence gate that keeps
+copyleft out of this program's dependencies, does not and cannot see any of
+this: it reads the Cargo graph, not the release assets.
+
+**What makes a download trustworthy here is weaker than for the ISOs, and worth
+knowing.** Debian and Ubuntu media are verified against pinned OpenPGP keys —
+signature first, digest second. These two files are verified against a SHA-256
+**compiled into the `entangled` binary** (`guest/bootstrap-kernel/pinned.toml`).
+That is better than a checksum file downloaded from beside the artifact, since
+an attacker who could serve you one could serve you the other; it is not a
+signature, there is no key and nothing to revoke, and anyone who can land a
+commit in this repository can change the pin. A file that does not hash to the
+pin is deleted, never used. Release tags are never reused, so a pin that was
+correct when it was reviewed stays correct.
+
+If you would rather not download a kernel at all: build it (`bash
+guest/bootstrap-kernel/build.sh` plus `bash scripts/build-bootstrap-initramfs.sh`
+on Linux, ~15 min), or point `ENTANGLED_BOOTSTRAP_DIR` at a directory that
+already holds the pair. A local `artifacts/bootstrap/` always wins over the
+cache, so a checkout that builds its own never picks up a download by accident.
 
 ## Living with a VM
 
@@ -780,21 +833,22 @@ occupies 16 GiB.
 
 When the manager disables a control it is saying "this would fail at boot", and
 it always says why: a short line under the control, and the long explanation as
-a tooltip. Four capability gates exist today, all of them the same statement —
+a tooltip. Three capability gates exist today, all of them the same statement —
 *this needs the Linux/KVM backend*:
 
 | Greyed out | Because |
 |---|---|
 | **Accelerate 3D graphics** | the host renderer speaks EGL, which the Windows host has no equivalent of yet; a 2D machine still gets a desktop |
 | **TAP networking** | there is no TAP device on Windows, and the drivers that would provide one are GPL, which this product cannot ship — `usernet` needs no host setup anyway |
-| **Debian** in the wizard | the Debian path boots this project's own bootstrap kernel, which builds on Linux only |
 | **ALSA / WASAPI** sound output | each is one host's audio system; `auto` takes whatever the host it lands on has and never blocks a start |
 
 The same checks run again when you press Save or Create, so a setting changed
 while a form was open cannot slip through. Separately, the manager checks before
 launching that the artifacts a profile needs are actually there — the firmware
-for a UEFI machine, the bootstrap kernel for a Debian install — and tells you
-where to get the missing one rather than letting the VM fail obscurely.
+for a UEFI machine, the bootstrap kernel and initramfs for a Debian install —
+and tells you where to get the missing one rather than letting the VM fail
+obscurely. The Debian wizard is offered on both hosts: its kernel used to be a
+capability the Windows backend simply did not have, and is now a download.
 
 ### Updates
 
@@ -825,9 +879,13 @@ configuration:
 4. **Anti-cheat games will not run.** Kernel-level anti-cheat refuses to run in
    a VM by design, and this VMM does not hide itself. Nor is there GPU
    passthrough.
-5. **`install debian` needs a Linux host**, because the bootstrap kernel it
-   boots the installed system with has no cross build. `install ubuntu` and
-   `install fedora` are portable.
+5. **`install debian` downloads a prebuilt guest kernel**, because the one it
+   boots the installer and the installed system with is a Linux kernel build
+   with no cross-compile. `entangled fetch bootstrap-kernel` gets it on either
+   host, checked against a SHA-256 pinned in the binary — which is a weaker
+   anchor than the pinned OpenPGP keys the ISOs get, and is spelled out under
+   "The guest bootstrap artifacts" above. `install ubuntu` and `install fedora`
+   need no such file.
 6. **Suspend refuses a changed disk.** Resuming onto an image whose size or
    mtime moved is refused by design (see above). Snapshots are also
    uncompressed, unencrypted, and always full — there is no incremental
