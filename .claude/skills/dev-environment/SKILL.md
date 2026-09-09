@@ -36,6 +36,13 @@ $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\entangled-target"   # or -<branch> fo
 cargo test --workspace
 ```
 
+**Keep your toolchain current, or CI will fail on lints you cannot see.**
+CI installs the latest stable; this machine's rustup does not update itself. A
+green local `clippy -D warnings` on an older stable means nothing — on
+2026-09-09 a two-month-old toolchain let `manual_slice_fill` through in two
+crates and turned main red twice. Run `rustup update stable` on **both** hosts
+before trusting a clean lint run.
+
 Full pre-merge verification checklist (both hosts): `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test
 --workspace`, `cargo deny check` (Linux is enough for deny; it is a license

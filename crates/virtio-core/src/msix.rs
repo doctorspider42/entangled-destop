@@ -682,12 +682,8 @@ impl TransportInterrupt for MsixInterrupt {
         let queues = self
             .with_state("reset", |s| {
                 s.config_vector = VIRTIO_MSI_NO_VECTOR;
-                for slot in &mut s.queue_vectors {
-                    *slot = VIRTIO_MSI_NO_VECTOR;
-                }
-                for word in &mut s.pending {
-                    *word = 0;
-                }
+                s.queue_vectors.fill(VIRTIO_MSI_NO_VECTOR);
+                s.pending.fill(0);
                 s.queue_vectors.len()
             })
             .unwrap_or(0);
@@ -709,15 +705,9 @@ impl TransportInterrupt for MsixInterrupt {
             .fetch_and(!MSIX_CONTROL_WRITE_MASK, Ordering::AcqRel);
         self.with_state("power-on reset", |s| {
             s.config_vector = VIRTIO_MSI_NO_VECTOR;
-            for slot in &mut s.queue_vectors {
-                *slot = VIRTIO_MSI_NO_VECTOR;
-            }
-            for word in &mut s.pending {
-                *word = 0;
-            }
-            for entry in &mut s.entries {
-                *entry = MsixEntry::default();
-            }
+            s.queue_vectors.fill(VIRTIO_MSI_NO_VECTOR);
+            s.pending.fill(0);
+            s.entries.fill(MsixEntry::default());
         });
     }
 

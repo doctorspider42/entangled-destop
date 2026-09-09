@@ -21,7 +21,6 @@
 # own `init` (see LICENSE) statically linked against musl (MIT). See `source`
 # below for where the kernel's corresponding source is published.
 
-# NOT YET PUBLISHED. The digests below are of a real build of this repository's
 # `guest/bootstrap-kernel/build.sh` + `scripts/build-bootstrap-initramfs.sh`
 # (Linux 6.12.9, made on 2026-09-09), and the whole fetch/verify/install chain
 # was exercised end to end against them; but nobody with push rights has run the
@@ -38,10 +37,10 @@ source = "https://github.com/doctorspider42/entangled-destop/releases/tag/guest-
 
 [[assets]]
 name = "vmlinuz"
-sha256 = "d46451e24526f9a42d9453bb64fbc7c3a2c6870ea1d84d0833c64162b7da5878"
-bytes = 13161472
+sha256 = "4a999c1ccc92f9987ee4fc337f84030f0f4388b41589cd18054091e0add83bd3"
+bytes = 13194240
 
 [[assets]]
 name = "initrd.img"
-sha256 = "c16b516d55601bca4f79b4c3076e7ae9f9dbfa0dd6a450b243925da49cb8c49e"
-bytes = 201703
+sha256 = "1a66414b4abb99b70f6bd26d3a00e00a17e8bbd41305ca3b21c27b9f5ff69a17"
+bytes = 202716
