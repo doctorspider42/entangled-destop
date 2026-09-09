@@ -66,8 +66,8 @@
 use std::path::{Path, PathBuf};
 
 use control_api::{
-    BootMode, BootSection, DiskSection, DisplaySection, SoundBackend, SoundSection,
-    VirtioTransport, VmConfig,
+    BootMode, BootSection, DiskSection, DisplaySection, GamepadBackend, GamepadSection,
+    SoundBackend, SoundSection, VirtioTransport, VmConfig,
 };
 
 use crate::disk;
@@ -231,8 +231,9 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             frame_stats: None,
         },
         // The installer has nothing to say; the *installed* profile below is
-        // where the card belongs.
+        // where the card and the pad belong.
         sound: SoundSection::default(),
+        gamepad: GamepadSection::default(),
     };
 
     let transcript = target.with_file_name(format!("{vm_name}-install.log"));
@@ -343,6 +344,14 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         sound: SoundSection {
             enabled: true,
             backend: SoundBackend::Auto,
+        },
+        // …and neither is a desktop you cannot play on (GAME-2104). Same
+        // bargain as the sound card: `auto` costs a virtio slot and nothing
+        // else, a host with no controller gets a pad that never moves, and one
+        // plugged in later is picked up without restarting the VM.
+        gamepad: GamepadSection {
+            enabled: true,
+            backend: GamepadBackend::Auto,
         },
     };
     let profile_path = target.with_file_name(format!("{vm_name}.toml"));

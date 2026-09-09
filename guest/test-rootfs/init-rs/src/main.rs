@@ -33,6 +33,18 @@
 //!                               has to be *guest code* that stops, not merely a
 //!                               device. Also never returns, so the host decides
 //!                               when the VM ends.
+//!   `entangled.padprobe=<n>`   the guest half of the gamepad acceptance
+//!                               (GAME-2104). Reports what the *kernel* made
+//!                               of the virtio-input descriptor — name, ids,
+//!                               whether joydev claimed it, how many buttons
+//!                               and axes it registered, and the `ABS_INFO`
+//!                               ranges it read back — then echoes at most
+//!                               `<n>` events the host injects, stopping early
+//!                               after 1.5 s of silence so "and nothing after
+//!                               that" is answerable too. Two lines:
+//!                               `padinfo` is printed *after* the event device
+//!                               is open, which is the host's cue that
+//!                               injecting will not race the open.
 //!   `entangled.netprobe=<ip>/<prefix>,<gateway>,<host>:<port>`
 //!                               configures eth0 statically (this initramfs has
 //!                               no DHCP client), opens a TCP connection to
@@ -69,6 +81,58 @@ const FITRIM: libc::Ioctl = 0xc018_5879u32 as libc::Ioctl;
 /// device.
 const BLKDISCARD: libc::Ioctl = 0x1277u32 as libc::Ioctl;
 
+/// Never echo more than this many input events, whatever the command line
+/// asks for: the probe must not become an unbounded loop, and a controller
+/// nobody is touching produces nothing at all, so a large number here would
+/// only ever mean "wait for the deadline".
+const MAX_PAD_EVENTS: usize = 256;
+
+/// How long the gamepad probe waits for the host to inject its sequence. Long
+/// enough for a slow boot to have finished settling, short enough that a
+/// broken event path is a test failure rather than a hung run.
+const PAD_EVENT_WAIT: Duration = Duration::from_secs(15);
+
+/// How long the gamepad probe keeps listening after the last event it saw,
+/// once at least one has arrived.
+///
+/// This is what turns `entangled.padprobe=<n>` from "wait for exactly n" into
+/// "collect at most n, then prove the stream stopped". A host test that asks
+/// for more events than it injects gets the difference as evidence: a pad that
+/// spams the guest after an unplug, or repeats a report, shows up as extra
+/// entries in `seq=` instead of being invisible because the probe had already
+/// counted enough and left.
+const PAD_QUIET: Duration = Duration::from_millis(1500);
+
+/// `EVIOCGABS(axis)` = `_IOR('E', 0x40 + axis, struct input_absinfo)`, spelled
+/// out because `libc` does not export the `EVIOC*` family. 24 is
+/// `size_of::<AbsInfo>()`; the cast is because `libc::Ioctl` is `i32` on musl
+/// and `u64` on glibc, and the bit pattern is what the kernel compares.
+const fn eviocgabs(axis: u32) -> libc::Ioctl {
+    ((2u32 << 30) | (24u32 << 16) | ((b'E' as u32) << 8) | (0x40 + axis)) as libc::Ioctl
+}
+
+/// `struct input_absinfo`.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct AbsInfo {
+    value: i32,
+    minimum: i32,
+    maximum: i32,
+    fuzz: i32,
+    flat: i32,
+    resolution: i32,
+}
+
+/// `struct input_event`: a timestamp in front of type/code/value.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct RawInputEvent {
+    time: libc::timeval,
+    event_type: u16,
+    code: u16,
+    value: i32,
+}
+
 /// How long the trim probe waits for `/dev/vda` to be created. virtio-blk
 /// probes asynchronously, so PID 1 can win the race on a fast boot.
 const DEVICE_WAIT: Duration = Duration::from_secs(5);
@@ -104,12 +168,19 @@ fn main() {
         mount("sysfs", "/sys", "sysfs");
         shm_probe(&expect);
     }
+    if let Some(count) =
+        param(&cmdline, "entangled.padprobe=").and_then(|v| v.parse::<usize>().ok())
+    {
+        mount("devtmpfs", "/dev", "devtmpfs");
+        pad_probe(count.min(MAX_PAD_EVENTS));
+    }
 
     if param(&cmdline, "entangled.poweroff=").as_deref() == Some("1") {
         acpi_power_off();
     }
 
-    if let Some(period) = param(&cmdline, "entangled.heartbeat=").and_then(|v| v.parse::<u64>().ok())
+    if let Some(period) =
+        param(&cmdline, "entangled.heartbeat=").and_then(|v| v.parse::<u64>().ok())
     {
         heartbeat(period);
     }
@@ -435,9 +506,9 @@ fn trim_probe(mib: u64) {
     let limits = discard_limits();
 
     match fitrim_route(bytes) {
-        Ok(trimmed) => println!(
-            "VMHOST_TEST_OK trim path=fitrim filled={bytes} trimmed={trimmed} {limits}"
-        ),
+        Ok(trimmed) => {
+            println!("VMHOST_TEST_OK trim path=fitrim filled={bytes} trimmed={trimmed} {limits}")
+        }
         // The device refused the trim, or the filesystem could not run it. The
         // filesystem is intact and must stay that way: falling back to a raw
         // BLKDISCARD here would write straight over it, and a later boot of the
@@ -570,8 +641,8 @@ fn fitrim_route(bytes: u64) -> Result<u64, TrimFailure> {
     // extents are visible to the FITRIM walk.
     unsafe { libc::sync() };
 
-    let dir = std::fs::File::open("/mnt")
-        .map_err(|e| TrimFailure::Refused(format!("open-mnt:{e}")))?;
+    let dir =
+        std::fs::File::open("/mnt").map_err(|e| TrimFailure::Refused(format!("open-mnt:{e}")))?;
     // struct fstrim_range { __u64 start; __u64 len; __u64 minlen; }
     let mut range: [u64; 3] = [0, u64::MAX, 0];
     // SAFETY: `dir` is a live directory fd on the mounted filesystem and
@@ -805,6 +876,284 @@ fn shm_probe(expect: &str) {
     fail("no-shared-memory-bar".into());
 }
 
+/// The guest half of the gamepad acceptance (GAME-2104).
+///
+/// The interesting question is not "did an event arrive" but **"what did the
+/// kernel make of the descriptor"** — a virtio-input device the host is happy
+/// with can still be registered as a tablet, or as a joystick with the wrong
+/// axis ranges, or not handed to `joydev` at all, and every one of those is a
+/// pad no game can use. So the probe reports the kernel's own conclusions:
+///
+/// * from `/proc/bus/input/devices` — the name, the `input_id`, how many `KEY`
+///   and `ABS` codes the input core registered, and which handlers claimed the
+///   device (`js0` there is `joydev` saying yes);
+/// * from `EVIOCGABS` on the event node — the ranges the kernel read out of
+///   our `ABS_INFO`, which is the descriptor coming back the other way.
+///
+/// Then it echoes the first `count` events the host injects, so the whole path
+/// (host push → virtqueue → `virtio_input` → input core → evdev) is proven end
+/// to end rather than inferred from the device merely existing.
+///
+/// Two lines, and the order matters: `padinfo` is printed **after** the event
+/// node is open, because evdev only buffers for clients that already exist —
+/// a host that injected on seeing the device would race the open and lose the
+/// events.
+fn pad_probe(count: usize) {
+    let Some(device) = find_input_device("Entangled Gamepad") else {
+        let names = input_device_names().join(",");
+        println!(
+            "VMHOST_TEST_FAIL padprobe not-enumerated devices={}",
+            if names.is_empty() { "none" } else { &names }
+        );
+        return;
+    };
+
+    let Some(node) = device.event_node.clone() else {
+        println!(
+            "VMHOST_TEST_FAIL padprobe no-event-node handlers={}",
+            if device.handlers.is_empty() {
+                "none".into()
+            } else {
+                device.handlers.join(",")
+            }
+        );
+        return;
+    };
+    let path = format!("/dev/input/{node}");
+    if let Err(why) = wait_for_device(Path::new(&path)) {
+        println!("VMHOST_TEST_FAIL padprobe {why}");
+        return;
+    }
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            println!("VMHOST_TEST_FAIL padprobe cannot-open-{node} {error}");
+            return;
+        }
+    };
+    let fd = file.as_raw_fd();
+
+    // The descriptor, read back through the kernel. ABS_X (0) is a stick,
+    // ABS_Z (2) a trigger and ABS_HAT0X (0x10) the D-pad: one of each, because
+    // they are the three different shapes the device publishes.
+    let range = |axis: u32| match abs_info(fd, axis) {
+        Some(info) => format!(
+            "{}:{}:{}:{}",
+            info.minimum, info.maximum, info.fuzz, info.flat
+        ),
+        None => "absent".to_string(),
+    };
+    // "joydev claimed it" is two claims, and only the second one matters to a
+    // game: the handler bound (`Handlers=` mentions a `js*`) *and* the node it
+    // promised is really there and really opens. A `js0` in that line with no
+    // openable `/dev/input/js0` behind it is what a missing devtmpfs entry or
+    // a permission problem looks like, and it is worth telling apart from
+    // joydev never having bound at all.
+    let js_node = device
+        .handlers
+        .iter()
+        .find(|handler| handler.starts_with("js"))
+        .cloned();
+    let js_open = js_node
+        .as_ref()
+        .is_some_and(|js| std::fs::File::open(format!("/dev/input/{js}")).is_ok());
+    // Whether the *kernel* has a `joydev` handler at all, which is a different
+    // question from whether it bound to this device. `CONFIG_INPUT_JOYDEV` is a
+    // separate symbol from `CONFIG_INPUT_EVDEV` and is a module in a stock
+    // distribution kernel, so `js=0` on a kernel without it says nothing about
+    // the descriptor — and a host test that could not tell the two apart would
+    // report the wrong bug, loudly, at whoever changed the device last.
+    let joydev_present = std::fs::read_to_string("/proc/bus/input/handlers")
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            line.split_ascii_whitespace()
+                .any(|field| field == "Name=joydev")
+        });
+    println!(
+        "VMHOST_TEST_OK padinfo name={} bus={:04x} vendor={:04x} product={:04x} \
+version={:04x} node={} js={} jsnode={} jsopen={} joydev={} handlers={} keys={} \
+axes={} absx={} absz={} abshat={}",
+        device.name.replace(' ', "_"),
+        device.bus,
+        device.vendor,
+        device.product,
+        device.version,
+        node,
+        u8::from(js_node.is_some()),
+        js_node.as_deref().unwrap_or("none"),
+        u8::from(js_open),
+        u8::from(joydev_present),
+        device.handlers.join(","),
+        device.key_count,
+        device.abs_count,
+        range(0x00),
+        range(0x02),
+        range(0x10),
+    );
+
+    // …and now the round trip. Blocking reads with a deadline enforced by the
+    // kernel rather than by a spin: `poll(2)` on the one descriptor.
+    //
+    // Two deadlines, because the interesting failure is not only "nothing
+    // arrived". Until the first event the probe waits [`PAD_EVENT_WAIT`], the
+    // patience a slow boot needs; after it, [`PAD_QUIET`] of silence ends the
+    // collection. So a host that asks for more events than it injects is
+    // asking "and then nothing more, yes?", and gets an answer.
+    let mut seen: Vec<String> = Vec::new();
+    let mut syn = 0usize;
+    let mut deadline = Instant::now() + PAD_EVENT_WAIT;
+    while seen.len() + syn < count && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let millis = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+        let mut fds = [libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: one initialised `pollfd` in local storage, a matching count,
+        // and a descriptor kept alive by `file` for the whole call. `poll`
+        // writes only `revents`.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, millis) };
+        if ready <= 0 {
+            break;
+        }
+        let mut buffer = [RawInputEvent::default(); 32];
+        // SAFETY: `fd` is live, and the destination is a local array of
+        // `#[repr(C)]` plain-old-data whose own size in bytes is the length —
+        // so the kernel cannot write past it and any bytes it does write are a
+        // valid value.
+        let read = unsafe {
+            libc::read(
+                fd,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(&buffer),
+            )
+        };
+        if read <= 0 {
+            break;
+        }
+        let records = (read as usize) / std::mem::size_of::<RawInputEvent>();
+        for event in buffer.iter().take(records) {
+            match event.event_type {
+                0x00 => syn += 1,
+                0x01 => seen.push(format!("k{:x}={}", event.code, event.value)),
+                0x03 => seen.push(format!("a{:x}={}", event.code, event.value)),
+                other => seen.push(format!("t{other:x}c{:x}={}", event.code, event.value)),
+            }
+        }
+        if records > 0 {
+            deadline = Instant::now() + PAD_QUIET;
+        }
+    }
+    println!(
+        "VMHOST_TEST_OK padprobe events={} syn={} seq={}",
+        seen.len(),
+        syn,
+        if seen.is_empty() {
+            "none".to_string()
+        } else {
+            seen.join(",")
+        }
+    );
+}
+
+/// One device as `/proc/bus/input/devices` describes it.
+#[derive(Debug, Default)]
+struct InputDeviceInfo {
+    name: String,
+    bus: u32,
+    vendor: u32,
+    product: u32,
+    version: u32,
+    handlers: Vec<String>,
+    event_node: Option<String>,
+    /// Set bits in the `B: KEY=` bitmap — the number of buttons the *input
+    /// core* registered, not the number the device claimed.
+    key_count: u32,
+    /// Set bits in the `B: ABS=` bitmap.
+    abs_count: u32,
+}
+
+/// Names of every input device the kernel registered, for a failure message.
+fn input_device_names() -> Vec<String> {
+    std::fs::read_to_string("/proc/bus/input/devices")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.strip_prefix("N: Name=\""))
+        .map(|rest| rest.trim_end_matches('"').replace(' ', "_"))
+        .collect()
+}
+
+/// Finds one device by name in `/proc/bus/input/devices`.
+///
+/// That file rather than sysfs because it carries the `Handlers=` line, which
+/// is the only place the kernel says out loud that `joydev` bound the device —
+/// and "is it a joystick" is half of what this probe exists to answer.
+fn find_input_device(want: &str) -> Option<InputDeviceInfo> {
+    let text = std::fs::read_to_string("/proc/bus/input/devices").ok()?;
+    for block in text.split("\n\n") {
+        let mut info = InputDeviceInfo::default();
+        let mut matched = false;
+        for line in block.lines() {
+            let line = line.trim_end();
+            if let Some(rest) = line.strip_prefix("I: ") {
+                for field in rest.split_ascii_whitespace() {
+                    let Some((key, value)) = field.split_once('=') else {
+                        continue;
+                    };
+                    let value = u32::from_str_radix(value, 16).unwrap_or(0);
+                    match key {
+                        "Bus" => info.bus = value,
+                        "Vendor" => info.vendor = value,
+                        "Product" => info.product = value,
+                        "Version" => info.version = value,
+                        _ => {}
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("N: Name=\"") {
+                info.name = rest.trim_end_matches('"').to_string();
+                matched = info.name == want;
+            } else if let Some(rest) = line.strip_prefix("H: Handlers=") {
+                info.handlers = rest.split_ascii_whitespace().map(str::to_string).collect();
+                info.event_node = info
+                    .handlers
+                    .iter()
+                    .find(|h| h.starts_with("event"))
+                    .cloned();
+            } else if let Some(rest) = line.strip_prefix("B: KEY=") {
+                info.key_count = count_bitmap_bits(rest);
+            } else if let Some(rest) = line.strip_prefix("B: ABS=") {
+                info.abs_count = count_bitmap_bits(rest);
+            }
+        }
+        if matched {
+            return Some(info);
+        }
+    }
+    None
+}
+
+/// Counts set bits in a `/proc/bus/input/devices` bitmap: space-separated hex
+/// words, most significant first. Only the population matters here, not which
+/// bits, so the word order is irrelevant.
+fn count_bitmap_bits(text: &str) -> u32 {
+    text.split_ascii_whitespace()
+        .filter_map(|word| u64::from_str_radix(word, 16).ok())
+        .map(u64::count_ones)
+        .sum()
+}
+
+/// `EVIOCGABS(axis)`.
+fn abs_info(fd: std::os::fd::RawFd, axis: u32) -> Option<AbsInfo> {
+    let mut info = AbsInfo::default();
+    // SAFETY: `fd` is live for the call; the request is `EVIOCGABS(axis)`,
+    // whose encoded payload size is `size_of::<AbsInfo>()`, and the
+    // destination is one such `#[repr(C)]` struct in local storage.
+    let result = unsafe { libc::ioctl(fd, eviocgabs(axis), std::ptr::addr_of_mut!(info)) };
+    (result >= 0).then_some(info)
+}
+
 /// Reports what the kernel found on the PCI bus, and how much of it bound to a
 /// virtio driver.
 ///
@@ -874,11 +1223,7 @@ fn pci_scan() {
         // for a modern virtio function must be `virtio-pci`.
         let driver = std::fs::read_link(dir.join("driver"))
             .ok()
-            .and_then(|target| {
-                target
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-            })
+            .and_then(|target| target.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_default();
         if is_virtio && !driver.is_empty() {
             bound += 1;
