@@ -462,6 +462,16 @@ it was is then a file the engine will refuse — so keeping it would leave a car
 that goes on offering a Resume which cannot work. Deleting a machine takes its
 snapshot with it for the same reason (`discovery::plan_delete`).
 
+**A resume does not consume the file**, deliberately — a restore that fails at
+startup has to be retriable, and `entangled resume` also points a later bare
+`save` back at the same path, which is what makes closing and re-opening a
+machine a loop rather than a one-way trip. The consequence is visible in the
+manager and is the honest reading rather than a bug: a machine that was resumed
+and then *stopped* (instead of suspended again) goes back to `Suspended` with
+its old file, and — once the running guest has written to its disk — a card that
+says "cannot resume here: the disk has changed". "Start fresh…" is the way out,
+and it deletes the file with the user watching.
+
 The vocabulary of the control channel moved to `control_api::control` in the
 process: `entangled run` and `entangled-manager` are two crates at the ends of
 one pipe, and a reply prefix spelled as a literal on each side would have
