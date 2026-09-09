@@ -893,8 +893,10 @@ runs on both hosts in a second rather than only where `/dev/kvm` exists.
 A BAR is guest-writable. A guest can therefore point a 256 MiB prefetchable
 window at its own page tables, at the LAPIC, at the pflash window or at another
 device — and KVM and WHP would both map it there if asked. So every placement
-goes through `machine_x86::shm::ShmWindow::follow`, which maps only inside the
-aperture published in the DSDT and otherwise leaves the window **unmapped**.
+goes through `machine_x86::shm::ShmWindow` — `follow`, or its two halves
+`release_for` and `claim` where a sweep needs them apart — which maps only
+inside the aperture published in the DSDT and otherwise leaves the window
+**unmapped**.
 Because the aperture starts at the top of RAM, one containment test rules out
 every collision that matters at once.
 
@@ -938,9 +940,10 @@ The `gpu_blob` target grew a real `ShmBacking` for this: it scribbles a canary
 over the whole window before every operation and reads every live mapping back,
 so the property is checked against *memory* rather than against the bookkeeping
 that is supposed to maintain it, and it aims arbitrary `(offset, len)` pairs —
-wrapping ones included — straight at the backing. Campaign: **1 085 637
-executions in 603 s** (1800 exec/s, 927 edges, 645-case corpus), no crashes and
-no invariant violation.
+wrapping ones included — straight at the backing. Campaign on the tree as
+merged: **1 197 656 executions in 603 s** (1986 exec/s, 927 edges, 668-case
+corpus), no crash and no invariant violation; an earlier 1 085 637-execution run
+before the review fixes was equally clean.
 
 The loopback Venus renderer writes a 32-byte signature at the mapping offset —
 magic, resource id, size, `blob_id`. A real Venus renderer will map its own
