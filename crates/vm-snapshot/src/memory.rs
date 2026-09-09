@@ -1101,28 +1101,47 @@ mod tests {
 
     /// A guest with the >3 GiB split: two regions, two sections, and the high
     /// one's contents must not land in the low one.
+    ///
+    /// Each region is deliberately above [`PARALLEL_FLOOR`], so this is also the
+    /// case where two regions are each scanned by a pool in turn — the run
+    /// offsets are region-relative and a pool that leaked one region's offsets
+    /// into the other's section would write the high guest's pages into low RAM.
     #[test]
     fn two_regions_stay_apart() {
-        let low = 0xc000_0000u64;
         let high = 0x1_0000_0000u64;
+        let each = (4 * SLAB) as usize;
         let build = || {
-            GuestMemoryMmap::from_ranges(&[
-                (GuestAddress(0), (4 << 20) as usize),
-                (GuestAddress(high), (4 << 20) as usize),
-            ])
-            .unwrap()
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), each), (GuestAddress(high), each)])
+                .unwrap()
         };
-        let _ = low;
         let mem = build();
         let target = build();
-        mem.write_obj(0xaau8, GuestAddress(PAGE)).unwrap();
-        mem.write_obj(0xbbu8, GuestAddress(high + PAGE)).unwrap();
+        // One mark per region per slab, so every worker has something to find.
+        for slab in 0..4u64 {
+            mem.write_obj(0xaau8, GuestAddress(slab * SLAB + PAGE))
+                .unwrap();
+            mem.write_obj(0xbbu8, GuestAddress(high + slab * SLAB + PAGE))
+                .unwrap();
+        }
         round_trip(&mem, &target);
-        assert_eq!(target.read_obj::<u8>(GuestAddress(PAGE)).unwrap(), 0xaa);
-        assert_eq!(
-            target.read_obj::<u8>(GuestAddress(high + PAGE)).unwrap(),
-            0xbb
-        );
+        for slab in 0..4u64 {
+            assert_eq!(
+                target
+                    .read_obj::<u8>(GuestAddress(slab * SLAB + PAGE))
+                    .unwrap(),
+                0xaa,
+                "low region, slab {slab}"
+            );
+            assert_eq!(
+                target
+                    .read_obj::<u8>(GuestAddress(high + slab * SLAB + PAGE))
+                    .unwrap(),
+                0xbb,
+                "high region, slab {slab}"
+            );
+        }
+        // And nothing bled across: the low region's other slabs are still zero.
+        assert_eq!(target.read_obj::<u8>(GuestAddress(SLAB - PAGE)).unwrap(), 0);
     }
 
     /// Restoring into a differently-shaped guest is refused rather than
