@@ -10,6 +10,13 @@ pub fn explain(lines: &[String]) -> Option<String> {
 }
 
 fn explain_line(line: &str) -> Option<String> {
+    // WSL's own failures come first: they are the only ones in this file that
+    // are not the engine's output at all, and `execvpe entangled failed 2` is
+    // the least readable line the product can produce. The translation lives in
+    // `control_api::wsl` because `entangled doctor` says the same thing.
+    if let Some(message) = control_api::wsl::translate(line) {
+        return Some(message);
+    }
     let lower = line.to_ascii_lowercase();
     let mentions_tap = lower.contains("tap");
 
@@ -105,6 +112,20 @@ mod tests {
         ]))
         .expect("hint")
         .contains("installer exited"));
+    }
+
+    /// The failure this whole feature exists for, arriving the one way a
+    /// pre-flight cannot stop: mid-run. It must reach the user as a sentence.
+    #[test]
+    fn recognises_wsls_own_noise_about_a_missing_engine() {
+        let log = lines(&[
+            "<3>WSL (13) ERROR: CreateProcessEntryCommon:505: execvpe entangled failed 2",
+            "<3>WSL (13) ERROR: CreateProcessEntryCommon:508: Create process not expected to \
+             return",
+        ]);
+        let hint = explain(&log).expect("hint");
+        assert!(hint.contains("no such program"), "{hint}");
+        assert!(!hint.contains("execvpe"), "{hint}");
     }
 
     #[test]

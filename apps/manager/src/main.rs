@@ -32,6 +32,7 @@ mod snapshots;
 mod theme;
 mod ui;
 mod update;
+mod wslengine;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -72,6 +73,13 @@ struct Cli {
 enum ScreenshotView {
     Main,
     Wizard,
+    /// The wizard on the backend step with WSL chosen and no Linux engine
+    /// installed: the state a fresh Windows install is in, and the one this
+    /// pre-flight exists for.
+    WizardWsl,
+    /// The same machine on the review step, where the refusal is shown and the
+    /// Create button is unavailable.
+    WizardWslReview,
     Settings,
     Disks,
     /// Saved sessions, and the two confirmations that throw one away — from

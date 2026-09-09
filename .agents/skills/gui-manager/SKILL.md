@@ -29,6 +29,8 @@ launcher.rs  finding the engine (path + origin + version), Runner, install/run
              argument vectors
 backend.rs   where a machine runs (native vs WSL), the capability matrix and
              Windows→WSL path translation — pure logic, tests on both hosts
+wslengine.rs the WSL backend's pre-flight: is there a Linux engine in the
+             distribution, and the verified download that installs one
 picker.rs    native file/folder dialogs, off-thread (rfd, XDG portal on Linux)
 hostcheck.rs `entangled doctor` on a worker thread, parsed into coloured rows
 process.rs   Supervisor: children, log tailing, stop/kill, state machine
@@ -217,6 +219,73 @@ On Windows the manager offers two hypervisors: **Windows (WHP)**, running
   `.short`, and the same check runs again at submit time in case the setting
   changed underneath the form.
 
+### The engine inside WSL (`wslengine.rs` + `control_api::wsl`)
+
+The WSL backend has a hole nothing else in the product has: **a Windows install
+ships no Linux binary**, so `wsl.exe -d Ubuntu -e entangled …` on a fresh
+machine runs a program that is not there, and WSL reports it as
+
+```text
+<3>WSL (13) ERROR: CreateProcessEntryCommon:505: execvpe entangled failed 2
+```
+
+after the user has filled in a whole wizard. Three rules close it, and all three
+must stay closed:
+
+1. **Ask before launching.** `control_api::wsl::probe_with` asks three questions
+   in order — does `wsl.exe` run, does the distribution exist, does the engine
+   inside it answer `--version` — and every "no" becomes an `EngineFault` with a
+   `what` and a `fix`. It lives in `control-api`, not here, because
+   `entangled doctor` prints the same verdict in its `engines` section and two
+   copies would drift. The runner is a parameter, so the whole flow (including
+   every classification) is unit-tested on both hosts with no `wsl.exe`.
+2. **Never let the raw noise out.** `control_api::wsl::translate` turns
+   `execvpe … failed 2` (and 13, and 8) into a sentence, and `diagnose::explain`
+   tries it first on every failed child's log — a distribution can always be
+   shut down between the check and the launch.
+3. **Offer the engine, do not ask for a path.** `wslengine::spawn_install`
+   downloads the pinned Linux build, verifies it, copies it into the
+   distribution and re-runs the check.
+
+`ManagerApp::wsl_engine` holds the answer, `ensure_wsl_check` starts a probe
+whenever the distribution or the engine path changes (never on the frame loop —
+a cold distribution takes seconds to boot), and `backend_block` is the single
+gate: `start()` refuses with it, the wizard's **Create & install** is
+`primary_button_enabled(…, blocked.is_none())` with the reason on hover.
+`preferred_backend()` is why a fresh wizard does not open on WSL when its engine
+is missing — the *setting* is left alone, because the engine may be installed a
+minute later, but the wizard starts where a machine can actually run.
+
+Two details that look like polish and are not:
+
+- **`wsl -e` runs no login shell.** `$PATH` is what WSL's init built, not what
+  `~/.profile` would have made, and `~/.local/bin` is usually only on the
+  second. So the install reports the **absolute** path it wrote and the manager
+  saves *that* as `wsl_entangled`; a check that only asked `command -v` under
+  `sh -lc` would pass and the launch would still fail. `PATH_PROBE` asks with
+  `sh -c` for exactly this reason, and the "engine is at ~/.local/bin but not on
+  the launch PATH" case has its own message.
+- **A loader complaint says "not found" and means the opposite.**
+  `libc.so.6: version 'GLIBC_2.38' not found` is a *present* engine on a
+  distribution older than the build; classifying it as missing would have the
+  manager offer to install the binary that just refused to load. Hence the
+  release build runs on `ubuntu-22.04`, for the oldest glibc it can reach.
+
+#### What the download trusts
+
+The asset is `entangled-linux-x86_64`, published by the release workflow's
+`linux-engine` job, which runs **before** the Windows job and hands it the
+SHA-256; `build.rs` compiles that digest into the manager as
+`ENTANGLED_LINUX_ENGINE_SHA256`. So a manager verifies its download against a
+digest fixed when it was built, describing the binary its own release published
+— nobody types it and nothing fetches it. It is *not* a signature (whoever can
+change the workflow can change what is hashed), which is the same honest ceiling
+`apps/entangled/src/bootstrap.rs` documents for the guest kernel. A build the
+pipeline did not make carries no digest, and then `install_block()` greys the
+button out and says so rather than downloading something it cannot check —
+which is what every developer build here does, so that is the state you will see
+locally.
+
 ## Theme tokens (GUI-1606)
 
 All in `theme.rs`; views never invent a colour.
@@ -312,9 +381,12 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
 - `--screenshot <png> [--screenshot-view <surface>]` renders a few frames, saves
   a PNG through `ViewportCommand::Screenshot` and exits — the quickest way to
   review a visual change without a human at the keyboard. Surfaces:
-  `main`, `wizard`, `settings`, `disks`, `snapshots`, `snapshot-delete`,
-  `snapshot-discard`, `diagnostics`, and one per editor section: `editor`
-  (Hardware), `editor-boot`, `editor-network`, `editor-storage`. **Every new
+  `main`, `wizard`, `wizard-wsl` (the backend step with WSL chosen and no
+  Linux engine), `wizard-wsl-review` (the same machine on the review step,
+  where Create is unavailable), `settings`, `disks`, `snapshots`,
+  `snapshot-delete`, `snapshot-discard`, `diagnostics`, and one per editor
+  section: `editor` (Hardware), `editor-boot`, `editor-network`,
+  `editor-storage`. **Every new
   surface gets one**, or it cannot be reviewed.
 - Alignment regressions do not survive a look at the pixels but do survive a
   glance at the window. When touching form layout, measure: crop the PNG and

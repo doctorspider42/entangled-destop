@@ -10,6 +10,7 @@ use crate::launcher::{self, VARIANTS};
 use crate::picker::PickTarget;
 use crate::theme;
 use crate::ui;
+use crate::wslengine;
 
 pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>) {
     if !app.modal.is_open() {
@@ -21,8 +22,11 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
         engine,
         scan,
         supervisor,
+        wsl_engine,
+        wsl_install_running,
         ..
     } = app;
+    let wsl_install_running = *wsl_install_running;
 
     let closed = match modal {
         Modal::None => false,
@@ -123,7 +127,10 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                             }
                         }
                         ui.add_space(16.0);
-                        backend_row(ui, &mut state.machine.backend);
+                        backend_row(ui, &mut state.machine.backend, wsl_engine);
+                        if state.machine.backend == Backend::Wsl {
+                            wsl_engine_note(ui, wsl_engine, wsl_install_running, actions);
+                        }
                     }
                     1 => {
                         wizard_heading(
@@ -381,7 +388,20 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                         },
                                     );
                                 }
-                                summary_row(ui, "Runs on", state.machine.backend.label());
+                                summary_row(
+                                    ui,
+                                    "Runs on",
+                                    &match (state.machine.backend, &*wsl_engine) {
+                                        (Backend::Wsl, wslengine::Status::Ready(found)) => {
+                                            format!(
+                                                "{} · {}",
+                                                state.machine.backend.label(),
+                                                found.summary()
+                                            )
+                                        }
+                                        _ => state.machine.backend.label().to_string(),
+                                    },
+                                );
                             });
                         let runner = launcher::Runner::new(
                             state.machine.backend,
@@ -400,6 +420,24 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                         if let Err(message) = &preview {
                             ui.add_space(10.0);
                             ui.label(RichText::new(message).color(theme::ERR).size(12.5));
+                        }
+                        // …and neither is a backend whose engine is not there.
+                        // The same refusal `ManagerApp::backend_block` gives the
+                        // Start button, shown before the last click rather than
+                        // after it, with the install offer attached.
+                        if state.machine.backend == Backend::Wsl {
+                            if let Some(refusal) = wsl_engine.refusal() {
+                                ui.add_space(10.0);
+                                ui.label(RichText::new(refusal).color(theme::ERR).size(12.5));
+                                ui.add_space(8.0);
+                                wsl_engine_buttons(
+                                    ui,
+                                    wsl_engine,
+                                    wsl_install_running,
+                                    0.0,
+                                    actions,
+                                );
+                            }
                         }
                         ui.add_space(10.0);
                         ui.collapsing("Advanced: command preview", |ui| {
@@ -434,8 +472,23 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                             state.step += 1;
                             state.error = None;
                         }
-                    } else if ui::primary_button(ui, "Create & install").clicked() {
-                        actions.push(Action::SubmitWizard);
+                    } else {
+                        // The last step's button is the one the whole
+                        // pre-flight protects: a machine that cannot start must
+                        // not be creatable, and the reason must be readable
+                        // without pressing it.
+                        let blocked = (state.machine.backend == Backend::Wsl)
+                            .then(|| wsl_engine.refusal())
+                            .flatten();
+                        let button =
+                            ui::primary_button_enabled(ui, "Create & install", blocked.is_none());
+                        match &blocked {
+                            Some(reason) => {
+                                button.on_hover_text(reason);
+                            }
+                            None if button.clicked() => actions.push(Action::SubmitWizard),
+                            None => {}
+                        }
                     }
                     if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
                         actions.push(Action::CloseModal);
@@ -509,7 +562,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             )
         }
         Modal::Settings(form) => frame(ctx, "settings", "Settings", 600.0, |ui| {
-            settings_body(ui, form, engine, actions)
+            settings_body(ui, form, engine, wsl_engine, wsl_install_running, actions)
         }),
         Modal::CreateDisk(state) => frame(ctx, "create-disk", "New disk", 470.0, |ui| {
             ui.label(ui::dim(
@@ -691,7 +744,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             "edit-vm",
             &format!("Edit {}", state.form.name),
             760.0,
-            |ui| edit_vm_body(ui, state, actions),
+            |ui| edit_vm_body(ui, state, wsl_engine, actions),
         ),
         Modal::MoveDisk(state) => frame(
             ctx,
@@ -743,6 +796,8 @@ fn settings_body(
     ui: &mut egui::Ui,
     form: &mut crate::app::SettingsForm,
     engine: &Result<crate::launcher::Engine, String>,
+    wsl_engine: &wslengine::Status,
+    wsl_install_running: bool,
     actions: &mut Vec<Action>,
 ) {
     ui::form_scope(ui);
@@ -762,9 +817,10 @@ fn settings_body(
     }
     ui.add_space(14.0);
 
-    backend_row(ui, &mut form.default_backend);
+    backend_row(ui, &mut form.default_backend, wsl_engine);
     if Backend::Wsl.available_on_host() && form.default_backend == Backend::Wsl {
         wsl_rows(ui, form);
+        wsl_engine_note(ui, wsl_engine, wsl_install_running, actions);
     }
     ui.add_space(14.0);
 
@@ -828,6 +884,7 @@ fn settings_body(
         if Backend::Wsl.available_on_host() && form.default_backend != Backend::Wsl {
             ui.add_space(8.0);
             wsl_rows(ui, form);
+            wsl_engine_note(ui, wsl_engine, wsl_install_running, actions);
         }
     });
 
@@ -891,7 +948,7 @@ fn engine_status(
 /// The where-does-this-run row, shared by Settings (the default) and the wizard
 /// and editor (one machine). On a host with only one backend it degrades to a
 /// read-only line rather than a combo box with one entry.
-fn backend_row(ui: &mut egui::Ui, value: &mut Backend) {
+fn backend_row(ui: &mut egui::Ui, value: &mut Backend, wsl_engine: &wslengine::Status) {
     let choices: Vec<Backend> = Backend::ALL
         .into_iter()
         .filter(|backend| backend.available_on_host())
@@ -914,16 +971,134 @@ fn backend_row(ui: &mut egui::Ui, value: &mut Backend) {
          and TAP networking today.",
         |ui, field_w| {
             egui::ComboBox::from_id_salt(("backend-choice", ui.id()))
-                .selected_text(value.label())
+                .selected_text(entry_label(*value, wsl_engine))
                 .width(ui::combo_width(field_w))
                 .show_ui(ui, |ui| {
                     for backend in &choices {
-                        ui.selectable_value(value, *backend, backend.label())
-                            .on_hover_text(backend.tooltip());
+                        ui.selectable_value(value, *backend, entry_label(*backend, wsl_engine))
+                            .on_hover_text(entry_tooltip(*backend, wsl_engine));
                     }
                 });
         },
     );
+}
+
+/// The name of one backend in the picker, with its problem attached.
+///
+/// A backend whose engine is missing stays **selectable** on purpose: the fix
+/// for "WSL has no engine" lives one row below, and a greyed-out entry is a
+/// door locked from the inside. What it must not do is look identical to the
+/// one that works, so the entry carries its own verdict and the tooltip carries
+/// the reason.
+fn entry_label(backend: Backend, wsl_engine: &wslengine::Status) -> String {
+    match (backend, wsl_engine) {
+        (Backend::Wsl, wslengine::Status::Failed(_)) => {
+            format!("{} — no Linux engine yet", backend.label())
+        }
+        (Backend::Wsl, wslengine::Status::Checking) => format!("{} — checking…", backend.label()),
+        _ => backend.label().to_string(),
+    }
+}
+
+fn entry_tooltip(backend: Backend, wsl_engine: &wslengine::Status) -> String {
+    match (backend, wsl_engine) {
+        (Backend::Wsl, wslengine::Status::Failed(fault)) => {
+            format!("{}\n\n{}\n\n{}", backend.tooltip(), fault.what, fault.fix)
+        }
+        (Backend::Wsl, wslengine::Status::Ready(found)) => {
+            format!("{}\n\nEngine: {}", backend.tooltip(), found.summary())
+        }
+        _ => backend.tooltip().to_string(),
+    }
+}
+
+/// The WSL engine's state under the row that selects it: one line of status
+/// and, when there is one, the button that fixes it.
+///
+/// This is the deliverable in one function. Before it, "your WSL has no
+/// `entangled`" was discovered by `wsl.exe` forty minutes into a wizard and
+/// reported as `execvpe entangled failed 2`.
+fn wsl_engine_note(
+    ui: &mut egui::Ui,
+    status: &wslengine::Status,
+    installing: bool,
+    actions: &mut Vec<Action>,
+) {
+    match status {
+        wslengine::Status::Unknown => {}
+        wslengine::Status::Checking => {
+            ui::form_note(
+                ui,
+                RichText::new("checking the WSL engine…")
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+            );
+        }
+        wslengine::Status::Ready(found) => {
+            ui::form_note(
+                ui,
+                RichText::new(format!("engine ready — {}", found.summary()))
+                    .color(theme::OK)
+                    .size(11.0),
+            );
+        }
+        wslengine::Status::Failed(fault) => {
+            ui::form_note(ui, RichText::new(&fault.what).color(theme::ERR).size(11.5));
+            ui::form_note(
+                ui,
+                RichText::new(&fault.fix).color(theme::TEXT_DIM).size(11.0),
+            );
+            ui.add_space(6.0);
+            wsl_engine_buttons(ui, status, installing, ui::FORM_LABEL_W, actions);
+        }
+    }
+}
+
+/// The two buttons that belong to a refused WSL engine: install it, or ask
+/// again. Split out because the review step shows them under a paragraph rather
+/// than under a form row, and repeating the sentence there read as two faults.
+fn wsl_engine_buttons(
+    ui: &mut egui::Ui,
+    status: &wslengine::Status,
+    installing: bool,
+    indent: f32,
+    actions: &mut Vec<Action>,
+) {
+    if status.refusal().is_none() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        if status.installable() {
+            let block = wslengine::install_block();
+            let label = if installing {
+                "Installing the Linux engine…"
+            } else {
+                "Install the Linux engine"
+            };
+            let enabled = !installing && block.is_none();
+            let button = ui::ghost_button(ui, label, enabled, theme::CYAN).on_hover_text(
+                block.unwrap_or_else(|| {
+                    format!(
+                        "Downloads the Linux build published with this exact version, \
+                                 checks it against the digest built into this program, copies \
+                                 it into the distribution as ~/{}, and re-runs this check.",
+                        control_api::wsl::HOME_ENGINE
+                    )
+                }),
+            );
+            if enabled && button.clicked() {
+                actions.push(Action::InstallWslEngine);
+            }
+        }
+        if ui::ghost_button(ui, "Check again", !installing, theme::TEXT_DIM)
+            .on_hover_text("Ask WSL the same three questions again")
+            .clicked()
+            && !installing
+        {
+            actions.push(Action::CheckWslEngine);
+        }
+    });
 }
 
 /// The two things the WSL backend cannot work out for itself.
@@ -963,7 +1138,12 @@ fn wsl_rows(ui: &mut egui::Ui, form: &mut crate::app::SettingsForm) {
 /// The Edit-VM form body. The left-hand cards are intentionally navigation,
 /// not separate save boundaries: changing one area keeps all unsaved edits and
 /// Save validates and writes the complete profile.
-fn edit_vm_body(ui: &mut egui::Ui, state: &mut crate::app::EditVmState, actions: &mut Vec<Action>) {
+fn edit_vm_body(
+    ui: &mut egui::Ui,
+    state: &mut crate::app::EditVmState,
+    wsl_engine: &wslengine::Status,
+    actions: &mut Vec<Action>,
+) {
     use crate::app::EditVmSection;
 
     let mut selected = state.section;
@@ -1029,7 +1209,7 @@ fn edit_vm_body(ui: &mut egui::Ui, state: &mut crate::app::EditVmState, actions:
                     ui.set_width(500.0);
                     ui.set_min_height(316.0);
                     match selected {
-                        EditVmSection::Hardware => edit_hardware(ui, &mut state.form),
+                        EditVmSection::Hardware => edit_hardware(ui, &mut state.form, wsl_engine),
                         EditVmSection::BootMedia => {
                             edit_boot_media(ui, &mut state.form, actions);
                         }
@@ -1152,7 +1332,11 @@ fn edit_panel_heading(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.add_space(18.0);
 }
 
-fn edit_hardware(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
+fn edit_hardware(
+    ui: &mut egui::Ui,
+    form: &mut crate::editor::EditForm,
+    wsl_engine: &wslengine::Status,
+) {
     use control_api::VirtioTransport;
 
     edit_panel_heading(
@@ -1186,7 +1370,7 @@ fn edit_hardware(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
         },
     );
     ui.add_space(16.0);
-    backend_row(ui, &mut form.backend);
+    backend_row(ui, &mut form.backend, wsl_engine);
     ui.add_space(12.0);
     ui::form_row(
         ui,

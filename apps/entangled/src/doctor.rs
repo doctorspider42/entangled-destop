@@ -37,6 +37,7 @@ pub fn run() -> Result<(), String> {
             println!("  memory slots    : {}", caps.nr_memslots);
             if caps.is_runnable() {
                 println!("  required caps   : all present");
+                engines();
                 install_readiness();
                 println!("host looks ready to run VMs");
                 Ok(())
@@ -103,9 +104,65 @@ pub fn run() -> Result<(), String> {
     println!("                    one are GPL). backend = \"tap\" is Linux-only.");
     println!("  VMs per process : 1 — WHP maps guest memory for one partition per process,");
     println!("                    so a second VM needs a second `entangled` process");
+    engines();
     install_readiness();
     println!("host looks ready to run VMs");
     Ok(())
+}
+
+/// Which engine each backend would use, and whether it runs.
+///
+/// A Windows host has two: `entangled.exe` on WHP (this program), and the Linux
+/// build inside WSL. The second one is the one that goes missing — the Windows
+/// installer ships no Linux binary — and until this section existed the only
+/// way to find that out was to start a machine and read
+/// `execvpe entangled failed 2`. So `doctor` asks the same three questions the
+/// manager's pre-flight asks, through the same code
+/// (`control_api::wsl::probe`), and prints the answer either way.
+///
+/// Which distribution: `ENTANGLED_WSL_DISTRO`, else the manager's default. The
+/// CLI does not read the manager's settings file — the two are independent
+/// programs — so the environment variable is the override.
+#[cfg(any(target_os = "linux", windows))]
+fn engines() {
+    let this = std::env::current_exe()
+        .map(|exe| exe.display().to_string())
+        .unwrap_or_else(|_| "entangled".to_string());
+    println!(
+        "  engines         : {:<8} {this} ({}) — this program",
+        if cfg!(windows) { "windows" } else { "linux" },
+        crate::VERSION
+    );
+    wsl_engine();
+}
+
+/// The WSL half of [`engines`]. Windows only: inside WSL this *is* the Linux
+/// engine, and probing `wsl.exe` back out through interop would report on the
+/// host that is already running the command.
+#[cfg(windows)]
+fn wsl_engine() {
+    let distro = std::env::var("ENTANGLED_WSL_DISTRO")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| control_api::wsl::DEFAULT_DISTRO.to_string());
+    let engine = std::env::var("ENTANGLED_WSL_ENGINE")
+        .ok()
+        .filter(|e| !e.trim().is_empty());
+    match control_api::wsl::probe(&distro, engine.as_deref()) {
+        Ok(found) => println!("                    wsl      {}", found.summary()),
+        Err(fault) => {
+            println!("                    wsl      MISSING — {}", fault.what);
+            println!("                             {}", fault.fix);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wsl_engine() {
+    println!(
+        "                    wsl      n/a — the WSL backend runs this same Linux engine, \
+         from a Windows host"
+    );
 }
 
 /// What `entangled install` needs on this host, and whether it is present.

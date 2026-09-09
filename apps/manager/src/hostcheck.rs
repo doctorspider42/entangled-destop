@@ -160,8 +160,9 @@ fn run_blocking(runner: &Runner, cwd: &std::path::Path) -> Report {
 }
 
 /// What a mock session shows instead of probing the host. Deliberately a mix:
-/// a healthy hypervisor with one missing artifact is the state the panel exists
-/// to make legible.
+/// a healthy hypervisor with two things missing — one artifact and one *engine*
+/// — is the state the panel exists to make legible, and the WSL engine line is
+/// the one this fixture exists to keep on screen.
 pub fn mock_report() -> Report {
     let output = "entangled doctor\n\
          \x20 hypervisor      : Windows Hypervisor Platform present\n\
@@ -170,6 +171,10 @@ pub fn mock_report() -> Report {
          \x20 uefi            : yes — CloudHv firmware via the PVH entry\n\
          \x20 networking      : backend = \"usernet\" — user-mode NAT in this process\n\
          \x20 VMs per process : 1\n\
+         \x20 engines         : windows  C:\\Program Files\\Entangled\\entangled.exe (0.2.0) — this program\n\
+         \x20                   wsl      MISSING — Ubuntu has no Entangled engine ('entangled' is not there)\n\
+         \x20                            The Windows installer ships no Linux build: let the manager\n\
+         \x20                            install one (Settings ▸ Linux engine).\n\
          \x20 install         : ubuntu — UEFI + verified ISO, offline (no mirror needed)\n\
          \x20                   debian — d-i on the bootstrap kernel, needs the network\n\
          \x20   firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB)\n\
@@ -213,6 +218,10 @@ mod tests {
     #[test]
     fn the_headline_counts_what_is_missing() {
         let mut report = mock_report();
+        // The fixture is missing two things: the bootstrap kernel and the Linux
+        // engine inside WSL.
+        assert_eq!(report.headline(), "Machines can run; 2 things are missing");
+        report.lines.retain(|line| !line.text.contains("wsl "));
         assert_eq!(report.headline(), "Machines can run; one thing is missing");
 
         report.lines.retain(|line| line.level != Level::Missing);
