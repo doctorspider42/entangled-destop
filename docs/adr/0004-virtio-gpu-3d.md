@@ -804,7 +804,7 @@ guest's physical address width.
 Decision: **our aperture is the firmware's.** `layout::pci_mmio64_base(mem)`
 returns the same number EDK2 computes — `TOP_OF_32BIT + (mem - MMIO_HOLE_START)`
 for a guest above the hole, `TOP_OF_32BIT` for one below it — and the aperture
-is 4 GiB long from there. The host's initial BAR assignment, the firmware's
+is 16 GiB long from there. The host's initial BAR assignment, the firmware's
 reassignment and the DSDT `_CRS` then all describe one range, and a BAR that
 moves during enumeration moves *inside* something the host already decodes.
 
@@ -814,11 +814,25 @@ rather than a stylistic one: EDK2 allocates from `Pci64Base` upwards, and
 of any fixed window we picked. Arithmetic, for the two sizes the tests cover:
 
 * 2048 MiB — no high RAM at all, top of address space 4 GiB, window at
-  `0x1_0000_0000`, aperture to `0x2_0000_0000`;
+  `0x1_0000_0000`, aperture to `0x5_0000_0000`;
 * 4096 MiB — high RAM `0x1_0000_0000..0x1_4000_0000`, window at
-  `0x1_4000_0000`, aperture to `0x2_4000_0000`;
+  `0x1_4000_0000`, aperture to `0x5_4000_0000`;
 * 65536 MiB (the config maximum) — window at `0x10_4000_0000`, aperture ending
-  at `0x11_4000_0000`, comfortably inside 2^46.
+  at `0x14_4000_0000`, comfortably inside 2^46.
+
+The length is 16 GiB rather than a smaller round number because it is *derived*
+from what it has to hold: `PCI_MMIO_SLOTS` functions × `MAX_SHM_BAR_BYTES`,
+plus one more window's worth of gap that natural alignment can push the first
+allocation by — nine gigabytes, rounded up to the next power of two and held
+there by a `const` assertion. It landed at 4 GiB first, under a comment making
+exactly that claim, which eight 1 GiB windows do not fit into. One device
+declares a region today, so nothing hit it.
+
+Ours is also **not** as long as the firmware's, and that asymmetry is worth
+naming: EDK2 publishes `Pci64Size=0x3FFEC0000000` and `PciBusDxe` allocates out
+of *that*, not out of the DSDT `_CRS`. If it ever placed a window past
+`pci_mmio64_end`, `ShmWindow::follow` would refuse it and the guest would get no
+`resource2` — quietly. The sizing rule above is what keeps that hypothetical.
 
 BARs are allocated out of the aperture by a bump allocator rather than from a
 slot table (`layout::Mmio64Allocator`), because a memory BAR must be aligned to
@@ -887,9 +901,22 @@ every collision that matters at once.
 "Decodes nothing" always means *unmap*, never "leave it and lose something".
 That is the difference from `crate::notify`'s ioeventfd sweep, which this one
 otherwise copies: a stale ioeventfd costs a kick, a stale memory mapping is host
-pages sitting at an address the guest has since given to something else. The
-sweep therefore runs on **both** hosts, unlike the ioeventfd one, and a machine
-reset takes every window down (ADR-0005).
+pages sitting where the guest has put something else. The sweep therefore runs
+on **both** hosts, unlike the ioeventfd one, and a machine reset takes every
+window down (ADR-0005).
+
+What it copies exactly, and had to be corrected to copy, is the **two passes**:
+release every window whose BAR moved, then claim them all. `PciBusDxe` hands out
+addresses in reverse device order, so a permutation of two functions' windows
+asks the host to map A where B still is — and both hypervisors refuse an
+overlapping range, KVM as an overlapping memory slot and WHP as a failed
+`WHvMapGpaRange`. A one-pass sweep leaves A unmapped with nothing to schedule
+the retry: a stale ioeventfd is picked up by the next sweep, but an unmapped
+window is not, and the guest's `mmap` of the region reads nothing, silently.
+`shm_bus::two_windows_that_swap_addresses_both_end_up_mapped` is the regression
+test, with a `GpaMapper` that refuses overlaps the way a real one does; it fails
+against the one-pass version. Latent today — one device declares a region — and
+cheap to get right before a second does.
 
 ### What the device does with it
 
@@ -906,6 +933,14 @@ Two rules follow, and both are fuzzed:
   The pages were last some other blob's, and a guest must not find them;
 * **and only that span.** Clearing past either end would wipe a neighbouring
   mapping's bytes under a guest that is using them.
+
+The `gpu_blob` target grew a real `ShmBacking` for this: it scribbles a canary
+over the whole window before every operation and reads every live mapping back,
+so the property is checked against *memory* rather than against the bookkeeping
+that is supposed to maintain it, and it aims arbitrary `(offset, len)` pairs —
+wrapping ones included — straight at the backing. Campaign: **1 085 637
+executions in 603 s** (1800 exec/s, 927 edges, 645-case corpus), no crashes and
+no invariant violation.
 
 The loopback Venus renderer writes a 32-byte signature at the mapping offset —
 magic, resource id, size, `blob_id`. A real Venus renderer will map its own
@@ -995,6 +1030,18 @@ a guest. Nothing on either host decodes a Vulkan command stream.
 5. The GUI's capability gate (`Backend::virgl_block`) still knows nothing about
    any of this, and still should not until step 1 lands — blob resources are
    offered only when a renderer declares them, and none does on this host.
+6. **One restore direction is still unguarded**, and closing it needs a format
+   field rather than a check. `TransportSaveState::shm_bases` records the bases
+   a window *was placed at*, so the dangerous direction is refused: a snapshot
+   that names one, restored onto a machine that would place it elsewhere or
+   nowhere, is `StateError::ShmBase`. The reverse — a snapshot taken with the
+   window unmapped, or on a build with no shm support at all, restored onto a
+   machine that has one — is accepted, because an empty `shm_bases` is
+   indistinguishable from "the guest had it unmapped", which is legitimate and
+   must stay accepted. Telling the two apart means recording the region ids the
+   transport *declares* alongside the bases it placed, which is a snapshot
+   format change and belongs with the next one, not bolted onto a landing pass.
+   Nothing a guest can do reaches it: it needs two different host builds.
 
 ## Amendment (2026-09-08): GAME-2105 — why a guest sits at 30 fps, and what it cost
 

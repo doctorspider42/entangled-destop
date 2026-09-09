@@ -206,8 +206,8 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_core::pci::VIRTIO_PCI_BAR_SIZE` | 32 KiB | guest-addressable register space per pci device; every capability's `offset + length` must fit | `virtio_core::pci::tests::capability_records_describe_the_real_bar_layout`, `regions_do_not_overlap_and_the_common_struct_fits` |
 | `virtio_core::ShmRegion::len` | non-zero | a declared shared-memory region must have a length; zero is refused at construction because "present with length 0" is the state the all-ones convention exists to avoid | `virtio_core::transport::tests::a_zero_length_shm_region_is_refused` |
 | `vmm_core::shm::MAX_SHM_WINDOW_BYTES` | 4 GiB | host memory one shared-memory window may commit; a host-configuration bound, not a guest one | `vmm_core::shm::tests::a_window_must_be_whole_pages_and_bounded` |
-| `machine_x86::layout::MAX_SHM_BAR_BYTES` | 1 GiB | one device's shared-memory BAR, which also bounds how far alignment can push the first allocation into the aperture | `machine_x86::shm::tests::a_plan_refuses_what_no_bar_could_carry` |
-| `machine_x86::layout::PCI_MMIO64_SIZE` | 4 GiB | the 64-bit aperture, starting at the top of RAM; a BAR outside it is **never mapped**, which is what stops a guest parking host pages over its own RAM | `machine_x86::shm::tests::a_bar_outside_the_aperture_is_never_mapped`, `shm_bus::a_window_the_guest_moves_out_of_the_aperture_is_unmapped` |
+| `machine_x86::layout::MAX_SHM_BAR_BYTES` | 1 GiB | one device's shared-memory BAR, which also bounds how far alignment can push the first allocation into the aperture. Checked on the running **sum** inside `shm::plan`'s loop, *before* `next_power_of_two` sees it — that method panics in debug and wraps to zero in release above 2^63, and a region length is not always this crate's value (an isolated renderer decodes it off the helper's pipe) | `machine_x86::shm::tests::a_plan_refuses_what_no_bar_could_carry` |
+| `machine_x86::layout::PCI_MMIO64_SIZE` | 16 GiB | the 64-bit aperture, starting at the top of RAM; a BAR outside it is **never mapped**, which is what stops a guest parking host pages over its own RAM. Derived, not picked: a `const` assertion holds it at ≥ `(PCI_MMIO_SLOTS + 1) × MAX_SHM_BAR_BYTES`, since a naturally aligned allocator needs one max window per slot plus one alignment gap. It is *narrower* than EDK2's own `Pci64Size` (2^46), so a firmware that ever placed a window past `pci_mmio64_end` would get a silent refusal | `machine_x86::shm::tests::a_bar_outside_the_aperture_is_never_mapped`, `shm_bus::a_window_the_guest_moves_out_of_the_aperture_is_unmapped` |
 | `virtio_core::ShmBacking` accesses | the **region's** length, not the BAR's | every host-side read/write/fill is bounded in u64 against the span the device declared, so one region cannot be reached through another's offsets | `machine_x86::shm::tests::a_region_backing_cannot_reach_another_region`, fuzz target `gpu_blob` |
 | `virtio_core::msix::MAX_MSIX_VECTORS` | 256 | *derived* (table region ÷ 16 B); vectors one function may publish, so `queues + 1` must fit or the transport refuses the device | `virtio_core::msix::tests::table_size_for_*`, `virtio_core::pci::tests::a_device_with_more_queues_than_msix_vectors_is_refused` |
 | `machine_x86::pci::MAX_PCI_DEVICES` | 9 | config spaces, BAR windows and IOAPIC pins on the root bus (8 devices + the host bridge) | `machine_x86::pci::tests::the_bus_is_bounded` |
@@ -334,6 +334,15 @@ before touching any of it:
   runs on **both** hosts, unlike `crate::notify`'s ioeventfd rebase, because a
   stale mapping is host memory at an address the guest has reused — not a lost
   kick. A machine reset unmaps too.
+- **Sweep in two passes: release every window, then claim.**
+  `ShmWindow::release_for` then `ShmWindow::claim`, never `follow` in a loop.
+  `PciBusDxe` permutes BAR addresses, so one function's new address is another's
+  old one, and both hypervisors refuse an overlapping range (KVM an overlapping
+  memory slot, WHP a failed `WHvMapGpaRange`). One pass leaves the loser
+  **unmapped with nothing to retry it** — worse than the ioeventfd case, where
+  the next sweep picks it up. Regression:
+  `shm_bus::two_windows_that_swap_addresses_both_end_up_mapped`, which uses a
+  `GpaMapper` that refuses overlaps the way a real one does.
 - **A span handed to a guest is zeroed, and only that span.**
   `BlobTable::reserve_mapping` clears before it returns, so it is a property of
   the table rather than of one caller; clearing past either end would wipe a

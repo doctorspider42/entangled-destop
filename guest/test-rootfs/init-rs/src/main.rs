@@ -817,11 +817,19 @@ fn shm_probe(expect: &str) {
         // One page is all the probe needs to see, and mapping 256 MiB of it
         // would be a pointless demand on a 256 MiB guest.
         let map_len = 2 * 4096usize;
+        // Checked *before* the mmap, not after: the safety argument below
+        // rests on the BAR being at least `map_len` bytes long, and a check
+        // that runs afterwards cannot justify a call that already happened.
+        // (It also leaked the mapping on the one path that took it.)
+        if (size as usize) < map_len {
+            fail(format!("bar-too-small size={size} want={map_len}"));
+            return;
+        }
         // SAFETY: `file` is an open sysfs PCI resource file whose BAR is at
-        // least `map_len` bytes long (checked above via `size`), the length is
-        // page aligned and non-zero, and the returned pointer is only used
-        // through `map_len` bounded reads and writes below before being
-        // unmapped. A null return is checked.
+        // least `map_len` bytes long (checked immediately above via `size`),
+        // the length is page aligned and non-zero, and the returned pointer is
+        // only used through `map_len` bounded reads and writes below before
+        // being unmapped. A `MAP_FAILED` return is checked.
         let addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -832,7 +840,7 @@ fn shm_probe(expect: &str) {
                 0,
             )
         };
-        if addr == libc::MAP_FAILED || (size as usize) < map_len {
+        if addr == libc::MAP_FAILED {
             fail(format!(
                 "mmap-failed:{} size={size}",
                 std::io::Error::last_os_error()

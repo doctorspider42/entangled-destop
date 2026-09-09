@@ -1085,8 +1085,16 @@ impl VirtioPciBus {
     ///
     /// The same sweep-all-slots shape as [`Self::reconcile_notify`], and for
     /// the same reason — a firmware reassigns the whole bus, so one function's
-    /// new address is another's old one — but with two differences worth
-    /// naming:
+    /// new address is another's old one — **including** the release-then-claim
+    /// split: pass one gives up every mapping whose BAR has moved, pass two
+    /// puts them back. One pass would not be enough for the same reason it is
+    /// not enough there, only worse. Two functions swapping windows means
+    /// asking the hypervisor to map A where B still is, and both hosts refuse
+    /// an overlapping range; a stale ioeventfd costs a kick until the next
+    /// sweep, but a window left unmapped has nothing to schedule the retry, so
+    /// the guest's `mmap` of the region reads nothing for good.
+    ///
+    /// Two further differences from the ioeventfd sweep:
     ///
     /// * it runs on every host, because the mapping is a hypervisor object on
     ///   both;
@@ -1096,9 +1104,13 @@ impl VirtioPciBus {
     ///   refuses to follow, is the one outcome that turns a device bug into a
     ///   memory-safety one for the guest.
     fn reconcile_shm(&self) {
+        let mut targets = [None; crate::pci::MAX_PCI_DEVICES];
         for (index, slot) in self.slots.iter().enumerate() {
             let Some(shm) = &slot.shm else {
                 continue;
+            };
+            let Some(target) = targets.get_mut(index) else {
+                break;
             };
             let window = match self.root.lock() {
                 Ok(root) => root.bar_window_of(index, vpci::VIRTIO_PCI_SHM_BAR_INDEX),
@@ -1109,7 +1121,15 @@ impl VirtioPciBus {
                     return;
                 }
             };
-            shm.follow(window.map(|(base, _)| base));
+            *target = shm.release_for(window.map(|(base, _)| base));
+        }
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(shm) = &slot.shm else {
+                continue;
+            };
+            if let Some(Some(base)) = targets.get(index).copied() {
+                shm.claim(base);
+            }
             // Tell the transport where each region ended up, so a snapshot
             // records it (ADR-0006). On this transport the *driver* never reads
             // that number — it derives the address from the BAR — so this is

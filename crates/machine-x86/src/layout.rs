@@ -353,22 +353,43 @@ pub const PCI_MMIO_HOLE_SIZE: u64 = VIRTIO_MMIO_BASE - PCI_MMIO_HOLE_BASE;
 // was rejected precisely because the firmware would move the BAR out of it:
 // EDK2 allocates from `Pci64Base` upwards, and `Pci64Base` follows RAM.
 //
-// The aperture is deliberately larger than what it holds (4 GiB for one
+// The aperture is deliberately larger than what it holds (16 GiB for one
 // 256 MiB window today), for the same reason the 32-bit one is: it has to
 // cover everywhere a firmware may legitimately re-align a BAR to.
-
-/// Size of the 64-bit MMIO aperture: 4 GiB starting at [`pci_mmio64_base`].
-///
-/// Room for every [`PCI_MMIO_SLOTS`] function to hold a
-/// [`MAX_SHM_BAR_BYTES`]-sized window and still leave slack for a firmware's
-/// natural alignment. Nothing but shared-memory regions is allocated from it.
-pub const PCI_MMIO64_SIZE: u64 = 4 << 30;
+//
+// It is *not* as large as the firmware's own — EDK2 publishes
+// `Pci64Size=0x3FFEC0000000`, everything up to 2^46, and `PciBusDxe` allocates
+// out of that rather than out of the DSDT `_CRS` this machine writes. So the
+// two are not the same range, and the one that decides whether a window is
+// mapped is ours: a BAR the firmware placed past [`pci_mmio64_end`] is refused
+// by `crate::shm::ShmWindow::follow` and the guest gets no `resource2`. Hence
+// the sizing rule below, which is arithmetic rather than a round number.
 
 /// Largest single shared-memory BAR this machine will place: 1 GiB.
 ///
 /// A BAR is naturally aligned to its own size, so this also bounds how far
 /// into the aperture the first allocation can be pushed by alignment.
 pub const MAX_SHM_BAR_BYTES: u64 = 1 << 30;
+
+/// Size of the 64-bit MMIO aperture starting at [`pci_mmio64_base`]: 16 GiB.
+///
+/// A power of two, so the `_CRS` window is one clean descriptor, but checked
+/// against the budget it claims to cover rather than picked to look tidy: the
+/// worst case a *naturally aligned* bump allocator can reach is one
+/// [`MAX_SHM_BAR_BYTES`] window per [`PCI_MMIO_SLOTS`] function, plus one more
+/// window's worth of alignment gap ahead of the first. Nothing but
+/// shared-memory regions is allocated from it.
+///
+/// A 4 GiB constant sat here first, under a comment making exactly this claim,
+/// and was wrong on its own terms — eight 1 GiB windows do not fit in 4 GiB.
+/// Nothing hit it, because one device declares a region today, which is
+/// precisely the kind of bug that waits for the day a second one does.
+pub const PCI_MMIO64_SIZE: u64 = 16 << 30;
+
+const _: () = assert!(
+    PCI_MMIO64_SIZE >= (PCI_MMIO_SLOTS + 1) * MAX_SHM_BAR_BYTES,
+    "the 64-bit aperture must hold one maximum-sized window per PCI slot, plus      the alignment gap the first one can be pushed by"
+);
 
 /// One past the last byte of guest RAM, for a guest of `mem_bytes`.
 ///
@@ -637,7 +658,16 @@ mod tests {
             alloc.allocate(MAX_SHM_BAR_BYTES * 2).is_none(),
             "past the cap"
         );
-        for _ in 0..4 {
+        // Derived from the aperture rather than written out, so this test says
+        // "it holds exactly what it claims to" and not "it holds four", and
+        // stays true when either constant moves.
+        let capacity = PCI_MMIO64_SIZE / MAX_SHM_BAR_BYTES;
+        assert!(
+            capacity >= PCI_MMIO_SLOTS + 1,
+            "the aperture must hold one maximum window per slot plus an \
+             alignment gap; it holds {capacity}"
+        );
+        for _ in 0..capacity {
             alloc.allocate(MAX_SHM_BAR_BYTES).expect("fits");
         }
         assert!(alloc.allocate(MAX_SHM_BAR_BYTES).is_none(), "aperture full");

@@ -80,10 +80,24 @@ pub fn plan(regions: &[ShmRegion]) -> Result<(u64, Vec<ShmPlacement>), ShmLayout
                 total: u64::MAX,
                 max: layout::MAX_SHM_BAR_BYTES,
             })?;
+        // Bounded here, before the sum reaches `next_power_of_two` below, and
+        // not only after it: that method **panics in debug and wraps to zero in
+        // release** above 2^63. A region length is not a guest value, but it is
+        // not this crate's value either — for an isolated renderer (GPU-012) it
+        // is decoded off the helper's pipe, and the helper is the one component
+        // this design assumes can misbehave. A refusal is the contract; a panic
+        // is not.
+        if total > layout::MAX_SHM_BAR_BYTES {
+            return Err(ShmLayoutError::TooLarge {
+                total,
+                max: layout::MAX_SHM_BAR_BYTES,
+            });
+        }
     }
     // A BAR's size is a power of two — the sizing protocol cannot express
     // anything else — and at least a page, because that is the granularity the
-    // guest maps it at.
+    // guest maps it at. `total` is at most `MAX_SHM_BAR_BYTES` by the loop
+    // above, so the rounding cannot overflow.
     let bar_size = total.max(page).next_power_of_two();
     if bar_size > layout::MAX_SHM_BAR_BYTES {
         return Err(ShmLayoutError::TooLarge {
@@ -313,10 +327,36 @@ impl ShmWindow {
     /// visible at an address the guest has since given to something else.
     ///
     /// Returns `true` when the window is mapped afterwards.
+    ///
+    /// One-shot: the release and the claim happen back to back, which is all a
+    /// bus with a single window needs. A sweep over **several** windows must
+    /// use [`Self::release_for`] and [`Self::claim`] instead — see the note
+    /// there.
     pub fn follow(&self, bar_base: Option<u64>) -> bool {
+        match self.release_for(bar_base) {
+            Some(base) => self.claim(base),
+            None => false,
+        }
+    }
+
+    /// The release half of [`Self::follow`]: gives up the mapping unless it is
+    /// already the right one, and returns the address still to be claimed.
+    ///
+    /// Split out because a sweep over several windows has to release **all** of
+    /// them before it claims **any** — exactly as `crate::notify`'s ioeventfd
+    /// sweep does, and for a sharper reason. A firmware that permutes two
+    /// functions' BARs asks this machine to map A where B still is; KVM refuses
+    /// an overlapping memory slot and WHP fails the `WHvMapGpaRange`, so a
+    /// one-pass sweep would leave A **unmapped** with nothing scheduled to
+    /// retry it, and the guest's `mmap` of the region would read nothing.
+    ///
+    /// `None` means there is nothing to claim — either the BAR decodes nothing,
+    /// or it decodes somewhere this machine will not follow it — and in both
+    /// cases the window is unmapped by the time this returns.
+    pub fn release_for(&self, bar_base: Option<u64>) -> Option<u64> {
         let Some(base) = bar_base else {
             self.unplace("the BAR decodes nothing");
-            return false;
+            return None;
         };
         if !self.is_placeable(base) {
             tracing::warn!(
@@ -332,8 +372,20 @@ impl ShmWindow {
                  follow it"
             );
             self.unplace("the guest moved the BAR out of the aperture");
-            return false;
+            return None;
         }
+        if self.window.placed_at() != Some(base) {
+            self.unplace("the guest moved the BAR");
+        }
+        Some(base)
+    }
+
+    /// The claim half of [`Self::follow`]: maps the window at `base`, which
+    /// [`Self::release_for`] has already vetted against the aperture.
+    /// Idempotent for an address the window already has.
+    ///
+    /// Returns `true` when the window is mapped afterwards.
+    pub fn claim(&self, base: u64) -> bool {
         if self.window.placed_at() == Some(base) {
             return true;
         }
@@ -514,6 +566,37 @@ mod tests {
                     len: layout::MAX_SHM_BAR_BYTES
                 },
                 ShmRegion { id: 2, len: 4096 },
+            ]),
+            Err(ShmLayoutError::TooLarge { .. })
+        ));
+        // A length above 2^63 must come back as a refusal. `next_power_of_two`
+        // panics on one in a debug build and wraps to zero in a release build,
+        // so an unbounded sum reaching it is a crash in tests and a nonsense
+        // BAR size in production. The value is page aligned so it gets past the
+        // earlier arms and reaches the rounding.
+        assert!(matches!(
+            plan(&[ShmRegion {
+                id: 1,
+                len: (1u64 << 63) + 4096
+            }]),
+            Err(ShmLayoutError::TooLarge { .. })
+        ));
+        // And the same total split across regions, so the bound is on the sum
+        // and not only on one entry.
+        assert!(matches!(
+            plan(&[
+                ShmRegion {
+                    id: 1,
+                    len: 1 << 62
+                },
+                ShmRegion {
+                    id: 2,
+                    len: 1 << 62
+                },
+                ShmRegion {
+                    id: 3,
+                    len: 1 << 62
+                },
             ]),
             Err(ShmLayoutError::TooLarge { .. })
         ));

@@ -482,3 +482,117 @@ fn an_unmapped_window_records_no_placement() {
         "a window that is not mapped must not be recorded as if it were"
     );
 }
+
+// ---- two windows, and a firmware that swaps them ---------------------------
+
+/// A [`vmm_core::shm::GpaMapper`] that models the one thing
+/// [`UnmappedGpaMapper`] cannot: **both hypervisors refuse an overlapping
+/// range.** KVM rejects a memory slot that overlaps a live one and WHP fails
+/// the `WHvMapGpaRange`, so a sweep that asks for A's new address while B is
+/// still sitting on it gets an error, not a second mapping.
+///
+/// Shared by every window on the bus, exactly as one hypervisor is.
+#[derive(Default)]
+struct ExclusiveMapper {
+    live: std::sync::Mutex<Vec<(u64, u64)>>,
+}
+
+impl vmm_core::shm::GpaMapper for ExclusiveMapper {
+    fn map(
+        &self,
+        gpa: u64,
+        region: &vmm_core::shm::HostShmRegion,
+    ) -> Result<(), vmm_core::hv::HvError> {
+        let len = region.len();
+        let mut live = self.live.lock().expect("mapper lock");
+        if live.iter().any(|&(at, l)| gpa < at + l && at < gpa + len) {
+            return Err(vmm_core::hv::HvError::Registers(format!(
+                "a live mapping already overlaps {gpa:#x}+{len}"
+            )));
+        }
+        live.push((gpa, len));
+        Ok(())
+    }
+
+    fn unmap(&self, gpa: u64, len: u64) -> Result<(), vmm_core::hv::HvError> {
+        self.live
+            .lock()
+            .expect("mapper lock")
+            .retain(|&(at, l)| (at, l) != (gpa, len));
+        Ok(())
+    }
+
+    fn backend(&self) -> &'static str {
+        "exclusive"
+    }
+}
+
+/// Two windowed functions on one bus, sharing one overlap-refusing mapper.
+fn bus_with_two_windows() -> VirtioPciBus {
+    let chip = chip();
+    let mapper: Arc<dyn vmm_core::shm::GpaMapper> = Arc::new(ExclusiveMapper::default());
+    let allocate = |len: u64| SharedWindow::new(len, Arc::clone(&mapper)).map(Arc::new);
+    let devices: Vec<Box<dyn virtio_core::VirtioDevice>> = vec![
+        Box::new(WindowedDevice::new(vec![virtio_core::ShmRegion {
+            id: 1,
+            len: WINDOW,
+        }])),
+        Box::new(WindowedDevice::new(vec![virtio_core::ShmRegion {
+            id: 1,
+            len: WINDOW,
+        }])),
+    ];
+    VirtioPciBus::attach_userspace_with_shm(
+        memory(),
+        devices,
+        chip.as_ref(),
+        PciInterruptMode::IntxOnly,
+        Some(ShmSupport {
+            mem_bytes: GUEST_BYTES,
+            allocate: &allocate,
+        }),
+    )
+    .expect("bus")
+}
+
+/// The reason `reconcile_shm` releases every window before it claims any.
+///
+/// `PciBusDxe` hands out addresses in reverse device order, so a permutation —
+/// here the simplest one, a swap — is not a hypothetical. Programmed one BAR
+/// write at a time, the way a firmware does it, the first write asks the host
+/// to map A where B still is; the hypervisor refuses, and A is left unmapped
+/// with nothing but the *next* write to rescue it. That next write does rescue
+/// it only if the sweep releases B before it retries A.
+///
+/// A one-pass sweep leaves A unmapped for good here, and the guest's `mmap` of
+/// its region reads nothing — with no error anywhere, which is what makes this
+/// worth a test rather than a comment.
+#[test]
+fn two_windows_that_swap_addresses_both_end_up_mapped() {
+    let bus = bus_with_two_windows();
+    let base = machine_x86::layout::pci_mmio64_base(GUEST_BYTES);
+    let (x, y) = (base, base + WINDOW);
+
+    place_bar(&bus, 1, x);
+    place_bar(&bus, 2, y);
+    assert_eq!(bus.shm_window(0).expect("window a").placed_at(), Some(x));
+    assert_eq!(bus.shm_window(1).expect("window b").placed_at(), Some(y));
+
+    // The swap, one function at a time. After the first write the two BARs
+    // genuinely name the same address, so A cannot be mapped yet — no sweep
+    // could fix that, and pretending otherwise would be the bug.
+    place_bar(&bus, 1, y);
+    assert_eq!(
+        bus.shm_window(0).expect("window a").placed_at(),
+        None,
+        "A must not be mapped on top of B"
+    );
+
+    place_bar(&bus, 2, x);
+    assert_eq!(
+        bus.shm_window(0).expect("window a").placed_at(),
+        Some(y),
+        "the sweep released B before retrying A, so A must have landed"
+    );
+    assert_eq!(bus.shm_window(1).expect("window b").placed_at(), Some(x));
+}
