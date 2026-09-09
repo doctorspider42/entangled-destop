@@ -438,10 +438,15 @@ pub fn resume_spec(
 }
 
 /// The bootstrap kernel a direct-Linux VM boots from, relative to the child's
-/// working directory. `entangled install debian` refuses to start without it and
-/// the profiles it writes reference it by this relative path, so the UI checks
-/// for it up front.
+/// working directory. A checkout that ran `guest/bootstrap-kernel/build.sh` has
+/// it there, and the profiles `install debian` writes on such a host reference
+/// it by exactly this relative path — which is why it is also the placeholder
+/// in the machine editor's KERNEL field.
 pub const BOOTSTRAP_KERNEL: &str = "artifacts/bootstrap/vmlinuz";
+
+/// Its initramfs. Half a pair is not a pair: a kernel with no initramfs boots to
+/// a panic, which is a worse failure than "not found".
+pub const BOOTSTRAP_INITRD: &str = "artifacts/bootstrap/initrd.img";
 
 /// The UEFI firmware an Ubuntu install boots through, same story: relative to the
 /// child's working directory, named in the profile that comes out.
@@ -466,19 +471,74 @@ pub const FIRMWARE_FIX: &str = if cfg!(windows) {
 /// blocking it on a missing one (which is what the wizard used to do) makes the
 /// only installer that works on Windows unreachable there.
 pub fn missing_install_artifact(cwd: &Path, family: GuestFamily) -> Option<String> {
-    let (artifact, hint) = match family {
-        GuestFamily::Ubuntu => (UEFI_FIRMWARE, FIRMWARE_FIX),
-        GuestFamily::Debian => (
-            BOOTSTRAP_KERNEL,
-            "The Debian installer boots Entangled's own kernel from there. Build it with \
-             guest/bootstrap-kernel/build.sh on Linux, or point Settings ▸ Advanced ▸ \
-             working directory at a tree that has it.",
-        ),
-    };
-    if cwd.join(artifact).is_file() {
-        return None;
+    match family {
+        GuestFamily::Ubuntu => {
+            if cwd.join(UEFI_FIRMWARE).is_file() {
+                return None;
+            }
+            Some(format!(
+                "no {UEFI_FIRMWARE} under {} — {FIRMWARE_FIX}",
+                cwd.display()
+            ))
+        }
+        GuestFamily::Debian => {
+            if bootstrap_artifacts_present(cwd) {
+                return None;
+            }
+            Some(format!(
+                "no bootstrap kernel for the Debian installer — not at {} and none in the \
+                 verified cache. Run `entangled fetch bootstrap-kernel` (about 13 MiB, checked \
+                 against a SHA-256 pinned in this build){}",
+                cwd.join(BOOTSTRAP_KERNEL).display(),
+                if cfg!(windows) {
+                    ", or copy an artifacts/bootstrap/ directory in from a Linux checkout and \
+                     point Settings ▸ Advanced ▸ working directory at it."
+                } else {
+                    ", or build it with `bash guest/bootstrap-kernel/build.sh`."
+                }
+            ))
+        }
     }
-    Some(format!("no {artifact} under {} — {hint}", cwd.display()))
+}
+
+/// Whether a bootstrap kernel + initramfs pair is reachable from a child started
+/// in `cwd`.
+///
+/// This mirrors `entangled`'s own resolver (`apps/entangled/src/bootstrap.rs`,
+/// which is the authority): an explicit directory, then the child's working
+/// directory, then the verified cache. It is deliberately a *little* more
+/// generous about the cache — the CLI knows which release tag this build pins
+/// and the manager does not, so any tag directory holding both files counts
+/// here. Being generous is the right way round: the worst case is a pre-flight
+/// that lets an install start and a CLI that then says precisely which artifact
+/// it wanted, which is a better message than the one this check could write.
+fn bootstrap_artifacts_present(cwd: &Path) -> bool {
+    let pair = |dir: &Path| dir.join("vmlinuz").is_file() && dir.join("initrd.img").is_file();
+    if let Some(dir) = std::env::var_os("ENTANGLED_BOOTSTRAP_DIR") {
+        if pair(Path::new(&dir)) {
+            return true;
+        }
+    }
+    if cwd.join(BOOTSTRAP_KERNEL).is_file() && cwd.join(BOOTSTRAP_INITRD).is_file() {
+        return true;
+    }
+    let Some(cache) = cache_root() else {
+        return false;
+    };
+    std::fs::read_dir(cache.join("bootstrap"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| pair(&entry.path()))
+}
+
+/// The one cache resolution the whole project shares, honouring the same
+/// `ENTANGLED_CACHE` override the CLI and the fetch scripts do.
+fn cache_root() -> Option<PathBuf> {
+    match std::env::var("ENTANGLED_CACHE") {
+        Ok(dir) if !dir.trim().is_empty() => Some(PathBuf::from(dir)),
+        _ => debian_media::cache_root(),
+    }
 }
 
 #[cfg(test)]
@@ -580,26 +640,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("artifacts/firmware")).unwrap();
         std::fs::write(dir.join(UEFI_FIRMWARE), b"fake firmware").unwrap();
+        // An empty cache of our own: the real one on a developer's machine may
+        // well hold a fetched kernel, and this test is about the *checkout*.
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let _cache_env = EnvGuard::set("ENTANGLED_CACHE", cache.as_os_str());
+        let _dir_env = EnvGuard::clear("ENTANGLED_BOOTSTRAP_DIR");
 
-        // Firmware present, kernel absent: Ubuntu can go, Debian cannot.
+        // Firmware present, kernel absent: Ubuntu can go, Debian cannot — and
+        // the refusal is a command, not a dead end. That sentence is the whole
+        // difference this feature makes on Windows.
         assert_eq!(missing_install_artifact(&dir, GuestFamily::Ubuntu), None);
         let debian =
             missing_install_artifact(&dir, GuestFamily::Debian).expect("no bootstrap kernel");
         assert!(debian.contains(BOOTSTRAP_KERNEL), "{debian}");
+        assert!(
+            debian.contains("entangled fetch bootstrap-kernel"),
+            "the Debian pre-flight must name the way out: {debian}"
+        );
 
-        // And the other way round.
+        // Half a pair is still missing: a kernel with no initramfs boots to a
+        // panic, which is a worse failure than this message.
         std::fs::create_dir_all(dir.join("artifacts/bootstrap")).unwrap();
         std::fs::write(dir.join(BOOTSTRAP_KERNEL), b"fake kernel").unwrap();
+        assert!(missing_install_artifact(&dir, GuestFamily::Debian).is_some());
+        std::fs::write(dir.join(BOOTSTRAP_INITRD), b"fake initrd").unwrap();
+
+        // And the other way round.
         std::fs::remove_file(dir.join(UEFI_FIRMWARE)).unwrap();
         assert_eq!(missing_install_artifact(&dir, GuestFamily::Debian), None);
         let ubuntu = missing_install_artifact(&dir, GuestFamily::Ubuntu).expect("no firmware");
         assert!(ubuntu.contains(UEFI_FIRMWARE), "{ubuntu}");
         assert!(ubuntu.contains("build-cloudhv.sh"), "{ubuntu}");
 
+        // …and the arm that exists so a Windows user who ran the fetch is not
+        // told to go build a kernel: a pair in the cache, nothing in the working
+        // directory. Folded into this test rather than written as its own,
+        // because both touch `ENTANGLED_CACHE` and cargo runs tests in threads
+        // of one process — two of them racing produced exactly the flake you
+        // would expect.
+        let elsewhere = dir.join("empty-checkout");
+        let tag = cache.join("bootstrap/guest-artifacts-6.12.9-1");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(&tag).unwrap();
+        std::fs::write(tag.join("vmlinuz"), b"fetched kernel").unwrap();
+        assert!(
+            missing_install_artifact(&elsewhere, GuestFamily::Debian).is_some(),
+            "half a cached pair is not a pair"
+        );
+        std::fs::write(tag.join("initrd.img"), b"fetched initrd").unwrap();
+        assert_eq!(
+            missing_install_artifact(&elsewhere, GuestFamily::Debian),
+            None
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The default a fresh wizard opens with: Ubuntu where Debian cannot work.
+    /// One environment variable, set or cleared for the length of a test and put
+    /// back afterwards. These tests share a process with every other test in this
+    /// binary, so without it they steal each other's cache root.
+    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self(key, previous)
+        }
+
+        fn clear(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self(key, previous)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    /// The default a fresh wizard opens with. Both installers work on both hosts
+    /// now, so this is a preference rather than a capability: Windows opens on
+    /// Ubuntu because that one installs entirely offline from a verified ISO,
+    /// while Debian's d-i downloads the system from a mirror.
     #[test]
     fn the_default_family_is_the_one_this_host_can_install() {
         let default = GuestFamily::default_for_host();

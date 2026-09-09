@@ -1572,17 +1572,6 @@ impl ManagerApp {
             return;
         };
 
-        // The wizard already greys out an installer this backend cannot run, so
-        // this is the belt to that braces: a settings change between opening the
-        // wizard and pressing the button must not reach the engine.
-        if machine.family == launcher::GuestFamily::Debian {
-            if let Some(reason) = machine.backend.debian_install_block() {
-                if let Modal::Wizard(state) = &mut self.modal {
-                    state.error = Some(reason.long.to_string());
-                }
-                return;
-            }
-        }
         match backend::reachability(
             machine.backend,
             [profile_path.as_path(), disk_path.as_path()],

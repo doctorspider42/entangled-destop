@@ -44,6 +44,10 @@ tracing-subscriber.workspace = true
 png.workspace = true
 control-api.workspace = true
 disk-image.workspace = true
+# Only for `debian_media::cache_root`: the one answer the CLI, the fetch scripts
+# and this GUI must all give to "where is the media cache". Copying those four
+# environment-variable rules a third time is how they drift.
+debian-media.workspace = true
 # Read-only: `vm_snapshot::inspect` answers what a snapshot is of, how big, from
 # which host and whether it could be restored — without a VM, a disk or a byte
 # of guest memory (ADR-0006 names this as the manager's way in). It is the one
