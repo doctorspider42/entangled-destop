@@ -762,6 +762,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The Windows installer must carry the firmware, and must refuse to build
+    /// without one.
+    ///
+    /// This module's whole search order rests on it — step 3, "the install
+    /// directory", is only ever populated by `installer/entangled.iss` — and
+    /// the bug being fixed here is precisely a release that shipped without it.
+    /// So the packaging invariant is asserted in the code that depends on it,
+    /// against the compiled-in text of the script itself.
+    #[test]
+    fn the_windows_installer_ships_the_firmware_and_will_not_build_without_it() {
+        const ISS: &str = include_str!("../../../installer/entangled.iss");
+        let entry = ISS
+            .lines()
+            .find(|line| line.starts_with("Source:") && line.contains("\\CLOUDHV.fd\";"))
+            .expect("installer/entangled.iss must ship CLOUDHV.fd");
+        assert!(
+            entry.contains(r#"DestDir: "{app}\artifacts\firmware""#),
+            "the firmware must land where this module looks for it — \
+             artifacts\\firmware beside the executable: {entry}"
+        );
+        assert!(
+            !entry.contains("skipifsourcedoesntexist"),
+            "a compile with no firmware must fail, not quietly ship a setup that \
+             cannot create a UEFI machine: {entry}"
+        );
+        // And the licence page shows what is redistributed, not only what we
+        // wrote (THIRD-PARTY-NOTICES.txt, appended at compile time).
+        assert!(
+            ISS.contains("THIRD-PARTY-NOTICES.txt"),
+            "the installer must show and install the third-party notices"
+        );
+    }
+
+    /// EDK2 is BSD-2-Clause-Patent — permissive, but attribution is a
+    /// condition, and this is the first non-Rust binary the project ships, so
+    /// `cargo about` cannot carry it. The notice is compiled in here so it
+    /// cannot be deleted without a test failing.
+    #[test]
+    fn the_redistributed_firmware_is_attributed() {
+        const NOTICES: &str = include_str!("../../../THIRD-PARTY-NOTICES.txt");
+        for needle in [
+            "TianoCore EDK2",
+            "BSD-2-Clause-Patent",
+            FIRMWARE_FILE,
+            "github.com/tianocore/edk2",
+            // The disclaimer the licence requires to travel with the binary.
+            "THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS",
+        ] {
+            assert!(
+                NOTICES.contains(needle),
+                "THIRD-PARTY-NOTICES.txt no longer mentions {needle:?}"
+            );
+        }
+        // The upstream tag the pin names must be the one the notice describes;
+        // bumping EDK2 without re-reading the attribution is the drift this
+        // catches.
+        let pin = pinned().expect("the compiled-in pin parses");
+        assert!(
+            NOTICES.contains(&pin.edk2_tag),
+            "the notices describe a different EDK2 than the pin ({})",
+            pin.edk2_tag
+        );
+    }
+
     /// One environment variable, set or cleared for the length of a test and
     /// put back afterwards.
     struct EnvGuard {

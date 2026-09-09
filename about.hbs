@@ -2,8 +2,36 @@
 <meta charset="utf-8">
 <title>Entangled Desktop third-party licenses</title>
 <h1>Third-party licenses</h1>
+
+<h2>Redistributed binaries that are not Rust crates</h2>
+<p>
+  <code>cargo about</code> reads the Cargo dependency graph, so it cannot see
+  anything we ship that is not a crate. Today that is exactly one thing:
+</p>
+<ul>
+  <li>
+    <b>TianoCore EDK2</b> — <code>artifacts/firmware/CLOUDHV.fd</code>, the UEFI
+    firmware a guest boots (<code>OvmfPkg/CloudHv/CloudHvX64</code>, built by
+    <code>guest/firmware/build-cloudhv.sh</code>). Licensed
+    <b>BSD-2-Clause-Patent</b>. It is guest-side content: never linked into a
+    host binary, only loaded into guest memory at runtime — but it <i>is</i>
+    redistributed, inside the Windows installer and as a release asset, so it is
+    attributed. The full notice and licence text are in
+    <code>THIRD-PARTY-NOTICES.txt</code> at the root of this repository, which
+    the installer both shows on its licence page and lays down beside the
+    binaries.
+  </li>
+</ul>
+<p>
+  The Linux bootstrap kernel is deliberately absent from that list: it is
+  GPL-2.0-only and is <i>not</i> shipped in the installer, only published as its
+  own release alongside its corresponding source
+  (<code>.github/workflows/guest-artifacts.yml</code>).
+</p>
+
+<h2>Rust dependencies</h2>
 {{#each licenses}}
-<h2>{{name}} ({{id}})</h2>
+<h3>{{name}} ({{id}})</h3>
 <ul>{{#each used_by}}<li>{{crate.name}} {{crate.version}}</li>{{/each}}</ul>
 <pre>{{text}}</pre>
 {{/each}}
