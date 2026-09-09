@@ -185,6 +185,9 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_gpu::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick (controlq and cursorq) | same shape as the blk budget test |
 | `virtio_input::MAX_PENDING_EVENTS` | 1024 | host-buffered input events while the guest is not draining (oldest dropped) | `input_queue::a_starved_queue_buffers_events_up_to_the_bound_and_drops_the_oldest` |
 | `virtio_input::config::PAYLOAD_MAX` | 128 | config-space payload bytes | `virtio_input::config::tests::{bitmap_drops_codes_beyond_the_payload, from_slice_truncates_at_the_payload_size}` |
+| `virtio_input::gamepad::MAX_EVENTS_PER_REPORT` | 20 | events one capture tick can push (11 buttons + 8 axes + the `SYN_REPORT`); *derived*, and what makes "one host tick is one bounded push" true by construction | `virtio_input::gamepad::tests::every_event_the_pump_can_produce_is_one_the_profile_advertises` (asserts the budget is exact) |
+| `virtio_input::gamepad::evdev::MAX_SCANNED_DEVICES` | 64 | `/dev/input` nodes one rescan opens and inspects — host-owned, so a sanity bound rather than a security one | `virtio_input::gamepad::evdev::tests::one_scan_looks_at_a_bounded_number_of_nodes_and_at_the_lowest_ones` (also pins that the sort happens *before* the cap) |
+| `virtio_input::gamepad::evdev::MAX_EVENTS_PER_POLL` | 256 | host `input_event` records folded into one `PadState` per tick; the remainder waits for the next one rather than being dropped | `virtio_input::gamepad::evdev::tests::one_poll_folds_a_bounded_number_of_events_and_leaves_the_rest` |
 | `virtio_net::MAX_FRAME_LEN` / `MAX_BUFFER_LEN` | 1514 / 1526 | bytes staged per frame, either direction | `net_queue::{tx_oversized_frames_are_dropped, an_oversized_host_frame_is_dropped_before_the_ring, rx_chain_too_small_for_the_frame_drops_it}` |
 | `virtio_net::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick | same shape as the blk budget test |
 | `virtio_sound::stream::MIN_PERIOD_BYTES` / `MAX_PERIOD_BYTES` | 64 / 64 KiB | one PCM period, and therefore the payload of one playback message | `virtio_sound::stream::tests::period_and_buffer_geometry_is_bounded_and_never_divides_by_zero`, `snd_queue::set_params_refuses_everything_the_device_never_advertised` |
@@ -504,6 +507,43 @@ Blob resources themselves (`virtio_gpu::blob`) are the device half:
   `InputEvent`). Absolute pointer: window coords →
   `InputEvent::abs_from_window` (0..=32767). Every batch ends with
   `InputEvent::SYN_REPORT`. On focus loss release all pressed keys (MVP-906).
+
+  **gamepad** (GAME-2104, `[gamepad] enabled`): a third `Profile`, and the
+  whole deliverable is its config space. Three consumers have to accept it and
+  none of them reads its *name* — `joydev` (so `/dev/input/js*` exists), udev's
+  `input_id` (so a desktop user gets an ACL on the node) and SDL's capability
+  fallback (so Steam maps it with no controller-database entry) — and the one
+  layout all three agree on is the kernel's own `xpad`. So the eleven
+  `BTN_GAMEPAD` codes, `ABS_X/Y/RX/RY` at `-32768..32767` fuzz 16 flat 128,
+  `ABS_Z/RZ` at `0..255`, `ABS_HAT0X/Y` at `-1..1`, copied code-for-code. Four
+  things that look like details and are not: `BTN_C`/`BTN_Z` are *omitted*
+  (advertising them makes it a six-face-button pad to SDL), `BTN_NORTH` is Y
+  and `BTN_WEST` is X (not clockwise), the ids stay `BUS_VIRTUAL` + our own
+  vendor rather than Microsoft's `045e`, and `flat` is the only deadzone in the
+  whole path — the host rescales and never filters.
+  Host capture is `virtio_input::gamepad`: sources report a pad's **complete
+  state** and the pump diffs it, which is why hotplug needs no code — an unplug
+  is `PadState::NEUTRAL`, so held buttons release and sticks re-centre, and
+  every later tick then produces exactly zero events. Linux is `/dev/input/
+  event*` by hand (four ioctls and a `poll`, in `libc` — no `gilrs`), Windows
+  is XInput. The pump is a host thread that writes guest memory, so it belongs
+  to one activation and takes the pause gate (ADR-0005), like virtio-net's
+  receive worker.
+  **`CONFIG_INPUT_JOYDEV` is a separate kernel symbol from
+  `CONFIG_INPUT_EVDEV`** and is a *module* in a stock Debian kernel. Without it
+  the pad is a perfectly good `event*` device with no `js*` at all — which is
+  what the boot acceptance failed on first. It is in
+  `guest/bootstrap-kernel/entangled.config` now; `tests/boot/tests/gamepad.rs`
+  self-skips rather than run on the Debian-installer fallback, because a
+  failure there says nothing about the descriptor.
+  One wart the acceptance turned up: **the tablet is a joystick too**, so a VM
+  with both has the tablet on `js0` and the pad on `js1`.
+  `joydev_dev_is_absolute_mouse()` only excludes a device whose key set is
+  *exactly* `BTN_LEFT`/`RIGHT`/`MIDDLE`, and the tablet also carries
+  `BTN_SIDE`/`BTN_EXTRA` for winit's Back and Forward. Harmless to SDL, which
+  ignores a joystick with no `BTN_JOYSTICK`-range keys; confusing to anything
+  that opens "the first joystick" by number. Written up on
+  `Profile::AbsolutePointer`.
 
 ## Testing
 

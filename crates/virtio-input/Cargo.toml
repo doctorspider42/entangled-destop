@@ -14,6 +14,20 @@ virtio-core.workspace = true
 virtio-queue.workspace = true
 vm-memory.workspace = true
 
+# Host gamepad capture (GAME-2104). Linux reads `/dev/input/event*` directly —
+# four ioctls and a poll, all in `libc` — rather than taking a controller crate:
+# `gilrs` is Apache-2.0 and would pass `cargo deny`, but it brings a
+# four-platform abstraction plus its own transitive tree to do what this crate
+# already does everywhere else (read a `#[repr(C)]` struct off a descriptor).
+# See `src/gamepad/evdev.rs`.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+# XInput through Microsoft's own bindings (MIT OR Apache-2.0), already in the
+# graph for virtio-snd's WASAPI sink.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_UI_Input_XboxController"] }
+
 [dev-dependencies]
 virtio-core = { workspace = true, features = ["test-utils"] }
 
