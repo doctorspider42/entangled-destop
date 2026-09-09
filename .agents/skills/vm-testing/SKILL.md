@@ -836,12 +836,16 @@ the spot. Idle, the four samples are nanoseconds apart and only an exact carry
 tears them; loaded, the exit handler itself can be preempted mid-access, which
 is the entire load dependence.
 
-Measured with the boot repeated under 48-64 CPU spinners on 16 cores:
+Measured with the firmware boot repeated under CPU spinners on 16 cores
+(boots that lost an application processor / boots run):
 
-| | KVM (idle) | KVM (64 spinners) | WHP (idle) | WHP (48 spinners) |
-|---|---|---|---|---|
-| before | 1/17 | 12/24 | 0/20 | 18/20 |
-| after | 0/31 | 0/46 | 0/20 | 0/50 |
+| | KVM idle | KVM, 48 spinners | KVM, 64 spinners | WHP idle | WHP, 48 spinners |
+|---|---|---|---|---|---|
+| before | 1/17 | 5/15 | 12/24 | 0/20 | **18/20** |
+| after | 0/20 | — | 0/66 | — | 0/50 |
+
+WHP suffers far more because its port-I/O exits are slower, so the four samples
+inside one access are further apart.
 
 Three things to take from it:
 
