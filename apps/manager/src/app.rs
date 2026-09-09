@@ -1555,6 +1555,16 @@ impl ManagerApp {
             return;
         };
         let chosen = self.backend_of(&name);
+        // Resuming is starting, so it owes the same two checks a cold start
+        // does — the engine first, because a saved session that dies on
+        // `execvpe` is the one failure a user cannot simply retry past.
+        if let Some(refusal) = self.backend_block(chosen) {
+            self.toast(
+                ToastLevel::Error,
+                format!("'{name}' cannot resume on {}: {refusal}", chosen.label()),
+            );
+            return;
+        }
         // The snapshot file itself has to be visible from the backend, exactly
         // as a profile and its disks do for a cold start.
         match backend::reachability(chosen, std::iter::once(row.path.as_path())) {
