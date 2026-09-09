@@ -38,8 +38,8 @@
 //! # What is being watched, and why each one needs *time*
 //!
 //! The guest is the test initramfs with `entangled.heartbeat=<ms>`: it prints
-//! `VMHOST_HEARTBEAT <n> uptime_ms=<t>` for ever and does nothing else. That one
-//! line carries most of the measurement.
+//! `VMHOST_HEARTBEAT <n> uptime_ms=<t> tsc=<n> pm_us=<n>` for ever and does
+//! nothing else. That one line carries most of the measurement.
 //!
 //! * **Host memory growth** — RSS of the VMM process, sampled periodically. The
 //!   guest touches its RAM once during boot and then stops, so a settled VM's
@@ -51,17 +51,27 @@
 //!   compared between the first and last heartbeat whose arrival the host timed.
 //!   Reported in ppm, with the measurement's own error beside it.
 //!
-//!   **This is the one that currently fails**, on the development host: a
-//!   2 h run on 2026-09-09 measured **−12 603 ppm** — the guest lost 90.7 s,
-//!   about 18 minutes a day — while leaking nothing, dropping no interrupt and
-//!   printing one benign line. It is not the clocksource (forcing `kvm-clock`
-//!   moves it by 0.07 %), not the harness (a 25 ms observer poll moves it by
-//!   2 %, the wrong way) and not lost output (zero gaps); it scales with host
-//!   load, from ~−5 000 ppm on a quiet machine to −2.5 % under a load average
-//!   of 20. The guest's time base appears to lose the time its vCPU is not
-//!   running, which is what a nested host (KVM inside WSL2) would produce. The
-//!   gate stays at 10 000 ppm on purpose — see the `vm-testing` skill for the
-//!   control runs and the open questions.
+//!   **This one failed for a day, and the guest was innocent.** A 2 h run on
+//!   2026-09-09 measured −12 603 ppm and short controls −32 000 ppm, on a guest
+//!   that leaked nothing, dropped no interrupt and printed one benign line.
+//!   Every suspect inside the VM was eliminated in turn and the answer was
+//!   outside it: **the WSL2 development host's own `CLOCK_MONOTONIC` runs
+//!   fast, by a wandering 0.8–3.8 %**, because it advances as though the TSC
+//!   were slower than it is (1 835.4 MHz observed against a real 1 896.4 MHz).
+//!   The guest, which KVM correctly tells 1 896 389 kHz, keeps real time to
+//!   about 100 ppm; the *reference* was the thing that was wrong, and it was
+//!   not even wrong by a constant. See [`HOST_CLOCK_SANITY_PPM`], which is how
+//!   the test now notices — it checks the host's monotonic clock against the
+//!   host's wall clock and, where they disagree, judges the guest against the
+//!   wall clock and says so. The 10 000 ppm gate was never widened.
+//!
+//!   Three counters are recorded per heartbeat so the next such finding is an
+//!   afternoon and not a day: the guest's `CLOCK_MONOTONIC`, the raw TSC under
+//!   it, and the host's clock as the *guest* reads it from the emulated ACPI PM
+//!   timer. The last one is what separates "the guest's clock is slow" from
+//!   "the host noticed the line late" — and note that it cannot separate the
+//!   guest from a wrong host clock, because we synthesise that timer from the
+//!   host clock too. Only `CLOCK_REALTIME` can.
 //! * **Interrupt and queue stalls** — the heartbeat is written by userspace to
 //!   the tty, i.e. through the *interrupt-driven* 8250 path (the one that lost
 //!   edges before the machine had an IOAPIC; see `repeat_boot.rs`). Every
@@ -76,7 +86,7 @@
 
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use boot_tests::{
     boot_artifacts, boot_once_driven, kvm_available, open_fds, rss_kib, thread_count, BootSpec,
@@ -115,10 +125,37 @@ const RSS_SLACK_KIB: u64 = 32 * 1024;
 /// interrupt does not produce 0.6 of the heartbeats, it produces none.
 const MIN_HEARTBEAT_RATIO: f64 = 0.5;
 
-/// Drift allowance, guest monotonic clock against host monotonic clock. A
-/// correct kvm-clock is orders of magnitude better than this; a guest given the
-/// wrong TSC frequency is orders of magnitude worse.
+/// Drift allowance, guest clock against the host's, in ppm. A correct guest is
+/// orders of magnitude better than this; a guest given the wrong TSC frequency
+/// is orders of magnitude worse. It has never been widened, and the day it
+/// looked as though it would have to be, the host was at fault — see
+/// [`HOST_CLOCK_SANITY_PPM`].
 const MAX_DRIFT_PPM: f64 = 10_000.0;
+
+/// How far the host's own `CLOCK_MONOTONIC` may disagree with its
+/// `CLOCK_REALTIME` before it is disqualified as the reference for the drift
+/// measurement.
+///
+/// A test that compares a guest against a host clock is only as good as that
+/// clock, and on 2026-09-09 that stopped being a theoretical concern: two hours
+/// of soak on the WSL2 development host reported the guest losing 90.7 s, and
+/// the guest was **right**. WSL2's `CLOCK_MONOTONIC` advances as though the TSC
+/// were slower than it is (1 835.4 MHz observed against a real 1 896.4 MHz), so
+/// the host's monotonic clock gains whole percent — +3.8 % and +0.8 % measured
+/// ninety minutes apart in one WSL boot — while its externally-disciplined
+/// `CLOCK_REALTIME` keeps real time. That the error *wanders* is why this is a
+/// per-run check and not a constant subtracted somewhere. Every guest clock
+/// derived from the TSC (the `tsc` clocksource and kvm-clock alike, since KVM
+/// scales the pvclock from the same frequency) then reads 3.3 % *slow* against
+/// that reference, and the only guest clock that agreed with it was
+/// `acpi_pm` — which agreed precisely because we synthesise the PM timer from
+/// the same wrong host clock.
+///
+/// So the reference is checked before it is used, and where it fails the run is
+/// judged against `CLOCK_REALTIME` instead and says so. 1 000 ppm is far above
+/// any NTP discipline (which is bounded at 500 ppm) and far below the 33 000
+/// ppm that produced the finding.
+const HOST_CLOCK_SANITY_PPM: f64 = 1_000.0;
 
 /// Console lines after the ready marker that are neither heartbeats nor blank.
 /// Not zero: the kernel is entitled to a few late lines (a device probing after
@@ -162,17 +199,42 @@ struct Sample {
     /// end-to-end number.
     guest_ms: f64,
     host_ms: f64,
+    /// Host milliseconds over the same interval as read **by the guest** from
+    /// the ACPI PM timer, where the guest could read it. Free of the host's
+    /// observation latency, so `guest_ms` against this is the drift with the
+    /// harness taken out of the picture.
+    pm_ms: Option<f64>,
+    /// TSC cycles the guest counted over the same interval, where its init
+    /// reports them.
+    tsc_cycles: Option<u64>,
     serial_bytes: usize,
 }
 
 impl Sample {
     /// Guest clock against host clock since the baseline, in parts per million.
     fn drift_ppm(&self) -> f64 {
-        if self.host_ms > 0.0 {
-            (self.guest_ms - self.host_ms) / self.host_ms * 1e6
-        } else {
-            0.0
-        }
+        ppm(self.guest_ms, self.host_ms)
+    }
+
+    /// The same comparison against the host clock the *guest* read, which is
+    /// the one that cannot be blamed on the harness.
+    fn guest_vs_pm_ppm(&self) -> Option<f64> {
+        self.pm_ms.map(|pm| ppm(self.guest_ms, pm))
+    }
+
+    /// The guest's own host-clock reading against the host's: near zero says
+    /// the harness's timing is sound and any drift is really the guest's.
+    fn pm_vs_host_ppm(&self) -> Option<f64> {
+        self.pm_ms.map(|pm| ppm(pm, self.host_ms))
+    }
+}
+
+/// `a` against `b` in parts per million, or zero where `b` has no length yet.
+fn ppm(a: f64, b: f64) -> f64 {
+    if b > 0.0 {
+        (a - b) / b * 1e6
+    } else {
+        0.0
     }
 }
 
@@ -194,18 +256,43 @@ struct Collected {
 struct Beat {
     tick: u64,
     guest_uptime_ms: u64,
+    /// The guest's raw TSC at the same instant, unscaled. `None` from a guest
+    /// init older than the three-clock probe.
+    tsc: Option<u64>,
+    /// The **host's** monotonic clock at the same instant, as the guest read it
+    /// through the emulated ACPI PM timer. `None` where the guest could not
+    /// open the port, or where the heartbeat is too slow to unwrap a 24-bit
+    /// counter.
+    ///
+    /// This is the term that makes a drift number diagnosable rather than
+    /// merely alarming: it is host time carried inside the guest's own line, so
+    /// comparing it with `guest_uptime_ms` measures the two time bases against
+    /// each other with **no** observation latency in between.
+    pm_us: Option<u64>,
     /// Host clock at the first observation of this tick — never the tick's own
     /// print time, but within one [`OBSERVE_INTERVAL`] plus one harness poll of
     /// it. Only ever set where the *transition* to this tick was watched, so
     /// that the same latency sits on both ends of an interval and cancels.
     seen: Instant,
+    /// The host's *wall* clock at the same instant, read next to `seen`.
+    ///
+    /// The reference's reference. `Instant` is `CLOCK_MONOTONIC`, which is a
+    /// free-running count of the host's own making and can be wrong about real
+    /// time without anything noticing — on the WSL2 development host it gains
+    /// 3.3 %, which is what made this test fail for a day (see
+    /// [`HOST_CLOCK_SANITY_PPM`]). `SystemTime` is `CLOCK_REALTIME`, which is
+    /// disciplined from outside the machine, so the two together say whether
+    /// the host is fit to judge the guest.
+    seen_real: SystemTime,
 }
 
-/// Parses the newest `VMHOST_HEARTBEAT <n> uptime_ms=<t>` line in `tail`.
+/// Parses the newest `VMHOST_HEARTBEAT <n> uptime_ms=<t> [tsc=<n>] [pm_us=<n>]`
+/// line in `tail`.
 ///
 /// Only complete lines count: a half-written one has no terminator yet, and its
-/// uptime field may be truncated mid-number.
-fn last_beat(tail: &str) -> Option<(u64, u64)> {
+/// uptime field may be truncated mid-number. The two clock fields are optional
+/// and read by name, so an older initramfs still measures what it can.
+fn last_beat(tail: &str) -> Option<(u64, u64, Option<u64>, Option<u64>)> {
     tail.lines()
         .rev()
         // The final element of `lines()` may be a partial line; a trailing
@@ -216,7 +303,16 @@ fn last_beat(tail: &str) -> Option<(u64, u64)> {
             let mut fields = rest.split_ascii_whitespace();
             let tick: u64 = fields.next()?.parse().ok()?;
             let uptime: u64 = fields.next()?.strip_prefix("uptime_ms=")?.parse().ok()?;
-            Some((tick, uptime))
+            let mut tsc = None;
+            let mut pm_us = None;
+            for field in fields {
+                if let Some(v) = field.strip_prefix("tsc=") {
+                    tsc = v.parse().ok();
+                } else if let Some(v) = field.strip_prefix("pm_us=") {
+                    pm_us = v.parse().ok();
+                }
+            }
+            Some((tick, uptime, tsc, pm_us))
         })
 }
 
@@ -225,11 +321,14 @@ fn last_beat(tail: &str) -> Option<(u64, u64)> {
 fn observe_beat(vm: &VmHandle, timeout: Duration) -> Option<Beat> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some((tick, guest_uptime_ms)) = last_beat(&vm.serial_tail(4096)) {
+        if let Some((tick, guest_uptime_ms, tsc, pm_us)) = last_beat(&vm.serial_tail(4096)) {
             return Some(Beat {
                 tick,
                 guest_uptime_ms,
+                tsc,
+                pm_us,
                 seen: Instant::now(),
+                seen_real: SystemTime::now(),
             });
         }
         if Instant::now() >= deadline {
@@ -253,14 +352,17 @@ fn observe_beat(vm: &VmHandle, timeout: Duration) -> Option<Beat> {
 /// ends of the interval, where it cancels.
 fn observe_next_beat(vm: &VmHandle, timeout: Duration) -> Option<Beat> {
     let deadline = Instant::now() + timeout;
-    let already = last_beat(&vm.serial_tail(4096)).map(|(tick, _)| tick);
+    let already = last_beat(&vm.serial_tail(4096)).map(|(tick, ..)| tick);
     loop {
-        if let Some((tick, guest_uptime_ms)) = last_beat(&vm.serial_tail(4096)) {
+        if let Some((tick, guest_uptime_ms, tsc, pm_us)) = last_beat(&vm.serial_tail(4096)) {
             if Some(tick) != already {
                 return Some(Beat {
                     tick,
                     guest_uptime_ms,
+                    tsc,
+                    pm_us,
                     seen: Instant::now(),
+                    seen_real: SystemTime::now(),
                 });
             }
         }
@@ -336,7 +438,8 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
             "# entangled soak: {soak_secs} s, {} transport, {memory_mib} MiB, \
              heartbeat {heartbeat_ms} ms, sample {sample_secs} s, warm-up {warmup:?}\n\
              # guest cmdline extra: {}\n\
-             at_s\trss_kib\tfds\tthreads\tticks\tguest_ms\thost_ms\tdrift_ppm\tserial_bytes",
+             at_s\trss_kib\tfds\tthreads\tticks\tguest_ms\thost_ms\tdrift_ppm\tpm_ms\t\
+             guest_vs_pm_ppm\tpm_vs_host_ppm\ttsc_cycles\tserial_bytes",
             spec.transport,
             if extra_cmdline.is_empty() {
                 "(none)"
@@ -406,6 +509,14 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
                     .guest_uptime_ms
                     .saturating_sub(base_beat.guest_uptime_ms) as f64,
                 host_ms: beat.seen.duration_since(base_beat.seen).as_secs_f64() * 1000.0,
+                pm_ms: beat
+                    .pm_us
+                    .zip(base_beat.pm_us)
+                    .map(|(now, base)| now.saturating_sub(base) as f64 / 1000.0),
+                tsc_cycles: beat
+                    .tsc
+                    .zip(base_beat.tsc)
+                    .map(|(now, base)| now.wrapping_sub(base)),
                 serial_bytes: vm.serial_bytes(),
             };
             // Every sample goes to the console and to the black box through
@@ -415,19 +526,27 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
             let record = |sample: &Sample, log: &mut Option<std::fs::File>| {
                 println!(
                     "soak {:>7.0}s: rss={} KiB fds={} threads={} ticks={} drift={:+.0} ppm \
-                     console={} B",
+                     (vs the guest's own host reading {}) console={} B",
                     sample.at_s,
                     sample.rss_kib,
                     sample.fds,
                     sample.threads,
                     sample.ticks,
                     sample.drift_ppm(),
+                    match sample.guest_vs_pm_ppm() {
+                        Some(ppm) => format!("{ppm:+.0} ppm"),
+                        None => "n/a".to_string(),
+                    },
                     sample.serial_bytes
                 );
                 if let Some(file) = log.as_mut() {
+                    let show = |v: Option<f64>| match v {
+                        Some(v) => format!("{v:+.0}"),
+                        None => "-".to_string(),
+                    };
                     let _ = writeln!(
                         file,
-                        "{:.0}\t{}\t{}\t{}\t{}\t{:.0}\t{:.0}\t{:+.0}\t{}",
+                        "{:.0}\t{}\t{}\t{}\t{}\t{:.0}\t{:.0}\t{:+.0}\t{}\t{}\t{}\t{}\t{}",
                         sample.at_s,
                         sample.rss_kib,
                         sample.fds,
@@ -436,6 +555,16 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
                         sample.guest_ms,
                         sample.host_ms,
                         sample.drift_ppm(),
+                        match sample.pm_ms {
+                            Some(pm) => format!("{pm:.0}"),
+                            None => "-".to_string(),
+                        },
+                        show(sample.guest_vs_pm_ppm()),
+                        show(sample.pm_vs_host_ppm()),
+                        match sample.tsc_cycles {
+                            Some(cycles) => cycles.to_string(),
+                            None => "-".to_string(),
+                        },
                         sample.serial_bytes
                     );
                     let _ = file.flush();
@@ -452,12 +581,16 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
                 // Track the newest heartbeat continuously rather than only at
                 // sample time: the drift measurement's error is how stale this
                 // reading is, so it is kept to one observe interval.
-                if let Some((tick, guest_uptime_ms)) = last_beat(&vm.serial_tail(4096)) {
+                if let Some((tick, guest_uptime_ms, tsc, pm_us)) = last_beat(&vm.serial_tail(4096))
+                {
                     if state.last_beat.map(|b| b.tick) != Some(tick) {
                         state.last_beat = Some(Beat {
                             tick,
                             guest_uptime_ms,
+                            tsc,
+                            pm_us,
                             seen: Instant::now(),
+                            seen_real: SystemTime::now(),
                         });
                     }
                 }
@@ -510,11 +643,43 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
     let guest_ms = final_beat
         .guest_uptime_ms
         .saturating_sub(first_beat.guest_uptime_ms) as f64;
-    let drift_ppm = if host_ms > 0.0 {
-        (guest_ms - host_ms) / host_ms * 1e6
-    } else {
-        0.0
-    };
+    let drift_ppm = ppm(guest_ms, host_ms);
+    // The same interval on the host's *wall* clock. `CLOCK_REALTIME` is stepped
+    // by whatever disciplines it, so it is the worse instrument over seconds
+    // and the better one over hours — which is exactly the way round a soak
+    // needs. `duration_since` fails only on a backwards step; that leaves the
+    // reference unavailable rather than wrong, and the checks below fall back
+    // to trusting the monotonic clock.
+    let host_real_ms = final_beat
+        .seen_real
+        .duration_since(first_beat.seen_real)
+        .ok()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .filter(|ms| *ms > 0.0);
+    // The host's monotonic clock against its own wall clock: the reference's
+    // own error, and the term that decides which of them judges the guest.
+    let host_ref_ppm = host_real_ms.map(|real| ppm(host_ms, real));
+    let host_clock_trustworthy = host_ref_ppm.is_none_or(|p| p.abs() <= HOST_CLOCK_SANITY_PPM);
+    let drift_real_ppm = host_real_ms.map(|real| ppm(guest_ms, real));
+    // The same interval as the *guest* measured the host over, through the ACPI
+    // PM timer. `pm_vs_host_ppm` is the harness's own report card — the guest's
+    // reading of host time against the host's, with only the observation
+    // latency between them — and `guest_vs_pm_ppm` is the drift with that
+    // latency removed entirely, because both of its terms were read by the same
+    // guest microseconds apart. When the two disagree, believe the second.
+    let pm_ms = final_beat
+        .pm_us
+        .zip(first_beat.pm_us)
+        .map(|(now, base)| now.saturating_sub(base) as f64 / 1000.0);
+    let guest_vs_pm_ppm = pm_ms.map(|pm| ppm(guest_ms, pm));
+    let pm_vs_host_ppm = pm_ms.map(|pm| ppm(pm, host_ms));
+    // What the guest's TSC actually did, against host time. A guest that
+    // believes a frequency it is not being given shows up here and nowhere
+    // else: the clocksource name says what it read, this says how fast it ran.
+    let tsc_mhz = final_beat
+        .tsc
+        .zip(first_beat.tsc)
+        .map(|(now, base)| now.wrapping_sub(base) as f64 / host_ms.max(f64::EPSILON) / 1000.0);
     // What the drift figure is worth. Each end of the interval is a beat the
     // host noticed within one harness poll plus one observe interval of its
     // being printed, so the whole measurement carries that much timing error —
@@ -570,6 +735,10 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
          at {:.0} s\n\
          guest clock       {:.0} ms guest vs {:.0} ms host, drift {:+.0} ppm \
          (+-{:.0} ppm observation error), clocksource {}\n\
+         cross-check       guest vs the host clock it read itself {}, that reading vs the \
+         host's own {}, guest TSC {}\n\
+         host reference    monotonic vs wall clock {}, guest vs the host's wall clock {} \
+         — reference {}\n\
          console           {} bytes total, {:.1} B per heartbeat since the baseline, \
          {} unexpected lines\n\
          ---------------------------------------------------------------------",
@@ -595,6 +764,31 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
         drift_ppm,
         drift_err_ppm,
         guest_clocksource(&outcome.serial).unwrap_or_else(|| "unknown".to_string()),
+        match guest_vs_pm_ppm {
+            Some(v) => format!("{v:+.0} ppm"),
+            None => "n/a (guest reported no PM timer)".to_string(),
+        },
+        match pm_vs_host_ppm {
+            Some(v) => format!("{v:+.0} ppm"),
+            None => "n/a".to_string(),
+        },
+        match tsc_mhz {
+            Some(v) => format!("{v:.3} MHz measured against host time"),
+            None => "n/a".to_string(),
+        },
+        match host_ref_ppm {
+            Some(v) => format!("{v:+.0} ppm"),
+            None => "n/a (the wall clock stepped backwards)".to_string(),
+        },
+        match drift_real_ppm {
+            Some(v) => format!("{v:+.0} ppm"),
+            None => "n/a".to_string(),
+        },
+        if host_clock_trustworthy {
+            "CLOCK_MONOTONIC"
+        } else {
+            "CLOCK_REALTIME (the host's monotonic clock is the outlier)"
+        },
         last.serial_bytes,
         // Marginal, not average: the boot log is a fixed cost the guest paid
         // once, and dividing it into the run's beats hides the number that
@@ -662,12 +856,36 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
     // The gate is widened by the measurement's own error rather than by a
     // fudge factor, so that a 60-second smoke run of this test is judged as
     // loosely as its evidence deserves and a two-hour run as tightly.
+    //
+    // *Which* host clock the guest is judged against is decided above, not
+    // here: a host whose monotonic clock disagrees with its own wall clock by
+    // more than `HOST_CLOCK_SANITY_PPM` has disqualified itself as the
+    // reference, and this measures against the wall clock instead rather than
+    // reporting the host's error as the guest's (see `HOST_CLOCK_SANITY_PPM`
+    // for the two hours that lesson cost).
+    let (judged_ppm, reference) = match (host_clock_trustworthy, drift_real_ppm) {
+        (true, _) | (false, None) => (drift_ppm, "the host's monotonic clock"),
+        (false, Some(real)) => (real, "the host's wall clock"),
+    };
     assert!(
-        drift_ppm.abs() <= MAX_DRIFT_PPM + drift_err_ppm,
-        "guest clock drifted {drift_ppm:+.0} ppm against the host over {:.0} s, beyond the \
+        judged_ppm.abs() <= MAX_DRIFT_PPM + drift_err_ppm,
+        "guest clock drifted {judged_ppm:+.0} ppm against {reference} over {:.0} s, beyond the \
          {MAX_DRIFT_PPM:.0} ppm allowance and the {drift_err_ppm:.0} ppm this run could not see",
         host_ms / 1000.0
     );
+    // Not an assertion: a host that cannot keep its own two clocks together is
+    // not a fault in the thing under test, and failing here would only make the
+    // suite red for someone else's reason. It is loud, though — a run judged
+    // against the fallback reference has to say so, or the next reader
+    // re-derives the whole finding from scratch.
+    if let Some(off) = host_ref_ppm.filter(|_| !host_clock_trustworthy) {
+        eprintln!(
+            "note: this host's CLOCK_MONOTONIC runs {off:+.0} ppm against its own CLOCK_REALTIME, \
+             so the guest was judged against the wall clock. The guest's TSC-derived clocks will \
+             read about {:+.0} ppm here for that reason alone, and it is not the guest's fault.",
+            -off / (1.0 + off / 1e6)
+        );
+    }
     assert!(
         unexpected.len() <= MAX_UNEXPECTED_LINES,
         "{} console lines that are not heartbeats: the guest is logging something",

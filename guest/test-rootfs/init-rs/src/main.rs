@@ -25,8 +25,18 @@
 //!                               rebooting: proves the FADT, the DSDT's `\_S5`
 //!                               and the host's ACPI PM block agree. Opt-in,
 //!                               because every other test wants the reboot path.
-//!   `entangled.heartbeat=<ms>`  print `VMHOST_HEARTBEAT <n> uptime_ms=<ms>` every `<ms>`
+//!   `entangled.heartbeat=<ms>`  print
+//!                               `VMHOST_HEARTBEAT <n> uptime_ms=<ms> tsc=<n> pm_us=<n>`
+//!                               every `<ms>`
 //!                               milliseconds, for ever, instead of rebooting.
+//!                               The three counters are the guest's
+//!                               `CLOCK_MONOTONIC`, the raw TSC under it and
+//!                               the *host's* monotonic clock seen through the
+//!                               emulated ACPI PM timer; together they say
+//!                               which layer a clock drift came from, which no
+//!                               host-side measurement can (`pm_us` is dropped
+//!                               for periods above 4 s, where the 24-bit
+//!                               counter cannot be unwrapped).
 //!                               The guest-side evidence for pause and resume
 //!                               (ADR-0005): a host that has frozen a VM can
 //!                               only prove it by the guest going quiet, and it
@@ -110,6 +120,30 @@ const PAD_EVENT_WAIT: Duration = Duration::from_secs(15);
 /// entries in `seq=` instead of being invisible because the probe had already
 /// counted enough and left.
 const PAD_QUIET: Duration = Duration::from_millis(1500);
+
+/// I/O port of the ACPI PM timer on this machine (`ACPI_PM_BASE + 8`, see
+/// `machine_x86::acpi::pm`). Read by the heartbeat probe as a **host** clock
+/// the guest can see: the host derives that counter from its own monotonic
+/// clock, so a guest that compares it against `CLOCK_MONOTONIC` measures the
+/// two time bases against each other without the host's observation latency
+/// entering the comparison at all. That is the difference between "the guest's
+/// clock is slow" and "the host noticed the line late", and no measurement
+/// taken only on the host can tell them apart.
+const ACPI_PM_TIMER_PORT: u16 = 0x608;
+
+/// The architectural ACPI PM timer frequency, 3.579545 MHz. Must agree with
+/// `machine_x86::acpi::pm::ACPI_PM_TIMER_HZ`.
+const ACPI_PM_TIMER_HZ: u64 = 3_579_545;
+
+/// The counter is 24 bits wide (the FADT leaves `TMR_VAL_EXT` clear), so it
+/// wraps every 4.69 s and a reader has to unwrap deltas itself.
+const ACPI_PM_TIMER_MASK: u32 = 0x00ff_ffff;
+
+/// Longest heartbeat period for which the PM timer can be unwrapped safely: a
+/// 24-bit counter at 3.579545 MHz wraps in 4.69 s, and a sampler slower than
+/// that cannot tell one wrap from two. Above it the probe reports no PM
+/// reading rather than a wrong one.
+const PM_TIMER_MAX_PERIOD_MS: u64 = 4_000;
 
 /// `EVIOCGABS(axis)` = `_IOR('E', 0x40 + axis, struct input_absinfo)`, spelled
 /// out because `libc` does not export the `EVIOC*` family. 24 is
@@ -227,16 +261,38 @@ fn heartbeat(period_ms: u64) {
     let period = Duration::from_millis(period_ms.clamp(10, 10_000));
     let started = Instant::now();
     let mut tick: u64 = 0;
+    // Three clocks, read within microseconds of each other inside the guest,
+    // so that a drift finding can name the layer that produced it (see
+    // `PmTimer` and `ACPI_PM_TIMER_PORT`). `pm` is only offered when the
+    // sampling period can unwrap it.
+    let mut pm = (period <= Duration::from_millis(PM_TIMER_MAX_PERIOD_MS))
+        .then(PmTimer::open)
+        .flatten();
     loop {
-        // The trailing field is the *guest's* monotonic clock, which is what
-        // makes timer drift measurable over a long run (MVP-1404): the host
-        // compares it against its own elapsed time, and neither the sleep's
-        // overshoot nor the print's cost enters the comparison. It is appended
-        // rather than woven in so that every existing reader — all of which take
-        // the first whitespace-separated token after the marker — keeps working.
+        // The trailing fields are the *guest's* clocks, which is what makes
+        // timer drift measurable over a long run (MVP-1404): the host compares
+        // them against its own elapsed time, and neither the sleep's overshoot
+        // nor the print's cost enters the comparison. They are appended rather
+        // than woven in so that every existing reader — all of which take the
+        // first whitespace-separated token after the marker — keeps working.
+        //
+        // * `uptime_ms` is `CLOCK_MONOTONIC`: the guest kernel's timekeeping,
+        //   on whatever clocksource it chose.
+        // * `tsc` is the raw counter underneath it, unscaled — the pair says
+        //   whether a wrong *frequency* or a stopped *counter* is at fault.
+        // * `pm_us` is the host's own monotonic clock, seen through the
+        //   emulated ACPI PM timer. It is the only term here the guest's time
+        //   base cannot influence, so it is the reference the other two are
+        //   judged against.
+        let uptime_ms = started.elapsed().as_millis();
+        let tsc = read_tsc();
+        let pm_us = pm.as_mut().map(PmTimer::elapsed_us);
         println!(
-            "VMHOST_HEARTBEAT {tick} uptime_ms={}",
-            started.elapsed().as_millis()
+            "VMHOST_HEARTBEAT {tick} uptime_ms={uptime_ms} tsc={tsc}{}",
+            match pm_us {
+                Some(us) => format!(" pm_us={us}"),
+                None => String::new(),
+            }
         );
         // Flushed explicitly: stdout to a serial console is line-buffered only
         // when it is a tty, and the host is counting *arrivals*.
@@ -244,6 +300,94 @@ fn heartbeat(period_ms: u64) {
         tick = tick.wrapping_add(1);
         std::thread::sleep(period);
     }
+}
+
+/// The CPU's time-stamp counter, raw and unscaled.
+///
+/// Deliberately *not* converted to seconds: the guest would have to believe a
+/// frequency to do that, and whether it should is exactly the question this
+/// reading exists to answer. Ratios against the other two clocks need no
+/// frequency at all.
+fn read_tsc() -> u64 {
+    // SAFETY: `rdtsc` reads a counter into edx:eax and touches no memory. It is
+    // unprivileged unless CR4.TSD is set, which no Linux kernel sets, and this
+    // binary only ever runs on x86-64.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// The host's monotonic clock, read from inside the guest through the emulated
+/// ACPI PM timer, with the 24-bit counter's wraps accumulated away.
+struct PmTimer {
+    /// The previous raw reading, for the wrap arithmetic.
+    last: u32,
+    /// Ticks since [`PmTimer::open`], unwrapped. 2^64 ticks is 163 000 years.
+    ticks: u64,
+}
+
+impl PmTimer {
+    /// Grants this process access to the timer's four ports and takes the
+    /// first reading, or `None` where there is no usable timer there — in which
+    /// case the probe simply reports two clocks instead of three.
+    ///
+    /// Two ways it can be absent, and both have to be caught, because a
+    /// *plausible-looking* third clock is worse than none: the kernel may
+    /// refuse the port (`ioperm` needs `CONFIG_X86_IOPL_IOPERM`), or the
+    /// machine may not decode it, in which case the read returns all-ones
+    /// for ever and a host comparing against it would see a guest that never
+    /// gains or loses a microsecond. So the counter has to be seen *moving*.
+    /// Each `in` is a VM exit, which takes microseconds, and the counter
+    /// advances every 280 ns — two consecutive reads that agree are a dead
+    /// port, not a coincidence.
+    fn open() -> Option<Self> {
+        // SAFETY: `ioperm` is a plain syscall taking no pointers. It widens
+        // this process's I/O permission bitmap by the four bytes of the PM
+        // timer and nothing else; as PID 1 we hold CAP_SYS_RAWIO. A kernel
+        // built without the ioperm syscall answers ENOSYS, which is the `!= 0`
+        // arm below.
+        let granted = unsafe { libc::ioperm(ACPI_PM_TIMER_PORT as libc::c_ulong, 4, 1) } == 0;
+        if !granted {
+            return None;
+        }
+        let first = read_pm_timer();
+        (read_pm_timer() != first).then_some(Self {
+            last: first,
+            ticks: 0,
+        })
+    }
+
+    /// Microseconds of host time since [`PmTimer::open`].
+    ///
+    /// Must be called more often than the counter wraps (4.69 s); the caller
+    /// guarantees that by refusing to open the timer for slower periods.
+    fn elapsed_us(&mut self) -> u64 {
+        let now = read_pm_timer();
+        let delta = now.wrapping_sub(self.last) & ACPI_PM_TIMER_MASK;
+        self.last = now;
+        self.ticks = self.ticks.wrapping_add(u64::from(delta));
+        // Multiply first: at 3.579545 MHz the product overflows u64 only after
+        // 163 000 years of ticks.
+        self.ticks.wrapping_mul(1_000_000) / ACPI_PM_TIMER_HZ
+    }
+}
+
+/// One 32-bit read of the PM timer port, masked to the 24 bits the FADT
+/// advertises.
+fn read_pm_timer() -> u32 {
+    let value: u32;
+    // SAFETY: a 32-bit `in` from a port this process was granted by
+    // `PmTimer::open`'s `ioperm`; without that grant the instruction would
+    // fault, which is why this function is private to `PmTimer`. The PM timer
+    // is read-only and side-effect-free on the host, the instruction touches no
+    // memory, and `dx`/`eax` are the only registers involved.
+    unsafe {
+        core::arch::asm!(
+            "in eax, dx",
+            in("dx") ACPI_PM_TIMER_PORT,
+            out("eax") value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    value & ACPI_PM_TIMER_MASK
 }
 
 /// Asks the kernel to power the machine off through ACPI and reports what
@@ -883,7 +1027,11 @@ fn shm_probe(expect: &str) {
         }
 
         let path = dir.join("resource2");
-        let file = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
             Ok(file) => file,
             Err(e) => {
                 fail(format!("cannot-open-resource2:{e}"));

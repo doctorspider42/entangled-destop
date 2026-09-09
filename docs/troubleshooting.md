@@ -29,7 +29,7 @@ one-line fix under it.
 - [The install seems stuck](#the-install-seems-stuck)
 - [The installed Ubuntu takes two minutes to reach the login prompt](#the-installed-ubuntu-takes-two-minutes-to-reach-the-login-prompt)
 - [Windows says "Windows protected your PC"](#windows-says-windows-protected-your-pc)
-- [The clock inside the guest falls behind](#the-clock-inside-the-guest-falls-behind)
+- [The guest's clock disagrees with the host's (WSL2)](#the-guests-clock-disagrees-with-the-hosts-wsl2)
 - [The guest has no joystick](#the-guest-has-no-joystick)
 - [`entangled resume` refuses the snapshot](#entangled-resume-refuses-the-snapshot)
 - [The manager says a machine is stopped when it is running](#the-manager-says-a-machine-is-stopped-when-it-is-running)
@@ -301,34 +301,48 @@ There is no published checksum to verify the download against either; if that is
 not acceptable, build from source instead — see the
 [user guide](user-guide.md#either-host-build-from-source).
 
-## The clock inside the guest falls behind
+## The guest's clock disagrees with the host's (WSL2)
 
-Known, measured, and not yet fixed. A two-hour endurance run of the test guest
-on the development host (KVM inside WSL2) on 2026-09-09 found the guest's
-monotonic clock running **1.26 % slow** — it counted 7 109 seconds while the
-host counted 7 200, so the guest lost **90.7 seconds in two hours**, about 18
-minutes a day. On a quiet machine the rate is nearer 0.5 %; it gets worse in
-proportion to how busy the host is, reaching 2.5 % with a load average of 20.
+**Resolved 2026-09-09: the guest is right and the WSL2 host's clock is wrong.**
+This section used to say the opposite, so if you are here from an older note,
+read on.
 
-What it is not: it is not the guest picking the wrong clock source (forcing
-`clocksource=kvm-clock` on the guest command line changes the number by 0.07 %),
-and it is not a measurement artefact. The guest's time base appears to lose the
-time its vCPU is not running.
+A guest of ours running on KVM inside WSL2 reports its monotonic clock some
+**1–4 % slower** than the WSL host's. The guest is keeping real time. WSL2's own
+`CLOCK_MONOTONIC` runs fast — it advances as though the CPU's time-stamp counter
+were slower than it is (1 835.4 MHz observed against a real 1 896.4 MHz) — and
+the size of the error **wanders**: +3.8 % and +0.8 % were measured ninety
+minutes apart in one WSL session. So it is the *host* clock that is fast, and by
+an amount that will not be the same when you check.
 
-What to do until it is fixed:
+How to check it yourself, on any WSL distribution, with no VM involved:
 
-- **Run NTP in the guest**, which any installed distribution already does. Note
-  what that buys and what it does not: 12 600 ppm is far beyond the ±500 ppm an
-  NTP client can slew away, so `systemd-timesyncd` keeps the *wall clock* right
-  by **stepping** it rather than by disciplining the rate — the time of day will
-  be correct and will occasionally jump. Elapsed-time measurements inside the
-  guest stay short. The guests that suffer most are the ones with no NTP at all:
-  minimal images, appliances, anything offline.
-- Do not use a guest's own clock to time anything that matters, and do not be
-  surprised by a slow guest clock after the host has been busy.
-- The measurement was made on a **nested** host (WSL2 on Hyper-V). Whether it
-  reproduces on bare-metal KVM or on Windows/WHP has not been established; if
-  you can measure it on either, that is worth reporting.
+```bash
+# CLOCK_MONOTONIC against the externally-disciplined wall clock.
+python3 -c 'import time; m=time.monotonic(); r=time.time(); time.sleep(120); print("monotonic %.3f  realtime %.3f" % (time.monotonic()-m, time.time()-r))'
+```
+
+On an affected WSL host the monotonic figure comes back 1–4 % larger. A second
+check from the Windows side: time the same command with PowerShell's
+`Measure-Command` — Windows QPC agrees with WSL's wall clock, not with its
+monotonic clock.
+
+What this means in practice:
+
+- **The guest's time of day is fine**, on WSL and everywhere else. KVM hands the
+  guest the true TSC frequency, and both the `tsc` clocksource and kvm-clock
+  derive from it. Measured against the host's *wall* clock, a two-hour guest run
+  is within about 100 ppm.
+- **Do not benchmark inside WSL** and expect the numbers to be real seconds —
+  everything timed there, in a guest or not, reads ~3 % long.
+- **Windows/WHP is unaffected.** The same guest on the same machine under WHP
+  measures +10 ppm against the host clock it reads through the emulated ACPI PM
+  timer.
+- Nothing in the VMM can correct a wrong host clock: KVM computes the guest's
+  TSC scaling ratio from the same host frequency it advertises to the guest, so
+  the error cancels out of any adjustment we could make. If it bothers you,
+  restart WSL (`wsl --shutdown`, then start it again) — the frequency is
+  established when the WSL VM boots.
 
 ## The guest has no joystick
 

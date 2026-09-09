@@ -98,7 +98,7 @@ ours to choose — EDK2's `OvmfPkg/Include/IndustryStandard/CloudHv.h` fixes
 | `0x60c` | 2 | GPE0_STS | `GPE0_BLK` +0 | write-1-to-clear; no source drives it yet |
 | `0x60e` | 2 | GPE0_EN | `GPE0_BLK` +2 | read/write |
 
-Three facts that look arbitrary and are not:
+Four facts that look arbitrary and are not:
 
 * **The PM timer is latched once per access, not once per byte.**
   `AcpiPmBlock::io_read` samples `AcpiPmTimer::ticks()` *before* it walks the
@@ -116,6 +116,19 @@ Three facts that look arbitrary and are not:
   counter immediately before the access and the counter immediately after it.**
   It applies to every free-running register, here and in any device added
   later.
+* **The PM timer is a host clock the guest can read, and the tests use it as
+  one.** `AcpiPmTimer` is derived from host `Instant`, so a guest reading
+  `0x608` is reading the host's own monotonic clock — which is why the test
+  initramfs's heartbeat probe reads it (`pm_us=` beside `uptime_ms=` and
+  `tsc=`), and why that reading settled the 2026-09-09 drift finding: guest
+  clock against host clock, both sampled inside the guest microseconds apart,
+  with none of the harness's observation latency in between. Two consequences.
+  The comparison **cannot** detect a host whose own clock is wrong — the WSL2
+  host's gains a wandering 0.8–3.8 %, so the PM timer we synthesise there gains
+  it too, and a guest firmware's `MicroSecondDelay()` is that much short on that
+  host. And any
+  device added later that reports host time to the guest inherits both the
+  usefulness and the blind spot.
 * **`SCI_EN` always reads set.** `FADT.SMI_CMD` is 0 (no SMI on this machine),
   so ACPICA must conclude the platform is *already* in ACPI mode;
   `AcpiHwGetMode()` decides that by reading exactly this bit. Read it back as 0

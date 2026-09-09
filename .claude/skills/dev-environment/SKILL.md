@@ -108,6 +108,34 @@ Rules that follow — and note how narrow your mandate is:
    installs.** Both dig into C: at once (LOCALAPPDATA target dirs + VHDX
    growth + WSL swap); that combination has cost this machine two outages.
 
+## The WSL clock is 3.3 % fast — every timing number is affected
+
+Measured 2026-09-09, and it is not a VM problem, it is a *this machine*
+problem: **WSL2's `CLOCK_MONOTONIC` gains thousands of ppm, and the amount
+wanders** — +37 889 ppm (3.8 %, 55 minutes a day) at 15:24 and +8 064 ppm
+ninety minutes later, in the same WSL boot. It advances as though the TSC ran at 1 835.4 MHz when the
+hardware really runs at 1 896.4 MHz (verified against Windows QPC to 103 ppm,
+and against WSL's own hv-timesync-disciplined `CLOCK_REALTIME`). Windows
+native is fine: `Instant` there is QPC, which agreed with `SystemTime` to
+170 ppm.
+
+Consequences, all of them real:
+
+- Anything timed with `Instant`/`std::time` inside WSL reads long, by a
+  percent or four —
+  benchmarks, throughput figures, "it took N seconds" in a report.
+- A guest of ours running on KVM in WSL keeps *correct real time* (KVM hands it
+  the true 1 896 389 kHz) and therefore reads **3.3 % slow against the host**.
+  That is the host being fast, not the guest being slow. It cost a day to
+  establish; the whole account is in the `vm-testing` skill under "The clock
+  finding".
+- Our emulated ACPI PM timer is derived from host `Instant`, so inside a
+  WSL-hosted guest it runs 3.3 % fast too — firmware `MicroSecondDelay()` waits
+  are correspondingly short here.
+- A wall-clock number you intend to quote should be taken on the Windows side,
+  or checked against `CLOCK_REALTIME` (`clock_gettime` both, compare the
+  deltas). Two clocks that disagree are one bug; three clocks name which.
+
 ## Running VMs and demos
 
 - **WSL kills the whole distro ~8 s after the last `wsl.exe` client exits** —
