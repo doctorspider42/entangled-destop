@@ -3,6 +3,7 @@
 
 mod config;
 pub mod control;
+pub mod wsl;
 
 pub use config::{
     BootMode, BootSection, CdromSection, ConfigError, DiskSection, DisplaySection, GamepadBackend,
