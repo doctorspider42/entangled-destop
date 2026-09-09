@@ -31,6 +31,55 @@
 //!   been produced while the pump is parked on the pause gate collapse into
 //!   the one delta computed after it resumes.
 //!
+//! # Rumble: why there is none, and what it would take
+//!
+//! GAME-2104 left force feedback as a follow-up, on the assumption that the
+//! guest half was the interesting part — a game uploads an `FF_RUMBLE`
+//! effect, gets an id back, plays it by writing an `EV_FF` event — and the
+//! host half was `XInputSetState` / `EVIOCSFF`. **The guest half does not
+//! exist**, at two independent levels, and neither is ours to fix here.
+//!
+//! 1. **Linux's `virtio_input.c` has no force feedback, and never has.**
+//!    `virtinput_probe()` queries `EV_BITS` for `EV_KEY`, `EV_REL`, `EV_ABS`,
+//!    `EV_MSC`, `EV_SW`, `EV_LED`, `EV_SND` and `EV_REP` — and nothing else.
+//!    It never calls `input_ff_create()`. So `EV_FF` is never set in the
+//!    device's `evbit`, whatever this device advertises: `EVIOCSFF` fails
+//!    before a game gets an effect id, and an `EV_FF` event written to the
+//!    node is dropped by `is_event_supported()` before it can reach
+//!    `dev->event()` and therefore before it could reach our status queue.
+//!    (Checked against v6.12, which is the pinned bootstrap kernel, and
+//!    against v6.16, v6.17 and master: zero occurrences of `EV_FF` or
+//!    `input_ff` in that file in any of them. The boot acceptance proves it
+//!    from the other end — see `tests/boot/tests/gamepad.rs`, which asserts
+//!    that a real guest kernel never even *asks* this device about `EV_FF`.)
+//!
+//! 2. **The virtio-input spec has nowhere to put an effect.** The only
+//!    driver-to-device channel is the status queue, and it carries
+//!    `struct virtio_input_event` — three fields, eight bytes. A
+//!    `struct ff_effect` is a tagged union of replay timings, an envelope and
+//!    per-type parameters; it cannot be expressed as one 8-byte triple, and
+//!    the spec defines no second channel and no `VIRTIO_INPUT_CFG_FF_BITS`.
+//!    So even a patched guest driver would need a spec extension before it
+//!    could upload anything.
+//!
+//! What this device does instead, and it is the honest maximum: advertise no
+//! `EV_FF` (a capability nothing can use is a lie to whoever reads the
+//! bitmap), *recognise* an `EV_FF` request if one ever arrives on the status
+//! queue, refuse it by name, and count it
+//! ([`crate::EventStats::status_ff`]). An effect id in such a request is a
+//! number the guest invented — this device has issued none — so it is
+//! logged and discarded, never used to index anything host-side.
+//!
+//! **Supported effect types: none. Everything else: refused and counted.**
+//!
+//! Unblocking it needs, in order: a virtio-input spec extension carrying
+//! `ff_effect` uploads and returning ids; a guest driver that implements it;
+//! and only then a host `RumbleSink` behind the usual cfgs
+//! (`XInputSetState` on Windows, `EVIOCSFF` plus a write on Linux). Writing
+//! the third without the first two is unreachable code, so it is not here.
+//! The alternative route real VMMs take — handing the guest the host's USB
+//! device directly — is a different feature with a different threat model.
+//!
 //! # Deadzones and curves
 //!
 //! There are none here, on purpose. The host rescales a source's raw axis

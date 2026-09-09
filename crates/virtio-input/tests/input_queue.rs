@@ -654,6 +654,132 @@ fn status_queue_chains_are_drained_and_acknowledged() {
     assert_eq!(h.event_at(buffer), Some(key(30, 1)));
 }
 
+/// The status queue is the one thing a guest can *write* to this device, so
+/// what it writes is classified and counted — including the one kind that
+/// would matter and cannot happen (GAME-2104 follow-up: rumble).
+#[test]
+fn the_status_queue_classifies_and_counts_what_the_guest_writes() {
+    let mut h = Harness::gamepad();
+    let addr = BUF_BASE + 0x600;
+
+    // Three events in one chain: an LED, an auto-repeat setting, and a play
+    // request for force-feedback effect 7 — an id this device never issued,
+    // because it advertises no EV_FF at all.
+    let events = [
+        InputEvent {
+            event_type: ev::LED,
+            code: 1,
+            value: 1,
+        },
+        InputEvent {
+            event_type: ev::REP,
+            code: 0,
+            value: 250,
+        },
+        InputEvent {
+            event_type: virtio_input::EV_FF,
+            code: 7,
+            value: 1,
+        },
+    ];
+    let mut bytes = Vec::new();
+    for event in events {
+        bytes.extend_from_slice(&event.to_le_bytes());
+    }
+    h.write_mem(addr, &bytes);
+    h.statusq
+        .write_desc(&h.mem, 0, addr, bytes.len() as u32, 0, 0);
+    h.statusq.publish(&h.mem, 0);
+    h.notify(STATUS_QUEUE);
+
+    let stats = h.handle.stats();
+    assert_eq!(stats.status_chains, 1);
+    assert_eq!(stats.status_events, 3, "every event in the chain was read");
+    assert_eq!(stats.status_ff, 1, "the play request was seen and refused");
+    assert_eq!(stats.status_rejected, 0);
+    // Refused means refused: nothing was written back, and the device is fine.
+    assert_eq!(h.statusq.used_elem(&h.mem, 0), (0, 0));
+    assert_eq!(h.transport.status() & status::DEVICE_NEEDS_RESET, 0);
+
+    // …and the classification itself is total, for any triple a guest can
+    // put on the wire.
+    for (event, expected) in [
+        (
+            InputEvent {
+                event_type: virtio_input::EV_FF,
+                code: u16::MAX,
+                value: u32::MAX,
+            },
+            virtio_input::StatusEvent::ForceFeedback {
+                id: u16::MAX,
+                plays: u32::MAX,
+            },
+        ),
+        (
+            InputEvent {
+                event_type: ev::LED,
+                code: 3,
+                value: 0,
+            },
+            virtio_input::StatusEvent::Led { code: 3, on: false },
+        ),
+        (
+            InputEvent {
+                event_type: ev::REP,
+                code: 1,
+                value: 33,
+            },
+            virtio_input::StatusEvent::Repeat { code: 1, value: 33 },
+        ),
+    ] {
+        assert_eq!(virtio_input::StatusEvent::classify(event), expected);
+    }
+    let junk = InputEvent {
+        event_type: u16::MAX,
+        code: u16::MAX,
+        value: u32::MAX,
+    };
+    assert_eq!(
+        virtio_input::StatusEvent::classify(junk),
+        virtio_input::StatusEvent::Other(junk)
+    );
+}
+
+/// A status chain that cannot be read is counted as refused and acked anyway:
+/// a driver must not be able to wedge its own device with a bad address.
+#[test]
+fn an_unreadable_status_chain_is_counted_and_still_acknowledged() {
+    let mut h = Harness::keyboard();
+    // Device-readable, well past the end of guest RAM.
+    h.statusq.write_desc(&h.mem, 0, MEM_SIZE + 0x1000, 64, 0, 0);
+    h.statusq.publish(&h.mem, 0);
+    // …and one whose buffers interleave direction, which is malformed.
+    h.statusq.write_desc(
+        &h.mem,
+        1,
+        BUF_BASE,
+        8,
+        VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT,
+        2,
+    );
+    h.statusq.write_desc(&h.mem, 2, BUF_BASE + 0x40, 8, 0, 0);
+    h.statusq.publish(&h.mem, 1);
+    h.notify(STATUS_QUEUE);
+
+    let stats = h.handle.stats();
+    assert_eq!(stats.status_chains, 2, "both were acknowledged");
+    assert_eq!(stats.status_rejected, 2);
+    assert_eq!(stats.status_events, 0, "nothing was read out of either");
+    assert_eq!(h.statusq.used_elem(&h.mem, 0), (0, 0));
+    assert_eq!(h.statusq.used_elem(&h.mem, 1), (1, 0));
+    assert_eq!(h.transport.status() & status::DEVICE_NEEDS_RESET, 0);
+
+    // The device still works.
+    let buffer = h.offer_buffer();
+    assert_eq!(h.push(&[key(30, 1)]), 1);
+    assert_eq!(h.event_at(buffer), Some(key(30, 1)));
+}
+
 #[test]
 fn many_events_drain_in_one_go() {
     let mut h = Harness::keyboard();

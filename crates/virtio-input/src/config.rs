@@ -225,9 +225,11 @@ pub enum Profile {
     /// makes it unnecessary. The bus stays [`BUS_VIRTUAL`], which is what this
     /// device actually is.
     ///
-    /// Not advertised, each for a reason: `EV_FF` (there is no rumble path
-    /// back to a host pad yet — GAME-2104 follow-up), `BTN_C`/`BTN_Z` (that is
-    /// the six-face-button layout), `BTN_TRIGGER_HAPPY*` (`xpad`'s
+    /// Not advertised, each for a reason: `EV_FF` (Linux's `virtio_input.c`
+    /// never queries it and the spec has no channel to upload an effect
+    /// through, so the bit would be a claim nothing can act on — the whole
+    /// account is on [`crate::gamepad`]), `BTN_C`/`BTN_Z` (that is the
+    /// six-face-button layout), `BTN_TRIGGER_HAPPY*` (`xpad`'s
     /// `dpad_to_buttons` mode, which is off by default) and `INPUT_PROP_*`
     /// (`xpad` sets none either).
     Gamepad,

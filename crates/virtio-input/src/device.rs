@@ -128,7 +128,75 @@ pub struct EventStats {
     pub rejected_buffers: u64,
     /// Status-queue chains drained and acknowledged.
     pub status_chains: u64,
+    /// Events read off the status queue, of every type.
+    pub status_events: u64,
+    /// `EV_FF` events among them — a guest asking for force feedback.
+    ///
+    /// Its own counter because it answers the one open question about rumble
+    /// (see [`crate::gamepad`]): a non-zero value here would mean a guest
+    /// driver found a path to `EV_FF` that Linux's `virtio_input.c` does not
+    /// have, which is exactly the day this device would need one too.
+    pub status_ff: u64,
+    /// Status-queue events refused: a chain that could not be walked, one
+    /// whose buffers interleave direction, or a buffer outside guest RAM.
+    ///
+    /// Counted rather than fatal. The status queue is a *write* path the guest
+    /// controls completely, so everything on it is refused in band: the chain
+    /// still goes back with length 0 and the device stays healthy.
+    pub status_rejected: u64,
 }
+
+/// What one status-queue event asks the device for.
+///
+/// The guest may write any `(type, code, value)` triple it likes here, so this
+/// is a classification of untrusted input and nothing more — no arm of it
+/// indexes anything host-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusEvent {
+    /// `EV_LED`: a keyboard indicator changed. Nothing to do — the host
+    /// window has no lock lights.
+    Led { code: u16, on: bool },
+    /// `EV_REP`: the guest wants a different auto-repeat delay or period. The
+    /// guest's own input core generates repeats, so there is nothing to set.
+    Repeat { code: u16, value: u32 },
+    /// `EV_FF`: play or stop force-feedback effect `id`, `value` times.
+    ///
+    /// Never produced by a Linux guest — see [`crate::gamepad`] on rumble —
+    /// and refused if one ever appears: an effect id the device never issued
+    /// must not be treated as meaningful, let alone used as an index.
+    ForceFeedback { id: u16, plays: u32 },
+    /// Anything else, kept whole rather than discarded so a log line can say
+    /// what arrived.
+    Other(InputEvent),
+}
+
+impl StatusEvent {
+    /// Classifies one wire event. Total: every bit pattern is some arm.
+    pub fn classify(event: InputEvent) -> Self {
+        match event.event_type {
+            crate::ev::LED => StatusEvent::Led {
+                code: event.code,
+                on: event.value != 0,
+            },
+            crate::ev::REP => StatusEvent::Repeat {
+                code: event.code,
+                value: event.value,
+            },
+            EV_FF => StatusEvent::ForceFeedback {
+                id: event.code,
+                plays: event.value,
+            },
+            _ => StatusEvent::Other(event),
+        }
+    }
+}
+
+/// `EV_FF` from `linux/input-event-codes.h`.
+///
+/// Not in [`crate::ev`] because no profile advertises it and none can usefully
+/// do so; it is here because the status queue has to be able to *recognise*
+/// one in order to refuse it by name.
+pub const EV_FF: u16 = 0x15;
 
 /// Resources handed over at `DRIVER_OK`.
 struct Active {
@@ -329,7 +397,7 @@ impl Shared {
             else {
                 break;
             };
-            self.log_status_chain(&mem, desc_table, queue_size, head);
+            self.absorb_status_chain(&mem, desc_table, queue_size, head, stats);
             active
                 .statusq
                 .add_used(mem.as_ref(), head, 0)
@@ -349,12 +417,33 @@ impl Shared {
         Ok(())
     }
 
-    /// Reads what the guest put on the status queue, purely for diagnostics.
-    /// Every failure is swallowed: a malformed status chain is still acked.
-    fn log_status_chain(&self, mem: &GuestMem, desc_table: u64, queue_size: u16, head: u16) {
+    /// Reads and classifies what the guest put on the status queue.
+    ///
+    /// This is the device's only *inbound* path and it is entirely
+    /// guest-shaped: the chain, its direction, its lengths and every byte in
+    /// it. So the rules are the virtqueue rules, applied one more time here:
+    /// the walk is bounded and index-checked by `virtio_core::chain`, every
+    /// read goes through `vm-memory` at an address that is only ever an
+    /// argument to a checked call, the number of events one chain is inspected
+    /// for is capped at [`STATUS_EVENTS_PER_CHAIN`], and nothing that arrives
+    /// is used to index anything. Every failure is counted and swallowed: a
+    /// malformed status chain is still acked, because the alternative is a
+    /// driver being able to wedge its own device.
+    ///
+    /// Nothing here *acts* on an event yet — see [`StatusEvent`] for what
+    /// each kind would mean and why.
+    fn absorb_status_chain(
+        &self,
+        mem: &GuestMem,
+        desc_table: u64,
+        queue_size: u16,
+        head: u16,
+        stats: &mut EventStats,
+    ) {
         let segments = match chain::walk(mem, desc_table, queue_size, head) {
             Ok(segments) => segments,
             Err(error) => {
+                stats.status_rejected = stats.status_rejected.saturating_add(1);
                 tracing::warn!(
                     device = self.profile.name(),
                     head,
@@ -365,6 +454,7 @@ impl Shared {
             }
         };
         let Ok((readable, _writable)) = chain::split_rw(&segments) else {
+            stats.status_rejected = stats.status_rejected.saturating_add(1);
             tracing::warn!(
                 device = self.profile.name(),
                 head,
@@ -380,9 +470,11 @@ impl Shared {
             {
                 let mut raw = [0u8; InputEvent::WIRE_SIZE];
                 let Some(addr) = segment.addr.checked_add(u64::from(offset)) else {
+                    stats.status_rejected = stats.status_rejected.saturating_add(1);
                     return;
                 };
                 if mem.read_slice(&mut raw, GuestAddress(addr)).is_err() {
+                    stats.status_rejected = stats.status_rejected.saturating_add(1);
                     tracing::debug!(
                         device = self.profile.name(),
                         head,
@@ -392,16 +484,52 @@ impl Shared {
                     return;
                 }
                 let event = InputEvent::from_le_bytes(raw);
-                tracing::debug!(
-                    device = self.profile.name(),
-                    event_type = event.event_type,
-                    code = event.code,
-                    value = event.value,
-                    "ignoring virtio-input status event (no LED/REP handling yet)"
-                );
+                stats.status_events = stats.status_events.saturating_add(1);
+                self.absorb_status_event(StatusEvent::classify(event), stats);
                 seen += 1;
                 offset = offset.saturating_add(InputEvent::WIRE_SIZE as u32);
             }
+        }
+    }
+
+    /// What one classified status event does. Today: gets counted and logged.
+    fn absorb_status_event(&self, event: StatusEvent, stats: &mut EventStats) {
+        match event {
+            StatusEvent::ForceFeedback { id, plays } => {
+                stats.status_ff = stats.status_ff.saturating_add(1);
+                // Loud, and once per event, because this cannot happen with
+                // any guest kernel that exists: `virtio_input.c` never sets
+                // `EV_FF` in `evbit`, so the input core drops an `EV_FF` write
+                // before it can reach `dev->event()`. A guest that got one
+                // through is running a driver we have never seen, and the id
+                // is a number it invented — this device has issued none.
+                tracing::warn!(
+                    device = self.profile.name(),
+                    effect = id,
+                    plays,
+                    "guest asked to play a force-feedback effect; this device advertises \
+                     no EV_FF and has issued no effect ids, so the request is refused"
+                );
+            }
+            StatusEvent::Led { code, on } => tracing::debug!(
+                device = self.profile.name(),
+                code,
+                on,
+                "ignoring virtio-input LED update (the host window has no lock lights)"
+            ),
+            StatusEvent::Repeat { code, value } => tracing::debug!(
+                device = self.profile.name(),
+                code,
+                value,
+                "ignoring virtio-input auto-repeat setting (the guest generates repeats)"
+            ),
+            StatusEvent::Other(event) => tracing::debug!(
+                device = self.profile.name(),
+                event_type = event.event_type,
+                code = event.code,
+                value = event.value,
+                "ignoring unrecognised virtio-input status event"
+            ),
         }
     }
 }

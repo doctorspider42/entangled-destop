@@ -35,9 +35,10 @@
 //! Game Bar. The guest device still advertises the button, because SDL's
 //! capability-based auto-mapping expects a complete pad and a controller
 //! plugged into a *Linux* host does deliver it; on Windows it simply never
-//! fires. Rumble (`XInputSetState`) is the other half of this file that does
-//! not exist yet — the guest device advertises no `EV_FF`, so there is nothing
-//! to forward.
+//! fires. Rumble (`XInputSetState`) is not here either, and will not be until
+//! something can ask for it: no guest driver can reach `EV_FF` over
+//! virtio-input and the spec has no channel to upload an effect through — the
+//! full account, and what unblocking it needs, is on [`super`].
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

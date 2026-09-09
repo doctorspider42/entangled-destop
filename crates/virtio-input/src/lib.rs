@@ -55,7 +55,9 @@ pub mod device;
 pub mod gamepad;
 
 pub use config::{DevIds, Profile, Selection};
-pub use device::{BufferError, EventStats, InputDevice, InputHandle, MAX_PENDING_EVENTS};
+pub use device::{
+    BufferError, EventStats, InputDevice, InputHandle, StatusEvent, EV_FF, MAX_PENDING_EVENTS,
+};
 pub use gamepad::{
     open_source, open_sources, GamepadCapture, GamepadError, GamepadSource, PadId, PadRoster,
     PadState, Poll, SourceChoice, SourceFactory, MAX_PLAYERS,
