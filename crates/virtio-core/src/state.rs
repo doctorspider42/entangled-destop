@@ -374,6 +374,18 @@ impl TransportState {
         }
     }
 
+    /// Forgets where region `id` was placed, because the host has taken the
+    /// window back out of the guest's address space (VEN-2001 phase 2).
+    ///
+    /// The counterpart of [`Self::set_shm_base`], and it exists for the
+    /// snapshot: `shm_bases` is what a restore checks the new machine's
+    /// placement against, so a base left behind after the window was unmapped
+    /// would make a perfectly restorable VM refuse — and, worse, would tell a
+    /// reader of the file that a window was mapped when it was not.
+    pub fn clear_shm_base(&mut self, id: u8) {
+        self.shm_bases.retain(|(slot, _)| *slot != id);
+    }
+
     /// Where region `id` was placed, if anywhere.
     pub fn shm_base(&self, id: u8) -> Option<u64> {
         self.shm_bases

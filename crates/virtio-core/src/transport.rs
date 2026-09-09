@@ -198,6 +198,13 @@ impl MmioTransport {
         self.state.set_shm_base(id, base);
     }
 
+    /// Forgets a placement (see [`TransportState::clear_shm_base`]).
+    ///
+    /// [`TransportState`]: crate::state::TransportState
+    pub fn clear_shm_base(&mut self, id: u8) {
+        self.state.clear_shm_base(id);
+    }
+
     // ---------------------------------------------------------------- reads
 
     /// Guest read at `offset` inside the slot.

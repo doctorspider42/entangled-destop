@@ -318,6 +318,164 @@ pub const PCI_MMIO_HOLE_BASE: u64 = MMIO_HOLE_START;
 /// [`VIRTIO_MMIO_BASE`].
 pub const PCI_MMIO_HOLE_SIZE: u64 = VIRTIO_MMIO_BASE - PCI_MMIO_HOLE_BASE;
 
+// ---- the 64-bit MMIO aperture (EPIC 20, VEN-2001) --------------------------
+//
+// Everything above lives below 4 GiB, because everything above is a register
+// file. A virtio **shared-memory region** is not: it is hundreds of megabytes
+// of host RAM the guest maps directly, and it wants a 64-bit prefetchable BAR
+// of its own ([`virtio_core::pci::VIRTIO_PCI_SHM_BAR_INDEX`]). That needs an
+// aperture nothing else claims, and picking one is not a matter of taste —
+// four things are already up there, and a fifth is chosen by the firmware:
+//
+//   * **high RAM.** A guest bigger than the 32-bit hole gets its remainder at
+//     4 GiB, and that region *grows with the guest's memory*
+//     (`vmm_core::create_guest_memory`). A constant above 4 GiB is a constant
+//     that works until someone boots a bigger VM.
+//   * **the pflash window**, `0xffc0_0000..0x1_0000_0000` — below 4 GiB, so it
+//     bounds this from underneath along with the whole 32-bit MMIO hole,
+//     the LAPIC and the IOAPIC.
+//   * **`Pci64Base`, which EDK2 chooses for itself.** Measured on this
+//     project's pinned CloudHv build with a 4096 MiB guest:
+//     `PlatformGetFirstNonAddressCB: FirstNonAddress=0x140000000` and
+//     `AddressWidthInitialization: Pci64Base=0x140000000
+//     Pci64Size=0x3FFEC0000000`. So the firmware's 64-bit aperture starts at
+//     **exactly** the top of RAM — no page of slack, whatever the vm-testing
+//     skill's prose says — and runs to 2^46, the guest's physical address
+//     width. `PciBusDxe` then reassigns every BAR, and a 64-bit *prefetchable*
+//     one lands in that aperture, aligned up from its base to the BAR's own
+//     size.
+//
+// Hence the rule this machine follows: **our aperture is the firmware's.**
+// [`pci_mmio64_base`] returns the same number EDK2 computes, so the host's
+// initial assignment, the firmware's reassignment and the DSDT `_CRS` all
+// describe one window, and a BAR that moves during enumeration moves *inside*
+// a range the host already decodes. The alternative — a fixed high address —
+// was rejected precisely because the firmware would move the BAR out of it:
+// EDK2 allocates from `Pci64Base` upwards, and `Pci64Base` follows RAM.
+//
+// The aperture is deliberately larger than what it holds (16 GiB for one
+// 256 MiB window today), for the same reason the 32-bit one is: it has to
+// cover everywhere a firmware may legitimately re-align a BAR to.
+//
+// It is *not* as large as the firmware's own — EDK2 publishes
+// `Pci64Size=0x3FFEC0000000`, everything up to 2^46, and `PciBusDxe` allocates
+// out of that rather than out of the DSDT `_CRS` this machine writes. So the
+// two are not the same range, and the one that decides whether a window is
+// mapped is ours: a BAR the firmware placed past [`pci_mmio64_end`] is refused
+// by `crate::shm::ShmWindow::follow` and the guest gets no `resource2`. Hence
+// the sizing rule below, which is arithmetic rather than a round number.
+
+/// Largest single shared-memory BAR this machine will place: 1 GiB.
+///
+/// A BAR is naturally aligned to its own size, so this also bounds how far
+/// into the aperture the first allocation can be pushed by alignment.
+pub const MAX_SHM_BAR_BYTES: u64 = 1 << 30;
+
+/// Size of the 64-bit MMIO aperture starting at [`pci_mmio64_base`]: 16 GiB.
+///
+/// A power of two, so the `_CRS` window is one clean descriptor, but checked
+/// against the budget it claims to cover rather than picked to look tidy: the
+/// worst case a *naturally aligned* bump allocator can reach is one
+/// [`MAX_SHM_BAR_BYTES`] window per [`PCI_MMIO_SLOTS`] function, plus one more
+/// window's worth of alignment gap ahead of the first. Nothing but
+/// shared-memory regions is allocated from it.
+///
+/// A 4 GiB constant sat here first, under a comment making exactly this claim,
+/// and was wrong on its own terms — eight 1 GiB windows do not fit in 4 GiB.
+/// Nothing hit it, because one device declares a region today, which is
+/// precisely the kind of bug that waits for the day a second one does.
+pub const PCI_MMIO64_SIZE: u64 = 16 << 30;
+
+const _: () = assert!(
+    PCI_MMIO64_SIZE >= (PCI_MMIO_SLOTS + 1) * MAX_SHM_BAR_BYTES,
+    "the 64-bit aperture must hold one maximum-sized window per PCI slot, plus      the alignment gap the first one can be pushed by"
+);
+
+/// One past the last byte of guest RAM, for a guest of `mem_bytes`.
+///
+/// The same split `vmm_core::create_guest_memory` makes and `crate::e820_map`
+/// publishes: low RAM up to [`MMIO_HOLE_START`], the remainder at 4 GiB. A
+/// guest that fits below the hole still ends at 4 GiB as far as the address
+/// space is concerned, because the hole is not RAM and nothing may be placed
+/// inside it.
+pub const fn top_of_ram(mem_bytes: u64) -> u64 {
+    if mem_bytes > MMIO_HOLE_START {
+        TOP_OF_32BIT + (mem_bytes - MMIO_HOLE_START)
+    } else {
+        TOP_OF_32BIT
+    }
+}
+
+/// Base of the 64-bit MMIO aperture for a guest of `mem_bytes`: the top of its
+/// RAM, which is exactly what EDK2 publishes as `Pci64Base`.
+///
+/// Page aligned by construction — `mem_bytes` is a whole number of MiB and
+/// both boundaries it is measured against are 1 MiB aligned.
+pub const fn pci_mmio64_base(mem_bytes: u64) -> u64 {
+    top_of_ram(mem_bytes)
+}
+
+/// One past the end of the 64-bit MMIO aperture for a guest of `mem_bytes`.
+pub const fn pci_mmio64_end(mem_bytes: u64) -> u64 {
+    pci_mmio64_base(mem_bytes) + PCI_MMIO64_SIZE
+}
+
+/// The same base, derived from the *last address* of a guest-memory object
+/// rather than from a configured size.
+///
+/// Same number by construction (`the_two_aperture_spellings_agree` proves it
+/// across every size), and it exists because half the machine has the
+/// `GuestMem` in hand and not the MiB figure — `crate::acpi::write` above all,
+/// whose seventeen callers would otherwise each have to be taught a number
+/// they do not currently hold.
+pub const fn pci_mmio64_base_above(last_addr: u64) -> u64 {
+    let top = last_addr.saturating_add(1);
+    if top > TOP_OF_32BIT {
+        top
+    } else {
+        TOP_OF_32BIT
+    }
+}
+
+/// Bump allocator for naturally aligned windows inside the 64-bit aperture.
+///
+/// Not a fixed slot table like [`pci_bar_slot`]: a shared-memory BAR's size is
+/// the device's business (it is the renderer's window length rounded up to a
+/// power of two), and a PCI memory BAR must be aligned to *its own* size. A
+/// table of equal slots would either waste the aperture or misalign a big
+/// window; a bump allocator does neither, and it is three lines.
+#[derive(Debug, Clone, Copy)]
+pub struct Mmio64Allocator {
+    next: u64,
+    end: u64,
+}
+
+impl Mmio64Allocator {
+    /// An allocator over the whole aperture of a guest with `mem_bytes` of RAM.
+    pub const fn for_guest(mem_bytes: u64) -> Self {
+        Self {
+            next: pci_mmio64_base(mem_bytes),
+            end: pci_mmio64_end(mem_bytes),
+        }
+    }
+
+    /// Reserves `size` bytes, aligned to `size`. `None` when the aperture is
+    /// full or `size` is not a usable BAR size — both host configuration
+    /// errors, never anything a guest can provoke.
+    pub fn allocate(&mut self, size: u64) -> Option<u64> {
+        if size == 0 || !size.is_power_of_two() || size > MAX_SHM_BAR_BYTES {
+            return None;
+        }
+        let base = self.next.checked_add(size - 1)? / size * size;
+        let end = base.checked_add(size)?;
+        if end > self.end {
+            return None;
+        }
+        self.next = end;
+        Some(base)
+    }
+}
+
 /// Base of the virtio-mmio device window region.
 pub const VIRTIO_MMIO_BASE: u64 = 0xd000_0000;
 
@@ -371,4 +529,147 @@ pub const fn virtio_irq(n: usize) -> Option<u32> {
 /// Returns the guest physical base address of virtio-mmio slot `n`.
 pub const fn virtio_mmio_slot(n: u64) -> u64 {
     VIRTIO_MMIO_BASE + n * VIRTIO_MMIO_SLOT_SIZE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+    /// The largest guest `control_api::MAX_MEMORY_MIB` allows. Restated rather
+    /// than imported: `machine-x86` does not depend on the config crate, and
+    /// the point of the sweep below is that the aperture is correct for every
+    /// size a user can ask for.
+    const MAX_GUEST_MIB: u64 = 65536;
+
+    /// The measurement this whole placement rests on
+    /// (`tests/boot/tests/uefi_highmem.rs`, and the log line quoted above):
+    /// EDK2's `Pci64Base` for a 4096 MiB guest is `0x1_4000_0000`.
+    #[test]
+    fn the_aperture_starts_where_edk2_puts_pci64base() {
+        assert_eq!(pci_mmio64_base(4096 * MIB), 0x1_4000_0000);
+        // A guest that fits below the hole has no high RAM at all, and both we
+        // and the firmware call the top of its address space 4 GiB.
+        assert_eq!(pci_mmio64_base(2048 * MIB), TOP_OF_32BIT);
+        assert_eq!(pci_mmio64_base(MMIO_HOLE_START), TOP_OF_32BIT);
+    }
+
+    /// The trap this constant exists to avoid: the aperture must clear RAM,
+    /// the 32-bit hole, pflash and the reset vector for **every** guest size,
+    /// not just the one someone tested with.
+    #[test]
+    fn the_aperture_never_overlaps_ram_or_anything_below_4_gib() {
+        for mib in [
+            1u64,
+            512,
+            2048,
+            3072,
+            3073,
+            4096,
+            8192,
+            16384,
+            MAX_GUEST_MIB,
+        ] {
+            let bytes = mib * MIB;
+            let base = pci_mmio64_base(bytes);
+            let top = top_of_ram(bytes);
+            assert!(
+                base >= top,
+                "{mib} MiB: aperture {base:#x} overlaps RAM ending {top:#x}"
+            );
+            assert!(
+                base >= TOP_OF_32BIT,
+                "{mib} MiB: aperture {base:#x} is below 4 GiB"
+            );
+            assert!(
+                base >= PFLASH_BASE + PFLASH_WINDOW_SIZE,
+                "{mib} MiB: aperture hits pflash"
+            );
+            assert!(
+                base > u64::from(u32::MAX),
+                "{mib} MiB: aperture is 32-bit addressable"
+            );
+            assert_eq!(
+                base % 0x1000,
+                0,
+                "{mib} MiB: aperture base is not page aligned"
+            );
+            // …and the whole aperture stays inside the 2^46 physical address
+            // width the firmware reports (`Pci64Size=0x3FFEC0000000`).
+            assert!(
+                pci_mmio64_end(bytes) < 1u64 << 46,
+                "{mib} MiB: aperture past 2^46"
+            );
+        }
+    }
+
+    /// A BAR is only decoded where it is naturally aligned, and the allocator
+    /// is the only thing that guarantees that for a window whose size is not
+    /// the aperture's alignment.
+    /// The two ways of asking for the aperture must never disagree: one is
+    /// what the PCI bus places BARs in, the other is what the DSDT publishes,
+    /// and a guest whose `_CRS` does not contain its own BAR does not get a
+    /// device.
+    #[test]
+    fn the_two_aperture_spellings_agree() {
+        for mib in [1u64, 512, 3071, 3072, 3073, 4096, 8192, MAX_GUEST_MIB] {
+            let bytes = mib * MIB;
+            let last = top_of_ram(bytes) - 1;
+            // For a guest below the hole the memory object's last address is
+            // `mem_bytes - 1`, not `top_of_ram - 1`; both must give 4 GiB.
+            let last_small = bytes - 1;
+            assert_eq!(
+                pci_mmio64_base_above(last),
+                pci_mmio64_base(bytes),
+                "{mib} MiB"
+            );
+            if bytes <= MMIO_HOLE_START {
+                assert_eq!(
+                    pci_mmio64_base_above(last_small),
+                    pci_mmio64_base(bytes),
+                    "{mib} MiB"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_allocator_aligns_every_window_to_its_own_size() {
+        // 3073 MiB puts the top of RAM at 4 GiB + 1 MiB, which is page aligned
+        // and nothing else — exactly the case a fixed slot table gets wrong.
+        let bytes = 3073 * MIB;
+        assert_eq!(pci_mmio64_base(bytes), TOP_OF_32BIT + MIB);
+        let mut alloc = Mmio64Allocator::for_guest(bytes);
+        let first = alloc.allocate(256 << 20).expect("256 MiB window");
+        assert_eq!(first % (256 << 20), 0, "{first:#x} is not 256 MiB aligned");
+        assert!(first >= pci_mmio64_base(bytes));
+        let second = alloc.allocate(1 << 30).expect("1 GiB window");
+        assert_eq!(second % (1 << 30), 0);
+        assert!(second >= first + (256 << 20), "windows must not overlap");
+        assert!(second + (1 << 30) <= pci_mmio64_end(bytes));
+    }
+
+    #[test]
+    fn the_allocator_refuses_bad_sizes_and_a_full_aperture() {
+        let mut alloc = Mmio64Allocator::for_guest(2048 * MIB);
+        assert!(alloc.allocate(0).is_none());
+        assert!(alloc.allocate(3 << 20).is_none(), "not a power of two");
+        assert!(
+            alloc.allocate(MAX_SHM_BAR_BYTES * 2).is_none(),
+            "past the cap"
+        );
+        // Derived from the aperture rather than written out, so this test says
+        // "it holds exactly what it claims to" and not "it holds four", and
+        // stays true when either constant moves.
+        let capacity = PCI_MMIO64_SIZE / MAX_SHM_BAR_BYTES;
+        assert!(
+            capacity > PCI_MMIO_SLOTS,
+            "the aperture must hold one maximum window per slot plus an \
+             alignment gap; it holds {capacity}"
+        );
+        for _ in 0..capacity {
+            alloc.allocate(MAX_SHM_BAR_BYTES).expect("fits");
+        }
+        assert!(alloc.allocate(MAX_SHM_BAR_BYTES).is_none(), "aperture full");
+    }
 }

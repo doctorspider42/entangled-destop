@@ -28,7 +28,16 @@
 //! * **no two live mappings overlap**, re-derived from scratch after every
 //!   operation — the invariant that stops one guest mapping aliasing another's
 //!   host memory;
-//! * every live mapping lies entirely inside the window.
+//! * every live mapping lies entirely inside the window;
+//! * **a span handed back by `reserve_mapping` is zeroed** (VEN-2001 phase 2).
+//!   Since the window has real host memory behind it, a guest that maps a blob
+//!   where another blob used to be must not find the other blob's bytes. The
+//!   harness scribbles a canary over the whole window before every operation
+//!   and then reads every live mapping back, so the property is checked against
+//!   memory rather than against the bookkeeping that is supposed to maintain it;
+//! * every host-side access through the backing is bounded — the fuzzer aims
+//!   arbitrary `(offset, len)` pairs at it directly, including ones that would
+//!   wrap in `u64`.
 
 #![no_main]
 
@@ -45,7 +54,91 @@ use virtio_gpu::protocol::{
 
 /// Window sizes the fuzzer picks between: none, one page, and something with
 /// room for a few blobs.
+///
+/// The last one is deliberately *not* backed by real memory: a gigabyte of
+/// host RAM per fuzz case would make the campaign about the allocator instead
+/// of about the bounds. Everything below `MAX_BACKED_BYTES` gets real pages.
 const WINDOWS: [u64; 4] = [0, BLOB_PAGE_SIZE, 64 * BLOB_PAGE_SIZE, 1 << 30];
+
+/// Largest window this target puts real host memory behind.
+const MAX_BACKED_BYTES: u64 = 64 * BLOB_PAGE_SIZE;
+
+/// The byte the harness scribbles over the whole window before each operation,
+/// so a span that comes back *not* zeroed is a leak of a previous mapping.
+const CANARY: u8 = 0xa5;
+
+/// Host memory behind the window, the same shape `machine_x86::shm` supplies
+/// but without a hypervisor: a plain buffer, every access bounded in `u64`
+/// before it becomes an index.
+struct FuzzBacking {
+    bytes: std::sync::Mutex<Vec<u8>>,
+}
+
+impl FuzzBacking {
+    fn new(len: u64) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            bytes: std::sync::Mutex::new(vec![0u8; len as usize]),
+        })
+    }
+
+    /// `[offset, offset + len)` as a `usize` range, or `None` when it leaves
+    /// the buffer. The whole point of the type: no arithmetic on a
+    /// guest-derived offset happens anywhere else.
+    fn range(&self, len_total: usize, offset: u64, len: u64) -> Option<(usize, usize)> {
+        let end = offset.checked_add(len)?;
+        if end > len_total as u64 {
+            return None;
+        }
+        Some((usize::try_from(offset).ok()?, usize::try_from(end).ok()?))
+    }
+}
+
+impl virtio_core::ShmBacking for FuzzBacking {
+    fn len(&self) -> u64 {
+        self.bytes.lock().unwrap().len() as u64
+    }
+
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), virtio_core::ShmAccessError> {
+        let bytes = self.bytes.lock().unwrap();
+        let (start, end) = self
+            .range(bytes.len(), offset, buf.len() as u64)
+            .ok_or(virtio_core::ShmAccessError {
+                offset,
+                len: buf.len() as u64,
+                window: bytes.len() as u64,
+            })?;
+        buf.copy_from_slice(&bytes[start..end]);
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), virtio_core::ShmAccessError> {
+        let mut bytes = self.bytes.lock().unwrap();
+        let total = bytes.len();
+        let (start, end) =
+            self.range(total, offset, data.len() as u64)
+                .ok_or(virtio_core::ShmAccessError {
+                    offset,
+                    len: data.len() as u64,
+                    window: total as u64,
+                })?;
+        bytes[start..end].copy_from_slice(data);
+        Ok(())
+    }
+
+    fn fill(&self, offset: u64, len: u64, byte: u8) -> Result<(), virtio_core::ShmAccessError> {
+        let mut bytes = self.bytes.lock().unwrap();
+        let total = bytes.len();
+        let (start, end) = self
+            .range(total, offset, len)
+            .ok_or(virtio_core::ShmAccessError {
+                offset,
+                len,
+                window: total as u64,
+            })?;
+        bytes[start..end].fill(byte);
+        Ok(())
+    }
+}
 
 #[derive(Debug, Arbitrary)]
 enum Op {
@@ -98,6 +191,9 @@ struct Case {
     ops: Vec<Op>,
     /// Direct window reservations, unmediated by the table.
     reservations: Vec<(u32, u64, u64)>,
+    /// Host-side accesses aimed straight at the window's backing, so the
+    /// bounds are fuzzed without a device in the way.
+    accesses: Vec<(u64, u16, bool)>,
 }
 
 /// Recomputes the overlap invariant from the outside, so a bug in the window's
@@ -139,13 +235,57 @@ fuzz_target!(|case: Case| {
 
     // ---- layer 2: the window on its own.
     let window_len = WINDOWS[usize::from(case.window) % WINDOWS.len()];
+    let backed = window_len != 0 && window_len <= MAX_BACKED_BYTES;
     let mut window = HostVisibleWindow::new(window_len);
+    let bare_backing = backed.then(|| FuzzBacking::new(window_len));
+    if let Some(backing) = &bare_backing {
+        assert!(
+            window.set_backing(backing.clone()),
+            "a backing of exactly the declared length must be accepted"
+        );
+        assert!(window.is_backed());
+    }
+    // A backing of the wrong length must be refused outright: the declared
+    // length is what every guest offset is checked against.
+    let mut mismatched = HostVisibleWindow::new(BLOB_PAGE_SIZE);
+    assert!(!mismatched.set_backing(FuzzBacking::new(2 * BLOB_PAGE_SIZE)));
+    assert!(!mismatched.is_backed());
+
     let mut live: Vec<(u64, u64)> = Vec::new();
     for (id, offset, size) in case.reservations.into_iter().take(64) {
         if window.reserve(id, offset, size).is_ok() {
             live.push((offset, size));
         }
         assert_no_overlaps(&window, &live);
+        // Clearing a span is the one host write the device makes on a guest's
+        // behalf; it must be bounded exactly like the reservation was.
+        let cleared = window.clear_span(offset, size).is_ok();
+        if backed && size > 0 {
+            let fits = offset.checked_add(size).is_some_and(|end| end <= window_len);
+            assert_eq!(cleared, fits, "clear_span disagreed with the window bounds");
+        }
+    }
+
+    // Host-side accesses straight at the backing, with arbitrary offsets.
+    if let Some(backing) = &bare_backing {
+        use virtio_core::ShmBacking as _;
+        for (offset, len, write) in case.accesses.iter().copied().take(64) {
+            let len = u64::from(len);
+            let inside = offset.checked_add(len).is_some_and(|end| end <= window_len);
+            let mut buf = vec![0u8; len as usize];
+            let result = if write {
+                backing.write(offset, &buf)
+            } else {
+                backing.read(offset, &mut buf)
+            };
+            assert_eq!(
+                result.is_ok(),
+                inside,
+                "a {}-byte access at {offset:#x} of a {window_len}-byte window",
+                len
+            );
+            assert_eq!(backing.fill(offset, len, 0).is_ok(), inside);
+        }
     }
 
     // ---- layers 3 and 4: the table, with the renderer's support fuzzed.
@@ -155,6 +295,10 @@ fuzz_target!(|case: Case| {
         host_visible_bytes: (window_len != 0).then_some(window_len),
     };
     let mut table = BlobTable::new(window_len);
+    let table_backing = backed.then(|| FuzzBacking::new(window_len));
+    if let Some(backing) = &table_backing {
+        assert!(table.window_mut().set_backing(backing.clone()));
+    }
     // (resource_id, size) of every blob the table accepted, so the harness can
     // recompute the window invariant without reaching inside it.
     let mut sizes: Vec<(u32, u64)> = Vec::new();
@@ -174,6 +318,17 @@ fuzz_target!(|case: Case| {
     };
 
     for op in case.ops.into_iter().take(64) {
+        // Poison every byte the guest could reach *before* the operation. A
+        // mapping created below must come back zeroed anyway; anything else
+        // means a span reached a guest with the previous owner's bytes in it.
+        if let Some(backing) = &table_backing {
+            use virtio_core::ShmBacking as _;
+            backing.fill(0, window_len, CANARY).expect("the whole window");
+        }
+        // The span this operation created, if it created one. Only *that* span
+        // is guaranteed zero: the poison above lands on every other live
+        // mapping too, and those were cleared in an earlier iteration.
+        let mut created: Option<(u64, u64)> = None;
         match op {
             Op::Create {
                 resource_id,
@@ -235,6 +390,7 @@ fuzz_target!(|case: Case| {
                 if let Ok(size) = table.reserve_mapping(resource_id, offset) {
                     table.commit_mapping(resource_id, offset);
                     mapped.push((resource_id, offset, size));
+                    created = Some((offset, size));
                 }
             }
             Op::MapAligned { resource_id, page } => {
@@ -243,6 +399,7 @@ fuzz_target!(|case: Case| {
                 if let Ok(size) = table.reserve_mapping(id, offset) {
                     table.commit_mapping(id, offset);
                     mapped.push((id, offset, size));
+                    created = Some((offset, size));
                 }
             }
             Op::Unmap { resource_id } => {
@@ -282,6 +439,46 @@ fuzz_target!(|case: Case| {
         );
         let spans: Vec<(u64, u64)> = mapped.iter().map(|(_, at, len)| (*at, *len)).collect();
         assert_no_overlaps(table.window(), &spans);
+        // A span this operation created must be all zeroes: `reserve_mapping`
+        // clears before it returns, and the canary written at the top of the
+        // iteration is what makes "still zero" mean something. Both ends of the
+        // span are read, because an off-by-one in the clear would show at
+        // exactly one of them.
+        if let (Some(backing), Some((at, len))) = (&table_backing, created) {
+            use virtio_core::ShmBacking as _;
+            let window = usize::try_from(len.min(4 * BLOB_PAGE_SIZE)).unwrap();
+            let mut head = vec![CANARY; window];
+            backing
+                .read(at, &mut head)
+                .expect("a live mapping is inside the window");
+            let mut tail = vec![CANARY; window];
+            backing
+                .read(at + len - window as u64, &mut tail)
+                .expect("a live mapping is inside the window");
+            assert!(
+                head.iter().chain(tail.iter()).all(|b| *b == 0),
+                "mapping {at:#x}+{len} was handed to the guest without being cleared"
+            );
+            // …and nothing outside it: clearing more than was asked for would
+            // wipe a neighbouring mapping's bytes under a guest that is using
+            // them.
+            if at > 0 {
+                let mut before = [0u8; 1];
+                backing.read(at - 1, &mut before).expect("in the window");
+                assert_eq!(
+                    before[0], CANARY,
+                    "the clear ran past the start of {at:#x}+{len}"
+                );
+            }
+            if at + len < window_len {
+                let mut after = [0u8; 1];
+                backing.read(at + len, &mut after).expect("in the window");
+                assert_eq!(
+                    after[0], CANARY,
+                    "the clear ran past the end of {at:#x}+{len}"
+                );
+            }
+        }
         for (id, at, _) in &mapped {
             assert_eq!(
                 table.window().resource_at(*at),

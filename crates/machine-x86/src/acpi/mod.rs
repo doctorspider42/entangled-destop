@@ -131,18 +131,24 @@ fn align_up(value: u64, alignment: u64) -> u64 {
 impl AcpiTables {
     /// Builds the whole table set for `vcpu_count` processors, laid out to be
     /// written at [`layout::ACPI_TABLES_START`].
-    pub fn new(vcpu_count: u32) -> Result<Self, AcpiError> {
+    pub fn new(vcpu_count: u32, mmio64_base: u64) -> Result<Self, AcpiError> {
         Self::at(
             layout::ACPI_TABLES_START,
             layout::ACPI_TABLES_SIZE,
             vcpu_count,
+            mmio64_base,
         )
     }
 
     /// Builds the table set for an arbitrary base and region size. Exists so the
     /// tests can prove the region check fires without pretending the machine's
     /// layout is different.
-    pub fn at(base: u64, region_size: u64, vcpu_count: u32) -> Result<Self, AcpiError> {
+    pub fn at(
+        base: u64,
+        region_size: u64,
+        vcpu_count: u32,
+        mmio64_base: u64,
+    ) -> Result<Self, AcpiError> {
         if vcpu_count == 0 || vcpu_count > MAX_ACPI_CPUS {
             return Err(AcpiError::TooManyCpus(vcpu_count));
         }
@@ -150,7 +156,7 @@ impl AcpiTables {
         // Leaf tables first: their sizes decide where the tables that point at
         // them can go.
         let madt_bytes = madt(vcpu_count);
-        let dsdt_bytes = dsdt(vcpu_count);
+        let dsdt_bytes = dsdt(vcpu_count, mmio64_base);
         let facs_bytes = facs();
 
         let rsdp_at = base;
@@ -516,7 +522,7 @@ const S5_SLP_TYP: u64 = pm::SLP_TYP_S5 as u64;
 /// * `\_SB.Cnnn` — one `ACPI0007` processor device per vCPU, `_UID` matching the
 ///   MADT's ACPI processor UID, which is how Linux pairs a CPU with its ACPI
 ///   object.
-fn dsdt(vcpu_count: u32) -> Vec<u8> {
+fn dsdt(vcpu_count: u32, mmio64_base: u64) -> Vec<u8> {
     let mut body = aml::name_path(
         &aml::root_name("_S5"),
         &aml::package(&[
@@ -541,6 +547,10 @@ fn dsdt(vcpu_count: u32) -> Vec<u8> {
                 layout::PCI_MMIO_HOLE_BASE as u32,
                 layout::PCI_MMIO_HOLE_SIZE as u32,
             ),
+            // The 64-bit aperture (EPIC 20): where a shared-memory BAR lives.
+            // Prefetchable, because the BAR is, and Linux refuses to claim a
+            // prefetchable BAR inside a window that is not.
+            aml::qword_memory(mmio64_base, layout::PCI_MMIO64_SIZE, true),
         ]),
     ));
     sb.extend_from_slice(&aml::device("PCI0", &pci0));
@@ -574,9 +584,13 @@ fn cpu_name(cpu: u32) -> String {
 /// leaves a zeroed region there, the RSDP signature check fails and the guest
 /// falls back to the MP table instead of reading garbage.
 pub fn write<M: vm_memory::GuestMemory>(mem: &M, vcpu_count: u32) -> Result<u64, AcpiError> {
-    use vm_memory::{Bytes, GuestAddress};
+    use vm_memory::{Address, Bytes, GuestAddress};
 
-    let tables = AcpiTables::new(vcpu_count)?;
+    // The 64-bit aperture starts at the top of RAM, which the memory object
+    // already knows — so this stays a two-argument call for all seventeen of
+    // its callers instead of threading a size through every one of them.
+    let mmio64_base = layout::pci_mmio64_base_above(mem.last_addr().raw_value());
+    let tables = AcpiTables::new(vcpu_count, mmio64_base)?;
     mem.write_slice(tables.blob(), GuestAddress(tables.base_address()))
         .map_err(|e| AcpiError::GuestMemory(e.to_string()))?;
     tracing::info!(
@@ -585,6 +599,7 @@ pub fn write<M: vm_memory::GuestMemory>(mem: &M, vcpu_count: u32) -> Result<u64,
         fadt = format_args!("{:#x}", tables.fadt_address()),
         madt = format_args!("{:#x}", tables.madt_address()),
         dsdt = format_args!("{:#x}", tables.dsdt_address()),
+        mmio64 = format_args!("{mmio64_base:#x}"),
         bytes = tables.blob().len(),
         vcpus = vcpu_count,
         "published ACPI tables"
@@ -595,6 +610,11 @@ pub fn write<M: vm_memory::GuestMemory>(mem: &M, vcpu_count: u32) -> Result<u64,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 64-bit aperture base of a guest small enough to have no high RAM —
+    /// 4 GiB, which is what `pci_mmio64_base` returns for every guest below the
+    /// 32-bit hole and what these tables are built for.
+    const TEST_MMIO64_BASE: u64 = layout::TOP_OF_32BIT;
 
     fn u16_at(bytes: &[u8], at: usize) -> u16 {
         u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap())
@@ -628,7 +648,7 @@ mod tests {
 
     #[test]
     fn rsdp_is_valid_and_points_at_the_xsdt() {
-        let tables = AcpiTables::new(2).unwrap();
+        let tables = AcpiTables::new(2, TEST_MMIO64_BASE).unwrap();
         let rsdp = tables.table_at(tables.rsdp_address(), RSDP_LEN).unwrap();
         assert_eq!(&rsdp[..8], b"RSD PTR ");
         assert_eq!(rsdp[15], 2, "revision 2 = XSDT-based");
@@ -649,7 +669,7 @@ mod tests {
 
     #[test]
     fn xsdt_lists_the_fadt_and_madt_only() {
-        let tables = AcpiTables::new(4).unwrap();
+        let tables = AcpiTables::new(4, TEST_MMIO64_BASE).unwrap();
         let xsdt = tables
             .table_at(tables.xsdt_address(), SDT_HEADER_LEN + 16)
             .unwrap();
@@ -668,7 +688,7 @@ mod tests {
 
     #[test]
     fn fadt_describes_the_pm_block_and_the_dsdt() {
-        let tables = AcpiTables::new(1).unwrap();
+        let tables = AcpiTables::new(1, TEST_MMIO64_BASE).unwrap();
         let fadt = tables.table_at(tables.fadt_address(), FADT_LEN).unwrap();
         assert_valid_sdt(fadt, b"FACP", 6);
         assert_eq!(fadt.len(), 276);
@@ -721,7 +741,7 @@ mod tests {
     /// or ACPICA prints "32/64X address mismatch in FADT" and overrides one.
     #[test]
     fn fadt_extended_blocks_agree_with_the_legacy_ones() {
-        let tables = AcpiTables::new(1).unwrap();
+        let tables = AcpiTables::new(1, TEST_MMIO64_BASE).unwrap();
         let fadt = tables.table_at(tables.fadt_address(), FADT_LEN).unwrap();
         for (legacy, extended, len_at) in [
             (56usize, 148usize, 88usize),
@@ -751,7 +771,7 @@ mod tests {
 
     #[test]
     fn facs_is_a_64_byte_aligned_signed_structure() {
-        let tables = AcpiTables::new(1).unwrap();
+        let tables = AcpiTables::new(1, TEST_MMIO64_BASE).unwrap();
         assert_eq!(tables.facs_address() % 64, 0, "ACPI 6.5 §5.2.10");
         let facs = tables.table_at(tables.facs_address(), FACS_LEN).unwrap();
         assert_eq!(&facs[..4], b"FACS");
@@ -762,7 +782,7 @@ mod tests {
     #[test]
     fn madt_matches_the_mp_table_topology() {
         for cpus in [1u32, 2, 4, 16] {
-            let tables = AcpiTables::new(cpus).unwrap();
+            let tables = AcpiTables::new(cpus, TEST_MMIO64_BASE).unwrap();
             let len = u32_at(
                 tables
                     .table_at(tables.madt_address(), SDT_HEADER_LEN)
@@ -854,7 +874,7 @@ mod tests {
 
     #[test]
     fn dsdt_carries_a_real_s5_package_and_a_pci_root_bridge() {
-        let tables = AcpiTables::new(2).unwrap();
+        let tables = AcpiTables::new(2, TEST_MMIO64_BASE).unwrap();
         let len = u32_at(
             tables
                 .table_at(tables.dsdt_address(), SDT_HEADER_LEN)
@@ -898,7 +918,7 @@ mod tests {
     /// Linux refuses the platform devices' memory regions.
     #[test]
     fn dsdt_pci_window_stops_below_the_virtio_slots() {
-        let tables = AcpiTables::new(1).unwrap();
+        let tables = AcpiTables::new(1, TEST_MMIO64_BASE).unwrap();
         let len = u32_at(
             tables
                 .table_at(tables.dsdt_address(), SDT_HEADER_LEN)
@@ -917,9 +937,49 @@ mod tests {
         );
     }
 
+    /// The 64-bit aperture the shared-memory BAR lives in has to be in the
+    /// same `_CRS`, above RAM, and prefetchable — the three things that decide
+    /// whether the guest claims BAR 2 or throws it away (EPIC 20, VEN-2001).
+    #[test]
+    fn dsdt_publishes_the_prefetchable_64_bit_aperture() {
+        // A 4096 MiB guest, whose aperture the firmware puts at 0x1_4000_0000.
+        let base = layout::pci_mmio64_base(4096 << 20);
+        assert_eq!(base, 0x1_4000_0000);
+        let tables = AcpiTables::new(1, base).unwrap();
+        let len = u32_at(
+            tables
+                .table_at(tables.dsdt_address(), SDT_HEADER_LEN)
+                .unwrap(),
+            4,
+        ) as usize;
+        let dsdt = tables.table_at(tables.dsdt_address(), len).unwrap();
+        // QWordMemory: tag 0x8a, payload length 0x2b, resource type 0 (memory).
+        let at = find(dsdt, &[0x8a, 0x2b, 0x00, 0x00]).expect("no QWordMemory in _CRS");
+        assert_eq!(dsdt[at + 5] & 0x01, 0x01, "the window must be writable");
+        assert_eq!(
+            (dsdt[at + 5] >> 1) & 0x03,
+            3,
+            "the window must be prefetchable, or Linux will not claim a              prefetchable BAR inside it"
+        );
+        let min = u64_at(dsdt, at + 14);
+        let max = u64_at(dsdt, at + 22);
+        let length = u64_at(dsdt, at + 38);
+        assert_eq!(min, base);
+        assert_eq!(length, layout::PCI_MMIO64_SIZE);
+        assert_eq!(max, base + length - 1);
+        assert!(
+            min >= layout::TOP_OF_32BIT,
+            "the aperture must be above 4 GiB"
+        );
+        assert!(
+            min > u64::from(layout::PCI_MMIO_HOLE_BASE as u32) + layout::PCI_MMIO_HOLE_SIZE,
+            "the two apertures must not overlap"
+        );
+    }
+
     #[test]
     fn tables_fit_the_reserved_region_even_at_the_cpu_limit() {
-        let tables = AcpiTables::new(MAX_ACPI_CPUS).unwrap();
+        let tables = AcpiTables::new(MAX_ACPI_CPUS, TEST_MMIO64_BASE).unwrap();
         assert!(
             tables.blob().len() as u64 <= layout::ACPI_TABLES_SIZE,
             "{} bytes for {MAX_ACPI_CPUS} CPUs",
@@ -934,13 +994,16 @@ mod tests {
 
     #[test]
     fn rejects_zero_and_too_many_cpus_and_a_region_that_is_too_small() {
-        assert!(matches!(AcpiTables::new(0), Err(AcpiError::TooManyCpus(0))));
         assert!(matches!(
-            AcpiTables::new(255),
+            AcpiTables::new(0, TEST_MMIO64_BASE),
+            Err(AcpiError::TooManyCpus(0))
+        ));
+        assert!(matches!(
+            AcpiTables::new(255, TEST_MMIO64_BASE),
             Err(AcpiError::TooManyCpus(255))
         ));
         assert!(matches!(
-            AcpiTables::at(layout::ACPI_TABLES_START, 0x100, 2),
+            AcpiTables::at(layout::ACPI_TABLES_START, 0x100, 2, TEST_MMIO64_BASE),
             Err(AcpiError::TooLarge { .. })
         ));
     }
@@ -949,7 +1012,7 @@ mod tests {
     /// all must be aligned.
     #[test]
     fn tables_are_aligned_and_ordered_without_overlap() {
-        let tables = AcpiTables::new(8).unwrap();
+        let tables = AcpiTables::new(8, TEST_MMIO64_BASE).unwrap();
         let addresses = [
             tables.rsdp_address(),
             tables.xsdt_address(),

@@ -102,6 +102,18 @@ pub struct VirtioMmioSlot {
     /// worker thread (MVP-307); `None` means every kick runs inline on the vCPU.
     #[cfg(target_os = "linux")]
     notifier: Option<DeviceNotifier<MmioTransport>>,
+    /// The host memory behind this device's shared-memory regions, when it
+    /// declared any and the machine could back them (EPIC 20, VEN-2001).
+    ///
+    /// Unlike the PCI side there is no BAR here, so the window is placed once
+    /// at attach and stays there: the guest learns its address by reading
+    /// `SHM_BASE`, and nothing in the mmio transport lets it move one.
+    ///
+    /// Held rather than dropped because the mapping lives exactly as long as
+    /// this `Arc` does — `SharedWindow::drop` unmaps it — so forgetting the
+    /// handle here would take the guest's window away the instant it was
+    /// published.
+    shm: Option<Arc<crate::shm::ShmWindow>>,
 }
 
 impl VirtioMmioSlot {
@@ -109,6 +121,12 @@ impl VirtioMmioSlot {
     #[cfg(target_os = "linux")]
     pub fn notifier(&self) -> Option<&DeviceNotifier<MmioTransport>> {
         self.notifier.as_ref()
+    }
+
+    /// The shared-memory window this device's regions live in, if any
+    /// (EPIC 20). For tests, the snapshot path and `entangled doctor`.
+    pub fn shm_window(&self) -> Option<&Arc<crate::shm::ShmWindow>> {
+        self.shm.as_ref()
     }
 }
 
@@ -154,6 +172,60 @@ fn transport_for(
     Ok((device_type, Arc::new(Mutex::new(transport))))
 }
 
+/// Places a shared-memory window for a virtio-**mmio** device and tells the
+/// transport where it landed (EPIC 20, VEN-2001).
+///
+/// The mmio counterpart of the PCI BAR dance, and much shorter, because this
+/// transport has no BAR: the machine picks the address, maps it once, and
+/// publishes it in `SHM_BASE`/`SHM_LEN` for the driver to read. There is
+/// nothing the guest can write that moves it, so there is no reconcile sweep
+/// here and no way for the window to end up somewhere the machine did not
+/// choose.
+///
+/// A window that cannot be placed is dropped rather than half-published: the
+/// transport is left with no base, which is the spec's "region does not exist"
+/// answer (all-ones), and the device's own `RESOURCE_MAP_BLOB` refusal is what
+/// the guest sees.
+fn place_mmio_shm(
+    slot: usize,
+    window: Option<Arc<crate::shm::ShmWindow>>,
+    transport: &Arc<Mutex<MmioTransport>>,
+) -> Option<Arc<crate::shm::ShmWindow>> {
+    let window = window?;
+    if !window.follow(Some(window.initial_base())) {
+        tracing::error!(
+            slot,
+            "could not place the shared-memory window; not publishing it"
+        );
+        return None;
+    }
+    let mut guard = match transport.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            tracing::error!(
+                slot,
+                "virtio-mmio transport lock is poisoned; not publishing SHM_BASE"
+            );
+            return None;
+        }
+    };
+    for placement in window.placements() {
+        let Some(at) = window.region_base(placement.id) else {
+            continue;
+        };
+        guard.set_shm_base(placement.id, at);
+        tracing::info!(
+            slot,
+            shmid = placement.id,
+            at = format_args!("{at:#x}"),
+            len = placement.len,
+            "published a virtio-mmio shared-memory region"
+        );
+    }
+    drop(guard);
+    Some(window)
+}
+
 impl VirtioMmioBus {
     /// A machine with no virtio devices.
     pub fn empty() -> Self {
@@ -185,6 +257,17 @@ impl VirtioMmioBus {
         devices: Vec<Box<dyn VirtioDevice>>,
         irqchip: &UserspaceIrqChip,
     ) -> Result<Self, VirtioAttachError> {
+        Self::attach_userspace_with_shm(mem, devices, irqchip, None)
+    }
+
+    /// [`Self::attach_userspace`] plus the host memory a device's
+    /// shared-memory regions need (EPIC 20, VEN-2001).
+    pub fn attach_userspace_with_shm(
+        mem: Arc<GuestMem>,
+        devices: Vec<Box<dyn VirtioDevice>>,
+        irqchip: &UserspaceIrqChip,
+        shm: Option<crate::shm::ShmSupport<'_>>,
+    ) -> Result<Self, VirtioAttachError> {
         if devices.len() > MAX_VIRTIO_SLOTS {
             return Err(VirtioAttachError::TooManySlots {
                 count: devices.len(),
@@ -192,12 +275,21 @@ impl VirtioMmioBus {
         }
         let mut bus = Self::empty();
         bus.slots.reserve(devices.len());
-        for (slot, device) in devices.into_iter().enumerate() {
+        let mut apertures = shm
+            .as_ref()
+            .map(|s| layout::Mmio64Allocator::for_guest(s.mem_bytes));
+        for (slot, mut device) in devices.into_iter().enumerate() {
             let (base, gsi) = placement(slot)?;
             let line = irqchip
                 .virtio_line(slot)
                 .map_err(|source| VirtioAttachError::IrqChip { slot, source })?;
+            let window = crate::shm::back_regions(
+                slot,
+                device.as_mut(),
+                shm.as_ref().zip(apertures.as_mut()),
+            );
             let (device_type, transport) = transport_for(slot, device, Arc::clone(&mem), line)?;
+            let window = place_mmio_shm(slot, window, &transport);
             tracing::info!(
                 slot,
                 device = ?device_type,
@@ -211,6 +303,7 @@ impl VirtioMmioBus {
                 transport,
                 #[cfg(target_os = "linux")]
                 notifier: None,
+                shm: window,
             });
         }
         Ok(bus)
@@ -241,6 +334,19 @@ impl VirtioMmioBus {
         devices: Vec<Box<dyn VirtioDevice>>,
         mode: QueueNotifyMode,
     ) -> Result<Self, VirtioAttachError> {
+        Self::attach_with_shm(vm, mem, devices, mode, None)
+    }
+
+    /// [`Self::attach_with`] plus the host memory a device's shared-memory
+    /// regions need (EPIC 20, VEN-2001).
+    #[cfg(target_os = "linux")]
+    pub fn attach_with_shm(
+        vm: Arc<VmFd>,
+        mem: Arc<GuestMem>,
+        devices: Vec<Box<dyn VirtioDevice>>,
+        mode: QueueNotifyMode,
+        shm: Option<crate::shm::ShmSupport<'_>>,
+    ) -> Result<Self, VirtioAttachError> {
         if devices.len() > MAX_VIRTIO_SLOTS {
             return Err(VirtioAttachError::TooManySlots {
                 count: devices.len(),
@@ -252,6 +358,9 @@ impl VirtioMmioBus {
             slots: Vec::with_capacity(devices.len()),
             mode,
         };
+        let mut apertures = shm
+            .as_ref()
+            .map(|s| layout::Mmio64Allocator::for_guest(s.mem_bytes));
         for (slot, mut device) in devices.into_iter().enumerate() {
             let (base, gsi) = placement(slot)?;
             let line = IrqFdLine::new(&vm, gsi)
@@ -261,8 +370,14 @@ impl VirtioMmioBus {
             // it is filled in below (see `virtio_core::DeferredWaker`).
             let waker = virtio_core::DeferredWaker::new();
             device.set_host_waker(Arc::clone(&waker) as Arc<dyn virtio_core::HostWaker>);
+            let window = crate::shm::back_regions(
+                slot,
+                device.as_mut(),
+                shm.as_ref().zip(apertures.as_mut()),
+            );
             let (device_type, transport) =
                 transport_for(slot, device, Arc::clone(&mem), Arc::new(line))?;
+            let window = place_mmio_shm(slot, window, &transport);
 
             let notifier = if mode.is_offloaded() {
                 // All of a device's queues share one QUEUE_NOTIFY register, so
@@ -291,6 +406,7 @@ impl VirtioMmioBus {
                 irq: gsi,
                 transport,
                 notifier,
+                shm: window,
             });
         }
         Ok(bus)
