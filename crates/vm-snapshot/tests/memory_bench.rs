@@ -126,7 +126,7 @@ fn measure(mem: &GuestMemoryMmap, total: u64) -> Run {
 
 fn report(label: &str, total: u64, run: &Run) {
     println!(
-        "[membench] {label:>10}  guest {:>7.0} MiB  saved {:>7.1} MiB ({:>4.1}%) in {} runs  \
+        "[membench] {label:>16}  guest {:>7.0} MiB  saved {:>7.1} MiB ({:>4.1}%) in {} runs  \
          file {:>7.1} MiB ({:>4.2}x)  save {:>7.2?}  restore {:>7.2?}  ={:>6.0} MiB/s scanned",
         mib(total),
         mib(run.saved_bytes),
@@ -162,13 +162,23 @@ fn what_a_memory_dump_costs() {
     for (label, mib_size) in [("bootstrap", 256u64), ("desktop", big_mib)] {
         let total = mib_size << 20;
         let (mem, touched) = touched_guest(total);
-        // Two passes: the first pays for first-touch page faults on the target
-        // allocation and warms the file's directory entry, and reporting a
-        // number that includes those would be measuring the operating system.
-        let _warm = measure(&mem, total);
-        let run = measure(&mem, total);
-        assert_eq!(run.saved_bytes, touched);
-        report(label, total, &run);
+        // **Two passes, and both are reported**, because they measure two
+        // different things and only one of them is what a user waits for.
+        //
+        // A real guest's untouched RAM is not resident in the host: nothing —
+        // not the guest through the hypervisor, not this process — has ever
+        // written it, so the scan takes a minor fault per page to read a zero.
+        // That is the *cold* pass, and it is what a suspend actually costs. The
+        // second pass finds every page resident and the file's metadata warm,
+        // which is what a benchmark that quietly discards its first run would
+        // report — flattering, and wrong by a factor that grows with the
+        // untouched fraction. Measured against each other, on the same guest,
+        // in the same second.
+        let cold = measure(&mem, total);
+        let warm = measure(&mem, total);
+        assert_eq!(cold.saved_bytes, touched);
+        report(&format!("{label}/cold"), total, &cold);
+        report(&format!("{label}/warm"), total, &warm);
     }
 }
 
@@ -179,9 +189,11 @@ fn what_a_memory_dump_costs() {
 fn what_an_untouched_guest_costs() {
     let total = 2048u64 << 20;
     let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), total as usize)]).unwrap();
-    let run = measure(&mem, total);
-    assert_eq!(run.saved_bytes, 0);
-    report("all-zero", total, &run);
+    let cold = measure(&mem, total);
+    let warm = measure(&mem, total);
+    assert_eq!(cold.saved_bytes, 0);
+    report("all-zero/cold", total, &cold);
+    report("all-zero/warm", total, &warm);
 }
 
 /// A sanity check that runs in the normal suite: the encoder and the decoder
