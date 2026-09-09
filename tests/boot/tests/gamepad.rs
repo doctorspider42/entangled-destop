@@ -9,7 +9,7 @@
 //! Those are the questions that decide whether a game in the guest can use the
 //! pad at all, and only a guest kernel can answer them.
 //!
-//! Two boots, because the pad has two halves:
+//! Four boots, because the pad has more halves than it looks:
 //!
 //! 1. **The descriptor**, driven by events the test writes straight into the
 //!    device's [`virtio_input::InputHandle`]. Exact sequence in, exact
@@ -17,6 +17,12 @@
 //! 2. **Hotplug**, driven by a scripted [`virtio_input::GamepadSource`] behind
 //!    the production [`virtio_input::GamepadCapture`] pump — the half a direct
 //!    push skips, and the only place "a controller went away" exists.
+//! 3. **Two players next to a tablet**, which is the only machine on which the
+//!    `js*` numbering means anything: it takes a second joystick to prove the
+//!    two pads are distinct devices, and a tablet to prove `joydev` leaves it
+//!    alone so `js0` belongs to player one.
+//! 4. **Force feedback**, which is a *negative* result and is asserted as one.
+//!    See [`force_feedback_is_unreachable_from_a_linux_guest`].
 //!
 //! Neither boot ever touches a real controller, on purpose: a machine with a
 //! pad plugged into it and a machine without must produce identical results,
@@ -456,5 +462,288 @@ fn a_controller_can_come_and_go_without_wedging_the_pad_or_spamming_the_guest() 
     assert!(
         step.load(Ordering::Acquire) >= 4,
         "the script never got past the swap, so the quiet half was not tested"
+    );
+}
+// ------------------------------------------------------- two players + js0
+
+/// One `name:uniq:eventnode:jsnode` record per input device, as the guest's
+/// `inputmap` line reports them.
+fn input_map(outcome: &boot_tests::BootOutcome) -> Vec<Vec<String>> {
+    let probe = outcome
+        .probe("inputmap")
+        .unwrap_or_else(|| panic!("no inputmap line:\n{}", outcome.serial));
+    let devices = probe
+        .iter()
+        .find(|(k, _)| k == "devices")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    if devices.is_empty() || devices == "none" {
+        return Vec::new();
+    }
+    devices
+        .split(',')
+        .map(|record| record.split(':').map(str::to_string).collect())
+        .collect()
+}
+
+/// A machine with a keyboard, a tablet and two pads — what a two-player VM
+/// actually is — asked the two questions that machine alone can answer.
+///
+/// **The js0 question.** `joydev`'s id table claims any `EV_ABS`/`ABS_X`
+/// device, which a tablet is, and the only escape is
+/// `joydev_dev_is_absolute_mouse()`: event types exactly `{SYN,KEY,ABS}`,
+/// `{SYN,KEY,ABS,MSC}` or `{SYN,KEY,ABS,MSC,REL}`, absolute axes exactly
+/// `{ABS_X, ABS_Y}`, keys exactly `{BTN_LEFT, BTN_RIGHT, BTN_MIDDLE}`. Until
+/// GAME-2104's follow-up the tablet failed two of those three, took `js0`, and
+/// left the pad on `js1` — so a game that opens the first joystick by number
+/// found a pointer. `virtio_input::config::joydev_would_bind` models the rule
+/// and is unit-tested; this is the same claim asked of a real kernel.
+///
+/// **The two-players question.** Two pads are two devices, not one device with
+/// a player field: same name, same `input_id`, different `U: Uniq=`. So the
+/// evidence is two `js*` nodes with different serials behind them — and an
+/// event pushed into player two that player one's node does *not* see, which
+/// is the part a shared device would fail.
+#[test]
+fn two_pads_and_a_tablet_leave_js0_to_player_one() {
+    let Some(spec) = spec() else { return };
+    let spec = spec.with_gamepad_probe(16).with_players(2).with_pointer();
+
+    let outcome = boot_once_driven(
+        &spec,
+        Some(Box::new(|vm: VmHandle| {
+            if vm.wait_for("VMHOST_TEST_OK padinfo ", 1, READY) == 0 {
+                vm.finish();
+                return;
+            }
+            assert_eq!(vm.gamepads.len(), 2, "the harness attached two pads");
+            // Player two first, and a different button, so "player one's node
+            // echoed only player one's press" is a statement about *which*
+            // device carried it and not about ordering.
+            let press = |code| {
+                vec![
+                    InputEvent {
+                        event_type: ev::KEY,
+                        code,
+                        value: 1,
+                    },
+                    InputEvent::SYN_REPORT,
+                ]
+            };
+            if let Err(error) = vm.gamepads[1].push(&press(btn::START)) {
+                eprintln!("harness: player two push failed: {error}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            if let Err(error) = vm.gamepads[0].push(&press(btn::SOUTH)) {
+                eprintln!("harness: player one push failed: {error}");
+            }
+            wait_for_the_probe(&vm);
+        })),
+    )
+    .expect("the VM boots");
+    assert!(
+        outcome.reached_ready(),
+        "guest never became ready:\n{}",
+        outcome.serial
+    );
+    quote_the_guest(&outcome);
+    for line in outcome
+        .serial
+        .lines()
+        .filter(|line| line.contains("VMHOST_TEST_OK inputmap"))
+    {
+        println!("guest: {}", line.trim());
+    }
+
+    let map = input_map(&outcome);
+    let find = |name: &str, uniq: &str| {
+        map.iter()
+            .find(|record| {
+                record.first().map(String::as_str) == Some(name)
+                    && record.get(1).map(String::as_str) == Some(uniq)
+            })
+            .unwrap_or_else(|| {
+                panic!("no {name} with uniq {uniq} in the guest's input map: {map:?}")
+            })
+    };
+    let js_of = |record: &Vec<String>| record.get(3).cloned().unwrap_or_default();
+
+    // Guarded the same way `padinfo` guards its js assertions: a kernel with
+    // no joydev cannot have a js* node for anything, and blaming the
+    // descriptor for that would be the wrong conclusion.
+    let info = outcome
+        .probe("padinfo")
+        .unwrap_or_else(|| panic!("no padinfo line:\n{}", outcome.serial));
+    let joydev = info
+        .iter()
+        .find(|(k, _)| k == "joydev")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("0");
+    if joydev == "1" {
+        assert_eq!(
+            js_of(find("Entangled_Tablet", "-")),
+            "-",
+            "joydev claimed the tablet, so the pad cannot have js0: {map:?}"
+        );
+        assert_eq!(
+            js_of(find("Entangled_Keyboard", "-")),
+            "-",
+            "a keyboard is not a joystick: {map:?}"
+        );
+        assert_eq!(
+            js_of(find("Entangled_Gamepad", "player-1")),
+            "js0",
+            "player one must be the first joystick: {map:?}"
+        );
+        assert_eq!(
+            js_of(find("Entangled_Gamepad", "player-2")),
+            "js1",
+            "player two must be the second: {map:?}"
+        );
+    } else {
+        eprintln!(
+            "NOT CHECKED: this guest kernel has no joydev handler, so no device can have a \
+             js* node — rebuild artifacts/bootstrap/vmlinuz with guest/bootstrap-kernel/build.sh"
+        );
+    }
+
+    // Two devices, whatever the kernel called them: different serials, and
+    // different event nodes.
+    let pads: Vec<&Vec<String>> = map
+        .iter()
+        .filter(|record| record.first().map(String::as_str) == Some("Entangled_Gamepad"))
+        .collect();
+    assert_eq!(
+        pads.len(),
+        2,
+        "two pads on the bus, two in the kernel: {map:?}"
+    );
+    assert_ne!(pads[0].get(1), pads[1].get(1), "serials must differ");
+    assert_ne!(pads[0].get(2), pads[1].get(2), "event nodes must differ");
+
+    // …and player two's press did not arrive on player one's node, which a
+    // single shared device could not manage.
+    let (seq, _events, syn) = echoed(&outcome);
+    assert_eq!(
+        seq,
+        vec![format!("k{:x}=1", btn::SOUTH)],
+        "player one's node saw something other than player one's button:\n{}",
+        outcome.serial
+    );
+    assert_eq!(syn, 1, "one report, from one pad");
+}
+
+// ---------------------------------------------------------- force feedback
+
+/// Rumble is not implemented, and this is the evidence for *why* rather than a
+/// TODO (GAME-2104 follow-up).
+///
+/// The claim is that no Linux guest can reach `EV_FF` over virtio-input, so
+/// there is nothing for a host rumble backend to be driven by. Two independent
+/// observations, both taken from a real guest kernel rather than from reading
+/// the driver:
+///
+/// * **the driver never asks.** `InputDevice::ev_bits_probed` records every
+///   `EV_BITS` subsel the guest selected during probe. `EV_KEY` is in there;
+///   `EV_FF` is not, because `virtinput_probe()` queries eight event types and
+///   force feedback is not one of them. So whatever this device advertised,
+///   the guest would never read it;
+/// * **an `EV_FF` event written to the node never arrives.** The guest writes
+///   one play request to `/dev/input/event*` — exactly what a game does after
+///   uploading an effect — and `evdev_write` reports success, because
+///   `input_inject_event` drops an unsupported type silently. The host end
+///   proves it was dropped: `status_ff` is still zero, so the event never
+///   reached `dev->event()` and therefore never reached the status queue.
+///
+/// Between them those say the gap is in the guest driver and the virtio-input
+/// spec, not in this device. See `virtio_input::gamepad` for what unblocking it
+/// would take.
+#[test]
+fn force_feedback_is_unreachable_from_a_linux_guest() {
+    let Some(spec) = spec() else { return };
+    let spec = spec.with_gamepad_probe(4);
+    // The driver runs inside the boot, so the handle has to be smuggled out to
+    // be inspected after it.
+    let pad: Arc<std::sync::Mutex<Option<virtio_input::InputHandle>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let captured = Arc::clone(&pad);
+
+    let outcome = boot_once_driven(
+        &spec,
+        Some(Box::new(move |vm: VmHandle| {
+            if let Ok(mut slot) = captured.lock() {
+                *slot = vm.gamepad.clone();
+            }
+            if vm.wait_for("VMHOST_TEST_OK padinfo ", 1, READY) == 0 {
+                vm.finish();
+                return;
+            }
+            wait_for_the_probe(&vm);
+        })),
+    )
+    .expect("the VM boots");
+    assert!(
+        outcome.reached_ready(),
+        "guest never became ready:\n{}",
+        outcome.serial
+    );
+    quote_the_guest(&outcome);
+
+    let info = outcome
+        .probe("padinfo")
+        .unwrap_or_else(|| panic!("no padinfo line:\n{}", outcome.serial));
+    let field = |key: &str| {
+        info.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("padinfo has no {key}:\n{}", outcome.serial))
+    };
+
+    // The kernel's own summary of what event types this device has. Bit 0x15
+    // is EV_FF; the bitmap is printed as space-free hex words, most
+    // significant first, and 0x15 is inside the lowest word.
+    let ev_bits = u64::from_str_radix(field("evbits"), 16)
+        .unwrap_or_else(|e| panic!("evbits {} is not hex: {e}", field("evbits")));
+    assert_eq!(
+        ev_bits & (1 << 0x15),
+        0,
+        "the guest device has EV_FF set, which no virtio_input.c does: evbits={:#x}",
+        ev_bits
+    );
+    assert_ne!(ev_bits & (1 << 0x01), 0, "EV_KEY must be set");
+    assert_eq!(field("ff"), "0", "EVIOCGBIT(EV_FF) reported effect types");
+
+    let pad = pad
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .expect("the driver ran and captured the handle");
+
+    // 1. The driver asked about EV_KEY and never about EV_FF.
+    let probed = pad.ev_bits_probed();
+    assert_ne!(
+        probed & (1 << ev::KEY),
+        0,
+        "the guest driver never even probed EV_KEY; something else is wrong"
+    );
+    assert_eq!(
+        probed & (1 << virtio_input::EV_FF),
+        0,
+        "the guest driver asked this device about EV_FF, which upstream never does: {probed:#x}"
+    );
+
+    // 2. The guest's EV_FF write was accepted by evdev and dropped by the
+    //    input core: it never reached the status queue.
+    let written = field("ffwrite");
+    assert!(
+        !written.starts_with('E'),
+        "the guest could not even write to its own event node: {written}"
+    );
+    let stats = pad.stats();
+    assert_eq!(
+        stats.status_ff, 0,
+        "an EV_FF request reached the device, which means a guest found a path \
+         upstream does not have — rumble may now be implementable:\n{}",
+        outcome.serial
     );
 }

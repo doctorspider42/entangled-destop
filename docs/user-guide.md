@@ -467,18 +467,19 @@ and every key the guest was told is down.
 
 ### Gamepads
 
-A machine can have a controller as well as a keyboard and a pointer. It is off
-by default — it costs a device slot, and an existing profile has to keep
-describing the machine it always described — so ask for it:
+A machine can have controllers as well as a keyboard and a pointer. They are
+off by default — each costs a device slot, and an existing profile has to keep
+describing the machine it always described — so ask for them:
 
 ```toml
 [gamepad]
 enabled = true
+# players = 1          # 1 to 4, one device slot each
 # backend = "auto"     # auto | null | evdev | xinput
 ```
 
-or tick *Give this machine a gamepad* in the manager's machine editor, under
-*Network & display*.
+or tick *Give this machine gamepads* in the manager's machine editor, under
+*Network & display*, and pick a number of players next to it.
 
 What the guest gets is an **Xbox 360-shaped pad**: eleven buttons, two sticks,
 two analogue triggers and a hat, with exactly the capability set that makes
@@ -502,13 +503,33 @@ the device sends the guest only what changed. A controller that disappears
 reads as neutral, so held buttons are released and sticks re-centre rather than
 the guest running forward for ever.
 
-Three things it does not do yet: **no rumble** (there is no force-feedback path
-back to the host pad), **one pad per machine**, and **no host-side deadzone or
+**More than one player.** `players = 2` gives the guest two controllers. They
+are separate devices, as two identical pads on a real machine are: same name,
+same ids, told apart by a serial (`player-1`, `player-2`) that the guest shows
+as `Uniq=`. Player 1 is `/dev/input/js0`, player 2 is `js1`. Host controllers
+fill the players in order and never move afterwards — the first pad the host
+sees is player 1, the second is player 2, and unplugging player 1's controller
+leaves player 2's alone rather than promoting it. Plugging a controller back in
+fills the empty slot.
+
+Each player costs a device slot, and there are eight. A machine with one disk,
+a network card and a sound card has spent six, so two players fit and a second
+disk then does not; three players need the sound card or the network turned
+off. `entangled run` says so by name and count if you ask for more than fits.
+
+Two things it does not do: **no rumble**, and **no host-side deadzone or
 response curve** — the only deadzone is the one the guest's own driver applies
-to the `ABS_INFO` the device publishes, which is `xpad`'s. Note also that the
-pad is **not necessarily `/dev/input/js0`** — the acceptance run for it found the
-machine's absolute pointer claiming `js0` and the pad landing on `js1` — so
-enumerate by name (`Entangled Gamepad`) rather than by number.
+to the `ABS_INFO` the device publishes, which is `xpad`'s.
+
+Rumble is not a missing afternoon's work, which is why it is stated here rather
+than promised. Linux's virtio-input driver has no force-feedback support at all
+D it never asks the device whether it has any, and never creates the kernel
+plumbing a game needs to upload an effect — and the virtio-input specification
+has no channel to carry an effect definition even if it did: the only
+guest-to-device message is an eight-byte event. So a game in the guest cannot
+get as far as asking for rumble, whatever the host could do with the request.
+Both halves of that are checked against a real guest kernel on every test run,
+so the day it changes, we will be told.
 
 ### Without a window
 
@@ -620,14 +641,14 @@ Things worth knowing about the shape:
   `"auto"` (whatever the host has), `"null"`, `"alsa"` or `"wasapi"`. `auto`
   never stops a machine from starting; a named backend the host cannot open
   does, on purpose.
-- **`[gamepad]`** is off unless you add it, the same way: `enabled = true` and a
-  `backend` of `"auto"`, `"null"`, `"evdev"` (Linux) or `"xinput"` (Windows).
-  See [Gamepads](#gamepads) below.
+- **`[gamepad]`** is off unless you add it, the same way: `enabled = true`,
+  `players` (1 to 4, one slot each) and a `backend` of `"auto"`, `"null"`,
+  `"evdev"` (Linux) or `"xinput"` (Windows). See [Gamepads](#gamepads) below.
 
 Every device costs a **slot**, and there are eight of them on either bus. A
 machine with one disk spends four (disk, GPU, keyboard, pointer); a network card
 is a fifth, a sound card a sixth and a gamepad a seventh, which leaves room for a
-CD-ROM *or* a second disk but not both. Going over is refused when the machine
+CD-ROM *or* a second disk *or* a second player, but only one of the three. Going over is refused when the machine
 is built, with the count in the message, rather than producing a guest that is
 quietly missing a device.
 
@@ -926,11 +947,14 @@ configuration:
     hypervisors. Nothing to do about it from here, but it makes any timing
     measured inside WSL unreliable. See
     [troubleshooting](troubleshooting.md#the-guests-clock-disagrees-with-the-hosts-wsl2).
-16. **One gamepad per machine, and no rumble.** The pad is an Xbox 360-shaped
-    virtio-input device; force feedback has no path back to the host controller,
-    there is no second player, and there is no host-side deadzone or response
-    curve (deliberately — the guest's own calibration would not be able to see
-    it).
+16. **No rumble, and at most four players.** The pads are Xbox 360-shaped
+    virtio-input devices, one virtio slot each, so the slot budget runs out
+    before the four does. Force feedback is not merely unimplemented: Linux's
+    virtio-input driver has no force-feedback support and the virtio-input
+    specification has no channel to upload an effect through, so a game in the
+    guest cannot ask for it — see [Gamepads](#gamepads). There is also no
+    host-side deadzone or response curve (deliberately — the guest's own
+    calibration would not be able to see it).
 
 ## Provenance of the commands in this guide
 
@@ -949,4 +973,5 @@ configuration:
 | the clock-drift numbers | `cargo test -p boot-tests --test soak -- --ignored --nocapture` on the Linux host and `cargo test -p vmm-core --test whp_clock -- --nocapture` on the Windows one, plus three 900 s control runs pinning the guest to `tsc`, `kvm-clock` and `acpi_pm`, and three measurements of the WSL host's own clock against Windows QPC and against its wall clock; the numbers are those runs' own output, and both tests pass |
 | the manager's views | rendered while writing this guide with `cargo run -p entangled-manager -- --mock --screenshot <png> --screenshot-view main\|wizard\|diagnostics`, and again for the Snapshots work with `--screenshot-view snapshots\|snapshot-delete\|snapshot-discard\|editor-network`; described from the pictures and the source |
 | the control channel's replies | `cargo test -p entangled --test suspend_restore -- --nocapture`, which passes; the `saved …` line is one of its own, with the path shortened |
-| `[gamepad] enabled = true`, and what the guest makes of the pad | `cargo test -p boot-tests --test gamepad -- --nocapture` was run here and passes: the guest kernel reports `name=Entangled_Gamepad … keys=11 axes=8 absx=-32768:32767:16:128`. The `js*` half of it self-skipped, because this checkout's bootstrap kernel predates `CONFIG_INPUT_JOYDEV=y` — so **`js0` vs `js1` is quoted from GAME-2104's acceptance run** (recorded in the backlog), not observed here |
+| `[gamepad] enabled = true`, `players = 2`, and what the guest makes of the pads | `cargo test -p boot-tests --test gamepad -- --nocapture` was re-run here against a bootstrap kernel built **with** `CONFIG_INPUT_JOYDEV=y`, and all four boots pass. The two-player and `js0` claims are that run’s own guest output: `inputmap devices=Entangled_Keyboard:-:event0:-,Entangled_Tablet:-:event1:-,Entangled_Gamepad:player-1:event2:js0,Entangled_Gamepad:player-2:event3:js1` |
+| that rumble is unreachable rather than merely unimplemented | the same run: the guest kernel publishes `evbits=b` (no `EV_FF`), `EVIOCGBIT(EV_FF)` reports nothing, the guest driver never once selects the device’s `EV_FF` capability while probing, and an `EV_FF` event written to the event node is accepted by evdev and never reaches the device |

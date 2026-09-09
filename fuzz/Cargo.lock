@@ -744,6 +744,7 @@ dependencies = [
  "virtio-block",
  "virtio-core",
  "virtio-gpu",
+ "virtio-input",
  "virtio-net",
  "virtio-sound",
  "vm-memory 0.17.2",
@@ -2176,6 +2177,19 @@ name = "virtio-gpu"
 version = "0.2.0"
 dependencies = [
  "libloading",
+ "thiserror",
+ "tracing",
+ "virtio-core",
+ "virtio-queue",
+ "vm-memory 0.17.2",
+ "windows",
+]
+
+[[package]]
+name = "virtio-input"
+version = "0.2.0"
+dependencies = [
+ "libc",
  "thiserror",
  "tracing",
  "virtio-core",

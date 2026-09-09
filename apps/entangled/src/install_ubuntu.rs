@@ -314,6 +314,9 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         // plugged in later is picked up without restarting the VM.
         gamepad: GamepadSection {
             enabled: true,
+            // One pad. A second is a config edit away and costs another virtio
+            // slot, which an installed profile with disk + cdrom cannot spare.
+            players: 1,
             backend: GamepadBackend::Auto,
         },
     };

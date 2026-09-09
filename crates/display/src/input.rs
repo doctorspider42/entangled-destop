@@ -57,14 +57,25 @@ pub mod rel {
     pub const WHEEL: u16 = 0x08;
 }
 
-/// Extra mouse buttons beyond `virtio_input::btn`.
+/// Where the host's Back and Forward mouse buttons go.
 ///
-/// TODO(virtio-input): upstream into `virtio_input::btn`.
-pub mod btn_ext {
-    /// `BTN_SIDE`.
-    pub const SIDE: u16 = 0x113;
-    /// `BTN_EXTRA`.
-    pub const EXTRA: u16 = 0x114;
+/// **Not** `BTN_SIDE`/`BTN_EXTRA`, which is where they went until GAME-2104's
+/// follow-up. `joydev` only leaves an absolute pointer alone if its key set is
+/// exactly the three primary mouse buttons, and a tablet it binds takes `js0`
+/// away from the gamepad — the whole argument is on
+/// `virtio_input::config::Profile::AbsolutePointer`.
+///
+/// `KEY_BACK`/`KEY_FORWARD` are inside the dense range the keyboard profile
+/// already advertises, so this costs no capability anywhere and
+/// `virtio_input::split_batch` routes them to the keyboard by itself. They are
+/// also what a multimedia keyboard sends, which is the binding browsers and
+/// desktops already have — a Back button that works in Firefox without the
+/// user configuring anything.
+pub mod nav {
+    /// `KEY_BACK` — winit's `MouseButton::Back`.
+    pub const BACK: u16 = virtio_input::key::BACK;
+    /// `KEY_FORWARD` — winit's `MouseButton::Forward`.
+    pub const FORWARD: u16 = virtio_input::key::FORWARD;
 }
 
 /// Linux `KEY_*` codes of the modifiers the reserved shortcuts need.
@@ -584,8 +595,8 @@ impl InputCapture {
             MouseButton::Left => btn::LEFT,
             MouseButton::Right => btn::RIGHT,
             MouseButton::Middle => btn::MIDDLE,
-            MouseButton::Back => btn_ext::SIDE,
-            MouseButton::Forward => btn_ext::EXTRA,
+            MouseButton::Back => nav::BACK,
+            MouseButton::Forward => nav::FORWARD,
             MouseButton::Other(_) => {
                 tracing::trace!(?button, "unmapped mouse button dropped");
                 return KeyOutcome::Ignored;
@@ -1456,8 +1467,8 @@ mod tests {
             (MouseButton::Left, btn::LEFT),
             (MouseButton::Right, btn::RIGHT),
             (MouseButton::Middle, btn::MIDDLE),
-            (MouseButton::Back, btn_ext::SIDE),
-            (MouseButton::Forward, btn_ext::EXTRA),
+            (MouseButton::Back, nav::BACK),
+            (MouseButton::Forward, nav::FORWARD),
         ] {
             assert_eq!(
                 c.on_button(button, ElementState::Pressed),

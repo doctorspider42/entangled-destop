@@ -17,6 +17,17 @@
 //! controller is adopted only *its* slot is polled, and empty slots are swept
 //! at most once every [`RESCAN_INTERVAL`].
 //!
+//! # Which user index is which player
+//!
+//! Windows *does* have controller slots of its own, but they are not the same
+//! thing as our players: XInput leaves a hole where a controller was unplugged
+//! and hands a freshly plugged pad the lowest free index, so user 2 can be the
+//! only pad on the machine. So the sweep offers whichever indices are occupied
+//! to the shared [`PadRoster`], in ascending order, and the roster decides —
+//! the same rule the evdev side uses, so a two-player VM behaves identically on
+//! both hosts. With one player that is exactly the old behaviour: the lowest
+//! occupied index.
+//!
 //! # What XInput cannot give us
 //!
 //! `BTN_MODE` (the guide/Xbox button) is bit `0x0400` of `wButtons` and
@@ -24,18 +35,20 @@
 //! Game Bar. The guest device still advertises the button, because SDL's
 //! capability-based auto-mapping expects a complete pad and a controller
 //! plugged into a *Linux* host does deliver it; on Windows it simply never
-//! fires. Rumble (`XInputSetState`) is the other half of this file that does
-//! not exist yet — the guest device advertises no `EV_FF`, so there is nothing
-//! to forward.
+//! fires. Rumble (`XInputSetState`) is not here either, and will not be until
+//! something can ask for it: no guest driver can reach `EV_FF` over
+//! virtio-input and the spec has no channel to upload an effect through — the
+//! full account, and what unblocking it needs, is on [`super`].
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::Win32::UI::Input::XboxController::{XInputGetState, XINPUT_STATE};
 
-use super::{GamepadSource, PadId, PadState, Poll, RESCAN_INTERVAL};
+use super::{GamepadSource, PadId, PadRoster, PadState, Poll, RESCAN_INTERVAL};
 use crate::btn;
 
-/// XInput supports four controllers; this VMM drives player one.
+/// XInput supports four controllers, which is also [`super::MAX_PLAYERS`].
 const MAX_USERS: u32 = 4;
 
 /// `ERROR_SUCCESS`.
@@ -75,6 +88,10 @@ const BUTTON_MAP: [(u16, u16); 10] = [
 
 /// Host gamepad capture through XInput.
 pub struct XInputSource {
+    /// Which player this source feeds (0-based).
+    player: usize,
+    /// Shared with every other player's source; see [`PadRoster`].
+    roster: Arc<PadRoster>,
     /// Which user index is adopted, if any.
     user: Option<u32>,
     next_scan: Instant,
@@ -87,12 +104,25 @@ impl Default for XInputSource {
 }
 
 impl XInputSource {
+    /// A single-player source with a roster of its own.
     pub fn new() -> Self {
+        Self::for_player(0, PadRoster::new(1))
+    }
+
+    /// The source for one player, sharing `roster` with the other players.
+    pub fn for_player(player: usize, roster: Arc<PadRoster>) -> Self {
         Self {
+            player,
+            roster,
             user: None,
             // Sweep on the very first poll.
             next_scan: Instant::now(),
         }
+    }
+
+    /// The roster key of one XInput user index.
+    fn slot_key(user: u32) -> String {
+        format!("xinput-{user}")
     }
 
     /// One `XInputGetState` call. `None` means "nothing in that slot".
@@ -109,18 +139,48 @@ impl XInputSource {
     }
 
     /// Finds a controller, at most once per [`RESCAN_INTERVAL`].
+    ///
+    /// Every occupied index is offered, not the first one found: the roster
+    /// cannot place a controller it has not been shown, and offering only the
+    /// first would give every player the same pad.
     fn scan(&mut self) {
         if self.user.is_some() || Instant::now() < self.next_scan {
             return;
         }
         self.next_scan = Instant::now() + RESCAN_INTERVAL;
-        for user in 0..MAX_USERS {
-            if Self::read(user).is_some() {
-                tracing::info!(user, "adopted host gamepad (XInput)");
-                self.user = Some(user);
-                return;
-            }
-        }
+        let occupied: Vec<String> = (0..MAX_USERS)
+            .filter(|&user| Self::read(user).is_some())
+            .map(Self::slot_key)
+            .collect();
+        let Some(key) = self.roster.claim(self.player, &occupied) else {
+            return;
+        };
+        let Some(user) = key
+            .strip_prefix("xinput-")
+            .and_then(|digits| digits.parse::<u32>().ok())
+        else {
+            return;
+        };
+        tracing::info!(
+            user,
+            player = self.player + 1,
+            "adopted host gamepad (XInput)"
+        );
+        self.user = Some(user);
+    }
+
+    /// Drops the adopted controller and frees its roster slot.
+    fn release(&mut self) {
+        self.user = None;
+        self.roster.release(self.player);
+    }
+}
+
+impl Drop for XInputSource {
+    /// A capture thread that stops — a device reset, or the VM closing —
+    /// must not leave its player's roster slot claimed for ever.
+    fn drop(&mut self) {
+        self.roster.release(self.player);
     }
 }
 
@@ -139,8 +199,12 @@ impl GamepadSource for XInputSource {
             return Poll::Disconnected;
         };
         let Some(raw) = Self::read(user) else {
-            tracing::debug!(user, "host gamepad disconnected (XInput)");
-            self.user = None;
+            tracing::debug!(
+                user,
+                player = self.player + 1,
+                "host gamepad disconnected (XInput)"
+            );
+            self.release();
             return Poll::Disconnected;
         };
         Poll::Connected {

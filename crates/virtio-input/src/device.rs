@@ -128,7 +128,75 @@ pub struct EventStats {
     pub rejected_buffers: u64,
     /// Status-queue chains drained and acknowledged.
     pub status_chains: u64,
+    /// Events read off the status queue, of every type.
+    pub status_events: u64,
+    /// `EV_FF` events among them — a guest asking for force feedback.
+    ///
+    /// Its own counter because it answers the one open question about rumble
+    /// (see [`crate::gamepad`]): a non-zero value here would mean a guest
+    /// driver found a path to `EV_FF` that Linux's `virtio_input.c` does not
+    /// have, which is exactly the day this device would need one too.
+    pub status_ff: u64,
+    /// Status-queue events refused: a chain that could not be walked, one
+    /// whose buffers interleave direction, or a buffer outside guest RAM.
+    ///
+    /// Counted rather than fatal. The status queue is a *write* path the guest
+    /// controls completely, so everything on it is refused in band: the chain
+    /// still goes back with length 0 and the device stays healthy.
+    pub status_rejected: u64,
 }
+
+/// What one status-queue event asks the device for.
+///
+/// The guest may write any `(type, code, value)` triple it likes here, so this
+/// is a classification of untrusted input and nothing more — no arm of it
+/// indexes anything host-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusEvent {
+    /// `EV_LED`: a keyboard indicator changed. Nothing to do — the host
+    /// window has no lock lights.
+    Led { code: u16, on: bool },
+    /// `EV_REP`: the guest wants a different auto-repeat delay or period. The
+    /// guest's own input core generates repeats, so there is nothing to set.
+    Repeat { code: u16, value: u32 },
+    /// `EV_FF`: play or stop force-feedback effect `id`, `value` times.
+    ///
+    /// Never produced by a Linux guest — see [`crate::gamepad`] on rumble —
+    /// and refused if one ever appears: an effect id the device never issued
+    /// must not be treated as meaningful, let alone used as an index.
+    ForceFeedback { id: u16, plays: u32 },
+    /// Anything else, kept whole rather than discarded so a log line can say
+    /// what arrived.
+    Other(InputEvent),
+}
+
+impl StatusEvent {
+    /// Classifies one wire event. Total: every bit pattern is some arm.
+    pub fn classify(event: InputEvent) -> Self {
+        match event.event_type {
+            crate::ev::LED => StatusEvent::Led {
+                code: event.code,
+                on: event.value != 0,
+            },
+            crate::ev::REP => StatusEvent::Repeat {
+                code: event.code,
+                value: event.value,
+            },
+            EV_FF => StatusEvent::ForceFeedback {
+                id: event.code,
+                plays: event.value,
+            },
+            _ => StatusEvent::Other(event),
+        }
+    }
+}
+
+/// `EV_FF` from `linux/input-event-codes.h`.
+///
+/// Not in [`crate::ev`] because no profile advertises it and none can usefully
+/// do so; it is here because the status queue has to be able to *recognise*
+/// one in order to refuse it by name.
+pub const EV_FF: u16 = 0x15;
 
 /// Resources handed over at `DRIVER_OK`.
 struct Active {
@@ -149,7 +217,20 @@ struct State {
 /// Everything both the guest side and the host side reach.
 struct Shared {
     profile: Profile,
+    /// `VIRTIO_INPUT_CFG_ID_SERIAL`, when this instance has one. Fixed at
+    /// construction and never guest-writable.
+    serial: Option<String>,
     state: Mutex<State>,
+    /// Which `EV_BITS` subsels the guest driver has ever selected, as a bit
+    /// per event type (`EV_CNT` is 32, so one word is the whole space).
+    ///
+    /// A guest-driven counter that cannot grow: the driver writes `subsel`,
+    /// we set bit `subsel`, and anything at or above `ev::CNT` is dropped. It
+    /// answers a question no host-side reasoning can — *which capabilities did
+    /// this kernel's driver actually ask about* — which is how
+    /// `tests/boot/tests/gamepad.rs` shows that Linux never enquires about
+    /// `EV_FF` at all (see [`crate::gamepad`] on rumble).
+    ev_bits_probed: std::sync::atomic::AtomicU32,
 }
 
 /// Locks the shared state, recovering from poisoning instead of panicking.
@@ -316,7 +397,7 @@ impl Shared {
             else {
                 break;
             };
-            self.log_status_chain(&mem, desc_table, queue_size, head);
+            self.absorb_status_chain(&mem, desc_table, queue_size, head, stats);
             active
                 .statusq
                 .add_used(mem.as_ref(), head, 0)
@@ -336,12 +417,33 @@ impl Shared {
         Ok(())
     }
 
-    /// Reads what the guest put on the status queue, purely for diagnostics.
-    /// Every failure is swallowed: a malformed status chain is still acked.
-    fn log_status_chain(&self, mem: &GuestMem, desc_table: u64, queue_size: u16, head: u16) {
+    /// Reads and classifies what the guest put on the status queue.
+    ///
+    /// This is the device's only *inbound* path and it is entirely
+    /// guest-shaped: the chain, its direction, its lengths and every byte in
+    /// it. So the rules are the virtqueue rules, applied one more time here:
+    /// the walk is bounded and index-checked by `virtio_core::chain`, every
+    /// read goes through `vm-memory` at an address that is only ever an
+    /// argument to a checked call, the number of events one chain is inspected
+    /// for is capped at [`STATUS_EVENTS_PER_CHAIN`], and nothing that arrives
+    /// is used to index anything. Every failure is counted and swallowed: a
+    /// malformed status chain is still acked, because the alternative is a
+    /// driver being able to wedge its own device.
+    ///
+    /// Nothing here *acts* on an event yet — see [`StatusEvent`] for what
+    /// each kind would mean and why.
+    fn absorb_status_chain(
+        &self,
+        mem: &GuestMem,
+        desc_table: u64,
+        queue_size: u16,
+        head: u16,
+        stats: &mut EventStats,
+    ) {
         let segments = match chain::walk(mem, desc_table, queue_size, head) {
             Ok(segments) => segments,
             Err(error) => {
+                stats.status_rejected = stats.status_rejected.saturating_add(1);
                 tracing::warn!(
                     device = self.profile.name(),
                     head,
@@ -352,6 +454,7 @@ impl Shared {
             }
         };
         let Ok((readable, _writable)) = chain::split_rw(&segments) else {
+            stats.status_rejected = stats.status_rejected.saturating_add(1);
             tracing::warn!(
                 device = self.profile.name(),
                 head,
@@ -367,9 +470,11 @@ impl Shared {
             {
                 let mut raw = [0u8; InputEvent::WIRE_SIZE];
                 let Some(addr) = segment.addr.checked_add(u64::from(offset)) else {
+                    stats.status_rejected = stats.status_rejected.saturating_add(1);
                     return;
                 };
                 if mem.read_slice(&mut raw, GuestAddress(addr)).is_err() {
+                    stats.status_rejected = stats.status_rejected.saturating_add(1);
                     tracing::debug!(
                         device = self.profile.name(),
                         head,
@@ -379,16 +484,52 @@ impl Shared {
                     return;
                 }
                 let event = InputEvent::from_le_bytes(raw);
-                tracing::debug!(
-                    device = self.profile.name(),
-                    event_type = event.event_type,
-                    code = event.code,
-                    value = event.value,
-                    "ignoring virtio-input status event (no LED/REP handling yet)"
-                );
+                stats.status_events = stats.status_events.saturating_add(1);
+                self.absorb_status_event(StatusEvent::classify(event), stats);
                 seen += 1;
                 offset = offset.saturating_add(InputEvent::WIRE_SIZE as u32);
             }
+        }
+    }
+
+    /// What one classified status event does. Today: gets counted and logged.
+    fn absorb_status_event(&self, event: StatusEvent, stats: &mut EventStats) {
+        match event {
+            StatusEvent::ForceFeedback { id, plays } => {
+                stats.status_ff = stats.status_ff.saturating_add(1);
+                // Loud, and once per event, because this cannot happen with
+                // any guest kernel that exists: `virtio_input.c` never sets
+                // `EV_FF` in `evbit`, so the input core drops an `EV_FF` write
+                // before it can reach `dev->event()`. A guest that got one
+                // through is running a driver we have never seen, and the id
+                // is a number it invented — this device has issued none.
+                tracing::warn!(
+                    device = self.profile.name(),
+                    effect = id,
+                    plays,
+                    "guest asked to play a force-feedback effect; this device advertises \
+                     no EV_FF and has issued no effect ids, so the request is refused"
+                );
+            }
+            StatusEvent::Led { code, on } => tracing::debug!(
+                device = self.profile.name(),
+                code,
+                on,
+                "ignoring virtio-input LED update (the host window has no lock lights)"
+            ),
+            StatusEvent::Repeat { code, value } => tracing::debug!(
+                device = self.profile.name(),
+                code,
+                value,
+                "ignoring virtio-input auto-repeat setting (the guest generates repeats)"
+            ),
+            StatusEvent::Other(event) => tracing::debug!(
+                device = self.profile.name(),
+                event_type = event.event_type,
+                code = event.code,
+                value = event.value,
+                "ignoring unrecognised virtio-input status event"
+            ),
         }
     }
 }
@@ -477,6 +618,14 @@ impl InputHandle {
     pub fn stats(&self) -> EventStats {
         lock(&self.shared.state).stats
     }
+
+    /// Which `EV_BITS` event types the guest driver has enquired about, one
+    /// bit per `EV_*` type; see [`InputDevice::ev_bits_probed`].
+    pub fn ev_bits_probed(&self) -> u32 {
+        self.shared
+            .ev_bits_probed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// A virtio-input device: keyboard or absolute pointer, per its [`Profile`].
@@ -511,12 +660,19 @@ impl std::fmt::Debug for InputDevice {
 }
 
 impl InputDevice {
-    /// Builds a device with the given profile.
+    /// Builds a device with the given profile and no serial.
     pub fn new(profile: Profile) -> Self {
+        Self::with_serial(profile, None)
+    }
+
+    /// Builds a device with the given profile and `VIRTIO_INPUT_CFG_ID_SERIAL`.
+    pub fn with_serial(profile: Profile, serial: Option<String>) -> Self {
         Self {
             shared: Arc::new(Shared {
                 profile,
+                serial,
                 state: Mutex::new(State::default()),
+                ev_bits_probed: std::sync::atomic::AtomicU32::new(0),
             }),
             // No virtio-input feature bits exist beyond the transport-level
             // ones (the spec defines none), so VERSION_1 is the whole set.
@@ -545,7 +701,18 @@ impl InputDevice {
     /// gets. [`crate::gamepad::GamepadCapture`] is the half that makes a real
     /// controller drive it.
     pub fn gamepad() -> Self {
-        Self::new(Profile::Gamepad)
+        Self::gamepad_for_player(0)
+    }
+
+    /// The gamepad of player `player` (0-based), with no host capture.
+    ///
+    /// The only difference between players is the serial
+    /// ([`config::player_serial`]): same name, same `input_id`, same
+    /// capabilities — which is exactly what two identical controllers look
+    /// like on a real machine, and what SDL expects when it enumerates two
+    /// pads. Slot order in the machine decides which is `js0`.
+    pub fn gamepad_for_player(player: usize) -> Self {
+        Self::with_serial(Profile::Gamepad, Some(config::player_serial(player)))
     }
 
     /// A gamepad fed by a real host controller (GAME-2104).
@@ -565,7 +732,15 @@ impl InputDevice {
     /// let pad = InputDevice::gamepad_with_capture(factory);
     /// ```
     pub fn gamepad_with_capture(capture: SourceFactory) -> Self {
-        let mut device = Self::new(Profile::Gamepad);
+        Self::gamepad_with_capture_for_player(capture, 0)
+    }
+
+    /// Player `player`'s gamepad, fed by `capture`.
+    ///
+    /// Which *host* controller that factory reads is the factory's business —
+    /// see [`crate::gamepad::open_sources`] and [`crate::gamepad::PadRoster`].
+    pub fn gamepad_with_capture_for_player(capture: SourceFactory, player: usize) -> Self {
+        let mut device = Self::gamepad_for_player(player);
         device.capture = Some(capture);
         device
     }
@@ -626,6 +801,31 @@ impl InputDevice {
     pub fn selected(&self) -> (u8, u8) {
         (self.select, self.subsel)
     }
+
+    /// Which `EV_BITS` event types the guest driver has enquired about, one
+    /// bit per `EV_*` type — `1 << ev::KEY` and so on.
+    ///
+    /// Cumulative for the life of the device and deliberately **not** cleared
+    /// by [`VirtioDevice::reset`] or carried in a snapshot: it describes the
+    /// *driver*, not the device, and the question it answers ("did this kernel
+    /// ever ask whether we do X?") is about the whole run.
+    pub fn ev_bits_probed(&self) -> u32 {
+        self.handle().ev_bits_probed()
+    }
+
+    /// Records an `EV_BITS` enquiry; see [`Shared::ev_bits_probed`].
+    fn note_probe(&self) {
+        if self.select != config::VIRTIO_INPUT_CFG_EV_BITS {
+            return;
+        }
+        let subsel = u16::from(self.subsel);
+        if subsel >= crate::ev::CNT {
+            return;
+        }
+        self.shared
+            .ev_bits_probed
+            .fetch_or(1u32 << subsel, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl VirtioDevice for InputDevice {
@@ -659,7 +859,12 @@ impl VirtioDevice for InputDevice {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        let selection = config::selection(self.shared.profile, self.select, self.subsel);
+        let selection = config::selection_with_serial(
+            self.shared.profile,
+            self.shared.serial.as_deref(),
+            self.select,
+            self.subsel,
+        );
         for (i, byte) in data.iter_mut().enumerate() {
             let index = offset.saturating_add(i as u64);
             *byte = match index {
@@ -684,7 +889,10 @@ impl VirtioDevice for InputDevice {
             let index = offset.saturating_add(i as u64);
             match index {
                 config::SELECT => self.select = *byte,
-                config::SUBSEL => self.subsel = *byte,
+                config::SUBSEL => {
+                    self.subsel = *byte;
+                    self.note_probe();
+                }
                 // `size`, `reserved` and the payload are read-only.
                 _ => ignored += 1,
             }
@@ -1011,7 +1219,10 @@ mod tests {
         );
         let buttons = probe(&mut device, config::VIRTIO_INPUT_CFG_EV_BITS, ev::KEY as u8);
         assert_eq!(buttons.len(), 35);
-        assert_eq!(buttons[34], 0x1f, "BTN_LEFT = 0x110 is byte 34 bit 0");
+        assert_eq!(
+            buttons[34], 0x07,
+            "BTN_LEFT/RIGHT/MIDDLE, and deliberately nothing else"
+        );
         assert!(buttons[..34].iter().all(|&b| b == 0));
         assert_eq!(
             probe(&mut device, config::VIRTIO_INPUT_CFG_EV_BITS, ev::ABS as u8),
@@ -1162,7 +1373,7 @@ mod tests {
             code: key::SELECT,
             value: 1
         }));
-        for code in [btn::LEFT, btn::RIGHT, btn::MIDDLE, btn::SIDE, btn::EXTRA] {
+        for code in [btn::LEFT, btn::RIGHT, btn::MIDDLE] {
             let event = InputEvent {
                 event_type: ev::KEY,
                 code,
@@ -1170,6 +1381,27 @@ mod tests {
             };
             assert!(Profile::AbsolutePointer.accepts(event));
             assert!(!Profile::Keyboard.accepts(event));
+        }
+        // Back and Forward are keyboard codes now (GAME-2104 follow-up), so
+        // they land on the other device — and `BTN_SIDE`/`BTN_EXTRA` land
+        // nowhere at all.
+        for code in [key::BACK, key::FORWARD] {
+            let event = InputEvent {
+                event_type: ev::KEY,
+                code,
+                value: 1,
+            };
+            assert!(Profile::Keyboard.accepts(event));
+            assert!(!Profile::AbsolutePointer.accepts(event));
+        }
+        for code in [btn::SIDE, btn::EXTRA] {
+            let event = InputEvent {
+                event_type: ev::KEY,
+                code,
+                value: 1,
+            };
+            assert!(!Profile::Keyboard.accepts(event));
+            assert!(!Profile::AbsolutePointer.accepts(event));
         }
     }
 }
