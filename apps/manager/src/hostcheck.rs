@@ -173,8 +173,8 @@ pub fn mock_report() -> Report {
          \x20 install         : ubuntu — UEFI + verified ISO, offline (no mirror needed)\n\
          \x20                   debian — d-i on the bootstrap kernel, needs the network\n\
          \x20   firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB)\n\
-         \x20   bootstrap kernel MISSING at artifacts/bootstrap/vmlinuz\n\
-         \x20                   Debian only: `bash guest/bootstrap-kernel/build.sh` on Linux\n\
+         \x20   bootstrap kernel MISSING — needed by `install debian` only\n\
+         \x20                   run `entangled fetch bootstrap-kernel` (~13 MiB, SHA-256 pinned)\n\
          \x20   ubuntu ISO       mock-cache/ubuntu-24.04.1-live-server-amd64.iso (2.9 GiB)\n\
          \x20   VM directory     mock-vms (412.0 GiB free of 953.0 GiB)\n\
          host looks ready to run VMs";

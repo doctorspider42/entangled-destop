@@ -163,7 +163,12 @@ green in the same change — run the WSL regression too (see CLAUDE.md).
 The boot tests need `artifacts/bootstrap/vmlinuz` (or `artifacts/tests/vmlinuz`
 as a fallback) and `artifacts/tests/test-initramfs.cpio.gz`; `whp_virtio_blk`
 also needs a raw disk image at `artifacts/tests/test-root.raw`. Those are built by
-Linux-side scripts; copying them in from another checkout is fine.
+Linux-side scripts; copying them in from another checkout is fine. For the
+bootstrap kernel specifically there is now a supported way that is not copying:
+`entangled fetch bootstrap-kernel` puts a digest-checked `vmlinuz` +
+`initrd.img` in `<cache>/bootstrap/<tag>/`, and `install debian` reads them from
+there — though these tests still want them at the fixed relative path, so
+copy or symlink them into `artifacts/bootstrap/`.
 
 **The whole workspace builds natively**, including the `virtio-*` crates and
 `display`, thanks to two vendored patches in `third_party/` (see their

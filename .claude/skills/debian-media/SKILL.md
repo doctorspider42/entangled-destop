@@ -104,6 +104,56 @@ key pinned before it becomes `stable`; the CD keys are long-lived.
 - The one network test is `tests/network.rs`:
   `cargo test -p debian-media --test network -- --ignored --nocapture`.
 
+## The guest bootstrap artifacts (`entangled fetch bootstrap-kernel`)
+
+`apps/entangled/src/bootstrap.rs`, not this crate — but it borrows this crate's
+`Transport`, `DigestAlgo`, `Manifest` and cache root, and it lands in the same
+cache (`<cache>/bootstrap/<release tag>/{vmlinuz,initrd.img}`), so it belongs in
+this skill.
+
+**Why it exists.** `install debian` runs d-i on *our* kernel, because Debian
+builds `virtio_mmio` without `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` and their
+installer kernel therefore sees none of our devices. Building ours is a Linux
+kernel build with no cross-compile, which used to make `install debian`
+impossible on Windows. CI now builds it once
+(`.github/workflows/guest-artifacts.yml`) and every host downloads it.
+
+**The trust chain is deliberately weaker than the media one, and the code says
+so out loud.** There is no signature over these files: the anchor is a SHA-256
+per asset in `guest/bootstrap-kernel/pinned.toml`, `include_str!`d into the
+binary. Better than a checksum file served next to the artifact (an attacker who
+can serve one can serve the other); not a signature (no key, nothing to revoke,
+and a commit can change the pin). Consequences to preserve if you touch it:
+
+- the provenance manifest it writes has `signature_verified = false` and a
+  `keyring` field that says "pinned sha256 in ...". Do not be tempted to make
+  that field look reassuring — a manifest that claims a signature nobody made
+  is the exact lie the field exists to prevent;
+- `entangled fetch bootstrap-kernel` prints `trust : SHA-256 pinned in this
+  build` and `no signature`, next to the media path's `signature : OK`. The two
+  outputs differ because the two guarantees differ.
+
+**Release tags are immutable and that is load-bearing.** A new build is a new
+tag, so a pin that was correct when it was reviewed keeps fetching the same
+bytes forever. The workflow prints the replacement TOML block into its job
+summary; committing it is a separate step, and between the two the previous tag
+still serves. Never rebuild a tag in place.
+
+**Order of resolution** (`bootstrap::locate`), and the reason for it:
+`ENTANGLED_BOOTSTRAP_DIR`, then `artifacts/bootstrap/` under the working
+directory, then the cache. The checkout beats the cache so a developer who just
+rebuilt the kernel gets *that* one; a stale download shadowing a fresh build is
+an afternoon. Only the cache arm is digest-checked on the way out — the other
+two are "an operator put these here on purpose".
+
+**Licence.** `vmlinuz` is GPL-2.0-only Linux. `cargo deny` does **not** cover it:
+that gate reads the Cargo graph, not release assets. Distributing the binary is
+what creates the source obligation, and the workflow meets it by publishing the
+upstream tarball, the `.config` and the build script in the same release — and
+refuses to publish if the tarball is not there. Guest-side content being exempt
+from the no-copyleft rule is about *linking into our program*, never about
+*distribution*.
+
 ## Ubuntu and Fedora media (shell scripts, not this crate)
 
 `crates/debian-media` owns Debian. The other two distributions are fetched by

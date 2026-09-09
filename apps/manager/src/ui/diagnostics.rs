@@ -134,7 +134,6 @@ fn backend_card(ui: &mut egui::Ui, app: &ManagerApp) {
             for (capability, blocked) in [
                 ("3D acceleration", Backend::Native.virgl_block()),
                 ("TAP networking", Backend::Native.tap_block()),
-                ("Debian installer", Backend::Native.debian_install_block()),
             ] {
                 let line = match blocked {
                     None => format!("{capability}: available on both backends"),

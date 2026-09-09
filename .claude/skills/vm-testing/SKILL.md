@@ -682,6 +682,57 @@ Every attached device must reach `virtio device activated`. Two lines mean a gap
   you were watching — a kick reached the wrong device's ioeventfd, i.e. a BAR
   moved and the registration did not follow it (`DeviceNotifier::rebase`).
 
+## Installing Debian, on either host (`debian_install`)
+
+`apps/entangled/tests/debian_install.rs`, same shape as `ubuntu_install` and
+`fedora_install`, `#[ignore]`d, self-skipping:
+
+```bash
+entangled fetch bootstrap-kernel     # or build.sh + build-bootstrap-initramfs.sh
+cargo test -p entangled --test debian_install -- --ignored --nocapture
+```
+
+It skips on a host with no hypervisor, and on a host with no **bootstrap kernel
++ initramfs** — which it looks for in the three places `entangled` does, in the
+same order: `ENTANGLED_BOOTSTRAP_DIR`, `artifacts/bootstrap/` in the checkout,
+then any tag directory under `<cache>/bootstrap/`. That last one is what
+`entangled fetch bootstrap-kernel` fills, and it is why this test can run on
+Windows at all: the kernel is a Linux kernel build with no cross-compile.
+
+What it asserts that the other two do not:
+
+- the install ends in an **ACPI power-off**, not d-i's default reboot. `Power
+  down` in the transcript is the assertion. A `reboot=k` triple fault is
+  reported as a stop by KVM and *absorbed* by WHP's local APIC, so on Windows
+  the installer VM would hang forever after a perfectly good install;
+- the generated profile's `kernel` and `initramfs` **exist as the profile spells
+  them**. A checkout that built its own keeps the historical relative
+  `artifacts/bootstrap/vmlinuz`; a host that downloaded the pair gets absolute
+  paths, and a relative one there names nothing. The test resolves relative
+  paths against the repo root and absolute ones as-is, which is exactly what
+  `entangled run` does;
+- `root=UUID=` rather than `root=/dev/vda1`.
+
+### Measured on this machine (Windows/WHP, 2026-09-09)
+
+| What | Number |
+|---|---|
+| `entangled install debian --auto --headless --network usernet`, d-i trixie, 1536 MiB | **6 min 34 s** by hand, **7 min 36 s** under the test |
+| installed system to `<vm name> login:` on ttyS0 | **7.3 s** |
+| Weston desktop drawn at 1920x1080 (screenshot at 45 s) | 76 distinct colours sampled, panel and clock legible |
+| the whole `debian_install` test, install + boot | 7 min 45 s |
+
+Two things about that boot worth knowing before you write an assertion on it:
+
+- **there is no bootloader and no firmware.** The profile boots the bootstrap
+  kernel directly, its initramfs prints `entangled-bootstrap: switching root to
+  /dev/vda1` and hands over to systemd. So none of the Ubuntu test's markers
+  apply here — no `BdsDxe`, no `shimx64.efi`, no GRUB banner — and 7 seconds
+  to a login prompt is normal rather than suspicious;
+- **the login prompt carries the VM name**, because `install debian` preseeds it
+  through `netcfg/get_hostname`: `e2e-debian login:`, not `debian login:`. Same
+  trap the Fedora test documents.
+
 ## Fuzzing (MVP-1402)
 
 `cargo-fuzz` targets live under `fuzz/`, which is its own workspace and is listed

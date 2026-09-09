@@ -177,9 +177,19 @@ times:
   worktree has NO firmware — `run` with UEFI boot fails with "cannot read
   firmware". Worktrees each need their own artifacts (or run the script once
   in the checkout you test from).
-- `scripts/fetch-test-kernel.sh` fetches the bootstrap kernel;
+- `scripts/fetch-test-kernel.sh` fetches the *Debian installer's* kernel for the
+  boot tests (not our bootstrap kernel — the name has misled people);
   `scripts/fetch-ubuntu-iso.sh [desktop]` fetches + verifies ISOs into the
   shared cache.
+- **The bootstrap kernel + initramfs no longer have to be built.**
+  `entangled fetch bootstrap-kernel` downloads the published pair (~13 MiB,
+  SHA-256 pinned in `guest/bootstrap-kernel/pinned.toml`) into
+  `<cache>/bootstrap/<tag>/`, which is shared machine state like the ISOs —
+  never delete it to free space. On Windows it is the only way to get them.
+  Building them locally still wins: `artifacts/bootstrap/` in a checkout is
+  preferred over the cache, so a rebuild is never shadowed by a download.
+  `ENTANGLED_BOOTSTRAP_DIR` points at a directory holding both, which is the
+  cheapest way to give a fresh worktree the pair without copying files.
 
 ## Worktree workflow for parallel agents
 

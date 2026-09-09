@@ -82,6 +82,19 @@ entry) and the installer's own transcript.
 
 Or press **+ Create machine** in `entangled-manager` and let the wizard do it.
 
+Debian is the same two commands with one extra in front, on either host:
+
+```bash
+entangled fetch bootstrap-kernel   # ~13 MiB: the Debian installer cannot run on
+                                   # Debian's own kernel here, so we ship one
+entangled install debian --disk ~/entangled-vms/debian.raw --size 32G --auto --headless
+```
+
+That kernel is upstream Linux, **GPL-2.0-only**, published with its corresponding
+source; it is checked against a SHA-256 pinned in the binary, which is a weaker
+guarantee than the pinned OpenPGP keys the ISOs get. Both facts are spelled out
+in the [user guide](docs/user-guide.md#the-guest-bootstrap-artifacts).
+
 ## Development
 
 This is also a working repository. [CLAUDE.md](CLAUDE.md) is the map: the

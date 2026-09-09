@@ -96,14 +96,33 @@ explicit choice between a new sparse RAW image and an existing image in the VM
 directory; the latter is never recreated or truncated.
 
 Which family the wizard *opens* on is per host: `GuestFamily::default_for_host()`
-is Ubuntu on Windows and Debian on Linux, because the Debian path boots the
-project's bootstrap kernel and that is a Linux kernel build with no cross build.
-`suggest_name` uses the same answer, so a fresh wizard on Windows proposes
-`ubuntu-1` — the name becomes the disk, the profile and the hostname, so the
-wrong distro's name outlives the wizard. Pre-flight is per family too
+is Ubuntu on Windows and Debian on Linux. That is now a *preference*, not a
+capability — Ubuntu installs entirely offline from a verified ISO while d-i
+downloads the system from a mirror, so it is the better first experience on a
+laptop. `suggest_name` uses the same answer, so a fresh wizard on Windows
+proposes `ubuntu-1` — the name becomes the disk, the profile and the hostname,
+so the wrong distro's name outlives the wizard. Pre-flight is per family
 (`launcher::missing_install_artifact`): the UEFI firmware for Ubuntu, the
-bootstrap kernel for Debian. Gating both on the kernel is what once made the
-only installer that works on Windows unreachable there.
+bootstrap kernel **and initramfs** for Debian. Gating both on the kernel is what
+once made the only installer that works on Windows unreachable there.
+
+**`Backend::debian_install_block` is gone, and do not bring it back.** It greyed
+out the Debian card on the Windows backend because the bootstrap kernel could
+not be built there. The kernel is now *downloaded*
+(`entangled fetch bootstrap-kernel`, digest-pinned), so the card is offered on
+both hosts and the only question left is whether this machine has the files yet
+— which is a pre-flight with a command in its message, not a capability gate.
+A greyed-out control that says "this backend cannot" about something the backend
+*can* is worse than no gate at all.
+
+`missing_install_artifact` therefore looks in three places for the Debian pair,
+mirroring `apps/entangled/src/bootstrap.rs` (which is the authority):
+`ENTANGLED_BOOTSTRAP_DIR`, the child's working directory, then any tag directory
+under `<cache>/bootstrap/`. The cache arm is deliberately *more* generous than
+the CLI's — the CLI knows which release tag this build pins and the manager
+does not — because the failure mode of being generous is an install that
+starts and gets a precise message from the CLI, which beats any message this
+check could write.
 
 The resulting `entangled install <debian|ubuntu> --disk <path> --size <n>G
 [--variant <v>] --memory-mib <max(1536, m)> --name <name> [--iso <path>]

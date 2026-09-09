@@ -47,22 +47,25 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                         // An installer this backend cannot run is greyed out
                         // with the reason on hover, rather than failing forty
                         // minutes later inside the engine.
-                        let debian_block = state.machine.backend.debian_install_block();
                         ui.horizontal(|ui| {
                             let card_width =
                                 (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
+                            // Debian is offered on both hosts now: its bootstrap
+                            // kernel is downloaded rather than built where it
+                            // cannot be built. Whether *this* machine has it yet
+                            // is a pre-flight question with a command as its
+                            // answer (launcher::missing_install_artifact), not a
+                            // backend capability, so nothing is greyed out here.
                             let debian = option_card(
                                 ui,
                                 card_width,
                                 "Debian",
                                 "Verified network or official installer media",
                                 state.machine.family == launcher::GuestFamily::Debian,
-                                debian_block.is_none(),
+                                true,
                                 theme::CYAN,
                             );
-                            if let Some(reason) = debian_block {
-                                debian.on_hover_text(reason.long);
-                            } else if debian.clicked() {
+                            if debian.clicked() {
                                 state.machine.family = launcher::GuestFamily::Debian;
                             }
                             if option_card(
@@ -79,15 +82,6 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                 state.machine.family = launcher::GuestFamily::Ubuntu;
                             }
                         });
-                        if let Some(reason) = debian_block {
-                            ui.add_space(6.0);
-                            ui.label(RichText::new(reason.short).color(theme::WARN).size(11.5));
-                            // Keep the form honest: never leave a blocked
-                            // choice selected behind the user's back.
-                            if state.machine.family == launcher::GuestFamily::Debian {
-                                state.machine.family = launcher::GuestFamily::Ubuntu;
-                            }
-                        }
                         ui.add_space(16.0);
                         match state.machine.family {
                             launcher::GuestFamily::Debian => {
