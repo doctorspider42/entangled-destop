@@ -16,13 +16,15 @@ the GUI can do, and a GUI crash can never take a guest down.
 main.rs      CLI flags (--vm-dir, --entangled, --mock, --screenshot[-view]) + tracing
 app.rs       ManagerApp (eframe::App): state, Action loop, frame layout
   ui/        views: top bar + side navigation, cards, guided wizard/dialogs,
-             Disks, Diagnostics, activity pane and toasts
+             Disks, Snapshots, Diagnostics, activity pane and toasts
   theme.rs   every colour, radius and font size in the product
   logo.rs    procedural mark + install spinner (egui painter, no assets)
 settings.rs  ~/.config/entangled/manager.toml, typed load/save
 update.rs    startup update check (GitHub /releases/latest) + installer
              download/launch, both on background threads; banner in cards.rs
 discovery.rs VM directory scan through control-api, delete plan + guards
+snapshots.rs reading the *.esnap files in the VM directory, and the verdict
+             that decides whether Resume is even offered (ADR-0006)
 launcher.rs  finding the engine (path + origin + version), Runner, install/run
              argument vectors
 backend.rs   where a machine runs (native vs WSL), the capability matrix and
@@ -291,9 +293,10 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
 - `--screenshot <png> [--screenshot-view <surface>]` renders a few frames, saves
   a PNG through `ViewportCommand::Screenshot` and exits — the quickest way to
   review a visual change without a human at the keyboard. Surfaces:
-  `main`, `wizard`, `settings`, `disks`, `diagnostics`, and one per editor
-  section: `editor` (Hardware), `editor-boot`, `editor-network`,
-  `editor-storage`. **Every new surface gets one**, or it cannot be reviewed.
+  `main`, `wizard`, `settings`, `disks`, `snapshots`, `snapshot-delete`,
+  `snapshot-discard`, `diagnostics`, and one per editor section: `editor`
+  (Hardware), `editor-boot`, `editor-network`, `editor-storage`. **Every new
+  surface gets one**, or it cannot be reviewed.
 - Alignment regressions do not survive a look at the pixels but do survive a
   glance at the window. When touching form layout, measure: crop the PNG and
   compare the right-hand edge of each field (PIL is available on this machine).
@@ -334,3 +337,52 @@ Two honesty rules the UI follows, and should keep following:
 `Task::send_control` drops the pipe on a write error, so a child that exited
 between the click and the write turns the buttons off instead of retrying into a
 broken pipe.
+
+## Suspend, Resume and the Snapshots view (ADR-0006)
+
+Suspend rides the same pipe as Pause and Restart — `Task::suspend` writes one
+`save` line — and Resume is a different child command, `entangled resume
+--control-stdin <file>` (`launcher::resume_spec`), with the same `TaskKind::Run`
+and the same log, because "resumed" and "started" are one event in a machine's
+history. Four rules earned by building it:
+
+- **The vocabulary is `control_api::control`, never a literal.** Two crates sit
+  at the ends of that pipe. A prefix spelled twice drifts, and the failure is
+  silent: the Suspend button spins until the child exits and then says the wrong
+  thing. `parse_reply` / `save_outcome` are the reader.
+- **A failed suspend still exits 0.** The engine stops the VM either way, so the
+  exit status cannot tell success from a snapshot that was never written — the
+  reply line is the only answer, and `LogBuffer::push_line` lifts it out **as it
+  goes past**. Scanning the tail afterwards loses it: a desktop guest can push
+  the whole log buffer through in the seconds a suspend takes.
+- **`Suspended` is a fact on disk, not a process.** `status_of` returns it for a
+  machine with no child *and* a `<name>.esnap` beside its profile, which is why
+  a card still reads correctly after the manager restarts. Only that
+  conventional path counts — a hand-made copy is a row in the Snapshots view,
+  not something a card offers to resume.
+- **Refusals are computed before the button is drawn**, in the scan worker:
+  `vm_snapshot::inspect` is a file open, and `snapshots::verdict` turns it into
+  plain sentences. Two things the engine cannot decide for the manager: the host
+  check follows the machine's **backend** (a Linux snapshot is right for a
+  Windows manager whose machine runs under WSL), and a path recorded by the
+  other engine (`/mnt/d/...` seen from Windows) is left to that engine rather
+  than reported as a disk that has vanished — see `snapshots::nameable_here`.
+
+### Cards that grow
+
+`horizontal_wrapped` only reports how many lines it took **after** it has drawn
+them, and a card's action strip is bottom-anchored, so a wrapped second line
+grows straight through the border. Both places that hit this now measure instead
+of declaring: `cards::measured_action_height` and the Snapshots row lay their
+content out once in an `egui::UiBuilder::new().sizing_pass().invisible()` child
+and use the resulting height. Declaring a line count per state was the first
+attempt and it was wrong the day a state was added — silently, because only a
+screenshot shows it. When you add a button or a sentence to a card, take the
+screenshot and check the pixels; `CARD_HEIGHT` is still a fixed floor and the
+tallest state (Suspended: two chip rows, a "saved 3 hours ago" line and two
+button lines) is what sets it.
+
+Related: a suspended machine's extra line is **always exactly one**. When the
+snapshot cannot go back it reads "saved 3 hours ago · 1.1 GiB · cannot resume
+here" with the full reason on the hover, rather than adding a second line the
+card has no room for.

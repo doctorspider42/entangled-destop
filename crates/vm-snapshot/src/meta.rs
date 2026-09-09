@@ -380,6 +380,43 @@ impl Metadata {
     }
 }
 
+/// A snapshot's `created_unix` as `YYYY-MM-DD HH:MM:SS UTC`.
+///
+/// Here rather than in each frontend because two of them already print it —
+/// `entangled snapshot` and the manager's Snapshots view — and a snapshot's
+/// timestamp reading differently in the two places it appears is the kind of
+/// difference a person spends five minutes on. The civil-date arithmetic is
+/// the RTC's, so this workspace still has exactly one copy of it and no date
+/// crate in the graph.
+pub fn format_unix(seconds: i64) -> String {
+    let t = machine_x86::rtc::civil_from_unix(seconds);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
+}
+
+/// How long ago `seconds` was, in the roughest useful unit ("4 minutes ago").
+///
+/// Rough on purpose: a list of snapshots is scanned for "which one is the one
+/// I just took", and to the second is noise next to the absolute stamp beside
+/// it.
+pub fn describe_age(seconds: i64, now: i64) -> String {
+    let delta = now - seconds;
+    if delta < 0 {
+        // A clock that moved backwards, or a file from another machine. Saying
+        // "in 3 hours" would be worse than saying nothing definite.
+        return "clock is behind this snapshot".to_string();
+    }
+    let plural = |n: i64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    match delta {
+        0..=44 => "just now".to_string(),
+        45..=5399 => plural((delta + 30) / 60, "minute"),
+        5400..=86_399 => plural((delta + 1800) / 3600, "hour"),
+        _ => plural((delta + 43_200) / 86_400, "day"),
+    }
+}
+
 /// Seconds since the Unix epoch, or 0 on a host whose clock is before it.
 pub fn now_unix() -> i64 {
     SystemTime::now()
@@ -513,5 +550,25 @@ mod tests {
         let note = fp.check().unwrap().expect("a note");
         assert!(note.contains("firmware"), "{note}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_timestamp_reads_the_same_everywhere_it_is_printed() {
+        // 2026-08-21 09:14:05 UTC.
+        assert_eq!(format_unix(1_787_303_645), "2026-08-21 09:14:05 UTC");
+        assert_eq!(format_unix(0), "1970-01-01 00:00:00 UTC");
+    }
+
+    #[test]
+    fn ages_round_to_the_unit_a_person_would_say() {
+        let now = 1_787_303_645;
+        assert_eq!(describe_age(now, now), "just now");
+        assert_eq!(describe_age(now - 60, now), "1 minute ago");
+        assert_eq!(describe_age(now - 3 * 60, now), "3 minutes ago");
+        assert_eq!(describe_age(now - 2 * 3600, now), "2 hours ago");
+        assert_eq!(describe_age(now - 3 * 86_400, now), "3 days ago");
+        // A file from a machine whose clock is ahead says so rather than
+        // claiming the future.
+        assert!(describe_age(now + 3600, now).contains("clock"));
     }
 }

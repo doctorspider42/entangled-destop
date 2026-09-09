@@ -2,6 +2,7 @@
 //! first consumer; the crate exists so a future GUI talks to the same model.
 
 mod config;
+pub mod control;
 
 pub use config::{
     BootMode, BootSection, CdromSection, ConfigError, DiskSection, DisplaySection, GamepadBackend,

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use control_api::{DiskSection, VmConfig};
+use control_api::{DiskSection, VirtioTransport, VmConfig};
 use thiserror::Error;
 
 pub use disk_image::format_bytes;
@@ -64,6 +64,10 @@ pub struct VmEntry {
     pub profile_path: PathBuf,
     pub memory_mib: u64,
     pub vcpus: u32,
+    /// Which virtio transport the guest sees. Part of the machine's *shape*,
+    /// so a snapshot taken with one cannot be restored onto the other — which
+    /// is why the card layer needs it and not just the editor.
+    pub transport: VirtioTransport,
     pub display: (u32, u32),
     pub network_interface: Option<String>,
     pub disks: Vec<DiskInfo>,
@@ -103,6 +107,9 @@ pub struct Scan {
     /// Every disk the profiles reference plus every loose `*.raw` in the VM
     /// directory (the Disks view).
     pub disks: Vec<DiskRow>,
+    /// Every `*.esnap` in the VM directory, read (the Snapshots view, and the
+    /// third resting state a card can be in).
+    pub snapshots: Vec<crate::snapshots::SnapshotRow>,
 }
 
 /// Scans `vm_dir` for VM profiles. A single broken profile never fails the
@@ -138,6 +145,7 @@ pub fn scan(vm_dir: &Path, work_dir: Option<&Path>) -> Result<Scan, DiscoveryErr
     scan.vms.sort_by(|a, b| a.name.cmp(&b.name));
     scan.problems.sort_by(|a, b| a.path.cmp(&b.path));
     scan.disks = disk_rows(&scan.vms, vm_dir);
+    scan.snapshots = snapshot_rows(vm_dir);
     Ok(scan)
 }
 
@@ -176,6 +184,7 @@ fn entry_from_config(path: &Path, cfg: &VmConfig, work_dir: Option<&Path>) -> Vm
         profile_path: path.to_path_buf(),
         memory_mib: cfg.memory_mib,
         vcpus: cfg.vcpus,
+        transport: cfg.transport,
         display: (cfg.display.width, cfg.display.height),
         network_interface: cfg.network.as_ref().and_then(|n| n.interface.clone()),
         disks,
@@ -202,6 +211,40 @@ fn resolve(path: &Path, work_dir: Option<&Path>, profile_dir: Option<&Path>) -> 
     }
 }
 
+/// Every snapshot file in the VM directory, read into a row.
+///
+/// The directory rather than "one per machine": a snapshot survives the machine
+/// it came from — its profile can be deleted, renamed or never have existed on
+/// this computer — and a half-gigabyte file nobody can see is a file nobody can
+/// delete. The row says which machine it is of, from the snapshot's own copy of
+/// the profile.
+pub fn snapshot_rows(vm_dir: &Path) -> Vec<crate::snapshots::SnapshotRow> {
+    let Ok(entries) = std::fs::read_dir(vm_dir) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<crate::snapshots::SnapshotRow> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext == vm_snapshot::EXTENSION)
+        })
+        .map(|path| crate::snapshots::read(&path))
+        .collect();
+    // Newest first: the one just taken is the one being looked for.
+    rows.sort_by(|a, b| {
+        let key = |row: &crate::snapshots::SnapshotRow| {
+            row.facts.as_ref().map(|f| f.created_unix).unwrap_or(0)
+        };
+        key(b)
+            .cmp(&key(a))
+            .then_with(|| a.file_name.cmp(&b.file_name))
+    });
+    rows
+}
+
 /// Files a delete would remove, in order. Disks outside the VM directory are
 /// deliberately left alone: a profile may point at a shared base image.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -223,11 +266,14 @@ pub fn plan_delete(entry: &VmEntry, vm_dir: &Path) -> DeletePlan {
             plan.kept_outside_vm_dir.push(disk.resolved.clone());
         }
     }
-    // Byproducts of the install flow and our own logs, best-effort.
+    // Byproducts of the install flow and our own logs, best-effort — plus the
+    // suspended session, which is bound to this machine's disks and useless the
+    // moment they are gone (ADR-0006).
     for byproduct in [
         vm_dir.join(format!("{}-install.log", entry.name)),
         vm_dir.join(format!("{}-run.log", entry.name)),
         vm_dir.join(format!("{}.install-initrd.img", entry.name)),
+        crate::snapshots::path_for(entry),
     ] {
         if byproduct.exists() {
             plan.remove.push(byproduct);

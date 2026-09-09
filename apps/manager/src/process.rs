@@ -109,6 +109,16 @@ struct LogBuffer {
     dropped: usize,
     partial: String,
     ansi: Ansi,
+    /// The suspend outcome, lifted out of the child's own reply line as it
+    /// goes past (ADR-0006).
+    ///
+    /// Read here rather than by scanning the tail later for two reasons: a
+    /// chatty guest can push 4000 lines through the buffer in the seconds a
+    /// desktop-sized suspend takes, and the reply is the *only* place the
+    /// reason for a failure appears — the process then exits with status 0
+    /// either way, so the exit code cannot tell success from a snapshot that
+    /// was never written.
+    save_result: Option<Result<String, String>>,
 }
 
 impl LogBuffer {
@@ -164,6 +174,12 @@ impl LogBuffer {
     }
 
     fn push_line(&mut self, text: String) {
+        if let Some(outcome) = control_api::control::parse_reply(&text)
+            .as_ref()
+            .and_then(control_api::control::save_outcome)
+        {
+            self.save_result = Some(outcome);
+        }
         if self.lines.len() == LOG_CAPACITY {
             self.lines.pop_front();
             self.dropped += 1;
@@ -231,6 +247,17 @@ struct Shared {
     /// claim; the VM's own idea of its state is one `status` command away for
     /// anything that needs the truth.
     pause_requested: AtomicBool,
+    /// Whether the manager has asked this VM to write itself to a file and stop
+    /// (ADR-0006). Unlike a pause this is **one-way**: `Suspended` never goes
+    /// back to `Running` in the same process, so the flag is set once and stays
+    /// set for the rest of the task's life. It is what tells the card that a
+    /// child which is about to exit is not being stopped, and what stops the
+    /// exit being reported as "powered off".
+    suspend_requested: AtomicBool,
+    /// When the suspend was asked for, so the card can say how long it has been
+    /// writing. The engine reports no progress while it runs — the honest thing
+    /// to show is elapsed time and what to expect.
+    suspend_at: Mutex<Option<Instant>>,
 }
 
 /// A supervised child process.
@@ -310,6 +337,48 @@ impl Task {
         // A reset always leaves the VM running, whichever state it was in.
         self.shared.pause_requested.store(false, Ordering::Release);
         true
+    }
+
+    /// Writes the whole machine to its snapshot file and stops it (ADR-0006).
+    ///
+    /// A bare `save`: the engine's default path is `<name>.esnap` beside the
+    /// profile, derived from the same two facts
+    /// [`crate::snapshots::path_for`] derives it from, so the manager knows
+    /// where the file will appear without naming it on a command line it would
+    /// have to translate for WSL.
+    ///
+    /// One-way, by construction. The engine serves a save ahead of every other
+    /// lifecycle request and exits afterwards whether it worked or not, so
+    /// there is nothing to un-ask.
+    pub fn suspend(&self) -> bool {
+        if self.suspend_requested() {
+            return true;
+        }
+        if !self.send_control(control_api::control::CMD_SAVE) {
+            return false;
+        }
+        *self.shared.suspend_at.lock_or_recover() = Some(Instant::now());
+        self.shared.suspend_requested.store(true, Ordering::Release);
+        true
+    }
+
+    /// Whether this VM is on its way into a file.
+    pub fn suspend_requested(&self) -> bool {
+        self.shared.suspend_requested.load(Ordering::Acquire)
+    }
+
+    /// How long the suspend has been running, for the card's progress line.
+    pub fn suspending_for(&self) -> Option<Duration> {
+        self.shared
+            .suspend_at
+            .lock_or_recover()
+            .map(|at| at.elapsed())
+    }
+
+    /// The engine's own answer to the suspend: the file and a summary, or why
+    /// there is no file. `None` until the reply line arrives.
+    pub fn save_result(&self) -> Option<Result<String, String>> {
+        self.shared.log.lock_or_recover().save_result.clone()
     }
 
     fn send_control(&self, command: &str) -> bool {
@@ -447,6 +516,8 @@ impl Supervisor {
             kill: AtomicBool::new(false),
             control: Mutex::new(child.stdin.take()),
             pause_requested: AtomicBool::new(false),
+            suspend_requested: AtomicBool::new(false),
+            suspend_at: Mutex::new(None),
         });
 
         let id = self.next_id;
@@ -1002,5 +1073,84 @@ mod tests {
 
         sup.prune(1);
         assert_eq!(sup.tasks().len(), 1);
+    }
+
+    /// The suspend outcome is lifted out of the reply line as it goes past.
+    /// Scanning the tail afterwards would not do: the guest's console shares
+    /// this buffer and a desktop can push [`LOG_CAPACITY`] lines through it
+    /// while the snapshot is being written.
+    #[test]
+    fn a_save_reply_is_captured_even_when_the_log_wraps_past_it() {
+        let mut log = LogBuffer::default();
+        log.push_chunk(
+            "entangled-control: saved /vms/demo.esnap 514 MiB in 2.76s
+",
+        );
+        let outcome = log.save_result.clone().expect("captured");
+        assert_eq!(
+            outcome.expect("success"),
+            "/vms/demo.esnap 514 MiB in 2.76s"
+        );
+        for i in 0..LOG_CAPACITY + 10 {
+            log.push_chunk(&format!(
+                "guest line {i}
+"
+            ));
+        }
+        assert!(log.dropped > 0, "the reply line has been evicted");
+        assert!(log.save_result.is_some(), "but its outcome is still known");
+    }
+
+    /// A suspend that fails still exits the VM with status 0, so the reply line
+    /// is the only place the reason ever appears.
+    #[test]
+    fn a_failed_save_keeps_its_reason() {
+        let mut log = LogBuffer::default();
+        log.push_chunk(
+            "entangled-control: error save no space left on device
+",
+        );
+        let reason = log.save_result.clone().expect("captured").unwrap_err();
+        assert_eq!(reason, "no space left on device");
+    }
+
+    /// Suspend is one-way (ADR-0006) and needs a control channel, like Pause.
+    #[cfg(unix)]
+    #[test]
+    fn suspend_writes_save_down_the_control_channel_once() {
+        let dir = temp_dir("proc-suspend");
+        let mut sup = Supervisor::new(no_waker());
+        // A child that copies its stdin into its stdout, which the supervisor
+        // has pointed at the log file — so what the manager wrote comes back
+        // through the same path a real reply would.
+        let mut spec = spec(&dir, "sleeper", "/bin/sh", &["-c", "cat"]);
+        spec.control = true;
+        let id = sup.spawn(spec).expect("spawn");
+        wait_until(|| sup.is_busy("sleeper"), "running state");
+
+        let task = sup.task(id).expect("task");
+        assert!(!task.suspend_requested());
+        assert!(task.suspend(), "the control channel took it");
+        assert!(task.suspend_requested());
+        assert!(task.suspending_for().is_some(), "the clock started");
+        // Asking twice must not write a second `save`: the engine serves the
+        // first one and exits, and a second line would land on a dead pipe.
+        assert!(task.suspend());
+
+        wait_until(
+            || {
+                sup.task(id)
+                    .is_some_and(|t| t.log_tail(20).0.iter().any(|l| l == "save"))
+            },
+            "the save command to reach the child",
+        );
+        let echoed = sup.task(id).expect("task").log_tail(20).0;
+        assert_eq!(
+            echoed.iter().filter(|l| *l == "save").count(),
+            1,
+            "one save, not two: {echoed:?}"
+        );
+        sup.task(id).expect("task").request_kill();
+        wait_until(|| !sup.any_active(), "child exit");
     }
 }
