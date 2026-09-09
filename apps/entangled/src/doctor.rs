@@ -120,18 +120,14 @@ fn install_readiness() {
     /// relative paths `install` resolves them with — so `doctor` run from the
     /// wrong working directory reports exactly what `install` would fail on.
     const FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
-    const BOOTSTRAP_KERNEL: &str = "artifacts/bootstrap/vmlinuz";
     const FIRMWARE_HINT: &str =
         "`bash guest/firmware/build-cloudhv.sh` (~2.5 min), or pass --firmware";
-    const KERNEL_HINT: &str = concat!(
-        "Debian only: `bash guest/bootstrap-kernel/build.sh` on Linux, ",
-        "or copy artifacts/bootstrap/ in from a Linux checkout"
-    );
 
     println!("  install         : ubuntu — UEFI + verified ISO, offline (no mirror needed)");
     println!("                    debian — d-i on the bootstrap kernel, needs the network");
+    println!("                    fedora — netinst through UEFI, kickstart, needs the network");
     artifact("firmware        ", Path::new(FIRMWARE), FIRMWARE_HINT);
-    artifact("bootstrap kernel", Path::new(BOOTSTRAP_KERNEL), KERNEL_HINT);
+    bootstrap_artifacts();
 
     match crate::paths::ubuntu_cache_dir() {
         Ok(dir) => match crate::paths::newest_iso(&dir) {
@@ -167,6 +163,40 @@ fn install_readiness() {
         "    network         --network {} by default on this host",
         crate::DEFAULT_NETWORK
     );
+}
+
+/// The Debian path's kernel + initramfs: present, or fetchable, and from where.
+///
+/// It answers the question `install debian` would fail on, through the same
+/// resolver `install debian` uses — so a checkout that built its own, a host
+/// that downloaded the published pair and a host that has neither each report
+/// what they actually are. "MISSING" here used to be a dead end on Windows; it
+/// is now a command.
+#[cfg(any(target_os = "linux", windows))]
+fn bootstrap_artifacts() {
+    match crate::bootstrap::locate() {
+        Some(found) => {
+            println!(
+                "    bootstrap kernel {} ({}, from {})",
+                found.kernel.display(),
+                size_of(&found.kernel),
+                found.origin.as_str()
+            );
+            println!(
+                "    bootstrap initrd {} ({})",
+                found.initrd.display(),
+                size_of(&found.initrd)
+            );
+        }
+        None => {
+            let pinned = crate::bootstrap::pinned()
+                .map(|pin| format!("{} (Linux {})", pin.tag, pin.kernel_version))
+                .unwrap_or_else(|e| format!("pin unreadable: {e}"));
+            println!("    bootstrap kernel MISSING — needed by `install debian` only");
+            println!("                    {}", crate::bootstrap::missing_hint());
+            println!("                    pinned release: {pinned}");
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", windows))]

@@ -1,0 +1,222 @@
+name: Guest artifacts
+
+# Builds the two guest-side files `entangled install debian` needs — the
+# bootstrap kernel and its initramfs — and publishes them, with the kernel's
+# corresponding source, as an immutable GitHub Release.
+#
+# WHY THIS EXISTS
+#   The Debian installer cannot run on Debian's own kernel here: they build
+#   virtio_mmio without CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES, so d-i sees none of
+#   our devices. We build our own, and that is a Linux kernel build with no
+#   cross-compile — which left `install debian` impossible on Windows. Building
+#   it once on Linux and letting every host download it is the fix.
+#
+# WHY IT IS ITS OWN RELEASE AND NOT AN ASSET OF THE INSTALLER RELEASE
+#   Three reasons, in order of weight:
+#     1. Distributing a compiled Linux kernel is distributing GPL-2.0-only
+#        software, and GPLv2 §3 wants the corresponding source available from
+#        the same place. That is the ~145 MB upstream tarball. Attaching it to
+#        every push-to-main release would upload it hundreds of times a year.
+#     2. The pin in guest/bootstrap-kernel/pinned.toml names a tag, and the
+#        whole point of a pin is that the bytes behind it never change. A tag
+#        that is rebuilt on every push cannot be pinned.
+#     3. The kernel changes when its config changes, which is roughly never;
+#        the installer changes on every commit. Tying the two together would
+#        mean rebuilding a kernel to ship a typo fix.
+#   `--latest=false` keeps /releases/latest pointing at the installer release,
+#   which is what the manager's update check reads (apps/manager/src/update.rs).
+#
+# AFTER IT RUNS
+#   The job summary contains the exact TOML block to paste into
+#   guest/bootstrap-kernel/pinned.toml. Until that is committed, `entangled`
+#   keeps fetching the *previous* tag, which still exists — release tags are
+#   never reused, so nothing breaks in between.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    # Deliberately NOT pinned.toml: committing the pin this job prints must not
+    # start another build of the thing it just pinned.
+    paths:
+      - guest/bootstrap-kernel/build.sh
+      - guest/bootstrap-kernel/entangled.config
+      - guest/bootstrap-initramfs/**
+      - scripts/build-bootstrap-initramfs.sh
+      - .github/workflows/guest-artifacts.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: guest-artifacts
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Build the bootstrap kernel and publish it with its source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The initramfs `init` is a static musl binary (see
+          # scripts/build-bootstrap-initramfs.sh).
+          targets: x86_64-unknown-linux-musl
+
+      - name: Read the pinned kernel version
+        id: kernel
+        run: |
+          set -euo pipefail
+          # One source of truth: the default in build.sh. A workflow that
+          # hard-coded its own version would build one kernel and label it
+          # another.
+          version=$(sed -n 's/^KERNEL_VERSION="\${KERNEL_VERSION:-\([0-9.]*\)}"$/\1/p' \
+              guest/bootstrap-kernel/build.sh)
+          if [ -z "$version" ]; then
+            echo "cannot read KERNEL_VERSION out of guest/bootstrap-kernel/build.sh" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=guest-artifacts-$version-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "kernel $version, tag guest-artifacts-$version-${{ github.run_number }}"
+
+      - name: Kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libelf-dev libssl-dev cpio xz-utils
+
+      # The tarball and the unpacked tree, keyed on the version and the config
+      # fragment: a config change must not reuse an object tree built from the
+      # old one, and a version bump must not reuse the old source at all.
+      - name: Cache the kernel tree
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/entangled-kernel
+          key: entangled-kernel-${{ steps.kernel.outputs.version }}-${{ hashFiles('guest/bootstrap-kernel/entangled.config', 'guest/bootstrap-kernel/build.sh') }}
+          restore-keys: |
+            entangled-kernel-${{ steps.kernel.outputs.version }}-
+
+      - name: Build the bootstrap kernel
+        run: bash guest/bootstrap-kernel/build.sh
+
+      - name: Build the bootstrap initramfs
+        run: bash scripts/build-bootstrap-initramfs.sh
+
+      - name: Assemble the release payload (binaries + corresponding source)
+        id: payload
+        run: |
+          set -euo pipefail
+          version="${{ steps.kernel.outputs.version }}"
+          tag="${{ steps.kernel.outputs.tag }}"
+          out=release-payload
+          src=~/.cache/entangled-kernel/linux-$version.tar.xz
+          mkdir -p "$out"
+
+          cp artifacts/bootstrap/vmlinuz artifacts/bootstrap/initrd.img "$out/"
+          # The .config the kernel was actually built with — part of the
+          # corresponding source, not a nicety: without it nobody can reproduce
+          # this binary from the tarball.
+          cp ~/.cache/entangled-kernel/linux-$version/.config "$out/kernel-$version.config"
+          cp guest/bootstrap-kernel/entangled.config guest/bootstrap-kernel/build.sh "$out/"
+
+          # GPLv2 §3: the binary and its corresponding source from the same
+          # place. This is the "same place", so the tarball ships here. A job
+          # that could not find it must fail rather than publish a kernel with
+          # no source next to it.
+          if [ ! -s "$src" ]; then
+            echo "no kernel source tarball at $src — refusing to publish a GPL binary without it" >&2
+            exit 1
+          fi
+          cp "$src" "$out/"
+
+          ( cd "$out" && sha256sum vmlinuz initrd.img "linux-$version.tar.xz" > SHA256SUMS )
+          cat "$out/SHA256SUMS"
+
+          kernel_sha=$(sha256sum "$out/vmlinuz" | cut -d' ' -f1)
+          initrd_sha=$(sha256sum "$out/initrd.img" | cut -d' ' -f1)
+          kernel_bytes=$(stat -c%s "$out/vmlinuz")
+          initrd_bytes=$(stat -c%s "$out/initrd.img")
+          {
+            echo "kernel_sha=$kernel_sha"
+            echo "initrd_sha=$initrd_sha"
+            echo "kernel_bytes=$kernel_bytes"
+            echo "initrd_bytes=$initrd_bytes"
+          } >> "$GITHUB_OUTPUT"
+
+          cat > "$out/SOURCES.md" <<EOF
+          # Corresponding source for the binaries in this release
+
+          \`vmlinuz\` is a compiled **Linux $version**, licensed **GPL-2.0-only**.
+          Everything needed to rebuild it byte-for-similar is in this same
+          release, which is what GPLv2 §3 asks of a download:
+
+          | File | What it is |
+          |---|---|
+          | \`linux-$version.tar.xz\` | the unmodified upstream source, as fetched from cdn.kernel.org by \`build.sh\` |
+          | \`kernel-$version.config\` | the exact \`.config\` this \`vmlinuz\` was built with |
+          | \`entangled.config\` | the config fragment applied on top of \`defconfig kvm_guest.config\` |
+          | \`build.sh\` | the script that did it, unchanged from the commit below |
+
+          No patches are applied to the kernel: \`build.sh\` unpacks the tarball,
+          merges the fragment, runs \`olddefconfig\` and builds \`bzImage\`.
+
+          \`initrd.img\` is Entangled Desktop's own \`init\`
+          (\`guest/bootstrap-initramfs/init-rs\`, this repository's licence),
+          statically linked against musl (MIT). Its source is this repository at
+          the commit below.
+
+          Built from commit \`${{ github.sha }}\` by
+          \`.github/workflows/guest-artifacts.yml\`, run ${{ github.run_number }}.
+          EOF
+          ls -l "$out"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.kernel.outputs.tag }}"
+          # --latest=false: /releases/latest must keep pointing at the installer
+          # release, because that is what the manager's update check reads.
+          gh release create "$tag" \
+            --title "Guest artifacts — Linux ${{ steps.kernel.outputs.version }} (build ${{ github.run_number }})" \
+            --notes-file release-payload/SOURCES.md \
+            --latest=false \
+            release-payload/vmlinuz \
+            release-payload/initrd.img \
+            release-payload/SHA256SUMS \
+            release-payload/SOURCES.md \
+            "release-payload/kernel-${{ steps.kernel.outputs.version }}.config" \
+            release-payload/entangled.config \
+            release-payload/build.sh \
+            "release-payload/linux-${{ steps.kernel.outputs.version }}.tar.xz"
+
+      - name: The pin to commit
+        run: |
+          {
+            echo '## Published `${{ steps.kernel.outputs.tag }}`'
+            echo
+            echo 'Now replace the block below `# HOW TO UPDATE IT` in'
+            echo '`guest/bootstrap-kernel/pinned.toml` and commit it. Until you do,'
+            echo '`entangled fetch bootstrap-kernel` keeps serving the previous tag.'
+            echo
+            echo '```toml'
+            echo 'tag = "${{ steps.kernel.outputs.tag }}"'
+            echo 'kernel_version = "${{ steps.kernel.outputs.version }}"'
+            echo 'base_url = "https://github.com/${{ github.repository }}/releases/download"'
+            echo 'source = "https://github.com/${{ github.repository }}/releases/tag/${{ steps.kernel.outputs.tag }}"'
+            echo
+            echo '[[assets]]'
+            echo 'name = "vmlinuz"'
+            echo 'sha256 = "${{ steps.payload.outputs.kernel_sha }}"'
+            echo 'bytes = ${{ steps.payload.outputs.kernel_bytes }}'
+            echo
+            echo '[[assets]]'
+            echo 'name = "initrd.img"'
+            echo 'sha256 = "${{ steps.payload.outputs.initrd_sha }}"'
+            echo 'bytes = ${{ steps.payload.outputs.initrd_bytes }}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

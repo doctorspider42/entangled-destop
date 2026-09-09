@@ -176,20 +176,15 @@ impl Backend {
         }
     }
 
-    /// Why a Debian installation cannot start here, or `None`.
-    ///
-    /// The Debian installer boots the project's own bootstrap kernel, which is
-    /// a Linux kernel build with no cross build — so on the Windows backend it
-    /// is not "missing", it is unbuildable.
-    pub fn debian_install_block(self) -> Option<Block> {
-        (!self.is_linux_kvm()).then_some(Block {
-            short: "Not available here — install Ubuntu, or switch to \"WSL (KVM)\".",
-            long: "The Debian installer boots Entangled's own bootstrap kernel, and that \
-                   kernel is built on Linux only — there is no Windows build of it. \
-                   Install Ubuntu here (it boots verified media through UEFI and needs no \
-                   kernel), or switch this machine to \"WSL (KVM)\".",
-        })
-    }
+    // There was a `debian_install_block` here, and it said the Debian installer
+    // could not run on the Windows backend at all: its bootstrap kernel is a
+    // Linux kernel build with no cross build, so on Windows it was not
+    // "missing", it was unbuildable. That is no longer true — the kernel is
+    // built once on Linux by the release pipeline and downloaded by
+    // `entangled fetch bootstrap-kernel`, digest-pinned. What is left is an
+    // ordinary missing-artifact check with a command in it, which is
+    // `launcher::missing_install_artifact`, and a backend capability gate would
+    // now be a lie that greys out a working installer.
 }
 
 /// A capability this backend cannot offer, in two lengths.
@@ -467,7 +462,6 @@ mod tests {
         assert!(Backend::Wsl.is_linux_kvm());
         assert!(Backend::Wsl.virgl_block().is_none());
         assert!(Backend::Wsl.tap_block().is_none());
-        assert!(Backend::Wsl.debian_install_block().is_none());
 
         assert_eq!(Backend::Native.is_linux_kvm(), cfg!(target_os = "linux"));
         if cfg!(windows) {
@@ -477,7 +471,6 @@ mod tests {
             // The inline line must stay short enough to sit under a field.
             assert!(reason.short.len() < 90, "{}", reason.short);
             assert!(Backend::Native.tap_block().is_some());
-            assert!(Backend::Native.debian_install_block().is_some());
             assert!(Backend::Wsl.available_on_host());
         } else {
             assert!(Backend::Native.virgl_block().is_none());

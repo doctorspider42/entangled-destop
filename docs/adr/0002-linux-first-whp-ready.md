@@ -283,8 +283,35 @@ same shape `run_vm` uses — one shared body, the differences named in one place
 |---|---|---|
 | `install --network` default | `tap` | `usernet` |
 | `--network tap` | the host interface | typed refusal naming `--network usernet` |
-| Debian bootstrap kernel | `guest/bootstrap-kernel/build.sh` | no cross build; copy `artifacts/bootstrap/` in, or install Ubuntu |
+| Debian bootstrap kernel | `guest/bootstrap-kernel/build.sh`, or the same download | `entangled fetch bootstrap-kernel` — no cross build, so the release pipeline builds it once on Linux and every host downloads it |
 | Everything else | identical | identical |
+
+### Amendment: the last Linux-only row became a download
+
+That third row said "copy `artifacts/bootstrap/` in from a Linux checkout, or
+install Ubuntu", and it was the only remaining thing a Windows user could not
+do at all. The constraint underneath it is real and unchanged — a Linux kernel
+build does not cross-compile, and Debian's own installer kernel cannot drive
+virtio-mmio because they build the module without
+`CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` — but it is a constraint on *building*,
+not on *having*. So the artifact is built once on Linux by CI
+(`.github/workflows/guest-artifacts.yml`), published under an immutable release
+tag with the kernel's corresponding source beside it, and fetched by
+`entangled fetch bootstrap-kernel` into the same cache the ISOs use.
+
+Two portability notes this leaves behind, both in the spirit of the rules above:
+
+- **the resolver is portable and the build is not.** `apps/entangled/src/bootstrap.rs`
+  has no `cfg(target_os)` at all: the pin, the digest check, the cache layout and
+  the download are byte logic, and the only per-host difference is one sentence
+  of advice in a failure message. That is the same shape as `net_plan` — the
+  hosts differ in *what they can do locally*, never in the code path;
+- **a fetched artifact cannot be named by a relative path.** Profiles written on
+  a checkout still say `artifacts/bootstrap/vmlinuz`, because that is what the
+  manager's working-directory setting exists to make work; profiles written on a
+  host that downloaded the pair name it absolutely. One resolver decides, and
+  the profile records what it decided, rather than a constant being written into
+  a file that might be read from anywhere.
 
 **The riskiest thing about the port turned out not to exist.** The plan named
 the installer's networking as the highest-risk item — d-i and subiquity both
