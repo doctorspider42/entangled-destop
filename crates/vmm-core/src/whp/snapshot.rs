@@ -176,6 +176,16 @@ const FLAGS_PENDING: u32 = 1 << 9;
 const MAX_BATCH: usize = 64;
 
 impl WhpVcpu {
+    /// This processor's multiprocessing state, as the neutral [`MpState`].
+    ///
+    /// The peer of the KVM backend's `Vcpu::mp_state`, and the same rule
+    /// applies: only the thread that owns the VP may ask, so the census is
+    /// filed by the run loop's own thread.
+    pub(crate) fn mp_state(&self) -> Result<MpState, HvError> {
+        let activity = self.read_u64s(&[WHvRegisterInternalActivityState])?;
+        Ok(mp_state_from_activity(activity[0]))
+    }
+
     /// Reads a batch of named registers as plain 64-bit values.
     fn read_u64s(&self, names: &[WHV_REGISTER_NAME]) -> Result<Vec<u64>, HvError> {
         if names.len() > MAX_BATCH {
