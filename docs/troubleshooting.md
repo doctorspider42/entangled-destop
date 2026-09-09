@@ -37,29 +37,45 @@ one-line fix under it.
 ## `cannot read firmware`
 
 ```text
-cannot read firmware artifacts/firmware/CLOUDHV.fd: No such file or directory
+No UEFI firmware (CLOUDHV.fd) on this host, and a machine that starts via UEFI
+cannot boot without it.
 ```
 
-The UEFI firmware is a **build artifact, not a file in the repository**, and a
-fresh checkout — or a fresh git worktree, or a fresh Windows installation — does
-not have it. Every UEFI boot needs it: `install ubuntu`, `install fedora`,
-booting anything installed, `--cdrom`.
+The UEFI firmware is EDK2's CloudHvX64 build. Every UEFI boot needs it:
+`install ubuntu`, `install fedora`, booting anything installed, `--cdrom`.
 
-On Linux, build it once:
+**On a Windows installation it ships with the program**, in
+`artifacts\firmware` next to `entangled.exe`, and is found from any working
+directory. If it is missing there, something removed it — reinstalling puts it
+back.
+
+Otherwise, on either host, download it:
+
+```bash
+entangled fetch firmware        # 4 MiB, checked against a SHA-256 pinned in this build
+```
+
+While this repository is private that download needs a GitHub token
+(`GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth login`); without one it answers 404
+regardless of whether the release exists, and says so.
+
+On Linux you can also build it once:
 
 ```bash
 sudo apt-get install -y build-essential uuid-dev iasl nasm python3 git
 bash guest/firmware/build-cloudhv.sh          # ~2.5 min
 ```
 
-On Windows there is no build — copy `artifacts/firmware/CLOUDHV.fd` in from a
-Linux checkout. Note the path is *relative to the working directory*, so a
-manager launched from the Start menu looks for it under `Program Files`. Put the
-file somewhere writable and set *Settings ▸ Advanced ▸ working directory* to its
-parent, or give the machine an absolute `[boot] firmware` path.
+`entangled doctor` reports which of the five places answered — an explicit
+`--firmware` or `[boot] firmware`, `ENTANGLED_FIRMWARE_DIR`, the install
+directory, the verified cache, or `artifacts/firmware/` in the working
+directory. A machine whose profile names a firmware path that does not exist
+does **not** fail: `entangled` falls through the same list and logs which one it
+used, so a profile copied between computers still starts.
 
-The same applies to the two test artifacts (`scripts/fetch-test-kernel.sh`,
-`scripts/build-test-initramfs.sh`) — built per checkout, never committed.
+The two test artifacts (`scripts/fetch-test-kernel.sh`,
+`scripts/build-test-initramfs.sh`) are still built per checkout and never
+committed.
 
 ## `the Debian installer needs Entangled's own kernel and initramfs`
 

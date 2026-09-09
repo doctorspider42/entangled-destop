@@ -3,7 +3,8 @@
 //! # The machine
 //!
 //! ```text
-//!   firmware   artifacts/firmware/CLOUDHV.fd, entered through PVH
+//!   firmware   CLOUDHV.fd, entered through PVH (crate::firmware finds it:
+//!              --firmware, this installation, the verified cache, this checkout)
 //!   NVRAM      <disk>.nvram, a CFI flash device at 0xffc00000 (machine_x86::pflash)
 //!   /dev/vda   the install target, writable
 //!   /dev/vdb   the verified Fedora installer ISO, read-only

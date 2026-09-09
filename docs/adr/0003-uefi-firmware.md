@@ -601,3 +601,88 @@ explanation. The
 full account, the measurements and the test that now notices are in the
 `vm-testing` skill under "The clock finding"; the equivalent note for anyone
 adding another host-time-derived register is in `acpi-machine`.
+
+## Amendment, 2026-09-09 (later still) — where the firmware comes from
+
+This ADR chose the firmware and specified the machine contract it imposes. It
+said nothing about **distribution**, and the omission shipped: a user who
+installed Entangled Desktop from the Windows installer, opened the manager and
+filled in the create-machine wizard for Ubuntu was told at the review step to
+
+> Copy artifacts/firmware/CLOUDHV.fd in from a Linux checkout or a release
+
+— of which they had neither, because the installer did not carry the file and
+no release published it. Every UEFI guest (Ubuntu Server, Ubuntu Desktop,
+Fedora) was therefore impossible on a fresh Windows install: a product that
+could not do the thing its own README advertises.
+
+### The two routes, and which one matters
+
+**The installer copy is what makes a fresh machine work.**
+`installer/entangled.iss` ships `CLOUDHV.fd` to `{app}\artifacts\firmware`,
+alongside `entangled.exe`. That is not a new layout — it is the relative path
+the binary has always searched and every generated profile has always named —
+so nothing needed moving and nothing needs configuring. The entry deliberately
+has no `skipifsourcedoesntexist`: a compile with no firmware to hand fails at
+ISCC rather than four screens into somebody's wizard, and
+`.github/workflows/release.yml` grew a Linux job that downloads the pinned
+asset (or builds it) so the Windows job always has one.
+
+This is possible only because **EDK2 is BSD-2-Clause-Patent**. Permissive, no
+source obligation — unlike the GPL-2.0-only bootstrap kernel next door, whose
+presence inside a setup executable would drag the corresponding-source
+obligation onto every copy of it. That asymmetry is the whole reason one
+guest artifact is in the installer and the other is not, and it is recorded in
+`apps/entangled/src/bootstrap.rs` so nobody "fixes" the inconsistency. The
+attribution EDK2 *does* require lives in `THIRD-PARTY-NOTICES.txt`, which the
+installer shows on its licence page (concatenated onto `LICENSE` by the Inno
+preprocessor) and installs beside the binaries; `cargo about` cannot see it,
+because that reads the Cargo graph and this is the project's first shipped
+binary that is not a crate.
+
+**The download is what serves a source checkout.** `entangled fetch firmware`
+pulls the same 4 MiB image into `<cache>/firmware/<tag>/`, checked against a
+SHA-256 in `guest/firmware/pinned.toml` compiled into the binary by
+`include_str!` — the identical anchor and the identical machinery the bootstrap
+kernel uses (`apps/entangled/src/artifact.rs`, generalised out of
+`bootstrap.rs` for the purpose). Bytes that miss the digest are deleted, not
+used, and the provenance manifest written beside them says `signature_verified
+= false`, because nothing signs these.
+
+**While this repository is private the download needs a token.** A plain
+`https://github.com/…/releases/download/…` URL answers 404 to anyone without
+credentials, indistinguishable from "never published" — which is exactly why
+the bootstrap kernel's fetch path has never worked for anyone but the owner.
+The fetcher now takes the API asset route (`GET
+/repos/<o>/<r>/releases/tags/<tag>`, then the asset's own URL with `Accept:
+application/octet-stream`) whenever it finds a `GITHUB_TOKEN`, a `GH_TOKEN` or
+a `gh auth token`, and without one the 404 says *private* rather than implying
+nothing exists. That closes the gap for a developer; it does not close it for a
+stranger, and the installer copy is the answer for the stranger. If the
+repository is ever made public the token becomes optional and nothing else
+changes.
+
+### The lookup
+
+Five places, in order, resolved once in `apps/entangled/src/firmware.rs` for
+both hypervisor hosts and both commands:
+
+1. `--firmware`, or the profile's `[boot] firmware`;
+2. `ENTANGLED_FIRMWARE_DIR`;
+3. `artifacts\firmware\` **beside the executable** — the installer's copy;
+4. the verified cache;
+5. `artifacts/firmware/` under the working directory.
+
+Two properties are worth stating because they were not obvious. First, an
+*explicit* path that is missing is an error naming that path — a `--firmware`
+silently replaced is how an afternoon disappears. Second, a *profile* path that
+is missing is not: `run` falls through to 2–5 and logs the substitution, which
+is what makes a machine created on a Linux checkout start on a Windows
+installation. The install directory sits ahead of the cache and the checkout
+because the copy that shipped with an executable is the one that matches it, and
+it is the only one an ordinary user has; a developer who means their own build
+says so with `ENTANGLED_FIRMWARE_DIR`.
+
+`entangled doctor` names which of the five answered, and the manager's
+pre-flight, its card warnings and its machine editor all ask the same question
+through `launcher::locate_firmware`.

@@ -181,11 +181,19 @@ times:
   crate's own `target/`. It now resolves the real output path and refuses to
   package an init older than its sources — if you see that refusal, your
   build failed, it did not.
-- The UEFI firmware comes from `bash guest/firmware/build-cloudhv.sh`
-  (~2.5 min, pinned EDK2, pflash PCDs asserted). A fresh checkout or a new
-  worktree has NO firmware — `run` with UEFI boot fails with "cannot read
-  firmware". Worktrees each need their own artifacts (or run the script once
-  in the checkout you test from).
+- **The UEFI firmware no longer has to be built either.** `entangled fetch
+  firmware` downloads the published `CLOUDHV.fd` (4 MiB, SHA-256 pinned in
+  `guest/firmware/pinned.toml`) into `<cache>/firmware/<tag>/`, shared machine
+  state like the ISOs — never delete it to free space. Building it still wins
+  for firmware work: `bash guest/firmware/build-cloudhv.sh` (~2.5 min, pinned
+  EDK2, pflash PCDs asserted) writes `artifacts/firmware/`, and
+  `ENTANGLED_FIRMWARE_DIR` forces a specific build ahead of everything else —
+  which you need, because the lookup order puts the *cache* ahead of the
+  checkout (installed users first). A fresh worktree therefore no longer needs
+  its own EDK2 build: fetch once, or point `ENTANGLED_FIRMWARE_DIR` at a
+  checkout that has one.
+  While this repository is private the fetch needs a token (`GITHUB_TOKEN`,
+  `GH_TOKEN` or `gh auth login`); without one it answers 404 and says so.
 - `scripts/fetch-test-kernel.sh` fetches the *Debian installer's* kernel for the
   boot tests (not our bootstrap kernel — the name has misled people);
   `scripts/fetch-ubuntu-iso.sh [desktop]` fetches + verifies ISOs into the

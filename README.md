@@ -57,13 +57,15 @@ Hypervisor Platform* optional feature (admin, one reboot).
 ```bash
 sudo apt-get install -y build-essential pkg-config curl
 cargo build --workspace --release
-bash guest/firmware/build-cloudhv.sh      # the UEFI firmware, once, ~2.5 min
+entangled fetch firmware                  # the UEFI firmware, 4 MiB, digest checked
 sudo usermod -aG kvm "$USER"              # then log out and back in
 ```
 
-The [user guide](docs/user-guide.md#getting-the-software) has the optional
-packages (3D, sound, TAP networking) and the Windows caveat about where the
-firmware has to live.
+`bash guest/firmware/build-cloudhv.sh` builds the same firmware locally instead
+(~2.5 min, Linux only). The Windows installer ships a copy next to the
+program, so a Windows installation needs neither. The
+[user guide](docs/user-guide.md#getting-the-software) has the optional packages
+(3D, sound, TAP networking) and the five places the firmware is looked for.
 
 ## First VM
 

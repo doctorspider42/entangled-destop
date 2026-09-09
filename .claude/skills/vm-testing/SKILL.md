@@ -568,8 +568,10 @@ existing device/serial tests are unaffected by any of it.
    `#[ignore]`d): `entangled install ubuntu` and then `entangled run` of the
    profile it wrote. See "Installing Ubuntu" below.
 
-Manual firmware bring-up (needs `bash guest/firmware/build-cloudhv.sh` once,
-~2.5 min, ~2 GiB of EDK2 checkout in `~/.cache/entangled-edk2`):
+Manual firmware bring-up (needs a firmware: `entangled fetch firmware`, or
+`bash guest/firmware/build-cloudhv.sh` once — ~2.5 min and ~2 GiB of EDK2
+checkout in `~/.cache/entangled-edk2` — which is what you want when the
+firmware itself is the thing under test):
 
 ```bash
 cargo run -p entangled -- run --headless examples/uefi-firmware.toml
@@ -584,7 +586,7 @@ option or device was found.` — the firmware works and has nothing to boot.
 ## Booting an installer ISO (UEFI-1803)
 
 ```bash
-bash guest/firmware/build-cloudhv.sh          # once, ~2.5 min
+entangled fetch firmware                      # 4 MiB, or build-cloudhv.sh to build it
 bash scripts/fetch-ubuntu-iso.sh              # once, ~2.9 GiB, GPG + SHA-256 verified
 cargo test -p boot-tests --test uefi_iso -- --ignored --nocapture
 ```
@@ -657,7 +659,7 @@ Two `#[ignore]`d tests pin this path:
 ## Installing Ubuntu, and booting what was installed (UEFI-1804)
 
 ```bash
-bash guest/firmware/build-cloudhv.sh          # once, ~2.5 min
+entangled fetch firmware                      # 4 MiB, or build-cloudhv.sh to build it
 bash scripts/fetch-ubuntu-iso.sh              # once, ~2.9 GiB, verified
 cargo run -p entangled -- install ubuntu --disk ~/entangled-vms/ubuntu.raw \
     --size 20G --auto --headless              # unattended
