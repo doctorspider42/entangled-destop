@@ -27,9 +27,71 @@ env:
   INNO_SETUP_URL: https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe
 
 jobs:
+  # The Linux build of the engine, published beside the Windows installer.
+  #
+  # It exists because of one gap the product could not close any other way: the
+  # manager's "WSL (KVM)" backend runs the *Linux* `entangled` inside WSL, and
+  # a Windows install has no Linux half — so the very first machine a user
+  # created on that backend died with `execvpe entangled failed 2`. The manager
+  # now downloads this asset and installs it into the distribution.
+  #
+  # The digest is the point of the job order: this binary is hashed HERE, and
+  # the hash is compiled into the manager built in the next job. The manager can
+  # therefore verify a download against a digest nobody typed and nothing
+  # fetched (apps/manager/src/wslengine.rs documents the whole anchor).
+  #
+  # ubuntu-22.04 on purpose: the glibc a release binary is linked against is the
+  # oldest distribution it can run on, and WSL installs are frequently older
+  # than the newest runner image.
+  linux-engine:
+    name: Linux engine (the WSL backend's half)
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.build.outputs.version }}
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build and hash the Linux engine
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The same version the Windows job computes: MAJOR.MINOR from the
+          # workspace, PATCH from the run number. The two are cross-checked
+          # below rather than trusted to stay in step.
+          # No regex backreferences: the first quoted field of the first
+          # `version = "..."` line, with the patch component dropped.
+          line=$(grep -m1 -E '^version = "[0-9]+' Cargo.toml)
+          core=${line#*\"}
+          core=${core%%\"*}
+          mm=${core%.*}
+          if [ -z "$mm" ]; then echo "workspace version not found" >&2; exit 1; fi
+          version="$mm.${{ github.run_number }}"
+          ENTANGLED_VERSION="$version" cargo build --release -p entangled
+          mkdir -p dist
+          cp target/release/entangled dist/entangled-linux-x86_64
+          sha256=$(sha256sum dist/entangled-linux-x86_64 | cut -d' ' -f1)
+          printf '%s' "$version" > dist/version.txt
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "Linux engine $version sha256=$sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-engine
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
   windows-installer:
     name: Windows installer + GitHub Release
     runs-on: windows-latest
+    needs: linux-engine
     steps:
       - uses: actions/checkout@v4
 
@@ -51,11 +113,31 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "release version: $version"
 
+      - name: Collect the Linux engine
+        shell: pwsh
+        run: |
+          $expected = "${{ steps.version.outputs.version }}"
+          $built = "${{ needs.linux-engine.outputs.version }}"
+          # The two jobs derive the version independently; a mismatch would ship
+          # a manager pinned to an asset published under another name.
+          if ($expected -ne $built) {
+            throw "version mismatch: this job computed $expected, the Linux engine job $built"
+          }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-engine
+          path: dist-linux
+
       - name: Build release binaries
         env:
           # build.rs stamps this into both binaries: --version output, the
           # manager's window title and its update check all report it.
           ENTANGLED_VERSION: ${{ steps.version.outputs.version }}
+          # …and this into the manager only: the SHA-256 of the Linux engine
+          # published by this same run, which is the manager's whole trust
+          # anchor for downloading one into WSL (apps/manager/src/wslengine.rs).
+          ENTANGLED_LINUX_ENGINE_SHA256: ${{ needs.linux-engine.outputs.sha256 }}
         run: cargo build --release -p entangled -p entangled-manager
 
       - name: Install Inno Setup 7 (pinned)
@@ -89,5 +171,6 @@ jobs:
             --title "Entangled Desktop v$v" `
             --generate-notes `
             --latest `
-            "installer/Output/entangled-desktop-$v-setup.exe"
+            "installer/Output/entangled-desktop-$v-setup.exe" `
+            "dist-linux/entangled-linux-x86_64"
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
