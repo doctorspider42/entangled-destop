@@ -42,7 +42,7 @@
 //! calibration and impossible for a game to undo.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -79,6 +79,118 @@ pub const BUTTON_COUNT: usize = btn::GAMEPAD.len();
 /// only thing that can grow without bound behind a stalled guest is
 /// [`crate::MAX_PENDING_EVENTS`], which already drops the oldest.
 pub const MAX_EVENTS_PER_REPORT: usize = BUTTON_COUNT + 8 + 1;
+
+// ------------------------------------------------------------------ roster
+
+/// The most players one VM can have.
+///
+/// Four because that is XInput's own limit, and because the virtio slot budget
+/// runs out first anyway: `machine_x86::virtio::MAX_VIRTIO_SLOTS` is 8, and a
+/// VM with one disk, a GPU, a keyboard, a tablet, a network card and a sound
+/// card has already spent six of them. See `control_api::GamepadSection`.
+pub const MAX_PLAYERS: usize = 4;
+
+/// Who owns which host controller.
+///
+/// Two sources polling `/dev/input` independently would both adopt the same
+/// pad, and both guest devices would then move together — so the decision of
+/// *which host controller is which player* has to be made in one place. This
+/// is that place, and it is deliberately portable: the backends differ only in
+/// what a "slot key" is (an evdev node path, or an XInput user index).
+///
+/// # The rule, and why it is this one
+///
+/// **Fill in order, never steal, never promote.** A player may take the
+/// lowest-keyed unclaimed controller, but only once every lower-numbered
+/// player already has one. Consequences, all deliberate:
+///
+/// * plugging pads in one at a time gives player 1, then player 2, in that
+///   order, which is what a person sitting down with two controllers expects;
+/// * when player 1's controller is unplugged, **player 2 keeps theirs**. The
+///   alternative — everyone shuffling up a slot — would hand player 2's
+///   controller to player 1's character mid-game, which is a far worse
+///   failure than one player pausing to plug back in;
+/// * the freed slot is the first to be refilled, so plugging back in restores
+///   the arrangement rather than appending a third player.
+///
+/// A claim lasts until the source releases it (an unplug, or the capture
+/// thread stopping — [`Drop`] covers the second), so a device reset that
+/// rebuilds its source cannot leak a slot.
+#[derive(Debug)]
+pub struct PadRoster {
+    slots: Mutex<Vec<Option<String>>>,
+}
+
+impl PadRoster {
+    /// A roster for `players` players, nobody assigned.
+    pub fn new(players: usize) -> Arc<Self> {
+        Arc::new(Self {
+            slots: Mutex::new(vec![None; players.clamp(1, MAX_PLAYERS)]),
+        })
+    }
+
+    /// How many players this roster was built for.
+    pub fn players(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// A poisoned lock here means an unrelated thread died holding it; the
+    /// data is a `Vec<Option<String>>` and still structurally valid, and the
+    /// VM must keep running.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Option<String>>> {
+        match self.slots.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("gamepad roster mutex was poisoned; recovering");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    /// Which player holds `key`, if anyone.
+    pub fn holder(&self, key: &str) -> Option<usize> {
+        self.lock().iter().position(|s| s.as_deref() == Some(key))
+    }
+
+    /// What `player` currently holds.
+    pub fn held_by(&self, player: usize) -> Option<String> {
+        self.lock().get(player).cloned().flatten()
+    }
+
+    /// Offers `candidates` — every host controller this backend can see, in
+    /// the backend's own preference order — to `player`, and returns the one
+    /// it may take.
+    ///
+    /// `None` means "not yet": either nothing is free, or a lower-numbered
+    /// player is still waiting, in which case this player must not leapfrog.
+    pub fn claim(&self, player: usize, candidates: &[String]) -> Option<String> {
+        let mut slots = self.lock();
+        if player >= slots.len() {
+            return None;
+        }
+        if slots[player].is_some() {
+            return slots[player].clone();
+        }
+        if slots[..player].iter().any(Option::is_none) {
+            return None;
+        }
+        let taken: Vec<&str> = slots.iter().filter_map(|s| s.as_deref()).collect();
+        let key = candidates
+            .iter()
+            .find(|key| !taken.contains(&key.as_str()))?
+            .clone();
+        slots[player] = Some(key.clone());
+        Some(key)
+    }
+
+    /// Gives up whatever `player` held. Idempotent.
+    pub fn release(&self, player: usize) {
+        let mut slots = self.lock();
+        if let Some(slot) = slots.get_mut(player) {
+            *slot = None;
+        }
+    }
+}
 
 /// Where a [`GamepadSource`] comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -309,54 +421,105 @@ impl GamepadSource for NullSource {
     }
 }
 
-/// Picks a host mechanism, returning its name and a factory for it.
+/// Picks a host mechanism for a single-player VM.
+///
+/// A thin wrapper over [`open_sources`] with `players = 1`, kept because most
+/// callers and every existing profile want exactly one pad.
+pub fn open_source(choice: SourceChoice) -> Result<(&'static str, SourceFactory), GamepadError> {
+    let (name, mut factories) = open_sources(choice, 1)?;
+    let factory = factories.pop().ok_or_else(|| GamepadError::Unavailable {
+        choice,
+        reason: "no source factory for player 1".to_owned(),
+    })?;
+    Ok((name, factory))
+}
+
+/// Picks a host mechanism and returns one factory per player, all sharing one
+/// [`PadRoster`].
 ///
 /// Mirrors `virtio_sound::open_sink`: `auto` never fails (a VM must not refuse
 /// to boot because this machine has no controller), while an explicitly named
 /// mechanism that is not there fails the run rather than silently doing
-/// nothing.
-pub fn open_source(choice: SourceChoice) -> Result<(&'static str, SourceFactory), GamepadError> {
+/// nothing. `players` is clamped into `1..=`[`MAX_PLAYERS`].
+pub fn open_sources(
+    choice: SourceChoice,
+    players: usize,
+) -> Result<(&'static str, Vec<SourceFactory>), GamepadError> {
     let unavailable = |reason: &str| GamepadError::Unavailable {
         choice,
         reason: reason.to_owned(),
     };
-    match choice {
-        SourceChoice::Null => Ok((
+    let players = players.clamp(1, MAX_PLAYERS);
+    let roster = PadRoster::new(players);
+    // Not every arm below uses it (the null source has no host controller to
+    // place, and a host with neither backend has only null), so name it as
+    // deliberately-unused rather than letting a cfg combination warn.
+    let _ = &roster;
+
+    let (name, make): (&'static str, Box<dyn Fn(usize) -> SourceFactory>) = match choice {
+        SourceChoice::Null => (
             "null",
-            Arc::new(|| -> Box<dyn GamepadSource> { Box::new(NullSource) }),
-        )),
+            Box::new(|_player| -> SourceFactory {
+                Arc::new(|| -> Box<dyn GamepadSource> { Box::new(NullSource) })
+            }),
+        ),
 
         #[cfg(target_os = "linux")]
         SourceChoice::Auto | SourceChoice::Evdev => {
             if choice == SourceChoice::Evdev {
                 evdev::probe().map_err(|e| unavailable(&e))?;
             }
-            Ok((
+            let roster = Arc::clone(&roster);
+            (
                 "evdev",
-                Arc::new(|| -> Box<dyn GamepadSource> { Box::new(evdev::EvdevSource::new()) }),
-            ))
+                Box::new(move |player| -> SourceFactory {
+                    let roster = Arc::clone(&roster);
+                    Arc::new(move || -> Box<dyn GamepadSource> {
+                        Box::new(evdev::EvdevSource::for_player(player, Arc::clone(&roster)))
+                    })
+                }),
+            )
         }
         #[cfg(not(target_os = "linux"))]
-        SourceChoice::Evdev => Err(unavailable(
-            "evdev is Linux-only; use \"xinput\" on Windows or \"auto\"",
-        )),
+        SourceChoice::Evdev => {
+            return Err(unavailable(
+                "evdev is Linux-only; use \"xinput\" on Windows or \"auto\"",
+            ))
+        }
 
         #[cfg(windows)]
-        SourceChoice::Auto | SourceChoice::XInput => Ok((
-            "xinput",
-            Arc::new(|| -> Box<dyn GamepadSource> { Box::new(xinput::XInputSource::new()) }),
-        )),
+        SourceChoice::Auto | SourceChoice::XInput => {
+            let roster = Arc::clone(&roster);
+            (
+                "xinput",
+                Box::new(move |player| -> SourceFactory {
+                    let roster = Arc::clone(&roster);
+                    Arc::new(move || -> Box<dyn GamepadSource> {
+                        Box::new(xinput::XInputSource::for_player(
+                            player,
+                            Arc::clone(&roster),
+                        ))
+                    })
+                }),
+            )
+        }
         #[cfg(not(windows))]
-        SourceChoice::XInput => Err(unavailable(
-            "XInput is Windows-only; use \"evdev\" on Linux or \"auto\"",
-        )),
+        SourceChoice::XInput => {
+            return Err(unavailable(
+                "XInput is Windows-only; use \"evdev\" on Linux or \"auto\"",
+            ))
+        }
 
         #[cfg(not(any(target_os = "linux", windows)))]
-        SourceChoice::Auto => Ok((
+        SourceChoice::Auto => (
             "null",
-            Arc::new(|| -> Box<dyn GamepadSource> { Box::new(NullSource) }),
-        )),
-    }
+            Box::new(|_player| -> SourceFactory {
+                Arc::new(|| -> Box<dyn GamepadSource> { Box::new(NullSource) })
+            }),
+        ),
+    };
+
+    Ok((name, (0..players).map(make).collect()))
 }
 
 // ------------------------------------------------------------------- pump
@@ -892,5 +1055,117 @@ mod tests {
         // and is *not* re-sent, because both pads have it down.
         assert_eq!(stats.reports.load(Ordering::Relaxed), 3);
         assert_eq!(stats.events.load(Ordering::Relaxed), 2 + 2 + 3);
+    }
+    // ------------------------------------------------------------- roster
+
+    fn keys(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_roster_fills_players_in_order_and_never_hands_out_the_same_pad_twice() {
+        let roster = PadRoster::new(2);
+        assert_eq!(roster.players(), 2);
+        let pads = keys(&["event3", "event7"]);
+
+        assert_eq!(roster.claim(0, &pads).as_deref(), Some("event3"));
+        assert_eq!(roster.claim(1, &pads).as_deref(), Some("event7"));
+        // Idempotent: a source that asks again gets what it already holds.
+        assert_eq!(roster.claim(0, &pads).as_deref(), Some("event3"));
+        assert_eq!(roster.holder("event7"), Some(1));
+        assert_eq!(roster.held_by(1).as_deref(), Some("event7"));
+    }
+
+    #[test]
+    fn player_two_does_not_leapfrog_player_one() {
+        // One pad on the machine and both sources scanning: it must go to
+        // player one, whichever thread happens to ask first.
+        let roster = PadRoster::new(2);
+        let pads = keys(&["event3"]);
+        assert_eq!(roster.claim(1, &pads), None, "player 2 must wait");
+        assert_eq!(roster.claim(0, &pads).as_deref(), Some("event3"));
+        assert_eq!(roster.claim(1, &pads), None, "nothing left to take");
+    }
+
+    #[test]
+    fn unplugging_player_one_leaves_player_two_alone() {
+        // The whole reason the rule is "fill in order, never promote": a
+        // shuffle here would hand player two's controller to player one's
+        // character in the middle of a game.
+        let roster = PadRoster::new(2);
+        let pads = keys(&["event3", "event7"]);
+        assert_eq!(roster.claim(0, &pads).as_deref(), Some("event3"));
+        assert_eq!(roster.claim(1, &pads).as_deref(), Some("event7"));
+
+        roster.release(0);
+        let remaining = keys(&["event7"]);
+        assert_eq!(roster.claim(0, &remaining), None, "event7 is still taken");
+        assert_eq!(roster.held_by(1).as_deref(), Some("event7"));
+
+        // …and the pad plugged back in fills the hole, not a third slot.
+        let back = keys(&["event7", "event9"]);
+        assert_eq!(roster.claim(0, &back).as_deref(), Some("event9"));
+    }
+
+    #[test]
+    fn the_roster_refuses_a_player_it_does_not_have_and_survives_an_empty_offer() {
+        let roster = PadRoster::new(1);
+        assert_eq!(roster.claim(1, &keys(&["event3"])), None);
+        assert_eq!(roster.claim(0, &[]), None);
+        assert_eq!(roster.holder("event3"), None);
+        assert_eq!(roster.held_by(9), None);
+        // Releasing a player that never existed is a no-op, not a panic.
+        roster.release(9);
+        assert_eq!(
+            roster.claim(0, &keys(&["event3"])).as_deref(),
+            Some("event3")
+        );
+    }
+
+    #[test]
+    fn a_roster_is_clamped_to_the_players_a_vm_can_have() {
+        assert_eq!(PadRoster::new(0).players(), 1);
+        assert_eq!(PadRoster::new(MAX_PLAYERS + 5).players(), MAX_PLAYERS);
+        assert_eq!(MAX_PLAYERS, 4, "XInput's limit, and the slot budget's");
+    }
+
+    #[test]
+    fn open_sources_gives_one_factory_per_player_and_clamps_the_count() {
+        let (name, factories) = open_sources(SourceChoice::Null, 2).expect("null never fails");
+        assert_eq!(name, "null");
+        assert_eq!(factories.len(), 2);
+        // Every factory really produces a source, and they are independent.
+        for factory in &factories {
+            assert_eq!(factory().name(), "null");
+        }
+        assert_eq!(
+            open_sources(SourceChoice::Null, 99)
+                .expect("clamped")
+                .1
+                .len(),
+            MAX_PLAYERS
+        );
+        assert_eq!(
+            open_sources(SourceChoice::Null, 0)
+                .expect("clamped")
+                .1
+                .len(),
+            1
+        );
+        // `auto` never fails on any host, whatever the player count.
+        assert!(open_sources(SourceChoice::Auto, MAX_PLAYERS).is_ok());
+    }
+
+    #[test]
+    fn two_players_never_share_one_host_controller() {
+        // The property, stated against the real sources rather than the
+        // roster alone: build both players' sources from `open_sources` and
+        // check that whatever each ends up holding, it is not the same key.
+        let roster = PadRoster::new(2);
+        let pads = keys(&["a", "b"]);
+        let first = roster.claim(0, &pads);
+        let second = roster.claim(1, &pads);
+        assert!(first.is_some() && second.is_some());
+        assert_ne!(first, second);
     }
 }

@@ -149,7 +149,20 @@ struct State {
 /// Everything both the guest side and the host side reach.
 struct Shared {
     profile: Profile,
+    /// `VIRTIO_INPUT_CFG_ID_SERIAL`, when this instance has one. Fixed at
+    /// construction and never guest-writable.
+    serial: Option<String>,
     state: Mutex<State>,
+    /// Which `EV_BITS` subsels the guest driver has ever selected, as a bit
+    /// per event type (`EV_CNT` is 32, so one word is the whole space).
+    ///
+    /// A guest-driven counter that cannot grow: the driver writes `subsel`,
+    /// we set bit `subsel`, and anything at or above `ev::CNT` is dropped. It
+    /// answers a question no host-side reasoning can — *which capabilities did
+    /// this kernel's driver actually ask about* — which is how
+    /// `tests/boot/tests/gamepad.rs` shows that Linux never enquires about
+    /// `EV_FF` at all (see [`crate::gamepad`] on rumble).
+    ev_bits_probed: std::sync::atomic::AtomicU32,
 }
 
 /// Locks the shared state, recovering from poisoning instead of panicking.
@@ -477,6 +490,14 @@ impl InputHandle {
     pub fn stats(&self) -> EventStats {
         lock(&self.shared.state).stats
     }
+
+    /// Which `EV_BITS` event types the guest driver has enquired about, one
+    /// bit per `EV_*` type; see [`InputDevice::ev_bits_probed`].
+    pub fn ev_bits_probed(&self) -> u32 {
+        self.shared
+            .ev_bits_probed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// A virtio-input device: keyboard or absolute pointer, per its [`Profile`].
@@ -511,12 +532,19 @@ impl std::fmt::Debug for InputDevice {
 }
 
 impl InputDevice {
-    /// Builds a device with the given profile.
+    /// Builds a device with the given profile and no serial.
     pub fn new(profile: Profile) -> Self {
+        Self::with_serial(profile, None)
+    }
+
+    /// Builds a device with the given profile and `VIRTIO_INPUT_CFG_ID_SERIAL`.
+    pub fn with_serial(profile: Profile, serial: Option<String>) -> Self {
         Self {
             shared: Arc::new(Shared {
                 profile,
+                serial,
                 state: Mutex::new(State::default()),
+                ev_bits_probed: std::sync::atomic::AtomicU32::new(0),
             }),
             // No virtio-input feature bits exist beyond the transport-level
             // ones (the spec defines none), so VERSION_1 is the whole set.
@@ -545,7 +573,18 @@ impl InputDevice {
     /// gets. [`crate::gamepad::GamepadCapture`] is the half that makes a real
     /// controller drive it.
     pub fn gamepad() -> Self {
-        Self::new(Profile::Gamepad)
+        Self::gamepad_for_player(0)
+    }
+
+    /// The gamepad of player `player` (0-based), with no host capture.
+    ///
+    /// The only difference between players is the serial
+    /// ([`config::player_serial`]): same name, same `input_id`, same
+    /// capabilities — which is exactly what two identical controllers look
+    /// like on a real machine, and what SDL expects when it enumerates two
+    /// pads. Slot order in the machine decides which is `js0`.
+    pub fn gamepad_for_player(player: usize) -> Self {
+        Self::with_serial(Profile::Gamepad, Some(config::player_serial(player)))
     }
 
     /// A gamepad fed by a real host controller (GAME-2104).
@@ -565,7 +604,15 @@ impl InputDevice {
     /// let pad = InputDevice::gamepad_with_capture(factory);
     /// ```
     pub fn gamepad_with_capture(capture: SourceFactory) -> Self {
-        let mut device = Self::new(Profile::Gamepad);
+        Self::gamepad_with_capture_for_player(capture, 0)
+    }
+
+    /// Player `player`'s gamepad, fed by `capture`.
+    ///
+    /// Which *host* controller that factory reads is the factory's business —
+    /// see [`crate::gamepad::open_sources`] and [`crate::gamepad::PadRoster`].
+    pub fn gamepad_with_capture_for_player(capture: SourceFactory, player: usize) -> Self {
+        let mut device = Self::gamepad_for_player(player);
         device.capture = Some(capture);
         device
     }
@@ -626,6 +673,31 @@ impl InputDevice {
     pub fn selected(&self) -> (u8, u8) {
         (self.select, self.subsel)
     }
+
+    /// Which `EV_BITS` event types the guest driver has enquired about, one
+    /// bit per `EV_*` type — `1 << ev::KEY` and so on.
+    ///
+    /// Cumulative for the life of the device and deliberately **not** cleared
+    /// by [`VirtioDevice::reset`] or carried in a snapshot: it describes the
+    /// *driver*, not the device, and the question it answers ("did this kernel
+    /// ever ask whether we do X?") is about the whole run.
+    pub fn ev_bits_probed(&self) -> u32 {
+        self.handle().ev_bits_probed()
+    }
+
+    /// Records an `EV_BITS` enquiry; see [`Shared::ev_bits_probed`].
+    fn note_probe(&self) {
+        if self.select != config::VIRTIO_INPUT_CFG_EV_BITS {
+            return;
+        }
+        let subsel = u16::from(self.subsel);
+        if subsel >= crate::ev::CNT {
+            return;
+        }
+        self.shared
+            .ev_bits_probed
+            .fetch_or(1u32 << subsel, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl VirtioDevice for InputDevice {
@@ -659,7 +731,12 @@ impl VirtioDevice for InputDevice {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        let selection = config::selection(self.shared.profile, self.select, self.subsel);
+        let selection = config::selection_with_serial(
+            self.shared.profile,
+            self.shared.serial.as_deref(),
+            self.select,
+            self.subsel,
+        );
         for (i, byte) in data.iter_mut().enumerate() {
             let index = offset.saturating_add(i as u64);
             *byte = match index {
@@ -684,7 +761,10 @@ impl VirtioDevice for InputDevice {
             let index = offset.saturating_add(i as u64);
             match index {
                 config::SELECT => self.select = *byte,
-                config::SUBSEL => self.subsel = *byte,
+                config::SUBSEL => {
+                    self.subsel = *byte;
+                    self.note_probe();
+                }
                 // `size`, `reserved` and the payload are read-only.
                 _ => ignored += 1,
             }

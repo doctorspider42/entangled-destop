@@ -48,8 +48,15 @@ pub const CONFIG_LEN: u64 = PAYLOAD + PAYLOAD_MAX as u64;
 pub const VIRTIO_INPUT_CFG_UNSET: u8 = 0x00;
 /// `VIRTIO_INPUT_CFG_ID_NAME`: the device name string.
 pub const VIRTIO_INPUT_CFG_ID_NAME: u8 = 0x01;
-/// `VIRTIO_INPUT_CFG_ID_SERIAL`: serial number string. Not implemented —
-/// Entangled Desktop input devices have no meaningful serial, so this reads `size = 0`.
+/// `VIRTIO_INPUT_CFG_ID_SERIAL`: serial number string.
+///
+/// The keyboard and the tablet have nothing to say here and answer `size = 0`.
+/// A **gamepad** answers [`player_serial`], because a two-player VM has two
+/// devices with the same name and the same `input_id` — exactly as two
+/// identical controllers on a real machine do — and the serial is where the
+/// kernel puts the thing that tells them apart: `virtio_input.c` assigns it to
+/// `idev->uniq`, which surfaces as `U: Uniq=` in `/proc/bus/input/devices` and
+/// as `SDL_GetJoystickSerial`.
 ///
 /// Note for readers coming from the backlog: 0x02 is the *serial*, not the
 /// device ids. `virtio_input.h` orders them `ID_NAME = 1, ID_SERIAL = 2,
@@ -85,6 +92,12 @@ pub const PRODUCT_TABLET: u16 = 0x0002;
 pub const PRODUCT_GAMEPAD: u16 = 0x0003;
 /// Version reported by every device.
 pub const INPUT_VERSION: u16 = 0x0001;
+
+/// The serial a gamepad publishes for `player` (0-based), one-based in the
+/// text because "player 0" is not a thing anyone says out loud.
+pub fn player_serial(player: usize) -> String {
+    format!("player-{}", player.saturating_add(1))
+}
 
 // ----------------------------------------------------------------- devids
 
@@ -531,8 +544,26 @@ impl Selection {
 /// selectors — answers [`Selection::EMPTY`], never an error: `select` is
 /// guest-controlled and probing unknown selectors is normal driver behaviour.
 pub fn selection(profile: Profile, select: u8, subsel: u8) -> Selection {
+    selection_with_serial(profile, None, select, subsel)
+}
+
+/// [`selection`], plus the device-level serial the profile cannot know about.
+///
+/// Split out rather than folded into [`Profile`] because the serial is the one
+/// piece of a device's identity that is *per instance*: two gamepads are the
+/// same profile and differ only here.
+pub fn selection_with_serial(
+    profile: Profile,
+    serial: Option<&str>,
+    select: u8,
+    subsel: u8,
+) -> Selection {
     match select {
         VIRTIO_INPUT_CFG_ID_NAME => Selection::from_slice(profile.name().as_bytes()),
+        VIRTIO_INPUT_CFG_ID_SERIAL => match serial {
+            Some(serial) => Selection::from_slice(serial.as_bytes()),
+            None => Selection::EMPTY,
+        },
         VIRTIO_INPUT_CFG_ID_DEVIDS => Selection::from_slice(&profile.devids().to_le_bytes()),
         VIRTIO_INPUT_CFG_EV_BITS => profile.event_bits(u16::from(subsel)),
         VIRTIO_INPUT_CFG_ABS_INFO => profile.abs_info(u16::from(subsel)),
@@ -656,16 +687,7 @@ mod tests {
         for code in [1u16, 28, 30, 42, 56, 57, 59, 88, 103, 111, 255, key::SELECT] {
             assert!(bit(payload, code), "KEY code {code} must be advertised");
         }
-        for code in [
-            key::RESERVED,
-            256,
-            271,
-            btn::LEFT,
-            btn::SIDE,
-            352,
-            354,
-            700,
-        ] {
+        for code in [key::RESERVED, 256, 271, btn::LEFT, btn::SIDE, 352, 354, 700] {
             assert!(!bit(payload, code), "code {code} must not be advertised");
         }
     }

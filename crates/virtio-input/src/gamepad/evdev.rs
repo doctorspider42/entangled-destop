@@ -13,12 +13,15 @@
 //!
 //! # What it does
 //!
-//! One controller at a time — player one. Every [`RESCAN_INTERVAL`] the source
-//! walks `/dev/input`, opens anything it can that looks like a gamepad, and
-//! adopts the lowest-numbered one. While a pad is adopted the source sits in
-//! `poll(2)`, folding `EV_KEY`/`EV_ABS` reports into a [`PadState`]. A pad that
-//! vanishes (`ENODEV`, or a read of 0 bytes) is dropped, and the pump turns
-//! that into a full release for the guest.
+//! One controller per source, and one source per player. Every
+//! [`RESCAN_INTERVAL`] the source walks `/dev/input`, opens everything it can
+//! that looks like a gamepad, and asks the shared [`PadRoster`] which of them
+//! is *this* player's — Linux has no controller slots of its own, so the
+//! roster supplies the ordering (see its docs for the fill/never-steal rule).
+//! While a pad is adopted the source sits in `poll(2)`, folding
+//! `EV_KEY`/`EV_ABS` reports into a [`PadState`]. A pad that vanishes
+//! (`ENODEV`, or a read of 0 bytes) is dropped, its roster slot freed, and the
+//! pump turns that into a full release for the guest.
 //!
 //! Axis values are rescaled from the host device's own `EVIOCGABS` range onto
 //! the range the guest device advertises — the one thing that has to happen
@@ -32,7 +35,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::{to_hat, to_stick, to_trigger, GamepadSource, PadId, PadState, Poll, RESCAN_INTERVAL};
+use std::sync::Arc;
+
+use super::{
+    to_hat, to_stick, to_trigger, GamepadSource, PadId, PadRoster, PadState, Poll, RESCAN_INTERVAL,
+};
 use crate::{abs, btn, ev};
 
 /// Where the kernel puts evdev nodes.
@@ -171,6 +178,12 @@ fn candidate_nodes(dir: &Path) -> Vec<PathBuf> {
     nodes
 }
 
+/// The roster key of one evdev node: its path, which is unique across the
+/// machine and stable while the device stays plugged in.
+fn slot_key(path: &Path) -> String {
+    path.display().to_string()
+}
+
 /// Reads `code`'s bit out of an evdev capability bitmap.
 fn has_bit(bitmap: &[u8], code: u16) -> bool {
     let index = usize::from(code / 8);
@@ -209,6 +222,10 @@ struct AdoptedPad {
 
 /// Host gamepad capture through evdev.
 pub struct EvdevSource {
+    /// Which player this source feeds (0-based).
+    player: usize,
+    /// Shared with every other player's source; see [`PadRoster`].
+    roster: Arc<PadRoster>,
     pad: Option<AdoptedPad>,
     state: PadState,
     next_scan: Instant,
@@ -224,8 +241,16 @@ impl Default for EvdevSource {
 }
 
 impl EvdevSource {
+    /// A single-player source with a roster of its own.
     pub fn new() -> Self {
+        Self::for_player(0, PadRoster::new(1))
+    }
+
+    /// The source for one player, sharing `roster` with the other players.
+    pub fn for_player(player: usize, roster: Arc<PadRoster>) -> Self {
         Self {
+            player,
+            roster,
             pad: None,
             state: PadState::NEUTRAL,
             // Scan on the very first poll rather than a second into the run.
@@ -234,11 +259,18 @@ impl EvdevSource {
         }
     }
 
-    /// Drops the adopted pad and re-centres the cached state.
+    /// Drops the adopted pad, frees its roster slot and re-centres the cached
+    /// state.
     fn release(&mut self, reason: &str) {
         if let Some(pad) = self.pad.take() {
-            tracing::debug!(path = %pad.path.display(), reason, "releasing host gamepad");
+            tracing::debug!(
+                path = %pad.path.display(),
+                player = self.player + 1,
+                reason,
+                "releasing host gamepad"
+            );
         }
+        self.roster.release(self.player);
         self.state = PadState::NEUTRAL;
     }
 
@@ -249,24 +281,15 @@ impl EvdevSource {
         }
         self.next_scan = Instant::now() + RESCAN_INTERVAL;
 
+        // Classify first, claim second. The roster can only place a
+        // controller if it is shown every controller, so this scan collects
+        // all of them and then asks which one is this player's — rather than
+        // grabbing the first that fits, which is how two players end up
+        // driving one pad.
+        let mut found: Vec<(String, AdoptedPad)> = Vec::new();
         for path in candidate_nodes(Path::new(INPUT_DIR)) {
             match self.try_adopt(&path) {
-                Ok(Some(pad)) => {
-                    tracing::info!(
-                        path = %pad.path.display(),
-                        controller = %pad.label,
-                        bus = format_args!("{:04x}", pad.ids.bustype),
-                        vendor = format_args!("{:04x}", pad.ids.vendor),
-                        product = format_args!("{:04x}", pad.ids.product),
-                        version = format_args!("{:04x}", pad.ids.version),
-                        digital_triggers = pad.digital_triggers,
-                        digital_dpad = pad.digital_dpad,
-                        "adopted host gamepad"
-                    );
-                    self.state = seed_state(&pad);
-                    self.pad = Some(pad);
-                    return;
-                }
+                Ok(Some(pad)) => found.push((slot_key(&pad.path), pad)),
                 Ok(None) => {}
                 Err(error) => {
                     if self.complained.insert(path.clone()) {
@@ -279,6 +302,32 @@ impl EvdevSource {
                 }
             }
         }
+
+        let keys: Vec<String> = found.iter().map(|(key, _)| key.clone()).collect();
+        let Some(key) = self.roster.claim(self.player, &keys) else {
+            return;
+        };
+        let Some(index) = found.iter().position(|(candidate, _)| *candidate == key) else {
+            // The roster named a key this scan did not offer, which can only
+            // happen if the slot was already held by a pad that has since
+            // gone. Nothing to adopt this time round.
+            return;
+        };
+        let pad = found.swap_remove(index).1;
+        tracing::info!(
+            path = %pad.path.display(),
+            player = self.player + 1,
+            controller = %pad.label,
+            bus = format_args!("{:04x}", pad.ids.bustype),
+            vendor = format_args!("{:04x}", pad.ids.vendor),
+            product = format_args!("{:04x}", pad.ids.product),
+            version = format_args!("{:04x}", pad.ids.version),
+            digital_triggers = pad.digital_triggers,
+            digital_dpad = pad.digital_dpad,
+            "adopted host gamepad"
+        );
+        self.state = seed_state(&pad);
+        self.pad = Some(pad);
     }
 
     /// Opens one node and decides whether it is a gamepad we can drive.
@@ -398,6 +447,14 @@ impl EvdevSource {
             }
         }
         true
+    }
+}
+
+impl Drop for EvdevSource {
+    /// A capture thread that stops — a device reset, or the VM closing —
+    /// must not leave its player's roster slot claimed for ever.
+    fn drop(&mut self) {
+        self.roster.release(self.player);
     }
 }
 

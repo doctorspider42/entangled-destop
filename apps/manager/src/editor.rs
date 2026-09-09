@@ -73,6 +73,12 @@ pub struct EditForm {
     /// `xinput` by hand keeps it across a toggle, and everyone else gets
     /// `auto`, which probes what this host has and never prevents a start.
     pub gamepad: bool,
+
+    /// `[gamepad] players` — how many pads the guest gets, one virtio slot
+    /// each. Only meaningful while [`Self::gamepad`] is on; kept across a
+    /// toggle so switching the pad off and on again does not silently drop a
+    /// second player.
+    pub gamepad_players: u8,
     /// The `[[disk]]` list, editable in place (order is guest device order).
     pub disks: Vec<control_api::DiskSection>,
     /// Buffer for the "add disk" field.
@@ -210,6 +216,10 @@ enabled = true
             sound: cfg.sound.enabled,
             sound_backend: cfg.sound.backend,
             gamepad: cfg.gamepad.enabled,
+            gamepad_players: cfg
+                .gamepad
+                .players
+                .clamp(1, control_api::MAX_GAMEPAD_PLAYERS),
             disks: cfg.disks.clone(),
             add_disk: String::new(),
             backend: Backend::Native,
@@ -263,6 +273,9 @@ enabled = true
         // the form does not offer it and silently rewriting a field nobody was
         // shown is how a hand-edited profile loses its choice.
         cfg.gamepad.enabled = self.gamepad;
+        cfg.gamepad.players = self
+            .gamepad_players
+            .clamp(1, control_api::MAX_GAMEPAD_PLAYERS);
         cfg.disks = self.disks.clone();
 
         let out = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
@@ -477,6 +490,47 @@ interface = "entangled0"
         let cfg = VmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).expect("reload");
         assert!(!cfg.gamepad.enabled);
         assert_eq!(cfg.gamepad.backend, GamepadBackend::Null);
+    }
+
+    /// The player count is the one gamepad field the form *does* own, so it
+    /// has to round-trip both ways and stay inside the range the config
+    /// validator will accept.
+    #[test]
+    fn the_gamepad_player_count_round_trips_and_stays_in_range() {
+        let path = temp_profile("players");
+        let mut form = EditForm::from_profile(&path).expect("load");
+        assert_eq!(form.gamepad_players, 1, "one player unless asked");
+
+        form.gamepad = true;
+        form.gamepad_players = 2;
+        form.save().expect("save");
+        let cfg = VmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).expect("reload");
+        assert_eq!(cfg.gamepad.players, 2);
+        assert_eq!(
+            EditForm::from_profile(&path)
+                .expect("reload")
+                .gamepad_players,
+            2
+        );
+
+        // A count out of range can only come from a hand-edited form (the
+        // picker offers 1..=MAX), and it must be clamped rather than written
+        // out to produce a profile the CLI would then refuse to start.
+        let mut form = EditForm::from_profile(&path).expect("reload");
+        form.gamepad_players = 99;
+        form.save().expect("save");
+        let cfg = VmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).expect("reload");
+        assert_eq!(cfg.gamepad.players, control_api::MAX_GAMEPAD_PLAYERS);
+
+        // Turning the pad off keeps the count, so switching back on does not
+        // silently lose player two.
+        let mut form = EditForm::from_profile(&path).expect("reload");
+        form.gamepad_players = 2;
+        form.gamepad = false;
+        form.save().expect("save");
+        let cfg = VmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).expect("reload");
+        assert!(!cfg.gamepad.enabled);
+        assert_eq!(cfg.gamepad.players, 2);
     }
 
     /// The picker never offers the other host's word, because naming it is a

@@ -428,7 +428,10 @@ fn gamepad_config_space_probes_as_an_xbox_shaped_joystick() {
         "no EV_FF"
     );
     assert!(h.probe(VIRTIO_INPUT_CFG_PROP_BITS, 0).is_empty());
-    assert!(h.probe(VIRTIO_INPUT_CFG_ID_SERIAL, 0).is_empty());
+    // The serial *is* implemented on a gamepad, and it is the only thing that
+    // tells two players' pads apart: same name, same input_id, different
+    // `U: Uniq=` (GAME-2104 follow-up).
+    assert_eq!(h.probe(VIRTIO_INPUT_CFG_ID_SERIAL, 0), b"player-1");
     // An axis the pad does not have answers `size = 0`, which is how a driver
     // learns the axis is absent rather than zero-ranged.
     assert!(h.probe(VIRTIO_INPUT_CFG_ABS_INFO, 0x12).is_empty());

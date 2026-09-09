@@ -1578,16 +1578,71 @@ fn edit_network_display(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
          through to it. Off by default: an existing machine keeps exactly the hardware it \
          had, and a guest that gains a joystick can change what its games do.",
         |ui, _| {
-            ui.checkbox(&mut form.gamepad, "Give this machine a gamepad")
+            ui.checkbox(&mut form.gamepad, "Give this machine gamepads")
                 .on_hover_text(
-                    "An Xbox-shaped controller the guest recognises with no drivers from \
-                     us. Entangled reads whichever pad this computer has — XInput on \
-                     Windows, evdev on Linux — and the guest sees one either way, even \
+                    "Xbox-shaped controllers the guest recognises with no drivers from \
+                     us. Entangled reads whichever pads this computer has — XInput on \
+                     Windows, evdev on Linux — and the guest sees them either way, even \
                      with nothing plugged in yet, so a pad can be connected while the \
                      machine is running.",
                 );
         },
     );
+    if form.gamepad {
+        ui.add_space(6.0);
+        ui::form_row(
+            ui,
+            "PLAYERS",
+            "How many controllers the guest sees. Each one is a separate device inside \
+             the machine, and a machine has room for eight devices in total — a disk, \
+             the screen, the keyboard, the pointer, the network and the sound card \
+             already use six, so two players fit but a second disk then does not. \
+             Player 1 is the pad the guest calls js0.",
+            |ui, field_w| {
+                egui::ComboBox::from_id_salt("edit-gamepad-players")
+                    .selected_text(players_label(form.gamepad_players))
+                    .width(ui::combo_width(field_w))
+                    .show_ui(ui, |ui| {
+                        for players in 1..=control_api::MAX_GAMEPAD_PLAYERS {
+                            ui.selectable_value(
+                                &mut form.gamepad_players,
+                                players,
+                                players_label(players),
+                            )
+                            .on_hover_text(players_hint(players));
+                        }
+                    });
+            },
+        );
+    }
+}
+
+/// The picker's own text: "1 player", "2 players".
+fn players_label(players: u8) -> String {
+    match players {
+        1 => "1 player".to_string(),
+        n => format!("{n} players"),
+    }
+}
+
+/// One sentence per player count, priced in device slots — the currency the
+/// choice is actually spent in.
+fn players_hint(players: u8) -> &'static str {
+    match players {
+        1 => {
+            "One controller. Leaves room for a second disk or a CD-ROM alongside the \
+             network and sound cards."
+        }
+        2 => {
+            "Two controllers, on their own devices, told apart by the guest. Fits beside \
+             the network and sound cards, but nothing else."
+        }
+        3 => "Three controllers. Needs the sound card or the network turned off.",
+        _ => {
+            "Four controllers, which is as many as Windows itself tracks. Needs both the \
+             sound card and the network turned off."
+        }
+    }
 }
 
 /// One sentence per sound backend, for the hover in the picker.

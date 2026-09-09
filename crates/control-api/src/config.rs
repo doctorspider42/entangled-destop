@@ -432,31 +432,59 @@ impl std::fmt::Display for GamepadBackend {
     }
 }
 
-/// `[gamepad]` — a virtio-input gamepad for the guest (GAME-2104).
+/// The most players one VM can have; mirrors `virtio_input::MAX_PLAYERS`
+/// (XInput's own limit) and is bounded well below it by the slot budget.
+pub const MAX_GAMEPAD_PLAYERS: u8 = 4;
+
+/// `[gamepad]` — virtio-input gamepads for the guest (GAME-2104).
 ///
-/// **Off by default**, for exactly the two reasons `[sound]` is. The pad is
-/// attached last, so turning it on never renames `/dev/vda` or shifts a PCI
-/// device number — but it does take one of the eight slots on either bus
+/// **Off by default**, for exactly the two reasons `[sound]` is. Pads are
+/// attached last, so turning them on never renames `/dev/vda` or shifts a PCI
+/// device number — but each takes one of the eight slots on either bus
 /// (`machine_x86::virtio::MAX_VIRTIO_SLOTS`, and eight functions plus the host
 /// bridge in `machine_x86::pci::MAX_PCI_DEVICES`). And an existing profile
 /// must keep describing exactly the machine it used to.
 ///
-/// The budget is now genuinely tight. A VM with one disk spends
-/// disk + gpu + keyboard + tablet = 4; a network adds a fifth, sound a sixth
-/// and this a seventh, leaving one slot for a CD-ROM *or* a second disk but
-/// not both. Anything past that is refused when the bus is built, with the
-/// count in the message.
+/// # The slot budget, spelled out
+///
+/// One pad is a device, not a feature flag: there is no way to put two
+/// players on one virtio-input device, because one virtio-input device is one
+/// evdev device and a game reads one controller per node. So `players = N`
+/// costs N slots, and the eight break down like this:
+///
+/// | Device | Slots |
+/// |---|---|
+/// | disks (`[[disk]]`, one each) | 1+ |
+/// | virtio-gpu | 1 |
+/// | keyboard | 1 |
+/// | tablet (absolute pointer) | 1 |
+/// | network (`[network]`) | 0 or 1 |
+/// | sound (`[sound]`) | 0 or 1 |
+/// | gamepads (`players`) | 0..=4 |
+///
+/// A one-disk VM with a network card and sound has spent six, so **two
+/// players fit and a CD-ROM or second disk then does not**. Drop the sound
+/// card or the network and two players leave room for one more device;
+/// three players need both dropped. Four never fits alongside sound and
+/// network, and the bus says so by name and count when it is built rather
+/// than failing obscurely later.
 ///
 /// ```toml
 /// [gamepad]
 /// enabled = true
-/// # backend = "auto"   # auto | null | evdev | xinput
+/// # players = 1       # 1..=4, one virtio slot each
+/// # backend = "auto"  # auto | null | evdev | xinput
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct GamepadSection {
     pub enabled: bool,
-    /// Which host mechanism the pad reads. Meaningless while `enabled` is
+    /// How many pads the guest gets, one virtio slot each. Meaningless while
+    /// `enabled` is false, and validated whether or not it is: a profile that
+    /// says `players = 9` is a mistake worth reporting even before the switch
+    /// is flipped.
+    pub players: u8,
+    /// Which host mechanism the pads read. Meaningless while `enabled` is
     /// false and therefore not refused there, so a profile may keep its chosen
     /// backend across an on/off toggle.
     pub backend: GamepadBackend,
@@ -466,6 +494,7 @@ impl Default for GamepadSection {
     fn default() -> Self {
         Self {
             enabled: false,
+            players: 1,
             backend: GamepadBackend::Auto,
         }
     }
@@ -505,6 +534,13 @@ impl VmConfig {
         }
         if self.display.width == 0 || self.display.height == 0 {
             return err("display dimensions must be non-zero".into());
+        }
+        if !(1..=MAX_GAMEPAD_PLAYERS).contains(&self.gamepad.players) {
+            return err(format!(
+                "gamepad.players {} outside supported range 1..={MAX_GAMEPAD_PLAYERS}; \
+                 each player is one virtio slot, and eight is all there are",
+                self.gamepad.players
+            ));
         }
         if !(MIN_REFRESH_HZ..=MAX_REFRESH_HZ).contains(&self.display.refresh_hz) {
             return err(format!(
@@ -687,6 +723,54 @@ scale = 1.0
         // …and so is a field nobody implemented.
         let unknown = BACKLOG_EXAMPLE.to_string() + "\n[gamepad]\ndeadzone = 0.2\n";
         assert!(VmConfig::from_toml(&unknown).is_err());
+    }
+
+    /// One player unless a profile asks for more, and never more than the
+    /// slot budget can hold.
+    #[test]
+    fn gamepad_players_defaults_to_one_and_is_bounded() {
+        let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).expect("parses");
+        assert_eq!(
+            cfg.gamepad.players, 1,
+            "a profile that says nothing gets one"
+        );
+
+        for players in 1..=MAX_GAMEPAD_PLAYERS {
+            let text =
+                format!("{BACKLOG_EXAMPLE}\n[gamepad]\nenabled = true\nplayers = {players}\n");
+            let cfg = VmConfig::from_toml(&text).unwrap_or_else(|e| panic!("{players}: {e}"));
+            assert_eq!(cfg.gamepad.players, players);
+            // …and it survives a round trip through TOML.
+            let text = toml::to_string(&cfg).expect("serialises");
+            assert_eq!(
+                VmConfig::from_toml(&text).expect("round-trips").gamepad,
+                cfg.gamepad
+            );
+        }
+
+        // Zero pads is not "no gamepad", it is a typo; so is a fifth player.
+        for players in [0u8, MAX_GAMEPAD_PLAYERS + 1, 200] {
+            let text =
+                format!("{BACKLOG_EXAMPLE}\n[gamepad]\nenabled = true\nplayers = {players}\n");
+            let error = VmConfig::from_toml(&text)
+                .expect_err(&format!("players = {players} must be refused"));
+            let ConfigError::Invalid(message) = error else {
+                panic!("players = {players} must be an Invalid, not a parse error");
+            };
+            assert!(
+                message.contains("gamepad.players") && message.contains("virtio slot"),
+                "the message must say what the limit is about: {message}"
+            );
+        }
+
+        // The count is validated even with the pad switched off: a profile
+        // carrying `players = 9` is a mistake worth reporting before the
+        // switch is flipped, not after.
+        let text = BACKLOG_EXAMPLE.to_string() + "\n[gamepad]\nenabled = false\nplayers = 9\n";
+        assert!(matches!(
+            VmConfig::from_toml(&text),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     /// A profile written before virtio-snd existed must keep describing
