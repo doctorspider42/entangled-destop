@@ -524,9 +524,7 @@ impl Lifecycle {
                 }
             }
             inner.save_error = None;
-            for slot in &mut inner.saved {
-                *slot = None;
-            }
+            inner.saved.fill(None);
             inner.phase = Phase::SaveVcpus;
             self.attention.store(true, Ordering::Release);
         }
