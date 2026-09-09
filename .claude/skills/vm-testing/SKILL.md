@@ -267,6 +267,46 @@ Read that as four verdicts and one apparent failure:
   The next section is that story, because it is the most expensive lesson this
   test has taught and the shape of it will recur.
 
+### The confirming run: 2 h on the same host, 2026-09-09, green
+
+```text
+duration          7200 s (2.00 h) after a 60s warm-up, 121 samples
+RSS               88260 -> 89452 KiB (+1192 KiB, +596 KiB/h)
+file descriptors  11 -> 11
+threads           6 -> 6
+heartbeats        7146 ticks, 7207 lines on the console, 0 gaps
+delivery          worst interval 0.95 of expected (60 expected per 60 s), at 1140 s
+guest clock       7168687 ms guest vs 7200121 ms host, drift -4366 ppm (+-104 ppm), clocksource tsc
+cross-check       guest vs the host clock it read itself -4393 ppm, that reading vs
+                  the host's own +27 ppm, guest TSC 1888.110 MHz against host time
+host reference    monotonic vs wall clock +4484 ppm, guest vs the host's wall clock
+                  +99 ppm - reference CLOCK_REALTIME (the host's monotonic clock is
+                  the outlier)
+console           565905 bytes total, 75.8 B per heartbeat, 1 unexpected line
+```
+
+Three numbers to read there, in order of how much they settle:
+
+- **+99 ppm** — the guest against real time over two hours. That is the verdict.
+- **+27 ppm** — the guest's own reading of the host clock against the host's
+  reading of it, i.e. everything the harness could have got wrong about
+  *when* a line arrived, over 7 146 heartbeats. It could not.
+- **+4 484 ppm** — the host's monotonic clock against its own wall clock, which
+  is the whole of the −4 366 ppm the old assertion would have failed on.
+
+And the per-sample series is the wander caught in the act: the host clock's
+error decays smoothly through the run, and the guest's apparent drift follows it
+exactly, while the guest's agreement with the wall clock never moves.
+
+| At | apparent drift | host clock error |
+|---|---|---|
+| 780 s | −9 942 ppm | ~+10 000 ppm |
+| 2 940 s | −7 334 ppm | — |
+| 4 740 s | −6 038 ppm | — |
+| 7 200 s | −4 366 ppm | +4 484 ppm |
+
+Load average over that run went from 0 to 12 and back; the drift did not notice.
+
 ### The clock finding: the reference was the broken clock
 
 Three things had to be fixed before the drift number meant anything. The first
