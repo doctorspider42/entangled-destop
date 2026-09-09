@@ -2,7 +2,10 @@
 
 The failures below are the ones people actually hit, in rough order of how often
 they happen on a machine that has never run this before. Each one starts with
-the message you will see, because that is what you will be searching for.
+the message you will see, because that is what you will be searching for. Every
+message quoted here is one this project really prints — the ones carrying
+numbers were captured from a passing test on the development machine, not
+written from memory.
 
 The first thing to run, always:
 
@@ -26,6 +29,8 @@ one-line fix under it.
 - [The install seems stuck](#the-install-seems-stuck)
 - [The installed Ubuntu takes two minutes to reach the login prompt](#the-installed-ubuntu-takes-two-minutes-to-reach-the-login-prompt)
 - [Windows says "Windows protected your PC"](#windows-says-windows-protected-your-pc)
+- [The guest has no joystick](#the-guest-has-no-joystick)
+- [`entangled resume` refuses the snapshot](#entangled-resume-refuses-the-snapshot)
 - [The manager says a machine is stopped when it is running](#the-manager-says-a-machine-is-stopped-when-it-is-running)
 
 ## `cannot read firmware`
@@ -262,12 +267,82 @@ There is no published checksum to verify the download against either; if that is
 not acceptable, build from source instead — see the
 [user guide](user-guide.md#either-host-build-from-source).
 
+## The guest has no joystick
+
+A machine only has a gamepad if its profile asks for one — it is off by default,
+like the sound card, because it costs a device slot and because an existing
+profile has to keep describing the machine it always described:
+
+```toml
+[gamepad]
+enabled = true
+```
+
+or *Configure ▸ Network & display ▸ Give this machine a gamepad* in the manager.
+Then, inside the guest:
+
+- `cat /proc/bus/input/devices` should list `Entangled Gamepad`. If it does not,
+  the device was never attached — check the host's run log for
+  `virtio device activated … device=Input`.
+- The pad is **not necessarily `/dev/input/js0`**: the machine's absolute
+  pointer also matches `joydev` and is attached first, so the pad may be `js1`.
+  Enumerate by name.
+- No `/dev/input/js*` **at all**, for any device, means the guest kernel has no
+  `joydev`: it is a separate config symbol from `evdev`, and a module rather
+  than built in on some distribution kernels (`modprobe joydev`). The pad's
+  `event*` node exists either way, and SDL uses that one.
+- A pad that exists but nothing can open belongs to the udev tag: without
+  `ID_INPUT_JOYSTICK` your desktop user gets no ACL on the node. `udevadm info
+  /dev/input/eventN` shows the tags.
+
+The host end is chosen by `backend`: `auto` (whatever this host has), `evdev`
+(Linux), `xinput` (Windows) or `null` — a pad the guest can see and the host
+never moves, which is what a headless run wants. None of them fail because no
+controller is plugged in; plugging one in later is enough.
+
+## `entangled resume` refuses the snapshot
+
+A snapshot is bound to the machine, the hypervisor and the disks it was taken
+from, and a restore that guessed would corrupt a filesystem. Every refusal names
+itself:
+
+```text
+not an Entangled snapshot: the file does not start with the "ENTGLSNP" magic
+snapshot is truncated: section index needs 78803098 more bytes, 39401549 are left
+snapshot format version 8 cannot be restored by this build (it writes and reads version 1)
+snapshot header carries unknown flags 0x1; it was written by a newer build
+snapshot was taken on Windows/WHP and this is Linux/KVM: a saved CPU carries that
+hypervisor's own interrupt-controller and extended-state blobs, which the other one
+cannot load
+snapshot section memory[0] is corrupt: its contents do not match the recorded digest
+disk /home/you/entangled-vms/ubuntu.raw has changed since the snapshot was taken
+(size: was 8388608, is 16777216); restoring onto it would corrupt the guest's filesystem
+```
+
+There is also a refusal for the machine itself having changed — different
+memory, different vCPU count — saying which field, was what, is what.
+
+None of these is recoverable, and none of them should be worked around: boot the
+machine normally instead and lose the saved session. The two you can avoid are
+the last two: do not edit or resize a machine that has a session saved (the
+manager lets you, and warns on the Configure hover), and do not touch its disk
+from the host in between. `entangled snapshot <file>` answers all of this
+**without** starting anything, and the manager's Snapshots view shows the same
+verdict as a sentence under each row, before you click Resume.
+
 ## The manager says a machine is stopped when it is running
 
 The manager tracks VMs as child processes and does not adopt orphans. Restart
 the manager while a VM it started is running, and the card goes back to
 *Stopped* while the machine keeps running; pressing Start then fails with
 whatever resource the live VM still holds (a busy TAP interface, most visibly).
+For the same reason, Pause, Restart and Suspend are greyed out on a VM this copy
+of the manager did not start — those need the control pipe to a child process.
+
+A **suspended** machine is the one state that does survive this: it is the
+absence of a process plus the presence of a `<name>.esnap` file, so a manager
+that has just started reads it correctly off the disk.
+
 Find the process and stop it the normal way:
 
 ```bash

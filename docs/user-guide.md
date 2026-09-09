@@ -52,7 +52,7 @@ What it can do today:
 | Guests | Debian, Ubuntu Server, Ubuntu Desktop, Fedora Workstation — installed by the tool itself, unattended, from media it verified |
 | Boot | UEFI firmware with a persistent variable store, or a direct Linux kernel boot with no firmware at all |
 | Graphics | 2D scanout in a resizable window; 1920×1080 is the size the project targets and tests. 3D (OpenGL through VirGL) on a Linux host |
-| Devices | virtio-blk, virtio-net, virtio-gpu, virtio-input (keyboard and absolute pointer), virtio-snd (playback), over virtio-mmio or virtio-pci with MSI-X |
+| Devices | virtio-blk, virtio-net, virtio-gpu, virtio-input (keyboard, absolute pointer and an Xbox-shaped gamepad), virtio-snd (playback), over virtio-mmio or virtio-pci with MSI-X |
 | Network | a host TAP interface (Linux), or a user-mode NAT that needs no administrator and no host setup (both hosts) |
 | Lifecycle | pause and resume, reboot in place, suspend to a file and restore it in a new process |
 | Disks | sparse RAW images: create, inspect, grow, move between drives, reclaim freed space through discard |
@@ -226,7 +226,7 @@ entangled doctor
     firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB)
     bootstrap kernel artifacts/bootstrap/vmlinuz (12.5 MiB)
     ubuntu ISO      /home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-live-server-amd64.iso (2.7 GiB)
-    VM directory    /home/you/entangled-vms (803 GiB free of 1007 GiB)
+    VM directory    /home/you/entangled-vms (781 GiB free of 1007 GiB)
     network         --network tap by default on this host
 host looks ready to run VMs
 ```
@@ -413,6 +413,51 @@ until you ask it not to.
 The window title says whether input is grabbed. Losing focus releases the grab
 and every key the guest was told is down.
 
+### Gamepads
+
+A machine can have a controller as well as a keyboard and a pointer. It is off
+by default — it costs a device slot, and an existing profile has to keep
+describing the machine it always described — so ask for it:
+
+```toml
+[gamepad]
+enabled = true
+# backend = "auto"     # auto | null | evdev | xinput
+```
+
+or tick *Give this machine a gamepad* in the manager's machine editor, under
+*Network & display*.
+
+What the guest gets is an **Xbox 360-shaped pad**: eleven buttons, two sticks,
+two analogue triggers and a hat, with exactly the capability set that makes
+Linux's `joydev` publish a `/dev/input/js*` node, udev tag the device
+`ID_INPUT_JOYSTICK` (which is what gives your desktop user permission to open
+it), and SDL — and therefore Steam and most games — derive a complete controller
+mapping without any database entry. It does **not** claim Microsoft's USB
+vendor and product ids to get one; it says it is a virtual device, and earns the
+mapping from its capabilities instead.
+
+`backend` chooses how the host reads a real controller: `evdev` reads
+`/dev/input/event*` directly on Linux, `xinput` uses XInput on Windows, `auto`
+takes whichever of those this host has, and `null` gives the guest a working
+pad that the host never moves — which is what a headless or CI run wants.
+`auto` never stops a machine from starting, and in particular does not care
+whether a controller is plugged in.
+
+Plugging and unplugging while the VM runs works in both directions, and so does
+swapping one pad for another: the host reports the controller's whole state and
+the device sends the guest only what changed. A controller that disappears
+reads as neutral, so held buttons are released and sticks re-centre rather than
+the guest running forward for ever.
+
+Three things it does not do yet: **no rumble** (there is no force-feedback path
+back to the host pad), **one pad per machine**, and **no host-side deadzone or
+response curve** — the only deadzone is the one the guest's own driver applies
+to the `ABS_INFO` the device publishes, which is `xpad`'s. Note also that the
+pad is **not necessarily `/dev/input/js0`** — the acceptance run for it found the
+machine's absolute pointer claiming `js0` and the pad landing on `js1` — so
+enumerate by name (`Entangled Gamepad`) rather than by number.
+
 ### Without a window
 
 ```bash
@@ -446,6 +491,21 @@ reads one lifecycle command per line on stdin: `pause`, `resume`, `reset`,
 This is how the GUI manager's buttons work, and how the end-to-end tests log
 into a guest.
 
+Each one is answered on stdout, interleaved with the guest's own console output
+and prefixed so a reader can pick it out of the noise:
+
+```text
+entangled-control: ok pause
+entangled-control: state=Running
+entangled-control: saved /home/you/vm.esnap 75.1 MiB written in 3.54s (75.1 MiB of 256 MiB guest RAM in 228 runs, 1 vCPUs)
+entangled-control: error save <why it could not be written>
+```
+
+`ok <command>` means accepted, not finished. `saved` and `error save …` are the
+two ways a suspend ends, and they are the last thing that VM says — it exits
+either way. The vocabulary is a wire format between two programs, so it lives in
+one place (`control_api::control`) rather than being spelled out twice.
+
 ## Machines on disk
 
 A machine is a TOML profile plus the files it names. Nothing is hidden in a
@@ -471,7 +531,18 @@ writable = true
 width = 1280
 height = 800
 scale = 1.0
+
+[sound]
+enabled = true
+
+[gamepad]
+enabled = true
 ```
+
+An installed machine gets the sound card and the gamepad switched on for you —
+both with `backend = "auto"`, which is the setting that can never be the reason
+a VM fails to start. `examples/ubuntu-installed.toml` is the same shape with a
+comment on every key.
 
 Things worth knowing about the shape:
 
@@ -497,6 +568,16 @@ Things worth knowing about the shape:
   `"auto"` (whatever the host has), `"null"`, `"alsa"` or `"wasapi"`. `auto`
   never stops a machine from starting; a named backend the host cannot open
   does, on purpose.
+- **`[gamepad]`** is off unless you add it, the same way: `enabled = true` and a
+  `backend` of `"auto"`, `"null"`, `"evdev"` (Linux) or `"xinput"` (Windows).
+  See [Gamepads](#gamepads) below.
+
+Every device costs a **slot**, and there are eight of them on either bus. A
+machine with one disk spends four (disk, GPU, keyboard, pointer); a network card
+is a fifth, a sound card a sixth and a gamepad a seventh, which leaves room for a
+CD-ROM *or* a second disk but not both. Going over is refused when the machine
+is built, with the count in the message, rather than producing a guest that is
+quietly missing a device.
 
 Disk images are sparse RAW files — no proprietary format, `dd` and `losetup`
 understand them:
@@ -545,6 +626,16 @@ want a second machine.
   entangled snapshot ~/entangled-vms/ubuntu.esnap   # just describe the file
   ```
 
+**A resume does not delete the snapshot**, on purpose: a restore that fails on
+startup has to be retriable, and `entangled resume` points a later bare `save`
+back at the same file, which is what makes closing and reopening a machine a
+loop rather than a one-way trip. There is one consequence worth knowing before
+it surprises you: if you resume a machine and then **stop** it instead of
+suspending it again, it goes back to *Suspended* holding the old file — and once
+the resumed guest has written to its disk, that file is one the engine will
+refuse. The manager says exactly that on the card, and *Start fresh…* is the way
+out; it deletes the stale session with you watching.
+
 `entangled snapshot` opens no disk and allocates no memory; it tells you what
 the file is of, when it was taken, what it contains and whether *this* machine
 could restore it — including for a snapshot taken on the other hypervisor, where
@@ -578,10 +669,38 @@ directory (`~/entangled-vms`, `%USERPROFILE%\entangled-vms` on Windows,
 changeable in Settings). A card shows the machine's memory, vCPUs, screen size,
 network interface, how big its disk is and how much of that is really allocated,
 and — while it runs — uptime, CPU and a small CPU graph. The buttons follow the
-state: **Start** when it is stopped, **Stop / Pause / Restart** when it runs,
-**Abort** during an install, plus **Configure** and a **More** menu with *Copy
-profile path*, *Open activity log* and *Delete machine*. A card whose disk file
-has gone missing says so and offers no Start button.
+state:
+
+| State | Buttons |
+|---|---|
+| **Stopped** | **Start** |
+| **Running** | **Stop**, **Pause** / **Resume**, **Restart**, **Suspend** |
+| **Stopping** | **Kill** (shutdown was asked for; force it) |
+| **Installing** | **Abort** |
+| **Suspending** | none — it is writing itself to a file and will stop when it has |
+| **Suspended** | **Resume**, **Start fresh…** |
+
+plus **Configure** on every card — allowed while a machine is stopped or
+suspended, with the warning that changing its hardware is what makes a saved
+session unrestorable — and a **More** menu holding *Copy profile path*, *Open
+activity log*, *Forget the saved session* (when there is one) and *Delete
+machine*. A card whose disk file has gone missing says so and offers no Start
+button.
+
+Pause, Restart and Suspend need the control channel, which only exists for a VM
+*this manager started*; on a machine someone launched from a terminal they are
+greyed out and say so rather than pretending.
+
+**Suspended** is the one state that is a fact on disk rather than something the
+manager is remembering: a machine is Suspended when it
+has no child process **and** there is a `<name>.esnap` beside its profile. That
+is why a suspended machine still reads correctly after the manager has been
+closed and reopened, where a *running* one does not (see the limits below). Its
+card says when the session was saved and how big it is, **Resume** is only bright
+when that session could really go back — the reason it could not is on the hover,
+before the click, not in an error afterwards — and **Start fresh…** asks before
+throwing the session away, because booting the machine from scratch is exactly
+what makes it unrestorable.
 
 **Create machine** opens a four-step wizard — *System*, *Hardware*, *Storage*,
 *Review*. You pick Debian or Ubuntu and its installer media, name the machine
@@ -595,7 +714,8 @@ learn the CLI.
 together: *Hardware* (memory, vCPUs, `mmio`/`pci`), *Boot & media* (direct-Linux
 kernel and command line, or UEFI firmware, NVRAM store and disc), *Network &
 display* (network backend and interface, MAC, screen size, 3D, sound and its
-output backend), *Storage* (the ordered list of disks — the order *is*
+output backend, and whether the machine gets a gamepad), *Storage* (the ordered
+list of disks — the order *is*
 `/dev/vda`, `/dev/vdb`, …). Edits go through the same validation `entangled run`
 would apply, before the file is written, so a profile the GUI saved always
 starts. A machine cannot be edited or deleted while it runs, and it cannot be
@@ -608,6 +728,18 @@ you can create, attach, detach, grow, move and delete images. Moving copies
 sparse-preserving, verifies the copy, updates every profile that referenced the
 image and only then deletes the original. Shrinking is not offered at all,
 because it can only destroy data.
+
+**Snapshots** — *Saved sessions* — lists every `.esnap` file in the VM
+directory: which machine it is of, when it was taken, how big it is on paper and
+on disk, and whether it could be resumed **here**. A snapshot is bound to the
+hypervisor it was taken on, to the build that wrote it and to the disks it was
+pinned to, so a row is often something that cannot be used — and each such row
+carries the reason as a plain sentence under it rather than as an error after
+the click: *"This was saved on Windows/WHP and the machine is set to run on
+Linux/KVM. A saved processor carries its own hypervisor's state, which the other
+one cannot load."* Each row offers **Resume**, **Reveal** (open the containing
+folder) and **Delete**; the header carries the totals, because "how much is this
+costing me" is the usual reason to open a list of very large files.
 
 **Diagnostics** answers "can this computer run machines?" It shows which engine
 binary the manager found, which backend new machines will use, the capability
@@ -726,7 +858,15 @@ configuration:
     several machines.
 14. **Nothing adopts an orphaned VM.** If the manager is restarted while a VM it
     started is running, its card shows *Stopped* while the machine is very much
-    alive.
+    alive — and Pause, Restart and Suspend are greyed out on any VM this copy of
+    the manager did not start, because the control channel is a pipe to a child
+    process. A *suspended* machine is the exception: that state is a file on
+    disk, so it survives a restart of the manager.
+15. **One gamepad per machine, and no rumble.** The pad is an Xbox 360-shaped
+    virtio-input device; force feedback has no path back to the host controller,
+    there is no second player, and there is no host-side deadzone or response
+    curve (deliberately — the guest's own calibration would not be able to see
+    it).
 
 ## Provenance of the commands in this guide
 
@@ -742,4 +882,6 @@ configuration:
 | `entangled fetch debian …`, `install debian …` | from the CLI's help output and the Debian install path's documentation; not re-run for this guide |
 | `entangled install ubuntu --iso <desktop iso> …` | the server command with the flags the CLI documents; the Desktop variant is what `tests/boot/tests/desktop_gnome.rs` boots, but this exact line was not re-run for the guide |
 | `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All` | the standard Windows spelling of the feature this project requires; the feature is enabled on the development host |
-| the manager's views | rendered while writing this guide with `cargo run -p entangled-manager -- --mock --screenshot <png> --screenshot-view main\|wizard\|diagnostics`, and described from the pictures and the source |
+| the manager's views | rendered while writing this guide with `cargo run -p entangled-manager -- --mock --screenshot <png> --screenshot-view main\|wizard\|diagnostics`, and again for the Snapshots work with `--screenshot-view snapshots\|snapshot-delete\|snapshot-discard\|editor-network`; described from the pictures and the source |
+| the control channel's replies | `cargo test -p entangled --test suspend_restore -- --nocapture`, which passes; the `saved …` line is one of its own, with the path shortened |
+| `[gamepad] enabled = true`, and what the guest makes of the pad | `cargo test -p boot-tests --test gamepad -- --nocapture` was run here and passes: the guest kernel reports `name=Entangled_Gamepad … keys=11 axes=8 absx=-32768:32767:16:128`. The `js*` half of it self-skipped, because this checkout's bootstrap kernel predates `CONFIG_INPUT_JOYDEV=y` — so **`js0` vs `js1` is quoted from GAME-2104's acceptance run** (recorded in the backlog), not observed here |
