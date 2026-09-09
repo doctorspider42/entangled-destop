@@ -668,3 +668,286 @@ pub trait GuestClock: Send + Sync {
     fn save_clock(&self) -> Result<VmClockState, HvError>;
     fn load_clock(&self, state: &VmClockState) -> Result<(), HvError>;
 }
+
+// ---- dirty-page tracking (ADR-0006) --------------------------------------
+
+/// The granularity both hypervisors report writes at: the architectural page.
+///
+/// KVM's `KVM_GET_DIRTY_LOG` and WHP's `WHvQueryGpaRangeDirtyBitmap` both hand
+/// back one bit per 4 KiB of the range, and neither offers a coarser or a finer
+/// setting on x86.
+pub const DIRTY_PAGE_SIZE: u64 = 4096;
+
+/// One RAM region's write log: a bit per page, set for every page the **guest**
+/// wrote since the log was last read.
+///
+/// Deliberately a value rather than a borrowed bitmap: both backends have to
+/// copy the kernel's or the hypervisor's bitmap out anyway, and a snapshot of
+/// the log is what every caller wants — the log itself keeps moving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirtyPages {
+    gpa: u64,
+    len: u64,
+    /// LSB-first: page *p* of the region is bit `p % 64` of word `p / 64`.
+    /// The same order both hypervisors use, so neither backend has to shuffle.
+    bits: Vec<u64>,
+}
+
+impl DirtyPages {
+    /// Builds a log for the region at `gpa` of `len` bytes.
+    ///
+    /// `bits` must cover every page; a short bitmap is a backend bug, not a
+    /// guest one, and it is refused here rather than read past.
+    pub fn new(gpa: u64, len: u64, bits: Vec<u64>) -> Result<Self, HvError> {
+        let pages = len.div_ceil(DIRTY_PAGE_SIZE);
+        let words = pages.div_ceil(64);
+        if (bits.len() as u64) < words {
+            return Err(HvError::Registers(format!(
+                "dirty bitmap for {len} bytes at {gpa:#x} is {} words, {words} are needed",
+                bits.len()
+            )));
+        }
+        Ok(Self { gpa, len, bits })
+    }
+
+    /// An all-clean log, for a region the host could not or need not query.
+    pub fn clean(gpa: u64, len: u64) -> Self {
+        let words = len.div_ceil(DIRTY_PAGE_SIZE).div_ceil(64);
+        Self {
+            gpa,
+            len,
+            bits: vec![0; words as usize],
+        }
+    }
+
+    pub fn gpa(&self) -> u64 {
+        self.gpa
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// How many pages the region has.
+    pub fn pages(&self) -> u64 {
+        self.len.div_ceil(DIRTY_PAGE_SIZE)
+    }
+
+    /// Whether page `page` (counted from the region's base) was written.
+    /// Out-of-range pages are clean rather than a panic — the caller may be
+    /// walking a region whose length is not a multiple of the page size.
+    pub fn is_dirty(&self, page: u64) -> bool {
+        if page >= self.pages() {
+            return false;
+        }
+        match self.bits.get((page / 64) as usize) {
+            Some(word) => word & (1u64 << (page % 64)) != 0,
+            None => false,
+        }
+    }
+
+    /// Whether the page containing `gpa` was written. `false` for an address
+    /// outside this region.
+    pub fn contains_dirty_gpa(&self, gpa: u64) -> bool {
+        match gpa.checked_sub(self.gpa) {
+            Some(offset) if offset < self.len => self.is_dirty(offset / DIRTY_PAGE_SIZE),
+            _ => false,
+        }
+    }
+
+    /// How many pages are set.
+    pub fn count(&self) -> u64 {
+        // The tail of the last word may cover pages past the region's end; a
+        // hypervisor should leave those clear, but counting them would make a
+        // short region report more dirty pages than it has.
+        let pages = self.pages();
+        let mut total = 0u64;
+        for (index, word) in self.bits.iter().enumerate() {
+            let first = index as u64 * 64;
+            if first >= pages {
+                break;
+            }
+            let word = if pages - first >= 64 {
+                *word
+            } else {
+                *word & ((1u64 << (pages - first)) - 1)
+            };
+            total += u64::from(word.count_ones());
+        }
+        total
+    }
+
+    /// Dirty bytes: a page's worth each, except a final short page, which
+    /// contributes only what the region actually has. `count() * PAGE` would
+    /// let a region whose length is not a multiple of the page size report more
+    /// bytes than it holds.
+    pub fn dirty_bytes(&self) -> u64 {
+        let pages = self.pages();
+        (0..pages)
+            .filter(|&page| self.is_dirty(page))
+            .map(|page| DIRTY_PAGE_SIZE.min(self.len - page * DIRTY_PAGE_SIZE))
+            .sum()
+    }
+
+    /// The dirty pages as `(offset, length)` runs of adjacent pages, in
+    /// ascending order — the shape anything that copies them wants.
+    pub fn runs(&self) -> Vec<(u64, u64)> {
+        let mut runs = Vec::new();
+        let mut start: Option<u64> = None;
+        for page in 0..self.pages() {
+            match (self.is_dirty(page), start) {
+                (true, None) => start = Some(page),
+                (false, Some(from)) => {
+                    runs.push(self.run(from, page));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(from) = start {
+            runs.push(self.run(from, self.pages()));
+        }
+        runs
+    }
+
+    fn run(&self, from: u64, to: u64) -> (u64, u64) {
+        let offset = from * DIRTY_PAGE_SIZE;
+        ((offset), (to * DIRTY_PAGE_SIZE).min(self.len) - offset)
+    }
+}
+
+/// What a host's write tracking can and cannot see.
+///
+/// A struct rather than a comment because the second field is the whole reason
+/// incremental snapshots are not built on this (ADR-0006): **neither** host's
+/// tracking sees a write the *VMM itself* makes through the host mapping. KVM
+/// write-protects the second-level page tables and WHP does the same to the
+/// SLAT; a `memcpy` from this process into guest RAM — every virtio-blk read
+/// completion, every received packet, every used-ring update, every boot image
+/// — faults neither and is reported by neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyTracking {
+    /// Writes the guest's own instructions make. Always true where tracking
+    /// exists at all; it is the thing being tracked.
+    pub guest_writes: bool,
+    /// Writes host code makes through the mapping that backs guest RAM.
+    /// **False on both hosts**, and there is no flag that changes it.
+    pub host_writes: bool,
+    /// Whether reading the log also clears it.
+    pub read_clears: bool,
+}
+
+/// The hypervisor's write log for guest RAM, where it has one (ADR-0006).
+///
+/// A trait for the same reason [`GuestClock`] and [`HostIrqChip`] are traits:
+/// the layer above holds it without holding a `kvm_ioctls::VmFd` or a
+/// `WHV_PARTITION_HANDLE`.
+///
+/// **Read [`DirtyTracking::host_writes`] before building anything on this.** A
+/// log that misses the VMM's own writes cannot answer "which pages changed
+/// since the last snapshot"; it answers "which pages the *guest* wrote", which
+/// is a strictly smaller set and a strictly different question.
+pub trait DirtyLog: Send + Sync {
+    /// What this host's tracking sees.
+    fn tracking(&self) -> DirtyTracking;
+
+    /// Whether the hypervisor is logging right now.
+    fn dirty_logging(&self) -> bool;
+
+    /// Turns logging on or off for every RAM region.
+    ///
+    /// A host that fixes the answer when the range is mapped — WHP does —
+    /// accepts a request that matches what it already does and refuses one that
+    /// does not, saying so. Additive per ADR-0002: neither backend's public API
+    /// bends to the other's shape.
+    fn set_dirty_logging(&self, on: bool) -> Result<(), HvError>;
+
+    /// Reads the log, one entry per RAM region in the same order the regions
+    /// were registered. Clears it where [`DirtyTracking::read_clears`] says so.
+    fn fetch_dirty(&self) -> Result<Vec<DirtyPages>, HvError>;
+}
+
+/// Totals over every region's log, for a one-line report.
+pub fn dirty_summary(log: &[DirtyPages]) -> (u64, u64, u64) {
+    let pages = log.iter().map(DirtyPages::count).sum();
+    let bytes = log.iter().map(DirtyPages::dirty_bytes).sum();
+    let total = log.iter().map(DirtyPages::len).sum();
+    (pages, bytes, total)
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_bitmap_is_refused_rather_than_read_past() {
+        // 1 MiB is 256 pages, which needs four 64-bit words.
+        assert!(DirtyPages::new(0, 1 << 20, vec![0; 4]).is_ok());
+        let err = DirtyPages::new(0, 1 << 20, vec![0; 3]).unwrap_err();
+        assert!(err.to_string().contains("4 are needed"), "{err}");
+    }
+
+    #[test]
+    fn bits_map_to_pages_lsb_first() {
+        let mut bits = vec![0u64; 4];
+        bits[0] = 1 << 0 | 1 << 3;
+        bits[1] = 1 << 5; // page 69
+        let log = DirtyPages::new(0x1000, 1 << 20, bits).unwrap();
+        assert!(log.is_dirty(0));
+        assert!(!log.is_dirty(1));
+        assert!(log.is_dirty(3));
+        assert!(log.is_dirty(69));
+        assert_eq!(log.count(), 3);
+        assert_eq!(log.dirty_bytes(), 3 * DIRTY_PAGE_SIZE);
+        // Addressed by GPA, which is where the region's base matters.
+        assert!(log.contains_dirty_gpa(0x1000));
+        assert!(log.contains_dirty_gpa(0x1fff));
+        assert!(!log.contains_dirty_gpa(0x2000));
+        assert!(!log.contains_dirty_gpa(0));
+        assert!(!log.contains_dirty_gpa(0x1000 + (1 << 20)));
+    }
+
+    /// Adjacent pages coalesce; the last run is clipped to the region.
+    #[test]
+    fn runs_coalesce_and_stop_at_the_end() {
+        // Five pages, of which 0,1 and 4 are dirty. The region is deliberately
+        // not a multiple of the page size.
+        let len = 4 * DIRTY_PAGE_SIZE + 100;
+        let log = DirtyPages::new(0, len, vec![0b1_0011]).unwrap();
+        assert_eq!(log.pages(), 5);
+        assert_eq!(
+            log.runs(),
+            vec![(0, 2 * DIRTY_PAGE_SIZE), (4 * DIRTY_PAGE_SIZE, 100)]
+        );
+        assert_eq!(log.count(), 3);
+        // The last page is 100 bytes long, so the byte count is clipped too.
+        assert_eq!(log.dirty_bytes(), 2 * DIRTY_PAGE_SIZE + 100);
+    }
+
+    /// A hypervisor that leaves the padding bits of the last word set must not
+    /// make the region look bigger than it is.
+    #[test]
+    fn padding_bits_past_the_region_do_not_count() {
+        let len = 3 * DIRTY_PAGE_SIZE;
+        let log = DirtyPages::new(0, len, vec![u64::MAX]).unwrap();
+        assert_eq!(log.count(), 3);
+        assert_eq!(log.dirty_bytes(), len);
+        assert_eq!(log.runs(), vec![(0, len)]);
+        assert!(!log.is_dirty(3));
+    }
+
+    #[test]
+    fn a_clean_log_is_the_right_shape() {
+        let log = DirtyPages::clean(0x1_0000_0000, 8 << 20);
+        assert_eq!(log.gpa(), 0x1_0000_0000);
+        assert_eq!(log.pages(), 2048);
+        assert_eq!(log.count(), 0);
+        assert!(log.runs().is_empty());
+        let (pages, bytes, total) = dirty_summary(std::slice::from_ref(&log));
+        assert_eq!((pages, bytes, total), (0, 0, 8 << 20));
+    }
+}
