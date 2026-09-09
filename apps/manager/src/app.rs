@@ -25,7 +25,10 @@ use crate::snapshots::{self, SnapshotRow, Verdict};
 use crate::theme;
 use crate::ui;
 use crate::update::{self, UpdateInfo};
+use crate::wslengine;
 use crate::ScreenshotView;
+
+use control_api::wsl::EngineFault;
 
 /// How often the VM directory is re-scanned while the window is open.
 const SCAN_INTERVAL: Duration = Duration::from_millis(2500);
@@ -329,6 +332,10 @@ pub enum Action {
     // ---- Diagnostics ----------------------------------------------------------
     /// Run `entangled doctor` on the current backend and show the answer.
     RunDiagnostics,
+    /// Re-run the WSL engine pre-flight (the distro, the path, `--version`).
+    CheckWslEngine,
+    /// Download the pinned Linux engine and copy it into the WSL distribution.
+    InstallWslEngine,
     // ---- Storage, the rest of the CLI's disk surface ---------------------------
     AskResizeDisk(PathBuf),
     SubmitResizeDisk,
@@ -425,6 +432,17 @@ pub struct ManagerApp {
     update_download: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     /// The one open file dialog, if any.
     picker: Option<picker::Pending>,
+    /// Is there a usable Linux engine inside WSL? The pre-flight for the WSL
+    /// backend, refreshed whenever the distribution or the engine path changes
+    /// and never blocking the frame loop.
+    pub wsl_engine: wslengine::Status,
+    /// What the current answer is *about*; a re-check is only needed when this
+    /// changes.
+    wsl_engine_target: Option<wslengine::Target>,
+    wsl_engine_rx: Option<mpsc::Receiver<Result<control_api::wsl::EngineFound, EngineFault>>>,
+    /// True while the pinned Linux engine is being downloaded and copied in.
+    pub wsl_install_running: bool,
+    wsl_install_rx: Option<mpsc::Receiver<Result<wslengine::Outcome, String>>>,
     /// The last `entangled doctor` answer, and whether one is in flight.
     pub doctor: Option<hostcheck::Report>,
     pub doctor_running: bool,
@@ -556,6 +574,18 @@ impl ManagerApp {
             update_check,
             update_download: None,
             picker: None,
+            // The mock session shows the state this whole pre-flight exists
+            // for — a distribution with no engine — so the wizard's refusal and
+            // its install button are reviewable in a screenshot on any machine.
+            wsl_engine: if mock_mode {
+                wslengine::mock_status()
+            } else {
+                wslengine::Status::Unknown
+            },
+            wsl_engine_target: None,
+            wsl_engine_rx: None,
+            wsl_install_running: false,
+            wsl_install_rx: None,
             doctor: mock_mode.then(hostcheck::mock_report),
             doctor_running: false,
             doctor_rx: None,
@@ -572,8 +602,25 @@ impl ManagerApp {
             frame: 0,
         };
 
+        // The WSL pre-flight starts with the window, not with the wizard's
+        // last step: the answer takes seconds (a cold distribution has to boot)
+        // and it decides which backend the wizard even opens on.
+        app.ensure_wsl_check(false);
+
         match startup.screenshot_view {
             ScreenshotView::Wizard => app.open_wizard(),
+            // The two WSL surfaces open the wizard and then *choose* the
+            // backend the pre-flight refuses — `preferred_backend` would not,
+            // which is the point of it.
+            ScreenshotView::WizardWsl | ScreenshotView::WizardWslReview => {
+                app.open_wizard();
+                if let Modal::Wizard(state) = &mut app.modal {
+                    state.machine.backend = Backend::Wsl;
+                    if startup.screenshot_view == ScreenshotView::WizardWslReview {
+                        state.step = 3;
+                    }
+                }
+            }
             ScreenshotView::Settings => app.open_settings(),
             ScreenshotView::Disks => app.view = View::Disks,
             ScreenshotView::Snapshots => app.view = View::Snapshots,
@@ -701,6 +748,7 @@ impl ManagerApp {
     }
 
     fn open_wizard(&mut self) {
+        self.ensure_wsl_check(false);
         let name = self.suggest_name();
         self.modal = Modal::Wizard(WizardState {
             machine: NewMachine {
@@ -715,11 +763,7 @@ impl ManagerApp {
                 variant: self.settings.default_variant.clone(),
                 automated: true,
                 headless: self.settings.headless_install,
-                backend: if self.settings.default_backend.available_on_host() {
-                    self.settings.default_backend
-                } else {
-                    Backend::Native
-                },
+                backend: self.preferred_backend(),
             },
             step: 0,
             error: None,
@@ -751,6 +795,145 @@ impl ManagerApp {
             "{}-new",
             launcher::GuestFamily::default_for_host().cli_name()
         )
+    }
+
+    /// Which distribution and Linux engine the WSL pre-flight is about.
+    fn wsl_target(&self) -> wslengine::Target {
+        wslengine::Target::new(
+            &self.settings.wsl_distro,
+            self.settings.wsl_entangled.as_deref(),
+        )
+    }
+
+    /// Starts the WSL pre-flight if it has not already answered this question.
+    ///
+    /// Cheap to call from anywhere — the wizard opening, a settings save, the
+    /// Diagnostics view — because it does nothing when the answer it holds is
+    /// already about the current distribution and engine path. `force` is for
+    /// the one case where the same question deserves a new answer: the user
+    /// asked, or an install just changed the world.
+    fn ensure_wsl_check(&mut self, force: bool) {
+        if self.mock_mode || !Backend::Wsl.available_on_host() {
+            return;
+        }
+        let target = self.wsl_target();
+        if !force && self.wsl_engine_target.as_ref() == Some(&target) {
+            return;
+        }
+        if self.wsl_engine_rx.is_some() && !force {
+            return;
+        }
+        self.wsl_engine_target = Some(target.clone());
+        self.wsl_engine = wslengine::Status::Checking;
+        self.wsl_engine_rx = Some(wslengine::spawn_probe(target, Arc::clone(&self.waker)));
+    }
+
+    /// Downloads the pinned Linux engine and copies it into the distribution.
+    ///
+    /// The button behind this exists because the honest answer to "your WSL has
+    /// no engine" is not a text field asking for a path a Windows user does not
+    /// have — it is doing the work. What comes back is an absolute Linux path,
+    /// and that path is *saved as the setting*: `wsl -e` runs no login shell, so
+    /// `~/.local/bin` being on a terminal's PATH proves nothing about a launch.
+    fn install_wsl_engine(&mut self) {
+        if self.wsl_install_running {
+            return;
+        }
+        if let Some(block) = wslengine::install_block() {
+            self.toast(ToastLevel::Error, block);
+            return;
+        }
+        let distro = self.wsl_target().distro;
+        let distro = if distro.is_empty() {
+            backend::DEFAULT_WSL_DISTRO.to_string()
+        } else {
+            distro
+        };
+        self.wsl_install_running = true;
+        self.toast(
+            ToastLevel::Info,
+            format!("downloading the Linux engine and installing it into {distro}…"),
+        );
+        self.wsl_install_rx = Some(wslengine::spawn_install(distro, Arc::clone(&self.waker)));
+    }
+
+    /// Collects both WSL-engine channels; each delivers at most one message.
+    fn collect_wsl_events(&mut self) {
+        if let Some(rx) = &self.wsl_engine_rx {
+            if let Ok(answer) = rx.try_recv() {
+                self.wsl_engine_rx = None;
+                self.wsl_engine = match answer {
+                    Ok(found) => {
+                        tracing::info!(engine = %found.summary(), "WSL engine found");
+                        wslengine::Status::Ready(found)
+                    }
+                    Err(fault) => {
+                        tracing::warn!(fault = %fault, "WSL engine unusable");
+                        wslengine::Status::Failed(fault)
+                    }
+                };
+            }
+        }
+        if let Some(rx) = &self.wsl_install_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.wsl_install_rx = None;
+                self.wsl_install_running = false;
+                match result {
+                    Ok(outcome) => {
+                        // The absolute path is the setting, for the reason in
+                        // `install_wsl_engine`'s doc comment. Persisted quietly:
+                        // a user who pressed one button should not then have to
+                        // press Save in a panel they never opened.
+                        self.settings.wsl_entangled = Some(outcome.installed.path.clone());
+                        self.persist_settings_quietly();
+                        let mut message = outcome.summary();
+                        if outcome.cached {
+                            message.push_str(" (from the verified download already on disk)");
+                        }
+                        if !outcome.rechecked {
+                            message.push_str(
+                                " — the distribution has no sha256sum, so the copy inside it \
+                                 could not be re-checked; the download itself was verified",
+                            );
+                        }
+                        self.toast(ToastLevel::Success, message);
+                        self.ensure_wsl_check(true);
+                    }
+                    Err(e) => self.toast(
+                        ToastLevel::Error,
+                        format!("the Linux engine was not installed: {e}"),
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Which backend a *new* machine should default to on this host.
+    ///
+    /// The saved default, unless that default is one this host cannot actually
+    /// use. A Windows machine with no Linux engine in its WSL must not open the
+    /// wizard on WSL: the user would fill in four steps and meet the failure at
+    /// the end, which is the bug this whole feature is about. The setting is
+    /// not changed — the engine may be installed a minute later — only the
+    /// wizard's starting point.
+    pub fn preferred_backend(&self) -> Backend {
+        let chosen = self.settings.default_backend;
+        if !chosen.available_on_host() {
+            return Backend::Native;
+        }
+        if chosen == Backend::Wsl && matches!(self.wsl_engine, wslengine::Status::Failed(_)) {
+            return Backend::Native;
+        }
+        chosen
+    }
+
+    /// The pre-flight verdict for one backend, or `None` when there is nothing
+    /// standing in the way. The wizard's Create button and `start` both gate on
+    /// this, so they cannot disagree.
+    pub fn backend_block(&self, backend: Backend) -> Option<String> {
+        (backend == Backend::Wsl)
+            .then(|| self.wsl_engine.refusal())
+            .flatten()
     }
 
     /// Collects the update-check and update-download answers; both channels
@@ -1136,6 +1319,17 @@ impl ManagerApp {
             return;
         };
         let chosen = self.backend_of(name);
+
+        // The engine the chosen backend would run, before anything is spawned.
+        // Without this the WSL case fails as raw `wsl.exe` noise in a log file,
+        // which is where this whole feature started.
+        if let Some(refusal) = self.backend_block(chosen) {
+            self.toast(
+                ToastLevel::Error,
+                format!("'{name}' cannot start on {}: {refusal}", chosen.label()),
+            );
+            return;
+        }
 
         // Everything the chosen backend must be able to see, checked here
         // rather than discovered as a "file not found" three layers down.
@@ -1586,6 +1780,13 @@ impl ManagerApp {
             return;
         };
 
+        if let Some(refusal) = self.backend_block(machine.backend) {
+            if let Modal::Wizard(state) = &mut self.modal {
+                state.error = Some(refusal);
+            }
+            return;
+        }
+
         match backend::reachability(
             machine.backend,
             [profile_path.as_path(), disk_path.as_path()],
@@ -1746,6 +1947,7 @@ impl ManagerApp {
             ),
         }
         self.refresh_engine();
+        self.ensure_wsl_check(false);
         self.modal = Modal::None;
         self.request_scan(true);
     }
@@ -2567,6 +2769,27 @@ impl ManagerApp {
                 self.modal = Modal::None;
                 self.toast(ToastLevel::Success, "Mock: disk grown in memory");
             }
+            Action::CheckWslEngine => {
+                self.toast(
+                    ToastLevel::Info,
+                    "Mock: no WSL is probed; the fixture keeps its 'no engine' answer",
+                );
+            }
+            Action::InstallWslEngine => {
+                // No download, no `wsl.exe`, no child: the fixture simply moves
+                // to the state a real install would have produced, so the
+                // before-and-after of the button is reviewable in a screenshot.
+                self.wsl_engine = wslengine::Status::Ready(control_api::wsl::EngineFound {
+                    distro: crate::backend::DEFAULT_WSL_DISTRO.to_string(),
+                    command: "/home/spider/.local/bin/entangled".to_string(),
+                    path: Some("/home/spider/.local/bin/entangled".to_string()),
+                    version: Some(crate::VERSION.to_string()),
+                });
+                self.toast(
+                    ToastLevel::Success,
+                    "Mock: the Linux engine would be downloaded, verified and installed",
+                );
+            }
             Action::RunDiagnostics => {
                 // A canned report rather than a real `doctor`: mock mode never
                 // probes the host, and a screenshot must show the same panel
@@ -2701,6 +2924,8 @@ impl ManagerApp {
             Action::SubmitMoveDisk => self.submit_move_disk(),
             Action::PickPath(target) => self.open_picker(target),
             Action::RunDiagnostics => self.run_diagnostics(),
+            Action::CheckWslEngine => self.ensure_wsl_check(true),
+            Action::InstallWslEngine => self.install_wsl_engine(),
             Action::AskResizeDisk(path) => self.ask_resize_disk(&path),
             Action::SubmitResizeDisk => self.submit_resize_disk(),
         }
@@ -2840,6 +3065,7 @@ impl eframe::App for ManagerApp {
         self.open_screenshot_surface();
         self.collect_task_results();
         self.collect_update_events();
+        self.collect_wsl_events();
         self.collect_move_events();
         self.collect_engine_version();
         self.collect_picker();

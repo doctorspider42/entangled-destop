@@ -36,7 +36,7 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                 .show(ui, |ui| {
                     engine_card(ui, app, actions);
                     ui.add_space(12.0);
-                    backend_card(ui, app);
+                    backend_card(ui, app, actions);
                     ui.add_space(12.0);
                     report_card(ui, app);
                 });
@@ -109,7 +109,7 @@ fn engine_card(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
 
 /// Where machines run, and what that costs them. Only interesting where there
 /// is a choice — on Linux this collapses to one honest line.
-fn backend_card(ui: &mut egui::Ui, app: &ManagerApp) {
+fn backend_card(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
     panel(ui, "Where machines run", theme::VIOLET, |ui| {
         let default = app.settings.default_backend;
         ui.horizontal_wrapped(|ui| {
@@ -130,6 +130,7 @@ fn backend_card(ui: &mut egui::Ui, app: &ManagerApp) {
                 Some(path) => format!("Linux engine: {path}"),
                 None => "Linux engine: whatever `entangled` resolves to inside WSL".to_string(),
             }));
+            wsl_engine_row(ui, app, actions);
             ui.add_space(6.0);
             for (capability, blocked) in [
                 ("3D acceleration", Backend::Native.virgl_block()),
@@ -209,6 +210,62 @@ fn report_card(ui: &mut egui::Ui, app: &ManagerApp) {
                 }
             });
     });
+}
+
+/// Whether the WSL backend could actually start a machine right now, and the
+/// button that makes it able to when it cannot.
+///
+/// The same answer `entangled doctor` prints in its `engines` section, kept
+/// beside the distribution and engine-path lines it is about — a user reading
+/// "Linux engine: whatever `entangled` resolves to inside WSL" deserves to know
+/// on the next line whether anything actually resolves.
+fn wsl_engine_row(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
+    let status = &app.wsl_engine;
+    let Some(line) = status.line() else {
+        return;
+    };
+    let tint = match status.usable() {
+        true => theme::OK,
+        false if status.refusal().is_some() => theme::ERR,
+        false => theme::TEXT_DIM,
+    };
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.label(ui::dim("Engine inside WSL:"));
+        ui.label(RichText::new(line).size(12.5).color(tint));
+    });
+    if let Some(refusal) = status.refusal() {
+        ui.add_space(4.0);
+        ui.label(ui::faint(refusal));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if status.installable() {
+                let block = crate::wslengine::install_block();
+                let enabled = !app.wsl_install_running && block.is_none();
+                let label = if app.wsl_install_running {
+                    "Installing…"
+                } else {
+                    "Install the Linux engine"
+                };
+                let button = ui::ghost_button(ui, label, enabled, theme::CYAN).on_hover_text(
+                    block.unwrap_or_else(|| {
+                        "Downloads the Linux build published with this exact version, checks                          it against the digest built into this program, and copies it into                          the distribution."
+                            .to_string()
+                    }),
+                );
+                if enabled && button.clicked() {
+                    actions.push(Action::InstallWslEngine);
+                }
+            }
+            if ui::ghost_button(ui, "Check again", !app.wsl_install_running, theme::TEXT_DIM)
+                .clicked()
+                && !app.wsl_install_running
+            {
+                actions.push(Action::CheckWslEngine);
+            }
+        });
+    }
 }
 
 /// A titled panel with the card surface and the accent hairline — the shape the

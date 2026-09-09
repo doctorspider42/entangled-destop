@@ -534,7 +534,7 @@ pub fn bootstrap_artifacts_present(cwd: &Path) -> bool {
 
 /// The one cache resolution the whole project shares, honouring the same
 /// `ENTANGLED_CACHE` override the CLI and the fetch scripts do.
-fn cache_root() -> Option<PathBuf> {
+pub fn cache_root() -> Option<PathBuf> {
     match std::env::var("ENTANGLED_CACHE") {
         Ok(dir) if !dir.trim().is_empty() => Some(PathBuf::from(dir)),
         _ => debian_media::cache_root(),

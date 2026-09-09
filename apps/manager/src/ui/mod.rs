@@ -22,6 +22,39 @@ pub fn primary_button(ui: &mut Ui, text: &str) -> Response {
     accent_button(ui, text, 0.35, theme::BG_DEEP)
 }
 
+/// The same button, in the state a pre-flight can put it in: present, greyed,
+/// and still a hover target so the reason can hang off it.
+///
+/// Never `clicked()` when disabled — a caller can wire it up exactly as it
+/// wires up the enabled one, and the refusal is a tooltip rather than an error
+/// the user has to provoke.
+pub fn primary_button_enabled(ui: &mut Ui, text: &str, enabled: bool) -> Response {
+    if enabled {
+        return primary_button(ui, text);
+    }
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, theme::TEXT_FAINT);
+    let size = galley.size() + Vec2::new(30.0, 15.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    let radius = CornerRadius::same(theme::CONTROL_RADIUS);
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, theme::mix(theme::CARD, theme::STROKE, 0.5));
+    painter.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0_f32, theme::STROKE),
+        StrokeKind::Inside,
+    );
+    painter.galley(
+        rect.center() - galley.size() * 0.5,
+        galley,
+        Color32::TRANSPARENT,
+    );
+    response
+}
+
 fn accent_button(ui: &mut Ui, text: &str, gradient_at: f32, fg: Color32) -> Response {
     let font = egui::TextStyle::Button.resolve(ui.style());
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
