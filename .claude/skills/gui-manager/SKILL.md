@@ -126,6 +126,20 @@ does not — because the failure mode of being generous is an install that
 starts and gets a precise message from the CLI, which beats any message this
 check could write.
 
+**The same applies to the firmware, and for the same reason it once did not.**
+`launcher::locate_firmware` mirrors `apps/entangled/src/firmware.rs`:
+`ENTANGLED_FIRMWARE_DIR`, `artifacts\firmware\` **beside the program** (what the
+Windows installer ships), any tag directory under `<cache>/firmware/`, then the
+working directory. Use it — never `cwd.join(UEFI_FIRMWARE).is_file()`, which is
+what the card warnings and the wizard used to do and what produced the worst
+message this project has shipped: a fresh Windows install told the user to
+"copy artifacts/firmware/CLOUDHV.fd in from a Linux checkout or a release",
+having neither and there being no such release. Every firmware message must
+name something the person in front of *that* computer can do — `entangled fetch
+firmware`, or reinstalling — which is what `launcher::FIRMWARE_FIX` now says.
+The machine editor uses the same lookup twice: to offer a real path when the
+field is empty, and to say *which* firmware a profile with a stale path will
+actually start on, because the CLI falls through rather than refusing.
 The resulting `entangled install <debian|ubuntu> --disk <path> --size <n>G
 [--variant <v>] --memory-mib <max(1536, m)> --name <name> [--iso <path>]
 [--auto] [--headless]` is spawned with the configured working directory.

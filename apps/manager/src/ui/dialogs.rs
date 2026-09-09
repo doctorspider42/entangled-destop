@@ -1503,7 +1503,37 @@ fn edit_boot_media(
                     form.firmware = suggested.display().to_string();
                 }
             } else {
-                ui::path_status_note(ui, &form.resolve(&firmware), launcher::FIRMWARE_FIX);
+                let resolved = form.resolve(&firmware);
+                // A profile carries the firmware path of the computer that
+                // created it, so on a fresh installation it often names
+                // nothing — and Entangled falls through to the copy this
+                // computer has rather than refusing (apps/entangled/src/firmware.rs).
+                // Saying "not found" and stopping there would describe a
+                // failure that will not happen.
+                match (
+                    resolved.is_file(),
+                    launcher::locate_firmware(&form.work_dir),
+                ) {
+                    (false, Some((found, origin))) => {
+                        ui::form_note(
+                            ui,
+                            RichText::new(format!("not found: {}", resolved.display()))
+                                .color(theme::WARN)
+                                .size(11.0),
+                        );
+                        ui::form_note(
+                            ui,
+                            RichText::new(format!(
+                                "this machine will start on the firmware from {}: {}",
+                                origin.label(),
+                                found.display()
+                            ))
+                            .color(theme::TEXT_FAINT)
+                            .size(11.0),
+                        );
+                    }
+                    _ => ui::path_status_note(ui, &resolved, launcher::FIRMWARE_FIX),
+                }
             }
             ui.add_space(8.0);
 

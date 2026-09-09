@@ -1,4 +1,12 @@
 # cargo-about configuration for generating THIRD_PARTY_LICENSES (MVP-006).
+#
+# SCOPE: this reads the Cargo dependency graph, and therefore covers Rust
+# crates and nothing else. It cannot see the one non-crate binary we
+# redistribute — the EDK2 UEFI firmware (BSD-2-Clause-Patent) that ships inside
+# the Windows installer — so that attribution is carried by hand in
+# THIRD-PARTY-NOTICES.txt and named in about.hbs, which puts it at the top of
+# the generated report. Anything else we ever ship that is not a crate belongs
+# in those two files as well; adding a licence id here would not do it.
 accepted = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

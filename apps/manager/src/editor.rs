@@ -121,9 +121,19 @@ impl EditForm {
         }
     }
 
-    /// The firmware every profile the installer writes points at.
+    /// The firmware to offer when a UEFI machine names none.
+    ///
+    /// Whatever this computer actually has, by the same lookup the CLI uses —
+    /// so on an installed copy the button offers the absolute path of the
+    /// firmware that shipped with the program rather than a relative path that
+    /// resolves to nothing. Only when nothing is found does it fall back to the
+    /// relative path every generated profile has always carried, which at least
+    /// tells the reader what the file is called.
     pub fn suggested_firmware(&self) -> PathBuf {
-        PathBuf::from(crate::launcher::UEFI_FIRMWARE)
+        match crate::launcher::locate_firmware(&self.work_dir) {
+            Some((path, _)) => path,
+            None => PathBuf::from(crate::launcher::UEFI_FIRMWARE),
+        }
     }
 }
 

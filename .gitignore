@@ -11,6 +11,9 @@ guest/bootstrap-initramfs/init-rs/target/
 entangled-screenshot-*.png
 # ISCC output (release.yml compiles the installer here)
 /installer/Output/
+# The licence page the .iss builds at compile time: LICENSE + the third-party
+# notices, concatenated so neither has to be duplicated in the tree.
+/installer/LICENSE-and-notices.txt
 
 # Local acceptance evidence (install/run transcripts, screenshots)
 install-*.log

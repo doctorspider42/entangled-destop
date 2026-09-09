@@ -4,6 +4,10 @@ name: Release
 # The version is MAJOR.MINOR from [workspace.package] in Cargo.toml with the
 # workflow run number as PATCH (e.g. 0.2.137) — monotonically increasing, so
 # the manager's update check can compare it against the running build.
+#
+# Two jobs, because the installer carries a Linux-built artifact: `firmware`
+# obtains CLOUDHV.fd on ubuntu-latest (see its own comment) and hands it to
+# `windows-installer` as a workflow artifact.
 
 on:
   push:
@@ -85,15 +89,106 @@ jobs:
         with:
           name: linux-engine
           path: dist/
+  # The UEFI firmware the installer ships (installer/entangled.iss).
+  #
+  # It has to come from somewhere Linux, because EDK2 does not build on
+  # windows-latest, and it has to come from *somewhere* on every run, because
+  # the .iss has no `skipifsourcedoesntexist` on it: a setup without the
+  # firmware installs a program that cannot create an Ubuntu or a Fedora
+  # machine, which is the bug this job exists to prevent from recurring.
+  #
+  # Fast path: download the pinned release asset, which is what
+  # guest/firmware/pinned.toml promises every `entangled fetch firmware` will
+  # get, and verify it against that same pin — so the copy inside the installer
+  # is byte-identical to the copy a source checkout downloads. Slow path: build
+  # it (~10 min). The slow path is what makes this job work before the firmware
+  # workflow has ever run, and the summary says which path was taken.
+  firmware:
+    name: The UEFI firmware for the installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the pin
+        id: pin
+        run: |
+          set -euo pipefail
+          pin=guest/firmware/pinned.toml
+          tag=$(sed -n 's/^tag = "\(.*\)"$/\1/p' "$pin" | head -1)
+          sha=$(sed -n 's/^sha256 = "\(.*\)"$/\1/p' "$pin" | head -1)
+          [ -n "$tag" ] && [ -n "$sha" ] || { echo "cannot read $pin" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Download the pinned firmware
+        id: download
+        # `gh release download` uses the workflow token, so it reaches assets of
+        # this PRIVATE repository — which a plain releases/download URL cannot.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/firmware
+          if gh release download "${{ steps.pin.outputs.tag }}" \
+               --pattern 'CLOUDHV.fd*' --dir artifacts/firmware 2>/dev/null \
+             && [ -s artifacts/firmware/CLOUDHV.fd ]; then
+            got=$(sha256sum artifacts/firmware/CLOUDHV.fd | cut -d' ' -f1)
+            if [ "$got" = "${{ steps.pin.outputs.sha }}" ]; then
+              echo "source=the pinned release ${{ steps.pin.outputs.tag }}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # A tag whose bytes have changed is a broken promise, not a warning:
+            # every `entangled fetch firmware` in the field is rejecting them.
+            echo "::error::${{ steps.pin.outputs.tag }} serves sha256 $got, but" \
+                 "guest/firmware/pinned.toml pins ${{ steps.pin.outputs.sha }}." \
+                 "Release tags are immutable by contract; fix the pin or the release."
+            exit 1
+          fi
+          echo "::notice::No published firmware at ${{ steps.pin.outputs.tag }} — building it."
+          echo "source=a fresh EDK2 build (nothing published at ${{ steps.pin.outputs.tag }} yet)" \
+            >> "$GITHUB_OUTPUT"
+          rm -f artifacts/firmware/CLOUDHV.fd
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential uuid-dev iasl nasm python3 git
+          bash guest/firmware/build-cloudhv.sh
+
+      - name: Say where it came from
+        run: |
+          {
+            echo "### UEFI firmware in this installer"
+            echo
+            echo "From **${{ steps.download.outputs.source }}**."
+            echo
+            echo '```'
+            sha256sum artifacts/firmware/CLOUDHV.fd
+            cat artifacts/firmware/CLOUDHV.fd.provenance 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uefi-firmware
+          path: artifacts/firmware/
           if-no-files-found: error
           retention-days: 1
 
   windows-installer:
     name: Windows installer + GitHub Release
+    # Both halves the installer cannot build for itself: the Linux engine whose
+    # digest is compiled into the manager, and the UEFI firmware it ships.
+    needs: [linux-engine, firmware]
     runs-on: windows-latest
-    needs: linux-engine
     steps:
       - uses: actions/checkout@v4
+
+      # Into the same `artifacts/firmware/` a checkout that ran
+      # guest/firmware/build-cloudhv.sh would have, which is where the .iss
+      # looks by default (`/DFirmwareDir`).
+      - uses: actions/download-artifact@v4
+        with:
+          name: uefi-firmware
+          path: artifacts/firmware
 
       - uses: dtolnay/rust-toolchain@stable
 

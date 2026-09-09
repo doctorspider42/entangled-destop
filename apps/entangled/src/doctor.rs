@@ -173,17 +173,10 @@ fn wsl_engine() {
 /// artifact is missing *before* a download or a forty-minute boot.
 #[cfg(any(target_os = "linux", windows))]
 fn install_readiness() {
-    /// The Ubuntu path's firmware and the Debian path's kernel, by the same
-    /// relative paths `install` resolves them with — so `doctor` run from the
-    /// wrong working directory reports exactly what `install` would fail on.
-    const FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
-    const FIRMWARE_HINT: &str =
-        "`bash guest/firmware/build-cloudhv.sh` (~2.5 min), or pass --firmware";
-
     println!("  install         : ubuntu — UEFI + verified ISO, offline (no mirror needed)");
     println!("                    debian — d-i on the bootstrap kernel, needs the network");
     println!("                    fedora — netinst through UEFI, kickstart, needs the network");
-    artifact("firmware        ", Path::new(FIRMWARE), FIRMWARE_HINT);
+    uefi_firmware();
     bootstrap_artifacts();
 
     match crate::paths::ubuntu_cache_dir() {
@@ -222,6 +215,39 @@ fn install_readiness() {
     );
 }
 
+/// The UEFI firmware every UEFI guest boots: present, or fetchable, and from
+/// where.
+///
+/// Through the same resolver `install` and `run` use, so this line answers the
+/// question they would fail on rather than a similar-looking one. "MISSING"
+/// here used to be a dead end on Windows — "copy it in from a Linux checkout" —
+/// and it is now a command.
+#[cfg(any(target_os = "linux", windows))]
+fn uefi_firmware() {
+    match crate::firmware::locate() {
+        Some(found) => {
+            println!(
+                "    firmware         {} ({}, from {})",
+                found.path.display(),
+                size_of(&found.path),
+                found.origin.as_str()
+            );
+        }
+        None => {
+            let pinned = crate::firmware::pinned()
+                .map(|pin| format!("{} ({})", pin.tag, pin.edk2_tag))
+                .unwrap_or_else(|e| format!("pin unreadable: {e}"));
+            println!("    firmware         MISSING — needed by every UEFI machine");
+            // Indented under the label, one line per sentence, so the manager's
+            // diagnostics panel marks the fault once and the fixes as info.
+            for line in crate::firmware::missing_message().lines() {
+                println!("                    {}", line.trim());
+            }
+            println!("                    pinned release: {pinned}");
+        }
+    }
+}
+
 /// The Debian path's kernel + initramfs: present, or fetchable, and from where.
 ///
 /// It answers the question `install debian` would fail on, through the same
@@ -253,16 +279,6 @@ fn bootstrap_artifacts() {
             println!("                    {}", crate::bootstrap::missing_hint());
             println!("                    pinned release: {pinned}");
         }
-    }
-}
-
-#[cfg(any(target_os = "linux", windows))]
-fn artifact(label: &str, path: &Path, hint: &str) {
-    if path.is_file() {
-        println!("    {label} {} ({})", path.display(), size_of(path));
-    } else {
-        println!("    {label} MISSING at {}", path.display());
-        println!("                    {hint}");
     }
 }
 

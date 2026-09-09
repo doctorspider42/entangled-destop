@@ -1,5 +1,9 @@
 //! `entangled` — the CLI control surface for the Entangled Desktop VMM.
 
+/// The pin, the digest check, the cache and the provenance note every
+/// published guest artifact shares — including the token route a *private*
+/// repository's release assets need.
+mod artifact;
 /// The guest kernel + initramfs `install debian` runs on: where they come
 /// from on a host that cannot build them, and what makes a download
 /// trustworthy. Portable — the pin, the digest check and the cache layout are
@@ -9,6 +13,10 @@ mod bootstrap;
 mod disk;
 mod doctor;
 mod fetch;
+/// The UEFI firmware every UEFI guest boots through: the five places it can
+/// come from, in order, and what to tell a user who has none. Portable for the
+/// same reason — the host that cannot build EDK2 is the one that needs this.
+mod firmware;
 /// `install` and `run` exist wherever a hypervisor backend does (KVM or WHP);
 /// any other OS still gets config validation and a typed refusal. The installer
 /// itself is portable — it drives the same `run_vm` both hosts share, and every
@@ -192,12 +200,15 @@ enum Command {
 
 #[derive(Args)]
 pub struct FetchArgs {
-    /// What to fetch: "debian" (verified installer media) or
+    /// What to fetch: "debian" (verified installer media), "firmware" (the
+    /// UEFI firmware every UEFI guest boots — 4 MiB, EDK2 CloudHvX64) or
     /// "bootstrap-kernel" (the guest kernel and initramfs `install debian`
-    /// runs on, ~13 MiB, checked against a SHA-256 pinned in this build).
+    /// runs on, ~13 MiB). The latter two are checked against a SHA-256 pinned
+    /// in this build.
     ///
-    /// The three options below describe Debian media only; the bootstrap
-    /// artifacts are one pinned release, so there is nothing to choose.
+    /// The three options below describe Debian media only; the firmware and
+    /// the bootstrap artifacts are one pinned release each, so there is
+    /// nothing to choose.
     distro: String,
     #[arg(long, default_value = "stable")]
     channel: String,
@@ -296,8 +307,10 @@ pub struct InstallArgs {
     /// scripts/fetch-fedora-iso.sh.
     #[arg(long)]
     pub iso: Option<PathBuf>,
-    /// UEFI firmware image (Ubuntu and Fedora). Defaults to
-    /// artifacts/firmware/CLOUDHV.fd.
+    /// UEFI firmware image (Ubuntu and Fedora). Without it the firmware
+    /// shipped beside this executable is used, then the verified cache
+    /// (`entangled fetch firmware`), then artifacts/firmware/CLOUDHV.fd in a
+    /// checkout.
     #[arg(long)]
     pub firmware: Option<PathBuf>,
     /// Size for a newly created disk (e.g. 16G).

@@ -42,10 +42,14 @@ display.workspace = true
 # hosts since `install` stopped being Linux-only (EPIC 17 phase 5).
 flate2.workspace = true
 toml.workspace = true
-# Deserializes the compiled-in guest-artifact pin (bootstrap.rs) - four fields
-# and a list, but they decide which kernel a guest boots, so they get a typed
-# shape rather than hand parsing.
+# Deserializes the compiled-in guest-artifact pins (bootstrap.rs, firmware.rs) -
+# four fields and a list each, but they decide which kernel and which firmware a
+# guest boots, so they get a typed shape rather than hand parsing.
 serde.workspace = true
+# One caller: the GitHub Releases API answer that names a *private* repository's
+# release asset by id (artifact.rs). The browser download URL 404s without
+# credentials, and the API asset endpoint is the only way in.
+serde_json.workspace = true
 
 # `sigaction` for the run path's SIGINT/SIGTERM handler; Windows uses
 # `SetConsoleCtrlHandler` below.

@@ -1359,12 +1359,17 @@ impl ManagerApp {
         // has no `artifacts/bootstrap/vmlinuz` would be a false alarm on every
         // start of a perfectly good machine.
         let missing = if vm.uefi {
-            (!cwd.join(launcher::UEFI_FIRMWARE).is_file()).then(|| {
+            // The same four-place lookup the CLI performs when it starts the
+            // machine (apps/entangled/src/firmware.rs): a profile whose
+            // relative `artifacts/firmware/CLOUDHV.fd` is not under the working
+            // directory still starts if this computer has the firmware
+            // anywhere, so complaining about the working directory alone was a
+            // false alarm on every start of a perfectly good machine.
+            launcher::locate_firmware(&cwd).is_none().then(|| {
                 format!(
-                    "no {} under {} — a profile with relative boot paths will fail to \
-                     start (Settings ▸ Advanced ▸ working directory)",
-                    launcher::UEFI_FIRMWARE,
-                    cwd.display()
+                    "no UEFI firmware on this computer — this machine cannot start without \
+                     it. {}",
+                    launcher::FIRMWARE_FIX
                 )
             })
         } else {

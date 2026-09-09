@@ -452,16 +452,97 @@ pub const BOOTSTRAP_INITRD: &str = "artifacts/bootstrap/initrd.img";
 /// child's working directory, named in the profile that comes out.
 pub const UEFI_FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
 
-/// How the UEFI firmware is obtained, in words a user can act on. Windows has
-/// no build for it, and saying so beats a build command that cannot run.
+/// Its file name on its own, for the three-place lookup below.
+const FIRMWARE_FILE: &str = "CLOUDHV.fd";
+
+/// How the UEFI firmware is obtained, in words a user can act on.
+///
+/// It used to say "copy artifacts/firmware/CLOUDHV.fd in from a Linux checkout
+/// or a release", which was accurate and useless: somebody who installed
+/// Entangled Desktop from the Windows installer has neither. The firmware now
+/// ships *inside* that installer and is downloadable besides, so the fix is a
+/// command and a reinstall rather than an errand.
 pub const FIRMWARE_FIX: &str = if cfg!(windows) {
-    "The firmware is built on Linux (guest/firmware/build-cloudhv.sh) and copied in — \
-     there is no Windows build of it. Copy artifacts/firmware/CLOUDHV.fd in from a Linux \
-     checkout or a release, then choose it here."
+    "The firmware normally ships with Entangled Desktop, in artifacts\\firmware next to the \
+     program. If it is not there, `entangled fetch firmware` downloads it (4 MiB, checked \
+     against a digest built into this program), or reinstalling puts it back."
 } else {
-    "Build it once with `bash guest/firmware/build-cloudhv.sh` (about 2.5 minutes), then \
-     choose it here."
+    "The firmware normally ships with Entangled Desktop, in artifacts/firmware next to the \
+     program. If it is not there, `entangled fetch firmware` downloads it (4 MiB, digest \
+     checked), or build it with `bash guest/firmware/build-cloudhv.sh` (about 2.5 minutes)."
 };
+
+/// Where a firmware image was found, in the words the panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmwareOrigin {
+    /// A directory named by `ENTANGLED_FIRMWARE_DIR`.
+    Directory,
+    /// `artifacts/firmware/` beside the program — what the installer ships.
+    Install,
+    /// The verified cache, filled by `entangled fetch firmware`.
+    Cache,
+    /// `artifacts/firmware/` under the child's working directory.
+    Checkout,
+}
+
+impl FirmwareOrigin {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Directory => "ENTANGLED_FIRMWARE_DIR",
+            Self::Install => "this installation",
+            Self::Cache => "the verified cache",
+            Self::Checkout => "the working directory",
+        }
+    }
+}
+
+/// Whether a UEFI firmware is reachable from a child started in `cwd`, and from
+/// where.
+///
+/// This mirrors `entangled`'s own resolver (`apps/entangled/src/firmware.rs`,
+/// which is the authority): an explicit directory, the install directory beside
+/// the program, the verified cache, then the working directory. It is
+/// deliberately a *little* more generous about the cache — the CLI knows which
+/// release tag its build pins and the manager does not, so any tag directory
+/// holding the file counts here. Being generous is the right way round: the
+/// worst case is a pre-flight that lets an install start and a CLI that then
+/// says precisely which artifact it wanted, which is a better message than the
+/// one this check could write.
+pub fn locate_firmware(cwd: &Path) -> Option<(PathBuf, FirmwareOrigin)> {
+    let image = |dir: PathBuf| -> Option<PathBuf> {
+        let path = dir.join(FIRMWARE_FILE);
+        path.is_file().then_some(path)
+    };
+    if let Some(dir) = std::env::var_os("ENTANGLED_FIRMWARE_DIR") {
+        if let Some(path) = image(PathBuf::from(dir)) {
+            return Some((path, FirmwareOrigin::Directory));
+        }
+    }
+    if let Some(path) = install_firmware_dir().and_then(image) {
+        return Some((path, FirmwareOrigin::Install));
+    }
+    if let Some(cache) = cache_root() {
+        let found = std::fs::read_dir(cache.join("firmware"))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .find_map(|entry| image(entry.path()));
+        if let Some(path) = found {
+            return Some((path, FirmwareOrigin::Cache));
+        }
+    }
+    image(cwd.join("artifacts").join("firmware")).map(|path| (path, FirmwareOrigin::Checkout))
+}
+
+/// `artifacts\firmware` beside the manager executable — where
+/// `installer/entangled.iss` puts the shipped copy, next to `entangled.exe`
+/// itself. The CLI resolves it relative to *its own* executable and the two sit
+/// in the same directory in every layout this project produces (`cargo build`
+/// and the installer alike).
+fn install_firmware_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join("artifacts").join("firmware"))
+}
 
 /// The artifact `entangled install <distro>` would fail on, if any — one message
 /// ready to show, or `None` when this host can install that distribution now.
@@ -473,11 +554,12 @@ pub const FIRMWARE_FIX: &str = if cfg!(windows) {
 pub fn missing_install_artifact(cwd: &Path, family: GuestFamily) -> Option<String> {
     match family {
         GuestFamily::Ubuntu => {
-            if cwd.join(UEFI_FIRMWARE).is_file() {
+            if locate_firmware(cwd).is_some() {
                 return None;
             }
             Some(format!(
-                "no {UEFI_FIRMWARE} under {} — {FIRMWARE_FIX}",
+                "no UEFI firmware ({FIRMWARE_FILE}) on this computer — not next to the \
+                 program, not in the verified cache, and not under {}. {FIRMWARE_FIX}",
                 cwd.display()
             ))
         }
@@ -646,6 +728,7 @@ mod tests {
         std::fs::create_dir_all(&cache).unwrap();
         let _cache_env = EnvGuard::set("ENTANGLED_CACHE", cache.as_os_str());
         let _dir_env = EnvGuard::clear("ENTANGLED_BOOTSTRAP_DIR");
+        let _fw_env = EnvGuard::clear("ENTANGLED_FIRMWARE_DIR");
 
         // Firmware present, kernel absent: Ubuntu can go, Debian cannot — and
         // the refusal is a command, not a dead end. That sentence is the whole
@@ -666,12 +749,33 @@ mod tests {
         assert!(missing_install_artifact(&dir, GuestFamily::Debian).is_some());
         std::fs::write(dir.join(BOOTSTRAP_INITRD), b"fake initrd").unwrap();
 
-        // And the other way round.
+        // And the other way round. The refusal must name a way out a person in
+        // front of *this* computer has: the firmware ships with the program and
+        // is downloadable, so "go and get a Linux checkout" is not it.
         std::fs::remove_file(dir.join(UEFI_FIRMWARE)).unwrap();
         assert_eq!(missing_install_artifact(&dir, GuestFamily::Debian), None);
         let ubuntu = missing_install_artifact(&dir, GuestFamily::Ubuntu).expect("no firmware");
-        assert!(ubuntu.contains(UEFI_FIRMWARE), "{ubuntu}");
-        assert!(ubuntu.contains("build-cloudhv.sh"), "{ubuntu}");
+        assert!(ubuntu.contains(FIRMWARE_FILE), "{ubuntu}");
+        assert!(
+            ubuntu.contains("entangled fetch firmware"),
+            "the firmware pre-flight must name the way out: {ubuntu}"
+        );
+        assert!(
+            !ubuntu.contains("Copy artifacts/firmware/CLOUDHV.fd in from a Linux checkout"),
+            "the old dead end came back: {ubuntu}"
+        );
+
+        // ...and a cached firmware, under any tag, satisfies it — the same
+        // generosity the bootstrap arm above shows, for the same reason.
+        let tag = cache.join("firmware/firmware-edk2-stable202602-1");
+        std::fs::create_dir_all(&tag).unwrap();
+        std::fs::write(tag.join(FIRMWARE_FILE), b"fetched firmware").unwrap();
+        assert_eq!(missing_install_artifact(&dir, GuestFamily::Ubuntu), None);
+        assert_eq!(
+            locate_firmware(&dir).map(|(_, origin)| origin),
+            Some(FirmwareOrigin::Cache)
+        );
+        std::fs::remove_file(tag.join(FIRMWARE_FILE)).unwrap();
 
         // …and the arm that exists so a Windows user who ran the fetch is not
         // told to go build a kernel: a pair in the cache, nothing in the working

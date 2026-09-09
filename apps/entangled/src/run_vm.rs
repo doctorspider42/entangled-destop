@@ -884,6 +884,7 @@ pub fn run_with(
     automation: Option<Automation>,
     options: RunOptions,
 ) -> Result<RunReport, String> {
+    let mut cfg = cfg;
     let RunOptions {
         headless,
         control_stdin,
@@ -894,6 +895,25 @@ pub fn run_with(
     let span = tracing::info_span!("vm", id = %cfg.name);
     let _guard = span.enter();
     install_signal_handlers()?;
+
+    // The firmware, resolved before anything else touches the config.
+    //
+    // A UEFI profile carries the firmware path the machine that *created* it
+    // used — nearly always the relative `artifacts/firmware/CLOUDHV.fd` of a
+    // checkout. Run the same profile from another directory, or on a host that
+    // installed Entangled Desktop rather than cloning it, and that path names
+    // nothing. `crate::firmware` falls through to the copy this host actually
+    // has (installed beside the executable, in the verified cache, or in a
+    // checkout) and, failing all of them, says what a *user* can do about it.
+    // Doing it here rather than in the two `uefi_plan`s keeps one answer for
+    // both hypervisor hosts, and puts the resolved path in front of everything
+    // that logs the config.
+    if cfg.boot.mode == control_api::BootMode::Uefi {
+        if let Some(configured) = cfg.boot.firmware.clone() {
+            cfg.boot.firmware = Some(crate::firmware::resolve_profile(&configured)?.path);
+        }
+    }
+    let cfg = cfg;
 
     // The pause/reset seam (ADR-0005), created before the machine because the
     // machine is attached to it and the vCPU threads are spawned with it.

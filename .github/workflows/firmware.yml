@@ -1,0 +1,193 @@
+name: UEFI firmware
+
+# Builds the UEFI firmware every UEFI guest boots — EDK2's CloudHvX64 flash
+# image — and publishes it, with its provenance and its licence, as an
+# immutable GitHub Release.
+#
+# WHY THIS EXISTS
+#   `entangled install ubuntu` and `install fedora` boot the guest's installer
+#   through firmware, because subiquity and Anaconda only create an EFI System
+#   Partition when they themselves booted under one. That firmware is an EDK2
+#   build: Linux only, 2.5 minutes, ~2 GiB of checkout. A person who installed
+#   Entangled Desktop from the Windows installer cannot produce one, and until
+#   this workflow there was nowhere to get one either — the create-machine
+#   wizard told them to "copy it in from a Linux checkout or a release", of
+#   which they had neither and we published neither.
+#
+# WHY IT IS A SEPARATE RELEASE FROM THE INSTALLER'S
+#   The pin in guest/firmware/pinned.toml names a tag, and the point of a pin
+#   is that the bytes behind it never change; a tag rebuilt on every push to
+#   main cannot be pinned. The firmware also changes only when the EDK2 tag or
+#   the build script does, which is roughly never, while the installer changes
+#   on every commit. `--latest=false` keeps /releases/latest pointing at the
+#   installer release, which is what the manager's update check reads
+#   (apps/manager/src/update.rs).
+#
+# WHY THE INSTALLER SHIPS A COPY ANYWAY
+#   This repository is private, so a release asset 404s for anyone without a
+#   token — and even public, a download is a thing that can fail. The firmware
+#   is 4 MiB and BSD-2-Clause-Patent (no source obligation, unlike the GPL
+#   bootstrap kernel next door), so it goes *inside* installer/entangled.iss as
+#   well. This release is what a source checkout fetches, and what
+#   .github/workflows/release.yml prefers when assembling the installer.
+#
+# AFTER IT RUNS
+#   The job summary contains the exact TOML block to paste into
+#   guest/firmware/pinned.toml. Until that is committed, `entangled fetch
+#   firmware` keeps fetching the *previous* tag, which still exists — release
+#   tags are never reused, so nothing breaks in between.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    # Deliberately NOT pinned.toml: committing the pin this job prints must not
+    # start another build of the thing it just pinned.
+    paths:
+      - guest/firmware/build-cloudhv.sh
+      - .github/workflows/firmware.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uefi-firmware
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Build CLOUDHV.fd and publish it with its provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the pinned EDK2 tag
+        id: edk2
+        run: |
+          set -euo pipefail
+          # One source of truth: the default in the build script. A workflow
+          # that hard-coded its own tag would build one firmware and label it
+          # another.
+          tag=$(sed -n 's/^EDK2_TAG="\${EDK2_TAG:-\([^}]*\)}"$/\1/p' \
+              guest/firmware/build-cloudhv.sh)
+          if [ -z "$tag" ]; then
+            echo "cannot read EDK2_TAG out of guest/firmware/build-cloudhv.sh" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release=firmware-$tag-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "edk2 $tag, release firmware-$tag-${{ github.run_number }}"
+
+      - name: EDK2 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential uuid-dev iasl nasm python3 git
+
+      # Deliberately uncached. The EDK2 checkout with submodules is ~2 GiB and
+      # this job runs only when the build script or the pinned tag changes —
+      # a few times a year. Caching it would trade 10 minutes of CI, rarely,
+      # for a permanent 2 GiB of the repository's 10 GiB cache budget, which
+      # the workflows that run on *every* push need more.
+      - name: Build the firmware
+        run: bash guest/firmware/build-cloudhv.sh
+
+      - name: Assemble the release payload
+        id: payload
+        run: |
+          set -euo pipefail
+          out=release-payload
+          mkdir -p "$out"
+          cp artifacts/firmware/CLOUDHV.fd "$out/"
+          cp artifacts/firmware/CLOUDHV.fd.provenance "$out/"
+          cp guest/firmware/build-cloudhv.sh "$out/"
+          # The licence the binary is redistributed under, from the tree it was
+          # built from — the same text THIRD-PARTY-NOTICES.txt quotes.
+          cp ~/.cache/entangled-edk2/edk2/License.txt "$out/LICENSE.EDK2.txt"
+
+          # A firmware that is not the PVH ELF variant would fail to boot in a
+          # way that looks like a VMM bug. The build script already checks this;
+          # checking it again here is what stops a bad artifact being published.
+          head -c4 "$out/CLOUDHV.fd" | od -An -tx1 | tr -d ' \n' | grep -qx 7f454c46 || {
+            echo "CLOUDHV.fd is not an ELF image; the PVH entry point is missing" >&2
+            exit 1
+          }
+
+          ( cd "$out" && sha256sum CLOUDHV.fd build-cloudhv.sh > SHA256SUMS )
+          cat "$out/SHA256SUMS"
+          sha=$(sha256sum "$out/CLOUDHV.fd" | cut -d' ' -f1)
+          bytes=$(stat -c%s "$out/CLOUDHV.fd")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "bytes=$bytes" >> "$GITHUB_OUTPUT"
+
+          cat > "$out/NOTES.md" <<EOF
+          # UEFI firmware — EDK2 CloudHvX64 (${{ steps.edk2.outputs.tag }})
+
+          \`CLOUDHV.fd\` is the UEFI firmware an Entangled Desktop virtual
+          machine starts in: EDK2's \`OvmfPkg/CloudHv/CloudHvX64\` package, the
+          fw_cfg-free variant entered at its PVH entry point. It runs entirely
+          inside the guest and is never linked into a host binary.
+
+          | File | What it is |
+          |---|---|
+          | \`CLOUDHV.fd\` | the 4 MiB flash image |
+          | \`CLOUDHV.fd.provenance\` | upstream tag, commit, build target, flash base and digest |
+          | \`build-cloudhv.sh\` | the script that produced it, unchanged from the commit below |
+          | \`LICENSE.EDK2.txt\` | BSD-2-Clause-Patent, from the EDK2 tree it was built from |
+          | \`SHA256SUMS\` | digests of the two files above |
+
+          One change is made to the upstream package, and it is in the script:
+          the flash-base PCDs are pointed at \`0xFFC00000\` so UEFI variables
+          land in a pflash device this VMM can back with a per-VM \`.nvram\`
+          file. See \`docs/adr/0003-uefi-firmware.md\`.
+
+          **Licence:** BSD-2-Clause-Patent. Permissive — there is no source
+          obligation, and the source is public at
+          [\`${{ steps.edk2.outputs.tag }}\`](https://github.com/tianocore/edk2/releases/tag/${{ steps.edk2.outputs.tag }}).
+
+          Built from commit \`${{ github.sha }}\` by
+          \`.github/workflows/firmware.yml\`, run ${{ github.run_number }}.
+          EOF
+          ls -l "$out"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.edk2.outputs.release }}" \
+            --title "UEFI firmware — EDK2 ${{ steps.edk2.outputs.tag }} (build ${{ github.run_number }})" \
+            --notes-file release-payload/NOTES.md \
+            --latest=false \
+            release-payload/CLOUDHV.fd \
+            release-payload/CLOUDHV.fd.provenance \
+            release-payload/SHA256SUMS \
+            release-payload/NOTES.md \
+            release-payload/LICENSE.EDK2.txt \
+            release-payload/build-cloudhv.sh
+
+      - name: The pin to commit
+        run: |
+          {
+            echo '## Published `${{ steps.edk2.outputs.release }}`'
+            echo
+            echo 'Now replace the block below `# NOT PUBLISHED YET` in'
+            echo '`guest/firmware/pinned.toml` — and delete that note, which says'
+            echo 'no release exists. Until you do, `entangled fetch firmware` keeps'
+            echo 'serving the previous tag.'
+            echo
+            echo '```toml'
+            echo 'tag = "${{ steps.edk2.outputs.release }}"'
+            echo 'edk2_tag = "${{ steps.edk2.outputs.tag }}"'
+            echo 'base_url = "https://github.com/${{ github.repository }}/releases/download"'
+            echo 'source = "https://github.com/${{ github.repository }}/releases/tag/${{ steps.edk2.outputs.release }}"'
+            echo
+            echo '[[assets]]'
+            echo 'name = "CLOUDHV.fd"'
+            echo 'sha256 = "${{ steps.payload.outputs.sha }}"'
+            echo 'bytes = ${{ steps.payload.outputs.bytes }}'
+            echo '```'
+            echo
+            echo 'The Windows installer takes its copy from this release too'
+            echo '(`.github/workflows/release.yml`), so the next push to main ships it.'
+          } >> "$GITHUB_STEP_SUMMARY"

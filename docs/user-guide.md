@@ -173,8 +173,16 @@ sudo apt-get install -y libasound2          # guest sound
 sudo apt-get install -y curl gnupg coreutils  # the ISO fetch scripts
 ```
 
-Two things are **not** in the repository because they are build artifacts, and a
-fresh checkout has neither:
+Two guest-side artifacts are **not** in the repository because they are build
+artifacts, and a fresh checkout has neither. Both can be downloaded instead of
+built:
+
+```bash
+entangled fetch firmware                  # the UEFI firmware, 4 MiB, a second
+entangled fetch bootstrap-kernel          # only for `install debian`, 13 MiB
+```
+
+or built on Linux, which is the only host either build runs on:
 
 ```bash
 sudo apt-get install -y build-essential uuid-dev iasl nasm python3 git
@@ -182,38 +190,59 @@ bash guest/firmware/build-cloudhv.sh      # the UEFI firmware, ~2.5 min, once
 bash guest/bootstrap-kernel/build.sh      # only for `install debian`, ~15 min
 ```
 
-The second one is optional even on Linux: `entangled fetch bootstrap-kernel`
-downloads the same two files, prebuilt and digest-checked, in a second. It is
-the *only* way to get them on Windows — see
-"[The guest bootstrap artifacts](#the-guest-bootstrap-artifacts)" below.
-
 `build-cloudhv.sh` checks out pinned EDK2 sources into
 `~/.cache/entangled-edk2` and builds `CLOUDHV.fd` into `artifacts/firmware/`.
-**Without it, every UEFI boot fails with `cannot read firmware …`** — the single
-most common first-run failure. There is no Windows build of it.
+**Without a firmware from somewhere, every UEFI boot fails** — which is every
+Ubuntu, every Fedora and every installed machine.
 
-### The firmware on a Windows install
+Both downloads are checked against a SHA-256 compiled into the `entangled`
+binary and are refused if they do not match; see
+"[The guest bootstrap artifacts](#the-guest-bootstrap-artifacts)" for exactly
+what that is and is not worth.
 
-The Windows installer does **not** ship `CLOUDHV.fd` — the firmware is built on
-Linux — and `entangled` looks for it at the *relative* path
-`artifacts\firmware\CLOUDHV.fd`, resolved against the working directory. Started
-from the Start menu, that working directory is the install folder under
-`Program Files`, which has no `artifacts` folder and is not writable. So on a
-fresh Windows installation `entangled doctor` reports:
+### Where the firmware comes from
+
+`entangled` looks in five places, in this order, and `entangled doctor` says
+which one answered:
+
+| # | Where | Who has it |
+|---|---|---|
+| 1 | `--firmware`, or the machine's own `[boot] firmware` | whoever set one |
+| 2 | `ENTANGLED_FIRMWARE_DIR` | a developer who just rebuilt EDK2 |
+| 3 | `artifacts\firmware\CLOUDHV.fd` **next to the program** | **every Windows installation** — the installer ships it |
+| 4 | the verified cache | anyone who ran `entangled fetch firmware` |
+| 5 | `artifacts/firmware/CLOUDHV.fd` under the working directory | a checkout that ran the build script |
+
+Row 3 is why a fresh Windows installation just works: the setup lays the
+firmware down beside `entangled.exe`, and it is found from any working
+directory. Nothing to copy, nothing to configure, and a machine created there
+records that absolute path in its profile.
+
+Row 1 has two halves that behave differently, deliberately. A `--firmware` you
+typed is obeyed or named in the error — never quietly replaced, because a flag
+that silently did nothing is how an afternoon disappears. A *profile's*
+`[boot] firmware`, on the other hand, is a starting point: a machine created on
+another computer names that computer's path, and when the file is not there
+`entangled` falls through to rows 2–5 and logs which one it used instead. That
+is what makes a machine portable between a Linux checkout and a Windows
+installation.
+
+If a host has none of them:
 
 ```text
-    firmware         MISSING at artifacts/firmware/CLOUDHV.fd
+    firmware         MISSING — needed by every UEFI machine
+                    No UEFI firmware (CLOUDHV.fd) on this host, and a machine that starts via UEFI cannot boot without it.
+                    Entangled Desktop can download it: run `entangled fetch firmware` (4 MiB, checked against a SHA-256 pinned in this build).
+                    It normally ships with Entangled Desktop, so reinstalling also puts it back — at C:\Program Files\Entangled Desktop\artifacts\firmware\CLOUDHV.fd.
+                    Or pass --firmware, or point ENTANGLED_FIRMWARE_DIR at a directory holding CLOUDHV.fd.
 ```
 
-and UEFI machines cannot start. The fix is two settings:
-
-1. put `CLOUDHV.fd` somewhere writable, e.g.
-   `%USERPROFILE%\entangled\artifacts\firmware\CLOUDHV.fd`, copied from a Linux
-   checkout;
-2. in the manager, *Settings ▸ Advanced ▸ working directory*, point at
-   `%USERPROFILE%\entangled` — or give each machine an absolute
-   `[boot] firmware` path in its profile, which the machine editor's *Boot &
-   media* section does for you.
+**While this repository is private**, `entangled fetch firmware` needs a GitHub
+token to reach the release asset — an unauthenticated download answers 404
+whether or not the asset exists. Set `GITHUB_TOKEN` or `GH_TOKEN`, or sign in
+with `gh auth login`, and the fetch uses it automatically. The installer copy
+(row 3) needs nothing, which is why it is the one that makes a fresh machine
+work.
 
 ## Check the host first: `entangled doctor`
 
@@ -229,7 +258,7 @@ entangled doctor
   install         : ubuntu — UEFI + verified ISO, offline (no mirror needed)
                     debian — d-i on the bootstrap kernel, needs the network
                     fedora — netinst through UEFI, kickstart, needs the network
-    firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB)
+    firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB, from this checkout)
     bootstrap kernel artifacts/bootstrap/vmlinuz (12.6 MiB, from this checkout)
     bootstrap initrd artifacts/bootstrap/initrd.img (197 KiB)
     ubuntu ISO      /home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-live-server-amd64.iso (2.7 GiB)
@@ -257,7 +286,7 @@ entangled doctor
                     DNS relay, outbound TCP), no TAP and no administrator
   VMs per process : 1 — WHP maps guest memory for one partition per process,
                     so a second VM needs a second `entangled` process
-    firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB)
+    firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB, from this checkout)
     bootstrap kernel MISSING — needed by `install debian` only
                     run `entangled fetch bootstrap-kernel` (~13 MiB, SHA-256 pinned), or
                     copy an artifacts/bootstrap/ directory in from a Linux checkout (the
@@ -279,9 +308,13 @@ signing key, pinned by fingerprint in this repository; nothing is used before
 both its OpenPGP signature and its SHA-256 check pass.
 
 ```bash
-bash guest/firmware/build-cloudhv.sh          # once, ~2.5 min
+entangled fetch firmware                      # 4 MiB, digest checked
 bash scripts/fetch-ubuntu-iso.sh              # once, ~2.9 GiB, verified
 ```
+
+A Windows installation already has the firmware next to the program, so the
+first line is a no-op there; on Linux `bash guest/firmware/build-cloudhv.sh`
+builds it instead (~2.5 min).
 
 On Windows there is no `fetch-ubuntu-iso.sh` — it is a bash script. Either run
 it once in WSL (the cache is `%LOCALAPPDATA%\entangled` on Windows and
@@ -440,6 +473,32 @@ guest/bootstrap-kernel/build.sh` plus `bash scripts/build-bootstrap-initramfs.sh
 on Linux, ~15 min), or point `ENTANGLED_BOOTSTRAP_DIR` at a directory that
 already holds the pair. A local `artifacts/bootstrap/` always wins over the
 cache, so a checkout that builds its own never picks up a download by accident.
+
+### The UEFI firmware, and how it is trusted
+
+`entangled fetch firmware` downloads one file into the same cache:
+
+| File | What it is | Licence |
+|---|---|---|
+| `CLOUDHV.fd` | 4 MiB: EDK2's `OvmfPkg/CloudHv/CloudHvX64` flash image, with the flash-base PCDs moved so UEFI variables land in a device this VMM can back with a file | **BSD-2-Clause-Patent** (TianoCore EDK2) |
+
+The trust story is the same as the bootstrap kernel's, word for word: a SHA-256
+compiled into the binary (`guest/firmware/pinned.toml`), no signature, deleted
+rather than used on a mismatch.
+
+The *licence* story is not. EDK2's is permissive with no source obligation, so
+unlike the kernel this file can be — and is — shipped **inside the Windows
+installer**, which is what makes a fresh Windows installation able to create a
+UEFI machine with no download at all. The attribution it does require is in
+`THIRD-PARTY-NOTICES.txt`: shown on the installer's licence page and installed
+beside the program.
+
+**While this repository is private, the download needs a GitHub token.** An
+unauthenticated release-asset URL answers 404 whether or not the asset exists,
+so set `GITHUB_TOKEN` or `GH_TOKEN`, or sign in with `gh auth login`, and the
+fetch will use it (it switches to the API asset endpoint, which private
+repositories do serve). This affects `entangled fetch bootstrap-kernel`
+identically. It does not affect the installer's copy, which is already on disk.
 
 ## Living with a VM
 
@@ -966,7 +1025,7 @@ configuration:
 | `entangled install ubuntu --disk … --size … --auto --headless` | copied from `apps/entangled/tests/ubuntu_install.rs`, which passes on both hosts |
 | `entangled install fedora --disk … --size … --network usernet --auto --headless` | copied from `apps/entangled/tests/fedora_install.rs` |
 | `entangled run --headless <profile>` | copied from the same tests |
-| `bash guest/firmware/build-cloudhv.sh`, `scripts/fetch-ubuntu-iso.sh`, `scripts/fetch-fedora-iso.sh` | the scripts' own documented invocations; the firmware and the Ubuntu ISO were both present and used on the machine this guide was written on |
+| `entangled fetch firmware`, `bash guest/firmware/build-cloudhv.sh`, `scripts/fetch-ubuntu-iso.sh`, `scripts/fetch-fedora-iso.sh` | the commands' own documented invocations; the fetch was run end to end against the published layout on 2026-09-09, and the firmware and the Ubuntu ISO were both present and used on the machine this guide was written on |
 | `entangled fetch debian …`, `install debian …` | from the CLI's help output and the Debian install path's documentation; not re-run for this guide |
 | `entangled install ubuntu --iso <desktop iso> …` | the server command with the flags the CLI documents; the Desktop variant is what `tests/boot/tests/desktop_gnome.rs` boots, but this exact line was not re-run for the guide |
 | `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All` | the standard Windows spelling of the feature this project requires; the feature is enabled on the development host |
