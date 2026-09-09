@@ -62,7 +62,7 @@ pub const DEFAULT_NETWORK: &str = if cfg!(target_os = "linux") {
 #[command(
     name = "entangled",
     version = VERSION,
-    about = "Entangled Desktop — a small VMM for Linux x86-64 hosts"
+    about = "Entangled Desktop — a small VMM for x86-64 hosts (Linux/KVM and Windows/WHP)"
 )]
 struct Cli {
     #[command(subcommand)]

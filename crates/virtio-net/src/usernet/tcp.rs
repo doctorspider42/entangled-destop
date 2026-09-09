@@ -6,7 +6,7 @@
 //! process, so nothing needs a raw socket, a TAP device or an administrator.
 //!
 //! ```text
-//!   guest ──TCP/IP over virtio-net──> smoltcp tcp::Socket ──bytes──> std::net::TcpStream ──> host
+//!   guest â”€â”€TCP/IP over virtio-netâ”€â”€> smoltcp tcp::Socket â”€â”€bytesâ”€â”€> std::net::TcpStream â”€â”€> host
 //! ```
 //!
 //! # Why smoltcp rather than a hand-written TCP
@@ -14,7 +14,7 @@
 //! Because the guest side really is TCP: sequence numbers, windows,
 //! retransmission, delayed ACKs, FIN handshakes and PAWS. `smoltcp::socket::tcp` is
 //! a complete, well-tested implementation of exactly that, `no_std`, 0BSD, with no
-//! I/O of its own — it takes packets in and gives packets out, which is precisely
+//! I/O of its own â€” it takes packets in and gives packets out, which is precisely
 //! the shape this needs.
 //!
 //! Two smoltcp features carry the design:
@@ -40,11 +40,11 @@
 //!
 //! # What the guest cannot do
 //!
-//! * open more than [`MAX_FLOWS`] connections — further SYNs are dropped, which the
+//! * open more than [`MAX_FLOWS`] connections â€” further SYNs are dropped, which the
 //!   guest sees as a lossy network and retries, rather than as unbounded host state;
 //! * reach the host itself: a SYN whose destination is on the guest's own segment
-//!   ([`UserNetConfig::is_local`]) is refused. Otherwise `192.168.74.1` — or any
-//!   other address the host happens to answer on — would be reachable from inside
+//!   ([`UserNetConfig::is_local`]) is refused. Otherwise `192.168.74.1` â€” or any
+//!   other address the host happens to answer on â€” would be reachable from inside
 //!   the guest, and a guest reaching *host-local* services is the whole class of bug
 //!   user-mode networking is supposed to avoid;
 //! * make this module index a buffer with a guest-supplied number. Every header read
@@ -72,12 +72,33 @@ use crate::frame::{ETH_HEADER_LEN, MAX_FRAME_LEN};
 pub const MAX_FLOWS: usize = 64;
 
 /// Per-direction socket buffer for one flow. 16 KiB is a window big enough that a
-/// package download is not round-trip bound, and 64 flows of it is 2 MiB — bounded,
+/// package download is not round-trip bound, and 64 flows of it is 2 MiB â€” bounded,
 /// and bounded by *us* rather than by the guest.
 pub const FLOW_BUFFER: usize = 16 * 1024;
 
 /// How long a host connect is given before the flow is abandoned.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often an established flow with nothing to say probes the guest.
+///
+/// Paired with [`FLOW_IDLE_TIMEOUT`] below, and useless without it: smoltcp only
+/// treats a silent peer as gone if a timeout is set, and only calls a peer that
+/// answers keep-alives silent if it stops answering *those*. Together they are an
+/// ordinary TCP keep-alive, and the pair is what keeps a long-lived idle
+/// connection (an ssh session, a held-open HTTP/1.1 socket) alive while still
+/// retiring one whose other end has vanished.
+pub const FLOW_KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// How long a flow may go without a word from the guest before it is aborted.
+///
+/// A flow is only ever retired by one of its two ends finishing, and the guest is
+/// an end that can simply stop existing: a reboot, a device reset, a crashed
+/// application, a guest that was paused for an hour. Nothing in the TCP state
+/// machine notices â€” the socket sits in `Established` or `FinWait2` holding one of
+/// [`MAX_FLOWS`] slots, and 64 of those wedge the NAT for the life of the process.
+/// So a flow whose guest has not answered four keep-alives is aborted, which sends
+/// it an RST and gives the slot back.
+pub const FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// IPv4 datagrams waiting in either direction, as smoltcp's `Device`.
 ///
@@ -155,6 +176,26 @@ struct Flow {
     guest_eof: bool,
 }
 
+/// How a [`TcpNat`] treats the host: the production answer, and the two a test or
+/// a fuzz harness needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HostAccess {
+    /// Off-segment destinations only, reached with real host sockets. The only
+    /// value production code ever builds.
+    Routed,
+    /// Real host sockets, host-local destinations allowed. The end-to-end tests
+    /// have no other way to point a flow at a listener they control â€” a test
+    /// cannot rely on the machine having a routable address, and every address it
+    /// *can* bind is host-local by definition. The guard itself is asserted by
+    /// `host_local_destinations_are_refused`.
+    #[cfg(test)]
+    HostLocal,
+    /// No host sockets at all: flows are created and smoltcp runs, but nothing is
+    /// ever connected. What the fuzz target drives, so that arbitrary guest bytes
+    /// can reach the TCP state machine without the fuzzer dialling the internet.
+    Offline,
+}
+
 /// The NAT: one smoltcp interface, one socket per guest connection.
 pub struct TcpNat {
     config: UserNetConfig,
@@ -165,29 +206,44 @@ pub struct TcpNat {
     /// Monotonic base for smoltcp's clock, which wants milliseconds since an
     /// arbitrary origin.
     epoch: StdInstant,
-    /// Always false outside this crate's tests, which have no other way to point a
-    /// flow at a listener they control — a test cannot rely on the machine having a
-    /// routable address, and every address it *can* bind is host-local by
-    /// definition. Set only by [`Self::new_allowing_host_local`], which is
-    /// `#[cfg(test)]`, so no configuration or guest input can reach it.
-    allow_host_local: bool,
+    /// Always [`HostAccess::Routed`] outside this crate's tests and its fuzz
+    /// harness: no configuration and no guest input can reach the other two.
+    access: HostAccess,
+    /// The keep-alive pair a new socket is given. Fields rather than constants so
+    /// a test can watch an abandoned flow retire in milliseconds instead of a
+    /// minute; production always uses the constants.
+    keepalive: Duration,
+    idle_timeout: Duration,
+    /// SYNs refused because the table was full â€” the counter that makes
+    /// "the NAT is wedged" visible from outside instead of only in a log line.
+    refused_at_limit: u64,
+    /// Flows retired since this NAT was built. With [`Self::flow_count`] it is the
+    /// evidence a lifecycle test needs: slots given back, not merely never taken.
+    retired: u64,
 }
 
 impl TcpNat {
     pub fn new(config: UserNetConfig) -> Self {
-        Self::build(config, false)
+        Self::build(config, HostAccess::Routed)
     }
 
-    /// [`Self::new`] with the host-local guard off, for the end-to-end test.
-    #[cfg(test)]
-    fn new_allowing_host_local(config: UserNetConfig) -> Self {
-        Self::build(config, true)
+    /// [`Self::new`] with a different host policy, for tests and the fuzz harness.
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub(super) fn with_access(config: UserNetConfig, access: HostAccess) -> Self {
+        Self::build(config, access)
     }
 
-    fn build(config: UserNetConfig, allow_host_local: bool) -> Self {
+    /// Shortens the keep-alive pair so a test can watch an abandoned flow retire.
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub(super) fn set_keepalive(&mut self, keepalive: Duration, idle_timeout: Duration) {
+        self.keepalive = keepalive;
+        self.idle_timeout = idle_timeout;
+    }
+
+    fn build(config: UserNetConfig, access: HostAccess) -> Self {
         let mut device = IpQueues::default();
         // `HardwareAddress::Ip` selects `Medium::Ip`: no MAC, no ARP, no neighbour
-        // cache — the router above owns all three.
+        // cache â€” the router above owns all three.
         let iface_config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(iface_config, &mut device, Instant::from_millis(0));
         iface.update_ip_addrs(|addrs| {
@@ -198,7 +254,7 @@ impl TcpNat {
         // The line that makes a transparent NAT possible: accept datagrams
         // addressed to hosts that are not us.
         iface.set_any_ip(true);
-        // …and the line without which `any_ip` does nothing. smoltcp only accepts a
+        // â€¦and the line without which `any_ip` does nothing. smoltcp only accepts a
         // foreign destination if a route for it resolves to a router address the
         // interface itself holds (`process_ipv4`: "Rejecting IPv4 packet; no
         // matching routes"), which is how it keeps `any_ip` from turning an
@@ -213,7 +269,11 @@ impl TcpNat {
             sockets: SocketSet::new(Vec::new()),
             flows: Vec::new(),
             epoch: StdInstant::now(),
-            allow_host_local,
+            access,
+            keepalive: FLOW_KEEPALIVE,
+            idle_timeout: FLOW_IDLE_TIMEOUT,
+            refused_at_limit: 0,
+            retired: 0,
         }
     }
 
@@ -231,6 +291,16 @@ impl TcpNat {
         self.flows.len()
     }
 
+    /// SYNs refused because [`MAX_FLOWS`] were already open.
+    pub fn refused_at_limit(&self) -> u64 {
+        self.refused_at_limit
+    }
+
+    /// Flows retired since this NAT was built.
+    pub fn retired(&self) -> u64 {
+        self.retired
+    }
+
     /// Feeds one IPv4 datagram carrying TCP into the stack, opening a flow when it
     /// is a fresh SYN. Reports whether a new flow was opened.
     ///
@@ -245,7 +315,7 @@ impl TcpNat {
     /// Opens a flow for a SYN that does not belong to one already.
     ///
     /// A SYN is the only packet that may create state. Anything else for an unknown
-    /// flow is handed to smoltcp anyway, which answers it with an RST — the correct
+    /// flow is handed to smoltcp anyway, which answers it with an RST â€” the correct
     /// response, and one that costs no host state.
     fn open_if_new(&mut self, ip: &Ipv4Repr, payload: &[u8]) -> bool {
         let Ok(packet) = TcpPacket::new_checked(payload) else {
@@ -266,7 +336,7 @@ impl TcpNat {
         }
         // A guest must not be able to reach services bound on the host's own
         // loopback or LAN addresses through the NAT.
-        if !self.allow_host_local
+        if self.access == HostAccess::Routed
             && (self.config.is_local(ip.dst_addr) || ip.dst_addr.is_loopback())
         {
             tracing::debug!(
@@ -276,6 +346,7 @@ impl TcpNat {
             return false;
         }
         if self.flows.len() >= MAX_FLOWS {
+            self.refused_at_limit = self.refused_at_limit.saturating_add(1);
             tracing::warn!(
                 flows = self.flows.len(),
                 "refusing a guest connection: the NAT is at its flow limit"
@@ -287,6 +358,10 @@ impl TcpNat {
             tcp::SocketBuffer::new(vec![0u8; FLOW_BUFFER]),
             tcp::SocketBuffer::new(vec![0u8; FLOW_BUFFER]),
         );
+        // The keep-alive pair: without it a guest that stops existing mid-flow
+        // holds its slot until the process does. See [`FLOW_IDLE_TIMEOUT`].
+        socket.set_keep_alive(Some(self.keepalive.into()));
+        socket.set_timeout(Some(self.idle_timeout.into()));
         // Listening on the *destination* the guest chose, which only works because
         // of `set_any_ip`.
         if let Err(error) = socket.listen((ip.dst_addr, packet.dst_port())) {
@@ -297,32 +372,37 @@ impl TcpNat {
 
         // The host connect on its own thread: `std` has no non-blocking connect, and
         // blocking here would stall every other flow.
-        let (sender, connecting) = mpsc::channel();
-        let target = SocketAddr::V4(remote);
-        if let Err(error) = std::thread::Builder::new()
-            .name("usernet-connect".into())
-            .spawn(move || {
-                let result =
-                    TcpStream::connect_timeout(&target, CONNECT_TIMEOUT).and_then(|stream| {
-                        stream.set_nonblocking(true)?;
-                        Ok(stream)
-                    });
-                // The receiver is gone if the flow was torn down first; that is not
-                // an error, it just means nobody is waiting any more.
-                let _ = sender.send(result);
-            })
-        {
-            tracing::warn!(%error, "cannot start a host connect thread");
-            self.sockets.remove(handle);
-            return false;
-        }
+        let connecting = if self.access == HostAccess::Offline {
+            None
+        } else {
+            let (sender, connecting) = mpsc::channel();
+            let target = SocketAddr::V4(remote);
+            if let Err(error) = std::thread::Builder::new()
+                .name("usernet-connect".into())
+                .spawn(move || {
+                    let result =
+                        TcpStream::connect_timeout(&target, CONNECT_TIMEOUT).and_then(|stream| {
+                            stream.set_nonblocking(true)?;
+                            Ok(stream)
+                        });
+                    // The receiver is gone if the flow was torn down first; that is
+                    // not an error, it just means nobody is waiting any more.
+                    let _ = sender.send(result);
+                })
+            {
+                tracing::warn!(%error, "cannot start a host connect thread");
+                self.sockets.remove(handle);
+                return false;
+            }
+            Some(connecting)
+        };
 
         tracing::debug!(guest_port, remote = %remote, "opened a NAT flow");
         self.flows.push(Flow {
             handle,
             guest_port,
             remote,
-            connecting: Some(connecting),
+            connecting,
             stream: None,
             started: StdInstant::now(),
             host_eof: false,
@@ -336,11 +416,18 @@ impl TcpNat {
     pub fn poll(&mut self, guest_mac: EthernetAddress, emit: &mut dyn FnMut(Vec<u8>)) {
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        self.service_flows();
-        // Sockets may have produced data or closed above, so run the stack again
-        // rather than leaving those bytes until the next tick.
+        let finished = self.service_flows();
+        // Sockets may have produced data, sent a FIN or been aborted above, so run
+        // the stack again rather than leaving any of it until the next tick â€” and
+        // run it *before* the finished flows are retired. A socket `abort()` only
+        // moves smoltcp to `Closed`; the RST that tells the guest its connection
+        // was refused is emitted by the next dispatch, and a socket removed from
+        // the set before that dispatch never sends it. That is the difference
+        // between a guest whose connect fails immediately and one that retries
+        // until its own SYN timeout expires.
         self.iface
             .poll(self.now(), &mut self.device, &mut self.sockets);
+        self.retire(finished);
 
         while let Some(datagram) = self.device.tx.pop_front() {
             let total = ETH_HEADER_LEN + datagram.len();
@@ -364,8 +451,10 @@ impl TcpNat {
         }
     }
 
-    /// Completes connects, copies bytes both ways, and retires finished flows.
-    fn service_flows(&mut self) {
+    /// Completes connects and copies bytes both ways, reporting the flows that
+    /// have ended. They are retired by [`Self::retire`] after one more pass of the
+    /// stack, so a socket's last segment is emitted before it is removed.
+    fn service_flows(&mut self) -> Vec<usize> {
         let mut finished = Vec::new();
         for (index, flow) in self.flows.iter_mut().enumerate() {
             let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
@@ -405,6 +494,13 @@ impl TcpNat {
             }
 
             let Some(stream) = flow.stream.as_mut() else {
+                // No host socket: the offline harness never makes one. There is
+                // nothing to copy, but the flow can still have ended â€” a guest RST
+                // or the keep-alive timeout closes the socket â€” and its slot has
+                // to come back either way.
+                if !socket.may_recv() && !socket.is_open() {
+                    finished.push(index);
+                }
                 continue;
             };
 
@@ -447,8 +543,8 @@ impl TcpNat {
             // until it answers with its own EOF.
             //
             // Without this the flow leaks. Every HTTP client closes first, so the
-            // socket sits in CloseWait forever — `is_open()` is still true there
-            // — the retirement test below never fires, and the 64 flow slots fill
+            // socket sits in CloseWait forever â€” `is_open()` is still true there
+            // â€” the retirement test below never fires, and the 64 flow slots fill
             // up. Measured: `debian-installer` retrieving its udebs over usernet
             // stalls at "Loading additional components" after exactly 64
             // downloads, with `refusing a guest connection: the NAT is at its
@@ -477,6 +573,11 @@ impl TcpNat {
             }
         }
 
+        finished
+    }
+
+    /// Gives the slots of finished flows back.
+    fn retire(&mut self, finished: Vec<usize>) {
         // Back to front, so removing one does not move the next.
         for index in finished.into_iter().rev() {
             if index >= self.flows.len() {
@@ -484,6 +585,7 @@ impl TcpNat {
             }
             let flow = self.flows.remove(index);
             self.sockets.remove(flow.handle);
+            self.retired = self.retired.saturating_add(1);
             tracing::debug!(remote = %flow.remote, "retired a NAT flow");
         }
     }
@@ -563,7 +665,7 @@ mod tests {
         assert_eq!(nat.flow_count(), 0);
     }
 
-    /// The guest must not be able to reach the host through the NAT — not the
+    /// The guest must not be able to reach the host through the NAT â€” not the
     /// gateway, not anything else on its own segment, and not loopback.
     #[test]
     fn host_local_destinations_are_refused() {
@@ -610,6 +712,14 @@ mod tests {
         port: u16,
         seq: u32,
         ack: u32,
+        /// The highest acknowledgement number the NAT has sent us, so a bulk
+        /// sender can keep itself inside the receive window instead of
+        /// overrunning it and stalling the stream.
+        acked: u32,
+        /// The receive window the NAT last advertised. A dumb peer that ignores
+        /// it and overruns the buffer has its segments dropped, and — having no
+        /// retransmission of its own — stalls forever.
+        window: u32,
         mac: EthernetAddress,
     }
 
@@ -621,12 +731,24 @@ mod tests {
                 port,
                 seq: 1000,
                 ack: 0,
+                acked: 1000,
+                window: 0,
                 mac: EthernetAddress([0x52, 0x54, 0, 7, 7, 7]),
             }
         }
 
         /// Sends one segment with the given flags and payload.
         fn send(&mut self, syn: bool, ack_flag: bool, fin: bool, data: &[u8]) {
+            self.emit(syn, ack_flag, fin, false, data);
+        }
+
+        /// The guest walking away mid-connection: an RST, which is what a rebooted
+        /// or reset guest's new stack answers a keep-alive with.
+        fn send_rst(&mut self) {
+            self.emit(false, true, false, true, &[]);
+        }
+
+        fn emit(&mut self, syn: bool, ack_flag: bool, fin: bool, rst: bool, data: &[u8]) {
             let caps = smoltcp::phy::ChecksumCapabilities::default();
             let dst = *self.remote.ip();
             let ip_repr = Ipv4Repr {
@@ -648,6 +770,7 @@ mod tests {
             tcp_packet.set_syn(syn);
             tcp_packet.set_ack(ack_flag);
             tcp_packet.set_fin(fin);
+            tcp_packet.set_rst(rst);
             tcp_packet.set_window_len(16384);
             tcp_packet.payload_mut().copy_from_slice(data);
             tcp_packet.fill_checksum(&ip_repr.src_addr.into(), &dst.into());
@@ -662,7 +785,7 @@ mod tests {
 
         /// Runs the NAT and returns every TCP segment it sent us, updating the
         /// acknowledgement number from the last one.
-        fn poll(&mut self) -> Vec<(bool, bool, bool, Vec<u8>)> {
+        fn poll(&mut self) -> Vec<Segment> {
             let mut frames = Vec::new();
             let mac = self.mac;
             self.nat.poll(mac, &mut |frame| frames.push(frame));
@@ -683,10 +806,70 @@ mod tests {
                 self.ack = (tcp.seq_number().0 as u32)
                     .wrapping_add(u32::from(tcp.syn() || tcp.fin()))
                     .wrapping_add(payload.len() as u32);
-                segments.push((tcp.syn(), tcp.ack(), tcp.fin(), payload));
+                if tcp.ack() {
+                    self.acked = tcp.ack_number().0 as u32;
+                    self.window = u32::from(tcp.window_len());
+                }
+                segments.push(Segment {
+                    syn: tcp.syn(),
+                    ack: tcp.ack(),
+                    fin: tcp.fin(),
+                    rst: tcp.rst(),
+                    // The MSS option only ever rides on a SYN.
+                    mss: tcp.syn().then(|| mss_option(&tcp)).flatten(),
+                    payload,
+                });
             }
             segments
         }
+
+        /// Points the peer at a fresh connection on the same remote: a new guest
+        /// port and sequence numbers back at the start, which is what the next
+        /// `SYN` in a short-lived-connection workload looks like.
+        fn reopen(&mut self, port: u16) {
+            self.port = port;
+            self.seq = 1000;
+            self.ack = 0;
+            self.acked = 1000;
+            self.window = 0;
+        }
+
+        /// SYN, SYN-ACK, ACK.
+        fn handshake(&mut self) {
+            self.send(true, false, false, &[]);
+            let _ = self.poll();
+            self.send(false, true, false, &[]);
+            let _ = self.poll();
+        }
+    }
+
+    /// One segment the NAT sent the guest.
+    #[derive(Debug, Clone)]
+    struct Segment {
+        syn: bool,
+        ack: bool,
+        fin: bool,
+        rst: bool,
+        /// The MSS option, when this segment is a SYN carrying one.
+        mss: Option<u16>,
+        payload: Vec<u8>,
+    }
+
+    /// The MSS option out of a SYN, by re-parsing the segment's options: the
+    /// `TcpPacket` accessors expose the header fields, and `TcpRepr::parse` is the
+    /// one that walks the option list.
+    fn mss_option(packet: &TcpPacket<&[u8]>) -> Option<u16> {
+        let caps = smoltcp::phy::ChecksumCapabilities::default();
+        let mut caps = caps;
+        caps.tcp = smoltcp::phy::Checksum::None;
+        smoltcp::wire::TcpRepr::parse(
+            packet,
+            &Ipv4Address::UNSPECIFIED.into(),
+            &Ipv4Address::UNSPECIFIED.into(),
+            &caps,
+        )
+        .ok()?
+        .max_seg_size
     }
 
     /// **The whole NAT, end to end**: a guest TCP connection is terminated by
@@ -694,7 +877,7 @@ mod tests {
     ///
     /// The listener is on loopback because that is the only address a test can be
     /// sure of binding, which is exactly why the host-local guard has a test-only
-    /// escape (see [`TcpNat::allow_host_local`]) — the guard itself is asserted by
+    /// escape (see [`HostAccess::HostLocal`]) â€” the guard itself is asserted by
     /// `host_local_destinations_are_refused`.
     #[test]
     fn a_guest_connection_reaches_a_host_listener_and_bytes_cross_both_ways() {
@@ -706,14 +889,18 @@ mod tests {
             SocketAddr::V6(_) => unreachable!("bound to an IPv4 address"),
         };
 
-        let mut peer = GuestPeer::new(TcpNat::new_allowing_host_local(config()), remote, 41000);
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::HostLocal),
+            remote,
+            41000,
+        );
 
         // SYN -> the listening socket answers SYN-ACK straight away; the host
         // connect is still in flight, deliberately.
         peer.send(true, false, false, &[]);
         let handshake = peer.poll();
         assert!(
-            handshake.iter().any(|(syn, ack, _, _)| *syn && *ack),
+            handshake.iter().any(|s| s.syn && s.ack),
             "the guest's SYN must be answered with a SYN-ACK: {handshake:?}"
         );
         // ACK completes the guest's half of the handshake.
@@ -727,7 +914,7 @@ mod tests {
         // guest -> host. The NAT has to be *polled* for the bytes to move: the copy
         // out of smoltcp's buffer into the host socket happens in `service_flows`,
         // and the flow only has a stream once a poll has collected the connect. So
-        // this reads and polls in the same loop instead of blocking on the read —
+        // this reads and polls in the same loop instead of blocking on the read â€”
         // blocking on it means nothing ever copies, which is the shape of a real
         // deadlock and not just a slow test.
         stream
@@ -764,8 +951,8 @@ mod tests {
         stream.flush().expect("flush the reply");
         let mut received = Vec::new();
         for _ in 0..200 {
-            for (_, _, _, payload) in peer.poll() {
-                received.extend_from_slice(&payload);
+            for segment in peer.poll() {
+                received.extend_from_slice(&segment.payload);
             }
             if received.windows(2).any(|w| w == b"hi") {
                 break;
@@ -784,7 +971,7 @@ mod tests {
     }
 
     /// **The flow leak that stalled an installer.** A guest that closes its half
-    /// first — which is what every HTTP client does — must get its slot back.
+    /// first â€” which is what every HTTP client does â€” must get its slot back.
     ///
     /// Before the half-close was propagated, the socket stayed in `CloseWait`
     /// forever: `is_open()` is true there, so the retirement test never fired and
@@ -803,14 +990,18 @@ mod tests {
             SocketAddr::V6(_) => unreachable!("bound to an IPv4 address"),
         };
 
-        let mut peer = GuestPeer::new(TcpNat::new_allowing_host_local(config()), remote, 41100);
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::HostLocal),
+            remote,
+            41100,
+        );
         peer.send(true, false, false, &[]);
         let _ = peer.poll();
         peer.send(false, true, false, &[]);
         let _ = peer.poll();
         let (mut stream, _) = listener.accept().expect("the NAT connects to the listener");
 
-        // One request, then the guest closes its half — FIN, the way a client that
+        // One request, then the guest closes its half â€” FIN, the way a client that
         // sent `Connection: close` does.
         peer.send(false, true, false, b"GET / HTTP/1.0\r\n\r\n");
         for _ in 0..50 {
@@ -888,7 +1079,7 @@ mod tests {
         let mut frames = Vec::new();
         nat.poll(guest_mac, &mut |frame| frames.push(frame));
         // The SYN is answered with a SYN-ACK as soon as the socket is listening; the
-        // host connect has not finished, which is deliberate — the guest's handshake
+        // host connect has not finished, which is deliberate â€” the guest's handshake
         // does not wait for it.
         assert!(
             !frames.is_empty(),
@@ -902,5 +1093,569 @@ mod tests {
             assert_eq!(repr.dst_addr, guest_mac);
             assert_eq!(repr.ethertype, EthernetProtocol::Ipv4);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Teardown, and the flow table under a real workload
+    // ---------------------------------------------------------------------
+
+    /// What the guest asks for, and what the host answers with.
+    const REQUEST: &[u8] = b"GET / HTTP/1.0\r\n\r\n";
+    const REPLY: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nbye";
+
+    /// A host peer with the shape that raced: it reads the request, writes the
+    /// whole reply and **closes in the same breath** â€” no flush-and-wait, no
+    /// half-close, no waiting for the client to go first. The FIN chases the
+    /// reply bytes through the NAT's teardown, which is precisely the ordering
+    /// that was measured failing about one run in four during WHP phase 4.
+    ///
+    /// Serves `count` connections in turn and reports how many it completed.
+    fn write_and_close_server(count: usize) -> (SocketAddrV4, std::thread::JoinHandle<usize>) {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a local listener");
+        let remote = match listener.local_addr().expect("the listener has an address") {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => unreachable!("bound to an IPv4 address"),
+        };
+        let handle = std::thread::spawn(move || {
+            let mut served = 0usize;
+            for _ in 0..count {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buf = [0u8; 256];
+                // One read is enough: the request is one segment.
+                match stream.read(&mut buf) {
+                    Ok(read) if buf[..read] == *REQUEST => (),
+                    // A truncated or altered request is a failure of the guest â†’
+                    // host direction; stopping here makes the served count say so.
+                    _ => break,
+                }
+                if stream.write_all(REPLY).is_err() {
+                    break;
+                }
+                // The racy half: the close follows the write with nothing in
+                // between.
+                drop(stream);
+                served += 1;
+            }
+            served
+        });
+        (remote, handle)
+    }
+
+    /// What one exchange looked like from the guest's side.
+    #[derive(Debug)]
+    struct Exchange {
+        received: Vec<u8>,
+        /// Bytes the guest had received by the time it had processed the first
+        /// segment carrying a FIN. Equal to the whole reply iff nothing was lost
+        /// to the teardown.
+        at_fin: Option<usize>,
+        /// Whether the flow gave its slot back.
+        retired: bool,
+    }
+
+    /// Drives one complete exchange against a [`write_and_close_server`]: connect,
+    /// request, collect until the FIN, then close the guest's half and let the
+    /// flow retire.
+    fn one_exchange(peer: &mut GuestPeer) -> Exchange {
+        peer.handshake();
+        peer.send(false, true, false, REQUEST);
+
+        let mut received = Vec::new();
+        let mut at_fin = None;
+        for _ in 0..800 {
+            for segment in peer.poll() {
+                // Payload first: a FIN may ride on the same segment as the last
+                // bytes, and that is delivery, not loss.
+                received.extend_from_slice(&segment.payload);
+                if segment.fin && at_fin.is_none() {
+                    at_fin = Some(received.len());
+                }
+            }
+            if at_fin.is_some() {
+                break;
+            }
+            peer.send(false, true, false, &[]);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // The guest closes its half too, the way a client does once it has read
+        // the response, and the flow must then give its slot back.
+        peer.send(false, true, true, &[]);
+        let mut retired = false;
+        for _ in 0..400 {
+            for segment in peer.poll() {
+                received.extend_from_slice(&segment.payload);
+            }
+            if peer.nat.flow_count() == 0 {
+                retired = true;
+                break;
+            }
+            peer.send(false, true, false, &[]);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Exchange {
+            received,
+            at_fin,
+            retired,
+        }
+    }
+
+    /// Runs `count` short-lived exchanges through **one** NAT and asserts both
+    /// properties at once: nothing is lost to the teardown, and every slot comes
+    /// back.
+    fn run_exchanges(count: usize) {
+        let (remote, server) = write_and_close_server(count);
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::HostLocal),
+            remote,
+            41200,
+        );
+        for i in 0..count {
+            peer.reopen(41200 + u16::try_from(i).expect("the campaign fits in a port range"));
+            let exchange = one_exchange(&mut peer);
+            assert_eq!(
+                exchange.at_fin,
+                Some(REPLY.len()),
+                "exchange {i}: the guest must have every byte of the reply before the FIN, \
+                 got {:?} of {} (received {:?})",
+                exchange.at_fin,
+                REPLY.len(),
+                String::from_utf8_lossy(&exchange.received)
+            );
+            assert_eq!(
+                exchange.received, REPLY,
+                "exchange {i}: the reply must arrive unaltered"
+            );
+            assert!(exchange.retired, "exchange {i}: the flow must be retired");
+            assert_eq!(peer.nat.flow_count(), 0, "exchange {i}");
+        }
+        assert_eq!(
+            peer.nat.retired(),
+            count as u64,
+            "every flow must have been retired, not merely absent"
+        );
+        assert_eq!(
+            server.join().expect("the host peer thread"),
+            count,
+            "the host peer must have served every connection"
+        );
+    }
+
+    /// **The teardown race, settled.** A host peer that writes its reply and
+    /// closes in the same breath must never have its FIN overtake those bytes on
+    /// the way to the guest.
+    ///
+    /// This is the shape WHP phase 4 measured failing about one run in four and
+    /// worked around in `whp_usernet.rs` by holding the host's half open until the
+    /// guest closed first. Thirty exchanges is not a formality: at the old failure
+    /// rate the chance of all thirty passing is under one in ten billion.
+    ///
+    /// It also asserts the other half of the same teardown â€” that each of those
+    /// short-lived connections gives its flow slot back, which is the leak that
+    /// stalled a Debian install.
+    #[test]
+    fn a_host_peer_that_closes_in_the_same_breath_never_beats_its_bytes_to_the_guest() {
+        run_exchanges(30);
+    }
+
+    /// The same campaign, long enough to quote a number. Ignored by default
+    /// because it is seconds of wall clock, not milliseconds:
+    /// `cargo test -p virtio-net -- --ignored the_teardown_race`.
+    #[test]
+    #[ignore = "campaign: 250 exchanges, seconds of wall clock"]
+    fn the_teardown_race_holds_over_a_long_campaign() {
+        run_exchanges(250);
+    }
+
+    /// **The install workload**: more short-lived connections than the flow table
+    /// has slots, one after another, through one NAT. The table has to be empty
+    /// afterwards â€” `debian-installer` fetching its udebs is exactly this, and it
+    /// stalled at slot 64 because nothing ever looked at `flow_count()`.
+    #[test]
+    fn more_connections_than_there_are_slots_leave_an_empty_flow_table() {
+        run_exchanges(MAX_FLOWS + 8);
+    }
+
+    /// A connection the host end refuses must reach the guest as an RST, not as
+    /// silence. Silence costs the guest its own SYN timeout â€” minutes, on a Linux
+    /// default â€” where an RST costs it nothing.
+    ///
+    /// This is what the retirement reorder in [`TcpNat::poll`] buys: `abort()`
+    /// only moves smoltcp to `Closed`, and a socket removed from the set before
+    /// the next dispatch never emits the reset it was aborted to send.
+    #[test]
+    fn a_connection_the_host_refuses_reaches_the_guest_as_a_reset() {
+        use std::net::TcpListener;
+
+        // A port nothing is listening on: bind one, learn its number, drop it.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a local listener");
+        let remote = match listener.local_addr().expect("the listener has an address") {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => unreachable!("bound to an IPv4 address"),
+        };
+        drop(listener);
+
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::HostLocal),
+            remote,
+            41400,
+        );
+        peer.handshake();
+        assert_eq!(peer.nat.flow_count(), 1, "the SYN opened a flow");
+
+        // A wall-clock deadline rather than a poll count: how long the host
+        // takes to refuse differs by an order of magnitude between the two
+        // hosts (immediate on Linux loopback, a SYN retransmit or two on
+        // Windows), and the worst case is the connect timing out — which the
+        // flow answers the same way, one second later.
+        let mut saw_reset = false;
+        let deadline = StdInstant::now() + CONNECT_TIMEOUT + Duration::from_secs(5);
+        while StdInstant::now() < deadline {
+            for segment in peer.poll() {
+                saw_reset |= segment.rst;
+            }
+            if saw_reset && peer.nat.flow_count() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            saw_reset,
+            "a refused host connect must be answered with an RST, not with silence"
+        );
+        assert_eq!(
+            peer.nat.flow_count(),
+            0,
+            "a refused connection must not hold a flow slot"
+        );
+    }
+
+    /// A guest that walks away â€” reset, rebooted, or simply gone â€” must not hold
+    /// a flow slot for the life of the process. Nothing in TCP notices a peer that
+    /// stops existing, so the keep-alive pair has to.
+    ///
+    /// Driven offline (no host socket at all) with the keep-alive pair shortened,
+    /// because the property is about the guest's silence and nothing else.
+    #[test]
+    fn a_flow_the_guest_abandons_is_retired_by_the_keepalive() {
+        let mut nat = TcpNat::with_access(config(), HostAccess::Offline);
+        nat.set_keepalive(Duration::from_millis(20), Duration::from_millis(120));
+        let mut peer = GuestPeer::new(
+            nat,
+            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 80),
+            41500,
+        );
+        peer.handshake();
+        assert_eq!(peer.nat.flow_count(), 1);
+
+        // â€¦and then the guest says nothing at all, ever again.
+        let deadline = StdInstant::now() + Duration::from_secs(5);
+        while StdInstant::now() < deadline {
+            let _ = peer.poll();
+            if peer.nat.flow_count() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            peer.nat.flow_count(),
+            0,
+            "an abandoned flow must be retired by the idle timeout"
+        );
+        assert_eq!(peer.nat.retired(), 1);
+    }
+
+    /// A guest that resets a flow gets its slot back immediately, which is what a
+    /// rebooted guest's new stack does to every connection its old one left open.
+    #[test]
+    fn a_flow_the_guest_resets_is_retired_at_once() {
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::Offline),
+            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 8), 80),
+            41600,
+        );
+        peer.handshake();
+        assert_eq!(peer.nat.flow_count(), 1);
+        peer.send_rst();
+        let _ = peer.poll();
+        let _ = peer.poll();
+        assert_eq!(peer.nat.flow_count(), 0, "an RST ends the flow");
+        assert_eq!(peer.nat.retired(), 1);
+    }
+
+    /// A full table refuses politely â€” the SYN is dropped and counted, nothing
+    /// grows, nothing wedges â€” and it **recovers**: once the abandoned flows time
+    /// out the next connection is accepted like any other.
+    ///
+    /// The recovery half is the one that matters. A NAT that refuses at the limit
+    /// and never comes back is a NAT that a single burst disables for the life of
+    /// the VM.
+    #[test]
+    fn a_full_flow_table_refuses_politely_and_then_recovers() {
+        let mut nat = TcpNat::with_access(config(), HostAccess::Offline);
+        nat.set_keepalive(Duration::from_millis(20), Duration::from_millis(120));
+        let remote = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 80);
+        let mut peer = GuestPeer::new(nat, remote, 42000);
+
+        for i in 0..MAX_FLOWS {
+            peer.reopen(42000 + u16::try_from(i).expect("in range"));
+            peer.send(true, false, false, &[]);
+        }
+        let _ = peer.poll();
+        assert_eq!(peer.nat.flow_count(), MAX_FLOWS);
+        assert_eq!(peer.nat.refused_at_limit(), 0);
+
+        // Eight more, all refused, none of them growing anything.
+        for i in 0..8 {
+            peer.reopen(43000 + i);
+            peer.send(true, false, false, &[]);
+        }
+        let _ = peer.poll();
+        assert_eq!(
+            peer.nat.flow_count(),
+            MAX_FLOWS,
+            "the table must not grow past its bound"
+        );
+        assert_eq!(
+            peer.nat.refused_at_limit(),
+            8,
+            "every refusal must be counted, so a full table is visible from outside"
+        );
+
+        // The abandoned flows time out, and the NAT is usable again.
+        let deadline = StdInstant::now() + Duration::from_secs(10);
+        while StdInstant::now() < deadline && peer.nat.flow_count() > 0 {
+            let _ = peer.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(peer.nat.flow_count(), 0, "every slot must come back");
+
+        peer.reopen(44000);
+        peer.send(true, false, false, &[]);
+        let handshake = peer.poll();
+        assert!(
+            handshake.iter().any(|s| s.syn && s.ack),
+            "a NAT that has recovered must answer the next SYN: {handshake:?}"
+        );
+        assert_eq!(peer.nat.flow_count(), 1);
+    }
+
+    /// The guest's MSS is the segment's MTU minus the two headers, and no frame
+    /// the NAT emits ever exceeds the MTU.
+    ///
+    /// There is deliberately **no MSS clamp** here, and this test is where that
+    /// decision is written down. The NAT terminates TCP: the guest's connection
+    /// ends in `smoltcp` and a separate host socket carries the bytes onward, so
+    /// the guest's segment size is negotiated against *this* segment's 1500-byte
+    /// MTU and has nothing to do with the host uplink's. A short uplink MTU (WSL's
+    /// 1472, a VPN's 1400) is the host stack's problem to solve, on a connection
+    /// the guest never sees â€” which is exactly the opposite of the TAP path, where
+    /// the guest's own segments are bridged onto that uplink and an nftables MSS
+    /// clamp is what keeps them from being dropped.
+    #[test]
+    fn the_advertised_mss_is_the_segment_mtu_and_no_frame_exceeds_it() {
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::Offline),
+            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 10), 80),
+            41700,
+        );
+        peer.send(true, false, false, &[]);
+        let handshake = peer.poll();
+        let syn_ack = handshake
+            .iter()
+            .find(|s| s.syn && s.ack)
+            .expect("the SYN is answered");
+        assert_eq!(
+            syn_ack.mss,
+            Some(u16::try_from(MAX_FRAME_LEN - ETH_HEADER_LEN - 40).expect("an MSS fits in u16")),
+            "the guest must be offered the segment's own MTU minus the IPv4 and TCP headers"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Numbers
+    // ---------------------------------------------------------------------
+
+    /// Bytes moved in each direction of the bulk measurement.
+    const BULK_BYTES: usize = 2 * 1024 * 1024;
+    /// Connections opened and closed for the setup-rate measurement.
+    const SETUP_CONNECTIONS: usize = 100;
+
+    /// **The datapath, measured rather than guessed** â€” bulk TCP in both
+    /// directions, connection setup rate and request/response latency, so the next
+    /// change to this module can be shown to have helped or not.
+    ///
+    /// What it measures is the NAT's *own* cost: the guest side is driven in a
+    /// tight loop with no sleep, so the number is the smoltcp + copy + host-socket
+    /// path and nothing else. A real VM adds the virtio ring, the RX worker and
+    /// the pump's cadence â€” `PUMP_BUSY` (1 ms) per pass with something in flight,
+    /// which is the latency floor a real guest sees and the first thing to look at
+    /// if a measured round trip here is fast and a real one is not.
+    ///
+    /// `cargo test -p virtio-net -- --ignored --nocapture measure_the_datapath`
+    #[test]
+    #[ignore = "measurement: moves megabytes and prints numbers"]
+    fn measure_the_datapath() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // ---- host -> guest ----
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a local listener");
+        let remote = match listener.local_addr().expect("the listener has an address") {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => unreachable!("bound to an IPv4 address"),
+        };
+        let sender = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let chunk = vec![0xa5u8; 64 * 1024];
+            let mut sent = 0;
+            while sent < BULK_BYTES {
+                let take = chunk.len().min(BULK_BYTES - sent);
+                if stream.write_all(&chunk[..take]).is_err() {
+                    return;
+                }
+                sent += take;
+            }
+            let _ = stream.flush();
+            // Held open: this half measures throughput, not teardown.
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::HostLocal),
+            remote,
+            45000,
+        );
+        peer.handshake();
+        let start = StdInstant::now();
+        let mut received = 0usize;
+        let deadline = start + Duration::from_secs(60);
+        while received < BULK_BYTES && StdInstant::now() < deadline {
+            for segment in peer.poll() {
+                received += segment.payload.len();
+            }
+            peer.send(false, true, false, &[]);
+        }
+        let down = start.elapsed();
+        let down_mib = received as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "usernet host->guest: {:.1} MiB in {:.2} s = {:.1} MiB/s",
+            down_mib,
+            down.as_secs_f64(),
+            down_mib / down.as_secs_f64()
+        );
+        assert_eq!(received, BULK_BYTES, "the whole stream must arrive");
+        drop(peer);
+        sender.join().expect("the sender thread");
+
+        // ---- guest -> host ----
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a local listener");
+        let remote = match listener.local_addr().expect("the listener has an address") {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => unreachable!("bound to an IPv4 address"),
+        };
+        let drained = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&drained);
+        let sink = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => {
+                        counter.fetch_add(read, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::HostLocal),
+            remote,
+            45100,
+        );
+        peer.handshake();
+        // Segment-sized writes, kept inside the receive window the NAT advertises
+        // â€” a guest that overruns it just has its data dropped.
+        let mss = MAX_FRAME_LEN - ETH_HEADER_LEN - 40;
+        let payload = vec![0x5au8; mss];
+        let start = StdInstant::now();
+        let mut sent = 0usize;
+        let deadline = start + Duration::from_secs(60);
+        while sent < BULK_BYTES && StdInstant::now() < deadline {
+            let _ = peer.poll();
+            while sent < BULK_BYTES {
+                let inflight = peer.seq.wrapping_sub(peer.acked);
+                let take = payload.len().min(BULK_BYTES - sent);
+                if inflight + take as u32 > peer.window {
+                    break;
+                }
+                peer.send(false, true, false, &payload[..take]);
+                sent += take;
+            }
+        }
+        // Let the last of it drain out of smoltcp into the host socket.
+        let drain_deadline = StdInstant::now() + Duration::from_secs(10);
+        while drained.load(Ordering::Relaxed) < BULK_BYTES && StdInstant::now() < drain_deadline {
+            let _ = peer.poll();
+            peer.send(false, true, false, &[]);
+        }
+        let up = start.elapsed();
+        let up_mib = drained.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "usernet guest->host: {:.1} MiB in {:.2} s = {:.1} MiB/s",
+            up_mib,
+            up.as_secs_f64(),
+            up_mib / up.as_secs_f64()
+        );
+        assert_eq!(
+            drained.load(Ordering::Relaxed),
+            BULK_BYTES,
+            "the whole stream must reach the host"
+        );
+        drop(peer);
+        sink.join().expect("the sink thread");
+
+        // ---- connection setup rate and request/response latency ----
+        let (remote, server) = write_and_close_server(SETUP_CONNECTIONS);
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::HostLocal),
+            remote,
+            45200,
+        );
+        let mut latencies = Vec::with_capacity(SETUP_CONNECTIONS);
+        let start = StdInstant::now();
+        for i in 0..SETUP_CONNECTIONS {
+            peer.reopen(45200 + u16::try_from(i).expect("in range"));
+            let began = StdInstant::now();
+            let exchange = one_exchange(&mut peer);
+            assert_eq!(exchange.at_fin, Some(REPLY.len()));
+            latencies.push(began.elapsed());
+        }
+        let total = start.elapsed();
+        latencies.sort();
+        eprintln!(
+            "usernet connection setup+exchange: {SETUP_CONNECTIONS} in {:.2} s = {:.0}/s; \
+             latency min {:.2} ms, median {:.2} ms, max {:.2} ms",
+            total.as_secs_f64(),
+            SETUP_CONNECTIONS as f64 / total.as_secs_f64(),
+            latencies[0].as_secs_f64() * 1e3,
+            latencies[SETUP_CONNECTIONS / 2].as_secs_f64() * 1e3,
+            latencies[SETUP_CONNECTIONS - 1].as_secs_f64() * 1e3,
+        );
+        assert_eq!(
+            server.join().expect("the host peer thread"),
+            SETUP_CONNECTIONS
+        );
     }
 }

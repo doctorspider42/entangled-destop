@@ -56,6 +56,9 @@ const PANIC_MARKER: &str = "Kernel panic - not syncing";
 /// iteration of a 100-boot run is much slower than the steady state.
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 
+/// How often [`boot_once`] looks at the console while the guest runs.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
 /// What to boot and how.
 #[derive(Debug, Clone)]
 pub struct BootSpec {
@@ -94,6 +97,14 @@ pub struct BootSpec {
     /// it. Never a *real* controller: see [`GamepadAttach`].
     pub gamepad: GamepadAttach,
     pub deadline: Duration,
+    /// How often the harness inspects the captured console while the vCPUs run.
+    ///
+    /// The default is small because most boots are over in seconds and the
+    /// measurement wants a tight bound on "when did the marker appear". A run
+    /// that lasts hours wants the opposite: every poll copies and scans the
+    /// whole transcript, so at 2 ms a soak spends most of the host's CPU
+    /// re-reading its own log. See `tests/soak.rs`.
+    pub poll_interval: Duration,
 }
 
 /// How a boot attaches the virtio-input gamepad (GAME-2104).
@@ -149,6 +160,7 @@ impl BootSpec {
             shm_window: false,
             gamepad: GamepadAttach::None,
             deadline: DEFAULT_DEADLINE,
+            poll_interval: DEFAULT_POLL_INTERVAL,
         }
     }
 
@@ -209,6 +221,12 @@ impl BootSpec {
 
     pub fn with_transport(mut self, transport: VirtioTransport) -> Self {
         self.transport = transport;
+        self
+    }
+
+    /// How often the harness inspects the console; see [`Self::poll_interval`].
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
         self
     }
 
@@ -350,6 +368,19 @@ impl Write for Capture {
 }
 
 impl Capture {
+    fn len(&self) -> usize {
+        self.0.lock().map(|inner| inner.len()).unwrap_or(0)
+    }
+
+    fn tail(&self, bytes: usize) -> String {
+        let inner = match self.0.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let from = inner.len().saturating_sub(bytes);
+        String::from_utf8_lossy(&inner[from..]).into_owned()
+    }
+
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().map(|v| v.clone()).unwrap_or_default()).into_owned()
     }
@@ -425,6 +456,18 @@ impl VmHandle {
     /// Everything the guest has printed so far.
     pub fn serial(&self) -> String {
         self.capture.text()
+    }
+
+    /// Bytes the guest has written to the console so far, without copying them.
+    /// A soak samples this to tell a quiet guest from a chatty one.
+    pub fn serial_bytes(&self) -> usize {
+        self.capture.len()
+    }
+
+    /// The last `bytes` bytes of the console. A run that lasts hours cannot
+    /// afford to copy its whole transcript every time it wants the newest line.
+    pub fn serial_tail(&self, bytes: usize) -> String {
+        self.capture.tail(bytes)
     }
 
     /// How many times `needle` appears on the console. The reboot tests count
@@ -702,7 +745,7 @@ pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOu
             }
             done.load(Ordering::Acquire) || run_started.elapsed() >= spec.deadline
         },
-        Duration::from_millis(2),
+        spec.poll_interval,
     );
     let time_to_ready = time_to_ready.get();
     let panicked = panicked.get();

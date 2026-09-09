@@ -190,6 +190,10 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_input::gamepad::evdev::MAX_EVENTS_PER_POLL` | 256 | host `input_event` records folded into one `PadState` per tick; the remainder waits for the next one rather than being dropped | `virtio_input::gamepad::evdev::tests::one_poll_folds_a_bounded_number_of_events_and_leaves_the_rest` |
 | `virtio_net::MAX_FRAME_LEN` / `MAX_BUFFER_LEN` | 1514 / 1526 | bytes staged per frame, either direction | `net_queue::{tx_oversized_frames_are_dropped, an_oversized_host_frame_is_dropped_before_the_ring, rx_chain_too_small_for_the_frame_drops_it}` |
 | `virtio_net::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick | same shape as the blk budget test |
+| `virtio_net::usernet::MAX_FLOWS` | 64 | concurrent guest TCP connections the NAT terminates; each is two 16 KiB socket buffers and, briefly, one connect thread | `usernet::tcp::tests::{the_flow_count_is_capped, a_full_flow_table_refuses_politely_and_then_recovers}`, fuzz target `usernet_frames` |
+| `virtio_net::usernet::FLOW_IDLE_TIMEOUT` / `FLOW_KEEPALIVE` | 60 s / 15 s | how long a flow may go unanswered by the guest before it is aborted and its slot returned. Not a size bound but a *liveness* one, and load-bearing for the same reason: a guest that stops existing (reboot, reset, pause) otherwise holds all 64 for the life of the process | `usernet::tcp::tests::{a_flow_the_guest_abandons_is_retired_by_the_keepalive, a_full_flow_table_refuses_politely_and_then_recovers}` |
+| `virtio_net::usernet::MAX_QUEUED_FRAMES` | 256 | frames queued for a guest that has stopped draining its RX queue | `usernet::tests::the_guest_queue_is_bounded`, fuzz target `usernet_frames` |
+| `virtio_net::usernet::MAX_DNS_QUERIES` / `DNS_QUERY_TTL` | 64 / 5 s | outstanding forwarded DNS queries, and how long one is remembered — the guest picks how many it sends | `usernet::tests::a_guest_dns_query_is_forwarded_and_its_answer_comes_back` (the round trip), oldest-first eviction in `DnsRelay::forward` |
 | `virtio_sound::stream::MIN_PERIOD_BYTES` / `MAX_PERIOD_BYTES` | 64 / 64 KiB | one PCM period — and therefore both the payload of one playback message and the **room one capture buffer may grant** | `virtio_sound::stream::tests::period_and_buffer_geometry_is_bounded_and_never_divides_by_zero`, `snd_queue::{set_params_refuses_everything_the_device_never_advertised, capture_messages_the_stream_cannot_accept_are_answered_not_filled}` |
 | `virtio_sound::stream::MAX_BUFFER_BYTES` | 1 MiB | the host PCM ring a guest can make the device allocate, **per stream** (`buffer_bytes` + one period of slack). On TX it bounds the bytes queued; on RX it bounds the room the un-retired buffers *reserve*, which is claimed at post time | same tests, plus `virtio_sound::device::tests::the_ring_capacity_follows_the_negotiated_buffer`, `snd_queue::flooding_the_capture_ring_beyond_the_negotiated_buffer_is_an_io_error` |
 | `virtio_sound::stream::MIN_PERIODS` / `MAX_PERIODS` | 2 / 1024 | periods one buffer may be divided into — the buffer must be a whole number of them | same tests |
@@ -422,6 +426,36 @@ Blob resources themselves (`virtio_gpu::blob`) are the device half:
   reports as open. `usernet::tcp::service_flows` propagates the guest's FIN as
   `Shutdown::Write` on the host stream; a unit test that closes both halves at
   once cannot see that class of bug.
+
+  **Five things about `usernet::tcp` that are load-bearing and were each a bug
+  or nearly one:**
+  - **A flow is retired only after the stack has spoken.** `poll` runs
+    `iface.poll` → `service_flows` → `iface.poll` → *then* removes the finished
+    sockets. `socket.abort()` merely moves smoltcp to `Closed`; the RST it was
+    aborted to send is emitted by the next dispatch, so a socket removed before
+    that dispatch never sends it — a guest whose host connect was refused got
+    silence and waited out its own SYN timeout. Same reordering is what lets the
+    ACK for a guest's final FIN go out before its socket disappears.
+  - **Every socket carries a keep-alive pair** (`FLOW_KEEPALIVE`,
+    `FLOW_IDLE_TIMEOUT`). Nothing in TCP notices a peer that stops existing, and
+    the guest is a peer that can: a reboot, a device reset, a paused VM. Without
+    it 64 abandoned flows wedge the NAT for the life of the process, and a
+    device reset does *not* rebuild the backend.
+  - **The flow table is observable** — `UserNetBackend::{flow_count,
+    flows_retired, flows_refused_at_limit}`. The leak above was invisible for
+    exactly as long as nothing outside the crate could see the number.
+  - **There is no MSS clamp and there must not be one.** The NAT *terminates*
+    TCP: the guest's connection ends in smoltcp and a separate host socket
+    carries the bytes on, so the guest's MSS is negotiated against this
+    segment's own 1500-byte MTU and a short host uplink (WSL's 1472, a VPN's
+    1400) is the host stack's problem on a connection the guest never sees.
+    That is the opposite of the TAP path, where the guest's own segments are
+    bridged onto that uplink and the nftables clamp in `scripts/setup-tap.sh`
+    is what keeps them from being dropped.
+  - **UDP is DHCP and DNS and nothing else.** There is no general UDP NAT, so
+    QUIC, NTP and mDNS do not work through this backend; anything else on UDP
+    is counted as `dropped_unsupported`. A test says so, and it is the test that
+    has to change the day one is added.
 - **gpu** (EPIC 8): wire format in `virtio_gpu::protocol` (constants, `CtrlHdr`,
   one struct per command, lengths asserted at compile time), host resources in
   `virtio_gpu::resource`, device in `virtio_gpu::device`. Only the two
