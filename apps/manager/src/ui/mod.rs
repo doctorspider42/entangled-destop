@@ -7,6 +7,7 @@ pub mod dialogs;
 pub mod disks;
 pub mod header;
 pub mod logpane;
+pub mod snapshots;
 pub mod toasts;
 
 use egui::{
@@ -86,6 +87,11 @@ pub fn ghost_button(ui: &mut Ui, text: &str, enabled: bool, tint: Color32) -> Re
     response
 }
 
+/// Inset between a card's border and its contents, on every edge. Named
+/// because a caller that sizes a card from its own measured content — the
+/// Snapshots rows, whose refusals wrap — has to subtract exactly this.
+pub const CARD_PAD: f32 = 15.0;
+
 /// A fixed-size interactive surface with the card look: rounded, faintly lit
 /// border, an accent bar on the left and a hover animation.
 pub fn card<R>(
@@ -131,7 +137,7 @@ pub fn card<R>(
 
     let mut child = ui.new_child(
         UiBuilder::new()
-            .max_rect(rect.shrink(15.0))
+            .max_rect(rect.shrink(CARD_PAD))
             .layout(Layout::top_down(Align::Min)),
     );
     let inner = add(&mut child, t);
@@ -427,7 +433,13 @@ pub fn banner(ui: &mut Ui, tint: Color32, text: &str, action: Option<&str>) -> b
 }
 
 /// The animated status pill (GUI-1601 + GUI-1606): a pulsing dot for a running
-/// VM, the entangled-particle spinner while installing.
+/// VM, the entangled-particle spinner while installing or suspending, a quiet
+/// filled ring for a machine parked in a file.
+///
+/// The indicator carries the *kind* of state and the colour carries which one:
+/// anything that spins is work in progress, anything static is at rest. That is
+/// what keeps Suspending and Suspended — one word apart — from being read as
+/// each other at a glance.
 pub fn status_badge(ui: &mut Ui, status: crate::app::Status, time: f64) {
     let text = status.label();
     let color = status.color();
@@ -435,7 +447,7 @@ pub fn status_badge(ui: &mut Ui, status: crate::app::Status, time: f64) {
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
     let indicator = 22.0;
     let size = Vec2::new(galley.size().x + indicator + 20.0, 22.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
 
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(11), color.gamma_multiply(0.12));
@@ -452,8 +464,18 @@ pub fn status_badge(ui: &mut Ui, status: crate::app::Status, time: f64) {
     )
     .with_max_x(rect.left() + 5.0 + indicator);
     match status {
-        crate::app::Status::Installing => {
+        crate::app::Status::Installing | crate::app::Status::Suspending => {
             crate::logo::paint_particle_spinner(painter, indicator_rect, time)
+        }
+        crate::app::Status::Suspended => {
+            // At rest, but holding something: a filled core inside a complete
+            // ring, and nothing moving.
+            painter.circle_stroke(
+                indicator_rect.center(),
+                5.5,
+                Stroke::new(1.2_f32, color.gamma_multiply(0.55)),
+            );
+            painter.circle_filled(indicator_rect.center(), 2.8, color);
         }
         crate::app::Status::Running => {
             // Breathing halo: alive without being loud.
@@ -489,4 +511,5 @@ pub fn status_badge(ui: &mut Ui, status: crate::app::Status, time: f64) {
         galley,
         Color32::TRANSPARENT,
     );
+    response.on_hover_text(status.tooltip());
 }

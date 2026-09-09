@@ -699,6 +699,7 @@ kwantowej (motyw splątania). Stack: egui/eframe na wgpu — natywnie, wydajnie.
 | GUI-1604 | Usuwanie maszyny (dysk + profil) z potwierdzeniem | P0 |
 | GUI-1605 | Podgląd logu instalacji/konsoli w UI | P1 |
 | GUI-1606 | Motyw "quantum": ciemny, akcenty cyan/fiolet, subtelne animacje | P0 |
+| GUI-1607 | Uśpienie/wznowienie maszyny z karty + widok "Saved sessions" (ADR-0006): odmowy pokazane **przed** kliknięciem, kasowanie z potwierdzeniem | P1 |
 
 ## EPIC 17 — Natywny host Windows (WHP)
 
@@ -817,7 +818,7 @@ linuksowy).
 | GAME-2101 | Scanout bez kopii (zależy od VEN-2005 / GPU-fazy 3) — dziś każda klatka jedzie GPU→RAM→GPU, ~500 MB/s przy 1080p60 | P0 | |
 | GAME-2102 | `virtio-sound` (PCM playback, potem capture) + backend hosta: PipeWire/ALSA na Linuksie, WASAPI na Windowsie | P0 | playback zrobiony (`crates/virtio-sound`, `[sound] enabled`); ALSA przez `dlopen` (licencja — patrz `src/alsa.rs`), WASAPI shared mode; capture = faza 2 |
 | GAME-2103 | Venus (EPIC 20) jako ścieżka dla Vulkana/Protona | P0 | |
-| GAME-2104 | Pad: `virtio-input` z osiową mapą kontrolera + przechwytywanie z hosta (XInput/evdev), hotplug | P1 | |
+| GAME-2104 | Pad: `virtio-input` z osiową mapą kontrolera + przechwytywanie z hosta (XInput/evdev), hotplug | P1 | zrobione (`Profile::Gamepad`, `[gamepad] enabled`): deskryptor skopiowany z jądrowego `xpad` (11 przycisków `BTN_GAMEPAD`, `ABS_X/Y/RX/RY/Z/RZ` + hat), więc `joydev` daje `/dev/input/js0`, udev taguje `ID_INPUT_JOYSTICK`, a SDL wyprowadza mapowanie z samych capability — bez wpisu w bazie kontrolerów i bez podszywania się pod VID/PID Microsoftu. Host: evdev pisany ręcznie (`libc`, cztery ioctl-e — bez `gilrs`) i XInput; źródła raportują *stan*, pompa liczy różnicę, więc hotplug w obie strony wychodzi sam. Bez martwej strefy po stronie hosta. Akceptacja na żywym gościu (`tests/boot/tests/gamepad.rs`, dwa boot-y): jądro rejestruje `js=1 keys=11 axes=8 absx=-32768:32767:16:128`, a wpięcie/wypięcie pada w trakcie pracy daje dokładnie trzy raporty (wciśnięcie, zwolnienie *przy wypięciu*, nowy pad) i ciszę potem. Wymagało `CONFIG_INPUT_JOYDEV=y` w jądrze bootstrap — to osobny symbol od `CONFIG_INPUT_EVDEV`. Zostaje: rumble (`EV_FF` ↔ `XInputSetState`), drugi gracz, przełącznik w GUI, oraz drobiazg — tablet też trafia do `joydev`, więc zajmuje `js0`, a pad dostaje `js1`.
 | GAME-2105 | Pacing klatek i vsync zamiast wyścigu: prezentacja związana z fence'em gościa, pomiar 1%/0.1% low | P1 | zmierzone i wyjaśnione (aneks do ADR-0004 z 2026-09-08): `--frame-stats` + rozbicie interwału na quiet/submit/service, 1%/0.1% low, duplicate/dropped; `[display] refresh_hz` (gość prezentuje dokładnie w rytmie EDID-owego odświeżania); readback w izolowanym rendererze 30 ms → 13 ms, 26 → 50 fps |
 | GAME-2106 | Przypinanie vCPU do rdzeni i duże strony pamięci (opcjonalne, mierzone — nie na wiarę) | P2 | |
 | GAME-2107 | Akceptacja: `vkmark`/`glmark2`, `vkcube`, jeden realny tytuł przez Protona; liczby przed/po dla każdego kroku wyżej | P0 | |

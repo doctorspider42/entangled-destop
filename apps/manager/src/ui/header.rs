@@ -93,189 +93,225 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                 .inner_margin(egui::Margin::symmetric(14, 18)),
         )
         .show(ctx, |ui| {
+            // The status box claims the bottom of the column first; the
+            // navigation scrolls in whatever is left.
+            egui::TopBottomPanel::bottom("host-status")
+                .frame(egui::Frame::new().inner_margin(egui::Margin {
+                    top: 12,
+                    ..egui::Margin::ZERO
+                }))
+                .show_separator_line(false)
+                .show_inside(ui, |ui| host_status(ui, app));
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| navigation(ui, app, actions));
+        });
+}
+
+/// The navigation column's items. Its own function because it lives inside a
+/// scroll area now: five entries plus the status box no longer fit a short
+/// window, and an item that slides underneath the box is an item nobody can
+/// click.
+fn navigation(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
+    ui.label(
+        RichText::new("LIBRARY")
+            .monospace()
+            .size(10.0)
+            .color(theme::TEXT_FAINT),
+    );
+    ui.add_space(8.0);
+    if nav_item(
+        ui,
+        "Machines",
+        "Your virtual computers",
+        app.view == crate::app::View::Machines,
+        theme::CYAN,
+    )
+    .clicked()
+        && app.view != crate::app::View::Machines
+    {
+        actions.push(Action::SwitchView(crate::app::View::Machines));
+    }
+    if nav_item(
+        ui,
+        "Storage",
+        "Disk images and attachments",
+        app.view == crate::app::View::Disks,
+        theme::VIOLET,
+    )
+    .clicked()
+        && app.view != crate::app::View::Disks
+    {
+        actions.push(Action::SwitchView(crate::app::View::Disks));
+    }
+    // Saved sessions (ADR-0006). Beside Storage rather than under
+    // Operations because that is what they are: large files in the VM
+    // directory that a person browses, keeps and deletes. The count is
+    // in the detail line so the item is worth glancing at.
+    let saved = app.scan.snapshots.len();
+    if nav_item(
+        ui,
+        "Snapshots",
+        &match saved {
+            0 => "Suspended machines, ready to resume".to_string(),
+            1 => "1 saved session".to_string(),
+            n => format!("{n} saved sessions"),
+        },
+        app.view == crate::app::View::Snapshots,
+        if saved > 0 {
+            theme::VIOLET
+        } else {
+            theme::TEXT_DIM
+        },
+    )
+    .clicked()
+        && app.view != crate::app::View::Snapshots
+    {
+        actions.push(Action::SwitchView(crate::app::View::Snapshots));
+    }
+
+    ui.add_space(20.0);
+    ui.label(
+        RichText::new("OPERATIONS")
+            .monospace()
+            .size(10.0)
+            .color(theme::TEXT_FAINT),
+    );
+    ui.add_space(8.0);
+    // Diagnostics carries the colour of the worst thing it knows: red
+    // when the engine is missing, amber while a check runs, quiet
+    // otherwise. A nav item that shouts only when something is wrong.
+    let diagnostics_tint = if app.engine.is_err() {
+        theme::ERR
+    } else if app.doctor_running {
+        theme::WARN
+    } else {
+        theme::OK
+    };
+    if nav_item(
+        ui,
+        "Diagnostics",
+        "Engine, backend and host readiness",
+        app.view == crate::app::View::Diagnostics,
+        diagnostics_tint,
+    )
+    .clicked()
+        && app.view != crate::app::View::Diagnostics
+    {
+        actions.push(Action::SwitchView(crate::app::View::Diagnostics));
+    }
+    let activity = if app.log_open {
+        "Hide activity"
+    } else {
+        "Activity"
+    };
+    let activity_tint = if app.supervisor.any_active() {
+        theme::CYAN
+    } else if app.mock_mode {
+        theme::VIOLET
+    } else {
+        theme::OK
+    };
+    if nav_item(
+        ui,
+        activity,
+        "Installs, starts and console output",
+        app.log_open,
+        activity_tint,
+    )
+    .clicked()
+    {
+        actions.push(Action::ToggleLogPane);
+    }
+    let (refresh_title, refresh_detail, refresh_active, refresh_tint) = match app.refresh_state() {
+        RefreshState::Idle => (
+            "Refresh",
+            "Scan the machine library now",
+            false,
+            theme::TEXT_DIM,
+        ),
+        RefreshState::Scanning => (
+            "Refreshing…",
+            "Looking for machine changes",
+            true,
+            theme::CYAN,
+        ),
+        RefreshState::Complete => ("Up to date", "Machine library refreshed", true, theme::OK),
+    };
+    if nav_item(
+        ui,
+        refresh_title,
+        refresh_detail,
+        refresh_active,
+        refresh_tint,
+    )
+    .clicked()
+    {
+        actions.push(Action::Refresh);
+    }
+}
+
+/// The status box pinned to the bottom of the navigation column.
+///
+/// A bottom panel inside the side panel rather than a bottom-up layout after
+/// the items: the box has to claim its space *before* the navigation does, or
+/// a window shorter than the list slides the last item underneath it. Not
+/// hypothetical — adding a fifth item is what found it.
+fn host_status(ui: &mut egui::Ui, app: &ManagerApp) {
+    egui::Frame::new()
+        .fill(theme::INSET)
+        .stroke(Stroke::new(1.0_f32, theme::STROKE))
+        .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
+        .inner_margin(egui::Margin::same(11))
+        .show(ui, |ui| {
+            let count = app.scan.vms.len();
+            let active = app
+                .scan
+                .vms
+                .iter()
+                .filter(|vm| app.is_busy(&vm.name))
+                .count();
             ui.label(
-                RichText::new("LIBRARY")
+                RichText::new("HOST STATUS")
                     .monospace()
                     .size(10.0)
                     .color(theme::TEXT_FAINT),
             );
-            ui.add_space(8.0);
-            if nav_item(
-                ui,
-                "Machines",
-                "Your virtual computers",
-                app.view == crate::app::View::Machines,
-                theme::CYAN,
-            )
-            .clicked()
-                && app.view != crate::app::View::Machines
-            {
-                actions.push(Action::SwitchView(crate::app::View::Machines));
-            }
-            if nav_item(
-                ui,
-                "Storage",
-                "Disk images and attachments",
-                app.view == crate::app::View::Disks,
-                theme::VIOLET,
-            )
-            .clicked()
-                && app.view != crate::app::View::Disks
-            {
-                actions.push(Action::SwitchView(crate::app::View::Disks));
-            }
-
-            ui.add_space(20.0);
+            ui.add_space(5.0);
             ui.label(
-                RichText::new("OPERATIONS")
-                    .monospace()
-                    .size(10.0)
-                    .color(theme::TEXT_FAINT),
+                RichText::new(format!("{count} machines · {active} active"))
+                    .size(12.5)
+                    .color(theme::TEXT),
             );
-            ui.add_space(8.0);
-            // Diagnostics carries the colour of the worst thing it knows: red
-            // when the engine is missing, amber while a check runs, quiet
-            // otherwise. A nav item that shouts only when something is wrong.
-            let diagnostics_tint = if app.engine.is_err() {
-                theme::ERR
-            } else if app.doctor_running {
-                theme::WARN
-            } else {
-                theme::OK
-            };
-            if nav_item(
-                ui,
-                "Diagnostics",
-                "Engine, backend and host readiness",
-                app.view == crate::app::View::Diagnostics,
-                diagnostics_tint,
-            )
-            .clicked()
-                && app.view != crate::app::View::Diagnostics
-            {
-                actions.push(Action::SwitchView(crate::app::View::Diagnostics));
+            if let Some(cpu) = app.stats.host.cpu_percent {
+                ui.label(ui::faint(format!("CPU {cpu:.0}%")));
             }
-            let activity = if app.log_open {
-                "Hide activity"
-            } else {
-                "Activity"
-            };
-            let activity_tint = if app.supervisor.any_active() {
-                theme::CYAN
-            } else if app.mock_mode {
-                theme::VIOLET
-            } else {
-                theme::OK
-            };
-            if nav_item(
-                ui,
-                activity,
-                "Installs, starts and console output",
-                app.log_open,
-                activity_tint,
-            )
-            .clicked()
-            {
-                actions.push(Action::ToggleLogPane);
+            if let Some((free, _)) = app.stats.host.vm_dir_space {
+                ui.label(ui::faint(format!(
+                    "{} storage free",
+                    crate::discovery::format_bytes(free)
+                )));
             }
-            let (refresh_title, refresh_detail, refresh_active, refresh_tint) =
-                match app.refresh_state() {
-                    RefreshState::Idle => (
-                        "Refresh",
-                        "Scan the machine library now",
-                        false,
-                        theme::TEXT_DIM,
-                    ),
-                    RefreshState::Scanning => (
-                        "Refreshing…",
-                        "Looking for machine changes",
-                        true,
-                        theme::CYAN,
-                    ),
-                    RefreshState::Complete => {
-                        ("Up to date", "Machine library refreshed", true, theme::OK)
-                    }
-                };
-            if nav_item(
-                ui,
-                refresh_title,
-                refresh_detail,
-                refresh_active,
-                refresh_tint,
+            ui.add_space(5.0);
+            ui.add(
+                egui::Label::new(ui::faint(app.settings.vm_dir.display().to_string())).truncate(),
             )
-            .clicked()
-            {
-                actions.push(Action::Refresh);
-            }
-
-            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(ui.available_width(), 146.0),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        egui::Frame::new()
-                            .fill(theme::INSET)
-                            .stroke(Stroke::new(1.0_f32, theme::STROKE))
-                            .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
-                            .inner_margin(egui::Margin::same(11))
-                            .show(ui, |ui| {
-                                let count = app.scan.vms.len();
-                                let active = app
-                                    .scan
-                                    .vms
-                                    .iter()
-                                    .filter(|vm| app.is_busy(&vm.name))
-                                    .count();
-                                ui.label(
-                                    RichText::new("HOST STATUS")
-                                        .monospace()
-                                        .size(10.0)
-                                        .color(theme::TEXT_FAINT),
-                                );
-                                ui.add_space(5.0);
-                                ui.label(
-                                    RichText::new(format!("{count} machines · {active} active"))
-                                        .size(12.5)
-                                        .color(theme::TEXT),
-                                );
-                                if let Some(cpu) = app.stats.host.cpu_percent {
-                                    ui.label(ui::faint(format!("CPU {cpu:.0}%")));
-                                }
-                                if let Some((free, _)) = app.stats.host.vm_dir_space {
-                                    ui.label(ui::faint(format!(
-                                        "{} storage free",
-                                        crate::discovery::format_bytes(free)
-                                    )));
-                                }
-                                ui.add_space(5.0);
-                                ui.add(
-                                    egui::Label::new(ui::faint(
-                                        app.settings.vm_dir.display().to_string(),
-                                    ))
-                                    .truncate(),
-                                )
-                                .on_hover_text(app.settings.vm_dir.display().to_string());
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new(if app.settings.animations_enabled {
-                                        "MOTION ON"
-                                    } else {
-                                        "MOTION OFF"
-                                    })
-                                    .monospace()
-                                    .size(9.5)
-                                    .color(
-                                        if app.settings.animations_enabled {
-                                            theme::CYAN_DEEP
-                                        } else {
-                                            theme::TEXT_FAINT
-                                        },
-                                    ),
-                                );
-                            });
-                    },
-                );
-            });
+            .on_hover_text(app.settings.vm_dir.display().to_string());
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(if app.settings.animations_enabled {
+                    "MOTION ON"
+                } else {
+                    "MOTION OFF"
+                })
+                .monospace()
+                .size(9.5)
+                .color(if app.settings.animations_enabled {
+                    theme::CYAN_DEEP
+                } else {
+                    theme::TEXT_FAINT
+                }),
+            );
         });
 }
 

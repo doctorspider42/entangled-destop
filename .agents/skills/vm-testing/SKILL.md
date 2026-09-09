@@ -96,6 +96,23 @@ unit tests live with their crates.
   guest half of the user-mode-NAT acceptance
   (`crates/vmm-core/tests/whp_usernet.rs`). TX alone is a SYN; only the echo
   proves RX delivery.
+- `entangled.padprobe=<n>` reports what the guest kernel made of the
+  virtio-input gamepad — name, `input_id`, whether `joydev` bound it and its
+  `js*` node opens, how many `KEY`/`ABS` codes the input core registered, and
+  the `EVIOCGABS` ranges — then echoes **at most** `n` events, stopping after
+  1.5 s of silence. That ceiling-plus-silence shape is the point: a host that
+  asks for more than it injects gets "and nothing after that" answered, which
+  is how `tests/boot/tests/gamepad.rs` proves an unplugged controller stops
+  producing events instead of only proving a plugged-in one starts.
+  **It needs the bootstrap kernel**: `CONFIG_INPUT_JOYDEV` is a separate symbol
+  from `CONFIG_INPUT_EVDEV` and is a module in the Debian-installer kernel, so
+  on the fallback the pad has no `js*` for a reason that is nothing to do with
+  the device. The test self-skips there — and for the harder case, a
+  `artifacts/bootstrap/vmlinuz` built *before* that option was added, the probe
+  reports `joydev=` (is the handler registered at all, from
+  `/proc/bus/input/handlers`) and the test skips only the `js*` assertions,
+  saying so. A guest probe that can distinguish "the device was refused" from
+  "the kernel cannot answer" is worth the four extra lines every time.
 - Sources: `guest/test-rootfs/init-rs` (static musl init), built by
   `scripts/build-test-initramfs.sh`; kernel via `scripts/fetch-test-kernel.sh`.
 
@@ -628,3 +645,25 @@ waiting for. Seen on both hosts, always green when rerun alone
 the single test — and if you need a verdict under load, run the boot tests
 sequentially (`--test-threads=1`) rather than treating one red run as a
 regression.
+
+### Boot the shape the profiles use, not just the small one
+
+Until 2026-09-08 every UEFI boot test built a 2048 MiB guest, so the whole
+high-RAM split — two guest-memory regions, RAM continuing at 4 GiB, a 64-bit
+PCI aperture above the top of RAM — had no boot coverage at all, while the
+desktop profiles have asked for 4096 MiB since `examples/ubuntu-desktop-live.toml`
+was written. `tests/boot/tests/uefi_highmem.rs` and its WHP twin
+`crates/vmm-core/tests/whp_highmem.rs` close that: 4096 MiB, both regions
+mapped, `PlatformAddHobCB: HighMemory` in the log, `Pci64Base` one page past
+the end of RAM, ACPI installed, no `X64 Exception`, Boot Manager reached. 1.5 s
+on KVM, 2.8 s on WHP — a size, not a duration, so there is no excuse for the
+next machine-wide constant to be tested only at 2 GiB.
+
+They also compare the PVH hand-off block byte-for-byte across the run. That is
+the assertion that turns "the firmware took a `#GP` in `AcpiPlatformDxe`" into
+a sentence: EDK2 re-reads `hvm_start_info.rsdp_paddr` out of guest memory at
+the end of DXE, so a scribbled block surfaces half a boot later as a
+non-canonical dereference with no hint of what happened (ADR-0003).
+
+Note what they deliberately do **not** assert: the firmware's CPU count. That
+is the load flake above, and a regression test must not inherit it.

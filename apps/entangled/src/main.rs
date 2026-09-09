@@ -461,7 +461,7 @@ fn inspect_snapshot(path: &Path) -> Result<(), String> {
     println!("  vm             {}", meta.vm_name);
     println!(
         "  taken          {} (unix {})",
-        format_unix(meta.created_unix),
+        vm_snapshot::meta::format_unix(meta.created_unix),
         meta.created_unix
     );
     println!("  written by     {}", meta.writer);
@@ -517,17 +517,6 @@ fn inspect_snapshot(path: &Path) -> Result<(), String> {
         );
     }
     Ok(())
-}
-
-/// A Unix timestamp as `YYYY-MM-DD HH:MM:SS` UTC, using the same civil-date
-/// arithmetic the RTC does — no date crate in the graph, and none needed for
-/// one line of output.
-fn format_unix(seconds: i64) -> String {
-    let t = machine_x86::rtc::civil_from_unix(seconds);
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
-        t.year, t.month, t.day, t.hour, t.minute, t.second
-    )
 }
 
 /// `entangled resume <file>` (ADR-0006).

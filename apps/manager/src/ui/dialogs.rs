@@ -713,6 +713,20 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             520.0,
             |ui| resize_disk_body(ui, state, actions),
         ),
+        Modal::DeleteSnapshot(state) => frame(
+            ctx,
+            "delete-snapshot",
+            "Forget this saved session?",
+            520.0,
+            |ui| delete_snapshot_body(ui, state, actions),
+        ),
+        Modal::DiscardSnapshot(state) => frame(
+            ctx,
+            "discard-snapshot",
+            &format!("Start {} from scratch?", state.vm),
+            520.0,
+            |ui| discard_snapshot_body(ui, state, actions),
+        ),
     };
 
     if closed {
@@ -980,7 +994,10 @@ fn edit_vm_body(ui: &mut egui::Ui, state: &mut crate::app::EditVmState, actions:
                 (
                     EditVmSection::NetworkDisplay,
                     "Network & display",
-                    "Connectivity, screen, 3D, sound",
+                    // One line at 184 px, which is what the card is: a second
+                    // line is clipped, and "3D" is the one word this list can
+                    // spare — it sits directly under Screen in the panel.
+                    "Network, screen, sound, gamepad",
                     theme::OK,
                 ),
                 (
@@ -1558,6 +1575,25 @@ fn edit_network_display(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
             );
         }
     }
+
+    ui.add_space(12.0);
+    ui::form_row(
+        ui,
+        "GAMEPAD",
+        "Gives the machine a game controller, and passes one plugged into this computer \
+         through to it. Off by default: an existing machine keeps exactly the hardware it \
+         had, and a guest that gains a joystick can change what its games do.",
+        |ui, _| {
+            ui.checkbox(&mut form.gamepad, "Give this machine a gamepad")
+                .on_hover_text(
+                    "An Xbox-shaped controller the guest recognises with no drivers from \
+                     us. Entangled reads whichever pad this computer has — XInput on \
+                     Windows, evdev on Linux — and the guest sees one either way, even \
+                     with nothing plugged in yet, so a pad can be connected while the \
+                     machine is running.",
+                );
+        },
+    );
 }
 
 /// One sentence per sound backend, for the hover in the picker.
@@ -1881,6 +1917,95 @@ fn resize_disk_body(
             .is_ok_and(|bytes| bytes >= state.row.apparent_bytes);
         if ui::ghost_button(ui, "Grow the disk", ready, theme::CYAN).clicked() {
             actions.push(Action::SubmitResizeDisk);
+        }
+        if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+            actions.push(Action::CloseModal);
+        }
+    });
+}
+
+/// The snapshot delete confirmation.
+///
+/// No typed name here, unlike deleting a machine: what is lost is one session's
+/// worth of work in progress, not a computer and its disks, and a confirmation
+/// heavy enough for the second is theatre for the first. What the dialog owes
+/// the user instead is an exact statement of what goes and what stays — and
+/// those two sentences are the whole content.
+fn delete_snapshot_body(
+    ui: &mut egui::Ui,
+    state: &crate::app::DeleteSnapshotState,
+    actions: &mut Vec<Action>,
+) {
+    ui.label(
+        RichText::new(crate::snapshots::what_is_lost(&state.row))
+            .color(theme::TEXT)
+            .size(13.0),
+    );
+    ui.add_space(12.0);
+    ui.label(ui::faint(format!(
+        "− {}  ({})",
+        state.row.path.display(),
+        format_bytes(state.row.apparent_bytes)
+    )));
+    if let Some(allocated) = state.row.allocated_bytes {
+        ui.label(ui::faint(format!(
+            "   {} of drive space comes back",
+            format_bytes(allocated)
+        )));
+    }
+    if let Some(error) = &state.error {
+        ui.add_space(8.0);
+        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+    }
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        if ui::ghost_button(ui, "Forget it", true, theme::ERR).clicked() {
+            actions.push(Action::ConfirmDeleteSnapshot);
+        }
+        if ui::ghost_button(ui, "Keep it", true, theme::TEXT_DIM).clicked() {
+            actions.push(Action::CloseModal);
+        }
+    });
+}
+
+/// "Start fresh" on a suspended machine.
+///
+/// The saved session is deleted *before* the machine starts, deliberately. A
+/// cold-booted guest writes to the disk within seconds, and a snapshot pinned
+/// to that disk as it was is then a file the engine will refuse — so keeping it
+/// would mean a card that goes on offering a Resume that cannot work. Better to
+/// throw it away with the user watching than to leave a trap.
+fn discard_snapshot_body(
+    ui: &mut egui::Ui,
+    state: &crate::app::DiscardSnapshotState,
+    actions: &mut Vec<Action>,
+) {
+    ui.label(
+        RichText::new(format!(
+            "'{}' has a saved session. Booting it from scratch cannot keep that: the guest \
+             writes to the same disk the session is pinned to, and a snapshot whose disk has \
+             moved on can no longer be restored.",
+            state.vm
+        ))
+        .color(theme::TEXT)
+        .size(13.0),
+    );
+    ui.add_space(12.0);
+    ui.label(ui::dim(crate::snapshots::what_is_lost(&state.row)));
+    ui.add_space(8.0);
+    ui.label(ui::faint(format!(
+        "− {}  ({})",
+        state.row.path.display(),
+        format_bytes(state.row.apparent_bytes)
+    )));
+    if let Some(error) = &state.error {
+        ui.add_space(8.0);
+        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+    }
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        if ui::ghost_button(ui, "Discard it and start", true, theme::WARN).clicked() {
+            actions.push(Action::ConfirmDiscardSnapshot);
         }
         if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
             actions.push(Action::CloseModal);

@@ -67,6 +67,10 @@ impl Harness {
         Self::around(InputDevice::absolute_pointer())
     }
 
+    fn gamepad() -> Self {
+        Self::around(InputDevice::gamepad())
+    }
+
     fn around(device: InputDevice) -> Self {
         let handle = device.handle();
         let mem = Arc::new(guest_memory(MEM_SIZE));
@@ -344,6 +348,119 @@ fn tablet_config_space_probes_as_an_absolute_pointer() {
     // Any other axis, and auto-repeat, are absent.
     assert!(h.probe(VIRTIO_INPUT_CFG_ABS_INFO, 0x02).is_empty());
     assert!(h.probe(VIRTIO_INPUT_CFG_EV_BITS, ev::REP as u8).is_empty());
+}
+
+/// The pad over a real transport, not only over `config::selection`: what a
+/// guest driver reads out of the register window during probe is what decides
+/// whether `joydev` claims it, and that path runs through the transport's
+/// `select`/`subsel`/`size` handshake rather than through the profile table.
+///
+/// `tests/boot/tests/gamepad.rs` proves a real kernel agrees; this proves the
+/// bytes it reads are the ones the profile meant, without needing a kernel.
+#[test]
+fn gamepad_config_space_probes_as_an_xbox_shaped_joystick() {
+    let mut h = Harness::gamepad();
+    assert_eq!(h.probe(VIRTIO_INPUT_CFG_ID_NAME, 0), b"Entangled Gamepad");
+    assert_eq!(
+        h.probe(VIRTIO_INPUT_CFG_ID_DEVIDS, 0),
+        vec![0x06, 0x00, 0x4d, 0x56, 0x03, 0x00, 0x01, 0x00],
+        "BUS_VIRTUAL, our own vendor, product 3 — never Microsoft's 045e"
+    );
+
+    // The eleven `BTN_GAMEPAD` codes and nothing else. BTN_SOUTH = 0x130 is
+    // byte 38, BTN_THUMBR = 0x13e is byte 39 bit 6.
+    let buttons = h.probe(VIRTIO_INPUT_CFG_EV_BITS, ev::KEY as u8);
+    assert_eq!(buttons.len(), 40);
+    assert_eq!(buttons[38], 0b1101_1011, "SOUTH EAST _ NORTH WEST _ TL TR");
+    assert_eq!(
+        buttons[39], 0b0111_1100,
+        "_ _ SELECT START MODE THUMBL THUMBR"
+    );
+    assert!(
+        buttons[..38].iter().all(|&b| b == 0),
+        "no BTN_MOUSE, no BTN_TOUCH, no BTN_DIGI"
+    );
+    assert_eq!(
+        buttons.iter().map(|b| b.count_ones()).sum::<u32>(),
+        btn::GAMEPAD.len() as u32
+    );
+
+    // ABS_X/Y/Z/RX/RY/RZ in byte 0, ABS_HAT0X/Y in byte 2.
+    assert_eq!(
+        h.probe(VIRTIO_INPUT_CFG_EV_BITS, ev::ABS as u8),
+        vec![0x3f, 0x00, 0x03]
+    );
+
+    // The three axis shapes, on the wire. Sticks are signed: a driver reading
+    // `min` as unsigned would see 0xffff8000 and give the guest a stick that
+    // only travels one way.
+    for axis in [abs::X, abs::Y, abs::RX, abs::RY] {
+        let info = h.probe(VIRTIO_INPUT_CFG_ABS_INFO, axis as u8);
+        assert_eq!(info.len(), 20);
+        assert_eq!(&info[0..4], &[0x00, 0x80, 0xff, 0xff], "min = -32768");
+        assert_eq!(&info[4..8], &[0xff, 0x7f, 0x00, 0x00], "max = 32767");
+        assert_eq!(&info[8..12], &[16, 0, 0, 0], "fuzz = 16");
+        assert_eq!(&info[12..16], &[128, 0, 0, 0], "flat = 128");
+        assert_eq!(&info[16..20], &[0, 0, 0, 0], "res = 0");
+    }
+    for axis in [abs::Z, abs::RZ] {
+        let info = h.probe(VIRTIO_INPUT_CFG_ABS_INFO, axis as u8);
+        assert_eq!(&info[0..8], &[0, 0, 0, 0, 0xff, 0, 0, 0], "0..=255");
+        assert_eq!(&info[8..20], &[0u8; 12], "no fuzz or flat on a trigger");
+    }
+    for axis in [abs::HAT0X, abs::HAT0Y] {
+        let info = h.probe(VIRTIO_INPUT_CFG_ABS_INFO, axis as u8);
+        assert_eq!(&info[0..4], &[0xff, 0xff, 0xff, 0xff], "min = -1");
+        assert_eq!(&info[4..8], &[1, 0, 0, 0], "max = 1");
+    }
+
+    // Not a keyboard, not a pointer, and no rumble: every one of these would
+    // change what SDL and `joydev` make of the device.
+    assert!(h.probe(VIRTIO_INPUT_CFG_EV_BITS, ev::REL as u8).is_empty());
+    assert!(h.probe(VIRTIO_INPUT_CFG_EV_BITS, ev::REP as u8).is_empty());
+    assert!(
+        h.probe(VIRTIO_INPUT_CFG_EV_BITS, 0x15).is_empty(),
+        "no EV_FF"
+    );
+    assert!(h.probe(VIRTIO_INPUT_CFG_PROP_BITS, 0).is_empty());
+    assert!(h.probe(VIRTIO_INPUT_CFG_ID_SERIAL, 0).is_empty());
+    // An axis the pad does not have answers `size = 0`, which is how a driver
+    // learns the axis is absent rather than zero-ranged.
+    assert!(h.probe(VIRTIO_INPUT_CFG_ABS_INFO, 0x12).is_empty());
+}
+
+/// One report of a pad in motion, byte for byte on the ring — including the
+/// negative stick value, which is the one thing a `u32` field could mangle.
+#[test]
+fn a_gamepad_report_lands_on_the_ring_with_its_negative_axis_intact() {
+    let mut h = Harness::gamepad();
+    let buffers = h.offer_buffers(4);
+    let batch = vec![
+        InputEvent {
+            event_type: ev::KEY,
+            code: btn::SOUTH,
+            value: 1,
+        },
+        InputEvent {
+            event_type: ev::ABS,
+            code: abs::X,
+            value: (-32768i32) as u32,
+        },
+        InputEvent::SYN_REPORT,
+    ];
+    assert_eq!(h.push(&batch), 3);
+    assert_eq!(
+        h.read_mem(buffers[0], InputEvent::WIRE_SIZE),
+        vec![0x01, 0x00, 0x30, 0x01, 0x01, 0x00, 0x00, 0x00],
+        "EV_KEY, BTN_SOUTH, pressed"
+    );
+    assert_eq!(
+        h.read_mem(buffers[1], InputEvent::WIRE_SIZE),
+        vec![0x03, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0xff],
+        "EV_ABS, ABS_X, -32768 as two's complement"
+    );
+    assert_eq!(h.read_mem(buffers[2], InputEvent::WIRE_SIZE), vec![0u8; 8]);
+    assert_eq!(h.event_at(buffers[3]), None);
 }
 
 #[test]

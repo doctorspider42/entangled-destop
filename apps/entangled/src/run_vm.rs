@@ -203,9 +203,14 @@ struct BuiltDevices {
 }
 
 /// One virtio-blk device per `[[disk]]` entry, the configured network backend,
-/// the GPU on the given scanout and the two input devices — in exactly this
-/// order on both hosts, because device order is guest-visible naming
-/// (`/dev/vda`, `00:01.0`).
+/// the GPU on the given scanout, the keyboard and tablet, and then the two
+/// opt-in devices — the sound card and the gamepad — in exactly this order on
+/// both hosts, because device order is guest-visible naming (`/dev/vda`,
+/// `00:01.0`). Anything new goes on the *end*, for the same reason.
+///
+/// The full set is eight devices with one disk and no CD-ROM, which is exactly
+/// `machine_x86::virtio::MAX_VIRTIO_SLOTS`; the bus refuses a ninth by name and
+/// count when it is built.
 fn build_devices(
     cfg: &VmConfig,
     display_handle: display::DisplayHandle,
@@ -380,6 +385,33 @@ fn build_devices(
         );
         devices.push(Box::new(virtio_sound::SoundDevice::new(sink, factory)));
     }
+
+    // virtio-input gamepad (GAME-2104), last for the same reason the sound
+    // card is second-to-last: appending never renames a disk nor moves a PCI
+    // function that an existing profile already depends on.
+    if cfg.gamepad.enabled {
+        let choice = match cfg.gamepad.backend {
+            control_api::GamepadBackend::Auto => virtio_input::SourceChoice::Auto,
+            control_api::GamepadBackend::Null => virtio_input::SourceChoice::Null,
+            control_api::GamepadBackend::Evdev => virtio_input::SourceChoice::Evdev,
+            control_api::GamepadBackend::XInput => virtio_input::SourceChoice::XInput,
+        };
+        // `auto` never fails — a machine with no controller still boots, and a
+        // pad plugged in later is picked up — but an explicitly named
+        // mechanism that this host does not have fails the run, exactly as
+        // `[sound] backend` and `[display] virgl` do.
+        let (mechanism, factory) = virtio_input::open_source(choice)
+            .map_err(|e| format!("[gamepad] backend = \"{}\": {e}", cfg.gamepad.backend))?;
+        tracing::info!(
+            mechanism,
+            requested = %cfg.gamepad.backend,
+            "attaching virtio-input gamepad"
+        );
+        devices.push(Box::new(virtio_input::InputDevice::gamepad_with_capture(
+            factory,
+        )));
+    }
+
     Ok(BuiltDevices {
         devices,
         net_cmdline,
@@ -462,7 +494,13 @@ fn note_control_event(
 /// Prefix every line the control channel prints, so a program driving a VM can
 /// tell its own answers apart from the guest's console — they share stdout,
 /// because the guest console *is* what `entangled run` prints.
-pub const CONTROL_PREFIX: &str = "entangled-control:";
+///
+/// The prefix and the reply shapes are `control_api::control`'s, not this
+/// module's: the other end of the pipe is `entangled-manager`, a separate
+/// crate that has to recognise the same words. A literal on each side would
+/// drift, and the failure mode is silent — a Suspend button that never learns
+/// its file was written.
+pub const CONTROL_PREFIX: &str = control_api::control::PREFIX;
 
 /// Reads lifecycle commands from stdin, one per line (ADR-0005).
 ///
@@ -509,12 +547,18 @@ fn spawn_control_channel(
                     Some((command, rest)) => (command, rest),
                     None => (line, ""),
                 };
+                // The command words are `control_api::control`'s constants, so
+                // the writer at the other end of the pipe and the reader here
+                // cannot drift apart.
+                use control_api::control::{
+                    CMD_PAUSE, CMD_RESET, CMD_RESUME, CMD_SAVE, CMD_STATUS, CMD_TYPE,
+                };
                 match command {
                     "" => {}
-                    "pause" => requests.pause.store(true, Ordering::Relaxed),
-                    "resume" => requests.resume.store(true, Ordering::Relaxed),
-                    "reset" => requests.reset.store(true, Ordering::Relaxed),
-                    "save" => {
+                    CMD_PAUSE => requests.pause.store(true, Ordering::Relaxed),
+                    CMD_RESUME => requests.resume.store(true, Ordering::Relaxed),
+                    CMD_RESET => requests.reset.store(true, Ordering::Relaxed),
+                    CMD_SAVE => {
                         let path = match argument.trim() {
                             "" => snapshot.clone(),
                             given => Some(PathBuf::from(given)),
@@ -530,7 +574,7 @@ fn spawn_control_channel(
                             }
                         }
                     }
-                    "type" => {
+                    CMD_TYPE => {
                         // Carriage return, not newline: the guest's terminal
                         // discipline is what turns it into one, and a bare `\n`
                         // is not what a serial keyboard sends.
@@ -538,7 +582,7 @@ fn spawn_control_channel(
                         bytes.push(b'\r');
                         bus.push_serial_input(&bytes);
                     }
-                    "status" => {
+                    CMD_STATUS => {
                         println!("{CONTROL_PREFIX} state={:?}", lifecycle.state());
                     }
                     other => {

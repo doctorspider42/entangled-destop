@@ -67,6 +67,12 @@ pub struct EditForm {
     /// keeps it: turning the card off and on again must not silently reset a
     /// deliberate choice.
     pub sound_backend: SoundBackend,
+    /// `[gamepad] enabled` — whether the guest gets a virtio-input gamepad
+    /// (GAME-2104). `[gamepad] backend` is deliberately **not** modelled: the
+    /// form leaves it in [`Self::base`], so a profile that names `evdev` or
+    /// `xinput` by hand keeps it across a toggle, and everyone else gets
+    /// `auto`, which probes what this host has and never prevents a start.
+    pub gamepad: bool,
     /// The `[[disk]]` list, editable in place (order is guest device order).
     pub disks: Vec<control_api::DiskSection>,
     /// Buffer for the "add disk" field.
@@ -203,6 +209,7 @@ enabled = true
             virgl: cfg.display.virgl,
             sound: cfg.sound.enabled,
             sound_backend: cfg.sound.backend,
+            gamepad: cfg.gamepad.enabled,
             disks: cfg.disks.clone(),
             add_disk: String::new(),
             backend: Backend::Native,
@@ -252,6 +259,10 @@ enabled = true
             enabled: self.sound,
             backend: self.sound_backend,
         };
+        // Only the switch: `backend` stays whatever the profile said, because
+        // the form does not offer it and silently rewriting a field nobody was
+        // shown is how a hand-edited profile loses its choice.
+        cfg.gamepad.enabled = self.gamepad;
         cfg.disks = self.disks.clone();
 
         let out = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
@@ -281,6 +292,7 @@ enabled = true
 #[cfg(test)]
 mod tests {
     use super::*;
+    use control_api::GamepadBackend;
 
     const PROFILE: &str = r#"
 name = "edit-me"
@@ -430,6 +442,41 @@ interface = "entangled0"
         let cfg = VmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).expect("reload");
         assert!(!cfg.sound.enabled);
         assert_eq!(cfg.sound.backend, SoundBackend::Null);
+    }
+
+    /// The gamepad is the same opt-in switch as the sound card, with one
+    /// difference the form has to honour: it does **not** offer `backend`, so a
+    /// profile that names one by hand must come back out with it intact. A
+    /// checkbox that quietly rewrote a neighbouring field would be the worst
+    /// kind of editor.
+    #[test]
+    fn the_gamepad_is_opt_in_and_leaves_a_hand_picked_backend_alone() {
+        let path = temp_profile("gamepad");
+        let mut form = EditForm::from_profile(&path).expect("load");
+        assert!(!form.gamepad, "a profile with no [gamepad] has none");
+        assert!(!form.dirty());
+
+        form.gamepad = true;
+        assert!(form.dirty());
+        form.save().expect("save");
+        let cfg = VmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).expect("reload");
+        assert!(cfg.gamepad.enabled);
+        assert_eq!(cfg.gamepad.backend, GamepadBackend::Auto);
+
+        // A backend the form never shows survives both directions of the
+        // toggle, because `to_config` only writes the switch.
+        std::fs::write(
+            &path,
+            format!("{PROFILE}\n[gamepad]\nenabled = true\nbackend = \"null\"\n"),
+        )
+        .expect("hand edit");
+        let mut form = EditForm::from_profile(&path).expect("reload");
+        assert!(form.gamepad);
+        form.gamepad = false;
+        form.save().expect("save");
+        let cfg = VmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).expect("reload");
+        assert!(!cfg.gamepad.enabled);
+        assert_eq!(cfg.gamepad.backend, GamepadBackend::Null);
     }
 
     /// The picker never offers the other host's word, because naming it is a

@@ -53,6 +53,7 @@ use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress};
 
 use crate::config::{self, Profile};
+use crate::gamepad::{GamepadCapture, SourceFactory};
 use crate::InputEvent;
 
 /// Number of virtqueues: `eventq` and `statusq`.
@@ -488,6 +489,14 @@ pub struct InputDevice {
     /// caller of `read_config`/`write_config`.
     select: u8,
     subsel: u8,
+    /// Host gamepad capture, if this device was built with any (GAME-2104).
+    ///
+    /// A factory rather than a source: the pump is tied to one *activation*,
+    /// so a guest that resets the device gets a fresh source with fresh file
+    /// descriptors rather than one that was already half-read.
+    capture: Option<SourceFactory>,
+    /// The running pump, `Some` only between `activate()` and `reset()`.
+    pump: Option<GamepadCapture>,
 }
 
 impl std::fmt::Debug for InputDevice {
@@ -515,6 +524,8 @@ impl InputDevice {
             acked_features: 0,
             select: config::VIRTIO_INPUT_CFG_UNSET,
             subsel: 0,
+            capture: None,
+            pump: None,
         }
     }
 
@@ -526,6 +537,50 @@ impl InputDevice {
     /// A tablet-style absolute pointer (MVP-901/903).
     pub fn absolute_pointer() -> Self {
         Self::new(Profile::AbsolutePointer)
+    }
+
+    /// A gamepad with no host capture attached (GAME-2104): the guest gets a
+    /// pad that enumerates and never moves unless something pushes events into
+    /// its [`InputHandle`]. That is what the tests use, and what a headless run
+    /// gets. [`crate::gamepad::GamepadCapture`] is the half that makes a real
+    /// controller drive it.
+    pub fn gamepad() -> Self {
+        Self::new(Profile::Gamepad)
+    }
+
+    /// A gamepad fed by a real host controller (GAME-2104).
+    ///
+    /// The capture thread is started when the driver sets `DRIVER_OK` and
+    /// stopped by a reset or by dropping the device — the same lifetime
+    /// virtio-net's receive worker has, and for the same reason: it is a host
+    /// thread that writes guest memory, so it belongs to one activation and
+    /// owes the pause gate a wait (ADR-0005).
+    ///
+    /// ```no_run
+    /// use virtio_input::{gamepad, InputDevice};
+    ///
+    /// let (mechanism, factory) = gamepad::open_source(gamepad::SourceChoice::Auto)
+    ///     .expect("auto never fails");
+    /// tracing::info!(mechanism, "attaching virtio-input gamepad");
+    /// let pad = InputDevice::gamepad_with_capture(factory);
+    /// ```
+    pub fn gamepad_with_capture(capture: SourceFactory) -> Self {
+        let mut device = Self::new(Profile::Gamepad);
+        device.capture = Some(capture);
+        device
+    }
+
+    /// True while a host capture thread is running for this device.
+    pub fn is_capturing(&self) -> bool {
+        self.pump.is_some()
+    }
+
+    /// Stops and joins the capture thread. Idempotent and infallible, so both
+    /// `reset()` and `Drop` can call it.
+    fn stop_capture(&mut self) {
+        if let Some(mut pump) = self.pump.take() {
+            pump.stop();
+        }
     }
 
     /// This device's profile.
@@ -661,6 +716,9 @@ impl VirtioDevice for InputDevice {
             });
         };
 
+        // Re-activation without a reset in between must not leak a thread.
+        self.stop_capture();
+
         let mut state = lock(&self.shared.state);
         // A stale buffer from a previous activation is not this driver's input.
         state.pending.clear();
@@ -671,6 +729,22 @@ impl VirtioDevice for InputDevice {
             statusq,
         });
         drop(state);
+
+        // Host capture starts only now: before `DRIVER_OK` there is nowhere to
+        // put a button press, and `push` would drop it as `dropped_inactive`.
+        if let Some(factory) = self.capture.as_ref() {
+            match GamepadCapture::start(self.handle(), Arc::clone(&resources.quiesce), factory()) {
+                Ok(pump) => self.pump = Some(pump),
+                // A capture thread that will not start costs the guest its
+                // controller, not its boot: the device still enumerates and
+                // still accepts events pushed by anything else.
+                Err(error) => tracing::error!(
+                    %error,
+                    "host gamepad capture is unavailable; the guest pad will not move"
+                ),
+            }
+        }
+
         tracing::info!(
             device = self.shared.profile.name(),
             profile = ?self.shared.profile,
@@ -721,6 +795,8 @@ impl VirtioDevice for InputDevice {
     }
 
     fn reset(&mut self) {
+        // Before the lock: `stop_capture` joins a thread that takes it.
+        self.stop_capture();
         let mut state = lock(&self.shared.state);
         let dropped = state.pending.len();
         state.pending.clear();
@@ -737,6 +813,14 @@ impl VirtioDevice for InputDevice {
                 "virtio-input reset dropped buffered events"
             );
         }
+    }
+}
+
+impl Drop for InputDevice {
+    /// Guarantees "closing the VM leaves no capture thread behind" even if the
+    /// driver never reset the device.
+    fn drop(&mut self) {
+        self.stop_capture();
     }
 }
 

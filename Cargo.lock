@@ -404,6 +404,7 @@ dependencies = [
  "virtio-core",
  "virtio-gpu",
  "virtio-input",
+ "vm-memory 0.17.2",
  "vmm-core",
 ]
 
@@ -1418,6 +1419,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "vm-snapshot",
  "wgpu 25.0.2",
  "windows 0.62.2",
 ]
@@ -4512,11 +4514,13 @@ dependencies = [
 name = "virtio-input"
 version = "0.2.0"
 dependencies = [
+ "libc",
  "thiserror 2.0.20",
  "tracing",
  "virtio-core",
  "virtio-queue",
  "vm-memory 0.17.2",
+ "windows 0.62.2",
 ]
 
 [[package]]
