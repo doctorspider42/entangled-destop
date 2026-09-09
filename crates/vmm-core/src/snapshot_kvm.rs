@@ -155,7 +155,7 @@ impl Vcpu {
 }
 
 /// KVM's `mp_state` word as a neutral value.
-fn mp_state_from_kvm(value: u32) -> MpState {
+pub(crate) fn mp_state_from_kvm(value: u32) -> MpState {
     match value {
         kvm_bindings::KVM_MP_STATE_RUNNABLE => MpState::Runnable,
         kvm_bindings::KVM_MP_STATE_UNINITIALIZED => MpState::Uninitialized,

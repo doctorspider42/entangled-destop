@@ -98,8 +98,24 @@ ours to choose — EDK2's `OvmfPkg/Include/IndustryStandard/CloudHv.h` fixes
 | `0x60c` | 2 | GPE0_STS | `GPE0_BLK` +0 | write-1-to-clear; no source drives it yet |
 | `0x60e` | 2 | GPE0_EN | `GPE0_BLK` +2 | read/write |
 
-Two facts that look arbitrary and are not:
+Three facts that look arbitrary and are not:
 
+* **The PM timer is latched once per access, not once per byte.**
+  `AcpiPmBlock::io_read` samples `AcpiPmTimer::ticks()` *before* it walks the
+  bytes of the access, because it is the one register in the block that moves
+  on its own. Sampling per byte — which it did until 2026-09-09 — lets a carry
+  out of the low byte land between byte 0 and byte 1, and the assembled 32-bit
+  value is then up to 255 ticks ahead of the counter, so the guest's *next* read
+  appears to go backwards. That is not a rounding error to a guest: EDK2's
+  `MpInitLib` differences successive reads and reads a negative difference as
+  the 24-bit counter wrapping, adding 4.7 s to its elapsed total and abandoning
+  an application processor on the spot — the `MpInitLib: Find 1 processors`
+  flake, 18 of 20 loaded WHP boots. The invariant to hold, and the one
+  `acpi::pm::tests::a_wide_timer_read_is_one_sample_of_the_counter` asserts, is
+  the one real hardware offers: **the value a guest reads lies between the
+  counter immediately before the access and the counter immediately after it.**
+  It applies to every free-running register, here and in any device added
+  later.
 * **`SCI_EN` always reads set.** `FADT.SMI_CMD` is 0 (no SMI on this machine),
   so ACPICA must conclude the platform is *already* in ACPI mode;
   `AcpiHwGetMode()` decides that by reading exactly this bit. Read it back as 0

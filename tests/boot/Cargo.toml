@@ -35,6 +35,9 @@ virtio-gpu.workspace = true
 virtio-input.workspace = true
 display.workspace = true
 tracing.workspace = true
+# The AP-startup test reads the run loop's own warn lines (a triple-faulting
+# application processor names its fault site), so it needs a subscriber.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

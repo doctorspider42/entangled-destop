@@ -817,16 +817,57 @@ Two lessons it cost to learn, both worth keeping:
   step and save the whole console to a file named in the failure message; a tail
   is never enough for a boot log.
 
-### Flaky under parallel load: the UEFI boot tests
+### `MpInitLib: Find 1 processors` was a bug in our clock, not a flake
 
-`cargo test --workspace` runs boot tests concurrently with everything else, and
-the EDK2 firmware's AP sweep is timing-sensitive: under load it can report
-`MpInitLib: Find 1 processors` and the test then fails on the tables it was
-waiting for. Seen on both hosts, always green when rerun alone
-(`cargo test -p boot-tests --test uefi_acpi`). Before blaming a change, rerun
-the single test — and if you need a verdict under load, run the boot tests
-sequentially (`--test-threads=1`) rather than treating one red run as a
-regression.
+For months this was written up here as an unavoidable timing flake: under
+parallel load a UEFI boot test would report `MpInitLib: Find 1 processors`, the
+tables it was waiting for would not appear, and a rerun on a quiet machine was
+always green. It was a real defect in `machine_x86::acpi::pm`, fixed on
+2026-09-09, and it is worth keeping the story because the shape recurs.
+
+The PM timer served a 32-bit `IN` **one byte at a time**, sampling the host
+clock again for each byte. A carry out of the low byte between two samples
+returns a value up to 255 ticks ahead of the counter, so the next read looks
+like it went *backwards*. EDK2 measures its 50 ms AP-detection window by
+differencing successive PM-timer reads (`MpLib.c::CheckTimeout`) and treats any
+negative difference as the 24-bit counter having wrapped — it adds a whole
+4.7-second cycle to its elapsed total and abandons the application processor on
+the spot. Idle, the four samples are nanoseconds apart and only an exact carry
+tears them; loaded, the exit handler itself can be preempted mid-access, which
+is the entire load dependence.
+
+Measured with the firmware boot repeated under CPU spinners on 16 cores
+(boots that lost an application processor / boots run):
+
+| | KVM idle | KVM, 48 spinners | KVM, 64 spinners | WHP idle | WHP, 48 spinners |
+|---|---|---|---|---|---|
+| before | 1/17 | 5/15 | 12/24 | 0/20 | **18/20** |
+| after | 0/20 | — | 0/66 | — | 0/50 |
+
+WHP suffers far more because its port-I/O exits are slower, so the four samples
+inside one access are further apart.
+
+Three things to take from it:
+
+- **A counter register is sampled once per access, not once per byte.** Anything
+  free-running that a guest can read wide — a timer, a cycle counter, a queue
+  index — has to be latched for the whole access. The regression test is
+  `acpi::pm::tests::a_wide_timer_read_is_one_sample_of_the_counter`, and its
+  invariant is the one real hardware offers: the value read lies between the
+  counter immediately before the access and the counter immediately after.
+- **A test that tolerates either answer cannot catch this.** The UEFI boot tests
+  now assert the *configured* processor count (`uefi_acpi`, `uefi_highmem`,
+  `uefi_iso`, `whp_uefi`, `whp_highmem`). Widening a tolerance is how a bug
+  survives months.
+- **Load is a test input.** None of this reproduces on an idle machine.
+  `tests/boot/tests/ap_startup.rs::ap_startup_campaign` (ignored;
+  `$ENTANGLED_AP_BOOTS`) is the KVM form — it dates the INIT-SIPI, the AP's
+  first executed instruction and the firmware's verdict on one timeline — and
+  the equivalent on WHP is looping `whp_highmem` while spinners run.
+
+If you *do* see a wrong CPU count again, the run loops now say so themselves:
+`vmm_core::VcpuCensus` logs at warn with the configured and started counts and
+names the processors still waiting for their SIPI.
 
 ### Boot the shape the profiles use, not just the small one
 

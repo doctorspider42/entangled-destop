@@ -334,6 +334,22 @@ impl AcpiPmBlock {
             return;
         }
         let offset = port - layout::ACPI_PM_BASE;
+        // **One sample of the counter for the whole access.** The PM timer is
+        // the only register here that moves on its own, and sampling it once
+        // per *byte* — which this used to do — makes a 32-bit `IN` return a
+        // torn value: byte 0 comes from tick T and byte 1 from T+1, so if the
+        // low byte carried in between, the assembled reading is up to 255 ticks
+        // ahead of the counter and the *next* reading appears to go backwards.
+        //
+        // A guest cannot tell that from the 24-bit counter wrapping, and EDK2
+        // does not try: `MpInitLib`'s `CheckTimeout()` adds a whole cycle
+        // (2^24 ticks, 4.7 s) to its accumulated total on any negative delta,
+        // instantly exhausting the 50 ms it gives an AP to check in. That is
+        // the `MpInitLib: Find 1 processors in system` flake — rare when the
+        // host is idle (the four samples are nanoseconds apart, so only an
+        // exact carry tears them) and common when it is loaded, because then
+        // the exit handler itself can be preempted between two bytes.
+        let ticks = self.timer.ticks();
         for (i, byte) in data.iter_mut().enumerate() {
             let Ok(at) = u16::try_from(usize::from(offset) + i) else {
                 return;
@@ -341,7 +357,7 @@ impl AcpiPmBlock {
             if at >= layout::ACPI_PM_SIZE {
                 return;
             }
-            *byte = self.read_byte(at);
+            *byte = self.read_byte(at, ticks);
         }
     }
 
@@ -363,10 +379,12 @@ impl AcpiPmBlock {
         }
     }
 
-    fn read_byte(&self, offset: u16) -> u8 {
+    /// One byte of the register block. `ticks` is the single counter sample the
+    /// whole access shares — see [`Self::io_read`] for why that matters.
+    fn read_byte(&self, offset: u16, ticks: u32) -> u8 {
         // The PM timer is the only register not behind the mutex.
         if (OFF_PM_TIMER..OFF_PM_TIMER + u16::from(PM_TMR_LEN)).contains(&offset) {
-            let bytes = self.timer.ticks().to_le_bytes();
+            let bytes = ticks.to_le_bytes();
             return bytes[usize::from(offset - OFF_PM_TIMER)];
         }
         let regs = self.regs();
@@ -556,6 +574,40 @@ mod tests {
             ACPI_PM_TIMER_HZ / 20
         );
         assert_eq!(last & !ACPI_PM_TIMER_MASK, 0, "never wider than 24 bits");
+    }
+
+    /// A 32-bit `IN` must return **one** sample of the counter, not four
+    /// bytes stitched from four samples.
+    ///
+    /// The invariant is exactly the one a real counter offers: the value the
+    /// guest gets lies between the counter immediately before the access and
+    /// the counter immediately after it. A per-byte sample breaks it — a carry
+    /// out of the low byte between byte 0 and byte 1 puts the reading up to 255
+    /// ticks *past* the counter, and the next reading then appears to go
+    /// backwards. EDK2's `MpInitLib` reads any backwards step as the 24-bit
+    /// counter wrapping and adds 4.7 s to its elapsed total, which instantly
+    /// exhausts the 50 ms it allows an application processor to check in: the
+    /// `MpInitLib: Find 1 processors in system` flake.
+    #[test]
+    fn a_wide_timer_read_is_one_sample_of_the_counter() {
+        let pm = AcpiPmBlock::new();
+        let mut previous = 0u32;
+        for _ in 0..200_000 {
+            let before = pm.ticks();
+            let mut data = [0u8; 4];
+            pm.io_read(PM_TIMER_PORT, &mut data);
+            let after = pm.ticks();
+            let value = u32::from_le_bytes(data);
+            assert!(
+                before <= value && value <= after,
+                "torn read: {value} is not between {before} and {after}"
+            );
+            assert!(
+                value >= previous,
+                "the counter went backwards: {previous} -> {value}"
+            );
+            previous = value;
+        }
     }
 
     #[test]
