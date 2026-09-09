@@ -877,7 +877,7 @@ configuration:
 
 | Command | How it was verified |
 |---|---|
-| `entangled doctor` | run on both hosts while writing this guide; both outputs pasted verbatim (the Windows one abridged) |
+| `entangled doctor` | run on both hosts, and re-run on both after the merge that this revision documents; both outputs pasted as printed, with home directories replaced by `you` and the Windows one abridged where the `…` says so |
 | `entangled disk create --size 8G …`, `disk inspect` | run while writing this guide; output pasted verbatim |
 | `entangled --help`, `disk/install/run/fetch/resume/snapshot --help` | run while writing this guide; every flag named here comes from that output |
 | `entangled install ubuntu --disk … --size … --auto --headless` | copied from `apps/entangled/tests/ubuntu_install.rs`, which passes on both hosts |
