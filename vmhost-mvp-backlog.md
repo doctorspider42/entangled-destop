@@ -699,6 +699,7 @@ kwantowej (motyw splątania). Stack: egui/eframe na wgpu — natywnie, wydajnie.
 | GUI-1604 | Usuwanie maszyny (dysk + profil) z potwierdzeniem | P0 |
 | GUI-1605 | Podgląd logu instalacji/konsoli w UI | P1 |
 | GUI-1606 | Motyw "quantum": ciemny, akcenty cyan/fiolet, subtelne animacje | P0 |
+| GUI-1607 | Uśpienie/wznowienie maszyny z karty + widok "Saved sessions" (ADR-0006): odmowy pokazane **przed** kliknięciem, kasowanie z potwierdzeniem | P1 |
 
 ## EPIC 17 — Natywny host Windows (WHP)
 

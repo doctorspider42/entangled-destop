@@ -254,7 +254,7 @@ for one state.
 | the VM window | `Ctrl+Alt+S` | — (a new process, with a new window) |
 | `entangled run --control-stdin` | `save [path]` | — |
 | the command line | `run --snapshot <file>` names the target | `entangled resume <file>` |
-| `entangled-manager` | not yet wired; see below | |
+| `entangled-manager` | a running machine's **Suspend** button | **Resume** on a suspended machine's card, or on any row of the Snapshots view |
 
 `Ctrl+Alt+S` joins `Ctrl+Alt+P`/`R`/`G`/`Q`/`O` and `F11`, and like them it hands
 the modifiers back to the guest first — with a stronger reason: the guest is
@@ -372,12 +372,7 @@ but able to run its whole shutdown path.
 - A snapshot is bound to its host, its build and its disks. That is three ways
   for a file to become unusable, and all three are deliberate: the alternative
   to each refusal is a guest that misbehaves later.
-- `entangled-manager` is not wired to this yet — the GUI is being rebuilt in
-  parallel. What it needs already exists and is documented for it:
-  `vm_snapshot::inspect(path)` reads a snapshot's name, size, host, shape, disk
-  list and "could this machine restore it?" **without touching a VM**, and the
-  `save [path]` control command plus `entangled resume` are the two child-process
-  invocations a Suspend button and a Resume button would make.
+- `entangled-manager` is wired to this — see the amendment below.
 - **A resumed guest is not identical to one that never stopped.** The honest
   list is in the TODO below.
 
@@ -422,3 +417,57 @@ but able to run its whole shutdown path.
 11. **A snapshot pins its disks by size and mtime.** A filesystem with coarse or
    absent mtimes (some network mounts) weakens the check to size alone, and the
    code says so rather than pretending otherwise.
+
+## Amendment, 2026-09-09: the manager's three states
+
+`entangled-manager` now reaches all of this, and doing so turned up one thing
+the ADR had not had to name.
+
+**A machine with a snapshot is a third resting state.** The manager's `Status`
+gains `Suspending` and `Suspended` beside Running/Stopping/Installing/Stopped,
+and only the first of those is a property of a process. `Suspended` is *the
+absence of a child plus the presence of a file* — which is what makes it
+survive the manager being closed and reopened, unlike "running", which this
+process only knows because it started the child (ADR-0005's known gap about
+orphan adoption is unchanged, and does not apply here). The file is looked for
+at exactly one place, `<name>.esnap` beside the profile, because that is where a
+bare `save` writes; a copy someone made by hand is a snapshot of the same
+machine, appears in the Snapshots view, and is deliberately *not* what the card
+offers to resume.
+
+**Every refusal is computed before the button is drawn.** `vm_snapshot::inspect`
+costs a file open, so the manager takes the verdict during its directory scan
+and greys the Resume button out with the reason on its hover, rather than
+letting a child process discover it. Two of the checks the engine cannot make
+for the manager:
+
+- `SnapshotInfo::restorable_here` answers for *this* process, and the manager is
+  never the process that restores anything. On Windows a machine may be set to
+  run through WSL, where the hypervisor is KVM and a Linux snapshot is exactly
+  right — so the host check is redone against the machine's chosen backend, and
+  the refusal names the backend that *would* work.
+- A path recorded by the other engine (`/mnt/d/vms/root.raw` seen from Windows)
+  is not a disk that has vanished. It is left to the engine that can see it,
+  with a note saying so, because "your disk is missing" is the loudest refusal
+  in the product and it must not fire on a file that is fine.
+
+**Editing the machine orphans its snapshot**, and the manager says so twice: the
+Configure button's hover warns before the edit, and a shape that no longer
+matches is a named refusal on the card afterwards ("memory: was 2048 MiB, is
+4096 MiB"). The engine's own `MachineShape::check` is the backstop.
+
+**"Start fresh" deletes the snapshot first**, with a confirmation. A cold-booted
+guest writes to the disk within seconds, and a snapshot pinned to that disk as
+it was is then a file the engine will refuse — so keeping it would leave a card
+that goes on offering a Resume which cannot work. Deleting a machine takes its
+snapshot with it for the same reason (`discovery::plan_delete`).
+
+The vocabulary of the control channel moved to `control_api::control` in the
+process: `entangled run` and `entangled-manager` are two crates at the ends of
+one pipe, and a reply prefix spelled as a literal on each side would have
+drifted silently — the Suspend button would have spun until the child exited and
+then reported the wrong thing. A failed suspend is the case that makes this
+matter: the engine exits with status 0 either way, so the reply line is the only
+place the reason ever appears, and the manager lifts it out of the log as it
+goes past rather than scanning the tail afterwards (a desktop guest can push the
+whole log buffer through in the seconds a suspend takes).

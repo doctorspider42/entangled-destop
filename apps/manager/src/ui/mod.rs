@@ -87,6 +87,11 @@ pub fn ghost_button(ui: &mut Ui, text: &str, enabled: bool, tint: Color32) -> Re
     response
 }
 
+/// Inset between a card's border and its contents, on every edge. Named
+/// because a caller that sizes a card from its own measured content — the
+/// Snapshots rows, whose refusals wrap — has to subtract exactly this.
+pub const CARD_PAD: f32 = 15.0;
+
 /// A fixed-size interactive surface with the card look: rounded, faintly lit
 /// border, an accent bar on the left and a hover animation.
 pub fn card<R>(
@@ -132,7 +137,7 @@ pub fn card<R>(
 
     let mut child = ui.new_child(
         UiBuilder::new()
-            .max_rect(rect.shrink(15.0))
+            .max_rect(rect.shrink(CARD_PAD))
             .layout(Layout::top_down(Align::Min)),
     );
     let inner = add(&mut child, t);

@@ -74,9 +74,11 @@ enum ScreenshotView {
     Wizard,
     Settings,
     Disks,
-    /// Saved sessions, and the confirmation that throws one away.
+    /// Saved sessions, and the two confirmations that throw one away — from
+    /// the Snapshots list, and from a suspended machine's own card.
     Snapshots,
     SnapshotDelete,
+    SnapshotDiscard,
     /// The machine editor, on each of its sections — one surface per section,
     /// because that is how the panels are actually reviewed.
     Editor,

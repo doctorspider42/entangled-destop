@@ -10,13 +10,11 @@ use crate::ui;
 
 // Six lifecycle buttons do not fit on one line at [`theme::CARD_WIDTH`], and a
 // running machine now has six. The action row wraps instead, and the card is
-// tall enough for the second line — measured against the widest state (Running,
-// with a control channel), not guessed.
-const CARD_HEIGHT: f32 = 276.0;
-/// Height of one line of card buttons, and the gap between two wrapped lines.
-/// Measured against `ui::ghost_button` (its galley plus 13 px of padding), not
-/// guessed — the strip's height has to be known before the row is laid out.
-const ACTION_ROW_H: f32 = 31.0;
+// tall enough for two lines under the tallest content any state produces — a
+// suspended machine with a wrapped chip row, a "saved 3 hours ago" line and a
+// reason it cannot go back.
+const CARD_HEIGHT: f32 = 340.0;
+/// Gap between two wrapped lines of card buttons.
 const ACTION_WRAP_GAP: f32 = 6.0;
 
 pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
@@ -264,205 +262,257 @@ fn vm_card(
             suspend_line(ui, app, vm, status);
             ui.add_space(6.0);
 
-            // The action strip sits on the bottom edge, and its height is
-            // *reserved* rather than discovered: a wrapped row inside a
-            // bottom-up layout grows downward, straight through the card's
-            // border. A running machine has six buttons and they do not fit on
-            // one line at CARD_WIDTH, so that state gets two.
-            let lines = if status == Status::Running { 2.0 } else { 1.0 };
-            let strip = lines * ACTION_ROW_H + (lines - 1.0) * ACTION_WRAP_GAP;
+            // The action strip sits on the card's bottom edge, so its height
+            // has to be known *before* it is laid out — a wrapped row inside a
+            // bottom-anchored space grows downward, straight through the
+            // border. egui only learns how many lines a `horizontal_wrapped`
+            // takes by laying it out, so it is laid out twice: once invisibly
+            // to be measured, once for real. Declaring a line count per state
+            // was the first attempt, and it was wrong for Suspended on the day
+            // that state was added — silently, because only a screenshot shows
+            // it.
+            let strip = measured_action_height(ui, app, vm, status, missing_disk, &path);
             ui.add_space((ui.available_height() - strip).max(0.0));
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(7.0, ACTION_WRAP_GAP);
-                match status {
-                    Status::Stopped => {
-                        if !missing_disk && ui::primary_button(ui, "Start").clicked() {
-                            actions.push(Action::Start(vm.name.clone()));
-                        }
-                    }
-                    // The third resting state (ADR-0006). Resume is the
-                    // primary action, and it is only bright when the saved
-                    // session could really go back — the reasons it could
-                    // not are on the hover, not in a toast after the click.
-                    Status::Suspended => {
-                        let verdict = app
-                            .snapshot_for(&vm.name)
-                            .map(|row| app.snapshot_verdict(row))
-                            .unwrap_or_default();
-                        let hover = if verdict.resumable() {
-                            "Put the machine back exactly as you left it — the same \
+            action_strip(ui, app, vm, status, missing_disk, &path, actions);
+        },
+    );
+}
+
+/// Lays the action strip out once, invisibly, to learn how tall it will be.
+fn measured_action_height(
+    ui: &mut egui::Ui,
+    app: &ManagerApp,
+    vm: &VmEntry,
+    status: Status,
+    missing_disk: bool,
+    path: &str,
+) -> f32 {
+    let mut probe = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("action-strip-sizing")
+            .max_rect(egui::Rect::from_min_size(
+                ui.cursor().min,
+                Vec2::new(ui.available_width(), 400.0),
+            ))
+            .layout(Layout::top_down(Align::Min))
+            .sizing_pass()
+            .invisible(),
+    );
+    // The throwaway action list is the point of the second pass being free of
+    // side effects: an invisible, disabled `Ui` reports no clicks, but a button
+    // that somehow did would push into a vector nobody reads.
+    action_strip(
+        &mut probe,
+        app,
+        vm,
+        status,
+        missing_disk,
+        path,
+        &mut Vec::new(),
+    );
+    probe.min_rect().height()
+}
+
+/// Every button a machine in this state offers, wrapped onto as many lines as
+/// [`theme::CARD_WIDTH`] needs.
+fn action_strip(
+    ui: &mut egui::Ui,
+    app: &ManagerApp,
+    vm: &VmEntry,
+    status: Status,
+    missing_disk: bool,
+    path: &str,
+    actions: &mut Vec<Action>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(7.0, ACTION_WRAP_GAP);
+        match status {
+            Status::Stopped => {
+                if !missing_disk && ui::primary_button(ui, "Start").clicked() {
+                    actions.push(Action::Start(vm.name.clone()));
+                }
+            }
+            // The third resting state (ADR-0006). Resume is the
+            // primary action, and it is only bright when the saved
+            // session could really go back — the reasons it could
+            // not are on the hover, not in a toast after the click.
+            Status::Suspended => {
+                let verdict = app
+                    .snapshot_for(&vm.name)
+                    .map(|row| app.snapshot_verdict(row))
+                    .unwrap_or_default();
+                let hover = if verdict.resumable() {
+                    "Put the machine back exactly as you left it — the same \
                              programs, the same windows."
-                                .to_string()
-                        } else {
-                            verdict.blocked.join("\n\n")
-                        };
-                        if verdict.resumable() {
-                            if ui::primary_button(ui, "Resume")
-                                .on_hover_text(hover)
-                                .clicked()
-                            {
-                                actions.push(Action::ResumeVm(vm.name.clone()));
-                            }
-                        } else if ui::ghost_button(ui, "Resume", false, theme::VIOLET)
-                            .on_hover_text(hover)
-                            .clicked()
-                        {
-                            // Unreachable while disabled; kept so the arm
-                            // stays one shape.
-                        }
-                        if ui::ghost_button(ui, "Start fresh…", !missing_disk, theme::WARN)
-                            .on_hover_text(
-                                "Boot the machine from scratch. The saved session cannot \
+                        .to_string()
+                } else {
+                    verdict.blocked.join("\n\n")
+                };
+                if verdict.resumable() {
+                    if ui::primary_button(ui, "Resume")
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        actions.push(Action::ResumeVm(vm.name.clone()));
+                    }
+                } else if ui::ghost_button(ui, "Resume", false, theme::VIOLET)
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    // Unreachable while disabled; kept so the arm
+                    // stays one shape.
+                }
+                if ui::ghost_button(ui, "Start fresh…", !missing_disk, theme::WARN)
+                    .on_hover_text(
+                        "Boot the machine from scratch. The saved session cannot \
                                  survive that — the guest writes to the disk it was \
                                  pinned to — so it is thrown away first, and you are \
                                  asked before anything happens.",
-                            )
-                            .clicked()
-                        {
-                            actions.push(Action::AskDiscardSnapshot(vm.name.clone()));
-                        }
-                    }
-                    // One-way, and nothing to press: the machine is being
-                    // written to a file and will stop when it has.
-                    Status::Suspending => {
-                        if let Some(task) = app.supervisor.active_task(&vm.name) {
-                            if ui::ghost_button(ui, "View activity", true, theme::CYAN).clicked() {
-                                actions.push(Action::SelectLog(task.id));
-                            }
-                        }
-                    }
-                    Status::Running => {
-                        if ui::ghost_button(ui, "Stop", true, theme::WARN).clicked() {
-                            actions.push(Action::Stop(vm.name.clone()));
-                        }
-                        // Pause and Restart (ADR-0005). Only for a VM this
-                        // manager started: the control channel is a pipe to
-                        // a child, so a VM launched from a terminal has
-                        // none and the buttons say so rather than lying.
-                        let controllable = app.has_control(&vm.name);
-                        let paused = app.is_paused(&vm.name);
-                        let label = if paused { "Resume" } else { "Pause" };
-                        if ui::ghost_button(ui, label, controllable, theme::VIOLET)
-                            .on_hover_text(if !controllable {
-                                "This VM was not started from here"
-                            } else if paused {
-                                "Let the machine continue exactly where it stopped"
-                            } else {
-                                "Freeze the machine; nothing in it makes progress"
-                            })
-                            .clicked()
-                        {
-                            actions.push(Action::TogglePause(vm.name.clone()));
-                        }
-                        if ui::ghost_button(ui, "Restart", controllable, theme::VIOLET)
-                            .on_hover_text(if controllable {
-                                "Reboot the machine in place, as the guest's own Restart does"
-                            } else {
-                                "This VM was not started from here"
-                            })
-                            .clicked()
-                        {
-                            actions.push(Action::Reset(vm.name.clone()));
-                        }
-                        // Suspend (ADR-0006): close the lid. Sits beside
-                        // Stop because that is the choice being made — this
-                        // is the other way to stop a machine, and the one
-                        // that keeps everything it was doing.
-                        if ui::ghost_button(ui, "Suspend", controllable, theme::VIOLET)
-                            .on_hover_text(if controllable {
-                                "Write the whole machine to a file and stop it. Opening it \
-                                 again puts you back exactly here. A machine with 2 GiB of \
-                                 memory takes a few seconds; a desktop takes longer."
-                            } else {
-                                "This VM was not started from here"
-                            })
-                            .clicked()
-                        {
-                            actions.push(Action::Suspend(vm.name.clone()));
-                        }
-                    }
-                    Status::Stopping => {
-                        if ui::ghost_button(ui, "Kill", true, theme::ERR)
-                            .on_hover_text("Shutdown was requested; force it")
-                            .clicked()
-                        {
-                            actions.push(Action::Stop(vm.name.clone()));
-                        }
-                    }
-                    Status::Installing => {
-                        if ui::ghost_button(ui, "Abort", true, theme::ERR).clicked() {
-                            actions.push(Action::Stop(vm.name.clone()));
-                        }
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::AskDiscardSnapshot(vm.name.clone()));
+                }
+            }
+            // One-way, and nothing to press: the machine is being
+            // written to a file and will stop when it has.
+            Status::Suspending => {
+                if let Some(task) = app.supervisor.active_task(&vm.name) {
+                    if ui::ghost_button(ui, "View activity", true, theme::CYAN).clicked() {
+                        actions.push(Action::SelectLog(task.id));
                     }
                 }
-                // A suspended machine can be configured — it is not
-                // running — but changing its hardware is exactly what makes
-                // the saved session unrestorable, so the hover says so
-                // instead of the refusal arriving at resume time.
-                let configurable = matches!(status, Status::Stopped | Status::Suspended);
-                if ui::ghost_button(ui, "Configure", configurable, theme::VIOLET)
-                    .on_hover_text(match status {
-                        Status::Stopped => "Memory, vCPUs, boot, network, disks, display",
-                        Status::Suspended => {
-                            "Memory, vCPUs, boot, network, disks, display. Changing the \
-                             hardware makes the saved session unrestorable — a snapshot \
-                             only goes back onto the machine it came off."
-                        }
-                        _ => "Stop the machine first",
+            }
+            Status::Running => {
+                if ui::ghost_button(ui, "Stop", true, theme::WARN).clicked() {
+                    actions.push(Action::Stop(vm.name.clone()));
+                }
+                // Pause and Restart (ADR-0005). Only for a VM this
+                // manager started: the control channel is a pipe to
+                // a child, so a VM launched from a terminal has
+                // none and the buttons say so rather than lying.
+                let controllable = app.has_control(&vm.name);
+                let paused = app.is_paused(&vm.name);
+                let label = if paused { "Resume" } else { "Pause" };
+                if ui::ghost_button(ui, label, controllable, theme::VIOLET)
+                    .on_hover_text(if !controllable {
+                        "This VM was not started from here"
+                    } else if paused {
+                        "Let the machine continue exactly where it stopped"
+                    } else {
+                        "Freeze the machine; nothing in it makes progress"
                     })
                     .clicked()
                 {
-                    actions.push(Action::AskEditVm(vm.name.clone()));
+                    actions.push(Action::TogglePause(vm.name.clone()));
                 }
-                ui.menu_button("More", |ui| {
-                    if ui.button("Copy profile path").clicked() {
-                        actions.push(Action::CopyProfilePath(path.clone()));
-                        ui.close();
-                    }
-                    if let Some(task) = app
-                        .supervisor
-                        .tasks()
-                        .iter()
-                        .rev()
-                        .find(|t| t.vm == vm.name)
-                    {
-                        if ui.button("Open activity log").clicked() {
-                            actions.push(Action::SelectLog(task.id));
-                            ui.close();
-                        }
-                    }
-                    ui.separator();
-                    if app.snapshot_for(&vm.name).is_some()
-                        && ui
-                            .add_enabled(
-                                status == Status::Suspended,
-                                egui::Button::new("Forget the saved session"),
-                            )
-                            .on_hover_text(
-                                "Delete the snapshot and leave the machine stopped. Its \
+                if ui::ghost_button(ui, "Restart", controllable, theme::VIOLET)
+                    .on_hover_text(if controllable {
+                        "Reboot the machine in place, as the guest's own Restart does"
+                    } else {
+                        "This VM was not started from here"
+                    })
+                    .clicked()
+                {
+                    actions.push(Action::Reset(vm.name.clone()));
+                }
+                // Suspend (ADR-0006): close the lid. Sits beside
+                // Stop because that is the choice being made — this
+                // is the other way to stop a machine, and the one
+                // that keeps everything it was doing.
+                if ui::ghost_button(ui, "Suspend", controllable, theme::VIOLET)
+                    .on_hover_text(if controllable {
+                        "Write the whole machine to a file and stop it. Opening it \
+                                 again puts you back exactly here. A machine with 2 GiB of \
+                                 memory takes a few seconds; a desktop takes longer."
+                    } else {
+                        "This VM was not started from here"
+                    })
+                    .clicked()
+                {
+                    actions.push(Action::Suspend(vm.name.clone()));
+                }
+            }
+            Status::Stopping => {
+                if ui::ghost_button(ui, "Kill", true, theme::ERR)
+                    .on_hover_text("Shutdown was requested; force it")
+                    .clicked()
+                {
+                    actions.push(Action::Stop(vm.name.clone()));
+                }
+            }
+            Status::Installing => {
+                if ui::ghost_button(ui, "Abort", true, theme::ERR).clicked() {
+                    actions.push(Action::Stop(vm.name.clone()));
+                }
+            }
+        }
+        // A suspended machine can be configured — it is not
+        // running — but changing its hardware is exactly what makes
+        // the saved session unrestorable, so the hover says so
+        // instead of the refusal arriving at resume time.
+        let configurable = matches!(status, Status::Stopped | Status::Suspended);
+        if ui::ghost_button(ui, "Configure", configurable, theme::VIOLET)
+            .on_hover_text(match status {
+                Status::Stopped => "Memory, vCPUs, boot, network, disks, display",
+                Status::Suspended => {
+                    "Memory, vCPUs, boot, network, disks, display. Changing the \
+                             hardware makes the saved session unrestorable — a snapshot \
+                             only goes back onto the machine it came off."
+                }
+                _ => "Stop the machine first",
+            })
+            .clicked()
+        {
+            actions.push(Action::AskEditVm(vm.name.clone()));
+        }
+        ui.menu_button("More", |ui| {
+            if ui.button("Copy profile path").clicked() {
+                actions.push(Action::CopyProfilePath(path.to_string()));
+                ui.close();
+            }
+            if let Some(task) = app
+                .supervisor
+                .tasks()
+                .iter()
+                .rev()
+                .find(|t| t.vm == vm.name)
+            {
+                if ui.button("Open activity log").clicked() {
+                    actions.push(Action::SelectLog(task.id));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if app.snapshot_for(&vm.name).is_some()
+                && ui
+                    .add_enabled(
+                        status == Status::Suspended,
+                        egui::Button::new("Forget the saved session"),
+                    )
+                    .on_hover_text(
+                        "Delete the snapshot and leave the machine stopped. Its \
                                  disks and settings are untouched.",
-                            )
-                            .clicked()
-                    {
-                        if let Some(row) = app.snapshot_for(&vm.name) {
-                            actions.push(Action::AskDeleteSnapshot(row.path.clone()));
-                        }
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            matches!(status, Status::Stopped | Status::Suspended),
-                            egui::Button::new("Delete machine"),
-                        )
-                        .clicked()
-                    {
-                        actions.push(Action::AskDelete(vm.name.clone()));
-                        ui.close();
-                    }
-                });
-            });
-        },
-    );
+                    )
+                    .clicked()
+            {
+                if let Some(row) = app.snapshot_for(&vm.name) {
+                    actions.push(Action::AskDeleteSnapshot(row.path.clone()));
+                }
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    matches!(status, Status::Stopped | Status::Suspended),
+                    egui::Button::new("Delete machine"),
+                )
+                .clicked()
+            {
+                actions.push(Action::AskDelete(vm.name.clone()));
+                ui.close();
+            }
+        });
+    });
 }
 
 /// What a machine in one of the two snapshot states has to say for itself.
@@ -503,8 +553,7 @@ fn suspend_line(ui: &mut egui::Ui, app: &ManagerApp, vm: &VmEntry, status: Statu
                 return;
             };
             let verdict = app.snapshot_verdict(row);
-            ui.add_space(2.0);
-            let mut line = match &row.facts {
+            let mut when = match &row.facts {
                 Ok(facts) => format!(
                     "saved {}",
                     vm_snapshot::meta::describe_age(
@@ -514,16 +563,28 @@ fn suspend_line(ui: &mut egui::Ui, app: &ManagerApp, vm: &VmEntry, status: Statu
                 ),
                 Err(_) => "saved session unreadable".to_string(),
             };
-            line.push_str(&format!(" · {}", format_bytes(row.apparent_bytes)));
-            ui.label(RichText::new(line).color(theme::VIOLET).size(12.0))
-                .on_hover_text(row.path.display().to_string());
-            if let Some(reason) = verdict.blocked.first() {
+            when.push_str(&format!(" · {}", format_bytes(row.apparent_bytes)));
+            ui.add_space(2.0);
+            // One line either way, never two. A card whose height depends on
+            // whether its snapshot happens to be refusable is a card that
+            // overflows its own border on the day the refusal appears — and a
+            // truncated half-sentence was never the whole reason anyway: the
+            // full text is on this line's hover, on the greyed-out Resume
+            // button, and written out in the Snapshots view.
+            if verdict.resumable() {
+                ui.label(RichText::new(when).color(theme::VIOLET).size(12.0))
+                    .on_hover_text(row.path.display().to_string());
+            } else {
                 ui.label(
-                    egui::RichText::new(shorten_end(reason, 52))
+                    RichText::new(format!("{when} · cannot resume here"))
                         .color(theme::WARN)
-                        .size(11.5),
+                        .size(12.0),
                 )
-                .on_hover_text(verdict.blocked.join("\n\n"));
+                .on_hover_text(format!(
+                    "{}\n\n{}",
+                    row.path.display(),
+                    verdict.blocked.join("\n\n")
+                ));
             }
         }
         _ => {}
@@ -709,17 +770,6 @@ fn accent_for(name: &str) -> f32 {
     (sum % 100) as f32 / 100.0
 }
 
-/// Trailing ellipsis, for a sentence that has a tooltip carrying the whole of
-/// it. The opposite end from [`shorten`], because a refusal's first words are
-/// the ones that identify it.
-fn shorten_end(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let head: String = text.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", head.trim_end())
-}
-
 /// Middle-ellipsis for long paths.
 fn shorten(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
@@ -747,17 +797,6 @@ mod tests {
             assert_eq!(value, accent_for(name));
             assert!((0.0..1.0).contains(&value), "{name} → {value}");
         }
-    }
-
-    #[test]
-    fn shorten_end_keeps_the_start_of_a_refusal() {
-        let reason = "This was saved on Linux/KVM and the machine is set to run on \
-                      Windows/WHP.";
-        let short = shorten_end(reason, 30);
-        assert!(short.starts_with("This was saved on"), "{short}");
-        assert!(short.ends_with('…'), "{short}");
-        assert!(short.chars().count() <= 30, "{short}");
-        assert_eq!(shorten_end("short", 30), "short");
     }
 
     #[test]

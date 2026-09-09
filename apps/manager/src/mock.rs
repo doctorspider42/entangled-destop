@@ -21,7 +21,10 @@ pub fn scan() -> Scan {
     let aurora_disk = root.join("aurora-lab.raw");
     let orion_disk = root.join("orion-build.raw");
 
-    let vms = vec![
+    // Name order, because that is what `discovery::scan` sorts a real
+    // directory into — a fixture whose grid is laid out differently from every
+    // real one is a fixture that hides layout problems.
+    let mut vms = vec![
         VmEntry {
             name: "nebula-dev".into(),
             profile_path: root.join("nebula-dev.toml"),
@@ -84,6 +87,7 @@ pub fn scan() -> Scan {
             disks: vec![disk_info(&orion_disk, 16 * GIB, 3 * GIB)],
         },
     ];
+    vms.sort_by(|a, b| a.name.cmp(&b.name));
 
     let disks = vec![
         disk_row(

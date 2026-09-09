@@ -105,112 +105,137 @@ fn snapshot_row(ui: &mut egui::Ui, app: &ManagerApp, row: &SnapshotRow, actions:
     let busy = app.is_busy(&vm_name);
     let width = ui.available_width();
 
-    ui::card(ui, id, Vec2::new(width, ROW_HEIGHT), accent_at, |ui, _| {
-        // Line 1: the machine it is of, badges, sizes on the right.
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(&vm_name)
-                    .size(16.0)
-                    .color(theme::TEXT)
-                    .strong(),
-            );
-            match &row.facts {
-                Ok(facts) => {
-                    ui::chip(ui, facts.host.as_str(), theme::CYAN);
-                    if verdict.resumable() {
-                        ui::chip(ui, "resumable", theme::OK);
-                    } else {
-                        ui::chip(ui, "cannot resume here", theme::WARN);
-                    }
-                }
-                Err(_) => ui::chip(ui, "unreadable", theme::ERR),
-            }
-            if busy {
-                ui::chip(ui, "machine is running", theme::OK);
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let mut text = format!("{} apparent", format_bytes(row.apparent_bytes));
-                if let Some(allocated) = row.allocated_bytes {
-                    text.push_str(&format!(" · {} on disk", format_bytes(allocated)));
-                }
-                ui.label(ui::dim(text)).on_hover_text(
-                    "A snapshot holds only the memory the guest had actually touched, and is \
-                     written sparse — so what it occupies is smaller again than its size.",
-                );
-            });
-        });
+    // A refusal is a whole sentence and it wraps: how many lines depends on the
+    // reason, the window width and the font, so the row's height is measured
+    // rather than declared. A fixed height was the first attempt — the
+    // foreign-hypervisor refusal, which is two lines at any ordinary window
+    // size, ran straight under the buttons.
+    let height = {
+        let mut probe = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("snapshot-row-sizing", &row.path))
+                .max_rect(egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    Vec2::new(width - 2.0 * ui::CARD_PAD, 4000.0),
+                ))
+                .layout(Layout::top_down(Align::Min))
+                .sizing_pass()
+                .invisible(),
+        );
+        snapshot_row_body(&mut probe, row, &verdict, &vm_name, busy, &mut Vec::new());
+        (probe.min_rect().height() + 2.0 * ui::CARD_PAD).max(ROW_HEIGHT)
+    };
 
-        // Line 2: when, and the machine's shape.
+    ui::card(ui, id, Vec2::new(width, height), accent_at, |ui, _| {
+        snapshot_row_body(ui, row, &verdict, &vm_name, busy, actions);
+    });
+}
+
+fn snapshot_row_body(
+    ui: &mut egui::Ui,
+    row: &SnapshotRow,
+    verdict: &crate::snapshots::Verdict,
+    vm_name: &str,
+    busy: bool,
+    actions: &mut Vec<Action>,
+) {
+    // Line 1: the machine it is of, badges, sizes on the right.
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(vm_name)
+                .size(16.0)
+                .color(theme::TEXT)
+                .strong(),
+        );
         match &row.facts {
             Ok(facts) => {
-                let taken = vm_snapshot::meta::format_unix(facts.created_unix);
-                ui.label(ui::dim(format!(
-                    "{} · taken {}",
-                    row.shape_line(),
-                    vm_snapshot::meta::describe_age(
-                        facts.created_unix,
-                        vm_snapshot::meta::now_unix()
-                    )
-                )))
-                .on_hover_text(format!("{taken}\nwritten by {}", facts.writer));
+                ui::chip(ui, facts.host.as_str(), theme::CYAN);
+                if verdict.resumable() {
+                    ui::chip(ui, "resumable", theme::OK);
+                } else {
+                    ui::chip(ui, "cannot resume here", theme::WARN);
+                }
             }
-            Err(error) => {
-                ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+            Err(_) => ui::chip(ui, "unreadable", theme::ERR),
+        }
+        if busy {
+            ui::chip(ui, "machine is running", theme::OK);
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let mut text = format!("{} apparent", format_bytes(row.apparent_bytes));
+            if let Some(allocated) = row.allocated_bytes {
+                text.push_str(&format!(" · {} on disk", format_bytes(allocated)));
             }
-        }
-        let path = row.path.display().to_string();
-        ui.label(ui::faint(shorten_start(&path, 72)))
-            .on_hover_text(&path);
-
-        // Line 3: why it cannot be used, or what is merely worth knowing.
-        for reason in verdict.blocked.iter().take(2) {
-            ui.label(RichText::new(reason).color(theme::WARN).size(11.5));
-        }
-        if verdict.blocked.is_empty() {
-            for note in verdict.notes.iter().take(1) {
-                ui.label(ui::faint(note.clone()));
-            }
-        }
-
-        // Line 4: the actions.
-        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(7.0, 6.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 7.0;
-                    if ui::ghost_button(ui, "Delete", !busy, theme::ERR)
-                        .on_hover_text(if busy {
-                            "The machine is running — it may be about to write here"
-                        } else {
-                            "Throw the saved session away. The machine and its disks stay."
-                        })
-                        .clicked()
-                    {
-                        actions.push(Action::AskDeleteSnapshot(row.path.clone()));
-                    }
-                    if ui::ghost_button(ui, "Reveal", true, theme::TEXT_DIM)
-                        .on_hover_text("Show the file in the system file manager")
-                        .clicked()
-                    {
-                        actions.push(Action::Reveal(row.path.clone()));
-                    }
-                    let resumable = verdict.resumable() && !busy;
-                    let hover = if busy {
-                        format!("'{vm_name}' is already running")
-                    } else if resumable {
-                        format!("Start '{vm_name}' from this session instead of booting it")
-                    } else {
-                        verdict.blocked.join("\n\n")
-                    };
-                    if ui::ghost_button(ui, "Resume", resumable, theme::VIOLET)
-                        .on_hover_text(hover)
-                        .clicked()
-                    {
-                        actions.push(Action::ResumeSnapshot(row.path.clone()));
-                    }
-                });
-            });
+            ui.label(ui::dim(text)).on_hover_text(
+                "A snapshot holds only the memory the guest had actually touched, and is \
+                     written sparse — so what it occupies is smaller again than its size.",
+            );
         });
+    });
+
+    // Line 2: when, and the machine's shape. A file that cannot be read has
+    // neither, and its one sentence is the refusal below — printing the raw
+    // parser error here as well said the same thing twice, in two voices.
+    if let Ok(facts) = &row.facts {
+        let taken = vm_snapshot::meta::format_unix(facts.created_unix);
+        ui.label(ui::dim(format!(
+            "{} · taken {}",
+            row.shape_line(),
+            vm_snapshot::meta::describe_age(facts.created_unix, vm_snapshot::meta::now_unix())
+        )))
+        .on_hover_text(format!("{taken}\nwritten by {}", facts.writer));
+    }
+    let path = row.path.display().to_string();
+    ui.label(ui::faint(shorten_start(&path, 72)))
+        .on_hover_text(&path);
+
+    // Line 3: why it cannot be used, or what is merely worth knowing. Whole
+    // sentences, wrapped — this is the one surface where a refusal is read
+    // rather than hovered, and the row grows to hold it.
+    ui.add_space(4.0);
+    for reason in verdict.blocked.iter().take(2) {
+        ui.label(RichText::new(reason).color(theme::WARN).size(11.5));
+    }
+    if verdict.blocked.is_empty() {
+        for note in verdict.notes.iter().take(1) {
+            ui.label(ui::faint(note.clone()));
+        }
+    }
+
+    // Line 4: the actions, on the row's own last line.
+    ui.add_space(8.0);
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 7.0;
+        if ui::ghost_button(ui, "Delete", !busy, theme::ERR)
+            .on_hover_text(if busy {
+                "The machine is running — it may be about to write here"
+            } else {
+                "Throw the saved session away. The machine and its disks stay."
+            })
+            .clicked()
+        {
+            actions.push(Action::AskDeleteSnapshot(row.path.clone()));
+        }
+        if ui::ghost_button(ui, "Reveal", true, theme::TEXT_DIM)
+            .on_hover_text("Show the file in the system file manager")
+            .clicked()
+        {
+            actions.push(Action::Reveal(row.path.clone()));
+        }
+        let resumable = verdict.resumable() && !busy;
+        let hover = if busy {
+            format!("'{vm_name}' is already running")
+        } else if resumable {
+            format!("Start '{vm_name}' from this session instead of booting it")
+        } else {
+            verdict.blocked.join("\n\n")
+        };
+        if ui::ghost_button(ui, "Resume", resumable, theme::VIOLET)
+            .on_hover_text(hover)
+            .clicked()
+        {
+            actions.push(Action::ResumeSnapshot(row.path.clone()));
+        }
     });
 }
 

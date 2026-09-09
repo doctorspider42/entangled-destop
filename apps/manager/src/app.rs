@@ -581,6 +581,9 @@ impl ManagerApp {
             ScreenshotView::SnapshotDelete => {
                 app.view = View::Snapshots;
             }
+            // The discard confirmation belongs to a card, so it is reviewed
+            // over the Machines grid it is opened from.
+            ScreenshotView::SnapshotDiscard => app.view = View::Machines,
             ScreenshotView::Main
             | ScreenshotView::Editor
             | ScreenshotView::EditorBoot
@@ -895,6 +898,22 @@ impl ManagerApp {
             };
             self.screenshot_surface_opened = true;
             self.ask_delete_snapshot(&path);
+            return;
+        }
+        if self.screenshot_view == ScreenshotView::SnapshotDiscard {
+            // The one machine that is actually suspended, which is the only
+            // state the dialog can be reached from.
+            let Some(name) = self
+                .scan
+                .vms
+                .iter()
+                .map(|vm| vm.name.clone())
+                .find(|name| self.status_of(name) == Status::Suspended)
+            else {
+                return;
+            };
+            self.screenshot_surface_opened = true;
+            self.ask_discard_snapshot(&name);
             return;
         }
         let section = match self.screenshot_view {
@@ -2413,6 +2432,15 @@ impl ManagerApp {
                     self.mock_statuses.insert(name.clone(), Status::Running);
                     self.toast(ToastLevel::Success, format!("Mock: resumed '{name}'"));
                 }
+            }
+            // "Start fresh" on a machine whose saved session has already gone
+            // is just a start, and `ask_discard_snapshot` does exactly that —
+            // including the child spawn, which mock mode must never reach. The
+            // guard leaves the ordinary case (there *is* a session) to the real
+            // handler, which only opens a modal.
+            Action::AskDiscardSnapshot(name) if self.snapshot_for(name).is_none() => {
+                self.mock_statuses.insert(name.clone(), Status::Running);
+                self.toast(ToastLevel::Success, format!("Mock: started '{name}'"));
             }
             Action::ConfirmDeleteSnapshot => {
                 if let Modal::DeleteSnapshot(state) = &self.modal {

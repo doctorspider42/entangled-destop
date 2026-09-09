@@ -994,7 +994,10 @@ fn edit_vm_body(ui: &mut egui::Ui, state: &mut crate::app::EditVmState, actions:
                 (
                     EditVmSection::NetworkDisplay,
                     "Network & display",
-                    "Connectivity, screen, 3D, sound",
+                    // One line at 184 px, which is what the card is: a second
+                    // line is clipped, and "3D" is the one word this list can
+                    // spare — it sits directly under Screen in the panel.
+                    "Network, screen, sound, gamepad",
                     theme::OK,
                 ),
                 (
@@ -1572,6 +1575,25 @@ fn edit_network_display(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
             );
         }
     }
+
+    ui.add_space(12.0);
+    ui::form_row(
+        ui,
+        "GAMEPAD",
+        "Gives the machine a game controller, and passes one plugged into this computer \
+         through to it. Off by default: an existing machine keeps exactly the hardware it \
+         had, and a guest that gains a joystick can change what its games do.",
+        |ui, _| {
+            ui.checkbox(&mut form.gamepad, "Give this machine a gamepad")
+                .on_hover_text(
+                    "An Xbox-shaped controller the guest recognises with no drivers from \
+                     us. Entangled reads whichever pad this computer has — XInput on \
+                     Windows, evdev on Linux — and the guest sees one either way, even \
+                     with nothing plugged in yet, so a pad can be connected while the \
+                     machine is running.",
+                );
+        },
+    );
 }
 
 /// One sentence per sound backend, for the hover in the picker.
