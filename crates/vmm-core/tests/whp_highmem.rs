@@ -194,6 +194,21 @@ fn cloudhv_firmware_boots_a_guest_with_ram_above_the_split_on_whp() {
             .filter(|l| l.contains("ASSERT"))
             .collect::<Vec<_>>()
     );
+    // The firmware's own CPU count, from `MpInitLib`'s INIT-SIPI sweep. This
+    // used to be left unasserted as "the load flake"; the flake was a torn read
+    // of our ACPI PM timer (machine_x86::acpi::pm), not something a test has to
+    // tolerate.
+    assert!(
+        log.contains(&format!(
+            "MpInitLib: Find {} processors in system",
+            MACHINE.vcpu_count
+        )),
+        "the firmware did not find exactly {} processors: {:?}",
+        MACHINE.vcpu_count,
+        log.lines()
+            .filter(|l| l.contains("MpInitLib"))
+            .collect::<Vec<_>>()
+    );
     assert!(
         log.contains(BOOT_MANAGER),
         "the firmware did not reach the Boot Manager within {DEADLINE:?}:\n{}",
