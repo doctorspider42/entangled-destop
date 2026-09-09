@@ -20,6 +20,8 @@
 //! | `ENTANGLED_SOAK_HEARTBEAT_MS` | 1000 | the guest's heartbeat period |
 //! | `ENTANGLED_SOAK_MEMORY_MIB` | 256 | guest RAM |
 //! | `ENTANGLED_SOAK_TRANSPORT` | mmio | `pci` runs the same soak over virtio-pci |
+//! | `ENTANGLED_SOAK_CMDLINE` | — | extra words for the guest's kernel command line |
+//! | `ENTANGLED_SOAK_POLL_MS` | 500 | how often the harness re-reads the console |
 //! | `ENTANGLED_SOAK_LOG` | — | write every sample to this TSV file as it is taken |
 //!
 //! **Use the log file.** A soak is exactly the kind of run that a reboot, a
@@ -47,8 +49,19 @@
 //!   nowhere else. Both counts must be *identical* to the settled baseline.
 //! * **Timer drift** — the guest's own `CLOCK_MONOTONIC` against the host's,
 //!   compared between the first and last heartbeat whose arrival the host timed.
-//!   Reported in ppm; a TSC or kvm-clock that is offered to the guest at the
-//!   wrong frequency drifts linearly and is invisible in a four-second boot.
+//!   Reported in ppm, with the measurement's own error beside it.
+//!
+//!   **This is the one that currently fails**, on the development host: a
+//!   2 h run on 2026-09-09 measured **−12 603 ppm** — the guest lost 90.7 s,
+//!   about 18 minutes a day — while leaking nothing, dropping no interrupt and
+//!   printing one benign line. It is not the clocksource (forcing `kvm-clock`
+//!   moves it by 0.07 %), not the harness (a 25 ms observer poll moves it by
+//!   2 %, the wrong way) and not lost output (zero gaps); it scales with host
+//!   load, from ~−5 000 ppm on a quiet machine to −2.5 % under a load average
+//!   of 20. The guest's time base appears to lose the time its vCPU is not
+//!   running, which is what a nested host (KVM inside WSL2) would produce. The
+//!   gate stays at 10 000 ppm on purpose — see the `vm-testing` skill for the
+//!   control runs and the open questions.
 //! * **Interrupt and queue stalls** — the heartbeat is written by userspace to
 //!   the tty, i.e. through the *interrupt-driven* 8250 path (the one that lost
 //!   edges before the machine had an IOAPIC; see `repeat_boot.rs`). Every
@@ -276,13 +289,25 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
     let soak = Duration::from_secs(soak_secs);
     let sample_every = Duration::from_secs(sample_secs);
 
+    // Words appended to the guest's command line. The reason this exists is
+    // the drift finding below: `ENTANGLED_SOAK_CMDLINE=clocksource=kvm-clock`
+    // is the control run that told a wrong *clocksource* apart from a wrong
+    // *clock*, and an experiment that has to be re-run by editing the test is
+    // an experiment nobody re-runs.
+    let extra_cmdline = std::env::var("ENTANGLED_SOAK_CMDLINE").unwrap_or_default();
+    // How often the harness refreshes its copy of the console. The default is
+    // 500 ms because at the harness's own 2 ms the whole transcript would be
+    // copied and scanned five hundred times a second for hours — but it is also
+    // the dominant term in the drift measurement's error, so the drift finding's
+    // control run needs to be able to shrink it.
+    let poll_ms = env_u64("ENTANGLED_SOAK_POLL_MS", 500, 10, 5_000);
     let mut spec = BootSpec::new(kernel, initramfs)
-        .with_extra_cmdline(format!("entangled.heartbeat={heartbeat_ms}"))
+        .with_extra_cmdline(format!(
+            "entangled.heartbeat={heartbeat_ms} {extra_cmdline}"
+        ))
         .with_transport(transport())
         .with_vcpus(1)
-        // At the default 2 ms the harness would copy and scan the whole
-        // transcript five hundred times a second for four hours.
-        .with_poll_interval(Duration::from_millis(500));
+        .with_poll_interval(Duration::from_millis(poll_ms));
     spec.memory_mib = memory_mib;
     // The driver ends the run; the deadline is only the backstop that keeps a
     // wedged driver from running for ever.
@@ -310,8 +335,14 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
             file,
             "# entangled soak: {soak_secs} s, {} transport, {memory_mib} MiB, \
              heartbeat {heartbeat_ms} ms, sample {sample_secs} s, warm-up {warmup:?}\n\
+             # guest cmdline extra: {}\n\
              at_s\trss_kib\tfds\tthreads\tticks\tguest_ms\thost_ms\tdrift_ppm\tserial_bytes",
-            spec.transport
+            spec.transport,
+            if extra_cmdline.is_empty() {
+                "(none)"
+            } else {
+                &extra_cmdline
+            }
         );
         let _ = file.flush();
     }
@@ -377,29 +408,11 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
                 host_ms: beat.seen.duration_since(base_beat.seen).as_secs_f64() * 1000.0,
                 serial_bytes: vm.serial_bytes(),
             };
-            state.samples.push(take(0.0, &vm, base_beat));
-
-            let mut next_sample = started + sample_every;
-            while started.elapsed() < soak {
-                std::thread::sleep(OBSERVE_INTERVAL);
-                // Track the newest heartbeat continuously rather than only at
-                // sample time: the drift measurement's error is how stale this
-                // reading is, so it is kept to one observe interval.
-                if let Some((tick, guest_uptime_ms)) = last_beat(&vm.serial_tail(4096)) {
-                    if state.last_beat.map(|b| b.tick) != Some(tick) {
-                        state.last_beat = Some(Beat {
-                            tick,
-                            guest_uptime_ms,
-                            seen: Instant::now(),
-                        });
-                    }
-                }
-                if Instant::now() < next_sample {
-                    continue;
-                }
-                next_sample += sample_every;
-                let beat = state.last_beat.unwrap_or(base_beat);
-                let sample = take(started.elapsed().as_secs_f64(), &vm, beat);
+            // Every sample goes to the console and to the black box through
+            // this one place — including the baseline. A log file whose first
+            // row is the *second* sample cannot reproduce the summary it is
+            // supposed to be evidence for.
+            let record = |sample: &Sample, log: &mut Option<std::fs::File>| {
                 println!(
                     "soak {:>7.0}s: rss={} KiB fds={} threads={} ticks={} drift={:+.0} ppm \
                      console={} B",
@@ -427,6 +440,34 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
                     );
                     let _ = file.flush();
                 }
+            };
+
+            let baseline = take(0.0, &vm, base_beat);
+            record(&baseline, &mut log);
+            state.samples.push(baseline);
+
+            let mut next_sample = started + sample_every;
+            while started.elapsed() < soak {
+                std::thread::sleep(OBSERVE_INTERVAL);
+                // Track the newest heartbeat continuously rather than only at
+                // sample time: the drift measurement's error is how stale this
+                // reading is, so it is kept to one observe interval.
+                if let Some((tick, guest_uptime_ms)) = last_beat(&vm.serial_tail(4096)) {
+                    if state.last_beat.map(|b| b.tick) != Some(tick) {
+                        state.last_beat = Some(Beat {
+                            tick,
+                            guest_uptime_ms,
+                            seen: Instant::now(),
+                        });
+                    }
+                }
+                if Instant::now() < next_sample {
+                    continue;
+                }
+                next_sample += sample_every;
+                let beat = state.last_beat.unwrap_or(base_beat);
+                let sample = take(started.elapsed().as_secs_f64(), &vm, beat);
+                record(&sample, &mut log);
                 state.samples.push(sample);
             }
             state.ran_for = Some(started.elapsed());
@@ -528,8 +569,9 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
          delivery          worst interval {:.2} of expected ({} expected per {sample_secs} s), \
          at {:.0} s\n\
          guest clock       {:.0} ms guest vs {:.0} ms host, drift {:+.0} ppm \
-         (+-{:.0} ppm observation error)\n\
-         console           {} bytes total, {:.1} B per heartbeat, {} unexpected lines\n\
+         (+-{:.0} ppm observation error), clocksource {}\n\
+         console           {} bytes total, {:.1} B per heartbeat since the baseline, \
+         {} unexpected lines\n\
          ---------------------------------------------------------------------",
         last.at_s,
         last.at_s / 3600.0,
@@ -552,8 +594,13 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
         host_ms,
         drift_ppm,
         drift_err_ppm,
+        guest_clocksource(&outcome.serial).unwrap_or_else(|| "unknown".to_string()),
         last.serial_bytes,
-        last.serial_bytes as f64 / (last.ticks.max(1) as f64),
+        // Marginal, not average: the boot log is a fixed cost the guest paid
+        // once, and dividing it into the run's beats hides the number that
+        // matters — what one settled heartbeat costs on the wire.
+        (last.serial_bytes - baseline.serial_bytes) as f64
+            / (last.ticks.saturating_sub(baseline.ticks).max(1) as f64),
         unexpected.len(),
     );
     println!("\n{report}");
@@ -626,6 +673,20 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
         "{} console lines that are not heartbeats: the guest is logging something",
         unexpected.len()
     );
+}
+
+/// The clocksource the guest kernel settled on, from its own boot log.
+///
+/// Printed beside the drift because it is the first thing anyone will ask about
+/// a drift number, and because it is not constant: this guest starts on
+/// `kvm-clock` and switches to `tsc` two seconds later, and those two answer to
+/// completely different things on the host side.
+fn guest_clocksource(console: &str) -> Option<String> {
+    console
+        .lines()
+        .filter_map(|line| line.split_once("Switched to clocksource "))
+        .map(|(_, name)| name.trim().to_string())
+        .next_back()
 }
 
 /// Every heartbeat tick number on the console, in order.

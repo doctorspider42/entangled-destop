@@ -862,7 +862,12 @@ configuration:
     the manager did not start, because the control channel is a pipe to a child
     process. A *suspended* machine is the exception: that state is a file on
     disk, so it survives a restart of the manager.
-15. **One gamepad per machine, and no rumble.** The pad is an Xbox 360-shaped
+15. **The guest's clock runs slow.** Measured at 1.26 % over two hours on the
+    development host, and worse the busier the host is; a guest running NTP
+    corrects it invisibly, one without NTP will drift. See
+    [troubleshooting](troubleshooting.md#the-clock-inside-the-guest-falls-behind)
+    for what has and has not been ruled out.
+16. **One gamepad per machine, and no rumble.** The pad is an Xbox 360-shaped
     virtio-input device; force feedback has no path back to the host controller,
     there is no second player, and there is no host-side deadzone or response
     curve (deliberately — the guest's own calibration would not be able to see
@@ -882,6 +887,7 @@ configuration:
 | `entangled fetch debian …`, `install debian …` | from the CLI's help output and the Debian install path's documentation; not re-run for this guide |
 | `entangled install ubuntu --iso <desktop iso> …` | the server command with the flags the CLI documents; the Desktop variant is what `tests/boot/tests/desktop_gnome.rs` boots, but this exact line was not re-run for the guide |
 | `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All` | the standard Windows spelling of the feature this project requires; the feature is enabled on the development host |
+| the clock-drift numbers | `cargo test -p boot-tests --test soak -- --ignored --nocapture` for two hours on this machine, plus three shorter control runs; the numbers are this run's own output, and the run **fails** on them |
 | the manager's views | rendered while writing this guide with `cargo run -p entangled-manager -- --mock --screenshot <png> --screenshot-view main\|wizard\|diagnostics`, and again for the Snapshots work with `--screenshot-view snapshots\|snapshot-delete\|snapshot-discard\|editor-network`; described from the pictures and the source |
 | the control channel's replies | `cargo test -p entangled --test suspend_restore -- --nocapture`, which passes; the `saved …` line is one of its own, with the path shortened |
 | `[gamepad] enabled = true`, and what the guest makes of the pad | `cargo test -p boot-tests --test gamepad -- --nocapture` was run here and passes: the guest kernel reports `name=Entangled_Gamepad … keys=11 axes=8 absx=-32768:32767:16:128`. The `js*` half of it self-skipped, because this checkout's bootstrap kernel predates `CONFIG_INPUT_JOYDEV=y` — so **`js0` vs `js1` is quoted from GAME-2104's acceptance run** (recorded in the backlog), not observed here |
