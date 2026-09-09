@@ -16,9 +16,13 @@
 //!
 //! # Where it comes from now, in order
 //!
-//! 1. **`--firmware`**, or the `firmware` key of the profile being run. An
-//!    explicit path is obeyed and, when it is missing, named in the error
-//!    rather than quietly replaced.
+//! 1. **`--firmware`**, or the `firmware` key of the profile being run — two
+//!    halves that behave differently on purpose ([`resolve`] versus
+//!    [`resolve_profile`]). A path you *typed* is obeyed or named in the error;
+//!    a `--firmware` silently replaced by something else is how an afternoon
+//!    disappears. A path a *profile* carries is a starting point: it names the
+//!    firmware of the computer that created the machine, so when it is not
+//!    here the lookup continues at 2 and logs which one it used instead.
 //! 2. **`ENTANGLED_FIRMWARE_DIR`** — a directory holding `CLOUDHV.fd`. The
 //!    escape hatch for a developer who just rebuilt EDK2 and means *that* one.
 //! 3. **The install directory**: `CLOUDHV.fd` under `artifacts/firmware/`

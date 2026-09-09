@@ -218,11 +218,14 @@ firmware down beside `entangled.exe`, and it is found from any working
 directory. Nothing to copy, nothing to configure, and a machine created there
 records that absolute path in its profile.
 
-Row 1 is also a *fallback*, not a trap. A profile created on another computer
-names that computer's firmware path; when the file is not there, `entangled`
-falls through to rows 2–5 and logs the substitution rather than refusing to
-start. That is what makes a profile portable between a Linux checkout and a
-Windows installation.
+Row 1 has two halves that behave differently, deliberately. A `--firmware` you
+typed is obeyed or named in the error — never quietly replaced, because a flag
+that silently did nothing is how an afternoon disappears. A *profile's*
+`[boot] firmware`, on the other hand, is a starting point: a machine created on
+another computer names that computer's path, and when the file is not there
+`entangled` falls through to rows 2–5 and logs which one it used instead. That
+is what makes a machine portable between a Linux checkout and a Windows
+installation.
 
 If a host has none of them:
 

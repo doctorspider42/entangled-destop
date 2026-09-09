@@ -243,7 +243,17 @@ pub fn fetch_into(
                 ));
             }
             if token.is_none() {
-                token = Some(github_token());
+                // Only for github.com. A mirror named through the environment
+                // must never receive an `Authorization` header, and the surest
+                // way to guarantee that is not to go looking for a token at
+                // all — which also spares a `gh auth token` process spawn on
+                // every offline-mirror fetch.
+                token = Some(
+                    github_repo(release.base_url)
+                        .is_some()
+                        .then(github_token)
+                        .flatten(),
+                );
             }
             let token = token.as_ref().and_then(Option::as_deref);
             download_verified(transport, release, asset, &path, &expected, token)?;
