@@ -143,6 +143,24 @@ unit tests live with their crates.
   `/proc/bus/input/handlers`) and the test skips only the `js*` assertions,
   saying so. A guest probe that can distinguish "the device was refused" from
   "the kernel cannot answer" is worth the four extra lines every time.
+  **Check which kernel you have before trusting a green run.** That escape
+  hatch is doing real work: a `vmlinuz` from before 2026-09-09 has no joydev,
+  so every `js*` assertion in `tests/boot/tests/gamepad.rs` passes without
+  checking anything and prints `NOT CHECKED` while doing it. `joydev=1` in the
+  `padinfo` line is the only proof the js half ran. Rebuild with
+  `guest/bootstrap-kernel/build.sh` (it asserts the symbol) if it says 0.
+- The same probe prints two more lines. `inputmap` is the whole machine's
+  input topology — one `name:uniq:eventnode:jsnode` record per device — and it
+  is the only place questions *about the devices next to a device* can be
+  settled: which of them `joydev` claimed, and therefore who gets `js0`; and
+  whether a two-player VM really has two distinct joysticks (different
+  `U: Uniq=`, different nodes). `padinfo` additionally carries `evbits=` (the
+  `B: EV=` bitmap verbatim), `ff=` and `ffwrite=`, which together with the
+  host-side `InputHandle::ev_bits_probed` and `EventStats::status_ff` are how
+  the rumble dead end is asserted as a *negative result* rather than left as a
+  TODO. Both patterns generalise: when the claim is about the guest kernel's
+  own classification, quote the kernel's bytes rather than paraphrasing them,
+  and when the claim is "the guest never asked", record what it *did* ask.
 - Sources: `guest/test-rootfs/init-rs` (static musl init), built by
   `scripts/build-test-initramfs.sh`; kernel via `scripts/fetch-test-kernel.sh`.
 
@@ -821,6 +839,7 @@ full and the fuzz build is large.
 | `blk_discard` | the DISCARD / WRITE_ZEROES segment array: `segment_count` on the array's shape, `DiscardSegment::parse`/`validate` on each range, for both commands. Asserts what the host then relies on — an accepted range is inside the disk, its byte offset *and* end are representable, `unmap` only for write-zeroes, only the one defined flag bit ever accepted |
 | `gpu_3d_commands` | `virtio_gpu::renderer::validate_stream` on raw bytes, plus arbitrary 3D command sequences (contexts, creates, backing, transfers, submits, readback) through `Gpu3d` + `NullRenderer` with real guest memory |
 | `gpu_blob` | the blob-resource surface (VEN-2001/2007): the three wire parsers on raw bytes including the `nr_entries` walk, then arbitrary create/map/unmap/unref against `BlobTable` with the renderer's declared support itself fuzzed. Asserts the invariants, not just absence of panic — the byte budget equals the sum of live blobs, the window holds exactly the mappings the harness believes in, every mapping is inside the window, and **no two mappings overlap**, re-derived from outside after every operation |
+| `input_device` | the whole virtio-input device over a real `MmioTransport`: arbitrary chains on both queues, the config-space `(select, subsel)` state machine at any width and offset (a `size` that outran its payload would leak out of the device struct), guest writes to read-only config bytes, and host pushes interleaved with all of it. The status queue is the point — it is the only thing a guest can *write* to this device, and the `EV_FF` request rumble would have used lands there. Asserts no panic, no `DEVICE_NEEDS_RESET`, that the status queue is never written back, and that no used entry claims more than one `virtio_input_event` or more than a chain offered |
 | `snd_control` | the virtio-snd parsers and bounds on raw bytes: `QueryInfo`/`ItemHdr`/`RawSetParams` round trips, `stream::validate_params`, `validate_xfer` and the lifecycle. Asserts that an *accepted* SET_PARAMS is inside every advertised set and every named bound, and that a refusal is `BAD_MSG` or `NOT_SUPP` and never `OK`/`IO_ERR` |
 | `snd_device` | a brought-up `SoundDevice` with a live pump thread behind a real `MmioTransport`, fed descriptor chains of arbitrary shape (any lengths, any addresses, readable/writable in any order, indirect flags) on all four queues, interleaved with resets. Asserts no panic, no `DEVICE_NEEDS_RESET` from guest input, and no used entry claiming more bytes than the guest offered |
 | `gpu_remote_protocol` | the isolated-renderer wire format, both directions, with an exact re-encode check |

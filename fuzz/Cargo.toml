@@ -29,6 +29,7 @@ arbitrary = { version = "1", features = ["derive"] }
 virtio-core = { path = "../crates/virtio-core", features = ["test-utils"] }
 vm-memory = { version = "0.17", features = ["backend-mmap"] }
 virtio-block = { path = "../crates/virtio-block" }
+virtio-input = { path = "../crates/virtio-input" }
 virtio-gpu = { path = "../crates/virtio-gpu" }
 virtio-sound = { path = "../crates/virtio-sound" }
 # `fuzzing` exposes the offline NAT harness: the real router with no host
@@ -89,6 +90,13 @@ bench = false
 [[bin]]
 name = "gpu_blob"
 path = "fuzz_targets/gpu_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "input_device"
+path = "fuzz_targets/input_device.rs"
 test = false
 doc = false
 bench = false

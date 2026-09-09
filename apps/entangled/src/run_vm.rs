@@ -395,9 +395,13 @@ fn build_devices(
         ));
     }
 
-    // virtio-input gamepad (GAME-2104), last for the same reason the sound
+    // virtio-input gamepads (GAME-2104), last for the same reason the sound
     // card is second-to-last: appending never renames a disk nor moves a PCI
     // function that an existing profile already depends on.
+    //
+    // One device per player, in player order, so player 1 is the lowest slot
+    // and therefore the lowest `/dev/input/js*` in the guest: joydev hands
+    // out minors in registration order, and registration order is this order.
     if cfg.gamepad.enabled {
         let choice = match cfg.gamepad.backend {
             control_api::GamepadBackend::Auto => virtio_input::SourceChoice::Auto,
@@ -409,16 +413,20 @@ fn build_devices(
         // pad plugged in later is picked up — but an explicitly named
         // mechanism that this host does not have fails the run, exactly as
         // `[sound] backend` and `[display] virgl` do.
-        let (mechanism, factory) = virtio_input::open_source(choice)
+        let players = usize::from(cfg.gamepad.players.max(1));
+        let (mechanism, factories) = virtio_input::open_sources(choice, players)
             .map_err(|e| format!("[gamepad] backend = \"{}\": {e}", cfg.gamepad.backend))?;
         tracing::info!(
             mechanism,
+            players = factories.len(),
             requested = %cfg.gamepad.backend,
-            "attaching virtio-input gamepad"
+            "attaching virtio-input gamepads"
         );
-        devices.push(Box::new(virtio_input::InputDevice::gamepad_with_capture(
-            factory,
-        )));
+        for (player, factory) in factories.into_iter().enumerate() {
+            devices.push(Box::new(
+                virtio_input::InputDevice::gamepad_with_capture_for_player(factory, player),
+            ));
+        }
     }
 
     Ok(BuiltDevices {
