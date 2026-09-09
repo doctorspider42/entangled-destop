@@ -203,9 +203,14 @@ struct BuiltDevices {
 }
 
 /// One virtio-blk device per `[[disk]]` entry, the configured network backend,
-/// the GPU on the given scanout and the two input devices — in exactly this
-/// order on both hosts, because device order is guest-visible naming
-/// (`/dev/vda`, `00:01.0`).
+/// the GPU on the given scanout, the keyboard and tablet, and then the two
+/// opt-in devices — the sound card and the gamepad — in exactly this order on
+/// both hosts, because device order is guest-visible naming (`/dev/vda`,
+/// `00:01.0`). Anything new goes on the *end*, for the same reason.
+///
+/// The full set is eight devices with one disk and no CD-ROM, which is exactly
+/// `machine_x86::virtio::MAX_VIRTIO_SLOTS`; the bus refuses a ninth by name and
+/// count when it is built.
 fn build_devices(
     cfg: &VmConfig,
     display_handle: display::DisplayHandle,
@@ -380,6 +385,33 @@ fn build_devices(
         );
         devices.push(Box::new(virtio_sound::SoundDevice::new(sink, factory)));
     }
+
+    // virtio-input gamepad (GAME-2104), last for the same reason the sound
+    // card is second-to-last: appending never renames a disk nor moves a PCI
+    // function that an existing profile already depends on.
+    if cfg.gamepad.enabled {
+        let choice = match cfg.gamepad.backend {
+            control_api::GamepadBackend::Auto => virtio_input::SourceChoice::Auto,
+            control_api::GamepadBackend::Null => virtio_input::SourceChoice::Null,
+            control_api::GamepadBackend::Evdev => virtio_input::SourceChoice::Evdev,
+            control_api::GamepadBackend::XInput => virtio_input::SourceChoice::XInput,
+        };
+        // `auto` never fails — a machine with no controller still boots, and a
+        // pad plugged in later is picked up — but an explicitly named
+        // mechanism that this host does not have fails the run, exactly as
+        // `[sound] backend` and `[display] virgl` do.
+        let (mechanism, factory) = virtio_input::open_source(choice)
+            .map_err(|e| format!("[gamepad] backend = \"{}\": {e}", cfg.gamepad.backend))?;
+        tracing::info!(
+            mechanism,
+            requested = %cfg.gamepad.backend,
+            "attaching virtio-input gamepad"
+        );
+        devices.push(Box::new(virtio_input::InputDevice::gamepad_with_capture(
+            factory,
+        )));
+    }
+
     Ok(BuiltDevices {
         devices,
         net_cmdline,

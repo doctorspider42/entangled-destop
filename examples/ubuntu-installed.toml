@@ -70,3 +70,21 @@ scale = 1.0
 # provide it fails the run instead.
 [sound]
 enabled = true
+
+# A gamepad (GAME-2104). Off unless a profile asks, and attached last, for the
+# same reasons as the sound card — including the slot budget: with a disk, the
+# network, the GPU, keyboard, tablet and sound, this is the eighth and last
+# device the bus has room for.
+#
+# `backend = "auto"` (the default) reads real controllers through evdev on
+# Linux and XInput on Windows, and quietly does nothing on a machine with no
+# controller — a pad plugged in later is picked up without restarting the VM,
+# and one unplugged releases whatever it was holding. Name a mechanism
+# explicitly ("null", "evdev", "xinput") and a host that cannot provide it
+# fails the run instead.
+#
+# The guest sees an Xbox-shaped pad on /dev/input/js0 and /dev/input/event*,
+# which SDL (and therefore Steam) maps from its capabilities with no
+# controller-database entry and no per-game configuration.
+[gamepad]
+enabled = true

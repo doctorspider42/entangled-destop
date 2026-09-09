@@ -13,6 +13,8 @@
 //!   no `virtio_mmio.device=` clause anywhere on the command line.
 //! * `tests/lifecycle.rs` — ADR-0005: pause, resume and reboot-in-place, using
 //!   [`boot_once_driven`] to act on the VM while its vCPUs are running.
+//! * `tests/gamepad.rs` — GAME-2104: what a real guest kernel makes of the
+//!   gamepad descriptor, and hotplug through the production capture pump.
 //!
 //! [`BootSpec::transport`] selects the virtio transport, so any test built on the
 //! harness can be run either way — which is the point: a transport that only the
@@ -84,7 +86,42 @@ pub struct BootSpec {
     /// [`PciInterruptMode::IntxOnly`] explicitly, because a Linux guest offered
     /// MSI-X will never choose INTx and the path would stop being tested.
     pub pci_interrupts: PciInterruptMode,
+    /// Whether to attach a virtio-input gamepad (GAME-2104), and what drives
+    /// it. Never a *real* controller: see [`GamepadAttach`].
+    pub gamepad: GamepadAttach,
     pub deadline: Duration,
+}
+
+/// How a boot attaches the virtio-input gamepad (GAME-2104).
+///
+/// Neither variant ever touches a host controller, and that is deliberate: a
+/// machine with a pad plugged into it and a machine without must produce
+/// identical results, or the acceptance is measuring the developer's desk.
+#[derive(Clone, Default)]
+pub enum GamepadAttach {
+    /// No pad on the bus at all.
+    #[default]
+    None,
+    /// A pad with no capture behind it. The only thing that can move it is
+    /// [`VmHandle::gamepad`], so the test writes the exact event sequence it
+    /// then asserts on — which is what the descriptor acceptance needs.
+    Injected,
+    /// A pad driven by the real [`virtio_input::GamepadCapture`] pump over a
+    /// scripted [`virtio_input::GamepadSource`]. Slower and less exact than
+    /// [`Self::Injected`], and the only way to exercise the half of the path a
+    /// direct push skips: connect/disconnect, the state diff, and therefore
+    /// hotplug.
+    Captured(virtio_input::SourceFactory),
+}
+
+impl std::fmt::Debug for GamepadAttach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "None",
+            Self::Injected => "Injected",
+            Self::Captured(_) => "Captured(..)",
+        })
+    }
 }
 
 impl BootSpec {
@@ -105,6 +142,7 @@ impl BootSpec {
             notify: QueueNotifyMode::from_env(),
             transport: VirtioTransport::default(),
             pci_interrupts: PciInterruptMode::default(),
+            gamepad: GamepadAttach::None,
             deadline: DEFAULT_DEADLINE,
         }
     }
@@ -173,6 +211,39 @@ impl BootSpec {
     /// [`Self::pci_interrupts`].
     pub fn with_pci_interrupts(mut self, interrupts: PciInterruptMode) -> Self {
         self.pci_interrupts = interrupts;
+        self
+    }
+
+    /// Attaches a gamepad and asks the guest to report what the kernel made of
+    /// it, then to echo up to `events` input events (GAME-2104).
+    ///
+    /// `events` is a **ceiling**, not a target: the guest also stops after a
+    /// short silence, so asking for more than the host injects turns the
+    /// probe's `seq=` into evidence that nothing else followed. The driver
+    /// injects through [`VmHandle::gamepad`] once the guest's `padinfo` line
+    /// says its event node is open.
+    pub fn with_gamepad_probe(mut self, events: usize) -> Self {
+        self.gamepad = GamepadAttach::Injected;
+        self.with_pad_probe_cmdline(events)
+    }
+
+    /// The same probe, but with the pad driven by the production capture pump
+    /// over `source` instead of by direct pushes — the hotplug acceptance.
+    pub fn with_gamepad_capture(
+        mut self,
+        source: virtio_input::SourceFactory,
+        events: usize,
+    ) -> Self {
+        self.gamepad = GamepadAttach::Captured(source);
+        self.with_pad_probe_cmdline(events)
+    }
+
+    fn with_pad_probe_cmdline(mut self, events: usize) -> Self {
+        self.extra_cmdline = match self.extra_cmdline.trim() {
+            "" => format!("entangled.padprobe={events}"),
+            existing => format!("{existing} entangled.padprobe={events}"),
+        };
+        self.await_marker = Some("padprobe".into());
         self
     }
 
@@ -329,6 +400,10 @@ impl MachineLifecycle for TestMachine {
 /// console, and a way to say "I have seen enough".
 pub struct VmHandle {
     pub lifecycle: Arc<Lifecycle>,
+    /// The host end of the guest's gamepad, when [`BootSpec::gamepad`] asked
+    /// for one. Pushing into it is exactly what `entangled run`'s capture
+    /// thread does, minus the controller.
+    pub gamepad: Option<virtio_input::InputHandle>,
     capture: Capture,
     done: Arc<AtomicBool>,
 }
@@ -416,6 +491,22 @@ pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOu
             .map_err(|e| format!("cannot attach disk {}: {e}", disk.display()))?;
         devices.push(Box::new(device));
     }
+    // Last, as `entangled run` attaches it, so the guest sees the same machine.
+    let gamepad_sink = match &spec.gamepad {
+        GamepadAttach::None => None,
+        GamepadAttach::Injected => {
+            let device = virtio_input::InputDevice::gamepad();
+            let sink = device.handle();
+            devices.push(Box::new(device));
+            Some(sink)
+        }
+        GamepadAttach::Captured(source) => {
+            let device = virtio_input::InputDevice::gamepad_with_capture(Arc::clone(source));
+            let sink = device.handle();
+            devices.push(Box::new(device));
+            Some(sink)
+        }
+    };
 
     let mem = Arc::new(vm.memory().clone());
     let quiesce = Quiesce::new();
@@ -492,6 +583,7 @@ pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOu
             }));
             let handle = VmHandle {
                 lifecycle: Arc::clone(&lifecycle),
+                gamepad: gamepad_sink,
                 capture: capture.clone(),
                 done: Arc::clone(&done),
             };
@@ -666,6 +758,20 @@ pub fn artifact(relative: &str) -> Option<PathBuf> {
 /// been built (EPIC 11), otherwise the fetched Debian test kernel.
 pub fn boot_kernel() -> Option<PathBuf> {
     artifact("bootstrap/vmlinuz").or_else(|| artifact("tests/vmlinuz"))
+}
+
+/// The project's own bootstrap kernel, and *only* that one.
+///
+/// [`boot_kernel`] falls back to the fetched Debian-installer kernel, which is
+/// right for a test whose subject is the machine. It is wrong for a test whose
+/// subject is what the **guest kernel's own input core** makes of a
+/// descriptor: `CONFIG_INPUT_JOYDEV` is in
+/// `guest/bootstrap-kernel/entangled.config` and is a module (so, absent —
+/// this initramfs loads none) in a stock installer kernel. On the fallback
+/// "the pad is a joystick" would come back false for a reason that has nothing
+/// to do with the device, which is worse than not answering.
+pub fn bootstrap_kernel() -> Option<PathBuf> {
+    artifact("bootstrap/vmlinuz")
 }
 
 pub fn test_initramfs() -> Option<PathBuf> {
