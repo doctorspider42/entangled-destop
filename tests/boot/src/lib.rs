@@ -93,9 +93,22 @@ pub struct BootSpec {
     /// host-visible window, and back that window with real host memory
     /// (EPIC 20, VEN-2001). `pci` only — an mmio guest has no BAR to enumerate.
     pub shm_window: bool,
-    /// Whether to attach a virtio-input gamepad (GAME-2104), and what drives
-    /// it. Never a *real* controller: see [`GamepadAttach`].
+    /// Whether to attach virtio-input gamepads (GAME-2104), and what drives
+    /// them. Never a *real* controller: see [`GamepadAttach`].
     pub gamepad: GamepadAttach,
+    /// How many gamepads to attach, when [`Self::gamepad`] asks for any.
+    ///
+    /// One device per player, in player order, exactly as `entangled run`
+    /// attaches them — so the `js*` numbering a two-player test observes is
+    /// the numbering a player would get.
+    pub gamepad_players: usize,
+    /// Attach the keyboard and the tablet as well, ahead of the pads.
+    ///
+    /// Off by default, because most boots have no use for them and every
+    /// device costs a virtio slot. The one thing it is needed for is the js0
+    /// question: whether `joydev` claims the tablet is only observable on a
+    /// machine that *has* a tablet next to a pad.
+    pub pointer: bool,
     pub deadline: Duration,
     /// How often the harness inspects the captured console while the vCPUs run.
     ///
@@ -159,6 +172,8 @@ impl BootSpec {
             pci_interrupts: PciInterruptMode::default(),
             shm_window: false,
             gamepad: GamepadAttach::None,
+            gamepad_players: 1,
+            pointer: false,
             deadline: DEFAULT_DEADLINE,
             poll_interval: DEFAULT_POLL_INTERVAL,
         }
@@ -248,6 +263,18 @@ impl BootSpec {
     pub fn with_gamepad_probe(mut self, events: usize) -> Self {
         self.gamepad = GamepadAttach::Injected;
         self.with_pad_probe_cmdline(events)
+    }
+
+    /// How many pads to attach; see [`Self::gamepad_players`].
+    pub fn with_players(mut self, players: usize) -> Self {
+        self.gamepad_players = players.clamp(1, virtio_input::MAX_PLAYERS);
+        self
+    }
+
+    /// Also attach the keyboard and tablet; see [`Self::pointer`].
+    pub fn with_pointer(mut self) -> Self {
+        self.pointer = true;
+        self
     }
 
     /// The same probe, but with the pad driven by the production capture pump
@@ -447,7 +474,11 @@ pub struct VmHandle {
     /// The host end of the guest's gamepad, when [`BootSpec::gamepad`] asked
     /// for one. Pushing into it is exactly what `entangled run`'s capture
     /// thread does, minus the controller.
+    ///
+    /// Player one's, when there are several; [`Self::gamepads`] has them all.
     pub gamepad: Option<virtio_input::InputHandle>,
+    /// One handle per player, in player order.
+    pub gamepads: Vec<virtio_input::InputHandle>,
     capture: Capture,
     done: Arc<AtomicBool>,
 }
@@ -547,22 +578,37 @@ pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOu
             .map_err(|e| format!("cannot attach disk {}: {e}", disk.display()))?;
         devices.push(Box::new(device));
     }
-    // Last, as `entangled run` attaches it, so the guest sees the same machine.
-    let gamepad_sink = match &spec.gamepad {
-        GamepadAttach::None => None,
-        GamepadAttach::Injected => {
-            let device = virtio_input::InputDevice::gamepad();
-            let sink = device.handle();
+    // Keyboard and tablet ahead of the pads, as `entangled run` attaches them,
+    // so a test that asks for them sees the same registration order — which is
+    // what decides `js*` numbering in the guest.
+    if spec.pointer {
+        for device in [
+            virtio_input::InputDevice::keyboard(),
+            virtio_input::InputDevice::absolute_pointer(),
+        ] {
             devices.push(Box::new(device));
-            Some(sink)
         }
-        GamepadAttach::Captured(source) => {
-            let device = virtio_input::InputDevice::gamepad_with_capture(Arc::clone(source));
-            let sink = device.handle();
+    }
+    // Last, as `entangled run` attaches them, so the guest sees the same
+    // machine. One device per player, in player order.
+    let mut gamepad_sinks: Vec<virtio_input::InputHandle> = Vec::new();
+    if !matches!(spec.gamepad, GamepadAttach::None) {
+        for player in 0..spec.gamepad_players.max(1) {
+            let device = match &spec.gamepad {
+                GamepadAttach::None => unreachable!("checked above"),
+                GamepadAttach::Injected => virtio_input::InputDevice::gamepad_for_player(player),
+                GamepadAttach::Captured(source) => {
+                    virtio_input::InputDevice::gamepad_with_capture_for_player(
+                        Arc::clone(source),
+                        player,
+                    )
+                }
+            };
+            gamepad_sinks.push(device.handle());
             devices.push(Box::new(device));
-            Some(sink)
         }
-    };
+    }
+    let gamepad_sink = gamepad_sinks.first().cloned();
 
     if spec.shm_window {
         // A detached scanout: this boot is about the window, not about pixels,
@@ -673,6 +719,7 @@ pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOu
             let handle = VmHandle {
                 lifecycle: Arc::clone(&lifecycle),
                 gamepad: gamepad_sink,
+                gamepads: gamepad_sinks,
                 capture: capture.clone(),
                 done: Arc::clone(&done),
             };

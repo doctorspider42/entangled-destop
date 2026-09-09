@@ -48,10 +48,15 @@
 //!                               of the virtio-input descriptor — name, ids,
 //!                               whether joydev claimed it, how many buttons
 //!                               and axes it registered, and the `ABS_INFO`
-//!                               ranges it read back — then echoes at most
+//!                               ranges it read back, the serial that tells
+//!                               two players' pads apart, and what it thinks
+//!                               of force feedback — then echoes at most
 //!                               `<n>` events the host injects, stopping early
 //!                               after 1.5 s of silence so "and nothing after
-//!                               that" is answerable too. Two lines:
+//!                               that" is answerable too. Three lines:
+//!                               `inputmap` (the whole machine's input
+//!                               topology, which is where the js0 question is
+//!                               settled), then `padinfo`, then `padprobe`.
 //!                               `padinfo` is printed *after* the event device
 //!                               is open, which is the host's cue that
 //!                               injecting will not race the open.
@@ -1202,11 +1207,75 @@ fn pad_probe(count: usize) {
             line.split_ascii_whitespace()
                 .any(|field| field == "Name=joydev")
         });
+    // The whole machine's input topology, before anything about this one
+    // device: which devices exist, what serial each published, and which of
+    // them `joydev` claimed. It is the only place the js0 question can be
+    // answered, because the answer is about the devices *next to* this one.
+    println!("VMHOST_TEST_OK inputmap devices={}", input_map());
+
+    // Force feedback, asked of the kernel rather than assumed (GAME-2104
+    // follow-up). Three separate facts, because they fail differently:
+    //
+    //   evbits= the `B: EV=` bitmap the kernel published. Bit 0x15 is EV_FF;
+    //           `virtio_input.c` never queries our EV_FF selector and never
+    //           calls `input_ff_create()`, so it should be clear.
+    //   ff=     how many FF effect types `EVIOCGBIT(EV_FF)` reports.
+    //   ffwrite= what happens when a program writes an EV_FF play request to
+    //           the event node, which is exactly what a game does after
+    //           uploading an effect. `evdev_write` reports success either way,
+    //           so the interesting half of this answer is on the *host*: the
+    //           device's `status_ff` counter stays zero, because the input
+    //           core drops the event before `dev->event()` is reached.
+    let ff_bits = ioctl_bitmap(fd, eviocgbit(EV_FF, FF_BITMAP_BYTES), FF_BITMAP_BYTES)
+        .map(|bytes| bytes.iter().map(|b| b.count_ones()).sum::<u32>())
+        .unwrap_or(0);
+    // A second, writable descriptor: the probe's own `fd` is read-only, and
+    // injecting an event needs `O_RDWR` — which is also how a game opens the
+    // node when it intends to upload effects.
+    let ff_write = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Err(error) => format!(
+            "open-E{}",
+            error.raw_os_error().unwrap_or(0)
+        ),
+        Ok(writable) => {
+            let play = RawInputEvent {
+                event_type: EV_FF,
+                code: 0,
+                value: 1,
+                ..RawInputEvent::default()
+            };
+            // SAFETY: the descriptor is kept alive by `writable` for the whole
+            // call, and the source is one `#[repr(C)]` plain-old-data record
+            // whose own size in bytes is the length — so the kernel reads
+            // exactly the bytes this program owns.
+            let written = unsafe {
+                libc::write(
+                    writable.as_raw_fd(),
+                    std::ptr::addr_of!(play).cast::<libc::c_void>(),
+                    std::mem::size_of::<RawInputEvent>(),
+                )
+            };
+            if written < 0 {
+                format!(
+                    "E{}",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                )
+            } else {
+                written.to_string()
+            }
+        }
+    };
+
     println!(
-        "VMHOST_TEST_OK padinfo name={} bus={:04x} vendor={:04x} product={:04x} \
+        "VMHOST_TEST_OK padinfo name={} uniq={} bus={:04x} vendor={:04x} product={:04x} \
 version={:04x} node={} js={} jsnode={} jsopen={} joydev={} handlers={} keys={} \
-axes={} absx={} absz={} abshat={}",
+axes={} absx={} absz={} abshat={} evbits={} ff={} ffwrite={}",
         device.name.replace(' ', "_"),
+        if device.uniq.is_empty() {
+            "none"
+        } else {
+            device.uniq.as_str()
+        },
         device.bus,
         device.vendor,
         device.product,
@@ -1222,6 +1291,13 @@ axes={} absx={} absz={} abshat={}",
         range(0x00),
         range(0x02),
         range(0x10),
+        if device.ev_bits.is_empty() {
+            "none"
+        } else {
+            device.ev_bits.as_str()
+        },
+        ff_bits,
+        ff_write,
     );
 
     // …and now the round trip. Blocking reads with a deadline enforced by the
@@ -1291,9 +1367,17 @@ axes={} absx={} absz={} abshat={}",
 }
 
 /// One device as `/proc/bus/input/devices` describes it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct InputDeviceInfo {
     name: String,
+    /// `U: Uniq=` — what the device published as its serial. Two gamepads have
+    /// the same name and the same ids and differ only here.
+    uniq: String,
+    /// The `B: EV=` bitmap, verbatim. Quoted rather than decoded because it is
+    /// the kernel's own summary of which event types this device has, and "is
+    /// bit 0x15 (EV_FF) set" is a question better answered from the source
+    /// bytes than from our reading of them.
+    ev_bits: String,
     bus: u32,
     vendor: u32,
     product: u32,
@@ -1317,53 +1401,107 @@ fn input_device_names() -> Vec<String> {
         .collect()
 }
 
+/// Every device in `/proc/bus/input/devices`, in the order the kernel lists
+/// them — which is registration order, and therefore the order the machine
+/// attached them.
+fn all_input_devices() -> Vec<InputDeviceInfo> {
+    let Ok(text) = std::fs::read_to_string("/proc/bus/input/devices") else {
+        return Vec::new();
+    };
+    text.split("\n\n").filter_map(parse_input_block).collect()
+}
+
+/// One `name:uniq:eventnode:jsnode` record per input device, comma separated
+/// and space-free, so a boot test can read the whole machine's input topology
+/// off one serial line.
+///
+/// Evidence for two claims at once: that a two-player VM really has two
+/// distinct joysticks (different `uniq`, different `js*`), and that the tablet
+/// is **not** one of them — the `joydev` classification that decides who gets
+/// `js0`.
+fn input_map() -> String {
+    let records: Vec<String> = all_input_devices()
+        .iter()
+        .map(|device| {
+            let js = device
+                .handlers
+                .iter()
+                .find(|handler| handler.starts_with("js"))
+                .map(String::as_str)
+                .unwrap_or("-");
+            format!(
+                "{}:{}:{}:{}",
+                device.name.replace(' ', "_"),
+                if device.uniq.is_empty() {
+                    "-"
+                } else {
+                    device.uniq.as_str()
+                },
+                device.event_node.as_deref().unwrap_or("-"),
+                js
+            )
+        })
+        .collect();
+    if records.is_empty() {
+        "none".to_string()
+    } else {
+        records.join(",")
+    }
+}
+
 /// Finds one device by name in `/proc/bus/input/devices`.
 ///
 /// That file rather than sysfs because it carries the `Handlers=` line, which
-/// is the only place the kernel says out loud that `joydev` bound the device —
-/// and "is it a joystick" is half of what this probe exists to answer.
+/// is the only place the kernel says out loud that `joydev` bound the device D
+/// and "is it a joystick" is half of what the pad probe exists to answer.
+///
+/// With several identically named devices (two players' gamepads) this returns
+/// the first, which is the lowest slot, which is player one.
 fn find_input_device(want: &str) -> Option<InputDeviceInfo> {
-    let text = std::fs::read_to_string("/proc/bus/input/devices").ok()?;
-    for block in text.split("\n\n") {
-        let mut info = InputDeviceInfo::default();
-        let mut matched = false;
-        for line in block.lines() {
-            let line = line.trim_end();
-            if let Some(rest) = line.strip_prefix("I: ") {
-                for field in rest.split_ascii_whitespace() {
-                    let Some((key, value)) = field.split_once('=') else {
-                        continue;
-                    };
-                    let value = u32::from_str_radix(value, 16).unwrap_or(0);
-                    match key {
-                        "Bus" => info.bus = value,
-                        "Vendor" => info.vendor = value,
-                        "Product" => info.product = value,
-                        "Version" => info.version = value,
-                        _ => {}
-                    }
+    all_input_devices()
+        .into_iter()
+        .find(|device| device.name == want)
+}
+
+/// Parses one blank-line-separated block of `/proc/bus/input/devices`.
+fn parse_input_block(block: &str) -> Option<InputDeviceInfo> {
+    let mut info = InputDeviceInfo::default();
+    for line in block.lines() {
+        let line = line.trim_end();
+        if let Some(rest) = line.strip_prefix("I: ") {
+            for field in rest.split_ascii_whitespace() {
+                let Some((key, value)) = field.split_once('=') else {
+                    continue;
+                };
+                let value = u32::from_str_radix(value, 16).unwrap_or(0);
+                match key {
+                    "Bus" => info.bus = value,
+                    "Vendor" => info.vendor = value,
+                    "Product" => info.product = value,
+                    "Version" => info.version = value,
+                    _ => {}
                 }
-            } else if let Some(rest) = line.strip_prefix("N: Name=\"") {
-                info.name = rest.trim_end_matches('"').to_string();
-                matched = info.name == want;
-            } else if let Some(rest) = line.strip_prefix("H: Handlers=") {
-                info.handlers = rest.split_ascii_whitespace().map(str::to_string).collect();
-                info.event_node = info
-                    .handlers
-                    .iter()
-                    .find(|h| h.starts_with("event"))
-                    .cloned();
-            } else if let Some(rest) = line.strip_prefix("B: KEY=") {
-                info.key_count = count_bitmap_bits(rest);
-            } else if let Some(rest) = line.strip_prefix("B: ABS=") {
-                info.abs_count = count_bitmap_bits(rest);
             }
-        }
-        if matched {
-            return Some(info);
+        } else if let Some(rest) = line.strip_prefix("N: Name=\"") {
+            info.name = rest.trim_end_matches('"').to_string();
+        } else if let Some(rest) = line.strip_prefix("U: Uniq=") {
+            info.uniq = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("H: Handlers=") {
+            info.handlers = rest.split_ascii_whitespace().map(str::to_string).collect();
+            info.event_node = info
+                .handlers
+                .iter()
+                .find(|h| h.starts_with("event"))
+                .cloned();
+        } else if let Some(rest) = line.strip_prefix("B: EV=") {
+            info.ev_bits = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("B: KEY=") {
+            info.key_count = count_bitmap_bits(rest);
+        } else if let Some(rest) = line.strip_prefix("B: ABS=") {
+            info.abs_count = count_bitmap_bits(rest);
         }
     }
-    None
+    (!info.name.is_empty()).then_some(info)
 }
 
 /// Counts set bits in a `/proc/bus/input/devices` bitmap: space-separated hex
@@ -1374,6 +1512,34 @@ fn count_bitmap_bits(text: &str) -> u32 {
         .filter_map(|word| u64::from_str_radix(word, 16).ok())
         .map(u64::count_ones)
         .sum()
+}
+
+/// `EV_FF` from `linux/input-event-codes.h`.
+const EV_FF: u16 = 0x15;
+
+/// Bytes of `EV_FF` bitmap fetched: `FF_CNT` is 0x80, so sixteen covers it.
+const FF_BITMAP_BYTES: usize = 16;
+
+/// `EVIOCGBIT(ev, len)` — which codes of event type `ev` the device can emit.
+const fn eviocgbit(event_type: u16, len: usize) -> libc::Ioctl {
+    #[allow(clippy::unnecessary_cast)]
+    (((2u32 << 30) | ((len as u32) << 16) | ((b'E' as u32) << 8) | (0x20 + event_type as u32))
+        as libc::Ioctl)
+}
+
+/// Runs one `EVIOC*` read ioctl into a byte buffer, returning what it filled.
+fn ioctl_bitmap(fd: std::os::fd::RawFd, request: libc::Ioctl, len: usize) -> Option<Vec<u8>> {
+    let mut buffer = vec![0u8; len];
+    // SAFETY: `fd` is live for the call, `request` is an `_IOC_READ` request
+    // whose encoded size is exactly `len` (the same number builds both), and
+    // `buffer` is a `len`-byte allocation — so the kernel writes at most what
+    // this program owns.
+    let filled = unsafe { libc::ioctl(fd, request, buffer.as_mut_ptr()) };
+    if filled < 0 {
+        return None;
+    }
+    buffer.truncate((filled as usize).min(len));
+    Some(buffer)
 }
 
 /// `EVIOCGABS(axis)`.
