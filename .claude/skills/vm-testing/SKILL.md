@@ -96,6 +96,36 @@ unit tests live with their crates.
   guest half of the user-mode-NAT acceptance
   (`crates/vmm-core/tests/whp_usernet.rs`). TX alone is a SYN; only the echo
   proves RX delivery.
+  `entangled.netprobe=dhcp,<gateway>,<host>:<port>` is the same probe for a
+  kernel booted with `ip=dhcp`: it skips the ioctls, reads back the address
+  the *lease* gave it and reports that. Use it to exercise the NAT's DHCP
+  server with a real client — the portable acceptance is
+  `apps/entangled/tests/usernet_guest.rs`, which runs `entangled run` on
+  whichever hypervisor the host has and checks the console for both
+  `IP-Config: Got DHCP answer` and the probe's OK line. **It needs the
+  bootstrap kernel**, for the same class of reason as the gamepad probe:
+  virtio-net is a *module* in the Debian-installer kernel, so on the fallback
+  there is no `eth0` at all when init runs and the failure reads exactly like
+  a broken NAT.
+- **usernet's teardown has its own tests now, and they are the ones to extend.**
+  Two real bugs came out of that path, both found by a stalled install rather
+  than by a test: a flow leak (`is_open()` is true in `CloseWait`, so the
+  retirement condition never fired) and a suspected race where a host peer
+  closing right after its last write beat those bytes to the guest. The shape
+  that settles both lives in `virtio_net::usernet::tcp`'s test module — a host
+  peer that writes and closes in the same breath, run thirty times per test run
+  and 250 times in the `--ignored` campaign
+  (`the_teardown_race_holds_over_a_long_campaign`), asserting the guest has
+  every reply byte *before* the FIN and that the flow table returns to zero.
+  Three things to copy if you test this area:
+  - assert `flow_count()` **after** a workload, never only during it. The leak
+    was invisible for exactly as long as nothing did;
+  - drive the guest side through a real `smoltcp` handshake, and respect the
+    window the NAT advertises — a dumb sender that overruns the receive buffer
+    has its segments dropped, never retransmits, and stalls in a way that looks
+    like a NAT bug and is not;
+  - `measure_the_datapath` (`--ignored`, `--nocapture`) is the before/after
+    number for any change to that module.
 - `entangled.padprobe=<n>` reports what the guest kernel made of the
   virtio-input gamepad — name, `input_id`, whether `joydev` bound it and its
   `js*` node opens, how many `KEY`/`ABS` codes the input core registered, and
@@ -509,6 +539,7 @@ full and the fuzz build is large.
 | `snd_control` | the virtio-snd parsers and bounds on raw bytes: `QueryInfo`/`ItemHdr`/`RawSetParams` round trips, `stream::validate_params`, `validate_xfer` and the lifecycle. Asserts that an *accepted* SET_PARAMS is inside every advertised set and every named bound, and that a refusal is `BAD_MSG` or `NOT_SUPP` and never `OK`/`IO_ERR` |
 | `snd_device` | a brought-up `SoundDevice` with a live pump thread behind a real `MmioTransport`, fed descriptor chains of arbitrary shape (any lengths, any addresses, readable/writable in any order, indirect flags) on all four queues, interleaved with resets. Asserts no panic, no `DEVICE_NEEDS_RESET` from guest input, and no used entry claiming more bytes than the guest offered |
 | `gpu_remote_protocol` | the isolated-renderer wire format, both directions, with an exact re-encode check |
+| `usernet_frames` | the user-mode NAT's receive path (WHP-1704): arbitrary guest frames — raw bytes, shaped Ethernet, shaped IPv4 with the header and transport checksums fixed so the fuzzer reaches ICMP, DHCP, the DNS relay and the whole smoltcp TCP state machine — through `usernet::offline::OfflineNet`, the real router with **no host sockets** (a fuzzer that could connect would dial arbitrary internet addresses at libFuzzer speed). Asserts the flow table stays inside `MAX_FLOWS`, the guest queue inside `MAX_QUEUED_FRAMES`, and that every emitted frame is one the guest's own device would accept and claims to come from the gateway |
 | `snapshot_parse` | the whole snapshot parser (ADR-0006): the container's header and index, every section decoder against raw bytes, **and** arbitrary bytes spliced into a well-formed container so the decoders are reached *through* the digest checks rather than around them |
 
 Rules that keep the targets useful:

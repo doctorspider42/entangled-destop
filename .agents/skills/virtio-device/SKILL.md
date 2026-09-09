@@ -422,6 +422,36 @@ Blob resources themselves (`virtio_gpu::blob`) are the device half:
   reports as open. `usernet::tcp::service_flows` propagates the guest's FIN as
   `Shutdown::Write` on the host stream; a unit test that closes both halves at
   once cannot see that class of bug.
+
+  **Five things about `usernet::tcp` that are load-bearing and were each a bug
+  or nearly one:**
+  - **A flow is retired only after the stack has spoken.** `poll` runs
+    `iface.poll` → `service_flows` → `iface.poll` → *then* removes the finished
+    sockets. `socket.abort()` merely moves smoltcp to `Closed`; the RST it was
+    aborted to send is emitted by the next dispatch, so a socket removed before
+    that dispatch never sends it — a guest whose host connect was refused got
+    silence and waited out its own SYN timeout. Same reordering is what lets the
+    ACK for a guest's final FIN go out before its socket disappears.
+  - **Every socket carries a keep-alive pair** (`FLOW_KEEPALIVE`,
+    `FLOW_IDLE_TIMEOUT`). Nothing in TCP notices a peer that stops existing, and
+    the guest is a peer that can: a reboot, a device reset, a paused VM. Without
+    it 64 abandoned flows wedge the NAT for the life of the process, and a
+    device reset does *not* rebuild the backend.
+  - **The flow table is observable** — `UserNetBackend::{flow_count,
+    flows_retired, flows_refused_at_limit}`. The leak above was invisible for
+    exactly as long as nothing outside the crate could see the number.
+  - **There is no MSS clamp and there must not be one.** The NAT *terminates*
+    TCP: the guest's connection ends in smoltcp and a separate host socket
+    carries the bytes on, so the guest's MSS is negotiated against this
+    segment's own 1500-byte MTU and a short host uplink (WSL's 1472, a VPN's
+    1400) is the host stack's problem on a connection the guest never sees.
+    That is the opposite of the TAP path, where the guest's own segments are
+    bridged onto that uplink and the nftables clamp in `scripts/setup-tap.sh`
+    is what keeps them from being dropped.
+  - **UDP is DHCP and DNS and nothing else.** There is no general UDP NAT, so
+    QUIC, NTP and mDNS do not work through this backend; anything else on UDP
+    is counted as `dropped_unsupported`. A test says so, and it is the test that
+    has to change the day one is added.
 - **gpu** (EPIC 8): wire format in `virtio_gpu::protocol` (constants, `CtrlHdr`,
   one struct per command, lengths asserted at compile time), host resources in
   `virtio_gpu::resource`, device in `virtio_gpu::device`. Only the two

@@ -1308,8 +1308,14 @@ mod tests {
         peer.handshake();
         assert_eq!(peer.nat.flow_count(), 1, "the SYN opened a flow");
 
+        // A wall-clock deadline rather than a poll count: how long the host
+        // takes to refuse differs by an order of magnitude between the two
+        // hosts (immediate on Linux loopback, a SYN retransmit or two on
+        // Windows), and the worst case is the connect timing out — which the
+        // flow answers the same way, one second later.
         let mut saw_reset = false;
-        for _ in 0..600 {
+        let deadline = StdInstant::now() + CONNECT_TIMEOUT + Duration::from_secs(5);
+        while StdInstant::now() < deadline {
             for segment in peer.poll() {
                 saw_reset |= segment.rst;
             }
