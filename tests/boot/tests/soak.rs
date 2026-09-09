@@ -880,7 +880,7 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
             "note: this host's CLOCK_MONOTONIC runs {off:+.0} ppm against its own CLOCK_REALTIME, \
              so the guest was judged against the wall clock. The guest's TSC-derived clocks will \
              read about {:+.0} ppm here for that reason alone, and it is not the guest's fault.",
-            -off as f64 / (1.0 + off / 1e6)
+            -off / (1.0 + off / 1e6)
         );
     }
     assert!(
