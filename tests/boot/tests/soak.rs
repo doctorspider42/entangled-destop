@@ -7,7 +7,7 @@
 //! the seventy-thousandth line shows up only in the second.
 //!
 //! ```text
-//! ENTANGLED_SOAK_SECS=14400 \
+//! ENTANGLED_SOAK_LOG=$HOME/soak.tsv \
 //!   cargo test -p boot-tests --test soak -- --ignored --nocapture
 //! ```
 //!
@@ -15,12 +15,23 @@
 //!
 //! | Variable | Default | Meaning |
 //! |---|---|---|
-//! | `ENTANGLED_SOAK_SECS` | 14400 (4 h) | how long the guest runs after warm-up |
+//! | `ENTANGLED_SOAK_SECS` | 7200 (2 h) | how long the guest runs after warm-up |
 //! | `ENTANGLED_SOAK_SAMPLE_SECS` | 60 | how often the host records a sample |
 //! | `ENTANGLED_SOAK_HEARTBEAT_MS` | 1000 | the guest's heartbeat period |
 //! | `ENTANGLED_SOAK_MEMORY_MIB` | 256 | guest RAM |
 //! | `ENTANGLED_SOAK_TRANSPORT` | mmio | `pci` runs the same soak over virtio-pci |
-//! | `ENTANGLED_SOAK_LOG` | — | also append every sample to this TSV file |
+//! | `ENTANGLED_SOAK_LOG` | — | write every sample to this TSV file as it is taken |
+//!
+//! **Use the log file.** A soak is exactly the kind of run that a reboot, a
+//! full disk or an overnight power cut takes with it, and a run whose numbers
+//! only exist in the test's final `println!` leaves *nothing* behind when that
+//! happens — it happened here on 2026-09-08, fifty minutes into a four-hour
+//! run. Each sample is written and flushed as it is taken, so the file is a
+//! complete account of everything up to the moment the machine died: it carries
+//! the run's parameters, then per-sample RSS, descriptors, threads, the newest
+//! heartbeat with the guest and host clocks beside each other, and finally the
+//! same summary block the test prints. Every assertion below except the two
+//! whole-transcript ones (gaps, unexpected lines) can be re-derived from it.
 //!
 //! # What is being watched, and why each one needs *time*
 //!
@@ -61,9 +72,12 @@ use boot_tests::{
 use control_api::VirtioTransport;
 use linux_boot::GUEST_READY_MARKER;
 
-/// Four hours: long enough for a slow leak to become visible against sampling
-/// noise, short enough to fit in one session on a shared development machine.
-const DEFAULT_SECS: u64 = 4 * 3600;
+/// Two hours: long enough that a per-interrupt or per-kick leak has had seven
+/// thousand heartbeats to show itself, and short enough that the run actually
+/// finishes on a shared development machine — which the four-hour default this
+/// replaces did not, twice. Longer runs are `ENTANGLED_SOAK_SECS`, and the
+/// eight-hour one MVP-1404 asks for is a nightly job, not a desk job.
+const DEFAULT_SECS: u64 = 2 * 3600;
 
 /// Time given to the boot itself before the soak is declared a failure.
 const BOOT_DEADLINE: Duration = Duration::from_secs(120);
@@ -128,7 +142,25 @@ struct Sample {
     /// Heartbeats seen in total, from the tick number rather than by counting
     /// lines: a *dropped* line must not silently shrink the denominator.
     ticks: u64,
+    /// Guest and host milliseconds between the baseline heartbeat and the
+    /// newest one seen at this sample. Recorded per sample and not only at the
+    /// end so that the drift is a *series* in the log file — a clock that runs
+    /// away linearly and one that jumps once look identical in a single
+    /// end-to-end number.
+    guest_ms: f64,
+    host_ms: f64,
     serial_bytes: usize,
+}
+
+impl Sample {
+    /// Guest clock against host clock since the baseline, in parts per million.
+    fn drift_ppm(&self) -> f64 {
+        if self.host_ms > 0.0 {
+            (self.guest_ms - self.host_ms) / self.host_ms * 1e6
+        } else {
+            0.0
+        }
+    }
 }
 
 /// What the driver hands back when the run ends.
@@ -150,7 +182,9 @@ struct Beat {
     tick: u64,
     guest_uptime_ms: u64,
     /// Host clock at the first observation of this tick — never the tick's own
-    /// print time, but within one [`OBSERVE_INTERVAL`] of it.
+    /// print time, but within one [`OBSERVE_INTERVAL`] plus one harness poll of
+    /// it. Only ever set where the *transition* to this tick was watched, so
+    /// that the same latency sits on both ends of an interval and cancels.
     seen: Instant,
 }
 
@@ -192,8 +226,40 @@ fn observe_beat(vm: &VmHandle, timeout: Duration) -> Option<Beat> {
     }
 }
 
+/// Waits for the *next* heartbeat after the one already on the console.
+///
+/// The baseline of the clock comparison must be a beat the host watched
+/// **arrive**, never one it merely found lying in the transcript. A beat that
+/// is already there was printed up to one harness poll plus one observe
+/// interval ago, and dating it "now" shortens the host side of every later
+/// comparison by that much — a fixed offset that the ppm figure then divides by
+/// the run length, so it reads as enormous drift in a short run and quietly
+/// decays in a long one. Measured with `observe_beat` here: +77 356 ppm at 10 s
+/// falling to +10 031 ppm at 60 s, all of it one ~0.6 s bias and none of it the
+/// guest's clock. Detecting the transition puts the same small latency on both
+/// ends of the interval, where it cancels.
+fn observe_next_beat(vm: &VmHandle, timeout: Duration) -> Option<Beat> {
+    let deadline = Instant::now() + timeout;
+    let already = last_beat(&vm.serial_tail(4096)).map(|(tick, _)| tick);
+    loop {
+        if let Some((tick, guest_uptime_ms)) = last_beat(&vm.serial_tail(4096)) {
+            if Some(tick) != already {
+                return Some(Beat {
+                    tick,
+                    guest_uptime_ms,
+                    seen: Instant::now(),
+                });
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(OBSERVE_INTERVAL);
+    }
+}
+
 #[test]
-#[ignore = "endurance: runs one VM for hours (ENTANGLED_SOAK_SECS, default 4 h)"]
+#[ignore = "endurance: runs one VM for hours (ENTANGLED_SOAK_SECS, default 2 h)"]
 fn a_long_running_guest_neither_grows_nor_stalls() {
     if !kvm_available() {
         return;
@@ -228,11 +294,26 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
         spec.transport
     );
 
-    let mut log = std::env::var("ENTANGLED_SOAK_LOG")
+    // The log file is the run's black box: written and flushed sample by
+    // sample, so a machine that dies mid-soak still leaves the numbers up to
+    // the moment it died. The summary block is appended to the same file at the
+    // end, which is why the path outlives the handle the driver owns.
+    let log_path = std::env::var("ENTANGLED_SOAK_LOG")
         .ok()
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from);
+    let mut log = log_path
+        .as_ref()
         .and_then(|path| std::fs::File::create(path).ok());
     if let Some(file) = log.as_mut() {
-        let _ = writeln!(file, "at_s\trss_kib\tfds\tthreads\tticks\tserial_bytes");
+        let _ = writeln!(
+            file,
+            "# entangled soak: {soak_secs} s, {} transport, {memory_mib} MiB, \
+             heartbeat {heartbeat_ms} ms, sample {sample_secs} s, warm-up {warmup:?}\n\
+             at_s\trss_kib\tfds\tthreads\tticks\tguest_ms\thost_ms\tdrift_ppm\tserial_bytes",
+            spec.transport
+        );
+        let _ = file.flush();
     }
 
     // Everything the driver learns has to come back out through this: a driver
@@ -272,23 +353,31 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
             // Baseline. Taken after the warm-up so that page faults and lazy
             // host initialisation are behind us; everything after this point is
             // what a *settled* VM does.
-            let started = Instant::now();
-            let Some(base_beat) = observe_beat(&vm, Duration::from_secs(30)) else {
+            let Some(base_beat) = observe_next_beat(&vm, Duration::from_secs(30)) else {
                 state.boot_failed = Some("no heartbeat at the baseline sample".to_string());
                 finish(state);
                 return;
             };
+            // The clock starts at the baseline *beat*, not before the wait for
+            // it: otherwise the first interval is a second short of the ticks
+            // its `at_s` span implies, and the delivery ratio opens the run with
+            // a dip that means nothing.
+            let started = base_beat.seen;
             state.first_beat = Some(base_beat);
             state.last_beat = Some(base_beat);
-            let take = |at_s: f64, vm: &VmHandle, ticks: u64| Sample {
+            let take = |at_s: f64, vm: &VmHandle, beat: Beat| Sample {
                 at_s,
                 rss_kib: rss_kib(),
                 fds: open_fds(),
                 threads: thread_count(),
-                ticks,
+                ticks: beat.tick,
+                guest_ms: beat
+                    .guest_uptime_ms
+                    .saturating_sub(base_beat.guest_uptime_ms) as f64,
+                host_ms: beat.seen.duration_since(base_beat.seen).as_secs_f64() * 1000.0,
                 serial_bytes: vm.serial_bytes(),
             };
-            state.samples.push(take(0.0, &vm, base_beat.tick));
+            state.samples.push(take(0.0, &vm, base_beat));
 
             let mut next_sample = started + sample_every;
             while started.elapsed() < soak {
@@ -309,26 +398,31 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
                     continue;
                 }
                 next_sample += sample_every;
-                let ticks = state.last_beat.map(|b| b.tick).unwrap_or(0);
-                let sample = take(started.elapsed().as_secs_f64(), &vm, ticks);
+                let beat = state.last_beat.unwrap_or(base_beat);
+                let sample = take(started.elapsed().as_secs_f64(), &vm, beat);
                 println!(
-                    "soak {:>7.0}s: rss={} KiB fds={} threads={} ticks={} console={} B",
+                    "soak {:>7.0}s: rss={} KiB fds={} threads={} ticks={} drift={:+.0} ppm \
+                     console={} B",
                     sample.at_s,
                     sample.rss_kib,
                     sample.fds,
                     sample.threads,
                     sample.ticks,
+                    sample.drift_ppm(),
                     sample.serial_bytes
                 );
                 if let Some(file) = log.as_mut() {
                     let _ = writeln!(
                         file,
-                        "{:.0}\t{}\t{}\t{}\t{}\t{}",
+                        "{:.0}\t{}\t{}\t{}\t{}\t{:.0}\t{:.0}\t{:+.0}\t{}",
                         sample.at_s,
                         sample.rss_kib,
                         sample.fds,
                         sample.threads,
                         sample.ticks,
+                        sample.guest_ms,
+                        sample.host_ms,
+                        sample.drift_ppm(),
                         sample.serial_bytes
                     );
                     let _ = file.flush();
@@ -380,6 +474,17 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
     } else {
         0.0
     };
+    // What the drift figure is worth. Each end of the interval is a beat the
+    // host noticed within one harness poll plus one observe interval of its
+    // being printed, so the whole measurement carries that much timing error —
+    // constant in milliseconds, and therefore smaller in ppm the longer the run
+    // is. Printed beside the number so nobody reads a short soak's drift as a
+    // clock defect (see `observe_next_beat`).
+    let drift_err_ppm = if host_ms > 0.0 {
+        (spec.poll_interval + OBSERVE_INTERVAL).as_secs_f64() * 1000.0 / host_ms * 1e6
+    } else {
+        0.0
+    };
 
     // Heartbeat accounting. `beats` is every tick number the console carries, so
     // a gap in it is a line the guest produced and the host never received.
@@ -413,8 +518,8 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
     if let Some(ran_for) = collected.ran_for {
         println!("\nsoak: the driver ran for {ran_for:?}");
     }
-    println!(
-        "\n---- soak result ----------------------------------------------------\n\
+    let report = format!(
+        "---- soak result ----------------------------------------------------\n\
          duration          {:.0} s ({:.2} h) after a {warmup:?} warm-up, {} samples\n\
          RSS               {} -> {} KiB ({:+} KiB, {:+.0} KiB/h)\n\
          file descriptors  {} -> {}\n\
@@ -422,7 +527,8 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
          heartbeats        {} ticks, {} lines on the console, {} gaps\n\
          delivery          worst interval {:.2} of expected ({} expected per {sample_secs} s), \
          at {:.0} s\n\
-         guest clock       {:.0} ms guest vs {:.0} ms host, drift {:+.0} ppm\n\
+         guest clock       {:.0} ms guest vs {:.0} ms host, drift {:+.0} ppm \
+         (+-{:.0} ppm observation error)\n\
          console           {} bytes total, {:.1} B per heartbeat, {} unexpected lines\n\
          ---------------------------------------------------------------------",
         last.at_s,
@@ -445,15 +551,33 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
         guest_ms,
         host_ms,
         drift_ppm,
+        drift_err_ppm,
         last.serial_bytes,
         last.serial_bytes as f64 / (last.ticks.max(1) as f64),
         unexpected.len(),
     );
+    println!("\n{report}");
     for line in unexpected.iter().take(MAX_UNEXPECTED_LINES + 4) {
         println!("unexpected console line: {line}");
     }
     for gap in gaps.iter().take(20) {
         println!("heartbeat gap: {} .. {}", gap.0, gap.1);
+    }
+    // The same verdict into the black box, so the file is the whole account of
+    // the run and not just of its samples.
+    if let Some(path) = log_path.as_ref() {
+        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+            for line in report.lines() {
+                let _ = writeln!(file, "# {line}");
+            }
+            for gap in gaps.iter().take(20) {
+                let _ = writeln!(file, "# heartbeat gap: {} .. {}", gap.0, gap.1);
+            }
+            for line in unexpected.iter().take(MAX_UNEXPECTED_LINES + 4) {
+                let _ = writeln!(file, "# unexpected console line: {line}");
+            }
+            let _ = file.flush();
+        }
     }
 
     // ------------------------------------------------------------ assertions
@@ -488,9 +612,13 @@ fn a_long_running_guest_neither_grows_nor_stalls() {
         "the guest delivered only {worst_ratio:.2} of the expected heartbeats in the interval \
          ending at {worst_at:.0} s — a stall, not slowness"
     );
+    // The gate is widened by the measurement's own error rather than by a
+    // fudge factor, so that a 60-second smoke run of this test is judged as
+    // loosely as its evidence deserves and a two-hour run as tightly.
     assert!(
-        drift_ppm.abs() <= MAX_DRIFT_PPM,
-        "guest clock drifted {drift_ppm:+.0} ppm against the host over {:.0} s",
+        drift_ppm.abs() <= MAX_DRIFT_PPM + drift_err_ppm,
+        "guest clock drifted {drift_ppm:+.0} ppm against the host over {:.0} s, beyond the \
+         {MAX_DRIFT_PPM:.0} ppm allowance and the {drift_err_ppm:.0} ppm this run could not see",
         host_ms / 1000.0
     );
     assert!(
