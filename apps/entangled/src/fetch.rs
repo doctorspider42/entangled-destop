@@ -9,8 +9,8 @@
 //!
 //! * Debian media: a pinned OpenPGP key signed the checksum root, which names
 //!   the digest. Signature first, digest second.
-//! * bootstrap artifacts: a SHA-256 compiled into *this binary*. No signature
-//!   exists, and the output says so in as many words.
+//! * bootstrap artifacts and the UEFI firmware: a SHA-256 compiled into *this
+//!   binary*. No signature exists, and the output says so in as many words.
 
 use debian_media::{FetchOptions, FetchReport, MediaKind, Provenance};
 
@@ -25,6 +25,13 @@ pub fn run(args: &FetchArgs) -> Result<(), String> {
         || args.distro.eq_ignore_ascii_case("bootstrap")
     {
         return run_bootstrap(args);
+    }
+    if args
+        .distro
+        .eq_ignore_ascii_case(crate::firmware::FETCH_TARGET)
+        || args.distro.eq_ignore_ascii_case("uefi")
+    {
+        return run_firmware(args);
     }
     let report = debian_media::fetch_debian(
         &args.distro,
@@ -138,6 +145,43 @@ fn run_bootstrap(args: &FetchArgs) -> Result<(), String> {
     }
     println!();
     println!("`entangled install debian` will find these; `entangled doctor` reports them.");
+    Ok(())
+}
+
+/// `entangled fetch firmware` — the UEFI firmware every UEFI guest boots.
+///
+/// The whole reason this exists: `install ubuntu` and `install fedora` need
+/// EDK2's CloudHv build, that build only runs on Linux, and a person who
+/// installed Entangled Desktop on Windows has no Linux checkout to copy one
+/// from. The installer ships a copy for exactly that reason; this command is
+/// how a *source checkout* on such a host gets one, and how a stale or deleted
+/// copy is replaced.
+fn run_firmware(args: &FetchArgs) -> Result<(), String> {
+    let report = crate::firmware::fetch(crate::firmware::FetchOptions {
+        refresh: args.refresh,
+        offline: args.offline,
+    })?;
+
+    println!(
+        "UEFI firmware — EDK2 CloudHvX64, {} ({})",
+        report.edk2_tag, report.tag
+    );
+    // Not "signature: OK". There is none, and the line that would say so is the
+    // line somebody would quote in a security review.
+    println!("  trust         : SHA-256 pinned in this build (guest/firmware/pinned.toml)");
+    println!(
+        "                  no signature — see the pin file for what that does and does not buy"
+    );
+    println!("  licence       : BSD-2-Clause-Patent (EDK2); see THIRD-PARTY-NOTICES.txt");
+    println!("  source        : {}", report.source);
+    println!("  cache         : {}", report.dir.display());
+    println!();
+    println!("  {} [{}]", report.asset.name, report.asset.status.as_str());
+    println!("    path     : {}", report.asset.path.display());
+    println!("    url      : {}", report.asset.url);
+    println!("    sha256   : {}", report.asset.sha256);
+    println!();
+    println!("`entangled install ubuntu` and `install fedora` will find this; `entangled doctor` reports it.");
     Ok(())
 }
 

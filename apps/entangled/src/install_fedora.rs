@@ -78,9 +78,6 @@ use crate::seed;
 use crate::InstallArgs;
 use disk_image as diskfs;
 
-/// The firmware built by `guest/firmware/build-cloudhv.sh`.
-const FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
-
 /// The maintained kickstart, compiled in so `--auto` works from any working
 /// directory (the same reason the Debian preseed and the Ubuntu autoinstall are).
 const KICKSTART: &str = include_str!("../../../assets/kickstart/fedora-workstation.ks");
@@ -108,20 +105,21 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
          --network none. Use --network usernet (no host setup) or --network tap",
     )?;
 
-    // 1. Firmware. Named early because it is the one artifact a fresh checkout
-    //    does not have, and the error has to say how to get it.
-    let firmware = args
-        .firmware
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(FIRMWARE));
-    if !firmware.exists() {
-        return Err(format!(
-            "firmware {} not found — build it with `bash guest/firmware/build-cloudhv.sh` \
-             (~2.5 min). A Fedora install needs UEFI: Anaconda only creates an EFI System \
-             Partition when the installer itself booted under firmware",
-            firmware.display()
-        ));
-    }
+    // 1. Firmware. Named early because it is the one artifact a fresh host may
+    //    not have, and the error has to say how to get it — in terms of what the
+    //    person in front of the machine can do (crate::firmware).
+    let firmware = crate::firmware::resolve(args.firmware.as_deref()).map_err(|e| {
+        format!(
+            "{e}\n  A Fedora install needs UEFI: Anaconda only creates an EFI System \
+             Partition when the installer itself booted under firmware."
+        )
+    })?;
+    tracing::info!(
+        path = %firmware.path.display(),
+        origin = firmware.origin.as_str(),
+        "UEFI firmware"
+    );
+    let firmware = firmware.path;
 
     // 2. The verified ISO. Never fetched here: scripts/fetch-fedora-iso.sh owns
     //    the trust chain (pinned release key, clearsigned CHECKSUM), and this

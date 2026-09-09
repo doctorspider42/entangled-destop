@@ -57,9 +57,6 @@ use crate::seed;
 use crate::InstallArgs;
 use disk_image as diskfs;
 
-/// The firmware built by `guest/firmware/build-cloudhv.sh`.
-const FIRMWARE: &str = "artifacts/firmware/CLOUDHV.fd";
-
 /// Installer VM size. subiquity wants ~2 GiB; 2560 is the generous choice
 /// `examples/ubuntu-uefi.toml` documents. (Guests above 3072 MiB are legal
 /// since the high-RAM split, but the text installer gains nothing from more.)
@@ -72,20 +69,21 @@ const INSTALLER_MEMORY_MIB: u64 = 2560;
 const INSTALLED_MEMORY_MIB: u64 = 2048;
 
 pub fn run(args: &InstallArgs) -> Result<(), String> {
-    // 1. Firmware. Named first because it is the one artifact a fresh checkout
-    //    does not have, and the error has to say how to get it.
-    let firmware = args
-        .firmware
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(FIRMWARE));
-    if !firmware.exists() {
-        return Err(format!(
-            "firmware {} not found — build it with `bash guest/firmware/build-cloudhv.sh` \
-             (~2.5 min). An Ubuntu install needs UEFI: subiquity only creates an EFI \
-             System Partition when the installer itself booted under firmware",
-            firmware.display()
-        ));
-    }
+    // 1. Firmware. Named first because it is the one artifact a fresh host may
+    //    not have, and the error has to say how to get it — in terms of what
+    //    the person in front of the machine can do (crate::firmware).
+    let firmware = crate::firmware::resolve(args.firmware.as_deref()).map_err(|e| {
+        format!(
+            "{e}\n  An Ubuntu install needs UEFI: subiquity only creates an EFI System \
+             Partition when the installer itself booted under firmware."
+        )
+    })?;
+    tracing::info!(
+        path = %firmware.path.display(),
+        origin = firmware.origin.as_str(),
+        "UEFI firmware"
+    );
+    let firmware = firmware.path;
 
     // 2. The verified ISO. Never fetched here: scripts/fetch-ubuntu-iso.sh owns
     //    the trust chain (pinned signing key, signed SHA256SUMS), and this

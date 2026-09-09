@@ -13,32 +13,10 @@
 //!
 //! So the release pipeline builds them once on Linux and publishes them as
 //! assets of a GitHub Release, and this module fetches them into the same
-//! verified cache the ISOs use.
-//!
-//! # What is trusted, and how strongly
-//!
-//! The pin is [`guest/bootstrap-kernel/pinned.toml`](../../../guest/bootstrap-kernel/pinned.toml),
-//! **compiled into this binary** by `include_str!`. It names the release tag,
-//! the asset file names and a **SHA-256 per asset**. A download that does not
-//! hash to the pinned digest is deleted, not used.
-//!
-//! That anchor is worth being precise about, because it is easy to overstate:
-//!
-//! * the digest lives in *our source tree*, reviewable in `git log` and shipped
-//!   inside the executable the user already decided to run. It is **not** a
-//!   checksum file fetched from beside the artifact, which would give an
-//!   attacker who can serve the artifact the checksum too;
-//! * it is **not** a signature. There is no key here and nothing to revoke.
-//!   Whoever can land a commit can change the pin, and whoever can publish a
-//!   release under the pinned tag *before* the pin is written can choose what
-//!   the pin then records. Tags are immutable once assets are attached, which is
-//!   what makes an already-pinned release safe to re-fetch forever;
-//! * TLS to `github.com` is the transport, so the download is at least not
-//!   attacker-modifiable in flight even before the digest check.
-//!
-//! In short: as strong as the git history of this repository, and no stronger.
-//! The Debian media path next door is stronger — pinned OpenPGP keys, signature
-//! before digest — because Debian signs its media and we do not yet sign ours.
+//! verified cache the ISOs use. The pin, the digest check, the cache and the
+//! private-repository token route all live in [`crate::artifact`], which the
+//! firmware ([`crate::firmware`]) shares — read that module for what the pin is
+//! worth as a trust anchor.
 //!
 //! # Licence — read this before adding an asset
 //!
@@ -50,12 +28,19 @@
 //! script ("equivalent access to copy the source code from the same place").
 //! See `.github/workflows/guest-artifacts.yml`, which will not publish without
 //! them, and `docs/user-guide.md` § "The guest bootstrap artifacts".
+//!
+//! This is also why the kernel is **not** in the Windows installer while the
+//! UEFI firmware is: shipping a GPL binary inside a setup executable drags the
+//! source obligation onto every copy of that installer, and EDK2's
+//! BSD-2-Clause-Patent has no such condition.
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use debian_media::{DigestAlgo, Manifest, Transport, UreqTransport};
 use serde::Deserialize;
+
+use crate::artifact::{self, Hint, PinnedAsset};
+
+pub use crate::artifact::{FetchOptions, FetchedAsset};
 
 /// File name of the kernel asset, in the release and in the cache.
 pub const KERNEL_FILE: &str = "vmlinuz";
@@ -78,13 +63,14 @@ const BASE_URL_ENV: &str = "ENTANGLED_BOOTSTRAP_BASE_URL";
 /// operator put these here on purpose".
 const DIR_ENV: &str = "ENTANGLED_BOOTSTRAP_DIR";
 
-/// Nothing here is remotely this big; a server that streams forever is a bug or
-/// an attack, and either way it must not fill the disk. The kernel is ~13 MiB
-/// and the initramfs ~200 KiB.
-const MAX_ASSET_LEN: u64 = 256 * 1024 * 1024;
-
 /// The compiled-in pin. Its digests are what a download must hash to.
 const PINNED_TOML: &str = include_str!("../../../guest/bootstrap-kernel/pinned.toml");
+
+/// Where the pin lives, for messages that ask a human to look at it.
+const PIN_PATH: &str = "guest/bootstrap-kernel/pinned.toml";
+
+/// The workflow that publishes the release this pin names.
+const WORKFLOW: &str = ".github/workflows/guest-artifacts.yml";
 
 // ---------------------------------------------------------------------------
 // The pin
@@ -109,16 +95,6 @@ pub struct Pinned {
     pub assets: Vec<PinnedAsset>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct PinnedAsset {
-    pub name: String,
-    /// Lower-case hex SHA-256 of the asset, 64 characters.
-    pub sha256: String,
-    /// Size in bytes, so the download can be announced and a wildly wrong
-    /// response rejected before it is hashed.
-    pub bytes: u64,
-}
-
 impl Pinned {
     fn asset(&self, name: &str) -> Result<&PinnedAsset, String> {
         self.assets
@@ -127,19 +103,29 @@ impl Pinned {
             .ok_or_else(|| format!("{PIN_PATH} names no asset '{name}'"))
     }
 
-    /// The download URL for one asset.
+    /// The release description [`crate::artifact`] fetches against.
+    fn release<'a>(&'a self, base_url: &'a str, version: &'a str) -> artifact::Release<'a> {
+        artifact::Release {
+            pin_path: PIN_PATH,
+            tag: &self.tag,
+            base_url,
+            version,
+            assets: &self.assets,
+            hint: Hint {
+                workflow: WORKFLOW,
+                base_url_env: BASE_URL_ENV,
+                dir_env: DIR_ENV,
+            },
+        }
+    }
+
+    /// The plain browser download URL for one asset. Only the tests need it
+    /// spelled out; the fetch path builds it inside [`crate::artifact`].
+    #[cfg(test)]
     fn url(&self, asset: &PinnedAsset) -> String {
-        format!(
-            "{}/{}/{}",
-            base_url(self).trim_end_matches('/'),
-            self.tag,
-            asset.name
-        )
+        self.release(&base_url(self), "").url(asset)
     }
 }
-
-/// Where the pin lives, for messages that ask a human to look at it.
-const PIN_PATH: &str = "guest/bootstrap-kernel/pinned.toml";
 
 /// Reads the compiled-in pin.
 ///
@@ -149,17 +135,7 @@ const PIN_PATH: &str = "guest/bootstrap-kernel/pinned.toml";
 pub fn pinned() -> Result<Pinned, String> {
     let pin: Pinned = toml::from_str(PINNED_TOML)
         .map_err(|e| format!("{PIN_PATH} is not a valid guest-artifact pin: {e}"))?;
-    for asset in &pin.assets {
-        if asset.sha256.len() != DigestAlgo::Sha256.hex_len()
-            || !asset.sha256.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Err(format!(
-                "{PIN_PATH}: asset '{}' has no usable sha256 (got {:?}) — a pin without a \
-                 digest would download an unverified kernel",
-                asset.name, asset.sha256
-            ));
-        }
-    }
+    artifact::validate_digests(PIN_PATH, &pin.assets)?;
     Ok(pin)
 }
 
@@ -214,24 +190,7 @@ pub struct Artifacts {
 pub fn cache_dir(pin: &Pinned) -> Result<PathBuf, String> {
     Ok(crate::paths::cache_root()?
         .join("bootstrap")
-        .join(sanitize(&pin.tag)))
-}
-
-/// A tag or file name reduced to something safe to join onto a path. The pin is
-/// ours, but it is still text that becomes a path, and `..` in it would escape
-/// the cache.
-fn sanitize(component: &str) -> String {
-    component
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .replace("..", "__")
+        .join(artifact::sanitize(&pin.tag)))
 }
 
 /// Where the artifacts are on this host, if anywhere.
@@ -258,7 +217,7 @@ pub fn locate() -> Option<Artifacts> {
     // become the kernel a guest boots.
     for (path, name) in [(&found.kernel, KERNEL_FILE), (&found.initrd, INITRD_FILE)] {
         let asset = pin.asset(name).ok()?;
-        if digest_of(path).ok()? != asset.sha256.to_ascii_lowercase() {
+        if artifact::digest_of(path).ok()? != asset.sha256.to_ascii_lowercase() {
             return None;
         }
     }
@@ -299,32 +258,6 @@ pub fn missing_hint() -> String {
 // Fetching them
 // ---------------------------------------------------------------------------
 
-/// What one asset did during a fetch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssetStatus {
-    /// Already in the cache and hashing to the pinned digest.
-    Cached,
-    Downloaded,
-}
-
-impl AssetStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            AssetStatus::Cached => "cached",
-            AssetStatus::Downloaded => "downloaded",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct FetchedAsset {
-    pub name: String,
-    pub path: PathBuf,
-    pub url: String,
-    pub sha256: String,
-    pub status: AssetStatus,
-}
-
 #[derive(Debug, Clone)]
 pub struct FetchReport {
     pub tag: String,
@@ -334,23 +267,18 @@ pub struct FetchReport {
     pub assets: Vec<FetchedAsset>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FetchOptions {
-    /// Re-download even when the cached copy already matches the pin.
-    pub refresh: bool,
-    /// Never touch the network: use the cache or fail.
-    pub offline: bool,
-}
-
 /// Downloads (or re-verifies) the pinned guest artifacts into the cache.
 pub fn fetch(options: FetchOptions) -> Result<FetchReport, String> {
-    let transport = UreqTransport::new();
+    let transport = debian_media::UreqTransport::new();
     fetch_with(&transport, options)
 }
 
-/// The body, against any [`Transport`] — which is how the accept and reject
-/// paths are tested without a network.
-pub fn fetch_with(transport: &dyn Transport, options: FetchOptions) -> Result<FetchReport, String> {
+/// The body, against any `Transport` — which is how the accept and reject paths
+/// are tested without a network.
+pub fn fetch_with(
+    transport: &dyn debian_media::Transport,
+    options: FetchOptions,
+) -> Result<FetchReport, String> {
     let pin = pinned()?;
     let dir = cache_dir(&pin)?;
     fetch_into(transport, &pin, &dir, options)
@@ -360,75 +288,14 @@ pub fn fetch_with(transport: &dyn Transport, options: FetchOptions) -> Result<Fe
 /// digests of bytes they made up — the compiled-in pin describes a 13 MiB kernel
 /// no fixture can produce.
 pub fn fetch_into(
-    transport: &dyn Transport,
+    transport: &dyn debian_media::Transport,
     pin: &Pinned,
     dir: &Path,
     options: FetchOptions,
 ) -> Result<FetchReport, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-
-    let mut assets = Vec::new();
-    for name in [KERNEL_FILE, INITRD_FILE] {
-        let asset = pin.asset(name)?;
-        let expected = asset.sha256.to_ascii_lowercase();
-        let path = dir.join(sanitize(name));
-        let url = pin.url(asset);
-
-        let cached = !options.refresh
-            && path.is_file()
-            && digest_of(&path).is_ok_and(|found| found == expected);
-        let status = if cached {
-            AssetStatus::Cached
-        } else {
-            if options.offline {
-                return Err(format!(
-                    "--offline, and {} is not in the cache (or does not match the pinned \
-                     digest): {}",
-                    name,
-                    path.display()
-                ));
-            }
-            download_verified(transport, &url, &path, asset, &expected)?;
-            AssetStatus::Downloaded
-        };
-
-        // The provenance note the whole project writes beside a verified
-        // artifact. `signature_verified` is *false* and that is not a bug: there
-        // is no signature over these, only a digest pinned in our source. A
-        // manifest that claimed otherwise would be the lie this field exists to
-        // prevent.
-        //
-        // Written on a download, and on a cache hit only when it is missing.
-        // `fetched_at` means "when these bytes arrived", so rewriting it on
-        // every cache hit would turn the one field that dates the artifact into
-        // a record of the last time anything looked at it.
-        let manifest_path = debian_media::manifest_path(&path);
-        if status == AssetStatus::Downloaded || !manifest_path.is_file() {
-            let manifest = Manifest {
-                url: url.clone(),
-                version: format!("{} ({})", pin.kernel_version, pin.tag),
-                fetched_at: debian_media::now_utc(),
-                sha512_hex: expected.clone(),
-                signature_verified: false,
-                signed_by: None,
-                keyring: Some(format!("pinned sha256 in {PIN_PATH}")),
-            };
-            let text = manifest
-                .to_toml()
-                .map_err(|e| format!("cannot render the provenance manifest: {e}"))?;
-            std::fs::write(&manifest_path, text)
-                .map_err(|e| format!("cannot write {}: {e}", manifest_path.display()))?;
-        }
-
-        assets.push(FetchedAsset {
-            name: name.to_string(),
-            path,
-            url,
-            sha256: expected,
-            status,
-        });
-    }
-
+    let url = base_url(pin);
+    let version = format!("{} ({})", pin.kernel_version, pin.tag);
+    let assets = artifact::fetch_into(transport, &pin.release(&url, &version), dir, options)?;
     Ok(FetchReport {
         tag: pin.tag.clone(),
         kernel_version: pin.kernel_version.clone(),
@@ -438,118 +305,11 @@ pub fn fetch_into(
     })
 }
 
-/// Streams one asset to `<path>.part`, hashing as it goes, and renames it into
-/// place only once the digest matches the pin.
-///
-/// No resume: these are small enough that restarting is cheaper than the
-/// bookkeeping, and unlike a 2.9 GiB ISO an interrupted 13 MiB download is not
-/// worth keeping. A failed verification deletes the partial — the same rule
-/// `debian-media` follows, for the same reason.
-fn download_verified(
-    transport: &dyn Transport,
-    url: &str,
-    path: &Path,
-    asset: &PinnedAsset,
-    expected: &str,
-) -> Result<(), String> {
-    let partial = debian_media::partial_path(path);
-    let _ = std::fs::remove_file(&partial);
-
-    tracing::info!(url, bytes = asset.bytes, "downloading guest artifact");
-    let download = transport
-        .get_range(url, 0)
-        .map_err(|e| format!("cannot download {url}: {e}{}", not_published_hint(&e)))?;
-
-    let mut hasher = DigestAlgo::Sha256.hasher();
-    let mut file = std::fs::File::create(&partial)
-        .map_err(|e| format!("cannot create {}: {e}", partial.display()))?;
-    let mut reader = download.body.take(MAX_ASSET_LEN + 1);
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut written: u64 = 0;
-    loop {
-        let read = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                let _ = std::fs::remove_file(&partial);
-                return Err(format!("download of {url} failed: {e}"));
-            }
-        };
-        written += read as u64;
-        if written > MAX_ASSET_LEN {
-            let _ = std::fs::remove_file(&partial);
-            return Err(format!(
-                "{url} is larger than the {MAX_ASSET_LEN} byte limit for a guest artifact"
-            ));
-        }
-        hasher.update(&buf[..read]);
-        if let Err(e) = file.write_all(&buf[..read]) {
-            let _ = std::fs::remove_file(&partial);
-            return Err(format!("cannot write {}: {e}", partial.display()));
-        }
-    }
-    if let Err(e) = file.flush() {
-        let _ = std::fs::remove_file(&partial);
-        return Err(format!("cannot write {}: {e}", partial.display()));
-    }
-    drop(file);
-
-    let found = hasher.finish_hex();
-    if found != expected {
-        let _ = std::fs::remove_file(&partial);
-        return Err(format!(
-            "{url} does not match the digest pinned in {PIN_PATH}: expected sha256 \
-             {expected}, got {found} ({written} bytes). The file has been deleted; nothing \
-             unverified is kept"
-        ));
-    }
-    std::fs::rename(&partial, path).map_err(|e| {
-        let _ = std::fs::remove_file(&partial);
-        format!(
-            "cannot move the verified download into {}: {e}",
-            path.display()
-        )
-    })
-}
-
-/// A 404 here has exactly one likely cause and one exact fix, so say it rather
-/// than leaving "HTTP status 404" to be interpreted.
-fn not_published_hint(error: &debian_media::TransportError) -> String {
-    match error {
-        debian_media::TransportError::Status(404) => format!(
-            "\n  the release tag pinned in {PIN_PATH} has no such asset. Either the \
-             guest-artifacts workflow has not published it yet (see \
-             .github/workflows/guest-artifacts.yml), or {BASE_URL_ENV} points somewhere \
-             that does not serve it. Until it is published, put a `vmlinuz` and an \
-             `initrd.img` built by `guest/bootstrap-kernel/build.sh` in a directory and \
-             name it with {DIR_ENV}"
-        ),
-        _ => String::new(),
-    }
-}
-
-/// SHA-256 of a file on disk, streamed.
-fn digest_of(path: &Path) -> Result<String, String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut hasher = DigestAlgo::Sha256.hasher();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buf)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    Ok(hasher.finish_hex())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use debian_media::{Download, TransportError};
+    use crate::artifact::AssetStatus;
+    use debian_media::{DigestAlgo, Download, Manifest, Transport, TransportError};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -666,41 +426,6 @@ mod tests {
             url.ends_with(&format!("/{}/{KERNEL_FILE}", pin.tag)),
             "{url}"
         );
-    }
-
-    /// A pin whose digest is missing or malformed is refused outright — the
-    /// alternative is downloading a kernel and hoping. `pinned()` reads a
-    /// compiled-in file that cannot be swapped, so the rule it applies is
-    /// asserted here over the same predicate.
-    #[test]
-    fn a_pin_without_a_usable_digest_would_be_refused() {
-        for bad in ["", &"z".repeat(64), &"ab".repeat(10)] {
-            let usable = bad.len() == DigestAlgo::Sha256.hex_len()
-                && bad.bytes().all(|b| b.is_ascii_hexdigit());
-            assert!(!usable, "{bad:?} must not count as a usable digest");
-        }
-        let good = "d4".repeat(32);
-        assert!(
-            good.len() == DigestAlgo::Sha256.hex_len()
-                && good.bytes().all(|b| b.is_ascii_hexdigit())
-        );
-    }
-
-    /// `..` in a tag must not walk out of the cache directory. The pin is ours,
-    /// but it is still text that becomes a path.
-    #[test]
-    fn path_components_from_the_pin_are_sanitised() {
-        assert_eq!(
-            sanitize("guest-artifacts-6.12.9-1"),
-            "guest-artifacts-6.12.9-1"
-        );
-        for hostile in ["../../etc", "..\\..\\windows", "a/b", "c:evil"] {
-            let safe = sanitize(hostile);
-            assert!(
-                !safe.contains('/') && !safe.contains('\\') && !safe.contains(".."),
-                "{hostile:?} sanitised to {safe:?}"
-            );
-        }
     }
 
     /// The happy path, end to end over a fixture: both assets downloaded, both
@@ -854,18 +579,23 @@ mod tests {
     }
 
     /// A release that has not been published yet answers 404, and a bare
-    /// "HTTP status 404" is not an answer: the message must say which of the two
-    /// causes it is and what to do instead.
+    /// "HTTP status 404" is not an answer: the message must say which of the
+    /// causes it is and what to do instead — including the one that is true of
+    /// this repository today, that it is private.
     #[test]
     fn a_missing_release_asset_explains_itself() {
         let (kernel, initrd) = (b"k".as_slice(), b"i".as_slice());
-        let pin = fake_pin(kernel, initrd);
+        let mut pin = fake_pin(kernel, initrd);
+        // A github.com base URL, because the private-repository sentence is the
+        // one a user hits and it is only true of GitHub.
+        pin.base_url =
+            "https://github.com/doctorspider42/entangled-destop/releases/download".into();
         let dir = temp_dir("missing");
         let empty = Fixture::new(&[]);
         let err =
             fetch_into(&empty, &pin, &dir, FetchOptions::default()).expect_err("nothing served");
         assert!(err.contains("404"), "{err}");
-        assert!(err.contains("guest-artifacts.yml"), "{err}");
+        assert!(err.contains(WORKFLOW), "{err}");
         assert!(err.contains(BASE_URL_ENV), "{err}");
         assert!(err.contains(DIR_ENV), "{err}");
         let _ = std::fs::remove_dir_all(&dir);

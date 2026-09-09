@@ -172,7 +172,7 @@ pub fn mock_report() -> Report {
          \x20 VMs per process : 1\n\
          \x20 install         : ubuntu — UEFI + verified ISO, offline (no mirror needed)\n\
          \x20                   debian — d-i on the bootstrap kernel, needs the network\n\
-         \x20   firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB)\n\
+         \x20   firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB, from this installation)\n\
          \x20   bootstrap kernel MISSING — needed by `install debian` only\n\
          \x20                   run `entangled fetch bootstrap-kernel` (~13 MiB, SHA-256 pinned)\n\
          \x20   ubuntu ISO       mock-cache/ubuntu-24.04.1-live-server-amd64.iso (2.9 GiB)\n\
@@ -193,8 +193,9 @@ mod tests {
     #[test]
     fn missing_artifacts_are_marked_and_their_fix_is_not() {
         let lines = parse(
-            "  firmware         MISSING at artifacts/firmware/CLOUDHV.fd\n\
-             \x20                  `bash guest/firmware/build-cloudhv.sh`\n\
+            "  firmware         MISSING — needed by every UEFI machine\n\
+             \x20                  Entangled Desktop can download it: run \
+             `entangled fetch firmware`\n\
              host looks ready to run VMs",
             true,
         );

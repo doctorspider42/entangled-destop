@@ -1,0 +1,57 @@
+# The published UEFI firmware `entangled fetch firmware` downloads.
+#
+# This file is COMPILED INTO the `entangled` binary (apps/entangled/src/firmware.rs,
+# `include_str!`). It is the trust anchor for that download: bytes that do not
+# hash to the `sha256` below are deleted, not used. There is no signature and no
+# key — this is as strong as the git history of this repository and no stronger,
+# which is why the digest belongs here, in review, and not in a checksum file
+# fetched from beside the artifact.
+#
+# WHAT THIS IS
+#   EDK2's OvmfPkg/CloudHv/CloudHvX64 build — the fw_cfg-free, PVH-entry OVMF
+#   variant — with the flash PCDs pointed at 0xFFC00000 so UEFI variables land
+#   in a pflash device this VMM can back with a per-VM .nvram file. All of that
+#   is guest/firmware/build-cloudhv.sh, and the reasoning is in
+#   docs/adr/0003-uefi-firmware.md. The image is exactly 4 MiB and its first
+#   four bytes are \x7fELF; anything else is not this firmware.
+#
+# LICENCE
+#   BSD-2-Clause-Patent (EDK2). Permissive: no source obligation, unlike the
+#   GPL-2.0 bootstrap kernel next door, which is why this one — and only this
+#   one — is also shipped inside the Windows installer. The attribution we owe
+#   is in THIRD-PARTY-NOTICES.txt, which the installer both shows on its licence
+#   page and lays down beside the binaries.
+#
+# HOW TO UPDATE IT
+#   1. Change `guest/firmware/build-cloudhv.sh` (or bump EDK2_TAG in it) and
+#      push. `.github/workflows/firmware.yml` builds it on Linux, publishes it
+#      under a new immutable tag with its provenance and licence, and prints the
+#      exact replacement for the block below in its job summary.
+#   2. Commit that block. Until you do, `entangled` keeps fetching the previous
+#      tag, which still exists — a release tag is never reused.
+#
+# NOT PUBLISHED YET
+#   The digest below is of a firmware built by guest/firmware/build-cloudhv.sh
+#   on 2026-08-19 (edk2-stable202602, DEBUG/GCC5, flash base 0xFFC00000), and the
+#   whole fetch/verify/resolve chain was exercised end to end against it. Nobody
+#   with push rights has run the firmware workflow yet, so the tag below has no
+#   release behind it. Two consequences, both deliberate:
+#     * the Windows installer carries its own copy (installer/entangled.iss), so
+#       a fresh install needs no download at all — that is the route that makes
+#       the product work today;
+#     * a fetch answers 404 with a message saying exactly that. This repository
+#       is also PRIVATE, so even once published the download needs a token
+#       (GITHUB_TOKEN, GH_TOKEN or `gh auth login`); apps/entangled/src/artifact.rs
+#       takes the API asset route when it finds one.
+#   Run the workflow, replace this block with what it prints, and delete this
+#   note.
+
+tag = "firmware-edk2-stable202602-1"
+edk2_tag = "edk2-stable202602"
+base_url = "https://github.com/doctorspider42/entangled-destop/releases/download"
+source = "https://github.com/doctorspider42/entangled-destop/releases/tag/firmware-edk2-stable202602-1"
+
+[[assets]]
+name = "CLOUDHV.fd"
+sha256 = "1622a4366769871659374b6f67211075546a669f2d3de700984e15aadb482c50"
+bytes = 4194304
