@@ -52,8 +52,9 @@ pub struct Settings {
     /// (see [`crate::launcher::locate_cli`]).
     pub entangled_binary: Option<PathBuf>,
     /// Working directory for spawned CLI children. VM profiles may contain
-    /// relative paths (the installer writes `artifacts/bootstrap/vmlinuz`),
-    /// and those resolve against this directory.
+    /// relative paths (the installer writes `artifacts/bootstrap/vmlinuz` when
+    /// that is where it found the kernel; a *fetched* one is named absolutely,
+    /// and needs none of this), and those resolve against this directory.
     pub work_dir: Option<PathBuf>,
     /// Pass `--headless` to `entangled install` by default (no installer
     /// window; the log pane still shows the serial console).

@@ -687,9 +687,10 @@ What it asserts that the other two do not:
 
 | What | Number |
 |---|---|
-| `entangled install debian --auto --headless --network usernet`, d-i trixie, 1536 MiB | **6 min 34 s** |
+| `entangled install debian --auto --headless --network usernet`, d-i trixie, 1536 MiB | **6 min 34 s** by hand, **7 min 36 s** under the test |
 | installed system to `<vm name> login:` on ttyS0 | **7.3 s** |
 | Weston desktop drawn at 1920x1080 (screenshot at 45 s) | 76 distinct colours sampled, panel and clock legible |
+| the whole `debian_install` test, install + boot | 7 min 45 s |
 
 Two things about that boot worth knowing before you write an assertion on it:
 

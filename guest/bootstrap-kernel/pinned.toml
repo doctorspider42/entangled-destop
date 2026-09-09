@@ -21,6 +21,16 @@
 # own `init` (see LICENSE) statically linked against musl (MIT). See `source`
 # below for where the kernel's corresponding source is published.
 
+# NOT YET PUBLISHED. The digests below are of a real build of this repository's
+# `guest/bootstrap-kernel/build.sh` + `scripts/build-bootstrap-initramfs.sh`
+# (Linux 6.12.9, made on 2026-09-09), and the whole fetch/verify/install chain
+# was exercised end to end against them; but nobody with push rights has run the
+# guest-artifacts workflow yet, so the tag below has no release behind it and a
+# fetch answers 404 with a message saying exactly that. Run the workflow, then
+# replace this whole block with what it prints and delete this note.
+# Until then, ENTANGLED_BOOTSTRAP_DIR (a directory holding vmlinuz and
+# initrd.img) is the supported way in.
+
 tag = "guest-artifacts-6.12.9-1"
 kernel_version = "6.12.9"
 base_url = "https://github.com/doctorspider42/entangled-destop/releases/download"

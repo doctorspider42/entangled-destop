@@ -50,18 +50,19 @@ use common::read_transcript;
 
 const BIN: &str = env!("CARGO_BIN_EXE_entangled");
 
-/// A full unattended d-i install measured **6 min 34 s** on the development
-/// machine (Windows/WHP, 1536 MiB, usernet NAT, deb.debian.org over a domestic
-/// line, ~1.5 GiB downloaded). Most of that is the mirror rather than the VMM,
-/// so the deadline is far above it: this must fail rather than hang, but it must
-/// not fail because somebody's link is slow.
+/// A full unattended d-i install measured **6 min 34 s** and **7 min 36 s** on
+/// two runs on the development machine (Windows/WHP, 1536 MiB, usernet NAT,
+/// deb.debian.org over a domestic line). The minute between them is the mirror,
+/// not the VMM, which is why the deadline is far above both: this must fail
+/// rather than hang, but it must not fail because somebody's link is slow.
 const INSTALL_DEADLINE: Duration = Duration::from_secs(75 * 60);
 
 /// Boot of the installed system: no firmware and no bootloader on this path —
 /// the bootstrap kernel is started directly and its initramfs `switch_root`s
 /// into `/dev/vda1` — so this is systemd's own start-up and nothing else. It
 /// took **7.3 s** to the login prompt on the development machine, which is why
-/// six minutes is generous rather than tight.
+/// six minutes is generous rather than tight. If it ever approaches the
+/// deadline, something is wrong with the disk, not with the deadline.
 const BOOT_DEADLINE: Duration = Duration::from_secs(6 * 60);
 
 /// `agetty` prints `<hostname> login:`, and the hostname is the VM name, which

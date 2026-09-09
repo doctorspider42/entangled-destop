@@ -49,7 +49,7 @@
 //! release carries the exact upstream tarball, its `.config` and the build
 //! script ("equivalent access to copy the source code from the same place").
 //! See `.github/workflows/guest-artifacts.yml`, which will not publish without
-//! them, and `docs/user-guide.md` § "What the guest artifacts are".
+//! them, and `docs/user-guide.md` § "The guest bootstrap artifacts".
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -280,7 +280,12 @@ fn pair_in(dir: &Path, origin: Origin) -> Option<Artifacts> {
 pub fn missing_hint() -> String {
     let mut hint = String::from("run `entangled fetch bootstrap-kernel` (~13 MiB, SHA-256 pinned)");
     if cfg!(target_os = "linux") {
-        hint.push_str(", or build it here with `bash guest/bootstrap-kernel/build.sh`");
+        // Both scripts, not just the kernel one: half a pair is not a pair, and
+        // `build.sh` alone leaves a host that still cannot install Debian.
+        hint.push_str(
+            ", or build them here with `bash guest/bootstrap-kernel/build.sh` and \
+             `bash scripts/build-bootstrap-initramfs.sh`",
+        );
     } else {
         hint.push_str(
             ", or copy an artifacts/bootstrap/ directory in from a Linux checkout (the kernel \
@@ -392,21 +397,28 @@ pub fn fetch_into(
         // is no signature over these, only a digest pinned in our source. A
         // manifest that claimed otherwise would be the lie this field exists to
         // prevent.
-        let manifest = Manifest {
-            url: url.clone(),
-            version: format!("{} ({})", pin.kernel_version, pin.tag),
-            fetched_at: debian_media::now_utc(),
-            sha512_hex: expected.clone(),
-            signature_verified: false,
-            signed_by: None,
-            keyring: Some(format!("pinned sha256 in {PIN_PATH}")),
-        };
+        //
+        // Written on a download, and on a cache hit only when it is missing.
+        // `fetched_at` means "when these bytes arrived", so rewriting it on
+        // every cache hit would turn the one field that dates the artifact into
+        // a record of the last time anything looked at it.
         let manifest_path = debian_media::manifest_path(&path);
-        let text = manifest
-            .to_toml()
-            .map_err(|e| format!("cannot render the provenance manifest: {e}"))?;
-        std::fs::write(&manifest_path, text)
-            .map_err(|e| format!("cannot write {}: {e}", manifest_path.display()))?;
+        if status == AssetStatus::Downloaded || !manifest_path.is_file() {
+            let manifest = Manifest {
+                url: url.clone(),
+                version: format!("{} ({})", pin.kernel_version, pin.tag),
+                fetched_at: debian_media::now_utc(),
+                sha512_hex: expected.clone(),
+                signature_verified: false,
+                signed_by: None,
+                keyring: Some(format!("pinned sha256 in {PIN_PATH}")),
+            };
+            let text = manifest
+                .to_toml()
+                .map_err(|e| format!("cannot render the provenance manifest: {e}"))?;
+            std::fs::write(&manifest_path, text)
+                .map_err(|e| format!("cannot write {}: {e}", manifest_path.display()))?;
+        }
 
         assets.push(FetchedAsset {
             name: name.to_string(),

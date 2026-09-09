@@ -512,7 +512,7 @@ pub fn missing_install_artifact(cwd: &Path, family: GuestFamily) -> Option<Strin
 /// here. Being generous is the right way round: the worst case is a pre-flight
 /// that lets an install start and a CLI that then says precisely which artifact
 /// it wanted, which is a better message than the one this check could write.
-fn bootstrap_artifacts_present(cwd: &Path) -> bool {
+pub fn bootstrap_artifacts_present(cwd: &Path) -> bool {
     let pair = |dir: &Path| dir.join("vmlinuz").is_file() && dir.join("initrd.img").is_file();
     if let Some(dir) = std::env::var_os("ENTANGLED_BOOTSTRAP_DIR") {
         if pair(Path::new(&dir)) {

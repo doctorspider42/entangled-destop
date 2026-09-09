@@ -1157,20 +1157,34 @@ impl ManagerApp {
         // Ubuntu install) needs the firmware and has no use for a bootstrap
         // kernel, so warning about the kernel there is noise that trains people
         // to ignore the warning that matters.
-        let artifact = if vm.uefi {
-            launcher::UEFI_FIRMWARE
-        } else {
-            launcher::BOOTSTRAP_KERNEL
-        };
-        if !cwd.join(artifact).is_file() {
-            self.toast(
-                ToastLevel::Warn,
+        //
+        // The direct-Linux arm goes through the same three-place lookup the
+        // install pre-flight uses rather than a bare `cwd.join(...)`: a profile
+        // written on a host that *downloaded* the bootstrap pair names it
+        // absolutely, in the cache, and complaining that the working directory
+        // has no `artifacts/bootstrap/vmlinuz` would be a false alarm on every
+        // start of a perfectly good machine.
+        let missing = if vm.uefi {
+            (!cwd.join(launcher::UEFI_FIRMWARE).is_file()).then(|| {
                 format!(
-                    "no {artifact} under {} — a profile with relative boot paths will \
-                     fail to start (Settings ▸ Advanced ▸ working directory)",
+                    "no {} under {} — a profile with relative boot paths will fail to \
+                     start (Settings ▸ Advanced ▸ working directory)",
+                    launcher::UEFI_FIRMWARE,
                     cwd.display()
-                ),
-            );
+                )
+            })
+        } else {
+            (!launcher::bootstrap_artifacts_present(&cwd)).then(|| {
+                format!(
+                    "no bootstrap kernel under {} and none in the verified cache — a \
+                     profile that boots one will fail to start. `entangled fetch \
+                     bootstrap-kernel` downloads it",
+                    cwd.display()
+                )
+            })
+        };
+        if let Some(message) = missing {
+            self.toast(ToastLevel::Warn, message);
         }
         let runner = Runner::new(chosen, cli, &self.settings);
         let spec = match launcher::run_spec(&runner, &vm, cwd, &self.settings.vm_dir) {

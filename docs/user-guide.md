@@ -268,7 +268,6 @@ entangled doctor
 host looks ready to run VMs
 ```
 
-
 ## Quickstart: Ubuntu Server
 
 This is the portable path: it works the same on Linux and on Windows, it boots
