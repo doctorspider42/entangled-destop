@@ -538,3 +538,40 @@ HLT and gives KVM no reason to exit, so the vCPU threads — which check
   would make GRUB draw on the scanout instead, and the serial exchange would have
   to become a virtio-input one. The mechanism is deliberately small and in one
   place (`install_ubuntu::GrubScript`) for exactly that reason.
+
+## Amendment, 2026-09-09 — both open questions from 2026-09-08 are answered
+
+The previous amendment left `MpInitLib: Find 1 processors` filed as "the load
+flake the vm-testing skill documents" and the `#GP` as unexplained. Neither
+stands.
+
+**The cause was ours, and it was a torn register read.** `AcpiPmBlock::io_read`
+sampled the PM timer once per byte and stitched a 32-bit `IN` out of four
+samples. A carry out of the low byte between two samples yields a value up to
+255 ticks ahead of the counter, so the *next* read appears to go backwards —
+and `MpLib.c::CheckTimeout` differences successive PM-timer reads and reads a
+negative difference as the 24-bit counter wrapping. It then adds a whole
+4.7-second cycle to its elapsed total and abandons the AP immediately. That is
+the entire load dependence: idle, the four samples are nanoseconds apart and
+only an exact carry tears them; loaded, the exit handler itself is preempted
+mid-access. The evidence is a clock that jumps rather than a deadline that
+expires — the firmware's verdict lands 68–115 ms after the IPI on a healthy
+boot and 17–33 ms on a failing one.
+
+The timer is now latched once per access, and the invariant is a test: a wide
+read must lie between the counter immediately before and immediately after the
+access. It fails within a few iterations against the old code. Reproduction
+rates: KVM 12/24 lost APs at 64 spinners before, 0/66 after; WHP 18/20 at 48
+spinners before, 0/50 after.
+
+**An abandoned AP is a live hazard, which is why the cause had to go.** Provoked
+deliberately, every lost AP ended in a triple fault: it executes the wakeup page
+*after* `FreeResetVector()` restored it, which in real mode with `ds` at zero is
+a stream of writes into low memory — where the ACPI tables, the PVH hand-off
+block and the MP table live. The tables were intact in all four provoked losses,
+so this is a hazard rather than an observed corruption, but it is a plausible
+mechanism for the unreproducible `#GP`. There is no sound host-side fix — from
+the VMM's side a SIPI'd AP is just a running CPU — so the answer is to remove
+the cause and make the symptom loud: `VcpuCensus` now logs
+`configured=2 started=1` at warn, and the boot tests assert the configured
+count instead of tolerating either.

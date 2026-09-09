@@ -48,7 +48,7 @@ use windows::Win32::System::Hypervisor::{
 };
 
 use crate::hv::{
-    ExitHandler, HvError, RunOutcome, VcpuRegisters, X86Registers, X86SpecialRegisters,
+    ExitHandler, HvError, RunOutcome, VcpuCensus, VcpuRegisters, X86Registers, X86SpecialRegisters,
 };
 use crate::lifecycle::{Checkpoint, Lifecycle, ResettableVcpu, VcpuKick};
 use crate::whp::cpuid::{CpuidPolicy, CpuidResult};
@@ -376,13 +376,20 @@ impl WhpVcpu {
                     if handler.shutdown_requested() {
                         return Ok(RunOutcome::Shutdown);
                     }
+                    let site = crate::hv::fault_site(self);
                     let can_reset = lifecycle.is_some_and(Lifecycle::can_reset);
                     let Some(lifecycle) = lifecycle.filter(|_| can_reset) else {
+                        tracing::warn!(
+                            vcpu = self.index,
+                            %site,
+                            "unrecoverable exception with no power-off latched and no lifecycle                              to restart the machine: ending the VM"
+                        );
                         return Ok(RunOutcome::Shutdown);
                     };
                     if self.index == 0 {
                         tracing::info!(
                             vcpu = self.index,
+                            %site,
                             "unrecoverable exception on the boot CPU with no power-off latched:                              treating it as a reboot"
                         );
                         if !lifecycle.request_guest_reset() {
@@ -396,6 +403,7 @@ impl WhpVcpu {
                     }
                     tracing::warn!(
                         vcpu = self.index,
+                        %site,
                         "unrecoverable exception on an application processor: parking it and                          leaving the machine running"
                     );
                     match park(self, lifecycle, running, None) {
@@ -778,6 +786,10 @@ pub struct WhpVcpuThreads {
     handles: Vec<JoinHandle<Result<RunOutcome, VmmError>>>,
     /// Released on stop, so a *paused* VM can still be torn down (ADR-0005).
     lifecycle: Option<Arc<Lifecycle>>,
+    /// Which processors the guest actually brought up; reported once the run
+    /// is over, because a guest running on fewer CPUs than it was given says
+    /// nothing about it itself.
+    census: Arc<VcpuCensus>,
 }
 
 /// A [`VcpuCanceller`] *is* the WHP kick: unlike KVM's signal, it is a
@@ -808,11 +820,13 @@ pub fn spawn_vcpus_with(
     lifecycle: Option<Arc<Lifecycle>>,
 ) -> Result<WhpVcpuThreads, VmmError> {
     let running = Arc::new(AtomicBool::new(true));
+    let census = Arc::new(VcpuCensus::new(vcpus.len() as u32));
     let mut cancellers = Vec::with_capacity(vcpus.len());
     let mut handles = Vec::with_capacity(vcpus.len());
     for mut vcpu in vcpus {
         let mut handler = make_handler(vcpu.index);
         let flag = Arc::clone(&running);
+        let census = Arc::clone(&census);
         let canceller = vcpu.canceller();
         if let Some(lifecycle) = &lifecycle {
             lifecycle.register_kicker(Arc::new(canceller.clone()));
@@ -824,6 +838,7 @@ pub fn spawn_vcpus_with(
             .spawn(move || {
                 let index = vcpu.index;
                 let outcome = vcpu.run_loop_with(handler.as_mut(), &flag, lifecycle.as_deref());
+                census.file(index, vcpu.mp_state());
                 if let Some(lifecycle) = &lifecycle {
                     lifecycle.vcpu_finished(index);
                 }
@@ -840,6 +855,7 @@ pub fn spawn_vcpus_with(
         cancellers,
         handles,
         lifecycle,
+        census,
     })
 }
 
@@ -855,7 +871,9 @@ impl WhpVcpuThreads {
             lifecycle.shutdown();
         }
         let cancellers = self.cancellers;
-        self.handles
+        let census = Arc::clone(&self.census);
+        let outcomes: Vec<_> = self
+            .handles
             .into_iter()
             .zip(cancellers)
             .map(|(handle, canceller)| {
@@ -868,12 +886,17 @@ impl WhpVcpuThreads {
                 }
                 join_outcome(handle)
             })
-            .collect()
+            .collect();
+        census.report();
+        outcomes
     }
 
     /// Waits for the guests to end on their own (halt/shutdown).
     pub fn join(self) -> Vec<Result<RunOutcome, VmmError>> {
-        self.handles.into_iter().map(join_outcome).collect()
+        let census = Arc::clone(&self.census);
+        let outcomes: Vec<_> = self.handles.into_iter().map(join_outcome).collect();
+        census.report();
+        outcomes
     }
 
     /// Waits until every vCPU ends on its own **or** `should_stop` returns

@@ -9,8 +9,8 @@ use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vmm_sys_util::signal::{register_signal_handler, Killable};
 
 use crate::hv::{
-    ExitHandler, HvError, RunOutcome, VcpuRegisters, X86DescriptorTable, X86Registers, X86Segment,
-    X86SpecialRegisters,
+    ExitHandler, HvError, MpState, RunOutcome, VcpuCensus, VcpuRegisters, X86DescriptorTable,
+    X86Registers, X86Segment, X86SpecialRegisters,
 };
 use crate::lifecycle::{Checkpoint, Lifecycle, ResettableVcpu, VcpuKick};
 use crate::VmmError;
@@ -119,6 +119,18 @@ impl Vcpu {
 
     pub fn fd(&self) -> &VcpuFd {
         &self.fd
+    }
+
+    /// This processor's multiprocessing state, as the neutral [`MpState`].
+    ///
+    /// A vCPU ioctl, so only the owning thread may ask — which is why the
+    /// census is filed by the run loop's own thread rather than collected by
+    /// whoever joins it.
+    pub(crate) fn mp_state(&self) -> Result<MpState, HvError> {
+        self.fd
+            .get_mp_state()
+            .map(|state| crate::snapshot_kvm::mp_state_from_kvm(state.mp_state))
+            .map_err(|e| HvError::Registers(format!("KVM_GET_MP_STATE: {e}")))
     }
 }
 
@@ -348,12 +360,21 @@ impl Vcpu {
                     if handler.shutdown_requested() {
                         return Ok(RunOutcome::Shutdown);
                     }
+                    let site = crate::hv::fault_site(self);
                     let can_reset = lifecycle.is_some_and(Lifecycle::can_reset);
                     match (index, can_reset) {
-                        (_, false) => return Ok(RunOutcome::Shutdown),
+                        (_, false) => {
+                            tracing::warn!(
+                                vcpu = index,
+                                %site,
+                                "triple fault with no power-off latched and no lifecycle to                                  restart the machine: ending the VM"
+                            );
+                            return Ok(RunOutcome::Shutdown);
+                        }
                         (0, true) => {
                             tracing::info!(
                                 vcpu = index,
+                                %site,
                                 "triple fault on the boot CPU with no power-off latched:                                  treating it as a reboot"
                             );
                             let Some(lifecycle) = lifecycle else {
@@ -371,6 +392,7 @@ impl Vcpu {
                         (_, true) => {
                             tracing::warn!(
                                 vcpu = index,
+                                %site,
                                 "triple fault on an application processor: parking it and                                  leaving the machine running"
                             );
                             let Some(lifecycle) = lifecycle else {
@@ -781,6 +803,10 @@ pub struct VcpuThreads {
     handles: Vec<JoinHandle<Result<RunOutcome, VmmError>>>,
     /// Released on stop, so a *paused* VM can still be torn down (ADR-0005).
     lifecycle: Option<Arc<Lifecycle>>,
+    /// Which processors the guest actually brought up; reported once the run
+    /// is over, because a guest running on fewer CPUs than it was given says
+    /// nothing about it itself.
+    census: Arc<VcpuCensus>,
 }
 
 /// Kicks one vCPU thread out of `KVM_RUN` with the RT signal, from any thread.
@@ -831,11 +857,13 @@ pub fn spawn_vcpus_with(
 ) -> Result<VcpuThreads, VmmError> {
     ensure_kick_signal_handler()?;
     let running = Arc::new(AtomicBool::new(true));
+    let census = Arc::new(VcpuCensus::new(vcpus.len() as u32));
     let mut handles = Vec::with_capacity(vcpus.len());
     for mut vcpu in vcpus {
         let mut handler = make_handler(vcpu.index);
         let flag = Arc::clone(&running);
         let lifecycle = lifecycle.clone();
+        let census = Arc::clone(&census);
         let published = Arc::new(AtomicU64::new(0));
         if let Some(lifecycle) = &lifecycle {
             lifecycle.register_kicker(Arc::new(SignalKicker {
@@ -849,6 +877,7 @@ pub fn spawn_vcpus_with(
                 published.store(unsafe { libc::pthread_self() } as u64, Ordering::Release);
                 let index = vcpu.index;
                 let outcome = vcpu.run_loop_with(handler.as_mut(), &flag, lifecycle.as_deref());
+                census.file(index, vcpu.mp_state());
                 if let Some(lifecycle) = &lifecycle {
                     lifecycle.vcpu_finished(index);
                 }
@@ -864,6 +893,7 @@ pub fn spawn_vcpus_with(
         running,
         handles,
         lifecycle,
+        census,
     })
 }
 
@@ -879,7 +909,9 @@ impl VcpuThreads {
             // lets a paused VM be shut down.
             lifecycle.shutdown();
         }
-        self.handles
+        let census = Arc::clone(&self.census);
+        let outcomes: Vec<_> = self
+            .handles
             .into_iter()
             .map(|handle| {
                 while !handle.is_finished() {
@@ -888,12 +920,17 @@ impl VcpuThreads {
                 }
                 join_outcome(handle)
             })
-            .collect()
+            .collect();
+        census.report();
+        outcomes
     }
 
     /// Waits for the guests to end on their own (halt/shutdown).
     pub fn join(self) -> Vec<Result<RunOutcome, VmmError>> {
-        self.handles.into_iter().map(join_outcome).collect()
+        let census = Arc::clone(&self.census);
+        let outcomes: Vec<_> = self.handles.into_iter().map(join_outcome).collect();
+        census.report();
+        outcomes
     }
 
     /// Waits until every vCPU ends on its own **or** `should_stop` returns

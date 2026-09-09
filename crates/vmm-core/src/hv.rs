@@ -271,6 +271,41 @@ pub trait VcpuRegisters {
     fn set_special_registers(&self, sregs: &X86SpecialRegisters) -> Result<(), HvError>;
 }
 
+/// Where a vCPU was executing when the hypervisor reported a triple fault.
+///
+/// A shutdown exit is otherwise anonymous, and the case where that hurts most
+/// is an **application processor faulting during startup**: it means the AP was
+/// executing something other than the wakeup code the firmware pointed it at,
+/// which is the signature of a firmware that gave up waiting for it and
+/// reclaimed the memory that code lived in (ADR-0003). Naming the site turns
+/// "the VM ended" into a diagnosis — a real-mode `cs:base` just under 1 MiB
+/// with `cr0` paging off says exactly that.
+///
+/// Portable on purpose: both backends report the same fields through
+/// [`VcpuRegisters`], so the two run loops print the same line.
+pub(crate) fn fault_site<V: VcpuRegisters + ?Sized>(vcpu: &V) -> String {
+    match (vcpu.get_registers(), vcpu.get_special_registers()) {
+        (Ok(regs), Ok(sregs)) => {
+            let site = format!(
+                "cs {:#06x}:{:#x} rip {:#x} cr0 {:#x} efer {:#x} rflags {:#x}",
+                sregs.cs.selector, sregs.cs.base, regs.rip, sregs.cr0, sregs.efer, regs.rflags
+            );
+            // KVM on AMD cannot hand back the faulting state: `SHUTDOWN` leaves
+            // the VMCB undefined, so `shutdown_interception()` zeroes it and
+            // INITs the vCPU *before* reporting the exit. What comes back then
+            // is the reset vector, which would otherwise read as "the guest
+            // jumped to 0xFFFFFFF0" — a diagnosis of its own, and the wrong
+            // one. Say so rather than let the reader believe it.
+            if sregs.cs.selector == 0xf000 && sregs.cs.base == 0xffff_0000 && regs.rip == 0xfff0 {
+                format!("{site} (the architectural reset state: some hosts reset the vCPU before reporting a triple fault, so this is not the faulting instruction)")
+            } else {
+                site
+            }
+        }
+        _ => "registers unreadable".into(),
+    }
+}
+
 // ---- full CPU state, for suspend/restore (ADR-0006) ----------------------
 
 /// One model-specific register, as an index/value pair.
@@ -389,6 +424,93 @@ impl MpState {
             MpState::SipiReceived => "sipi-received",
             MpState::Stopped => "stopped",
         }
+    }
+
+    /// True while the processor is still waiting to be started — it has never
+    /// executed a guest instruction.
+    ///
+    /// `SipiReceived` counts: KVM uses it for a startup IPI that has been
+    /// accepted but not yet applied, which is still one instruction short of
+    /// running.
+    pub const fn is_waiting_for_startup(self) -> bool {
+        matches!(
+            self,
+            MpState::Uninitialized | MpState::InitReceived | MpState::SipiReceived
+        )
+    }
+}
+
+/// How many of a VM's processors the guest actually brought up.
+///
+/// A guest that runs on fewer CPUs than the VM was configured for is otherwise
+/// **silent**: it simply runs slower, and nothing in the host log says why. The
+/// cause is always the same shape — the guest's own startup sweep gave the
+/// application processor a deadline and the processor missed it (EDK2's
+/// `MpInitLib` allows 50 ms; Linux's `smpboot` allows ten seconds) — and the
+/// host is the only party that can see both numbers at once.
+///
+/// Each vCPU thread files its final [`MpState`] as it ends; a processor still
+/// [waiting for startup](MpState::is_waiting_for_startup) never ran.
+#[derive(Debug)]
+pub struct VcpuCensus {
+    configured: u32,
+    /// `(index, final state)`, in whatever order the threads finish.
+    filed: std::sync::Mutex<Vec<(u32, MpState)>>,
+}
+
+impl VcpuCensus {
+    pub fn new(configured: u32) -> Self {
+        Self {
+            configured,
+            filed: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Called by a vCPU thread as it ends, with the state its own hypervisor
+    /// reports. A backend that cannot read it files nothing rather than
+    /// guessing — an unreadable state must not be reported as a lost CPU.
+    pub fn file(&self, index: u32, state: Result<MpState, HvError>) {
+        match state {
+            Ok(state) => {
+                if let Ok(mut filed) = self.filed.lock() {
+                    filed.push((index, state));
+                }
+            }
+            Err(error) => {
+                tracing::debug!(vcpu = index, %error, "could not read the final mp_state")
+            }
+        }
+    }
+
+    /// Logs the verdict once the run is over. Silent when every processor ran.
+    pub fn report(&self) {
+        let Ok(filed) = self.filed.lock() else {
+            return;
+        };
+        if filed.is_empty() {
+            return;
+        }
+        let asleep: Vec<&(u32, MpState)> = filed
+            .iter()
+            .filter(|(_, state)| state.is_waiting_for_startup())
+            .collect();
+        if asleep.is_empty() {
+            return;
+        }
+        let ran = self.configured.saturating_sub(asleep.len() as u32);
+        let never_started = asleep
+            .iter()
+            .map(|(index, state)| format!("vcpu{index} ({})", state.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(
+            configured = self.configured,
+            started = ran,
+            %never_started,
+            "the guest ran on fewer processors than this VM was configured for: \
+             these never left wait-for-SIPI, so the guest's own startup sweep \
+             gave up on them"
+        );
     }
 }
 

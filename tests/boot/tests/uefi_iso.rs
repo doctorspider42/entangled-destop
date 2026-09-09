@@ -320,6 +320,21 @@ fn cloudhv_boots_the_ubuntu_iso_to_its_bootloader() {
         "the firmware asserted — that is a missing machine feature, see ADR-0003: {asserts:?}"
     );
 
+    // Both configured processors, from `MpInitLib`'s INIT-SIPI sweep. Left
+    // unasserted until 2026-09-09 as "the load flake"; the flake was a torn
+    // read of our ACPI PM timer (machine_x86::acpi::pm).
+    assert!(
+        log.contains(&format!(
+            "MpInitLib: Find {} processors in system",
+            machine.vcpu_count
+        )),
+        "the firmware did not find exactly {} processors: {:?}",
+        machine.vcpu_count,
+        log.lines()
+            .filter(|l| l.contains("MpInitLib"))
+            .collect::<Vec<_>>()
+    );
+
     // Criterion (a).
     assert!(
         log.contains(OPENED_BOOTX64),
