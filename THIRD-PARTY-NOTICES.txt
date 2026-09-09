@@ -20,8 +20,9 @@ nevertheless redistribute.
 WHAT IT IS
   A 4 MiB build of EDK2's OvmfPkg/CloudHv/CloudHvX64 package: the UEFI
   firmware a virtual machine starts in, the equivalent of a physical PC's
-  BIOS. It runs entirely inside the guest; it is never linked into, and
-  never loaded by, any Entangled Desktop process.
+  BIOS. It is never linked into a host binary. Entangled Desktop reads the
+  file and copies it into the virtual machine's memory; the only processor
+  that ever executes it is the guest's virtual one.
 
 WHERE IT CAME FROM
   https://github.com/tianocore/edk2, tag edk2-stable202602, built by

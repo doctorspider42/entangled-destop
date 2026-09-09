@@ -4,13 +4,15 @@
 ;
 ;   ISCC.exe /DAppVersion=<MAJOR.MINOR.PATCH> /DBinDir=<cargo release dir> installer\entangled.iss
 ;
-; Local dry run (after `cargo build --release -p entangled -p entangled-manager`):
+; Local dry run (after `cargo build --release -p entangled -p entangled-manager`,
+; and with a CLOUDHV.fd in artifacts\firmware\ or named by /DFirmwareDir):
 ;
 ;   ISCC.exe /DAppVersion=0.2.0 /DBinDir=..\target\release installer\entangled.iss
 ;
-; Written for Inno Setup 6 (the current major). No code signing yet — there is
-; no certificate; SignTool/SignedUninstaller are the TODO markers for when one
-; exists.
+; Written for Inno Setup 7, which is what release.yml pins (INNO_SETUP_URL) and
+; what the ISPP file primitives below were tested against. No code signing yet —
+; there is no certificate; SignTool/SignedUninstaller are the TODO markers for
+; when one exists.
 ;
 ; THE FIRMWARE IS NOT OPTIONAL. Every UEFI machine — which is every Ubuntu and
 ; every Fedora — boots through artifacts\firmware\CLOUDHV.fd, and the only build
