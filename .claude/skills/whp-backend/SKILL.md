@@ -633,9 +633,12 @@ Still open after phase 4:
   KVM VM (`KVM_EXIT_SHUTDOWN`) but not a WHP one — see the traps below. Guests
   should power off via ACPI S5 on both hosts; a real reboot (restart the same
   VM) is unimplemented on both.
-- **DHCP in the test guest** — the netprobe configures itself statically;
-  `ip=dhcp` against the usernet DHCP server would exercise that server from a
-  real kernel (it is unit-tested today).
+- ~~**DHCP in the test guest**~~ — closed. `entangled.netprobe=dhcp,…` reads
+  back what the kernel's own `ip=dhcp` client was given, and
+  `apps/entangled/tests/usernet_guest.rs` asserts the lease and the TCP echo
+  through the NAT on **both** hosts. `CONFIG_IP_PNP_DHCP` was already `=y` via
+  `defconfig`; it is now stated in the bootstrap kernel's fragment and asserted
+  by its build, so it cannot quietly go.
 - **The doorbell optimisation** for synchronous kicks, if a measurement ever
   demands it.
 

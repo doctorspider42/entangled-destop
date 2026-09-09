@@ -381,6 +381,151 @@ fn unroutable_frames_are_dropped_and_counted() {
     assert_eq!(recv(&backend), None);
 }
 
+/// **DNS forwarding, end to end.** The guest's query has to leave through the
+/// relay's own host socket, and the resolver's answer has to come back addressed
+/// from the gateway to the port the guest asked from — a guest resolver matches on
+/// both, and gets neither if the relay only half works.
+///
+/// The "resolver" is a UDP socket this test binds on loopback, so nothing leaves
+/// the machine and no real DNS server is involved.
+#[test]
+fn a_guest_dns_query_is_forwarded_and_its_answer_comes_back() {
+    let resolver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a fake resolver");
+    resolver
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("a read timeout can be set");
+    let upstream = resolver.local_addr().expect("the resolver has an address");
+    let backend = UserNetBackend::new(UserNetConfig::default().with_dns_upstream(upstream))
+        .expect("the user-mode network needs no privileges");
+    let config = *backend.config();
+
+    // A minimal DNS query: the transaction id is the first two bytes, which is
+    // all the relay itself looks at.
+    let query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00query";
+    backend
+        .write_frame(&eth(
+            UserNetConfig::GATEWAY_MAC,
+            EthernetProtocol::Ipv4,
+            &guest_udp(config.guest, config.gateway, 5353, 53, query),
+        ))
+        .expect("never a host failure");
+
+    let mut buf = [0u8; 512];
+    let (len, from) = resolver
+        .recv_from(&mut buf)
+        .expect("the query is forwarded");
+    assert_eq!(&buf[..len], query, "the query must be forwarded unaltered");
+    let answer = b"\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00answer";
+    resolver.send_to(answer, from).expect("answer the query");
+
+    // The pump picks the answer up; give it a few ticks.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let frame = loop {
+        if let Some(frame) = recv(&backend) {
+            break frame;
+        }
+        assert!(Instant::now() < deadline, "the DNS answer never came back");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    let eth_frame = EthernetFrame::new_checked(&frame[..]).expect("a well-formed frame");
+    assert_eq!(
+        EthernetRepr::parse(&eth_frame)
+            .expect("a parseable header")
+            .src_addr,
+        UserNetConfig::GATEWAY_MAC
+    );
+    let packet = Ipv4Packet::new_checked(eth_frame.payload()).expect("a well-formed IPv4 packet");
+    let caps = ChecksumCapabilities::default();
+    let ip = Ipv4Repr::parse(&packet, &caps).expect("a valid IPv4 header");
+    assert_eq!(ip.src_addr, config.gateway, "answers come from the gateway");
+    assert_eq!(ip.dst_addr, config.guest);
+    let udp_packet = UdpPacket::new_checked(packet.payload()).expect("a well-formed datagram");
+    let udp = UdpRepr::parse(&udp_packet, &ip.src_addr.into(), &ip.dst_addr.into(), &caps)
+        .expect("a valid UDP header");
+    assert_eq!(udp.src_port, 53);
+    assert_eq!(
+        udp.dst_port, 5353,
+        "the answer must go back to the port the guest asked from"
+    );
+    assert_eq!(udp_packet.payload(), answer);
+
+    let stats = backend.stats();
+    assert_eq!(stats.dns_queries.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.dns_replies.load(Ordering::Relaxed), 1);
+}
+
+/// An answer from somebody other than the resolver we asked is dropped, not
+/// delivered. The relay's socket only ever talks to one address, so anything else
+/// arriving on it is either a spoof or a stray.
+#[test]
+fn a_dns_answer_from_the_wrong_source_is_not_delivered() {
+    let resolver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a fake resolver");
+    let upstream = resolver.local_addr().expect("the resolver has an address");
+    let mut relay = DnsRelay::new(upstream);
+    assert!(relay.forward(5353, b"\x12\x34rest"));
+
+    let mut buf = [0u8; 64];
+    resolver
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("a read timeout can be set");
+    let (_, from) = resolver.recv_from(&mut buf).expect("the query arrives");
+
+    // A different socket answers with the right transaction id.
+    let impostor = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind an impostor");
+    impostor
+        .send_to(b"\x12\x34spoofed", from)
+        .expect("the impostor answers");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(relay.poll().is_none(), "only the resolver we asked answers");
+    assert!(
+        relay.is_busy(),
+        "and the query is still outstanding, not consumed by the spoof"
+    );
+}
+
+/// **UDP is DHCP and DNS, and nothing else.** There is no general UDP NAT here:
+/// anything else the guest sends over UDP is counted as unsupported and dropped,
+/// which means QUIC, NTP, mDNS and games are unreachable through this backend.
+///
+/// Written as a test rather than only as a comment because it is the kind of gap
+/// that is otherwise discovered by a user, and because the day a UDP NAT is added
+/// this test is the one that has to change.
+#[test]
+fn udp_other_than_dhcp_and_dns_is_refused_rather_than_forwarded() {
+    let backend = backend();
+    let stats = backend.stats();
+    let config = *backend.config();
+    for port in [443u16, 123, 5353, 27015] {
+        backend
+            .write_frame(&eth(
+                UserNetConfig::GATEWAY_MAC,
+                EthernetProtocol::Ipv4,
+                &guest_udp(
+                    config.guest,
+                    Ipv4Address::new(203, 0, 113, 1),
+                    40000,
+                    port,
+                    b"payload",
+                ),
+            ))
+            .expect("never a host failure");
+    }
+    assert_eq!(stats.dropped_unsupported.load(Ordering::Relaxed), 4);
+    assert_eq!(stats.dns_queries.load(Ordering::Relaxed), 0);
+    assert_eq!(recv(&backend), None, "nothing is answered");
+}
+
+/// The flow table is observable from outside the crate, because the leak that
+/// stalled a Debian install was invisible exactly while it was not.
+#[test]
+fn the_backend_reports_its_flow_table() {
+    let backend = backend();
+    assert_eq!(backend.flow_count(), 0);
+    assert_eq!(backend.flows_retired(), 0);
+    assert_eq!(backend.flows_refused_at_limit(), 0);
+}
+
 /// The queue is bounded by the *host*, not by whether the guest reads: a guest that
 /// stops draining its RX queue must not be able to grow this process.
 #[test]

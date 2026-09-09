@@ -31,6 +31,9 @@ vm-memory = { version = "0.17", features = ["backend-mmap"] }
 virtio-block = { path = "../crates/virtio-block" }
 virtio-gpu = { path = "../crates/virtio-gpu" }
 virtio-sound = { path = "../crates/virtio-sound" }
+# `fuzzing` exposes the offline NAT harness: the real router with no host
+# sockets, so a fuzzer cannot dial the internet.
+virtio-net = { path = "../crates/virtio-net", features = ["fuzzing"] }
 debian-media = { path = "../crates/debian-media" }
 vm-snapshot = { path = "../crates/vm-snapshot" }
 
@@ -100,6 +103,13 @@ bench = false
 [[bin]]
 name = "snd_device"
 path = "fuzz_targets/snd_device.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "usernet_frames"
+path = "fuzz_targets/usernet_frames.rs"
 test = false
 doc = false
 bench = false

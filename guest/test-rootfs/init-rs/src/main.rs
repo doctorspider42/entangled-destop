@@ -47,10 +47,18 @@
 //!                               injecting will not race the open.
 //!   `entangled.netprobe=<ip>/<prefix>,<gateway>,<host>:<port>`
 //!                               configures eth0 statically (this initramfs has
-//!                               no DHCP client), opens a TCP connection to
-//!                               `<host>:<port>` and expects its greeting echoed
-//!                               back — the guest-side evidence for a virtio-net
-//!                               backend (WHP-1704: the user-mode NAT).
+//!                               no DHCP client of its own), opens a TCP
+//!                               connection to `<host>:<port>` and expects its
+//!                               greeting echoed back — the guest-side evidence
+//!                               for a virtio-net backend (WHP-1704: the
+//!                               user-mode NAT).
+//!   `entangled.netprobe=dhcp,<gateway>,<host>:<port>`
+//!                               the same, but for a kernel booted with
+//!                               `ip=dhcp`: eth0 is already configured, so the
+//!                               probe reports the address the *lease* gave it
+//!                               and then does the same TCP echo. The evidence
+//!                               that a real DHCP client and the NAT's server
+//!                               agree.
 
 use std::ffi::CString;
 use std::io::{Read, Write};
@@ -282,18 +290,23 @@ fn acpi_power_off() {
     println!("VMHOST_TEST_FAIL poweroff kernel-refused-power-off");
 }
 
-/// Proves the virtio-net path end to end: configures `eth0` statically,
-/// connects out over TCP and expects the greeting echoed back.
+/// Proves the virtio-net path end to end: brings `eth0` up, connects out over
+/// TCP and expects the greeting echoed back.
 ///
-/// `spec` is `<ip>/<prefix>,<gateway>,<host>:<port>`. Static configuration
-/// rather than DHCP because this initramfs has no DHCP client and the bootstrap
-/// kernel no `CONFIG_IP_PNP` — the ioctls below *are* the whole network stack
-/// setup, which also keeps the probe's evidence about the datapath rather than
-/// about a client implementation.
+/// `spec` is `<ip>/<prefix>,<gateway>,<host>:<port>`, or **`dhcp`** in place of
+/// the address, which means "the kernel has already configured this interface —
+/// go and see what it got".
 ///
-/// The echo matters: a SYN alone proves the guest's TX path, but only bytes
-/// coming *back* prove RX delivery — frames queued by the host, an RX interrupt
-/// raised, buffers completed.
+/// Both forms exist because they prove different things. The static one is the
+/// datapath and nothing else: the ioctls below *are* the whole network stack
+/// setup, so a failure is the device's. The `dhcp` one needs the kernel's own
+/// `ip=dhcp` autoconfiguration to have completed first, which makes it evidence
+/// about the **NAT's DHCP server** — a real client, DISCOVER through ACK, before
+/// a single byte of TCP.
+///
+/// The echo matters in both: a SYN alone proves the guest's TX path, but only
+/// bytes coming *back* prove RX delivery — frames queued by the host, an RX
+/// interrupt raised, buffers completed.
 fn net_probe(spec: &str) {
     let fail = |why: String| println!("VMHOST_TEST_FAIL netprobe {why}");
     let Some((address, rest)) = spec.split_once(',') else {
@@ -302,24 +315,34 @@ fn net_probe(spec: &str) {
     let Some((gateway, target)) = rest.split_once(',') else {
         return fail("malformed-spec".into());
     };
-    let Some((ip, prefix)) = address.split_once('/') else {
-        return fail("malformed-address".into());
-    };
-    let (Ok(ip), Ok(prefix), Ok(gateway)) = (
-        ip.parse::<Ipv4Addr>(),
-        prefix.parse::<u32>(),
-        gateway.parse::<Ipv4Addr>(),
-    ) else {
-        return fail("malformed-address".into());
+    let Ok(gateway) = gateway.parse::<Ipv4Addr>() else {
+        return fail("malformed-gateway".into());
     };
     let Ok(SocketAddr::V4(target)) = target.parse::<SocketAddr>() else {
         return fail("malformed-target".into());
     };
-    let netmask = Ipv4Addr::from(u32::MAX.checked_shl(32 - prefix.min(32)).unwrap_or(0));
 
-    if let Err(why) = configure_eth0(ip, netmask, gateway) {
-        return fail(why);
-    }
+    let (ip, prefix) = if address == "dhcp" {
+        // The kernel's `ip=dhcp` did the work before init existed; all this has
+        // to do is report what it was given, which is what makes the line the
+        // host greps for evidence of a *lease* rather than of a static address.
+        match configured_eth0() {
+            Ok(configured) => configured,
+            Err(why) => return fail(why),
+        }
+    } else {
+        let Some((ip, prefix)) = address.split_once('/') else {
+            return fail("malformed-address".into());
+        };
+        let (Ok(ip), Ok(prefix)) = (ip.parse::<Ipv4Addr>(), prefix.parse::<u32>()) else {
+            return fail("malformed-address".into());
+        };
+        let netmask = Ipv4Addr::from(u32::MAX.checked_shl(32 - prefix.min(32)).unwrap_or(0));
+        if let Err(why) = configure_eth0(ip, netmask, gateway) {
+            return fail(why);
+        }
+        (ip, prefix)
+    };
 
     let started = Instant::now();
     let mut stream = match TcpStream::connect_timeout(&SocketAddr::V4(target), CONNECT_TIMEOUT) {
@@ -356,6 +379,49 @@ fn net_probe(spec: &str) {
 
 /// How long the network probe waits for a connect and for the echo.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Reads back the address and prefix `eth0` already has, for the `dhcp` form of
+/// the probe: the kernel's own `ip=dhcp` client ran before init existed, and
+/// this is how the guest reports what the lease gave it.
+fn configured_eth0() -> Result<(Ipv4Addr, u32), String> {
+    // SAFETY: a plain socket() call; the fd is closed below.
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err(format!("socket:{}", std::io::Error::last_os_error()));
+    }
+    let result = configured_eth0_on(sock);
+    // SAFETY: closing the fd opened above, exactly once.
+    unsafe { libc::close(sock) };
+    result
+}
+
+fn configured_eth0_on(sock: libc::c_int) -> Result<(Ipv4Addr, u32), String> {
+    const NAME: &[u8] = b"eth0\0";
+
+    fn query(sock: libc::c_int, request: libc::c_ulong, what: &str) -> Result<Ipv4Addr, String> {
+        // SAFETY: ifreq is a plain C struct for which zero is a valid pattern.
+        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (dst, src) in ifr.ifr_name.iter_mut().zip(NAME) {
+            *dst = *src as libc::c_char;
+        }
+        // SAFETY: `ifr` is a live, fully initialised ifreq and `request` is one
+        // of the SIOCGIF* codes, which write exactly one sockaddr into it.
+        if unsafe { libc::ioctl(sock, request as libc::Ioctl, &mut ifr) } < 0 {
+            return Err(format!("{what}:{}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: the AF_INET arm is the one the kernel just filled in for an
+        // IPv4 query, and sockaddr_in is the same size as sockaddr.
+        let sin: libc::sockaddr_in = unsafe { std::mem::transmute(ifr.ifr_ifru.ifru_addr) };
+        Ok(Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes()))
+    }
+
+    let ip = query(sock, libc::SIOCGIFADDR, "no-address")?;
+    if ip.is_unspecified() {
+        return Err("no-address:eth0-is-unconfigured".into());
+    }
+    let netmask = query(sock, libc::SIOCGIFNETMASK, "no-netmask")?;
+    Ok((ip, u32::from_be_bytes(netmask.octets()).count_ones()))
+}
 
 /// Brings `eth0` up with a static address and a default route, through the
 /// classic SIOCSIF*/SIOCADDRT ioctls — the smallest network configuration that

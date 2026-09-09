@@ -58,6 +58,8 @@
 //! replacing it with epoll/IOCP is a contained change behind this module.
 
 mod dhcp;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod offline;
 mod tcp;
 
 use std::collections::VecDeque;
@@ -78,7 +80,7 @@ use crate::backend::{NetBackend, NetError, Readiness};
 use crate::frame::{ETH_HEADER_LEN, MAX_FRAME_LEN};
 
 pub use dhcp::{Lease, CLIENT_PORT, SERVER_PORT};
-pub use tcp::TcpNat;
+pub use tcp::{TcpNat, FLOW_IDLE_TIMEOUT, FLOW_KEEPALIVE, MAX_FLOWS};
 
 /// Frames queued for the guest before the backend starts dropping them.
 ///
@@ -780,6 +782,30 @@ impl UserNetBackend {
     /// evidence a boot test asserts on.
     pub fn lease(&self) -> Option<Lease> {
         self.router.lock().ok().and_then(|r| r.dhcp.lease())
+    }
+
+    /// Live NAT flows, out of [`tcp::MAX_FLOWS`].
+    ///
+    /// The number the flow-leak bug was invisible without: a workload that closes
+    /// thousands of connections has to leave this at zero, and nothing could see it
+    /// from outside the crate until it did not. Also what `entangled doctor` and a
+    /// soak run should watch.
+    pub fn flow_count(&self) -> usize {
+        self.router.lock().map(|r| r.tcp.flow_count()).unwrap_or(0)
+    }
+
+    /// Flows retired since the backend was built, and SYNs refused because the
+    /// table was full. Together with [`Self::flow_count`] they say whether a full
+    /// table is a workload or a leak.
+    pub fn flows_retired(&self) -> u64 {
+        self.router.lock().map(|r| r.tcp.retired()).unwrap_or(0)
+    }
+
+    pub fn flows_refused_at_limit(&self) -> u64 {
+        self.router
+            .lock()
+            .map(|r| r.tcp.refused_at_limit())
+            .unwrap_or(0)
     }
 
     /// The `ip=` clause a kernel with `CONFIG_IP_PNP` can use to configure itself

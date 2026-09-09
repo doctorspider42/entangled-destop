@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes `usernet::offline::OfflineNet`: the router with no host sockets, which
+# is what the `usernet_frames` fuzz target drives. Off by default — a VM must
+# never be able to build a NAT that does not connect.
+fuzzing = []
+
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
