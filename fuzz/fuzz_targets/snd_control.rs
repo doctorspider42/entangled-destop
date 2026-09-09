@@ -23,7 +23,10 @@
 //! * the lifecycle only ever reaches a state the spec's diagram draws, and only
 //!   over an edge it draws;
 //! * an accepted I/O message is a whole number of frames no larger than one
-//!   period of the stream the guest itself configured.
+//!   period of the stream the guest itself configured — in **either**
+//!   direction, and only on the queue that matches the stream's own direction,
+//!   which is the check that stops a guest from having device-readable memory
+//!   treated as a buffer to fill.
 
 #![no_main]
 
@@ -31,8 +34,9 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use virtio_sound::protocol::{self, ItemHdr, QueryInfo, RawSetParams};
 use virtio_sound::stream::{
-    self, ParamError, StreamState, XferError, MAX_BUFFER_BYTES, MAX_CHANNELS, MAX_PERIODS,
-    MAX_PERIOD_BYTES, MIN_CHANNELS, MIN_PERIODS, MIN_PERIOD_BYTES, STREAMS,
+    self, direction_of, ParamError, StreamState, XferError, INPUT_STREAM, MAX_BUFFER_BYTES,
+    MAX_CHANNELS, MAX_PERIODS, MAX_PERIOD_BYTES, MIN_CHANNELS, MIN_PERIODS, MIN_PERIOD_BYTES,
+    OUTPUT_STREAM, STREAMS,
 };
 
 #[derive(Debug, Arbitrary)]
@@ -48,9 +52,12 @@ struct Case {
     /// Which lifecycle command to try, and from which state.
     command: u32,
     state: u8,
-    /// An I/O message: the stream it names and how much audio it carries.
+    /// An I/O message: the stream it names and how much audio it carries (or,
+    /// on the capture queue, how much room it grants).
     xfer_stream: u32,
     xfer_len: u32,
+    /// Which of the two audio queues it arrived on.
+    xfer_capture: bool,
 }
 
 fn state_of(byte: u8) -> StreamState {
@@ -127,24 +134,49 @@ fuzz_target!(|case: Case| {
             );
 
             // --- an I/O message against those parameters --------------------
+            //
+            // Both queues, every time: `len` is the audio the guest wrote on
+            // TX and the room it made writable on RX, and the accepting branch
+            // is what the device then bounds a write to guest memory by.
             let state = state_of(case.state);
             let len = (case.xfer_len % (MAX_PERIOD_BYTES + 64)) as usize;
-            match stream::validate_xfer(state, Some(params), case.xfer_stream, len) {
-                Ok(accepted) => {
-                    assert_eq!(accepted, params);
-                    assert!(state.accepts_io());
-                    assert!(case.xfer_stream < STREAMS);
-                    assert_ne!(len, 0);
-                    assert_eq!(len % frame as usize, 0);
-                    assert!(len <= params.period_bytes as usize);
-                }
-                Err(error) => {
-                    assert_eq!(error.status(), protocol::S_BAD_MSG);
-                    match error {
-                        XferError::UnknownStream { id } => assert!(id >= STREAMS),
-                        XferError::NotReady { state: s } => assert!(!s.accepts_io()),
-                        XferError::NotConfigured => unreachable!("params were Some"),
-                        XferError::Payload { len: l, .. } => assert_eq!(l, len),
+            let queue = if case.xfer_capture {
+                protocol::D_INPUT
+            } else {
+                protocol::D_OUTPUT
+            };
+            for queue in [queue, protocol::D_OUTPUT, protocol::D_INPUT] {
+                match stream::validate_xfer(queue, state, Some(params), case.xfer_stream, len) {
+                    Ok(accepted) => {
+                        assert_eq!(accepted, params);
+                        assert!(state.accepts_io());
+                        assert!(case.xfer_stream < STREAMS);
+                        // The whole point of the direction check: an accepted
+                        // message is always on the queue its stream belongs to,
+                        // so the device can never be talked into filling a
+                        // playback buffer or draining a capture one.
+                        assert_eq!(direction_of(case.xfer_stream), Some(queue));
+                        assert_ne!(len, 0);
+                        assert_eq!(len % frame as usize, 0);
+                        assert!(len <= params.period_bytes as usize);
+                        assert!(len <= MAX_PERIOD_BYTES as usize);
+                    }
+                    Err(error) => {
+                        assert_eq!(error.status(), protocol::S_BAD_MSG);
+                        match error {
+                            XferError::UnknownStream { id } => {
+                                assert!(id >= STREAMS);
+                                assert_eq!(direction_of(id), None);
+                            }
+                            XferError::WrongDirection { id, queue: q } => {
+                                assert_eq!(q, queue);
+                                assert_ne!(direction_of(id), Some(queue));
+                                assert!(id < STREAMS);
+                            }
+                            XferError::NotReady { state: s } => assert!(!s.accepts_io()),
+                            XferError::NotConfigured => unreachable!("params were Some"),
+                            XferError::Payload { len: l, .. } => assert_eq!(l, len),
+                        }
                     }
                 }
             }
@@ -170,9 +202,18 @@ fuzz_target!(|case: Case| {
 
     // --- a stream with no parameters at all ---------------------------------
     let state = state_of(case.state);
-    match stream::validate_xfer(state, None, case.xfer_stream, case.xfer_len as usize) {
-        Ok(_) => unreachable!("an unconfigured stream must never accept audio"),
-        Err(error) => assert_eq!(error.status(), protocol::S_BAD_MSG),
+    for queue in [protocol::D_OUTPUT, protocol::D_INPUT] {
+        match stream::validate_xfer(queue, state, None, case.xfer_stream, case.xfer_len as usize) {
+            Ok(_) => unreachable!("an unconfigured stream must never accept audio"),
+            Err(error) => assert_eq!(error.status(), protocol::S_BAD_MSG),
+        }
+    }
+
+    // --- the direction table is total and injective -------------------------
+    assert_eq!(direction_of(OUTPUT_STREAM), Some(protocol::D_OUTPUT));
+    assert_eq!(direction_of(INPUT_STREAM), Some(protocol::D_INPUT));
+    if case.xfer_stream >= STREAMS {
+        assert_eq!(direction_of(case.xfer_stream), None);
     }
 
     // --- the lifecycle ------------------------------------------------------
@@ -209,6 +250,10 @@ fuzz_target!(|case: Case| {
     );
     assert_eq!(
         protocol::ChmapInfo::stereo_output().encode().len(),
+        protocol::CHMAP_INFO_LEN
+    );
+    assert_eq!(
+        protocol::ChmapInfo::stereo_input().encode().len(),
         protocol::CHMAP_INFO_LEN
     );
 });

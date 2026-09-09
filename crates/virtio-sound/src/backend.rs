@@ -1,9 +1,11 @@
-//! The host playback contract.
+//! The host playback and capture contracts.
 //!
 //! [`SoundDevice`](crate::SoundDevice) never talks to an audio API; it fills a
-//! ring and a pump thread hands periods to an [`AudioSink`]. Everything
-//! guest-facing — the protocol, the validation, the completion accounting — is
-//! identical on every host; only the sink differs.
+//! ring and a pump thread hands periods to an [`AudioSink`], while a second
+//! pump takes periods from an [`AudioSource`] and fills the ring the guest's
+//! capture buffers drain. Everything guest-facing — the protocol, the
+//! validation, the completion accounting — is identical on every host; only
+//! the two endpoints differ.
 //!
 //! Three sinks ship:
 //!
@@ -16,14 +18,27 @@
 //! * the real ones: [`crate::alsa::AlsaSink`] on Linux and
 //!   [`crate::wasapi::WasapiSink`] on Windows.
 //!
-//! # Pacing is the contract
+//! and three sources, mirroring them:
 //!
-//! [`AudioSink::write`] must take about as long as the audio it accepts lasts.
-//! That is what makes the device's period-based completion work: a playback
-//! message is returned to the guest when its audio has been *consumed*, and a
-//! sink that accepted everything instantly would make ALSA in the guest
-//! believe an hour of audio played in a millisecond. Real sinks get this from
-//! the hardware clock; [`Pacer`] gives it to the null ones.
+//! * [`SilentSource`] — the default microphone of a host that has none: real
+//!   time, zero samples. Always available, on every OS.
+//! * [`ToneSource`] — a deterministic synthetic signal, which is what lets the
+//!   capture tests assert *which* samples arrived without a microphone in the
+//!   room.
+//! * the real ones: [`crate::alsa::AlsaSource`] on Linux and
+//!   [`crate::wasapi::WasapiSource`] on Windows.
+//!
+//! # Pacing is the contract, in both directions
+//!
+//! [`AudioSink::write`] must take about as long as the audio it accepts lasts,
+//! and [`AudioSource::read`] about as long as the audio it produces. That is
+//! what makes the device's period-based completion work: a playback message is
+//! returned to the guest when its audio has been *consumed*, a capture buffer
+//! when its audio *exists*. An endpoint with zero latency would make ALSA in
+//! the guest believe an hour of audio moved in a millisecond — in the capture
+//! direction it would also let a guest with a deep ring pull hours of
+//! "recording" out of a second of wall clock. Real endpoints get their timing
+//! from the hardware clock; [`Pacer`] gives it to the software ones.
 
 use std::time::{Duration, Instant};
 
@@ -108,6 +123,37 @@ pub trait AudioSink: Send {
     /// audio lasts. Returns the bytes accepted; a short write is congestion,
     /// not failure, and the caller re-offers the rest.
     fn write(&mut self, pcm: &[u8]) -> Result<usize, AudioError>;
+
+    /// Releases the host device. Idempotent; called on STOP, RELEASE, device
+    /// reset and drop.
+    fn stop(&mut self);
+}
+
+/// A host capture endpoint — the [`AudioSink`] contract read backwards.
+///
+/// Lives on, and is only ever touched from, the device's *capture* pump
+/// thread, for the same reason its sink twin does: WASAPI's COM objects and
+/// ALSA's handle are thread-affine.
+pub trait AudioSource: Send {
+    /// Short label for log records, e.g. `alsa:default`.
+    fn name(&self) -> &str;
+
+    /// Opens the host device for `format`. `period_bytes` is the chunk size
+    /// [`Self::read`] will be called with. Called on every capture stream
+    /// PREPARE; a source must tolerate being started again after
+    /// [`Self::stop`].
+    fn start(&mut self, format: StreamFormat, period_bytes: usize) -> Result<(), AudioError>;
+
+    /// Fills `pcm` with captured audio (interleaved S16LE), blocking for
+    /// roughly as long as that audio lasts.
+    ///
+    /// Returns the bytes **actually produced**, which is what the caller may
+    /// account for. A short read is not a failure — it is a source with less
+    /// than a period available — and the caller re-asks rather than treating
+    /// the untouched tail as audio. A source must never report more bytes than
+    /// `pcm.len()`; the device clamps anyway, because the whole RX path is
+    /// built on never trusting a length twice.
+    fn read(&mut self, pcm: &mut [u8]) -> Result<usize, AudioError>;
 
     /// Releases the host device. Idempotent; called on STOP, RELEASE, device
     /// reset and drop.
@@ -382,6 +428,257 @@ impl AudioSink for RecordingSink {
     }
 }
 
+// ------------------------------------------------------------ software sources
+
+/// What a software [`AudioSource`] has been asked for, shared with whoever is
+/// watching. The capture-side twin of [`Recording`]'s bookkeeping.
+#[derive(Debug, Default)]
+pub struct SourceLog {
+    inner: std::sync::Mutex<SourceLogInner>,
+}
+
+#[derive(Debug, Default)]
+struct SourceLogInner {
+    format: Option<StreamFormat>,
+    starts: usize,
+    stops: usize,
+    bytes: u64,
+}
+
+impl SourceLog {
+    /// The format the last `start` asked for.
+    pub fn format(&self) -> Option<StreamFormat> {
+        self.inner.lock().ok().and_then(|l| l.format)
+    }
+
+    pub fn starts(&self) -> usize {
+        self.inner.lock().map(|l| l.starts).unwrap_or(0)
+    }
+
+    pub fn stops(&self) -> usize {
+        self.inner.lock().map(|l| l.stops).unwrap_or(0)
+    }
+
+    /// Bytes the source has produced since it was created.
+    pub fn bytes(&self) -> u64 {
+        self.inner.lock().map(|l| l.bytes).unwrap_or(0)
+    }
+
+    fn started(&self, format: StreamFormat) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.format = Some(format);
+            inner.starts += 1;
+        }
+    }
+
+    fn stopped(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.stops += 1;
+        }
+    }
+
+    fn produced(&self, bytes: usize) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.bytes = inner.bytes.saturating_add(bytes as u64);
+        }
+    }
+}
+
+/// A microphone that hears nothing, on the host clock.
+///
+/// The default capture endpoint everywhere: a VM must come up with a working
+/// recording device on a host with no microphone, over SSH, and in CI. Like
+/// [`NullSink`] it is deliberately not a no-op — a source that returned a
+/// period instantly would let a guest pull an hour of "recording" out of a
+/// millisecond of wall clock.
+#[derive(Debug)]
+pub struct SilentSource {
+    pacer: Option<Pacer>,
+    paced: bool,
+    log: std::sync::Arc<SourceLog>,
+}
+
+impl Default for SilentSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SilentSource {
+    /// A silent source that keeps time, like a microphone that is muted.
+    pub fn new() -> Self {
+        Self {
+            pacer: None,
+            paced: true,
+            log: std::sync::Arc::new(SourceLog::default()),
+        }
+    }
+
+    /// A silent source that produces audio as fast as it is asked for.
+    ///
+    /// For fuzzing and for tests about *what* happens rather than *when*.
+    /// Never give one to a VM.
+    pub fn unpaced() -> Self {
+        Self {
+            pacer: None,
+            paced: false,
+            log: std::sync::Arc::new(SourceLog::default()),
+        }
+    }
+
+    /// The log this source writes into, so a caller can watch it after the
+    /// source has been moved onto the capture pump.
+    pub fn log(&self) -> std::sync::Arc<SourceLog> {
+        std::sync::Arc::clone(&self.log)
+    }
+}
+
+impl AudioSource for SilentSource {
+    fn name(&self) -> &str {
+        "silent"
+    }
+
+    fn start(&mut self, format: StreamFormat, _period_bytes: usize) -> Result<(), AudioError> {
+        self.pacer = self.paced.then(|| Pacer::new(format));
+        self.log.started(format);
+        Ok(())
+    }
+
+    fn read(&mut self, pcm: &mut [u8]) -> Result<usize, AudioError> {
+        pcm.fill(0);
+        if let Some(pacer) = self.pacer.as_mut() {
+            pacer.advance(pcm.len());
+        }
+        self.log.produced(pcm.len());
+        Ok(pcm.len())
+    }
+
+    fn stop(&mut self) {
+        self.pacer = None;
+        self.log.stopped();
+    }
+}
+
+/// The default amplitude of a [`ToneSource`], as a fraction of full scale that
+/// leaves plenty of headroom and is still unmistakably not silence.
+pub const TONE_AMPLITUDE: f64 = 16000.0;
+
+/// A microphone that hears a pure tone — deterministic, on the host clock.
+///
+/// The capture-side twin of the 440 Hz sine the playback tests push: because
+/// the sample at absolute frame *n* is a function of *n* alone, a test can
+/// regenerate exactly what the guest should have received and compare byte for
+/// byte, with no microphone and no recording of the host's own room.
+///
+/// Not test-only on purpose. "Give the guest a known signal" is a genuinely
+/// useful thing for a VMM to be able to do when someone is debugging a guest's
+/// audio stack, and having one implementation rather than a test double means
+/// the tests exercise the real capture pump.
+#[derive(Debug)]
+pub struct ToneSource {
+    hz: f64,
+    format: StreamFormat,
+    /// Absolute frame counter, so the waveform is continuous across reads.
+    frame: u64,
+    pacer: Option<Pacer>,
+    paced: bool,
+    log: std::sync::Arc<SourceLog>,
+}
+
+impl ToneSource {
+    /// A paced tone source at `hz`, and the log it writes into.
+    pub fn new(hz: f64) -> (Self, std::sync::Arc<SourceLog>) {
+        Self::build(hz, true)
+    }
+
+    /// A tone source that produces audio as fast as it is asked for. For tests
+    /// about *what* arrives rather than *when*; never give one to a VM.
+    pub fn unpaced(hz: f64) -> (Self, std::sync::Arc<SourceLog>) {
+        Self::build(hz, false)
+    }
+
+    /// Another tone source writing into an existing log — what a device's
+    /// source factory uses, so a caller can watch a source built after the
+    /// device was moved into its transport.
+    pub fn sharing(hz: f64, paced: bool, log: std::sync::Arc<SourceLog>) -> Self {
+        Self {
+            hz,
+            format: StreamFormat {
+                rate_hz: 48000,
+                channels: 2,
+            },
+            frame: 0,
+            pacer: None,
+            paced,
+            log,
+        }
+    }
+
+    fn build(hz: f64, paced: bool) -> (Self, std::sync::Arc<SourceLog>) {
+        let log = std::sync::Arc::new(SourceLog::default());
+        (Self::sharing(hz, paced, std::sync::Arc::clone(&log)), log)
+    }
+
+    /// The S16LE sample this source produces for absolute frame `frame` of a
+    /// `hz` tone at `rate_hz`. Public so a test can build the exact bytes it
+    /// expects without duplicating the arithmetic.
+    pub fn sample_at(hz: f64, rate_hz: u32, frame: u64) -> i16 {
+        if rate_hz == 0 {
+            return 0;
+        }
+        let t = frame as f64 / f64::from(rate_hz);
+        ((t * hz * std::f64::consts::TAU).sin() * TONE_AMPLITUDE) as i16
+    }
+}
+
+impl AudioSource for ToneSource {
+    fn name(&self) -> &str {
+        "tone"
+    }
+
+    fn start(&mut self, format: StreamFormat, _period_bytes: usize) -> Result<(), AudioError> {
+        self.format = format;
+        self.frame = 0;
+        self.pacer = self.paced.then(|| Pacer::new(format));
+        self.log.started(format);
+        Ok(())
+    }
+
+    fn read(&mut self, pcm: &mut [u8]) -> Result<usize, AudioError> {
+        let channels = usize::from(self.format.channels).max(1);
+        let frame_bytes = channels * 2;
+        // Only whole frames are ever produced: a partial frame would put the
+        // guest's channels out of step for the rest of the stream.
+        let frames = pcm.len() / frame_bytes;
+        let produced = frames * frame_bytes;
+        for f in 0..frames {
+            let value = Self::sample_at(
+                self.hz,
+                self.format.rate_hz,
+                self.frame.saturating_add(f as u64),
+            );
+            let bytes = value.to_le_bytes();
+            for c in 0..channels {
+                let at = f * frame_bytes + c * 2;
+                if let Some(slot) = pcm.get_mut(at..at + 2) {
+                    slot.copy_from_slice(&bytes);
+                }
+            }
+        }
+        self.frame = self.frame.saturating_add(frames as u64);
+        if let Some(pacer) = self.pacer.as_mut() {
+            pacer.advance(produced);
+        }
+        self.log.produced(produced);
+        Ok(produced)
+    }
+
+    fn stop(&mut self) {
+        self.pacer = None;
+        self.log.stopped();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +742,94 @@ mod tests {
         assert_eq!(recording.samples(), vec![1, 2, 3, 4]);
         assert_eq!(recording.format(), Some(STEREO_48K));
         assert_eq!((recording.starts(), recording.stops()), (1, 1));
+    }
+
+    /// The capture-side half of the pacing contract: a source that produced a
+    /// period instantly would let a guest with a deep ring pull hours of
+    /// "recording" out of a second of wall clock.
+    #[test]
+    fn a_software_source_takes_about_as_long_as_the_audio_it_produces() {
+        for source in [
+            Box::new(SilentSource::new()) as Box<dyn AudioSource>,
+            Box::new(ToneSource::new(440.0).0),
+        ] {
+            let mut source = source;
+            source.start(STEREO_48K, 4096).expect("source starts");
+            let mut period = vec![0u8; 4 * 4800]; // 100 ms
+            let began = Instant::now();
+            for _ in 0..2 {
+                assert_eq!(source.read(&mut period).expect("read"), period.len());
+            }
+            let elapsed = began.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(150),
+                "{} produced 200 ms of audio in {elapsed:?}",
+                source.name()
+            );
+        }
+    }
+
+    /// A source may never claim more bytes than the caller made room for, and
+    /// must only ever produce whole frames.
+    #[test]
+    fn a_source_never_reports_more_than_the_room_it_was_given() {
+        let (mut tone, log) = ToneSource::unpaced(1000.0);
+        tone.start(STEREO_48K, 1024).expect("start");
+        // A buffer that is not a whole number of 4-byte frames: the odd tail
+        // is left alone rather than half-written.
+        let mut buf = vec![0xabu8; 4 * 10 + 3];
+        let produced = tone.read(&mut buf).expect("read");
+        assert_eq!(produced, 40);
+        assert!(produced <= buf.len());
+        assert_eq!(
+            &buf[40..],
+            &[0xab, 0xab, 0xab],
+            "the partial frame is untouched"
+        );
+        assert_eq!(log.bytes(), 40);
+
+        // Zero room is answered with zero bytes, not a panic or a partial frame.
+        assert_eq!(tone.read(&mut []).expect("read"), 0);
+        assert_eq!(tone.read(&mut [0u8; 3]).expect("read"), 0);
+    }
+
+    /// The waveform must be continuous across reads — a source that restarted
+    /// its phase every period would put a click at every period boundary and
+    /// make a frequency measurement meaningless.
+    #[test]
+    fn the_tone_source_is_deterministic_and_continuous_across_reads() {
+        let (mut tone, log) = ToneSource::unpaced(440.0);
+        tone.start(STEREO_48K, 64).expect("start");
+        let mut first = vec![0u8; 64];
+        let mut second = vec![0u8; 64];
+        tone.read(&mut first).expect("read");
+        tone.read(&mut second).expect("read");
+
+        let mut expected = Vec::new();
+        for frame in 0..32u64 {
+            let value = ToneSource::sample_at(440.0, 48000, frame);
+            expected.extend_from_slice(&value.to_le_bytes());
+            expected.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut got = first.clone();
+        got.extend_from_slice(&second);
+        assert_eq!(got, expected, "the two reads are not one continuous tone");
+        assert_eq!(log.format(), Some(STEREO_48K));
+        assert_eq!((log.starts(), log.stops()), (1, 0));
+        tone.stop();
+        assert_eq!(log.stops(), 1);
+    }
+
+    #[test]
+    fn the_silent_source_is_silent_and_says_what_it_was_opened_for() {
+        let mut source = SilentSource::unpaced();
+        let log = source.log();
+        source.start(STEREO_48K, 512).expect("start");
+        let mut buf = vec![0xffu8; 64];
+        assert_eq!(source.read(&mut buf).expect("read"), 64);
+        assert_eq!(buf, vec![0u8; 64], "a silent source must zero the buffer");
+        assert_eq!(log.format(), Some(STEREO_48K));
+        assert_eq!(log.bytes(), 64);
     }
 
     /// A recording left running for hours must not become the host's memory

@@ -6,8 +6,9 @@
 //!
 //! # What the device advertises, and why so little
 //!
-//! One output stream, `S16` samples, 44100 or 48000 Hz, one or two channels.
-//! A guest ALSA stack converts anything else in userspace before it ever
+//! One output stream and one input stream, `S16` samples, 44100 or 48000 Hz,
+//! one or two channels — the *same* set in both directions, deliberately. A
+//! guest ALSA stack converts anything else in userspace before it ever
 //! reaches the device, so a longer list buys nothing but more host code on an
 //! untrusted path — the same "correct first, fast later" call `virtio-net`
 //! made about offloads. The advertised set lives in [`SUPPORTED_FORMATS`] /
@@ -15,20 +16,40 @@
 //! rather than against whatever the guest claims we said.
 
 use crate::protocol::{
-    self, rate_hz, FMT_S16, PCM_F_EVT_SHMEM_PERIODS, PCM_F_EVT_XRUNS, PCM_F_MSG_POLLING,
-    PCM_F_SHMEM_GUEST, PCM_F_SHMEM_HOST, RATE_44100, RATE_48000, S_BAD_MSG, S_NOT_SUPP,
+    self, rate_hz, D_INPUT, D_OUTPUT, FMT_S16, PCM_F_EVT_SHMEM_PERIODS, PCM_F_EVT_XRUNS,
+    PCM_F_MSG_POLLING, PCM_F_SHMEM_GUEST, PCM_F_SHMEM_HOST, RATE_44100, RATE_48000, S_BAD_MSG,
+    S_NOT_SUPP,
 };
 
-/// Streams this device advertises: one, for playback.
+/// Streams this device advertises: two — one playback, one capture.
 ///
-/// Capture (`VIRTIO_SND_D_INPUT`) is a documented phase 2 — see the crate
-/// docs. Advertising zero capture streams is what keeps the RX queue unused by
-/// a conforming driver.
-pub const STREAMS: u32 = 1;
-/// Physical jacks advertised: one line-out.
-pub const JACKS: u32 = 1;
-/// Channel maps advertised: one, matching the output stream.
-pub const CHMAPS: u32 = 1;
+/// The identifiers are fixed, not discovered: [`OUTPUT_STREAM`] then
+/// [`INPUT_STREAM`], and `PCM_INFO` reports them in that order. Every
+/// identifier a guest sends is checked against this count, and every I/O
+/// message additionally against the direction of the queue it arrived on.
+pub const STREAMS: u32 = 2;
+/// The playback stream's identifier.
+pub const OUTPUT_STREAM: u32 = 0;
+/// The capture stream's identifier.
+pub const INPUT_STREAM: u32 = 1;
+/// Physical jacks advertised: a line-out and a microphone, in that order.
+pub const JACKS: u32 = 2;
+/// Channel maps advertised: one per stream, in stream order.
+pub const CHMAPS: u32 = 2;
+
+/// Which way a stream identifier points, or `None` when it names no stream we
+/// advertise.
+///
+/// The device's whole notion of "this message arrived on the wrong queue"
+/// comes from here, so it is a function of the *constant* identifiers and
+/// never of anything the guest asserts.
+pub const fn direction_of(stream_id: u32) -> Option<u8> {
+    match stream_id {
+        OUTPUT_STREAM => Some(D_OUTPUT),
+        INPUT_STREAM => Some(D_INPUT),
+        _ => None,
+    }
+}
 
 /// Channels one stream may carry. Two, because that is what the chmap
 /// describes and what every host sink accepts without a matrix mixer.
@@ -260,6 +281,9 @@ pub enum XferError {
     #[error("I/O for stream id {id}, outside the advertised range 0..{STREAMS}")]
     UnknownStream { id: u32 },
 
+    #[error("I/O for stream id {id} arrived on the queue for direction {queue}")]
+    WrongDirection { id: u32, queue: u8 },
+
     #[error("I/O message for a stream that is {state:?}")]
     NotReady { state: StreamState },
 
@@ -284,20 +308,38 @@ impl XferError {
     }
 }
 
-/// Checks one playback message's header and payload length against the stream
-/// the driver configured. Pure, so the fuzz target can drive it directly.
+/// Checks one I/O message's header and payload length against the stream the
+/// driver configured. Pure, so the fuzz target can drive it directly.
+///
+/// `queue` is the direction of the virtqueue the message arrived on —
+/// [`protocol::D_OUTPUT`] for TX, [`protocol::D_INPUT`] for RX — and a stream
+/// identifier that points the other way is refused before anything else looks
+/// at it. Without that check a guest could name the capture stream on the TX
+/// queue and have the device treat guest-readable bytes as a buffer it may
+/// fill, which is exactly the ownership confusion the RX path exists to avoid.
+///
+/// `payload_len` is the length the *guest* granted for this direction: the
+/// device-readable audio on TX, the device-**writable** room on RX. Either way
+/// it must be non-empty, a whole number of frames, and no larger than one
+/// negotiated period.
 ///
 /// Returns the parameters the caller should stage against, which is also the
-/// proof that `params` was `Some` and the payload is a whole number of frames
-/// no larger than one period.
+/// proof that `params` was `Some` and that `payload_len` is usable.
 pub fn validate_xfer(
+    queue: u8,
     state: StreamState,
     params: Option<PcmParams>,
     stream_id: u32,
     payload_len: usize,
 ) -> Result<PcmParams, XferError> {
-    if stream_id >= STREAMS {
+    let Some(direction) = direction_of(stream_id) else {
         return Err(XferError::UnknownStream { id: stream_id });
+    };
+    if direction != queue {
+        return Err(XferError::WrongDirection {
+            id: stream_id,
+            queue,
+        });
     }
     if !state.accepts_io() {
         return Err(XferError::NotReady { state });
@@ -401,6 +443,15 @@ mod tests {
     use super::*;
     use crate::protocol::{RawSetParams, FMT_FLOAT, FMT_S32, RATE_192000, RATE_8000};
 
+    /// `direction_of` is the only place a stream id becomes a direction, so a
+    /// test that names both constants keeps the two halves honest.
+    const _: () = {
+        assert!(OUTPUT_STREAM < STREAMS);
+        assert!(INPUT_STREAM < STREAMS);
+        assert!(OUTPUT_STREAM != INPUT_STREAM);
+        assert!(CHMAPS == STREAMS, "one channel map per stream");
+    };
+
     fn good() -> RawSetParams {
         RawSetParams {
             stream_id: 0,
@@ -453,6 +504,34 @@ mod tests {
                 validate_params(&RawSetParams { rate, ..good() }).expect_err("rate accepted");
             assert_eq!(error, ParamError::Rate { rate });
             assert_eq!(error.status(), S_NOT_SUPP);
+        }
+    }
+
+    /// Two streams, and the two identifiers point opposite ways. Everything
+    /// the RX path does is keyed off this being a device constant.
+    #[test]
+    fn the_two_advertised_streams_are_one_out_and_one_in() {
+        assert_eq!(STREAMS, 2);
+        assert_eq!(direction_of(OUTPUT_STREAM), Some(D_OUTPUT));
+        assert_eq!(direction_of(INPUT_STREAM), Some(D_INPUT));
+        for id in [STREAMS, STREAMS + 1, u32::MAX] {
+            assert_eq!(direction_of(id), None, "stream {id} is not advertised");
+        }
+    }
+
+    /// Both directions take the same parameters: the guest's own stack does
+    /// the converting, and a capture stream the playback stream cannot mirror
+    /// would need a second host code path on an untrusted input.
+    #[test]
+    fn both_streams_accept_exactly_the_same_geometry() {
+        for stream_id in [OUTPUT_STREAM, INPUT_STREAM] {
+            let params = validate_params(&RawSetParams {
+                stream_id,
+                ..good()
+            })
+            .expect("both directions take the advertised set");
+            assert_eq!(params.rate_hz, 48000);
+            assert_eq!(params.frame_bytes(), 4);
         }
     }
 
@@ -593,22 +672,42 @@ mod tests {
         let frame = params.frame_bytes() as usize;
 
         assert_eq!(
-            validate_xfer(StreamState::Prepared, Some(params), 0, frame),
+            validate_xfer(
+                D_OUTPUT,
+                StreamState::Prepared,
+                Some(params),
+                OUTPUT_STREAM,
+                frame
+            ),
             Ok(params),
             "a prepared stream takes buffers: ALSA fills before it starts"
         );
         assert_eq!(
             validate_xfer(
+                D_OUTPUT,
                 StreamState::Running,
                 Some(params),
-                0,
+                OUTPUT_STREAM,
+                params.period_bytes as usize
+            ),
+            Ok(params)
+        );
+        // And the same rules hold for the capture stream on the capture queue,
+        // where the length being checked is device-*writable* room.
+        assert_eq!(
+            validate_xfer(
+                D_INPUT,
+                StreamState::Running,
+                Some(params),
+                INPUT_STREAM,
                 params.period_bytes as usize
             ),
             Ok(params)
         );
 
-        for (state, params_in, id, len, expected) in [
+        for (queue, state, params_in, id, len, expected) in [
             (
+                D_OUTPUT,
                 StreamState::Running,
                 Some(params),
                 STREAMS,
@@ -616,54 +715,83 @@ mod tests {
                 XferError::UnknownStream { id: STREAMS },
             ),
             (
+                D_OUTPUT,
                 StreamState::Unset,
                 Some(params),
-                0,
+                OUTPUT_STREAM,
                 frame,
                 XferError::NotReady {
                     state: StreamState::Unset,
                 },
             ),
             (
+                D_OUTPUT,
                 StreamState::ParamsSet,
                 Some(params),
-                0,
+                OUTPUT_STREAM,
                 frame,
                 XferError::NotReady {
                     state: StreamState::ParamsSet,
                 },
             ),
             (
+                D_OUTPUT,
                 StreamState::Running,
                 None,
-                0,
+                OUTPUT_STREAM,
                 frame,
                 XferError::NotConfigured,
             ),
+            // The ownership inversion in one line: the capture stream named on
+            // the playback queue, and the playback stream on the capture one.
+            (
+                D_OUTPUT,
+                StreamState::Running,
+                Some(params),
+                INPUT_STREAM,
+                frame,
+                XferError::WrongDirection {
+                    id: INPUT_STREAM,
+                    queue: D_OUTPUT,
+                },
+            ),
+            (
+                D_INPUT,
+                StreamState::Running,
+                Some(params),
+                OUTPUT_STREAM,
+                frame,
+                XferError::WrongDirection {
+                    id: OUTPUT_STREAM,
+                    queue: D_INPUT,
+                },
+            ),
         ] {
             assert_eq!(
-                validate_xfer(state, params_in, id, len),
+                validate_xfer(queue, state, params_in, id, len),
                 Err(expected),
-                "{state:?} {id} {len}"
+                "{queue} {state:?} {id} {len}"
             );
             assert_eq!(expected.status(), S_BAD_MSG);
         }
 
-        // Empty, partial and oversized payloads.
-        for len in [
-            0,
-            1,
-            frame + 1,
-            params.period_bytes as usize + frame,
-            usize::MAX,
-        ] {
-            assert!(
-                matches!(
-                    validate_xfer(StreamState::Running, Some(params), 0, len),
-                    Err(XferError::Payload { .. })
-                ),
-                "payload of {len} bytes accepted"
-            );
+        // Empty, partial and oversized payloads, in both directions.
+        for (queue, id) in [(D_OUTPUT, OUTPUT_STREAM), (D_INPUT, INPUT_STREAM)] {
+            for len in [
+                0,
+                1,
+                frame + 1,
+                params.period_bytes as usize + frame,
+                usize::MAX,
+            ] {
+                assert!(
+                    matches!(
+                        validate_xfer(queue, StreamState::Running, Some(params), id, len),
+                        Err(XferError::Payload { .. })
+                    ),
+                    "payload of {len} bytes accepted on queue {queue}"
+                );
+            }
         }
     }
 

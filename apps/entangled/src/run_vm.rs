@@ -378,12 +378,21 @@ fn build_devices(
         // silently playing into nothing, exactly as `[display] virgl` does.
         let (sink, factory) = virtio_sound::open_sink(choice)
             .map_err(|e| format!("[sound] backend = \"{}\": {e}", cfg.sound.backend))?;
+        // The capture half of the same backend. It never fails the run: a
+        // machine with speakers and no microphone is completely ordinary, so
+        // an absent one degrades to a capture device that records silence —
+        // see `virtio_sound::open_source`.
+        let (source, source_factory) = virtio_sound::open_source(choice)
+            .map_err(|e| format!("[sound] backend = \"{}\": {e}", cfg.sound.backend))?;
         tracing::info!(
             %sink,
+            %source,
             requested = %cfg.sound.backend,
             "attaching virtio-snd device"
         );
-        devices.push(Box::new(virtio_sound::SoundDevice::new(sink, factory)));
+        devices.push(Box::new(
+            virtio_sound::SoundDevice::new(sink, factory).with_source(source, source_factory),
+        ));
     }
 
     // virtio-input gamepad (GAME-2104), last for the same reason the sound
