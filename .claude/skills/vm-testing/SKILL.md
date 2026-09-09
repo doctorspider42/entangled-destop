@@ -168,6 +168,157 @@ The queue-notify measurement uses the same harness:
 cargo test -p boot-tests --test notify_bench -- --ignored --nocapture
 ```
 
+## Endurance: the soak (MVP-1404)
+
+`tests/boot/tests/soak.rs` boots **one** VM and leaves it running. Where
+`repeat_boot` looks for what a teardown forgets to release, this looks for what
+a *running* VM accumulates, which is a different defect class: a leaked irqfd
+shows up in the first, a serial IRQ that stops being delivered after the
+seventy-thousandth line only in the second. The guest is the test initramfs with
+`entangled.heartbeat=<ms>`, whose one line — `VMHOST_HEARTBEAT <n>
+uptime_ms=<t>` — carries most of the measurement.
+
+```bash
+ENTANGLED_SOAK_LOG=$HOME/soak.tsv \
+  cargo test -p boot-tests --test soak -- --ignored --nocapture
+```
+
+Default two hours (`ENTANGLED_SOAK_SECS`), 256 MiB, mmio, one vCPU, sampled
+every 60 s after a 60 s warm-up. The other knobs are in the file's header table;
+two are worth knowing here.
+
+**Always pass `ENTANGLED_SOAK_LOG`.** Every sample is written and flushed as it
+is taken and the summary block is appended at the end, so the file is a complete
+account of the run up to the moment anything interrupts it. This is not
+hypothetical: the first attempt at this run died with the machine at ~50 minutes
+on 2026-09-08 and left nothing at all behind, because the numbers only existed
+in a `println!` that never happened. Everything the test asserts except the two
+whole-transcript checks (gaps, unexpected lines) can be re-derived from the file.
+
+**`ENTANGLED_SOAK_CMDLINE=<words>`** appends to the guest's kernel command line
+and **`ENTANGLED_SOAK_POLL_MS=<n>`** changes how often the harness re-reads the
+console. Both exist for the control runs below — an experiment that needs the
+test edited to repeat is an experiment nobody repeats.
+
+### The measured run: 2 h on KVM in WSL2, 2026-09-09
+
+```text
+duration          7200 s (2.00 h) after a 60s warm-up, 121 samples
+RSS               85352 -> 85668 KiB (+316 KiB, +158 KiB/h)
+file descriptors  11 -> 11
+threads           6 -> 6
+heartbeats        7066 ticks, 7127 lines on the console, 0 gaps
+delivery          worst interval 0.90 of expected (60 expected per 60 s), at 4800 s
+guest clock       7109386 ms guest vs 7200131 ms host, drift -12603 ppm (+-104 ppm)
+console           309994 bytes total, 43.5 B per heartbeat, 1 unexpected lines
+```
+
+(Verbatim from the run. The summary gained two fields *afterwards*, from what
+this run taught: the clocksource, and a bytes-per-heartbeat that is marginal
+rather than an average over a boot log the guest paid for once — 39 B, not 43.5.)
+
+Read that as four verdicts and one failure:
+
+- **Nothing leaks.** Descriptors and threads are *identical* after two hours and
+  7 066 heartbeats — no per-interrupt eventfd, no per-kick worker. The 316 KiB
+  of RSS is not monotonic (it fell as well as rose, 85 128 KiB at 45 minutes) and
+  is dwarfed by the 285 KiB of console text the harness itself accumulated over
+  the same period, which is the same memory. Treat +316 KiB / 2 h as noise, and
+  the 32 MiB allowance as the thing that would catch a real leak.
+- **No interrupt is ever lost.** 7 066 consecutive tick numbers with **zero
+  gaps** — every line the guest wrote to the interrupt-driven 8250 arrived. That
+  is the assertion this test exists for, and it is the one `repeat_boot` found
+  broken before the machine had an IOAPIC.
+- **No stalls.** The worst 60-second window carried 0.90 of the heartbeats its
+  length implies, and that window was heavily loaded (below).
+- **The guest says almost nothing.** One line in two hours, and it is benign:
+  `kworker/0:1 (10) used greatest stack depth: 13712 bytes left`. 43.5 B per
+  heartbeat on the wire.
+- **The guest's clock loses time, and the test fails on it.** −12 603 ppm over
+  two hours: the guest's `CLOCK_MONOTONIC` advanced 7 109 s while the host's
+  advanced 7 200 s, so **the guest lost 90.7 seconds — about 18 minutes a day.**
+
+### The clock finding, and how to measure it honestly
+
+Two things had to be fixed before that number meant anything, and both are worth
+knowing before trusting any drift measurement here:
+
+1. **Date the beat you watched arrive, never the one you found.** The baseline
+   used to be whichever heartbeat happened to be sitting in the transcript,
+   stamped "now" although it had been printed up to one harness poll earlier.
+   That fixed ~0.6 s offset is then divided by the run length, so the same
+   healthy guest read **+77 356 ppm at 10 s and +10 031 ppm at 60 s** — and the
+   same offset would be under +200 ppm across an hour. A number that fails a
+   short run, vanishes in a long one and means nothing in either.
+   `observe_next_beat` waits for the *transition*, which puts
+   the same small latency on both ends of the interval where it cancels.
+2. **Print the error bar.** One harness poll plus one observe interval (750 ms)
+   is the measurement's whole timing error: ±104 ppm over two hours, ±17 000 ppm
+   over 45 seconds. The assertion is widened by exactly that, so a smoke run of
+   this test is judged as loosely as its evidence deserves.
+
+With that in place the drift is real, and **it tracks host load**. Per-interval,
+from the log file:
+
+| Wall-clock window | Host load average | Interval drift |
+|---|---|---|
+| first ~60 min, machine quiet | ~1–3 | −2 200 … −6 000 ppm |
+| last ~40 min, another agent fuzzing | ~18–20 | −22 000 … −25 700 ppm |
+
+So there is a floor of roughly **−5 000 ppm on an idle machine** (7 minutes a
+day) and it degrades to −2.5 % when the host is busy.
+
+**Three control runs say what it is not.** All three were launched together, so
+they saw the same (heavily loaded, ~50–65) machine, and each one removes a
+suspect:
+
+| Control | Drift |
+|---|---|
+| default: `tsc` clocksource, 500 ms observer poll, 900 s | **−25 667 ppm** ±834 |
+| `ENTANGLED_SOAK_CMDLINE=clocksource=kvm-clock`, 900 s | **−25 686 ppm** ±834 |
+| `ENTANGLED_SOAK_POLL_MS=25`, 600 s | **−26 132 ppm** ±459 |
+
+- **Not the clocksource.** Forcing `kvm-clock` — the paravirtual clock whose
+  scale the host maintains — changes the number by 0.07 %. The two runs even
+  produced the same 868 heartbeats. So this is not the guest believing a wrong
+  TSC frequency, which was the first and most attractive theory (the guest does
+  take one on trust: `tsc: Detected 1896.389 MHz processor`, the host's nominal
+  base clock, with `Calibrating delay loop (skipped)` and no refinement pass,
+  and it then leaves `kvm-clock` for the raw `tsc` at 2.4 s — the report prints
+  `clocksource <name>` beside the drift because of this run).
+- **Not the harness.** Twenty times faster observation moves the number by 2 %,
+  in the *wrong* direction. The drift is in the guest's time base, not in when
+  the host notices a line.
+- **Not lost output.** Zero gaps in all three, and the delivery ratio never
+  below 0.95.
+
+What is left is that **the guest's time base loses roughly the time its vCPU is
+not running**: guest `CLOCK_MONOTONIC` advanced 876.5 s while the host's
+advanced 899.6 s. That is consistent with KVM having no stable master clock on
+this host and adjusting the guest TSC per vCPU load, which is exactly the regime
+a nested host produces.
+
+**Measured on KVM inside WSL2 — a nested host whose own clock is
+Hyper-V-derived — so do not carry the number to bare metal without re-measuring
+there.** The open questions, for whoever owns the time base
+(`vmm-core`, `machine-x86`): does it reproduce on a bare-metal KVM host, does it
+reproduce on WHP, and does KVM report a stable master clock here. What is *not*
+in doubt is that a guest of ours can be a percent slow while reporting a healthy
+everything-else, and that no test before this one would have noticed.
+
+**The soak therefore fails on this machine, on that assertion alone**, and it is
+left failing on purpose: 10 000 ppm is a generous gate that a correct guest
+clock beats by orders of magnitude, and moving it to accommodate the measurement
+would delete the finding.
+
+### What it deliberately does not assert
+
+Nothing about absolute performance, and no ratio tighter than 0.5 of the
+expected heartbeats in a window: this machine runs other agents' builds and VMs,
+and a guest descheduled for a second is not a stalled guest. A lost interrupt
+does not produce 0.6 of the heartbeats — it produces none, and then a gap in the
+tick numbers, which is the assertion that actually catches it.
+
 ## ACPI tests
 
 Details and the expected serial output are in the `acpi-machine` skill; what

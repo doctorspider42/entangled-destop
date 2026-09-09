@@ -25,7 +25,7 @@
 //!                               rebooting: proves the FADT, the DSDT's `\_S5`
 //!                               and the host's ACPI PM block agree. Opt-in,
 //!                               because every other test wants the reboot path.
-//!   `entangled.heartbeat=<ms>`  print `VMHOST_HEARTBEAT <n>` every `<ms>`
+//!   `entangled.heartbeat=<ms>`  print `VMHOST_HEARTBEAT <n> uptime_ms=<ms>` every `<ms>`
 //!                               milliseconds, for ever, instead of rebooting.
 //!                               The guest-side evidence for pause and resume
 //!                               (ADR-0005): a host that has frozen a VM can
@@ -217,9 +217,19 @@ fn main() {
 /// would be a serial-console flood rather than a probe.
 fn heartbeat(period_ms: u64) {
     let period = Duration::from_millis(period_ms.clamp(10, 10_000));
+    let started = Instant::now();
     let mut tick: u64 = 0;
     loop {
-        println!("VMHOST_HEARTBEAT {tick}");
+        // The trailing field is the *guest's* monotonic clock, which is what
+        // makes timer drift measurable over a long run (MVP-1404): the host
+        // compares it against its own elapsed time, and neither the sleep's
+        // overshoot nor the print's cost enters the comparison. It is appended
+        // rather than woven in so that every existing reader — all of which take
+        // the first whitespace-separated token after the marker — keeps working.
+        println!(
+            "VMHOST_HEARTBEAT {tick} uptime_ms={}",
+            started.elapsed().as_millis()
+        );
         // Flushed explicitly: stdout to a serial console is line-buffered only
         // when it is a tty, and the host is counting *arrivals*.
         let _ = std::io::stdout().flush();

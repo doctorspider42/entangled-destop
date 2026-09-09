@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-08-18
-- Backlog: [entangled-mvp-backlog.md](../../entangled-mvp-backlog.md) (MVP-001)
+- Backlog: [vmhost-mvp-backlog.md](../../vmhost-mvp-backlog.md) (MVP-001)
 
 ## Context
 

@@ -280,7 +280,10 @@ fn heartbeats(console: &str) -> Vec<u64> {
     console
         .lines()
         .filter_map(|line| line.trim().strip_prefix(HEARTBEAT))
-        .filter_map(|rest| rest.trim().parse::<u64>().ok())
+        // Only the first token: the line carries the guest's own uptime after
+        // the counter (the soak's drift measurement), and a reader of the
+        // counter must not care how many fields follow it.
+        .filter_map(|rest| rest.split_ascii_whitespace().next()?.parse::<u64>().ok())
         .collect()
 }
 
