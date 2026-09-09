@@ -663,7 +663,7 @@ mod tests {
         // stays true when either constant moves.
         let capacity = PCI_MMIO64_SIZE / MAX_SHM_BAR_BYTES;
         assert!(
-            capacity >= PCI_MMIO_SLOTS + 1,
+            capacity > PCI_MMIO_SLOTS,
             "the aperture must hold one maximum window per slot plus an \
              alignment gap; it holds {capacity}"
         );
