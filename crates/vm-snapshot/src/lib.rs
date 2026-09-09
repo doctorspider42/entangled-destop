@@ -43,7 +43,7 @@ pub use error::{Result, SnapshotError};
 pub use format::{
     Arch, HostKind, SectionEntry, SectionKind, SnapshotReader, SnapshotWriter, MAGIC, VERSION,
 };
-pub use memory::MemoryStats;
+pub use memory::{Codec, MemoryStats, SaveOptions};
 pub use meta::{DeviceSlot, FileFingerprint, FileRole, MachineShape, Metadata};
 pub use vm::{inspect, SnapshotInfo, SnapshotSummary};
 

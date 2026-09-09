@@ -23,6 +23,9 @@ control-api.workspace = true
 # reuses rather than reimplementing.
 disk-image.workspace = true
 vm-memory.workspace = true
+# Guest RAM compresses about two to one and the write is what a suspend waits
+# on (ADR-0006).
+lz4_flex.workspace = true
 
 [lints]
 workspace = true

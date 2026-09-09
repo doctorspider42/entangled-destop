@@ -6,8 +6,11 @@
 //! entirely zero:
 //!
 //! ```text
-//!   gpa u64 | region length u64 | page size u32 | reserved u32
-//!   ( offset u64 | length u64 | length bytes ) *   until the section ends
+//!   gpa u64 | region length u64 | page size u32 | codec u32
+//!   ( raw length u64 | stored length u64 | stored bytes ) *  until the section ends
+//!
+//!   a block, once decoded:
+//!   ( offset u64 | length u64 | length bytes ) *  until the block ends
 //! ```
 //!
 //! **Why skipping zeroes is not an optimisation.** A guest is handed
@@ -24,27 +27,193 @@
 //! itself small, and the snapshot is still marked sparse
 //! (`disk_image::ops::mark_sparse`) because the sections around the memory are
 //! written by seeking.
+//!
+//! # How the scan is fast (ADR-0006, the dirty-page round)
+//!
+//! Two changes, neither of which touches the format — a snapshot written by
+//! this code is byte for byte the one the single-threaded version wrote:
+//!
+//! * **The guest is scanned where it lies.** The first version read every
+//!   region into a 1 MiB scratch buffer and looked for zeroes there, which is a
+//!   full-RAM `memcpy` performed to discover that three quarters of it is zero.
+//!   `slab_bytes` takes the bounds-checked `VolatileSlice` the region already
+//!   offers and reads through it in place.
+//! * **Slabs are scanned in parallel.** The region is cut into [`SLAB`]-sized
+//!   pieces handed to a small pool; each returns the encoded runs for its own
+//!   piece and the writer emits them **in slab order**, so the output does not
+//!   depend on how the threads were scheduled. Hashing and writing stay on one
+//!   thread — a SHA-256 over a section is inherently serial — and overlap the
+//!   scanning of the slabs behind them.
+//!
+//! Runs never span a slab boundary, exactly as they never spanned the old scan
+//! chunk: a run that reaches the end of one slab is closed and the next slab
+//! starts a new one. The restore side rejoins them because it writes by offset,
+//! so the only visible effect is a slightly longer run list.
+//!
+//! # And then the file itself
+//!
+//! With the scan no longer the cost, what a suspend waits on is the write.
+//! Guest RAM compresses, so each slab's runs go through **LZ4 block
+//! compression** on the worker that scanned them — the one part of the pipeline
+//! with cores to spare — and the writer hashes and writes what comes out. Two
+//! consequences worth stating plainly:
+//!
+//! * the section's shape changed, so [`MEMORY_VERSION`] is 2 and a version-1
+//!   memory section is a named refusal. That is the cost of the change, and it
+//!   is the reason the compression is a *block* framing around the same run
+//!   encoding rather than a new one: everything about how a run is spelled is
+//!   unchanged, which keeps the diff — and the risk — to the framing;
+//! * a codec is a decoder that allocates on somebody else's numbers, so both
+//!   lengths of every block are bounded before anything is reserved, and a
+//!   block that decompresses to a different length than it claims is refused
+//!   rather than used short.
 
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::sync_channel;
+use std::sync::Mutex;
 
-use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryRegion};
+use vm_memory::{
+    Bytes, GuestAddress, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, VolatileSlice,
+};
 
 use crate::codec::{Reader, Writer};
 use crate::error::{Result, SnapshotError};
 use crate::format::{SectionKind, SnapshotReader, SnapshotWriter};
 
 /// Version of the memory section's encoding.
-pub const MEMORY_VERSION: u32 = 1;
+///
+/// 2 since the compressed block framing. The parallel scan on its own did not
+/// bump it — the same runs, in the same order, with the same bytes — because a
+/// version buys a refusal, and a refusal that protects nothing costs somebody
+/// their snapshot for no reason. Compression does change what is in the file,
+/// so it does.
+pub const MEMORY_VERSION: u32 = 2;
+
+/// How a memory block's bytes are stored.
+///
+/// Part of the format: the value is written into every region header and an
+/// unknown one is refused, so a future codec is a refusal on an old build
+/// rather than a mis-decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    /// Stored bytes are the bytes. Both lengths must agree.
+    None,
+    /// LZ4 block format (no frame header: the block's own length and the
+    /// section's SHA-256 already say what a frame would).
+    Lz4Block,
+}
+
+impl Codec {
+    const fn code(self) -> u32 {
+        match self {
+            Codec::None => 0,
+            Codec::Lz4Block => 1,
+        }
+    }
+
+    fn from_code(code: u32) -> Result<Self> {
+        match code {
+            0 => Ok(Codec::None),
+            1 => Ok(Codec::Lz4Block),
+            other => Err(SnapshotError::BadValue {
+                what: "memory block codec",
+                value: u64::from(other),
+            }),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Codec::None => "none",
+            Codec::Lz4Block => "lz4-block",
+        }
+    }
+}
+
+/// Set to `0` to write an uncompressed snapshot. For measurement, and for a
+/// host where the CPU is scarcer than the disk.
+pub const COMPRESS_ENV: &str = "ENTANGLED_SNAPSHOT_COMPRESS";
+
+/// Largest block a decoder will decompress, and therefore the largest buffer a
+/// file can make it allocate. A writer produces at most one slab of runs plus
+/// their headers; this is an order of magnitude of headroom above that, so a
+/// snapshot written by any plausible future slab size still reads, and a
+/// corrupt length still cannot ask for a gigabyte.
+const MAX_BLOCK_RAW: u64 = 64 << 20;
+
+/// Largest *stored* block. LZ4's worst case is a little above its input, and an
+/// uncompressed block is exactly its input.
+const MAX_BLOCK_STORED: u64 = MAX_BLOCK_RAW + (1 << 20);
 
 /// Granularity zero-detection works at. The architectural page: coarser would
 /// keep zeroes, finer would multiply the run list for no gain.
 pub const PAGE: u64 = 4096;
 
-/// How much memory is read from the guest at a time while scanning.
-const SCAN_CHUNK: usize = 1 << 20;
+/// How much of a region one worker scans at a time.
+///
+/// The trade is between parallelism and the buffers in flight: a worker's
+/// output is at most one slab of bytes, and the writer may be holding a few
+/// while it waits for the one it needs next. 4 MiB keeps the worst case in tens
+/// of megabytes and is still 1024 pages, so the run list barely notices the
+/// boundaries.
+pub const SLAB: u64 = 4 << 20;
+
+/// Below this a region is scanned on the calling thread. Spawning a pool to
+/// look at a few megabytes costs more than it saves.
+const PARALLEL_FLOOR: u64 = 2 * SLAB;
+
+/// Most workers the scan will use. Beyond this the writer is the bottleneck —
+/// one SHA-256, one file — and the extra threads only enlarge the reorder
+/// buffer.
+const MAX_WORKERS: usize = 8;
+
+/// Overrides the worker count, for measurement and for a host where a suspend
+/// must not take every core.
+pub const THREADS_ENV: &str = "ENTANGLED_SNAPSHOT_THREADS";
 
 /// Fixed part at the front of a memory section.
 const REGION_HEADER: usize = 8 + 8 + 4 + 4;
+
+/// How a save is allowed to spend the machine.
+///
+/// Explicit rather than read from the environment deep inside the scan, so a
+/// test can pin both and prove the output does not depend on either — which is
+/// the property the whole parallel scheme rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaveOptions {
+    /// Threads that scan and compress. One means the calling thread only.
+    pub workers: usize,
+    pub codec: Codec,
+}
+
+impl Default for SaveOptions {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl SaveOptions {
+    /// What a real suspend uses: every core up to [`MAX_WORKERS`], LZ4, unless
+    /// [`THREADS_ENV`] or [`COMPRESS_ENV`] says otherwise.
+    pub fn from_env() -> Self {
+        let workers = match std::env::var(THREADS_ENV)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(n) => n.max(1),
+            None => std::thread::available_parallelism()
+                .map(|n| n.get().min(MAX_WORKERS))
+                .unwrap_or(1),
+        };
+        let codec = match std::env::var(COMPRESS_ENV).as_deref() {
+            Ok("0") | Ok("no") | Ok("off") | Ok("false") => Codec::None,
+            _ => Codec::Lz4Block,
+        };
+        Self { workers, codec }
+    }
+}
 
 /// What one save moved.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -82,6 +251,21 @@ impl MemoryStats {
 pub fn save<M, W>(mem: &M, out: &mut SnapshotWriter<W>) -> Result<MemoryStats>
 where
     M: GuestMemory,
+    M::R: Sync,
+    W: Write + std::io::Seek,
+{
+    save_with(mem, out, SaveOptions::from_env())
+}
+
+/// [`save`] with the worker count and the codec chosen by the caller.
+pub fn save_with<M, W>(
+    mem: &M,
+    out: &mut SnapshotWriter<W>,
+    options: SaveOptions,
+) -> Result<MemoryStats>
+where
+    M: GuestMemory,
+    M::R: Sync,
     W: Write + std::io::Seek,
 {
     let mut total = MemoryStats::default();
@@ -91,26 +275,27 @@ where
             value: u64::MAX,
             max: u64::from(u32::MAX),
         })?;
-        total.add(save_region(mem, region, index, out)?);
+        total.add(save_region(region, index, out, options)?);
     }
     Ok(total)
 }
 
-fn save_region<M, W>(
-    mem: &M,
-    region: &M::R,
+fn save_region<R, W>(
+    region: &R,
     index: u32,
     out: &mut SnapshotWriter<W>,
+    options: SaveOptions,
 ) -> Result<MemoryStats>
 where
-    M: GuestMemory,
+    R: GuestMemoryRegion + Sync,
     W: Write + std::io::Seek,
 {
     let gpa = region.start_addr().0;
     let len = region.len();
+    let codec = options.codec;
     let mut section = out.section(SectionKind::Memory, MEMORY_VERSION, index)?;
     let mut header = Writer::with_capacity(REGION_HEADER);
-    header.u64(gpa).u64(len).u32(PAGE as u32).u32(0);
+    header.u64(gpa).u64(len).u32(PAGE as u32).u32(codec.code());
     section
         .write_all(header.as_bytes())
         .map_err(SnapshotError::io("writing a memory region header"))?;
@@ -119,57 +304,359 @@ where
         total_bytes: len,
         ..MemoryStats::default()
     };
-    let mut buf = vec![0u8; SCAN_CHUNK];
-    // The run currently being built, as an offset into the region plus how much
-    // of `pending` belongs to it. Runs never span a chunk boundary in the
-    // buffer, but they do span it in the file: a run that reaches the end of one
-    // chunk is flushed and the next chunk starts a new one. Coalescing across
-    // chunks would need the previous chunk's bytes to still be in hand.
-    let mut offset = 0u64;
-    while offset < len {
-        let want = (len - offset).min(SCAN_CHUNK as u64) as usize;
-        let chunk = &mut buf[..want];
-        mem.read_slice(chunk, GuestAddress(gpa + offset))
-            .map_err(|e| {
-                SnapshotError::Restore(format!("reading guest memory at {gpa:#x}: {e}"))
-            })?;
-
-        let mut run_start: Option<usize> = None;
-        let mut at = 0usize;
-        while at < want {
-            let page_end = (at + PAGE as usize).min(want);
-            let page = &chunk[at..page_end];
-            let empty = page.iter().all(|&b| b == 0);
-            match (empty, run_start) {
-                (false, None) => run_start = Some(at),
-                (true, Some(start)) => {
-                    write_run(&mut section, offset + start as u64, &chunk[start..at])?;
-                    stats.saved_bytes += (at - start) as u64;
-                    stats.runs += 1;
-                    run_start = None;
-                }
-                _ => {}
+    let slabs = len.div_ceil(SLAB);
+    let workers = options.workers.min(slabs as usize).max(1);
+    if len < PARALLEL_FLOOR || workers <= 1 {
+        let mut staging = Staging::default();
+        for slab in 0..slabs {
+            let offset = slab * SLAB;
+            let runs = scan_slab(region, offset, slab_len(len, slab))?;
+            if runs.is_empty() {
+                continue;
             }
-            at = page_end;
+            let block = build_block(region, &runs, codec, &mut staging, &mut stats)?;
+            write_block(&mut section, block)?;
         }
-        if let Some(start) = run_start {
-            write_run(&mut section, offset + start as u64, &chunk[start..want])?;
-            stats.saved_bytes += (want - start) as u64;
-            stats.runs += 1;
-        }
-        offset += want as u64;
+    } else {
+        scan_in_parallel(region, len, slabs, workers, codec, &mut section, &mut stats)?;
     }
     section.finish()?;
     Ok(stats)
 }
 
-fn write_run<W: Write>(out: &mut W, offset: u64, bytes: &[u8]) -> Result<()> {
+/// How long slab `slab` is: a whole [`SLAB`] except for the last one.
+fn slab_len(region_len: u64, slab: u64) -> u64 {
+    (region_len - slab * SLAB).min(SLAB)
+}
+
+/// One slab's non-zero runs, as `(offset in the region, length)` pairs.
+///
+/// Deliberately **not** the bytes. An earlier attempt had each worker build the
+/// encoded run bytes and hand them to the writer, which cost 512 MiB of
+/// allocation and one extra copy per byte on a desktop-sized guest and made
+/// four threads *slower* than one (measured; see ADR-0006). What the parallel
+/// part is good at is touching two gigabytes to find out which quarter of it
+/// matters; the answer is a few thousand pairs, and the writer reads the bytes
+/// straight out of guest memory when it needs them.
+type Runs = Vec<(u64, u64)>;
+
+/// The host bytes of a range of the region, read through its own bounds check.
+///
+/// The whole point of the exercise: no copy. `get_slice` is the checked API —
+/// it refuses an offset or a length outside the region — and what comes back is
+/// a view of the very pages the guest runs on.
+fn region_bytes<R: GuestMemoryRegion>(region: &R, offset: u64, len: u64) -> Result<&[u8]> {
+    let len = usize::try_from(len).map_err(|_| SnapshotError::BadValue {
+        what: "memory slab length",
+        value: len,
+    })?;
+    let slice: VolatileSlice<'_, _> =
+        region
+            .get_slice(MemoryRegionAddress(offset), len)
+            .map_err(|e| {
+                SnapshotError::Restore(format!("reading guest memory at offset {offset:#x}: {e}"))
+            })?;
+    let guard = slice.ptr_guard();
+    // SAFETY: `get_slice` has just bounds-checked `offset..offset + len`
+    // against this region, so the pointer it hands back addresses exactly `len`
+    // bytes of the region's own mapping — anonymous `mmap` on Linux,
+    // `VirtualAlloc(MEM_COMMIT)` on Windows, both zero-filled by the kernel, so
+    // none of it is uninitialised. The borrowed slice cannot outlive `region`,
+    // which the caller holds.
+    //
+    // Reading it as a plain slice rather than through the volatile accessors is
+    // sound because of this module's contract, restated in `save`: a snapshot is
+    // taken at a lifecycle stop point with every vCPU parked and every host
+    // worker quiesced (ADR-0005), so nothing writes guest memory while it is
+    // read. A save taken without that guarantee is a torn picture of a machine
+    // that never existed whether the read went through `read_slice` or not; this
+    // makes the requirement explicit instead of paying a full-RAM `memcpy` to
+    // hide it.
+    Ok(unsafe { std::slice::from_raw_parts(guard.as_ptr(), len) })
+}
+
+/// Finds the non-zero runs of one slab. The expensive part, and the parallel
+/// one: it reads every byte of the slab and returns a handful of pairs.
+fn scan_slab<R: GuestMemoryRegion>(region: &R, offset: u64, len: u64) -> Result<Runs> {
+    let bytes = region_bytes(region, offset, len)?;
+    let mut runs = Runs::new();
+    let mut run_start: Option<usize> = None;
+    let mut at = 0usize;
+    let want = bytes.len();
+    while at < want {
+        let page_end = (at + PAGE as usize).min(want);
+        let empty = is_zero(&bytes[at..page_end]);
+        match (empty, run_start) {
+            (false, None) => run_start = Some(at),
+            (true, Some(start)) => {
+                runs.push((offset + start as u64, (at - start) as u64));
+                run_start = None;
+            }
+            _ => {}
+        }
+        at = page_end;
+    }
+    if let Some(start) = run_start {
+        runs.push((offset + start as u64, (want - start) as u64));
+    }
+    Ok(runs)
+}
+
+/// Whether a page is entirely zero.
+///
+/// Word at a time rather than byte at a time: `align_to` hands back the aligned
+/// middle as `u64`s, which is eight times fewer comparisons and vectorises
+/// cleanly, and the unaligned ends are at most seven bytes each. Guest pages are
+/// page aligned in practice, so the ends are usually empty.
+fn is_zero(page: &[u8]) -> bool {
+    // SAFETY: `u64` has no invalid bit patterns and no padding, so any correctly
+    // aligned run of eight initialised bytes is a valid `u64`. `align_to` is
+    // what guarantees the alignment; the prefix and suffix it leaves over are
+    // checked as bytes.
+    let (head, words, tail) = unsafe { page.align_to::<u64>() };
+    head.iter().all(|&b| b == 0) && words.iter().all(|&w| w == 0) && tail.iter().all(|&b| b == 0)
+}
+
+/// The two buffers one slab's worth of work needs, kept across slabs so a
+/// whole snapshot costs two allocations per thread rather than two per slab.
+///
+/// Not a micro-optimisation: an earlier version allocated a fresh buffer per
+/// slab and, on a desktop-sized guest, spent more time in the allocator's
+/// `mmap`/`munmap` path than in the scan — four threads came out *slower* than
+/// one (measured; ADR-0006).
+#[derive(Default)]
+struct Staging {
+    /// The runs, spelled the way the format spells them, before compression.
+    raw: Vec<u8>,
+    /// What the codec made of them.
+    stored: Vec<u8>,
+}
+
+/// What one worker hands the writer: which slab, what the block decodes to,
+/// the stored bytes, and the counts for that slab alone.
+type Ready = (u64, u64, Vec<u8>, MemoryStats);
+
+/// One block ready for the file: the length it decodes to, and its bytes.
+struct Block<'a> {
+    raw_len: u64,
+    stored: &'a [u8],
+}
+
+/// Gathers one slab's runs into `staging.raw` and compresses them.
+///
+/// The gather is the only copy of guest memory in the whole save, and it earns
+/// itself twice over: it turns a hundred thousand small writes into one, and it
+/// gives the codec a block big enough to find matches in.
+fn build_block<'a, R: GuestMemoryRegion>(
+    region: &R,
+    runs: &Runs,
+    codec: Codec,
+    staging: &'a mut Staging,
+    stats: &mut MemoryStats,
+) -> Result<Block<'a>> {
+    staging.raw.clear();
+    for &(offset, len) in runs {
+        let mut header = Writer::with_capacity(16);
+        header.u64(offset).u64(len);
+        staging.raw.extend_from_slice(header.as_bytes());
+        staging
+            .raw
+            .extend_from_slice(region_bytes(region, offset, len)?);
+        stats.saved_bytes += len;
+        stats.runs += 1;
+    }
+    let raw_len = staging.raw.len() as u64;
+    // A wholly zero slab: nothing to store, and nothing for a codec to be
+    // asked to do with an empty input. The caller writes no block at all.
+    if raw_len == 0 {
+        return Ok(Block {
+            raw_len: 0,
+            stored: &staging.raw,
+        });
+    }
+    match codec {
+        Codec::None => Ok(Block {
+            raw_len,
+            stored: &staging.raw,
+        }),
+        Codec::Lz4Block => {
+            let bound = lz4_flex::block::get_maximum_output_size(staging.raw.len());
+            staging.stored.resize(bound, 0);
+            let written = lz4_flex::block::compress_into(&staging.raw, &mut staging.stored)
+                .map_err(|e| SnapshotError::Restore(format!("compressing a memory block: {e}")))?;
+            staging.stored.truncate(written);
+            Ok(Block {
+                raw_len,
+                stored: &staging.stored,
+            })
+        }
+    }
+}
+
+/// Writes one block's framing and its bytes.
+///
+/// A slab with no runs — a wholly zero four megabytes, which is most of an idle
+/// guest — writes **nothing at all**, not an empty block. That keeps the
+/// all-zero case at the few hundred bytes it was before compression, and it is
+/// what lets the decoder refuse a zero-length block outright rather than
+/// looping on one.
+fn write_block<W: Write>(out: &mut W, block: Block<'_>) -> Result<()> {
+    debug_assert!(block.raw_len > 0, "an empty block must not be written");
     let mut header = Writer::with_capacity(16);
-    header.u64(offset).u64(bytes.len() as u64);
+    header.u64(block.raw_len).u64(block.stored.len() as u64);
     out.write_all(header.as_bytes())
-        .map_err(SnapshotError::io("writing a memory run header"))?;
-    out.write_all(bytes)
-        .map_err(SnapshotError::io("writing a memory run"))
+        .map_err(SnapshotError::io("writing a memory block header"))?;
+    out.write_all(block.stored)
+        .map_err(SnapshotError::io("writing a memory block"))
+}
+
+/// Scans the region's slabs on a pool and writes them **in slab order**.
+///
+/// The ordering is the whole contract: the file a four-thread run produces is
+/// the file a one-thread run produces, so nothing downstream — the digest, the
+/// restore, a diff of two snapshots — can tell how many cores were free.
+///
+/// The consumer always drains the channel into a reorder buffer before it waits
+/// for the slab it needs next, which is what keeps a worker from blocking on a
+/// full channel while the consumer blocks on that worker. What is buffered is
+/// run *lists*, tens of bytes each, so the reorder buffer costs nothing whatever
+/// order the slabs arrive in.
+#[allow(clippy::too_many_arguments)]
+fn scan_in_parallel<R, W>(
+    region: &R,
+    len: u64,
+    slabs: u64,
+    workers: usize,
+    codec: Codec,
+    out: &mut W,
+    stats: &mut MemoryStats,
+) -> Result<()>
+where
+    R: GuestMemoryRegion + Sync,
+    W: Write,
+{
+    let next = AtomicU64::new(0);
+    let failure: Mutex<Option<SnapshotError>> = Mutex::new(None);
+    // Deep enough that a worker rarely blocks, small enough that the scan does
+    // not run far ahead of a slow disk.
+    let (tx, rx) = sync_channel::<Ready>(workers * 2);
+    // Compressed blocks come back here to be filled again. A worker that finds
+    // the pool empty allocates one; the writer puts a used one back unless the
+    // pool is already deep enough. That is the whole recycling scheme, and it is
+    // enough: the steady state is a fixed set of buffers going round, so a
+    // multi-gigabyte guest costs a handful of allocations rather than one per
+    // slab. (Allocating per slab is what made four threads slower than one in
+    // the first attempt — ADR-0006.)
+    let pool: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    let depth = workers * 4;
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let next = &next;
+            let failure = &failure;
+            let pool = &pool;
+            scope.spawn(move || {
+                let mut staging = Staging::default();
+                loop {
+                    let slab = next.fetch_add(1, Ordering::Relaxed);
+                    if slab >= slabs {
+                        return;
+                    }
+                    // Per-slab counts, summed by the writer in slab order, so
+                    // the totals do not depend on the scheduling either.
+                    let mut mine = MemoryStats::default();
+                    let mut buf = pool
+                        .lock()
+                        .ok()
+                        .and_then(|mut p| p.pop())
+                        .unwrap_or_default();
+                    buf.clear();
+                    let outcome =
+                        scan_slab(region, slab * SLAB, slab_len(len, slab)).and_then(|runs| {
+                            let block = build_block(region, &runs, codec, &mut staging, &mut mine)?;
+                            buf.extend_from_slice(block.stored);
+                            Ok(block.raw_len)
+                        });
+                    match outcome {
+                        // A closed channel means the writer gave up; stop
+                        // scanning rather than working for nobody.
+                        Ok(raw_len) => {
+                            if tx.send((slab, raw_len, buf, mine)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            if let Ok(mut slot) = failure.lock() {
+                                slot.get_or_insert(error);
+                            }
+                            // Claim the rest so the other workers stop too.
+                            next.store(slabs, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let mut pending: BTreeMap<u64, (u64, Vec<u8>, MemoryStats)> = BTreeMap::new();
+        let mut wanted = 0u64;
+        let mut result = Ok(());
+        while wanted < slabs {
+            match pending.remove(&wanted) {
+                Some((raw_len, buf, mine)) => {
+                    // A wholly zero slab produced no runs and writes nothing.
+                    let outcome = if raw_len == 0 {
+                        Ok(())
+                    } else {
+                        write_block(
+                            out,
+                            Block {
+                                raw_len,
+                                stored: &buf,
+                            },
+                        )
+                    };
+                    stats.saved_bytes += mine.saved_bytes;
+                    stats.runs += mine.runs;
+                    if let Ok(mut p) = pool.lock() {
+                        if p.len() < depth {
+                            p.push(buf);
+                        }
+                    }
+                    if let Err(error) = outcome {
+                        result = Err(error);
+                        break;
+                    }
+                    wanted += 1;
+                }
+                None => match rx.recv() {
+                    Ok((slab, raw_len, buf, mine)) => {
+                        pending.insert(slab, (raw_len, buf, mine));
+                    }
+                    // Every sender is gone and the slab we need has not
+                    // arrived: a worker failed, or one died.
+                    Err(_) => break,
+                },
+            }
+        }
+        // Dropping the receiver stops the workers from blocking on a full
+        // channel while the scope waits for them to finish.
+        drop(rx);
+        if let Ok(mut slot) = failure.lock() {
+            if let Some(error) = slot.take() {
+                return Err(error);
+            }
+        }
+        result?;
+        if wanted < slabs {
+            return Err(SnapshotError::Restore(format!(
+                "the memory scan produced {wanted} of {slabs} slabs"
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// Reads every memory section back into `mem`.
@@ -203,22 +690,32 @@ where
 /// Parser state for one streamed memory section.
 ///
 /// The section arrives in fixed-size chunks that have nothing to do with the
-/// run boundaries inside it, so this is a small state machine rather than a
-/// straight-line decode: it accumulates the 16-byte header of the next run
-/// across a chunk boundary, then copies bytes straight into guest memory until
-/// the run is done.
+/// block boundaries inside it, so the outer layer is a small state machine: the
+/// region header, then, repeatedly, a 16-byte block header and the block's
+/// stored bytes, both accumulated across chunk boundaries.
+///
+/// The **inner** layer is not a state machine any more, and that is the one
+/// simplification the compressed framing bought: a block is decoded whole, so
+/// the runs inside it are read by straight-line code with no cross-chunk
+/// bookkeeping.
 struct RunParser<'a, M: GuestMemory> {
     mem: &'a M,
     gpa: u64,
     region_len: u64,
+    codec: Codec,
     /// Bytes of the fixed region header still to be consumed.
     header_left: usize,
     header: Vec<u8>,
-    /// Bytes of the current run header collected so far.
+    /// Bytes of the current block header collected so far.
     pending: Vec<u8>,
-    /// Where the current run writes next, and how much of it is left.
-    write_at: u64,
-    run_left: u64,
+    /// What the current block decodes to, and how much of it is still to
+    /// arrive.
+    raw_len: u64,
+    stored_left: u64,
+    /// The current block's stored bytes as they arrive, and the buffer they
+    /// decompress into. Both reused across blocks.
+    stored: Vec<u8>,
+    raw: Vec<u8>,
     stats: MemoryStats,
 }
 
@@ -235,45 +732,143 @@ impl<M: GuestMemory> RunParser<'_, M> {
                 }
                 continue;
             }
-            if self.run_left > 0 {
-                let take = (self.run_left.min(chunk.len() as u64)) as usize;
-                self.mem
-                    .write_slice(&chunk[..take], GuestAddress(self.write_at))
-                    .map_err(|e| {
-                        SnapshotError::Restore(format!(
-                            "writing guest memory at {:#x}: {e}",
-                            self.write_at
-                        ))
-                    })?;
-                self.write_at += take as u64;
-                self.run_left -= take as u64;
+            if self.stored_left > 0 {
+                let take = (self.stored_left.min(chunk.len() as u64)) as usize;
+                self.stored.extend_from_slice(&chunk[..take]);
+                self.stored_left -= take as u64;
                 chunk = &chunk[take..];
+                if self.stored_left == 0 {
+                    self.apply_block()?;
+                }
                 continue;
             }
             let take = (16 - self.pending.len()).min(chunk.len());
             self.pending.extend_from_slice(&chunk[..take]);
             chunk = &chunk[take..];
             if self.pending.len() == 16 {
-                let mut r = Reader::new(&self.pending);
-                let offset = r.u64("memory run offset")?;
-                let len = r.u64("memory run length")?;
-                let end = offset.checked_add(len).ok_or(SnapshotError::BadValue {
-                    what: "memory run offset + length",
-                    value: offset,
-                })?;
-                if end > self.region_len {
-                    return Err(SnapshotError::BadValue {
-                        what: "memory run past the end of its region",
-                        value: end,
-                    });
-                }
-                self.write_at = self.gpa + offset;
-                self.run_left = len;
-                self.stats.saved_bytes += len;
-                self.stats.runs += 1;
-                self.pending.clear();
+                self.start_block()?;
             }
         }
+        Ok(())
+    }
+
+    /// Reads a block header and bounds both of its lengths **before** the
+    /// buffers they size are reserved.
+    fn start_block(&mut self) -> Result<()> {
+        let mut r = Reader::new(&self.pending);
+        let raw_len = r.u64("memory block raw length")?;
+        let stored_len = r.u64("memory block stored length")?;
+        self.pending.clear();
+        if raw_len > MAX_BLOCK_RAW {
+            return Err(SnapshotError::TooLarge {
+                what: "memory block",
+                value: raw_len,
+                max: MAX_BLOCK_RAW,
+            });
+        }
+        if stored_len > MAX_BLOCK_STORED {
+            return Err(SnapshotError::TooLarge {
+                what: "stored memory block",
+                value: stored_len,
+                max: MAX_BLOCK_STORED,
+            });
+        }
+        if self.codec == Codec::None && stored_len != raw_len {
+            return Err(SnapshotError::Mismatch {
+                field: "uncompressed memory block length".into(),
+                snapshot: stored_len.to_string(),
+                current: raw_len.to_string(),
+            });
+        }
+        // A block that decodes to nothing is a writer that emitted an empty
+        // slab, which the writer above never does — and a decoder that accepted
+        // it would loop on zero-length blocks for as long as the section lasts.
+        if raw_len == 0 || stored_len == 0 {
+            return Err(SnapshotError::BadValue {
+                what: "empty memory block",
+                value: raw_len,
+            });
+        }
+        self.raw_len = raw_len;
+        self.stored_left = stored_len;
+        self.stored.clear();
+        self.stored.reserve(stored_len as usize);
+        Ok(())
+    }
+
+    /// Decodes one complete block and writes its runs into guest memory.
+    fn apply_block(&mut self) -> Result<()> {
+        let raw_len = self.raw_len as usize;
+        let raw: &[u8] = match self.codec {
+            Codec::None => &self.stored,
+            Codec::Lz4Block => {
+                self.raw.clear();
+                self.raw.resize(raw_len, 0);
+                let written = lz4_flex::block::decompress_into(&self.stored, &mut self.raw)
+                    .map_err(|e| {
+                        SnapshotError::Restore(format!("decompressing a memory block: {e}"))
+                    })?;
+                // A block that unpacks short is a block whose header lied, and
+                // the bytes past `written` would restore as zeroes — a hole in
+                // the guest that nothing else would ever notice.
+                if written != raw_len {
+                    return Err(SnapshotError::Mismatch {
+                        field: "decompressed memory block length".into(),
+                        snapshot: raw_len.to_string(),
+                        current: written.to_string(),
+                    });
+                }
+                &self.raw
+            }
+        };
+
+        let mut at = 0usize;
+        while at < raw.len() {
+            if raw.len() - at < 16 {
+                return Err(SnapshotError::Truncated {
+                    what: "memory run header",
+                    need: 16,
+                    have: (raw.len() - at) as u64,
+                });
+            }
+            let mut r = Reader::new(&raw[at..at + 16]);
+            let offset = r.u64("memory run offset")?;
+            let len = r.u64("memory run length")?;
+            at += 16;
+            let end = offset.checked_add(len).ok_or(SnapshotError::BadValue {
+                what: "memory run offset + length",
+                value: offset,
+            })?;
+            if end > self.region_len {
+                return Err(SnapshotError::BadValue {
+                    what: "memory run past the end of its region",
+                    value: end,
+                });
+            }
+            let len = usize::try_from(len).map_err(|_| SnapshotError::BadValue {
+                what: "memory run length",
+                value: len,
+            })?;
+            if raw.len() - at < len {
+                return Err(SnapshotError::Truncated {
+                    what: "memory run",
+                    need: len as u64,
+                    have: (raw.len() - at) as u64,
+                });
+            }
+            self.mem
+                .write_slice(&raw[at..at + len], GuestAddress(self.gpa + offset))
+                .map_err(|e| {
+                    SnapshotError::Restore(format!(
+                        "writing guest memory at {:#x}: {e}",
+                        self.gpa + offset
+                    ))
+                })?;
+            at += len;
+            self.stats.saved_bytes += len as u64;
+            self.stats.runs += 1;
+        }
+        self.raw_len = 0;
         Ok(())
     }
 
@@ -282,13 +877,7 @@ impl<M: GuestMemory> RunParser<'_, M> {
         let gpa = r.u64("memory region gpa")?;
         let len = r.u64("memory region length")?;
         let page = r.u32("memory region page size")?;
-        let reserved = r.u32("memory region reserved")?;
-        if reserved != 0 {
-            return Err(SnapshotError::BadValue {
-                what: "memory region reserved word",
-                value: u64::from(reserved),
-            });
-        }
+        self.codec = Codec::from_code(r.u32("memory region codec")?)?;
         if page == 0 {
             return Err(SnapshotError::BadValue {
                 what: "memory region page size",
@@ -305,13 +894,13 @@ impl<M: GuestMemory> RunParser<'_, M> {
         Ok(())
     }
 
-    /// A section that ended mid-run or mid-header is truncated, whatever the
+    /// A section that ended mid-block or mid-header is truncated, whatever the
     /// digest says about the bytes that did arrive.
     fn finish(self) -> Result<MemoryStats> {
-        if self.header_left > 0 || self.run_left > 0 || !self.pending.is_empty() {
+        if self.header_left > 0 || self.stored_left > 0 || !self.pending.is_empty() {
             return Err(SnapshotError::Truncated {
                 what: "memory section",
-                need: self.run_left + self.header_left as u64 + self.pending.len() as u64,
+                need: self.stored_left + self.header_left as u64 + self.pending.len() as u64,
                 have: 0,
             });
         }
@@ -334,11 +923,16 @@ where
         mem,
         gpa,
         region_len: len,
+        // Overwritten by the region header before a block is read; a section
+        // that ends before its header is truncated, not uncompressed.
+        codec: Codec::None,
         header_left: REGION_HEADER,
         header: Vec::with_capacity(REGION_HEADER),
         pending: Vec::with_capacity(16),
-        write_at: 0,
-        run_left: 0,
+        raw_len: 0,
+        stored_left: 0,
+        stored: Vec::new(),
+        raw: Vec::new(),
         stats: MemoryStats {
             total_bytes: len,
             ..MemoryStats::default()
@@ -487,5 +1081,359 @@ mod tests {
         let mut r = SnapshotReader::open(Cursor::new(&bytes)).unwrap();
         let err = restore(&target, &mut r).unwrap_err();
         assert!(matches!(err, SnapshotError::Mismatch { .. }), "{err}");
+    }
+
+    // ------------------------------------------------ the compressed framing
+
+    /// A guest with enough shape to exercise several slabs and both codecs.
+    fn patterned(bytes: usize) -> GuestMemoryMmap {
+        let mem = memory(bytes);
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut page = vec![0u8; PAGE as usize];
+        for index in 0..(bytes as u64 / PAGE) {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            if seed % 3 == 0 {
+                continue;
+            }
+            for (at, slot) in page.iter_mut().enumerate() {
+                *slot = if at % 4 == 0 {
+                    (seed >> (at % 56)) as u8 | 1
+                } else {
+                    0
+                };
+            }
+            mem.write_slice(&page, GuestAddress(index * PAGE)).unwrap();
+        }
+        mem
+    }
+
+    fn save_bytes(mem: &GuestMemoryMmap, options: SaveOptions) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = SnapshotWriter::create(&mut buf, HostKind::KvmLinux).unwrap();
+        save_with(mem, &mut w, options).unwrap();
+        w.finish().unwrap();
+        buf.into_inner()
+    }
+
+    fn read_back(bytes: &[u8], target: &GuestMemoryMmap) -> Result<MemoryStats> {
+        let mut r = SnapshotReader::open(Cursor::new(bytes))?;
+        restore(target, &mut r)
+    }
+
+    /// **The property the whole parallel scheme rests on.** One thread and
+    /// eight threads must write the same file, byte for byte — otherwise the
+    /// digest, a diff of two snapshots, and any future incremental would all
+    /// depend on how busy the machine was.
+    #[test]
+    fn the_thread_count_does_not_change_the_file() {
+        let mem = patterned(20 << 20);
+        for codec in [Codec::None, Codec::Lz4Block] {
+            let one = save_bytes(&mem, SaveOptions { workers: 1, codec });
+            let many = save_bytes(&mem, SaveOptions { workers: 8, codec });
+            assert!(
+                one == many,
+                "{} bytes with one worker, {} with eight, codec {}",
+                one.len(),
+                many.len(),
+                codec.as_str()
+            );
+            let target = memory(20 << 20);
+            read_back(&many, &target).expect("restore");
+            let mut a = vec![0u8; 20 << 20];
+            let mut b = vec![0u8; 20 << 20];
+            mem.read_slice(&mut a, GuestAddress(0)).unwrap();
+            target.read_slice(&mut b, GuestAddress(0)).unwrap();
+            assert!(
+                a == b,
+                "the restored guest is not the saved one ({})",
+                codec.as_str()
+            );
+        }
+    }
+
+    /// Compression is smaller, and both codecs restore the same guest.
+    #[test]
+    fn both_codecs_round_trip_and_lz4_is_smaller() {
+        let mem = patterned(20 << 20);
+        let plain = save_bytes(
+            &mem,
+            SaveOptions {
+                workers: 2,
+                codec: Codec::None,
+            },
+        );
+        let packed = save_bytes(
+            &mem,
+            SaveOptions {
+                workers: 2,
+                codec: Codec::Lz4Block,
+            },
+        );
+        assert!(
+            packed.len() < plain.len(),
+            "lz4 produced {} bytes against {} uncompressed",
+            packed.len(),
+            plain.len()
+        );
+        for bytes in [&plain, &packed] {
+            let target = memory(20 << 20);
+            let stats = read_back(bytes, &target).expect("restore");
+            assert!(stats.saved_bytes > 0);
+            let mut a = vec![0u8; 20 << 20];
+            let mut b = vec![0u8; 20 << 20];
+            mem.read_slice(&mut a, GuestAddress(0)).unwrap();
+            target.read_slice(&mut b, GuestAddress(0)).unwrap();
+            assert!(a == b);
+        }
+    }
+
+    /// Builds a memory section by hand so the decoder's refusals can be reached
+    /// through a container whose digests are correct — the failure under test is
+    /// then the one named, not a checksum.
+    fn handmade(codec: u32, blocks: &[(u64, u64, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = SnapshotWriter::create(&mut buf, HostKind::KvmLinux).unwrap();
+        {
+            let mut section = w.section(SectionKind::Memory, MEMORY_VERSION, 0).unwrap();
+            let mut header = Writer::with_capacity(REGION_HEADER);
+            header.u64(0).u64(4 << 20).u32(PAGE as u32).u32(codec);
+            section.write_all(header.as_bytes()).unwrap();
+            for (raw_len, stored_len, bytes) in blocks {
+                let mut head = Writer::with_capacity(16);
+                head.u64(*raw_len).u64(*stored_len);
+                section.write_all(head.as_bytes()).unwrap();
+                section.write_all(bytes).unwrap();
+            }
+            section.finish().unwrap();
+        }
+        w.finish().unwrap();
+        buf.into_inner()
+    }
+
+    fn refuse(bytes: &[u8]) -> SnapshotError {
+        let target = memory(4 << 20);
+        read_back(bytes, &target).expect_err("this snapshot should have been refused")
+    }
+
+    /// **Every new refusal the compressed framing brought, by name.**
+    #[test]
+    fn the_block_framing_refuses_by_name() {
+        // A codec this build does not know. Not a mis-decode: a refusal.
+        let err = refuse(&handmade(7, &[]));
+        assert!(
+            matches!(
+                &err,
+                SnapshotError::BadValue {
+                    what: "memory block codec",
+                    value: 7
+                }
+            ),
+            "{err}"
+        );
+
+        // A raw length no writer could have produced, offered before any buffer
+        // is reserved for it.
+        let err = refuse(&handmade(1, &[(MAX_BLOCK_RAW + 1, 4, vec![0u8; 4])]));
+        assert!(
+            matches!(
+                &err,
+                SnapshotError::TooLarge {
+                    what: "memory block",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let err = refuse(&handmade(1, &[(16, MAX_BLOCK_STORED + 1, Vec::new())]));
+        assert!(
+            matches!(
+                &err,
+                SnapshotError::TooLarge {
+                    what: "stored memory block",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+
+        // An uncompressed block whose two lengths disagree: one of them is a
+        // lie and there is no way to tell which.
+        let err = refuse(&handmade(0, &[(32, 16, vec![0u8; 16])]));
+        assert!(
+            matches!(&err, SnapshotError::Mismatch { field, .. }
+                if field == "uncompressed memory block length"),
+            "{err}"
+        );
+
+        // A zero-length block: the writer never emits one, and a decoder that
+        // took it would make no progress.
+        let err = refuse(&handmade(1, &[(0, 0, Vec::new())]));
+        assert!(
+            matches!(
+                &err,
+                SnapshotError::BadValue {
+                    what: "empty memory block",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+
+        // Bytes that are not an LZ4 block.
+        let err = refuse(&handmade(1, &[(4096, 8, vec![0xffu8; 8])]));
+        assert!(
+            matches!(&err, SnapshotError::Restore(text) if text.contains("decompressing")),
+            "{err}"
+        );
+
+        // A block that unpacks *short* of what it claims. The bytes past the end
+        // would restore as zeroes — a hole in the guest nothing else would see.
+        let short = lz4_flex::block::compress(&[0u8; 64]);
+        let err = refuse(&handmade(1, &[(4096, short.len() as u64, short)]));
+        assert!(
+            matches!(&err, SnapshotError::Mismatch { field, .. }
+                if field == "decompressed memory block length"),
+            "{err}"
+        );
+
+        // A block whose contents end mid-run.
+        let mut inner = Writer::with_capacity(16);
+        inner.u64(0).u64(4096);
+        let raw = inner.into_bytes();
+        let stored = lz4_flex::block::compress(&raw);
+        let err = refuse(&handmade(
+            1,
+            &[(raw.len() as u64, stored.len() as u64, stored)],
+        ));
+        assert!(
+            matches!(
+                &err,
+                SnapshotError::Truncated {
+                    what: "memory run",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+
+        // A run that points past the end of the region it belongs to.
+        let mut inner = Writer::with_capacity(16);
+        inner.u64((4 << 20) - 16).u64(4096);
+        let mut raw = inner.into_bytes();
+        raw.extend_from_slice(&[1u8; 4096]);
+        let stored = lz4_flex::block::compress(&raw);
+        let err = refuse(&handmade(
+            1,
+            &[(raw.len() as u64, stored.len() as u64, stored)],
+        ));
+        assert!(
+            matches!(
+                &err,
+                SnapshotError::BadValue {
+                    what: "memory run past the end of its region",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+
+        // A section that stops in the middle of a block.
+        let raw = vec![7u8; 64];
+        let stored = lz4_flex::block::compress(&raw);
+        let mut short = stored.clone();
+        short.pop();
+        let err = refuse(&handmade(
+            1,
+            &[(raw.len() as u64, stored.len() as u64, short)],
+        ));
+        assert!(
+            matches!(
+                &err,
+                SnapshotError::Truncated {
+                    what: "memory section",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// A memory section from before the compressed framing is refused by
+    /// version, not decoded as though its reserved word were a codec.
+    #[test]
+    fn a_version_1_memory_section_is_refused() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = SnapshotWriter::create(&mut buf, HostKind::KvmLinux).unwrap();
+        w.put(SectionKind::Memory, 1, 0, &[0u8; REGION_HEADER])
+            .unwrap();
+        w.finish().unwrap();
+        let err = refuse(&buf.into_inner());
+        match err {
+            SnapshotError::SectionVersion {
+                section,
+                found,
+                expected,
+            } => {
+                assert_eq!(section, "memory");
+                assert_eq!(found, 1);
+                assert_eq!(expected, MEMORY_VERSION);
+            }
+            other => panic!("expected a section-version refusal, got {other}"),
+        }
+    }
+
+    /// A wholly zero slab writes no block at all, which is what keeps an idle
+    /// guest's snapshot at a few hundred bytes even with a codec in the path.
+    #[test]
+    fn a_zero_slab_writes_no_block() {
+        let mem = memory(16 << 20);
+        for workers in [1usize, 4] {
+            let bytes = save_bytes(
+                &mem,
+                SaveOptions {
+                    workers,
+                    codec: Codec::Lz4Block,
+                },
+            );
+            assert!(
+                bytes.len() < 4096,
+                "{workers} workers produced {} bytes",
+                bytes.len()
+            );
+            let target = memory(16 << 20);
+            let stats = read_back(&bytes, &target).expect("restore");
+            assert_eq!(stats.saved_bytes, 0);
+            assert_eq!(stats.runs, 0);
+        }
+    }
+
+    /// A run that spans a slab boundary is split in the file and rejoined in the
+    /// guest — the parallel scan's one visible effect on the run list.
+    #[test]
+    fn a_run_across_a_slab_boundary_is_rejoined() {
+        let total = (4 * SLAB) as usize;
+        let mem = memory(total);
+        let start = SLAB - 2 * PAGE;
+        let filler = vec![0xc3u8; 4 * PAGE as usize];
+        mem.write_slice(&filler, GuestAddress(start)).unwrap();
+        let bytes = save_bytes(
+            &mem,
+            SaveOptions {
+                workers: 4,
+                codec: Codec::Lz4Block,
+            },
+        );
+        let target = memory(total);
+        let stats = read_back(&bytes, &target).expect("restore");
+        assert_eq!(
+            stats.runs, 2,
+            "the boundary should split the run in the file"
+        );
+        assert_eq!(stats.saved_bytes, 4 * PAGE);
+        let mut back = vec![0u8; 4 * PAGE as usize];
+        target.read_slice(&mut back, GuestAddress(start)).unwrap();
+        assert!(back == filler);
     }
 }
