@@ -1,0 +1,37 @@
+# The published guest artifacts `entangled fetch bootstrap-kernel` downloads.
+#
+# This file is COMPILED INTO the `entangled` binary (apps/entangled/src/bootstrap.rs,
+# `include_str!`). It is the trust anchor for those downloads: bytes that do not
+# hash to the `sha256` below are deleted, not used. There is no signature and no
+# key — this is as strong as the git history of this repository and no stronger,
+# which is why the digests belong here, in review, and not in a checksum file
+# fetched from beside the artifact.
+#
+# HOW TO UPDATE IT
+#   1. Change `guest/bootstrap-kernel/{build.sh,entangled.config}` or
+#      `guest/bootstrap-initramfs/`, and push. `.github/workflows/guest-artifacts.yml`
+#      builds both artifacts on Linux, publishes them under a new immutable tag
+#      together with the corresponding kernel source (GPLv2 §3), and prints the
+#      exact replacement for the block below in its job summary.
+#   2. Commit that block. Until you do, `entangled` keeps fetching the previous
+#      tag, which still exists — a release tag is never reused.
+#
+# The artifacts themselves are guest-side content and do not go through
+# `cargo deny`: `vmlinuz` is GPL-2.0-only Linux, `initrd.img` is this project's
+# own `init` (see LICENSE) statically linked against musl (MIT). See `source`
+# below for where the kernel's corresponding source is published.
+
+tag = "guest-artifacts-6.12.9-1"
+kernel_version = "6.12.9"
+base_url = "https://github.com/doctorspider42/entangled-destop/releases/download"
+source = "https://github.com/doctorspider42/entangled-destop/releases/tag/guest-artifacts-6.12.9-1"
+
+[[assets]]
+name = "vmlinuz"
+sha256 = "d46451e24526f9a42d9453bb64fbc7c3a2c6870ea1d84d0833c64162b7da5878"
+bytes = 13161472
+
+[[assets]]
+name = "initrd.img"
+sha256 = "c16b516d55601bca4f79b4c3076e7ae9f9dbfa0dd6a450b243925da49cb8c49e"
+bytes = 201703

@@ -1,15 +1,31 @@
-//! `entangled fetch` — download and verify installer media (backlog EPIC 6/12).
+//! `entangled fetch` — download and verify installer media (backlog EPIC 6/12),
+//! and the guest bootstrap artifacts.
 //!
-//! All the work lives in the `debian-media` crate; this module only turns its
-//! [`FetchReport`] into something readable on a terminal. The important thing it
-//! prints is *why* the media is trusted: which key signed the checksum root and
-//! where the provenance manifest went.
+//! All the work lives in the `debian-media` crate (or [`crate::bootstrap`]);
+//! this module only turns a report into something readable on a terminal. The
+//! important thing it prints is *why* the artifact is trusted — and the two
+//! answers are genuinely different, so they are printed differently rather than
+//! flattened into one reassuring "verified":
+//!
+//! * Debian media: a pinned OpenPGP key signed the checksum root, which names
+//!   the digest. Signature first, digest second.
+//! * bootstrap artifacts: a SHA-256 compiled into *this binary*. No signature
+//!   exists, and the output says so in as many words.
 
 use debian_media::{FetchOptions, FetchReport, MediaKind, Provenance};
 
 use crate::FetchArgs;
 
+/// The spelling `fetch` accepts for the guest artifacts. Also the name `doctor`
+/// and every failure hint print, so there is exactly one command to copy.
+pub const BOOTSTRAP_TARGET: &str = "bootstrap-kernel";
+
 pub fn run(args: &FetchArgs) -> Result<(), String> {
+    if args.distro.eq_ignore_ascii_case(BOOTSTRAP_TARGET)
+        || args.distro.eq_ignore_ascii_case("bootstrap")
+    {
+        return run_bootstrap(args);
+    }
     let report = debian_media::fetch_debian(
         &args.distro,
         &args.channel,
@@ -84,6 +100,45 @@ fn print_report(report: &FetchReport) {
         println!("    manifest : {}", artifact.manifest_path.display());
         println!("    fetched  : {}", artifact.manifest.fetched_at);
     }
+}
+
+/// `entangled fetch bootstrap-kernel` — the guest kernel and initramfs.
+///
+/// The whole reason this exists: `install debian` needs a kernel that Debian's
+/// installer kernel cannot be, this project builds one, and that build is a
+/// Linux kernel build with no cross-compile. A Windows host had no way to get it
+/// at all before this command.
+fn run_bootstrap(args: &FetchArgs) -> Result<(), String> {
+    let report = crate::bootstrap::fetch(crate::bootstrap::FetchOptions {
+        refresh: args.refresh,
+        offline: args.offline,
+    })?;
+
+    println!(
+        "guest bootstrap artifacts — Linux {} ({})",
+        report.kernel_version, report.tag
+    );
+    // Not "signature: OK". There is none, and the line that would say so is the
+    // line somebody would quote in a security review.
+    println!("  trust         : SHA-256 pinned in this build (guest/bootstrap-kernel/pinned.toml)");
+    println!(
+        "                  no signature — see the pin file for what that does and does not buy"
+    );
+    println!(
+        "  kernel source : {}   (GPL-2.0-only; published with the binary)",
+        report.source
+    );
+    println!("  cache         : {}", report.dir.display());
+    for asset in &report.assets {
+        println!();
+        println!("  {} [{}]", asset.name, asset.status.as_str());
+        println!("    path     : {}", asset.path.display());
+        println!("    url      : {}", asset.url);
+        println!("    sha256   : {}", asset.sha256);
+    }
+    println!();
+    println!("`entangled install debian` will find these; `entangled doctor` reports them.");
+    Ok(())
 }
 
 fn kind_label(kind: MediaKind) -> &'static str {

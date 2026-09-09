@@ -1383,6 +1383,7 @@ dependencies = [
  "linux-boot",
  "machine-x86",
  "png",
+ "serde",
  "thiserror 2.0.20",
  "toml",
  "tracing",
@@ -1405,6 +1406,7 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "control-api",
+ "debian-media",
  "disk-image",
  "eframe",
  "egui",

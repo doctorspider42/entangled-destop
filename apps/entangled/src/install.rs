@@ -12,7 +12,7 @@
 //! |---|---|---|
 //! | Default network | `tap` (`scripts/setup-tap.sh`), static netcfg | `usernet` (user-mode NAT in-process), static netcfg from its own config |
 //! | `--network tap` | the host interface | refused: [`NETWORK_TAP_UNAVAILABLE`] |
-//! | Bootstrap kernel (Debian) | `guest/bootstrap-kernel/build.sh` | copied in from a Linux checkout — there is no cross build |
+//! | Bootstrap kernel (Debian) | `guest/bootstrap-kernel/build.sh`, or the same download | `entangled fetch bootstrap-kernel` — the kernel build is Linux-only, so Windows downloads the published one ([`crate::bootstrap`]) |
 //! | Ubuntu | offline install off the verified ISO — identical on both | ditto |
 //!
 //! Nothing else is host-specific, and in particular nothing here mounts
@@ -73,9 +73,6 @@ const TAP_GUEST_DNS: &str = "1.1.1.1";
 /// The maintained automated profile (EPIC 13). Compiled in so `--auto` works
 /// from any working directory.
 const AUTO_PRESEED: &str = include_str!("../../../assets/preseed/auto-weston.cfg");
-
-/// The project kernel that boots both installer and installed system.
-const BOOTSTRAP_KERNEL: &str = "artifacts/bootstrap/vmlinuz";
 
 // ---------------------------------------------------------------------------
 // The one per-host choice: which network the installer gets
@@ -245,22 +242,21 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     // Debian builds virtio_mmio without cmdline-device support, so their
     // kernel cannot see our devices. The fetched kernel stays verified in the
     // cache (useful for ISO flows post-MVP).
-    let kernel = PathBuf::from(BOOTSTRAP_KERNEL);
-    if !kernel.exists() {
-        return Err(format!(
-            "bootstrap kernel {BOOTSTRAP_KERNEL} not found — build it with \
-             `bash guest/bootstrap-kernel/build.sh` (the Debian installer kernel \
-             cannot drive virtio-mmio devices).{}",
-            if cfg!(target_os = "linux") {
-                ""
-            } else {
-                " That script is a Linux kernel build and does not cross-build: copy \
-                 artifacts/bootstrap/ in from a Linux checkout, or install Ubuntu \
-                 instead — `entangled install ubuntu` boots verified media through \
-                 UEFI and needs no project kernel at all"
-            }
-        ));
-    }
+    let artifacts = crate::bootstrap::locate().ok_or_else(|| {
+        format!(
+            "the Debian installer needs Entangled's own kernel and initramfs, and this \
+             host has neither {}/ nor a verified copy in the cache. {}",
+            crate::bootstrap::CHECKOUT_DIR,
+            crate::bootstrap::missing_hint()
+        )
+    })?;
+    let kernel = artifacts.kernel.clone();
+    tracing::info!(
+        kernel = %kernel.display(),
+        initrd = %artifacts.initrd.display(),
+        origin = artifacts.origin.as_str(),
+        "bootstrap artifacts resolved"
+    );
     tracing::info!(version = %report.version, variant = %args.variant, "installer media ready");
 
     // 2. Target disk (MVP-1001/1006).
@@ -362,8 +358,14 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         transport: VirtioTransport::default(),
         boot: BootSection {
             mode: BootMode::DirectLinux,
-            kernel: Some(PathBuf::from("artifacts/bootstrap/vmlinuz")),
-            initramfs: Some(PathBuf::from("artifacts/bootstrap/initrd.img")),
+            // Whatever `locate` resolved, spelled the same way: relative for a
+            // checkout that built its own (which is what every profile this
+            // project has ever written, and what the manager's working-directory
+            // setting exists to make work), absolute for a fetched pair. A
+            // relative `artifacts/bootstrap/...` in a profile on a host that
+            // downloaded them names nothing at all.
+            kernel: Some(artifacts.kernel.clone()),
+            initramfs: Some(artifacts.initrd.clone()),
             firmware: None,
             nvram: None,
             cmdline: format!("console=ttyS0 root=UUID={} rw", root.uuid),

@@ -1,5 +1,11 @@
 //! `entangled` — the CLI control surface for the Entangled Desktop VMM.
 
+/// The guest kernel + initramfs `install debian` runs on: where they come
+/// from on a host that cannot build them, and what makes a download
+/// trustworthy. Portable — the pin, the digest check and the cache layout are
+/// byte logic, and the host that most needs them is the one that cannot build
+/// them.
+mod bootstrap;
 mod disk;
 mod doctor;
 mod fetch;
@@ -78,7 +84,7 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
-    /// Download and verify installer media (Debian stable).
+    /// Download and verify installer media, or the guest bootstrap artifacts.
     Fetch(FetchArgs),
     /// Manage virtual disks.
     #[command(subcommand)]
@@ -186,7 +192,12 @@ enum Command {
 
 #[derive(Args)]
 pub struct FetchArgs {
-    /// Distribution to fetch (only "debian").
+    /// What to fetch: "debian" (verified installer media) or
+    /// "bootstrap-kernel" (the guest kernel and initramfs `install debian`
+    /// runs on, ~13 MiB, checked against a SHA-256 pinned in this build).
+    ///
+    /// The three options below describe Debian media only; the bootstrap
+    /// artifacts are one pinned release, so there is nothing to choose.
     distro: String,
     #[arg(long, default_value = "stable")]
     channel: String,
