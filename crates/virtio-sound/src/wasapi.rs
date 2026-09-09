@@ -1,6 +1,6 @@
-//! The Windows playback sink: WASAPI in shared mode, through Microsoft's
-//! `windows` crate (MIT OR Apache-2.0 — the licence question that makes the
-//! Linux side interesting does not arise here).
+//! The Windows playback sink and capture source: WASAPI in shared mode,
+//! through Microsoft's `windows` crate (MIT OR Apache-2.0 — the licence
+//! question that makes the Linux side interesting does not arise here).
 //!
 //! # Shared mode, and why no resampler
 //!
@@ -25,14 +25,14 @@
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, WAVEFORMATEX,
+    eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient,
+    IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 
-use crate::backend::{AudioError, AudioSink, StreamFormat};
+use crate::backend::{AudioError, AudioSink, AudioSource, StreamFormat};
 
 /// `WAVE_FORMAT_PCM`.
 const WAVE_FORMAT_PCM: u16 = 1;
@@ -46,6 +46,9 @@ const AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY: u32 = 0x0800_0000;
 const REFTIMES_PER_SEC: i64 = 10_000_000;
 /// Endpoint buffer we ask for: 100 ms, comfortably more than the pump's chunk.
 const BUFFER_DURATION: i64 = REFTIMES_PER_SEC / 10;
+/// `AUDCLNT_BUFFERFLAGS_SILENT`: the packet's memory is undefined and the
+/// caller must treat it as silence.
+const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
 
 /// Owns this thread's COM apartment for as long as the sink lives.
 struct ComGuard {
@@ -74,6 +77,41 @@ impl Drop for ComGuard {
             unsafe { CoUninitialize() };
         }
     }
+}
+
+/// The `WAVEFORMATEX` for one of our S16LE streams.
+fn wave_format(format: StreamFormat) -> WAVEFORMATEX {
+    let block_align = u16::from(format.channels).saturating_mul(2);
+    WAVEFORMATEX {
+        wFormatTag: WAVE_FORMAT_PCM,
+        nChannels: u16::from(format.channels),
+        nSamplesPerSec: format.rate_hz,
+        nAvgBytesPerSec: format.rate_hz.saturating_mul(u32::from(block_align)),
+        nBlockAlign: block_align,
+        wBitsPerSample: 16,
+        cbSize: 0,
+    }
+}
+
+/// Activates an `IAudioClient` on the default console endpoint for `capture`
+/// or render. Shared by the sink, the source and both of their probes, so
+/// "which endpoint" is decided in exactly one place.
+fn default_endpoint(capture: bool) -> Result<IAudioClient, AudioError> {
+    let what = if capture { "capture" } else { "render" };
+    // SAFETY: standard COM activation of the MMDevice enumerator; the class id
+    // is the one the `windows` crate generated for it and the returned
+    // interface is checked by `CoCreateInstance` itself.
+    let enumerator: IMMDeviceEnumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+            .map_err(|e| AudioError::Unavailable(format!("MMDeviceEnumerator: {e}")))?;
+    let flow = if capture { eCapture } else { eRender };
+    // SAFETY: `enumerator` is a live interface pointer just obtained above.
+    let device = unsafe { enumerator.GetDefaultAudioEndpoint(flow, eConsole) }
+        .map_err(|e| AudioError::Unavailable(format!("no default {what} endpoint: {e}")))?;
+    // SAFETY: `device` is live; `Activate` with no activation parameters is the
+    // documented way to obtain an IAudioClient from an endpoint.
+    unsafe { device.Activate(CLSCTX_ALL, None) }
+        .map_err(|e| AudioError::Unavailable(format!("IAudioClient ({what}): {e}")))
 }
 
 /// A shared-mode WASAPI render stream on the default console endpoint.
@@ -130,19 +168,7 @@ impl WasapiSink {
     /// stream and holds nothing afterwards.
     pub fn probe() -> Result<String, AudioError> {
         let _com = ComGuard::enter();
-        // SAFETY: standard COM activation of the MMDevice enumerator; the
-        // class id is the one the `windows` crate generated for it and the
-        // returned interface is checked by `CoCreateInstance` itself.
-        let enumerator: IMMDeviceEnumerator =
-            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
-                .map_err(|e| AudioError::Unavailable(format!("MMDeviceEnumerator: {e}")))?;
-        // SAFETY: `enumerator` is a live interface pointer just obtained above.
-        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
-            .map_err(|e| AudioError::Unavailable(format!("no default render endpoint: {e}")))?;
-        // SAFETY: `device` is live; `Activate` with no activation parameters is
-        // the documented way to obtain an IAudioClient from an endpoint.
-        let _client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
-            .map_err(|e| AudioError::Unavailable(format!("IAudioClient: {e}")))?;
+        let _client = default_endpoint(false)?;
         Ok("wasapi".to_owned())
     }
 
@@ -181,27 +207,8 @@ impl AudioSink for WasapiSink {
         }
         self.frame_bytes = format.frame_bytes().max(1);
 
-        // SAFETY: as in `probe` — plain COM activation with checked results.
-        let enumerator: IMMDeviceEnumerator =
-            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
-                .map_err(|e| AudioError::Unavailable(format!("MMDeviceEnumerator: {e}")))?;
-        // SAFETY: `enumerator` is live.
-        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
-            .map_err(|e| AudioError::Unavailable(format!("no default render endpoint: {e}")))?;
-        // SAFETY: `device` is live.
-        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
-            .map_err(|e| AudioError::Unavailable(format!("IAudioClient: {e}")))?;
-
-        let block_align = u16::from(format.channels).saturating_mul(2);
-        let wfx = WAVEFORMATEX {
-            wFormatTag: WAVE_FORMAT_PCM,
-            nChannels: u16::from(format.channels),
-            nSamplesPerSec: format.rate_hz,
-            nAvgBytesPerSec: format.rate_hz.saturating_mul(u32::from(block_align)),
-            nBlockAlign: block_align,
-            wBitsPerSample: 16,
-            cbSize: 0,
-        };
+        let client = default_endpoint(false)?;
+        let wfx = wave_format(format);
         // SAFETY: `client` is live and uninitialised; `&wfx` points at a
         // `WAVEFORMATEX` that outlives the call (Initialize copies it), and the
         // two conversion flags are what let a shared-mode client name a format
@@ -302,6 +309,245 @@ impl AudioSink for WasapiSink {
     }
 }
 
+// ------------------------------------------------------------ capture source
+
+/// A shared-mode WASAPI capture stream on the default console microphone.
+///
+/// # Why there is a leftover buffer
+///
+/// `IAudioCaptureClient` is packet-oriented in a way the render client is not:
+/// `GetBuffer` hands over a whole packet and `ReleaseBuffer` must then be told
+/// that *all* of it was consumed (or none of it). The device asks for whatever
+/// room the guest's next capture buffer has, which is not a packet size, so a
+/// packet that does not fit is copied into [`Self::leftover`] and drained on
+/// the following read. Holding a partial packet in the endpoint instead would
+/// mean releasing zero frames and reading the same packet forever.
+pub struct WasapiSource {
+    com: Option<ComGuard>,
+    client: Option<IAudioClient>,
+    capture: Option<IAudioCaptureClient>,
+    frame_bytes: usize,
+    /// Bytes taken from the endpoint that did not fit the caller's buffer.
+    leftover: Vec<u8>,
+    /// How long to sleep when the endpoint has produced nothing yet.
+    wait: Duration,
+}
+
+// SAFETY: as for `WasapiSink` — the COM interfaces and the apartment guard are
+// created, used and released on one and the same thread (the device's capture
+// pump). `Send` is only what allows the *empty* source to be constructed
+// elsewhere and moved there; nothing inside is touched until `start`.
+unsafe impl Send for WasapiSource {}
+
+impl std::fmt::Debug for WasapiSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasapiSource")
+            .field("open", &self.client.is_some())
+            .field("leftover", &self.leftover.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for WasapiSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WasapiSource {
+    /// An unopened source. Cheap and infallible: the endpoint is only touched
+    /// in [`AudioSource::start`], on the capture pump thread.
+    pub fn new() -> Self {
+        Self {
+            com: None,
+            client: None,
+            capture: None,
+            frame_bytes: 4,
+            leftover: Vec::new(),
+            wait: Duration::from_millis(5),
+        }
+    }
+
+    /// Checks that this host has a usable default capture endpoint, so an
+    /// explicit backend fails at VM start rather than recording silence.
+    pub fn probe() -> Result<String, AudioError> {
+        let _com = ComGuard::enter();
+        let _client = default_endpoint(true)?;
+        Ok("wasapi".to_owned())
+    }
+
+    fn release(&mut self) {
+        if let Some(client) = self.client.take() {
+            // SAFETY: `client` is a live interface this source initialised and
+            // started; stopping and resetting an already-stopped client is
+            // documented as harmless, and the results are only advisory here.
+            unsafe {
+                let _ = client.Stop();
+                let _ = client.Reset();
+            }
+        }
+        self.capture = None;
+        self.leftover.clear();
+    }
+
+    /// Moves as much of `leftover` into `out` as fits, returning the bytes
+    /// moved. Whole frames only — a partial frame would put the guest's
+    /// channels out of step for the rest of the stream.
+    fn drain_leftover(&mut self, out: &mut [u8]) -> usize {
+        let frame_bytes = self.frame_bytes.max(1);
+        let take = out.len().min(self.leftover.len()) / frame_bytes * frame_bytes;
+        if take == 0 {
+            return 0;
+        }
+        let (Some(dst), Some(src)) = (out.get_mut(..take), self.leftover.get(..take)) else {
+            return 0;
+        };
+        dst.copy_from_slice(src);
+        self.leftover.drain(..take);
+        take
+    }
+}
+
+impl Drop for WasapiSource {
+    fn drop(&mut self) {
+        self.release();
+        // The apartment goes last: the interfaces must be released inside it.
+        self.com = None;
+    }
+}
+
+impl AudioSource for WasapiSource {
+    fn name(&self) -> &str {
+        "wasapi"
+    }
+
+    fn start(&mut self, format: StreamFormat, _period_bytes: usize) -> Result<(), AudioError> {
+        self.release();
+        if self.com.is_none() {
+            self.com = Some(ComGuard::enter());
+        }
+        self.frame_bytes = format.frame_bytes().max(1);
+
+        let client = default_endpoint(true)?;
+        let wfx = wave_format(format);
+        // SAFETY: `client` is live and uninitialised; `&wfx` points at a
+        // `WAVEFORMATEX` that outlives the call (Initialize copies it), and the
+        // two conversion flags are what let a shared-mode client name a format
+        // other than the engine's mix format — for capture as for render.
+        unsafe {
+            client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                BUFFER_DURATION,
+                0,
+                &wfx,
+                None,
+            )
+        }
+        .map_err(|e| AudioError::Format {
+            rate_hz: format.rate_hz,
+            channels: format.channels,
+            reason: e.to_string(),
+        })?;
+
+        // SAFETY: `client` is initialised, which is what these three calls
+        // require.
+        let buffer_frames = unsafe { client.GetBufferSize() }
+            .map_err(|e| AudioError::Io(format!("GetBufferSize: {e}")))?;
+        // SAFETY: same.
+        let capture: IAudioCaptureClient = unsafe { client.GetService() }
+            .map_err(|e| AudioError::Io(format!("IAudioCaptureClient: {e}")))?;
+        // SAFETY: same.
+        unsafe { client.Start() }.map_err(|e| AudioError::Io(format!("Start: {e}")))?;
+
+        // Sleep for a quarter of the endpoint buffer when it has nothing yet:
+        // long enough not to spin, short enough never to fall behind.
+        let quarter = u64::from(buffer_frames) * 250 / u64::from(format.rate_hz.max(1));
+        self.wait = Duration::from_millis(quarter.clamp(1, 50));
+        self.client = Some(client);
+        self.capture = Some(capture);
+        Ok(())
+    }
+
+    fn read(&mut self, out: &mut [u8]) -> Result<usize, AudioError> {
+        if self.capture.is_none() {
+            return Err(AudioError::Io("WASAPI capture stream is not open".into()));
+        }
+        let frame_bytes = self.frame_bytes.max(1);
+        let want = out.len() / frame_bytes * frame_bytes;
+        if want == 0 {
+            return Ok(0);
+        }
+        let mut done = self.drain_leftover(out);
+        // A stopped endpoint (an unplugged USB microphone) must not wedge the
+        // pump: give up after several times the audio's own duration and let
+        // the caller fall back to silence.
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        while done < want {
+            let Some(capture) = self.capture.as_ref() else {
+                break;
+            };
+            // SAFETY: `capture` is a live client belonging to a started
+            // `IAudioClient`.
+            let available = unsafe { capture.GetNextPacketSize() }
+                .map_err(|e| AudioError::Io(format!("GetNextPacketSize: {e}")))?;
+            if available == 0 {
+                if Instant::now() >= deadline {
+                    return Err(AudioError::Io(
+                        "WASAPI endpoint stopped producing audio".into(),
+                    ));
+                }
+                std::thread::sleep(self.wait);
+                continue;
+            }
+
+            let mut data: *mut u8 = std::ptr::null_mut();
+            let mut frames: u32 = 0;
+            let mut flags: u32 = 0;
+            // SAFETY: `capture` is live; the three out-parameters are live
+            // locals the callee writes through. On success `data` points at
+            // `frames * nBlockAlign` bytes owned by the endpoint until the
+            // matching `ReleaseBuffer`.
+            unsafe { capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None) }
+                .map_err(|e| AudioError::Io(format!("GetBuffer: {e}")))?;
+            let packet_bytes = (frames as usize).saturating_mul(frame_bytes);
+            let mut packet = vec![0u8; packet_bytes];
+            if flags & AUDCLNT_BUFFERFLAGS_SILENT == 0 && !data.is_null() && packet_bytes > 0 {
+                // SAFETY: `data` is non-null and, per the call above, points at
+                // `frames * nBlockAlign` = `packet_bytes` readable bytes owned
+                // by the endpoint until ReleaseBuffer, which has not run yet.
+                // `packet` is a freshly allocated host buffer of exactly that
+                // length, so the two cannot overlap.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data, packet.as_mut_ptr(), packet_bytes);
+                }
+            }
+            // A silent packet stays zeroed — its memory is documented as
+            // undefined, so it is never read.
+            // SAFETY: releases exactly the frames just obtained, which is the
+            // only value ReleaseBuffer accepts after a successful GetBuffer.
+            unsafe { capture.ReleaseBuffer(frames) }
+                .map_err(|e| AudioError::Io(format!("ReleaseBuffer: {e}")))?;
+
+            let take = packet_bytes.min(want - done);
+            if let (Some(dst), Some(src)) = (out.get_mut(done..done + take), packet.get(..take)) {
+                dst.copy_from_slice(src);
+                done += take;
+            }
+            if take < packet_bytes {
+                // Keep the tail for the next read rather than dropping it.
+                self.leftover.extend_from_slice(&packet[take..]);
+            }
+        }
+        Ok(done)
+    }
+
+    fn stop(&mut self) {
+        self.release();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +560,43 @@ mod tests {
             Ok(name) => assert_eq!(name, "wasapi"),
             Err(error) => eprintln!("skipping: {error}"),
         }
+    }
+
+    /// The same, for the microphone. A machine with speakers and no
+    /// microphone is completely ordinary, so this skips more often than its
+    /// render twin.
+    #[test]
+    fn the_default_capture_endpoint_is_reachable_when_the_host_has_one() {
+        match WasapiSource::probe() {
+            Ok(name) => assert_eq!(name, "wasapi"),
+            Err(error) => eprintln!("skipping: {error}"),
+        }
+    }
+
+    /// A source that was never started must refuse a read rather than
+    /// dereference a null interface.
+    #[test]
+    fn reading_from_an_unopened_source_is_an_error_not_a_crash() {
+        let mut source = WasapiSource::new();
+        assert!(source.read(&mut [0u8; 64]).is_err());
+        source.stop();
+    }
+
+    /// The leftover buffer only ever hands back whole frames, however awkward
+    /// the caller's room is.
+    #[test]
+    fn the_leftover_buffer_hands_back_whole_frames_only() {
+        let mut source = WasapiSource::new();
+        source.frame_bytes = 4;
+        source.leftover = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let mut out = [0u8; 7];
+        assert_eq!(source.drain_leftover(&mut out), 4);
+        assert_eq!(&out[..4], &[1, 2, 3, 4]);
+        assert_eq!(source.leftover, vec![5, 6, 7, 8]);
+        // Room for less than one frame moves nothing.
+        let mut tiny = [0u8; 3];
+        assert_eq!(source.drain_leftover(&mut tiny), 0);
+        assert_eq!(source.leftover.len(), 4);
     }
 
     /// A sink that was never started must refuse a write rather than

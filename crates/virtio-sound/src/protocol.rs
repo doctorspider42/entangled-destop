@@ -22,9 +22,9 @@ pub const VQ_CONTROL: u16 = 0;
 pub const VQ_EVENT: u16 = 1;
 /// Playback queue (guest → host).
 pub const VQ_TX: u16 = 2;
-/// Capture queue (host → guest). Present because the spec mandates all four
-/// queues; no capture stream is advertised, so a conforming driver never uses
-/// it (phase 2 — see the crate docs).
+/// Capture queue (host → guest). The guest posts *empty* buffers here and the
+/// device fills them — the ownership inversion the RX path is built around
+/// (see [`crate::device`]).
 pub const VQ_RX: u16 = 3;
 /// Number of virtqueues a virtio-snd device exposes. Fixed by the spec.
 pub const NUM_QUEUES: usize = 4;
@@ -166,6 +166,26 @@ pub const CHMAP_MONO: u8 = 2;
 pub const CHMAP_FL: u8 = 3;
 /// `VIRTIO_SND_CHMAP_FR`.
 pub const CHMAP_FR: u8 = 4;
+
+// ------------------------------------------------------- HDA pin defaults
+//
+// `hda_reg_defconf` is an HDA pin default-configuration dword, which is how a
+// virtio-snd jack says what it physically is. Only two fields matter to us:
+// bits 20..23 are the *default device* and bits 30..31 the port connectivity.
+// Everything else (colour, location, association) stays zero, which reads as
+// "unknown", and a driver that shows a name gets one from the device field.
+
+/// Bit position of the HDA "default device" field.
+const HDA_DEFCONF_DEVICE_SHIFT: u32 = 20;
+/// HDA default device `Line Out`.
+const HDA_DEVICE_LINE_OUT: u32 = 0x0;
+/// HDA default device `Mic In`.
+const HDA_DEVICE_MIC_IN: u32 = 0xa;
+
+/// `hda_reg_defconf` for the line-out jack.
+pub const DEFCONF_LINE_OUT: u32 = HDA_DEVICE_LINE_OUT << HDA_DEFCONF_DEVICE_SHIFT;
+/// `hda_reg_defconf` for the microphone jack.
+pub const DEFCONF_MIC_IN: u32 = HDA_DEVICE_MIC_IN << HDA_DEFCONF_DEVICE_SHIFT;
 
 // ------------------------------------------------------- PCM stream features
 
@@ -382,12 +402,23 @@ pub struct ChmapInfo {
 impl ChmapInfo {
     /// A stereo output map (front left, front right).
     pub fn stereo_output() -> Self {
+        Self::stereo(D_OUTPUT)
+    }
+
+    /// A stereo *input* map. Same two positions: a capture stream carries the
+    /// same channels the playback one does, so the guest's mixer lines them up
+    /// without a matrix.
+    pub fn stereo_input() -> Self {
+        Self::stereo(D_INPUT)
+    }
+
+    fn stereo(direction: u8) -> Self {
         let mut positions = [CHMAP_NONE; CHMAP_MAX_SIZE];
         positions[0] = CHMAP_FL;
         positions[1] = CHMAP_FR;
         Self {
             hda_fn_nid: 0,
-            direction: D_OUTPUT,
+            direction,
             channels: 2,
             positions,
         }
@@ -520,12 +551,28 @@ mod tests {
 
     #[test]
     fn the_stereo_chmap_is_front_left_then_front_right() {
-        let raw = ChmapInfo::stereo_output().encode();
-        assert_eq!(raw[4], D_OUTPUT);
-        assert_eq!(raw[5], 2);
-        assert_eq!(raw[6], CHMAP_FL);
-        assert_eq!(raw[7], CHMAP_FR);
-        assert_eq!(&raw[8..], &[0u8; CHMAP_INFO_LEN - 8]);
+        for (map, direction) in [
+            (ChmapInfo::stereo_output(), D_OUTPUT),
+            (ChmapInfo::stereo_input(), D_INPUT),
+        ] {
+            let raw = map.encode();
+            assert_eq!(raw[4], direction);
+            assert_eq!(raw[5], 2);
+            assert_eq!(raw[6], CHMAP_FL);
+            assert_eq!(raw[7], CHMAP_FR);
+            assert_eq!(&raw[8..], &[0u8; CHMAP_INFO_LEN - 8]);
+        }
+    }
+
+    /// The two jack default-configuration dwords must name the two HDA device
+    /// types a desktop shows as "Line Out" and "Microphone"; everything else
+    /// in the field stays zero.
+    #[test]
+    fn the_jack_defconfs_name_a_line_out_and_a_microphone() {
+        assert_eq!(DEFCONF_LINE_OUT, 0);
+        assert_eq!(DEFCONF_MIC_IN, 0x00a0_0000);
+        assert_eq!((DEFCONF_MIC_IN >> 20) & 0xf, 0xa);
+        assert_eq!(DEFCONF_MIC_IN & !(0xf << 20), 0, "no other field is set");
     }
 
     #[test]

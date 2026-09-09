@@ -18,38 +18,36 @@
 //! Nothing here knows about virtio-mmio or virtio-pci: the device sees queues,
 //! features and its config space, so both transports drive it unchanged.
 //!
-//! # What this phase implements, and what it does not
+//! # What this implements, and what it does not
 //!
-//! **Implemented:** all four queues; jack, PCM and channel-map information
+//! **Implemented:** all four queues; two PCM streams, one out and one in, with
+//! their jacks and channel maps; the jack, PCM and channel-map information
 //! messages; the full `SET_PARAMS` / `PREPARE` / `START` / `STOP` / `RELEASE`
-//! lifecycle; and period-based playback on the TX queue, where a message is
-//! returned to the guest only once its audio has actually been consumed by the
-//! host.
+//! lifecycle per stream; period-based playback on the TX queue, where a
+//! message is returned to the guest only once its audio has actually been
+//! consumed by the host; and period-based **capture** on the RX queue, where a
+//! guest buffer is filled and returned only once the audio to fill it exists.
 //!
-//! **Deferred to phase 2, deliberately and completely rather than half-done:**
+//! **Still deliberately absent:**
 //!
-//! * **Capture (RX).** The config space advertises one *output* stream and no
-//!   input stream, and the channel map is an output map, so a conforming
-//!   driver never posts a capture buffer. One that does is answered
-//!   `VIRTIO_SND_S_NOT_SUPP` in band. Adding capture means a second stream in
-//!   the info table, an input chmap, an `AudioSource` half of the sink trait
-//!   and a pump that fills guest buffers — none of which is stubbed here.
 //! * **Controls** (`VIRTIO_SND_F_CTLS`): no mixer elements, so the guest's
 //!   volume slider is its own software mixer. Not offered as a feature.
 //! * **Shared-memory and event-based transfer** (`VIRTIO_SND_PCM_F_SHMEM_*`,
 //!   `F_EVT_*`, `F_MSG_POLLING`): not offered, so the driver stays on the
 //!   plain message path.
-//! * **Formats beyond `S16`** and **rates beyond 44100/48000**: the guest's
-//!   own ALSA converts, and every extra format is more host code on an
-//!   untrusted path. See [`stream::SUPPORTED_FORMATS`].
+//! * **Formats beyond `S16`** and **rates beyond 44100/48000**, in *either*
+//!   direction: the guest's own ALSA converts, and every extra format is more
+//!   host code on an untrusted path. See [`stream::SUPPORTED_FORMATS`].
 //!
 //! # The Linux licence decision
 //!
 //! `libasound` is LGPL and `cargo deny check` blocks copyleft in the host's
-//! dependency graph, so the ALSA sink `dlopen`s the host's library at runtime
-//! and links nothing — the arrangement ADR-0004 already settled on for
-//! virglrenderer. The full reasoning, including why PipeWire's MIT client
-//! library was *not* the answer, is in [`alsa`]'s module docs.
+//! dependency graph, so the ALSA sink and source `dlopen` the host's library
+//! at runtime and link nothing — the arrangement ADR-0004 already settled on
+//! for virglrenderer. The full reasoning, including why PipeWire's MIT client
+//! library was *not* the answer, is in [`alsa`]'s module docs. Capture added
+//! one more symbol to resolve (`snd_pcm_readi`) and changed nothing else about
+//! it.
 
 pub mod backend;
 pub mod device;
@@ -62,17 +60,18 @@ pub mod alsa;
 pub mod wasapi;
 
 pub use backend::{
-    AudioError, AudioSink, NullSink, Pacer, Recording, RecordingSink, StreamFormat,
-    MAX_RECORDING_BYTES,
+    AudioError, AudioSink, AudioSource, NullSink, Pacer, Recording, RecordingSink, SilentSource,
+    SourceLog, StreamFormat, ToneSource, MAX_RECORDING_BYTES,
 };
 pub use device::{
-    SinkFactory, SoundDevice, SoundStats, CHAINS_PER_NOTIFY, MAX_CONTROL_MSG_BYTES,
-    MAX_PENDING_PERIODS, MAX_XFER_BYTES, NUM_QUEUES,
+    SinkFactory, SoundDevice, SoundStats, SourceFactory, CHAINS_PER_NOTIFY,
+    MAX_CAPTURE_HEADER_BYTES, MAX_CONTROL_MSG_BYTES, MAX_PENDING_PERIODS, MAX_XFER_BYTES,
+    NUM_QUEUES,
 };
 pub use stream::{
-    ParamError, PcmParams, StreamState, XferError, CHMAPS, JACKS, MAX_BUFFER_BYTES, MAX_CHANNELS,
-    MAX_PERIODS, MAX_PERIOD_BYTES, MIN_PERIODS, MIN_PERIOD_BYTES, STREAMS, SUPPORTED_FORMATS,
-    SUPPORTED_RATES,
+    ParamError, PcmParams, StreamState, XferError, CHMAPS, INPUT_STREAM, JACKS, MAX_BUFFER_BYTES,
+    MAX_CHANNELS, MAX_PERIODS, MAX_PERIOD_BYTES, MIN_PERIODS, MIN_PERIOD_BYTES, OUTPUT_STREAM,
+    STREAMS, SUPPORTED_FORMATS, SUPPORTED_RATES,
 };
 
 /// Which host sink a VM should use.
@@ -131,6 +130,89 @@ pub fn open_sink(choice: SinkChoice) -> Result<(String, SinkFactory), AudioError
             }
         },
     }
+}
+
+/// Resolves a [`SinkChoice`] into a name and a [`SourceFactory`] — the
+/// capture-side twin of [`open_sink`], driven by the same `[sound] backend`
+/// word because a VM has one audio host, not two.
+///
+/// The fallback is *softer* than the sink's on purpose. A machine with
+/// speakers and no microphone is completely ordinary, and a laptop's
+/// microphone can be muted at the firmware level, so even an explicit backend
+/// degrades to [`SilentSource`] with a warning rather than failing the run.
+/// The guest still gets a working capture device; it records silence.
+pub fn open_source(choice: SinkChoice) -> Result<(String, SourceFactory), AudioError> {
+    let resolved = match choice {
+        SinkChoice::Null => return Ok(silent_factory()),
+        SinkChoice::Alsa => alsa_source_factory(),
+        SinkChoice::Wasapi => wasapi_source_factory(),
+        SinkChoice::Auto => match native_source_factory() {
+            None => return Ok(silent_factory()),
+            Some(resolved) => resolved,
+        },
+    };
+    match resolved {
+        Ok(resolved) => Ok(resolved),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "no host microphone; the guest gets a capture device that records silence"
+            );
+            Ok(silent_factory())
+        }
+    }
+}
+
+fn silent_factory() -> (String, SourceFactory) {
+    (
+        "silent".to_owned(),
+        std::sync::Arc::new(|| Box::new(SilentSource::new()) as Box<dyn AudioSource>),
+    )
+}
+
+/// The native capture backend of *this* host, or `None` if it has none.
+fn native_source_factory() -> Option<Result<(String, SourceFactory), AudioError>> {
+    #[cfg(target_os = "linux")]
+    return Some(alsa_source_factory());
+    #[cfg(windows)]
+    return Some(wasapi_source_factory());
+    #[cfg(not(any(target_os = "linux", windows)))]
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn alsa_source_factory() -> Result<(String, SourceFactory), AudioError> {
+    let name = alsa::AlsaSource::load()?.name().to_owned();
+    let factory: SourceFactory = std::sync::Arc::new(|| match alsa::AlsaSource::load() {
+        Ok(source) => Box::new(source) as Box<dyn AudioSource>,
+        Err(error) => {
+            tracing::warn!(%error, "ALSA disappeared between startup and use");
+            Box::new(SilentSource::new()) as Box<dyn AudioSource>
+        }
+    });
+    Ok((name, factory))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn alsa_source_factory() -> Result<(String, SourceFactory), AudioError> {
+    Err(AudioError::Unavailable(
+        "[sound] backend = \"alsa\" is Linux-only; use \"auto\" or \"null\"".into(),
+    ))
+}
+
+#[cfg(windows)]
+fn wasapi_source_factory() -> Result<(String, SourceFactory), AudioError> {
+    let name = wasapi::WasapiSource::probe()?;
+    let factory: SourceFactory =
+        std::sync::Arc::new(|| Box::new(wasapi::WasapiSource::new()) as Box<dyn AudioSource>);
+    Ok((name, factory))
+}
+
+#[cfg(not(windows))]
+fn wasapi_source_factory() -> Result<(String, SourceFactory), AudioError> {
+    Err(AudioError::Unavailable(
+        "[sound] backend = \"wasapi\" is Windows-only; use \"auto\" or \"null\"".into(),
+    ))
 }
 
 fn null_factory() -> (String, SinkFactory) {
