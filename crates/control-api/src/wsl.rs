@@ -57,6 +57,9 @@ pub const HOME_BIN: &str = ".local/bin";
 /// `$HOME`-relative path of an engine this project installed.
 pub const HOME_ENGINE: &str = ".local/bin/entangled";
 
+/// The key [`PATH_PROBE`] reports that path under.
+const HOME_ENGINE_KEY: &str = "HOME_ENGINE";
+
 /// The program every command here belongs to.
 pub const WSL_PROGRAM: &str = "wsl.exe";
 
@@ -417,14 +420,7 @@ pub fn probe_with(
     }
 
     // 2. Does the engine run, exactly the way a launch would run it?
-    let attempt = run(&[
-        "-d".into(),
-        distro.to_string(),
-        "-e".into(),
-        command.to_string(),
-        "--version".into(),
-    ])
-    .map_err(|e| {
+    let attempt = run(&version_args(distro, command)).map_err(|e| {
         EngineFault::new(
             Fault::NoWsl,
             format!("Windows could not start wsl.exe ({e})"),
@@ -446,12 +442,51 @@ pub fn probe_with(
     // 3. It did not. Find out *why* before writing a sentence about it: a file
     //    that exists at the conventional place but is not on the launch PATH is
     //    a completely different message from one that is not there at all.
-    Err(classify(
-        distro,
-        command,
-        &attempt,
-        resolve(distro, command, run),
-    ))
+    let facts = resolve(distro, command, run);
+
+    // 4. And when it is at that conventional place, finish the job rather than
+    //    reporting it. `~/.local/bin/entangled` is where *this project*
+    //    installs an engine — the manager's button and `entangled wsl
+    //    install-engine` both write exactly there — and it is off the PATH
+    //    `wsl -e` uses only because that launch runs no login shell. An engine
+    //    that answers at its absolute path is an engine: say so, and report
+    //    the absolute path as the command, so the caller stores the spelling
+    //    that works instead of asking a Windows user to type a Linux one.
+    //
+    //    This is what makes the installer's optional WSL task complete on its
+    //    own: nobody is there to paste a path into Settings afterwards.
+    if command == PATH_LOOKUP {
+        if let Some(home) = facts.get(HOME_ENGINE_KEY).cloned() {
+            if let Ok(retry) = run(&version_args(distro, &home)) {
+                if retry.ok() {
+                    return Ok(EngineFound {
+                        distro: distro.to_string(),
+                        command: home.clone(),
+                        path: Some(home),
+                        version: parse_version(&retry.text()),
+                    });
+                }
+                // It is there and it will not run. That is the retry's error to
+                // report, not the bare name's — and it must not become "install
+                // one", because installing the same bytes again changes nothing.
+                return Err(classify(distro, &home, &retry, facts));
+            }
+        }
+    }
+
+    Err(classify(distro, command, &attempt, facts))
+}
+
+/// `wsl -d <distro> -e <command> --version` — the exact spelling a launch uses,
+/// because a probe spelled any other way proves nothing about one.
+fn version_args(distro: &str, command: &str) -> Vec<String> {
+    vec![
+        "-d".to_string(),
+        distro.to_string(),
+        "-e".to_string(),
+        command.to_string(),
+        "--version".to_string(),
+    ]
 }
 
 /// [`probe_with`] against the plain `std::process` runner.
@@ -554,10 +589,11 @@ fn classify(
         );
     }
 
-    // The headline case, and the one with the best fix: the file is there, at
-    // the place this manager installs to, and the launch cannot see it because
-    // `wsl -e` does not read ~/.profile.
-    if let Some(found) = facts.get("HOME_ENGINE") {
+    // The file is there, at the place this project installs to, and the launch
+    // cannot see it because `wsl -e` does not read ~/.profile. `probe_with`
+    // normally resolves this itself by re-running the absolute path; reaching
+    // here means even that could not be started, so the sentence is the fix.
+    if let Some(found) = facts.get(HOME_ENGINE_KEY) {
         if command == PATH_LOOKUP {
             return EngineFault::new(
                 Fault::NoEngine,
@@ -694,6 +730,73 @@ pub fn parse_installed(text: &str) -> Option<Installed> {
 /// spelled `'\''`.
 pub fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+// ---------------------------------------------------------------------------
+// Windows paths as the distribution sees them
+// ---------------------------------------------------------------------------
+
+/// Errors [`to_wsl_path`] reports, each with the fix in the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WslPathError(pub String);
+
+impl std::fmt::Display for WslPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WslPathError {}
+
+/// Translates a Windows path into the path WSL sees.
+///
+/// `D:\vms\ubuntu.toml` → `/mnt/d/vms/ubuntu.toml`. A path that is already
+/// POSIX passes through (a setting may legitimately hold one — the Linux
+/// binary's own path, for instance). Everything else is refused *here* rather
+/// than deep inside `wsl.exe`, where the message would be "The system cannot
+/// find the path specified".
+///
+/// Deliberately pure string work: `Path` semantics differ per host, and this
+/// function must give the same answers when the tests run on Linux. It lives
+/// beside the probe because both the manager's launch path and the engine
+/// install ([`crate::wsl_engine`]) hand WSL a Windows path and must agree
+/// about what it becomes.
+pub fn to_wsl_path(path: &std::path::Path) -> Result<String, WslPathError> {
+    let text = path.to_string_lossy().replace('\\', "/");
+    if text.is_empty() {
+        return Err(WslPathError("the path is empty".to_string()));
+    }
+    // Already a Linux path.
+    if text.starts_with('/') && !text.starts_with("//") {
+        return Ok(text);
+    }
+    // UNC / network share: WSL can mount those, but not by any rule we can
+    // derive, so say so instead of guessing.
+    if text.starts_with("//") {
+        return Err(WslPathError(format!(
+            "{} is a network path (UNC). WSL cannot see it under /mnt automatically — \
+             move the machine's files onto a local drive, or mount the share inside WSL \
+             yourself and point the VM directory at the mount.",
+            path.display()
+        )));
+    }
+    let bytes = text.as_bytes();
+    let drive_letter = (bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'/')
+        .then(|| bytes[0] as char)
+        .filter(char::is_ascii_alphabetic);
+    match drive_letter {
+        Some(letter) => Ok(format!(
+            "/mnt/{}{}",
+            letter.to_ascii_lowercase(),
+            &text[2..]
+        )),
+        None => Err(WslPathError(format!(
+            "{} is not an absolute path with a drive letter, so there is no place for it \
+             under /mnt in WSL. Pick the file again with the browse button — the manager \
+             stores the full path.",
+            path.display()
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -931,11 +1034,15 @@ mod tests {
         );
     }
 
-    /// The subtle one: the engine is installed where the manager puts it, and
-    /// `wsl -e` still cannot see it because it runs no login shell. The fix is
-    /// the absolute path, and the message has to say so.
+    /// The subtle one: the engine is installed where this project puts it, and
+    /// `wsl -e` cannot see it because it runs no login shell. That is not a
+    /// fault — it is an engine at an absolute path — so the probe re-runs it
+    /// there and reports *that* spelling, which is the one a launch can use.
+    ///
+    /// This is what lets the Windows installer's optional WSL task finish the
+    /// job: nobody is there afterwards to paste a Linux path into Settings.
     #[test]
-    fn an_engine_off_the_launch_path_is_diagnosed_precisely() {
+    fn an_engine_off_the_launch_path_is_found_at_its_absolute_path() {
         let fake = Fake::new(vec![
             Ok(Ran {
                 code: Some(0),
@@ -944,15 +1051,76 @@ mod tests {
             }),
             failed(1, "execvpe entangled failed 2\n"),
             ok("HOME_ENGINE=/home/spider/.local/bin/entangled\n"),
+            ok("entangled 0.2.137\n"),
         ]);
-        let fault = probe_with("Ubuntu", None, &|args| fake.run(args)).expect_err("off PATH");
-        assert_eq!(fault.fault, Fault::NoEngine);
-        assert!(fault.what.contains("not on the PATH"), "{}", fault.what);
-        assert!(
-            fault.fix.contains("/home/spider/.local/bin/entangled"),
-            "{}",
-            fault.fix
+        let found = probe_with("Ubuntu", None, &|args| fake.run(args)).expect("found");
+        assert_eq!(found.command, "/home/spider/.local/bin/entangled");
+        assert_eq!(
+            found.path.as_deref(),
+            Some("/home/spider/.local/bin/entangled")
         );
+        assert_eq!(found.version.as_deref(), Some("0.2.137"));
+
+        // The retry has to be spelled like a launch too, or it proves nothing.
+        assert_eq!(
+            fake.seen.borrow()[3],
+            vec![
+                "-d",
+                "Ubuntu",
+                "-e",
+                "/home/spider/.local/bin/entangled",
+                "--version"
+            ]
+        );
+    }
+
+    /// The same file, and it will not run. The message must be about *that*,
+    /// and must not offer to install the very bytes that just refused.
+    #[test]
+    fn an_engine_at_the_conventional_path_that_will_not_run_is_not_reinstalled() {
+        let fake = Fake::new(vec![
+            Ok(Ran {
+                code: Some(0),
+                stdout: utf16("Ubuntu\r\n"),
+                stderr: Vec::new(),
+            }),
+            failed(1, "execvpe entangled failed 2\n"),
+            ok("HOME_ENGINE=/home/spider/.local/bin/entangled\n"),
+            failed(
+                126,
+                "/home/spider/.local/bin/entangled: 1: Exec format error",
+            ),
+        ]);
+        let fault = probe_with("Ubuntu", None, &|args| fake.run(args)).expect_err("broken");
+        assert_eq!(fault.fault, Fault::EngineFailed);
+        assert!(
+            fault.what.contains("/home/spider/.local/bin/entangled"),
+            "{}",
+            fault.what
+        );
+        assert!(!fault.fault.installable());
+    }
+
+    /// Windows paths become `/mnt/<drive>/…`; the two shapes WSL genuinely
+    /// cannot reach are refused with the fix in the sentence. Pure string work,
+    /// so the answers are the same when this runs on Linux.
+    #[test]
+    fn windows_paths_become_the_paths_the_distribution_sees() {
+        use std::path::Path;
+        assert_eq!(
+            to_wsl_path(Path::new(r"D:\vms\ubuntu.toml")).expect("translated"),
+            "/mnt/d/vms/ubuntu.toml"
+        );
+        assert_eq!(
+            to_wsl_path(Path::new("/home/spider/.local/bin/entangled")).expect("already POSIX"),
+            "/home/spider/.local/bin/entangled"
+        );
+        assert!(to_wsl_path(Path::new(r"\\server\share\vm.raw"))
+            .expect_err("UNC")
+            .0
+            .contains("network path"));
+        assert!(to_wsl_path(Path::new("relative/vm.raw")).is_err());
+        assert!(to_wsl_path(Path::new("")).is_err());
     }
 
     #[test]

@@ -226,63 +226,13 @@ impl Reachability {
     }
 }
 
-/// Errors [`to_wsl_path`] reports, each with the fix in the message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WslPathError(pub String);
-
-impl std::fmt::Display for WslPathError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Translates a Windows path into the path WSL sees.
-///
-/// `D:\vms\ubuntu.toml` → `/mnt/d/vms/ubuntu.toml`. A path that is already
-/// POSIX passes through (the settings may legitimately hold one — the Linux
-/// binary's own path, for instance). Everything else is refused *here*, in the
-/// UI, rather than deep inside `wsl.exe` where the message would be "The system
-/// cannot find the path specified".
-///
-/// Deliberately pure string work: `Path` semantics differ per host, and this
-/// function must give the same answers when the tests run on Linux.
-pub fn to_wsl_path(path: &Path) -> Result<String, WslPathError> {
-    let text = path.to_string_lossy().replace('\\', "/");
-    if text.is_empty() {
-        return Err(WslPathError("the path is empty".to_string()));
-    }
-    // Already a Linux path.
-    if text.starts_with('/') && !text.starts_with("//") {
-        return Ok(text);
-    }
-    // UNC / network share: WSL can mount those, but not by any rule we can
-    // derive, so say so instead of guessing.
-    if text.starts_with("//") {
-        return Err(WslPathError(format!(
-            "{} is a network path (UNC). WSL cannot see it under /mnt automatically — \
-             move the machine's files onto a local drive, or mount the share inside WSL \
-             yourself and point the VM directory at the mount.",
-            path.display()
-        )));
-    }
-    let bytes = text.as_bytes();
-    let drive_letter = (bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'/')
-        .then(|| bytes[0] as char)
-        .filter(char::is_ascii_alphabetic);
-    match drive_letter {
-        Some(letter) => Ok(format!(
-            "/mnt/{}{}",
-            letter.to_ascii_lowercase(),
-            &text[2..]
-        )),
-        None => Err(WslPathError(format!(
-            "{} is not an absolute path with a drive letter, so there is no place for it \
-             under /mnt in WSL. Pick the file again with the browse button — the manager \
-             stores the full path.",
-            path.display()
-        ))),
-    }
-}
+/// Translating a Windows path into the one WSL sees now lives beside the WSL
+/// probe in `control-api`, because the engine installer needs exactly the same
+/// answer for the file it hands the distribution. Re-exported under the name
+/// this crate has always used.
+/// (Its error type is `control_api::wsl::WslPathError`; nothing in this crate
+/// names it, so it is not re-exported alongside.)
+pub use control_api::wsl::to_wsl_path;
 
 /// Whether a machine whose files live under `paths` can be started on
 /// `backend`, and what the user should know if it can.

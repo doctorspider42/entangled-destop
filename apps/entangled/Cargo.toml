@@ -16,7 +16,10 @@ clap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-control-api.workspace = true
+# `engine-install`: the shared download-verify-install of the Linux engine
+# for WSL (control-api/src/wsl_engine.rs), which this binary and the other
+# one both perform and neither may reimplement.
+control-api = { workspace = true, features = ["engine-install"] }
 debian-media.workspace = true
 disk-image.workspace = true
 vmm-core.workspace = true

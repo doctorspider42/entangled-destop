@@ -857,6 +857,26 @@ impl ManagerApp {
         self.wsl_install_rx = Some(wslengine::spawn_install(distro, Arc::clone(&self.waker)));
     }
 
+    /// Records the engine path a probe discovered, when there is no setting yet.
+    ///
+    /// The probe resolves `~/.local/bin/entangled` itself when the bare name is
+    /// not on the launch PATH (`wsl -e` runs no login shell), but a *launch*
+    /// uses the setting, not the probe's answer — so without this, an engine
+    /// installed by the Windows installer's optional WSL task would show green
+    /// here and still fail to start a machine. Nothing is overwritten: a path
+    /// the user typed, or one a previous install stored, wins.
+    fn adopt_wsl_engine_path(&mut self, found: &control_api::wsl::EngineFound) {
+        if self.settings.wsl_entangled.is_some() || !found.command.starts_with('/') {
+            return;
+        }
+        tracing::info!(
+            engine = %found.command,
+            "adopting the engine the probe resolved as the Linux engine setting"
+        );
+        self.settings.wsl_entangled = Some(found.command.clone());
+        self.persist_settings_quietly();
+    }
+
     /// Collects both WSL-engine channels; each delivers at most one message.
     fn collect_wsl_events(&mut self) {
         if let Some(rx) = &self.wsl_engine_rx {
@@ -865,6 +885,7 @@ impl ManagerApp {
                 self.wsl_engine = match answer {
                     Ok(found) => {
                         tracing::info!(engine = %found.summary(), "WSL engine found");
+                        self.adopt_wsl_engine_path(&found);
                         wslengine::Status::Ready(found)
                     }
                     Err(fault) => {
@@ -886,17 +907,10 @@ impl ManagerApp {
                         // press Save in a panel they never opened.
                         self.settings.wsl_entangled = Some(outcome.installed.path.clone());
                         self.persist_settings_quietly();
-                        let mut message = outcome.summary();
-                        if outcome.cached {
-                            message.push_str(" (from the verified download already on disk)");
-                        }
-                        if !outcome.rechecked {
-                            message.push_str(
-                                " — the distribution has no sha256sum, so the copy inside it \
-                                 could not be re-checked; the download itself was verified",
-                            );
-                        }
-                        self.toast(ToastLevel::Success, message);
+                        // The same sentence `entangled wsl install-engine`
+                        // prints, from the same place: two surfaces describing
+                        // one install differently is how caveats get lost.
+                        self.toast(ToastLevel::Success, outcome.sentence());
                         self.ensure_wsl_check(true);
                     }
                     Err(e) => self.toast(

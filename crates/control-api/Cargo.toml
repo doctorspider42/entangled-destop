@@ -7,10 +7,23 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# The download-and-install half of the WSL Linux engine (`src/wsl_engine.rs`),
+# shared by `entangled wsl install-engine` and the manager's Settings button.
+# Behind a feature because it is the only thing in this crate that needs an
+# HTTP client, and `disk-image` and `vm-snapshot` — which depend on the config
+# model and nothing else — must not grow a TLS and OpenPGP stack to get it.
+engine-install = ["dep:debian-media", "dep:tracing"]
+
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
 toml.workspace = true
+# Only with `engine-install`: the digest, the HTTP transport and the provenance
+# manifest the whole project already shares. Never a second copy of any of them.
+debian-media = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [lints]
 workspace = true

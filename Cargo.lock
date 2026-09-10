@@ -701,9 +701,11 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 name = "control-api"
 version = "0.2.0"
 dependencies = [
+ "debian-media",
  "serde",
  "thiserror 2.0.20",
  "toml",
+ "tracing",
 ]
 
 [[package]]
