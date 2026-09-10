@@ -55,9 +55,11 @@ Otherwise, on either host, download it:
 entangled fetch firmware        # 4 MiB, checked against a SHA-256 pinned in this build
 ```
 
-While this repository is private that download needs a GitHub token
-(`GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth login`); without one it answers 404
-regardless of whether the release exists, and says so.
+No credentials are needed: the repository is public. If the download answers
+404 anyway, the pinned release genuinely has no such asset — the message names
+the pin file and the workflow that publishes it. A digest mismatch is a
+different failure and says so: the bytes are deleted and nothing unverified is
+kept.
 
 On Linux you can also build it once:
 

@@ -580,14 +580,14 @@ mod tests {
 
     /// A release that has not been published yet answers 404, and a bare
     /// "HTTP status 404" is not an answer: the message must say which of the
-    /// causes it is and what to do instead — including the one that is true of
-    /// this repository today, that it is private.
+    /// causes it is and what to do instead. The repository is public, so the
+    /// headline cause is the missing asset — credentials are the footnote.
     #[test]
     fn a_missing_release_asset_explains_itself() {
         let (kernel, initrd) = (b"k".as_slice(), b"i".as_slice());
         let mut pin = fake_pin(kernel, initrd);
-        // A github.com base URL, because the private-repository sentence is the
-        // one a user hits and it is only true of GitHub.
+        // A github.com base URL, because the credentials footnote is only
+        // true of GitHub and a mirror must never be told to authenticate.
         pin.base_url =
             "https://github.com/doctorspider42/entangled-destop/releases/download".into();
         let dir = temp_dir("missing");

@@ -124,8 +124,8 @@ jobs:
 
       - name: Download the pinned firmware
         id: download
-        # `gh release download` uses the workflow token, so it reaches assets of
-        # this PRIVATE repository — which a plain releases/download URL cannot.
+        # `gh release download` uses the workflow token: no rate limit, and it
+        # keeps working if this repository is ever made private again.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

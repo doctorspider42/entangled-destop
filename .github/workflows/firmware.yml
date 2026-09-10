@@ -24,8 +24,8 @@ name: UEFI firmware
 #   (apps/manager/src/update.rs).
 #
 # WHY THE INSTALLER SHIPS A COPY ANYWAY
-#   This repository is private, so a release asset 404s for anyone without a
-#   token — and even public, a download is a thing that can fail. The firmware
+#   A download is a thing that can fail — no network, a rate limit, a release
+#   that has not been published yet. The firmware
 #   is 4 MiB and BSD-2-Clause-Patent (no source obligation, unlike the GPL
 #   bootstrap kernel next door), so it goes *inside* installer/entangled.iss as
 #   well. This release is what a source checkout fetches, and what
