@@ -1815,22 +1815,52 @@ mod host {
         // where its devices are, through `virtio_mmio.device=` clauses; on pci it
         // enumerates them itself and the command line stays as configured.
         tracing::info!(transport = %cfg.transport, devices = devices.len(), "attaching virtio devices");
-        let (bus, cmdline) = match cfg.transport {
-            VirtioTransport::Mmio => {
-                let virtio = VirtioMmioBus::attach(vm.fd_shared(), Arc::clone(&mem), devices)
+        // The host memory a device's shared-memory regions need (EPIC 20).
+        // Unconditional and free: `back_regions` allocates nothing for a
+        // device that declares no region, which is every device but a
+        // virtio-gpu whose renderer serves host-visible blobs. Scoped, because
+        // the allocator borrows the VM and `take_vcpus` below needs it
+        // mutably — `create_shm_window` takes `&self`, so the borrow can end
+        // here.
+        let (bus, cmdline) = {
+            let allocate = |len: u64, host_mapped: bool| vm.create_shm_window(len, host_mapped);
+            let shm = || {
+                Some(machine_x86::shm::ShmSupport {
+                    mem_bytes: machine.memory_mib << 20,
+                    allocate: &allocate,
+                })
+            };
+            match cfg.transport {
+                VirtioTransport::Mmio => {
+                    let virtio = VirtioMmioBus::attach_with_shm(
+                        vm.fd_shared(),
+                        Arc::clone(&mem),
+                        devices,
+                        machine_x86::notify::QueueNotifyMode::from_env(),
+                        shm(),
+                    )
                     .map_err(|e| e.to_string())?;
-                let cmdline = direct_linux_cmdline(
-                    &cfg.boot.cmdline,
-                    net_cmdline.as_deref(),
-                    &virtio.cmdline_clauses(),
-                );
-                (MachineBus::with_virtio(serial, virtio), cmdline)
-            }
-            VirtioTransport::Pci => {
-                let pci = VirtioPciBus::attach(vm.fd_shared(), Arc::clone(&mem), devices)
+                    let cmdline = direct_linux_cmdline(
+                        &cfg.boot.cmdline,
+                        net_cmdline.as_deref(),
+                        &virtio.cmdline_clauses(),
+                    );
+                    (MachineBus::with_virtio(serial, virtio), cmdline)
+                }
+                VirtioTransport::Pci => {
+                    let pci = VirtioPciBus::attach_with_shm(
+                        vm.fd_shared(),
+                        Arc::clone(&mem),
+                        devices,
+                        machine_x86::notify::QueueNotifyMode::from_env(),
+                        machine_x86::virtio_pci::PciInterruptMode::from_env(),
+                        shm(),
+                    )
                     .map_err(|e| e.to_string())?;
-                let cmdline = direct_linux_cmdline(&cfg.boot.cmdline, net_cmdline.as_deref(), "");
-                (MachineBus::with_virtio_pci(serial, pci), cmdline)
+                    let cmdline =
+                        direct_linux_cmdline(&cfg.boot.cmdline, net_cmdline.as_deref(), "");
+                    (MachineBus::with_virtio_pci(serial, pci), cmdline)
+                }
             }
         };
         // A UEFI firmware probes the ACPI PM timer and the RTC before it does
@@ -2086,27 +2116,50 @@ mod host {
 
         let mem = Arc::new(vm.memory().clone());
         tracing::info!(transport = %cfg.transport, devices = devices.len(), "attaching virtio devices");
-        let (bus, cmdline) = match cfg.transport {
-            VirtioTransport::Mmio => {
-                let virtio = VirtioMmioBus::attach_userspace(Arc::clone(&mem), devices, &irqchip)
+        // The host memory a device's shared-memory regions need (EPIC 20).
+        // Unconditional and free: `back_regions` allocates nothing for a
+        // device that declares no region, which is every device but a
+        // virtio-gpu whose renderer serves host-visible blobs. Scoped, because
+        // the allocator borrows the VM and `take_vcpus` below needs it
+        // mutably — `create_shm_window` takes `&self`, so the borrow can end
+        // here.
+        let (bus, cmdline) = {
+            let allocate = |len: u64, host_mapped: bool| vm.create_shm_window(len, host_mapped);
+            let shm = || {
+                Some(machine_x86::shm::ShmSupport {
+                    mem_bytes: machine.memory_mib << 20,
+                    allocate: &allocate,
+                })
+            };
+            match cfg.transport {
+                VirtioTransport::Mmio => {
+                    let virtio = VirtioMmioBus::attach_userspace_with_shm(
+                        Arc::clone(&mem),
+                        devices,
+                        &irqchip,
+                        shm(),
+                    )
                     .map_err(|e| e.to_string())?;
-                let cmdline = direct_linux_cmdline(
-                    &cfg.boot.cmdline,
-                    net_cmdline.as_deref(),
-                    &virtio.cmdline_clauses(),
-                );
-                (MachineBus::with_virtio(serial, virtio), cmdline)
-            }
-            VirtioTransport::Pci => {
-                let pci = VirtioPciBus::attach_userspace(
-                    Arc::clone(&mem),
-                    devices,
-                    &irqchip,
-                    PciInterruptMode::from_env(),
-                )
-                .map_err(|e| e.to_string())?;
-                let cmdline = direct_linux_cmdline(&cfg.boot.cmdline, net_cmdline.as_deref(), "");
-                (MachineBus::with_virtio_pci(serial, pci), cmdline)
+                    let cmdline = direct_linux_cmdline(
+                        &cfg.boot.cmdline,
+                        net_cmdline.as_deref(),
+                        &virtio.cmdline_clauses(),
+                    );
+                    (MachineBus::with_virtio(serial, virtio), cmdline)
+                }
+                VirtioTransport::Pci => {
+                    let pci = VirtioPciBus::attach_userspace_with_shm(
+                        Arc::clone(&mem),
+                        devices,
+                        &irqchip,
+                        PciInterruptMode::from_env(),
+                        shm(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let cmdline =
+                        direct_linux_cmdline(&cfg.boot.cmdline, net_cmdline.as_deref(), "");
+                    (MachineBus::with_virtio_pci(serial, pci), cmdline)
+                }
             }
         };
         let bus = match cfg.boot.mode {
