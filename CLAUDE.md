@@ -83,7 +83,7 @@ kernel and initramfs artifacts, and self-skips without them.
 | `crates/display` | winit window, wgpu renderer, host input capture | EPIC 7 |
 | `crates/debian-media` | Debian download, PGP+SHA-512 verification, cache, manifests | EPIC 6 |
 | `crates/disk-image` | Portable disk-image logic: MBR/GPT/ext4 inspection, create/resize, sparse-preserving relocate, profile-reference guard, `.nvram` sidecar convention | — |
-| `crates/control-api` | VM config model (TOML), lifecycle API for CLI/GUI | EPIC 12 |
+| `crates/control-api` | VM config model (TOML), lifecycle API for CLI/GUI, and the WSL engine both binaries share: the probe and its sentences, plus the pinned download/verify/install behind the `engine-install` feature | EPIC 12 |
 | `apps/entangled` | `entangled` binary: fetch/disk/install/run/doctor | EPIC 10/12 |
 | `apps/manager` | `entangled-manager`: native egui GUI, drives the CLI as child processes | EPIC 16 |
 

@@ -465,6 +465,64 @@ mod tests {
         }
     }
 
+    /// …and the installer's copy of that table must agree with it.
+    ///
+    /// `installer/entangled.iss` cannot be compiled against this enum: it is a
+    /// Pascal Script that only ever sees an exit code. So the two tables are
+    /// written twice and checked here, because the failure mode of a silent
+    /// disagreement is an installer confidently telling a user the opposite of
+    /// what happened.
+    #[test]
+    fn the_installer_reads_the_same_table() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../installer/entangled.iss");
+        let Ok(script) = std::fs::read_to_string(&path) else {
+            // A crates.io-style source package has no installer directory; the
+            // check is for this repository, not for the world.
+            eprintln!("skipped: no {}", path.display());
+            return;
+        };
+        let expected = [
+            ("WslOk", Status::Installed),
+            ("WslFailed", Status::Failed),
+            ("WslNoWsl", Status::NoWsl),
+            ("WslNoDistro", Status::NoDistro),
+            ("WslUnusable", Status::EngineUnusable),
+            ("WslNoDownload", Status::DownloadFailed),
+            ("WslBadDigest", Status::DigestMismatch),
+            ("WslNoPin", Status::NoPinnedDigest),
+            ("WslTimedOut", Status::TimedOut),
+            ("WslNotWindows", Status::NotWindows),
+        ];
+        for (name, status) in expected {
+            let line = script
+                .lines()
+                .map(str::trim)
+                .find(|line| {
+                    line.starts_with(name)
+                        && line[name.len()..].starts_with(|c: char| c.is_whitespace() || c == '=')
+                })
+                .unwrap_or_else(|| panic!("{} declares no {name}", path.display()));
+            let value: u8 = line
+                .split('=')
+                .nth(1)
+                .and_then(|rest| rest.trim().trim_end_matches(';').parse().ok())
+                .unwrap_or_else(|| panic!("cannot read a number out of {line:?}"));
+            assert_eq!(
+                value,
+                status.code(),
+                "installer/entangled.iss says {name} = {value}, this program exits \
+                 {} for it",
+                status.code()
+            );
+        }
+        // And the command line the installer runs has to exist.
+        assert!(
+            script.contains("wsl install-engine --quiet --timeout "),
+            "the installer no longer runs the command this table describes"
+        );
+    }
+
     /// Every shared install failure must reach a code of its own — a fallback
     /// that swallowed one into "something went wrong" would take the fix out
     /// of the installer's sentence.

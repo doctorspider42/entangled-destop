@@ -37,12 +37,14 @@ jobs:
   # manager's "WSL (KVM)" backend runs the *Linux* `entangled` inside WSL, and
   # a Windows install has no Linux half — so the very first machine a user
   # created on that backend died with `execvpe entangled failed 2`. The manager
-  # now downloads this asset and installs it into the distribution.
+  # now downloads this asset and installs it into the distribution — from its
+  # Settings panel, and from the Windows installer's optional task, which runs
+  # `entangled wsl install-engine`.
   #
   # The digest is the point of the job order: this binary is hashed HERE, and
-  # the hash is compiled into the manager built in the next job. The manager can
-  # therefore verify a download against a digest nobody typed and nothing
-  # fetched (apps/manager/src/wslengine.rs documents the whole anchor).
+  # the hash is compiled into BOTH Windows binaries built in the next job. They
+  # can therefore verify a download against a digest nobody typed and nothing
+  # fetched (crates/control-api/src/wsl_engine.rs documents the whole anchor).
   #
   # ubuntu-22.04 on purpose: the glibc a release binary is linked against is the
   # oldest distribution it can run on, and WSL installs are frequently older
@@ -229,9 +231,15 @@ jobs:
           # build.rs stamps this into both binaries: --version output, the
           # manager's window title and its update check all report it.
           ENTANGLED_VERSION: ${{ steps.version.outputs.version }}
-          # …and this into the manager only: the SHA-256 of the Linux engine
-          # published by this same run, which is the manager's whole trust
-          # anchor for downloading one into WSL (apps/manager/src/wslengine.rs).
+          # …and this into BOTH: the SHA-256 of the Linux engine published by
+          # this same run, which is the whole trust anchor for downloading one
+          # into WSL. The manager uses it for its Settings button
+          # (apps/manager/src/wslengine.rs) and the CLI for `entangled wsl
+          # install-engine` (apps/entangled/src/wsl_engine.rs), which is what
+          # the installer's optional WSL task runs. Both go through
+          # control_api::wsl_engine, so one digest, one code path, two
+          # surfaces. A build without this variable refuses to download at all
+          # rather than fetching something it cannot check.
           ENTANGLED_LINUX_ENGINE_SHA256: ${{ needs.linux-engine.outputs.sha256 }}
         run: cargo build --release -p entangled -p entangled-manager
 
