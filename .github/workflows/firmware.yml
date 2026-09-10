@@ -44,8 +44,12 @@ on:
     # Deliberately NOT pinned.toml: committing the pin this job prints must not
     # start another build of the thing it just pinned.
     paths:
+      # Only what changes the *image*. Editing this workflow's own text used to
+      # rebuild and publish a fresh firmware release — build 3 exists because a
+      # message in it was corrected — which leaves the pin naming an older tag
+      # for no reason. Run it by hand (workflow_dispatch) after a workflow edit
+      # that should produce a new image.
       - guest/firmware/build-cloudhv.sh
-      - .github/workflows/firmware.yml
 
 permissions:
   contents: write

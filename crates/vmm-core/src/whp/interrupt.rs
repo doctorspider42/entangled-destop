@@ -268,6 +268,19 @@ mod tests {
         let seen = gate.epoch();
         let start = std::time::Instant::now();
         assert_eq!(gate.wait_since(seen, Duration::from_millis(30)), seen);
-        assert!(start.elapsed() >= Duration::from_millis(20));
+        // Two properties matter here and neither is the exact duration: the
+        // wait ended by itself (the epoch did not move, asserted above) and it
+        // ended at all. A tight lower bound would test the host's timer, not
+        // us — a Windows condvar may return a few milliseconds early, and the
+        // default timer granularity there is ~15.6 ms, which is what turned
+        // this into a CI flake. Keep only the bound that would catch a real
+        // defect: a timeout ignored entirely would return instantly, and a
+        // wedged one would never return.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(10),
+            "returned too fast to have waited: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "wedged: {elapsed:?}");
     }
 }
