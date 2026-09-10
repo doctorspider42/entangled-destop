@@ -1008,31 +1008,35 @@ Exactly one thing now, and it is the same one as before: **a renderer**. The
 window it was missing exists, is mapped, is bounded and is provable from inside
 a guest. Nothing on either host decodes a Vulkan command stream.
 
+*(Superseded on 2026-09-10 by the phase-3 amendment below: a Linux host with a
+self-built virglrenderer 1.1 does decode one now. Left as written, because the
+sentence dates the moment and the phase-3 section is where the answer is.)*
+
 ### Next agent starts here
 
-1. **A real Venus renderer (VEN-2003).** Build virglrenderer ≥ 1.0 with
-   `-Dvenus=true` on a host where `apt` is available, then fill in
-   `VirglRenderer::map_blob` with `virgl_renderer_resource_map` and
-   `Renderer3d::set_host_visible` with the window it should map into, and add
-   `VIRGL_RENDERER_VENUS` (very likely with `USE_EXTERNAL_BLOB`) to the init
-   flags. The typed-context and create-blob FFI halves are already written and
-   behind the runtime probe; the window is now waiting for them.
-2. **Per-blob host mappings.** This phase maps the *whole* window as one
-   hypervisor slot and lets the device write into it. A real Venus renderer
-   wants the opposite: `virgl_renderer_resource_map` hands back a host pointer
-   per blob, and the VMM maps *that* at the guest-named offset — one slot per
-   live mapping, torn down on unmap. `GpaMapper` takes a `&HostShmRegion` today
-   and would grow a sub-range form; `HostVisibleWindow` already tracks exactly
-   the spans that would need one. Nothing above the seam changes.
-3. **Guest acceptance (VEN-2006)** is meaningful after 1, and only on a host
-   with a real Vulkan device. `vulkaninfo` inside the guest is the first
-   milestone, `vkcube` the second.
+1. ~~**A real Venus renderer (VEN-2003).**~~ Done, 2026-09-10 — see the
+   phase-3 amendment below. Two of the guesses in this item were wrong and are
+   worth leaving visible: `USE_EXTERNAL_BLOB` turned out to be exactly the flag
+   *not* to set, and `apt` was never the obstacle (the build needed newer
+   Vulkan headers than the distribution has, which is a pin rather than a
+   package).
+2. ~~**Per-blob host mappings.**~~ Done, 2026-09-10. The shape predicted here
+   is the shape it took, with one correction: it is a **mode**, not an
+   addition. The whole-window mapping and a renderer range inside it overlap,
+   and no hypervisor allows that, so a window is one or the other. "Nothing
+   above the seam changes" was also not quite right — the renderer declares the
+   mode and the device carries it, because only the renderer knows.
+3. ~~**Guest acceptance (VEN-2006).**~~ Done, 2026-09-10:
+   `tests/boot/tests/venus_vulkan.rs`. `vulkaninfo` was not needed — a
+   python-ctypes probe needs nothing on the ISO but `libvulkan.so.1`. `vkcube`
+   is still open, and still meaningless for speed on a host whose only ICD is
+   lavapipe.
 4. **Zero-copy scanout (VEN-2005/GPU phase 3)** is still where the frame rate
    is: GAME-2105 measured the readback at 13 ms of a 20 ms frame. Unrelated to
    this window, and unblocked by nothing in it.
 5. The GUI's capability gate (`Backend::virgl_block`) still knows nothing about
-   any of this, and still should not until step 1 lands — blob resources are
-   offered only when a renderer declares them, and none does on this host.
+   any of this. Step 1 has now landed, so it has something to say — see the
+   phase-3 list.
 6. **One restore direction is still unguarded**, and closing it needs a format
    field rather than a check. `TransportSaveState::shm_bases` records the bases
    a window *was placed at*, so the dangerous direction is refused: a snapshot
