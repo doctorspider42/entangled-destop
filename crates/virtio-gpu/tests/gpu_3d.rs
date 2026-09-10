@@ -642,12 +642,26 @@ fn a_2d_created_resource_attaches_to_a_3d_context() {
     assert_ok(&h.run(&ctx_attach(1, 2)));
     assert_ok(&h.run(&ctx_attach(1, 2)));
 
-    // Validation is unchanged: the context still has to exist, the id still
-    // has to name something live, and id 0 is still never valid.
+    // Validation is unchanged for an **attach**: the context still has to
+    // exist, the id still has to name something live, and id 0 is still never
+    // valid.
     assert_err(&h.run(&ctx_attach(9, 2)), resp::ERR_INVALID_CONTEXT_ID);
-    assert_err(&h.run(&ctx_detach(9, 2)), resp::ERR_INVALID_CONTEXT_ID);
     assert_err(&h.run(&ctx_attach(1, 0)), resp::ERR_INVALID_RESOURCE_ID);
     assert_err(&h.run(&ctx_attach(1, 77)), resp::ERR_INVALID_RESOURCE_ID);
+    // A **detach** from a context that is not there is nothing to do, so it
+    // answers OK (VEN-2003). Ubuntu 26.04's DRM client destroys its context
+    // and *then* closes the objects that were attached to it, in that order,
+    // and a device that refuses logs an error on every boot for an operation
+    // it would have done nothing about. QEMU and crosvm accept it too. Both
+    // shapes the guest can send: a context that never existed, and one that
+    // has been destroyed.
+    assert_ok(&h.run(&ctx_detach(9, 2)));
+    assert_ok(&h.run(&ctx_create(4, "short-lived")));
+    assert_ok(&h.run(&ctx_attach(4, 2)));
+    assert_ok(&h.run(&ctx_destroy(4)));
+    assert_ok(&h.run(&ctx_detach(4, 2)));
+    // …and the resource id is still checked, so a detach is not a hole.
+    assert_err(&h.run(&ctx_detach(9, 0)), resp::ERR_INVALID_RESOURCE_ID);
 
     // And the id stops being attachable the moment the guest unrefs it.
     assert_ok(&h.run(&resource_unref(2)));

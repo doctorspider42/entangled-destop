@@ -1908,6 +1908,22 @@ impl<S: ScanoutSink> GpuDevice<S> {
         let owned_2d =
             self.resources.get(cmd.resource_id).is_some() || self.blobs.owns(cmd.resource_id);
         let gpu = self.three_d_mut(kind)?;
+        // A **detach** from a context that no longer exists is nothing, so it
+        // answers OK. Observed on every Venus boot of Ubuntu 26.04 (VEN-2003):
+        // the guest's DRM client destroys its context and then closes the GEM
+        // objects that were attached to it, in that order, and a device that
+        // refuses logs `*ERROR* response 0x1204 (command 0x203)` for something
+        // it was going to do nothing about either way. QEMU and crosvm accept
+        // it for the same reason. An **attach** still requires a live context:
+        // there the guest is asking for state to exist afterwards.
+        if !attach && !gpu.has_context(ctx_id) {
+            tracing::debug!(
+                ctx = ctx_id,
+                resource = cmd.resource_id,
+                "virtio-gpu ctx detach names a context that is already gone: nothing to do"
+            );
+            return Ok(Reply::ok());
+        }
         if owned_2d {
             if !gpu.has_context(ctx_id) {
                 return Err(CommandError::UnknownContext(ctx_id));
