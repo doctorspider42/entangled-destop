@@ -153,6 +153,21 @@ fn wsl_engine() {
         Err(fault) => {
             println!("                    wsl      MISSING — {}", fault.what);
             println!("                             {}", fault.fix);
+            // The shared sentence is venue-neutral (the manager prints it too),
+            // so the one fix that only exists *here* is named here: in a
+            // terminal there is a command for this, and it is the same code the
+            // manager's button and the installer's optional task run.
+            if fault.fault.installable() {
+                println!(
+                    "                             or, from this terminal: `entangled wsl \
+                     install-engine{}`",
+                    if distro == control_api::wsl::DEFAULT_DISTRO {
+                        String::new()
+                    } else {
+                        format!(" --distro {distro}")
+                    }
+                );
+            }
         }
     }
 }

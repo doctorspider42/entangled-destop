@@ -233,7 +233,7 @@ On Windows the manager offers two hypervisors: **Windows (WHP)**, running
   `.short`, and the same check runs again at submit time in case the setting
   changed underneath the form.
 
-### The engine inside WSL (`wslengine.rs` + `control_api::wsl`)
+### The engine inside WSL (`wslengine.rs` + `control_api::wsl{,_engine}`)
 
 The WSL backend has a hole nothing else in the product has: **a Windows install
 ships no Linux binary**, so `wsl.exe -d Ubuntu -e entangled …` on a fresh
@@ -259,7 +259,13 @@ must stay closed:
    shut down between the check and the launch.
 3. **Offer the engine, do not ask for a path.** `wslengine::spawn_install`
    downloads the pinned Linux build, verifies it, copies it into the
-   distribution and re-runs the check.
+   distribution and re-runs the check. The download, the digest check and the
+   copy are **not in this crate**: they are `control_api::wsl_engine`
+   (`engine-install` feature), because `entangled wsl install-engine` performs
+   the identical install for the Windows installer's optional task, and a
+   second copy of a security check is a security bug waiting for a release.
+   This module supplies the one thing only this binary knows — its own
+   `ENTANGLED_LINUX_ENGINE_SHA256`, version and cache — as a `wsl_engine::Pin`.
 
 `ManagerApp::wsl_engine` holds the answer, `ensure_wsl_check` starts a probe
 whenever the distribution or the engine path changes (never on the frame loop —
@@ -277,8 +283,12 @@ Two details that look like polish and are not:
   second. So the install reports the **absolute** path it wrote and the manager
   saves *that* as `wsl_entangled`; a check that only asked `command -v` under
   `sh -lc` would pass and the launch would still fail. `PATH_PROBE` asks with
-  `sh -c` for exactly this reason, and the "engine is at ~/.local/bin but not on
-  the launch PATH" case has its own message.
+  `sh -c` for exactly this reason. When the bare name misses and
+  `~/.local/bin/entangled` is there, `probe_with` re-runs *that* path and
+  reports it as the engine, and `ManagerApp::adopt_wsl_engine_path` stores it
+  when the setting is empty — otherwise an engine installed by the Windows
+  installer (nobody is there afterwards to paste a Linux path into Settings)
+  would read green and still not start a machine.
 - **A loader complaint says "not found" and means the opposite.**
   `libc.so.6: version 'GLIBC_2.38' not found` is a *present* engine on a
   distribution older than the build; classifying it as missing would have the
@@ -299,6 +309,15 @@ pipeline did not make carries no digest, and then `install_block()` greys the
 button out and says so rather than downloading something it cannot check —
 which is what every developer build here does, so that is the state you will see
 locally.
+
+`apps/entangled/build.rs` stamps the same variable into the CLI, so
+`entangled wsl install-engine` has the same anchor and the same refusal. The
+Windows installer's optional task runs that command (see
+`installer/entangled.iss`) through `ExecAsOriginalUser`, because WSL
+distributions are per-Windows-user and an elevated step would otherwise ask the
+wrong account's WSL. Its exit codes are the installer's interface and are
+pinned by a test in `apps/entangled/src/wsl_engine.rs`; nothing it can do fails
+the installation.
 
 ## Theme tokens (GUI-1606)
 

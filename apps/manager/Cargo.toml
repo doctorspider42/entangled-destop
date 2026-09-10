@@ -42,7 +42,10 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 png.workspace = true
-control-api.workspace = true
+# `engine-install`: the shared download-verify-install of the Linux engine
+# for WSL (control-api/src/wsl_engine.rs), which this binary and the other
+# one both perform and neither may reimplement.
+control-api = { workspace = true, features = ["engine-install"] }
 disk-image.workspace = true
 # Only for `debian_media::cache_root`: the one answer the CLI, the fetch scripts
 # and this GUI must all give to "where is the media cache". Copying those four

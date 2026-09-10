@@ -1,132 +1,65 @@
 //! The Linux engine inside WSL: checking it before a run, and offering to
 //! install it when it is not there.
 //!
-//! The classification lives in [`control_api::wsl`] (shared with `entangled
-//! doctor`); this module is the manager's half of it — the worker threads, the
-//! download, and the state the UI renders.
+//! Almost nothing happens here any more, and that is the point. The
+//! classification lives in [`control_api::wsl`] and the download, the digest
+//! check and the copy into the distribution live in
+//! [`control_api::wsl_engine`] — both shared with `entangled`, which offers
+//! the same install as `entangled wsl install-engine` and is what the Windows
+//! installer's optional task runs. This module is the manager's half: the
+//! worker threads, the state the UI renders, and the one fact only this binary
+//! knows — the digest the release pipeline stamped into *it*.
 //!
 //! # What the download trusts
 //!
-//! One asset, `entangled-linux-x86_64`, published by the **same release run**
-//! that built this manager, and verified against a SHA-256 that the release
-//! pipeline stamped into this binary at compile time
-//! (`ENTANGLED_LINUX_ENGINE_SHA256`, forwarded by `build.rs`). Bytes that do not
-//! hash to it are deleted, not used, and are never handed to WSL.
-//!
-//! That is a slightly different anchor from the guest kernel's
-//! (`guest/bootstrap-kernel/pinned.toml`, a digest committed to the source
-//! tree), and deliberately so:
-//!
-//! * the kernel is built once and pinned by a human in a later commit, because
-//!   many releases share one kernel. The Linux engine is *this* release's own
-//!   build — pinning it in the tree would mean shipping an installer whose
-//!   engine is a version behind, forever;
-//! * so the pipeline hashes the Linux binary **before** it builds the Windows
-//!   half, and the digest is compiled into the manager that will download it.
-//!   Nobody types it, nobody can point it at a different build, and the
-//!   `windows-installer` job that publishes the installer is the job that
-//!   publishes the binary the digest describes;
-//! * it is still **not a signature**. There is no key and nothing to revoke:
-//!   whoever can change the workflow can change what gets hashed. TLS to
-//!   github.com is the transport. In short — as strong as the git history of
-//!   this repository plus the integrity of one CI run, and no stronger, which
-//!   is the same honest ceiling `bootstrap.rs` documents for the kernel.
-//!
-//! A build made outside the pipeline (every developer build) carries no digest
-//! at all, and then the install button says so instead of downloading something
-//! it cannot check. Refusing is the whole point: an unverified engine copied
-//! into a distribution would be the one thing in the product with no anchor.
-//!
-//! # Licence
-//!
-//! The asset is our own binary, Apache-2.0, built from this repository — the
-//! question `cargo deny` answers for the crate graph is the same question here
-//! and has the same answer. Nothing GPL is downloaded, shipped or linked.
+//! `ENTANGLED_LINUX_ENGINE_SHA256`, forwarded by `build.rs` from the release
+//! workflow, which hashed the Linux binary before it built this one. The whole
+//! anchor — what it is worth, and why it is not a signature — is written out
+//! in [`control_api::wsl_engine`]. A build the pipeline did not make (every
+//! developer build) carries no digest, and then [`install_block`] says so and
+//! the button is greyed rather than downloading something it cannot check.
 
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc;
 
-use control_api::wsl::{self, EngineFault, EngineFound, Fault, Installed};
-use debian_media::{DigestAlgo, Manifest, Transport, UreqTransport};
+use control_api::wsl::{self, EngineFault, EngineFound, Fault};
+use control_api::wsl_engine::{self, Pin};
+use debian_media::UreqTransport;
 
-use crate::process::Waker;
+pub use control_api::wsl_engine::Outcome;
 
-/// The release asset holding the Linux build of `entangled`.
-pub const ASSET: &str = "entangled-linux-x86_64";
-
-/// SHA-256 of that asset for *this* build, stamped in by the release pipeline.
-/// Empty in any build the pipeline did not make.
+/// SHA-256 of the Linux engine for *this* build, stamped in by the release
+/// pipeline. Empty in any build the pipeline did not make.
 const PINNED_SHA256: &str = env!("ENTANGLED_LINUX_ENGINE_SHA256");
-
-/// Relocate the download (a mirror, or a directory served over HTTP in a test)
-/// without weakening it: the compiled-in digest is enforced against whatever it
-/// serves.
-const URL_ENV: &str = "ENTANGLED_LINUX_ENGINE_URL";
-
-/// The engine is ~20 MiB. A server that streams forever is a bug or an attack,
-/// and either way it must not fill the disk.
-const MAX_ASSET_LEN: u64 = 256 * 1024 * 1024;
-
-/// Where the verified download is kept: `<cache>/engine/<version>/<asset>`, per
-/// version, because two builds of the same version do not exist but two
-/// versions certainly do.
-fn cache_path() -> Result<PathBuf, String> {
-    let root = crate::launcher::cache_root()
-        .ok_or_else(|| "no cache directory (set ENTANGLED_CACHE or HOME)".to_string())?;
-    Ok(root
-        .join("engine")
-        .join(sanitize(crate::VERSION))
-        .join(ASSET))
-}
-
-fn sanitize(component: &str) -> String {
-    component
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .replace("..", "__")
-}
 
 /// The pinned digest, or `None` in a build the release pipeline did not make.
 pub fn pinned_sha256() -> Option<&'static str> {
-    let pin = PINNED_SHA256.trim();
-    (pin.len() == DigestAlgo::Sha256.hex_len() && pin.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then_some(pin)
+    wsl_engine::valid_pin(PINNED_SHA256)
 }
 
-/// Where the asset is downloaded from.
-pub fn asset_url() -> String {
-    if let Ok(url) = std::env::var(URL_ENV) {
-        if !url.trim().is_empty() {
-            return url.trim().to_string();
-        }
+/// Where this binary keeps verified downloads. `None` when the host has no
+/// cache directory at all, which is the one state that has to be reported
+/// before anything is attempted.
+fn cache_root() -> Option<PathBuf> {
+    crate::launcher::cache_root()
+}
+
+/// The three facts the shared installer needs from this binary: which release
+/// it belongs to, the digest it was published with, and where it caches.
+fn pin(cache_root: &std::path::Path) -> Pin<'_> {
+    Pin {
+        version: crate::VERSION,
+        sha256: pinned_sha256(),
+        cache_root,
     }
-    format!(
-        "https://github.com/{}/releases/download/v{}/{ASSET}",
-        crate::update::REPO,
-        crate::VERSION
-    )
 }
 
 /// Why this build cannot offer the download, in the words the button's tooltip
 /// uses. `None` when it can.
 pub fn install_block() -> Option<String> {
-    pinned_sha256().is_none().then(|| {
-        format!(
-            "This build of the manager was not made by the release pipeline, so it carries no \
-             verified digest for the Linux engine (version {}). Build the Linux engine \
-             yourself and put its path in Settings ▸ Linux engine — the manager will not \
-             download a binary it cannot check.",
-            crate::VERSION
-        )
-    })
+    // The cache root is not part of the *pin* question, so a throwaway path is
+    // enough here: `install_block` only ever reads the digest.
+    wsl_engine::install_block(&pin(std::path::Path::new(".")))
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +153,7 @@ fn run_quiet(args: &[String]) -> std::io::Result<wsl::Ran> {
 /// it never happens on the frame loop.
 pub fn spawn_probe(
     target: Target,
-    waker: Waker,
+    waker: crate::process::Waker,
 ) -> mpsc::Receiver<Result<EngineFound, EngineFault>> {
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -241,46 +174,17 @@ pub fn spawn_probe(
 // Installing
 // ---------------------------------------------------------------------------
 
-/// What a successful install produced, for the toast and for the setting the
-/// manager then writes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Outcome {
-    pub installed: Installed,
-    /// The asset was already in the verified cache; no network was used.
-    pub cached: bool,
-    /// The distribution recomputed the digest of the copy it now holds and it
-    /// matched. `false` only means the distribution had no `sha256sum` — the
-    /// bytes were still verified on this side before they were handed over.
-    pub rechecked: bool,
-}
-
-impl Outcome {
-    pub fn summary(&self) -> String {
-        let version = self
-            .installed
-            .version
-            .as_deref()
-            .unwrap_or("version unknown");
-        let path = if self.installed.on_path {
-            ", and on the distribution's PATH"
-        } else {
-            ""
-        };
-        format!(
-            "Linux engine {version} installed at {}{path}",
-            self.installed.path
-        )
-    }
-}
-
 /// Downloads the pinned Linux engine (or reuses the verified cache copy) and
 /// installs it into `distro`, on a worker thread.
-pub fn spawn_install(distro: String, waker: Waker) -> mpsc::Receiver<Result<Outcome, String>> {
+pub fn spawn_install(
+    distro: String,
+    waker: crate::process::Waker,
+) -> mpsc::Receiver<Result<Outcome, String>> {
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("wsl-engine-install".to_string())
         .spawn(move || {
-            let result = install_blocking(&UreqTransport::new(), &distro, &run_quiet);
+            let result = install_blocking(&distro);
             if tx.send(result).is_ok() {
                 waker();
             }
@@ -291,199 +195,12 @@ pub fn spawn_install(distro: String, waker: Waker) -> mpsc::Receiver<Result<Outc
     rx
 }
 
-/// The whole install, against an injectable transport and runner so the accept
-/// and refuse paths are testable with no network and no WSL.
-pub fn install_blocking(
-    transport: &dyn Transport,
-    distro: &str,
-    run: wsl::Runner<'_>,
-) -> Result<Outcome, String> {
-    if let Some(block) = install_block() {
-        return Err(block);
-    }
-    let expected = pinned_sha256()
-        .ok_or("no pinned digest")?
-        .to_ascii_lowercase();
-    let path = cache_path()?;
-    let cached = fetch_verified(transport, &path, &expected)?;
-
-    // The distribution has to reach the file, and a cache under a UNC path (a
-    // roaming profile on a share) is the one place it cannot. Say that here
-    // rather than letting `cp` fail inside a shell script.
-    let source = crate::backend::to_wsl_path(&path).map_err(|e| {
-        format!(
-            "the verified download is at {}, which WSL cannot see: {e}",
-            path.display()
-        )
-    })?;
-
-    let out = run(&wsl::install_args(distro, &source))
-        .map_err(|e| format!("cannot start {}: {e}", wsl::WSL_PROGRAM))?;
-    let text = out.text();
-    if !out.ok() {
-        return Err(format!(
-            "installing the engine into {distro} failed: {}",
-            wsl::translate(&text).unwrap_or_else(|| first_line(&text))
-        ));
-    }
-    let installed = wsl::parse_installed(&text).ok_or_else(|| {
-        format!(
-            "{distro} accepted the copy but did not report where it went: {}",
-            first_line(&text)
-        )
-    })?;
-
-    // The last link of the chain: the bytes inside the distribution are the
-    // bytes that were verified out here. A distribution with no `sha256sum`
-    // cannot answer, which is reported rather than assumed away.
-    let rechecked = match &installed.sha256 {
-        Some(found) if *found != expected => {
-            return Err(format!(
-                "the engine copied into {distro} does not match what was downloaded \
-                 (expected sha256 {expected}, the distribution computed {found}). Nothing \
-                 unverified is left in use: remove {} and try again",
-                installed.path
-            ))
-        }
-        Some(_) => true,
-        None => false,
-    };
-
-    Ok(Outcome {
-        installed,
-        cached,
-        rechecked,
-    })
-}
-
-/// Makes sure the cache holds a copy matching the pin. Returns `true` when it
-/// already did and nothing was downloaded.
-fn fetch_verified(transport: &dyn Transport, path: &Path, expected: &str) -> Result<bool, String> {
-    if path.is_file() && digest_of(path).is_ok_and(|found| found == expected) {
-        return Ok(true);
-    }
-    let dir = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-
-    let url = asset_url();
-    let partial = debian_media::partial_path(path);
-    let _ = std::fs::remove_file(&partial);
-    tracing::info!(url, "downloading the Linux engine");
-
-    let download = transport
-        .get_range(&url, 0)
-        .map_err(|e| format!("cannot download {url}: {e}{}", not_published_hint(&e)))?;
-    let mut hasher = DigestAlgo::Sha256.hasher();
-    let mut file = std::fs::File::create(&partial)
-        .map_err(|e| format!("cannot create {}: {e}", partial.display()))?;
-    let mut reader = download.body.take(MAX_ASSET_LEN + 1);
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut written: u64 = 0;
-    loop {
-        let read = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                let _ = std::fs::remove_file(&partial);
-                return Err(format!("download of {url} failed: {e}"));
-            }
-        };
-        written += read as u64;
-        if written > MAX_ASSET_LEN {
-            let _ = std::fs::remove_file(&partial);
-            return Err(format!("{url} is larger than this build will accept"));
-        }
-        hasher.update(&buf[..read]);
-        if let Err(e) = file.write_all(&buf[..read]) {
-            let _ = std::fs::remove_file(&partial);
-            return Err(format!("cannot write {}: {e}", partial.display()));
-        }
-    }
-    if let Err(e) = file.flush() {
-        let _ = std::fs::remove_file(&partial);
-        return Err(format!("cannot write {}: {e}", partial.display()));
-    }
-    drop(file);
-
-    let found = hasher.finish_hex();
-    if found != expected {
-        let _ = std::fs::remove_file(&partial);
-        return Err(format!(
-            "{url} does not match the digest this build was published with: expected sha256 \
-             {expected}, got {found} ({written} bytes). The file has been deleted; nothing \
-             unverified is kept"
-        ));
-    }
-    std::fs::rename(&partial, path).map_err(|e| {
-        let _ = std::fs::remove_file(&partial);
-        format!(
-            "cannot move the verified download into {}: {e}",
-            path.display()
-        )
-    })?;
-
-    // The same provenance note the media cache writes beside every artifact.
-    // `signature_verified` is false and that is not an oversight: there is no
-    // signature over this, only a digest compiled into the program that
-    // downloaded it.
-    let manifest = Manifest {
-        url: url.clone(),
-        version: crate::VERSION.to_string(),
-        fetched_at: debian_media::now_utc(),
-        sha512_hex: expected.to_string(),
-        signature_verified: false,
-        signed_by: None,
-        keyring: Some("sha256 stamped into this manager by the release pipeline".to_string()),
-    };
-    if let Ok(text) = manifest.to_toml() {
-        let manifest_path = debian_media::manifest_path(path);
-        if let Err(e) = std::fs::write(&manifest_path, text) {
-            tracing::warn!(error = %e, path = %manifest_path.display(), "cannot write the provenance note");
-        }
-    }
-    Ok(false)
-}
-
-/// A 404 here has one likely cause, so say it instead of leaving "HTTP status
-/// 404" to be interpreted.
-fn not_published_hint(error: &debian_media::TransportError) -> String {
-    match error {
-        debian_media::TransportError::Status(404) => format!(
-            "\n  release v{} carries no {ASSET} asset. Either this build was made from a \
-             branch that never published one, or {URL_ENV} points somewhere that does not \
-             serve it. Build the Linux engine yourself and name it in Settings ▸ Linux \
-             engine instead.",
-            crate::VERSION
-        ),
-        _ => String::new(),
-    }
-}
-
-fn digest_of(path: &Path) -> Result<String, String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut hasher = DigestAlgo::Sha256.hasher();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buf)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    Ok(hasher.finish_hex())
-}
-
-fn first_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("no output")
-        .to_string()
+/// The shared install, with this binary's pin, cache and quiet runner.
+fn install_blocking(distro: &str) -> Result<Outcome, String> {
+    let root = cache_root()
+        .ok_or_else(|| "no cache directory (set ENTANGLED_CACHE or HOME)".to_string())?;
+    wsl_engine::install_blocking(&UreqTransport::new(), &pin(&root), distro, &run_quiet)
+        .map_err(|e| e.to_string())
 }
 
 /// The fixture the `--mock` session shows: a distribution with no engine, which
@@ -502,76 +219,22 @@ pub fn mock_status() -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use debian_media::{Download, TransportError};
-    use std::collections::HashMap;
-
-    struct Serve(HashMap<String, Vec<u8>>);
-
-    impl Transport for Serve {
-        fn get_all(&self, url: &str, _limit: u64) -> Result<Vec<u8>, TransportError> {
-            self.0.get(url).cloned().ok_or(TransportError::Status(404))
-        }
-
-        fn get_range(&self, url: &str, _offset: u64) -> Result<Download, TransportError> {
-            let body = self
-                .0
-                .get(url)
-                .cloned()
-                .ok_or(TransportError::Status(404))?;
-            Ok(Download {
-                resumed: false,
-                total_len: Some(body.len() as u64),
-                body: Box::new(std::io::Cursor::new(body)),
-            })
-        }
-    }
 
     /// A build the pipeline did not make must refuse to download rather than
     /// fetch something it cannot check — and say why, in a sentence with a way
-    /// out in it.
+    /// out in it. (The refusal itself is tested in `control-api`; what is
+    /// asserted here is that *this* binary's digest reaches it.)
     #[test]
-    fn a_developer_build_refuses_to_download_an_unpinned_engine() {
-        if pinned_sha256().is_some() {
+    fn a_developer_build_greys_the_install_button() {
+        match pinned_sha256() {
             // A release build: the pin exists, and this test's premise does not.
-            return;
+            Some(pin) => assert!(install_block().is_none(), "pinned {pin} but still blocked"),
+            None => {
+                let block = install_block().expect("no pin, so no download");
+                assert!(block.contains("Settings"), "{block}");
+                assert!(block.contains(crate::VERSION), "{block}");
+            }
         }
-        let block = install_block().expect("no pin, so no download");
-        assert!(block.contains("Settings"), "{block}");
-        let serve = Serve(HashMap::new());
-        let error = install_blocking(&serve, "Ubuntu", &|_| Ok(wsl::Ran::default()))
-            .expect_err("must not download");
-        assert!(error.contains("verified digest"), "{error}");
-    }
-
-    /// The download half, driven end to end against a fake server: a body that
-    /// hashes wrong is deleted rather than installed.
-    #[test]
-    fn a_download_that_does_not_match_the_pin_is_deleted() {
-        let dir = std::env::temp_dir().join(format!("entangled-wslengine-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join(ASSET);
-        let good = b"the real engine".to_vec();
-        let expected = DigestAlgo::Sha256.hex_of(&good);
-        let url = asset_url();
-
-        let wrong = Serve(
-            [(url.clone(), b"something else".to_vec())]
-                .into_iter()
-                .collect(),
-        );
-        let error = fetch_verified(&wrong, &path, &expected).expect_err("digest mismatch");
-        assert!(error.contains("does not match the digest"), "{error}");
-        assert!(!path.exists(), "an unverified download must not be kept");
-
-        let right = Serve([(url, good)].into_iter().collect());
-        assert!(!fetch_verified(&right, &path, &expected).expect("accepted"));
-        assert!(path.is_file());
-        // Second time round it is a cache hit and nothing is served at all.
-        let empty = Serve(HashMap::new());
-        assert!(fetch_verified(&empty, &path, &expected).expect("cached"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The status is what gates the buttons, so its three answers must not
@@ -627,9 +290,9 @@ mod tests {
     }
 
     #[test]
-    fn the_asset_url_is_this_version_and_is_overridable() {
-        let url = asset_url();
+    fn the_asset_url_is_this_version_and_ends_in_the_asset() {
+        let url = wsl_engine::asset_url(crate::VERSION);
         assert!(url.contains(crate::VERSION), "{url}");
-        assert!(url.ends_with(ASSET), "{url}");
+        assert!(url.ends_with(wsl_engine::ASSET), "{url}");
     }
 }

@@ -33,6 +33,12 @@ mod run_vm;
 #[cfg(any(target_os = "linux", windows))]
 mod seed;
 mod snapshot;
+/// `entangled wsl install-engine`: the Linux engine inside WSL, installed from
+/// a script. Portable for the same reason the rest of this list is — the
+/// flags, the exit-code table and the report parse everywhere; only the
+/// `wsl.exe` conversation is Windows-shaped, and on any other host the command
+/// says so instead of pretending.
+mod wsl_engine;
 
 /// The isolated-renderer helper (ADR-0004 GPU-012). Linux-only, like the
 /// renderer it hosts.
@@ -187,6 +193,16 @@ enum Command {
     },
     /// Check host prerequisites (KVM, capabilities, graphics backend).
     Doctor,
+    /// The Linux engine inside WSL (Windows hosts).
+    ///
+    /// A Windows install has no Linux half, so the "WSL (KVM)" backend has
+    /// nothing to run until one is put there. `install-engine` downloads the
+    /// build published with this exact version, checks it against the digest
+    /// compiled into this program, and copies it into the distribution — the
+    /// same thing the manager's Settings button does, and what the installer's
+    /// optional task runs.
+    #[command(subcommand)]
+    Wsl(wsl_engine::WslCommand),
     /// Serve the 3D renderer protocol on stdin (ADR-0004 GPU-012).
     ///
     /// Not for interactive use: `entangled run` starts this on itself so that
@@ -343,17 +359,29 @@ fn main() -> ExitCode {
         )
         .init();
 
-    match run(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("error: {message}");
-            ExitCode::FAILURE
-        }
+    match Cli::parse().command {
+        // One command answers with an exit *code* rather than a message: the
+        // Windows installer runs `wsl install-engine` hidden and has nothing
+        // to read but the code (the table is in src/wsl_engine.rs).
+        Command::Wsl(command) => wsl_engine::run(command),
+        other => match run(other) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("error: {message}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
-fn run(cli: Cli) -> Result<(), String> {
-    match cli.command {
+/// Everything except `wsl`, which `main` answers with an exit code of its own.
+fn run(command: Command) -> Result<(), String> {
+    match command {
+        // Unreachable by construction — `main` peels this one off first — and
+        // an error rather than a panic, because a refusal is never worth a
+        // crash. Spelled out instead of left to a catch-all so that a second
+        // exit-code command cannot silently fall through to a wrong answer.
+        Command::Wsl(_) => Err("internal: `wsl` is answered in main()".to_string()),
         Command::Disk(command) => match command {
             DiskCommand::Create { path, size } => disk::create(&path, &size),
             DiskCommand::Inspect { path, json } => disk::inspect(&path, json),
