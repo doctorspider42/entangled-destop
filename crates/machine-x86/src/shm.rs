@@ -518,9 +518,18 @@ impl ShmBacking for ShmBackingHandle {
     }
 
     fn unmap_host(&self, offset: u64) {
-        // An offset outside the region never named a mapping, so there is
-        // nothing to take down and nothing to report.
-        if let Ok(at) = self.at(offset, 0) {
+        // `self.at(offset, 0)` is *not* the right check, and the `venus_window`
+        // fuzzer found out why on its second minute: a zero-length span is
+        // "inside" the region at `offset == len` too, which is the *next*
+        // region's offset 0 — so region 1 could unmap region 2's mapping and
+        // leave the guest reading host memory the renderer had freed. An
+        // unmap names a byte, so the byte has to be one of ours.
+        if offset >= self.len {
+            return;
+        }
+        // An offset outside the region never named a mapping of ours, so
+        // there is nothing to take down and nothing to report.
+        if let Ok(at) = self.at(offset, 1) {
             self.window.unmap_host_range(at);
         }
     }
@@ -939,6 +948,19 @@ mod tests {
         let live = mapper.live.lock().expect("mapper").clone();
         assert_eq!(live.len(), 2);
         assert!(live.contains_key(&(moved + 4096)) && live.contains_key(&(moved + 8192)));
+
+        // One region must not be able to unmap another's span. Region 1 is
+        // 8192 bytes long, so its offset 8192 is region 2's offset 0 in
+        // window terms — and a zero-length bounds check calls that "inside".
+        // The `venus_window` fuzzer found exactly this; the consequence is a
+        // guest still reading host memory the renderer is about to free.
+        first.unmap_host(8192);
+        first.unmap_host(u64::MAX);
+        assert_eq!(
+            mapper.live.lock().expect("mapper").len(),
+            2,
+            "region 1 reached past its own end and took region 2's mapping down"
+        );
 
         first.unmap_host(4096);
         second.unmap_host(0);
