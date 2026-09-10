@@ -54,6 +54,58 @@ const USE_EGL: c_int = 1;
 const USE_SURFACELESS: c_int = 1 << 3;
 /// `VIRGL_RENDERER_USE_GLES`.
 const USE_GLES: c_int = 1 << 4;
+/// `VIRGL_RENDERER_VENUS`: decode the guest's Vulkan stream (VEN-2003).
+const VENUS: c_int = 1 << 6;
+/// `VIRGL_RENDERER_RENDER_SERVER`: run the Venus decoder in a subprocess the
+/// library spawns and supervises.
+///
+/// Not optional and not a policy choice of ours: virglrenderer 1.1's Venus
+/// support **only** exists behind the render server. `virgl_renderer_init`
+/// reaches `proxy_renderer_init` from this flag alone, and every Venus entry
+/// point after it — the capset, `context_create_with_flags`, the blob
+/// allocation — begins with `if (!state.proxy_initialized) return EINVAL`. The
+/// server is found at the path compiled into the library (`libexec/
+/// virgl_render_server` under its own prefix), overridable with
+/// `RENDER_SERVER_EXEC_PATH`.
+///
+/// A consequence worth naming rather than discovering: the untrusted Vulkan
+/// command stream is decoded in a process of its own whatever
+/// `[display] virgl_isolation` says, so a Venus decoder crash is contained by
+/// construction and GPU-012's containment covers the GL half beside it.
+const RENDER_SERVER: c_int = 1 << 9;
+
+/// `VIRGL_RENDERER_USE_EXTERNAL_BLOB`, deliberately **not** set.
+///
+/// With it, a host blob comes back as a file descriptor the VMM is expected to
+/// `mmap` itself; without it, `virgl_renderer_resource_map` does the `mmap`
+/// and hands back a host pointer, which is exactly what
+/// [`Renderer3d::map_blob`] needs and what the hypervisor seam takes
+/// (`vmm_core::HostRange`). The flag only changes the *classic virgl* path in
+/// this version anyway (`VREND_USE_EXTERNAL_BLOB`); Venus resources cross the
+/// render-server socket as fds regardless, and the library mmaps them for us.
+#[allow(dead_code)]
+const USE_EXTERNAL_BLOB: c_int = 1 << 5;
+
+/// How much host-visible window a Venus renderer asks the machine layer for.
+///
+/// Not host memory we allocate — with `host_mapped` the window's own pages are
+/// never shown to a guest (`vmm_core::SharedWindow::new_host_mapped`) — but
+/// guest *address space*, carved out of the 64-bit PCI aperture, that the
+/// guest's `drm_mm` allocator carves up for blob mappings. 256 MiB is what
+/// crosvm and QEMU offer, and the bound that actually bites is
+/// `vmm_core::MAX_HOST_RANGES`, which counts hypervisor mappings rather than
+/// bytes.
+const VENUS_WINDOW_BYTES: u64 = 256 << 20;
+
+/// Environment variable naming an explicit `libvirglrenderer.so` to load,
+/// ahead of the system one.
+///
+/// The Venus-capable build is not a distribution package on any host we
+/// target (jammy ships 0.9.1): it comes out of
+/// `guest/virglrenderer/build-virglrenderer.sh` into a cache directory. This
+/// is how a VM is pointed at it without `LD_LIBRARY_PATH` games that would
+/// also re-point every other library the process loads.
+pub const LIB_ENV: &str = "ENTANGLED_VIRGL_LIB";
 
 /// `VIRTIO_GPU_CAPSET_VIRGL` / `VIRTIO_GPU_CAPSET_VIRGL2`.
 const CAPSET_VIRGL: u32 = 1;
@@ -93,15 +145,26 @@ struct VenusApi {
     context_create_with_flags: unsafe extern "C" fn(u32, u32, u32, *const c_char) -> c_int,
     /// `virgl_renderer_resource_create_blob(&args)`.
     resource_create_blob: unsafe extern "C" fn(*const CreateBlobArgs) -> c_int,
+    /// `virgl_renderer_resource_map(res_handle, &map, &size)` — the host
+    /// pointer a host-visible blob is mapped at, and how many bytes of it
+    /// there are (VEN-2003).
+    resource_map: unsafe extern "C" fn(u32, *mut *mut c_void, *mut u64) -> c_int,
+    /// `virgl_renderer_resource_unmap(res_handle)`.
+    resource_unmap: unsafe extern "C" fn(u32) -> c_int,
+    /// `virgl_renderer_resource_get_map_info(res_handle, &map_info)`: the
+    /// caching the guest must use. Optional even on a Venus-capable library,
+    /// so it is an `Option` while the four required ones are not.
+    resource_get_map_info: Option<unsafe extern "C" fn(u32, *mut u32) -> c_int>,
 }
 
 /// Symbols the Venus probe requires the library to have before it believes it.
 ///
-/// Four, but only two are *stored* ([`VenusApi`]): `virgl_renderer_resource_map`
-/// and `..._unmap` are what a host-visible mapping would call, and there is no
-/// window to map into until the machine layer allocates one — so resolving
-/// them is evidence about the library, not a capability we can use yet
-/// (VEN-2003; see `map_blob`).
+/// All four are now *used* (VEN-2003): `virgl_renderer_resource_map`
+/// and `..._unmap` were evidence about the library rather than a capability
+/// until the machine layer grew a window to map into, and now they are how a
+/// blob mapping reaches a guest. Resolved all-or-nothing, because half a Venus
+/// implementation is worse than none: the guest would negotiate the capset and
+/// then fail on its first allocation.
 const VENUS_SYMBOLS: [&str; 4] = [
     "virgl_renderer_context_create_with_flags",
     "virgl_renderer_resource_create_blob",
@@ -417,6 +480,23 @@ pub struct VirglRenderer {
     /// binding lets teardown calls execute GL. `Drop` on any other thread
     /// leaks instead of calling into the library (see `Drop`).
     init_thread: Option<std::thread::ThreadId>,
+    /// The device's host-visible window, once the machine layer has one
+    /// (VEN-2003). This is the only way a host pointer reaches a guest.
+    host_visible: Option<Arc<dyn virtio_core::ShmBacking>>,
+    /// Window offset of every live blob mapping, by resource id, so a teardown
+    /// can take them out of the guest before the renderer frees the pages
+    /// behind them.
+    blob_mappings: HashMap<u32, u64>,
+    /// Set when `virgl_renderer_init` refused the Venus flags and we fell back
+    /// to a GL-only renderer.
+    ///
+    /// The capsets were advertised at `load`, before EGL could be brought up
+    /// on the right thread, so by the time this is known the guest may already
+    /// have read `num_capsets`. Rather than lie in both directions the
+    /// advertisement stands and every Venus *operation* fails in band with a
+    /// reason, which a guest driver handles and which leaves the classic virgl
+    /// half working.
+    venus_lost: bool,
 }
 
 // SAFETY: the renderer is moved to the device worker thread once and used
@@ -445,18 +525,43 @@ impl VirglRenderer {
     }
 
     fn load_inner() -> Result<Self, String> {
-        let lib = ["libvirglrenderer.so.1", "libvirglrenderer.so"]
-            .iter()
-            .find_map(|name| {
-                // SAFETY: dlopen of a system library; its constructors are the
-                // platform loader's business, and we resolve symbols before use.
-                unsafe { libloading::Library::new(name) }.ok()
-            })
-            .ok_or_else(|| {
-                "libvirglrenderer.so.1 not found — install libvirglrenderer1 \
-                 (Debian/Ubuntu) or disable [display] virgl"
-                    .to_string()
-            })?;
+        // An explicit path first: the Venus-capable build is packaged by no
+        // distribution we target and lives in a cache directory (see
+        // `LIB_ENV`). Then the sonames, which is where a distribution's own
+        // library is.
+        let explicit = std::env::var(LIB_ENV).ok().filter(|p| !p.is_empty());
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(path) = &explicit {
+            candidates.push(path.clone());
+        }
+        candidates.push("libvirglrenderer.so.1".into());
+        candidates.push("libvirglrenderer.so".into());
+        let mut opened = None;
+        for name in &candidates {
+            // SAFETY: dlopen of a library named by the host operator; its
+            // constructors are the platform loader's business, and we resolve
+            // every symbol before use.
+            match unsafe { libloading::Library::new(name.as_str()) } {
+                Ok(lib) => {
+                    if explicit.as_deref() == Some(name.as_str()) {
+                        tracing::info!(path = %name, "{LIB_ENV} names the virglrenderer to load");
+                    }
+                    opened = Some(lib);
+                    break;
+                }
+                // A path the operator asked for and we could not open is a
+                // configuration error, not something to paper over with the
+                // system library: that would silently drop Venus.
+                Err(error) if explicit.as_deref() == Some(name.as_str()) => {
+                    return Err(format!("{LIB_ENV}={name} could not be loaded: {error}"));
+                }
+                Err(_) => (),
+            }
+        }
+        let lib = opened.ok_or_else(|| {
+            "libvirglrenderer.so.1 not found: install libvirglrenderer1              (Debian/Ubuntu), build one with guest/virglrenderer/build-virglrenderer.sh              and point ENTANGLED_VIRGL_LIB at it, or disable [display] virgl"
+                .to_string()
+        })?;
 
         macro_rules! sym {
             ($name:literal) => {
@@ -546,9 +651,20 @@ impl VirglRenderer {
                 unsafe extern "C" fn(*const CreateBlobArgs) -> c_int,
                 "virgl_renderer_resource_create_blob"
             );
-            // Presence-only: see `VENUS_SYMBOLS`.
-            let resource_map = opt_sym!(*const c_void, "virgl_renderer_resource_map");
-            let resource_unmap = opt_sym!(*const c_void, "virgl_renderer_resource_unmap");
+            let resource_map = opt_sym!(
+                unsafe extern "C" fn(u32, *mut *mut c_void, *mut u64) -> c_int,
+                "virgl_renderer_resource_map"
+            );
+            let resource_unmap = opt_sym!(
+                unsafe extern "C" fn(u32) -> c_int,
+                "virgl_renderer_resource_unmap"
+            );
+            // Not in `VENUS_SYMBOLS`: a library may serve Venus without it,
+            // and the fallback is the cache type that is always safe.
+            let resource_get_map_info = opt_sym!(
+                unsafe extern "C" fn(u32, *mut u32) -> c_int,
+                "virgl_renderer_resource_get_map_info"
+            );
 
             let missing: Vec<&str> = VENUS_SYMBOLS
                 .iter()
@@ -566,13 +682,24 @@ impl VirglRenderer {
             // size tables and is safe before init (as for VIRGL above).
             unsafe { (api.get_cap_set)(crate::CAPSET_VENUS, &mut venus_version, &mut venus_size) };
 
-            match (context_create_with_flags, resource_create_blob) {
-                (Some(context_create_with_flags), Some(resource_create_blob))
-                    if missing.is_empty() && venus_size > 0 =>
-                {
+            match (
+                context_create_with_flags,
+                resource_create_blob,
+                resource_map,
+                resource_unmap,
+            ) {
+                (
+                    Some(context_create_with_flags),
+                    Some(resource_create_blob),
+                    Some(resource_map),
+                    Some(resource_unmap),
+                ) if missing.is_empty() && venus_size > 0 => {
                     api.venus = Some(VenusApi {
                         context_create_with_flags,
                         resource_create_blob,
+                        resource_map,
+                        resource_unmap,
+                        resource_get_map_info,
                     });
                     capsets.push(CapsetInfo {
                         id: crate::CAPSET_VENUS,
@@ -618,6 +745,9 @@ impl VirglRenderer {
                 get_drm_fd: None,
             }),
             init_thread: None,
+            host_visible: None,
+            blob_mappings: HashMap::new(),
+            venus_lost: false,
         })
     }
 
@@ -632,17 +762,27 @@ impl VirglRenderer {
                 let callbacks = std::ptr::from_mut::<Callbacks>(&mut *self.callbacks);
                 // Surfaceless EGL first (headless, WSLg — the probed
                 // configuration); GLES as the fallback for hosts whose EGL
-                // offers no desktop-GL contexts.
+                // offers no desktop-GL contexts. Venus goes on the front of
+                // that list rather than beside it: `VENUS | RENDER_SERVER`
+                // adds a Vulkan decoder in a subprocess *next to* the GL one,
+                // so the first attempt is strictly the most capable and every
+                // later attempt is a degradation we then have to admit to.
+                let want_venus = self.api.venus.is_some();
+                let mut attempts: Vec<c_int> = Vec::new();
+                if want_venus {
+                    attempts.push(USE_EGL | USE_SURFACELESS | VENUS | RENDER_SERVER);
+                }
+                attempts.push(USE_EGL | USE_SURFACELESS);
+                attempts.push(USE_EGL | USE_SURFACELESS | USE_GLES);
                 let mut rc = -1;
-                for flags in [
-                    USE_EGL | USE_SURFACELESS,
-                    USE_EGL | USE_SURFACELESS | USE_GLES,
-                ] {
+                let mut got_venus = false;
+                for flags in attempts {
                     // SAFETY: the cookie and the callbacks struct are boxed in
                     // `self` and outlive the initialized library — required,
                     // because the library stores both *pointers*.
                     rc = unsafe { (self.api.init)(cookie, flags, callbacks) };
                     if rc == 0 {
+                        got_venus = flags & VENUS != 0;
                         break;
                     }
                 }
@@ -650,6 +790,19 @@ impl VirglRenderer {
                     return Err(CommandError::Renderer(format!(
                         "virgl_renderer_init failed ({rc}): no usable EGL/GL on this host"
                     )));
+                }
+                if want_venus && !got_venus {
+                    // The library has Venus compiled in but could not start
+                    // it — almost always a render server it cannot exec
+                    // (`RENDER_SERVER_EXEC_PATH`), sometimes a host with no
+                    // Vulkan ICD at all. Loud, because the guest was already
+                    // told the capset exists.
+                    self.venus_lost = true;
+                    tracing::error!(
+                        "virglrenderer would not initialize with VENUS | RENDER_SERVER;                          3D falls back to classic virgl and every Venus command will be                          refused in band. Check that virgl_render_server is installed                          beside the library, or set RENDER_SERVER_EXEC_PATH (VEN-2003)"
+                    );
+                } else if got_venus {
+                    tracing::info!("virglrenderer initialized with Venus (VEN-2003)");
                 }
                 self.init_thread = Some(std::thread::current().id());
                 // SAFETY: no arguments; valid only after a successful init,
@@ -674,6 +827,37 @@ impl VirglRenderer {
                 tracing::info!("virglrenderer reset");
                 self.state = State::Ready;
                 Ok(())
+            }
+        }
+    }
+
+    /// Refuses a Venus operation on a renderer whose Venus half never came
+    /// up (see [`VirglRenderer::venus_lost`]).
+    fn venus_alive(&self) -> Result<(), CommandError> {
+        if self.venus_lost {
+            return Err(CommandError::Renderer(
+                "this host advertised Venus but virglrenderer could not start it".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Takes one blob mapping out of the guest and then out of the library,
+    /// in that order.
+    ///
+    /// The order is the whole content of the method: `resource_unmap` frees
+    /// (or `munmap`s) the host pages, and a guest whose page tables still
+    /// pointed at them would be reading whatever the host reused them for.
+    fn take_mapping_down(&mut self, resource_id: u32, offset: u64) {
+        if let Some(backing) = self.host_visible.as_ref() {
+            backing.unmap_host(offset);
+        }
+        if let Some(venus) = self.api.venus.as_ref() {
+            // SAFETY: plain id of a resource this renderer mapped; the guest
+            // mapping is already gone by the line above.
+            let rc = unsafe { (venus.resource_unmap)(resource_id) };
+            if rc != 0 {
+                tracing::warn!(resource = resource_id, rc, "resource_unmap refused");
             }
         }
     }
@@ -753,36 +937,48 @@ impl Renderer3d for VirglRenderer {
     }
 
     fn blob_support(&self) -> crate::blob::BlobSupport {
-        // VEN-2001/VEN-2003. `host_visible_bytes` is deliberately `None` even
-        // on a library that has `virgl_renderer_resource_map`: mapping a blob
-        // into the *guest* needs a shared-memory window the machine layer has
-        // to allocate and back with host pages, and neither host does that
-        // yet. Claiming a window we cannot back would fail the guest's
-        // `mmap` after it had already built a Vulkan allocation around it.
+        // VEN-2003. `host_visible_bytes` is `Some` now: the window exists, the
+        // machine layer backs it, and `map_blob` below puts the renderer's own
+        // pages into it. It is deliberately a *request* for address space
+        // rather than a measurement of anything — the guest's own `drm_mm`
+        // carves the region up, and the bound that bites is the
+        // hypervisor-mapping count (`vmm_core::MAX_HOST_RANGES`), not bytes.
+        //
+        // `host_mapped` is what makes the window a different object all the
+        // way down to the hypervisor: with a real Venus renderer the guest
+        // never sees the device's own pages there, only `VkDeviceMemory` the
+        // host Vulkan driver allocated.
+        let venus = self.api.venus.is_some();
         crate::blob::BlobSupport {
-            guest: self.api.venus.is_some(),
-            host3d: self.api.venus.is_some(),
-            host_visible_bytes: None,
+            guest: venus,
+            host3d: venus,
+            host_visible_bytes: venus.then_some(VENUS_WINDOW_BYTES),
+            host_mapped: venus,
         }
     }
 
     fn create_blob(
         &mut self,
+        ctx_id: u32,
         args: &crate::protocol::ResourceCreateBlob,
         _mem: &Arc<GuestMem>,
         _entries: &[MemEntry],
     ) -> Result<(), CommandError> {
         self.ensure_ready()?;
+        self.venus_alive()?;
         let venus = self
             .api
             .venus
             .as_ref()
             .ok_or(CommandError::UnsupportedBlobMem(args.blob_mem))?;
         // Only host-side blobs reach a renderer at all (the device keeps
-        // guest-memory blobs to itself), so there are no iovecs to pass.
+        // guest-memory blobs to itself — see `GpuDevice::resource_create_blob`),
+        // so there are no iovecs to pass. `ctx_id` is load-bearing: a host blob
+        // is resolved through the context that asked for it, and for Venus that
+        // context is the Vulkan connection the `blob_id` was minted on.
         let c_args = CreateBlobArgs {
             res_handle: args.resource_id,
-            ctx_id: 0,
+            ctx_id,
             blob_mem: args.blob_mem,
             blob_flags: args.blob_flags,
             blob_id: args.blob_id,
@@ -809,6 +1005,15 @@ impl Renderer3d for VirglRenderer {
         if self.ensure_ready().is_err() {
             return;
         }
+        // A guest may unref a blob it never unmapped. The device tells us
+        // about that separately, but if it ever did not, the host pages must
+        // still come out of the guest *before* the renderer frees them — so
+        // this is repeated here, where it is cheap and idempotent. The
+        // alternative is a guest reading a `VkDeviceMemory` that has been
+        // recycled.
+        if let Some(offset) = self.blob_mappings.remove(&resource_id) {
+            self.take_mapping_down(resource_id, offset);
+        }
         self.resources.remove(&resource_id);
         // SAFETY: plain id argument; the library ignores unknown ids.
         unsafe { (self.api.resource_unref)(resource_id) };
@@ -816,15 +1021,125 @@ impl Renderer3d for VirglRenderer {
 
     fn map_blob(
         &mut self,
-        _resource_id: u32,
-        _offset: u64,
-        _size: u64,
+        resource_id: u32,
+        offset: u64,
+        size: u64,
     ) -> Result<crate::blob::BlobMapping, CommandError> {
-        // See `blob_support`: there is no window to map into yet. The FFI half
-        // (`virgl_renderer_resource_map`) is resolved and ready; what is
-        // missing is the machine layer's BAR/GPA window and the host mapping
-        // behind it.
-        Err(CommandError::NoHostVisibleWindow)
+        self.ensure_ready()?;
+        self.venus_alive()?;
+        if self.host_visible.is_none() {
+            return Err(CommandError::NoHostVisibleWindow);
+        }
+        if self.blob_mappings.contains_key(&resource_id) {
+            // The device checks this too. The renderer checks it as well
+            // because `virgl_renderer_resource_map` refuses a second map, and
+            // we would otherwise have to tell that apart from a real failure.
+            return Err(CommandError::BlobAlreadyMapped(resource_id));
+        }
+        let venus = self
+            .api
+            .venus
+            .as_ref()
+            .ok_or(CommandError::NoHostVisibleWindow)?;
+
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let mut mapped: u64 = 0;
+        // SAFETY: out-pointers to locals, valid for the call. The library
+        // mmaps the resource (or asks its Vulkan allocator to) and writes the
+        // address and length back; it holds that mapping until
+        // `resource_unmap`, which is what the `HostRange` below rests on.
+        let rc = unsafe { (venus.resource_map)(resource_id, &mut ptr, &mut mapped) };
+        if rc != 0 || ptr.is_null() {
+            return Err(CommandError::Renderer(format!(
+                "resource_map({resource_id}): rc {rc}"
+            )));
+        }
+        let host_addr = ptr as u64;
+        // Everything from here is a host value the guest is about to reach
+        // through, so every failure has to give the library its mapping back
+        // rather than leave a live one nobody owns.
+        if mapped < size {
+            // SAFETY: plain id; undoes the map made immediately above, on the
+            // same thread, with no guest mapping ever made for it.
+            unsafe { (venus.resource_unmap)(resource_id) };
+            return Err(CommandError::Renderer(format!(
+                "resource_map({resource_id}) gave {mapped} bytes, the blob wants {size}"
+            )));
+        }
+        // SAFETY: `host_addr`..+`size` is inside the mapping the library just
+        // made and holds until `resource_unmap`, and every path that calls
+        // `resource_unmap` takes the guest mapping down first. The device has
+        // already checked that `offset`..+`size` lies inside the window and is
+        // disjoint from every other live mapping.
+        let placed = unsafe {
+            self.host_visible
+                .as_ref()
+                .expect("checked above")
+                .map_host(offset, host_addr, size)
+        };
+        if let Err(error) = placed {
+            // SAFETY: plain id; undoes the map above. The machine refused the
+            // range, so no guest mapping of it exists to invalidate.
+            unsafe { (venus.resource_unmap)(resource_id) };
+            return Err(CommandError::Renderer(format!(
+                "the machine refused a blob mapping at window offset {offset:#x}: {error}"
+            )));
+        }
+
+        // The caching the *host* says this memory has. Getting it wrong is not
+        // a crash, it is a guest reading stale bytes out of its own Vulkan
+        // allocation, so the fallback is the conservative one.
+        let mut map_info = crate::protocol::MAP_CACHE_CACHED;
+        if let Some(get_map_info) = venus.resource_get_map_info {
+            let mut info = 0u32;
+            // SAFETY: out-pointer to a local; the entry point only reads the
+            // cache type the library recorded for this resource.
+            if unsafe { get_map_info(resource_id, &mut info) } == 0
+                && info & crate::protocol::MAP_CACHE_MASK != 0
+            {
+                map_info = info & crate::protocol::MAP_CACHE_MASK;
+            }
+        }
+        self.blob_mappings.insert(resource_id, offset);
+        tracing::debug!(
+            resource = resource_id,
+            at = format_args!("{offset:#x}"),
+            size,
+            map_info,
+            "a Venus blob is mapped into the guest host-visible window"
+        );
+        Ok(crate::blob::BlobMapping { map_info })
+    }
+
+    fn unmap_blob(&mut self, resource_id: u32, offset: u64) {
+        if self.ensure_ready().is_err() {
+            return;
+        }
+        if self.blob_mappings.remove(&resource_id).is_none() {
+            return;
+        }
+        self.take_mapping_down(resource_id, offset);
+    }
+
+    fn set_host_visible(&mut self, backing: Arc<dyn virtio_core::ShmBacking>) {
+        if !backing.host_mapped() {
+            // The machine gave us a window of its own pages, which means it
+            // has mapped the whole thing into the guest already; a renderer
+            // range at an offset inside it would overlap, and both hypervisors
+            // refuse that. This is a wiring bug (the device asked for the wrong
+            // mode), not a guest one, so it is loud and it disables mapping
+            // rather than corrupting a window.
+            tracing::error!(
+                "virtio-gpu handed the Venus renderer a device-backed window; \
+                 host-visible blob mappings are disabled for this VM (VEN-2003)"
+            );
+            return;
+        }
+        tracing::info!(
+            len = backing.len(),
+            "the Venus renderer has the guest host-visible window"
+        );
+        self.host_visible = Some(backing);
     }
 
     fn ctx_destroy(&mut self, ctx_id: u32) {
@@ -1177,6 +1492,19 @@ impl Renderer3d for VirglRenderer {
                 self.graveyard.push(attachment);
             }
         }
+        // Blob mappings come out of the *guest* now, not later: the deferred
+        // `virgl_renderer_reset` frees the host pages behind them, and a guest
+        // whose page tables still reached those pages after a device reset
+        // would be reading whatever the host reused them for. Unmapping a
+        // hypervisor range is safe from any thread, unlike the library call —
+        // so the half that has to happen now can, and the half that has to
+        // wait does.
+        let mapped: Vec<u64> = self.blob_mappings.drain().map(|(_, at)| at).collect();
+        if let Some(backing) = self.host_visible.as_ref() {
+            for offset in mapped {
+                backing.unmap_host(offset);
+            }
+        }
         self.resources.clear();
         self.contexts.clear();
         // Fences belong to contexts that are about to stop existing; the
@@ -1213,6 +1541,12 @@ impl Drop for VirglRenderer {
                 // leaks the library-held resources — the process is on its
                 // way out whenever a VM's device tree is dropped, and the
                 // renderer is process-global either way.
+                // Whatever thread this is, the guest must stop reaching the
+                // renderer's pages before the library is allowed to free them.
+                let mapped: Vec<(u32, u64)> = self.blob_mappings.drain().collect();
+                for (resource, offset) in mapped {
+                    self.take_mapping_down(resource, offset);
+                }
                 let same_thread = self.init_thread == Some(std::thread::current().id());
                 if same_thread {
                     for id in ids {

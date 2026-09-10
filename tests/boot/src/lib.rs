@@ -638,7 +638,7 @@ pub fn boot_once_driven(spec: &BootSpec, drive: Option<Driver>) -> Result<BootOu
             // The window allocator borrows the VM for the length of the attach
             // and nothing longer — `create_shm_window` takes `&self`, so the
             // closure can go out of scope before `take_vcpus`.
-            let allocate = |len: u64| vm.create_shm_window(len);
+            let allocate = |len: u64, host_mapped: bool| vm.create_shm_window(len, host_mapped);
             let shm = spec.shm_window.then_some(machine_x86::shm::ShmSupport {
                 mem_bytes: machine.memory_mib << 20,
                 allocate: &allocate,

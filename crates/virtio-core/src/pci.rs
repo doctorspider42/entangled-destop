@@ -1301,8 +1301,13 @@ mod tests {
             crate::ShmRegion {
                 id: 1,
                 len: 8 << 30,
+                host_mapped: false,
             },
-            crate::ShmRegion { id: 2, len: 4096 },
+            crate::ShmRegion {
+                id: 2,
+                len: 4096,
+                host_mapped: false,
+            },
         ];
         let bar_size = 16u64 << 30;
         let placements =
@@ -1342,12 +1347,14 @@ mod tests {
         let regions = [crate::ShmRegion {
             id: 1,
             len: 2 << 30,
+            host_mapped: false,
         }];
         assert!(place_shm_regions(&regions, 1 << 30, 4096).is_none());
         // …and an overflowing length cannot wrap into a "fitting" placement.
         let evil = [crate::ShmRegion {
             id: 1,
             len: u64::MAX,
+            host_mapped: false,
         }];
         assert!(place_shm_regions(&evil, u64::MAX, 4096).is_none());
     }

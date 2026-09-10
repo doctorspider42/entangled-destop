@@ -724,18 +724,32 @@ impl Renderer3d for RemoteRenderer {
     // ------------------------------------- blob resources (EPIC 20/VEN-2001)
 
     fn blob_support(&self) -> BlobSupport {
-        self.blob_support
+        // Whatever the helper's own renderer can do, an *isolated* one can
+        // never put host memory in the guest's window (VEN-2003): the window
+        // is host pages in the VMM's address space, and a pointer the helper
+        // hands back names nothing there. So the window is withheld here,
+        // rather than advertised and then failed at map time when the guest
+        // has already built a Vulkan allocation around it.
+        BlobSupport {
+            host_visible_bytes: None,
+            host_mapped: false,
+            ..self.blob_support
+        }
     }
 
     fn create_blob(
         &mut self,
+        ctx_id: u32,
         args: &ResourceCreateBlob,
         _mem: &Arc<GuestMem>,
         _entries: &[MemEntry],
     ) -> Result<(), CommandError> {
         // Guest pages deliberately do not cross the boundary (GPU-012): the
         // helper gets the blob's *identity* and size, never an address.
-        self.call_ok(&Request::CreateBlob(*args))
+        self.call_ok(&Request::CreateBlob {
+            ctx_id,
+            args: *args,
+        })
     }
 
     fn destroy_blob(&mut self, resource_id: u32) {

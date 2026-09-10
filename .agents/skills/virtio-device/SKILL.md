@@ -362,10 +362,12 @@ a second. The real thing with a real guest is `tests/boot/tests/pci_shm.rs`.
 Blob resources themselves (`virtio_gpu::blob`) are the device half:
 
 - Three memory types. `BLOB_MEM_GUEST` is guest pages and needs no renderer at
-  all (it is the venus command ring); `BLOB_MEM_HOST3D` is a renderer
-  allocation named by `blob_id`; `BLOB_MEM_HOST3D_GUEST` is both. Unknown types
-  and unknown flag bits are **refused, never ignored** — ignoring a "use" flag
-  hands the guest a resource that silently cannot do what it asked for.
+  all; `BLOB_MEM_HOST3D` is a renderer allocation named by `blob_id`;
+  `BLOB_MEM_HOST3D_GUEST` is both. Unknown types and unknown flag bits are
+  **refused, never ignored** — ignoring a "use" flag hands the guest a resource
+  that silently cannot do what it asked for. (Phase 1 guessed the venus command
+  ring would be a `BLOB_MEM_GUEST` blob. It is not — see the Venus section
+  below — so a guest blob still never reaches a renderer.)
 - The blob table is a *third* owner in the one id namespace. Every existing
   command routes by ownership (the rule ADR-0004's mixed-namespace amendment
   established): attach/detach-backing and `TRANSFER_*_3D` are refused for a
@@ -381,6 +383,53 @@ Blob resources themselves (`virtio_gpu::blob`) are the device half:
   `VIRTIO_GPU_F_CONTEXT_INIT` are offered only when the attached renderer's
   `BlobSupport` / capsets justify them, so a virgl-only host is byte-identical
   to before.
+
+### Venus, and the second window mode (VEN-2003, 2026-09-10)
+
+A **renderer-mapped** window is the other shape a shared-memory region can
+take, and the two cannot coexist in one BAR — they overlap, and both
+hypervisors refuse that. Read this before touching `vmm_core::shm`,
+`machine_x86::shm` or `virtio_gpu::blob`:
+
+- The mode travels renderer → device → machine: `BlobSupport::host_mapped` →
+  `ShmRegion::host_mapped` → `SharedWindow::new_host_mapped`. In that mode
+  **nothing is mapped until a blob is**, the window's own pages are never shown
+  to the guest, and `ShmBacking::read/write/fill` are **refused** rather than
+  silently landing in memory no guest reads. Branch on
+  `ShmBacking::host_mapped()`, never on getting an error.
+- The renderer puts host memory in through `unsafe ShmBacking::map_host(offset,
+  host_addr, len)`, whose safety contract is the whole design: *those pages stay
+  mapped at that address until `unmap_host` returns*. It reaches the hypervisor
+  as `vmm_core::HostRange`, whose only general constructor is `unsafe` for the
+  same reason.
+- **Order is the safety property.** Every teardown path takes the *guest*
+  mapping down before the renderer frees the pages —
+  `VirglRenderer::take_mapping_down` is the one place that does it, and
+  `unmap_blob`, `destroy_blob`, `reset` and `Drop` all go through it. A device
+  reset unmaps immediately (safe from any thread) even though the library-side
+  teardown is deferred to the worker thread.
+- `MAX_HOST_RANGES` (`vmm_core`, 64) bounds **hypervisor objects**, not
+  bookkeeping: KVM reserves `1 + MAX_HOST_RANGES` memory-slot numbers per window
+  and allocates from that pool, so a guest that maps blobs without unmapping
+  gets an in-band failure rather than a VMM out of slots somewhere else.
+- An **isolated** renderer (GPU-012) withholds the window entirely
+  (`host_visible_bytes: None`): an `Arc` does not cross a pipe and a pointer in
+  the helper's address space names nothing in the VMM's. The guest is told at
+  create time, not at map time.
+- Venus needs `virgl_renderer_init` with `VENUS | RENDER_SERVER` **together** —
+  the flag alone does nothing in virglrenderer 1.1, every Venus entry point
+  checks `state.proxy_initialized`. The decoder therefore runs in a subprocess
+  virglrenderer spawns, whatever `[display] virgl_isolation` says.
+- `Renderer3d::create_blob` takes the header's `ctx_id`, because a host blob is
+  resolved *through the context that asked for it*.
+- Tests: `virtio-gpu/tests/venus_host.rs` (real library, self-skipping),
+  `machine_x86::shm::tests::a_renderer_mapped_window_places_renderer_pages_at_the_regions_offset`
+  (both hosts, no hypervisor), fuzz target `venus_window`,
+  `boot-tests/venus_vulkan.rs` (`--ignored`, a real guest).
+- The library is not packaged anywhere: build it with
+  `guest/virglrenderer/build-virglrenderer.sh` and point `ENTANGLED_VIRGL_LIB`
+  at the result. Without it every Venus probe answers "no" and the device is
+  byte-identical to a virgl-only one.
 
 ## Per-device references
 

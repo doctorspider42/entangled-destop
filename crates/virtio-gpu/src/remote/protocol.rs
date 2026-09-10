@@ -120,7 +120,7 @@ pub mod tag {
 /// the running binary's own path, and a mismatch is a packaging bug that
 /// should fail loudly at handshake rather than quietly at the first venus
 /// context.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// A request from the VMM to the renderer process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +201,13 @@ pub enum Request {
     /// Create a host-side blob. Guest-memory blobs never cross this boundary:
     /// they are guest pages the device tracks itself, and the isolated helper
     /// has no window onto guest RAM by construction (GPU-012).
-    CreateBlob(ResourceCreateBlob),
+    CreateBlob {
+        /// The context the blob is named on — see
+        /// [`Renderer3d::create_blob`](crate::renderer::Renderer3d::create_blob).
+        /// New in protocol version 3 (VEN-2003).
+        ctx_id: u32,
+        args: ResourceCreateBlob,
+    },
     DestroyBlob {
         resource_id: u32,
     },
@@ -465,7 +471,7 @@ impl Request {
             Self::Reset => tag::RESET,
             Self::CreateFence { .. } => tag::CREATE_FENCE,
             Self::PollFences => tag::POLL_FENCES,
-            Self::CreateBlob(_) => tag::CREATE_BLOB,
+            Self::CreateBlob { .. } => tag::CREATE_BLOB,
             Self::DestroyBlob { .. } => tag::DESTROY_BLOB,
             Self::MapBlob { .. } => tag::MAP_BLOB,
             Self::UnmapBlob { .. } => tag::UNMAP_BLOB,
@@ -548,8 +554,8 @@ impl Request {
                 w.u32(*ctx_id).u32(*fence_id);
             }
             Self::PollFences => (),
-            Self::CreateBlob(args) => {
-                w.create_blob(args);
+            Self::CreateBlob { ctx_id, args } => {
+                w.u32(*ctx_id).create_blob(args);
             }
             Self::DestroyBlob { resource_id } => {
                 w.u32(*resource_id);
@@ -636,7 +642,10 @@ impl Request {
                 fence_id: r.u32()?,
             },
             tag::POLL_FENCES => Self::PollFences,
-            tag::CREATE_BLOB => Self::CreateBlob(r.create_blob()?),
+            tag::CREATE_BLOB => Self::CreateBlob {
+                ctx_id: r.u32()?,
+                args: r.create_blob()?,
+            },
             tag::DESTROY_BLOB => Self::DestroyBlob {
                 resource_id: r.u32()?,
             },
@@ -751,6 +760,13 @@ impl Reply {
                     // there is no such thing as a zero-length window, so the
                     // mapping is canonical in both directions.
                     host_visible_bytes: (bytes != 0).then_some(bytes),
+                    // Not on the wire, and deliberately: both of these hand
+                    // the renderer something an *isolated* one must never
+                    // have — a host pointer into the guest's window, and the
+                    // guest's own pages. A helper that claimed them would be
+                    // claiming its way out of the containment GPU-012 exists
+                    // for, so the client decides, not the helper.
+                    host_mapped: false,
                 })
             }
             tag::FENCE => Self::Fence {
@@ -894,14 +910,17 @@ mod tests {
             },
             Request::PollFences,
             // Blob resources (VEN-2001).
-            Request::CreateBlob(ResourceCreateBlob {
-                resource_id: 9,
-                blob_mem: crate::protocol::BLOB_MEM_HOST3D,
-                blob_flags: crate::protocol::BLOB_FLAG_USE_MAPPABLE,
-                nr_entries: 0,
-                blob_id: 0xdead_beef_cafe,
-                size: 1 << 20,
-            }),
+            Request::CreateBlob {
+                ctx_id: 7,
+                args: ResourceCreateBlob {
+                    resource_id: 9,
+                    blob_mem: crate::protocol::BLOB_MEM_HOST3D,
+                    blob_flags: crate::protocol::BLOB_FLAG_USE_MAPPABLE,
+                    nr_entries: 0,
+                    blob_id: 0xdead_beef_cafe,
+                    size: 1 << 20,
+                },
+            },
             Request::DestroyBlob { resource_id: 9 },
             Request::MapBlob {
                 resource_id: 9,
@@ -950,6 +969,7 @@ mod tests {
                 guest: true,
                 host3d: true,
                 host_visible_bytes: Some(8 << 30),
+                host_mapped: false,
             }),
         ] {
             round_trip_reply(reply);

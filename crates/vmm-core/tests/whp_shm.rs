@@ -116,7 +116,7 @@ fn a_guest_reads_and_writes_the_shared_memory_window_on_whp() {
 
     let mem = Arc::new(partition.memory().clone());
     // The one WHP-specific line in the whole window path.
-    let allocate = |len: u64| partition.create_shm_window(len);
+    let allocate = |len: u64, host_mapped: bool| partition.create_shm_window(len, host_mapped);
     let pci = VirtioPciBus::attach_userspace_with_shm(
         mem,
         devices,

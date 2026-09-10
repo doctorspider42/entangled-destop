@@ -20,9 +20,18 @@
 //! | [`BLOB_MEM_HOST3D`](crate::protocol::BLOB_MEM_HOST3D) | the renderer, named by `blob_id` | forwards `blob_id` to the renderer; no guest pages |
 //! | [`BLOB_MEM_HOST3D_GUEST`](crate::protocol::BLOB_MEM_HOST3D_GUEST) | both | both of the above; transfers shadow between them |
 //!
-//! A guest blob is the cheap and important one — it is the venus ring — and it
-//! needs no renderer support whatsoever. The two host3d types need a renderer
-//! that can name its own allocations, which is [`BlobSupport`].
+//! A guest blob is the cheap one: its pages are the guest's and it needs no
+//! renderer support whatsoever. The two host3d types need a renderer that can
+//! name its own allocations, which is [`BlobSupport`].
+//!
+//! Phase 1 guessed that the venus command ring would be a *guest* blob. It is
+//! not (VEN-2003): mesa's venus driver allocates its rings and reply shmem as
+//! `HOST3D` + `MAPPABLE`, and it has to — virglrenderer decodes Venus in its
+//! own render-server process, whose `proxy_context_attach_resource` refuses
+//! any resource it cannot receive as a file descriptor, which an iovec list
+//! over anonymous guest RAM never is. So the host3d types are the Venus path
+//! and the asymmetry in this module — a guest blob never reaches the
+//! renderer — costs Venus nothing.
 //!
 //! # The untrusted-guest rules this module enforces
 //!
@@ -104,6 +113,17 @@ pub struct BlobSupport {
     /// into, or `None` when it has none — and then `RESOURCE_MAP_BLOB` is
     /// refused in band, which is honest rather than silently broken.
     pub host_visible_bytes: Option<u64>,
+    /// `true` when the bytes a guest reads through the window are the
+    /// *renderer's* own host memory, put there one blob at a time
+    /// (VEN-2003), rather than pages the device allocated and can write.
+    ///
+    /// This reaches all the way down to the hypervisor
+    /// ([`virtio_core::ShmRegion::host_mapped`]), because the two are
+    /// different mappings and cannot both be live. A real Venus renderer sets
+    /// it; the portable loopback does not, because its whole point is to be
+    /// provable on a host with no GPU, and it proves that by *writing* into
+    /// the window.
+    pub host_mapped: bool,
 }
 
 impl BlobSupport {
@@ -112,6 +132,7 @@ impl BlobSupport {
         guest: false,
         host3d: false,
         host_visible_bytes: None,
+        host_mapped: false,
     };
 
     /// True when the device should offer `VIRTIO_GPU_F_RESOURCE_BLOB` at all.
@@ -309,6 +330,15 @@ impl HostVisibleWindow {
         let Some(backing) = &self.backing else {
             return Ok(());
         };
+        if backing.host_mapped() {
+            // The window's own pages are not what the guest reads (VEN-2003):
+            // the span it is about to see is a fresh `VkDeviceMemory` the
+            // renderer allocated for *this* blob, and there is nothing of a
+            // previous owner's in it to clear. Clearing here would zero pages
+            // no guest can reach, which is worse than doing nothing because it
+            // would look like the guarantee still held.
+            return Ok(());
+        }
         backing.fill(offset, size, 0).map_err(|error| {
             tracing::error!(%error, "cannot clear a shared-memory span for a new mapping");
             CommandError::BadBlobMapping { offset, size }
@@ -649,6 +679,7 @@ mod tests {
             guest: true,
             host3d: true,
             host_visible_bytes: Some(64 << 20),
+            host_mapped: false,
         }
     }
 

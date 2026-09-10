@@ -585,12 +585,29 @@ impl WhpPartition {
     /// driver enables memory space — and is mapped read/write with **no
     /// execute**, which is the strongest statement either host can make about
     /// host memory that is not guest RAM.
-    pub fn create_shm_window(&self, len: u64) -> Result<Arc<SharedWindow>, VmmError> {
+    pub fn create_shm_window(
+        &self,
+        len: u64,
+        host_mapped: bool,
+    ) -> Result<Arc<SharedWindow>, VmmError> {
         let mapper = Arc::new(WhpGpaMapper {
             partition: Arc::clone(&self.partition),
         });
-        let window = SharedWindow::new(len, mapper)?;
-        tracing::info!(len, "allocated a shared-memory window for this partition");
+        // `host_mapped` costs WHP nothing extra: a GPA range is addressed by
+        // its address, so there is no slot pool to size and no reservation to
+        // make. Windows has no Venus renderer to supply the ranges yet
+        // (ADR-0004), but the mode is the portable half and it builds, tests
+        // and would work here the day one exists.
+        let window = if host_mapped {
+            SharedWindow::new_host_mapped(len, mapper)?
+        } else {
+            SharedWindow::new(len, mapper)?
+        };
+        tracing::info!(
+            len,
+            host_mapped,
+            "allocated a shared-memory window for this partition"
+        );
         Ok(Arc::new(window))
     }
 
@@ -613,19 +630,21 @@ struct WhpGpaMapper {
 }
 
 impl crate::shm::GpaMapper for WhpGpaMapper {
-    fn map(&self, gpa: u64, region: &crate::shm::HostShmRegion) -> Result<(), HvError> {
-        // SAFETY: `region` owns a live, page-aligned `VirtualAlloc` allocation
-        // of exactly `region.len()` bytes. The `SharedWindow` that owns it
-        // unmaps this range before dropping the pages, and this mapper holds an
-        // `Arc` on the partition, so the handle is live for the whole call and
-        // WHP never keeps a pointer into freed memory. Read+write and *not*
-        // execute: this is data the guest maps, never code the host offers it.
+    fn map_range(&self, gpa: u64, range: crate::shm::HostRange) -> Result<(), HvError> {
+        // SAFETY: `range` promises `range.len()` bytes of live, page-aligned
+        // host memory at `range.addr()` — discharged by `HostShmRegion` for a
+        // window's own `VirtualAlloc` pages and by the 3D renderer for a blob
+        // mapping. The `SharedWindow` that owns the promise unmaps this range
+        // before the pages go away, and this mapper holds an `Arc` on the
+        // partition, so the handle is live for the whole call and WHP never
+        // keeps a pointer into freed memory. Read+write and *not* execute:
+        // this is data the guest maps, never code the host offers it.
         unsafe {
             WHvMapGpaRange(
                 self.partition.handle,
-                region.host_addr() as *mut core::ffi::c_void,
+                range.addr() as *mut core::ffi::c_void,
                 gpa,
-                region.len(),
+                range.len(),
                 WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite,
             )
         }
@@ -637,10 +656,10 @@ impl crate::shm::GpaMapper for WhpGpaMapper {
         })
     }
 
-    fn unmap(&self, gpa: u64, len: u64) -> Result<(), HvError> {
+    fn unmap_range(&self, gpa: u64, len: u64) -> Result<(), HvError> {
         // SAFETY: `gpa`/`len` name a range this mapper mapped and has not
-        // unmapped since (`SharedWindow` tracks exactly one live placement),
-        // and the partition handle is kept alive by the `Arc`.
+        // unmapped since (`SharedWindow` tracks every live placement), and the
+        // partition handle is kept alive by the `Arc`.
         unsafe { WHvUnmapGpaRange(self.partition.handle, gpa, len) }.map_err(|e| {
             HvError::Registers(format!(
                 "WHvUnmapGpaRange(shm) at {gpa:#x}: {e} ({:#010x})",

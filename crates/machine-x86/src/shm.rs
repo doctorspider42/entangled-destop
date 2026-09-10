@@ -135,8 +135,14 @@ pub struct ShmSupport<'a> {
     pub mem_bytes: u64,
     /// Allocates `len` bytes of host memory already tied to this VM's
     /// hypervisor, unplaced.
+    ///
+    /// The `bool` is [`ShmRegion::host_mapped`]: `false` gives a window of its
+    /// own pages, `true` one whose bytes the device's 3D renderer supplies per
+    /// blob mapping (VEN-2003). It reaches the hypervisor because the two are
+    /// different objects there — a slot pool on KVM against a single slot —
+    /// and not because either backend chooses between them.
     #[allow(clippy::type_complexity)]
-    pub allocate: &'a dyn Fn(u64) -> Result<Arc<SharedWindow>, vmm_core::VmmError>,
+    pub allocate: &'a dyn Fn(u64, bool) -> Result<Arc<SharedWindow>, vmm_core::VmmError>,
 }
 
 /// Allocates and hands over the host memory behind `device`'s declared
@@ -189,7 +195,18 @@ pub fn back_regions(
         );
         return None;
     };
-    let pages = match (support.allocate)(bar_size) {
+    // One window per device, so one mode per device: a device that declared a
+    // renderer-mapped region and an ordinary one at the same time is asking
+    // for two windows in one BAR, and there is no sensible half-answer.
+    let host_mapped = regions.iter().any(|r| r.host_mapped);
+    if host_mapped && !regions.iter().all(|r| r.host_mapped) {
+        tracing::error!(
+            slot,
+            "a device may not mix renderer-mapped and device-backed shared-memory regions"
+        );
+        return None;
+    }
+    let pages = match (support.allocate)(bar_size, host_mapped) {
         Ok(pages) => pages,
         Err(error) => {
             tracing::error!(slot, bar_size, %error, "cannot allocate the shared-memory window");
@@ -474,6 +491,49 @@ impl ShmBacking for ShmBackingHandle {
         self.len
     }
 
+    fn host_mapped(&self) -> bool {
+        self.window.is_host_mapped()
+    }
+
+    unsafe fn map_host(
+        &self,
+        offset: u64,
+        host_addr: u64,
+        len: u64,
+    ) -> Result<(), virtio_core::ShmMapError> {
+        if !self.window.is_host_mapped() {
+            return Err(virtio_core::ShmMapError::Unsupported);
+        }
+        let at = self
+            .at(offset, len)
+            .map_err(|e| virtio_core::ShmMapError::Refused(e.to_string()))?;
+        // SAFETY: the caller's obligation — `host_addr`..+`len` is live host
+        // memory that stays mapped until `unmap_host` — is exactly the one
+        // `HostRange::new` asks for, and it is passed straight through to the
+        // hypervisor seam. Nothing here dereferences the address.
+        let range = unsafe { vmm_core::HostRange::new(host_addr, len) };
+        self.window
+            .map_host_range(at, range)
+            .map_err(|e| virtio_core::ShmMapError::Refused(e.to_string()))
+    }
+
+    fn unmap_host(&self, offset: u64) {
+        // `self.at(offset, 0)` is *not* the right check, and the `venus_window`
+        // fuzzer found out why on its second minute: a zero-length span is
+        // "inside" the region at `offset == len` too, which is the *next*
+        // region's offset 0 — so region 1 could unmap region 2's mapping and
+        // leave the guest reading host memory the renderer had freed. An
+        // unmap names a byte, so the byte has to be one of ours.
+        if offset >= self.len {
+            return;
+        }
+        // An offset outside the region never named a mapping of ours, so
+        // there is nothing to take down and nothing to report.
+        if let Ok(at) = self.at(offset, 1) {
+            self.window.unmap_host_range(at);
+        }
+    }
+
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), ShmAccessError> {
         let at = self.at(offset, buf.len() as u64)?;
         self.window.read(at, buf).map_err(convert)
@@ -494,15 +554,25 @@ impl ShmBacking for ShmBackingHandle {
 /// `vmm-core` (the dependency points the other way), so the same refusal is
 /// spelled once in each and translated here.
 fn convert(error: vmm_core::shm::ShmAccessError) -> ShmAccessError {
-    let vmm_core::shm::ShmAccessError::OutOfBounds {
-        offset,
-        len,
-        window,
-    } = error;
-    ShmAccessError {
-        offset,
-        len,
-        window,
+    match error {
+        vmm_core::shm::ShmAccessError::OutOfBounds {
+            offset,
+            len,
+            window,
+        } => ShmAccessError {
+            offset,
+            len,
+            window,
+        },
+        // A device touching a renderer-mapped window's own pages is a wiring
+        // bug, not a bounds error, and there is no field in the portable type
+        // to say so — `window: 0` is the closest honest answer and the log
+        // above it names the real reason.
+        vmm_core::shm::ShmAccessError::HostMapped { offset, len } => ShmAccessError {
+            offset,
+            len,
+            window: 0,
+        },
     }
 }
 
@@ -533,6 +603,7 @@ mod tests {
         let (size, placements) = plan(&[ShmRegion {
             id: 1,
             len: 3 << 20,
+            host_mapped: false,
         }])
         .unwrap();
         assert_eq!(size, 4 << 20, "a BAR size must be a power of two");
@@ -544,17 +615,26 @@ mod tests {
     #[test]
     fn a_plan_refuses_what_no_bar_could_carry() {
         assert_eq!(
-            plan(&[ShmRegion { id: 1, len: 0 }]),
+            plan(&[ShmRegion {
+                id: 1,
+                len: 0,
+                host_mapped: false
+            }]),
             Err(ShmLayoutError::ZeroLength)
         );
         assert!(matches!(
-            plan(&[ShmRegion { id: 1, len: 4095 }]),
+            plan(&[ShmRegion {
+                id: 1,
+                len: 4095,
+                host_mapped: false
+            }]),
             Err(ShmLayoutError::Unaligned { .. })
         ));
         assert!(matches!(
             plan(&[ShmRegion {
                 id: 1,
-                len: layout::MAX_SHM_BAR_BYTES + 4096
+                len: layout::MAX_SHM_BAR_BYTES + 4096,
+                host_mapped: false,
             }]),
             Err(ShmLayoutError::TooLarge { .. })
         ));
@@ -563,9 +643,14 @@ mod tests {
             plan(&[
                 ShmRegion {
                     id: 1,
-                    len: layout::MAX_SHM_BAR_BYTES
+                    len: layout::MAX_SHM_BAR_BYTES,
+                    host_mapped: false,
                 },
-                ShmRegion { id: 2, len: 4096 },
+                ShmRegion {
+                    id: 2,
+                    len: 4096,
+                    host_mapped: false
+                },
             ]),
             Err(ShmLayoutError::TooLarge { .. })
         ));
@@ -577,7 +662,8 @@ mod tests {
         assert!(matches!(
             plan(&[ShmRegion {
                 id: 1,
-                len: (1u64 << 63) + 4096
+                len: (1u64 << 63) + 4096,
+                host_mapped: false,
             }]),
             Err(ShmLayoutError::TooLarge { .. })
         ));
@@ -587,15 +673,18 @@ mod tests {
             plan(&[
                 ShmRegion {
                     id: 1,
-                    len: 1 << 62
+                    len: 1 << 62,
+                    host_mapped: false,
                 },
                 ShmRegion {
                     id: 2,
-                    len: 1 << 62
+                    len: 1 << 62,
+                    host_mapped: false,
                 },
                 ShmRegion {
                     id: 3,
-                    len: 1 << 62
+                    len: 1 << 62,
+                    host_mapped: false,
                 },
             ]),
             Err(ShmLayoutError::TooLarge { .. })
@@ -607,6 +696,7 @@ mod tests {
         let regions = [ShmRegion {
             id: 1,
             len: 256 * MIB,
+            host_mapped: false,
         }];
         let w = window(256 * MIB, &regions);
         assert_eq!(
@@ -637,7 +727,11 @@ mod tests {
     /// LAPIC, or past the aperture must leave the window unmapped.
     #[test]
     fn a_bar_outside_the_aperture_is_never_mapped() {
-        let regions = [ShmRegion { id: 1, len: 4096 }];
+        let regions = [ShmRegion {
+            id: 1,
+            len: 4096,
+            host_mapped: false,
+        }];
         let w = window(4096, &regions);
         let aperture = layout::pci_mmio64_base(GUEST);
 
@@ -672,7 +766,11 @@ mod tests {
     /// The last byte of the aperture is usable; one byte more is not.
     #[test]
     fn the_aperture_bound_is_inclusive_at_the_top() {
-        let regions = [ShmRegion { id: 1, len: 4096 }];
+        let regions = [ShmRegion {
+            id: 1,
+            len: 4096,
+            host_mapped: false,
+        }];
         let w = window(4096, &regions);
         let last = layout::pci_mmio64_end(GUEST) - 4096;
         assert!(w.follow(Some(last)));
@@ -681,7 +779,11 @@ mod tests {
 
     #[test]
     fn the_device_backing_is_bounded_by_the_window() {
-        let regions = [ShmRegion { id: 1, len: 8192 }];
+        let regions = [ShmRegion {
+            id: 1,
+            len: 8192,
+            host_mapped: false,
+        }];
         let w = window(8192, &regions);
         let backing = w.backing_for(1).expect("region 1");
         assert!(w.backing_for(2).is_none(), "no such region");
@@ -704,8 +806,16 @@ mod tests {
     #[test]
     fn a_region_backing_cannot_reach_another_region() {
         let regions = [
-            ShmRegion { id: 1, len: 8192 },
-            ShmRegion { id: 2, len: 4096 },
+            ShmRegion {
+                id: 1,
+                len: 8192,
+                host_mapped: false,
+            },
+            ShmRegion {
+                id: 2,
+                len: 4096,
+                host_mapped: false,
+            },
         ];
         let w = window(16384, &regions);
         let first = w.backing_for(1).expect("region 1");
@@ -728,6 +838,154 @@ mod tests {
         assert!(second.read(4096, &mut probe).is_err());
         assert!(second.fill(4090, 16, 0).is_err());
         assert!(second.write(u64::MAX, b"x").is_err(), "no wrap");
+    }
+
+    /// A mapper that remembers where it was asked to put host memory, so a
+    /// test can check the *guest* address a renderer range lands at rather
+    /// than only that a call happened.
+    #[derive(Default)]
+    struct RecordingMapper {
+        live: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, u64)>>,
+    }
+
+    impl vmm_core::shm::GpaMapper for RecordingMapper {
+        fn map_range(
+            &self,
+            gpa: u64,
+            range: vmm_core::shm::HostRange,
+        ) -> Result<(), vmm_core::hv::HvError> {
+            self.live
+                .lock()
+                .expect("mapper")
+                .insert(gpa, (range.addr(), range.len()));
+            Ok(())
+        }
+        fn unmap_range(&self, gpa: u64, _len: u64) -> Result<(), vmm_core::hv::HvError> {
+            self.live.lock().expect("mapper").remove(&gpa);
+            Ok(())
+        }
+        fn backend(&self) -> &'static str {
+            "recording"
+        }
+    }
+
+    /// The Venus mode end to end at this layer (VEN-2003): the window's own
+    /// pages never reach the guest, the renderer's do, and each region's
+    /// offsets are its own.
+    #[test]
+    fn a_renderer_mapped_window_places_renderer_pages_at_the_regions_offset() {
+        let regions = [
+            ShmRegion {
+                id: 1,
+                len: 8192,
+                host_mapped: true,
+            },
+            ShmRegion {
+                id: 2,
+                len: 4096,
+                host_mapped: true,
+            },
+        ];
+        let (bar_size, placements) = plan(&regions).expect("plan");
+        let mapper = Arc::new(RecordingMapper::default());
+        let shared = Arc::new(
+            vmm_core::shm::SharedWindow::new_host_mapped(bar_size, mapper.clone())
+                .expect("host-mapped window"),
+        );
+        let base = layout::Mmio64Allocator::for_guest(GUEST)
+            .allocate(bar_size)
+            .expect("aperture");
+        let w = ShmWindow::new(shared, bar_size, placements, base, GUEST).expect("window");
+
+        let first = w.backing_for(1).expect("region 1");
+        let second = w.backing_for(2).expect("region 2");
+        assert!(first.host_mapped() && second.host_mapped());
+        // The device must not be able to write bytes it thinks a guest reads.
+        assert!(first.write(0, b"x").is_err());
+        assert!(first.fill(0, 4096, 0).is_err());
+        let mut buf = [0u8; 4];
+        assert!(first.read(0, &mut buf).is_err());
+
+        // Enabling the BAR maps nothing at all: there is no renderer memory in
+        // the window yet, and the window's own pages are not the guest's.
+        assert!(w.follow(Some(base)));
+        assert!(mapper.live.lock().expect("mapper").is_empty());
+
+        // Two pages of stand-in "renderer" memory.
+        let pages = vmm_core::shm::HostShmRegion::new(8192).expect("renderer pages");
+        let addr = pages.range().addr();
+        // SAFETY: `pages` is alive for the whole test and is exactly 8192
+        // bytes; both sub-ranges below lie inside it.
+        let first_page = unsafe { vmm_core::shm::HostRange::new(addr, 4096) };
+        // SAFETY: as above, the second page of the same live allocation.
+        let second_page = unsafe { vmm_core::shm::HostRange::new(addr + 4096, 4096) };
+
+        // SAFETY: both ranges are inside `pages`, which outlives every mapping
+        // made here (they are all torn down before it drops).
+        unsafe {
+            first
+                .map_host(4096, first_page.addr(), 4096)
+                .expect("inside region 1");
+            second
+                .map_host(0, second_page.addr(), 4096)
+                .expect("inside region 2");
+            // Region 2 is 4096 long; its offset 4096 is region 1's business.
+            assert!(second.map_host(4096, first_page.addr(), 4096).is_err());
+            assert!(second.map_host(u64::MAX, first_page.addr(), 4096).is_err());
+        }
+
+        // Region 1 sits at BAR offset 0 and region 2 at 8192, so the two
+        // guest addresses are base+4096 and base+8192 — the region-relative
+        // offset translated once, and never mixed up.
+        let live = mapper.live.lock().expect("mapper").clone();
+        assert_eq!(live.len(), 2);
+        assert_eq!(live.get(&(base + 4096)), Some(&(first_page.addr(), 4096)));
+        assert_eq!(live.get(&(base + 8192)), Some(&(second_page.addr(), 4096)));
+
+        // A firmware reassignment moves both.
+        let moved = base + 64 * MIB;
+        assert!(w.follow(Some(moved)));
+        let live = mapper.live.lock().expect("mapper").clone();
+        assert_eq!(live.len(), 2);
+        assert!(live.contains_key(&(moved + 4096)) && live.contains_key(&(moved + 8192)));
+
+        // One region must not be able to unmap another's span. Region 1 is
+        // 8192 bytes long, so its offset 8192 is region 2's offset 0 in
+        // window terms — and a zero-length bounds check calls that "inside".
+        // The `venus_window` fuzzer found exactly this; the consequence is a
+        // guest still reading host memory the renderer is about to free.
+        first.unmap_host(8192);
+        first.unmap_host(u64::MAX);
+        assert_eq!(
+            mapper.live.lock().expect("mapper").len(),
+            2,
+            "region 1 reached past its own end and took region 2's mapping down"
+        );
+
+        first.unmap_host(4096);
+        second.unmap_host(0);
+        assert!(mapper.live.lock().expect("mapper").is_empty());
+    }
+
+    /// A device-backed window has nowhere to put renderer memory, and says so
+    /// rather than mapping it somewhere plausible.
+    #[test]
+    fn a_device_backed_window_refuses_renderer_memory() {
+        let regions = [ShmRegion {
+            id: 1,
+            len: 4096,
+            host_mapped: false,
+        }];
+        let w = window(4096, &regions);
+        let backing = w.backing_for(1).expect("region 1");
+        assert!(!backing.host_mapped());
+        // SAFETY: the call is refused on the mode before the address is used;
+        // the value never reaches a hypervisor.
+        let refused = unsafe { backing.map_host(0, 0x1000, 4096) };
+        assert!(matches!(
+            refused,
+            Err(virtio_core::ShmMapError::Unsupported)
+        ));
     }
 
     #[test]

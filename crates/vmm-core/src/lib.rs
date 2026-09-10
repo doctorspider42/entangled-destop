@@ -42,8 +42,8 @@ pub use lifecycle::{
 };
 pub use memory::{create_guest_memory, GuestMem, HIGH_RAM_START, LOW_RAM_END};
 pub use shm::{
-    GpaMapper, HostShmRegion, SharedWindow, ShmAccessError, UnmappedGpaMapper,
-    MAX_SHM_WINDOW_BYTES, SHM_PAGE_SIZE,
+    GpaMapper, HostRange, HostShmRegion, SharedWindow, ShmAccessError, UnmappedGpaMapper,
+    MAX_HOST_RANGES, MAX_SHM_WINDOW_BYTES, SHM_PAGE_SIZE,
 };
 pub use state::{VmState, VmStateError};
 

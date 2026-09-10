@@ -131,6 +131,19 @@ pub struct ShmRegion {
     pub id: u8,
     /// Length of the window in bytes. Never zero for a region that exists.
     pub len: u64,
+    /// Whether the bytes inside this region come from somewhere the *device*
+    /// cannot write — a 3D renderer's own allocations, one host span per live
+    /// blob mapping (VEN-2003).
+    ///
+    /// The machine layer needs to know before it allocates: a window of its
+    /// own pages is one hypervisor mapping covering the whole region, and a
+    /// renderer-supplied one is a mapping per span at the offset the guest
+    /// named. The two cannot both be live, because they overlap and every
+    /// hypervisor refuses that — so this is a mode, not a hint.
+    ///
+    /// `false` is phase 1's window and the only thing any device but
+    /// virtio-gpu-with-Venus wants.
+    pub host_mapped: bool,
 }
 
 /// A host-side access to a shared-memory region that would have left it.
@@ -187,6 +200,66 @@ pub trait ShmBacking: Send + Sync {
     /// caller that matters — clearing a span before a guest may read it —
     /// would otherwise allocate a copy of the span to do it.
     fn fill(&self, offset: u64, len: u64, byte: u8) -> Result<(), ShmAccessError>;
+
+    /// Whether this window's bytes come from the device's renderer rather than
+    /// from pages the device can write ([`ShmRegion::host_mapped`]).
+    ///
+    /// A device must branch on this rather than discover it by getting an
+    /// error: on such a window [`read`](Self::read), [`write`](Self::write)
+    /// and [`fill`](Self::fill) all fail, because the pages they would touch
+    /// are not the ones a guest sees.
+    fn host_mapped(&self) -> bool {
+        false
+    }
+
+    /// Puts renderer-owned host memory at `offset` inside the window, so a
+    /// guest reading the window at that offset reads *those* bytes (VEN-2003).
+    ///
+    /// This is the one call in the device crates that carries a raw host
+    /// address, and it exists because the bytes behind a Venus blob mapping
+    /// are a `VkDeviceMemory` the host Vulkan driver owns:
+    /// `virgl_renderer_resource_map` hands back a pointer, and only the
+    /// machine layer can put a pointer in front of a guest.
+    ///
+    /// The default refuses, which is what every window that is not
+    /// [`host_mapped`](Self::host_mapped) must do.
+    ///
+    /// # Safety
+    ///
+    /// `host_addr` must be the base of `len` bytes of host memory that is
+    /// readable, writable and **stays mapped at that address** until the
+    /// matching [`unmap_host`](Self::unmap_host) has returned. The guest
+    /// reaches these pages with no exit and no host code in the path, so a
+    /// span that goes away underneath one is a use-after-free the hypervisor
+    /// commits on the caller's behalf.
+    unsafe fn map_host(&self, offset: u64, host_addr: u64, len: u64) -> Result<(), ShmMapError> {
+        let _ = (offset, host_addr, len);
+        Err(ShmMapError::Unsupported)
+    }
+
+    /// Takes the renderer memory at `offset` back out of the guest.
+    ///
+    /// Infallible on purpose: the guest has already stopped using the mapping
+    /// and the renderer is about to free the pages, so there is nothing left
+    /// to fail *into* — a hypervisor that refuses is a host bug to log.
+    fn unmap_host(&self, offset: u64) {
+        let _ = offset;
+    }
+}
+
+/// Why a renderer span could not be put into a shared-memory window
+/// (VEN-2003).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ShmMapError {
+    /// The window shows its own pages; there is nowhere for a renderer span to
+    /// go. Every backing but virtio-gpu's Venus window answers this.
+    #[error("this shared-memory window cannot host renderer memory")]
+    Unsupported,
+
+    /// The machine layer refused the span — out of the window, unaligned,
+    /// overlapping another mapping, or the hypervisor said no.
+    #[error("{0}")]
+    Refused(String),
 }
 
 /// A host-side wakeup a device may hold to ask for service from the

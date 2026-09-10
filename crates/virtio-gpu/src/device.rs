@@ -529,6 +529,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         Some(virtio_core::ShmRegion {
             id: VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
             len,
+            host_mapped: self.blob_support.host_mapped,
         })
     }
 
@@ -1247,7 +1248,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             {
                 Err(CommandError::UnsupportedCommand(kind))
             }
-            cmd::RESOURCE_CREATE_BLOB => self.resource_create_blob(mem, buf),
+            cmd::RESOURCE_CREATE_BLOB => self.resource_create_blob(mem, hdr, buf),
             cmd::SET_SCANOUT_BLOB => self.set_scanout_blob(buf),
             cmd::RESOURCE_MAP_BLOB => self.resource_map_blob(buf),
             cmd::RESOURCE_UNMAP_BLOB => self.resource_unmap_blob(buf),
@@ -1907,6 +1908,22 @@ impl<S: ScanoutSink> GpuDevice<S> {
         let owned_2d =
             self.resources.get(cmd.resource_id).is_some() || self.blobs.owns(cmd.resource_id);
         let gpu = self.three_d_mut(kind)?;
+        // A **detach** from a context that no longer exists is nothing, so it
+        // answers OK. Observed on every Venus boot of Ubuntu 26.04 (VEN-2003):
+        // the guest's DRM client destroys its context and then closes the GEM
+        // objects that were attached to it, in that order, and a device that
+        // refuses logs `*ERROR* response 0x1204 (command 0x203)` for something
+        // it was going to do nothing about either way. QEMU and crosvm accept
+        // it for the same reason. An **attach** still requires a live context:
+        // there the guest is asking for state to exist afterwards.
+        if !attach && !gpu.has_context(ctx_id) {
+            tracing::debug!(
+                ctx = ctx_id,
+                resource = cmd.resource_id,
+                "virtio-gpu ctx detach names a context that is already gone: nothing to do"
+            );
+            return Ok(Reply::ok());
+        }
         if owned_2d {
             if !gpu.has_context(ctx_id) {
                 return Err(CommandError::UnknownContext(ctx_id));
@@ -2001,6 +2018,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
     fn resource_create_blob(
         &mut self,
         mem: &Arc<GuestMem>,
+        hdr: &CtrlHdr,
         buf: &[u8],
     ) -> Result<Reply, CommandError> {
         let kind = cmd::RESOURCE_CREATE_BLOB;
@@ -2039,8 +2057,22 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // A guest-memory blob is bookkeeping only: the pages are the guest's,
         // and putting them in front of the host renderer would hand a C
         // library guest pointers for no reason at all.
+        //
+        // VEN-2003 checked whether Venus forces that open, and it does not:
+        // virglrenderer decodes Venus in its own render-server process, whose
+        // `proxy_context_attach_resource` refuses any resource it cannot
+        // receive as a file descriptor — which an iovec list over anonymous
+        // guest RAM never is. Mesa's venus driver knows that and puts its
+        // rings in `HOST3D` blobs instead. So the asymmetry stands, and it now
+        // stands on a measurement rather than on a preference.
+        //
+        // `ctx_id` is the header's: `virgl_renderer_resource_create_blob`
+        // resolves a host blob through the context that asked for it, and for
+        // Venus that context *is* the Vulkan connection the `blob_id` was
+        // minted on.
         if args.blob_mem != BLOB_MEM_GUEST {
-            self.three_d_mut(kind)?.create_blob(&args, mem, &entries)?;
+            self.three_d_mut(kind)?
+                .create_blob(hdr.ctx_id, &args, mem, &entries)?;
         }
         self.blobs.insert(&args, &entries, backing_len)?;
         tracing::debug!(

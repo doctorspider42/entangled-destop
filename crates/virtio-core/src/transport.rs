@@ -577,6 +577,7 @@ mod tests {
             shm: vec![ShmRegion {
                 id: 1,
                 len: 0x1_0000_0000,
+                host_mapped: false,
             }],
             ..Default::default()
         };
@@ -619,7 +620,11 @@ mod tests {
     #[test]
     fn a_reset_clears_the_shm_selector_but_not_the_placement() {
         let device = TestDevice {
-            shm: vec![ShmRegion { id: 0, len: 4096 }],
+            shm: vec![ShmRegion {
+                id: 0,
+                len: 4096,
+                host_mapped: false,
+            }],
             ..Default::default()
         };
         let (mut transport, _) = transport_with(device);
@@ -640,7 +645,11 @@ mod tests {
         let line = Arc::new(TestIrqLine::default());
         let mem = Arc::new(testing::guest_memory(0x2_0000));
         let device = TestDevice {
-            shm: vec![ShmRegion { id: 3, len: 0 }],
+            shm: vec![ShmRegion {
+                id: 3,
+                len: 0,
+                host_mapped: false,
+            }],
             ..Default::default()
         };
         assert!(matches!(

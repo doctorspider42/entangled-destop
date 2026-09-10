@@ -741,6 +741,7 @@ dependencies = [
  "arbitrary",
  "debian-media",
  "libfuzzer-sys",
+ "machine-x86",
  "virtio-block",
  "virtio-core",
  "virtio-gpu",
@@ -749,6 +750,7 @@ dependencies = [
  "virtio-sound",
  "vm-memory 0.17.2",
  "vm-snapshot",
+ "vmm-core",
 ]
 
 [[package]]

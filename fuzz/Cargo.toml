@@ -37,6 +37,10 @@ virtio-sound = { path = "../crates/virtio-sound" }
 virtio-net = { path = "../crates/virtio-net", features = ["fuzzing"] }
 debian-media = { path = "../crates/debian-media" }
 vm-snapshot = { path = "../crates/vm-snapshot" }
+# The Venus window fuzzer drives the real machine-layer window and the real
+# hypervisor seam, with a recording `GpaMapper` in place of KVM/WHP.
+machine-x86 = { path = "../crates/machine-x86" }
+vmm-core = { path = "../crates/vmm-core" }
 
 [[bin]]
 name = "chain_walk"
@@ -90,6 +94,13 @@ bench = false
 [[bin]]
 name = "gpu_blob"
 path = "fuzz_targets/gpu_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "venus_window"
+path = "fuzz_targets/venus_window.rs"
 test = false
 doc = false
 bench = false

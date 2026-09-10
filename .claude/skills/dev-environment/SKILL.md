@@ -200,6 +200,24 @@ times:
   fetch died on a digest mismatch and `release.yml` refused to build an
   installer at all. The digest in that file is of the PUBLISHED asset; write it
   only after the firmware workflow has published one.
+- **virglrenderer with Venus has to be built, once, per machine.** jammy ships
+  0.9.1, which has no Venus and no blob resources at all, so 3D stays classic
+  virgl against it. `bash guest/virglrenderer/build-virglrenderer.sh` (~2 min,
+  pinned virglrenderer 1.1.0 + Vulkan-Headers 1.3.269) installs into
+  `~/.cache/entangled-virglrenderer/<tag>/` — **shared machine state like the
+  ISOs, never delete it to free space** — and prints the
+  `ENTANGLED_VIRGL_LIB=<path>` line that points a VM or a test at it. Nothing
+  links against it; it is `dlopen`ed (ADR-0004). Needs `meson ninja-build
+  pkg-config libepoxy-dev libdrm-dev libgbm-dev libegl1-mesa-dev
+  libgles2-mesa-dev libvulkan-dev`, which are installed on this machine.
+  Two traps worth knowing before a 3D run:
+  - the host's **only Vulkan ICD is lavapipe** (Vulkan on the CPU), so a Venus
+    run here proves correctness and nothing about speed;
+  - the WSLg D3D12 GL stack still SIGSEGVs under sustained GNOME compositing
+    (ADR-0004's GPU-012 failure model), and it takes the *whole test* with it
+    when the renderer is in-process. `LIBGL_ALWAYS_SOFTWARE=1` moves the GL
+    half onto host llvmpipe and is what makes a multi-minute desktop run
+    finish. It does not affect the Venus half, which is lavapipe either way.
 - `scripts/fetch-test-kernel.sh` fetches the *Debian installer's* kernel for the
   boot tests (not our bootstrap kernel — the name has misled people);
   `scripts/fetch-ubuntu-iso.sh [desktop]` fetches + verifies ISOs into the

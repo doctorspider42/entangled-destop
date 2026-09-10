@@ -26,7 +26,7 @@
 //! A rule violation fails that one command in band (see
 //! [`crate::CommandError`]); nothing here panics on guest input.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use virtio_core::{GuestMem, HostWaker};
@@ -292,13 +292,21 @@ pub trait Renderer3d: Send {
     /// Every field of `args` has already been bounds-checked
     /// ([`crate::blob::BlobTable::validate`]); `entries` is empty for
     /// `HOST3D`.
+    ///
+    /// `ctx_id` is the header's context, and it is not decoration: a host
+    /// blob is *named* by `(ctx_id, blob_id)` — for Venus, the `blob_id` is a
+    /// `VkDeviceMemory` the guest allocated on that Vulkan connection, and
+    /// asking a different context for it finds nothing. It may be 0, which is
+    /// the kernel's own context and what a guest uses for a blob it allocates
+    /// outside any 3D context.
     fn create_blob(
         &mut self,
+        ctx_id: u32,
         args: &ResourceCreateBlob,
         mem: &Arc<GuestMem>,
         entries: &[MemEntry],
     ) -> Result<(), CommandError> {
-        let _ = (args, mem, entries);
+        let _ = (ctx_id, args, mem, entries);
         Err(CommandError::UnsupportedBlobMem(args.blob_mem))
     }
 
@@ -435,7 +443,13 @@ struct TrackedResource {
 /// here, never straight to the trait.
 pub struct Gpu3d {
     renderer: Box<dyn Renderer3d>,
-    contexts: HashSet<u32>,
+    /// Live contexts, and the capset id each was created with (VEN-2003).
+    ///
+    /// The capset is not bookkeeping: it decides how `SUBMIT_3D` on that
+    /// context is *validated*, because a virgl stream and a Venus stream have
+    /// nothing in common but the command that carries them. See
+    /// [`Gpu3d::submit`].
+    contexts: HashMap<u32, u32>,
     resources: HashMap<u32, TrackedResource>,
     total_elements: u64,
 }
@@ -454,7 +468,7 @@ impl Gpu3d {
     pub fn new(renderer: Box<dyn Renderer3d>) -> Self {
         Self {
             renderer,
-            contexts: HashSet::new(),
+            contexts: HashMap::new(),
             resources: HashMap::new(),
             total_elements: 0,
         }
@@ -504,7 +518,7 @@ impl Gpu3d {
         context_init: u32,
         name: &str,
     ) -> Result<(), CommandError> {
-        if ctx_id == 0 || self.contexts.contains(&ctx_id) {
+        if ctx_id == 0 || self.contexts.contains_key(&ctx_id) {
             return Err(CommandError::BadContextId(ctx_id));
         }
         if self.contexts.len() >= MAX_CONTEXTS {
@@ -526,7 +540,7 @@ impl Gpu3d {
             return Err(CommandError::UnsupportedContextType(context_init));
         }
         self.renderer.ctx_create(ctx_id, capset_id, name)?;
-        self.contexts.insert(ctx_id);
+        self.contexts.insert(ctx_id, capset_id);
         Ok(())
     }
 
@@ -559,11 +573,20 @@ impl Gpu3d {
     /// here — see [`Renderer3d::create_blob`].
     pub fn create_blob(
         &mut self,
+        ctx_id: u32,
         args: &ResourceCreateBlob,
         mem: &Arc<GuestMem>,
         entries: &[MemEntry],
     ) -> Result<(), CommandError> {
-        self.renderer.create_blob(args, mem, entries)
+        // A blob names a context the same way every other 3D command does, so
+        // it is checked the same way: ctx 0 is the kernel's and always valid,
+        // anything else must be a context this guest actually created. Without
+        // this a guest could make the host renderer look up an id it never
+        // opened.
+        if ctx_id != 0 && !self.contexts.contains_key(&ctx_id) {
+            return Err(CommandError::UnknownContext(ctx_id));
+        }
+        self.renderer.create_blob(ctx_id, args, mem, entries)
     }
 
     /// Drops a host-side blob.
@@ -588,7 +611,7 @@ impl Gpu3d {
 
     /// `CTX_DESTROY` (GPU-004).
     pub fn ctx_destroy(&mut self, ctx_id: u32) -> Result<(), CommandError> {
-        if !self.contexts.remove(&ctx_id) {
+        if self.contexts.remove(&ctx_id).is_none() {
             return Err(CommandError::UnknownContext(ctx_id));
         }
         self.renderer.ctx_destroy(ctx_id);
@@ -602,7 +625,7 @@ impl Gpu3d {
     /// (the kernel does it for its console framebuffer), and that command still
     /// has to be refused for a context that does not exist.
     pub fn has_context(&self, ctx_id: u32) -> bool {
-        self.contexts.contains(&ctx_id)
+        self.contexts.contains_key(&ctx_id)
     }
 
     /// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` (GPU-006) for the ids this
@@ -614,7 +637,7 @@ impl Gpu3d {
         resource_id: u32,
         attach: bool,
     ) -> Result<(), CommandError> {
-        if !self.contexts.contains(&ctx_id) {
+        if !self.contexts.contains_key(&ctx_id) {
             return Err(CommandError::UnknownContext(ctx_id));
         }
         if !self.resources.contains_key(&resource_id) {
@@ -737,7 +760,7 @@ impl Gpu3d {
     ) -> Result<(), CommandError> {
         // ctx 0 is the kernel's own context and always valid (dumb-buffer
         // uploads arrive on it before any GL client exists).
-        if ctx_id != 0 && !self.contexts.contains(&ctx_id) {
+        if ctx_id != 0 && !self.contexts.contains_key(&ctx_id) {
             return Err(CommandError::UnknownContext(ctx_id));
         }
         let tracked = self
@@ -767,14 +790,40 @@ impl Gpu3d {
     }
 
     /// `SUBMIT_3D` (GPU-007): bound, structurally validate, dispatch.
+    ///
+    /// **The structural validation is per context type** (VEN-2003).
+    /// [`validate_stream`] walks the *virgl* encoding — 32-bit headers whose
+    /// top half is a payload length — and that encoding is a property of the
+    /// classic virgl context, not of the command that carries it. A Venus
+    /// context's submit is a serialized Vulkan stream with an entirely
+    /// different shape, and running the virgl walk over it rejects perfectly
+    /// valid work: a guest whose venus driver could not set its ring up
+    /// `abort()`s, which is exactly what the first acceptance run produced
+    /// (`*ERROR* response 0x1205 (command 0x207)`, then a core dump).
+    ///
+    /// What every context type still gets is the part that is about *us*
+    /// rather than about the encoding: the size cap that bounds staging, and
+    /// dword alignment — `virgl_renderer_submit_cmd` takes a dword count, so a
+    /// length that is not a multiple of four cannot be passed on at all.
+    /// Beyond that a typed context's bytes are opaque to this device by
+    /// design; validating them would mean implementing Venus here, and the
+    /// component that does understand them decodes them in a process of its
+    /// own (ADR-0004's phase-3 amendment).
     pub fn submit(&mut self, ctx_id: u32, stream: &[u8]) -> Result<(), CommandError> {
-        if !self.contexts.contains(&ctx_id) {
-            return Err(CommandError::UnknownContext(ctx_id));
-        }
+        let capset = *self
+            .contexts
+            .get(&ctx_id)
+            .ok_or(CommandError::UnknownContext(ctx_id))?;
         if stream.len() > MAX_SUBMIT_BYTES {
             return Err(CommandError::StreamTooLarge(stream.len()));
         }
-        validate_stream(stream)?;
+        if capset == 0 || capset == crate::CAPSET_VIRGL || capset == crate::CAPSET_VIRGL2 {
+            validate_stream(stream)?;
+        } else if stream.len() % 4 != 0 {
+            return Err(CommandError::InvalidStream(
+                "a typed context's stream is not a whole number of dwords",
+            ));
+        }
         self.renderer.submit(ctx_id, stream)
     }
 
@@ -811,7 +860,7 @@ impl Gpu3d {
         ctx_id: u32,
         fence_id: u32,
     ) -> Result<FenceOutcome, CommandError> {
-        if ctx_id != 0 && !self.contexts.contains(&ctx_id) {
+        if ctx_id != 0 && !self.contexts.contains_key(&ctx_id) {
             return Err(CommandError::UnknownContext(ctx_id));
         }
         self.renderer.create_fence(ctx_id, fence_id)
@@ -911,6 +960,50 @@ mod tests {
         assert!(matches!(
             validate_stream(&evil),
             Err(CommandError::InvalidStream(_))
+        ));
+    }
+
+    /// VEN-2003: the virgl length walk belongs to the virgl *context type*,
+    /// not to `SUBMIT_3D`. Running it over a Venus stream refuses valid work,
+    /// which on a real guest is a venus driver that cannot build its ring and
+    /// `abort()`s — the first acceptance run's failure exactly.
+    #[test]
+    fn a_typed_contexts_stream_is_not_walked_as_a_virgl_one() {
+        let mut gpu = Gpu3d::new(Box::new(crate::NullRenderer::with_venus()));
+        gpu.ctx_create(1, 0, "virgl").expect("classic context");
+        gpu.ctx_create(2, crate::CAPSET_VENUS, "venus")
+            .expect("venus context");
+
+        // Four dwords that are nonsense as a virgl stream: the first header
+        // claims 0xffff payload dwords, so the walk runs off the end.
+        let venus_bytes: Vec<u8> = [0xffff_0001u32, 0, 0, 0]
+            .iter()
+            .flat_map(|dw| dw.to_le_bytes())
+            .collect();
+        assert!(
+            matches!(
+                gpu.submit(1, &venus_bytes),
+                Err(CommandError::InvalidStream(_))
+            ),
+            "a virgl context still gets the virgl walk"
+        );
+        gpu.submit(2, &venus_bytes)
+            .expect("a venus context's bytes are opaque to this device");
+
+        // What every context type still owes: dword alignment (the library
+        // takes a dword count) and the size cap.
+        assert!(matches!(
+            gpu.submit(2, &[0u8; 3]),
+            Err(CommandError::InvalidStream(_))
+        ));
+        assert!(matches!(
+            gpu.submit(2, &vec![0u8; MAX_SUBMIT_BYTES + 4]),
+            Err(CommandError::StreamTooLarge(_))
+        ));
+        // …and a context that does not exist is still refused, typed or not.
+        assert!(matches!(
+            gpu.submit(3, &venus_bytes),
+            Err(CommandError::UnknownContext(3))
         ));
     }
 

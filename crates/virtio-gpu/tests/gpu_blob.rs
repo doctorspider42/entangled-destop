@@ -405,7 +405,8 @@ impl Harness {
                 device.shm_regions(),
                 vec![virtio_core::ShmRegion {
                     id: virtio_gpu::VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
-                    len: WINDOW
+                    len: WINDOW,
+                    host_mapped: false,
                 }],
                 "the device must declare the region the machine is about to back"
             );
