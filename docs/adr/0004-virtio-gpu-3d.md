@@ -1211,3 +1211,361 @@ cost half the frame rate.
 * The phase-2 table is left in place above rather than rewritten: it is what
   was measured, and the interesting part of this amendment is *why* it read the
   way it did.
+
+## Amendment (2026-09-10): EPIC 20 phase 3 — Venus renders
+
+Phase 2 ended with one sentence: "What Venus still lacks is exactly one thing,
+and it is the same one as before: **a renderer**." This amendment is that
+renderer, what it cost, and — the part that matters more than the code — what
+this host can and cannot be used to claim about it.
+
+### The library, and why it had to be built
+
+`libvirglrenderer1` on jammy is **0.9.1**, which predates blob resources and
+Venus entirely. Every `dlopen`-time probe this project has added since EPIC 20
+phase 1 came back negative against it, correctly.
+
+`guest/virglrenderer/build-virglrenderer.sh` builds the library instead, the
+way `guest/firmware/build-cloudhv.sh` builds the firmware: pinned tag, pinned
+commit, verified after the clone, installed into
+`~/.cache/entangled-virglrenderer/<tag>/` (shared machine state, never inside a
+worktree). It is **not** linked — `ENTANGLED_VIRGL_LIB` names it and
+`VirglRenderer::load` `dlopen`s it, so `cargo build --workspace` stays
+header-free on both hosts and `cargo deny` still governs only the Cargo graph.
+
+- **virglrenderer `virglrenderer-1.1.0`**, commit
+  `1aeaf5e10a9c89096e96d09599aa419d5c50712f`, MIT.
+- `meson --buildtype release -Dvenus=true -Dplatforms=egl`.
+- **Vulkan-Headers `v1.3.269`**, commit
+  `374f9fd97520f6dd1b80745de09208d878ab4a52`, Apache-2.0, headers only.
+  Needed because the bundled `venus-protocol` headers are generated against
+  `VK_HEADER_VERSION 269` while jammy's `libvulkan-dev` is 1.3.204: the build
+  dies on `StdVideoH264LevelIdc`, which lives in the newer `vk_video/` headers.
+  The Vulkan *loader* stays the distribution's.
+- Runtime dependencies of the result, verified with `readelf -d`: `libm`,
+  `libepoxy.so.0` (MIT), `libdrm.so.2` (MIT), `libgbm.so.1` (Mesa, MIT),
+  `libvulkan.so.1` (Apache-2.0 loader), `libc`. All permissive.
+- The script asserts the four Venus entry points are exported rather than
+  trusting `-Dvenus=true`, because a library without them degrades to classic
+  virgl *silently*, which is the failure mode hardest to notice.
+
+### Three things the library taught us, all load-bearing
+
+**1. Venus in 1.1 exists only behind the render server.** `VIRGL_RENDERER_VENUS`
+alone does nothing: `virgl_renderer_init` only reaches `proxy_renderer_init`
+when `VIRGL_RENDERER_RENDER_SERVER` is also set, and every Venus entry point
+after that begins with `if (!state.proxy_initialized) return EINVAL` — the
+capset, `context_create_with_flags`, the blob allocation. The init flags are
+therefore `USE_EGL | USE_SURFACELESS | VENUS | RENDER_SERVER`, which brings up
+classic virgl in-process *and* a Venus decoder in a subprocess the library
+spawns (found at the path compiled into it, overridable with
+`RENDER_SERVER_EXEC_PATH`).
+
+That is a security property arriving for free, and it deserves saying out loud:
+**the untrusted Vulkan command stream is decoded in a process of its own
+regardless of `[display] virgl_isolation`.** GPU-012 containment covers the GL
+half; virglrenderer's own render server covers the Vulkan half.
+
+**2. The venus command ring is not a guest blob.** Phase 1's blob amendment
+guessed it would be, and built `BLOB_MEM_GUEST` around that guess. It is wrong,
+and the reason is the render server: `proxy_context_attach_resource` refuses any
+resource it cannot receive as a *file descriptor*, and an iovec list over
+anonymous guest RAM never is one. Mesa's venus driver knows this and allocates
+its rings and reply shmem as `HOST3D` + `MAPPABLE` blobs — the path this phase
+implements. So the phase-1 asymmetry (a guest-memory blob never reaches the
+renderer) survives untouched, and now rests on a measurement instead of a
+preference. The one code change it forced is smaller than the guess would have
+been: `Renderer3d::create_blob` grew a `ctx_id`, because
+`virgl_renderer_resource_create_blob` resolves a host blob *through the context
+that asked for it*, and for Venus that context is the Vulkan connection the
+`blob_id` was minted on.
+
+**3. `virgl_renderer_resource_map` hands back a plain host pointer**, page
+aligned in practice, together with a length and (through
+`virgl_renderer_resource_get_map_info`) a caching type — exactly the shape the
+phase-2 "next agent starts here" list predicted, and the reason
+`VIRGL_RENDERER_USE_EXTERNAL_BLOB` is **not** set. With external blobs a host
+blob comes back as an fd the VMM must `mmap` itself; without it the library does
+the `mmap` and the VMM gets an address it can hand straight to a hypervisor.
+Page alignment is still *checked*, not assumed: `vkMapMemory` promises only
+`minMemoryMapAlignment`, which the spec allows to be 64 bytes.
+
+### The window had to become a different object
+
+Phase 2 mapped the whole window as one hypervisor slot and let the device write
+into it (the loopback signature, and the `pci_shm.rs` proof). Venus wants the
+opposite: a host pointer per blob, at the offset the guest named. The two cannot
+both be live — they overlap, and KVM refuses an overlapping memory slot while
+WHP fails the `WHvMapGpaRange` — so this is a **mode**, not a layering:
+
+| | device-backed (phase 2) | renderer-mapped (Venus) |
+|---|---|---|
+| what the guest reads | pages the VMM allocated | `VkDeviceMemory` the host Vulkan driver allocated |
+| hypervisor objects | one, covering the BAR | one per live blob mapping |
+| before any blob is mapped | the whole window decodes | **nothing** decodes |
+| device host access (`read`/`write`/`fill`) | works | **refused** |
+| who clears a span before the guest sees it | the device (`reserve_mapping`) | nobody has to: the span *is* a fresh allocation |
+
+The mode is declared by the renderer (`BlobSupport::host_mapped`), carried by
+the device (`ShmRegion::host_mapped`) and honoured by the machine
+(`SharedWindow::new_host_mapped`). Refusing host reads and writes on such a
+window rather than silently doing nothing is the point of the middle rows: a
+device writing bytes no guest can see is a bug that looks like a working
+guarantee.
+
+**`GpaMapper` is addressed by range now, not by region.** One pair,
+`map_range`/`unmap_range`, taking a `HostRange` — a plain (address, length)
+whose only general constructor is `unsafe` and carries the whole contract:
+*these pages stay mapped, at this address, until the matching unmap returns*.
+`HostShmRegion` discharges it safely for a window's own pages; the renderer
+discharges it for a blob mapping, and every path that calls
+`virgl_renderer_resource_unmap` takes the guest mapping down **first**
+(`VirglRenderer::take_mapping_down`, which `unmap_blob`, `destroy_blob`,
+`reset` and `Drop` all go through). The reverse order is a guest reading a
+`VkDeviceMemory` the host has recycled.
+
+KVM needed the only real bookkeeping: a memory slot is identified by number, so
+`Vm::create_shm_window` reserves `1 + MAX_HOST_RANGES` of them per window and
+the mapper allocates out of that pool. `MAX_HOST_RANGES` (64) is therefore not a
+bookkeeping bound like the device's `MAX_HOST_VISIBLE_MAPPINGS` (4096) — it is
+the number of *hypervisor objects* a guest can make the host create, and past it
+a map fails in band. WHP addresses a range by its address and needed nothing; it
+gets the mode anyway, because it costs four lines and Windows will want it the
+day it has a renderer.
+
+One consequence for the isolated renderer (GPU-012), decided rather than
+discovered: `RemoteRenderer` now **withholds the window entirely** instead of
+advertising one it cannot fill. An `Arc` does not cross a pipe, and a host
+pointer in the helper's address space names nothing in the VMM's — so a guest
+running against an isolated renderer is told at `RESOURCE_CREATE_BLOB` time
+that there is no mappable memory here, rather than at map time when it has
+already built a Vulkan allocation around the promise.
+
+### What is fuzzed, and why it is a new target rather than a wider old one
+
+`gpu_blob` fuzzes a guest offset indexing *inside* a mapping. The new surface is
+a guest offset **becoming** a mapping, out of three guest-controlled values
+multiplied together (the BAR base, the region's offset in the BAR, and the
+offset inside the region). `fuzz/fuzz_targets/venus_window.rs` drives the real
+`machine_x86::shm::ShmWindow` with a recording `GpaMapper` and real host pages,
+and re-derives the invariants from **outside** — against what the hypervisor was
+actually told, never against the bookkeeping meant to maintain it:
+
+* every live range lies inside the window's current placement;
+* no two live ranges overlap (the mapper asserts it the way KVM would refuse
+  it);
+* nothing at all is mapped while the BAR decodes nothing, or decodes somewhere
+  the machine will not follow;
+* the count never passes `MAX_HOST_RANGES`;
+* a second region's offsets can never reach the first region's span;
+* dropping the window leaves the hypervisor holding nothing.
+
+**It paid for itself in two minutes.** `ShmBackingHandle::unmap_host` bounded
+its offset with `at(offset, 0)`, and a zero-length span is "inside" a region at
+`offset == len` too — which is the *next* region's offset 0. So region 1 could
+unmap region 2's mapping, and the guest would go on reading host memory the
+renderer was about to free. An unmap names a byte, so the byte has to be one of
+ours: the check is `offset < len` now, with a unit test beside the existing
+`a_region_backing_cannot_reach_another_region`. (The target's *first* finding
+was in the harness rather than the product — dropping the `ShmWindow` while the
+region backings still held `Arc`s on the window, so nothing was unmapped. Worth
+recording, because the ownership note in `machine_x86::shm` says exactly that
+and it was still got wrong.)
+
+Campaign on the tree as merged: **1 050 426 executions in 902 s** (1164
+exec/s, 1539-case corpus, peak RSS 528 MiB), no crash and no invariant
+violation; a 630 426-execution run immediately after the fix was equally clean.
+`gpu_blob` and `gpu_3d_commands` are unchanged and still cover what they
+covered.
+
+### Honesty about performance, and what was refused
+
+The only Vulkan ICD on this project's development host is **lavapipe** —
+`llvmpipe`, `PHYSICAL_DEVICE_TYPE_CPU`. A working Venus path here therefore
+proves *correctness*: that the protocol, the blob allocation, the window
+mapping and the guest's driver all agree. It proves nothing whatsoever about
+speed, and a frame number taken from it would be a number about llvmpipe
+running under a translation layer inside a VM.
+
+So **no figure was added beside the phase-2 or GAME-2105 frame tables**, and
+none should be until a host with a real Vulkan device runs this. That is not
+caution for its own sake: those tables already produced one wrong conclusion
+(the 1.9 ms readback that turned out to be a host-llvmpipe run), and the
+procedural lesson recorded there — *a performance figure has to record which
+renderer produced it* — applies twice over to a figure whose renderer is a CPU.
+
+What was measured instead is the part that is about this code rather than about
+the host GPU: `crates/virtio-gpu/tests/venus_host.rs` asserts the address
+`virgl_renderer_resource_map` returns is page aligned, at least as long as the
+blob, lands at the window offset the guest named, and is host memory the test
+can write and read back — and that a device reset takes it out of the window
+before the library frees it.
+
+### The guest evidence
+
+`tests/boot/tests/venus_vulkan.rs`, KVM, Ubuntu 26.04 Desktop live session,
+4 vCPUs, 4096 MiB, UEFI, the Venus-capable library above. The guest kernel,
+verbatim:
+
+```text
+[    0.818843] pci 0000:00:02.0: BAR 2 [mem 0x140000000-0x14fffffff 64bit pref]
+[    1.565292] [drm] Host memory window: 0x140000000 +0x10000000
+[    1.565816] [drm] features: +virgl +edid +resource_blob +host_visible
+[    1.565818] [drm] features: +context_init
+[    1.572425] [drm] number of cap sets: 3
+[    1.573205] [drm] cap set 0: id 1, max-version 1, max-size 308
+[    1.573940] [drm] cap set 1: id 2, max-version 2, max-size 1384
+[    1.574538] [drm] cap set 2: id 4, max-version 0, max-size 160
+```
+
+`+host_visible` is the line phase 2 could not produce: the kernel found the
+shared-memory region, claimed the 64-bit prefetchable BAR at the top of RAM,
+and is willing to map blobs into it. Cap set 2 is `VIRTIO_GPU_CAPSET_VENUS`.
+
+Then, typed into a `systemd.debug_shell` root shell once the desktop was up —
+a python-ctypes `vkCreateInstance` + `vkEnumeratePhysicalDevices` +
+`vkGetPhysicalDeviceProperties`, needing nothing on the ISO but
+`libvulkan.so.1`:
+
+```text
+VKPROBE_ICDS=asahi_icd.json gfxstream_vk_icd.json intel_hasvk_icd.json
+  intel_icd.json lvp_icd.json nouveau_icd.json radeon_icd.json virtio_icd.json
+VKPROBE_COUNT=2 rc=0
+VKPROBE_DEVICE=Virtio-GPU Venus (llvmpipe (LLVM 15.0.7, 256 bits))
+VKPROBE_DEVICE=llvmpipe (LLVM 21.1.8, 256 bits)
+```
+
+Two Vulkan devices, and the part that cannot be faked is the pair of LLVM
+versions. **15.0.7** is jammy's mesa 23.2.1 — the *host's* lavapipe, reached
+through Venus. **21.1.8** is Ubuntu 26.04's own, the guest's software fallback
+sitting next to it. A guest process enumerated the host's Vulkan stack over
+virtio-gpu, and the string `Virtio-GPU Venus (...)` is mesa's venus driver
+naming itself.
+
+The desktop reached `graphical.target` in 62 s on the same device, so the GL
+half is unaffected: one virtio-gpu serves classic virgl to mutter and Venus to
+Vulkan clients at the same time, which is the whole point of putting the capset
+beside the others rather than instead of them.
+
+**Two runs before this one failed, and both failures were real.**
+
+The first died with `SIGSEGV` after 90 seconds — WSLg's D3D12 mesa dereferencing
+a NULL gallium hook under sustained GNOME compositing, the exact GPU-012 failure
+model this ADR recorded in 2026-08-20, this time provoked by `gst-plugin-scan`
+probing video buffers. `LIBGL_ALWAYS_SOFTWARE=1` moves the *GL* half onto host
+llvmpipe and is what lets a multi-minute desktop run finish here; it does not
+touch the Venus half, which is lavapipe either way. That is now in the
+`dev-environment` skill, because every future 3D acceptance on this machine will
+need it.
+
+The second reached the probe and the guest said:
+
+```text
+[drm:virtio_gpu_dequeue_ctrl_func [virtio_gpu]] *ERROR* response 0x1205 (command 0x207)
+Aborted                    (core dumped) python3 -c 'import ctypes; ...'
+```
+
+`ERR_INVALID_PARAMETER` on `SUBMIT_3D`, then mesa's venus driver aborting
+because it could not build its ring — and the cause was ours.
+`renderer::validate_stream` walks the **virgl** encoding (32-bit headers whose
+top half is a payload dword count), and that encoding belongs to the classic
+virgl *context type*, not to the command that carries it. `Gpu3d` now remembers
+each context's capset and walks only a virgl one's stream. What every context
+type still owes is the part that is about this device rather than about the
+encoding: the size cap, and dword alignment, because
+`virgl_renderer_submit_cmd` takes a dword count and a length that is not a
+multiple of four cannot be passed on at all. Beyond that a typed context's
+bytes are opaque here by design — validating them would mean implementing Venus
+in the VMM, and the component that does understand them decodes them in a
+process of its own.
+
+Two smaller things the runs turned up, both now fixed:
+
+* **`CTX_DETACH_RESOURCE` from a destroyed context.** Once per boot, right
+  after `fb0`: the guest's DRM client destroys its context and *then* closes
+  the objects that were attached to it. Refusing that made the guest log
+  `*ERROR* response 0x1204 (command 0x203)` about an operation the device was
+  going to do nothing about; it answers OK now, as QEMU and crosvm do. An
+  attach still requires a live context.
+* **`ERR_UNSPEC` on ten `SUBMIT_3D`s** around the 100-second mark, from the
+  guest's gstreamer probing hardware video decode. Our library is built without
+  `-Dvideo=true`, so `CREATE_VIDEO_BUFFER` is rejected by virglrenderer and the
+  guest falls back. Left alone deliberately: a feature we do not offer being
+  refused in band is the system working.
+
+### Can the installer set this up for the user?
+
+Asked, and worth answering here because the answer is mostly yes and the
+constraints are specific.
+
+**Is the build redistributable as it stands?** Yes. virglrenderer is MIT and
+the four things the built `.so` needs at runtime are `libepoxy.so.0` (MIT),
+`libdrm.so.2` (MIT), `libgbm.so.1` (Mesa, MIT), `libvulkan.so.1` (the
+Khronos loader, Apache-2.0) and libc — all permissive, none copyleft, so the
+`cargo deny` rule that governs our Cargo graph is not even engaged and the
+attribution owed is a THIRD-PARTY-NOTICES entry. The `virgl_render_server`
+binary beside it is part of the same MIT project and has to ship too, because
+Venus does not work without it.
+
+**What it links against at runtime, and therefore the minimum distro.** The
+build on this machine is against jammy (Ubuntu 22.04): glibc 2.35, and the
+sonames above. A binary built there runs on 22.04 and newer, not on older —
+glibc is forward compatible only. The runtime packages a user needs are small:
+`libepoxy0`, `libdrm2`, `libgbm1`, `libvulkan1` and a Vulkan ICD
+(`mesa-vulkan-drivers` covers lavapipe and the open-source GPU drivers). Note
+what is *not* in that list: no `-dev` packages, no meson, no compiler. The
+build dependencies are a build-machine concern only.
+
+**The shape that fits this project.** Publish the `.so` plus
+`virgl_render_server` as a release asset (a `virglrenderer-<tag>-<distro>`
+tarball with its own `SHA256SUMS` and provenance, exactly like `CLOUDHV.fd`),
+pin the digest in a `guest/virglrenderer/pinned.toml` the binary
+`include_str!`s, and have the installer's existing optional WSL task place it
+beside the Linux engine and `apt install` the five runtime packages. `wsl -u
+root` needs no password, which is what makes the apt half possible at all —
+the same property that made the WSL engine task possible. `RENDER_SERVER_EXEC_PATH`
+is how the server is found once it is not at its build-time prefix, and
+`ENTANGLED_VIRGL_LIB` is how the engine finds the library; both already exist.
+
+Two caveats to state on that page rather than discover later. First, the user's
+WSL still has **no GPU Vulkan device** — WSLg exposes `/dev/dxg`, not a DRM
+node, so the ICD that gets used is lavapipe and Venus there is correctness, not
+speed. Second, a distro-shipped virglrenderer will eventually be new enough
+(Ubuntu 24.04 packages 1.0.0, 26.04 will be newer still), at which point the
+right answer is to stop shipping ours and let the runtime probe find theirs —
+which it already would, because `ENTANGLED_VIRGL_LIB` is only consulted when it
+is set.
+
+### Next agent starts here
+
+1. **A host with a real Vulkan device.** Everything above is correctness; none
+   of it is a performance claim, and this host cannot make one. A native Linux
+   box with a DRM node, or Windows against its own ICD, is where the number
+   that motivated EPIC 20 actually lives. Until then, do not put a Venus figure
+   beside the frame tables.
+2. **Windows.** WHP already has the window, the mode and the sub-range mapping;
+   what it lacks is a renderer. Two shapes, unchanged from the 2026-08-20
+   amendment: virglrenderer built for Windows on ANGLE (GL only, no Venus —
+   the render server is `fork`/`socketpair`), or a native Venus decoder. The
+   render-server dependency discovered here makes the first cheaper and the
+   second harder than the phase-1 note assumed, and that is worth re-costing
+   before anyone starts.
+3. **Zero-copy scanout (VEN-2005 / GPU phase 3)** is still where the frame rate
+   is — GAME-2105 measured the readback at 13 ms of a 20 ms frame — and it is
+   still blocked on a host with a DRM node. Unrelated to Venus, and unblocked
+   by nothing in this phase.
+4. **`SET_SCANOUT_BLOB` on a host blob** is still refused. With Venus that is
+   now a real gap rather than a theoretical one: a Vulkan application rendering
+   into a `VkImage` and presenting it wants exactly that path, and today it has
+   to round-trip through a guest-memory blob. It needs the same export the
+   zero-copy scanout needs, so it belongs with item 3.
+5. **The GUI capability gate** (`Backend::virgl_block`) still knows nothing
+   about any of this. Now that a host *can* serve Venus, the "3D: Venus /
+   VirGL / none" line the phase-1 list asked for has something to say — and it
+   should say which library it found and where, because on a machine with both
+   0.9.1 and a self-built 1.1.0 the difference is invisible otherwise.
+6. **`MAX_HOST_RANGES` is 64 and untested against a demanding guest.** A
+   Vulkan application with many host-visible `VkDeviceMemory` allocations will
+   find it. Raising it is a one-constant change (KVM's slot limit is far
+   higher), but the honest move is to measure a real application first and set
+   it from that rather than from a guess.
