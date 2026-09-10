@@ -109,7 +109,13 @@ fn chip() -> Arc<UserspaceIrqChip> {
 /// path so this file compiles and runs on Windows too.
 fn bus_with_window(regions: Vec<virtio_core::ShmRegion>) -> VirtioPciBus {
     let chip = chip();
-    let allocate = |len: u64| SharedWindow::new(len, Arc::new(UnmappedGpaMapper)).map(Arc::new);
+    let allocate = |len: u64, host_mapped: bool| {
+        if host_mapped {
+            SharedWindow::new_host_mapped(len, Arc::new(UnmappedGpaMapper)).map(Arc::new)
+        } else {
+            SharedWindow::new(len, Arc::new(UnmappedGpaMapper)).map(Arc::new)
+        }
+    };
     let devices: Vec<Box<dyn virtio_core::VirtioDevice>> =
         vec![Box::new(WindowedDevice::new(regions))];
     VirtioPciBus::attach_userspace_with_shm(
@@ -131,7 +137,11 @@ fn bus_without_support() -> VirtioPciBus {
     let chip = chip();
     let devices: Vec<Box<dyn virtio_core::VirtioDevice>> =
         vec![Box::new(WindowedDevice::new(vec![
-            virtio_core::ShmRegion { id: 1, len: WINDOW },
+            virtio_core::ShmRegion {
+                id: 1,
+                len: WINDOW,
+                host_mapped: false,
+            },
         ]))];
     VirtioPciBus::attach_userspace(memory(), devices, chip.as_ref(), PciInterruptMode::IntxOnly)
         .expect("bus")
@@ -210,7 +220,11 @@ fn shm_capabilities(bus: &VirtioPciBus, device: u8) -> Vec<Vec<u8>> {
 /// restored in the low register.
 #[test]
 fn the_sizing_protocol_reports_the_window_on_a_64_bit_pair() {
-    let bus = bus_with_window(vec![virtio_core::ShmRegion { id: 1, len: WINDOW }]);
+    let bus = bus_with_window(vec![virtio_core::ShmRegion {
+        id: 1,
+        len: WINDOW,
+        host_mapped: false,
+    }]);
     let low = pci::reg::BAR0 + 2 * 4;
     let base = read_dword(&bus, 1, low);
     let base_high = read_dword(&bus, 1, low + 4);
@@ -250,8 +264,16 @@ fn the_sizing_protocol_reports_the_window_on_a_64_bit_pair() {
 #[test]
 fn the_shared_memory_capability_names_bar_2_and_the_region() {
     let bus = bus_with_window(vec![
-        virtio_core::ShmRegion { id: 1, len: WINDOW },
-        virtio_core::ShmRegion { id: 7, len: 8192 },
+        virtio_core::ShmRegion {
+            id: 1,
+            len: WINDOW,
+            host_mapped: false,
+        },
+        virtio_core::ShmRegion {
+            id: 7,
+            len: 8192,
+            host_mapped: false,
+        },
     ]);
     let records = shm_capabilities(&bus, 1);
     assert_eq!(records.len(), 2, "one capability per declared region");
@@ -300,7 +322,11 @@ fn a_machine_that_cannot_back_a_window_publishes_nothing() {
 /// mapping has to be where the guest has just put it.
 #[test]
 fn the_window_follows_a_firmware_bar_reassignment() {
-    let bus = bus_with_window(vec![virtio_core::ShmRegion { id: 1, len: WINDOW }]);
+    let bus = bus_with_window(vec![virtio_core::ShmRegion {
+        id: 1,
+        len: WINDOW,
+        host_mapped: false,
+    }]);
     let window = bus.shm_window(0).expect("backed").clone();
     let aperture = machine_x86::layout::pci_mmio64_base(GUEST_BYTES);
 
@@ -348,7 +374,11 @@ fn the_window_follows_a_firmware_bar_reassignment() {
 /// underneath.
 #[test]
 fn a_window_the_guest_moves_out_of_the_aperture_is_unmapped() {
-    let bus = bus_with_window(vec![virtio_core::ShmRegion { id: 1, len: WINDOW }]);
+    let bus = bus_with_window(vec![virtio_core::ShmRegion {
+        id: 1,
+        len: WINDOW,
+        host_mapped: false,
+    }]);
     let window = bus.shm_window(0).expect("backed").clone();
     let aperture = machine_x86::layout::pci_mmio64_base(GUEST_BYTES);
     place_bar(&bus, 1, aperture);
@@ -387,7 +417,11 @@ fn a_window_the_guest_moves_out_of_the_aperture_is_unmapped() {
 /// same memory the window maps.
 #[test]
 fn the_device_and_the_window_share_the_same_pages() {
-    let bus = bus_with_window(vec![virtio_core::ShmRegion { id: 1, len: WINDOW }]);
+    let bus = bus_with_window(vec![virtio_core::ShmRegion {
+        id: 1,
+        len: WINDOW,
+        host_mapped: false,
+    }]);
     let window = bus.shm_window(0).expect("backed");
     let backing = window.backing_for(1).expect("region 1");
     assert_eq!(backing.len(), WINDOW);
@@ -421,7 +455,11 @@ fn the_device_and_the_window_share_the_same_pages() {
 /// the only honest answer, and `virtio_core::StateError::ShmBase` is it.
 #[test]
 fn a_snapshot_records_the_window_and_a_moved_one_is_refused() {
-    let bus = bus_with_window(vec![virtio_core::ShmRegion { id: 1, len: WINDOW }]);
+    let bus = bus_with_window(vec![virtio_core::ShmRegion {
+        id: 1,
+        len: WINDOW,
+        host_mapped: false,
+    }]);
     let window = bus.shm_window(0).expect("backed").clone();
     let aperture = machine_x86::layout::pci_mmio64_base(GUEST_BYTES);
     place_bar(&bus, 1, aperture);
@@ -439,7 +477,11 @@ fn a_snapshot_records_the_window_and_a_moved_one_is_refused() {
 
     // Restoring onto the machine that produced it puts the window back at the
     // same address and the transport accepts it.
-    let same = bus_with_window(vec![virtio_core::ShmRegion { id: 1, len: WINDOW }]);
+    let same = bus_with_window(vec![virtio_core::ShmRegion {
+        id: 1,
+        len: WINDOW,
+        host_mapped: false,
+    }]);
     same.load_state(&config, &saved)
         .expect("same machine, same window");
     assert_eq!(
@@ -454,7 +496,11 @@ fn a_snapshot_records_the_window_and_a_moved_one_is_refused() {
     // whole second machine here would test less, not more.
     let mut moved = saved.clone();
     moved[0].state.shm_bases = vec![(1, aperture + 0x4000_0000)];
-    let elsewhere = bus_with_window(vec![virtio_core::ShmRegion { id: 1, len: WINDOW }]);
+    let elsewhere = bus_with_window(vec![virtio_core::ShmRegion {
+        id: 1,
+        len: WINDOW,
+        host_mapped: false,
+    }]);
     let error = elsewhere
         .load_state(&config, &moved)
         .expect_err("a window that moved must be refused");
@@ -470,7 +516,11 @@ fn a_snapshot_records_the_window_and_a_moved_one_is_refused() {
 /// was not using.
 #[test]
 fn an_unmapped_window_records_no_placement() {
-    let bus = bus_with_window(vec![virtio_core::ShmRegion { id: 1, len: WINDOW }]);
+    let bus = bus_with_window(vec![virtio_core::ShmRegion {
+        id: 1,
+        len: WINDOW,
+        host_mapped: false,
+    }]);
     let aperture = machine_x86::layout::pci_mmio64_base(GUEST_BYTES);
     place_bar(&bus, 1, aperture);
     assert_eq!(bus.save_state()[0].state.shm_bases, vec![(1, aperture)]);
@@ -498,12 +548,12 @@ struct ExclusiveMapper {
 }
 
 impl vmm_core::shm::GpaMapper for ExclusiveMapper {
-    fn map(
+    fn map_range(
         &self,
         gpa: u64,
-        region: &vmm_core::shm::HostShmRegion,
+        range: vmm_core::shm::HostRange,
     ) -> Result<(), vmm_core::hv::HvError> {
-        let len = region.len();
+        let len = range.len();
         let mut live = self.live.lock().expect("mapper lock");
         if live.iter().any(|&(at, l)| gpa < at + l && at < gpa + len) {
             return Err(vmm_core::hv::HvError::Registers(format!(
@@ -514,7 +564,7 @@ impl vmm_core::shm::GpaMapper for ExclusiveMapper {
         Ok(())
     }
 
-    fn unmap(&self, gpa: u64, len: u64) -> Result<(), vmm_core::hv::HvError> {
+    fn unmap_range(&self, gpa: u64, len: u64) -> Result<(), vmm_core::hv::HvError> {
         self.live
             .lock()
             .expect("mapper lock")
@@ -531,15 +581,18 @@ impl vmm_core::shm::GpaMapper for ExclusiveMapper {
 fn bus_with_two_windows() -> VirtioPciBus {
     let chip = chip();
     let mapper: Arc<dyn vmm_core::shm::GpaMapper> = Arc::new(ExclusiveMapper::default());
-    let allocate = |len: u64| SharedWindow::new(len, Arc::clone(&mapper)).map(Arc::new);
+    let allocate =
+        |len: u64, _host_mapped: bool| SharedWindow::new(len, Arc::clone(&mapper)).map(Arc::new);
     let devices: Vec<Box<dyn virtio_core::VirtioDevice>> = vec![
         Box::new(WindowedDevice::new(vec![virtio_core::ShmRegion {
             id: 1,
             len: WINDOW,
+            host_mapped: false,
         }])),
         Box::new(WindowedDevice::new(vec![virtio_core::ShmRegion {
             id: 1,
             len: WINDOW,
+            host_mapped: false,
         }])),
     ];
     VirtioPciBus::attach_userspace_with_shm(

@@ -163,12 +163,12 @@ fn virglrenderer_round_trips_pixels_through_host_gl() {
 /// libvirglrenderer actually offers for Venus.
 ///
 /// Not an assertion about *which* answer is right — jammy's 0.9.1 has no Venus
-/// and a self-built 1.x does — but about the two answers being **consistent**:
-/// the venus capset is advertised if and only if the renderer will accept a
-/// venus-typed context and a blob, and never with a host-visible window
-/// (nothing backs one yet). Folded into the round-trip test rather than
-/// standing alone because the library is a process singleton, so two tests
-/// that both `load()` would race for it and one would always skip.
+/// and a self-built 1.x does — but about the answers being **consistent**: the
+/// venus capset is advertised if and only if the renderer will accept a
+/// venus-typed context and a blob, and if and only if it asks for a
+/// host-visible window it will host-map. Folded into the round-trip test
+/// rather than standing alone because the library is a process singleton, so
+/// two tests that both `load()` would race for it and one would always skip.
 fn assert_venus_probe_is_self_consistent(renderer: &VirglRenderer) {
     let capsets: Vec<_> = virtio_gpu::Renderer3d::capsets(renderer).to_vec();
     let blob = virtio_gpu::Renderer3d::blob_support(renderer);
@@ -183,12 +183,29 @@ fn assert_venus_probe_is_self_consistent(renderer: &VirglRenderer) {
         blob.any(),
         "the venus capset and blob support come from the same set of symbols;          advertising one without the other hands the guest a device it cannot use"
     );
-    assert!(
-        blob.host_visible_bytes.is_none(),
-        "no host has a shared-memory window backed yet (VEN-2001's machine-layer half)"
+    // The window and the mode travel together, in both directions. A window
+    // without `host_mapped` would be a device that writes pages the guest
+    // reads through Vulkan; `host_mapped` without a window would be a mode
+    // with nothing to apply it to.
+    assert_eq!(
+        blob.host_visible_bytes.is_some(),
+        blob.host_mapped,
+        "a Venus renderer maps its own pages into the window it asked for"
+    );
+    assert_eq!(
+        blob.host_visible_bytes.is_some(),
+        venus.is_some(),
+        "only a Venus renderer has host memory to put in a window"
     );
     match venus {
-        Some(info) => assert!(info.max_size > 0, "an advertised capset must have a blob"),
+        Some(info) => {
+            assert!(info.max_size > 0, "an advertised capset must have a blob");
+            eprintln!(
+                "VEN-2003: this host serves Venus (capset {} bytes, {} MiB window)",
+                info.max_size,
+                blob.host_visible_bytes.unwrap_or(0) >> 20
+            );
+        }
         None => eprintln!(
             "VEN-2003: this host's virglrenderer has no Venus support;              the device stays on classic virgl"
         ),

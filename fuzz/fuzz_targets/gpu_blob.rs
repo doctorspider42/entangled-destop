@@ -293,6 +293,7 @@ fuzz_target!(|case: Case| {
         guest: case.guest_blobs,
         host3d: case.host3d_blobs,
         host_visible_bytes: (window_len != 0).then_some(window_len),
+        host_mapped: false,
     };
     let mut table = BlobTable::new(window_len);
     let table_backing = backed.then(|| FuzzBacking::new(window_len));

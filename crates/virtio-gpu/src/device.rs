@@ -529,6 +529,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         Some(virtio_core::ShmRegion {
             id: VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
             len,
+            host_mapped: self.blob_support.host_mapped,
         })
     }
 
@@ -1247,7 +1248,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             {
                 Err(CommandError::UnsupportedCommand(kind))
             }
-            cmd::RESOURCE_CREATE_BLOB => self.resource_create_blob(mem, buf),
+            cmd::RESOURCE_CREATE_BLOB => self.resource_create_blob(mem, hdr, buf),
             cmd::SET_SCANOUT_BLOB => self.set_scanout_blob(buf),
             cmd::RESOURCE_MAP_BLOB => self.resource_map_blob(buf),
             cmd::RESOURCE_UNMAP_BLOB => self.resource_unmap_blob(buf),
@@ -2001,6 +2002,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
     fn resource_create_blob(
         &mut self,
         mem: &Arc<GuestMem>,
+        hdr: &CtrlHdr,
         buf: &[u8],
     ) -> Result<Reply, CommandError> {
         let kind = cmd::RESOURCE_CREATE_BLOB;
@@ -2039,8 +2041,22 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // A guest-memory blob is bookkeeping only: the pages are the guest's,
         // and putting them in front of the host renderer would hand a C
         // library guest pointers for no reason at all.
+        //
+        // VEN-2003 checked whether Venus forces that open, and it does not:
+        // virglrenderer decodes Venus in its own render-server process, whose
+        // `proxy_context_attach_resource` refuses any resource it cannot
+        // receive as a file descriptor — which an iovec list over anonymous
+        // guest RAM never is. Mesa's venus driver knows that and puts its
+        // rings in `HOST3D` blobs instead. So the asymmetry stands, and it now
+        // stands on a measurement rather than on a preference.
+        //
+        // `ctx_id` is the header's: `virgl_renderer_resource_create_blob`
+        // resolves a host blob through the context that asked for it, and for
+        // Venus that context *is* the Vulkan connection the `blob_id` was
+        // minted on.
         if args.blob_mem != BLOB_MEM_GUEST {
-            self.three_d_mut(kind)?.create_blob(&args, mem, &entries)?;
+            self.three_d_mut(kind)?
+                .create_blob(hdr.ctx_id, &args, mem, &entries)?;
         }
         self.blobs.insert(&args, &entries, backing_len)?;
         tracing::debug!(

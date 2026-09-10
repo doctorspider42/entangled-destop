@@ -48,6 +48,7 @@
 //! two backends implement [`GpaMapper`] — four lines each, one call apiece —
 //! and everything above the seam moves a window by asking a trait.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use vm_memory::{MmapRegion, VolatileMemory};
@@ -58,6 +59,18 @@ use crate::VmmError;
 /// Page size every shared-memory window is a multiple of, and the alignment
 /// both hypervisors require of a mapped range.
 pub const SHM_PAGE_SIZE: u64 = 4096;
+
+/// Most renderer-supplied host ranges one window may hold at a time
+/// (VEN-2003).
+///
+/// Each one is a hypervisor mapping of its own — a KVM memory slot, a WHP GPA
+/// range — so this is not a bookkeeping bound like the device's
+/// `MAX_HOST_VISIBLE_MAPPINGS`: it is the number of *hypervisor objects* a
+/// guest can make the host create by mapping blobs. KVM reserves the slot
+/// numbers up front, which is what makes the bound a constant rather than a
+/// hope, and a guest past it gets `ERR_OUT_OF_MEMORY` for the map instead of a
+/// VMM that runs out of slots somewhere else.
+pub const MAX_HOST_RANGES: usize = 64;
 
 /// Largest window this VMM will allocate, as a sanity bound on a host
 /// configuration value: 4 GiB. A window is committed host memory, so a typo in
@@ -125,6 +138,18 @@ impl HostShmRegion {
     /// hypervisor together with [`len`](Self::len).
     pub fn host_addr(&self) -> u64 {
         self.mapping.as_ptr() as u64
+    }
+
+    /// This allocation as a [`HostRange`], for the hypervisor seam.
+    ///
+    /// Safe, unlike [`HostRange::new`], precisely because the obligation that
+    /// constructor carries is discharged here: the pages are *ours*, they are
+    /// exactly `len` bytes long, and [`SharedWindow`] unmaps every range
+    /// before it drops the region.
+    pub fn range(&self) -> HostRange {
+        // SAFETY: `self.mapping` is a live `MmapRegion` of exactly `self.len`
+        // readable/writable bytes, owned by this struct.
+        unsafe { HostRange::new(self.host_addr(), self.len) }
     }
 
     /// Copies `buf.len()` bytes out of the window at `offset`.
@@ -211,24 +236,102 @@ impl HostShmRegion {
 pub enum ShmAccessError {
     #[error("shared-memory access at {offset:#x}+{len} leaves the {window}-byte window")]
     OutOfBounds { offset: u64, len: u64, window: u64 },
+
+    /// The window's bytes are the renderer's (VEN-2003), so its own pages are
+    /// not what a guest reads and touching them would be a silent no-op.
+    #[error(
+        "shared-memory access at {offset:#x}+{len} is on a window whose bytes come from the \
+         3D renderer; its own pages are not mapped into the guest"
+    )]
+    HostMapped { offset: u64, len: u64 },
+}
+
+/// A span of host memory, by address and length, on its way to a hypervisor.
+///
+/// The one type in this crate that carries a raw host address as data, and it
+/// exists because of Venus (VEN-2003): the bytes behind a host-visible blob
+/// mapping are not ours at all — `virgl_renderer_resource_map` hands back a
+/// pointer into a `VkDeviceMemory` the host Vulkan driver owns, and the VMM's
+/// job is to put *that* in front of the guest at the offset the guest named.
+/// So the seam cannot be "a region we allocated" any more; it has to be "a
+/// span somebody promises stays put".
+///
+/// The promise is the whole content of this type, which is why the only
+/// general constructor is `unsafe` while [`HostShmRegion::range`] is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostRange {
+    addr: u64,
+    len: u64,
+}
+
+impl HostRange {
+    /// A span of `len` bytes of host memory starting at `addr`.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must be the start of `len` bytes of host memory that is
+    /// readable, writable and **stays mapped at that address** for as long as
+    /// the range may be mapped into a guest — that is, until the matching
+    /// [`GpaMapper::unmap_range`] has returned. A guest gets the pages with no
+    /// exit and no host code in the path, so a span that goes away underneath
+    /// one is a use-after-free the hypervisor performs on the caller's behalf.
+    pub unsafe fn new(addr: u64, len: u64) -> Self {
+        Self { addr, len }
+    }
+
+    /// Host virtual address of the first byte.
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+
+    /// Length in bytes.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Never true in practice: a zero-length range is refused before it is
+    /// built.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether both ends sit on a [`SHM_PAGE_SIZE`] boundary, which every
+    /// hypervisor mapping requires.
+    ///
+    /// Checked rather than assumed for a renderer-supplied span: `vkMapMemory`
+    /// promises only `minMemoryMapAlignment`, which the spec allows to be as
+    /// small as 64 bytes, and an unaligned pointer handed to
+    /// `KVM_SET_USER_MEMORY_REGION` is an `EINVAL` at best.
+    pub fn is_page_aligned(&self) -> bool {
+        self.addr % SHM_PAGE_SIZE == 0 && self.len % SHM_PAGE_SIZE == 0 && self.len != 0
+    }
 }
 
 /// The hypervisor half of a shared-memory window: putting host pages into the
 /// guest's physical address space, and taking them out again.
 ///
 /// One implementation per backend (`Vm` on KVM, `WhpPartition` on Windows),
-/// each holding whatever bookkeeping its host needs — a memory-slot number on
-/// KVM, nothing at all on WHP. Everything above this trait moves a window
-/// without naming a hypervisor type, which is ADR-0002's rule.
+/// each holding whatever bookkeeping its host needs — a pool of memory-slot
+/// numbers on KVM, nothing at all on WHP. Everything above this trait moves a
+/// window without naming a hypervisor type, which is ADR-0002's rule.
+///
+/// A mapper serves **one window**, but a window is not one mapping: since
+/// VEN-2003 it is the window's own pages *or* a set of renderer-supplied
+/// sub-ranges, each at its own guest address. So the unit here is a range and
+/// not a region, and the mapper is addressed by guest address throughout.
 pub trait GpaMapper: Send + Sync {
-    /// Maps `region` at guest physical `gpa`, read/write, not executable where
-    /// the host can say so. Replacing an existing mapping of the same window is
-    /// the caller's job, not this method's.
-    fn map(&self, gpa: u64, region: &HostShmRegion) -> Result<(), HvError>;
+    /// Maps `range` at guest physical `gpa`, read/write, not executable where
+    /// the host can say so.
+    ///
+    /// Mapping a `gpa` that already has a range from this mapper replaces it.
+    /// Overlapping a *different* mapping — another window, guest RAM — is
+    /// refused by both hypervisors, which is why the layer above releases
+    /// before it claims.
+    fn map_range(&self, gpa: u64, range: HostRange) -> Result<(), HvError>;
 
     /// Removes a mapping of `len` bytes at `gpa` previously made by
-    /// [`map`](Self::map).
-    fn unmap(&self, gpa: u64, len: u64) -> Result<(), HvError>;
+    /// [`map_range`](Self::map_range).
+    fn unmap_range(&self, gpa: u64, len: u64) -> Result<(), HvError>;
 
     /// A name for logs, so a failure says which backend refused.
     fn backend(&self) -> &'static str;
@@ -244,11 +347,11 @@ pub trait GpaMapper: Send + Sync {
 pub struct UnmappedGpaMapper;
 
 impl GpaMapper for UnmappedGpaMapper {
-    fn map(&self, _gpa: u64, _region: &HostShmRegion) -> Result<(), HvError> {
+    fn map_range(&self, _gpa: u64, _range: HostRange) -> Result<(), HvError> {
         Ok(())
     }
 
-    fn unmap(&self, _gpa: u64, _len: u64) -> Result<(), HvError> {
+    fn unmap_range(&self, _gpa: u64, _len: u64) -> Result<(), HvError> {
         Ok(())
     }
 
@@ -266,9 +369,24 @@ impl GpaMapper for UnmappedGpaMapper {
 pub struct SharedWindow {
     region: HostShmRegion,
     mapper: Arc<dyn GpaMapper>,
-    /// Guest physical address the window is currently mapped at, if any.
-    /// Behind a `Mutex` because a BAR write on any vCPU thread can move it.
-    placed: Mutex<Option<u64>>,
+    /// Whether the guest sees this window's *own* pages (VEN-2001) or ranges
+    /// the 3D renderer supplies one blob at a time (VEN-2003). See
+    /// [`SharedWindow::new_host_mapped`].
+    host_mapped: bool,
+    /// Where the window decodes and what is mapped inside it. One lock,
+    /// because a BAR write on any vCPU thread can move the whole thing while a
+    /// device worker is adding a range to it.
+    placed: Mutex<Placement>,
+}
+
+/// The mutable half of a [`SharedWindow`].
+#[derive(Default)]
+struct Placement {
+    /// Guest physical address of the window's first byte, if the BAR decodes.
+    base: Option<u64>,
+    /// Renderer-supplied host ranges, by offset inside the window. Always
+    /// empty for a window that shows its own pages.
+    ranges: BTreeMap<u64, HostRange>,
 }
 
 impl std::fmt::Debug for SharedWindow {
@@ -276,13 +394,16 @@ impl std::fmt::Debug for SharedWindow {
         f.debug_struct("SharedWindow")
             .field("len", &self.region.len())
             .field("backend", &self.mapper.backend())
+            .field("host_mapped", &self.host_mapped)
             .field("placed_at", &self.placed_at())
+            .field("ranges", &self.range_count())
             .finish()
     }
 }
 
 impl SharedWindow {
-    /// A window of `len` bytes, allocated but not yet placed.
+    /// A window of `len` bytes whose own pages are what the guest sees,
+    /// allocated but not yet placed.
     ///
     /// Unplaced is the correct initial state on both hosts and in both boot
     /// modes: a PCI function decodes nothing until its driver sets the
@@ -292,7 +413,40 @@ impl SharedWindow {
         Ok(Self {
             region: HostShmRegion::new(len)?,
             mapper,
-            placed: Mutex::new(None),
+            host_mapped: false,
+            placed: Mutex::new(Placement::default()),
+        })
+    }
+
+    /// A window whose bytes come from the 3D renderer, one host range per live
+    /// blob mapping (VEN-2003).
+    ///
+    /// The difference from [`new`](Self::new) is everything about what the
+    /// guest can reach: **nothing is mapped** until
+    /// [`map_host_range`](Self::map_host_range) puts a renderer-supplied span
+    /// at an offset, and the window's own allocation is never shown to a guest
+    /// at all — an access to an unmapped part of the window is an ordinary
+    /// unmapped-GPA exit, exactly as it would be past the end.
+    ///
+    /// Why the modes cannot be one mode: a hypervisor mapping of the whole
+    /// window and a mapping of a renderer's pointer at an offset *inside* it
+    /// overlap, and both KVM and WHP refuse an overlapping range. Punching a
+    /// hole in a KVM memory slot means deleting it and creating the two halves
+    /// around the hole, per mapping, which is more slots and more failure modes
+    /// than mapping only what the renderer actually owns.
+    ///
+    /// The allocation still happens, and is still the window's length: it is
+    /// what `HostShmRegion::new` validates the length against, it is what
+    /// [`len`](Self::len) reports, and it costs nothing a host notices
+    /// (untouched anonymous pages). Host-side [`read`](Self::read) /
+    /// [`write`](Self::write) / [`fill`](Self::fill) are refused on such a
+    /// window, because writing bytes no guest can see is worse than an error.
+    pub fn new_host_mapped(len: u64, mapper: Arc<dyn GpaMapper>) -> Result<Self, VmmError> {
+        Ok(Self {
+            region: HostShmRegion::new(len)?,
+            mapper,
+            host_mapped: true,
+            placed: Mutex::new(Placement::default()),
         })
     }
 
@@ -306,16 +460,33 @@ impl SharedWindow {
         false
     }
 
+    /// Whether the guest sees renderer-supplied ranges rather than this
+    /// window's own pages.
+    pub fn is_host_mapped(&self) -> bool {
+        self.host_mapped
+    }
+
     /// Where the window is mapped in guest physical memory, if it is.
+    ///
+    /// For a host-mapped window this is where the window *would* put a range,
+    /// not a promise that anything is mapped there — see
+    /// [`new_host_mapped`](Self::new_host_mapped).
     pub fn placed_at(&self) -> Option<u64> {
-        self.placed.lock().ok().and_then(|p| *p)
+        self.placed.lock().ok().and_then(|p| p.base)
+    }
+
+    /// Live renderer-supplied ranges.
+    pub fn range_count(&self) -> usize {
+        self.placed.lock().map(|p| p.ranges.len()).unwrap_or(0)
     }
 
     /// Maps the window at `gpa`, moving it if it was somewhere else.
     ///
     /// Idempotent for the address it is already at, so the BAR-reconcile sweep
     /// can call it after every configuration write without churning a mapping
-    /// the guest is actively using.
+    /// the guest is actively using. For a host-mapped window this moves every
+    /// live range with the BAR, which is the whole reason placement and the
+    /// ranges share one lock.
     pub fn place(&self, gpa: u64) -> Result<(), HvError> {
         if gpa % SHM_PAGE_SIZE != 0 {
             return Err(HvError::Registers(format!(
@@ -328,32 +499,39 @@ impl SharedWindow {
                 self.len()
             )));
         }
-        let mut placed = self
-            .placed
-            .lock()
-            .map_err(|_| HvError::Registers("shared-memory placement lock poisoned".into()))?;
-        if *placed == Some(gpa) {
+        let mut placed = self.lock()?;
+        if placed.base == Some(gpa) {
             return Ok(());
         }
         // Old mapping first: leaving two live mappings of the same host pages
-        // would let a guest see the window twice and, on KVM, would need a
-        // second memory slot we have not reserved.
-        if let Some(old) = placed.take() {
-            if let Err(error) = self.mapper.unmap(old, self.len()) {
-                tracing::warn!(
-                    backend = self.mapper.backend(),
-                    at = format_args!("{old:#x}"),
-                    %error,
-                    "could not unmap a shared-memory window before moving it"
-                );
-            }
+        // would let a guest see the window twice and, on KVM, would need
+        // memory slots we have not reserved.
+        if let Some(old) = placed.base.take() {
+            self.unmap_all(&placed, old);
         }
-        self.mapper.map(gpa, &self.region)?;
-        *placed = Some(gpa);
+        if self.host_mapped {
+            // Nothing to map for the window itself; the ranges follow it.
+            for (offset, range) in &placed.ranges {
+                if let Err(error) = self.mapper.map_range(gpa + offset, *range) {
+                    tracing::error!(
+                        backend = self.mapper.backend(),
+                        at = format_args!("{:#x}", gpa + offset),
+                        %error,
+                        "could not move a renderer-supplied range with its BAR; \
+                         the guest's mapping of that blob now reads nothing"
+                    );
+                }
+            }
+        } else {
+            self.mapper.map_range(gpa, self.region.range())?;
+        }
+        placed.base = Some(gpa);
         tracing::debug!(
             backend = self.mapper.backend(),
             at = format_args!("{gpa:#x}"),
             len = self.len(),
+            host_mapped = self.host_mapped,
+            ranges = placed.ranges.len(),
             "shared-memory window placed"
         );
         Ok(())
@@ -361,15 +539,16 @@ impl SharedWindow {
 
     /// Takes the window out of the guest's address space. A no-op when it is
     /// not placed.
+    ///
+    /// The renderer's ranges are *kept* — they belong to blobs the guest still
+    /// holds — and are re-mapped by the next [`place`](Self::place). A BAR that
+    /// stops decoding is not a blob that stopped existing.
     pub fn unplace(&self) -> Result<(), HvError> {
-        let mut placed = self
-            .placed
-            .lock()
-            .map_err(|_| HvError::Registers("shared-memory placement lock poisoned".into()))?;
-        let Some(at) = placed.take() else {
+        let mut placed = self.lock()?;
+        let Some(at) = placed.base.take() else {
             return Ok(());
         };
-        self.mapper.unmap(at, self.len())?;
+        self.unmap_all(&placed, at);
         tracing::debug!(
             backend = self.mapper.backend(),
             at = format_args!("{at:#x}"),
@@ -378,19 +557,149 @@ impl SharedWindow {
         Ok(())
     }
 
+    /// Puts renderer-supplied host memory at `offset` inside the window
+    /// (VEN-2003).
+    ///
+    /// Every bound is checked here, in `u64`, before a hypervisor sees
+    /// anything: the mode, both ends' page alignment, the span against the
+    /// window, the count against [`MAX_HOST_RANGES`], and overlap with the
+    /// ranges below and above. The device has already checked the *guest's*
+    /// half of this (`virtio_gpu::blob::HostVisibleWindow`) — this is the host
+    /// half, and it is deliberately not the same check: the length here comes
+    /// from the renderer, and the address comes from a C library.
+    pub fn map_host_range(&self, offset: u64, range: HostRange) -> Result<(), HvError> {
+        if !self.host_mapped {
+            return Err(HvError::Registers(
+                "this shared-memory window shows its own pages; a renderer range cannot go in it"
+                    .into(),
+            ));
+        }
+        if !range.is_page_aligned() {
+            return Err(HvError::Registers(format!(
+                "a renderer range at {:#x}+{} is not page aligned",
+                range.addr(),
+                range.len()
+            )));
+        }
+        if offset % SHM_PAGE_SIZE != 0 {
+            return Err(HvError::Registers(format!(
+                "a renderer range cannot sit at window offset {offset:#x}: not page aligned"
+            )));
+        }
+        let end = offset
+            .checked_add(range.len())
+            .filter(|end| *end <= self.len())
+            .ok_or_else(|| {
+                HvError::Registers(format!(
+                    "a renderer range at {offset:#x}+{} leaves the {}-byte window",
+                    range.len(),
+                    self.len()
+                ))
+            })?;
+        let mut placed = self.lock()?;
+        if placed.ranges.len() >= MAX_HOST_RANGES && !placed.ranges.contains_key(&offset) {
+            return Err(HvError::Registers(format!(
+                "this window already holds {MAX_HOST_RANGES} renderer ranges"
+            )));
+        }
+        if let Some((start, below)) = placed.ranges.range(..=offset).next_back() {
+            if start.saturating_add(below.len()) > offset {
+                return Err(HvError::Registers(format!(
+                    "a renderer range at {offset:#x} overlaps the one at {start:#x}"
+                )));
+            }
+        }
+        if let Some((start, _)) = placed.ranges.range(offset..).next() {
+            if *start < end {
+                return Err(HvError::Registers(format!(
+                    "a renderer range ending at {end:#x} overlaps the one at {start:#x}"
+                )));
+            }
+        }
+        if let Some(base) = placed.base {
+            self.mapper.map_range(base + offset, range)?;
+        }
+        placed.ranges.insert(offset, range);
+        Ok(())
+    }
+
+    /// Removes the renderer range at `offset`. Infallible by design: the guest
+    /// has already stopped using the mapping, and a hypervisor that refuses the
+    /// unmap is a host bug to log, not a command to fail.
+    pub fn unmap_host_range(&self, offset: u64) {
+        let Ok(mut placed) = self.lock() else {
+            return;
+        };
+        let Some(range) = placed.ranges.remove(&offset) else {
+            return;
+        };
+        if let Some(base) = placed.base {
+            if let Err(error) = self.mapper.unmap_range(base + offset, range.len()) {
+                tracing::error!(
+                    backend = self.mapper.backend(),
+                    at = format_args!("{:#x}", base + offset),
+                    %error,
+                    "could not unmap a renderer-supplied range; the guest may still \
+                     reach host memory the renderer is about to free"
+                );
+            }
+        }
+    }
+
     /// Host-side read out of the window (see [`HostShmRegion::read`]).
     pub fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), ShmAccessError> {
+        self.own_pages(offset, buf.len() as u64)?;
         self.region.read(offset, buf)
     }
 
     /// Host-side write into the window.
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), ShmAccessError> {
+        self.own_pages(offset, data.len() as u64)?;
         self.region.write(offset, data)
     }
 
     /// Host-side fill, used to clear a span before a guest is allowed to see it.
     pub fn fill(&self, offset: u64, len: u64, byte: u8) -> Result<(), ShmAccessError> {
+        self.own_pages(offset, len)?;
         self.region.fill(offset, len, byte)
+    }
+
+    /// Refuses host access to a window whose bytes are the renderer's, where a
+    /// write would land in pages no guest can see.
+    fn own_pages(&self, offset: u64, len: u64) -> Result<(), ShmAccessError> {
+        if self.host_mapped {
+            return Err(ShmAccessError::HostMapped { offset, len });
+        }
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Placement>, HvError> {
+        self.placed
+            .lock()
+            .map_err(|_| HvError::Registers("shared-memory placement lock poisoned".into()))
+    }
+
+    /// Removes whatever this window has mapped at base address `at`.
+    fn unmap_all(&self, placed: &Placement, at: u64) {
+        let spans: Vec<(u64, u64)> = if self.host_mapped {
+            placed
+                .ranges
+                .iter()
+                .map(|(offset, range)| (at + offset, range.len()))
+                .collect()
+        } else {
+            vec![(at, self.len())]
+        };
+        for (gpa, len) in spans {
+            if let Err(error) = self.mapper.unmap_range(gpa, len) {
+                tracing::warn!(
+                    backend = self.mapper.backend(),
+                    at = format_args!("{gpa:#x}"),
+                    %error,
+                    "could not unmap a shared-memory range"
+                );
+            }
+        }
     }
 }
 
@@ -491,16 +800,22 @@ mod tests {
         maps: AtomicUsize,
         unmaps: AtomicUsize,
         last_map: Mutex<Option<u64>>,
+        /// What the "hypervisor" currently has mapped, so a test can assert
+        /// where a guest would actually reach and not only how many calls were
+        /// made.
+        live: Mutex<BTreeMap<u64, u64>>,
     }
 
     impl GpaMapper for CountingMapper {
-        fn map(&self, gpa: u64, _region: &HostShmRegion) -> Result<(), HvError> {
+        fn map_range(&self, gpa: u64, range: HostRange) -> Result<(), HvError> {
             self.maps.fetch_add(1, Ordering::SeqCst);
             *self.last_map.lock().unwrap() = Some(gpa);
+            self.live.lock().unwrap().insert(gpa, range.len());
             Ok(())
         }
-        fn unmap(&self, _gpa: u64, _len: u64) -> Result<(), HvError> {
+        fn unmap_range(&self, gpa: u64, _len: u64) -> Result<(), HvError> {
             self.unmaps.fetch_add(1, Ordering::SeqCst);
+            self.live.lock().unwrap().remove(&gpa);
             Ok(())
         }
         fn backend(&self) -> &'static str {
@@ -555,6 +870,161 @@ mod tests {
             mapper.unmaps.load(Ordering::SeqCst),
             1,
             "the hypervisor must not outlive the host pages"
+        );
+    }
+
+    /// A page of host memory a test can hand to a host-mapped window as if it
+    /// came from the renderer.
+    fn renderer_pages(pages: u64) -> (HostShmRegion, HostRange) {
+        let region = HostShmRegion::new(pages * PAGE).expect("renderer pages");
+        let range = region.range();
+        (region, range)
+    }
+
+    /// The Venus mode: nothing is mapped until a renderer range arrives, and
+    /// then exactly that span is, at the window offset the guest named.
+    #[test]
+    fn a_host_mapped_window_maps_only_what_the_renderer_supplies() {
+        let mapper = Arc::new(CountingMapper::default());
+        let window = SharedWindow::new_host_mapped(16 * PAGE, mapper.clone()).unwrap();
+        assert!(window.is_host_mapped());
+        let (_pages, range) = renderer_pages(2);
+
+        // Placing the BAR maps nothing at all: there are no ranges yet.
+        window.place(0x1_0000_0000).unwrap();
+        assert_eq!(mapper.maps.load(Ordering::SeqCst), 0);
+        assert_eq!(window.placed_at(), Some(0x1_0000_0000));
+
+        window.map_host_range(4 * PAGE, range).unwrap();
+        assert_eq!(mapper.maps.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mapper.live.lock().unwrap().get(&(0x1_0000_0000 + 4 * PAGE)),
+            Some(&(2 * PAGE)),
+            "the range lands at base + offset, and only there"
+        );
+        assert_eq!(window.range_count(), 1);
+
+        // A BAR move takes every range with it.
+        window.place(0x2_0000_0000).unwrap();
+        let live = mapper.live.lock().unwrap().clone();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live.get(&(0x2_0000_0000 + 4 * PAGE)), Some(&(2 * PAGE)));
+
+        // A BAR that stops decoding unmaps them but does not forget them: the
+        // blob still exists as far as the guest is concerned.
+        window.unplace().unwrap();
+        assert!(mapper.live.lock().unwrap().is_empty());
+        assert_eq!(window.range_count(), 1);
+        window.place(0x2_0000_0000).unwrap();
+        assert_eq!(mapper.live.lock().unwrap().len(), 1);
+
+        window.unmap_host_range(4 * PAGE);
+        assert_eq!(window.range_count(), 0);
+        assert!(mapper.live.lock().unwrap().is_empty());
+    }
+
+    /// Everything the layer below the device still has to check for itself:
+    /// the offset, the renderer's own alignment, the span, the count and
+    /// overlap.
+    #[test]
+    fn a_host_mapped_window_bounds_every_range_it_is_offered() {
+        let window = SharedWindow::new_host_mapped(16 * PAGE, Arc::new(UnmappedGpaMapper)).unwrap();
+        let (_pages, range) = renderer_pages(2);
+        window.place(0x1_0000_0000).unwrap();
+
+        assert!(window.map_host_range(1, range).is_err(), "offset alignment");
+        assert!(
+            window.map_host_range(15 * PAGE, range).is_err(),
+            "runs off the end"
+        );
+        assert!(
+            window.map_host_range(u64::MAX, range).is_err(),
+            "offset wraps"
+        );
+        // SAFETY: never mapped — the call is refused on alignment before the
+        // address is used, which is exactly what this asserts.
+        let unaligned = unsafe { HostRange::new(0x1001, PAGE) };
+        assert!(window.map_host_range(0, unaligned).is_err());
+        // SAFETY: same; a zero length is refused before use.
+        let empty = unsafe { HostRange::new(0x1000, 0) };
+        assert!(window.map_host_range(0, empty).is_err());
+        assert_eq!(window.range_count(), 0, "no refusal left a range behind");
+
+        window.map_host_range(4 * PAGE, range).unwrap();
+        assert!(
+            window.map_host_range(5 * PAGE, range).is_err(),
+            "overlaps from above"
+        );
+        assert!(
+            window.map_host_range(3 * PAGE, range).is_err(),
+            "overlaps from below"
+        );
+        window.map_host_range(6 * PAGE, range).expect("exact fit");
+        assert_eq!(window.range_count(), 2);
+    }
+
+    /// The two modes are not interchangeable, and each refuses the other's
+    /// operation rather than doing something quietly useless.
+    #[test]
+    fn the_two_window_modes_refuse_each_others_operations() {
+        let own = SharedWindow::new(PAGE, Arc::new(UnmappedGpaMapper)).unwrap();
+        let (_pages, range) = renderer_pages(1);
+        assert!(!own.is_host_mapped());
+        assert!(own.map_host_range(0, range).is_err());
+        own.write(0, b"host").expect("its own pages are writable");
+
+        let rendered = SharedWindow::new_host_mapped(PAGE, Arc::new(UnmappedGpaMapper)).unwrap();
+        assert!(matches!(
+            rendered.write(0, b"host"),
+            Err(ShmAccessError::HostMapped { .. })
+        ));
+        assert!(matches!(
+            rendered.read(0, &mut [0u8; 4]),
+            Err(ShmAccessError::HostMapped { .. })
+        ));
+        assert!(matches!(
+            rendered.fill(0, PAGE, 0),
+            Err(ShmAccessError::HostMapped { .. })
+        ));
+    }
+
+    /// A guest that maps blobs without ever unmapping them must hit a bound,
+    /// because every range is a hypervisor object.
+    #[test]
+    fn renderer_ranges_are_bounded() {
+        let window = SharedWindow::new_host_mapped(
+            (MAX_HOST_RANGES as u64 + 4) * PAGE,
+            Arc::new(UnmappedGpaMapper),
+        )
+        .unwrap();
+        let (_pages, range) = renderer_pages(1);
+        for i in 0..MAX_HOST_RANGES as u64 {
+            window.map_host_range(i * PAGE, range).expect("in budget");
+        }
+        assert!(window
+            .map_host_range(MAX_HOST_RANGES as u64 * PAGE, range)
+            .is_err());
+        window.unmap_host_range(0);
+        window
+            .map_host_range(MAX_HOST_RANGES as u64 * PAGE, range)
+            .expect("room again");
+    }
+
+    /// Dropping a host-mapped window must take its ranges out of the guest,
+    /// not only its own pages — the renderer is about to free them.
+    #[test]
+    fn dropping_a_host_mapped_window_unmaps_every_range() {
+        let mapper = Arc::new(CountingMapper::default());
+        let (_pages, range) = renderer_pages(1);
+        {
+            let window = SharedWindow::new_host_mapped(4 * PAGE, mapper.clone()).unwrap();
+            window.place(0x4_0000_0000).unwrap();
+            window.map_host_range(0, range).unwrap();
+            window.map_host_range(2 * PAGE, range).unwrap();
+        }
+        assert!(
+            mapper.live.lock().unwrap().is_empty(),
+            "the hypervisor must not outlive the renderer's pages either"
         );
     }
 

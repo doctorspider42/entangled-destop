@@ -197,7 +197,7 @@ fn handle(
         // Blob resources (VEN-2001). Only host-side blobs ever arrive here —
         // a guest-memory blob is guest pages the device keeps to itself, and
         // the isolated helper has no window onto guest RAM by construction.
-        Request::CreateBlob(args) => {
+        Request::CreateBlob { ctx_id, args } => {
             // The helper does not trust the VMM either (the GPU-012 rule), so
             // the guest-derived fields are re-checked on this side too.
             if args.resource_id == 0 || args.size == 0 || args.size > crate::MAX_BLOB_BYTES {
@@ -214,7 +214,7 @@ fn handle(
                 Ok(shadow) => shadow.mem,
                 Err(message) => return error(message),
             };
-            match renderer.create_blob(&args, &mem, &[]) {
+            match renderer.create_blob(ctx_id, &args, &mem, &[]) {
                 Ok(()) => Reply::Ok,
                 Err(e) => error(e),
             }

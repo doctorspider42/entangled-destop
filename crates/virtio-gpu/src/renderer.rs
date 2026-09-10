@@ -292,13 +292,21 @@ pub trait Renderer3d: Send {
     /// Every field of `args` has already been bounds-checked
     /// ([`crate::blob::BlobTable::validate`]); `entries` is empty for
     /// `HOST3D`.
+    ///
+    /// `ctx_id` is the header's context, and it is not decoration: a host
+    /// blob is *named* by `(ctx_id, blob_id)` — for Venus, the `blob_id` is a
+    /// `VkDeviceMemory` the guest allocated on that Vulkan connection, and
+    /// asking a different context for it finds nothing. It may be 0, which is
+    /// the kernel's own context and what a guest uses for a blob it allocates
+    /// outside any 3D context.
     fn create_blob(
         &mut self,
+        ctx_id: u32,
         args: &ResourceCreateBlob,
         mem: &Arc<GuestMem>,
         entries: &[MemEntry],
     ) -> Result<(), CommandError> {
-        let _ = (args, mem, entries);
+        let _ = (ctx_id, args, mem, entries);
         Err(CommandError::UnsupportedBlobMem(args.blob_mem))
     }
 
@@ -559,11 +567,20 @@ impl Gpu3d {
     /// here — see [`Renderer3d::create_blob`].
     pub fn create_blob(
         &mut self,
+        ctx_id: u32,
         args: &ResourceCreateBlob,
         mem: &Arc<GuestMem>,
         entries: &[MemEntry],
     ) -> Result<(), CommandError> {
-        self.renderer.create_blob(args, mem, entries)
+        // A blob names a context the same way every other 3D command does, so
+        // it is checked the same way: ctx 0 is the kernel's and always valid,
+        // anything else must be a context this guest actually created. Without
+        // this a guest could make the host renderer look up an id it never
+        // opened.
+        if ctx_id != 0 && !self.contexts.contains(&ctx_id) {
+            return Err(CommandError::UnknownContext(ctx_id));
+        }
+        self.renderer.create_blob(ctx_id, args, mem, entries)
     }
 
     /// Drops a host-side blob.

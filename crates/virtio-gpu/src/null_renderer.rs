@@ -408,6 +408,11 @@ impl Renderer3d for NullRenderer {
                 guest: true,
                 host3d: true,
                 host_visible_bytes: Some(NULL_HOST_VISIBLE_BYTES),
+                // The loopback *writes* its signature into the window, which
+                // is the whole point of it: it proves the guest reads host
+                // bytes on a machine with no GPU. So it takes the
+                // device-backed window, never the renderer-mapped one.
+                host_mapped: false,
             }
         } else {
             BlobSupport::NONE
@@ -416,6 +421,7 @@ impl Renderer3d for NullRenderer {
 
     fn create_blob(
         &mut self,
+        _ctx_id: u32,
         args: &ResourceCreateBlob,
         _mem: &Arc<GuestMem>,
         _entries: &[MemEntry],

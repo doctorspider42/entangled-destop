@@ -205,20 +205,47 @@ impl Vm {
     /// BAR, and unmaps it when memory decoding goes away
     /// (`machine_x86::shm`).
     ///
-    /// One slot per window, reserved for the life of the VM even while the
-    /// window is unmapped, because KVM identifies a mapping by its slot number
-    /// and reusing one would silently replace somebody else's.
-    pub fn create_shm_window(&self, len: u64) -> Result<Arc<SharedWindow>, VmmError> {
-        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
+    /// Slots reserved for one window: one for the window itself and
+    /// [`MAX_HOST_RANGES`](crate::shm::MAX_HOST_RANGES) for the renderer
+    /// ranges a Venus guest can put inside it (VEN-2003).
+    ///
+    /// Reserved up front, all of them, for the same reason the single slot was:
+    /// KVM identifies a mapping by its slot number, so a number handed out
+    /// twice silently replaces somebody else's mapping. Reserving a *range* of
+    /// numbers is what turns "how many blobs may be mapped at once" into a
+    /// constant the machine can enforce instead of a resource it can exhaust.
+    pub const SHM_SLOTS_PER_WINDOW: u32 = 1 + crate::shm::MAX_HOST_RANGES as u32;
+
+    /// Allocates a shared-memory window of `len` bytes and reserves the KVM
+    /// memory slots it will live in (EPIC 20, VEN-2001/VEN-2003).
+    ///
+    /// `host_mapped` picks which kind: `false` is a window of our own pages,
+    /// `true` is one whose bytes the 3D renderer supplies per blob mapping —
+    /// see [`SharedWindow::new_host_mapped`].
+    pub fn create_shm_window(
+        &self,
+        len: u64,
+        host_mapped: bool,
+    ) -> Result<Arc<SharedWindow>, VmmError> {
+        let first = self
+            .next_slot
+            .fetch_add(Self::SHM_SLOTS_PER_WINDOW, Ordering::Relaxed);
         let mapper = Arc::new(KvmGpaMapper {
             fd: Arc::clone(&self.fd),
-            slot,
+            slots: (first..first + Self::SHM_SLOTS_PER_WINDOW).collect(),
+            live: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
-        let window = SharedWindow::new(len, mapper)?;
+        let window = if host_mapped {
+            SharedWindow::new_host_mapped(len, mapper)?
+        } else {
+            SharedWindow::new(len, mapper)?
+        };
         tracing::info!(
-            slot,
+            first_slot = first,
+            slots = Self::SHM_SLOTS_PER_WINDOW,
             len,
-            "reserved a KVM memory slot for a shared-memory window"
+            host_mapped,
+            "reserved KVM memory slots for a shared-memory window"
         );
         Ok(Arc::new(window))
     }
@@ -291,41 +318,75 @@ impl Vm {
 /// but a reader comparing the two backends deserves to be told.
 struct KvmGpaMapper {
     fd: Arc<VmFd>,
-    slot: u32,
+    /// The slot numbers reserved for this window, base mapping included.
+    slots: Vec<u32>,
+    /// Which slot each live guest address is using, so a move or an unmap
+    /// addresses the right one and a freed slot goes back in the pool.
+    live: std::sync::Mutex<std::collections::HashMap<u64, u32>>,
 }
 
-impl crate::shm::GpaMapper for KvmGpaMapper {
-    fn map(&self, gpa: u64, region: &crate::shm::HostShmRegion) -> Result<(), HvError> {
+impl KvmGpaMapper {
+    fn set_region(&self, slot: u32, gpa: u64, addr: u64, len: u64) -> Result<(), HvError> {
         let mr = kvm_userspace_memory_region {
-            slot: self.slot,
+            slot,
             flags: 0,
             guest_phys_addr: gpa,
-            memory_size: region.len(),
-            userspace_addr: region.host_addr(),
+            memory_size: len,
+            userspace_addr: addr,
         };
-        // SAFETY: `region` owns a live, page-aligned host mapping of exactly
-        // `region.len()` bytes; the caller (`SharedWindow`) holds it for as
-        // long as this slot exists and unmaps the slot before dropping it, so
-        // KVM never holds a pointer into freed memory. The slot number is this
-        // mapper's own, reserved by `Vm::create_shm_window` and used by nothing
-        // else.
+        // SAFETY: `addr` is the base of `len` bytes of live, page-aligned host
+        // memory — that is the promise `HostRange` carries, discharged either
+        // by `HostShmRegion` (our own allocation) or by the 3D renderer, which
+        // keeps its `virgl_renderer_resource_map` mapping until the matching
+        // unmap. `SharedWindow` deletes every slot before the pages go away, so
+        // KVM never holds a pointer into freed memory. The slot number comes
+        // from this mapper's own reserved range and is used by nothing else. A
+        // zero `len` is the kernel's spelling of "delete this slot", and then
+        // no pointer is read at all.
         unsafe { self.fd.set_user_memory_region(mr) }
             .map_err(|e| HvError::Registers(format!("KVM_SET_USER_MEMORY_REGION(shm): {e}")))
     }
+}
 
-    fn unmap(&self, _gpa: u64, _len: u64) -> Result<(), HvError> {
-        let mr = kvm_userspace_memory_region {
-            slot: self.slot,
-            flags: 0,
-            guest_phys_addr: 0,
-            memory_size: 0,
-            userspace_addr: 0,
+impl crate::shm::GpaMapper for KvmGpaMapper {
+    fn map_range(&self, gpa: u64, range: crate::shm::HostRange) -> Result<(), HvError> {
+        let mut live = self
+            .live
+            .lock()
+            .map_err(|_| HvError::Registers("shm slot table poisoned".into()))?;
+        let slot = match live.get(&gpa) {
+            // Same address again: KVM replaces a slot in place, which is how a
+            // window moves without ever having two live mappings.
+            Some(slot) => *slot,
+            None => *self
+                .slots
+                .iter()
+                .find(|slot| !live.values().any(|used| used == *slot))
+                .ok_or_else(|| {
+                    HvError::Registers(format!(
+                        "no KVM memory slot left for a shared-memory range at {gpa:#x}; \
+                         this window's {} are all in use",
+                        self.slots.len()
+                    ))
+                })?,
         };
-        // SAFETY: a zero `memory_size` deletes the slot; the kernel reads no
-        // host pointer out of this structure, so there is nothing here that
-        // could dangle.
-        unsafe { self.fd.set_user_memory_region(mr) }
-            .map_err(|e| HvError::Registers(format!("KVM_SET_USER_MEMORY_REGION(shm delete): {e}")))
+        self.set_region(slot, gpa, range.addr(), range.len())?;
+        live.insert(gpa, slot);
+        Ok(())
+    }
+
+    fn unmap_range(&self, gpa: u64, _len: u64) -> Result<(), HvError> {
+        let mut live = self
+            .live
+            .lock()
+            .map_err(|_| HvError::Registers("shm slot table poisoned".into()))?;
+        let Some(slot) = live.remove(&gpa) else {
+            return Ok(());
+        };
+        // A zero `memory_size` deletes the slot, which is the kernel's
+        // documented spelling of "this mapping is gone" and the only way to
+        // stop the guest reaching the pages.
+        self.set_region(slot, 0, 0, 0)
     }
 
     fn backend(&self) -> &'static str {

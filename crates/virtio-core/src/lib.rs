@@ -54,7 +54,7 @@ pub mod testing;
 pub use chain::{ChainError, ChainWalkGuard, Segment, MAX_DESC_CHAIN_LEN};
 pub use device::{
     DeferredWaker, DeviceError, DeviceResources, DeviceType, HostWaker, ShmAccessError, ShmBacking,
-    ShmRegion, VirtioDevice,
+    ShmMapError, ShmRegion, VirtioDevice,
 };
 pub use interrupt::{
     Interrupt, InterruptError, IrqLine, LineInterrupt, MsiMessage, MsiSink, TransportInterrupt,
