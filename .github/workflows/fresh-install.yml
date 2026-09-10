@@ -1,0 +1,137 @@
+name: Fresh install
+
+# Does the thing we ship actually work for someone who has never seen this
+# project?
+#
+# Every other workflow here tests the *tree*: a checkout with `artifacts/`
+# built, a warm cargo cache, a configured WSL, a token in the environment. In
+# one evening the project's author, installing the published release on a
+# second machine, hit two blockers none of that could see — a firmware that
+# only ever existed in a source checkout, and a Linux engine the Windows
+# installer never shipped. This job is the counterweight: it downloads the
+# published setup .exe like a stranger, installs it, and runs the installed
+# binaries with an empty per-user profile.
+#
+# WHAT IT CANNOT COVER, and there is no way around either:
+#
+#   * **no hypervisor.** GitHub's windows-latest runners expose neither WHP nor
+#     nested virtualization, so `entangled doctor` exits non-zero here and no
+#     guest can be booted. That is exactly why `doctor` reports the install
+#     inventory *before* it fails on the hypervisor — the firmware, the
+#     bootstrap artifacts and the WSL engine are all still asserted on a runner
+#     that cannot run a VM. The boot half is the developer machine's job:
+#     `-Stages guest` in scripts/fresh-install-acceptance.ps1.
+#   * **no WSL.** The runner has no distribution, so "is there a Linux engine
+#     in WSL" can only be answered as "no, and here is the fix", which is the
+#     half of that regression a machine can check. Whether the install *works*
+#     needs a real distribution.
+#
+# The Linux job is the other stranger: the published `entangled-linux-x86_64`
+# is the binary the WSL backend installs, and ubuntu-latest runs it with an
+# empty HOME and no checkout on its PATH. KVM is absent there too, so it
+# asserts the inventory rather than a boot.
+
+on:
+  # Right after a release publishes: the artifact under test is the one that
+  # run just made, so a firmware that failed to ship is red within minutes
+  # rather than at the next person's install.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  # And daily, because a release can stop working without anyone pushing:
+  # an asset deleted, a repository made private again, GitHub changing what an
+  # unauthenticated download answers.
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to install (default: latest)'
+        required: false
+        default: 'latest'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fresh-install
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows — install the published setup and run it as a stranger
+    # A release run that failed published nothing worth testing.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-latest
+    steps:
+      # Only for the script. Nothing the *installed program* does may depend
+      # on this checkout, and the script asserts as much: its working directory
+      # is under RUNNER_TEMP, with no Cargo.toml and no artifacts/ at or above
+      # it.
+      - uses: actions/checkout@v4
+
+      - name: Fresh-install acceptance
+        shell: pwsh
+        run: |
+          $tag = '${{ github.event.inputs.tag }}'
+          if (-not $tag) { $tag = 'latest' }
+          & .\scripts\fresh-install-acceptance.ps1 `
+              -Tag $tag `
+              -Root (Join-Path $env:RUNNER_TEMP 'fresh') `
+              -Stages download,install,tree,doctor,fetch,engine `
+              -JsonReport (Join-Path $env:RUNNER_TEMP 'fresh-install-report.json')
+          exit $LASTEXITCODE
+
+      - name: Summarise
+        if: always()
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP 'fresh-install-report.json'
+          "### Fresh install (Windows)`n" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          if (Test-Path $report) {
+            "| | check | detail |"        | Out-File -Append $env:GITHUB_STEP_SUMMARY
+            "|---|---|---|"               | Out-File -Append $env:GITHUB_STEP_SUMMARY
+            foreach ($c in (Get-Content -Raw $report | ConvertFrom-Json)) {
+              $mark = switch ($c.Status) { 'PASS' { '✅' } 'FAIL' { '❌' } 'SKIP' { '⏭️' } default { 'ℹ️' } }
+              $detail = ($c.Detail -replace '\|', '\|') -replace "`r?`n", '<br>'
+              "| $mark | $($c.Name) | $detail" + " |" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+            }
+          } else {
+            "The acceptance script produced no report — it failed before it could." |
+              Out-File -Append $env:GITHUB_STEP_SUMMARY
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fresh-install-windows
+          path: |
+            ${{ runner.temp }}/fresh/logs/
+            ${{ runner.temp }}/fresh-install-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  linux:
+    name: Linux — run the published engine with an empty HOME
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fresh-install acceptance
+        run: |
+          tag='${{ github.event.inputs.tag }}'
+          bash scripts/fresh-install-acceptance.sh --tag "${tag:-latest}" \
+            --root "$RUNNER_TEMP/fresh"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fresh-install-linux
+          path: ${{ runner.temp }}/fresh/logs/
+          if-no-files-found: warn
+          retention-days: 14

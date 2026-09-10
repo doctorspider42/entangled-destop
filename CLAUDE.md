@@ -55,6 +55,23 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p entangled -- run --headless examples\windows-whp.toml
 ```
 
+None of that tests **what we ship**. Every command above runs in a checkout
+with artifacts, a warm cache and a developer's environment; three separate
+shipped-product bugs have hidden in exactly that gap (a firmware the installer
+never carried, a Linux engine it never shipped, a pinned digest no release
+served). The fresh-install acceptance installs a *published release* and runs
+it with an empty per-user profile — see the `vm-testing` skill:
+
+```powershell
+pwsh -File scripts\fresh-install-acceptance.ps1          # elevated; the latest release
+```
+```bash
+bash scripts/fresh-install-acceptance.sh                 # the published Linux engine
+```
+
+`.github/workflows/fresh-install.yml` runs both after every release, minus the
+parts that need a hypervisor.
+
 Two vendored, minimally patched crates in `third_party/` (`virtio-queue`,
 `linux-loader` — see their VENDORED.md and ADR-0002) take the unix-only
 `vm-memory` `rawfd` feature back out of the graph; cargo features are additive,
