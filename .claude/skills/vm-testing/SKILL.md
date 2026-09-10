@@ -53,6 +53,12 @@ unit tests live with their crates.
    skill), compare against goldens with a small per-pixel tolerance; store
    goldens under `tests/graphical/golden/` as PNG (small resolutions for
    tests, e.g. 640×480, plus one 1920×1080 case).
+7. **Fresh-install acceptance** — the only tier that does not build anything.
+   It installs a *published release* and runs it with an empty per-user
+   profile. Everything in tiers 1-6 runs inside a checkout with artifacts, a
+   warm cache and a developer's environment variables; this tier is the one
+   that behaves like a stranger. See the section below — three separate
+   shipped-product bugs have been invisible to the other six tiers.
 
 ## Running
 
@@ -68,6 +74,153 @@ unit tests live with their crates.
   lints and tests the workspace and asserts the `whp_*` self-skip path stays a
   loud, working path (no WHP on GitHub's runners).
 - Docker: `docker run --device /dev/kvm …` (see `docker/Dockerfile.dev`).
+
+## The fresh-install acceptance: testing what we ship, not what we build
+
+Every tier above runs in a checkout. `artifacts/` is populated, the cargo cache
+is warm, WSL is configured, `GITHUB_TOKEN` is in the environment,
+`~/entangled-vms` exists. **A stranger has none of that**, and for a long time
+nothing here behaved like one. The cost, in one evening, was two blockers the
+1500-test suite could not see:
+
+* `no artifacts/firmware/CLOUDHV.fd under F:\Program Files\Entangled Desktop`
+  — every UEFI guest impossible, because the firmware was a gitignored
+  artifact that only ever existed in a source checkout;
+* `execvpe entangled failed 2` — the WSL backend running a Linux binary the
+  Windows installer never shipped.
+
+And a third, found by this harness on the day it was written: `entangled fetch
+firmware` failed for **everyone**, because `guest/firmware/pinned.toml` held
+the digest of a locally built firmware while the workflow had published a
+different one. Nothing caught it, because the only host that fetches is a host
+without a copy — and every host in the loop had a copy.
+
+The pattern behind all three: *a check that only runs where the artifact is
+already present cannot see the artifact missing.*
+
+### Running it
+
+Two scripts, one per host. Neither needs a hypervisor for its default stages.
+
+```powershell
+# Windows, elevated (the installer is PrivilegesRequired=admin).
+pwsh -File scripts\fresh-install-acceptance.ps1                 # latest release
+pwsh -File scripts\fresh-install-acceptance.ps1 -Tag v0.2.44    # a specific one
+```
+
+```bash
+# Linux — the published entangled-linux-x86_64, which is also the binary
+# `entangled wsl install-engine` puts inside a WSL distribution.
+bash scripts/fresh-install-acceptance.sh --tag v0.2.44
+```
+
+The Windows script's stages, in order: `download` (the setup .exe off GitHub
+Releases, unauthenticated), `install` (`/VERYSILENT /DIR=<scratch>`), `tree`
+(what actually landed), `doctor`, `fetch`, `engine`, and the opt-in `guest`:
+
+```powershell
+pwsh -File scripts\fresh-install-acceptance.ps1 -Tag v0.2.44 `
+    -Stages download,install,tree,doctor,fetch,engine,guest `
+    -Iso "$env:LOCALAPPDATA\entangled\ubuntu\26.04\ubuntu-26.04-live-server-amd64.iso"
+```
+
+`guest` takes a machine from nothing to a login prompt on the installed
+program: ~15 min for the unattended Ubuntu install plus ~2 min to boot it. It
+needs a hypervisor and an ISO. There is no `bash scripts/fetch-ubuntu-iso.sh`
+on Windows, so `-Iso` is mandatory — which is itself the newcomer's path, and
+the reason the parameter exists rather than a download.
+
+### What "stranger" means, mechanically
+
+Copy this list when writing anything that claims to test a shipped artifact:
+
+* the artifact comes off GitHub Releases over plain HTTPS — no `gh`, no token,
+  no checkout;
+* `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP` (or `HOME`, `XDG_*`) point
+  at a throwaway tree, so there is no manager settings file, no verified media
+  cache and no `~/entangled-vms`;
+* every `ENTANGLED_*`, `CARGO*`, `RUST*` and `*_TOKEN` variable is stripped —
+  `ENTANGLED_FIRMWARE_DIR` alone would hand the program the very artifact the
+  test is about;
+* the directory holding `gh.exe` comes off `PATH`. Scrubbing `APPDATA` hides
+  gh's config file, but modern gh keeps tokens in the OS credential store,
+  which no environment variable hides;
+* the working directory has **no `Cargo.toml` and no `artifacts/` at or above
+  it** — asserted, not assumed. This is the one that silently rescues a broken
+  installation: `artifacts/firmware/CLOUDHV.fd` relative to the working
+  directory is row 5 of the firmware lookup, and a test run from a checkout
+  passes whatever the installer did.
+
+### Never run the setup without `/DIR`
+
+Inno **ignores an unrecognised command-line parameter** — no complaint, no
+stop. So `setup.exe /VERYSILENT /EXTRACT=<dir>`, which looks like a way to
+list what a release ships without installing it, is in fact a silent
+unattended install into `{autopf}` on top of whatever was already there. It
+did exactly that on this machine while somebody was trying to avoid touching
+a real installation. There is no `/EXTRACT`. Name the destination, every time.
+
+### Do not disturb the real installation
+
+`installer/entangled.iss` keeps one `AppId` for the life of the product — it is
+the upgrade identity and must never change. So a second install into a scratch
+`{app}` **rewrites that AppId's uninstall registration and the shared Start
+Menu shortcuts**, and uninstalling it afterwards deletes them: the developer's
+own installation silently loses its Add/Remove entry and its Start Menu group.
+The script snapshots both before installing (`reg export`, a copy of the group
+directory) and restores them in cleanup, then asserts the restored registration
+points back at the real install. On a CI runner all of it is a no-op.
+
+The user's VM directory, media cache, manager settings and WSL engine are never
+written at all — the scrubbed profile means the installed program cannot see
+them — and `/MERGETASKS=!desktopicon,!wslengine` keeps the installer's optional
+tasks out of the way, so nothing touches WSL either.
+
+### What CI covers, and what it cannot
+
+`.github/workflows/fresh-install.yml` runs both scripts after every `Release`
+run completes, plus daily and on demand. It covers: the release resolving and
+downloading without credentials, the setup installing unattended, the shipped
+tree (**the firmware regression, directly**), `doctor`'s inventory, `entangled
+fetch firmware` with an empty cache, and the `wsl install-engine` surface
+existing in the shipped binary.
+
+It cannot cover:
+
+* **a hypervisor.** GitHub's `windows-latest` exposes no WHP and no nested
+  virtualization, and `ubuntu-latest` has no `/dev/kvm` for this job. Nothing
+  boots there. This is why `entangled doctor` prints the install inventory
+  *before* it fails on the hypervisor (`apps/entangled/src/doctor.rs`
+  `report()`): on a runner that cannot run a VM, the inventory is the whole
+  point of the command, and until that change CI could assert nothing at all
+  about a fresh installation. Booting is the developer machine's job:
+  `-Stages guest`.
+* **WSL.** No distribution on the runner, so "is there a Linux engine in WSL"
+  can only be answered as "no, and here is the fix". Whether the install
+  *works* needs a real distribution — run the Windows script on a machine that
+  has one, or `entangled wsl install-engine` by hand.
+* **an upgrade over an existing installation.** The runner has nothing to
+  upgrade from, and doing it on a developer machine would mean overwriting
+  their real install. Untested; a TODO.
+
+### Reading a failure
+
+Each check prints `[PASS]`/`[FAIL]` with the evidence under it, and the
+Windows script writes `-JsonReport` for the workflow summary. The stage logs
+(`<root>\logs\`) survive cleanup on purpose — `setup.log` is Inno's own, and
+`guest-install.log` / `guest-boot.log` are the serial transcripts, kept with
+every byte the guest sent.
+
+What the script *matches* against goes through `ConvertTo-PlainText` first,
+because the tier-4 warning above applies here too and applied to the person
+who wrote this section: the first guest run reported `boot chain: Welcome to
+Ubuntu` as a failure on a guest that had reached its login prompt, because
+systemd colours the distribution name and `Welcome to Ubuntu` is not what is
+on the wire. Two lines up from where it is documented. If you add a marker,
+strip first.
+
+A check named `REGRESSION:` is one of the two evening bugs. If one of those
+goes red, the shipped product is broken for every new user, not flaky.
 
 ## Guest test images
 

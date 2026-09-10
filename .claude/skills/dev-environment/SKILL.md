@@ -192,8 +192,14 @@ times:
   checkout (installed users first). A fresh worktree therefore no longer needs
   its own EDK2 build: fetch once, or point `ENTANGLED_FIRMWARE_DIR` at a
   checkout that has one.
-  While this repository is private the fetch needs a token (`GITHUB_TOKEN`,
-  `GH_TOKEN` or `gh auth login`); without one it answers 404 and says so.
+  The fetch needs **no token** — the repository is public. It will use a
+  `GITHUB_TOKEN`/`GH_TOKEN`/`gh auth login` if it finds one (rate limits, and
+  if the repo ever goes private again). What it will not tolerate is a wrong
+  pin: on 2026-09-10 `guest/firmware/pinned.toml` still held the digest of a
+  *local* build while the workflow had published a different one, so every
+  fetch died on a digest mismatch and `release.yml` refused to build an
+  installer at all. The digest in that file is of the PUBLISHED asset; write it
+  only after the firmware workflow has published one.
 - `scripts/fetch-test-kernel.sh` fetches the *Debian installer's* kernel for the
   boot tests (not our bootstrap kernel — the name has misled people);
   `scripts/fetch-ubuntu-iso.sh [desktop]` fetches + verifies ISOs into the

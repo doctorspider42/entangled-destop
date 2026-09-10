@@ -30,28 +30,46 @@
 #   2. Commit that block. Until you do, `entangled` keeps fetching the previous
 #      tag, which still exists — a release tag is never reused.
 #
-# NOT PUBLISHED YET
-#   The digest below is of a firmware built by guest/firmware/build-cloudhv.sh
-#   on 2026-08-19 (edk2-stable202602, DEBUG/GCC5, flash base 0xFFC00000), and the
-#   whole fetch/verify/resolve chain was exercised end to end against it. Nobody
-#   with push rights has run the firmware workflow yet, so the tag below has no
-#   release behind it. Two consequences, both deliberate:
-#     * the Windows installer carries its own copy (installer/entangled.iss), so
-#       a fresh install needs no download at all — that is the route that makes
-#       the product work today;
-#     * a fetch answers 404 with a message saying exactly that. This repository
-#       is also PRIVATE, so even once published the download needs a token
-#       (GITHUB_TOKEN, GH_TOKEN or `gh auth login`); apps/entangled/src/artifact.rs
-#       takes the API asset route when it finds one.
-#   Run the workflow, replace this block with what it prints, and delete this
-#   note.
+# WHY THIS BLOCK WAS WRONG FOR A DAY, AND WHAT IT COSTS TO GET WRONG
+#   Until 2026-09-10 the digest here was of a firmware built *locally* on
+#   2026-08-19, written while the tag below had no release behind it. The
+#   firmware workflow then ran and published a real one — a build of this same
+#   script, from the same EDK2 tag, on a runner — and it hashed to something
+#   else. (The two CI builds of that evening, 106 seconds apart, are
+#   byte-identical to each other, so the build is reproducible on one image;
+#   what is not reproducible is a build on somebody's laptop against a
+#   different distribution's GCC.) Nothing noticed for a day, because a digest
+#   is only checked by a host that has to download:
+#     * the developer machine had the local build in its cache already and
+#       never fetched;
+#     * the Windows installer carries its own copy (installer/entangled.iss),
+#       so a fresh Windows install still worked.
+#   Everyone else — every Linux user, every WSL engine, every host recovering
+#   from a "firmware MISSING" — ran the one command the tool tells them to run
+#   and got "does not match the digest pinned in guest/firmware/pinned.toml".
+#   The release pipeline stopped too: .github/workflows/release.yml refuses to
+#   build an installer around a firmware that misses this pin, so main shipped
+#   nothing until the pin was corrected.
+#
+#   The lesson is in step 1 above: the digest here is of the PUBLISHED asset,
+#   which means it can only be written after the workflow has published one. A
+#   digest of a local build is a placeholder, and a placeholder that nothing
+#   fetches is a placeholder nothing catches.
+#
+#   scripts/fresh-install-acceptance.{ps1,sh} run `entangled fetch firmware`
+#   with an empty cache and no token, which is the check that would have caught
+#   this on the day it happened.
 
-tag = "firmware-edk2-stable202602-1"
+tag = "firmware-edk2-stable202602-2"
 edk2_tag = "edk2-stable202602"
 base_url = "https://github.com/doctorspider42/entangled-destop/releases/download"
-source = "https://github.com/doctorspider42/entangled-destop/releases/tag/firmware-edk2-stable202602-1"
+source = "https://github.com/doctorspider42/entangled-destop/releases/tag/firmware-edk2-stable202602-2"
 
 [[assets]]
 name = "CLOUDHV.fd"
-sha256 = "1622a4366769871659374b6f67211075546a669f2d3de700984e15aadb482c50"
+# The published build: OvmfPkg/CloudHv/CloudHvX64.dsc, DEBUG/GCC5,
+# DEBUG_ON_SERIAL_PORT, flash base 0xFFC00000, EDK2 commit
+# b7a715f7c03c45c6b4575bf88596bfd79658b8ce, built 2026-09-09T20:21:34Z. The
+# release's own SHA256SUMS and CLOUDHV.fd.provenance both say the same thing.
+sha256 = "0f8db260025fdac81fceb0c17555ea8a33e1f63a4ac41ed8aac8856fc6e6a425"
 bytes = 4194304

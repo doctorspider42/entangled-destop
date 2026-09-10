@@ -32,18 +32,22 @@
 //!
 //! In short: as strong as the git history of this repository, and no stronger.
 //!
-//! # The private-repository problem
+//! # Credentials: not needed, still supported
 //!
-//! This repository is private, and a plain
-//! `https://github.com/<owner>/<repo>/releases/download/<tag>/<file>` URL
-//! answers **404** to anyone without credentials — indistinguishable from "not
-//! published yet". Private release assets are only reachable through the API:
-//! resolve the release by tag, find the asset's id, then `GET` that asset's API
-//! URL with `Accept: application/octet-stream`. [`github_token`] finds a token
-//! if the host has one (`GITHUB_TOKEN`, `GH_TOKEN`, `gh auth token`) and
-//! [`fetch_into`] takes that route when it does. With no token the browser URL
-//! is used, and a 404 says so in as many words instead of pretending the
-//! release is missing.
+//! **This repository is public**, so the plain
+//! `https://github.com/<owner>/<repo>/releases/download/<tag>/<file>` URL is
+//! all a newcomer needs, and that is the route taken when no token is present.
+//! Say it plainly, because it has not always been true and a message that
+//! still claimed otherwise sent people off to make a personal access token
+//! they did not need.
+//!
+//! The authenticated route stays, because it costs one branch and covers two
+//! cases: a repository made private again, and the unauthenticated rate limit.
+//! Private release assets are only reachable through the API — resolve the
+//! release by tag, find the asset's id, then `GET` that asset's API URL with
+//! `Accept: application/octet-stream`. [`github_token`] finds a token if the
+//! host has one (`GITHUB_TOKEN`, `GH_TOKEN`, `gh auth token`) and
+//! [`fetch_into`] takes that route when it does.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -522,9 +526,12 @@ pub fn github_token() -> Option<String> {
 /// A 404 here has a small number of likely causes and an exact fix for each, so
 /// say them rather than leaving "HTTP status 404" to be interpreted.
 ///
-/// The private-repository case is first because it is the one that is true
-/// today: this repository is private, so an unauthenticated release download
-/// 404s whether or not the release exists.
+/// The repository is **public**, so a 404 with no token means what it says:
+/// there is no such asset. That has not always been true, and while it was not,
+/// this message told everyone to go and make a personal access token — advice
+/// that is now a detour into GitHub's settings for a problem it cannot fix. So
+/// the missing asset is named first, and credentials are the footnote they
+/// became.
 fn missing_hint(release: &Release<'_>, error: &TransportError, token: Option<&str>) -> String {
     let Hint {
         workflow,
@@ -533,13 +540,15 @@ fn missing_hint(release: &Release<'_>, error: &TransportError, token: Option<&st
     } = release.hint;
     match error {
         TransportError::Status(404) if token.is_none() => format!(
-            "\n  this repository is PRIVATE, so an unauthenticated release download always \
-             answers 404 — whether or not the asset exists. Set GITHUB_TOKEN (or GH_TOKEN, or \
-             sign in with `gh auth login`) and run this again; with a token the download goes \
-             through the API asset endpoint, which private repositories do serve.\
-             \n  Failing that: the release pinned in {} may simply not be published yet (see \
-             {workflow}), {base_url_env} can point at a mirror, and {dir_env} can name a \
-             directory that already holds the files",
+            "\n  the release tag pinned in {} has no such asset. Either {workflow} has not \
+             published it yet, or the pin names a tag that does not exist. {base_url_env} can \
+             point at a mirror, and {dir_env} can name a directory that already holds the \
+             files.\
+             \n  No credentials are needed for this download — the repository is public. If it \
+             has been made private again, an unauthenticated download answers 404 whether or \
+             not the asset exists: set GITHUB_TOKEN (or GH_TOKEN, or sign in with `gh auth \
+             login`) and the download takes the API asset endpoint, which private repositories \
+             do serve",
             release.pin_path
         ),
         TransportError::Status(404) => format!(
@@ -636,11 +645,13 @@ mod tests {
         assert_eq!(asset_url_in("not json at all", "CLOUDHV.fd"), None);
     }
 
-    /// The 404 a user actually hits today, on a private repository with no
-    /// token: it must say *private* and name the token, because "404" alone
-    /// reads as "this project never published it".
+    /// The 404 a newcomer actually hits: no token, public repository, so the
+    /// asset really is not there. It must name the pin and the workflow first,
+    /// and must not send anyone off to make a personal access token as though
+    /// that were the fix — which is what it used to do, and which stayed in the
+    /// message for as long as nobody without credentials tried it.
     #[test]
-    fn an_unauthenticated_404_blames_the_private_repository() {
+    fn an_unauthenticated_404_blames_the_missing_asset_not_the_reader() {
         let assets = [PinnedAsset {
             name: "CLOUDHV.fd".into(),
             sha256: "d4".repeat(32),
@@ -659,9 +670,21 @@ mod tests {
             },
         };
         let hint = missing_hint(&release, &TransportError::Status(404), None);
-        assert!(hint.contains("PRIVATE"), "{hint}");
-        assert!(hint.contains("GITHUB_TOKEN"), "{hint}");
         assert!(hint.contains("guest/firmware/pinned.toml"), "{hint}");
+        assert!(hint.contains(".github/workflows/firmware.yml"), "{hint}");
+        assert!(hint.contains("ENTANGLED_FIRMWARE_DIR"), "{hint}");
+        assert!(
+            hint.contains("No credentials are needed"),
+            "a public repository's 404 must not read as an authentication problem: {hint}"
+        );
+        // The private case is a footnote, not the headline — but it is still
+        // there, because this repository has been private before.
+        assert!(hint.contains("GITHUB_TOKEN"), "{hint}");
+        let headline = hint.trim_start().lines().next().unwrap_or_default();
+        assert!(
+            !headline.contains("GITHUB_TOKEN") && !headline.contains("private"),
+            "the first line must be about the asset, not about credentials: {headline}"
+        );
 
         // With a token a 404 means something else, and says so.
         let hint = missing_hint(&release, &TransportError::Status(404), Some("t"));

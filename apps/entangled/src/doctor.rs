@@ -18,11 +18,43 @@ use std::path::Path;
 #[cfg(any(target_os = "linux", windows))]
 use disk_image::ops::disk_space;
 
+/// The hypervisor verdict and the portable inventory, in that order, with the
+/// verdict deciding only the *exit code*.
+///
+/// The order is load-bearing and it was learned the expensive way. A host whose
+/// hypervisor is unavailable is exactly the host whose owner most needs the
+/// second half — "is the firmware there, did the installer ship it, is there an
+/// engine in WSL" — and until this function existed `doctor` answered that host
+/// with one line and an error. The person who has just turned a Windows feature
+/// on and not yet rebooted, or who is not in the `kvm` group, learned nothing
+/// about their installation; neither did a CI runner, which is why the
+/// fresh-install acceptance could not assert the shipped-firmware regression on
+/// one (`scripts/fresh-install-acceptance.ps1`).
+///
+/// So: print what this host *has* whatever the hypervisor said, and then fail
+/// if it said no. Nothing about the exit code changes — a host that cannot run
+/// VMs still exits non-zero, and the manager's Diagnostics panel still says
+/// "This host cannot run machines yet" over a panel that now has content in it.
+#[cfg(any(target_os = "linux", windows))]
+fn report(hypervisor: Result<(), String>) -> Result<(), String> {
+    engines();
+    install_readiness();
+    hypervisor?;
+    println!("host looks ready to run VMs");
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub fn run() -> Result<(), String> {
+    println!("entangled doctor");
+    report(kvm())
+}
+
+/// The KVM arm's verdict: prints what it found, returns whether it is usable.
+#[cfg(target_os = "linux")]
+fn kvm() -> Result<(), String> {
     use vmm_core::Hypervisor;
 
-    println!("entangled doctor");
     if !std::path::Path::new("/dev/kvm").exists() {
         return Err(
             "/dev/kvm not found — KVM is unavailable (kernel module missing or no \
@@ -37,9 +69,6 @@ pub fn run() -> Result<(), String> {
             println!("  memory slots    : {}", caps.nr_memslots);
             if caps.is_runnable() {
                 println!("  required caps   : all present");
-                engines();
-                install_readiness();
-                println!("host looks ready to run VMs");
                 Ok(())
             } else {
                 Err(format!(
@@ -56,6 +85,13 @@ pub fn run() -> Result<(), String> {
 }
 
 /// The WHP arm (EPIC 17 phase 3).
+#[cfg(windows)]
+pub fn run() -> Result<(), String> {
+    println!("entangled doctor");
+    report(whp())
+}
+
+/// The WHP arm's verdict: prints what it found, returns whether it is usable.
 ///
 /// WHP has no device node to check, so "is it there" is a capability query, and a
 /// disabled optional feature is reported rather than thrown: that is the whole
@@ -68,10 +104,9 @@ pub fn run() -> Result<(), String> {
 /// VM per process because WHP will only map guest memory for a single partition
 /// per host process.
 #[cfg(windows)]
-pub fn run() -> Result<(), String> {
+fn whp() -> Result<(), String> {
     use vmm_core::whp::{WhpHypervisor, WHP_ENABLE_HINT};
 
-    println!("entangled doctor");
     let caps = WhpHypervisor::probe()
         .map_err(|e| format!("cannot query the Windows Hypervisor Platform: {e}"))?;
     println!(
@@ -104,9 +139,6 @@ pub fn run() -> Result<(), String> {
     println!("                    one are GPL). backend = \"tap\" is Linux-only.");
     println!("  VMs per process : 1 — WHP maps guest memory for one partition per process,");
     println!("                    so a second VM needs a second `entangled` process");
-    engines();
-    install_readiness();
-    println!("host looks ready to run VMs");
     Ok(())
 }
 

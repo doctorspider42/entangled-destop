@@ -237,12 +237,13 @@ If a host has none of them:
                     Or pass --firmware, or point ENTANGLED_FIRMWARE_DIR at a directory holding CLOUDHV.fd.
 ```
 
-**While this repository is private**, `entangled fetch firmware` needs a GitHub
-token to reach the release asset — an unauthenticated download answers 404
-whether or not the asset exists. Set `GITHUB_TOKEN` or `GH_TOKEN`, or sign in
-with `gh auth login`, and the fetch uses it automatically. The installer copy
-(row 3) needs nothing, which is why it is the one that makes a fresh machine
-work.
+`entangled fetch firmware` needs **no credentials**: this repository is public
+and the download is an ordinary HTTPS request, verified against a SHA-256
+pinned in the binary. (It will use a `GITHUB_TOKEN`, a `GH_TOKEN` or a `gh auth
+login` if it finds one, which matters only if the repository is ever made
+private again, or if you are behind the unauthenticated rate limit.) The
+installer copy — row 3 — needs not even that, which is why it is the one that
+makes a fresh Windows machine work with nothing downloaded at all.
 
 ## Check the host first: `entangled doctor`
 
@@ -493,12 +494,13 @@ UEFI machine with no download at all. The attribution it does require is in
 `THIRD-PARTY-NOTICES.txt`: shown on the installer's licence page and installed
 beside the program.
 
-**While this repository is private, the download needs a GitHub token.** An
-unauthenticated release-asset URL answers 404 whether or not the asset exists,
-so set `GITHUB_TOKEN` or `GH_TOKEN`, or sign in with `gh auth login`, and the
-fetch will use it (it switches to the API asset endpoint, which private
-repositories do serve). This affects `entangled fetch bootstrap-kernel`
-identically. It does not affect the installer's copy, which is already on disk.
+**The download needs no credentials.** The repository is public, so the
+release-asset URL is an ordinary HTTPS request; the digest pinned in the binary
+is what makes it safe, not the transport. A `GITHUB_TOKEN`, a `GH_TOKEN` or a
+`gh auth login` is used if present — it switches to the API asset endpoint,
+which is what a *private* repository needs and what the unauthenticated rate
+limit sometimes needs. The same is true of `entangled fetch bootstrap-kernel`,
+and none of it affects the installer's copy, which is already on disk.
 
 ## Living with a VM
 

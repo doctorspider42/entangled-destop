@@ -649,18 +649,41 @@ kernel uses (`apps/entangled/src/artifact.rs`, generalised out of
 used, and the provenance manifest written beside them says `signature_verified
 = false`, because nothing signs these.
 
-**While this repository is private the download needs a token.** A plain
-`https://github.com/…/releases/download/…` URL answers 404 to anyone without
-credentials, indistinguishable from "never published" — which is exactly why
-the bootstrap kernel's fetch path has never worked for anyone but the owner.
-The fetcher now takes the API asset route (`GET
-/repos/<o>/<r>/releases/tags/<tag>`, then the asset's own URL with `Accept:
-application/octet-stream`) whenever it finds a `GITHUB_TOKEN`, a `GH_TOKEN` or
-a `gh auth token`, and without one the 404 says *private* rather than implying
-nothing exists. That closes the gap for a developer; it does not close it for a
-stranger, and the installer copy is the answer for the stranger. If the
-repository is ever made public the token becomes optional and nothing else
-changes.
+**Amendment, 2026-09-10 — the download needs no token, and the pin is the
+thing that has to be right.** The repository is public, so a plain
+`https://github.com/…/releases/download/…` URL serves the asset to anyone. The
+API asset route (`GET /repos/<o>/<r>/releases/tags/<tag>`, then the asset's own
+URL with `Accept: application/octet-stream`) is still taken whenever a
+`GITHUB_TOKEN`, a `GH_TOKEN` or a `gh auth token` is present, because it costs
+one branch and covers both a repository made private again and the
+unauthenticated rate limit. What is *not* optional is the digest, and that is
+where this actually failed:
+
+`guest/firmware/pinned.toml` carried the SHA-256 of a firmware built locally
+on 2026-08-19, written at a time when nothing had been published under the
+tag. When `.github/workflows/firmware.yml` later published a real one — the
+same script, the same EDK2 tag, a different machine — the bytes differed, and
+every `entangled fetch firmware` in existence began
+answering "does not match the digest pinned in guest/firmware/pinned.toml".
+Nobody noticed for a day, because the only hosts that fetch are the ones
+without a copy: the developer machine had the local build cached and the
+Windows installer carries its own. (The two CI builds of that evening, 106
+seconds apart, are byte-identical to each other — the build *is* reproducible
+on one runner image. What is not reproducible is a build on a laptop against
+another distribution's GCC, which is what the old digest was of.)
+`.github/workflows/release.yml` noticed
+eventually, in the harshest possible way — it refuses to build an installer
+around a firmware that misses the pin, so main published nothing at all.
+
+Two rules come out of it, both now written into the pin file itself:
+
+* the digest in the pin is of the **published** asset, so it can only be
+  written *after* the workflow has published one. A digest of a local build is
+  a placeholder, and a placeholder nothing fetches is a placeholder nothing
+  catches;
+* the thing that catches it is a host with an empty cache and no credentials —
+  which is what `scripts/fresh-install-acceptance.{ps1,sh}` and the
+  `Fresh install` workflow now are.
 
 ### The lookup
 
