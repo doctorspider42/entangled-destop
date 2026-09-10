@@ -1077,10 +1077,12 @@ impl ManagerApp {
                 Err(message) => self.scan_error = Some(message),
             }
         }
-        // A pending install whose profile has appeared is now a real VM.
+        // A pending install whose profile has appeared is now a real VM — so it
+        // stays pending only while no profile is scanned for it, or while its
+        // own child process is still running.
         let known: Vec<String> = self.scan.vms.iter().map(|vm| vm.name.clone()).collect();
         self.pending
-            .retain(|p| !(known.contains(&p.name) && !self.supervisor.is_busy(&p.name)));
+            .retain(|p| !known.contains(&p.name) || self.supervisor.is_busy(&p.name));
     }
 
     fn open_screenshot_surface(&mut self) {

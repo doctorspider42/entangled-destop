@@ -439,3 +439,42 @@ reasoning:
 One limit is worth stating plainly because it is easy to assume otherwise:
 **usernet forwards UDP only for DHCP and DNS.** QUIC, NTP, mDNS and game
 traffic do not cross it, and a test says so.
+
+## Amendment, 2026-09-10 — WHP's version skew is a portability seam too
+
+This ADR's portability rules are about the two *hosts*. One finding says they
+are not enough: two Windows versions of the same host can disagree about an API
+this backend depends on.
+
+`WHvDeleteVirtualProcessor` followed by `WHvCreateVirtualProcessor` at the same
+index works on the Windows the WHP backend was developed against, and does not
+work at all on Windows 10 19045 (AMD Threadripper 1920X, WHP feature on): the
+delete succeeds, and every create for that index afterwards returns
+`E_INVALIDARG (0x80070057)` for the life of the partition. That pattern was how
+the reset returned a virtual processor to power-on state, so on that host a
+reboot ended the VM. ADR-0005's 2026-09-10 amendment has the measurement, the
+replacement, and the reason the replacement is more portable rather than merely
+different: it asks WHP for nothing beyond reading and writing processor state,
+which is what suspend/restore already needs.
+
+Two rules follow, both cheap:
+
+- **Prefer state a host will hand back over state a host will recreate.** Where
+  the choice exists, reading the pristine state once and writing it again asks
+  less of the platform than any "make me a new one of these" call, and it is
+  the same code the snapshot already owes (ADR-0006).
+- **Phase 4's BSP-only rule stands and gets simpler.** Register setup is still
+  BSP-only, and an AP still must not be touched by the host — but the reset no
+  longer needs to *know* that: the state it writes back is per index, so the
+  AP's wait-for-startup activity word returns to an AP and nothing branches on
+  `is_boot_cpu`.
+
+A third point is about the tests rather than the API. Both WHP reset tests
+self-skip without the guest artifacts (`artifacts/bootstrap/vmlinuz`,
+`artifacts/tests/test-initramfs.cpio.gz`), which are gitignored and built by a
+bash script — so on a Windows-only checkout they had always skipped, and a
+platform difference this basic went unseen. The script is Linux-only but the
+work is not: the `init` cross-builds from Windows with
+`rustup target add x86_64-unknown-linux-musl` and
+`RUSTFLAGS="-Clinker=rust-lld -Clink-self-contained=yes"`, and the `cpio`/`gzip`
+packing is one WSL command. The `whp-backend` skill carries the exact recipe.
