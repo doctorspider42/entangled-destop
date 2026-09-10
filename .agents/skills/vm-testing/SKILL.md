@@ -151,6 +151,15 @@ Copy this list when writing anything that claims to test a shipped artifact:
   directory is row 5 of the firmware lookup, and a test run from a checkout
   passes whatever the installer did.
 
+### Never run the setup without `/DIR`
+
+Inno **ignores an unrecognised command-line parameter** — no complaint, no
+stop. So `setup.exe /VERYSILENT /EXTRACT=<dir>`, which looks like a way to
+list what a release ships without installing it, is in fact a silent
+unattended install into `{autopf}` on top of whatever was already there. It
+did exactly that on this machine while somebody was trying to avoid touching
+a real installation. There is no `/EXTRACT`. Name the destination, every time.
+
 ### Do not disturb the real installation
 
 `installer/entangled.iss` keeps one `AppId` for the life of the product — it is
@@ -199,8 +208,16 @@ It cannot cover:
 Each check prints `[PASS]`/`[FAIL]` with the evidence under it, and the
 Windows script writes `-JsonReport` for the workflow summary. The stage logs
 (`<root>\logs\`) survive cleanup on purpose — `setup.log` is Inno's own, and
-`guest-install.log` / `guest-boot.log` are the serial transcripts, to be read
-with the same ANSI-and-not-UTF-8 care as any other transcript here.
+`guest-install.log` / `guest-boot.log` are the serial transcripts, kept with
+every byte the guest sent.
+
+What the script *matches* against goes through `ConvertTo-PlainText` first,
+because the tier-4 warning above applies here too and applied to the person
+who wrote this section: the first guest run reported `boot chain: Welcome to
+Ubuntu` as a failure on a guest that had reached its login prompt, because
+systemd colours the distribution name and `Welcome to Ubuntu` is not what is
+on the wire. Two lines up from where it is documented. If you add a marker,
+strip first.
 
 A check named `REGRESSION:` is one of the two evening bugs. If one of those
 goes red, the shipped product is broken for every new user, not flaky.

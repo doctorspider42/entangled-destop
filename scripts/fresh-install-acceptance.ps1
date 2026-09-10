@@ -233,6 +233,35 @@ function Exit-StrangerEnv {
 }
 
 <#
+    A serial transcript is neither plain text nor reliably UTF-8, and both
+    halves have cost this project an acceptance run before. `Get-Content -Raw`
+    handles the second (it substitutes rather than failing); this handles the
+    first.
+
+    systemd colours the distribution name, so what is actually on the wire is
+
+        ESC[0;1;39mWelcome to ESC[0mESC[1mUbuntu 26.04 LTS
+
+    and `-match 'Welcome to Ubuntu'` can never match it. A marker split by an
+    escape sequence is not a marker. The raw bytes stay in the log file; only
+    what is matched against goes through here.
+
+    Four families, because a boot transcript has all four: CSI (ESC[...),
+    OSC (ESC]... terminated by BEL or ST — the boot-progress markers use it),
+    DCS (ESCP... ST — the terminfo query does), and lone two-character
+    escapes.
+#>
+function ConvertTo-PlainText {
+    param([string] $Text)
+    if (-not $Text) { return '' }
+    $Text = $Text -replace "\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?", ''
+    $Text = $Text -replace "\u001bP[^\u001b]*(?:\u001b\\)?", ''
+    $Text = $Text -replace "\u001b\[[0-9;?]*[ -/]*[@-~]", ''
+    $Text = $Text -replace "\u001b[@-Z\\-_]", ''
+    return $Text
+}
+
+<#
     Runs an installed binary the way a newcomer's shell would, capturing
     everything it printed.
 
@@ -265,7 +294,7 @@ function Invoke-Stranger {
         $sawMarker = $false
         while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
             if ($UntilMarker) {
-                $sofar = Get-Content -Raw -LiteralPath $Log -ErrorAction SilentlyContinue
+                $sofar = ConvertTo-PlainText (Get-Content -Raw -LiteralPath $Log -ErrorAction SilentlyContinue)
                 if ($sofar -and $sofar.Contains($UntilMarker)) { $sawMarker = $true; break }
             }
             Start-Sleep -Milliseconds 500
@@ -279,10 +308,12 @@ function Invoke-Stranger {
             try { $proc.Kill($true) } catch { }
             $proc.WaitForExit(30000) | Out-Null
         }
-        $out = (Get-Content -Raw -LiteralPath $Log -ErrorAction SilentlyContinue) ?? ''
         $err = (Get-Content -Raw -LiteralPath $errLog -ErrorAction SilentlyContinue) ?? ''
-        if ($err) { $out = $out + $err; Add-Content -LiteralPath $Log -Value $err }
+        if ($err) { Add-Content -LiteralPath $Log -Value $err }
         Remove-Item -LiteralPath $errLog -ErrorAction SilentlyContinue
+        # The escapes are stripped from what callers match against; the log
+        # file on disk keeps every byte the guest sent.
+        $out = ConvertTo-PlainText (((Get-Content -Raw -LiteralPath $Log -ErrorAction SilentlyContinue) ?? '') + $err)
         return @{
             ExitCode   = ($proc.HasExited ? $proc.ExitCode : -1)
             Output     = $out
@@ -335,7 +366,8 @@ $StrangerProfile = @{
 }
 
 $Entangled = Join-Path $AppDir 'entangled.exe'
-$Manager   = Join-Path $AppDir 'entangled-manager.exe'
+# The manager is only ever checked for existence: it is an eframe GUI, and
+# starting it to ask its version would put a window on somebody's desktop.
 $Firmware  = Join-Path $AppDir 'artifacts\firmware\CLOUDHV.fd'
 
 $order = @('download', 'install', 'tree', 'doctor', 'fetch', 'engine', 'guest')
@@ -488,6 +520,13 @@ if ($run['install']) {
 
     $script:HadExisting = Backup-ExistingInstallation
 
+    # NEVER run this setup without /DIR, and never with a switch it does not
+    # know. Inno IGNORES an unrecognised parameter — it does not complain and
+    # it does not stop — so `setup.exe /VERYSILENT /EXTRACT=<dir>` (there is no
+    # /EXTRACT) is a silent, unattended install into {autopf}, straight over
+    # whatever the person running it already had. Asked for a file listing,
+    # it upgraded a real installation instead. Every invocation here names its
+    # destination.
     $setupLog = Join-Path $script:LogDir 'setup.log'
     $setupArgs = @(
         '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCANCEL',
@@ -731,7 +770,7 @@ if ($run['engine']) {
         -Condition $hasWslCli `
         -Detail ($hasWslCli ?
             'entangled wsl install-engine — what the manager button and the installer task both run' :
-            "this release has no `wsl` subcommand, so installer/entangled.iss's optional task would exit -1 and the manager's Settings button is the only way in:`n" +
+            "this release has no 'wsl' subcommand, so installer/entangled.iss's optional task would exit -1 and the manager's Settings button is the only way in:`n" +
             (($help.Output -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 3) -join "`n")) | Out-Null
 
     # The installer offers the same thing at install time. Read out of the
@@ -808,8 +847,15 @@ if ($run['guest']) {
 
             Assert-Check -Name 'the installed system reaches a login prompt' -Condition $boot.SawMarker `
                 -Detail (($boot.Output -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6) -join "`n") | Out-Null
-            foreach ($needle in @('shimx64.efi', 'GNU GRUB', 'Welcome to Ubuntu')) {
-                Assert-Check -Name "boot chain: $needle" -Condition ($boot.Output -match [regex]::Escape($needle)) -Detail '' | Out-Null
+            # Each one proves the step before it could not have been skipped:
+            # the firmware loaded the *installed* bootloader out of the
+            # persisted NVRAM entry (with no Boot#### it would fall back to
+            # removable media), GRUB ran, the installed kernel reached
+            # systemd, and the late-commands console configuration took.
+            foreach ($needle in @('\EFI\ubuntu\shimx64.efi', 'GNU GRUB', 'Welcome to Ubuntu',
+                    'serial-getty@ttyS0')) {
+                Assert-Check -Name "boot chain: $needle" `
+                    -Condition ($boot.Output.Contains($needle)) -Detail '' | Out-Null
             }
         }
     }
