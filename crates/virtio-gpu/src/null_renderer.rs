@@ -52,12 +52,18 @@ const CAPSETS: [CapsetInfo; 2] = [
 /// Capsets served in Venus mode ([`NullRenderer::with_venus`]): the virgl pair
 /// plus [`crate::CAPSET_VENUS`].
 ///
-/// The venus capset blob is `struct virgl_renderer_capset_venus`, which is
-/// `{ u32 wire_format_version; u32 vk_xml_version; u32 vk_ext_command_serialization_spec_version; u32 vk_ms_command_serialization_spec_version; ... }`
-/// — 32 bytes in the versions that matter. We serve zeroes of that length: a
-/// guest that reads it sees wire format 0 and declines to use the context,
-/// which is exactly right for a renderer that cannot execute Vulkan. The point
-/// of the loopback is to prove the *plumbing* end to end, not to pretend.
+/// The venus capset blob is `struct virgl_renderer_capset_venus`, and its
+/// length is [`crate::venus::capset::VENUS_CAPSET_LEN`] — taken from there
+/// rather than written out again, because a loopback that advertises a
+/// *different* size from the real one tests the wrong plumbing. It said 32
+/// until 2026-09-16, when the real struct was read out of virglrenderer's
+/// `src/venus_hw.h` and turned out to be 40 words; the comment here had also
+/// mis-named the fourth field (it is `vk_mesa_venus_protocol_spec_version`).
+///
+/// We serve zeroes of that length: a guest that reads it sees wire format 0
+/// and declines to use the context, which is exactly right for a renderer that
+/// cannot execute Vulkan. The point of the loopback is to prove the *plumbing*
+/// end to end, not to pretend.
 const CAPSETS_VENUS: [CapsetInfo; 3] = [
     CAPSETS[0],
     CAPSETS[1],
@@ -68,8 +74,9 @@ const CAPSETS_VENUS: [CapsetInfo; 3] = [
     },
 ];
 
-/// Size of the venus capset blob (`struct virgl_renderer_capset_venus`).
-const VENUS_CAPSET_BYTES: u32 = 32;
+/// Size of the venus capset blob (`struct virgl_renderer_capset_venus`), from
+/// the module that owns the layout.
+const VENUS_CAPSET_BYTES: u32 = crate::venus::capset::VENUS_CAPSET_LEN as u32;
 
 /// Size of the loopback host-visible window ([`NullRenderer::with_venus`]):
 /// enough that the mapping bookkeeping is exercised with realistic offsets,

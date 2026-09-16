@@ -77,6 +77,7 @@ pub mod renderer;
 pub mod resource;
 pub mod save;
 pub mod sink;
+pub mod venus;
 #[cfg(target_os = "linux")]
 pub mod virgl;
 

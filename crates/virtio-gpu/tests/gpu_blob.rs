@@ -598,7 +598,11 @@ fn a_venus_renderer_makes_the_device_offer_blob_context_init_and_a_window() {
     );
     let capset = h.run(&Request::new(cmd::GET_CAPSET).u32(CAPSET_VENUS).u32(0));
     assert_eq!(capset.kind(), resp::OK_CAPSET);
-    assert_eq!(capset.body().len(), 32, "virgl_renderer_capset_venus");
+    assert_eq!(
+        capset.body().len(),
+        virtio_gpu::venus::capset::VENUS_CAPSET_LEN,
+        "the guest is served a whole `struct virgl_renderer_capset_venus`; it read          32 bytes until 2026-09-16, when the struct was read out of virglrenderer's          src/venus_hw.h and turned out to be 40 words"
+    );
 
     // The shared-memory region is declared but *absent* until the machine
     // layer places it — a driver told about a window that decodes nothing
