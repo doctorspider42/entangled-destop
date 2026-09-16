@@ -299,6 +299,25 @@ fn build_devices(
     if cfg.display.virgl {
         #[cfg(target_os = "linux")]
         {
+            // A renderer this program fetched is offered to the loader as a
+            // *preference* (`ENTANGLED_VIRGL_LIB_DEFAULT`), never as an
+            // instruction: if it will not open — a host with no Vulkan loader
+            // is the case that happens — `virtio_gpu::virgl` falls through to
+            // the system library rather than losing 3D altogether. An operator
+            // who set `ENTANGLED_VIRGL_LIB` outranks both and is left alone.
+            // Set before the renderer is built, and before the isolated one is
+            // spawned, because the helper process inherits this environment.
+            if std::env::var_os(virtio_gpu::virgl::LIB_ENV).is_none() {
+                if let Some(found) = crate::virgl_lib::locate() {
+                    tracing::info!(
+                        lib = %found.lib.display(),
+                        server = %found.server.display(),
+                        origin = found.origin.as_str(),
+                        "offering a Venus-capable virglrenderer to the 3D renderer"
+                    );
+                    std::env::set_var(virtio_gpu::virgl::LIB_DEFAULT_ENV, &found.lib);
+                }
+            }
             // GPU-012 (ADR-0004): by default the renderer runs in its own
             // process, so a crash inside the host GL stack degrades this VM to
             // 2D instead of killing it. `virgl_isolation = "in-process"` puts

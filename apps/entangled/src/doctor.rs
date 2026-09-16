@@ -38,6 +38,7 @@ use disk_image::ops::disk_space;
 #[cfg(any(target_os = "linux", windows))]
 fn report(hypervisor: Result<(), String>) -> Result<(), String> {
     engines();
+    three_d();
     install_readiness();
     hypervisor?;
     println!("host looks ready to run VMs");
@@ -350,4 +351,77 @@ pub fn run() -> Result<(), String> {
          Hypervisor Platform"
             .into(),
     )
+}
+
+/// Whether this host can serve the guest's 3D, and with what
+/// ([ADR-0004](../../../docs/adr/0004-virtio-gpu-3d.md)).
+///
+/// `doctor` was silent about 3D until 2026-09-16, which meant the one tool
+/// whose job is "will this host run VMs" could not answer "will this host do
+/// 3D" — and the answer is not obvious: it depends on an artifact that is
+/// neither in the installer nor in any distribution, and `[display] virgl =
+/// true` fails at VM start rather than at configuration time. So this reports
+/// it before anybody spends a boot finding out.
+///
+/// What it deliberately does *not* claim: whether a distribution's own
+/// `libvirglrenderer` is present. Finding that out means `dlopen`ing it, and
+/// `doctor` starts no renderers — so a host with no pinned pair is reported as
+/// having no *Venus*, with the system library named as the thing that may still
+/// serve classic VirGL.
+#[cfg(target_os = "linux")]
+fn three_d() {
+    match crate::virgl_lib::locate() {
+        Some(found) => {
+            println!(
+                "  3D              : Venus — virglrenderer at {} (from {})",
+                found.lib.display(),
+                found.origin.as_str()
+            );
+            println!(
+                "                    render server {} (needs libvulkan.so.1 at run time)",
+                found.server.display()
+            );
+        }
+        None => {
+            println!(
+                "  3D              : no Venus renderer — `[display] virgl = true` will use this"
+            );
+            println!("                    host's own libvirglrenderer if it has one, which serves");
+            println!("                    classic VirGL and no Venus (jammy packages 0.9.1).");
+            for line in wrap_hint(&crate::virgl_lib::missing_hint()) {
+                println!("                    {line}");
+            }
+        }
+    }
+}
+
+/// The Windows arm, where the answer is short and fixed: the host renderer
+/// speaks EGL, and this host has no equivalent yet (ADR-0004's Windows plan).
+#[cfg(windows)]
+fn three_d() {
+    println!("  3D              : none — `[display] virgl = true` is Linux-only; the host");
+    println!("                    renderer (virglrenderer) speaks EGL. Run the VM on the");
+    println!("                    WSL (KVM) backend for 3D, or leave it off and get 2D.");
+}
+
+/// Breaks a one-line hint at word boundaries so it sits inside `doctor`'s
+/// indented column rather than wrapping raggedly in a narrow terminal.
+#[cfg(target_os = "linux")]
+fn wrap_hint(hint: &str) -> Vec<String> {
+    const WIDTH: usize = 74;
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in hint.split_whitespace() {
+        if !current.is_empty() && current.len() + 1 + word.len() > WIDTH {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }

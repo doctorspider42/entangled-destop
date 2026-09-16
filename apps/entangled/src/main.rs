@@ -33,6 +33,12 @@ mod run_vm;
 #[cfg(any(target_os = "linux", windows))]
 mod seed;
 mod snapshot;
+// The renderer is a Linux `.so` that only the Linux engine can `dlopen`, so the
+// module that finds and fetches it is Linux-only too. `fetch virglrenderer` on
+// Windows says where the artifact belongs rather than downloading bytes that
+// host cannot use.
+#[cfg(target_os = "linux")]
+mod virgl_lib;
 /// `entangled wsl install-engine`: the Linux engine inside WSL, installed from
 /// a script. Portable for the same reason the rest of this list is — the
 /// flags, the exit-code table and the report parse everywhere; only the
@@ -217,14 +223,15 @@ enum Command {
 #[derive(Args)]
 pub struct FetchArgs {
     /// What to fetch: "debian" (verified installer media), "firmware" (the
-    /// UEFI firmware every UEFI guest boots — 4 MiB, EDK2 CloudHvX64) or
+    /// UEFI firmware every UEFI guest boots — 4 MiB, EDK2 CloudHvX64),
     /// "bootstrap-kernel" (the guest kernel and initramfs `install debian`
-    /// runs on, ~13 MiB). The latter two are checked against a SHA-256 pinned
-    /// in this build.
+    /// runs on, ~13 MiB) or "virglrenderer" (the host 3D renderer that serves
+    /// Venus, Linux only). All but the first are checked against a SHA-256
+    /// pinned in this build.
     ///
-    /// The three options below describe Debian media only; the firmware and
-    /// the bootstrap artifacts are one pinned release each, so there is
-    /// nothing to choose.
+    /// The three options below describe Debian media only; the firmware, the
+    /// bootstrap artifacts and the renderer are one pinned release each, so
+    /// there is nothing to choose.
     distro: String,
     #[arg(long, default_value = "stable")]
     channel: String,

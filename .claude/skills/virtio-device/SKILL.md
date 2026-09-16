@@ -878,3 +878,37 @@ when a resumed guest misbehaves: on **KVM** the 8259s, IOAPIC and 8254 are in
 the kernel, and the snapshot carries them through `vmm_core::hv::HostIrqChip`.
 A restore that skipped them comes back with every IOAPIC pin masked — and MSI-X
 devices keep working, so the VM looks half-alive.
+
+## Publishing the renderer (ADR-0004, 2026-09-16)
+
+A Venus-capable virglrenderer is now a **published, pinned artifact**, the third
+after the UEFI firmware and the bootstrap kernel:
+
+* `entangled fetch virglrenderer` downloads `libvirglrenderer.so.1` and
+  `virgl_render_server` into `<cache>/virglrenderer/<tag>/`, digest-checked
+  against `guest/virglrenderer/pinned.toml`.
+* `.github/workflows/virglrenderer.yml` builds and publishes them, on
+  **ubuntu-22.04** — the same runner as the Linux engine, so both binaries this
+  project ships for Linux carry the same floor, GLIBC_2.34. Do not "modernise"
+  that runner: a newer one silently narrows the hosts that can load the renderer
+  to fewer than the hosts that can run the engine.
+* `apps/entangled/src/virgl_lib.rs` finds them (`ENTANGLED_VIRGL_DIR`, then the
+  verified cache) and `doctor` reports the result as a `3D:` line.
+
+Two rules that are easy to break and expensive to debug:
+
+**Both files or nothing.** Venus exists only behind the render server, so a
+directory holding just the library is not a renderer and `pair_in` says so. A
+library published alone would serve classic virgl and refuse every Venus command
+in band — green logs, no Venus, no explanation.
+
+**Never point `ENTANGLED_VIRGL_LIB` at a fetched library from code.** That
+variable is a *person's* instruction and a path that will not open is a hard
+error. The one `entangled run` sets is `ENTANGLED_VIRGL_LIB_DEFAULT`, which
+falls through to the system library when it cannot be loaded — the case being a
+host with no `libvulkan.so.1`, which a Venus build hard-requires and the
+distribution's 0.9.x does not.
+
+The loader also exports `RENDER_SERVER_EXEC_PATH` itself, derived from the
+library it opened, because virglrenderer compiles that path in as an absolute
+one under its build prefix. Without it a downloaded artifact loses Venus quietly.

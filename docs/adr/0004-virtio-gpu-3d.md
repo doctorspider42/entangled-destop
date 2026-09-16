@@ -1573,3 +1573,91 @@ is set.
    find it. Raising it is a one-constant change (KVM's slot limit is far
    higher), but the honest move is to measure a real application first and set
    it from that rather than from a guess.
+
+## Amendment, 2026-09-16 — the renderer becomes an artifact we publish
+
+Every amendment before this one asked what Venus *could* do on a host that had
+built virglrenderer by hand. This one is about the hosts that have not, which is
+all of them: `entangled fetch virglrenderer` now downloads a Venus-capable
+renderer the way `fetch firmware` and `fetch bootstrap-kernel` already download
+theirs, and `doctor` reports what a host actually has.
+
+### What was missing, stated plainly
+
+Nothing shipped a renderer, on any surface. `entangled fetch` knew three
+targets and none was this; `installer/entangled.iss` carried two executables,
+an icon, three text files and `CLOUDHV.fd`; the WSL engine installer
+(`control_api::wsl::install_script`) copies exactly one file, the `entangled`
+binary, so the "WSL (KVM)" backend the manager advertises as *the one that can
+do 3D* installed nothing that makes 3D possible. `doctor` said nothing about 3D
+at all, the manager's 3D checkbox was gated only on `is_linux_kvm()`, and the
+error a user finally got at VM start named `guest/virglrenderer/build-virglrenderer.sh`
+— a path inside a source checkout that an installed user does not have.
+
+That is the same shape as the three shipped-product bugs this project already
+records: a firmware the installer never carried, a Linux engine it never
+shipped, a pinned digest no release served.
+
+### The two things that had to change in the loader first
+
+Publishing a prebuilt `.so` is not just a matter of uploading one.
+
+**The render server's path is compiled in, and absolute.** Venus in
+virglrenderer 1.1 exists only behind `VIRGL_RENDERER_RENDER_SERVER`, and the
+library `fork`/`exec`s `virgl_render_server` from a path fixed at build time
+under its own `--prefix`. For a downloaded artifact that is a directory on a CI
+runner, so Venus would degrade — quietly, to classic virgl with a warning,
+which is the failure mode that survives a release because nothing crashes.
+`VirglRenderer` now derives the path from the library it actually opened and
+exports `RENDER_SERVER_EXEC_PATH`, unless the operator set it. Measured rather
+than assumed: with the build's original prefix moved away so the compiled-in
+path is dead, `venus_host.rs` still passes from a relocated tree — and the
+negative control, the same tree with no `virgl_render_server` in it, skips with
+"Venus is advertised but a venus context will not start".
+
+**A library we chose is a preference, not an instruction.** There are now two
+variables. `ENTANGLED_VIRGL_LIB` is a person's, and a path that will not open
+is still a hard error, because silently loading a different library is how a
+Venus run becomes a classic-virgl run nobody notices.
+`ENTANGLED_VIRGL_LIB_DEFAULT` is the one `entangled run` sets from the cache,
+and a path that will not open falls through to the system library. The host
+that makes the difference real has no `libvulkan.so.1`: a Venus build lists it
+in `DT_NEEDED` and will not `dlopen` at all there, while the distribution's own
+0.9.x does not link Vulkan and works fine. Preferring our download must not
+take 3D away from somebody who had it.
+
+### The ABI question, and why it turned out to be smaller than it looked
+
+A published binary carries a glibc floor, which the firmware and the kernel do
+not have to think about — both are flat images that link nothing. Measured on
+the 1.1.0 build: the library and the render server each need at most
+**GLIBC_2.34**, and their only *versioned* symbol requirements come from `libc`
+and `libm` — nothing versioned from libepoxy, libdrm, libgbm or libvulkan,
+which are plain soname matches.
+
+The floor is therefore one number, and it is a number this project had already
+chosen: `release.yml` builds the Linux engine on `ubuntu-22.04`, so
+`.github/workflows/virglrenderer.yml` does too. GLIBC_2.34 covers Ubuntu 22.04+,
+Debian 12+ and Fedora 35+, and excludes Ubuntu 20.04 and Debian 11 — which the
+Linux engine already excluded. The renderer narrows nothing.
+
+### What a user needs on their own host
+
+Only runtime libraries, all present on any desktop install: `libepoxy.so.0`,
+`libdrm.so.2`, `libgbm.so.1`, `libvulkan.so.1`, `libm`, `libc`. The `-dev`
+packages and meson/ninja that `build-virglrenderer.sh` wants are a developer's
+problem and stay one.
+
+### Still not done
+
+- **The pin has no release behind it.** `guest/virglrenderer/pinned.toml`
+  carries placeholder digests and a note saying so; a fetch answers 404 with
+  the workflow's name in it. Running `.github/workflows/virglrenderer.yml` once
+  and committing the block it prints is what turns this on, and only a push can
+  do that.
+- **Windows gets nothing from this.** The artifact is a Linux `.so` and only
+  the WSL engine can load it; `fetch virglrenderer` on Windows downloads bytes
+  that host cannot use. Driving the fetch *inside* WSL from the manager is the
+  obvious follow-up, and is not done.
+- **The manager still gates its 3D checkbox on the backend alone**, not on
+  whether a renderer exists. `doctor` now knows; the GUI does not.
