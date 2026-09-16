@@ -1752,10 +1752,44 @@ Two traps this probe cost, recorded so the next one does not pay them:
   expected 128 where the GPU produced 127. A one-bit rounding disagreement reads
   exactly like a failed mechanism; clear to an exact `k/255`.
 
+### The presentation layer closes the path
+
+wgpu consumes the shared image, measured the same day. The route is entirely
+below wgpu's public API and every step of it exists:
+
+1. `Features::VULKAN_EXTERNAL_MEMORY_WIN32` — wgpu-hal already enables
+   `VK_KHR_external_memory_win32` when the adapter has it, and exposes the fact
+   as a feature, so no bring-your-own-device is needed;
+2. `Device::as_hal::<Vulkan>()` for the raw `ash::Device`;
+3. import the named memory and bind an image, exactly as the raw probe does;
+4. `wgpu_hal::vulkan::Device::texture_from_raw` — with a **drop callback**, or
+   wgpu-hal takes ownership of the image and destroys it without knowing about
+   the memory imported behind it;
+5. `Device::create_texture_from_hal::<Vulkan>()` for a real `wgpu::Texture`.
+
+In a separate process from the producer, wgpu's own command encoder then read
+back the exact pixels the producer cleared:
+
+```
+WGPU: adapter NVIDIA GeForce RTX 2070 (Vulkan)
+WGPU: device opened with VULKAN_EXTERNAL_MEMORY_WIN32
+WGPU: imported the shared memory onto wgpu's Vulkan device
+WGPU: it is now a wgpu::Texture
+WGPU: read BGRA [224, 160, 64, 255] back through wgpu ->
+      THE PRESENTATION LAYER SEES THE PRODUCER'S PIXELS
+```
+
+The `copy_texture_to_buffer` in that last line is the *proof*, not the design:
+it exists so a CPU-side assertion is possible. A real presenter samples the
+texture into the surface and never touches host memory at all.
+
+So the whole presentation path for a Windows host with an out-of-process
+renderer is now demonstrated end to end, and the `Backends::VULKAN` hint is
+load-bearing — wgpu prefers DX12 on this host, and a DX12 device cannot import
+a Vulkan `OPAQUE_WIN32` handle.
+
 ### Still untested
 
-- **wgpu importing the handle.** `wgpu_hal`'s `texture_from_raw` is the seam and
-  the presentation layer already runs on wgpu, but nothing here has driven it.
 - **External semaphores in anger.** The extension is present; the decoder/
   presenter handshake is a design item, not a measured one.
 - Everything above the boundary: the decoder itself, which is the whole cost.
