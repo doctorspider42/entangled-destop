@@ -1661,3 +1661,101 @@ problem and stay one.
   obvious follow-up, and is not done.
 - **The manager still gates its 3D checkbox on the backend alone**, not on
   whether a renderer exists. `doctor` now knows; the GUI does not.
+
+## Amendment, 2026-09-16 — what a Windows host can actually share with a renderer
+
+The Windows 3D plan in this ADR has always been one sentence ("virglrenderer
+built for Windows on ANGLE"). Two reconnaissance passes replaced it with
+measurements, and the conclusion is different from the sentence.
+
+### ANGLE is not the way in
+
+virglrenderer *does* have a Windows host target — `with_host_windows` in
+`meson.build`, a `mman_win32.c` shim, and `have_egl = true` forced for Windows
+and Darwin. It looks supported until you read how upstream builds it:
+
+```
+--cross-file=.gitlab-ci/x86_64-w64-mingw32 -Dplatforms= -Dtests=false
+                                            -Drender-server=false -Dvenus=false
+```
+
+`-Dplatforms=` is **empty**: no EGL, no GLX, no renderer backend at all. It is a
+compile smoke test, and the job carrying it is marked `FIXME: ... turned off`.
+Meanwhile `vrend_winsys_egl.c` — the only EGL winsys there is — is written
+around gbm (ten `#ifdef ENABLE_GBM` sites) and `ENABLE_GBM` is never set on
+Windows, and its surfaceless path asks for `EGL_PLATFORM_SURFACELESS_MESA`,
+which ANGLE does not implement. So "build virglrenderer for Windows against
+ANGLE" is not a configuration; it is writing a winsys backend for a shape
+nobody has ever run, in C we do not own, for classic VirGL only.
+
+### The renderer cannot be remote, for a reason that is not about transport
+
+`RemoteRenderer` already runs the renderer in another process and its transport
+is abstracted (a `socketpair` on Unix, a duplex named pipe on Windows), its
+protocol is portable and tested, and guest memory never crosses it — only
+bytes. Moving that transport to TCP, and the renderer to a Linux box or WSL,
+therefore looks cheap. It is cheap. It also cannot serve Venus, and the reason
+is structural rather than incidental: the host-visible window is *host pages in
+the VMM's address space*, and a pointer another process hands back names
+nothing there. `remote::client` already withholds the window for exactly this,
+which is why an isolated renderer reports `host_visible_bytes=0` while still
+advertising the venus capset.
+
+Measured anyway, because the transport question was worth pricing
+(Windows → WSL, this machine): **684 µs** per call/reply over the VM's own
+address, **29.4 ms** to move a 1080p frame, a ~34 fps ceiling from the readback
+alone. Over `127.0.0.1` it is **50 ms** per call — WSL2's localhost forwarding
+is a userspace relay and is 73× worse than the direct address, which is a trap
+worth knowing before anybody benchmarks anything across that boundary.
+
+### What Windows *can* do, measured
+
+The interesting design is therefore not a port of virglrenderer at all: it is a
+native Venus decoder against the host's own Vulkan, in a sandboxed process,
+sharing one image with the VMM. Its riskiest assumption — that a frame can go
+from the decoder to the presenter without passing through the CPU — is now
+tested on this machine (NVIDIA RTX 2070, driver `0x91160000`, Vulkan 1.4.312).
+The probe is kept with the VM directory; its four findings:
+
+1. Every extension the design needs is present: `VK_KHR_external_memory`,
+   `..._win32`, `VK_KHR_external_semaphore`, `..._win32`,
+   `VK_KHR_dedicated_allocation`, `VK_KHR_timeline_semaphore`.
+2. `B8G8R8A8_UNORM`, `OPTIMAL`, as `OPAQUE_WIN32`: exportable **and**
+   importable, and not dedicated-only.
+3. An image exported on one device and imported on another reads back the
+   producer's pixels exactly.
+4. **Across a real process boundary** — a second process, its own instance,
+   device and queue, opening the memory by name — the same. `SHARED ACROSS
+   PROCESSES`.
+
+Costs, 1080p:
+
+| | per frame | ceiling |
+|---|---|---|
+| produce into the shared image (no CPU copy) | 0.070 ms | ~14 300 fps |
+| copy the same frame out to host memory | 0.740 ms | ~1 350 fps |
+
+Sharing is 10.6× cheaper — **and both numbers are irrelevant**, which is the
+finding that matters. The guest desktop measured on this host runs at 5.4 fps,
+a 185 ms frame; a local readback is 0.4 % of that. Zero-copy scanout (VEN-2005)
+is therefore *not* the thing to build first and was never the risk. The frames
+go somewhere else entirely, and on a Windows host that somewhere is the
+decoder that does not exist yet.
+
+Two traps this probe cost, recorded so the next one does not pay them:
+
+- A named export with `dwAccess = 0` produces a handle nothing may open, and
+  the import fails as `ERROR_OUT_OF_DEVICE_MEMORY` — an error that says nothing
+  about access rights. `GENERIC_ALL` is what a shared render target wants, and a
+  sandboxed decoder will want a deliberate ACL rather than the default.
+- The first run of the probe reported "NOT shared" because it cleared to 0.5 and
+  expected 128 where the GPU produced 127. A one-bit rounding disagreement reads
+  exactly like a failed mechanism; clear to an exact `k/255`.
+
+### Still untested
+
+- **wgpu importing the handle.** `wgpu_hal`'s `texture_from_raw` is the seam and
+  the presentation layer already runs on wgpu, but nothing here has driven it.
+- **External semaphores in anger.** The extension is present; the decoder/
+  presenter handshake is a design item, not a measured one.
+- Everything above the boundary: the decoder itself, which is the whole cost.
