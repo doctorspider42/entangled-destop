@@ -165,11 +165,13 @@ impl fmt::Display for RingRegion {
 /// session reads when a guest's Vulkan driver silently fails to start. None of
 /// them is a host error: a bad layout fails the `vkCreateRingMESA` that carried
 /// it and the device carries on.
+///
+/// Every variant is about the *values*, never about the bytes they came in:
+/// a truncated or malformed encoding is refused before this type is reached,
+/// by [`wire`](super::wire), and has its own vocabulary there. One failure,
+/// one name for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum RingLayoutError {
-    #[error("ring create info is truncated: {len} bytes, {expected} required")]
-    TruncatedCreateInfo { len: usize, expected: usize },
-
     #[error("the ring region is zero-sized")]
     ZeroSizedRing,
 
@@ -253,8 +255,10 @@ pub enum RingLayoutError {
 ///
 /// This is guest input and nothing more: constructing one asserts nothing, and
 /// no field here may be used to index anything. It exists so that decoding the
-/// wire bytes and judging them are separate steps with separate tests. The only
-/// thing that may be done with one is [`RingLayout::new`].
+/// wire bytes and judging them are separate steps, owned by separate modules:
+/// [`transport`](super::transport) walks the `sType` and the pNext chain and
+/// fills one of these in, and the only thing that may then be done with it is
+/// [`RingLayout::new`].
 ///
 /// Field names follow the Mesa struct (`headOffset` → `head_offset`) and are
 /// declared in wire order; all the `*_offset` values are relative to the start
@@ -306,64 +310,19 @@ impl RingCreateInfo {
     /// fields are not 8-byte aligned in it.
     ///
     /// The order is `vn_decode_VkRingCreateInfoMESA_self_temp`'s
-    /// (`venus-protocol/vn_protocol_renderer_transport.h:208-223`); the
-    /// `sType`/`pNext` the generated decoder consumes ahead of the body are the
-    /// caller's. Nothing downstream depends on this decoder —
-    /// [`RingLayout::new`] takes the struct, not bytes — so if the dispatcher
-    /// that lands later finds the encoding differs, only this function changes.
+    /// (`venus-protocol/vn_protocol_renderer_transport.h:208-223`).
+    ///
+    /// **Nothing in this file decodes with it.** It is the *size* half of the
+    /// struct's description, kept beside the fields it describes so the two
+    /// cannot drift, and it exists for
+    /// [`transport::RING_CREATE_INFO_MIN_WIRE_LEN`](super::transport::RING_CREATE_INFO_MIN_WIRE_LEN),
+    /// which adds the `sType` and the empty-chain marker to it to get the
+    /// least a command carrying one of these can possibly be. Reading the
+    /// bytes is [`transport`](super::transport)'s job, through
+    /// [`wire::Decoder`](super::wire::Decoder): a bare slice could not do it
+    /// anyway, since the body is preceded by an arbitrary-length pNext chain
+    /// that has to be walked before anyone knows where it starts.
     pub const WIRE_LEN: usize = 2 * 4 + 10 * 8;
-
-    /// Decode the fixed body from a Venus command stream.
-    ///
-    /// The caller has already consumed the struct's `sType`/`pNext` (the
-    /// generated decoder skips them before the body) and passes the remaining
-    /// bytes; anything after [`WIRE_LEN`](Self::WIRE_LEN) belongs to the
-    /// caller and is ignored here. Little-endian, because the protocol is
-    /// only ever spoken between a guest and a host of the same endianness and
-    /// both ends of ours are x86-64.
-    ///
-    /// Decoding asserts nothing about the values: a successfully decoded
-    /// `RingCreateInfo` is still entirely untrusted.
-    pub fn from_wire_le(bytes: &[u8]) -> Result<Self, RingLayoutError> {
-        if bytes.len() < Self::WIRE_LEN {
-            return Err(RingLayoutError::TruncatedCreateInfo {
-                len: bytes.len(),
-                expected: Self::WIRE_LEN,
-            });
-        }
-        Ok(Self {
-            flags: u32_at(bytes, 0),
-            resource_id: u32_at(bytes, 4),
-            offset: u64_at(bytes, 8),
-            size: u64_at(bytes, 16),
-            idle_timeout_ns: u64_at(bytes, 24),
-            head_offset: u64_at(bytes, 32),
-            tail_offset: u64_at(bytes, 40),
-            status_offset: u64_at(bytes, 48),
-            buffer_offset: u64_at(bytes, 56),
-            buffer_size: u64_at(bytes, 64),
-            extra_offset: u64_at(bytes, 72),
-            extra_size: u64_at(bytes, 80),
-        })
-    }
-}
-
-/// Little-endian `u32` at `at`, or 0 when the slice is too short. The callers
-/// above length-check first; the fallback exists so that no decode path can
-/// panic on guest bytes.
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    bytes
-        .get(at..at.saturating_add(4))
-        .and_then(|s| <[u8; 4]>::try_from(s).ok())
-        .map_or(0, u32::from_le_bytes)
-}
-
-/// Little-endian `u64` at `at`, or 0 when the slice is too short.
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    bytes
-        .get(at..at.saturating_add(8))
-        .and_then(|s| <[u8; 8]>::try_from(s).ok())
-        .map_or(0, u64::from_le_bytes)
 }
 
 /// A validated byte range **inside the shared-memory resource**.
@@ -740,16 +699,6 @@ impl RingLayout {
             buffer,
             extra: (!extra.is_empty()).then_some(extra),
         })
-    }
-
-    /// Decode a create info from the wire and validate it in one step.
-    ///
-    /// # Errors
-    ///
-    /// [`RingLayoutError::TruncatedCreateInfo`] if the bytes are short, then
-    /// whatever [`RingLayout::new`] makes of them.
-    pub fn from_wire_le(bytes: &[u8], resource_size: u64) -> Result<Self, RingLayoutError> {
-        Self::new(RingCreateInfo::from_wire_le(bytes)?, resource_size)
     }
 
     /// The shared-memory resource this ring lives in. Every offset below is
@@ -1439,58 +1388,35 @@ mod tests {
     }
 
     #[test]
-    fn the_wire_body_decodes_field_for_field() {
-        // `flags` is carried, so a non-zero value has to survive the round
-        // trip even though nothing validates it.
-        let info = RingCreateInfo {
-            flags: 0xdead_beef,
-            ..good()
-        };
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&info.flags.to_le_bytes());
-        bytes.extend_from_slice(&info.resource_id.to_le_bytes());
-        for field in [
-            info.offset,
-            info.size,
-            info.idle_timeout_ns,
-            info.head_offset,
-            info.tail_offset,
-            info.status_offset,
-            info.buffer_offset,
-            info.buffer_size,
-            info.extra_offset,
-            info.extra_size,
-        ] {
-            bytes.extend_from_slice(&field.to_le_bytes());
-        }
-        assert_eq!(bytes.len(), RingCreateInfo::WIRE_LEN);
-        assert_eq!(bytes.len(), 88);
-        assert_eq!(RingCreateInfo::from_wire_le(&bytes), Ok(info));
-        assert_eq!(accept(info).flags(), 0xdead_beef);
+    fn the_wire_length_counts_the_fields_beside_it() {
+        // Nothing here decodes, so this constant's only guard is that it still
+        // describes the struct it sits next to: two `uint32_t`s and ten 64-bit
+        // fields. `transport` builds its minimum-command length on it.
+        assert_eq!(RingCreateInfo::WIRE_LEN, 88);
+        assert_eq!(RingCreateInfo::WIRE_LEN, 2 * 4 + 10 * 8);
+    }
 
-        // Trailing bytes belong to the caller's stream, not to us.
-        bytes.extend_from_slice(&[0xff; 32]);
-        assert_eq!(RingCreateInfo::from_wire_le(&bytes), Ok(info));
-        assert_eq!(RingLayout::from_wire_le(&bytes, RESOURCE), Ok(accept(info)));
-
-        // Every truncation is refused, none of them panics.
-        for len in 0..RingCreateInfo::WIRE_LEN {
-            assert_eq!(
-                RingCreateInfo::from_wire_le(&bytes[..len]),
-                Err(RingLayoutError::TruncatedCreateInfo {
-                    len,
-                    expected: RingCreateInfo::WIRE_LEN,
-                })
-            );
+    #[test]
+    fn flags_are_carried_through_unjudged() {
+        // No bit is defined, so no bit is refused — but the value has to
+        // arrive intact for whoever gains a meaning for one.
+        for flags in [0, 1, 0xdead_beef, u32::MAX] {
+            let layout = accept(RingCreateInfo { flags, ..good() });
+            assert_eq!(layout.flags(), flags);
         }
     }
 
     #[test]
     fn an_all_zero_create_info_is_refused() {
-        // What a guest sends when it sends nothing at all.
-        let zeroed = [0u8; RingCreateInfo::WIRE_LEN];
+        // What the decoder hands us when a guest sends nothing at all: every
+        // field zero, which is a zero-sized ring before it is anything else.
         assert_eq!(
-            RingLayout::from_wire_le(&zeroed, RESOURCE),
+            RingLayout::new(RingCreateInfo::default(), RESOURCE),
+            Err(RingLayoutError::ZeroSizedRing)
+        );
+        // And in a resource that is itself empty.
+        assert_eq!(
+            RingLayout::new(RingCreateInfo::default(), 0),
             Err(RingLayoutError::ZeroSizedRing)
         );
     }

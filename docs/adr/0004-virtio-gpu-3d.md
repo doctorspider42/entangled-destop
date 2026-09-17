@@ -1793,3 +1793,122 @@ a Vulkan `OPAQUE_WIN32` handle.
 - **External semaphores in anger.** The extension is present; the decoder/
   presenter handshake is a design item, not a measured one.
 - Everything above the boundary: the decoder itself, which is the whole cost.
+
+## Amendment, 2026-09-17 — EPIC 20 phase 4: the transport, and the first bytes a real guest sent
+
+Phase 3 made Venus render on a Linux host with virglrenderer doing the Vulkan.
+This phase builds the half we cannot borrow: **our own** implementation of
+everything a Venus guest touches before a single Vulkan command is executed —
+the capset it reads to decide whether to load at all, the byte primitives, the
+ten transport commands, the command ring's layout and the pump that drains it.
+It executes no Vulkan. That seam is the point: the parts a malicious guest can
+reach are pure logic over bytes, so they are tested on every host, including
+hosts with no GPU.
+
+### What is here
+
+`crates/virtio-gpu/src/venus/`, seven modules, ~300 tests:
+
+| Module | What it owns |
+|---|---|
+| `capset` | The 160 bytes a guest reads before it will speak to us |
+| `wire` | Decoder/encoder primitives: little-endian, 4-byte granular, no length field anywhere |
+| `transport` | The ten commands that arrive on the context stream and create the ring |
+| `ring` | The five regions of a ring the guest proposes and we validate |
+| `shmem` | The host pages the ring lives in — the only `unsafe` in the family |
+| `pump` | The head/tail protocol, and the shadow copy that makes decoding safe while the guest writes |
+| `renderer` | The `Renderer3d` that ties them together, behind `ENTANGLED_VENUS_CAPTURE` |
+
+The renderer is a diagnostic stage behind an environment variable rather than a
+profile key, for the same reason `ENTANGLED_GPU_FENCES` is: a `[display]` key
+would be inherited by every profile, the manager and the installer's tests, for
+something the next phase deletes.
+
+`capset` and `ring` were additionally mutation-tested, because a test suite
+over a byte layout is the easiest kind to write vacuously — every assertion
+passes and every field is off by four.
+
+### The bytes
+
+All of those tests encode what we believe the protocol to be and decode it
+again. That proves self-consistency and nothing else: a field misread the same
+way twice round-trips perfectly. So the acceptance for this phase was to make
+a *real* Mesa venus driver, in a real guest, say something to us.
+
+It did. Seventy-two bytes, on an Ubuntu guest under WHP:
+
+```
+vkSetReplyCommandStreamMESA { resourceId:  8, offset: 0, size: 20 }
+vkSetReplyCommandStreamMESA { resourceId: 10, offset: 0, size: 20 }
+```
+
+— the driver pointing our reply encoder at a window before it asks anything,
+twice, the second time with a fresh blob after the first got no answer. Then
+Mesa called `abort()`, which is exactly what this stage promised: a renderer
+that replies to nothing gets a guest that gives up.
+
+Those bytes are now `the_first_bytes_a_real_mesa_venus_driver_sent_us` in
+`transport.rs`, and they pin down three things a round trip cannot: that the
+command header is `{ opcode, flags }` and not the reverse, that a
+`simple_pointer` is a **64-bit** presence marker rather than the 32-bit one it
+is natural to write, and that `VkCommandStreamDescriptionMESA` packs a
+`uint32_t` and two `size_t`s with no padding — so `offset` lands unaligned. Our
+decoder read them correctly on the first attempt.
+
+### Four days of the wrong question
+
+Getting there took seven guest boots, and six of them asked the wrong question,
+which is worth recording because the failure mode is general.
+
+The guest kernel read our capset perfectly from the first run — `cap set 0: id
+4, max-version 0, max-size 160`, every feature negotiated, the host-visible
+window mapped at `0x140000000` — and yet Mesa yielded `llvmpipe` and the
+capture file stayed empty. With `VN_DEBUG=init` producing **no output at all**,
+the natural reading was "the driver looked at our capset and declined", and
+four hypotheses were eliminated against that reading: an empty extension mask,
+a `max_version` mismatch, `supports_multiple_timelines = 0`, a missing driver
+library. Two capset fields were even falsified to coax the driver past a gate
+it was never standing at.
+
+The reading was unfounded, and one control run killed it: `VN_DEBUG=vtest`
+forces venus onto a renderer that cannot exist, and it printed nothing either.
+Silence was never evidence.
+
+Asking the kernel directly — the same three ioctls venus makes, from python,
+with Mesa out of the middle — gave the answer in one line:
+
+```
+OPEN=errno13(Permission denied)      /dev/dri/renderD128, as the login user
+ROOT OPEN=ok
+ROOT CAPS=ok       vk_xml_version 1.3.269, our 160 bytes, verbatim
+ROOT CTXINIT=ok    a Venus context, on our renderer
+```
+
+We log in on `ttyS0`. `systemd-logind` grants the DRM render node to the user
+of a *graphical* seat by ACL, and a serial login is not one. Every silent run
+was a driver that failed `open(2)` before it had anything to say. Our capset
+was never the question.
+
+`supports_multiple_timelines` has been reverted to false, which is what
+`VenusCapset::new()` says truthfully: `virtio_gpu::fence` is one FIFO, and a
+renderer that promises per-queue timelines and then retires in submission order
+does not fail loudly — it returns the wrong fence to the wrong queue. The
+permissive extension mask stays, on two grounds that the other field had
+neither: it is what virglrenderer effectively advertises (`venus_hw.h`, with
+the sentinel clear "all the extensions are assumed to be supported by the
+renderer side protocol"), and it is the configuration the captured bytes were
+produced under, so removing it would cost the golden vector its provenance.
+
+The general lesson: **a diagnostic's silence is only evidence once you have
+seen that diagnostic speak.** Establish that first, or every hypothesis you
+eliminate is eliminated against nothing.
+
+### What phase 4 does not have
+
+- **Replies.** The renderer decodes and captures; it encodes nothing back.
+  That is the whole of phase 5, and Mesa's `abort()` is the measurement of it.
+- **`save`/`load` for rings** (ADR-0006). A snapshot taken with a live Venus
+  context will refuse.
+- **One sink for all rings**, so a multi-ring capture interleaves into soup.
+- **`allow_vk_wait_syncs`**, which belongs with the threading model rather than
+  with the capset that advertises it.
