@@ -2052,6 +2052,16 @@ not have" is paid.
   Against a real guest the capture should be `SetReply` (36 B) +
   `vkEnumerateInstanceVersion` (16 B), and the guest should abort on "ring
   fatal error" at once rather than on its 3.5 s watchdog.
+
+  **Measured on 2026-09-23** (Ubuntu guest, root, `MESA_LOG_LEVEL=debug
+  VN_DEBUG=init,result`): the capture is exactly those 52 bytes, the second
+  command byte-for-byte `89 00 00 00 01 00 00 00 01 00 00 00 00 00 00 00`, and
+  the renderer logs FATAL after `0x24` of `0x34` bytes. Mesa, now able to
+  speak, reports `connected to renderer`, wire format 1, vk.xml 1.3.269 and
+  protocol spec 2, and then `aborting on ring fatal error at iter 4096`.
+  The abort reason is the one predicted; its timing is not. Mesa reads the
+  status word only at the same iteration where the watchdog would check
+  `ALIVE`, so it still comes about 3.5 s in. What changed is *why* it aborts.
 - **One sink per ring.** `VenusRenderer` takes a `SinkFactory`
   (`(ctx_id, ring) -> io::Result<S>`), and `ENTANGLED_VENUS_CAPTURE` is now a
   prefix: each ring writes `<prefix>.ctx<N>.ring<M>.bin`, `M` counting the
