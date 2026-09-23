@@ -2137,9 +2137,12 @@ mod tests {
     /// a field misread the same way twice round-trips perfectly. These bytes
     /// were not written by us. They came out of `libvulkan_virtio.so` in an
     /// Ubuntu guest on 2026-09-17, through virtio-gpu, into the capture sink,
-    /// and they are the first thing that driver says to a renderer — it points
-    /// the reply encoder at a window before it asks anything, twice, because
-    /// the second attempt used a fresh blob after the first got no answer.
+    /// and they are the first thing that driver says to a renderer: it points
+    /// the ring's reply encoder at a window before it asks anything. There are
+    /// two because there were two `VkInstance`s — each one is its own virtio-gpu
+    /// context with its own ring and its own reply pool, which is why both
+    /// windows start at offset 0 — and the capture sink of that day fed every
+    /// ring into one file. It is not a retry.
     ///
     /// What they pin down is exactly what a round trip cannot: that the
     /// command header is `{ opcode, flags }` and not the reverse, that a

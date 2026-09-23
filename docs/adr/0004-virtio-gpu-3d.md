@@ -1977,3 +1977,40 @@ mapping decides the memory type.
 Untested: the driver migrating type 5 memory under pressure while it is
 mapped, allocations much larger than 2 MiB, and a Linux guest's own PAT
 choices.
+
+## Correction, 2026-09-23 — what the phase-4 bytes actually were
+
+A reading of Mesa 26.2.3 and virglrenderer 1.1.0 against the phase-4 run
+(`spec-phase5-bringup.md`, kept with the session's research notes) shows that
+three things written in the phase-4 amendment were wrong. They are kept above
+as written, as this ADR does with its other wrong guesses, and corrected here.
+
+- **The two `SetReply`s were not a retry.** A reply window comes from a
+  sequential pool created per `VkInstance` (`vn_renderer_util.c:94-116`,
+  `vn_instance.c:315-316`), and each `VkInstance` is its own virtio-gpu
+  context with its own ring. Two windows, both at offset 0, therefore mean two
+  instances in two contexts. They landed in one file because the capture sink
+  fed every ring into it.
+- **The abort was not "no reply"; it was our doorbell model.** Mesa submits
+  `SetReply` and the command it precedes as two ring submissions with nothing
+  between them. It rings the doorbell at most once per millisecond
+  (`vn_ring.c:478-489`) and relies on the host polling for the `idleTimeout` it
+  passed at ring creation. Our renderer drained once on the doorbell, published
+  `IDLE` and never looked again, so `vkEnumerateInstanceVersion` (opcode 137,
+  16 bytes) sat unread in each ring. About 3.5 s later Mesa's watchdog found
+  `VK_RING_STATUS_ALIVE_BIT_MESA` never set and aborted
+  (`vn_common.c:229-283`). Stage 5a.1 fixes both: a ring worker that polls for
+  `idleTimeout`, and an `ALIVE` monitor.
+- **virglrenderer does not leave the extension-mask sentinel clear.** It sets
+  it, over an enumerated mask of exactly what its protocol decodes
+  (`vkr_renderer.c:40-48`). The permissive mask in `run_vm.rs` therefore has no
+  reference precedent, and it goes once the generated protocol (stage 5a.2)
+  provides the table to enumerate from.
+
+And one refinement of "a diagnostic's silence is only evidence once you have
+seen it speak". `VN_DEBUG` was silent because it *could not* speak: every
+`vn_log` is `MESA_LOG_DEBUG` (`vn_common.c:92-99`), and a release Mesa defaults
+to `MESA_LOG_INFO` (`util/log.c:134-137`). Guest probes need
+`MESA_LOG_LEVEL=debug` alongside `VN_DEBUG`. The lesson stands. The
+`EACCES` on `/dev/dri/renderD128` stands too — it was measured with raw ioctls,
+not inferred from silence.
