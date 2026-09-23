@@ -59,9 +59,11 @@ hbuf_put_u64(struct hbuf *b, uint64_t v)
 
 struct hrng {
    uint64_t state;
-   /* chain-poisoning request and whether it was honoured */
+   /* chain-poisoning request, and the link chosen for it: the sType to
+    * find in the encoded bytes and the one to write over it */
    int poison;
-   int poisoned;
+   int32_t poison_stype;
+   int32_t poison_with;
 };
 
 static inline uint64_t
@@ -83,7 +85,8 @@ hrng_seed(struct hrng *r, uint64_t seed)
    if (!r->state)
       r->state = 1;
    r->poison = 0;
-   r->poisoned = 0;
+   r->poison_stype = 0;
+   r->poison_with = 0;
    hrng_next(r);
 }
 

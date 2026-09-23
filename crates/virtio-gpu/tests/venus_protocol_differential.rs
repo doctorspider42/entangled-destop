@@ -15,13 +15,17 @@
 //!
 //! The re-encoded replies go back to the C harness, whose driver-side reply
 //! decoder must accept every one. For every poisoned case — a pNext chain
-//! carrying a structure the protocol knows but this crate did not generate —
-//! decoding must refuse, and with `UnknownPnextStype`.
+//! link whose sType the C harness rewrote, in the bytes, to one its parent
+//! does not admit, which the C renderer refused — decoding must refuse, and
+//! with `UnknownPnextStype`.
+//!
+//! It also compares [`info`] with the C renderer's extension table and the
+//! capset mask virglrenderer builds from it (`VENUS_DIFF_INFO`).
 
 use std::fs;
 use std::io::Write;
 
-use virtio_gpu::venus::protocol::{Command, ProtocolError};
+use virtio_gpu::venus::protocol::{info, Command, ProtocolError};
 use virtio_gpu::venus::wire::{Decoder, Encoder, WireError};
 
 struct Record {
@@ -46,7 +50,7 @@ fn records(mut data: &[u8]) -> Vec<Record> {
     let mut out = Vec::new();
     while !data.is_empty() {
         let command = u32_of(&mut data);
-        let poisoned = u32_of(&mut data) != 0;
+        let poisoned = u32_of(&mut data) & 1 != 0;
         let seed = u64::from_le_bytes(take(&mut data, 8).try_into().expect("8 bytes"));
         let n = u32_of(&mut data) as usize;
         let bytes = take(&mut data, n).to_vec();
@@ -63,6 +67,64 @@ fn records(mut data: &[u8]) -> Vec<Record> {
     out
 }
 
+/// The registry name of the command `bytes` start with.
+fn command_name(bytes: &[u8]) -> &'static str {
+    let opcode = bytes.get(..4).map_or(u32::MAX, |b| {
+        u32::from_le_bytes(b.try_into().expect("4 bytes"))
+    });
+    virtio_gpu::venus::protocol::command_type_name(opcode).unwrap_or("unknown")
+}
+
+/// Phase 0: info.rs against `vn_protocol_renderer_info.h`, as the C harness
+/// printed it.
+fn check_info() {
+    let path = std::env::var("VENUS_DIFF_INFO").expect("VENUS_DIFF_INFO");
+    let text = fs::read_to_string(path).expect("info file");
+    let mut extensions = Vec::new();
+    let mut mask = Vec::new();
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.first().copied() {
+            Some("ext") => extensions.push((
+                words[1].to_owned(),
+                words[2].parse::<u32>().expect("number"),
+                words[3].parse::<u32>().expect("version"),
+            )),
+            Some("mask") => {
+                mask = words[1..]
+                    .iter()
+                    .map(|w| w.parse::<u32>().expect("mask word"))
+                    .collect()
+            }
+            Some("vk_xml_version") => {
+                assert_eq!(words[1].parse::<u32>().ok(), Some(info::VK_XML_VERSION));
+            }
+            Some("wire_format_version") => {
+                assert_eq!(
+                    words[1].parse::<u32>().ok(),
+                    Some(info::WIRE_FORMAT_VERSION)
+                );
+            }
+            _ => {}
+        }
+    }
+    let ours: Vec<(String, u32, u32)> = info::EXTENSIONS
+        .iter()
+        .map(|e| (e.name.to_owned(), e.number, e.spec_version))
+        .collect();
+    assert_eq!(ours, extensions, "the extension table is the C renderer's");
+    assert_eq!(
+        mask,
+        info::DECODABLE_EXTENSION_MASK,
+        "the decodable mask is what virglrenderer advertises"
+    );
+    assert!(info::EXTENSIONS.iter().all(|e| e.decodable));
+    println!(
+        "info: {} extensions and the capset mask agree with the C renderer",
+        extensions.len()
+    );
+}
+
 #[test]
 #[ignore = "driven by tools/venus-protocol/harness/run_differential.py"]
 fn generated_rust_matches_the_generated_c_byte_for_byte() {
@@ -75,10 +137,11 @@ fn generated_rust_matches_the_generated_c_byte_for_byte() {
              VENUS_DIFF_CASES and VENUS_DIFF_REPLIES"
         );
     };
+    check_info();
     let data = fs::read(&cases).expect("case file");
     let mut out = fs::File::create(&replies).expect("reply file");
 
-    let mut per_command: std::collections::BTreeMap<&'static str, (u32, u32)> =
+    let mut per_command: std::collections::BTreeMap<&'static str, (u32, u32, u32)> =
         std::collections::BTreeMap::new();
     let mut failures = Vec::new();
     let (mut positive, mut refused) = (0u32, 0u32);
@@ -90,7 +153,11 @@ fn generated_rust_matches_the_generated_c_byte_for_byte() {
 
         if rec.poisoned {
             match decoded {
-                Err(ProtocolError::Wire(WireError::UnknownPnextStype { .. })) => refused += 1,
+                Err(ProtocolError::Wire(WireError::UnknownPnextStype { .. })) => {
+                    refused += 1;
+                    let name = command_name(&rec.bytes);
+                    per_command.entry(name).or_default().2 += 1;
+                }
                 other => failures.push(format!(
                     "{what}: a chain with an unadmitted sType was not refused as one: {other:?}"
                 )),
@@ -175,8 +242,8 @@ fn generated_rust_matches_the_generated_c_byte_for_byte() {
         }
     }
 
-    for (name, (seen, passed)) in &per_command {
-        println!("  {name:<45} {passed:>5} / {seen:<5} round-tripped");
+    for (name, (seen, passed, poisoned)) in &per_command {
+        println!("  {name:<50} {passed:>5} / {seen:<5} round-tripped, {poisoned} poisoned refused");
     }
     println!(
         "rust: {positive} commands and replies byte-identical to the C, {refused} poisoned chains \

@@ -74,6 +74,50 @@ pub enum ExecError {
     /// The context already went fatal on another ring.
     #[error("venus context {0} is fatal and executes nothing more")]
     ContextFatal(u32),
+    /// A command the protocol decodes and this stage does not implement.
+    /// Fatal as an undecodable one was: accepting it without doing it would
+    /// leave the guest believing in work that never happened.
+    #[error("{command} is decodable but not implemented by this renderer")]
+    NotImplemented {
+        /// The command.
+        command: &'static str,
+    },
+    /// A chained structure the protocol decodes and this stage does not
+    /// accept ([`policy::admits_link`]).
+    #[error(
+        "{command}: {parent} chains sType {stype} ({name}), which this renderer does not implement"
+    )]
+    UnimplementedLink {
+        /// The command.
+        command: &'static str,
+        /// The structure whose chain carried it.
+        parent: &'static str,
+        /// The link's `VkStructureType`.
+        stype: i32,
+        /// Its structure name, when the protocol knows it.
+        name: &'static str,
+    },
+}
+
+/// The first chained structure `command` carries that the policy does not
+/// admit, as the refusal it is.
+fn unadmitted_link(command: &Command<'_>) -> Option<ExecError> {
+    let mut found = None;
+    command.for_each_link(&mut |parent, stype| {
+        if found.is_none() && !policy::admits_link(stype) {
+            found = Some((parent, stype));
+        }
+    });
+    found.map(|(parent, stype)| unimplemented_link(command.name(), parent, stype))
+}
+
+fn unimplemented_link(command: &'static str, parent: &'static str, stype: i32) -> ExecError {
+    ExecError::UnimplementedLink {
+        command,
+        parent,
+        stype,
+        name: crate::venus::protocol::info::structure(stype).map_or("unknown", |s| s.name),
+    }
 }
 
 fn invalid(command: &'static str, what: impl Into<String>) -> ExecError {
@@ -140,7 +184,21 @@ impl<H: HostVulkan> VulkanContext<H> {
         if self.fatal {
             return Err(ExecError::ContextFatal(self.ctx_id));
         }
-        let result = match command {
+        let result = match unadmitted_link(command) {
+            Some(error) => Err(error),
+            None => self.dispatch(command),
+        };
+        if result.is_err() {
+            self.fatal = true;
+        }
+        result
+    }
+
+    /// [`Self::execute`] after the chains passed: one arm per command this
+    /// stage implements, and a refusal for every other one the protocol
+    /// decodes.
+    fn dispatch(&mut self, command: &mut Command<'_>) -> Result<(), ExecError> {
+        match command {
             Command::EnumerateInstanceVersion(args) => {
                 match self.host.instance_version() {
                     Ok(version) => {
@@ -176,11 +234,10 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::CreateImage(args) => self.create_image(args),
             Command::DestroyImage(args) => self.destroy_image(args),
             Command::GetImageMemoryRequirements2(args) => self.image_memory_requirements(args),
-        };
-        if result.is_err() {
-            self.fatal = true;
+            other => Err(ExecError::NotImplemented {
+                command: other.name(),
+            }),
         }
-        result
     }
 
     // ------------------------------------------------------------ instance
@@ -541,6 +598,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                     .iter()
                     .take(n)
                     .map(|family| VkQueueFamilyProperties2 {
+                        p_next: Vec::new(),
                         queue_family_properties: family.clone(),
                     })
                     .collect();
@@ -1196,6 +1254,13 @@ fn check_image_format_info(
             VkPhysicalDeviceImageFormatInfo2Next::VkImageStencilUsageCreateInfo(s) => {
                 check_usage(command, s.stencil_usage)?;
             }
+            other => {
+                return Err(unimplemented_link(
+                    command,
+                    "VkPhysicalDeviceImageFormatInfo2",
+                    ChainLink::structure_type(other),
+                ))
+            }
         }
     }
     Ok(())
@@ -1285,6 +1350,13 @@ fn check_image_create_info(
             }
             VkImageCreateInfoNext::VkImageStencilUsageCreateInfo(s) => {
                 check_usage(command, s.stencil_usage)?;
+            }
+            other => {
+                return Err(unimplemented_link(
+                    command,
+                    "VkImageCreateInfo",
+                    ChainLink::structure_type(other),
+                ))
             }
         }
     }

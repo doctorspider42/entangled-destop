@@ -2,28 +2,32 @@
 // from venus-protocol git-70991d4c. DO NOT EDIT: regenerate with
 //     python scripts/venus-gen.py
 
-//! The `command_pool` group: its commands and the structures only they reach.
+//! The `query_pool` group: its commands and the structures only they reach.
 
 #![allow(unused_imports)]
 
 use super::*;
 use crate::venus::wire::{CommandHeader, Decoder, Encoder};
 
-/// `VkCommandPoolCreateInfo` (`VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO`).
+/// `VkQueryPoolCreateInfo` (`VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO`).
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct VkCommandPoolCreateInfo {
-    /// `VkCommandPoolCreateFlags flags`
-    pub flags: VkCommandPoolCreateFlags,
-    /// `uint32_t queueFamilyIndex`
-    pub queue_family_index: u32,
+pub struct VkQueryPoolCreateInfo {
+    /// `VkQueryPoolCreateFlags flags`
+    pub flags: VkQueryPoolCreateFlags,
+    /// `VkQueryType queryType`
+    pub query_type: VkQueryType,
+    /// `uint32_t queryCount`
+    pub query_count: u32,
+    /// `VkQueryPipelineStatisticFlags pipelineStatistics`
+    pub pipeline_statistics: VkQueryPipelineStatisticFlags,
 }
 
-impl VkCommandPoolCreateInfo {
+impl VkQueryPoolCreateInfo {
     // No output parameter reaches this structure, so it has no skeleton
     // form and the `partial` flag below is ignored.
 
-    /// `VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO`.
-    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    /// `VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
 
     /// Decode the whole structure, as an input carries it.
     ///
@@ -46,8 +50,8 @@ impl VkCommandPoolCreateInfo {
     /// # Errors
     /// As [`Self::decode`].
     pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
-        expect_structure_type(dec, "VkCommandPoolCreateInfo", Self::STRUCTURE_TYPE)?;
-        dec.empty_pnext_chain("VkCommandPoolCreateInfo")?;
+        expect_structure_type(dec, "VkQueryPoolCreateInfo", Self::STRUCTURE_TYPE)?;
+        dec.empty_pnext_chain("VkQueryPoolCreateInfo")?;
         Self::decode_body(dec, partial)
     }
 
@@ -62,16 +66,20 @@ impl VkCommandPoolCreateInfo {
     }
 
     /// The fields after `sType` and `pNext`, as a chain link carries them
-    /// (`vn_decode_VkCommandPoolCreateInfo_self_temp`).
+    /// (`vn_decode_VkQueryPoolCreateInfo_self_temp`).
     ///
     /// # Errors
     /// As [`Self::decode`].
     pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
-        let flags: VkCommandPoolCreateFlags = dec.u32()?;
-        let queue_family_index: u32 = dec.u32()?;
+        let flags: VkQueryPoolCreateFlags = dec.u32()?;
+        let query_type: VkQueryType = dec.i32()?;
+        let query_count: u32 = dec.u32()?;
+        let pipeline_statistics: VkQueryPipelineStatisticFlags = dec.u32()?;
         Ok(Self {
             flags,
-            queue_family_index,
+            query_type,
+            query_count,
+            pipeline_statistics,
         })
     }
 
@@ -81,12 +89,14 @@ impl VkCommandPoolCreateInfo {
     /// As [`Self::encode`].
     pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
         enc.u32(self.flags)?;
-        enc.u32(self.queue_family_index)?;
+        enc.i32(self.query_type)?;
+        enc.u32(self.query_count)?;
+        enc.u32(self.pipeline_statistics)?;
         Ok(())
     }
 }
 
-/// The arguments of `vkCreateCommandPool`, and its reply.
+/// The arguments of `vkCreateQueryPool`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -94,55 +104,55 @@ impl VkCommandPoolCreateInfo {
 /// fills the outputs in place and sets `ret`, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct CreateCommandPoolArgs {
+pub struct CreateQueryPoolArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `const VkCommandPoolCreateInfo* pCreateInfo` — in.
-    pub p_create_info: Option<VkCommandPoolCreateInfo>,
-    /// `VkCommandPool* pCommandPool` — out.
-    pub p_command_pool: Option<VkCommandPool>,
+    /// `const VkQueryPoolCreateInfo* pCreateInfo` — in.
+    pub p_create_info: Option<VkQueryPoolCreateInfo>,
+    /// `VkQueryPool* pQueryPool` — out.
+    pub p_query_pool: Option<VkQueryPool>,
     /// The return value (`VkResult`), written first in the reply.
     pub ret: VkResult,
 }
 
-impl CreateCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkCreateCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_CREATE_COMMAND_POOL_EXT;
+impl CreateQueryPoolArgs {
+    /// `VK_COMMAND_TYPE_vkCreateQueryPool_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_CREATE_QUERY_POOL_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkCreateCommandPool";
+    pub const NAME: &'static str = "vkCreateQueryPool";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkCreateCommandPool_args_temp`).
+    /// (`vn_decode_vkCreateQueryPool_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkCreateCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkCreateQueryPool"));
         }
-        let p_create_info: Option<VkCommandPoolCreateInfo> = if dec.simple_pointer()? {
-            Some(VkCommandPoolCreateInfo::decode_with(dec, false)?)
+        let p_create_info: Option<VkQueryPoolCreateInfo> = if dec.simple_pointer()? {
+            Some(VkQueryPoolCreateInfo::decode_with(dec, false)?)
         } else {
-            return Err(null_pointer(dec, "vkCreateCommandPool", "pCreateInfo"));
+            return Err(null_pointer(dec, "vkCreateQueryPool", "pCreateInfo"));
         };
         dec.null_allocator()?;
-        let p_command_pool: Option<VkCommandPool> = if dec.simple_pointer()? {
-            Some(VkCommandPool(dec.handle()?))
+        let p_query_pool: Option<VkQueryPool> = if dec.simple_pointer()? {
+            Some(VkQueryPool(dec.handle()?))
         } else {
-            return Err(null_pointer(dec, "vkCreateCommandPool", "pCommandPool"));
+            return Err(null_pointer(dec, "vkCreateQueryPool", "pQueryPool"));
         };
         Ok(Self {
             device,
             p_create_info,
-            p_command_pool,
+            p_query_pool,
             ret: Default::default(),
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkCreateCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkCreateQueryPool`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -157,14 +167,14 @@ impl CreateCommandPoolArgs {
             v.encode_with(enc, false)?;
         }
         enc.null_allocator()?;
-        enc.simple_pointer(self.p_command_pool.is_some())?;
-        if let Some(v) = &self.p_command_pool {
+        enc.simple_pointer(self.p_query_pool.is_some())?;
+        if let Some(v) = &self.p_query_pool {
             enc.handle(v.0)?;
         }
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkCreateCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkCreateQueryPool_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -175,15 +185,15 @@ impl CreateCommandPoolArgs {
     pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
         enc.reply_header(Self::OPCODE)?;
         enc.i32(self.ret)?;
-        enc.simple_pointer(self.p_command_pool.is_some())?;
-        if let Some(v) = &self.p_command_pool {
+        enc.simple_pointer(self.p_query_pool.is_some())?;
+        if let Some(v) = &self.p_query_pool {
             enc.handle(v.0)?;
         }
         Ok(())
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkCreateCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkCreateQueryPool_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -198,8 +208,8 @@ impl CreateCommandPoolArgs {
             });
         }
         self.ret = dec.i32()?;
-        self.p_command_pool = if dec.simple_pointer()? {
-            Some(VkCommandPool(dec.handle()?))
+        self.p_query_pool = if dec.simple_pointer()? {
+            Some(VkQueryPool(dec.handle()?))
         } else {
             None
         };
@@ -207,7 +217,7 @@ impl CreateCommandPoolArgs {
     }
 }
 
-/// The arguments of `vkDestroyCommandPool`, and its reply.
+/// The arguments of `vkDestroyQueryPool`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -215,40 +225,37 @@ impl CreateCommandPoolArgs {
 /// fills the outputs in place, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct DestroyCommandPoolArgs {
+pub struct DestroyQueryPoolArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
+    /// `VkQueryPool queryPool` — in.
+    pub query_pool: VkQueryPool,
 }
 
-impl DestroyCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkDestroyCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_DESTROY_COMMAND_POOL_EXT;
+impl DestroyQueryPoolArgs {
+    /// `VK_COMMAND_TYPE_vkDestroyQueryPool_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_DESTROY_QUERY_POOL_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkDestroyCommandPool";
+    pub const NAME: &'static str = "vkDestroyQueryPool";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkDestroyCommandPool_args_temp`).
+    /// (`vn_decode_vkDestroyQueryPool_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkDestroyCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkDestroyQueryPool"));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
+        let query_pool: VkQueryPool = VkQueryPool(dec.handle()?);
         dec.null_allocator()?;
-        Ok(Self {
-            device,
-            command_pool,
-        })
+        Ok(Self { device, query_pool })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkDestroyCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkDestroyQueryPool`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -258,12 +265,12 @@ impl DestroyCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
+        enc.handle(self.query_pool.0)?;
         enc.null_allocator()?;
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkDestroyCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkDestroyQueryPool_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -277,7 +284,7 @@ impl DestroyCommandPoolArgs {
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkDestroyCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkDestroyQueryPool_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -295,7 +302,7 @@ impl DestroyCommandPoolArgs {
     }
 }
 
-/// The arguments of `vkResetCommandPool`, and its reply.
+/// The arguments of `vkGetQueryPoolResults`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -303,46 +310,67 @@ impl DestroyCommandPoolArgs {
 /// fills the outputs in place and sets `ret`, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct ResetCommandPoolArgs {
+pub struct GetQueryPoolResultsArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
-    /// `VkCommandPoolResetFlags flags` — in.
-    pub flags: VkCommandPoolResetFlags,
+    /// `VkQueryPool queryPool` — in.
+    pub query_pool: VkQueryPool,
+    /// `uint32_t firstQuery` — in.
+    pub first_query: u32,
+    /// `uint32_t queryCount` — in.
+    pub query_count: u32,
+    /// `size_t dataSize` — in.
+    pub data_size: u64,
+    /// `void* pData` — out.
+    pub p_data: Option<Vec<u8>>,
+    /// `VkDeviceSize stride` — in.
+    pub stride: VkDeviceSize,
+    /// `VkQueryResultFlags flags` — in.
+    pub flags: VkQueryResultFlags,
     /// The return value (`VkResult`), written first in the reply.
     pub ret: VkResult,
 }
 
-impl ResetCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkResetCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_RESET_COMMAND_POOL_EXT;
+impl GetQueryPoolResultsArgs {
+    /// `VK_COMMAND_TYPE_vkGetQueryPoolResults_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_QUERY_POOL_RESULTS_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkResetCommandPool";
+    pub const NAME: &'static str = "vkGetQueryPoolResults";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkResetCommandPool_args_temp`).
+    /// (`vn_decode_vkGetQueryPoolResults_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkResetCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkGetQueryPoolResults"));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
-        let flags: VkCommandPoolResetFlags = dec.u32()?;
+        let query_pool: VkQueryPool = VkQueryPool(dec.handle()?);
+        let first_query: u32 = dec.u32()?;
+        let query_count: u32 = dec.u32()?;
+        let data_size: u64 = dec.size()?;
+        let p_data: Option<Vec<u8>> =
+            array_presence(dec, data_size, NullArray::Checked)?.map(|_| Vec::new());
+        let stride: VkDeviceSize = dec.u64()?;
+        let flags: VkQueryResultFlags = dec.u32()?;
         Ok(Self {
             device,
-            command_pool,
+            query_pool,
+            first_query,
+            query_count,
+            data_size,
+            p_data,
+            stride,
             flags,
             ret: Default::default(),
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkResetCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkGetQueryPoolResults`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -352,12 +380,21 @@ impl ResetCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
+        enc.handle(self.query_pool.0)?;
+        enc.u32(self.first_query)?;
+        enc.u32(self.query_count)?;
+        enc.size(self.data_size)?;
+        enc.array_size(if self.p_data.is_some() {
+            self.data_size
+        } else {
+            0
+        })?;
+        enc.u64(self.stride)?;
         enc.u32(self.flags)?;
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkResetCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkGetQueryPoolResults_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -368,11 +405,19 @@ impl ResetCommandPoolArgs {
     pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
         enc.reply_header(Self::OPCODE)?;
         enc.i32(self.ret)?;
+        if let Some(v) = &self.p_data {
+            let count = self.data_size;
+            check_len("vkGetQueryPoolResults", "pData", count, v.len())?;
+            enc.array_size(count)?;
+            enc.blob(v)?;
+        } else {
+            enc.array_size(0)?;
+        }
         Ok(())
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkResetCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkGetQueryPoolResults_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -387,11 +432,15 @@ impl ResetCommandPoolArgs {
             });
         }
         self.ret = dec.i32()?;
+        self.p_data = match array_presence(dec, self.data_size, NullArray::Unchecked)? {
+            Some(n) => Some(decode_owned_blob(dec, n)?),
+            None => None,
+        };
         Ok(())
     }
 }
 
-/// The arguments of `vkTrimCommandPool`, and its reply.
+/// The arguments of `vkResetQueryPool`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -399,43 +448,47 @@ impl ResetCommandPoolArgs {
 /// fills the outputs in place, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct TrimCommandPoolArgs {
+pub struct ResetQueryPoolArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
-    /// `VkCommandPoolTrimFlags flags` — in.
-    pub flags: VkCommandPoolTrimFlags,
+    /// `VkQueryPool queryPool` — in.
+    pub query_pool: VkQueryPool,
+    /// `uint32_t firstQuery` — in.
+    pub first_query: u32,
+    /// `uint32_t queryCount` — in.
+    pub query_count: u32,
 }
 
-impl TrimCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkTrimCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_TRIM_COMMAND_POOL_EXT;
+impl ResetQueryPoolArgs {
+    /// `VK_COMMAND_TYPE_vkResetQueryPool_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_RESET_QUERY_POOL_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkTrimCommandPool";
+    pub const NAME: &'static str = "vkResetQueryPool";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkTrimCommandPool_args_temp`).
+    /// (`vn_decode_vkResetQueryPool_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkTrimCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkResetQueryPool"));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
-        let flags: VkCommandPoolTrimFlags = dec.u32()?;
+        let query_pool: VkQueryPool = VkQueryPool(dec.handle()?);
+        let first_query: u32 = dec.u32()?;
+        let query_count: u32 = dec.u32()?;
         Ok(Self {
             device,
-            command_pool,
-            flags,
+            query_pool,
+            first_query,
+            query_count,
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkTrimCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkResetQueryPool`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -445,12 +498,13 @@ impl TrimCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
-        enc.u32(self.flags)?;
+        enc.handle(self.query_pool.0)?;
+        enc.u32(self.first_query)?;
+        enc.u32(self.query_count)?;
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkTrimCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkResetQueryPool_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -464,7 +518,7 @@ impl TrimCommandPoolArgs {
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkTrimCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkResetQueryPool_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors

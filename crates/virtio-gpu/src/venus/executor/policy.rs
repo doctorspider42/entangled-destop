@@ -20,9 +20,15 @@
 //!   nothing; we implement no sparse command, and vulkaninfo enables
 //!   `sparseBinding` when it is offered and then creates a sparse image
 //!   (spec §1.2).
+//! * **Only the chained structures this stage was written for are
+//!   accepted** ([`admits_link`]). The generated protocol decodes every
+//!   structure the venus protocol can chain, as vkr's does; vkr then hands
+//!   them all to the driver. Here a link outside core 1.0–1.3 and the venus
+//!   protocol's own is refused as unimplemented, which is where the decoder
+//!   used to refuse it before it decoded the whole protocol.
 
 use crate::venus::capset::{vk_api_version_parts, vk_make_api_version};
-use crate::venus::protocol::info::EXTENSIONS;
+use crate::venus::protocol::info::{self, EXTENSIONS};
 use crate::venus::protocol::{
     VkExtensionProperties, VkPhysicalDeviceFeatures, VkPhysicalDeviceFeatures2,
     VkPhysicalDeviceMemoryProperties, VkPhysicalDeviceProperties2, VkQueueFamilyProperties,
@@ -159,24 +165,51 @@ pub fn mask_core_features(core: &mut VkPhysicalDeviceFeatures) {
     core.sparse_residency_aliased = 0;
 }
 
+/// The extensions this stage implements: the venus protocol's own two,
+/// which no host device reports. Every other extension the protocol can
+/// decode waits for the stage that implements its commands and structures.
+pub const IMPLEMENTED_EXTENSIONS: &[&str] =
+    &["VK_EXT_command_serialization", "VK_MESA_venus_protocol"];
+
+/// The newest core version whose chained structures this stage accepts.
+pub const ADMITTED_CHAIN_API: u32 = vk_make_api_version(0, 1, 3, 0);
+
 /// The device extensions a guest is told about: the host's, **intersected
-/// with what the generated protocol can decode**, spec versions clamped to the
-/// protocol's (`vkr_physical_device_init_extensions` does the same with its
-/// own table). Today the decodable set holds only the two private transport
-/// extensions, which no host device reports, so the list is empty — which
-/// keeps every pNext chain the guest sends inside what this crate decodes.
+/// with what the generated protocol can decode and this stage implements**
+/// ([`IMPLEMENTED_EXTENSIONS`]), spec versions clamped to the protocol's
+/// (`vkr_physical_device_init_extensions` does the same with its own table).
+/// Today that is only the two private transport extensions, which no host
+/// device reports, so the list is empty — which keeps every pNext chain a
+/// correct guest sends inside [`admits_link`].
 #[must_use]
 pub fn advertised_extensions(host: &[VkExtensionProperties]) -> Vec<VkExtensionProperties> {
     host.iter()
         .filter_map(|ext| {
             let name = std::str::from_utf8(c_name(&ext.extension_name)).ok()?;
             let known = EXTENSIONS.iter().find(|e| e.name == name)?;
-            known.decodable.then(|| VkExtensionProperties {
-                extension_name: ext.extension_name,
-                spec_version: ext.spec_version.min(known.spec_version),
+            (known.decodable && IMPLEMENTED_EXTENSIONS.contains(&name)).then(|| {
+                VkExtensionProperties {
+                    extension_name: ext.extension_name,
+                    spec_version: ext.spec_version.min(known.spec_version),
+                }
             })
         })
         .collect()
+}
+
+/// Whether a chained structure of type `stype` is one this stage accepts:
+/// core Vulkan 1.0 to [`ADMITTED_CHAIN_API`], or added by one of
+/// [`IMPLEMENTED_EXTENSIONS`] — exactly the pNext whitelist the bring-up
+/// protocol was generated with (`[api] 1.3`, the two venus extensions).
+/// Everything else the protocol can chain decodes, and is refused here.
+#[must_use]
+pub fn admits_link(stype: i32) -> bool {
+    info::structure(stype).is_some_and(|s| {
+        s.core.is_some_and(|core| core <= ADMITTED_CHAIN_API)
+            || s.extensions
+                .iter()
+                .any(|e| IMPLEMENTED_EXTENSIONS.contains(e))
+    })
 }
 
 /// Whether the host reports `name` among `extensions`.

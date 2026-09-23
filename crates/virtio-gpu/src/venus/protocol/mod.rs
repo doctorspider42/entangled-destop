@@ -31,9 +31,13 @@
 //!
 //! # What is generated, and for what
 //!
-//! `tools/venus-protocol/rust-selection.txt` names the commands. For each,
-//! the generator emits a `*Args` type in its group module ([`instance`],
-//! [`device`], …) with:
+//! `tools/venus-protocol/rust-selection.txt` names the commands, and says
+//! `*`: **the whole protocol** — every one of the 325 commands venus-protocol
+//! can serialize, less the ten transport commands [`super::transport`]
+//! hand-writes, every structure and union they reach and every pNext
+//! whitelist exactly as the C renderer's. For each command the generator
+//! emits a `*Args` type in its group module ([`instance`], [`device`],
+//! [`command_buffer`], …) with:
 //!
 //! * `decode` — the renderer side: arguments as the guest encoded them, with
 //!   output parameters present as the *skeletons* the guest sent (a marker,
@@ -48,8 +52,17 @@
 //!
 //! Every structure those commands reach — by value, by pointer, or through a
 //! pNext chain — gets `decode`/`encode` and `decode_partial`/`encode_partial`
-//! (the skeleton form an output structure takes inside a *command*).
+//! (the skeleton form an output structure takes inside a *command*). A union
+//! is an enum with one variant per member: `decode`/`encode` for the ones the
+//! protocol always sends under a default tag, `decode_tagged`/`encode_tagged`
+//! for the ones a selector field in their holder tags. Every type that can
+//! hold a pNext link has `for_each_link`, which is how an executor judges a
+//! command's chains against what it implements.
 //! [`dispatch::Command`] ties them together behind one opcode switch.
+//!
+//! Decoding a command is not implementing it: the executor refuses every
+//! generated command it has no handler for, and every chained structure its
+//! policy does not admit.
 //!
 //! # What the host must still do with it
 //!
@@ -72,11 +85,16 @@
 //!   keeps reading fields out of what it has just said is the wrong struct.
 //! * A pNext chain may carry each `sType` once. Vulkan forbids repeats; the C
 //!   does not look. [`super::transport`] made the same call.
-//! * A pNext chain may only carry structures this crate generated, and that
-//!   is narrower than the C: the chain whitelist is the protocol's, filtered
-//!   to core versions up to `[api]` and the extensions in `[extensions]` of
-//!   the selection file. [`info::DECODABLE_EXTENSION_MASK`] is the capset
+//! * A pNext chain may only carry structures this crate generated. With the
+//!   default selection that is exactly the C's whitelist; a narrower
+//!   selection filters it to core versions up to `[api]` and the extensions
+//!   in `[extensions]`, and [`info::DECODABLE_EXTENSION_MASK`] is the capset
 //!   mask that keeps the guest's encoder inside that set.
+//! * A selected union's own tag must equal its holder's selector. Mesa writes
+//!   the selector as the tag; the C decoder reads both and compares neither.
+//! * A strided array's stride must be the element size. Mesa packs the
+//!   elements and rewrites the stride to `sizeof(element)`; the C decoder
+//!   takes whatever came and hands it to the driver with the packed array.
 //! * A string must carry its NUL. The C writes one over the last byte.
 //!   (Fixed-size `char[N]` arrays follow the C: their last byte is forced to
 //!   NUL.)
@@ -91,8 +109,11 @@
 //! one shape that bound cannot cover — a guest may legitimately ask for 200
 //! of them in 20 bytes — so they are **not** allocated at decode: they
 //! decode as `Some(Vec::new())`, and the count field says how many the guest
-//! can take. Blobs and strings are borrowed from the command bytes and cost
-//! nothing. A pNext chain is bounded by [`MAX_PNEXT_DEPTH`](super::wire::MAX_PNEXT_DEPTH).
+//! can take. The same goes for an output blob (`vkGetQueryPoolResults`'
+//! `pData`): its size is the guest's `dataSize`, and the executor allocates
+//! it when it has something to put there. Input blobs and strings are
+//! borrowed from the command bytes and cost nothing. A pNext chain is
+//! bounded by [`MAX_PNEXT_DEPTH`](super::wire::MAX_PNEXT_DEPTH).
 //!
 //! No generated function panics, indexes with a guest value, or
 //! `unwrap`s; every refusal poisons the decoder it came from, so a caller
@@ -111,30 +132,111 @@ use thiserror::Error;
 use super::wire::{Decoder, Encoder, PnextVisitor, WireError};
 
 #[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod acceleration_structure;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod buffer;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod buffer_view;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod command_buffer;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
 pub mod command_pool;
 pub mod defines;
 #[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod descriptor_heap;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod descriptor_pool;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod descriptor_set;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod descriptor_set_layout;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod descriptor_update_template;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
 pub mod device;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod device_memory;
 #[allow(clippy::large_enum_variant)]
 pub mod dispatch;
 #[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod event;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod fence;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod framebuffer;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod host_copy;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
 pub mod image;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod image_view;
 pub mod info;
 #[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
 pub mod instance;
 #[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod pipeline;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod pipeline_cache;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod pipeline_layout;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod private_data_slot;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod query_pool;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod queue;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod render_pass;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod sampler;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod sampler_ycbcr_conversion;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod semaphore;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod shader_module;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
 pub mod structs;
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+pub mod transport;
 
 #[cfg(test)]
 mod tests;
 
+pub use acceleration_structure::*;
+pub use buffer::*;
+pub use buffer_view::*;
+pub use command_buffer::*;
 pub use command_pool::*;
 pub use defines::*;
+pub use descriptor_heap::*;
+pub use descriptor_pool::*;
+pub use descriptor_set::*;
+pub use descriptor_set_layout::*;
+pub use descriptor_update_template::*;
 pub use device::*;
+pub use device_memory::*;
 pub use dispatch::*;
+pub use event::*;
+pub use fence::*;
+pub use framebuffer::*;
+pub use host_copy::*;
 pub use image::*;
+pub use image_view::*;
 pub use instance::*;
+pub use pipeline::*;
+pub use pipeline_cache::*;
+pub use pipeline_layout::*;
+pub use private_data_slot::*;
+pub use query_pool::*;
+pub use queue::*;
+pub use render_pass::*;
+pub use sampler::*;
+pub use sampler_ycbcr_conversion::*;
+pub use semaphore::*;
+pub use shader_module::*;
 pub use structs::*;
+pub use transport::*;
 
 /// Why a Venus command could not be decoded, or a reply encoded.
 ///
@@ -246,9 +348,11 @@ pub enum ProtocolError {
         opcode: u32,
     },
 
-    /// A real Venus command that this crate did not generate a decoder for.
-    /// Fatal for the same reason as [`ProtocolError::UnknownOpcode`], and
-    /// the fix is a line in `tools/venus-protocol/rust-selection.txt`.
+    /// A real Venus command that this crate did not generate a decoder for:
+    /// one venus-protocol cannot serialize at all (`vkMapMemory`, the fd
+    /// commands, ...), a transport command asked of the wrong decoder, or one
+    /// a narrower `tools/venus-protocol/rust-selection.txt` left out. Fatal
+    /// for the same reason as [`ProtocolError::UnknownOpcode`].
     #[error("{command} (opcode {opcode}) has no generated decoder")]
     NotGenerated {
         /// Its `VkCommandTypeEXT`.
@@ -264,6 +368,62 @@ pub enum ProtocolError {
         command: &'static str,
         /// Only the unknown bits.
         unknown: u32,
+    },
+
+    /// A union tag that selects none of the union's members
+    /// (`vn_cs_decoder_set_fatal` in the `default:` of the union's switch).
+    #[error("union {union} has no member for tag {tag}")]
+    UnknownUnionTag {
+        /// The union.
+        union: &'static str,
+        /// The tag the guest sent.
+        tag: i64,
+    },
+
+    /// A selected union whose own wire tag is not its holder's selector.
+    /// Mesa's encoder writes the selector as the tag, so the two cannot
+    /// differ in a stream it produced; the C decoder reads both and compares
+    /// neither, which would hand the driver one member under the other's
+    /// name. Stricter than the C.
+    #[error("{owner}::{field} carries union tag {tag} but its selector says {selector}")]
+    UnionSelectorMismatch {
+        /// The structure holding the union.
+        owner: &'static str,
+        /// The union member.
+        field: &'static str,
+        /// The tag on the wire.
+        tag: i64,
+        /// The selector field's value.
+        selector: i64,
+    },
+
+    /// Encode side: a union asked to go out under a tag that selects a
+    /// member it does not hold.
+    #[error("union {union} does not hold the member tag {tag} selects")]
+    UnionTagMismatch {
+        /// The union.
+        union: &'static str,
+        /// The tag asked for.
+        tag: i64,
+    },
+
+    /// A strided array's stride that is not the element's size. Mesa's
+    /// encoder packs the elements and rewrites the stride to
+    /// `sizeof(element)`; the C decoder reads whatever came, and a driver
+    /// handed the packed array with a larger stride reads past it. Stricter
+    /// than the C.
+    #[error(
+        "{owner}::{field} is {stride}, not the {expected}-byte element size the array is packed at"
+    )]
+    BadStride {
+        /// The command or structure.
+        owner: &'static str,
+        /// The stride parameter.
+        field: &'static str,
+        /// What the guest sent.
+        stride: u32,
+        /// `sizeof(element)`.
+        expected: u32,
     },
 }
 
@@ -300,6 +460,61 @@ pub fn unsupported_pointer(
 /// [`ProtocolError::NullDispatchHandle`], recorded on `dec`.
 pub fn null_dispatch_handle(dec: &mut Decoder<'_>, command: &'static str) -> ProtocolError {
     refuse(dec, ProtocolError::NullDispatchHandle { command })
+}
+
+/// [`ProtocolError::UnknownUnionTag`], recorded on `dec`.
+pub fn unknown_union_tag(dec: &mut Decoder<'_>, union: &'static str, tag: i64) -> ProtocolError {
+    refuse(dec, ProtocolError::UnknownUnionTag { union, tag })
+}
+
+/// A selected union's wire tag against its holder's selector field.
+///
+/// # Errors
+/// [`ProtocolError::UnionSelectorMismatch`] when they differ.
+pub fn check_union_tag(
+    dec: &mut Decoder<'_>,
+    owner: &'static str,
+    field: &'static str,
+    tag: i64,
+    selector: i64,
+) -> Result<(), ProtocolError> {
+    if tag == selector {
+        return Ok(());
+    }
+    Err(refuse(
+        dec,
+        ProtocolError::UnionSelectorMismatch {
+            owner,
+            field,
+            tag,
+            selector,
+        },
+    ))
+}
+
+/// A stride parameter against the element size its array travels packed at.
+///
+/// # Errors
+/// [`ProtocolError::BadStride`] when they differ.
+pub fn check_stride(
+    dec: &mut Decoder<'_>,
+    owner: &'static str,
+    field: &'static str,
+    stride: u32,
+    expected: u32,
+) -> Result<(), ProtocolError> {
+    if stride == expected {
+        return Ok(());
+    }
+    Err(refuse(
+        dec,
+        ProtocolError::BadStride {
+            owner,
+            field,
+            stride,
+            expected,
+        },
+    ))
 }
 
 /// Read and check a structure's `sType`.
@@ -431,6 +646,142 @@ pub fn decode_vec<'a, T>(
         (Ok(values), None) => Ok(values),
         (Err(wire), None) => Err(ProtocolError::Wire(wire)),
     }
+}
+
+/// [`decode_vec`], with each element told its index — the outer level of a
+/// two-level array, whose inner counts are read from the element of another
+/// array with the same index (`pInfos[i].geometryCount`).
+///
+/// # Errors
+/// As [`decode_vec`].
+pub fn decode_vec_indexed<'a, T>(
+    dec: &mut Decoder<'a>,
+    n: usize,
+    mut item: impl FnMut(&mut Decoder<'a>, usize) -> Result<T, ProtocolError>,
+) -> Result<Vec<T>, ProtocolError> {
+    let mut index = 0usize;
+    decode_vec(dec, n, |d| {
+        let value = item(d, index);
+        index = index.saturating_add(1);
+        value
+    })
+}
+
+/// The inner level of a two-level array: its 8-byte length, which must
+/// equal `expected` (`vn_decode_array_size`, no null form), as a count.
+///
+/// # Errors
+/// [`WireError::ArrayLengthMismatch`], [`WireError::ArrayLongerThanStream`]
+/// for a length no host slice could hold, or [`WireError::Truncated`].
+pub fn inner_array(dec: &mut Decoder<'_>, expected: u64) -> Result<usize, ProtocolError> {
+    let size = dec.array_size(expected)?;
+    match usize::try_from(size) {
+        Ok(len) => Ok(len),
+        Err(_) => {
+            let left = dec.remaining();
+            Err(refuse(
+                dec,
+                ProtocolError::Wire(WireError::ArrayLongerThanStream {
+                    count: size,
+                    needed: size,
+                    left,
+                }),
+            ))
+        }
+    }
+}
+
+/// `n` opaque bytes padded to four, copied out of the stream — a blob the
+/// host keeps or writes itself (`vn_decode_blob_array` into storage it
+/// owns). Bounded by the stream: the bytes have to be there.
+///
+/// # Errors
+/// [`WireError::Truncated`], or [`WireError::OutOfMemory`].
+pub fn decode_owned_blob(dec: &mut Decoder<'_>, n: usize) -> Result<Vec<u8>, ProtocolError> {
+    let bytes = dec.blob(n)?;
+    let mut out = Vec::new();
+    if out.try_reserve_exact(bytes.len()).is_err() {
+        return Err(refuse(
+            dec,
+            ProtocolError::Wire(WireError::OutOfMemory {
+                wanted: bytes.len(),
+            }),
+        ));
+    }
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+/// `n` packed `uint16_t`s: `2 * n` bytes, then padding to four — not one
+/// four-byte slot each as a lone `uint16_t` travels
+/// (`vn_decode_uint16_t_array`, `(size + 3) & ~3`).
+///
+/// # Errors
+/// [`WireError::Truncated`], [`WireError::ArrayLongerThanStream`] for a
+/// count whose bytes overflow, or [`WireError::OutOfMemory`].
+pub fn decode_u16_array(dec: &mut Decoder<'_>, n: usize) -> Result<Vec<u16>, ProtocolError> {
+    let Some(len) = n.checked_mul(2) else {
+        let left = dec.remaining();
+        let count = u64::try_from(n).unwrap_or(u64::MAX);
+        return Err(refuse(
+            dec,
+            ProtocolError::Wire(WireError::ArrayLongerThanStream {
+                count,
+                needed: u64::MAX,
+                left,
+            }),
+        ));
+    };
+    let bytes = dec.blob(len)?;
+    let mut out = Vec::new();
+    if out.try_reserve_exact(n).is_err() {
+        return Err(refuse(
+            dec,
+            ProtocolError::Wire(WireError::OutOfMemory { wanted: len }),
+        ));
+    }
+    out.extend(
+        bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+    );
+    Ok(out)
+}
+
+/// A fixed `uint16_t[N]`: the 8-byte length (which must be `N`), then the
+/// `N` values packed as [`decode_u16_array`] reads them.
+///
+/// # Errors
+/// [`WireError::ArrayLengthMismatch`] or [`WireError::Truncated`].
+pub fn decode_u16_fixed<const N: usize>(dec: &mut Decoder<'_>) -> Result<[u16; N], ProtocolError> {
+    dec.array_size(N as u64)?;
+    let bytes = dec.blob(N.saturating_mul(2))?;
+    let mut out = [0u16; N];
+    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        *slot = u16::from_le_bytes([pair[0], pair[1]]);
+    }
+    Ok(out)
+}
+
+/// Packed `uint16_t`s, the mirror of [`decode_u16_array`]: two bytes each,
+/// then zero padding to four.
+///
+/// # Errors
+/// Whatever the encoder refused.
+pub fn encode_u16_array(enc: &mut Encoder, values: &[u16]) -> Result<(), ProtocolError> {
+    let mut bytes = Vec::new();
+    if bytes
+        .try_reserve_exact(values.len().saturating_mul(2))
+        .is_err()
+    {
+        return Err(ProtocolError::Wire(WireError::OutOfMemory {
+            wanted: values.len().saturating_mul(2),
+        }));
+    }
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(enc.blob(&bytes)?)
 }
 
 /// One element of an array of strings: its own 8-byte length, unchecked,

@@ -45,16 +45,42 @@ Nothing upstream is edited. Everything below imports `vn_protocol` and
 - `rust_protocol.py` — translates `vn_protocol.Gen`'s model (in/out
   classification, partial encoding, validity, null-branch rules,
   `IGNORABLE_LIST`, chain lists, command grouping) into Rust over
-  `crates/virtio-gpu/src/venus/wire.rs`. Refuses (`Unsupported`) any
-  construct it does not translate yet: unions, strided arrays, nested
-  dynamic arrays, blobs written straight into a reply, arithmetic `len`
-  expressions, packed `uint16_t` arrays.
+  `crates/virtio-gpu/src/venus/wire.rs`, for **the whole protocol**: 315
+  commands (the 325 serializable ones less the ten transport commands
+  `venus/transport.rs` hand-writes), 516 structures, 7 unions, 187
+  extensions. Every construct git-70991d4c uses is translated, each to the
+  C templates' own semantics:
+  - unions (`types_union.h`): an enum per union; a default-tagged union
+    (`UNION_DEFAULT_TAGS`) carries its `uint32_t` member index, a selected
+    one the value of its holder's selector (and must agree with it — a
+    check the C does not make);
+  - strided arrays: packed on the wire, the stride parameter written as
+    `sizeof(element)` (`stride = sizeof(...)` in `_encode_variable`) and
+    refused on decode when it is anything else;
+  - two-level arrays (`ppGeometries`, `ppBuildRangeInfos`,
+    `ppMaxPrimitiveCounts`): the outer array as any other, each inner one an
+    8-byte size that must equal its count — a constant, or the outer
+    element's `pInfos[i].geometryCount` — with no null form;
+  - blobs the host writes (`need_blob_encode`: `vkGetQueryPoolResults`,
+    `vkGetPipelineCacheData`, ...; and skeleton blobs like
+    `VkHostAddressRangeEXT::address`): sized in the command, owned by the
+    executor, written into the reply as any blob;
+  - arithmetic `len` (`codeSize / 4`, `(rasterizationSamples + 31) / 32`):
+    evaluated in C's unsigned type, wrapping (an enum with no negative value
+    is `unsigned int` under GCC and Clang; the harness asserts it);
+  - constant `len` (`2*VK_UUID_SIZE`);
+  - packed `uint16_t` arrays (`vn_encode_uint16_t_array`): two bytes each,
+    padded to four — no command at this revision carries one;
+  - a union member the wire cannot carry (`hostAddress`): its null marker.
+  Anything newer still raises `Unsupported` at generation time.
 - `templates/rust_*.rs` — the Mako templates it renders (defines, info,
   group modules, dispatch).
 - `rust-selection.txt` — which commands, which core API version and which
-  extensions the generated chains admit.
+  extensions the generated chains admit; `*` (everything) in all three by
+  default, with the transport commands excluded by name.
 - `harness/` — the differential check against the generated C (driver and
-  renderer); see `harness/run_differential.py`.
+  renderer) over every generated command, including poisoned chains and
+  the extension table; see `harness/run_differential.py`.
 - this file.
 
 ## Regenerating
@@ -64,7 +90,9 @@ python scripts/venus-gen.py          # with Mako installed; see its --help
 ```
 
 CI job `venus-protocol` (`.github/workflows/ci.yml`) regenerates, fails on
-`git diff --exit-code`, and runs the differential harness.
+`git diff --exit-code`, checks `scripts/venus-ash-gen.py --check` (the
+executor's `ash` bridge, which reads the generated protocol), and runs the
+differential harness.
 
 ## Updating to a newer upstream revision
 

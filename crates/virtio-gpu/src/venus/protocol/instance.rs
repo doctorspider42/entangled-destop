@@ -534,3 +534,292 @@ impl EnumerateInstanceVersionArgs {
         Ok(())
     }
 }
+
+/// The arguments of `vkEnumerateInstanceLayerProperties`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place and sets `ret`, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EnumerateInstanceLayerPropertiesArgs {
+    /// `uint32_t* pPropertyCount` — in/out.
+    pub p_property_count: Option<u32>,
+    /// `VkLayerProperties* pProperties` — out.
+    pub p_properties: Option<Vec<VkLayerProperties>>,
+    /// The return value (`VkResult`), written first in the reply.
+    pub ret: VkResult,
+}
+
+impl EnumerateInstanceLayerPropertiesArgs {
+    /// `VK_COMMAND_TYPE_vkEnumerateInstanceLayerProperties_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_ENUMERATE_INSTANCE_LAYER_PROPERTIES_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkEnumerateInstanceLayerProperties";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkEnumerateInstanceLayerProperties_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        let p_property_count: Option<u32> = if dec.simple_pointer()? {
+            Some(dec.u32()?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkEnumerateInstanceLayerProperties",
+                "pPropertyCount",
+            ));
+        };
+        let p_properties: Option<Vec<VkLayerProperties>> = array_presence(
+            dec,
+            u64::from(p_property_count.unwrap_or(0)),
+            NullArray::Unchecked,
+        )?
+        .map(|_| Vec::new());
+        Ok(Self {
+            p_property_count,
+            p_properties,
+            ret: Default::default(),
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkEnumerateInstanceLayerProperties`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.simple_pointer(self.p_property_count.is_some())?;
+        if let Some(v) = &self.p_property_count {
+            enc.u32(*v)?;
+        }
+        if self.p_properties.is_some() {
+            enc.array_size(u64::from(self.p_property_count.unwrap_or(0)))?;
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkEnumerateInstanceLayerProperties_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.i32(self.ret)?;
+        enc.simple_pointer(self.p_property_count.is_some())?;
+        if let Some(v) = &self.p_property_count {
+            enc.u32(*v)?;
+        }
+        if let Some(v) = &self.p_properties {
+            let count = u64::from(self.p_property_count.unwrap_or(0));
+            check_len(
+                "vkEnumerateInstanceLayerProperties",
+                "pProperties",
+                count,
+                v.len(),
+            )?;
+            enc.array_size(count)?;
+            for e in v {
+                e.encode_with(enc, false)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkEnumerateInstanceLayerProperties_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.ret = dec.i32()?;
+        self.p_property_count = if dec.simple_pointer()? {
+            Some(dec.u32()?)
+        } else {
+            None
+        };
+        self.p_properties = match array_presence(
+            dec,
+            u64::from(self.p_property_count.unwrap_or(0)),
+            NullArray::Unchecked,
+        )? {
+            Some(n) => Some(decode_vec(dec, n, |dec| {
+                VkLayerProperties::decode_with(dec, false)
+            })?),
+            None => None,
+        };
+        Ok(())
+    }
+}
+
+/// The arguments of `vkEnumerateInstanceExtensionProperties`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place and sets `ret`, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EnumerateInstanceExtensionPropertiesArgs<'a> {
+    /// `const char* pLayerName` — in.
+    pub p_layer_name: Option<&'a [u8]>,
+    /// `uint32_t* pPropertyCount` — in/out.
+    pub p_property_count: Option<u32>,
+    /// `VkExtensionProperties* pProperties` — out.
+    pub p_properties: Option<Vec<VkExtensionProperties>>,
+    /// The return value (`VkResult`), written first in the reply.
+    pub ret: VkResult,
+}
+
+impl<'a> EnumerateInstanceExtensionPropertiesArgs<'a> {
+    /// `VK_COMMAND_TYPE_vkEnumerateInstanceExtensionProperties_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_ENUMERATE_INSTANCE_EXTENSION_PROPERTIES_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkEnumerateInstanceExtensionProperties";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkEnumerateInstanceExtensionProperties_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'a>) -> Result<Self, ProtocolError> {
+        let p_layer_name: Option<&'a [u8]> = dec.opt_string()?;
+        let p_property_count: Option<u32> = if dec.simple_pointer()? {
+            Some(dec.u32()?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkEnumerateInstanceExtensionProperties",
+                "pPropertyCount",
+            ));
+        };
+        let p_properties: Option<Vec<VkExtensionProperties>> = array_presence(
+            dec,
+            u64::from(p_property_count.unwrap_or(0)),
+            NullArray::Unchecked,
+        )?
+        .map(|_| Vec::new());
+        Ok(Self {
+            p_layer_name,
+            p_property_count,
+            p_properties,
+            ret: Default::default(),
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkEnumerateInstanceExtensionProperties`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.opt_string(self.p_layer_name)?;
+        enc.simple_pointer(self.p_property_count.is_some())?;
+        if let Some(v) = &self.p_property_count {
+            enc.u32(*v)?;
+        }
+        if self.p_properties.is_some() {
+            enc.array_size(u64::from(self.p_property_count.unwrap_or(0)))?;
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkEnumerateInstanceExtensionProperties_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.i32(self.ret)?;
+        enc.simple_pointer(self.p_property_count.is_some())?;
+        if let Some(v) = &self.p_property_count {
+            enc.u32(*v)?;
+        }
+        if let Some(v) = &self.p_properties {
+            let count = u64::from(self.p_property_count.unwrap_or(0));
+            check_len(
+                "vkEnumerateInstanceExtensionProperties",
+                "pProperties",
+                count,
+                v.len(),
+            )?;
+            enc.array_size(count)?;
+            for e in v {
+                e.encode_with(enc, false)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkEnumerateInstanceExtensionProperties_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'a>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.ret = dec.i32()?;
+        self.p_property_count = if dec.simple_pointer()? {
+            Some(dec.u32()?)
+        } else {
+            None
+        };
+        self.p_properties = match array_presence(
+            dec,
+            u64::from(self.p_property_count.unwrap_or(0)),
+            NullArray::Unchecked,
+        )? {
+            Some(n) => Some(decode_vec(dec, n, |dec| {
+                VkExtensionProperties::decode_with(dec, false)
+            })?),
+            None => None,
+        };
+        Ok(())
+    }
+}

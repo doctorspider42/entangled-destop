@@ -2,16 +2,17 @@
 ## SPDX-License-Identifier: MIT
 ##
 ## The Rust side of vn_protocol_renderer_info.h, plus which extensions this
-## crate can actually decode.
+## crate can actually decode and where every chainable structure comes from.
 <%
     ver = M.vk_xml_version()
     packed = (ver[0] << 29) | (ver[1] << 22) | (ver[2] << 12) | ver[3]
-    amaj, amin = (int(x) for x in M.selection.api.split('.'))
+    amaj, amin = (int(x) for x in M.api().split('.'))
     api_packed = (amaj << 22) | (amin << 12)
     exts = M.extensions()
     decodable = [e for e in exts if e[3]]
     all_mask = M.mask([e[1] for e in exts], 32, True)
     dec_mask = M.mask([e[1] for e in decodable], 32, True)
+    origins = M.structure_origins()
 %>\
 //! What the protocol revision knows, and what this crate decodes of it.
 //!
@@ -24,6 +25,11 @@
 //! extension is not in the mask, and any structure it does send that this
 //! crate did not generate is fatal on arrival (spec §6; virglrenderer sets
 //! the sentinel and enumerates its own list, `vkr_renderer.c:40-48`).
+//!
+//! Decodable is not *implemented*: which device extensions a guest is
+//! offered, and which chained structures an executor accepts, are the
+//! executor's policy. [`STRUCTURES`] is the registry fact that policy is
+//! written against.
 
 /// `VN_WIRE_FORMAT_VERSION`: must equal the guest's exactly, or Mesa stubs
 /// the instance out.
@@ -68,8 +74,7 @@ pub const DECODABLE_EXTENSION_MASK: [u32; 32] = [
 ];
 
 /// `vk_extension_mask1` for every extension in the protocol, sentinel set:
-/// what virglrenderer's `vn_info_extension_mask_init` advertises. For
-/// comparison only — this crate cannot decode most of it.
+/// what virglrenderer's `vn_info_extension_mask_init` advertises.
 pub const PROTOCOL_EXTENSION_MASK: [u32; 32] = [
 % for w in all_mask:
     ${'%#010x' % w},
@@ -89,4 +94,34 @@ pub fn extension(name: &str) -> Option<&'static ExtensionInfo> {
 /// `capset::ExtensionMask::enumerating`.
 pub fn decodable_extension_numbers() -> impl Iterator<Item = u32> {
     EXTENSIONS.iter().filter(|e| e.decodable).map(|e| e.number)
+}
+
+/// Where a generated extensible structure comes from in the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructureInfo {
+    /// Its `VkStructureType` value.
+    pub stype: i32,
+    /// `Vk...`.
+    pub name: &'static str,
+    /// The first core version that has it, in `VK_MAKE_API_VERSION(0, major,
+    /// minor, 0)` packing; `None` for a structure only extensions add.
+    pub core: Option<u32>,
+    /// The protocol's extensions that add it, sorted.
+    pub extensions: &'static [&'static str],
+}
+
+/// Every generated structure that has an `sType`, sorted by it.
+pub const STRUCTURES: &[StructureInfo] = &[
+% for value, name, stype, core, names in origins:
+    StructureInfo { stype: ${value}, name: "${name}", core: ${'Some(%#x)' % core if core is not None else 'None'}, extensions: &[${', '.join('"%s"' % n for n in names)}] },
+% endfor
+];
+
+/// The [`STRUCTURES`] entry for `stype`.
+#[must_use]
+pub fn structure(stype: i32) -> Option<&'static StructureInfo> {
+    STRUCTURES
+        .binary_search_by(|s| s.stype.cmp(&stype))
+        .ok()
+        .and_then(|i| STRUCTURES.get(i))
 }

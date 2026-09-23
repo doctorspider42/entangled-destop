@@ -413,6 +413,7 @@ pub fn create_device(
             p_next: chain,
             queue_create_info_count: 1,
             p_queue_create_infos: Some(vec![VkDeviceQueueCreateInfo {
+                p_next: Vec::new(),
                 flags: 0,
                 queue_family_index: 0,
                 queue_count: 1,
@@ -452,7 +453,7 @@ pub fn create_pool(device: u64, id: u64) -> Command<'static> {
     })
 }
 
-pub fn image_info() -> VkImageCreateInfo {
+pub fn image_info() -> VkImageCreateInfo<'static> {
     VkImageCreateInfo {
         image_type: 1,
         format: RGBA8,
@@ -470,7 +471,7 @@ pub fn image_info() -> VkImageCreateInfo {
     }
 }
 
-pub fn create_image(device: u64, id: u64, info: VkImageCreateInfo) -> Command<'static> {
+pub fn create_image(device: u64, id: u64, info: VkImageCreateInfo<'static>) -> Command<'static> {
     Command::CreateImage(CreateImageArgs {
         device: VkDevice(device),
         p_create_info: Some(info),

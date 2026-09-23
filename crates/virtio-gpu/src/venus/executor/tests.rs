@@ -693,10 +693,7 @@ fn an_image_outside_vulkan_1_3_never_reaches_the_driver() {
         with_device(&mut h);
         let head = h.call(&create_image(DEVICE, IMAGE, info)).expect_err(what);
         assert_eq!(head, h.last_start, "{what}");
-        assert!(
-            host.image_requests().is_empty(),
-            "{what} reached the driver"
-        );
+        assert!(host.image_requests() == 0, "{what} reached the driver");
     }
 }
 
@@ -801,12 +798,34 @@ fn a_transport_command_asking_for_a_reply_is_fatal() {
 }
 
 #[test]
-fn a_command_this_stage_does_not_generate_is_fatal_and_left_unconsumed() {
+fn a_command_the_protocol_cannot_carry_is_fatal_and_left_unconsumed() {
     let (mut h, _) = standard();
     assert_eq!(h.submit(&set_reply(REPLY_RES, 0, 64)), Outcome::Consumed);
-    // vkGetPhysicalDeviceFeatures (v1), opcode 3: a real command, not
-    // generated.
+    // vkMapMemory, opcode 23: a real command, which the protocol does not
+    // serialize (a host pointer out), so nothing decodes it.
+    assert_eq!(command_type_name(23), Some("vkMapMemory"));
+    let mut enc = Encoder::new();
+    enc.command_header(crate::venus::wire::CommandHeader {
+        opcode: 23,
+        flags: COMMAND_GENERATE_REPLY,
+    })
+    .unwrap();
+    enc.handle(DEVICE).unwrap();
+    let at = h.tail();
+    assert_eq!(
+        h.submit(&enc.finish().unwrap()),
+        Outcome::Fatal { head: at }
+    );
+}
+
+#[test]
+fn a_decodable_command_this_stage_does_not_implement_is_fatal_and_left_unconsumed() {
+    let (mut h, _) = standard();
+    assert_eq!(h.submit(&set_reply(REPLY_RES, 0, 64)), Outcome::Consumed);
+    // vkGetPhysicalDeviceFeatures (v1), opcode 3: generated, decodable, and
+    // not one this stage answers.
     assert_eq!(command_type_name(3), Some("vkGetPhysicalDeviceFeatures"));
+    assert!(GENERATED_COMMANDS.iter().any(|(op, _)| *op == 3));
     let mut enc = Encoder::new();
     enc.command_header(crate::venus::wire::CommandHeader {
         opcode: 3,
@@ -820,6 +839,275 @@ fn a_command_this_stage_does_not_generate_is_fatal_and_left_unconsumed() {
         h.submit(&enc.finish().unwrap()),
         Outcome::Fatal { head: at }
     );
+}
+
+#[test]
+fn a_decodable_command_without_a_handler_is_refused_as_not_implemented() {
+    let mut ctx = super::VulkanContext::new(CTX, Arc::new(FakeVulkan::standard()));
+    let mut command = Command::GetPhysicalDeviceFeatures(GetPhysicalDeviceFeaturesArgs {
+        physical_device: VkPhysicalDevice(PHYSICAL),
+        p_features: Some(VkPhysicalDeviceFeatures::default()),
+    });
+    assert_eq!(
+        ctx.execute(&mut command),
+        Err(super::ExecError::NotImplemented {
+            command: "vkGetPhysicalDeviceFeatures"
+        })
+    );
+    assert!(ctx.is_fatal(), "the context is done, as for any refusal");
+
+    // A command buffer command, which no stage before command buffers has:
+    // refused, not silently recorded.
+    let mut ctx = super::VulkanContext::new(CTX, Arc::new(FakeVulkan::standard()));
+    let mut draw = Command::CmdDraw(CmdDrawArgs {
+        command_buffer: VkCommandBuffer(0x99),
+        vertex_count: 3,
+        instance_count: 1,
+        first_vertex: 0,
+        first_instance: 0,
+    });
+    assert_eq!(
+        ctx.execute(&mut draw),
+        Err(super::ExecError::NotImplemented {
+            command: "vkCmdDraw"
+        })
+    );
+}
+
+#[test]
+fn a_chained_structure_this_stage_does_not_implement_is_fatal_and_never_reaches_the_host() {
+    let drm = || {
+        VkImageCreateInfoNext::VkImageDrmFormatModifierListCreateInfoEXT(
+            VkImageDrmFormatModifierListCreateInfoEXT {
+                drm_format_modifier_count: 1,
+                p_drm_format_modifiers: Some(vec![0]),
+            },
+        )
+    };
+    // It decodes: the protocol admits it in VkImageCreateInfo's chain.
+    let info = VkImageCreateInfo {
+        p_next: vec![drm()],
+        ..image_info()
+    };
+    let bytes = call_bytes(&create_image(DEVICE, IMAGE, info.clone()));
+    let mut dec = crate::venus::wire::Decoder::new(&bytes);
+    let (_, mut decoded) = Command::decode_next(&mut dec).expect("decodes");
+
+    // The executor refuses it, naming it, before anything else is judged.
+    let mut ctx = super::VulkanContext::new(CTX, Arc::new(FakeVulkan::standard()));
+    assert_eq!(
+        ctx.execute(&mut decoded),
+        Err(super::ExecError::UnimplementedLink {
+            command: "vkCreateImage",
+            parent: "VkImageCreateInfo",
+            stype: VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+            name: "VkImageDrmFormatModifierListCreateInfoEXT",
+        })
+    );
+
+    // Through the ring: fatal on that command, and the host never asked.
+    let (mut h, host) = standard();
+    with_device(&mut h);
+    let head = h
+        .call(&create_image(DEVICE, IMAGE, info))
+        .expect_err("an unimplemented link is fatal");
+    assert_eq!(head, h.last_start, "head stays in front of the command");
+    assert_eq!(host.image_requests(), 0);
+    assert!(h.fatal());
+}
+
+/// Every sType `N`'s whitelist holds, found by asking it to decode each
+/// structure the protocol knows from no bytes at all: an admitted one fails
+/// on the missing bytes, an unadmitted one is not recognised.
+fn whitelist<N: ChainLink<'static>>() -> Vec<i32> {
+    info::STRUCTURES
+        .iter()
+        .filter(|s| {
+            let mut dec = crate::venus::wire::Decoder::new(&[]);
+            N::decode_body(s.stype, &mut dec, false).is_some()
+        })
+        .map(|s| s.stype)
+        .collect()
+}
+
+fn admitted_names<N: ChainLink<'static>>() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = whitelist::<N>()
+        .into_iter()
+        .filter(|s| super::policy::admits_link(*s))
+        .filter_map(|s| info::structure(s).map(|i| i.name))
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+#[test]
+fn the_links_this_stage_admits_are_exactly_the_ones_the_bring_up_protocol_decoded() {
+    // The pNext whitelists of the bring-up commands as the generator emitted
+    // them with `[api] 1.3` and the two venus extensions, before it
+    // generated the whole protocol: the executor's policy must keep
+    // admitting exactly these, whatever the decoder now accepts.
+    let sorted = |mut v: Vec<&'static str>| {
+        v.sort_unstable();
+        v
+    };
+    let features = [
+        "VkPhysicalDevicePrivateDataFeatures",
+        "VkPhysicalDeviceVariablePointersFeatures",
+        "VkPhysicalDeviceMultiviewFeatures",
+        "VkPhysicalDevice16BitStorageFeatures",
+        "VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures",
+        "VkPhysicalDeviceSamplerYcbcrConversionFeatures",
+        "VkPhysicalDeviceProtectedMemoryFeatures",
+        "VkPhysicalDeviceInlineUniformBlockFeatures",
+        "VkPhysicalDeviceMaintenance4Features",
+        "VkPhysicalDeviceShaderDrawParametersFeatures",
+        "VkPhysicalDeviceShaderFloat16Int8Features",
+        "VkPhysicalDeviceHostQueryResetFeatures",
+        "VkPhysicalDeviceDescriptorIndexingFeatures",
+        "VkPhysicalDeviceTimelineSemaphoreFeatures",
+        "VkPhysicalDevice8BitStorageFeatures",
+        "VkPhysicalDeviceVulkanMemoryModelFeatures",
+        "VkPhysicalDeviceShaderAtomicInt64Features",
+        "VkPhysicalDeviceScalarBlockLayoutFeatures",
+        "VkPhysicalDeviceUniformBufferStandardLayoutFeatures",
+        "VkPhysicalDeviceBufferDeviceAddressFeatures",
+        "VkPhysicalDeviceImagelessFramebufferFeatures",
+        "VkPhysicalDeviceTextureCompressionASTCHDRFeatures",
+        "VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures",
+        "VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures",
+        "VkPhysicalDeviceSubgroupSizeControlFeatures",
+        "VkPhysicalDevicePipelineCreationCacheControlFeatures",
+        "VkPhysicalDeviceVulkan11Features",
+        "VkPhysicalDeviceVulkan12Features",
+        "VkPhysicalDeviceVulkan13Features",
+        "VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures",
+        "VkPhysicalDeviceImageRobustnessFeatures",
+        "VkPhysicalDeviceShaderTerminateInvocationFeatures",
+        "VkPhysicalDeviceSynchronization2Features",
+        "VkPhysicalDeviceShaderIntegerDotProductFeatures",
+        "VkPhysicalDeviceDynamicRenderingFeatures",
+    ];
+    let mut device = features.to_vec();
+    device.extend([
+        "VkDevicePrivateDataCreateInfo",
+        "VkPhysicalDeviceFeatures2",
+        "VkDeviceGroupDeviceCreateInfo",
+    ]);
+    assert_eq!(admitted_names::<VkDeviceCreateInfoNext>(), sorted(device));
+    assert_eq!(
+        admitted_names::<VkPhysicalDeviceFeatures2Next>(),
+        sorted(features.to_vec())
+    );
+    assert_eq!(
+        admitted_names::<VkPhysicalDeviceProperties2Next>(),
+        sorted(vec![
+            "VkPhysicalDeviceDriverProperties",
+            "VkPhysicalDeviceIDProperties",
+            "VkPhysicalDeviceMultiviewProperties",
+            "VkPhysicalDeviceSubgroupProperties",
+            "VkPhysicalDevicePointClippingProperties",
+            "VkPhysicalDeviceProtectedMemoryProperties",
+            "VkPhysicalDeviceSamplerFilterMinmaxProperties",
+            "VkPhysicalDeviceInlineUniformBlockProperties",
+            "VkPhysicalDeviceMaintenance3Properties",
+            "VkPhysicalDeviceMaintenance4Properties",
+            "VkPhysicalDeviceFloatControlsProperties",
+            "VkPhysicalDeviceDescriptorIndexingProperties",
+            "VkPhysicalDeviceTimelineSemaphoreProperties",
+            "VkPhysicalDeviceDepthStencilResolveProperties",
+            "VkPhysicalDeviceTexelBufferAlignmentProperties",
+            "VkPhysicalDeviceSubgroupSizeControlProperties",
+            "VkPhysicalDeviceVulkan11Properties",
+            "VkPhysicalDeviceVulkan12Properties",
+            "VkPhysicalDeviceVulkan13Properties",
+            "VkPhysicalDeviceShaderIntegerDotProductProperties",
+        ])
+    );
+    assert_eq!(
+        admitted_names::<VkFormatProperties2Next>(),
+        ["VkFormatProperties3"]
+    );
+    assert_eq!(
+        admitted_names::<VkPhysicalDeviceImageFormatInfo2Next>(),
+        sorted(vec![
+            "VkPhysicalDeviceExternalImageFormatInfo",
+            "VkImageFormatListCreateInfo",
+            "VkImageStencilUsageCreateInfo",
+        ])
+    );
+    assert_eq!(
+        admitted_names::<VkImageFormatProperties2Next>(),
+        sorted(vec![
+            "VkExternalImageFormatProperties",
+            "VkSamplerYcbcrConversionImageFormatProperties",
+        ])
+    );
+    assert_eq!(
+        admitted_names::<VkDeviceQueueInfo2Next>(),
+        ["VkDeviceQueueTimelineInfoMESA"]
+    );
+    assert_eq!(
+        admitted_names::<VkImageCreateInfoNext>(),
+        sorted(vec![
+            "VkExternalMemoryImageCreateInfo",
+            "VkImageFormatListCreateInfo",
+            "VkImageStencilUsageCreateInfo",
+        ])
+    );
+    assert_eq!(
+        admitted_names::<VkImageMemoryRequirementsInfo2Next>(),
+        ["VkImagePlaneMemoryRequirementsInfo"]
+    );
+    assert_eq!(
+        admitted_names::<VkMemoryRequirements2Next>(),
+        ["VkMemoryDedicatedRequirements"]
+    );
+    // Chains the bring-up protocol had none for admit nothing.
+    for (what, n) in [
+        (
+            "VkQueueFamilyProperties2",
+            admitted_names::<VkQueueFamilyProperties2Next>().len(),
+        ),
+        (
+            "VkPhysicalDeviceMemoryProperties2",
+            admitted_names::<VkPhysicalDeviceMemoryProperties2Next>().len(),
+        ),
+        (
+            "VkDeviceQueueCreateInfo",
+            admitted_names::<VkDeviceQueueCreateInfoNext>().len(),
+        ),
+    ] {
+        assert_eq!(n, 0, "{what}");
+    }
+    // And the decoder does accept more than that: the whitelist is the
+    // protocol's.
+    assert!(
+        whitelist::<VkDeviceCreateInfoNext>().len() > 100,
+        "the decoder admits the whole protocol's device chain"
+    );
+}
+
+#[test]
+fn the_advertised_extensions_are_still_only_the_implemented_ones() {
+    // Every extension is decodable now; the host's list still reaches the
+    // guest only through what this stage implements.
+    assert!(info::EXTENSIONS.iter().all(|e| e.decodable));
+    let named = |name: &[u8]| {
+        let mut ext = VkExtensionProperties {
+            spec_version: 1,
+            ..Default::default()
+        };
+        for (slot, byte) in ext.extension_name.iter_mut().zip(name) {
+            *slot = *byte;
+        }
+        ext
+    };
+    let host = [
+        named(b"VK_KHR_swapchain"),
+        named(b"VK_EXT_custom_border_color"),
+        named(b"VK_KHR_timeline_semaphore"),
+    ];
+    assert!(super::policy::advertised_extensions(&host).is_empty());
 }
 
 #[test]

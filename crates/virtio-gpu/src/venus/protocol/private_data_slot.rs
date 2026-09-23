@@ -2,28 +2,26 @@
 // from venus-protocol git-70991d4c. DO NOT EDIT: regenerate with
 //     python scripts/venus-gen.py
 
-//! The `command_pool` group: its commands and the structures only they reach.
+//! The `private_data_slot` group: its commands and the structures only they reach.
 
 #![allow(unused_imports)]
 
 use super::*;
 use crate::venus::wire::{CommandHeader, Decoder, Encoder};
 
-/// `VkCommandPoolCreateInfo` (`VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO`).
+/// `VkPrivateDataSlotCreateInfo` (`VK_STRUCTURE_TYPE_PRIVATE_DATA_SLOT_CREATE_INFO`).
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct VkCommandPoolCreateInfo {
-    /// `VkCommandPoolCreateFlags flags`
-    pub flags: VkCommandPoolCreateFlags,
-    /// `uint32_t queueFamilyIndex`
-    pub queue_family_index: u32,
+pub struct VkPrivateDataSlotCreateInfo {
+    /// `VkPrivateDataSlotCreateFlags flags`
+    pub flags: VkPrivateDataSlotCreateFlags,
 }
 
-impl VkCommandPoolCreateInfo {
+impl VkPrivateDataSlotCreateInfo {
     // No output parameter reaches this structure, so it has no skeleton
     // form and the `partial` flag below is ignored.
 
-    /// `VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO`.
-    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    /// `VK_STRUCTURE_TYPE_PRIVATE_DATA_SLOT_CREATE_INFO`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_PRIVATE_DATA_SLOT_CREATE_INFO;
 
     /// Decode the whole structure, as an input carries it.
     ///
@@ -46,8 +44,8 @@ impl VkCommandPoolCreateInfo {
     /// # Errors
     /// As [`Self::decode`].
     pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
-        expect_structure_type(dec, "VkCommandPoolCreateInfo", Self::STRUCTURE_TYPE)?;
-        dec.empty_pnext_chain("VkCommandPoolCreateInfo")?;
+        expect_structure_type(dec, "VkPrivateDataSlotCreateInfo", Self::STRUCTURE_TYPE)?;
+        dec.empty_pnext_chain("VkPrivateDataSlotCreateInfo")?;
         Self::decode_body(dec, partial)
     }
 
@@ -62,17 +60,13 @@ impl VkCommandPoolCreateInfo {
     }
 
     /// The fields after `sType` and `pNext`, as a chain link carries them
-    /// (`vn_decode_VkCommandPoolCreateInfo_self_temp`).
+    /// (`vn_decode_VkPrivateDataSlotCreateInfo_self_temp`).
     ///
     /// # Errors
     /// As [`Self::decode`].
     pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
-        let flags: VkCommandPoolCreateFlags = dec.u32()?;
-        let queue_family_index: u32 = dec.u32()?;
-        Ok(Self {
-            flags,
-            queue_family_index,
-        })
+        let flags: VkPrivateDataSlotCreateFlags = dec.u32()?;
+        Ok(Self { flags })
     }
 
     /// The fields after `sType` and `pNext`, as a chain link carries them.
@@ -81,12 +75,11 @@ impl VkCommandPoolCreateInfo {
     /// As [`Self::encode`].
     pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
         enc.u32(self.flags)?;
-        enc.u32(self.queue_family_index)?;
         Ok(())
     }
 }
 
-/// The arguments of `vkCreateCommandPool`, and its reply.
+/// The arguments of `vkCreatePrivateDataSlot`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -94,55 +87,59 @@ impl VkCommandPoolCreateInfo {
 /// fills the outputs in place and sets `ret`, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct CreateCommandPoolArgs {
+pub struct CreatePrivateDataSlotArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `const VkCommandPoolCreateInfo* pCreateInfo` — in.
-    pub p_create_info: Option<VkCommandPoolCreateInfo>,
-    /// `VkCommandPool* pCommandPool` — out.
-    pub p_command_pool: Option<VkCommandPool>,
+    /// `const VkPrivateDataSlotCreateInfo* pCreateInfo` — in.
+    pub p_create_info: Option<VkPrivateDataSlotCreateInfo>,
+    /// `VkPrivateDataSlot* pPrivateDataSlot` — out.
+    pub p_private_data_slot: Option<VkPrivateDataSlot>,
     /// The return value (`VkResult`), written first in the reply.
     pub ret: VkResult,
 }
 
-impl CreateCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkCreateCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_CREATE_COMMAND_POOL_EXT;
+impl CreatePrivateDataSlotArgs {
+    /// `VK_COMMAND_TYPE_vkCreatePrivateDataSlot_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_CREATE_PRIVATE_DATA_SLOT_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkCreateCommandPool";
+    pub const NAME: &'static str = "vkCreatePrivateDataSlot";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkCreateCommandPool_args_temp`).
+    /// (`vn_decode_vkCreatePrivateDataSlot_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkCreateCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkCreatePrivateDataSlot"));
         }
-        let p_create_info: Option<VkCommandPoolCreateInfo> = if dec.simple_pointer()? {
-            Some(VkCommandPoolCreateInfo::decode_with(dec, false)?)
+        let p_create_info: Option<VkPrivateDataSlotCreateInfo> = if dec.simple_pointer()? {
+            Some(VkPrivateDataSlotCreateInfo::decode_with(dec, false)?)
         } else {
-            return Err(null_pointer(dec, "vkCreateCommandPool", "pCreateInfo"));
+            return Err(null_pointer(dec, "vkCreatePrivateDataSlot", "pCreateInfo"));
         };
         dec.null_allocator()?;
-        let p_command_pool: Option<VkCommandPool> = if dec.simple_pointer()? {
-            Some(VkCommandPool(dec.handle()?))
+        let p_private_data_slot: Option<VkPrivateDataSlot> = if dec.simple_pointer()? {
+            Some(VkPrivateDataSlot(dec.handle()?))
         } else {
-            return Err(null_pointer(dec, "vkCreateCommandPool", "pCommandPool"));
+            return Err(null_pointer(
+                dec,
+                "vkCreatePrivateDataSlot",
+                "pPrivateDataSlot",
+            ));
         };
         Ok(Self {
             device,
             p_create_info,
-            p_command_pool,
+            p_private_data_slot,
             ret: Default::default(),
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkCreateCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkCreatePrivateDataSlot`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -157,14 +154,14 @@ impl CreateCommandPoolArgs {
             v.encode_with(enc, false)?;
         }
         enc.null_allocator()?;
-        enc.simple_pointer(self.p_command_pool.is_some())?;
-        if let Some(v) = &self.p_command_pool {
+        enc.simple_pointer(self.p_private_data_slot.is_some())?;
+        if let Some(v) = &self.p_private_data_slot {
             enc.handle(v.0)?;
         }
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkCreateCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkCreatePrivateDataSlot_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -175,15 +172,15 @@ impl CreateCommandPoolArgs {
     pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
         enc.reply_header(Self::OPCODE)?;
         enc.i32(self.ret)?;
-        enc.simple_pointer(self.p_command_pool.is_some())?;
-        if let Some(v) = &self.p_command_pool {
+        enc.simple_pointer(self.p_private_data_slot.is_some())?;
+        if let Some(v) = &self.p_private_data_slot {
             enc.handle(v.0)?;
         }
         Ok(())
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkCreateCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkCreatePrivateDataSlot_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -198,8 +195,8 @@ impl CreateCommandPoolArgs {
             });
         }
         self.ret = dec.i32()?;
-        self.p_command_pool = if dec.simple_pointer()? {
-            Some(VkCommandPool(dec.handle()?))
+        self.p_private_data_slot = if dec.simple_pointer()? {
+            Some(VkPrivateDataSlot(dec.handle()?))
         } else {
             None
         };
@@ -207,7 +204,7 @@ impl CreateCommandPoolArgs {
     }
 }
 
-/// The arguments of `vkDestroyCommandPool`, and its reply.
+/// The arguments of `vkDestroyPrivateDataSlot`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -215,40 +212,40 @@ impl CreateCommandPoolArgs {
 /// fills the outputs in place, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct DestroyCommandPoolArgs {
+pub struct DestroyPrivateDataSlotArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
+    /// `VkPrivateDataSlot privateDataSlot` — in.
+    pub private_data_slot: VkPrivateDataSlot,
 }
 
-impl DestroyCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkDestroyCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_DESTROY_COMMAND_POOL_EXT;
+impl DestroyPrivateDataSlotArgs {
+    /// `VK_COMMAND_TYPE_vkDestroyPrivateDataSlot_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_DESTROY_PRIVATE_DATA_SLOT_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkDestroyCommandPool";
+    pub const NAME: &'static str = "vkDestroyPrivateDataSlot";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkDestroyCommandPool_args_temp`).
+    /// (`vn_decode_vkDestroyPrivateDataSlot_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkDestroyCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkDestroyPrivateDataSlot"));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
+        let private_data_slot: VkPrivateDataSlot = VkPrivateDataSlot(dec.handle()?);
         dec.null_allocator()?;
         Ok(Self {
             device,
-            command_pool,
+            private_data_slot,
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkDestroyCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkDestroyPrivateDataSlot`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -258,12 +255,12 @@ impl DestroyCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
+        enc.handle(self.private_data_slot.0)?;
         enc.null_allocator()?;
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkDestroyCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkDestroyPrivateDataSlot_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -277,7 +274,7 @@ impl DestroyCommandPoolArgs {
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkDestroyCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkDestroyPrivateDataSlot_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -295,7 +292,7 @@ impl DestroyCommandPoolArgs {
     }
 }
 
-/// The arguments of `vkResetCommandPool`, and its reply.
+/// The arguments of `vkSetPrivateData`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -303,46 +300,54 @@ impl DestroyCommandPoolArgs {
 /// fills the outputs in place and sets `ret`, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct ResetCommandPoolArgs {
+pub struct SetPrivateDataArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
-    /// `VkCommandPoolResetFlags flags` — in.
-    pub flags: VkCommandPoolResetFlags,
+    /// `VkObjectType objectType` — in.
+    pub object_type: VkObjectType,
+    /// `uint64_t objectHandle` — in.
+    pub object_handle: u64,
+    /// `VkPrivateDataSlot privateDataSlot` — in.
+    pub private_data_slot: VkPrivateDataSlot,
+    /// `uint64_t data` — in.
+    pub data: u64,
     /// The return value (`VkResult`), written first in the reply.
     pub ret: VkResult,
 }
 
-impl ResetCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkResetCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_RESET_COMMAND_POOL_EXT;
+impl SetPrivateDataArgs {
+    /// `VK_COMMAND_TYPE_vkSetPrivateData_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_SET_PRIVATE_DATA_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkResetCommandPool";
+    pub const NAME: &'static str = "vkSetPrivateData";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkResetCommandPool_args_temp`).
+    /// (`vn_decode_vkSetPrivateData_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkResetCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkSetPrivateData"));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
-        let flags: VkCommandPoolResetFlags = dec.u32()?;
+        let object_type: VkObjectType = dec.i32()?;
+        let object_handle: u64 = dec.u64()?;
+        let private_data_slot: VkPrivateDataSlot = VkPrivateDataSlot(dec.handle()?);
+        let data: u64 = dec.u64()?;
         Ok(Self {
             device,
-            command_pool,
-            flags,
+            object_type,
+            object_handle,
+            private_data_slot,
+            data,
             ret: Default::default(),
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkResetCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkSetPrivateData`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -352,12 +357,14 @@ impl ResetCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
-        enc.u32(self.flags)?;
+        enc.i32(self.object_type)?;
+        enc.u64(self.object_handle)?;
+        enc.handle(self.private_data_slot.0)?;
+        enc.u64(self.data)?;
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkResetCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkSetPrivateData_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -372,7 +379,7 @@ impl ResetCommandPoolArgs {
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkResetCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkSetPrivateData_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -391,7 +398,7 @@ impl ResetCommandPoolArgs {
     }
 }
 
-/// The arguments of `vkTrimCommandPool`, and its reply.
+/// The arguments of `vkGetPrivateData`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -399,43 +406,55 @@ impl ResetCommandPoolArgs {
 /// fills the outputs in place, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct TrimCommandPoolArgs {
+pub struct GetPrivateDataArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
-    /// `VkCommandPoolTrimFlags flags` — in.
-    pub flags: VkCommandPoolTrimFlags,
+    /// `VkObjectType objectType` — in.
+    pub object_type: VkObjectType,
+    /// `uint64_t objectHandle` — in.
+    pub object_handle: u64,
+    /// `VkPrivateDataSlot privateDataSlot` — in.
+    pub private_data_slot: VkPrivateDataSlot,
+    /// `uint64_t* pData` — out.
+    pub p_data: Option<u64>,
 }
 
-impl TrimCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkTrimCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_TRIM_COMMAND_POOL_EXT;
+impl GetPrivateDataArgs {
+    /// `VK_COMMAND_TYPE_vkGetPrivateData_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_PRIVATE_DATA_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkTrimCommandPool";
+    pub const NAME: &'static str = "vkGetPrivateData";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkTrimCommandPool_args_temp`).
+    /// (`vn_decode_vkGetPrivateData_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkTrimCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkGetPrivateData"));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
-        let flags: VkCommandPoolTrimFlags = dec.u32()?;
+        let object_type: VkObjectType = dec.i32()?;
+        let object_handle: u64 = dec.u64()?;
+        let private_data_slot: VkPrivateDataSlot = VkPrivateDataSlot(dec.handle()?);
+        let p_data: Option<u64> = if dec.simple_pointer()? {
+            Some(Default::default())
+        } else {
+            return Err(null_pointer(dec, "vkGetPrivateData", "pData"));
+        };
         Ok(Self {
             device,
-            command_pool,
-            flags,
+            object_type,
+            object_handle,
+            private_data_slot,
+            p_data,
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkTrimCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkGetPrivateData`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -445,12 +464,14 @@ impl TrimCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
-        enc.u32(self.flags)?;
+        enc.i32(self.object_type)?;
+        enc.u64(self.object_handle)?;
+        enc.handle(self.private_data_slot.0)?;
+        enc.simple_pointer(self.p_data.is_some())?;
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkTrimCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkGetPrivateData_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -460,11 +481,15 @@ impl TrimCommandPoolArgs {
     /// its count.
     pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
         enc.reply_header(Self::OPCODE)?;
+        enc.simple_pointer(self.p_data.is_some())?;
+        if let Some(v) = &self.p_data {
+            enc.u64(*v)?;
+        }
         Ok(())
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkTrimCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkGetPrivateData_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -478,6 +503,11 @@ impl TrimCommandPoolArgs {
                 found,
             });
         }
+        self.p_data = if dec.simple_pointer()? {
+            Some(dec.u64()?)
+        } else {
+            None
+        };
         Ok(())
     }
 }
