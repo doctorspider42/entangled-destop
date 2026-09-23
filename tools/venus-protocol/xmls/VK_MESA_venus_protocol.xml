@@ -1,0 +1,315 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<registry>
+    <comment>
+Copyright 2020 Google LLC
+
+SPDX-License-Identifier: Apache-2.0 OR MIT
+    </comment>
+
+    <comment>
+This file, VK_MESA_venus_protocol.xml, provides definitions for
+VK_MESA_venus_protocol. These definitions are used by Venus driver and
+renderer, and are not exposed to applications.
+    </comment>
+
+    <types>
+        <type requires="VkCommandStreamExecutionFlagBitsMESA" category="bitmask">typedef <type>VkFlags</type> <name>VkCommandStreamExecutionFlagsMESA</name>;</type>
+        <type requires="VkRingCreateFlagBitsMESA" category="bitmask">typedef <type>VkFlags</type> <name>VkRingCreateFlagsMESA</name>;</type>
+        <type requires="VkRingNotifyFlagBitsMESA" category="bitmask">typedef <type>VkFlags</type> <name>VkRingNotifyFlagsMESA</name>;</type>
+        <type requires="VkRingStatusFlagBitsMESA" category="bitmask">typedef <type>VkFlags</type> <name>VkRingStatusFlagsMESA</name>;</type>
+
+        <type name="VkCommandStreamExecutionFlagBitsMESA" category="enum"/>
+        <type name="VkRingCreateFlagBitsMESA" category="enum"/>
+        <type name="VkRingNotifyFlagBitsMESA" category="enum"/>
+        <type name="VkRingStatusFlagBitsMESA" category="enum"/>
+
+        <type category="struct" name="VkCommandStreamDescriptionMESA">
+            <member><type>uint32_t</type>                         <name>resourceId</name></member>
+            <member><type>size_t</type>                           <name>offset</name></member>
+            <member><type>size_t</type>                           <name>size</name></member>
+        </type>
+        <type category="struct" name="VkCommandStreamDependencyMESA">
+            <member><type>uint32_t</type>                         <name>srcCommandStream</name></member>
+            <member><type>uint32_t</type>                         <name>dstCommandStream</name></member>
+        </type>
+
+        <type category="struct" name="VkRingCreateInfoMESA">
+            <member values="VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true">const <type>void</type>*      <name>pNext</name></member>
+            <member optional="true"><type>VkRingCreateFlagsMESA</type> <name>flags</name></member>
+            <member><type>uint32_t</type>                         <name>resourceId</name></member>
+            <member><type>size_t</type>                           <name>offset</name></member>
+            <member><type>size_t</type>                           <name>size</name></member>
+            <member><type>uint64_t</type>                         <name>idleTimeout</name></member>
+            <member><type>size_t</type>                           <name>headOffset</name></member>
+            <member><type>size_t</type>                           <name>tailOffset</name></member>
+            <member><type>size_t</type>                           <name>statusOffset</name></member>
+            <member><type>size_t</type>                           <name>bufferOffset</name></member>
+            <member><type>size_t</type>                           <name>bufferSize</name></member>
+            <member><type>size_t</type>                           <name>extraOffset</name></member>
+            <member><type>size_t</type>                           <name>extraSize</name></member>
+        </type>
+
+        <type category="struct" name="VkRingMonitorInfoMESA" structextends="VkRingCreateInfoMESA">
+            <member values="VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true">const <type>void</type>*      <name>pNext</name></member>
+            <member><type>uint32_t</type> <name>maxReportingPeriodMicroseconds</name></member>
+        </type>
+
+        <type category="struct" name="VkRingPriorityInfoMESA" structextends="VkRingCreateInfoMESA">
+            <member values="VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true">const <type>void</type>*      <name>pNext</name></member>
+            <member><type>int32_t</type> <name>priority</name></member>
+        </type>
+
+        <type category="struct" name="VkMemoryResourcePropertiesMESA">
+            <member values="VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true"><type>void</type>*            <name>pNext</name></member>
+            <member><type>uint32_t</type>                         <name>memoryTypeBits</name></member>
+        </type>
+
+        <type category="struct" name="VkImportMemoryResourceInfoMESA" structextends="VkMemoryAllocateInfo">
+            <member values="VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true">const <type>void</type>*      <name>pNext</name></member>
+            <member><type>uint32_t</type>                         <name>resourceId</name></member>
+        </type>
+
+        <type category="struct" name="VkMemoryResourceAllocationSizePropertiesMESA" structextends="VkMemoryResourcePropertiesMESA">
+            <member values="VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true"><type>void</type>*            <name>pNext</name></member>
+            <member><type>uint64_t</type>                         <name>allocationSize</name></member>
+        </type>
+
+        <type category="struct" name="VkImportSemaphoreResourceInfoMESA">
+            <member values="VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_RESOURCE_INFO_MESA"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true">const <type>void</type>*      <name>pNext</name></member>
+            <member><type>VkSemaphore</type>                      <name>semaphore</name></member>
+            <member><type>uint32_t</type>                         <name>resourceId</name></member>
+        </type>
+
+        <type category="struct" name="VkDeviceQueueTimelineInfoMESA" structextends="VkDeviceQueueInfo2">
+            <member values="VK_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true">const <type>void</type>*      <name>pNext</name></member>
+            <member><type>uint32_t</type>                         <name>ringIdx</name></member>
+        </type>
+
+        <type category="struct" name="VkCopyImageToMemoryInfoMESA">
+            <member values="VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_MESA"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true">const <type>void</type>*                         <name>pNext</name></member>
+            <member optional="true"><type>VkHostImageCopyFlags</type>                <name>flags</name></member>
+            <member><type>VkImage</type>                                             <name>srcImage</name></member>
+            <member><type>VkImageLayout</type>                                       <name>srcImageLayout</name></member>
+            <member><type>uint32_t</type>                                            <name>memoryRowLength</name></member>
+            <member><type>uint32_t</type>                                            <name>memoryImageHeight</name></member>
+            <member><type>VkImageSubresourceLayers</type>                            <name>imageSubresource</name></member>
+            <member><type>VkOffset3D</type>                                          <name>imageOffset</name></member>
+            <member><type>VkExtent3D</type>                                          <name>imageExtent</name></member>
+        </type>
+
+        <type category="struct" name="VkMemoryToImageCopyMESA">
+            <member values="VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_MESA"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true">const <type>void</type>*                         <name>pNext</name></member>
+            <member><type>size_t</type>                                              <name>dataSize</name></member>
+            <member len="dataSize">const <type>void</type>*                          <name>pData</name></member>
+            <member><type>uint32_t</type>                                            <name>memoryRowLength</name></member>
+            <member><type>uint32_t</type>                                            <name>memoryImageHeight</name></member>
+            <member><type>VkImageSubresourceLayers</type>                            <name>imageSubresource</name></member>
+            <member><type>VkOffset3D</type>                                          <name>imageOffset</name></member>
+            <member><type>VkExtent3D</type>                                          <name>imageExtent</name></member>
+        </type>
+
+        <type category="struct" name="VkCopyMemoryToImageInfoMESA">
+            <member values="VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_MESA"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true">const <type>void</type>*                         <name>pNext</name></member>
+            <member optional="true"><type>VkHostImageCopyFlags</type>                <name>flags</name></member>
+            <member><type>VkImage</type>                                             <name>dstImage</name></member>
+            <member><type>VkImageLayout</type>                                       <name>dstImageLayout</name></member>
+            <member><type>uint32_t</type>                                            <name>regionCount</name></member>
+            <member len="regionCount">const <type>VkMemoryToImageCopyMESA</type>*    <name>pRegions</name></member>
+        </type>
+    </types>
+
+    <enums name="VkCommandStreamExecutionFlagBitsMESA" type="bitmask">
+    </enums>
+    <enums name="VkRingCreateFlagBitsMESA" type="bitmask">
+    </enums>
+    <enums name="VkRingNotifyFlagBitsMESA" type="bitmask">
+    </enums>
+    <enums name="VkRingStatusFlagBitsMESA" type="bitmask">
+        <enum value="0"   name="VK_RING_STATUS_NONE_MESA"/>
+        <enum bitpos="0"  name="VK_RING_STATUS_IDLE_BIT_MESA"/>
+        <enum bitpos="1"  name="VK_RING_STATUS_FATAL_BIT_MESA"/>
+        <enum bitpos="2"  name="VK_RING_STATUS_ALIVE_BIT_MESA"/>
+    </enums>
+
+    <commands>
+        <command>
+            <proto><type>void</type> <name>vkSetReplyCommandStreamMESA</name></proto>
+            <param>const <type>VkCommandStreamDescriptionMESA</type>* <name>pStream</name></param>
+        </command>
+        <command>
+            <proto><type>void</type> <name>vkSeekReplyCommandStreamMESA</name></proto>
+            <param><type>size_t</type> <name>position</name></param>
+        </command>
+
+        <command>
+            <proto><type>void</type> <name>vkExecuteCommandStreamsMESA</name></proto>
+            <param><type>uint32_t</type> <name>streamCount</name></param>
+            <param len="streamCount">const <type>VkCommandStreamDescriptionMESA</type>* <name>pStreams</name></param>
+            <param len="streamCount" optional="true">const <type>size_t</type>* <name>pReplyPositions</name></param>
+            <param optional="true"><type>uint32_t</type> <name>dependencyCount</name></param>
+            <param len="dependencyCount">const <type>VkCommandStreamDependencyMESA</type>* <name>pDependencies</name></param>
+            <param optional="true"><type>VkCommandStreamExecutionFlagsMESA</type> <name>flags</name></param>
+        </command>
+
+        <command>
+            <proto><type>void</type> <name>vkCreateRingMESA</name></proto>
+            <param><type>uint64_t</type><name>ring</name></param>
+            <param>const <type>VkRingCreateInfoMESA</type>* <name>pCreateInfo</name></param>
+        </command>
+        <command>
+            <proto><type>void</type> <name>vkDestroyRingMESA</name></proto>
+            <param><type>uint64_t</type> <name>ring</name></param>
+        </command>
+        <command>
+            <proto><type>void</type> <name>vkNotifyRingMESA</name></proto>
+            <param><type>uint64_t</type> <name>ring</name></param>
+            <param><type>uint32_t</type> <name>seqno</name></param>
+            <param optional="true"><type>VkRingNotifyFlagsMESA</type> <name>flags</name></param>
+        </command>
+        <command>
+            <proto><type>void</type> <name>vkWriteRingExtraMESA</name></proto>
+            <param><type>uint64_t</type> <name>ring</name></param>
+            <param><type>size_t</type> <name>offset</name></param>
+            <param><type>uint32_t</type> <name>value</name></param>
+        </command>
+        <command>
+            <proto><type>VkResult</type> <name>vkGetMemoryResourcePropertiesMESA</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param><type>uint32_t</type> <name>resourceId</name></param>
+            <param><type>VkMemoryResourcePropertiesMESA</type>* <name>pMemoryResourceProperties</name></param>
+        </command>
+        <command>
+            <proto><type>void</type> <name>vkResetFenceResourceMESA</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param><type>VkFence</type> <name>fence</name></param>
+        </command>
+        <command>
+            <proto><type>void</type> <name>vkWaitSemaphoreResourceMESA</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param><type>VkSemaphore</type> <name>semaphore</name></param>
+        </command>
+        <command>
+            <proto><type>void</type> <name>vkImportSemaphoreResourceMESA</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param>const <type>VkImportSemaphoreResourceInfoMESA</type>* <name>pImportSemaphoreResourceInfo</name></param>
+        </command>
+        <command>
+            <proto><type>void</type> <name>vkSubmitVirtqueueSeqnoMESA</name></proto>
+            <param><type>uint64_t</type> <name>ring</name></param>
+            <param><type>uint64_t</type> <name>seqno</name></param>
+        </command>
+        <command>
+            <proto><type>void</type> <name>vkWaitVirtqueueSeqnoMESA</name></proto>
+            <param><type>uint64_t</type> <name>seqno</name></param>
+        </command>
+        <command>
+            <proto><type>void</type> <name>vkWaitRingSeqnoMESA</name></proto>
+            <param><type>uint64_t</type> <name>ring</name></param>
+            <param><type>uint64_t</type> <name>seqno</name></param>
+        </command>
+        <command>
+            <proto><type>VkResult</type> <name>vkCopyImageToMemoryMESA</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param>const <type>VkCopyImageToMemoryInfoMESA</type>* <name>pCopyImageToMemoryInfo</name></param>
+            <param><type>size_t</type> <name>dataSize</name></param>
+            <param len="dataSize"><type>void</type>* <name>pData</name></param>
+        </command>
+        <command>
+            <proto><type>VkResult</type> <name>vkCopyMemoryToImageMESA</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param>const <type>VkCopyMemoryToImageInfoMESA</type>* <name>pCopyMemoryToImageInfo</name></param>
+        </command>
+        <command>
+            <proto><type>VkResult</type> <name>vkWriteSamplerDescriptorMESA</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param>const <type>VkSamplerCreateInfo</type>* <name>pSampler</name></param>
+            <param><type>size_t</type> <name>dataSize</name></param>
+            <param len="dataSize"><type>void</type>* <name>pData</name></param>
+        </command>
+        <command>
+            <proto><type>VkResult</type> <name>vkWriteResourceDescriptorMESA</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param>const <type>VkResourceDescriptorInfoEXT</type>* <name>pResource</name></param>
+            <param><type>size_t</type> <name>dataSize</name></param>
+            <param len="dataSize"><type>void</type>* <name>pData</name></param>
+        </command>
+    </commands>
+
+    <extensions>
+        <extension name="VK_MESA_venus_protocol" number="385" type="instance" author="MESA" contact="Chia-I Wu @olvaffe1, Yiwei Zhang @zzyiwei" supported="vulkan">
+            <require>
+                <enum value="4"                                             name="VK_MESA_VENUS_PROTOCOL_SPEC_VERSION"/>
+                <enum value="&quot;VK_MESA_venus_protocol&quot;"            name="VK_MESA_VENUS_PROTOCOL_EXTENSION_NAME"/>
+
+                <comment>VK_MESA_VENUS_PROTOCOL_SPEC_VERSION 1</comment>
+                <enum offset="0" extends="VkStructureType"                  name="VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA"/>
+                <enum offset="1" extends="VkStructureType"                  name="VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA"/>
+                <enum offset="2" extends="VkStructureType"                  name="VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA"/>
+                <enum offset="3" extends="VkStructureType"                  name="VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA"/>
+                <enum offset="4" extends="VkStructureType"                  name="VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_RESOURCE_INFO_MESA"/>
+                <enum offset="5" extends="VkStructureType"                  name="VK_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA"/>
+                <enum offset="6" extends="VkStructureType"                  name="VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA"/>
+                <type name="VkCommandStreamExecutionFlagBitsMESA"/>
+                <type name="VkCommandStreamExecutionFlagsMESA"/>
+                <type name="VkRingCreateFlagBitsMESA"/>
+                <type name="VkRingCreateFlagsMESA"/>
+                <type name="VkRingNotifyFlagBitsMESA"/>
+                <type name="VkRingNotifyFlagsMESA"/>
+                <type name="VkRingStatusFlagBitsMESA"/>
+                <type name="VkRingStatusFlagsMESA"/>
+                <type name="VkCommandStreamDescriptionMESA"/>
+                <type name="VkCommandStreamDependencyMESA"/>
+                <type name="VkRingCreateInfoMESA"/>
+                <type name="VkRingMonitorInfoMESA"/>
+                <type name="VkMemoryResourcePropertiesMESA"/>
+                <type name="VkImportMemoryResourceInfoMESA"/>
+                <type name="VkMemoryResourceAllocationSizePropertiesMESA"/>
+                <type name="VkImportSemaphoreResourceInfoMESA"/>
+                <type name="VkDeviceQueueTimelineInfoMESA"/>
+                <command name="vkSetReplyCommandStreamMESA"/>
+                <command name="vkSeekReplyCommandStreamMESA"/>
+                <command name="vkExecuteCommandStreamsMESA"/>
+                <command name="vkCreateRingMESA"/>
+                <command name="vkDestroyRingMESA"/>
+                <command name="vkNotifyRingMESA"/>
+                <command name="vkWriteRingExtraMESA"/>
+                <command name="vkGetMemoryResourcePropertiesMESA"/>
+                <command name="vkResetFenceResourceMESA"/>
+                <command name="vkWaitSemaphoreResourceMESA"/>
+                <command name="vkImportSemaphoreResourceMESA"/>
+                <command name="vkSubmitVirtqueueSeqnoMESA"/>
+                <command name="vkWaitVirtqueueSeqnoMESA"/>
+                <command name="vkWaitRingSeqnoMESA"/>
+
+                <comment>VK_MESA_VENUS_PROTOCOL_SPEC_VERSION 2</comment>
+                <enum offset="7" extends="VkStructureType"                  name="VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA"/>
+                <type name="VkRingPriorityInfoMESA"/>
+
+                <comment>VK_MESA_VENUS_PROTOCOL_SPEC_VERSION 3</comment>
+                <enum offset="8" extends="VkStructureType"                  name="VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_MESA"/>
+                <enum offset="9" extends="VkStructureType"                  name="VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_MESA"/>
+                <enum offset="10" extends="VkStructureType"                 name="VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_MESA"/>
+                <type name="VkCopyImageToMemoryInfoMESA"/>
+                <type name="VkMemoryToImageCopyMESA"/>
+                <type name="VkCopyMemoryToImageInfoMESA"/>
+                <command name="vkCopyImageToMemoryMESA"/>
+                <command name="vkCopyMemoryToImageMESA"/>
+
+                <comment>VK_MESA_VENUS_PROTOCOL_SPEC_VERSION 4</comment>
+                <command name="vkWriteSamplerDescriptorMESA"/>
+                <command name="vkWriteResourceDescriptorMESA"/>
+            </require>
+        </extension>
+    </extensions>
+</registry>

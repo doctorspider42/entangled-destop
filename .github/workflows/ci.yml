@@ -61,6 +61,33 @@ jobs:
             throw "expected the WHP boot test to report its self-skip on a runner without WHP"
           }
 
+  venus-protocol:
+    name: Venus protocol is generated, and matches Mesa's C (EPIC 20)
+    # crates/virtio-gpu/src/venus/protocol/ is generated from the vendored
+    # venus-protocol generator (tools/venus-protocol, git-70991d4c) and
+    # checked in. This job is the only thing that keeps the two from
+    # drifting: it regenerates and fails on any diff, then runs the
+    # differential harness, which compiles the generator's C driver and
+    # renderer and requires the Rust to agree with them byte for byte.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Mako (the generator's only dependency)
+        run: python -m pip install "mako==1.4.3"
+      - name: Regenerate
+        run: python scripts/venus-gen.py
+      - name: Generated code is up to date
+        run: git diff --exit-code -- crates/virtio-gpu/src/venus/protocol
+      - name: Differential check against the generated C
+        run: python tools/venus-protocol/harness/run_differential.py --seeds 256
+
   license-audit:
     name: License audit (MVP-003)
     runs-on: ubuntu-latest
