@@ -2192,3 +2192,55 @@ host's own GPU. No other process and no C renderer sits in the path.
   `VK_ERROR_FORMAT_NOT_SUPPORTED`** once during vulkaninfo's probing. That is a
   legitimate answer to a probe, but it should be checked against the host's own
   answer for the same query.
+
+### Resolved — why the guest said 1.2, and why that is also the swapchain
+
+Read from the guest's exact Mesa, 26.0.8 (Ubuntu's `-1ubuntu0.3` patches
+nothing in venus):
+
+- **The clamp.** `vn_physical_device_sanitize_properties` clamps the device to
+  1.2 whenever `VK_KHR_synchronization2` is not exposed
+  (`vn_physical_device.c:538-543`).
+- **Why sync2 was missing.** It is a pass-through extension, so it needs our
+  `vkEnumerateDeviceExtensionProperties` to list it, and ours is empty. On WSI
+  builds, which Ubuntu's is, it is additionally gated on
+  `renderer_sync_fd.semaphore_importable` (`:1262-1271`, `:1328`).
+- **What that needs from us.** The guest sets `semaphore_importable` only when
+  we list `VK_KHR_external_semaphore_fd` and answer
+  `vkGetPhysicalDeviceExternalSemaphoreProperties(SYNC_FD)` with `IMPORTABLE`
+  (`:1124-1141`).
+- **The same gate hides `VK_KHR_swapchain`.** In 26.0.8,
+  `semaphore_importable` also decides whether the guest exposes
+  `VK_KHR_swapchain` at all (`:1212-1224`).
+
+So the guest's Vulkan version and its ability to present rest on one thing:
+**sync_fd semaphore import, which a Windows host does not have and our
+renderer must emulate.** virglrenderer does it with a real sync_fd. We need:
+
+- `vkImportSemaphoreResourceMESA(resourceId 0)` = "signal the semaphore now"
+  (`vn_queue.c:398-414`), emulated by an empty signalling submit;
+- `vkWaitSemaphoreResourceMESA` = "consume the pending payload"
+  (`vn_queue.c:2489-2490`);
+- a synthesized `SYNC_FD` properties reply;
+- `VK_KHR_external_semaphore_fd` stripped from `vkCreateDevice`, and
+  `VkExportSemaphoreCreateInfo{SYNC_FD}` stripped from `vkCreateSemaphore`,
+  before they reach the host driver.
+
+My hypothesis above, that the extension mask caused this, was wrong. The mask
+is read in exactly one place, `vn_cs_renderer_protocol_has_extension`
+(`vn_cs.h:102-105`). The generated guest encoders use it to decide whether to
+*send* an extension's `pNext` structs, and silently drop the ones whose bit is
+clear. A mask bit therefore obliges the renderer to decode, never to support,
+and the real risk runs the other way: an extension we enumerate without its bit
+has its structs dropped on the floor.
+
+Two more 26.0.8 facts that shape the next stage:
+
+- **`supports_multiple_timelines` is only asserted, and asserts are compiled
+  out.** The guest always creates 64 rings and binds every queue to a
+  `ring_idx` (`vn_renderer_virtgpu.c:1497-1500`, `vn_device.c:83-99`). Per-ring
+  fences are owed whatever we advertise.
+- **26.0.8 still uses fence feedback**: extra command buffers writing into
+  `HOST_VISIBLE|HOST_COHERENT` memory (`vn_feedback.c:74-77`), plus async
+  `vkWaitForFences`/`vkWaitSemaphores` that the renderer must truly block on
+  (`vn_queue.c:1759`, `:2243`).
