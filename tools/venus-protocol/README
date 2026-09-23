@@ -1,0 +1,12 @@
+Update vk.xml
+
+ - ./utils/update_vk_xml.sh <VER>
+ - or manually
+   - copy vk.xml from Vulkan-Docs to xmls/
+   - copy headers from Vulkan-Headers to include/
+
+Add an extension
+
+ - add an extension string to VK_XML_EXTENSION_LIST
+ - update VK_EXT_command_serialization.xml with the help of
+   print_vk_command_types.py

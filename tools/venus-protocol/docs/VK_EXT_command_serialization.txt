@@ -1,0 +1,134 @@
+VK_EXT_command_serialization
+============================
+
+VK_EXT_command_serialization defines the serialization of Vulkan commands.
+
+Vulkan commands can be serialized into command streams.  Command streams are
+normally shared with another process for parsing and execution, and can
+optionally cause reply streams to be generated.
+
+## Command Streams
+
+A command in a command stream has a variable length:
+
+| DW  | Description                       |
+|-----|-----------------------------------|
+| 0   | `VkCommandTypeEXT`                |
+| 1   | `VkCommandFlagsEXT`               |
+| 2-N | command parameters                |
+
+After `VkCommandTypeEXT` and `VkCommandFlagsEXT`, the parameters of the
+corresponding Vulkan command are serialized in order.
+
+The length of a command is implicitly defined by the command type and not
+explicitly serialized.  It is impossible to skip an unrecognized command type
+during deserialization.
+
+When `VK_COMMAND_GENERATE_REPLY_BIT_EXT` is set in `VkCommandFlagsEXT`, a
+command reply is generated to the reply stream.
+
+When a command parameter is a non-const pointer/array, the value(s) pointed to
+is assumed to be uninitialized except for
+
+ - `sType` of a struct
+ - `pNext` of a struct
+ - object handles
+ - `uint32_t` indicating the size of another command parameter
+
+A special rule must be followed to serialize only the initialized parts.
+(More specific?  There may also be bugs (grep WA) in the codegen.)
+
+## Reply Streams
+
+A reply in a reply stream has a variable length:
+
+| DW  | Description                       |
+|-----|-----------------------------------|
+| 0   | `VkCommandTypeEXT`                |
+| 1-N | command return and out parameters |
+
+After `VkCommandTypeEXT`, the return value and the non-const pointer/array
+parameters, if there is any, of the corresponding Vulkan command, are
+serialized in order.
+
+The length of a reply is implicitly defined by the command type and not
+explicitly serialized.  It is impossible to skip an unrecognized reply during
+deserialization.
+
+## Scalars
+
+When a command parameter is a fixed-width integer, it is serialized in little
+endian byte order, and is padded to 32-bit (with garbage?).
+
+When a command parameter is a floating-point number, it is reinterpret-casted
+to an unsigned fixed-width integer of the same width, and is serialized as an
+unsigned fixed-width integer.
+
+When a command parameter is an enum, it is casted to a `int32_t` and is
+serialized as a `int32_t`.
+
+When a command parameter is a `size_t`, it is casted to a `uint64_t` and is
+serialized as a `uint64_t`.
+
+## Object Handles
+
+When a command parameter is an object handle, dispatchable or not, a
+`uint64_t` is serialized indicating the object id.  A `NULL` or
+`VK_NULL_HANDLE` object handle has object id 0.
+
+## Pointers
+
+When a command parameter is a non-`void` pointer, a `uint64_t` is serialized
+first, indicating the number of serialized values follow.  The values pointed
+to by the pointer are then serialized.  Padding to 32-bit, if needed, happens
+after all values are serialized, not after each individual value.
+
+A `void` pointer used to form a `pNext` chain is said to be a `pNext` pointer.
+It is serialized as a pointer to a struct whose type is determined by
+`VkStructureType`.
+
+A `void` pointer pointing to a blob with a known size is said to be a blob
+pointer.  It is serialized as a `uint8_t` pointer.
+
+A `char` pointer is serialized as a blob pointer.  The blob consists of
+characters up to, and including, the first null character.
+
+A pointer serialization with zero value must be deserialized to `NULL`.  It is
+impossible to distinguish `NULL` and a non-`NULL` pointer with zero value
+after serialization.  (Is this going to be an issue?)
+
+## Fixed-Size Arrays
+
+When a command parameter is a fixed-size array, it is serialized as a pointer.
+The number of values serialized must be less than or equal to the fixed size.
+
+## Structs
+
+When a command parameter is a struct, the data members of the struct are
+serialized in order, using the same rules that are applied on command
+parameters.
+
+## Unions
+
+When a command parameter is a union, a `uint32_t` is serialized first,
+indicating the index of the data member serialized.  The data member is then
+serialized, using the same rules that are applied on command parameters.
+
+## External Handles
+
+When a command parameter is an external handle, whether it is serializable or
+not is out of the scope of this extension.
+
+(Should VK_EXT_command_serialization extend
+VkExternal{Memory,Semaphore,Fence}HandleTypeFlagBits to define serializable
+external handles?  Or leave it to other extensions?)
+
+## Others
+
+When a command parameter is not of a type with a serialization specified, it
+is not serializable.  This includes, but is not limited to,
+
+ - function pointers
+ - pointers to mapped memory object regions
+ - WSI handles
+ - external handles (see above)

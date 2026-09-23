@@ -49,6 +49,7 @@
 //! drawn here.
 
 pub mod capset;
+pub mod protocol;
 pub mod pump;
 pub mod renderer;
 pub mod ring;
