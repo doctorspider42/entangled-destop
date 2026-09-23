@@ -35,11 +35,17 @@
 //! * [`pump`] — the head/tail protocol over a validated [`ring::RingLayout`]:
 //!   what the host consumes, what it publishes, and the private shadow copy
 //!   that makes decoding safe while a guest is still writing the ring.
+//! * [`service`] — *when* the pump runs: one worker thread per ring that keeps
+//!   polling for the guest's `idleTimeout` before it publishes `IDLE`, and one
+//!   monitor thread per context that keeps setting `ALIVE` for the guest's
+//!   watchdog. The only threads in this module family, and both take ADR-0005's
+//!   `Quiesce` gate.
 //!
-//! * [`renderer`] — the [`crate::Renderer3d`] that ties the six together: it
+//! * [`renderer`] — the [`crate::Renderer3d`] that ties the seven together: it
 //!   advertises the capset, accepts a venus context, decodes the transport
-//!   stream, allocates the ring's pages and pumps them. It executes no Vulkan;
-//!   what it does with the bytes is a [`pump::RingSink`] someone else supplies.
+//!   stream, allocates the ring's pages and starts their service. It executes
+//!   no Vulkan; what it does with the bytes is a [`pump::RingSink`] per ring
+//!   that someone else supplies.
 //!
 //! # What is deliberately *not* here
 //!
@@ -52,6 +58,7 @@ pub mod capset;
 pub mod pump;
 pub mod renderer;
 pub mod ring;
+pub mod service;
 pub mod shmem;
 pub mod transport;
 pub mod wire;

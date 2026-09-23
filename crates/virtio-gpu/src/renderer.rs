@@ -224,6 +224,20 @@ pub trait Renderer3d: Send {
         let _ = waker;
     }
 
+    /// Hands the renderer the VM's pause gate (ADR-0005), from the device's
+    /// `activate`.
+    ///
+    /// A renderer that runs threads of its own which touch guest-visible
+    /// memory — the Venus renderer's ring workers and `ALIVE` monitors write
+    /// ring pages the guest maps — must take
+    /// [`Quiesce::wait_while_paused`](virtio_core::Quiesce::wait_while_paused)
+    /// before every pass, outside any lock the device holds, or "paused" is a
+    /// lie. The default ignores it: a renderer that only works inside trait
+    /// calls is already behind the gated queue worker.
+    fn set_quiesce(&mut self, quiesce: Arc<virtio_core::Quiesce>) {
+        let _ = quiesce;
+    }
+
     /// Creates host fence `fence_id` on `ctx_id`'s timeline, covering
     /// everything submitted to that context so far.
     ///
@@ -874,6 +888,11 @@ impl Gpu3d {
     /// Installs the device's host waker on the renderer.
     pub fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
         self.renderer.set_host_waker(waker);
+    }
+
+    /// Installs the VM's pause gate on the renderer (ADR-0005).
+    pub fn set_quiesce(&mut self, quiesce: Arc<virtio_core::Quiesce>) {
+        self.renderer.set_quiesce(quiesce);
     }
 
     /// Installs the shared-memory window's host pages on the renderer

@@ -106,6 +106,16 @@
 //! exactly. The reasoning is repeated here so that a later reader with a
 //! benchmark does not "optimise" it away:
 //!
+//! **`status` is never stored whole.** It is the one control word both sides
+//! write: the host sets and clears `IDLE`, `FATAL` and `ALIVE`, and the guest
+//! clears `ALIVE` with its own atomic AND when its watchdog arms. Every host
+//! write to it is therefore [`RingPages::set_status_bits`] or
+//! [`RingPages::clear_status_bits`] — `fetch_or`/`fetch_and` of the named bits,
+//! as the reference's `vkr_ring_set_status_bits` is — and the [`RingBacking`]
+//! trait offers no whole-word store for it at all. A store computed from a
+//! host-side picture of the word would resurrect a bit the guest had just
+//! cleared or erase one the monitor had just set.
+//!
 //! **All three control words are accessed [`SeqCst`].** The reference is weaker
 //! — release on `head`, acquire on `tail` — and we could be too, *except* that
 //! [`RingPump::enter_idle`] publishes `STATUS_IDLE` and then loads `tail`. A
@@ -816,6 +826,35 @@ impl Drop for RingPages {
     }
 }
 
+impl RingPages {
+    /// Atomically OR `bits` into a ring's `status` word, returning the value it
+    /// held before (or [`POISON_WORD`] if the word is not inside these pages).
+    ///
+    /// `status` is the one control word both sides write — the host sets and
+    /// clears `IDLE`, `FATAL` and `ALIVE`, the guest clears `ALIVE` with its own
+    /// `atomic_fetch_and` when its watchdog arms (`vn_common.c:229-243`) — so
+    /// every host write to it is a read-modify-write of named bits, never a
+    /// store of a whole value. [`SeqCst`](Ordering::SeqCst), like every other
+    /// control-word access here: the idle handshake is this write followed by a
+    /// load of `tail`, and only a full barrier orders those two.
+    ///
+    /// Callable from any thread: the ring worker and the context's monitor
+    /// both use it on the same word at once, which is exactly the case a
+    /// read-modify-write exists for.
+    pub fn set_status_bits(&self, status: &HostWord, bits: u32) -> u32 {
+        self.word(status.store_offset(), status.writer())
+            .map_or(POISON_WORD, |w| w.fetch_or(bits, Ordering::SeqCst))
+    }
+
+    /// Atomically clear `bits` in a ring's `status` word, returning the value
+    /// it held before. The counterpart of
+    /// [`set_status_bits`](Self::set_status_bits), with the same reasoning.
+    pub fn clear_status_bits(&self, status: &HostWord, bits: u32) -> u32 {
+        self.word(status.store_offset(), status.writer())
+            .map_or(POISON_WORD, |w| w.fetch_and(!bits, Ordering::SeqCst))
+    }
+}
+
 impl RingBacking for RingPages {
     fn load_host_word(&self, word: &HostWord) -> u32 {
         self.word(word.offset(), word.writer())
@@ -827,10 +866,18 @@ impl RingBacking for RingPages {
             .map_or(POISON_WORD, |w| w.load(Ordering::SeqCst))
     }
 
-    fn store_host_word(&self, word: &HostWord, value: u32) {
-        if let Some(w) = self.word(word.store_offset(), word.writer()) {
+    fn store_head(&self, head: &HostWord, value: u32) {
+        if let Some(w) = self.word(head.store_offset(), head.writer()) {
             w.store(value, Ordering::SeqCst);
         }
+    }
+
+    fn set_status_bits(&self, status: &HostWord, bits: u32) {
+        let _previous = RingPages::set_status_bits(self, status, bits);
+    }
+
+    fn clear_status_bits(&self, status: &HostWord, bits: u32) {
+        let _previous = RingPages::clear_status_bits(self, status, bits);
     }
 
     fn read_buffer(&self, buffer: &Region, offset: u64, dst: &mut [u8]) {
@@ -1218,24 +1265,30 @@ mod tests {
             .accepts(&layout)
             .expect("the layout is this resource's");
 
-        // The host's two words: stored through the type-stated store path, read
-        // back both through the loader and out of the raw bytes, so a store to
-        // the wrong offset cannot hide behind a load from the same wrong one.
-        for (word, value) in [
-            (layout.head(), 0x1234_5678u32),
-            (layout.status(), 0x0000_0003),
-            (layout.head(), u32::MAX),
-            (layout.status(), 0),
-        ] {
-            pages.store_host_word(&word, value);
-            assert_eq!(pages.load_host_word(&word), value);
+        // `head`: stored through the type-stated store path, read back both
+        // through the loader and out of the raw bytes, so a store to the wrong
+        // offset cannot hide behind a load from the same wrong one.
+        let head = layout.head();
+        for value in [0x1234_5678u32, u32::MAX, 0] {
+            pages.store_head(&head, value);
+            assert_eq!(pages.load_host_word(&head), value);
             assert_eq!(
-                peek(&pages, word.offset(), 4),
+                peek(&pages, head.offset(), 4),
                 value.to_le_bytes(),
-                "the {:#x} word did not land where it was addressed",
-                word.offset()
+                "head did not land where it was addressed"
             );
         }
+
+        // `status`: never stored, only read-modify-written, bit by bit — and
+        // each write returns what the word held before it.
+        let status = layout.status();
+        assert_eq!(pages.set_status_bits(&status, 0x3), 0);
+        assert_eq!(pages.set_status_bits(&status, 0x4), 0x3);
+        assert_eq!(pages.clear_status_bits(&status, 0x1), 0x7);
+        assert_eq!(pages.load_host_word(&status), 0x6);
+        assert_eq!(peek(&pages, status.offset(), 4), 0x6u32.to_le_bytes());
+        assert_eq!(pages.clear_status_bits(&status, u32::MAX), 0x6);
+        assert_eq!(pages.load_host_word(&status), 0);
 
         // The guest's word: written the way the guest writes it, loaded the way
         // the host loads it. There is no `store_guest_word` and there cannot
@@ -1247,13 +1300,113 @@ mod tests {
         }
 
         // Three distinct words, not one aliased three ways.
-        pages.store_host_word(&layout.head(), 0xaaaa_aaaa);
-        pages.store_host_word(&layout.status(), 0xbbbb_bbbb);
+        pages.store_head(&layout.head(), 0xaaaa_aaaa);
+        pages.set_status_bits(&layout.status(), 0xbbbb_bbbb);
         guest_store(&pages, layout.tail().offset(), 0xcccc_cccc);
         assert_eq!(pages.load_host_word(&layout.head()), 0xaaaa_aaaa);
         assert_eq!(pages.load_guest_word(&layout.tail()), 0xcccc_cccc);
         assert_eq!(pages.load_host_word(&layout.status()), 0xbbbb_bbbb);
         assert!(!pages.is_poisoned());
+    }
+
+    /// Clear bits of a word the way the guest's watchdog does
+    /// (`vn_ring_unset_status_bits`): its own `atomic_fetch_and`.
+    fn guest_clear_bits(pages: &RingPages, offset: u64, bits: u32) {
+        let byte = usize::try_from(offset).expect("fixture offset fits a usize");
+        assert!(byte + 4 <= pages.mapped_len() as usize);
+        assert_eq!(offset % 4, 0);
+        // SAFETY: as `guest_store` — the assertions put the four bytes inside
+        // the live allocation on a 4-byte boundary, and `pages` outlives the
+        // borrow.
+        unsafe {
+            AtomicU32::from_ptr(pages.as_ptr().add(byte).cast::<u32>())
+                .fetch_and(!bits, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn the_guest_clearing_alive_and_the_host_toggling_idle_lose_no_bit() {
+        use crate::venus::pump::{STATUS_ALIVE, STATUS_FATAL, STATUS_IDLE};
+
+        let pages = RingPages::new(RESOURCE).expect("a page");
+        let status = layout().status();
+        let at = status.offset();
+        let read = |p: &RingPages| p.load_host_word(&status);
+
+        // Deterministic first, one interleaving at a time: the monitor asserts
+        // ALIVE, the ring worker publishes IDLE, the guest arms its watchdog,
+        // the worker wakes. A host that stored a whole word from its own
+        // picture would get one of these wrong.
+        pages.set_status_bits(&status, STATUS_ALIVE);
+        pages.set_status_bits(&status, STATUS_IDLE);
+        assert_eq!(read(&pages), STATUS_ALIVE | STATUS_IDLE);
+        guest_clear_bits(&pages, at, STATUS_ALIVE);
+        assert_eq!(read(&pages), STATUS_IDLE);
+        pages.clear_status_bits(&status, STATUS_IDLE);
+        assert_eq!(read(&pages), 0, "clearing IDLE must not bring ALIVE back");
+        pages.set_status_bits(&status, STATUS_FATAL);
+        pages.set_status_bits(&status, STATUS_ALIVE);
+        assert_eq!(read(&pages), STATUS_FATAL | STATUS_ALIVE);
+
+        // Then concurrently. The "host" toggles IDLE a great many times while
+        // the "guest" keeps clearing ALIVE and the "monitor" keeps setting it.
+        // FATAL was published before any of them started and must survive all
+        // of it, and the host's own bit must end where the host left it.
+        let pages = Arc::new(pages);
+        let rounds = 20_000;
+        std::thread::scope(|scope| {
+            let host = {
+                let pages = Arc::clone(&pages);
+                scope.spawn(move || {
+                    for _ in 0..rounds {
+                        pages.set_status_bits(&status, STATUS_IDLE);
+                        pages.clear_status_bits(&status, STATUS_IDLE);
+                    }
+                    pages.set_status_bits(&status, STATUS_IDLE);
+                })
+            };
+            let guest = {
+                let pages = Arc::clone(&pages);
+                scope.spawn(move || {
+                    for _ in 0..rounds {
+                        guest_clear_bits(&pages, at, STATUS_ALIVE);
+                        assert_ne!(
+                            pages.load_host_word(&status) & STATUS_FATAL,
+                            0,
+                            "FATAL was lost under the guest's clear"
+                        );
+                    }
+                })
+            };
+            let monitor = {
+                let pages = Arc::clone(&pages);
+                scope.spawn(move || {
+                    for _ in 0..rounds {
+                        let before = pages.set_status_bits(&status, STATUS_ALIVE);
+                        assert_ne!(before & STATUS_FATAL, 0, "FATAL was lost");
+                    }
+                })
+            };
+            host.join().expect("host thread");
+            guest.join().expect("guest thread");
+            monitor.join().expect("monitor thread");
+        });
+        let end = pages.load_host_word(&status);
+        assert_eq!(end & STATUS_FATAL, STATUS_FATAL, "FATAL survived");
+        assert_eq!(
+            end & STATUS_IDLE,
+            STATUS_IDLE,
+            "the host's last word stands"
+        );
+
+        // And with everyone stopped, one more of each lands exactly.
+        guest_clear_bits(&pages, at, STATUS_ALIVE);
+        assert_eq!(pages.load_host_word(&status) & STATUS_ALIVE, 0);
+        pages.set_status_bits(&status, STATUS_ALIVE);
+        assert_eq!(
+            pages.load_host_word(&status),
+            STATUS_FATAL | STATUS_IDLE | STATUS_ALIVE
+        );
     }
 
     #[test]
@@ -1593,7 +1746,12 @@ mod tests {
         assert_eq!(pages.load_host_word(&stray.head()), POISON_WORD);
         assert!(pages.is_poisoned());
         assert_eq!(pages.load_guest_word(&stray.tail()), POISON_WORD);
-        pages.store_host_word(&stray.status(), 0x1234);
+        pages.store_head(&stray.head(), 0x1234);
+        assert_eq!(pages.set_status_bits(&stray.status(), 0x1234), POISON_WORD);
+        assert_eq!(
+            pages.clear_status_bits(&stray.status(), 0x1234),
+            POISON_WORD
+        );
 
         // And the pump does refuse it, rather than adopting a ring whose words
         // are nowhere.
@@ -1695,7 +1853,7 @@ mod tests {
         assert_eq!(Arc::strong_count(published.pages()), 1);
         assert_eq!(published.pages().host_addr(), addr);
         let layout = layout();
-        published.pages().store_host_word(&layout.head(), 0x5eed);
+        published.pages().store_head(&layout.head(), 0x5eed);
         assert_eq!(published.pages().load_host_word(&layout.head()), 0x5eed);
 
         // Only dropping the publication unmaps — and the allocation outlives

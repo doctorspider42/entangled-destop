@@ -42,16 +42,34 @@ use virtio_core::VirtioDevice;
 use vmm_core::hv::{GuestClock, HostIrqChip, X86CpuState};
 use vmm_core::{Lifecycle, MachineConfig, RunOutcome, VmState};
 
-/// Where the Venus transport capture writes the guest's command stream, and
+/// Where the Venus transport capture writes the guest's command streams, and
 /// the switch that turns that renderer on at all (EPIC 20 phase 4, ADR-0004).
 ///
 /// Diagnostic, so it lives here rather than in a profile: what it attaches
-/// serves the Venus capset and a command ring and executes no Vulkan, so a
-/// guest reaches the ring and then waits for a reply that never comes. That is
-/// the point of the stage — the capture is how we learn what Mesa's driver
-/// really sends, which no amount of reading the reference can answer — but it
-/// is not a thing a profile should be able to ask for by accident.
+/// serves the Venus capset and command rings and executes no Vulkan, so a
+/// guest reaches its ring, sends its first command, and is told the ring is
+/// fatal (its driver aborts on "ring fatal error"). That is the point of the
+/// stage — the capture is how we learn what Mesa's driver really sends, which
+/// no amount of reading the reference can answer — but it is not a thing a
+/// profile should be able to ask for by accident.
+///
+/// The value is a path *prefix*: every ring the guest creates writes its own
+/// file, `<value>.ctx<N>.ring<M>.bin`, where `N` is the virtio-gpu context id
+/// (one per guest `VkInstance`) and `M` counts the rings this VM run has
+/// created, from 0, in creation order — the guest's ring handle is a pointer
+/// value and is logged beside the path instead. Each file holds the reply
+/// bookkeeping the capture consumed, then the first command it could not
+/// answer and the rest of that batch. A file from an earlier run with the same
+/// name is overwritten.
 const VENUS_CAPTURE_ENV: &str = "ENTANGLED_VENUS_CAPTURE";
+
+/// The capture file for the `seq`-th ring of a run, on context `ctx_id`: see
+/// [`VENUS_CAPTURE_ENV`].
+fn venus_capture_path(prefix: &std::path::Path, ctx_id: u32, seq: u64) -> PathBuf {
+    let mut name = prefix.as_os_str().to_owned();
+    name.push(format!(".ctx{ctx_id}.ring{seq}.bin"));
+    PathBuf::from(name)
+}
 
 /// Set by the SIGINT/SIGTERM (Linux) or console-control (Windows) handler; the
 /// run loop polls it (MVP-1204).
@@ -319,15 +337,45 @@ fn build_devices(
     // have meant a schema every profile, the manager and the installer's tests
     // would inherit, for something two stages from now deletes. The precedent
     // is `ENTANGLED_GPU_FENCES`, which is diagnostic in the same way.
-    if let Some(path) = std::env::var_os(VENUS_CAPTURE_ENV) {
-        let path = PathBuf::from(path);
-        let file = std::fs::File::create(&path)
-            .map_err(|e| format!("cannot write the Venus capture to {}: {e}", path.display()))?;
+    if let Some(prefix) = std::env::var_os(VENUS_CAPTURE_ENV) {
+        let prefix = PathBuf::from(prefix);
+        // The files are made per ring, long after this point; a directory that
+        // is not there is worth failing the run for now rather than refusing
+        // every ring later.
+        let dir = match prefix.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        if !dir.is_dir() {
+            return Err(format!(
+                "cannot write the Venus capture under {}: {} is not a directory",
+                prefix.display(),
+                dir.display()
+            ));
+        }
         tracing::warn!(
-            path = %path.display(),
-            "attaching the Venus TRANSPORT renderer: it advertises the Venus capset and              captures the guest's command stream, and executes no Vulkan — a guest will              reach a command ring and then block on its first reply"
+            prefix = %prefix.display(),
+            "attaching the Venus TRANSPORT renderer: it advertises the Venus capset and              captures each command ring to <prefix>.ctx<N>.ring<M>.bin, and executes no              Vulkan — a guest will reach a ring, send its first command, and be told the              ring is fatal"
         );
-        let mut renderer = virtio_gpu::VenusRenderer::new(virtio_gpu::WriteSink::new(file));
+        let mut next_ring = 0u64;
+        let sinks = move |ctx_id: u32,
+                          ring: u64|
+              -> std::io::Result<virtio_gpu::WriteSink<std::fs::File>> {
+            let seq = next_ring;
+            next_ring += 1;
+            let path = venus_capture_path(&prefix, ctx_id, seq);
+            let file = std::fs::File::create(&path).inspect_err(|error| {
+                tracing::error!(path = %path.display(), %error, "cannot create a Venus ring capture");
+            })?;
+            tracing::info!(
+                path = %path.display(),
+                ctx_id,
+                ring = format_args!("{ring:#x}"),
+                "capturing a Venus command ring"
+            );
+            Ok(virtio_gpu::WriteSink::new(file))
+        };
+        let mut renderer = virtio_gpu::VenusRenderer::new(sinks);
         // Tell the guest to assume every Vulkan extension is served, rather
         // than handing it an enumerated-but-empty list.
         //

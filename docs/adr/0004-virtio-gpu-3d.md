@@ -2014,3 +2014,61 @@ to `MESA_LOG_INFO` (`util/log.c:134-137`). Guest probes need
 `MESA_LOG_LEVEL=debug` alongside `VN_DEBUG`. The lesson stands. The
 `EACCES` on `/dev/dri/renderD128` stands too — it was measured with raw ioctls,
 not inferred from silence.
+
+## Amendment, 2026-09-23 — stage 5a.1, the ring service
+
+The two faults the correction above names are fixed in
+`crates/virtio-gpu/src/venus/service.rs`, and one debt from "What phase 4 does
+not have" is paid.
+
+- **Every ring has a worker thread**, faithful to `vkr_ring_thread`
+  (`vkr_ring.c:241-335`): pump while there is progress; with none, keep
+  polling `tail` (sixteen yields, then `vkr_ring_relax`'s doubling sleeps,
+  never past the deadline) until `idleTimeout` has passed since the last
+  progress; publish `IDLE`, re-read `tail`, and take `IDLE` back down if work
+  arrived; otherwise park until the doorbell, and take `IDLE` down on waking.
+  `vkNotifyRingMESA` now only wakes the worker; the device's queue worker never
+  touches ring pages. The decisions are a pure state machine (`RingService`)
+  over an injected clock, tested deterministically, including the exact Mesa
+  shape: `SetReply` rings, the command a few microseconds later does not, both
+  are consumed.
+- **Every context with a monitored ring has an `ALIVE` monitor**
+  (`vkr_context.c:507-545`), at the shortest period any of its rings asked
+  for, floored at 1 ms (`MIN_MONITOR_PERIOD`) so a guest cannot make it spin; a
+  period of zero refuses the ring, as the reference does. It is a separate
+  thread because a worker stuck in one long command cannot report on itself,
+  and a test holds a worker inside its sink to prove `ALIVE` keeps coming.
+- **`status` is only ever read-modify-written.** The guest clears `ALIVE`
+  with its own atomic AND (`vn_common.c:229-243`), so the pump's old
+  whole-word store from a host-side mirror would have raced it. `RingBacking`
+  now offers `store_head` and `set_status_bits`/`clear_status_bits`
+  (`fetch_or`/`fetch_and`, `SeqCst`) and no whole-word store of `status`.
+- **A sink decides how far `head` moves, and can end the ring.**
+  `Batch::fatal_after(n)` advances `head` over `n` bytes and no further,
+  publishes `FATAL` and stops the worker — never past a command whose reply was
+  not written (spec §5 item 4). The capture sinks use it: they consume and
+  record `SetReply`/`SeekReply`, and at the first command they would have to
+  answer they record it and the rest of the batch and declare the ring fatal.
+  Against a real guest the capture should be `SetReply` (36 B) +
+  `vkEnumerateInstanceVersion` (16 B), and the guest should abort on "ring
+  fatal error" at once rather than on its 3.5 s watchdog.
+- **One sink per ring.** `VenusRenderer` takes a `SinkFactory`
+  (`(ctx_id, ring) -> io::Result<S>`), and `ENTANGLED_VENUS_CAPTURE` is now a
+  prefix: each ring writes `<prefix>.ctx<N>.ring<M>.bin`, `M` counting the
+  run's rings from 0. The "one sink for all rings" debt above is gone.
+- **ADR-0005 is honoured by both threads**: a `Quiesce` pass before every
+  pass, outside every lock, and stop-and-join on `vkDestroyRingMESA`,
+  `ctx_destroy`, blob destruction and `reset` — including on a paused VM.
+
+Still owed: replies (5a.2 onwards), and `save`/`load` for rings (ADR-0006).
+
+One risk the reference shares and this stage does not fix: the idle
+handshake assumes the host's `idleTimeout` is at least as long, in real time,
+as the guest's one-millisecond doorbell rate limit. A host clock that runs
+fast — WSL's does, by up to 3.8 % — can publish `IDLE` a few tens of
+microseconds before the guest is allowed to ring again; a submission in that
+gap is announced by no doorbell, and the ring parks on it while the monitor
+keeps the watchdog quiet. The wake-up latency of a real doorbell normally
+covers the gap. If a guest is ever seen hanging with `IDLE` up and
+`tail != head`, a bounded park (re-check `tail` every few milliseconds) is the
+cheap fix.

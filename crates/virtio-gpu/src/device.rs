@@ -2454,6 +2454,12 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
                 actual: resources.queues.len(),
             });
         }
+        // The renderer is the only thing here with host threads of its own
+        // that touch guest-visible memory (the Venus ring workers and
+        // monitors), so it is the one that needs the pause gate.
+        if let Some(gpu) = self.three_d.as_mut() {
+            gpu.set_quiesce(Arc::clone(&resources.quiesce));
+        }
         let mut queues = resources.queues.into_iter();
         self.control = queues.next();
         self.cursor = queues.next();
