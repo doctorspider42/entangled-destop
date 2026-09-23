@@ -3,15 +3,22 @@
 //! guest wants its ring in, decodes the context command stream and pumps the
 //! ring (EPIC 20, ADR-0004).
 //!
-//! **It executes no Vulkan.** This is the transport half and nothing else: a
-//! real Mesa `venus` guest can get all the way to handing us a command ring and
-//! writing commands into it, and what happens to those bytes is a
-//! [`RingSink`] per ring, made by a [`SinkFactory`] the caller supplies —
-//! [`CaptureSink`] for a test, [`WriteSink`] for `entangled run` writing one
-//! capture file per ring. Nothing here decodes a Vulkan command, and
-//! deliberately so: everything up to the ring is pure logic over bytes and is
-//! provable on a host with no GPU at all, which is the whole reason the seam is
-//! drawn where [`super`]'s docs draw it.
+//! **It executes no Vulkan itself.** This is the transport half: a real Mesa
+//! `venus` guest can get all the way to handing us a command ring and writing
+//! commands into it, and what happens to those bytes is a [`RingSink`] per
+//! ring, made by a [`SinkFactory`] the caller supplies — [`CaptureSink`] for a
+//! test, [`WriteSink`] for `entangled run` writing one capture file per ring,
+//! or [`ExecutorFactory`](super::executor::ExecutorFactory)'s sink, which
+//! executes and answers (stage 5a.3). Nothing in this file decodes a Vulkan
+//! command, and deliberately so: everything up to the ring is pure logic over
+//! bytes and is provable on a host with no GPU at all, which is the whole
+//! reason the seam is drawn where [`super`]'s docs draw it.
+//!
+//! What a sink needs beyond its bytes it gets through the factory: a
+//! [`RingEnv`] per ring, whose [`ContextBlobs`] is the context's view of the
+//! host blobs — where an executing sink writes its replies — and the
+//! `context_created` / `context_destroyed` / `reset` hooks, each called only
+//! once every ring worker it concerns has been joined.
 //!
 //! # The guest's route through here
 //!
@@ -67,7 +74,9 @@
 //!   [`RingPump::status`], plus the layout, the monitor period and the window
 //!   offset each set of pages was published at. It is not implemented because
 //!   nothing in this file is reachable from a shipping VM yet — the renderer is
-//!   opt-in and executes nothing — but a snapshot taken over a live ring
+//!   opt-in and diagnostic; a factory whose sinks hold host Vulkan objects
+//!   refuses a snapshot by name ([`SinkFactory::snapshot_refusal`]) — but a
+//!   snapshot taken over a live ring
 //!   without it would resume a guest whose `head` says one thing and whose host
 //!   cursor says another, which is the quietest possible corruption.
 //!
@@ -224,6 +233,241 @@ pub trait SinkFactory: Send {
     /// Whatever stopped the sink being made — for `entangled run`, a capture
     /// file that could not be created.
     fn sink_for(&mut self, ctx_id: u32, ring: u64) -> io::Result<Self::Sink>;
+
+    /// The sink for a ring, given everything the renderer can hand it beyond
+    /// the bytes: the context's host blobs, where an executing sink writes
+    /// its replies. The renderer calls this, never
+    /// [`sink_for`](Self::sink_for) directly; the default forwards to it, so
+    /// a capture ignores what it has no use for.
+    ///
+    /// # Errors
+    ///
+    /// As [`sink_for`](Self::sink_for).
+    fn sink_for_ring(&mut self, env: RingEnv) -> io::Result<Self::Sink> {
+        self.sink_for(env.ctx_id, env.ring)
+    }
+
+    /// A venus context was created. Called before any of its rings exist.
+    fn context_created(&mut self, _ctx_id: u32) {}
+
+    /// A venus context is gone. Called **after** every ring worker of it has
+    /// been stopped and joined, so nothing of the context is running and a
+    /// factory that keeps per-context state (host Vulkan objects) may destroy
+    /// it without racing a sink.
+    fn context_destroyed(&mut self, _ctx_id: u32) {}
+
+    /// The device reset (ADR-0005). Called after every context has been
+    /// dropped and every thread joined; a factory holding host state must
+    /// leave none behind.
+    fn reset(&mut self) {}
+
+    /// Why a snapshot taken now would lose something a resumed guest would
+    /// notice (ADR-0006), or `None` if it would not. A factory whose sinks
+    /// hold host Vulkan objects must refuse by name: those cannot be written
+    /// to a file.
+    fn snapshot_refusal(&self) -> Option<String> {
+        None
+    }
+}
+
+/// What the renderer hands a [`SinkFactory`] for a new ring.
+#[derive(Debug, Clone)]
+pub struct RingEnv {
+    /// The context the ring belongs to.
+    pub ctx_id: u32,
+    /// The guest's handle for the ring.
+    pub ring: u64,
+    /// The host blobs this ring's context may name as a reply window.
+    pub blobs: ContextBlobs,
+}
+
+// ------------------------------------------------- blobs a sink may write
+
+/// Why a reply window could not be bound or written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ReplyBlobError {
+    /// The resource is not a host blob this renderer holds.
+    #[error("resource {0} is not a host blob")]
+    NotAHostBlob(u32),
+    /// The blob belongs to another context.
+    #[error("resource {resource_id} belongs to venus context {owner}, not to {ctx_id}")]
+    Foreign {
+        /// The blob named.
+        resource_id: u32,
+        /// Its context.
+        owner: u32,
+        /// The context that named it.
+        ctx_id: u32,
+    },
+    /// `offset + size` passes the end of the blob.
+    #[error("a {size:#x}-byte window at {offset:#x} does not fit the {blob:#x}-byte resource {resource_id}")]
+    OutsideBlob {
+        /// The blob named.
+        resource_id: u32,
+        /// The window's offset.
+        offset: u64,
+        /// The window's size.
+        size: u64,
+        /// The blob's size.
+        blob: u64,
+    },
+    /// The blob was destroyed (or replaced by another under the same id)
+    /// since the window was bound.
+    #[error("resource {0} was destroyed while it was a reply window")]
+    Gone(u32),
+}
+
+/// A bound reply window's blob, as the directory knew it when it was bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobRef {
+    /// The resource id.
+    pub resource_id: u32,
+    /// Which incarnation of that id: a blob destroyed and re-created under
+    /// the same id is a different one, and a window on the old one is gone.
+    pub generation: u64,
+}
+
+#[derive(Debug)]
+struct DirectoryEntry {
+    ctx_id: u32,
+    pages: Arc<RingPages>,
+    generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct DirectoryState {
+    blobs: HashMap<u32, DirectoryEntry>,
+    next_generation: u64,
+}
+
+/// Every host blob the renderer holds, shared with the ring workers behind a
+/// lock so a sink can write a reply into one.
+///
+/// The renderer inserts on `RESOURCE_CREATE_BLOB` and removes on destroy and
+/// reset; a sink writes **under the same lock**, so a blob that has been
+/// removed can never be written afterwards — the removal either happened
+/// before the write (which then finds the blob gone and refuses) or waits for
+/// it. That is the whole of the "destroyed while it is the reply window"
+/// case, which virglrenderer tolerates by unbinding the stream
+/// (`vkr_cs_encoder_check_stream`); a later reply with no window is then
+/// fatal, as there.
+#[derive(Debug, Clone, Default)]
+pub struct BlobDirectory(Arc<Mutex<DirectoryState>>);
+
+impl BlobDirectory {
+    fn with<T>(&self, f: impl FnOnce(&mut DirectoryState) -> T) -> T {
+        match self.0.lock() {
+            Ok(mut guard) => f(&mut guard),
+            Err(poisoned) => f(&mut poisoned.into_inner()),
+        }
+    }
+
+    fn insert(&self, resource_id: u32, ctx_id: u32, pages: Arc<RingPages>) {
+        self.with(|state| {
+            state.next_generation = state.next_generation.wrapping_add(1);
+            let generation = state.next_generation;
+            state.blobs.insert(
+                resource_id,
+                DirectoryEntry {
+                    ctx_id,
+                    pages,
+                    generation,
+                },
+            );
+        });
+    }
+
+    fn remove(&self, resource_id: u32) {
+        self.with(|state| state.blobs.remove(&resource_id));
+    }
+
+    fn clear(&self) {
+        self.with(|state| state.blobs.clear());
+    }
+
+    /// The part of the directory context `ctx_id` may reach.
+    #[must_use]
+    pub fn for_context(&self, ctx_id: u32) -> ContextBlobs {
+        ContextBlobs {
+            ctx_id,
+            directory: self.clone(),
+        }
+    }
+}
+
+/// The host blobs one context may name: its own, and the kernel's (context
+/// 0), exactly the blobs a ring of it may be built on.
+#[derive(Debug, Clone)]
+pub struct ContextBlobs {
+    ctx_id: u32,
+    directory: BlobDirectory,
+}
+
+impl ContextBlobs {
+    /// Judge a `vkSetReplyCommandStreamMESA`: the resource must be a host blob
+    /// of this context and `offset + size` must fit it (`vkr_transport.c:14-29`,
+    /// `vkr_cs.c:10-38`).
+    ///
+    /// # Errors
+    /// [`ReplyBlobError`] naming the rule broken.
+    pub fn bind(
+        &self,
+        resource_id: u32,
+        offset: u64,
+        size: u64,
+    ) -> Result<BlobRef, ReplyBlobError> {
+        self.directory.with(|state| {
+            let entry = state
+                .blobs
+                .get(&resource_id)
+                .ok_or(ReplyBlobError::NotAHostBlob(resource_id))?;
+            if entry.ctx_id != 0 && entry.ctx_id != self.ctx_id {
+                return Err(ReplyBlobError::Foreign {
+                    resource_id,
+                    owner: entry.ctx_id,
+                    ctx_id: self.ctx_id,
+                });
+            }
+            let blob = entry.pages.resource_len();
+            if offset.checked_add(size).is_none_or(|end| end > blob) {
+                return Err(ReplyBlobError::OutsideBlob {
+                    resource_id,
+                    offset,
+                    size,
+                    blob,
+                });
+            }
+            Ok(BlobRef {
+                resource_id,
+                generation: entry.generation,
+            })
+        })
+    }
+
+    /// Write `bytes` at resource offset `at` of the blob `blob` names, under
+    /// the directory lock.
+    ///
+    /// # Errors
+    /// [`ReplyBlobError::Gone`] if that blob no longer exists, and
+    /// [`ReplyBlobError::OutsideBlob`] if the bytes do not fit it.
+    pub fn write(&self, blob: BlobRef, at: u64, bytes: &[u8]) -> Result<(), ReplyBlobError> {
+        self.directory.with(|state| {
+            let entry = state
+                .blobs
+                .get(&blob.resource_id)
+                .filter(|entry| entry.generation == blob.generation)
+                .ok_or(ReplyBlobError::Gone(blob.resource_id))?;
+            entry
+                .pages
+                .write_bytes(at, bytes)
+                .map_err(|_| ReplyBlobError::OutsideBlob {
+                    resource_id: blob.resource_id,
+                    offset: at,
+                    size: bytes.len() as u64,
+                    blob: entry.pages.resource_len(),
+                })
+        })
+    }
 }
 
 impl<F, S> SinkFactory for F
@@ -834,6 +1078,9 @@ pub struct VenusRenderer<F> {
     /// The host-visible window, once the machine layer has supplied one.
     window: Option<Arc<dyn ShmBacking>>,
     blobs: HashMap<u32, RingBlob>,
+    /// The same blobs, shared with the ring workers so an executing sink can
+    /// write replies into them; kept in step with `blobs`.
+    directory: BlobDirectory,
     /// Sum of [`RingBlob::size`], against [`MAX_RING_BLOB_BYTES`].
     blob_bytes: u64,
     contexts: HashMap<u32, Context>,
@@ -874,6 +1121,7 @@ impl<F> VenusRenderer<F> {
             capset: VenusCapset::new(),
             window: None,
             blobs: HashMap::new(),
+            directory: BlobDirectory::default(),
             blob_bytes: 0,
             contexts: HashMap::new(),
             observed: 0,
@@ -910,6 +1158,20 @@ impl<F> VenusRenderer<F> {
     #[must_use]
     pub fn blob_count(&self) -> usize {
         self.blobs.len()
+    }
+
+    /// The pages behind a host blob, for a test playing the guest.
+    #[cfg(test)]
+    pub(crate) fn blob_pages(&self, resource_id: u32) -> Option<Arc<RingPages>> {
+        self.blobs
+            .get(&resource_id)
+            .map(|blob| Arc::clone(&blob.pages))
+    }
+
+    /// The factory, for a test that inspects what it holds.
+    #[cfg(test)]
+    pub(crate) fn factory(&self) -> &F {
+        &self.sinks
     }
 
     /// Transport commands that were decoded and accepted without being
@@ -1030,6 +1292,8 @@ impl<F> VenusRenderer<F> {
         // bounded and refused by name rather than believed.
         let pages = Arc::new(RingPages::new(args.size)?);
         self.blob_bytes = self.blob_bytes.saturating_add(args.size);
+        self.directory
+            .insert(args.resource_id, ctx_id, Arc::clone(&pages));
         self.blobs.insert(
             args.resource_id,
             RingBlob {
@@ -1251,14 +1515,19 @@ impl<F: SinkFactory> VenusRenderer<F> {
         let layout = RingLayout::new(info, pages.resource_len())?;
         let pump = pages.adopt(layout)?;
 
-        let sink =
-            self.sinks
-                .sink_for(ctx_id, ring)
-                .map_err(|error| VenusError::SinkUnavailable {
-                    ctx_id,
-                    ring,
-                    reason: error.to_string(),
-                })?;
+        let env = RingEnv {
+            ctx_id,
+            ring,
+            blobs: self.directory.for_context(ctx_id),
+        };
+        let sink = self
+            .sinks
+            .sink_for_ring(env)
+            .map_err(|error| VenusError::SinkUnavailable {
+                ctx_id,
+                ring,
+                reason: error.to_string(),
+            })?;
 
         let quiesce = Arc::clone(&self.quiesce);
         let live = self.live.clone();
@@ -1408,6 +1677,9 @@ impl<F: SinkFactory> VenusRenderer<F> {
     /// pages, and every ring that was built on them.
     fn drop_blob(&mut self, resource_id: u32) {
         if let Some(blob) = self.blobs.remove(&resource_id) {
+            // Out of the sinks' reach first: after this returns no reply can
+            // land in these pages, whichever ring was about to write one.
+            self.directory.remove(resource_id);
             self.blob_bytes = self.blob_bytes.saturating_sub(blob.size);
             self.drop_rings_on(resource_id);
             drop(blob);
@@ -1429,6 +1701,7 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
 
     fn ctx_create(&mut self, ctx_id: u32, capset_id: u32, name: &str) -> Result<(), CommandError> {
         self.create_context(ctx_id, capset_id)?;
+        self.sinks.context_created(ctx_id);
         tracing::debug!(ctx_id, capset_id, name, "venus context created");
         Ok(())
     }
@@ -1437,7 +1710,11 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         // Dropping the context stops and joins its ring workers and its
         // monitor, then drops its rings; the pages behind them belong to the
         // blobs and stay until those are destroyed or the device resets.
-        self.contexts.remove(&ctx_id);
+        if self.contexts.remove(&ctx_id).is_some() {
+            // Only now, with every ring of it joined, may the factory tear
+            // down what its sinks shared (host Vulkan objects).
+            self.sinks.context_destroyed(ctx_id);
+        }
     }
 
     fn resource_create_3d(&mut self, _args: &ResourceCreate3d) -> Result<(), CommandError> {
@@ -1495,9 +1772,16 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
             context.signal_stop();
         }
         self.contexts.clear();
+        // Every thread is joined: the factory's shared state can go.
+        self.sinks.reset();
+        self.directory.clear();
         self.blobs.clear();
         self.blob_bytes = 0;
         self.observed = 0;
+    }
+
+    fn snapshot_refusal(&self) -> Option<String> {
+        self.sinks.snapshot_refusal()
     }
 
     fn blob_support(&self) -> BlobSupport {

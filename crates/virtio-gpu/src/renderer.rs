@@ -238,6 +238,20 @@ pub trait Renderer3d: Send {
         let _ = quiesce;
     }
 
+    /// Why a snapshot taken now would lose host state a resumed guest would
+    /// notice missing (ADR-0006), or `None`.
+    ///
+    /// The device already records how many 3D contexts were open and tells a
+    /// restored driver to start again; that is honest for state a restart
+    /// rebuilds. A renderer holding **host Vulkan objects** a guest believes
+    /// in (the Venus executor, stage 5a.3) is different — those ids are baked
+    /// into the guest's own driver state and cannot be written to a file — so
+    /// it refuses the snapshot by name here instead. The default refuses
+    /// nothing.
+    fn snapshot_refusal(&self) -> Option<String> {
+        None
+    }
+
     /// Creates host fence `fence_id` on `ctx_id`'s timeline, covering
     /// everything submitted to that context so far.
     ///
@@ -893,6 +907,11 @@ impl Gpu3d {
     /// Installs the VM's pause gate on the renderer (ADR-0005).
     pub fn set_quiesce(&mut self, quiesce: Arc<virtio_core::Quiesce>) {
         self.renderer.set_quiesce(quiesce);
+    }
+
+    /// [`Renderer3d::snapshot_refusal`] of the renderer.
+    pub fn snapshot_refusal(&self) -> Option<String> {
+        self.renderer.snapshot_refusal()
     }
 
     /// Installs the shared-memory window's host pages on the renderer

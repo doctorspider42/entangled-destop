@@ -384,9 +384,14 @@ impl VenusCapset {
     ///
     /// The protocol versions are fixed by the ICD we have to satisfy; the
     /// three capability flags are this VMM's honest answers (see each field).
-    /// The extension mask is enumerated and empty: a renderer that really can
-    /// execute Vulkan replaces it with its host driver's list, and until one
-    /// does, promising nothing optional is the answer that cannot lie.
+    /// The extension mask is enumerated — sentinel set — and holds exactly the
+    /// extensions the generated protocol decodes
+    /// ([`DECODABLE_EXTENSION_MASK`](super::protocol::info::DECODABLE_EXTENSION_MASK)),
+    /// which is what virglrenderer advertises of its own protocol
+    /// (`vkr_renderer.c:40-48`). The mask gates only which structures the
+    /// guest's *encoder* may chain; which extensions a device offers is the
+    /// executor's `vkEnumerateDeviceExtensionProperties` answer, filtered to
+    /// the same set.
     pub fn new() -> Self {
         Self {
             wire_format_version: Self::WIRE_FORMAT_VERSION,
@@ -395,7 +400,7 @@ impl VenusCapset {
                 Self::VK_EXT_COMMAND_SERIALIZATION_SPEC_VERSION,
             vk_mesa_venus_protocol_spec_version: Self::VK_MESA_VENUS_PROTOCOL_SPEC_VERSION,
             supports_blob_id_0: true,
-            extensions: ExtensionMask::ENUMERATED,
+            extensions: ExtensionMask::from_words(super::protocol::info::DECODABLE_EXTENSION_MASK),
             allow_vk_wait_syncs: true,
             supports_multiple_timelines: false,
             use_guest_vram: false,
@@ -633,7 +638,11 @@ mod tests {
     fn the_extension_mask_occupies_words_five_to_thirty_six() {
         // One bit in the first mask word and one in the last, so both ends of
         // the array are pinned.
+        // From an empty enumerated mask: the default one carries the
+        // decodable transport extensions (word 12), which is not what this
+        // test is about.
         let mut capset = VenusCapset::new();
+        capset.extensions = ExtensionMask::ENUMERATED;
         capset.enable_extension(1).expect("extension 1");
         capset.enable_extension(MAX_EXTENSION_NUMBER).expect("1023");
 
@@ -870,6 +879,13 @@ mod tests {
         // One fence timeline, because FenceQueue retires strictly in
         // submission order. See the field docs before flipping this.
         assert_eq!(words[word::SUPPORTS_MULTIPLE_TIMELINES], 0);
+        // Exactly what the generated protocol decodes, sentinel set — never
+        // the all-zero "assume everything" mask.
+        assert_eq!(
+            words[word::EXTENSION_MASK1..word::EXTENSION_MASK1 + EXTENSION_MASK_WORDS],
+            super::super::protocol::info::DECODABLE_EXTENSION_MASK
+        );
+        assert!(capset.extensions.is_enumerated());
     }
 
     #[test]

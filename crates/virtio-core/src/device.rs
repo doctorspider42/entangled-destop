@@ -443,6 +443,18 @@ pub trait VirtioDevice: Send {
         Vec::new()
     }
 
+    /// Why a snapshot taken now would lose state a resumed guest would
+    /// notice missing, or `None` (ADR-0006).
+    ///
+    /// Asked before any state is written, with the VM paused. A device whose
+    /// [`Self::save_device`] would silently drop something the guest's driver
+    /// still believes in — host GPU objects it holds ids for — answers with a
+    /// sentence naming it, and the snapshot is refused rather than written
+    /// without it. The default refuses nothing.
+    fn snapshot_refusal(&self) -> Option<String> {
+        None
+    }
+
     /// Puts [`Self::save_device`]'s bytes back, after the transport has
     /// re-activated the device.
     ///

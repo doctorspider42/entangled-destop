@@ -63,6 +63,14 @@ use vmm_core::{Lifecycle, MachineConfig, RunOutcome, VmState};
 /// name is overwritten.
 const VENUS_CAPTURE_ENV: &str = "ENTANGLED_VENUS_CAPTURE";
 
+/// The switch for the Venus **executor** (EPIC 20 stage 5a.3, ADR-0004):
+/// `ENTANGLED_VENUS=vulkan` attaches the renderer that executes a guest's
+/// Vulkan bring-up on the host GPU and answers it. Diagnostic, and an
+/// environment variable, for the reason [`VENUS_CAPTURE_ENV`] is; the capture
+/// wins if both are set. The run fails before the guest boots if the host has
+/// no Vulkan loader or no device the executor would expose.
+const VENUS_ENV: &str = "ENTANGLED_VENUS";
+
 /// The capture file for the `seq`-th ring of a run, on context `ctx_id`: see
 /// [`VENUS_CAPTURE_ENV`].
 fn venus_capture_path(prefix: &std::path::Path, ctx_id: u32, seq: u64) -> PathBuf {
@@ -375,32 +383,50 @@ fn build_devices(
             );
             Ok(virtio_gpu::WriteSink::new(file))
         };
-        let mut renderer = virtio_gpu::VenusRenderer::new(sinks);
-        // Tell the guest to assume every Vulkan extension is served, rather
-        // than handing it an enumerated-but-empty list.
+        // The capset is `VenusCapset::new()`'s, unchanged: an enumerated
+        // extension mask of exactly what the generated protocol decodes, as
+        // virglrenderer advertises of its own (`vkr_renderer.c:40-48`). The
+        // all-zero "assume every extension" mask this stage once sent had no
+        // reference precedent (ADR-0004, correction of 2026-09-23).
         //
-        // `VenusCapset::new()` is honest — it says "we support no optional
-        // extension" — and honest is what a *renderer* should be. This one
-        // executes nothing, so honesty here is a lie of a different kind: it
-        // makes Mesa's venus driver decline before it has sent us a single
-        // byte, and the whole point of this stage is to find out what it
-        // sends. The permissive form is what virglrenderer effectively
-        // advertises too (`venus_hw.h`: with the sentinel clear "all the
-        // extensions are assumed to be supported by the renderer side
-        // protocol").
-        let mut capset = virtio_gpu::venus::capset::VenusCapset::new();
-        capset.extensions = virtio_gpu::venus::capset::ExtensionMask::GUEST_ASSUMES_EVERYTHING;
-        // `supports_multiple_timelines` stays as `VenusCapset::new()` left it
-        // — false — even though claiming it was the obvious next guess when a
-        // guest declined us. `virtio_gpu::fence` is one FIFO retiring in
-        // submission order, and Mesa's venus driver binds every `VkQueue` to a
-        // `ring_idx` at creation: a renderer that promises per-queue timelines
-        // and then retires everything in one order does not fail loudly, it
-        // returns the wrong fence to the wrong queue. Advertising a capability
-        // to coax a guest past a gate is how a capture run turns into a
-        // haunting later, and this one was never consulted anyway — the ICD
-        // that declined us had not been loaded at all.
-        renderer.set_capset(capset);
+        // `supports_multiple_timelines` stays false: `virtio_gpu::fence` is one
+        // FIFO retiring in submission order, and a renderer that promises
+        // per-queue timelines and then retires everything in one order returns
+        // the wrong fence to the wrong queue.
+        let renderer = virtio_gpu::VenusRenderer::new(sinks);
+        let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
+        gpu.set_refresh_hz(cfg.display.refresh_hz);
+        gpu.set_frame_stats(cfg.display.frame_stats.clone());
+        devices.push(Box::new(gpu));
+    } else if let Some(mode) = std::env::var_os(VENUS_ENV) {
+        // The Venus executor (EPIC 20 stage 5a.3): the renderer that answers,
+        // on the host GPU. Diagnostic for the same reason the capture is — an
+        // environment variable, not a profile key — and refused up front on a
+        // host with no device it would expose, rather than attached to answer
+        // a guest's first enumeration with nothing.
+        if mode != "vulkan" {
+            return Err(format!(
+                "{VENUS_ENV}={} is not a Venus renderer this build has; the one there is is \"vulkan\"",
+                mode.to_string_lossy()
+            ));
+        }
+        let host = virtio_gpu::host_vulkan::AshVulkan::load()
+            .map_err(|why| format!("{VENUS_ENV}=vulkan, but {why}"))?;
+        let shown = host
+            .usable_devices()
+            .map_err(|why| format!("{VENUS_ENV}=vulkan, but {why}"))?;
+        for device in &shown {
+            tracing::info!(
+                device = %device.name(),
+                importable_memory_types = format_args!("{:#x}", device.importable),
+                "a Venus guest will see this host Vulkan device"
+            );
+        }
+        tracing::warn!(
+            "attaching the Venus EXECUTING renderer (stage 5a.3): it answers the Vulkan              bring-up — instance, physical devices, device, queues, images — on the host GPU,              and nothing past it: no memory, no submission"
+        );
+        let renderer =
+            virtio_gpu::VenusRenderer::new(virtio_gpu::ExecutorFactory::new(Arc::new(host)));
         let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
         gpu.set_refresh_hz(cfg.display.refresh_hz);
         gpu.set_frame_stats(cfg.display.frame_stats.clone());
@@ -1632,6 +1658,14 @@ mod host_api {
         /// The clock is read last of the small state, as close as possible to
         /// the memory dump it will be restored alongside.
         fn save_machine(&self, cpus: &[X86CpuState], path: &Path) -> Result<String, String> {
+            // Before anything is read or written: a device holding host state
+            // the file cannot carry (a Venus context's host Vulkan objects,
+            // stage 5a.3) refuses the whole snapshot, by name, rather than
+            // letting it be written without that state.
+            let refusals = self.bus.snapshot_refusals();
+            if !refusals.is_empty() {
+                return Err(format!("cannot snapshot this VM: {}", refusals.join("; ")));
+            }
             // Read before the dump, while the numbers still describe the same
             // instant. Never fatal: this is an instrument, and a VM must not
             // fail to suspend because one could not be read.

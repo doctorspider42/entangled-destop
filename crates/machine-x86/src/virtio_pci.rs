@@ -809,6 +809,21 @@ impl VirtioPciBus {
         self.reconcile_shm();
     }
 
+    /// Every function on this bus whose device would refuse a snapshot now,
+    /// each as its own sentence (ADR-0006).
+    pub fn snapshot_refusals(&self) -> Vec<String> {
+        self.slots
+            .iter()
+            .filter_map(|slot| match slot.transport.lock() {
+                Ok(transport) => transport.snapshot_refusal(),
+                Err(_) => Some(format!(
+                    "the virtio-pci transport of device {} is poisoned",
+                    slot.device_number
+                )),
+            })
+            .collect()
+    }
+
     /// Every function on this bus, for a snapshot (ADR-0006).
     ///
     /// The configuration spaces are saved separately, by the bus's `PciRoot`

@@ -2082,3 +2082,66 @@ keeps the watchdog quiet. The wake-up latency of a real doorbell normally
 covers the gap. If a guest is ever seen hanging with `IDLE` up and
 `tail != head`, a bounded park (re-check `tail` every few milliseconds) is the
 cheap fix.
+
+## Amendment, 2026-09-23 — stage 5a.3, the executor
+
+The renderer stops capturing and answers. `crates/virtio-gpu/src/venus/executor/`
+is a `SinkFactory` whose per-ring sink decodes each command with the generated
+protocol, executes it, writes the reply into the guest's reply window and only
+then lets `head` move; `crates/virtio-gpu/src/host_vulkan/` is the host side,
+over `ash` 0.38 loaded at run time (`Entry::load`, nothing linked). It is
+attached with `ENTANGLED_VENUS=vulkan` — diagnostic, an environment variable,
+for the capture's reason — and the run is refused before the guest boots if
+the host has no device the executor would expose.
+
+- **The host is a trait.** `HostVulkan` covers exactly this stage's calls and
+  speaks the generated protocol structures, so the object table, the id rules,
+  every policy and every reply shape are tested against a fake on every host;
+  the `ash` side is the only code that turns a validated value into a driver
+  structure, and it is outside `venus` so that family's only `unsafe` stays in
+  `shmem`. The ~1500-field bridge between the two is generated
+  (`scripts/venus-ash-gen.py`, from the protocol and ash's own definitions).
+- **Object ids** are virglrenderer's rules plus the ones it leaves to the
+  driver: unique per context whatever the type, typed lookups, parents
+  recorded and checked, destruction in dependency order on `vkDestroy*`,
+  context destruction and device reset. Anything wrong is fatal to the context
+  and to the ring, with `head` left on the offending command.
+- **Replies** go into a `HOST3D` blob of the same context, bounded by the
+  window (stricter than vkr, which bounds by the resource), under the blob
+  directory's lock, so a blob destroyed while it is the window is never
+  written again.
+- **What the guest is shown, where it differs from vkr:** CPU devices hidden;
+  `apiVersion` capped at 1.3 in `Properties2` as well as in `Properties`;
+  sparse features reported false (no sparse command exists here, and
+  vulkaninfo enables what it is offered); device extensions limited to what the
+  protocol decodes, which today is none; and the memory policy below.
+- **Memory.** Type indices are the host's. Every type that does not accept an
+  import of our own pages (`vkGetMemoryHostPointerPropertiesEXT` on a
+  `RingPages` allocation, through a throwaway device) loses
+  `HOST_VISIBLE|HOST_COHERENT|HOST_CACHED`; a device without
+  `VK_EXT_external_memory_host`, or left with no coherent host-visible type, is
+  not exposed. On the RTX 2070 (driver 580.88), from the real-GPU test:
+
+  | type | heap | host flags | guest flags |
+  |---|---|---|---|
+  | 0 | 1 | — | — |
+  | 1 | 0 | `DEVICE_LOCAL` | `DEVICE_LOCAL` |
+  | 2 | 0 | `DEVICE_LOCAL` | `DEVICE_LOCAL` |
+  | 3 | 1 | `HOST_VISIBLE\|HOST_COHERENT` | same |
+  | 4 | 1 | `HOST_VISIBLE\|HOST_COHERENT\|HOST_CACHED` | same |
+  | 5 | 2 | `DEVICE_LOCAL\|HOST_VISIBLE\|HOST_COHERENT` (the BAR) | `DEVICE_LOCAL` |
+
+  `memoryTypeBits` importable from host allocations: `0x18`, as the
+  2026-09-23 probe measured by hand.
+- **The capset** now carries the enumerated mask of what the protocol decodes,
+  sentinel set, as virglrenderer does; the "assume everything" override is
+  gone from `run_vm.rs`.
+- **Snapshots** are refused by name while a Venus context holds host Vulkan
+  objects: `VirtioDevice::snapshot_refusal` (default `None`), asked by
+  `MachineBus::snapshot_refusals` before anything is written.
+
+Owed by the next stage: `supports_multiple_timelines` is still false, and
+release Mesa binds every queue to a fence timeline in 1..63 regardless; the
+executor records each queue's `ring_idx`, and `virtio_gpu::fence` needs one FIFO
+per `ring_idx` before `vkQueueSubmit` can retire a guest fence and the capset
+bit can flip. `vkExecuteCommandStreamsMESA` (commands over 8 KiB) is refused.

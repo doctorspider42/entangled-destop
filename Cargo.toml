@@ -108,6 +108,11 @@ libc = "0.2"
 # Runtime dlopen of libvirglrenderer (ADR-0004) — ISC, already in the graph
 # as wgpu's loader.
 libloading = "0.8"
+# The Venus executor's host Vulkan (EPIC 20 stage 5a.3, ADR-0004). MIT OR
+# Apache-2.0, already in the graph through wgpu-hal at this exact version, and
+# loaded at run time (`Entry::load`): nothing links against a Vulkan loader, so
+# a host without one simply cannot offer that renderer.
+ash = "0.38"
 
 # host display (EPIC 7) — portable, built on Windows and Linux alike.
 # wgpu is pinned to 26 because 30 raises the MSRV above workspace rust-version.

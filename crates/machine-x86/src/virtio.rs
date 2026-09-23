@@ -455,6 +455,22 @@ impl VirtioMmioBus {
         }
     }
 
+    /// Every device on this window that would refuse a snapshot now, each
+    /// as its own sentence (ADR-0006). A poisoned transport lock is a refusal
+    /// too: its device cannot be asked.
+    pub fn snapshot_refusals(&self) -> Vec<String> {
+        self.slots
+            .iter()
+            .filter_map(|slot| match slot.transport.lock() {
+                Ok(transport) => transport.snapshot_refusal(),
+                Err(_) => Some(format!(
+                    "the virtio-mmio transport at {:#x} is poisoned",
+                    slot.base
+                )),
+            })
+            .collect()
+    }
+
     /// Every slot on this window, for a snapshot (ADR-0006).
     pub fn save_state(&self) -> Vec<crate::state::SavedVirtioSlot> {
         self.slots

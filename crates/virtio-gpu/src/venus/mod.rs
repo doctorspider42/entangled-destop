@@ -43,18 +43,27 @@
 //!
 //! * [`renderer`] — the [`crate::Renderer3d`] that ties the seven together: it
 //!   advertises the capset, accepts a venus context, decodes the transport
-//!   stream, allocates the ring's pages and starts their service. It executes
-//!   no Vulkan; what it does with the bytes is a [`pump::RingSink`] per ring
-//!   that someone else supplies.
+//!   stream, allocates the ring's pages and starts their service. What it
+//!   does with a ring's bytes is a [`pump::RingSink`] per ring that a
+//!   [`renderer::SinkFactory`] supplies — a capture, or the executor.
+//! * [`protocol`] — the Vulkan half of the protocol, generated from Mesa's own
+//!   generator: a decoder and a reply encoder per command.
+//! * [`executor`] — the sink that answers (stage 5a.3): an object table per
+//!   context, the policies that decide what a guest is shown, and every
+//!   command of the `vulkaninfo` bring-up executed through a
+//!   [`executor::HostVulkan`] trait.
 //!
-//! # What is deliberately *not* here
+//! # Where the host GPU is
 //!
-//! The execution half: an object table, host Vulkan, and the per-command
-//! decoders generated from `vk.xml`. Those need a GPU to be worth anything,
-//! and everything above needs none — which is the whole reason the seam is
-//! drawn here.
+//! Not here. [`executor::HostVulkan`] is a trait, and everything in this
+//! family — the object table, the id rules, the policies, the reply shapes —
+//! is tested against a fake on every host, including Linux CI with no GPU.
+//! The one real implementation, over `ash`, is [`crate::host_vulkan`]: it is
+//! outside this family because every Vulkan call is `unsafe`, and this
+//! family's only `unsafe` stays in [`shmem`].
 
 pub mod capset;
+pub mod executor;
 pub mod protocol;
 pub mod pump;
 pub mod renderer;

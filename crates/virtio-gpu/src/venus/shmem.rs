@@ -42,6 +42,11 @@
 //!   comes from a [`RingLayout`]; see "bounds" below.
 //! * [`Publication`] — the proof that pages are currently in front of a guest.
 //!   Holding one keeps the pages alive; dropping one takes them back down.
+//! * [`RingPages::write_bytes`] / [`RingPages::read_bytes`] — bounded byte
+//!   copies into and out of any host blob, which is how the executor's replies
+//!   reach a guest's reply window (stage 5a.3) without a `&mut [u8]` ever
+//!   being formed over memory the guest can see, and without a second
+//!   `unsafe` anywhere else in the family.
 //!
 //! # The lifetime obligation, and how it is discharged
 //!
@@ -244,6 +249,12 @@ pub enum ShmemError {
         align = CONTROL_WORD_LEN
     )]
     MisalignedExtraWrite { offset: u64, at: u64 },
+
+    #[error(
+        "a {len:#x}-byte copy at offset {offset:#x} does not fit the {size:#x}-byte \
+         resource these pages are"
+    )]
+    BytesOutsideResource { offset: u64, len: u64, size: u64 },
 
     #[error(transparent)]
     Pump(#[from] PumpError),
@@ -741,6 +752,101 @@ impl RingPages {
         };
         slot.store(value, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Copy `src` into these pages at resource offset `offset`: how a Venus
+    /// reply reaches the guest (EPIC 20 stage 5a.3).
+    ///
+    /// A reply window is a range of a host blob the guest named with
+    /// `vkSetReplyCommandStreamMESA`; the caller has already bounded the write
+    /// by that window, and this bounds it again by the resource, so no
+    /// combination of guest numbers can reach past the allocation.
+    ///
+    /// The bytes are stored one [`AtomicU8`] at a time, [`Relaxed`]: the guest
+    /// may be reading (or, if it is hostile, writing) the same bytes right
+    /// now, and a plain `&mut [u8]` over guest-visible memory would be a data
+    /// race. No ordering is needed here because none is promised here: the
+    /// ring worker stores `head` [`SeqCst`](Ordering::SeqCst) only after every
+    /// reply of the batch is written, and that store is what orders these
+    /// bytes before the guest's acquire load of `head` (spec §5).
+    ///
+    /// # Errors
+    ///
+    /// [`ShmemError::BytesOutsideResource`] when `offset + src.len()` passes
+    /// [`resource_len`](Self::resource_len); nothing is written then.
+    pub fn write_bytes(&self, offset: u64, src: &[u8]) -> Result<(), ShmemError> {
+        let base = self.byte_range(offset, src.len())?;
+        // SAFETY: `byte_range` established `base + src.len() <=
+        // self.declared <= self.alloc.size()`, so every byte touched below is
+        // inside our own live allocation and `add(base + i)` stays within one
+        // allocated object for every `i` in `0..src.len()`. `AtomicU8` needs no
+        // alignment beyond a byte. The stores are atomic because the guest may
+        // be touching these bytes concurrently; a racing relaxed atomic store
+        // is defined, a plain write through a slice would not be.
+        unsafe {
+            let base = self.ptr.as_ptr().add(base);
+            for (i, byte) in src.iter().enumerate() {
+                AtomicU8::from_ptr(base.add(i)).store(*byte, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy `dst.len()` bytes out of these pages at resource offset `offset`,
+    /// with the same bounds and the same relaxed atomic loads as
+    /// [`RingBacking::read_buffer`]. The values may be anything a guest wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`ShmemError::BytesOutsideResource`]; `dst` is left as it was.
+    pub fn read_bytes(&self, offset: u64, dst: &mut [u8]) -> Result<(), ShmemError> {
+        let base = self.byte_range(offset, dst.len())?;
+        // SAFETY: as in `write_bytes`: `byte_range` keeps every byte inside
+        // the live allocation, and the loads are relaxed atomics because the
+        // guest may be storing to the same bytes.
+        unsafe {
+            let base = self.ptr.as_ptr().add(base);
+            for (i, slot) in dst.iter_mut().enumerate() {
+                *slot = AtomicU8::from_ptr(base.add(i)).load(Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    /// `offset` as a host index, once `offset + len` is proven inside the
+    /// declared resource.
+    fn byte_range(&self, offset: u64, len: usize) -> Result<usize, ShmemError> {
+        let len64 = len as u64;
+        offset
+            .checked_add(len64)
+            .filter(|end| *end <= self.declared)
+            .and_then(|_| usize::try_from(offset).ok())
+            .ok_or(ShmemError::BytesOutsideResource {
+                offset,
+                len: len64,
+                size: self.declared,
+            })
+    }
+
+    /// A test playing the guest: store a 32-bit word the way the guest's
+    /// driver stores `tail`, through the same accessor the host's own words
+    /// use. Refuses (returns `false`) rather than panicking on a bad offset.
+    #[cfg(test)]
+    pub(crate) fn guest_store_word(&self, offset: u64, value: u32) -> bool {
+        match self.word(offset, Writer::Guest) {
+            Some(word) => {
+                word.store(value, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A test playing the guest: load a 32-bit word (`head`, `status`).
+    #[cfg(test)]
+    pub(crate) fn guest_load_word(&self, offset: u64) -> Option<u32> {
+        self.word(offset, Writer::Guest)
+            .map(|word| word.load(Ordering::SeqCst))
     }
 
     /// One control word as an atomic, or `None` — loudly — if the offset is not

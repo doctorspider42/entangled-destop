@@ -2575,6 +2575,16 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
     /// treated exactly like 3D contexts: the count goes in the file, and a
     /// restored device that finds a non-zero one tells the driver to start
     /// again.
+    /// The renderer's refusal, if it holds host state a snapshot would lose
+    /// (a Venus context's host Vulkan objects). Everything else this device
+    /// owns is either saved or honestly counted — see [`Self::save_device`].
+    fn snapshot_refusal(&self) -> Option<String> {
+        self.three_d
+            .as_ref()
+            .and_then(Gpu3d::snapshot_refusal)
+            .map(|why| format!("virtio-gpu: {why}"))
+    }
+
     fn save_device(&self) -> Vec<u8> {
         let state = crate::save::GpuState {
             events_read: self.events_read,

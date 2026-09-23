@@ -13,6 +13,8 @@ tracing.workspace = true
 virtio-core.workspace = true
 virtio-queue.workspace = true
 vm-memory.workspace = true
+# Host Vulkan for the Venus executor (`host_vulkan`), dlopened at run time.
+ash.workspace = true
 
 # The real 3D renderer (ADR-0004) dlopens libvirglrenderer at runtime; the
 # loader itself is the only build-time dependency, and only on Linux.
