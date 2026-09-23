@@ -1912,3 +1912,68 @@ eliminate is eliminated against nothing.
 - **One sink for all rings**, so a multi-ring capture interleaves into soup.
 - **`allow_vk_wait_syncs`**, which belongs with the threading model rather than
   with the capset that advertises it.
+
+## Amendment, 2026-09-23 — the guest can see NVIDIA Vulkan memory under WHP
+
+Venus maps host `VkDeviceMemory` straight into guest-physical space. On KVM
+that works because KVM maps any host VA; on WHP nobody had measured whether
+memory the NVIDIA driver owns, or has imported, survives `WHvMapGpaRange` with
+coherent data both ways. Everything in phase 5 that touches memory rested on
+that, so it was measured before anything was built on it
+(`F:\VMs\Entangled\probes\host-visible-memory\`, RTX 2070, driver 580.88,
+Windows 10 Home).
+
+### It works, in every case tried
+
+Two candidates, 2 MiB each, one row per memory type and order:
+
+- **A — the driver's memory:** `vkAllocateMemory` + `vkMapMemory`, then
+  `WHvMapGpaRange` of that pointer, for every `HOST_VISIBLE` type (3, 4, and
+  the 214 MiB `DEVICE_LOCAL|HOST_VISIBLE` type 5).
+- **B — our pages, imported:** `VirtualAlloc`, then
+  `VK_EXT_external_memory_host`. Only types 3 and 4 accept a host pointer
+  (`memoryTypeBits = 0x18`, alignment 4 KiB). Both orders were tried: import
+  then map, and map then import.
+
+Every row: allocation `VK_SUCCESS`, mapping `S_OK`, and host-CPU → guest,
+GPU → guest, guest → GPU and unmap/remap (a different allocation at the same
+GPA, never stale) all correct. Each step used its own pattern, and a stale
+value would have been named as such. This held over six full runs, with the
+guest's caches both disabled and enabled, and I reproduced it independently.
+
+### What differs is speed, and the type decides it
+
+Guest access, in TSC ticks per dword (plain guest RAM ≈ 2.2):
+
+| backing | guest read | guest store | note |
+|---|---|---|---|
+| A, type 4 (cached) | ≈ 2–3 | ≈ 2–3 | full speed |
+| B, type 3 or 4 (our pages) | ≈ 2–6 | ≈ 2–5 | full speed, even as type 3 |
+| A, type 3 (driver WC) | ≈ 300–500 | ≈ 180–380 | host stores 3–5: **write-combining is lost in the guest** |
+| A, type 5 (BAR) | ≈ 2000 | ≈ 30–200 | reads as slow as the host's own; one run landed in system memory |
+
+The guest's own cache settings changed nothing. On this host the host-side
+mapping decides the memory type.
+
+`WHvMapGpaRange` of 2 MiB takes a median of 24–39 µs, and `WHvUnmapGpaRange`
+55–116 µs.
+
+### Consequences for the renderer
+
+- **Guest-visible memory of types 3 and 4 is backed by our own pages,
+  imported.** That is the fast row, and the VMM owns the pages and their
+  lifetime — which is also what save/restore (ADR-0006) and the guest-untrusted
+  rules want: freeing a guest's allocation can never leave the partition
+  mapping a page the driver has recycled.
+- **Type 5 is the open question.** It cannot be imported. Mapped from the
+  driver it is correct but slow, and its placement is not stable. Either the
+  renderer hides it from the guest (advertising a subset of memory properties
+  is legitimate), or it forwards it for write-only uploads. That is decided
+  with a real workload, not now.
+- **Mappings are not free.** At tens of µs each, the renderer maps whole
+  `VkDeviceMemory` objects, never sub-ranges per access. A guest allocator that
+  suballocates, as every serious one does, keeps the count low.
+
+Untested: the driver migrating type 5 memory under pressure while it is
+mapped, allocations much larger than 2 MiB, and a Linux guest's own PAT
+choices.
