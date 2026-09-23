@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -106,6 +107,41 @@ const VENUS_WINDOW_BYTES: u64 = 256 << 20;
 /// is how a VM is pointed at it without `LD_LIBRARY_PATH` games that would
 /// also re-point every other library the process loads.
 pub const LIB_ENV: &str = "ENTANGLED_VIRGL_LIB";
+
+/// The same, for a path this *program* worked out rather than a person: the
+/// library `entangled fetch virglrenderer` put in the verified cache.
+///
+/// Two variables rather than one, because the right answer to "this path did
+/// not load" differs by who chose it. A human who set [`LIB_ENV`] gets a hard
+/// error, because silently using a different library is how a Venus run
+/// becomes a classic-virgl run nobody notices. A path we picked ourselves is a
+/// *preference*: a cached library that will not open — no Vulkan loader on
+/// this host, a soname the distribution does not carry — must fall through to
+/// whatever the system has rather than take 3D down with it. The host that
+/// makes this concrete is one with no `libvulkan.so.1`: a Venus-capable
+/// virglrenderer lists it in `DT_NEEDED` and will not `dlopen` at all there,
+/// while the distribution's own 0.9.x has no Vulkan in it and works fine.
+pub const LIB_DEFAULT_ENV: &str = "ENTANGLED_VIRGL_LIB_DEFAULT";
+
+/// Where virglrenderer looks for the Venus subprocess, and what this module
+/// sets when it can work the answer out.
+///
+/// The path is compiled into the library at build time as an *absolute* path
+/// under its own `--prefix`, which is fine for a library built on the machine
+/// that uses it and wrong for one that was downloaded: the prefix is then a
+/// directory on a CI runner. Rather than make the artifact unpackageable, the
+/// loader derives the path from the library it actually opened and exports it
+/// here — an override the library reads before falling back to what it was
+/// built with. Never set when the operator already set it, and never guessed:
+/// if the file is not there, the variable is left alone and virglrenderer's own
+/// path gets its chance.
+pub const RENDER_SERVER_ENV: &str = "RENDER_SERVER_EXEC_PATH";
+
+/// The render server's name and its place under an install prefix
+/// (`<prefix>/libexec/virgl_render_server`, beside
+/// `<prefix>/lib/<triple>/libvirglrenderer.so.1`).
+const RENDER_SERVER_FILE: &str = "virgl_render_server";
+const LIBEXEC_DIR: &str = "libexec";
 
 /// `VIRTIO_GPU_CAPSET_VIRGL` / `VIRTIO_GPU_CAPSET_VIRGL2`.
 const CAPSET_VIRGL: u32 = 1;
@@ -524,14 +560,78 @@ impl VirglRenderer {
         result
     }
 
+    /// Points [`RENDER_SERVER_ENV`] at the Venus subprocess shipped beside
+    /// `lib_path`, if there is one and the operator has not chosen otherwise.
+    ///
+    /// Called with the path we just `dlopen`ed, which is the only moment this
+    /// is knowable: the library's own compiled-in path belongs to whichever
+    /// prefix it was *built* under, and a downloaded artifact was built
+    /// somewhere else entirely.
+    fn export_render_server(lib_path: &Path) {
+        if std::env::var_os(RENDER_SERVER_ENV).is_some_and(|v| !v.is_empty()) {
+            return;
+        }
+        let Some(server) = Self::render_server_beside(lib_path) else {
+            return;
+        };
+        tracing::info!(
+            path = %server.display(),
+            "pointing {RENDER_SERVER_ENV} at the render server shipped with this library"
+        );
+        // SAFETY (as a matter of program logic rather than memory): this runs
+        // before `virgl_renderer_init` reads the variable, on the thread that
+        // is about to load the renderer, and the process is ours.
+        std::env::set_var(RENDER_SERVER_ENV, &server);
+    }
+
+    /// The Venus subprocess belonging to the library at `lib_path`, or `None`
+    /// when there is none to be sure about — a distribution that lays its tree
+    /// out differently keeps virglrenderer's own compiled-in answer rather than
+    /// getting a wrong one from us.
+    ///
+    /// Two layouts count as "belonging", because this project produces both:
+    ///
+    /// * **beside the library**, which is what the verified cache holds —
+    ///   `entangled fetch virglrenderer` downloads two files into one
+    ///   directory, and there is no prefix to speak of;
+    /// * **under a shared prefix** (`<prefix>/libexec/virgl_render_server` for
+    ///   `<prefix>/lib/<triple>/libvirglrenderer.so.1`), which is what
+    ///   `guest/virglrenderer/build-virglrenderer.sh` installs and what a
+    ///   distribution package looks like.
+    fn render_server_beside(lib_path: &Path) -> Option<PathBuf> {
+        let lib_dir = lib_path.parent()?;
+        let sibling = lib_dir.join(RENDER_SERVER_FILE);
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+        // Walk up past `<triple>` and `lib`, but accept a prefix with no
+        // triple component too (`<prefix>/lib/libvirglrenderer.so.1`).
+        let mut prefix = Some(lib_dir);
+        for _ in 0..2 {
+            let candidate = prefix?.join(LIBEXEC_DIR).join(RENDER_SERVER_FILE);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            prefix = prefix?.parent();
+        }
+        let candidate = prefix?.join(LIBEXEC_DIR).join(RENDER_SERVER_FILE);
+        candidate.is_file().then_some(candidate)
+    }
+
     fn load_inner() -> Result<Self, String> {
         // An explicit path first: the Venus-capable build is packaged by no
         // distribution we target and lives in a cache directory (see
         // `LIB_ENV`). Then the sonames, which is where a distribution's own
         // library is.
         let explicit = std::env::var(LIB_ENV).ok().filter(|p| !p.is_empty());
+        let preferred = std::env::var(LIB_DEFAULT_ENV)
+            .ok()
+            .filter(|p| !p.is_empty());
         let mut candidates: Vec<String> = Vec::new();
         if let Some(path) = &explicit {
+            candidates.push(path.clone());
+        }
+        if let Some(path) = &preferred {
             candidates.push(path.clone());
         }
         candidates.push("libvirglrenderer.so.1".into());
@@ -545,6 +645,14 @@ impl VirglRenderer {
                 Ok(lib) => {
                     if explicit.as_deref() == Some(name.as_str()) {
                         tracing::info!(path = %name, "{LIB_ENV} names the virglrenderer to load");
+                    } else if preferred.as_deref() == Some(name.as_str()) {
+                        tracing::info!(path = %name, "loading the virglrenderer from the cache");
+                    }
+                    // Only a *path* tells us where the Venus subprocess lives;
+                    // a bare soname was resolved by the loader's search rules
+                    // and we would be guessing at a prefix.
+                    if name.contains('/') {
+                        Self::export_render_server(Path::new(name.as_str()));
                     }
                     opened = Some(lib);
                     break;
@@ -554,6 +662,16 @@ impl VirglRenderer {
                 // system library: that would silently drop Venus.
                 Err(error) if explicit.as_deref() == Some(name.as_str()) => {
                     return Err(format!("{LIB_ENV}={name} could not be loaded: {error}"));
+                }
+                // A path *we* chose is a preference, not an instruction — see
+                // [`LIB_DEFAULT_ENV`]. Say so once and carry on down the list.
+                Err(error) if preferred.as_deref() == Some(name.as_str()) => {
+                    tracing::warn!(
+                        path = %name,
+                        %error,
+                        "the cached virglrenderer would not load; falling back to this \
+                         host's own library, which may be older and may not serve Venus"
+                    );
                 }
                 Err(_) => (),
             }
@@ -1610,5 +1728,105 @@ impl Drop for VirglRenderer {
                 RENDERER_LIVE.store(false, Ordering::SeqCst);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A temporary directory that cleans itself up, so these tests need no
+    /// dev-dependency for one.
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "entangled-virgl-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+
+        /// Creates `relative` as an empty file, parents included.
+        fn touch(&self, relative: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(&path, b"").expect("write");
+            path
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The layout `guest/virglrenderer/build-virglrenderer.sh` installs, and the
+    /// one a published artifact unpacks to.
+    #[test]
+    fn the_render_server_is_found_beside_a_multiarch_library() {
+        let tree = TempTree::new("multiarch");
+        let lib = tree.touch("lib/x86_64-linux-gnu/libvirglrenderer.so.1");
+        let server = tree.touch("libexec/virgl_render_server");
+        assert_eq!(
+            VirglRenderer::render_server_beside(&lib),
+            Some(server),
+            "a library under lib/<triple>/ must find the server two levels up"
+        );
+    }
+
+    /// A prefix with no triple component, which is what a hand-rolled
+    /// `--prefix` build can produce.
+    #[test]
+    fn the_render_server_is_found_beside_a_plain_lib_directory() {
+        let tree = TempTree::new("plainlib");
+        let lib = tree.touch("lib/libvirglrenderer.so.1");
+        let server = tree.touch("libexec/virgl_render_server");
+        assert_eq!(VirglRenderer::render_server_beside(&lib), Some(server));
+    }
+
+    /// The case that must stay quiet: a distribution that lays its tree out
+    /// some other way keeps virglrenderer's own compiled-in answer, because a
+    /// wrong `RENDER_SERVER_EXEC_PATH` is worse than none. `export_render_server`
+    /// sets nothing when this is `None`.
+    #[test]
+    fn a_library_with_no_server_beside_it_yields_nothing() {
+        let tree = TempTree::new("noserver");
+        let lib = tree.touch("lib/x86_64-linux-gnu/libvirglrenderer.so.1");
+        assert_eq!(VirglRenderer::render_server_beside(&lib), None);
+    }
+
+    /// The layout the verified cache has: `entangled fetch virglrenderer` puts
+    /// both files in one directory, with no prefix around them.
+    #[test]
+    fn the_render_server_is_found_beside_the_library_itself() {
+        let tree = TempTree::new("sibling");
+        let lib = tree.touch("libvirglrenderer.so.1");
+        let server = tree.touch("virgl_render_server");
+        assert_eq!(VirglRenderer::render_server_beside(&lib), Some(server));
+    }
+
+    /// A bare soname never reaches this code (the loader resolved it and we do
+    /// not know the prefix), but the guard is cheap and the behaviour should be
+    /// stated: no parent, no answer.
+    #[test]
+    fn a_bare_soname_yields_nothing() {
+        assert_eq!(
+            VirglRenderer::render_server_beside(Path::new("libvirglrenderer.so.1")),
+            None
+        );
+    }
+
+    /// The two environment variables mean different things, and the difference
+    /// is the whole point of there being two (see [`LIB_DEFAULT_ENV`]).
+    #[test]
+    fn the_two_library_variables_are_distinct() {
+        assert_ne!(LIB_ENV, LIB_DEFAULT_ENV);
+        assert_eq!(RENDER_SERVER_ENV, "RENDER_SERVER_EXEC_PATH");
     }
 }

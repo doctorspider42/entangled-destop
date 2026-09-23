@@ -6,11 +6,14 @@
 //! above `vmm_core::lifecycle` is shared code, so what this file is really for
 //! is the two places where the backends genuinely differ:
 //!
-//! * **the reset itself.** KVM writes the architectural state back by hand;
-//!   WHP deletes the virtual processor and creates it again, because a VP that
-//!   `WHvCreateVirtualProcessor` just made *is* in the reset state, including
-//!   an application processor's wait-for-startup suspension — which ADR-0002
-//!   phase 4 says a host must not disturb by any other means.
+//! * **the reset itself.** KVM writes architectural reset values back by hand.
+//!   WHP cannot: an application processor's wait-for-startup suspension has no
+//!   public reset value, and ADR-0002 phase 4 says a host must not disturb it
+//!   by any other means. So that backend *remembers* the state
+//!   `WHvCreateVirtualProcessor` produced — read back before the guest ever
+//!   ran — and writes it again. (It used to delete the VP and create a new one
+//!   instead, which reads better and does not work on every Windows: see
+//!   `WhpVcpu::reset_arch_state`.)
 //! * **how a guest reboot arrives.** On KVM a triple fault reaches the run loop
 //!   as `KVM_EXIT_SHUTDOWN`; on WHP, with local APIC emulation on, it is
 //!   absorbed and the VP parks. So on this host a reboot has to come through a
@@ -110,9 +113,14 @@ impl MachineLifecycle for WhpMachine {
     }
 }
 
+/// Builds and starts a single-processor VM with the lifecycle seam attached.
+fn start(extra_cmdline: &str) -> Option<Fixture> {
+    start_with(&MACHINE, extra_cmdline)
+}
+
 /// Builds and starts a VM with the lifecycle seam attached, or `None` when this
 /// machine cannot run one (no WHP, no artifacts).
-fn start(extra_cmdline: &str) -> Option<Fixture> {
+fn start_with(machine: &'static vmm_core::MachineConfig, extra_cmdline: &str) -> Option<Fixture> {
     let hv = match WhpHypervisor::open() {
         Ok(hv) => hv,
         Err(e) => {
@@ -132,12 +140,12 @@ fn start(extra_cmdline: &str) -> Option<Fixture> {
     };
     eprintln!("booting the {which} kernel: {}", kernel.display());
 
-    let mut partition = WhpPartition::with_options(&hv, &MACHINE, WhpOptions::for_guest())
+    let mut partition = WhpPartition::with_options(&hv, machine, WhpOptions::for_guest())
         .expect("WHP partition with a local APIC");
-    machine_x86::mptable::write(partition.memory(), MACHINE.vcpu_count).unwrap();
-    machine_x86::acpi::write(partition.memory(), MACHINE.vcpu_count).unwrap();
+    machine_x86::mptable::write(partition.memory(), machine.vcpu_count).unwrap();
+    machine_x86::acpi::write(partition.memory(), machine.vcpu_count).unwrap();
 
-    let irqchip = UserspaceIrqChip::new(partition.interrupt_delivery(), MACHINE.vcpu_count)
+    let irqchip = UserspaceIrqChip::new(partition.interrupt_delivery(), machine.vcpu_count)
         .expect("userspace irqchip");
     let capture = Capture::default();
     let serial = SerialConsole::with_trigger(irqchip.serial_line(), Box::new(capture.clone()));
@@ -145,7 +153,7 @@ fn start(extra_cmdline: &str) -> Option<Fixture> {
 
     let mem = Arc::new(partition.memory().clone());
     let quiesce = Quiesce::new();
-    let mem_size = MACHINE.memory_mib << 20;
+    let mem_size = machine.memory_mib << 20;
     // `reboot=k` on purpose: on this host it is the *keyboard controller pulse*
     // that reaches the machine, not the triple fault WHP would absorb.
     let boot = BootConfig {
@@ -164,13 +172,13 @@ fn start(extra_cmdline: &str) -> Option<Fixture> {
         x86_boot::setup_boot_regs(vcpu, loaded.entry, loaded.boot_params_addr).unwrap();
     }
 
-    let lifecycle = Lifecycle::new(MACHINE.vcpu_count);
+    let lifecycle = Lifecycle::new(machine.vcpu_count);
     bus.set_quiesce(Arc::clone(&quiesce));
     lifecycle.attach_machine(Arc::new(WhpMachine {
         bus: bus.clone(),
         mem,
         quiesce,
-        vcpus: MACHINE.vcpu_count,
+        vcpus: machine.vcpu_count,
         boot,
         mem_size,
         entry: Mutex::new((loaded.entry, loaded.boot_params_addr)),
@@ -279,8 +287,7 @@ fn pause_freezes_the_guest_and_resume_continues_the_same_boot() {
     vm.stop();
 }
 
-/// A host-initiated reset reboots the machine in place, twice in a row —
-/// which on this host means deleting and re-creating the virtual processor.
+/// A host-initiated reset reboots the machine in place, twice in a row.
 #[test]
 fn a_host_reset_reboots_the_guest_in_place_twice() {
     let _guard = whp_guard();
@@ -351,4 +358,72 @@ fn a_guest_initiated_reboot_comes_back_twice() {
         tail(&text, 40)
     );
     assert!(resets >= 2, "resets: {resets}");
+}
+
+/// The application processor comes back too.
+///
+/// This is the half of a WHP reset that the single-processor tests above cannot
+/// see. An AP spends its whole life blocked inside `WHvRunVirtualProcessor`
+/// until the guest's INIT/SIPI wakes it, and what decides whether it is
+/// blocked is WHP's internal activity word — not a register any of this code
+/// writes deliberately. A reset that returns the BSP correctly and leaves an AP
+/// *runnable* does not fail loudly: the guest reboots and quietly comes back on
+/// one CPU, exactly the failure `whp_smp.rs` exists to name. So the assertion
+/// is the kernel's own count, twice: once for the first boot and once after the
+/// reset.
+#[test]
+fn an_smp_guest_comes_back_from_a_host_reset_with_its_ap() {
+    const SMP_MACHINE: vmm_core::MachineConfig = vmm_core::MachineConfig {
+        memory_mib: 512,
+        vcpu_count: 2,
+    };
+    /// The line `whp_smp.rs` asserts on, for the same reason.
+    const SMP_MARKER: &str = "smpboot: Total of 2 processors activated";
+
+    let _guard = whp_guard();
+    // The heartbeat probe, for the same reason the host-reset test above wants
+    // it: without it this init reboots itself the moment it is ready, and the
+    // only reset in this test has to be the one it asks for.
+    let Some(vm) = start_with(&SMP_MACHINE, "entangled.heartbeat=100") else {
+        return;
+    };
+    // Both markers before resetting, and the *ready* one is what to wait on:
+    // this kernel counts its processors at 0.2 s and reaches `/init` at 3 s, so
+    // a reset triggered on the SMP line alone lands mid-boot and the first boot
+    // never gets as far as saying it was ready.
+    if vm.wait_for(GUEST_READY_MARKER, 1, BOOT_DEADLINE) == 0 {
+        let text = vm.stop();
+        panic!("no {GUEST_READY_MARKER}; serial tail:\n{}", tail(&text, 40));
+    }
+    if vm.count(SMP_MARKER) == 0 {
+        let text = vm.stop();
+        panic!(
+            "the first boot never brought its AP up (looking for {SMP_MARKER:?}); \
+             serial tail:\n{}",
+            tail(&text, 40)
+        );
+    }
+
+    let started = Instant::now();
+    vm.lifecycle.reset().expect("reset");
+    assert_eq!(vm.lifecycle.state(), RunState::Running);
+    assert_eq!(vm.lifecycle.resets(), 1);
+    eprintln!("reset acknowledged in {:?}", started.elapsed());
+
+    let booted = vm.wait_for(GUEST_READY_MARKER, 2, BOOT_DEADLINE);
+    let smp = vm.wait_for(SMP_MARKER, 2, STEP);
+    let text = vm.stop();
+    assert_eq!(
+        booted,
+        2,
+        "expected two boots (one plus the reset), saw {booted}; serial tail:\n{}",
+        tail(&text, 40)
+    );
+    assert_eq!(
+        smp,
+        2,
+        "the guest came back from the reset without its application processor \
+         ({smp} occurrences of {SMP_MARKER:?}); serial tail:\n{}",
+        tail(&text, 60)
+    );
 }

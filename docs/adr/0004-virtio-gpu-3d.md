@@ -1573,3 +1573,342 @@ is set.
    find it. Raising it is a one-constant change (KVM's slot limit is far
    higher), but the honest move is to measure a real application first and set
    it from that rather than from a guess.
+
+## Amendment, 2026-09-16 — the renderer becomes an artifact we publish
+
+Every amendment before this one asked what Venus *could* do on a host that had
+built virglrenderer by hand. This one is about the hosts that have not, which is
+all of them: `entangled fetch virglrenderer` now downloads a Venus-capable
+renderer the way `fetch firmware` and `fetch bootstrap-kernel` already download
+theirs, and `doctor` reports what a host actually has.
+
+### What was missing, stated plainly
+
+Nothing shipped a renderer, on any surface. `entangled fetch` knew three
+targets and none was this; `installer/entangled.iss` carried two executables,
+an icon, three text files and `CLOUDHV.fd`; the WSL engine installer
+(`control_api::wsl::install_script`) copies exactly one file, the `entangled`
+binary, so the "WSL (KVM)" backend the manager advertises as *the one that can
+do 3D* installed nothing that makes 3D possible. `doctor` said nothing about 3D
+at all, the manager's 3D checkbox was gated only on `is_linux_kvm()`, and the
+error a user finally got at VM start named `guest/virglrenderer/build-virglrenderer.sh`
+— a path inside a source checkout that an installed user does not have.
+
+That is the same shape as the three shipped-product bugs this project already
+records: a firmware the installer never carried, a Linux engine it never
+shipped, a pinned digest no release served.
+
+### The two things that had to change in the loader first
+
+Publishing a prebuilt `.so` is not just a matter of uploading one.
+
+**The render server's path is compiled in, and absolute.** Venus in
+virglrenderer 1.1 exists only behind `VIRGL_RENDERER_RENDER_SERVER`, and the
+library `fork`/`exec`s `virgl_render_server` from a path fixed at build time
+under its own `--prefix`. For a downloaded artifact that is a directory on a CI
+runner, so Venus would degrade — quietly, to classic virgl with a warning,
+which is the failure mode that survives a release because nothing crashes.
+`VirglRenderer` now derives the path from the library it actually opened and
+exports `RENDER_SERVER_EXEC_PATH`, unless the operator set it. Measured rather
+than assumed: with the build's original prefix moved away so the compiled-in
+path is dead, `venus_host.rs` still passes from a relocated tree — and the
+negative control, the same tree with no `virgl_render_server` in it, skips with
+"Venus is advertised but a venus context will not start".
+
+**A library we chose is a preference, not an instruction.** There are now two
+variables. `ENTANGLED_VIRGL_LIB` is a person's, and a path that will not open
+is still a hard error, because silently loading a different library is how a
+Venus run becomes a classic-virgl run nobody notices.
+`ENTANGLED_VIRGL_LIB_DEFAULT` is the one `entangled run` sets from the cache,
+and a path that will not open falls through to the system library. The host
+that makes the difference real has no `libvulkan.so.1`: a Venus build lists it
+in `DT_NEEDED` and will not `dlopen` at all there, while the distribution's own
+0.9.x does not link Vulkan and works fine. Preferring our download must not
+take 3D away from somebody who had it.
+
+### The ABI question, and why it turned out to be smaller than it looked
+
+A published binary carries a glibc floor, which the firmware and the kernel do
+not have to think about — both are flat images that link nothing. Measured on
+the 1.1.0 build: the library and the render server each need at most
+**GLIBC_2.34**, and their only *versioned* symbol requirements come from `libc`
+and `libm` — nothing versioned from libepoxy, libdrm, libgbm or libvulkan,
+which are plain soname matches.
+
+The floor is therefore one number, and it is a number this project had already
+chosen: `release.yml` builds the Linux engine on `ubuntu-22.04`, so
+`.github/workflows/virglrenderer.yml` does too. GLIBC_2.34 covers Ubuntu 22.04+,
+Debian 12+ and Fedora 35+, and excludes Ubuntu 20.04 and Debian 11 — which the
+Linux engine already excluded. The renderer narrows nothing.
+
+### What a user needs on their own host
+
+Only runtime libraries, all present on any desktop install: `libepoxy.so.0`,
+`libdrm.so.2`, `libgbm.so.1`, `libvulkan.so.1`, `libm`, `libc`. The `-dev`
+packages and meson/ninja that `build-virglrenderer.sh` wants are a developer's
+problem and stay one.
+
+### Still not done
+
+- **The pin has no release behind it.** `guest/virglrenderer/pinned.toml`
+  carries placeholder digests and a note saying so; a fetch answers 404 with
+  the workflow's name in it. Running `.github/workflows/virglrenderer.yml` once
+  and committing the block it prints is what turns this on, and only a push can
+  do that.
+- **Windows gets nothing from this.** The artifact is a Linux `.so` and only
+  the WSL engine can load it; `fetch virglrenderer` on Windows downloads bytes
+  that host cannot use. Driving the fetch *inside* WSL from the manager is the
+  obvious follow-up, and is not done.
+- **The manager still gates its 3D checkbox on the backend alone**, not on
+  whether a renderer exists. `doctor` now knows; the GUI does not.
+
+## Amendment, 2026-09-16 — what a Windows host can actually share with a renderer
+
+The Windows 3D plan in this ADR has always been one sentence ("virglrenderer
+built for Windows on ANGLE"). Two reconnaissance passes replaced it with
+measurements, and the conclusion is different from the sentence.
+
+### ANGLE is not the way in
+
+virglrenderer *does* have a Windows host target — `with_host_windows` in
+`meson.build`, a `mman_win32.c` shim, and `have_egl = true` forced for Windows
+and Darwin. It looks supported until you read how upstream builds it:
+
+```
+--cross-file=.gitlab-ci/x86_64-w64-mingw32 -Dplatforms= -Dtests=false
+                                            -Drender-server=false -Dvenus=false
+```
+
+`-Dplatforms=` is **empty**: no EGL, no GLX, no renderer backend at all. It is a
+compile smoke test, and the job carrying it is marked `FIXME: ... turned off`.
+Meanwhile `vrend_winsys_egl.c` — the only EGL winsys there is — is written
+around gbm (ten `#ifdef ENABLE_GBM` sites) and `ENABLE_GBM` is never set on
+Windows, and its surfaceless path asks for `EGL_PLATFORM_SURFACELESS_MESA`,
+which ANGLE does not implement. So "build virglrenderer for Windows against
+ANGLE" is not a configuration; it is writing a winsys backend for a shape
+nobody has ever run, in C we do not own, for classic VirGL only.
+
+### The renderer cannot be remote, for a reason that is not about transport
+
+`RemoteRenderer` already runs the renderer in another process and its transport
+is abstracted (a `socketpair` on Unix, a duplex named pipe on Windows), its
+protocol is portable and tested, and guest memory never crosses it — only
+bytes. Moving that transport to TCP, and the renderer to a Linux box or WSL,
+therefore looks cheap. It is cheap. It also cannot serve Venus, and the reason
+is structural rather than incidental: the host-visible window is *host pages in
+the VMM's address space*, and a pointer another process hands back names
+nothing there. `remote::client` already withholds the window for exactly this,
+which is why an isolated renderer reports `host_visible_bytes=0` while still
+advertising the venus capset.
+
+Measured anyway, because the transport question was worth pricing
+(Windows → WSL, this machine): **684 µs** per call/reply over the VM's own
+address, **29.4 ms** to move a 1080p frame, a ~34 fps ceiling from the readback
+alone. Over `127.0.0.1` it is **50 ms** per call — WSL2's localhost forwarding
+is a userspace relay and is 73× worse than the direct address, which is a trap
+worth knowing before anybody benchmarks anything across that boundary.
+
+### What Windows *can* do, measured
+
+The interesting design is therefore not a port of virglrenderer at all: it is a
+native Venus decoder against the host's own Vulkan, in a sandboxed process,
+sharing one image with the VMM. Its riskiest assumption — that a frame can go
+from the decoder to the presenter without passing through the CPU — is now
+tested on this machine (NVIDIA RTX 2070, driver `0x91160000`, Vulkan 1.4.312).
+The probe is kept with the VM directory; its four findings:
+
+1. Every extension the design needs is present: `VK_KHR_external_memory`,
+   `..._win32`, `VK_KHR_external_semaphore`, `..._win32`,
+   `VK_KHR_dedicated_allocation`, `VK_KHR_timeline_semaphore`.
+2. `B8G8R8A8_UNORM`, `OPTIMAL`, as `OPAQUE_WIN32`: exportable **and**
+   importable, and not dedicated-only.
+3. An image exported on one device and imported on another reads back the
+   producer's pixels exactly.
+4. **Across a real process boundary** — a second process, its own instance,
+   device and queue, opening the memory by name — the same. `SHARED ACROSS
+   PROCESSES`.
+
+Costs, 1080p:
+
+| | per frame | ceiling |
+|---|---|---|
+| produce into the shared image (no CPU copy) | 0.070 ms | ~14 300 fps |
+| copy the same frame out to host memory | 0.740 ms | ~1 350 fps |
+
+Sharing is 10.6× cheaper — **and both numbers are irrelevant**, which is the
+finding that matters. The guest desktop measured on this host runs at 5.4 fps,
+a 185 ms frame; a local readback is 0.4 % of that. Zero-copy scanout (VEN-2005)
+is therefore *not* the thing to build first and was never the risk. The frames
+go somewhere else entirely, and on a Windows host that somewhere is the
+decoder that does not exist yet.
+
+Two traps this probe cost, recorded so the next one does not pay them:
+
+- A named export with `dwAccess = 0` produces a handle nothing may open, and
+  the import fails as `ERROR_OUT_OF_DEVICE_MEMORY` — an error that says nothing
+  about access rights. `GENERIC_ALL` is what a shared render target wants, and a
+  sandboxed decoder will want a deliberate ACL rather than the default.
+- The first run of the probe reported "NOT shared" because it cleared to 0.5 and
+  expected 128 where the GPU produced 127. A one-bit rounding disagreement reads
+  exactly like a failed mechanism; clear to an exact `k/255`.
+
+### The presentation layer closes the path
+
+wgpu consumes the shared image, measured the same day. The route is entirely
+below wgpu's public API and every step of it exists:
+
+1. `Features::VULKAN_EXTERNAL_MEMORY_WIN32` — wgpu-hal already enables
+   `VK_KHR_external_memory_win32` when the adapter has it, and exposes the fact
+   as a feature, so no bring-your-own-device is needed;
+2. `Device::as_hal::<Vulkan>()` for the raw `ash::Device`;
+3. import the named memory and bind an image, exactly as the raw probe does;
+4. `wgpu_hal::vulkan::Device::texture_from_raw` — with a **drop callback**, or
+   wgpu-hal takes ownership of the image and destroys it without knowing about
+   the memory imported behind it;
+5. `Device::create_texture_from_hal::<Vulkan>()` for a real `wgpu::Texture`.
+
+In a separate process from the producer, wgpu's own command encoder then read
+back the exact pixels the producer cleared:
+
+```
+WGPU: adapter NVIDIA GeForce RTX 2070 (Vulkan)
+WGPU: device opened with VULKAN_EXTERNAL_MEMORY_WIN32
+WGPU: imported the shared memory onto wgpu's Vulkan device
+WGPU: it is now a wgpu::Texture
+WGPU: read BGRA [224, 160, 64, 255] back through wgpu ->
+      THE PRESENTATION LAYER SEES THE PRODUCER'S PIXELS
+```
+
+The `copy_texture_to_buffer` in that last line is the *proof*, not the design:
+it exists so a CPU-side assertion is possible. A real presenter samples the
+texture into the surface and never touches host memory at all.
+
+So the whole presentation path for a Windows host with an out-of-process
+renderer is now demonstrated end to end, and the `Backends::VULKAN` hint is
+load-bearing — wgpu prefers DX12 on this host, and a DX12 device cannot import
+a Vulkan `OPAQUE_WIN32` handle.
+
+### Still untested
+
+- **External semaphores in anger.** The extension is present; the decoder/
+  presenter handshake is a design item, not a measured one.
+- Everything above the boundary: the decoder itself, which is the whole cost.
+
+## Amendment, 2026-09-17 — EPIC 20 phase 4: the transport, and the first bytes a real guest sent
+
+Phase 3 made Venus render on a Linux host with virglrenderer doing the Vulkan.
+This phase builds the half we cannot borrow: **our own** implementation of
+everything a Venus guest touches before a single Vulkan command is executed —
+the capset it reads to decide whether to load at all, the byte primitives, the
+ten transport commands, the command ring's layout and the pump that drains it.
+It executes no Vulkan. That seam is the point: the parts a malicious guest can
+reach are pure logic over bytes, so they are tested on every host, including
+hosts with no GPU.
+
+### What is here
+
+`crates/virtio-gpu/src/venus/`, seven modules, ~300 tests:
+
+| Module | What it owns |
+|---|---|
+| `capset` | The 160 bytes a guest reads before it will speak to us |
+| `wire` | Decoder/encoder primitives: little-endian, 4-byte granular, no length field anywhere |
+| `transport` | The ten commands that arrive on the context stream and create the ring |
+| `ring` | The five regions of a ring the guest proposes and we validate |
+| `shmem` | The host pages the ring lives in — the only `unsafe` in the family |
+| `pump` | The head/tail protocol, and the shadow copy that makes decoding safe while the guest writes |
+| `renderer` | The `Renderer3d` that ties them together, behind `ENTANGLED_VENUS_CAPTURE` |
+
+The renderer is a diagnostic stage behind an environment variable rather than a
+profile key, for the same reason `ENTANGLED_GPU_FENCES` is: a `[display]` key
+would be inherited by every profile, the manager and the installer's tests, for
+something the next phase deletes.
+
+`capset` and `ring` were additionally mutation-tested, because a test suite
+over a byte layout is the easiest kind to write vacuously — every assertion
+passes and every field is off by four.
+
+### The bytes
+
+All of those tests encode what we believe the protocol to be and decode it
+again. That proves self-consistency and nothing else: a field misread the same
+way twice round-trips perfectly. So the acceptance for this phase was to make
+a *real* Mesa venus driver, in a real guest, say something to us.
+
+It did. Seventy-two bytes, on an Ubuntu guest under WHP:
+
+```
+vkSetReplyCommandStreamMESA { resourceId:  8, offset: 0, size: 20 }
+vkSetReplyCommandStreamMESA { resourceId: 10, offset: 0, size: 20 }
+```
+
+— the driver pointing our reply encoder at a window before it asks anything,
+twice, the second time with a fresh blob after the first got no answer. Then
+Mesa called `abort()`, which is exactly what this stage promised: a renderer
+that replies to nothing gets a guest that gives up.
+
+Those bytes are now `the_first_bytes_a_real_mesa_venus_driver_sent_us` in
+`transport.rs`, and they pin down three things a round trip cannot: that the
+command header is `{ opcode, flags }` and not the reverse, that a
+`simple_pointer` is a **64-bit** presence marker rather than the 32-bit one it
+is natural to write, and that `VkCommandStreamDescriptionMESA` packs a
+`uint32_t` and two `size_t`s with no padding — so `offset` lands unaligned. Our
+decoder read them correctly on the first attempt.
+
+### Four days of the wrong question
+
+Getting there took seven guest boots, and six of them asked the wrong question,
+which is worth recording because the failure mode is general.
+
+The guest kernel read our capset perfectly from the first run — `cap set 0: id
+4, max-version 0, max-size 160`, every feature negotiated, the host-visible
+window mapped at `0x140000000` — and yet Mesa yielded `llvmpipe` and the
+capture file stayed empty. With `VN_DEBUG=init` producing **no output at all**,
+the natural reading was "the driver looked at our capset and declined", and
+four hypotheses were eliminated against that reading: an empty extension mask,
+a `max_version` mismatch, `supports_multiple_timelines = 0`, a missing driver
+library. Two capset fields were even falsified to coax the driver past a gate
+it was never standing at.
+
+The reading was unfounded, and one control run killed it: `VN_DEBUG=vtest`
+forces venus onto a renderer that cannot exist, and it printed nothing either.
+Silence was never evidence.
+
+Asking the kernel directly — the same three ioctls venus makes, from python,
+with Mesa out of the middle — gave the answer in one line:
+
+```
+OPEN=errno13(Permission denied)      /dev/dri/renderD128, as the login user
+ROOT OPEN=ok
+ROOT CAPS=ok       vk_xml_version 1.3.269, our 160 bytes, verbatim
+ROOT CTXINIT=ok    a Venus context, on our renderer
+```
+
+We log in on `ttyS0`. `systemd-logind` grants the DRM render node to the user
+of a *graphical* seat by ACL, and a serial login is not one. Every silent run
+was a driver that failed `open(2)` before it had anything to say. Our capset
+was never the question.
+
+`supports_multiple_timelines` has been reverted to false, which is what
+`VenusCapset::new()` says truthfully: `virtio_gpu::fence` is one FIFO, and a
+renderer that promises per-queue timelines and then retires in submission order
+does not fail loudly — it returns the wrong fence to the wrong queue. The
+permissive extension mask stays, on two grounds that the other field had
+neither: it is what virglrenderer effectively advertises (`venus_hw.h`, with
+the sentinel clear "all the extensions are assumed to be supported by the
+renderer side protocol"), and it is the configuration the captured bytes were
+produced under, so removing it would cost the golden vector its provenance.
+
+The general lesson: **a diagnostic's silence is only evidence once you have
+seen that diagnostic speak.** Establish that first, or every hypothesis you
+eliminate is eliminated against nothing.
+
+### What phase 4 does not have
+
+- **Replies.** The renderer decodes and captures; it encodes nothing back.
+  That is the whole of phase 5, and Mesa's `abort()` is the measurement of it.
+- **`save`/`load` for rings** (ADR-0006). A snapshot taken with a live Venus
+  context will refuse.
+- **One sink for all rings**, so a multi-ring capture interleaves into soup.
+- **`allow_vk_wait_syncs`**, which belongs with the threading model rather than
+  with the capset that advertises it.

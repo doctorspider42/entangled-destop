@@ -143,7 +143,7 @@ ever be taken at, and a resumed guest finds descriptors it never posted.
 
 | Class | While paused | On reset |
 |---|---|---|
-| vCPU threads | parked at the lifecycle checkpoint | arch state (KVM: events, LAPIC page, regs, `mp_state`; WHP: VP deleted and re-created), then the boot state the first boot used |
+| vCPU threads | parked at the lifecycle checkpoint | arch state (KVM: events, LAPIC page, regs, `mp_state`; WHP: the state `WHvCreateVirtualProcessor` produced, read back at creation and written again — see the 2026-09-10 amendment), then the boot state the first boot used |
 | ioeventfd queue workers (KVM) | park on `virtio_core::Quiesce` **before** taking the transport lock | keep running — host wiring, not guest state; their addresses are re-based (below) |
 | virtio-net receive thread | parks on the same gate at the top of its loop | stopped and re-created by the device's own `reset()` |
 | virtio devices + queues | reached only through a parked vCPU or a parked worker | `TransportState::power_on_reset`: device `reset()`, queues, features, status, ISR — **and** `config_generation` and the MSI-X table, which a *device* reset deliberately keeps |
@@ -245,10 +245,13 @@ Debug builds, on the development machine.
 | an installed Ubuntu rebooting itself, three boots | 467 s | 414 s |
 | repeated guest reboots | 42 in 90 s (`examples/boot-test.toml`), no leaked thread or fd | — |
 
-WHP's reset is an order of magnitude faster because deleting and re-creating a
+WHP's reset was an order of magnitude faster because deleting and re-creating a
 virtual processor is cheaper than writing an architectural reset state back
-register by register — and it is also more complete, which is the happier half
-of that trade.
+register by register. That is no longer how it works (2026-09-10 amendment) and
+the figure has not been re-taken on the machine those numbers came from; the
+replacement writes a whole saved state back and measured 10-11 ms on the host
+described below, which is the same order as the row above rather than the same
+number.
 
 Acceptance, both hosts: `tests/boot/tests/lifecycle.rs` and
 `crates/vmm-core/tests/whp_lifecycle.rs` assert pause (the guest's heartbeat
@@ -358,3 +361,56 @@ Two smaller debts this ADR leaves behind, worth clearing on the way:
   a lie and a reboot a haunting.
 - `entangled run` grew a control channel. It is a small surface (five commands)
   and it is what makes the manager's buttons real rather than a stop and a start.
+
+## Amendment, 2026-09-10 — WHP's reset cannot delete the virtual processor
+
+The original WHP reset deleted the virtual processor and created a new one, on
+the reasoning that a VP `WHvCreateVirtualProcessor` has just made *is* in the
+architectural reset state — including the two parts no public register exposes,
+the local APIC and an application processor's wait-for-startup suspension
+(ADR-0002 phase 4). That reasoning is still right. The mechanism is not
+portable across Windows versions.
+
+**Measured on an AMD Ryzen Threadripper 1920X, Windows 10 19045.7725, WHP
+feature on:** `WHvDeleteVirtualProcessor` returns success and then *every*
+`WHvCreateVirtualProcessor` for that index returns `E_INVALIDARG`
+(`0x80070057`). The index is spent for the life of the partition. A standalone
+probe against the raw API varied everything that looked relevant — one
+processor and four, index 0 and index 3, local APIC emulation on and off, the
+create issued from the VP's owning thread and from another one — and the answer
+never changed. Partition create/destroy is unaffected
+(`whp_smoke::hundred_create_destroy_cycles` passes on the same host).
+
+The visible consequence was that a reboot *ended* the VM instead of restarting
+it: the guest reached `reboot: machine restart`, the reset failed, and the run
+loop then reported `WHvRunVirtualProcessor … A virtual processor with the
+specified index does not exist (0x80370307)`. Ctrl+Alt+R and the manager's
+Restart button did the same thing. It had not been caught because
+`whp_lifecycle.rs` self-skips without the guest artifacts, and this machine had
+never had them.
+
+**The replacement keeps the reasoning and drops the deletion.** `WhpVcpu::new`
+reads the whole processor back immediately after creating it, before the guest
+has ever run, and `reset_arch_state` writes that state again. The read and the
+write are the `snapshot`/`restore` pair ADR-0006 already needs, which is the
+reason this is small: it already carries the interrupt-controller blob, the
+XSAVE area, and the internal activity word that holds an AP's startup suspend.
+Nothing in this backend has to know what WHP's reset *values* are — they are
+whatever WHP produced. Deleting and re-creating survives as the fallback for
+the one shape whose power-on state cannot be read back, a partition with local
+APIC emulation off, which is the phase-1 smoke shape and never resets.
+
+Two things worth keeping in mind:
+
+- **The pristine state is per index**, so an AP's suspended activity word comes
+  back on an AP and the BSP's runnable one on the BSP, with no `is_boot_cpu`
+  branch anywhere.
+- **The AP half needs its own test.** A reset that returns the BSP correctly
+  and leaves an AP runnable does not fail loudly — the guest reboots and comes
+  back quietly on one CPU. `whp_lifecycle::an_smp_guest_comes_back_from_a_host_reset_with_its_ap`
+  is that test, and it asserts the kernel's own `smpboot: Total of 2 processors
+  activated` twice. Writing it also produced a trap worth recording: that line
+  appears 0.2 s into a boot and `/init` is not reached until 3 s, so a reset
+  triggered on the SMP line alone lands mid-boot and the *first* boot never
+  prints a ready marker at all — which reads exactly like "the reset did
+  nothing" while the reset was in fact perfect.

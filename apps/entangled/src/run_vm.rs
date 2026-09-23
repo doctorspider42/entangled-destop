@@ -42,6 +42,17 @@ use virtio_core::VirtioDevice;
 use vmm_core::hv::{GuestClock, HostIrqChip, X86CpuState};
 use vmm_core::{Lifecycle, MachineConfig, RunOutcome, VmState};
 
+/// Where the Venus transport capture writes the guest's command stream, and
+/// the switch that turns that renderer on at all (EPIC 20 phase 4, ADR-0004).
+///
+/// Diagnostic, so it lives here rather than in a profile: what it attaches
+/// serves the Venus capset and a command ring and executes no Vulkan, so a
+/// guest reaches the ring and then waits for a reply that never comes. That is
+/// the point of the stage — the capture is how we learn what Mesa's driver
+/// really sends, which no amount of reading the reference can answer — but it
+/// is not a thing a profile should be able to ask for by accident.
+const VENUS_CAPTURE_ENV: &str = "ENTANGLED_VENUS_CAPTURE";
+
 /// Set by the SIGINT/SIGTERM (Linux) or console-control (Windows) handler; the
 /// run loop polls it (MVP-1204).
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -296,9 +307,78 @@ fn build_devices(
     // the host's virglrenderer — or the run fails, loudly: a profile that
     // asked for 3D and silently got llvmpipe is the bug the option exists to
     // fix.
-    if cfg.display.virgl {
+    // The Venus transport capture (EPIC 20 phase 4), ahead of everything else
+    // because it is not a variant of 3D — it is a different renderer entirely,
+    // and on Windows it is the only one there is.
+    //
+    // An environment variable rather than a profile key, deliberately. This is
+    // a diagnostic stage: the renderer advertises the Venus capset, carries a
+    // guest as far as a live command ring and writes what comes through it to
+    // a file, and it executes no Vulkan at all — so a guest that gets a reply
+    // from us gets nothing and waits. Putting that behind `[display]` would
+    // have meant a schema every profile, the manager and the installer's tests
+    // would inherit, for something two stages from now deletes. The precedent
+    // is `ENTANGLED_GPU_FENCES`, which is diagnostic in the same way.
+    if let Some(path) = std::env::var_os(VENUS_CAPTURE_ENV) {
+        let path = PathBuf::from(path);
+        let file = std::fs::File::create(&path)
+            .map_err(|e| format!("cannot write the Venus capture to {}: {e}", path.display()))?;
+        tracing::warn!(
+            path = %path.display(),
+            "attaching the Venus TRANSPORT renderer: it advertises the Venus capset and              captures the guest's command stream, and executes no Vulkan — a guest will              reach a command ring and then block on its first reply"
+        );
+        let mut renderer = virtio_gpu::VenusRenderer::new(virtio_gpu::WriteSink::new(file));
+        // Tell the guest to assume every Vulkan extension is served, rather
+        // than handing it an enumerated-but-empty list.
+        //
+        // `VenusCapset::new()` is honest — it says "we support no optional
+        // extension" — and honest is what a *renderer* should be. This one
+        // executes nothing, so honesty here is a lie of a different kind: it
+        // makes Mesa's venus driver decline before it has sent us a single
+        // byte, and the whole point of this stage is to find out what it
+        // sends. The permissive form is what virglrenderer effectively
+        // advertises too (`venus_hw.h`: with the sentinel clear "all the
+        // extensions are assumed to be supported by the renderer side
+        // protocol").
+        let mut capset = virtio_gpu::venus::capset::VenusCapset::new();
+        capset.extensions = virtio_gpu::venus::capset::ExtensionMask::GUEST_ASSUMES_EVERYTHING;
+        // `supports_multiple_timelines` stays as `VenusCapset::new()` left it
+        // — false — even though claiming it was the obvious next guess when a
+        // guest declined us. `virtio_gpu::fence` is one FIFO retiring in
+        // submission order, and Mesa's venus driver binds every `VkQueue` to a
+        // `ring_idx` at creation: a renderer that promises per-queue timelines
+        // and then retires everything in one order does not fail loudly, it
+        // returns the wrong fence to the wrong queue. Advertising a capability
+        // to coax a guest past a gate is how a capture run turns into a
+        // haunting later, and this one was never consulted anyway — the ICD
+        // that declined us had not been loaded at all.
+        renderer.set_capset(capset);
+        let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
+        gpu.set_refresh_hz(cfg.display.refresh_hz);
+        gpu.set_frame_stats(cfg.display.frame_stats.clone());
+        devices.push(Box::new(gpu));
+    } else if cfg.display.virgl {
         #[cfg(target_os = "linux")]
         {
+            // A renderer this program fetched is offered to the loader as a
+            // *preference* (`ENTANGLED_VIRGL_LIB_DEFAULT`), never as an
+            // instruction: if it will not open — a host with no Vulkan loader
+            // is the case that happens — `virtio_gpu::virgl` falls through to
+            // the system library rather than losing 3D altogether. An operator
+            // who set `ENTANGLED_VIRGL_LIB` outranks both and is left alone.
+            // Set before the renderer is built, and before the isolated one is
+            // spawned, because the helper process inherits this environment.
+            if std::env::var_os(virtio_gpu::virgl::LIB_ENV).is_none() {
+                if let Some(found) = crate::virgl_lib::locate() {
+                    tracing::info!(
+                        lib = %found.lib.display(),
+                        server = %found.server.display(),
+                        origin = found.origin.as_str(),
+                        "offering a Venus-capable virglrenderer to the 3D renderer"
+                    );
+                    std::env::set_var(virtio_gpu::virgl::LIB_DEFAULT_ENV, &found.lib);
+                }
+            }
             // GPU-012 (ADR-0004): by default the renderer runs in its own
             // process, so a crash inside the host GL stack degrades this VM to
             // 2D instead of killing it. `virgl_isolation = "in-process"` puts

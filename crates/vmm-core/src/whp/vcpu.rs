@@ -48,7 +48,8 @@ use windows::Win32::System::Hypervisor::{
 };
 
 use crate::hv::{
-    ExitHandler, HvError, RunOutcome, VcpuCensus, VcpuRegisters, X86Registers, X86SpecialRegisters,
+    ExitHandler, HvError, RunOutcome, VcpuCensus, VcpuRegisters, X86CpuState, X86Registers,
+    X86SpecialRegisters,
 };
 use crate::lifecycle::{Checkpoint, Lifecycle, ResettableVcpu, VcpuKick};
 use crate::whp::cpuid::{CpuidPolicy, CpuidResult};
@@ -72,16 +73,55 @@ pub struct WhpVcpu {
     /// This machine's CPUID policy, applied to the `X64Cpuid` exits the
     /// partition's exit list produces.
     cpuid: CpuidPolicy,
+    /// What `WHvCreateVirtualProcessor` had just made this VP, read back before
+    /// the guest ever ran — the power-on state [`Self::reset_arch_state`] puts
+    /// back. `None` when the partition would not report it (see
+    /// [`Self::capture_pristine`]).
+    pristine: Option<Box<X86CpuState>>,
 }
 
 impl WhpVcpu {
     pub(super) fn new(partition: Arc<Partition>, index: u32) -> Result<Self, VmmError> {
         create_virtual_processor(partition.handle(), index)?;
-        Ok(Self {
+        let mut vcpu = Self {
             index,
             partition,
             cpuid: CpuidPolicy::new(index),
-        })
+            pristine: None,
+        };
+        vcpu.pristine = vcpu.capture_pristine();
+        Ok(vcpu)
+    }
+
+    /// Reads back the state WHP just created this VP in, for
+    /// [`Self::reset_arch_state`] to write again on a reboot.
+    ///
+    /// This is a snapshot in the [ADR-0006](../../../../docs/adr/0006-suspend-restore.md)
+    /// sense and uses the same code, which is the point: `snapshot`/`restore`
+    /// already carry every part of a WHP processor that a reset has to return —
+    /// the local APIC, the XSAVE area, the internal activity word that holds an
+    /// application processor's wait-for-startup suspension — and none of those
+    /// has a public "reset value" this backend could otherwise write.
+    ///
+    /// Returns `None` rather than failing the vCPU. The one configuration that
+    /// cannot be captured is a partition with local APIC emulation off
+    /// (`WHvGetVirtualProcessorInterruptControllerState` has nothing to
+    /// report), which is the phase-1 smoke shape: those guests halt and are
+    /// never reset. A `None` here is what makes `reset_arch_state` fall back to
+    /// deleting and re-creating the VP.
+    fn capture_pristine(&self) -> Option<Box<X86CpuState>> {
+        match self.snapshot() {
+            Ok(state) => Some(Box::new(state)),
+            Err(e) => {
+                tracing::debug!(
+                    vcpu = self.index,
+                    error = %e,
+                    "this partition would not report a virtual processor's power-on state; \
+                     a reset of this VM will have to re-create the processor instead"
+                );
+                None
+            }
+        }
     }
 
     /// A handle another thread can use to kick this vCPU out of
@@ -665,32 +705,65 @@ impl ResettableVcpu for WhpVcpu {
         self.restore(state)
     }
 
-    /// Deletes this virtual processor and creates it again.
+    /// Writes back the state this virtual processor was created in.
     ///
-    /// WHP has no "reset a VP" call, but it has something better: a VP that
-    /// `WHvCreateVirtualProcessor` just made **is** in the architectural reset
-    /// state, including the parts no public register exposes — the local APIC,
-    /// and an application processor's wait-for-startup suspension. That last one
-    /// is the whole reason this backend cannot do what the KVM one does: the
-    /// rule recorded in ADR-0002 phase 4 is that an AP must be left exactly as
-    /// WHP created it or the guest's INIT/SIPI never makes it runnable, and
-    /// re-creating it is the only way to get back there after a boot has used
-    /// it.
+    /// WHP has no "reset a VP" call, and the state a reset has to return is
+    /// bigger than the public registers: the local APIC, and an application
+    /// processor's wait-for-startup suspension. ADR-0002 phase 4 records the
+    /// rule that an AP must be left exactly as WHP created it or the guest's
+    /// INIT/SIPI never makes it runnable — so this backend cannot hand-write
+    /// architectural reset values the way the KVM one does.
+    ///
+    /// What it does instead is *remember* that state. [`Self::capture_pristine`]
+    /// reads the whole processor back at creation, before the guest has run,
+    /// and this writes it again — the same `snapshot`/`restore` pair ADR-0006
+    /// uses, which already covers the APIC blob, the XSAVE area and the
+    /// internal activity word. Nothing has to know what WHP's reset values
+    /// *are*; they are whatever WHP produced.
+    ///
+    /// # Why not delete the VP and create it again
+    ///
+    /// That is the obvious reading of "a freshly created VP is in the reset
+    /// state", and it is what this did until 2026-09-10. It does not work
+    /// everywhere: on this project's Windows 10 host (19045, WHP feature on)
+    /// `WHvDeleteVirtualProcessor` succeeds and every subsequent
+    /// `WHvCreateVirtualProcessor` for that index answers
+    /// `E_INVALIDARG (0x80070057)` — the index is spent for the life of the
+    /// partition. Measured for one and four processors, index 0 and index 3,
+    /// local APIC emulation on and off, and from both the owning thread and
+    /// another one; the answer never changed. So a reboot-in-place ended the
+    /// VM there rather than restarting it (`whp_lifecycle`'s two reset tests,
+    /// and the window's Ctrl+Alt+R).
+    ///
+    /// It stays as the fallback for the one shape whose power-on state cannot
+    /// be read back — a partition with local APIC emulation off — because on a
+    /// host where index reuse *does* work it is still correct, and on this one
+    /// it fails with the WHP error rather than silently resetting nothing.
     ///
     /// Safe at this point and only at this point: the vCPU is parked at a
     /// lifecycle checkpoint, so nothing is inside `WHvRunVirtualProcessor` for
     /// this index, and this runs on the thread that owns the VP.
     fn reset_arch_state(&mut self, _is_boot_cpu: bool) -> Result<(), HvError> {
-        let handle = self.partition.handle();
-        // SAFETY: this VP was created on the partition we hold an `Arc` on, is
-        // not running (the caller parked it), and is deleted exactly once here —
-        // the `WHvCreateVirtualProcessor` immediately below restores the
-        // invariant `Drop` relies on. A failure to delete is fatal to the reset
-        // rather than ignored, because creating over a live VP would fail too.
-        unsafe { WHvDeleteVirtualProcessor(handle, self.index) }
-            .map_err(|e| HvError::Registers(format!("WHvDeleteVirtualProcessor: {e}")))?;
-        create_virtual_processor(handle, self.index)
-            .map_err(|e| HvError::Registers(e.to_string()))?;
+        match self.pristine.take() {
+            Some(pristine) => {
+                let result = self.restore(&pristine);
+                self.pristine = Some(pristine);
+                result?;
+            }
+            None => {
+                let handle = self.partition.handle();
+                // SAFETY: this VP was created on the partition we hold an `Arc`
+                // on, is not running (the caller parked it), and is deleted
+                // exactly once here — the `WHvCreateVirtualProcessor`
+                // immediately below restores the invariant `Drop` relies on. A
+                // failure to delete is fatal to the reset rather than ignored,
+                // because creating over a live VP would fail too.
+                unsafe { WHvDeleteVirtualProcessor(handle, self.index) }
+                    .map_err(|e| HvError::Registers(format!("WHvDeleteVirtualProcessor: {e}")))?;
+                create_virtual_processor(handle, self.index)
+                    .map_err(|e| HvError::Registers(e.to_string()))?;
+            }
+        }
         self.cpuid = CpuidPolicy::new(self.index);
         Ok(())
     }

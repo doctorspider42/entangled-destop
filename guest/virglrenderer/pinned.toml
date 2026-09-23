@@ -1,0 +1,69 @@
+# The published virglrenderer `entangled fetch virglrenderer` downloads.
+#
+# This file is COMPILED INTO the `entangled` binary (apps/entangled/src/virgl_lib.rs,
+# `include_str!`). It is the trust anchor for those downloads: bytes that do not
+# hash to the `sha256` below are deleted, not used. There is no signature and no
+# key — this is as strong as the git history of this repository and no stronger,
+# which is why the digests belong here, in review, and not in a checksum file
+# fetched from beside the artifact.
+#
+# WHY THIS ARTIFACT EXISTS
+#   Ubuntu jammy packages virglrenderer 0.9.1, which has no Venus and no blob
+#   resources at all (ADR-0004). Venus needs >= 1.0 built with `-Dvenus=true`,
+#   which no distribution we target ships, so a user who cannot build one from
+#   source cannot have Venus — and building from source needs meson, ninja and
+#   six -dev packages that a *user* should never be asked for. Hence a published
+#   binary, the same bargain as the firmware and the bootstrap kernel.
+#
+# WHAT A USER STILL NEEDS ON THEIR OWN HOST
+#   Only runtime libraries, all of them on any desktop install: libepoxy.so.0,
+#   libdrm.so.2, libgbm.so.1, libvulkan.so.1, libm, libc. Note `libvulkan.so.1`
+#   in particular — it is a hard `DT_NEEDED` of a Venus-capable build, where the
+#   distribution's 0.9.x does not link Vulkan at all. A host without a Vulkan
+#   loader therefore cannot load this library, and `virtio_gpu::virgl` falls
+#   back to the system one rather than losing 3D altogether.
+#
+# GLIBC BASELINE
+#   Built on ubuntu-22.04, the same runner as the Linux engine in
+#   `.github/workflows/release.yml`, so both binaries this project publishes for
+#   Linux carry the same floor: GLIBC_2.34. That covers Ubuntu 22.04+, Debian 12+
+#   and Fedora 35+, and excludes Ubuntu 20.04 and Debian 11 — which the Linux
+#   engine already excluded, so this artifact narrows nothing.
+#
+# HOW TO UPDATE IT
+#   1. Change `guest/virglrenderer/build-virglrenderer.sh` (or its pinned
+#      virglrenderer/Vulkan-Headers revisions) and push.
+#      `.github/workflows/virglrenderer.yml` builds both files on Linux,
+#      publishes them under a new immutable tag, and prints the exact
+#      replacement for the block below in its job summary.
+#   2. Commit that block. Until you do, `entangled` keeps fetching the previous
+#      tag, which still exists — a release tag is never reused.
+#
+#   The digests below are of the PUBLISHED assets. Never paste the digest of a
+#   local build: on 2026-09-10 that mistake in `guest/firmware/pinned.toml` made
+#   every fetch die on a mismatch and stopped `release.yml` building an
+#   installer at all.
+#
+# STATUS, 2026-09-16: the workflow below has never been run, so this tag has no
+#   release behind it and a fetch answers 404 with a message that says exactly
+#   that. The digests are placeholders and are *meant* to be wrong — they are
+#   the shape the pin takes, not a claim about any bytes. Run the workflow, then
+#   replace this whole block with what its summary prints, and delete this note.
+#   Until then the way in is a local build:
+#   `bash guest/virglrenderer/build-virglrenderer.sh`, then
+#   `ENTANGLED_VIRGL_DIR=<its lib dir>` or `ENTANGLED_VIRGL_LIB=<the .so>`.
+
+tag = "virglrenderer-1.1.0-1"
+virglrenderer_version = "1.1.0"
+base_url = "https://github.com/doctorspider42/entangled-destop/releases/download"
+source = "https://github.com/doctorspider42/entangled-destop/releases/tag/virglrenderer-1.1.0-1"
+
+[[assets]]
+name = "libvirglrenderer.so.1"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+bytes = 0
+
+[[assets]]
+name = "virgl_render_server"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+bytes = 0

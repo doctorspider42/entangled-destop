@@ -20,11 +20,17 @@ use crate::FetchArgs;
 /// and every failure hint print, so there is exactly one command to copy.
 pub const BOOTSTRAP_TARGET: &str = "bootstrap-kernel";
 
+/// The spelling `fetch` accepts for the host 3D renderer (ADR-0004).
+pub const VIRGL_TARGET: &str = "virglrenderer";
+
 pub fn run(args: &FetchArgs) -> Result<(), String> {
     if args.distro.eq_ignore_ascii_case(BOOTSTRAP_TARGET)
         || args.distro.eq_ignore_ascii_case("bootstrap")
     {
         return run_bootstrap(args);
+    }
+    if args.distro.eq_ignore_ascii_case(VIRGL_TARGET) || args.distro.eq_ignore_ascii_case("virgl") {
+        return run_virglrenderer(args);
     }
     if args
         .distro
@@ -193,4 +199,69 @@ fn kind_label(kind: MediaKind) -> &'static str {
         MediaKind::Sha512Sums => "checksum file",
         MediaKind::Sha512SumsSignature => "checksum signature",
     }
+}
+
+/// `entangled fetch virglrenderer` — the host 3D renderer (ADR-0004).
+///
+/// The whole reason this exists: Venus needs virglrenderer >= 1.0 built with
+/// `-Dvenus=true`, no distribution this project targets ships one (jammy has
+/// 0.9.1, which has no Venus at all), and building it needs meson, ninja and
+/// six `-dev` packages. That is a fine ask of a developer and a ridiculous one
+/// of somebody who installed a desktop VMM — so the project builds it once, in
+/// CI, and pins the digest.
+#[cfg(target_os = "linux")]
+fn run_virglrenderer(args: &FetchArgs) -> Result<(), String> {
+    let report = crate::virgl_lib::fetch(crate::artifact::FetchOptions {
+        refresh: args.refresh,
+        offline: args.offline,
+    })?;
+
+    println!(
+        "host 3D renderer — virglrenderer {} with Venus ({})",
+        report.virglrenderer_version, report.tag
+    );
+    // Not "signature: OK". There is none, and the line that would say so is the
+    // line somebody would quote in a security review.
+    println!("  trust         : SHA-256 pinned in this build (guest/virglrenderer/pinned.toml)");
+    println!(
+        "                  no signature — see the pin file for what that does and does not buy"
+    );
+    println!("  licence       : MIT (virglrenderer); see THIRD-PARTY-NOTICES.txt");
+    println!("  source        : {}", report.source);
+    println!("  cache         : {}", report.dir.display());
+    for asset in &report.assets {
+        println!();
+        println!("  {} [{}]", asset.name, asset.status.as_str());
+        println!("    path     : {}", asset.path.display());
+        println!("    url      : {}", asset.url);
+        println!("    sha256   : {}", asset.sha256);
+    }
+    println!();
+    // The runtime dependencies are the user's own, and one of them is worth
+    // naming: a Venus build hard-links Vulkan where the distribution's 0.9.x
+    // does not, so a host with no loader keeps its old renderer rather than
+    // this one.
+    println!(
+        "Needs libepoxy.so.0, libdrm.so.2, libgbm.so.1 and libvulkan.so.1 at run time; a host \
+         without a Vulkan loader falls back to its own virglrenderer and gets no Venus."
+    );
+    println!("`[display] virgl = true` will find this; `entangled doctor` reports it.");
+    Ok(())
+}
+
+/// The same command on a host that cannot use what it would download.
+///
+/// The renderer is a Linux shared object; only the Linux engine inside WSL can
+/// `dlopen` it, and the cache it must land in is that distribution's, not this
+/// one's. Downloading it into `%LOCALAPPDATA%` would leave a file nothing ever
+/// reads and a user who believes 3D is now available — which is the failure
+/// this whole artifact exists to stop repeating.
+#[cfg(not(target_os = "linux"))]
+fn run_virglrenderer(_args: &FetchArgs) -> Result<(), String> {
+    Err(format!(
+        "`entangled fetch {VIRGL_TARGET}` is Linux-only: the renderer is a Linux shared \
+         object, and on this host 3D runs through the WSL (KVM) backend. Install that \
+         engine (`entangled wsl install-engine`) and fetch it from inside the \
+         distribution: `wsl -d <distro> -e entangled fetch {VIRGL_TARGET}`."
+    ))
 }

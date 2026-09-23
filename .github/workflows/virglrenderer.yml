@@ -1,0 +1,224 @@
+name: virglrenderer
+
+# Builds the host 3D renderer — virglrenderer with Venus — and publishes it as
+# an immutable GitHub Release for `entangled fetch virglrenderer` to download.
+#
+# WHY THIS EXISTS
+#   Venus needs virglrenderer >= 1.0 built with `-Dvenus=true`. Ubuntu jammy
+#   packages 0.9.1, which has no Venus and no blob resources at all (ADR-0004),
+#   and no distribution this project targets ships a Venus build. Building one
+#   needs meson, ninja and six `-dev` packages: a fine ask of a developer and a
+#   ridiculous one of somebody who installed a desktop VMM. So it is built once,
+#   here, and pinned by digest — the same bargain as the UEFI firmware and the
+#   bootstrap kernel.
+#
+# WHY TWO FILES
+#   Venus in virglrenderer 1.1 exists only behind the render server:
+#   `VIRGL_RENDERER_VENUS` does nothing without `VIRGL_RENDERER_RENDER_SERVER`,
+#   and the library `fork`/`exec`s a separate `virgl_render_server`. Publishing
+#   the library alone would publish a renderer that cannot serve the one feature
+#   it was built for.
+#
+# WHY ubuntu-22.04 AND NOT ubuntu-latest
+#   A published binary carries a glibc floor, and this one must not be higher
+#   than the floor the project already has. `release.yml` builds the Linux
+#   engine on ubuntu-22.04, so that is the baseline: GLIBC_2.34, which covers
+#   Ubuntu 22.04+, Debian 12+ and Fedora 35+. Building here on a newer runner
+#   would quietly narrow the set of hosts that can run the renderer to less than
+#   the set that can run the engine, which is the kind of mismatch nobody
+#   notices until a user reports that 3D will not start.
+#
+# WHAT IT DELIBERATELY DOES NOT DO
+#   Test it. A GitHub runner has no GPU and no Vulkan ICD worth rendering
+#   against, so the job asserts what is checkable without one — that the four
+#   Venus entry points are exported — and leaves "does Venus actually serve a
+#   guest" to `crates/virtio-gpu/tests/venus_host.rs` on a machine with a
+#   renderer.
+#
+# AFTER IT RUNS
+#   The job summary contains the exact TOML block to paste into
+#   guest/virglrenderer/pinned.toml. Until that is committed, `entangled` keeps
+#   fetching the previous tag, which still exists — release tags are never
+#   reused, so nothing breaks in between.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    # Deliberately NOT pinned.toml: committing the pin this job prints must not
+    # start another build of the thing it just pinned.
+    paths:
+      - guest/virglrenderer/build-virglrenderer.sh
+      - .github/workflows/virglrenderer.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: virglrenderer
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Build virglrenderer with Venus and publish it
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the pinned virglrenderer version
+        id: virgl
+        run: |
+          set -euo pipefail
+          # One source of truth: the default in the build script, which also
+          # names the prefix the build installs under. A workflow that
+          # hard-coded its own version would build one library and label it
+          # another, and would go on labelling it that after a bump.
+          virgl_tag=$(sed -n 's/^VIRGL_TAG="\${VIRGL_TAG:-\(.*\)}"$/\1/p' \
+              guest/virglrenderer/build-virglrenderer.sh)
+          version="${virgl_tag#virglrenderer-}"
+          if [ -z "$virgl_tag" ] || [ "$version" = "$virgl_tag" ]; then
+            echo "cannot read VIRGL_TAG out of guest/virglrenderer/build-virglrenderer.sh" >&2
+            exit 1
+          fi
+          echo "prefix=$virgl_tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=virglrenderer-$version-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "virglrenderer $version, tag virglrenderer-$version-${{ github.run_number }}"
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build pkg-config libepoxy-dev libdrm-dev libgbm-dev \
+            libegl1-mesa-dev libgles2-mesa-dev libvulkan-dev python3-pip
+
+      - name: Build virglrenderer
+        run: bash guest/virglrenderer/build-virglrenderer.sh
+
+      - name: Assemble the release payload
+        id: payload
+        run: |
+          set -euo pipefail
+          version="${{ steps.virgl.outputs.version }}"
+          prefix=~/.cache/entangled-virglrenderer/${{ steps.virgl.outputs.prefix }}
+          out=release-payload
+          mkdir -p "$out"
+
+          lib=$(find "$prefix/lib" -name 'libvirglrenderer.so.1*' -type f | head -n 1)
+          server="$prefix/libexec/virgl_render_server"
+          if [ ! -s "$lib" ] || [ ! -s "$server" ]; then
+            echo "the build produced no library/render-server pair under $prefix" >&2
+            exit 1
+          fi
+          # Published under the soname, because that is the name the loader asks
+          # for and the name `virgl_lib.rs` looks for in the cache.
+          cp "$lib" "$out/libvirglrenderer.so.1"
+          cp "$server" "$out/virgl_render_server"
+
+          # The claim this artifact exists to make, asserted rather than
+          # assumed: a library built without Venus exports none of these and
+          # would degrade to classic virgl in complete silence.
+          for sym in virgl_renderer_context_create_with_flags \
+                     virgl_renderer_resource_create_blob \
+                     virgl_renderer_resource_map \
+                     virgl_renderer_resource_unmap; do
+            if ! objdump -T "$out/libvirglrenderer.so.1" | grep -q " $sym\$"; then
+              echo "the built library does not export $sym — this is not a Venus build" >&2
+              exit 1
+            fi
+          done
+
+          # The glibc floor, recorded where a human will see it rather than
+          # discovered by a user whose distribution is too old.
+          floor=$(objdump -T "$out/libvirglrenderer.so.1" \
+              | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+          echo "glibc floor: $floor"
+          echo "floor=$floor" >> "$GITHUB_OUTPUT"
+
+          ( cd "$out" && sha256sum libvirglrenderer.so.1 virgl_render_server > SHA256SUMS )
+          cat "$out/SHA256SUMS"
+
+          lib_sha=$(sha256sum "$out/libvirglrenderer.so.1" | cut -d' ' -f1)
+          server_sha=$(sha256sum "$out/virgl_render_server" | cut -d' ' -f1)
+          {
+            echo "lib_sha=$lib_sha"
+            echo "server_sha=$server_sha"
+            echo "lib_bytes=$(stat -c%s "$out/libvirglrenderer.so.1")"
+            echo "server_bytes=$(stat -c%s "$out/virgl_render_server")"
+          } >> "$GITHUB_OUTPUT"
+
+          cp guest/virglrenderer/build-virglrenderer.sh "$out/"
+
+          cat > "$out/NOTES.md" <<EOF
+          # virglrenderer $version with Venus
+
+          The host 3D renderer \`entangled fetch virglrenderer\` downloads, built
+          by \`guest/virglrenderer/build-virglrenderer.sh\` (included here,
+          unchanged from the commit below) on **ubuntu-22.04** — the same runner
+          as the Linux engine, so both carry the same glibc floor, **$floor**.
+
+          | File | What it is |
+          |---|---|
+          | \`libvirglrenderer.so.1\` | the renderer the VMM \`dlopen\`s |
+          | \`virgl_render_server\` | the Venus decoder it \`fork\`/\`exec\`s — Venus does not work without it |
+          | \`build-virglrenderer.sh\` | the script that built both |
+
+          **Runtime dependencies**, all of them on any desktop install:
+          \`libepoxy.so.0\`, \`libdrm.so.2\`, \`libgbm.so.1\`, \`libvulkan.so.1\`,
+          \`libm\`, \`libc\`. \`libvulkan.so.1\` is a hard requirement of a Venus
+          build where the distribution's own 0.9.x does not link Vulkan at all,
+          so a host with no Vulkan loader cannot load this library — Entangled
+          Desktop falls back to the system renderer there rather than losing 3D.
+
+          virglrenderer is **MIT**; its pinned upstream revision is in the build
+          script. Built from commit \`${{ github.sha }}\` by
+          \`.github/workflows/virglrenderer.yml\`, run ${{ github.run_number }}.
+          EOF
+          ls -l "$out"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # --latest=false: /releases/latest must keep pointing at the installer
+          # release, because that is what the manager's update check reads.
+          gh release create "${{ steps.virgl.outputs.tag }}" \
+            --title "virglrenderer ${{ steps.virgl.outputs.version }} with Venus (build ${{ github.run_number }})" \
+            --notes-file release-payload/NOTES.md \
+            --latest=false \
+            release-payload/libvirglrenderer.so.1 \
+            release-payload/virgl_render_server \
+            release-payload/SHA256SUMS \
+            release-payload/NOTES.md \
+            release-payload/build-virglrenderer.sh
+
+      - name: The pin to commit
+        run: |
+          {
+            echo '## Published `${{ steps.virgl.outputs.tag }}`'
+            echo
+            echo 'glibc floor: `${{ steps.payload.outputs.floor }}`'
+            echo
+            echo 'Now replace the block at the bottom of'
+            echo '`guest/virglrenderer/pinned.toml` and commit it (deleting the'
+            echo '"STATUS" note if it is still there). Until you do,'
+            echo '`entangled fetch virglrenderer` keeps serving the previous tag.'
+            echo
+            echo '```toml'
+            echo 'tag = "${{ steps.virgl.outputs.tag }}"'
+            echo 'virglrenderer_version = "${{ steps.virgl.outputs.version }}"'
+            echo 'base_url = "https://github.com/${{ github.repository }}/releases/download"'
+            echo 'source = "https://github.com/${{ github.repository }}/releases/tag/${{ steps.virgl.outputs.tag }}"'
+            echo
+            echo '[[assets]]'
+            echo 'name = "libvirglrenderer.so.1"'
+            echo 'sha256 = "${{ steps.payload.outputs.lib_sha }}"'
+            echo 'bytes = ${{ steps.payload.outputs.lib_bytes }}'
+            echo
+            echo '[[assets]]'
+            echo 'name = "virgl_render_server"'
+            echo 'sha256 = "${{ steps.payload.outputs.server_sha }}"'
+            echo 'bytes = ${{ steps.payload.outputs.server_bytes }}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -170,6 +170,18 @@ bootstrap kernel specifically there is now a supported way that is not copying:
 there — though these tests still want them at the fixed relative path, so
 copy or symlink them into `artifacts/bootstrap/`.
 
+**Cross-building the test initramfs on Windows.** `scripts/build-test-initramfs.sh`
+is bash, but nothing in it needs Linux except `cpio`. On a Windows-only checkout:
+`rustup target add x86_64-unknown-linux-musl`, copy `guest/test-rootfs/init-rs`
+somewhere *outside* the repository (a worktree under `.claude/worktrees/` is
+inside the main workspace, so cargo refuses the standalone crate in place),
+build it with `RUSTFLAGS="-Clinker=rust-lld -Clink-self-contained=yes" cargo
+build --release --target x86_64-unknown-linux-musl`, and pack the resulting
+`entangled-test-init` as `init` with `cpio -o -H newc | gzip -9` in WSL. This is
+worth knowing because these artifacts being absent is not a loud failure — the
+tests self-skip, and on 2026-09-10 that is how a WHP reset that could not work
+at all on this host went unnoticed (ADR-0002's amendment).
+
 **The whole workspace builds natively**, including the `virtio-*` crates and
 `display`, thanks to two vendored patches in `third_party/` (see their
 VENDORED.md). What is still Linux-only above `vmm-core` is `machine_x86::irqfd`
@@ -693,18 +705,44 @@ real thing with a real guest is `cargo test -p vmm-core --test whp_shm`.
 
 ## Pause and reset on WHP (ADR-0005)
 
-**Resetting a virtual processor is `WHvDeleteVirtualProcessor` +
-`WHvCreateVirtualProcessor`.** There is no reset call, but there is something
-better: a VP that `WHvCreateVirtualProcessor` just made *is* in the
-architectural reset state, including the parts no public register exposes — the
-local APIC, and an application processor's wait-for-startup suspension. That
-last one is the whole reason the KVM approach (write the state back by hand)
-cannot be used here: this skill's SMP section records that an AP must be left
-exactly as WHP created it or the guest's INIT/SIPI never makes it runnable, and
-re-creating it is the only way back to that state after a boot has used it.
+**Resetting a virtual processor is writing back the state it was created in.**
+There is no reset call, and the state a reset has to return is bigger than the
+public registers: the local APIC, and an application processor's
+wait-for-startup suspension. That last one is the whole reason the KVM approach
+(hand-write architectural reset values) cannot be used here — this skill's SMP
+section records that an AP must be left exactly as WHP created it or the
+guest's INIT/SIPI never makes it runnable.
+
+So `WhpVcpu::new` reads the *whole* processor back immediately after
+`WHvCreateVirtualProcessor`, before the guest has ever run, and
+`reset_arch_state` writes that back. The read and the write are the
+`snapshot`/`restore` pair ADR-0006 already needs, which is why this is a dozen
+lines: it carries the interrupt-controller blob, the XSAVE area and the
+internal activity word that holds the AP suspend. Nothing has to know what
+WHP's reset *values* are, and because the saved state is per index there is no
+`is_boot_cpu` branch — an AP's suspended activity word comes back on the AP.
 Safe only at a lifecycle checkpoint, where nothing is inside
 `WHvRunVirtualProcessor` for that index, and it runs on the owning thread.
-Measured: **7-8 ms** for a full machine reset, against KVM's 62-66 ms.
+Measured: **10-11 ms** for a full machine reset (Windows 10 19045, Threadripper
+1920X), against KVM's 62-66 ms.
+
+**Do not go back to deleting and re-creating the VP.** That reads better and it
+is what this did until 2026-09-10, but it is not portable across Windows
+versions. On Windows 10 19045 `WHvDeleteVirtualProcessor` returns success and
+then *every* `WHvCreateVirtualProcessor` for that index returns
+`E_INVALIDARG (0x80070057)` — the index is spent for the life of the partition.
+A raw-API probe varied one processor and four, index 0 and index 3, local APIC
+emulation on and off, the owning thread and another one; the answer never
+changed. Partition create/destroy is fine on the same host
+(`whp_smoke::hundred_create_destroy_cycles` passes), so this is specific to VP
+index reuse. The symptom was a reboot *ending* the VM: the guest reached
+`reboot: machine restart`, the reset failed, and the run loop then reported
+`WHvRunVirtualProcessor … A virtual processor with the specified index does not
+exist (0x80370307)`. Delete+create survives only as the fallback for a
+partition with local APIC emulation off, whose power-on state cannot be read
+back (`WHvGetVirtualProcessorInterruptControllerState` has nothing to report) —
+the phase-1 smoke shape, which never resets. ADR-0002 and ADR-0005 both carry
+the 2026-09-10 amendment.
 
 **`reboot=k` now works, and this is the host where that matters most.** Phase 4
 recorded that a triple fault is absorbed by WHP with local APIC emulation on and
@@ -726,7 +764,16 @@ the partition's halt gate as well as cancelling a run, which is exactly what a
 barrier needs from both states.
 
 Acceptance: `cargo test -p vmm-core --test whp_lifecycle` — pause (95 µs to
-acknowledge), resume, host reset twice, and a guest-initiated reboot. And
+acknowledge), resume, host reset twice, a guest-initiated reboot, and an **SMP**
+host reset. That last one is not redundant: a reset that returns the BSP
+correctly and leaves an AP runnable does not fail loudly — the guest reboots and
+comes back quietly on one CPU — so
+`an_smp_guest_comes_back_from_a_host_reset_with_its_ap` asserts the kernel's own
+`smpboot: Total of 2 processors activated`, twice. Writing it turned up a trap:
+that line appears 0.2 s into a boot and `/init` is not reached until 3 s, so a
+reset triggered on the SMP line alone lands mid-boot and the *first* boot never
+prints a ready marker — which reads exactly like "the reset did nothing" while
+the reset was in fact perfect. Wait for the ready marker, then reset. And
 end-to-end, on this host: `cargo test -p entangled --test guest_reboot --
 --ignored` reboots an installed Ubuntu twice through its own firmware in 414 s,
 each one arriving as `0xcf9 cold reset` and coming back through
