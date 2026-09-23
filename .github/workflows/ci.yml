@@ -85,6 +85,12 @@ jobs:
         run: python scripts/venus-gen.py
       - name: Generated code is up to date
         run: git diff --exit-code -- crates/virtio-gpu/src/venus/protocol
+      - name: The executor's ash bridge is up to date
+        # scripts/venus-ash-gen.py reads the generated protocol and ash's
+        # sources from the cargo registry.
+        run: |
+          cargo fetch
+          python scripts/venus-ash-gen.py --check
       - name: Differential check against the generated C
         run: python tools/venus-protocol/harness/run_differential.py --seeds 256
 

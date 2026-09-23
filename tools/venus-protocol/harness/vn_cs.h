@@ -63,9 +63,42 @@ vn_cs_encoder_reserve(struct vn_cs_encoder *enc, size_t size)
    return true;
 }
 
+/* Every 4- and 8-byte write, for the harness to find a chain link's sType
+ * in the encoded bytes (run_differential.py, h_poison). */
+struct hwrite {
+   size_t at;
+   size_t size;
+   uint64_t value;
+};
+extern struct hwrite *h_writes;
+extern size_t h_nwrites, h_capwrites;
+
+static inline void
+h_log_write(size_t at, const void *val, size_t val_size)
+{
+   if (val_size != 4 && val_size != 8)
+      return;
+   if (h_nwrites == h_capwrites) {
+      h_capwrites = h_capwrites ? h_capwrites * 2 : 1024;
+      h_writes = realloc(h_writes, h_capwrites * sizeof(*h_writes));
+      if (!h_writes) {
+         fprintf(stderr, "harness: out of memory\n");
+         exit(2);
+      }
+   }
+   uint64_t value = 0;
+   memcpy(&value, val, val_size);
+   h_writes[h_nwrites].at = at;
+   h_writes[h_nwrites].size = val_size;
+   h_writes[h_nwrites].value = value;
+   h_nwrites++;
+}
+
 static inline void
 vn_cs_encoder_write(struct vn_cs_encoder *enc, size_t size, const void *val, size_t val_size)
 {
+   if (val_size)
+      h_log_write(enc->buf.len, val, val_size);
    hbuf_reserve(&enc->buf, size);
    memset(enc->buf.data + enc->buf.len, 0, size);
    if (val_size)

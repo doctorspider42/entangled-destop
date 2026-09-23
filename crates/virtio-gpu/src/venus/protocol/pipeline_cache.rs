@@ -2,34 +2,36 @@
 // from venus-protocol git-70991d4c. DO NOT EDIT: regenerate with
 //     python scripts/venus-gen.py
 
-//! The `command_pool` group: its commands and the structures only they reach.
+//! The `pipeline_cache` group: its commands and the structures only they reach.
 
 #![allow(unused_imports)]
 
 use super::*;
 use crate::venus::wire::{CommandHeader, Decoder, Encoder};
 
-/// `VkCommandPoolCreateInfo` (`VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO`).
+/// `VkPipelineCacheCreateInfo` (`VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO`).
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct VkCommandPoolCreateInfo {
-    /// `VkCommandPoolCreateFlags flags`
-    pub flags: VkCommandPoolCreateFlags,
-    /// `uint32_t queueFamilyIndex`
-    pub queue_family_index: u32,
+pub struct VkPipelineCacheCreateInfo<'a> {
+    /// `VkPipelineCacheCreateFlags flags`
+    pub flags: VkPipelineCacheCreateFlags,
+    /// `size_t initialDataSize`
+    pub initial_data_size: u64,
+    /// `const void* pInitialData`
+    pub p_initial_data: Option<&'a [u8]>,
 }
 
-impl VkCommandPoolCreateInfo {
+impl<'a> VkPipelineCacheCreateInfo<'a> {
     // No output parameter reaches this structure, so it has no skeleton
     // form and the `partial` flag below is ignored.
 
-    /// `VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO`.
-    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    /// `VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
 
     /// Decode the whole structure, as an input carries it.
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
-    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+    pub fn decode(dec: &mut Decoder<'a>) -> Result<Self, ProtocolError> {
         Self::decode_with(dec, false)
     }
 
@@ -45,9 +47,9 @@ impl VkCommandPoolCreateInfo {
     ///
     /// # Errors
     /// As [`Self::decode`].
-    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
-        expect_structure_type(dec, "VkCommandPoolCreateInfo", Self::STRUCTURE_TYPE)?;
-        dec.empty_pnext_chain("VkCommandPoolCreateInfo")?;
+    pub fn decode_with(dec: &mut Decoder<'a>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(dec, "VkPipelineCacheCreateInfo", Self::STRUCTURE_TYPE)?;
+        dec.empty_pnext_chain("VkPipelineCacheCreateInfo")?;
         Self::decode_body(dec, partial)
     }
 
@@ -62,16 +64,22 @@ impl VkCommandPoolCreateInfo {
     }
 
     /// The fields after `sType` and `pNext`, as a chain link carries them
-    /// (`vn_decode_VkCommandPoolCreateInfo_self_temp`).
+    /// (`vn_decode_VkPipelineCacheCreateInfo_self_temp`).
     ///
     /// # Errors
     /// As [`Self::decode`].
-    pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
-        let flags: VkCommandPoolCreateFlags = dec.u32()?;
-        let queue_family_index: u32 = dec.u32()?;
+    pub fn decode_body(dec: &mut Decoder<'a>, _partial: bool) -> Result<Self, ProtocolError> {
+        let flags: VkPipelineCacheCreateFlags = dec.u32()?;
+        let initial_data_size: u64 = dec.size()?;
+        let p_initial_data: Option<&'a [u8]> =
+            match array_presence(dec, initial_data_size, NullArray::Checked)? {
+                Some(n) => Some(dec.blob(n)?),
+                None => None,
+            };
         Ok(Self {
             flags,
-            queue_family_index,
+            initial_data_size,
+            p_initial_data,
         })
     }
 
@@ -81,12 +89,20 @@ impl VkCommandPoolCreateInfo {
     /// As [`Self::encode`].
     pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
         enc.u32(self.flags)?;
-        enc.u32(self.queue_family_index)?;
+        enc.size(self.initial_data_size)?;
+        if let Some(v) = &self.p_initial_data {
+            let count = self.initial_data_size;
+            check_len("VkPipelineCacheCreateInfo", "pInitialData", count, v.len())?;
+            enc.array_size(count)?;
+            enc.blob(v)?;
+        } else {
+            enc.array_size(0)?;
+        }
         Ok(())
     }
 }
 
-/// The arguments of `vkCreateCommandPool`, and its reply.
+/// The arguments of `vkCreatePipelineCache`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -94,55 +110,55 @@ impl VkCommandPoolCreateInfo {
 /// fills the outputs in place and sets `ret`, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct CreateCommandPoolArgs {
+pub struct CreatePipelineCacheArgs<'a> {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `const VkCommandPoolCreateInfo* pCreateInfo` — in.
-    pub p_create_info: Option<VkCommandPoolCreateInfo>,
-    /// `VkCommandPool* pCommandPool` — out.
-    pub p_command_pool: Option<VkCommandPool>,
+    /// `const VkPipelineCacheCreateInfo* pCreateInfo` — in.
+    pub p_create_info: Option<VkPipelineCacheCreateInfo<'a>>,
+    /// `VkPipelineCache* pPipelineCache` — out.
+    pub p_pipeline_cache: Option<VkPipelineCache>,
     /// The return value (`VkResult`), written first in the reply.
     pub ret: VkResult,
 }
 
-impl CreateCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkCreateCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_CREATE_COMMAND_POOL_EXT;
+impl<'a> CreatePipelineCacheArgs<'a> {
+    /// `VK_COMMAND_TYPE_vkCreatePipelineCache_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_CREATE_PIPELINE_CACHE_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkCreateCommandPool";
+    pub const NAME: &'static str = "vkCreatePipelineCache";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkCreateCommandPool_args_temp`).
+    /// (`vn_decode_vkCreatePipelineCache_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
-    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+    pub fn decode(dec: &mut Decoder<'a>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkCreateCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkCreatePipelineCache"));
         }
-        let p_create_info: Option<VkCommandPoolCreateInfo> = if dec.simple_pointer()? {
-            Some(VkCommandPoolCreateInfo::decode_with(dec, false)?)
+        let p_create_info: Option<VkPipelineCacheCreateInfo<'a>> = if dec.simple_pointer()? {
+            Some(VkPipelineCacheCreateInfo::decode_with(dec, false)?)
         } else {
-            return Err(null_pointer(dec, "vkCreateCommandPool", "pCreateInfo"));
+            return Err(null_pointer(dec, "vkCreatePipelineCache", "pCreateInfo"));
         };
         dec.null_allocator()?;
-        let p_command_pool: Option<VkCommandPool> = if dec.simple_pointer()? {
-            Some(VkCommandPool(dec.handle()?))
+        let p_pipeline_cache: Option<VkPipelineCache> = if dec.simple_pointer()? {
+            Some(VkPipelineCache(dec.handle()?))
         } else {
-            return Err(null_pointer(dec, "vkCreateCommandPool", "pCommandPool"));
+            return Err(null_pointer(dec, "vkCreatePipelineCache", "pPipelineCache"));
         };
         Ok(Self {
             device,
             p_create_info,
-            p_command_pool,
+            p_pipeline_cache,
             ret: Default::default(),
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkCreateCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkCreatePipelineCache`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -157,14 +173,14 @@ impl CreateCommandPoolArgs {
             v.encode_with(enc, false)?;
         }
         enc.null_allocator()?;
-        enc.simple_pointer(self.p_command_pool.is_some())?;
-        if let Some(v) = &self.p_command_pool {
+        enc.simple_pointer(self.p_pipeline_cache.is_some())?;
+        if let Some(v) = &self.p_pipeline_cache {
             enc.handle(v.0)?;
         }
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkCreateCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkCreatePipelineCache_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -175,20 +191,20 @@ impl CreateCommandPoolArgs {
     pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
         enc.reply_header(Self::OPCODE)?;
         enc.i32(self.ret)?;
-        enc.simple_pointer(self.p_command_pool.is_some())?;
-        if let Some(v) = &self.p_command_pool {
+        enc.simple_pointer(self.p_pipeline_cache.is_some())?;
+        if let Some(v) = &self.p_pipeline_cache {
             enc.handle(v.0)?;
         }
         Ok(())
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkCreateCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkCreatePipelineCache_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
     /// Whatever the wire or this layer refused.
-    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'a>) -> Result<(), ProtocolError> {
         let found = dec.reply_header()?;
         if found != Self::OPCODE {
             dec.set_fatal(crate::venus::wire::WireError::Poisoned);
@@ -198,8 +214,8 @@ impl CreateCommandPoolArgs {
             });
         }
         self.ret = dec.i32()?;
-        self.p_command_pool = if dec.simple_pointer()? {
-            Some(VkCommandPool(dec.handle()?))
+        self.p_pipeline_cache = if dec.simple_pointer()? {
+            Some(VkPipelineCache(dec.handle()?))
         } else {
             None
         };
@@ -207,7 +223,7 @@ impl CreateCommandPoolArgs {
     }
 }
 
-/// The arguments of `vkDestroyCommandPool`, and its reply.
+/// The arguments of `vkDestroyPipelineCache`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -215,40 +231,40 @@ impl CreateCommandPoolArgs {
 /// fills the outputs in place, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct DestroyCommandPoolArgs {
+pub struct DestroyPipelineCacheArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
+    /// `VkPipelineCache pipelineCache` — in.
+    pub pipeline_cache: VkPipelineCache,
 }
 
-impl DestroyCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkDestroyCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_DESTROY_COMMAND_POOL_EXT;
+impl DestroyPipelineCacheArgs {
+    /// `VK_COMMAND_TYPE_vkDestroyPipelineCache_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_DESTROY_PIPELINE_CACHE_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkDestroyCommandPool";
+    pub const NAME: &'static str = "vkDestroyPipelineCache";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkDestroyCommandPool_args_temp`).
+    /// (`vn_decode_vkDestroyPipelineCache_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkDestroyCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkDestroyPipelineCache"));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
+        let pipeline_cache: VkPipelineCache = VkPipelineCache(dec.handle()?);
         dec.null_allocator()?;
         Ok(Self {
             device,
-            command_pool,
+            pipeline_cache,
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkDestroyCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkDestroyPipelineCache`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -258,12 +274,12 @@ impl DestroyCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
+        enc.handle(self.pipeline_cache.0)?;
         enc.null_allocator()?;
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkDestroyCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkDestroyPipelineCache_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -277,7 +293,7 @@ impl DestroyCommandPoolArgs {
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkDestroyCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkDestroyPipelineCache_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -295,7 +311,7 @@ impl DestroyCommandPoolArgs {
     }
 }
 
-/// The arguments of `vkResetCommandPool`, and its reply.
+/// The arguments of `vkGetPipelineCacheData`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -303,46 +319,56 @@ impl DestroyCommandPoolArgs {
 /// fills the outputs in place and sets `ret`, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct ResetCommandPoolArgs {
+pub struct GetPipelineCacheDataArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
-    /// `VkCommandPoolResetFlags flags` — in.
-    pub flags: VkCommandPoolResetFlags,
+    /// `VkPipelineCache pipelineCache` — in.
+    pub pipeline_cache: VkPipelineCache,
+    /// `size_t* pDataSize` — in/out.
+    pub p_data_size: Option<u64>,
+    /// `void* pData` — out.
+    pub p_data: Option<Vec<u8>>,
     /// The return value (`VkResult`), written first in the reply.
     pub ret: VkResult,
 }
 
-impl ResetCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkResetCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_RESET_COMMAND_POOL_EXT;
+impl GetPipelineCacheDataArgs {
+    /// `VK_COMMAND_TYPE_vkGetPipelineCacheData_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_PIPELINE_CACHE_DATA_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkResetCommandPool";
+    pub const NAME: &'static str = "vkGetPipelineCacheData";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkResetCommandPool_args_temp`).
+    /// (`vn_decode_vkGetPipelineCacheData_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkResetCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkGetPipelineCacheData"));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
-        let flags: VkCommandPoolResetFlags = dec.u32()?;
+        let pipeline_cache: VkPipelineCache = VkPipelineCache(dec.handle()?);
+        let p_data_size: Option<u64> = if dec.simple_pointer()? {
+            Some(dec.size()?)
+        } else {
+            return Err(null_pointer(dec, "vkGetPipelineCacheData", "pDataSize"));
+        };
+        let p_data: Option<Vec<u8>> =
+            array_presence(dec, p_data_size.unwrap_or(0), NullArray::Unchecked)?
+                .map(|_| Vec::new());
         Ok(Self {
             device,
-            command_pool,
-            flags,
+            pipeline_cache,
+            p_data_size,
+            p_data,
             ret: Default::default(),
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkResetCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkGetPipelineCacheData`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -352,12 +378,20 @@ impl ResetCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
-        enc.u32(self.flags)?;
+        enc.handle(self.pipeline_cache.0)?;
+        enc.simple_pointer(self.p_data_size.is_some())?;
+        if let Some(v) = &self.p_data_size {
+            enc.size(*v)?;
+        }
+        enc.array_size(if self.p_data.is_some() {
+            self.p_data_size.unwrap_or(0)
+        } else {
+            0
+        })?;
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkResetCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkGetPipelineCacheData_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -368,11 +402,23 @@ impl ResetCommandPoolArgs {
     pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
         enc.reply_header(Self::OPCODE)?;
         enc.i32(self.ret)?;
+        enc.simple_pointer(self.p_data_size.is_some())?;
+        if let Some(v) = &self.p_data_size {
+            enc.size(*v)?;
+        }
+        if let Some(v) = &self.p_data {
+            let count = self.p_data_size.unwrap_or(0);
+            check_len("vkGetPipelineCacheData", "pData", count, v.len())?;
+            enc.array_size(count)?;
+            enc.blob(v)?;
+        } else {
+            enc.array_size(0)?;
+        }
         Ok(())
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkResetCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkGetPipelineCacheData_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -387,55 +433,80 @@ impl ResetCommandPoolArgs {
             });
         }
         self.ret = dec.i32()?;
+        self.p_data_size = if dec.simple_pointer()? {
+            Some(dec.size()?)
+        } else {
+            None
+        };
+        self.p_data =
+            match array_presence(dec, self.p_data_size.unwrap_or(0), NullArray::Unchecked)? {
+                Some(n) => Some(decode_owned_blob(dec, n)?),
+                None => None,
+            };
         Ok(())
     }
 }
 
-/// The arguments of `vkTrimCommandPool`, and its reply.
+/// The arguments of `vkMergePipelineCaches`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
 /// output structures carrying their `sType` and chain skeleton. The executor
-/// fills the outputs in place, then
+/// fills the outputs in place and sets `ret`, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct TrimCommandPoolArgs {
+pub struct MergePipelineCachesArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
-    /// `VkCommandPoolTrimFlags flags` — in.
-    pub flags: VkCommandPoolTrimFlags,
+    /// `VkPipelineCache dstCache` — in.
+    pub dst_cache: VkPipelineCache,
+    /// `uint32_t srcCacheCount` — in.
+    pub src_cache_count: u32,
+    /// `const VkPipelineCache* pSrcCaches` — in.
+    pub p_src_caches: Option<Vec<VkPipelineCache>>,
+    /// The return value (`VkResult`), written first in the reply.
+    pub ret: VkResult,
 }
 
-impl TrimCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkTrimCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_TRIM_COMMAND_POOL_EXT;
+impl MergePipelineCachesArgs {
+    /// `VK_COMMAND_TYPE_vkMergePipelineCaches_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_MERGE_PIPELINE_CACHES_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkTrimCommandPool";
+    pub const NAME: &'static str = "vkMergePipelineCaches";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkTrimCommandPool_args_temp`).
+    /// (`vn_decode_vkMergePipelineCaches_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkTrimCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkMergePipelineCaches"));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
-        let flags: VkCommandPoolTrimFlags = dec.u32()?;
+        let dst_cache: VkPipelineCache = VkPipelineCache(dec.handle()?);
+        let src_cache_count: u32 = dec.u32()?;
+        let p_src_caches: Option<Vec<VkPipelineCache>> =
+            match array_presence(dec, u64::from(src_cache_count), NullArray::Checked)? {
+                Some(n) => Some(decode_vec(dec, n, |dec| {
+                    dec.handle()
+                        .map(VkPipelineCache)
+                        .map_err(ProtocolError::from)
+                })?),
+                None => None,
+            };
         Ok(Self {
             device,
-            command_pool,
-            flags,
+            dst_cache,
+            src_cache_count,
+            p_src_caches,
+            ret: Default::default(),
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkTrimCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkMergePipelineCaches`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -445,12 +516,22 @@ impl TrimCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
-        enc.u32(self.flags)?;
+        enc.handle(self.dst_cache.0)?;
+        enc.u32(self.src_cache_count)?;
+        if let Some(v) = &self.p_src_caches {
+            let count = u64::from(self.src_cache_count);
+            check_len("vkMergePipelineCaches", "pSrcCaches", count, v.len())?;
+            enc.array_size(count)?;
+            for e in v {
+                enc.handle(e.0)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkTrimCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkMergePipelineCaches_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -460,11 +541,12 @@ impl TrimCommandPoolArgs {
     /// its count.
     pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
         enc.reply_header(Self::OPCODE)?;
+        enc.i32(self.ret)?;
         Ok(())
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkTrimCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkMergePipelineCaches_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -478,6 +560,7 @@ impl TrimCommandPoolArgs {
                 found,
             });
         }
+        self.ret = dec.i32()?;
         Ok(())
     }
 }

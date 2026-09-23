@@ -140,6 +140,23 @@ ${"impl<'a>" if any_lt else 'impl'} Command${"<'a>" if any_lt else ''} {
         Ok(enc.finish()?)
     }
 
+    /// Visit every pNext link the command carries, anywhere in its
+    /// arguments, as `(parent structure, sType)`. The chain whitelists are
+    /// the protocol's, which is wider than what an executor implements;
+    /// this is how an executor judges them.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        match self {
+% for cmd in M.commands:
+%   if M.reach_chain[cmd]:
+            Self::${R.command_variant(cmd)}(args) => args.for_each_link(f),
+%   endif
+% endfor
+% if not all(M.reach_chain[c] for c in M.commands):
+            _ => {}
+% endif
+        }
+    }
+
     /// Decode a reply into this command's outputs, as the guest's driver would.
     ///
     /// # Errors

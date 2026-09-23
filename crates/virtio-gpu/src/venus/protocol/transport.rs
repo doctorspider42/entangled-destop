@@ -2,91 +2,14 @@
 // from venus-protocol git-70991d4c. DO NOT EDIT: regenerate with
 //     python scripts/venus-gen.py
 
-//! The `command_pool` group: its commands and the structures only they reach.
+//! The `transport` group: its commands and the structures only they reach.
 
 #![allow(unused_imports)]
 
 use super::*;
 use crate::venus::wire::{CommandHeader, Decoder, Encoder};
 
-/// `VkCommandPoolCreateInfo` (`VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO`).
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct VkCommandPoolCreateInfo {
-    /// `VkCommandPoolCreateFlags flags`
-    pub flags: VkCommandPoolCreateFlags,
-    /// `uint32_t queueFamilyIndex`
-    pub queue_family_index: u32,
-}
-
-impl VkCommandPoolCreateInfo {
-    // No output parameter reaches this structure, so it has no skeleton
-    // form and the `partial` flag below is ignored.
-
-    /// `VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO`.
-    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-
-    /// Decode the whole structure, as an input carries it.
-    ///
-    /// # Errors
-    /// Whatever the wire or this layer refused; `dec` is left fatal.
-    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
-        Self::decode_with(dec, false)
-    }
-
-    /// Encode the whole structure, as a reply carries it.
-    ///
-    /// # Errors
-    /// Whatever the encoder refused, or an array that disagrees with its count.
-    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
-        self.encode_with(enc, false)
-    }
-
-    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
-    ///
-    /// # Errors
-    /// As [`Self::decode`].
-    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
-        expect_structure_type(dec, "VkCommandPoolCreateInfo", Self::STRUCTURE_TYPE)?;
-        dec.empty_pnext_chain("VkCommandPoolCreateInfo")?;
-        Self::decode_body(dec, partial)
-    }
-
-    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
-    ///
-    /// # Errors
-    /// As [`Self::encode`].
-    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
-        enc.structure_type(Self::STRUCTURE_TYPE)?;
-        enc.simple_pointer(false)?;
-        self.encode_body(enc, partial)
-    }
-
-    /// The fields after `sType` and `pNext`, as a chain link carries them
-    /// (`vn_decode_VkCommandPoolCreateInfo_self_temp`).
-    ///
-    /// # Errors
-    /// As [`Self::decode`].
-    pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
-        let flags: VkCommandPoolCreateFlags = dec.u32()?;
-        let queue_family_index: u32 = dec.u32()?;
-        Ok(Self {
-            flags,
-            queue_family_index,
-        })
-    }
-
-    /// The fields after `sType` and `pNext`, as a chain link carries them.
-    ///
-    /// # Errors
-    /// As [`Self::encode`].
-    pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
-        enc.u32(self.flags)?;
-        enc.u32(self.queue_family_index)?;
-        Ok(())
-    }
-}
-
-/// The arguments of `vkCreateCommandPool`, and its reply.
+/// The arguments of `vkCreateDeferredOperationKHR`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -94,55 +17,51 @@ impl VkCommandPoolCreateInfo {
 /// fills the outputs in place and sets `ret`, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct CreateCommandPoolArgs {
+pub struct CreateDeferredOperationKHRArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `const VkCommandPoolCreateInfo* pCreateInfo` — in.
-    pub p_create_info: Option<VkCommandPoolCreateInfo>,
-    /// `VkCommandPool* pCommandPool` — out.
-    pub p_command_pool: Option<VkCommandPool>,
+    /// `VkDeferredOperationKHR* pDeferredOperation` — out.
+    pub p_deferred_operation: Option<VkDeferredOperationKHR>,
     /// The return value (`VkResult`), written first in the reply.
     pub ret: VkResult,
 }
 
-impl CreateCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkCreateCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_CREATE_COMMAND_POOL_EXT;
+impl CreateDeferredOperationKHRArgs {
+    /// `VK_COMMAND_TYPE_vkCreateDeferredOperationKHR_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_CREATE_DEFERRED_OPERATION_KHR_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkCreateCommandPool";
+    pub const NAME: &'static str = "vkCreateDeferredOperationKHR";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkCreateCommandPool_args_temp`).
+    /// (`vn_decode_vkCreateDeferredOperationKHR_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkCreateCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkCreateDeferredOperationKHR"));
         }
-        let p_create_info: Option<VkCommandPoolCreateInfo> = if dec.simple_pointer()? {
-            Some(VkCommandPoolCreateInfo::decode_with(dec, false)?)
-        } else {
-            return Err(null_pointer(dec, "vkCreateCommandPool", "pCreateInfo"));
-        };
         dec.null_allocator()?;
-        let p_command_pool: Option<VkCommandPool> = if dec.simple_pointer()? {
-            Some(VkCommandPool(dec.handle()?))
+        let p_deferred_operation: Option<VkDeferredOperationKHR> = if dec.simple_pointer()? {
+            Some(VkDeferredOperationKHR(dec.handle()?))
         } else {
-            return Err(null_pointer(dec, "vkCreateCommandPool", "pCommandPool"));
+            return Err(null_pointer(
+                dec,
+                "vkCreateDeferredOperationKHR",
+                "pDeferredOperation",
+            ));
         };
         Ok(Self {
             device,
-            p_create_info,
-            p_command_pool,
+            p_deferred_operation,
             ret: Default::default(),
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkCreateCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkCreateDeferredOperationKHR`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -152,19 +71,15 @@ impl CreateCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.simple_pointer(self.p_create_info.is_some())?;
-        if let Some(v) = &self.p_create_info {
-            v.encode_with(enc, false)?;
-        }
         enc.null_allocator()?;
-        enc.simple_pointer(self.p_command_pool.is_some())?;
-        if let Some(v) = &self.p_command_pool {
+        enc.simple_pointer(self.p_deferred_operation.is_some())?;
+        if let Some(v) = &self.p_deferred_operation {
             enc.handle(v.0)?;
         }
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkCreateCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkCreateDeferredOperationKHR_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -175,15 +90,15 @@ impl CreateCommandPoolArgs {
     pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
         enc.reply_header(Self::OPCODE)?;
         enc.i32(self.ret)?;
-        enc.simple_pointer(self.p_command_pool.is_some())?;
-        if let Some(v) = &self.p_command_pool {
+        enc.simple_pointer(self.p_deferred_operation.is_some())?;
+        if let Some(v) = &self.p_deferred_operation {
             enc.handle(v.0)?;
         }
         Ok(())
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkCreateCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkCreateDeferredOperationKHR_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -198,8 +113,8 @@ impl CreateCommandPoolArgs {
             });
         }
         self.ret = dec.i32()?;
-        self.p_command_pool = if dec.simple_pointer()? {
-            Some(VkCommandPool(dec.handle()?))
+        self.p_deferred_operation = if dec.simple_pointer()? {
+            Some(VkDeferredOperationKHR(dec.handle()?))
         } else {
             None
         };
@@ -207,7 +122,7 @@ impl CreateCommandPoolArgs {
     }
 }
 
-/// The arguments of `vkDestroyCommandPool`, and its reply.
+/// The arguments of `vkDestroyDeferredOperationKHR`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -215,40 +130,37 @@ impl CreateCommandPoolArgs {
 /// fills the outputs in place, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct DestroyCommandPoolArgs {
+pub struct DestroyDeferredOperationKHRArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
+    /// `VkDeferredOperationKHR operation` — in.
+    pub operation: VkDeferredOperationKHR,
 }
 
-impl DestroyCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkDestroyCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_DESTROY_COMMAND_POOL_EXT;
+impl DestroyDeferredOperationKHRArgs {
+    /// `VK_COMMAND_TYPE_vkDestroyDeferredOperationKHR_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_DESTROY_DEFERRED_OPERATION_KHR_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkDestroyCommandPool";
+    pub const NAME: &'static str = "vkDestroyDeferredOperationKHR";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkDestroyCommandPool_args_temp`).
+    /// (`vn_decode_vkDestroyDeferredOperationKHR_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkDestroyCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkDestroyDeferredOperationKHR"));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
+        let operation: VkDeferredOperationKHR = VkDeferredOperationKHR(dec.handle()?);
         dec.null_allocator()?;
-        Ok(Self {
-            device,
-            command_pool,
-        })
+        Ok(Self { device, operation })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkDestroyCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkDestroyDeferredOperationKHR`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -258,12 +170,12 @@ impl DestroyCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
+        enc.handle(self.operation.0)?;
         enc.null_allocator()?;
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkDestroyCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkDestroyDeferredOperationKHR_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -277,7 +189,7 @@ impl DestroyCommandPoolArgs {
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkDestroyCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkDestroyDeferredOperationKHR_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -295,7 +207,7 @@ impl DestroyCommandPoolArgs {
     }
 }
 
-/// The arguments of `vkResetCommandPool`, and its reply.
+/// The arguments of `vkGetDeferredOperationMaxConcurrencyKHR`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
@@ -303,46 +215,45 @@ impl DestroyCommandPoolArgs {
 /// fills the outputs in place and sets `ret`, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct ResetCommandPoolArgs {
+pub struct GetDeferredOperationMaxConcurrencyKHRArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
-    /// `VkCommandPoolResetFlags flags` — in.
-    pub flags: VkCommandPoolResetFlags,
-    /// The return value (`VkResult`), written first in the reply.
-    pub ret: VkResult,
+    /// `VkDeferredOperationKHR operation` — in.
+    pub operation: VkDeferredOperationKHR,
+    /// The return value (`uint32_t`), written first in the reply.
+    pub ret: u32,
 }
 
-impl ResetCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkResetCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_RESET_COMMAND_POOL_EXT;
+impl GetDeferredOperationMaxConcurrencyKHRArgs {
+    /// `VK_COMMAND_TYPE_vkGetDeferredOperationMaxConcurrencyKHR_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_DEFERRED_OPERATION_MAX_CONCURRENCY_KHR_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkResetCommandPool";
+    pub const NAME: &'static str = "vkGetDeferredOperationMaxConcurrencyKHR";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkResetCommandPool_args_temp`).
+    /// (`vn_decode_vkGetDeferredOperationMaxConcurrencyKHR_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkResetCommandPool"));
+            return Err(null_dispatch_handle(
+                dec,
+                "vkGetDeferredOperationMaxConcurrencyKHR",
+            ));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
-        let flags: VkCommandPoolResetFlags = dec.u32()?;
+        let operation: VkDeferredOperationKHR = VkDeferredOperationKHR(dec.handle()?);
         Ok(Self {
             device,
-            command_pool,
-            flags,
+            operation,
             ret: Default::default(),
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkResetCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkGetDeferredOperationMaxConcurrencyKHR`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -352,12 +263,102 @@ impl ResetCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
-        enc.u32(self.flags)?;
+        enc.handle(self.operation.0)?;
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkResetCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkGetDeferredOperationMaxConcurrencyKHR_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.u32(self.ret)?;
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkGetDeferredOperationMaxConcurrencyKHR_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.ret = dec.u32()?;
+        Ok(())
+    }
+}
+
+/// The arguments of `vkGetDeferredOperationResultKHR`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place and sets `ret`, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GetDeferredOperationResultKHRArgs {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `VkDeferredOperationKHR operation` — in.
+    pub operation: VkDeferredOperationKHR,
+    /// The return value (`VkResult`), written first in the reply.
+    pub ret: VkResult,
+}
+
+impl GetDeferredOperationResultKHRArgs {
+    /// `VK_COMMAND_TYPE_vkGetDeferredOperationResultKHR_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_DEFERRED_OPERATION_RESULT_KHR_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkGetDeferredOperationResultKHR";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkGetDeferredOperationResultKHR_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(dec, "vkGetDeferredOperationResultKHR"));
+        }
+        let operation: VkDeferredOperationKHR = VkDeferredOperationKHR(dec.handle()?);
+        Ok(Self {
+            device,
+            operation,
+            ret: Default::default(),
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkGetDeferredOperationResultKHR`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.handle(self.operation.0)?;
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkGetDeferredOperationResultKHR_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -372,7 +373,7 @@ impl ResetCommandPoolArgs {
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkResetCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkGetDeferredOperationResultKHR_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -391,51 +392,50 @@ impl ResetCommandPoolArgs {
     }
 }
 
-/// The arguments of `vkTrimCommandPool`, and its reply.
+/// The arguments of `vkDeferredOperationJoinKHR`, and its reply.
 ///
 /// Inputs are as the guest sent them. Outputs are as the guest *sized*
 /// them: present or null, output handles carrying the guest's chosen id,
 /// output structures carrying their `sType` and chain skeleton. The executor
-/// fills the outputs in place, then
+/// fills the outputs in place and sets `ret`, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct TrimCommandPoolArgs {
+pub struct DeferredOperationJoinKHRArgs {
     /// `VkDevice device` — in.
     pub device: VkDevice,
-    /// `VkCommandPool commandPool` — in.
-    pub command_pool: VkCommandPool,
-    /// `VkCommandPoolTrimFlags flags` — in.
-    pub flags: VkCommandPoolTrimFlags,
+    /// `VkDeferredOperationKHR operation` — in.
+    pub operation: VkDeferredOperationKHR,
+    /// The return value (`VkResult`), written first in the reply.
+    pub ret: VkResult,
 }
 
-impl TrimCommandPoolArgs {
-    /// `VK_COMMAND_TYPE_vkTrimCommandPool_EXT`.
-    pub const OPCODE: u32 = VK_COMMAND_TYPE_TRIM_COMMAND_POOL_EXT;
+impl DeferredOperationJoinKHRArgs {
+    /// `VK_COMMAND_TYPE_vkDeferredOperationJoinKHR_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_DEFERRED_OPERATION_JOIN_KHR_EXT;
 
     /// The command's registry name.
-    pub const NAME: &'static str = "vkTrimCommandPool";
+    pub const NAME: &'static str = "vkDeferredOperationJoinKHR";
 
     /// Decode the arguments that follow the 8-byte command header
-    /// (`vn_decode_vkTrimCommandPool_args_temp`).
+    /// (`vn_decode_vkDeferredOperationJoinKHR_args_temp`).
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
-            return Err(null_dispatch_handle(dec, "vkTrimCommandPool"));
+            return Err(null_dispatch_handle(dec, "vkDeferredOperationJoinKHR"));
         }
-        let command_pool: VkCommandPool = VkCommandPool(dec.handle()?);
-        let flags: VkCommandPoolTrimFlags = dec.u32()?;
+        let operation: VkDeferredOperationKHR = VkDeferredOperationKHR(dec.handle()?);
         Ok(Self {
             device,
-            command_pool,
-            flags,
+            operation,
+            ret: Default::default(),
         })
     }
 
     /// Encode the command as the guest's driver does, header included
-    /// (`vn_encode_vkTrimCommandPool`): outputs as skeletons.
+    /// (`vn_encode_vkDeferredOperationJoinKHR`): outputs as skeletons.
     ///
     /// # Errors
     /// Whatever the encoder refused, or an array that disagrees with its count.
@@ -445,12 +445,11 @@ impl TrimCommandPoolArgs {
             flags,
         })?;
         enc.handle(self.device.0)?;
-        enc.handle(self.command_pool.0)?;
-        enc.u32(self.flags)?;
+        enc.handle(self.operation.0)?;
         Ok(())
     }
 
-    /// Encode the reply (`vn_encode_vkTrimCommandPool_reply`): the opcode, the
+    /// Encode the reply (`vn_encode_vkDeferredOperationJoinKHR_reply`): the opcode, the
     /// return value if any, then every output parameter.
     ///
     /// On `Err` the encoder holds a partial reply and must be dropped.
@@ -460,11 +459,12 @@ impl TrimCommandPoolArgs {
     /// its count.
     pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
         enc.reply_header(Self::OPCODE)?;
+        enc.i32(self.ret)?;
         Ok(())
     }
 
     /// Decode a reply into this command's outputs, as the guest's driver
-    /// does (`vn_decode_vkTrimCommandPool_reply`): arrays in a reply are never
+    /// does (`vn_decode_vkDeferredOperationJoinKHR_reply`): arrays in a reply are never
     /// cross-checked in their null branch, and a null output is not fatal.
     ///
     /// # Errors
@@ -478,6 +478,7 @@ impl TrimCommandPoolArgs {
                 found,
             });
         }
+        self.ret = dec.i32()?;
         Ok(())
     }
 }

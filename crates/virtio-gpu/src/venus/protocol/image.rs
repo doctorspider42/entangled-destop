@@ -9,11 +9,118 @@
 use super::*;
 use crate::venus::wire::{CommandHeader, Decoder, Encoder};
 
+/// `VkSparseImageMemoryRequirements`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkSparseImageMemoryRequirements {
+    /// `VkSparseImageFormatProperties formatProperties`
+    pub format_properties: VkSparseImageFormatProperties,
+    /// `uint32_t imageMipTailFirstLod`
+    pub image_mip_tail_first_lod: u32,
+    /// `VkDeviceSize imageMipTailSize`
+    pub image_mip_tail_size: VkDeviceSize,
+    /// `VkDeviceSize imageMipTailOffset`
+    pub image_mip_tail_offset: VkDeviceSize,
+    /// `VkDeviceSize imageMipTailStride`
+    pub image_mip_tail_stride: VkDeviceSize,
+}
+
+impl VkSparseImageMemoryRequirements {
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Decode the skeleton an output structure is sent as inside a command
+    /// (`vn_decode_VkSparseImageMemoryRequirements_partial_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_partial(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, true)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// Encode the skeleton form (`vn_encode_VkSparseImageMemoryRequirements_partial`).
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_partial(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, true)
+    }
+
+    /// `decode` or `decode_partial`.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        let format_properties: VkSparseImageFormatProperties =
+            VkSparseImageFormatProperties::decode_with(dec, partial)?;
+        let image_mip_tail_first_lod: u32 = if partial {
+            Default::default()
+        } else {
+            dec.u32()?
+        };
+        let image_mip_tail_size: VkDeviceSize = if partial {
+            Default::default()
+        } else {
+            dec.u64()?
+        };
+        let image_mip_tail_offset: VkDeviceSize = if partial {
+            Default::default()
+        } else {
+            dec.u64()?
+        };
+        let image_mip_tail_stride: VkDeviceSize = if partial {
+            Default::default()
+        } else {
+            dec.u64()?
+        };
+        Ok(Self {
+            format_properties,
+            image_mip_tail_first_lod,
+            image_mip_tail_size,
+            image_mip_tail_offset,
+            image_mip_tail_stride,
+        })
+    }
+
+    /// `encode` or `encode_partial`.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        self.format_properties.encode_with(enc, partial)?;
+        if !partial {
+            enc.u32(self.image_mip_tail_first_lod)?;
+        }
+        if !partial {
+            enc.u64(self.image_mip_tail_size)?;
+        }
+        if !partial {
+            enc.u64(self.image_mip_tail_offset)?;
+        }
+        if !partial {
+            enc.u64(self.image_mip_tail_stride)?;
+        }
+        Ok(())
+    }
+}
+
 /// `VkImageCreateInfo` (`VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO`).
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct VkImageCreateInfo {
-    /// The pNext chain, in the guest's order. Admits: `VkExternalMemoryImageCreateInfo`, `VkImageFormatListCreateInfo`, `VkImageStencilUsageCreateInfo`.
-    pub p_next: Vec<VkImageCreateInfoNext>,
+pub struct VkImageCreateInfo<'a> {
+    /// The pNext chain, in the guest's order. Admits: `VkExternalMemoryImageCreateInfo`, `VkImageFormatListCreateInfo`, `VkImageDrmFormatModifierListCreateInfoEXT`, `VkImageDrmFormatModifierExplicitCreateInfoEXT`, `VkImageStencilUsageCreateInfo`, `VkOpaqueCaptureDataCreateInfoEXT`.
+    pub p_next: Vec<VkImageCreateInfoNext<'a>>,
     /// `VkImageCreateFlags flags`
     pub flags: VkImageCreateFlags,
     /// `VkImageType imageType`
@@ -42,7 +149,7 @@ pub struct VkImageCreateInfo {
     pub initial_layout: VkImageLayout,
 }
 
-impl VkImageCreateInfo {
+impl<'a> VkImageCreateInfo<'a> {
     // No output parameter reaches this structure, so it has no skeleton
     // form and the `partial` flag below is ignored.
 
@@ -53,7 +160,7 @@ impl VkImageCreateInfo {
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
-    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+    pub fn decode(dec: &mut Decoder<'a>) -> Result<Self, ProtocolError> {
         Self::decode_with(dec, false)
     }
 
@@ -69,7 +176,7 @@ impl VkImageCreateInfo {
     ///
     /// # Errors
     /// As [`Self::decode`].
-    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+    pub fn decode_with(dec: &mut Decoder<'a>, partial: bool) -> Result<Self, ProtocolError> {
         expect_structure_type(dec, "VkImageCreateInfo", Self::STRUCTURE_TYPE)?;
         let p_next = decode_chain::<VkImageCreateInfoNext>(dec, partial)?;
         let mut value = Self::decode_body(dec, partial)?;
@@ -92,7 +199,7 @@ impl VkImageCreateInfo {
     ///
     /// # Errors
     /// As [`Self::decode`].
-    pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
+    pub fn decode_body(dec: &mut Decoder<'a>, _partial: bool) -> Result<Self, ProtocolError> {
         let flags: VkImageCreateFlags = dec.u32()?;
         let image_type: VkImageType = dec.i32()?;
         let format: VkFormat = dec.i32()?;
@@ -161,20 +268,34 @@ impl VkImageCreateInfo {
         enc.i32(self.initial_layout)?;
         Ok(())
     }
+
+    /// Visit every pNext link this structure carries — its own chain's and
+    /// its members' — as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        for link in &self.p_next {
+            f("VkImageCreateInfo", link.structure_type());
+        }
+    }
 }
 
 /// A link of `VkImageCreateInfo`'s pNext chain.
 #[derive(Debug, Clone, PartialEq)]
-pub enum VkImageCreateInfoNext {
+pub enum VkImageCreateInfoNext<'a> {
     /// `VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO`.
     VkExternalMemoryImageCreateInfo(VkExternalMemoryImageCreateInfo),
     /// `VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO`.
     VkImageFormatListCreateInfo(VkImageFormatListCreateInfo),
+    /// `VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT`.
+    VkImageDrmFormatModifierListCreateInfoEXT(VkImageDrmFormatModifierListCreateInfoEXT),
+    /// `VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT`.
+    VkImageDrmFormatModifierExplicitCreateInfoEXT(VkImageDrmFormatModifierExplicitCreateInfoEXT),
     /// `VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO`.
     VkImageStencilUsageCreateInfo(VkImageStencilUsageCreateInfo),
+    /// `VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT`.
+    VkOpaqueCaptureDataCreateInfoEXT(VkOpaqueCaptureDataCreateInfoEXT<'a>),
 }
 
-impl<'a> ChainLink<'a> for VkImageCreateInfoNext {
+impl<'a> ChainLink<'a> for VkImageCreateInfoNext<'a> {
     const PARENT: &'static str = "VkImageCreateInfo";
 
     fn structure_type(&self) -> i32 {
@@ -183,8 +304,17 @@ impl<'a> ChainLink<'a> for VkImageCreateInfoNext {
                 VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO
             }
             Self::VkImageFormatListCreateInfo(_) => VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+            Self::VkImageDrmFormatModifierListCreateInfoEXT(_) => {
+                VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT
+            }
+            Self::VkImageDrmFormatModifierExplicitCreateInfoEXT(_) => {
+                VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT
+            }
             Self::VkImageStencilUsageCreateInfo(_) => {
                 VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO
+            }
+            Self::VkOpaqueCaptureDataCreateInfoEXT(_) => {
+                VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT
             }
         }
     }
@@ -203,9 +333,21 @@ impl<'a> ChainLink<'a> for VkImageCreateInfoNext {
                 VkImageFormatListCreateInfo::decode_body(dec, partial)
                     .map(Self::VkImageFormatListCreateInfo)
             }
+            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT => {
+                VkImageDrmFormatModifierListCreateInfoEXT::decode_body(dec, partial)
+                    .map(Self::VkImageDrmFormatModifierListCreateInfoEXT)
+            }
+            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT => {
+                VkImageDrmFormatModifierExplicitCreateInfoEXT::decode_body(dec, partial)
+                    .map(Self::VkImageDrmFormatModifierExplicitCreateInfoEXT)
+            }
             VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO => {
                 VkImageStencilUsageCreateInfo::decode_body(dec, partial)
                     .map(Self::VkImageStencilUsageCreateInfo)
+            }
+            VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT => {
+                VkOpaqueCaptureDataCreateInfoEXT::decode_body(dec, partial)
+                    .map(Self::VkOpaqueCaptureDataCreateInfoEXT)
             }
             _ => return None,
         })
@@ -215,7 +357,12 @@ impl<'a> ChainLink<'a> for VkImageCreateInfoNext {
         match self {
             Self::VkExternalMemoryImageCreateInfo(link) => link.encode_body(enc, partial),
             Self::VkImageFormatListCreateInfo(link) => link.encode_body(enc, partial),
+            Self::VkImageDrmFormatModifierListCreateInfoEXT(link) => link.encode_body(enc, partial),
+            Self::VkImageDrmFormatModifierExplicitCreateInfoEXT(link) => {
+                link.encode_body(enc, partial)
+            }
             Self::VkImageStencilUsageCreateInfo(link) => link.encode_body(enc, partial),
+            Self::VkOpaqueCaptureDataCreateInfoEXT(link) => link.encode_body(enc, partial),
         }
     }
 }
@@ -286,6 +433,761 @@ impl VkExternalMemoryImageCreateInfo {
     /// As [`Self::encode`].
     pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
         enc.u32(self.handle_types)?;
+        Ok(())
+    }
+}
+
+/// `VkImageDrmFormatModifierListCreateInfoEXT` (`VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkImageDrmFormatModifierListCreateInfoEXT {
+    /// `uint32_t drmFormatModifierCount`
+    pub drm_format_modifier_count: u32,
+    /// `const uint64_t* pDrmFormatModifiers`
+    pub p_drm_format_modifiers: Option<Vec<u64>>,
+}
+
+impl VkImageDrmFormatModifierListCreateInfoEXT {
+    // No output parameter reaches this structure, so it has no skeleton
+    // form and the `partial` flag below is ignored.
+
+    /// `VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT`.
+    pub const STRUCTURE_TYPE: i32 =
+        VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
+
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(
+            dec,
+            "VkImageDrmFormatModifierListCreateInfoEXT",
+            Self::STRUCTURE_TYPE,
+        )?;
+        dec.empty_pnext_chain("VkImageDrmFormatModifierListCreateInfoEXT")?;
+        Self::decode_body(dec, partial)
+    }
+
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        enc.simple_pointer(false)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkImageDrmFormatModifierListCreateInfoEXT_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
+        let drm_format_modifier_count: u32 = dec.u32()?;
+        let p_drm_format_modifiers: Option<Vec<u64>> = match array_presence(
+            dec,
+            u64::from(drm_format_modifier_count),
+            NullArray::Checked,
+        )? {
+            Some(n) => Some(dec.u64_array(n)?),
+            None => None,
+        };
+        Ok(Self {
+            drm_format_modifier_count,
+            p_drm_format_modifiers,
+        })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
+        enc.u32(self.drm_format_modifier_count)?;
+        if let Some(v) = &self.p_drm_format_modifiers {
+            let count = u64::from(self.drm_format_modifier_count);
+            check_len(
+                "VkImageDrmFormatModifierListCreateInfoEXT",
+                "pDrmFormatModifiers",
+                count,
+                v.len(),
+            )?;
+            enc.array_size(count)?;
+            for e in v {
+                enc.u64(*e)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+}
+
+/// `VkSubresourceLayout`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkSubresourceLayout {
+    /// `VkDeviceSize offset`
+    pub offset: VkDeviceSize,
+    /// `VkDeviceSize size`
+    pub size: VkDeviceSize,
+    /// `VkDeviceSize rowPitch`
+    pub row_pitch: VkDeviceSize,
+    /// `VkDeviceSize arrayPitch`
+    pub array_pitch: VkDeviceSize,
+    /// `VkDeviceSize depthPitch`
+    pub depth_pitch: VkDeviceSize,
+}
+
+impl VkSubresourceLayout {
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Decode the skeleton an output structure is sent as inside a command
+    /// (`vn_decode_VkSubresourceLayout_partial_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_partial(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, true)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// Encode the skeleton form (`vn_encode_VkSubresourceLayout_partial`).
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_partial(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, true)
+    }
+
+    /// `decode` or `decode_partial`.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        let offset: VkDeviceSize = if partial {
+            Default::default()
+        } else {
+            dec.u64()?
+        };
+        let size: VkDeviceSize = if partial {
+            Default::default()
+        } else {
+            dec.u64()?
+        };
+        let row_pitch: VkDeviceSize = if partial {
+            Default::default()
+        } else {
+            dec.u64()?
+        };
+        let array_pitch: VkDeviceSize = if partial {
+            Default::default()
+        } else {
+            dec.u64()?
+        };
+        let depth_pitch: VkDeviceSize = if partial {
+            Default::default()
+        } else {
+            dec.u64()?
+        };
+        Ok(Self {
+            offset,
+            size,
+            row_pitch,
+            array_pitch,
+            depth_pitch,
+        })
+    }
+
+    /// `encode` or `encode_partial`.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        if !partial {
+            enc.u64(self.offset)?;
+        }
+        if !partial {
+            enc.u64(self.size)?;
+        }
+        if !partial {
+            enc.u64(self.row_pitch)?;
+        }
+        if !partial {
+            enc.u64(self.array_pitch)?;
+        }
+        if !partial {
+            enc.u64(self.depth_pitch)?;
+        }
+        Ok(())
+    }
+}
+
+/// `VkImageDrmFormatModifierExplicitCreateInfoEXT` (`VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkImageDrmFormatModifierExplicitCreateInfoEXT {
+    /// `uint64_t drmFormatModifier`
+    pub drm_format_modifier: u64,
+    /// `uint32_t drmFormatModifierPlaneCount`
+    pub drm_format_modifier_plane_count: u32,
+    /// `const VkSubresourceLayout* pPlaneLayouts`
+    pub p_plane_layouts: Option<Vec<VkSubresourceLayout>>,
+}
+
+impl VkImageDrmFormatModifierExplicitCreateInfoEXT {
+    // No output parameter reaches this structure, so it has no skeleton
+    // form and the `partial` flag below is ignored.
+
+    /// `VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT`.
+    pub const STRUCTURE_TYPE: i32 =
+        VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(
+            dec,
+            "VkImageDrmFormatModifierExplicitCreateInfoEXT",
+            Self::STRUCTURE_TYPE,
+        )?;
+        dec.empty_pnext_chain("VkImageDrmFormatModifierExplicitCreateInfoEXT")?;
+        Self::decode_body(dec, partial)
+    }
+
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        enc.simple_pointer(false)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkImageDrmFormatModifierExplicitCreateInfoEXT_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
+        let drm_format_modifier: u64 = dec.u64()?;
+        let drm_format_modifier_plane_count: u32 = dec.u32()?;
+        let p_plane_layouts: Option<Vec<VkSubresourceLayout>> = match array_presence(
+            dec,
+            u64::from(drm_format_modifier_plane_count),
+            NullArray::Checked,
+        )? {
+            Some(n) => Some(decode_vec(dec, n, |dec| {
+                VkSubresourceLayout::decode_with(dec, false)
+            })?),
+            None => None,
+        };
+        Ok(Self {
+            drm_format_modifier,
+            drm_format_modifier_plane_count,
+            p_plane_layouts,
+        })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
+        enc.u64(self.drm_format_modifier)?;
+        enc.u32(self.drm_format_modifier_plane_count)?;
+        if let Some(v) = &self.p_plane_layouts {
+            let count = u64::from(self.drm_format_modifier_plane_count);
+            check_len(
+                "VkImageDrmFormatModifierExplicitCreateInfoEXT",
+                "pPlaneLayouts",
+                count,
+                v.len(),
+            )?;
+            enc.array_size(count)?;
+            for e in v {
+                e.encode_with(enc, false)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+}
+
+/// `VkOpaqueCaptureDataCreateInfoEXT` (`VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkOpaqueCaptureDataCreateInfoEXT<'a> {
+    /// `const VkHostAddressRangeConstEXT* pData`
+    pub p_data: Option<VkHostAddressRangeConstEXT<'a>>,
+}
+
+impl<'a> VkOpaqueCaptureDataCreateInfoEXT<'a> {
+    // No output parameter reaches this structure, so it has no skeleton
+    // form and the `partial` flag below is ignored.
+
+    /// `VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT;
+
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'a>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'a>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(
+            dec,
+            "VkOpaqueCaptureDataCreateInfoEXT",
+            Self::STRUCTURE_TYPE,
+        )?;
+        dec.empty_pnext_chain("VkOpaqueCaptureDataCreateInfoEXT")?;
+        Self::decode_body(dec, partial)
+    }
+
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        enc.simple_pointer(false)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkOpaqueCaptureDataCreateInfoEXT_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'a>, _partial: bool) -> Result<Self, ProtocolError> {
+        let p_data: Option<VkHostAddressRangeConstEXT<'a>> = if dec.simple_pointer()? {
+            Some(VkHostAddressRangeConstEXT::decode_with(dec, false)?)
+        } else {
+            None
+        };
+        Ok(Self { p_data })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
+        enc.simple_pointer(self.p_data.is_some())?;
+        if let Some(v) = &self.p_data {
+            v.encode_with(enc, false)?;
+        }
+        Ok(())
+    }
+}
+
+/// `VkBindImageMemoryInfo` (`VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkBindImageMemoryInfo {
+    /// The pNext chain, in the guest's order. Admits: `VkBindImageMemoryDeviceGroupInfo`, `VkBindImagePlaneMemoryInfo`, `VkBindMemoryStatus`.
+    pub p_next: Vec<VkBindImageMemoryInfoNext>,
+    /// `VkImage image`
+    pub image: VkImage,
+    /// `VkDeviceMemory memory`
+    pub memory: VkDeviceMemory,
+    /// `VkDeviceSize memoryOffset`
+    pub memory_offset: VkDeviceSize,
+}
+
+impl VkBindImageMemoryInfo {
+    // No output parameter reaches this structure, so it has no skeleton
+    // form and the `partial` flag below is ignored.
+
+    /// `VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
+
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(dec, "VkBindImageMemoryInfo", Self::STRUCTURE_TYPE)?;
+        let p_next = decode_chain::<VkBindImageMemoryInfoNext>(dec, partial)?;
+        let mut value = Self::decode_body(dec, partial)?;
+        value.p_next = p_next;
+        Ok(value)
+    }
+
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        encode_chain(enc, &self.p_next, partial)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkBindImageMemoryInfo_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
+        let image: VkImage = VkImage(dec.handle()?);
+        let memory: VkDeviceMemory = VkDeviceMemory(dec.handle()?);
+        let memory_offset: VkDeviceSize = dec.u64()?;
+        Ok(Self {
+            p_next: Vec::new(),
+            image,
+            memory,
+            memory_offset,
+        })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
+        enc.handle(self.image.0)?;
+        enc.handle(self.memory.0)?;
+        enc.u64(self.memory_offset)?;
+        Ok(())
+    }
+
+    /// Visit every pNext link this structure carries — its own chain's and
+    /// its members' — as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        for link in &self.p_next {
+            f("VkBindImageMemoryInfo", link.structure_type());
+        }
+    }
+}
+
+/// A link of `VkBindImageMemoryInfo`'s pNext chain.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VkBindImageMemoryInfoNext {
+    /// `VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO`.
+    VkBindImageMemoryDeviceGroupInfo(VkBindImageMemoryDeviceGroupInfo),
+    /// `VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO`.
+    VkBindImagePlaneMemoryInfo(VkBindImagePlaneMemoryInfo),
+    /// `VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS`.
+    VkBindMemoryStatus(VkBindMemoryStatus),
+}
+
+impl<'a> ChainLink<'a> for VkBindImageMemoryInfoNext {
+    const PARENT: &'static str = "VkBindImageMemoryInfo";
+
+    fn structure_type(&self) -> i32 {
+        match self {
+            Self::VkBindImageMemoryDeviceGroupInfo(_) => {
+                VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO
+            }
+            Self::VkBindImagePlaneMemoryInfo(_) => VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO,
+            Self::VkBindMemoryStatus(_) => VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS,
+        }
+    }
+
+    fn decode_body(
+        stype: i32,
+        dec: &mut Decoder<'a>,
+        partial: bool,
+    ) -> Option<Result<Self, ProtocolError>> {
+        Some(match stype {
+            VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO => {
+                VkBindImageMemoryDeviceGroupInfo::decode_body(dec, partial)
+                    .map(Self::VkBindImageMemoryDeviceGroupInfo)
+            }
+            VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO => {
+                VkBindImagePlaneMemoryInfo::decode_body(dec, partial)
+                    .map(Self::VkBindImagePlaneMemoryInfo)
+            }
+            VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS => {
+                VkBindMemoryStatus::decode_body(dec, partial).map(Self::VkBindMemoryStatus)
+            }
+            _ => return None,
+        })
+    }
+
+    fn encode_body(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        match self {
+            Self::VkBindImageMemoryDeviceGroupInfo(link) => link.encode_body(enc, partial),
+            Self::VkBindImagePlaneMemoryInfo(link) => link.encode_body(enc, partial),
+            Self::VkBindMemoryStatus(link) => link.encode_body(enc, partial),
+        }
+    }
+}
+
+/// `VkBindImageMemoryDeviceGroupInfo` (`VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkBindImageMemoryDeviceGroupInfo {
+    /// `uint32_t deviceIndexCount`
+    pub device_index_count: u32,
+    /// `const uint32_t* pDeviceIndices`
+    pub p_device_indices: Option<Vec<u32>>,
+    /// `uint32_t splitInstanceBindRegionCount`
+    pub split_instance_bind_region_count: u32,
+    /// `const VkRect2D* pSplitInstanceBindRegions`
+    pub p_split_instance_bind_regions: Option<Vec<VkRect2D>>,
+}
+
+impl VkBindImageMemoryDeviceGroupInfo {
+    // No output parameter reaches this structure, so it has no skeleton
+    // form and the `partial` flag below is ignored.
+
+    /// `VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO;
+
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(
+            dec,
+            "VkBindImageMemoryDeviceGroupInfo",
+            Self::STRUCTURE_TYPE,
+        )?;
+        dec.empty_pnext_chain("VkBindImageMemoryDeviceGroupInfo")?;
+        Self::decode_body(dec, partial)
+    }
+
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        enc.simple_pointer(false)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkBindImageMemoryDeviceGroupInfo_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
+        let device_index_count: u32 = dec.u32()?;
+        let p_device_indices: Option<Vec<u32>> =
+            match array_presence(dec, u64::from(device_index_count), NullArray::Checked)? {
+                Some(n) => Some(dec.u32_array(n)?),
+                None => None,
+            };
+        let split_instance_bind_region_count: u32 = dec.u32()?;
+        let p_split_instance_bind_regions: Option<Vec<VkRect2D>> = match array_presence(
+            dec,
+            u64::from(split_instance_bind_region_count),
+            NullArray::Checked,
+        )? {
+            Some(n) => Some(decode_vec(dec, n, |dec| VkRect2D::decode_with(dec, false))?),
+            None => None,
+        };
+        Ok(Self {
+            device_index_count,
+            p_device_indices,
+            split_instance_bind_region_count,
+            p_split_instance_bind_regions,
+        })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
+        enc.u32(self.device_index_count)?;
+        if let Some(v) = &self.p_device_indices {
+            let count = u64::from(self.device_index_count);
+            check_len(
+                "VkBindImageMemoryDeviceGroupInfo",
+                "pDeviceIndices",
+                count,
+                v.len(),
+            )?;
+            enc.array_size(count)?;
+            for e in v {
+                enc.u32(*e)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        enc.u32(self.split_instance_bind_region_count)?;
+        if let Some(v) = &self.p_split_instance_bind_regions {
+            let count = u64::from(self.split_instance_bind_region_count);
+            check_len(
+                "VkBindImageMemoryDeviceGroupInfo",
+                "pSplitInstanceBindRegions",
+                count,
+                v.len(),
+            )?;
+            enc.array_size(count)?;
+            for e in v {
+                e.encode_with(enc, false)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+}
+
+/// `VkBindImagePlaneMemoryInfo` (`VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkBindImagePlaneMemoryInfo {
+    /// `VkImageAspectFlagBits planeAspect`
+    pub plane_aspect: VkImageAspectFlagBits,
+}
+
+impl VkBindImagePlaneMemoryInfo {
+    // No output parameter reaches this structure, so it has no skeleton
+    // form and the `partial` flag below is ignored.
+
+    /// `VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO;
+
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(dec, "VkBindImagePlaneMemoryInfo", Self::STRUCTURE_TYPE)?;
+        dec.empty_pnext_chain("VkBindImagePlaneMemoryInfo")?;
+        Self::decode_body(dec, partial)
+    }
+
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        enc.simple_pointer(false)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkBindImagePlaneMemoryInfo_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
+        let plane_aspect: VkImageAspectFlagBits = dec.i32()?;
+        Ok(Self { plane_aspect })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
+        enc.i32(self.plane_aspect)?;
         Ok(())
     }
 }
@@ -364,6 +1266,14 @@ impl VkImageMemoryRequirementsInfo2 {
     pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
         enc.handle(self.image.0)?;
         Ok(())
+    }
+
+    /// Visit every pNext link this structure carries — its own chain's and
+    /// its members' — as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        for link in &self.p_next {
+            f("VkImageMemoryRequirementsInfo2", link.structure_type());
+        }
     }
 }
 
@@ -480,33 +1390,26 @@ impl VkImagePlaneMemoryRequirementsInfo {
     }
 }
 
-/// `VkMemoryRequirements`.
+/// `VkImageSparseMemoryRequirementsInfo2` (`VK_STRUCTURE_TYPE_IMAGE_SPARSE_MEMORY_REQUIREMENTS_INFO_2`).
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct VkMemoryRequirements {
-    /// `VkDeviceSize size`
-    pub size: VkDeviceSize,
-    /// `VkDeviceSize alignment`
-    pub alignment: VkDeviceSize,
-    /// `uint32_t memoryTypeBits`
-    pub memory_type_bits: u32,
+pub struct VkImageSparseMemoryRequirementsInfo2 {
+    /// `VkImage image`
+    pub image: VkImage,
 }
 
-impl VkMemoryRequirements {
+impl VkImageSparseMemoryRequirementsInfo2 {
+    // No output parameter reaches this structure, so it has no skeleton
+    // form and the `partial` flag below is ignored.
+
+    /// `VK_STRUCTURE_TYPE_IMAGE_SPARSE_MEMORY_REQUIREMENTS_INFO_2`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_IMAGE_SPARSE_MEMORY_REQUIREMENTS_INFO_2;
+
     /// Decode the whole structure, as an input carries it.
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
     pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
         Self::decode_with(dec, false)
-    }
-
-    /// Decode the skeleton an output structure is sent as inside a command
-    /// (`vn_decode_VkMemoryRequirements_partial_temp`).
-    ///
-    /// # Errors
-    /// As [`Self::decode`].
-    pub fn decode_partial(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
-        Self::decode_with(dec, true)
     }
 
     /// Encode the whole structure, as a reply carries it.
@@ -517,71 +1420,60 @@ impl VkMemoryRequirements {
         self.encode_with(enc, false)
     }
 
-    /// Encode the skeleton form (`vn_encode_VkMemoryRequirements_partial`).
-    ///
-    /// # Errors
-    /// As [`Self::encode`].
-    pub fn encode_partial(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
-        self.encode_with(enc, true)
-    }
-
-    /// `decode` or `decode_partial`.
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
     ///
     /// # Errors
     /// As [`Self::decode`].
     pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
-        let size: VkDeviceSize = if partial {
-            Default::default()
-        } else {
-            dec.u64()?
-        };
-        let alignment: VkDeviceSize = if partial {
-            Default::default()
-        } else {
-            dec.u64()?
-        };
-        let memory_type_bits: u32 = if partial {
-            Default::default()
-        } else {
-            dec.u32()?
-        };
-        Ok(Self {
-            size,
-            alignment,
-            memory_type_bits,
-        })
+        expect_structure_type(
+            dec,
+            "VkImageSparseMemoryRequirementsInfo2",
+            Self::STRUCTURE_TYPE,
+        )?;
+        dec.empty_pnext_chain("VkImageSparseMemoryRequirementsInfo2")?;
+        Self::decode_body(dec, partial)
     }
 
-    /// `encode` or `encode_partial`.
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
     ///
     /// # Errors
     /// As [`Self::encode`].
     pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
-        if !partial {
-            enc.u64(self.size)?;
-        }
-        if !partial {
-            enc.u64(self.alignment)?;
-        }
-        if !partial {
-            enc.u32(self.memory_type_bits)?;
-        }
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        enc.simple_pointer(false)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkImageSparseMemoryRequirementsInfo2_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
+        let image: VkImage = VkImage(dec.handle()?);
+        Ok(Self { image })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
+        enc.handle(self.image.0)?;
         Ok(())
     }
 }
 
-/// `VkMemoryRequirements2` (`VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2`).
+/// `VkSparseImageMemoryRequirements2` (`VK_STRUCTURE_TYPE_SPARSE_IMAGE_MEMORY_REQUIREMENTS_2`).
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct VkMemoryRequirements2 {
-    /// The pNext chain, in the guest's order. Admits: `VkMemoryDedicatedRequirements`.
-    pub p_next: Vec<VkMemoryRequirements2Next>,
-    /// `VkMemoryRequirements memoryRequirements`
-    pub memory_requirements: VkMemoryRequirements,
+pub struct VkSparseImageMemoryRequirements2 {
+    /// `VkSparseImageMemoryRequirements memoryRequirements`
+    pub memory_requirements: VkSparseImageMemoryRequirements,
 }
 
-impl VkMemoryRequirements2 {
-    /// `VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2`.
-    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+impl VkSparseImageMemoryRequirements2 {
+    /// `VK_STRUCTURE_TYPE_SPARSE_IMAGE_MEMORY_REQUIREMENTS_2`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_SPARSE_IMAGE_MEMORY_REQUIREMENTS_2;
 
     /// Decode the whole structure, as an input carries it.
     ///
@@ -592,7 +1484,7 @@ impl VkMemoryRequirements2 {
     }
 
     /// Decode the skeleton an output structure is sent as inside a command
-    /// (`vn_decode_VkMemoryRequirements2_partial_temp`).
+    /// (`vn_decode_VkSparseImageMemoryRequirements2_partial_temp`).
     ///
     /// # Errors
     /// As [`Self::decode`].
@@ -608,7 +1500,7 @@ impl VkMemoryRequirements2 {
         self.encode_with(enc, false)
     }
 
-    /// Encode the skeleton form (`vn_encode_VkMemoryRequirements2_partial`).
+    /// Encode the skeleton form (`vn_encode_VkSparseImageMemoryRequirements2_partial`).
     ///
     /// # Errors
     /// As [`Self::encode`].
@@ -621,8 +1513,363 @@ impl VkMemoryRequirements2 {
     /// # Errors
     /// As [`Self::decode`].
     pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
-        expect_structure_type(dec, "VkMemoryRequirements2", Self::STRUCTURE_TYPE)?;
-        let p_next = decode_chain::<VkMemoryRequirements2Next>(dec, partial)?;
+        expect_structure_type(
+            dec,
+            "VkSparseImageMemoryRequirements2",
+            Self::STRUCTURE_TYPE,
+        )?;
+        dec.empty_pnext_chain("VkSparseImageMemoryRequirements2")?;
+        Self::decode_body(dec, partial)
+    }
+
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        enc.simple_pointer(false)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkSparseImageMemoryRequirements2_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        let memory_requirements: VkSparseImageMemoryRequirements =
+            VkSparseImageMemoryRequirements::decode_with(dec, partial)?;
+        Ok(Self {
+            memory_requirements,
+        })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        self.memory_requirements.encode_with(enc, partial)?;
+        Ok(())
+    }
+}
+
+/// `VkDeviceImageMemoryRequirements` (`VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkDeviceImageMemoryRequirements<'a> {
+    /// `const VkImageCreateInfo* pCreateInfo`
+    pub p_create_info: Option<VkImageCreateInfo<'a>>,
+    /// `VkImageAspectFlagBits planeAspect`
+    pub plane_aspect: VkImageAspectFlagBits,
+}
+
+impl<'a> VkDeviceImageMemoryRequirements<'a> {
+    // No output parameter reaches this structure, so it has no skeleton
+    // form and the `partial` flag below is ignored.
+
+    /// `VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS;
+
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'a>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'a>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(dec, "VkDeviceImageMemoryRequirements", Self::STRUCTURE_TYPE)?;
+        dec.empty_pnext_chain("VkDeviceImageMemoryRequirements")?;
+        Self::decode_body(dec, partial)
+    }
+
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        enc.simple_pointer(false)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkDeviceImageMemoryRequirements_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'a>, _partial: bool) -> Result<Self, ProtocolError> {
+        let p_create_info: Option<VkImageCreateInfo<'a>> = if dec.simple_pointer()? {
+            Some(VkImageCreateInfo::decode_with(dec, false)?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "VkDeviceImageMemoryRequirements",
+                "pCreateInfo",
+            ));
+        };
+        let plane_aspect: VkImageAspectFlagBits = dec.i32()?;
+        Ok(Self {
+            p_create_info,
+            plane_aspect,
+        })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
+        enc.simple_pointer(self.p_create_info.is_some())?;
+        if let Some(v) = &self.p_create_info {
+            v.encode_with(enc, false)?;
+        }
+        enc.i32(self.plane_aspect)?;
+        Ok(())
+    }
+
+    /// Visit every pNext link this structure carries — its own chain's and
+    /// its members' — as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        if let Some(v) = &self.p_create_info {
+            v.for_each_link(f);
+        }
+    }
+}
+
+/// `VkImageDrmFormatModifierPropertiesEXT` (`VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkImageDrmFormatModifierPropertiesEXT {
+    /// `uint64_t drmFormatModifier`
+    pub drm_format_modifier: u64,
+}
+
+impl VkImageDrmFormatModifierPropertiesEXT {
+    /// `VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT;
+
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Decode the skeleton an output structure is sent as inside a command
+    /// (`vn_decode_VkImageDrmFormatModifierPropertiesEXT_partial_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_partial(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, true)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// Encode the skeleton form (`vn_encode_VkImageDrmFormatModifierPropertiesEXT_partial`).
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_partial(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, true)
+    }
+
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(
+            dec,
+            "VkImageDrmFormatModifierPropertiesEXT",
+            Self::STRUCTURE_TYPE,
+        )?;
+        dec.empty_pnext_chain("VkImageDrmFormatModifierPropertiesEXT")?;
+        Self::decode_body(dec, partial)
+    }
+
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        enc.simple_pointer(false)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkImageDrmFormatModifierPropertiesEXT_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        let drm_format_modifier: u64 = if partial {
+            Default::default()
+        } else {
+            dec.u64()?
+        };
+        Ok(Self {
+            drm_format_modifier,
+        })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        if !partial {
+            enc.u64(self.drm_format_modifier)?;
+        }
+        Ok(())
+    }
+}
+
+/// `VkImageSubresource2` (`VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkImageSubresource2 {
+    /// `VkImageSubresource imageSubresource`
+    pub image_subresource: VkImageSubresource,
+}
+
+impl VkImageSubresource2 {
+    // No output parameter reaches this structure, so it has no skeleton
+    // form and the `partial` flag below is ignored.
+
+    /// `VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2;
+
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(dec, "VkImageSubresource2", Self::STRUCTURE_TYPE)?;
+        dec.empty_pnext_chain("VkImageSubresource2")?;
+        Self::decode_body(dec, partial)
+    }
+
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        enc.simple_pointer(false)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkImageSubresource2_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'_>, _partial: bool) -> Result<Self, ProtocolError> {
+        let image_subresource: VkImageSubresource = VkImageSubresource::decode_with(dec, false)?;
+        Ok(Self { image_subresource })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
+        self.image_subresource.encode_with(enc, false)?;
+        Ok(())
+    }
+}
+
+/// `VkSubresourceLayout2` (`VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkSubresourceLayout2 {
+    /// The pNext chain, in the guest's order. Admits: `VkSubresourceHostMemcpySize`.
+    pub p_next: Vec<VkSubresourceLayout2Next>,
+    /// `VkSubresourceLayout subresourceLayout`
+    pub subresource_layout: VkSubresourceLayout,
+}
+
+impl VkSubresourceLayout2 {
+    /// `VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2;
+
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Decode the skeleton an output structure is sent as inside a command
+    /// (`vn_decode_VkSubresourceLayout2_partial_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_partial(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, true)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// Encode the skeleton form (`vn_encode_VkSubresourceLayout2_partial`).
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_partial(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, true)
+    }
+
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(dec, "VkSubresourceLayout2", Self::STRUCTURE_TYPE)?;
+        let p_next = decode_chain::<VkSubresourceLayout2Next>(dec, partial)?;
         let mut value = Self::decode_body(dec, partial)?;
         value.p_next = p_next;
         Ok(value)
@@ -639,16 +1886,16 @@ impl VkMemoryRequirements2 {
     }
 
     /// The fields after `sType` and `pNext`, as a chain link carries them
-    /// (`vn_decode_VkMemoryRequirements2_self_temp`).
+    /// (`vn_decode_VkSubresourceLayout2_self_temp`).
     ///
     /// # Errors
     /// As [`Self::decode`].
     pub fn decode_body(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
-        let memory_requirements: VkMemoryRequirements =
-            VkMemoryRequirements::decode_with(dec, partial)?;
+        let subresource_layout: VkSubresourceLayout =
+            VkSubresourceLayout::decode_with(dec, partial)?;
         Ok(Self {
             p_next: Vec::new(),
-            memory_requirements,
+            subresource_layout,
         })
     }
 
@@ -657,26 +1904,32 @@ impl VkMemoryRequirements2 {
     /// # Errors
     /// As [`Self::encode`].
     pub fn encode_body(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
-        self.memory_requirements.encode_with(enc, partial)?;
+        self.subresource_layout.encode_with(enc, partial)?;
         Ok(())
+    }
+
+    /// Visit every pNext link this structure carries — its own chain's and
+    /// its members' — as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        for link in &self.p_next {
+            f("VkSubresourceLayout2", link.structure_type());
+        }
     }
 }
 
-/// A link of `VkMemoryRequirements2`'s pNext chain.
+/// A link of `VkSubresourceLayout2`'s pNext chain.
 #[derive(Debug, Clone, PartialEq)]
-pub enum VkMemoryRequirements2Next {
-    /// `VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS`.
-    VkMemoryDedicatedRequirements(VkMemoryDedicatedRequirements),
+pub enum VkSubresourceLayout2Next {
+    /// `VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE`.
+    VkSubresourceHostMemcpySize(VkSubresourceHostMemcpySize),
 }
 
-impl<'a> ChainLink<'a> for VkMemoryRequirements2Next {
-    const PARENT: &'static str = "VkMemoryRequirements2";
+impl<'a> ChainLink<'a> for VkSubresourceLayout2Next {
+    const PARENT: &'static str = "VkSubresourceLayout2";
 
     fn structure_type(&self) -> i32 {
         match self {
-            Self::VkMemoryDedicatedRequirements(_) => {
-                VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS
-            }
+            Self::VkSubresourceHostMemcpySize(_) => VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE,
         }
     }
 
@@ -686,9 +1939,9 @@ impl<'a> ChainLink<'a> for VkMemoryRequirements2Next {
         partial: bool,
     ) -> Option<Result<Self, ProtocolError>> {
         Some(match stype {
-            VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS => {
-                VkMemoryDedicatedRequirements::decode_body(dec, partial)
-                    .map(Self::VkMemoryDedicatedRequirements)
+            VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE => {
+                VkSubresourceHostMemcpySize::decode_body(dec, partial)
+                    .map(Self::VkSubresourceHostMemcpySize)
             }
             _ => return None,
         })
@@ -696,23 +1949,21 @@ impl<'a> ChainLink<'a> for VkMemoryRequirements2Next {
 
     fn encode_body(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
         match self {
-            Self::VkMemoryDedicatedRequirements(link) => link.encode_body(enc, partial),
+            Self::VkSubresourceHostMemcpySize(link) => link.encode_body(enc, partial),
         }
     }
 }
 
-/// `VkMemoryDedicatedRequirements` (`VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS`).
+/// `VkSubresourceHostMemcpySize` (`VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE`).
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct VkMemoryDedicatedRequirements {
-    /// `VkBool32 prefersDedicatedAllocation`
-    pub prefers_dedicated_allocation: VkBool32,
-    /// `VkBool32 requiresDedicatedAllocation`
-    pub requires_dedicated_allocation: VkBool32,
+pub struct VkSubresourceHostMemcpySize {
+    /// `VkDeviceSize size`
+    pub size: VkDeviceSize,
 }
 
-impl VkMemoryDedicatedRequirements {
-    /// `VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS`.
-    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS;
+impl VkSubresourceHostMemcpySize {
+    /// `VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE;
 
     /// Decode the whole structure, as an input carries it.
     ///
@@ -723,7 +1974,7 @@ impl VkMemoryDedicatedRequirements {
     }
 
     /// Decode the skeleton an output structure is sent as inside a command
-    /// (`vn_decode_VkMemoryDedicatedRequirements_partial_temp`).
+    /// (`vn_decode_VkSubresourceHostMemcpySize_partial_temp`).
     ///
     /// # Errors
     /// As [`Self::decode`].
@@ -739,7 +1990,7 @@ impl VkMemoryDedicatedRequirements {
         self.encode_with(enc, false)
     }
 
-    /// Encode the skeleton form (`vn_encode_VkMemoryDedicatedRequirements_partial`).
+    /// Encode the skeleton form (`vn_encode_VkSubresourceHostMemcpySize_partial`).
     ///
     /// # Errors
     /// As [`Self::encode`].
@@ -752,8 +2003,8 @@ impl VkMemoryDedicatedRequirements {
     /// # Errors
     /// As [`Self::decode`].
     pub fn decode_with(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
-        expect_structure_type(dec, "VkMemoryDedicatedRequirements", Self::STRUCTURE_TYPE)?;
-        dec.empty_pnext_chain("VkMemoryDedicatedRequirements")?;
+        expect_structure_type(dec, "VkSubresourceHostMemcpySize", Self::STRUCTURE_TYPE)?;
+        dec.empty_pnext_chain("VkSubresourceHostMemcpySize")?;
         Self::decode_body(dec, partial)
     }
 
@@ -768,25 +2019,17 @@ impl VkMemoryDedicatedRequirements {
     }
 
     /// The fields after `sType` and `pNext`, as a chain link carries them
-    /// (`vn_decode_VkMemoryDedicatedRequirements_self_temp`).
+    /// (`vn_decode_VkSubresourceHostMemcpySize_self_temp`).
     ///
     /// # Errors
     /// As [`Self::decode`].
     pub fn decode_body(dec: &mut Decoder<'_>, partial: bool) -> Result<Self, ProtocolError> {
-        let prefers_dedicated_allocation: VkBool32 = if partial {
+        let size: VkDeviceSize = if partial {
             Default::default()
         } else {
-            dec.u32()?
+            dec.u64()?
         };
-        let requires_dedicated_allocation: VkBool32 = if partial {
-            Default::default()
-        } else {
-            dec.u32()?
-        };
-        Ok(Self {
-            prefers_dedicated_allocation,
-            requires_dedicated_allocation,
-        })
+        Ok(Self { size })
     }
 
     /// The fields after `sType` and `pNext`, as a chain link carries them.
@@ -795,11 +2038,483 @@ impl VkMemoryDedicatedRequirements {
     /// As [`Self::encode`].
     pub fn encode_body(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
         if !partial {
-            enc.u32(self.prefers_dedicated_allocation)?;
+            enc.u64(self.size)?;
         }
-        if !partial {
-            enc.u32(self.requires_dedicated_allocation)?;
+        Ok(())
+    }
+}
+
+/// `VkDeviceImageSubresourceInfo` (`VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VkDeviceImageSubresourceInfo<'a> {
+    /// `const VkImageCreateInfo* pCreateInfo`
+    pub p_create_info: Option<VkImageCreateInfo<'a>>,
+    /// `const VkImageSubresource2* pSubresource`
+    pub p_subresource: Option<VkImageSubresource2>,
+}
+
+impl<'a> VkDeviceImageSubresourceInfo<'a> {
+    // No output parameter reaches this structure, so it has no skeleton
+    // form and the `partial` flag below is ignored.
+
+    /// `VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO`.
+    pub const STRUCTURE_TYPE: i32 = VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO;
+
+    /// Decode the whole structure, as an input carries it.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'a>) -> Result<Self, ProtocolError> {
+        Self::decode_with(dec, false)
+    }
+
+    /// Encode the whole structure, as a reply carries it.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        self.encode_with(enc, false)
+    }
+
+    /// `decode` or `decode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_with(dec: &mut Decoder<'a>, partial: bool) -> Result<Self, ProtocolError> {
+        expect_structure_type(dec, "VkDeviceImageSubresourceInfo", Self::STRUCTURE_TYPE)?;
+        dec.empty_pnext_chain("VkDeviceImageSubresourceInfo")?;
+        Self::decode_body(dec, partial)
+    }
+
+    /// `encode` or `encode_partial`: `sType`, the pNext chain, the body.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_with(&self, enc: &mut Encoder, partial: bool) -> Result<(), ProtocolError> {
+        enc.structure_type(Self::STRUCTURE_TYPE)?;
+        enc.simple_pointer(false)?;
+        self.encode_body(enc, partial)
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them
+    /// (`vn_decode_VkDeviceImageSubresourceInfo_self_temp`).
+    ///
+    /// # Errors
+    /// As [`Self::decode`].
+    pub fn decode_body(dec: &mut Decoder<'a>, _partial: bool) -> Result<Self, ProtocolError> {
+        let p_create_info: Option<VkImageCreateInfo<'a>> = if dec.simple_pointer()? {
+            Some(VkImageCreateInfo::decode_with(dec, false)?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "VkDeviceImageSubresourceInfo",
+                "pCreateInfo",
+            ));
+        };
+        let p_subresource: Option<VkImageSubresource2> = if dec.simple_pointer()? {
+            Some(VkImageSubresource2::decode_with(dec, false)?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "VkDeviceImageSubresourceInfo",
+                "pSubresource",
+            ));
+        };
+        Ok(Self {
+            p_create_info,
+            p_subresource,
+        })
+    }
+
+    /// The fields after `sType` and `pNext`, as a chain link carries them.
+    ///
+    /// # Errors
+    /// As [`Self::encode`].
+    pub fn encode_body(&self, enc: &mut Encoder, _partial: bool) -> Result<(), ProtocolError> {
+        enc.simple_pointer(self.p_create_info.is_some())?;
+        if let Some(v) = &self.p_create_info {
+            v.encode_with(enc, false)?;
         }
+        enc.simple_pointer(self.p_subresource.is_some())?;
+        if let Some(v) = &self.p_subresource {
+            v.encode_with(enc, false)?;
+        }
+        Ok(())
+    }
+
+    /// Visit every pNext link this structure carries — its own chain's and
+    /// its members' — as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        if let Some(v) = &self.p_create_info {
+            v.for_each_link(f);
+        }
+    }
+}
+
+/// The arguments of `vkGetImageMemoryRequirements`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GetImageMemoryRequirementsArgs {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `VkImage image` — in.
+    pub image: VkImage,
+    /// `VkMemoryRequirements* pMemoryRequirements` — out.
+    pub p_memory_requirements: Option<VkMemoryRequirements>,
+}
+
+impl GetImageMemoryRequirementsArgs {
+    /// `VK_COMMAND_TYPE_vkGetImageMemoryRequirements_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_IMAGE_MEMORY_REQUIREMENTS_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkGetImageMemoryRequirements";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkGetImageMemoryRequirements_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(dec, "vkGetImageMemoryRequirements"));
+        }
+        let image: VkImage = VkImage(dec.handle()?);
+        let p_memory_requirements: Option<VkMemoryRequirements> = if dec.simple_pointer()? {
+            Some(VkMemoryRequirements::decode_with(dec, true)?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetImageMemoryRequirements",
+                "pMemoryRequirements",
+            ));
+        };
+        Ok(Self {
+            device,
+            image,
+            p_memory_requirements,
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkGetImageMemoryRequirements`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.handle(self.image.0)?;
+        enc.simple_pointer(self.p_memory_requirements.is_some())?;
+        if let Some(v) = &self.p_memory_requirements {
+            v.encode_with(enc, true)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkGetImageMemoryRequirements_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.simple_pointer(self.p_memory_requirements.is_some())?;
+        if let Some(v) = &self.p_memory_requirements {
+            v.encode_with(enc, false)?;
+        }
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkGetImageMemoryRequirements_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.p_memory_requirements = if dec.simple_pointer()? {
+            Some(VkMemoryRequirements::decode_with(dec, false)?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+}
+
+/// The arguments of `vkBindImageMemory`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place and sets `ret`, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BindImageMemoryArgs {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `VkImage image` — in.
+    pub image: VkImage,
+    /// `VkDeviceMemory memory` — in.
+    pub memory: VkDeviceMemory,
+    /// `VkDeviceSize memoryOffset` — in.
+    pub memory_offset: VkDeviceSize,
+    /// The return value (`VkResult`), written first in the reply.
+    pub ret: VkResult,
+}
+
+impl BindImageMemoryArgs {
+    /// `VK_COMMAND_TYPE_vkBindImageMemory_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_BIND_IMAGE_MEMORY_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkBindImageMemory";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkBindImageMemory_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(dec, "vkBindImageMemory"));
+        }
+        let image: VkImage = VkImage(dec.handle()?);
+        let memory: VkDeviceMemory = VkDeviceMemory(dec.handle()?);
+        let memory_offset: VkDeviceSize = dec.u64()?;
+        Ok(Self {
+            device,
+            image,
+            memory,
+            memory_offset,
+            ret: Default::default(),
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkBindImageMemory`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.handle(self.image.0)?;
+        enc.handle(self.memory.0)?;
+        enc.u64(self.memory_offset)?;
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkBindImageMemory_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.i32(self.ret)?;
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkBindImageMemory_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.ret = dec.i32()?;
+        Ok(())
+    }
+}
+
+/// The arguments of `vkGetImageSparseMemoryRequirements`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GetImageSparseMemoryRequirementsArgs {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `VkImage image` — in.
+    pub image: VkImage,
+    /// `uint32_t* pSparseMemoryRequirementCount` — in/out.
+    pub p_sparse_memory_requirement_count: Option<u32>,
+    /// `VkSparseImageMemoryRequirements* pSparseMemoryRequirements` — out.
+    pub p_sparse_memory_requirements: Option<Vec<VkSparseImageMemoryRequirements>>,
+}
+
+impl GetImageSparseMemoryRequirementsArgs {
+    /// `VK_COMMAND_TYPE_vkGetImageSparseMemoryRequirements_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkGetImageSparseMemoryRequirements";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkGetImageSparseMemoryRequirements_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(
+                dec,
+                "vkGetImageSparseMemoryRequirements",
+            ));
+        }
+        let image: VkImage = VkImage(dec.handle()?);
+        let p_sparse_memory_requirement_count: Option<u32> = if dec.simple_pointer()? {
+            Some(dec.u32()?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetImageSparseMemoryRequirements",
+                "pSparseMemoryRequirementCount",
+            ));
+        };
+        let p_sparse_memory_requirements: Option<Vec<VkSparseImageMemoryRequirements>> =
+            array_presence(
+                dec,
+                u64::from(p_sparse_memory_requirement_count.unwrap_or(0)),
+                NullArray::Unchecked,
+            )?
+            .map(|_| Vec::new());
+        Ok(Self {
+            device,
+            image,
+            p_sparse_memory_requirement_count,
+            p_sparse_memory_requirements,
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkGetImageSparseMemoryRequirements`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.handle(self.image.0)?;
+        enc.simple_pointer(self.p_sparse_memory_requirement_count.is_some())?;
+        if let Some(v) = &self.p_sparse_memory_requirement_count {
+            enc.u32(*v)?;
+        }
+        if self.p_sparse_memory_requirements.is_some() {
+            enc.array_size(u64::from(
+                self.p_sparse_memory_requirement_count.unwrap_or(0),
+            ))?;
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkGetImageSparseMemoryRequirements_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.simple_pointer(self.p_sparse_memory_requirement_count.is_some())?;
+        if let Some(v) = &self.p_sparse_memory_requirement_count {
+            enc.u32(*v)?;
+        }
+        if let Some(v) = &self.p_sparse_memory_requirements {
+            let count = u64::from(self.p_sparse_memory_requirement_count.unwrap_or(0));
+            check_len(
+                "vkGetImageSparseMemoryRequirements",
+                "pSparseMemoryRequirements",
+                count,
+                v.len(),
+            )?;
+            enc.array_size(count)?;
+            for e in v {
+                e.encode_with(enc, false)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkGetImageSparseMemoryRequirements_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.p_sparse_memory_requirement_count = if dec.simple_pointer()? {
+            Some(dec.u32()?)
+        } else {
+            None
+        };
+        self.p_sparse_memory_requirements = match array_presence(
+            dec,
+            u64::from(self.p_sparse_memory_requirement_count.unwrap_or(0)),
+            NullArray::Unchecked,
+        )? {
+            Some(n) => Some(decode_vec(dec, n, |dec| {
+                VkSparseImageMemoryRequirements::decode_with(dec, false)
+            })?),
+            None => None,
+        };
         Ok(())
     }
 }
@@ -812,18 +2527,18 @@ impl VkMemoryDedicatedRequirements {
 /// fills the outputs in place and sets `ret`, then
 /// [`Self::encode_reply`] writes them back.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct CreateImageArgs {
+pub struct CreateImageArgs<'a> {
     /// `VkDevice device` — in.
     pub device: VkDevice,
     /// `const VkImageCreateInfo* pCreateInfo` — in.
-    pub p_create_info: Option<VkImageCreateInfo>,
+    pub p_create_info: Option<VkImageCreateInfo<'a>>,
     /// `VkImage* pImage` — out.
     pub p_image: Option<VkImage>,
     /// The return value (`VkResult`), written first in the reply.
     pub ret: VkResult,
 }
 
-impl CreateImageArgs {
+impl<'a> CreateImageArgs<'a> {
     /// `VK_COMMAND_TYPE_vkCreateImage_EXT`.
     pub const OPCODE: u32 = VK_COMMAND_TYPE_CREATE_IMAGE_EXT;
 
@@ -835,12 +2550,12 @@ impl CreateImageArgs {
     ///
     /// # Errors
     /// Whatever the wire or this layer refused; `dec` is left fatal.
-    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+    pub fn decode(dec: &mut Decoder<'a>) -> Result<Self, ProtocolError> {
         let device: VkDevice = VkDevice(dec.handle()?);
         if device.0 == 0 {
             return Err(null_dispatch_handle(dec, "vkCreateImage"));
         }
-        let p_create_info: Option<VkImageCreateInfo> = if dec.simple_pointer()? {
+        let p_create_info: Option<VkImageCreateInfo<'a>> = if dec.simple_pointer()? {
             Some(VkImageCreateInfo::decode_with(dec, false)?)
         } else {
             return Err(null_pointer(dec, "vkCreateImage", "pCreateInfo"));
@@ -906,7 +2621,7 @@ impl CreateImageArgs {
     ///
     /// # Errors
     /// Whatever the wire or this layer refused.
-    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'a>) -> Result<(), ProtocolError> {
         let found = dec.reply_header()?;
         if found != Self::OPCODE {
             dec.set_fatal(crate::venus::wire::WireError::Poisoned);
@@ -922,6 +2637,13 @@ impl CreateImageArgs {
             None
         };
         Ok(())
+    }
+
+    /// Visit every pNext link the arguments carry, as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        if let Some(v) = &self.p_create_info {
+            v.for_each_link(f);
+        }
     }
 }
 
@@ -1007,6 +2729,247 @@ impl DestroyImageArgs {
             });
         }
         Ok(())
+    }
+}
+
+/// The arguments of `vkGetImageSubresourceLayout`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GetImageSubresourceLayoutArgs {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `VkImage image` — in.
+    pub image: VkImage,
+    /// `const VkImageSubresource* pSubresource` — in.
+    pub p_subresource: Option<VkImageSubresource>,
+    /// `VkSubresourceLayout* pLayout` — out.
+    pub p_layout: Option<VkSubresourceLayout>,
+}
+
+impl GetImageSubresourceLayoutArgs {
+    /// `VK_COMMAND_TYPE_vkGetImageSubresourceLayout_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_IMAGE_SUBRESOURCE_LAYOUT_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkGetImageSubresourceLayout";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkGetImageSubresourceLayout_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(dec, "vkGetImageSubresourceLayout"));
+        }
+        let image: VkImage = VkImage(dec.handle()?);
+        let p_subresource: Option<VkImageSubresource> = if dec.simple_pointer()? {
+            Some(VkImageSubresource::decode_with(dec, false)?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetImageSubresourceLayout",
+                "pSubresource",
+            ));
+        };
+        let p_layout: Option<VkSubresourceLayout> = if dec.simple_pointer()? {
+            Some(VkSubresourceLayout::decode_with(dec, true)?)
+        } else {
+            return Err(null_pointer(dec, "vkGetImageSubresourceLayout", "pLayout"));
+        };
+        Ok(Self {
+            device,
+            image,
+            p_subresource,
+            p_layout,
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkGetImageSubresourceLayout`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.handle(self.image.0)?;
+        enc.simple_pointer(self.p_subresource.is_some())?;
+        if let Some(v) = &self.p_subresource {
+            v.encode_with(enc, false)?;
+        }
+        enc.simple_pointer(self.p_layout.is_some())?;
+        if let Some(v) = &self.p_layout {
+            v.encode_with(enc, true)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkGetImageSubresourceLayout_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.simple_pointer(self.p_layout.is_some())?;
+        if let Some(v) = &self.p_layout {
+            v.encode_with(enc, false)?;
+        }
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkGetImageSubresourceLayout_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.p_layout = if dec.simple_pointer()? {
+            Some(VkSubresourceLayout::decode_with(dec, false)?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+}
+
+/// The arguments of `vkBindImageMemory2`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place and sets `ret`, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BindImageMemory2Args {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `uint32_t bindInfoCount` — in.
+    pub bind_info_count: u32,
+    /// `const VkBindImageMemoryInfo* pBindInfos` — in.
+    pub p_bind_infos: Option<Vec<VkBindImageMemoryInfo>>,
+    /// The return value (`VkResult`), written first in the reply.
+    pub ret: VkResult,
+}
+
+impl BindImageMemory2Args {
+    /// `VK_COMMAND_TYPE_vkBindImageMemory2_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_BIND_IMAGE_MEMORY_2_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkBindImageMemory2";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkBindImageMemory2_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(dec, "vkBindImageMemory2"));
+        }
+        let bind_info_count: u32 = dec.u32()?;
+        let p_bind_infos: Option<Vec<VkBindImageMemoryInfo>> =
+            match array_presence(dec, u64::from(bind_info_count), NullArray::Checked)? {
+                Some(n) => Some(decode_vec(dec, n, |dec| {
+                    VkBindImageMemoryInfo::decode_with(dec, false)
+                })?),
+                None => None,
+            };
+        Ok(Self {
+            device,
+            bind_info_count,
+            p_bind_infos,
+            ret: Default::default(),
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkBindImageMemory2`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.u32(self.bind_info_count)?;
+        if let Some(v) = &self.p_bind_infos {
+            let count = u64::from(self.bind_info_count);
+            check_len("vkBindImageMemory2", "pBindInfos", count, v.len())?;
+            enc.array_size(count)?;
+            for e in v {
+                e.encode_with(enc, false)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkBindImageMemory2_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.i32(self.ret)?;
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkBindImageMemory2_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.ret = dec.i32()?;
+        Ok(())
+    }
+
+    /// Visit every pNext link the arguments carry, as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        for e in self.p_bind_infos.iter().flatten() {
+            e.for_each_link(f);
+        }
     }
 }
 
@@ -1125,5 +3088,905 @@ impl GetImageMemoryRequirements2Args {
             None
         };
         Ok(())
+    }
+
+    /// Visit every pNext link the arguments carry, as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        if let Some(v) = &self.p_info {
+            v.for_each_link(f);
+        }
+        if let Some(v) = &self.p_memory_requirements {
+            v.for_each_link(f);
+        }
+    }
+}
+
+/// The arguments of `vkGetImageSparseMemoryRequirements2`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GetImageSparseMemoryRequirements2Args {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `const VkImageSparseMemoryRequirementsInfo2* pInfo` — in.
+    pub p_info: Option<VkImageSparseMemoryRequirementsInfo2>,
+    /// `uint32_t* pSparseMemoryRequirementCount` — in/out.
+    pub p_sparse_memory_requirement_count: Option<u32>,
+    /// `VkSparseImageMemoryRequirements2* pSparseMemoryRequirements` — out.
+    pub p_sparse_memory_requirements: Option<Vec<VkSparseImageMemoryRequirements2>>,
+}
+
+impl GetImageSparseMemoryRequirements2Args {
+    /// `VK_COMMAND_TYPE_vkGetImageSparseMemoryRequirements2_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS_2_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkGetImageSparseMemoryRequirements2";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkGetImageSparseMemoryRequirements2_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(
+                dec,
+                "vkGetImageSparseMemoryRequirements2",
+            ));
+        }
+        let p_info: Option<VkImageSparseMemoryRequirementsInfo2> = if dec.simple_pointer()? {
+            Some(VkImageSparseMemoryRequirementsInfo2::decode_with(
+                dec, false,
+            )?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetImageSparseMemoryRequirements2",
+                "pInfo",
+            ));
+        };
+        let p_sparse_memory_requirement_count: Option<u32> = if dec.simple_pointer()? {
+            Some(dec.u32()?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetImageSparseMemoryRequirements2",
+                "pSparseMemoryRequirementCount",
+            ));
+        };
+        let p_sparse_memory_requirements: Option<Vec<VkSparseImageMemoryRequirements2>> =
+            match array_presence(
+                dec,
+                u64::from(p_sparse_memory_requirement_count.unwrap_or(0)),
+                NullArray::Unchecked,
+            )? {
+                Some(n) => Some(decode_vec(dec, n, |dec| {
+                    VkSparseImageMemoryRequirements2::decode_with(dec, true)
+                })?),
+                None => None,
+            };
+        Ok(Self {
+            device,
+            p_info,
+            p_sparse_memory_requirement_count,
+            p_sparse_memory_requirements,
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkGetImageSparseMemoryRequirements2`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.simple_pointer(self.p_info.is_some())?;
+        if let Some(v) = &self.p_info {
+            v.encode_with(enc, false)?;
+        }
+        enc.simple_pointer(self.p_sparse_memory_requirement_count.is_some())?;
+        if let Some(v) = &self.p_sparse_memory_requirement_count {
+            enc.u32(*v)?;
+        }
+        if let Some(v) = &self.p_sparse_memory_requirements {
+            let count = u64::from(self.p_sparse_memory_requirement_count.unwrap_or(0));
+            check_len(
+                "vkGetImageSparseMemoryRequirements2",
+                "pSparseMemoryRequirements",
+                count,
+                v.len(),
+            )?;
+            enc.array_size(count)?;
+            for e in v {
+                e.encode_with(enc, true)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkGetImageSparseMemoryRequirements2_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.simple_pointer(self.p_sparse_memory_requirement_count.is_some())?;
+        if let Some(v) = &self.p_sparse_memory_requirement_count {
+            enc.u32(*v)?;
+        }
+        if let Some(v) = &self.p_sparse_memory_requirements {
+            let count = u64::from(self.p_sparse_memory_requirement_count.unwrap_or(0));
+            check_len(
+                "vkGetImageSparseMemoryRequirements2",
+                "pSparseMemoryRequirements",
+                count,
+                v.len(),
+            )?;
+            enc.array_size(count)?;
+            for e in v {
+                e.encode_with(enc, false)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkGetImageSparseMemoryRequirements2_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.p_sparse_memory_requirement_count = if dec.simple_pointer()? {
+            Some(dec.u32()?)
+        } else {
+            None
+        };
+        self.p_sparse_memory_requirements = match array_presence(
+            dec,
+            u64::from(self.p_sparse_memory_requirement_count.unwrap_or(0)),
+            NullArray::Unchecked,
+        )? {
+            Some(n) => Some(decode_vec(dec, n, |dec| {
+                VkSparseImageMemoryRequirements2::decode_with(dec, false)
+            })?),
+            None => None,
+        };
+        Ok(())
+    }
+}
+
+/// The arguments of `vkGetDeviceImageMemoryRequirements`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GetDeviceImageMemoryRequirementsArgs<'a> {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `const VkDeviceImageMemoryRequirements* pInfo` — in.
+    pub p_info: Option<VkDeviceImageMemoryRequirements<'a>>,
+    /// `VkMemoryRequirements2* pMemoryRequirements` — out.
+    pub p_memory_requirements: Option<VkMemoryRequirements2>,
+}
+
+impl<'a> GetDeviceImageMemoryRequirementsArgs<'a> {
+    /// `VK_COMMAND_TYPE_vkGetDeviceImageMemoryRequirements_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_DEVICE_IMAGE_MEMORY_REQUIREMENTS_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkGetDeviceImageMemoryRequirements";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkGetDeviceImageMemoryRequirements_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'a>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(
+                dec,
+                "vkGetDeviceImageMemoryRequirements",
+            ));
+        }
+        let p_info: Option<VkDeviceImageMemoryRequirements<'a>> = if dec.simple_pointer()? {
+            Some(VkDeviceImageMemoryRequirements::decode_with(dec, false)?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetDeviceImageMemoryRequirements",
+                "pInfo",
+            ));
+        };
+        let p_memory_requirements: Option<VkMemoryRequirements2> = if dec.simple_pointer()? {
+            Some(VkMemoryRequirements2::decode_with(dec, true)?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetDeviceImageMemoryRequirements",
+                "pMemoryRequirements",
+            ));
+        };
+        Ok(Self {
+            device,
+            p_info,
+            p_memory_requirements,
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkGetDeviceImageMemoryRequirements`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.simple_pointer(self.p_info.is_some())?;
+        if let Some(v) = &self.p_info {
+            v.encode_with(enc, false)?;
+        }
+        enc.simple_pointer(self.p_memory_requirements.is_some())?;
+        if let Some(v) = &self.p_memory_requirements {
+            v.encode_with(enc, true)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkGetDeviceImageMemoryRequirements_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.simple_pointer(self.p_memory_requirements.is_some())?;
+        if let Some(v) = &self.p_memory_requirements {
+            v.encode_with(enc, false)?;
+        }
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkGetDeviceImageMemoryRequirements_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'a>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.p_memory_requirements = if dec.simple_pointer()? {
+            Some(VkMemoryRequirements2::decode_with(dec, false)?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// Visit every pNext link the arguments carry, as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        if let Some(v) = &self.p_info {
+            v.for_each_link(f);
+        }
+        if let Some(v) = &self.p_memory_requirements {
+            v.for_each_link(f);
+        }
+    }
+}
+
+/// The arguments of `vkGetDeviceImageSparseMemoryRequirements`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GetDeviceImageSparseMemoryRequirementsArgs<'a> {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `const VkDeviceImageMemoryRequirements* pInfo` — in.
+    pub p_info: Option<VkDeviceImageMemoryRequirements<'a>>,
+    /// `uint32_t* pSparseMemoryRequirementCount` — in/out.
+    pub p_sparse_memory_requirement_count: Option<u32>,
+    /// `VkSparseImageMemoryRequirements2* pSparseMemoryRequirements` — out.
+    pub p_sparse_memory_requirements: Option<Vec<VkSparseImageMemoryRequirements2>>,
+}
+
+impl<'a> GetDeviceImageSparseMemoryRequirementsArgs<'a> {
+    /// `VK_COMMAND_TYPE_vkGetDeviceImageSparseMemoryRequirements_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_DEVICE_IMAGE_SPARSE_MEMORY_REQUIREMENTS_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkGetDeviceImageSparseMemoryRequirements";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkGetDeviceImageSparseMemoryRequirements_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'a>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(
+                dec,
+                "vkGetDeviceImageSparseMemoryRequirements",
+            ));
+        }
+        let p_info: Option<VkDeviceImageMemoryRequirements<'a>> = if dec.simple_pointer()? {
+            Some(VkDeviceImageMemoryRequirements::decode_with(dec, false)?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetDeviceImageSparseMemoryRequirements",
+                "pInfo",
+            ));
+        };
+        let p_sparse_memory_requirement_count: Option<u32> = if dec.simple_pointer()? {
+            Some(dec.u32()?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetDeviceImageSparseMemoryRequirements",
+                "pSparseMemoryRequirementCount",
+            ));
+        };
+        let p_sparse_memory_requirements: Option<Vec<VkSparseImageMemoryRequirements2>> =
+            match array_presence(
+                dec,
+                u64::from(p_sparse_memory_requirement_count.unwrap_or(0)),
+                NullArray::Unchecked,
+            )? {
+                Some(n) => Some(decode_vec(dec, n, |dec| {
+                    VkSparseImageMemoryRequirements2::decode_with(dec, true)
+                })?),
+                None => None,
+            };
+        Ok(Self {
+            device,
+            p_info,
+            p_sparse_memory_requirement_count,
+            p_sparse_memory_requirements,
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkGetDeviceImageSparseMemoryRequirements`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.simple_pointer(self.p_info.is_some())?;
+        if let Some(v) = &self.p_info {
+            v.encode_with(enc, false)?;
+        }
+        enc.simple_pointer(self.p_sparse_memory_requirement_count.is_some())?;
+        if let Some(v) = &self.p_sparse_memory_requirement_count {
+            enc.u32(*v)?;
+        }
+        if let Some(v) = &self.p_sparse_memory_requirements {
+            let count = u64::from(self.p_sparse_memory_requirement_count.unwrap_or(0));
+            check_len(
+                "vkGetDeviceImageSparseMemoryRequirements",
+                "pSparseMemoryRequirements",
+                count,
+                v.len(),
+            )?;
+            enc.array_size(count)?;
+            for e in v {
+                e.encode_with(enc, true)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkGetDeviceImageSparseMemoryRequirements_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.simple_pointer(self.p_sparse_memory_requirement_count.is_some())?;
+        if let Some(v) = &self.p_sparse_memory_requirement_count {
+            enc.u32(*v)?;
+        }
+        if let Some(v) = &self.p_sparse_memory_requirements {
+            let count = u64::from(self.p_sparse_memory_requirement_count.unwrap_or(0));
+            check_len(
+                "vkGetDeviceImageSparseMemoryRequirements",
+                "pSparseMemoryRequirements",
+                count,
+                v.len(),
+            )?;
+            enc.array_size(count)?;
+            for e in v {
+                e.encode_with(enc, false)?;
+            }
+        } else {
+            enc.array_size(0)?;
+        }
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkGetDeviceImageSparseMemoryRequirements_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'a>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.p_sparse_memory_requirement_count = if dec.simple_pointer()? {
+            Some(dec.u32()?)
+        } else {
+            None
+        };
+        self.p_sparse_memory_requirements = match array_presence(
+            dec,
+            u64::from(self.p_sparse_memory_requirement_count.unwrap_or(0)),
+            NullArray::Unchecked,
+        )? {
+            Some(n) => Some(decode_vec(dec, n, |dec| {
+                VkSparseImageMemoryRequirements2::decode_with(dec, false)
+            })?),
+            None => None,
+        };
+        Ok(())
+    }
+
+    /// Visit every pNext link the arguments carry, as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        if let Some(v) = &self.p_info {
+            v.for_each_link(f);
+        }
+    }
+}
+
+/// The arguments of `vkGetImageDrmFormatModifierPropertiesEXT`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place and sets `ret`, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GetImageDrmFormatModifierPropertiesEXTArgs {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `VkImage image` — in.
+    pub image: VkImage,
+    /// `VkImageDrmFormatModifierPropertiesEXT* pProperties` — out.
+    pub p_properties: Option<VkImageDrmFormatModifierPropertiesEXT>,
+    /// The return value (`VkResult`), written first in the reply.
+    pub ret: VkResult,
+}
+
+impl GetImageDrmFormatModifierPropertiesEXTArgs {
+    /// `VK_COMMAND_TYPE_vkGetImageDrmFormatModifierPropertiesEXT_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkGetImageDrmFormatModifierPropertiesEXT";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkGetImageDrmFormatModifierPropertiesEXT_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(
+                dec,
+                "vkGetImageDrmFormatModifierPropertiesEXT",
+            ));
+        }
+        let image: VkImage = VkImage(dec.handle()?);
+        let p_properties: Option<VkImageDrmFormatModifierPropertiesEXT> = if dec.simple_pointer()? {
+            Some(VkImageDrmFormatModifierPropertiesEXT::decode_with(
+                dec, true,
+            )?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetImageDrmFormatModifierPropertiesEXT",
+                "pProperties",
+            ));
+        };
+        Ok(Self {
+            device,
+            image,
+            p_properties,
+            ret: Default::default(),
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkGetImageDrmFormatModifierPropertiesEXT`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.handle(self.image.0)?;
+        enc.simple_pointer(self.p_properties.is_some())?;
+        if let Some(v) = &self.p_properties {
+            v.encode_with(enc, true)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkGetImageDrmFormatModifierPropertiesEXT_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.i32(self.ret)?;
+        enc.simple_pointer(self.p_properties.is_some())?;
+        if let Some(v) = &self.p_properties {
+            v.encode_with(enc, false)?;
+        }
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkGetImageDrmFormatModifierPropertiesEXT_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.ret = dec.i32()?;
+        self.p_properties = if dec.simple_pointer()? {
+            Some(VkImageDrmFormatModifierPropertiesEXT::decode_with(
+                dec, false,
+            )?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+}
+
+/// The arguments of `vkGetImageSubresourceLayout2`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GetImageSubresourceLayout2Args {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `VkImage image` — in.
+    pub image: VkImage,
+    /// `const VkImageSubresource2* pSubresource` — in.
+    pub p_subresource: Option<VkImageSubresource2>,
+    /// `VkSubresourceLayout2* pLayout` — out.
+    pub p_layout: Option<VkSubresourceLayout2>,
+}
+
+impl GetImageSubresourceLayout2Args {
+    /// `VK_COMMAND_TYPE_vkGetImageSubresourceLayout2_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_IMAGE_SUBRESOURCE_LAYOUT_2_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkGetImageSubresourceLayout2";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkGetImageSubresourceLayout2_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(dec, "vkGetImageSubresourceLayout2"));
+        }
+        let image: VkImage = VkImage(dec.handle()?);
+        let p_subresource: Option<VkImageSubresource2> = if dec.simple_pointer()? {
+            Some(VkImageSubresource2::decode_with(dec, false)?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetImageSubresourceLayout2",
+                "pSubresource",
+            ));
+        };
+        let p_layout: Option<VkSubresourceLayout2> = if dec.simple_pointer()? {
+            Some(VkSubresourceLayout2::decode_with(dec, true)?)
+        } else {
+            return Err(null_pointer(dec, "vkGetImageSubresourceLayout2", "pLayout"));
+        };
+        Ok(Self {
+            device,
+            image,
+            p_subresource,
+            p_layout,
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkGetImageSubresourceLayout2`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.handle(self.image.0)?;
+        enc.simple_pointer(self.p_subresource.is_some())?;
+        if let Some(v) = &self.p_subresource {
+            v.encode_with(enc, false)?;
+        }
+        enc.simple_pointer(self.p_layout.is_some())?;
+        if let Some(v) = &self.p_layout {
+            v.encode_with(enc, true)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkGetImageSubresourceLayout2_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.simple_pointer(self.p_layout.is_some())?;
+        if let Some(v) = &self.p_layout {
+            v.encode_with(enc, false)?;
+        }
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkGetImageSubresourceLayout2_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'_>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.p_layout = if dec.simple_pointer()? {
+            Some(VkSubresourceLayout2::decode_with(dec, false)?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// Visit every pNext link the arguments carry, as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        if let Some(v) = &self.p_layout {
+            v.for_each_link(f);
+        }
+    }
+}
+
+/// The arguments of `vkGetDeviceImageSubresourceLayout`, and its reply.
+///
+/// Inputs are as the guest sent them. Outputs are as the guest *sized*
+/// them: present or null, output handles carrying the guest's chosen id,
+/// output structures carrying their `sType` and chain skeleton. The executor
+/// fills the outputs in place, then
+/// [`Self::encode_reply`] writes them back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GetDeviceImageSubresourceLayoutArgs<'a> {
+    /// `VkDevice device` — in.
+    pub device: VkDevice,
+    /// `const VkDeviceImageSubresourceInfo* pInfo` — in.
+    pub p_info: Option<VkDeviceImageSubresourceInfo<'a>>,
+    /// `VkSubresourceLayout2* pLayout` — out.
+    pub p_layout: Option<VkSubresourceLayout2>,
+}
+
+impl<'a> GetDeviceImageSubresourceLayoutArgs<'a> {
+    /// `VK_COMMAND_TYPE_vkGetDeviceImageSubresourceLayout_EXT`.
+    pub const OPCODE: u32 = VK_COMMAND_TYPE_GET_DEVICE_IMAGE_SUBRESOURCE_LAYOUT_EXT;
+
+    /// The command's registry name.
+    pub const NAME: &'static str = "vkGetDeviceImageSubresourceLayout";
+
+    /// Decode the arguments that follow the 8-byte command header
+    /// (`vn_decode_vkGetDeviceImageSubresourceLayout_args_temp`).
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused; `dec` is left fatal.
+    pub fn decode(dec: &mut Decoder<'a>) -> Result<Self, ProtocolError> {
+        let device: VkDevice = VkDevice(dec.handle()?);
+        if device.0 == 0 {
+            return Err(null_dispatch_handle(
+                dec,
+                "vkGetDeviceImageSubresourceLayout",
+            ));
+        }
+        let p_info: Option<VkDeviceImageSubresourceInfo<'a>> = if dec.simple_pointer()? {
+            Some(VkDeviceImageSubresourceInfo::decode_with(dec, false)?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetDeviceImageSubresourceLayout",
+                "pInfo",
+            ));
+        };
+        let p_layout: Option<VkSubresourceLayout2> = if dec.simple_pointer()? {
+            Some(VkSubresourceLayout2::decode_with(dec, true)?)
+        } else {
+            return Err(null_pointer(
+                dec,
+                "vkGetDeviceImageSubresourceLayout",
+                "pLayout",
+            ));
+        };
+        Ok(Self {
+            device,
+            p_info,
+            p_layout,
+        })
+    }
+
+    /// Encode the command as the guest's driver does, header included
+    /// (`vn_encode_vkGetDeviceImageSubresourceLayout`): outputs as skeletons.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an array that disagrees with its count.
+    pub fn encode_command(&self, enc: &mut Encoder, flags: u32) -> Result<(), ProtocolError> {
+        enc.command_header(CommandHeader {
+            opcode: Self::OPCODE,
+            flags,
+        })?;
+        enc.handle(self.device.0)?;
+        enc.simple_pointer(self.p_info.is_some())?;
+        if let Some(v) = &self.p_info {
+            v.encode_with(enc, false)?;
+        }
+        enc.simple_pointer(self.p_layout.is_some())?;
+        if let Some(v) = &self.p_layout {
+            v.encode_with(enc, true)?;
+        }
+        Ok(())
+    }
+
+    /// Encode the reply (`vn_encode_vkGetDeviceImageSubresourceLayout_reply`): the opcode, the
+    /// return value if any, then every output parameter.
+    ///
+    /// On `Err` the encoder holds a partial reply and must be dropped.
+    ///
+    /// # Errors
+    /// Whatever the encoder refused, or an output array that disagrees with
+    /// its count.
+    pub fn encode_reply(&self, enc: &mut Encoder) -> Result<(), ProtocolError> {
+        enc.reply_header(Self::OPCODE)?;
+        enc.simple_pointer(self.p_layout.is_some())?;
+        if let Some(v) = &self.p_layout {
+            v.encode_with(enc, false)?;
+        }
+        Ok(())
+    }
+
+    /// Decode a reply into this command's outputs, as the guest's driver
+    /// does (`vn_decode_vkGetDeviceImageSubresourceLayout_reply`): arrays in a reply are never
+    /// cross-checked in their null branch, and a null output is not fatal.
+    ///
+    /// # Errors
+    /// Whatever the wire or this layer refused.
+    pub fn decode_reply(&mut self, dec: &mut Decoder<'a>) -> Result<(), ProtocolError> {
+        let found = dec.reply_header()?;
+        if found != Self::OPCODE {
+            dec.set_fatal(crate::venus::wire::WireError::Poisoned);
+            return Err(ProtocolError::WrongReplyOpcode {
+                expected: Self::OPCODE,
+                found,
+            });
+        }
+        self.p_layout = if dec.simple_pointer()? {
+            Some(VkSubresourceLayout2::decode_with(dec, false)?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// Visit every pNext link the arguments carry, as `(parent, sType)`.
+    pub fn for_each_link(&self, f: &mut dyn FnMut(&'static str, i32)) {
+        if let Some(v) = &self.p_info {
+            v.for_each_link(f);
+        }
+        if let Some(v) = &self.p_layout {
+            v.for_each_link(f);
+        }
     }
 }

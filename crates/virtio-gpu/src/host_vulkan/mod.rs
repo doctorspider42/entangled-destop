@@ -51,7 +51,8 @@ use crate::venus::protocol::{
     VkMemoryRequirements2Next, VkPhysicalDeviceFeatures, VkPhysicalDeviceFeatures2,
     VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceImageFormatInfo2Next,
     VkPhysicalDeviceMemoryProperties, VkPhysicalDeviceProperties, VkPhysicalDeviceProperties2,
-    VkQueueFamilyProperties, VkResult, VK_SUCCESS,
+    VkQueueFamilyProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT, VK_ERROR_FORMAT_NOT_SUPPORTED,
+    VK_ERROR_INITIALIZATION_FAILED, VK_SUCCESS,
 };
 use crate::venus::shmem::RingPages;
 
@@ -374,10 +375,13 @@ impl HostVulkan for AshVulkan {
             );
         }
         out.format_properties = FromAsh::from_ash(&head.format_properties);
+        // Only the links the executor admits reach here (`policy::admits_link`);
+        // any other stays as the guest sized it.
         for link in &mut out.p_next {
-            let VkFormatProperties2Next::VkFormatProperties3(p) = link;
-            if wants3 {
-                *p = FromAsh::from_ash(&props3);
+            if let VkFormatProperties2Next::VkFormatProperties3(p) = link {
+                if wants3 {
+                    *p = FromAsh::from_ash(&props3);
+                }
             }
         }
     }
@@ -412,6 +416,9 @@ impl HostVulkan for AshVulkan {
                 VkPhysicalDeviceImageFormatInfo2Next::VkImageStencilUsageCreateInfo(s) => {
                     stencil = Some(s.to_ash());
                 }
+                // The executor refuses every other link before a host is
+                // asked; a query that got here with one is not answered.
+                _ => return VK_ERROR_FORMAT_NOT_SUPPORTED,
             }
         }
         let mut list_info = list
@@ -464,6 +471,8 @@ impl HostVulkan for AshVulkan {
                 VkImageFormatProperties2Next::VkSamplerYcbcrConversionImageFormatProperties(p) => {
                     *p = FromAsh::from_ash(&ycbcr_out);
                 }
+                // Not admitted by the executor, so never here.
+                _ => {}
             }
         }
         match result {
@@ -499,7 +508,11 @@ impl HostVulkan for AshVulkan {
             .group
             .as_deref()
             .map(|members| vk::DeviceGroupDeviceCreateInfo::default().physical_devices(members));
-        let mut links = DeviceLinks::new(&request.chain);
+        // The executor admits only links with a twin; one without is refused
+        // rather than dropped.
+        let Ok(mut links) = DeviceLinks::new(&request.chain) else {
+            return Err(VK_ERROR_FEATURE_NOT_PRESENT);
+        };
         let mut info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&name_ptrs);
@@ -586,6 +599,9 @@ impl HostVulkan for AshVulkan {
                 VkImageCreateInfoNext::VkImageStencilUsageCreateInfo(s) => {
                     stencil = Some(s.to_ash());
                 }
+                // The executor refuses every other link before a host is
+                // asked; an image that got here with one is not created.
+                _ => return Err(VK_ERROR_INITIALIZATION_FAILED),
             }
         }
         let mut list_info = list

@@ -13,17 +13,19 @@
 # specification.** Every emitter below cites the `vn_protocol.py` function it
 # mirrors (`_encode_variable`, `_decode_variable`, `_get_variable_validity`,
 # ...). Where Rust needs a different *shape* (an `Option<Vec<T>>` for a
-# pointer-and-count pair), the bytes on the wire must still be exactly the
-# C's; `tools/venus-protocol/harness` checks that against the C output.
+# pointer-and-count pair, an enum for a union), the bytes on the wire must
+# still be exactly the C's; `tools/venus-protocol/harness` checks that against
+# the C output.
 #
-# Constructs the milestone never reaches (unions, strided arrays, nested
-# dynamic arrays, blobs written straight into the reply, arithmetic `len`
-# expressions) raise `Unsupported` at generation time rather than emitting
-# something plausible. Adding a command that needs one is a generator change,
-# made on purpose, not a silent mistranslation.
+# Every construct the protocol at the pinned revision uses is translated:
+# unions (selector-tagged and default-tagged), strided arrays, two-level
+# dynamic arrays, blobs a reply carries, arithmetic `len` expressions,
+# constant-length pointers and packed `uint16_t` arrays. What is left raises
+# `Unsupported` at generation time rather than emitting something plausible,
+# so a newer upstream revision that needs something new is a generator
+# change made on purpose, not a silent mistranslation.
 
 import argparse
-import copy
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -53,7 +55,7 @@ RUST_KEYWORDS = {
     'super', 'trait', 'true', 'type', 'unsafe', 'use', 'where', 'while',
     'async', 'await', 'dyn', 'abstract', 'become', 'box', 'do', 'final',
     'macro', 'override', 'priv', 'typeof', 'unsized', 'virtual', 'yield',
-    'try',
+    'try', 'gen',
 }
 
 # Locals the generated functions use themselves; a field may not shadow them.
@@ -88,19 +90,32 @@ def snake(name):
     return res
 
 
+def camel(name):
+    """A union member name as an enum variant: `float32` -> `Float32`."""
+    return name[:1].upper() + name[1:]
+
+
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
 
+ALL = '*'
+
+
 class Selection:
-    def __init__(self, api, extensions, commands):
+    """rust-selection.txt: `*` selects everything a section can hold, and in
+    `[commands]` a `-name` line takes one command back out of it."""
+
+    def __init__(self, api, extensions, commands, excluded):
         self.api = api
         self.extensions = extensions
         self.commands = commands
+        self.excluded = excluded
 
     @staticmethod
     def parse(path):
         sections = {'api': [], 'extensions': [], 'commands': []}
+        excluded = []
         current = None
         for raw in Path(path).read_text(encoding='utf-8').splitlines():
             line = raw.split('#', 1)[0].strip()
@@ -113,12 +128,25 @@ class Selection:
                 continue
             if current is None:
                 raise ValueError('%s: entry %r before any section' % (path, line))
+            if line.startswith('-'):
+                if current != 'commands':
+                    raise ValueError('%s: %r: only [commands] takes exclusions' % (path, line))
+                if line[1:] in excluded:
+                    raise ValueError('%s: %r excluded twice' % (path, line))
+                excluded.append(line[1:])
+                continue
             if line in sections[current]:
                 raise ValueError('%s: %r listed twice' % (path, line))
             sections[current].append(line)
-        if len(sections['api']) != 1 or not re.fullmatch(r'1\.\d+', sections['api'][0]):
-            raise ValueError('%s: [api] must hold exactly one version like 1.3' % path)
-        return Selection(sections['api'][0], sections['extensions'], sections['commands'])
+        for name, entries in sections.items():
+            if ALL in entries and len(entries) != 1:
+                raise ValueError('%s: [%s] holds `*` and more' % (path, name))
+        api = sections['api']
+        if len(api) != 1 or not (api[0] == ALL or re.fullmatch(r'1\.\d+', api[0])):
+            raise ValueError('%s: [api] must hold exactly one version like 1.3, or *' % path)
+        if excluded and sections['commands'] != [ALL]:
+            raise ValueError('%s: a `-name` exclusion needs `*` in [commands]' % path)
+        return Selection(api[0], sections['extensions'], sections['commands'], excluded)
 
 
 # ---------------------------------------------------------------------------
@@ -126,11 +154,13 @@ class Selection:
 # ---------------------------------------------------------------------------
 
 class Elem:
-    """What one element of a field is: a scalar, a handle or a struct."""
+    """What one element of a field is: a scalar, a handle, a struct or a
+    union."""
 
     SCALAR = 'scalar'
     HANDLE = 'handle'
     STRUCT = 'struct'
+    UNION = 'union'
 
     # Primitive C type -> (Rust type, Decoder/Encoder method).
     PRIMS = {
@@ -157,17 +187,52 @@ class Elem:
     def is_byte(self):
         return self.kind == self.SCALAR and self.prim in ('char', 'uint8_t', 'void')
 
+    def is_u16(self):
+        return self.kind == self.SCALAR and self.prim == 'uint16_t'
+
+    def is_compound(self):
+        return self.kind in (self.STRUCT, self.UNION)
+
+
+class Count:
+    """How many elements one level of an array has, as the C computes it
+    (`VariableInfo._init_loop_info`).
+
+    PATH     a member (or `pointer->member`) named as the count;
+    EXPR     C arithmetic over one member, `codeSize / 4`;
+    CONST    known at generation time, `2*VK_UUID_SIZE` or the `1` of a
+             pointer-to-one inner level;
+    INDEXED  an inner level's count read from the outer array's element,
+             `pInfos[i].geometryCount`.
+    """
+
+    PATH = 'path'
+    EXPR = 'expr'
+    CONST = 'const'
+    INDEXED = 'indexed'
+
+    def __init__(self, kind, text, path=None, value=None, ast=None, guarded=True):
+        self.kind = kind
+        self.text = text        # the registry's own spelling
+        self.path = path        # [VkVariable] for PATH / INDEXED / EXPR (its one var)
+        self.value = value      # CONST
+        self.ast = ast          # EXPR
+        self.guarded = guarded  # INDEXED: whether the C guards a null outer array
+
 
 class Field:
-    """One member of a struct or one parameter of a command, in Rust terms."""
+    """One member of a struct or union, or one parameter of a command, in
+    Rust terms."""
 
     PLAIN = 'plain'
     STATIC = 'static'
     PTR = 'ptr'
     DYN = 'dyn'
+    NESTED = 'nested'
     STRING = 'string'
     STRING_ARRAY = 'string_array'
     BLOB = 'blob'
+    BLOB_OUT = 'blob_out'
     NULL_ONLY = 'null_only'
 
     def __init__(self, owner, var):
@@ -178,8 +243,12 @@ class Field:
         self.shape = None
         self.elem = None
         self.n = None           # STATIC length
-        self.len_var = None     # DYN-like: path of VkVariables naming the count
+        self.count = None       # Count of a dynamic array (outer level)
+        self.inner = None       # NESTED: Count of the inner level
         self.condition = None   # IGNORABLE_LIST translation, encode side only
+        self.selector = None    # a union member: the variable naming its tag
+        self.stride_of = None   # a stride parameter: the C sizeof it must equal
+        self.strided = None     # a strided array: the name of its stride parameter
         self.optional = var.is_optional()
         self.can_validate = var.can_validate()
 
@@ -197,9 +266,11 @@ class Model:
         self.chains = {}          # VkType -> [VkType]
         self.zero_width = {}      # VkType -> bool (partial encoding is empty)
         self.lifetime = {}        # VkType -> bool
+        self.reach_chain = {}     # VkType -> bool (a pNext chain is reachable)
         self.aliases = []         # scalar alias VkTypes, registry order
         self.handles = []         # handle VkTypes, registry order
         self.enum_consts = {}     # name -> (rust type, value)
+        self.constructs = {}      # construct -> set of command names reaching it
 
         self._init_chain_allowed()
         self._init_commands()
@@ -208,7 +279,9 @@ class Model:
         self._check_partial_closure()
         self._init_zero_width()
         self._init_lifetimes()
+        self._init_reach_chain()
         self._init_groups()
+        self._init_constructs()
 
     # ---- registry helpers -------------------------------------------------
 
@@ -237,37 +310,54 @@ class Model:
             raise Unsupported('%s: array dimension %s = %r' % (var.name, dim, value))
         return int(value)
 
-    def enum_value(self, enum_ty_name, key):
-        values = self.reg.type_table[enum_ty_name].enums.values
-        return int(values[key], 0)
+    def newest_api(self):
+        return max((f.number for f in self.reg.features),
+                   key=lambda n: tuple(int(x) for x in n.split('.')))
+
+    def api(self):
+        """The `[api]` version, `*` resolved to the newest vk.xml knows."""
+        return self.newest_api() if self.selection.api == ALL else self.selection.api
+
+    def chosen_extensions(self):
+        if self.selection.extensions == [ALL]:
+            return list(vp.VK_XML_EXTENSION_LIST)
+        return list(self.selection.extensions)
 
     # ---- which chain structures are admitted -------------------------------
 
     def _init_chain_allowed(self):
-        api = self.selection.api
+        api = self.api()
         major, minor = (int(x) for x in api.split('.'))
-        allowed = set()
-        numbers = set()
-        for feat in self.reg.features:
-            fmaj, fmin = (int(x) for x in feat.number.split('.'))
-            numbers.add(feat.number)
-            if (fmaj, fmin) <= (major, minor):
-                allowed.update(feat.types)
+        numbers = {feat.number for feat in self.reg.features}
         if api not in numbers:
             raise ValueError('[api] %s is not a Vulkan version in vk.xml' % api)
 
         exts = {e.name: e for e in self.reg.extensions}
-        chosen = set(self.selection.extensions)
-        for name in self.selection.extensions:
+        chosen = self.chosen_extensions()
+        for name in chosen:
             if name not in vp.VK_XML_EXTENSION_LIST:
                 raise ValueError('extension %s is not in VK_XML_EXTENSION_LIST' % name)
             if name not in exts:
                 raise ValueError('extension %s is not in the registry' % name)
-        for name in self.selection.extensions:
+
+        # Everything, which is the default: the chain whitelist is exactly
+        # the protocol's (`Gen.get_chain`, the `switch` of every
+        # `vn_decode_*_pnext_temp`), with no filter of our own on top.
+        if api == self.newest_api() and set(chosen) == set(vp.VK_XML_EXTENSION_LIST):
+            self.chain_allowed = None
+            return
+
+        allowed = set()
+        for feat in self.reg.features:
+            fmaj, fmin = (int(x) for x in feat.number.split('.'))
+            if (fmaj, fmin) <= (major, minor):
+                allowed.update(feat.types)
+        chosen_set = set(chosen)
+        for name in chosen:
             ext = exts[name]
             allowed.update(ext.types)
             for deps, types in ext.optional_types.items():
-                if self._deps_met(deps, chosen):
+                if self._deps_met(deps, chosen_set):
                     allowed.update(types)
         self.chain_allowed = allowed
 
@@ -284,15 +374,22 @@ class Model:
     def _init_commands(self):
         supported = self.gen.supported_types[VkType.COMMAND]
         by_name = {c.name: c for c in supported}
+        sel = self.selection
+        if sel.commands == [ALL]:
+            for name in sel.excluded:
+                if name not in by_name:
+                    raise ValueError('excluded command %s is not in the venus protocol' % name)
+            names = [c.name for c in supported
+                     if self.gen.is_serializable(c) and c.name not in sel.excluded]
+        else:
+            names = sel.commands
         self.commands = []
-        for name in self.selection.commands:
+        for name in names:
             cmd = by_name.get(name)
             if cmd is None:
                 raise ValueError('command %s is not in the venus protocol' % name)
             if not self.gen.is_serializable(cmd):
                 raise ValueError('command %s is not serializable' % name)
-            if 'need_blob_encode' in cmd.attrs:
-                raise Unsupported('%s writes a blob straight into its reply' % name)
             self.commands.append(cmd)
         # registry order, so the output does not depend on the list's order
         order = {c: i for i, c in enumerate(supported)}
@@ -300,6 +397,8 @@ class Model:
 
     def chain_of(self, ty):
         types, _skipped = self.gen.get_chain(ty)
+        if self.chain_allowed is None:
+            return types
         return [t for t in types if t in self.chain_allowed]
 
     def _init_closure(self):
@@ -307,29 +406,30 @@ class Model:
         visiting = []
 
         def visit(ty):
-            if ty.category == VkType.UNION:
-                raise Unsupported('union %s' % ty.name)
-            if ty.category != VkType.STRUCT:
+            if ty.category not in (VkType.STRUCT, VkType.UNION):
                 return
             if ty in seen:
                 return
             if ty in visiting:
                 raise Unsupported('%s contains itself' % ty.name)
+            if ty.category == VkType.UNION and not self.gen.is_serializable(ty):
+                raise Unsupported('union %s is not serializable' % ty.name)
             visiting.append(ty)
             for var in ty.variables:
                 if var.is_p_next():
                     continue
-                if var.maybe_null() and not self.gen.is_serializable(var):
+                if not self.gen.is_serializable(var):
                     continue
                 visit(var.ty.base)
             visiting.pop()
             seen.append(ty)
-            for nxt in self.chain_of(ty):
-                visit(nxt)
+            if ty.category == VkType.STRUCT:
+                for nxt in self.chain_of(ty):
+                    visit(nxt)
 
         for cmd in self.commands:
             for var in cmd.variables:
-                if var.maybe_null() and not self.gen.is_serializable(var):
+                if not self.gen.is_serializable(var):
                     continue
                 visit(var.ty.base)
         # Dependency order (members before the structs holding them) is what
@@ -348,7 +448,7 @@ class Model:
         if cat == VkType.STRUCT:
             return Elem(Elem.STRUCT, base, base.name)
         if cat == VkType.UNION:
-            raise Unsupported('union %s' % base.name)
+            return Elem(Elem.UNION, base, base.name)
         prim = self._primitive_of(base)
         rust, method = Elem.PRIMS[prim]
         if cat == VkType.DEFAULT:
@@ -373,18 +473,41 @@ class Model:
             return self._primitive_of(base.typedef)
         raise Unsupported('type %s (category %d)' % (base.name, cat))
 
+    def c_layout(self, ty):
+        """(sizeof, alignof) of a C type, for the strided arrays whose stride
+        the driver rewrites to `sizeof(element)`. Only what a stride element
+        can be: scalars, and structures of them."""
+        cat = ty.category
+        if cat in (VkType.DEFAULT, VkType.BASETYPE, VkType.ENUM, VkType.BITMASK):
+            prim = self._primitive_of(ty)
+            size = {'uint32_t': 4, 'int32_t': 4, 'float': 4, 'uint64_t': 8,
+                    'int64_t': 8, 'double': 8, 'uint16_t': 2, 'uint8_t': 1}.get(prim)
+            if size is None:
+                raise Unsupported('sizeof %s' % ty.name)
+            return size, size
+        if cat != VkType.STRUCT or ty.s_type:
+            raise Unsupported('sizeof %s' % ty.name)
+        size, align = 0, 1
+        for var in ty.variables:
+            if var.ty.is_pointer():
+                raise Unsupported('sizeof %s: pointer member' % ty.name)
+            s, a = self.c_layout(var.ty.base)
+            if var.ty.is_static_array():
+                s *= self.static_len(var)
+            size = (size + a - 1) // a * a + s
+            align = max(align, a)
+        return (size + align - 1) // align * align, align
+
     def _field(self, owner, var):
         f = Field(owner, var)
         ty = var.ty
         base = ty.base
 
-        if 'stride' in var.attrs:
-            raise Unsupported('%s.%s: strided array' % (owner.name, var.name))
-        if 'selector' in var.attrs:
-            raise Unsupported('%s.%s: union selector' % (owner.name, var.name))
-
         if not self.gen.is_serializable(var):
-            if var.maybe_null():
+            # `_decode_variable` over an unserializable pointer: the marker,
+            # fatal when set, and when null fatal again unless optional or
+            # noautovalidity. A union's host address is the one non-optional.
+            if var.ty.is_pointer():
                 f.shape = Field.NULL_ONLY
                 return f
             raise Unsupported('%s.%s is not serializable' % (owner.name, var.name))
@@ -392,6 +515,16 @@ class Model:
         for ign in vp.Gen.IGNORABLE_LIST:
             if ign.struct == owner.name and ign.var == var.name:
                 f.condition = self._translate_condition(ign.condition)
+
+        if 'selector' in var.attrs:
+            if ty.is_pointer() or ty.is_static_array() or base.category != VkType.UNION \
+                    or not base.is_valid_union():
+                raise Unsupported('%s.%s: selector on a non-union' % (owner.name, var.name))
+            sel = [v for v in owner.variables if v.name == var.attrs['selector']]
+            if len(sel) != 1 or sel[0].ty.is_pointer():
+                raise Unsupported('%s.%s: selector %s' % (owner.name, var.name, var.attrs['selector']))
+            f.selector = sel[0]
+            self.elem_of(base.sty)
 
         if ty.is_static_array():
             if ty.is_pointer():
@@ -401,8 +534,8 @@ class Model:
             f.shape = Field.STATIC
             f.n = self.static_len(var)
             f.elem = self.elem_of(base)
-            if f.elem.kind == Elem.SCALAR and f.elem.prim == 'uint16_t':
-                raise Unsupported('%s.%s: packed uint16_t array' % (owner.name, var.name))
+            if f.elem.kind == Elem.UNION:
+                raise Unsupported('%s.%s: array of unions' % (owner.name, var.name))
             return f
 
         if not ty.is_pointer():
@@ -418,6 +551,8 @@ class Model:
                 raise Unsupported('%s.%s: void pointer without len' % (owner.name, var.name))
             f.shape = Field.PTR
             f.elem = self.elem_of(base)
+            if f.elem.kind == Elem.UNION and base.is_valid_union():
+                raise Unsupported('%s.%s: pointer to a selected union' % (owner.name, var.name))
             return f
 
         exprs = var.attrs['len_exprs']
@@ -430,32 +565,166 @@ class Model:
             if depth == 2 and len(exprs) == 2 and exprs[1] == 'null-terminated':
                 f.shape = Field.STRING_ARRAY
                 f.elem = self.elem_of(base)
-                f.len_var = self._len_path(owner, var, exprs[0], names[0])
+                f.count = self._count(owner, var, exprs[0], names[0])
                 return f
             raise Unsupported('%s.%s: string shape %r' % (owner.name, var.name, exprs))
+
+        if depth == 2 and len(exprs) == 2:
+            f.shape = Field.NESTED
+            f.elem = self.elem_of(base)
+            f.count = self._count(owner, var, exprs[0], names[0])
+            f.inner = self._inner_count(owner, var, exprs[1], names[1])
+            if f.elem.kind == Elem.UNION or f.elem.is_byte() or f.elem.is_u16():
+                raise Unsupported('%s.%s: nested array of %s' % (owner.name, var.name, base.name))
+            return f
         if depth != 1 or len(exprs) != 1:
             raise Unsupported('%s.%s: nested dynamic array' % (owner.name, var.name))
-        f.len_var = self._len_path(owner, var, exprs[0], names[0])
+        f.count = self._count(owner, var, exprs[0], names[0])
+        if 'stride' in var.attrs:
+            f.strided = var.attrs['stride']
+        # A blob the host writes — an output parameter, or a member a
+        # skeleton leaves unwritten — is held owned; an input one is
+        # borrowed from the command bytes.
+        written = 'var_out' in var.attrs or (
+            owner.category == VkType.STRUCT and 'need_partial' in owner.attrs
+            and self.gen._get_variable_validity(owner, var, False) == INVALID)
         if var.is_blob():
-            f.shape = Field.BLOB
-            f.elem = None
+            f.shape = Field.BLOB_OUT if written else Field.BLOB
             return f
         f.elem = self.elem_of(base)
         if f.elem.is_byte():
-            f.shape = Field.BLOB
-        elif f.elem.kind == Elem.SCALAR and f.elem.prim == 'uint16_t':
-            raise Unsupported('%s.%s: packed uint16_t array' % (owner.name, var.name))
+            f.shape = Field.BLOB_OUT if written else Field.BLOB
+            f.elem = None
         else:
             f.shape = Field.DYN
+            if f.elem.kind == Elem.UNION and base.is_valid_union():
+                raise Unsupported('%s.%s: array of selected unions' % (owner.name, var.name))
         return f
 
-    def _len_path(self, owner, var, expr, name):
-        if expr != name or not name:
-            raise Unsupported('%s.%s: len expression %r' % (owner.name, var.name, expr))
+    # ---- counts: mirrors VariableInfo._init_loop_info ------------------------
+
+    def _count(self, owner, var, expr, name):
+        if not name:
+            return Count(Count.CONST, expr, value=self._const_value(owner, var, expr))
         path = owner.find_variables(name)
         if not path or len(path) > 2:
             raise Unsupported('%s.%s: len %r' % (owner.name, var.name, name))
-        return path
+        if expr == name:
+            return Count(Count.PATH, expr, path=path)
+        if len(path) != 1 or path[0].ty.is_pointer():
+            raise Unsupported('%s.%s: len expression over %r' % (owner.name, var.name, name))
+        ast = self._parse_expr(owner, var, expr, name)
+        self.c_unsigned_width(path[0])
+        return Count(Count.EXPR, expr, path=path, ast=ast)
+
+    def _inner_count(self, owner, var, expr, name):
+        if not name:
+            return Count(Count.CONST, expr, value=self._const_value(owner, var, expr))
+        if '[i].' in name:
+            path = owner.find_variables(name)
+            if len(path) != 2 or expr != name or path[0].ty.indirection_depth() != 1:
+                raise Unsupported('%s.%s: inner len %r' % (owner.name, var.name, name))
+            # `VariableInfo._init_loop_info` leaves ppBuildRangeInfos's inner
+            # count unguarded; the outer array is required there, so the
+            # difference never shows on a stream that decodes.
+            return Count(Count.INDEXED, expr, path=path, guarded=var.name != 'ppBuildRangeInfos')
+        raise Unsupported('%s.%s: inner len %r' % (owner.name, var.name, expr))
+
+    def _const_value(self, owner, var, expr):
+        ast = self._parse_expr(owner, var, expr, None)
+        return self._eval_const(ast)
+
+    TOKEN = re.compile(r'\s*(?:(\d+)|([A-Za-z_]\w*)|(.))')
+
+    def _parse_expr(self, owner, var, text, name):
+        """A registry `len` expression: integers, API constants, the one
+        member `name`, `+ - * /` and parentheses. Anything else is refused."""
+        toks = []
+        for m in self.TOKEN.finditer(text):
+            if m.group(1):
+                toks.append(('int', int(m.group(1))))
+            elif m.group(2):
+                ident = m.group(2)
+                if ident == name:
+                    toks.append(('var', ident))
+                elif ident in self.constants and self.constants[ident].isdigit():
+                    toks.append(('int', int(self.constants[ident])))
+                else:
+                    raise Unsupported('%s.%s: len %r names %s' % (owner.name, var.name, text, ident))
+            elif m.group(3) and m.group(3).strip():
+                if m.group(3) not in '+-*/()':
+                    raise Unsupported('%s.%s: len %r' % (owner.name, var.name, text))
+                toks.append(('op', m.group(3)))
+        pos = [0]
+
+        def peek():
+            return toks[pos[0]] if pos[0] < len(toks) else ('end', None)
+
+        def take():
+            t = peek()
+            pos[0] += 1
+            return t
+
+        def primary():
+            t = take()
+            if t[0] in ('int', 'var'):
+                return t
+            if t == ('op', '('):
+                e = expr()
+                if take() != ('op', ')'):
+                    raise Unsupported('%s.%s: len %r' % (owner.name, var.name, text))
+                return e
+            raise Unsupported('%s.%s: len %r' % (owner.name, var.name, text))
+
+        def term():
+            e = primary()
+            while peek() in (('op', '*'), ('op', '/')):
+                op = take()[1]
+                rhs = primary()
+                if op == '/' and (rhs[0] != 'int' or rhs[1] == 0):
+                    raise Unsupported('%s.%s: len %r divides by a non-constant' % (
+                        owner.name, var.name, text))
+                e = ('bin', op, e, rhs)
+            return e
+
+        def expr():
+            e = term()
+            while peek() in (('op', '+'), ('op', '-')):
+                op = take()[1]
+                e = ('bin', op, e, term())
+            return e
+
+        ast = expr()
+        if peek()[0] != 'end':
+            raise Unsupported('%s.%s: len %r' % (owner.name, var.name, text))
+        return ast
+
+    @staticmethod
+    def _eval_const(ast):
+        if ast[0] == 'int':
+            return ast[1]
+        if ast[0] == 'var':
+            raise Unsupported('a constant len names a member')
+        _, op, a, b = ast
+        a, b = Model._eval_const(a), Model._eval_const(b)
+        return {'+': a + b, '-': a - b, '*': a * b, '/': a // b}[op]
+
+    def c_unsigned_width(self, var):
+        """The C type an arithmetic `len` computes in once `var` is read: the
+        usual arithmetic conversions over an unsigned operand. An enum with
+        no negative value is `unsigned int` under GCC and Clang, which is
+        what virglrenderer is built with (the harness asserts it)."""
+        base = var.ty.base
+        if base.category == VkType.ENUM:
+            if base.enums.bitwidth != 32 or any(int(v, 0) < 0 for v in base.enums.values.values()):
+                raise Unsupported('len over enum %s' % base.name)
+            return 32
+        prim = self._primitive_of(base)
+        if prim in ('uint64_t', 'size_t'):
+            return 64
+        if prim == 'uint32_t':
+            return 32
+        raise Unsupported('len arithmetic over %s' % base.name)
 
     def _translate_condition(self, cond):
         m = re.fullmatch(r'val->(\w+) == (VK_\w+)', cond)
@@ -477,8 +746,9 @@ class Model:
                     rust = flags if flags in self.reg.type_table else 'u32'
                 else:
                     rust = ty.name
+                    self.elem_of(ty)
                 self.enum_consts[key] = (rust, value)
-                return
+                return value
         raise Unsupported('constant %s' % key)
 
     def _init_fields(self):
@@ -491,17 +761,67 @@ class Model:
                     raise Unsupported('%s: pNext without sType' % ty.name)
                 fields.append(self._field(ty, var))
             self.fields[ty] = fields
-            self.chains[ty] = [t for t in self.chain_of(ty) if t in self.structs]
+            if ty.category == VkType.STRUCT:
+                self.chains[ty] = [t for t in self.chain_of(ty) if t in self.structs]
+            else:
+                self.chains[ty] = []
+                self._init_union(ty)
+            self._init_strides(ty)
             self._check_names(ty, fields)
         for cmd in self.commands:
             fields = [self._field(cmd, var) for var in cmd.variables]
             self.fields[cmd] = fields
+            self._init_strides(cmd)
             self._check_names(cmd, fields)
             if cmd.ret:
                 self.elem_of(cmd.ret.ty.base)
         # VkResult names every reply's return value and defines.rs lists its
         # values whether or not a selected command returns one.
         self.elem_of(self.reg.type_table['VkResult'])
+
+    def _init_union(self, ty):
+        """A union's cases, as `get_union_cases` lists them: the selector
+        values each member answers to, or its index for a union the
+        protocol always sends with its default tag (`UNION_DEFAULT_TAGS`)."""
+        cases = {}
+        order = []
+        for tag, var in ty.get_union_cases():
+            value = self._need_const(tag) if ty.is_valid_union() else tag
+            f = next(f for f in self.fields[ty] if f.var is var)
+            if f.shape not in (Field.PLAIN, Field.STATIC, Field.PTR, Field.NULL_ONLY):
+                raise Unsupported('%s.%s: union member shape %s' % (ty.name, var.name, f.shape))
+            if f.shape in (Field.PLAIN, Field.PTR) and f.elem.kind == Elem.UNION                     and f.elem.ty.is_valid_union():
+                raise Unsupported('%s.%s: selected union in a union' % (ty.name, var.name))
+            if var.name not in cases:
+                cases[var.name] = []
+                order.append(f)
+            cases[var.name].append((tag, value))
+        ty.attrs['rust_cases'] = [(f, cases[f.var.name]) for f in order]
+        if ty.is_valid_union():
+            self.elem_of(ty.sty)
+            ty.attrs['rust_default'] = order[0]
+        else:
+            default = vp.Gen.UNION_DEFAULT_TAGS[ty.name]
+            ty.attrs['rust_default'] = next(f for f, tags in ty.attrs['rust_cases']
+                                            if tags[0][1] == default)
+            ty.attrs['rust_default_tag'] = default
+
+    def _init_strides(self, owner):
+        """A strided array's stride parameter goes out as
+        `sizeof(element)`: the driver packs the elements and rewrites it
+        (`stride = sizeof(...)` in `_encode_variable`)."""
+        for f in self.fields[owner]:
+            if not f.strided:
+                continue
+            if f.shape != Field.DYN or f.elem.kind != Elem.STRUCT:
+                raise Unsupported('%s.%s: strided %s' % (owner.name, f.c_name, f.shape))
+            stride = [g for g in self.fields[owner] if g.c_name == f.strided]
+            if len(stride) != 1 or stride[0].shape != Field.PLAIN \
+                    or stride[0].elem.kind != Elem.SCALAR or stride[0].elem.prim != 'uint32_t':
+                raise Unsupported('%s.%s: stride %s' % (owner.name, f.c_name, f.strided))
+            if 'var_out' in f.var.attrs or 'var_out' in stride[0].var.attrs:
+                raise Unsupported('%s.%s: output stride' % (owner.name, f.c_name))
+            stride[0].stride_of = self.c_layout(f.elem.ty)[0]
 
     @staticmethod
     def _check_names(ty, fields):
@@ -510,6 +830,9 @@ class Model:
             raise Unsupported('%s: field names collide after snake_case' % ty.name)
         if 'p_next' in names or 'ret' in names:
             raise Unsupported('%s: field shadows p_next/ret' % ty.name)
+        for f in fields:
+            if f.selector is not None and '%s_tag' % f.name in names:
+                raise Unsupported('%s: %s_tag collides' % (ty.name, f.name))
 
     # ---- validity: mirrors vn_protocol.Gen._get_variable_validity -----------
 
@@ -524,7 +847,7 @@ class Model:
         """Whether `ty` has a skeleton form at all: vn_protocol sets
         `need_partial` on every type an output parameter reaches, members and
         chain links included, and only those get `*_partial` codecs."""
-        return 'need_partial' in ty.attrs
+        return ty.category == VkType.STRUCT and 'need_partial' in ty.attrs
 
     def _check_partial_closure(self):
         for ty in self.structs:
@@ -584,12 +907,34 @@ class Model:
         for f in self.fields[ty]:
             if f.shape in (Field.STRING, Field.STRING_ARRAY, Field.BLOB):
                 return True
-            if f.elem is not None and f.elem.kind == Elem.STRUCT and self.lifetime[f.elem.ty]:
+            if f.elem is not None and f.elem.is_compound() and self.lifetime[f.elem.ty]:
                 return True
         return any(self.lifetime[t] for t in self.chains.get(ty, []))
 
     def chain_lifetime(self, ty):
         return any(self.lifetime[t] for t in self.chains[ty])
+
+    def _init_reach_chain(self):
+        """Which types carry a pNext link somewhere inside them, for the
+        link walk the executor judges chains with."""
+        for ty in self.structs:
+            self.reach_chain[ty] = bool(self.chains[ty])
+        changed = True
+        while changed:
+            changed = False
+            for ty in self.structs:
+                if self.reach_chain[ty]:
+                    continue
+                if any(self.walks(f) for f in self.fields[ty]) or \
+                        any(self.reach_chain[t] for t in self.chains[ty]):
+                    self.reach_chain[ty] = True
+                    changed = True
+        for cmd in self.commands:
+            self.reach_chain[cmd] = any(self.walks(f) for f in self.fields[cmd])
+
+    def walks(self, f):
+        """Whether field `f` can hold a pNext link."""
+        return f.elem is not None and f.elem.is_compound() and self.reach_chain.get(f.elem.ty, False)
 
     # ---- groups: mirrors GenStructsAndCommands --------------------------------
 
@@ -627,13 +972,57 @@ class Model:
 
     def _reach(self, ty, acc):
         for f in self.fields[ty]:
-            if f.elem is not None and f.elem.kind == Elem.STRUCT and f.elem.ty not in acc:
+            if f.elem is not None and f.elem.is_compound() and f.elem.ty not in acc:
                 acc.add(f.elem.ty)
                 self._reach(f.elem.ty, acc)
         for t in self.chains.get(ty, []):
             if t not in acc:
                 acc.add(t)
                 self._reach(t, acc)
+
+    # ---- construct coverage, for the harness report ----------------------------
+
+    def field_constructs(self, f):
+        out = set()
+        if f.elem is not None and f.elem.kind == Elem.UNION:
+            out.add('union (selector)' if f.selector is not None else 'union (default tag)')
+        if f.strided:
+            out.add('strided array')
+        if f.shape == Field.NESTED:
+            out.add('nested dynamic array')
+        if f.shape == Field.BLOB_OUT:
+            out.add('blob in the reply')
+        if f.count is not None and f.count.kind == Count.EXPR:
+            out.add('arithmetic len')
+        if f.count is not None and f.count.kind == Count.CONST:
+            out.add('constant len')
+        if f.elem is not None and f.elem.is_u16() and f.shape in (Field.DYN, Field.STATIC):
+            out.add('packed uint16_t array')
+        if f.shape == Field.NULL_ONLY and not f.var.maybe_null():
+            out.add('unserializable pointer')
+        return out
+
+    def _init_constructs(self):
+        memo = {}
+
+        def of(ty, stack):
+            if ty in memo:
+                return memo[ty]
+            acc = set()
+            stack = stack | {ty}
+            for f in self.fields[ty]:
+                acc |= self.field_constructs(f)
+                if f.elem is not None and f.elem.is_compound() and f.elem.ty not in stack:
+                    acc |= of(f.elem.ty, stack)
+            for t in self.chains.get(ty, []):
+                if t not in stack:
+                    acc |= of(t, stack)
+            memo[ty] = acc
+            return acc
+
+        for cmd in self.commands:
+            for c in of(cmd, frozenset()):
+                self.constructs.setdefault(c, set()).add(cmd.name)
 
     # ---- enum and version tables --------------------------------------------
 
@@ -643,6 +1032,34 @@ class Model:
         for ty in self.structs:
             if ty.s_type:
                 out.append((ty.s_type, int(values[ty.s_type], 0)))
+        return out
+
+    def structure_origins(self):
+        """Where every generated extensible structure comes from in the
+        registry: the first core version that has it, and the protocol's
+        extensions that add it. Sorted by sType."""
+        values = self.reg.type_table['VkStructureType'].enums.values
+        exts = [e for e in self.reg.extensions if e.name in vp.VK_XML_EXTENSION_LIST]
+        out = []
+        for ty in self.structs:
+            if not ty.s_type:
+                continue
+            core = None
+            for feat in self.reg.features:
+                if ty in feat.types:
+                    ver = tuple(int(x) for x in feat.number.split('.'))
+                    if core is None or ver < core:
+                        core = ver
+            names = set()
+            for ext in exts:
+                if ty in ext.types:
+                    names.add(ext.name)
+                for deps, types in ext.optional_types.items():
+                    if ty in types and vp.Gen.support_type_depends(deps):
+                        names.add(ext.name)
+            packed = (core[0] << 22) | (core[1] << 12) if core else None
+            out.append((int(values[ty.s_type], 0), ty.name, ty.s_type, packed, sorted(names)))
+        out.sort(key=lambda t: t[0])
         return out
 
     def command_types(self):
@@ -678,7 +1095,7 @@ class Model:
     def extensions(self):
         exts = [e for e in self.reg.extensions if e.name in vp.VK_XML_EXTENSION_LIST]
         exts.sort(key=lambda e: e.name)
-        chosen = set(self.selection.extensions)
+        chosen = set(self.chosen_extensions())
         return [(e.name, e.number, e.version, e.name in chosen) for e in exts]
 
     @staticmethod
@@ -715,7 +1132,7 @@ class Rust:
         return "<'a>" if self.m.lifetime.get(ty) else ''
 
     def elem_type(self, elem):
-        if elem.kind == Elem.STRUCT:
+        if elem.is_compound():
             return elem.rust + self.lt(elem.ty)
         return elem.rust
 
@@ -730,8 +1147,12 @@ class Rust:
             return 'Option<%s>' % self.elem_type(f.elem)
         if f.shape == Field.DYN:
             return 'Option<Vec<%s>>' % self.elem_type(f.elem)
+        if f.shape == Field.NESTED:
+            return 'Option<Vec<Vec<%s>>>' % self.elem_type(f.elem)
         if f.shape in (Field.STRING, Field.BLOB):
             return "Option<&'a [u8]>"
+        if f.shape == Field.BLOB_OUT:
+            return 'Option<Vec<u8>>'
         if f.shape == Field.STRING_ARRAY:
             return "Option<Vec<&'a [u8]>>"
         raise AssertionError(f.shape)
@@ -753,16 +1174,34 @@ class Rust:
 
     # ---- counts ----------------------------------------------------------
 
-    def count_expr(self, f, access):
-        """The array length a len-path names, as a `u64` expression.
+    def count_expr(self, count, access, index=None):
+        """An array level's length, as a `u64` expression.
 
         Mirrors `VariableInfo._init_loop_info`: a pointer count reads as
         `(p ? *p : 0)`, a count inside a pointed-to struct as
-        `(p ? p->count : 0)`.
+        `(p ? p->count : 0)`, an inner count as `(outer ? outer[i].c : 0)`,
+        and arithmetic as C evaluates it in its unsigned type.
         """
-        path = f.len_var
+        if count.kind == Count.CONST:
+            return '%du64' % count.value
+        if count.kind == Count.EXPR:
+            var = count.path[0]
+            width = self.m.c_unsigned_width(var)
+            ty = 'u%d' % width
+            operand = access(snake(var.name))
+            prim = self.m._primitive_of(var.ty.base)
+            if prim == 'int32_t':
+                operand = '(%s as u32)' % operand
+            text = self._expr(count.ast, operand, ty)
+            return text if width == 64 else 'u64::from(%s)' % text
+        path = count.path
         head = path[0]
         head_name = access(snake(head.name))
+        if count.kind == Count.INDEXED:
+            member = path[1]
+            inner = self._to_u64(member.ty.base, 'e.%s' % snake(member.name))
+            return '%s.as_deref().and_then(|v| v.get(%s)).map_or(0, |e| %s)' % (
+                head_name, index, inner)
         if len(path) == 1:
             base = head.ty.base
             if head.ty.is_pointer():
@@ -771,6 +1210,26 @@ class Rust:
         member = path[1]
         inner = self._to_u64(member.ty.base, 'v.%s' % snake(member.name))
         return '%s.as_ref().map_or(0, |v| %s)' % (head_name, inner)
+
+    def _expr(self, ast, operand, ty):
+        """C arithmetic in Rust: wrapping like C's unsigned types, and a
+        division (always by a non-zero constant) parenthesised only where it
+        is a method's receiver."""
+        text, _div = self._expr_parts(ast, operand, ty)
+        return text
+
+    def _expr_parts(self, ast, operand, ty):
+        if ast[0] == 'int':
+            return '%d%s' % (ast[1], ty), False
+        if ast[0] == 'var':
+            return operand, False
+        _, op, a, b = ast
+        a, a_div = self._expr_parts(a, operand, ty)
+        if op == '/':
+            return '%s / %d%s' % (a, b[1], ty), True
+        b, _b_div = self._expr_parts(b, operand, ty)
+        method = {'+': 'wrapping_add', '-': 'wrapping_sub', '*': 'wrapping_mul'}[op]
+        return '%s.%s(%s)' % ('(%s)' % a if a_div else a, method, b), False
 
     def _to_u64(self, base, expr):
         prim = self.m._primitive_of(base)
@@ -790,6 +1249,8 @@ class Rust:
             return 'dec.%s()?' % elem.method
         if elem.kind == Elem.HANDLE:
             return '%s(dec.handle()?)' % elem.rust
+        if elem.kind == Elem.UNION:
+            return '%s::decode(dec)?' % elem.rust
         return '%s::decode_with(dec, §)?' % elem.rust
 
     def elem_decode_closure(self, elem):
@@ -800,6 +1261,8 @@ class Rust:
             return '|dec| dec.%s().map_err(ProtocolError::from)' % elem.method
         if elem.kind == Elem.HANDLE:
             return '|dec| dec.handle().map(%s).map_err(ProtocolError::from)' % elem.rust
+        if elem.kind == Elem.UNION:
+            return '%s::decode' % elem.rust
         return '|dec| %s::decode_with(dec, §)' % elem.rust
 
     def elem_encode(self, elem, value):
@@ -810,11 +1273,33 @@ class Rust:
             return 'enc.%s(%s)?;' % (elem.method, value)
         if elem.kind == Elem.HANDLE:
             return 'enc.handle(%s.0)?;' % value.lstrip('*')
+        if elem.kind == Elem.UNION:
+            return '%s.encode(enc)?;' % value
         return '%s.encode_with(enc, §)?;' % value
 
     def elem_zero_width(self, elem, validity):
         return (elem.kind == Elem.STRUCT and validity == PARTIAL
                 and self.m.zero_width[elem.ty])
+
+    def dyn_elems(self, elem, n):
+        """Decode `n` elements of a dynamic array: typed bulk reads for
+        scalars (`vn_decode_*_array`), packed for `uint16_t`, one by one for
+        everything else."""
+        if elem.kind == Elem.SCALAR and elem.method in ('u32', 'f32'):
+            return 'dec.%s_array(%s)?' % (elem.method, n)
+        if elem.kind == Elem.SCALAR and elem.method in ('u64', 'size'):
+            return 'dec.u64_array(%s)?' % n
+        if elem.is_u16():
+            return 'decode_u16_array(dec, %s)?' % n
+        return 'decode_vec(dec, %s, %s)?' % (n, self.elem_decode_closure(elem))
+
+    def each_encode(self, elem, seq):
+        """Encode every element of `seq` (a slice)."""
+        if elem.is_u16():
+            return 'encode_u16_array(enc, %s)?;' % seq
+        if elem.is_compound():
+            return 'for e in %s { %s }' % (seq, self.elem_encode(elem, 'e'))
+        return 'for e in %s { %s }' % (seq, self.elem_encode(elem, '*e'))
 
     # ---- decode: mirrors _decode_variable_info + _decode_variable -----------
 
@@ -839,6 +1324,8 @@ class Rust:
             if f.elem.is_byte():
                 helper = 'decode_char_array' if f.elem.prim == 'char' else 'decode_byte_array'
                 return '%s::<%d>(dec)?' % (helper, f.n)
+            if f.elem.is_u16():
+                return 'decode_u16_fixed::<%d>(dec)?' % f.n
             return 'decode_fixed_array::<_, %d>(dec, %s)?' % (f.n, self.elem_decode_closure(f.elem))
 
         if shape == Field.PTR:
@@ -862,36 +1349,52 @@ class Rust:
             # Decoder::opt_string
             return 'dec.opt_string()?'
 
-        # DYN, STRING_ARRAY, BLOB: the array size is the presence marker.
-        count = self.count_expr(f, access)
+        # DYN, NESTED, STRING_ARRAY, BLOB, BLOB_OUT: the array size is the
+        # presence marker.
+        count = self.count_expr(f.count, access)
         checked = (not driver and not f.optional and f.can_validate)
         presence = 'array_presence(dec, %s, %s)?' % (
             count, 'NullArray::Checked' if checked else 'NullArray::Unchecked')
 
         if validity == INVALID:
-            if shape != Field.DYN:
-                raise Unsupported('%s.%s: output blob' % (owner, f.c_name))
+            if shape not in (Field.DYN, Field.BLOB_OUT):
+                raise Unsupported('%s.%s: output %s' % (owner, f.c_name, shape))
             return '%s.map(|_| Vec::new())' % presence
 
         if shape == Field.STRING_ARRAY:
             elems = 'decode_vec(dec, n, decode_string_element)?'
         elif shape == Field.BLOB:
             elems = 'dec.blob(n)?'
+        elif shape == Field.BLOB_OUT:
+            elems = 'decode_owned_blob(dec, n)?'
+        elif shape == Field.NESTED:
+            if validity != VALID:
+                raise Unsupported('%s.%s: partial nested array' % (owner, f.c_name))
+            index = '_i' if f.inner.kind == Count.CONST else 'i'
+            inner = self.count_expr(f.inner, access, 'i')
+            each = self.dyn_elems(f.elem, 'n').replace('§', 'false')
+            if each.startswith(('decode_vec(', 'decode_u16_array(')):
+                each = each[:-1]    # already a Result<_, ProtocolError>
+            else:
+                each = 'Ok(%s)' % each
+            body = 'let n = inner_array(dec, %s)?; %s' % (inner, each)
+            elems = 'decode_vec_indexed(dec, n, |dec, %s| { %s })?' % (index, body)
         elif self.elem_zero_width(f.elem, validity):
             return '%s.map(|_| Vec::new())' % presence
-        elif f.elem.kind == Elem.SCALAR and f.elem.method in ('u32', 'f32'):
-            elems = 'dec.%s_array(n)?' % f.elem.method
-        elif f.elem.kind == Elem.SCALAR and f.elem.method in ('u64', 'size'):
-            elems = 'dec.u64_array(n)?'
         else:
-            elems = 'decode_vec(dec, n, %s)?' % self.elem_decode_closure(f.elem)
+            elems = self.dyn_elems(f.elem, 'n')
         return 'match %s { Some(n) => Some(%s), None => None }' % (presence, elems)
 
     def null_only_decode(self, f, owner):
+        """`_decode_variable` for a pointer the wire cannot carry: fatal when
+        set, and when null fatal too unless optional or noautovalidity."""
         if f.var.ty.base.name == 'VkAllocationCallbacks':
             return 'dec.null_allocator()?;'
-        return 'if dec.simple_pointer()? { return Err(unsupported_pointer(dec, "%s", "%s")); }' % (
-            owner, f.c_name)
+        what = '"%s", "%s"' % (owner, f.c_name)
+        if not f.optional and f.can_validate:
+            return ('if dec.simple_pointer()? { return Err(unsupported_pointer(dec, %s)); } '
+                    'else { return Err(null_pointer(dec, %s)); }' % (what, what))
+        return 'if dec.simple_pointer()? { return Err(unsupported_pointer(dec, %s)); }' % what
 
     # ---- encode: mirrors _encode_variable_info + _encode_variable -----------
 
@@ -908,8 +1411,12 @@ class Rust:
         if shape == Field.PLAIN:
             if validity == INVALID:
                 return ''
-            if f.elem.kind == Elem.STRUCT:
-                return self.elem_encode(f.elem, val)
+            if f.stride_of is not None:
+                # `stride = sizeof(...)` before it is encoded: the elements
+                # travel packed, whatever stride the caller used.
+                return 'enc.u32(%d)?;' % f.stride_of
+            if f.selector is not None:
+                return '%s.encode_tagged(enc, %s)?;' % (val, access(snake(f.selector.name)))
             return self.elem_encode(f.elem, val)
 
         if shape == Field.STATIC:
@@ -917,16 +1424,12 @@ class Rust:
                 return ''
             if f.elem.is_byte():
                 return 'enc.array_size(%d)?; enc.blob(&%s)?;' % (f.n, val)
-            if f.elem.kind == Elem.STRUCT:
-                body = self.elem_encode(f.elem, 'e')
-            else:
-                body = self.elem_encode(f.elem, '*e')
-            return 'enc.array_size(%d)?; for e in &%s { %s }' % (f.n, val, body)
+            return 'enc.array_size(%d)?; %s' % (f.n, self.each_encode(f.elem, '&' + val))
 
         if shape == Field.PTR:
             if validity == INVALID:
                 return 'enc.simple_pointer(%s.is_some())?;' % val
-            if f.elem.kind == Elem.STRUCT:
+            if f.elem.is_compound():
                 body = self.elem_encode(f.elem, 'v')
             else:
                 body = self.elem_encode(f.elem, '*v')
@@ -938,21 +1441,26 @@ class Rust:
                 raise Unsupported('%s.%s: output string' % (owner, f.c_name))
             return 'enc.opt_string(%s)?;' % val
 
-        count = self.count_expr(f, access)
+        count = self.count_expr(f.count, access)
 
         if validity == INVALID:
             return 'enc.array_size(if %s.is_some() { %s } else { 0 })?;' % (val, count)
 
         if shape == Field.STRING_ARRAY:
             each = 'for e in v { enc.opt_string(Some(e))?; }'
-        elif shape == Field.BLOB:
+        elif shape in (Field.BLOB, Field.BLOB_OUT):
             each = 'enc.blob(v)?;'
+        elif shape == Field.NESTED:
+            inner = self.count_expr(f.inner, access, 'i')
+            loop = 'for e in v' if f.inner.kind == Count.CONST else \
+                'for (i, e) in v.iter().enumerate()'
+            each = ('%s { let inner = %s; check_len(%s, inner, e.len())?; '
+                    'enc.array_size(inner)?; %s }' % (
+                        loop, inner, what, self.each_encode(f.elem, 'e').replace('§', 'false')))
         elif self.elem_zero_width(f.elem, validity):
             each = None
-        elif f.elem.kind == Elem.STRUCT:
-            each = 'for e in v { %s }' % self.elem_encode(f.elem, 'e')
         else:
-            each = 'for e in v { %s }' % self.elem_encode(f.elem, '*e')
+            each = self.each_encode(f.elem, 'v')
 
         if each is None:
             # Zero-width elements: the count alone is the encoding, and the
@@ -974,12 +1482,33 @@ class Rust:
                     'else { enc.array_size(0)?; }' % (f.condition, val, present))
         return ('if let Some(v) = &%s { %s } else { enc.array_size(0)?; }' % (val, present))
 
+    # ---- field decode, shared by structs and commands ------------------------
+
+    def let_decode(self, owner, f, expr):
+        """The `let` (or `let`s) binding field `f` to `expr`, plus the
+        checks that follow the whole body. A selected union binds its wire
+        tag beside it; a stride parameter is checked where it is read."""
+        name = owner.name
+        if f.selector is not None:
+            sel = self.m.elem_of(f.elem.ty.sty)
+            stmt = 'let (%s_tag, %s): (%s, %s) = %s::decode_tagged(dec)?;' % (
+                f.name, f.name, sel.rust, self.field_type(f), f.elem.rust)
+            post = ('check_union_tag(dec, "%s", "%s", i64::from(%s_tag), i64::from(%s))?;' % (
+                name, f.c_name, f.name, snake(f.selector.name)))
+            return [stmt], [post]
+        out = ['let %s: %s = %s;' % (f.name, self.field_type(f), expr)]
+        if f.stride_of is not None:
+            out.append('check_stride(dec, "%s", "%s", %s, %d)?;' % (
+                name, f.c_name, f.name, f.stride_of))
+        return out, []
+
     # ---- struct bodies ------------------------------------------------------
 
     def body_decode(self, ty):
         """`let` statements decoding every field of struct `ty`, honouring the
         runtime `partial` flag. Returns (statements, uses_partial)."""
         out = []
+        post = []
         uses = False
         owner = ty.name
 
@@ -992,6 +1521,13 @@ class Rust:
                 continue
             vf = VALID
             vp_ = self.m.validity(ty, f, False) if self.m.has_partial(ty) else VALID
+            if f.selector is not None:
+                if vp_ != VALID:
+                    raise Unsupported('%s.%s: a selected union in a skeleton' % (owner, f.c_name))
+                stmts, checks = self.let_decode(ty, f, None)
+                out.extend(stmts)
+                post.extend(checks)
+                continue
             a = self.decode_expr(f, vf, False, access, owner)
             b = self.decode_expr(f, vp_, False, access, owner)
             if a == b:
@@ -1005,8 +1541,10 @@ class Rust:
                 expr = 'if partial { %s } else { %s }' % (
                     b.replace('§', 'true' if vp_ == PARTIAL else 'false'),
                     a.replace('§', 'false'))
-            out.append('let %s: %s = %s;' % (f.name, self.field_type(f), expr))
-        return out, uses
+            stmts, checks = self.let_decode(ty, f, expr)
+            out.extend(stmts)
+            post.extend(checks)
+        return out + post, uses
 
     def body_encode(self, ty):
         out = []
@@ -1038,10 +1576,115 @@ class Rust:
                     out.append('if partial { %s } else { %s }' % (b, a))
         return out, uses
 
+    # ---- unions: mirrors types_union.h -----------------------------------------
+
+    def union_cases(self, ty):
+        return ty.attrs['rust_cases']
+
+    def union_variant(self, f):
+        return camel(f.c_name)
+
+    def union_member_decode(self, ty, f):
+        """The expression a case decodes its member with (VALID, with
+        storage: `decode_struct_member(ty, var, 'val->', False, ...)`)."""
+        return self.decode_expr(f, VALID, False, lambda n: n, ty.name).replace('§', 'false')
+
+    def union_member_encode(self, f):
+        """Statements encoding a case's member, bound as `value` (a ref)."""
+        sh = f.shape
+        if sh == Field.NULL_ONLY:
+            return 'enc.simple_pointer(false)?;'
+        if sh == Field.PLAIN:
+            if f.elem.kind == Elem.SCALAR:
+                if f.elem.prim == 'double':
+                    return 'enc.u64(value.to_bits())?;'
+                return 'enc.%s(*value)?;' % f.elem.method
+            if f.elem.kind == Elem.HANDLE:
+                return 'enc.handle(value.0)?;'
+            if f.elem.kind == Elem.UNION:
+                return 'value.encode(enc)?;'
+            return 'value.encode_with(enc, false)?;'
+        if sh == Field.STATIC:
+            if f.elem.is_byte():
+                return 'enc.array_size(%d)?; enc.blob(value)?;' % f.n
+            return 'enc.array_size(%d)?; %s' % (f.n, self.each_encode(f.elem, 'value').replace('§', 'false'))
+        if sh == Field.PTR:
+            if f.elem.is_compound():
+                body = self.elem_encode(f.elem, 'v').replace('§', 'false')
+            else:
+                body = self.elem_encode(f.elem, '*v')
+            return 'enc.simple_pointer(value.is_some())?; if let Some(v) = value { %s }' % body
+        raise AssertionError(sh)
+
+    @staticmethod
+    def union_tag_pattern(tags):
+        return ' | '.join(t[0] if isinstance(t[0], str) else str(t[1]) for t in tags)
+
+    # ---- the link walk -----------------------------------------------------------
+
+    def walk_stmts(self, fields, access):
+        """Statements visiting every pNext link reachable through `fields`."""
+        out = []
+        for f in fields:
+            if not self.m.walks(f):
+                continue
+            val = access(f.name)
+            if f.shape == Field.PLAIN:
+                out.append('%s.for_each_link(f);' % val)
+            elif f.shape == Field.PTR:
+                out.append('if let Some(v) = &%s { v.for_each_link(f); }' % val)
+            elif f.shape == Field.STATIC:
+                out.append('for e in &%s { e.for_each_link(f); }' % val)
+            elif f.shape == Field.DYN:
+                out.append('for e in %s.iter().flatten() { e.for_each_link(f); }' % val)
+            elif f.shape == Field.NESTED:
+                out.append('for e in %s.iter().flatten().flatten() { e.for_each_link(f); }' % val)
+            else:
+                raise AssertionError(f.shape)
+        return out
+
+    def union_walk(self, ty):
+        """The body of a union's `for_each_link`: a `match`, or an `if let`
+        where only one member can hold a link."""
+        arms = []
+        exhaustive = True
+        for f, _tags in self.union_cases(ty):
+            if not self.m.walks(f):
+                exhaustive = False
+                continue
+            v = self.union_variant(f)
+            if f.shape == Field.PLAIN:
+                arms.append(('Self::%s(value)' % v, 'value.for_each_link(f);'))
+            elif f.shape == Field.PTR:
+                exhaustive = False
+                arms.append(('Self::%s(Some(value))' % v, 'value.for_each_link(f);'))
+            elif f.shape == Field.STATIC:
+                arms.append(('Self::%s(value)' % v, 'for e in value { e.for_each_link(f); }'))
+            else:
+                raise AssertionError(f.shape)
+        return self.match_or_if_let(arms, exhaustive)
+
+    @staticmethod
+    def match_or_if_let(arms, exhaustive):
+        if len(arms) == 1 and not exhaustive:
+            return 'if let %s = self { %s }' % arms[0]
+        body = ' '.join('%s => { %s }' % a for a in arms)
+        if not exhaustive:
+            body += ' _ => {}'
+        return 'match self { %s }' % body
+
+    def next_walk(self, ty):
+        """The body of a pNext enum's `for_each_link`."""
+        chain = self.m.chains[ty]
+        arms = [('Self::%s(link)' % c.name, 'link.for_each_link(f);')
+                for c in chain if self.m.reach_chain[c]]
+        return self.match_or_if_let(arms, len(arms) == len(chain))
+
     # ---- commands -----------------------------------------------------------
 
     def command_decode(self, cmd):
         out = []
+        post = []
         owner = cmd.name
 
         def access(name):
@@ -1053,14 +1696,18 @@ class Rust:
                 out.append(self.null_only_decode(f, owner))
                 continue
             v = self.m.command_validity(cmd, f)
+            if f.selector is not None:
+                raise Unsupported('%s.%s: selected union parameter' % (owner, f.c_name))
             expr = self.decode_expr(f, v, False, access, owner)
             expr = expr.replace('§', 'true' if v == PARTIAL else 'false')
-            out.append('let %s: %s = %s;' % (f.name, self.field_type(f), expr))
+            stmts, checks = self.let_decode(cmd, f, expr)
+            out.extend(stmts)
+            post.extend(checks)
             if i == 0 and f.shape == Field.PLAIN and f.elem.kind == Elem.HANDLE \
                     and f.elem.ty.dispatchable:
                 out.append('if %s.0 == 0 { return Err(null_dispatch_handle(dec, "%s")); }' % (
                     f.name, owner))
-        return out
+        return out + post
 
     def command_encode(self, cmd):
         out = []
@@ -1145,7 +1792,7 @@ def generate(selection_path, outdir):
     outdir.mkdir(parents=True, exist_ok=True)
     files = {}
     common = dict(M=model, R=rust, VALID=VALID, PARTIAL=PARTIAL, INVALID=INVALID,
-                  Field=Field, Elem=Elem)
+                  Field=Field, Elem=Elem, VkType=VkType)
     files['defines.rs'] = render('rust_defines.rs', **common)
     files['info.rs'] = render('rust_info.rs', **common)
     for group, content in model.groups.items():

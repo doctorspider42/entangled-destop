@@ -6,8 +6,14 @@ generated protocol structures; the host renderer (crates/virtio-gpu/src/
 host_vulkan/) speaks `ash`. This script writes the field-for-field bridge
 between the two so that nobody copies ~1500 fields by hand:
 
-* `FromAsh` for every protocol structure that has an `ash` counterpart whose
-  fields can all be converted (host -> guest: what a query answers);
+* `FromAsh` for every protocol structure **the executor uses** that has an
+  `ash` counterpart whose fields can all be converted (host -> guest: what a
+  query answers). "Uses" is computed, not listed: the structures reachable
+  from the arguments of `EXECUTOR_COMMANDS` (checked against the `dispatch`
+  match in venus/executor/context.rs), through members and through the pNext
+  links the executor admits (`policy::admits_link`: core up to 1.3, and the
+  venus protocol's own). The generated protocol is the whole protocol; this
+  bridge stays the executor's size;
 * `ToAsh` for the same set (guest -> host: what a create is built from);
 * `query_features2` / `query_properties2`: one host call each that chains
   every structure the protocol can carry in that pNext chain, gated by the
@@ -107,6 +113,25 @@ CORE_VERSION = {
     'VkPhysicalDeviceShaderIntegerDotProductProperties': 13,
 }
 
+# The commands `VulkanContext::dispatch` implements. The script refuses to
+# run when this list and the `Command::X(args) =>` arms of that match differ.
+EXECUTOR_COMMANDS = [
+    'EnumerateInstanceVersion', 'CreateInstance', 'DestroyInstance',
+    'EnumeratePhysicalDevices', 'EnumeratePhysicalDeviceGroups',
+    'GetPhysicalDeviceProperties', 'GetPhysicalDeviceProperties2',
+    'GetPhysicalDeviceFeatures2', 'GetPhysicalDeviceQueueFamilyProperties2',
+    'GetPhysicalDeviceMemoryProperties2', 'EnumerateDeviceExtensionProperties',
+    'GetPhysicalDeviceFormatProperties2', 'GetPhysicalDeviceImageFormatProperties2',
+    'CreateDevice', 'DestroyDevice', 'GetDeviceQueue2', 'CreateCommandPool',
+    'DestroyCommandPool', 'CreateImage', 'DestroyImage', 'GetImageMemoryRequirements2',
+]
+CONTEXT = ROOT / 'crates' / 'virtio-gpu' / 'src' / 'venus' / 'executor' / 'context.rs'
+
+# The executor's chain policy (venus/executor/policy.rs `admits_link`),
+# restated for the one question this script asks of it.
+ADMITTED_API = (1 << 22) | (3 << 12)
+ADMITTED_EXTENSIONS = {'VK_MESA_venus_protocol', 'VK_EXT_command_serialization'}
+
 ASH_SCALARS = {'u8', 'u16', 'u32', 'i32', 'u64', 'i64', 'f32', 'f64', 'usize',
                'Bool32', 'DeviceSize', 'DeviceAddress', 'SampleMask', 'Flags', 'Flags64'}
 PROTO_SCALARS = {'u8', 'u16', 'u32', 'i32', 'u64', 'i64', 'f32', 'f64'}
@@ -146,6 +171,33 @@ def parse_structs(text):
     return out
 
 
+ORIGIN_RE = re.compile(r'StructureInfo \{\s*stype: -?\d+,\s*name: "(\w+)",\s*'
+                       r'core: (None|Some\((0x[0-9a-f]+)\)),\s*extensions: &\[([^\]]*)\],?\s*\}')
+
+
+def admitted_structures():
+    text = (PROTOCOL / 'info.rs').read_text(encoding='utf-8')
+    out = set()
+    for m in ORIGIN_RE.finditer(text):
+        core = int(m.group(3), 16) if m.group(3) else None
+        exts = set(re.findall(r'"(\w+)"', m.group(4)))
+        if (core is not None and core <= ADMITTED_API) or exts & ADMITTED_EXTENSIONS:
+            out.add(m.group(1))
+    if not out:
+        sys.exit('no StructureInfo entries parsed from protocol/info.rs')
+    return out
+
+
+def check_executor_commands():
+    text = CONTEXT.read_text(encoding='utf-8')
+    body = text[text.index('fn dispatch('):]
+    body = body[:body.index('\n    }\n')]
+    arms = re.findall(r'Command::(\w+)\(args\)', body)
+    if sorted(arms) != sorted(EXECUTOR_COMMANDS):
+        sys.exit('EXECUTOR_COMMANDS disagrees with the dispatch match in %s:\n  script: %s\n  match:  %s'
+                 % (CONTEXT, sorted(EXECUTOR_COMMANDS), sorted(arms)))
+
+
 def proto_structs():
     structs, aliases, handles, enums = {}, {}, set(), {}
     for f in sorted(PROTOCOL.glob('*.rs')):
@@ -155,9 +207,9 @@ def proto_structs():
         for m in re.finditer(r'^pub struct (Vk\w+)\(pub u64\);', text, re.M):
             handles.add(m.group(1))
         for name, (_, fields) in parse_structs(text).items():
-            if name.startswith('Vk'):
+            if name.startswith('Vk') or name.endswith('Args'):
                 structs[name] = fields
-        for m in re.finditer(r'^pub enum (Vk\w+Next) \{\n(.*?)^\}', text, re.M | re.S):
+        for m in re.finditer(r"^pub enum (Vk\w+Next)(?:<'a>)? \{\n(.*?)^\}", text, re.M | re.S):
             variants = re.findall(r'^\s*(Vk\w+)\(', m.group(2), re.M)
             enums[m.group(1)] = variants
     return structs, aliases, handles, enums
@@ -168,10 +220,35 @@ ARRAY_RE = re.compile(r'^\[(\w+); (\w+)\]$')
 
 class Gen:
     def __init__(self):
+        check_executor_commands()
         self.pstructs, self.aliases, self.handles, self.enums = proto_structs()
+        self.admitted = admitted_structures()
+        self.enums = {k: [v for v in vs if v in self.admitted] for k, vs in self.enums.items()}
         self.astructs = parse_structs(find_ash().read_text(encoding='utf-8'))
+        self.used = self.executor_structs()
         self.convertible = {}
         self.failures = {}
+
+    def executor_structs(self):
+        """Every protocol structure reachable from the executor's commands,
+        through members and admitted pNext links."""
+        seen = set()
+        todo = ['%sArgs' % c for c in EXECUTOR_COMMANDS]
+        for name in todo:
+            if name not in self.pstructs:
+                sys.exit(f'{name} is not in the generated protocol')
+        while todo:
+            name = todo.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            for _field, ty in self.pstructs.get(name, []):
+                for ident in re.findall(r'\b(Vk\w+)', ty):
+                    if ident in self.enums:
+                        todo.extend(self.enums[ident])
+                    elif ident in self.pstructs:
+                        todo.append(ident)
+        return {n for n in seen if n.startswith('Vk')}
 
     def ash_name(self, pname):
         return pname[2:]
@@ -267,7 +344,7 @@ class Gen:
         return True
 
     def emit(self):
-        for name in sorted(self.pstructs):
+        for name in sorted(self.used):
             self.is_convertible(name)
         out = []
         w = out.append
@@ -394,7 +471,7 @@ class Gen:
                 sys.exit(f'{enum}::{v} is not convertible: {self.failures.get(v)}')
         w('/// The owned `ash` twins of a `VkDeviceCreateInfo` pNext chain, minus')
         w('/// `VkDeviceGroupDeviceCreateInfo`, whose handles only the caller can')
-        w('/// translate.')
+        w('/// translate. Only the links the executor admits have a twin here.')
         w('#[derive(Default)]')
         w('pub struct DeviceLinks {')
         for i, v in enumerate(variants):
@@ -405,16 +482,21 @@ class Gen:
         w('')
         w('impl DeviceLinks {')
         w('    /// Convert every link but the device-group one.')
-        w(f'    pub fn new(links: &[{enum}]) -> Self {{')
+        w('    ///')
+        w('    /// # Errors')
+        w('    /// The `sType` of a link with no twin here: one the executor does')
+        w('    /// not admit, which it refuses before a host is asked.')
+        w(f'    pub fn new(links: &[{enum}]) -> Result<Self, i32> {{')
         w('        let mut out = Self::default();')
         w('        for link in links {')
         w('            match link {')
         for i, v in enumerate(variants):
             w(f'                {enum}::{v}(v) => out.l{i} = Some(v.to_ash()),')
         w(f'                {enum}::VkDeviceGroupDeviceCreateInfo(_) => {{}}')
+        w('                other => return Err(ChainLink::structure_type(other)),')
         w('            }')
         w('        }')
-        w('        out')
+        w('        Ok(out)')
         w('    }')
         w('')
         w('    /// Link every converted structure onto `info`.')

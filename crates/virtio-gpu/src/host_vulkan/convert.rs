@@ -1623,6 +1623,7 @@ impl ToAsh for VkPhysicalDeviceMemoryProperties {
 impl FromAsh<vk::PhysicalDeviceMemoryProperties2<'_>> for VkPhysicalDeviceMemoryProperties2 {
     fn from_ash(src: &vk::PhysicalDeviceMemoryProperties2<'_>) -> Self {
         Self {
+            p_next: Vec::new(),
             memory_properties: VkPhysicalDeviceMemoryProperties::from_ash(&src.memory_properties),
         }
     }
@@ -3086,6 +3087,7 @@ impl ToAsh for VkQueueFamilyProperties {
 impl FromAsh<vk::QueueFamilyProperties2<'_>> for VkQueueFamilyProperties2 {
     fn from_ash(src: &vk::QueueFamilyProperties2<'_>) -> Self {
         Self {
+            p_next: Vec::new(),
             queue_family_properties: VkQueueFamilyProperties::from_ash(
                 &src.queue_family_properties,
             ),
@@ -3837,7 +3839,7 @@ pub unsafe fn query_properties2(
 
 /// The owned `ash` twins of a `VkDeviceCreateInfo` pNext chain, minus
 /// `VkDeviceGroupDeviceCreateInfo`, whose handles only the caller can
-/// translate.
+/// translate. Only the links the executor admits have a twin here.
 #[derive(Default)]
 pub struct DeviceLinks {
     l0: Option<vk::DevicePrivateDataCreateInfo<'static>>,
@@ -3881,7 +3883,11 @@ pub struct DeviceLinks {
 
 impl DeviceLinks {
     /// Convert every link but the device-group one.
-    pub fn new(links: &[VkDeviceCreateInfoNext]) -> Self {
+    ///
+    /// # Errors
+    /// The `sType` of a link with no twin here: one the executor does
+    /// not admit, which it refuses before a host is asked.
+    pub fn new(links: &[VkDeviceCreateInfoNext]) -> Result<Self, i32> {
         let mut out = Self::default();
         for link in links {
             match link {
@@ -3995,9 +4001,10 @@ impl DeviceLinks {
                     out.l36 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkDeviceGroupDeviceCreateInfo(_) => {}
+                other => return Err(ChainLink::structure_type(other)),
             }
         }
-        out
+        Ok(out)
     }
 
     /// Link every converted structure onto `info`.

@@ -164,7 +164,7 @@ struct Live {
     next: u64,
     by_kind: HashMap<&'static str, usize>,
     devices: Vec<(u64, DeviceRequest<usize>)>,
-    images: Vec<VkImageCreateInfo>,
+    images: usize,
 }
 
 /// The fake host. See the module docs.
@@ -235,10 +235,10 @@ impl FakeVulkan {
         self.with(|live| live.devices.iter().map(|(_, r)| r.clone()).collect())
     }
 
-    /// Every `vkCreateImage` that reached the host.
+    /// How many `vkCreateImage`s reached the host.
     #[must_use]
-    pub fn image_requests(&self) -> Vec<VkImageCreateInfo> {
-        self.with(|live| live.images.clone())
+    pub fn image_requests(&self) -> usize {
+        self.with(|live| live.images)
     }
 }
 
@@ -296,10 +296,11 @@ impl HostVulkan for FakeVulkan {
             buffer_features: 0x58,
         };
         for link in &mut out.p_next {
-            let VkFormatProperties2Next::VkFormatProperties3(p) = link;
-            p.linear_tiling_features = u64::from(features & 0xff);
-            p.optimal_tiling_features = u64::from(features);
-            p.buffer_features = 0x58;
+            if let VkFormatProperties2Next::VkFormatProperties3(p) = link {
+                p.linear_tiling_features = u64::from(features & 0xff);
+                p.optimal_tiling_features = u64::from(features);
+                p.buffer_features = 0x58;
+            }
         }
     }
 
@@ -358,8 +359,8 @@ impl HostVulkan for FakeVulkan {
         self.destroy("command pool");
     }
 
-    fn create_image(&self, _device: &u64, info: &VkImageCreateInfo) -> Result<u64, VkResult> {
-        self.with(|live| live.images.push(info.clone()));
+    fn create_image(&self, _device: &u64, _info: &VkImageCreateInfo) -> Result<u64, VkResult> {
+        self.with(|live| live.images += 1);
         Ok(self.create("image"))
     }
 

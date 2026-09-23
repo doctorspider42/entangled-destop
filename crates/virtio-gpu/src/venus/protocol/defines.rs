@@ -29,11 +29,296 @@ impl VkPhysicalDevice {
     }
 }
 
+/// `VkSemaphore`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkSemaphore(pub u64);
+
+impl VkSemaphore {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkCommandBuffer` (dispatchable): the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkCommandBuffer(pub u64);
+
+impl VkCommandBuffer {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// `VkImage`: the guest's object id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct VkImage(pub u64);
 
 impl VkImage {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkBuffer`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkBuffer(pub u64);
+
+impl VkBuffer {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkDeviceMemory`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkDeviceMemory(pub u64);
+
+impl VkDeviceMemory {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkSamplerYcbcrConversion`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkSamplerYcbcrConversion(pub u64);
+
+impl VkSamplerYcbcrConversion {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkShaderModule`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkShaderModule(pub u64);
+
+impl VkShaderModule {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkPipelineLayout`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkPipelineLayout(pub u64);
+
+impl VkPipelineLayout {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkRenderPass`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkRenderPass(pub u64);
+
+impl VkRenderPass {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkPipeline`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkPipeline(pub u64);
+
+impl VkPipeline {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkDescriptorSetLayout`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkDescriptorSetLayout(pub u64);
+
+impl VkDescriptorSetLayout {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkSampler`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkSampler(pub u64);
+
+impl VkSampler {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkDescriptorPool`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkDescriptorPool(pub u64);
+
+impl VkDescriptorPool {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkImageView`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkImageView(pub u64);
+
+impl VkImageView {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkDescriptorSet`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkDescriptorSet(pub u64);
+
+impl VkDescriptorSet {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkBufferView`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkBufferView(pub u64);
+
+impl VkBufferView {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkAccelerationStructureKHR`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkAccelerationStructureKHR(pub u64);
+
+impl VkAccelerationStructureKHR {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkCommandPool`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkCommandPool(pub u64);
+
+impl VkCommandPool {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkFramebuffer`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkFramebuffer(pub u64);
+
+impl VkFramebuffer {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkTensorARM`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkTensorARM(pub u64);
+
+impl VkTensorARM {
     /// `VK_NULL_HANDLE`.
     pub const NULL: Self = Self(0);
 
@@ -74,11 +359,11 @@ impl VkDevice {
     }
 }
 
-/// `VkCommandPool`: the guest's object id.
+/// `VkQueue` (dispatchable): the guest's object id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
-pub struct VkCommandPool(pub u64);
+pub struct VkQueue(pub u64);
 
-impl VkCommandPool {
+impl VkQueue {
     /// `VK_NULL_HANDLE`.
     pub const NULL: Self = Self(0);
 
@@ -89,11 +374,101 @@ impl VkCommandPool {
     }
 }
 
-/// `VkQueue` (dispatchable): the guest's object id.
+/// `VkFence`: the guest's object id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
-pub struct VkQueue(pub u64);
+pub struct VkFence(pub u64);
 
-impl VkQueue {
+impl VkFence {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkEvent`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkEvent(pub u64);
+
+impl VkEvent {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkQueryPool`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkQueryPool(pub u64);
+
+impl VkQueryPool {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkPipelineCache`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkPipelineCache(pub u64);
+
+impl VkPipelineCache {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkDescriptorUpdateTemplate`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkDescriptorUpdateTemplate(pub u64);
+
+impl VkDescriptorUpdateTemplate {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkDeferredOperationKHR`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkDeferredOperationKHR(pub u64);
+
+impl VkDeferredOperationKHR {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: Self = Self(0);
+
+    /// Whether this is `VK_NULL_HANDLE`.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// `VkPrivateDataSlot`: the guest's object id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct VkPrivateDataSlot(pub u64);
+
+impl VkPrivateDataSlot {
     /// `VK_NULL_HANDLE`.
     pub const NULL: Self = Self(0);
 
@@ -121,20 +496,98 @@ pub type VkBool32 = u32;
 /// `VkPhysicalDeviceType` (enum), as it travels: `int32_t`.
 pub type VkPhysicalDeviceType = i32;
 
+/// `VkQueueFlags` (flags), as it travels: `uint32_t`.
+pub type VkQueueFlags = u32;
+
+/// `VkMemoryPropertyFlags` (flags), as it travels: `uint32_t`.
+pub type VkMemoryPropertyFlags = u32;
+
+/// `VkMemoryHeapFlags` (flags), as it travels: `uint32_t`.
+pub type VkMemoryHeapFlags = u32;
+
+/// `VkFormatFeatureFlags` (flags), as it travels: `uint32_t`.
+pub type VkFormatFeatureFlags = u32;
+
 /// `VkDeviceQueueCreateFlags` (flags), as it travels: `uint32_t`.
 pub type VkDeviceQueueCreateFlags = u32;
 
+/// `VkQueueGlobalPriority` (enum), as it travels: `int32_t`.
+pub type VkQueueGlobalPriority = i32;
+
 /// `VkDeviceCreateFlags` (flags), as it travels: `uint32_t`.
 pub type VkDeviceCreateFlags = u32;
+
+/// `VkPipelineStageFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineStageFlags = u32;
+
+/// `VkExternalMemoryHandleTypeFlags` (flags), as it travels: `uint32_t`.
+pub type VkExternalMemoryHandleTypeFlags = u32;
+
+/// `VkMemoryAllocateFlags` (flags), as it travels: `uint32_t`.
+pub type VkMemoryAllocateFlags = u32;
+
+/// `VkImageAspectFlags` (flags), as it travels: `uint32_t`.
+pub type VkImageAspectFlags = u32;
+
+/// `VkSparseImageFormatFlags` (flags), as it travels: `uint32_t`.
+pub type VkSparseImageFormatFlags = u32;
+
+/// `VkSparseMemoryBindFlags` (flags), as it travels: `uint32_t`.
+pub type VkSparseMemoryBindFlags = u32;
+
+/// `VkFenceCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkFenceCreateFlags = u32;
+
+/// `VkExternalFenceHandleTypeFlags` (flags), as it travels: `uint32_t`.
+pub type VkExternalFenceHandleTypeFlags = u32;
+
+/// `VkSemaphoreCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkSemaphoreCreateFlags = u32;
+
+/// `VkExternalSemaphoreHandleTypeFlags` (flags), as it travels: `uint32_t`.
+pub type VkExternalSemaphoreHandleTypeFlags = u32;
+
+/// `VkSemaphoreType` (enum), as it travels: `int32_t`.
+pub type VkSemaphoreType = i32;
+
+/// `VkEventCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkEventCreateFlags = u32;
+
+/// `VkQueryPoolCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkQueryPoolCreateFlags = u32;
+
+/// `VkQueryType` (enum), as it travels: `int32_t`.
+pub type VkQueryType = i32;
+
+/// `VkQueryPipelineStatisticFlags` (flags), as it travels: `uint32_t`.
+pub type VkQueryPipelineStatisticFlags = u32;
+
+/// `VkBufferCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkBufferCreateFlags = u32;
+
+/// `VkBufferUsageFlags` (flags), as it travels: `uint32_t`.
+pub type VkBufferUsageFlags = u32;
+
+/// `VkSharingMode` (enum), as it travels: `int32_t`.
+pub type VkSharingMode = i32;
+
+/// `VkBufferUsageFlags2` (flags), as it travels: `uint64_t`.
+pub type VkBufferUsageFlags2 = u64;
+
+/// `VkDeviceAddress` (basetype), as it travels: `uint64_t`.
+pub type VkDeviceAddress = u64;
+
+/// `VkBufferViewCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkBufferViewCreateFlags = u32;
+
+/// `VkFormat` (enum), as it travels: `int32_t`.
+pub type VkFormat = i32;
 
 /// `VkImageCreateFlags` (flags), as it travels: `uint32_t`.
 pub type VkImageCreateFlags = u32;
 
 /// `VkImageType` (enum), as it travels: `int32_t`.
 pub type VkImageType = i32;
-
-/// `VkFormat` (enum), as it travels: `int32_t`.
-pub type VkFormat = i32;
 
 /// `VkSampleCountFlagBits` (enum), as it travels: `int32_t`.
 pub type VkSampleCountFlagBits = i32;
@@ -145,23 +598,236 @@ pub type VkImageTiling = i32;
 /// `VkImageUsageFlags` (flags), as it travels: `uint32_t`.
 pub type VkImageUsageFlags = u32;
 
-/// `VkSharingMode` (enum), as it travels: `int32_t`.
-pub type VkSharingMode = i32;
-
 /// `VkImageLayout` (enum), as it travels: `int32_t`.
 pub type VkImageLayout = i32;
 
-/// `VkExternalMemoryHandleTypeFlags` (flags), as it travels: `uint32_t`.
-pub type VkExternalMemoryHandleTypeFlags = u32;
+/// `VkComponentSwizzle` (enum), as it travels: `int32_t`.
+pub type VkComponentSwizzle = i32;
+
+/// `VkImageViewCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkImageViewCreateFlags = u32;
+
+/// `VkImageViewType` (enum), as it travels: `int32_t`.
+pub type VkImageViewType = i32;
+
+/// `VkShaderModuleCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkShaderModuleCreateFlags = u32;
+
+/// `VkPipelineCacheCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineCacheCreateFlags = u32;
+
+/// `VkPipelineShaderStageCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineShaderStageCreateFlags = u32;
+
+/// `VkShaderStageFlagBits` (enum), as it travels: `int32_t`.
+pub type VkShaderStageFlagBits = i32;
+
+/// `VkPipelineRobustnessBufferBehavior` (enum), as it travels: `int32_t`.
+pub type VkPipelineRobustnessBufferBehavior = i32;
+
+/// `VkPipelineRobustnessImageBehavior` (enum), as it travels: `int32_t`.
+pub type VkPipelineRobustnessImageBehavior = i32;
+
+/// `VkSamplerCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkSamplerCreateFlags = u32;
+
+/// `VkFilter` (enum), as it travels: `int32_t`.
+pub type VkFilter = i32;
+
+/// `VkSamplerMipmapMode` (enum), as it travels: `int32_t`.
+pub type VkSamplerMipmapMode = i32;
+
+/// `VkSamplerAddressMode` (enum), as it travels: `int32_t`.
+pub type VkSamplerAddressMode = i32;
+
+/// `VkCompareOp` (enum), as it travels: `int32_t`.
+pub type VkCompareOp = i32;
+
+/// `VkBorderColor` (enum), as it travels: `int32_t`.
+pub type VkBorderColor = i32;
+
+/// `VkSamplerReductionMode` (enum), as it travels: `int32_t`.
+pub type VkSamplerReductionMode = i32;
+
+/// `VkDescriptorMappingSourceEXT` (enum), as it travels: `int32_t`.
+pub type VkDescriptorMappingSourceEXT = i32;
+
+/// `VkSpirvResourceTypeFlagsEXT` (flags), as it travels: `uint32_t`.
+pub type VkSpirvResourceTypeFlagsEXT = u32;
+
+/// `VkVertexInputRate` (enum), as it travels: `int32_t`.
+pub type VkVertexInputRate = i32;
+
+/// `VkPipelineVertexInputStateCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineVertexInputStateCreateFlags = u32;
+
+/// `VkPipelineInputAssemblyStateCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineInputAssemblyStateCreateFlags = u32;
+
+/// `VkPrimitiveTopology` (enum), as it travels: `int32_t`.
+pub type VkPrimitiveTopology = i32;
+
+/// `VkPipelineTessellationStateCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineTessellationStateCreateFlags = u32;
+
+/// `VkTessellationDomainOrigin` (enum), as it travels: `int32_t`.
+pub type VkTessellationDomainOrigin = i32;
+
+/// `VkPipelineViewportStateCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineViewportStateCreateFlags = u32;
+
+/// `VkDepthClampModeEXT` (enum), as it travels: `int32_t`.
+pub type VkDepthClampModeEXT = i32;
+
+/// `VkPipelineRasterizationStateCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineRasterizationStateCreateFlags = u32;
+
+/// `VkPolygonMode` (enum), as it travels: `int32_t`.
+pub type VkPolygonMode = i32;
+
+/// `VkCullModeFlags` (flags), as it travels: `uint32_t`.
+pub type VkCullModeFlags = u32;
+
+/// `VkFrontFace` (enum), as it travels: `int32_t`.
+pub type VkFrontFace = i32;
+
+/// `VkPipelineRasterizationConservativeStateCreateFlagsEXT` (flags), as it travels: `uint32_t`.
+pub type VkPipelineRasterizationConservativeStateCreateFlagsEXT = u32;
+
+/// `VkConservativeRasterizationModeEXT` (enum), as it travels: `int32_t`.
+pub type VkConservativeRasterizationModeEXT = i32;
+
+/// `VkPipelineRasterizationStateStreamCreateFlagsEXT` (flags), as it travels: `uint32_t`.
+pub type VkPipelineRasterizationStateStreamCreateFlagsEXT = u32;
+
+/// `VkPipelineRasterizationDepthClipStateCreateFlagsEXT` (flags), as it travels: `uint32_t`.
+pub type VkPipelineRasterizationDepthClipStateCreateFlagsEXT = u32;
+
+/// `VkLineRasterizationMode` (enum), as it travels: `int32_t`.
+pub type VkLineRasterizationMode = i32;
+
+/// `VkProvokingVertexModeEXT` (enum), as it travels: `int32_t`.
+pub type VkProvokingVertexModeEXT = i32;
+
+/// `VkDepthBiasRepresentationEXT` (enum), as it travels: `int32_t`.
+pub type VkDepthBiasRepresentationEXT = i32;
+
+/// `VkPipelineMultisampleStateCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineMultisampleStateCreateFlags = u32;
+
+/// `VkSampleMask` (basetype), as it travels: `uint32_t`.
+pub type VkSampleMask = u32;
+
+/// `VkStencilOp` (enum), as it travels: `int32_t`.
+pub type VkStencilOp = i32;
+
+/// `VkPipelineDepthStencilStateCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineDepthStencilStateCreateFlags = u32;
+
+/// `VkBlendFactor` (enum), as it travels: `int32_t`.
+pub type VkBlendFactor = i32;
+
+/// `VkBlendOp` (enum), as it travels: `int32_t`.
+pub type VkBlendOp = i32;
+
+/// `VkColorComponentFlags` (flags), as it travels: `uint32_t`.
+pub type VkColorComponentFlags = u32;
+
+/// `VkPipelineColorBlendStateCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineColorBlendStateCreateFlags = u32;
+
+/// `VkLogicOp` (enum), as it travels: `int32_t`.
+pub type VkLogicOp = i32;
+
+/// `VkBlendOverlapEXT` (enum), as it travels: `int32_t`.
+pub type VkBlendOverlapEXT = i32;
+
+/// `VkPipelineDynamicStateCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineDynamicStateCreateFlags = u32;
+
+/// `VkDynamicState` (enum), as it travels: `int32_t`.
+pub type VkDynamicState = i32;
+
+/// `VkPipelineCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineCreateFlags = u32;
+
+/// `VkPipelineCreateFlags2` (flags), as it travels: `uint64_t`.
+pub type VkPipelineCreateFlags2 = u64;
+
+/// `VkPipelineCreationFeedbackFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineCreationFeedbackFlags = u32;
+
+/// `VkFragmentShadingRateCombinerOpKHR` (enum), as it travels: `int32_t`.
+pub type VkFragmentShadingRateCombinerOpKHR = i32;
+
+/// `VkGraphicsPipelineLibraryFlagsEXT` (flags), as it travels: `uint32_t`.
+pub type VkGraphicsPipelineLibraryFlagsEXT = u32;
+
+/// `VkShaderStageFlags` (flags), as it travels: `uint32_t`.
+pub type VkShaderStageFlags = u32;
+
+/// `VkPipelineLayoutCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPipelineLayoutCreateFlags = u32;
+
+/// `VkDescriptorType` (enum), as it travels: `int32_t`.
+pub type VkDescriptorType = i32;
+
+/// `VkDescriptorSetLayoutCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkDescriptorSetLayoutCreateFlags = u32;
+
+/// `VkDescriptorBindingFlags` (flags), as it travels: `uint32_t`.
+pub type VkDescriptorBindingFlags = u32;
+
+/// `VkDescriptorPoolCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkDescriptorPoolCreateFlags = u32;
+
+/// `VkFramebufferCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkFramebufferCreateFlags = u32;
+
+/// `VkAttachmentDescriptionFlags` (flags), as it travels: `uint32_t`.
+pub type VkAttachmentDescriptionFlags = u32;
+
+/// `VkAttachmentLoadOp` (enum), as it travels: `int32_t`.
+pub type VkAttachmentLoadOp = i32;
+
+/// `VkAttachmentStoreOp` (enum), as it travels: `int32_t`.
+pub type VkAttachmentStoreOp = i32;
+
+/// `VkSubpassDescriptionFlags` (flags), as it travels: `uint32_t`.
+pub type VkSubpassDescriptionFlags = u32;
+
+/// `VkPipelineBindPoint` (enum), as it travels: `int32_t`.
+pub type VkPipelineBindPoint = i32;
+
+/// `VkAccessFlags` (flags), as it travels: `uint32_t`.
+pub type VkAccessFlags = u32;
+
+/// `VkDependencyFlags` (flags), as it travels: `uint32_t`.
+pub type VkDependencyFlags = u32;
+
+/// `VkRenderPassCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkRenderPassCreateFlags = u32;
 
 /// `VkCommandPoolCreateFlags` (flags), as it travels: `uint32_t`.
 pub type VkCommandPoolCreateFlags = u32;
 
+/// `VkCommandBufferLevel` (enum), as it travels: `int32_t`.
+pub type VkCommandBufferLevel = i32;
+
+/// `VkQueryControlFlags` (flags), as it travels: `uint32_t`.
+pub type VkQueryControlFlags = u32;
+
+/// `VkRenderingFlags` (flags), as it travels: `uint32_t`.
+pub type VkRenderingFlags = u32;
+
+/// `VkCommandBufferUsageFlags` (flags), as it travels: `uint32_t`.
+pub type VkCommandBufferUsageFlags = u32;
+
+/// `VkConditionalRenderingFlagsEXT` (flags), as it travels: `uint32_t`.
+pub type VkConditionalRenderingFlagsEXT = u32;
+
 /// `VkDriverId` (enum), as it travels: `int32_t`.
 pub type VkDriverId = i32;
-
-/// `VkShaderStageFlags` (flags), as it travels: `uint32_t`.
-pub type VkShaderStageFlags = u32;
 
 /// `VkSubgroupFeatureFlags` (flags), as it travels: `uint32_t`.
 pub type VkSubgroupFeatureFlags = u32;
@@ -175,9 +841,6 @@ pub type VkShaderFloatControlsIndependence = i32;
 /// `VkResolveModeFlags` (flags), as it travels: `uint32_t`.
 pub type VkResolveModeFlags = u32;
 
-/// `VkFormatFeatureFlags` (flags), as it travels: `uint32_t`.
-pub type VkFormatFeatureFlags = u32;
-
 /// `VkFormatFeatureFlags2` (flags), as it travels: `uint64_t`.
 pub type VkFormatFeatureFlags2 = u64;
 
@@ -187,22 +850,227 @@ pub type VkExternalMemoryHandleTypeFlagBits = i32;
 /// `VkExternalMemoryFeatureFlags` (flags), as it travels: `uint32_t`.
 pub type VkExternalMemoryFeatureFlags = u32;
 
-/// `VkQueueFlags` (flags), as it travels: `uint32_t`.
-pub type VkQueueFlags = u32;
+/// `VkExternalSemaphoreHandleTypeFlagBits` (enum), as it travels: `int32_t`.
+pub type VkExternalSemaphoreHandleTypeFlagBits = i32;
 
-/// `VkMemoryPropertyFlags` (flags), as it travels: `uint32_t`.
-pub type VkMemoryPropertyFlags = u32;
+/// `VkExternalSemaphoreFeatureFlags` (flags), as it travels: `uint32_t`.
+pub type VkExternalSemaphoreFeatureFlags = u32;
 
-/// `VkMemoryHeapFlags` (flags), as it travels: `uint32_t`.
-pub type VkMemoryHeapFlags = u32;
+/// `VkExternalFenceHandleTypeFlagBits` (enum), as it travels: `int32_t`.
+pub type VkExternalFenceHandleTypeFlagBits = i32;
 
-/// `VkImageAspectFlagBits` (enum), as it travels: `int32_t`.
-pub type VkImageAspectFlagBits = i32;
+/// `VkExternalFenceFeatureFlags` (flags), as it travels: `uint32_t`.
+pub type VkExternalFenceFeatureFlags = u32;
 
 /// `VkResult` (enum), as it travels: `int32_t`.
 pub type VkResult = i32;
 
+/// `VkImageAspectFlagBits` (enum), as it travels: `int32_t`.
+pub type VkImageAspectFlagBits = i32;
+
+/// `VkDescriptorUpdateTemplateCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkDescriptorUpdateTemplateCreateFlags = u32;
+
+/// `VkDescriptorUpdateTemplateType` (enum), as it travels: `int32_t`.
+pub type VkDescriptorUpdateTemplateType = i32;
+
+/// `VkSamplerYcbcrModelConversion` (enum), as it travels: `int32_t`.
+pub type VkSamplerYcbcrModelConversion = i32;
+
+/// `VkSamplerYcbcrRange` (enum), as it travels: `int32_t`.
+pub type VkSamplerYcbcrRange = i32;
+
+/// `VkChromaLocation` (enum), as it travels: `int32_t`.
+pub type VkChromaLocation = i32;
+
+/// `VkTimeDomainKHR` (enum), as it travels: `int32_t`.
+pub type VkTimeDomainKHR = i32;
+
+/// `VkResolveModeFlagBits` (enum), as it travels: `int32_t`.
+pub type VkResolveModeFlagBits = i32;
+
+/// `VkPipelineStageFlags2` (flags), as it travels: `uint64_t`.
+pub type VkPipelineStageFlags2 = u64;
+
+/// `VkAccessFlags2` (flags), as it travels: `uint64_t`.
+pub type VkAccessFlags2 = u64;
+
+/// `VkSubpassContents` (enum), as it travels: `int32_t`.
+pub type VkSubpassContents = i32;
+
+/// `VkSemaphoreWaitFlags` (flags), as it travels: `uint32_t`.
+pub type VkSemaphoreWaitFlags = u32;
+
+/// `VkCopyAccelerationStructureModeKHR` (enum), as it travels: `int32_t`.
+pub type VkCopyAccelerationStructureModeKHR = i32;
+
+/// `VkRayTracingShaderGroupTypeKHR` (enum), as it travels: `int32_t`.
+pub type VkRayTracingShaderGroupTypeKHR = i32;
+
+/// `VkToolPurposeFlags` (flags), as it travels: `uint32_t`.
+pub type VkToolPurposeFlags = u32;
+
+/// `VkAccelerationStructureCreateFlagsKHR` (flags), as it travels: `uint32_t`.
+pub type VkAccelerationStructureCreateFlagsKHR = u32;
+
+/// `VkAccelerationStructureTypeKHR` (enum), as it travels: `int32_t`.
+pub type VkAccelerationStructureTypeKHR = i32;
+
+/// `VkIndexType` (enum), as it travels: `int32_t`.
+pub type VkIndexType = i32;
+
+/// `VkGeometryTypeKHR` (enum), as it travels: `int32_t`.
+pub type VkGeometryTypeKHR = i32;
+
+/// `VkGeometryFlagsKHR` (flags), as it travels: `uint32_t`.
+pub type VkGeometryFlagsKHR = u32;
+
+/// `VkBuildAccelerationStructureFlagsKHR` (flags), as it travels: `uint32_t`.
+pub type VkBuildAccelerationStructureFlagsKHR = u32;
+
+/// `VkBuildAccelerationStructureModeKHR` (enum), as it travels: `int32_t`.
+pub type VkBuildAccelerationStructureModeKHR = i32;
+
+/// `VkPrivateDataSlotCreateFlags` (flags), as it travels: `uint32_t`.
+pub type VkPrivateDataSlotCreateFlags = u32;
+
+/// `VkSubmitFlags` (flags), as it travels: `uint32_t`.
+pub type VkSubmitFlags = u32;
+
+/// `VkHostImageCopyFlags` (flags), as it travels: `uint32_t`.
+pub type VkHostImageCopyFlags = u32;
+
+/// `VkMemoryUnmapFlags` (flags), as it travels: `uint32_t`.
+pub type VkMemoryUnmapFlags = u32;
+
+/// `VkComponentTypeKHR` (enum), as it travels: `int32_t`.
+pub type VkComponentTypeKHR = i32;
+
+/// `VkScopeKHR` (enum), as it travels: `int32_t`.
+pub type VkScopeKHR = i32;
+
+/// `VkTensorViewCreateFlagsARM` (flags), as it travels: `uint64_t`.
+pub type VkTensorViewCreateFlagsARM = u64;
+
+/// `VkQueryResultFlags` (flags), as it travels: `uint32_t`.
+pub type VkQueryResultFlags = u32;
+
+/// `VkDescriptorPoolResetFlags` (flags), as it travels: `uint32_t`.
+pub type VkDescriptorPoolResetFlags = u32;
+
+/// `VkCommandPoolResetFlags` (flags), as it travels: `uint32_t`.
+pub type VkCommandPoolResetFlags = u32;
+
+/// `VkCommandBufferResetFlags` (flags), as it travels: `uint32_t`.
+pub type VkCommandBufferResetFlags = u32;
+
+/// `VkStencilFaceFlags` (flags), as it travels: `uint32_t`.
+pub type VkStencilFaceFlags = u32;
+
+/// `VkPipelineStageFlagBits` (enum), as it travels: `int32_t`.
+pub type VkPipelineStageFlagBits = i32;
+
+/// `VkCommandPoolTrimFlags` (flags), as it travels: `uint32_t`.
+pub type VkCommandPoolTrimFlags = u32;
+
+/// `VkPeerMemoryFeatureFlags` (flags), as it travels: `uint32_t`.
+pub type VkPeerMemoryFeatureFlags = u32;
+
+/// `VkAccelerationStructureCompatibilityKHR` (enum), as it travels: `int32_t`.
+pub type VkAccelerationStructureCompatibilityKHR = i32;
+
+/// `VkShaderGroupShaderKHR` (enum), as it travels: `int32_t`.
+pub type VkShaderGroupShaderKHR = i32;
+
+/// `VkObjectType` (enum), as it travels: `int32_t`.
+pub type VkObjectType = i32;
+
+/// `VkAccelerationStructureBuildTypeKHR` (enum), as it travels: `int32_t`.
+pub type VkAccelerationStructureBuildTypeKHR = i32;
+
 // ---- enum values the generated code names ----------------------------------
+
+/// `VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT`.
+pub const VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT: VkDescriptorMappingSourceEXT =
+    0;
+
+/// `VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_ARRAY_EXT`.
+pub const VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_ARRAY_EXT:
+    VkDescriptorMappingSourceEXT = 3;
+
+/// `VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_EXT`.
+pub const VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_EXT: VkDescriptorMappingSourceEXT =
+    2;
+
+/// `VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT`.
+pub const VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT: VkDescriptorMappingSourceEXT = 1;
+
+/// `VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_SHADER_RECORD_INDEX_EXT`.
+pub const VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_SHADER_RECORD_INDEX_EXT:
+    VkDescriptorMappingSourceEXT = 8;
+
+/// `VK_DESCRIPTOR_MAPPING_SOURCE_INDIRECT_ADDRESS_EXT`.
+pub const VK_DESCRIPTOR_MAPPING_SOURCE_INDIRECT_ADDRESS_EXT: VkDescriptorMappingSourceEXT = 7;
+
+/// `VK_DESCRIPTOR_MAPPING_SOURCE_PUSH_ADDRESS_EXT`.
+pub const VK_DESCRIPTOR_MAPPING_SOURCE_PUSH_ADDRESS_EXT: VkDescriptorMappingSourceEXT = 6;
+
+/// `VK_DESCRIPTOR_MAPPING_SOURCE_PUSH_DATA_EXT`.
+pub const VK_DESCRIPTOR_MAPPING_SOURCE_PUSH_DATA_EXT: VkDescriptorMappingSourceEXT = 5;
+
+/// `VK_DESCRIPTOR_MAPPING_SOURCE_RESOURCE_HEAP_DATA_EXT`.
+pub const VK_DESCRIPTOR_MAPPING_SOURCE_RESOURCE_HEAP_DATA_EXT: VkDescriptorMappingSourceEXT = 4;
+
+/// `VK_DESCRIPTOR_MAPPING_SOURCE_SHADER_RECORD_ADDRESS_EXT`.
+pub const VK_DESCRIPTOR_MAPPING_SOURCE_SHADER_RECORD_ADDRESS_EXT: VkDescriptorMappingSourceEXT = 10;
+
+/// `VK_DESCRIPTOR_MAPPING_SOURCE_SHADER_RECORD_DATA_EXT`.
+pub const VK_DESCRIPTOR_MAPPING_SOURCE_SHADER_RECORD_DATA_EXT: VkDescriptorMappingSourceEXT = 9;
+
+/// `VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR`.
+pub const VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: VkDescriptorType = 1000150000;
+
+/// `VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM`.
+pub const VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM: VkDescriptorType = 1000440001;
+
+/// `VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT`.
+pub const VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: VkDescriptorType = 10;
+
+/// `VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE`.
+pub const VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: VkDescriptorType = 2;
+
+/// `VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM`.
+pub const VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM: VkDescriptorType = 1000440000;
+
+/// `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`.
+pub const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: VkDescriptorType = 7;
+
+/// `VK_DESCRIPTOR_TYPE_STORAGE_IMAGE`.
+pub const VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: VkDescriptorType = 3;
+
+/// `VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER`.
+pub const VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: VkDescriptorType = 5;
+
+/// `VK_DESCRIPTOR_TYPE_TENSOR_ARM`.
+pub const VK_DESCRIPTOR_TYPE_TENSOR_ARM: VkDescriptorType = 1000460000;
+
+/// `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER`.
+pub const VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: VkDescriptorType = 6;
+
+/// `VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER`.
+pub const VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: VkDescriptorType = 4;
+
+/// `VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT`.
+pub const VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT: VkFramebufferCreateFlags = 1;
+
+/// `VK_GEOMETRY_TYPE_AABBS_KHR`.
+pub const VK_GEOMETRY_TYPE_AABBS_KHR: VkGeometryTypeKHR = 1;
+
+/// `VK_GEOMETRY_TYPE_INSTANCES_KHR`.
+pub const VK_GEOMETRY_TYPE_INSTANCES_KHR: VkGeometryTypeKHR = 2;
+
+/// `VK_GEOMETRY_TYPE_TRIANGLES_KHR`.
+pub const VK_GEOMETRY_TYPE_TRIANGLES_KHR: VkGeometryTypeKHR = 0;
 
 /// `VK_SHARING_MODE_CONCURRENT`.
 pub const VK_SHARING_MODE_CONCURRENT: VkSharingMode = 1;
@@ -403,6 +1271,9 @@ pub const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: i32 = 1;
 /// `VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO`.
 pub const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: i32 = 2;
 
+/// `VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO: i32 = 1000174000;
+
 /// `VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO`.
 pub const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: i32 = 3;
 
@@ -434,11 +1305,26 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES: i
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES: i32 = 1000145001;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BLEND_OPERATION_ADVANCED_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BLEND_OPERATION_ADVANCED_FEATURES_EXT: i32 = 1000148000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT: i32 = 1000392000;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES: i32 = 1000138000;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES: i32 = 1000413000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES: i32 = 1000470000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES: i32 = 1000545000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: i32 = 1000562000;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES: i32 = 1000063000;
@@ -449,6 +1335,9 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES: i32 = 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES: i32 = 1000261000;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GLOBAL_PRIORITY_QUERY_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GLOBAL_PRIORITY_QUERY_FEATURES: i32 = 1000388000;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES: i32 = 1000161001;
 
@@ -458,11 +1347,50 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES: i32 = 1
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: i32 = 1000177000;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT: i32 = 1000081001;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES: i32 = 1000211000;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES: i32 = 1000180000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT: i32 = 1000260000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT: i32 = 1000273000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES: i32 = 1000190002;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT: i32 = 1000028000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR: i32 =
+    1000201000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR: i32 =
+    1000203000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT: i32 = 1000328000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR: i32 = 1000150013;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR: i32 = 1000347000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR: i32 = 1000348013;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR: i32 =
+    1000386000;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES: i32 = 1000221000;
@@ -471,8 +1399,14 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES: i32 = 
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES: i32 =
     1000253000;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT: i32 = 1000102000;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: i32 = 1000257000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT: i32 = 1000244000;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES: i32 = 1000108000;
@@ -480,16 +1414,39 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES: i32 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES: i32 = 1000066000;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_IMAGE_ARRAYS_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_IMAGE_ARRAYS_FEATURES_EXT: i32 = 1000252000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR: i32 = 1000181000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES: i32 = 1000265000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT: i32 =
+    1000251000;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES: i32 =
     1000241000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT: i32 =
+    1000356000;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES: i32 =
     1000276000;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT: i32 = 1000281000;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: i32 = 1000225002;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES: i32 = 1000259000;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES: i32 =
@@ -504,27 +1461,288 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: i32 = 51;
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: i32 = 53;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES: i32 = 55;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT: i32 = 1000287002;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT: i32 = 1000411000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT: i32 = 1000267000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT: i32 = 1000377000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT: i32 = 1000455000;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES: i32 =
     1000325000;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR: i32 =
+    1000323000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_KHR: i32 = 1000286000;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES: i32 = 1000335000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR: i32 =
+    1000336000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT: i32 = 1000340000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT: i32 =
+    1000234000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR: i32 = 1000226003;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES: i32 = 1000215000;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT: i32 = 1000393000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT: i32 = 1000418000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT:
+    i32 = 1000524000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_VERTEX_ATTRIBUTES_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_VERTEX_ATTRIBUTES_FEATURES_EXT: i32 = 1000495000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT: i32 = 1000351000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT: i32 = 1000355000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT: i32 = 1000582000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT: i32 =
+    1000352000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_RELAXED_EXTENDED_INSTRUCTION_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_RELAXED_EXTENDED_INSTRUCTION_FEATURES_KHR: i32 =
+    1000558000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COLOR_WRITE_ENABLE_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COLOR_WRITE_ENABLE_FEATURES_EXT: i32 = 1000381000;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES: i32 = 1000314007;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES: i32 = 1000270000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVES_GENERATED_QUERY_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVES_GENERATED_QUERY_FEATURES_EXT: i32 =
+    1000382000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_DITHERING_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_DITHERING_FEATURES_EXT: i32 = 1000465000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT:
+    i32 = 1000376000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_PROTECTED_ACCESS_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_PROTECTED_ACCESS_FEATURES: i32 = 1000466000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_2_PLANE_444_FORMATS_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_2_PLANE_444_FORMATS_FEATURES_EXT: i32 =
+    1000330000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT: i32 = 1000254000;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES: i32 = 1000280000;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR: i32 = 1000579000;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES: i32 = 1000044003;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT: i32 = 1000391000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT:
+    i32 = 1000342000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT: i32 =
+    1000320000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NESTED_COMMAND_BUFFER_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NESTED_COMMAND_BUFFER_FEATURES_EXT: i32 = 1000451000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT: i32 = 1000422000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES: i32 = 1000068001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT: i32 =
+    1000339000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_ZERO_ONE_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_ZERO_ONE_FEATURES_KHR: i32 = 1000421000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_LIBRARY_GROUP_HANDLES_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_LIBRARY_GROUP_HANDLES_FEATURES_EXT: i32 =
+    1000498000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT: i32 =
+    1000499000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT: i32 = 1000283000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR: i32 =
+    1000481000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: i32 = 1000506000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR: i32 =
+    1000434000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES: i32 = 1000416000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_EXPECT_ASSUME_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_EXPECT_ASSUME_FEATURES: i32 = 1000544000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES: i32 = 1000528000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES: i32 = 1000232000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_QUAD_CONTROL_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_QUAD_CONTROL_FEATURES_KHR: i32 = 1000235000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR: i32 = 1000141000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_REPLICATED_COMPOSITES_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_REPLICATED_COMPOSITES_FEATURES_EXT: i32 =
+    1000564000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNIFORM_BUFFER_UNSIZED_ARRAY_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNIFORM_BUFFER_UNSIZED_ARRAY_FEATURES_EXT: i32 =
+    1000642000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT: i32 = 1000567000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR: i32 = 1000387000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT: i32 = 1000135009;
+
 /// `VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO`.
 pub const VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO: i32 = 1000070001;
+
+/// `VK_STRUCTURE_TYPE_SUBMIT_INFO`.
+pub const VK_STRUCTURE_TYPE_SUBMIT_INFO: i32 = 4;
+
+/// `VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO`.
+pub const VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO: i32 = 1000060005;
+
+/// `VK_STRUCTURE_TYPE_PROTECTED_SUBMIT_INFO`.
+pub const VK_STRUCTURE_TYPE_PROTECTED_SUBMIT_INFO: i32 = 1000145000;
+
+/// `VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO`.
+pub const VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO: i32 = 1000207003;
+
+/// `VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO`.
+pub const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: i32 = 5;
+
+/// `VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO`.
+pub const VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO: i32 = 1000072002;
+
+/// `VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO`.
+pub const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO: i32 = 1000060000;
+
+/// `VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO`.
+pub const VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO: i32 = 1000127001;
+
+/// `VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO`.
+pub const VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO: i32 = 1000257003;
+
+/// `VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA`.
+pub const VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA: i32 = 1000384002;
+
+/// `VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE`.
+pub const VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE: i32 = 6;
+
+/// `VK_STRUCTURE_TYPE_BIND_SPARSE_INFO`.
+pub const VK_STRUCTURE_TYPE_BIND_SPARSE_INFO: i32 = 7;
+
+/// `VK_STRUCTURE_TYPE_DEVICE_GROUP_BIND_SPARSE_INFO`.
+pub const VK_STRUCTURE_TYPE_DEVICE_GROUP_BIND_SPARSE_INFO: i32 = 1000060006;
+
+/// `VK_STRUCTURE_TYPE_FENCE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_FENCE_CREATE_INFO: i32 = 8;
+
+/// `VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO: i32 = 1000113000;
+
+/// `VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO: i32 = 9;
+
+/// `VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO: i32 = 1000077000;
+
+/// `VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO: i32 = 1000207002;
+
+/// `VK_STRUCTURE_TYPE_EVENT_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_EVENT_CREATE_INFO: i32 = 10;
+
+/// `VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO: i32 = 11;
+
+/// `VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: i32 = 12;
+
+/// `VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO: i32 = 1000470006;
+
+/// `VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO: i32 = 1000072000;
+
+/// `VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO: i32 = 1000257002;
+
+/// `VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_CREATE_INFO_EXT: i32 = 1000244002;
+
+/// `VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO: i32 = 13;
 
 /// `VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO`.
 pub const VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO: i32 = 14;
@@ -535,14 +1753,294 @@ pub const VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: i32 = 1000072001;
 /// `VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO`.
 pub const VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO: i32 = 1000147000;
 
+/// `VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT: i32 = 1000158003;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT: i32 = 1000158004;
+
 /// `VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO`.
 pub const VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO: i32 = 1000246000;
+
+/// `VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT: i32 = 1000135007;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO: i32 = 15;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO: i32 = 1000117002;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT: i32 = 1000418001;
+
+/// `VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO`.
+pub const VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO: i32 = 1000156001;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT: i32 = 1000391001;
+
+/// `VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: i32 = 16;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO: i32 = 17;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO: i32 = 18;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO: i32 =
+    1000225001;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO: i32 = 1000068000;
+
+/// `VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO: i32 = 31;
+
+/// `VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO: i32 = 1000130001;
+
+/// `VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT: i32 = 1000287000;
+
+/// `VK_STRUCTURE_TYPE_SAMPLER_BORDER_COLOR_COMPONENT_MAPPING_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_SAMPLER_BORDER_COLOR_COMPONENT_MAPPING_CREATE_INFO_EXT: i32 =
+    1000411001;
+
+/// `VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_INDEX_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_INDEX_CREATE_INFO_EXT: i32 = 1000135011;
+
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT`.
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT: i32 = 1000135005;
+
+/// `VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT: i32 = 1000135006;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO: i32 = 19;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO: i32 = 1000190001;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO: i32 = 20;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO: i32 = 21;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO: i32 = 1000117003;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO: i32 = 22;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT: i32 = 1000355001;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLAMP_CONTROL_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLAMP_CONTROL_CREATE_INFO_EXT: i32 = 1000582001;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO: i32 = 23;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT: i32 =
+    1000101001;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT: i32 = 1000028002;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT: i32 =
+    1000102001;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO: i32 = 1000259001;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT: i32 =
+    1000254001;
+
+/// `VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT: i32 = 1000283002;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO: i32 = 24;
+
+/// `VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT: i32 = 1000143000;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT: i32 = 1000143002;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO: i32 = 25;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO: i32 = 26;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_ADVANCED_STATE_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_ADVANCED_STATE_CREATE_INFO_EXT: i32 = 1000148002;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_COLOR_WRITE_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_COLOR_WRITE_CREATE_INFO_EXT: i32 = 1000381001;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO: i32 = 27;
+
+/// `VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO: i32 = 28;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO: i32 = 1000470005;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR: i32 = 1000290000;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO: i32 = 1000192000;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR: i32 = 1000226001;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO: i32 = 1000044002;
+
+/// `VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT: i32 = 1000320002;
+
+/// `VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO`.
+pub const VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO: i32 = 1000232001;
+
+/// `VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO`.
+pub const VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO: i32 = 1000232002;
+
+/// `VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO: i32 = 29;
+
+/// `VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: i32 = 30;
+
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: i32 = 32;
+
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO: i32 = 1000161000;
+
+/// `VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT: i32 = 1000351002;
+
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO: i32 = 33;
+
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_INLINE_UNIFORM_BLOCK_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_INLINE_UNIFORM_BLOCK_CREATE_INFO: i32 = 1000138003;
+
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO`.
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO: i32 = 34;
+
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO`.
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO: i32 =
+    1000161003;
+
+/// `VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET`.
+pub const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: i32 = 35;
+
+/// `VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK`.
+pub const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK: i32 = 1000138002;
+
+/// `VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR`.
+pub const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR: i32 = 1000150007;
+
+/// `VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET`.
+pub const VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET: i32 = 36;
+
+/// `VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO: i32 = 37;
+
+/// `VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENT_IMAGE_INFO`.
+pub const VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENT_IMAGE_INFO: i32 = 1000108002;
+
+/// `VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO: i32 = 1000108001;
+
+/// `VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO: i32 = 38;
+
+/// `VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO: i32 = 1000053000;
+
+/// `VK_STRUCTURE_TYPE_RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO: i32 = 1000117001;
+
+/// `VK_STRUCTURE_TYPE_RENDERING_AREA_INFO`.
+pub const VK_STRUCTURE_TYPE_RENDERING_AREA_INFO: i32 = 1000470003;
 
 /// `VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO`.
 pub const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: i32 = 39;
 
+/// `VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO`.
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: i32 = 40;
+
+/// `VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO`.
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO: i32 = 41;
+
+/// `VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT: i32 =
+    1000081000;
+
+/// `VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO`.
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO: i32 = 1000044004;
+
+/// `VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT: i32 = 1000135003;
+
+/// `VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_DESCRIPTOR_HEAP_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_DESCRIPTOR_HEAP_INFO_EXT: i32 = 1000135010;
+
+/// `VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO`.
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: i32 = 42;
+
+/// `VK_STRUCTURE_TYPE_DEVICE_GROUP_COMMAND_BUFFER_BEGIN_INFO`.
+pub const VK_STRUCTURE_TYPE_DEVICE_GROUP_COMMAND_BUFFER_BEGIN_INFO: i32 = 1000060004;
+
+/// `VK_STRUCTURE_TYPE_MEMORY_BARRIER`.
+pub const VK_STRUCTURE_TYPE_MEMORY_BARRIER: i32 = 46;
+
+/// `VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER`.
+pub const VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER: i32 = 44;
+
+/// `VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT`.
+pub const VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT: i32 = 1000453000;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER`.
+pub const VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER: i32 = 45;
+
+/// `VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT: i32 = 1000081002;
+
+/// `VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO`.
+pub const VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO: i32 = 43;
+
+/// `VK_STRUCTURE_TYPE_DEVICE_GROUP_RENDER_PASS_BEGIN_INFO`.
+pub const VK_STRUCTURE_TYPE_DEVICE_GROUP_RENDER_PASS_BEGIN_INFO: i32 = 1000060003;
+
+/// `VK_STRUCTURE_TYPE_RENDER_PASS_SAMPLE_LOCATIONS_BEGIN_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_RENDER_PASS_SAMPLE_LOCATIONS_BEGIN_INFO_EXT: i32 = 1000143001;
+
+/// `VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO`.
+pub const VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO: i32 = 1000108003;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2: i32 = 1000059001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT: i32 = 1000392001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES: i32 = 1000080000;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES: i32 = 1000196000;
@@ -565,6 +2063,13 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_PROPERTIES: i32 = 1
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES: i32 = 1000130000;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT: i32 = 1000143003;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BLEND_OPERATION_ADVANCED_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BLEND_OPERATION_ADVANCED_PROPERTIES_EXT: i32 =
+    1000148001;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_PROPERTIES: i32 = 1000138001;
 
@@ -574,8 +2079,21 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES: i32 = 1000
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES: i32 = 1000413001;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES: i32 = 1000470001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_PROPERTIES: i32 = 1000545001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR: i32 = 1000562001;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES: i32 = 1000197000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT: i32 =
+    1000101000;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES: i32 = 1000161002;
@@ -583,14 +2101,43 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES: i32 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_PROPERTIES: i32 = 1000207001;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT: i32 =
+    1000190000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES: i32 = 1000525000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT: i32 = 1000212000;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES: i32 = 1000199000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT: i32 = 1000028001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_PROPERTIES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_PROPERTIES_KHR: i32 =
+    1000511000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT: i32 = 1000328001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR: i32 = 1000150014;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR: i32 = 1000347001;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES: i32 = 1000281001;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES: i32 = 1000225000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES: i32 = 1000259002;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES: i32 = 50;
@@ -601,20 +2148,81 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES: i32 = 52;
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES: i32 = 54;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_PROPERTIES: i32 = 56;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT: i32 = 1000287001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT: i32 =
+    1000455001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_KHR: i32 = 1000286001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR: i32 = 1000226002;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_VERTEX_ATTRIBUTES_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_VERTEX_ATTRIBUTES_PROPERTIES_EXT: i32 =
+    1000495001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES: i32 = 1000270001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_PROPERTIES_EXT: i32 = 1000254002;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES: i32 = 1000280001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_PROPERTIES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_PROPERTIES_KHR: i32 =
+    1000322000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT: i32 =
+    1000320001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NESTED_COMMAND_BUFFER_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NESTED_COMMAND_BUFFER_PROPERTIES_EXT: i32 = 1000451001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_PROPERTIES: i32 = 1000068002;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR: i32 = 1000506002;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT: i32 = 1000135008;
 
 /// `VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2`.
 pub const VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2: i32 = 1000059002;
 
+/// `VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT`.
+pub const VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT: i32 = 1000158000;
+
+/// `VK_STRUCTURE_TYPE_SUBPASS_RESOLVE_PERFORMANCE_QUERY_EXT`.
+pub const VK_STRUCTURE_TYPE_SUBPASS_RESOLVE_PERFORMANCE_QUERY_EXT: i32 = 1000376001;
+
 /// `VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3`.
 pub const VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3: i32 = 1000360000;
+
+/// `VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT`.
+pub const VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT: i32 = 1000158006;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2: i32 = 1000059004;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO: i32 = 1000071000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT: i32 = 1000158002;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_IMAGE_FORMAT_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_IMAGE_FORMAT_INFO_EXT: i32 = 1000170000;
 
 /// `VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2`.
 pub const VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2: i32 = 1000059003;
@@ -625,20 +2233,77 @@ pub const VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES: i32 = 1000071001;
 /// `VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES: i32 = 1000156005;
 
+/// `VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT: i32 = 1000170001;
+
+/// `VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY`.
+pub const VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY: i32 = 1000270009;
+
 /// `VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2`.
 pub const VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2: i32 = 1000059005;
+
+/// `VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES: i32 = 1000388001;
 
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2: i32 = 1000059006;
 
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: i32 = 1000237000;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_INFO_2`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_INFO_2: i32 = 1000059008;
+
+/// `VK_STRUCTURE_TYPE_SPARSE_IMAGE_FORMAT_PROPERTIES_2`.
+pub const VK_STRUCTURE_TYPE_SPARSE_IMAGE_FORMAT_PROPERTIES_2: i32 = 1000059007;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO: i32 = 1000071002;
+
+/// `VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES: i32 = 1000071003;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO: i32 = 1000076000;
+
+/// `VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES: i32 = 1000076001;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO: i32 = 1000112000;
+
+/// `VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES: i32 = 1000112001;
+
 /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES`.
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES: i32 = 1000070000;
 
-/// `VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2`.
-pub const VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2: i32 = 1000146001;
+/// `VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO`.
+pub const VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO: i32 = 1000157000;
 
-/// `VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO`.
-pub const VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO: i32 = 1000156003;
+/// `VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_DEVICE_GROUP_INFO`.
+pub const VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_DEVICE_GROUP_INFO: i32 = 1000060013;
+
+/// `VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS`.
+pub const VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS: i32 = 1000545002;
+
+/// `VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO`.
+pub const VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO: i32 = 1000157001;
+
+/// `VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO`.
+pub const VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO: i32 = 1000060014;
+
+/// `VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO`.
+pub const VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO: i32 = 1000156002;
+
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO: i32 = 1000085000;
+
+/// `VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT: i32 = 1000143004;
+
+/// `VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2`.
+pub const VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2: i32 = 1000146000;
 
 /// `VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2`.
 pub const VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2: i32 = 1000146003;
@@ -646,11 +2311,285 @@ pub const VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2: i32 = 1000146003;
 /// `VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS`.
 pub const VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: i32 = 1000127000;
 
+/// `VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2`.
+pub const VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2: i32 = 1000146001;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO`.
+pub const VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO: i32 = 1000156003;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_SPARSE_MEMORY_REQUIREMENTS_INFO_2`.
+pub const VK_STRUCTURE_TYPE_IMAGE_SPARSE_MEMORY_REQUIREMENTS_INFO_2: i32 = 1000146002;
+
+/// `VK_STRUCTURE_TYPE_SPARSE_IMAGE_MEMORY_REQUIREMENTS_2`.
+pub const VK_STRUCTURE_TYPE_SPARSE_IMAGE_MEMORY_REQUIREMENTS_2: i32 = 1000146004;
+
+/// `VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS`.
+pub const VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS: i32 = 1000413002;
+
+/// `VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS`.
+pub const VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS: i32 = 1000413003;
+
+/// `VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO: i32 = 1000156000;
+
 /// `VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2`.
 pub const VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2: i32 = 1000145003;
 
 /// `VK_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA`.
 pub const VK_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA: i32 = 1000384005;
+
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT`.
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT: i32 = 1000168001;
+
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT`.
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT: i32 =
+    1000161004;
+
+/// `VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR: i32 = 1000184000;
+
+/// `VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2`.
+pub const VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2: i32 = 1000109000;
+
+/// `VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_STENCIL_LAYOUT`.
+pub const VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_STENCIL_LAYOUT: i32 = 1000241002;
+
+/// `VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2`.
+pub const VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2: i32 = 1000109001;
+
+/// `VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_STENCIL_LAYOUT`.
+pub const VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_STENCIL_LAYOUT: i32 = 1000241001;
+
+/// `VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2`.
+pub const VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2: i32 = 1000109002;
+
+/// `VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE`.
+pub const VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE: i32 = 1000199001;
+
+/// `VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR: i32 = 1000226000;
+
+/// `VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT: i32 = 1000376002;
+
+/// `VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2`.
+pub const VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2: i32 = 1000109003;
+
+/// `VK_STRUCTURE_TYPE_MEMORY_BARRIER_2`.
+pub const VK_STRUCTURE_TYPE_MEMORY_BARRIER_2: i32 = 1000314000;
+
+/// `VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2`.
+pub const VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2: i32 = 1000109004;
+
+/// `VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO`.
+pub const VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO: i32 = 1000109005;
+
+/// `VK_STRUCTURE_TYPE_SUBPASS_END_INFO`.
+pub const VK_STRUCTURE_TYPE_SUBPASS_END_INFO: i32 = 1000109006;
+
+/// `VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO`.
+pub const VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO: i32 = 1000207004;
+
+/// `VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO`.
+pub const VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO: i32 = 1000207005;
+
+/// `VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR: i32 = 1000150010;
+
+/// `VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_TO_MEMORY_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_TO_MEMORY_INFO_KHR: i32 = 1000150011;
+
+/// `VK_STRUCTURE_TYPE_COPY_MEMORY_TO_ACCELERATION_STRUCTURE_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_COPY_MEMORY_TO_ACCELERATION_STRUCTURE_INFO_KHR: i32 = 1000150012;
+
+/// `VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR: i32 = 1000150016;
+
+/// `VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_INTERFACE_CREATE_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_INTERFACE_CREATE_INFO_KHR: i32 = 1000150018;
+
+/// `VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR: i32 = 1000150015;
+
+/// `VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_VERSION_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_VERSION_INFO_KHR: i32 = 1000150009;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT`.
+pub const VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT: i32 = 1000158005;
+
+/// `VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO`.
+pub const VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO: i32 = 1000244001;
+
+/// `VK_STRUCTURE_TYPE_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS_INFO`.
+pub const VK_STRUCTURE_TYPE_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS_INFO: i32 = 1000257004;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TOOL_PROPERTIES`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TOOL_PROPERTIES: i32 = 1000245000;
+
+/// `VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR: i32 = 1000150017;
+
+/// `VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR`.
+pub const VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR: i32 = 1000150005;
+
+/// `VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR`.
+pub const VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR: i32 = 1000150003;
+
+/// `VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR`.
+pub const VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR: i32 = 1000150004;
+
+/// `VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR`.
+pub const VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR: i32 = 1000150006;
+
+/// `VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR: i32 = 1000150000;
+
+/// `VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR: i32 = 1000150002;
+
+/// `VK_STRUCTURE_TYPE_PRIVATE_DATA_SLOT_CREATE_INFO`.
+pub const VK_STRUCTURE_TYPE_PRIVATE_DATA_SLOT_CREATE_INFO: i32 = 1000295002;
+
+/// `VK_STRUCTURE_TYPE_BUFFER_COPY_2`.
+pub const VK_STRUCTURE_TYPE_BUFFER_COPY_2: i32 = 1000337006;
+
+/// `VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2`.
+pub const VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2: i32 = 1000337000;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_COPY_2`.
+pub const VK_STRUCTURE_TYPE_IMAGE_COPY_2: i32 = 1000337007;
+
+/// `VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2`.
+pub const VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2: i32 = 1000337001;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_BLIT_2`.
+pub const VK_STRUCTURE_TYPE_IMAGE_BLIT_2: i32 = 1000337008;
+
+/// `VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2`.
+pub const VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2: i32 = 1000337004;
+
+/// `VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2`.
+pub const VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2: i32 = 1000337009;
+
+/// `VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2`.
+pub const VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2: i32 = 1000337002;
+
+/// `VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2`.
+pub const VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2: i32 = 1000337003;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_RESOLVE_2`.
+pub const VK_STRUCTURE_TYPE_IMAGE_RESOLVE_2: i32 = 1000337010;
+
+/// `VK_STRUCTURE_TYPE_RESOLVE_IMAGE_INFO_2`.
+pub const VK_STRUCTURE_TYPE_RESOLVE_IMAGE_INFO_2: i32 = 1000337005;
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR`.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR: i32 = 1000226004;
+
+/// `VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR: i32 = 1000150020;
+
+/// `VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT`.
+pub const VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT: i32 = 1000352001;
+
+/// `VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT`.
+pub const VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT: i32 = 1000352002;
+
+/// `VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2`.
+pub const VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2: i32 = 1000314001;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2`.
+pub const VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2: i32 = 1000314002;
+
+/// `VK_STRUCTURE_TYPE_DEPENDENCY_INFO`.
+pub const VK_STRUCTURE_TYPE_DEPENDENCY_INFO: i32 = 1000314003;
+
+/// `VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO`.
+pub const VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO: i32 = 1000314005;
+
+/// `VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO`.
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO: i32 = 1000314006;
+
+/// `VK_STRUCTURE_TYPE_SUBMIT_INFO_2`.
+pub const VK_STRUCTURE_TYPE_SUBMIT_INFO_2: i32 = 1000314004;
+
+/// `VK_STRUCTURE_TYPE_COPY_IMAGE_TO_IMAGE_INFO`.
+pub const VK_STRUCTURE_TYPE_COPY_IMAGE_TO_IMAGE_INFO: i32 = 1000270007;
+
+/// `VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO`.
+pub const VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO: i32 = 1000270006;
+
+/// `VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO`.
+pub const VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO: i32 = 1000044001;
+
+/// `VK_STRUCTURE_TYPE_RENDERING_INFO`.
+pub const VK_STRUCTURE_TYPE_RENDERING_INFO: i32 = 1000044000;
+
+/// `VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR`.
+pub const VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR: i32 = 1000044006;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2`.
+pub const VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2: i32 = 1000338003;
+
+/// `VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2`.
+pub const VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2: i32 = 1000338002;
+
+/// `VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE`.
+pub const VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE: i32 = 1000270008;
+
+/// `VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT: i32 = 1000283001;
+
+/// `VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO`.
+pub const VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO: i32 = 1000470004;
+
+/// `VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO`.
+pub const VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO: i32 = 1000271001;
+
+/// `VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR`.
+pub const VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR: i32 = 1000506001;
+
+/// `VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO`.
+pub const VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO: i32 = 1000545003;
+
+/// `VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO`.
+pub const VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO: i32 = 1000545004;
+
+/// `VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO`.
+pub const VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO: i32 = 1000545005;
+
+/// `VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT: i32 = 1000135004;
+
+/// `VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA`.
+pub const VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA: i32 = 1000384001;
+
+/// `VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA`.
+pub const VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA: i32 = 1000384003;
+
+/// `VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_RESOURCE_INFO_MESA`.
+pub const VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_RESOURCE_INFO_MESA: i32 = 1000384004;
+
+/// `VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_MESA`.
+pub const VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_MESA: i32 = 1000384008;
+
+/// `VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_MESA`.
+pub const VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_MESA: i32 = 1000384009;
+
+/// `VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_MESA`.
+pub const VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_MESA: i32 = 1000384010;
+
+/// `VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT: i32 = 1000135001;
+
+/// `VK_STRUCTURE_TYPE_TEXEL_BUFFER_DESCRIPTOR_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_TEXEL_BUFFER_DESCRIPTOR_INFO_EXT: i32 = 1000135000;
+
+/// `VK_STRUCTURE_TYPE_TENSOR_VIEW_CREATE_INFO_ARM`.
+pub const VK_STRUCTURE_TYPE_TENSOR_VIEW_CREATE_INFO_ARM: i32 = 1000460001;
+
+/// `VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT`.
+pub const VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT: i32 = 1000135002;
 
 // ---- VkCommandTypeEXT: every opcode the protocol defines ---------------------
 
