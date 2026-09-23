@@ -2145,3 +2145,50 @@ release Mesa binds every queue to a fence timeline in 1..63 regardless; the
 executor records each queue's `ring_idx`, and `virtio_gpu::fence` needs one FIFO
 per `ring_idx` before `vkQueueSubmit` can retire a guest fence and the capset
 bit can flip. `vkExecuteCommandStreamsMESA` (commands over 8 KiB) is refused.
+
+## Amendment, 2026-09-23 — a Linux guest on WHP sees the RTX 2070 through our own renderer
+
+Stage 5a's milestone, measured in the Ubuntu guest (Mesa 26.0.8, root,
+`VK_DRIVER_FILES` = venus only, `MESA_LOG_LEVEL=debug VN_DEBUG=init,result`),
+against the executing renderer (`ENTANGLED_VENUS=vulkan`, commit `f3cf3ae`):
+
+```
+$ vulkaninfo --summary                       # exit 0
+GPU0:
+    apiVersion   = 1.2.0
+    vendorID     = 0x10de
+    deviceType   = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    deviceName   = Virtio-GPU Venus (NVIDIA GeForce RTX 2070)
+    driverName   = venus
+    driverInfo   = Mesa 26.0.8-1ubuntu0.3
+```
+
+With every ICD visible, the loader orders the venus device first and llvmpipe
+second. The renderer logged no refusal and no FATAL. Mesa logged
+`renderer instance version 1.3.309`.
+
+So every piece written for this stage has now run against the real thing:
+the capset, the transport, the ring worker and its monitor, the generated
+protocol, the object table and the host-Vulkan executor, on WHP and on the
+host's own GPU. No other process and no C renderer sits in the path.
+
+### Open
+
+- **`apiVersion 1.2.0`, not 1.3.** We answer with the host's version capped at
+  1.3, and the Mesa 26.2.3 source clamps only to 1.3 at the lowest
+  (`vn_physical_device.c:528-541`). The guest runs 26.0.8, whose clamps may
+  differ; the exact `.0` patch suggests a deliberate clamp rather than our
+  number passed through. The prime suspect is the enumerated extension mask
+  (sentinel set, only the two protocol extensions). Mesa checks the renderer's
+  protocol knowledge of an extension before encoding its structs, and every
+  1.3-core struct belongs to an extension that was promoted into 1.3. The
+  answer is to read the guest's own `vn_physical_device.c` for 26.0.8 and a
+  full, non-summary `vulkaninfo` dump.
+- **No device extensions are advertised.** That is enough for this milestone
+  and not enough for anything that presents: WSI, and Zink's GL on top of
+  Vulkan, both need extensions, and the protocol has to be able to decode them
+  before we may say so.
+- **`vkGetPhysicalDeviceImageFormatProperties2` returned
+  `VK_ERROR_FORMAT_NOT_SUPPORTED`** once during vulkaninfo's probing. That is a
+  legitimate answer to a probe, but it should be checked against the host's own
+  answer for the same query.
