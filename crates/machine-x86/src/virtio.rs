@@ -39,6 +39,7 @@ use virtio_core::interrupt::IrqLine;
 use virtio_core::transport::TransportError;
 use virtio_core::{mmio, GuestMem, MmioTransport, VirtioDevice};
 
+use crate::host_wake::HostWakeService;
 use crate::irqchip::{IrqChipError, UserspaceIrqChip};
 #[cfg(target_os = "linux")]
 use crate::irqfd::{IrqFdError, IrqFdLine};
@@ -136,6 +137,10 @@ pub struct VirtioMmioBus {
     slots: Vec<VirtioMmioSlot>,
     #[cfg(target_os = "linux")]
     mode: QueueNotifyMode,
+    /// The host-wake worker of a synchronous-kick window
+    /// ([`Self::attach_userspace`]); `None` on the KVM path, whose ioeventfd
+    /// workers serve wakes themselves (see [`crate::host_wake`]).
+    host_wake: Option<HostWakeService<MmioTransport>>,
 }
 
 /// Slot placement: the mmio window base and the IOAPIC pin for slot `index`.
@@ -233,6 +238,7 @@ impl VirtioMmioBus {
             slots: Vec::new(),
             #[cfg(target_os = "linux")]
             mode: QueueNotifyMode::Synchronous,
+            host_wake: None,
         }
     }
 
@@ -248,7 +254,10 @@ impl VirtioMmioBus {
     /// * there is no ioeventfd, so every `QUEUE_NOTIFY` write stays a full VM exit
     ///   and the device runs **inline on the vCPU thread** that took it. That is
     ///   [`QueueNotifyMode::Synchronous`], which the KVM path has always supported
-    ///   as a fallback — correct, just serialised against guest execution.
+    ///   as a fallback — correct, just serialised against guest execution;
+    /// * and so there is no worker to serve a device's [`virtio_core::HostWaker`]
+    ///   either: this window runs one [`HostWakeService`] thread instead, and
+    ///   every device gets a waker whose wake is a queue-0 notify from it.
     ///
     /// Portable on purpose: it compiles and is exercised on Linux too, which is
     /// what keeps the unit tests for it running in CI on both hosts.
@@ -275,6 +284,7 @@ impl VirtioMmioBus {
         }
         let mut bus = Self::empty();
         bus.slots.reserve(devices.len());
+        let host_wake = HostWakeService::new(devices.len());
         let mut apertures = shm
             .as_ref()
             .map(|s| layout::Mmio64Allocator::for_guest(s.mem_bytes));
@@ -283,6 +293,9 @@ impl VirtioMmioBus {
             let line = irqchip
                 .virtio_line(slot)
                 .map_err(|source| VirtioAttachError::IrqChip { slot, source })?;
+            // Before the device disappears into its transport, like the KVM
+            // path's `DeferredWaker`; a wake before the thread starts is kept.
+            device.set_host_waker(host_wake.waker(slot));
             let window = crate::shm::back_regions(
                 slot,
                 device.as_mut(),
@@ -306,6 +319,8 @@ impl VirtioMmioBus {
                 shm: window,
             });
         }
+        host_wake.start(bus.slots.iter().map(|s| Arc::clone(&s.transport)).collect());
+        bus.host_wake = Some(host_wake);
         Ok(bus)
     }
 
@@ -357,6 +372,7 @@ impl VirtioMmioBus {
         let mut bus = Self {
             slots: Vec::with_capacity(devices.len()),
             mode,
+            host_wake: None,
         };
         let mut apertures = shm
             .as_ref()
@@ -433,6 +449,9 @@ impl VirtioMmioBus {
                 notifier.set_quiesce(Arc::clone(&quiesce));
             }
         }
+        if let Some(host_wake) = &self.host_wake {
+            host_wake.set_quiesce(quiesce);
+        }
     }
 
     /// Machine reset (ADR-0005): every transport and device back to power-on.
@@ -443,7 +462,14 @@ impl VirtioMmioBus {
     /// no configuration space and nothing for the queue-notify registrations to
     /// follow. The whole of a slot's guest-visible state is its
     /// `TransportState`.
+    ///
+    /// The host-wake thread, where there is one, is stopped and joined first
+    /// and restarted empty: a wake of the boot being reset must not reach the
+    /// next one's driver.
     pub fn reset(&self) {
+        if let Some(host_wake) = &self.host_wake {
+            host_wake.reset();
+        }
         for slot in &self.slots {
             match slot.transport.lock() {
                 Ok(mut transport) => transport.power_on_reset(),
@@ -538,7 +564,7 @@ impl VirtioMmioBus {
     /// Idempotent, and also run from `Drop`, so "closing the VM leaves no
     /// device threads behind" holds even on an error path that never gets here
     /// (EPIC 14 acceptance criterion). A bus whose kicks are synchronous owns no
-    /// threads and no registrations, so there is nothing to undo.
+    /// registrations, only its host-wake thread, which is joined here.
     pub fn shutdown(&self) {
         #[cfg(target_os = "linux")]
         for slot in &self.slots {
@@ -546,6 +572,14 @@ impl VirtioMmioBus {
                 notifier.shutdown();
             }
         }
+        if let Some(host_wake) = &self.host_wake {
+            host_wake.shutdown();
+        }
+    }
+
+    /// The host-wake worker of a synchronous-kick window, if this is one.
+    pub fn host_wake(&self) -> Option<&HostWakeService<MmioTransport>> {
+        self.host_wake.as_ref()
     }
 
     /// The `virtio_mmio.device=` clauses announcing every slot, in probe order.

@@ -145,6 +145,7 @@ ever be taken at, and a resumed guest finds descriptors it never posted.
 |---|---|---|
 | vCPU threads | parked at the lifecycle checkpoint | arch state (KVM: events, LAPIC page, regs, `mp_state`; WHP: the state `WHvCreateVirtualProcessor` produced, read back at creation and written again — see the 2026-09-10 amendment), then the boot state the first boot used |
 | ioeventfd queue workers (KVM) | park on `virtio_core::Quiesce` **before** taking the transport lock | keep running — host wiring, not guest state; their addresses are re-based (below) |
+| host-wake thread (WHP, `machine_x86::host_wake`, 2026-09-24) | parks on the same gate **before** taking the transport lock; a wake while paused is kept and served on resume | stopped and joined, its pending wakes dropped, a fresh thread started — before the transports are reset |
 | virtio-net receive thread | parks on the same gate at the top of its loop | stopped and re-created by the device's own `reset()` |
 | virtio devices + queues | reached only through a parked vCPU or a parked worker | `TransportState::power_on_reset`: device `reset()`, queues, features, status, ISR — **and** `config_generation` and the MSI-X table, which a *device* reset deliberately keeps |
 | virtio-pci config space | not touched | restored from a power-on snapshot taken when the function was attached; then the notify ioeventfds re-based around the restored BARs |

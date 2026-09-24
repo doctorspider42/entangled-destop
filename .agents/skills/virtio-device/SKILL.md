@@ -585,7 +585,15 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
     to be *called* via `virtio_core::HostWaker` — implemented in
     `machine_x86::notify` as a write to **queue 0's existing eventfd**, i.e. a
     wake is an ordinary `queue_notify(0)`. `DeferredWaker` covers the ordering
-    (the device is inside its transport before the worker exists). Bounds that
+    (the device is inside its transport before the worker exists). On the
+    synchronous-kick buses (WHP) `machine_x86::host_wake` makes the same
+    `queue_notify(0)` from a pause-gated thread of the bus's own (2026-09-24;
+    before that WHP devices got no waker). **A waker is never a reason to
+    complete work the host has not finished**: a device must be correct when
+    its waker never fires (unit tests, `ENTANGLED_QUEUE_NOTIFY=sync`) — what
+    it holds is served at the next kick. virgl's device-timeline fences may
+    still fall back to phase 1 without one (one GL context, in order); a
+    Venus `ring_idx` fence may not, and stays pending. Bounds that
     are load-bearing: `MAX_PENDING_FENCES` (64, checked *before* asking the
     renderer for a fence), a 2 s watchdog (`FENCE_TIMEOUT`) so a stalled host
     never becomes a stalled guest, immediate answers for failed fenced

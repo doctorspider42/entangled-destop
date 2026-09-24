@@ -217,10 +217,20 @@ pub trait Renderer3d: Send {
     /// Hands the renderer the device's [`HostWaker`], which it may use to ask
     /// for a [`Self::poll_fences`] call from the device's worker context.
     ///
-    /// A renderer that gets no waker (or is given one that cannot deliver)
-    /// must keep answering [`Self::create_fence`] with
-    /// [`FenceOutcome::Signalled`] — i.e. stay on phase 1's synchronous
-    /// model — because nothing would ever complete a deferred response.
+    /// Both hosts' machine layers install one on every device (KVM: the
+    /// ioeventfd worker's queue-0 eventfd; WHP: `machine_x86::host_wake`).
+    /// Without one, a deferred response is still completed — the device
+    /// polls on every notify — just not until the guest next kicks it.
+    ///
+    /// What a renderer may do without a waker depends on the timeline. On the
+    /// **device timeline** a renderer may stay on phase 1's synchronous model
+    /// and answer [`Self::create_fence`] with [`FenceOutcome::Signalled`]:
+    /// every command there runs on one host context in submission order, so
+    /// nothing the guest does next can overtake it. A **ring timeline**
+    /// ([`Self::create_fence_on`] with `ring_idx` ≥ 1) has no such ordering —
+    /// it is a host `VkQueue` running on its own — so its fence must stay
+    /// pending until the work before it is done, waker or not. Signalling it
+    /// early tells the guest its GPU work is finished before it has run.
     fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
         let _ = waker;
     }
@@ -292,7 +302,8 @@ pub trait Renderer3d: Send {
     /// fence goes on the device's one timeline, and [`Self::create_fence`]
     /// decides. A renderer that answers [`FenceTimeline::Ring`] here must
     /// report that fence's retirement through [`Self::poll_fence_timelines`]
-    /// on the same timeline.
+    /// on the same timeline, and — waker or no waker (see
+    /// [`Self::set_host_waker`]) — only once the work before it has run.
     fn create_fence_on(
         &mut self,
         ctx_id: u32,

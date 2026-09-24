@@ -721,6 +721,16 @@ impl HostWaker for CountingWaker {
 /// A device with two queues of family 0, bound to timelines 1 and 2 (host
 /// queue handles 0 and 1), and the device's waker installed.
 fn two_queues(h: &mut Harness<FakeVulkan>) -> Arc<CountingWaker> {
+    two_queues_without_a_waker(h);
+    let waker = Arc::new(CountingWaker::default());
+    h.renderer
+        .set_host_waker(Arc::clone(&waker) as Arc<dyn HostWaker>);
+    waker
+}
+
+/// [`two_queues`] on a device that was never handed a waker — a unit test's
+/// device, or a host configuration whose waker never fires.
+fn two_queues_without_a_waker(h: &mut Harness<FakeVulkan>) {
     boot(h);
     let mut create = create_device(PHYSICAL, DEVICE, Vec::new());
     if let Command::CreateDevice(a) = &mut create {
@@ -744,10 +754,6 @@ fn two_queues(h: &mut Harness<FakeVulkan>) -> Arc<CountingWaker> {
     }
     h.call(&second).unwrap();
     assert!(!h.fatal());
-    let waker = Arc::new(CountingWaker::default());
-    h.renderer
-        .set_host_waker(Arc::clone(&waker) as Arc<dyn HostWaker>);
-    waker
 }
 
 fn ring(ring_idx: u8) -> FenceTimeline {
@@ -880,15 +886,36 @@ fn fence_threads_are_capped_across_every_context_and_given_back() {
     let _ = collect(&mut h, 3, Duration::from_secs(5));
 }
 
+/// The bug every WHP guest had until 2026-09-24: with no waker a ring fence
+/// was answered signalled at once, before the GPU work it guards had run. It
+/// must stay pending while the queue is busy, and be collected by the next
+/// poll once the work is done — the device polls on every notify, so the
+/// guest's next kick is what delivers it.
 #[test]
-fn without_a_waker_a_timeline_fence_is_signalled_at_once() {
+fn without_a_waker_a_timeline_fence_stays_pending_until_the_work_is_done_and_the_device_polls() {
     let host = Arc::new(FakeVulkan::standard());
     let mut h = Harness::new(Arc::clone(&host));
-    with_device(&mut h);
+    two_queues_without_a_waker(&mut h);
+    assert!(!h.renderer.has_host_waker());
+    host.stick_queue(0);
     assert_eq!(
         h.renderer.create_fence_on(CTX, Some(1), 7).unwrap(),
-        (ring(1), FenceOutcome::Signalled)
+        (ring(1), FenceOutcome::Pending),
+        "the queue's GPU work has not run"
     );
+    assert!(
+        collect(&mut h, 1, Duration::from_millis(150)).is_empty(),
+        "nothing retires while the queue is busy"
+    );
+    host.release_queue(0);
+    assert_eq!(
+        collect(&mut h, 1, Duration::from_secs(5)),
+        vec![(ring(1), 7)],
+        "the next poll after the work collects it"
+    );
+    let counts = h.renderer.ring_fence_counts();
+    assert_eq!((counts.deferred, counts.signalled_unrunnable), (1, 0));
+    assert_eq!(host.live("VkFence"), 0);
 }
 
 #[test]
@@ -978,4 +1005,5 @@ fn a_timeline_fence_on_a_lost_device_is_signalled() {
         (ring(1), FenceOutcome::Signalled)
     );
     assert_eq!(host.live("VkFence"), 0, "its host fence is gone");
+    assert_eq!(h.renderer.ring_fence_counts().signalled_unrunnable, 1);
 }

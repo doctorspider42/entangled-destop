@@ -277,9 +277,12 @@ pub enum ShmMapError {
 ///
 /// Portable by design: the trait carries no fd. The Linux machine layer
 /// implements it as an eventfd write into the device's queue-notify worker;
-/// a host (or notify mode) with no worker simply never installs a waker, and
-/// [`VirtioDevice::set_host_waker`]'s default keeps such devices on their
-/// synchronous paths.
+/// a synchronous-kick machine (WHP) runs a host-wake thread that makes the
+/// same queue-0 notify (`machine_x86::host_wake`). A device must still work
+/// with a waker that never fires (unit tests, `ENTANGLED_QUEUE_NOTIFY=sync` on
+/// KVM): whatever it holds is then served at the guest's next kick — later,
+/// never wrongly. In particular a waker is never a reason to complete work
+/// the host has not finished.
 pub trait HostWaker: Send + Sync {
     /// Requests a queue-0 `notify` from the device's worker context. Must be
     /// cheap, non-blocking and callable from any thread.
@@ -296,11 +299,10 @@ pub trait HostWaker: Send + Sync {
 /// worker is up — and a wake that arrives in the gap is remembered and
 /// delivered by [`Self::install`] instead of being lost.
 ///
-/// A `DeferredWaker` that is never filled in is inert, which is exactly what
-/// a host with no worker thread needs: the device sees a waker it can hold,
-/// its wakes go nowhere, and every path that depends on one must therefore
-/// keep a synchronous fallback (`Renderer3d::create_fence` returning
-/// `Signalled`).
+/// A `DeferredWaker` that is never filled in is inert — the KVM path's
+/// `ENTANGLED_QUEUE_NOTIFY=sync` mode, which has no worker: the device sees a
+/// waker it can hold, its wakes go nowhere, and whatever it deferred is served
+/// at the guest's next kick (see [`HostWaker`]).
 #[derive(Default)]
 pub struct DeferredWaker {
     inner: std::sync::Mutex<Option<std::sync::Arc<dyn HostWaker>>>,
@@ -474,10 +476,12 @@ pub trait VirtioDevice: Send {
 
     /// Hands the device a [`HostWaker`] it may use to request service from
     /// its worker context (see the trait docs). Called at most once, before
-    /// the device is attached to a transport, and only on hosts whose notify
-    /// mode runs a worker. The default ignores it — a device with no
-    /// asynchronous host work needs nothing here, and a device that *would*
-    /// use one must keep a synchronous fallback for when none arrives.
+    /// the device is attached to a transport — on both hosts: KVM's attach
+    /// hands over a `DeferredWaker` filled with the queue worker's eventfd,
+    /// the synchronous-kick attach (WHP) one served by its host-wake thread.
+    /// The default ignores it — a device with no asynchronous host work needs
+    /// nothing here, and a device that *would* use one must still be correct
+    /// when none arrives or it never fires (served at the next guest kick).
     fn set_host_waker(&mut self, waker: std::sync::Arc<dyn HostWaker>) {
         let _ = waker;
     }

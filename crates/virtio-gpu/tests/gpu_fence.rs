@@ -462,26 +462,40 @@ struct Harness {
 
 impl Harness {
     fn new(control: FenceControl) -> Self {
-        Self::build(control, 16, None)
+        Self::build(control, 16, None, true)
     }
 
     fn with_ring(control: FenceControl, ring_size: u16) -> Self {
-        Self::build(control, ring_size, None)
+        Self::build(control, ring_size, None, true)
+    }
+
+    /// A device the machine layer never handed a waker: a unit test's, or a
+    /// host configuration whose waker never fires.
+    fn without_waker(control: FenceControl) -> Self {
+        Self::build(control, 16, None, false)
     }
 
     /// A harness whose fence watchdog fires after `timeout` — zero makes the
     /// watchdog observable without a two-second test.
     fn with_fence_timeout(control: FenceControl, timeout: Duration) -> Self {
-        Self::build(control, 16, Some(timeout))
+        Self::build(control, 16, Some(timeout), true)
     }
 
-    fn build(control: FenceControl, ring_size: u16, timeout: Option<Duration>) -> Self {
+    fn build(
+        control: FenceControl,
+        ring_size: u16,
+        timeout: Option<Duration>,
+        waker: bool,
+    ) -> Self {
         let display = DisplayHandle::detached(64, 64).expect("detached display");
         let mut device =
             GpuDevice::with_renderer(display.clone(), Box::new(DeferringRenderer::new(control)));
         // The machine layer hands every device a waker before it reaches its
-        // transport; without one a renderer must not defer at all.
-        device.set_host_waker(Arc::new(CountingWaker::default()));
+        // transport, on both hosts (KVM's queue worker, WHP's host-wake
+        // thread).
+        if waker {
+            device.set_host_waker(Arc::new(CountingWaker::default()));
+        }
         if let Some(timeout) = timeout {
             device.set_fence_timeout(timeout);
         }
@@ -822,6 +836,40 @@ fn fences_on_two_ring_timelines_retire_independently_and_in_order() {
             .collect::<Vec<_>>(),
         vec![0x8003, 0x8004]
     );
+    assert!(!h.needs_reset());
+}
+
+/// A ring-timeline fence on a device with no waker is still held until the
+/// host work behind it is done — never answered because nobody would say
+/// when it finished — and the first kick after the retirement delivers it.
+/// Until 2026-09-24 every WHP guest's Venus fences were answered at once
+/// here, before the GPU work they guard had run.
+#[test]
+fn without_a_waker_a_ring_fence_is_held_until_its_work_is_done_and_the_next_kick_collects_it() {
+    let control = FenceControl::default();
+    let mut h = Harness::without_waker(control.clone());
+    h.open_3d();
+    let ring = FenceTimeline::Ring {
+        ctx_id: 1,
+        ring_idx: 1,
+    };
+    let stream = stream_of(1);
+    assert!(h
+        .run(&submit_3d(1, &stream).fenced(0x9001).on_ring(1))
+        .is_empty());
+    assert_eq!(control.created_on(), vec![(ring, 0x9001)]);
+    // Kicks while the work is not done answer nothing.
+    for _ in 0..3 {
+        h.kick();
+        assert!(h.collect().is_empty(), "answered before its work was done");
+    }
+    control.retire_on(ring, 0x9001);
+    h.kick();
+    let done = h.collect();
+    assert_eq!(done.len(), 1);
+    assert_ok(&done[0]);
+    assert_eq!(done[0].fence_id(), 0x9001);
+    assert_eq!(control.wakes(), 0, "there was no waker to call");
     assert!(!h.needs_reset());
 }
 

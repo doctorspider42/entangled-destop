@@ -3974,3 +3974,112 @@ In order:
    buffer is a page allocation, a driver import and a hypervisor map.
 3. Renderer-wide bounds for host Vulkan objects and for transient decode
    memory, both still per-context and per-thread only.
+
+## Amendment, 2026-09-24 — no early fences: WHP gets a host waker, and the runaway is the idle blank
+
+The capacity amendment above left two leads for the compositor runaway. The
+first, the missing WHP waker, is closed here; it turned out not to be the
+runaway's cause, and the second measurement names what is.
+
+### Fences are never answered before their work
+
+`VenusRenderer::create_fence_on` used to answer a `ring_idx` ≥ 1 fence
+signalled at once when the device had no host waker, on the theory that
+nothing would ever collect a deferred one. Every device on WHP had no waker
+(ADR-0002, the 2026-09-24 amendment), so on that host every fence a guest put
+on a queue's timeline told it the GPU work was done before it had run —
+77 004 of them in the capacity run's final desktop. That fallback is gone.
+A ring fence now goes to its queue's fence thread with or without a waker;
+the waker only decides how soon the device hears of the retirement — at once,
+or at the next poll, which every notify makes. The device timeline keeps its
+phase-1 fallback (one host GL context runs in order, so nothing can overtake
+it); a ring timeline is a `VkQueue` running on its own and has no such
+excuse. Ring 0 (the context's CPU timeline) and fences with no `ring_idx`
+are unchanged: signalled once the context commands before them ran (5b.3).
+The one remaining "signalled at once" is a fence on a context already fatal or
+a device lost, whose work will never run; `RingFenceCounts` counts both
+answers and the usage log carries them (`ring_fences_deferred`,
+`ring_fences_signalled_unrunnable`).
+
+The machine layer now gives WHP a waker (`machine_x86::host_wake`), so both
+hosts defer. Measured in the same stress desktop (Ubuntu 26.04, GNOME on
+zink, WHP, RTX 2070, 13 contexts at the peak):
+
+| | before (capacity run 6) | now |
+|---|---|---|
+| ring fences answered before their work | 78 979 | **0** |
+| ring fences deferred to a fence thread | 0 | 84 308 |
+| answered at once as unrunnable | — | 0 |
+| peak pending ring fences | 0 | 1 |
+| device fence wait, mean / max | — | 331 µs / 33 ms, no watchdog timeout |
+| desktop composite, 13 contexts | ~33 fps | 35–38 fps |
+| glmark2 (FIFO), each of 3 windows | 20–22 FPS | 21–23 FPS |
+| vk-smoke | 9/9 | 9/9 |
+
+Tests: `without_a_waker_a_timeline_fence_stays_pending_until_the_work_is_done_and_the_device_polls`
+(fake Vulkan, a stuck queue), `without_a_waker_a_ring_fence_is_held_until_its_work_is_done_and_the_next_kick_collects_it`
+(the device over a real virtqueue), and the 5b.3 real-GPU test on the RTX 2070
+both ways: `a_timeline_fence_retires_after_the_real_gpu_work_before_it` and
+`without_a_waker_a_timeline_fence_still_waits_for_the_real_gpu_work` — a
+32 MiB fill, every word present when the fence is collected, ~38 ms after
+the submit either way.
+
+### The runaway persists, and it starts when the screen blanks
+
+Deferring the fences did not change the runaway: gnome-shell's context again
+went from 50 memory blobs to 561 (1 066 MiB) in ten seconds and was refused at
+its 1 GiB share (`size=1920000`, then `vkBindBufferMemory2 … names no
+VkDeviceMemory`), which ended its context and the session. What the new run
+added is *when*. The log line just before it, every time:
+
+| Run | `virtio-gpu scanout disabled` | first refusal | gdm (re)start → blank |
+|---|---|---|---|
+| capacity 5 | 16:48:07 | 16:48:15 | 5 min 22 s |
+| capacity 6 | 17:05:00 | 17:05:10 | 5 min 21 s |
+| this run | 18:12:10.19 | 18:12:17.77 | 5 min 22 s |
+| this run, the restarted session | 18:17:34 | (VM powered off) | 5 min 11 s |
+
+The last virtio-gpu frame was presented at 18:12:08; the scanout was
+disabled at 18:12:10; the allocations began in the same second. A scanout
+the guest turns off five minutes after its session starts, again five
+minutes after the next one, with no input in between, is GNOME's idle blank
+(`org.gnome.desktop.session idle-delay`, 300 s by default): mutter turns the
+CRTC off and stops painting. The clients keep committing frames — mutter keeps
+answering frame callbacks for surfaces it is not painting — and each commit
+of an 800×600 client is uploaded at once: a fresh host-visible allocation of
+exactly 800 × 600 × 4 = 1 920 000 bytes in gnome-shell's context, zink's
+texture-upload staging buffer (3 840 000 for vkmark's, 2 MiB slabs beside
+them). zink frees a staging buffer only when its batch completes, and a batch
+of a compositor that is not painting is never submitted; zink's own backstop
+flush is at 80 % of the device-local heaps (6.4 GB here), far above the
+1 GiB share at which this renderer refuses. So the runaway is the guest's
+compositor holding every upload of a blanked screen until something refuses
+it, and the fences are not involved: nothing is submitted, so nothing waits.
+
+What is ours and what is not:
+
+- The blank itself is guest policy, and a `SET_SCANOUT` of resource 0 is
+  honoured correctly.
+- The unbounded hold is mutter + zink behaviour; the same compositor on a
+  host-memory-rich native driver would run until zink's 80 % flush.
+- The *crash* is the interaction with our share: zink sizes its backstop from
+  the heap sizes the renderer reports, and those are the host GPU's, not the
+  budget this renderer enforces. Reporting heap sizes that reflect the budget
+  (or a `VK_EXT_memory_budget` that does) would let zink flush before the
+  refusal, but it changes what every guest application is told about VRAM,
+  so it is a decision for the stage that takes this on, not a contained fix.
+
+Also seen in the same run, and the same mechanism from the client side: two
+glmark2 processes whose compositor had died kept allocating and freeing a
+1 921 024-byte host-visible buffer per frame, ~155/s each, for eight minutes
+— freed every time, so not a leak, but the host-visible allocation throughput
+the "next limits" list names.
+
+Next limits, revised:
+
+1. The blanked-compositor hold: heap sizes or a memory budget that make zink
+   flush before the share refuses, or a guest-side setting for the demo
+   image (`idle-delay 0`) in the meantime.
+2. Host-visible allocation throughput (unchanged).
+3. Renderer-wide bounds for host Vulkan objects and transient decode memory
+   (unchanged).

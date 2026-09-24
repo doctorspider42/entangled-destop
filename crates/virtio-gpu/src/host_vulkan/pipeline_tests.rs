@@ -1062,13 +1062,27 @@ impl virtio_core::HostWaker for Wakes {
 /// word of which is already there when the retirement is collected.
 #[test]
 fn a_timeline_fence_retires_after_the_real_gpu_work_before_it() {
+    timeline_fence_after_real_gpu_work(true);
+}
+
+/// The same with no waker at all — every WHP device until 2026-09-24, when
+/// the fence was answered signalled before the fill had run. It must be
+/// pending, and the poll that collects it must find every word written.
+#[test]
+fn without_a_waker_a_timeline_fence_still_waits_for_the_real_gpu_work() {
+    timeline_fence_after_real_gpu_work(false);
+}
+
+fn timeline_fence_after_real_gpu_work(with_waker: bool) {
     const SIZE: u64 = 32 << 20;
     const WORDS: usize = (SIZE / 4) as usize;
     let Some(host) = host() else { return };
     let mut h = setup_1_3(host);
     let wakes = Arc::new(Wakes::default());
-    h.renderer
-        .set_host_waker(Arc::clone(&wakes) as Arc<dyn virtio_core::HostWaker>);
+    if with_waker {
+        h.renderer
+            .set_host_waker(Arc::clone(&wakes) as Arc<dyn virtio_core::HostWaker>);
+    }
     let data = buffer(&mut h, 0x800, SIZE, USAGE_TRANSFER_DST, true);
     data.write_words(&vec![0; WORDS]);
     let tw = (STAGE_TRANSFER, ACCESS_TRANSFER_WRITE);
@@ -1107,14 +1121,19 @@ fn a_timeline_fence_retires_after_the_real_gpu_work_before_it() {
         .filter(|w| **w != 0x1000_0007)
         .count();
     eprintln!(
-        "ring fence: retired {elapsed:?} after the submit, {wrong} of {WORDS} words wrong, {} wakes",
+        "ring fence (waker: {with_waker}): retired {elapsed:?} after the submit, {wrong} of {WORDS} words wrong, {} wakes",
         wakes.0.load(std::sync::atomic::Ordering::SeqCst)
     );
     assert_eq!(
         wrong, 0,
         "every word the GPU wrote before the fence is there"
     );
-    assert!(wakes.0.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    assert_eq!(
+        wakes.0.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        with_waker,
+        "a waker, when there is one, is how the device hears of it"
+    );
+    assert_eq!(h.renderer.ring_fence_counts().deferred, 1);
     teardown(h);
 }
 

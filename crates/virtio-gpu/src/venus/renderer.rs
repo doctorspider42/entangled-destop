@@ -696,6 +696,25 @@ pub struct RingFence {
 /// watchdog already answered them); the oldest of those are dropped.
 pub const MAX_RETIRED_RING_FENCES: usize = 4 * crate::MAX_PENDING_FENCES;
 
+/// How the renderer answered the fences on a context's `ring_idx` timelines
+/// 1..64 (stage 5b.3), since it was created: diagnostics, logged with the
+/// usage line (target `virtio_gpu::venus::usage`).
+///
+/// There is no "answered early" counter because there is no such answer any
+/// more: until 2026-09-24 a device with no host waker — every device on WHP —
+/// had each of these fences signalled at once, before the GPU work it guards
+/// had run (77 004 of them in one desktop run). Now a fence is either
+/// deferred until its queue's work is done, or answered at once because that
+/// work will never run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RingFenceCounts {
+    /// Handed to the queue's fence thread; retired after the work before it.
+    pub deferred: u64,
+    /// Answered signalled without waiting, because the context is already
+    /// fatal or the device is lost: nothing more will ever run on it.
+    pub signalled_unrunnable: u64,
+}
+
 #[derive(Default)]
 struct RetireState {
     retired: Mutex<Vec<RingFence>>,
@@ -769,9 +788,10 @@ impl FenceRetirer {
         self.len() == 0
     }
 
-    /// Whether the device has handed over a waker. Without one nothing would
-    /// ever collect a retirement, so no fence may be deferred
-    /// ([`Renderer3d::set_host_waker`]).
+    /// Whether the device has handed over a waker. Without one a retirement
+    /// is still recorded, and collected the next time the device polls — a
+    /// fence is never answered before its work because nobody would say when
+    /// it finished (2026-09-24, ADR-0004).
     #[must_use]
     pub fn has_waker(&self) -> bool {
         self.waker().is_some()
@@ -2323,6 +2343,8 @@ pub struct VenusRenderer<F> {
     /// Ring fences the factory retired, for the device to collect (stage
     /// 5b.3).
     retirer: FenceRetirer,
+    /// How the ring fences asked for so far were answered.
+    ring_fences: RingFenceCounts,
     /// The most of everything a cap bounds this renderer has held since the
     /// last reset ([`VenusUsage`]).
     peak: VenusUsage,
@@ -2384,6 +2406,7 @@ impl<F> VenusRenderer<F> {
             quiesce: Quiesce::new(),
             live: LiveThreads::new(),
             retirer: FenceRetirer::default(),
+            ring_fences: RingFenceCounts::default(),
             peak: VenusUsage::default(),
             peak_unlogged: false,
             sampled: None,
@@ -2501,6 +2524,18 @@ impl<F> VenusRenderer<F> {
             .monitor
             .as_ref()
             .map(RingMonitor::period)
+    }
+
+    /// Whether the device has handed this renderer a host waker.
+    #[must_use]
+    pub fn has_host_waker(&self) -> bool {
+        self.retirer.has_waker()
+    }
+
+    /// How the ring fences asked for so far were answered ([`RingFenceCounts`]).
+    #[must_use]
+    pub fn ring_fence_counts(&self) -> RingFenceCounts {
+        self.ring_fences
     }
 
     /// Ring workers and monitors running right now. Zero after a
@@ -2787,6 +2822,8 @@ impl<F: SinkFactory> VenusRenderer<F> {
             host_visible_bytes = now.factory.host_visible_bytes,
             objects = now.factory.objects,
             pending_ring_fences = now.factory.pending_ring_fences,
+            ring_fences_deferred = self.ring_fences.deferred,
+            ring_fences_signalled_unrunnable = self.ring_fences.signalled_unrunnable,
             peak_contexts = peak.contexts,
             peak_rings = peak.rings,
             peak_context_rings = peak.max_context_rings,
@@ -3692,9 +3729,13 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
     /// have been executed by the time the device asks. `ring_idx` 0 is the
     /// context's CPU timeline, retired the same way for the same reason
     /// (`vkr_context_submit_fence`). Every other `ring_idx` goes to the
-    /// factory, which puts a host fence on the queue bound to it; without a
-    /// waker nothing would collect it, so it is signalled at once instead
-    /// (the trait's contract).
+    /// factory, which puts a host fence on the queue bound to it, and the
+    /// fence is pending until that queue's work before it is done — **with or
+    /// without a waker**. The waker only decides how soon the device hears of
+    /// the retirement: at once, or the next time it polls. Answering a fence
+    /// signalled because no waker was installed would tell the guest its GPU
+    /// work is finished before it has run, which is what every WHP guest was
+    /// told until the machine layer gave that host a waker (2026-09-24).
     fn create_fence_on(
         &mut self,
         ctx_id: u32,
@@ -3711,21 +3752,31 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         if !self.contexts.contains_key(&ctx_id) {
             return Err(VenusError::UnknownContext(ctx_id).into());
         }
-        if !self.retirer.has_waker() {
-            tracing::debug!(
-                ctx_id,
-                ring_idx,
-                "no host waker: a venus queue fence completes synchronously"
-            );
-            return Ok((timeline, FenceOutcome::Signalled));
-        }
         let fence = RingFence {
             ctx_id,
             ring_idx,
             fence_id,
         };
         match self.sinks.create_ring_fence(fence, &self.retirer) {
-            Ok(outcome) => Ok((timeline, outcome)),
+            Ok(outcome) => {
+                match outcome {
+                    FenceOutcome::Pending => {
+                        self.ring_fences.deferred = self.ring_fences.deferred.saturating_add(1);
+                    }
+                    FenceOutcome::Signalled => {
+                        self.ring_fences.signalled_unrunnable =
+                            self.ring_fences.signalled_unrunnable.saturating_add(1);
+                        tracing::debug!(
+                            ctx_id,
+                            ring_idx,
+                            fence_id,
+                            "a venus queue fence on a fatal context or a lost device is \
+                             signalled at once: its work will never run"
+                        );
+                    }
+                }
+                Ok((timeline, outcome))
+            }
             Err(why) => Err(VenusError::RingFence {
                 ctx_id,
                 ring_idx,
