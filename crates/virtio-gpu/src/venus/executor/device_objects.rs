@@ -131,10 +131,9 @@ impl<H: HostVulkan> Resolver<'_, H> {
             Kind::ImageView => Ok(self.objects.image_view(device, id)?.host.raw()),
             Kind::DeviceMemory => Ok(self.objects.memory(device, id)?.host.raw()),
             Kind::CommandPool => Ok(self.objects.pool(device, id)?.host.raw()),
-            Kind::Instance | Kind::PhysicalDevice | Kind::Semaphore => {
-                // Never named by a device-level structure this stage serves
-                // (a semaphore is refused before translation); an id of one
-                // is refused as what it is.
+            Kind::Instance | Kind::PhysicalDevice => {
+                // Never named by a device-level structure this renderer
+                // serves; an id of one is refused as what it is.
                 self.objects.check(id, kind)?;
                 Err(IdError::Unknown {
                     id,
@@ -163,9 +162,6 @@ impl<H: HostVulkan> Resolve for Resolver<'_, H> {
                 field: what,
                 error: IdError::Zero(kind.name()),
             });
-        }
-        if kind == Kind::Semaphore {
-            return Err(ExecError::Semaphore(self.command));
         }
         self.lookup(kind, id).map_err(|error| ExecError::IdIn {
             command: self.command,
@@ -327,6 +323,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.create(command, Kind::PrivateDataSlot, Facts::None, 0)
             }
             Command::CreateFence(_) => self.create(command, Kind::Fence, Facts::None, 0),
+            Command::CreateSemaphore(_) => self.create_semaphore(command),
 
             Command::DestroyShaderModule(args) => {
                 self.destroy(Kind::ShaderModule, args.device.0, args.shader_module.0)
@@ -379,6 +376,27 @@ impl<H: HostVulkan> VulkanContext<H> {
             // Waits for the queues first, so a fence a queue's record
             // stands on is never destroyed while that work may run.
             Command::DestroyFence(args) => self.destroy(Kind::Fence, args.device.0, args.fence.0),
+            // Likewise: nothing submitted that waits on or signals it may
+            // still be running when it goes.
+            Command::DestroySemaphore(args) => {
+                self.destroy(Kind::Semaphore, args.device.0, args.semaphore.0)
+            }
+            Command::GetSemaphoreCounterValue(args) => {
+                self.require_timeline(
+                    "vkGetSemaphoreCounterValue",
+                    args.device.0,
+                    args.semaphore.0,
+                )?;
+                self.pass_through(command)
+            }
+            Command::SignalSemaphore(args) => {
+                const NAME: &str = "vkSignalSemaphore";
+                let Some(info) = &args.p_signal_info else {
+                    return Err(invalid(NAME, "pSignalInfo is null"));
+                };
+                self.require_timeline(NAME, args.device.0, info.semaphore.0)?;
+                self.pass_through(command)
+            }
 
             // ------------------------------------------- descriptor sets
             Command::AllocateDescriptorSets(args) => {
@@ -561,10 +579,46 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::ResetCommandPool(_) | Command::ResetCommandBuffer(_) => {
                 self.pass_through(command)
             }
+            Command::BeginCommandBuffer(args) => {
+                // A secondary recorded for dynamic rendering (stage 5b.3)
+                // inherits its colour formats, which a driver keeps in an
+                // array of maxColorAttachments.
+                use crate::venus::protocol::VkCommandBufferInheritanceInfoNext as N;
+                const NAME: &str = "vkBeginCommandBuffer";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                let limit = self.limits(NAME, device)?.max_color_attachments;
+                let inherited = args
+                    .p_begin_info
+                    .iter()
+                    .filter_map(|b| b.p_inheritance_info.as_ref())
+                    .flat_map(|i| i.p_next.iter())
+                    .any(|l| {
+                        matches!(l, N::VkCommandBufferInheritanceRenderingInfo(r)
+                            if r.color_attachment_count > limit)
+                    });
+                if inherited {
+                    return Err(invalid(
+                        NAME,
+                        "inherited rendering with more colour attachments than maxColorAttachments",
+                    ));
+                }
+                self.pass_through(command)
+            }
+            Command::CmdBeginRendering(args) => {
+                const NAME: &str = "vkCmdBeginRendering";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                if let Some(info) = &args.p_rendering_info {
+                    self.check_rendering(NAME, device, info)?;
+                }
+                self.pass_through(command)
+            }
 
             // --------------------------------------- fences and submission
             Command::ResetFences(_) => self.reset_fences(command),
-            Command::WaitForFences(_) | Command::QueueWaitIdle(_) | Command::DeviceWaitIdle(_) => {
+            Command::WaitForFences(_)
+            | Command::WaitSemaphores(_)
+            | Command::QueueWaitIdle(_)
+            | Command::DeviceWaitIdle(_) => {
                 // One slice with no time left: the ring worker drives the
                 // real, sliced wait (`ExecutingSink`); a caller that reaches
                 // past it gets an answer that does not block.
@@ -1076,9 +1130,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             }
 
             other if generated::is_pass_through(other) => self.pass_through(other),
-            other => Err(ExecError::NotImplemented {
-                command: other.name(),
-            }),
+            other => self.dispatch_extension(other),
         }
     }
 
@@ -1119,7 +1171,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             .device_and_guest(device)
             .map_err(id_error(name))?;
         let wanted = generated::min_api(command);
-        let have = guest.properties.properties.api_version;
+        let have = guest.api_version();
         let version = |v: u32| (v >> 22, (v >> 12) & 0x3ff);
         if wanted == 0 || version(wanted) > version(have) {
             let (major, minor) = version(wanted);
@@ -1512,6 +1564,69 @@ impl<H: HostVulkan> VulkanContext<H> {
             ));
         }
         Ok(())
+    }
+
+    /// A dynamic-rendering scope (stage 5b.3), bounded as a render pass's
+    /// attachments are: colour attachments inside `maxColorAttachments` (the
+    /// driver keeps them in an array of that size), a layer count, a view
+    /// mask inside `maxMultiviewViewCount`, and a nonzero render area. Every
+    /// view is translated like any other id (of this device, or null where
+    /// Vulkan lets an attachment be absent), and every layout, load and
+    /// store op and resolve mode is range-checked by the generated walk.
+    fn check_rendering(
+        &self,
+        command: &'static str,
+        device: u64,
+        info: &crate::venus::protocol::VkRenderingInfo,
+    ) -> Result<(), ExecError> {
+        let limits = self.limits(command, device)?;
+        if info.color_attachment_count > limits.max_color_attachments {
+            return Err(invalid(
+                command,
+                format!(
+                    "{} colour attachments, past maxColorAttachments {}",
+                    info.color_attachment_count, limits.max_color_attachments
+                ),
+            ));
+        }
+        let views = self.max_multiview_views(command, device)?;
+        if info.view_mask != 0 && 32 - info.view_mask.leading_zeros() > views {
+            return Err(invalid(
+                command,
+                format!(
+                    "view mask {:#x} past maxMultiviewViewCount {views}",
+                    info.view_mask
+                ),
+            ));
+        }
+        if info.view_mask == 0 && info.layer_count == 0 {
+            return Err(invalid(command, "a layer count of 0 without multiview"));
+        }
+        if info.render_area.extent.width == 0 || info.render_area.extent.height == 0 {
+            return Err(invalid(command, "an empty render area"));
+        }
+        Ok(())
+    }
+
+    /// `maxMultiviewViewCount` as the guest was told it (0 when the host's
+    /// chain did not carry it: no multiview).
+    fn max_multiview_views(&self, command: &'static str, device: u64) -> Result<u32, ExecError> {
+        use crate::venus::protocol::VkPhysicalDeviceProperties2Next as N;
+        let (_, guest) = self
+            .objects
+            .device_and_guest(device)
+            .map_err(id_error(command))?;
+        Ok(guest
+            .properties
+            .p_next
+            .iter()
+            .find_map(|l| match l {
+                N::VkPhysicalDeviceVulkan11Properties(p) => Some(p.max_multiview_view_count),
+                N::VkPhysicalDeviceMultiviewProperties(p) => Some(p.max_multiview_view_count),
+                _ => None,
+            })
+            .unwrap_or(0)
+            .min(32))
     }
 
     /// The layout facts of descriptor set `set`.
@@ -2084,6 +2199,20 @@ fn check_graphics_state(
                 command,
                 "more blend attachments than maxColorAttachments",
             ));
+        }
+    }
+    // A pipeline for dynamic rendering (stage 5b.3) names its colour
+    // formats instead of a render pass, as many as a begin may bind.
+    for link in &info.p_next {
+        if let crate::venus::protocol::VkGraphicsPipelineCreateInfoNext::VkPipelineRenderingCreateInfo(r) =
+            link
+        {
+            if r.color_attachment_count > limits.max_color_attachments {
+                return Err(invalid(
+                    command,
+                    "more rendering colour formats than maxColorAttachments",
+                ));
+            }
         }
     }
     Ok(())

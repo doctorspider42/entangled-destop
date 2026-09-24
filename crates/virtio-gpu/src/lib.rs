@@ -92,7 +92,7 @@ pub use device::{
     NUM_QUEUES, NUM_SCANOUTS, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
 };
 pub use error::CommandError;
-pub use fence::{FenceQueue, MAX_PENDING_FENCES};
+pub use fence::{FenceQueue, FenceTimeline, MAX_PENDING_FENCES};
 pub use null_renderer::{
     loopback_signature, NullRenderer, LOOPBACK_MAGIC, LOOPBACK_SIGNATURE_LEN,
     NULL_HOST_VISIBLE_BYTES,

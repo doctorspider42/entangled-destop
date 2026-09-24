@@ -343,13 +343,17 @@ pub struct VenusCapset {
     /// Each `VkQueue` gets its own virtio-gpu fence timeline, named by the
     /// header's `ring_idx` (`ring_idx == 0` is reserved for CPU fences).
     ///
-    /// **False for us**, and this one is a device capability rather than a
-    /// renderer capability: [`FenceQueue`](crate::FenceQueue) retires fences
-    /// strictly in submission order on one timeline. Advertising per-queue
-    /// timelines over a single FIFO would let a guest wait on a later queue's
-    /// fence that cannot retire until an unrelated earlier queue's does.
-    /// Flipping this to `true` means giving the fence table one FIFO per
-    /// `ring_idx` first.
+    /// It takes two things, and both exist since EPIC 20 stage 5b.3: a device
+    /// whose fence table keeps one FIFO per `(context, ring_idx)`
+    /// ([`FenceQueue`](crate::FenceQueue) and
+    /// [`FenceTimeline`](crate::FenceTimeline)), so a later queue's fence
+    /// never waits behind an unrelated earlier queue's; and a renderer that
+    /// retires a fence on a queue's timeline when that queue's work is done.
+    /// [`Self::new`] says **false**, because a renderer that executes nothing
+    /// (a capture) has no queue to retire one on; the Venus renderer sets it
+    /// from its sink factory (`SinkFactory::retires_ring_fences`), which is
+    /// **true** for the executor. Mesa only asserts the bit and binds every
+    /// queue to a timeline regardless.
     ///
     /// Note again that this `ring_idx` is *not* the Venus command ring of
     /// [`super::ring`]; see the module docs.
@@ -885,8 +889,9 @@ mod tests {
         // A blocking wait blocks virglrenderer's render-server process, not a
         // queue-serving thread of this device (ADR-0004).
         assert_eq!(words[word::ALLOW_VK_WAIT_SYNCS], 1);
-        // One fence timeline, because FenceQueue retires strictly in
-        // submission order. See the field docs before flipping this.
+        // No queue timelines by default: a renderer that executes nothing has
+        // no queue to retire a fence on. The executing one turns this on
+        // (`VenusRenderer::new`, from its factory); see the field docs.
         assert_eq!(words[word::SUPPORTS_MULTIPLE_TIMELINES], 0);
         // Exactly what the executor admits, sentinel set — never the all-zero
         // "assume everything" mask, and no longer the whole decodable table.

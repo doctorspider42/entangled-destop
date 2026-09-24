@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use super::host::HostVulkan;
 use super::policy::GuestDevice;
+use super::timeline::QueueSync;
 use crate::venus::shmem::RingPages;
 
 /// Most objects one context may hold. A guest id names a host allocation,
@@ -94,8 +95,7 @@ pub enum Kind {
     Fence,
     /// `VkPrivateDataSlot`.
     PrivateDataSlot,
-    /// `VkSemaphore`: named by the protocol, never created by this stage
-    /// (stage 5b.3), so every id of it is unknown.
+    /// `VkSemaphore` (stage 5b.3).
     Semaphore,
 }
 
@@ -217,8 +217,10 @@ pub struct CreatedQueue {
 
 /// A `VkDevice`.
 pub struct DeviceObject<H: HostVulkan> {
-    /// The host device.
-    pub host: H::Device,
+    /// The host device. Shared with the fence threads of its queues
+    /// ([`super::timeline::QueueSync`]), which [`Objects::destroy_device`]
+    /// joins before the device goes.
+    pub host: Arc<H::Device>,
     /// The guest id of its physical device.
     pub physical: u64,
     /// Every queue it was created with.
@@ -241,6 +243,9 @@ pub struct QueueObject<H: HostVulkan> {
     pub family: u32,
     /// What is known of the work submitted to it (stage 5b.2).
     pub pending: Pending,
+    /// The thread retiring virtio-gpu fences on its `ring_idx` (stage
+    /// 5b.3), started by the first one.
+    pub sync: Option<QueueSync<H>>,
 }
 
 /// What the executor knows of the work a queue may still be running: enough
@@ -496,6 +501,40 @@ pub enum Facts {
         /// The count of the layout's variable binding, for this set.
         variable: u32,
     },
+    /// A semaphore (stage 5b.3), and — for a binary one — the state its
+    /// payload is in as the executor has seen the guest drive it.
+    Semaphore(SemaphoreState),
+}
+
+/// What the executor knows of a semaphore (stage 5b.3).
+///
+/// A binary semaphore's state is tracked from what the guest submits,
+/// because two of its operations have no host counterpart on a Windows
+/// host — a temporary import of an already-signalled sync file
+/// (`vkImportSemaphoreResourceMESA`, resource 0) is `temporary`, and is
+/// consumed by the next wait without the host ever seeing that wait — and
+/// because a binary wait with nothing to wait for, or a signal of one
+/// already signalled, is a host GPU that waits forever or a driver's
+/// invalid usage, and is refused before it reaches either.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SemaphoreState {
+    /// `VK_SEMAPHORE_TYPE_TIMELINE`. Nothing else is tracked for one: its
+    /// waits may precede their signals, and its value is the host's.
+    pub timeline: bool,
+    /// Binary: a signal operation was submitted and no wait has consumed
+    /// it yet (its permanent payload is, or will be, signalled).
+    pub pending: bool,
+    /// Binary: a signalled temporary payload is imported, and the next wait
+    /// consumes it instead of the permanent one.
+    pub temporary: bool,
+}
+
+impl SemaphoreState {
+    /// Whether a wait now has something to wait for.
+    #[must_use]
+    pub fn waitable(&self) -> bool {
+        self.timeline || self.pending || self.temporary
+    }
 }
 
 /// A stage-5b.2 object: every kind whose host object is a plain Vulkan
@@ -534,6 +573,7 @@ pub const RAW_TEARDOWN_ORDER: &[Kind] = &[
     Kind::QueryPool,
     Kind::Event,
     Kind::Fence,
+    Kind::Semaphore,
     Kind::PrivateDataSlot,
 ];
 
@@ -881,6 +921,25 @@ impl<H: HostVulkan> Objects<H> {
         self.queues.values().any(|queue| queue.ring_idx == ring_idx)
     }
 
+    /// The queue bound to fence timeline `ring_idx`, by guest id.
+    #[must_use]
+    pub fn queue_on_ring(&self, ring_idx: u32) -> Option<u64> {
+        self.queues
+            .iter()
+            .find(|(_, queue)| queue.ring_idx == ring_idx)
+            .map(|(id, _)| *id)
+    }
+
+    /// Ring fences created on every queue and not yet retired.
+    #[must_use]
+    pub fn pending_ring_fences(&self) -> usize {
+        self.queues
+            .values()
+            .filter_map(|queue| queue.sync.as_ref())
+            .map(QueueSync::pending)
+            .sum()
+    }
+
     /// The queue `id` names.
     ///
     /// # Errors
@@ -975,6 +1034,15 @@ impl<H: HostVulkan> Objects<H> {
             id,
             expected: kind.name(),
         })
+    }
+
+    /// The stage-5b.2 object `id` names, mutably, which must be a `kind` of
+    /// `device`.
+    ///
+    /// # Errors
+    /// As [`Self::raw`].
+    pub fn raw_mut(&mut self, kind: Kind, device: u64, id: u64) -> Result<&mut RawObject, IdError> {
+        child_in_mut(&mut self.raw, &self.kinds, kind, device, id)
     }
 
     /// Take stage-5b.2 object `id` (a `kind` of `device`) out of the table;
@@ -1216,10 +1284,31 @@ impl<H: HostVulkan> Objects<H> {
             return;
         };
         self.kinds.remove(&id);
+        // The fence threads of its queues first (stage 5b.3): each is told
+        // to stop, then joined — within one wait slice, and none takes a lock
+        // the caller holds — so none is waiting on the device when it goes.
+        let mut syncs: Vec<QueueSync<H>> = self
+            .queues
+            .values_mut()
+            .filter(|queue| queue.device == id)
+            .filter_map(|queue| queue.sync.take())
+            .collect();
+        for sync in &syncs {
+            sync.signal_stop();
+        }
+        for sync in &mut syncs {
+            sync.join();
+        }
         // Nothing may be freed under work the GPU is still doing: vkr waits
         // on its worker thread the same way (`vkr_device_destroy`). A lost
         // device answers at once, and its objects may still be destroyed.
         let _ = host.device_wait_idle(&device.host);
+        // The fences the threads had not seen signal have now (the device is
+        // idle): destroyed, and retired in order, as vkr retires a queue's
+        // outstanding syncs when it goes (`vkr_queue_sync_thread_fini`).
+        for sync in syncs {
+            sync.finish(host, &device.host);
+        }
         let raw = children_of(&self.raw, id);
         // Pool children leave the table only: their pools free them.
         for child in &raw {
@@ -1293,7 +1382,16 @@ impl<H: HostVulkan> Objects<H> {
             self.queues.remove(&child);
             self.kinds.remove(&child);
         }
-        host.destroy_device(device.host);
+        match Arc::try_unwrap(device.host) {
+            Ok(handle) => host.destroy_device(handle),
+            // Every fence thread holding a clone was joined above; one that
+            // was not would be a thread still able to call the device, so it
+            // is leaked rather than destroyed under it.
+            Err(_) => tracing::error!(
+                device = format_args!("{id:#x}"),
+                "a host VkDevice is still shared at destruction and is leaked"
+            ),
+        }
     }
 
     /// Destroy the instance and everything under it. After this the table is

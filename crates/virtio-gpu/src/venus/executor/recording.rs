@@ -760,3 +760,323 @@ pub fn reset_fences(device: u64, fences: &[u64]) -> Command<'static> {
         ret: 0,
     })
 }
+
+// ------------------------------------------------ stage 5b.3: semaphores
+
+pub const SEMAPHORE: u64 = 0xe0;
+
+/// `vkCreateSemaphore` as `vn_CreateSemaphore` sends it: a timeline one
+/// with `initial` when `timeline` is `Some`, and a
+/// `VkExportSemaphoreCreateInfo` of `export` when that is nonzero.
+pub fn create_semaphore(
+    device: u64,
+    id: u64,
+    timeline: Option<u64>,
+    export: u32,
+) -> Command<'static> {
+    let mut p_next = Vec::new();
+    if let Some(initial) = timeline {
+        p_next.push(VkSemaphoreCreateInfoNext::VkSemaphoreTypeCreateInfo(
+            VkSemaphoreTypeCreateInfo {
+                semaphore_type: 1,
+                initial_value: initial,
+            },
+        ));
+    }
+    if export != 0 {
+        p_next.push(VkSemaphoreCreateInfoNext::VkExportSemaphoreCreateInfo(
+            VkExportSemaphoreCreateInfo {
+                handle_types: export,
+            },
+        ));
+    }
+    Command::CreateSemaphore(CreateSemaphoreArgs {
+        device: VkDevice(device),
+        p_create_info: Some(VkSemaphoreCreateInfo { p_next, flags: 0 }),
+        p_semaphore: Some(VkSemaphore(id)),
+        ret: 0,
+    })
+}
+
+pub fn destroy_semaphore(device: u64, id: u64) -> Command<'static> {
+    Command::DestroySemaphore(DestroySemaphoreArgs {
+        device: VkDevice(device),
+        semaphore: VkSemaphore(id),
+    })
+}
+
+/// One `vkQueueSubmit` batch of `cbs` that waits on `waits` and signals
+/// `signals`, each `(semaphore, value)`; a `VkTimelineSemaphoreSubmitInfo`
+/// carries the values when `timeline` (vk-smoke check 8's shape).
+pub fn submit_semaphores(
+    queue: u64,
+    cbs: &[u64],
+    waits: &[(u64, u64)],
+    signals: &[(u64, u64)],
+    timeline: bool,
+    fence: u64,
+) -> Command<'static> {
+    let mut p_next = Vec::new();
+    if timeline {
+        p_next.push(VkSubmitInfoNext::VkTimelineSemaphoreSubmitInfo(
+            VkTimelineSemaphoreSubmitInfo {
+                wait_semaphore_value_count: waits.len() as u32,
+                p_wait_semaphore_values: Some(waits.iter().map(|w| w.1).collect()),
+                signal_semaphore_value_count: signals.len() as u32,
+                p_signal_semaphore_values: Some(signals.iter().map(|s| s.1).collect()),
+            },
+        ));
+    }
+    Command::QueueSubmit(QueueSubmitArgs {
+        queue: VkQueue(queue),
+        submit_count: 1,
+        p_submits: Some(vec![VkSubmitInfo {
+            p_next,
+            wait_semaphore_count: waits.len() as u32,
+            p_wait_semaphores: Some(waits.iter().map(|w| VkSemaphore(w.0)).collect()),
+            p_wait_dst_stage_mask: Some(vec![STAGE_TRANSFER; waits.len()]),
+            command_buffer_count: cbs.len() as u32,
+            p_command_buffers: Some(cbs.iter().copied().map(VkCommandBuffer).collect()),
+            signal_semaphore_count: signals.len() as u32,
+            p_signal_semaphores: Some(signals.iter().map(|s| VkSemaphore(s.0)).collect()),
+        }]),
+        fence: VkFence(fence),
+        ret: 0,
+    })
+}
+
+/// The same batch as `vkQueueSubmit2`, as Mesa sends it once the device is
+/// 1.3 (`dev->has_sync2`).
+pub fn submit2_semaphores(
+    queue: u64,
+    cbs: &[u64],
+    waits: &[(u64, u64)],
+    signals: &[(u64, u64)],
+    fence: u64,
+) -> Command<'static> {
+    let info = |(semaphore, value): &(u64, u64)| VkSemaphoreSubmitInfo {
+        semaphore: VkSemaphore(*semaphore),
+        value: *value,
+        stage_mask: u64::from(STAGE_TRANSFER),
+        device_index: 0,
+    };
+    Command::QueueSubmit2(QueueSubmit2Args {
+        queue: VkQueue(queue),
+        submit_count: 1,
+        p_submits: Some(vec![VkSubmitInfo2 {
+            flags: 0,
+            wait_semaphore_info_count: waits.len() as u32,
+            p_wait_semaphore_infos: Some(waits.iter().map(info).collect()),
+            command_buffer_info_count: cbs.len() as u32,
+            p_command_buffer_infos: Some(
+                cbs.iter()
+                    .map(|c| VkCommandBufferSubmitInfo {
+                        command_buffer: VkCommandBuffer(*c),
+                        device_mask: 0,
+                    })
+                    .collect(),
+            ),
+            signal_semaphore_info_count: signals.len() as u32,
+            p_signal_semaphore_infos: Some(signals.iter().map(info).collect()),
+        }]),
+        fence: VkFence(fence),
+        ret: 0,
+    })
+}
+
+/// `vkWaitSemaphores` for every `(semaphore, value)`, as Mesa sends it
+/// asynchronously once the feedback slot shows the value.
+pub fn wait_semaphores(device: u64, values: &[(u64, u64)], timeout: u64) -> Command<'static> {
+    Command::WaitSemaphores(WaitSemaphoresArgs {
+        device: VkDevice(device),
+        p_wait_info: Some(VkSemaphoreWaitInfo {
+            flags: 0,
+            semaphore_count: values.len() as u32,
+            p_semaphores: Some(values.iter().map(|v| VkSemaphore(v.0)).collect()),
+            p_values: Some(values.iter().map(|v| v.1).collect()),
+        }),
+        timeout,
+        ret: 0,
+    })
+}
+
+pub fn signal_semaphore(device: u64, semaphore: u64, value: u64) -> Command<'static> {
+    Command::SignalSemaphore(SignalSemaphoreArgs {
+        device: VkDevice(device),
+        p_signal_info: Some(VkSemaphoreSignalInfo {
+            semaphore: VkSemaphore(semaphore),
+            value,
+        }),
+        ret: 0,
+    })
+}
+
+pub fn counter_value(device: u64, semaphore: u64) -> Command<'static> {
+    Command::GetSemaphoreCounterValue(GetSemaphoreCounterValueArgs {
+        device: VkDevice(device),
+        semaphore: VkSemaphore(semaphore),
+        p_value: Some(0),
+        ret: 0,
+    })
+}
+
+/// `vkImportSemaphoreResourceMESA` as `vn_queue_submission_fix_batch_semaphores`
+/// sends it.
+pub fn import_semaphore_resource(
+    device: u64,
+    semaphore: u64,
+    resource_id: u32,
+) -> Command<'static> {
+    Command::ImportSemaphoreResourceMESA(ImportSemaphoreResourceMESAArgs {
+        device: VkDevice(device),
+        p_import_semaphore_resource_info: Some(VkImportSemaphoreResourceInfoMESA {
+            semaphore: VkSemaphore(semaphore),
+            resource_id,
+        }),
+    })
+}
+
+/// `vkWaitSemaphoreResourceMESA` as `vn_GetSemaphoreFdKHR` sends it.
+pub fn wait_semaphore_resource(device: u64, semaphore: u64) -> Command<'static> {
+    Command::WaitSemaphoreResourceMESA(WaitSemaphoreResourceMESAArgs {
+        device: VkDevice(device),
+        semaphore: VkSemaphore(semaphore),
+    })
+}
+
+/// `vkGetPhysicalDeviceExternalSemaphoreProperties`, as
+/// `vn_physical_device_init_external_semaphore_handles` asks it.
+pub fn external_semaphore_query(
+    physical: u64,
+    handle_type: i32,
+    timeline: bool,
+) -> Command<'static> {
+    let p_next = if timeline {
+        vec![
+            VkPhysicalDeviceExternalSemaphoreInfoNext::VkSemaphoreTypeCreateInfo(
+                VkSemaphoreTypeCreateInfo {
+                    semaphore_type: 1,
+                    initial_value: 0,
+                },
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
+    Command::GetPhysicalDeviceExternalSemaphoreProperties(
+        GetPhysicalDeviceExternalSemaphorePropertiesArgs {
+            physical_device: VkPhysicalDevice(physical),
+            p_external_semaphore_info: Some(VkPhysicalDeviceExternalSemaphoreInfo {
+                p_next,
+                handle_type,
+            }),
+            p_external_semaphore_properties: Some(VkExternalSemaphoreProperties::default()),
+        },
+    )
+}
+
+// ------------------------------------------- stage 5b.3: dynamic rendering
+
+/// vk-smoke's triangle pipeline for dynamic rendering: no render pass, a
+/// `VkPipelineRenderingCreateInfo` naming the one colour format instead.
+pub fn create_dynamic_triangle_pipeline(
+    device: u64,
+    id: u64,
+    module: u64,
+    layout: u64,
+    format: i32,
+    size: u32,
+) -> Command<'static> {
+    let mut command = create_triangle_pipeline(device, id, module, layout, 0, size);
+    if let Command::CreateGraphicsPipelines(a) = &mut command {
+        for info in a.p_create_infos.iter_mut().flatten() {
+            info.p_next.push(
+                VkGraphicsPipelineCreateInfoNext::VkPipelineRenderingCreateInfo(
+                    VkPipelineRenderingCreateInfo {
+                        view_mask: 0,
+                        color_attachment_count: 1,
+                        p_color_attachment_formats: Some(vec![format]),
+                        depth_attachment_format: 0,
+                        stencil_attachment_format: 0,
+                    },
+                ),
+            );
+        }
+    }
+    command
+}
+
+/// `vkCmdBeginRendering` of one colour attachment, `view`, cleared to
+/// `clear` and stored, over `size`².
+pub fn begin_rendering(cb: u64, view: u64, size: u32, clear: [f32; 4]) -> Command<'static> {
+    Command::CmdBeginRendering(CmdBeginRenderingArgs {
+        command_buffer: VkCommandBuffer(cb),
+        p_rendering_info: Some(VkRenderingInfo {
+            p_next: Vec::new(),
+            flags: 0,
+            render_area: VkRect2D {
+                offset: VkOffset2D { x: 0, y: 0 },
+                extent: VkExtent2D {
+                    width: size,
+                    height: size,
+                },
+            },
+            layer_count: 1,
+            view_mask: 0,
+            color_attachment_count: 1,
+            p_color_attachments: Some(vec![VkRenderingAttachmentInfo {
+                image_view: VkImageView(view),
+                image_layout: 2, // COLOR_ATTACHMENT_OPTIMAL
+                resolve_mode: 0,
+                resolve_image_view: VkImageView(0),
+                resolve_image_layout: 0,
+                load_op: 1,  // CLEAR
+                store_op: 0, // STORE
+                clear_value: VkClearValue::Color(VkClearColorValue::Float32(clear)),
+            }]),
+            p_depth_attachment: None,
+            p_stencil_attachment: None,
+        }),
+    })
+}
+
+pub fn end_rendering(cb: u64) -> Command<'static> {
+    Command::CmdEndRendering(CmdEndRenderingArgs {
+        command_buffer: VkCommandBuffer(cb),
+    })
+}
+
+/// One image layout transition through `vkCmdPipelineBarrier2` (core 1.3):
+/// `(stage, access)` pairs in the 64-bit flags of sync2.
+pub fn image_barrier2(
+    cb: u64,
+    image: u64,
+    layouts: (i32, i32),
+    src: (u64, u64),
+    dst: (u64, u64),
+) -> Command<'static> {
+    Command::CmdPipelineBarrier2(CmdPipelineBarrier2Args {
+        command_buffer: VkCommandBuffer(cb),
+        p_dependency_info: Some(VkDependencyInfo {
+            dependency_flags: 0,
+            memory_barrier_count: 0,
+            p_memory_barriers: None,
+            buffer_memory_barrier_count: 0,
+            p_buffer_memory_barriers: None,
+            image_memory_barrier_count: 1,
+            p_image_memory_barriers: Some(vec![VkImageMemoryBarrier2 {
+                p_next: Vec::new(),
+                src_stage_mask: src.0,
+                src_access_mask: src.1,
+                dst_stage_mask: dst.0,
+                dst_access_mask: dst.1,
+                old_layout: layouts.0,
+                new_layout: layouts.1,
+                src_queue_family_index: QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: QUEUE_FAMILY_IGNORED,
+                image: VkImage(image),
+                subresource_range: color_range(),
+            }]),
+        }),
+    })
+}

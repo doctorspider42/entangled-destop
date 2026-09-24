@@ -713,7 +713,9 @@ fn queue_and_device_idle_are_served_from_what_was_submitted() {
 // ------------------------------------------------------------ refusals
 
 #[test]
-fn a_submit_naming_a_semaphore_is_refused_until_stage_5b3() {
+fn a_submit_naming_a_semaphore_nobody_created_is_fatal() {
+    // Stage 5b.3 serves semaphores (sync_tests); an id that names none is
+    // still refused before the host sees the submit.
     let (mut h, host) = setup();
     buffer(&mut h, BUF);
     record_fill(&mut h, CB, BUF);

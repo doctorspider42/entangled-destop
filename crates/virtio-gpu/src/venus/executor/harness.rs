@@ -303,8 +303,25 @@ impl<H: HostVulkan> Harness<H> {
         Self::build(factory, None)
     }
 
+    /// [`Self::new`] behind the VM's pause gate `quiesce` (ADR-0005), as
+    /// the device hands it over at activation, before any ring exists.
+    pub fn gated(host: Arc<H>, quiesce: Arc<virtio_core::Quiesce>) -> Self {
+        Self::build_with(ExecutorFactory::new(host), None, Some(quiesce))
+    }
+
     fn build(factory: ExecutorFactory<H>, monitor_us: Option<u32>) -> Self {
+        Self::build_with(factory, monitor_us, None)
+    }
+
+    fn build_with(
+        factory: ExecutorFactory<H>,
+        monitor_us: Option<u32>,
+        quiesce: Option<Arc<virtio_core::Quiesce>>,
+    ) -> Self {
         let mut renderer = VenusRenderer::new(factory);
+        if let Some(quiesce) = quiesce {
+            renderer.set_quiesce(quiesce);
+        }
         let window = Arc::new(RecordingWindow::default());
         renderer.set_host_visible(Arc::clone(&window) as Arc<dyn ShmBacking>);
         let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));

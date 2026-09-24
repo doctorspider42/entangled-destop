@@ -17,9 +17,11 @@
 //! * [`context`] is what each command does, [`memory`] the memory, buffer,
 //!   binding and view commands (stage 5b.1), [`device_objects`] pipelines,
 //!   descriptors, render passes, queries and every `vkCmd*`, [`submit`]
-//!   submission, fences and waits (stage 5b.2), [`generated`] the translation
-//!   all of stage 5b.2 goes through, [`objects`] the id rules, [`policy`]
-//!   what the guest is told, [`host`] the trait the host sits behind.
+//!   submission, fences, semaphores and waits (stages 5b.2 and 5b.3),
+//!   [`timeline`] the virtio-gpu fences of a queue's `ring_idx` (stage 5b.3),
+//!   [`generated`] the translation all of stage 5b.2 goes through,
+//!   [`objects`] the id rules, [`policy`] what the guest is told, [`host`]
+//!   the trait the host sits behind.
 //!
 //! # Memory the guest maps
 //!
@@ -74,7 +76,8 @@
 //!
 //! # Waits
 //!
-//! `vkWaitForFences`, `vkQueueWaitIdle` and `vkDeviceWaitIdle` are waited for
+//! `vkWaitForFences`, `vkWaitSemaphores`, `vkQueueWaitIdle` and
+//! `vkDeviceWaitIdle` are waited for
 //! on this thread, in slices of [`submit::WAIT_SLICE`] with the context lock
 //! released in between ([`submit`]'s module docs). The context's ring monitor
 //! keeps `ALIVE` set meanwhile; a ring being torn down stops waiting within a
@@ -88,18 +91,15 @@
 //! down with it: the device's objects are destroyed as ever when the context
 //! goes, which Vulkan allows on a lost device.
 //!
-//! # What this stage does not do
+//! # Fence timelines (stage 5b.3)
 //!
-//! * Fence timelines. `vkGetDeviceQueue2` records the `ring_idx` the guest
-//!   binds each queue to, and that is all. The capset still says
-//!   `supports_multiple_timelines = false`, and **release Mesa binds queues
-//!   to timelines 1–63 regardless** (spec §6). Mesa 26.0.8's submit path
-//!   never asks for a virtio-gpu fence on those timelines (its fences are
-//!   the feedback slots [`submit`] describes, and `vkGetFenceFdKHR` is the
-//!   only path that would), so this stage leaves them as they were: the
-//!   stage that exports a sync file must give `virtio_gpu::fence` one FIFO
-//!   per `ring_idx` before it can retire one, and only then flip the bit.
-//! * Semaphores (stage 5b.3): a submit or wait naming one is refused.
+//! `vkGetDeviceQueue2` binds each queue to the `ring_idx` the guest names,
+//! and a virtio-gpu fence on that timeline
+//! ([`SinkFactory::create_ring_fence`]) becomes a host fence on that queue,
+//! retired by the queue's fence thread ([`timeline`]); the device keeps one
+//! FIFO per `(context, ring_idx)` (`crate::fence`), so the capset says
+//! `supports_multiple_timelines` — which Mesa only asserts, and binds queues
+//! to timelines 1–63 regardless (spec §6).
 
 pub mod context;
 pub mod device_objects;
@@ -109,6 +109,7 @@ pub mod memory;
 pub mod objects;
 pub mod policy;
 pub mod submit;
+pub mod timeline;
 
 #[cfg(test)]
 pub(crate) mod fake;
@@ -122,6 +123,8 @@ mod memory_tests;
 pub(crate) mod recording;
 #[cfg(test)]
 mod submit_tests;
+#[cfg(test)]
+mod sync_tests;
 #[cfg(test)]
 mod tests;
 
@@ -826,6 +829,29 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         for (_, context) in self.contexts.drain() {
             lock(&context).destroy_all();
         }
+    }
+
+    fn retires_ring_fences(&self) -> bool {
+        true
+    }
+
+    fn create_ring_fence(
+        &mut self,
+        fence: super::renderer::RingFence,
+        retire: &super::renderer::FenceRetirer,
+    ) -> Result<crate::renderer::FenceOutcome, String> {
+        let context = self
+            .contexts
+            .get(&fence.ctx_id)
+            .ok_or_else(|| format!("venus context {} has no Vulkan", fence.ctx_id))?;
+        lock(context).create_ring_fence(fence, retire)
+    }
+
+    fn pending_ring_fences(&self) -> usize {
+        self.contexts
+            .values()
+            .map(|context| lock(context).objects.pending_ring_fences())
+            .sum()
     }
 
     fn snapshot_refusal(&self) -> Option<String> {

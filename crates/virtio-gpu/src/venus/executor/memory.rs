@@ -1392,7 +1392,7 @@ impl<H: HostVulkan> VulkanContext<H> {
 /// refused on a device that reports less: its host entry point may not
 /// exist, and `ash` answers a missing one with a panic.
 fn require_1_3(command: &'static str, guest: &GuestDevice) -> Result<(), ExecError> {
-    if guest.properties.properties.api_version < policy::MAX_API_VERSION {
+    if guest.api_version() < policy::MAX_API_VERSION {
         return Err(invalid(
             command,
             "a Vulkan 1.3 command on a device that reports an older version",

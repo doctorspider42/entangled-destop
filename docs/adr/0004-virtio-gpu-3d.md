@@ -2525,3 +2525,140 @@ system memory (type 3), and the GPU reads and writes it across PCIe. The fix,
 if that is it, is a real workload decision: which types to expose, and whether
 a guest's storage buffers belong in memory the guest never maps. This is a
 performance item, not a correctness one.
+
+## Amendment, 2026-09-24 — stage 5b.3, semaphores, sync-file emulation, queue timelines and Vulkan 1.3
+
+The executor now serves semaphores, the sync-file semaphore import Mesa's WSI
+rests on, and virtio-gpu fences on every queue's `ring_idx` timeline, and it
+advertises `VK_KHR_synchronization2`. Against Mesa 26.0.8 that is what turns
+the guest's device into **Vulkan 1.3 with `VK_KHR_swapchain`**: the three
+gates of "Resolved — why the guest said 1.2" are now open.
+
+### What the guest is shown
+
+| extension | how | what it obliges the renderer to |
+|---|---|---|
+| `VK_KHR_synchronization2` | passed through, on a device of 1.3 or newer | every command it adds is core 1.3 (`vkQueueSubmit2`, `vkCmdPipelineBarrier2`, `vkCmd{Set,Reset,Wait}Event{s}2`, `vkCmdWriteTimestamp2`, the KHR aliases encoded as the core commands), all served; its structures are core 1.3 (`VkDependencyInfo`, `Vk*MemoryBarrier2`, `VkSubmitInfo2`, `VkSemaphoreSubmitInfo`, `VkCommandBufferSubmitInfo`, `VkPhysicalDeviceSynchronization2Features`) and admitted; capset bit 315, already set by 5b.1 |
+| `VK_KHR_external_semaphore_fd` | **emulated**, advertised whatever the host has | the `SYNC_FD` answer below; stripped from `vkCreateDevice` (Mesa adds it for every device an application wants a swapchain on, `vn_device.c:333-337`) and `VkExportSemaphoreCreateInfo{SYNC_FD}` stripped from `vkCreateSemaphore`, before the driver sees either; `vkImportSemaphoreResourceMESA` and `vkWaitSemaphoreResourceMESA`. Its own two commands are never sent (Mesa implements them itself) and it chains no structure, so it needs no capset bit |
+
+`vkGetPhysicalDeviceExternalSemaphoreProperties(SYNC_FD)` answers
+**`IMPORTABLE` only** for a binary semaphore (compatible type `SYNC_FD`,
+nothing exportable), and nothing for a timeline one; every other handle type
+gets the host driver's own answer. `IMPORTABLE` is what sets
+`renderer_sync_fd.semaphore_importable` (`vn_physical_device.c:1124-1141`),
+and that one flag is the gate on sync2 (`:1262-1271`, and with it 1.3,
+`:538-543`) and on the swapchain (`:1212-1224`). `EXPORTABLE` would also make
+the guest offer `VK_KHR_external_semaphore_fd` to its applications
+(`:1173-1179`), whose `vkGetSemaphoreFdKHR` exports through a fence on the
+queue's timeline and `vkWaitSemaphoreResourceMESA`; both are implemented and
+tested, but nothing in 1.3 or the swapchain needs an application to export a
+sync file, so the promise is not made. It is one constant to flip.
+
+The executor's version gate is now the guest's version as Mesa 26.0.8 will
+show it — the host's capped at 1.3, and 1.2 when sync2 is not advertised — so
+a core-1.3 command passes exactly when the guest can have one of its own to
+send. On the RTX 2070 that is 1.3 (`apiVersion 1.3.312` from the host's 1.4;
+the guest clamps it to 1.3.0 because protocol spec 2 cannot carry host image
+copy, `:535-536`). Features2 and Properties2 answer every 1.3 structure from
+the host's chain (`VkPhysicalDeviceVulkan13Features`/`Properties`, and the
+individual sync2, dynamic-rendering and maintenance4 structures).
+
+### What the guest sends on the WSI and sync-file paths, and what each becomes
+
+Read from 26.0.8's `vn_queue.c` and `vn_wsi.c`. Without a dma-buf export the
+guest's common WSI runs in its software mode (`vn_wsi.c:134-139`): images are
+copied by the CPU, and the renderer sees ordinary submits and fences.
+
+| guest | when | here |
+|---|---|---|
+| `vkCreateSemaphore` (binary; timeline with `VkSemaphoreTypeCreateInfo`; `VkExportSemaphoreCreateInfo` if the application asked) | async | created; `SYNC_FD` stripped from the export, any other type must be one the host exports |
+| `vkQueueSubmit`/`vkQueueSubmit2` with waits and signals | async; `Submit2` once the device is 1.3 (`vn_device.c:554`) | translated; timeline values and device-group indices checked against the counts a driver indexes by; each binary semaphore's state tracked (below) |
+| `vkImportSemaphoreResourceMESA`, resource 0 | before a submit that waits on a semaphore whose temporary payload was an imported sync file the guest already waited for itself (`vn_queue.c:387-417`) — every acquired swapchain image | **recorded, not performed**: the semaphore has a signalled temporary payload, and the next wait consumes it — a submit's wait on it is taken out of the batch before the host sees it |
+| `vkWaitSemaphoreResourceMESA` | `vkGetSemaphoreFdKHR` (`:2440-2495`), which needs an exportable renderer (not offered) | the temporary payload consumed if there is one, otherwise the permanent one with an empty submit that waits on it |
+| execbuffer with a fence on the queue's `ring_idx`, carrying `vkWaitRingSeqnoMESA` | `vn_create_sync_file`, the same exports | a host fence on the bound queue, retired by the queue's fence thread |
+| `vkWaitSemaphores(UINT64_MAX)` async, `vkGetSemaphoreCounterValue`, `vkSignalSemaphore` | timeline feedback read signalled; feedback off; host signal | a real wait in 20 ms slices off the context lock, like `vkWaitForFences`; passed through; timeline semaphores only |
+| `vkImportFenceResourceMESA`, `vkResetFenceResourceMESA` | never; only with an exportable sync-file fence, not advertised | refused |
+
+Why the import is bookkeeping and not the "empty signalling submit" the
+2026-09-23 finding suggested: vkr imports a sync file of `-1` as a
+*temporary* payload, and a signalling submit gets that wrong three ways — it
+waits behind the queue's earlier work, it changes the *permanent* payload a
+temporary import must leave alone, and when the permanent payload is already
+signalled it is a signal of a signalled binary semaphore, which a driver need
+not survive. Dropping the consuming wait is exactly what waiting on a
+signalled temporary payload means. The same per-semaphore record refuses a
+binary wait with no signal submitted before it (a GPU that waits forever) and
+a second signal of a signalled binary semaphore, before the driver sees them.
+
+### Fences on a queue's timeline, and the waiter model
+
+`virtio_gpu::fence` keeps one FIFO per timeline — the device's
+(`VIRTIO_GPU_FLAG_INFO_RING_IDX` clear: every virgl fence, unchanged) and one
+per `(context, ring_idx)` — in one bounded table, so a retirement completes
+only its own timeline's prefix and the cap, the watchdog and a reset's drain
+stay what they were. A renderer names the timeline through additive
+`Renderer3d` methods whose defaults are the old behaviour, so virgl's fences
+are untouched. `ring_idx` 0 is the context's CPU timeline and, as in vkr, is
+signalled at once (the context commands before it have run). Every other
+`ring_idx` goes to the executor: an empty `vkQueueSubmit` with a host fence
+on the queue bound to it (a fence on a timeline no queue is bound to is
+refused, as vkr refuses it, and the device answers it at once), handed to
+**that queue's fence thread**, started by its first fence, which waits for
+the FIFO's head in 50 ms slices, destroys the host fence and records the
+retirement for the device, then wakes it. As vkr: one thread per queue,
+because the ring workers must not block and one `vkWaitForFences` covers one
+device and one fence at a time; a single poller would add latency to every
+fence or leave a signalled one waiting behind another queue.
+
+- **ADR-0005.** The fence thread touches no guest memory and takes no lock
+  the executor or the device holds; the guest sees a retirement only when the
+  device's (gated) queue worker writes the held response, so it takes no pass,
+  and a pause neither waits for it nor breaks it. `vkDestroyDevice`, context
+  destruction and reset stop and join every fence thread of the device (one
+  slice), wait for the device to go idle, then destroy the fences still queued
+  and retire them in order, as vkr does when a queue goes; a reset then drops
+  every retirement of the old boot, so none can complete a new boot's fence of
+  the same id. Tested on a paused VM.
+- **ADR-0006.** A snapshot is refused by name while any ring fence is queued
+  or retired and not yet collected, before the executor's own refusal of live
+  host objects.
+- The capset's `supports_multiple_timelines` is now true for the executing
+  renderer (false for a capture, which has no queue); Mesa only asserts it.
+
+### Core 1.3 coverage
+
+Every core 1.3 command the protocol decodes is served except two:
+`vkGetDeviceImageSparseMemoryRequirements` (every sparse feature is reported
+false) and `vkGetPhysicalDeviceToolProperties` (answered by the guest driver
+itself). Of the rest, `vkQueueSubmit2`, `vkCmdBeginRendering`,
+`vkCmdBindVertexBuffers2`, `vkCmdCopy{Buffer,BufferToImage,ImageToBuffer}2`,
+`vkCmdSet{Viewport,Scissor}WithCount`, `vkCmdWriteTimestamp2` and the private
+data commands are hand-written with bounds; `vkGetDevice{Buffer,Image}MemoryRequirements`
+are bespoke (5b.1); the rest pass through the generated translation. Dynamic
+rendering is bounded as a render pass is: colour attachments inside
+`maxColorAttachments` in `vkCmdBeginRendering`, `VkPipelineRenderingCreateInfo`
+and an inherited `VkCommandBufferInheritanceRenderingInfo`
+(`vkBeginCommandBuffer` is hand-written for it), a view mask inside
+`maxMultiviewViewCount`, a layer count and a render area; every view is a
+typed id of the device.
+
+### Measured on the RTX 2070
+
+Driven through a real ring with the generated driver-side encoder, as the
+guest would (`host_vulkan::pipeline_tests`, driver 580.88, Windows): the
+device shown as `apiVersion 1.3.312` with `VK_KHR_synchronization2` and
+`VK_KHR_external_semaphore_fd`, `SYNC_FD` features `0x2`; vk-smoke check 7 —
+the triangle through `vkCmdBeginRendering`, its transitions through
+`vkCmdPipelineBarrier2`, submitted with `vkQueueSubmit2` — **256×256 exact,
+`fnv1a=0xd79d631c4d62403b`**, the checksum of the bare RTX 2070; check 8 — a
+timeline semaphore across two submits, the host's wait for 2 in 7.1 ms,
+counter 2, 0 words wrong, then `vkQueueWaitIdle` and `vkDeviceWaitIdle`; the
+WSI sequence (three frames of import, render signalling a binary semaphore,
+the present's `vkQueueSubmit2` waiting on it with a fence, then a sync-file
+export) with no refusal; and a fence on timeline 1 retired 82 ms after a
+submit of eight 32 MiB fills, with all 8 388 608 words already written.
+
+Owed: the guest acceptance (vk-smoke all nine checks with the guest at 1.3,
+and `vulkaninfo` listing `VK_KHR_swapchain` and `VK_KHR_synchronization2`),
+and presenting through a real swapchain, which in the guest's software WSI
+is CPU copies — correct, and slow.

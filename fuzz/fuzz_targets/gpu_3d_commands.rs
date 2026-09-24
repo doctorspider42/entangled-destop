@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use virtio_gpu::fence::{FenceQueue, MAX_PENDING_FENCES};
+use virtio_gpu::fence::{FenceQueue, FenceTimeline, MAX_PENDING_FENCES};
 use virtio_gpu::protocol::{Box3d, MemEntry, Rect, ResourceCreate3d, Transfer3d};
 use virtio_gpu::renderer::{validate_stream, CapsetInfo, FenceOutcome, Renderer3d};
 use virtio_gpu::{CommandError, Gpu3d, NullRenderer};
@@ -293,7 +293,7 @@ fuzz_target!(|case: Case| {
                 if let Ok(FenceOutcome::Pending) = gpu.create_fence(ctx_id, fence_id) {
                     // Exactly the device's rule: never hold more than the cap,
                     // and never allocate past it.
-                    let _ = pending.push(fence_id, fence_id);
+                    let _ = pending.push(FenceTimeline::Device, fence_id, fence_id);
                 }
                 assert!(pending.len() <= MAX_PENDING_FENCES);
             }
@@ -310,7 +310,7 @@ fuzz_target!(|case: Case| {
                     // Prefix completion: every payload is its own id, so a
                     // completion for an id that is not in the table returns
                     // nothing rather than mismatching.
-                    for (_, payload) in pending.complete(id) {
+                    for (_, payload) in pending.complete(FenceTimeline::Device, id) {
                         assert!(payload <= id || payload != id, "payload/id bookkeeping");
                     }
                 }

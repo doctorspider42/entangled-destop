@@ -79,7 +79,7 @@ fn the_whole_vulkaninfo_bring_up_is_answered_the_way_mesa_decodes_it() {
     assert_eq!(p.vendor_id, 0x10de);
     assert_eq!(p.api_version, vk_make_api_version(0, 1, 3, 312));
 
-    // Rows 7–8: nothing the protocol cannot decode is advertised — the host's
+    // Rows 7–8: only what this renderer serves is advertised — the host's
     // swapchain and external-memory-host are filtered out.
     let ext_query =
         Command::EnumerateDeviceExtensionProperties(EnumerateDeviceExtensionPropertiesArgs {
@@ -92,7 +92,9 @@ fn the_whole_vulkaninfo_bring_up_is_answered_the_way_mesa_decodes_it() {
     let Command::EnumerateDeviceExtensionProperties(x) = h.call(&ext_query).unwrap() else {
         panic!()
     };
-    assert_eq!((x.ret, x.p_property_count), (VK_SUCCESS, Some(0)));
+    // Stage 5b.3: the host's VK_KHR_synchronization2, and the emulated
+    // VK_KHR_external_semaphore_fd; nothing else of the host's list.
+    assert_eq!((x.ret, x.p_property_count), (VK_SUCCESS, Some(2)));
 
     // Row 9: Features2 with the chain Mesa builds at 1.3 (prepended, so
     // 1.3 first); sparse masked, the rest passed through, order kept.
@@ -1108,9 +1110,10 @@ fn the_links_this_stage_admits_are_exactly_the_ones_the_bring_up_protocol_decode
 }
 
 #[test]
-fn the_advertised_extensions_are_still_only_the_implemented_ones() {
+fn the_advertised_extensions_are_only_the_served_and_the_emulated_ones() {
     // Every extension is decodable now; the host's list still reaches the
-    // guest only through what this stage implements.
+    // guest only through what this renderer serves, plus the sync-fd
+    // semaphore extension it emulates (stage 5b.3).
     assert!(info::EXTENSIONS.iter().all(|e| e.decodable));
     let named = |name: &[u8]| {
         let mut ext = VkExtensionProperties {
@@ -1127,7 +1130,12 @@ fn the_advertised_extensions_are_still_only_the_implemented_ones() {
         named(b"VK_EXT_custom_border_color"),
         named(b"VK_KHR_timeline_semaphore"),
     ];
-    assert!(super::policy::advertised_extensions(&host).is_empty());
+    let shown = super::policy::advertised_extensions(&host, super::policy::MAX_API_VERSION);
+    let names: Vec<&[u8]> = shown
+        .iter()
+        .map(|e| super::policy::c_name(&e.extension_name))
+        .collect();
+    assert_eq!(names, vec![b"VK_KHR_external_semaphore_fd".as_slice()]);
 }
 
 #[test]

@@ -92,9 +92,18 @@ pub enum ExecError {
         /// Its core minor version.
         minor: u32,
     },
-    /// A submit or a wait naming a semaphore: stage 5b.3.
-    #[error("{0} names a semaphore; semaphores are not implemented yet (stage 5b.3)")]
-    Semaphore(&'static str),
+    /// A semaphore used in a way its type or state forbids (stage 5b.3): a
+    /// binary wait with no signal before it, a signal of a binary semaphore
+    /// already signalled, a timeline-only command on a binary one.
+    #[error("{command}: semaphore {id:#x}: {what}")]
+    Semaphore {
+        /// The command.
+        command: &'static str,
+        /// The semaphore's guest id.
+        id: u64,
+        /// What was wrong.
+        what: &'static str,
+    },
     /// A second `vkCreateInstance` on one context (`vkr_instance.c:87-90`).
     #[error("vkCreateInstance on a context that already has instance {0:#x}")]
     SecondInstance(u64),
@@ -335,6 +344,9 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::GetPhysicalDeviceQueueFamilyProperties2(args) => self.queue_families(args),
             Command::GetPhysicalDeviceMemoryProperties2(args) => self.memory_properties(args),
             Command::EnumerateDeviceExtensionProperties(args) => self.device_extensions(args),
+            Command::GetPhysicalDeviceExternalSemaphoreProperties(args) => {
+                self.external_semaphore_properties(args)
+            }
             Command::GetPhysicalDeviceFormatProperties2(args) => self.format_properties(args),
             Command::GetPhysicalDeviceImageFormatProperties2(args) => {
                 self.image_format_properties(args)
@@ -795,6 +807,45 @@ impl<H: HostVulkan> VulkanContext<H> {
         Ok(())
     }
 
+    /// `vkGetPhysicalDeviceExternalSemaphoreProperties` (stage 5b.3):
+    /// `SYNC_FD` synthesized, every other handle type the host's answer
+    /// ([`policy::external_semaphore_properties`]). The handle type must be
+    /// one bit of Vulkan 1.3's, and the chain's semaphore type a real one.
+    fn external_semaphore_properties(
+        &mut self,
+        args: &mut crate::venus::protocol::GetPhysicalDeviceExternalSemaphorePropertiesArgs,
+    ) -> Result<(), ExecError> {
+        use crate::venus::protocol::VkPhysicalDeviceExternalSemaphoreInfoNext as N;
+        const NAME: &str = "vkGetPhysicalDeviceExternalSemaphoreProperties";
+        let Some(info) = &args.p_external_semaphore_info else {
+            return Err(invalid(NAME, "pExternalSemaphoreInfo is null"));
+        };
+        let handle = u32::try_from(info.handle_type).unwrap_or(0);
+        if !handle.is_power_of_two() || handle & !policy::SEMAPHORE_HANDLE_CORE != 0 {
+            return Err(invalid(NAME, format!("handle type {handle:#x}")));
+        }
+        let mut timeline = false;
+        for link in &info.p_next {
+            match link {
+                N::VkSemaphoreTypeCreateInfo(t) => match t.semaphore_type {
+                    policy::SEMAPHORE_TYPE_BINARY => {}
+                    policy::SEMAPHORE_TYPE_TIMELINE => timeline = true,
+                    other => return Err(invalid(NAME, format!("semaphore type {other}"))),
+                },
+            }
+        }
+        let (instance, device) = self
+            .objects
+            .physical(args.physical_device.0)
+            .map_err(id_error(NAME))?;
+        let host = &self.host;
+        let answer = policy::external_semaphore_properties(handle, timeline, || {
+            host.external_semaphore_properties(instance, device.host, handle, timeline)
+        });
+        args.p_external_semaphore_properties = Some(answer);
+        Ok(())
+    }
+
     /// `vkGetPhysicalDeviceFormatProperties2`, forwarded with a checked
     /// format.
     fn format_properties(
@@ -925,7 +976,11 @@ impl<H: HostVulkan> VulkanContext<H> {
             });
         }
 
-        // Extensions: only what we advertised, plus our own.
+        // Extensions: only what we advertised, plus our own — and never an
+        // emulated one (`VK_KHR_external_semaphore_fd`, which Mesa adds for
+        // every device an application wants a swapchain on,
+        // `vn_device.c:333-337`): the host driver may not have it, and what
+        // it stands for is this renderer's to do, not the driver's.
         let mut extensions: Vec<String> = Vec::new();
         for name in info
             .pp_enabled_extension_names
@@ -939,6 +994,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                     .any(|e| policy::c_name(&e.extension_name) == name.as_bytes())
             });
             match advertised {
+                Some(name) if policy::is_emulated_extension(name) => {}
                 Some(name) => extensions.push(name.to_owned()),
                 None => {
                     args.ret = VK_ERROR_EXTENSION_NOT_PRESENT;
@@ -1080,7 +1136,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.objects.insert_device(
                     id,
                     DeviceObject {
-                        host: device,
+                        host: Arc::new(device),
                         physical,
                         queues: created,
                         group_size,
@@ -1176,6 +1232,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 ring_idx,
                 family: info.queue_family_index,
                 pending: Pending::default(),
+                sync: None,
             },
         );
         Ok(())

@@ -131,6 +131,8 @@ EXECUTOR_COMMANDS = [
     'GetBufferDeviceAddress', 'CreateBufferView', 'DestroyBufferView',
     'GetImageMemoryRequirements', 'GetDeviceImageMemoryRequirements', 'BindImageMemory',
     'BindImageMemory2', 'GetImageSubresourceLayout', 'CreateImageView', 'DestroyImageView',
+    # stage 5b.3: the one external-handle query served
+    'GetPhysicalDeviceExternalSemaphoreProperties',
 ]
 CONTEXT = ROOT / 'crates' / 'virtio-gpu' / 'src' / 'venus' / 'executor' / 'context.rs'
 

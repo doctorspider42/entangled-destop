@@ -561,6 +561,38 @@ impl HostVulkan for AshVulkan {
         }
     }
 
+    fn external_semaphore_properties(
+        &self,
+        instance: &ash::Instance,
+        device: vk::PhysicalDevice,
+        handle_type: u32,
+        timeline: bool,
+    ) -> crate::venus::protocol::VkExternalSemaphoreProperties {
+        let mut kind = vk::SemaphoreTypeCreateInfo::default().semaphore_type(if timeline {
+            vk::SemaphoreType::TIMELINE
+        } else {
+            vk::SemaphoreType::BINARY
+        });
+        let mut info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::from_raw(handle_type));
+        if timeline {
+            info = info.push_next(&mut kind);
+        }
+        let mut out = vk::ExternalSemaphoreProperties::default();
+        // SAFETY: `device` is ours; the handle type is one core 1.3 bit (the
+        // executor checked it) and the info, its chain and the output are
+        // locals that outlive the call, a core 1.1 entry point of an instance
+        // made at 1.3.
+        unsafe {
+            instance.get_physical_device_external_semaphore_properties(device, &info, &mut out);
+        }
+        crate::venus::protocol::VkExternalSemaphoreProperties {
+            export_from_imported_handle_types: out.export_from_imported_handle_types.as_raw(),
+            compatible_handle_types: out.compatible_handle_types.as_raw(),
+            external_semaphore_features: out.external_semaphore_features.as_raw(),
+        }
+    }
+
     fn create_device(
         &self,
         instance: &ash::Instance,
@@ -1169,6 +1201,7 @@ impl HostVulkan for AshVulkan {
                 Kind::QueryPool => d.destroy_query_pool(vk::QueryPool::from_raw(raw), None),
                 Kind::Event => d.destroy_event(vk::Event::from_raw(raw), None),
                 Kind::Fence => d.destroy_fence(vk::Fence::from_raw(raw), None),
+                Kind::Semaphore => d.destroy_semaphore(vk::Semaphore::from_raw(raw), None),
                 Kind::PrivateDataSlot => {
                     d.destroy_private_data_slot(vk::PrivateDataSlot::from_raw(raw), None);
                 }

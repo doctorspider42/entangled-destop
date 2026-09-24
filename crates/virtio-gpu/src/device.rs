@@ -47,7 +47,7 @@ use vm_memory::{Bytes, GuestAddress};
 
 use crate::blob::{BlobSupport, BlobTable, MAX_BLOB_ENTRIES};
 use crate::error::CommandError;
-use crate::fence::{FenceQueue, MAX_PENDING_FENCES};
+use crate::fence::{FenceQueue, FenceTimeline, MAX_PENDING_FENCES};
 use crate::pacing::FramePacing;
 use crate::protocol::{
     capset_info_body, cmd, config_bytes, display_info_body, edid_body, map_info_body, resp,
@@ -920,14 +920,14 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // until it retires (ADR-0004 phase 2). Over the cap — or with no room
         // recorded — the response goes out now, which is phase 1's model and
         // strictly safer than pinning more chains.
-        if let Some(fence_id) = fence {
+        if let Some((timeline, fence_id)) = fence {
             let pending = PendingResponse {
                 head,
                 writable: writable.to_vec(),
                 hdr: resp_hdr,
                 body,
             };
-            match self.pending_fences.push(fence_id, pending) {
+            match self.pending_fences.push(timeline, fence_id, pending) {
                 Ok(()) => {
                     self.fence_stats.deferred = self.fence_stats.deferred.saturating_add(1);
                     self.fence_stats.peak_pending =
@@ -960,13 +960,16 @@ impl<S: ScanoutSink> GpuDevice<S> {
     }
 
     /// Whether this command's response must wait for a host fence, and on
-    /// which fence id (ADR-0004 phase 2).
+    /// which timeline and fence id (ADR-0004 phase 2; the timeline since
+    /// EPIC 20 stage 5b.3: the header's `ring_idx` when it carries
+    /// `VIRTIO_GPU_FLAG_INFO_RING_IDX`, as the guest kernel keeps one fence
+    /// context per `(context, ring_idx)`).
     ///
     /// `None` — answer now — for everything that is not a fenced 3D command,
     /// for a command that failed (a fence on a rejected command has nothing
     /// to wait for: the driver must see the error immediately), and whenever
     /// the renderer says the fence is already signalled.
-    fn fence_for(&mut self, hdr: &CtrlHdr, code: u32) -> Option<u32> {
+    fn fence_for(&mut self, hdr: &CtrlHdr, code: u32) -> Option<(FenceTimeline, u32)> {
         if !hdr.wants_fence() || !FENCED_3D_COMMANDS.contains(&hdr.kind) {
             return None;
         }
@@ -1002,9 +1005,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // and the pending table is 64 deep, so the truncation cannot alias
         // anything that matters.
         let fence_id = hdr.fence_id as u32;
-        match gpu.create_fence(hdr.ctx_id, fence_id) {
-            Ok(FenceOutcome::Pending) => Some(fence_id),
-            Ok(FenceOutcome::Signalled) => {
+        let ring_idx =
+            (hdr.flags & crate::protocol::FLAG_INFO_RING_IDX != 0).then_some(hdr.ring_idx);
+        match gpu.create_fence_on(hdr.ctx_id, ring_idx, fence_id) {
+            Ok((timeline, FenceOutcome::Pending)) => Some((timeline, fence_id)),
+            Ok((_, FenceOutcome::Signalled)) => {
                 self.fence_stats.synchronous = self.fence_stats.synchronous.saturating_add(1);
                 None
             }
@@ -1016,6 +1021,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 tracing::warn!(
                     ctx = hdr.ctx_id,
                     fence = fence_id,
+                    ring_idx = ?ring_idx,
                     %error,
                     "virtio-gpu could not create a host fence; completing synchronously"
                 );
@@ -1056,12 +1062,12 @@ impl<S: ScanoutSink> GpuDevice<S> {
         }
         let pending = self.pending_fences.len();
         let retired = match self.three_d.as_mut() {
-            Some(gpu) => gpu.poll_fences(pending),
+            Some(gpu) => gpu.poll_fence_timelines(pending),
             None => Vec::new(),
         };
         let mut done: Vec<(Duration, PendingResponse)> = Vec::new();
-        for fence_id in retired {
-            done.extend(self.pending_fences.complete(fence_id));
+        for (timeline, fence_id) in retired {
+            done.extend(self.pending_fences.complete(timeline, fence_id));
         }
         self.fence_stats.retired = self.fence_stats.retired.saturating_add(done.len() as u64);
         for (waited, _) in &done {

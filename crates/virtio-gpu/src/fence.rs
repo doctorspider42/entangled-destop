@@ -7,10 +7,27 @@
 //! table those held-back responses wait in.
 //!
 //! Portable and renderer-agnostic: entries are pushed in submission order and
-//! retired in submission order, because that is the contract virgl fences
-//! (and the guest's DRM fence timeline) have — the Linux `virtio_gpu` driver
-//! signals **every** fence with an id at or below the one a response carries,
-//! so completing out of order would prematurely signal earlier fences.
+//! retired in submission order **within their timeline** ([`FenceTimeline`]),
+//! because that is the contract virgl fences (and the guest's DRM fence
+//! timelines) have — the Linux `virtio_gpu` driver signals every fence *of
+//! the same dma-fence context* with an id at or below the one a response
+//! carries (`virtio_gpu_fence_event_process`), so completing out of order
+//! within a timeline would prematurely signal earlier fences of it.
+//!
+//! # Timelines (EPIC 20 stage 5b.3)
+//!
+//! A fenced command without `VIRTIO_GPU_FLAG_INFO_RING_IDX` is on the
+//! device's one global timeline ([`FenceTimeline::Device`]), which is every
+//! virgl fence and the only timeline there was before Venus. A context made
+//! with `CONTEXT_INIT` that sets the flag names one of its own
+//! `(ctx_id, ring_idx)` timelines ([`FenceTimeline::Ring`]) — the kernel
+//! gives each its own dma-fence context — and Mesa's venus binds one per
+//! `VkQueue`. Fences on different timelines retire **independently**: a
+//! queue whose GPU work finished must not wait behind another queue's that
+//! has not, and one timeline's retirement must never complete another's
+//! entries. The table is still one bounded deque in submission order, each
+//! entry tagged with its timeline, so the cap, the watchdog's "oldest entry"
+//! and a reset's drain are what they always were.
 //!
 //! # Bounds (the guest is untrusted)
 //!
@@ -36,10 +53,27 @@ use std::time::{Duration, Instant};
 /// tested*, per the MVP-1407 rule).
 pub const MAX_PENDING_FENCES: usize = 64;
 
-/// A FIFO of payloads waiting on host fence retirement, keyed by the 32-bit
-/// host fence id (the wire's u64 `fence_id`, truncated exactly the way it is
-/// truncated toward virglrenderer — ids are compared, never ordered, so the
-/// truncation only requires ids not to repeat within one table's depth).
+/// The timeline a fence retires on. See the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FenceTimeline {
+    /// The device's global timeline: every fence without
+    /// `VIRTIO_GPU_FLAG_INFO_RING_IDX` (all of virgl's).
+    Device,
+    /// Timeline `ring_idx` of context `ctx_id`. `ring_idx` 0 is the
+    /// context's CPU timeline.
+    Ring {
+        /// The context.
+        ctx_id: u32,
+        /// The header's `ring_idx`.
+        ring_idx: u8,
+    },
+}
+
+/// FIFOs of payloads waiting on host fence retirement, one per
+/// [`FenceTimeline`], keyed by the 32-bit host fence id (the wire's u64
+/// `fence_id`, truncated exactly the way it is truncated toward
+/// virglrenderer — ids are compared, never ordered, so the truncation only
+/// requires ids not to repeat within one timeline's depth).
 ///
 /// Every entry is stamped on the way in, so the owner can both age out a
 /// fence that never retires (the device's watchdog) and report how long the
@@ -51,6 +85,7 @@ pub struct FenceQueue<T> {
 
 #[derive(Debug)]
 struct Entry<T> {
+    timeline: FenceTimeline,
     id: u32,
     at: Instant,
     payload: T,
@@ -88,13 +123,15 @@ impl<T> FenceQueue<T> {
         self.entries.front().map(|e| e.at.elapsed())
     }
 
-    /// Appends a payload waiting on `fence_id`. Returns the payload back when
-    /// the table is full — the caller answers that command in band instead.
-    pub fn push(&mut self, fence_id: u32, payload: T) -> Result<(), T> {
+    /// Appends a payload waiting on `fence_id` of `timeline`. Returns the
+    /// payload back when the table is full — the caller answers that command
+    /// in band instead.
+    pub fn push(&mut self, timeline: FenceTimeline, fence_id: u32, payload: T) -> Result<(), T> {
         if self.is_full() {
             return Err(payload);
         }
         self.entries.push_back(Entry {
+            timeline,
             id: fence_id,
             at: Instant::now(),
             payload,
@@ -102,23 +139,44 @@ impl<T> FenceQueue<T> {
         Ok(())
     }
 
-    /// Retires `fence_id` and everything submitted before it, in order, with
-    /// how long each one waited.
+    /// Entries waiting on `timeline`.
+    pub fn len_on(&self, timeline: FenceTimeline) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.timeline == timeline)
+            .count()
+    }
+
+    /// Retires `fence_id` of `timeline` and everything submitted on that
+    /// timeline before it, in order, with how long each one waited. Entries
+    /// of every other timeline stay where they are.
     ///
-    /// Host fences retire in creation order, and retirement callbacks
-    /// coalesce (the renderer may only report the *latest* retired id), so
-    /// one call completes the whole prefix up to and including the entry
-    /// whose id matches. An id with no matching entry completes nothing —
-    /// either it was already handed out on an earlier (coalesced) call, or
-    /// the entries were dropped by a device reset.
-    pub fn complete(&mut self, fence_id: u32) -> Vec<(Duration, T)> {
-        let Some(last) = self.entries.iter().position(|e| e.id == fence_id) else {
+    /// Host fences retire in creation order within their timeline, and
+    /// retirement callbacks coalesce (the renderer may only report the
+    /// *latest* retired id), so one call completes the timeline's whole
+    /// prefix up to and including the entry whose id matches. An id with no
+    /// matching entry on that timeline completes nothing — either it was
+    /// already handed out on an earlier (coalesced) call, or the entries were
+    /// dropped by a device reset.
+    pub fn complete(&mut self, timeline: FenceTimeline, fence_id: u32) -> Vec<(Duration, T)> {
+        let Some(last) = self
+            .entries
+            .iter()
+            .position(|e| e.timeline == timeline && e.id == fence_id)
+        else {
             return Vec::new();
         };
-        self.entries
-            .drain(..=last)
-            .map(|e| (e.at.elapsed(), e.payload))
-            .collect()
+        let mut done = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.entries.len());
+        for (index, e) in self.entries.drain(..).enumerate() {
+            if index <= last && e.timeline == timeline {
+                done.push((e.at.elapsed(), e.payload));
+            } else {
+                kept.push_back(e);
+            }
+        }
+        self.entries = kept;
+        done
     }
 
     /// Empties the table (device reset, renderer loss, the watchdog): every
@@ -140,28 +198,34 @@ mod tests {
         batch.into_iter().map(|(_, payload)| payload).collect()
     }
 
+    const D: FenceTimeline = FenceTimeline::Device;
+
+    fn ring(ctx_id: u32, ring_idx: u8) -> FenceTimeline {
+        FenceTimeline::Ring { ctx_id, ring_idx }
+    }
+
     #[test]
     fn retirement_completes_the_whole_prefix_in_order() {
         let mut q = FenceQueue::new();
         for id in 1..=5u32 {
-            q.push(id, id * 10).expect("under the cap");
+            q.push(D, id, id * 10).expect("under the cap");
         }
         // A coalesced callback reporting only fence 3 retires 1, 2 and 3.
-        assert_eq!(payloads(q.complete(3)), vec![10, 20, 30]);
+        assert_eq!(payloads(q.complete(D, 3)), vec![10, 20, 30]);
         assert_eq!(q.len(), 2);
         // Re-reporting an already-retired id completes nothing.
-        assert_eq!(payloads(q.complete(3)), Vec::<u32>::new());
-        assert_eq!(payloads(q.complete(2)), Vec::<u32>::new());
+        assert_eq!(payloads(q.complete(D, 3)), Vec::<u32>::new());
+        assert_eq!(payloads(q.complete(D, 2)), Vec::<u32>::new());
         // The rest retires when its own id arrives.
-        assert_eq!(payloads(q.complete(5)), vec![40, 50]);
+        assert_eq!(payloads(q.complete(D, 5)), vec![40, 50]);
         assert!(q.is_empty());
     }
 
     #[test]
     fn unknown_ids_complete_nothing() {
         let mut q = FenceQueue::new();
-        q.push(7, "a").expect("push");
-        assert!(q.complete(99).is_empty());
+        q.push(D, 7, "a").expect("push");
+        assert!(q.complete(D, 99).is_empty());
         assert_eq!(q.len(), 1);
     }
 
@@ -169,12 +233,12 @@ mod tests {
     fn the_oldest_entry_ages_and_an_empty_table_has_no_age() {
         let mut q: FenceQueue<u32> = FenceQueue::new();
         assert!(q.oldest_age().is_none());
-        q.push(1, 1).expect("push");
-        q.push(2, 2).expect("push");
+        q.push(D, 1, 1).expect("push");
+        q.push(D, 2, 2).expect("push");
         let first = q.oldest_age().expect("an entry is waiting");
         // The oldest age tracks the *front* entry, so retiring it moves the
         // watchdog's clock forward rather than resetting it.
-        assert_eq!(payloads(q.complete(1)), vec![1]);
+        assert_eq!(payloads(q.complete(D, 1)), vec![1]);
         let second = q.oldest_age().expect("one entry left");
         assert!(second <= first.max(second), "ages are monotonic per entry");
         assert_eq!(payloads(q.drain_all()), vec![2]);
@@ -185,21 +249,68 @@ mod tests {
     fn the_cap_holds_and_returns_the_payload() {
         let mut q = FenceQueue::new();
         for id in 0..MAX_PENDING_FENCES as u32 {
-            q.push(id, id).expect("under the cap");
+            q.push(D, id, id).expect("under the cap");
         }
         assert!(q.is_full());
-        assert_eq!(q.push(u32::MAX, 1234), Err(1234));
+        assert_eq!(q.push(D, u32::MAX, 1234), Err(1234));
         assert_eq!(q.len(), MAX_PENDING_FENCES);
         // Draining one makes room for one.
-        assert_eq!(payloads(q.complete(0)), vec![0]);
-        q.push(u32::MAX, 1234).expect("room again");
+        assert_eq!(payloads(q.complete(D, 0)), vec![0]);
+        q.push(D, u32::MAX, 1234).expect("room again");
+    }
+
+    #[test]
+    fn two_timelines_retire_independently_and_in_order_within_each() {
+        let mut q = FenceQueue::new();
+        // Interleaved, as two queues' fences arrive.
+        q.push(ring(1, 1), 10, "a1").expect("push");
+        q.push(ring(1, 2), 20, "b1").expect("push");
+        q.push(ring(1, 1), 11, "a2").expect("push");
+        q.push(ring(1, 2), 21, "b2").expect("push");
+        q.push(ring(1, 1), 12, "a3").expect("push");
+        // Queue B's second fence retires first: only B's prefix completes.
+        assert_eq!(payloads(q.complete(ring(1, 2), 21)), vec!["b1", "b2"]);
+        assert_eq!(q.len_on(ring(1, 1)), 3);
+        assert_eq!(q.len_on(ring(1, 2)), 0);
+        // An id of another timeline completes nothing here.
+        assert!(q.complete(ring(1, 2), 11).is_empty());
+        assert!(q.complete(D, 11).is_empty());
+        // A's prefix, in order.
+        assert_eq!(payloads(q.complete(ring(1, 1), 11)), vec!["a1", "a2"]);
+        assert_eq!(payloads(q.complete(ring(1, 1), 12)), vec!["a3"]);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn the_same_ring_of_two_contexts_is_two_timelines() {
+        let mut q = FenceQueue::new();
+        q.push(ring(1, 1), 5, 1).expect("push");
+        q.push(ring(2, 1), 6, 2).expect("push");
+        q.push(D, 7, 3).expect("push");
+        assert_eq!(payloads(q.complete(ring(2, 1), 6)), vec![2]);
+        assert_eq!(payloads(q.complete(D, 7)), vec![3]);
+        assert_eq!(payloads(q.complete(ring(1, 1), 5)), vec![1]);
+    }
+
+    #[test]
+    fn the_cap_the_watchdog_age_and_the_drain_span_every_timeline() {
+        let mut q = FenceQueue::new();
+        for id in 0..MAX_PENDING_FENCES as u32 {
+            let timeline = ring(1, (id % 3) as u8 + 1);
+            q.push(timeline, id, id).expect("under the cap");
+        }
+        assert!(q.is_full());
+        assert_eq!(q.push(D, 999, 999), Err(999));
+        assert!(q.oldest_age().is_some());
+        let all = payloads(q.drain_all());
+        assert_eq!(all, (0..MAX_PENDING_FENCES as u32).collect::<Vec<_>>());
     }
 
     #[test]
     fn drain_all_returns_everything_in_order() {
         let mut q = FenceQueue::new();
-        q.push(1, "x").expect("push");
-        q.push(2, "y").expect("push");
+        q.push(D, 1, "x").expect("push");
+        q.push(D, 2, "y").expect("push");
         assert_eq!(payloads(q.drain_all()), vec!["x", "y"]);
         assert!(q.is_empty());
     }

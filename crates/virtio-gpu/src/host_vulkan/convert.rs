@@ -357,6 +357,35 @@ impl ToAsh for VkExternalMemoryProperties {
     }
 }
 
+impl FromAsh<vk::ExternalSemaphoreProperties<'_>> for VkExternalSemaphoreProperties {
+    fn from_ash(src: &vk::ExternalSemaphoreProperties<'_>) -> Self {
+        Self {
+            export_from_imported_handle_types: src.export_from_imported_handle_types.as_raw(),
+            compatible_handle_types: src.compatible_handle_types.as_raw(),
+            external_semaphore_features: src.external_semaphore_features.as_raw(),
+        }
+    }
+}
+
+impl ToAsh for VkExternalSemaphoreProperties {
+    type Ash = vk::ExternalSemaphoreProperties<'static>;
+    fn to_ash(&self) -> vk::ExternalSemaphoreProperties<'static> {
+        let src = self;
+        vk::ExternalSemaphoreProperties {
+            export_from_imported_handle_types: vk::ExternalSemaphoreHandleTypeFlags::from_raw(
+                src.export_from_imported_handle_types,
+            ),
+            compatible_handle_types: vk::ExternalSemaphoreHandleTypeFlags::from_raw(
+                src.compatible_handle_types,
+            ),
+            external_semaphore_features: vk::ExternalSemaphoreFeatureFlags::from_raw(
+                src.external_semaphore_features,
+            ),
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::FormatProperties> for VkFormatProperties {
     fn from_ash(src: &vk::FormatProperties) -> Self {
         Self {
@@ -1135,6 +1164,28 @@ impl ToAsh for VkPhysicalDeviceExternalImageFormatInfo {
         let src = self;
         vk::PhysicalDeviceExternalImageFormatInfo {
             handle_type: vk::ExternalMemoryHandleTypeFlags::from_raw(src.handle_type as u32),
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceExternalSemaphoreInfo<'_>>
+    for VkPhysicalDeviceExternalSemaphoreInfo
+{
+    fn from_ash(src: &vk::PhysicalDeviceExternalSemaphoreInfo<'_>) -> Self {
+        Self {
+            p_next: Vec::new(),
+            handle_type: src.handle_type.as_raw() as i32,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceExternalSemaphoreInfo {
+    type Ash = vk::PhysicalDeviceExternalSemaphoreInfo<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceExternalSemaphoreInfo<'static> {
+        let src = self;
+        vk::PhysicalDeviceExternalSemaphoreInfo {
+            handle_type: vk::ExternalSemaphoreHandleTypeFlags::from_raw(src.handle_type as u32),
             ..Default::default()
         }
     }
@@ -3418,6 +3469,27 @@ impl ToAsh for VkSamplerYcbcrConversionImageFormatProperties {
         let src = self;
         vk::SamplerYcbcrConversionImageFormatProperties {
             combined_image_sampler_descriptor_count: src.combined_image_sampler_descriptor_count,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::SemaphoreTypeCreateInfo<'_>> for VkSemaphoreTypeCreateInfo {
+    fn from_ash(src: &vk::SemaphoreTypeCreateInfo<'_>) -> Self {
+        Self {
+            semaphore_type: src.semaphore_type.as_raw(),
+            initial_value: src.initial_value,
+        }
+    }
+}
+
+impl ToAsh for VkSemaphoreTypeCreateInfo {
+    type Ash = vk::SemaphoreTypeCreateInfo<'static>;
+    fn to_ash(&self) -> vk::SemaphoreTypeCreateInfo<'static> {
+        let src = self;
+        vk::SemaphoreTypeCreateInfo {
+            semaphore_type: vk::SemaphoreType::from_raw(src.semaphore_type),
+            initial_value: src.initial_value,
             ..Default::default()
         }
     }

@@ -390,10 +390,10 @@ fn build_devices(
         // all-zero "assume every extension" mask this stage once sent had no
         // reference precedent (ADR-0004, correction of 2026-09-23).
         //
-        // `supports_multiple_timelines` stays false: `virtio_gpu::fence` is one
-        // FIFO retiring in submission order, and a renderer that promises
-        // per-queue timelines and then retires everything in one order returns
-        // the wrong fence to the wrong queue.
+        // `supports_multiple_timelines` is false for a capture: it runs no
+        // queue that could retire a fence on one
+        // (`SinkFactory::retires_ring_fences`; the executing renderer below
+        // says true, stage 5b.3).
         let renderer = virtio_gpu::VenusRenderer::new(sinks);
         let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
         gpu.set_refresh_hz(cfg.display.refresh_hz);
@@ -424,9 +424,11 @@ fn build_devices(
             );
         }
         tracing::warn!(
-            "attaching the Venus EXECUTING renderer (stage 5b.2): it answers the Vulkan bring-up, \
-             device memory, buffers, images, pipelines, descriptors, render passes, command \
-             buffers and fenced queue submission on the host GPU; semaphores are not served yet"
+            "attaching the Venus EXECUTING renderer (stage 5b.3): it answers the Vulkan 1.3 \
+             bring-up, device memory, buffers, images, pipelines, descriptors, render passes, \
+             dynamic rendering, command buffers, queue submission with fences and semaphores, \
+             the sync-file semaphore import a guest swapchain needs, and fences on every \
+             queue's timeline, on the host GPU"
         );
         let renderer =
             virtio_gpu::VenusRenderer::new(virtio_gpu::ExecutorFactory::new(Arc::new(host)));

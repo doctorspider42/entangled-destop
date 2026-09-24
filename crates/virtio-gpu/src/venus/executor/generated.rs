@@ -218,6 +218,12 @@ pub fn e_VkSamplerYcbcrRange(v: i32) -> bool {
     matches!(v, 0..=1)
 }
 
+/// Whether `v` is a `VkSemaphoreType` value of core Vulkan 1.0-1.3.
+#[must_use]
+pub fn e_VkSemaphoreType(v: i32) -> bool {
+    matches!(v, 0..=1)
+}
+
 /// Whether `v` is a `VkStencilOp` value of core Vulkan 1.0-1.3.
 #[must_use]
 pub fn e_VkStencilOp(v: i32) -> bool {
@@ -442,6 +448,56 @@ fn t_VkFenceCreateInfo(r: &mut dyn Resolve, v: &mut VkFenceCreateInfo) -> Result
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkFenceCreateInfo.flags", v.flags
+        )));
+    }
+    Ok(())
+}
+
+fn t_VkExportSemaphoreCreateInfo(
+    r: &mut dyn Resolve,
+    v: &mut VkExportSemaphoreCreateInfo,
+) -> Result<(), ExecError> {
+    if !(v.handle_types & !0x1f_u32 == 0) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkExportSemaphoreCreateInfo.handleTypes", v.handle_types
+        )));
+    }
+    Ok(())
+}
+
+fn t_VkSemaphoreTypeCreateInfo(
+    r: &mut dyn Resolve,
+    v: &mut VkSemaphoreTypeCreateInfo,
+) -> Result<(), ExecError> {
+    if !(e_VkSemaphoreType(v.semaphore_type)) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkSemaphoreTypeCreateInfo.semaphoreType", v.semaphore_type
+        )));
+    }
+    Ok(())
+}
+
+fn t_VkSemaphoreCreateInfo(
+    r: &mut dyn Resolve,
+    v: &mut VkSemaphoreCreateInfo,
+) -> Result<(), ExecError> {
+    for link in v.p_next.iter_mut() {
+        match link {
+            VkSemaphoreCreateInfoNext::VkExportSemaphoreCreateInfo(x) => {
+                t_VkExportSemaphoreCreateInfo(r, x)?
+            }
+            VkSemaphoreCreateInfoNext::VkSemaphoreTypeCreateInfo(x) => {
+                t_VkSemaphoreTypeCreateInfo(r, x)?
+            }
+            other => return Err(r.link("VkSemaphoreCreateInfo", ChainLink::structure_type(other))),
+        }
+    }
+    if !(v.flags & !0x0_u32 == 0) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkSemaphoreCreateInfo.flags", v.flags
         )));
     }
     Ok(())
@@ -3111,6 +3167,68 @@ fn t_VkSubpassEndInfo(r: &mut dyn Resolve, v: &mut VkSubpassEndInfo) -> Result<(
     Ok(())
 }
 
+fn t_VkSemaphoreWaitInfo(
+    r: &mut dyn Resolve,
+    v: &mut VkSemaphoreWaitInfo,
+) -> Result<(), ExecError> {
+    if !(v.flags & !0x1_u32 == 0) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkSemaphoreWaitInfo.flags", v.flags
+        )));
+    }
+    if let Some(x) = &v.p_semaphores {
+        chk_len(
+            r,
+            "VkSemaphoreWaitInfo.pSemaphores",
+            x.len(),
+            u64::from(v.semaphore_count),
+        )?;
+    }
+    if v.p_semaphores.is_none() && u64::from(v.semaphore_count) != 0 {
+        return Err(r.invalid(format!(
+            "{} is null with a nonzero count",
+            "VkSemaphoreWaitInfo.pSemaphores"
+        )));
+    }
+    for h in v.p_semaphores.iter_mut().flatten() {
+        h.0 = r.handle(
+            Kind::Semaphore,
+            h.0,
+            false,
+            "VkSemaphoreWaitInfo.pSemaphores",
+        )?;
+    }
+    if let Some(x) = &v.p_values {
+        chk_len(
+            r,
+            "VkSemaphoreWaitInfo.pValues",
+            x.len(),
+            u64::from(v.semaphore_count),
+        )?;
+    }
+    if v.p_values.is_none() && u64::from(v.semaphore_count) != 0 {
+        return Err(r.invalid(format!(
+            "{} is null with a nonzero count",
+            "VkSemaphoreWaitInfo.pValues"
+        )));
+    }
+    Ok(())
+}
+
+fn t_VkSemaphoreSignalInfo(
+    r: &mut dyn Resolve,
+    v: &mut VkSemaphoreSignalInfo,
+) -> Result<(), ExecError> {
+    v.semaphore.0 = r.handle(
+        Kind::Semaphore,
+        v.semaphore.0,
+        false,
+        "VkSemaphoreSignalInfo.semaphore",
+    )?;
+    Ok(())
+}
+
 fn t_VkPrivateDataSlotCreateInfo(
     r: &mut dyn Resolve,
     v: &mut VkPrivateDataSlotCreateInfo,
@@ -3857,6 +3975,25 @@ fn t_WaitForFences(r: &mut dyn Resolve, a: &mut WaitForFencesArgs) -> Result<(),
     for h in a.p_fences.iter_mut().flatten() {
         h.0 = r.handle(Kind::Fence, h.0, false, "vkWaitForFences.pFences")?;
     }
+    Ok(())
+}
+
+fn t_CreateSemaphore(r: &mut dyn Resolve, a: &mut CreateSemaphoreArgs) -> Result<(), ExecError> {
+    a.device.0 = r.handle(Kind::Device, a.device.0, false, "vkCreateSemaphore.device")?;
+    if let Some(x) = a.p_create_info.as_mut() {
+        t_VkSemaphoreCreateInfo(r, x)?;
+    }
+    Ok(())
+}
+
+fn t_DestroySemaphore(r: &mut dyn Resolve, a: &mut DestroySemaphoreArgs) -> Result<(), ExecError> {
+    a.device.0 = r.handle(Kind::Device, a.device.0, false, "vkDestroySemaphore.device")?;
+    a.semaphore.0 = r.handle(
+        Kind::Semaphore,
+        a.semaphore.0,
+        true,
+        "vkDestroySemaphore.semaphore",
+    )?;
     Ok(())
 }
 
@@ -6070,6 +6207,41 @@ fn t_CmdEndRenderPass2(
     Ok(())
 }
 
+fn t_GetSemaphoreCounterValue(
+    r: &mut dyn Resolve,
+    a: &mut GetSemaphoreCounterValueArgs,
+) -> Result<(), ExecError> {
+    a.device.0 = r.handle(
+        Kind::Device,
+        a.device.0,
+        false,
+        "vkGetSemaphoreCounterValue.device",
+    )?;
+    a.semaphore.0 = r.handle(
+        Kind::Semaphore,
+        a.semaphore.0,
+        false,
+        "vkGetSemaphoreCounterValue.semaphore",
+    )?;
+    Ok(())
+}
+
+fn t_WaitSemaphores(r: &mut dyn Resolve, a: &mut WaitSemaphoresArgs) -> Result<(), ExecError> {
+    a.device.0 = r.handle(Kind::Device, a.device.0, false, "vkWaitSemaphores.device")?;
+    if let Some(x) = a.p_wait_info.as_mut() {
+        t_VkSemaphoreWaitInfo(r, x)?;
+    }
+    Ok(())
+}
+
+fn t_SignalSemaphore(r: &mut dyn Resolve, a: &mut SignalSemaphoreArgs) -> Result<(), ExecError> {
+    a.device.0 = r.handle(Kind::Device, a.device.0, false, "vkSignalSemaphore.device")?;
+    if let Some(x) = a.p_signal_info.as_mut() {
+        t_VkSemaphoreSignalInfo(r, x)?;
+    }
+    Ok(())
+}
+
 fn t_CmdDrawIndirectCount(
     r: &mut dyn Resolve,
     a: &mut CmdDrawIndirectCountArgs,
@@ -6773,6 +6945,8 @@ pub fn translate(r: &mut dyn Resolve, command: &mut Command<'_>) -> Result<(), E
         Command::ResetFences(a) => t_ResetFences(r, a),
         Command::GetFenceStatus(a) => t_GetFenceStatus(r, a),
         Command::WaitForFences(a) => t_WaitForFences(r, a),
+        Command::CreateSemaphore(a) => t_CreateSemaphore(r, a),
+        Command::DestroySemaphore(a) => t_DestroySemaphore(r, a),
         Command::CreateEvent(a) => t_CreateEvent(r, a),
         Command::DestroyEvent(a) => t_DestroyEvent(r, a),
         Command::GetEventStatus(a) => t_GetEventStatus(r, a),
@@ -6871,6 +7045,9 @@ pub fn translate(r: &mut dyn Resolve, command: &mut Command<'_>) -> Result<(), E
         Command::CmdBeginRenderPass2(a) => t_CmdBeginRenderPass2(r, a),
         Command::CmdNextSubpass2(a) => t_CmdNextSubpass2(r, a),
         Command::CmdEndRenderPass2(a) => t_CmdEndRenderPass2(r, a),
+        Command::GetSemaphoreCounterValue(a) => t_GetSemaphoreCounterValue(r, a),
+        Command::WaitSemaphores(a) => t_WaitSemaphores(r, a),
+        Command::SignalSemaphore(a) => t_SignalSemaphore(r, a),
         Command::CmdDrawIndirectCount(a) => t_CmdDrawIndirectCount(r, a),
         Command::CmdDrawIndexedIndirectCount(a) => t_CmdDrawIndexedIndirectCount(r, a),
         Command::CmdSetCullMode(a) => t_CmdSetCullMode(r, a),
@@ -7397,7 +7574,6 @@ pub fn is_pass_through(command: &Command<'_>) -> bool {
             | Command::ResetEvent(_)
             | Command::MergePipelineCaches(_)
             | Command::GetRenderAreaGranularity(_)
-            | Command::BeginCommandBuffer(_)
             | Command::EndCommandBuffer(_)
             | Command::CmdSetLineWidth(_)
             | Command::CmdSetDepthBias(_)
@@ -7445,7 +7621,6 @@ pub fn is_pass_through(command: &Command<'_>) -> bool {
             | Command::CmdResetEvent2(_)
             | Command::CmdWaitEvents2(_)
             | Command::CmdPipelineBarrier2(_)
-            | Command::CmdBeginRendering(_)
             | Command::CmdEndRendering(_)
     )
 }
@@ -7460,6 +7635,7 @@ pub fn set_result(command: &mut Command<'_>, ret: i32) -> bool {
         Command::ResetFences(a) => a.ret = ret,
         Command::GetFenceStatus(a) => a.ret = ret,
         Command::WaitForFences(a) => a.ret = ret,
+        Command::CreateSemaphore(a) => a.ret = ret,
         Command::CreateEvent(a) => a.ret = ret,
         Command::GetEventStatus(a) => a.ret = ret,
         Command::SetEvent(a) => a.ret = ret,
@@ -7489,6 +7665,9 @@ pub fn set_result(command: &mut Command<'_>, ret: i32) -> bool {
         Command::CreateDescriptorUpdateTemplate(a) => a.ret = ret,
         Command::CreateSamplerYcbcrConversion(a) => a.ret = ret,
         Command::CreateRenderPass2(a) => a.ret = ret,
+        Command::GetSemaphoreCounterValue(a) => a.ret = ret,
+        Command::WaitSemaphores(a) => a.ret = ret,
+        Command::SignalSemaphore(a) => a.ret = ret,
         Command::CreatePrivateDataSlot(a) => a.ret = ret,
         Command::SetPrivateData(a) => a.ret = ret,
         Command::QueueSubmit2(a) => a.ret = ret,
@@ -7508,6 +7687,7 @@ pub fn result_of(command: &Command<'_>) -> Option<i32> {
         Command::ResetFences(a) => Some(a.ret),
         Command::GetFenceStatus(a) => Some(a.ret),
         Command::WaitForFences(a) => Some(a.ret),
+        Command::CreateSemaphore(a) => Some(a.ret),
         Command::CreateEvent(a) => Some(a.ret),
         Command::GetEventStatus(a) => Some(a.ret),
         Command::SetEvent(a) => Some(a.ret),
@@ -7537,6 +7717,9 @@ pub fn result_of(command: &Command<'_>) -> Option<i32> {
         Command::CreateDescriptorUpdateTemplate(a) => Some(a.ret),
         Command::CreateSamplerYcbcrConversion(a) => Some(a.ret),
         Command::CreateRenderPass2(a) => Some(a.ret),
+        Command::GetSemaphoreCounterValue(a) => Some(a.ret),
+        Command::WaitSemaphores(a) => Some(a.ret),
+        Command::SignalSemaphore(a) => Some(a.ret),
         Command::CreatePrivateDataSlot(a) => Some(a.ret),
         Command::SetPrivateData(a) => Some(a.ret),
         Command::QueueSubmit2(a) => Some(a.ret),
@@ -7551,6 +7734,10 @@ pub fn output_handles<'c>(command: &'c mut Command<'_>) -> Option<(Kind, Vec<&'c
         Command::CreateFence(a) => Some((
             Kind::Fence,
             a.p_fence.iter_mut().map(|h| &mut h.0).collect(),
+        )),
+        Command::CreateSemaphore(a) => Some((
+            Kind::Semaphore,
+            a.p_semaphore.iter_mut().map(|h| &mut h.0).collect(),
         )),
         Command::CreateEvent(a) => Some((
             Kind::Event,
@@ -7657,6 +7844,8 @@ pub const TRANSLATED: &[&str] = &[
     "vkResetFences",
     "vkGetFenceStatus",
     "vkWaitForFences",
+    "vkCreateSemaphore",
+    "vkDestroySemaphore",
     "vkCreateEvent",
     "vkDestroyEvent",
     "vkGetEventStatus",
@@ -7755,6 +7944,9 @@ pub const TRANSLATED: &[&str] = &[
     "vkCmdBeginRenderPass2",
     "vkCmdNextSubpass2",
     "vkCmdEndRenderPass2",
+    "vkGetSemaphoreCounterValue",
+    "vkWaitSemaphores",
+    "vkSignalSemaphore",
     "vkCmdDrawIndirectCount",
     "vkCmdDrawIndexedIndirectCount",
     "vkCmdSetCullMode",
@@ -7800,7 +7992,6 @@ pub const PASS_THROUGH: &[&str] = &[
     "vkResetEvent",
     "vkMergePipelineCaches",
     "vkGetRenderAreaGranularity",
-    "vkBeginCommandBuffer",
     "vkEndCommandBuffer",
     "vkCmdSetLineWidth",
     "vkCmdSetDepthBias",
@@ -7848,6 +8039,5 @@ pub const PASS_THROUGH: &[&str] = &[
     "vkCmdResetEvent2",
     "vkCmdWaitEvents2",
     "vkCmdPipelineBarrier2",
-    "vkCmdBeginRendering",
     "vkCmdEndRendering",
 ];

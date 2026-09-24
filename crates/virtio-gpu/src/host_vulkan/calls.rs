@@ -281,6 +281,67 @@ fn ch_VkFenceCreateInfo(
     Ok(next)
 }
 
+fn c_VkExportSemaphoreCreateInfo(
+    a: &mut Arena,
+    v: &VkExportSemaphoreCreateInfo,
+) -> Result<vk::ExportSemaphoreCreateInfo<'static>, CallError> {
+    Ok(vk::ExportSemaphoreCreateInfo {
+        handle_types: vk::ExternalSemaphoreHandleTypeFlags::from_raw(v.handle_types),
+        ..Default::default()
+    })
+}
+
+fn c_VkSemaphoreTypeCreateInfo(
+    a: &mut Arena,
+    v: &VkSemaphoreTypeCreateInfo,
+) -> Result<vk::SemaphoreTypeCreateInfo<'static>, CallError> {
+    Ok(vk::SemaphoreTypeCreateInfo {
+        semaphore_type: vk::SemaphoreType::from_raw(v.semaphore_type),
+        initial_value: v.initial_value,
+        ..Default::default()
+    })
+}
+
+fn c_VkSemaphoreCreateInfo(
+    a: &mut Arena,
+    v: &VkSemaphoreCreateInfo,
+) -> Result<vk::SemaphoreCreateInfo<'static>, CallError> {
+    let next = ch_VkSemaphoreCreateInfo(a, &v.p_next)?;
+    Ok(vk::SemaphoreCreateInfo {
+        p_next: next as _,
+        flags: vk::SemaphoreCreateFlags::from_raw(v.flags),
+        ..Default::default()
+    })
+}
+
+fn ch_VkSemaphoreCreateInfo(
+    a: &mut Arena,
+    links: &[VkSemaphoreCreateInfoNext],
+) -> Result<*mut c_void, CallError> {
+    let mut next: *mut c_void = core::ptr::null_mut();
+    for link in links.iter().rev() {
+        next = match link {
+            VkSemaphoreCreateInfoNext::VkExportSemaphoreCreateInfo(x) => {
+                let mut c = c_VkExportSemaphoreCreateInfo(a, x)?;
+                c.p_next = next as _;
+                a.one(c).cast()
+            }
+            VkSemaphoreCreateInfoNext::VkSemaphoreTypeCreateInfo(x) => {
+                let mut c = c_VkSemaphoreTypeCreateInfo(a, x)?;
+                c.p_next = next as _;
+                a.one(c).cast()
+            }
+            other => {
+                return Err(CallError::Link {
+                    parent: "VkSemaphoreCreateInfo",
+                    stype: ChainLink::structure_type(other),
+                })
+            }
+        };
+    }
+    Ok(next)
+}
+
 fn c_VkEventCreateInfo(
     a: &mut Arena,
     v: &VkEventCreateInfo,
@@ -3019,6 +3080,56 @@ fn c_VkSubpassEndInfo(
     })
 }
 
+fn c_VkSemaphoreWaitInfo(
+    a: &mut Arena,
+    v: &VkSemaphoreWaitInfo,
+) -> Result<vk::SemaphoreWaitInfo<'static>, CallError> {
+    if let Some(x) = &v.p_semaphores {
+        same(
+            x.len(),
+            u64::from(v.semaphore_count),
+            "VkSemaphoreWaitInfo.pSemaphores",
+        )?;
+    }
+    if let Some(x) = &v.p_values {
+        same(
+            x.len(),
+            u64::from(v.semaphore_count),
+            "VkSemaphoreWaitInfo.pValues",
+        )?;
+    }
+    Ok(vk::SemaphoreWaitInfo {
+        flags: vk::SemaphoreWaitFlags::from_raw(v.flags),
+        semaphore_count: v.semaphore_count,
+        p_semaphores: match &v.p_semaphores {
+            Some(xs) => {
+                let c: Vec<_> = xs.iter().map(|x| vk::Semaphore::from_raw(x.0)).collect();
+                a.slice(c).cast_const()
+            }
+            None => core::ptr::null(),
+        },
+        p_values: match &v.p_values {
+            Some(xs) => {
+                let c: Vec<_> = xs.iter().map(|x| *x).collect();
+                a.slice(c).cast_const()
+            }
+            None => core::ptr::null(),
+        },
+        ..Default::default()
+    })
+}
+
+fn c_VkSemaphoreSignalInfo(
+    a: &mut Arena,
+    v: &VkSemaphoreSignalInfo,
+) -> Result<vk::SemaphoreSignalInfo<'static>, CallError> {
+    Ok(vk::SemaphoreSignalInfo {
+        semaphore: vk::Semaphore::from_raw(v.semaphore.0),
+        value: v.value,
+        ..Default::default()
+    })
+}
+
 fn c_VkPrivateDataSlotCreateInfo(
     a: &mut Arena,
     v: &VkPrivateDataSlotCreateInfo,
@@ -3774,6 +3885,44 @@ unsafe fn call_WaitForFences(
         )
     };
     args.ret = r.as_raw();
+    Ok(())
+}
+
+unsafe fn call_CreateSemaphore(
+    device: &ash::Device,
+    a: &mut Arena,
+    args: &mut CreateSemaphoreArgs,
+) -> Result<(), CallError> {
+    let mut o_p_semaphore = vk::Semaphore::null();
+    let p1 = match &args.p_create_info {
+        Some(x) => {
+            let c = c_VkSemaphoreCreateInfo(a, x)?;
+            a.one(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    let p2 = core::ptr::null();
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    let r =
+        unsafe { (device.fp_v1_0().create_semaphore)(device.handle(), p1, p2, &mut o_p_semaphore) };
+    args.ret = r.as_raw();
+    args.p_semaphore = Some(VkSemaphore(o_p_semaphore.as_raw()));
+    Ok(())
+}
+
+unsafe fn call_DestroySemaphore(
+    device: &ash::Device,
+    a: &mut Arena,
+    args: &mut DestroySemaphoreArgs,
+) -> Result<(), CallError> {
+    let p1 = vk::Semaphore::from_raw(args.semaphore.0);
+    let p2 = core::ptr::null();
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe { (device.fp_v1_0().destroy_semaphore)(device.handle(), p1, p2) };
     Ok(())
 }
 
@@ -6213,6 +6362,64 @@ unsafe fn call_CmdEndRenderPass2(
     Ok(())
 }
 
+unsafe fn call_GetSemaphoreCounterValue(
+    device: &ash::Device,
+    a: &mut Arena,
+    args: &mut GetSemaphoreCounterValueArgs,
+) -> Result<(), CallError> {
+    let mut o_p_value = args.p_value.unwrap_or_default();
+    let p1 = vk::Semaphore::from_raw(args.semaphore.0);
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    let r = unsafe {
+        (device.fp_v1_2().get_semaphore_counter_value)(device.handle(), p1, &mut o_p_value)
+    };
+    args.ret = r.as_raw();
+    args.p_value = Some(o_p_value);
+    Ok(())
+}
+
+unsafe fn call_WaitSemaphores(
+    device: &ash::Device,
+    a: &mut Arena,
+    args: &mut WaitSemaphoresArgs,
+) -> Result<(), CallError> {
+    let p1 = match &args.p_wait_info {
+        Some(x) => {
+            let c = c_VkSemaphoreWaitInfo(a, x)?;
+            a.one(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    let r = unsafe { (device.fp_v1_2().wait_semaphores)(device.handle(), p1, args.timeout) };
+    args.ret = r.as_raw();
+    Ok(())
+}
+
+unsafe fn call_SignalSemaphore(
+    device: &ash::Device,
+    a: &mut Arena,
+    args: &mut SignalSemaphoreArgs,
+) -> Result<(), CallError> {
+    let p1 = match &args.p_signal_info {
+        Some(x) => {
+            let c = c_VkSemaphoreSignalInfo(a, x)?;
+            a.one(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    let r = unsafe { (device.fp_v1_2().signal_semaphore)(device.handle(), p1) };
+    args.ret = r.as_raw();
+    Ok(())
+}
+
 unsafe fn call_CmdDrawIndirectCount(
     device: &ash::Device,
     a: &mut Arena,
@@ -6986,6 +7193,8 @@ pub unsafe fn call(device: &ash::Device, command: &mut Command<'_>) -> Result<()
             Command::ResetFences(args) => call_ResetFences(device, &mut arena, args),
             Command::GetFenceStatus(args) => call_GetFenceStatus(device, &mut arena, args),
             Command::WaitForFences(args) => call_WaitForFences(device, &mut arena, args),
+            Command::CreateSemaphore(args) => call_CreateSemaphore(device, &mut arena, args),
+            Command::DestroySemaphore(args) => call_DestroySemaphore(device, &mut arena, args),
             Command::CreateEvent(args) => call_CreateEvent(device, &mut arena, args),
             Command::DestroyEvent(args) => call_DestroyEvent(device, &mut arena, args),
             Command::GetEventStatus(args) => call_GetEventStatus(device, &mut arena, args),
@@ -7162,6 +7371,11 @@ pub unsafe fn call(device: &ash::Device, command: &mut Command<'_>) -> Result<()
             }
             Command::CmdNextSubpass2(args) => call_CmdNextSubpass2(device, &mut arena, args),
             Command::CmdEndRenderPass2(args) => call_CmdEndRenderPass2(device, &mut arena, args),
+            Command::GetSemaphoreCounterValue(args) => {
+                call_GetSemaphoreCounterValue(device, &mut arena, args)
+            }
+            Command::WaitSemaphores(args) => call_WaitSemaphores(device, &mut arena, args),
+            Command::SignalSemaphore(args) => call_SignalSemaphore(device, &mut arena, args),
             Command::CmdDrawIndirectCount(args) => {
                 call_CmdDrawIndirectCount(device, &mut arena, args)
             }

@@ -24,9 +24,9 @@ use std::sync::Arc;
 use super::objects::Kind;
 use crate::venus::protocol::{
     Command, VkBufferCreateInfo, VkBufferViewCreateInfo, VkCommandPoolCreateInfo,
-    VkDeviceCreateInfoNext, VkExtensionProperties, VkFormat, VkFormatProperties2,
-    VkImageAspectFlagBits, VkImageCreateInfo, VkImageFormatProperties2, VkImageSubresource,
-    VkImageViewCreateInfo, VkMemoryRequirements2, VkPhysicalDeviceFeatures,
+    VkDeviceCreateInfoNext, VkExtensionProperties, VkExternalSemaphoreProperties, VkFormat,
+    VkFormatProperties2, VkImageAspectFlagBits, VkImageCreateInfo, VkImageFormatProperties2,
+    VkImageSubresource, VkImageViewCreateInfo, VkMemoryRequirements2, VkPhysicalDeviceFeatures,
     VkPhysicalDeviceFeatures2, VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceMemoryProperties,
     VkPhysicalDeviceProperties2, VkQueueFamilyProperties, VkResult, VkSubresourceLayout,
 };
@@ -211,8 +211,10 @@ pub trait HostVulkan: Send + Sync + 'static {
     type Instance: Send + 'static;
     /// A host `VkPhysicalDevice`.
     type PhysicalDevice: Copy + Eq + Send + fmt::Debug + 'static;
-    /// A host `VkDevice` together with whatever calling it needs.
-    type Device: Send + 'static;
+    /// A host `VkDevice` together with whatever calling it needs. Shared
+    /// with the fence threads of its queues (stage 5b.3), which only wait on
+    /// and destroy fences of their own through it.
+    type Device: Send + Sync + 'static;
     /// A host `VkQueue`.
     type Queue: Copy + Send + RawHandle + 'static;
     /// A host `VkCommandPool`.
@@ -289,6 +291,16 @@ pub trait HostVulkan: Send + Sync + 'static {
         info: &VkPhysicalDeviceImageFormatInfo2,
         out: &mut VkImageFormatProperties2,
     ) -> VkResult;
+
+    /// `vkGetPhysicalDeviceExternalSemaphoreProperties` for `handle_type`,
+    /// of a timeline semaphore when `timeline`: the host driver's own answer.
+    fn external_semaphore_properties(
+        &self,
+        instance: &Self::Instance,
+        device: Self::PhysicalDevice,
+        handle_type: u32,
+        timeline: bool,
+    ) -> VkExternalSemaphoreProperties;
 
     /// `vkCreateDevice`.
     ///

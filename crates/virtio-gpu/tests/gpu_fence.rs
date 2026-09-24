@@ -21,6 +21,9 @@
 //!   wedge the device by fencing everything;
 //! * a fence that never retires is completed by the watchdog;
 //! * a device reset releases everything held;
+//! * fences on two `ring_idx` timelines of a context (stage 5b.3) retire
+//!   independently, each in its own order, and a retirement never completes
+//!   another timeline's responses;
 //! * a renderer that dies mid-flight (GPU-012) degrades the device instead of
 //!   killing it: the pending responses come back, the 2D path still works,
 //!   and the driver is told the device needs a reset.
@@ -34,7 +37,7 @@ use virtio_core::chain::VIRTQ_DESC_F_WRITE;
 use virtio_core::testing::{guest_memory, SplitRing, TestIrqLine};
 use virtio_core::{mmio, status, GuestMem, HostWaker, MmioTransport, VirtioDevice};
 use virtio_gpu::protocol::{cmd, resp, MemEntry, Rect, ResourceCreate3d, Transfer3d, CTRL_HDR_LEN};
-use virtio_gpu::renderer::{CapsetInfo, FenceOutcome, Renderer3d};
+use virtio_gpu::renderer::{CapsetInfo, FenceOutcome, FenceTimeline, Renderer3d};
 use virtio_gpu::{CommandError, GpuDevice, NullRenderer, MAX_PENDING_FENCES};
 use vm_memory::{Bytes, GuestAddress};
 
@@ -66,6 +69,10 @@ struct FenceState {
     dead: bool,
     /// `still_pending` values the device reported.
     reported_pending: Vec<usize>,
+    /// Fences created on a `ring_idx` timeline, in creation order.
+    created_on: Vec<(FenceTimeline, u32)>,
+    /// Timeline fences the next poll will report.
+    retire_on: Vec<(FenceTimeline, u32)>,
 }
 
 #[derive(Clone, Default)]
@@ -83,6 +90,15 @@ impl FenceControl {
     /// Marks `fence_id` retired; the device learns of it on its next poll.
     fn retire(&self, fence_id: u32) {
         self.with(|s| s.retire.push(fence_id));
+    }
+
+    /// Marks `fence_id` of `timeline` retired.
+    fn retire_on(&self, timeline: FenceTimeline, fence_id: u32) {
+        self.with(|s| s.retire_on.push((timeline, fence_id)));
+    }
+
+    fn created_on(&self) -> Vec<(FenceTimeline, u32)> {
+        self.with(|s| s.created_on.clone())
     }
 
     fn polls(&self) -> usize {
@@ -238,6 +254,35 @@ impl Renderer3d for DeferringRenderer {
         })
     }
 
+    /// A header with a `ring_idx` names a context timeline, as the Venus
+    /// renderer's do; without one, the device's (the default, virgl's).
+    fn create_fence_on(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: Option<u8>,
+        fence_id: u32,
+    ) -> Result<(FenceTimeline, FenceOutcome), CommandError> {
+        let Some(ring_idx) = ring_idx else {
+            return self
+                .create_fence(ctx_id, fence_id)
+                .map(|o| (FenceTimeline::Device, o));
+        };
+        let timeline = FenceTimeline::Ring { ctx_id, ring_idx };
+        self.control
+            .with(|s| s.created_on.push((timeline, fence_id)));
+        Ok((timeline, FenceOutcome::Pending))
+    }
+
+    fn poll_fence_timelines(&mut self, still_pending: usize) -> Vec<(FenceTimeline, u32)> {
+        let device: Vec<(FenceTimeline, u32)> = self
+            .poll_fences(still_pending)
+            .into_iter()
+            .map(|id| (FenceTimeline::Device, id))
+            .collect();
+        let rings = self.control.with(|s| std::mem::take(&mut s.retire_on));
+        device.into_iter().chain(rings).collect()
+    }
+
     fn is_alive(&self) -> bool {
         !self.is_dead()
     }
@@ -273,6 +318,16 @@ impl Request {
     fn fenced(mut self, fence_id: u64) -> Self {
         self.0[4..8].copy_from_slice(&virtio_gpu::FLAG_FENCE.to_le_bytes());
         self.0[8..16].copy_from_slice(&fence_id.to_le_bytes());
+        self
+    }
+
+    /// On timeline `ring_idx` (`VIRTIO_GPU_FLAG_INFO_RING_IDX`), as the guest
+    /// kernel sends an execbuffer with `VIRTGPU_EXECBUF_RING_IDX`.
+    fn on_ring(mut self, ring_idx: u8) -> Self {
+        let flags = u32::from_le_bytes(self.0[4..8].try_into().expect("in range"))
+            | virtio_gpu::FLAG_INFO_RING_IDX;
+        self.0[4..8].copy_from_slice(&flags.to_le_bytes());
+        self.0[20] = ring_idx;
         self
     }
 
@@ -691,6 +746,83 @@ fn retiring_one_fence_completes_the_whole_prefix_in_order() {
     // fence bookkeeping assumes.
     let heads: Vec<u16> = done.iter().map(|r| r.head).collect();
     assert!(heads.windows(2).all(|w| w[0] < w[1]), "{heads:?}");
+}
+
+/// Stage 5b.3: a context's queues each have a fence timeline. Fences on two
+/// of them retire independently — the second queue's finishing first
+/// completes only its own — and in order within each; a device-timeline
+/// fence in between is untouched by either; and each response echoes its
+/// `ring_idx`.
+#[test]
+fn fences_on_two_ring_timelines_retire_independently_and_in_order() {
+    let control = FenceControl::default();
+    let mut h = Harness::with_ring(control.clone(), 64);
+    h.open_3d();
+    let stream = stream_of(1);
+    let ring = |ring_idx| FenceTimeline::Ring {
+        ctx_id: 1,
+        ring_idx,
+    };
+    for (fence, ring_idx) in [
+        (0x8001u64, Some(1u8)),
+        (0x8002, Some(2)),
+        (0x8003, None),
+        (0x8004, Some(1)),
+        (0x8005, Some(2)),
+    ] {
+        let request = submit_3d(1, &stream).fenced(fence);
+        let request = match ring_idx {
+            Some(r) => request.on_ring(r),
+            None => request,
+        };
+        assert!(h.run(&request).is_empty(), "every one is deferred");
+    }
+    assert_eq!(
+        control.created_on(),
+        vec![
+            (ring(1), 0x8001),
+            (ring(2), 0x8002),
+            (ring(1), 0x8004),
+            (ring(2), 0x8005)
+        ]
+    );
+    assert_eq!(control.created(), vec![0x8003], "the device timeline's own");
+
+    // Timeline 2's newest retires first: only timeline 2's two complete.
+    control.retire_on(ring(2), 0x8005);
+    h.kick();
+    let done = h.collect();
+    let fences: Vec<u64> = done.iter().map(Response::fence_id).collect();
+    assert_eq!(fences, vec![0x8002, 0x8005]);
+    for response in &done {
+        assert_ne!(response.flags() & virtio_gpu::FLAG_INFO_RING_IDX, 0);
+        assert_eq!(response.raw[20], 2, "the ring_idx is echoed");
+    }
+    // An id of timeline 1 reported on timeline 2 completes nothing.
+    control.retire_on(ring(2), 0x8004);
+    h.kick();
+    assert!(h.collect().is_empty());
+    // Timeline 1, then the device's.
+    control.retire_on(ring(1), 0x8001);
+    h.kick();
+    assert_eq!(
+        h.collect()
+            .iter()
+            .map(Response::fence_id)
+            .collect::<Vec<_>>(),
+        vec![0x8001]
+    );
+    control.retire(0x8003);
+    control.retire_on(ring(1), 0x8004);
+    h.kick();
+    assert_eq!(
+        h.collect()
+            .iter()
+            .map(Response::fence_id)
+            .collect::<Vec<_>>(),
+        vec![0x8003, 0x8004]
+    );
+    assert!(!h.needs_reset());
 }
 
 /// A fenced command that *fails* is answered at once: there is no host work

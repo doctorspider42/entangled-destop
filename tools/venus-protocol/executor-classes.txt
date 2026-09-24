@@ -4,8 +4,12 @@
 # hand-written sections agree with the `match` arms that implement them.
 #
 # A line is one command; `#` starts a comment. Extension commands are not
-# listed: no device extension is advertised, so every one of them stays
-# refused as "decodable but not implemented".
+# listed: the device extensions advertised (VK_KHR_synchronization2,
+# VK_KHR_external_semaphore_fd) add no command outside core 1.3 that a guest
+# sends, and the venus protocol's own vkImportSemaphoreResourceMESA and
+# vkWaitSemaphoreResourceMESA are served by hand (executor/submit.rs,
+# `dispatch_extension`); every other extension command stays refused as
+# "decodable but not implemented".
 #
 # [bespoke]      Stages 5a.3 and 5b.1: hand-written end to end, host call
 #                included (`VulkanContext::dispatch` in executor/context.rs,
@@ -35,6 +39,7 @@ vkGetPhysicalDeviceFeatures2
 vkGetPhysicalDeviceQueueFamilyProperties2
 vkGetPhysicalDeviceMemoryProperties2
 vkEnumerateDeviceExtensionProperties
+vkGetPhysicalDeviceExternalSemaphoreProperties  # SYNC_FD synthesized (5b.3)
 vkGetPhysicalDeviceFormatProperties2
 vkGetPhysicalDeviceImageFormatProperties2
 vkCreateDevice
@@ -109,6 +114,7 @@ vkDestroyPrivateDataSlot
 vkSetPrivateData                # objectHandle is an id of objectType
 vkGetPrivateData
 # Command buffers and pools.
+vkBeginCommandBuffer            # inherited rendering inside maxColorAttachments (5b.3)
 vkAllocateCommandBuffers        # ids bound to the pool, with their level
 vkFreeCommandBuffers
 vkResetCommandPool
@@ -118,7 +124,12 @@ vkCreateFence
 vkDestroyFence
 vkResetFences
 vkWaitForFences                 # a real wait, in slices, off the context lock
-vkQueueSubmit                   # no semaphore until stage 5b.3
+vkCreateSemaphore               # binary or timeline; SYNC_FD export stripped (5b.3)
+vkDestroySemaphore
+vkGetSemaphoreCounterValue      # timeline only
+vkWaitSemaphores                # timeline only; sliced like vkWaitForFences
+vkSignalSemaphore               # timeline only
+vkQueueSubmit                   # semaphore state, counts, temporary payloads (5b.3)
 vkQueueSubmit2
 vkQueueWaitIdle
 vkDeviceWaitIdle
@@ -128,6 +139,7 @@ vkCmdBindPipeline               # the pipeline's own bind point
 vkCmdBindDescriptorSets         # sets inside the layout, one offset per dynamic descriptor
 vkCmdBeginRenderPass            # framebuffer and pass agree, a clear value per cleared attachment
 vkCmdBeginRenderPass2
+vkCmdBeginRendering             # colour attachments, view mask, layers, area (5b.3)
 vkCmdBindIndexBuffer            # offset inside the buffer
 vkCmdBindVertexBuffers          # binding range and offsets
 vkCmdBindVertexBuffers2
@@ -160,7 +172,6 @@ vkCmdSetDeviceMask              # inside the device group
 vkCmdExecuteCommands            # secondaries only
 
 [generated]
-vkBeginCommandBuffer
 vkEndCommandBuffer
 vkTrimCommandPool
 vkMergePipelineCaches
@@ -202,7 +213,6 @@ vkCmdNextSubpass
 vkCmdNextSubpass2
 vkCmdEndRenderPass
 vkCmdEndRenderPass2
-vkCmdBeginRendering
 vkCmdEndRendering
 vkCmdSetCullMode
 vkCmdSetFrontFace
@@ -225,12 +235,6 @@ vkGetDeviceImageSparseMemoryRequirements
 vkGetPhysicalDeviceSparseImageFormatProperties
 vkGetPhysicalDeviceSparseImageFormatProperties2
 vkQueueBindSparse
-# Semaphores are stage 5b.3.
-vkCreateSemaphore
-vkDestroySemaphore
-vkGetSemaphoreCounterValue
-vkWaitSemaphores
-vkSignalSemaphore
 # The 1.0 forms of queries Mesa only ever asks in their 1.1 form.
 vkGetPhysicalDeviceFeatures
 vkGetPhysicalDeviceQueueFamilyProperties
@@ -243,9 +247,9 @@ vkEnumerateInstanceExtensionProperties
 vkEnumerateDeviceLayerProperties
 vkGetDeviceQueue
 vkGetPhysicalDeviceToolProperties
-# External handles: no external-handle extension is advertised.
+# External handles: no external-memory or external-fence extension is
+# advertised (the one semaphore query is served, above).
 vkGetPhysicalDeviceExternalBufferProperties
-vkGetPhysicalDeviceExternalSemaphoreProperties
 vkGetPhysicalDeviceExternalFenceProperties
 # Host-visible memory is the renderer's own coherent pages: nothing to map,
 # unmap, flush or invalidate on the host (ADR-0004, 2026-09-23).

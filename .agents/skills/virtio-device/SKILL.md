@@ -551,7 +551,15 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
     renderer for a fence), a 2 s watchdog (`FENCE_TIMEOUT`) so a stalled host
     never becomes a stalled guest, immediate answers for failed fenced
     commands, and a reset that drops everything held. `ENTANGLED_GPU_FENCES=sync`
-    forces phase 1 back for a measurement.
+    forces phase 1 back for a measurement. Since EPIC 20 stage 5b.3 the table
+    holds **one FIFO per timeline** (`virtio_gpu::FenceTimeline`): the device's,
+    for every fence without `VIRTIO_GPU_FLAG_INFO_RING_IDX` (all of virgl's),
+    and one per `(ctx_id, ring_idx)` when the header carries it (the guest
+    kernel's per-ring fence contexts; Venus binds one per `VkQueue`). A
+    retirement completes only its own timeline's prefix. A renderer names the
+    timeline through `Renderer3d::create_fence_on` / `poll_fence_timelines`,
+    whose defaults put everything on the device timeline — never change a
+    renderer's fence behaviour by editing `create_fence`/`poll_fences` alone.
   - **The renderer runs in another process by default** (`[display]
     virgl_isolation = "process"`, GPU-012). `virtio_gpu::remote` is the whole
     story: a portable protocol (builds/tests on Windows too), a client that

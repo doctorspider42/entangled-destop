@@ -127,14 +127,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use thiserror::Error;
-use virtio_core::{GuestMem, Quiesce, ShmBacking};
+use virtio_core::{GuestMem, HostWaker, Quiesce, ShmBacking};
 
 use crate::blob::{BlobMapping, BlobSupport};
 use crate::error::CommandError;
 use crate::protocol::{
     MemEntry, Rect, ResourceCreate3d, ResourceCreateBlob, Transfer3d, BLOB_MEM_HOST3D,
 };
-use crate::renderer::{CapsetInfo, Renderer3d};
+use crate::renderer::{CapsetInfo, FenceOutcome, FenceTimeline, Renderer3d};
 
 use super::capset::{VenusCapset, VENUS_CAPSET_LEN, VENUS_CAPSET_MAX_VERSION};
 #[cfg(doc)]
@@ -309,6 +309,156 @@ pub trait SinkFactory: Send {
     /// to a file.
     fn snapshot_refusal(&self) -> Option<String> {
         None
+    }
+
+    /// Whether this factory retires virtio-gpu fences on a context's
+    /// `ring_idx` timelines ([`Self::create_ring_fence`]) — what the capset's
+    /// `supports_multiple_timelines` says (stage 5b.3). The default: no.
+    fn retires_ring_fences(&self) -> bool {
+        false
+    }
+
+    /// A virtio-gpu fence on `fence.ring_idx` (1..64) of `fence.ctx_id`: it
+    /// retires once the work submitted so far to the `VkQueue` the guest
+    /// bound to that timeline is done, reported through `retire` from
+    /// whichever thread sees it ([`FenceRetirer::retire`]).
+    /// [`FenceOutcome::Signalled`] when it is already past (a lost device).
+    ///
+    /// Called on the device's queue worker, after the context commands
+    /// before the fence have been executed.
+    ///
+    /// # Errors
+    /// Why no host queue can carry it — vkr refuses a fence on a timeline no
+    /// queue is bound to (`vkr_context_submit_fence`). The default: this
+    /// factory executes no Vulkan.
+    fn create_ring_fence(
+        &mut self,
+        fence: RingFence,
+        retire: &FenceRetirer,
+    ) -> Result<FenceOutcome, String> {
+        let _ = (fence, retire);
+        Err("this renderer executes no Vulkan, so no queue is bound to any ring_idx".into())
+    }
+
+    /// Ring fences created and not yet retired.
+    fn pending_ring_fences(&self) -> usize {
+        0
+    }
+}
+
+// ------------------------------------------------------------ ring fences
+
+/// A virtio-gpu fence on one of a context's `ring_idx` timelines (EPIC 20
+/// stage 5b.3; the kernel's per-`(context, ring_idx)` fence context).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingFence {
+    /// The context.
+    pub ctx_id: u32,
+    /// The timeline, 1..64 (0 is the CPU's, which never reaches a factory).
+    pub ring_idx: u8,
+    /// The fence id, as the device keys it.
+    pub fence_id: u32,
+}
+
+/// Most retired ring fences held for the device at once. The device asks
+/// for a fence only while its own table ([`crate::MAX_PENDING_FENCES`]) has
+/// room and collects retirements whenever it is woken, so this is only ever
+/// reached by retirements nobody is waiting for any more (the device's
+/// watchdog already answered them); the oldest of those are dropped.
+pub const MAX_RETIRED_RING_FENCES: usize = 4 * crate::MAX_PENDING_FENCES;
+
+#[derive(Default)]
+struct RetireState {
+    retired: Mutex<Vec<RingFence>>,
+    waker: Mutex<Option<Arc<dyn HostWaker>>>,
+}
+
+/// Where a [`SinkFactory`] reports ring fences it has retired: a list the
+/// device collects on its (pause-gated) queue worker through
+/// [`Renderer3d::poll_fence_timelines`], and the device's [`HostWaker`] to
+/// ask it to. Cheap to clone; every clone is the same list.
+///
+/// The thread that retires touches no guest memory — the guest learns of a
+/// retirement only when the device's worker writes the held response — so
+/// it needs no pass of the pause gate (ADR-0005's row for renderer threads).
+#[derive(Clone, Default)]
+pub struct FenceRetirer(Arc<RetireState>);
+
+impl fmt::Debug for FenceRetirer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FenceRetirer")
+            .field("retired", &self.len())
+            .field("waker", &self.has_waker())
+            .finish()
+    }
+}
+
+impl FenceRetirer {
+    fn retired(&self) -> std::sync::MutexGuard<'_, Vec<RingFence>> {
+        self.0
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn waker(&self) -> Option<Arc<dyn HostWaker>> {
+        self.0
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Report `fence` retired, and wake the device to collect it.
+    pub fn retire(&self, fence: RingFence) {
+        {
+            let mut retired = self.retired();
+            if retired.len() >= MAX_RETIRED_RING_FENCES {
+                retired.remove(0);
+            }
+            retired.push(fence);
+        }
+        if let Some(waker) = self.waker() {
+            waker.wake();
+        }
+    }
+
+    /// Everything retired since the last call, oldest first.
+    pub fn take(&self) -> Vec<RingFence> {
+        std::mem::take(&mut *self.retired())
+    }
+
+    /// Retired fences not collected yet.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.retired().len()
+    }
+
+    /// Whether nothing is waiting to be collected.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether the device has handed over a waker. Without one nothing would
+    /// ever collect a retirement, so no fence may be deferred
+    /// ([`Renderer3d::set_host_waker`]).
+    #[must_use]
+    pub fn has_waker(&self) -> bool {
+        self.waker().is_some()
+    }
+
+    /// Install the device's waker.
+    pub fn set_waker(&self, waker: Arc<dyn HostWaker>) {
+        *self
+            .0
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker);
+    }
+
+    fn clear(&self) {
+        self.retired().clear();
     }
 }
 
@@ -1039,6 +1189,19 @@ pub enum VenusError {
     /// A classic-3D command on a renderer that serves only Venus.
     #[error("this renderer serves only Venus contexts and has no {0}")]
     NoClassic3d(&'static str),
+
+    /// A virtio-gpu fence on a `ring_idx` timeline the factory could not
+    /// put on a host queue (stage 5b.3): no queue bound to it, no context,
+    /// or a factory that executes no Vulkan.
+    #[error("a fence on ring_idx {ring_idx} of venus context {ctx_id}: {why}")]
+    RingFence {
+        /// The context.
+        ctx_id: u32,
+        /// The timeline.
+        ring_idx: u8,
+        /// Why.
+        why: String,
+    },
 }
 
 impl From<VenusError> for CommandError {
@@ -1106,7 +1269,9 @@ impl From<VenusError> for CommandError {
                 Self::Renderer(err.to_string())
             }
             VenusError::NoWindow => Self::NoHostVisibleWindow,
-            VenusError::NoClassic3d(_) => Self::Renderer(err.to_string()),
+            VenusError::NoClassic3d(_) | VenusError::RingFence { .. } => {
+                Self::Renderer(err.to_string())
+            }
         }
     }
 }
@@ -1237,6 +1402,9 @@ pub struct VenusRenderer<F> {
     quiesce: Arc<Quiesce>,
     /// Every ring worker and monitor this renderer has running.
     live: LiveThreads,
+    /// Ring fences the factory retired, for the device to collect (stage
+    /// 5b.3).
+    retirer: FenceRetirer,
 }
 
 impl<F> fmt::Debug for VenusRenderer<F> {
@@ -1259,10 +1427,18 @@ impl<F> VenusRenderer<F> {
     ///
     /// Each ring's bytes go to its own sink, on its own worker thread, so rings
     /// from different contexts (different guest `VkInstance`s) never interleave.
-    pub fn new(sinks: F) -> Self {
+    pub fn new(sinks: F) -> Self
+    where
+        F: SinkFactory,
+    {
+        let mut capset = VenusCapset::new();
+        // Per-queue fence timelines are honest exactly when the factory
+        // retires them; the device keeps one fence FIFO per
+        // `(context, ring_idx)` either way (`crate::fence`).
+        capset.supports_multiple_timelines = sinks.retires_ring_fences();
         Self {
             sinks,
-            capset: VenusCapset::new(),
+            capset,
             window: None,
             blobs: HashMap::new(),
             directory: BlobDirectory::default(),
@@ -1273,6 +1449,7 @@ impl<F> VenusRenderer<F> {
             observed: 0,
             quiesce: Quiesce::new(),
             live: LiveThreads::new(),
+            retirer: FenceRetirer::default(),
         }
     }
 
@@ -2047,8 +2224,13 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
             context.signal_stop();
         }
         self.contexts.clear();
-        // Every thread is joined: the factory's shared state can go.
+        // Every thread is joined: the factory's shared state can go — and
+        // with it every host queue's fence thread, joined by the factory,
+        // whose last retirements belong to the boot that ends here: the
+        // device drops its held responses on reset, and a stale retirement
+        // must not complete a new boot's fence of the same id.
         self.sinks.reset();
+        self.retirer.clear();
         self.directory.clear();
         self.blobs.clear();
         self.blob_bytes = 0;
@@ -2058,7 +2240,85 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
     }
 
     fn snapshot_refusal(&self) -> Option<String> {
+        let pending = self.sinks.pending_ring_fences() + self.retirer.len();
+        if pending > 0 {
+            // A held response is a descriptor chain the guest is waiting on
+            // for GPU work this process owns; a restored VM would wait for a
+            // host fence nothing will ever signal.
+            return Some(format!(
+                "{pending} virtio-gpu fences on Venus queue timelines are waiting for host GPU \
+                 work, which a snapshot cannot carry"
+            ));
+        }
         self.sinks.snapshot_refusal()
+    }
+
+    fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
+        self.retirer.set_waker(waker);
+    }
+
+    /// Stage 5b.3. A fence without a `ring_idx` is on the device's timeline
+    /// and, as before, already signalled: the context commands before it
+    /// have been executed by the time the device asks. `ring_idx` 0 is the
+    /// context's CPU timeline, retired the same way for the same reason
+    /// (`vkr_context_submit_fence`). Every other `ring_idx` goes to the
+    /// factory, which puts a host fence on the queue bound to it; without a
+    /// waker nothing would collect it, so it is signalled at once instead
+    /// (the trait's contract).
+    fn create_fence_on(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: Option<u8>,
+        fence_id: u32,
+    ) -> Result<(FenceTimeline, FenceOutcome), CommandError> {
+        let Some(ring_idx) = ring_idx else {
+            return Ok((FenceTimeline::Device, FenceOutcome::Signalled));
+        };
+        let timeline = FenceTimeline::Ring { ctx_id, ring_idx };
+        if ring_idx == 0 {
+            return Ok((timeline, FenceOutcome::Signalled));
+        }
+        if !self.contexts.contains_key(&ctx_id) {
+            return Err(VenusError::UnknownContext(ctx_id).into());
+        }
+        if !self.retirer.has_waker() {
+            tracing::debug!(
+                ctx_id,
+                ring_idx,
+                "no host waker: a venus queue fence completes synchronously"
+            );
+            return Ok((timeline, FenceOutcome::Signalled));
+        }
+        let fence = RingFence {
+            ctx_id,
+            ring_idx,
+            fence_id,
+        };
+        match self.sinks.create_ring_fence(fence, &self.retirer) {
+            Ok(outcome) => Ok((timeline, outcome)),
+            Err(why) => Err(VenusError::RingFence {
+                ctx_id,
+                ring_idx,
+                why,
+            }
+            .into()),
+        }
+    }
+
+    fn poll_fence_timelines(&mut self, _still_pending: usize) -> Vec<(FenceTimeline, u32)> {
+        self.retirer
+            .take()
+            .into_iter()
+            .map(|f| {
+                (
+                    FenceTimeline::Ring {
+                        ctx_id: f.ctx_id,
+                        ring_idx: f.ring_idx,
+                    },
+                    f.fence_id,
+                )
+            })
+            .collect()
     }
 
     fn blob_support(&self) -> BlobSupport {

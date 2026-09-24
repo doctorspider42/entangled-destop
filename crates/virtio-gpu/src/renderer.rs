@@ -33,6 +33,7 @@ use virtio_core::{GuestMem, HostWaker};
 
 use crate::blob::{BlobMapping, BlobSupport};
 use crate::error::CommandError;
+pub use crate::fence::FenceTimeline;
 use crate::protocol::{Box3d, MemEntry, Rect, ResourceCreate3d, ResourceCreateBlob, Transfer3d};
 
 /// Most rendering contexts a guest may hold open at once. Each mesa process
@@ -279,6 +280,38 @@ pub trait Renderer3d: Send {
     fn poll_fences(&mut self, still_pending: usize) -> Vec<u32> {
         let _ = still_pending;
         Vec::new()
+    }
+
+    /// [`Self::create_fence`] for a command whose header named a fence
+    /// timeline (`VIRTIO_GPU_FLAG_INFO_RING_IDX`, `ring_idx` = `Some`), or
+    /// none: which timeline the fence is on, and whether it is already
+    /// signalled (EPIC 20 stage 5b.3).
+    ///
+    /// The default is every renderer's behaviour before per-context
+    /// timelines existed, and still virgl's: the `ring_idx` is ignored, the
+    /// fence goes on the device's one timeline, and [`Self::create_fence`]
+    /// decides. A renderer that answers [`FenceTimeline::Ring`] here must
+    /// report that fence's retirement through [`Self::poll_fence_timelines`]
+    /// on the same timeline.
+    fn create_fence_on(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: Option<u8>,
+        fence_id: u32,
+    ) -> Result<(FenceTimeline, FenceOutcome), CommandError> {
+        let _ = ring_idx;
+        self.create_fence(ctx_id, fence_id)
+            .map(|outcome| (FenceTimeline::Device, outcome))
+    }
+
+    /// [`Self::poll_fences`] with each retired fence's timeline. The default
+    /// puts every id [`Self::poll_fences`] reports on the device's timeline,
+    /// which is where [`Self::create_fence_on`]'s default put them.
+    fn poll_fence_timelines(&mut self, still_pending: usize) -> Vec<(FenceTimeline, u32)> {
+        self.poll_fences(still_pending)
+            .into_iter()
+            .map(|id| (FenceTimeline::Device, id))
+            .collect()
     }
 
     // -------------------------------- zero-copy scanout (ADR-0004 phase 2)
@@ -894,9 +927,32 @@ impl Gpu3d {
         self.renderer.create_fence(ctx_id, fence_id)
     }
 
+    /// [`Self::create_fence`] with the header's fence timeline, when it named
+    /// one ([`Renderer3d::create_fence_on`]).
+    ///
+    /// # Errors
+    /// An unknown context, or the renderer's refusal.
+    pub fn create_fence_on(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: Option<u8>,
+        fence_id: u32,
+    ) -> Result<(FenceTimeline, FenceOutcome), CommandError> {
+        if ctx_id != 0 && !self.contexts.contains_key(&ctx_id) {
+            return Err(CommandError::UnknownContext(ctx_id));
+        }
+        self.renderer.create_fence_on(ctx_id, ring_idx, fence_id)
+    }
+
     /// Host fences that have retired since the last call, oldest first.
     pub fn poll_fences(&mut self, still_pending: usize) -> Vec<u32> {
         self.renderer.poll_fences(still_pending)
+    }
+
+    /// Host fences that have retired since the last call, with their
+    /// timelines, oldest first within each.
+    pub fn poll_fence_timelines(&mut self, still_pending: usize) -> Vec<(FenceTimeline, u32)> {
+        self.renderer.poll_fence_timelines(still_pending)
     }
 
     /// Installs the device's host waker on the renderer.

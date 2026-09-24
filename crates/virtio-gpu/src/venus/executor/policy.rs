@@ -29,6 +29,12 @@
 //!   them all to the driver. Here a link outside core 1.0–1.3 and the venus
 //!   protocol's own is refused as unimplemented, which is where the decoder
 //!   used to refuse it before it decoded the whole protocol.
+//! * **Device extensions are the ones this renderer serves** (stage 5b.3,
+//!   [`advertised_extensions`]): `VK_KHR_synchronization2` passed through,
+//!   and `VK_KHR_external_semaphore_fd` **emulated** — a Windows host has no
+//!   sync_fd, and Mesa 26.0.8 exposes Vulkan 1.3 and `VK_KHR_swapchain` only
+//!   on a renderer that can import one ([`external_semaphore_properties`]).
+//!   vkr advertises what the host driver has.
 //! * **The capset's extension mask is what [`admits_link`] admits**
 //!   ([`admitted_extension_numbers`]), not everything the protocol decodes.
 //!   vkr advertises its whole decode table (`vkr_renderer.c:40-48`) because
@@ -43,8 +49,9 @@
 use crate::venus::capset::{vk_api_version_parts, vk_make_api_version, ExtensionMask};
 use crate::venus::protocol::info::{self, EXTENSIONS};
 use crate::venus::protocol::{
-    VkExtensionProperties, VkPhysicalDeviceFeatures, VkPhysicalDeviceFeatures2,
-    VkPhysicalDeviceMemoryProperties, VkPhysicalDeviceProperties2, VkQueueFamilyProperties,
+    VkExtensionProperties, VkExternalSemaphoreProperties, VkPhysicalDeviceFeatures,
+    VkPhysicalDeviceFeatures2, VkPhysicalDeviceMemoryProperties, VkPhysicalDeviceProperties2,
+    VkQueueFamilyProperties,
 };
 
 use super::host::HostDeviceInfo;
@@ -53,6 +60,10 @@ use super::host::HostDeviceInfo;
 /// `VKR_MAX_API_VERSION` (`vkr_common.h:39`). The capset's `vk_xml_version`
 /// (1.3.269) and protocol spec 2 cap the guest there anyway.
 pub const MAX_API_VERSION: u32 = vk_make_api_version(0, 1, 3, 0);
+
+/// Vulkan 1.2: what Mesa 26.0.8 clamps a device to when it does not expose
+/// `VK_KHR_synchronization2` (`vn_physical_device.c:538-543`).
+pub const API_1_2: u32 = vk_make_api_version(0, 1, 2, 0);
 
 /// The oldest device version exposed: 1.1, below which Mesa's venus drops a
 /// device on its own (`vn_physical_device.c:1499-1506`) and vkr refuses an
@@ -194,36 +205,142 @@ pub fn mask_core_features(core: &mut VkPhysicalDeviceFeatures) {
     core.sparse_residency_aliased = 0;
 }
 
-/// The extensions this stage implements: the venus protocol's own two,
-/// which no host device reports. Every other extension the protocol can
-/// decode waits for the stage that implements its commands and structures.
+/// The extensions whose structures this renderer implements outside core:
+/// the venus protocol's own two, which no host device reports. Every other
+/// extension the protocol can decode waits for the stage that implements its
+/// commands and structures.
 pub const IMPLEMENTED_EXTENSIONS: &[&str] =
     &["VK_EXT_command_serialization", "VK_MESA_venus_protocol"];
+
+/// `VK_KHR_synchronization2`: passed through from the host (stage 5b.3).
+/// Everything it adds is core Vulkan 1.3 — `vkQueueSubmit2`,
+/// `vkCmdPipelineBarrier2`, `vkCmd*Event2`, `vkCmdWriteTimestamp2` and their
+/// structures, whose KHR aliases the protocol encodes as the core commands —
+/// so it is advertised only on a device of 1.3 or newer, where every one of
+/// those entry points exists on the host and the executor serves it.
+pub const SYNCHRONIZATION_2: &str = "VK_KHR_synchronization2";
+
+/// `VK_KHR_external_semaphore_fd`: **emulated**, advertised on every device
+/// whatever the host has (stage 5b.3). The guest never sends its own two
+/// commands — Mesa implements `vkImportSemaphoreFdKHR` and
+/// `vkGetSemaphoreFdKHR` itself — and it adds no chained structure, so it
+/// needs no capset bit. What it obliges the renderer to: the `SYNC_FD`
+/// answer of [`external_semaphore_properties`], a `vkCreateDevice` that
+/// enables it (stripped before the host sees it), a
+/// `VkExportSemaphoreCreateInfo{SYNC_FD}` (stripped likewise), and
+/// `vkImportSemaphoreResourceMESA` / `vkWaitSemaphoreResourceMESA`
+/// (`executor::submit`).
+pub const EXTERNAL_SEMAPHORE_FD: &str = "VK_KHR_external_semaphore_fd";
+
+/// `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`.
+pub const SEMAPHORE_HANDLE_SYNC_FD: u32 = 0x10;
+/// Every `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_*` bit of Vulkan 1.3 core.
+pub const SEMAPHORE_HANDLE_CORE: u32 = 0x1f;
+/// `VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT`.
+pub const SEMAPHORE_FEATURE_EXPORTABLE: u32 = 0x1;
+/// `VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT`.
+pub const SEMAPHORE_FEATURE_IMPORTABLE: u32 = 0x2;
+/// `VK_SEMAPHORE_TYPE_BINARY` / `_TIMELINE`.
+pub const SEMAPHORE_TYPE_BINARY: i32 = 0;
+/// `VK_SEMAPHORE_TYPE_TIMELINE`.
+pub const SEMAPHORE_TYPE_TIMELINE: i32 = 1;
+
+/// The extensions a device is shown that the host need not have: their
+/// spec version as this renderer implements them.
+pub const EMULATED_EXTENSIONS: &[(&str, u32)] = &[(EXTERNAL_SEMAPHORE_FD, 1)];
+
+/// What `vkGetPhysicalDeviceExternalSemaphoreProperties` answers.
+///
+/// **`SYNC_FD` is synthesized**: `IMPORTABLE` for a binary semaphore, with
+/// `SYNC_FD` its one compatible type, and nothing for a timeline one (a sync
+/// file is binary). That is exactly what Mesa 26.0.8 needs to set
+/// `renderer_sync_fd.semaphore_importable` (`vn_physical_device.c:1124-1141`),
+/// which is the gate on `VK_KHR_synchronization2` — and with it Vulkan 1.3 —
+/// and on `VK_KHR_swapchain` (`:1212-1224`, `:1262-1271`). A Windows driver
+/// answers 0 for it; this renderer emulates the one import Mesa makes
+/// (`vkImportSemaphoreResourceMESA` with resource 0, a signalled payload).
+///
+/// **Not `EXPORTABLE`.** With it the guest would also expose
+/// `VK_KHR_external_semaphore_fd` to its own applications (`:1173-1179`),
+/// whose `vkGetSemaphoreFdKHR` rests on a virtio-gpu fence per queue and
+/// `vkWaitSemaphoreResourceMESA`. Both are implemented, but nothing in the
+/// guest's Vulkan 1.3 or its swapchain needs an application to export a
+/// sync file, and an export is a promise to a consumer outside Vulkan this
+/// renderer has never been tested against; so it is not made.
+///
+/// Every other handle type gets the host's own answer (`host`).
+#[must_use]
+pub fn external_semaphore_properties(
+    handle_type: u32,
+    timeline: bool,
+    host: impl FnOnce() -> VkExternalSemaphoreProperties,
+) -> VkExternalSemaphoreProperties {
+    if handle_type != SEMAPHORE_HANDLE_SYNC_FD {
+        return host();
+    }
+    if timeline {
+        return VkExternalSemaphoreProperties::default();
+    }
+    VkExternalSemaphoreProperties {
+        export_from_imported_handle_types: 0,
+        compatible_handle_types: SEMAPHORE_HANDLE_SYNC_FD,
+        external_semaphore_features: SEMAPHORE_FEATURE_IMPORTABLE,
+    }
+}
 
 /// The newest core version whose chained structures this stage accepts.
 pub const ADMITTED_CHAIN_API: u32 = vk_make_api_version(0, 1, 3, 0);
 
-/// The device extensions a guest is told about: the host's, **intersected
-/// with what the generated protocol can decode and this stage implements**
-/// ([`IMPLEMENTED_EXTENSIONS`]), spec versions clamped to the protocol's
-/// (`vkr_physical_device_init_extensions` does the same with its own table).
-/// Today that is only the two private transport extensions, which no host
-/// device reports, so the list is empty — which keeps every pNext chain a
-/// correct guest sends inside [`admits_link`].
+/// The device extensions a guest is told about (stage 5b.3):
+///
+/// * the host's, **intersected with what the generated protocol can decode
+///   and this renderer serves** — [`IMPLEMENTED_EXTENSIONS`], and
+///   [`SYNCHRONIZATION_2`] on a device of Vulkan 1.3 or newer (`api` is the
+///   device's `apiVersion` as the guest is shown it) — spec versions clamped
+///   to the protocol's (`vkr_physical_device_init_extensions` does the same
+///   with its own table);
+/// * and the [`EMULATED_EXTENSIONS`], whatever the host has, at the spec
+///   version this renderer implements (clamped to the protocol's too).
+///
+/// Every structure either brings is core 1.0–1.3, inside [`admits_link`].
 #[must_use]
-pub fn advertised_extensions(host: &[VkExtensionProperties]) -> Vec<VkExtensionProperties> {
-    host.iter()
+pub fn advertised_extensions(
+    host: &[VkExtensionProperties],
+    api: u32,
+) -> Vec<VkExtensionProperties> {
+    let passes = |name: &str| {
+        IMPLEMENTED_EXTENSIONS.contains(&name)
+            || (name == SYNCHRONIZATION_2 && (api >> 12) >= (MAX_API_VERSION >> 12))
+    };
+    let mut out: Vec<VkExtensionProperties> = host
+        .iter()
         .filter_map(|ext| {
             let name = std::str::from_utf8(c_name(&ext.extension_name)).ok()?;
             let known = EXTENSIONS.iter().find(|e| e.name == name)?;
-            (known.decodable && IMPLEMENTED_EXTENSIONS.contains(&name)).then(|| {
-                VkExtensionProperties {
-                    extension_name: ext.extension_name,
-                    spec_version: ext.spec_version.min(known.spec_version),
-                }
+            (known.decodable && passes(name)).then(|| VkExtensionProperties {
+                extension_name: ext.extension_name,
+                spec_version: ext.spec_version.min(known.spec_version),
             })
         })
-        .collect()
+        .collect();
+    for (name, spec) in EMULATED_EXTENSIONS {
+        let Some(known) = EXTENSIONS.iter().find(|e| e.name == *name && e.decodable) else {
+            continue;
+        };
+        out.retain(|e| c_name(&e.extension_name) != name.as_bytes());
+        out.push(VkExtensionProperties {
+            extension_name: name_array(name),
+            spec_version: (*spec).min(known.spec_version),
+        });
+    }
+    out
+}
+
+/// Whether `name` is one of the [`EMULATED_EXTENSIONS`]: enabled for the
+/// guest, never for the host driver.
+#[must_use]
+pub fn is_emulated_extension(name: &str) -> bool {
+    EMULATED_EXTENSIONS.iter().any(|(e, _)| *e == name)
 }
 
 /// Whether a chained structure of type `stype` is one this stage accepts:
@@ -397,6 +514,22 @@ impl GuestDevice {
         }
     }
 
+    /// The device's Vulkan version **as the guest's driver will show it**:
+    /// what [`expose`] reported (the host's, capped at 1.3), clamped to 1.2
+    /// when `VK_KHR_synchronization2` is not advertised, because Mesa 26.0.8
+    /// clamps it there then (`vn_physical_device.c:538-543`). A command newer
+    /// than this is refused: the guest cannot have one of its own to send,
+    /// and the host's entry point for it may not exist.
+    #[must_use]
+    pub fn api_version(&self) -> u32 {
+        let reported = self.properties.properties.api_version;
+        if has_extension(&self.extensions, SYNCHRONIZATION_2) {
+            reported
+        } else {
+            reported.min(API_1_2)
+        }
+    }
+
     /// The feature bit `bufferDeviceAddress` as the guest is told it.
     #[must_use]
     pub fn buffer_device_address(&self) -> bool {
@@ -457,11 +590,12 @@ pub fn expose(info: HostDeviceInfo) -> Result<GuestDevice, Hidden> {
         cap_minor(properties.properties.api_version, MAX_API_VERSION);
     let mut features = info.features;
     mask_features(&mut features);
+    let extensions = advertised_extensions(&info.extensions, properties.properties.api_version);
     Ok(GuestDevice {
         properties,
         features,
         queue_families: info.queue_families,
-        extensions: advertised_extensions(&info.extensions),
+        extensions,
         memory,
         host_memory: info.memory,
         importable,
@@ -475,7 +609,9 @@ pub fn expose(info: HostDeviceInfo) -> Result<GuestDevice, Hidden> {
 // (`vn_protocol_renderer_types.h`). These are the checks that stand between
 // a guest's number and the NVIDIA driver, each against Vulkan 1.3 core plus
 // nothing: an extension value is only legal once an extension that defines
-// it is enabled, and this stage enables none for the guest.
+// it is enabled, and the two a guest may enable here add none —
+// `VK_KHR_synchronization2`'s values are all core 1.3, and
+// `VK_KHR_external_semaphore_fd`'s one handle-type bit is core 1.1.
 
 /// A `VkFormat` Vulkan 1.3 core defines (including `VK_FORMAT_UNDEFINED`).
 #[must_use]
@@ -694,11 +830,68 @@ mod tests {
                 spec_version: 99,
             },
         ];
-        let out = advertised_extensions(&host);
-        assert_eq!(out.len(), 1, "only the decodable one survives");
-        assert_eq!(c_name(&out[0].extension_name), b"VK_MESA_venus_protocol");
+        let out = advertised_extensions(&host, MAX_API_VERSION);
+        let names: Vec<&[u8]> = out.iter().map(|e| c_name(&e.extension_name)).collect();
+        assert_eq!(
+            names,
+            vec![
+                &b"VK_MESA_venus_protocol"[..],
+                EXTERNAL_SEMAPHORE_FD.as_bytes()
+            ],
+            "the decodable served one, and the emulated one the host lacks"
+        );
         assert_eq!(out[0].spec_version, 4, "clamped to the protocol's");
+        assert_eq!(out[1].spec_version, 1);
         assert!(has_extension(&host, EXTERNAL_MEMORY_HOST));
+    }
+
+    #[test]
+    fn synchronization2_is_passed_through_only_on_a_vulkan_1_3_device() {
+        let host = [
+            VkExtensionProperties {
+                extension_name: name_array(SYNCHRONIZATION_2),
+                spec_version: 1,
+            },
+            VkExtensionProperties {
+                extension_name: name_array(EXTERNAL_SEMAPHORE_FD),
+                spec_version: 7,
+            },
+        ];
+        let at_1_3 = advertised_extensions(&host, vk_make_api_version(0, 1, 3, 309));
+        assert!(has_extension(&at_1_3, SYNCHRONIZATION_2));
+        // The host's own sync-fd extension is not what is advertised: the
+        // emulation's is, once, at its own spec version.
+        let fd: Vec<_> = at_1_3
+            .iter()
+            .filter(|e| c_name(&e.extension_name) == EXTERNAL_SEMAPHORE_FD.as_bytes())
+            .collect();
+        assert_eq!(fd.len(), 1);
+        assert_eq!(fd[0].spec_version, 1);
+        let at_1_2 = advertised_extensions(&host, vk_make_api_version(0, 1, 2, 198));
+        assert!(!has_extension(&at_1_2, SYNCHRONIZATION_2));
+        assert!(has_extension(&at_1_2, EXTERNAL_SEMAPHORE_FD));
+        assert!(is_emulated_extension(EXTERNAL_SEMAPHORE_FD));
+        assert!(!is_emulated_extension(SYNCHRONIZATION_2));
+    }
+
+    #[test]
+    fn the_sync_fd_answer_is_importable_for_binary_only_and_other_types_are_the_hosts() {
+        let host = || VkExternalSemaphoreProperties {
+            export_from_imported_handle_types: 0x2,
+            compatible_handle_types: 0x2,
+            external_semaphore_features: 0x3,
+        };
+        let binary = external_semaphore_properties(SEMAPHORE_HANDLE_SYNC_FD, false, host);
+        assert_eq!(
+            binary.external_semaphore_features,
+            SEMAPHORE_FEATURE_IMPORTABLE
+        );
+        assert_eq!(binary.compatible_handle_types, SEMAPHORE_HANDLE_SYNC_FD);
+        assert_eq!(binary.export_from_imported_handle_types, 0);
+        let timeline = external_semaphore_properties(SEMAPHORE_HANDLE_SYNC_FD, true, host);
+        assert_eq!(timeline, VkExternalSemaphoreProperties::default());
+        let opaque = external_semaphore_properties(0x2, false, host);
+        assert_eq!(opaque, host());
     }
 
     #[test]

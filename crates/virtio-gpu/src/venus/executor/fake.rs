@@ -33,7 +33,9 @@ pub struct FakeDevice {
 /// An RTX-2070-shaped device: discrete, Vulkan 1.4.312, six memory types
 /// (0–2 device local, 3 host visible and coherent, 4 host visible, coherent
 /// and cached — both importable — and 5 the BAR: device local and host
-/// visible, **not** importable), sparse features on, two queue families.
+/// visible, **not** importable), sparse features on, two queue families,
+/// and — like the RTX 2070 — `VK_KHR_synchronization2` among its
+/// extensions.
 #[must_use]
 pub fn gpu(name: &str) -> FakeDevice {
     let mut info = HostDeviceInfo::default();
@@ -116,6 +118,21 @@ pub fn gpu(name: &str) -> FakeDevice {
                 ..Default::default()
             },
         ),
+        VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceSynchronization2Features(
+            VkPhysicalDeviceSynchronization2Features {
+                synchronization2: 1,
+            },
+        ),
+        VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceDynamicRenderingFeatures(
+            VkPhysicalDeviceDynamicRenderingFeatures {
+                dynamic_rendering: 1,
+            },
+        ),
+        VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceTimelineSemaphoreFeatures(
+            VkPhysicalDeviceTimelineSemaphoreFeatures {
+                timeline_semaphore: 1,
+            },
+        ),
     ];
     info.queue_families = vec![
         VkQueueFamilyProperties {
@@ -161,6 +178,10 @@ pub fn gpu(name: &str) -> FakeDevice {
         },
         VkExtensionProperties {
             extension_name: name_array(EXTERNAL_MEMORY_HOST),
+            spec_version: 1,
+        },
+        VkExtensionProperties {
+            extension_name: name_array("VK_KHR_synchronization2"),
             spec_version: 1,
         },
     ];
@@ -228,6 +249,17 @@ struct Live {
     submitted: Vec<Vec<u64>>,
     /// What each pool child is, for the live counts.
     child_kinds: HashMap<u64, &'static str>,
+    /// Every translated submit's semaphores, as host handles: `(queue,
+    /// waits, signals)` per batch (stage 5b.3).
+    semaphore_ops: Vec<(u64, Vec<u64>, Vec<u64>)>,
+    /// Timeline semaphores and their values.
+    timelines: HashMap<u64, u64>,
+    /// Every `vkCreateSemaphore`'s `VkExportSemaphoreCreateInfo` handle
+    /// types, as the host saw it (`None`: no such structure).
+    semaphore_exports: Vec<Option<u32>>,
+    /// Fences of submits to a queue in [`FakeVulkan::stuck_queues`]: they
+    /// signal only once the queue is released.
+    stuck_fences: HashMap<u64, u64>,
 }
 
 /// The fake host. See the module docs.
@@ -247,6 +279,9 @@ pub struct FakeVulkan {
     /// A lost device: every submit and every wait answers
     /// `VK_ERROR_DEVICE_LOST`.
     pub lost: AtomicBool,
+    /// Host queues whose work never finishes until
+    /// [`FakeVulkan::release_queue`] (stage 5b.3).
+    pub stuck_queues: Mutex<std::collections::HashSet<u64>>,
     /// Called with every stage-5b.2 command's name as it reaches the host.
     #[allow(clippy::type_complexity)]
     pub on_call: Mutex<Option<Box<dyn FnMut(&str) + Send>>>,
@@ -273,6 +308,7 @@ impl FakeVulkan {
             hold: AtomicBool::new(false),
             stuck: AtomicBool::new(false),
             lost: AtomicBool::new(false),
+            stuck_queues: Mutex::new(std::collections::HashSet::new()),
             on_call: Mutex::new(None),
         }
     }
@@ -387,6 +423,49 @@ impl FakeVulkan {
         self.with(|live| live.held.len())
     }
 
+    /// Every submit batch's semaphores, as host handles: `(queue, waits,
+    /// signals)`.
+    #[must_use]
+    pub fn semaphore_ops(&self) -> Vec<(u64, Vec<u64>, Vec<u64>)> {
+        self.with(|live| live.semaphore_ops.clone())
+    }
+
+    /// Every `vkCreateSemaphore`'s export handle types as the host saw them.
+    #[must_use]
+    pub fn semaphore_exports(&self) -> Vec<Option<u32>> {
+        self.with(|live| live.semaphore_exports.clone())
+    }
+
+    /// A timeline semaphore's value on the fake GPU.
+    #[must_use]
+    pub fn timeline_value(&self, semaphore: u64) -> Option<u64> {
+        self.with(|live| live.timelines.get(&semaphore).copied())
+    }
+
+    /// Make host queue `queue`'s work never finish until released.
+    pub fn stick_queue(&self, queue: u64) {
+        self.stuck_queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(queue);
+    }
+
+    /// Let host queue `queue`'s work finish.
+    pub fn release_queue(&self, queue: u64) {
+        self.stuck_queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&queue);
+        self.with(|live| live.stuck_fences.retain(|_, q| *q != queue));
+    }
+
+    fn queue_stuck(&self, queue: u64) -> bool {
+        self.stuck_queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&queue)
+    }
+
     fn forget_children(live: &mut Live, pool: u64) {
         let children: Vec<u64> = live
             .pool_children
@@ -417,8 +496,94 @@ impl FakeVulkan {
                     .flatten()
                     .flat_map(|s| s.p_command_buffers.iter().flatten().map(|c| c.0))
                     .collect();
+                for s in a.p_submits.iter().flatten() {
+                    let waits: Vec<u64> =
+                        s.p_wait_semaphores.iter().flatten().map(|x| x.0).collect();
+                    let signals: Vec<u64> = s
+                        .p_signal_semaphores
+                        .iter()
+                        .flatten()
+                        .map(|x| x.0)
+                        .collect();
+                    let values: Vec<u64> = s
+                        .p_next
+                        .iter()
+                        .find_map(|l| match l {
+                            VkSubmitInfoNext::VkTimelineSemaphoreSubmitInfo(t) => {
+                                t.p_signal_semaphore_values.clone()
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    self.with(|live| {
+                        for (sem, value) in signals.iter().zip(&values) {
+                            if let Some(v) = live.timelines.get_mut(sem) {
+                                *v = (*v).max(*value);
+                            }
+                        }
+                        live.semaphore_ops.push((a.queue.0, waits, signals));
+                    });
+                }
+                let stuck = self.queue_stuck(a.queue.0);
                 self.submit(cbs, a.fence.0, hold);
+                if stuck && a.fence.0 != 0 {
+                    self.with(|live| live.stuck_fences.insert(a.fence.0, a.queue.0));
+                }
                 VK_SUCCESS
+            }
+            Command::CreateSemaphore(a) => {
+                let exported = a.p_create_info.as_ref().and_then(|i| {
+                    i.p_next.iter().find_map(|l| match l {
+                        VkSemaphoreCreateInfoNext::VkExportSemaphoreCreateInfo(e) => {
+                            Some(e.handle_types)
+                        }
+                        _ => None,
+                    })
+                });
+                self.with(|live| live.semaphore_exports.push(exported));
+                VK_SUCCESS
+            }
+            Command::GetSemaphoreCounterValue(a) => {
+                a.p_value = Some(self.timeline_value(a.semaphore.0).unwrap_or(0));
+                VK_SUCCESS
+            }
+            Command::SignalSemaphore(a) => {
+                if let Some(info) = &a.p_signal_info {
+                    self.with(|live| {
+                        if let Some(v) = live.timelines.get_mut(&info.semaphore.0) {
+                            *v = (*v).max(info.value);
+                        }
+                    });
+                }
+                VK_SUCCESS
+            }
+            Command::WaitSemaphores(a) => {
+                if lost {
+                    return lost_ret;
+                }
+                let Some(info) = &a.p_wait_info else {
+                    return VK_ERROR_UNKNOWN;
+                };
+                let reached: Vec<bool> = self.with(|live| {
+                    info.p_semaphores
+                        .iter()
+                        .flatten()
+                        .zip(info.p_values.iter().flatten())
+                        .map(|(s, v)| live.timelines.get(&s.0).copied().unwrap_or(0) >= *v)
+                        .collect()
+                });
+                let any = info.flags & 1 != 0;
+                let done = if any {
+                    reached.iter().any(|r| *r)
+                } else {
+                    reached.iter().all(|r| *r)
+                };
+                if done && !stuck {
+                    VK_SUCCESS
+                } else {
+                    std::thread::sleep(std::time::Duration::from_nanos(a.timeout.min(2_000_000)));
+                    VK_TIMEOUT
+                }
             }
             Command::QueueSubmit2(a) => {
                 if lost {
@@ -435,7 +600,37 @@ impl FakeVulkan {
                             .map(|c| c.command_buffer.0)
                     })
                     .collect();
+                for s in a.p_submits.iter().flatten() {
+                    let waits: Vec<u64> = s
+                        .p_wait_semaphore_infos
+                        .iter()
+                        .flatten()
+                        .map(|x| x.semaphore.0)
+                        .collect();
+                    let signals: Vec<(u64, u64)> = s
+                        .p_signal_semaphore_infos
+                        .iter()
+                        .flatten()
+                        .map(|x| (x.semaphore.0, x.value))
+                        .collect();
+                    self.with(|live| {
+                        for (sem, value) in &signals {
+                            if let Some(v) = live.timelines.get_mut(sem) {
+                                *v = (*v).max(*value);
+                            }
+                        }
+                        live.semaphore_ops.push((
+                            a.queue.0,
+                            waits,
+                            signals.iter().map(|(s, _)| *s).collect(),
+                        ));
+                    });
+                }
+                let stuck = self.queue_stuck(a.queue.0);
                 self.submit(cbs, a.fence.0, hold);
+                if stuck && a.fence.0 != 0 {
+                    self.with(|live| live.stuck_fences.insert(a.fence.0, a.queue.0));
+                }
                 VK_SUCCESS
             }
             Command::GetFenceStatus(a) => {
@@ -454,7 +649,9 @@ impl FakeVulkan {
                     return lost_ret;
                 }
                 let fences: Vec<u64> = a.p_fences.iter().flatten().map(|f| f.0).collect();
-                if stuck {
+                let on_stuck_queue =
+                    self.with(|live| fences.iter().any(|f| live.stuck_fences.contains_key(f)));
+                if stuck || on_stuck_queue {
                     std::thread::sleep(std::time::Duration::from_nanos(a.timeout.min(2_000_000)));
                     return VK_TIMEOUT;
                 }
@@ -680,6 +877,25 @@ impl HostVulkan for FakeVulkan {
             max_resource_size: 1 << 31,
         };
         VK_SUCCESS
+    }
+
+    fn external_semaphore_properties(
+        &self,
+        _instance: &u64,
+        _device: usize,
+        handle_type: u32,
+        _timeline: bool,
+    ) -> VkExternalSemaphoreProperties {
+        // As a Windows driver: its own opaque handles, and no sync file.
+        if handle_type == 0x2 {
+            VkExternalSemaphoreProperties {
+                export_from_imported_handle_types: 0x2,
+                compatible_handle_types: 0x2,
+                external_semaphore_features: 0x3,
+            }
+        } else {
+            VkExternalSemaphoreProperties::default()
+        }
     }
 
     fn create_device(
@@ -935,6 +1151,19 @@ impl HostVulkan for FakeVulkan {
             Command::CreateFence(a) => a.p_create_info.as_ref().map(|i| i.flags & 1 != 0),
             _ => None,
         };
+        let timeline = match command {
+            Command::CreateSemaphore(a) => a.p_create_info.as_ref().and_then(|i| {
+                i.p_next.iter().find_map(|l| match l {
+                    VkSemaphoreCreateInfoNext::VkSemaphoreTypeCreateInfo(t)
+                        if t.semaphore_type == 1 =>
+                    {
+                        Some(t.initial_value)
+                    }
+                    _ => None,
+                })
+            }),
+            _ => None,
+        };
         let ret = self.serve(command);
         generated::set_result(command, ret);
         if ret >= 0 {
@@ -949,6 +1178,9 @@ impl HostVulkan for FakeVulkan {
                         }
                         if let Some(signalled) = signalled {
                             live.fences.insert(handle, signalled);
+                        }
+                        if let Some(value) = timeline {
+                            live.timelines.insert(handle, value);
                         }
                     });
                 }
