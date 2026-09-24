@@ -415,10 +415,22 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   `unmap_blob`, `destroy_blob`, `reset` and `Drop` all go through it. A device
   reset unmaps immediately (safe from any thread) even though the library-side
   teardown is deferred to the worker thread.
-- `MAX_HOST_RANGES` (`vmm_core`, 64) bounds **hypervisor objects**, not
+- `MAX_HOST_RANGES` (`vmm_core`, 1024) bounds **hypervisor objects**, not
   bookkeeping: KVM reserves `1 + MAX_HOST_RANGES` memory-slot numbers per window
-  and allocates from that pool, so a guest that maps blobs without unmapping
-  gets an in-band failure rather than a VMM out of slots somewhere else.
+  (fewer when `KVM_CAP_NR_MEMSLOTS` is short, keeping 16 for the ROMs mapped
+  after it) and allocates from that pool, so a guest that maps blobs without
+  unmapping gets an in-band failure rather than a VMM out of slots somewhere
+  else.
+- **Size a guest-facing cap for a desktop, not for one client.** With GNOME
+  composited through Zink every GL client is a venus instance that keeps its
+  rings, 8 MiB command-stream chunks and mapped memory for life. Four clients
+  held 69 window ranges and 75 MiB of host blobs, past the old 64 / 64 MiB caps.
+  vkcube died on its next swapchain, and nothing said why: the guest kernel
+  does not wait for `RESOURCE_CREATE_BLOB`'s answer, so a refused blob shows
+  up only as a later `mmap` `EINVAL`. Give a per-client share *and* a global
+  cap (the Venus renderer's `MAX_RING_BLOB*_PER_CONTEXT`), and measure the
+  real desktop before choosing the numbers (ADR-0004, amendment on caps sized
+  for one client).
 - An **isolated** renderer (GPU-012) withholds the window entirely
   (`host_visible_bytes: None`): an `Arc` does not cross a pipe and a pointer in
   the helper's address space names nothing in the VMM's. The guest is told at

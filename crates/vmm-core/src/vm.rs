@@ -43,6 +43,9 @@ pub struct Vm {
     /// mapped after a window would silently have reused the window's slot —
     /// which KVM implements as "replace that mapping", not as an error.
     next_slot: AtomicU32,
+    /// `KVM_CAP_NR_MEMSLOTS`: slot numbers at or past it do not exist, so a
+    /// shared-memory window reserves none of them.
+    nr_memslots: u32,
     /// This VM's guest-RAM write log (ADR-0006). One per VM, not one per
     /// caller: it remembers whether logging is on, and two handles with two
     /// answers would let one of them turn it off under the other.
@@ -92,6 +95,7 @@ impl Vm {
             vcpus.push(Vcpu::new(&fd, hv.kvm(), index)?);
         }
         let next_slot = AtomicU32::new(memory.num_regions() as u32);
+        let nr_memslots = u32::try_from(hv.kvm().get_nr_memslots()).unwrap_or(u32::MAX);
         let fd_for_dirty = Arc::clone(&fd);
         Ok(Self {
             fd,
@@ -100,6 +104,7 @@ impl Vm {
             roms: Vec::new(),
             readonly_mem,
             next_slot,
+            nr_memslots,
             dirty: Arc::new(KvmDirtyLog {
                 fd: Arc::clone(&fd_for_dirty),
                 slots: ram_slots,
@@ -216,6 +221,11 @@ impl Vm {
     /// constant the machine can enforce instead of a resource it can exhaust.
     pub const SHM_SLOTS_PER_WINDOW: u32 = 1 + crate::shm::MAX_HOST_RANGES as u32;
 
+    /// Slot numbers a shared-memory window leaves free for what is mapped
+    /// after it — firmware ROMs, another window — on a KVM with fewer slots
+    /// than the window could use.
+    const SLOTS_KEPT_FREE: u32 = 16;
+
     /// Allocates a shared-memory window of `len` bytes and reserves the KVM
     /// memory slots it will live in (EPIC 20, VEN-2001/VEN-2003).
     ///
@@ -227,12 +237,42 @@ impl Vm {
         len: u64,
         host_mapped: bool,
     ) -> Result<Arc<SharedWindow>, VmmError> {
+        // Only the numbers this kernel has: a current KVM offers 32764 slots,
+        // an older one 509, and whatever is mapped after the window — the
+        // firmware ROMs are — still needs a number below the last. So a
+        // window takes what is left short of `SLOTS_KEPT_FREE`, never less
+        // than its own mapping's one; a blob map that then finds no slot is
+        // refused by the mapper, as one past `MAX_HOST_RANGES` is by the
+        // window.
+        let nr = self.nr_memslots;
+        let want = Self::SHM_SLOTS_PER_WINDOW;
+        let slots_for = |next: u32| {
+            want.min(
+                nr.saturating_sub(next)
+                    .saturating_sub(Self::SLOTS_KEPT_FREE),
+            )
+            .max(1)
+        };
         let first = self
             .next_slot
-            .fetch_add(Self::SHM_SLOTS_PER_WINDOW, Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                Some(next.saturating_add(slots_for(next)))
+            })
+            .unwrap_or_else(|next| next);
+        let count = slots_for(first);
+        if count < want {
+            tracing::warn!(
+                first_slot = first,
+                nr_memslots = nr,
+                reserved = count,
+                wanted = want,
+                "this KVM has fewer memory slots than a shared-memory window can use; the \
+                 guest can map fewer 3D blobs at once"
+            );
+        }
         let mapper = Arc::new(KvmGpaMapper {
             fd: Arc::clone(&self.fd),
-            slots: (first..first + Self::SHM_SLOTS_PER_WINDOW).collect(),
+            slots: (first..first.saturating_add(count)).collect(),
             live: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let window = if host_mapped {
@@ -242,7 +282,7 @@ impl Vm {
         };
         tracing::info!(
             first_slot = first,
-            slots = Self::SHM_SLOTS_PER_WINDOW,
+            slots = count,
             len,
             host_mapped,
             "reserved KVM memory slots for a shared-memory window"
@@ -358,17 +398,20 @@ impl crate::shm::GpaMapper for KvmGpaMapper {
             // Same address again: KVM replaces a slot in place, which is how a
             // window moves without ever having two live mappings.
             Some(slot) => *slot,
-            None => *self
-                .slots
-                .iter()
-                .find(|slot| !live.values().any(|used| used == *slot))
-                .ok_or_else(|| {
-                    HvError::Registers(format!(
-                        "no KVM memory slot left for a shared-memory range at {gpa:#x}; \
+            None => {
+                let used: std::collections::HashSet<u32> = live.values().copied().collect();
+                *self
+                    .slots
+                    .iter()
+                    .find(|slot| !used.contains(*slot))
+                    .ok_or_else(|| {
+                        HvError::Registers(format!(
+                            "no KVM memory slot left for a shared-memory range at {gpa:#x}; \
                          this window's {} are all in use",
-                        self.slots.len()
-                    ))
-                })?,
+                            self.slots.len()
+                        ))
+                    })?
+            }
         };
         self.set_region(slot, gpa, range.addr(), range.len())?;
         live.insert(gpa, slot);

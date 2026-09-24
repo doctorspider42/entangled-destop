@@ -1330,7 +1330,8 @@ discharges it for a blob mapping, and every path that calls
 
 KVM needed the only real bookkeeping: a memory slot is identified by number, so
 `Vm::create_shm_window` reserves `1 + MAX_HOST_RANGES` of them per window and
-the mapper allocates out of that pool. `MAX_HOST_RANGES` (64) is therefore not a
+the mapper allocates out of that pool. `MAX_HOST_RANGES` (64 then, 1024 since the
+2026-09-24 amendment on caps sized for one client) is therefore not a
 bookkeeping bound like the device's `MAX_HOST_VISIBLE_MAPPINGS` (4096) — it is
 the number of *hypervisor objects* a guest can make the host create, and past it
 a map fails in band. WHP addresses a range by its address and needed nothing; it
@@ -1568,7 +1569,8 @@ is set.
    VirGL / none" line the phase-1 list asked for has something to say — and it
    should say which library it found and where, because on a machine with both
    0.9.1 and a self-built 1.1.0 the difference is invisible otherwise.
-6. **`MAX_HOST_RANGES` is 64 and untested against a demanding guest.** A
+6. **`MAX_HOST_RANGES` is 64 and untested against a demanding guest.** (Found
+   and raised to 1024: the 2026-09-24 amendment on caps sized for one client.) A
    Vulkan application with many host-visible `VkDeviceMemory` allocations will
    find it. Raising it is a one-constant change (KVM's slot limit is far
    higher), but the honest move is to measure a real application first and set
@@ -3709,3 +3711,85 @@ structure, so the guest's chain length never reaches them.
 - a device created with its whole chain,
 - refusals past the cap and of duplicates,
 - that the cap stays at least twice the longest decodable chain.
+
+## Amendment, 2026-09-24 — two caps sized for one client, found by a desktop
+
+`vkcube --wsi wayland` died in `demo_prepare_swapchain` (`Assertion '!err'`,
+`cube.c:1533`) whenever it ran beside glmark2 under the GPU-composited GNOME.
+It ran fine alone. Nothing in the executor answered an error; the failure was
+one layer down, in two caps that had been sized for a single Vulkan client.
+Since stage 5c every GL client is a venus instance of its own (gnome-shell,
+both gnome-initial-setup processes, glmark2), and each keeps its rings,
+command-stream pools and mapped memory for as long as it lives.
+
+**The evidence, in order.** Guest side, with `MESA_LOG_LEVEL=debug
+VN_DEBUG=wsi,result`:
+
+```
+MESA-VIRTIO: debug: mmap failed: gpu_fd=4, handle=11, size=1000000, offset=..., err=Invalid argument
+MESA-VIRTIO: debug: vn_MapMemory2: VK_ERROR_MEMORY_MAP_FAILED
+MESA-VIRTIO: debug: vn_CreateSwapchainKHR: VK_ERROR_MEMORY_MAP_FAILED
+```
+
+The 1 000 000-byte memory is the 500×500 swapchain's blit buffer. The venus
+WSI is on its software path (`driverVersion` 580.88 < 590.48.1,
+`vn_wsi.c:134-139`), so it maps host-visible memory for every image. The host
+refused the `RESOURCE_MAP_BLOB` behind that `mmap`:
+
+```
+virtio-gpu command rejected command=0x0208 response=0x1200 error=... the
+shared-memory window refused the pages of resource 201: ... this window
+already holds 64 renderer ranges
+```
+
+At that moment the window held exactly 64 ranges: gnome-shell 24,
+gnome-initial-setup 3 + 15, vkcube 10, glmark2 12, 128 MiB of the 256 MiB
+window. `vmm_core::MAX_HOST_RANGES` was 64. Item 6 of the VEN-2003 list
+predicted it; this is the demanding guest it asked for.
+
+A few milliseconds earlier the Venus renderer had refused glmark2's next
+8 MiB command-stream chunk (`vn_instance.c:328`: the pool grows in 8 MiB
+chunks). It refused 23 times in 20 ms: 23 host blobs held 60.5 MiB against a
+renderer-wide `MAX_RING_BLOB_BYTES` of 64 MiB. That cap assumed "a venus ring
+is ~1 MiB", but gnome-shell alone held 26 MiB. The guest kernel does not wait
+for `RESOURCE_CREATE_BLOB`'s answer, so venus sees such a refusal only when a
+later map fails. Neither refusal is fatal to a context, so the host log had no
+"could not be answered". The virtio-gpu debug line said only "host resource
+memory is exhausted". The renderer now logs, at debug, which cap refused a
+blob and what the context and the renderer held.
+
+**The fix.**
+
+- `MAX_HOST_RANGES` is **1024**, sixteen per venus context at the 64-context
+  cap. On KVM each range is a memory slot. `Vm::create_shm_window` now
+  reserves no more than `KVM_CAP_NR_MEMSLOTS` leaves, keeping 16 back for the
+  firmware ROMs mapped after it. A map past that is refused in band, as one
+  past the constant is. This matters on a 509-slot kernel. WHP has no pool.
+- Host blobs have a **per-context** share (`MAX_RING_BLOBS_PER_CONTEXT` 64,
+  `MAX_RING_BLOB_BYTES_PER_CONTEXT` 128 MiB) and a renderer-wide cap
+  (`MAX_RING_BLOBS` 1024, `MAX_RING_BLOB_BYTES` 1 GiB). The renderer-wide
+  byte cap matches the executor's `MAX_HOST_VISIBLE_BYTES`. One hungry client
+  is now refused at its own share and can no longer take the rest from
+  everyone else.
+
+Pinned by `shm::tests::a_gpu_composited_desktop_fits_in_the_renderer_ranges`
+and by two `venus::renderer` tests:
+`a_gpu_composited_desktop_of_venus_clients_fits_in_the_host_blob_budget`
+replays the five clients' measured blobs, and
+`one_context_cannot_take_the_host_blob_budget_from_the_rest` runs at a
+shrunken scale. Both regression tests fail at the old values.
+
+**Measured after it**, same guest and same pair: vkcube ("Selected GPU 0:
+Virtio-GPU Venus (NVIDIA GeForce RTX 2070)") was still running after 60 s
+beside glmark2 on zink (GL 4.6, ~100 FPS). The peak was 69 ranges, 148.6 MiB
+mapped and 74.7 MiB of host blobs, with no refusal of any kind. vk-smoke
+passed 9/9.
+
+**The next cap in line** is the window itself:
+`VENUS_HOST_VISIBLE_BYTES` (256 MiB), 58 % full with four clients. Past it the
+guest kernel's own allocator of the BAR fails the map. Raising it costs
+guest-physical address space and, on Windows, commit charge for the window's
+unshown allocation. Measure a busier desktop before choosing the number.
+`MAX_RINGS` is a bound from the same one-client era: 32 renderer-wide
+against 64 contexts, one host thread each. Each GTK4 app is a venus instance
+too.

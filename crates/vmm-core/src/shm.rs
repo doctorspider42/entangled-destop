@@ -70,7 +70,19 @@ pub const SHM_PAGE_SIZE: u64 = 4096;
 /// numbers up front, which is what makes the bound a constant rather than a
 /// hope, and a guest past it gets `ERR_OUT_OF_MEMORY` for the map instead of a
 /// VMM that runs out of slots somewhere else.
-pub const MAX_HOST_RANGES: usize = 64;
+///
+/// Sized for a desktop, not for one client. It was 64, which one Vulkan
+/// client never approached; but with GNOME composited through Zink every GL
+/// client is a venus instance, each keeping its rings, reply pools and every
+/// host-visible allocation it maps mapped for as long as it lives. Measured on
+/// the Ubuntu 26.04 guest (2026-09-24): gnome-shell 24 ranges,
+/// gnome-initial-setup 18, glmark2 12, vkcube 10 — 64 in all, at which point
+/// vkcube's next swapchain could not map its buffers and died. 1024 is sixteen
+/// per venus context at the renderer's 64-context cap. On KVM each is a memory
+/// slot; `Vm::create_shm_window` reserves no more than the host's
+/// `KVM_CAP_NR_MEMSLOTS` leaves, and a map past that is refused like one past
+/// this.
+pub const MAX_HOST_RANGES: usize = 1024;
 
 /// Largest window this VMM will allocate, as a sanity bound on a host
 /// configuration value: 4 GiB. A window is committed host memory, so a typo in
@@ -1008,6 +1020,25 @@ mod tests {
         window
             .map_host_range(MAX_HOST_RANGES as u64 * PAGE, range)
             .expect("room again");
+    }
+
+    /// The regression: GNOME composited through Zink, with gnome-shell,
+    /// gnome-initial-setup, glmark2 and vkcube running, held 64 renderer
+    /// ranges, and the 65th — vkcube's next swapchain buffer — was refused
+    /// (2026-09-24). A desktop four times that busy must fit.
+    #[test]
+    fn a_gpu_composited_desktop_fits_in_the_renderer_ranges() {
+        const DESKTOP: u64 = 4 * 64;
+        let window =
+            SharedWindow::new_host_mapped((DESKTOP + 1) * PAGE, Arc::new(UnmappedGpaMapper))
+                .unwrap();
+        let (_pages, range) = renderer_pages(1);
+        for i in 0..DESKTOP {
+            window
+                .map_host_range(i * PAGE, range)
+                .unwrap_or_else(|e| panic!("range {i} of a busy desktop was refused: {e}"));
+        }
+        assert_eq!(window.range_count(), DESKTOP as usize);
     }
 
     /// Dropping a host-mapped window must take its ranges out of the guest,

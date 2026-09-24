@@ -214,8 +214,23 @@ pub const MAX_RINGS_PER_CONTEXT: usize = 8;
 /// guest is producing.
 pub const MAX_RINGS: usize = 32;
 
-/// Most host blobs this renderer backs with pages at once.
-pub const MAX_RING_BLOBS: usize = 64;
+/// Most host blobs (`blob_id` 0: rings, reply windows, command-stream
+/// pools) this renderer backs with pages at once, across every context.
+///
+/// Sized for a desktop, not for one client. With GNOME composited through
+/// Zink every GL client is a venus instance of its own, and a Mesa 26.0.8
+/// venus instance holds several of these for as long as it lives — measured
+/// on the Ubuntu 26.04 guest, 2026-09-24: gnome-shell 7 (a 132 KiB ring, a
+/// 20 KiB one, two 1 MiB pools and three 8 MiB command-stream chunks,
+/// `vn_instance.c:328-332`), glmark2, vkcube and gnome-initial-setup 3 to 5
+/// each. The per-context caps ([`MAX_RING_BLOBS_PER_CONTEXT`],
+/// [`MAX_RING_BLOB_BYTES_PER_CONTEXT`]) keep one hungry client from taking
+/// this from the rest.
+pub const MAX_RING_BLOBS: usize = 1024;
+
+/// Most host blobs one venus context holds at once — see [`MAX_RING_BLOBS`].
+/// Nine times the most any client was measured to hold.
+pub const MAX_RING_BLOBS_PER_CONTEXT: usize = 64;
 
 /// Most blobs of `VkDeviceMemory` this renderer holds at once.
 ///
@@ -225,14 +240,50 @@ pub const MAX_RING_BLOBS: usize = 64;
 /// most drivers report.
 pub const MAX_MEMORY_BLOBS: usize = 4096;
 
-/// Most host bytes this renderer will allocate across all live blobs.
+/// Most host bytes this renderer will allocate across all live host blobs.
 ///
-/// A ring's shared-memory resource is a guest-chosen size, so it is a guest
-/// value naming a host allocation twice over: per blob,
-/// [`super::shmem::MAX_RESOURCE_BYTES`] caps one; this caps their sum. A real
-/// venus ring is ~1 MiB, so 64 MiB is two orders of magnitude of headroom and
-/// still a number a host can afford to lose to a hostile guest.
-pub const MAX_RING_BLOB_BYTES: u64 = 64 << 20;
+/// A host blob's size is guest-chosen, so it is a guest value naming a host
+/// allocation twice over: per blob, [`super::shmem::MAX_RESOURCE_BYTES`] caps
+/// one; this caps their sum, and [`MAX_RING_BLOB_BYTES_PER_CONTEXT`] one
+/// context's share of it.
+///
+/// It was 64 MiB, on the belief that "a real venus ring is ~1 MiB". A venus
+/// *instance* is more than its ring: its command-stream pool grows in 8 MiB
+/// chunks, and freed chunks stay cached for 3 s (`vn_renderer_internal.c`).
+/// On the GPU-composited GNOME desktop gnome-shell alone held 26 MiB, five
+/// clients 60.5 MiB, and the next 8 MiB chunk glmark2 asked for was refused —
+/// 23 times in 20 ms. 1 GiB is the same bound the executor puts on
+/// host-visible Vulkan memory ([`super::executor::MAX_HOST_VISIBLE_BYTES`]):
+/// what a hostile guest can make this host commit, and six times what a busy
+/// desktop was measured to use.
+pub const MAX_RING_BLOB_BYTES: u64 = 1 << 30;
+
+/// Most host-blob bytes one venus context holds at once — see
+/// [`MAX_RING_BLOB_BYTES`]. Sixteen command-stream chunks, five times
+/// gnome-shell's measured 26 MiB.
+pub const MAX_RING_BLOB_BYTES_PER_CONTEXT: u64 = 128 << 20;
+
+/// The host-blob caps one renderer enforces: the constants above, unless a
+/// test shrinks them to make the global caps reachable without allocating a
+/// gigabyte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostBlobLimits {
+    blobs: usize,
+    bytes: u64,
+    blobs_per_context: usize,
+    bytes_per_context: u64,
+}
+
+impl Default for HostBlobLimits {
+    fn default() -> Self {
+        Self {
+            blobs: MAX_RING_BLOBS,
+            bytes: MAX_RING_BLOB_BYTES,
+            blobs_per_context: MAX_RING_BLOBS_PER_CONTEXT,
+            bytes_per_context: MAX_RING_BLOB_BYTES_PER_CONTEXT,
+        }
+    }
+}
 
 /// Canonical images one handle blob keeps on record (stage S2b): the
 /// exporter's and a few importers'. Past it the oldest is forgotten — each
@@ -1627,8 +1678,20 @@ pub enum VenusError {
     UnknownBlob(u32),
 
     /// The [`MAX_RING_BLOBS`] cap.
-    #[error("the host limit of {MAX_RING_BLOBS} venus host blobs is reached")]
-    TooManyBlobs,
+    #[error("the host limit of {max} venus host blobs is reached")]
+    TooManyBlobs {
+        /// [`MAX_RING_BLOBS`].
+        max: usize,
+    },
+
+    /// The [`MAX_RING_BLOBS_PER_CONTEXT`] cap.
+    #[error("venus context {ctx_id} already holds the {max} host blobs one context may")]
+    TooManyContextBlobs {
+        /// The context.
+        ctx_id: u32,
+        /// [`MAX_RING_BLOBS_PER_CONTEXT`].
+        max: usize,
+    },
 
     /// The [`MAX_MEMORY_BLOBS`] cap.
     #[error("the host limit of {MAX_MEMORY_BLOBS} blobs of Vulkan memory is reached")]
@@ -1682,6 +1745,20 @@ pub enum VenusError {
         /// The size asked for.
         size: u64,
         /// [`MAX_RING_BLOB_BYTES`].
+        max: u64,
+    },
+
+    /// The [`MAX_RING_BLOB_BYTES_PER_CONTEXT`] budget.
+    #[error(
+        "a {size:#x}-byte blob would take venus context {ctx_id} past the {max:#x} bytes of \
+         host blobs one context may hold"
+    )]
+    ContextBlobBudget {
+        /// The context.
+        ctx_id: u32,
+        /// The size asked for.
+        size: u64,
+        /// [`MAX_RING_BLOB_BYTES_PER_CONTEXT`].
         max: u64,
     },
 
@@ -1810,9 +1887,11 @@ impl From<VenusError> for CommandError {
             }
             VenusError::UnsupportedBlobMem(blob_mem) => Self::UnsupportedBlobMem(blob_mem),
             VenusError::DuplicateBlob(id) => Self::DuplicateResource(id),
-            VenusError::TooManyBlobs
+            VenusError::TooManyBlobs { .. }
+            | VenusError::TooManyContextBlobs { .. }
             | VenusError::TooManyMemoryBlobs
-            | VenusError::BlobBudget { .. } => Self::OutOfMemory,
+            | VenusError::BlobBudget { .. }
+            | VenusError::ContextBlobBudget { .. } => Self::OutOfMemory,
             VenusError::BlobAlreadyMapped(id) => Self::BlobAlreadyMapped(id),
             VenusError::HandleBlobNotMappable(id) => Self::BlobNotMappable(id),
             VenusError::BlobSpanMismatch { .. } | VenusError::WindowRefused { .. } => {
@@ -2020,6 +2099,13 @@ pub struct VenusRenderer<F> {
     blob_bytes: u64,
     /// Ring blobs, against [`MAX_RING_BLOBS`].
     shm_blobs: usize,
+    /// Ring blobs and their bytes per creating context, against
+    /// [`MAX_RING_BLOBS_PER_CONTEXT`] and [`MAX_RING_BLOB_BYTES_PER_CONTEXT`].
+    /// Keyed by the blob's `ctx_id` and kept until its last blob goes, so a
+    /// destroyed context's blobs still count against its id.
+    host_blob_use: HashMap<u32, (usize, u64)>,
+    /// The caps the four counters above are held to.
+    host_blob_limits: HostBlobLimits,
     /// Memory blobs, against [`MAX_MEMORY_BLOBS`].
     memory_blobs: usize,
     contexts: HashMap<u32, Context>,
@@ -2075,6 +2161,8 @@ impl<F> VenusRenderer<F> {
             directory: BlobDirectory::default(),
             blob_bytes: 0,
             shm_blobs: 0,
+            host_blob_use: HashMap::new(),
+            host_blob_limits: HostBlobLimits::default(),
             memory_blobs: 0,
             contexts: HashMap::new(),
             observed: 0,
@@ -2112,6 +2200,13 @@ impl<F> VenusRenderer<F> {
     #[must_use]
     pub fn blob_count(&self) -> usize {
         self.blobs.len()
+    }
+
+    /// Shrink the host-blob caps, so a test can reach the renderer-wide ones
+    /// without allocating a gigabyte.
+    #[cfg(test)]
+    fn set_host_blob_limits(&mut self, limits: HostBlobLimits) {
+        self.host_blob_limits = limits;
     }
 
     /// The pages behind a host blob, for a test playing the guest.
@@ -2232,13 +2327,30 @@ impl<F> VenusRenderer<F> {
         entries: &[MemEntry],
     ) -> Result<(), VenusError> {
         self.check_host_blob(ctx_id, args, entries)?;
-        if self.shm_blobs >= MAX_RING_BLOBS {
-            return Err(VenusError::TooManyBlobs);
+        let limits = self.host_blob_limits;
+        // The context's own share first: a client that has used its share is
+        // told so by name, and cannot take the rest from everyone else.
+        let (held, held_bytes) = self.host_blob_use.get(&ctx_id).copied().unwrap_or((0, 0));
+        if held >= limits.blobs_per_context {
+            return Err(VenusError::TooManyContextBlobs {
+                ctx_id,
+                max: limits.blobs_per_context,
+            });
         }
-        if self.blob_bytes.saturating_add(args.size) > MAX_RING_BLOB_BYTES {
+        if held_bytes.saturating_add(args.size) > limits.bytes_per_context {
+            return Err(VenusError::ContextBlobBudget {
+                ctx_id,
+                size: args.size,
+                max: limits.bytes_per_context,
+            });
+        }
+        if self.shm_blobs >= limits.blobs {
+            return Err(VenusError::TooManyBlobs { max: limits.blobs });
+        }
+        if self.blob_bytes.saturating_add(args.size) > limits.bytes {
             return Err(VenusError::BlobBudget {
                 size: args.size,
-                max: MAX_RING_BLOB_BYTES,
+                max: limits.bytes,
             });
         }
 
@@ -2247,6 +2359,9 @@ impl<F> VenusRenderer<F> {
         let pages = Arc::new(RingPages::new(args.size)?);
         self.blob_bytes = self.blob_bytes.saturating_add(args.size);
         self.shm_blobs = self.shm_blobs.saturating_add(1);
+        let share = self.host_blob_use.entry(ctx_id).or_default();
+        share.0 = share.0.saturating_add(1);
+        share.1 = share.1.saturating_add(args.size);
         self.directory
             .insert(args.resource_id, ctx_id, Arc::clone(&pages));
         self.blobs.insert(
@@ -2846,6 +2961,13 @@ impl<F: SinkFactory> VenusRenderer<F> {
                     self.directory.remove(resource_id);
                     self.blob_bytes = self.blob_bytes.saturating_sub(blob.size);
                     self.shm_blobs = self.shm_blobs.saturating_sub(1);
+                    if let Some(share) = self.host_blob_use.get_mut(&blob.ctx_id) {
+                        share.0 = share.0.saturating_sub(1);
+                        share.1 = share.1.saturating_sub(blob.size);
+                        if share.0 == 0 {
+                            self.host_blob_use.remove(&blob.ctx_id);
+                        }
+                    }
                     self.drop_rings_on(resource_id);
                 }
                 // Neither a reply window nor a ring can be one; its pages go
@@ -3124,6 +3246,7 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         self.blobs.clear();
         self.blob_bytes = 0;
         self.shm_blobs = 0;
+        self.host_blob_use.clear();
         self.memory_blobs = 0;
         self.observed = 0;
     }
@@ -3245,10 +3368,26 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
     ) -> Result<(), CommandError> {
         // `blob_id` 0 is plain shared memory (vkr: `!blob_id && flags ==
         // MAPPABLE`); anything else names a `VkDeviceMemory`.
-        if args.blob_id == 0 {
-            self.create_host_blob(ctx_id, args, entries)?;
+        let created = if args.blob_id == 0 {
+            self.create_host_blob(ctx_id, args, entries)
         } else {
-            self.create_memory_blob(ctx_id, args, entries)?;
+            self.create_memory_blob(ctx_id, args, entries)
+        };
+        if let Err(error) = created {
+            // The device logs the refusal too, but only as the virtio-gpu
+            // response code it becomes; which cap it was is said here.
+            tracing::debug!(
+                ctx_id,
+                resource = args.resource_id,
+                blob_id = args.blob_id,
+                size = args.size,
+                host_blobs = self.shm_blobs,
+                host_blob_bytes = self.blob_bytes,
+                memory_blobs = self.memory_blobs,
+                %error,
+                "venus blob refused"
+            );
+            return Err(error.into());
         }
         tracing::debug!(
             ctx_id,
@@ -4507,8 +4646,9 @@ mod tests {
             );
         }
 
-        // The total-bytes budget: what stops a guest turning blob creation into
-        // host memory exhaustion.
+        // A context's byte budget: what stops one guest process turning blob
+        // creation into host memory exhaustion (the renderer-wide budget
+        // behind it: `one_context_cannot_take_the_host_blob_budget_from_the_rest`).
         let chunk = 8u64 << 20;
         let mut created = 0u32;
         loop {
@@ -4524,7 +4664,7 @@ mod tests {
         }
         assert_eq!(
             u64::from(created),
-            (MAX_RING_BLOB_BYTES - RESOURCE) / chunk,
+            (MAX_RING_BLOB_BYTES_PER_CONTEXT - RESOURCE) / chunk,
             "the budget is exact, and the fixture's own blob counts against it"
         );
 
@@ -4777,16 +4917,148 @@ mod tests {
             .expect("a context");
         // 64 × 4 KiB is 256 KiB, comfortably under the byte budget, so this is
         // the count cap and nothing else.
-        for id in 1..=MAX_RING_BLOBS as u32 {
+        for id in 1..=MAX_RING_BLOBS_PER_CONTEXT as u32 {
             renderer
                 .create_blob(CTX, &blob_args(id, RESOURCE), &mem, &[])
                 .expect("under the cap");
         }
-        assert_eq!(renderer.blob_count(), MAX_RING_BLOBS);
+        assert_eq!(renderer.blob_count(), MAX_RING_BLOBS_PER_CONTEXT);
         assert!(matches!(
             renderer.create_blob(CTX, &blob_args(9999, RESOURCE), &mem, &[]),
             Err(CommandError::OutOfMemory)
         ));
+        // The cap is the context's: another one still gets blobs.
+        renderer
+            .ctx_create(CTX + 1, crate::CAPSET_VENUS, "")
+            .expect("a second context");
+        renderer
+            .create_blob(CTX + 1, &blob_args(9999, RESOURCE), &mem, &[])
+            .expect("a second context's share is its own");
+    }
+
+    /// The host blobs each Mesa 26.0.8 venus instance held on the
+    /// GPU-composited GNOME desktop (Ubuntu 26.04, 2026-09-24) when glmark2's
+    /// next 8 MiB command-stream chunk was refused: rings (132 KiB, 20 KiB),
+    /// the reply and command-stream pools (1 MiB each) and 8 MiB
+    /// command-stream chunks (`vn_instance.c:328-332`).
+    const GNOME_SHELL: &[u64] = &[
+        20 << 10,
+        132 << 10,
+        1 << 20,
+        1 << 20,
+        8 << 20,
+        8 << 20,
+        8 << 20,
+    ];
+    const INITIAL_SETUP_A: &[u64] = &[132 << 10, 1 << 20, 1 << 20];
+    const INITIAL_SETUP_B: &[u64] = &[20 << 10, 132 << 10, 1 << 20, 1 << 20, 8 << 20];
+    const VKCUBE: &[u64] = &[132 << 10, 1 << 20, 8 << 20];
+    const GLMARK2: &[u64] = &[20 << 10, 132 << 10, 1 << 20, 1 << 20, 8 << 20];
+
+    /// The regression: five venus clients held 23 host blobs and 60.5 MiB,
+    /// and the renderer-wide 64 MiB budget refused glmark2's next 8 MiB
+    /// chunk. The guest kernel does not wait for `RESOURCE_CREATE_BLOB`'s
+    /// answer, so venus found out only when the map of that blob failed.
+    #[test]
+    fn a_gpu_composited_desktop_of_venus_clients_fits_in_the_host_blob_budget() {
+        let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
+        let mut renderer = VenusRenderer::new(CaptureSink::new().factory());
+        let clients = [
+            GNOME_SHELL,
+            INITIAL_SETUP_A,
+            INITIAL_SETUP_B,
+            VKCUBE,
+            GLMARK2,
+        ];
+        let mut id = 1u32;
+        for (ctx, blobs) in (1u32..).zip(clients) {
+            renderer
+                .ctx_create(ctx, crate::CAPSET_VENUS, "")
+                .expect("a context");
+            for size in blobs {
+                renderer
+                    .create_blob(ctx, &blob_args(id, *size), &mem, &[])
+                    .expect("what the desktop held");
+                id += 1;
+            }
+        }
+        // glmark2's next chunk, and one more for everyone after it.
+        for ctx in [5u32, 5, 1, 2, 3, 4] {
+            renderer
+                .create_blob(ctx, &blob_args(id, 8 << 20), &mem, &[])
+                .unwrap_or_else(|e| panic!("context {ctx}'s next 8 MiB chunk was refused: {e}"));
+            id += 1;
+        }
+    }
+
+    #[test]
+    fn one_context_cannot_take_the_host_blob_budget_from_the_rest() {
+        let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
+        let mut renderer = VenusRenderer::new(CaptureSink::new().factory());
+        // Scaled down so the renderer-wide caps are reachable without
+        // allocating a gigabyte; the rule is the same at any scale.
+        renderer.set_host_blob_limits(HostBlobLimits {
+            blobs: 6,
+            bytes: 14 * RESOURCE,
+            blobs_per_context: 4,
+            bytes_per_context: 5 * RESOURCE,
+        });
+        for ctx in 1..=4 {
+            renderer
+                .ctx_create(ctx, crate::CAPSET_VENUS, "")
+                .expect("a context");
+        }
+        let mut create = |ctx: u32, id: u32, size: u64| {
+            renderer.create_blob(ctx, &blob_args(id, size), &mem, &[])
+        };
+
+        // A context's bytes: 4 pages, then 2 more would pass its 5.
+        create(1, 1, 4 * RESOURCE).expect("under its share");
+        assert!(matches!(
+            create(1, 2, 2 * RESOURCE),
+            Err(CommandError::OutOfMemory)
+        ));
+        // A context's count: its fifth blob, however small.
+        for id in 3..=6 {
+            create(2, id, RESOURCE).expect("under its count");
+        }
+        assert!(matches!(
+            create(2, 7, RESOURCE),
+            Err(CommandError::OutOfMemory)
+        ));
+        // Neither refusal cost context 3 anything...
+        create(3, 8, 5 * RESOURCE).expect("its own share");
+        // ...but the renderer-wide count still binds: six blobs are live.
+        assert!(matches!(
+            create(4, 9, RESOURCE),
+            Err(CommandError::OutOfMemory)
+        ));
+
+        // Freeing one gives its slot back to whoever asks next, and its bytes
+        // back to its context.
+        renderer.destroy_blob(1);
+        renderer
+            .create_blob(1, &blob_args(10, 2 * RESOURCE), &mem, &[])
+            .expect("its share was refunded");
+        // 2 + 4 + 5 = 11 pages live in 6 blobs. Free one of context 2's, and
+        // 5 more pages are inside context 4's share but past the
+        // renderer-wide 14; 4 more are exactly up to it.
+        renderer.destroy_blob(3);
+        assert!(matches!(
+            renderer.create_blob(4, &blob_args(11, 5 * RESOURCE), &mem, &[]),
+            Err(CommandError::OutOfMemory)
+        ));
+        renderer
+            .create_blob(4, &blob_args(11, 4 * RESOURCE), &mem, &[])
+            .expect("exactly up to the renderer-wide byte cap");
+
+        renderer.reset();
+        renderer
+            .ctx_create(1, crate::CAPSET_VENUS, "")
+            .expect("a context after the reset");
+        renderer
+            .create_blob(1, &blob_args(12, 5 * RESOURCE), &mem, &[])
+            .expect("a reset forgets every share");
     }
 
     #[test]
