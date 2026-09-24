@@ -306,6 +306,7 @@ impl<'a> Batch<'a> {
         Consumed {
             bytes: self.clamp(n),
             fatal: false,
+            blocked: false,
         }
     }
 
@@ -339,6 +340,28 @@ impl<'a> Batch<'a> {
         Consumed {
             bytes: self.clamp(n),
             fatal: true,
+            blocked: false,
+        }
+    }
+
+    /// Report that the first `n` bytes (clamped to the batch) were handled,
+    /// and that the command after them is **waiting on something outside the
+    /// ring** — `vkWaitVirtqueueSeqnoMESA`, whose seqno arrives on the
+    /// context stream.
+    ///
+    /// The pump advances `head` over the `n` bytes and answers
+    /// [`Pass::Blocked`]. Unlike [`nothing`](Self::nothing) it does **not**
+    /// remember the `tail`: the same bytes are offered again on the next
+    /// pass, because what changes the answer is not the guest's `tail` but
+    /// the other stream. That is what lets the worker give the pause gate its
+    /// pass back between looks instead of holding it for the whole wait
+    /// (ADR-0005).
+    #[must_use]
+    pub fn blocked(&self, n: usize) -> Consumed {
+        Consumed {
+            bytes: self.clamp(n),
+            fatal: false,
+            blocked: true,
         }
     }
 
@@ -355,6 +378,7 @@ impl<'a> Batch<'a> {
 pub struct Consumed {
     bytes: u32,
     fatal: bool,
+    blocked: bool,
 }
 
 impl Consumed {
@@ -369,6 +393,13 @@ impl Consumed {
     #[must_use]
     pub fn is_fatal(self) -> bool {
         self.fatal
+    }
+
+    /// Whether the sink is waiting on something outside the ring after
+    /// [`bytes`](Self::bytes); see [`Batch::blocked`].
+    #[must_use]
+    pub fn is_blocked(self) -> bool {
+        self.blocked
     }
 }
 
@@ -436,6 +467,22 @@ pub enum Pass {
     Deadlocked {
         /// How many bytes were on offer. Always the buffer's full length.
         offered: u32,
+    },
+
+    /// The sink took `consumed` of the `offered` bytes (possibly none) and is
+    /// waiting on something outside the ring before it can take the command
+    /// after them ([`Batch::blocked`]). `head` was republished if `consumed`
+    /// is not zero. Not a stall: nothing is remembered, and the next pass
+    /// offers the rest again whether or not `tail` has moved — so the driver
+    /// should wait for whatever the sink is waiting on (the worker: its
+    /// doorbell, which the context stream rings) before pumping again. Not a
+    /// deadlock either, even on a full ring: the thing that unblocks it does
+    /// not need ring space.
+    Blocked {
+        /// How many bytes the guest had waiting.
+        offered: u32,
+        /// How many of them the sink took before the blocked command.
+        consumed: u32,
     },
 }
 
@@ -744,6 +791,22 @@ impl RingPump {
             }
             self.mark_fatal(backing);
             return Err(PumpError::SinkFatal {
+                offered: claimed,
+                consumed: taken,
+            });
+        }
+
+        if answer.is_blocked() {
+            // Waiting on the other stream, not on the guest's `tail`: the
+            // next pass must offer these bytes again, so nothing is
+            // remembered about them. What was handled before the wait is
+            // released as usual.
+            self.stalled_at = None;
+            if taken != 0 {
+                self.cur = self.cur.wrapping_add(taken);
+                backing.store_head(&self.layout.head(), self.cur);
+            }
+            return Ok(Pass::Blocked {
                 offered: claimed,
                 consumed: taken,
             });
@@ -1721,6 +1784,61 @@ mod tests {
         assert_eq!(pump.pump(&*ring, &mut greedy), Ok(Pass::Idle));
     }
 
+    // ------------------------------------------------- a sink that is waiting
+
+    #[test]
+    fn a_blocked_sink_releases_what_it_handled_and_is_offered_the_rest_again() {
+        // `vkWaitVirtqueueSeqnoMESA`: the answer depends on the context
+        // stream, not on `tail`, so unlike a stall nothing is remembered and
+        // the same bytes come back on the next pass.
+        struct Waits(usize, usize);
+        impl RingSink for Waits {
+            fn consume(&mut self, batch: Batch<'_>) -> Consumed {
+                self.1 += 1;
+                batch.blocked(self.0)
+            }
+        }
+        let ring = MockRing::new();
+        let mut pump = pump_on(&ring);
+        ring.produce(0, b"doneWAIT");
+        ring.set_tail(8);
+        let mut sink = Waits(4, 0);
+        assert_eq!(
+            pump.pump(&*ring, &mut sink),
+            Ok(Pass::Blocked {
+                offered: 8,
+                consumed: 4
+            })
+        );
+        assert_eq!(ring.head(), 4);
+        sink.0 = 0;
+        assert_eq!(
+            pump.pump(&*ring, &mut sink),
+            Ok(Pass::Blocked {
+                offered: 4,
+                consumed: 0
+            })
+        );
+        assert_eq!(sink.1, 2, "re-offered with tail unmoved");
+        assert_eq!(pump.enter_idle(&*ring), Idle::WorkArrived);
+
+        // A full ring behind a wait is not a deadlock: what unblocks it
+        // needs no ring space.
+        let ring = MockRing::new();
+        let mut pump = pump_on(&ring);
+        ring.set_tail(BUFFER);
+        let mut sink = Waits(0, 0);
+        assert_eq!(
+            pump.pump(&*ring, &mut sink),
+            Ok(Pass::Blocked {
+                offered: BUFFER,
+                consumed: 0
+            })
+        );
+        assert!(!pump.is_fatal());
+        assert_eq!(ring.status() & STATUS_FATAL, 0);
+    }
+
     // ------------------------------------------------- a sink that cannot answer
 
     #[test]
@@ -2034,6 +2152,7 @@ mod tests {
                     }
                     Pass::Idle => assert_eq!(produced, delivered),
                     Pass::Stalled { .. } | Pass::Deadlocked { .. } => assert_eq!(taken, 0),
+                    Pass::Blocked { .. } => panic!("this sink never blocks"),
                 }
                 assert!(ok, "the sink was handed a byte out of stream order");
                 delivered = delivered.wrapping_add(u32::try_from(taken).unwrap_or(0));

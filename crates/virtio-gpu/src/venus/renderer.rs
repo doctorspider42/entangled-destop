@@ -147,6 +147,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -563,6 +564,49 @@ pub struct RingEnv {
     pub ring: u64,
     /// The host blobs this ring's context may name as a reply window.
     pub blobs: ContextBlobs,
+    /// The ring's virtqueue seqno, which the context stream records and the
+    /// ring's `vkWaitVirtqueueSeqnoMESA` waits for.
+    pub virtqueue_seqno: Arc<VirtqueueSeqno>,
+}
+
+/// One ring's **virtqueue seqno** (`vkr_ring::virtqueue_seqno`): the value
+/// the last `vkSubmitVirtqueueSeqnoMESA` for it recorded, which a
+/// `vkWaitVirtqueueSeqnoMESA` inside the ring waits for.
+///
+/// It is Mesa's *roundtrip* (`vn_ring_roundtrip`, `vn_ring.c:744-767`): the
+/// guest puts the submit on the virtqueue behind the commands the ring has
+/// to see done — a dma-buf's `RESOURCE_CREATE_BLOB`, before the ring's
+/// `vkAllocateMemory` imports it — and the wait in the ring, so the ring
+/// runs no further until the device worker has got that far. The value is
+/// a free-running 64-bit count per ring from 1 (`roundtrip_next`); both
+/// sides compare it as vkr does, as a plain `u64` (`virtqueue_seqno <
+/// seqno` in `vkr_ring_wait_virtqueue_seqno`), and a submit overwrites
+/// rather than raises it, as vkr's does.
+///
+/// Written by the device worker, read by the ring's worker; the store is a
+/// release and the load an acquire, so everything the device worker did
+/// before the submit — the blob it created — is visible to the ring that
+/// sees the value.
+#[derive(Debug, Default)]
+pub struct VirtqueueSeqno(AtomicU64);
+
+impl VirtqueueSeqno {
+    /// `vkSubmitVirtqueueSeqnoMESA`: record `seqno`.
+    pub fn submit(&self, seqno: u64) {
+        self.0.store(seqno, Ordering::Release);
+    }
+
+    /// Whether a `vkWaitVirtqueueSeqnoMESA(seqno)` may go on.
+    #[must_use]
+    pub fn reached(&self, seqno: u64) -> bool {
+        self.0.load(Ordering::Acquire) >= seqno
+    }
+
+    /// The value recorded last (0 before any).
+    #[must_use]
+    pub fn current(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 // ------------------------------------------------- blobs a sink may write
@@ -1905,6 +1949,9 @@ struct Ring {
     layout: RingLayout,
     /// Whether the context's monitor is keeping this ring alive.
     monitored: bool,
+    /// What `vkSubmitVirtqueueSeqnoMESA` records for the ring; its sink
+    /// holds the other reference.
+    virtqueue_seqno: Arc<VirtqueueSeqno>,
     /// The thread that owns the ring's [`RingPump`] and sink. Never restarted:
     /// once the ring is fatal the worker has ended, and it stays ended, which
     /// is what the module docs promise. Dropping it stops and joins it.
@@ -1976,8 +2023,9 @@ pub struct VenusRenderer<F> {
     /// Memory blobs, against [`MAX_MEMORY_BLOBS`].
     memory_blobs: usize,
     contexts: HashMap<u32, Context>,
-    /// Transport commands accepted but not executed (reply streams, seqnos):
-    /// a diagnostic, and what a test asserts to show they were not refused.
+    /// Transport commands accepted but not executed (reply streams on the
+    /// context stream): a diagnostic, and what a test asserts to show they
+    /// were not refused.
     observed: u64,
     /// The VM's pause gate, which every ring worker and monitor takes before
     /// it touches a ring (ADR-0005). An always-open gate until the device
@@ -2092,8 +2140,8 @@ impl<F> VenusRenderer<F> {
     }
 
     /// Transport commands that were decoded and accepted without being
-    /// executed — the reply-stream and seqno commands this renderer carries but
-    /// has no Vulkan to perform.
+    /// executed — the reply-stream commands the context stream carries but
+    /// serves only on a ring.
     #[must_use]
     pub fn observed_commands(&self) -> u64 {
         self.observed
@@ -2543,15 +2591,18 @@ impl<F: SinkFactory> VenusRenderer<F> {
             TransportCommand::WaitRingSeqno { ring, seqno } => {
                 self.wait_ring_seqno(ctx_id, ring, seqno)
             }
-            // Carried, counted and not executed: these are the reply-stream and
-            // seqno commands, and every one of them is about Vulkan work this
-            // renderer does not do. Refusing them would stop a real guest before
-            // it ever built its ring, which is the one thing this renderer
-            // exists to let it do.
+            TransportCommand::SubmitVirtqueueSeqno { ring, seqno } => {
+                self.submit_virtqueue_seqno(ctx_id, ring, seqno)
+            }
+            // Carried, counted and not executed: the reply-stream commands
+            // belong on a ring, where an executing sink serves them; on the
+            // context stream they are about Vulkan work this stream does not
+            // do. Refusing them would stop a real guest before it ever built
+            // its ring, which is the one thing this renderer exists to let it
+            // do.
             TransportCommand::SetReplyCommandStream { .. }
             | TransportCommand::SeekReplyCommandStream { .. }
-            | TransportCommand::ExecuteCommandStreams { .. }
-            | TransportCommand::SubmitVirtqueueSeqno { .. } => {
+            | TransportCommand::ExecuteCommandStreams { .. } => {
                 self.observed = self.observed.saturating_add(1);
                 Ok(())
             }
@@ -2622,10 +2673,12 @@ impl<F: SinkFactory> VenusRenderer<F> {
         let layout = RingLayout::new(info, pages.resource_len())?;
         let pump = pages.adopt(layout)?;
 
+        let virtqueue_seqno = Arc::new(VirtqueueSeqno::default());
         let env = RingEnv {
             ctx_id,
             ring,
             blobs: self.directory.for_context(ctx_id),
+            virtqueue_seqno: Arc::clone(&virtqueue_seqno),
         };
         let sink = self
             .sinks
@@ -2696,6 +2749,7 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 resource_id,
                 layout,
                 monitored,
+                virtqueue_seqno,
                 worker,
             },
         );
@@ -2858,6 +2912,32 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 scanout: None,
             },
         );
+        Ok(())
+    }
+
+    /// `vkSubmitVirtqueueSeqnoMESA` on the context stream
+    /// (`vkr_dispatch_vkSubmitVirtqueueSeqnoMESA`): record `seqno` as the
+    /// ring's virtqueue seqno and ring its doorbell, so a worker blocked in
+    /// `vkWaitVirtqueueSeqnoMESA` looks again now rather than at the end of
+    /// its wait ([`super::service::Step::Blocked`]). This runs on the device
+    /// worker, after every virtqueue command before it — which is the whole
+    /// point of the command. An unknown ring is refused, as vkr refuses it.
+    fn submit_virtqueue_seqno(
+        &mut self,
+        ctx_id: u32,
+        ring: u64,
+        seqno: u64,
+    ) -> Result<(), VenusError> {
+        let context = self
+            .contexts
+            .get(&ctx_id)
+            .ok_or(VenusError::UnknownContext(ctx_id))?;
+        let live = context
+            .rings
+            .get(&ring)
+            .ok_or(VenusError::UnknownRing { ctx_id, ring })?;
+        live.virtqueue_seqno.submit(seqno);
+        live.worker.notify();
         Ok(())
     }
 

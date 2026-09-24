@@ -67,7 +67,10 @@
 //! exactly the work — never while holding any device lock, and never while
 //! parked. Stopping is `stop flag → wake the condvar → Quiesce::wake → join`,
 //! which works while the VM is paused: a worker waiting at the gate re-checks
-//! its liveness predicate and leaves. Neither thread ever takes a lock that the
+//! its liveness predicate and leaves. A ring whose sink is waiting on the
+//! context stream ([`Step::Blocked`]) waits between passes, on its doorbell,
+//! so it holds no pass while the thing it waits for is behind the gated
+//! device worker. Neither thread ever takes a lock that the
 //! device side holds while joining it, which is what makes joining from inside
 //! a device callback (`vkDestroyRingMESA`, `ctx_destroy`, `reset`) safe.
 //!
@@ -142,6 +145,29 @@ pub fn relax_backoff(iter: u32) -> Duration {
     BASE_SLEEP.saturating_mul(1u32 << shift)
 }
 
+/// The longest a blocked ring waits between two looks at what it is waiting
+/// for ([`Step::Blocked`]).
+///
+/// Only a safety net: the renderer rings the worker's doorbell when it
+/// records the value a blocked sink waits for, and a stop rings the same
+/// condition variable, so neither waits this out. What it does bound is the
+/// cost of a guest that blocks its ring and never sends the seqno — one pass
+/// over the ring's bytes this often — and, were a doorbell ever missed, the
+/// latency that would cost.
+pub const MAX_BLOCKED_WAIT: Duration = Duration::from_millis(100);
+
+/// The wait after `iter` consecutive blocked passes: from one millisecond,
+/// doubling, up to [`MAX_BLOCKED_WAIT`]. Always long enough to be a
+/// condition-variable wait ([`INTERRUPTIBLE_SLEEP`]), because the doorbell is
+/// what normally ends it.
+#[must_use]
+pub fn blocked_backoff(iter: u32) -> Duration {
+    let shift = iter.saturating_sub(1).min(16);
+    INTERRUPTIBLE_SLEEP
+        .saturating_mul(1u32 << shift)
+        .min(MAX_BLOCKED_WAIT)
+}
+
 // ------------------------------------------------------------ the decisions
 
 /// Why a ring stopped for good. Every one of these has published
@@ -175,6 +201,12 @@ pub enum Step {
     /// `IDLE` is published and a re-read of `tail` confirmed there is nothing
     /// to do. Block until a doorbell, then call [`RingService::wake`].
     Park,
+    /// The sink is waiting on the context stream ([`Pass::Blocked`]): wait
+    /// for a doorbell — the renderer rings one when it records what the sink
+    /// waits for — or at most this long, **holding no pass**, then step
+    /// again. `IDLE` stays down meanwhile, as virglrenderer's ring thread
+    /// keeps it down while it waits (`vkr_ring_wait_virtqueue_seqno`).
+    Blocked(Duration),
     /// The ring is dead and `FATAL` is published. The worker ends.
     Stopped(RingStop),
 }
@@ -293,6 +325,17 @@ impl<S: RingSink> RingService<S> {
                 Step::Again
             }
             Ok(Pass::Idle | Pass::Stalled { .. }) => self.relax(now),
+            Ok(Pass::Blocked { consumed, .. }) => {
+                // Not idle: the ring has work, it just cannot run it yet. The
+                // idle clock restarts so `IDLE` is not published under a
+                // command the ring is about to run.
+                self.last_progress = now;
+                if consumed != 0 {
+                    self.relax_iter = 0;
+                }
+                self.relax_iter = self.relax_iter.saturating_add(1);
+                Step::Blocked(blocked_backoff(self.relax_iter))
+            }
             Ok(Pass::Deadlocked { offered }) => {
                 // The pump reports this and leaves the policy to its driver;
                 // the policy is that a guest waiting on a `head` that cannot
@@ -438,6 +481,25 @@ impl WorkerShared {
                 .wait(rung)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+    }
+
+    /// Wait out one [`Step::Blocked`]: until a doorbell (consumed), a stop,
+    /// or `limit`. A doorbell that arrived before this is called ends it at
+    /// once — it is checked under the lock the ringer takes — so a value
+    /// recorded between the sink's look and this wait is never slept past.
+    fn wait_blocked(&self, limit: Duration) {
+        let mut rung = relock(&self.doorbell);
+        if self.stopping() {
+            return;
+        }
+        if !*rung {
+            rung = self
+                .changed
+                .wait_timeout(rung, limit)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        *rung = false;
     }
 
     /// Sit out one poll backoff. Short ones sleep (high resolution on both
@@ -606,6 +668,10 @@ fn serve<S: RingSink>(
         match step {
             Step::Again => {}
             Step::Poll(backoff) => shared.pause_for(backoff),
+            // The pass was dropped above: a blocked ring holds none while it
+            // waits, so a pause settles and a reset joins while the value it
+            // waits for is still behind the (gated) device worker.
+            Step::Blocked(limit) => shared.wait_blocked(limit),
             Step::Park => {
                 if !shared.wait_for_doorbell() {
                     break;
@@ -1049,6 +1115,7 @@ mod tests {
                 }
                 Step::Again => {}
                 Step::Park => break,
+                Step::Blocked(limit) => panic!("blocked for {limit:?}"),
                 Step::Stopped(why) => panic!("stopped: {why}"),
             }
         }
@@ -1304,6 +1371,65 @@ mod tests {
         assert_eq!(ring.status() & STATUS_FATAL, STATUS_FATAL);
         assert_eq!(ring.head(), 0);
         assert_eq!(ring.tail(), BUFFER);
+    }
+
+    #[test]
+    fn a_blocked_sink_is_offered_the_same_bytes_again_never_parks_and_never_deadlocks() {
+        /// Takes four-byte commands; a zero word is "wait for `open`".
+        struct Gate {
+            open: Arc<AtomicBool>,
+            offers: usize,
+        }
+        impl RingSink for Gate {
+            fn consume(&mut self, batch: Batch<'_>) -> Consumed {
+                self.offers += 1;
+                let mut done = 0;
+                for word in batch.bytes().chunks_exact(4) {
+                    if word == [0; 4] && !self.open.load(Ordering::SeqCst) {
+                        return batch.blocked(done);
+                    }
+                    done += 4;
+                }
+                batch.consumed(done)
+            }
+        }
+        let open = Arc::new(AtomicBool::new(false));
+        let ring = Guest::new(TIMEOUT);
+        let gate = Gate {
+            open: Arc::clone(&open),
+            offers: 0,
+        };
+        let mut svc = ring.service(gate, Duration::ZERO);
+        ring.submit(&[1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 2, 2]);
+        // What came before the wait is released; the wait is not.
+        let Step::Blocked(first) = svc.step(us(1), &ring) else {
+            panic!("not blocked")
+        };
+        assert_eq!(first, INTERRUPTIBLE_SLEEP);
+        assert_eq!(ring.head(), 4);
+        // Long past the idle timeout, with `tail` unmoved, the same bytes are
+        // offered again, `IDLE` never goes up, and the wait grows to its cap.
+        let mut last = first;
+        for i in 1..20u32 {
+            let Step::Blocked(limit) = svc.step(us(1) + TIMEOUT * 10 * i, &ring) else {
+                panic!("not blocked")
+            };
+            assert!(limit >= last && limit <= MAX_BLOCKED_WAIT);
+            last = limit;
+        }
+        assert_eq!(last, MAX_BLOCKED_WAIT);
+        assert_eq!(svc.sink().offers, 20);
+        assert_eq!(ring.status() & STATUS_IDLE, 0);
+        assert_eq!(ring.head(), 4);
+        // Blocked on a full ring is still not a deadlock.
+        ring.submit(&vec![3u8; BUFFER as usize - 12]);
+        assert!(matches!(svc.step(us(500_000), &ring), Step::Blocked(_)));
+        assert_eq!(ring.status() & STATUS_FATAL, 0);
+        // Once it opens, the rest runs, and the ring idles as usual.
+        open.store(true, Ordering::SeqCst);
+        assert_eq!(svc.step(us(500_001), &ring), Step::Again);
+        assert_eq!(ring.head(), ring.tail());
+        assert_eq!(settle(&mut svc, us(600_000), &ring), Step::Park);
     }
 
     // --------------------------------------------------------- the monitor

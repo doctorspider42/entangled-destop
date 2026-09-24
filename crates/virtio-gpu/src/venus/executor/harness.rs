@@ -237,6 +237,35 @@ pub fn async_bytes(command: &Command<'_>) -> Vec<u8> {
     })
 }
 
+/// `vkSubmitVirtqueueSeqnoMESA(ring, seqno)`, as `vn_ring_submit_roundtrip`
+/// puts it on the virtqueue.
+#[must_use]
+pub fn submit_virtqueue_seqno_bytes(ring: u64, seqno: u64) -> Vec<u8> {
+    encoded(|enc| {
+        enc.command_header(CommandHeader {
+            opcode: Opcode::SubmitVirtqueueSeqno.as_u32(),
+            flags: 0,
+        })
+        .expect("encode");
+        enc.u64(ring).expect("encode");
+        enc.u64(seqno).expect("encode");
+    })
+}
+
+/// `vkWaitVirtqueueSeqnoMESA(seqno)`, as `vn_ring_wait_roundtrip` puts it
+/// into the ring.
+#[must_use]
+pub fn wait_virtqueue_seqno_bytes(seqno: u64) -> Vec<u8> {
+    encoded(|enc| {
+        enc.command_header(CommandHeader {
+            opcode: Opcode::WaitVirtqueueSeqno.as_u32(),
+            flags: 0,
+        })
+        .expect("encode");
+        enc.u64(seqno).expect("encode");
+    })
+}
+
 fn create_ring_stream(monitor_us: Option<u32>) -> Vec<u8> {
     create_ring_stream_on(RING, RING_RES, monitor_us)
 }
@@ -477,6 +506,24 @@ impl<H: HostVulkan> Harness<H> {
             enc.u64(seqno).expect("encode");
         });
         self.renderer.submit(self.ctx, &bytes)
+    }
+
+    /// `vkSubmitVirtqueueSeqnoMESA` for the harness ring, on the context
+    /// stream — the virtqueue half of Mesa's roundtrip.
+    ///
+    /// # Errors
+    /// The renderer's refusal.
+    pub fn submit_virtqueue_seqno(&mut self, seqno: u64) -> Result<(), crate::error::CommandError> {
+        let bytes = submit_virtqueue_seqno_bytes(self.ring_handle, seqno);
+        self.renderer.submit(self.ctx, &bytes)
+    }
+
+    /// `ALIVE`, `IDLE` and `FATAL` as the guest reads them.
+    #[must_use]
+    pub fn status(&self) -> u32 {
+        self.ring
+            .guest_load_word(STATUS)
+            .expect("status is in the ring")
     }
 
     /// `head` as the guest reads it.

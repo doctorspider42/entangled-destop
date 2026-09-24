@@ -282,3 +282,197 @@ fn sparse_fence_semaphore_and_buffer_queries_about_unserved_values_answer_nothin
     }
     assert!(!h.fatal());
 }
+
+// ------------------------------------------------ long pNext chains
+//
+// A guest shown 70-odd extensions asks `vkGetPhysicalDeviceFeatures2` about
+// dozens of structures in one chain; at 33 links the old depth cap killed
+// the context (found by GNOME on the GPU, zink under it).
+
+/// Every link `N` admits, found by asking the generated decoder about every
+/// structure type the registry can number — core ones below 1000, every
+/// extension's `1_000_000_000 + (extension - 1) * 1000 + offset` — with a
+/// zeroed skeleton body, which is what an output link is on the wire.
+fn admitted<N: for<'a> ChainLink<'a>>() -> Vec<N> {
+    let zeros = [0u8; 4096];
+    let core = 0..1000i32;
+    let extensions =
+        (0..1000i32).flat_map(|ext| (0..1000i32).map(move |at| 1_000_000_000 + ext * 1000 + at));
+    let mut links = Vec::new();
+    for stype in core.chain(extensions) {
+        let mut dec = crate::venus::wire::Decoder::new(&zeros);
+        if let Some(link) = N::decode_body(stype, &mut dec, true) {
+            links.push(link.unwrap_or_else(|e| panic!("sType {stype}: {e}")));
+        }
+    }
+    links
+}
+
+/// The links of [`admitted`] the executor serves ([`super::policy::admits_link`]):
+/// what the capset's extension mask lets a guest chain at all, and so the
+/// longest chain Mesa can send.
+fn served<N: for<'a> ChainLink<'a>>() -> Vec<N> {
+    let mut links = admitted::<N>();
+    links.retain(|l| super::policy::admits_link(l.structure_type()));
+    links
+}
+
+fn features_query(p_next: Vec<VkPhysicalDeviceFeatures2Next>) -> Command<'static> {
+    Command::GetPhysicalDeviceFeatures2(GetPhysicalDeviceFeatures2Args {
+        physical_device: VkPhysicalDevice(PHYSICAL),
+        p_features: Some(VkPhysicalDeviceFeatures2 {
+            p_next,
+            ..Default::default()
+        }),
+    })
+}
+
+fn properties_query(p_next: Vec<VkPhysicalDeviceProperties2Next>) -> Command<'static> {
+    Command::GetPhysicalDeviceProperties2(GetPhysicalDeviceProperties2Args {
+        physical_device: VkPhysicalDevice(PHYSICAL),
+        p_properties: Some(VkPhysicalDeviceProperties2 {
+            p_next,
+            ..Default::default()
+        }),
+    })
+}
+
+#[test]
+fn the_depth_cap_is_at_least_twice_the_longest_chain_any_parent_admits() {
+    // The decoder runs before the policy, so what bounds its recursion is
+    // everything the protocol admits (117, 51 and 120 today)...
+    let features = admitted::<VkPhysicalDeviceFeatures2Next>().len();
+    let properties = admitted::<VkPhysicalDeviceProperties2Next>().len();
+    let device = admitted::<VkDeviceCreateInfoNext>().len();
+    let longest = features.max(properties).max(device);
+    assert!(
+        2 * longest <= crate::venus::wire::MAX_PNEXT_DEPTH as usize,
+        "a regenerated protocol admits {longest} links: raise MAX_PNEXT_DEPTH"
+    );
+    // ...and what a guest really sends is what the executor serves (44, 27
+    // and 47 today), which is past the 32 links the cap used to be.
+    let chained = served::<VkPhysicalDeviceFeatures2Next>().len();
+    assert!(chained > 32, "{chained}");
+    assert!(served::<VkDeviceCreateInfoNext>().len() > 32);
+}
+
+#[test]
+fn a_features_query_chaining_every_admitted_structure_is_answered_in_order() {
+    let (mut h, _) = harness();
+    let links = served::<VkPhysicalDeviceFeatures2Next>();
+    let asked: Vec<i32> = links.iter().map(ChainLink::structure_type).collect();
+    let Command::GetPhysicalDeviceFeatures2(f) =
+        h.call(&features_query(links)).expect("answered, not fatal")
+    else {
+        panic!()
+    };
+    let answer = f.p_features.unwrap().p_next;
+    let got: Vec<i32> = answer.iter().map(ChainLink::structure_type).collect();
+    assert_eq!(got, asked, "the reply echoes the guest's chain");
+    // The structures the host knows are answered from it, wherever in the
+    // chain they sit.
+    assert!(answer.iter().any(|l| matches!(l,
+        VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceVulkan13Features(v)
+            if v.synchronization2 == 1 && v.dynamic_rendering == 1)));
+    assert!(!h.fatal());
+    h.call(&features_query(Vec::new()))
+        .expect("the context lives");
+}
+
+#[test]
+fn a_properties_query_chaining_every_admitted_structure_is_answered_in_order() {
+    let (mut h, _) = harness();
+    let links = served::<VkPhysicalDeviceProperties2Next>();
+    let asked: Vec<i32> = links.iter().map(ChainLink::structure_type).collect();
+    let Command::GetPhysicalDeviceProperties2(all) = h
+        .call(&properties_query(links.clone()))
+        .expect("answered, not fatal")
+    else {
+        panic!()
+    };
+    let all = all.p_properties.unwrap().p_next;
+    let got: Vec<i32> = all.iter().map(ChainLink::structure_type).collect();
+    assert_eq!(got, asked, "the reply echoes the guest's chain");
+    // Each link answers exactly what it answers on its own.
+    for (link, answered) in links.into_iter().zip(&all).step_by(7) {
+        let Command::GetPhysicalDeviceProperties2(one) =
+            h.call(&properties_query(vec![link])).expect("answered")
+        else {
+            panic!()
+        };
+        assert_eq!(&one.p_properties.unwrap().p_next[0], answered);
+    }
+    assert!(!h.fatal());
+}
+
+#[test]
+fn a_chain_past_the_depth_cap_and_a_duplicate_link_are_still_fatal() {
+    use crate::venus::wire::{
+        Decoder, Encoder, WireError, COMMAND_GENERATE_REPLY, MAX_PNEXT_DEPTH,
+    };
+    let decode = |command: &Command<'_>| {
+        let mut enc = Encoder::new();
+        command
+            .encode_command(&mut enc, COMMAND_GENERATE_REPLY)
+            .expect("encode");
+        let bytes = enc.finish().expect("encode");
+        Command::decode_next(&mut Decoder::new(&bytes)).map(|_| ())
+    };
+    let link =
+        || VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceVulkan13Features(Default::default());
+    // What the executor refuses, it refuses as the decoder does: too deep
+    // on the way down, before any duplicate can be seen...
+    let deep = features_query((0..=MAX_PNEXT_DEPTH).map(|_| link()).collect());
+    assert!(matches!(
+        decode(&deep),
+        Err(ProtocolError::Wire(WireError::PnextChainTooDeep {
+            parent: "VkPhysicalDeviceFeatures2"
+        }))
+    ));
+    // ...and a link named twice, however short the chain.
+    let twice = features_query(vec![link(), link()]);
+    assert!(matches!(
+        decode(&twice),
+        Err(ProtocolError::DuplicatePnextStype {
+            parent: "VkPhysicalDeviceFeatures2",
+            ..
+        })
+    ));
+    // Exactly at the cap, a chain is only refused for its duplicates.
+    let at_cap = features_query((0..MAX_PNEXT_DEPTH).map(|_| link()).collect());
+    assert!(matches!(
+        decode(&at_cap),
+        Err(ProtocolError::DuplicatePnextStype { .. })
+    ));
+
+    for command in [deep, twice] {
+        let (mut h, _) = harness();
+        let Err(head) = h.call(&command) else {
+            panic!("not refused")
+        };
+        assert!(h.fatal());
+        assert_ne!(head, h.tail(), "head passed the refused command");
+        assert_eq!(h.renderer.factory().context_fatal(CTX), Some(true));
+    }
+}
+
+#[test]
+fn a_device_created_with_every_served_structure_chained_is_created() {
+    // Zink creates its device with the chain it queried: dozens of feature
+    // structures (all zero here, so all a subset of what was reported). The
+    // device-group link needs real members, so it is left to its own tests.
+    let host = Arc::new(FakeVulkan::standard());
+    let mut h = Harness::new(Arc::clone(&host));
+    boot(&mut h);
+    let mut chain = served::<VkDeviceCreateInfoNext>();
+    chain.retain(|l| !matches!(l, VkDeviceCreateInfoNext::VkDeviceGroupDeviceCreateInfo(_)));
+    assert!(chain.len() > 32, "{}", chain.len());
+    let Command::CreateDevice(reply) = h
+        .call(&create_device(PHYSICAL, DEVICE, chain))
+        .expect("answered, not fatal")
+    else {
+        panic!()
+    };
+    assert_eq!(reply.ret, VK_SUCCESS);
+    assert!(!h.fatal());
+}

@@ -596,7 +596,7 @@ fn structural_refusals_each_have_their_own_error() {
         .u64(2)
         .u64(1)
         .i32(STYPE_PROPERTIES_2);
-    for _ in 0..40 {
+    for _ in 0..=crate::venus::wire::MAX_PNEXT_DEPTH {
         deep = deep.u64(1).i32(STYPE_ID_PROPERTIES);
     }
     assert!(matches!(

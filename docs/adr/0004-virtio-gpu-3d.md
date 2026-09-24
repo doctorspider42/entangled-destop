@@ -3617,3 +3617,95 @@ Not yet:
   into wgpu) is the next performance step.
 - **The guest must be configured**: the driconf file, and render-node access
   for serial-console tools (ADR above). Nothing installs either yet.
+
+## Amendment, 2026-09-24 — two fixes found by guest traffic on the GPU desktop
+
+With GNOME composited on the GPU and GL clients on zink, the guest sent two
+things the executor refused. Each refusal ended the context.
+
+### `vkWaitVirtqueueSeqnoMESA` inside a ring
+
+This is Mesa's *roundtrip* (`vn_ring_roundtrip`, `vn_ring.c:744-767`). The
+guest puts `vkSubmitVirtqueueSeqnoMESA(ring, n)` on the virtqueue, then
+`vkWaitVirtqueueSeqnoMESA(n)` in the ring. The ring must run nothing after
+the wait until the device worker has run everything queued before the
+submit. Mesa 26.0.8 sends one:
+
+- before importing a dma-buf as memory (`vn_device_memory_import_dma_buf`),
+- before `vkGetMemoryFdPropertiesKHR` of a dma-buf
+  (`vn_get_memory_dma_buf_properties`),
+- when allocating exportable memory (`vn_device_memory_alloc_export`); that
+  one is waited for in `vn_FreeMemory`,
+- when a map of freshly made memory fails (`vn_MapMemory2`).
+
+The first two name a resource the virtqueue has only just created. Its other
+callers need guest VRAM, which this device does not offer. So advertising
+dma-buf is what started the traffic.
+
+What we do, following virglrenderer (`vkr_transport.c`, `vkr_ring.c`):
+
+- **Submit.** A submit on the context stream stores `n` as the ring's
+  virtqueue seqno (`renderer::VirtqueueSeqno`) and rings the ring's
+  doorbell. An unknown ring is refused. A submit inside a ring is still
+  fatal.
+- **Compare.** Values are compared as plain `u64`, as vkr does (`seqno <
+  n`). Mesa counts from 1 per ring, so the counter does not wrap, and a
+  submit overwrites the stored value rather than raising it.
+- **Wait.** A wait whose value has not arrived is **not** waited out inside
+  the sink. The sink returns everything before the wait with the new
+  `Batch::blocked`. The pump publishes `head` up to the wait and remembers no
+  stall. The worker gives back its pause-gate pass and sleeps on its
+  doorbell (`service::Step::Blocked`, at most `MAX_BLOCKED_WAIT` = 100 ms per
+  sleep, as a safety net). Then it decodes the wait again. `IDLE` stays down
+  meanwhile, as in vkr.
+- **Why not block in place.** The submit usually sits behind the device
+  worker, and a pause gates that worker. A ring that waited while holding
+  its pass would have kept the pause from settling. This way a pause
+  settles, a reset or context teardown joins the worker at once, and the
+  `ALIVE` monitor keeps the guest's watchdog quiet.
+- **No time limit, as in vkr.** A wait held for more than
+  `VIRTQUEUE_WAIT_WARN_AFTER` (5 s) is logged once.
+- **Nested.** Inside `vkExecuteCommandStreamsMESA` the wait cannot be handed
+  back, so there it waits in place and checks the stop signal between short
+  sleeps. Mesa never sends it there: a 16-byte command always goes into the
+  ring directly.
+
+A wait on the context stream stays refused. It would block the worker that
+has to deliver the submit.
+
+`vkWaitRingSeqnoMESA` is unchanged. Suppose a context-side wait asks for a
+ring position past a pending virtqueue wait, and the submit comes later on
+the same virtqueue. That would deadlock in vkr. Here it times out after
+`WAIT_RING_SEQNO_TIMEOUT` instead. Mesa always queues the submit before it
+writes the ring wait, so FIFO order rules this out.
+
+Pinned by `venus::executor::seqno_tests`, `pump` and `service` tests.
+
+### pNext chains deeper than 32 links
+
+`vkGetPhysicalDeviceFeatures2` was refused with "deeper than 32 links". The
+executor serves 44 structures under `VkPhysicalDeviceFeatures2`, 27 under
+`VkPhysicalDeviceProperties2` and 47 under `VkDeviceCreateInfo`. Zink chains
+all it knows in one query, and then again in `vkCreateDevice`.
+
+The decoder runs before the executor's policy, so its bound must cover what
+the generated protocol admits: 117, 51 and 120. `wire::MAX_PNEXT_DEPTH` is
+now **256**, more than twice the longest chain that can be decoded. It is a
+stack bound only. Two other bounds hold the content:
+
+- the duplicate-`sType` refusal limits a valid chain to what its parent
+  admits;
+- each decoded link is now charged to the command's allocation budget
+  (`Decoder::charge`).
+
+The generated code reaches the limit only through `wire`, so regenerating
+changed nothing. All three generators pass `--check`. On the host side
+(`host_vulkan`), chains are built from one fixed field per admitted
+structure, so the guest's chain length never reaches them.
+
+`venus::executor::query_tests` pins:
+
+- queries with every served structure chained,
+- a device created with its whole chain,
+- refusals past the cap and of duplicates,
+- that the cap stays at least twice the longest decodable chain.

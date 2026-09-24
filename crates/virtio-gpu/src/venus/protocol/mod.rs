@@ -902,6 +902,9 @@ impl<'a, N: ChainLink<'a>> PnextVisitor<'a> for ChainVisitor<N> {
         match N::decode_body(stype, dec, self.partial) {
             None => Err(Self::unknown(stype)),
             Some(Ok(link)) => {
+                // What the chain costs the host is charged like any array's,
+                // so the budget bounds it as well as the depth does.
+                dec.charge(std::mem::size_of::<N>())?;
                 if self.links.iter().any(|l| l.structure_type() == stype) {
                     self.duplicate.get_or_insert(stype);
                 }

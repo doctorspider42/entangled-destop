@@ -93,6 +93,36 @@
 //! keeps `ALIVE` set meanwhile; a ring being torn down stops waiting within a
 //! slice, without consuming the command.
 //!
+//! # Roundtrips: `vkWaitVirtqueueSeqnoMESA` (found by GNOME on the GPU)
+//!
+//! Mesa 26.0.8 orders the virtqueue against a ring with a *roundtrip*
+//! (`vn_ring_roundtrip`, `vn_ring.c:744-767`): `vkSubmitVirtqueueSeqnoMESA`
+//! on the virtqueue, then `vkWaitVirtqueueSeqnoMESA` for the same value in
+//! the ring, so the ring runs nothing after the wait before the device
+//! worker has run everything before the submit. It does so before importing
+//! a dma-buf as memory (`vn_device_memory_import_dma_buf`) and before asking
+//! a dma-buf's memory type bits (`vn_get_memory_dma_buf_properties`), both
+//! of which name a resource the virtqueue has only just created; after
+//! allocating exportable memory it submits one and waits for it in
+//! `vkFreeMemory` (`vn_device_memory_alloc_export`, `vn_FreeMemory`), and a
+//! failed map of freshly made memory does the same (`vn_MapMemory2`). The
+//! other callers only run with guest VRAM, which this device does not offer.
+//!
+//! The renderer records the submit ([`super::renderer::VirtqueueSeqno`]).
+//! The wait, when the value is not there yet, is **not** waited for inside
+//! the sink: the sink hands back everything before it with
+//! [`Batch::blocked`], the worker drops its pause-gate pass and sleeps on its
+//! doorbell ([`super::service::Step::Blocked`]), which the renderer rings
+//! when it records a value, and the next pass decodes the wait again. So a
+//! pause while the submit is still behind the gated device worker settles,
+//! a teardown joins at once, and the ring's monitor keeps `ALIVE` set for
+//! the guest's watchdog meanwhile. There is no time limit, as in vkr: the
+//! guest asked its ring to wait, and only its own virtqueue can release it.
+//! Inside a `vkExecuteCommandStreamsMESA` a wait cannot be handed back
+//! (the call would run again from its first stream), so there it is waited
+//! for in place, checking the stop between short sleeps; Mesa never sends it
+//! there — a 16-byte command always goes into the ring directly.
+//!
 //! # A lost device
 //!
 //! A `VK_ERROR_DEVICE_LOST` from the driver is answered to the guest — the
@@ -149,6 +179,8 @@ mod s1_tests;
 #[cfg(test)]
 mod s2b_tests;
 #[cfg(test)]
+mod seqno_tests;
+#[cfg(test)]
 mod submit_tests;
 #[cfg(test)]
 mod sync_tests;
@@ -158,7 +190,7 @@ mod tests;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -172,7 +204,7 @@ use super::pump::{Batch, Consumed, RingSink};
 use super::renderer::VenusRenderer;
 use super::renderer::{
     BlobRef, ContextBlobs, ExportedMemory, ReplyBlobError, RingEnv, ScanoutRelease, ScanoutTarget,
-    SinkFactory,
+    SinkFactory, VirtqueueSeqno,
 };
 use super::service::StopSignal;
 use super::shmem::PageBudget;
@@ -183,6 +215,12 @@ use super::transport::{
     TransportStream,
 };
 use super::wire::{Decoder, WireError, COMMAND_HEADER_BYTES};
+
+/// How long a ring may sit blocked in one `vkWaitVirtqueueSeqnoMESA` before
+/// the wait is logged. A diagnostic only — the wait itself has no limit
+/// (module docs, "Roundtrips") — set well past anything a device worker
+/// takes to reach a `SUBMIT_3D` the guest has already queued.
+pub const VIRTQUEUE_WAIT_WARN_AFTER: Duration = Duration::from_secs(5);
 
 /// The most bytes one `vkExecuteCommandStreamsMESA` may have the executor
 /// copy and run: 64 MiB, eight times Mesa's whole command-stream pool
@@ -344,6 +382,11 @@ pub struct ExecutingSink<H: HostVulkan> {
     blobs: ContextBlobs,
     window: Option<ReplyWindow>,
     stop: StopSignal,
+    /// What the ring's `vkWaitVirtqueueSeqnoMESA` waits for.
+    virtqueue_seqno: Arc<VirtqueueSeqno>,
+    /// The wait the ring is blocked in, if it is: the seqno, since when, and
+    /// whether that has been logged. Diagnostics only.
+    blocked: Option<(u64, Instant, bool)>,
 }
 
 impl<H: HostVulkan> std::fmt::Debug for ExecutingSink<H> {
@@ -370,6 +413,9 @@ enum Step {
     Stopped,
     /// The ring is dead: `opcode` could not be answered.
     Fatal { opcode: u32, error: SinkError },
+    /// A `vkWaitVirtqueueSeqnoMESA` of `used` bytes whose `seqno` the
+    /// context stream has not recorded yet: consume nothing of it.
+    Blocked { used: usize, seqno: u64 },
 }
 
 impl<H: HostVulkan> ExecutingSink<H> {
@@ -381,6 +427,8 @@ impl<H: HostVulkan> ExecutingSink<H> {
             blobs: env.blobs,
             window: None,
             stop: StopSignal::never(),
+            virtqueue_seqno: env.virtqueue_seqno,
+            blocked: None,
         }
     }
 
@@ -519,6 +567,24 @@ impl<H: HostVulkan> ExecutingSink<H> {
                     return fatal(error);
                 }
             }
+            // A ring's half of Mesa's roundtrip (module docs).
+            TransportCommand::WaitVirtqueueSeqno { seqno } => {
+                if !self.virtqueue_seqno.reached(seqno) {
+                    return Step::Blocked {
+                        used: stream.position(),
+                        seqno,
+                    };
+                }
+                if let Some((_, since, true)) = self.blocked.take() {
+                    tracing::info!(
+                        ctx_id = self.ctx_id,
+                        ring = format_args!("{:#x}", self.ring),
+                        seqno,
+                        waited_ms = since.elapsed().as_millis(),
+                        "a Venus ring's long vkWaitVirtqueueSeqnoMESA was released"
+                    );
+                }
+            }
             TransportCommand::ExecuteCommandStreams {
                 streams,
                 reply_positions,
@@ -613,6 +679,12 @@ impl<H: HostVulkan> ExecutingSink<H> {
                         lost = true;
                     }
                     Step::Stopped => return Ok(StepOf::Stopped),
+                    Step::Blocked { used, seqno } => {
+                        if !self.wait_in_place(seqno) {
+                            return Ok(StepOf::Stopped);
+                        }
+                        at = at.saturating_add(used.max(1));
+                    }
                     Step::Incomplete => return Err(SinkError::TruncatedStream { index }),
                     Step::Fatal { opcode, error } => {
                         return Err(SinkError::InStream {
@@ -632,6 +704,49 @@ impl<H: HostVulkan> ExecutingSink<H> {
             }
         }
         Ok(StepOf::Done(()))
+    }
+
+    /// `vkWaitVirtqueueSeqnoMESA` inside a command stream, where it cannot be
+    /// handed back (module docs): wait here, checking the stop between short
+    /// sleeps. `false`: the ring is being torn down.
+    fn wait_in_place(&self, seqno: u64) -> bool {
+        let mut spins = 0u32;
+        loop {
+            if self.virtqueue_seqno.reached(seqno) {
+                return true;
+            }
+            if self.stop.is_stopping() {
+                return false;
+            }
+            spins = spins.saturating_add(1);
+            if spins < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Note that the ring is blocked on `seqno`, and say so once if it has
+    /// been for [`VIRTQUEUE_WAIT_WARN_AFTER`].
+    fn note_blocked(&mut self, seqno: u64) {
+        match &mut self.blocked {
+            Some((waiting, since, warned)) if *waiting == seqno => {
+                if !*warned && since.elapsed() >= VIRTQUEUE_WAIT_WARN_AFTER {
+                    *warned = true;
+                    tracing::warn!(
+                        ctx_id = self.ctx_id,
+                        ring = format_args!("{:#x}", self.ring),
+                        seqno,
+                        recorded = self.virtqueue_seqno.current(),
+                        "a Venus ring has waited {:?} for a vkSubmitVirtqueueSeqnoMESA the \
+                         guest has not sent; the ring runs nothing further until it does",
+                        VIRTQUEUE_WAIT_WARN_AFTER
+                    );
+                }
+            }
+            other => *other = Some((seqno, Instant::now(), false)),
+        }
     }
 
     /// Encode `command`'s reply into the window and advance the cursor.
@@ -705,6 +820,10 @@ impl<H: HostVulkan> RingSink for ExecutingSink<H> {
             match self.step(rest, false) {
                 Step::Done(used) => done = done.saturating_add(used.max(1)),
                 Step::Incomplete | Step::Stopped => return batch.consumed(done),
+                Step::Blocked { seqno, .. } => {
+                    self.note_blocked(seqno);
+                    return batch.blocked(done);
+                }
                 Step::DoneThenFatal(used) => {
                     lock(&self.context).set_fatal();
                     tracing::warn!(
