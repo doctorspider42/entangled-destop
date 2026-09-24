@@ -1772,3 +1772,71 @@ fn an_export_is_imported_by_a_second_context_and_both_see_the_same_bytes() {
     h.use_context(CTX);
     teardown(h);
 }
+
+/// A pipeline-cache size query carries whatever the app's size variable
+/// held, because with `pData` NULL the spec says the input is ignored — and
+/// zink's first real device died on it. The query must be answered with the
+/// host's real size however large the input, and the data call that follows
+/// must return exactly that many bytes.
+#[test]
+fn a_pipeline_cache_size_query_ignores_the_size_it_was_handed() {
+    const CACHE: u64 = 0x7c00;
+    let Some(host) = host() else { return };
+    let mut h = setup(host);
+    let Command::CreatePipelineCache(c) = h
+        .call(&Command::CreatePipelineCache(CreatePipelineCacheArgs {
+            device: VkDevice(DEVICE),
+            p_create_info: Some(VkPipelineCacheCreateInfo {
+                flags: 0,
+                initial_data_size: 0,
+                p_initial_data: None,
+            }),
+            p_pipeline_cache: Some(VkPipelineCache(CACHE)),
+            ret: 0,
+        }))
+        .expect("a pipeline cache")
+    else {
+        panic!("wrong reply")
+    };
+    assert_eq!(c.ret, VK_SUCCESS);
+
+    let Command::GetPipelineCacheData(q) = h
+        .call(&Command::GetPipelineCacheData(GetPipelineCacheDataArgs {
+            device: VkDevice(DEVICE),
+            pipeline_cache: VkPipelineCache(CACHE),
+            // Far past the per-call output cap: an uninitialised variable.
+            p_data_size: Some(u64::MAX / 3),
+            p_data: None,
+            ret: 0,
+        }))
+        .expect("the size query is answered, not refused")
+    else {
+        panic!("wrong reply")
+    };
+    assert_eq!(q.ret, VK_SUCCESS);
+    let size = q.p_data_size.expect("a size");
+    assert!(size > 0, "every cache has at least its header");
+    println!("pipeline cache data: {size} bytes");
+
+    let Command::GetPipelineCacheData(d) = h
+        .call(&Command::GetPipelineCacheData(GetPipelineCacheDataArgs {
+            device: VkDevice(DEVICE),
+            pipeline_cache: VkPipelineCache(CACHE),
+            p_data_size: Some(size),
+            p_data: Some(vec![0; usize::try_from(size).expect("small")]),
+            ret: 0,
+        }))
+        .expect("the data")
+    else {
+        panic!("wrong reply")
+    };
+    assert_eq!(d.ret, VK_SUCCESS);
+    assert_eq!(d.p_data.as_ref().map(Vec::len), usize::try_from(size).ok());
+    assert!(!h.fatal());
+    h.send(&Command::DestroyPipelineCache(DestroyPipelineCacheArgs {
+        device: VkDevice(DEVICE),
+        pipeline_cache: VkPipelineCache(CACHE),
+    }))
+    .unwrap();
+    teardown(h);
+}

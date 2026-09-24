@@ -312,9 +312,23 @@ pub struct MemoryObject<H: HostVulkan> {
     pub device: u64,
     /// The host memory.
     pub host: H::Memory,
-    /// `allocationSize` as the guest asked for it — what every bind is
-    /// judged against (the host's may be rounded up past it).
+    /// `allocationSize` as the guest asked for it: what the blob of this
+    /// memory is sized from, and what the guest believes it has.
     pub size: u64,
+    /// What the host really allocated, which every bind is judged against:
+    /// the imported pages for a host-visible type, and the guest's size
+    /// rounded up to a blob page otherwise (not for a dedicated allocation,
+    /// whose size the spec pins to its resource).
+    ///
+    /// Not the guest's size, because venus computes buffer requirements
+    /// from a per-usage cache as `align(size, cached.alignment)`
+    /// (`vn_buffer.c:136-146`) — implementation-defined, and wrong on this
+    /// host for a 4-byte buffer whose real requirement is 16 at alignment
+    /// 16. A bind judged against the guest's 4 bytes killed zink's first
+    /// device; judged against the host's allocation it is exactly as safe,
+    /// because what the check protects is the host memory, not the guest's
+    /// arithmetic.
+    pub host_size: u64,
     /// `memoryTypeIndex`.
     pub type_index: u32,
     /// The type's property flags **as the guest sees them**.

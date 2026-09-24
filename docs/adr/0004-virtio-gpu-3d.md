@@ -2965,3 +2965,48 @@ depth clip, vertex divisors). The expectation for the guest acceptance:
 `eglinfo` names `zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070)
 (MESA_VENUS))` with OpenGL 4.6 core and compatibility profiles and OpenGL ES
 3.2 — to be read from the run, not assumed.
+
+## Amendment, 2026-09-24 — OpenGL runs on the host GPU; a window does not yet
+
+After stage 5c and two fixes that only real zink traffic could find, the
+guest's GL runs on the RTX 2070. With `MESA_LOADER_DRIVER_OVERRIDE=zink`,
+surfaceless EGL gives:
+
+```
+OpenGL core profile renderer: zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070) (MESA_VENUS))
+```
+
+— core, compatibility and ES, all on our device.
+
+### The two fixes
+
+- **A bind is judged against what the host allocated.** Venus computes a
+  buffer's memory requirements from a per-usage cache as
+  `align(size, cached.alignment)` (`vn_buffer.c:136-146`), an
+  implementation-defined rule. On this host a 4-byte buffer really needs
+  16 bytes at alignment 16, so the guest allocated 4 bytes and bound 16.
+  vkr does not check and the driver allocates in pages, so nobody else
+  notices. The check exists to protect the host allocation, so it now
+  measures that: a non-dedicated allocation is rounded up to a blob page on
+  the host, host-visible memory already is whole pages, and binds are
+  judged against `MemoryObject::host_size`.
+- **A size query ignores the size it is handed.** The generated host call for
+  `vkGetPipelineCacheData` bounded `*pDataSize` even when `pData` was NULL —
+  the size query, whose input the spec says is ignored, and which carries
+  whatever the app's variable held. `vkGetQueryPoolResults` shared the
+  pattern. The fix is in `scripts/venus-exec-gen.py`, so it covers both.
+
+Each fix has a test that fails without it. The pipeline-cache one runs on the
+real RTX 2070, where the cache header is 36 bytes.
+
+### What still falls back
+
+The Wayland EGL platform creates the zink screen, then fails at
+`dri2_setup_device` ("DRI2: failed to setup EGLDevice",
+`platform_wayland.c:2737-2740`) and drops to llvmpipe. libdrm is not the
+cause: a guest probe shows `drmGetDevice2` on both `card0` and `renderD128`
+equal to the only `drmGetDevices2` entry. So the fd EGL holds at that point
+is not the node libdrm describes. The next question is which device the
+software-rendered GNOME compositor hands its clients through `linux-dmabuf`.
+The durable answer is GNOME itself on the GPU, which is the next stage in any
+case.

@@ -4238,7 +4238,11 @@ unsafe fn call_GetQueryPoolResults(
     a: &mut Arena,
     args: &mut GetQueryPoolResultsArgs,
 ) -> Result<(), CallError> {
-    let n_p_data = bounded_bytes(args.data_size, "vkGetQueryPoolResults.pData")?;
+    let n_p_data = if args.p_data.is_some() {
+        bounded_bytes(args.data_size, "vkGetQueryPoolResults.pData")?
+    } else {
+        0
+    };
     let mut o_p_data: Option<Vec<u8>> = args.p_data.as_ref().map(|_| vec![0u8; n_p_data]);
     let p1 = vk::QueryPool::from_raw(args.query_pool.0);
     let p4 = args.data_size as usize;
@@ -4372,10 +4376,14 @@ unsafe fn call_GetPipelineCacheData(
     args: &mut GetPipelineCacheDataArgs,
 ) -> Result<(), CallError> {
     let mut o_p_data_size: usize = args.p_data_size.map_or(0, |x| x as usize);
-    let n_p_data = bounded_bytes(
-        args.p_data_size.unwrap_or(0),
-        "vkGetPipelineCacheData.pData",
-    )?;
+    let n_p_data = if args.p_data.is_some() {
+        bounded_bytes(
+            args.p_data_size.unwrap_or(0),
+            "vkGetPipelineCacheData.pData",
+        )?
+    } else {
+        0
+    };
     let mut o_p_data: Option<Vec<u8>> = args.p_data.as_ref().map(|_| vec![0u8; n_p_data]);
     let p1 = vk::PipelineCache::from_raw(args.pipeline_cache.0);
     // SAFETY: the contract of `call`, which this is one arm of; every pointer

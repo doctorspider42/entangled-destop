@@ -1125,3 +1125,40 @@ fn destroying_the_context_keeps_a_mapped_blob_safe_until_it_goes() {
     assert!(import.pages.upgrade().is_none());
     assert_eq!(h.renderer.snapshot_refusal(), None);
 }
+
+#[test]
+fn a_bind_is_judged_against_what_the_host_allocated_not_the_guests_arithmetic() {
+    // What zink's first device did on the RTX 2070: venus computed a 4-byte
+    // buffer's requirement from its per-usage cache as `align(4, 4)` while the
+    // host wanted more, allocated 4 bytes of device-local memory and bound the
+    // buffer at 0. The fake wants 256 at alignment 256 for a 4-byte buffer.
+    const DEVICE_LOCAL_TYPE: u32 = 1;
+    let (mut h, host) = standard();
+    h.call(&create_buffer(DEVICE, BUFFER, buffer_info(4, TRANSFER)))
+        .expect("buffer");
+    h.send(&allocate(DEVICE, MEMORY, 4, DEVICE_LOCAL_TYPE, Vec::new()))
+        .expect("allocate");
+    h.send(&bind_buffers(DEVICE, &[(BUFFER, MEMORY, 0)]))
+        .expect("inside the page the host really allocated");
+    assert_eq!(host.buffer_binds().len(), 1);
+
+    // The same memory at the last aligned offset that still leaves room past
+    // the page is refused: the check still guards the host allocation.
+    let (mut h, host) = standard();
+    h.call(&create_buffer(DEVICE, BUFFER, buffer_info(4, TRANSFER)))
+        .expect("buffer");
+    h.send(&allocate(DEVICE, MEMORY, 4, DEVICE_LOCAL_TYPE, Vec::new()))
+        .expect("allocate");
+    fatal_on(&mut h, &bind_buffers(DEVICE, &[(BUFFER, MEMORY, 4096)]));
+    assert!(host.buffer_binds().is_empty());
+
+    // Host-visible memory is our pages, already whole pages.
+    let (mut h, host) = standard();
+    h.call(&create_buffer(DEVICE, BUFFER, buffer_info(4, TRANSFER)))
+        .expect("buffer");
+    h.send(&allocate(DEVICE, MEMORY, 4, HOST_COHERENT_TYPE, Vec::new()))
+        .expect("allocate");
+    h.send(&bind_buffers(DEVICE, &[(BUFFER, MEMORY, 0)]))
+        .expect("inside the imported page");
+    assert_eq!(host.buffer_binds().len(), 1);
+}

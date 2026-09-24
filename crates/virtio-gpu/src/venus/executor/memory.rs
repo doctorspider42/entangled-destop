@@ -427,8 +427,21 @@ impl<H: HostVulkan> VulkanContext<H> {
             };
             (Some(pages), request)
         } else {
+            // Rounded up to a blob page unless dedicated (see
+            // `MemoryObject::host_size`); the heap check above was made on
+            // the guest's size, and a page more cannot overflow it by more
+            // than the rounding.
+            let host_size = if dedicated.is_some() {
+                Some(size)
+            } else {
+                size.checked_next_multiple_of(crate::blob::BLOB_PAGE_SIZE)
+            };
+            let Some(host_size) = host_size else {
+                args.ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                return Ok(());
+            };
             let request = MemoryRequest {
-                size,
+                size: host_size,
                 type_index,
                 import: None,
                 flags,
@@ -436,6 +449,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             };
             (None, request)
         };
+        let host_size = request.size;
         match self.host.allocate_memory(&device.host, &request) {
             Ok(memory) => {
                 self.objects.insert_memory(
@@ -444,6 +458,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                         device: device_id,
                         host: memory,
                         size,
+                        host_size,
                         type_index,
                         property_flags,
                         pages,
@@ -554,6 +569,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                         device: device_id,
                         host: memory,
                         size,
+                        host_size: request.size,
                         type_index,
                         property_flags,
                         pages: Some(pages),
@@ -1004,13 +1020,13 @@ impl<H: HostVulkan> VulkanContext<H> {
         let fits = bind
             .memory_offset
             .checked_add(req.size)
-            .is_some_and(|end| end <= memory.size);
+            .is_some_and(|end| end <= memory.host_size);
         if !aligned(bind.memory_offset, req.alignment) || !fits {
             return Err(invalid(
                 command,
                 format!(
-                    "{:#x} bytes at {:#x} (alignment {:#x}) do not fit the {:#x}-byte memory",
-                    req.size, bind.memory_offset, req.alignment, memory.size
+                    "{:#x} bytes at {:#x} (alignment {:#x}) do not fit the {:#x}-byte host allocation of a {:#x}-byte memory",
+                    req.size, bind.memory_offset, req.alignment, memory.host_size, memory.size
                 ),
             ));
         }
@@ -1428,13 +1444,13 @@ impl<H: HostVulkan> VulkanContext<H> {
         let fits = bind
             .memory_offset
             .checked_add(req.size)
-            .is_some_and(|end| end <= memory.size);
+            .is_some_and(|end| end <= memory.host_size);
         if !aligned(bind.memory_offset, req.alignment) || !fits {
             return Err(invalid(
                 command,
                 format!(
-                    "{:#x} bytes at {:#x} (alignment {:#x}) do not fit the {:#x}-byte memory",
-                    req.size, bind.memory_offset, req.alignment, memory.size
+                    "{:#x} bytes at {:#x} (alignment {:#x}) do not fit the {:#x}-byte host allocation of a {:#x}-byte memory",
+                    req.size, bind.memory_offset, req.alignment, memory.host_size, memory.size
                 ),
             ));
         }

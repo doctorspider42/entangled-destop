@@ -1319,7 +1319,12 @@ class Gen:
                     post.append('if let Some(d) = %s.as_mut() { b_%s(&o_%s, d); }' % (v, ty.name, f.name))
                 elif f.shape == rp.Field.BLOB_OUT:
                     count = self.r.count_expr(f.count, acc)
-                    pre.append('let n_%s = bounded_bytes(%s, "%s.%s")?;' % (f.name, count, c.name, f.c_name))
+                    # Bounded only when the guest passed the output at all: with
+                    # `pData` NULL the call is a size query, the spec says the
+                    # input `*pDataSize` is ignored, and Mesa leaves whatever the
+                    # app's variable held in it. Bounding it anyway refused
+                    # zink's pipeline-cache size query and killed its context.
+                    pre.append('let n_%s = if %s.is_some() { bounded_bytes(%s, "%s.%s")? } else { 0 };' % (f.name, v, count, c.name, f.c_name))
                     pre.append('let mut o_%s: Option<Vec<u8>> = %s.as_ref().map(|_| vec![0u8; n_%s]);' % (f.name, v, f.name))
                     exprs.append('o_%s.as_mut().map_or(core::ptr::null_mut(), |b| b.as_mut_ptr().cast())' % f.name)
                     # a count that the call itself writes (the pDataSize idiom)
