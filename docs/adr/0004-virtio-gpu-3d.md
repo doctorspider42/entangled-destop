@@ -2488,3 +2488,40 @@ Checks 4, 5, 6 and 9 need nothing past this stage; 7 skips (the guest reports
 makes the context fatal and the guest's next ring wait finds the ring dead —
 so run `--checks 4,5,6,7,9` to see 9; in the default order 8 ends the run.
 Nothing before check 8 names a semaphore.
+
+## Amendment, 2026-09-24 — a Linux guest renders on the host GPU, with exact pixels
+
+The guest acceptance for 5b.1 and 5b.2 was `guest/vk-smoke` inside the Ubuntu
+guest (Mesa 26.0.8 venus, root, fetched over usernet) against the executing
+renderer (commit `3f68f67`), run with `--checks 1,2,3,4,5,6,7,9`. Check 8
+needs semaphores, which are stage 5b.3, and refusing them ends the context:
+
+```
+SMOKE 1 instance     PASS  "Virtio-GPU Venus (NVIDIA GeForce RTX 2070)" apiVersion=1.2.0
+SMOKE 2 device       PASS
+SMOKE 3 host-memory  PASS  1 MiB, type 3, write/unmap/remap/read back
+SMOKE 4 transfer     PASS  fill x3 + update + 2-region copy of 64 KiB verified
+SMOKE 5 compute      PASS  1048576 elements, all f(i) correct
+SMOKE 6 graphics     PASS  256x256 exact, fnv1a=0x2678f2a0e39fba1b
+SMOKE 7 dynamic-rendering  SKIP  (guest reports 1.2 — stage 5b.3)
+SMOKE 9 many-submits PASS  1000 submits, 1000 fences, none lost
+SMOKE DONE pass=7 fail=0 skip=2
+```
+
+After 5b.1 alone, checks 1–3 passed and the renderer refused
+`vkAllocateCommandBuffers` by name, exactly where that stage ended.
+
+The triangle's checksum is **the one the same binary produces on the bare RTX
+2070 on the host**, so the guest's pixels are bit-identical to native. The
+renderer logged no refusal.
+
+### Observed, not yet understood: GPU time
+
+GPU time from the smoke test's own timestamps is far higher in the guest than
+native: 24 ms against 0.64 ms for compute, and 12.9 ms against 0.20 ms for the
+triangle. The prime suspect is placement. The 5a.3 memory policy hides
+`HOST_VISIBLE` on the BAR type, so every buffer the guest wants mapped lands in
+system memory (type 3), and the GPU reads and writes it across PCIe. The fix,
+if that is it, is a real workload decision: which types to expose, and whether
+a guest's storage buffers belong in memory the guest never maps. This is a
+performance item, not a correctness one.
