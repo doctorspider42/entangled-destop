@@ -393,20 +393,131 @@ fn three_d() {
             }
         }
     }
+    for line in venus_lines(&venus_host(), false) {
+        println!("                    {line}");
+    }
 }
 
 /// The Windows arm, where the answer is short and fixed: the host renderer
 /// speaks EGL, and this host has no equivalent yet (ADR-0004's Windows plan).
+///
+/// Since the Venus renderer (ADR-0004, "how a user turns it on") that is only
+/// half of it: `[display] venus = true` is 3D on this host, on its own Vulkan
+/// device, and the lines before virgl's say whether it has one.
 #[cfg(windows)]
 fn three_d() {
-    println!("  3D              : none — `[display] virgl = true` is Linux-only; the host");
-    println!("                    renderer (virglrenderer) speaks EGL. Run the VM on the");
-    println!("                    WSL (KVM) backend for 3D, or leave it off and get 2D.");
+    let mut lines = venus_lines(&venus_host(), true).into_iter();
+    if let Some(first) = lines.next() {
+        println!("  3D              : {first}");
+    }
+    for line in lines {
+        println!("                    {line}");
+    }
+    println!("                    virgl    Linux-only — `[display] virgl = true` needs");
+    println!("                             virglrenderer, which speaks EGL; on this host use");
+    println!("                             venus, or the WSL (KVM) backend for virgl");
+}
+
+/// A host Vulkan device as the Venus renderer would show it to a guest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VenusDevice {
+    pub name: String,
+    /// The version the guest is shown (the host's, capped at 1.3).
+    pub api_version: u32,
+    /// `minImportedHostPointerAlignment` of `VK_EXT_external_memory_host`,
+    /// which every shown device has: it is how a guest's mapping is our pages.
+    pub import_alignment: u64,
+    /// `VK_KHR_external_memory_win32` with the device/driver UUIDs an import
+    /// is checked against: device-local memory shared between guest
+    /// contexts, which is what a GPU-composited desktop's scanout is (ADR-0004
+    /// stage S1). Never on a Linux host yet.
+    pub memory_export: bool,
+}
+
+/// What `[display] venus = true` would find on this host: the loader, and the
+/// devices the renderer would show — through the same probe `entangled run`
+/// refuses a start with, so the answer here is the answer there.
+///
+/// # Errors
+/// The sentence `run` would fail with: no loader, no instance, or every
+/// device hidden with its reason (a missing `VK_EXT_external_memory_host`
+/// among them).
+pub fn venus_host() -> Result<Vec<VenusDevice>, String> {
+    let host = virtio_gpu::host_vulkan::AshVulkan::load()?;
+    Ok(host
+        .usable_devices()?
+        .iter()
+        .map(|device| VenusDevice {
+            name: device.name(),
+            api_version: device.properties.properties.api_version,
+            import_alignment: device.import_alignment,
+            memory_export: device.memory_export,
+        })
+        .collect())
+}
+
+/// The indentation of a Venus line under its `venus` sub-label.
+const VENUS_SUB: &str = "         ";
+
+/// `doctor`'s Venus lines: the first unindented (it follows a label, or sits
+/// in the 3D column), the rest in the sub-column under it. `windows` picks
+/// the host's story for shared scanout memory; it is a parameter so both
+/// stories are tested on either host.
+fn venus_lines(found: &Result<Vec<VenusDevice>, String>, windows: bool) -> Vec<String> {
+    let devices = match found {
+        Ok(devices) if !devices.is_empty() => devices,
+        Ok(_) => return vec!["venus    unavailable — the host has no Vulkan device".into()],
+        Err(why) => {
+            let mut lines = vec![
+                "venus    unavailable — `[display] venus = true` would refuse to start:".into(),
+            ];
+            lines.extend(
+                wrap_hint(why)
+                    .into_iter()
+                    .map(|l| format!("{VENUS_SUB}{l}")),
+            );
+            return lines;
+        }
+    };
+    let mut lines = vec![
+        "venus    ready — `[display] venus = true`: the guest's Vulkan, and its OpenGL and"
+            .to_string(),
+        format!("{VENUS_SUB}desktop through Zink, on this host's GPU"),
+    ];
+    for device in devices {
+        let v = device.api_version;
+        lines.push(format!(
+            "{VENUS_SUB}device {} (Vulkan {}.{}.{} to the guest)",
+            device.name,
+            v >> 22,
+            (v >> 12) & 0x3ff,
+            v & 0xfff
+        ));
+        lines.push(format!(
+            "{VENUS_SUB}  VK_EXT_external_memory_host   yes (pages imported at {}-byte alignment)",
+            device.import_alignment
+        ));
+        let export = match (windows, device.memory_export) {
+            (true, true) => [
+                "VK_KHR_external_memory_win32  yes (shared scanout: GNOME composites on",
+                "                              the GPU)",
+            ],
+            (true, false) => [
+                "VK_KHR_external_memory_win32  no — clients run on the GPU, GNOME's scanout",
+                "                              buffers stay in software",
+            ],
+            (false, _) => [
+                "shared scanout memory         none on Linux hosts yet (ADR-0004 S1):",
+                "                              clients run on the GPU, GNOME's scanout stays dumb",
+            ],
+        };
+        lines.extend(export.iter().map(|l| format!("{VENUS_SUB}  {l}")));
+    }
+    lines
 }
 
 /// Breaks a one-line hint at word boundaries so it sits inside `doctor`'s
 /// indented column rather than wrapping raggedly in a narrow terminal.
-#[cfg(target_os = "linux")]
 fn wrap_hint(hint: &str) -> Vec<String> {
     const WIDTH: usize = 74;
     let mut lines = Vec::new();
@@ -424,4 +535,73 @@ fn wrap_hint(hint: &str) -> Vec<String> {
         lines.push(current);
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{venus_lines, VenusDevice, VENUS_SUB};
+
+    fn rtx(memory_export: bool) -> VenusDevice {
+        VenusDevice {
+            name: "NVIDIA GeForce RTX 2070".into(),
+            api_version: (1 << 22) | (3 << 12) | 289,
+            import_alignment: 4096,
+            memory_export,
+        }
+    }
+
+    /// A host that can serve Venus says so, names each device and the two
+    /// memory capabilities the renderer and the GPU desktop rest on.
+    #[test]
+    fn a_ready_host_names_its_device_and_the_extensions() {
+        let lines = venus_lines(&Ok(vec![rtx(true)]), true);
+        assert!(
+            lines[0].starts_with("venus    ready — `[display] venus = true`"),
+            "{lines:?}"
+        );
+        let text = lines.join("\n");
+        for needle in [
+            "device NVIDIA GeForce RTX 2070 (Vulkan 1.3.289 to the guest)",
+            "VK_EXT_external_memory_host   yes (pages imported at 4096-byte alignment)",
+            "VK_KHR_external_memory_win32  yes",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+        }
+        // Every line after the first sits in the sub-column, never flush left,
+        // and fits doctor's column.
+        assert!(
+            lines[1..].iter().all(|l| l.starts_with(VENUS_SUB)),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|l| l.chars().count() <= 90), "{lines:?}");
+
+        let no_export = venus_lines(&Ok(vec![rtx(false)]), true).join("\n");
+        assert!(
+            no_export.contains("VK_KHR_external_memory_win32  no — "),
+            "{no_export}"
+        );
+        let linux = venus_lines(&Ok(vec![rtx(false)]), false).join("\n");
+        assert!(!linux.contains("win32"), "{linux}");
+        assert!(linux.contains("none on Linux hosts yet"), "{linux}");
+    }
+
+    /// A host that cannot says what `run` would refuse with, wrapped into the
+    /// column, and never with doctor's MISSING marker: 3D is optional, and the
+    /// manager paints MISSING as a fault.
+    #[test]
+    fn an_unready_host_says_why_without_calling_it_a_fault() {
+        let why = "every host Vulkan device is hidden (llvmpipe: it lacks \
+                   VK_EXT_external_memory_host, so no guest mapping could be our own pages)";
+        for lines in [
+            venus_lines(&Err(why.into()), true),
+            venus_lines(&Err("the host has no usable Vulkan loader".into()), false),
+            venus_lines(&Ok(Vec::new()), true),
+        ] {
+            assert!(lines[0].starts_with("venus    unavailable — "), "{lines:?}");
+            assert!(lines.iter().all(|l| !l.contains("MISSING")), "{lines:?}");
+            assert!(lines.iter().all(|l| l.chars().count() <= 90), "{lines:?}");
+        }
+        let text = venus_lines(&Err(why.into()), true).join(" ");
+        assert!(text.contains("VK_EXT_external_memory_host"), "{text}");
+    }
 }

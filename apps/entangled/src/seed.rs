@@ -68,6 +68,81 @@ const MIN_IMAGE_BYTES: usize = 64 * 1024;
 /// working directory (the same reason the Debian preseed is compiled in).
 const AUTOINSTALL: &str = include_str!("../../../assets/autoinstall/ubuntu-server.yaml");
 
+/// The Desktop ISO's twin of [`AUTOINSTALL`]: the same document with the
+/// desktop's install source. Compiled in for the same reason — an installed
+/// copy has no `assets/` directory to pass to `--autoinstall`.
+const AUTOINSTALL_DESKTOP: &str = include_str!("../../../assets/autoinstall/ubuntu-desktop.yaml");
+
+/// Which compiled-in autoinstall profile `--auto` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinProfile {
+    /// `ubuntu-server-minimal`, for the live-server ISO.
+    Server,
+    /// `ubuntu-desktop-minimal`, for the Desktop ISO: GNOME on GDM.
+    Desktop,
+}
+
+impl BuiltinProfile {
+    /// The profile an ISO needs, from its file name — which is Canonical's
+    /// (`ubuntu-26.04.1-desktop-amd64.iso`, `ubuntu-26.04-live-server-amd64.iso`)
+    /// for everything `scripts/fetch-ubuntu-iso.sh` verifies into the cache.
+    /// Each profile names an install source only its own ISO carries, so
+    /// guessing wrong fails the install; a renamed ISO reads as a server one,
+    /// which is what `--auto` always meant before the desktop profile existed.
+    pub fn for_iso(iso: &Path) -> Self {
+        let name = iso
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if name.contains("desktop") {
+            Self::Desktop
+        } else {
+            Self::Server
+        }
+    }
+
+    fn template(self) -> &'static str {
+        match self {
+            Self::Server => AUTOINSTALL,
+            Self::Desktop => AUTOINSTALL_DESKTOP,
+        }
+    }
+}
+
+/// `/etc/drirc` on a GPU desktop (ADR-0004, "how a user turns it on"): every
+/// OpenGL client on a virtio-gpu device — GNOME Shell first among them — is
+/// loaded on Zink, which turns its GL into Vulkan for Mesa's venus driver and
+/// so for the host GPU. Without it Mesa picks virgl's GL driver, which our
+/// Venus renderer does not serve, and the desktop falls back to llvmpipe.
+pub const VENUS_DRIRC: &[&str] = &[
+    "<!-- Entangled GPU desktop: every GL client on zink, over Venus (ADR-0004) -->",
+    "<driconf>",
+    "  <device driver=\"loader\" kernel_driver=\"virtio_gpu\">",
+    "    <application name=\"every GL client on zink\">",
+    "      <option name=\"dri_driver\" value=\"zink\" />",
+    "    </application>",
+    "  </device>",
+    "</driconf>",
+];
+
+/// Where the GPU desktop's GSettings default goes in the target, and what it
+/// says. A vendor override rather than a dconf database: it needs no dconf
+/// profile (Ubuntu ships none for users) and survives package upgrades, which
+/// recompile the directory it sits in. `90_` sorts after Ubuntu's own `10_`.
+pub const VENUS_GSCHEMA_OVERRIDE: &str =
+    "/usr/share/glib-2.0/schemas/90_entangled-venus.gschema.override";
+
+/// The override's lines. `idle-delay 0` because a blanked GNOME on Zink keeps
+/// every client upload of the blanked screen and is refused at its Venus
+/// share within seconds, which ends the session (ADR-0004, the amendments of
+/// the idle blank and of honest heaps). Until client presentation moves to
+/// dma-buf, the desktop must not blank.
+pub const VENUS_GSCHEMA_LINES: &[&str] = &[
+    "# Entangled GPU desktop: no idle blank (ADR-0004)",
+    "[org.gnome.desktop.session]",
+    "idle-delay=uint32 0",
+];
+
 /// Placeholder substituted with the VM name.
 const HOSTNAME_PLACEHOLDER: &str = "@HOSTNAME@";
 
@@ -101,6 +176,20 @@ pub enum SeedError {
          is read-only verified media here"
     )]
     NotCloudConfig,
+
+    #[error(
+        "--venus sets the installed guest up for the GPU desktop from the autoinstall's own \
+         late-commands, and this configuration has no block-style 'late-commands:' list to \
+         add them to. Add one under 'autoinstall:' (an empty '- true' item will do)"
+    )]
+    NoLateCommands,
+
+    #[error(
+        "--venus adds the desktop user to the 'render' group, and the autoinstall \
+         configuration names no usable identity.username ({found}). It must be a plain \
+         Unix user name: a lower-case letter or '_', then letters, digits, '_' or '-'"
+    )]
+    NoUsername { found: String },
 }
 
 /// One file per sector run; the seed only ever has two, so the cap is generous
@@ -118,14 +207,18 @@ pub struct Seed {
 }
 
 /// Builds the autoinstall user-data for `hostname`, either from the compiled-in
-/// profile or from a caller-supplied file.
-pub fn user_data(hostname: &str, custom: Option<&Path>) -> Result<String, SeedError> {
+/// `builtin` profile or from a caller-supplied file (which then wins).
+pub fn user_data(
+    hostname: &str,
+    custom: Option<&Path>,
+    builtin: BuiltinProfile,
+) -> Result<String, SeedError> {
     let template = match custom {
         Some(path) => std::fs::read_to_string(path).map_err(|source| SeedError::ReadConfig {
             path: path.to_path_buf(),
             source,
         })?,
-        None => AUTOINSTALL.to_string(),
+        None => builtin.template().to_string(),
     };
     // A file that is not cloud-config would be *ignored*, and the installer
     // would sit at its first interactive screen with no explanation. Refuse it
@@ -134,6 +227,125 @@ pub fn user_data(hostname: &str, custom: Option<&Path>) -> Result<String, SeedEr
         return Err(SeedError::NotCloudConfig);
     }
     Ok(template.replace(HOSTNAME_PLACEHOLDER, hostname))
+}
+
+/// The late-commands that make an installed Ubuntu a GPU desktop on the
+/// Venus renderer (`install ubuntu --venus`; ADR-0004, "how a user turns it
+/// on"), for the desktop user `user`, one YAML list item per entry.
+///
+/// All of it happens inside the installer, against `/target`, so the first
+/// boot is already the finished machine — nothing is typed into a serial
+/// console afterwards:
+///
+/// 1. [`VENUS_DRIRC`] as `/etc/drirc`: GNOME Shell and every GL client on Zink.
+/// 2. [`VENUS_GSCHEMA_LINES`] as [`VENUS_GSCHEMA_OVERRIDE`], compiled in the
+///    target: no idle blank.
+/// 3. `user` in `render`. A graphical session reaches `/dev/dri/renderD128`
+///    by logind's ACL without it; a serial or SSH login — which is how every
+///    Vulkan probe of this project reaches the guest — does not, and gets an
+///    `EACCES` that reads like a renderer bug.
+pub fn venus_late_commands(user: &str) -> Vec<String> {
+    let printf = |lines: &[&str], path: &str| {
+        let mut command = String::from(">-\n  printf '%s\\n'\n");
+        for line in lines {
+            command.push_str(&format!("  '{line}'\n"));
+        }
+        command.push_str(&format!("  > /target{path}"));
+        command
+    };
+    vec![
+        printf(VENUS_DRIRC, "/etc/drirc"),
+        printf(VENUS_GSCHEMA_LINES, VENUS_GSCHEMA_OVERRIDE),
+        "curtin in-target -- glib-compile-schemas /usr/share/glib-2.0/schemas".to_string(),
+        format!("curtin in-target -- usermod -aG render {user}"),
+    ]
+}
+
+/// `user_data` with [`venus_late_commands`] put at the head of its
+/// `late-commands:` list, for the user its `identity` creates.
+///
+/// A text edit rather than a YAML round trip, on purpose: the document is
+/// the user's (or ours, with its comments), and a parser would reflow it and
+/// drop every comment that explains it. The edit is small enough to be exact
+/// — find the key, find its items' indentation, insert — and anything it
+/// cannot place is refused by name rather than guessed at.
+pub fn with_venus_guest(user_data: &str) -> Result<String, SeedError> {
+    let user = identity_username(user_data)?;
+    let lines: Vec<&str> = user_data.lines().collect();
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let key = lines
+        .iter()
+        .position(|line| {
+            let body = line.trim();
+            body == "late-commands:"
+                || body
+                    .strip_prefix("late-commands:")
+                    .is_some_and(|rest| rest.trim_start().starts_with('#'))
+        })
+        .ok_or(SeedError::NoLateCommands)?;
+    let key_indent = indent(lines[key]);
+    // The items' indentation is the first item's; YAML also allows them at
+    // the key's own column. With no item yet, two past the key.
+    let item_indent = lines[key + 1..]
+        .iter()
+        .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .filter(|line| line.trim_start().starts_with('-') && indent(line) >= key_indent)
+        .map_or(key_indent + 2, |line| indent(line));
+    let pad = " ".repeat(item_indent);
+    let mut out = String::with_capacity(user_data.len() + 1024);
+    for line in &lines[..=key] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    for command in venus_late_commands(&user) {
+        // Line 0 is the item; the rest are a block scalar's content, which
+        // `venus_late_commands` already indents two past the dash.
+        for (i, line) in command.lines().enumerate() {
+            out.push_str(&pad);
+            if i == 0 {
+                out.push_str("- ");
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    for line in &lines[key + 1..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// `identity.username`: the first `username:` key of the document, which in
+/// an autoinstall is the identity's. Refused unless it is a plain Unix name,
+/// because it is spliced into a shell command.
+fn identity_username(user_data: &str) -> Result<String, SeedError> {
+    let found = user_data
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .find_map(|line| line.trim().strip_prefix("username:"))
+        .map(|value| {
+            let value = value.split('#').next().unwrap_or_default().trim();
+            value.trim_matches(|c| c == '"' || c == '\'').to_string()
+        });
+    let Some(name) = found else {
+        return Err(SeedError::NoUsername {
+            found: "none".into(),
+        });
+    };
+    let mut chars = name.chars();
+    let plain = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        && name.len() <= 32;
+    if plain {
+        Ok(name)
+    } else {
+        Err(SeedError::NoUsername {
+            found: format!("'{name}'"),
+        })
+    }
 }
 
 /// Writes a NoCloud seed volume at `path` carrying `user_data`.
@@ -531,7 +743,7 @@ mod tests {
     /// would become the installed system's hostname.
     #[test]
     fn the_builtin_autoinstall_is_cloud_config_with_our_hostname() {
-        let text = user_data("ubuntu-demo", None).unwrap();
+        let text = user_data("ubuntu-demo", None, BuiltinProfile::Server).unwrap();
         assert!(text.starts_with("#cloud-config"));
         assert!(!text.contains(HOSTNAME_PLACEHOLDER));
         assert!(text.contains("hostname: \"ubuntu-demo\""));
@@ -552,6 +764,168 @@ mod tests {
         assert!(text.contains("password: \"$6$"));
     }
 
+    /// The Desktop ISO gets the desktop profile, by Canonical's file name;
+    /// anything else keeps the server profile `--auto` always meant.
+    #[test]
+    fn the_builtin_profile_follows_the_iso() {
+        for (iso, profile) in [
+            ("ubuntu-26.04.1-desktop-amd64.iso", BuiltinProfile::Desktop),
+            ("UBUNTU-26.04-DESKTOP-AMD64.ISO", BuiltinProfile::Desktop),
+            ("ubuntu-26.04-live-server-amd64.iso", BuiltinProfile::Server),
+            ("installer.iso", BuiltinProfile::Server),
+        ] {
+            let path = Path::new("cache").join("ubuntu").join(iso);
+            assert_eq!(BuiltinProfile::for_iso(&path), profile, "{iso}");
+        }
+        let desktop = user_data("gpu", None, BuiltinProfile::Desktop).expect("desktop");
+        assert!(desktop.contains("id: ubuntu-desktop-minimal"), "{desktop}");
+        assert!(desktop.contains("hostname: \"gpu\""));
+        let server = user_data("srv", None, BuiltinProfile::Server).expect("server");
+        assert!(server.contains("id: ubuntu-server-minimal"));
+    }
+
+    /// What `--venus` adds to the built-in profiles, byte for byte: four
+    /// items at the head of `late-commands`, at the list's own indentation,
+    /// before the serial-console items that were already there.
+    #[test]
+    fn venus_late_commands_are_exact_and_first() {
+        const EXPECTED: &str = r#"  late-commands:
+    - >-
+      printf '%s\n'
+      '<!-- Entangled GPU desktop: every GL client on zink, over Venus (ADR-0004) -->'
+      '<driconf>'
+      '  <device driver="loader" kernel_driver="virtio_gpu">'
+      '    <application name="every GL client on zink">'
+      '      <option name="dri_driver" value="zink" />'
+      '    </application>'
+      '  </device>'
+      '</driconf>'
+      > /target/etc/drirc
+    - >-
+      printf '%s\n'
+      '# Entangled GPU desktop: no idle blank (ADR-0004)'
+      '[org.gnome.desktop.session]'
+      'idle-delay=uint32 0'
+      > /target/usr/share/glib-2.0/schemas/90_entangled-venus.gschema.override
+    - curtin in-target -- glib-compile-schemas /usr/share/glib-2.0/schemas
+    - curtin in-target -- usermod -aG render entangled
+    - sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/d"#;
+        for profile in [BuiltinProfile::Server, BuiltinProfile::Desktop] {
+            let plain = user_data("gpu", None, profile).expect("user-data");
+            let text = with_venus_guest(&plain).expect("venus added");
+            assert!(text.contains(EXPECTED), "{profile:?}:\n{text}");
+            assert_eq!(text.matches("late-commands:").count(), 1);
+            // Nothing else moved: taking the four items out gives the
+            // original back.
+            let items: String = venus_late_commands("entangled")
+                .iter()
+                .flat_map(|command| {
+                    command
+                        .lines()
+                        .enumerate()
+                        .map(|(i, line)| format!("    {}{line}\n", if i == 0 { "- " } else { "" }))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(text.replacen(&items, "", 1), plain, "{profile:?}");
+        }
+    }
+
+    /// What the shell in the installer runs, after YAML folds each `>-` item
+    /// onto one line: the drirc and the override land with exactly their
+    /// lines. Single quotes delimit every line, so none may contain one.
+    #[test]
+    fn the_folded_commands_write_exactly_the_files() {
+        for line in VENUS_DRIRC.iter().chain(VENUS_GSCHEMA_LINES) {
+            assert!(!line.contains('\''), "{line}");
+        }
+        let fold = |command: &str| {
+            let mut lines = command.lines();
+            assert_eq!(lines.next(), Some(">-"));
+            lines.map(str::trim).collect::<Vec<_>>().join(" ")
+        };
+        let commands = venus_late_commands("desk_user-1");
+        let quoted = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|l| format!("'{l}'"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(
+            fold(&commands[0]),
+            format!("printf '%s\\n' {} > /target/etc/drirc", quoted(VENUS_DRIRC))
+        );
+        assert_eq!(
+            fold(&commands[1]),
+            format!(
+                "printf '%s\\n' {} > /target{VENUS_GSCHEMA_OVERRIDE}",
+                quoted(VENUS_GSCHEMA_LINES)
+            )
+        );
+        assert_eq!(
+            commands[3],
+            "curtin in-target -- usermod -aG render desk_user-1"
+        );
+        // Leading spaces of an XML line sit inside its quotes, so folding
+        // (which trims the YAML indentation) keeps them.
+        assert!(fold(&commands[0]).contains("'  <device driver="));
+    }
+
+    /// A user's own autoinstall: the list's indentation is followed, an
+    /// indentless list too, and what cannot be placed is refused by name.
+    #[test]
+    fn venus_follows_a_custom_document_or_refuses_it() {
+        let indentless = "#cloud-config\nautoinstall:\n  version: 1\n  identity:\n    \
+                          username: \"alice\"\n  late-commands:\n  - echo one\n";
+        let text = with_venus_guest(indentless).expect("indentless list");
+        assert!(
+            text.contains("  late-commands:\n  - >-\n    printf '%s\\n'\n"),
+            "{text}"
+        );
+        assert!(text.contains("  - curtin in-target -- usermod -aG render alice\n  - echo one\n"));
+
+        let empty = "#cloud-config\nautoinstall:\n  identity:\n    username: bob # me\n  \
+                     late-commands:   # ours\n  shutdown: poweroff\n";
+        let text = with_venus_guest(empty).expect("an empty list is given items");
+        assert!(
+            text.contains("  late-commands:   # ours\n    - >-\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("render bob\n  shutdown: poweroff\n"),
+            "{text}"
+        );
+
+        let none = "#cloud-config\nautoinstall:\n  identity:\n    username: bob\n";
+        assert!(matches!(
+            with_venus_guest(none),
+            Err(SeedError::NoLateCommands)
+        ));
+        let flow = "#cloud-config\nautoinstall:\n  identity:\n    username: bob\n  \
+                    late-commands: [true]\n";
+        assert!(matches!(
+            with_venus_guest(flow),
+            Err(SeedError::NoLateCommands)
+        ));
+
+        for bad in ["", "Bob", "bob; reboot", "$(id)", "9lives"] {
+            let text = format!(
+                "#cloud-config\nautoinstall:\n  identity:\n    username: '{bad}'\n  \
+                 late-commands:\n    - true\n"
+            );
+            assert!(
+                matches!(with_venus_guest(&text), Err(SeedError::NoUsername { .. })),
+                "{bad:?} must be refused"
+            );
+        }
+        let nobody = "#cloud-config\nautoinstall:\n  late-commands:\n    - true\n";
+        assert!(matches!(
+            with_venus_guest(nobody),
+            Err(SeedError::NoUsername { .. })
+        ));
+    }
+
     /// A configuration that is not cloud-config would be silently ignored by
     /// cloud-init, leaving the installer at its first interactive screen.
     #[test]
@@ -561,15 +935,17 @@ mod tests {
         let path = dir.join(format!("bare-{}.yaml", std::process::id()));
         std::fs::write(&path, "version: 1\nidentity:\n  username: x\n").unwrap();
         assert!(matches!(
-            user_data("h", Some(&path)),
+            user_data("h", Some(&path), BuiltinProfile::Server),
             Err(SeedError::NotCloudConfig)
         ));
 
         std::fs::write(&path, "#cloud-config\nautoinstall:\n  version: 1\n").unwrap();
-        assert!(user_data("h", Some(&path)).unwrap().contains("autoinstall"));
+        assert!(user_data("h", Some(&path), BuiltinProfile::Server)
+            .unwrap()
+            .contains("autoinstall"));
         // A missing file is a typed error, not a panic.
         assert!(matches!(
-            user_data("h", Some(&dir.join("nope.yaml"))),
+            user_data("h", Some(&dir.join("nope.yaml")), BuiltinProfile::Server),
             Err(SeedError::ReadConfig { .. })
         ));
         std::fs::remove_file(&path).unwrap();
@@ -581,7 +957,7 @@ mod tests {
         let dir = std::env::temp_dir().join("entangled-seed-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("seed-{}.iso", std::process::id()));
-        let text = user_data("seedtest", None).unwrap();
+        let text = user_data("seedtest", None, BuiltinProfile::Server).unwrap();
         let seed = write(&path, &text, "entangled-seedtest").unwrap();
 
         assert_eq!(seed.bytes, std::fs::metadata(&path).unwrap().len() as usize);

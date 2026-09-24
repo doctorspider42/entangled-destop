@@ -133,7 +133,11 @@ fn backend_card(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) 
             wsl_engine_row(ui, app, actions);
             ui.add_space(6.0);
             for (capability, blocked) in [
-                ("3D acceleration", Backend::Native.virgl_block()),
+                (
+                    "GPU desktop (Venus)",
+                    Backend::Native.gpu_block(control_api::GpuRenderer::Venus),
+                ),
+                ("OpenGL 3D (virgl)", Backend::Native.virgl_block()),
                 ("TAP networking", Backend::Native.tap_block()),
             ] {
                 let line = match blocked {

@@ -271,9 +271,31 @@ fails loudly instead of silently running software rendering or silence. Install
 the library, or change the profile — `[sound] backend = "auto"` takes whatever
 the host has and never blocks a start.
 
-On a Windows host, 3D is not available at all (see the
-[limits](user-guide.md#limits-in-one-place)); the manager greys the option out
-and says so.
+On a Windows host `virgl` is not available at all (see the
+[limits](user-guide.md#limits-in-one-place)); the manager greys that option out
+and offers the GPU desktop instead.
+
+`[display] venus = true` fails the same way, before the guest boots, when the
+host's Vulkan cannot serve it:
+
+```text
+[display] venus = true, but the host has no usable Vulkan loader: …
+[display] venus = true, but every host Vulkan device is hidden (…: it lacks VK_EXT_external_memory_host, …)
+```
+
+`entangled doctor` prints the same sentence under `3D`. Install or update the
+GPU's Vulkan driver, or drop the key to run in 2D.
+
+## The GPU desktop goes black and the session ends
+
+A GNOME guest on `venus = true` whose screen blanks after idling (five
+minutes by default) keeps every program's upload of the screen it no longer
+shows. Within seconds that reaches the renderer's memory share for one guest
+context, the allocation is refused, and gnome-shell's session ends (the run log
+says `vkBindBufferMemory2 … names no VkDeviceMemory`). The idle blank must be
+off: `install ubuntu --venus` turns it off by default. If a user set it back,
+turn it off again in the guest with
+`gsettings set org.gnome.desktop.session idle-delay 0`.
 
 ## The install seems stuck
 

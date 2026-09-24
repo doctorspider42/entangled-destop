@@ -4223,3 +4223,155 @@ diagnostic run of the amendment above saw one submit in ten seconds.
 2. Host-visible allocation throughput (unchanged).
 3. Renderer-wide bounds for host Vulkan objects and transient decode memory
    (unchanged).
+
+## Amendment, 2026-09-24 — how a user turns it on: `[display] venus = true`
+
+Until now the executing Venus renderer was attached by an environment
+variable (`ENTANGLED_VENUS=vulkan`), and a GPU desktop also needed three
+changes typed into the guest over its serial console. Both are now product
+settings.
+
+### The profile key
+
+`[display] venus = true` attaches the Venus executor on the host's Vulkan
+device, on both hosts. It is a boolean beside `virgl` rather than a
+`renderer = "…"` enum, for two reasons:
+
+- **Old engines must read new profiles.** Every section denies unknown
+  fields, and the manager on Windows drives a WSL engine that may be an older
+  release. `venus` is written only when it is true, so a profile saved by
+  this build is byte-identical to before unless someone chose Venus.
+  `host_visible_mib` follows the same rule.
+- **`virgl` already exists as a boolean.** A `renderer` key would have
+  duplicated it, and one of the two would then have had to win.
+
+`control_api::GpuRenderer` (`TwoD`, `Virgl`, `Venus`) is what the run path,
+the manager and the tests use instead of the two booleans.
+`DisplaySection::gpu_renderer` and `set_gpu_renderer` convert between them.
+`virgl = true` together with `venus = true` is refused at parse time, with both
+keys named. One virtio-gpu device has one `Renderer3d`: virgl serves OpenGL
+through virglrenderer, and Venus serves Vulkan, plus OpenGL through the guest's
+Zink. On a Linux host virglrenderer can also carry Venus, but that is its
+Venus, not this one. A profile has no precedence to guess.
+
+`run_vm::gpu_plan` makes the choice before anything is loaded, so it is tested
+without a GPU:
+
+| input | renderer |
+|---|---|
+| `ENTANGLED_VENUS_CAPTURE` set | the transport capture, over everything |
+| `ENTANGLED_VENUS=vulkan` | the executor; if the profile asked for virgl or 2D, a warning names what it replaced |
+| `ENTANGLED_VENUS=` anything else | refused, naming the profile key |
+| `venus = true` | the executor |
+| `virgl = true` | virglrenderer (Linux; elsewhere refused, and the refusal now names `venus`) |
+| neither | 2D |
+
+**`ENTANGLED_VENUS` stays, as a developer override.** It puts Venus under a
+profile nobody wants to edit: an installer run, a test's generated profile, or
+an A/B comparison against the same file. Every measurement in the amendments
+above was taken that way, and runs still in progress use it. It changes what
+the machine is without the profile saying so, which is why it logs a warning
+when it overrides the profile. The capture keeps its variable for the reason
+its own stage gave: it executes nothing, and a profile should not be able to ask
+for it by accident. The attach line is now `info`, and it says who asked:
+`attaching the Venus EXECUTING renderer … source=[display] venus = true
+host_visible_mib=4096`.
+
+### `entangled doctor`
+
+The `3D` section reports what `venus = true` would find, through the same probe
+`run` uses to refuse a start (`AshVulkan::load` + `usable_devices`). It
+reports the loader, each device the guest would be shown, the version it
+would be told, and the two memory capabilities this renderer depends on:
+
+```text
+  3D              : venus    ready — `[display] venus = true`: the guest's Vulkan, and its OpenGL and
+                             desktop through Zink, on this host's GPU
+                             device NVIDIA GeForce RTX 2070 (Vulkan 1.3.312 to the guest)
+                               VK_EXT_external_memory_host   yes (pages imported at 4096-byte alignment)
+                               VK_KHR_external_memory_win32  yes (shared scanout: GNOME composites on
+                                                             the GPU)
+                    virgl    Linux-only — `[display] virgl = true` needs
+                             virglrenderer, which speaks EGL; on this host use
+                             venus, or the WSL (KVM) backend for virgl
+```
+
+That is this machine's Windows output. A host that cannot serve Venus gets
+`venus    unavailable —` followed by the probe's own sentence. A device hidden
+for lacking `VK_EXT_external_memory_host` is named with that reason. The line
+does not use `MISSING`, because 3D is optional and the manager's diagnostics
+panel paints `MISSING` as a fault. On Linux the Venus lines follow the
+virglrenderer lines. In place of the Win32 line they say that shared scanout
+memory does not exist there yet (stage S1: no `OPAQUE_FD` export), so GNOME's
+scanout stays in dumb buffers.
+
+### The guest, configured by its installer
+
+`entangled install ubuntu --venus` (with `--auto` and the Desktop ISO, or with
+an `--autoinstall` file) adds four items to the head of the autoinstall's
+`late-commands`. They run in the installer against `/target`, so the first boot
+is already the finished machine and nothing is typed afterwards:
+
+```yaml
+    - >-
+      printf '%s\n'
+      '<!-- Entangled GPU desktop: every GL client on zink, over Venus (ADR-0004) -->'
+      '<driconf>'
+      '  <device driver="loader" kernel_driver="virtio_gpu">'
+      '    <application name="every GL client on zink">'
+      '      <option name="dri_driver" value="zink" />'
+      '    </application>'
+      '  </device>'
+      '</driconf>'
+      > /target/etc/drirc
+    - >-
+      printf '%s\n'
+      '# Entangled GPU desktop: no idle blank (ADR-0004)'
+      '[org.gnome.desktop.session]'
+      'idle-delay=uint32 0'
+      > /target/usr/share/glib-2.0/schemas/90_entangled-venus.gschema.override
+    - curtin in-target -- glib-compile-schemas /usr/share/glib-2.0/schemas
+    - curtin in-target -- usermod -aG render entangled
+```
+
+- **The drirc** is the one the GNOME measurement settled on. It has no
+  `executable=`, so every GL client on a virtio-gpu device goes to Zink, not
+  only gnome-shell.
+- **No idle blank, as a GSettings vendor override, not a dconf database.**
+  Ubuntu ships no dconf profile for users (the guest has only `ibus`'s), so a
+  `local` database would be read by nothing unless a profile were written as
+  well. An override in the schema directory is read by every GSettings client,
+  sorts after Ubuntu's `10_` files, and survives package upgrades, which
+  recompile that directory. A user's own `gsettings set` still wins, as it
+  should.
+- **`render`**: the user comes from the document's `identity.username`, and
+  the command is refused unless that is a plain Unix name. A graphical login
+  reaches the render node through logind's ACL anyway. This is for serial and
+  SSH logins, where every Vulkan probe of this project runs.
+
+The edit is to the text, not a YAML round trip: the document may be the
+user's, and a parser would drop its comments. `seed::with_venus_guest` finds the
+block-style `late-commands:` key and its items' indentation (indentless lists
+included), inserts the items at that indentation, and refuses a document that
+has no such list, or has only a flow-style one, rather than guess. `--venus` is
+refused without a seed (an interactive install) and with the built-in
+*server* profile. A server has no GNOME, and has no `glib-compile-schemas` for
+the override, so the install would fail twenty minutes in. It is also refused
+for `install debian` and `install fedora`, whose automation has nothing written
+for it yet.
+
+`--auto` now chooses its built-in profile from the ISO's file name:
+`assets/autoinstall/ubuntu-desktop.yaml` (`ubuntu-desktop-minimal`) for a
+Desktop ISO and the server profile otherwise. Both are compiled in, because an
+installed copy has no `assets/` directory to pass to `--autoinstall`. The
+installed profile gets `venus = true` and at least 4096 MiB, the size the GNOME
+measurements were taken at (Zink sizes its mapped-bytes limit from guest RAM).
+The installer VM itself always runs in 2D. It needs no host Vulkan to install
+onto a disk, and the disk is portable anyway. A host that cannot serve Venus
+therefore gets a warning at install time, not a refusal.
+
+The manager's Edit dialog replaces the "Accelerate 3D graphics" checkbox with a
+three-way *3D* choice: Off (2D), OpenGL (virgl), GPU desktop (Venus).
+`Backend::gpu_block` greys out virgl on a WHP engine and never Venus. The
+choice writes exactly one switch, and switching back to 2D leaves no `venus` key
+behind.

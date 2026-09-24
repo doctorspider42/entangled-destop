@@ -208,6 +208,20 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     if args.distro.eq_ignore_ascii_case("ubuntu") {
         return crate::install_ubuntu::run(args);
     }
+    // The GPU desktop is set up by subiquity's late-commands; the other two
+    // installers have their own automation languages and nothing written
+    // for them yet. Refused rather than ignored: a profile that says
+    // `venus = true` over a guest configured for nothing boots GNOME in
+    // software and looks like a renderer bug.
+    if args.venus {
+        return Err(format!(
+            "--venus is for `install ubuntu` (the Ubuntu Desktop ISO): it configures the \
+             guest through the autoinstall's late-commands, which {} does not have. For \
+             another guest set `[display] venus = true` in its profile and configure the \
+             guest by hand (ADR-0004, \"how a user turns it on\")",
+            args.distro
+        ));
+    }
     if args.distro.eq_ignore_ascii_case("fedora") {
         return crate::install_fedora::run(args);
     }
@@ -782,6 +796,7 @@ mod tests {
             network: crate::DEFAULT_NETWORK.into(),
             name: name.map(str::to_string),
             headless: true,
+            venus: false,
         };
 
         // A disk path in this host's spelling, with a space in it — the shape

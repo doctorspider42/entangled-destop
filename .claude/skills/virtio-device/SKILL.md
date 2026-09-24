@@ -470,6 +470,32 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   at the result. Without it every Venus probe answers "no" and the device is
   byte-identical to a virgl-only one.
 
+### Attaching the Venus executor (this VMM's own renderer, both hosts)
+
+- **The product switch is `[display] venus = true`** (ADR-0004, "how a user
+  turns it on"). It is refused beside `virgl = true`: one device, one
+  `Renderer3d`. It is serialized only when true, because an older engine
+  denies unknown keys. Reason with `control_api::GpuRenderer`
+  (`DisplaySection::gpu_renderer`/`set_gpu_renderer`), never with the two
+  booleans.
+- `run_vm::gpu_plan` is the one place the choice is made, and it is
+  unit-tested. `ENTANGLED_VENUS_CAPTURE` wins over everything.
+  `ENTANGLED_VENUS=vulkan` is a **developer override** that puts Venus under
+  any profile and warns what it replaced. Use it for installer runs and A/B
+  comparisons on one file; a profile a user runs says `venus = true`.
+- The attach line names who asked: `attaching the Venus EXECUTING renderer …
+  source=[display] venus = true host_visible_mib=4096`. Grep for that line,
+  not for the variable, when checking that a run attached it.
+- `entangled doctor` runs the same probe `run` refuses with (`doctor::venus_host`).
+  Its `3D` section names the device and says whether the host has
+  `VK_EXT_external_memory_host` (required: a device without it is hidden) and,
+  on Windows, `VK_KHR_external_memory_win32` (without it GNOME's scanout stays
+  in software).
+- A guest needs its GL sent to Zink and its idle blank off for the desktop.
+  `install ubuntu --venus` writes both through the autoinstall
+  (`seed::venus_late_commands`). An existing guest is configured by hand, as
+  the user guide's "A GPU-accelerated desktop" says.
+
 ## Per-device references
 
 - **blk** (EPIC 4): request = header (type/reserved/sector) + data + status

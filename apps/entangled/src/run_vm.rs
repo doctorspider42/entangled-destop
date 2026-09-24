@@ -63,13 +63,87 @@ use vmm_core::{Lifecycle, MachineConfig, RunOutcome, VmState};
 /// name is overwritten.
 const VENUS_CAPTURE_ENV: &str = "ENTANGLED_VENUS_CAPTURE";
 
-/// The switch for the Venus **executor** (EPIC 20 stage 5a.3, ADR-0004):
-/// `ENTANGLED_VENUS=vulkan` attaches the renderer that executes a guest's
-/// Vulkan bring-up on the host GPU and answers it. Diagnostic, and an
-/// environment variable, for the reason [`VENUS_CAPTURE_ENV`] is; the capture
-/// wins if both are set. The run fails before the guest boots if the host has
-/// no Vulkan loader or no device the executor would expose.
+/// A **developer override** for the Venus executor (EPIC 20 stage 5a.3,
+/// ADR-0004): `ENTANGLED_VENUS=vulkan` attaches it whatever the profile says,
+/// as though it had `[display] venus = true` — and in place of `virgl = true`
+/// if it has that, with a warning.
+///
+/// The product switch is the profile key (ADR-0004, "how a user turns it
+/// on"); this stays because it puts Venus under a profile nobody wants to
+/// edit — an installer run, a test's generated profile, an A/B against the
+/// same file — which is how every measurement before the key existed was
+/// taken. [`VENUS_CAPTURE_ENV`] wins if both are set. Either way the run fails
+/// before the guest boots if the host has no Vulkan loader or no device the
+/// executor would expose.
 const VENUS_ENV: &str = "ENTANGLED_VENUS";
+
+/// Why the Venus executor was attached, for its log line and its errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VenusSource {
+    /// `[display] venus = true`.
+    Profile,
+    /// [`VENUS_ENV`], over a profile that asked for `overridden`.
+    Override {
+        overridden: control_api::GpuRenderer,
+    },
+}
+
+impl VenusSource {
+    /// How an error names the thing that asked for Venus.
+    fn asked_by(self) -> String {
+        match self {
+            Self::Profile => "[display] venus = true".into(),
+            Self::Override { .. } => format!("{VENUS_ENV}=vulkan"),
+        }
+    }
+}
+
+/// Which renderer the virtio-gpu device gets, decided before anything is
+/// loaded — the part of the choice a test can check without a GPU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GpuPlan {
+    /// The Venus transport capture ([`VENUS_CAPTURE_ENV`]): a diagnostic that
+    /// outranks everything, because it is not a variant of 3D.
+    Capture(PathBuf),
+    /// The Venus executor on the host's Vulkan device.
+    Venus(VenusSource),
+    /// virglrenderer (Linux hosts).
+    Virgl,
+    /// No 3D.
+    TwoD,
+}
+
+/// The profile's renderer, as the two developer environment variables leave
+/// it. `capture` and `venus` are those variables' values.
+fn gpu_plan(
+    display: &control_api::DisplaySection,
+    capture: Option<std::ffi::OsString>,
+    venus: Option<std::ffi::OsString>,
+) -> Result<GpuPlan, String> {
+    use control_api::GpuRenderer;
+    if let Some(prefix) = capture {
+        return Ok(GpuPlan::Capture(PathBuf::from(prefix)));
+    }
+    let asked = display.gpu_renderer();
+    if let Some(mode) = venus {
+        if mode != "vulkan" {
+            return Err(format!(
+                "{VENUS_ENV}={} is not a Venus renderer this build has; the one there is is \
+                 \"vulkan\" (and the product switch is `[display] venus = true`)",
+                mode.to_string_lossy()
+            ));
+        }
+        return Ok(GpuPlan::Venus(match asked {
+            GpuRenderer::Venus => VenusSource::Profile,
+            overridden => VenusSource::Override { overridden },
+        }));
+    }
+    Ok(match asked {
+        GpuRenderer::Venus => GpuPlan::Venus(VenusSource::Profile),
+        GpuRenderer::Virgl => GpuPlan::Virgl,
+        GpuRenderer::TwoD => GpuPlan::TwoD,
+    })
+}
 
 /// The Venus renderer's host-visible window: the profile's
 /// `[display] host_visible_mib`, else the renderer's default (ADR-0004, the
@@ -339,25 +413,26 @@ fn build_devices(
 
     // Presentation + virtio-gpu (EPIC 7/8): the device pushes scanout pixels
     // into the display handle; with a window they appear on screen, headless
-    // they are still screenshot-able. With `[display] virgl = true`
-    // (ADR-0004) the device additionally executes 3D command streams through
-    // the host's virglrenderer — or the run fails, loudly: a profile that
-    // asked for 3D and silently got llvmpipe is the bug the option exists to
-    // fix.
+    // they are still screenshot-able. With `[display] venus = true` or
+    // `virgl = true` (ADR-0004) the device additionally executes the guest's
+    // 3D through a host renderer — or the run fails, loudly: a profile that
+    // asked for 3D and silently got llvmpipe is the bug the options exist to
+    // fix. Which one is `gpu_plan`'s answer, developer overrides included.
+    let plan = gpu_plan(
+        &cfg.display,
+        std::env::var_os(VENUS_CAPTURE_ENV),
+        std::env::var_os(VENUS_ENV),
+    )?;
     // The Venus transport capture (EPIC 20 phase 4), ahead of everything else
-    // because it is not a variant of 3D — it is a different renderer entirely,
-    // and on Windows it is the only one there is.
+    // because it is not a variant of 3D — it is a different renderer entirely.
     //
-    // An environment variable rather than a profile key, deliberately. This is
-    // a diagnostic stage: the renderer advertises the Venus capset, carries a
-    // guest as far as a live command ring and writes what comes through it to
-    // a file, and it executes no Vulkan at all — so a guest that gets a reply
-    // from us gets nothing and waits. Putting that behind `[display]` would
-    // have meant a schema every profile, the manager and the installer's tests
-    // would inherit, for something two stages from now deletes. The precedent
-    // is `ENTANGLED_GPU_FENCES`, which is diagnostic in the same way.
-    if let Some(prefix) = std::env::var_os(VENUS_CAPTURE_ENV) {
-        let prefix = PathBuf::from(prefix);
+    // An environment variable rather than a profile key, deliberately: the
+    // renderer advertises the Venus capset, carries a guest as far as a live
+    // command ring and writes what comes through it to a file, and it executes
+    // no Vulkan at all — so a guest that gets a reply from us gets nothing and
+    // waits. It is how the protocol is studied, never a thing a profile should
+    // be able to ask for by accident. The precedent is `ENTANGLED_GPU_FENCES`.
+    if let GpuPlan::Capture(prefix) = plan {
         // The files are made per ring, long after this point; a directory that
         // is not there is worth failing the run for now rather than refusing
         // every ring later.
@@ -411,23 +486,26 @@ fn build_devices(
         gpu.set_refresh_hz(cfg.display.refresh_hz);
         gpu.set_frame_stats(cfg.display.frame_stats.clone());
         devices.push(Box::new(gpu));
-    } else if let Some(mode) = std::env::var_os(VENUS_ENV) {
+    } else if let GpuPlan::Venus(source) = plan {
         // The Venus executor (EPIC 20 stage 5a.3): the renderer that answers,
-        // on the host GPU. Diagnostic for the same reason the capture is — an
-        // environment variable, not a profile key — and refused up front on a
+        // on the host GPU — the GPU desktop's renderer. Refused up front on a
         // host with no device it would expose, rather than attached to answer
         // a guest's first enumeration with nothing.
-        if mode != "vulkan" {
-            return Err(format!(
-                "{VENUS_ENV}={} is not a Venus renderer this build has; the one there is is \"vulkan\"",
-                mode.to_string_lossy()
-            ));
+        match source {
+            VenusSource::Profile => {}
+            VenusSource::Override { overridden } => tracing::warn!(
+                var = VENUS_ENV,
+                profile = %overridden,
+                "developer override: the Venus renderer replaces the renderer this \
+                 profile asks for"
+            ),
         }
+        let asked_by = source.asked_by();
         let host = virtio_gpu::host_vulkan::AshVulkan::load()
-            .map_err(|why| format!("{VENUS_ENV}=vulkan, but {why}"))?;
+            .map_err(|why| format!("{asked_by}, but {why}"))?;
         let shown = host
             .usable_devices()
-            .map_err(|why| format!("{VENUS_ENV}=vulkan, but {why}"))?;
+            .map_err(|why| format!("{asked_by}, but {why}"))?;
         for device in &shown {
             tracing::info!(
                 device = %device.name(),
@@ -435,12 +513,11 @@ fn build_devices(
                 "a Venus guest will see this host Vulkan device"
             );
         }
-        tracing::warn!(
-            "attaching the Venus EXECUTING renderer (stage 5b.3): it answers the Vulkan 1.3 \
-             bring-up, device memory, buffers, images, pipelines, descriptors, render passes, \
-             dynamic rendering, command buffers, queue submission with fences and semaphores, \
-             the sync-file semaphore import a guest swapchain needs, and fences on every \
-             queue's timeline, on the host GPU"
+        tracing::info!(
+            source = %asked_by,
+            host_visible_mib = venus_host_visible_bytes(&cfg.display) >> 20,
+            "attaching the Venus EXECUTING renderer: the guest's Vulkan, and its OpenGL \
+             through Zink, run on the host GPU"
         );
         let renderer =
             virtio_gpu::VenusRenderer::new(virtio_gpu::ExecutorFactory::new(Arc::new(host)))
@@ -449,7 +526,7 @@ fn build_devices(
         gpu.set_refresh_hz(cfg.display.refresh_hz);
         gpu.set_frame_stats(cfg.display.frame_stats.clone());
         devices.push(Box::new(gpu));
-    } else if cfg.display.virgl {
+    } else if plan == GpuPlan::Virgl {
         #[cfg(target_os = "linux")]
         {
             // A renderer this program fetched is offered to the loader as a
@@ -512,12 +589,11 @@ fn build_devices(
         }
         #[cfg(not(target_os = "linux"))]
         {
-            return Err(
-                "[display] virgl = true is Linux-only for now: the host renderer \
-                 (virglrenderer) speaks EGL. See docs/adr/0004-virtio-gpu-3d.md \
-                 for the Windows plan, or drop the option to run with 2D"
-                    .into(),
-            );
+            return Err("[display] virgl = true is Linux-only: the host renderer \
+                 (virglrenderer) speaks EGL. On this host 3D is `[display] venus = true` \
+                 instead (the Venus renderer on the host's Vulkan device — `entangled \
+                 doctor` says whether it has one), or drop the option to run with 2D"
+                .into());
         }
     } else {
         let mut gpu = virtio_gpu::GpuDevice::new(display_handle);
@@ -2521,7 +2597,77 @@ fn extend_cmdline(configured: &str, clauses: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{direct_linux_cmdline, extend_cmdline, venus_host_visible_bytes};
+    use super::{
+        direct_linux_cmdline, extend_cmdline, gpu_plan, venus_host_visible_bytes, GpuPlan,
+        VenusSource,
+    };
+    use control_api::{DisplaySection, GpuRenderer};
+    use std::ffi::OsString;
+
+    fn display(renderer: GpuRenderer) -> DisplaySection {
+        let mut display = DisplaySection::default();
+        display.set_gpu_renderer(renderer);
+        display
+    }
+
+    /// The profile decides, with no variable set: `venus = true` is the
+    /// executor, `virgl = true` is virglrenderer, neither is 2D.
+    #[test]
+    fn the_profile_picks_the_renderer() {
+        for (renderer, plan) in [
+            (GpuRenderer::TwoD, GpuPlan::TwoD),
+            (GpuRenderer::Virgl, GpuPlan::Virgl),
+            (GpuRenderer::Venus, GpuPlan::Venus(VenusSource::Profile)),
+        ] {
+            assert_eq!(gpu_plan(&display(renderer), None, None), Ok(plan));
+        }
+    }
+
+    /// `ENTANGLED_VENUS=vulkan` is a developer override: it puts Venus under
+    /// any profile and says which renderer it displaced; any other value is
+    /// refused rather than read as "off".
+    #[test]
+    fn the_venus_variable_overrides_the_profile_and_names_what_it_replaced() {
+        let vulkan = || Some(OsString::from("vulkan"));
+        assert_eq!(
+            gpu_plan(&display(GpuRenderer::Venus), None, vulkan()),
+            Ok(GpuPlan::Venus(VenusSource::Profile))
+        );
+        for overridden in [GpuRenderer::TwoD, GpuRenderer::Virgl] {
+            let plan = gpu_plan(&display(overridden), None, vulkan());
+            assert_eq!(
+                plan,
+                Ok(GpuPlan::Venus(VenusSource::Override { overridden }))
+            );
+        }
+        assert_eq!(
+            VenusSource::Profile.asked_by(),
+            "[display] venus = true",
+            "errors name the profile key"
+        );
+        let error = gpu_plan(&display(GpuRenderer::Venus), None, Some("on".into()))
+            .expect_err("an unknown value is refused");
+        assert!(
+            error.contains("ENTANGLED_VENUS=on") && error.contains("venus = true"),
+            "{error}"
+        );
+    }
+
+    /// The capture is a diagnostic that outranks every renderer, the
+    /// override included.
+    #[test]
+    fn the_capture_outranks_everything() {
+        for renderer in GpuRenderer::ALL {
+            assert_eq!(
+                gpu_plan(
+                    &display(renderer),
+                    Some("C:/captures/run".into()),
+                    Some("vulkan".into())
+                ),
+                Ok(GpuPlan::Capture("C:/captures/run".into()))
+            );
+        }
+    }
 
     /// `control_api` states the Venus window's default and bounds without the
     /// device or machine crates; this is the place that sees all three. The

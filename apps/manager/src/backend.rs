@@ -102,13 +102,23 @@ impl Backend {
     /// Why 3D is unavailable on this backend, or `None` when it works.
     pub fn virgl_block(self) -> Option<Block> {
         (!self.is_linux_kvm()).then_some(Block {
-            short: "Needs the Linux/KVM backend — switch this machine to \"WSL (KVM)\".",
-            long: "3D acceleration needs the Linux/KVM backend for now: the host renderer \
-                   (virglrenderer) speaks EGL, which Windows has no equivalent of yet \
-                   (ADR-0004). Switch this machine to \"WSL (KVM)\", or leave 3D off and \
-                   run with 2D — the guest still gets a desktop, drawn by its own \
-                   processor.",
+            short: "virgl needs the Linux/KVM backend — use the GPU desktop (Venus) here.",
+            long: "virgl (OpenGL) needs the Linux/KVM backend: its host renderer \
+                   (virglrenderer) speaks EGL, which Windows has no equivalent of \
+                   (ADR-0004). On this backend choose \"GPU desktop (Venus)\", which runs \
+                   on the host's Vulkan device, or switch this machine to \"WSL (KVM)\".",
         })
+    }
+
+    /// Why `renderer` is unavailable on this backend, or `None` when it
+    /// works. Only virgl is host-bound; the Venus renderer runs on either
+    /// engine (it needs a host Vulkan device, which `entangled doctor`
+    /// reports and `run` checks before the guest boots).
+    pub fn gpu_block(self, renderer: control_api::GpuRenderer) -> Option<Block> {
+        match renderer {
+            control_api::GpuRenderer::Virgl => self.virgl_block(),
+            control_api::GpuRenderer::TwoD | control_api::GpuRenderer::Venus => None,
+        }
     }
 
     /// Why TAP networking is unavailable, or `None`.
@@ -412,11 +422,25 @@ mod tests {
         assert!(Backend::Wsl.is_linux_kvm());
         assert!(Backend::Wsl.virgl_block().is_none());
         assert!(Backend::Wsl.tap_block().is_none());
+        // The Venus renderer and 2D are never host-bound.
+        for backend in [Backend::Native, Backend::Wsl] {
+            for renderer in [
+                control_api::GpuRenderer::TwoD,
+                control_api::GpuRenderer::Venus,
+            ] {
+                assert!(backend.gpu_block(renderer).is_none(), "{renderer}");
+            }
+        }
 
         assert_eq!(Backend::Native.is_linux_kvm(), cfg!(target_os = "linux"));
         if cfg!(windows) {
             let reason = Backend::Native.virgl_block().expect("blocked on WHP");
             assert!(reason.short.contains("Linux/KVM"), "{}", reason.short);
+            // …and it names the renderer that does work here.
+            assert!(reason.short.contains("Venus"), "{}", reason.short);
+            assert!(Backend::Native
+                .gpu_block(control_api::GpuRenderer::Virgl)
+                .is_some());
             assert!(reason.long.contains("ADR-0004"), "{}", reason.long);
             // The inline line must stay short enough to sit under a field.
             assert!(reason.short.len() < 90, "{}", reason.short);

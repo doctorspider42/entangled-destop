@@ -227,8 +227,10 @@ On Windows the manager offers two hypervisors: **Windows (WHP)**, running
   16 GiB.
 - The control pipe survives `wsl.exe`, so Pause and Restart still work. The
   window does not come up on the Windows desktop — WSLg opens its own.
-- **Capabilities follow the kernel, not the host.** `Backend::virgl_block`,
-  `tap_block` and `debian_install_block` are the single source of truth for
+- **Capabilities follow the kernel, not the host.** `Backend::virgl_block`
+  (through `gpu_block(GpuRenderer)`, which blocks only virgl — the Venus GPU
+  desktop runs on either engine), `tap_block` and `debian_install_block` are
+  the single source of truth for
   "this fails at boot"; the editor and the wizard grey the control out and show
   `.short`, and the same check runs again at submit time in case the setting
   changed underneath the form.

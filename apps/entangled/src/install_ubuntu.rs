@@ -69,6 +69,12 @@ const INSTALLER_MEMORY_MIB: u64 = 2560;
 /// profile — a desktop install sized at 4096 must not boot into 2048.
 const INSTALLED_MEMORY_MIB: u64 = 2048;
 
+/// What a GPU desktop (`--venus`) gets at least: the size its measurements
+/// were taken at (ADR-0004's GNOME-on-the-GPU amendments). Zink sizes its
+/// mapped-bytes limit from guest RAM, and GNOME with a few GL clients on it
+/// is not a 2 GiB machine.
+const VENUS_MEMORY_MIB: u64 = 4096;
+
 pub fn run(args: &InstallArgs) -> Result<(), String> {
     // 1. Firmware. Named first because it is the one artifact a fresh host may
     //    not have, and the error has to say how to get it — in terms of what
@@ -129,8 +135,31 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     // how a layout the built-in profile does not cover gets installed), and it is
     // not the same claim as "unattended", so it is not the same flag.
     let automated = args.auto || args.autoinstall.is_some();
+    // The built-in profile follows the ISO: each names an install source only
+    // its own ISO carries (`ubuntu-server-minimal`, `ubuntu-desktop-minimal`).
+    let builtin = seed::BuiltinProfile::for_iso(&iso);
+    if args.venus {
+        venus_preflight(automated, args.autoinstall.is_some(), builtin)?;
+        if let Err(why) = crate::doctor::venus_host() {
+            tracing::warn!(
+                %why,
+                "this host cannot serve the Venus renderer; the installed profile will \
+                 refuse to start here until it can (`entangled doctor`)"
+            );
+        }
+    }
     let seed = if automated {
-        let user_data = seed::user_data(&vm_name, args.autoinstall.as_deref())
+        if args.autoinstall.is_none() {
+            tracing::info!(profile = ?builtin, iso = %iso.display(), "built-in autoinstall profile");
+        }
+        let user_data = seed::user_data(&vm_name, args.autoinstall.as_deref(), builtin)
+            .and_then(|text| {
+                if args.venus {
+                    seed::with_venus_guest(&text)
+                } else {
+                    Ok(text)
+                }
+            })
             .map_err(|e| format!("cannot build the autoinstall configuration: {e}"))?;
         let seed_path = target.with_file_name(format!("{vm_name}-seed.iso"));
         Some(
@@ -194,6 +223,10 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             scale: 1.0,
             virgl: false,
             virgl_isolation: control_api::VirglIsolation::default(),
+            // The installer itself runs in 2D whatever the machine will be:
+            // it draws nothing a GPU would help with, and it must not need a
+            // host Vulkan device to install onto a disk.
+            venus: false,
             refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             frame_stats: None,
             host_visible_mib: None,
@@ -275,9 +308,14 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     //    firmware finds \\EFI\\ubuntu\\shimx64.efi through the Boot#### entry
     //    grub-install wrote into the NVRAM store, which is why `nvram` is the
     //    key that makes this profile work more than once.
+    let installed_memory = if args.venus {
+        VENUS_MEMORY_MIB
+    } else {
+        INSTALLED_MEMORY_MIB
+    };
     let profile = VmConfig {
         name: vm_name.clone(),
-        memory_mib: args.memory_mib.max(INSTALLED_MEMORY_MIB),
+        memory_mib: args.memory_mib.max(installed_memory),
         vcpus: 2,
         transport: VirtioTransport::Pci,
         boot: BootSection {
@@ -298,6 +336,9 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             scale: 1.0,
             virgl: false,
             virgl_isolation: control_api::VirglIsolation::default(),
+            // The GPU desktop the seed's late-commands just configured the
+            // guest for (ADR-0004, "how a user turns it on").
+            venus: args.venus,
             refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             frame_stats: None,
             host_visible_mib: None,
@@ -345,6 +386,45 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         profile_path.display(),
         profile_path.display()
     );
+    if args.venus {
+        println!(
+            "gpu:        [display] venus = true — GNOME and every GL client on Zink over the \
+             host GPU (the guest's /etc/drirc), no idle blank"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `--venus` can do what it says, before any disk is written to.
+///
+/// It configures the guest from the seed, so there must be one; and with the
+/// built-in profile it needs the desktop one — a server install has no GNOME
+/// to put on Zink, and no `glib-compile-schemas` for the late-command that
+/// turns the idle blank off, which would fail the install twenty minutes in.
+/// A custom `--autoinstall` is the author's to get right. The host's own
+/// Vulkan is only *warned* about: the disk is portable, and the host that
+/// runs it may not be this one.
+fn venus_preflight(
+    automated: bool,
+    custom: bool,
+    builtin: seed::BuiltinProfile,
+) -> Result<(), String> {
+    if !automated {
+        return Err(
+            "--venus configures the installed guest from the autoinstall seed, and an \
+             interactive install has none: add --auto (with the Desktop ISO) or --autoinstall"
+                .into(),
+        );
+    }
+    if !custom && builtin != seed::BuiltinProfile::Desktop {
+        return Err(
+            "--venus sets up a GPU desktop, and this ISO is not an Ubuntu Desktop ISO (the \
+             built-in profile follows the ISO's file name). Fetch one with `bash \
+             scripts/fetch-ubuntu-iso.sh desktop` and pass it with --iso, or pass your own \
+             --autoinstall"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -551,6 +631,21 @@ mod tests {
             interactive.contains("console=ttyS0,115200n8"),
             "{interactive}"
         );
+    }
+
+    /// `--venus` is refused where it could only half-work: no seed to
+    /// configure the guest from, or the built-in *server* profile, whose
+    /// install would fail at the schema late-command twenty minutes in.
+    #[test]
+    fn venus_needs_a_seed_and_a_desktop() {
+        use seed::BuiltinProfile::{Desktop, Server};
+        let interactive = venus_preflight(false, false, Desktop).expect_err("no seed");
+        assert!(interactive.contains("--auto"), "{interactive}");
+        let server = venus_preflight(true, false, Server).expect_err("server profile");
+        assert!(server.contains("Desktop ISO"), "{server}");
+        assert!(venus_preflight(true, false, Desktop).is_ok());
+        // A custom autoinstall is its author's: the ISO's name says nothing.
+        assert!(venus_preflight(true, true, Server).is_ok());
     }
 
     #[test]

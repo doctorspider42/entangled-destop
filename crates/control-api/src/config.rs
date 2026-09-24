@@ -287,6 +287,20 @@ pub struct DisplaySection {
     /// Whether that renderer runs in its own process (GPU-012). Ignored when
     /// `virgl` is false.
     pub virgl_isolation: VirglIsolation,
+    /// The GPU desktop (ADR-0004, "how a user turns it on"): this VMM's own
+    /// Venus renderer, which executes the guest's Vulkan on the host's
+    /// Vulkan device — and with it, through Mesa's Zink in the guest, its
+    /// OpenGL and its compositor. Both hosts; the host needs a Vulkan device
+    /// with `VK_EXT_external_memory_host` (`entangled doctor` says), or the
+    /// run fails before the guest boots rather than silently booting 2D.
+    ///
+    /// One renderer per virtio-gpu device, so `venus` and [`Self::virgl`]
+    /// together are refused. Off by default, and **not written when off**:
+    /// a profile saved by this build must still load in an engine built
+    /// before the key existed (the manager drives a WSL engine that may be
+    /// an older release, and every section here denies unknown fields).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub venus: bool,
     /// The refresh rate the virtual monitor's EDID advertises, in Hz
     /// (GAME-2105).
     ///
@@ -344,10 +358,63 @@ impl Default for DisplaySection {
             scale: 1.0,
             virgl: false,
             virgl_isolation: VirglIsolation::default(),
+            venus: false,
             refresh_hz: DEFAULT_REFRESH_HZ,
             frame_stats: None,
             host_visible_mib: None,
         }
+    }
+}
+
+/// Which host renderer a VM's virtio-gpu device gets — the one answer the
+/// `[display]` switches `virgl` and `venus` add up to. The profile keeps the
+/// two booleans (every profile written before Venus has `virgl`, and an old
+/// engine must keep reading new profiles); this is what the run path, the
+/// manager and the tests reason with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuRenderer {
+    /// No 3D: the device scans out what the guest draws on its CPU.
+    #[default]
+    TwoD,
+    /// OpenGL through the host's virglrenderer (Linux hosts only).
+    Virgl,
+    /// Vulkan, and OpenGL through Zink, on this VMM's Venus renderer over the
+    /// host's Vulkan device (both hosts).
+    Venus,
+}
+
+impl GpuRenderer {
+    pub const ALL: [GpuRenderer; 3] = [GpuRenderer::TwoD, GpuRenderer::Virgl, GpuRenderer::Venus];
+}
+
+impl std::fmt::Display for GpuRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TwoD => "2d",
+            Self::Virgl => "virgl",
+            Self::Venus => "venus",
+        })
+    }
+}
+
+impl DisplaySection {
+    /// The renderer these switches select. A section with both switches on
+    /// is refused by validation; one built by hand that has both reads as
+    /// [`GpuRenderer::Venus`], the newer of the two, but never reaches a run.
+    pub fn gpu_renderer(&self) -> GpuRenderer {
+        match (self.venus, self.virgl) {
+            (true, _) => GpuRenderer::Venus,
+            (false, true) => GpuRenderer::Virgl,
+            (false, false) => GpuRenderer::TwoD,
+        }
+    }
+
+    /// Sets the switches for `renderer`, leaving every other key —
+    /// `virgl_isolation` and `host_visible_mib` included — as it was, so a
+    /// round trip through another renderer keeps a deliberate choice.
+    pub fn set_gpu_renderer(&mut self, renderer: GpuRenderer) {
+        self.virgl = renderer == GpuRenderer::Virgl;
+        self.venus = renderer == GpuRenderer::Venus;
     }
 }
 
@@ -573,6 +640,16 @@ impl VmConfig {
                 self.display.refresh_hz
             ));
         }
+        if self.display.virgl && self.display.venus {
+            return err(
+                "display.virgl and display.venus are both true, but they are two \
+                 different host renderers for the one virtio-gpu device: virgl serves \
+                 OpenGL through the host's virglrenderer (Linux hosts), venus serves Vulkan \
+                 — and OpenGL through Zink in the guest — on the host's Vulkan device. \
+                 Keep one"
+                    .into(),
+            );
+        }
         if let Some(mib) = self.display.host_visible_mib {
             if !mib.is_power_of_two()
                 || !(MIN_HOST_VISIBLE_MIB..=MAX_HOST_VISIBLE_MIB).contains(&mib)
@@ -765,6 +842,73 @@ scale = 1.0
                     && DEFAULT_HOST_VISIBLE_MIB <= MAX_HOST_VISIBLE_MIB
             );
         };
+    }
+
+    /// `[display] venus`: off unless asked for, never written while off (an
+    /// older engine denies unknown keys), round-trips when on, and refused
+    /// beside `virgl` — one device, one renderer.
+    #[test]
+    fn venus_is_an_opt_in_renderer_that_excludes_virgl() {
+        let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).expect("parses");
+        assert!(!cfg.display.venus);
+        assert_eq!(cfg.display.gpu_renderer(), GpuRenderer::TwoD);
+        let text = toml::to_string_pretty(&cfg).expect("serialises");
+        assert!(!text.contains("venus"), "no key invented while off: {text}");
+
+        let on = format!("{BACKLOG_EXAMPLE}venus = true\n");
+        let cfg = VmConfig::from_toml(&on).expect("venus = true parses");
+        assert!(cfg.display.venus && !cfg.display.virgl);
+        assert_eq!(cfg.display.gpu_renderer(), GpuRenderer::Venus);
+        let text = toml::to_string_pretty(&cfg).expect("serialises");
+        assert!(text.contains("venus = true"), "{text}");
+        assert_eq!(VmConfig::from_toml(&text).expect("round-trips"), cfg);
+
+        let virgl = format!("{BACKLOG_EXAMPLE}virgl = true\n");
+        assert_eq!(
+            VmConfig::from_toml(&virgl)
+                .expect("virgl parses")
+                .display
+                .gpu_renderer(),
+            GpuRenderer::Virgl
+        );
+
+        let both = format!("{BACKLOG_EXAMPLE}virgl = true\nvenus = true\n");
+        let error = VmConfig::from_toml(&both).expect_err("both renderers refused");
+        let ConfigError::Invalid(message) = error else {
+            panic!("an Invalid, not a parse error: {error}");
+        };
+        assert!(
+            message.contains("display.virgl") && message.contains("display.venus"),
+            "names both keys: {message}"
+        );
+
+        // Not a string: a typo'd `venus = "vulkan"` (the old environment
+        // variable's value) is a parse error, not a silent false.
+        let word = format!("{BACKLOG_EXAMPLE}venus = \"vulkan\"\n");
+        assert!(matches!(
+            VmConfig::from_toml(&word),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    /// The setter moves only the two switches: isolation and the window
+    /// survive a trip through another renderer.
+    #[test]
+    fn setting_a_renderer_keeps_every_other_display_key() {
+        let mut display = DisplaySection {
+            virgl_isolation: VirglIsolation::InProcess,
+            host_visible_mib: Some(512),
+            ..DisplaySection::default()
+        };
+        for renderer in GpuRenderer::ALL {
+            display.set_gpu_renderer(renderer);
+            assert_eq!(display.gpu_renderer(), renderer);
+            assert!(!(display.virgl && display.venus));
+            assert_eq!(display.virgl_isolation, VirglIsolation::InProcess);
+            assert_eq!(display.host_visible_mib, Some(512));
+        }
+        assert_eq!(GpuRenderer::Venus.to_string(), "venus");
+        assert_eq!(GpuRenderer::TwoD.to_string(), "2d");
     }
 
     #[test]
