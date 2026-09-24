@@ -824,6 +824,27 @@ install, ~2.5 min from `entangled run` to `ubuntu login:` (most of it cloud-init
 generating SSH host keys on first boot). The automated form of both halves is
 `cargo test -p entangled --test ubuntu_install -- --ignored --nocapture`.
 
+**`--auto` follows the ISO.** An ISO whose file name says `desktop` gets the
+built-in desktop profile (`assets/autoinstall/ubuntu-desktop.yaml`,
+`ubuntu-desktop-minimal`). Anything else gets the server one. **`--venus`**
+(desktop only, and it needs a seed) adds four late-commands at the head of the
+list: `/etc/drirc` sending every GL client to Zink, a
+`90_entangled-venus.gschema.override` with `idle-delay 0`, its
+`glib-compile-schemas`, and `usermod -aG render <identity.username>`. The
+written profile gets `[display] venus = true` and at least 4096 MiB. The
+installer VM itself stays 2D. Check the items in `<name>-seed.iso`'s
+user-data, and on the installed guest check that `/proc/$(pgrep -x
+gnome-shell)/maps` has `libvulkan_virtio`. The exact text is pinned by
+`seed::tests::venus_late_commands_are_exact_and_first`. On 2026-09-24 the
+commands were run for real in the Venus guest against a scratch `/target`:
+`glib-compile-schemas --strict` passed on its real schema set, `gsettings`
+read `uint32 0`, and the drirc parsed identically to the one GNOME ran on.
+The render-group item is safe where it sits: subiquity's postinstall creates the
+identity user (11:04:52 in that guest's installer log) before
+`subiquity/Late/run_user_supplied` starts (11:05:00).
+A full `install ubuntu --venus` run has not been made yet: there was no
+Desktop ISO on the machine.
+
 **Three files come out of an install, and all three matter:**
 
 | File | What breaks without it |

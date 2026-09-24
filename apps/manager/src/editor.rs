@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use control_api::{
-    BootMode, CdromSection, NetworkBackend, NetworkSection, SoundBackend, SoundSection,
-    VirtioTransport, VmConfig,
+    BootMode, CdromSection, GpuRenderer, NetworkBackend, NetworkSection, SoundBackend,
+    SoundSection, VirtioTransport, VmConfig,
 };
 
 use crate::backend::Backend;
@@ -60,7 +60,10 @@ pub struct EditForm {
     pub mac: String,
     pub display_width: u32,
     pub display_height: u32,
-    pub virgl: bool,
+    /// `[display] virgl` / `venus`, as the one choice they are: a device has
+    /// one renderer, and `control-api` refuses both switches at once.
+    /// `virgl_isolation` and `host_visible_mib` stay in [`Self::base`].
+    pub gpu: GpuRenderer,
     /// `[sound] enabled` — whether the guest gets a virtio-snd card at all.
     pub sound: bool,
     /// `[sound] backend`. Kept across an on/off toggle, the way the profile
@@ -222,7 +225,7 @@ enabled = true
                 .unwrap_or_default(),
             display_width: cfg.display.width,
             display_height: cfg.display.height,
-            virgl: cfg.display.virgl,
+            gpu: cfg.display.gpu_renderer(),
             sound: cfg.sound.enabled,
             sound_backend: cfg.sound.backend,
             gamepad: cfg.gamepad.enabled,
@@ -274,7 +277,7 @@ enabled = true
         };
         cfg.display.width = self.display_width;
         cfg.display.height = self.display_height;
-        cfg.display.virgl = self.virgl;
+        cfg.display.set_gpu_renderer(self.gpu);
         cfg.sound = SoundSection {
             enabled: self.sound,
             backend: self.sound_backend,
@@ -361,7 +364,7 @@ interface = "entangled0"
         assert_eq!(form.kernel, "artifacts/bootstrap/vmlinuz");
         assert_eq!(form.network, NetworkChoice::Tap);
         assert_eq!(form.interface, "entangled0");
-        assert!(!form.virgl);
+        assert_eq!(form.gpu, GpuRenderer::TwoD);
         assert_eq!(form.disks.len(), 1);
         assert!(!form.dirty(), "an untouched form is clean");
     }
@@ -383,7 +386,7 @@ interface = "entangled0"
         form.vcpus = 6;
         form.network = NetworkChoice::Usernet;
         form.interface = String::new();
-        form.virgl = true;
+        form.gpu = GpuRenderer::Virgl;
         assert!(form.dirty());
         form.save().expect("save");
 
@@ -399,6 +402,41 @@ interface = "entangled0"
         // Untouched parts survived.
         assert_eq!(cfg.boot.cmdline, "console=ttyS0 root=UUID=deadbeef rw");
         assert_eq!(cfg.disks.len(), 1);
+    }
+
+    /// The 3D choice writes exactly one switch, and switching renderer
+    /// clears the other: a profile with both is one `entangled run` refuses.
+    #[test]
+    fn the_renderer_choice_writes_one_switch() {
+        let path = temp_profile("gpu");
+        let mut form = EditForm::from_profile(&path).expect("load");
+        form.gpu = GpuRenderer::Virgl;
+        form.save().expect("save virgl");
+        let mut form = EditForm::from_profile(&path).expect("reload");
+        assert_eq!(form.gpu, GpuRenderer::Virgl);
+
+        form.gpu = GpuRenderer::Venus;
+        assert!(form.dirty());
+        form.save().expect("save venus");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let cfg = VmConfig::from_toml(&text).expect("reload");
+        assert!(cfg.display.venus && !cfg.display.virgl, "{text}");
+        assert_eq!(
+            EditForm::from_profile(&path).unwrap().gpu,
+            GpuRenderer::Venus
+        );
+
+        // And back off: no `venus` key left behind for an older engine to
+        // trip over.
+        let mut form = EditForm::from_profile(&path).expect("reload");
+        form.gpu = GpuRenderer::TwoD;
+        form.save().expect("save 2d");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("venus"), "{text}");
+        assert_eq!(
+            VmConfig::from_toml(&text).unwrap().display.gpu_renderer(),
+            GpuRenderer::TwoD
+        );
     }
 
     #[test]

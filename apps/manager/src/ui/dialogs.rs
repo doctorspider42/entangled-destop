@@ -3,6 +3,8 @@
 
 use egui::{Align, Layout, RichText, Vec2};
 
+use control_api::GpuRenderer;
+
 use crate::app::{Action, ManagerApp, Modal};
 use crate::backend::Backend;
 use crate::discovery::format_bytes;
@@ -1699,37 +1701,52 @@ fn edit_network_display(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
     );
     ui.add_space(6.0);
 
-    let virgl_block = form.backend.virgl_block();
-    if virgl_block.is_some() {
+    let virgl_block = form.backend.gpu_block(GpuRenderer::Virgl);
+    if form.gpu == GpuRenderer::Virgl && virgl_block.is_some() {
         // Unavailable here — and never silently left on, because the engine
         // refuses to boot a profile that asks for 3D it cannot deliver.
-        form.virgl = false;
+        form.gpu = GpuRenderer::TwoD;
     }
     ui::form_row(
         ui,
         "3D",
         "Hardware-accelerated 3D inside the guest, using this computer's graphics card. \
          Without it the guest still has a desktop, drawn by its own processor.",
-        |ui, _| {
-            let response = ui
-                .add_enabled_ui(virgl_block.is_none(), |ui| {
-                    ui.checkbox(&mut form.virgl, "Accelerate 3D graphics")
+        |ui, field_w| {
+            egui::ComboBox::from_id_salt("edit-gpu")
+                .selected_text(gpu_label(form.gpu))
+                .width(ui::combo_width(field_w))
+                .show_ui(ui, |ui| {
+                    for choice in GpuRenderer::ALL {
+                        let block = form.backend.gpu_block(choice);
+                        let response = ui
+                            .add_enabled_ui(block.is_none(), |ui| {
+                                ui.selectable_value(&mut form.gpu, choice, gpu_label(choice))
+                            })
+                            .inner;
+                        match block {
+                            Some(reason) => response.on_disabled_hover_text(reason.long),
+                            None => response.on_hover_text(gpu_hint(choice)),
+                        };
+                    }
                 })
-                .inner;
-            match virgl_block {
-                Some(reason) => response.on_hover_text(reason.long),
-                None => response.on_hover_text(
-                    "The machine gets a real GPU pipeline. If the host cannot provide one, \
-                     the machine refuses to start rather than quietly falling back to \
-                     software rendering.",
-                ),
-            };
+                .response
+                .on_hover_text(
+                    "If the host cannot provide the renderer chosen here, the machine \
+                     refuses to start rather than quietly falling back to software \
+                     rendering. `entangled doctor` (Diagnostics) says what this host has.",
+                );
         },
     );
-    if let Some(reason) = virgl_block {
+    if form.gpu == GpuRenderer::Venus {
         ui::form_note(
             ui,
-            RichText::new(reason.short).color(theme::WARN).size(11.0),
+            RichText::new(
+                "The guest must be set up for it: `entangled install ubuntu --venus` does \
+                 that; see the user guide's \"A GPU desktop\".",
+            )
+            .color(theme::WARN)
+            .size(11.0),
         );
     }
 
@@ -2461,4 +2478,30 @@ fn frame<R>(
             add(ui);
         });
     response.should_close()
+}
+
+/// The 3D renderer as the editor's combo box names it.
+fn gpu_label(renderer: control_api::GpuRenderer) -> &'static str {
+    use control_api::GpuRenderer;
+    match renderer {
+        GpuRenderer::TwoD => "Off (2D)",
+        GpuRenderer::Virgl => "OpenGL (virgl)",
+        GpuRenderer::Venus => "GPU desktop (Venus)",
+    }
+}
+
+fn gpu_hint(renderer: control_api::GpuRenderer) -> &'static str {
+    use control_api::GpuRenderer;
+    match renderer {
+        GpuRenderer::TwoD => {
+            "No 3D. The guest draws its desktop with its own processor, which works \
+             everywhere."
+        }
+        GpuRenderer::Virgl => "OpenGL through the host's virglrenderer. Linux/KVM backends only.",
+        GpuRenderer::Venus => {
+            "The guest's Vulkan, and its OpenGL and desktop through Zink, on this \
+             computer's graphics card. Either backend; needs a Vulkan driver, which \
+             Diagnostics checks."
+        }
+    }
 }

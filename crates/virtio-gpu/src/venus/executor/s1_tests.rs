@@ -829,15 +829,16 @@ fn only_linear_is_listed_only_for_scanout_formats_with_optimal_features() {
     let (_, srgb) = modifiers_of(&mut h, BGRA_SRGB, Some(4));
     assert_eq!(srgb.len(), 1);
     assert_eq!(srgb[0].2 & 0x6, 0, "no STORAGE_IMAGE(_ATOMIC)");
-    // Not a scanout format: none. The 10-bit pair are.
-    for format in [RGBA8, 43, 58, 64] {
+    // Not a scanout format: none. The 10-bit pair are, and (stage S5) the
+    // 64-bit and 16-bit formats a swapchain can be made of.
+    for format in [RGBA8, 43, 58, 64, 97, 91, 4, 5, 8] {
         assert_eq!(
             modifiers_of(&mut h, format, Some(4)).0,
             1,
             "format {format}"
         );
     }
-    for format in [100, 126, 97] {
+    for format in [100, 126, 23, 109] {
         assert_eq!(
             modifiers_of(&mut h, format, Some(4)),
             (0, Vec::new()),

@@ -26,7 +26,7 @@ sources by a script in this repository.
 | Guests | Debian, Ubuntu Server, Ubuntu Desktop, Fedora Workstation — installed unattended from verified media |
 | Hosts | Linux with `/dev/kvm`; Windows with the Windows Hypervisor Platform, natively (not inside WSL) |
 | Boot | UEFI with a persistent variable store, or a direct Linux kernel boot with no firmware |
-| Graphics | 2D scanout in a resizable window (1920×1080 is the tested target); OpenGL through VirGL on a Linux host |
+| Graphics | 2D scanout in a resizable window (1920×1080 is the tested target); a GPU desktop on either host — Vulkan, and OpenGL through Zink, on the host GPU (`[display] venus = true`, `install ubuntu --venus`); OpenGL through VirGL on a Linux host |
 | Devices | virtio-blk, -net, -gpu, -input (keyboard, pointer, gamepad), -snd over virtio-mmio or virtio-pci with MSI-X |
 | Network | a host TAP interface (Linux), or a user-mode NAT needing no administrator (both hosts) |
 | Lifecycle | pause and resume, reboot in place, suspend to a file and restore it later |
@@ -40,7 +40,8 @@ sources by a script in this repository.
 - **Not a server product.** No daemon, no API, no clustering, no live migration.
 - **Not signed.** The Windows binaries are unsigned and no checksums are
   published; SmartScreen will warn, and it is right to.
-- 3D is Linux-host only, there is no USB or PCI passthrough, and anti-cheat
+- The GPU desktop needs a host Vulkan driver and a guest set up for it (the
+  installer does that), there is no USB or PCI passthrough, and anti-cheat
   games will not run. The full list is in the
   [user guide](docs/user-guide.md#limits-in-one-place).
 

@@ -179,6 +179,8 @@ mod s1_tests;
 #[cfg(test)]
 mod s2b_tests;
 #[cfg(test)]
+mod s5_tests;
+#[cfg(test)]
 mod seqno_tests;
 #[cfg(test)]
 mod submit_tests;

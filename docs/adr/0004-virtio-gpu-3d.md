@@ -4223,3 +4223,389 @@ diagnostic run of the amendment above saw one submit in ten seconds.
 2. Host-visible allocation throughput (unchanged).
 3. Renderer-wide bounds for host Vulkan objects and transient decode memory
    (unchanged).
+
+## Amendment, 2026-09-24 — how a user turns it on: `[display] venus = true`
+
+Until now the executing Venus renderer was attached by an environment
+variable (`ENTANGLED_VENUS=vulkan`), and a GPU desktop also needed three
+changes typed into the guest over its serial console. Both are now product
+settings.
+
+### The profile key
+
+`[display] venus = true` attaches the Venus executor on the host's Vulkan
+device, on both hosts. It is a boolean beside `virgl` rather than a
+`renderer = "…"` enum, for two reasons:
+
+- **Old engines must read new profiles.** Every section denies unknown
+  fields, and the manager on Windows drives a WSL engine that may be an older
+  release. `venus` is written only when it is true, so a profile saved by
+  this build is byte-identical to before unless someone chose Venus.
+  `host_visible_mib` follows the same rule.
+- **`virgl` already exists as a boolean.** A `renderer` key would have
+  duplicated it, and one of the two would then have had to win.
+
+`control_api::GpuRenderer` (`TwoD`, `Virgl`, `Venus`) is what the run path,
+the manager and the tests use instead of the two booleans.
+`DisplaySection::gpu_renderer` and `set_gpu_renderer` convert between them.
+`virgl = true` together with `venus = true` is refused at parse time, with both
+keys named. One virtio-gpu device has one `Renderer3d`: virgl serves OpenGL
+through virglrenderer, and Venus serves Vulkan, plus OpenGL through the guest's
+Zink. On a Linux host virglrenderer can also carry Venus, but that is its
+Venus, not this one. A profile has no precedence to guess.
+
+`run_vm::gpu_plan` makes the choice before anything is loaded, so it is tested
+without a GPU:
+
+| input | renderer |
+|---|---|
+| `ENTANGLED_VENUS_CAPTURE` set | the transport capture, over everything |
+| `ENTANGLED_VENUS=vulkan` | the executor; if the profile asked for virgl or 2D, a warning names what it replaced |
+| `ENTANGLED_VENUS=` anything else | refused, naming the profile key |
+| `venus = true` | the executor |
+| `virgl = true` | virglrenderer (Linux; elsewhere refused, and the refusal now names `venus`) |
+| neither | 2D |
+
+**`ENTANGLED_VENUS` stays, as a developer override.** It puts Venus under a
+profile nobody wants to edit: an installer run, a test's generated profile, or
+an A/B comparison against the same file. Every measurement in the amendments
+above was taken that way, and runs still in progress use it. It changes what
+the machine is without the profile saying so, which is why it logs a warning
+when it overrides the profile. The capture keeps its variable for the reason
+its own stage gave: it executes nothing, and a profile should not be able to ask
+for it by accident. The attach line is now `info`, and it says who asked:
+`attaching the Venus EXECUTING renderer … source=[display] venus = true
+host_visible_mib=4096`.
+
+### `entangled doctor`
+
+The `3D` section reports what `venus = true` would find, through the same probe
+`run` uses to refuse a start (`AshVulkan::load` + `usable_devices`). It
+reports the loader, each device the guest would be shown, the version it
+would be told, and the two memory capabilities this renderer depends on:
+
+```text
+  3D              : venus    ready — `[display] venus = true`: the guest's Vulkan, and its OpenGL and
+                             desktop through Zink, on this host's GPU
+                             device NVIDIA GeForce RTX 2070 (Vulkan 1.3.312 to the guest)
+                               VK_EXT_external_memory_host   yes (pages imported at 4096-byte alignment)
+                               VK_KHR_external_memory_win32  yes (shared scanout: GNOME composites on
+                                                             the GPU)
+                    virgl    Linux-only — `[display] virgl = true` needs
+                             virglrenderer, which speaks EGL; on this host use
+                             venus, or the WSL (KVM) backend for virgl
+```
+
+That is this machine's Windows output. A host that cannot serve Venus gets
+`venus    unavailable —` followed by the probe's own sentence. A device hidden
+for lacking `VK_EXT_external_memory_host` is named with that reason. The line
+does not use `MISSING`, because 3D is optional and the manager's diagnostics
+panel paints `MISSING` as a fault. On Linux the Venus lines follow the
+virglrenderer lines. In place of the Win32 line they say that shared scanout
+memory does not exist there yet (stage S1: no `OPAQUE_FD` export), so GNOME's
+scanout stays in dumb buffers.
+
+### The guest, configured by its installer
+
+`entangled install ubuntu --venus` (with `--auto` and the Desktop ISO, or with
+an `--autoinstall` file) adds four items to the head of the autoinstall's
+`late-commands`. They run in the installer against `/target`, so the first boot
+is already the finished machine and nothing is typed afterwards:
+
+```yaml
+    - >-
+      printf '%s\n'
+      '<!-- Entangled GPU desktop: every GL client on zink, over Venus (ADR-0004) -->'
+      '<driconf>'
+      '  <device driver="loader" kernel_driver="virtio_gpu">'
+      '    <application name="every GL client on zink">'
+      '      <option name="dri_driver" value="zink" />'
+      '    </application>'
+      '  </device>'
+      '</driconf>'
+      > /target/etc/drirc
+    - >-
+      printf '%s\n'
+      '# Entangled GPU desktop: no idle blank (ADR-0004)'
+      '[org.gnome.desktop.session]'
+      'idle-delay=uint32 0'
+      > /target/usr/share/glib-2.0/schemas/90_entangled-venus.gschema.override
+    - curtin in-target -- glib-compile-schemas /usr/share/glib-2.0/schemas
+    - curtin in-target -- usermod -aG render entangled
+```
+
+- **The drirc** is the one the GNOME measurement settled on. It has no
+  `executable=`, so every GL client on a virtio-gpu device goes to Zink, not
+  only gnome-shell.
+- **No idle blank, as a GSettings vendor override, not a dconf database.**
+  Ubuntu ships no dconf profile for users (the guest has only `ibus`'s), so a
+  `local` database would be read by nothing unless a profile were written as
+  well. An override in the schema directory is read by every GSettings client,
+  sorts after Ubuntu's `10_` files, and survives package upgrades, which
+  recompile that directory. A user's own `gsettings set` still wins, as it
+  should.
+- **`render`**: the user comes from the document's `identity.username`, and
+  the command is refused unless that is a plain Unix name. A graphical login
+  reaches the render node through logind's ACL anyway. This is for serial and
+  SSH logins, where every Vulkan probe of this project runs. The user exists
+  by then. The existing guest's installer log shows subiquity's postinstall
+  creating `entangled` at 11:04:52, and `subiquity/Late/run_user_supplied`
+  starting at 11:05:00.
+
+The edit is to the text, not a YAML round trip: the document may be the
+user's, and a parser would drop its comments. `seed::with_venus_guest` finds the
+block-style `late-commands:` key and its items' indentation (indentless lists
+included), inserts the items at that indentation, and refuses a document that
+has no such list, or has only a flow-style one, rather than guess. `--venus` is
+refused without a seed (an interactive install) and with the built-in
+*server* profile. A server has no GNOME, and has no `glib-compile-schemas` for
+the override, so the install would fail twenty minutes in. It is also refused
+for `install debian` and `install fedora`, whose automation has nothing written
+for it yet.
+
+`--auto` now chooses its built-in profile from the ISO's file name:
+`assets/autoinstall/ubuntu-desktop.yaml` (`ubuntu-desktop-minimal`) for a
+Desktop ISO and the server profile otherwise. Both are compiled in, because an
+installed copy has no `assets/` directory to pass to `--autoinstall`. The
+installed profile gets `venus = true` and at least 4096 MiB, the size the GNOME
+measurements were taken at (Zink sizes its mapped-bytes limit from guest RAM).
+The installer VM itself always runs in 2D. It needs no host Vulkan to install
+onto a disk, and the disk is portable anyway. A host that cannot serve Venus
+therefore gets a warning at install time, not a refusal.
+
+The manager's Edit dialog replaces the "Accelerate 3D graphics" checkbox with a
+three-way *3D* choice: Off (2D), OpenGL (virgl), GPU desktop (Venus).
+`Backend::gpu_block` greys out virgl on a WHP engine and never Venus. The
+choice writes exactly one switch, and switching back to 2D leaves no `venus` key
+behind.
+
+### Measured
+
+WHP, RTX 2070, a copy of `venus-ubuntu-net.toml` that adds only
+`venus = true`. `ENTANGLED_VENUS` was not set. Two boots:
+
+- The run logged `attaching the Venus EXECUTING renderer … source=[display]
+  venus = true host_visible_mib=4096`. The device scanned out a renderer blob
+  (`the guest composites on the GPU resource=9 width=1920 height=1080`).
+  `gnome-shell` (pid 1702, the `entangled` session) maps `libvulkan_virtio`
+  five times, and a GL context made as root reads `zink Vulkan
+  1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070) (MESA_VENUS))`.
+- The four late-commands, run against a scratch `/target` in that guest:
+  `glib-compile-schemas --strict` accepted the override against the guest's
+  real schemas, `gsettings` read `uint32 0` from the result, and the drirc
+  parsed to the same elements as `/etc/drirc`, the file GNOME was running on.
+- This guest's own user database says `idle-delay uint32 60`, left there by
+  the measurements above. A user's value outranks a vendor default, so the
+  first boot blanked at +66 s. That is exactly what the override cannot
+  prevent, and why the troubleshooting page names `gsettings set`.
+
+No `install ubuntu --venus` has run end to end: this machine has no Desktop
+ISO. The seed is covered by the unit tests, which pin the four items byte for
+byte, check their folding, and check their placement in both built-in profiles
+and in user documents. PyYAML read the generated document back as seven
+late-commands in that order.
+
+## Amendment, 2026-09-24 — GNOME on the GPU, S5: clients present through dma-buf
+
+Until this stage every Vulkan client in the guest, and every GL client (Zink
+presents through venus's WSI via kopper), used venus's **software WSI**. It
+rendered on the GPU, copied each frame into host-visible memory and sent it
+to Mutter as `wl_shm`, and Mutter uploaded it again. That was the fuel of the
+blanked-compositor runaway of the two amendments above. S5 puts clients on
+venus's **native dma-buf WSI**: swapchain images are S1's canonical LINEAR
+images in exported device-local memory, and Mutter imports them through Zink.
+
+### The switch (`policy::GuestWsi`, `policy::shape_identity`)
+
+Mesa 26.0.8 chooses the path in `vn_wsi_init` (`vn_wsi.c:134-139`): the
+software WSI when the renderer lists no `VK_EXT_external_memory_dma_buf`, or
+when the renderer's `driverID` is NVIDIA's and its `driverVersion` is below
+590.48.1. The RTX 2070's driver is 580.88, below the gate on its own. So the
+cap stage 5c put in was not the only thing holding the WSI back: the host's
+number was. `driverVersion` is read for this gate alone (`vn_wsi.c:138`), and
+the guest shows applications its own `driverVersion` (26.0.8) anyway. The
+gate is venus's trust in the NVIDIA *Linux* driver's dma-buf handling. The
+dma-bufs a guest of this renderer shares are S1's emulation, whatever the host
+driver, so the host's version says nothing about them.
+
+`GuestWsi::for_device(driver_id, memory_export)` names the path, and every
+decision follows from it:
+
+| path | when | NVIDIA `driverVersion` shown | dma-buf pair | foreign queues, LINEAR modifiers |
+|---|---|---|---|---|
+| `DmaBuf` | NVIDIA, device-local memory exportable (Windows, `OPAQUE_WIN32`) | at least 590.48.1 (580.88 → `0x938c0040`) | yes | yes |
+| `Software` | NVIDIA, no export (a Linux host) | below 590.48.1, as before | yes | no |
+| `Unshared` | any other driver | the host's | no | no |
+
+Another vendor stays `Unshared` because the native path there has never been
+measured: its exports go through the same emulation, but whether that driver
+exports undedicated optimal images is unknown. The vendor-id swap (`0x10de` →
+`0x1af4`) is unchanged, so `vn_wsi.c:155-174` still does not hide the DRM
+identity, and the WSI's `same_gpu` check (`wsi_common_wayland.c:1567-1592`)
+passes against Mutter's main device, the render node. The context-creation
+log now says `wsi="dma-buf" driver_version=0x938c0040`.
+
+### What the native path sends, and what each becomes
+
+Read from `wsi_common.c`, `wsi_common_drm.c`, `wsi_common_wayland.c`, `vn_wsi.c`,
+`vn_command_buffer.c` and `zink_resource.c` (Mesa 26.0.8), and from Mutter
+50.1's `meta-wayland-dma-buf.c`. The native path is taken only when the
+compositor lists a modifier for the swapchain's format and the device offers
+it (`wsi_drm_image_needs_buffer_blit`, `wsi_common_drm.c:893-904`: with
+`supports_scanout = false`, `vn_wsi.c:189`, no modifiers means the prime blit
+path). Mutter lists what Zink's `eglQueryDmaBufModifiersEXT` answers
+(`add_format`, `meta-wayland-dma-buf.c:1714-1765`), which is this renderer's
+LINEAR, and adds `DRM_FORMAT_MOD_INVALID` to each format, which the WSI skips
+(`wsi_wl_format_add_modifier`).
+
+| client (vkcube, kopper) | here |
+|---|---|
+| implicit-sync probe: 4096 bytes of type 0, export `DMA_BUF`, blob, `DMA_BUF_IOCTL_EXPORT/IMPORT_SYNC_FILE` (`wsi_common_drm.c:95-176`) | a handle blob of type 0 (flags 0 on the RTX 2070). It must succeed: if it fails, the WSI asks the driver for implicit sync instead, which venus ignores, and no present carries a fence |
+| `vkGetPhysicalDeviceImageFormatProperties2`, DRM tiling, LINEAR, flags `ALIAS` (and `MUTABLE`, `EXTENDED_USAGE` and a list for a mutable swapchain) (`wsi_common_drm.c:633-676`) | the canonical image's limits. **Was `VK_ERROR_FORMAT_NOT_SUPPORTED`**: fixed below |
+| `vkCreateImage`, `[LINEAR]`, `DMA_BUF` external, `ALIAS` | the canonical image, `ALIAS` and `EXTENDED_USAGE` set aside. **Was fatal** |
+| `vkAllocateMemory` dedicated, export `DMA_BUF`, device-local; the blob | exportable memory; a handle blob (S1) |
+| `vkGetImageDrmFormatModifierPropertiesEXT`, `vkGetImageSubresourceLayout(MEMORY_PLANE_0)` | LINEAR; the synthesized plane (S1) |
+| `vkGetMemoryFdKHR`; `zwp_linux_buffer_params_v1.add(fd, 0, 0, pitch, 0, 0)`, `create_immed` | guest-side only |
+| present: the render pass's `PRESENT_SRC_KHR` rewritten to `GENERAL` and a release to `FOREIGN` (`vn_command_buffer.c:202-270`, `vn_image.h:19`) | a judged foreign barrier (S1) |
+| present: a `SYNC_FD` semaphore signalled by the submit, `vkGetSemaphoreFdKHR`, imported into the dma-buf | a ring fence on the queue that signalled it, retired by the queue's fence thread after the work (5b.3, S1, and `5d842ee`'s WHP waker) |
+| acquire: `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` of its own image, imported as the acquire semaphore (`vn_wsi.c:892-960`) | guest-side, then 5b.3's semaphore import |
+
+| compositor (gnome-shell on Zink) | here |
+|---|---|
+| `CTX_ATTACH_RESOURCE` of the client's blob, the roundtrip, `vkGetMemoryResourcePropertiesMESA` | attach (5c); the export's type bit (S1) |
+| `vkCreateImage` explicit LINEAR at the client's pitch, `initialLayout = PREINITIALIZED` (`zink_resource.c:1650-1653`) | the same canonical image |
+| `vkAllocateMemory` + `VkImportMemoryResourceInfoMESA` | a Win32 import of the same payload (S1) |
+| acquire from `FOREIGN` out of `PREINITIALIZED`; sampling; release to `FOREIGN` at batch end (`zink_batch.c:900-934`) | passed through. On the RTX 2070 the acquire out of `PREINITIALIZED` of an image another device wrote in `GENERAL` keeps the pixels (measured, below) |
+
+**Sync.** Venus exposes no exportable timeline semaphores
+(`external_timeline_semaphore_handles = 0`, `vn_physical_device.c:1144-1152`),
+so `wsi_device_supports_explicit_sync` is false and the client never uses
+Mutter's `wp_linux_drm_syncobj_manager_v1`. It syncs implicitly: the probe
+succeeds, so `chain->dma_buf_semaphore` exists and every present puts the
+sync file of its submit on the dma-buf. Mutter waits for that fence
+(`meta_wayland_dma_buf_create_source`, `:1100-1136`, `DMA_BUF_SYNC_READ`)
+before it applies the commit. The fence is a ring fence, and since `5d842ee`
+none is answered before the GPU work it follows, on either host. Venus also
+waits for it on the CPU before handing the fd over (`vn_wsi_sync_wait`,
+`vn_queue.c:2461`). So a frame is complete on the host GPU before gnome-shell
+is even woken to sample it. The other direction is Zink's own implicit sync.
+Before the first use of an imported dma-buf after acquiring it from
+`FOREIGN`, Zink waits for the dma-buf's sync file
+(`zink_synchronization.cpp:464-472`). After each submit it puts its own
+signal semaphore's sync file on every exportable dma-buf the batch used
+(`zink_batch.c:829-839`). The client's next acquire exports that fence with
+its own (`vn_wsi.c:892-910`). The same ring fences carry it, so a client does
+not overwrite an image gnome-shell is still reading. A compositor that is not
+on Zink would have to attach such a fence itself.
+
+### The two fixes
+
+- **`ALIAS` and `EXTENDED_USAGE` on a modifier image** (`modifier::IGNORED_FLAGS`).
+  Mesa's WSI creates every swapchain image with `ALIAS` (`wsi_common.c:671`),
+  and every mutable one also with `MUTABLE | EXTENDED_USAGE`
+  (`:706-707`). Venus strips `ALIAS` only for ANV (`vn_physical_device.c:2831-2841`).
+  `CanonicalFormat::admits` refused both. The WSI's format query then
+  answered unsupported, the WSI's modifier filter came back empty, and
+  `wsi_configure_native_image` fails the swapchain with
+  `VK_ERROR_OUT_OF_HOST_MEMORY` (`wsi_common_drm.c:706-716`). A create would have been fatal.
+  Both are now accepted and never forwarded. Every canonical image of one
+  format and extent has byte-identical host create infos for `OPAQUE_WIN32`
+  memory, so two of them on one memory alias by the same guarantee an
+  import across devices already relies on. The guest's usage is still held
+  to the superset of its own format, which the host accepted without
+  `EXTENDED_USAGE`.
+- **LINEAR for every format a swapchain can be made of** (`modifier::SCANOUT_FORMATS`,
+  now with bytes per pixel; the synthesized pitch is `W × bpp` rounded to 256).
+  Under GNOME on the GPU the guest's first surface format is
+  `R16G16B16A16_SFLOAT` (Mutter's order, measured with `vulkaninfo`), and
+  vkcube takes the first format it knows (`cube.c:4608-4625`). S1 offered
+  LINEAR for six 32-bit formats only, so vkcube went down the **prime path**:
+  an optimal image blitted into a linear `DMA_BUF` buffer. That buffer lives in
+  our pages here, which are not device-local, and the blit buffer's
+  `wsi_select_device_memory_type` finds no device-local type and reaches
+  `UNREACHABLE("No memory type found")` (`wsi_common.c:1922-1959`). In a
+  release build that is undefined behaviour: **vkcube spun forever at 100 %
+  CPU** in `libvulkan_virtio.so` after its implicit-sync probe, never sending
+  another command (gdb, `wchan` 0, in the guest). S5 offers LINEAR also for
+  `R16G16B16A16_SFLOAT`, `R16G16B16A16_UNORM` and the seven 16-bit packed
+  formats. Those are all the single-plane formats of the WSI's DRM table
+  (`wsi_common_wayland.c:406-619`) apart from the 24-bit pair, which no host
+  here renders to. The RTX 2070 makes a canonical image of all 15
+  (`a_frame_presented_through_dma_buf_wsi_is_read_exactly_by_the_compositor`
+  prints the list). A handle-blob scanout still reads only the two BGRA
+  formats. The prime path itself stays a trap: a format the host cannot make
+  canonical, on another host, would still send a client there. Making it work
+  would need a `DMA_BUF` buffer offered device-local memory, which is a
+  resource that can be both our pages and a Win32 export. That is not built.
+
+Tests: `s5_tests` (fake host): the WSI's query and image for vkcube's and
+kopper's swapchains, and their host create infos equal to Zink's; ignored
+flags against every other flag; the implicit-sync probe; a present, the
+compositor's import and acquire out of `PREINITIALIZED`, and the next acquire;
+the identity. `policy` tests: every path's identity and extensions, and
+`expose` choosing dma-buf exactly where memory can be exported. Real GPU
+(RTX 2070, 580.88, Windows):
+`host_vulkan::pipeline_tests::a_frame_presented_through_dma_buf_wsi_is_read_exactly_by_the_compositor`.
+vkcube is the exporter: the probe on type 0, an `ALIAS` swapchain image,
+vk-smoke's triangle, the release to `FOREIGN` in `GENERAL`. The compositor
+imports in `PREINITIALIZED`, acquires and copies, and reads `256x256 exact,
+6 probes ok`, `fnv1a=0x2678f2a0e39fba1b`. The first fix fails the create
+without it. The second fails the format assertion without it.
+
+### Measured in the guest
+
+Ubuntu 26.04, Mesa 26.0.8, GNOME composited through Zink, WHP, RTX 2070,
+`ENTANGLED_VENUS=vulkan`, every GL client on Zink by driconf. "Before" is the
+build of `9fcd3aa` on the same image, the same day and the same script.
+
+| | before (software WSI) | S5 (dma-buf WSI) |
+|---|---|---|
+| `WAYLAND_DEBUG=client vkcube --c 300` | 6 `wl_shm` pools, 0 dma-buf params | **6 `zwp_linux_buffer_params_v1`**, `add(fd, 0, 0, 4096, 0, 0)` (LINEAR), `create_immed(500, 500, XBGR16161616F)`, 0 `wl_shm`, 296 releases, `prime_blit=0` |
+| `WAYLAND_DEBUG=client glmark2-wayland -b build` (Zink) | 5 `wl_shm` pools | **4 dma-buf params**, `add(fd, 0, 0, 3328, 0, 0)`, `create_immed(800, 600, ARGB8888)`; one `wl_shm` pool (the cursor) |
+| glmark2 `build`, alone, 6 s | 124 FPS | **185 and 149 FPS** (two runs; 131 in the run whose vkcube was spinning, below) |
+| glmark2 `jellyfish` FIFO beside vkcube and gnome-calculator | 27–30 FPS | 28–31 FPS |
+| desktop composite, same three clients | 44–50 fps | 44–47 fps |
+| guest `virtio-gpu-host-visible-mm` used, same three | 184 MiB | 154 MiB |
+| vk-smoke | 9/9 | 9/9 |
+
+Screenshots were copied on the host while the clients ran. vkcube alone
+shows the textured cube, and the painting and woken desktops show glmark2's
+jellyfish, vkcube and gnome-calculator. Presentation through dma-buf is not
+what makes a frame rate: with three clients the desktop composites at the
+same ~45 fps either way, and FIFO paces jellyfish to it. What goes is the
+copying. glmark2 alone gains 20–50 % in `build`, and the guest's host-visible
+use drops by 30 MiB. One screenshot of vkcube shows the window's two triangles
+from two different frames, and the other shows faint content of the window
+behind it. **The build of `9fcd3aa` shows the same split** in its own vkcube
+screenshot, so the tear is not the dma-buf path. A likely cause, not
+verified: the kernel does not fence `RESOURCE_FLUSH` of a HOST3D blob
+(`virtgpu_plane.c:365-375` fences only dumb and imported framebuffers).
+gnome-shell may then render into a buffer before this device's scanout
+readback has read it.
+
+**The idle-blank test, twice** (`idle-delay 60` as the session user;
+glmark2 jellyfish, vkcube and gnome-calculator running; woken with
+`org.gnome.ScreenSaver.SetActive false` and `loginctl unlock-sessions`). The
+first run was blanked 4 min 08 s, with the first build, whose vkcube was stuck
+in the prime path. The second was blanked 3 min 31 s, with the fixed build and
+vkcube presenting. **The session survived both times.** All three clients and
+gnome-shell were alive about 1, 2 and 3 minutes into the blank and after the
+wake, gnome-shell's journal had no fatal line, and the desktop
+painted again (`s5-woken.png`). Renderer-wide host-visible memory stayed at
+**71 MiB** for the whole blank. The largest context's peak was **41.6 MiB**,
+reached at session start, before any client ran, and never exceeded. That is
+gnome-shell's whole host-visible share, against the 1 GiB it reached in about
+8 s in every earlier run. The guest allocator read 154–158 MiB throughout.
+There are no uploads to hold: gnome-shell imports each client's buffer once
+and samples it. After the wake glmark2 ran at 23–25 FPS against 30–31 before
+the blank, with the desktop at 41–43 fps against 44–47. That was not
+investigated.
+
+### Owed
+
+- The prime path (above): a `DMA_BUF` buffer that can be device-local.
+- The host window's copy of a scanout can tear (above, pre-existing).
+- Explicit sync (`wp_linux_drm_syncobj`) needs venus timeline-semaphore
+  export, which venus does not offer.
+- A Linux host keeps the software WSI (`GuestWsi::Software`), as it has no
+  device-local export.

@@ -51,7 +51,7 @@ What it can do today:
 |---|---|
 | Guests | Debian, Ubuntu Server, Ubuntu Desktop, Fedora Workstation — installed by the tool itself, unattended, from media it verified |
 | Boot | UEFI firmware with a persistent variable store, or a direct Linux kernel boot with no firmware at all |
-| Graphics | 2D scanout in a resizable window; 1920×1080 is the size the project targets and tests. 3D (OpenGL through VirGL) on a Linux host |
+| Graphics | 2D scanout in a resizable window; 1920×1080 is the size the project targets and tests. A GPU desktop on either host — the guest's Vulkan, and its OpenGL through Zink, on the host GPU ([below](#a-gpu-accelerated-desktop-venus)). OpenGL through VirGL on a Linux host |
 | Devices | virtio-blk, virtio-net, virtio-gpu, virtio-input (keyboard, absolute pointer and an Xbox-shaped gamepad), virtio-snd (playback), over virtio-mmio or virtio-pci with MSI-X |
 | Network | a host TAP interface (Linux), or a user-mode NAT that needs no administrator and no host setup (both hosts) |
 | Lifecycle | pause and resume, reboot in place, suspend to a file and restore it in a new process |
@@ -91,7 +91,10 @@ What it can do today:
 - For the window: a Wayland or X11 session, and a GPU with a working Vulkan or
   GL driver (the window is rendered with wgpu; llvmpipe works but is slow).
 - Optional, feature by feature:
-  - **3D acceleration** — `libvirglrenderer` and a GL driver. It is opened at
+  - **The GPU desktop** (`[display] venus = true`) — a Vulkan driver with
+    `VK_EXT_external_memory_host`; the loader is opened at runtime, never
+    linked, and `entangled doctor` says whether a device qualifies.
+  - **VirGL 3D** — `libvirglrenderer` and a GL driver. It is opened at
     runtime with `dlopen`, never linked, so its absence costs you 3D and
     nothing else ([ADR-0004](adr/0004-virtio-gpu-3d.md)).
   - **Sound** — ALSA (`libasound`), also opened at runtime.
@@ -113,6 +116,10 @@ What it can do today:
 - Virtualization enabled in the BIOS/UEFI setup, as above.
 - No administrator rights are needed to *run* VMs once the feature is on, and
   the user-mode network backend needs none either.
+- Optional: for **the GPU desktop** (`[display] venus = true`), a GPU whose
+  Vulkan driver has `VK_EXT_external_memory_host` and
+  `VK_KHR_external_memory_win32` — current NVIDIA and AMD drivers do;
+  `entangled doctor` checks.
 
 ## Getting the software
 
@@ -371,7 +378,88 @@ entangled install ubuntu --iso "$iso" --disk ~/entangled-vms/desktop.raw \
 
 An explicit `--memory-mib` carries through to the installed machine's profile,
 which matters here: a desktop sized at 4096 for the install must not boot into
-the 2048 MiB default afterwards.
+the 2048 MiB default afterwards. `--auto` picks the built-in *desktop* answer
+file for an ISO whose name says `desktop` (Canonical's names do), and the
+server one otherwise.
+
+### A GPU-accelerated desktop (Venus)
+
+Add `--venus` to the desktop install and the machine comes out with its desktop
+on the host's graphics card — GNOME Shell and every OpenGL program through
+Mesa's Zink, Vulkan programs directly, all executed by Entangled's own Venus
+renderer on the host GPU:
+
+```bash
+entangled install ubuntu --iso "$iso" --disk ~/entangled-vms/desktop.raw \
+    --size 40G --auto --venus --headless
+entangled run ~/entangled-vms/desktop.toml
+```
+
+What `--venus` does, all of it inside the installer so the first boot is the
+finished machine:
+
+- the profile gets `[display] venus = true`, and at least 4096 MiB;
+- the guest gets `/etc/drirc` sending every GL client on a virtio-gpu device to
+  Zink (without it Mesa picks the virgl driver, which this renderer does not
+  serve, and GNOME falls back to software);
+- GNOME's idle blank is turned off, by a GSettings default
+  (`/usr/share/glib-2.0/schemas/90_entangled-venus.gschema.override`,
+  `idle-delay 0`). **Keep it off.** A blanked GNOME on Zink keeps every
+  client's upload of the screen it no longer shows, and within seconds reaches
+  the memory share the renderer allows one guest context; the renderer refuses
+  it, and that ends the session. This goes away when client presentation moves
+  to dma-buf ([ADR-0004](adr/0004-virtio-gpu-3d.md));
+- the desktop user joins the `render` group, so the GPU also works from a serial
+  or SSH login (a graphical login gets it anyway).
+
+`--venus` needs `--auto` with the Desktop ISO, or an `--autoinstall` file with a
+`late-commands:` list for it to extend; it refuses a server ISO, which has no
+GNOME to put on the GPU.
+
+**The host needs a Vulkan device** with `VK_EXT_external_memory_host`, and on
+Windows `VK_KHR_external_memory_win32` for GNOME itself to composite on the GPU.
+`entangled doctor` says, under `3D`:
+
+```text
+  3D              : venus    ready — `[display] venus = true`: the guest's Vulkan, and its OpenGL and
+                             desktop through Zink, on this host's GPU
+                             device NVIDIA GeForce RTX 2070 (Vulkan 1.3.312 to the guest)
+                               VK_EXT_external_memory_host   yes (pages imported at 4096-byte alignment)
+                               VK_KHR_external_memory_win32  yes (shared scanout: GNOME composites on
+                                                             the GPU)
+```
+
+A host without one refuses to start the machine rather than quietly booting it
+in software. The GPU desktop is measured on Windows (WHP, an RTX 2070). On a
+Linux host the renderer serves Vulkan and GL programs the same way, but GNOME's
+own scanout buffers stay plain memory (there is no shared-memory export there
+yet), and under WSL the only Vulkan device is lavapipe, which runs on the CPU.
+
+**An existing machine** needs the same two halves by hand: `venus = true` under
+`[display]` (or *3D → GPU desktop (Venus)* in the manager's Edit dialog), and
+the guest set up as above — as root, write the `/etc/drirc` below, then
+
+```bash
+printf '%s\n' '[org.gnome.desktop.session]' 'idle-delay=uint32 0' \
+  > /usr/share/glib-2.0/schemas/90_entangled-venus.gschema.override
+glib-compile-schemas /usr/share/glib-2.0/schemas
+usermod -aG render "$USER_NAME"
+```
+
+```xml
+<driconf>
+  <device driver="loader" kernel_driver="virtio_gpu">
+    <application name="every GL client on zink">
+      <option name="dri_driver" value="zink" />
+    </application>
+  </device>
+</driconf>
+```
+
+`venus` and `virgl` are two different renderers for the one GPU device, so a
+profile may set one of them, not both. A machine running on Venus cannot be
+suspended while the guest holds GPU objects (which, with a desktop, is always):
+`save` says so and the machine keeps running.
 
 ## Quickstart: Fedora Workstation
 
@@ -695,8 +783,11 @@ Things worth knowing about the shape:
 - **`[network]`** picks `backend = "tap"` (Linux only) or `"usernet"`; omit the
   section for a machine with no network card.
 - **`[display]`** sets the initial scanout size (`width`, `height`) and window
-  `scale`; the guest can change modes within it. `virgl = true` asks for 3D
-  (Linux hosts only), and `refresh_hz` sets the refresh rate the guest is told
+  `scale`; the guest can change modes within it. `venus = true` asks for the
+  GPU desktop — Vulkan, and OpenGL through Zink, on the host's Vulkan device,
+  either host (see [A GPU-accelerated desktop](#a-gpu-accelerated-desktop-venus));
+  `virgl = true` asks for OpenGL through virglrenderer (Linux hosts only); one
+  or the other, not both. `refresh_hz` sets the refresh rate the guest is told
   about, which is the ceiling its compositor paces itself to.
 - **`[sound]`** is off unless you add it: `enabled = true` and a `backend` of
   `"auto"` (whatever the host has), `"null"`, `"alsa"` or `"wasapi"`. `auto`
@@ -948,10 +1039,12 @@ configuration:
 
 1. **No Windows guests.** Untested and unsupported; Linux guests are what CI
    boots.
-2. **3D is Linux-host only.** VirGL runs on `libvirglrenderer`, which is opened
-   at runtime on Linux. A Windows host gets 2D. Vulkan-through-Venus plumbing
-   exists in the protocol and the device, but **nothing on any host decodes a
-   Vulkan command stream yet**, so Venus renders nothing.
+2. **The GPU desktop needs the guest's cooperation and a Vulkan host.**
+   `[display] venus = true` runs the guest's Vulkan, and its OpenGL through
+   Zink, on the host GPU, on either host — but the guest must send its GL to
+   Zink and keep GNOME from blanking the screen (`install ubuntu --venus` does
+   both), and only Windows hosts let GNOME itself composite on the GPU so far.
+   VirGL (`virgl = true`, OpenGL through `libvirglrenderer`) is Linux-host only.
 3. **No zero-copy scanout.** Every presented frame is read back from the
    renderer into host memory and uploaded to the window's texture. On the
    development host that readback is 13 ms of a 20 ms frame — the current cap on
@@ -1030,6 +1123,8 @@ configuration:
 | `entangled fetch firmware`, `bash guest/firmware/build-cloudhv.sh`, `scripts/fetch-ubuntu-iso.sh`, `scripts/fetch-fedora-iso.sh` | the commands' own documented invocations; the fetch was run end to end against the published layout on 2026-09-09, and the firmware and the Ubuntu ISO were both present and used on the machine this guide was written on |
 | `entangled fetch debian …`, `install debian …` | from the CLI's help output and the Debian install path's documentation; not re-run for this guide |
 | `entangled install ubuntu --iso <desktop iso> …` | the server command with the flags the CLI documents; the Desktop variant is what `tests/boot/tests/desktop_gnome.rs` boots, but this exact line was not re-run for the guide |
+| `entangled install ubuntu --iso <desktop iso> … --auto --venus --headless` | **not run end to end**: there was no Desktop ISO on the machine this was written on. The four late-commands it adds are pinned byte for byte by `seed::tests::venus_late_commands_are_exact_and_first`, and on 2026-09-24 they were run in the existing Venus guest against a scratch `/target`. `glib-compile-schemas --strict` accepted the override against the guest's real schemas, `gsettings` read `uint32 0` from it, and the drirc parsed to the same elements as the one GNOME was running on |
+| `[display] venus = true`, the `3D` lines of `entangled doctor` | the profile key: a copy of the Venus guest's profile with only `venus = true` added, run on Windows/WHP without `ENTANGLED_VENUS`. It logged `attaching the Venus EXECUTING renderer … source=[display] venus = true`, and `gnome-shell` mapped `libvulkan_virtio`. The doctor output is this machine's (RTX 2070), pasted as printed |
 | `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All` | the standard Windows spelling of the feature this project requires; the feature is enabled on the development host |
 | the clock-drift numbers | `cargo test -p boot-tests --test soak -- --ignored --nocapture` on the Linux host and `cargo test -p vmm-core --test whp_clock -- --nocapture` on the Windows one, plus three 900 s control runs pinning the guest to `tsc`, `kvm-clock` and `acpi_pm`, and three measurements of the WSL host's own clock against Windows QPC and against its wall clock; the numbers are those runs' own output, and both tests pass |
 | the manager's views | rendered while writing this guide with `cargo run -p entangled-manager -- --mock --screenshot <png> --screenshot-view main\|wizard\|diagnostics`, and again for the Snapshots work with `--screenshot-view snapshots\|snapshot-delete\|snapshot-discard\|editor-network`; described from the pictures and the source |

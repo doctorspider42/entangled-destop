@@ -1455,12 +1455,17 @@ fn the_host_gpu_is_shown_what_zink_needs() {
         ] {
             assert!(has(name), "{name}");
         }
-        assert!(p.driver_version < crate::venus::executor::policy::NVIDIA_DMA_BUF_WSI_DRIVER);
         // Stage S1: where device-local memory can leave the device (an NT
-        // handle, so Windows), GNOME's two as well.
+        // handle, so Windows), GNOME's two as well; and stage S5: there the
+        // driver is shown at venus's dma-buf WSI gate or past it, and
+        // elsewhere below it.
+        let gate = crate::venus::executor::policy::NVIDIA_DMA_BUF_WSI_DRIVER;
         if cfg!(windows) {
             assert!(has("VK_EXT_queue_family_foreign"));
             assert!(has("VK_EXT_image_drm_format_modifier"));
+            assert!(p.driver_version >= gate);
+        } else {
+            assert!(p.driver_version < gate);
         }
     }
     assert!(!has("VK_KHR_swapchain") && !has("VK_EXT_external_memory_host"));
@@ -2300,6 +2305,315 @@ fn a_linear_modifier_image_rendered_by_one_context_is_read_back_exactly_by_anoth
         instance: VkInstance(INSTANCE),
     }))
     .unwrap();
+    assert_eq!(h.renderer.factory().host_objects(), 0);
+    assert!(!h.fatal());
+}
+
+// --------------------------------------------------------------- stage S5
+
+/// Stage S5 on the host GPU: a frame presented through native dma-buf WSI
+/// and composited by another guest process, as Mesa 26.0.8 and Zink send
+/// it. Context 1 is vkcube: the implicit-sync probe first (4096 bytes of
+/// memory type 0 exported as `DMA_BUF`, and its blob,
+/// `wsi_drm_check_dma_buf_sync_file_import_export`), then a swapchain image
+/// as `wsi_configure_native_image` makes one — DRM tiling, `[LINEAR]`,
+/// `ALIAS`, colour attachment and nothing else — in dedicated exported
+/// memory, vk-smoke's triangle rendered into it, and venus's present-time
+/// release to `FOREIGN` in `GENERAL`. Context 2 is the compositor: attached,
+/// it imports the blob as Zink imports a dma-buf (explicit LINEAR at the
+/// plane's pitch, `PREINITIALIZED`), acquires it from `FOREIGN` out of
+/// `PREINITIALIZED` as Zink does for a fresh import, and copies it into our
+/// pages. Every pixel against the CPU reference, and vk-smoke's checksum.
+/// Skips where device-local memory cannot be exported.
+#[test]
+fn a_frame_presented_through_dma_buf_wsi_is_read_exactly_by_the_compositor() {
+    const SIZE: u32 = raster::SIZE;
+    const PROBE: u64 = 0x600;
+    const PROBE_RES: u32 = 96;
+    const IMG: u64 = 0x610;
+    const IMG_MEM: u64 = 0x611;
+    const VIEW: u64 = 0x612;
+    const RES: u32 = 97;
+    const IMPORTED: u64 = 0x620;
+    const IMPORTED_MEM: u64 = 0x621;
+    const LAYOUT_GENERAL: i32 = 1;
+    const LAYOUT_PREINITIALIZED: i32 = 8;
+    const ALIAS: u32 = 0x400;
+    const S1: &[&str] = &[
+        "VK_EXT_queue_family_foreign",
+        "VK_EXT_image_drm_format_modifier",
+    ];
+    let Some(host) = host() else { return };
+    let mut h = Harness::new(host);
+    boot(&mut h);
+    let shown = device_extension_names(&mut h);
+    if !S1.iter().all(|n| shown.iter().any(|s| s == n)) {
+        eprintln!("skipping: this host cannot export device-local memory (stage S1)");
+        return;
+    }
+    zink_device(&mut h, S1);
+    let types = memory_types(&mut h);
+
+    // LINEAR on every format a swapchain can be made of that the host makes
+    // canonical — above all R16G16B16A16_SFLOAT, the first surface format
+    // the guest's WSI lists, which without it sends vkcube down Mesa's prime
+    // path.
+    let mut offered = Vec::new();
+    for (format, _, _) in crate::venus::executor::modifier::SCANOUT_FORMATS {
+        let Command::GetPhysicalDeviceFormatProperties2(f) = h
+            .call(&Command::GetPhysicalDeviceFormatProperties2(
+                GetPhysicalDeviceFormatProperties2Args {
+                    physical_device: VkPhysicalDevice(PHYSICAL),
+                    format: *format,
+                    p_format_properties: Some(VkFormatProperties2 {
+                        p_next: vec![
+                            VkFormatProperties2Next::VkDrmFormatModifierPropertiesListEXT(
+                                VkDrmFormatModifierPropertiesListEXT {
+                                    drm_format_modifier_count: 0,
+                                    p_drm_format_modifier_properties: None,
+                                },
+                            ),
+                        ],
+                        ..Default::default()
+                    }),
+                },
+            ))
+            .unwrap()
+        else {
+            panic!()
+        };
+        let props = f.p_format_properties.unwrap();
+        let VkFormatProperties2Next::VkDrmFormatModifierPropertiesListEXT(list) = &props.p_next[0]
+        else {
+            panic!()
+        };
+        if list.drm_format_modifier_count == 1 {
+            offered.push(*format);
+        }
+    }
+    eprintln!("S5 LINEAR offered for formats {offered:?}");
+    for format in [RGBA8, BGRA8, 97] {
+        assert!(offered.contains(&format), "format {format}");
+    }
+
+    // The WSI's implicit-sync probe: without it, no present would carry a
+    // fence the compositor could wait for.
+    h.send(&allocate(
+        DEVICE,
+        PROBE,
+        4096,
+        0,
+        vec![VkMemoryAllocateInfoNext::VkExportMemoryAllocateInfo(
+            VkExportMemoryAllocateInfo {
+                handle_types: 0x200,
+            },
+        )],
+    ))
+    .unwrap();
+    h.memory_blob(CTX, PROBE_RES, PROBE, 4096)
+        .expect("the probe's blob: memory type 0 exports");
+    eprintln!(
+        "S5 probe: type 0 flags {:#x}, exported",
+        types.memory_types[0].property_flags
+    );
+    h.renderer.destroy_blob(PROBE_RES);
+    h.send(&free(DEVICE, PROBE)).unwrap();
+
+    // The swapchain image, as vkcube's swapchain makes it.
+    let mut info = linear_image(0x10, None);
+    info.flags = ALIAS;
+    info.p_next
+        .retain(|l| !matches!(l, VkImageCreateInfoNext::VkImageFormatListCreateInfo(_)));
+    let Command::CreateImage(i) = h.call(&create_image(DEVICE, IMG, info)).unwrap() else {
+        panic!()
+    };
+    assert_eq!(i.ret, VK_SUCCESS, "the canonical image, ALIAS set aside");
+    let Command::GetImageMemoryRequirements2(r) =
+        h.call(&memory_requirements(DEVICE, IMG)).unwrap()
+    else {
+        panic!()
+    };
+    let req = r.p_memory_requirements.unwrap().memory_requirements;
+    let ty = pick_type(&types, req.memory_type_bits, MEM_PROPERTY_DEVICE_LOCAL);
+    h.send(&allocate(
+        DEVICE,
+        IMG_MEM,
+        req.size,
+        ty,
+        vec![
+            VkMemoryAllocateInfoNext::VkMemoryDedicatedAllocateInfo(
+                VkMemoryDedicatedAllocateInfo {
+                    image: VkImage(IMG),
+                    buffer: VkBuffer(0),
+                },
+            ),
+            VkMemoryAllocateInfoNext::VkExportMemoryAllocateInfo(VkExportMemoryAllocateInfo {
+                handle_types: 0x200,
+            }),
+        ],
+    ))
+    .unwrap();
+    let blob = req.size.next_multiple_of(4096);
+    h.memory_blob(CTX, RES, IMG_MEM, blob)
+        .expect("a handle blob of the swapchain image");
+    h.send(&bind_image(DEVICE, IMG, IMG_MEM, 0)).unwrap();
+    let Command::GetImageSubresourceLayout(l) = h
+        .call(&Command::GetImageSubresourceLayout(
+            GetImageSubresourceLayoutArgs {
+                device: VkDevice(DEVICE),
+                image: VkImage(IMG),
+                p_subresource: Some(VkImageSubresource {
+                    aspect_mask: 0x80, // MEMORY_PLANE_0
+                    mip_level: 0,
+                    array_layer: 0,
+                }),
+                p_layout: Some(Default::default()),
+            },
+        ))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let plane = l.p_layout.unwrap();
+
+    // vkcube's frame, and venus's release at present.
+    h.send(&create_image_view(DEVICE, VIEW, IMG, RGBA8))
+        .unwrap();
+    let vertices = buffer(&mut h, 0x630, 60, USAGE_VERTEX, true);
+    vertices.write_words(&raster::vertex_data().map(f32::to_bits));
+    h.send(&create_render_pass(DEVICE, RENDER_PASS, RGBA8))
+        .unwrap();
+    h.send(&create_framebuffer(
+        DEVICE,
+        FRAMEBUFFER,
+        RENDER_PASS,
+        VIEW,
+        SIZE,
+    ))
+    .unwrap();
+    h.send(&create_shader_module(DEVICE, SHADER, &spirv(TRIANGLE_WGSL)))
+        .unwrap();
+    h.send(&create_pipeline_layout(DEVICE, PIPELINE_LAYOUT, &[]))
+        .unwrap();
+    h.send(&create_triangle_pipeline(
+        DEVICE,
+        PIPELINE,
+        SHADER,
+        PIPELINE_LAYOUT,
+        RENDER_PASS,
+        SIZE,
+    ))
+    .unwrap();
+    submit_zink(
+        &mut h,
+        &[
+            begin(CB),
+            begin_render_pass(CB, RENDER_PASS, FRAMEBUFFER, SIZE, raster::CLEAR_6),
+            bind_pipeline(CB, 0, PIPELINE),
+            bind_vertex_buffer(CB, vertices.id),
+            draw(CB, 3),
+            end_render_pass(CB),
+            image_barrier2_families(
+                CB,
+                IMG,
+                (LAYOUT_TRANSFER_SRC, LAYOUT_GENERAL),
+                (STAGE2_COLOR_OUTPUT, ACCESS2_COLOR_WRITE),
+                (STAGE2_NONE, 0),
+                (0, FOREIGN),
+            ),
+            end(CB),
+        ],
+        CB,
+        FENCE,
+    );
+
+    // The compositor.
+    h.use_context(2);
+    boot(&mut h);
+    zink_device(&mut h, S1);
+    h.renderer.ctx_attach_blob(2, RES, true);
+    let mut import = linear_image(0x1 | 0x4, Some(plane.row_pitch));
+    import.initial_layout = LAYOUT_PREINITIALIZED;
+    let Command::CreateImage(i) = h.call(&create_image(DEVICE, IMPORTED, import)).unwrap() else {
+        panic!()
+    };
+    assert_eq!(i.ret, VK_SUCCESS, "Zink's import of the dma-buf");
+    let Command::GetImageMemoryRequirements2(r) =
+        h.call(&memory_requirements(DEVICE, IMPORTED)).unwrap()
+    else {
+        panic!()
+    };
+    let req2 = r.p_memory_requirements.unwrap().memory_requirements;
+    assert_eq!(req2.size, req.size, "identical requirements");
+    h.send(&allocate(
+        DEVICE,
+        IMPORTED_MEM,
+        req2.size,
+        ty,
+        vec![
+            VkMemoryAllocateInfoNext::VkImportMemoryResourceInfoMESA(
+                VkImportMemoryResourceInfoMESA { resource_id: RES },
+            ),
+            VkMemoryAllocateInfoNext::VkMemoryDedicatedAllocateInfo(
+                VkMemoryDedicatedAllocateInfo {
+                    image: VkImage(IMPORTED),
+                    buffer: VkBuffer(0),
+                },
+            ),
+        ],
+    ))
+    .unwrap();
+    h.send(&bind_image(DEVICE, IMPORTED, IMPORTED_MEM, 0))
+        .unwrap();
+    let bytes = u64::from(SIZE * SIZE * 4);
+    let readback = buffer(&mut h, 0x640, bytes, USAGE_TRANSFER_DST, true);
+    readback.write_words(&vec![0xdead_beef; (bytes / 4) as usize]);
+    submit_zink(
+        &mut h,
+        &[
+            begin(CB),
+            image_barrier2_families(
+                CB,
+                IMPORTED,
+                (LAYOUT_PREINITIALIZED, LAYOUT_TRANSFER_SRC),
+                (STAGE2_NONE, 0),
+                (STAGE2_TRANSFER, ACCESS2_TRANSFER_READ),
+                (FOREIGN, 0),
+            ),
+            copy_image_to_buffer(CB, IMPORTED, readback.id, SIZE),
+            buffer_barrier(
+                CB,
+                readback.id,
+                (STAGE_TRANSFER, ACCESS_TRANSFER_WRITE),
+                (STAGE_HOST, ACCESS_HOST_READ),
+            ),
+            end(CB),
+        ],
+        CB,
+        FENCE,
+    );
+    let mut got = vec![0u8; bytes as usize];
+    readback.pages().read_bytes(0, &mut got).unwrap();
+    match raster::verify(&got, raster::CLEAR_6) {
+        Ok(detail) => eprintln!("S5 dma-buf WSI frame: {detail}"),
+        Err(why) => panic!("the compositor read the wrong frame: {why}"),
+    }
+    let sum = raster::checksum(&got);
+    eprintln!("S5 dma-buf WSI frame: fnv1a={sum:#018x}");
+    assert_eq!(
+        sum, 0x2678_f2a0_e39f_ba1b,
+        "vk-smoke check 6's checksum on the bare RTX 2070"
+    );
+    h.send(&Command::DestroyInstance(DestroyInstanceArgs {
+        instance: VkInstance(INSTANCE),
+    }))
+    .unwrap();
+    h.use_context(CTX);
+    h.send(&Command::DestroyInstance(DestroyInstanceArgs {
+        instance: VkInstance(INSTANCE),
+    }))
+    .unwrap();
+    h.renderer.destroy_blob(RES);
     assert_eq!(h.renderer.factory().host_objects(), 0);
     assert!(!h.fatal());
 }
