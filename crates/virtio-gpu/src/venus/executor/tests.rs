@@ -1237,3 +1237,37 @@ fn a_snapshot_is_refused_by_name_while_host_vulkan_objects_are_live() {
     let why = virtio_core::VirtioDevice::snapshot_refusal(&gpu).expect("the device refuses");
     assert!(why.starts_with("virtio-gpu: "), "{why}");
 }
+
+#[test]
+fn a_command_pool_may_name_any_family_of_the_physical_device_as_mesa_wsi_does() {
+    // `with_device` creates the device with queues in family 0 only. Mesa's
+    // WSI still makes a blit pool for every family (`wsi_swapchain_init`),
+    // and the spec allows it: the index need only be one of the physical
+    // device's families. Refusing this killed the first real `vkcube`.
+    let host = Arc::new(FakeVulkan::standard());
+    let mut h = Harness::new(Arc::clone(&host));
+    with_device(&mut h);
+    let before = host.live("command pool");
+
+    let Command::CreateCommandPool(mut pool) = create_pool(DEVICE, POOL + 1) else {
+        panic!("a pool builder")
+    };
+    if let Some(info) = pool.p_create_info.as_mut() {
+        info.queue_family_index = 1;
+    }
+    h.send(&Command::CreateCommandPool(pool))
+        .expect("a pool on a family the device has no queue in is valid");
+    assert_eq!(host.live("command pool"), before + 1);
+
+    // One past the physical device's two families is still refused, before
+    // the driver sees it.
+    let Command::CreateCommandPool(mut past) = create_pool(DEVICE, POOL + 2) else {
+        panic!("a pool builder")
+    };
+    if let Some(info) = past.p_create_info.as_mut() {
+        info.queue_family_index = 2;
+    }
+    let start = h.tail();
+    assert_eq!(h.send(&Command::CreateCommandPool(past)), Err(start));
+    assert_eq!(host.live("command pool"), before + 1);
+}

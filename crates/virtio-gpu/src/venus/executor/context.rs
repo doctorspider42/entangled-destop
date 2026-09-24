@@ -1240,8 +1240,16 @@ impl<H: HostVulkan> VulkanContext<H> {
 
     // --------------------------------------------------------- pool, image
 
-    /// `vkCreateCommandPool`: flags inside 1.3 core, a family the device has a
-    /// queue in, and `PROTECTED` only for a family with a protected queue.
+    /// `vkCreateCommandPool`: flags inside 1.3 core, a family the *physical*
+    /// device has, and `PROTECTED` only for a family the device was created
+    /// with a protected queue in.
+    ///
+    /// Not "a family the device has a queue in": the spec asks only that
+    /// `queueFamilyIndex` name one of the physical device's families
+    /// (`VUID-vkCreateCommandPool-queueFamilyIndex-01937`), and Mesa's WSI
+    /// relies on exactly that — `wsi_swapchain_init` makes a blit pool for
+    /// every family, queues or not. Requiring a queue killed the first
+    /// `vkcube` a real guest ran, on family 1 of the RTX 2070.
     fn create_command_pool(&mut self, args: &mut CreateCommandPoolArgs) -> Result<(), ExecError> {
         const NAME: &str = "vkCreateCommandPool";
         let device_id = args.device.0;
@@ -1257,14 +1265,29 @@ impl<H: HostVulkan> VulkanContext<H> {
             return Err(invalid(NAME, format!("flags {:#x}", info.flags)));
         }
         let protected = info.flags & policy::COMMAND_POOL_CREATE_PROTECTED != 0;
-        if !device.queues.iter().any(|q| {
-            q.family == info.queue_family_index
-                && (!protected || q.flags & policy::QUEUE_CREATE_PROTECTED != 0)
-        }) {
+        let families = self
+            .guest_device(NAME, device.physical)?
+            .queue_families
+            .len();
+        let family = usize::try_from(info.queue_family_index).unwrap_or(usize::MAX);
+        if family >= families {
             return Err(invalid(
                 NAME,
                 format!(
-                    "queue family {} has no such queue on this device",
+                    "queue family {} is not one of the device's {families}",
+                    info.queue_family_index
+                ),
+            ));
+        }
+        if protected
+            && !device.queues.iter().any(|q| {
+                q.family == info.queue_family_index && q.flags & policy::QUEUE_CREATE_PROTECTED != 0
+            })
+        {
+            return Err(invalid(
+                NAME,
+                format!(
+                    "a protected pool on family {} needs a protected queue there",
                     info.queue_family_index
                 ),
             ));

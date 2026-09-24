@@ -2695,3 +2695,49 @@ With a swapchain exposed, a Vulkan application in the guest can now present.
 Without dma-buf, Mesa's WSI takes its software path (`vn_wsi.c:134`): it renders
 on the GPU and copies the result into shared memory for the guest's display
 server. That is the next thing to measure.
+
+## Amendment, 2026-09-24 — vkcube on the guest's desktop, rendered by the host GPU
+
+The first real Vulkan *application* in the guest. Ubuntu 26.04 GNOME, logged
+in automatically on `seat0` under Wayland; `vkcube --wsi wayland` run as the
+session's user:
+
+```
+Selected GPU 0: Virtio-GPU Venus (NVIDIA GeForce RTX 2070), type: DiscreteGpu
+```
+
+It stayed up for the whole run (several minutes), the renderer logged no
+refusal, and the VMM's own screenshot shows the textured LunarG cube
+spinning in a window on the GNOME desktop. The path is this ADR's whole
+stack on WHP: the guest's Mesa venus driver, our transport and ring, the
+generated protocol, the executor on the RTX 2070, and our imported pages
+mapped through WHP. Because we export no dma-buf, Mesa's WSI takes its
+software path (`vn_wsi.c:134`): the GPU renders, the frame is copied into
+`wl_shm`, and the guest's own compositor puts it on the existing 2D scanout.
+
+### The bug the first run found
+
+The first attempt died at once. We refused `vkCreateCommandPool` on queue
+family 1, because the device had been created with a queue in family 0 only.
+That check was stricter than the spec: `queueFamilyIndex` need only name one of
+the *physical* device's families
+(`VUID-vkCreateCommandPool-queueFamilyIndex-01937`). Mesa's WSI relies on
+exactly that — `wsi_swapchain_init` makes a blit pool for every family,
+whether a queue exists on it or not. The check now follows the spec, and a
+protected pool still needs a protected queue on its family. The case is pinned
+by `a_command_pool_may_name_any_family_of_the_physical_device_as_mesa_wsi_does`.
+
+It is the first bug a real *application* found that none of our tests,
+the guest-side smoke test included, could have found. That is the argument
+for running real applications next, rather than growing the smoke test.
+
+### What this does not yet show
+
+- **GNOME itself is not on the GPU.** `gnome-shell` maps only `dri_gbm.so`;
+  its GL runs in software. A composited desktop on the GPU means GL on
+  Vulkan (Zink) over venus, and Zink with GBM/KMS needs dma-buf-shaped
+  exports that this renderer does not make.
+- **Every frame crosses the CPU twice**: guest WSI copy into `wl_shm`, then
+  the compositor's scanout upload on the host. It is correct, and far from
+  the zero-copy path the 2026-09-16 amendments measured.
+- **Frame rate** has not been measured.
