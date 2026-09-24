@@ -388,6 +388,11 @@ impl Consumed {
 pub trait RingSink {
     /// Take some prefix of `batch` and say how much.
     fn consume(&mut self, batch: Batch<'_>) -> Consumed;
+
+    /// The worker's stop request, handed over once before the worker starts.
+    /// A sink that may block inside [`consume`](Self::consume) keeps it and
+    /// gives up when it is raised; the default has no use for it.
+    fn attach_stop(&mut self, _stop: super::service::StopSignal) {}
 }
 
 /// What one pass over the ring did.

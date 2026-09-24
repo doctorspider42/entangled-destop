@@ -858,8 +858,22 @@ fn a_decodable_command_without_a_handler_is_refused_as_not_implemented() {
     );
     assert!(ctx.is_fatal(), "the context is done, as for any refusal");
 
-    // A command buffer command, which no stage before command buffers has:
+    // An extension's command buffer command (no extension is advertised):
     // refused, not silently recorded.
+    let mut ctx = super::VulkanContext::new(CTX, Arc::new(FakeVulkan::standard()));
+    let mut stipple = Command::CmdSetLineStippleEnableEXT(CmdSetLineStippleEnableEXTArgs {
+        command_buffer: VkCommandBuffer(0x99),
+        stippled_line_enable: 1,
+    });
+    assert_eq!(
+        ctx.execute(&mut stipple),
+        Err(super::ExecError::NotImplemented {
+            command: "vkCmdSetLineStippleEnableEXT"
+        })
+    );
+
+    // Stage 5b.2 serves vkCmdDraw; on a command buffer nobody allocated it
+    // is refused as the unknown id it is.
     let mut ctx = super::VulkanContext::new(CTX, Arc::new(FakeVulkan::standard()));
     let mut draw = Command::CmdDraw(CmdDrawArgs {
         command_buffer: VkCommandBuffer(0x99),
@@ -870,8 +884,12 @@ fn a_decodable_command_without_a_handler_is_refused_as_not_implemented() {
     });
     assert_eq!(
         ctx.execute(&mut draw),
-        Err(super::ExecError::NotImplemented {
-            command: "vkCmdDraw"
+        Err(super::ExecError::Id {
+            command: "vkCmdDraw",
+            error: super::objects::IdError::Unknown {
+                id: 0x99,
+                expected: "VkCommandBuffer"
+            }
         })
     );
 }

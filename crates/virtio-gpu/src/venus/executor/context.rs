@@ -43,7 +43,7 @@ use super::host::{DeviceRequest, HostVulkan, InstanceRequest, QueueRequest};
 use super::memory::{guest_type_bits, image_facts, image_planes};
 use super::objects::{
     CreatedQueue, DeviceChild, DeviceObject, ExposedDevice, IdError, ImageObject, Kind, Objects,
-    QueueObject,
+    Pending, QueueObject,
 };
 use super::policy::{self, GuestDevice, MAX_API_VERSION, MIN_API_VERSION};
 
@@ -63,6 +63,38 @@ pub enum ExecError {
         /// What was wrong with the id.
         error: IdError,
     },
+    /// An id inside a command's structures that translation refused
+    /// (stage 5b.2): the field it was in, and why.
+    #[error("{command}: {field}: {error}")]
+    IdIn {
+        /// The command.
+        command: &'static str,
+        /// The member or parameter, `Struct.member`.
+        field: &'static str,
+        /// What was wrong with the id.
+        error: IdError,
+    },
+    /// The host refused a translated command before calling the driver.
+    #[error("{command}: {error}")]
+    HostCall {
+        /// The command.
+        command: &'static str,
+        /// Why.
+        error: super::host::CallError,
+    },
+    /// A command newer than the device's Vulkan version as the guest sees it.
+    #[error("{command} is Vulkan {major}.{minor}, newer than the device the guest was shown")]
+    TooNew {
+        /// The command.
+        command: &'static str,
+        /// Its core major version.
+        major: u32,
+        /// Its core minor version.
+        minor: u32,
+    },
+    /// A submit or a wait naming a semaphore: stage 5b.3.
+    #[error("{0} names a semaphore; semaphores are not implemented yet (stage 5b.3)")]
+    Semaphore(&'static str),
     /// A second `vkCreateInstance` on one context (`vkr_instance.c:87-90`).
     #[error("vkCreateInstance on a context that already has instance {0:#x}")]
     SecondInstance(u64),
@@ -148,9 +180,16 @@ pub struct VulkanContext<H: HostVulkan> {
     pub(super) host: Arc<H>,
     pub(super) objects: Objects<H>,
     pub(super) fatal: bool,
+    /// The driver answered `VK_ERROR_DEVICE_LOST`: the command that saw it
+    /// is answered, and the context goes fatal straight after
+    /// ([`Self::take_lost`]).
+    pub(super) lost: bool,
     /// The renderer-wide budget every host-visible allocation's pages are
     /// charged to ([`super::MAX_HOST_VISIBLE_BYTES`]).
     pub(super) budget: Arc<PageBudget>,
+    /// The stop signal of the ring whose command is executing, for a wait
+    /// that must give up when the ring is torn down.
+    pub(super) stop: Option<crate::venus::service::StopSignal>,
 }
 
 impl<H: HostVulkan> VulkanContext<H> {
@@ -168,8 +207,16 @@ impl<H: HostVulkan> VulkanContext<H> {
             host,
             objects: Objects::default(),
             fatal: false,
+            lost: false,
             budget,
+            stop: None,
         }
+    }
+
+    /// Whether a command has seen `VK_ERROR_DEVICE_LOST` since the last ask;
+    /// the caller makes the context fatal once the command's reply is out.
+    pub fn take_lost(&mut self) -> bool {
+        std::mem::take(&mut self.lost)
     }
 
     /// The host device, a queue of it and its family, and a buffer of it,
@@ -229,6 +276,30 @@ impl<H: HostVulkan> VulkanContext<H> {
         let result = match unadmitted_link(command) {
             Some(error) => Err(error),
             None => self.dispatch(command),
+        };
+        if result.is_err() {
+            self.fatal = true;
+        }
+        result
+    }
+
+    /// One slice of a wait command, at most `slice` long, with every rule
+    /// [`Self::execute`] applies ([`super::submit`]'s `wait_slice`).
+    /// `Ok(true)` once the command is answered.
+    ///
+    /// # Errors
+    /// As [`Self::execute`].
+    pub fn execute_wait(
+        &mut self,
+        command: &mut Command<'_>,
+        slice: std::time::Duration,
+    ) -> Result<bool, ExecError> {
+        if self.fatal {
+            return Err(ExecError::ContextFatal(self.ctx_id));
+        }
+        let result = match unadmitted_link(command) {
+            Some(error) => Err(error),
+            None => self.wait_slice(command, slice),
         };
         if result.is_err() {
             self.fatal = true;
@@ -298,13 +369,12 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::GetImageSubresourceLayout(args) => self.image_subresource_layout(args),
             Command::CreateImageView(args) => self.create_image_view(args),
             Command::DestroyImageView(args) => self.destroy_image_view(args),
-            // `vkGetBufferOpaqueCaptureAddress` and
-            // `vkGetDeviceMemoryOpaqueCaptureAddress` land here on purpose:
+            // Stage 5b.2 (`device_objects`), and a refusal for every other
+            // decodable command there. `vkGetBufferOpaqueCaptureAddress` and
+            // `vkGetDeviceMemoryOpaqueCaptureAddress` are refused on purpose:
             // they are only valid with `bufferDeviceAddressCaptureReplay`,
             // which `policy::mask_features` reports false.
-            other => Err(ExecError::NotImplemented {
-                command: other.name(),
-            }),
+            other => self.dispatch_objects(other),
         }
     }
 
@@ -962,10 +1032,31 @@ impl<H: HostVulkan> VulkanContext<H> {
             args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
             return Ok(());
         }
+        // Containment for what the checks let past (stage 5b.2, ADR-0004):
+        // the host device always has `robustBufferAccess` when it supports
+        // it, whatever the guest enabled, so an out-of-range buffer access
+        // from a shader stays inside the buffer. The guest is told nothing:
+        // it enabled what it enabled, and a robust device only behaves better
+        // than one that is not. vkr enables no robustness of its own.
+        let mut features = info.p_enabled_features.clone();
+        let robust = guest.features.features.robust_buffer_access != 0;
+        if robust {
+            if has_features2 {
+                for link in &mut chain {
+                    if let VkDeviceCreateInfoNext::VkPhysicalDeviceFeatures2(f) = link {
+                        f.features.robust_buffer_access = 1;
+                    }
+                }
+            } else {
+                features
+                    .get_or_insert_with(Default::default)
+                    .robust_buffer_access = 1;
+            }
+        }
         let request = DeviceRequest {
             queues,
             extensions,
-            features: info.p_enabled_features.clone(),
+            features,
             chain,
             group,
         };
@@ -1084,6 +1175,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 host: host_queue,
                 ring_idx,
                 family: info.queue_family_index,
+                pending: Pending::default(),
             },
         );
         Ok(())
@@ -1140,10 +1232,19 @@ impl<H: HostVulkan> VulkanContext<H> {
         Ok(())
     }
 
-    /// `vkDestroyCommandPool`; `VK_NULL_HANDLE` is a no-op.
+    /// `vkDestroyCommandPool`; `VK_NULL_HANDLE` is a no-op. Its command
+    /// buffers go with it (the driver frees them), after any work that may
+    /// still be running them.
     fn destroy_command_pool(&mut self, args: &DestroyCommandPoolArgs) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyCommandPool";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
+        if args.command_pool.0 != 0 {
+            self.objects
+                .pool(args.device.0, args.command_pool.0)
+                .map_err(id_error(NAME))?;
+            self.settle(args.device.0);
+            self.objects.forget_pool_children(args.command_pool.0);
+        }
         if let Some(pool) = self
             .objects
             .take_pool(args.device.0, args.command_pool.0)
@@ -1211,6 +1312,8 @@ impl<H: HostVulkan> VulkanContext<H> {
     fn destroy_image(&mut self, args: &DestroyImageArgs) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyImage";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
+        // Nothing the GPU may still be using is freed under it.
+        self.settle(args.device.0);
         if let Some(image) = self
             .objects
             .take_image(args.device.0, args.image.0)

@@ -218,7 +218,7 @@ pub fn async_bytes(command: &Command<'_>) -> Vec<u8> {
     })
 }
 
-fn create_ring_stream() -> Vec<u8> {
+fn create_ring_stream(monitor_us: Option<u32>) -> Vec<u8> {
     encoded(|enc| {
         enc.command_header(CommandHeader {
             opcode: Opcode::CreateRing.as_u32(),
@@ -228,7 +228,17 @@ fn create_ring_stream() -> Vec<u8> {
         enc.handle(RING).expect("encode");
         enc.simple_pointer(true).expect("encode");
         enc.i32(STYPE_RING_CREATE_INFO_MESA).expect("encode");
-        enc.simple_pointer(false).expect("encode");
+        match monitor_us {
+            None => enc.simple_pointer(false).expect("encode"),
+            Some(period) => {
+                // One VkRingMonitorInfoMESA, as Mesa chains it (3 s there).
+                enc.simple_pointer(true).expect("encode");
+                enc.i32(crate::venus::transport::STYPE_RING_MONITOR_INFO_MESA)
+                    .expect("encode");
+                enc.simple_pointer(false).expect("encode");
+                enc.u32(period).expect("encode");
+            }
+        }
         enc.flags(0).expect("encode");
         enc.u32(RING_RES).expect("encode");
         for value in [
@@ -267,8 +277,33 @@ impl<H: HostVulkan> Harness<H> {
         Self::with_factory(ExecutorFactory::new(host))
     }
 
+    /// [`Self::new`] with the ring on the context's `ALIVE` monitor,
+    /// reporting at least every `period_us`.
+    pub fn monitored(host: Arc<H>, period_us: u32) -> Self {
+        Self::build(ExecutorFactory::new(host), Some(period_us))
+    }
+
+    /// `ALIVE` in the ring's status, as the guest reads it.
+    #[must_use]
+    pub fn alive(&self) -> bool {
+        self.ring
+            .guest_load_word(STATUS)
+            .is_some_and(|s| s & crate::venus::pump::STATUS_ALIVE != 0)
+    }
+
+    /// Clear `ALIVE`, as the guest's watchdog does when it starts waiting.
+    pub fn clear_alive(&self) {
+        assert!(self
+            .ring
+            .guest_clear_word_bits(STATUS, crate::venus::pump::STATUS_ALIVE));
+    }
+
     /// [`Self::new`] over a factory the test built (a smaller budget).
     pub fn with_factory(factory: ExecutorFactory<H>) -> Self {
+        Self::build(factory, None)
+    }
+
+    fn build(factory: ExecutorFactory<H>, monitor_us: Option<u32>) -> Self {
         let mut renderer = VenusRenderer::new(factory);
         let window = Arc::new(RecordingWindow::default());
         renderer.set_host_visible(Arc::clone(&window) as Arc<dyn ShmBacking>);
@@ -283,7 +318,7 @@ impl<H: HostVulkan> Harness<H> {
             .create_blob(CTX, &blob(REPLY_RES, REPLY_BYTES), &mem, &[])
             .expect("the reply pool");
         renderer
-            .submit(CTX, &create_ring_stream())
+            .submit(CTX, &create_ring_stream(monitor_us))
             .expect("the ring is adopted");
         let ring = renderer.blob_pages(RING_RES).expect("the ring blob");
         let reply = renderer.blob_pages(REPLY_RES).expect("the reply pool");

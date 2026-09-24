@@ -15,9 +15,11 @@
 //!   execute, encode the reply when the header asks for one, write it, and
 //!   report those bytes consumed.
 //! * [`context`] is what each command does, [`memory`] the memory, buffer,
-//!   binding and view commands (stage 5b.1), [`objects`] the id rules,
-//!   [`policy`] what the guest is told, [`host`] the trait the host sits
-//!   behind.
+//!   binding and view commands (stage 5b.1), [`device_objects`] pipelines,
+//!   descriptors, render passes, queries and every `vkCmd*`, [`submit`]
+//!   submission, fences and waits (stage 5b.2), [`generated`] the translation
+//!   all of stage 5b.2 goes through, [`objects`] the id rules, [`policy`]
+//!   what the guest is told, [`host`] the trait the host sits behind.
 //!
 //! # Memory the guest maps
 //!
@@ -54,40 +56,79 @@
 //! pump's `SeqCst` store of `head`, after the sink returns, is what orders
 //! the reply bytes before the guest sees them.
 //!
+//! # Command streams outside the ring (stage 5b.2)
+//!
+//! A submission larger than the ring's direct size (8 KiB on Mesa's primary
+//! ring: a recorded command buffer, a big shader module) arrives as
+//! `vkExecuteCommandStreamsMESA`, naming ranges of shared-memory blobs of the
+//! same context (`vkr_transport.c`). Each range is bounded by its blob,
+//! **copied** out under the blob directory's lock ([`ContextBlobs::read`]) —
+//! vkr decodes in place, and the guest may still be writing — and executed
+//! command by command through exactly the path a ring command takes, replies
+//! included. A stream must hold whole commands; one that carries another
+//! `vkExecuteCommandStreamsMESA` is refused, as in vkr; the bytes one call may
+//! name are bounded by [`MAX_STREAM_BYTES`]. Mesa 26.0.8 passes no reply
+//! positions and no dependencies; both are served anyway — a position seeks
+//! the reply stream before its stream, and a dependency must point forward,
+//! which executing the streams in order satisfies.
+//!
+//! # Waits
+//!
+//! `vkWaitForFences`, `vkQueueWaitIdle` and `vkDeviceWaitIdle` are waited for
+//! on this thread, in slices of [`submit::WAIT_SLICE`] with the context lock
+//! released in between ([`submit`]'s module docs). The context's ring monitor
+//! keeps `ALIVE` set meanwhile; a ring being torn down stops waiting within a
+//! slice, without consuming the command.
+//!
+//! # A lost device
+//!
+//! A `VK_ERROR_DEVICE_LOST` from the driver is answered to the guest — the
+//! command that met it is replied to and consumed — and then the context is
+//! fatal, as if the next command had been refused. Nothing on the host goes
+//! down with it: the device's objects are destroyed as ever when the context
+//! goes, which Vulkan allows on a lost device.
+//!
 //! # What this stage does not do
 //!
-//! * `vkExecuteCommandStreamsMESA` (a command too large for the ring, copied
-//!   to a separate blob) is refused as unimplemented. Mesa only sends it for
-//!   a command over 8 KiB, and nothing in the bring-up is (spec §1.1).
 //! * Fence timelines. `vkGetDeviceQueue2` records the `ring_idx` the guest
 //!   binds each queue to, and that is all. The capset still says
 //!   `supports_multiple_timelines = false`, and **release Mesa binds queues
-//!   to timelines 1–63 regardless** (spec §6): the stage that implements
-//!   `vkQueueSubmit` must give `virtio_gpu::fence` one FIFO per `ring_idx`
-//!   (the `ring_idx` recorded here) before it can retire a guest fence, and
-//!   only then flip the capset bit.
-//! * Queue submission, and with it the command buffers, fences and
-//!   semaphores that would use the memory (stage 5b.3). Until then nothing
-//!   but a test's own submit path makes the GPU touch it.
+//!   to timelines 1–63 regardless** (spec §6). Mesa 26.0.8's submit path
+//!   never asks for a virtio-gpu fence on those timelines (its fences are
+//!   the feedback slots [`submit`] describes, and `vkGetFenceFdKHR` is the
+//!   only path that would), so this stage leaves them as they were: the
+//!   stage that exports a sync file must give `virtio_gpu::fence` one FIFO
+//!   per `ring_idx` before it can retire one, and only then flip the bit.
+//! * Semaphores (stage 5b.3): a submit or wait naming one is refused.
 
 pub mod context;
+pub mod device_objects;
+pub mod generated;
 pub mod host;
 pub mod memory;
 pub mod objects;
 pub mod policy;
+pub mod submit;
 
 #[cfg(test)]
 pub(crate) mod fake;
 #[cfg(test)]
+mod generated_tests;
+#[cfg(test)]
 pub(crate) mod harness;
 #[cfg(test)]
 mod memory_tests;
+#[cfg(test)]
+pub(crate) mod recording;
+#[cfg(test)]
+mod submit_tests;
 #[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use thiserror::Error;
 
@@ -100,9 +141,19 @@ use super::pump::{Batch, Consumed, RingSink};
 #[cfg(doc)]
 use super::renderer::VenusRenderer;
 use super::renderer::{BlobRef, ContextBlobs, ReplyBlobError, RingEnv, SinkFactory};
+use super::service::StopSignal;
 use super::shmem::{PageBudget, RingPages};
-use super::transport::{Opcode, TransportCommand, TransportError, TransportStream};
+use super::transport::{
+    CommandStreamDependency, CommandStreamDescription, Opcode, TransportCommand, TransportError,
+    TransportStream,
+};
 use super::wire::{Decoder, WireError, COMMAND_HEADER_BYTES};
+
+/// The most bytes one `vkExecuteCommandStreamsMESA` may have the executor
+/// copy and run: 64 MiB, eight times Mesa's whole command-stream pool
+/// (`vn_instance.c:328-329`) and far past any recorded command buffer or
+/// shader module a guest sends.
+pub const MAX_STREAM_BYTES: u64 = 64 << 20;
 
 /// Why a ring's sink gave up. Every variant is fatal to the ring and to its
 /// context.
@@ -163,6 +214,59 @@ pub enum SinkError {
         /// Why.
         error: ProtocolError,
     },
+    /// `vkExecuteCommandStreamsMESA` inside a stream it runs.
+    #[error("vkExecuteCommandStreamsMESA inside a command stream (nested execution)")]
+    NestedStreams,
+    /// `vkExecuteCommandStreamsMESA` naming no stream (`vkr_transport.c`).
+    #[error("vkExecuteCommandStreamsMESA names no stream")]
+    NoStreams,
+    /// More bytes than [`MAX_STREAM_BYTES`].
+    #[error(
+        "vkExecuteCommandStreamsMESA names {total:#x} bytes, past the {MAX_STREAM_BYTES:#x} it may"
+    )]
+    StreamsTooLarge {
+        /// What it named.
+        total: u64,
+    },
+    /// A stream range this context may not read.
+    #[error("command stream {index}: {error}")]
+    Stream {
+        /// Which stream.
+        index: usize,
+        /// Why.
+        error: ReplyBlobError,
+    },
+    /// A dependency that is not an edge from an earlier stream to a later
+    /// one of the same call.
+    #[error("a stream dependency {src} -> {dst} among {streams} streams")]
+    Dependency {
+        /// `srcCommandStream`.
+        src: u32,
+        /// `dstCommandStream`.
+        dst: u32,
+        /// How many streams the call names.
+        streams: usize,
+    },
+    /// A stream that ends inside a command.
+    #[error("command stream {index} ends inside a command")]
+    TruncatedStream {
+        /// Which stream.
+        index: usize,
+    },
+    /// A command inside a stream that could not be answered.
+    #[error("command stream {index}, {command} (opcode {opcode}) at {at:#x}: {error}")]
+    InStream {
+        /// Which stream.
+        index: usize,
+        /// The command's opcode.
+        opcode: u32,
+        /// Its name.
+        command: &'static str,
+        /// Where in the stream.
+        at: usize,
+        /// Why.
+        error: Box<SinkError>,
+    },
 }
 
 /// The renderer-wide cap on host pages behind `HOST_VISIBLE` guest memory:
@@ -204,6 +308,7 @@ pub struct ExecutingSink<H: HostVulkan> {
     context: Arc<Mutex<VulkanContext<H>>>,
     blobs: ContextBlobs,
     window: Option<ReplyWindow>,
+    stop: StopSignal,
 }
 
 impl<H: HostVulkan> std::fmt::Debug for ExecutingSink<H> {
@@ -220,8 +325,14 @@ impl<H: HostVulkan> std::fmt::Debug for ExecutingSink<H> {
 enum Step {
     /// A whole command was handled; this many bytes are consumed.
     Done(usize),
+    /// A whole command was handled and answered, and the device is lost:
+    /// consume it, then end the ring and the context.
+    DoneThenFatal(usize),
     /// The batch ends inside a command: wait for more.
     Incomplete,
+    /// The ring is being torn down in the middle of a wait: consume nothing
+    /// more.
+    Stopped,
     /// The ring is dead: `opcode` could not be answered.
     Fatal { opcode: u32, error: SinkError },
 }
@@ -234,10 +345,13 @@ impl<H: HostVulkan> ExecutingSink<H> {
             context,
             blobs: env.blobs,
             window: None,
+            stop: StopSignal::never(),
         }
     }
 
-    fn step(&mut self, rest: &[u8]) -> Step {
+    /// One command at the front of `rest`. `nested`: `rest` is a stream a
+    /// `vkExecuteCommandStreamsMESA` named, not the ring.
+    fn step(&mut self, rest: &[u8], nested: bool) -> Step {
         let Some(opcode) = rest
             .get(..4)
             .and_then(|b| <[u8; 4]>::try_from(b).ok())
@@ -253,11 +367,7 @@ impl<H: HostVulkan> ExecutingSink<H> {
             return fatal(ExecError::ContextFatal(self.ctx_id).into());
         }
         if Opcode::from_u32(opcode).is_some() {
-            return match self.transport(rest) {
-                Ok(Some(used)) => Step::Done(used),
-                Ok(None) => Step::Incomplete,
-                Err(error) => fatal(error),
-            };
+            return self.transport(rest, nested);
         }
 
         let mut dec = Decoder::new(rest);
@@ -279,59 +389,214 @@ impl<H: HostVulkan> ExecutingSink<H> {
         if header.wants_reply() && self.window.is_none() {
             return fatal(SinkError::NoReplyWindow(name));
         }
-        if let Err(error) = lock(&self.context).execute(&mut command) {
-            return fatal(error.into());
+        let executed = if submit::is_wait(&command) {
+            self.wait(&mut command)
+        } else {
+            let mut context = lock(&self.context);
+            context.stop = Some(self.stop.clone());
+            context.execute(&mut command).map(|()| true)
+        };
+        match executed {
+            Err(error) => return fatal(error.into()),
+            Ok(false) => return Step::Stopped,
+            Ok(true) => {}
         }
         if header.wants_reply() {
             if let Err(error) = self.reply(&command) {
                 return fatal(error);
             }
         }
+        if lock(&self.context).take_lost() {
+            return Step::DoneThenFatal(used);
+        }
         Step::Done(used)
     }
 
-    /// A transport command found in the ring. `Ok(None)`: incomplete.
-    fn transport(&mut self, rest: &[u8]) -> Result<Option<usize>, SinkError> {
+    /// A wait, one slice at a time with the context lock released between
+    /// slices ([`submit`]). `Ok(false)`: the ring is being torn down.
+    fn wait(&mut self, command: &mut Command<'_>) -> Result<bool, ExecError> {
+        let limit = submit::wait_limit(command);
+        let start = Instant::now();
+        loop {
+            let slice = limit.map_or(submit::WAIT_SLICE, |limit| {
+                limit
+                    .saturating_sub(start.elapsed())
+                    .min(submit::WAIT_SLICE)
+            });
+            let done = {
+                let mut context = lock(&self.context);
+                context.stop = Some(self.stop.clone());
+                context.execute_wait(command, slice)?
+            };
+            if done {
+                return Ok(true);
+            }
+            if limit.is_some_and(|limit| start.elapsed() >= limit) {
+                submit::time_out(command);
+                return Ok(true);
+            }
+            if self.stop.is_stopping() {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// A transport command at the front of `rest`.
+    fn transport(&mut self, rest: &[u8], nested: bool) -> Step {
         let mut stream = TransportStream::new(rest);
         let request = match stream.next_command() {
-            None | Some(Err(TransportError::Wire(WireError::Truncated { .. }))) => return Ok(None),
-            Some(Err(error)) => return Err(error.into()),
+            None | Some(Err(TransportError::Wire(WireError::Truncated { .. }))) => {
+                return Step::Incomplete
+            }
+            Some(Err(error)) => {
+                return Step::Fatal {
+                    opcode: rest
+                        .get(..4)
+                        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                        .map_or(0, u32::from_le_bytes),
+                    error: error.into(),
+                }
+            }
             Some(Ok(request)) => request,
         };
+        let opcode = request.command.opcode().as_u32();
+        let fatal = |error: SinkError| Step::Fatal { opcode, error };
         let name = request.command.opcode().name();
+        if request.header.wants_reply() {
+            return fatal(SinkError::TransportReply(name));
+        }
         match request.command {
             TransportCommand::SetReplyCommandStream { stream: desc } => {
-                if request.header.wants_reply() {
-                    return Err(SinkError::TransportReply(name));
+                match self.blobs.bind(desc.resource_id, desc.offset, desc.size) {
+                    Ok(blob) => {
+                        self.window = Some(ReplyWindow {
+                            blob,
+                            offset: desc.offset,
+                            size: desc.size,
+                            cursor: 0,
+                        });
+                    }
+                    Err(error) => return fatal(error.into()),
                 }
-                let blob = self.blobs.bind(desc.resource_id, desc.offset, desc.size)?;
-                self.window = Some(ReplyWindow {
-                    blob,
-                    offset: desc.offset,
-                    size: desc.size,
-                    cursor: 0,
-                });
             }
             TransportCommand::SeekReplyCommandStream { position } => {
-                if request.header.wants_reply() {
-                    return Err(SinkError::TransportReply(name));
+                if let Err(error) = self.seek(position) {
+                    return fatal(error);
                 }
-                match self.window.as_mut() {
-                    Some(window) if position <= window.size => window.cursor = position,
-                    other => {
-                        return Err(SinkError::SeekOutsideWindow {
-                            position,
-                            size: other.map_or(0, |w| w.size),
-                        })
-                    }
+            }
+            TransportCommand::ExecuteCommandStreams {
+                streams,
+                reply_positions,
+                dependencies,
+                flags: _,
+            } => {
+                if nested {
+                    return fatal(SinkError::NestedStreams);
                 }
+                return match self.execute_streams(
+                    &streams,
+                    reply_positions.as_deref(),
+                    &dependencies,
+                ) {
+                    Ok(StepOf::Done(())) => Step::Done(stream.position()),
+                    Ok(StepOf::DoneThenFatal(())) => Step::DoneThenFatal(stream.position()),
+                    Ok(StepOf::Stopped) => Step::Stopped,
+                    Err(error) => fatal(error),
+                };
             }
             // The context-stream commands are refused on a ring as vkr
             // refuses them (`is_dispatched_from_vkr_context`), and the rest
             // are not this stage's.
-            _ => return Err(SinkError::NotOnRing(name)),
+            _ => return fatal(SinkError::NotOnRing(name)),
         }
-        Ok(Some(stream.position()))
+        Step::Done(stream.position())
+    }
+
+    /// `vkSeekReplyCommandStreamMESA`, or a stream's reply position.
+    fn seek(&mut self, position: u64) -> Result<(), SinkError> {
+        match self.window.as_mut() {
+            Some(window) if position <= window.size => {
+                window.cursor = position;
+                Ok(())
+            }
+            other => Err(SinkError::SeekOutsideWindow {
+                position,
+                size: other.map_or(0, |w| w.size),
+            }),
+        }
+    }
+
+    /// `vkExecuteCommandStreamsMESA`: see the module docs.
+    fn execute_streams(
+        &mut self,
+        streams: &[CommandStreamDescription],
+        reply_positions: Option<&[u64]>,
+        dependencies: &[CommandStreamDependency],
+    ) -> Result<StreamStep, SinkError> {
+        if streams.is_empty() {
+            return Err(SinkError::NoStreams);
+        }
+        for d in dependencies {
+            let n = streams.len();
+            let fits = |i: u32| usize::try_from(i).is_ok_and(|i| i < n);
+            if !fits(d.src_command_stream)
+                || !fits(d.dst_command_stream)
+                || d.src_command_stream >= d.dst_command_stream
+            {
+                return Err(SinkError::Dependency {
+                    src: d.src_command_stream,
+                    dst: d.dst_command_stream,
+                    streams: n,
+                });
+            }
+        }
+        let total = streams
+            .iter()
+            .fold(0u64, |sum, s| sum.saturating_add(s.size));
+        if total > MAX_STREAM_BYTES {
+            return Err(SinkError::StreamsTooLarge { total });
+        }
+        let mut lost = false;
+        for (index, desc) in streams.iter().enumerate() {
+            if let Some(position) = reply_positions.and_then(|p| p.get(index)) {
+                self.seek(*position)?;
+            }
+            if desc.size == 0 {
+                continue;
+            }
+            let bytes = self
+                .blobs
+                .read(desc.resource_id, desc.offset, desc.size)
+                .map_err(|error| SinkError::Stream { index, error })?;
+            let mut at = 0usize;
+            while at < bytes.len() {
+                let rest = bytes.get(at..).unwrap_or_default();
+                match self.step(rest, true) {
+                    Step::Done(used) => at = at.saturating_add(used.max(1)),
+                    Step::DoneThenFatal(used) => {
+                        at = at.saturating_add(used.max(1));
+                        lost = true;
+                    }
+                    Step::Stopped => return Ok(StepOf::Stopped),
+                    Step::Incomplete => return Err(SinkError::TruncatedStream { index }),
+                    Step::Fatal { opcode, error } => {
+                        return Err(SinkError::InStream {
+                            index,
+                            opcode,
+                            command: command_type_name(opcode)
+                                .or_else(|| Opcode::from_u32(opcode).map(Opcode::name))
+                                .unwrap_or("an unknown command"),
+                            at,
+                            error: Box::new(error),
+                        })
+                    }
+                }
+                if lost {
+                    return Ok(StepOf::DoneThenFatal(()));
+                }
+            }
+        }
+        Ok(StepOf::Done(()))
     }
 
     /// Encode `command`'s reply into the window and advance the cursor.
@@ -366,6 +631,31 @@ impl<H: HostVulkan> ExecutingSink<H> {
             Err(error) => Err(error.into()),
         }
     }
+
+    fn log_fatal(&self, opcode: u32, at: usize, error: &SinkError) {
+        tracing::warn!(
+            ctx_id = self.ctx_id,
+            ring = format_args!("{:#x}", self.ring),
+            opcode,
+            command = command_type_name(opcode)
+                .or_else(|| Opcode::from_u32(opcode).map(Opcode::name))
+                .unwrap_or("an unknown command"),
+            at,
+            %error,
+            "a Venus command could not be answered; the ring and its context are fatal"
+        );
+    }
+}
+
+/// [`Step`] for a whole `vkExecuteCommandStreamsMESA`, whose length the
+/// caller knows.
+type StreamStep = StepOf<()>;
+
+/// A [`Step`] carrying `T` where it carries a length.
+enum StepOf<T> {
+    Done(T),
+    DoneThenFatal(T),
+    Stopped,
 }
 
 impl<H: HostVulkan> RingSink for ExecutingSink<H> {
@@ -377,24 +667,29 @@ impl<H: HostVulkan> RingSink for ExecutingSink<H> {
                 Some(rest) if !rest.is_empty() => rest,
                 _ => return batch.consumed(done),
             };
-            match self.step(rest) {
+            match self.step(rest, false) {
                 Step::Done(used) => done = done.saturating_add(used.max(1)),
-                Step::Incomplete => return batch.consumed(done),
-                Step::Fatal { opcode, error } => {
+                Step::Incomplete | Step::Stopped => return batch.consumed(done),
+                Step::DoneThenFatal(used) => {
                     lock(&self.context).set_fatal();
                     tracing::warn!(
                         ctx_id = self.ctx_id,
                         ring = format_args!("{:#x}", self.ring),
-                        opcode,
-                        command = command_type_name(opcode).unwrap_or("an unknown command"),
-                        at = done,
-                        %error,
-                        "a Venus command could not be answered; the ring and its context are fatal"
+                        "the host Vulkan device is lost; the ring and its context end after that reply"
                     );
+                    return batch.fatal_after(done.saturating_add(used.max(1)));
+                }
+                Step::Fatal { opcode, error } => {
+                    lock(&self.context).set_fatal();
+                    self.log_fatal(opcode, done, &error);
                     return batch.fatal_after(done);
                 }
             }
         }
+    }
+
+    fn attach_stop(&mut self, stop: StopSignal) {
+        self.stop = stop;
     }
 }
 

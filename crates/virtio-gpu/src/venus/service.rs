@@ -228,6 +228,11 @@ impl<S: RingSink> RingService<S> {
         &self.sink
     }
 
+    /// The sink, mutably.
+    pub fn sink_mut(&mut self) -> &mut S {
+        &mut self.sink
+    }
+
     /// Whether the ring is parked waiting for a doorbell.
     #[must_use]
     pub fn is_parked(&self) -> bool {
@@ -455,6 +460,27 @@ impl WorkerShared {
     }
 }
 
+/// A ring worker's stop request, as its sink sees it
+/// ([`RingSink::attach_stop`](super::pump::RingSink::attach_stop)): a sink
+/// that blocks inside `consume` — a Vulkan wait, in slices — polls it between
+/// slices, so tearing the ring down never waits on the guest's timeout.
+#[derive(Debug, Clone)]
+pub struct StopSignal(Arc<WorkerShared>);
+
+impl StopSignal {
+    /// Whether the worker has been asked to stop.
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.0.stopping()
+    }
+
+    /// A signal nobody will ever raise, for a sink run outside a worker.
+    #[must_use]
+    pub fn never() -> Self {
+        Self(Arc::new(WorkerShared::default()))
+    }
+}
+
 /// One adopted ring's worker thread. See the module docs.
 ///
 /// Dropping it stops and joins the thread; [`stop`](Self::stop) does the same
@@ -479,7 +505,7 @@ impl RingWorker {
     /// Whatever the OS says when it will not start a thread.
     pub fn spawn<S>(
         name: String,
-        service: RingService<S>,
+        mut service: RingService<S>,
         pages: Arc<RingPages>,
         quiesce: Arc<Quiesce>,
         live: &LiveThreads,
@@ -488,6 +514,9 @@ impl RingWorker {
         S: RingSink + Send + 'static,
     {
         let shared = Arc::new(WorkerShared::default());
+        service
+            .sink_mut()
+            .attach_stop(StopSignal(Arc::clone(&shared)));
         let guard = live.enter();
         let thread = {
             let shared = Arc::clone(&shared);

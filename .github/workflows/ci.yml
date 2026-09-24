@@ -91,6 +91,12 @@ jobs:
         run: |
           cargo fetch
           python scripts/venus-ash-gen.py --check
+      - name: The executor's generated translation and host calls are up to date
+        # scripts/venus-exec-gen.py reads the same model as the protocol
+        # (Mako, above), vk.xml, tools/venus-protocol/executor-classes.txt and
+        # ash's sources (fetched above); it also refuses a classification
+        # that disagrees with the executor's hand-written match arms.
+        run: python scripts/venus-exec-gen.py --check
       - name: Differential check against the generated C
         run: python tools/venus-protocol/harness/run_differential.py --seeds 256
 

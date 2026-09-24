@@ -2343,3 +2343,148 @@ what will use this memory, and the sync_fd semaphore emulation that unlocks
 sync2 and the swapchain (the 2026-09-23 finding); `save`/`load` for memory,
 which a snapshot still refuses by name while any host Vulkan object or any
 imported page is alive.
+
+## Amendment, 2026-09-24 — stage 5b.2, pipelines, command buffers and fenced submission
+
+The executor now serves every core Vulkan 1.0–1.3 command a guest needs to
+build pipelines, descriptors, render passes, framebuffers, query pools and
+events, to record command buffers — every core `vkCmd*`, secondaries included —
+and to submit them with an optional binary fence and wait for it. Command
+streams too large for the ring arrive through `vkExecuteCommandStreamsMESA`,
+which is served. Semaphores remain stage 5b.3.
+
+### The mechanical majority is generated
+
+`scripts/venus-exec-gen.py` (a sibling of `venus-ash-gen.py`, reading the same
+`rust_protocol.py` model as the protocol, `vk.xml`, and ash's sources) writes
+two files from a checked-in classification of all 211 core ≤ 1.3 commands the
+protocol decodes (`tools/venus-protocol/executor-classes.txt`: 41 *bespoke* —
+stages 5a.3/5b.1 —, 85 *hand-written*, 56 *generated*, 29 *refused*):
+
+- `venus/executor/generated.rs`, portable and without `unsafe`: for the 141
+  commands served by translation, the walk that replaces every guest id in the
+  inputs — nested in structures, in arrays, in admitted pNext links — by the
+  host handle, through a `Resolve` the context implements (typed, of the
+  command's device, 0 only where vk.xml says `optional`/`noautovalidity`, with
+  a short list of handles vk.xml lets be null that a driver would dereference:
+  a stage's module, a pipeline's layout, `vkUpdateDescriptorSets`' `dstSet`,
+  set layouts, bound sets, index and vertex buffers); every enum checked
+  against the values core 1.0–1.3 defines and every flag word against the core
+  bits (from `vk.xml`'s `<feature>` blocks, not from the extensions); every
+  array against the count it travels with. Plus the tables the executor asks:
+  a command's dispatchable, its core version, its `VkResult`, its output
+  handles.
+- `host_vulkan/calls.rs`: the one place a translated command becomes a driver
+  call. Each structure is rebuilt as its `ash` twin in an arena
+  (`host_vulkan/arena.rs`) — every pointer into an arena-owned copy that
+  outlives the call, pNext links in the guest's order — and the entry point is
+  called through `ash`'s function table; outputs are written back. The one
+  `unsafe` contract is the translation's.
+
+The *generated* commands are exactly that; the *hand-written* ones add what
+only the context knows (`venus/executor/device_objects.rs`, `submit.rs`):
+binding the guest's ids to what a create made and taking them out on destroy,
+facts about objects later commands are judged by, bounds, submission's
+bookkeeping. `--check` runs in CI beside the other two generators; the script
+also refuses a classification that disagrees with the executor's `match` arms.
+
+### Validation posture
+
+1. **Typed ids everywhere**: an unknown id, one of another type, or one of
+   another device is fatal to the context, however deep in a structure it is.
+2. **Enum and flag ranges**: core Vulkan 1.3 values only — no device extension
+   is advertised, so an extension's value is no correct guest's.
+3. **Structural bounds** — counts, sizes, offsets into objects the renderer
+   knows, and indices into the fixed-size state a driver keeps on the host:
+   buffer ranges of fills, updates, copies, indirect draws and dispatches,
+   vertex and index bindings, descriptor buffer ranges and query-result copies
+   against the buffer's size; query ranges against the pool; descriptor writes
+   and copies against the set layout's bindings (the consecutive-binding rule
+   included, variable-count bindings at the count allocated); one dynamic
+   offset per dynamic descriptor bound; sets against the pipeline layout;
+   attachment references, preserve indices, dependencies and multiview arrays
+   inside their render pass; a framebuffer made for as many attachments as its
+   pass, and a clear value for every attachment a begin clears; viewports,
+   scissors, vertex bindings and attributes, colour attachments and push
+   constants within the device's limits; specialization entries inside their
+   data; one shader stage of each kind; a command no newer than the device's
+   version as the guest sees it (its entry point may not exist).
+4. **Past that, the driver**, as in vkr: full valid-usage checking is not the
+   goal. Two known edges: a buffer–image copy's footprint beyond its first
+   byte (it depends on format and extent; a transfer is not covered by
+   robustness either), and "ignored-if" pointers a driver reads anyway.
+5. **Containment**: every host device is created with `robustBufferAccess`
+   when it supports it, whatever the guest enabled, so a shader's stray buffer
+   access stays inside its buffer. The guest is not told: it enabled what it
+   enabled, and a robust device only behaves better. vkr enables none.
+
+### Submission, fences and waits
+
+What Mesa 26.0.8 sends (read from `vn_queue.c`, `vn_feedback.c`,
+`vn_command_buffer.c`, `vn_ring.c`): a recording is encoded locally and sent at
+`vkEndCommandBuffer` as one submission, through `vkExecuteCommandStreamsMESA`
+when it is over the ring's 8 KiB direct size (as is any large single command);
+`vkQueueSubmit` asynchronously (`vkQueueSubmit2` only with sync2, which the
+guest does not have yet); **no semaphore on any plain submit** (only the
+sparse path adds one); a fenced submit carries the fence's **feedback command
+buffer**, recorded once at `vkCreateFence` (barrier, `vkCmdFillBuffer` of
+`VK_SUCCESS` into the fence's slot of a host-visible feedback buffer, barrier
+to `HOST`) and resubmitted unchanged; the guest polls that slot and, once it
+reads signalled, sends an **asynchronous** `vkWaitForFences(1, fence, VK_TRUE,
+UINT64_MAX)`; `vkGetFenceStatus` only without feedback; `vkQueueWaitIdle` and
+`vkDeviceWaitIdle` never (vkr refuses both). All of it is served: the
+feedback command buffers are just more command buffers writing memory the guest
+maps (5b.1), and tested so, with the real GPU writing the slot the guest reads.
+
+- **Waits are real, and sliced.** `vkWaitForFences` is waited for on the ring
+  worker, in 20 ms slices with the context lock released between them, the
+  guest's timeout honoured to the slice (`UINT64_MAX` is forever); a ring being
+  torn down stops within a slice. The context's `ALIVE` monitor runs apart from
+  the worker and keeps the guest's watchdog fed meanwhile (tested with a GPU
+  that never finishes). `vkQueueWaitIdle`/`vkDeviceWaitIdle` are served from
+  each queue's record of pending work.
+- **Nothing is freed under the GPU.** Each queue records the fence of its
+  newest fenced submit (which covers every earlier batch) and whether an
+  unfenced submit followed. Every destroy, free and pool reset waits for that
+  record to clear first — the fence, or the queue going idle — so a guest that
+  destroys what a pending submission uses gets a wait, not a host driver
+  freeing memory under the GPU; Mesa's own order (wait, then destroy) never
+  waits. Device and context teardown wait for the device to go idle, as vkr.
+- **A lost device** (`VK_ERROR_DEVICE_LOST` from any call) is answered — the
+  command that met it is replied to and consumed — and the context is then
+  fatal. The VMM stays up; the objects are destroyed as ever.
+- **Pausing**: a slice-waiting ring holds its ADR-0005 pass for the whole wait,
+  so a pause during one is the bounded "pausing anyway" of
+  `Quiesce::wait_until_idle`. GPU work already submitted cannot be paused in
+  any case; a snapshot still refuses while any host Vulkan object is alive.
+
+### Where this differs from vkr
+
+`vkExecuteCommandStreamsMESA` copies each stream before decoding (vkr decodes
+in place while the guest may write), bounds the bytes one call names (64 MiB)
+and refuses a dependency that does not point forward (vkr ignores them); waits
+are sliced and `vkQueueWaitIdle`/`vkDeviceWaitIdle` are served; a lost device
+ends the context; destroys wait for pending work; every check in the posture
+above is ours; `vkFree{CommandBuffers,DescriptorSets}` must name the pool the
+objects came from; a pipeline call that fails partway destroys what it did make
+(vkr leaks it); `robustBufferAccess` is on; semaphores are refused (5b.3).
+
+### Measured on the RTX 2070
+
+Driven through a real ring with the generated driver-side encoder, exactly as
+the guest would (`host_vulkan::pipeline_tests`, driver 580.88, Windows):
+vk-smoke check 4 plus a fence feedback buffer — 16384 words through the blob,
+0 wrong, the feedback slot reads `VK_SUCCESS`; check 5 — vk-smoke's compute
+shader over 1 Mi elements, 0 wrong; check 6 — vk-smoke's triangle through a
+classic render pass, **256×256 exact, `fnv1a=0x2678f2a0e39fba1b`**, the
+checksum vk-smoke's README gives for the bare RTX 2070; a 293 872-byte shader
+module through `vkExecuteCommandStreamsMESA`, run over 4096 elements, 0 wrong;
+200 fenced submits, each waited for as Mesa waits, no word lost.
+
+### vk-smoke in the guest
+
+Checks 4, 5, 6 and 9 need nothing past this stage; 7 skips (the guest reports
+1.2). **Check 8 creates a timeline semaphore** — asynchronously, so its refusal
+makes the context fatal and the guest's next ring wait finds the ring dead —
+so run `--checks 4,5,6,7,9` to see 9; in the default order 8 ends the run.
+Nothing before check 8 names a semaphore.

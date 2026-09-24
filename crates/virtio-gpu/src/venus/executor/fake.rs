@@ -3,15 +3,19 @@
 //! a test can prove teardown leaves none.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::venus::capset::vk_make_api_version;
 use crate::venus::protocol::*;
 use crate::venus::shmem::RingPages;
 
+use super::generated;
 use super::host::{
-    DeviceRequest, HostDeviceInfo, HostGroup, HostVulkan, ImageBind, InstanceRequest, MemoryRequest,
+    CallError, DeviceRequest, HostDeviceInfo, HostGroup, HostVulkan, ImageBind, InstanceRequest,
+    MemoryRequest, RawHandle,
 };
+use super::objects::Kind;
 use super::policy::{name_array, EXTERNAL_MEMORY_HOST};
 
 /// `VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU`.
@@ -41,6 +45,16 @@ pub fn gpu(name: &str) -> FakeDevice {
     props.device_type = DISCRETE;
     props.device_name = name_array(name);
     props.limits.max_image_dimension2d = 32768;
+    // The fixed-size state stage 5b.2 bounds commands against, as an RTX
+    // 2070 reports it.
+    props.limits.max_bound_descriptor_sets = 32;
+    props.limits.max_push_constants_size = 256;
+    props.limits.max_vertex_input_bindings = 32;
+    props.limits.max_vertex_input_attributes = 32;
+    props.limits.max_viewports = 16;
+    props.limits.max_color_attachments = 8;
+    props.limits.max_descriptor_set_uniform_buffers_dynamic = 15;
+    props.limits.max_descriptor_set_storage_buffers_dynamic = 16;
     info.properties.p_next = vec![
         VkPhysicalDeviceProperties2Next::VkPhysicalDeviceVulkan11Properties(
             VkPhysicalDeviceVulkan11Properties {
@@ -201,10 +215,22 @@ struct Live {
     image_binds: Vec<(u64, u64, u64)>,
     host_memory_resources: Vec<(&'static str, bool)>,
     buffer_sizes: HashMap<u64, u64>,
+    /// Every stage-5b.2 call and destroy, in order: `"vkCmdDraw"`,
+    /// `"destroy VkPipeline"`, `"device idle"`.
+    calls: Vec<String>,
+    /// Every fence and whether it is signalled.
+    fences: HashMap<u64, bool>,
+    /// Fences of submissions the fake GPU has not finished.
+    held: Vec<u64>,
+    /// Command buffers and descriptor sets, and the pool each came from.
+    pool_children: HashMap<u64, u64>,
+    /// Every translated `vkQueueSubmit`'s command buffers, as host handles.
+    submitted: Vec<Vec<u64>>,
+    /// What each pool child is, for the live counts.
+    child_kinds: HashMap<u64, &'static str>,
 }
 
 /// The fake host. See the module docs.
-#[derive(Debug)]
 pub struct FakeVulkan {
     /// What `vkEnumerateInstanceVersion` answers.
     pub version: u32,
@@ -213,6 +239,26 @@ pub struct FakeVulkan {
     /// What `vkGetMemoryHostPointerPropertiesEXT` answers for any pages.
     pub host_pointer_bits: u32,
     live: Mutex<Live>,
+    /// The fake GPU: finish every submission at once (`false`), or only when
+    /// something waits for it (`true`).
+    pub hold: AtomicBool,
+    /// A GPU that never finishes: every wait times out.
+    pub stuck: AtomicBool,
+    /// A lost device: every submit and every wait answers
+    /// `VK_ERROR_DEVICE_LOST`.
+    pub lost: AtomicBool,
+    /// Called with every stage-5b.2 command's name as it reaches the host.
+    #[allow(clippy::type_complexity)]
+    pub on_call: Mutex<Option<Box<dyn FnMut(&str) + Send>>>,
+}
+
+impl std::fmt::Debug for FakeVulkan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeVulkan")
+            .field("version", &self.version)
+            .field("devices", &self.devices.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl FakeVulkan {
@@ -224,6 +270,10 @@ impl FakeVulkan {
             devices,
             host_pointer_bits: 0x18,
             live: Mutex::new(Live::default()),
+            hold: AtomicBool::new(false),
+            stuck: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
+            on_call: Mutex::new(None),
         }
     }
 
@@ -310,6 +360,207 @@ impl FakeVulkan {
     #[must_use]
     pub fn host_memory_resources(&self) -> Vec<(&'static str, bool)> {
         self.with(|live| live.host_memory_resources.clone())
+    }
+
+    /// Every stage-5b.2 command, destroy and idle wait that reached the
+    /// host, in order.
+    #[must_use]
+    pub fn calls(&self) -> Vec<String> {
+        self.with(|live| live.calls.clone())
+    }
+
+    /// How many times `name` reached the host.
+    #[must_use]
+    pub fn called(&self, name: &str) -> usize {
+        self.with(|live| live.calls.iter().filter(|c| *c == name).count())
+    }
+
+    /// Every submit's command buffers, as host handles.
+    #[must_use]
+    pub fn submitted(&self) -> Vec<Vec<u64>> {
+        self.with(|live| live.submitted.clone())
+    }
+
+    /// Submissions the fake GPU has not finished.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.with(|live| live.held.len())
+    }
+
+    fn forget_children(live: &mut Live, pool: u64) {
+        let children: Vec<u64> = live
+            .pool_children
+            .iter()
+            .filter(|(_, p)| **p == pool)
+            .map(|(c, _)| *c)
+            .collect();
+        for child in children {
+            live.pool_children.remove(&child);
+            live.release_child(child);
+        }
+    }
+
+    /// The whole fake GPU for one stage-5b.2 command: what `call` answers.
+    fn serve(&self, command: &mut Command<'_>) -> i32 {
+        let lost = self.lost.load(Ordering::SeqCst);
+        let hold = self.hold.load(Ordering::SeqCst);
+        let stuck = self.stuck.load(Ordering::SeqCst);
+        let lost_ret = VK_ERROR_DEVICE_LOST;
+        match command {
+            Command::QueueSubmit(a) => {
+                if lost {
+                    return lost_ret;
+                }
+                let cbs: Vec<u64> = a
+                    .p_submits
+                    .iter()
+                    .flatten()
+                    .flat_map(|s| s.p_command_buffers.iter().flatten().map(|c| c.0))
+                    .collect();
+                self.submit(cbs, a.fence.0, hold);
+                VK_SUCCESS
+            }
+            Command::QueueSubmit2(a) => {
+                if lost {
+                    return lost_ret;
+                }
+                let cbs: Vec<u64> = a
+                    .p_submits
+                    .iter()
+                    .flatten()
+                    .flat_map(|s| {
+                        s.p_command_buffer_infos
+                            .iter()
+                            .flatten()
+                            .map(|c| c.command_buffer.0)
+                    })
+                    .collect();
+                self.submit(cbs, a.fence.0, hold);
+                VK_SUCCESS
+            }
+            Command::GetFenceStatus(a) => {
+                if lost {
+                    return lost_ret;
+                }
+                let signalled = self.with(|live| live.fences.get(&a.fence.0).copied());
+                if signalled == Some(true) {
+                    VK_SUCCESS
+                } else {
+                    VK_NOT_READY
+                }
+            }
+            Command::WaitForFences(a) => {
+                if lost {
+                    return lost_ret;
+                }
+                let fences: Vec<u64> = a.p_fences.iter().flatten().map(|f| f.0).collect();
+                if stuck {
+                    std::thread::sleep(std::time::Duration::from_nanos(a.timeout.min(2_000_000)));
+                    return VK_TIMEOUT;
+                }
+                self.with(|live| {
+                    if a.timeout > 0 {
+                        // Waiting is the GPU getting there.
+                        for fence in &fences {
+                            live.finish(*fence);
+                        }
+                    }
+                    let done = |f: &u64| live.fences.get(f).copied() == Some(true);
+                    let ok = if a.wait_all != 0 {
+                        fences.iter().all(done)
+                    } else {
+                        fences.iter().any(done)
+                    };
+                    if ok {
+                        VK_SUCCESS
+                    } else {
+                        VK_TIMEOUT
+                    }
+                })
+            }
+            Command::ResetFences(a) => {
+                self.with(|live| {
+                    for fence in a.p_fences.iter().flatten() {
+                        live.fences.insert(fence.0, false);
+                    }
+                });
+                VK_SUCCESS
+            }
+            Command::QueueWaitIdle(_) | Command::DeviceWaitIdle(_) => {
+                if lost {
+                    return lost_ret;
+                }
+                if stuck {
+                    return VK_TIMEOUT;
+                }
+                self.with(Live::finish_all);
+                VK_SUCCESS
+            }
+            Command::FreeCommandBuffers(a) => {
+                self.with(|live| {
+                    for cb in a.p_command_buffers.iter().flatten() {
+                        if live.pool_children.remove(&cb.0).is_some() {
+                            live.release_child(cb.0);
+                        }
+                    }
+                });
+                VK_SUCCESS
+            }
+            Command::FreeDescriptorSets(a) => {
+                self.with(|live| {
+                    for set in a.p_descriptor_sets.iter().flatten() {
+                        if live.pool_children.remove(&set.0).is_some() {
+                            live.release_child(set.0);
+                        }
+                    }
+                });
+                VK_SUCCESS
+            }
+            Command::ResetDescriptorPool(a) => {
+                let pool = a.descriptor_pool.0;
+                self.with(|live| Self::forget_children(live, pool));
+                VK_SUCCESS
+            }
+            _ => VK_SUCCESS,
+        }
+    }
+
+    fn submit(&self, cbs: Vec<u64>, fence: u64, hold: bool) {
+        self.with(|live| {
+            live.submitted.push(cbs);
+            if fence != 0 {
+                live.fences.insert(fence, !hold);
+                if hold {
+                    live.held.push(fence);
+                }
+            }
+        });
+    }
+}
+
+impl Live {
+    fn finish(&mut self, fence: u64) {
+        // A fence covers everything submitted before it.
+        if let Some(at) = self.held.iter().position(|f| *f == fence) {
+            for f in self.held.drain(..=at) {
+                self.fences.insert(f, true);
+            }
+        }
+    }
+
+    fn finish_all(&mut self) {
+        for f in self.held.drain(..) {
+            self.fences.insert(f, true);
+        }
+    }
+
+    /// A command buffer or descriptor set its pool gave back.
+    fn release_child(&mut self, child: u64) {
+        if let Some(kind) = self.child_kinds.remove(&child) {
+            if let Some(count) = self.by_kind.get_mut(kind) {
+                *count = count.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -458,7 +709,8 @@ impl HostVulkan for FakeVulkan {
         Ok(self.create("command pool"))
     }
 
-    fn destroy_command_pool(&self, _device: &u64, _pool: u64) {
+    fn destroy_command_pool(&self, _device: &u64, pool: u64) {
+        self.with(|live| Self::forget_children(live, pool));
         self.destroy("command pool");
     }
 
@@ -656,5 +908,83 @@ impl HostVulkan for FakeVulkan {
 
     fn destroy_buffer_view(&self, _device: &u64, _view: u64) {
         self.destroy("buffer view");
+    }
+
+    fn call(&self, _device: &u64, command: &mut Command<'_>) -> Result<(), CallError> {
+        let name = command.name();
+        if let Some(hook) = self
+            .on_call
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            hook(name);
+        }
+        self.with(|live| live.calls.push(name.to_owned()));
+        // Pool children remember their pool (a translated handle).
+        let pool = match command {
+            Command::AllocateCommandBuffers(a) => {
+                a.p_allocate_info.as_ref().map(|i| i.command_pool.0)
+            }
+            Command::AllocateDescriptorSets(a) => {
+                a.p_allocate_info.as_ref().map(|i| i.descriptor_pool.0)
+            }
+            _ => None,
+        };
+        let signalled = match command {
+            Command::CreateFence(a) => a.p_create_info.as_ref().map(|i| i.flags & 1 != 0),
+            _ => None,
+        };
+        let ret = self.serve(command);
+        generated::set_result(command, ret);
+        if ret >= 0 {
+            if let Some((kind, slots)) = generated::output_handles(command) {
+                for slot in slots {
+                    let handle = self.create(kind.name());
+                    *slot = handle;
+                    self.with(|live| {
+                        if let Some(pool) = pool {
+                            live.pool_children.insert(handle, pool);
+                            live.child_kinds.insert(handle, kind.name());
+                        }
+                        if let Some(signalled) = signalled {
+                            live.fences.insert(handle, signalled);
+                        }
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn destroy_object(&self, _device: &u64, kind: Kind, raw: u64) {
+        self.with(|live| {
+            live.calls.push(format!("destroy {}", kind.name()));
+            if kind == Kind::DescriptorPool {
+                Self::forget_children(live, raw);
+            }
+            if kind == Kind::Fence {
+                live.fences.remove(&raw);
+            }
+        });
+        self.destroy(kind.name());
+    }
+
+    fn device_wait_idle(&self, _device: &u64) -> VkResult {
+        self.with(|live| {
+            live.calls.push("device idle".to_owned());
+            live.finish_all();
+        });
+        if self.lost.load(Ordering::SeqCst) {
+            VK_ERROR_DEVICE_LOST
+        } else {
+            VK_SUCCESS
+        }
+    }
+}
+
+impl RawHandle for FakeMemory {
+    fn raw(&self) -> u64 {
+        self.handle
     }
 }

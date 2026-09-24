@@ -14,7 +14,7 @@ use crate::venus::executor::policy::{c_name, MEMORY_PROPERTY_HOST_ANY};
 use crate::venus::protocol::*;
 
 /// The host, if it has a device the executor would expose.
-fn host() -> Option<Arc<AshVulkan>> {
+pub(super) fn host() -> Option<Arc<AshVulkan>> {
     let host = match AshVulkan::load() {
         Ok(host) => host,
         Err(why) => {
@@ -254,7 +254,7 @@ fn the_bring_up_runs_on_the_host_gpu_and_names_it_as_ash_does() {
 }
 
 /// `with_device` without the enumeration `boot` would repeat.
-fn with_device_on(h: &mut Harness<AshVulkan>) {
+pub(super) fn with_device_on(h: &mut Harness<AshVulkan>) {
     let Command::CreateDevice(d) = h
         .call(&create_device(PHYSICAL, DEVICE, Vec::new()))
         .unwrap()

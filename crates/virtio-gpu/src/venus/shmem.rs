@@ -1041,6 +1041,19 @@ impl RingPages {
         }
     }
 
+    /// A test playing the guest: clear `bits` of a 32-bit word with an atomic
+    /// AND, the way the guest's watchdog clears `ALIVE` in `status`.
+    #[cfg(test)]
+    pub(crate) fn guest_clear_word_bits(&self, offset: u64, bits: u32) -> bool {
+        match self.word(offset, Writer::Guest) {
+            Some(word) => {
+                word.fetch_and(!bits, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// A test playing the guest: load a 32-bit word (`head`, `status`).
     #[cfg(test)]
     pub(crate) fn guest_load_word(&self, offset: u64) -> Option<u32> {

@@ -486,6 +486,47 @@ impl ContextBlobs {
         })
     }
 
+    /// Copy `size` bytes at `offset` of host blob `resource_id` out, under
+    /// the directory lock: a `vkExecuteCommandStreamsMESA` stream. The same
+    /// rules as [`Self::bind`] (a blob of this context or the kernel's, the
+    /// range inside it, `vkr_cs_decoder_set_resource_stream`); the copy is
+    /// private, so a guest still writing the blob changes nothing the
+    /// executor has begun to decode.
+    ///
+    /// # Errors
+    /// [`ReplyBlobError`] naming the rule broken.
+    pub fn read(
+        &self,
+        resource_id: u32,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, ReplyBlobError> {
+        let blob = self.bind(resource_id, offset, size)?;
+        let len = usize::try_from(size).map_err(|_| ReplyBlobError::OutsideBlob {
+            resource_id,
+            offset,
+            size,
+            blob: 0,
+        })?;
+        self.directory.with(|state| {
+            let entry = state
+                .blobs
+                .get(&resource_id)
+                .filter(|entry| entry.generation == blob.generation)
+                .ok_or(ReplyBlobError::Gone(resource_id))?;
+            let mut bytes = vec![0u8; len];
+            entry.pages.read_bytes(offset, &mut bytes).map_err(|_| {
+                ReplyBlobError::OutsideBlob {
+                    resource_id,
+                    offset,
+                    size,
+                    blob: entry.pages.resource_len(),
+                }
+            })?;
+            Ok(bytes)
+        })
+    }
+
     /// Write `bytes` at resource offset `at` of the blob `blob` names, under
     /// the directory lock.
     ///

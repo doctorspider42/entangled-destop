@@ -424,9 +424,9 @@ fn build_devices(
             );
         }
         tracing::warn!(
-            "attaching the Venus EXECUTING renderer (stage 5b.1): it answers the Vulkan bring-up, \
-             device memory, buffers, images and views on the host GPU, and nothing past them: no \
-             command buffers, no submission"
+            "attaching the Venus EXECUTING renderer (stage 5b.2): it answers the Vulkan bring-up, \
+             device memory, buffers, images, pipelines, descriptors, render passes, command \
+             buffers and fenced queue submission on the host GPU; semaphores are not served yet"
         );
         let renderer =
             virtio_gpu::VenusRenderer::new(virtio_gpu::ExecutorFactory::new(Arc::new(host)));

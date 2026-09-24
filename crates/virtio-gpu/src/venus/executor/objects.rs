@@ -14,9 +14,10 @@
 //!   through the wrong parent (an image of device A destroyed through device
 //!   B) is fatal. virglrenderer relies on the driver for this; we do not hand
 //!   the driver a pair it has to judge.
-//! * **Destruction is in dependency order** — image views, buffer views,
-//!   images, buffers, device memory, command pools, queues, then devices,
-//!   then physical devices, then the instance — whether it comes from a
+//! * **Destruction is in dependency order** — the device idle first, then
+//!   the stage-5b.2 objects ([`RAW_TEARDOWN_ORDER`]), image views, buffer
+//!   views, images, buffers, device memory, command pools, queues, then
+//!   devices, then physical devices, then the instance — whether it comes from a
 //!   `vkDestroy*`, from the context going away, or from a device reset, and
 //!   every host object is destroyed exactly once because destroying it
 //!   *takes* it out of the table. Memory goes after everything that may be
@@ -59,6 +60,43 @@ pub enum Kind {
     BufferView,
     /// `VkImageView`.
     ImageView,
+    /// `VkCommandBuffer`.
+    CommandBuffer,
+    /// `VkShaderModule`.
+    ShaderModule,
+    /// `VkPipelineLayout`.
+    PipelineLayout,
+    /// `VkDescriptorSetLayout`.
+    DescriptorSetLayout,
+    /// `VkDescriptorPool`.
+    DescriptorPool,
+    /// `VkDescriptorSet`.
+    DescriptorSet,
+    /// `VkDescriptorUpdateTemplate`.
+    DescriptorUpdateTemplate,
+    /// `VkSampler`.
+    Sampler,
+    /// `VkSamplerYcbcrConversion`.
+    SamplerYcbcrConversion,
+    /// `VkPipelineCache`.
+    PipelineCache,
+    /// `VkPipeline`.
+    Pipeline,
+    /// `VkRenderPass`.
+    RenderPass,
+    /// `VkFramebuffer`.
+    Framebuffer,
+    /// `VkQueryPool`.
+    QueryPool,
+    /// `VkEvent`.
+    Event,
+    /// `VkFence`.
+    Fence,
+    /// `VkPrivateDataSlot`.
+    PrivateDataSlot,
+    /// `VkSemaphore`: named by the protocol, never created by this stage
+    /// (stage 5b.3), so every id of it is unknown.
+    Semaphore,
 }
 
 impl Kind {
@@ -76,6 +114,24 @@ impl Kind {
             Self::Buffer => "VkBuffer",
             Self::BufferView => "VkBufferView",
             Self::ImageView => "VkImageView",
+            Self::CommandBuffer => "VkCommandBuffer",
+            Self::ShaderModule => "VkShaderModule",
+            Self::PipelineLayout => "VkPipelineLayout",
+            Self::DescriptorSetLayout => "VkDescriptorSetLayout",
+            Self::DescriptorPool => "VkDescriptorPool",
+            Self::DescriptorSet => "VkDescriptorSet",
+            Self::DescriptorUpdateTemplate => "VkDescriptorUpdateTemplate",
+            Self::Sampler => "VkSampler",
+            Self::SamplerYcbcrConversion => "VkSamplerYcbcrConversion",
+            Self::PipelineCache => "VkPipelineCache",
+            Self::Pipeline => "VkPipeline",
+            Self::RenderPass => "VkRenderPass",
+            Self::Framebuffer => "VkFramebuffer",
+            Self::QueryPool => "VkQueryPool",
+            Self::Event => "VkEvent",
+            Self::Fence => "VkFence",
+            Self::PrivateDataSlot => "VkPrivateDataSlot",
+            Self::Semaphore => "VkSemaphore",
         }
     }
 }
@@ -183,6 +239,31 @@ pub struct QueueObject<H: HostVulkan> {
     pub ring_idx: u32,
     /// Its queue family.
     pub family: u32,
+    /// What is known of the work submitted to it (stage 5b.2).
+    pub pending: Pending,
+}
+
+/// What the executor knows of the work a queue may still be running: enough
+/// to wait for all of it before anything that work may use is destroyed.
+///
+/// A `vkQueueSubmit` fence covers every batch submitted to the queue before
+/// it, so the fence of the newest fenced submit stands for the queue's whole
+/// past — until an unfenced submit follows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pending {
+    /// The newest submit's fence, `(guest id, host handle)`.
+    pub fence: Option<(u64, u64)>,
+    /// Whether a submit without a fence came after it: only the queue going
+    /// idle can tell when that one is done.
+    pub unfenced: bool,
+}
+
+impl Pending {
+    /// Whether anything may still be running.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.fence.is_some() || self.unfenced
+    }
 }
 
 /// A `VkCommandPool`: a host handle and its device.
@@ -316,6 +397,146 @@ pub struct ViewObject<T> {
     pub host: T,
 }
 
+/// One binding of a descriptor set layout, as a write into a set of it is
+/// judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutBinding {
+    /// `binding`.
+    pub binding: u32,
+    /// `descriptorType`.
+    pub descriptor_type: i32,
+    /// `descriptorCount`: descriptors, or bytes for an inline uniform block.
+    pub count: u32,
+}
+
+/// A descriptor set layout's bindings, by binding number, and what a
+/// `vkCmdBindDescriptorSets` of a set of it owes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SetLayoutInfo {
+    /// Every binding, sorted by binding number.
+    pub bindings: Vec<LayoutBinding>,
+    /// Dynamic buffer descriptors: the dynamic offsets a bind of a set of
+    /// this layout supplies.
+    pub dynamic: u32,
+    /// The binding created with `VARIABLE_DESCRIPTOR_COUNT`, if any: a set
+    /// has as many of it as its allocation asked for.
+    pub variable: Option<u32>,
+}
+
+impl SetLayoutInfo {
+    /// The binding numbered `binding`.
+    #[must_use]
+    pub fn binding(&self, binding: u32) -> Option<&LayoutBinding> {
+        self.bindings
+            .binary_search_by_key(&binding, |b| b.binding)
+            .ok()
+            .and_then(|i| self.bindings.get(i))
+    }
+}
+
+/// What the executor keeps of a stage-5b.2 object beyond its handle: the
+/// facts later commands are judged by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Facts {
+    /// Nothing.
+    None,
+    /// A command buffer, and whether it is secondary.
+    CommandBuffer {
+        /// `VK_COMMAND_BUFFER_LEVEL_SECONDARY`.
+        secondary: bool,
+    },
+    /// A pipeline and the bind point it was created for.
+    Pipeline {
+        /// `VkPipelineBindPoint`.
+        bind_point: i32,
+    },
+    /// A query pool.
+    QueryPool {
+        /// `queryType`.
+        query_type: i32,
+        /// `queryCount`: every query index is below it.
+        count: u32,
+        /// Values one query answers: 1, or the statistics a pipeline
+        /// statistics pool counts.
+        values: u32,
+    },
+    /// A descriptor pool.
+    DescriptorPool {
+        /// `VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT`.
+        free_individual: bool,
+    },
+    /// A framebuffer.
+    Framebuffer {
+        /// `VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT`.
+        imageless: bool,
+        /// `attachmentCount`.
+        attachments: u32,
+    },
+    /// A render pass.
+    RenderPass {
+        /// `attachmentCount`.
+        attachments: u32,
+        /// One past the highest attachment index a `CLEAR` load op reads a
+        /// clear value for: what `clearValueCount` must reach.
+        clears: u32,
+    },
+    /// A pipeline layout.
+    PipelineLayout {
+        /// `setLayoutCount`.
+        sets: u32,
+    },
+    /// A descriptor set layout.
+    SetLayout(Arc<SetLayoutInfo>),
+    /// A descriptor set: its layout's bindings (shared, and kept even if the
+    /// layout is destroyed first, which Vulkan allows), and how many
+    /// descriptors its variable-count binding got.
+    DescriptorSet {
+        /// The layout it was allocated with.
+        layout: Arc<SetLayoutInfo>,
+        /// The count of the layout's variable binding, for this set.
+        variable: u32,
+    },
+}
+
+/// A stage-5b.2 object: every kind whose host object is a plain Vulkan
+/// handle, created through [`HostVulkan::call`] and destroyed through
+/// [`HostVulkan::destroy_object`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawObject {
+    /// What it is.
+    pub kind: Kind,
+    /// Its device's guest id.
+    pub device: u64,
+    /// The host handle.
+    pub host: u64,
+    /// The guest id of the pool it came from (command buffers, descriptor
+    /// sets), 0 for every other kind.
+    pub pool: u64,
+    /// What later commands are judged by.
+    pub facts: Facts,
+}
+
+/// The order the stage-5b.2 objects of a device are torn down in: users
+/// before what they use. Command buffers and descriptor sets are not in it:
+/// their pools free them.
+pub const RAW_TEARDOWN_ORDER: &[Kind] = &[
+    Kind::Pipeline,
+    Kind::Framebuffer,
+    Kind::RenderPass,
+    Kind::DescriptorUpdateTemplate,
+    Kind::DescriptorPool,
+    Kind::DescriptorSetLayout,
+    Kind::PipelineLayout,
+    Kind::Sampler,
+    Kind::SamplerYcbcrConversion,
+    Kind::ShaderModule,
+    Kind::PipelineCache,
+    Kind::QueryPool,
+    Kind::Event,
+    Kind::Fence,
+    Kind::PrivateDataSlot,
+];
+
 /// A table entry that belongs to a device.
 pub trait Child {
     /// The device's guest id.
@@ -328,6 +549,11 @@ impl<T> Child for DeviceChild<T> {
     }
 }
 impl<T> Child for ViewObject<T> {
+    fn device(&self) -> u64 {
+        self.device
+    }
+}
+impl Child for RawObject {
     fn device(&self) -> u64 {
         self.device
     }
@@ -361,6 +587,7 @@ pub struct Objects<H: HostVulkan> {
     buffers: HashMap<u64, BufferObject<H>>,
     buffer_views: HashMap<u64, ViewObject<H::BufferView>>,
     image_views: HashMap<u64, ViewObject<H::ImageView>>,
+    raw: HashMap<u64, RawObject>,
 }
 
 impl<H: HostVulkan> Default for Objects<H> {
@@ -377,6 +604,7 @@ impl<H: HostVulkan> Default for Objects<H> {
             buffers: HashMap::new(),
             buffer_views: HashMap::new(),
             image_views: HashMap::new(),
+            raw: HashMap::new(),
         }
     }
 }
@@ -665,6 +893,127 @@ impl<H: HostVulkan> Objects<H> {
         })
     }
 
+    /// The queue `id` names, mutably.
+    ///
+    /// # Errors
+    /// As [`Self::check`].
+    pub fn queue_mut(&mut self, id: u64) -> Result<&mut QueueObject<H>, IdError> {
+        self.check(id, Kind::Queue)?;
+        self.queues.get_mut(&id).ok_or(IdError::Unknown {
+            id,
+            expected: Kind::Queue.name(),
+        })
+    }
+
+    /// Every queue of `device`, by guest id, in id order.
+    #[must_use]
+    pub fn queues_of(&self, device: u64) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .queues
+            .iter()
+            .filter(|(_, queue)| queue.device == device)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The command pool `id` names, which must belong to `device`.
+    ///
+    /// # Errors
+    /// As [`Self::image`], for a pool.
+    pub fn pool(&self, device: u64, id: u64) -> Result<&DeviceChild<H::CommandPool>, IdError> {
+        child_in(&self.pools, &self.kinds, Kind::CommandPool, device, id)
+    }
+
+    /// The buffer view `id` names, which must belong to `device`.
+    ///
+    /// # Errors
+    /// As [`Self::image`], for a view.
+    pub fn buffer_view(&self, device: u64, id: u64) -> Result<&ViewObject<H::BufferView>, IdError> {
+        child_in(
+            &self.buffer_views,
+            &self.kinds,
+            Kind::BufferView,
+            device,
+            id,
+        )
+    }
+
+    /// The image view `id` names, which must belong to `device`.
+    ///
+    /// # Errors
+    /// As [`Self::image`], for a view.
+    pub fn image_view(&self, device: u64, id: u64) -> Result<&ViewObject<H::ImageView>, IdError> {
+        child_in(&self.image_views, &self.kinds, Kind::ImageView, device, id)
+    }
+
+    // ------------------------------------------------ stage-5b.2 objects
+
+    /// Bind stage-5b.2 object `id`. The caller has checked the id.
+    pub fn insert_raw(&mut self, id: u64, object: RawObject) {
+        self.kinds.insert(id, object.kind);
+        self.raw.insert(id, object);
+    }
+
+    /// The stage-5b.2 object `id` names, which must be a `kind` of `device`.
+    ///
+    /// # Errors
+    /// As [`Self::image`].
+    pub fn raw(&self, kind: Kind, device: u64, id: u64) -> Result<&RawObject, IdError> {
+        child_in(&self.raw, &self.kinds, kind, device, id)
+    }
+
+    /// The stage-5b.2 object `id` names, whatever its device: how a command
+    /// dispatched on a command buffer finds its device.
+    ///
+    /// # Errors
+    /// As [`Self::check`].
+    pub fn raw_any(&self, kind: Kind, id: u64) -> Result<&RawObject, IdError> {
+        self.check(id, kind)?;
+        self.raw.get(&id).ok_or(IdError::Unknown {
+            id,
+            expected: kind.name(),
+        })
+    }
+
+    /// Take stage-5b.2 object `id` (a `kind` of `device`) out of the table;
+    /// `Ok(None)` for id 0.
+    ///
+    /// # Errors
+    /// As [`Self::raw`].
+    pub fn take_raw(
+        &mut self,
+        kind: Kind,
+        device: u64,
+        id: u64,
+    ) -> Result<Option<RawObject>, IdError> {
+        take_in(&mut self.raw, &mut self.kinds, kind, device, id)
+    }
+
+    /// Take out, without destroying anything on the host, every object
+    /// allocated from pool `pool` (command buffers or descriptor sets): the
+    /// host frees them with the pool, or with a pool reset. Answers how many.
+    pub fn forget_pool_children(&mut self, pool: u64) -> usize {
+        let children: Vec<u64> = self
+            .raw
+            .iter()
+            .filter(|(_, object)| object.pool == pool)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &children {
+            self.raw.remove(id);
+            self.kinds.remove(id);
+        }
+        children.len()
+    }
+
+    /// Objects of `kind` the table holds, of every device.
+    #[must_use]
+    pub fn count_of(&self, kind: Kind) -> usize {
+        self.kinds.values().filter(|k| **k == kind).count()
+    }
+
     /// Some queue of `device`, for a test that submits.
     #[cfg(test)]
     pub(crate) fn any_queue(&self, device: u64) -> Option<&QueueObject<H>> {
@@ -867,6 +1216,35 @@ impl<H: HostVulkan> Objects<H> {
             return;
         };
         self.kinds.remove(&id);
+        // Nothing may be freed under work the GPU is still doing: vkr waits
+        // on its worker thread the same way (`vkr_device_destroy`). A lost
+        // device answers at once, and its objects may still be destroyed.
+        let _ = host.device_wait_idle(&device.host);
+        let raw = children_of(&self.raw, id);
+        // Pool children leave the table only: their pools free them.
+        for child in &raw {
+            if self
+                .raw
+                .get(child)
+                .is_some_and(|o| matches!(o.kind, Kind::CommandBuffer | Kind::DescriptorSet))
+            {
+                self.raw.remove(child);
+                self.kinds.remove(child);
+            }
+        }
+        for kind in RAW_TEARDOWN_ORDER {
+            for child in &raw {
+                let Some(object) = self.raw.get(child).cloned() else {
+                    continue;
+                };
+                if object.kind != *kind {
+                    continue;
+                }
+                self.raw.remove(child);
+                self.kinds.remove(child);
+                host.destroy_object(&device.host, object.kind, object.host);
+            }
+        }
         for child in children_of(&self.image_views, id) {
             if let Some(view) = self.image_views.remove(&child) {
                 self.kinds.remove(&child);
@@ -941,5 +1319,6 @@ impl<H: HostVulkan> Objects<H> {
         self.buffers.clear();
         self.buffer_views.clear();
         self.image_views.clear();
+        self.raw.clear();
     }
 }

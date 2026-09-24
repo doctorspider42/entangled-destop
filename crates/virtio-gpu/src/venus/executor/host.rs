@@ -1,6 +1,9 @@
-//! The host Vulkan the executor drives: exactly the calls stages 5a.3 and
-//! 5b.1 make, as a trait, so that everything above it — the object table, the id rules,
-//! the policies and the reply shapes — is provable on a host with no GPU.
+//! The host Vulkan the executor drives, as a trait, so that everything above
+//! it — the object table, the id rules, the policies and the reply shapes —
+//! is provable on a host with no GPU. Stages 5a.3 and 5b.1 have one typed
+//! method per call; stage 5b.2's ~140 commands go through one generic
+//! [`HostVulkan::call`], fed a command the generated translation has already
+//! turned into host handles and checked ([`super::generated`]).
 //!
 //! The trait speaks the **generated protocol structures**, not `ash`'s. That
 //! is the seam's whole point: a fake implements it by filling in plain Rust
@@ -18,13 +21,14 @@
 use std::fmt;
 use std::sync::Arc;
 
+use super::objects::Kind;
 use crate::venus::protocol::{
-    VkBufferCreateInfo, VkBufferViewCreateInfo, VkCommandPoolCreateInfo, VkDeviceCreateInfoNext,
-    VkExtensionProperties, VkFormat, VkFormatProperties2, VkImageAspectFlagBits, VkImageCreateInfo,
-    VkImageFormatProperties2, VkImageSubresource, VkImageViewCreateInfo, VkMemoryRequirements2,
-    VkPhysicalDeviceFeatures, VkPhysicalDeviceFeatures2, VkPhysicalDeviceImageFormatInfo2,
-    VkPhysicalDeviceMemoryProperties, VkPhysicalDeviceProperties2, VkQueueFamilyProperties,
-    VkResult, VkSubresourceLayout,
+    Command, VkBufferCreateInfo, VkBufferViewCreateInfo, VkCommandPoolCreateInfo,
+    VkDeviceCreateInfoNext, VkExtensionProperties, VkFormat, VkFormatProperties2,
+    VkImageAspectFlagBits, VkImageCreateInfo, VkImageFormatProperties2, VkImageSubresource,
+    VkImageViewCreateInfo, VkMemoryRequirements2, VkPhysicalDeviceFeatures,
+    VkPhysicalDeviceFeatures2, VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceMemoryProperties,
+    VkPhysicalDeviceProperties2, VkQueueFamilyProperties, VkResult, VkSubresourceLayout,
 };
 use crate::venus::shmem::RingPages;
 
@@ -152,6 +156,50 @@ pub struct ImageBind<'m, I, M> {
     pub plane: Option<VkImageAspectFlagBits>,
 }
 
+/// A host object as the raw `u64` every Vulkan handle is: what translation
+/// ([`super::generated`]) puts in place of a guest id, and what the generated
+/// host call turns back into a typed handle.
+pub trait RawHandle {
+    /// The handle's value.
+    fn raw(&self) -> u64;
+}
+
+impl RawHandle for u64 {
+    fn raw(&self) -> u64 {
+        *self
+    }
+}
+
+/// Why a generated host call did not reach the driver. Every one is a
+/// disagreement between the translated command and the host's own checks,
+/// and the command is refused, fatal to the context, with nothing called.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CallError {
+    /// The command has no generated call.
+    #[error("{0} has no generated host call")]
+    NoCall(&'static str),
+    /// A chained structure the executor does not admit reached the host.
+    #[error("{parent} chains sType {stype}, which the host call does not build")]
+    Link {
+        /// The structure whose chain carried it.
+        parent: &'static str,
+        /// Its `sType`.
+        stype: i32,
+    },
+    /// An array that disagrees with its count.
+    #[error("{what} disagrees with its count")]
+    Count {
+        /// The field.
+        what: &'static str,
+    },
+    /// An output larger than the host will allocate for one call.
+    #[error("{what} asks for more than the host allocates for one call")]
+    TooLarge {
+        /// The field.
+        what: &'static str,
+    },
+}
+
 /// The host Vulkan calls this stage makes. See the module docs.
 ///
 /// Every method is infallible where the Vulkan call is, and returns the
@@ -166,20 +214,20 @@ pub trait HostVulkan: Send + Sync + 'static {
     /// A host `VkDevice` together with whatever calling it needs.
     type Device: Send + 'static;
     /// A host `VkQueue`.
-    type Queue: Copy + Send + 'static;
+    type Queue: Copy + Send + RawHandle + 'static;
     /// A host `VkCommandPool`.
-    type CommandPool: Copy + Send + 'static;
+    type CommandPool: Copy + Send + RawHandle + 'static;
     /// A host `VkImage`.
-    type Image: Copy + Send + 'static;
+    type Image: Copy + Send + RawHandle + 'static;
     /// A host `VkDeviceMemory` together with whatever keeps it valid (the
     /// imported pages' `Arc`). Owned: [`HostVulkan::free_memory`] takes it.
-    type Memory: Send + 'static;
+    type Memory: Send + RawHandle + 'static;
     /// A host `VkBuffer`.
-    type Buffer: Copy + Send + 'static;
+    type Buffer: Copy + Send + RawHandle + 'static;
     /// A host `VkBufferView`.
-    type BufferView: Copy + Send + 'static;
+    type BufferView: Copy + Send + RawHandle + 'static;
     /// A host `VkImageView`.
-    type ImageView: Copy + Send + 'static;
+    type ImageView: Copy + Send + RawHandle + 'static;
 
     /// `vkEnumerateInstanceVersion` of the host loader.
     ///
@@ -446,4 +494,23 @@ pub trait HostVulkan: Send + Sync + 'static {
 
     /// `vkDestroyBufferView`.
     fn destroy_buffer_view(&self, device: &Self::Device, view: Self::BufferView);
+
+    // ------------------------------------------------------- stage 5b.2
+
+    /// Call the driver for `command`, whose inputs the executor translated
+    /// ([`super::generated::translate`]): every guest id replaced by the
+    /// host handle it names, every value checked. Outputs — created handles,
+    /// results, blobs, structures — are written back into `command`.
+    ///
+    /// # Errors
+    /// [`CallError`]: nothing reached the driver.
+    fn call(&self, device: &Self::Device, command: &mut Command<'_>) -> Result<(), CallError>;
+
+    /// Destroy one stage-5b.2 object of `kind` (never a command buffer or a
+    /// descriptor set, which their pools free), host handle `raw`, created
+    /// on `device` through [`call`](Self::call).
+    fn destroy_object(&self, device: &Self::Device, kind: Kind, raw: u64);
+
+    /// `vkDeviceWaitIdle`, before anything is torn down under the GPU.
+    fn device_wait_idle(&self, device: &Self::Device) -> VkResult;
 }

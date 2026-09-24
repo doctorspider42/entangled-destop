@@ -371,6 +371,8 @@ impl<H: HostVulkan> VulkanContext<H> {
     pub(super) fn free_memory(&mut self, args: &FreeMemoryArgs) -> Result<(), ExecError> {
         const NAME: &str = "vkFreeMemory";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
+        // Nothing the GPU may still be using is freed under it.
+        self.settle(args.device.0);
         if let Some(memory) = self
             .objects
             .take_memory(args.device.0, args.memory.0)
@@ -574,6 +576,8 @@ impl<H: HostVulkan> VulkanContext<H> {
     pub(super) fn destroy_buffer(&mut self, args: &DestroyBufferArgs) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyBuffer";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
+        // Nothing the GPU may still be using is freed under it.
+        self.settle(args.device.0);
         if let Some(buffer) = self
             .objects
             .take_buffer(args.device.0, args.buffer.0)
@@ -971,6 +975,8 @@ impl<H: HostVulkan> VulkanContext<H> {
     ) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyBufferView";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
+        // Nothing the GPU may still be using is freed under it.
+        self.settle(args.device.0);
         if let Some(view) = self
             .objects
             .take_buffer_view(args.device.0, args.buffer_view.0)
@@ -1368,6 +1374,8 @@ impl<H: HostVulkan> VulkanContext<H> {
     ) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyImageView";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
+        // Nothing the GPU may still be using is freed under it.
+        self.settle(args.device.0);
         if let Some(view) = self
             .objects
             .take_image_view(args.device.0, args.image_view.0)
