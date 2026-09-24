@@ -110,6 +110,13 @@
 //! FIFO per `(context, ring_idx)` (`crate::fence`), so the capset says
 //! `supports_multiple_timelines` — which Mesa only asserts, and binds queues
 //! to timelines 1–63 regardless (spec §6).
+//!
+//! # Scanout of a handle blob (stage S2b)
+//!
+//! A guest compositor's frames are handle blobs; the factory reads one back
+//! through a device of the renderer's own ([`scanout`]), made the first time
+//! one is scanned out, on the GPU the blob was exported from. It is not any
+//! context's: no guest teardown reaches it.
 
 pub mod context;
 pub mod device_objects;
@@ -119,6 +126,7 @@ pub mod memory;
 pub mod modifier;
 pub mod objects;
 pub mod policy;
+pub mod scanout;
 pub mod submit;
 pub mod timeline;
 
@@ -133,9 +141,13 @@ pub(crate) mod harness;
 #[cfg(test)]
 mod memory_tests;
 #[cfg(test)]
+mod query_tests;
+#[cfg(test)]
 pub(crate) mod recording;
 #[cfg(test)]
 mod s1_tests;
+#[cfg(test)]
+mod s2b_tests;
 #[cfg(test)]
 mod submit_tests;
 #[cfg(test)]
@@ -159,7 +171,8 @@ use super::pump::{Batch, Consumed, RingSink};
 #[cfg(doc)]
 use super::renderer::VenusRenderer;
 use super::renderer::{
-    BlobRef, ContextBlobs, ExportedMemory, ReplyBlobError, RingEnv, SinkFactory,
+    BlobRef, ContextBlobs, ExportedMemory, ReplyBlobError, RingEnv, ScanoutRelease, ScanoutTarget,
+    SinkFactory,
 };
 use super::service::StopSignal;
 use super::shmem::PageBudget;
@@ -720,6 +733,9 @@ pub struct ExecutorFactory<H: HostVulkan> {
     host: Arc<H>,
     contexts: HashMap<u32, Arc<Mutex<VulkanContext<H>>>>,
     budget: Arc<PageBudget>,
+    /// The renderer's own scanout device (stage S2b), once a handle blob
+    /// has been scanned out.
+    scanout: Option<scanout::ScanoutDevice<H>>,
 }
 
 impl<H: HostVulkan> std::fmt::Debug for ExecutorFactory<H> {
@@ -745,7 +761,41 @@ impl<H: HostVulkan> ExecutorFactory<H> {
             host,
             contexts: HashMap::new(),
             budget: PageBudget::new(limit),
+            scanout: None,
         }
+    }
+
+    /// The scanout device for a blob exported on the GPU `target` names,
+    /// opened now if there is none or it is on another GPU (stage S2b).
+    fn scanout_device(
+        &mut self,
+        target: &ScanoutTarget,
+    ) -> Result<&mut scanout::ScanoutDevice<H>, String> {
+        let uuids = target
+            .handle
+            .0
+            .downcast_ref::<memory::HandleExport<H>>()
+            .ok_or("a handle this host did not make")?
+            .uuids;
+        if self.scanout.as_ref().is_some_and(|d| d.uuids() != uuids) {
+            self.scanout = None;
+        }
+        if self.scanout.is_none() {
+            self.scanout = Some(scanout::ScanoutDevice::open(
+                Arc::clone(&self.host),
+                Arc::clone(&self.budget),
+                uuids,
+            )?);
+        }
+        self.scanout
+            .as_mut()
+            .ok_or_else(|| "no scanout device".to_owned())
+    }
+
+    /// The scanout device, for a test.
+    #[cfg(test)]
+    pub(crate) fn scanout(&self) -> Option<&scanout::ScanoutDevice<H>> {
+        self.scanout.as_ref()
     }
 
     /// Bytes of host pages behind host-visible memory right now — every
@@ -851,6 +901,55 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         for (_, context) in self.contexts.drain() {
             lock(&context).destroy_all();
         }
+        // Stage S2b: every import goes; the scanout device stays (it holds
+        // nothing of any guest after this — `scanout`'s module docs).
+        if let Some(device) = self.scanout.as_mut() {
+            device.clear();
+        }
+    }
+
+    fn prepare_scanout(&mut self, target: &ScanoutTarget) -> Result<(), String> {
+        let device = self.scanout_device(target)?;
+        match device.prepare(target) {
+            Ok(()) => Ok(()),
+            Err(scanout::ScanoutError::Lost(why)) => {
+                self.scanout = None;
+                Err(format!("the scanout device is lost ({why})"))
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn read_scanout(
+        &mut self,
+        target: &ScanoutTarget,
+        release: ScanoutRelease,
+        rect: crate::protocol::Rect,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let device = self.scanout_device(target)?;
+        match device.read(target, release, rect, out) {
+            Ok(()) => Ok(()),
+            Err(scanout::ScanoutError::Lost(why)) => {
+                // Dropped now, made again by the next scanout.
+                tracing::warn!(%why, "the venus scanout device is lost; it will be made again");
+                self.scanout = None;
+                Err(format!("the scanout device is lost ({why})"))
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn forget_scanout(&mut self, resource_id: u32) {
+        if let Some(device) = self.scanout.as_mut() {
+            device.forget(resource_id);
+        }
+    }
+
+    fn scanout_targets(&self) -> usize {
+        self.scanout
+            .as_ref()
+            .map_or(0, scanout::ScanoutDevice::target_count)
     }
 
     fn retires_ring_fences(&self) -> bool {

@@ -252,6 +252,58 @@ fn barrier_families(
     buffers.chain(images).collect()
 }
 
+/// One image barrier that releases its image out of the instance (stage
+/// S2b): to `VK_QUEUE_FAMILY_FOREIGN_EXT` or `VK_QUEUE_FAMILY_EXTERNAL`,
+/// from a family of the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Release {
+    image: u64,
+    new_layout: i32,
+    dst_family: u32,
+}
+
+/// Whether `(src, dst)` releases out of the instance.
+fn is_release(src: u32, dst: u32) -> bool {
+    use super::policy::{QUEUE_FAMILY_EXTERNAL, QUEUE_FAMILY_FOREIGN, QUEUE_FAMILY_IGNORED};
+    let outside = |f: u32| f == QUEUE_FAMILY_EXTERNAL || f == QUEUE_FAMILY_FOREIGN;
+    outside(dst) && !outside(src) && src != QUEUE_FAMILY_IGNORED
+}
+
+/// The releases among a 1.0 barrier command's image barriers.
+fn image_releases(images: Option<&[crate::venus::protocol::VkImageMemoryBarrier]>) -> Vec<Release> {
+    images
+        .unwrap_or_default()
+        .iter()
+        .filter(|b| is_release(b.src_queue_family_index, b.dst_queue_family_index))
+        .map(|b| Release {
+            image: b.image.0,
+            new_layout: b.new_layout,
+            dst_family: b.dst_queue_family_index,
+        })
+        .collect()
+}
+
+/// [`image_releases`] of sync2 dependency infos.
+fn dependency_releases<'a>(
+    infos: impl Iterator<Item = &'a crate::venus::protocol::VkDependencyInfo>,
+) -> Vec<Release> {
+    let mut out = Vec::new();
+    for info in infos {
+        out.extend(
+            info.p_image_memory_barriers
+                .iter()
+                .flatten()
+                .filter(|b| is_release(b.src_queue_family_index, b.dst_queue_family_index))
+                .map(|b| Release {
+                    image: b.image.0,
+                    new_layout: b.new_layout,
+                    dst_family: b.dst_queue_family_index,
+                }),
+        );
+    }
+    out
+}
+
 /// [`barrier_families`] of sync2 dependency infos.
 fn dependency_families<'a>(
     infos: impl Iterator<Item = &'a crate::venus::protocol::VkDependencyInfo>,
@@ -1372,8 +1424,11 @@ impl<H: HostVulkan> VulkanContext<H> {
                     args.p_buffer_memory_barriers.as_deref(),
                     args.p_image_memory_barriers.as_deref(),
                 );
+                let releases = image_releases(args.p_image_memory_barriers.as_deref());
                 self.check_families(NAME, device, &pairs, false)?;
-                self.pass_through(command)
+                self.pass_through(command)?;
+                self.note_releases(device, &releases);
+                Ok(())
             }
             Command::CmdWaitEvents(args) => {
                 const NAME: &str = "vkCmdWaitEvents";
@@ -1382,22 +1437,31 @@ impl<H: HostVulkan> VulkanContext<H> {
                     args.p_buffer_memory_barriers.as_deref(),
                     args.p_image_memory_barriers.as_deref(),
                 );
+                let releases = image_releases(args.p_image_memory_barriers.as_deref());
                 self.check_families(NAME, device, &pairs, false)?;
-                self.pass_through(command)
+                self.pass_through(command)?;
+                self.note_releases(device, &releases);
+                Ok(())
             }
             Command::CmdPipelineBarrier2(args) => {
                 const NAME: &str = "vkCmdPipelineBarrier2";
                 let device = self.cmd_device(NAME, args.command_buffer.0)?;
                 let pairs = dependency_families(args.p_dependency_info.iter());
+                let releases = dependency_releases(args.p_dependency_info.iter());
                 self.check_families(NAME, device, &pairs, false)?;
-                self.pass_through(command)
+                self.pass_through(command)?;
+                self.note_releases(device, &releases);
+                Ok(())
             }
             Command::CmdWaitEvents2(args) => {
                 const NAME: &str = "vkCmdWaitEvents2";
                 let device = self.cmd_device(NAME, args.command_buffer.0)?;
                 let pairs = dependency_families(args.p_dependency_infos.iter().flatten());
+                let releases = dependency_releases(args.p_dependency_infos.iter().flatten());
                 self.check_families(NAME, device, &pairs, false)?;
-                self.pass_through(command)
+                self.pass_through(command)?;
+                self.note_releases(device, &releases);
+                Ok(())
             }
             Command::CmdSetEvent2(args) => {
                 const NAME: &str = "vkCmdSetEvent2";
@@ -1466,6 +1530,33 @@ impl<H: HostVulkan> VulkanContext<H> {
             }
         }
         Ok(())
+    }
+
+    /// Stage S2b: every image barrier that releases an image out of the
+    /// instance, on an image recorded as a handle blob's canonical image,
+    /// sets that blob's release — the layout and family the renderer's
+    /// scanout device acquires it from and hands it back to. Zink releases
+    /// every exported image this way at the end of each batch
+    /// (`zink_batch.c:900-934`: `oldLayout == newLayout == res->layout`,
+    /// `srcQueueFamilyIndex` its own queue's family, `dst` `FOREIGN`).
+    /// Recorded when the barrier is recorded, which for a frame Mutter flips
+    /// is before the flip: Mutter commits a frame only once its fence has
+    /// signalled (`meta-kms-impl-device.c:2089-2116`).
+    fn note_releases(&self, device: u64, releases: &[Release]) {
+        let Some(blobs) = self.blobs.as_ref() else {
+            return;
+        };
+        for release in releases {
+            let Some(scanout) = self
+                .objects
+                .image(device, release.image)
+                .ok()
+                .and_then(|image| image.scanout.as_ref())
+            else {
+                continue;
+            };
+            blobs.record_release(&scanout.shared, release.new_layout, release.dst_family);
+        }
     }
 
     // ------------------------------------------------------ the three steps

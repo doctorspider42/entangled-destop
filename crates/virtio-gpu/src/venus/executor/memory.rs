@@ -123,7 +123,7 @@ use crate::venus::protocol::{
     VK_ERROR_INVALID_EXTERNAL_HANDLE, VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_OUT_OF_HOST_MEMORY,
     VK_ERROR_UNKNOWN, VK_SHARING_MODE_CONCURRENT, VK_SUCCESS,
 };
-use crate::venus::renderer::{ExportedMemory, SharedHandle};
+use crate::venus::renderer::{ExportedMemory, ScanoutImage, SharedHandle, SharedRef};
 use crate::venus::shmem::{RingPages, ShmemError};
 
 #[cfg(doc)]
@@ -136,8 +136,8 @@ use super::context::{
 use super::host::{Dedicated, HostVulkan, ImageBind, MemoryRequest, ResourceMemory};
 use super::modifier::{self, IMAGE_ASPECT_MEMORY_PLANE_0};
 use super::objects::{
-    Binding, BufferObject, DedicatedTo, DeviceObject, ImageFacts, Kind, MemoryHandle, MemoryObject,
-    ViewObject,
+    Binding, BufferObject, DedicatedTo, DeviceObject, ImageFacts, ImageObject, ImageScanout, Kind,
+    MemoryHandle, MemoryObject, ViewObject,
 };
 use super::policy::{self, GuestDevice};
 
@@ -159,6 +159,35 @@ pub struct HandleExport<H: HostVulkan> {
     pub size: u64,
     /// The exporting device's `(deviceUUID, driverUUID)`.
     pub uuids: ([u8; 16], [u8; 16]),
+}
+
+/// Record canonical image `id` of context `ctx_id` on the handle blob holding
+/// `shared` (stage S2b), giving the image the token the record lives by.
+fn record_image<H: HostVulkan>(
+    ctx_id: u32,
+    blobs: &crate::venus::renderer::ContextBlobs,
+    shared: &SharedRef,
+    id: u64,
+    image: &mut ImageObject<H>,
+) {
+    let (Some(canonical), Some((_, offset))) = (image.canonical.clone(), image.bound_memory) else {
+        return;
+    };
+    let token = Arc::new(());
+    blobs.record_scanout_image(
+        shared,
+        ScanoutImage {
+            ctx_id,
+            image: id,
+            offset,
+            canonical,
+            alive: Arc::downgrade(&token),
+        },
+    );
+    image.scanout = Some(ImageScanout {
+        shared: shared.clone(),
+        token,
+    });
 }
 
 /// The `VkExternalMemory*CreateInfo` a resource was created with on the host.
@@ -569,6 +598,8 @@ impl<H: HostVulkan> VulkanContext<H> {
                         } else {
                             MemoryHandle::None
                         },
+                        // Stage S2b: the handle, once its blob is made.
+                        shared: None,
                     },
                 );
                 args.ret = VK_SUCCESS;
@@ -700,6 +731,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                         dedicated: None,
                         allocate_flags: flags.map_or(0, |(f, _)| f),
                         handle: MemoryHandle::None,
+                        shared: None,
                     },
                 );
                 args.ret = VK_SUCCESS;
@@ -817,6 +849,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                         dedicated,
                         allocate_flags: flags.map_or(0, |(f, _)| f),
                         handle: MemoryHandle::Imported,
+                        shared: Some(SharedRef::of(shared)),
                     },
                 );
                 args.ret = VK_SUCCESS;
@@ -998,10 +1031,29 @@ impl<H: HostVulkan> VulkanContext<H> {
             .host
             .export_memory_handle(&device.host, &memory.host)
             .map_err(|ret| format!("vkGetMemoryWin32HandleKHR of memory {blob_id:#x}: {ret}"))?;
-        self.objects
+        let handle = SharedHandle(Arc::new(HandleExport::<H> {
+            shared: Arc::new(shared),
+            type_index,
+            size: host_size,
+            uuids,
+        }));
+        let memory = self
+            .objects
             .memory_by_id_mut(blob_id)
-            .map_err(|error| error.to_string())?
-            .exported = true;
+            .map_err(|error| error.to_string())?;
+        memory.exported = true;
+        // Stage S2b: how a canonical image bound to this memory later finds
+        // the blob to record itself on — without holding the handle open —
+        // and the ones bound already record themselves now (pending in the
+        // directory until the renderer inserts the blob, straight after).
+        let shared = SharedRef::of(&handle);
+        memory.shared = Some(shared.clone());
+        if let Some(blobs) = self.blobs.clone() {
+            let ctx_id = self.ctx_id;
+            for (id, image) in self.objects.unrecorded_images_on(blob_id) {
+                record_image(ctx_id, &blobs, &shared, id, image);
+            }
+        }
         tracing::debug!(
             ctx_id = self.ctx_id,
             memory = format_args!("{blob_id:#x}"),
@@ -1009,14 +1061,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             type_index,
             "device-local memory exported as a handle blob"
         );
-        Ok(ExportedMemory::Handle(SharedHandle(Arc::new(
-            HandleExport::<H> {
-                shared: Arc::new(shared),
-                type_index,
-                size: host_size,
-                uuids,
-            },
-        ))))
+        Ok(ExportedMemory::Handle(handle))
     }
 
     // --------------------------------------------------------- buffers
@@ -1684,7 +1729,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             // Stage S1: the canonical image's requirements, as for a create.
             let physical = device.physical;
             let host_info = match self.modifier_create_info(NAME, physical, create, choice)? {
-                Ok((host_info, layout)) => Some((host_info, layout)),
+                Ok((host_info, layout, _)) => Some((host_info, layout)),
                 // The explicit layout a create would answer for: the image
                 // that would not be has no requirements to report.
                 Err(_) => None,
@@ -1921,8 +1966,39 @@ impl<H: HostVulkan> VulkanContext<H> {
                     .map_err(id_error(command))?;
                 image.bound_planes |= 1 << index;
             }
+            for bind in binds {
+                self.record_scanout_image(device_id, bind);
+            }
         }
         Ok(ret)
+    }
+
+    /// Stage S2b: a canonical image bound to the memory of a handle blob —
+    /// the export's own memory, or an import of it — is recorded on that blob
+    /// as the image its payload holds
+    /// ([`ContextBlobs::record_scanout_image`](crate::venus::renderer::ContextBlobs::record_scanout_image)),
+    /// under the blob directory's lock: its exact canonical create info and
+    /// the offset it is bound at. That is what a `SET_SCANOUT_BLOB` of the
+    /// blob is judged against and what the renderer's scanout device
+    /// recreates. Memory whose blob is not made yet records the image when
+    /// it is ([`Self::export_memory`]). The record lives as long as the image
+    /// does (a token the image holds), whichever way the image goes.
+    fn record_scanout_image(&mut self, device_id: u64, bind: &VkBindImageMemoryInfo) {
+        let shared = self
+            .objects
+            .memory(device_id, bind.memory.0)
+            .ok()
+            .and_then(|memory| memory.shared.clone());
+        let Ok(image) = self.objects.image_mut(device_id, bind.image.0) else {
+            return;
+        };
+        if image.canonical.is_none() {
+            return;
+        }
+        image.bound_memory = Some((bind.memory.0, bind.memory_offset));
+        if let (Some(shared), Some(blobs)) = (shared, self.blobs.as_ref()) {
+            record_image(self.ctx_id, blobs, &shared, bind.image.0, image);
+        }
     }
 
     /// `vkBindImageMemory`.

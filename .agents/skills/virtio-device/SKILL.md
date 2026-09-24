@@ -142,6 +142,13 @@ tested by asking for it: `PciInterruptMode::IntxOnly` (or
 5. Status writes are validated with `virtio_core::status::write_is_valid`;
    write of 0 = reset. `reset()` must be infallible and return the device to
    pre-ACKNOWLEDGE state (acceptance criterion EPIC 3).
+6. **A query is not malformed input.** A guest asking "what about value X?"
+   for a value some spec or extension defines but the device does not serve
+   gets "unsupported" or "nothing", never a dead context; only *creating*
+   something of that value is refused. The Venus executor learned this from
+   Zink, whose format table probes `VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR`
+   (maintenance5) at startup: a fatal answer killed every GL client
+   (ADR-0004, S2b amendment; `venus::executor::query_tests`).
 
 ## Resource bounds (MVP-1407 audit)
 

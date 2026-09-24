@@ -86,6 +86,16 @@
 //! Anything but `DRM_FORMAT_MOD_LINEAR` is refused: the format query answers
 //! `VK_ERROR_FORMAT_NOT_SUPPORTED`, and a create naming another modifier is
 //! fatal, as a guest that ignored the query's answer is.
+//!
+//! # The third party: the scanout device (stage S2b)
+//!
+//! The renderer reads a handle blob a guest compositor flips to through a
+//! device of its own ([`super::scanout`]), importing the same handle and
+//! creating the same image over it. That image is not re-derived: when a
+//! canonical image is bound to handle memory, the executor records its
+//! [`CanonicalImage`] on the blob, and the scanout device builds its host
+//! create info from that record with [`CanonicalImage::create_info`] — the
+//! one function every side's create info comes from.
 
 use crate::venus::protocol::{
     VkExtent3D, VkExternalImageFormatProperties, VkFormatProperties2, VkFormatProperties2Next,
@@ -268,17 +278,41 @@ pub struct CanonicalFormat {
     pub limits: VkImageFormatProperties,
 }
 
-impl CanonicalFormat {
-    /// The host create info of a `width × height` modifier image, in
-    /// `initial_layout`. Its external memory (`OPAQUE_WIN32`) is the host's
-    /// to add ([`super::host::ResourceMemory::Handle`]).
+/// `VK_FORMAT_B8G8R8A8_UNORM` and `VK_FORMAT_B8G8R8A8_SRGB`: the canonical
+/// formats whose bytes are already in the order a virtio-gpu
+/// `B8G8R8X8`/`B8G8R8A8` scanout names (GBM's `XRGB8888` is Mesa's
+/// `BGRX8888_UNORM`, which Zink emulates as `B8G8R8A8_UNORM`,
+/// `zink_format.c:176`). The sRGB twin stores the same bytes; only the
+/// sampler's decoding differs, and a scanout samples nothing.
+pub const SCANOUT_BGRA_FORMATS: [i32; 2] = [44, 50];
+
+/// One canonical host image, **exactly**: the create info both sides of a
+/// share build from it — the exporting context, every importing one, and
+/// the renderer's own scanout device (stage S2b) — so all of them lay the
+/// same payload out the same way. What stage S2b records on a handle blob
+/// when such an image is bound to its memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalImage {
+    /// The format.
+    pub format: i32,
+    /// The canonical flags.
+    pub flags: u32,
+    /// The canonical view format list.
+    pub view_formats: Vec<i32>,
+    /// The usage superset the host accepted.
+    pub usage: u32,
+    /// `extent.width`.
+    pub width: u32,
+    /// `extent.height`.
+    pub height: u32,
+}
+
+impl CanonicalImage {
+    /// The host create info, in `initial_layout`. Its external memory
+    /// (`OPAQUE_WIN32`) is the host's to add
+    /// ([`super::host::ResourceMemory::Handle`]).
     #[must_use]
-    pub fn create_info(
-        &self,
-        width: u32,
-        height: u32,
-        initial_layout: i32,
-    ) -> VkImageCreateInfo<'static> {
+    pub fn create_info(&self, initial_layout: i32) -> VkImageCreateInfo<'static> {
         let p_next = if self.view_formats.is_empty() {
             Vec::new()
         } else {
@@ -295,8 +329,8 @@ impl CanonicalFormat {
             image_type: IMAGE_TYPE_2D,
             format: self.format,
             extent: VkExtent3D {
-                width,
-                height,
+                width: self.width,
+                height: self.height,
                 depth: 1,
             },
             mip_levels: 1,
@@ -309,6 +343,45 @@ impl CanonicalFormat {
             p_queue_family_indices: None,
             initial_layout,
         }
+    }
+
+    /// The synthesized plane the guest was told for this image.
+    #[must_use]
+    pub fn layout(&self) -> ModifierLayout {
+        ModifierLayout::new(self.width, self.height)
+    }
+
+    /// Whether its bytes are in BGRA order ([`SCANOUT_BGRA_FORMATS`]).
+    #[must_use]
+    pub fn is_bgra8(&self) -> bool {
+        SCANOUT_BGRA_FORMATS.contains(&self.format)
+    }
+}
+
+impl CanonicalFormat {
+    /// The canonical image of this format at `width × height`.
+    #[must_use]
+    pub fn image(&self, width: u32, height: u32) -> CanonicalImage {
+        CanonicalImage {
+            format: self.format,
+            flags: self.flags,
+            view_formats: self.view_formats.clone(),
+            usage: self.usage,
+            width,
+            height,
+        }
+    }
+
+    /// The host create info of a `width × height` modifier image, in
+    /// `initial_layout` ([`CanonicalImage::create_info`]).
+    #[must_use]
+    pub fn create_info(
+        &self,
+        width: u32,
+        height: u32,
+        initial_layout: i32,
+    ) -> VkImageCreateInfo<'static> {
+        self.image(width, height).create_info(initial_layout)
     }
 
     /// The limits a modifier image of this format is shown: the host's for

@@ -909,17 +909,22 @@ fn dma_buf_buffer_queries_answer_for_our_pages_and_nothing_else() {
         (a.external_memory_features, a.compatible_handle_types),
         (0, opaque_win32)
     );
-    assert!(!h.fatal());
+    // A handle type or usage bit of an extension this device does not
+    // serve is a question answered "nothing", never fatal.
     for (handle, usage, what) in [
-        (0x3, 0x3, "two handle bits"),
         (0x80, 0x3, "HOST_ALLOCATION, the renderer's own"),
-        (dma_buf, 0, "no usage"),
         (
             dma_buf,
             0x0040_0000,
             "a usage bit no extension here defines",
         ),
     ] {
+        let a = answer(&mut h, handle, usage);
+        assert_eq!(a.external_memory_features, 0, "{what}");
+    }
+    assert!(!h.fatal());
+    // What valid usage forbids outright stays fatal.
+    for (handle, usage, what) in [(0x3, 0x3, "two handle bits"), (dma_buf, 0, "no usage")] {
         let (mut fresh, _) = zink();
         fatal_on(&mut fresh, &buffer_query(handle, usage), what);
     }

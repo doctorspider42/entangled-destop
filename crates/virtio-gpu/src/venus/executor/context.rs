@@ -45,7 +45,7 @@ use super::host::{DeviceRequest, HostVulkan, InstanceRequest, QueueRequest, Reso
 use super::memory::{
     external_handle_types, external_type_bits, image_facts, image_planes, resource_memory,
 };
-use super::modifier::{self, ModifierLayout};
+use super::modifier::{self, CanonicalImage, ModifierLayout};
 use super::objects::{
     CreatedQueue, DeviceChild, DeviceObject, ExposedDevice, IdError, ImageObject, Kind, Objects,
     Pending, QueueObject,
@@ -373,6 +373,36 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::GetPhysicalDeviceFormatProperties2(args) => self.format_properties(args),
             Command::GetPhysicalDeviceImageFormatProperties2(args) => {
                 self.image_format_properties(args)
+            }
+            Command::GetPhysicalDeviceSparseImageFormatProperties(args) => {
+                self.objects
+                    .physical(args.physical_device.0)
+                    .map_err(id_error("vkGetPhysicalDeviceSparseImageFormatProperties"))?;
+                answer_no_entries(&mut args.p_property_count, &mut args.p_properties);
+                Ok(())
+            }
+            Command::GetPhysicalDeviceSparseImageFormatProperties2(args) => {
+                self.objects
+                    .physical(args.physical_device.0)
+                    .map_err(id_error("vkGetPhysicalDeviceSparseImageFormatProperties2"))?;
+                answer_no_entries(&mut args.p_property_count, &mut args.p_properties);
+                Ok(())
+            }
+            Command::GetPhysicalDeviceExternalFenceProperties(args) => {
+                // No external fence handle is served (`VK_KHR_external_fence_fd`
+                // is not advertised; Mesa asks only when it is,
+                // `vn_physical_device.c:1075-1090`): "nothing", whatever the
+                // handle type, as a driver answers one it does not know.
+                self.objects
+                    .physical(args.physical_device.0)
+                    .map_err(id_error("vkGetPhysicalDeviceExternalFenceProperties"))?;
+                args.p_external_fence_properties =
+                    Some(crate::venus::protocol::VkExternalFenceProperties {
+                        export_from_imported_handle_types: 0,
+                        compatible_handle_types: 0,
+                        external_fence_features: 0,
+                    });
+                Ok(())
             }
             Command::CreateDevice(args) => self.create_device(args),
             Command::DestroyDevice(args) => self.destroy_device(args),
@@ -844,7 +874,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             return Err(invalid(NAME, "pExternalSemaphoreInfo is null"));
         };
         let handle = u32::try_from(info.handle_type).unwrap_or(0);
-        if !handle.is_power_of_two() || handle & !policy::SEMAPHORE_HANDLE_CORE != 0 {
+        if !handle.is_power_of_two() {
             return Err(invalid(NAME, format!("handle type {handle:#x}")));
         }
         let mut timeline = false;
@@ -861,6 +891,12 @@ impl<H: HostVulkan> VulkanContext<H> {
             .objects
             .physical(args.physical_device.0)
             .map_err(id_error(NAME))?;
+        if handle & !policy::SEMAPHORE_HANDLE_CORE != 0 {
+            // An extension's handle type (a Zircon event, say): a question
+            // with the answer "nothing", never asked of the host.
+            args.p_external_semaphore_properties = Some(Default::default());
+            return Ok(());
+        }
         let host = &self.host;
         let answer = policy::external_semaphore_properties(handle, timeline, || {
             host.external_semaphore_properties(instance, device.host, handle, timeline)
@@ -890,26 +926,23 @@ impl<H: HostVulkan> VulkanContext<H> {
             .physical(args.physical_device.0)
             .map_err(id_error(NAME))?;
         let handle = u32::try_from(info.handle_type).unwrap_or(0);
-        let known_handle = handle.is_power_of_two()
-            && (handle & !policy::EXTERNAL_MEMORY_HANDLE_CORE == 0
-                || handle == policy::MEMORY_HANDLE_DMA_BUF);
-        if !known_handle {
-            return Err(invalid(NAME, format!("handle type {handle:#x}")));
+        if !handle.is_power_of_two() || info.usage == 0 {
+            return Err(invalid(
+                NAME,
+                format!("handle type {handle:#x}, usage {:#x}", info.usage),
+            ));
         }
         let advertised = |name: &str| policy::has_extension(&device.guest.extensions, name);
         let usage_known = policy::BUFFER_USAGE_CORE
             | policy::BUFFER_USAGE_DEVICE_ADDRESS
             | policy::buffer_usage_of_extensions(advertised);
-        if info.usage == 0
-            || info.usage & !usage_known != 0
-            || info.flags & !policy::BUFFER_CREATE_CORE != 0
-        {
-            return Err(invalid(
-                NAME,
-                format!("usage {:#x} or flags {:#x}", info.usage, info.flags),
-            ));
-        }
-        let answer = if handle == policy::MEMORY_HANDLE_DMA_BUF {
+        // An extension's handle type, usage or flag this device does not
+        // serve is a question answered "nothing" below, not an attack.
+        let served = info.usage & !usage_known == 0
+            && info.flags & !policy::BUFFER_CREATE_CORE == 0
+            && (handle & !policy::EXTERNAL_MEMORY_HANDLE_CORE == 0
+                || handle == policy::MEMORY_HANDLE_DMA_BUF);
+        let answer = if served && handle == policy::MEMORY_HANDLE_DMA_BUF {
             // Our pages, or (stage S1) exportable device-local memory.
             let shareable =
                 self.host
@@ -951,12 +984,6 @@ impl<H: HostVulkan> VulkanContext<H> {
             VkFormatProperties2Next as N,
         };
         const NAME: &str = "vkGetPhysicalDeviceFormatProperties2";
-        if !policy::is_core_format(args.format) {
-            return Err(invalid(
-                NAME,
-                format!("format {} is not a Vulkan 1.3 format", args.format),
-            ));
-        }
         let (instance, device) = self
             .objects
             .physical(args.physical_device.0)
@@ -964,6 +991,16 @@ impl<H: HostVulkan> VulkanContext<H> {
         let Some(out) = args.p_format_properties.as_mut() else {
             return Ok(());
         };
+        if !policy::is_core_format(args.format) {
+            // A *query* about a format outside core 1.3 is a question, not
+            // an attack — Zink probes every format it knows while building
+            // its format table, `VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR`
+            // (maintenance5, 1000470000) among them — so it is answered
+            // "no features" here and never reaches the driver, whose tables
+            // may not know the value.
+            no_format_features(out);
+            return Ok(());
+        }
         self.host
             .format_properties(instance, device.host, args.format, out);
         let asks = out.p_next.iter().any(|l| {
@@ -1036,7 +1073,16 @@ impl<H: HostVulkan> VulkanContext<H> {
             .map_err(id_error(NAME))?;
         let drm =
             policy::has_extension(&device.guest.extensions, policy::IMAGE_DRM_FORMAT_MODIFIER);
-        check_image_format_info(NAME, info, drm)?;
+        if !check_image_format_info(NAME, info, drm)? {
+            // A format, tiling, usage, flag or handle type this device does
+            // not serve: unsupported, as the driver would answer for one it
+            // does not know — never fatal, and never asked of the host.
+            if let Some(out) = args.p_image_format_properties.as_mut() {
+                out.image_format_properties = Default::default();
+            }
+            args.ret = VK_ERROR_FORMAT_NOT_SUPPORTED;
+            return Ok(());
+        }
         if info.tiling == modifier::IMAGE_TILING_DRM_FORMAT_MODIFIER {
             let answer = modifier::image_format_properties(
                 &*self.host,
@@ -1657,6 +1703,9 @@ impl<H: HostVulkan> VulkanContext<H> {
                         external,
                         handle,
                         modifier: None,
+                        canonical: None,
+                        bound_memory: None,
+                        scanout: None,
                         bound_planes: 0,
                     },
                 );
@@ -1684,7 +1733,10 @@ impl<H: HostVulkan> VulkanContext<H> {
         physical: u64,
         info: &VkImageCreateInfo,
         choice: &ModifierChoice,
-    ) -> Result<Result<(VkImageCreateInfo<'static>, ModifierLayout), VkResult>, ExecError> {
+    ) -> Result<
+        Result<(VkImageCreateInfo<'static>, ModifierLayout, CanonicalImage), VkResult>,
+        ExecError,
+    > {
         let (instance, exposed) = self.objects.physical(physical).map_err(id_error(command))?;
         if info.image_type != 1
             || info.extent.depth != 1
@@ -1749,15 +1801,15 @@ impl<H: HostVulkan> VulkanContext<H> {
                 return Ok(Err(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT));
             }
         }
-        let host =
-            canonical.create_info(info.extent.width, info.extent.height, info.initial_layout);
+        let image = canonical.image(info.extent.width, info.extent.height);
+        let host = image.create_info(info.initial_layout);
         if !image_limits_hold(&*self.host, instance, exposed.host, &host) {
             return Err(invalid(
                 command,
                 "the canonical image is outside what the host reports for it",
             ));
         }
-        Ok(Ok((host, layout)))
+        Ok(Ok((host, layout, image)))
     }
 
     /// `vkCreateImage` of a DRM-modifier image (stage S1): the canonical
@@ -1782,13 +1834,14 @@ impl<H: HostVulkan> VulkanContext<H> {
             .device(device_id)
             .map_err(id_error(NAME))?
             .physical;
-        let (host_info, layout) = match self.modifier_create_info(NAME, physical, info, choice)? {
-            Ok(created) => created,
-            Err(ret) => {
-                args.ret = ret;
-                return Ok(());
-            }
-        };
+        let (host_info, layout, canonical) =
+            match self.modifier_create_info(NAME, physical, info, choice)? {
+                Ok(created) => created,
+                Err(ret) => {
+                    args.ret = ret;
+                    return Ok(());
+                }
+            };
         if !self.objects.has_room() {
             args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
             return Ok(());
@@ -1836,6 +1889,9 @@ impl<H: HostVulkan> VulkanContext<H> {
                 external: true,
                 handle: true,
                 modifier: Some(layout),
+                canonical: Some(canonical),
+                bound_memory: None,
+                scanout: None,
                 bound_planes: 0,
             },
         );
@@ -1977,6 +2033,43 @@ fn extension_enabled_for(stype: i32, enabled: &[String]) -> bool {
     })
 }
 
+/// A `VkFormatProperties2` for a format this renderer does not serve: no
+/// features in the base structure or any chained one, and empty modifier
+/// lists.
+fn no_format_features(out: &mut crate::venus::protocol::VkFormatProperties2) {
+    use crate::venus::protocol::VkFormatProperties2Next as N;
+    out.format_properties = Default::default();
+    for link in &mut out.p_next {
+        match link {
+            N::VkDrmFormatModifierPropertiesListEXT(list) => fill_modifier_list(
+                &mut list.drm_format_modifier_count,
+                &mut list.p_drm_format_modifier_properties,
+                Vec::new(),
+            ),
+            N::VkDrmFormatModifierPropertiesList2EXT(list) => fill_modifier_list(
+                &mut list.drm_format_modifier_count,
+                &mut list.p_drm_format_modifier_properties,
+                Vec::new(),
+            ),
+            N::VkFormatProperties3(p) => {
+                *p = crate::venus::protocol::VkFormatProperties3::default();
+            }
+            N::VkSubpassResolvePerformanceQueryEXT(p) => {
+                *p = crate::venus::protocol::VkSubpassResolvePerformanceQueryEXT::default();
+            }
+        }
+    }
+}
+
+/// A count-and-array query answered with no entries: count 0, and an
+/// array — if one was passed — with nothing in it.
+fn answer_no_entries<T>(count: &mut Option<u32>, array: &mut Option<Vec<T>>) {
+    *count = Some(0);
+    if let Some(slots) = array.as_mut() {
+        slots.clear();
+    }
+}
+
 /// The count protocol of a DRM format modifier list (stage S1): with no
 /// array, how many entries there are; with one, as many as its capacity
 /// (`count`, the skeleton carries no elements) holds, and the count of those
@@ -2023,20 +2116,29 @@ fn subset(requested: &[u8], reported: &[u8]) -> bool {
 /// shown the emulated `VK_EXT_image_drm_format_modifier` (stage S1): its
 /// tiling and its `VkPhysicalDeviceImageDrmFormatModifierInfoEXT` come
 /// together or not at all (`VUID-VkPhysicalDeviceImageFormatInfo2-tiling-02249`).
+///
+/// A query is a question, so a value some extension defines but this
+/// device does not serve — a format outside core 1.3, DRM-modifier tiling
+/// without the extension shown, an extension's usage or flag bit, view
+/// format or handle type — answers `Ok(false)`: unsupported, which the
+/// caller turns into `VK_ERROR_FORMAT_NOT_SUPPORTED`. Only what no
+/// extension defines, or what a valid-usage rule forbids outright (a zero
+/// usage, a modifier structure without its tiling), is fatal.
 fn check_image_format_info(
     command: &'static str,
     info: &VkPhysicalDeviceImageFormatInfo2,
     drm: bool,
-) -> Result<(), ExecError> {
-    let drm_tiling = drm && info.tiling == modifier::IMAGE_TILING_DRM_FORMAT_MODIFIER;
-    if !policy::is_core_format(info.format)
-        || !policy::is_image_type(info.type_)
-        || !(policy::is_image_tiling(info.tiling) || drm_tiling)
-    {
+) -> Result<bool, ExecError> {
+    let drm_value = info.tiling == modifier::IMAGE_TILING_DRM_FORMAT_MODIFIER;
+    let drm_tiling = drm && drm_value;
+    if !policy::is_image_type(info.type_) || !(policy::is_image_tiling(info.tiling) || drm_value) {
         return Err(invalid(
             command,
-            "format, type or tiling outside Vulkan 1.3 and the extensions shown",
+            "an image type or tiling no Vulkan version or extension defines",
         ));
+    }
+    if info.usage == 0 {
+        return Err(invalid(command, "usage 0"));
     }
     let modifier_info = info.p_next.iter().any(|l| {
         matches!(
@@ -2044,36 +2146,42 @@ fn check_image_format_info(
             VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceImageDrmFormatModifierInfoEXT(_)
         )
     });
-    if modifier_info != drm_tiling {
+    if modifier_info != drm_value {
         return Err(invalid(
             command,
             "VkPhysicalDeviceImageDrmFormatModifierInfoEXT is chained exactly for DRM format \
-             modifier tiling, on a device shown the extension",
+             modifier tiling",
         ));
     }
-    if info.usage == 0 || info.usage & !policy::IMAGE_USAGE_CORE != 0 {
-        return Err(invalid(command, format!("usage {:#x}", info.usage)));
-    }
-    if info.flags & !policy::IMAGE_CREATE_CORE != 0 {
-        return Err(invalid(command, format!("flags {:#x}", info.flags)));
-    }
+    let mut supported = policy::is_core_format(info.format)
+        && (drm_tiling || !drm_value)
+        && info.usage & !policy::IMAGE_USAGE_CORE == 0
+        && info.flags & !policy::IMAGE_CREATE_CORE == 0;
     for link in &info.p_next {
         match link {
             VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceExternalImageFormatInfo(e) => {
                 let dma_buf =
                     u32::try_from(e.handle_type).ok() == Some(policy::MEMORY_HANDLE_DMA_BUF);
                 if !policy::is_handle_type_bit(e.handle_type) && !dma_buf {
-                    return Err(invalid(
-                        command,
-                        format!("handle type {:#x}", e.handle_type),
-                    ));
+                    supported = false;
                 }
             }
             VkPhysicalDeviceImageFormatInfo2Next::VkImageFormatListCreateInfo(l) => {
-                check_view_formats(command, l.p_view_formats.as_deref())?;
+                let formats = l.p_view_formats.as_deref().unwrap_or_default();
+                if formats.contains(&0) {
+                    return Err(invalid(command, "VK_FORMAT_UNDEFINED as a view format"));
+                }
+                if !formats.iter().all(|f| policy::is_core_format(*f)) {
+                    supported = false;
+                }
             }
             VkPhysicalDeviceImageFormatInfo2Next::VkImageStencilUsageCreateInfo(s) => {
-                check_usage(command, s.stencil_usage)?;
+                if s.stencil_usage == 0 {
+                    return Err(invalid(command, "stencil usage 0"));
+                }
+                if s.stencil_usage & !policy::IMAGE_USAGE_CORE != 0 {
+                    supported = false;
+                }
             }
             VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceImageDrmFormatModifierInfoEXT(
                 m,
@@ -2093,7 +2201,7 @@ fn check_image_format_info(
             }
         }
     }
-    Ok(())
+    Ok(supported)
 }
 
 fn check_usage(command: &'static str, usage: u32) -> Result<(), ExecError> {

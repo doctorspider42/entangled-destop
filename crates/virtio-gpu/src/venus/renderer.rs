@@ -92,6 +92,27 @@
 //! guest finds no stale `head` in shared memory because it finds no shared
 //! memory at all.
 //!
+//! # Scanout of its own blobs (stage S2b of "GNOME on the GPU")
+//!
+//! [`Renderer3d::scanout_blob`] and [`Renderer3d::read_rect_bgra`] serve a
+//! guest compositor's flips (ADR-0004's S2b amendment):
+//!
+//! * a **page blob** (host-visible memory: our pages) is accepted when the
+//!   image fits the pages — `offset + stride × (height − 1) + width × 4`, in
+//!   u64 — and read row by row out of them;
+//! * a **handle blob** is accepted only when a canonical DRM-modifier image
+//!   recorded on it ([`ScanoutImage`], put there by the executor when the
+//!   image was bound to the memory) is exactly the image the spec describes
+//!   ([`scanout_mismatch`]), and is read by the factory
+//!   ([`SinkFactory::read_scanout`]) — for the executor, through a scanout
+//!   device of the renderer's own, between an acquire and a release that
+//!   match the guest's last recorded release ([`ScanoutRelease`]);
+//! * anything else is refused, and a refusal keeps the last acceptance.
+//!
+//! The directory is where the image and the release are recorded, under its
+//! lock, found by the handle's identity ([`SharedRef`]) rather than by a
+//! guest id.
+//!
 //! # Every guest-supplied id is a name, never an index
 //!
 //! Contexts, rings, blobs and resources all live in [`HashMap`]s keyed by the
@@ -126,7 +147,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -137,9 +158,10 @@ use crate::error::CommandError;
 use crate::protocol::{
     MemEntry, Rect, ResourceCreate3d, ResourceCreateBlob, Transfer3d, BLOB_MEM_HOST3D,
 };
-use crate::renderer::{CapsetInfo, FenceOutcome, FenceTimeline, Renderer3d};
+use crate::renderer::{CapsetInfo, FenceOutcome, FenceTimeline, Renderer3d, ScanoutBlobSpec};
 
 use super::capset::{VenusCapset, VENUS_CAPSET_LEN, VENUS_CAPSET_MAX_VERSION};
+use super::executor::modifier::CanonicalImage;
 #[cfg(doc)]
 use super::pump::RingPump;
 use super::pump::{Batch, Consumed, RingBacking, RingSink};
@@ -210,6 +232,11 @@ pub const MAX_MEMORY_BLOBS: usize = 4096;
 /// venus ring is ~1 MiB, so 64 MiB is two orders of magnitude of headroom and
 /// still a number a host can afford to lose to a hostile guest.
 pub const MAX_RING_BLOB_BYTES: u64 = 64 << 20;
+
+/// Canonical images one handle blob keeps on record (stage S2b): the
+/// exporter's and a few importers'. Past it the oldest is forgotten — each
+/// record is a claim about the same payload, so any one of them describes it.
+pub const MAX_SCANOUT_IMAGES: usize = 8;
 
 /// How long a `vkWaitRingSeqnoMESA` on the context stream waits for its ring
 /// before refusing. The device's queue worker is blocked for as long as it
@@ -350,6 +377,65 @@ pub trait SinkFactory: Send {
     fn pending_ring_fences(&self) -> usize {
         0
     }
+
+    /// Stage S2b: get ready to read handle blob `target.resource_id` back as
+    /// `target.spec`, the renderer having judged the spec against the
+    /// canonical image recorded on the blob (`target.image`) — for the
+    /// executor, import the blob's handle on the renderer's own scanout
+    /// device and create exactly that image over it. Replaces whatever this
+    /// resource had prepared only on success.
+    ///
+    /// # Errors
+    /// Why the blob cannot be read back on this host. The default: this
+    /// factory executes no Vulkan.
+    fn prepare_scanout(&mut self, target: &ScanoutTarget) -> Result<(), String> {
+        let _ = target;
+        Err("this renderer executes no Vulkan, so a handle blob cannot be read back".into())
+    }
+
+    /// Stage S2b: `rect` of a prepared (or evicted, and so prepared again)
+    /// handle blob's image as packed BGRA, exactly `rect.width *
+    /// rect.height * 4` bytes into `out`, acquiring the image from the
+    /// guest's last recorded release and handing it back the same way.
+    ///
+    /// # Errors
+    /// Why not: a GPU that did not finish in time, a lost device, a host
+    /// refusal. The default: this factory executes no Vulkan.
+    fn read_scanout(
+        &mut self,
+        target: &ScanoutTarget,
+        release: ScanoutRelease,
+        rect: Rect,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let _ = (target, release, rect, out);
+        Err("this renderer executes no Vulkan, so a handle blob cannot be read back".into())
+    }
+
+    /// Stage S2b: resource `resource_id` is gone (or scanned out no more):
+    /// whatever was prepared for it goes.
+    fn forget_scanout(&mut self, resource_id: u32) {
+        let _ = resource_id;
+    }
+
+    /// Resources with a prepared scanout right now — a diagnostic.
+    fn scanout_targets(&self) -> usize {
+        0
+    }
+}
+
+/// A handle blob to read back, as the renderer accepted it (stage S2b,
+/// [`SinkFactory::prepare_scanout`]).
+#[derive(Debug, Clone)]
+pub struct ScanoutTarget {
+    /// The blob.
+    pub resource_id: u32,
+    /// Its host handle.
+    pub handle: SharedHandle,
+    /// The canonical image recorded on it that the spec matched.
+    pub image: CanonicalImage,
+    /// The accepted layout.
+    pub spec: ScanoutBlobSpec,
 }
 
 // ------------------------------------------------------------ ring fences
@@ -547,6 +633,94 @@ impl DirectoryEntry {
 struct MemoryEntry {
     size: u64,
     attached: Vec<u32>,
+    /// Stage S2b, handle blobs only: the canonical images bound to the
+    /// payload, newest last, at most [`MAX_SCANOUT_IMAGES`].
+    images: Vec<ScanoutImage>,
+    /// Stage S2b: the last release of the payload out of the instance
+    /// recorded by any context whose canonical image is on record here.
+    release: Option<ScanoutRelease>,
+}
+
+/// A handle blob's host handle **without holding it open** (stage S2b): what
+/// a `VkDeviceMemory` keeps of the handle its blob holds, to find that blob
+/// again by identity when a canonical image is bound to it.
+#[derive(Clone)]
+pub struct SharedRef(Weak<dyn std::any::Any + Send + Sync>);
+
+impl SharedRef {
+    /// A reference to `handle`.
+    #[must_use]
+    pub fn of(handle: &SharedHandle) -> Self {
+        Self(Arc::downgrade(&handle.0))
+    }
+
+    /// Whether `handle` is the handle this refers to.
+    #[must_use]
+    pub fn is(&self, handle: &SharedHandle) -> bool {
+        std::ptr::addr_eq(Weak::as_ptr(&self.0), Arc::as_ptr(&handle.0))
+    }
+
+    /// Whether the handle is still held by anything (a blob, an import in
+    /// progress).
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+
+    /// The handle's address: its key in the directory's index. Stable, and
+    /// never another handle's, while this reference exists — a `Weak` keeps
+    /// the allocation (not the value) from being reused.
+    fn key(&self) -> usize {
+        Weak::as_ptr(&self.0).cast::<()>() as usize
+    }
+}
+
+impl SharedHandle {
+    /// [`SharedRef::key`] of this handle.
+    fn key(&self) -> usize {
+        Arc::as_ptr(&self.0).cast::<()>() as usize
+    }
+}
+
+impl fmt::Debug for SharedRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SharedRef(..)")
+    }
+}
+
+/// One canonical image bound to a handle blob's payload (stage S2b).
+#[derive(Debug, Clone)]
+pub struct ScanoutImage {
+    /// The context whose image it is.
+    pub ctx_id: u32,
+    /// The image's guest id there.
+    pub image: u64,
+    /// `memoryOffset` of the bind.
+    pub offset: u64,
+    /// The image exactly.
+    pub canonical: CanonicalImage,
+    /// Alive as long as the image is.
+    pub alive: Weak<()>,
+}
+
+impl ScanoutImage {
+    /// Whether the image still exists.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.alive.strong_count() > 0
+    }
+}
+
+/// How the guest last released a handle blob's image out of its instance
+/// (stage S2b): the layout it left it in and the family it released it to
+/// (`VK_QUEUE_FAMILY_FOREIGN_EXT`, or `VK_QUEUE_FAMILY_EXTERNAL`). The
+/// scanout device acquires from exactly this and releases back to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanoutRelease {
+    /// `newLayout` of the release.
+    pub layout: i32,
+    /// `dstQueueFamilyIndex` of the release.
+    pub family: u32,
 }
 
 /// A host handle to exportable device-local memory (stage S1), as the
@@ -606,6 +780,44 @@ pub struct MemoryBlob {
 struct DirectoryState {
     blobs: HashMap<u32, DirectoryEntry>,
     next_generation: u64,
+    /// Stage S2b: every live handle blob by its handle's address
+    /// ([`SharedRef::key`]), so a bind or a release finds its blob at once.
+    by_handle: HashMap<usize, u32>,
+    /// Stage S2b: canonical images recorded against a handle whose blob is
+    /// not in the directory yet — the exporter's image, bound before Mesa's
+    /// `RESOURCE_CREATE_BLOB` of its memory arrived — adopted by that blob
+    /// when it is inserted. At most [`MAX_SCANOUT_IMAGES`] × 8, the dead
+    /// pruned first.
+    pending: Vec<(SharedRef, ScanoutImage)>,
+}
+
+impl DirectoryState {
+    /// The handle blob holding `shared`, if it is in the directory.
+    fn handle_entry(&mut self, shared: &SharedRef) -> Option<&mut DirectoryEntry> {
+        let id = *self.by_handle.get(&shared.key())?;
+        self.blobs
+            .get_mut(&id)
+            .filter(|entry| matches!(&entry.backing, ExportedMemory::Handle(h) if shared.is(h)))
+    }
+}
+
+/// Take a removed entry's handle out of the index, if the index still
+/// names that entry's handle.
+fn forget_handle(by_handle: &mut HashMap<usize, u32>, entry: &DirectoryEntry) {
+    if let ExportedMemory::Handle(handle) = &entry.backing {
+        by_handle.remove(&handle.key());
+    }
+}
+
+/// Add `image` to a handle blob's record: a record of the same image
+/// replaces the old one, the dead go, and past [`MAX_SCANOUT_IMAGES`] the
+/// oldest.
+fn push_image(images: &mut Vec<ScanoutImage>, image: ScanoutImage) {
+    images.retain(|r| r.is_alive() && !(r.ctx_id == image.ctx_id && r.image == image.image));
+    if images.len() >= MAX_SCANOUT_IMAGES {
+        images.remove(0);
+    }
+    images.push(image);
 }
 
 /// Every host blob the renderer holds, shared with the ring workers behind a
@@ -641,7 +853,7 @@ impl BlobDirectory {
             backing,
             Some(MemoryEntry {
                 size,
-                attached: Vec::new(),
+                ..MemoryEntry::default()
             }),
         );
     }
@@ -656,7 +868,21 @@ impl BlobDirectory {
         self.with(|state| {
             state.next_generation = state.next_generation.wrapping_add(1);
             let generation = state.next_generation;
-            state.blobs.insert(
+            let mut memory = memory;
+            if let (ExportedMemory::Handle(handle), Some(memory)) = (&backing, memory.as_mut()) {
+                // Stage S2b: the images bound to this memory before its blob
+                // existed are this blob's now.
+                state.by_handle.insert(handle.key(), resource_id);
+                let pending = std::mem::take(&mut state.pending);
+                for (shared, image) in pending {
+                    if shared.is(handle) {
+                        push_image(&mut memory.images, image);
+                    } else if shared.is_alive() && image.is_alive() {
+                        state.pending.push((shared, image));
+                    }
+                }
+            }
+            if let Some(old) = state.blobs.insert(
                 resource_id,
                 DirectoryEntry {
                     ctx_id,
@@ -664,7 +890,9 @@ impl BlobDirectory {
                     generation,
                     memory,
                 },
-            );
+            ) {
+                forget_handle(&mut state.by_handle, &old);
+            }
         });
     }
 
@@ -687,23 +915,53 @@ impl BlobDirectory {
         });
     }
 
-    /// Forget context `ctx_id` in every attachment list: it is gone.
+    /// Forget context `ctx_id` in every attachment list and every scanout
+    /// record: it is gone.
     fn forget_context(&self, ctx_id: u32) {
         self.with(|state| {
             for entry in state.blobs.values_mut() {
                 if let Some(memory) = entry.memory.as_mut() {
                     memory.attached.retain(|c| *c != ctx_id);
+                    memory.images.retain(|r| r.ctx_id != ctx_id && r.is_alive());
                 }
             }
         });
     }
 
+    /// Stage S2b: what handle blob `resource_id` holds for a scanout — its
+    /// handle, the canonical images still alive on record (newest first) and
+    /// the last release. `None` for anything that is not a handle blob.
+    fn scanout_state(
+        &self,
+        resource_id: u32,
+    ) -> Option<(SharedHandle, Vec<ScanoutImage>, Option<ScanoutRelease>)> {
+        self.with(|state| {
+            let entry = state.blobs.get_mut(&resource_id)?;
+            let ExportedMemory::Handle(handle) = &entry.backing else {
+                return None;
+            };
+            let handle = handle.clone();
+            let memory = entry.memory.as_mut()?;
+            memory.images.retain(ScanoutImage::is_alive);
+            let images = memory.images.iter().rev().cloned().collect();
+            Some((handle, images, memory.release))
+        })
+    }
+
     fn remove(&self, resource_id: u32) {
-        self.with(|state| state.blobs.remove(&resource_id));
+        self.with(|state| {
+            if let Some(old) = state.blobs.remove(&resource_id) {
+                forget_handle(&mut state.by_handle, &old);
+            }
+        });
     }
 
     fn clear(&self) {
-        self.with(|state| state.blobs.clear());
+        self.with(|state| {
+            state.blobs.clear();
+            state.by_handle.clear();
+            state.pending.clear();
+        });
     }
 
     /// The part of the directory context `ctx_id` may reach.
@@ -849,6 +1107,49 @@ impl ContextBlobs {
                 owner: entry.ctx_id,
             })
         })
+    }
+
+    /// Stage S2b: record `image` — a canonical image bound to memory whose
+    /// handle is `shared` — on the handle blob holding that handle, under the
+    /// directory lock. The blob is found by the handle's identity, never by
+    /// an id, so a blob id reused since cannot be confused with it. A handle
+    /// whose blob is not in the directory yet keeps the record pending for
+    /// it (the exporter's bind comes before `RESOURCE_CREATE_BLOB` when an
+    /// application binds first); a handle nothing holds any more records
+    /// nothing. A record of the same image replaces the old one; past
+    /// [`MAX_SCANOUT_IMAGES`] the oldest goes.
+    pub fn record_scanout_image(&self, shared: &SharedRef, image: ScanoutImage) {
+        self.directory.with(|state| {
+            if let Some(memory) = state
+                .handle_entry(shared)
+                .and_then(|entry| entry.memory.as_mut())
+            {
+                push_image(&mut memory.images, image);
+                return;
+            }
+            if !shared.is_alive() {
+                return;
+            }
+            state.pending.retain(|(s, i)| s.is_alive() && i.is_alive());
+            if state.pending.len() >= MAX_SCANOUT_IMAGES * 8 {
+                state.pending.remove(0);
+            }
+            state.pending.push((shared.clone(), image));
+        });
+    }
+
+    /// Stage S2b: a release out of the instance — to `family`, left in
+    /// `layout` — of a canonical image bound to memory whose handle is
+    /// `shared`, under the directory lock. Nothing if its blob is gone.
+    pub fn record_release(&self, shared: &SharedRef, layout: i32, family: u32) {
+        self.directory.with(|state| {
+            if let Some(memory) = state
+                .handle_entry(shared)
+                .and_then(|entry| entry.memory.as_mut())
+            {
+                memory.release = Some(ScanoutRelease { layout, family });
+            }
+        });
     }
 
     /// Write `bytes` at resource offset `at` of the blob `blob` names, under
@@ -1387,6 +1688,25 @@ pub enum VenusError {
         /// Why.
         why: String,
     },
+
+    /// A `SET_SCANOUT_BLOB` layout this renderer cannot read back (stage
+    /// S2b).
+    #[error("resource {resource_id} cannot be scanned out with that layout: {reason}")]
+    ScanoutRefused {
+        /// The blob.
+        resource_id: u32,
+        /// Why.
+        reason: String,
+    },
+
+    /// A scanout readback that failed on the host (stage S2b).
+    #[error("the scanout readback of resource {resource_id} failed: {reason}")]
+    ScanoutRead {
+        /// The blob.
+        resource_id: u32,
+        /// Why.
+        reason: String,
+    },
 }
 
 impl From<VenusError> for CommandError {
@@ -1458,8 +1778,63 @@ impl From<VenusError> for CommandError {
             VenusError::NoClassic3d(_) | VenusError::RingFence { .. } => {
                 Self::Renderer(err.to_string())
             }
+            VenusError::ScanoutRefused {
+                resource_id,
+                reason,
+            } => Self::ScanoutLayout {
+                resource_id,
+                reason,
+            },
+            VenusError::ScanoutRead { .. } => Self::Renderer(err.to_string()),
         }
     }
+}
+
+/// Why a canonical image recorded on a handle blob is not the image a
+/// `SET_SCANOUT_BLOB` of `spec` describes (stage S2b), or `None` when it is.
+///
+/// The format must be BGRA-ordered — `B8G8R8A8_UNORM` or its sRGB twin
+/// ([`CanonicalImage::is_bgra8`]), which is what GBM's `XRGB8888` and
+/// `ARGB8888` are to Zink — because the device accepts only the two BGRA
+/// scanout formats: an RGBA-ordered image under one would be a guest that
+/// named the wrong fourcc, and is refused rather than silently swizzled. The
+/// extent must be the framebuffer's, and the plane the one the guest was
+/// told for this image (`executor::modifier`, lie 3): offset 0 — in the
+/// blob and in the memory the image is bound at — and exactly the
+/// synthesized row pitch. The pitch is metadata, never an address: the
+/// pixels are read through the image.
+#[must_use]
+pub fn scanout_mismatch(image: &ScanoutImage, spec: &ScanoutBlobSpec) -> Option<String> {
+    let canonical = &image.canonical;
+    if spec.format != crate::FORMAT_B8G8R8X8_UNORM && spec.format != crate::FORMAT_B8G8R8A8_UNORM {
+        return Some(format!("scanout format {} is not a BGRA one", spec.format));
+    }
+    if !canonical.is_bgra8() {
+        return Some(format!(
+            "the image bound to it is of VkFormat {}, not B8G8R8A8 (UNORM or SRGB)",
+            canonical.format
+        ));
+    }
+    if (canonical.width, canonical.height) != (spec.width, spec.height) {
+        return Some(format!(
+            "the image bound to it is {}x{}, the framebuffer {}x{}",
+            canonical.width, canonical.height, spec.width, spec.height
+        ));
+    }
+    if image.offset != 0 || spec.offset != 0 {
+        return Some(format!(
+            "plane 0 at offset {} of a blob whose image is bound at {}: the plane is at 0",
+            spec.offset, image.offset
+        ));
+    }
+    let pitch = canonical.layout().row_pitch;
+    if u64::from(spec.stride) != pitch {
+        return Some(format!(
+            "stride {} is not the {pitch}-byte pitch the guest was told for the image",
+            spec.stride
+        ));
+    }
+    None
 }
 
 // ---------------------------------------------------------------- the state
@@ -1485,6 +1860,17 @@ struct RingBlob {
     /// Whether the pages are the blob's own (`blob_id` 0), a
     /// `VkDeviceMemory`'s, or no pages at all.
     kind: BlobKind,
+    /// Stage S2b: the layout a `SET_SCANOUT_BLOB` of this blob was accepted
+    /// as, and — for a handle blob — the canonical image it matched.
+    scanout: Option<AcceptedScanout>,
+}
+
+/// A scanout layout the renderer accepted for one blob (stage S2b).
+#[derive(Debug, Clone)]
+struct AcceptedScanout {
+    spec: ScanoutBlobSpec,
+    /// The canonical image the spec matched; `None` for a page blob.
+    image: Option<CanonicalImage>,
 }
 
 impl RingBlob {
@@ -1824,6 +2210,7 @@ impl<F> VenusRenderer<F> {
                 blob_id: args.blob_id,
                 size: args.size,
                 kind: BlobKind::Shm,
+                scanout: None,
             },
         );
         Ok(())
@@ -1911,6 +2298,164 @@ impl<F> VenusRenderer<F> {
 }
 
 impl<F: SinkFactory> VenusRenderer<F> {
+    /// `SET_SCANOUT_BLOB` of a blob of this renderer (stage S2b,
+    /// [`Renderer3d::scanout_blob`]): see the module docs' scanout section.
+    fn accept_scanout(
+        &mut self,
+        resource_id: u32,
+        spec: &ScanoutBlobSpec,
+    ) -> Result<(), VenusError> {
+        let refused = |reason: String| VenusError::ScanoutRefused {
+            resource_id,
+            reason,
+        };
+        let blob = self
+            .blobs
+            .get(&resource_id)
+            .ok_or(VenusError::UnknownBlob(resource_id))?;
+        let image = match (blob.kind, &blob.backing) {
+            (BlobKind::Memory, ExportedMemory::Pages(pages)) => {
+                // `offset + stride × (height − 1) + width × 4`, in u64: the
+                // last byte a row of the image touches.
+                let last = u64::from(spec.stride)
+                    .checked_mul(u64::from(spec.height.saturating_sub(1)))
+                    .and_then(|rows| rows.checked_add(u64::from(spec.offset)))
+                    .and_then(|at| at.checked_add(u64::from(spec.width).checked_mul(4)?));
+                match last {
+                    Some(end) if spec.width > 0 && spec.height > 0 && end <= pages.mapped_len() => {}
+                    _ => {
+                        return Err(refused(format!(
+                            "{}x{} at stride {} from offset {} does not fit the {:#x} host bytes                              of the memory",
+                            spec.width,
+                            spec.height,
+                            spec.stride,
+                            spec.offset,
+                            pages.mapped_len()
+                        )))
+                    }
+                }
+                None
+            }
+            (BlobKind::Handle, ExportedMemory::Handle(_)) => {
+                let (handle, images, _) = self
+                    .directory
+                    .scanout_state(resource_id)
+                    .ok_or_else(|| refused("the handle blob is not in the directory".into()))?;
+                let Some(newest) = images.first() else {
+                    return Err(refused(
+                        "no canonical DRM-modifier image is bound to its memory, so nothing says                          how its bytes are laid out"
+                            .into(),
+                    ));
+                };
+                let Some(matched) = images
+                    .iter()
+                    .find(|image| scanout_mismatch(image, spec).is_none())
+                else {
+                    return Err(refused(
+                        scanout_mismatch(newest, spec).unwrap_or_else(|| "no image matches".into()),
+                    ));
+                };
+                let target = ScanoutTarget {
+                    resource_id,
+                    handle,
+                    image: matched.canonical.clone(),
+                    spec: *spec,
+                };
+                self.sinks.prepare_scanout(&target).map_err(refused)?;
+                Some(target.image)
+            }
+            _ => {
+                return Err(refused(
+                    "a ring or reply blob is not an image; only a blob of Vulkan memory is".into(),
+                ))
+            }
+        };
+        if let Some(blob) = self.blobs.get_mut(&resource_id) {
+            blob.scanout = Some(AcceptedScanout { spec: *spec, image });
+        }
+        Ok(())
+    }
+
+    /// `read_rect_bgra` of a blob accepted for scanout (stage S2b).
+    fn read_scanout(
+        &mut self,
+        resource_id: u32,
+        rect: Rect,
+        out: &mut Vec<u8>,
+    ) -> Result<(), VenusError> {
+        let failed = |reason: String| VenusError::ScanoutRead {
+            resource_id,
+            reason,
+        };
+        let blob = self
+            .blobs
+            .get(&resource_id)
+            .ok_or(VenusError::UnknownBlob(resource_id))?;
+        let accepted = blob
+            .scanout
+            .clone()
+            .ok_or(VenusError::UnknownBlob(resource_id))?;
+        let spec = accepted.spec;
+        if !rect.fits_within(spec.width, spec.height) {
+            return Err(failed(format!(
+                "the {}x{} rect at ({}, {}) is outside the {}x{} image",
+                rect.width, rect.height, rect.x, rect.y, spec.width, spec.height
+            )));
+        }
+        let row = usize::try_from(u64::from(rect.width) * 4)
+            .map_err(|_| failed("a row larger than this host addresses".into()))?;
+        let len = usize::try_from(rect.pixels().saturating_mul(4))
+            .map_err(|_| failed("a rect larger than this host addresses".into()))?;
+        match (&blob.backing, accepted.image) {
+            (ExportedMemory::Pages(pages), None) => {
+                out.clear();
+                out.try_reserve_exact(len)
+                    .map_err(|_| failed(format!("{len} bytes of readback buffer")))?;
+                out.resize(len, 0);
+                for (y, dst) in (rect.y..).zip(out.chunks_exact_mut(row.max(1))) {
+                    // Bounded by `accept_scanout`'s check of the whole image
+                    // against the pages, and again by `read_bytes` itself.
+                    let at = u64::from(spec.offset)
+                        + u64::from(y) * u64::from(spec.stride)
+                        + u64::from(rect.x) * 4;
+                    pages
+                        .read_bytes(at, dst)
+                        .map_err(|error| failed(error.to_string()))?;
+                }
+                Ok(())
+            }
+            (ExportedMemory::Handle(handle), Some(image)) => {
+                let release = self
+                    .directory
+                    .scanout_state(resource_id)
+                    .and_then(|(_, _, release)| release)
+                    .ok_or_else(|| {
+                        failed(
+                            "the guest has not released its image to a queue family outside                              its instance yet, so there is no frame to acquire"
+                                .into(),
+                        )
+                    })?;
+                let target = ScanoutTarget {
+                    resource_id,
+                    handle: handle.clone(),
+                    image,
+                    spec,
+                };
+                self.sinks
+                    .read_scanout(&target, release, rect, out)
+                    .map_err(failed)?;
+                if out.len() != len {
+                    return Err(failed(format!(
+                        "the scanout device returned {} bytes for {len}",
+                        out.len()
+                    )));
+                }
+                Ok(())
+            }
+            _ => Err(failed("the accepted layout does not match the blob".into())),
+        }
+    }
+
     /// `SUBMIT_3D` on a venus context: decode the transport stream and act.
     ///
     /// A **decode** refusal poisons the context (see the module docs); an
@@ -2261,6 +2806,10 @@ impl<F: SinkFactory> VenusRenderer<F> {
                     // import made already holds its own `Arc` of them.
                     self.directory.remove(resource_id);
                     self.memory_blobs = self.memory_blobs.saturating_sub(1);
+                    // Stage S2b: the scanout device's import of it goes too.
+                    if blob.kind == BlobKind::Handle {
+                        self.sinks.forget_scanout(resource_id);
+                    }
                 }
             }
             drop(blob);
@@ -2306,6 +2855,7 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 blob_id: args.blob_id,
                 size: args.size,
                 kind,
+                scanout: None,
             },
         );
         Ok(())
@@ -2441,13 +2991,34 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         Ok(())
     }
 
+    /// Only a blob accepted for scanout ([`Self::scanout_blob`]) has pixels
+    /// to read (stage S2b); there is no other resource here.
     fn read_rect_bgra(
         &mut self,
         resource_id: u32,
-        _rect: Rect,
-        _out: &mut Vec<u8>,
+        rect: Rect,
+        out: &mut Vec<u8>,
     ) -> Result<(), CommandError> {
-        Err(CommandError::UnknownResource(resource_id))
+        self.read_scanout(resource_id, rect, out).map_err(|error| {
+            tracing::debug!(resource = resource_id, %error, "venus scanout readback failed");
+            error.into()
+        })
+    }
+
+    /// Stage S2b: a page blob is accepted when the image fits its pages; a
+    /// handle blob when a canonical image recorded on it is exactly the
+    /// image the spec describes ([`scanout_mismatch`]) and the factory could
+    /// prepare the renderer's own read of it. A refusal keeps what was
+    /// accepted before.
+    fn scanout_blob(
+        &mut self,
+        resource_id: u32,
+        spec: &ScanoutBlobSpec,
+    ) -> Result<(), CommandError> {
+        self.accept_scanout(resource_id, spec).map_err(|error| {
+            tracing::warn!(resource = resource_id, ?spec, %error, "venus scanout refused");
+            error.into()
+        })
     }
 
     fn reset(&mut self) {

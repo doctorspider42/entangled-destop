@@ -3328,3 +3328,219 @@ fake renderer whose readback encodes each pixel's coordinates and resource.
 2. `read_rect_bgra` for such a resource: copy the rows of `rect` out of that
    memory (`offset + y × stride + x × 4`) as packed BGRA.
 3. `destroy_blob` and `reset`: forget the spec.
+
+## Amendment, 2026-09-24 — GNOME on the GPU, S2b: the Venus renderer serves the scanout
+
+S2a gave the device a way to ask a renderer for a renderer blob's pixels.
+S2b is the Venus renderer's answer, for both kinds of blob its memory
+makes. The code is `venus/renderer.rs` (the judgement and the page path),
+`venus/executor/scanout.rs` (the handle path), and the recording in
+`venus/executor/{memory,device_objects,modifier}.rs`.
+
+### What the guest does, verified
+
+- **The release.** At the end of every batch Zink releases each exported
+  image out of its instance (`zink_batch.c:900-934`): one image barrier with
+  `oldLayout == newLayout == res->layout`, so no layout change — whatever
+  layout the frame left the image in. `srcAccessMask` is its last access and
+  `dstAccessMask` 0. `dstStageMask` is `ALL_COMMANDS`. `srcQueueFamilyIndex`
+  is its queue's family and `dstQueueFamilyIndex` is
+  `VK_QUEUE_FAMILY_FOREIGN_EXT`. The layout is therefore not a constant.
+  After a render pass it is the pass's final layout. After a blit it is
+  `TRANSFER_DST`. On a driver Zink runs with `general_layout` it is
+  `GENERAL` (`zink_screen.c:3134-3143`).
+- **The fence.** Mutter 50.1 commits a KMS update only once the update's
+  `sync_fd` — the frame's `EGL_ANDROID_native_fence_sync` fence
+  (`meta-onscreen-native.c:1812-1822`) — is readable
+  (`meta-kms-impl-device.c:2089-2116`). By the time `SET_SCANOUT_BLOB` and
+  `RESOURCE_FLUSH` arrive, the release has executed on the host GPU. The
+  host's copy needs no semaphore of its own.
+- **The format.** GBM's `XRGB8888` is Mesa's `BGRX8888_UNORM`
+  (`dri_helpers.c:434`), which Zink emulates as `B8G8R8A8_UNORM`
+  (`zink_format.c:176`). The kernel sends it as `B8G8R8X8_UNORM`.
+
+### Page blobs
+
+A blob of host-visible memory is our pages. It is accepted when
+`offset + stride × (height − 1) + width × 4 <= pages.mapped_len()`, computed
+in u64. That is the last byte the image touches, so the check is exact at
+the end rather than `stride × height`. It is read row by row through
+`RingPages::read_bytes` into the device's buffer, packed. A ring or reply
+blob (`blob_id` 0) is not an image and is refused.
+
+### Handle blobs: the canonical image, recorded
+
+The guest's pitch for a handle blob is synthesized and says nothing about
+the bytes (S1). The only authority on the layout is the canonical image
+bound to the memory, so the blob must know which image that is.
+
+- **What is recorded.** `modifier::CanonicalImage`: format, flags, view
+  formats, usage superset, width and height. That is exactly what the host
+  create info is built from (`CanonicalImage::create_info`, which the
+  exporter, every importer and the scanout device all call). The record
+  also holds the bind's `memoryOffset`, the context and image ids, and a
+  `Weak` of a token the image object owns.
+- **When.** At every successful bind of a canonical image to handle memory:
+  the exporting memory, or an import of a handle blob. Memory keeps a `Weak`
+  of the handle its blob holds (`SharedRef`). The directory finds the blob
+  by that handle's identity, through an index keyed by the handle's address,
+  never by a resource id a guest could reuse. Mesa makes the blob inside
+  `vkAllocateMemory`, before the bind. An application that binds first gets
+  its images recorded when the blob is made: `export_memory` records the
+  images already bound, pending in the directory until the renderer inserts
+  the blob straight after, where they are adopted.
+- **Lifetime.** The record is updated under the directory lock. It lives
+  exactly as long as the image object: the token dies with it, whichever
+  path destroys it (`vkDestroyImage`, device teardown, context teardown, a
+  reset), and dead records are pruned. At most `MAX_SCANOUT_IMAGES` (8) are
+  kept per blob, oldest first out. Pending records are capped at 64.
+  `forget_context` drops a context's records. Removing the blob drops its
+  records and its index entry.
+- **The release, recorded too.** Every image barrier of a recorded canonical
+  image that releases it out of the instance (to `FOREIGN` or `EXTERNAL`,
+  from a family of the device) sets the blob's last release: the layout and
+  the family. It is recorded when the barrier is recorded, which for a
+  flipped frame is before the flip. It is kept per blob, not per image,
+  because it describes the payload.
+
+`scanout_blob` of a handle blob is accepted only when a live record
+matches the spec: the format is BGRA-ordered (`B8G8R8A8_UNORM` or `_SRGB` —
+the same bytes; a scanout samples nothing), the extent is the
+framebuffer's, and both the plane offset and the bind offset are 0. The
+stride must be exactly the synthesized pitch. An RGBA-ordered canonical
+image under a BGRA scanout is **refused, not swizzled**: the device accepts
+only the two BGRA formats, so it would be a guest naming the wrong fourcc.
+Anything else is `ERR_INVALID_PARAMETER` (`CommandError::ScanoutLayout`),
+logged with the reason ("no canonical DRM-modifier image is bound to its
+memory", "stride 7936 is not the 7680-byte pitch…"). A refusal keeps the
+previous acceptance.
+
+### The scanout device
+
+One host `VkDevice` owned by the renderer's factory (`ExecutorFactory`),
+not by any guest context, so nothing a guest does to its own objects
+reaches it. It is created lazily by the first handle-blob scanout, on the
+physical device whose `deviceUUID`/`driverUUID` are the export's. It has
+one queue (the first graphics family, else the first with transfers), one
+command pool, one command buffer, one fence, and three extensions:
+`VK_KHR_external_memory_win32`, `VK_EXT_external_memory_host` and
+`VK_EXT_queue_family_foreign`.
+
+For each blob it keeps an import: the export's NT handle imported
+(`VkImportMemoryWin32HandleInfoKHR`, the export's own size and type,
+undedicated). **Exactly the canonical image** on record is created over it
+and bound at 0, and it has a staging buffer of `width × height × 4` bytes of
+our own pages, charged to the renderer's 1 GiB host-visible budget. At most
+`MAX_SCANOUT_TARGETS` (4) are kept, the least recently read evicted first. A
+compositor flips between two or three; an evicted one is simply made again
+by the next read.
+
+**One read**, on the one command buffer, fenced:
+
+| | `src` family | `dst` family | `oldLayout` | `newLayout` | stages | access |
+|---|---|---|---|---|---|---|
+| acquire | the release's (`FOREIGN`) | ours | the release's layout `L` | `L` if `GENERAL` or `TRANSFER_SRC`, else `TRANSFER_SRC` | `TOP_OF_PIPE` → `TRANSFER` | 0 → `TRANSFER_READ` |
+| copy | `vkCmdCopyImageToBuffer` of the rect, packed | | | | | |
+| release | ours | the release's | the copy layout | `L` | `TRANSFER` → `BOTTOM_OF_PIPE` | 0 → 0 |
+
+A buffer barrier beside the release (`TRANSFER_WRITE` → `HOST_READ`) makes
+the copy visible to the host. The old layout is never `UNDEFINED`, which
+would discard the frame. Releasing back in `L` makes the guest's next
+acquire (`oldLayout = res->layout`, from `FOREIGN`) exactly consistent. A
+release in a layout the device will not acquire from is refused before
+anything is recorded: `UNDEFINED`, `PREINITIALIZED`, the two
+`synchronization2` layouts (not enabled here), or any extension layout. So
+is a read before any release has been recorded.
+
+The fence is waited for `SCANOUT_WAIT` (100 ms) at most. On a timeout the
+flush fails in band, the window keeps its frame, and the next read first
+waits (bounded) for that work. A lost device fails the flush and drops the
+whole scanout device; the next scanout makes a new one. Only then are the
+rows read out of the staging pages through the bounded
+`RingPages::read_bytes`.
+
+### Lifecycle
+
+- **No thread of its own.** The readback runs inside `read_rect_bgra` on the
+  device's gated queue worker, as S2a said, so there is no new `Quiesce`
+  obligation.
+- **Unref.** `destroy_blob` of a handle blob drops its import, image and
+  staging buffer (`SinkFactory::forget_scanout`). A changed spec replaces
+  the import once the new one is complete.
+- **Reset.** `reset()` drops every import. **The `VkDevice` itself is
+  kept.** After that it holds nothing of any guest, and a rebooted desktop
+  scans out again within seconds; re-creating a device on every reboot
+  would only be a stall. It goes when the renderer does, when it is lost,
+  or when a blob of another GPU is scanned out.
+- **Snapshots.** Unchanged. A handle blob already refuses a snapshot by
+  name. A page-blob scanout's memory is a live executor object, which
+  refuses one too; the device-side record is S2a's.
+
+### Measured on the RTX 2070
+
+The test is
+`host_vulkan::pipeline_tests::a_handle_blob_flip_reads_back_the_frame_through_the_renderers_scanout_device`,
+driver 580.88 on Windows, through the renderer's `scanout_blob` and
+`read_rect_bgra`. That is the whole Venus path the device calls. A real
+`GpuDevice` needs a guest ring the test harness does not reach, so the
+device half stays S2a's fake-renderer tests. Context 1 exports a 256×256
+LINEAR BGRA8 buffer, blob before bind as Mesa does, renders vk-smoke's
+check-6 triangle and releases it as Zink does. The renderer reads back
+`256x256 exact, 6 probes ok, px red/green/blue/clear=8362/8363/8363/40448`,
+BGRA `fnv1a=0x9a880db295ee1483`. Swizzled back to RGBA that is
+`0x2678f2a0e39fba1b`, vk-smoke's checksum. The guest then re-acquires the
+buffer from `FOREIGN`, draws check 7's clear and releases it again. The
+second flush reads the new frame (BGRA `0x4c1a0a49e1373503`, RGBA
+`0xd79d631c4d62403b`), so the acquire/release cycle repeats.
+
+Per flush:
+
+| | 256×256 | 1920×1080 |
+|---|---:|---:|
+| release build, median (min–max) | 0.19 ms (0.18–0.34) | 4.1 ms (3.8–6.4) |
+| debug build, median | 9.6 ms | 278 ms |
+| first read (import, image, staging), release | 0.52 ms | — |
+
+At 1080p, 2.65 ms of the 4.1 ms is the relaxed byte-at-a-time copy out of
+the staging pages (measured alone). The GPU copy, the submit and the fence
+are the other ~1.5 ms. This is the copy path, option (a) of the research.
+
+### Queries are questions (found by kmscube on this stage's parent)
+
+Zink's format table probes formats outside core 1.3. It asked
+`vkGetPhysicalDeviceFormatProperties2` about `VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR`
+(1000470000, maintenance5), and the executor killed the context: every GL
+client on Zink died at startup. A query about a value some extension
+defines but this device does not serve is now answered, and never sent to
+the driver:
+
+- `vkGetPhysicalDeviceFormatProperties2`: no features in the base structure
+  and in every chained one; modifier lists come back empty.
+- `vkGetPhysicalDeviceImageFormatProperties2`: `VK_ERROR_FORMAT_NOT_SUPPORTED`
+  for a non-core format, DRM-modifier tiling without the extension shown,
+  an extension's usage, flag, view format, stencil usage or handle type.
+- `vkGetPhysicalDeviceExternalSemaphoreProperties` of an extension's handle
+  type, and `vkGetPhysicalDeviceExternalBufferProperties` of an extension's
+  handle type, usage or flag: "nothing".
+- `vkGetPhysicalDeviceSparseImageFormatProperties(2)`: no entries, since no
+  sparse feature is shown. `vkGetPhysicalDeviceExternalFenceProperties`:
+  nothing, since no external fence is served. All three used to be refused
+  as unimplemented.
+
+What no Vulkan defines (an image type of 7), or what valid usage forbids
+outright (usage 0, two handle bits, a modifier structure without its
+tiling), stays fatal. So does **creating** an image or view of any value
+outside what is served. Pinned by `venus::executor::query_tests`.
+
+### Owed
+
+- **Guest acceptance**: kmscube, then GNOME with `dri_driver=zink` (the
+  coordinator's run).
+- **Zero-copy** (a later stage). Short of that, a word-wise copy out of the
+  staging pages, which have no concurrent host writer, would take about
+  2 ms off a 1080p flush.
+- The release layout is the one **recorded** last. A command buffer
+  recorded once and submitted many times with different releases is not
+  followed; Zink records one per batch.
+- A Linux host (`OPAQUE_FD`) has no handle blobs, so no handle-blob scanout
+  either.

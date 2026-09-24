@@ -290,6 +290,35 @@ impl ToAsh for VkExternalBufferProperties {
     }
 }
 
+impl FromAsh<vk::ExternalFenceProperties<'_>> for VkExternalFenceProperties {
+    fn from_ash(src: &vk::ExternalFenceProperties<'_>) -> Self {
+        Self {
+            export_from_imported_handle_types: src.export_from_imported_handle_types.as_raw(),
+            compatible_handle_types: src.compatible_handle_types.as_raw(),
+            external_fence_features: src.external_fence_features.as_raw(),
+        }
+    }
+}
+
+impl ToAsh for VkExternalFenceProperties {
+    type Ash = vk::ExternalFenceProperties<'static>;
+    fn to_ash(&self) -> vk::ExternalFenceProperties<'static> {
+        let src = self;
+        vk::ExternalFenceProperties {
+            export_from_imported_handle_types: vk::ExternalFenceHandleTypeFlags::from_raw(
+                src.export_from_imported_handle_types,
+            ),
+            compatible_handle_types: vk::ExternalFenceHandleTypeFlags::from_raw(
+                src.compatible_handle_types,
+            ),
+            external_fence_features: vk::ExternalFenceFeatureFlags::from_raw(
+                src.external_fence_features,
+            ),
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::ExternalImageFormatProperties<'_>> for VkExternalImageFormatProperties {
     fn from_ash(src: &vk::ExternalImageFormatProperties<'_>) -> Self {
         Self {
@@ -1299,6 +1328,25 @@ impl ToAsh for VkPhysicalDeviceExternalBufferInfo {
             flags: vk::BufferCreateFlags::from_raw(src.flags),
             usage: vk::BufferUsageFlags::from_raw(src.usage),
             handle_type: vk::ExternalMemoryHandleTypeFlags::from_raw(src.handle_type as u32),
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceExternalFenceInfo<'_>> for VkPhysicalDeviceExternalFenceInfo {
+    fn from_ash(src: &vk::PhysicalDeviceExternalFenceInfo<'_>) -> Self {
+        Self {
+            handle_type: src.handle_type.as_raw() as i32,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceExternalFenceInfo {
+    type Ash = vk::PhysicalDeviceExternalFenceInfo<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceExternalFenceInfo<'static> {
+        let src = self;
+        vk::PhysicalDeviceExternalFenceInfo {
+            handle_type: vk::ExternalFenceHandleTypeFlags::from_raw(src.handle_type as u32),
             ..Default::default()
         }
     }
@@ -2796,6 +2844,35 @@ impl ToAsh for VkPhysicalDeviceShaderTerminateInvocationFeatures {
     }
 }
 
+impl FromAsh<vk::PhysicalDeviceSparseImageFormatInfo2<'_>>
+    for VkPhysicalDeviceSparseImageFormatInfo2
+{
+    fn from_ash(src: &vk::PhysicalDeviceSparseImageFormatInfo2<'_>) -> Self {
+        Self {
+            format: src.format.as_raw(),
+            type_: src.ty.as_raw(),
+            samples: src.samples.as_raw() as i32,
+            usage: src.usage.as_raw(),
+            tiling: src.tiling.as_raw(),
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceSparseImageFormatInfo2 {
+    type Ash = vk::PhysicalDeviceSparseImageFormatInfo2<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceSparseImageFormatInfo2<'static> {
+        let src = self;
+        vk::PhysicalDeviceSparseImageFormatInfo2 {
+            format: vk::Format::from_raw(src.format),
+            ty: vk::ImageType::from_raw(src.type_),
+            samples: vk::SampleCountFlags::from_raw(src.samples as u32),
+            usage: vk::ImageUsageFlags::from_raw(src.usage),
+            tiling: vk::ImageTiling::from_raw(src.tiling),
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::PhysicalDeviceSparseProperties> for VkPhysicalDeviceSparseProperties {
     fn from_ash(src: &vk::PhysicalDeviceSparseProperties) -> Self {
         Self {
@@ -3937,6 +4014,48 @@ impl ToAsh for VkSemaphoreTypeCreateInfo {
         vk::SemaphoreTypeCreateInfo {
             semaphore_type: vk::SemaphoreType::from_raw(src.semaphore_type),
             initial_value: src.initial_value,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::SparseImageFormatProperties> for VkSparseImageFormatProperties {
+    fn from_ash(src: &vk::SparseImageFormatProperties) -> Self {
+        Self {
+            aspect_mask: src.aspect_mask.as_raw(),
+            image_granularity: VkExtent3D::from_ash(&src.image_granularity),
+            flags: src.flags.as_raw(),
+        }
+    }
+}
+
+impl ToAsh for VkSparseImageFormatProperties {
+    type Ash = vk::SparseImageFormatProperties;
+    fn to_ash(&self) -> vk::SparseImageFormatProperties {
+        let src = self;
+        vk::SparseImageFormatProperties {
+            aspect_mask: vk::ImageAspectFlags::from_raw(src.aspect_mask),
+            image_granularity: src.image_granularity.to_ash(),
+            flags: vk::SparseImageFormatFlags::from_raw(src.flags),
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::SparseImageFormatProperties2<'_>> for VkSparseImageFormatProperties2 {
+    fn from_ash(src: &vk::SparseImageFormatProperties2<'_>) -> Self {
+        Self {
+            properties: VkSparseImageFormatProperties::from_ash(&src.properties),
+        }
+    }
+}
+
+impl ToAsh for VkSparseImageFormatProperties2 {
+    type Ash = vk::SparseImageFormatProperties2<'static>;
+    fn to_ash(&self) -> vk::SparseImageFormatProperties2<'static> {
+        let src = self;
+        vk::SparseImageFormatProperties2 {
+            properties: src.properties.to_ash(),
             ..Default::default()
         }
     }

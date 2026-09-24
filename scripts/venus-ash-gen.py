@@ -140,6 +140,10 @@ EXECUTOR_COMMANDS = [
     'GetPhysicalDeviceExternalSemaphoreProperties',
     # stage 5c: the dma-buf buffer query, emulated
     'GetPhysicalDeviceExternalBufferProperties',
+    # S2b: queries answered without the host
+    'GetPhysicalDeviceSparseImageFormatProperties',
+    'GetPhysicalDeviceSparseImageFormatProperties2',
+    'GetPhysicalDeviceExternalFenceProperties',
 ]
 CONTEXT = ROOT / 'crates' / 'virtio-gpu' / 'src' / 'venus' / 'executor' / 'context.rs'
 

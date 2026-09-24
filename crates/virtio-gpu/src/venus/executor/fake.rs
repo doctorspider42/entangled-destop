@@ -403,6 +403,39 @@ struct Live {
     /// Fences of submits to a queue in [`FakeVulkan::stuck_queues`]: they
     /// signal only once the queue is released.
     stuck_fences: HashMap<u64, u64>,
+    /// Every image barrier recorded, 1.0 and sync2 alike (stage S2b).
+    image_barriers: Vec<FakeBarrier>,
+    /// The pages each memory imported, by host handle (stage S2b): where a
+    /// copy into a buffer bound to it lands.
+    memory_pages: HashMap<u64, Weak<RingPages>>,
+}
+
+/// One image barrier as the fake host saw it (stage S2b), its masks widened
+/// to sync2's 64 bits (and a 1.0 barrier's stages taken from its command).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FakeBarrier {
+    /// The host image.
+    pub image: u64,
+    /// `oldLayout`, `newLayout`.
+    pub layouts: (i32, i32),
+    /// `srcQueueFamilyIndex`, `dstQueueFamilyIndex`.
+    pub families: (u32, u32),
+    /// `(srcStageMask, srcAccessMask)`.
+    pub src: (u64, u64),
+    /// `(dstStageMask, dstAccessMask)`.
+    pub dst: (u64, u64),
+}
+
+/// What the fake GPU writes for texel `(x, y)` of any image a copy reads
+/// (stage S2b): four bytes that name the coordinates, in memory order.
+#[must_use]
+pub fn texel(x: u32, y: u32) -> [u8; 4] {
+    [
+        x as u8,
+        y as u8,
+        ((x >> 8) as u8 & 0xf) | (((y >> 8) as u8 & 0xf) << 4),
+        0xa5,
+    ]
 }
 
 /// The fake host. See the module docs.
@@ -530,6 +563,78 @@ impl FakeVulkan {
     #[must_use]
     pub fn image_infos(&self) -> Vec<ImageInfo> {
         self.with(|live| live.image_infos.clone())
+    }
+
+    /// Every image barrier recorded, oldest first (stage S2b).
+    #[must_use]
+    pub fn image_barriers(&self) -> Vec<FakeBarrier> {
+        self.with(|live| live.image_barriers.clone())
+    }
+
+    /// Record a command's image barriers, and have a copy into a buffer of
+    /// our pages write [`texel`]s there (stage S2b).
+    fn observe(&self, command: &Command<'_>) {
+        match command {
+            Command::CmdPipelineBarrier(a) => {
+                let (src, dst) = (u64::from(a.src_stage_mask), u64::from(a.dst_stage_mask));
+                self.with(|live| {
+                    for b in a.p_image_memory_barriers.iter().flatten() {
+                        live.image_barriers.push(FakeBarrier {
+                            image: b.image.0,
+                            layouts: (b.old_layout, b.new_layout),
+                            families: (b.src_queue_family_index, b.dst_queue_family_index),
+                            src: (src, u64::from(b.src_access_mask)),
+                            dst: (dst, u64::from(b.dst_access_mask)),
+                        });
+                    }
+                });
+            }
+            Command::CmdPipelineBarrier2(a) => self.with(|live| {
+                for b in a
+                    .p_dependency_info
+                    .iter()
+                    .flat_map(|d| d.p_image_memory_barriers.iter().flatten())
+                {
+                    live.image_barriers.push(FakeBarrier {
+                        image: b.image.0,
+                        layouts: (b.old_layout, b.new_layout),
+                        families: (b.src_queue_family_index, b.dst_queue_family_index),
+                        src: (b.src_stage_mask, b.src_access_mask),
+                        dst: (b.dst_stage_mask, b.dst_access_mask),
+                    });
+                }
+            }),
+            Command::CmdCopyImageToBuffer(a) => {
+                let pages = self.with(|live| {
+                    let (_, memory, offset) = *live
+                        .buffer_binds
+                        .iter()
+                        .rev()
+                        .find(|(b, _, _)| *b == a.dst_buffer.0)?;
+                    let pages = live.memory_pages.get(&memory)?.upgrade()?;
+                    Some((pages, offset))
+                });
+                let Some((pages, base)) = pages else {
+                    return;
+                };
+                for region in a.p_regions.iter().flatten() {
+                    let e = &region.image_extent;
+                    let row = if region.buffer_row_length == 0 {
+                        e.width
+                    } else {
+                        region.buffer_row_length
+                    };
+                    let (x0, y0) = (region.image_offset.x as u32, region.image_offset.y as u32);
+                    for y in 0..e.height {
+                        let bytes: Vec<u8> =
+                            (0..e.width).flat_map(|x| texel(x0 + x, y0 + y)).collect();
+                        let at = base + region.buffer_offset + u64::from(y) * u64::from(row) * 4;
+                        let _ = pages.write_bytes(at, &bytes);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The RTX-2070-shaped GPU and a CPU device beside it.
@@ -1338,6 +1443,7 @@ impl HostVulkan for FakeVulkan {
                     len: request.size,
                     pages: Arc::downgrade(pages),
                 });
+                live.memory_pages.insert(handle, Arc::downgrade(pages));
             }
             if request.export_handle {
                 assert!(request.dedicated.is_none(), "exports are never dedicated");
@@ -1479,6 +1585,7 @@ impl HostVulkan for FakeVulkan {
             hook(name);
         }
         self.with(|live| live.calls.push(name.to_owned()));
+        self.observe(command);
         // Pool children remember their pool (a translated handle).
         let pool = match command {
             Command::AllocateCommandBuffers(a) => {

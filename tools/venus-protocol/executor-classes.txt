@@ -51,6 +51,11 @@ vkGetPhysicalDeviceExternalSemaphoreProperties  # SYNC_FD synthesized (5b.3)
 vkGetPhysicalDeviceExternalBufferProperties     # DMA_BUF emulated (5c)
 vkGetPhysicalDeviceFormatProperties2
 vkGetPhysicalDeviceImageFormatProperties2
+# Queries answered without the host (S2b): no sparse residency is shown, so
+# no entries; no external fence is served, so nothing.
+vkGetPhysicalDeviceSparseImageFormatProperties
+vkGetPhysicalDeviceSparseImageFormatProperties2
+vkGetPhysicalDeviceExternalFenceProperties
 vkCreateDevice
 vkDestroyDevice
 vkGetDeviceQueue2
@@ -255,8 +260,6 @@ vkCmdEndConditionalRenderingEXT
 vkGetImageSparseMemoryRequirements
 vkGetImageSparseMemoryRequirements2
 vkGetDeviceImageSparseMemoryRequirements
-vkGetPhysicalDeviceSparseImageFormatProperties
-vkGetPhysicalDeviceSparseImageFormatProperties2
 vkQueueBindSparse
 # The 1.0 forms of queries Mesa only ever asks in their 1.1 form.
 vkGetPhysicalDeviceFeatures
@@ -270,9 +273,6 @@ vkEnumerateInstanceExtensionProperties
 vkEnumerateDeviceLayerProperties
 vkGetDeviceQueue
 vkGetPhysicalDeviceToolProperties
-# External handles: no external-fence extension is advertised (the semaphore
-# and buffer queries are served, above).
-vkGetPhysicalDeviceExternalFenceProperties
 # Host-visible memory is the renderer's own coherent pages: nothing to map,
 # unmap, flush or invalidate on the host (ADR-0004, 2026-09-23).
 vkUnmapMemory

@@ -348,6 +348,20 @@ pub struct MemoryObject<H: HostVulkan> {
     /// memory (stage S1): either may be bound only to a resource created for
     /// it (`handle` on the buffer or image).
     pub handle: MemoryHandle,
+    /// The host handle its handle blob holds (stage S2b), without keeping it
+    /// open: the export's own, once the blob was made of it, or the one an
+    /// import imported. How a bind of a canonical image to this memory finds
+    /// the blob to record itself on.
+    pub shared: Option<crate::venus::renderer::SharedRef>,
+}
+
+/// A canonical image recorded on a handle blob (stage S2b).
+#[derive(Debug)]
+pub struct ImageScanout {
+    /// The handle of the blob it is recorded on.
+    pub shared: crate::venus::renderer::SharedRef,
+    /// The record lives exactly as long as this does.
+    pub token: std::sync::Arc<()>,
 }
 
 /// What a `VkDeviceMemory` is to a host handle (stage S1).
@@ -449,6 +463,18 @@ pub struct ImageObject<H: HostVulkan> {
     /// `executor::modifier`): the synthesized LINEAR plane it is shown as. Its
     /// host image is the canonical optimal one.
     pub modifier: Option<super::modifier::ModifierLayout>,
+    /// For the same image, that canonical host image exactly: what a bind
+    /// of it to handle memory records on the blob (stage S2b).
+    pub canonical: Option<super::modifier::CanonicalImage>,
+    /// For a canonical image: the memory it is bound to and the offset, so
+    /// a blob made of that memory after the bind can still record it (stage
+    /// S2b).
+    pub bound_memory: Option<(u64, u64)>,
+    /// Set once the image is recorded as the canonical image of a handle
+    /// blob's payload (stage S2b): which handle, and the token whose life is
+    /// the record's — dropping this image, by whatever path, retires the
+    /// record.
+    pub scanout: Option<ImageScanout>,
     /// Bit `n` set once plane `n` is bound (bit 0 for a non-disjoint image).
     pub bound_planes: u32,
 }
@@ -1192,6 +1218,20 @@ impl<H: HostVulkan> Objects<H> {
     /// As [`Self::image`].
     pub fn image_mut(&mut self, device: u64, id: u64) -> Result<&mut ImageObject<H>, IdError> {
         child_in_mut(&mut self.images, &self.kinds, Kind::Image, device, id)
+    }
+
+    /// Every canonical image bound to memory `memory` and not yet recorded
+    /// on a handle blob, with the offset it is bound at (stage S2b).
+    pub fn unrecorded_images_on(&mut self, memory: u64) -> Vec<(u64, &mut ImageObject<H>)> {
+        self.images
+            .iter_mut()
+            .filter(|(_, image)| {
+                image.scanout.is_none()
+                    && image.canonical.is_some()
+                    && image.bound_memory.is_some_and(|(m, _)| m == memory)
+            })
+            .map(|(id, image)| (*id, image))
+            .collect()
     }
 
     /// Take image `id` of `device` out of the table.

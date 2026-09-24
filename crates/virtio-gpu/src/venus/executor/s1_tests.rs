@@ -22,32 +22,32 @@ use super::policy;
 use super::recording::*;
 
 /// The fake's device-local type (and 3, 4 are our pages).
-const DEVICE_LOCAL_TYPE: u32 = 1;
-const HOST_TYPE: u32 = 3;
+pub(super) const DEVICE_LOCAL_TYPE: u32 = 1;
+pub(super) const HOST_TYPE: u32 = 3;
 /// `VK_FORMAT_B8G8R8A8_UNORM` / `_SRGB`: XRGB8888 and its twin.
-const BGRA: i32 = 44;
-const BGRA_SRGB: i32 = 50;
-const W: u32 = 1920;
-const H: u32 = 1080;
+pub(super) const BGRA: i32 = 44;
+pub(super) const BGRA_SRGB: i32 = 50;
+pub(super) const W: u32 = 1920;
+pub(super) const H: u32 = 1080;
 /// 1920 × 4, already 256-aligned.
-const PITCH: u64 = 7680;
+pub(super) const PITCH: u64 = 7680;
 /// `rowPitch × height`, which the requirements are raised to.
 const PLANE: u64 = PITCH * H as u64;
 
-const MUTABLE: u32 = 0x8;
-const USAGE_SAMPLED: u32 = 0x4;
+pub(super) const MUTABLE: u32 = 0x8;
+pub(super) const USAGE_SAMPLED: u32 = 0x4;
 const USAGE_STORAGE: u32 = 0x8;
-const USAGE_COLOR: u32 = 0x10;
-const USAGE_TRANSFER: u32 = 0x1 | 0x2;
+pub(super) const USAGE_COLOR: u32 = 0x10;
+pub(super) const USAGE_TRANSFER: u32 = 0x1 | 0x2;
 /// What the fake's scanout formats support once they have attachments:
 /// transfers, sampled, blits, storage, colour attachment and blend.
-const SCANOUT_FEATURES: u32 = 0x1_d401 | 0x80 | 0x100 | 0x2;
+pub(super) const SCANOUT_FEATURES: u32 = 0x1_d401 | 0x80 | 0x100 | 0x2;
 /// The superset those features give: transfers, sampled, storage, colour
 /// and input attachment.
 const SUPERSET: u32 = USAGE_TRANSFER | USAGE_SAMPLED | USAGE_STORAGE | USAGE_COLOR | 0x80;
 
 /// What a Zink device enables for GNOME on the GPU, as venus sends it.
-const S1_EXTENSIONS: &[&str] = &[
+pub(super) const S1_EXTENSIONS: &[&str] = &[
     "VK_KHR_external_semaphore_fd",
     "VK_EXT_external_memory_dma_buf",
     "VK_KHR_external_memory_fd",
@@ -57,7 +57,7 @@ const S1_EXTENSIONS: &[&str] = &[
 
 /// An RTX-2070-shaped fake that can export device-local memory, has
 /// `VK_EXT_queue_family_foreign`, and attachments on its formats.
-fn gpu(name: &str, uuid: u8) -> fake::FakeDevice {
+pub(super) fn gpu(name: &str, uuid: u8) -> fake::FakeDevice {
     let mut device = fake::zink_gpu(name);
     device.info.extensions.push(VkExtensionProperties {
         extension_name: policy::name_array(policy::QUEUE_FAMILY_FOREIGN_EXT),
@@ -79,14 +79,14 @@ fn gpu(name: &str, uuid: u8) -> fake::FakeDevice {
     device
 }
 
-fn host_with(devices: Vec<fake::FakeDevice>) -> Arc<FakeVulkan> {
+pub(super) fn host_with(devices: Vec<fake::FakeDevice>) -> Arc<FakeVulkan> {
     let host = FakeVulkan::new(devices);
     host.format_features
         .store(SCANOUT_FEATURES, Ordering::SeqCst);
     Arc::new(host)
 }
 
-fn device_with(physical: u64, exts: &[&'static str]) -> Command<'static> {
+pub(super) fn device_with(physical: u64, exts: &[&'static str]) -> Command<'static> {
     let Command::CreateDevice(mut args) = create_device(physical, DEVICE, Vec::new()) else {
         unreachable!()
     };
@@ -99,7 +99,12 @@ fn device_with(physical: u64, exts: &[&'static str]) -> Command<'static> {
 
 /// Boot the current context on its `physical` (of `physicals` enumerated),
 /// a device with `exts`, its pool, queue and a command buffer.
-fn device_on(h: &mut Harness<FakeVulkan>, physicals: &[u64], physical: u64, exts: &[&'static str]) {
+pub(super) fn device_on(
+    h: &mut Harness<FakeVulkan>,
+    physicals: &[u64],
+    physical: u64,
+    exts: &[&'static str],
+) {
     h.call(&enumerate_instance_version()).expect("version");
     h.call(&create_instance(INSTANCE)).expect("instance");
     h.call(&enumerate(INSTANCE, None)).expect("count");
@@ -117,11 +122,11 @@ fn device_on(h: &mut Harness<FakeVulkan>, physicals: &[u64], physical: u64, exts
 }
 
 /// Context 1 on the one GPU of an S1 host.
-fn s1() -> (Harness<FakeVulkan>, Arc<FakeVulkan>) {
+pub(super) fn s1() -> (Harness<FakeVulkan>, Arc<FakeVulkan>) {
     s1_with(S1_EXTENSIONS)
 }
 
-fn s1_with(exts: &[&'static str]) -> (Harness<FakeVulkan>, Arc<FakeVulkan>) {
+pub(super) fn s1_with(exts: &[&'static str]) -> (Harness<FakeVulkan>, Arc<FakeVulkan>) {
     let host = host_with(vec![gpu("NVIDIA GeForce RTX 2070", 7)]);
     let mut h = Harness::new(Arc::clone(&host));
     device_on(&mut h, &[PHYSICAL], PHYSICAL, exts);
@@ -140,19 +145,19 @@ fn refused(command: Command<'static>, what: &str) {
     fatal_on(&mut h, &command, what);
 }
 
-fn dma_buf_export() -> VkMemoryAllocateInfoNext {
+pub(super) fn dma_buf_export() -> VkMemoryAllocateInfoNext {
     VkMemoryAllocateInfoNext::VkExportMemoryAllocateInfo(VkExportMemoryAllocateInfo {
         handle_types: policy::MEMORY_HANDLE_DMA_BUF,
     })
 }
 
-fn import_of(resource_id: u32) -> VkMemoryAllocateInfoNext {
+pub(super) fn import_of(resource_id: u32) -> VkMemoryAllocateInfoNext {
     VkMemoryAllocateInfoNext::VkImportMemoryResourceInfoMESA(VkImportMemoryResourceInfoMESA {
         resource_id,
     })
 }
 
-fn dedicated_to(image: u64) -> VkMemoryAllocateInfoNext {
+pub(super) fn dedicated_to(image: u64) -> VkMemoryAllocateInfoNext {
     VkMemoryAllocateInfoNext::VkMemoryDedicatedAllocateInfo(VkMemoryDedicatedAllocateInfo {
         image: VkImage(image),
         buffer: VkBuffer(0),
@@ -160,7 +165,7 @@ fn dedicated_to(image: u64) -> VkMemoryAllocateInfoNext {
 }
 
 /// How a modifier image names LINEAR.
-enum Named {
+pub(super) enum Named {
     List(Vec<u64>),
     Explicit(u64, VkSubresourceLayout),
 }
@@ -168,7 +173,7 @@ enum Named {
 /// A DRM-modifier image create info as Zink builds it
 /// (`zink_resource.c:1317-1379`): `DMA_BUF` external memory (venus's
 /// rewrite of `OPAQUE_FD | DMA_BUF`), and the modifier named.
-fn modifier_info(
+pub(super) fn modifier_info(
     format: i32,
     usage: u32,
     flags: u32,
@@ -227,7 +232,7 @@ fn modifier_info(
 /// The exporter's image, as Zink rebuilds a GBM scanout buffer at export:
 /// mutable between UNORM and sRGB, colour, sampled and transfers, the list
 /// `[LINEAR]`.
-fn exporter_image() -> VkImageCreateInfo<'static> {
+pub(super) fn exporter_image() -> VkImageCreateInfo<'static> {
     modifier_info(
         BGRA,
         USAGE_COLOR | USAGE_SAMPLED | USAGE_TRANSFER,
@@ -240,7 +245,7 @@ fn exporter_image() -> VkImageCreateInfo<'static> {
 /// The importer's image, as Zink imports a dma-buf
 /// (`zink_resource_from_handle`): no srgb list, the explicit LINEAR plane
 /// with the stride the exporter reported.
-fn importer_image(pitch: u64) -> VkImageCreateInfo<'static> {
+pub(super) fn importer_image(pitch: u64) -> VkImageCreateInfo<'static> {
     modifier_info(
         BGRA,
         USAGE_SAMPLED | USAGE_TRANSFER,
@@ -256,7 +261,11 @@ fn importer_image(pitch: u64) -> VkImageCreateInfo<'static> {
     )
 }
 
-fn create(h: &mut Harness<FakeVulkan>, id: u64, info: VkImageCreateInfo<'static>) -> i32 {
+pub(super) fn create(
+    h: &mut Harness<FakeVulkan>,
+    id: u64,
+    info: VkImageCreateInfo<'static>,
+) -> i32 {
     let Command::CreateImage(c) = h.call(&create_image(DEVICE, id, info)).expect("the create")
     else {
         panic!()
@@ -264,7 +273,7 @@ fn create(h: &mut Harness<FakeVulkan>, id: u64, info: VkImageCreateInfo<'static>
     c.ret
 }
 
-fn requirements(h: &mut Harness<FakeVulkan>, image: u64) -> VkMemoryRequirements {
+pub(super) fn requirements(h: &mut Harness<FakeVulkan>, image: u64) -> VkMemoryRequirements {
     let Command::GetImageMemoryRequirements2(r) =
         h.call(&memory_requirements(DEVICE, image)).unwrap()
     else {
@@ -300,17 +309,17 @@ fn resource_properties(h: &mut Harness<FakeVulkan>, resource_id: u32) -> (i32, u
     (p.ret, props.memory_type_bits, size.allocation_size)
 }
 
-const EXPORTER: u64 = 0x900;
-const EXPORTED_MEM: u64 = 0x901;
-const EXPORTED_RES: u32 = 90;
-const IMPORTER: u64 = 0x910;
-const IMPORTED_MEM: u64 = 0x911;
+pub(super) const EXPORTER: u64 = 0x900;
+pub(super) const EXPORTED_MEM: u64 = 0x901;
+pub(super) const EXPORTED_RES: u32 = 90;
+pub(super) const IMPORTER: u64 = 0x910;
+pub(super) const IMPORTED_MEM: u64 = 0x911;
 
 /// Context 1's export, as Zink and venus make it: the modifier image, its
 /// requirements, an export allocation dedicated to it on a device-local type
 /// (`vn_device_memory_alloc_export`), the bind, and the blob venus makes of
 /// it at once. Answers the blob's size.
-fn export(h: &mut Harness<FakeVulkan>) -> u64 {
+pub(super) fn export(h: &mut Harness<FakeVulkan>) -> u64 {
     assert_eq!(create(h, EXPORTER, exporter_image()), VK_SUCCESS);
     let req = requirements(h, EXPORTER);
     assert_ne!(req.memory_type_bits & (1 << DEVICE_LOCAL_TYPE), 0);
@@ -332,7 +341,7 @@ fn export(h: &mut Harness<FakeVulkan>) -> u64 {
 }
 
 /// A second guest process: context 2, on `physical` of `physicals`.
-fn second_context(h: &mut Harness<FakeVulkan>, physicals: &[u64], physical: u64) {
+pub(super) fn second_context(h: &mut Harness<FakeVulkan>, physicals: &[u64], physical: u64) {
     h.use_context(2);
     device_on(h, physicals, physical, S1_EXTENSIONS);
 }

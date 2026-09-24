@@ -2284,3 +2284,426 @@ fn a_linear_modifier_image_rendered_by_one_context_is_read_back_exactly_by_anoth
     assert_eq!(h.renderer.factory().host_objects(), 0);
     assert!(!h.fatal());
 }
+
+// --------------------------------------------------------------- stage S2b
+
+/// `VK_FORMAT_B8G8R8A8_UNORM` / `_SRGB`: what Zink makes of GBM's XRGB8888.
+const BGRA8: i32 = 44;
+const BGRA8_SRGB: i32 = 50;
+const LAYOUT_TRANSFER_DST: i32 = 7;
+
+/// A `width × height` BGRA8 DRM-modifier image named LINEAR by a list, as
+/// Zink rebuilds a GBM scanout buffer for export (mutable with its sRGB
+/// twin), created for `DMA_BUF`.
+fn bgra_scanout_image(width: u32, height: u32, usage: u32) -> VkImageCreateInfo<'static> {
+    VkImageCreateInfo {
+        p_next: vec![
+            VkImageCreateInfoNext::VkExternalMemoryImageCreateInfo(
+                VkExternalMemoryImageCreateInfo {
+                    handle_types: 0x200,
+                },
+            ),
+            VkImageCreateInfoNext::VkImageFormatListCreateInfo(VkImageFormatListCreateInfo {
+                view_format_count: 2,
+                p_view_formats: Some(vec![BGRA8, BGRA8_SRGB]),
+            }),
+            VkImageCreateInfoNext::VkImageDrmFormatModifierListCreateInfoEXT(
+                VkImageDrmFormatModifierListCreateInfoEXT {
+                    drm_format_modifier_count: 1,
+                    p_drm_format_modifiers: Some(vec![0]),
+                },
+            ),
+        ],
+        flags: 0x8, // MUTABLE_FORMAT
+        image_type: 1,
+        format: BGRA8,
+        extent: VkExtent3D {
+            width,
+            height,
+            depth: 1,
+        },
+        mip_levels: 1,
+        array_layers: 1,
+        samples: 1,
+        tiling: DRM_TILING,
+        usage,
+        ..Default::default()
+    }
+}
+
+/// Context `h.ctx`'s export of a scanout buffer, in the order Mesa makes it:
+/// the image, an export allocation dedicated to it on a device-local type,
+/// **the blob straight away** (`vn_device_memory_alloc_export`), then the
+/// bind. Answers the synthesized pitch.
+fn scanout_export(
+    h: &mut Harness<AshVulkan>,
+    (image, memory, resource): (u64, u64, u32),
+    (width, height): (u32, u32),
+    usage: u32,
+) -> u64 {
+    let types = memory_types(h);
+    let Command::CreateImage(i) = h
+        .call(&create_image(
+            DEVICE,
+            image,
+            bgra_scanout_image(width, height, usage),
+        ))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(i.ret, VK_SUCCESS, "the canonical BGRA8 image");
+    let Command::GetImageMemoryRequirements2(r) =
+        h.call(&memory_requirements(DEVICE, image)).unwrap()
+    else {
+        panic!()
+    };
+    let req = r.p_memory_requirements.unwrap().memory_requirements;
+    let ty = pick_type(&types, req.memory_type_bits, MEM_PROPERTY_DEVICE_LOCAL);
+    h.send(&allocate(
+        DEVICE,
+        memory,
+        req.size,
+        ty,
+        vec![
+            VkMemoryAllocateInfoNext::VkExportMemoryAllocateInfo(VkExportMemoryAllocateInfo {
+                handle_types: 0x200,
+            }),
+            VkMemoryAllocateInfoNext::VkMemoryDedicatedAllocateInfo(
+                VkMemoryDedicatedAllocateInfo {
+                    image: VkImage(image),
+                    buffer: VkBuffer(0),
+                },
+            ),
+        ],
+    ))
+    .unwrap();
+    h.memory_blob(h.ctx, resource, memory, req.size.next_multiple_of(4096))
+        .expect("a handle blob");
+    h.send(&bind_image(DEVICE, image, memory, 0)).unwrap();
+    let Command::GetImageSubresourceLayout(l) = h
+        .call(&Command::GetImageSubresourceLayout(
+            GetImageSubresourceLayoutArgs {
+                device: VkDevice(DEVICE),
+                image: VkImage(image),
+                p_subresource: Some(VkImageSubresource {
+                    aspect_mask: 0x80, // MEMORY_PLANE_0
+                    mip_level: 0,
+                    array_layer: 0,
+                }),
+                p_layout: Some(Default::default()),
+            },
+        ))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(!h.fatal());
+    l.p_layout.unwrap().row_pitch
+}
+
+/// One recording submitted and waited for, on a fence of its own.
+fn submit_frame(h: &mut Harness<AshVulkan>, commands: &[Command<'_>], fence: u64) {
+    assert_eq!(h.submit_recording(commands), Outcome::Consumed);
+    h.send(&create_fence(DEVICE, fence, false)).unwrap();
+    h.send(&queue_submit(QUEUE, &[CB], fence)).unwrap();
+    h.send(&wait_fences(DEVICE, &[fence], u64::MAX)).unwrap();
+    h.send(&destroy_fence(DEVICE, fence)).unwrap();
+    assert!(!h.fatal(), "every command was accepted");
+}
+
+/// vk-smoke's reference in the byte order a BGRA scanout carries.
+fn bgra_of(rgba: &[u8]) -> Vec<u8> {
+    rgba.chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+        .collect()
+}
+
+/// `n` flush-sized reads of `rect`, timed; answers the last read and the
+/// per-read times, sorted.
+fn timed_reads(
+    h: &mut Harness<AshVulkan>,
+    resource: u32,
+    rect: crate::protocol::Rect,
+    n: usize,
+) -> (Vec<u8>, Vec<std::time::Duration>) {
+    let mut out = Vec::new();
+    let mut times = Vec::with_capacity(n);
+    for _ in 0..n {
+        let start = std::time::Instant::now();
+        h.renderer
+            .read_rect_bgra(resource, rect, &mut out)
+            .expect("the scanout readback");
+        times.push(start.elapsed());
+    }
+    times.sort();
+    (out, times)
+}
+
+fn report(what: &str, times: &[std::time::Duration]) {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    eprintln!(
+        "S2b {what}: {} reads, min {:.3} ms, median {:.3} ms, max {:.3} ms",
+        times.len(),
+        ms(times[0]),
+        ms(times[times.len() / 2]),
+        ms(times[times.len() - 1]),
+    );
+}
+
+/// Stage S2b on the host GPU, as GNOME's flips go: context 1 (the
+/// compositor, on Zink) exports a 256×256 LINEAR BGRA8 scanout buffer — the
+/// canonical optimal image in exportable device-local memory, its blob made
+/// before the bind as Mesa makes it — renders vk-smoke's check-6 triangle
+/// into it and releases it to `VK_QUEUE_FAMILY_FOREIGN_EXT` exactly as Zink
+/// does at the end of a batch (no layout change). The renderer then accepts
+/// the flip's `SET_SCANOUT_BLOB` layout (XRGB8888, 256×256, the synthesized
+/// pitch, offset 0) and reads the frame back through its own scanout
+/// device: every pixel against the CPU reference in BGRA order, and the
+/// BGRA checksum. A second frame (check 7's clear colour), acquired back
+/// from `FOREIGN` by the guest, rendered and released again, reads back as
+/// the new frame — the acquire/release cycle repeats. Then the per-flush
+/// time at 256×256 and, with a cleared 1920×1080 buffer, at 1080p. Skips on
+/// a host that cannot export device-local memory.
+#[test]
+fn a_handle_blob_flip_reads_back_the_frame_through_the_renderers_scanout_device() {
+    use crate::protocol::Rect;
+    use crate::renderer::ScanoutBlobSpec;
+    use crate::venus::renderer::SinkFactory as _;
+    const SIZE: u32 = raster::SIZE;
+    const IMG: u64 = 0x400;
+    const IMG_MEM: u64 = 0x401;
+    const VIEW: u64 = 0x402;
+    const RES: u32 = 95;
+    const BIG: u64 = 0x600;
+    const BIG_MEM: u64 = 0x601;
+    const BIG_RES: u32 = 96;
+    const S1: &[&str] = &[
+        "VK_EXT_queue_family_foreign",
+        "VK_EXT_image_drm_format_modifier",
+    ];
+    let Some(host) = host() else { return };
+    let mut h = Harness::new(host);
+    boot(&mut h);
+    let shown = device_extension_names(&mut h);
+    if !S1.iter().all(|n| shown.iter().any(|s| s == n)) {
+        eprintln!("skipping: this host cannot export device-local memory (stage S1)");
+        return;
+    }
+    zink_device(&mut h, S1);
+
+    // The compositor's scanout buffer.
+    let pitch = scanout_export(
+        &mut h,
+        (IMG, IMG_MEM, RES),
+        (SIZE, SIZE),
+        0x10 | 0x1 | 0x2, // COLOR_ATTACHMENT | TRANSFER_SRC | TRANSFER_DST
+    );
+    assert_eq!(pitch, 1024);
+    h.send(&create_image_view(DEVICE, VIEW, IMG, BGRA8))
+        .unwrap();
+    let vertices = buffer(&mut h, 0x410, 60, USAGE_VERTEX, true);
+    vertices.write_words(&raster::vertex_data().map(f32::to_bits));
+    h.send(&create_render_pass(DEVICE, RENDER_PASS, BGRA8))
+        .unwrap();
+    h.send(&create_framebuffer(
+        DEVICE,
+        FRAMEBUFFER,
+        RENDER_PASS,
+        VIEW,
+        SIZE,
+    ))
+    .unwrap();
+    h.send(&create_shader_module(DEVICE, SHADER, &spirv(TRIANGLE_WGSL)))
+        .unwrap();
+    h.send(&create_pipeline_layout(DEVICE, PIPELINE_LAYOUT, &[]))
+        .unwrap();
+    h.send(&create_triangle_pipeline(
+        DEVICE,
+        PIPELINE,
+        SHADER,
+        PIPELINE_LAYOUT,
+        RENDER_PASS,
+        SIZE,
+    ))
+    .unwrap();
+    // A frame: the render pass leaves the image TRANSFER_SRC_OPTIMAL, and
+    // Zink releases it in whatever layout it is in.
+    let frame = |clear: [f32; 4], acquire: bool| {
+        let mut commands = vec![begin(CB)];
+        if acquire {
+            // Zink's acquire of a dma-buf it released last batch.
+            commands.push(image_barrier2_families(
+                CB,
+                IMG,
+                (LAYOUT_TRANSFER_SRC, LAYOUT_TRANSFER_SRC),
+                (STAGE2_NONE, 0),
+                (STAGE2_COLOR_OUTPUT, ACCESS2_COLOR_WRITE),
+                (FOREIGN, 0),
+            ));
+        }
+        commands.extend([
+            begin_render_pass(CB, RENDER_PASS, FRAMEBUFFER, SIZE, clear),
+            bind_pipeline(CB, 0, PIPELINE),
+            bind_vertex_buffer(CB, vertices.id),
+            draw(CB, 3),
+            end_render_pass(CB),
+            image_barrier2_families(
+                CB,
+                IMG,
+                (LAYOUT_TRANSFER_SRC, LAYOUT_TRANSFER_SRC),
+                (STAGE2_COLOR_OUTPUT, ACCESS2_COLOR_WRITE),
+                (STAGE2_NONE, 0),
+                (0, FOREIGN),
+            ),
+            end(CB),
+        ]);
+        commands
+    };
+    submit_frame(&mut h, &frame(raster::CLEAR_6, false), 0xf0);
+
+    // The flip: XRGB8888 at the pitch GBM reported.
+    let spec = ScanoutBlobSpec {
+        format: crate::FORMAT_B8G8R8X8_UNORM,
+        width: SIZE,
+        height: SIZE,
+        stride: pitch as u32,
+        offset: 0,
+    };
+    h.renderer
+        .scanout_blob(RES, &spec)
+        .expect("the canonical image on record matches the flip");
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: SIZE,
+        height: SIZE,
+    };
+    let first = std::time::Instant::now();
+    let mut got = Vec::new();
+    h.renderer
+        .read_rect_bgra(RES, whole, &mut got)
+        .expect("the first readback");
+    let first = first.elapsed();
+    let want6 = bgra_of(&raster::reference(raster::CLEAR_6));
+    assert_eq!(got.len(), want6.len());
+    match raster::verify(&bgra_of(&got), raster::CLEAR_6) {
+        Ok(detail) => eprintln!("S2b frame 1 (check 6): {detail}"),
+        Err(why) => panic!("the scanout read the wrong frame: {why}"),
+    }
+    let sum6 = raster::checksum(&got);
+    eprintln!("S2b frame 1: BGRA fnv1a={sum6:#018x}, first read {first:?}");
+    assert_eq!(sum6, raster::checksum(&want6), "vk-smoke check 6, in BGRA");
+    // A partial rect is exactly those rows.
+    let part = Rect {
+        x: 100,
+        y: 30,
+        width: 17,
+        height: 9,
+    };
+    let mut rows = Vec::new();
+    h.renderer.read_rect_bgra(RES, part, &mut rows).unwrap();
+    let expect: Vec<u8> = (part.y..part.y + part.height)
+        .flat_map(|y| {
+            let at = ((y * SIZE + part.x) * 4) as usize;
+            want6[at..at + (part.width * 4) as usize].to_vec()
+        })
+        .collect();
+    assert_eq!(rows, expect, "a partial rect");
+    let (_, times256) = timed_reads(&mut h, RES, whole, 50);
+    report("256x256 per flush", &times256);
+
+    // The guest takes the buffer back, draws the next frame, releases it.
+    submit_frame(&mut h, &frame(raster::CLEAR_7, true), 0xf1);
+    let mut got = Vec::new();
+    h.renderer.read_rect_bgra(RES, whole, &mut got).unwrap();
+    match raster::verify(&bgra_of(&got), raster::CLEAR_7) {
+        Ok(detail) => eprintln!("S2b frame 2 (check 7 clear): {detail}"),
+        Err(why) => panic!("the second flush read a stale frame: {why}"),
+    }
+    let sum7 = raster::checksum(&got);
+    eprintln!("S2b frame 2: BGRA fnv1a={sum7:#018x}");
+    assert_eq!(
+        sum7,
+        raster::checksum(&bgra_of(&raster::reference(raster::CLEAR_7)))
+    );
+    assert_ne!(sum7, sum6);
+
+    // 1080p: a cleared buffer, released as Zink leaves a blit target.
+    let (w, hh) = (1920u32, 1080u32);
+    let big_pitch = scanout_export(&mut h, (BIG, BIG_MEM, BIG_RES), (w, hh), 0x10 | 0x1 | 0x2);
+    assert_eq!(big_pitch, 7680);
+    // Exactly representable in UNORM8: 51, 153, 102, 255.
+    let colour = [0.2f32, 0.6, 0.4, 1.0];
+    submit_frame(
+        &mut h,
+        &[
+            begin(CB),
+            image_barrier2(
+                CB,
+                BIG,
+                (0, LAYOUT_TRANSFER_DST),
+                (STAGE2_NONE, 0),
+                (STAGE2_TRANSFER, 0x1000),
+            ),
+            Command::CmdClearColorImage(CmdClearColorImageArgs {
+                command_buffer: VkCommandBuffer(CB),
+                image: VkImage(BIG),
+                image_layout: LAYOUT_TRANSFER_DST,
+                p_color: Some(VkClearColorValue::Float32(colour)),
+                range_count: 1,
+                p_ranges: Some(vec![color_range()]),
+            }),
+            image_barrier2_families(
+                CB,
+                BIG,
+                (LAYOUT_TRANSFER_DST, LAYOUT_TRANSFER_DST),
+                (STAGE2_TRANSFER, 0x1000),
+                (STAGE2_NONE, 0),
+                (0, FOREIGN),
+            ),
+            end(CB),
+        ],
+        0xf2,
+    );
+    h.renderer
+        .scanout_blob(
+            BIG_RES,
+            &ScanoutBlobSpec {
+                format: crate::FORMAT_B8G8R8X8_UNORM,
+                width: w,
+                height: hh,
+                stride: big_pitch as u32,
+                offset: 0,
+            },
+        )
+        .expect("the 1080p flip");
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width: w,
+        height: hh,
+    };
+    let (got, times1080) = timed_reads(&mut h, BIG_RES, full, 30);
+    report("1920x1080 per flush", &times1080);
+    let texel = raster::clear_rgba8(colour);
+    let texel = [texel[2], texel[1], texel[0], texel[3]];
+    assert_eq!(got.len(), (w * hh * 4) as usize);
+    assert!(
+        got.chunks_exact(4).all(|p| p == texel),
+        "every 1080p pixel is the clear colour in BGRA"
+    );
+    assert_eq!(h.renderer.factory().scanout_targets(), 2);
+
+    // Unref and teardown leave nothing on the host.
+    h.renderer.destroy_blob(RES);
+    h.renderer.destroy_blob(BIG_RES);
+    assert_eq!(h.renderer.factory().scanout_targets(), 0);
+    h.send(&Command::DestroyInstance(DestroyInstanceArgs {
+        instance: VkInstance(INSTANCE),
+    }))
+    .unwrap();
+    assert_eq!(h.renderer.factory().host_objects(), 0);
+    h.renderer.reset();
+    assert!(!h.fatal());
+}
