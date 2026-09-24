@@ -2741,3 +2741,46 @@ for running real applications next, rather than growing the smoke test.
   the compositor's scanout upload on the host. It is correct, and far from
   the zero-copy path the 2026-09-16 amendments measured.
 - **Frame rate** has not been measured.
+
+## Amendment, 2026-09-24 — OpenGL is not on the GPU yet, and why
+
+`glmark2-wayland` with `MESA_LOADER_DRIVER_OVERRIDE=zink` ran for minutes at
+roughly 280 FPS, which looked like success. It was not: its own
+`GL_RENDERER` line says `llvmpipe (LLVM 21.1.8, 256 bits)`, and so does
+`eglinfo` for every profile. The override failed silently and GL fell back
+to software. The lesson is the one ADR-0004 recorded for `VN_DEBUG`: read
+the renderer string before believing a frame rate.
+
+Mesa said why when asked (`MESA_LOG_LEVEL=debug`, surfaceless EGL):
+`ZINK: failed to choose pdev`. Read from Mesa 26.0.8:
+
+- **The DRM identity.** On the EGL/GBM path, zink is handed the render
+  node and picks the Vulkan device whose `VkPhysicalDeviceDrmPropertiesEXT`
+  names that node (`zink_screen.c:1660-1685`, `:1736-1777`). Venus normally
+  reports the virtgpu node, but `vn_wsi_init` zeroes the DRM and PCI identity
+  and hides `EXT_physical_device_drm` whenever `vendorID == 0x10de`
+  (`vn_wsi.c:155-174`). That quirk exists for a real NVIDIA GPU visible to a
+  guest's WSI. We pass the host's vendor ID through, so zink never finds its
+  device.
+- **Then extension *strings*.** zink requires `VK_KHR_maintenance1`,
+  `create_renderpass2`, `imageless_framebuffer`, `dynamic_rendering` and
+  `descriptor_update_template` by name. Core 1.3 promotion does not count
+  (`zink_device_info.py:506-525`). It also requires `nullDescriptor` from
+  robustness2 (`zink_screen.c:3458-3461`).
+- **Then `VK_KHR_external_memory_fd`** (`zink_screen.c:3862-3866`), which
+  venus exposes only if the renderer advertises
+  `VK_EXT_external_memory_dma_buf` (`vn_physical_device.c:1040-1051`).
+- **GL version gates** beyond that: transform feedback, depth clip and
+  vertex divisor for 3.3; the `maintenance2` string for 4.0; a *reported*
+  `robustBufferAccess` for 4.3; the `draw_indirect_count` string for 4.6.
+
+Separately, venus decides software WSI (the `wl_shm` path vkcube uses) from
+`driverID`/`driverVersion`, not from `vendorID`: NVIDIA below 590.48.1, or no
+dma-buf advertised (`vn_wsi.c:134-139`). Advertising an emulated dma-buf would
+therefore flip WSI onto a path this renderer cannot serve the day the host
+driver reaches 590.48, unless the reported version is held below it.
+
+Stage 5c takes these in order: report the virtio vendor ID (`0x1af4`) for an
+NVIDIA host, hold the reported driver version under the dma-buf-WSI line,
+advertise and serve the extensions above, and emulate
+`VK_EXT_external_memory_dma_buf` over our own pages.
