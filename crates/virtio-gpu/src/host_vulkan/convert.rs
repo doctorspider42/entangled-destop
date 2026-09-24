@@ -31,6 +31,46 @@ pub trait ToAsh {
     fn to_ash(&self) -> Self::Ash;
 }
 
+impl FromAsh<vk::BindImagePlaneMemoryInfo<'_>> for VkBindImagePlaneMemoryInfo {
+    fn from_ash(src: &vk::BindImagePlaneMemoryInfo<'_>) -> Self {
+        Self {
+            plane_aspect: src.plane_aspect.as_raw() as i32,
+        }
+    }
+}
+
+impl ToAsh for VkBindImagePlaneMemoryInfo {
+    type Ash = vk::BindImagePlaneMemoryInfo<'static>;
+    fn to_ash(&self) -> vk::BindImagePlaneMemoryInfo<'static> {
+        let src = self;
+        vk::BindImagePlaneMemoryInfo {
+            plane_aspect: vk::ImageAspectFlags::from_raw(src.plane_aspect as u32),
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::BufferOpaqueCaptureAddressCreateInfo<'_>>
+    for VkBufferOpaqueCaptureAddressCreateInfo
+{
+    fn from_ash(src: &vk::BufferOpaqueCaptureAddressCreateInfo<'_>) -> Self {
+        Self {
+            opaque_capture_address: src.opaque_capture_address,
+        }
+    }
+}
+
+impl ToAsh for VkBufferOpaqueCaptureAddressCreateInfo {
+    type Ash = vk::BufferOpaqueCaptureAddressCreateInfo<'static>;
+    fn to_ash(&self) -> vk::BufferOpaqueCaptureAddressCreateInfo<'static> {
+        let src = self;
+        vk::BufferOpaqueCaptureAddressCreateInfo {
+            opaque_capture_address: src.opaque_capture_address,
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::CommandPoolCreateInfo<'_>> for VkCommandPoolCreateInfo {
     fn from_ash(src: &vk::CommandPoolCreateInfo<'_>) -> Self {
         Self {
@@ -47,6 +87,31 @@ impl ToAsh for VkCommandPoolCreateInfo {
         vk::CommandPoolCreateInfo {
             flags: vk::CommandPoolCreateFlags::from_raw(src.flags),
             queue_family_index: src.queue_family_index,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::ComponentMapping> for VkComponentMapping {
+    fn from_ash(src: &vk::ComponentMapping) -> Self {
+        Self {
+            r: src.r.as_raw(),
+            g: src.g.as_raw(),
+            b: src.b.as_raw(),
+            a: src.a.as_raw(),
+        }
+    }
+}
+
+impl ToAsh for VkComponentMapping {
+    type Ash = vk::ComponentMapping;
+    fn to_ash(&self) -> vk::ComponentMapping {
+        let src = self;
+        vk::ComponentMapping {
+            r: vk::ComponentSwizzle::from_raw(src.r),
+            g: vk::ComponentSwizzle::from_raw(src.g),
+            b: vk::ComponentSwizzle::from_raw(src.b),
+            a: vk::ComponentSwizzle::from_raw(src.a),
             ..Default::default()
         }
     }
@@ -120,6 +185,25 @@ impl ToAsh for VkDeviceQueueInfo2 {
     }
 }
 
+impl FromAsh<vk::ExportMemoryAllocateInfo<'_>> for VkExportMemoryAllocateInfo {
+    fn from_ash(src: &vk::ExportMemoryAllocateInfo<'_>) -> Self {
+        Self {
+            handle_types: src.handle_types.as_raw(),
+        }
+    }
+}
+
+impl ToAsh for VkExportMemoryAllocateInfo {
+    type Ash = vk::ExportMemoryAllocateInfo<'static>;
+    fn to_ash(&self) -> vk::ExportMemoryAllocateInfo<'static> {
+        let src = self;
+        vk::ExportMemoryAllocateInfo {
+            handle_types: vk::ExternalMemoryHandleTypeFlags::from_raw(src.handle_types),
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::ExtensionProperties> for VkExtensionProperties {
     fn from_ash(src: &vk::ExtensionProperties) -> Self {
         Self {
@@ -136,6 +220,27 @@ impl ToAsh for VkExtensionProperties {
         vk::ExtensionProperties {
             extension_name: src.extension_name.map(|b| b as c_char),
             spec_version: src.spec_version,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::Extent2D> for VkExtent2D {
+    fn from_ash(src: &vk::Extent2D) -> Self {
+        Self {
+            width: src.width,
+            height: src.height,
+        }
+    }
+}
+
+impl ToAsh for VkExtent2D {
+    type Ash = vk::Extent2D;
+    fn to_ash(&self) -> vk::Extent2D {
+        let src = self;
+        vk::Extent2D {
+            width: src.width,
+            height: src.height,
             ..Default::default()
         }
     }
@@ -180,6 +285,25 @@ impl ToAsh for VkExternalImageFormatProperties {
         let src = self;
         vk::ExternalImageFormatProperties {
             external_memory_properties: src.external_memory_properties.to_ash(),
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::ExternalMemoryBufferCreateInfo<'_>> for VkExternalMemoryBufferCreateInfo {
+    fn from_ash(src: &vk::ExternalMemoryBufferCreateInfo<'_>) -> Self {
+        Self {
+            handle_types: src.handle_types.as_raw(),
+        }
+    }
+}
+
+impl ToAsh for VkExternalMemoryBufferCreateInfo {
+    type Ash = vk::ExternalMemoryBufferCreateInfo<'static>;
+    fn to_ash(&self) -> vk::ExternalMemoryBufferCreateInfo<'static> {
+        let src = self;
+        vk::ExternalMemoryBufferCreateInfo {
+            handle_types: vk::ExternalMemoryHandleTypeFlags::from_raw(src.handle_types),
             ..Default::default()
         }
     }
@@ -386,6 +510,118 @@ impl ToAsh for VkImageStencilUsageCreateInfo {
     }
 }
 
+impl FromAsh<vk::ImageSubresource> for VkImageSubresource {
+    fn from_ash(src: &vk::ImageSubresource) -> Self {
+        Self {
+            aspect_mask: src.aspect_mask.as_raw(),
+            mip_level: src.mip_level,
+            array_layer: src.array_layer,
+        }
+    }
+}
+
+impl ToAsh for VkImageSubresource {
+    type Ash = vk::ImageSubresource;
+    fn to_ash(&self) -> vk::ImageSubresource {
+        let src = self;
+        vk::ImageSubresource {
+            aspect_mask: vk::ImageAspectFlags::from_raw(src.aspect_mask),
+            mip_level: src.mip_level,
+            array_layer: src.array_layer,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::ImageSubresourceRange> for VkImageSubresourceRange {
+    fn from_ash(src: &vk::ImageSubresourceRange) -> Self {
+        Self {
+            aspect_mask: src.aspect_mask.as_raw(),
+            base_mip_level: src.base_mip_level,
+            level_count: src.level_count,
+            base_array_layer: src.base_array_layer,
+            layer_count: src.layer_count,
+        }
+    }
+}
+
+impl ToAsh for VkImageSubresourceRange {
+    type Ash = vk::ImageSubresourceRange;
+    fn to_ash(&self) -> vk::ImageSubresourceRange {
+        let src = self;
+        vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::from_raw(src.aspect_mask),
+            base_mip_level: src.base_mip_level,
+            level_count: src.level_count,
+            base_array_layer: src.base_array_layer,
+            layer_count: src.layer_count,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::ImageViewUsageCreateInfo<'_>> for VkImageViewUsageCreateInfo {
+    fn from_ash(src: &vk::ImageViewUsageCreateInfo<'_>) -> Self {
+        Self {
+            usage: src.usage.as_raw(),
+        }
+    }
+}
+
+impl ToAsh for VkImageViewUsageCreateInfo {
+    type Ash = vk::ImageViewUsageCreateInfo<'static>;
+    fn to_ash(&self) -> vk::ImageViewUsageCreateInfo<'static> {
+        let src = self;
+        vk::ImageViewUsageCreateInfo {
+            usage: vk::ImageUsageFlags::from_raw(src.usage),
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::MemoryAllocateFlagsInfo<'_>> for VkMemoryAllocateFlagsInfo {
+    fn from_ash(src: &vk::MemoryAllocateFlagsInfo<'_>) -> Self {
+        Self {
+            flags: src.flags.as_raw(),
+            device_mask: src.device_mask,
+        }
+    }
+}
+
+impl ToAsh for VkMemoryAllocateFlagsInfo {
+    type Ash = vk::MemoryAllocateFlagsInfo<'static>;
+    fn to_ash(&self) -> vk::MemoryAllocateFlagsInfo<'static> {
+        let src = self;
+        vk::MemoryAllocateFlagsInfo {
+            flags: vk::MemoryAllocateFlags::from_raw(src.flags),
+            device_mask: src.device_mask,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::MemoryAllocateInfo<'_>> for VkMemoryAllocateInfo {
+    fn from_ash(src: &vk::MemoryAllocateInfo<'_>) -> Self {
+        Self {
+            p_next: Vec::new(),
+            allocation_size: src.allocation_size,
+            memory_type_index: src.memory_type_index,
+        }
+    }
+}
+
+impl ToAsh for VkMemoryAllocateInfo {
+    type Ash = vk::MemoryAllocateInfo<'static>;
+    fn to_ash(&self) -> vk::MemoryAllocateInfo<'static> {
+        let src = self;
+        vk::MemoryAllocateInfo {
+            allocation_size: src.allocation_size,
+            memory_type_index: src.memory_type_index,
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::MemoryDedicatedRequirements<'_>> for VkMemoryDedicatedRequirements {
     fn from_ash(src: &vk::MemoryDedicatedRequirements<'_>) -> Self {
         Self {
@@ -423,6 +659,27 @@ impl ToAsh for VkMemoryHeap {
         vk::MemoryHeap {
             size: src.size,
             flags: vk::MemoryHeapFlags::from_raw(src.flags),
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::MemoryOpaqueCaptureAddressAllocateInfo<'_>>
+    for VkMemoryOpaqueCaptureAddressAllocateInfo
+{
+    fn from_ash(src: &vk::MemoryOpaqueCaptureAddressAllocateInfo<'_>) -> Self {
+        Self {
+            opaque_capture_address: src.opaque_capture_address,
+        }
+    }
+}
+
+impl ToAsh for VkMemoryOpaqueCaptureAddressAllocateInfo {
+    type Ash = vk::MemoryOpaqueCaptureAddressAllocateInfo<'static>;
+    fn to_ash(&self) -> vk::MemoryOpaqueCaptureAddressAllocateInfo<'static> {
+        let src = self;
+        vk::MemoryOpaqueCaptureAddressAllocateInfo {
+            opaque_capture_address: src.opaque_capture_address,
             ..Default::default()
         }
     }
@@ -487,6 +744,24 @@ impl ToAsh for VkMemoryType {
         vk::MemoryType {
             property_flags: vk::MemoryPropertyFlags::from_raw(src.property_flags),
             heap_index: src.heap_index,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::Offset2D> for VkOffset2D {
+    fn from_ash(src: &vk::Offset2D) -> Self {
+        Self { x: src.x, y: src.y }
+    }
+}
+
+impl ToAsh for VkOffset2D {
+    type Ash = vk::Offset2D;
+    fn to_ash(&self) -> vk::Offset2D {
+        let src = self;
+        vk::Offset2D {
+            x: src.x,
+            y: src.y,
             ..Default::default()
         }
     }
@@ -3106,6 +3381,27 @@ impl ToAsh for VkQueueFamilyProperties2 {
     }
 }
 
+impl FromAsh<vk::Rect2D> for VkRect2D {
+    fn from_ash(src: &vk::Rect2D) -> Self {
+        Self {
+            offset: VkOffset2D::from_ash(&src.offset),
+            extent: VkExtent2D::from_ash(&src.extent),
+        }
+    }
+}
+
+impl ToAsh for VkRect2D {
+    type Ash = vk::Rect2D;
+    fn to_ash(&self) -> vk::Rect2D {
+        let src = self;
+        vk::Rect2D {
+            offset: src.offset.to_ash(),
+            extent: src.extent.to_ash(),
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::SamplerYcbcrConversionImageFormatProperties<'_>>
     for VkSamplerYcbcrConversionImageFormatProperties
 {
@@ -3122,6 +3418,33 @@ impl ToAsh for VkSamplerYcbcrConversionImageFormatProperties {
         let src = self;
         vk::SamplerYcbcrConversionImageFormatProperties {
             combined_image_sampler_descriptor_count: src.combined_image_sampler_descriptor_count,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::SubresourceLayout> for VkSubresourceLayout {
+    fn from_ash(src: &vk::SubresourceLayout) -> Self {
+        Self {
+            offset: src.offset,
+            size: src.size,
+            row_pitch: src.row_pitch,
+            array_pitch: src.array_pitch,
+            depth_pitch: src.depth_pitch,
+        }
+    }
+}
+
+impl ToAsh for VkSubresourceLayout {
+    type Ash = vk::SubresourceLayout;
+    fn to_ash(&self) -> vk::SubresourceLayout {
+        let src = self;
+        vk::SubresourceLayout {
+            offset: src.offset,
+            size: src.size,
+            row_pitch: src.row_pitch,
+            array_pitch: src.array_pitch,
+            depth_pitch: src.depth_pitch,
             ..Default::default()
         }
     }

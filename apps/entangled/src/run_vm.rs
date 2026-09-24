@@ -384,8 +384,9 @@ fn build_devices(
             Ok(virtio_gpu::WriteSink::new(file))
         };
         // The capset is `VenusCapset::new()`'s, unchanged: an enumerated
-        // extension mask of exactly what the generated protocol decodes, as
-        // virglrenderer advertises of its own (`vkr_renderer.c:40-48`). The
+        // extension mask of exactly the extensions whose structures the
+        // executor admits (stage 5b.1; virglrenderer advertises everything
+        // its protocol decodes, `vkr_renderer.c:40-48`). The
         // all-zero "assume every extension" mask this stage once sent had no
         // reference precedent (ADR-0004, correction of 2026-09-23).
         //
@@ -423,7 +424,9 @@ fn build_devices(
             );
         }
         tracing::warn!(
-            "attaching the Venus EXECUTING renderer (stage 5a.3): it answers the Vulkan              bring-up — instance, physical devices, device, queues, images — on the host GPU,              and nothing past it: no memory, no submission"
+            "attaching the Venus EXECUTING renderer (stage 5b.1): it answers the Vulkan bring-up, \
+             device memory, buffers, images and views on the host GPU, and nothing past them: no \
+             command buffers, no submission"
         );
         let renderer =
             virtio_gpu::VenusRenderer::new(virtio_gpu::ExecutorFactory::new(Arc::new(host)));

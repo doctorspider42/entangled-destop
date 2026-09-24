@@ -124,6 +124,13 @@ EXECUTOR_COMMANDS = [
     'GetPhysicalDeviceFormatProperties2', 'GetPhysicalDeviceImageFormatProperties2',
     'CreateDevice', 'DestroyDevice', 'GetDeviceQueue2', 'CreateCommandPool',
     'DestroyCommandPool', 'CreateImage', 'DestroyImage', 'GetImageMemoryRequirements2',
+    # stage 5b.1: memory, buffers, image binding, views
+    'AllocateMemory', 'FreeMemory', 'GetDeviceMemoryCommitment', 'CreateBuffer',
+    'DestroyBuffer', 'GetBufferMemoryRequirements', 'GetBufferMemoryRequirements2',
+    'GetDeviceBufferMemoryRequirements', 'BindBufferMemory', 'BindBufferMemory2',
+    'GetBufferDeviceAddress', 'CreateBufferView', 'DestroyBufferView',
+    'GetImageMemoryRequirements', 'GetDeviceImageMemoryRequirements', 'BindImageMemory',
+    'BindImageMemory2', 'GetImageSubresourceLayout', 'CreateImageView', 'DestroyImageView',
 ]
 CONTEXT = ROOT / 'crates' / 'virtio-gpu' / 'src' / 'venus' / 'executor' / 'context.rs'
 

@@ -14,9 +14,19 @@
 //!   carry (`vkSetReplyCommandStreamMESA`, `vkSeekReplyCommandStreamMESA`),
 //!   execute, encode the reply when the header asks for one, write it, and
 //!   report those bytes consumed.
-//! * [`context`] is what each command does, [`objects`] the id rules,
+//! * [`context`] is what each command does, [`memory`] the memory, buffer,
+//!   binding and view commands (stage 5b.1), [`objects`] the id rules,
 //!   [`policy`] what the guest is told, [`host`] the trait the host sits
 //!   behind.
+//!
+//! # Memory the guest maps
+//!
+//! A `HOST_VISIBLE` allocation is our own pages, imported into the driver
+//! ([`memory`]'s module docs), and a `HOST3D` blob whose `blob_id` names it
+//! is **the same pages** ([`ExecutorFactory`]'s
+//! [`SinkFactory::export_memory`]). Their bytes are charged to one
+//! renderer-wide budget, [`MAX_HOST_VISIBLE_BYTES`], until the last holder of
+//! them — memory object, blob or mapping — is gone.
 //!
 //! # What makes a ring fatal
 //!
@@ -56,12 +66,13 @@
 //!   `vkQueueSubmit` must give `virtio_gpu::fence` one FIFO per `ring_idx`
 //!   (the `ring_idx` recorded here) before it can retire a guest fence, and
 //!   only then flip the capset bit.
-//! * Memory. `vkAllocateMemory` is not generated; the memory policy
-//!   ([`policy::guest_memory`]) already describes the memory the next stage
-//!   will back with imported host pages.
+//! * Queue submission, and with it the command buffers, fences and
+//!   semaphores that would use the memory (stage 5b.3). Until then nothing
+//!   but a test's own submit path makes the GPU touch it.
 
 pub mod context;
 pub mod host;
+pub mod memory;
 pub mod objects;
 pub mod policy;
 
@@ -69,6 +80,8 @@ pub mod policy;
 pub(crate) mod fake;
 #[cfg(test)]
 pub(crate) mod harness;
+#[cfg(test)]
+mod memory_tests;
 #[cfg(test)]
 mod tests;
 
@@ -87,6 +100,7 @@ use super::pump::{Batch, Consumed, RingSink};
 #[cfg(doc)]
 use super::renderer::VenusRenderer;
 use super::renderer::{BlobRef, ContextBlobs, ReplyBlobError, RingEnv, SinkFactory};
+use super::shmem::{PageBudget, RingPages};
 use super::transport::{Opcode, TransportCommand, TransportError, TransportStream};
 use super::wire::{Decoder, WireError, COMMAND_HEADER_BYTES};
 
@@ -150,6 +164,21 @@ pub enum SinkError {
         error: ProtocolError,
     },
 }
+
+/// The renderer-wide cap on host pages behind `HOST_VISIBLE` guest memory:
+/// 1 GiB.
+///
+/// Every byte of it is host RAM the guest chose the size of, pinned by the
+/// host driver while imported, so it is bounded like every other guest-sized
+/// allocation — per allocation by the whole cap and across allocations by
+/// what is left of it. 1 GiB is four times the shared-memory window a guest
+/// can map at once ([`super::renderer::VENUS_HOST_VISIBLE_BYTES`], 256 MiB),
+/// which leaves room for staging memory that is allocated but not mapped,
+/// and is a loss a 16 GiB host can afford to a hostile guest. Past it an
+/// allocation answers `VK_ERROR_OUT_OF_DEVICE_MEMORY`: to the guest the
+/// host-visible heap is full. Device-local memory is not charged; the
+/// driver's own heap bounds it.
+pub const MAX_HOST_VISIBLE_BYTES: u64 = 1 << 30;
 
 /// The reply window a ring's encoder points at (`vkr_cs_encoder`'s stream).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +402,7 @@ impl<H: HostVulkan> RingSink for ExecutingSink<H> {
 pub struct ExecutorFactory<H: HostVulkan> {
     host: Arc<H>,
     contexts: HashMap<u32, Arc<Mutex<VulkanContext<H>>>>,
+    budget: Arc<PageBudget>,
 }
 
 impl<H: HostVulkan> std::fmt::Debug for ExecutorFactory<H> {
@@ -380,6 +410,7 @@ impl<H: HostVulkan> std::fmt::Debug for ExecutorFactory<H> {
         f.debug_struct("ExecutorFactory")
             .field("contexts", &self.contexts.len())
             .field("host_objects", &self.host_objects())
+            .field("host_visible_bytes", &self.budget.used())
             .finish()
     }
 }
@@ -387,10 +418,37 @@ impl<H: HostVulkan> std::fmt::Debug for ExecutorFactory<H> {
 impl<H: HostVulkan> ExecutorFactory<H> {
     /// An executor over `host`.
     pub fn new(host: Arc<H>) -> Self {
+        Self::with_budget(host, MAX_HOST_VISIBLE_BYTES)
+    }
+
+    /// An executor over `host` whose host-visible memory is capped at
+    /// `limit` bytes instead of [`MAX_HOST_VISIBLE_BYTES`].
+    pub fn with_budget(host: Arc<H>, limit: u64) -> Self {
         Self {
             host,
             contexts: HashMap::new(),
+            budget: PageBudget::new(limit),
         }
+    }
+
+    /// Bytes of host pages behind host-visible memory right now — every
+    /// allocation whose last holder is still alive.
+    #[must_use]
+    pub fn host_visible_bytes(&self) -> u64 {
+        self.budget.used()
+    }
+
+    /// Run `f` on context `ctx_id`, for a test that reaches past the ring.
+    #[cfg(test)]
+    pub(crate) fn with_context<T>(
+        &self,
+        ctx_id: u32,
+        f: impl FnOnce(&VulkanContext<H>) -> T,
+    ) -> Option<T> {
+        self.contexts.get(&ctx_id).map(|context| {
+            let guard = lock(context);
+            f(&guard)
+        })
     }
 
     /// The host this executor drives.
@@ -419,11 +477,14 @@ impl<H: HostVulkan> ExecutorFactory<H> {
 
     fn context(&mut self, ctx_id: u32) -> Arc<Mutex<VulkanContext<H>>> {
         let host = &self.host;
-        Arc::clone(
-            self.contexts.entry(ctx_id).or_insert_with(|| {
-                Arc::new(Mutex::new(VulkanContext::new(ctx_id, Arc::clone(host))))
-            }),
-        )
+        let budget = &self.budget;
+        Arc::clone(self.contexts.entry(ctx_id).or_insert_with(|| {
+            Arc::new(Mutex::new(VulkanContext::with_budget(
+                ctx_id,
+                Arc::clone(host),
+                Arc::clone(budget),
+            )))
+        }))
     }
 }
 
@@ -445,6 +506,21 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         let _ = self.context(ctx_id);
     }
 
+    fn export_memory(
+        &mut self,
+        ctx_id: u32,
+        blob_id: u64,
+        size: u64,
+    ) -> Result<Arc<RingPages>, String> {
+        // Only a context that exists: a blob of another context's memory
+        // finds nothing, because each context has its own table.
+        let context = self
+            .contexts
+            .get(&ctx_id)
+            .ok_or_else(|| format!("venus context {ctx_id} holds no Vulkan memory"))?;
+        lock(context).export_memory(blob_id, size)
+    }
+
     fn context_destroyed(&mut self, ctx_id: u32) {
         if let Some(context) = self.contexts.remove(&ctx_id) {
             lock(&context).destroy_all();
@@ -459,6 +535,15 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
 
     fn snapshot_refusal(&self) -> Option<String> {
         let objects = self.host_objects();
+        let pages = self.budget.used();
+        if objects == 0 && pages > 0 {
+            // Memory freed while a blob of it lives keeps its pages, and the
+            // guest may still be looking at them.
+            return Some(format!(
+                "the Venus executor still holds {pages:#x} bytes of host-visible Vulkan memory \
+                 pages a guest can map, and they cannot be written to a snapshot"
+            ));
+        }
         (objects > 0).then(|| {
             format!(
                 "the Venus executor holds {objects} host Vulkan objects a guest driver believes \

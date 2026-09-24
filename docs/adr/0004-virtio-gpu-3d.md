@@ -2244,3 +2244,102 @@ Two more 26.0.8 facts that shape the next stage:
   `HOST_VISIBLE|HOST_COHERENT` memory (`vn_feedback.c:74-77`), plus async
   `vkWaitForFences`/`vkWaitSemaphores` that the renderer must truly block on
   (`vn_queue.c:1759`, `:2243`).
+
+## Amendment, 2026-09-24 — stage 5b.1, device memory, buffers and images
+
+The executor now allocates and frees device memory, creates buffers, binds
+buffers and images, answers every memory-requirements query and creates buffer
+and image views (`venus/executor/memory.rs`), and a `HOST3D` blob whose
+`blob_id` names a `VkDeviceMemory` is **that memory's pages**. This is the
+memory model the 2026-09-23 measurement chose, built.
+
+- **Guest-visible memory is our pages, imported.** An allocation of a type the
+  guest sees as `HOST_VISIBLE` (types 3 and 4 on the RTX 2070) is a
+  `RingPages::for_memory` allocation — zeroed, aligned to the driver's
+  `minImportedHostPointerAlignment`, rounded up to a multiple of it — checked
+  against `vkGetMemoryHostPointerPropertiesEXT` for the guest's type index and
+  imported with `VK_EXT_external_memory_host` (`HOST_ALLOCATION`). Every other
+  type is a plain `vkAllocateMemory`, and no blob can be made of it.
+- **The blob is the same `Arc`.** `RESOURCE_CREATE_BLOB` with a `blob_id`
+  asks the factory (`SinkFactory::export_memory`) for that context's memory;
+  it must be host-visible, the blob's size must be the allocation rounded to
+  4 KiB (what the guest kernel sends), and — as in vkr — a memory is exported
+  once. Mapping publishes exactly the blob's span of those pages
+  (`RingPages::publish_len`), so the guest's mapping and the GPU's view are one
+  set of bytes. `blob_id` 0 stays plain shared memory for rings and replies.
+- **Lifetime.** The pages have three holders — the host memory object
+  (`host_vulkan::HostMemory`, which releases its `Arc` only after
+  `vkFreeMemory` has returned, and after `vkDeviceWaitIdle` for an import),
+  the blob, and the publication — and are freed when the last goes, whichever
+  order the guest frees in. Mesa's own order (unref the bo, then
+  `vkFreeMemory` into the ring) races on the host by construction, and both
+  orders are tested. A partition can never map pages the allocator has
+  reused, and a GPU can never write pages the executor has let go of.
+- **Budget.** 1 GiB of imported pages renderer-wide
+  (`executor::MAX_HOST_VISIBLE_BYTES`, a `shmem::PageBudget` shared by every
+  context), charged at allocation and refunded only when the pages are freed,
+  so freeing memory while its blob stays mapped does not free budget. Past it
+  an allocation answers `VK_ERROR_OUT_OF_DEVICE_MEMORY`. Device-local memory
+  is the driver's to bound; a size past its heap gets the same answer before
+  the driver is asked.
+- **What a resource may be bound to.** Binding imported memory is valid only
+  for a resource created for that handle type. Every buffer and image is
+  created with a `VkExternalMemory*CreateInfo{HOST_ALLOCATION}` when the driver
+  reports the handle type `IMPORTABLE` for it, and its `memoryTypeBits` name
+  the host-visible types only then. On the RTX 2070 a transfer buffer may live
+  in types 3 and 4 (`memoryTypeBits = 0x1b`); an image the driver will not
+  import for never sees them. Every bind is judged against the same filtered
+  bits, the offset against the alignment and the requirement against the
+  guest's allocation size, before the driver is asked.
+- **The capset's extension mask is now what the executor admits** — the two
+  venus extensions plus every extension that adds a structure the chain
+  policy admits (core 1.1–1.3), 60 in all, derived from the same table and
+  rule (`policy::admitted_extension_numbers`). That includes
+  `VK_KHR_synchronization2` (315) and `VK_KHR_dynamic_rendering` (45), on which
+  the guest gates core-1.3 structures, and was checked against every
+  `vn_cs_renderer_protocol_has_extension` gate in Mesa 26.0.8's driver
+  headers: each gated structure the executor admits has its bit. It is
+  narrower than virglrenderer's (everything its protocol decodes), because
+  here a decoded structure outside the admitted set is fatal.
+- **`vkWaitRingSeqnoMESA` is served** on the context stream: the device waits
+  (bounded, 5 s) until the ring's `head` passes the seqno. Mesa sends it
+  before creating the blob of memory it allocated without a reply
+  (`vn_device_memory_wait_alloc`); without it the blob could arrive before the
+  ring worker had executed the allocation.
+
+Where this differs from vkr, beyond the memory model: every bind, view and
+requirements query is validated before the driver sees it (vkr trusts the
+driver); `bufferDeviceAddressCaptureReplay` is reported false, and so
+`vkGetBufferOpaqueCaptureAddress`, `vkGetDeviceMemoryOpaqueCaptureAddress` and
+any nonzero opaque capture address are refused; `vkGetDeviceMemoryCommitment`
+is forwarded only for a lazily allocated type and answers 0 otherwise; a
+ring cannot be built on a blob of Vulkan memory.
+
+What Mesa 26.0.8 sends, and what it gets: `vkAllocateMemory` without a reply,
+`VkMemoryAllocateFlagsInfo`, `VkMemoryDedicatedAllocateInfo` and an
+`VkExportMemoryAllocateInfo` it has rewritten to handle types 0 (all served);
+`VkImportMemoryResourceInfoMESA` only for a dma-buf import or guest vram,
+neither of which exists here (`VK_ERROR_INVALID_EXTERNAL_HANDLE`, as vkr
+answers a resource it cannot import); the blob lazily, at the first
+`vkMapMemory`, as `HOST3D`/`MAPPABLE` with `blob_id` = the memory's id;
+`vkCreateBuffer` + `vkGetBufferMemoryRequirements2` (with
+`VkMemoryDedicatedRequirements`) or, on its requirements-cache hit, the create
+alone; `vkBindBufferMemory2`, `vkBindImageMemory2`, `vkCreateImageView` and
+`vkCreateBufferView` without replies; `vkGetDevice{Buffer,Image}MemoryRequirements`
+(refused on a device below 1.3, where the entry point may not exist);
+`vkGetImageSubresourceLayout` for linear images. A `vkBindImageMemory2` with no
+memory is its WSI path and needs a swapchain nothing here offers yet.
+
+**Measured on the RTX 2070** (driver 580.88, Windows,
+`host_vulkan::tests::the_host_gpu_fills_a_buffer_and_the_guest_reads_it_through_the_blob`):
+for each of types 3 and 4, a 64 KiB transfer buffer allocated and bound through
+the executor, its memory's blob mapped into a window, the guest's bytes
+overwritten by the **host GPU** (`vkCmdFillBuffer` through a test-only submit
+path, `AshVulkan::fill_buffer`), and all 16384 words read back through the
+blob's pages as the guest sees them, 0 wrong.
+
+Owed by the next stages: queue submission (5b.3), whose command buffers are
+what will use this memory, and the sync_fd semaphore emulation that unlocks
+sync2 and the swapchain (the 2026-09-23 finding); `save`/`load` for memory,
+which a snapshot still refuses by name while any host Vulkan object or any
+imported page is alive.

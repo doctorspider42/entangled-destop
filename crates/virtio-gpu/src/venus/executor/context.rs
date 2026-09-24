@@ -1,5 +1,6 @@
 //! One venus context's Vulkan: its object table, its host, and what each of
-//! this stage's commands does to them (spec §1.2 rows 2–26).
+//! the bring-up's commands does to them (spec §1.2 rows 2–26). Memory,
+//! buffers, image binding and views are [`super::memory`]'s.
 //!
 //! Every command follows virglrenderer's `vkr_dispatch_*` unless the function
 //! says otherwise. The shape of each is the same: resolve every id to a host
@@ -14,6 +15,8 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+
+use crate::venus::shmem::PageBudget;
 
 use thiserror::Error;
 
@@ -37,8 +40,10 @@ use crate::venus::protocol::{
 use crate::venus::wire::Encoder;
 
 use super::host::{DeviceRequest, HostVulkan, InstanceRequest, QueueRequest};
+use super::memory::{guest_type_bits, image_facts, image_planes};
 use super::objects::{
-    CreatedQueue, DeviceChild, DeviceObject, ExposedDevice, IdError, Kind, Objects, QueueObject,
+    CreatedQueue, DeviceChild, DeviceObject, ExposedDevice, IdError, ImageObject, Kind, Objects,
+    QueueObject,
 };
 use super::policy::{self, GuestDevice, MAX_API_VERSION, MIN_API_VERSION};
 
@@ -111,7 +116,11 @@ fn unadmitted_link(command: &Command<'_>) -> Option<ExecError> {
     found.map(|(parent, stype)| unimplemented_link(command.name(), parent, stype))
 }
 
-fn unimplemented_link(command: &'static str, parent: &'static str, stype: i32) -> ExecError {
+pub(super) fn unimplemented_link(
+    command: &'static str,
+    parent: &'static str,
+    stype: i32,
+) -> ExecError {
     ExecError::UnimplementedLink {
         command,
         parent,
@@ -120,14 +129,14 @@ fn unimplemented_link(command: &'static str, parent: &'static str, stype: i32) -
     }
 }
 
-fn invalid(command: &'static str, what: impl Into<String>) -> ExecError {
+pub(super) fn invalid(command: &'static str, what: impl Into<String>) -> ExecError {
     ExecError::Invalid {
         command,
         what: what.into(),
     }
 }
 
-fn id_error(command: &'static str) -> impl Fn(IdError) -> ExecError {
+pub(super) fn id_error(command: &'static str) -> impl Fn(IdError) -> ExecError {
     move |error| ExecError::Id { command, error }
 }
 
@@ -135,21 +144,54 @@ fn id_error(command: &'static str) -> impl Fn(IdError) -> ExecError {
 /// satisfies Vulkan's external-synchronization rules for everything this
 /// stage calls).
 pub struct VulkanContext<H: HostVulkan> {
-    ctx_id: u32,
-    host: Arc<H>,
-    objects: Objects<H>,
-    fatal: bool,
+    pub(super) ctx_id: u32,
+    pub(super) host: Arc<H>,
+    pub(super) objects: Objects<H>,
+    pub(super) fatal: bool,
+    /// The renderer-wide budget every host-visible allocation's pages are
+    /// charged to ([`super::MAX_HOST_VISIBLE_BYTES`]).
+    pub(super) budget: Arc<PageBudget>,
 }
 
 impl<H: HostVulkan> VulkanContext<H> {
-    /// An empty context on `host`.
+    /// An empty context on `host`, with a host-visible budget of its own
+    /// ([`super::MAX_HOST_VISIBLE_BYTES`]).
     pub fn new(ctx_id: u32, host: Arc<H>) -> Self {
+        Self::with_budget(ctx_id, host, PageBudget::new(super::MAX_HOST_VISIBLE_BYTES))
+    }
+
+    /// An empty context on `host`, charging host-visible memory to `budget`
+    /// — the one every context of a renderer shares.
+    pub fn with_budget(ctx_id: u32, host: Arc<H>, budget: Arc<PageBudget>) -> Self {
         Self {
             ctx_id,
             host,
             objects: Objects::default(),
             fatal: false,
+            budget,
         }
+    }
+
+    /// The host device, a queue of it and its family, and a buffer of it,
+    /// for a real-GPU test that has the host do something to a buffer the
+    /// guest made.
+    #[cfg(test)]
+    pub(crate) fn with_host_buffer<T>(
+        &self,
+        device: u64,
+        buffer: u64,
+        f: impl FnOnce(&H, &H::Device, H::Queue, u32, H::Buffer) -> T,
+    ) -> Option<T> {
+        let host_device = self.objects.device(device).ok()?;
+        let queue = self.objects.any_queue(device)?;
+        let buffer = self.objects.buffer(device, buffer).ok()?;
+        Some(f(
+            &self.host,
+            &host_device.host,
+            queue.host,
+            queue.family,
+            buffer.host,
+        ))
     }
 
     /// Guest-visible objects in the table (the physical devices included).
@@ -234,6 +276,32 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::CreateImage(args) => self.create_image(args),
             Command::DestroyImage(args) => self.destroy_image(args),
             Command::GetImageMemoryRequirements2(args) => self.image_memory_requirements(args),
+            Command::AllocateMemory(args) => self.allocate_memory(args),
+            Command::FreeMemory(args) => self.free_memory(args),
+            Command::GetDeviceMemoryCommitment(args) => self.memory_commitment(args),
+            Command::CreateBuffer(args) => self.create_buffer(args),
+            Command::DestroyBuffer(args) => self.destroy_buffer(args),
+            Command::GetBufferMemoryRequirements(args) => self.buffer_requirements(args),
+            Command::GetBufferMemoryRequirements2(args) => self.buffer_requirements2(args),
+            Command::GetDeviceBufferMemoryRequirements(args) => {
+                self.device_buffer_requirements(args)
+            }
+            Command::BindBufferMemory(args) => self.bind_buffer_memory(args),
+            Command::BindBufferMemory2(args) => self.bind_buffer_memory2(args),
+            Command::GetBufferDeviceAddress(args) => self.buffer_device_address(args),
+            Command::CreateBufferView(args) => self.create_buffer_view(args),
+            Command::DestroyBufferView(args) => self.destroy_buffer_view(args),
+            Command::GetImageMemoryRequirements(args) => self.image_requirements(args),
+            Command::GetDeviceImageMemoryRequirements(args) => self.device_image_requirements(args),
+            Command::BindImageMemory(args) => self.bind_image_memory(args),
+            Command::BindImageMemory2(args) => self.bind_image_memory2(args),
+            Command::GetImageSubresourceLayout(args) => self.image_subresource_layout(args),
+            Command::CreateImageView(args) => self.create_image_view(args),
+            Command::DestroyImageView(args) => self.destroy_image_view(args),
+            // `vkGetBufferOpaqueCaptureAddress` and
+            // `vkGetDeviceMemoryOpaqueCaptureAddress` land here on purpose:
+            // they are only valid with `bufferDeviceAddressCaptureReplay`,
+            // which `policy::mask_features` reports false.
             other => Err(ExecError::NotImplemented {
                 command: other.name(),
             }),
@@ -829,6 +897,15 @@ impl<H: HostVulkan> VulkanContext<H> {
         }
         let mut chain = Vec::new();
         let mut group = None;
+        let buffer_device_address = info.p_next.iter().any(|link| match link {
+            VkDeviceCreateInfoNext::VkPhysicalDeviceVulkan12Features(f) => {
+                f.buffer_device_address != 0
+            }
+            VkDeviceCreateInfoNext::VkPhysicalDeviceBufferDeviceAddressFeatures(f) => {
+                f.buffer_device_address != 0
+            }
+            _ => false,
+        });
         for link in &info.p_next {
             match link {
                 VkDeviceCreateInfoNext::VkDeviceGroupDeviceCreateInfo(g) => {
@@ -892,6 +969,9 @@ impl<H: HostVulkan> VulkanContext<H> {
             chain,
             group,
         };
+        let group_size = request.group.as_ref().map_or(1, |members| {
+            u32::try_from(members.len()).unwrap_or(1).max(1)
+        });
         let (instance, _) = self.objects.physical(physical).map_err(id_error(NAME))?;
         match self.host.create_device(instance, host_physical, &request) {
             Ok(device) => {
@@ -912,6 +992,8 @@ impl<H: HostVulkan> VulkanContext<H> {
                         host: device,
                         physical,
                         queues: created,
+                        group_size,
+                        buffer_device_address,
                     },
                 );
                 args.ret = VK_SUCCESS;
@@ -1001,6 +1083,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 device: device_id,
                 host: host_queue,
                 ring_idx,
+                family: info.queue_family_index,
             },
         );
         Ok(())
@@ -1092,46 +1175,29 @@ impl<H: HostVulkan> VulkanContext<H> {
             .physical(device.physical)
             .map_err(id_error(NAME))?;
         check_image_create_info(NAME, info, &exposed.guest)?;
-
-        let query = VkPhysicalDeviceImageFormatInfo2 {
-            p_next: Vec::new(),
-            format: info.format,
-            type_: info.image_type,
-            tiling: info.tiling,
-            usage: info.usage,
-            flags: info.flags,
-        };
-        let mut limits = VkImageFormatProperties2::default();
-        let ret = self
-            .host
-            .image_format_properties(instance, exposed.host, &query, &mut limits);
-        let limits = &limits.image_format_properties;
-        let samples = u32::try_from(info.samples).unwrap_or(0);
-        if ret != VK_SUCCESS
-            || info.extent.width > limits.max_extent.width
-            || info.extent.height > limits.max_extent.height
-            || info.extent.depth > limits.max_extent.depth
-            || info.mip_levels > limits.max_mip_levels
-            || info.array_layers > limits.max_array_layers
-            || limits.sample_counts & samples == 0
-        {
+        if !image_limits_hold(&*self.host, instance, exposed.host, info) {
             return Err(invalid(
                 NAME,
                 "the image is outside what the host reports for its format, type, tiling, usage and flags",
             ));
         }
+        let planes = image_planes(NAME, info)?;
 
         if !self.objects.has_room() {
             args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
             return Ok(());
         }
-        match self.host.create_image(&device.host, info) {
+        let host_memory = self.host.image_accepts_host_memory(&device.host, info);
+        match self.host.create_image(&device.host, info, host_memory) {
             Ok(image) => {
                 self.objects.insert_image(
                     id,
-                    DeviceChild {
+                    ImageObject {
                         device: device_id,
                         host: image,
+                        facts: image_facts(info, planes),
+                        host_memory,
+                        bound_planes: 0,
                     },
                 );
                 args.ret = VK_SUCCESS;
@@ -1156,9 +1222,11 @@ impl<H: HostVulkan> VulkanContext<H> {
         Ok(())
     }
 
-    /// `vkGetImageMemoryRequirements2`. `memoryTypeBits` passes through
-    /// untouched: [`policy::guest_memory`] keeps every type index, so the
-    /// host's bits name the same types in the guest's table.
+    /// `vkGetImageMemoryRequirements2`. Type indices need no translation
+    /// ([`policy::guest_memory`] keeps every one), but the bits are filtered
+    /// to what this image may be bound to ([`guest_type_bits`]): no
+    /// host-visible type unless it was created able to take our imported
+    /// pages. A plane is named exactly when the image is disjoint.
     fn image_memory_requirements(
         &mut self,
         args: &mut GetImageMemoryRequirements2Args,
@@ -1183,10 +1251,29 @@ impl<H: HostVulkan> VulkanContext<H> {
                 }
             }
         }
-        let device = self.objects.device(device_id).map_err(id_error(NAME))?;
+        let disjoint = image.facts.flags & policy::IMAGE_CREATE_DISJOINT != 0;
+        let plane_in_range = plane.is_some_and(|aspect| {
+            let index = aspect.trailing_zeros().saturating_sub(4);
+            index < image.facts.planes
+        });
+        if disjoint != plane.is_some() || (disjoint && !plane_in_range) {
+            return Err(invalid(
+                NAME,
+                "a plane is named exactly when the image is disjoint, and must be one it has",
+            ));
+        }
+        let (device, guest) = self
+            .objects
+            .device_and_guest(device_id)
+            .map_err(id_error(NAME))?;
         if let Some(out) = args.p_memory_requirements.as_mut() {
             self.host
-                .image_memory_requirements(&device.host, image, plane, out);
+                .image_memory_requirements(&device.host, image.host, plane, out);
+            out.memory_requirements.memory_type_bits = guest_type_bits(
+                guest,
+                image.host_memory,
+                out.memory_requirements.memory_type_bits,
+            );
         }
         Ok(())
     }
@@ -1284,8 +1371,39 @@ fn check_view_formats(command: &'static str, formats: Option<&[i32]>) -> Result<
     Ok(())
 }
 
+/// Whether an image of `info` is inside what the host's own
+/// `vkGetPhysicalDeviceImageFormatProperties2` reports for its format, type,
+/// tiling, usage and flags: an image outside them is invalid usage the
+/// driver is not required to survive.
+pub(super) fn image_limits_hold<H: HostVulkan>(
+    host: &H,
+    instance: &H::Instance,
+    physical: H::PhysicalDevice,
+    info: &VkImageCreateInfo,
+) -> bool {
+    let query = VkPhysicalDeviceImageFormatInfo2 {
+        p_next: Vec::new(),
+        format: info.format,
+        type_: info.image_type,
+        tiling: info.tiling,
+        usage: info.usage,
+        flags: info.flags,
+    };
+    let mut limits = VkImageFormatProperties2::default();
+    let ret = host.image_format_properties(instance, physical, &query, &mut limits);
+    let limits = &limits.image_format_properties;
+    let samples = u32::try_from(info.samples).unwrap_or(0);
+    ret == VK_SUCCESS
+        && info.extent.width <= limits.max_extent.width
+        && info.extent.height <= limits.max_extent.height
+        && info.extent.depth <= limits.max_extent.depth
+        && info.mip_levels <= limits.max_mip_levels
+        && info.array_layers <= limits.max_array_layers
+        && limits.sample_counts & samples != 0
+}
+
 /// The checks `vkCreateImage` gets before the driver sees its create info.
-fn check_image_create_info(
+pub(super) fn check_image_create_info(
     command: &'static str,
     info: &VkImageCreateInfo,
     guest: &GuestDevice,

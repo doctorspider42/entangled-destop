@@ -32,27 +32,37 @@
 //!   was range-checked by the executor against Vulkan 1.3 core
 //!   ([`crate::venus::executor::policy`]).
 //! * **External synchronization** is the executor's per-context lock.
+//! * **Imported pages outlive their import.** A host-visible
+//!   `VkDeviceMemory` is our [`RingPages`], imported with
+//!   `VK_EXT_external_memory_host`; [`HostMemory`] holds an `Arc` of them
+//!   and [`HostVulkan::free_memory`] drops it only after `vkFreeMemory` has
+//!   returned (and after the device went idle), so the driver never holds a
+//!   pointer into pages that have been freed.
 
 pub mod convert;
 
 use std::ffi::{c_char, c_void, CString};
+use std::sync::Arc;
 
 use ash::vk;
 
 use crate::venus::executor::host::{
-    DeviceRequest, HostDeviceInfo, HostGroup, HostVulkan, InstanceRequest,
+    Dedicated, DeviceRequest, HostDeviceInfo, HostGroup, HostVulkan, ImageBind, InstanceRequest,
+    MemoryRequest,
 };
 use crate::venus::executor::policy::{has_extension, EXTERNAL_MEMORY_HOST};
 use crate::venus::executor::GuestDevice;
 use crate::venus::protocol::{
-    VkCommandPoolCreateInfo, VkExtensionProperties, VkFormat, VkFormatProperties2,
-    VkFormatProperties2Next, VkImageAspectFlagBits, VkImageCreateInfo, VkImageCreateInfoNext,
-    VkImageFormatProperties2, VkImageFormatProperties2Next, VkMemoryRequirements2,
-    VkMemoryRequirements2Next, VkPhysicalDeviceFeatures, VkPhysicalDeviceFeatures2,
-    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceImageFormatInfo2Next,
-    VkPhysicalDeviceMemoryProperties, VkPhysicalDeviceProperties, VkPhysicalDeviceProperties2,
-    VkQueueFamilyProperties, VkResult, VK_ERROR_FEATURE_NOT_PRESENT, VK_ERROR_FORMAT_NOT_SUPPORTED,
-    VK_ERROR_INITIALIZATION_FAILED, VK_SUCCESS,
+    VkBufferCreateInfo, VkBufferCreateInfoNext, VkBufferViewCreateInfo, VkCommandPoolCreateInfo,
+    VkExtensionProperties, VkFormat, VkFormatProperties2, VkFormatProperties2Next,
+    VkImageAspectFlagBits, VkImageCreateInfo, VkImageCreateInfoNext, VkImageFormatProperties2,
+    VkImageFormatProperties2Next, VkImageSubresource, VkImageViewCreateInfo,
+    VkImageViewCreateInfoNext, VkMemoryRequirements2, VkMemoryRequirements2Next,
+    VkPhysicalDeviceFeatures, VkPhysicalDeviceFeatures2, VkPhysicalDeviceImageFormatInfo2,
+    VkPhysicalDeviceImageFormatInfo2Next, VkPhysicalDeviceMemoryProperties,
+    VkPhysicalDeviceProperties, VkPhysicalDeviceProperties2, VkQueueFamilyProperties, VkResult,
+    VkSubresourceLayout, VK_ERROR_FEATURE_NOT_PRESENT, VK_ERROR_FORMAT_NOT_SUPPORTED,
+    VK_ERROR_INITIALIZATION_FAILED, VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS,
 };
 use crate::venus::shmem::RingPages;
 
@@ -65,6 +75,29 @@ const API_1_3: u32 = vk::API_VERSION_1_3;
 /// RTX 2070 says 4 KiB; anything past 2 MiB is a driver the probe does not
 /// trust with a real allocation.
 const MAX_IMPORT_ALIGNMENT: u64 = 2 << 20;
+
+/// The handle type every guest-visible allocation is imported as.
+const HOST_ALLOCATION: vk::ExternalMemoryHandleTypeFlags =
+    vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+
+/// A host `VkDevice`, and what calling it needs beyond `ash`'s table: its
+/// instance and physical device (for the external-memory queries a resource
+/// is created by) and the one extension entry point the renderer calls.
+pub struct HostDevice {
+    device: ash::Device,
+    instance: ash::Instance,
+    physical: vk::PhysicalDevice,
+    /// `vkGetMemoryHostPointerPropertiesEXT`, resolved from the device (the
+    /// renderer enables `VK_EXT_external_memory_host` on every one).
+    host_pointer_properties: Option<vk::PFN_vkGetMemoryHostPointerPropertiesEXT>,
+}
+
+/// A host `VkDeviceMemory`, and — for an import — the pages the driver
+/// imported, kept alive until after it is freed.
+pub struct HostMemory {
+    memory: vk::DeviceMemory,
+    pages: Option<Arc<RingPages>>,
+}
 
 /// The host's Vulkan loader. See the module docs.
 pub struct AshVulkan {
@@ -122,7 +155,7 @@ impl AshVulkan {
         instance: &ash::Instance,
         device: vk::PhysicalDevice,
         families: &[VkQueueFamilyProperties],
-    ) -> Option<u32> {
+    ) -> Option<(u32, u64)> {
         let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host_props);
         // SAFETY: `device` is ours; `props2` and the one structure chained on
@@ -183,7 +216,7 @@ impl AshVulkan {
                 )
             };
             drop(pages);
-            (result == vk::Result::SUCCESS).then_some(out.memory_type_bits)
+            (result == vk::Result::SUCCESS).then_some((out.memory_type_bits, align))
         });
         // SAFETY: `probe` was created above, owns no child, and is not used
         // after this.
@@ -204,10 +237,14 @@ fn c_string(text: &Option<String>) -> Option<CString> {
 impl HostVulkan for AshVulkan {
     type Instance = ash::Instance;
     type PhysicalDevice = vk::PhysicalDevice;
-    type Device = ash::Device;
+    type Device = HostDevice;
     type Queue = vk::Queue;
     type CommandPool = vk::CommandPool;
     type Image = vk::Image;
+    type Memory = HostMemory;
+    type Buffer = vk::Buffer;
+    type BufferView = vk::BufferView;
+    type ImageView = vk::ImageView;
 
     fn instance_version(&self) -> Result<u32, VkResult> {
         // SAFETY: a global command with no arguments but the out value.
@@ -303,7 +340,7 @@ impl HostVulkan for AshVulkan {
             .iter()
             .map(VkExtensionProperties::from_ash)
             .collect();
-        let host_import_types = (api >= vk::API_VERSION_1_1
+        let host_import = (api >= vk::API_VERSION_1_1
             && has_extension(&extensions, EXTERNAL_MEMORY_HOST))
         .then(|| self.probe_host_import(instance, device, &queue_families))
         .flatten();
@@ -313,7 +350,8 @@ impl HostVulkan for AshVulkan {
             queue_families,
             memory: VkPhysicalDeviceMemoryProperties::from_ash(&memory),
             extensions,
-            host_import_types,
+            host_import_types: host_import.map(|(bits, _)| bits),
+            host_import_alignment: host_import.map_or(0, |(_, align)| align),
         }
     }
 
@@ -486,7 +524,7 @@ impl HostVulkan for AshVulkan {
         instance: &ash::Instance,
         device: vk::PhysicalDevice,
         request: &DeviceRequest<vk::PhysicalDevice>,
-    ) -> Result<ash::Device, VkResult> {
+    ) -> Result<HostDevice, VkResult> {
         let queues: Vec<vk::DeviceQueueCreateInfo<'_>> = request
             .queues
             .iter()
@@ -528,20 +566,50 @@ impl HostVulkan for AshVulkan {
         // in [0, 1], extensions advertised or the renderer's own, features
         // no more than reported); every array and chained structure it
         // points at is a local that outlives the call.
-        unsafe { instance.create_device(device, &info, None) }.map_err(result_code)
+        let created =
+            unsafe { instance.create_device(device, &info, None) }.map_err(result_code)?;
+        // Resolved by hand rather than through `ash::ext::external_memory_host`,
+        // whose fallback for a missing entry point panics.
+        // SAFETY: `created` is a live device made with the extension enabled
+        // (the executor always asks for it), and the name is a NUL-terminated
+        // literal.
+        let raw = unsafe {
+            instance.get_device_proc_addr(
+                created.handle(),
+                c"vkGetMemoryHostPointerPropertiesEXT".as_ptr(),
+            )
+        };
+        let host_pointer_properties = raw.map(|raw| {
+            // SAFETY: the loader returned this pointer for exactly this entry
+            // point, whose C signature `PFN_vkGetMemoryHostPointerPropertiesEXT`
+            // is; both are `extern "system"` function pointers of one ABI.
+            unsafe {
+                std::mem::transmute::<
+                    unsafe extern "system" fn(),
+                    vk::PFN_vkGetMemoryHostPointerPropertiesEXT,
+                >(raw)
+            }
+        });
+        Ok(HostDevice {
+            device: created,
+            instance: instance.clone(),
+            physical: device,
+            host_pointer_properties,
+        })
     }
 
-    fn destroy_device(&self, device: ash::Device) {
+    fn destroy_device(&self, device: HostDevice) {
         // SAFETY: the executor destroyed every child first; the value is
         // consumed. Waiting for idle first is what vkr does on its worker
         // thread; this stage submits nothing, so it returns at once.
         unsafe {
-            let _ = device.device_wait_idle();
-            device.destroy_device(None);
+            let _ = device.device.device_wait_idle();
+            device.device.destroy_device(None);
         }
     }
 
-    fn device_queue(&self, device: &ash::Device, flags: u32, family: u32, index: u32) -> vk::Queue {
+    fn device_queue(&self, device: &HostDevice, flags: u32, family: u32, index: u32) -> vk::Queue {
+        let device = &device.device;
         if flags == 0 {
             // SAFETY: `(family, index)` is a queue the device was created
             // with (the executor checked); plain `vkGetDeviceQueue` for
@@ -559,94 +627,69 @@ impl HostVulkan for AshVulkan {
 
     fn create_command_pool(
         &self,
-        device: &ash::Device,
+        device: &HostDevice,
         info: &VkCommandPoolCreateInfo,
     ) -> Result<vk::CommandPool, VkResult> {
         let info = info.to_ash();
         // SAFETY: `device` is ours; flags and family were checked.
-        unsafe { device.create_command_pool(&info, None) }.map_err(result_code)
+        unsafe { device.device.create_command_pool(&info, None) }.map_err(result_code)
     }
 
-    fn destroy_command_pool(&self, device: &ash::Device, pool: vk::CommandPool) {
+    fn destroy_command_pool(&self, device: &HostDevice, pool: vk::CommandPool) {
         // SAFETY: `pool` was created on `device` and is destroyed once.
-        unsafe { device.destroy_command_pool(pool, None) };
+        unsafe { device.device.destroy_command_pool(pool, None) };
+    }
+
+    fn image_accepts_host_memory(&self, device: &HostDevice, info: &VkImageCreateInfo) -> bool {
+        let mut external =
+            vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(HOST_ALLOCATION);
+        let query = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(vk::Format::from_raw(info.format))
+            .ty(vk::ImageType::from_raw(info.image_type))
+            .tiling(vk::ImageTiling::from_raw(info.tiling))
+            .usage(vk::ImageUsageFlags::from_raw(info.usage))
+            .flags(vk::ImageCreateFlags::from_raw(info.flags))
+            .push_next(&mut external);
+        let mut external_out = vk::ExternalImageFormatProperties::default();
+        let mut out = vk::ImageFormatProperties2::default().push_next(&mut external_out);
+        // SAFETY: the physical device is the device's own; every field was
+        // checked against 1.3 core by the executor; `query`, `out` and their
+        // chains are locals that outlive the call.
+        let result = unsafe {
+            device
+                .instance
+                .get_physical_device_image_format_properties2(device.physical, &query, &mut out)
+        };
+        result.is_ok()
+            && external_out
+                .external_memory_properties
+                .external_memory_features
+                .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
     }
 
     fn create_image(
         &self,
-        device: &ash::Device,
+        device: &HostDevice,
         info: &VkImageCreateInfo,
+        host_memory: bool,
     ) -> Result<vk::Image, VkResult> {
-        let families: Vec<u32> = info.p_queue_family_indices.clone().unwrap_or_default();
-        let mut external = None;
-        let mut list: Option<Vec<vk::Format>> = None;
-        let mut stencil = None;
-        for link in &info.p_next {
-            match link {
-                VkImageCreateInfoNext::VkExternalMemoryImageCreateInfo(e) => {
-                    external = Some(e.to_ash());
-                }
-                VkImageCreateInfoNext::VkImageFormatListCreateInfo(l) => {
-                    list = Some(
-                        l.p_view_formats
-                            .as_deref()
-                            .unwrap_or_default()
-                            .iter()
-                            .map(|f| vk::Format::from_raw(*f))
-                            .collect(),
-                    );
-                }
-                VkImageCreateInfoNext::VkImageStencilUsageCreateInfo(s) => {
-                    stencil = Some(s.to_ash());
-                }
-                // The executor refuses every other link before a host is
-                // asked; an image that got here with one is not created.
-                _ => return Err(VK_ERROR_INITIALIZATION_FAILED),
-            }
-        }
-        let mut list_info = list
-            .as_deref()
-            .map(|formats| vk::ImageFormatListCreateInfo::default().view_formats(formats));
-        let mut create = vk::ImageCreateInfo::default()
-            .flags(vk::ImageCreateFlags::from_raw(info.flags))
-            .image_type(vk::ImageType::from_raw(info.image_type))
-            .format(vk::Format::from_raw(info.format))
-            .extent(info.extent.to_ash())
-            .mip_levels(info.mip_levels)
-            .array_layers(info.array_layers)
-            .samples(vk::SampleCountFlags::from_raw(
-                u32::try_from(info.samples).unwrap_or(1),
-            ))
-            .tiling(vk::ImageTiling::from_raw(info.tiling))
-            .usage(vk::ImageUsageFlags::from_raw(info.usage))
-            .sharing_mode(vk::SharingMode::from_raw(info.sharing_mode))
-            .initial_layout(vk::ImageLayout::from_raw(info.initial_layout));
-        if info.sharing_mode == vk::SharingMode::CONCURRENT.as_raw() {
-            create = create.queue_family_indices(&families);
-        }
-        if let Some(e) = external.as_mut() {
-            create = create.push_next(e);
-        }
-        if let Some(l) = list_info.as_mut() {
-            create = create.push_next(l);
-        }
-        if let Some(s) = stencil.as_mut() {
-            create = create.push_next(s);
-        }
-        // SAFETY: `device` is ours; every field was range-checked and the
-        // image checked against the host's own format limits; the create
-        // info, its chain and its slices are locals that outlive the call.
-        unsafe { device.create_image(&create, None) }.map_err(result_code)
+        with_image_create_info(info, host_memory, |create| {
+            // SAFETY: `device` is ours; every field was range-checked and the
+            // image checked against the host's own format limits; the create
+            // info, its chain and its slices are locals of the helper that
+            // outlive the call.
+            unsafe { device.device.create_image(create, None) }.map_err(result_code)
+        })?
     }
 
-    fn destroy_image(&self, device: &ash::Device, image: vk::Image) {
+    fn destroy_image(&self, device: &HostDevice, image: vk::Image) {
         // SAFETY: `image` was created on `device` and is destroyed once.
-        unsafe { device.destroy_image(image, None) };
+        unsafe { device.device.destroy_image(image, None) };
     }
 
     fn image_memory_requirements(
         &self,
-        device: &ash::Device,
+        device: &HostDevice,
         image: vk::Image,
         plane: Option<VkImageAspectFlagBits>,
         out: &mut VkMemoryRequirements2,
@@ -660,20 +703,575 @@ impl HostVulkan for AshVulkan {
         if let Some(p) = plane_info.as_mut() {
             info = info.push_next(p);
         }
-        let wants_dedicated = !out.p_next.is_empty();
-        let mut dedicated = vk::MemoryDedicatedRequirements::default();
-        let mut head = vk::MemoryRequirements2::default();
-        if wants_dedicated {
-            head = head.push_next(&mut dedicated);
+        with_requirements(out, |head| {
+            // SAFETY: `image` was created on `device`; the plane aspect was
+            // checked; `info`, `head` and their chains are locals that
+            // outlive the call.
+            unsafe { device.device.get_image_memory_requirements2(&info, head) };
+        });
+    }
+
+    fn device_image_memory_requirements(
+        &self,
+        device: &HostDevice,
+        info: &VkImageCreateInfo,
+        host_memory: bool,
+        plane: Option<VkImageAspectFlagBits>,
+        out: &mut VkMemoryRequirements2,
+    ) {
+        let aspect =
+            vk::ImageAspectFlags::from_raw(plane.and_then(|p| u32::try_from(p).ok()).unwrap_or(0));
+        let _ = with_image_create_info(info, host_memory, |create| {
+            let query = vk::DeviceImageMemoryRequirements::default()
+                .create_info(create)
+                .plane_aspect(aspect);
+            with_requirements(out, |head| {
+                // SAFETY: the executor asks this only of a device of Vulkan
+                // 1.3 (where the entry point is core); the create info was
+                // checked as `vkCreateImage` checks it; every structure is a
+                // local that outlives the call.
+                unsafe {
+                    device
+                        .device
+                        .get_device_image_memory_requirements(&query, head)
+                };
+            });
+        });
+    }
+
+    fn image_subresource_layout(
+        &self,
+        device: &HostDevice,
+        image: vk::Image,
+        subresource: &VkImageSubresource,
+    ) -> VkSubresourceLayout {
+        let sub = vk::ImageSubresource {
+            aspect_mask: vk::ImageAspectFlags::from_raw(subresource.aspect_mask),
+            mip_level: subresource.mip_level,
+            array_layer: subresource.array_layer,
+        };
+        // SAFETY: `image` is a linear image of `device`, and the subresource
+        // one aspect, level and layer it has (the executor checked).
+        let layout = unsafe { device.device.get_image_subresource_layout(image, sub) };
+        VkSubresourceLayout {
+            offset: layout.offset,
+            size: layout.size,
+            row_pitch: layout.row_pitch,
+            array_pitch: layout.array_pitch,
+            depth_pitch: layout.depth_pitch,
         }
-        // SAFETY: `image` was created on `device`; the plane aspect was
-        // checked; `info`, `head` and their chains are locals that outlive
-        // the call.
-        unsafe { device.get_image_memory_requirements2(&info, &mut head) };
-        out.memory_requirements = FromAsh::from_ash(&head.memory_requirements);
-        for link in &mut out.p_next {
-            let VkMemoryRequirements2Next::VkMemoryDedicatedRequirements(d) = link;
-            *d = FromAsh::from_ash(&dedicated);
+    }
+
+    fn bind_image_memory(
+        &self,
+        device: &HostDevice,
+        binds: &[ImageBind<'_, vk::Image, HostMemory>],
+    ) -> VkResult {
+        let mut planes: Vec<Option<vk::BindImagePlaneMemoryInfo<'_>>> = binds
+            .iter()
+            .map(|b| {
+                b.plane.map(|aspect| {
+                    vk::BindImagePlaneMemoryInfo::default().plane_aspect(
+                        vk::ImageAspectFlags::from_raw(u32::try_from(aspect).unwrap_or(0)),
+                    )
+                })
+            })
+            .collect();
+        let infos: Vec<vk::BindImageMemoryInfo<'_>> = binds
+            .iter()
+            .zip(planes.iter_mut())
+            .map(|(b, plane)| {
+                let info = vk::BindImageMemoryInfo::default()
+                    .image(b.image)
+                    .memory(b.memory.memory)
+                    .memory_offset(b.offset);
+                match plane.as_mut() {
+                    Some(p) => info.push_next(p),
+                    None => info,
+                }
+            })
+            .collect();
+        // SAFETY: every image and memory is of `device` and unbound; every
+        // offset is aligned and every requirement fits its memory (the
+        // executor checked); `infos` and the plane structures are locals
+        // that outlive the call.
+        match unsafe { device.device.bind_image_memory2(&infos) } {
+            Ok(()) => VK_SUCCESS,
+            Err(error) => result_code(error),
+        }
+    }
+
+    fn create_image_view(
+        &self,
+        device: &HostDevice,
+        image: vk::Image,
+        info: &VkImageViewCreateInfo,
+    ) -> Result<vk::ImageView, VkResult> {
+        let mut usage = None;
+        for link in &info.p_next {
+            match link {
+                VkImageViewCreateInfoNext::VkImageViewUsageCreateInfo(u) => {
+                    usage = Some(
+                        vk::ImageViewUsageCreateInfo::default()
+                            .usage(vk::ImageUsageFlags::from_raw(u.usage)),
+                    );
+                }
+                // The executor refuses every other link first.
+                _ => return Err(VK_ERROR_INITIALIZATION_FAILED),
+            }
+        }
+        let c = &info.components;
+        let r = &info.subresource_range;
+        let mut create = vk::ImageViewCreateInfo::default()
+            .flags(vk::ImageViewCreateFlags::from_raw(info.flags))
+            .image(image)
+            .view_type(vk::ImageViewType::from_raw(info.view_type))
+            .format(vk::Format::from_raw(info.format))
+            .components(vk::ComponentMapping {
+                r: vk::ComponentSwizzle::from_raw(c.r),
+                g: vk::ComponentSwizzle::from_raw(c.g),
+                b: vk::ComponentSwizzle::from_raw(c.b),
+                a: vk::ComponentSwizzle::from_raw(c.a),
+            })
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::from_raw(r.aspect_mask),
+                base_mip_level: r.base_mip_level,
+                level_count: r.level_count,
+                base_array_layer: r.base_array_layer,
+                layer_count: r.layer_count,
+            });
+        if let Some(u) = usage.as_mut() {
+            create = create.push_next(u);
+        }
+        // SAFETY: `image` is a bound image of `device`; the view type, format,
+        // swizzles and range were checked against the image and 1.3 core;
+        // `create` and its chain are locals that outlive the call.
+        unsafe { device.device.create_image_view(&create, None) }.map_err(result_code)
+    }
+
+    fn destroy_image_view(&self, device: &HostDevice, view: vk::ImageView) {
+        // SAFETY: `view` was created on `device` and is destroyed once.
+        unsafe { device.device.destroy_image_view(view, None) };
+    }
+
+    fn host_pointer_types(&self, device: &HostDevice, pages: &RingPages) -> Result<u32, VkResult> {
+        let Some(get) = device.host_pointer_properties else {
+            return Err(VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        };
+        let mut out = vk::MemoryHostPointerPropertiesEXT::default();
+        // SAFETY: `get` is the device's own entry point; `pages` is a live
+        // allocation aligned to the driver's `minImportedHostPointerAlignment`
+        // (`RingPages::for_memory`) that outlives the call; `out` is a local
+        // of the right type. The query imports nothing.
+        let result = unsafe {
+            get(
+                device.device.handle(),
+                HOST_ALLOCATION,
+                pages.as_ptr().cast::<c_void>().cast_const(),
+                &mut out,
+            )
+        };
+        if result == vk::Result::SUCCESS {
+            Ok(out.memory_type_bits)
+        } else {
+            Err(result_code(result))
+        }
+    }
+
+    fn allocate_memory(
+        &self,
+        device: &HostDevice,
+        request: &MemoryRequest<vk::Buffer, vk::Image>,
+    ) -> Result<HostMemory, VkResult> {
+        let mut import = request.import.as_ref().map(|pages| {
+            vk::ImportMemoryHostPointerInfoEXT::default()
+                .handle_type(HOST_ALLOCATION)
+                .host_pointer(pages.as_ptr().cast::<c_void>())
+        });
+        let mut flags = request.flags.map(|(flags, mask)| {
+            vk::MemoryAllocateFlagsInfo::default()
+                .flags(vk::MemoryAllocateFlags::from_raw(flags))
+                .device_mask(mask)
+        });
+        let mut dedicated = request.dedicated.map(|d| match d {
+            Dedicated::Buffer(buffer) => vk::MemoryDedicatedAllocateInfo::default().buffer(buffer),
+            Dedicated::Image(image) => vk::MemoryDedicatedAllocateInfo::default().image(image),
+        });
+        let mut info = vk::MemoryAllocateInfo::default()
+            .allocation_size(request.size)
+            .memory_type_index(request.type_index);
+        if let Some(i) = import.as_mut() {
+            info = info.push_next(i);
+        }
+        if let Some(f) = flags.as_mut() {
+            info = info.push_next(f);
+        }
+        if let Some(d) = dedicated.as_mut() {
+            info = info.push_next(d);
+        }
+        // SAFETY: `device` is ours; the type index, size, flags and dedicated
+        // resource were checked by the executor. For an import, the pointer
+        // is the base of `pages`, aligned to `minImportedHostPointerAlignment`
+        // and `request.size` (= `pages.mapped_len()`, a multiple of it) bytes
+        // long, and the executor asked `vkGetMemoryHostPointerPropertiesEXT`
+        // that the type accepts it. Those pages outlive the import: the
+        // `HostMemory` built below holds an `Arc` of them, which
+        // `free_memory` releases only after `vkFreeMemory` has returned.
+        // Every chained structure is a local that outlives the call.
+        let memory = unsafe { device.device.allocate_memory(&info, None) }.map_err(result_code)?;
+        Ok(HostMemory {
+            memory,
+            pages: request.import.clone(),
+        })
+    }
+
+    fn free_memory(&self, device: &HostDevice, memory: HostMemory) {
+        if memory.pages.is_some() {
+            // The pages go back to the allocator after this, so no GPU work
+            // may still be writing them. Nothing is submitted in this stage
+            // but a test's own work; the wait is what keeps that true once
+            // the guest submits too (stage 5b.3).
+            // SAFETY: `device` is ours, and the executor's context lock is
+            // external synchronization for every queue of it.
+            let _ = unsafe { device.device.device_wait_idle() };
+        }
+        // SAFETY: `memory` was allocated on `device` and is freed once (the
+        // value is consumed).
+        unsafe { device.device.free_memory(memory.memory, None) };
+        // Only now may the imported pages go (if this was their last holder).
+        drop(memory.pages);
+    }
+
+    fn memory_commitment(&self, device: &HostDevice, memory: &HostMemory) -> u64 {
+        // SAFETY: `memory` is of `device` and of a lazily allocated type (the
+        // executor asks nothing else).
+        unsafe { device.device.get_device_memory_commitment(memory.memory) }
+    }
+
+    fn buffer_accepts_host_memory(&self, device: &HostDevice, flags: u32, usage: u32) -> bool {
+        let info = vk::PhysicalDeviceExternalBufferInfo::default()
+            .flags(vk::BufferCreateFlags::from_raw(flags))
+            .usage(vk::BufferUsageFlags::from_raw(usage))
+            .handle_type(HOST_ALLOCATION);
+        let mut out = vk::ExternalBufferProperties::default();
+        // SAFETY: the physical device is the device's own; flags and usage
+        // were checked against 1.3 core; `info` and `out` are locals.
+        unsafe {
+            device
+                .instance
+                .get_physical_device_external_buffer_properties(device.physical, &info, &mut out)
+        };
+        out.external_memory_properties
+            .external_memory_features
+            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    }
+
+    fn create_buffer(
+        &self,
+        device: &HostDevice,
+        info: &VkBufferCreateInfo,
+        host_memory: bool,
+    ) -> Result<vk::Buffer, VkResult> {
+        with_buffer_create_info(info, host_memory, |create| {
+            // SAFETY: `device` is ours; every field was checked; the create
+            // info and its chain are locals of the helper that outlive the
+            // call.
+            unsafe { device.device.create_buffer(create, None) }.map_err(result_code)
+        })?
+    }
+
+    fn destroy_buffer(&self, device: &HostDevice, buffer: vk::Buffer) {
+        // SAFETY: `buffer` was created on `device` and is destroyed once.
+        unsafe { device.device.destroy_buffer(buffer, None) };
+    }
+
+    fn buffer_memory_requirements(
+        &self,
+        device: &HostDevice,
+        buffer: vk::Buffer,
+        out: &mut VkMemoryRequirements2,
+    ) {
+        let info = vk::BufferMemoryRequirementsInfo2::default().buffer(buffer);
+        with_requirements(out, |head| {
+            // SAFETY: `buffer` was created on `device`; `info` and `head` are
+            // locals that outlive the call.
+            unsafe { device.device.get_buffer_memory_requirements2(&info, head) };
+        });
+    }
+
+    fn device_buffer_memory_requirements(
+        &self,
+        device: &HostDevice,
+        info: &VkBufferCreateInfo,
+        host_memory: bool,
+        out: &mut VkMemoryRequirements2,
+    ) {
+        let _ = with_buffer_create_info(info, host_memory, |create| {
+            let query = vk::DeviceBufferMemoryRequirements::default().create_info(create);
+            with_requirements(out, |head| {
+                // SAFETY: the executor asks this only of a device of Vulkan
+                // 1.3 (where the entry point is core); the create info was
+                // checked as `vkCreateBuffer` checks it; every structure is a
+                // local that outlives the call.
+                unsafe {
+                    device
+                        .device
+                        .get_device_buffer_memory_requirements(&query, head)
+                };
+            });
+        });
+    }
+
+    fn bind_buffer_memory(
+        &self,
+        device: &HostDevice,
+        binds: &[(vk::Buffer, &HostMemory, u64)],
+    ) -> VkResult {
+        let infos: Vec<vk::BindBufferMemoryInfo<'_>> = binds
+            .iter()
+            .map(|(buffer, memory, offset)| {
+                vk::BindBufferMemoryInfo::default()
+                    .buffer(*buffer)
+                    .memory(memory.memory)
+                    .memory_offset(*offset)
+            })
+            .collect();
+        // SAFETY: every buffer and memory is of `device`, every buffer
+        // unbound, every offset aligned and every requirement inside its
+        // memory (the executor checked); `infos` is a local that outlives the
+        // call.
+        match unsafe { device.device.bind_buffer_memory2(&infos) } {
+            Ok(()) => VK_SUCCESS,
+            Err(error) => result_code(error),
+        }
+    }
+
+    fn buffer_device_address(&self, device: &HostDevice, buffer: vk::Buffer) -> u64 {
+        let info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
+        // SAFETY: `buffer` is a bound buffer of `device` created with
+        // `SHADER_DEVICE_ADDRESS` usage, on a device that enabled
+        // `bufferDeviceAddress` (the executor checked all three).
+        unsafe { device.device.get_buffer_device_address(&info) }
+    }
+
+    fn create_buffer_view(
+        &self,
+        device: &HostDevice,
+        buffer: vk::Buffer,
+        info: &VkBufferViewCreateInfo,
+    ) -> Result<vk::BufferView, VkResult> {
+        let create = vk::BufferViewCreateInfo::default()
+            .buffer(buffer)
+            .format(vk::Format::from_raw(info.format))
+            .offset(info.offset)
+            .range(info.range);
+        // SAFETY: `buffer` is a bound texel buffer of `device`; the format,
+        // offset and range were checked against it; `create` is a local.
+        unsafe { device.device.create_buffer_view(&create, None) }.map_err(result_code)
+    }
+
+    fn destroy_buffer_view(&self, device: &HostDevice, view: vk::BufferView) {
+        // SAFETY: `view` was created on `device` and is destroyed once.
+        unsafe { device.device.destroy_buffer_view(view, None) };
+    }
+}
+
+/// Run `f` on `out`'s `ash` twin, chaining `VkMemoryDedicatedRequirements`
+/// exactly when `out` carries it, and copy the answer back.
+fn with_requirements(
+    out: &mut VkMemoryRequirements2,
+    f: impl FnOnce(&mut vk::MemoryRequirements2<'_>),
+) {
+    let wants_dedicated = !out.p_next.is_empty();
+    let mut dedicated = vk::MemoryDedicatedRequirements::default();
+    let mut head = vk::MemoryRequirements2::default();
+    if wants_dedicated {
+        head = head.push_next(&mut dedicated);
+    }
+    f(&mut head);
+    out.memory_requirements = FromAsh::from_ash(&head.memory_requirements);
+    for link in &mut out.p_next {
+        let VkMemoryRequirements2Next::VkMemoryDedicatedRequirements(d) = link;
+        *d = FromAsh::from_ash(&dedicated);
+    }
+}
+
+/// Build the `ash` create info of a checked `VkImageCreateInfo` — with a
+/// `VkExternalMemoryImageCreateInfo` for host allocations when
+/// `host_memory` — and run `f` on it while every structure it points at is
+/// alive.
+///
+/// # Errors
+/// `VK_ERROR_INITIALIZATION_FAILED` for a link the executor does not admit
+/// (it refuses those first; one reaching here is not built).
+fn with_image_create_info<T>(
+    info: &VkImageCreateInfo,
+    host_memory: bool,
+    f: impl FnOnce(&vk::ImageCreateInfo<'_>) -> T,
+) -> Result<T, VkResult> {
+    let families: Vec<u32> = info.p_queue_family_indices.clone().unwrap_or_default();
+    let mut list: Option<Vec<vk::Format>> = None;
+    let mut stencil = None;
+    for link in &info.p_next {
+        match link {
+            // The guest's is always empty (the executor refuses any handle
+            // type); ours replaces it.
+            VkImageCreateInfoNext::VkExternalMemoryImageCreateInfo(_) => {}
+            VkImageCreateInfoNext::VkImageFormatListCreateInfo(l) => {
+                list = Some(
+                    l.p_view_formats
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|f| vk::Format::from_raw(*f))
+                        .collect(),
+                );
+            }
+            VkImageCreateInfoNext::VkImageStencilUsageCreateInfo(s) => {
+                stencil = Some(s.to_ash());
+            }
+            _ => return Err(VK_ERROR_INITIALIZATION_FAILED),
+        }
+    }
+    let mut external = host_memory
+        .then(|| vk::ExternalMemoryImageCreateInfo::default().handle_types(HOST_ALLOCATION));
+    let mut list_info = list
+        .as_deref()
+        .map(|formats| vk::ImageFormatListCreateInfo::default().view_formats(formats));
+    let mut create = vk::ImageCreateInfo::default()
+        .flags(vk::ImageCreateFlags::from_raw(info.flags))
+        .image_type(vk::ImageType::from_raw(info.image_type))
+        .format(vk::Format::from_raw(info.format))
+        .extent(info.extent.to_ash())
+        .mip_levels(info.mip_levels)
+        .array_layers(info.array_layers)
+        .samples(vk::SampleCountFlags::from_raw(
+            u32::try_from(info.samples).unwrap_or(1),
+        ))
+        .tiling(vk::ImageTiling::from_raw(info.tiling))
+        .usage(vk::ImageUsageFlags::from_raw(info.usage))
+        .sharing_mode(vk::SharingMode::from_raw(info.sharing_mode))
+        .initial_layout(vk::ImageLayout::from_raw(info.initial_layout));
+    if info.sharing_mode == vk::SharingMode::CONCURRENT.as_raw() {
+        create = create.queue_family_indices(&families);
+    }
+    if let Some(e) = external.as_mut() {
+        create = create.push_next(e);
+    }
+    if let Some(l) = list_info.as_mut() {
+        create = create.push_next(l);
+    }
+    if let Some(s) = stencil.as_mut() {
+        create = create.push_next(s);
+    }
+    Ok(f(&create))
+}
+
+/// [`with_image_create_info`] for a buffer.
+///
+/// # Errors
+/// As there.
+fn with_buffer_create_info<T>(
+    info: &VkBufferCreateInfo,
+    host_memory: bool,
+    f: impl FnOnce(&vk::BufferCreateInfo<'_>) -> T,
+) -> Result<T, VkResult> {
+    let families: Vec<u32> = info.p_queue_family_indices.clone().unwrap_or_default();
+    for link in &info.p_next {
+        match link {
+            // Both are empty by the time they get here (a handle type and a
+            // capture address are refused first), so neither is forwarded.
+            VkBufferCreateInfoNext::VkExternalMemoryBufferCreateInfo(_)
+            | VkBufferCreateInfoNext::VkBufferOpaqueCaptureAddressCreateInfo(_) => {}
+            _ => return Err(VK_ERROR_INITIALIZATION_FAILED),
+        }
+    }
+    let mut external = host_memory
+        .then(|| vk::ExternalMemoryBufferCreateInfo::default().handle_types(HOST_ALLOCATION));
+    let mut create = vk::BufferCreateInfo::default()
+        .flags(vk::BufferCreateFlags::from_raw(info.flags))
+        .size(info.size)
+        .usage(vk::BufferUsageFlags::from_raw(info.usage))
+        .sharing_mode(vk::SharingMode::from_raw(info.sharing_mode));
+    if info.sharing_mode == vk::SharingMode::CONCURRENT.as_raw() {
+        create = create.queue_family_indices(&families);
+    }
+    if let Some(e) = external.as_mut() {
+        create = create.push_next(e);
+    }
+    Ok(f(&create))
+}
+
+impl AshVulkan {
+    /// Test-only: have the host GPU fill `size` bytes of `buffer` at
+    /// `offset` with `data` (`vkCmdFillBuffer`) on `queue` of `family`, and
+    /// wait until the writes are visible to the host. A throwaway command
+    /// pool on `family`, one
+    /// command buffer, one fence, all destroyed before returning. Queue
+    /// submission for the guest is stage 5b.3; this proves the memory path
+    /// end to end before it exists.
+    ///
+    /// # Errors
+    /// The first failing Vulkan call.
+    #[cfg(test)]
+    pub(crate) fn fill_buffer(
+        &self,
+        device: &HostDevice,
+        (queue, family): (vk::Queue, u32),
+        buffer: vk::Buffer,
+        offset: u64,
+        size: u64,
+        data: u32,
+    ) -> Result<(), vk::Result> {
+        let d = &device.device;
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(family);
+        // SAFETY: test-only; every handle is of `d`, every structure a local
+        // that outlives its call, and everything created here is destroyed
+        // here, after the fence says the GPU is done with it. `buffer` is
+        // bound to memory of `d` and `queue` is a queue of `d` of `family`.
+        unsafe {
+            let pool = d.create_command_pool(&pool_info, None)?;
+            let result = (|| {
+                let alloc = vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1);
+                let cmd = *d
+                    .allocate_command_buffers(&alloc)?
+                    .first()
+                    .ok_or(vk::Result::ERROR_UNKNOWN)?;
+                d.begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )?;
+                d.cmd_fill_buffer(cmd, buffer, offset, size, data);
+                // The fence makes the writes available on the device; this is
+                // what makes them visible to a host read.
+                let barrier = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[barrier],
+                    &[],
+                    &[],
+                );
+                d.end_command_buffer(cmd)?;
+                let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
+                let cmds = [cmd];
+                let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+                let waited = d
+                    .queue_submit(queue, &[submit], fence)
+                    .and_then(|()| d.wait_for_fences(&[fence], true, 10_000_000_000));
+                d.destroy_fence(fence, None);
+                waited
+            })();
+            d.destroy_command_pool(pool, None);
+            result
         }
     }
 }

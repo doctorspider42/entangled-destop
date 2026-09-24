@@ -19,15 +19,28 @@
 //! * **Sparse features are reported false** ([`mask_features`]). vkr masks
 //!   nothing; we implement no sparse command, and vulkaninfo enables
 //!   `sparseBinding` when it is offered and then creates a sparse image
-//!   (spec §1.2).
+//!   (spec §1.2). **So is `bufferDeviceAddressCaptureReplay`** (stage 5b.1):
+//!   replaying a capture means handing the driver addresses the guest chose,
+//!   and neither `vkGetBufferOpaqueCaptureAddress` nor
+//!   `vkGetDeviceMemoryOpaqueCaptureAddress` is served.
 //! * **Only the chained structures this stage was written for are
 //!   accepted** ([`admits_link`]). The generated protocol decodes every
 //!   structure the venus protocol can chain, as vkr's does; vkr then hands
 //!   them all to the driver. Here a link outside core 1.0–1.3 and the venus
 //!   protocol's own is refused as unimplemented, which is where the decoder
 //!   used to refuse it before it decoded the whole protocol.
+//! * **The capset's extension mask is what [`admits_link`] admits**
+//!   ([`admitted_extension_numbers`]), not everything the protocol decodes.
+//!   vkr advertises its whole decode table (`vkr_renderer.c:40-48`) because
+//!   it hands every decoded structure to the driver; here a decoded structure
+//!   outside the admitted set is fatal, so a bit for its extension would be
+//!   an invitation to die. And the mask has to name the extensions promoted
+//!   into core 1.1–1.3, because the guest gates even a core structure on its
+//!   original extension's bit (`VkPhysicalDeviceSynchronization2Features` on
+//!   bit 315, `VkPipelineRenderingCreateInfo` on bit 45) and silently drops
+//!   it when that bit is clear.
 
-use crate::venus::capset::{vk_api_version_parts, vk_make_api_version};
+use crate::venus::capset::{vk_api_version_parts, vk_make_api_version, ExtensionMask};
 use crate::venus::protocol::info::{self, EXTENSIONS};
 use crate::venus::protocol::{
     VkExtensionProperties, VkPhysicalDeviceFeatures, VkPhysicalDeviceFeatures2,
@@ -55,6 +68,8 @@ pub const MEMORY_PROPERTY_HOST_VISIBLE: u32 = 0x2;
 pub const MEMORY_PROPERTY_HOST_COHERENT: u32 = 0x4;
 /// `VK_MEMORY_PROPERTY_HOST_CACHED_BIT`.
 pub const MEMORY_PROPERTY_HOST_CACHED: u32 = 0x8;
+/// `VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT`.
+pub const MEMORY_PROPERTY_LAZILY_ALLOCATED: u32 = 0x10;
 /// The three bits that promise a CPU mapping, which [`guest_memory`] takes
 /// off every type the VMM cannot back with its own pages.
 pub const MEMORY_PROPERTY_HOST_ANY: u32 =
@@ -147,9 +162,23 @@ pub fn has_coherent_host_type(memory: &VkPhysicalDeviceMemoryProperties) -> bool
 /// No sparse command is implemented (`vkQueueBindSparse`,
 /// `vkGetPhysicalDeviceSparseImageFormatProperties*`), and vulkaninfo turns
 /// `sparseBinding` on when offered and creates a sparse image (spec §1.2).
-/// vkr masks nothing.
+/// And `bufferDeviceAddressCaptureReplay`, in both structures that carry it:
+/// its two commands are not served and its create-time structures would
+/// hand the driver addresses the guest chose. vkr masks nothing.
 pub fn mask_features(features: &mut VkPhysicalDeviceFeatures2) {
+    use crate::venus::protocol::VkPhysicalDeviceFeatures2Next as N;
     mask_core_features(&mut features.features);
+    for link in &mut features.p_next {
+        match link {
+            N::VkPhysicalDeviceVulkan12Features(f) => {
+                f.buffer_device_address_capture_replay = 0;
+            }
+            N::VkPhysicalDeviceBufferDeviceAddressFeatures(f) => {
+                f.buffer_device_address_capture_replay = 0;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// [`mask_features`] on the core structure alone.
@@ -210,6 +239,58 @@ pub fn admits_link(stype: i32) -> bool {
                 .iter()
                 .any(|e| IMPLEMENTED_EXTENSIONS.contains(e))
     })
+}
+
+/// The Vulkan extension numbers the capset's `vk_extension_mask1` carries:
+/// every extension that adds a structure [`admits_link`] admits, and the
+/// venus protocol's own two — **derived from the same table and the same
+/// rule** the executor judges a chain by, so the mask and the executor
+/// cannot drift apart.
+///
+/// That is the two protocol extensions plus the extensions promoted into
+/// core 1.1–1.3 that brought structures with them (60 in all against the
+/// generated protocol, including `VK_KHR_synchronization2` = 315 and
+/// `VK_KHR_dynamic_rendering` = 45, on which the guest gates core-1.3
+/// structures), and one that was not promoted but adds a core structure
+/// too: `VK_EXT_buffer_device_address`, which shares
+/// `VkBufferDeviceAddressInfo` with its KHR successor. Its bit lets the guest
+/// send that one structure, which the executor admits; its own feature
+/// structure is not admitted, and the guest chains it only for a device that
+/// enabled the extension, which no device here can.
+///
+/// A promoted extension that added no structure, or whose structures were
+/// not themselves promoted (`VK_EXT_4444_formats`,
+/// `VK_EXT_extended_dynamic_state`), has no bit: the mask gates only chained
+/// structures (`vn_cs_renderer_protocol_has_extension`), so a bit with
+/// nothing admitted behind it would promise nothing but a fatal refusal.
+#[must_use]
+pub fn admitted_extension_numbers() -> Vec<u32> {
+    let mut names: Vec<&str> = IMPLEMENTED_EXTENSIONS.to_vec();
+    for s in info::STRUCTURES {
+        if admits_link(s.stype) {
+            names.extend(s.extensions.iter().copied());
+        }
+    }
+    let mut numbers: Vec<u32> = names
+        .into_iter()
+        .filter_map(|name| info::extension(name).map(|e| e.number))
+        .collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    numbers
+}
+
+/// [`admitted_extension_numbers`] as the capset's enumerated mask, sentinel
+/// set.
+#[must_use]
+pub fn admitted_extension_mask() -> ExtensionMask {
+    let mut mask = ExtensionMask::ENUMERATED;
+    for number in admitted_extension_numbers() {
+        // Every registry number in the protocol's table is below 1024; one
+        // that were not would simply stay unadvertised.
+        let _ = mask.enable(number);
+    }
+    mask
 }
 
 /// Whether the host reports `name` among `extensions`.
@@ -274,6 +355,9 @@ pub struct GuestDevice {
     pub extensions: Vec<VkExtensionProperties>,
     /// `memoryTypeBits` of host-allocation imports.
     pub importable: u32,
+    /// `minImportedHostPointerAlignment`: what the executor rounds and
+    /// aligns the pages of a host-visible allocation to.
+    pub import_alignment: u64,
 }
 
 impl GuestDevice {
@@ -281,6 +365,47 @@ impl GuestDevice {
     #[must_use]
     pub fn name(&self) -> String {
         String::from_utf8_lossy(c_name(&self.properties.properties.device_name)).into_owned()
+    }
+
+    /// The memory types the guest sees as `HOST_VISIBLE`: exactly the ones
+    /// the executor backs with its own imported pages ([`guest_memory`]
+    /// leaves the bit only on importable types).
+    #[must_use]
+    pub fn host_visible_types(&self) -> u32 {
+        let count = usize::try_from(self.memory.memory_type_count).unwrap_or(0);
+        self.memory
+            .memory_types
+            .iter()
+            .take(count)
+            .enumerate()
+            .filter(|(_, ty)| ty.property_flags & MEMORY_PROPERTY_HOST_VISIBLE != 0)
+            .fold(0u32, |bits, (index, _)| {
+                bits | u32::try_from(index)
+                    .ok()
+                    .and_then(|i| 1u32.checked_shl(i))
+                    .unwrap_or(0)
+            })
+    }
+
+    /// Every memory type index the guest sees, as a bit mask.
+    #[must_use]
+    pub fn all_types(&self) -> u32 {
+        match self.memory.memory_type_count {
+            0 => 0,
+            n if n >= 32 => u32::MAX,
+            n => (1u32 << n) - 1,
+        }
+    }
+
+    /// The feature bit `bufferDeviceAddress` as the guest is told it.
+    #[must_use]
+    pub fn buffer_device_address(&self) -> bool {
+        use crate::venus::protocol::VkPhysicalDeviceFeatures2Next as N;
+        self.features.p_next.iter().any(|link| match link {
+            N::VkPhysicalDeviceVulkan12Features(f) => f.buffer_device_address != 0,
+            N::VkPhysicalDeviceBufferDeviceAddressFeatures(f) => f.buffer_device_address != 0,
+            _ => false,
+        })
     }
 
     /// The feature bit `protectedMemory` as the guest is told it, from
@@ -317,6 +442,12 @@ pub fn expose(info: HostDeviceInfo) -> Result<GuestDevice, Hidden> {
         Some(bits) if has_extension(&info.extensions, EXTERNAL_MEMORY_HOST) => bits,
         _ => return Err(Hidden::NoHostImport),
     };
+    let import_alignment = info.host_import_alignment;
+    if !import_alignment.is_power_of_two()
+        || import_alignment > crate::venus::shmem::MAX_MEMORY_ALIGNMENT
+    {
+        return Err(Hidden::NoHostImport);
+    }
     let memory = guest_memory(&info.memory, importable);
     if !has_coherent_host_type(&memory) {
         return Err(Hidden::NoCoherentHostMemory);
@@ -334,6 +465,7 @@ pub fn expose(info: HostDeviceInfo) -> Result<GuestDevice, Hidden> {
         memory,
         host_memory: info.memory,
         importable,
+        import_alignment,
     })
 }
 
@@ -387,6 +519,62 @@ pub const IMAGE_CREATE_SPARSE: u32 = 0x7;
 
 /// `VK_IMAGE_CREATE_PROTECTED_BIT`.
 pub const IMAGE_CREATE_PROTECTED: u32 = 0x800;
+
+/// `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`.
+pub const IMAGE_CREATE_MUTABLE_FORMAT: u32 = 0x8;
+/// `VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT`.
+pub const IMAGE_CREATE_CUBE_COMPATIBLE: u32 = 0x10;
+/// `VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT`.
+pub const IMAGE_CREATE_2D_ARRAY_COMPATIBLE: u32 = 0x20;
+/// `VK_IMAGE_CREATE_DISJOINT_BIT`.
+pub const IMAGE_CREATE_DISJOINT: u32 = 0x200;
+
+/// `VK_IMAGE_TILING_LINEAR`.
+pub const IMAGE_TILING_LINEAR: i32 = 1;
+
+/// `VK_BUFFER_CREATE_*` bits of Vulkan 1.3 core: the three sparse ones,
+/// `PROTECTED` and `DEVICE_ADDRESS_CAPTURE_REPLAY`.
+pub const BUFFER_CREATE_CORE: u32 = 0x1f;
+/// The sparse `VK_BUFFER_CREATE_*` bits, never legal here.
+pub const BUFFER_CREATE_SPARSE: u32 = 0x7;
+/// `VK_BUFFER_CREATE_PROTECTED_BIT`.
+pub const BUFFER_CREATE_PROTECTED: u32 = 0x8;
+/// `VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT`, never legal here:
+/// capture replay is masked ([`mask_features`]).
+pub const BUFFER_CREATE_CAPTURE_REPLAY: u32 = 0x10;
+
+/// `VK_BUFFER_USAGE_*` bits of Vulkan 1.0 core (`TRANSFER_SRC` through
+/// `INDIRECT_BUFFER`).
+pub const BUFFER_USAGE_CORE: u32 = 0x1ff;
+/// `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` (1.2), legal only on a device
+/// that enabled `bufferDeviceAddress`.
+pub const BUFFER_USAGE_DEVICE_ADDRESS: u32 = 0x2_0000;
+/// `VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | STORAGE_TEXEL_BUFFER_BIT`:
+/// one of them is what a buffer view needs.
+pub const BUFFER_USAGE_TEXEL: u32 = 0xc;
+
+/// `VK_MEMORY_ALLOCATE_DEVICE_MASK_BIT`.
+pub const MEMORY_ALLOCATE_DEVICE_MASK: u32 = 0x1;
+/// `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`.
+pub const MEMORY_ALLOCATE_DEVICE_ADDRESS: u32 = 0x2;
+/// `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT`.
+pub const MEMORY_ALLOCATE_CAPTURE_REPLAY: u32 = 0x4;
+
+/// `VK_IMAGE_ASPECT_*` bits a view or a subresource may name in 1.3 core:
+/// colour, depth, stencil and the three planes (not `METADATA`).
+pub const IMAGE_ASPECT_VIEW: u32 = 0x77;
+
+/// `VkImageViewType`: 1D through cube array.
+#[must_use]
+pub fn is_image_view_type(value: i32) -> bool {
+    (0..=6).contains(&value)
+}
+
+/// `VkComponentSwizzle`: identity through A.
+#[must_use]
+pub fn is_component_swizzle(value: i32) -> bool {
+    (0..=6).contains(&value)
+}
 
 /// `VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT`.
 pub const QUEUE_CREATE_PROTECTED: u32 = 0x1;
@@ -511,6 +699,55 @@ mod tests {
         assert_eq!(c_name(&out[0].extension_name), b"VK_MESA_venus_protocol");
         assert_eq!(out[0].spec_version, 4, "clamped to the protocol's");
         assert!(has_extension(&host, EXTERNAL_MEMORY_HOST));
+    }
+
+    #[test]
+    fn the_capset_mask_is_what_the_executor_admits_and_names_the_promoted_extensions() {
+        let numbers = admitted_extension_numbers();
+        // The two protocol extensions, and the ones the guest gates core
+        // structures on (ADR-0004, 2026-09-23: sync2 and dynamic rendering).
+        for (number, name) in [
+            (384, "VK_EXT_command_serialization"),
+            (385, "VK_MESA_venus_protocol"),
+            (315, "VK_KHR_synchronization2"),
+            (45, "VK_KHR_dynamic_rendering"),
+            (414, "VK_KHR_maintenance4"),
+            (61, "VK_KHR_device_group"),
+            (128, "VK_KHR_dedicated_allocation"),
+            (158, "VK_KHR_bind_memory2"),
+            (147, "VK_KHR_get_memory_requirements2"),
+        ] {
+            assert!(numbers.contains(&number), "{name} ({number})");
+            assert_eq!(info::extension(name).map(|e| e.number), Some(number));
+        }
+        // Nothing whose structures the executor would refuse.
+        for (number, name) in [
+            (288, "VK_EXT_custom_border_color"),
+            (471, "VK_KHR_maintenance5"),
+            (1, "VK_KHR_swapchain"),
+            (158 + 1000, "no such extension"),
+        ] {
+            assert!(!numbers.contains(&number), "{name} ({number})");
+        }
+        // Every bit is an extension one of whose structures is admitted —
+        // or one of the two protocol extensions — so the mask and the chain
+        // policy are one rule.
+        for number in &numbers {
+            let ext = info::EXTENSIONS
+                .iter()
+                .find(|e| e.number == *number)
+                .expect("a known extension");
+            let admitted = IMPLEMENTED_EXTENSIONS.contains(&ext.name)
+                || info::STRUCTURES
+                    .iter()
+                    .any(|s| admits_link(s.stype) && s.extensions.contains(&ext.name));
+            assert!(admitted, "{}", ext.name);
+        }
+        assert_eq!(numbers.len(), 60);
+        let mask = admitted_extension_mask();
+        assert!(mask.is_enumerated());
+        let set: u32 = mask.words().iter().map(|w| w.count_ones()).sum();
+        assert_eq!(set, 61, "60 extensions and the sentinel");
     }
 
     #[test]

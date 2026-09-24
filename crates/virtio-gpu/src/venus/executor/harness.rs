@@ -5,10 +5,11 @@
 //! would do both. No `unsafe`: the ring and the reply window are reached
 //! through [`RingPages`]' bounded copies and test-only word accessors.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use virtio_core::GuestMem;
+use virtio_core::{GuestMem, ShmAccessError, ShmBacking, ShmMapError};
 
 use crate::protocol::{ResourceCreateBlob, BLOB_FLAG_USE_MAPPABLE, BLOB_MEM_HOST3D};
 use crate::renderer::Renderer3d;
@@ -40,8 +41,8 @@ const HEAD: u64 = 0;
 const TAIL: u64 = 4;
 const STATUS: u64 = 8;
 const BUFFER_OFFSET: u64 = 0x100;
-const BUFFER: u64 = 0x1_0000;
-const RING_BYTES: u64 = BUFFER_OFFSET + BUFFER + 0x100;
+const RING_BUFFER: u64 = 0x1_0000;
+const RING_BYTES: u64 = BUFFER_OFFSET + RING_BUFFER + 0x100;
 
 /// What a submission came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,10 +56,90 @@ pub enum Outcome {
     },
 }
 
+/// A host-visible window with no hypervisor behind it: what the renderer
+/// publishes into it is recorded, offset → (host address, length), and that
+/// address is where "the guest" would be looking.
+#[derive(Debug, Default)]
+pub struct RecordingWindow {
+    mapped: Mutex<BTreeMap<u64, (u64, u64)>>,
+}
+
+impl RecordingWindow {
+    /// The live mapping at `offset`, if there is one.
+    #[must_use]
+    pub fn at(&self, offset: u64) -> Option<(u64, u64)> {
+        self.mapped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&offset)
+            .copied()
+    }
+
+    /// Live mappings.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.mapped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+impl ShmBacking for RecordingWindow {
+    fn len(&self) -> u64 {
+        crate::venus::renderer::VENUS_HOST_VISIBLE_BYTES
+    }
+
+    fn host_mapped(&self) -> bool {
+        true
+    }
+
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), ShmAccessError> {
+        Err(ShmAccessError {
+            offset,
+            len: buf.len() as u64,
+            window: self.len(),
+        })
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), ShmAccessError> {
+        Err(ShmAccessError {
+            offset,
+            len: data.len() as u64,
+            window: self.len(),
+        })
+    }
+
+    fn fill(&self, offset: u64, len: u64, _byte: u8) -> Result<(), ShmAccessError> {
+        Err(ShmAccessError {
+            offset,
+            len,
+            window: self.len(),
+        })
+    }
+
+    unsafe fn map_host(&self, offset: u64, host_addr: u64, len: u64) -> Result<(), ShmMapError> {
+        self.mapped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(offset, (host_addr, len));
+        Ok(())
+    }
+
+    fn unmap_host(&self, offset: u64) {
+        self.mapped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&offset);
+    }
+}
+
 /// The fixture. See the module docs.
 pub struct Harness<H: HostVulkan> {
     /// The renderer under test.
     pub renderer: VenusRenderer<ExecutorFactory<H>>,
+    /// The host-visible window the renderer publishes blobs into.
+    pub window: Arc<RecordingWindow>,
     /// Guest memory, which a `HOST3D` blob never touches.
     pub mem: Arc<GuestMem>,
     ring: Arc<RingPages>,
@@ -158,8 +239,8 @@ fn create_ring_stream() -> Vec<u8> {
             TAIL,
             STATUS,
             BUFFER_OFFSET,
-            BUFFER,
-            BUFFER_OFFSET + BUFFER,
+            RING_BUFFER,
+            BUFFER_OFFSET + RING_BUFFER,
             4,
         ] {
             enc.u64(value).expect("encode");
@@ -183,7 +264,14 @@ fn notify_stream() -> Vec<u8> {
 impl<H: HostVulkan> Harness<H> {
     /// A renderer over `host` with context [`CTX`], a ring and a reply pool.
     pub fn new(host: Arc<H>) -> Self {
-        let mut renderer = VenusRenderer::new(ExecutorFactory::new(host));
+        Self::with_factory(ExecutorFactory::new(host))
+    }
+
+    /// [`Self::new`] over a factory the test built (a smaller budget).
+    pub fn with_factory(factory: ExecutorFactory<H>) -> Self {
+        let mut renderer = VenusRenderer::new(factory);
+        let window = Arc::new(RecordingWindow::default());
+        renderer.set_host_visible(Arc::clone(&window) as Arc<dyn ShmBacking>);
         let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
         renderer
             .ctx_create(CTX, crate::CAPSET_VENUS, "venus")
@@ -201,6 +289,7 @@ impl<H: HostVulkan> Harness<H> {
         let reply = renderer.blob_pages(REPLY_RES).expect("the reply pool");
         Self {
             renderer,
+            window,
             mem,
             ring,
             reply,
@@ -215,6 +304,43 @@ impl<H: HostVulkan> Harness<H> {
         self.renderer
             .create_blob(ctx_id, &blob(resource_id, size), &self.mem, &[])
             .expect("a host blob");
+    }
+
+    /// `RESOURCE_CREATE_BLOB` of `VkDeviceMemory` `memory`, as Mesa's
+    /// `vn_renderer_bo_create_from_device_memory` makes it: `HOST3D`,
+    /// `MAPPABLE`, `blob_id` = the memory's id.
+    ///
+    /// # Errors
+    /// The renderer's refusal.
+    pub fn memory_blob(
+        &mut self,
+        ctx_id: u32,
+        resource_id: u32,
+        memory: u64,
+        size: u64,
+    ) -> Result<(), crate::error::CommandError> {
+        let args = ResourceCreateBlob {
+            blob_id: memory,
+            ..blob(resource_id, size)
+        };
+        self.renderer.create_blob(ctx_id, &args, &self.mem, &[])
+    }
+
+    /// `vkWaitRingSeqnoMESA` for the harness ring, on the context stream.
+    ///
+    /// # Errors
+    /// The renderer's refusal.
+    pub fn wait_ring_seqno(&mut self, seqno: u64) -> Result<(), crate::error::CommandError> {
+        let bytes = encoded(|enc| {
+            enc.command_header(CommandHeader {
+                opcode: Opcode::WaitRingSeqno.as_u32(),
+                flags: 0,
+            })
+            .expect("encode");
+            enc.u64(RING).expect("encode");
+            enc.u64(seqno).expect("encode");
+        });
+        self.renderer.submit(CTX, &bytes)
     }
 
     /// `head` as the guest reads it.
@@ -266,8 +392,8 @@ impl<H: HostVulkan> Harness<H> {
         let mut at = u64::from(self.tail);
         let mut rest = bytes;
         while !rest.is_empty() {
-            let position = at % BUFFER;
-            let room = usize::try_from(BUFFER - position).expect("fits");
+            let position = at % RING_BUFFER;
+            let room = usize::try_from(RING_BUFFER - position).expect("fits");
             let (now, later) = rest.split_at(rest.len().min(room));
             self.ring
                 .write_bytes(BUFFER_OFFSET + position, now)
@@ -500,6 +626,122 @@ pub fn destroy_image(device: u64, image: u64) -> Command<'static> {
     Command::DestroyImage(DestroyImageArgs {
         device: VkDevice(device),
         image: VkImage(image),
+    })
+}
+
+pub const MEMORY: u64 = 0x70;
+pub const BUFFER: u64 = 0x80;
+pub const BUFFER_VIEW: u64 = 0x90;
+pub const IMAGE_VIEW: u64 = 0xa0;
+
+/// `VK_BUFFER_USAGE_TRANSFER_SRC_BIT | TRANSFER_DST_BIT`, Mesa's feedback
+/// buffer usage.
+pub const TRANSFER: u32 = 0x3;
+
+pub fn memory_properties(physical: u64) -> Command<'static> {
+    Command::GetPhysicalDeviceMemoryProperties2(GetPhysicalDeviceMemoryProperties2Args {
+        physical_device: VkPhysicalDevice(physical),
+        p_memory_properties: Some(Default::default()),
+    })
+}
+
+pub fn buffer_info(size: u64, usage: u32) -> VkBufferCreateInfo {
+    VkBufferCreateInfo {
+        size,
+        usage,
+        ..Default::default()
+    }
+}
+
+pub fn create_buffer(device: u64, id: u64, info: VkBufferCreateInfo) -> Command<'static> {
+    Command::CreateBuffer(CreateBufferArgs {
+        device: VkDevice(device),
+        p_create_info: Some(info),
+        p_buffer: Some(VkBuffer(id)),
+        ret: 0,
+    })
+}
+
+pub fn destroy_buffer(device: u64, id: u64) -> Command<'static> {
+    Command::DestroyBuffer(DestroyBufferArgs {
+        device: VkDevice(device),
+        buffer: VkBuffer(id),
+    })
+}
+
+/// `vkGetBufferMemoryRequirements2` as `vn_buffer_init` asks it, with
+/// `VkMemoryDedicatedRequirements` chained.
+pub fn buffer_requirements(device: u64, buffer: u64) -> Command<'static> {
+    Command::GetBufferMemoryRequirements2(GetBufferMemoryRequirements2Args {
+        device: VkDevice(device),
+        p_info: Some(VkBufferMemoryRequirementsInfo2 {
+            buffer: VkBuffer(buffer),
+        }),
+        p_memory_requirements: Some(VkMemoryRequirements2 {
+            p_next: vec![VkMemoryRequirements2Next::VkMemoryDedicatedRequirements(
+                VkMemoryDedicatedRequirements::default(),
+            )],
+            ..Default::default()
+        }),
+    })
+}
+
+pub fn allocate(
+    device: u64,
+    id: u64,
+    size: u64,
+    type_index: u32,
+    chain: Vec<VkMemoryAllocateInfoNext>,
+) -> Command<'static> {
+    Command::AllocateMemory(AllocateMemoryArgs {
+        device: VkDevice(device),
+        p_allocate_info: Some(VkMemoryAllocateInfo {
+            p_next: chain,
+            allocation_size: size,
+            memory_type_index: type_index,
+        }),
+        p_memory: Some(VkDeviceMemory(id)),
+        ret: 0,
+    })
+}
+
+pub fn free(device: u64, id: u64) -> Command<'static> {
+    Command::FreeMemory(FreeMemoryArgs {
+        device: VkDevice(device),
+        memory: VkDeviceMemory(id),
+    })
+}
+
+pub fn bind_buffers(device: u64, binds: &[(u64, u64, u64)]) -> Command<'static> {
+    Command::BindBufferMemory2(BindBufferMemory2Args {
+        device: VkDevice(device),
+        bind_info_count: binds.len() as u32,
+        p_bind_infos: Some(
+            binds
+                .iter()
+                .map(|(buffer, memory, offset)| VkBindBufferMemoryInfo {
+                    p_next: Vec::new(),
+                    buffer: VkBuffer(*buffer),
+                    memory: VkDeviceMemory(*memory),
+                    memory_offset: *offset,
+                })
+                .collect(),
+        ),
+        ret: 0,
+    })
+}
+
+pub fn bind_image(device: u64, image: u64, memory: u64, offset: u64) -> Command<'static> {
+    Command::BindImageMemory2(BindImageMemory2Args {
+        device: VkDevice(device),
+        bind_info_count: 1,
+        p_bind_infos: Some(vec![VkBindImageMemoryInfo {
+            p_next: Vec::new(),
+            image: VkImage(image),
+            memory: VkDeviceMemory(memory),
+            memory_offset: offset,
+        }]),
+        ret: 0,
     })
 }
 

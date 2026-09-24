@@ -47,6 +47,15 @@
 //!   reach a guest's reply window (stage 5a.3) without a `&mut [u8]` ever
 //!   being formed over memory the guest can see, and without a second
 //!   `unsafe` anywhere else in the family.
+//! * [`RingPages::for_memory`] and [`PageBudget`] — the same allocation, sized
+//!   and aligned for a host-visible `VkDeviceMemory` (stage 5b.1). The
+//!   executor imports these pages into the host driver with
+//!   `VK_EXT_external_memory_host` and a `HOST3D` blob of that memory wraps
+//!   **the same `Arc`**, so the guest's mapping and the GPU's view are one
+//!   set of bytes — the configuration ADR-0004 measured coherent on WHP. The
+//!   budget is charged when they are allocated and refunded only when the
+//!   last `Arc` goes, however many holders (the Vulkan memory object, the
+//!   blob, a publication) there were.
 //!
 //! # The lifetime obligation, and how it is discharged
 //!
@@ -65,6 +74,16 @@
 //! `Arc` afterwards (a `Drop` impl runs before the value's fields are dropped),
 //! so the order is always *unmap, then free*, and it holds on an unwinding path
 //! too.
+//!
+//! The same argument covers device-memory pages (stage 5b.1), which have
+//! **three** kinds of holder instead of two: the executor's `VkDeviceMemory`
+//! (and the host driver's import of it, which `host_vulkan` keeps an `Arc`
+//! beside and releases only after `vkFreeMemory` has returned), the blob that
+//! names the memory, and the publication that maps the blob. Any of them may
+//! go first — the guest frees memory while its blob is still mapped, or
+//! destroys the blob while the memory is still bound to a buffer — and the
+//! pages are freed only when the last one has, so neither the partition nor
+//! the GPU can ever be left looking at memory the allocator has reused.
 //!
 //! What the type system cannot carry, and what a caller therefore owes:
 //!
@@ -153,7 +172,7 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout, LayoutError};
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use thiserror::Error;
@@ -182,6 +201,68 @@ pub const MAX_RESOURCE_BYTES: u64 = 2 * super::ring::MAX_BUFFER_BYTES;
 /// those units. A host reporting something *smaller* would not change what the
 /// hypervisor demands, so the queried value is only ever rounded up.
 pub const MIN_PAGE_BYTES: usize = 4096;
+
+/// The largest alignment [`RingPages::for_memory`] will honour: a host
+/// driver's `minImportedHostPointerAlignment` past 2 MiB is one the executor
+/// does not trust with a guest's allocation (the RTX 2070 says 4 KiB).
+pub const MAX_MEMORY_ALIGNMENT: u64 = 2 << 20;
+
+/// A renderer-wide cap on bytes of host pages, shared by every allocation
+/// charged to it and refunded only when an allocation is actually freed.
+///
+/// A guest-sized allocation names host memory, so it is bounded twice: per
+/// allocation by the budget's whole limit, and across allocations by what is
+/// left of it. The refund happens in [`RingPages`]'s `Drop`, after the pages
+/// are back with the allocator — so pages kept alive by a blob or a mapping
+/// after their `VkDeviceMemory` was freed still count, and a guest cannot
+/// free-and-reallocate its way past the cap while it keeps the old pages
+/// mapped.
+#[derive(Debug)]
+pub struct PageBudget {
+    limit: u64,
+    used: AtomicU64,
+}
+
+impl PageBudget {
+    /// A budget of `limit` bytes, none of them used.
+    #[must_use]
+    pub fn new(limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            used: AtomicU64::new(0),
+        })
+    }
+
+    /// The cap.
+    #[must_use]
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// Bytes charged and not yet refunded.
+    #[must_use]
+    pub fn used(&self) -> u64 {
+        self.used.load(Ordering::Acquire)
+    }
+
+    /// Take `bytes` out of the budget, or refuse without taking anything.
+    fn try_charge(&self, bytes: u64) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.limit)
+            })
+            .is_ok()
+    }
+
+    /// Give `bytes` back. Saturating: a refund can only follow its charge.
+    fn refund(&self, bytes: u64) {
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+}
 
 /// Why a set of ring pages could not be allocated, or could not be used with a
 /// particular [`RingLayout`].
@@ -213,6 +294,11 @@ pub enum ShmemError {
 
     #[error("the host could not allocate {size:#x} bytes aligned to {align:#x}")]
     OutOfMemory { size: u64, align: u64 },
+
+    #[error(
+        "{size:#x} more bytes of host pages would pass the {limit:#x}-byte budget ({used:#x} already in use)"
+    )]
+    OverBudget { size: u64, used: u64, limit: u64 },
 
     #[error(
         "the {region} region ends at {end:#x}, past the {size:#x}-byte \
@@ -397,9 +483,14 @@ pub struct RingPages {
     /// Set the first time an accessor is handed an offset that is not inside
     /// [`Self::declared`]. See [`Self::is_poisoned`].
     poisoned: AtomicBool,
+    /// The budget these pages were charged to and how much, refunded in
+    /// [`Drop`] once the pages are back with the allocator. `None` for ring
+    /// blobs, which the renderer budgets itself.
+    charge: Option<(Arc<PageBudget>, u64)>,
 }
 
-// SAFETY: `RingPages` is a plain owned allocation plus two integers. Every
+// SAFETY: `RingPages` is a plain owned allocation plus two integers, a flag
+// and an optional `Arc` of a budget made of atomics (itself `Send + Sync`). Every
 // access to the bytes through a shared reference goes through `AtomicU32` or
 // `AtomicU8`, so concurrent use from several threads is data-race free by
 // construction; the pointer is set once at construction and never changed, and
@@ -438,40 +529,123 @@ impl RingPages {
                 max: MAX_RESOURCE_BYTES,
             });
         }
+        let (alloc, _) = Self::layout(size, page_size())?;
+        Self::allocate(alloc, size, None)
+    }
 
-        let page = page_size();
-        let page_u64 = page as u64;
+    /// Allocate the pages behind one host-visible `VkDeviceMemory` of `size`
+    /// bytes (stage 5b.1): zeroed, aligned to `align` (the host driver's
+    /// `minImportedHostPointerAlignment`, raised to at least a page), and
+    /// **rounded up to a whole multiple of it**, because an import must cover
+    /// whole aligned units. The rounded length is both
+    /// [`resource_len`](Self::resource_len) and
+    /// [`mapped_len`](Self::mapped_len): every byte of it is ours and every
+    /// byte of it is what the driver imports.
+    ///
+    /// The rounded length is charged to `budget` before anything is
+    /// allocated and refunded when the pages are freed.
+    ///
+    /// # Errors
+    ///
+    /// [`ShmemError::ZeroSized`]; [`ShmemError::UnusableLayout`] for an
+    /// alignment that is not a power of two or is past
+    /// [`MAX_MEMORY_ALIGNMENT`]; [`ShmemError::TooLarge`] for a size past the
+    /// budget's whole limit; [`ShmemError::OverBudget`] when what is left of
+    /// it is too little; [`ShmemError::OutOfMemory`] when the allocator
+    /// refuses (the charge is given back).
+    pub fn for_memory(size: u64, align: u64, budget: &Arc<PageBudget>) -> Result<Self, ShmemError> {
+        if size == 0 {
+            return Err(ShmemError::ZeroSized);
+        }
+        let page = page_size() as u64;
+        if !align.is_power_of_two() || align > MAX_MEMORY_ALIGNMENT {
+            return Err(ShmemError::UnusableLayout { size, align });
+        }
+        let align = align.max(page);
+        let rounded = size
+            .checked_next_multiple_of(align)
+            .ok_or(ShmemError::UnusableLayout { size, align })?;
+        if rounded > budget.limit() {
+            return Err(ShmemError::TooLarge {
+                size: rounded,
+                max: budget.limit(),
+            });
+        }
+        let align_usize =
+            usize::try_from(align).map_err(|_| ShmemError::UnusableLayout { size, align })?;
+        let (alloc, rounded) = Self::layout(rounded, align_usize)?;
+        if !budget.try_charge(rounded) {
+            return Err(ShmemError::OverBudget {
+                size: rounded,
+                used: budget.used(),
+                limit: budget.limit(),
+            });
+        }
+        let charge = (Arc::clone(budget), rounded);
+        match Self::allocate(alloc, rounded, Some(charge)) {
+            Ok(pages) => Ok(pages),
+            // `allocate` hands the charge back only by dropping it unused, so
+            // refund here: nothing was allocated.
+            Err(error) => {
+                budget.refund(rounded);
+                Err(error)
+            }
+        }
+    }
+
+    /// `size` rounded up to `align` (a power of two, at least a page) as an
+    /// allocation layout, and the rounded length.
+    fn layout(size: u64, align: usize) -> Result<(Layout, u64), ShmemError> {
+        let align_u64 = align as u64;
         let bytes = size
-            .checked_next_multiple_of(page_u64)
+            .checked_next_multiple_of(align_u64)
             .and_then(|rounded| usize::try_from(rounded).ok())
             .ok_or(ShmemError::UnusableLayout {
                 size,
-                align: page_u64,
+                align: align_u64,
             })?;
-        let alloc = Layout::from_size_align(bytes, page).map_err(|_: LayoutError| {
+        let alloc = Layout::from_size_align(bytes, align).map_err(|_: LayoutError| {
             ShmemError::UnusableLayout {
                 size: bytes as u64,
-                align: page_u64,
+                align: align_u64,
             }
         })?;
+        Ok((alloc, bytes as u64))
+    }
 
-        // SAFETY: `alloc` has a non-zero size (`size >= 1` rounded up to a
-        // page), which is `alloc_zeroed`'s one precondition. The returned
+    /// Allocate `alloc` zeroed, declaring `declared` bytes of it.
+    fn allocate(
+        alloc: Layout,
+        declared: u64,
+        charge: Option<(Arc<PageBudget>, u64)>,
+    ) -> Result<Self, ShmemError> {
+        let page_u64 = alloc.align() as u64;
+        let bytes = alloc.size();
+
+        // SAFETY: `alloc` has a non-zero size (both constructors refuse a
+        // zero `size` and round it *up* to a page or more), which is
+        // `alloc_zeroed`'s one precondition. The returned
         // pointer is either null — handled immediately below — or the base of
         // `alloc.size()` readable, writable, zeroed bytes aligned to
         // `alloc.align()`, owned by this value until `Drop` hands the same
         // `Layout` back to `dealloc`.
         let raw = unsafe { alloc_zeroed(alloc) };
-        let ptr = NonNull::new(raw).ok_or(ShmemError::OutOfMemory {
-            size: bytes as u64,
-            align: page_u64,
-        })?;
+        let Some(ptr) = NonNull::new(raw) else {
+            // Dropping the unused charge refunds nothing (only `RingPages`'
+            // own `Drop` does); the caller that took it gives it back.
+            drop(charge);
+            return Err(ShmemError::OutOfMemory {
+                size: bytes as u64,
+                align: page_u64,
+            });
+        };
 
         Ok(Self {
             ptr,
             alloc,
-            declared: size,
+            declared,
             poisoned: AtomicBool::new(false),
+            charge,
         })
     }
 
@@ -605,15 +779,40 @@ impl RingPages {
         window: Arc<dyn ShmBacking>,
         offset: u64,
     ) -> Result<Publication, ShmMapError> {
+        self.publish_len(window, offset, self.mapped_len())
+    }
+
+    /// [`publish`](Self::publish) of only the first `len` bytes: how a blob
+    /// of a `VkDeviceMemory` is shown, whose span in the window is the blob's
+    /// size (the allocation rounded to a 4 KiB page) while the pages behind
+    /// it may be rounded further, to the driver's import alignment. A prefix
+    /// of our own allocation is still every byte ours.
+    ///
+    /// # Errors
+    ///
+    /// As [`publish`](Self::publish), and [`ShmMapError::Refused`] for a
+    /// `len` that is zero, not a whole number of [`MIN_PAGE_BYTES`] pages, or
+    /// longer than [`mapped_len`](Self::mapped_len).
+    pub fn publish_len(
+        self: &Arc<Self>,
+        window: Arc<dyn ShmBacking>,
+        offset: u64,
+        len: u64,
+    ) -> Result<Publication, ShmMapError> {
         // Branch on the mode rather than discover it from an error, as
         // `ShmBacking::host_mapped`'s docs require.
         if !window.host_mapped() {
             return Err(ShmMapError::Unsupported);
         }
-        let len = self.mapped_len();
-        // SAFETY: `host_addr()` is the base of exactly `len` readable, writable
-        // bytes — `alloc_zeroed` gave us them and nothing hands them back until
-        // `Drop`. They stay mapped at that address until the matching
+        if len == 0 || len % MIN_PAGE_BYTES as u64 != 0 || len > self.mapped_len() {
+            return Err(ShmMapError::Refused(format!(
+                "a {len:#x}-byte span is not a whole number of pages inside these {:#x} bytes",
+                self.mapped_len()
+            )));
+        }
+        // SAFETY: `host_addr()` is the base of at least `len` readable, writable
+        // bytes (`len <= mapped_len()`, checked above) — `alloc_zeroed` gave
+        // us them and nothing hands them back until `Drop`. They stay mapped at that address until the matching
         // `unmap_host` returns because the `Publication` built below owns an
         // `Arc<Self>`: `Publication::drop` calls `unmap_host` and its fields —
         // including that `Arc`, and therefore the earliest possible `dealloc` —
@@ -929,6 +1128,9 @@ impl Drop for RingPages {
         // reaching this drop at all means every publication has already been
         // dropped and every `unmap_host` has already returned.
         unsafe { dealloc(self.ptr.as_ptr(), self.alloc) }
+        if let Some((budget, bytes)) = self.charge.take() {
+            budget.refund(bytes);
+        }
     }
 }
 
@@ -1074,7 +1276,8 @@ impl Publication {
         self.offset
     }
 
-    /// How many bytes were published: always [`RingPages::mapped_len`].
+    /// How many bytes were published: [`RingPages::mapped_len`], or the
+    /// prefix [`RingPages::publish_len`] was asked for.
     #[must_use]
     pub fn len(&self) -> u64 {
         self.len
@@ -1966,6 +2169,107 @@ mod tests {
         // that call, because `Drop::drop` runs before the `Arc` field does.
         drop(published);
         assert_eq!(window.events().last(), Some(&Event::Unmap { offset: 0 }));
+    }
+
+    // ------------------------------------------------ device-memory pages
+
+    #[test]
+    fn memory_pages_are_rounded_to_the_import_alignment_and_charged_until_freed() {
+        let budget = PageBudget::new(1 << 20);
+        let page = page_size() as u64;
+        // A 64 KiB import alignment: the size rounds to it, the base obeys it.
+        let pages =
+            Arc::new(RingPages::for_memory(0x1_0001, 0x1_0000, &budget).expect("fits the budget"));
+        assert_eq!(pages.resource_len(), 0x2_0000);
+        assert_eq!(pages.mapped_len(), 0x2_0000);
+        assert_eq!(pages.host_addr() % 0x1_0000, 0);
+        let addr = pages.host_addr();
+        assert_eq!(budget.used(), 0x2_0000);
+        // An alignment below a page is raised to one.
+        let small = RingPages::for_memory(1, 1, &budget).expect("a page");
+        assert_eq!(small.mapped_len(), page);
+        assert_eq!(budget.used(), 0x2_0000 + page);
+        drop(small);
+        assert_eq!(budget.used(), 0x2_0000);
+
+        // Every holder but the last may go; the charge stays until it does.
+        let blob = Arc::clone(&pages);
+        let window = Window::host_mapped();
+        let published = blob
+            .publish_len(Arc::clone(&window) as Arc<dyn ShmBacking>, 0, 0x1_1000)
+            .expect("a page-multiple prefix");
+        assert_eq!(published.len(), 0x1_1000);
+        drop(pages);
+        drop(blob);
+        assert_eq!(budget.used(), 0x2_0000, "the mapping still holds the pages");
+        drop(published);
+        assert_eq!(budget.used(), 0, "refunded once the last holder went");
+        assert_eq!(
+            window.events(),
+            vec![
+                Event::Map {
+                    offset: 0,
+                    addr,
+                    len: 0x1_1000
+                },
+                Event::Unmap { offset: 0 }
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_pages_past_the_budget_or_badly_aligned_are_refused_and_charge_nothing() {
+        let budget = PageBudget::new(0x4_0000);
+        let keep = RingPages::for_memory(0x3_0000, 4096, &budget).expect("fits");
+        assert_eq!(
+            RingPages::for_memory(0x2_0000, 4096, &budget).map(|_| ()),
+            Err(ShmemError::OverBudget {
+                size: 0x2_0000,
+                used: 0x3_0000,
+                limit: 0x4_0000
+            })
+        );
+        assert_eq!(budget.used(), 0x3_0000, "a refusal charges nothing");
+        assert_eq!(
+            RingPages::for_memory(0x4_0001, 4096, &budget).map(|_| ()),
+            Err(ShmemError::TooLarge {
+                size: 0x4_1000,
+                max: 0x4_0000
+            })
+        );
+        assert_eq!(
+            RingPages::for_memory(0, 4096, &budget).map(|_| ()),
+            Err(ShmemError::ZeroSized)
+        );
+        for align in [3, 0x3000, MAX_MEMORY_ALIGNMENT * 2] {
+            assert!(matches!(
+                RingPages::for_memory(4096, align, &budget),
+                Err(ShmemError::UnusableLayout { .. })
+            ));
+        }
+        assert!(matches!(
+            RingPages::for_memory(u64::MAX, 4096, &budget),
+            Err(ShmemError::UnusableLayout { .. })
+        ));
+        drop(keep);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_prefix_publication_is_whole_pages_inside_the_allocation() {
+        let budget = PageBudget::new(1 << 20);
+        let pages = Arc::new(RingPages::for_memory(0x2000, 4096, &budget).expect("fits"));
+        let window = Window::host_mapped();
+        for len in [0, 0x800, 0x2001, 0x3000] {
+            assert!(
+                matches!(
+                    pages.publish_len(Arc::clone(&window) as Arc<dyn ShmBacking>, 0, len),
+                    Err(ShmMapError::Refused(_))
+                ),
+                "{len:#x}"
+            );
+        }
+        assert!(window.events().is_empty(), "nothing refused was mapped");
     }
 
     // ------------------------------------------------------------ end to end

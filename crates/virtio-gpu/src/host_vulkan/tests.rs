@@ -8,6 +8,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use super::AshVulkan;
+use crate::renderer::Renderer3d;
 use crate::venus::executor::harness::*;
 use crate::venus::executor::policy::{c_name, MEMORY_PROPERTY_HOST_ANY};
 use crate::venus::protocol::*;
@@ -278,4 +279,130 @@ fn a_reset_on_the_real_gpu_leaves_nothing_behind() {
     assert!(h.renderer.factory().host_objects() > 0);
     crate::renderer::Renderer3d::reset(&mut h.renderer);
     assert_eq!(h.renderer.factory().host_objects(), 0);
+}
+
+/// Stage 5b.1 end to end on the host GPU: a buffer in host-visible memory the
+/// executor allocated (our pages, imported), the blob the guest makes of that
+/// memory mapped into the window, the **host GPU** filling the buffer, and
+/// the pattern read back through the blob's pages — the bytes the guest's
+/// mapping shows.
+#[test]
+fn the_host_gpu_fills_a_buffer_and_the_guest_reads_it_through_the_blob() {
+    const SIZE: u64 = 64 << 10;
+    const MEM_RES: u32 = 20;
+    const MAP_AT: u64 = 0x40_0000;
+    const PATTERN: u32 = 0xC0FF_EE11;
+    let Some(host) = host() else { return };
+    let mut h = Harness::new(Arc::clone(&host));
+    boot(&mut h);
+    with_device_on(&mut h);
+
+    let Command::GetPhysicalDeviceMemoryProperties2(m) =
+        h.call(&memory_properties(PHYSICAL)).unwrap()
+    else {
+        panic!()
+    };
+    let memory = m.p_memory_properties.unwrap().memory_properties;
+    // Every host-visible coherent type the guest may map (types 3 and 4 on
+    // the RTX 2070), each through the whole path; Mesa's feedback buffer
+    // takes the first of them (`vn_get_memory_type_index`).
+    let coherent = 0x2 | 0x4;
+    let candidates: Vec<u32> = (0..memory.memory_type_count)
+        .filter(|i| memory.memory_types[*i as usize].property_flags & coherent == coherent)
+        .collect();
+    assert!(!candidates.is_empty(), "a host-visible coherent type");
+    for (round, type_index) in candidates.into_iter().enumerate() {
+        let res = MEM_RES + u32::try_from(round).unwrap();
+        let Command::CreateBuffer(b) = h
+            .call(&create_buffer(DEVICE, BUFFER, buffer_info(SIZE, TRANSFER)))
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(b.ret, VK_SUCCESS);
+        let Command::GetBufferMemoryRequirements2(r) =
+            h.call(&buffer_requirements(DEVICE, BUFFER)).unwrap()
+        else {
+            panic!()
+        };
+        let req = r.p_memory_requirements.unwrap().memory_requirements;
+        eprintln!(
+            "type {type_index} (guest flags {:#x}): buffer of {SIZE:#x} needs {:#x}, alignment {:#x}, memoryTypeBits {:#x}",
+            memory.memory_types[type_index as usize].property_flags,
+            req.size,
+            req.alignment,
+            req.memory_type_bits
+        );
+        assert_ne!(
+            req.memory_type_bits & (1 << type_index),
+            0,
+            "a transfer buffer may live in host-visible memory"
+        );
+        h.send(&allocate(DEVICE, MEMORY, req.size, type_index, Vec::new()))
+            .unwrap();
+        h.send(&bind_buffers(DEVICE, &[(BUFFER, MEMORY, 0)]))
+            .unwrap();
+        assert!(!h.fatal(), "the allocation and the bind were accepted");
+        assert!(h.renderer.factory().host_visible_bytes() >= req.size);
+
+        let blob_size = req.size.next_multiple_of(4096);
+        h.memory_blob(CTX, res, MEMORY, blob_size)
+            .expect("a blob of the memory");
+        h.renderer
+            .map_blob(res, MAP_AT, blob_size)
+            .expect("mapped into the window");
+        let pages = h.renderer.blob_pages(res).expect("the blob's pages");
+        assert_eq!(
+            h.window.at(MAP_AT),
+            Some((pages.host_addr(), blob_size)),
+            "the guest's mapping is the imported pages"
+        );
+        // The guest writes something the GPU must overwrite.
+        pages
+            .write_bytes(0, &vec![0xaa; usize::try_from(SIZE).unwrap()])
+            .unwrap();
+
+        let pattern = PATTERN ^ type_index;
+        let filled = h
+            .renderer
+            .factory()
+            .with_context(CTX, |ctx| {
+                ctx.with_host_buffer(DEVICE, BUFFER, |host, device, queue, family, buffer| {
+                    host.fill_buffer(device, (queue, family), buffer, 0, SIZE, pattern)
+                })
+            })
+            .flatten()
+            .expect("the context, its device, a queue and the buffer");
+        filled.expect("the host GPU filled the buffer");
+
+        let mut seen = vec![0u8; usize::try_from(SIZE).unwrap()];
+        pages.read_bytes(0, &mut seen).unwrap();
+        let words: Vec<u32> = seen
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        let wrong = words.iter().filter(|w| **w != pattern).count();
+        eprintln!(
+            "type {type_index}: read back {} words through the blob: first {:#010x}, last {:#010x}, {wrong} wrong",
+            words.len(),
+            words[0],
+            words[words.len() - 1]
+        );
+        assert_eq!(wrong, 0, "every word the GPU wrote is what the guest reads");
+
+        // Teardown as Mesa does it: the bo first, then the memory, then the
+        // buffer; nothing of the host is left.
+        h.renderer.unmap_blob(res, MAP_AT);
+        h.renderer.destroy_blob(res);
+        drop(pages);
+        h.send(&free(DEVICE, MEMORY)).unwrap();
+        h.send(&destroy_buffer(DEVICE, BUFFER)).unwrap();
+        assert_eq!(h.renderer.factory().host_visible_bytes(), 0);
+    }
+    h.send(&Command::DestroyInstance(DestroyInstanceArgs {
+        instance: VkInstance(INSTANCE),
+    }))
+    .unwrap();
+    assert_eq!(h.renderer.factory().host_objects(), 0);
+    assert!(!h.fatal());
 }

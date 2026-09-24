@@ -304,8 +304,10 @@ fn the_whole_vulkaninfo_bring_up_is_answered_the_way_mesa_decodes_it() {
         16384
     );
 
-    // Row 22: an image and its requirements; memoryTypeBits are the host's,
-    // naming the same (unchanged) indices.
+    // Row 22: an image and its requirements; memoryTypeBits name the same
+    // (unchanged) indices as the host's, minus the host-visible types an
+    // optimal image cannot be bound to (stage 5b.1: the fake driver imports
+    // host memory for linear images only).
     let Command::CreateImage(ci) = h.call(&create_image(DEVICE, IMAGE, image_info())).unwrap()
     else {
         panic!()
@@ -317,7 +319,7 @@ fn the_whole_vulkaninfo_bring_up_is_answered_the_way_mesa_decodes_it() {
         panic!()
     };
     let mr = mr.p_memory_requirements.unwrap();
-    assert_eq!(mr.memory_requirements.memory_type_bits, 0x3f);
+    assert_eq!(mr.memory_requirements.memory_type_bits, 0x3f & !0x18);
     let [VkMemoryRequirements2Next::VkMemoryDedicatedRequirements(dedicated)] =
         mr.p_next.as_slice()
     else {

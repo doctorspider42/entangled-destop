@@ -385,13 +385,22 @@ impl VenusCapset {
     /// The protocol versions are fixed by the ICD we have to satisfy; the
     /// three capability flags are this VMM's honest answers (see each field).
     /// The extension mask is enumerated — sentinel set — and holds exactly the
-    /// extensions the generated protocol decodes
-    /// ([`DECODABLE_EXTENSION_MASK`](super::protocol::info::DECODABLE_EXTENSION_MASK)),
-    /// which is what virglrenderer advertises of its own protocol
-    /// (`vkr_renderer.c:40-48`). The mask gates only which structures the
-    /// guest's *encoder* may chain; which extensions a device offers is the
-    /// executor's `vkEnumerateDeviceExtensionProperties` answer, filtered to
-    /// the same set.
+    /// extensions whose chained structures the executor **admits**
+    /// ([`admitted_extension_mask`](super::executor::policy::admitted_extension_mask)):
+    /// the two venus protocol extensions and every extension promoted into
+    /// core 1.1–1.3 that brought a structure with it, derived from the same
+    /// rule the executor judges each chain by.
+    ///
+    /// This is narrower than virglrenderer, which advertises everything its
+    /// protocol decodes (`vkr_renderer.c:40-48`) because it hands every
+    /// decoded structure to the driver. The mask gates only which structures
+    /// the guest's *encoder* may send (`vn_cs_renderer_protocol_has_extension`),
+    /// dropping the rest silently — so a bit here obliges the executor to
+    /// accept that extension's structures (a decoded one it does not admit is
+    /// fatal), and a missing bit drops even a core structure the guest gates on
+    /// its original extension (`VkPhysicalDeviceSynchronization2Features` on
+    /// bit 315). Which extensions a device *offers* is the executor's
+    /// `vkEnumerateDeviceExtensionProperties` answer, a separate question.
     pub fn new() -> Self {
         Self {
             wire_format_version: Self::WIRE_FORMAT_VERSION,
@@ -400,7 +409,7 @@ impl VenusCapset {
                 Self::VK_EXT_COMMAND_SERIALIZATION_SPEC_VERSION,
             vk_mesa_venus_protocol_spec_version: Self::VK_MESA_VENUS_PROTOCOL_SPEC_VERSION,
             supports_blob_id_0: true,
-            extensions: ExtensionMask::from_words(super::protocol::info::DECODABLE_EXTENSION_MASK),
+            extensions: super::executor::policy::admitted_extension_mask(),
             allow_vk_wait_syncs: true,
             supports_multiple_timelines: false,
             use_guest_vram: false,
@@ -879,13 +888,17 @@ mod tests {
         // One fence timeline, because FenceQueue retires strictly in
         // submission order. See the field docs before flipping this.
         assert_eq!(words[word::SUPPORTS_MULTIPLE_TIMELINES], 0);
-        // Exactly what the generated protocol decodes, sentinel set — never
-        // the all-zero "assume everything" mask.
+        // Exactly what the executor admits, sentinel set — never the all-zero
+        // "assume everything" mask, and no longer the whole decodable table.
         assert_eq!(
             words[word::EXTENSION_MASK1..word::EXTENSION_MASK1 + EXTENSION_MASK_WORDS],
-            super::super::protocol::info::DECODABLE_EXTENSION_MASK
+            *super::super::executor::policy::admitted_extension_mask().words()
         );
         assert!(capset.extensions.is_enumerated());
+        assert_ne!(
+            capset.extensions.words(),
+            &super::super::protocol::info::DECODABLE_EXTENSION_MASK
+        );
     }
 
     #[test]

@@ -31,7 +31,11 @@
 //!    allocate [`RingPages`] for it here, because a ring's three control words
 //!    are lock-free atomics both sides hammer and only host-owned pages
 //!    published with [`RingPages::publish`] can express that (see
-//!    [`super::shmem`]).
+//!    [`super::shmem`]). That is `blob_id` 0. A blob with any other
+//!    `blob_id` names a `VkDeviceMemory` of the same context, and gets no new
+//!    pages: [`SinkFactory::export_memory`] hands back **the pages that
+//!    memory already is** (stage 5b.1), so mapping the blob shows the guest
+//!    exactly the bytes the GPU uses.
 //! 4. `RESOURCE_MAP_BLOB` — the pages go in front of the guest at the window
 //!    offset it named, and the [`Publication`] that keeps them alive is held
 //!    beside them.
@@ -187,6 +191,14 @@ pub const MAX_RINGS: usize = 32;
 /// Most host blobs this renderer backs with pages at once.
 pub const MAX_RING_BLOBS: usize = 64;
 
+/// Most blobs of `VkDeviceMemory` this renderer holds at once.
+///
+/// They allocate nothing — their pages are the memory's, charged to the
+/// executor's budget — so this bounds only the table: Mesa makes one per
+/// host-visible allocation it maps, and 4096 is the `maxMemoryAllocationCount`
+/// most drivers report.
+pub const MAX_MEMORY_BLOBS: usize = 4096;
+
 /// Most host bytes this renderer will allocate across all live blobs.
 ///
 /// A ring's shared-memory resource is a guest-chosen size, so it is a guest
@@ -195,6 +207,13 @@ pub const MAX_RING_BLOBS: usize = 64;
 /// venus ring is ~1 MiB, so 64 MiB is two orders of magnitude of headroom and
 /// still a number a host can afford to lose to a hostile guest.
 pub const MAX_RING_BLOB_BYTES: u64 = 64 << 20;
+
+/// How long a `vkWaitRingSeqnoMESA` on the context stream waits for its ring
+/// before refusing. The device's queue worker is blocked for as long as it
+/// waits, so it is bounded — generously, because what it waits for is a
+/// command the ring worker is executing now (Mesa sends it before making a
+/// blob of memory it allocated asynchronously, `vn_device_memory_wait_alloc`).
+pub const WAIT_RING_SEQNO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The capsets this renderer serves: Venus, and nothing else.
 ///
@@ -245,6 +264,29 @@ pub trait SinkFactory: Send {
     /// As [`sink_for`](Self::sink_for).
     fn sink_for_ring(&mut self, env: RingEnv) -> io::Result<Self::Sink> {
         self.sink_for(env.ctx_id, env.ring)
+    }
+
+    /// The pages behind `VkDeviceMemory` `blob_id` of context `ctx_id`, for
+    /// a `HOST3D` blob of `size` bytes naming it (stage 5b.1). The renderer
+    /// publishes exactly these pages when the blob is mapped, so the guest
+    /// sees the bytes the host driver imported.
+    ///
+    /// # Errors
+    ///
+    /// Why no such blob can be made — no such memory in that context, a type
+    /// the guest cannot map, a size that is not the allocation's, a blob made
+    /// of it already. The default: this factory holds no Vulkan memory.
+    fn export_memory(
+        &mut self,
+        ctx_id: u32,
+        blob_id: u64,
+        size: u64,
+    ) -> Result<Arc<RingPages>, String> {
+        let _ = size;
+        Err(format!(
+            "venus context {ctx_id} has no Vulkan memory {blob_id:#x}: this renderer executes \
+             no Vulkan"
+        ))
     }
 
     /// A venus context was created. Called before any of its rings exist.
@@ -876,6 +918,40 @@ pub enum VenusError {
     #[error("the host limit of {MAX_RING_BLOBS} venus host blobs is reached")]
     TooManyBlobs,
 
+    /// The [`MAX_MEMORY_BLOBS`] cap.
+    #[error("the host limit of {MAX_MEMORY_BLOBS} blobs of Vulkan memory is reached")]
+    TooManyMemoryBlobs,
+
+    /// A blob naming a `VkDeviceMemory` that cannot be one.
+    #[error("resource {resource_id} cannot be a blob of Vulkan memory {blob_id:#x}: {reason}")]
+    MemoryBlob {
+        /// The blob.
+        resource_id: u32,
+        /// The memory it named.
+        blob_id: u64,
+        /// What the executor said.
+        reason: String,
+    },
+
+    /// `vkCreateRingMESA` over a blob of Vulkan memory: a ring lives in
+    /// pages of its own.
+    #[error("resource {0} is a blob of Vulkan memory, and a ring lives in a blob of its own")]
+    RingOnDeviceMemory(u32),
+
+    /// `vkWaitRingSeqnoMESA` for a seqno its ring cannot reach, or did not
+    /// reach in [`WAIT_RING_SEQNO_TIMEOUT`].
+    #[error("ring {ring:#x} of venus context {ctx_id} did not reach seqno {seqno:#x}: {why}")]
+    RingSeqno {
+        /// The context.
+        ctx_id: u32,
+        /// The ring.
+        ring: u64,
+        /// The seqno.
+        seqno: u64,
+        /// Why not.
+        why: &'static str,
+    },
+
     /// The [`MAX_RING_BLOB_BYTES`] budget.
     #[error(
         "a {size:#x}-byte blob would take the host past the {max:#x} bytes this renderer will \
@@ -956,7 +1032,14 @@ impl From<VenusError> for CommandError {
             }
             VenusError::UnknownRingResource(id)
             | VenusError::UnknownBlob(id)
-            | VenusError::BlobCarriesPages(id) => Self::UnknownResource(id),
+            | VenusError::BlobCarriesPages(id)
+            | VenusError::RingOnDeviceMemory(id) => Self::UnknownResource(id),
+            VenusError::MemoryBlob { .. } => {
+                Self::InvalidStream("a blob names Vulkan memory it cannot be")
+            }
+            VenusError::RingSeqno { .. } => {
+                Self::InvalidStream("a venus ring did not reach the seqno waited for")
+            }
             VenusError::ForeignRingResource { resource_id, .. } => {
                 Self::UnknownResource(resource_id)
             }
@@ -974,7 +1057,9 @@ impl From<VenusError> for CommandError {
             }
             VenusError::UnsupportedBlobMem(blob_mem) => Self::UnsupportedBlobMem(blob_mem),
             VenusError::DuplicateBlob(id) => Self::DuplicateResource(id),
-            VenusError::TooManyBlobs | VenusError::BlobBudget { .. } => Self::OutOfMemory,
+            VenusError::TooManyBlobs
+            | VenusError::TooManyMemoryBlobs
+            | VenusError::BlobBudget { .. } => Self::OutOfMemory,
             VenusError::BlobAlreadyMapped(id) => Self::BlobAlreadyMapped(id),
             VenusError::BlobSpanMismatch { .. } | VenusError::WindowRefused { .. } => {
                 Self::Renderer(err.to_string())
@@ -1001,8 +1086,21 @@ struct RingBlob {
     ctx_id: u32,
     /// The renderer-side name the guest minted it under.
     blob_id: u64,
-    /// The size the guest asked for, which is [`RingPages::resource_len`].
+    /// The size the guest asked for: [`RingPages::resource_len`] for a
+    /// ring blob, the span a memory blob's mapping covers for one of those.
     size: u64,
+    /// Whether the pages are the blob's own (`blob_id` 0) or a
+    /// `VkDeviceMemory`'s.
+    kind: BlobKind,
+}
+
+/// What a host blob's pages are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobKind {
+    /// Allocated for the blob (`blob_id` 0): rings and reply windows.
+    Shm,
+    /// A `VkDeviceMemory`'s imported pages, shared with the executor.
+    Memory,
 }
 
 /// One live command ring.
@@ -1081,8 +1179,13 @@ pub struct VenusRenderer<F> {
     /// The same blobs, shared with the ring workers so an executing sink can
     /// write replies into them; kept in step with `blobs`.
     directory: BlobDirectory,
-    /// Sum of [`RingBlob::size`], against [`MAX_RING_BLOB_BYTES`].
+    /// Sum of [`RingBlob::size`] over ring blobs, against
+    /// [`MAX_RING_BLOB_BYTES`].
     blob_bytes: u64,
+    /// Ring blobs, against [`MAX_RING_BLOBS`].
+    shm_blobs: usize,
+    /// Memory blobs, against [`MAX_MEMORY_BLOBS`].
+    memory_blobs: usize,
     contexts: HashMap<u32, Context>,
     /// Transport commands accepted but not executed (reply streams, seqnos):
     /// a diagnostic, and what a test asserts to show they were not refused.
@@ -1123,6 +1226,8 @@ impl<F> VenusRenderer<F> {
             blobs: HashMap::new(),
             directory: BlobDirectory::default(),
             blob_bytes: 0,
+            shm_blobs: 0,
+            memory_blobs: 0,
             contexts: HashMap::new(),
             observed: 0,
             quiesce: Quiesce::new(),
@@ -1252,8 +1357,8 @@ impl<F> VenusRenderer<F> {
 
     // --------------------------------------------------------------- blobs
 
-    /// `RESOURCE_CREATE_BLOB` for a host blob: allocate the pages a ring will
-    /// live in.
+    /// `RESOURCE_CREATE_BLOB` for a host blob with `blob_id` 0: allocate the
+    /// pages a ring or a reply window will live in.
     ///
     /// Only [`BLOB_MEM_HOST3D`] is served. `HOST3D_GUEST` would hand us guest
     /// pages *as well*, and a ring cannot live in them — the control words are
@@ -1262,6 +1367,46 @@ impl<F> VenusRenderer<F> {
     /// ignoring half of what the guest asked for.
     fn create_host_blob(
         &mut self,
+        ctx_id: u32,
+        args: &ResourceCreateBlob,
+        entries: &[MemEntry],
+    ) -> Result<(), VenusError> {
+        self.check_host_blob(ctx_id, args, entries)?;
+        if self.shm_blobs >= MAX_RING_BLOBS {
+            return Err(VenusError::TooManyBlobs);
+        }
+        if self.blob_bytes.saturating_add(args.size) > MAX_RING_BLOB_BYTES {
+            return Err(VenusError::BlobBudget {
+                size: args.size,
+                max: MAX_RING_BLOB_BYTES,
+            });
+        }
+
+        // The size is guest-chosen, and `RingPages::new` is where that is
+        // bounded and refused by name rather than believed.
+        let pages = Arc::new(RingPages::new(args.size)?);
+        self.blob_bytes = self.blob_bytes.saturating_add(args.size);
+        self.shm_blobs = self.shm_blobs.saturating_add(1);
+        self.directory
+            .insert(args.resource_id, ctx_id, Arc::clone(&pages));
+        self.blobs.insert(
+            args.resource_id,
+            RingBlob {
+                publication: None,
+                pages,
+                ctx_id,
+                blob_id: args.blob_id,
+                size: args.size,
+                kind: BlobKind::Shm,
+            },
+        );
+        Ok(())
+    }
+
+    /// What every host blob must be, whichever pages it gets: `HOST3D`, no
+    /// guest pages, a live context (or the kernel's), an unused id.
+    fn check_host_blob(
+        &self,
         ctx_id: u32,
         args: &ResourceCreateBlob,
         entries: &[MemEntry],
@@ -1278,32 +1423,6 @@ impl<F> VenusRenderer<F> {
         if self.blobs.contains_key(&args.resource_id) {
             return Err(VenusError::DuplicateBlob(args.resource_id));
         }
-        if self.blobs.len() >= MAX_RING_BLOBS {
-            return Err(VenusError::TooManyBlobs);
-        }
-        if self.blob_bytes.saturating_add(args.size) > MAX_RING_BLOB_BYTES {
-            return Err(VenusError::BlobBudget {
-                size: args.size,
-                max: MAX_RING_BLOB_BYTES,
-            });
-        }
-
-        // The size is guest-chosen, and `RingPages::new` is where that is
-        // bounded and refused by name rather than believed.
-        let pages = Arc::new(RingPages::new(args.size)?);
-        self.blob_bytes = self.blob_bytes.saturating_add(args.size);
-        self.directory
-            .insert(args.resource_id, ctx_id, Arc::clone(&pages));
-        self.blobs.insert(
-            args.resource_id,
-            RingBlob {
-                publication: None,
-                pages,
-                ctx_id,
-                blob_id: args.blob_id,
-                size: args.size,
-            },
-        );
         Ok(())
     }
 
@@ -1329,24 +1448,32 @@ impl<F> VenusRenderer<F> {
                 actual: blob.size,
             });
         }
-        let publication =
-            blob.pages
-                .publish(window, offset)
-                .map_err(|err| VenusError::WindowRefused {
-                    resource_id,
-                    reason: err.to_string(),
-                })?;
-        blob.publication = Some(publication);
+        // A ring blob shows all of its pages; a memory blob shows the span
+        // the device reserved for it, which its pages may run past (they are
+        // rounded to the driver's import alignment) — a prefix of our own
+        // allocation, so still nothing but ours.
+        let published = match blob.kind {
+            BlobKind::Shm => blob.pages.publish(window, offset),
+            BlobKind::Memory => blob.pages.publish_len(window, offset, blob.size),
+        };
+        let publication = published.map_err(|err| VenusError::WindowRefused {
+            resource_id,
+            reason: err.to_string(),
+        })?;
         tracing::debug!(
             resource = resource_id,
             blob_id = blob.blob_id,
             offset = format_args!("{offset:#x}"),
-            len = blob.pages.mapped_len(),
-            "venus ring pages published into the shared-memory window"
+            len = publication.len(),
+            kind = ?blob.kind,
+            "venus blob pages published into the shared-memory window"
         );
-        // The bytes behind the window are plain host RAM, so cached is the
-        // truthful answer; a real Venus renderer's host-visible heap would be
-        // write-combining and would say so.
+        blob.publication = Some(publication);
+        // The bytes behind the window are plain host RAM — ours, for a ring
+        // and for imported memory alike — so cached is the truthful answer.
+        // ADR-0004's measurement: our pages run at full speed in the guest
+        // even as the driver's write-combined type 3, because the host-side
+        // mapping decides the memory type.
         Ok(BlobMapping::CACHED)
     }
 
@@ -1438,6 +1565,9 @@ impl<F: SinkFactory> VenusRenderer<F> {
             TransportCommand::WaitVirtqueueSeqno { .. } => Err(VenusError::RingOnlyCommand(
                 Opcode::WaitVirtqueueSeqno.name(),
             )),
+            TransportCommand::WaitRingSeqno { ring, seqno } => {
+                self.wait_ring_seqno(ctx_id, ring, seqno)
+            }
             // Carried, counted and not executed: these are the reply-stream and
             // seqno commands, and every one of them is about Vulkan work this
             // renderer does not do. Refusing them would stop a real guest before
@@ -1446,8 +1576,7 @@ impl<F: SinkFactory> VenusRenderer<F> {
             TransportCommand::SetReplyCommandStream { .. }
             | TransportCommand::SeekReplyCommandStream { .. }
             | TransportCommand::ExecuteCommandStreams { .. }
-            | TransportCommand::SubmitVirtqueueSeqno { .. }
-            | TransportCommand::WaitRingSeqno { .. } => {
+            | TransportCommand::SubmitVirtqueueSeqno { .. } => {
                 self.observed = self.observed.saturating_add(1);
                 Ok(())
             }
@@ -1504,6 +1633,9 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 owner: blob.ctx_id,
                 ctx_id,
             });
+        }
+        if blob.kind == BlobKind::Memory {
+            return Err(VenusError::RingOnDeviceMemory(resource_id));
         }
         let pages = Arc::clone(&blob.pages);
 
@@ -1677,12 +1809,114 @@ impl<F: SinkFactory> VenusRenderer<F> {
     /// pages, and every ring that was built on them.
     fn drop_blob(&mut self, resource_id: u32) {
         if let Some(blob) = self.blobs.remove(&resource_id) {
-            // Out of the sinks' reach first: after this returns no reply can
-            // land in these pages, whichever ring was about to write one.
-            self.directory.remove(resource_id);
-            self.blob_bytes = self.blob_bytes.saturating_sub(blob.size);
-            self.drop_rings_on(resource_id);
+            match blob.kind {
+                BlobKind::Shm => {
+                    // Out of the sinks' reach first: after this returns no
+                    // reply can land in these pages, whichever ring was about
+                    // to write one.
+                    self.directory.remove(resource_id);
+                    self.blob_bytes = self.blob_bytes.saturating_sub(blob.size);
+                    self.shm_blobs = self.shm_blobs.saturating_sub(1);
+                    self.drop_rings_on(resource_id);
+                }
+                // Neither a reply window nor a ring can be one; its pages go
+                // back to the executor's memory object, or — if that was
+                // freed first — to the allocator, once the publication below
+                // has unmapped them.
+                BlobKind::Memory => self.memory_blobs = self.memory_blobs.saturating_sub(1),
+            }
             drop(blob);
+        }
+    }
+
+    /// `RESOURCE_CREATE_BLOB` with a `blob_id`: a blob of `VkDeviceMemory`
+    /// `blob_id` of context `ctx_id`, wrapping the pages the executor already
+    /// imported for it (`vkr_context_create_resource_from_device_memory`).
+    fn create_memory_blob(
+        &mut self,
+        ctx_id: u32,
+        args: &ResourceCreateBlob,
+        entries: &[MemEntry],
+    ) -> Result<(), VenusError> {
+        self.check_host_blob(ctx_id, args, entries)?;
+        if self.memory_blobs >= MAX_MEMORY_BLOBS {
+            return Err(VenusError::TooManyMemoryBlobs);
+        }
+        let pages = self
+            .sinks
+            .export_memory(ctx_id, args.blob_id, args.size)
+            .map_err(|reason| VenusError::MemoryBlob {
+                resource_id: args.resource_id,
+                blob_id: args.blob_id,
+                reason,
+            })?;
+        self.memory_blobs = self.memory_blobs.saturating_add(1);
+        self.blobs.insert(
+            args.resource_id,
+            RingBlob {
+                publication: None,
+                pages,
+                ctx_id,
+                blob_id: args.blob_id,
+                size: args.size,
+                kind: BlobKind::Memory,
+            },
+        );
+        Ok(())
+    }
+
+    /// `vkWaitRingSeqnoMESA` on the context stream
+    /// (`vkr_context_wait_ring_seqno`): block until the ring's `head` has
+    /// reached `seqno` — its worker has executed every command before it.
+    ///
+    /// Mesa sends it before making a blob of memory it allocated without a
+    /// reply (`vn_device_memory_wait_alloc`), so the blob's
+    /// `RESOURCE_CREATE_BLOB`, which follows on the same virtqueue, finds the
+    /// memory the ring made. A seqno past the ring's `tail` can never be
+    /// reached and is refused at once, as vkr's ring thread refuses it; a
+    /// ring that has died, or that has not got there in
+    /// [`WAIT_RING_SEQNO_TIMEOUT`], is refused too. Seqnos compare as the
+    /// wrapping 32-bit ring positions they are (`vkr_seqno_ge`).
+    fn wait_ring_seqno(&mut self, ctx_id: u32, ring: u64, seqno: u64) -> Result<(), VenusError> {
+        let context = self
+            .contexts
+            .get(&ctx_id)
+            .ok_or(VenusError::UnknownContext(ctx_id))?;
+        let live = context
+            .rings
+            .get(&ring)
+            .ok_or(VenusError::UnknownRing { ctx_id, ring })?;
+        // The ring position is 32 bits; vkr compares the low half too.
+        let target = seqno as u32;
+        let reached = |position: u32| position.wrapping_sub(target) <= i32::MAX as u32;
+        let refuse = |why| VenusError::RingSeqno {
+            ctx_id,
+            ring,
+            seqno,
+            why,
+        };
+        if !reached(live.pages.load_guest_word(&live.layout.tail())) {
+            return Err(refuse("the ring's tail is short of it"));
+        }
+        live.worker.notify();
+        let deadline = std::time::Instant::now() + WAIT_RING_SEQNO_TIMEOUT;
+        let mut spins = 0u32;
+        loop {
+            if reached(live.pages.load_host_word(&live.layout.head())) {
+                return Ok(());
+            }
+            if live.worker.has_ended() {
+                return Err(refuse("the ring stopped first"));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(refuse("the wait timed out"));
+            }
+            spins = spins.saturating_add(1);
+            if spins < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_micros(100));
+            }
         }
     }
 }
@@ -1777,6 +2011,8 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         self.directory.clear();
         self.blobs.clear();
         self.blob_bytes = 0;
+        self.shm_blobs = 0;
+        self.memory_blobs = 0;
         self.observed = 0;
     }
 
@@ -1806,13 +2042,19 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         _mem: &Arc<GuestMem>,
         entries: &[MemEntry],
     ) -> Result<(), CommandError> {
-        self.create_host_blob(ctx_id, args, entries)?;
+        // `blob_id` 0 is plain shared memory (vkr: `!blob_id && flags ==
+        // MAPPABLE`); anything else names a `VkDeviceMemory`.
+        if args.blob_id == 0 {
+            self.create_host_blob(ctx_id, args, entries)?;
+        } else {
+            self.create_memory_blob(ctx_id, args, entries)?;
+        }
         tracing::debug!(
             ctx_id,
             resource = args.resource_id,
             blob_id = args.blob_id,
             size = args.size,
-            "venus host blob allocated"
+            "venus host blob created"
         );
         Ok(())
     }

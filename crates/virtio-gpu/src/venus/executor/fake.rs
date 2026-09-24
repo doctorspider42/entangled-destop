@@ -3,12 +3,15 @@
 //! a test can prove teardown leaves none.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::venus::capset::vk_make_api_version;
 use crate::venus::protocol::*;
+use crate::venus::shmem::RingPages;
 
-use super::host::{DeviceRequest, HostDeviceInfo, HostGroup, HostVulkan, InstanceRequest};
+use super::host::{
+    DeviceRequest, HostDeviceInfo, HostGroup, HostVulkan, ImageBind, InstanceRequest, MemoryRequest,
+};
 use super::policy::{name_array, EXTERNAL_MEMORY_HOST};
 
 /// `VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU`.
@@ -88,6 +91,7 @@ pub fn gpu(name: &str) -> FakeDevice {
             VkPhysicalDeviceVulkan12Features {
                 timeline_semaphore: 1,
                 buffer_device_address: 1,
+                buffer_device_address_capture_replay: 1,
                 ..Default::default()
             },
         ),
@@ -147,6 +151,7 @@ pub fn gpu(name: &str) -> FakeDevice {
         },
     ];
     info.host_import_types = Some(0x18);
+    info.host_import_alignment = 4096;
     FakeDevice { info }
 }
 
@@ -159,12 +164,43 @@ pub fn cpu() -> FakeDevice {
     device
 }
 
+/// One `vkAllocateMemory` that imported our pages, as the fake driver saw it.
+#[derive(Debug, Clone)]
+pub struct Import {
+    /// The host pointer it was handed.
+    pub addr: u64,
+    /// `allocationSize`.
+    pub len: u64,
+    /// The pages themselves, without keeping them alive: `upgrade` fails
+    /// once every holder is gone.
+    pub pages: Weak<RingPages>,
+}
+
+/// The fake's `VkDeviceMemory`: a handle and, for an import, the pages the
+/// driver would have pinned — kept alive exactly as long as the memory, as
+/// the real host keeps them.
+#[derive(Debug)]
+pub struct FakeMemory {
+    /// The handle.
+    pub handle: u64,
+    /// `allocationSize`.
+    pub size: u64,
+    /// The imported pages.
+    pub pages: Option<Arc<RingPages>>,
+}
+
 #[derive(Debug, Default)]
 struct Live {
     next: u64,
     by_kind: HashMap<&'static str, usize>,
     devices: Vec<(u64, DeviceRequest<usize>)>,
     images: usize,
+    imports: Vec<Import>,
+    allocations: Vec<(u32, u64, bool)>,
+    buffer_binds: Vec<(u64, u64, u64)>,
+    image_binds: Vec<(u64, u64, u64)>,
+    host_memory_resources: Vec<(&'static str, bool)>,
+    buffer_sizes: HashMap<u64, u64>,
 }
 
 /// The fake host. See the module docs.
@@ -174,6 +210,8 @@ pub struct FakeVulkan {
     pub version: u32,
     /// The physical devices, in enumeration order.
     pub devices: Vec<FakeDevice>,
+    /// What `vkGetMemoryHostPointerPropertiesEXT` answers for any pages.
+    pub host_pointer_bits: u32,
     live: Mutex<Live>,
 }
 
@@ -184,6 +222,7 @@ impl FakeVulkan {
         Self {
             version: vk_make_api_version(0, 1, 4, 309),
             devices,
+            host_pointer_bits: 0x18,
             live: Mutex::new(Live::default()),
         }
     }
@@ -240,6 +279,66 @@ impl FakeVulkan {
     pub fn image_requests(&self) -> usize {
         self.with(|live| live.images)
     }
+
+    /// Every import of our pages the fake driver saw, oldest first.
+    #[must_use]
+    pub fn imports(&self) -> Vec<Import> {
+        self.with(|live| live.imports.clone())
+    }
+
+    /// Every `vkAllocateMemory` that reached the host: `(type, size,
+    /// imported)`.
+    #[must_use]
+    pub fn allocations(&self) -> Vec<(u32, u64, bool)> {
+        self.with(|live| live.allocations.clone())
+    }
+
+    /// Every buffer bind that reached the host: `(buffer, memory, offset)`.
+    #[must_use]
+    pub fn buffer_binds(&self) -> Vec<(u64, u64, u64)> {
+        self.with(|live| live.buffer_binds.clone())
+    }
+
+    /// Every image bind that reached the host: `(image, memory, offset)`.
+    #[must_use]
+    pub fn image_binds(&self) -> Vec<(u64, u64, u64)> {
+        self.with(|live| live.image_binds.clone())
+    }
+
+    /// Every buffer and image created, and whether it was created able to
+    /// take host allocations.
+    #[must_use]
+    pub fn host_memory_resources(&self) -> Vec<(&'static str, bool)> {
+        self.with(|live| live.host_memory_resources.clone())
+    }
+}
+
+/// The fake's buffer requirements: 256-byte aligned, every type.
+fn buffer_requirements(size: u64, out: &mut VkMemoryRequirements2) {
+    out.memory_requirements = VkMemoryRequirements {
+        size: size.next_multiple_of(256),
+        alignment: 256,
+        memory_type_bits: 0x3f,
+    };
+    for link in &mut out.p_next {
+        let VkMemoryRequirements2Next::VkMemoryDedicatedRequirements(d) = link;
+        d.prefers_dedicated_allocation = 0;
+        d.requires_dedicated_allocation = 0;
+    }
+}
+
+/// The fake's image requirements: 1 MiB, 1 KiB aligned, every type.
+fn image_requirements(out: &mut VkMemoryRequirements2) {
+    out.memory_requirements = VkMemoryRequirements {
+        size: 1 << 20,
+        alignment: 1024,
+        memory_type_bits: 0x3f,
+    };
+    for link in &mut out.p_next {
+        let VkMemoryRequirements2Next::VkMemoryDedicatedRequirements(d) = link;
+        d.prefers_dedicated_allocation = 1;
+        d.requires_dedicated_allocation = 0;
+    }
 }
 
 impl HostVulkan for FakeVulkan {
@@ -249,6 +348,10 @@ impl HostVulkan for FakeVulkan {
     type Queue = u64;
     type CommandPool = u64;
     type Image = u64;
+    type Memory = FakeMemory;
+    type Buffer = u64;
+    type BufferView = u64;
+    type ImageView = u64;
 
     fn instance_version(&self) -> Result<u32, VkResult> {
         Ok(self.version)
@@ -359,8 +462,21 @@ impl HostVulkan for FakeVulkan {
         self.destroy("command pool");
     }
 
-    fn create_image(&self, _device: &u64, _info: &VkImageCreateInfo) -> Result<u64, VkResult> {
-        self.with(|live| live.images += 1);
+    fn image_accepts_host_memory(&self, _device: &u64, info: &VkImageCreateInfo) -> bool {
+        // As a driver that imports host memory for linear images only.
+        info.tiling == 1
+    }
+
+    fn create_image(
+        &self,
+        _device: &u64,
+        _info: &VkImageCreateInfo,
+        host_memory: bool,
+    ) -> Result<u64, VkResult> {
+        self.with(|live| {
+            live.images += 1;
+            live.host_memory_resources.push(("image", host_memory));
+        });
         Ok(self.create("image"))
     }
 
@@ -375,15 +491,170 @@ impl HostVulkan for FakeVulkan {
         _plane: Option<VkImageAspectFlagBits>,
         out: &mut VkMemoryRequirements2,
     ) {
-        out.memory_requirements = VkMemoryRequirements {
-            size: 1 << 20,
-            alignment: 1024,
-            memory_type_bits: 0x3f,
-        };
-        for link in &mut out.p_next {
-            let VkMemoryRequirements2Next::VkMemoryDedicatedRequirements(d) = link;
-            d.prefers_dedicated_allocation = 1;
-            d.requires_dedicated_allocation = 0;
+        image_requirements(out);
+    }
+
+    fn device_image_memory_requirements(
+        &self,
+        _device: &u64,
+        _info: &VkImageCreateInfo,
+        _host_memory: bool,
+        _plane: Option<VkImageAspectFlagBits>,
+        out: &mut VkMemoryRequirements2,
+    ) {
+        image_requirements(out);
+    }
+
+    fn image_subresource_layout(
+        &self,
+        _device: &u64,
+        _image: u64,
+        subresource: &VkImageSubresource,
+    ) -> VkSubresourceLayout {
+        VkSubresourceLayout {
+            offset: u64::from(subresource.mip_level) * 0x1000,
+            size: 0x1000,
+            row_pitch: 256,
+            array_pitch: 0x1000,
+            depth_pitch: 0x1000,
         }
+    }
+
+    fn bind_image_memory(
+        &self,
+        _device: &u64,
+        binds: &[ImageBind<'_, u64, FakeMemory>],
+    ) -> VkResult {
+        self.with(|live| {
+            for bind in binds {
+                live.image_binds
+                    .push((bind.image, bind.memory.handle, bind.offset));
+            }
+        });
+        VK_SUCCESS
+    }
+
+    fn create_image_view(
+        &self,
+        _device: &u64,
+        _image: u64,
+        _info: &VkImageViewCreateInfo,
+    ) -> Result<u64, VkResult> {
+        Ok(self.create("image view"))
+    }
+
+    fn destroy_image_view(&self, _device: &u64, _view: u64) {
+        self.destroy("image view");
+    }
+
+    fn host_pointer_types(&self, _device: &u64, _pages: &RingPages) -> Result<u32, VkResult> {
+        Ok(self.host_pointer_bits)
+    }
+
+    fn allocate_memory(
+        &self,
+        _device: &u64,
+        request: &MemoryRequest<u64, u64>,
+    ) -> Result<FakeMemory, VkResult> {
+        let handle = self.create("memory");
+        self.with(|live| {
+            live.allocations
+                .push((request.type_index, request.size, request.import.is_some()));
+            if let Some(pages) = &request.import {
+                live.imports.push(Import {
+                    addr: pages.host_addr(),
+                    len: request.size,
+                    pages: Arc::downgrade(pages),
+                });
+            }
+        });
+        Ok(FakeMemory {
+            handle,
+            size: request.size,
+            pages: request.import.clone(),
+        })
+    }
+
+    fn free_memory(&self, _device: &u64, memory: FakeMemory) {
+        // As the real host: the import's pages are held exactly as long as
+        // the memory, and are all of it.
+        assert!(memory
+            .pages
+            .as_ref()
+            .is_none_or(|pages| pages.mapped_len() == memory.size));
+        drop(memory);
+        self.destroy("memory");
+    }
+
+    fn memory_commitment(&self, _device: &u64, memory: &FakeMemory) -> u64 {
+        memory.size / 2
+    }
+
+    fn buffer_accepts_host_memory(&self, _device: &u64, _flags: u32, _usage: u32) -> bool {
+        true
+    }
+
+    fn create_buffer(
+        &self,
+        _device: &u64,
+        info: &VkBufferCreateInfo,
+        host_memory: bool,
+    ) -> Result<u64, VkResult> {
+        let handle = self.create("buffer");
+        self.with(|live| {
+            live.host_memory_resources.push(("buffer", host_memory));
+            live.buffer_sizes.insert(handle, info.size);
+        });
+        Ok(handle)
+    }
+
+    fn destroy_buffer(&self, _device: &u64, _buffer: u64) {
+        self.destroy("buffer");
+    }
+
+    fn buffer_memory_requirements(
+        &self,
+        _device: &u64,
+        buffer: u64,
+        out: &mut VkMemoryRequirements2,
+    ) {
+        let size = self.with(|live| live.buffer_sizes.get(&buffer).copied().unwrap_or(0));
+        buffer_requirements(size, out);
+    }
+
+    fn device_buffer_memory_requirements(
+        &self,
+        _device: &u64,
+        info: &VkBufferCreateInfo,
+        _host_memory: bool,
+        out: &mut VkMemoryRequirements2,
+    ) {
+        buffer_requirements(info.size, out);
+    }
+
+    fn bind_buffer_memory(&self, _device: &u64, binds: &[(u64, &FakeMemory, u64)]) -> VkResult {
+        self.with(|live| {
+            for (buffer, memory, offset) in binds {
+                live.buffer_binds.push((*buffer, memory.handle, *offset));
+            }
+        });
+        VK_SUCCESS
+    }
+
+    fn buffer_device_address(&self, _device: &u64, buffer: u64) -> u64 {
+        0x1_0000_0000 + (buffer << 16)
+    }
+
+    fn create_buffer_view(
+        &self,
+        _device: &u64,
+        _buffer: u64,
+        _info: &VkBufferViewCreateInfo,
+    ) -> Result<u64, VkResult> {
+        Ok(self.create("buffer view"))
+    }
+
+    fn destroy_buffer_view(&self, _device: &u64, _view: u64) {
+        self.destroy("buffer view");
     }
 }

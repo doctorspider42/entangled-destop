@@ -1,5 +1,5 @@
-//! The host Vulkan the executor drives: exactly the calls stage 5a.3 makes,
-//! as a trait, so that everything above it — the object table, the id rules,
+//! The host Vulkan the executor drives: exactly the calls stages 5a.3 and
+//! 5b.1 make, as a trait, so that everything above it — the object table, the id rules,
 //! the policies and the reply shapes — is provable on a host with no GPU.
 //!
 //! The trait speaks the **generated protocol structures**, not `ash`'s. That
@@ -16,14 +16,17 @@
 //! which it cannot.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::venus::protocol::{
-    VkCommandPoolCreateInfo, VkDeviceCreateInfoNext, VkExtensionProperties, VkFormat,
-    VkFormatProperties2, VkImageAspectFlagBits, VkImageCreateInfo, VkImageFormatProperties2,
-    VkMemoryRequirements2, VkPhysicalDeviceFeatures, VkPhysicalDeviceFeatures2,
-    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceMemoryProperties,
-    VkPhysicalDeviceProperties2, VkQueueFamilyProperties, VkResult,
+    VkBufferCreateInfo, VkBufferViewCreateInfo, VkCommandPoolCreateInfo, VkDeviceCreateInfoNext,
+    VkExtensionProperties, VkFormat, VkFormatProperties2, VkImageAspectFlagBits, VkImageCreateInfo,
+    VkImageFormatProperties2, VkImageSubresource, VkImageViewCreateInfo, VkMemoryRequirements2,
+    VkPhysicalDeviceFeatures, VkPhysicalDeviceFeatures2, VkPhysicalDeviceImageFormatInfo2,
+    VkPhysicalDeviceMemoryProperties, VkPhysicalDeviceProperties2, VkQueueFamilyProperties,
+    VkResult, VkSubresourceLayout,
 };
+use crate::venus::shmem::RingPages;
 
 /// Everything the host says about one physical device, gathered once when
 /// a guest instance first enumerates (properties and features are invariant,
@@ -48,6 +51,9 @@ pub struct HostDeviceInfo {
     /// device is not exposed, because nothing it could map is memory the VMM
     /// owns (ADR-0004, 2026-09-23).
     pub host_import_types: Option<u32>,
+    /// `VkPhysicalDeviceExternalMemoryHostPropertiesEXT::minImportedHostPointerAlignment`,
+    /// 0 when unknown.
+    pub host_import_alignment: u64,
 }
 
 /// One `VkPhysicalDeviceGroupProperties`, host side.
@@ -104,6 +110,48 @@ pub struct DeviceRequest<P> {
     pub group: Option<Vec<P>>,
 }
 
+/// The resource a `VkMemoryDedicatedAllocateInfo` names, as host handles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dedicated<B, I> {
+    /// A buffer.
+    Buffer(B),
+    /// An image.
+    Image(I),
+}
+
+/// A `vkAllocateMemory`, rebuilt from the decoded structures and validated.
+#[derive(Debug, Clone)]
+pub struct MemoryRequest<B, I> {
+    /// `allocationSize` as the host is asked for it: the guest's, or — for
+    /// an import — the whole of `import`, which is the guest's rounded up to
+    /// the driver's import alignment.
+    pub size: u64,
+    /// `memoryTypeIndex`, the host's own (the guest sees the same indices).
+    pub type_index: u32,
+    /// Our pages, to import with `VK_EXT_external_memory_host`
+    /// (`HOST_ALLOCATION_BIT_EXT`). The host keeps this `Arc` for as long as
+    /// the memory object lives and drops it only after `vkFreeMemory` has
+    /// returned, so the driver can never be left importing freed pages.
+    pub import: Option<Arc<RingPages>>,
+    /// `VkMemoryAllocateFlagsInfo`: `(flags, deviceMask)`.
+    pub flags: Option<(u32, u32)>,
+    /// `VkMemoryDedicatedAllocateInfo`, never with an import.
+    pub dedicated: Option<Dedicated<B, I>>,
+}
+
+/// One `VkBindImageMemoryInfo`, host side.
+#[derive(Debug)]
+pub struct ImageBind<'m, I, M> {
+    /// The image.
+    pub image: I,
+    /// The memory.
+    pub memory: &'m M,
+    /// `memoryOffset`.
+    pub offset: u64,
+    /// A chained `VkBindImagePlaneMemoryInfo`'s plane, for a disjoint image.
+    pub plane: Option<VkImageAspectFlagBits>,
+}
+
 /// The host Vulkan calls this stage makes. See the module docs.
 ///
 /// Every method is infallible where the Vulkan call is, and returns the
@@ -123,6 +171,15 @@ pub trait HostVulkan: Send + Sync + 'static {
     type CommandPool: Copy + Send + 'static;
     /// A host `VkImage`.
     type Image: Copy + Send + 'static;
+    /// A host `VkDeviceMemory` together with whatever keeps it valid (the
+    /// imported pages' `Arc`). Owned: [`HostVulkan::free_memory`] takes it.
+    type Memory: Send + 'static;
+    /// A host `VkBuffer`.
+    type Buffer: Copy + Send + 'static;
+    /// A host `VkBufferView`.
+    type BufferView: Copy + Send + 'static;
+    /// A host `VkImageView`.
+    type ImageView: Copy + Send + 'static;
 
     /// `vkEnumerateInstanceVersion` of the host loader.
     ///
@@ -221,7 +278,15 @@ pub trait HostVulkan: Send + Sync + 'static {
     /// `vkDestroyCommandPool`.
     fn destroy_command_pool(&self, device: &Self::Device, pool: Self::CommandPool);
 
-    /// `vkCreateImage` from a validated create info and its chain.
+    /// Whether an image created from `info` may be bound to our imported
+    /// pages — `VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT` is
+    /// `IMPORTABLE` for it — so that it is created ready for them and its
+    /// requirements may name the host-visible types.
+    fn image_accepts_host_memory(&self, device: &Self::Device, info: &VkImageCreateInfo) -> bool;
+
+    /// `vkCreateImage` from a validated create info and its chain; with
+    /// `host_memory`, created with a `VkExternalMemoryImageCreateInfo` for
+    /// host allocations, as binding imported memory requires.
     ///
     /// # Errors
     /// The driver's `VkResult`.
@@ -229,6 +294,7 @@ pub trait HostVulkan: Send + Sync + 'static {
         &self,
         device: &Self::Device,
         info: &VkImageCreateInfo,
+        host_memory: bool,
     ) -> Result<Self::Image, VkResult>;
 
     /// `vkDestroyImage`.
@@ -244,4 +310,140 @@ pub trait HostVulkan: Send + Sync + 'static {
         plane: Option<VkImageAspectFlagBits>,
         out: &mut VkMemoryRequirements2,
     );
+
+    /// `vkGetDeviceImageMemoryRequirements` for an image that
+    /// [`create_image`](Self::create_image) would make of `info` and
+    /// `host_memory`, filling `out` and exactly the output links it carries.
+    fn device_image_memory_requirements(
+        &self,
+        device: &Self::Device,
+        info: &VkImageCreateInfo,
+        host_memory: bool,
+        plane: Option<VkImageAspectFlagBits>,
+        out: &mut VkMemoryRequirements2,
+    );
+
+    /// `vkGetImageSubresourceLayout` for a linear image.
+    fn image_subresource_layout(
+        &self,
+        device: &Self::Device,
+        image: Self::Image,
+        subresource: &VkImageSubresource,
+    ) -> VkSubresourceLayout;
+
+    /// `vkBindImageMemory2`, every bind validated.
+    fn bind_image_memory(
+        &self,
+        device: &Self::Device,
+        binds: &[ImageBind<'_, Self::Image, Self::Memory>],
+    ) -> VkResult;
+
+    /// `vkCreateImageView` of `image` from a validated create info.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn create_image_view(
+        &self,
+        device: &Self::Device,
+        image: Self::Image,
+        info: &VkImageViewCreateInfo,
+    ) -> Result<Self::ImageView, VkResult>;
+
+    /// `vkDestroyImageView`.
+    fn destroy_image_view(&self, device: &Self::Device, view: Self::ImageView);
+
+    // ------------------------------------------------------------- memory
+
+    /// `vkGetMemoryHostPointerPropertiesEXT` for `pages`: the memory types
+    /// they may be imported into.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn host_pointer_types(&self, device: &Self::Device, pages: &RingPages)
+        -> Result<u32, VkResult>;
+
+    /// `vkAllocateMemory`.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn allocate_memory(
+        &self,
+        device: &Self::Device,
+        request: &MemoryRequest<Self::Buffer, Self::Image>,
+    ) -> Result<Self::Memory, VkResult>;
+
+    /// `vkFreeMemory`. For imported memory the host waits for the device to
+    /// go idle first: pages the GPU may still be writing are not pages the
+    /// executor may let go of.
+    fn free_memory(&self, device: &Self::Device, memory: Self::Memory);
+
+    /// `vkGetDeviceMemoryCommitment`, for a lazily allocated type.
+    fn memory_commitment(&self, device: &Self::Device, memory: &Self::Memory) -> u64;
+
+    // ------------------------------------------------------------ buffers
+
+    /// Whether a buffer of these `flags` and `usage` may be bound to our
+    /// imported pages; see [`image_accepts_host_memory`](Self::image_accepts_host_memory).
+    fn buffer_accepts_host_memory(&self, device: &Self::Device, flags: u32, usage: u32) -> bool;
+
+    /// `vkCreateBuffer` from a validated create info; `host_memory` as for
+    /// [`create_image`](Self::create_image).
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn create_buffer(
+        &self,
+        device: &Self::Device,
+        info: &VkBufferCreateInfo,
+        host_memory: bool,
+    ) -> Result<Self::Buffer, VkResult>;
+
+    /// `vkDestroyBuffer`.
+    fn destroy_buffer(&self, device: &Self::Device, buffer: Self::Buffer);
+
+    /// `vkGetBufferMemoryRequirements2`, filling `out` and exactly the output
+    /// links it already carries.
+    fn buffer_memory_requirements(
+        &self,
+        device: &Self::Device,
+        buffer: Self::Buffer,
+        out: &mut VkMemoryRequirements2,
+    );
+
+    /// `vkGetDeviceBufferMemoryRequirements` for the buffer
+    /// [`create_buffer`](Self::create_buffer) would make of the same
+    /// arguments.
+    fn device_buffer_memory_requirements(
+        &self,
+        device: &Self::Device,
+        info: &VkBufferCreateInfo,
+        host_memory: bool,
+        out: &mut VkMemoryRequirements2,
+    );
+
+    /// `vkBindBufferMemory2`, every bind validated: `(buffer, memory,
+    /// offset)`.
+    fn bind_buffer_memory(
+        &self,
+        device: &Self::Device,
+        binds: &[(Self::Buffer, &Self::Memory, u64)],
+    ) -> VkResult;
+
+    /// `vkGetBufferDeviceAddress`, for a buffer created with
+    /// `SHADER_DEVICE_ADDRESS` usage on a device with `bufferDeviceAddress`.
+    fn buffer_device_address(&self, device: &Self::Device, buffer: Self::Buffer) -> u64;
+
+    /// `vkCreateBufferView` of `buffer` from a validated create info.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn create_buffer_view(
+        &self,
+        device: &Self::Device,
+        buffer: Self::Buffer,
+        info: &VkBufferViewCreateInfo,
+    ) -> Result<Self::BufferView, VkResult>;
+
+    /// `vkDestroyBufferView`.
+    fn destroy_buffer_view(&self, device: &Self::Device, view: Self::BufferView);
 }
