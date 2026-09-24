@@ -63,8 +63,16 @@
 //! finished by then is an error for this flush (the window keeps its last
 //! frame), and the next read waits for that work first, again bounded; a
 //! lost device is an error and the whole device is dropped, to be made again
-//! by the next scanout. Only then are the rows copied out of the staging
-//! pages, through the bounded [`RingPages::read_bytes`].
+//! by the next scanout. Only then is the rect copied out of the staging
+//! pages — packed, so in one plain block, through the bounded
+//! [`PrivatePages::read_rows`]. The staging pages are [`PrivatePages`]: no
+//! guest ever maps them (they are no blob, and publishing them is refused),
+//! and nothing else writes them once the fence has signalled, so the copy
+//! needs none of the byte-wise atomic loads guest-visible pages do.
+//!
+//! The copy is of the flush's rect only, on the GPU and on the CPU alike:
+//! the device passes the guest's damage rect clipped to the scanout, and the
+//! image copy reads exactly that region, packed at its own width.
 //!
 //! # Lifecycle
 //!
@@ -93,7 +101,7 @@ use crate::venus::protocol::{
 };
 use crate::venus::protocol::{VkBuffer, VkImage};
 use crate::venus::renderer::{ScanoutRelease, ScanoutTarget, SharedRef};
-use crate::venus::shmem::{PageBudget, RingPages};
+use crate::venus::shmem::{PageBudget, PrivatePages};
 
 use super::generated;
 use super::host::{
@@ -192,7 +200,8 @@ struct Target<H: HostVulkan> {
     image: Option<H::Image>,
     buffer: Option<H::Buffer>,
     staging: Option<H::Memory>,
-    pages: Option<Arc<RingPages>>,
+    /// The staging buffer's pages: host-private, never a blob.
+    pages: Option<PrivatePages>,
 }
 
 impl<H: HostVulkan> Target<H> {
@@ -648,12 +657,12 @@ impl<H: HostVulkan> ScanoutDevice<H> {
             .max(req.alignment)
             .checked_next_power_of_two()
             .unwrap_or(u64::MAX);
-        let pages = Arc::new(
-            RingPages::for_memory(req.size.max(bytes), align, &self.budget)
-                .map_err(|e| refused(format!("staging pages: {e}")))?,
-        );
+        // Host-private: the guest never maps these, so the readback may be
+        // one plain copy (`PrivatePages::read_rows`).
+        let pages = PrivatePages::for_memory(req.size.max(bytes), align, &self.budget)
+            .map_err(|e| refused(format!("staging pages: {e}")))?;
         let types = host
-            .host_pointer_types(device, &pages)
+            .host_pointer_types(device, pages.import_pages())
             .map_err(|r| refused(format!("vkGetMemoryHostPointerPropertiesEXT ({r})")))?
             & req.memory_type_bits;
         if types == 0 {
@@ -667,7 +676,7 @@ impl<H: HostVulkan> ScanoutDevice<H> {
                 &MemoryRequest {
                     size: pages.mapped_len(),
                     type_index: types.trailing_zeros(),
-                    import: Some(Arc::clone(&pages)),
+                    import: Some(Arc::clone(pages.import_pages())),
                     flags: None,
                     dedicated: None,
                     export_handle: false,
@@ -721,7 +730,11 @@ impl<H: HostVulkan> ScanoutDevice<H> {
         if !rect.fits_within(target.spec.width, target.spec.height) {
             return Err(refused("the rect is outside the image"));
         }
-        let len = usize::try_from(rect.pixels().saturating_mul(4))
+        // The copy below packs the rect at its own width (`bufferRowLength`
+        // 0), so the staging rows are `row` bytes apart: one block.
+        let row = usize::try_from(u64::from(rect.width) * 4)
+            .map_err(|_| refused("a row larger than this host addresses"))?;
+        let rows = usize::try_from(rect.height)
             .map_err(|_| refused("a rect larger than this host addresses"))?;
         self.settle()?;
         let at = self.target_index(target)?;
@@ -905,12 +918,10 @@ impl<H: HostVulkan> ScanoutDevice<H> {
                 )));
             }
         }
-        out.clear();
-        out.try_reserve_exact(len)
-            .map_err(|_| refused(format!("{len} bytes of readback buffer")))?;
-        out.resize(len, 0);
+        // The fence has signalled: the copy is done and visible to the host,
+        // and nothing else writes these pages — `read_rows`' precondition.
         pages
-            .read_bytes(0, out)
+            .read_rows(0, row as u64, row, rows, out)
             .map_err(|e| refused(format!("the staging pages: {e}")))?;
         Ok(())
     }

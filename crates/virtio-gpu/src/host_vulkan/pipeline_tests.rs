@@ -2693,6 +2693,17 @@ fn a_handle_blob_flip_reads_back_the_frame_through_the_renderers_scanout_device(
         got.chunks_exact(4).all(|p| p == texel),
         "every 1080p pixel is the clear colour in BGRA"
     );
+    // A guest's smaller damage rect is copied alone, on the GPU and the CPU.
+    let damage = Rect {
+        x: 720,
+        y: 405,
+        width: 480,
+        height: 270,
+    };
+    let (got, times_damage) = timed_reads(&mut h, BIG_RES, damage, 30);
+    report("480x270 damage of 1920x1080 per flush", &times_damage);
+    assert_eq!(got.len(), (480 * 270 * 4) as usize);
+    assert!(got.chunks_exact(4).all(|p| p == texel));
     assert_eq!(h.renderer.factory().scanout_targets(), 2);
 
     // Unref and teardown leave nothing on the host.
