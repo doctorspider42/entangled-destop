@@ -839,6 +839,9 @@ gnome-shell)/maps` has `libvulkan_virtio`. The exact text is pinned by
 commands were run for real in the Venus guest against a scratch `/target`:
 `glib-compile-schemas --strict` passed on its real schema set, `gsettings`
 read `uint32 0`, and the drirc parsed identically to the one GNOME ran on.
+The render-group item is safe where it sits: subiquity's postinstall creates the
+identity user (11:04:52 in that guest's installer log) before
+`subiquity/Late/run_user_supplied` starts (11:05:00).
 A full `install ubuntu --venus` run has not been made yet: there was no
 Desktop ISO on the machine.
 

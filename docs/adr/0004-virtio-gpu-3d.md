@@ -4347,7 +4347,10 @@ is already the finished machine and nothing is typed afterwards:
 - **`render`**: the user comes from the document's `identity.username`, and
   the command is refused unless that is a plain Unix name. A graphical login
   reaches the render node through logind's ACL anyway. This is for serial and
-  SSH logins, where every Vulkan probe of this project runs.
+  SSH logins, where every Vulkan probe of this project runs. The user exists
+  by then. The existing guest's installer log shows subiquity's postinstall
+  creating `entangled` at 11:04:52, and `subiquity/Late/run_user_supplied`
+  starting at 11:05:00.
 
 The edit is to the text, not a YAML round trip: the document may be the
 user's, and a parser would drop its comments. `seed::with_venus_guest` finds the
@@ -4375,3 +4378,29 @@ three-way *3D* choice: Off (2D), OpenGL (virgl), GPU desktop (Venus).
 `Backend::gpu_block` greys out virgl on a WHP engine and never Venus. The
 choice writes exactly one switch, and switching back to 2D leaves no `venus` key
 behind.
+
+### Measured
+
+WHP, RTX 2070, a copy of `venus-ubuntu-net.toml` that adds only
+`venus = true`. `ENTANGLED_VENUS` was not set. Two boots:
+
+- The run logged `attaching the Venus EXECUTING renderer … source=[display]
+  venus = true host_visible_mib=4096`. The device scanned out a renderer blob
+  (`the guest composites on the GPU resource=9 width=1920 height=1080`).
+  `gnome-shell` (pid 1702, the `entangled` session) maps `libvulkan_virtio`
+  five times, and a GL context made as root reads `zink Vulkan
+  1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070) (MESA_VENUS))`.
+- The four late-commands, run against a scratch `/target` in that guest:
+  `glib-compile-schemas --strict` accepted the override against the guest's
+  real schemas, `gsettings` read `uint32 0` from the result, and the drirc
+  parsed to the same elements as `/etc/drirc`, the file GNOME was running on.
+- This guest's own user database says `idle-delay uint32 60`, left there by
+  the measurements above. A user's value outranks a vendor default, so the
+  first boot blanked at +66 s. That is exactly what the override cannot
+  prevent, and why the troubleshooting page names `gsettings set`.
+
+No `install ubuntu --venus` has run end to end: this machine has no Desktop
+ISO. The seed is covered by the unit tests, which pin the four items byte for
+byte, check their folding, and check their placement in both built-in profiles
+and in user documents. PyYAML read the generated document back as seven
+late-commands in that order.
