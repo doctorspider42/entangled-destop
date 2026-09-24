@@ -4042,34 +4042,50 @@ added is *when*. The log line just before it, every time:
 The last virtio-gpu frame was presented at 18:12:08; the scanout was
 disabled at 18:12:10; the allocations began in the same second. A scanout
 the guest turns off five minutes after its session starts, again five
-minutes after the next one, with no input in between, is GNOME's idle blank
-(`org.gnome.desktop.session idle-delay`, 300 s by default): mutter turns the
-CRTC off and stops painting. The clients keep committing frames — mutter keeps
-answering frame callbacks for surfaces it is not painting — and each commit
-of an 800×600 client is uploaded at once: a fresh host-visible allocation of
-exactly 800 × 600 × 4 = 1 920 000 bytes in gnome-shell's context, zink's
-texture-upload staging buffer (3 840 000 for vkmark's, 2 MiB slabs beside
-them). zink frees a staging buffer only when its batch completes, and a batch
-of a compositor that is not painting is never submitted; zink's own backstop
-flush is at 80 % of the device-local heaps (6.4 GB here), far above the
-1 GiB share at which this renderer refuses. So the runaway is the guest's
-compositor holding every upload of a blanked screen until something refuses
-it, and the fences are not involved: nothing is submitted, so nothing waits.
+minutes after the next one, with no input in between, is GNOME's idle blank:
+the guest reads `idle-delay` `uint32 300`, `idle-dim` and `lock-enabled`
+true. mutter turns the CRTC off.
+
+A second run, with a per-ring command histogram (a diagnostic build, not
+kept) and only three clients (glmark2 jellyfish, vkcube, gnome-calculator),
+reproduced it — blank at 18:52:31.36, gnome-shell refused at 18:52:41.75 —
+and shows what gnome-shell's context does on either side of the blank:
+
+| per second | desktop painting | after the blank |
+|---|---|---|
+| `vkQueueSubmit` / `vkWaitSemaphores` | ~270 / ~270 | **0** (one submit in ten seconds) |
+| `vkCreateBuffer` / `vkDestroyBuffer` | ~570 / ~570 | 160 / 0 |
+| `vkAllocateMemory` | 0 (sub-allocated) | ~100 |
+| `vkCreateImage` + `vkBindImageMemory2` | 0 | ~80 |
+| destroys or frees of any kind | balanced | **0** |
+
+So after the blank every client commit (~80/s across the three) gets a new
+image, two new buffers and ~1.25 new host-visible allocations — the upload
+of that frame, 800 × 600 × 4 = 1 920 000 bytes for glmark2, 2 MiB slabs
+beside them — and none of it is ever submitted, so none of it is ever done
+and zink frees none of it: zink releases a batch's resources only when the
+batch completes, and its own backstop flush is at 80 % of the device-local
+heaps (6.4 GB here), far above the 1 GiB share at which this renderer
+refuses. The one submit after the blank (timeline value 71 543 on
+gnome-shell's semaphore) was waited on by the host and completed; nothing
+was pending on any fence, semaphore or ring fence of ours when the share
+refused. The runaway is the guest compositor holding every upload of a
+blanked screen, and the fences were never part of it.
 
 What is ours and what is not:
 
 - The blank itself is guest policy, and a `SET_SCANOUT` of resource 0 is
   honoured correctly.
-- The unbounded hold is mutter + zink behaviour; the same compositor on a
-  host-memory-rich native driver would run until zink's 80 % flush.
+- The unbounded hold is mutter + zink behaviour: the same compositor on zink
+  over any Vulkan driver would hold until zink's 80 % flush.
 - The *crash* is the interaction with our share: zink sizes its backstop from
-  the heap sizes the renderer reports, and those are the host GPU's, not the
-  budget this renderer enforces. Reporting heap sizes that reflect the budget
+  the device-local heap sizes the guest is told, which are the host GPU's
+  (8 GB), not the budget this renderer enforces. Reporting heap sizes that reflect the budget
   (or a `VK_EXT_memory_budget` that does) would let zink flush before the
   refusal, but it changes what every guest application is told about VRAM,
   so it is a decision for the stage that takes this on, not a contained fix.
 
-Also seen in the same run, and the same mechanism from the client side: two
+Also seen in the first run, from the client side: two
 glmark2 processes whose compositor had died kept allocating and freeing a
 1 921 024-byte host-visible buffer per frame, ~155/s each, for eight minutes
 — freed every time, so not a leak, but the host-visible allocation throughput
