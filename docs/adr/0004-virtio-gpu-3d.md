@@ -3264,3 +3264,67 @@ memory neither can map.
   There this stage advertises nothing.
 - `save`/`load`: a snapshot is refused by name while a handle blob lives,
   even after every Vulkan object has gone.
+
+## Amendment, 2026-09-24 — GNOME on the GPU, S2a: the device scans out renderer blobs
+
+A GPU-composited guest desktop (Mutter over GBM → zink → venus) puts its
+frames on screen through **renderer blobs**. Each scanout buffer is a guest
+`VkDeviceMemory` that the kernel wraps in a `RESOURCE_CREATE_BLOB` with
+`BLOB_MEM_HOST3D` and `SHAREABLE`, never `MAPPABLE`. Every page flip is then
+`SET_SCANOUT_BLOB` (`B8G8R8X8`, the framebuffer's width and height,
+`strides[0]`, `offsets[0]`) followed by an unfenced `RESOURCE_FLUSH`, with no
+transfer (Linux 7.0 `virtgpu_plane.c:267-305`, `virtgpu_vq.c:1459-1493`). Until
+now the device refused `SET_SCANOUT_BLOB` for anything but a guest-memory blob.
+S2a is the device and trait half. The Venus renderer's implementation is a
+later stage.
+
+- **The hook is additive.** `Renderer3d::scanout_blob(resource_id,
+  &ScanoutBlobSpec) -> Result<(), CommandError>`, where `ScanoutBlobSpec` is
+  `{format, width, height, stride, offset}`. The default refuses with the
+  error the device answered before (`ERR_INVALID_PARAMETER`), so virgl, the
+  loopback and the isolated renderer are unchanged. The isolated renderer does
+  not forward the hook: that would need a new request in its protocol, and it
+  has no host blob memory worth reading back.
+- **The pixels come through `read_rect_bgra`**, with no new read call. An
+  accepted `scanout_blob` promises that `read_rect_bgra(resource_id, rect)`
+  now reads that layout, until the next accepted spec for that resource,
+  `destroy_blob` or `reset`. The flush path is the one 3D scanouts already
+  use: clip to the scanout, read into the device's reused buffer, then
+  `update_scanout`. `display` did not change. A second read call would only
+  pass the spec again on every frame, and the renderer is already required to
+  keep it.
+- **One spec per buffer.** A compositor alternates between two or three
+  buffers on every flip. The device therefore stores the accepted spec on the
+  blob, not on the scanout. Flipping to a buffer whose layout is already
+  accepted makes no renderer call. A changed layout is asked again. A refusal
+  keeps the previous acceptance and the previous binding. After the first
+  renderer-blob scanout, which is logged once at info, re-binds log at debug.
+- **Bounds before the renderer.** The device checks the rect against the
+  framebuffer, the framebuffer against `MAX_RESOURCE_PIXELS`, the stride
+  against a row (`width × 4`), and `offset + stride × height` against the
+  blob's declared size, all in u64. Flush damage is checked against the
+  declared framebuffer. The renderer's answer must be exactly
+  `rect.width × rect.height × 4` bytes, or the flush fails in band.
+- **Lifetimes follow the other sources.** `RESOURCE_UNREF` of the blob on
+  screen disables the scanout. `SET_SCANOUT`/`SET_SCANOUT_BLOB` with resource
+  0 disables it. A device reset drops the binding, the blobs and every accepted
+  layout. A lost renderer (GPU-012) drops a renderer-blob scanout, as it drops
+  a 3D one. `HOST3D_GUEST` blobs take the renderer path too: their pixels are
+  the renderer's as well.
+- **Snapshots** (ADR-0006) record the binding as a blob scanout, which is
+  host-owned. A restore rebinds nothing and reads nothing, the window keeps its
+  initial frame, and the blob counts in `live_blobs`, so the driver is told to
+  start again. This matches a 3D-resource scanout. The readback runs on the
+  gated queue worker inside a trait call, so it needs no `Quiesce` of its own.
+
+Pinned by the `renderer_blob_scanout` tests in `tests/gpu_blob.rs`. They use a
+fake renderer whose readback encodes each pixel's coordinates and resource.
+
+**What the Venus renderer owes for this to work:**
+
+1. `scanout_blob`: accept a blob that is one of its `VkDeviceMemory` blobs
+   and is at least `offset + stride × height` bytes on the host, then record
+   the spec per resource.
+2. `read_rect_bgra` for such a resource: copy the rows of `rect` out of that
+   memory (`offset + y × stride + x × 4`) as packed BGRA.
+3. `destroy_blob` and `reset`: forget the spec.

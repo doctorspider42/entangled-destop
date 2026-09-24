@@ -99,7 +99,7 @@ pub use null_renderer::{
 };
 pub use pacing::{FramePacing, PacingReport};
 pub use protocol::{cmd, resp, CtrlHdr, Rect, FLAG_FENCE, FLAG_INFO_RING_IDX};
-pub use renderer::{CapsetInfo, FenceOutcome, Gpu3d, Renderer3d, ScanoutExport};
+pub use renderer::{CapsetInfo, FenceOutcome, Gpu3d, Renderer3d, ScanoutBlobSpec, ScanoutExport};
 // The Venus transport half (EPIC 20 phase 4). Named at the top level because
 // `entangled run` builds one; everything under `venus::` stays reachable by
 // path, because the layers below are what a *test* reaches for, not a caller.
