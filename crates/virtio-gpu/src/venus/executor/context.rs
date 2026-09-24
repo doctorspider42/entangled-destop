@@ -559,6 +559,7 @@ impl<H: HostVulkan> VulkanContext<H> {
     ) -> Result<Result<usize, VkResult>, ExecError> {
         let host = Arc::clone(&self.host);
         let ctx_id = self.ctx_id;
+        let share = self.budget.limit();
         let object = self
             .objects
             .instance_mut(instance)
@@ -577,8 +578,25 @@ impl<H: HostVulkan> VulkanContext<H> {
                 String::from_utf8_lossy(policy::c_name(&info.properties.properties.device_name))
                     .into_owned();
             match policy::expose(info) {
-                Ok(guest) => {
-                    tracing::info!(ctx_id, device = %name, "exposing a host Vulkan device to the guest");
+                Ok(mut guest) => {
+                    // What this context can hold of the heap of our pages
+                    // (`policy::guest_heaps`): its host-visible share.
+                    guest.memory = policy::guest_heaps(&guest.memory, share);
+                    let heaps: Vec<u64> = guest
+                        .memory
+                        .memory_heaps
+                        .iter()
+                        .take(usize::try_from(guest.memory.memory_heap_count).unwrap_or(0))
+                        .map(|heap| heap.size)
+                        .collect();
+                    tracing::info!(
+                        ctx_id,
+                        device = %name,
+                        ?heaps,
+                        host_visible_share = share,
+                        zink_flush_threshold = policy::zink_flush_threshold(&guest.memory),
+                        "exposing a host Vulkan device to the guest"
+                    );
                     devices.push(ExposedDevice {
                         host: handle,
                         guest,

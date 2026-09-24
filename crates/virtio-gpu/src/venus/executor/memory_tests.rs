@@ -362,6 +362,73 @@ fn the_host_visible_share_is_a_fraction_of_the_whole() {
     const { assert!(super::MAX_HOST_VISIBLE_BYTES_PER_CONTEXT <= super::MAX_HOST_VISIBLE_BYTES / 2) };
 }
 
+/// The guest is told the heap of its host-visible types is its context's
+/// share, and a client that allocates there and never frees — the compositor
+/// after GNOME's idle blank (ADR-0004) — is refused exactly when it has filled
+/// the heap it was told: the heap is the truth, not the host's system memory.
+/// Device-local heaps stay the host's; nothing of ours bounds them.
+#[test]
+fn the_heap_of_our_pages_is_the_share_and_is_full_where_the_share_refuses() {
+    const SHARE: u64 = 16 * SIZE;
+    let host = Arc::new(FakeVulkan::standard());
+    let mut h = Harness::with_factory(ExecutorFactory::with_budgets(
+        Arc::clone(&host),
+        4 * SHARE,
+        SHARE,
+    ));
+    with_device(&mut h);
+    let Command::GetPhysicalDeviceMemoryProperties2(m) =
+        h.call(&memory_properties(PHYSICAL)).expect("answered")
+    else {
+        panic!("wrong reply")
+    };
+    let told = m.p_memory_properties.expect("filled").memory_properties;
+    // The fake's heap 1 (16 GiB of system memory) holds types 3 and 4, the
+    // importable ones; heap 0 (8 GiB) the device-local types and the BAR.
+    assert_eq!(told.memory_heaps[1].size, SHARE);
+    assert_eq!(told.memory_heaps[0].size, 8 << 30);
+    let flags: Vec<u32> = told.memory_types[..6]
+        .iter()
+        .map(|t| t.property_flags)
+        .collect();
+    assert_eq!(flags, vec![0x1, 0x1, 0x1, 0x6, 0xe, 0x1], "types unchanged");
+
+    let call = |h: &mut Harness<FakeVulkan>, id: u64, size: u64, ty: u32| {
+        let Command::AllocateMemory(a) = h
+            .call(&allocate(DEVICE, id, size, ty, Vec::new()))
+            .expect("answered")
+        else {
+            panic!("wrong reply")
+        };
+        a.ret
+    };
+    // One allocation past the heap is refused by the heap itself.
+    assert_eq!(
+        call(&mut h, MEMORY, SHARE + SIZE, HOST_COHERENT_TYPE),
+        VK_ERROR_OUT_OF_DEVICE_MEMORY
+    );
+    // Allocations that are never freed fill it, and only it.
+    let mut held = 0;
+    let mut id = MEMORY;
+    let refused = loop {
+        let ret = call(&mut h, id, SIZE, HOST_COHERENT_TYPE);
+        if ret != VK_SUCCESS {
+            break ret;
+        }
+        held += SIZE;
+        id += 1;
+    };
+    assert_eq!(refused, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    assert_eq!(held, told.memory_heaps[1].size);
+    assert_eq!(h.renderer.factory().host_visible_bytes(), SHARE);
+    // Device-local memory is the driver's: past the share, still served.
+    assert_eq!(
+        call(&mut h, id + 1, 4 * SHARE, DEVICE_LOCAL_TYPE),
+        VK_SUCCESS
+    );
+    assert!(!h.fatal());
+}
+
 #[test]
 fn the_host_visible_budget_is_renderer_wide_and_answered_in_vulkan_terms() {
     let host = Arc::new(FakeVulkan::standard());

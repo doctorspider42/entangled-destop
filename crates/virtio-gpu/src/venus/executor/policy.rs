@@ -15,7 +15,8 @@
 //!   vkr forwards the host's memory properties unchanged and makes any
 //!   host-visible allocation exportable; on WHP the VMM must own the pages a
 //!   guest maps, and only types that import host allocations can be backed by
-//!   them (ADR-0004, 2026-09-23).
+//!   them (ADR-0004, 2026-09-23). **And the heap of those types is only as
+//!   large as the context's host-visible share** ([`guest_heaps`]).
 //! * **Sparse features are reported false** ([`mask_features`]). vkr masks
 //!   nothing; we implement no sparse command, and vulkaninfo enables
 //!   `sparseBinding` when it is offered and then creates a sparse image
@@ -91,6 +92,8 @@ pub const MEMORY_PROPERTY_HOST_VISIBLE: u32 = 0x2;
 pub const MEMORY_PROPERTY_HOST_COHERENT: u32 = 0x4;
 /// `VK_MEMORY_PROPERTY_HOST_CACHED_BIT`.
 pub const MEMORY_PROPERTY_HOST_CACHED: u32 = 0x8;
+/// `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT`.
+pub const MEMORY_HEAP_DEVICE_LOCAL: u32 = 0x1;
 /// `VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT`.
 pub const MEMORY_PROPERTY_LAZILY_ALLOCATED: u32 = 0x10;
 /// The three bits that promise a CPU mapping, which [`guest_memory`] takes
@@ -164,6 +167,72 @@ pub fn guest_memory(
         }
     }
     out
+}
+
+/// The heap sizes a guest sees: at most what one of its allocations there
+/// could ever be backed by. Every heap holding a type the guest sees as
+/// `HOST_VISIBLE` — which after [`guest_memory`] means a type the executor
+/// backs with its own pages — reports `min(host size, host_visible_limit)`,
+/// the context's host-visible share (`PageBudget::share`): no context can hold
+/// more of it, so a guest that sizes its staging or its budget from the heap
+/// is told the number it will be refused at. Every other heap keeps the host's
+/// size: device-local memory is the driver's, bounded by nothing of ours per
+/// context, and the driver refuses past its own heap. Type indices, flags and
+/// heap flags are unchanged. vkr forwards the host's heaps.
+///
+/// This is *not* what Zink's memory-pressure flush reads: that is 80 % of the
+/// **device-local** heaps only ([`zink_flush_threshold`]), so it does not
+/// move Zink's backstop, and it does not stop the compositor that runs away
+/// at GNOME's idle blank (ADR-0004, the honest-heaps amendment: not even a
+/// device-local total shrunk to put that backstop at the share did). What it
+/// changes is what Zink itself reads of this heap — the largest single
+/// allocation it tries (`zink_bo.c:288-292`), its BO cache (an eighth of all
+/// heaps, `zink_bo.c:1396-1402`) and its buffer-size caps
+/// (`zink_screen.c:455-470`) — and what any Vulkan client that budgets from
+/// heap sizes plans to put in memory we charge.
+#[must_use]
+pub fn guest_heaps(
+    memory: &VkPhysicalDeviceMemoryProperties,
+    host_visible_limit: u64,
+) -> VkPhysicalDeviceMemoryProperties {
+    let mut out = memory.clone();
+    let types = usize::try_from(memory.memory_type_count).unwrap_or(0);
+    let heaps = usize::try_from(memory.memory_heap_count).unwrap_or(0);
+    for (index, heap) in out.memory_heaps.iter_mut().enumerate().take(heaps) {
+        let holds_host_visible = memory.memory_types.iter().take(types).any(|ty| {
+            usize::try_from(ty.heap_index).is_ok_and(|h| h == index)
+                && ty.property_flags & MEMORY_PROPERTY_HOST_VISIBLE != 0
+        });
+        if holds_host_visible {
+            heap.size = heap.size.min(host_visible_limit);
+        }
+    }
+    out
+}
+
+/// Zink's memory-pressure backstop for a device reporting `memory`, as Mesa
+/// 26.0.8 computes it: 80 % of the sum of every `DEVICE_LOCAL` heap
+/// (`get_video_mem`, `zink_screen.c:272-281`; `clamp_video_mem`,
+/// `zink_screen.c:3633-3634`). A batch whose referenced resources — every
+/// buffer and image object it names, host-visible or not
+/// (`zink_batch.c:1066-1069`) — reach this sets `oom_flush` and `oom_stall`
+/// (`zink_batch.c:1024-1031`), and the batch is flushed at the next
+/// synchronized copy or framebuffer change (`zink_context.c:4183`, `:5108`,
+/// `:5297`). It is Zink's only flush driven by memory; nothing reads the
+/// other heaps for it.
+#[must_use]
+pub fn zink_flush_threshold(memory: &VkPhysicalDeviceMemoryProperties) -> u64 {
+    let heaps = usize::try_from(memory.memory_heap_count).unwrap_or(0);
+    let device_local: u64 = memory
+        .memory_heaps
+        .iter()
+        .take(heaps)
+        .filter(|heap| heap.flags & MEMORY_HEAP_DEVICE_LOCAL != 0)
+        .map(|heap| heap.size)
+        .fold(0, u64::saturating_add);
+    // `total_video_mem * 0.8` in C, a double truncated back: the same byte
+    // for any heap size a GPU reports.
+    device_local / 5 * 4 + device_local % 5 * 4 / 5
 }
 
 /// Whether any memory type the guest sees is `HOST_VISIBLE | HOST_COHERENT`.
@@ -812,7 +881,8 @@ pub struct GuestDevice {
     pub features: VkPhysicalDeviceFeatures2,
     /// Queue families, as the host reports them.
     pub queue_families: Vec<VkQueueFamilyProperties>,
-    /// [`guest_memory`] of the host's.
+    /// [`guest_memory`] of the host's; a context then applies
+    /// [`guest_heaps`] with its host-visible share before a guest sees it.
     pub memory: VkPhysicalDeviceMemoryProperties,
     /// The host's, for diagnostics and the policy table.
     pub host_memory: VkPhysicalDeviceMemoryProperties,
@@ -1276,7 +1346,7 @@ pub fn is_handle_type_bit(value: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::venus::protocol::VkMemoryType;
+    use crate::venus::protocol::{VkMemoryHeap, VkMemoryType};
 
     fn memory(flags: &[u32]) -> VkPhysicalDeviceMemoryProperties {
         let mut out = VkPhysicalDeviceMemoryProperties {
@@ -1327,6 +1397,124 @@ mod tests {
         assert_eq!(guest.memory_types[0].property_flags, 0x1);
         assert_eq!(guest.memory_types[1].property_flags, 0x2);
         assert!(!has_coherent_host_type(&guest), "visible but not coherent");
+    }
+
+    /// The host's heaps and types on the RTX 2070 under Windows, as the host
+    /// `vulkaninfo` prints them: 0 device-local (7.82 GiB), 1 system memory
+    /// (31.94 GiB, holding type 0 with no flags and the importable host
+    /// types 3 and 4), 2 the 214 MiB BAR (type 5, which we cannot import).
+    fn rtx_2070() -> VkPhysicalDeviceMemoryProperties {
+        let mut out = VkPhysicalDeviceMemoryProperties {
+            memory_type_count: 6,
+            memory_heap_count: 3,
+            ..Default::default()
+        };
+        let types = [(1, 0x0), (0, 0x1), (0, 0x1), (1, 0x6), (1, 0xe), (2, 0x7)];
+        for (slot, (heap_index, property_flags)) in out.memory_types.iter_mut().zip(types) {
+            *slot = VkMemoryType {
+                property_flags,
+                heap_index,
+            };
+        }
+        out.memory_heaps[0] = VkMemoryHeap {
+            size: 8_394_899_456,
+            flags: MEMORY_HEAP_DEVICE_LOCAL,
+        };
+        out.memory_heaps[1] = VkMemoryHeap {
+            size: 34_293_346_304,
+            flags: 0,
+        };
+        out.memory_heaps[2] = VkMemoryHeap {
+            size: 224_395_264,
+            flags: MEMORY_HEAP_DEVICE_LOCAL,
+        };
+        out
+    }
+
+    #[test]
+    fn the_heap_of_our_pages_reports_the_share_and_every_other_heap_the_host() {
+        let host = rtx_2070();
+        let typed = guest_memory(&host, 0x18);
+        let guest = guest_heaps(&typed, 1 << 30);
+        let sizes: Vec<u64> = guest.memory_heaps[..3].iter().map(|h| h.size).collect();
+        assert_eq!(
+            sizes,
+            vec![8_394_899_456, 1 << 30, 224_395_264],
+            "system memory holds our pages and is the share; VRAM and the BAR              (no longer host visible to the guest) are the host's"
+        );
+        // Nothing else moves: heap count and flags, type count, every type's
+        // heap index and flags.
+        assert_eq!(guest.memory_heap_count, 3);
+        assert_eq!(guest.memory_type_count, 6);
+        for (heap, before) in guest.memory_heaps.iter().zip(&typed.memory_heaps) {
+            assert_eq!(heap.flags, before.flags);
+        }
+        assert_eq!(guest.memory_types, typed.memory_types);
+        // A share past the heap leaves the heap alone.
+        assert_eq!(guest_heaps(&typed, u64::MAX), typed);
+        // A heap of host-visible types we cannot import (none importable:
+        // `guest_memory` took every host bit) is the host's.
+        let none = guest_memory(&host, 0);
+        assert_eq!(guest_heaps(&none, 1 << 30), none);
+    }
+
+    #[test]
+    fn a_device_local_heap_with_our_pages_is_the_share_too() {
+        // A unified-memory GPU: one device-local heap, every type in it, one
+        // of them importable and host visible. Our pages bound it.
+        let mut host = memory(&[0x1, 0x7]);
+        host.memory_heap_count = 1;
+        host.memory_heaps[0] = VkMemoryHeap {
+            size: 16 << 30,
+            flags: MEMORY_HEAP_DEVICE_LOCAL,
+        };
+        let guest = guest_heaps(&guest_memory(&host, 0x2), 1 << 30);
+        assert_eq!(guest.memory_heaps[0].size, 1 << 30);
+        assert_eq!(guest.memory_heaps[0].flags, MEMORY_HEAP_DEVICE_LOCAL);
+        assert_eq!(guest.memory_types[1].property_flags, 0x7);
+    }
+
+    #[test]
+    fn heap_indices_past_the_counts_are_never_read_or_written() {
+        let mut host = memory(&[0x6]);
+        host.memory_types[0].heap_index = 40;
+        host.memory_heap_count = 99;
+        host.memory_heaps[0].size = 1 << 40;
+        let guest = guest_heaps(&host, 1 << 30);
+        assert_eq!(guest.memory_heaps[0].size, 1 << 40, "no type is in heap 0");
+    }
+
+    /// The runaway of ADR-0004, in Zink's arithmetic: after GNOME's idle
+    /// blank gnome-shell records one upload per client commit — a 1 920 000
+    /// byte host-visible staging buffer and an image of the same size, both
+    /// counted by `check_oom_flush` — and submits none of them. Its share
+    /// refuses the 560th staging buffer; Zink's backstop is 1796 uploads away,
+    /// with the host-visible heap told the truth or not. The heap sizes are
+    /// not the lever.
+    #[test]
+    fn a_blanked_compositor_meets_its_share_long_before_zinks_backstop() {
+        const UPLOAD: u64 = 1_920_000;
+        const SHARE: u64 = 1 << 30;
+        let host = guest_memory(&rtx_2070(), 0x18);
+        for guest in [guest_heaps(&host, SHARE), host.clone()] {
+            let to_backstop = zink_flush_threshold(&guest).div_ceil(2 * UPLOAD);
+            let to_refusal = SHARE / UPLOAD + 1;
+            assert_eq!((to_refusal, to_backstop), (560, 1796));
+        }
+        // What the guest is told of the heap its staging lives in is exactly
+        // where the refusal comes: 559 uploads fit in it, the 560th does not.
+        let told = guest_heaps(&host, SHARE).memory_heaps[1].size;
+        assert_eq!(told / UPLOAD, 559);
+    }
+
+    #[test]
+    fn zinks_backstop_is_eighty_percent_of_the_device_local_heaps_only() {
+        let guest = guest_heaps(&guest_memory(&rtx_2070(), 0x18), 1 << 30);
+        // (8 394 899 456 + 224 395 264) * 0.8, as `clamp_video_mem`.
+        assert_eq!(zink_flush_threshold(&guest), 6_895_435_776);
+        // The system heap never enters it, clamped or not.
+        assert_eq!(zink_flush_threshold(&rtx_2070()), 6_895_435_776);
+        assert_eq!(zink_flush_threshold(&memory(&[0x6])), 0);
     }
 
     #[test]

@@ -4099,3 +4099,127 @@ Next limits, revised:
 2. Host-visible allocation throughput (unchanged).
 3. Renderer-wide bounds for host Vulkan objects and transient decode memory
    (unchanged).
+
+## Amendment, 2026-09-24 — honest heaps, and why they do not stop the blanked compositor
+
+The amendment above left "heap sizes or a memory budget that make zink flush
+before the share refuses" as the first next limit. This stage makes the heaps
+honest, reads what Zink actually does with them, and measures both that and a
+deliberately dishonest variant in the guest. Neither stops the runaway.
+
+### The heaps a guest is told
+
+`policy::guest_heaps`, applied per context when its instance first enumerates
+devices: every heap holding a type the guest sees as `HOST_VISIBLE` — after
+`guest_memory` only the types backed by our imported pages — reports
+`min(host size, the context's host-visible share)`. Every other heap keeps the
+host's size. Type indices, type flags and heap flags are unchanged. On the RTX
+2070 the guest's `vulkaninfo` now reads:
+
+| heap | flags | host | guest |
+|---|---|---|---|
+| 0 | `DEVICE_LOCAL` | 7.82 GiB | 7.82 GiB |
+| 1 | — (types 0, 3, 4; 3 and 4 are our pages) | 31.94 GiB | **1024 MiB** |
+| 2 | `DEVICE_LOCAL` (the BAR, type 5, no longer host visible) | 214 MiB | 214 MiB |
+
+Device-local heaps are left alone because nothing of ours bounds them per
+context: device-local memory is not charged to any budget, the driver refuses
+past its own heap, and a context may allocate all of it. `VK_EXT_memory_budget`
+is neither advertised (it is not in `ADMITTED_EXTENSIONS`, and Mesa 26.0.8's
+venus offers it only under `VN_DEBUG=mem_budget`, `vn_physical_device.c:1426`)
+nor admitted as a chain link, so no budget can disagree with the heaps; the
+guest's `vulkaninfo` lists no `VK_EXT_memory_budget`. The per-context share
+stays 1 GiB (below).
+
+What the honest heap changes: a Vulkan client that sizes its staging or budget
+from heap sizes is told the number it will be refused at, and Zink itself reads
+this heap for the largest single allocation it tries (`zink_bo.c:288-292`),
+the size of its BO cache (an eighth of all heaps, `zink_bo.c:1396-1402`) and
+its buffer-size caps (`zink_screen.c:455-470`). The refusal is exactly where
+the heap is full
+(`the_heap_of_our_pages_is_the_share_and_is_full_where_the_share_refuses`).
+
+### What Zink's backstop reads
+
+Zink (Mesa 26.0.8) has one memory-driven flush:
+
+- `clamp_video_mem = total_video_mem * 0.8` (`zink_screen.c:3633-3634`), where
+  `total_video_mem` is the sum of the heaps with `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT`
+  and nothing else (`get_video_mem`, `zink_screen.c:272-281`).
+- Every buffer or image object a batch references adds its size to
+  `bs->resource_size`, host-visible or not (`zink_batch.c:1066-1069`, both the
+  synchronized and the unsynchronized lists, `:1143`).
+- When that reaches `clamp_video_mem`, `check_oom_flush` sets `oom_flush` and
+  `oom_stall` (`zink_batch.c:1024-1031`). Nothing flushes there. The batch is
+  flushed at the next *synchronized* buffer↔image copy (`zink_context.c:5108`),
+  `resource_copy_region` (`:5297`) or framebuffer change (`:4183`).
+- `u_threaded_context`'s mapped-bytes limit (a quarter of guest RAM,
+  `zink_context.c:5960`) counts `buffer_map`/`texture_map` only; a
+  `texture_subdata` never touches it.
+
+So the system heap — the one holding our pages — never enters the backstop.
+With honest heaps it stays at 0.8 × (8 394 899 456 + 224 395 264) =
+**6 895 435 776 bytes**. In the runaway each client commit is a 1 920 000-byte
+staging buffer plus an image of the same size, so the backstop is 1796 uploads
+away and the share refuses the 560th
+(`a_blanked_compositor_meets_its_share_long_before_zinks_backstop`). The
+previous amendment's premise — that heap sizes reflecting the budget would let
+Zink flush first — holds only for the device-local heaps, and only if a flush
+point comes.
+
+### Measured: neither heap policy survives the blank
+
+Three guest runs, WHP, RTX 2070, Ubuntu 26.04 with GNOME on zink,
+`idle-delay` set to 60 as the session user (read back as `uint32 60`),
+glmark2 jellyfish + vkcube + gnome-calculator (GTK4):
+
+| run | heaps told | Zink backstop | blank → refusal | what happened |
+|---|---|---|---|---|
+| A: honest | 7.82 GiB / 1 GiB / 214 MiB | 6.90 GB | 7.7 s | 106 → 990 MB in 6 s, no drop, refused at the share |
+| B: device-local scaled (diagnostic build only) | 1.22 GiB / 1 GiB / 33 MiB | 1.00 GiB | 24.5 s | one flush: 862 → 247 MB at +6 s, then 247 MB → 1.09 GB in 16 s with no second flush, refused at the share |
+| C: honest, the committed build | as A | 6.90 GB | 8.5 s | 125 MB → 1.14 GB in 8 s, refused at the share |
+
+Each refusal was `vkBindBufferMemory2 … names no VkDeviceMemory` on
+gnome-shell's context, which ended it; gnome-shell was gone at the first
+check a minute into the blank, vkcube asserted in `demo_prepare_swapchain` and
+gnome-calculator reported "Lost connection to Wayland compositor"; glmark2
+survived. The wake (`org.gnome.ScreenSaver.SetActive false` and
+`loginctl unlock-sessions`) therefore had no session to wake. vk-smoke on the
+committed build: 9/9.
+
+Run B is the informative one. Zink's backstop *did* fire once it was put under
+the share — so `resource_size` does grow with these uploads — but only when
+gnome-shell next reached a flush point, which a blanked mutter does only
+sporadically. The likely reason, from the source rather than measured: a
+texture no batch holds takes `u_threaded_context`'s unsynchronized
+`texture_subdata` path (`can_unsync`, `u_threaded_context.c`
+`tc_texture_subdata`), and Zink records that copy without the flush check
+(`zink_context.c:5108` requires `!unsync`). After the one flush the next did
+not come within 16 s, while the hold grew again at ~50 MB/s. No backstop size can bound that: even a backstop of
+zero bytes leaves the time between two flush points to the share, and the
+diagnostic run of the amendment above saw one submit in ten seconds.
+
+### Decisions
+
+- **Heaps stay honest: our-pages heap = the share, device-local = the host's.**
+  Shrinking device-local heaps is not honest (nothing of ours bounds them), it
+  would tell every Vulkan client that budgets from heap sizes to put its
+  overflow in system-memory types — our pages here, the budget we refuse
+  from — and run B shows it does not fix the
+  runaway anyway. It was a diagnostic override only and is not in the tree.
+- **The share stays 1 GiB.** The runaway grows at 50–150 MB/s for as long as
+  the compositor reaches no flush point, which is unbounded; a larger share only
+  delays the refusal and raises what a hostile guest pins (2 GiB renderer-wide).
+- The context-creation log now says what the guest was told:
+  `heaps=[…] host_visible_share=… zink_flush_threshold=…`.
+
+### Next limits, revised
+
+1. The blanked-compositor hold is not the renderer's to size away. What can
+   end it is guest-side: `idle-delay 0` (no blank) on the demo image, or a
+   mutter/Zink that flushes uploads while the CRTC is off. On the renderer side
+   the only remaining lever is making a refused allocation survivable, which
+   Mesa's asynchronous `vkAllocateMemory` makes a protocol change, not a policy.
+2. Host-visible allocation throughput (unchanged).
+3. Renderer-wide bounds for host Vulkan objects and transient decode memory
+   (unchanged).
