@@ -595,6 +595,11 @@ impl<H: HostVulkan> VulkanContext<H> {
                         ?heaps,
                         host_visible_share = share,
                         zink_flush_threshold = policy::zink_flush_threshold(&guest.memory),
+                        wsi = guest.wsi.name(),
+                        driver_version = format_args!(
+                            "{:#x}",
+                            guest.properties.properties.driver_version
+                        ),
                         "exposing a host Vulkan device to the guest"
                     );
                     devices.push(ExposedDevice {
@@ -1835,7 +1840,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 ),
             ));
         }
-        let layout = ModifierLayout::new(info.extent.width, info.extent.height);
+        let layout = ModifierLayout::new(info.format, info.extent.width, info.extent.height);
         if let ModifierChoice::Explicit(plane) = choice {
             if plane.offset != 0 || plane.row_pitch != layout.row_pitch {
                 return Ok(Err(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT));

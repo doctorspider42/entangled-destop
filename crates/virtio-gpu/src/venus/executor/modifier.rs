@@ -39,7 +39,11 @@
 //! Nothing the guest chose beyond `F`, `W`, `H` and the initial layout
 //! reaches the host image: its usage must be a subset of the superset, its
 //! flags of the canonical flags, its view formats of the canonical list, or
-//! the create is refused. So two guest processes that create "the same"
+//! the create is refused. Two flags are the exception: `ALIAS` and
+//! `EXTENDED_USAGE` ([`IGNORED_FLAGS`]) are accepted and not forwarded,
+//! because Mesa's WSI creates every swapchain image with the first and every
+//! mutable one with the second (`wsi_configure_image`, `wsi_common.c:671`,
+//! `:706-707`) and neither changes what the canonical image already is. So two guest processes that create "the same"
 //! LINEAR image — the exporter with `VkImageDrmFormatModifierListCreateInfoEXT`,
 //! the importer with `VkImageDrmFormatModifierExplicitCreateInfoEXT` and
 //! whatever usage each wants — get byte-identical host create infos, and with
@@ -121,26 +125,86 @@ pub const IMAGE_ASPECT_MEMORY_PLANE_0: u32 = 0x80;
 /// and every GBM backend here expect of a linear buffer.
 pub const PITCH_ALIGNMENT: u64 = 256;
 
-/// `VK_FORMAT_R8G8B8A8_UNORM` / `_SRGB`, `VK_FORMAT_B8G8R8A8_UNORM` /
-/// `_SRGB`, `VK_FORMAT_A2R10G10B10_UNORM_PACK32`,
-/// `VK_FORMAT_A2B10G10R10_UNORM_PACK32`: the scanout formats, each with its
-/// sRGB/UNORM twin if it has one. `XRGB8888`/`ARGB8888` are
-/// `B8G8R8A8_UNORM` in Vulkan (Zink's `B8G8R8X8` too), `XBGR8888` is
-/// `R8G8B8A8_UNORM`, and the 10-bit pair are the 30-bit fourccs.
-pub const SCANOUT_FORMATS: &[(i32, Option<i32>)] = &[
-    (37, Some(43)),
-    (43, Some(37)),
-    (44, Some(50)),
-    (50, Some(44)),
-    (58, None),
-    (64, None),
+/// The formats `DRM_FORMAT_MOD_LINEAR` is offered for, each with its
+/// sRGB/UNORM twin if it has one and its bytes per pixel: every single-plane
+/// colour format a Wayland client's swapchain can be made of
+/// (`wsi_wl_display_add_drm_format_modifier`, `wsi_common_wayland.c:406-619`).
+///
+/// * `VK_FORMAT_R8G8B8A8_UNORM` / `_SRGB`, `VK_FORMAT_B8G8R8A8_UNORM` /
+///   `_SRGB` (stage S1): `XRGB8888`/`ARGB8888` are `B8G8R8A8_UNORM` in
+///   Vulkan (Zink's `B8G8R8X8` too), `XBGR8888`/`ABGR8888` `R8G8B8A8_UNORM`;
+/// * `VK_FORMAT_A2R10G10B10_UNORM_PACK32`, `VK_FORMAT_A2B10G10R10_UNORM_PACK32`:
+///   the 30-bit fourccs;
+/// * (stage S5) `VK_FORMAT_R16G16B16A16_SFLOAT` and `_UNORM`: the 64-bit
+///   fourccs. Under GNOME on the GPU the guest's WSI lists
+///   `R16G16B16A16_SFLOAT` as its first surface format (measured), and
+///   vkcube takes the first surface format it knows (`cube.c:4608-4625`);
+/// * (stage S5) the 16-bit packed formats `R5G6B5`, `B5G6R5`, `A1R5G5B5`,
+///   `R5G5B5A1`, `B5G5R5A1`, `R4G4B4A4`, `B4G4R4A4`.
+///
+/// A format a client can pick *without* LINEAR sends Mesa's WSI down its
+/// prime path (`wsi_drm_image_needs_buffer_blit`, `wsi_common_drm.c:893-904`),
+/// whose blit buffer must find a device-local type among the `DMA_BUF`
+/// buffer's memory types (`wsi_select_device_memory_type`,
+/// `wsi_common.c:1922-1959`). A `DMA_BUF` buffer here lives in our pages,
+/// which are not device-local, and Mesa's `UNREACHABLE` there is undefined
+/// behaviour: a release build spins forever (measured, vkcube on
+/// `R16G16B16A16_SFLOAT`). So every format a swapchain can use is here, and
+/// the ones the host cannot make canonical are simply not offered.
+pub const SCANOUT_FORMATS: &[(i32, Option<i32>, u64)] = &[
+    (37, Some(43), 4),
+    (43, Some(37), 4),
+    (44, Some(50), 4),
+    (50, Some(44), 4),
+    (58, None, 4),
+    (64, None, 4),
+    (97, None, 8),
+    (91, None, 8),
+    (4, None, 2),
+    (5, None, 2),
+    (8, None, 2),
+    (6, None, 2),
+    (7, None, 2),
+    (2, None, 2),
+    (3, None, 2),
 ];
 
-/// Bytes per pixel of every scanout format.
-pub const SCANOUT_BYTES_PER_PIXEL: u64 = 4;
+/// Bytes per pixel of a [`SCANOUT_FORMATS`] format, and of the BGRA pair
+/// a handle-blob scanout reads.
+#[must_use]
+pub fn bytes_per_pixel(format: i32) -> u64 {
+    SCANOUT_FORMATS
+        .iter()
+        .find(|(f, _, _)| *f == format)
+        .map_or(4, |(_, _, bpp)| *bpp)
+}
 
 /// `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`.
 const MUTABLE_FORMAT: u32 = 0x8;
+/// `VK_IMAGE_CREATE_EXTENDED_USAGE_BIT`.
+const EXTENDED_USAGE: u32 = 0x100;
+/// `VK_IMAGE_CREATE_ALIAS_BIT`.
+const ALIAS: u32 = 0x400;
+
+/// Create flags a guest's modifier image may carry that the canonical image
+/// does not, accepted and never forwarded (stage S5):
+///
+/// * `ALIAS`: Mesa's WSI sets it on every swapchain image
+///   (`wsi_common.c:671`), and venus forwards it for every driver but ANV
+///   (`vn_physical_device.c:2831-2841`). It promises that two images of
+///   identical parameters bound to the same memory read it the same way.
+///   Every canonical image of one format and extent has *byte-identical*
+///   host create infos, all for `OPAQUE_WIN32` external memory, whose layout
+///   is fixed by those parameters alone — the guarantee an import across
+///   devices already relies on, and one that covers two images of one device
+///   too. Forwarding it would instead make an exporter's host image differ
+///   from an importer's that lacks it.
+/// * `EXTENDED_USAGE`: set with `MUTABLE_FORMAT` by the WSI for a mutable
+///   swapchain (`wsi_common.c:706-707`, Zink's kopper), allowing usage that
+///   only a view format supports. The guest's usage is still held to the
+///   superset of `F` itself, which the host accepted without the flag, so
+///   the flag permits nothing the host image lacks.
+pub const IGNORED_FLAGS: u32 = ALIAS | EXTENDED_USAGE;
 
 // VkFormatFeatureFlagBits the usage superset is derived from.
 const FEATURE_SAMPLED_IMAGE: u32 = 0x1;
@@ -173,8 +237,8 @@ const TILING_OPTIMAL: i32 = 0;
 pub fn scanout_format(format: i32) -> Option<Option<i32>> {
     SCANOUT_FORMATS
         .iter()
-        .find(|(f, _)| *f == format)
-        .map(|(_, twin)| *twin)
+        .find(|(f, _, _)| *f == format)
+        .map(|(_, twin, _)| *twin)
 }
 
 /// The usage an optimal image of a format with `features` could have, among
@@ -213,10 +277,10 @@ pub struct ModifierLayout {
 }
 
 impl ModifierLayout {
-    /// The layout of a `width × height` scanout image.
+    /// The layout of a `width × height` image of `format`.
     #[must_use]
-    pub fn new(width: u32, height: u32) -> Self {
-        let row = u64::from(width).saturating_mul(SCANOUT_BYTES_PER_PIXEL);
+    pub fn new(format: i32, width: u32, height: u32) -> Self {
+        let row = u64::from(width).saturating_mul(bytes_per_pixel(format));
         Self {
             width,
             height,
@@ -348,7 +412,7 @@ impl CanonicalImage {
     /// The synthesized plane the guest was told for this image.
     #[must_use]
     pub fn layout(&self) -> ModifierLayout {
-        ModifierLayout::new(self.width, self.height)
+        ModifierLayout::new(self.format, self.width, self.height)
     }
 
     /// Whether its bytes are in BGRA order ([`SCANOUT_BGRA_FORMATS`]).
@@ -397,12 +461,13 @@ impl CanonicalFormat {
     }
 
     /// Whether a guest's `flags` and view formats fit the canonical ones:
-    /// flags a subset, and — for a mutable request — a non-empty list inside
-    /// the canonical one (`VUID-VkImageCreateInfo-tiling-02353` requires the
-    /// list of a mutable modifier image).
+    /// flags a subset once [`IGNORED_FLAGS`] are set aside, and — for a
+    /// mutable request — a non-empty list inside the canonical one
+    /// (`VUID-VkImageCreateInfo-tiling-02353` requires the list of a mutable
+    /// modifier image).
     #[must_use]
     pub fn admits(&self, flags: u32, view_formats: Option<&[i32]>) -> bool {
-        if flags & !self.flags != 0 {
+        if flags & !(self.flags | IGNORED_FLAGS) != 0 {
             return false;
         }
         let list = view_formats.unwrap_or_default();
@@ -627,12 +692,12 @@ mod tests {
 
     #[test]
     fn the_synthesized_plane_is_a_256_aligned_linear_layout() {
-        let l = ModifierLayout::new(1920, 1080);
+        let l = ModifierLayout::new(44, 1920, 1080);
         assert_eq!(l.row_pitch, 7680);
         assert_eq!(l.size(), 7680 * 1080);
         let p = l.plane();
         assert_eq!((p.offset, p.row_pitch, p.size), (0, 7680, 7680 * 1080));
-        let odd = ModifierLayout::new(1, 3);
+        let odd = ModifierLayout::new(44, 1, 3);
         assert_eq!(odd.row_pitch, 256);
         assert_eq!(odd.size(), 768);
         // The requirement is raised to the plane, and stays aligned.
@@ -642,7 +707,7 @@ mod tests {
         assert!(l.requirement(4096, 0x1_0000) >= l.size());
         // A width no row can hold saturates rather than wraps.
         assert_eq!(
-            ModifierLayout::new(u32::MAX, 2).row_pitch % PITCH_ALIGNMENT,
+            ModifierLayout::new(44, u32::MAX, 2).row_pitch % PITCH_ALIGNMENT,
             0
         );
     }
@@ -662,5 +727,20 @@ mod tests {
         assert_eq!(scanout_format(44), Some(Some(50)));
         assert_eq!(scanout_format(58), Some(None));
         assert_eq!(scanout_format(100), None);
+        // Stage S5: the formats a swapchain can pick, at their own sizes.
+        assert_eq!(scanout_format(97), Some(None));
+        assert_eq!(bytes_per_pixel(97), 8);
+        assert_eq!(bytes_per_pixel(4), 2);
+        assert_eq!(bytes_per_pixel(44), 4);
+        assert_eq!(ModifierLayout::new(97, 500, 500).row_pitch, 4096);
+        assert_eq!(ModifierLayout::new(4, 500, 500).row_pitch, 1024);
+        assert_eq!(ModifierLayout::new(44, 500, 500).row_pitch, 2048);
+        for (format, twin, bpp) in SCANOUT_FORMATS {
+            assert!(policy::is_core_format(*format), "{format}");
+            assert!(matches!(bpp, 2 | 4 | 8), "{format}");
+            if let Some(twin) = twin {
+                assert_eq!(scanout_format(*twin), Some(Some(*format)));
+            }
+        }
     }
 }

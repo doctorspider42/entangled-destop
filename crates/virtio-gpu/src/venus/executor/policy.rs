@@ -44,10 +44,11 @@
 //!   `VK_EXT_image_drm_format_modifier`, emulated with `DRM_FORMAT_MOD_LINEAR`
 //!   alone (`executor::modifier`) — both only where device-local memory can
 //!   be exported as a host handle ([`GuestDevice::memory_export`]).
-//! * **The identity is shaped** ([`shape_identity`], stage 5c): an NVIDIA
-//!   device is shown with the virtio PCI vendor, and an NVIDIA driver new
-//!   enough for venus's dma-buf WSI is shown just below it. vkr forwards
-//!   both.
+//! * **The identity is shaped** ([`shape_identity`], stages 5c and S5): an
+//!   NVIDIA device is shown with the virtio PCI vendor, and an NVIDIA driver
+//!   on the side of venus's dma-buf WSI gate its [`GuestWsi`] needs — at
+//!   or past it where device-local memory can be exported (the guest's
+//!   swapchains are then dma-bufs), below it elsewhere. vkr forwards both.
 //! * **The capset's extension mask is what [`admits_link`] admits**
 //!   ([`admitted_extension_numbers`]), not everything the protocol decodes.
 //!   vkr advertises its whole decode table (`vkr_renderer.c:40-48`) because
@@ -678,30 +679,88 @@ pub fn passes_through(name: &str, api: u32) -> bool {
 ///   version this renderer implements (clamped to the protocol's too).
 ///
 /// Every structure they bring is inside [`admits_link`]. This is the set
-/// for a device whose guest WSI stays on its software path, and which can
-/// export device-local memory exactly when the host lists
-/// `VK_KHR_external_memory_win32` ([`advertised_extensions_on`]).
+/// for an NVIDIA device ([`GuestWsi::for_device`]): dma-buf WSI where the
+/// host lists `VK_KHR_external_memory_win32`, the software WSI elsewhere
+/// ([`advertised_extensions_on`]).
 #[must_use]
 pub fn advertised_extensions(
     host: &[VkExtensionProperties],
     api: u32,
 ) -> Vec<VkExtensionProperties> {
-    advertised_extensions_on(host, api, true, has_extension(host, EXTERNAL_MEMORY_WIN32))
+    let memory_export = has_extension(host, EXTERNAL_MEMORY_WIN32);
+    let wsi = GuestWsi::for_device(Some(DRIVER_ID_NVIDIA_PROPRIETARY), memory_export);
+    advertised_extensions_on(host, api, wsi, memory_export)
 }
 
-/// [`advertised_extensions`] for a device whose identity does
-/// (`software_wsi`) or does not keep Mesa 26.0.8's WSI on its software
-/// path ([`keeps_software_wsi`]), and which can (`memory_export`) or cannot
-/// export device-local memory as a host handle ([`GuestDevice::memory_export`]).
+/// Which of Mesa 26.0.8's venus WSI paths a guest device is put on
+/// (`vn_wsi_init`, `vn_wsi.c:134-139`), and so which of the dma-buf
+/// extensions it can be shown. Venus chooses the path from what it sees: the
+/// dma-buf pair listed or not, and the renderer's `driverID` and
+/// `driverVersion` — which [`shape_identity`] shapes for exactly this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestWsi {
+    /// **Native dma-buf WSI (stage S5).** Swapchain images are LINEAR
+    /// DRM-modifier images in exportable device-local memory — S1's
+    /// canonical images and handle blobs — handed to the compositor through
+    /// `zwp_linux_dmabuf_v1` and synchronised by a `SYNC_FD` sync file the
+    /// client puts on the dma-buf. Needs [`GuestDevice::memory_export`]. The
+    /// dma-buf pair, `VK_EXT_queue_family_foreign` and the emulated
+    /// `VK_EXT_image_drm_format_modifier` are all shown, and an NVIDIA
+    /// driver is shown at [`NVIDIA_DMA_BUF_WSI_DRIVER`] or newer.
+    DmaBuf,
+    /// **Software WSI**: images rendered on the GPU, copied into host-visible
+    /// memory and sent to the compositor as `wl_shm`. The dma-buf pair is
+    /// shown (Zink's memory over our pages, stage 5c), and an NVIDIA driver
+    /// is shown below [`NVIDIA_DMA_BUF_WSI_DRIVER`], which keeps venus here
+    /// with the pair listed.
+    Software,
+    /// Neither: the dma-buf pair is not shown. Listing it would put venus on
+    /// its native path on a driver that is not NVIDIA's, and that path needs
+    /// exports this renderer makes only through the S1 emulation, never
+    /// measured on another vendor's driver. The guest keeps the software WSI
+    /// and Zink its software GL.
+    Unshared,
+}
+
+impl GuestWsi {
+    /// The path for a device of `driver_id` that can (`memory_export`) or
+    /// cannot export device-local memory: native dma-buf WSI for an NVIDIA
+    /// driver that can, the software WSI for one that cannot, and no dma-buf
+    /// for any other driver.
+    #[must_use]
+    pub fn for_device(driver_id: Option<i32>, memory_export: bool) -> Self {
+        match (
+            driver_id == Some(DRIVER_ID_NVIDIA_PROPRIETARY),
+            memory_export,
+        ) {
+            (true, true) => Self::DmaBuf,
+            (true, false) => Self::Software,
+            (false, _) => Self::Unshared,
+        }
+    }
+
+    /// Its name in logs.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::DmaBuf => "dma-buf",
+            Self::Software => "software",
+            Self::Unshared => "software, no dma-buf",
+        }
+    }
+}
+
+/// [`advertised_extensions`] for a device put on the guest WSI path `wsi`,
+/// which can (`memory_export`) or cannot export device-local memory as a
+/// host handle ([`GuestDevice::memory_export`]).
 ///
-/// **The emulated dma-buf pair is advertised only where the WSI stays
-/// software.** Listing `VK_EXT_external_memory_dma_buf` is also what moves
-/// venus's WSI to its native dma-buf path (`vn_wsi.c:134-139`) — swapchain
-/// images exported to the guest's compositor as dma-bufs — for every
-/// renderer but an NVIDIA driver older than 590.48.01, which
-/// [`shape_identity`] makes every NVIDIA driver look like. On any other host
-/// the pair would trade a working swapchain for Zink's DRM screen, so it is
-/// not offered there, and Zink there stays on the guest's software GL.
+/// **The emulated dma-buf pair is advertised on either dma-buf path**
+/// ([`GuestWsi::DmaBuf`], [`GuestWsi::Software`]) and never on
+/// [`GuestWsi::Unshared`]. Listing `VK_EXT_external_memory_dma_buf` is
+/// also what moves venus's WSI to its native dma-buf path
+/// (`vn_wsi.c:134-139`) for every renderer but an NVIDIA driver older than
+/// 590.48.01; [`shape_identity`] shows each NVIDIA driver on the side of
+/// that line its path needs.
 ///
 /// **`VK_EXT_queue_family_foreign` and the emulated
 /// `VK_EXT_image_drm_format_modifier` (stage S1) go with the pair, and only
@@ -710,15 +769,19 @@ pub fn advertised_extensions(
 /// buffer through Zink instead of as a dumb buffer (`gbm_dri.c:902-903`); a
 /// host whose device-local memory cannot leave its device (a Linux host
 /// here: no `OPAQUE_WIN32`) would fail every such allocation, so it keeps
-/// the dumb buffers.
+/// the dumb buffers. They are also what the native WSI builds its swapchain
+/// images from (`wsi_configure_native_image`), which is why
+/// [`GuestWsi::for_device`] never chooses [`GuestWsi::DmaBuf`] without
+/// `memory_export`.
 #[must_use]
 pub fn advertised_extensions_on(
     host: &[VkExtensionProperties],
     api: u32,
-    software_wsi: bool,
+    wsi: GuestWsi,
     memory_export: bool,
 ) -> Vec<VkExtensionProperties> {
-    let gnome_on_gpu = software_wsi && memory_export;
+    let dma_buf = wsi != GuestWsi::Unshared;
+    let gnome_on_gpu = dma_buf && memory_export;
     let mut out: Vec<VkExtensionProperties> = host
         .iter()
         .filter_map(|ext| {
@@ -736,7 +799,7 @@ pub fn advertised_extensions_on(
         let Some(known) = EXTENSIONS.iter().find(|e| e.name == *name && e.decodable) else {
             continue;
         };
-        if !software_wsi && (*name == EXTERNAL_MEMORY_DMA_BUF || *name == EXTERNAL_MEMORY_FD) {
+        if !dma_buf && (*name == EXTERNAL_MEMORY_DMA_BUF || *name == EXTERNAL_MEMORY_FD) {
             continue;
         }
         if !gnome_on_gpu && *name == IMAGE_DRM_FORMAT_MODIFIER {
@@ -900,6 +963,9 @@ pub struct GuestDevice {
     /// given resource may then live in such memory is the host's answer for
     /// `OPAQUE_WIN32`, asked per resource.
     pub memory_export: bool,
+    /// The guest WSI path the identity and the extensions were shaped for
+    /// (stage S5).
+    pub wsi: GuestWsi,
 }
 
 impl GuestDevice {
@@ -1016,9 +1082,21 @@ pub const fn nvidia_version(major: u32, minor: u32, sub_minor: u32, patch: u32) 
 /// (`vn_wsi.c:134-139`).
 pub const NVIDIA_DMA_BUF_WSI_DRIVER: u32 = nvidia_version(590, 48, 1, 0);
 
-/// What a newer NVIDIA driver is reported as: 590.48.0.0, just below
-/// [`NVIDIA_DMA_BUF_WSI_DRIVER`].
+/// What a newer NVIDIA driver is reported as on [`GuestWsi::Software`]:
+/// 590.48.0.0, just below [`NVIDIA_DMA_BUF_WSI_DRIVER`].
 pub const NVIDIA_SOFTWARE_WSI_DRIVER: u32 = nvidia_version(590, 48, 0, 0);
+
+/// The `driverID` of a device's properties chain, from
+/// `VkPhysicalDeviceVulkan12Properties` or `VkPhysicalDeviceDriverProperties`.
+#[must_use]
+pub fn driver_id(properties: &VkPhysicalDeviceProperties2) -> Option<i32> {
+    use crate::venus::protocol::VkPhysicalDeviceProperties2Next as N;
+    properties.p_next.iter().find_map(|link| match link {
+        N::VkPhysicalDeviceVulkan12Properties(p) => Some(p.driver_id),
+        N::VkPhysicalDeviceDriverProperties(p) => Some(p.driver_id),
+        _ => None,
+    })
+}
 
 /// Shape the identity the guest is shown (stage 5c), in `Properties` and so
 /// in `Properties2` too (both answer from this one structure):
@@ -1037,34 +1115,37 @@ pub const NVIDIA_SOFTWARE_WSI_DRIVER: u32 = nvidia_version(590, 48, 0, 0);
 ///   choose pdev"). What keys NVIDIA-specific workarounds — Zink's and
 ///   venus's own (`zink_screen.c:2943`, `vn_query_pool.c:135`) — is
 ///   `driverID`, which stays the host's.
-/// * **While this renderer cannot present through a dma-buf, an NVIDIA
-///   driver is shown below the dma-buf WSI gate**: `driverVersion` capped at
-///   [`NVIDIA_SOFTWARE_WSI_DRIVER`] when `driverID` is
-///   `NVIDIA_PROPRIETARY`. Advertising `VK_EXT_external_memory_dma_buf` (for
-///   Zink) would otherwise put venus's WSI on its native dma-buf path for a
-///   590.48.01-or-newer host driver (`vn_wsi.c:134-139`), and that path needs
-///   exports this renderer cannot make — images with DRM format modifiers,
-///   scanned out by the guest's compositor. The guest shows its own
-///   `driverVersion` to applications anyway (`vn_physical_device.c:550-554`);
-///   the host's is only what venus's workarounds read. **Removing this cap is
-///   the switch that turns dma-buf WSI on**, once there is a dma-buf path to
-///   turn on. (The RTX 2070's driver today is 580.88, which the cap leaves
-///   as it is.)
-pub fn shape_identity(properties: &mut VkPhysicalDeviceProperties2) {
-    use crate::venus::protocol::VkPhysicalDeviceProperties2Next as N;
-    let driver_id = properties.p_next.iter().find_map(|link| match link {
-        N::VkPhysicalDeviceVulkan12Properties(p) => Some(p.driver_id),
-        N::VkPhysicalDeviceDriverProperties(p) => Some(p.driver_id),
-        _ => None,
-    });
+/// * **An NVIDIA driver is shown on the side of venus's dma-buf WSI gate
+///   (`vn_wsi.c:134-139`, 590.48.01) that `wsi` needs**, when `driverID` is
+///   `NVIDIA_PROPRIETARY`: at least [`NVIDIA_DMA_BUF_WSI_DRIVER`] for
+///   [`GuestWsi::DmaBuf`] (stage S5); below it for [`GuestWsi::Software`],
+///   a driver at or past it shown as [`NVIDIA_SOFTWARE_WSI_DRIVER`]
+///   (stage 5c). [`GuestWsi::Unshared`] lists no dma-buf,
+///   so there the version decides nothing and is left alone. The gate is
+///   venus's trust in the *NVIDIA Linux driver's* dma-buf handling. The
+///   dma-bufs a guest of this renderer shares are S1's canonical images in
+///   exported Win32 memory, whatever the host driver's version, so the
+///   host's own number (580.88 on the RTX 2070 today, below the gate) says
+///   nothing about them. Venus reads `driverVersion` for this gate alone
+///   (`vn_wsi.c:138`), and the guest shows applications its own
+///   `driverVersion` anyway (`vn_physical_device.c:550-554`).
+pub fn shape_identity(properties: &mut VkPhysicalDeviceProperties2, wsi: GuestWsi) {
+    let nvidia_driver = driver_id(properties) == Some(DRIVER_ID_NVIDIA_PROPRIETARY);
     let core = &mut properties.properties;
     if core.vendor_id == NVIDIA_VENDOR_ID {
         core.vendor_id = VIRTIO_PCI_VENDOR_ID;
     }
-    if driver_id == Some(DRIVER_ID_NVIDIA_PROPRIETARY)
-        && core.driver_version >= NVIDIA_DMA_BUF_WSI_DRIVER
-    {
-        core.driver_version = NVIDIA_SOFTWARE_WSI_DRIVER;
+    if nvidia_driver {
+        match wsi {
+            GuestWsi::DmaBuf => {
+                core.driver_version = core.driver_version.max(NVIDIA_DMA_BUF_WSI_DRIVER);
+            }
+            GuestWsi::Software if core.driver_version >= NVIDIA_DMA_BUF_WSI_DRIVER => {
+                core.driver_version = NVIDIA_SOFTWARE_WSI_DRIVER;
+            }
+            GuestWsi::Software => {}
+            GuestWsi::Unshared => {}
+        }
     }
 }
 
@@ -1088,17 +1169,11 @@ pub fn device_uuids(properties: &VkPhysicalDeviceProperties2) -> Option<([u8; 16
 /// Whether Mesa 26.0.8's venus keeps its WSI on the software path for a
 /// device shown with `properties` even when the renderer lists
 /// `VK_EXT_external_memory_dma_buf`: an NVIDIA driver older than 590.48.01
-/// (`vn_wsi.c:134-139`), which is every NVIDIA driver after
-/// [`shape_identity`].
+/// (`vn_wsi.c:134-139`). After [`shape_identity`] that is exactly an NVIDIA
+/// device on [`GuestWsi::Software`].
 #[must_use]
 pub fn keeps_software_wsi(properties: &VkPhysicalDeviceProperties2) -> bool {
-    use crate::venus::protocol::VkPhysicalDeviceProperties2Next as N;
-    let driver_id = properties.p_next.iter().find_map(|link| match link {
-        N::VkPhysicalDeviceVulkan12Properties(p) => Some(p.driver_id),
-        N::VkPhysicalDeviceDriverProperties(p) => Some(p.driver_id),
-        _ => None,
-    });
-    driver_id == Some(DRIVER_ID_NVIDIA_PROPRIETARY)
+    driver_id(properties) == Some(DRIVER_ID_NVIDIA_PROPRIETARY)
         && properties.properties.driver_version < NVIDIA_DMA_BUF_WSI_DRIVER
 }
 
@@ -1136,15 +1211,16 @@ pub fn expose(info: HostDeviceInfo) -> Result<GuestDevice, Hidden> {
     let mut properties = info.properties;
     properties.properties.api_version =
         cap_minor(properties.properties.api_version, MAX_API_VERSION);
-    shape_identity(&mut properties);
-    let mut features = info.features;
-    mask_features(&mut features);
     let memory_export = has_extension(&info.extensions, EXTERNAL_MEMORY_WIN32)
         && device_uuids(&properties).is_some();
+    let wsi = GuestWsi::for_device(driver_id(&properties), memory_export);
+    shape_identity(&mut properties, wsi);
+    let mut features = info.features;
+    mask_features(&mut features);
     let extensions = advertised_extensions_on(
         &info.extensions,
         properties.properties.api_version,
-        keeps_software_wsi(&properties),
+        wsi,
         memory_export,
     );
     Ok(GuestDevice {
@@ -1157,6 +1233,7 @@ pub fn expose(info: HostDeviceInfo) -> Result<GuestDevice, Hidden> {
         importable,
         import_alignment,
         memory_export,
+        wsi,
     })
 }
 
@@ -1700,11 +1777,12 @@ mod tests {
         }
     }
 
-    /// Stage 5c: an NVIDIA device is shown with the virtio vendor, and a
-    /// driver new enough for venus's dma-buf WSI below it; everything else
-    /// — device id, name, driver id — is the host's.
+    /// Stages 5c and S5: an NVIDIA device is shown with the virtio vendor,
+    /// and a driver on the side of venus's dma-buf WSI gate its path needs —
+    /// at or past it for dma-buf WSI, below it for the software WSI;
+    /// everything else — device id, name, driver id — is the host's.
     #[test]
-    fn the_identity_is_the_virtio_vendor_and_a_software_wsi_nvidia_driver() {
+    fn the_identity_is_the_virtio_vendor_and_a_driver_on_its_wsi_side_of_the_gate() {
         use crate::venus::protocol::{
             VkPhysicalDeviceProperties2Next as N, VkPhysicalDeviceVulkan12Properties,
         };
@@ -1729,78 +1807,145 @@ mod tests {
             (590 << 22) | (48 << 14) | (1 << 6)
         );
         const _: () = assert!(NVIDIA_SOFTWARE_WSI_DRIVER < NVIDIA_DMA_BUF_WSI_DRIVER);
-
-        // Today's driver: the vendor changes, the version does not.
-        let mut today = nvidia(nvidia_version(580, 88, 0, 0), DRIVER_ID_NVIDIA_PROPRIETARY);
-        shape_identity(&mut today);
-        assert_eq!(today.properties.vendor_id, VIRTIO_PCI_VENDOR_ID);
-        assert_eq!(today.properties.device_id, 0x1f02);
+        let today = nvidia_version(580, 88, 0, 0);
         assert_eq!(
-            today.properties.driver_version,
-            nvidia_version(580, 88, 0, 0)
+            driver_id(&nvidia(today, DRIVER_ID_NVIDIA_PROPRIETARY)),
+            Some(DRIVER_ID_NVIDIA_PROPRIETARY)
         );
+
+        // The path: dma-buf for NVIDIA with an export, software without,
+        // and no dma-buf for any other driver.
+        let nv = Some(DRIVER_ID_NVIDIA_PROPRIETARY);
+        assert_eq!(GuestWsi::for_device(nv, true), GuestWsi::DmaBuf);
+        assert_eq!(GuestWsi::for_device(nv, false), GuestWsi::Software);
+        assert_eq!(GuestWsi::for_device(Some(1), true), GuestWsi::Unshared);
+        assert_eq!(GuestWsi::for_device(None, true), GuestWsi::Unshared);
+
+        // Dma-buf WSI: today's 580.88 is shown at the gate, which is what
+        // turns venus's native WSI on; anything newer is left as it is.
+        let mut shown = nvidia(today, DRIVER_ID_NVIDIA_PROPRIETARY);
+        shape_identity(&mut shown, GuestWsi::DmaBuf);
+        assert_eq!(shown.properties.vendor_id, VIRTIO_PCI_VENDOR_ID);
+        assert_eq!(shown.properties.device_id, 0x1f02);
+        assert_eq!(shown.properties.driver_version, NVIDIA_DMA_BUF_WSI_DRIVER);
+        assert!(!keeps_software_wsi(&shown), "venus takes its dma-buf path");
         assert_eq!(
-            c_name(&today.properties.device_name),
+            c_name(&shown.properties.device_name),
             b"NVIDIA GeForce RTX 2070"
         );
         assert_eq!(
-            today.p_next,
+            shown.p_next,
             nvidia(0, DRIVER_ID_NVIDIA_PROPRIETARY).p_next,
             "driverID stays the host's"
         );
+        for version in [nvidia_version(595, 10, 0, 0), u32::MAX] {
+            let mut newer = nvidia(version, DRIVER_ID_NVIDIA_PROPRIETARY);
+            shape_identity(&mut newer, GuestWsi::DmaBuf);
+            assert_eq!(newer.properties.driver_version, version);
+        }
 
-        // The gate itself and anything newer: capped just below it.
+        // Software WSI: today's driver is left alone, the gate itself and
+        // anything newer is capped just below it.
+        let mut software = nvidia(today, DRIVER_ID_NVIDIA_PROPRIETARY);
+        shape_identity(&mut software, GuestWsi::Software);
+        assert_eq!(software.properties.vendor_id, VIRTIO_PCI_VENDOR_ID);
+        assert_eq!(software.properties.driver_version, today);
+        assert!(keeps_software_wsi(&software));
         for version in [
             NVIDIA_DMA_BUF_WSI_DRIVER,
             nvidia_version(595, 10, 0, 0),
             u32::MAX,
         ] {
             let mut newer = nvidia(version, DRIVER_ID_NVIDIA_PROPRIETARY);
-            shape_identity(&mut newer);
+            shape_identity(&mut newer, GuestWsi::Software);
             assert_eq!(newer.properties.driver_version, NVIDIA_SOFTWARE_WSI_DRIVER);
+            assert!(keeps_software_wsi(&newer));
         }
-        // One below the gate is left alone.
         let mut below = nvidia(NVIDIA_DMA_BUF_WSI_DRIVER - 1, DRIVER_ID_NVIDIA_PROPRIETARY);
-        shape_identity(&mut below);
+        shape_identity(&mut below, GuestWsi::Software);
         assert_eq!(
             below.properties.driver_version,
             NVIDIA_DMA_BUF_WSI_DRIVER - 1
         );
 
-        // Another driver's version is never touched, and another vendor
-        // keeps its id.
-        let mut other = nvidia(u32::MAX, 1);
-        other.properties.vendor_id = 0x1002;
-        shape_identity(&mut other);
-        assert_eq!(other.properties.vendor_id, 0x1002);
-        assert_eq!(other.properties.driver_version, u32::MAX);
+        // Another driver's version is never touched, on any path, and another
+        // vendor keeps its id.
+        for wsi in [GuestWsi::DmaBuf, GuestWsi::Software, GuestWsi::Unshared] {
+            let mut other = nvidia(u32::MAX, 1);
+            other.properties.vendor_id = 0x1002;
+            shape_identity(&mut other, wsi);
+            assert_eq!(other.properties.vendor_id, 0x1002);
+            assert_eq!(other.properties.driver_version, u32::MAX);
+            assert!(!keeps_software_wsi(&other));
+        }
 
-        // What the shaping buys: venus keeps the software WSI for every
-        // NVIDIA driver, so the dma-buf pair can be advertised there; for
-        // another driver it cannot, and is not.
-        let mut newest = nvidia(u32::MAX, DRIVER_ID_NVIDIA_PROPRIETARY);
-        shape_identity(&mut newest);
-        assert!(keeps_software_wsi(&newest));
-        assert!(keeps_software_wsi(&today));
-        assert!(!keeps_software_wsi(&other));
+        // What each path is shown.
         let host = [VkExtensionProperties {
             extension_name: name_array(TRANSFORM_FEEDBACK),
             spec_version: 1,
         }];
-        let on_other = advertised_extensions_on(&host, MAX_API_VERSION, false, true);
-        assert!(has_extension(&on_other, TRANSFORM_FEEDBACK));
-        assert!(has_extension(&on_other, EXTERNAL_SEMAPHORE_FD));
-        assert!(!has_extension(&on_other, EXTERNAL_MEMORY_DMA_BUF));
-        assert!(!has_extension(&on_other, EXTERNAL_MEMORY_FD));
+        let unshared = advertised_extensions_on(&host, MAX_API_VERSION, GuestWsi::Unshared, true);
+        assert!(has_extension(&unshared, TRANSFORM_FEEDBACK));
+        assert!(has_extension(&unshared, EXTERNAL_SEMAPHORE_FD));
+        assert!(!has_extension(&unshared, EXTERNAL_MEMORY_DMA_BUF));
+        assert!(!has_extension(&unshared, EXTERNAL_MEMORY_FD));
         assert!(
-            !has_extension(&on_other, IMAGE_DRM_FORMAT_MODIFIER),
+            !has_extension(&unshared, IMAGE_DRM_FORMAT_MODIFIER),
             "stage S1 goes with the dma-buf pair"
         );
-        let on_nvidia = advertised_extensions_on(&host, MAX_API_VERSION, true, false);
-        assert!(has_extension(&on_nvidia, EXTERNAL_MEMORY_DMA_BUF));
-        assert!(!has_extension(&on_nvidia, IMAGE_DRM_FORMAT_MODIFIER));
-        let exporting = advertised_extensions_on(&host, MAX_API_VERSION, true, true);
+        let software = advertised_extensions_on(&host, MAX_API_VERSION, GuestWsi::Software, false);
+        assert!(has_extension(&software, EXTERNAL_MEMORY_DMA_BUF));
+        assert!(has_extension(&software, EXTERNAL_MEMORY_FD));
+        assert!(!has_extension(&software, IMAGE_DRM_FORMAT_MODIFIER));
+        let exporting = advertised_extensions_on(&host, MAX_API_VERSION, GuestWsi::Software, true);
         assert!(has_extension(&exporting, IMAGE_DRM_FORMAT_MODIFIER));
+        let native = advertised_extensions_on(&host, MAX_API_VERSION, GuestWsi::DmaBuf, true);
+        for name in [
+            EXTERNAL_MEMORY_DMA_BUF,
+            EXTERNAL_MEMORY_FD,
+            IMAGE_DRM_FORMAT_MODIFIER,
+            EXTERNAL_SEMAPHORE_FD,
+        ] {
+            assert!(has_extension(&native, name), "{name}");
+        }
+    }
+
+    /// Stage S5, through [`expose`]: an NVIDIA host that can export
+    /// device-local memory puts the guest on dma-buf WSI — its driver shown
+    /// at the gate — and one that cannot keeps the software WSI.
+    #[test]
+    fn expose_chooses_dma_buf_wsi_exactly_where_device_local_memory_can_be_exported() {
+        use crate::venus::executor::fake;
+        let mut exporting = fake::zink_gpu("NVIDIA GeForce RTX 2070");
+        assert!(
+            has_extension(&exporting.info.extensions, EXTERNAL_MEMORY_WIN32),
+            "the fake RTX 2070 is a Windows one"
+        );
+        exporting.info.properties.properties.driver_version = nvidia_version(580, 88, 0, 0);
+        let shown = expose(exporting.info.clone()).expect("shown");
+        assert!(shown.memory_export);
+        assert_eq!(shown.wsi, GuestWsi::DmaBuf);
+        assert_eq!(
+            shown.properties.properties.driver_version,
+            NVIDIA_DMA_BUF_WSI_DRIVER
+        );
+        assert!(!keeps_software_wsi(&shown.properties));
+        assert!(has_extension(&shown.extensions, IMAGE_DRM_FORMAT_MODIFIER));
+        assert!(has_extension(&shown.extensions, EXTERNAL_MEMORY_DMA_BUF));
+        let mut linux = exporting.info.clone();
+        linux
+            .extensions
+            .retain(|e| c_name(&e.extension_name) != EXTERNAL_MEMORY_WIN32.as_bytes());
+        let shown = expose(linux).expect("shown");
+        assert!(!shown.memory_export);
+        assert_eq!(shown.wsi, GuestWsi::Software);
+        assert_eq!(
+            shown.properties.properties.driver_version,
+            nvidia_version(580, 88, 0, 0)
+        );
+        assert!(keeps_software_wsi(&shown.properties));
+        assert!(has_extension(&shown.extensions, EXTERNAL_MEMORY_DMA_BUF));
+        assert!(!has_extension(&shown.extensions, IMAGE_DRM_FORMAT_MODIFIER));
     }
 
     /// Stage 5c: a `DMA_BUF` query answers exportable and importable

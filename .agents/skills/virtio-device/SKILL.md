@@ -495,6 +495,17 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   `install ubuntu --venus` writes both through the autoinstall
   (`seed::venus_late_commands`). An existing guest is configured by hand, as
   the user guide's "A GPU-accelerated desktop" says.
+- **Clients present through dma-buf** (ADR-0004, S5) on a host that exports
+  device-local memory: `policy::GuestWsi` shows an NVIDIA driver at venus's
+  590.48.1 gate, and swapchains are S1's canonical LINEAR images. Two traps
+  that are easy to reintroduce: Mesa's WSI puts `ALIAS` on every swapchain
+  image and `EXTENDED_USAGE` on mutable ones (`modifier::IGNORED_FLAGS` must
+  keep accepting them), and a swapchain format *without* LINEAR sends the
+  WSI down its prime path, whose blit buffer finds no device-local type in
+  our pages and spins forever in Mesa's `UNREACHABLE`. Every format the WSI
+  can pick belongs in `modifier::SCANOUT_FORMATS`. Check a client with
+  `WAYLAND_DEBUG=client`: `zwp_linux_buffer_params_v1#N.add(...)`, not
+  `wl_shm#N.create_pool`.
 
 ## Per-device references
 
