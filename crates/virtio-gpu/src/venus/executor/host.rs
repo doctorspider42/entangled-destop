@@ -302,6 +302,19 @@ pub trait HostVulkan: Send + Sync + 'static {
         timeline: bool,
     ) -> VkExternalSemaphoreProperties;
 
+    /// Whether a buffer of these `flags` and `usage` on physical device
+    /// `device` may be bound to an import of our own pages
+    /// (`vkGetPhysicalDeviceExternalBufferProperties` answers
+    /// `HOST_ALLOCATION` `IMPORTABLE`): what a `DMA_BUF` buffer query is
+    /// answered by (stage 5c).
+    fn buffer_importable(
+        &self,
+        instance: &Self::Instance,
+        device: Self::PhysicalDevice,
+        flags: u32,
+        usage: u32,
+    ) -> bool;
+
     /// `vkCreateDevice`.
     ///
     /// # Errors

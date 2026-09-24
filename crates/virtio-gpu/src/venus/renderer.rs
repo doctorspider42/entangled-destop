@@ -524,6 +524,29 @@ struct DirectoryEntry {
     ctx_id: u32,
     pages: Arc<RingPages>,
     generation: u64,
+    /// `Some` for a blob of `VkDeviceMemory` (stage 5c): its size, and the
+    /// other contexts it is attached to (`CTX_ATTACH_RESOURCE`) — the ones
+    /// that may import it. `None` for a ring or reply blob.
+    memory: Option<MemoryEntry>,
+}
+
+#[derive(Debug, Default)]
+struct MemoryEntry {
+    size: u64,
+    attached: Vec<u32>,
+}
+
+/// A blob of `VkDeviceMemory` pages a context may import as memory of its
+/// own (`VkImportMemoryResourceInfoMESA`, stage 5c): the same `Arc` the
+/// exporting memory, its blob and its publication hold.
+#[derive(Debug, Clone)]
+pub struct MemoryBlob {
+    /// The pages.
+    pub pages: Arc<RingPages>,
+    /// The blob's size (the allocation rounded to 4 KiB).
+    pub size: u64,
+    /// The context whose memory it is a blob of.
+    pub owner: u32,
 }
 
 #[derive(Debug, Default)]
@@ -555,6 +578,28 @@ impl BlobDirectory {
     }
 
     fn insert(&self, resource_id: u32, ctx_id: u32, pages: Arc<RingPages>) {
+        self.insert_entry(resource_id, ctx_id, pages, None);
+    }
+
+    fn insert_memory(&self, resource_id: u32, ctx_id: u32, pages: Arc<RingPages>, size: u64) {
+        self.insert_entry(
+            resource_id,
+            ctx_id,
+            pages,
+            Some(MemoryEntry {
+                size,
+                attached: Vec::new(),
+            }),
+        );
+    }
+
+    fn insert_entry(
+        &self,
+        resource_id: u32,
+        ctx_id: u32,
+        pages: Arc<RingPages>,
+        memory: Option<MemoryEntry>,
+    ) {
         self.with(|state| {
             state.next_generation = state.next_generation.wrapping_add(1);
             let generation = state.next_generation;
@@ -564,8 +609,39 @@ impl BlobDirectory {
                     ctx_id,
                     pages,
                     generation,
+                    memory,
                 },
             );
+        });
+    }
+
+    /// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` of a blob of memory:
+    /// whether context `ctx_id` may import it. Nothing for any other blob.
+    fn attach(&self, resource_id: u32, ctx_id: u32, attach: bool) {
+        self.with(|state| {
+            let Some(memory) = state
+                .blobs
+                .get_mut(&resource_id)
+                .and_then(|e| e.memory.as_mut())
+            else {
+                return;
+            };
+            memory.attached.retain(|c| *c != ctx_id);
+            // Bounded by the contexts a renderer holds.
+            if attach && memory.attached.len() < MAX_VENUS_CONTEXTS {
+                memory.attached.push(ctx_id);
+            }
+        });
+    }
+
+    /// Forget context `ctx_id` in every attachment list: it is gone.
+    fn forget_context(&self, ctx_id: u32) {
+        self.with(|state| {
+            for entry in state.blobs.values_mut() {
+                if let Some(memory) = entry.memory.as_mut() {
+                    memory.attached.retain(|c| *c != ctx_id);
+                }
+            }
         });
     }
 
@@ -612,6 +688,7 @@ impl ContextBlobs {
             let entry = state
                 .blobs
                 .get(&resource_id)
+                .filter(|entry| entry.memory.is_none())
                 .ok_or(ReplyBlobError::NotAHostBlob(resource_id))?;
             if entry.ctx_id != 0 && entry.ctx_id != self.ctx_id {
                 return Err(ReplyBlobError::Foreign {
@@ -674,6 +751,43 @@ impl ContextBlobs {
                 }
             })?;
             Ok(bytes)
+        })
+    }
+
+    /// The pages of blob `resource_id` for an import as memory of this
+    /// context (stage 5c): a blob of `VkDeviceMemory` of **this renderer**,
+    /// made by this context or attached to it (`CTX_ATTACH_RESOURCE`, which
+    /// the guest kernel sends when a process opens a GEM handle of another's
+    /// dma-buf). The answer is the same `Arc` the blob holds, taken under the
+    /// directory lock, so the pages live as long as the import whatever the
+    /// exporter, its blob or its context do afterwards.
+    ///
+    /// # Errors
+    /// [`ReplyBlobError::NotAHostBlob`] for anything else — no such blob,
+    /// or a ring or reply blob — and [`ReplyBlobError::Foreign`] for a blob
+    /// of memory this context may not reach.
+    pub fn memory(&self, resource_id: u32) -> Result<MemoryBlob, ReplyBlobError> {
+        self.directory.with(|state| {
+            let entry = state
+                .blobs
+                .get(&resource_id)
+                .ok_or(ReplyBlobError::NotAHostBlob(resource_id))?;
+            let memory = entry
+                .memory
+                .as_ref()
+                .ok_or(ReplyBlobError::NotAHostBlob(resource_id))?;
+            if entry.ctx_id != self.ctx_id && !memory.attached.contains(&self.ctx_id) {
+                return Err(ReplyBlobError::Foreign {
+                    resource_id,
+                    owner: entry.ctx_id,
+                    ctx_id: self.ctx_id,
+                });
+            }
+            Ok(MemoryBlob {
+                pages: Arc::clone(&entry.pages),
+                size: memory.size,
+                owner: entry.ctx_id,
+            })
         })
     }
 
@@ -2041,7 +2155,12 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 // back to the executor's memory object, or — if that was
                 // freed first — to the allocator, once the publication below
                 // has unmapped them.
-                BlobKind::Memory => self.memory_blobs = self.memory_blobs.saturating_sub(1),
+                BlobKind::Memory => {
+                    // No new import can take the pages after this; an
+                    // import made already holds its own `Arc` of them.
+                    self.directory.remove(resource_id);
+                    self.memory_blobs = self.memory_blobs.saturating_sub(1);
+                }
             }
             drop(blob);
         }
@@ -2069,6 +2188,10 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 reason,
             })?;
         self.memory_blobs = self.memory_blobs.saturating_add(1);
+        // In the directory too, where another context attached to it may
+        // find it to import (stage 5c) — and never as a reply window.
+        self.directory
+            .insert_memory(args.resource_id, ctx_id, Arc::clone(&pages), args.size);
         self.blobs.insert(
             args.resource_id,
             RingBlob {
@@ -2166,6 +2289,8 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
             // Only now, with every ring of it joined, may the factory tear
             // down what its sinks shared (host Vulkan objects).
             self.sinks.context_destroyed(ctx_id);
+            // A context id the guest reuses starts with no attachments.
+            self.directory.forget_context(ctx_id);
         }
     }
 
@@ -2178,6 +2303,14 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
     fn ctx_attach_resource(&mut self, _ctx_id: u32, _resource_id: u32) {}
 
     fn ctx_detach_resource(&mut self, _ctx_id: u32, _resource_id: u32) {}
+
+    /// A blob attached to or detached from a venus context (stage 5c): for a
+    /// blob of `VkDeviceMemory`, whether that context may import it.
+    fn ctx_attach_blob(&mut self, ctx_id: u32, resource_id: u32, attach: bool) {
+        if self.contexts.contains_key(&ctx_id) || !attach {
+            self.directory.attach(resource_id, ctx_id, attach);
+        }
+    }
 
     fn attach_backing(
         &mut self,

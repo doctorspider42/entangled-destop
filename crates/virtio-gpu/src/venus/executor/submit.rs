@@ -700,6 +700,8 @@ impl<H: HostVulkan> VulkanContext<H> {
         match command {
             Command::ImportSemaphoreResourceMESA(args) => self.import_semaphore_resource(args),
             Command::WaitSemaphoreResourceMESA(args) => self.wait_semaphore_resource(args),
+            // Stage 5c: the dma-buf import's query (`executor::memory`).
+            Command::GetMemoryResourcePropertiesMESA(args) => self.memory_resource_properties(args),
             // `vkResetFenceResourceMESA` only follows a sync-file fence
             // export, which needs `VK_KHR_external_fence_fd` — not
             // advertised — and `vkImportFenceResourceMESA` is sent by no

@@ -525,6 +525,44 @@ fn c_VkVertexInputAttributeDescription(
     })
 }
 
+fn c_VkVertexInputBindingDivisorDescription(
+    a: &mut Arena,
+    v: &VkVertexInputBindingDivisorDescription,
+) -> Result<vk::VertexInputBindingDivisorDescriptionKHR, CallError> {
+    Ok(vk::VertexInputBindingDivisorDescriptionKHR {
+        binding: v.binding,
+        divisor: v.divisor,
+        ..Default::default()
+    })
+}
+
+fn c_VkPipelineVertexInputDivisorStateCreateInfo(
+    a: &mut Arena,
+    v: &VkPipelineVertexInputDivisorStateCreateInfo,
+) -> Result<vk::PipelineVertexInputDivisorStateCreateInfoKHR<'static>, CallError> {
+    if let Some(x) = &v.p_vertex_binding_divisors {
+        same(
+            x.len(),
+            u64::from(v.vertex_binding_divisor_count),
+            "VkPipelineVertexInputDivisorStateCreateInfo.pVertexBindingDivisors",
+        )?;
+    }
+    Ok(vk::PipelineVertexInputDivisorStateCreateInfoKHR {
+        vertex_binding_divisor_count: v.vertex_binding_divisor_count,
+        p_vertex_binding_divisors: match &v.p_vertex_binding_divisors {
+            Some(xs) => {
+                let c = xs
+                    .iter()
+                    .map(|x| c_VkVertexInputBindingDivisorDescription(a, x))
+                    .collect::<Result<Vec<_>, _>>()?;
+                a.slice(c).cast_const()
+            }
+            None => core::ptr::null(),
+        },
+        ..Default::default()
+    })
+}
+
 fn c_VkPipelineVertexInputStateCreateInfo(
     a: &mut Arena,
     v: &VkPipelineVertexInputStateCreateInfo,
@@ -574,16 +612,17 @@ fn c_VkPipelineVertexInputStateCreateInfo(
 }
 
 fn ch_VkPipelineVertexInputStateCreateInfo(
-    _a: &mut Arena,
+    a: &mut Arena,
     links: &[VkPipelineVertexInputStateCreateInfoNext],
 ) -> Result<*mut c_void, CallError> {
-    match links.first() {
-        Some(other) => Err(CallError::Link {
-            parent: "VkPipelineVertexInputStateCreateInfo",
-            stype: ChainLink::structure_type(other),
-        }),
-        None => Ok(core::ptr::null_mut()),
+    let mut next: *mut c_void = core::ptr::null_mut();
+    for link in links.iter().rev() {
+        next = match link {
+            VkPipelineVertexInputStateCreateInfoNext::VkPipelineVertexInputDivisorStateCreateInfo(x) => { let mut c = c_VkPipelineVertexInputDivisorStateCreateInfo(a, x)?; c.p_next = next as _; a.one(c).cast() }
+            other => return Err(CallError::Link { parent: "VkPipelineVertexInputStateCreateInfo", stype: ChainLink::structure_type(other) }),
+        };
     }
+    Ok(next)
 }
 
 fn c_VkPipelineInputAssemblyStateCreateInfo(
@@ -732,6 +771,51 @@ fn ch_VkPipelineViewportStateCreateInfo(
     }
 }
 
+fn c_VkPipelineRasterizationStateStreamCreateInfoEXT(
+    a: &mut Arena,
+    v: &VkPipelineRasterizationStateStreamCreateInfoEXT,
+) -> Result<vk::PipelineRasterizationStateStreamCreateInfoEXT<'static>, CallError> {
+    Ok(vk::PipelineRasterizationStateStreamCreateInfoEXT {
+        flags: vk::PipelineRasterizationStateStreamCreateFlagsEXT::from_raw(v.flags),
+        rasterization_stream: v.rasterization_stream,
+        ..Default::default()
+    })
+}
+
+fn c_VkPipelineRasterizationDepthClipStateCreateInfoEXT(
+    a: &mut Arena,
+    v: &VkPipelineRasterizationDepthClipStateCreateInfoEXT,
+) -> Result<vk::PipelineRasterizationDepthClipStateCreateInfoEXT<'static>, CallError> {
+    Ok(vk::PipelineRasterizationDepthClipStateCreateInfoEXT {
+        flags: vk::PipelineRasterizationDepthClipStateCreateFlagsEXT::from_raw(v.flags),
+        depth_clip_enable: v.depth_clip_enable,
+        ..Default::default()
+    })
+}
+
+fn c_VkPipelineRasterizationLineStateCreateInfo(
+    a: &mut Arena,
+    v: &VkPipelineRasterizationLineStateCreateInfo,
+) -> Result<vk::PipelineRasterizationLineStateCreateInfoKHR<'static>, CallError> {
+    Ok(vk::PipelineRasterizationLineStateCreateInfoKHR {
+        line_rasterization_mode: vk::LineRasterizationModeKHR::from_raw(v.line_rasterization_mode),
+        stippled_line_enable: v.stippled_line_enable,
+        line_stipple_factor: v.line_stipple_factor,
+        line_stipple_pattern: v.line_stipple_pattern,
+        ..Default::default()
+    })
+}
+
+fn c_VkPipelineRasterizationProvokingVertexStateCreateInfoEXT(
+    a: &mut Arena,
+    v: &VkPipelineRasterizationProvokingVertexStateCreateInfoEXT,
+) -> Result<vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT<'static>, CallError> {
+    Ok(vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT {
+        provoking_vertex_mode: vk::ProvokingVertexModeEXT::from_raw(v.provoking_vertex_mode),
+        ..Default::default()
+    })
+}
+
 fn c_VkPipelineRasterizationStateCreateInfo(
     a: &mut Arena,
     v: &VkPipelineRasterizationStateCreateInfo,
@@ -755,16 +839,20 @@ fn c_VkPipelineRasterizationStateCreateInfo(
 }
 
 fn ch_VkPipelineRasterizationStateCreateInfo(
-    _a: &mut Arena,
+    a: &mut Arena,
     links: &[VkPipelineRasterizationStateCreateInfoNext],
 ) -> Result<*mut c_void, CallError> {
-    match links.first() {
-        Some(other) => Err(CallError::Link {
-            parent: "VkPipelineRasterizationStateCreateInfo",
-            stype: ChainLink::structure_type(other),
-        }),
-        None => Ok(core::ptr::null_mut()),
+    let mut next: *mut c_void = core::ptr::null_mut();
+    for link in links.iter().rev() {
+        next = match link {
+            VkPipelineRasterizationStateCreateInfoNext::VkPipelineRasterizationStateStreamCreateInfoEXT(x) => { let mut c = c_VkPipelineRasterizationStateStreamCreateInfoEXT(a, x)?; c.p_next = next as _; a.one(c).cast() }
+            VkPipelineRasterizationStateCreateInfoNext::VkPipelineRasterizationDepthClipStateCreateInfoEXT(x) => { let mut c = c_VkPipelineRasterizationDepthClipStateCreateInfoEXT(a, x)?; c.p_next = next as _; a.one(c).cast() }
+            VkPipelineRasterizationStateCreateInfoNext::VkPipelineRasterizationLineStateCreateInfo(x) => { let mut c = c_VkPipelineRasterizationLineStateCreateInfo(a, x)?; c.p_next = next as _; a.one(c).cast() }
+            VkPipelineRasterizationStateCreateInfoNext::VkPipelineRasterizationProvokingVertexStateCreateInfoEXT(x) => { let mut c = c_VkPipelineRasterizationProvokingVertexStateCreateInfoEXT(a, x)?; c.p_next = next as _; a.one(c).cast() }
+            other => return Err(CallError::Link { parent: "VkPipelineRasterizationStateCreateInfo", stype: ChainLink::structure_type(other) }),
+        };
     }
+    Ok(next)
 }
 
 fn c_VkPipelineMultisampleStateCreateInfo(
@@ -1249,6 +1337,52 @@ fn c_VkSamplerReductionModeCreateInfo(
     })
 }
 
+fn u_VkClearColorValue(
+    a: &mut Arena,
+    v: &VkClearColorValue,
+) -> Result<vk::ClearColorValue, CallError> {
+    Ok(match v {
+        VkClearColorValue::Float32(x) => vk::ClearColorValue { float32: *x },
+        VkClearColorValue::Int32(x) => vk::ClearColorValue { int32: *x },
+        VkClearColorValue::Uint32(x) => vk::ClearColorValue { uint32: *x },
+    })
+}
+
+fn c_VkSamplerCustomBorderColorCreateInfoEXT(
+    a: &mut Arena,
+    v: &VkSamplerCustomBorderColorCreateInfoEXT,
+) -> Result<vk::SamplerCustomBorderColorCreateInfoEXT<'static>, CallError> {
+    Ok(vk::SamplerCustomBorderColorCreateInfoEXT {
+        custom_border_color: u_VkClearColorValue(a, &v.custom_border_color)?,
+        format: vk::Format::from_raw(v.format),
+        ..Default::default()
+    })
+}
+
+fn c_VkComponentMapping(
+    a: &mut Arena,
+    v: &VkComponentMapping,
+) -> Result<vk::ComponentMapping, CallError> {
+    Ok(vk::ComponentMapping {
+        r: vk::ComponentSwizzle::from_raw(v.r),
+        g: vk::ComponentSwizzle::from_raw(v.g),
+        b: vk::ComponentSwizzle::from_raw(v.b),
+        a: vk::ComponentSwizzle::from_raw(v.a),
+        ..Default::default()
+    })
+}
+
+fn c_VkSamplerBorderColorComponentMappingCreateInfoEXT(
+    a: &mut Arena,
+    v: &VkSamplerBorderColorComponentMappingCreateInfoEXT,
+) -> Result<vk::SamplerBorderColorComponentMappingCreateInfoEXT<'static>, CallError> {
+    Ok(vk::SamplerBorderColorComponentMappingCreateInfoEXT {
+        components: c_VkComponentMapping(a, &v.components)?,
+        srgb: v.srgb,
+        ..Default::default()
+    })
+}
+
 fn c_VkSamplerCreateInfo(
     a: &mut Arena,
     v: &VkSamplerCreateInfo,
@@ -1290,6 +1424,16 @@ fn ch_VkSamplerCreateInfo(
             }
             VkSamplerCreateInfoNext::VkSamplerReductionModeCreateInfo(x) => {
                 let mut c = c_VkSamplerReductionModeCreateInfo(a, x)?;
+                c.p_next = next as _;
+                a.one(c).cast()
+            }
+            VkSamplerCreateInfoNext::VkSamplerCustomBorderColorCreateInfoEXT(x) => {
+                let mut c = c_VkSamplerCustomBorderColorCreateInfoEXT(a, x)?;
+                c.p_next = next as _;
+                a.one(c).cast()
+            }
+            VkSamplerCreateInfoNext::VkSamplerBorderColorComponentMappingCreateInfoEXT(x) => {
+                let mut c = c_VkSamplerBorderColorComponentMappingCreateInfoEXT(a, x)?;
                 c.p_next = next as _;
                 a.one(c).cast()
             }
@@ -2150,6 +2294,16 @@ fn c_VkCommandBufferAllocateInfo(
     })
 }
 
+fn c_VkCommandBufferInheritanceConditionalRenderingInfoEXT(
+    a: &mut Arena,
+    v: &VkCommandBufferInheritanceConditionalRenderingInfoEXT,
+) -> Result<vk::CommandBufferInheritanceConditionalRenderingInfoEXT<'static>, CallError> {
+    Ok(vk::CommandBufferInheritanceConditionalRenderingInfoEXT {
+        conditional_rendering_enable: v.conditional_rendering_enable,
+        ..Default::default()
+    })
+}
+
 fn c_VkCommandBufferInheritanceRenderingInfo(
     a: &mut Arena,
     v: &VkCommandBufferInheritanceRenderingInfo,
@@ -2203,17 +2357,9 @@ fn ch_VkCommandBufferInheritanceInfo(
     let mut next: *mut c_void = core::ptr::null_mut();
     for link in links.iter().rev() {
         next = match link {
-            VkCommandBufferInheritanceInfoNext::VkCommandBufferInheritanceRenderingInfo(x) => {
-                let mut c = c_VkCommandBufferInheritanceRenderingInfo(a, x)?;
-                c.p_next = next as _;
-                a.one(c).cast()
-            }
-            other => {
-                return Err(CallError::Link {
-                    parent: "VkCommandBufferInheritanceInfo",
-                    stype: ChainLink::structure_type(other),
-                })
-            }
+            VkCommandBufferInheritanceInfoNext::VkCommandBufferInheritanceConditionalRenderingInfoEXT(x) => { let mut c = c_VkCommandBufferInheritanceConditionalRenderingInfoEXT(a, x)?; c.p_next = next as _; a.one(c).cast() }
+            VkCommandBufferInheritanceInfoNext::VkCommandBufferInheritanceRenderingInfo(x) => { let mut c = c_VkCommandBufferInheritanceRenderingInfo(a, x)?; c.p_next = next as _; a.one(c).cast() }
+            other => return Err(CallError::Link { parent: "VkCommandBufferInheritanceInfo", stype: ChainLink::structure_type(other) }),
         };
     }
     Ok(next)
@@ -2350,17 +2496,6 @@ fn c_VkBufferImageCopy(
         image_offset: c_VkOffset3D(a, &v.image_offset)?,
         image_extent: c_VkExtent3D(a, &v.image_extent)?,
         ..Default::default()
-    })
-}
-
-fn u_VkClearColorValue(
-    a: &mut Arena,
-    v: &VkClearColorValue,
-) -> Result<vk::ClearColorValue, CallError> {
-    Ok(match v {
-        VkClearColorValue::Float32(x) => vk::ClearColorValue { float32: *x },
-        VkClearColorValue::Int32(x) => vk::ClearColorValue { int32: *x },
-        VkClearColorValue::Uint32(x) => vk::ClearColorValue { uint32: *x },
     })
 }
 
@@ -2504,6 +2639,18 @@ fn ch_VkImageMemoryBarrier(
         }),
         None => Ok(core::ptr::null_mut()),
     }
+}
+
+fn c_VkConditionalRenderingBeginInfoEXT(
+    a: &mut Arena,
+    v: &VkConditionalRenderingBeginInfoEXT,
+) -> Result<vk::ConditionalRenderingBeginInfoEXT<'static>, CallError> {
+    Ok(vk::ConditionalRenderingBeginInfoEXT {
+        buffer: vk::Buffer::from_raw(v.buffer.0),
+        offset: v.offset,
+        flags: vk::ConditionalRenderingFlagsEXT::from_raw(v.flags),
+        ..Default::default()
+    })
 }
 
 fn c_VkDeviceGroupRenderPassBeginInfo(
@@ -2662,19 +2809,6 @@ fn c_VkDescriptorUpdateTemplateCreateInfo(
         pipeline_bind_point: vk::PipelineBindPoint::from_raw(v.pipeline_bind_point),
         pipeline_layout: vk::PipelineLayout::from_raw(v.pipeline_layout.0),
         set: v.set,
-        ..Default::default()
-    })
-}
-
-fn c_VkComponentMapping(
-    a: &mut Arena,
-    v: &VkComponentMapping,
-) -> Result<vk::ComponentMapping, CallError> {
-    Ok(vk::ComponentMapping {
-        r: vk::ComponentSwizzle::from_raw(v.r),
-        g: vk::ComponentSwizzle::from_raw(v.g),
-        b: vk::ComponentSwizzle::from_raw(v.b),
-        a: vk::ComponentSwizzle::from_raw(v.a),
         ..Default::default()
     })
 }
@@ -3716,8 +3850,46 @@ fn b_VkDescriptorSetLayoutSupport(
     dst.supported = src.supported;
 }
 
+/// The device-level entry points of every admitted extension with commands
+/// (`policy::ADMITTED_EXTENSIONS`), for the ones the host device was created
+/// with: `None` for one it was not, whose entry points may not exist.
+#[derive(Clone, Default)]
+pub struct ExtTables {
+    /// `VK_EXT_conditional_rendering`, when the device enabled it.
+    pub ext_conditional_rendering: Option<ash::ext::conditional_rendering::Device>,
+    /// `VK_EXT_line_rasterization`, when the device enabled it.
+    pub ext_line_rasterization: Option<ash::ext::line_rasterization::Device>,
+    /// `VK_EXT_transform_feedback`, when the device enabled it.
+    pub ext_transform_feedback: Option<ash::ext::transform_feedback::Device>,
+    /// `VK_KHR_line_rasterization`, when the device enabled it.
+    pub khr_line_rasterization: Option<ash::khr::line_rasterization::Device>,
+}
+
+impl ExtTables {
+    /// The tables of every extension `enabled` says the device was created
+    /// with, resolved from it.
+    #[must_use]
+    pub fn load(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        enabled: &dyn Fn(&str) -> bool,
+    ) -> Self {
+        Self {
+            ext_conditional_rendering: enabled("VK_EXT_conditional_rendering")
+                .then(|| ash::ext::conditional_rendering::Device::new(instance, device)),
+            ext_line_rasterization: enabled("VK_EXT_line_rasterization")
+                .then(|| ash::ext::line_rasterization::Device::new(instance, device)),
+            ext_transform_feedback: enabled("VK_EXT_transform_feedback")
+                .then(|| ash::ext::transform_feedback::Device::new(instance, device)),
+            khr_line_rasterization: enabled("VK_KHR_line_rasterization")
+                .then(|| ash::khr::line_rasterization::Device::new(instance, device)),
+        }
+    }
+}
+
 unsafe fn call_QueueSubmit(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut QueueSubmitArgs,
 ) -> Result<(), CallError> {
@@ -3750,6 +3922,7 @@ unsafe fn call_QueueSubmit(
 
 unsafe fn call_QueueWaitIdle(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut QueueWaitIdleArgs,
 ) -> Result<(), CallError> {
@@ -3764,6 +3937,7 @@ unsafe fn call_QueueWaitIdle(
 
 unsafe fn call_DeviceWaitIdle(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DeviceWaitIdleArgs,
 ) -> Result<(), CallError> {
@@ -3777,6 +3951,7 @@ unsafe fn call_DeviceWaitIdle(
 
 unsafe fn call_CreateFence(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateFenceArgs,
 ) -> Result<(), CallError> {
@@ -3800,6 +3975,7 @@ unsafe fn call_CreateFence(
 
 unsafe fn call_DestroyFence(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyFenceArgs,
 ) -> Result<(), CallError> {
@@ -3814,6 +3990,7 @@ unsafe fn call_DestroyFence(
 
 unsafe fn call_ResetFences(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut ResetFencesArgs,
 ) -> Result<(), CallError> {
@@ -3841,6 +4018,7 @@ unsafe fn call_ResetFences(
 
 unsafe fn call_GetFenceStatus(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut GetFenceStatusArgs,
 ) -> Result<(), CallError> {
@@ -3855,6 +4033,7 @@ unsafe fn call_GetFenceStatus(
 
 unsafe fn call_WaitForFences(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut WaitForFencesArgs,
 ) -> Result<(), CallError> {
@@ -3890,6 +4069,7 @@ unsafe fn call_WaitForFences(
 
 unsafe fn call_CreateSemaphore(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateSemaphoreArgs,
 ) -> Result<(), CallError> {
@@ -3914,6 +4094,7 @@ unsafe fn call_CreateSemaphore(
 
 unsafe fn call_DestroySemaphore(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroySemaphoreArgs,
 ) -> Result<(), CallError> {
@@ -3928,6 +4109,7 @@ unsafe fn call_DestroySemaphore(
 
 unsafe fn call_CreateEvent(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateEventArgs,
 ) -> Result<(), CallError> {
@@ -3951,6 +4133,7 @@ unsafe fn call_CreateEvent(
 
 unsafe fn call_DestroyEvent(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyEventArgs,
 ) -> Result<(), CallError> {
@@ -3965,6 +4148,7 @@ unsafe fn call_DestroyEvent(
 
 unsafe fn call_GetEventStatus(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut GetEventStatusArgs,
 ) -> Result<(), CallError> {
@@ -3979,6 +4163,7 @@ unsafe fn call_GetEventStatus(
 
 unsafe fn call_SetEvent(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut SetEventArgs,
 ) -> Result<(), CallError> {
@@ -3993,6 +4178,7 @@ unsafe fn call_SetEvent(
 
 unsafe fn call_ResetEvent(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut ResetEventArgs,
 ) -> Result<(), CallError> {
@@ -4007,6 +4193,7 @@ unsafe fn call_ResetEvent(
 
 unsafe fn call_CreateQueryPool(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateQueryPoolArgs,
 ) -> Result<(), CallError> {
@@ -4032,6 +4219,7 @@ unsafe fn call_CreateQueryPool(
 
 unsafe fn call_DestroyQueryPool(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyQueryPoolArgs,
 ) -> Result<(), CallError> {
@@ -4046,6 +4234,7 @@ unsafe fn call_DestroyQueryPool(
 
 unsafe fn call_GetQueryPoolResults(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut GetQueryPoolResultsArgs,
 ) -> Result<(), CallError> {
@@ -4080,6 +4269,7 @@ unsafe fn call_GetQueryPoolResults(
 
 unsafe fn call_ResetQueryPool(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut ResetQueryPoolArgs,
 ) -> Result<(), CallError> {
@@ -4095,6 +4285,7 @@ unsafe fn call_ResetQueryPool(
 
 unsafe fn call_CreateShaderModule(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateShaderModuleArgs,
 ) -> Result<(), CallError> {
@@ -4120,6 +4311,7 @@ unsafe fn call_CreateShaderModule(
 
 unsafe fn call_DestroyShaderModule(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyShaderModuleArgs,
 ) -> Result<(), CallError> {
@@ -4134,6 +4326,7 @@ unsafe fn call_DestroyShaderModule(
 
 unsafe fn call_CreatePipelineCache(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreatePipelineCacheArgs<'_>,
 ) -> Result<(), CallError> {
@@ -4159,6 +4352,7 @@ unsafe fn call_CreatePipelineCache(
 
 unsafe fn call_DestroyPipelineCache(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyPipelineCacheArgs,
 ) -> Result<(), CallError> {
@@ -4173,6 +4367,7 @@ unsafe fn call_DestroyPipelineCache(
 
 unsafe fn call_GetPipelineCacheData(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut GetPipelineCacheDataArgs,
 ) -> Result<(), CallError> {
@@ -4209,6 +4404,7 @@ unsafe fn call_GetPipelineCacheData(
 
 unsafe fn call_MergePipelineCaches(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut MergePipelineCachesArgs,
 ) -> Result<(), CallError> {
@@ -4242,6 +4438,7 @@ unsafe fn call_MergePipelineCaches(
 
 unsafe fn call_CreateGraphicsPipelines(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateGraphicsPipelinesArgs<'_>,
 ) -> Result<(), CallError> {
@@ -4294,6 +4491,7 @@ unsafe fn call_CreateGraphicsPipelines(
 
 unsafe fn call_CreateComputePipelines(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateComputePipelinesArgs<'_>,
 ) -> Result<(), CallError> {
@@ -4346,6 +4544,7 @@ unsafe fn call_CreateComputePipelines(
 
 unsafe fn call_DestroyPipeline(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyPipelineArgs,
 ) -> Result<(), CallError> {
@@ -4360,6 +4559,7 @@ unsafe fn call_DestroyPipeline(
 
 unsafe fn call_CreatePipelineLayout(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreatePipelineLayoutArgs,
 ) -> Result<(), CallError> {
@@ -4385,6 +4585,7 @@ unsafe fn call_CreatePipelineLayout(
 
 unsafe fn call_DestroyPipelineLayout(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyPipelineLayoutArgs,
 ) -> Result<(), CallError> {
@@ -4399,6 +4600,7 @@ unsafe fn call_DestroyPipelineLayout(
 
 unsafe fn call_CreateSampler(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateSamplerArgs,
 ) -> Result<(), CallError> {
@@ -4422,6 +4624,7 @@ unsafe fn call_CreateSampler(
 
 unsafe fn call_DestroySampler(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroySamplerArgs,
 ) -> Result<(), CallError> {
@@ -4436,6 +4639,7 @@ unsafe fn call_DestroySampler(
 
 unsafe fn call_CreateDescriptorSetLayout(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateDescriptorSetLayoutArgs,
 ) -> Result<(), CallError> {
@@ -4466,6 +4670,7 @@ unsafe fn call_CreateDescriptorSetLayout(
 
 unsafe fn call_DestroyDescriptorSetLayout(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyDescriptorSetLayoutArgs,
 ) -> Result<(), CallError> {
@@ -4480,6 +4685,7 @@ unsafe fn call_DestroyDescriptorSetLayout(
 
 unsafe fn call_CreateDescriptorPool(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateDescriptorPoolArgs,
 ) -> Result<(), CallError> {
@@ -4505,6 +4711,7 @@ unsafe fn call_CreateDescriptorPool(
 
 unsafe fn call_DestroyDescriptorPool(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyDescriptorPoolArgs,
 ) -> Result<(), CallError> {
@@ -4519,6 +4726,7 @@ unsafe fn call_DestroyDescriptorPool(
 
 unsafe fn call_ResetDescriptorPool(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut ResetDescriptorPoolArgs,
 ) -> Result<(), CallError> {
@@ -4534,6 +4742,7 @@ unsafe fn call_ResetDescriptorPool(
 
 unsafe fn call_AllocateDescriptorSets(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut AllocateDescriptorSetsArgs,
 ) -> Result<(), CallError> {
@@ -4573,6 +4782,7 @@ unsafe fn call_AllocateDescriptorSets(
 
 unsafe fn call_FreeDescriptorSets(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut FreeDescriptorSetsArgs,
 ) -> Result<(), CallError> {
@@ -4606,6 +4816,7 @@ unsafe fn call_FreeDescriptorSets(
 
 unsafe fn call_UpdateDescriptorSets(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut UpdateDescriptorSetsArgs<'_>,
 ) -> Result<(), CallError> {
@@ -4660,6 +4871,7 @@ unsafe fn call_UpdateDescriptorSets(
 
 unsafe fn call_CreateFramebuffer(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateFramebufferArgs,
 ) -> Result<(), CallError> {
@@ -4685,6 +4897,7 @@ unsafe fn call_CreateFramebuffer(
 
 unsafe fn call_DestroyFramebuffer(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyFramebufferArgs,
 ) -> Result<(), CallError> {
@@ -4699,6 +4912,7 @@ unsafe fn call_DestroyFramebuffer(
 
 unsafe fn call_CreateRenderPass(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateRenderPassArgs,
 ) -> Result<(), CallError> {
@@ -4724,6 +4938,7 @@ unsafe fn call_CreateRenderPass(
 
 unsafe fn call_DestroyRenderPass(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyRenderPassArgs,
 ) -> Result<(), CallError> {
@@ -4738,6 +4953,7 @@ unsafe fn call_DestroyRenderPass(
 
 unsafe fn call_GetRenderAreaGranularity(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut GetRenderAreaGranularityArgs,
 ) -> Result<(), CallError> {
@@ -4757,6 +4973,7 @@ unsafe fn call_GetRenderAreaGranularity(
 
 unsafe fn call_ResetCommandPool(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut ResetCommandPoolArgs,
 ) -> Result<(), CallError> {
@@ -4772,6 +4989,7 @@ unsafe fn call_ResetCommandPool(
 
 unsafe fn call_AllocateCommandBuffers(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut AllocateCommandBuffersArgs,
 ) -> Result<(), CallError> {
@@ -4811,6 +5029,7 @@ unsafe fn call_AllocateCommandBuffers(
 
 unsafe fn call_FreeCommandBuffers(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut FreeCommandBuffersArgs,
 ) -> Result<(), CallError> {
@@ -4843,6 +5062,7 @@ unsafe fn call_FreeCommandBuffers(
 
 unsafe fn call_BeginCommandBuffer(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut BeginCommandBufferArgs,
 ) -> Result<(), CallError> {
@@ -4864,6 +5084,7 @@ unsafe fn call_BeginCommandBuffer(
 
 unsafe fn call_EndCommandBuffer(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut EndCommandBufferArgs,
 ) -> Result<(), CallError> {
@@ -4878,6 +5099,7 @@ unsafe fn call_EndCommandBuffer(
 
 unsafe fn call_ResetCommandBuffer(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut ResetCommandBufferArgs,
 ) -> Result<(), CallError> {
@@ -4893,6 +5115,7 @@ unsafe fn call_ResetCommandBuffer(
 
 unsafe fn call_CmdBindPipeline(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdBindPipelineArgs,
 ) -> Result<(), CallError> {
@@ -4908,6 +5131,7 @@ unsafe fn call_CmdBindPipeline(
 
 unsafe fn call_CmdSetViewport(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetViewportArgs,
 ) -> Result<(), CallError> {
@@ -4940,6 +5164,7 @@ unsafe fn call_CmdSetViewport(
 
 unsafe fn call_CmdSetScissor(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetScissorArgs,
 ) -> Result<(), CallError> {
@@ -4970,6 +5195,7 @@ unsafe fn call_CmdSetScissor(
 
 unsafe fn call_CmdSetLineWidth(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetLineWidthArgs,
 ) -> Result<(), CallError> {
@@ -4983,6 +5209,7 @@ unsafe fn call_CmdSetLineWidth(
 
 unsafe fn call_CmdSetDepthBias(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetDepthBiasArgs,
 ) -> Result<(), CallError> {
@@ -5003,6 +5230,7 @@ unsafe fn call_CmdSetDepthBias(
 
 unsafe fn call_CmdSetBlendConstants(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetBlendConstantsArgs,
 ) -> Result<(), CallError> {
@@ -5017,6 +5245,7 @@ unsafe fn call_CmdSetBlendConstants(
 
 unsafe fn call_CmdSetDepthBounds(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetDepthBoundsArgs,
 ) -> Result<(), CallError> {
@@ -5032,6 +5261,7 @@ unsafe fn call_CmdSetDepthBounds(
 
 unsafe fn call_CmdSetStencilCompareMask(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetStencilCompareMaskArgs,
 ) -> Result<(), CallError> {
@@ -5046,6 +5276,7 @@ unsafe fn call_CmdSetStencilCompareMask(
 
 unsafe fn call_CmdSetStencilWriteMask(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetStencilWriteMaskArgs,
 ) -> Result<(), CallError> {
@@ -5060,6 +5291,7 @@ unsafe fn call_CmdSetStencilWriteMask(
 
 unsafe fn call_CmdSetStencilReference(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetStencilReferenceArgs,
 ) -> Result<(), CallError> {
@@ -5074,6 +5306,7 @@ unsafe fn call_CmdSetStencilReference(
 
 unsafe fn call_CmdBindDescriptorSets(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdBindDescriptorSetsArgs,
 ) -> Result<(), CallError> {
@@ -5131,6 +5364,7 @@ unsafe fn call_CmdBindDescriptorSets(
 
 unsafe fn call_CmdBindIndexBuffer(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdBindIndexBufferArgs,
 ) -> Result<(), CallError> {
@@ -5146,6 +5380,7 @@ unsafe fn call_CmdBindIndexBuffer(
 
 unsafe fn call_CmdBindVertexBuffers(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdBindVertexBuffersArgs,
 ) -> Result<(), CallError> {
@@ -5195,6 +5430,7 @@ unsafe fn call_CmdBindVertexBuffers(
 
 unsafe fn call_CmdDraw(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdDrawArgs,
 ) -> Result<(), CallError> {
@@ -5216,6 +5452,7 @@ unsafe fn call_CmdDraw(
 
 unsafe fn call_CmdDrawIndexed(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdDrawIndexedArgs,
 ) -> Result<(), CallError> {
@@ -5238,6 +5475,7 @@ unsafe fn call_CmdDrawIndexed(
 
 unsafe fn call_CmdDrawIndirect(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdDrawIndirectArgs,
 ) -> Result<(), CallError> {
@@ -5254,6 +5492,7 @@ unsafe fn call_CmdDrawIndirect(
 
 unsafe fn call_CmdDrawIndexedIndirect(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdDrawIndexedIndirectArgs,
 ) -> Result<(), CallError> {
@@ -5276,6 +5515,7 @@ unsafe fn call_CmdDrawIndexedIndirect(
 
 unsafe fn call_CmdDispatch(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdDispatchArgs,
 ) -> Result<(), CallError> {
@@ -5296,6 +5536,7 @@ unsafe fn call_CmdDispatch(
 
 unsafe fn call_CmdDispatchIndirect(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdDispatchIndirectArgs,
 ) -> Result<(), CallError> {
@@ -5310,6 +5551,7 @@ unsafe fn call_CmdDispatchIndirect(
 
 unsafe fn call_CmdCopyBuffer(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdCopyBufferArgs,
 ) -> Result<(), CallError> {
@@ -5342,6 +5584,7 @@ unsafe fn call_CmdCopyBuffer(
 
 unsafe fn call_CmdCopyImage(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdCopyImageArgs,
 ) -> Result<(), CallError> {
@@ -5376,6 +5619,7 @@ unsafe fn call_CmdCopyImage(
 
 unsafe fn call_CmdBlitImage(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdBlitImageArgs,
 ) -> Result<(), CallError> {
@@ -5411,6 +5655,7 @@ unsafe fn call_CmdBlitImage(
 
 unsafe fn call_CmdCopyBufferToImage(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdCopyBufferToImageArgs,
 ) -> Result<(), CallError> {
@@ -5444,6 +5689,7 @@ unsafe fn call_CmdCopyBufferToImage(
 
 unsafe fn call_CmdCopyImageToBuffer(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdCopyImageToBufferArgs,
 ) -> Result<(), CallError> {
@@ -5477,6 +5723,7 @@ unsafe fn call_CmdCopyImageToBuffer(
 
 unsafe fn call_CmdUpdateBuffer(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdUpdateBufferArgs<'_>,
 ) -> Result<(), CallError> {
@@ -5495,6 +5742,7 @@ unsafe fn call_CmdUpdateBuffer(
 
 unsafe fn call_CmdFillBuffer(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdFillBufferArgs,
 ) -> Result<(), CallError> {
@@ -5509,6 +5757,7 @@ unsafe fn call_CmdFillBuffer(
 
 unsafe fn call_CmdClearColorImage(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdClearColorImageArgs,
 ) -> Result<(), CallError> {
@@ -5548,6 +5797,7 @@ unsafe fn call_CmdClearColorImage(
 
 unsafe fn call_CmdClearDepthStencilImage(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdClearDepthStencilImageArgs,
 ) -> Result<(), CallError> {
@@ -5589,6 +5839,7 @@ unsafe fn call_CmdClearDepthStencilImage(
 
 unsafe fn call_CmdClearAttachments(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdClearAttachmentsArgs,
 ) -> Result<(), CallError> {
@@ -5638,6 +5889,7 @@ unsafe fn call_CmdClearAttachments(
 
 unsafe fn call_CmdResolveImage(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdResolveImageArgs,
 ) -> Result<(), CallError> {
@@ -5672,6 +5924,7 @@ unsafe fn call_CmdResolveImage(
 
 unsafe fn call_CmdSetEvent(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetEventArgs,
 ) -> Result<(), CallError> {
@@ -5687,6 +5940,7 @@ unsafe fn call_CmdSetEvent(
 
 unsafe fn call_CmdResetEvent(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdResetEventArgs,
 ) -> Result<(), CallError> {
@@ -5702,6 +5956,7 @@ unsafe fn call_CmdResetEvent(
 
 unsafe fn call_CmdWaitEvents(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdWaitEventsArgs,
 ) -> Result<(), CallError> {
@@ -5796,6 +6051,7 @@ unsafe fn call_CmdWaitEvents(
 
 unsafe fn call_CmdPipelineBarrier(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdPipelineBarrierArgs,
 ) -> Result<(), CallError> {
@@ -5876,6 +6132,7 @@ unsafe fn call_CmdPipelineBarrier(
 
 unsafe fn call_CmdBeginQuery(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdBeginQueryArgs,
 ) -> Result<(), CallError> {
@@ -5891,6 +6148,7 @@ unsafe fn call_CmdBeginQuery(
 
 unsafe fn call_CmdEndQuery(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdEndQueryArgs,
 ) -> Result<(), CallError> {
@@ -5903,8 +6161,54 @@ unsafe fn call_CmdEndQuery(
     Ok(())
 }
 
+unsafe fn call_CmdBeginConditionalRenderingEXT(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdBeginConditionalRenderingEXTArgs,
+) -> Result<(), CallError> {
+    let f = ext
+        .ext_conditional_rendering
+        .as_ref()
+        .map(|t| t.fp().cmd_begin_conditional_rendering_ext)
+        .ok_or(CallError::NoCall("vkCmdBeginConditionalRenderingEXT"))?;
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    let p1 = match &args.p_conditional_rendering_begin {
+        Some(x) => {
+            let c = c_VkConditionalRenderingBeginInfoEXT(a, x)?;
+            a.one(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe { (f)(p0, p1) };
+    Ok(())
+}
+
+unsafe fn call_CmdEndConditionalRenderingEXT(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdEndConditionalRenderingEXTArgs,
+) -> Result<(), CallError> {
+    let f = ext
+        .ext_conditional_rendering
+        .as_ref()
+        .map(|t| t.fp().cmd_end_conditional_rendering_ext)
+        .ok_or(CallError::NoCall("vkCmdEndConditionalRenderingEXT"))?;
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe { (f)(p0) };
+    Ok(())
+}
+
 unsafe fn call_CmdResetQueryPool(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdResetQueryPoolArgs,
 ) -> Result<(), CallError> {
@@ -5919,6 +6223,7 @@ unsafe fn call_CmdResetQueryPool(
 
 unsafe fn call_CmdWriteTimestamp(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdWriteTimestampArgs,
 ) -> Result<(), CallError> {
@@ -5934,6 +6239,7 @@ unsafe fn call_CmdWriteTimestamp(
 
 unsafe fn call_CmdCopyQueryPoolResults(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdCopyQueryPoolResultsArgs,
 ) -> Result<(), CallError> {
@@ -5961,6 +6267,7 @@ unsafe fn call_CmdCopyQueryPoolResults(
 
 unsafe fn call_CmdPushConstants(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdPushConstantsArgs<'_>,
 ) -> Result<(), CallError> {
@@ -5980,6 +6287,7 @@ unsafe fn call_CmdPushConstants(
 
 unsafe fn call_CmdBeginRenderPass(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdBeginRenderPassArgs,
 ) -> Result<(), CallError> {
@@ -6001,6 +6309,7 @@ unsafe fn call_CmdBeginRenderPass(
 
 unsafe fn call_CmdNextSubpass(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdNextSubpassArgs,
 ) -> Result<(), CallError> {
@@ -6015,6 +6324,7 @@ unsafe fn call_CmdNextSubpass(
 
 unsafe fn call_CmdEndRenderPass(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdEndRenderPassArgs,
 ) -> Result<(), CallError> {
@@ -6028,6 +6338,7 @@ unsafe fn call_CmdEndRenderPass(
 
 unsafe fn call_CmdExecuteCommands(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdExecuteCommandsArgs,
 ) -> Result<(), CallError> {
@@ -6058,6 +6369,7 @@ unsafe fn call_CmdExecuteCommands(
 
 unsafe fn call_TrimCommandPool(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut TrimCommandPoolArgs,
 ) -> Result<(), CallError> {
@@ -6072,6 +6384,7 @@ unsafe fn call_TrimCommandPool(
 
 unsafe fn call_GetDeviceGroupPeerMemoryFeatures(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut GetDeviceGroupPeerMemoryFeaturesArgs,
 ) -> Result<(), CallError> {
@@ -6094,6 +6407,7 @@ unsafe fn call_GetDeviceGroupPeerMemoryFeatures(
 
 unsafe fn call_CmdSetDeviceMask(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetDeviceMaskArgs,
 ) -> Result<(), CallError> {
@@ -6107,6 +6421,7 @@ unsafe fn call_CmdSetDeviceMask(
 
 unsafe fn call_CmdDispatchBase(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdDispatchBaseArgs,
 ) -> Result<(), CallError> {
@@ -6130,6 +6445,7 @@ unsafe fn call_CmdDispatchBase(
 
 unsafe fn call_CreateDescriptorUpdateTemplate(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateDescriptorUpdateTemplateArgs,
 ) -> Result<(), CallError> {
@@ -6162,6 +6478,7 @@ unsafe fn call_CreateDescriptorUpdateTemplate(
 
 unsafe fn call_DestroyDescriptorUpdateTemplate(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyDescriptorUpdateTemplateArgs,
 ) -> Result<(), CallError> {
@@ -6176,6 +6493,7 @@ unsafe fn call_DestroyDescriptorUpdateTemplate(
 
 unsafe fn call_CreateSamplerYcbcrConversion(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateSamplerYcbcrConversionArgs,
 ) -> Result<(), CallError> {
@@ -6206,6 +6524,7 @@ unsafe fn call_CreateSamplerYcbcrConversion(
 
 unsafe fn call_DestroySamplerYcbcrConversion(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroySamplerYcbcrConversionArgs,
 ) -> Result<(), CallError> {
@@ -6220,6 +6539,7 @@ unsafe fn call_DestroySamplerYcbcrConversion(
 
 unsafe fn call_GetDescriptorSetLayoutSupport(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut GetDescriptorSetLayoutSupportArgs,
 ) -> Result<(), CallError> {
@@ -6265,6 +6585,7 @@ b_VkDescriptorSetVariableDescriptorCountLayoutSupport(src, d);
 
 unsafe fn call_CreateRenderPass2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreateRenderPass2Args,
 ) -> Result<(), CallError> {
@@ -6290,6 +6611,7 @@ unsafe fn call_CreateRenderPass2(
 
 unsafe fn call_CmdBeginRenderPass2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdBeginRenderPass2Args,
 ) -> Result<(), CallError> {
@@ -6317,6 +6639,7 @@ unsafe fn call_CmdBeginRenderPass2(
 
 unsafe fn call_CmdNextSubpass2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdNextSubpass2Args,
 ) -> Result<(), CallError> {
@@ -6344,6 +6667,7 @@ unsafe fn call_CmdNextSubpass2(
 
 unsafe fn call_CmdEndRenderPass2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdEndRenderPass2Args,
 ) -> Result<(), CallError> {
@@ -6364,6 +6688,7 @@ unsafe fn call_CmdEndRenderPass2(
 
 unsafe fn call_GetSemaphoreCounterValue(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut GetSemaphoreCounterValueArgs,
 ) -> Result<(), CallError> {
@@ -6382,6 +6707,7 @@ unsafe fn call_GetSemaphoreCounterValue(
 
 unsafe fn call_WaitSemaphores(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut WaitSemaphoresArgs,
 ) -> Result<(), CallError> {
@@ -6402,6 +6728,7 @@ unsafe fn call_WaitSemaphores(
 
 unsafe fn call_SignalSemaphore(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut SignalSemaphoreArgs,
 ) -> Result<(), CallError> {
@@ -6422,6 +6749,7 @@ unsafe fn call_SignalSemaphore(
 
 unsafe fn call_CmdDrawIndirectCount(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdDrawIndirectCountArgs,
 ) -> Result<(), CallError> {
@@ -6447,6 +6775,7 @@ unsafe fn call_CmdDrawIndirectCount(
 
 unsafe fn call_CmdDrawIndexedIndirectCount(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdDrawIndexedIndirectCountArgs,
 ) -> Result<(), CallError> {
@@ -6470,8 +6799,275 @@ unsafe fn call_CmdDrawIndexedIndirectCount(
     Ok(())
 }
 
+unsafe fn call_CmdBindTransformFeedbackBuffersEXT(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdBindTransformFeedbackBuffersEXTArgs,
+) -> Result<(), CallError> {
+    let f = ext
+        .ext_transform_feedback
+        .as_ref()
+        .map(|t| t.fp().cmd_bind_transform_feedback_buffers_ext)
+        .ok_or(CallError::NoCall("vkCmdBindTransformFeedbackBuffersEXT"))?;
+    if let Some(x) = &args.p_buffers {
+        same(
+            x.len(),
+            u64::from(args.binding_count),
+            "vkCmdBindTransformFeedbackBuffersEXT.pBuffers",
+        )?;
+    }
+    if let Some(x) = &args.p_offsets {
+        same(
+            x.len(),
+            u64::from(args.binding_count),
+            "vkCmdBindTransformFeedbackBuffersEXT.pOffsets",
+        )?;
+    }
+    if let Some(x) = &args.p_sizes {
+        same(
+            x.len(),
+            u64::from(args.binding_count),
+            "vkCmdBindTransformFeedbackBuffersEXT.pSizes",
+        )?;
+    }
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    let p3 = match &args.p_buffers {
+        Some(xs) => {
+            let c: Vec<_> = xs.iter().map(|x| vk::Buffer::from_raw(x.0)).collect();
+            a.slice(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    let p4 = match &args.p_offsets {
+        Some(xs) => {
+            let c: Vec<_> = xs.iter().map(|x| *x).collect();
+            a.slice(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    let p5 = match &args.p_sizes {
+        Some(xs) => {
+            let c: Vec<_> = xs.iter().map(|x| *x).collect();
+            a.slice(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe { (f)(p0, args.first_binding, args.binding_count, p3, p4, p5) };
+    Ok(())
+}
+
+unsafe fn call_CmdBeginTransformFeedbackEXT(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdBeginTransformFeedbackEXTArgs,
+) -> Result<(), CallError> {
+    let f = ext
+        .ext_transform_feedback
+        .as_ref()
+        .map(|t| t.fp().cmd_begin_transform_feedback_ext)
+        .ok_or(CallError::NoCall("vkCmdBeginTransformFeedbackEXT"))?;
+    if let Some(x) = &args.p_counter_buffers {
+        same(
+            x.len(),
+            u64::from(args.counter_buffer_count),
+            "vkCmdBeginTransformFeedbackEXT.pCounterBuffers",
+        )?;
+    }
+    if let Some(x) = &args.p_counter_buffer_offsets {
+        same(
+            x.len(),
+            u64::from(args.counter_buffer_count),
+            "vkCmdBeginTransformFeedbackEXT.pCounterBufferOffsets",
+        )?;
+    }
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    let p3 = match &args.p_counter_buffers {
+        Some(xs) => {
+            let c: Vec<_> = xs.iter().map(|x| vk::Buffer::from_raw(x.0)).collect();
+            a.slice(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    let p4 = match &args.p_counter_buffer_offsets {
+        Some(xs) => {
+            let c: Vec<_> = xs.iter().map(|x| *x).collect();
+            a.slice(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe {
+        (f)(
+            p0,
+            args.first_counter_buffer,
+            args.counter_buffer_count,
+            p3,
+            p4,
+        )
+    };
+    Ok(())
+}
+
+unsafe fn call_CmdEndTransformFeedbackEXT(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdEndTransformFeedbackEXTArgs,
+) -> Result<(), CallError> {
+    let f = ext
+        .ext_transform_feedback
+        .as_ref()
+        .map(|t| t.fp().cmd_end_transform_feedback_ext)
+        .ok_or(CallError::NoCall("vkCmdEndTransformFeedbackEXT"))?;
+    if let Some(x) = &args.p_counter_buffers {
+        same(
+            x.len(),
+            u64::from(args.counter_buffer_count),
+            "vkCmdEndTransformFeedbackEXT.pCounterBuffers",
+        )?;
+    }
+    if let Some(x) = &args.p_counter_buffer_offsets {
+        same(
+            x.len(),
+            u64::from(args.counter_buffer_count),
+            "vkCmdEndTransformFeedbackEXT.pCounterBufferOffsets",
+        )?;
+    }
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    let p3 = match &args.p_counter_buffers {
+        Some(xs) => {
+            let c: Vec<_> = xs.iter().map(|x| vk::Buffer::from_raw(x.0)).collect();
+            a.slice(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    let p4 = match &args.p_counter_buffer_offsets {
+        Some(xs) => {
+            let c: Vec<_> = xs.iter().map(|x| *x).collect();
+            a.slice(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe {
+        (f)(
+            p0,
+            args.first_counter_buffer,
+            args.counter_buffer_count,
+            p3,
+            p4,
+        )
+    };
+    Ok(())
+}
+
+unsafe fn call_CmdBeginQueryIndexedEXT(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdBeginQueryIndexedEXTArgs,
+) -> Result<(), CallError> {
+    let f = ext
+        .ext_transform_feedback
+        .as_ref()
+        .map(|t| t.fp().cmd_begin_query_indexed_ext)
+        .ok_or(CallError::NoCall("vkCmdBeginQueryIndexedEXT"))?;
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    let p1 = vk::QueryPool::from_raw(args.query_pool.0);
+    let p3 = vk::QueryControlFlags::from_raw(args.flags);
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe { (f)(p0, p1, args.query, p3, args.index) };
+    Ok(())
+}
+
+unsafe fn call_CmdEndQueryIndexedEXT(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdEndQueryIndexedEXTArgs,
+) -> Result<(), CallError> {
+    let f = ext
+        .ext_transform_feedback
+        .as_ref()
+        .map(|t| t.fp().cmd_end_query_indexed_ext)
+        .ok_or(CallError::NoCall("vkCmdEndQueryIndexedEXT"))?;
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    let p1 = vk::QueryPool::from_raw(args.query_pool.0);
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe { (f)(p0, p1, args.query, args.index) };
+    Ok(())
+}
+
+unsafe fn call_CmdDrawIndirectByteCountEXT(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdDrawIndirectByteCountEXTArgs,
+) -> Result<(), CallError> {
+    let f = ext
+        .ext_transform_feedback
+        .as_ref()
+        .map(|t| t.fp().cmd_draw_indirect_byte_count_ext)
+        .ok_or(CallError::NoCall("vkCmdDrawIndirectByteCountEXT"))?;
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    let p3 = vk::Buffer::from_raw(args.counter_buffer.0);
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe {
+        (f)(
+            p0,
+            args.instance_count,
+            args.first_instance,
+            p3,
+            args.counter_buffer_offset,
+            args.counter_offset,
+            args.vertex_stride,
+        )
+    };
+    Ok(())
+}
+
+unsafe fn call_CmdSetLineStipple(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdSetLineStippleArgs,
+) -> Result<(), CallError> {
+    let f = ext
+        .ext_line_rasterization
+        .as_ref()
+        .map(|t| t.fp().cmd_set_line_stipple_ext)
+        .or_else(|| {
+            ext.khr_line_rasterization
+                .as_ref()
+                .map(|t| t.fp().cmd_set_line_stipple_khr)
+        })
+        .ok_or(CallError::NoCall("vkCmdSetLineStipple"))?;
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe { (f)(p0, args.line_stipple_factor, args.line_stipple_pattern) };
+    Ok(())
+}
+
 unsafe fn call_CmdSetCullMode(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetCullModeArgs,
 ) -> Result<(), CallError> {
@@ -6486,6 +7082,7 @@ unsafe fn call_CmdSetCullMode(
 
 unsafe fn call_CmdSetFrontFace(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetFrontFaceArgs,
 ) -> Result<(), CallError> {
@@ -6500,6 +7097,7 @@ unsafe fn call_CmdSetFrontFace(
 
 unsafe fn call_CmdSetPrimitiveTopology(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetPrimitiveTopologyArgs,
 ) -> Result<(), CallError> {
@@ -6514,6 +7112,7 @@ unsafe fn call_CmdSetPrimitiveTopology(
 
 unsafe fn call_CmdSetViewportWithCount(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetViewportWithCountArgs,
 ) -> Result<(), CallError> {
@@ -6544,6 +7143,7 @@ unsafe fn call_CmdSetViewportWithCount(
 
 unsafe fn call_CmdSetScissorWithCount(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetScissorWithCountArgs,
 ) -> Result<(), CallError> {
@@ -6574,6 +7174,7 @@ unsafe fn call_CmdSetScissorWithCount(
 
 unsafe fn call_CmdBindVertexBuffers2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdBindVertexBuffers2Args,
 ) -> Result<(), CallError> {
@@ -6653,6 +7254,7 @@ unsafe fn call_CmdBindVertexBuffers2(
 
 unsafe fn call_CmdSetDepthTestEnable(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetDepthTestEnableArgs,
 ) -> Result<(), CallError> {
@@ -6666,6 +7268,7 @@ unsafe fn call_CmdSetDepthTestEnable(
 
 unsafe fn call_CmdSetDepthWriteEnable(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetDepthWriteEnableArgs,
 ) -> Result<(), CallError> {
@@ -6679,6 +7282,7 @@ unsafe fn call_CmdSetDepthWriteEnable(
 
 unsafe fn call_CmdSetDepthCompareOp(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetDepthCompareOpArgs,
 ) -> Result<(), CallError> {
@@ -6693,6 +7297,7 @@ unsafe fn call_CmdSetDepthCompareOp(
 
 unsafe fn call_CmdSetDepthBoundsTestEnable(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetDepthBoundsTestEnableArgs,
 ) -> Result<(), CallError> {
@@ -6708,6 +7313,7 @@ unsafe fn call_CmdSetDepthBoundsTestEnable(
 
 unsafe fn call_CmdSetStencilTestEnable(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetStencilTestEnableArgs,
 ) -> Result<(), CallError> {
@@ -6721,6 +7327,7 @@ unsafe fn call_CmdSetStencilTestEnable(
 
 unsafe fn call_CmdSetStencilOp(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetStencilOpArgs,
 ) -> Result<(), CallError> {
@@ -6739,6 +7346,7 @@ unsafe fn call_CmdSetStencilOp(
 
 unsafe fn call_CmdSetRasterizerDiscardEnable(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetRasterizerDiscardEnableArgs,
 ) -> Result<(), CallError> {
@@ -6754,6 +7362,7 @@ unsafe fn call_CmdSetRasterizerDiscardEnable(
 
 unsafe fn call_CmdSetDepthBiasEnable(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetDepthBiasEnableArgs,
 ) -> Result<(), CallError> {
@@ -6767,6 +7376,7 @@ unsafe fn call_CmdSetDepthBiasEnable(
 
 unsafe fn call_CmdSetPrimitiveRestartEnable(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetPrimitiveRestartEnableArgs,
 ) -> Result<(), CallError> {
@@ -6782,6 +7392,7 @@ unsafe fn call_CmdSetPrimitiveRestartEnable(
 
 unsafe fn call_CreatePrivateDataSlot(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CreatePrivateDataSlotArgs,
 ) -> Result<(), CallError> {
@@ -6812,6 +7423,7 @@ unsafe fn call_CreatePrivateDataSlot(
 
 unsafe fn call_DestroyPrivateDataSlot(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut DestroyPrivateDataSlotArgs,
 ) -> Result<(), CallError> {
@@ -6826,6 +7438,7 @@ unsafe fn call_DestroyPrivateDataSlot(
 
 unsafe fn call_SetPrivateData(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut SetPrivateDataArgs,
 ) -> Result<(), CallError> {
@@ -6843,6 +7456,7 @@ unsafe fn call_SetPrivateData(
 
 unsafe fn call_GetPrivateData(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut GetPrivateDataArgs,
 ) -> Result<(), CallError> {
@@ -6867,6 +7481,7 @@ unsafe fn call_GetPrivateData(
 
 unsafe fn call_CmdCopyBuffer2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdCopyBuffer2Args,
 ) -> Result<(), CallError> {
@@ -6887,6 +7502,7 @@ unsafe fn call_CmdCopyBuffer2(
 
 unsafe fn call_CmdCopyImage2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdCopyImage2Args,
 ) -> Result<(), CallError> {
@@ -6907,6 +7523,7 @@ unsafe fn call_CmdCopyImage2(
 
 unsafe fn call_CmdBlitImage2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdBlitImage2Args,
 ) -> Result<(), CallError> {
@@ -6927,6 +7544,7 @@ unsafe fn call_CmdBlitImage2(
 
 unsafe fn call_CmdCopyBufferToImage2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdCopyBufferToImage2Args,
 ) -> Result<(), CallError> {
@@ -6947,6 +7565,7 @@ unsafe fn call_CmdCopyBufferToImage2(
 
 unsafe fn call_CmdCopyImageToBuffer2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdCopyImageToBuffer2Args,
 ) -> Result<(), CallError> {
@@ -6967,6 +7586,7 @@ unsafe fn call_CmdCopyImageToBuffer2(
 
 unsafe fn call_CmdResolveImage2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdResolveImage2Args,
 ) -> Result<(), CallError> {
@@ -6987,6 +7607,7 @@ unsafe fn call_CmdResolveImage2(
 
 unsafe fn call_CmdSetEvent2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdSetEvent2Args,
 ) -> Result<(), CallError> {
@@ -7008,6 +7629,7 @@ unsafe fn call_CmdSetEvent2(
 
 unsafe fn call_CmdResetEvent2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdResetEvent2Args,
 ) -> Result<(), CallError> {
@@ -7023,6 +7645,7 @@ unsafe fn call_CmdResetEvent2(
 
 unsafe fn call_CmdWaitEvents2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdWaitEvents2Args,
 ) -> Result<(), CallError> {
@@ -7067,6 +7690,7 @@ unsafe fn call_CmdWaitEvents2(
 
 unsafe fn call_CmdPipelineBarrier2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdPipelineBarrier2Args,
 ) -> Result<(), CallError> {
@@ -7087,6 +7711,7 @@ unsafe fn call_CmdPipelineBarrier2(
 
 unsafe fn call_QueueSubmit2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut QueueSubmit2Args,
 ) -> Result<(), CallError> {
@@ -7119,6 +7744,7 @@ unsafe fn call_QueueSubmit2(
 
 unsafe fn call_CmdWriteTimestamp2(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdWriteTimestamp2Args,
 ) -> Result<(), CallError> {
@@ -7134,6 +7760,7 @@ unsafe fn call_CmdWriteTimestamp2(
 
 unsafe fn call_CmdBeginRendering(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdBeginRenderingArgs,
 ) -> Result<(), CallError> {
@@ -7154,6 +7781,7 @@ unsafe fn call_CmdBeginRendering(
 
 unsafe fn call_CmdEndRendering(
     device: &ash::Device,
+    ext: &ExtTables,
     a: &mut Arena,
     args: &mut CmdEndRenderingArgs,
 ) -> Result<(), CallError> {
@@ -7179,276 +7807,350 @@ unsafe fn call_CmdEndRendering(
 /// agrees with its array; the command is core in `device`'s version; and the
 /// caller holds the external synchronisation Vulkan requires for the objects it
 /// names (the executor's context lock). Translation establishes all but the
-/// last two, which the executor does.
-pub unsafe fn call(device: &ash::Device, command: &mut Command<'_>) -> Result<(), CallError> {
+/// last two, which the executor does. An admitted extension's command is
+/// called only through `ext`, whose table exists only for an extension the
+/// device was created with, and the executor calls it only on a device the
+/// guest enabled that extension on.
+pub unsafe fn call(
+    device: &ash::Device,
+    ext: &ExtTables,
+    command: &mut Command<'_>,
+) -> Result<(), CallError> {
     let mut arena = Arena::default();
     // SAFETY: this function's own contract, passed on to the one arm taken.
     unsafe {
         match command {
-            Command::QueueSubmit(args) => call_QueueSubmit(device, &mut arena, args),
-            Command::QueueWaitIdle(args) => call_QueueWaitIdle(device, &mut arena, args),
-            Command::DeviceWaitIdle(args) => call_DeviceWaitIdle(device, &mut arena, args),
-            Command::CreateFence(args) => call_CreateFence(device, &mut arena, args),
-            Command::DestroyFence(args) => call_DestroyFence(device, &mut arena, args),
-            Command::ResetFences(args) => call_ResetFences(device, &mut arena, args),
-            Command::GetFenceStatus(args) => call_GetFenceStatus(device, &mut arena, args),
-            Command::WaitForFences(args) => call_WaitForFences(device, &mut arena, args),
-            Command::CreateSemaphore(args) => call_CreateSemaphore(device, &mut arena, args),
-            Command::DestroySemaphore(args) => call_DestroySemaphore(device, &mut arena, args),
-            Command::CreateEvent(args) => call_CreateEvent(device, &mut arena, args),
-            Command::DestroyEvent(args) => call_DestroyEvent(device, &mut arena, args),
-            Command::GetEventStatus(args) => call_GetEventStatus(device, &mut arena, args),
-            Command::SetEvent(args) => call_SetEvent(device, &mut arena, args),
-            Command::ResetEvent(args) => call_ResetEvent(device, &mut arena, args),
-            Command::CreateQueryPool(args) => call_CreateQueryPool(device, &mut arena, args),
-            Command::DestroyQueryPool(args) => call_DestroyQueryPool(device, &mut arena, args),
+            Command::QueueSubmit(args) => call_QueueSubmit(device, ext, &mut arena, args),
+            Command::QueueWaitIdle(args) => call_QueueWaitIdle(device, ext, &mut arena, args),
+            Command::DeviceWaitIdle(args) => call_DeviceWaitIdle(device, ext, &mut arena, args),
+            Command::CreateFence(args) => call_CreateFence(device, ext, &mut arena, args),
+            Command::DestroyFence(args) => call_DestroyFence(device, ext, &mut arena, args),
+            Command::ResetFences(args) => call_ResetFences(device, ext, &mut arena, args),
+            Command::GetFenceStatus(args) => call_GetFenceStatus(device, ext, &mut arena, args),
+            Command::WaitForFences(args) => call_WaitForFences(device, ext, &mut arena, args),
+            Command::CreateSemaphore(args) => call_CreateSemaphore(device, ext, &mut arena, args),
+            Command::DestroySemaphore(args) => call_DestroySemaphore(device, ext, &mut arena, args),
+            Command::CreateEvent(args) => call_CreateEvent(device, ext, &mut arena, args),
+            Command::DestroyEvent(args) => call_DestroyEvent(device, ext, &mut arena, args),
+            Command::GetEventStatus(args) => call_GetEventStatus(device, ext, &mut arena, args),
+            Command::SetEvent(args) => call_SetEvent(device, ext, &mut arena, args),
+            Command::ResetEvent(args) => call_ResetEvent(device, ext, &mut arena, args),
+            Command::CreateQueryPool(args) => call_CreateQueryPool(device, ext, &mut arena, args),
+            Command::DestroyQueryPool(args) => call_DestroyQueryPool(device, ext, &mut arena, args),
             Command::GetQueryPoolResults(args) => {
-                call_GetQueryPoolResults(device, &mut arena, args)
+                call_GetQueryPoolResults(device, ext, &mut arena, args)
             }
-            Command::ResetQueryPool(args) => call_ResetQueryPool(device, &mut arena, args),
-            Command::CreateShaderModule(args) => call_CreateShaderModule(device, &mut arena, args),
+            Command::ResetQueryPool(args) => call_ResetQueryPool(device, ext, &mut arena, args),
+            Command::CreateShaderModule(args) => {
+                call_CreateShaderModule(device, ext, &mut arena, args)
+            }
             Command::DestroyShaderModule(args) => {
-                call_DestroyShaderModule(device, &mut arena, args)
+                call_DestroyShaderModule(device, ext, &mut arena, args)
             }
             Command::CreatePipelineCache(args) => {
-                call_CreatePipelineCache(device, &mut arena, args)
+                call_CreatePipelineCache(device, ext, &mut arena, args)
             }
             Command::DestroyPipelineCache(args) => {
-                call_DestroyPipelineCache(device, &mut arena, args)
+                call_DestroyPipelineCache(device, ext, &mut arena, args)
             }
             Command::GetPipelineCacheData(args) => {
-                call_GetPipelineCacheData(device, &mut arena, args)
+                call_GetPipelineCacheData(device, ext, &mut arena, args)
             }
             Command::MergePipelineCaches(args) => {
-                call_MergePipelineCaches(device, &mut arena, args)
+                call_MergePipelineCaches(device, ext, &mut arena, args)
             }
             Command::CreateGraphicsPipelines(args) => {
-                call_CreateGraphicsPipelines(device, &mut arena, args)
+                call_CreateGraphicsPipelines(device, ext, &mut arena, args)
             }
             Command::CreateComputePipelines(args) => {
-                call_CreateComputePipelines(device, &mut arena, args)
+                call_CreateComputePipelines(device, ext, &mut arena, args)
             }
-            Command::DestroyPipeline(args) => call_DestroyPipeline(device, &mut arena, args),
+            Command::DestroyPipeline(args) => call_DestroyPipeline(device, ext, &mut arena, args),
             Command::CreatePipelineLayout(args) => {
-                call_CreatePipelineLayout(device, &mut arena, args)
+                call_CreatePipelineLayout(device, ext, &mut arena, args)
             }
             Command::DestroyPipelineLayout(args) => {
-                call_DestroyPipelineLayout(device, &mut arena, args)
+                call_DestroyPipelineLayout(device, ext, &mut arena, args)
             }
-            Command::CreateSampler(args) => call_CreateSampler(device, &mut arena, args),
-            Command::DestroySampler(args) => call_DestroySampler(device, &mut arena, args),
+            Command::CreateSampler(args) => call_CreateSampler(device, ext, &mut arena, args),
+            Command::DestroySampler(args) => call_DestroySampler(device, ext, &mut arena, args),
             Command::CreateDescriptorSetLayout(args) => {
-                call_CreateDescriptorSetLayout(device, &mut arena, args)
+                call_CreateDescriptorSetLayout(device, ext, &mut arena, args)
             }
             Command::DestroyDescriptorSetLayout(args) => {
-                call_DestroyDescriptorSetLayout(device, &mut arena, args)
+                call_DestroyDescriptorSetLayout(device, ext, &mut arena, args)
             }
             Command::CreateDescriptorPool(args) => {
-                call_CreateDescriptorPool(device, &mut arena, args)
+                call_CreateDescriptorPool(device, ext, &mut arena, args)
             }
             Command::DestroyDescriptorPool(args) => {
-                call_DestroyDescriptorPool(device, &mut arena, args)
+                call_DestroyDescriptorPool(device, ext, &mut arena, args)
             }
             Command::ResetDescriptorPool(args) => {
-                call_ResetDescriptorPool(device, &mut arena, args)
+                call_ResetDescriptorPool(device, ext, &mut arena, args)
             }
             Command::AllocateDescriptorSets(args) => {
-                call_AllocateDescriptorSets(device, &mut arena, args)
+                call_AllocateDescriptorSets(device, ext, &mut arena, args)
             }
-            Command::FreeDescriptorSets(args) => call_FreeDescriptorSets(device, &mut arena, args),
+            Command::FreeDescriptorSets(args) => {
+                call_FreeDescriptorSets(device, ext, &mut arena, args)
+            }
             Command::UpdateDescriptorSets(args) => {
-                call_UpdateDescriptorSets(device, &mut arena, args)
+                call_UpdateDescriptorSets(device, ext, &mut arena, args)
             }
-            Command::CreateFramebuffer(args) => call_CreateFramebuffer(device, &mut arena, args),
-            Command::DestroyFramebuffer(args) => call_DestroyFramebuffer(device, &mut arena, args),
-            Command::CreateRenderPass(args) => call_CreateRenderPass(device, &mut arena, args),
-            Command::DestroyRenderPass(args) => call_DestroyRenderPass(device, &mut arena, args),
+            Command::CreateFramebuffer(args) => {
+                call_CreateFramebuffer(device, ext, &mut arena, args)
+            }
+            Command::DestroyFramebuffer(args) => {
+                call_DestroyFramebuffer(device, ext, &mut arena, args)
+            }
+            Command::CreateRenderPass(args) => call_CreateRenderPass(device, ext, &mut arena, args),
+            Command::DestroyRenderPass(args) => {
+                call_DestroyRenderPass(device, ext, &mut arena, args)
+            }
             Command::GetRenderAreaGranularity(args) => {
-                call_GetRenderAreaGranularity(device, &mut arena, args)
+                call_GetRenderAreaGranularity(device, ext, &mut arena, args)
             }
-            Command::ResetCommandPool(args) => call_ResetCommandPool(device, &mut arena, args),
+            Command::ResetCommandPool(args) => call_ResetCommandPool(device, ext, &mut arena, args),
             Command::AllocateCommandBuffers(args) => {
-                call_AllocateCommandBuffers(device, &mut arena, args)
+                call_AllocateCommandBuffers(device, ext, &mut arena, args)
             }
-            Command::FreeCommandBuffers(args) => call_FreeCommandBuffers(device, &mut arena, args),
-            Command::BeginCommandBuffer(args) => call_BeginCommandBuffer(device, &mut arena, args),
-            Command::EndCommandBuffer(args) => call_EndCommandBuffer(device, &mut arena, args),
-            Command::ResetCommandBuffer(args) => call_ResetCommandBuffer(device, &mut arena, args),
-            Command::CmdBindPipeline(args) => call_CmdBindPipeline(device, &mut arena, args),
-            Command::CmdSetViewport(args) => call_CmdSetViewport(device, &mut arena, args),
-            Command::CmdSetScissor(args) => call_CmdSetScissor(device, &mut arena, args),
-            Command::CmdSetLineWidth(args) => call_CmdSetLineWidth(device, &mut arena, args),
-            Command::CmdSetDepthBias(args) => call_CmdSetDepthBias(device, &mut arena, args),
+            Command::FreeCommandBuffers(args) => {
+                call_FreeCommandBuffers(device, ext, &mut arena, args)
+            }
+            Command::BeginCommandBuffer(args) => {
+                call_BeginCommandBuffer(device, ext, &mut arena, args)
+            }
+            Command::EndCommandBuffer(args) => call_EndCommandBuffer(device, ext, &mut arena, args),
+            Command::ResetCommandBuffer(args) => {
+                call_ResetCommandBuffer(device, ext, &mut arena, args)
+            }
+            Command::CmdBindPipeline(args) => call_CmdBindPipeline(device, ext, &mut arena, args),
+            Command::CmdSetViewport(args) => call_CmdSetViewport(device, ext, &mut arena, args),
+            Command::CmdSetScissor(args) => call_CmdSetScissor(device, ext, &mut arena, args),
+            Command::CmdSetLineWidth(args) => call_CmdSetLineWidth(device, ext, &mut arena, args),
+            Command::CmdSetDepthBias(args) => call_CmdSetDepthBias(device, ext, &mut arena, args),
             Command::CmdSetBlendConstants(args) => {
-                call_CmdSetBlendConstants(device, &mut arena, args)
+                call_CmdSetBlendConstants(device, ext, &mut arena, args)
             }
-            Command::CmdSetDepthBounds(args) => call_CmdSetDepthBounds(device, &mut arena, args),
+            Command::CmdSetDepthBounds(args) => {
+                call_CmdSetDepthBounds(device, ext, &mut arena, args)
+            }
             Command::CmdSetStencilCompareMask(args) => {
-                call_CmdSetStencilCompareMask(device, &mut arena, args)
+                call_CmdSetStencilCompareMask(device, ext, &mut arena, args)
             }
             Command::CmdSetStencilWriteMask(args) => {
-                call_CmdSetStencilWriteMask(device, &mut arena, args)
+                call_CmdSetStencilWriteMask(device, ext, &mut arena, args)
             }
             Command::CmdSetStencilReference(args) => {
-                call_CmdSetStencilReference(device, &mut arena, args)
+                call_CmdSetStencilReference(device, ext, &mut arena, args)
             }
             Command::CmdBindDescriptorSets(args) => {
-                call_CmdBindDescriptorSets(device, &mut arena, args)
+                call_CmdBindDescriptorSets(device, ext, &mut arena, args)
             }
-            Command::CmdBindIndexBuffer(args) => call_CmdBindIndexBuffer(device, &mut arena, args),
+            Command::CmdBindIndexBuffer(args) => {
+                call_CmdBindIndexBuffer(device, ext, &mut arena, args)
+            }
             Command::CmdBindVertexBuffers(args) => {
-                call_CmdBindVertexBuffers(device, &mut arena, args)
+                call_CmdBindVertexBuffers(device, ext, &mut arena, args)
             }
-            Command::CmdDraw(args) => call_CmdDraw(device, &mut arena, args),
-            Command::CmdDrawIndexed(args) => call_CmdDrawIndexed(device, &mut arena, args),
-            Command::CmdDrawIndirect(args) => call_CmdDrawIndirect(device, &mut arena, args),
+            Command::CmdDraw(args) => call_CmdDraw(device, ext, &mut arena, args),
+            Command::CmdDrawIndexed(args) => call_CmdDrawIndexed(device, ext, &mut arena, args),
+            Command::CmdDrawIndirect(args) => call_CmdDrawIndirect(device, ext, &mut arena, args),
             Command::CmdDrawIndexedIndirect(args) => {
-                call_CmdDrawIndexedIndirect(device, &mut arena, args)
+                call_CmdDrawIndexedIndirect(device, ext, &mut arena, args)
             }
-            Command::CmdDispatch(args) => call_CmdDispatch(device, &mut arena, args),
+            Command::CmdDispatch(args) => call_CmdDispatch(device, ext, &mut arena, args),
             Command::CmdDispatchIndirect(args) => {
-                call_CmdDispatchIndirect(device, &mut arena, args)
+                call_CmdDispatchIndirect(device, ext, &mut arena, args)
             }
-            Command::CmdCopyBuffer(args) => call_CmdCopyBuffer(device, &mut arena, args),
-            Command::CmdCopyImage(args) => call_CmdCopyImage(device, &mut arena, args),
-            Command::CmdBlitImage(args) => call_CmdBlitImage(device, &mut arena, args),
+            Command::CmdCopyBuffer(args) => call_CmdCopyBuffer(device, ext, &mut arena, args),
+            Command::CmdCopyImage(args) => call_CmdCopyImage(device, ext, &mut arena, args),
+            Command::CmdBlitImage(args) => call_CmdBlitImage(device, ext, &mut arena, args),
             Command::CmdCopyBufferToImage(args) => {
-                call_CmdCopyBufferToImage(device, &mut arena, args)
+                call_CmdCopyBufferToImage(device, ext, &mut arena, args)
             }
             Command::CmdCopyImageToBuffer(args) => {
-                call_CmdCopyImageToBuffer(device, &mut arena, args)
+                call_CmdCopyImageToBuffer(device, ext, &mut arena, args)
             }
-            Command::CmdUpdateBuffer(args) => call_CmdUpdateBuffer(device, &mut arena, args),
-            Command::CmdFillBuffer(args) => call_CmdFillBuffer(device, &mut arena, args),
-            Command::CmdClearColorImage(args) => call_CmdClearColorImage(device, &mut arena, args),
+            Command::CmdUpdateBuffer(args) => call_CmdUpdateBuffer(device, ext, &mut arena, args),
+            Command::CmdFillBuffer(args) => call_CmdFillBuffer(device, ext, &mut arena, args),
+            Command::CmdClearColorImage(args) => {
+                call_CmdClearColorImage(device, ext, &mut arena, args)
+            }
             Command::CmdClearDepthStencilImage(args) => {
-                call_CmdClearDepthStencilImage(device, &mut arena, args)
+                call_CmdClearDepthStencilImage(device, ext, &mut arena, args)
             }
             Command::CmdClearAttachments(args) => {
-                call_CmdClearAttachments(device, &mut arena, args)
+                call_CmdClearAttachments(device, ext, &mut arena, args)
             }
-            Command::CmdResolveImage(args) => call_CmdResolveImage(device, &mut arena, args),
-            Command::CmdSetEvent(args) => call_CmdSetEvent(device, &mut arena, args),
-            Command::CmdResetEvent(args) => call_CmdResetEvent(device, &mut arena, args),
-            Command::CmdWaitEvents(args) => call_CmdWaitEvents(device, &mut arena, args),
-            Command::CmdPipelineBarrier(args) => call_CmdPipelineBarrier(device, &mut arena, args),
-            Command::CmdBeginQuery(args) => call_CmdBeginQuery(device, &mut arena, args),
-            Command::CmdEndQuery(args) => call_CmdEndQuery(device, &mut arena, args),
-            Command::CmdResetQueryPool(args) => call_CmdResetQueryPool(device, &mut arena, args),
-            Command::CmdWriteTimestamp(args) => call_CmdWriteTimestamp(device, &mut arena, args),
+            Command::CmdResolveImage(args) => call_CmdResolveImage(device, ext, &mut arena, args),
+            Command::CmdSetEvent(args) => call_CmdSetEvent(device, ext, &mut arena, args),
+            Command::CmdResetEvent(args) => call_CmdResetEvent(device, ext, &mut arena, args),
+            Command::CmdWaitEvents(args) => call_CmdWaitEvents(device, ext, &mut arena, args),
+            Command::CmdPipelineBarrier(args) => {
+                call_CmdPipelineBarrier(device, ext, &mut arena, args)
+            }
+            Command::CmdBeginQuery(args) => call_CmdBeginQuery(device, ext, &mut arena, args),
+            Command::CmdEndQuery(args) => call_CmdEndQuery(device, ext, &mut arena, args),
+            Command::CmdBeginConditionalRenderingEXT(args) => {
+                call_CmdBeginConditionalRenderingEXT(device, ext, &mut arena, args)
+            }
+            Command::CmdEndConditionalRenderingEXT(args) => {
+                call_CmdEndConditionalRenderingEXT(device, ext, &mut arena, args)
+            }
+            Command::CmdResetQueryPool(args) => {
+                call_CmdResetQueryPool(device, ext, &mut arena, args)
+            }
+            Command::CmdWriteTimestamp(args) => {
+                call_CmdWriteTimestamp(device, ext, &mut arena, args)
+            }
             Command::CmdCopyQueryPoolResults(args) => {
-                call_CmdCopyQueryPoolResults(device, &mut arena, args)
+                call_CmdCopyQueryPoolResults(device, ext, &mut arena, args)
             }
-            Command::CmdPushConstants(args) => call_CmdPushConstants(device, &mut arena, args),
-            Command::CmdBeginRenderPass(args) => call_CmdBeginRenderPass(device, &mut arena, args),
-            Command::CmdNextSubpass(args) => call_CmdNextSubpass(device, &mut arena, args),
-            Command::CmdEndRenderPass(args) => call_CmdEndRenderPass(device, &mut arena, args),
-            Command::CmdExecuteCommands(args) => call_CmdExecuteCommands(device, &mut arena, args),
-            Command::TrimCommandPool(args) => call_TrimCommandPool(device, &mut arena, args),
+            Command::CmdPushConstants(args) => call_CmdPushConstants(device, ext, &mut arena, args),
+            Command::CmdBeginRenderPass(args) => {
+                call_CmdBeginRenderPass(device, ext, &mut arena, args)
+            }
+            Command::CmdNextSubpass(args) => call_CmdNextSubpass(device, ext, &mut arena, args),
+            Command::CmdEndRenderPass(args) => call_CmdEndRenderPass(device, ext, &mut arena, args),
+            Command::CmdExecuteCommands(args) => {
+                call_CmdExecuteCommands(device, ext, &mut arena, args)
+            }
+            Command::TrimCommandPool(args) => call_TrimCommandPool(device, ext, &mut arena, args),
             Command::GetDeviceGroupPeerMemoryFeatures(args) => {
-                call_GetDeviceGroupPeerMemoryFeatures(device, &mut arena, args)
+                call_GetDeviceGroupPeerMemoryFeatures(device, ext, &mut arena, args)
             }
-            Command::CmdSetDeviceMask(args) => call_CmdSetDeviceMask(device, &mut arena, args),
-            Command::CmdDispatchBase(args) => call_CmdDispatchBase(device, &mut arena, args),
+            Command::CmdSetDeviceMask(args) => call_CmdSetDeviceMask(device, ext, &mut arena, args),
+            Command::CmdDispatchBase(args) => call_CmdDispatchBase(device, ext, &mut arena, args),
             Command::CreateDescriptorUpdateTemplate(args) => {
-                call_CreateDescriptorUpdateTemplate(device, &mut arena, args)
+                call_CreateDescriptorUpdateTemplate(device, ext, &mut arena, args)
             }
             Command::DestroyDescriptorUpdateTemplate(args) => {
-                call_DestroyDescriptorUpdateTemplate(device, &mut arena, args)
+                call_DestroyDescriptorUpdateTemplate(device, ext, &mut arena, args)
             }
             Command::CreateSamplerYcbcrConversion(args) => {
-                call_CreateSamplerYcbcrConversion(device, &mut arena, args)
+                call_CreateSamplerYcbcrConversion(device, ext, &mut arena, args)
             }
             Command::DestroySamplerYcbcrConversion(args) => {
-                call_DestroySamplerYcbcrConversion(device, &mut arena, args)
+                call_DestroySamplerYcbcrConversion(device, ext, &mut arena, args)
             }
             Command::GetDescriptorSetLayoutSupport(args) => {
-                call_GetDescriptorSetLayoutSupport(device, &mut arena, args)
+                call_GetDescriptorSetLayoutSupport(device, ext, &mut arena, args)
             }
-            Command::CreateRenderPass2(args) => call_CreateRenderPass2(device, &mut arena, args),
+            Command::CreateRenderPass2(args) => {
+                call_CreateRenderPass2(device, ext, &mut arena, args)
+            }
             Command::CmdBeginRenderPass2(args) => {
-                call_CmdBeginRenderPass2(device, &mut arena, args)
+                call_CmdBeginRenderPass2(device, ext, &mut arena, args)
             }
-            Command::CmdNextSubpass2(args) => call_CmdNextSubpass2(device, &mut arena, args),
-            Command::CmdEndRenderPass2(args) => call_CmdEndRenderPass2(device, &mut arena, args),
+            Command::CmdNextSubpass2(args) => call_CmdNextSubpass2(device, ext, &mut arena, args),
+            Command::CmdEndRenderPass2(args) => {
+                call_CmdEndRenderPass2(device, ext, &mut arena, args)
+            }
             Command::GetSemaphoreCounterValue(args) => {
-                call_GetSemaphoreCounterValue(device, &mut arena, args)
+                call_GetSemaphoreCounterValue(device, ext, &mut arena, args)
             }
-            Command::WaitSemaphores(args) => call_WaitSemaphores(device, &mut arena, args),
-            Command::SignalSemaphore(args) => call_SignalSemaphore(device, &mut arena, args),
+            Command::WaitSemaphores(args) => call_WaitSemaphores(device, ext, &mut arena, args),
+            Command::SignalSemaphore(args) => call_SignalSemaphore(device, ext, &mut arena, args),
             Command::CmdDrawIndirectCount(args) => {
-                call_CmdDrawIndirectCount(device, &mut arena, args)
+                call_CmdDrawIndirectCount(device, ext, &mut arena, args)
             }
             Command::CmdDrawIndexedIndirectCount(args) => {
-                call_CmdDrawIndexedIndirectCount(device, &mut arena, args)
+                call_CmdDrawIndexedIndirectCount(device, ext, &mut arena, args)
             }
-            Command::CmdSetCullMode(args) => call_CmdSetCullMode(device, &mut arena, args),
-            Command::CmdSetFrontFace(args) => call_CmdSetFrontFace(device, &mut arena, args),
+            Command::CmdBindTransformFeedbackBuffersEXT(args) => {
+                call_CmdBindTransformFeedbackBuffersEXT(device, ext, &mut arena, args)
+            }
+            Command::CmdBeginTransformFeedbackEXT(args) => {
+                call_CmdBeginTransformFeedbackEXT(device, ext, &mut arena, args)
+            }
+            Command::CmdEndTransformFeedbackEXT(args) => {
+                call_CmdEndTransformFeedbackEXT(device, ext, &mut arena, args)
+            }
+            Command::CmdBeginQueryIndexedEXT(args) => {
+                call_CmdBeginQueryIndexedEXT(device, ext, &mut arena, args)
+            }
+            Command::CmdEndQueryIndexedEXT(args) => {
+                call_CmdEndQueryIndexedEXT(device, ext, &mut arena, args)
+            }
+            Command::CmdDrawIndirectByteCountEXT(args) => {
+                call_CmdDrawIndirectByteCountEXT(device, ext, &mut arena, args)
+            }
+            Command::CmdSetLineStipple(args) => {
+                call_CmdSetLineStipple(device, ext, &mut arena, args)
+            }
+            Command::CmdSetCullMode(args) => call_CmdSetCullMode(device, ext, &mut arena, args),
+            Command::CmdSetFrontFace(args) => call_CmdSetFrontFace(device, ext, &mut arena, args),
             Command::CmdSetPrimitiveTopology(args) => {
-                call_CmdSetPrimitiveTopology(device, &mut arena, args)
+                call_CmdSetPrimitiveTopology(device, ext, &mut arena, args)
             }
             Command::CmdSetViewportWithCount(args) => {
-                call_CmdSetViewportWithCount(device, &mut arena, args)
+                call_CmdSetViewportWithCount(device, ext, &mut arena, args)
             }
             Command::CmdSetScissorWithCount(args) => {
-                call_CmdSetScissorWithCount(device, &mut arena, args)
+                call_CmdSetScissorWithCount(device, ext, &mut arena, args)
             }
             Command::CmdBindVertexBuffers2(args) => {
-                call_CmdBindVertexBuffers2(device, &mut arena, args)
+                call_CmdBindVertexBuffers2(device, ext, &mut arena, args)
             }
             Command::CmdSetDepthTestEnable(args) => {
-                call_CmdSetDepthTestEnable(device, &mut arena, args)
+                call_CmdSetDepthTestEnable(device, ext, &mut arena, args)
             }
             Command::CmdSetDepthWriteEnable(args) => {
-                call_CmdSetDepthWriteEnable(device, &mut arena, args)
+                call_CmdSetDepthWriteEnable(device, ext, &mut arena, args)
             }
             Command::CmdSetDepthCompareOp(args) => {
-                call_CmdSetDepthCompareOp(device, &mut arena, args)
+                call_CmdSetDepthCompareOp(device, ext, &mut arena, args)
             }
             Command::CmdSetDepthBoundsTestEnable(args) => {
-                call_CmdSetDepthBoundsTestEnable(device, &mut arena, args)
+                call_CmdSetDepthBoundsTestEnable(device, ext, &mut arena, args)
             }
             Command::CmdSetStencilTestEnable(args) => {
-                call_CmdSetStencilTestEnable(device, &mut arena, args)
+                call_CmdSetStencilTestEnable(device, ext, &mut arena, args)
             }
-            Command::CmdSetStencilOp(args) => call_CmdSetStencilOp(device, &mut arena, args),
+            Command::CmdSetStencilOp(args) => call_CmdSetStencilOp(device, ext, &mut arena, args),
             Command::CmdSetRasterizerDiscardEnable(args) => {
-                call_CmdSetRasterizerDiscardEnable(device, &mut arena, args)
+                call_CmdSetRasterizerDiscardEnable(device, ext, &mut arena, args)
             }
             Command::CmdSetDepthBiasEnable(args) => {
-                call_CmdSetDepthBiasEnable(device, &mut arena, args)
+                call_CmdSetDepthBiasEnable(device, ext, &mut arena, args)
             }
             Command::CmdSetPrimitiveRestartEnable(args) => {
-                call_CmdSetPrimitiveRestartEnable(device, &mut arena, args)
+                call_CmdSetPrimitiveRestartEnable(device, ext, &mut arena, args)
             }
             Command::CreatePrivateDataSlot(args) => {
-                call_CreatePrivateDataSlot(device, &mut arena, args)
+                call_CreatePrivateDataSlot(device, ext, &mut arena, args)
             }
             Command::DestroyPrivateDataSlot(args) => {
-                call_DestroyPrivateDataSlot(device, &mut arena, args)
+                call_DestroyPrivateDataSlot(device, ext, &mut arena, args)
             }
-            Command::SetPrivateData(args) => call_SetPrivateData(device, &mut arena, args),
-            Command::GetPrivateData(args) => call_GetPrivateData(device, &mut arena, args),
-            Command::CmdCopyBuffer2(args) => call_CmdCopyBuffer2(device, &mut arena, args),
-            Command::CmdCopyImage2(args) => call_CmdCopyImage2(device, &mut arena, args),
-            Command::CmdBlitImage2(args) => call_CmdBlitImage2(device, &mut arena, args),
+            Command::SetPrivateData(args) => call_SetPrivateData(device, ext, &mut arena, args),
+            Command::GetPrivateData(args) => call_GetPrivateData(device, ext, &mut arena, args),
+            Command::CmdCopyBuffer2(args) => call_CmdCopyBuffer2(device, ext, &mut arena, args),
+            Command::CmdCopyImage2(args) => call_CmdCopyImage2(device, ext, &mut arena, args),
+            Command::CmdBlitImage2(args) => call_CmdBlitImage2(device, ext, &mut arena, args),
             Command::CmdCopyBufferToImage2(args) => {
-                call_CmdCopyBufferToImage2(device, &mut arena, args)
+                call_CmdCopyBufferToImage2(device, ext, &mut arena, args)
             }
             Command::CmdCopyImageToBuffer2(args) => {
-                call_CmdCopyImageToBuffer2(device, &mut arena, args)
+                call_CmdCopyImageToBuffer2(device, ext, &mut arena, args)
             }
-            Command::CmdResolveImage2(args) => call_CmdResolveImage2(device, &mut arena, args),
-            Command::CmdSetEvent2(args) => call_CmdSetEvent2(device, &mut arena, args),
-            Command::CmdResetEvent2(args) => call_CmdResetEvent2(device, &mut arena, args),
-            Command::CmdWaitEvents2(args) => call_CmdWaitEvents2(device, &mut arena, args),
+            Command::CmdResolveImage2(args) => call_CmdResolveImage2(device, ext, &mut arena, args),
+            Command::CmdSetEvent2(args) => call_CmdSetEvent2(device, ext, &mut arena, args),
+            Command::CmdResetEvent2(args) => call_CmdResetEvent2(device, ext, &mut arena, args),
+            Command::CmdWaitEvents2(args) => call_CmdWaitEvents2(device, ext, &mut arena, args),
             Command::CmdPipelineBarrier2(args) => {
-                call_CmdPipelineBarrier2(device, &mut arena, args)
+                call_CmdPipelineBarrier2(device, ext, &mut arena, args)
             }
-            Command::QueueSubmit2(args) => call_QueueSubmit2(device, &mut arena, args),
-            Command::CmdWriteTimestamp2(args) => call_CmdWriteTimestamp2(device, &mut arena, args),
-            Command::CmdBeginRendering(args) => call_CmdBeginRendering(device, &mut arena, args),
-            Command::CmdEndRendering(args) => call_CmdEndRendering(device, &mut arena, args),
+            Command::QueueSubmit2(args) => call_QueueSubmit2(device, ext, &mut arena, args),
+            Command::CmdWriteTimestamp2(args) => {
+                call_CmdWriteTimestamp2(device, ext, &mut arena, args)
+            }
+            Command::CmdBeginRendering(args) => {
+                call_CmdBeginRendering(device, ext, &mut arena, args)
+            }
+            Command::CmdEndRendering(args) => call_CmdEndRendering(device, ext, &mut arena, args),
             other => Err(CallError::NoCall(other.name())),
         }
     }

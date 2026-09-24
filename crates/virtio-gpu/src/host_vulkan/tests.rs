@@ -96,7 +96,14 @@ fn the_bring_up_runs_on_the_host_gpu_and_names_it_as_ash_does() {
     let p = p.p_properties.unwrap();
     let (name, vendor, device) = first_gpu_directly();
     assert_eq!(String::from_utf8_lossy(c_name(&p.device_name)), name);
-    assert_eq!((p.vendor_id, p.device_id), (vendor, device));
+    // Stage 5c: an NVIDIA GPU is shown with the virtio vendor
+    // (`policy::shape_identity`); every other vendor as it is.
+    let shown = if vendor == crate::venus::executor::policy::NVIDIA_VENDOR_ID {
+        crate::venus::executor::policy::VIRTIO_PCI_VENDOR_ID
+    } else {
+        vendor
+    };
+    assert_eq!((p.vendor_id, p.device_id), (shown, device));
     let (_, major, minor, _) = crate::venus::capset::vk_api_version_parts(p.api_version);
     assert!((major, minor) <= (1, 3), "apiVersion is capped at 1.3");
 

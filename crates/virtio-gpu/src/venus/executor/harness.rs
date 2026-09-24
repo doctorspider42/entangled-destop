@@ -34,8 +34,9 @@ pub const REPLY_RES: u32 = 8;
 pub const RING: u64 = 0x5555_0000_0000_0001;
 /// Size of the reply pool, as Mesa's (1 MiB, `vn_instance.c:315-316`).
 pub const REPLY_BYTES: u64 = 1 << 20;
-/// Size of each reply window the harness binds.
-pub const WINDOW: u64 = 16 << 10;
+/// Size of each reply window the harness binds: room for the whole
+/// extension list a real GPU is shown (stage 5c: ~70 entries of 260 bytes).
+pub const WINDOW: u64 = 64 << 10;
 
 const HEAD: u64 = 0;
 const TAIL: u64 = 4;
@@ -150,6 +151,24 @@ pub struct Harness<H: HostVulkan> {
     /// Where the last submission started: the `head` a fatal on its first
     /// command leaves.
     pub last_start: u32,
+    /// The context the harness is driving now ([`CTX`] unless
+    /// [`Self::use_context`] switched), its ring handle and reply resource.
+    pub ctx: u32,
+    ring_handle: u64,
+    reply_res: u32,
+    /// The other contexts' lanes, parked while another is driven.
+    parked: std::collections::HashMap<u32, Lane>,
+}
+
+/// One context's ring, as the harness drives it.
+struct Lane {
+    ring: Arc<RingPages>,
+    reply: Arc<RingPages>,
+    tail: u32,
+    reply_at: u64,
+    last_start: u32,
+    ring_handle: u64,
+    reply_res: u32,
 }
 
 fn blob(resource_id: u32, size: u64) -> ResourceCreateBlob {
@@ -219,13 +238,17 @@ pub fn async_bytes(command: &Command<'_>) -> Vec<u8> {
 }
 
 fn create_ring_stream(monitor_us: Option<u32>) -> Vec<u8> {
+    create_ring_stream_on(RING, RING_RES, monitor_us)
+}
+
+fn create_ring_stream_on(ring: u64, ring_res: u32, monitor_us: Option<u32>) -> Vec<u8> {
     encoded(|enc| {
         enc.command_header(CommandHeader {
             opcode: Opcode::CreateRing.as_u32(),
             flags: 0,
         })
         .expect("encode");
-        enc.handle(RING).expect("encode");
+        enc.handle(ring).expect("encode");
         enc.simple_pointer(true).expect("encode");
         enc.i32(STYPE_RING_CREATE_INFO_MESA).expect("encode");
         match monitor_us {
@@ -240,7 +263,7 @@ fn create_ring_stream(monitor_us: Option<u32>) -> Vec<u8> {
             }
         }
         enc.flags(0).expect("encode");
-        enc.u32(RING_RES).expect("encode");
+        enc.u32(ring_res).expect("encode");
         for value in [
             0,
             RING_BYTES,
@@ -258,14 +281,14 @@ fn create_ring_stream(monitor_us: Option<u32>) -> Vec<u8> {
     })
 }
 
-fn notify_stream() -> Vec<u8> {
+fn notify_stream(ring: u64) -> Vec<u8> {
     encoded(|enc| {
         enc.command_header(CommandHeader {
             opcode: Opcode::NotifyRing.as_u32(),
             flags: 0,
         })
         .expect("encode");
-        enc.handle(RING).expect("encode");
+        enc.handle(ring).expect("encode");
         enc.u32(0).expect("encode");
         enc.flags(0).expect("encode");
     })
@@ -348,7 +371,68 @@ impl<H: HostVulkan> Harness<H> {
             tail: 0,
             reply_at: 0,
             last_start: 0,
+            ctx: CTX,
+            ring_handle: RING,
+            reply_res: REPLY_RES,
+            parked: std::collections::HashMap::new(),
         }
+    }
+
+    /// Drive context `ctx_id` from now on — a second guest process, with
+    /// its own ring and reply pool — creating it the first time (stage 5c's
+    /// cross-context imports). [`CTX`] is the harness's first.
+    pub fn use_context(&mut self, ctx_id: u32) {
+        if ctx_id == self.ctx {
+            return;
+        }
+        let current = Lane {
+            ring: Arc::clone(&self.ring),
+            reply: Arc::clone(&self.reply),
+            tail: self.tail,
+            reply_at: self.reply_at,
+            last_start: self.last_start,
+            ring_handle: self.ring_handle,
+            reply_res: self.reply_res,
+        };
+        self.parked.insert(self.ctx, current);
+        let lane = match self.parked.remove(&ctx_id) {
+            Some(lane) => lane,
+            None => {
+                // Resource ids and a ring handle of its own.
+                let ring_res = 1000 + ctx_id * 2;
+                let reply_res = ring_res + 1;
+                let ring_handle = RING + u64::from(ctx_id) * 0x100;
+                self.renderer
+                    .ctx_create(ctx_id, crate::CAPSET_VENUS, "venus")
+                    .expect("a second venus context");
+                self.renderer
+                    .create_blob(ctx_id, &blob(ring_res, RING_BYTES), &self.mem, &[])
+                    .expect("its ring blob");
+                self.renderer
+                    .create_blob(ctx_id, &blob(reply_res, REPLY_BYTES), &self.mem, &[])
+                    .expect("its reply pool");
+                self.renderer
+                    .submit(ctx_id, &create_ring_stream_on(ring_handle, ring_res, None))
+                    .expect("its ring is adopted");
+                Lane {
+                    ring: self.renderer.blob_pages(ring_res).expect("the ring blob"),
+                    reply: self.renderer.blob_pages(reply_res).expect("the reply pool"),
+                    tail: 0,
+                    reply_at: 0,
+                    last_start: 0,
+                    ring_handle,
+                    reply_res,
+                }
+            }
+        };
+        self.ctx = ctx_id;
+        self.ring = lane.ring;
+        self.reply = lane.reply;
+        self.tail = lane.tail;
+        self.reply_at = lane.reply_at;
+        self.last_start = lane.last_start;
+        self.ring_handle = lane.ring_handle;
+        self.reply_res = lane.reply_res;
     }
 
     /// Create another host blob, on `ctx_id`.
@@ -389,10 +473,10 @@ impl<H: HostVulkan> Harness<H> {
                 flags: 0,
             })
             .expect("encode");
-            enc.u64(RING).expect("encode");
+            enc.u64(self.ring_handle).expect("encode");
             enc.u64(seqno).expect("encode");
         });
-        self.renderer.submit(CTX, &bytes)
+        self.renderer.submit(self.ctx, &bytes)
     }
 
     /// `head` as the guest reads it.
@@ -458,7 +542,9 @@ impl<H: HostVulkan> Harness<H> {
         assert!(self.ring.guest_store_word(TAIL, self.tail));
         // Harmless when the worker is already polling, and answered with a
         // refusal once the ring is dead, which is the case being waited for.
-        let _ = self.renderer.submit(CTX, &notify_stream());
+        let _ = self
+            .renderer
+            .submit(self.ctx, &notify_stream(self.ring_handle));
     }
 
     /// `tail` so far: where the next command will start.
@@ -487,7 +573,7 @@ impl<H: HostVulkan> Harness<H> {
     /// `head` where the ring died, if it did.
     pub fn call(&mut self, command: &Command<'_>) -> Result<Command<'static>, u32> {
         let at = self.next_window();
-        if let Outcome::Fatal { head } = self.submit(&set_reply(REPLY_RES, at, WINDOW)) {
+        if let Outcome::Fatal { head } = self.submit(&set_reply(self.reply_res, at, WINDOW)) {
             return Err(head);
         }
         if let Outcome::Fatal { head } = self.submit(&call_bytes(command)) {

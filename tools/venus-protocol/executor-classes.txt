@@ -1,15 +1,19 @@
 # How the Venus executor serves every core Vulkan 1.0-1.3 command the
-# protocol decodes. Read by `scripts/venus-exec-gen.py`, which refuses to run
-# unless every such command is in exactly one section, and unless the two
-# hand-written sections agree with the `match` arms that implement them.
+# protocol decodes, and every command of an admitted device extension
+# (venus/executor/policy.rs `ADMITTED_EXTENSIONS`, stage 5c). Read by
+# `scripts/venus-exec-gen.py`, which refuses to run unless every such command
+# is in exactly one section, and unless the two hand-written sections agree
+# with the `match` arms that implement them.
 #
-# A line is one command; `#` starts a comment. Extension commands are not
-# listed: the device extensions advertised (VK_KHR_synchronization2,
-# VK_KHR_external_semaphore_fd) add no command outside core 1.3 that a guest
-# sends, and the venus protocol's own vkImportSemaphoreResourceMESA and
-# vkWaitSemaphoreResourceMESA are served by hand (executor/submit.rs,
-# `dispatch_extension`); every other extension command stays refused as
-# "decodable but not implemented".
+# A line is one command; `#` starts a comment. An admitted extension's
+# command is served only on a device the guest enabled one of the extensions
+# that bring it on (`generated::extensions_of`). The promoted extensions
+# advertised add no command outside core 1.3 that a guest sends (their KHR
+# aliases are encoded as the core commands), the emulated ones add none the
+# guest sends either, and the venus protocol's own vkImportSemaphoreResourceMESA,
+# vkWaitSemaphoreResourceMESA and vkGetMemoryResourcePropertiesMESA are served
+# by hand (executor/submit.rs, `dispatch_extension`); every other extension
+# command stays refused as "decodable but not implemented".
 #
 # [bespoke]      Stages 5a.3 and 5b.1: hand-written end to end, host call
 #                included (`VulkanContext::dispatch` in executor/context.rs,
@@ -40,6 +44,7 @@ vkGetPhysicalDeviceQueueFamilyProperties2
 vkGetPhysicalDeviceMemoryProperties2
 vkEnumerateDeviceExtensionProperties
 vkGetPhysicalDeviceExternalSemaphoreProperties  # SYNC_FD synthesized (5b.3)
+vkGetPhysicalDeviceExternalBufferProperties     # DMA_BUF emulated (5c)
 vkGetPhysicalDeviceFormatProperties2
 vkGetPhysicalDeviceImageFormatProperties2
 vkCreateDevice
@@ -170,6 +175,16 @@ vkCmdCopyQueryPoolResults
 vkCmdClearAttachments           # attachment indices inside maxColorAttachments
 vkCmdSetDeviceMask              # inside the device group
 vkCmdExecuteCommands            # secondaries only
+# Stage 5c: the admitted extensions' commands that name buffers, queries or
+# indices into the driver's fixed-size state.
+vkCmdBindTransformFeedbackBuffersEXT    # bindings inside maxTransformFeedbackBuffers, ranges inside the buffers
+vkCmdBeginTransformFeedbackEXT          # counter buffers inside the limit, 4 bytes inside each
+vkCmdEndTransformFeedbackEXT
+vkCmdBeginQueryIndexedEXT               # the query inside the pool, the stream inside maxTransformFeedbackStreams
+vkCmdEndQueryIndexedEXT
+vkCmdDrawIndirectByteCountEXT           # the counter inside its buffer, the stride inside the limit
+vkCmdBeginConditionalRenderingEXT       # the predicate's 4 bytes inside a CONDITIONAL_RENDERING buffer
+vkCmdSetLineStipple                     # factor in [1, 256]
 
 [generated]
 vkEndCommandBuffer
@@ -226,6 +241,7 @@ vkCmdSetStencilOp
 vkCmdSetRasterizerDiscardEnable
 vkCmdSetDepthBiasEnable
 vkCmdSetPrimitiveRestartEnable
+vkCmdEndConditionalRenderingEXT
 
 [refused]
 # Sparse resources: every sparse feature is reported false (policy::mask_features).
@@ -247,9 +263,8 @@ vkEnumerateInstanceExtensionProperties
 vkEnumerateDeviceLayerProperties
 vkGetDeviceQueue
 vkGetPhysicalDeviceToolProperties
-# External handles: no external-memory or external-fence extension is
-# advertised (the one semaphore query is served, above).
-vkGetPhysicalDeviceExternalBufferProperties
+# External handles: no external-fence extension is advertised (the semaphore
+# and buffer queries are served, above).
 vkGetPhysicalDeviceExternalFenceProperties
 # Host-visible memory is the renderer's own coherent pages: nothing to map,
 # unmap, flush or invalidate on the host (ADR-0004, 2026-09-23).

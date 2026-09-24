@@ -229,6 +229,24 @@ pub struct DeviceObject<H: HostVulkan> {
     pub group_size: u32,
     /// Whether it was created with `bufferDeviceAddress` enabled.
     pub buffer_device_address: bool,
+    /// The device extensions the guest enabled on it, every one of them
+    /// advertised (stage 5c): what an admitted extension's commands, values
+    /// and chained structures are judged by (`policy::ADMITTED_EXTENSIONS`).
+    pub extensions: Vec<String>,
+    /// Whether it was created with robustness2's `nullDescriptor`: a null
+    /// view, buffer or vertex buffer is then the guest's to name.
+    pub null_descriptor: bool,
+    /// Live samplers of it with a custom border colour, which a driver
+    /// keeps in a table of `maxCustomBorderColorSamplers` entries.
+    pub custom_border_samplers: u32,
+}
+
+impl<H: HostVulkan> DeviceObject<H> {
+    /// Whether the guest enabled `extension` on this device.
+    #[must_use]
+    pub fn enabled(&self, extension: &str) -> bool {
+        self.extensions.iter().any(|e| e == extension)
+    }
 }
 
 /// A `VkQueue`.
@@ -338,6 +356,10 @@ pub struct BufferObject<H: HostVulkan> {
     /// Whether it was created able to take our imported pages; its
     /// `memoryTypeBits` name the host-visible types only if so.
     pub host_memory: bool,
+    /// Whether it was created for `DMA_BUF` export (stage 5c): with
+    /// [`Self::host_memory`], its `memoryTypeBits` name our pages alone
+    /// (`memory::external_type_bits`).
+    pub external: bool,
     /// Its binding, once bound. A buffer is bound at most once.
     pub bound: Option<Binding>,
 }
@@ -376,6 +398,8 @@ pub struct ImageObject<H: HostVulkan> {
     pub facts: ImageFacts,
     /// As [`BufferObject::host_memory`].
     pub host_memory: bool,
+    /// As [`BufferObject::external`].
+    pub external: bool,
     /// Bit `n` set once plane `n` is bound (bit 0 for a non-disjoint image).
     pub bound_planes: u32,
 }
@@ -504,6 +528,9 @@ pub enum Facts {
     /// A semaphore (stage 5b.3), and — for a binary one — the state its
     /// payload is in as the executor has seen the guest drive it.
     Semaphore(SemaphoreState),
+    /// A sampler with a custom border colour (stage 5c): one entry of its
+    /// device's `maxCustomBorderColorSamplers`, given back when it goes.
+    CustomBorderSampler,
 }
 
 /// What the executor knows of a semaphore (stage 5b.3).

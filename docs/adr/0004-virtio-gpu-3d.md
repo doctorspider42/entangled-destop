@@ -2784,3 +2784,184 @@ Stage 5c takes these in order: report the virtio vendor ID (`0x1af4`) for an
 NVIDIA host, hold the reported driver version under the dma-buf-WSI line,
 advertise and serve the extensions above, and emulate
 `VK_EXT_external_memory_dma_buf` over our own pages.
+
+## Amendment, 2026-09-24 — stage 5c: the identity, Zink's extensions, and dma-buf over our pages
+
+Stage 5c is the list above, built. None of it is guest acceptance yet: the
+RTX 2070 runs every new path through a real ring (below), and `eglinfo` and
+`glmark2-wayland` under `MESA_LOADER_DRIVER_OVERRIDE=zink` are the next
+measurement. Two citations above, corrected from 26.0.8: the five extensions
+Zink requires by name are declared at `zink_device_info.py:62-63, 93-94,
+180-183, 203-206, 313-314` and refused at `:755-758`, and
+`zink_get_display_device` is `zink_screen.c:1666-1685`.
+
+### The identity (`policy::shape_identity`)
+
+- **`vendorID` `0x10de` is shown as `0x1af4`**, the virtio PCI vendor —
+  Mesa's `VIRTGPU_PCI_VENDOR_ID`, what the guest's render node really is
+  (`vn_renderer_virtgpu.c:44`, `:1461`). `deviceID`, `deviceName`,
+  `driverID` and `driverVersion` stay the host's. The `vn_wsi_init` quirk is
+  for a real NVIDIA GPU visible to the guest's window system; ours is a
+  virtual device, and what the NVIDIA workarounds of Zink and of venus itself
+  key on is `driverID` (`zink_screen.c:2943`, `vn_query_pool.c:135`), which
+  is kept. With the quirk not triggered, venus reports the virtgpu node's DRM
+  numbers and `EXT_physical_device_drm`, and Zink's match has something to
+  match.
+- **An NVIDIA `driverVersion` at or past 590.48.01 is shown as 590.48.0.0**
+  (`VN_MAKE_NVIDIA_VERSION`, `vn_common.h:76-78`: 10, 8, 8 and 6 bits; the
+  RTX 2070's 580.88 is `0x91160000`, which its `vulkaninfo` prints as
+  2434138112). Venus keeps its software WSI for an NVIDIA driver below that
+  line even when the renderer lists dma-buf (`vn_wsi.c:134-139`), and the
+  guest shows applications its own `driverVersion` anyway
+  (`vn_physical_device.c:550-554`). Today's 580.88 is untouched. **Removing
+  the cap is the switch that turns dma-buf WSI on**, once this renderer has a
+  dma-buf path to present through.
+- **A non-NVIDIA host is not offered the dma-buf pair**
+  (`policy::keeps_software_wsi`, `advertised_extensions_on`). For any other
+  driver the same line of `vn_wsi.c` puts venus's WSI on its native dma-buf
+  path the moment dma-buf is listed, and that path exports device-local,
+  optimal-tiling swapchain images this renderer cannot make: advertising it
+  there would trade a working swapchain for Zink's DRM screen. On such a host
+  Zink stays on the guest's software GL until dma-buf WSI exists. This
+  refines the stage-5c design, which named only the NVIDIA case.
+
+### What the guest is shown (`policy`)
+
+On the RTX 2070 (Windows, 580.88), from
+`host_vulkan::pipeline_tests::the_host_gpu_is_shown_what_zink_needs`: **71
+device extensions**, `apiVersion 1.3.312`, vendor `0x1af4`, device `0x1f02`,
+`driverVersion 0x91160000`.
+
+| kind | extensions | what it obliges the renderer to |
+|---|---|---|
+| promoted to 1.1–1.3, passed through (`PROMOTED_EXTENSIONS`: 58, of which the RTX 2070 has 57 — not `EXT_texture_compression_astc_hdr`) | 1.1: `16bit_storage`, `bind_memory2`, `dedicated_allocation`, `descriptor_update_template`, `external_{fence,memory,semaphore}`, `get_memory_requirements2`, `maintenance1/2/3`, `multiview`, `relaxed_block_layout`, `sampler_ycbcr_conversion`, `shader_draw_parameters`, `storage_buffer_storage_class`, `variable_pointers`; 1.2: `8bit_storage`, `buffer_device_address`, `create_renderpass2`, `depth_stencil_resolve`, `draw_indirect_count`, `driver_properties`, `image_format_list`, `imageless_framebuffer`, `sampler_mirror_clamp_to_edge`, `separate_depth_stencil_layouts`, `shader_atomic_int64`, `shader_float16_int8`, `shader_float_controls`, `shader_subgroup_extended_types`, `spirv_1_4`, `timeline_semaphore`, `uniform_buffer_standard_layout`, `vulkan_memory_model`, `EXT_descriptor_indexing`, `EXT_host_query_reset`, `EXT_sampler_filter_minmax`, `EXT_scalar_block_layout`, `EXT_separate_stencil_usage`, `EXT_shader_viewport_index_layer`; 1.3: `copy_commands2`, `dynamic_rendering`, `format_feature_flags2`, `maintenance4`, `shader_integer_dot_product`, `shader_non_semantic_info`, `shader_terminate_invocation`, `synchronization2`, `zero_initialize_workgroup_memory`, `EXT_image_robustness`, `EXT_inline_uniform_block`, `EXT_pipeline_creation_cache_control`, `EXT_pipeline_creation_feedback`, `EXT_private_data`, `EXT_shader_demote_to_helper_invocation`, `EXT_subgroup_size_control`, `EXT_texture_compression_astc_hdr` | nothing new: every command is core in that version and encoded as the core command, every own structure is core and admitted — the rule the list is drawn up by, from vk.xml. Out by the same rule: `KHR_device_group` (swapchain interactions), and `EXT_4444_formats`, `EXT_extended_dynamic_state`, `EXT_extended_dynamic_state2`, `EXT_texel_buffer_alignment`, `EXT_ycbcr_2plane_444_formats` (feature structures that were not promoted). `descriptor_update_template` is in because its one non-core command needs `KHR_push_descriptor`, not offered. Each only on a device of its version or newer |
+| admitted, passed through (`ADMITTED_EXTENSIONS`) | `EXT_robustness2` (`KHR_` where the host has it; the RTX 2070 has not), `EXT_transform_feedback`, `EXT_conditional_rendering`, `EXT_line_rasterization` and `KHR_`, `EXT_vertex_attribute_divisor` and `KHR_`, `EXT_depth_clip_enable`, `EXT_provoking_vertex`, `EXT_custom_border_color`, `EXT_border_color_swizzle` | their 25 structures, each admitted only on a device that enabled an extension bringing it; their feature and property structures queried from the host (gated on the host reporting the extension — the host instance is 1.3, and several are 1.4 names); their commands served (below); their enum values and flag bits legal once enabled |
+| emulated | `KHR_external_semaphore_fd` (5b.3), `EXT_external_memory_dma_buf`, `KHR_external_memory_fd` | the emulation below; all three stripped from a device create before the host sees it. `KHR_external_memory_fd` is listed because venus adds it with dma-buf to every device create that wants a swapchain or an fd (`vn_device.c:318-330`) |
+
+The capset's enumerated mask is still derived from the admitted structures:
+72 extensions (60, and the twelve admitted device extensions). The generators
+read `ADMITTED_EXTENSIONS` out of `policy.rs`, so the bridge, the translation
+and the policy are one list. `robustBufferAccess` is *reported* as the host
+reports it (Zink's GL 4.3 gate), and forced on every host device as before,
+which `robustBufferAccess2` needs.
+
+### Commands and bounds
+
+The nine new commands are classified in `executor-classes.txt` and go
+through the generated translation and host call like every other; the host
+call reaches the driver through `calls::ExtTables`, the `ash` tables of the
+admitted extensions the host device was created with. An extension command
+on a device that enabled none of its extensions is refused
+(`ExecError::NotEnabled`), and so are its structures (the generated chain
+walk) and its values (generated `x_`/`m_` helpers over `Resolve::enabled`,
+from vk.xml's extension `<require>` blocks and their `depends` — so sync2's
+transform-feedback stage and access bits are legal exactly with transform
+feedback).
+
+| command | bounded by hand |
+|---|---|
+| `vkCmdBindTransformFeedbackBuffersEXT` | bindings inside `maxTransformFeedbackBuffers`; each buffer `TRANSFORM_FEEDBACK`, its offset 4-aligned inside it, its range inside it and inside `maxTransformFeedbackBufferSize` |
+| `vkCmd{Begin,End}TransformFeedbackEXT` | counter slots inside the limit; each non-null counter 4 aligned bytes inside a `TRANSFORM_FEEDBACK_COUNTER` buffer |
+| `vkCmd{Begin,End}QueryIndexedEXT` | the query inside its pool; the index a stream the device has for a stream query, 0 otherwise (a stream pool's results are two values a query) |
+| `vkCmdDrawIndirectByteCountEXT` | the counter 4 aligned bytes inside its buffer; a stride in `1..=maxTransformFeedbackBufferDataStride` |
+| `vkCmdBeginConditionalRenderingEXT` | the predicate 4 aligned bytes inside a `CONDITIONAL_RENDERING` buffer (`End` is generated) |
+| `vkCmdSetLineStipple` | a factor in `[1, 256]`, as in `VkPipelineRasterizationLineStateCreateInfo` |
+
+Beyond the commands: a rasterization stream inside
+`maxTransformFeedbackStreams`; vertex divisors naming bindings inside
+`maxVertexInputBindings`, divisors inside `maxVertexAttribDivisor`; no more
+live custom-border-colour samplers than `maxCustomBorderColorSamplers`, a
+driver's fixed table; with robustness2's `nullDescriptor`, a null image
+view, texel view, buffer (offset 0, whole range) or vertex buffer (offset 0)
+is the guest's to send — Zink binds one for every unbound slot — and without
+it they are refused as before. A feature structure of an extension the guest
+did not enable is judged, and never forwarded.
+
+### `VK_EXT_external_memory_dma_buf`, emulated over our pages
+
+A dma-buf here is what a blob of this renderer already is: our pages.
+
+- **Queries.** `vkGetPhysicalDeviceExternalBufferProperties(DMA_BUF)`
+  answers `EXPORTABLE | IMPORTABLE`, compatible with and exportable from
+  `DMA_BUF`, exactly when the host would import our pages for such a buffer
+  (`HOST_ALLOCATION` `IMPORTABLE`), and nothing otherwise; every other handle
+  type is answered nothing. An image query with `DMA_BUF` — which 26.0.8
+  answers itself as unsupported for every tiling but DRM modifiers
+  (`vn_physical_device.c:2812-2817`), so only another guest driver would send
+  it — is asked of the host as `HOST_ALLOCATION` and answered the same way,
+  or `VK_ERROR_FORMAT_NOT_SUPPORTED`.
+- **Resources.** `VkExternalMemory{Buffer,Image}CreateInfo{DMA_BUF}` is
+  accepted on a device that enabled dma-buf (any other handle type is fatal).
+  The host resource is created as every resource is, for host allocations
+  when the host allows, and one that can take our pages then asks for them
+  alone in its `memoryTypeBits`. Zink creates every shared image this way,
+  with the `OPAQUE_FD` venus rewrites to `DMA_BUF`, and asks no format query
+  first (`zink_resource.c:1336-1340`, `:1504`).
+- **Exports.** `VkExportMemoryAllocateInfo{DMA_BUF}` is an ordinary
+  allocation. On a host-visible type it is our pages, and the blob Mesa makes
+  of it at once (`vn_device_memory_alloc_export`) is those pages, as for any
+  mapped memory. On any other type there is nothing to share: the memory is
+  made, its blob refused, and the guest's `vkAllocateMemory` answers
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` and frees it — refused in Vulkan terms. (Not
+  making the memory would make the guest's following free fatal.)
+- **Imports.** `vkGetMemoryResourcePropertiesMESA` and
+  `VkImportMemoryResourceInfoMESA` take a blob of `VkDeviceMemory` of this
+  renderer that the context made or is **attached** to, and nothing else
+  (`VK_ERROR_INVALID_EXTERNAL_HANDLE`, vkr's answer for a resource it cannot
+  import; vkr is fatal for a resource the context does not hold, which a
+  guest cannot tell from one not attached yet). The import is a new
+  `VkDeviceMemory` importing **the same pages** with
+  `VK_EXT_external_memory_host`, as a host-visible type the host accepts them
+  for, no larger than the blob; no blob is made of it again. Cross-context
+  sharing reaches the renderer as `CTX_ATTACH_RESOURCE`, which the guest
+  kernel sends when another process opens a GEM handle of the dma-buf: the
+  device used to answer a blob's attach alone, and now tells the renderer too
+  (`Renderer3d::ctx_attach_blob`, a no-op by default). Memory blobs live in
+  the blob directory beside rings and reply windows, and can never be bound
+  as either.
+- **Lifetime.** The import holds the pages' `Arc`, taken under the
+  directory lock, like the exporting memory, its blob and its publication;
+  the pages go when the last holder does, and the budget is charged once, at
+  the first allocation. The exporter may free its memory, destroy its blob or
+  its whole context first: the importer's GPU keeps writing pages that exist,
+  and a partition never maps pages the allocator reused (tested in that
+  order). A detach afterwards stops new imports and changes nothing for one
+  made.
+- **Left out**: `EXT_image_drm_format_modifier` and `EXT_queue_family_foreign`
+  (GNOME on the GPU is a later stage). Without the first Zink has no dma-buf
+  modifier queries and cannot export an image it did not create exportable
+  (`zink_screen.c:3613`, `zink_resource.c:1960-1962`); without the second its
+  `dmabuf` capability is 0 (`zink_screen.c:1128-1136`), so it offers no PRIME
+  import or export — EGL dma-buf image import and GBM buffer sharing are off
+  — while rendering into its own images and presenting through kopper's
+  (software) Vulkan swapchain are not affected.
+
+### Measured on the RTX 2070
+
+Driven through real rings with the generated driver-side encoder
+(`host_vulkan::pipeline_tests`, driver 580.88, Windows):
+
+- **Transform feedback.** A hand-assembled SPIR-V vertex shader (`Xfb`,
+  `XfbBuffer 0`, stride 16) writing `(i, 2i, 7, 1)`, one triangle with
+  rasterizer discard under dynamic rendering with no attachment, captured
+  into host-visible memory: `[0,0,7,1, 1,2,7,1, 2,4,7,1]`, nothing past it,
+  and the end counter at 48 bytes.
+- **Conditional rendering.** vk-smoke's compute shader over 4096 elements
+  inside `vkCmdBeginConditionalRenderingEXT`, the predicate written through
+  the blob: 0 — all 4096 untouched; 1 — all 4096 written.
+- **dma-buf across two contexts.** Context 1 exports 64 KiB for a `DMA_BUF`
+  buffer and writes a pattern through its blob; context 2, attached, imports
+  it on its own device, copies it into a buffer of its own and fills the
+  import: 16384 words of context 1's read by context 2, 0 wrong, and context
+  2's fill read back through context 1's blob, 0 wrong. One set of pages, two
+  `VkDevice`s importing it.
+
+### What the guest should report
+
+Zink's own gates for GL 4.6 are met on this device as the guest will see it
+(`draw_indirect_count`, transform feedback with 4 streams and 4 buffers,
+`robustBufferAccess` with `robustImageAccess2`, the `maintenance2` string,
+depth clip, vertex divisors). The expectation for the guest acceptance:
+`eglinfo` names `zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070)
+(MESA_VENUS))` with OpenGL 4.6 core and compatibility profiles and OpenGL ES
+3.2 — to be read from the run, not assumed.

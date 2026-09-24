@@ -12,12 +12,16 @@ between the two so that nobody copies ~1500 fields by hand:
   from the arguments of `EXECUTOR_COMMANDS` (checked against the `dispatch`
   match in venus/executor/context.rs), through members and through the pNext
   links the executor admits (`policy::admits_link`: core up to 1.3, and the
-  venus protocol's own). The generated protocol is the whole protocol; this
-  bridge stays the executor's size;
+  structures of `policy::ADMITTED_EXTENSIONS`, read out of policy.rs). The
+  generated protocol is the whole protocol; this bridge stays the executor's
+  size. A structure `ash` 0.38 (Vulkan 1.3.281) still knows by its extension
+  name is paired with that name (`resolve_ash_name`);
 * `ToAsh` for the same set (guest -> host: what a create is built from);
 * `query_features2` / `query_properties2`: one host call each that chains
   every structure the protocol can carry in that pNext chain, gated by the
-  core version that introduced it, and hands the whole chain back;
+  core version that introduced it or, for an admitted extension's, by the
+  device reporting one of the extensions that bring it, and hands the whole
+  chain back;
 * `DeviceLinks`: the owned `ash` twins of a `VkDeviceCreateInfo` chain, and
   the `push_next` calls that link them.
 
@@ -49,10 +53,11 @@ PROTOCOL = ROOT / 'crates' / 'virtio-gpu' / 'src' / 'venus' / 'protocol'
 OUT = ROOT / 'crates' / 'virtio-gpu' / 'src' / 'host_vulkan' / 'convert.rs'
 ASH_VERSION = '0.38.0+1.3.281'
 
-# Core version that introduced each structure a Features2/Properties2 chain
-# may carry here (the selection is core <= 1.3 and no extensions). Querying a
-# structure the device's version does not know is invalid usage, so the host
-# chain is gated on min(device apiVersion, 1.3).
+# Core version that introduced each core structure a Features2/Properties2
+# chain may carry here. Querying a structure the device's version does not
+# know is invalid usage, so the host chain is gated on min(device apiVersion,
+# 1.3); an admitted extension's structure is gated on the device reporting
+# the extension instead (stage 5c).
 CORE_VERSION = {
     # features
     'VkPhysicalDevicePrivateDataFeatures': 13,
@@ -133,13 +138,28 @@ EXECUTOR_COMMANDS = [
     'BindImageMemory2', 'GetImageSubresourceLayout', 'CreateImageView', 'DestroyImageView',
     # stage 5b.3: the one external-handle query served
     'GetPhysicalDeviceExternalSemaphoreProperties',
+    # stage 5c: the dma-buf buffer query, emulated
+    'GetPhysicalDeviceExternalBufferProperties',
 ]
 CONTEXT = ROOT / 'crates' / 'virtio-gpu' / 'src' / 'venus' / 'executor' / 'context.rs'
 
-# The executor's chain policy (venus/executor/policy.rs `admits_link`),
-# restated for the one question this script asks of it.
+# The executor's chain policy (venus/executor/policy.rs `admits_link`): core
+# up to 1.3, and the extensions of `ADMITTED_EXTENSIONS`, which is read out of
+# policy.rs itself so the bridge and the policy are one list.
 ADMITTED_API = (1 << 22) | (3 << 12)
-ADMITTED_EXTENSIONS = {'VK_MESA_venus_protocol', 'VK_EXT_command_serialization'}
+POLICY = ROOT / 'crates' / 'virtio-gpu' / 'src' / 'venus' / 'executor' / 'policy.rs'
+
+
+def policy_list(name):
+    """The string list `pub const <name>: &[&str] = &[...]` of policy.rs."""
+    text = POLICY.read_text(encoding='utf-8')
+    m = re.search(r'pub const %s: &\[&str\] =\s*&\[(.*?)\];' % name, text, re.S)
+    if not m:
+        sys.exit('no `pub const %s` string list in %s' % (name, POLICY))
+    return re.findall(r'"(\w+)"', m.group(1))
+
+
+ADMITTED_EXTENSIONS = set(policy_list('ADMITTED_EXTENSIONS'))
 
 ASH_SCALARS = {'u8', 'u16', 'u32', 'i32', 'u64', 'i64', 'f32', 'f64', 'usize',
                'Bool32', 'DeviceSize', 'DeviceAddress', 'SampleMask', 'Flags', 'Flags64'}
@@ -185,16 +205,38 @@ ORIGIN_RE = re.compile(r'StructureInfo \{\s*stype: -?\d+,\s*name: "(\w+)",\s*'
 
 
 def admitted_structures():
+    """Every structure the chain policy admits: name -> the admitted
+    extensions a host must report for it to be queried, empty for a
+    structure core up to 1.3 makes."""
     text = (PROTOCOL / 'info.rs').read_text(encoding='utf-8')
-    out = set()
+    out = {}
     for m in ORIGIN_RE.finditer(text):
         core = int(m.group(3), 16) if m.group(3) else None
         exts = set(re.findall(r'"(\w+)"', m.group(4)))
-        if (core is not None and core <= ADMITTED_API) or exts & ADMITTED_EXTENSIONS:
-            out.add(m.group(1))
+        if core is not None and core <= ADMITTED_API:
+            out[m.group(1)] = []
+        elif exts & ADMITTED_EXTENSIONS:
+            out[m.group(1)] = sorted(exts & ADMITTED_EXTENSIONS)
     if not out:
         sys.exit('no StructureInfo entries parsed from protocol/info.rs')
     return out
+
+
+def resolve_ash_name(pname, astructs):
+    """The `ash` 0.38 (Vulkan 1.3.281) name of protocol structure `pname`. A
+    structure vk.xml has since promoted to core 1.4, or renamed from EXT to
+    KHR, still carries its extension suffix there
+    (`VkPhysicalDeviceLineRasterizationFeatures` is
+    `PhysicalDeviceLineRasterizationFeaturesKHR`,
+    `VkPhysicalDeviceRobustness2FeaturesKHR` is `...Robustness2FeaturesEXT`)."""
+    base = pname[2:]
+    candidates = [base, base + 'KHR', base + 'EXT']
+    if base.endswith('KHR'):
+        candidates.append(base[:-3] + 'EXT')
+    for c in candidates:
+        if c in astructs:
+            return c
+    return base
 
 
 def check_executor_commands():
@@ -260,7 +302,7 @@ class Gen:
         return {n for n in seen if n.startswith('Vk')}
 
     def ash_name(self, pname):
-        return pname[2:]
+        return resolve_ash_name(pname, self.astructs)
 
     def proto_kind(self, ty):
         if ty in PROTO_SCALARS:
@@ -436,22 +478,28 @@ class Gen:
     def emit_query(self, w, enum, fname, ahead, core_field, core_ty, pty, call):
         variants = self.enums[enum]
         for v in variants:
-            if v not in CORE_VERSION:
-                sys.exit(f'{enum}::{v} has no core version in CORE_VERSION')
+            if v not in CORE_VERSION and not self.admitted.get(v):
+                sys.exit(f'{enum}::{v} has no core version in CORE_VERSION and no admitted extension')
             if self.convertible.get(v) is None:
                 sys.exit(f'{enum}::{v} is not convertible: {self.failures.get(v)}')
         w(f'/// `{call}` with every structure `{enum}` admits that')
-        w('/// the device\'s version knows, chained at once; the whole chain back, in')
-        w('/// protocol form. `api` is `min(device apiVersion, 1.3)`.')
+        w('/// the device knows, chained at once; the whole chain back, in protocol')
+        w('/// form. `api` is `min(device apiVersion, 1.3)`: a core structure is')
+        w('/// chained when its version is at most that, an extension\'s when `has`')
+        w('/// says the device reports one of the extensions that bring it.')
         w('///')
         w('/// # Safety')
         w('/// `pd` must be a physical device enumerated from `instance`.')
-        w(f'pub unsafe fn {fname}(instance: &ash::Instance, pd: vk::PhysicalDevice, api: u32) -> {pty} {{')
+        w(f'pub unsafe fn {fname}(instance: &ash::Instance, pd: vk::PhysicalDevice, api: u32, has: &dyn Fn(&str) -> bool) -> {pty} {{')
         for i, v in enumerate(variants):
             w(f'    let mut l{i} = vk::{self.ash_name(v)}::default();')
         for i, v in enumerate(variants):
-            ver = CORE_VERSION[v]
-            w(f'    let on{i} = api >= vk::API_VERSION_1_{ver % 10};')
+            if v in CORE_VERSION:
+                ver = CORE_VERSION[v]
+                w(f'    let on{i} = api >= vk::API_VERSION_1_{ver % 10};')
+            else:
+                exts = ' || '.join(f'has("{e}")' for e in self.admitted[v])
+                w(f'    let on{i} = {exts};')
         w(f'    let mut head = vk::{ahead}::default();')
         for i, _ in enumerate(variants):
             w(f'    if on{i} {{')

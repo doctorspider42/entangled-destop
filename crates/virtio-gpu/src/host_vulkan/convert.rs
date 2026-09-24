@@ -269,6 +269,27 @@ impl ToAsh for VkExtent3D {
     }
 }
 
+impl FromAsh<vk::ExternalBufferProperties<'_>> for VkExternalBufferProperties {
+    fn from_ash(src: &vk::ExternalBufferProperties<'_>) -> Self {
+        Self {
+            external_memory_properties: VkExternalMemoryProperties::from_ash(
+                &src.external_memory_properties,
+            ),
+        }
+    }
+}
+
+impl ToAsh for VkExternalBufferProperties {
+    type Ash = vk::ExternalBufferProperties<'static>;
+    fn to_ash(&self) -> vk::ExternalBufferProperties<'static> {
+        let src = self;
+        vk::ExternalBufferProperties {
+            external_memory_properties: src.external_memory_properties.to_ash(),
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::ExternalImageFormatProperties<'_>> for VkExternalImageFormatProperties {
     fn from_ash(src: &vk::ExternalImageFormatProperties<'_>) -> Self {
         Self {
@@ -844,6 +865,29 @@ impl ToAsh for VkPhysicalDevice8BitStorageFeatures {
     }
 }
 
+impl FromAsh<vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT<'_>>
+    for VkPhysicalDeviceBorderColorSwizzleFeaturesEXT
+{
+    fn from_ash(src: &vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT<'_>) -> Self {
+        Self {
+            border_color_swizzle: src.border_color_swizzle,
+            border_color_swizzle_from_image: src.border_color_swizzle_from_image,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceBorderColorSwizzleFeaturesEXT {
+    type Ash = vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT {
+            border_color_swizzle: src.border_color_swizzle,
+            border_color_swizzle_from_image: src.border_color_swizzle_from_image,
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::PhysicalDeviceBufferDeviceAddressFeatures<'_>>
     for VkPhysicalDeviceBufferDeviceAddressFeatures
 {
@@ -864,6 +908,94 @@ impl ToAsh for VkPhysicalDeviceBufferDeviceAddressFeatures {
             buffer_device_address: src.buffer_device_address,
             buffer_device_address_capture_replay: src.buffer_device_address_capture_replay,
             buffer_device_address_multi_device: src.buffer_device_address_multi_device,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceConditionalRenderingFeaturesEXT<'_>>
+    for VkPhysicalDeviceConditionalRenderingFeaturesEXT
+{
+    fn from_ash(src: &vk::PhysicalDeviceConditionalRenderingFeaturesEXT<'_>) -> Self {
+        Self {
+            conditional_rendering: src.conditional_rendering,
+            inherited_conditional_rendering: src.inherited_conditional_rendering,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceConditionalRenderingFeaturesEXT {
+    type Ash = vk::PhysicalDeviceConditionalRenderingFeaturesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceConditionalRenderingFeaturesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceConditionalRenderingFeaturesEXT {
+            conditional_rendering: src.conditional_rendering,
+            inherited_conditional_rendering: src.inherited_conditional_rendering,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceCustomBorderColorFeaturesEXT<'_>>
+    for VkPhysicalDeviceCustomBorderColorFeaturesEXT
+{
+    fn from_ash(src: &vk::PhysicalDeviceCustomBorderColorFeaturesEXT<'_>) -> Self {
+        Self {
+            custom_border_colors: src.custom_border_colors,
+            custom_border_color_without_format: src.custom_border_color_without_format,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceCustomBorderColorFeaturesEXT {
+    type Ash = vk::PhysicalDeviceCustomBorderColorFeaturesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceCustomBorderColorFeaturesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceCustomBorderColorFeaturesEXT {
+            custom_border_colors: src.custom_border_colors,
+            custom_border_color_without_format: src.custom_border_color_without_format,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceCustomBorderColorPropertiesEXT<'_>>
+    for VkPhysicalDeviceCustomBorderColorPropertiesEXT
+{
+    fn from_ash(src: &vk::PhysicalDeviceCustomBorderColorPropertiesEXT<'_>) -> Self {
+        Self {
+            max_custom_border_color_samplers: src.max_custom_border_color_samplers,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceCustomBorderColorPropertiesEXT {
+    type Ash = vk::PhysicalDeviceCustomBorderColorPropertiesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceCustomBorderColorPropertiesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceCustomBorderColorPropertiesEXT {
+            max_custom_border_color_samplers: src.max_custom_border_color_samplers,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceDepthClipEnableFeaturesEXT<'_>>
+    for VkPhysicalDeviceDepthClipEnableFeaturesEXT
+{
+    fn from_ash(src: &vk::PhysicalDeviceDepthClipEnableFeaturesEXT<'_>) -> Self {
+        Self {
+            depth_clip_enable: src.depth_clip_enable,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceDepthClipEnableFeaturesEXT {
+    type Ash = vk::PhysicalDeviceDepthClipEnableFeaturesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceDepthClipEnableFeaturesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceDepthClipEnableFeaturesEXT {
+            depth_clip_enable: src.depth_clip_enable,
             ..Default::default()
         }
     }
@@ -1143,6 +1275,30 @@ impl ToAsh for VkPhysicalDeviceDynamicRenderingFeatures {
         let src = self;
         vk::PhysicalDeviceDynamicRenderingFeatures {
             dynamic_rendering: src.dynamic_rendering,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceExternalBufferInfo<'_>> for VkPhysicalDeviceExternalBufferInfo {
+    fn from_ash(src: &vk::PhysicalDeviceExternalBufferInfo<'_>) -> Self {
+        Self {
+            p_next: Vec::new(),
+            flags: src.flags.as_raw(),
+            usage: src.usage.as_raw(),
+            handle_type: src.handle_type.as_raw() as i32,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceExternalBufferInfo {
+    type Ash = vk::PhysicalDeviceExternalBufferInfo<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceExternalBufferInfo<'static> {
+        let src = self;
+        vk::PhysicalDeviceExternalBufferInfo {
+            flags: vk::BufferCreateFlags::from_raw(src.flags),
+            usage: vk::BufferUsageFlags::from_raw(src.usage),
+            handle_type: vk::ExternalMemoryHandleTypeFlags::from_raw(src.handle_type as u32),
             ..Default::default()
         }
     }
@@ -1858,6 +2014,58 @@ impl ToAsh for VkPhysicalDeviceLimits {
     }
 }
 
+impl FromAsh<vk::PhysicalDeviceLineRasterizationFeaturesKHR<'_>>
+    for VkPhysicalDeviceLineRasterizationFeatures
+{
+    fn from_ash(src: &vk::PhysicalDeviceLineRasterizationFeaturesKHR<'_>) -> Self {
+        Self {
+            rectangular_lines: src.rectangular_lines,
+            bresenham_lines: src.bresenham_lines,
+            smooth_lines: src.smooth_lines,
+            stippled_rectangular_lines: src.stippled_rectangular_lines,
+            stippled_bresenham_lines: src.stippled_bresenham_lines,
+            stippled_smooth_lines: src.stippled_smooth_lines,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceLineRasterizationFeatures {
+    type Ash = vk::PhysicalDeviceLineRasterizationFeaturesKHR<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceLineRasterizationFeaturesKHR<'static> {
+        let src = self;
+        vk::PhysicalDeviceLineRasterizationFeaturesKHR {
+            rectangular_lines: src.rectangular_lines,
+            bresenham_lines: src.bresenham_lines,
+            smooth_lines: src.smooth_lines,
+            stippled_rectangular_lines: src.stippled_rectangular_lines,
+            stippled_bresenham_lines: src.stippled_bresenham_lines,
+            stippled_smooth_lines: src.stippled_smooth_lines,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceLineRasterizationPropertiesKHR<'_>>
+    for VkPhysicalDeviceLineRasterizationProperties
+{
+    fn from_ash(src: &vk::PhysicalDeviceLineRasterizationPropertiesKHR<'_>) -> Self {
+        Self {
+            line_sub_pixel_precision_bits: src.line_sub_pixel_precision_bits,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceLineRasterizationProperties {
+    type Ash = vk::PhysicalDeviceLineRasterizationPropertiesKHR<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceLineRasterizationPropertiesKHR<'static> {
+        let src = self;
+        vk::PhysicalDeviceLineRasterizationPropertiesKHR {
+            line_sub_pixel_precision_bits: src.line_sub_pixel_precision_bits,
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::PhysicalDeviceMaintenance3Properties<'_>>
     for VkPhysicalDeviceMaintenance3Properties
 {
@@ -2165,6 +2373,108 @@ impl ToAsh for VkPhysicalDeviceProtectedMemoryProperties {
         let src = self;
         vk::PhysicalDeviceProtectedMemoryProperties {
             protected_no_fault: src.protected_no_fault,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceProvokingVertexFeaturesEXT<'_>>
+    for VkPhysicalDeviceProvokingVertexFeaturesEXT
+{
+    fn from_ash(src: &vk::PhysicalDeviceProvokingVertexFeaturesEXT<'_>) -> Self {
+        Self {
+            provoking_vertex_last: src.provoking_vertex_last,
+            transform_feedback_preserves_provoking_vertex: src
+                .transform_feedback_preserves_provoking_vertex,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceProvokingVertexFeaturesEXT {
+    type Ash = vk::PhysicalDeviceProvokingVertexFeaturesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceProvokingVertexFeaturesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceProvokingVertexFeaturesEXT {
+            provoking_vertex_last: src.provoking_vertex_last,
+            transform_feedback_preserves_provoking_vertex: src
+                .transform_feedback_preserves_provoking_vertex,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceProvokingVertexPropertiesEXT<'_>>
+    for VkPhysicalDeviceProvokingVertexPropertiesEXT
+{
+    fn from_ash(src: &vk::PhysicalDeviceProvokingVertexPropertiesEXT<'_>) -> Self {
+        Self {
+            provoking_vertex_mode_per_pipeline: src.provoking_vertex_mode_per_pipeline,
+            transform_feedback_preserves_triangle_fan_provoking_vertex: src
+                .transform_feedback_preserves_triangle_fan_provoking_vertex,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceProvokingVertexPropertiesEXT {
+    type Ash = vk::PhysicalDeviceProvokingVertexPropertiesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceProvokingVertexPropertiesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceProvokingVertexPropertiesEXT {
+            provoking_vertex_mode_per_pipeline: src.provoking_vertex_mode_per_pipeline,
+            transform_feedback_preserves_triangle_fan_provoking_vertex: src
+                .transform_feedback_preserves_triangle_fan_provoking_vertex,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceRobustness2FeaturesEXT<'_>>
+    for VkPhysicalDeviceRobustness2FeaturesKHR
+{
+    fn from_ash(src: &vk::PhysicalDeviceRobustness2FeaturesEXT<'_>) -> Self {
+        Self {
+            robust_buffer_access2: src.robust_buffer_access2,
+            robust_image_access2: src.robust_image_access2,
+            null_descriptor: src.null_descriptor,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceRobustness2FeaturesKHR {
+    type Ash = vk::PhysicalDeviceRobustness2FeaturesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceRobustness2FeaturesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceRobustness2FeaturesEXT {
+            robust_buffer_access2: src.robust_buffer_access2,
+            robust_image_access2: src.robust_image_access2,
+            null_descriptor: src.null_descriptor,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceRobustness2PropertiesEXT<'_>>
+    for VkPhysicalDeviceRobustness2PropertiesKHR
+{
+    fn from_ash(src: &vk::PhysicalDeviceRobustness2PropertiesEXT<'_>) -> Self {
+        Self {
+            robust_storage_buffer_access_size_alignment: src
+                .robust_storage_buffer_access_size_alignment,
+            robust_uniform_buffer_access_size_alignment: src
+                .robust_uniform_buffer_access_size_alignment,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceRobustness2PropertiesKHR {
+    type Ash = vk::PhysicalDeviceRobustness2PropertiesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceRobustness2PropertiesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceRobustness2PropertiesEXT {
+            robust_storage_buffer_access_size_alignment: src
+                .robust_storage_buffer_access_size_alignment,
+            robust_uniform_buffer_access_size_alignment: src
+                .robust_uniform_buffer_access_size_alignment,
             ..Default::default()
         }
     }
@@ -2711,6 +3021,74 @@ impl ToAsh for VkPhysicalDeviceTimelineSemaphoreProperties {
     }
 }
 
+impl FromAsh<vk::PhysicalDeviceTransformFeedbackFeaturesEXT<'_>>
+    for VkPhysicalDeviceTransformFeedbackFeaturesEXT
+{
+    fn from_ash(src: &vk::PhysicalDeviceTransformFeedbackFeaturesEXT<'_>) -> Self {
+        Self {
+            transform_feedback: src.transform_feedback,
+            geometry_streams: src.geometry_streams,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceTransformFeedbackFeaturesEXT {
+    type Ash = vk::PhysicalDeviceTransformFeedbackFeaturesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceTransformFeedbackFeaturesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceTransformFeedbackFeaturesEXT {
+            transform_feedback: src.transform_feedback,
+            geometry_streams: src.geometry_streams,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceTransformFeedbackPropertiesEXT<'_>>
+    for VkPhysicalDeviceTransformFeedbackPropertiesEXT
+{
+    fn from_ash(src: &vk::PhysicalDeviceTransformFeedbackPropertiesEXT<'_>) -> Self {
+        Self {
+            max_transform_feedback_streams: src.max_transform_feedback_streams,
+            max_transform_feedback_buffers: src.max_transform_feedback_buffers,
+            max_transform_feedback_buffer_size: src.max_transform_feedback_buffer_size,
+            max_transform_feedback_stream_data_size: src.max_transform_feedback_stream_data_size,
+            max_transform_feedback_buffer_data_size: src.max_transform_feedback_buffer_data_size,
+            max_transform_feedback_buffer_data_stride: src
+                .max_transform_feedback_buffer_data_stride,
+            transform_feedback_queries: src.transform_feedback_queries,
+            transform_feedback_streams_lines_triangles: src
+                .transform_feedback_streams_lines_triangles,
+            transform_feedback_rasterization_stream_select: src
+                .transform_feedback_rasterization_stream_select,
+            transform_feedback_draw: src.transform_feedback_draw,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceTransformFeedbackPropertiesEXT {
+    type Ash = vk::PhysicalDeviceTransformFeedbackPropertiesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceTransformFeedbackPropertiesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceTransformFeedbackPropertiesEXT {
+            max_transform_feedback_streams: src.max_transform_feedback_streams,
+            max_transform_feedback_buffers: src.max_transform_feedback_buffers,
+            max_transform_feedback_buffer_size: src.max_transform_feedback_buffer_size,
+            max_transform_feedback_stream_data_size: src.max_transform_feedback_stream_data_size,
+            max_transform_feedback_buffer_data_size: src.max_transform_feedback_buffer_data_size,
+            max_transform_feedback_buffer_data_stride: src
+                .max_transform_feedback_buffer_data_stride,
+            transform_feedback_queries: src.transform_feedback_queries,
+            transform_feedback_streams_lines_triangles: src
+                .transform_feedback_streams_lines_triangles,
+            transform_feedback_rasterization_stream_select: src
+                .transform_feedback_rasterization_stream_select,
+            transform_feedback_draw: src.transform_feedback_draw,
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::PhysicalDeviceUniformBufferStandardLayoutFeatures<'_>>
     for VkPhysicalDeviceUniformBufferStandardLayoutFeatures
 {
@@ -2750,6 +3128,75 @@ impl ToAsh for VkPhysicalDeviceVariablePointersFeatures {
         vk::PhysicalDeviceVariablePointersFeatures {
             variable_pointers_storage_buffer: src.variable_pointers_storage_buffer,
             variable_pointers: src.variable_pointers,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR<'_>>
+    for VkPhysicalDeviceVertexAttributeDivisorFeatures
+{
+    fn from_ash(src: &vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR<'_>) -> Self {
+        Self {
+            vertex_attribute_instance_rate_divisor: src.vertex_attribute_instance_rate_divisor,
+            vertex_attribute_instance_rate_zero_divisor: src
+                .vertex_attribute_instance_rate_zero_divisor,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceVertexAttributeDivisorFeatures {
+    type Ash = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR<'static> {
+        let src = self;
+        vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR {
+            vertex_attribute_instance_rate_divisor: src.vertex_attribute_instance_rate_divisor,
+            vertex_attribute_instance_rate_zero_divisor: src
+                .vertex_attribute_instance_rate_zero_divisor,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceVertexAttributeDivisorPropertiesKHR<'_>>
+    for VkPhysicalDeviceVertexAttributeDivisorProperties
+{
+    fn from_ash(src: &vk::PhysicalDeviceVertexAttributeDivisorPropertiesKHR<'_>) -> Self {
+        Self {
+            max_vertex_attrib_divisor: src.max_vertex_attrib_divisor,
+            supports_non_zero_first_instance: src.supports_non_zero_first_instance,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceVertexAttributeDivisorProperties {
+    type Ash = vk::PhysicalDeviceVertexAttributeDivisorPropertiesKHR<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceVertexAttributeDivisorPropertiesKHR<'static> {
+        let src = self;
+        vk::PhysicalDeviceVertexAttributeDivisorPropertiesKHR {
+            max_vertex_attrib_divisor: src.max_vertex_attrib_divisor,
+            supports_non_zero_first_instance: src.supports_non_zero_first_instance,
+            ..Default::default()
+        }
+    }
+}
+
+impl FromAsh<vk::PhysicalDeviceVertexAttributeDivisorPropertiesEXT<'_>>
+    for VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT
+{
+    fn from_ash(src: &vk::PhysicalDeviceVertexAttributeDivisorPropertiesEXT<'_>) -> Self {
+        Self {
+            max_vertex_attrib_divisor: src.max_vertex_attrib_divisor,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT {
+    type Ash = vk::PhysicalDeviceVertexAttributeDivisorPropertiesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceVertexAttributeDivisorPropertiesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceVertexAttributeDivisorPropertiesEXT {
+            max_vertex_attrib_divisor: src.max_vertex_attrib_divisor,
             ..Default::default()
         }
     }
@@ -3523,8 +3970,10 @@ impl ToAsh for VkSubresourceLayout {
 }
 
 /// `get_physical_device_features2` with every structure `VkPhysicalDeviceFeatures2Next` admits that
-/// the device's version knows, chained at once; the whole chain back, in
-/// protocol form. `api` is `min(device apiVersion, 1.3)`.
+/// the device knows, chained at once; the whole chain back, in protocol
+/// form. `api` is `min(device apiVersion, 1.3)`: a core structure is
+/// chained when its version is at most that, an extension's when `has`
+/// says the device reports one of the extensions that bring it.
 ///
 /// # Safety
 /// `pd` must be a physical device enumerated from `instance`.
@@ -3532,6 +3981,7 @@ pub unsafe fn query_features2(
     instance: &ash::Instance,
     pd: vk::PhysicalDevice,
     api: u32,
+    has: &dyn Fn(&str) -> bool,
 ) -> VkPhysicalDeviceFeatures2 {
     let mut l0 = vk::PhysicalDevicePrivateDataFeatures::default();
     let mut l1 = vk::PhysicalDeviceVariablePointersFeatures::default();
@@ -3548,26 +3998,35 @@ pub unsafe fn query_features2(
     let mut l12 = vk::PhysicalDeviceDescriptorIndexingFeatures::default();
     let mut l13 = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
     let mut l14 = vk::PhysicalDevice8BitStorageFeatures::default();
-    let mut l15 = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
-    let mut l16 = vk::PhysicalDeviceShaderAtomicInt64Features::default();
-    let mut l17 = vk::PhysicalDeviceScalarBlockLayoutFeatures::default();
-    let mut l18 = vk::PhysicalDeviceUniformBufferStandardLayoutFeatures::default();
-    let mut l19 = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
-    let mut l20 = vk::PhysicalDeviceImagelessFramebufferFeatures::default();
-    let mut l21 = vk::PhysicalDeviceTextureCompressionASTCHDRFeatures::default();
-    let mut l22 = vk::PhysicalDeviceSeparateDepthStencilLayoutsFeatures::default();
-    let mut l23 = vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default();
-    let mut l24 = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
-    let mut l25 = vk::PhysicalDevicePipelineCreationCacheControlFeatures::default();
-    let mut l26 = vk::PhysicalDeviceVulkan11Features::default();
-    let mut l27 = vk::PhysicalDeviceVulkan12Features::default();
-    let mut l28 = vk::PhysicalDeviceVulkan13Features::default();
-    let mut l29 = vk::PhysicalDeviceZeroInitializeWorkgroupMemoryFeatures::default();
-    let mut l30 = vk::PhysicalDeviceImageRobustnessFeatures::default();
-    let mut l31 = vk::PhysicalDeviceShaderTerminateInvocationFeatures::default();
-    let mut l32 = vk::PhysicalDeviceSynchronization2Features::default();
-    let mut l33 = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
-    let mut l34 = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+    let mut l15 = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
+    let mut l16 = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
+    let mut l17 = vk::PhysicalDeviceShaderAtomicInt64Features::default();
+    let mut l18 = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default();
+    let mut l19 = vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default();
+    let mut l20 = vk::PhysicalDeviceScalarBlockLayoutFeatures::default();
+    let mut l21 = vk::PhysicalDeviceUniformBufferStandardLayoutFeatures::default();
+    let mut l22 = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
+    let mut l23 = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+    let mut l24 = vk::PhysicalDeviceImagelessFramebufferFeatures::default();
+    let mut l25 = vk::PhysicalDeviceTextureCompressionASTCHDRFeatures::default();
+    let mut l26 = vk::PhysicalDeviceSeparateDepthStencilLayoutsFeatures::default();
+    let mut l27 = vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default();
+    let mut l28 = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
+    let mut l29 = vk::PhysicalDeviceLineRasterizationFeaturesKHR::default();
+    let mut l30 = vk::PhysicalDevicePipelineCreationCacheControlFeatures::default();
+    let mut l31 = vk::PhysicalDeviceVulkan11Features::default();
+    let mut l32 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut l33 = vk::PhysicalDeviceVulkan13Features::default();
+    let mut l34 = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
+    let mut l35 = vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT::default();
+    let mut l36 = vk::PhysicalDeviceZeroInitializeWorkgroupMemoryFeatures::default();
+    let mut l37 = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+    let mut l38 = vk::PhysicalDeviceImageRobustnessFeatures::default();
+    let mut l39 = vk::PhysicalDeviceShaderTerminateInvocationFeatures::default();
+    let mut l40 = vk::PhysicalDeviceSynchronization2Features::default();
+    let mut l41 = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
+    let mut l42 = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+    let mut l43 = vk::PhysicalDeviceDynamicRenderingFeatures::default();
     let on0 = api >= vk::API_VERSION_1_3;
     let on1 = api >= vk::API_VERSION_1_1;
     let on2 = api >= vk::API_VERSION_1_1;
@@ -3583,26 +4042,35 @@ pub unsafe fn query_features2(
     let on12 = api >= vk::API_VERSION_1_2;
     let on13 = api >= vk::API_VERSION_1_2;
     let on14 = api >= vk::API_VERSION_1_2;
-    let on15 = api >= vk::API_VERSION_1_2;
+    let on15 = has("VK_EXT_conditional_rendering");
     let on16 = api >= vk::API_VERSION_1_2;
     let on17 = api >= vk::API_VERSION_1_2;
-    let on18 = api >= vk::API_VERSION_1_2;
-    let on19 = api >= vk::API_VERSION_1_2;
+    let on18 = has("VK_EXT_vertex_attribute_divisor") || has("VK_KHR_vertex_attribute_divisor");
+    let on19 = has("VK_EXT_transform_feedback");
     let on20 = api >= vk::API_VERSION_1_2;
-    let on21 = api >= vk::API_VERSION_1_3;
-    let on22 = api >= vk::API_VERSION_1_2;
-    let on23 = api >= vk::API_VERSION_1_3;
-    let on24 = api >= vk::API_VERSION_1_3;
+    let on21 = api >= vk::API_VERSION_1_2;
+    let on22 = has("VK_EXT_depth_clip_enable");
+    let on23 = api >= vk::API_VERSION_1_2;
+    let on24 = api >= vk::API_VERSION_1_2;
     let on25 = api >= vk::API_VERSION_1_3;
     let on26 = api >= vk::API_VERSION_1_2;
-    let on27 = api >= vk::API_VERSION_1_2;
+    let on27 = api >= vk::API_VERSION_1_3;
     let on28 = api >= vk::API_VERSION_1_3;
-    let on29 = api >= vk::API_VERSION_1_3;
+    let on29 = has("VK_EXT_line_rasterization") || has("VK_KHR_line_rasterization");
     let on30 = api >= vk::API_VERSION_1_3;
-    let on31 = api >= vk::API_VERSION_1_3;
-    let on32 = api >= vk::API_VERSION_1_3;
+    let on31 = api >= vk::API_VERSION_1_2;
+    let on32 = api >= vk::API_VERSION_1_2;
     let on33 = api >= vk::API_VERSION_1_3;
-    let on34 = api >= vk::API_VERSION_1_3;
+    let on34 = has("VK_EXT_custom_border_color");
+    let on35 = has("VK_EXT_border_color_swizzle");
+    let on36 = api >= vk::API_VERSION_1_3;
+    let on37 = has("VK_EXT_robustness2") || has("VK_KHR_robustness2");
+    let on38 = api >= vk::API_VERSION_1_3;
+    let on39 = api >= vk::API_VERSION_1_3;
+    let on40 = api >= vk::API_VERSION_1_3;
+    let on41 = has("VK_EXT_provoking_vertex");
+    let on42 = api >= vk::API_VERSION_1_3;
+    let on43 = api >= vk::API_VERSION_1_3;
     let mut head = vk::PhysicalDeviceFeatures2::default();
     if on0 {
         head = head.push_next(&mut l0);
@@ -3708,6 +4176,33 @@ pub unsafe fn query_features2(
     }
     if on34 {
         head = head.push_next(&mut l34);
+    }
+    if on35 {
+        head = head.push_next(&mut l35);
+    }
+    if on36 {
+        head = head.push_next(&mut l36);
+    }
+    if on37 {
+        head = head.push_next(&mut l37);
+    }
+    if on38 {
+        head = head.push_next(&mut l38);
+    }
+    if on39 {
+        head = head.push_next(&mut l39);
+    }
+    if on40 {
+        head = head.push_next(&mut l40);
+    }
+    if on41 {
+        head = head.push_next(&mut l41);
+    }
+    if on42 {
+        head = head.push_next(&mut l42);
+    }
+    if on43 {
+        head = head.push_next(&mut l43);
     }
     // SAFETY: the caller vouches for `pd`; `head` and every structure
     // chained onto it are locals of this function, correctly typed and
@@ -3823,141 +4318,204 @@ pub unsafe fn query_features2(
     }
     if on15 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceVulkanMemoryModelFeatures(
-                VkPhysicalDeviceVulkanMemoryModelFeatures::from_ash(&l15),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceConditionalRenderingFeaturesEXT(
+                VkPhysicalDeviceConditionalRenderingFeaturesEXT::from_ash(&l15),
             ),
         );
     }
     if on16 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderAtomicInt64Features(
-                VkPhysicalDeviceShaderAtomicInt64Features::from_ash(&l16),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceVulkanMemoryModelFeatures(
+                VkPhysicalDeviceVulkanMemoryModelFeatures::from_ash(&l16),
             ),
         );
     }
     if on17 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceScalarBlockLayoutFeatures(
-                VkPhysicalDeviceScalarBlockLayoutFeatures::from_ash(&l17),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderAtomicInt64Features(
+                VkPhysicalDeviceShaderAtomicInt64Features::from_ash(&l17),
             ),
         );
     }
     if on18 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceUniformBufferStandardLayoutFeatures(
-                VkPhysicalDeviceUniformBufferStandardLayoutFeatures::from_ash(&l18),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceVertexAttributeDivisorFeatures(
+                VkPhysicalDeviceVertexAttributeDivisorFeatures::from_ash(&l18),
             ),
         );
     }
     if on19 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceBufferDeviceAddressFeatures(
-                VkPhysicalDeviceBufferDeviceAddressFeatures::from_ash(&l19),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceTransformFeedbackFeaturesEXT(
+                VkPhysicalDeviceTransformFeedbackFeaturesEXT::from_ash(&l19),
             ),
         );
     }
     if on20 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceImagelessFramebufferFeatures(
-                VkPhysicalDeviceImagelessFramebufferFeatures::from_ash(&l20),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceScalarBlockLayoutFeatures(
+                VkPhysicalDeviceScalarBlockLayoutFeatures::from_ash(&l20),
             ),
         );
     }
     if on21 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceTextureCompressionASTCHDRFeatures(
-                VkPhysicalDeviceTextureCompressionASTCHDRFeatures::from_ash(&l21),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceUniformBufferStandardLayoutFeatures(
+                VkPhysicalDeviceUniformBufferStandardLayoutFeatures::from_ash(&l21),
             ),
         );
     }
     if on22 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures(
-                VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures::from_ash(&l22),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceDepthClipEnableFeaturesEXT(
+                VkPhysicalDeviceDepthClipEnableFeaturesEXT::from_ash(&l22),
             ),
         );
     }
     if on23 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures(
-                VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures::from_ash(&l23),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceBufferDeviceAddressFeatures(
+                VkPhysicalDeviceBufferDeviceAddressFeatures::from_ash(&l23),
             ),
         );
     }
     if on24 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceSubgroupSizeControlFeatures(
-                VkPhysicalDeviceSubgroupSizeControlFeatures::from_ash(&l24),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceImagelessFramebufferFeatures(
+                VkPhysicalDeviceImagelessFramebufferFeatures::from_ash(&l24),
             ),
         );
     }
     if on25 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDevicePipelineCreationCacheControlFeatures(
-                VkPhysicalDevicePipelineCreationCacheControlFeatures::from_ash(&l25),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceTextureCompressionASTCHDRFeatures(
+                VkPhysicalDeviceTextureCompressionASTCHDRFeatures::from_ash(&l25),
             ),
         );
     }
     if on26 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceVulkan11Features(
-                VkPhysicalDeviceVulkan11Features::from_ash(&l26),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures(
+                VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures::from_ash(&l26),
             ),
         );
     }
     if on27 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceVulkan12Features(
-                VkPhysicalDeviceVulkan12Features::from_ash(&l27),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures(
+                VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures::from_ash(&l27),
             ),
         );
     }
     if on28 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceVulkan13Features(
-                VkPhysicalDeviceVulkan13Features::from_ash(&l28),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceSubgroupSizeControlFeatures(
+                VkPhysicalDeviceSubgroupSizeControlFeatures::from_ash(&l28),
             ),
         );
     }
     if on29 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures(
-                VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures::from_ash(&l29),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceLineRasterizationFeatures(
+                VkPhysicalDeviceLineRasterizationFeatures::from_ash(&l29),
             ),
         );
     }
     if on30 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceImageRobustnessFeatures(
-                VkPhysicalDeviceImageRobustnessFeatures::from_ash(&l30),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDevicePipelineCreationCacheControlFeatures(
+                VkPhysicalDevicePipelineCreationCacheControlFeatures::from_ash(&l30),
             ),
         );
     }
     if on31 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderTerminateInvocationFeatures(
-                VkPhysicalDeviceShaderTerminateInvocationFeatures::from_ash(&l31),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceVulkan11Features(
+                VkPhysicalDeviceVulkan11Features::from_ash(&l31),
             ),
         );
     }
     if on32 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceSynchronization2Features(
-                VkPhysicalDeviceSynchronization2Features::from_ash(&l32),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceVulkan12Features(
+                VkPhysicalDeviceVulkan12Features::from_ash(&l32),
             ),
         );
     }
     if on33 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderIntegerDotProductFeatures(
-                VkPhysicalDeviceShaderIntegerDotProductFeatures::from_ash(&l33),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceVulkan13Features(
+                VkPhysicalDeviceVulkan13Features::from_ash(&l33),
             ),
         );
     }
     if on34 {
         p_next.push(
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceCustomBorderColorFeaturesEXT(
+                VkPhysicalDeviceCustomBorderColorFeaturesEXT::from_ash(&l34),
+            ),
+        );
+    }
+    if on35 {
+        p_next.push(
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceBorderColorSwizzleFeaturesEXT(
+                VkPhysicalDeviceBorderColorSwizzleFeaturesEXT::from_ash(&l35),
+            ),
+        );
+    }
+    if on36 {
+        p_next.push(
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures(
+                VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures::from_ash(&l36),
+            ),
+        );
+    }
+    if on37 {
+        p_next.push(
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceRobustness2FeaturesKHR(
+                VkPhysicalDeviceRobustness2FeaturesKHR::from_ash(&l37),
+            ),
+        );
+    }
+    if on38 {
+        p_next.push(
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceImageRobustnessFeatures(
+                VkPhysicalDeviceImageRobustnessFeatures::from_ash(&l38),
+            ),
+        );
+    }
+    if on39 {
+        p_next.push(
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderTerminateInvocationFeatures(
+                VkPhysicalDeviceShaderTerminateInvocationFeatures::from_ash(&l39),
+            ),
+        );
+    }
+    if on40 {
+        p_next.push(
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceSynchronization2Features(
+                VkPhysicalDeviceSynchronization2Features::from_ash(&l40),
+            ),
+        );
+    }
+    if on41 {
+        p_next.push(
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceProvokingVertexFeaturesEXT(
+                VkPhysicalDeviceProvokingVertexFeaturesEXT::from_ash(&l41),
+            ),
+        );
+    }
+    if on42 {
+        p_next.push(
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderIntegerDotProductFeatures(
+                VkPhysicalDeviceShaderIntegerDotProductFeatures::from_ash(&l42),
+            ),
+        );
+    }
+    if on43 {
+        p_next.push(
             VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceDynamicRenderingFeatures(
-                VkPhysicalDeviceDynamicRenderingFeatures::from_ash(&l34),
+                VkPhysicalDeviceDynamicRenderingFeatures::from_ash(&l43),
             ),
         );
     }
@@ -3968,8 +4526,10 @@ pub unsafe fn query_features2(
 }
 
 /// `get_physical_device_properties2` with every structure `VkPhysicalDeviceProperties2Next` admits that
-/// the device's version knows, chained at once; the whole chain back, in
-/// protocol form. `api` is `min(device apiVersion, 1.3)`.
+/// the device knows, chained at once; the whole chain back, in protocol
+/// form. `api` is `min(device apiVersion, 1.3)`: a core structure is
+/// chained when its version is at most that, an extension's when `has`
+/// says the device reports one of the extensions that bring it.
 ///
 /// # Safety
 /// `pd` must be a physical device enumerated from `instance`.
@@ -3977,6 +4537,7 @@ pub unsafe fn query_properties2(
     instance: &ash::Instance,
     pd: vk::PhysicalDevice,
     api: u32,
+    has: &dyn Fn(&str) -> bool,
 ) -> VkPhysicalDeviceProperties2 {
     let mut l0 = vk::PhysicalDeviceDriverProperties::default();
     let mut l1 = vk::PhysicalDeviceIDProperties::default();
@@ -3991,13 +4552,20 @@ pub unsafe fn query_properties2(
     let mut l10 = vk::PhysicalDeviceFloatControlsProperties::default();
     let mut l11 = vk::PhysicalDeviceDescriptorIndexingProperties::default();
     let mut l12 = vk::PhysicalDeviceTimelineSemaphoreProperties::default();
-    let mut l13 = vk::PhysicalDeviceDepthStencilResolveProperties::default();
-    let mut l14 = vk::PhysicalDeviceTexelBufferAlignmentProperties::default();
-    let mut l15 = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
-    let mut l16 = vk::PhysicalDeviceVulkan11Properties::default();
-    let mut l17 = vk::PhysicalDeviceVulkan12Properties::default();
-    let mut l18 = vk::PhysicalDeviceVulkan13Properties::default();
-    let mut l19 = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+    let mut l13 = vk::PhysicalDeviceVertexAttributeDivisorPropertiesEXT::default();
+    let mut l14 = vk::PhysicalDeviceVertexAttributeDivisorPropertiesKHR::default();
+    let mut l15 = vk::PhysicalDeviceDepthStencilResolveProperties::default();
+    let mut l16 = vk::PhysicalDeviceTransformFeedbackPropertiesEXT::default();
+    let mut l17 = vk::PhysicalDeviceTexelBufferAlignmentProperties::default();
+    let mut l18 = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+    let mut l19 = vk::PhysicalDeviceLineRasterizationPropertiesKHR::default();
+    let mut l20 = vk::PhysicalDeviceVulkan11Properties::default();
+    let mut l21 = vk::PhysicalDeviceVulkan12Properties::default();
+    let mut l22 = vk::PhysicalDeviceVulkan13Properties::default();
+    let mut l23 = vk::PhysicalDeviceCustomBorderColorPropertiesEXT::default();
+    let mut l24 = vk::PhysicalDeviceRobustness2PropertiesEXT::default();
+    let mut l25 = vk::PhysicalDeviceProvokingVertexPropertiesEXT::default();
+    let mut l26 = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
     let on0 = api >= vk::API_VERSION_1_2;
     let on1 = api >= vk::API_VERSION_1_1;
     let on2 = api >= vk::API_VERSION_1_1;
@@ -4011,13 +4579,20 @@ pub unsafe fn query_properties2(
     let on10 = api >= vk::API_VERSION_1_2;
     let on11 = api >= vk::API_VERSION_1_2;
     let on12 = api >= vk::API_VERSION_1_2;
-    let on13 = api >= vk::API_VERSION_1_2;
-    let on14 = api >= vk::API_VERSION_1_3;
-    let on15 = api >= vk::API_VERSION_1_3;
-    let on16 = api >= vk::API_VERSION_1_2;
-    let on17 = api >= vk::API_VERSION_1_2;
+    let on13 = has("VK_EXT_vertex_attribute_divisor");
+    let on14 = has("VK_KHR_vertex_attribute_divisor");
+    let on15 = api >= vk::API_VERSION_1_2;
+    let on16 = has("VK_EXT_transform_feedback");
+    let on17 = api >= vk::API_VERSION_1_3;
     let on18 = api >= vk::API_VERSION_1_3;
-    let on19 = api >= vk::API_VERSION_1_3;
+    let on19 = has("VK_EXT_line_rasterization") || has("VK_KHR_line_rasterization");
+    let on20 = api >= vk::API_VERSION_1_2;
+    let on21 = api >= vk::API_VERSION_1_2;
+    let on22 = api >= vk::API_VERSION_1_3;
+    let on23 = has("VK_EXT_custom_border_color");
+    let on24 = has("VK_EXT_robustness2") || has("VK_KHR_robustness2");
+    let on25 = has("VK_EXT_provoking_vertex");
+    let on26 = api >= vk::API_VERSION_1_3;
     let mut head = vk::PhysicalDeviceProperties2::default();
     if on0 {
         head = head.push_next(&mut l0);
@@ -4078,6 +4653,27 @@ pub unsafe fn query_properties2(
     }
     if on19 {
         head = head.push_next(&mut l19);
+    }
+    if on20 {
+        head = head.push_next(&mut l20);
+    }
+    if on21 {
+        head = head.push_next(&mut l21);
+    }
+    if on22 {
+        head = head.push_next(&mut l22);
+    }
+    if on23 {
+        head = head.push_next(&mut l23);
+    }
+    if on24 {
+        head = head.push_next(&mut l24);
+    }
+    if on25 {
+        head = head.push_next(&mut l25);
+    }
+    if on26 {
+        head = head.push_next(&mut l26);
     }
     // SAFETY: the caller vouches for `pd`; `head` and every structure
     // chained onto it are locals of this function, correctly typed and
@@ -4179,50 +4775,99 @@ pub unsafe fn query_properties2(
     }
     if on13 {
         p_next.push(
-            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceDepthStencilResolveProperties(
-                VkPhysicalDeviceDepthStencilResolveProperties::from_ash(&l13),
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT(
+                VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT::from_ash(&l13),
             ),
         );
     }
     if on14 {
         p_next.push(
-            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceTexelBufferAlignmentProperties(
-                VkPhysicalDeviceTexelBufferAlignmentProperties::from_ash(&l14),
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceVertexAttributeDivisorProperties(
+                VkPhysicalDeviceVertexAttributeDivisorProperties::from_ash(&l14),
             ),
         );
     }
     if on15 {
         p_next.push(
-            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceSubgroupSizeControlProperties(
-                VkPhysicalDeviceSubgroupSizeControlProperties::from_ash(&l15),
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceDepthStencilResolveProperties(
+                VkPhysicalDeviceDepthStencilResolveProperties::from_ash(&l15),
             ),
         );
     }
     if on16 {
         p_next.push(
-            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceVulkan11Properties(
-                VkPhysicalDeviceVulkan11Properties::from_ash(&l16),
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceTransformFeedbackPropertiesEXT(
+                VkPhysicalDeviceTransformFeedbackPropertiesEXT::from_ash(&l16),
             ),
         );
     }
     if on17 {
         p_next.push(
-            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceVulkan12Properties(
-                VkPhysicalDeviceVulkan12Properties::from_ash(&l17),
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceTexelBufferAlignmentProperties(
+                VkPhysicalDeviceTexelBufferAlignmentProperties::from_ash(&l17),
             ),
         );
     }
     if on18 {
         p_next.push(
-            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceVulkan13Properties(
-                VkPhysicalDeviceVulkan13Properties::from_ash(&l18),
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceSubgroupSizeControlProperties(
+                VkPhysicalDeviceSubgroupSizeControlProperties::from_ash(&l18),
             ),
         );
     }
     if on19 {
         p_next.push(
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceLineRasterizationProperties(
+                VkPhysicalDeviceLineRasterizationProperties::from_ash(&l19),
+            ),
+        );
+    }
+    if on20 {
+        p_next.push(
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceVulkan11Properties(
+                VkPhysicalDeviceVulkan11Properties::from_ash(&l20),
+            ),
+        );
+    }
+    if on21 {
+        p_next.push(
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceVulkan12Properties(
+                VkPhysicalDeviceVulkan12Properties::from_ash(&l21),
+            ),
+        );
+    }
+    if on22 {
+        p_next.push(
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceVulkan13Properties(
+                VkPhysicalDeviceVulkan13Properties::from_ash(&l22),
+            ),
+        );
+    }
+    if on23 {
+        p_next.push(
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceCustomBorderColorPropertiesEXT(
+                VkPhysicalDeviceCustomBorderColorPropertiesEXT::from_ash(&l23),
+            ),
+        );
+    }
+    if on24 {
+        p_next.push(
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceRobustness2PropertiesKHR(
+                VkPhysicalDeviceRobustness2PropertiesKHR::from_ash(&l24),
+            ),
+        );
+    }
+    if on25 {
+        p_next.push(
+            VkPhysicalDeviceProperties2Next::VkPhysicalDeviceProvokingVertexPropertiesEXT(
+                VkPhysicalDeviceProvokingVertexPropertiesEXT::from_ash(&l25),
+            ),
+        );
+    }
+    if on26 {
+        p_next.push(
             VkPhysicalDeviceProperties2Next::VkPhysicalDeviceShaderIntegerDotProductProperties(
-                VkPhysicalDeviceShaderIntegerDotProductProperties::from_ash(&l19),
+                VkPhysicalDeviceShaderIntegerDotProductProperties::from_ash(&l26),
             ),
         );
     }
@@ -4254,26 +4899,35 @@ pub struct DeviceLinks {
     l14: Option<vk::PhysicalDeviceDescriptorIndexingFeatures<'static>>,
     l15: Option<vk::PhysicalDeviceTimelineSemaphoreFeatures<'static>>,
     l16: Option<vk::PhysicalDevice8BitStorageFeatures<'static>>,
-    l17: Option<vk::PhysicalDeviceVulkanMemoryModelFeatures<'static>>,
-    l18: Option<vk::PhysicalDeviceShaderAtomicInt64Features<'static>>,
-    l19: Option<vk::PhysicalDeviceScalarBlockLayoutFeatures<'static>>,
-    l20: Option<vk::PhysicalDeviceUniformBufferStandardLayoutFeatures<'static>>,
-    l21: Option<vk::PhysicalDeviceBufferDeviceAddressFeatures<'static>>,
-    l22: Option<vk::PhysicalDeviceImagelessFramebufferFeatures<'static>>,
-    l23: Option<vk::PhysicalDeviceTextureCompressionASTCHDRFeatures<'static>>,
-    l24: Option<vk::PhysicalDeviceSeparateDepthStencilLayoutsFeatures<'static>>,
-    l25: Option<vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures<'static>>,
-    l26: Option<vk::PhysicalDeviceSubgroupSizeControlFeatures<'static>>,
-    l27: Option<vk::PhysicalDevicePipelineCreationCacheControlFeatures<'static>>,
-    l28: Option<vk::PhysicalDeviceVulkan11Features<'static>>,
-    l29: Option<vk::PhysicalDeviceVulkan12Features<'static>>,
-    l30: Option<vk::PhysicalDeviceVulkan13Features<'static>>,
-    l31: Option<vk::PhysicalDeviceZeroInitializeWorkgroupMemoryFeatures<'static>>,
-    l32: Option<vk::PhysicalDeviceImageRobustnessFeatures<'static>>,
-    l33: Option<vk::PhysicalDeviceShaderTerminateInvocationFeatures<'static>>,
-    l34: Option<vk::PhysicalDeviceSynchronization2Features<'static>>,
-    l35: Option<vk::PhysicalDeviceShaderIntegerDotProductFeatures<'static>>,
-    l36: Option<vk::PhysicalDeviceDynamicRenderingFeatures<'static>>,
+    l17: Option<vk::PhysicalDeviceConditionalRenderingFeaturesEXT<'static>>,
+    l18: Option<vk::PhysicalDeviceVulkanMemoryModelFeatures<'static>>,
+    l19: Option<vk::PhysicalDeviceShaderAtomicInt64Features<'static>>,
+    l20: Option<vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR<'static>>,
+    l21: Option<vk::PhysicalDeviceTransformFeedbackFeaturesEXT<'static>>,
+    l22: Option<vk::PhysicalDeviceScalarBlockLayoutFeatures<'static>>,
+    l23: Option<vk::PhysicalDeviceUniformBufferStandardLayoutFeatures<'static>>,
+    l24: Option<vk::PhysicalDeviceDepthClipEnableFeaturesEXT<'static>>,
+    l25: Option<vk::PhysicalDeviceBufferDeviceAddressFeatures<'static>>,
+    l26: Option<vk::PhysicalDeviceImagelessFramebufferFeatures<'static>>,
+    l27: Option<vk::PhysicalDeviceTextureCompressionASTCHDRFeatures<'static>>,
+    l28: Option<vk::PhysicalDeviceSeparateDepthStencilLayoutsFeatures<'static>>,
+    l29: Option<vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures<'static>>,
+    l30: Option<vk::PhysicalDeviceSubgroupSizeControlFeatures<'static>>,
+    l31: Option<vk::PhysicalDeviceLineRasterizationFeaturesKHR<'static>>,
+    l32: Option<vk::PhysicalDevicePipelineCreationCacheControlFeatures<'static>>,
+    l33: Option<vk::PhysicalDeviceVulkan11Features<'static>>,
+    l34: Option<vk::PhysicalDeviceVulkan12Features<'static>>,
+    l35: Option<vk::PhysicalDeviceVulkan13Features<'static>>,
+    l36: Option<vk::PhysicalDeviceCustomBorderColorFeaturesEXT<'static>>,
+    l37: Option<vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT<'static>>,
+    l38: Option<vk::PhysicalDeviceZeroInitializeWorkgroupMemoryFeatures<'static>>,
+    l39: Option<vk::PhysicalDeviceRobustness2FeaturesEXT<'static>>,
+    l40: Option<vk::PhysicalDeviceImageRobustnessFeatures<'static>>,
+    l41: Option<vk::PhysicalDeviceShaderTerminateInvocationFeatures<'static>>,
+    l42: Option<vk::PhysicalDeviceSynchronization2Features<'static>>,
+    l43: Option<vk::PhysicalDeviceProvokingVertexFeaturesEXT<'static>>,
+    l44: Option<vk::PhysicalDeviceShaderIntegerDotProductFeatures<'static>>,
+    l45: Option<vk::PhysicalDeviceDynamicRenderingFeatures<'static>>,
 }
 
 impl DeviceLinks {
@@ -4335,65 +4989,92 @@ impl DeviceLinks {
                 VkDeviceCreateInfoNext::VkPhysicalDevice8BitStorageFeatures(v) => {
                     out.l16 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceVulkanMemoryModelFeatures(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceConditionalRenderingFeaturesEXT(v) => {
                     out.l17 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceShaderAtomicInt64Features(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceVulkanMemoryModelFeatures(v) => {
                     out.l18 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceScalarBlockLayoutFeatures(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceShaderAtomicInt64Features(v) => {
                     out.l19 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceUniformBufferStandardLayoutFeatures(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceVertexAttributeDivisorFeatures(v) => {
                     out.l20 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceBufferDeviceAddressFeatures(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceTransformFeedbackFeaturesEXT(v) => {
                     out.l21 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceImagelessFramebufferFeatures(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceScalarBlockLayoutFeatures(v) => {
                     out.l22 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceTextureCompressionASTCHDRFeatures(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceUniformBufferStandardLayoutFeatures(v) => {
                     out.l23 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceDepthClipEnableFeaturesEXT(v) => {
                     out.l24 = Some(v.to_ash())
+                }
+                VkDeviceCreateInfoNext::VkPhysicalDeviceBufferDeviceAddressFeatures(v) => {
+                    out.l25 = Some(v.to_ash())
+                }
+                VkDeviceCreateInfoNext::VkPhysicalDeviceImagelessFramebufferFeatures(v) => {
+                    out.l26 = Some(v.to_ash())
+                }
+                VkDeviceCreateInfoNext::VkPhysicalDeviceTextureCompressionASTCHDRFeatures(v) => {
+                    out.l27 = Some(v.to_ash())
+                }
+                VkDeviceCreateInfoNext::VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures(v) => {
+                    out.l28 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures(
                     v,
-                ) => out.l25 = Some(v.to_ash()),
+                ) => out.l29 = Some(v.to_ash()),
                 VkDeviceCreateInfoNext::VkPhysicalDeviceSubgroupSizeControlFeatures(v) => {
-                    out.l26 = Some(v.to_ash())
+                    out.l30 = Some(v.to_ash())
+                }
+                VkDeviceCreateInfoNext::VkPhysicalDeviceLineRasterizationFeatures(v) => {
+                    out.l31 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkPhysicalDevicePipelineCreationCacheControlFeatures(v) => {
-                    out.l27 = Some(v.to_ash())
+                    out.l32 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkPhysicalDeviceVulkan11Features(v) => {
-                    out.l28 = Some(v.to_ash())
+                    out.l33 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkPhysicalDeviceVulkan12Features(v) => {
-                    out.l29 = Some(v.to_ash())
+                    out.l34 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkPhysicalDeviceVulkan13Features(v) => {
-                    out.l30 = Some(v.to_ash())
+                    out.l35 = Some(v.to_ash())
+                }
+                VkDeviceCreateInfoNext::VkPhysicalDeviceCustomBorderColorFeaturesEXT(v) => {
+                    out.l36 = Some(v.to_ash())
+                }
+                VkDeviceCreateInfoNext::VkPhysicalDeviceBorderColorSwizzleFeaturesEXT(v) => {
+                    out.l37 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures(
                     v,
-                ) => out.l31 = Some(v.to_ash()),
+                ) => out.l38 = Some(v.to_ash()),
+                VkDeviceCreateInfoNext::VkPhysicalDeviceRobustness2FeaturesKHR(v) => {
+                    out.l39 = Some(v.to_ash())
+                }
                 VkDeviceCreateInfoNext::VkPhysicalDeviceImageRobustnessFeatures(v) => {
-                    out.l32 = Some(v.to_ash())
+                    out.l40 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkPhysicalDeviceShaderTerminateInvocationFeatures(v) => {
-                    out.l33 = Some(v.to_ash())
+                    out.l41 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkPhysicalDeviceSynchronization2Features(v) => {
-                    out.l34 = Some(v.to_ash())
+                    out.l42 = Some(v.to_ash())
+                }
+                VkDeviceCreateInfoNext::VkPhysicalDeviceProvokingVertexFeaturesEXT(v) => {
+                    out.l43 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkPhysicalDeviceShaderIntegerDotProductFeatures(v) => {
-                    out.l35 = Some(v.to_ash())
+                    out.l44 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkPhysicalDeviceDynamicRenderingFeatures(v) => {
-                    out.l36 = Some(v.to_ash())
+                    out.l45 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkDeviceGroupDeviceCreateInfo(_) => {}
                 other => return Err(ChainLink::structure_type(other)),
@@ -4513,6 +5194,33 @@ impl DeviceLinks {
             info = info.push_next(l);
         }
         if let Some(l) = self.l36.as_mut() {
+            info = info.push_next(l);
+        }
+        if let Some(l) = self.l37.as_mut() {
+            info = info.push_next(l);
+        }
+        if let Some(l) = self.l38.as_mut() {
+            info = info.push_next(l);
+        }
+        if let Some(l) = self.l39.as_mut() {
+            info = info.push_next(l);
+        }
+        if let Some(l) = self.l40.as_mut() {
+            info = info.push_next(l);
+        }
+        if let Some(l) = self.l41.as_mut() {
+            info = info.push_next(l);
+        }
+        if let Some(l) = self.l42.as_mut() {
+            info = info.push_next(l);
+        }
+        if let Some(l) = self.l43.as_mut() {
+            info = info.push_next(l);
+        }
+        if let Some(l) = self.l44.as_mut() {
+            info = info.push_next(l);
+        }
+        if let Some(l) = self.l45.as_mut() {
             info = info.push_next(l);
         }
         info

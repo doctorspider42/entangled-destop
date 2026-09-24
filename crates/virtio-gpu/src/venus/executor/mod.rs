@@ -112,6 +112,8 @@ pub mod submit;
 pub mod timeline;
 
 #[cfg(test)]
+mod ext_tests;
+#[cfg(test)]
 pub(crate) mod fake;
 #[cfg(test)]
 mod generated_tests;
@@ -797,6 +799,9 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
 
     fn sink_for_ring(&mut self, env: RingEnv) -> io::Result<Self::Sink> {
         let context = self.context(env.ctx_id);
+        lock(&context)
+            .blobs
+            .get_or_insert_with(|| env.blobs.clone());
         Ok(ExecutingSink::new(env, context))
     }
 

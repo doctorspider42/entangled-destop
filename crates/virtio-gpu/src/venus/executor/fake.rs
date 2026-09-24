@@ -190,6 +190,107 @@ pub fn gpu(name: &str) -> FakeDevice {
     FakeDevice { info }
 }
 
+/// [`gpu`] with everything stage 5c passes through for Zink, as the RTX 2070
+/// reports it (the Windows 580.88 driver has `VK_EXT_robustness2` and not the
+/// KHR one): the promoted extensions, the admitted ones, their feature and
+/// property structures — transform feedback with 4 streams and 4 buffers of
+/// at most 4 GiB and 2048-byte strides, and room for only **two** custom
+/// border colour samplers, so that the limit is testable.
+#[must_use]
+pub fn zink_gpu(name: &str) -> FakeDevice {
+    let mut device = gpu(name);
+    let info = &mut device.info;
+    let mut names: Vec<&str> = super::policy::PROMOTED_EXTENSIONS
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| *n != "VK_KHR_synchronization2" && *n != "VK_EXT_texture_compression_astc_hdr")
+        .collect();
+    names.extend([
+        "VK_EXT_border_color_swizzle",
+        "VK_EXT_conditional_rendering",
+        "VK_EXT_custom_border_color",
+        "VK_EXT_depth_clip_enable",
+        "VK_EXT_line_rasterization",
+        "VK_EXT_provoking_vertex",
+        "VK_EXT_robustness2",
+        "VK_EXT_transform_feedback",
+        "VK_EXT_vertex_attribute_divisor",
+        "VK_KHR_line_rasterization",
+        "VK_KHR_vertex_attribute_divisor",
+        "VK_KHR_external_memory_win32",
+    ]);
+    for name in names {
+        info.extensions.push(VkExtensionProperties {
+            extension_name: name_array(name),
+            spec_version: 1,
+        });
+    }
+    info.features.p_next.extend([
+        VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceTransformFeedbackFeaturesEXT(
+            VkPhysicalDeviceTransformFeedbackFeaturesEXT {
+                transform_feedback: 1,
+                geometry_streams: 1,
+            },
+        ),
+        VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceRobustness2FeaturesKHR(
+            VkPhysicalDeviceRobustness2FeaturesKHR {
+                robust_buffer_access2: 1,
+                robust_image_access2: 1,
+                null_descriptor: 1,
+            },
+        ),
+        VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceConditionalRenderingFeaturesEXT(
+            VkPhysicalDeviceConditionalRenderingFeaturesEXT {
+                conditional_rendering: 1,
+                inherited_conditional_rendering: 1,
+            },
+        ),
+        VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceCustomBorderColorFeaturesEXT(
+            VkPhysicalDeviceCustomBorderColorFeaturesEXT {
+                custom_border_colors: 1,
+                custom_border_color_without_format: 1,
+            },
+        ),
+        VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceLineRasterizationFeatures(
+            VkPhysicalDeviceLineRasterizationFeatures {
+                rectangular_lines: 1,
+                bresenham_lines: 1,
+                smooth_lines: 1,
+                stippled_rectangular_lines: 1,
+                stippled_bresenham_lines: 1,
+                stippled_smooth_lines: 1,
+            },
+        ),
+    ]);
+    info.properties.p_next.extend([
+        VkPhysicalDeviceProperties2Next::VkPhysicalDeviceTransformFeedbackPropertiesEXT(
+            VkPhysicalDeviceTransformFeedbackPropertiesEXT {
+                max_transform_feedback_streams: 4,
+                max_transform_feedback_buffers: 4,
+                max_transform_feedback_buffer_size: 1 << 32,
+                max_transform_feedback_stream_data_size: 512,
+                max_transform_feedback_buffer_data_size: 512,
+                max_transform_feedback_buffer_data_stride: 2048,
+                transform_feedback_queries: 1,
+                transform_feedback_streams_lines_triangles: 1,
+                transform_feedback_rasterization_stream_select: 1,
+                transform_feedback_draw: 1,
+            },
+        ),
+        VkPhysicalDeviceProperties2Next::VkPhysicalDeviceCustomBorderColorPropertiesEXT(
+            VkPhysicalDeviceCustomBorderColorPropertiesEXT {
+                max_custom_border_color_samplers: 2,
+            },
+        ),
+        VkPhysicalDeviceProperties2Next::VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT(
+            VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT {
+                max_vertex_attrib_divisor: 1 << 16,
+            },
+        ),
+    ]);
+    device
+}
+
 /// A lavapipe-shaped device: a CPU implementation, which is never exposed.
 #[must_use]
 pub fn cpu() -> FakeDevice {
@@ -285,6 +386,9 @@ pub struct FakeVulkan {
     /// Called with every stage-5b.2 command's name as it reaches the host.
     #[allow(clippy::type_complexity)]
     pub on_call: Mutex<Option<Box<dyn FnMut(&str) + Send>>>,
+    /// What `vkGetPhysicalDeviceExternalBufferProperties(HOST_ALLOCATION)`
+    /// answers for every buffer: importable (`true`, the default) or not.
+    pub buffer_imports: AtomicBool,
 }
 
 impl std::fmt::Debug for FakeVulkan {
@@ -310,6 +414,7 @@ impl FakeVulkan {
             lost: AtomicBool::new(false),
             stuck_queues: Mutex::new(std::collections::HashSet::new()),
             on_call: Mutex::new(None),
+            buffer_imports: AtomicBool::new(true),
         }
     }
 
@@ -876,6 +981,24 @@ impl HostVulkan for FakeVulkan {
             sample_counts: 0xf,
             max_resource_size: 1 << 31,
         };
+        // As a driver that imports host allocations for linear images only
+        // (`image_accepts_host_memory`), and knows no other external type.
+        let external = info.p_next.iter().find_map(|l| match l {
+            VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceExternalImageFormatInfo(e) => {
+                Some(e.handle_type)
+            }
+            _ => None,
+        });
+        for link in &mut out.p_next {
+            if let VkImageFormatProperties2Next::VkExternalImageFormatProperties(p) = link {
+                let importable = external == Some(0x80) && info.tiling == 1;
+                p.external_memory_properties = VkExternalMemoryProperties {
+                    external_memory_features: if importable { 0x4 } else { 0 },
+                    export_from_imported_handle_types: 0,
+                    compatible_handle_types: if importable { 0x80 } else { 0 },
+                };
+            }
+        }
         VK_SUCCESS
     }
 
@@ -896,6 +1019,10 @@ impl HostVulkan for FakeVulkan {
         } else {
             VkExternalSemaphoreProperties::default()
         }
+    }
+
+    fn buffer_importable(&self, _instance: &u64, _device: usize, _flags: u32, _usage: u32) -> bool {
+        self.buffer_imports.load(Ordering::SeqCst)
     }
 
     fn create_device(

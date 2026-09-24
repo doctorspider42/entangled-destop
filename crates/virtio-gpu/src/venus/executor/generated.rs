@@ -41,6 +41,10 @@ pub trait Resolve {
     fn invalid(&self, what: String) -> ExecError;
     /// A refusal of a chained structure the executor does not admit.
     fn link(&self, parent: &'static str, stype: i32) -> ExecError;
+    /// Whether the device the command is translated against enabled
+    /// `extension`: a value or a chained structure an admitted extension adds
+    /// is refused on a device that did not (`policy::ADMITTED_EXTENSIONS`).
+    fn enabled(&self, extension: &'static str) -> bool;
 }
 
 fn chk_len(r: &dyn Resolve, what: &'static str, len: usize, count: u64) -> Result<(), ExecError> {
@@ -152,6 +156,12 @@ pub fn e_VkIndexType(v: i32) -> bool {
     matches!(v, 0..=1)
 }
 
+/// Whether `v` is a `VkLineRasterizationMode` value of core Vulkan 1.0-1.3.
+#[must_use]
+pub fn e_VkLineRasterizationMode(v: i32) -> bool {
+    matches!(v, 0..=3)
+}
+
 /// Whether `v` is a `VkLogicOp` value of core Vulkan 1.0-1.3.
 #[must_use]
 pub fn e_VkLogicOp(v: i32) -> bool {
@@ -180,6 +190,12 @@ pub fn e_VkPolygonMode(v: i32) -> bool {
 #[must_use]
 pub fn e_VkPrimitiveTopology(v: i32) -> bool {
     matches!(v, 0..=10)
+}
+
+/// Whether `v` is a `VkProvokingVertexModeEXT` value of core Vulkan 1.0-1.3.
+#[must_use]
+pub fn e_VkProvokingVertexModeEXT(v: i32) -> bool {
+    matches!(v, 0..=1)
 }
 
 /// Whether `v` is a `VkQueryType` value of core Vulkan 1.0-1.3.
@@ -370,7 +386,7 @@ fn t_VkSubmitInfo(r: &mut dyn Resolve, v: &mut VkSubmitInfo) -> Result<(), ExecE
         )));
     }
     for x in v.p_wait_dst_stage_mask.iter().flatten() {
-        if !(*x & !0x1ffff_u32 == 0) {
+        if !(*x & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
             return Err(r.invalid(format!(
                 "{} = {:#x} is not a Vulkan 1.3 value",
                 "VkSubmitInfo.pWaitDstStageMask", *x
@@ -523,7 +539,7 @@ fn t_VkQueryPoolCreateInfo(
             "VkQueryPoolCreateInfo.flags", v.flags
         )));
     }
-    if !(e_VkQueryType(v.query_type)) {
+    if !(e_VkQueryType(v.query_type) || x_VkQueryType(&*r, v.query_type)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkQueryPoolCreateInfo.queryType", v.query_type
@@ -690,19 +706,43 @@ fn t_VkVertexInputAttributeDescription(
     Ok(())
 }
 
+fn t_VkVertexInputBindingDivisorDescription(
+    r: &mut dyn Resolve,
+    v: &mut VkVertexInputBindingDivisorDescription,
+) -> Result<(), ExecError> {
+    Ok(())
+}
+
+fn t_VkPipelineVertexInputDivisorStateCreateInfo(
+    r: &mut dyn Resolve,
+    v: &mut VkPipelineVertexInputDivisorStateCreateInfo,
+) -> Result<(), ExecError> {
+    if let Some(x) = &v.p_vertex_binding_divisors {
+        chk_len(
+            r,
+            "VkPipelineVertexInputDivisorStateCreateInfo.pVertexBindingDivisors",
+            x.len(),
+            u64::from(v.vertex_binding_divisor_count),
+        )?;
+    }
+    if v.p_vertex_binding_divisors.is_none() && u64::from(v.vertex_binding_divisor_count) != 0 {
+        return Err(r.invalid(format!(
+            "{} is null with a nonzero count",
+            "VkPipelineVertexInputDivisorStateCreateInfo.pVertexBindingDivisors"
+        )));
+    }
+    for x in v.p_vertex_binding_divisors.iter_mut().flatten() {
+        t_VkVertexInputBindingDivisorDescription(r, x)?;
+    }
+    Ok(())
+}
+
 fn t_VkPipelineVertexInputStateCreateInfo(
     r: &mut dyn Resolve,
     v: &mut VkPipelineVertexInputStateCreateInfo,
 ) -> Result<(), ExecError> {
     for link in v.p_next.iter_mut() {
-        match link {
-            other => {
-                return Err(r.link(
-                    "VkPipelineVertexInputStateCreateInfo",
-                    ChainLink::structure_type(other),
-                ))
-            }
-        }
+        match link { VkPipelineVertexInputStateCreateInfoNext::VkPipelineVertexInputDivisorStateCreateInfo(x) => { if !(r.enabled("VK_EXT_vertex_attribute_divisor") || r.enabled("VK_KHR_vertex_attribute_divisor")) { return Err(r.link("VkPipelineVertexInputStateCreateInfo", VkPipelineVertexInputDivisorStateCreateInfo::STRUCTURE_TYPE)); } t_VkPipelineVertexInputDivisorStateCreateInfo(r, x)? } other => return Err(r.link("VkPipelineVertexInputStateCreateInfo", ChainLink::structure_type(other))), }
     }
     if !(v.flags & !0x0_u32 == 0) {
         return Err(r.invalid(format!(
@@ -862,19 +902,66 @@ fn t_VkPipelineViewportStateCreateInfo(
     Ok(())
 }
 
+fn t_VkPipelineRasterizationStateStreamCreateInfoEXT(
+    r: &mut dyn Resolve,
+    v: &mut VkPipelineRasterizationStateStreamCreateInfoEXT,
+) -> Result<(), ExecError> {
+    if !(v.flags & !0x0_u32 == 0) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkPipelineRasterizationStateStreamCreateInfoEXT.flags", v.flags
+        )));
+    }
+    Ok(())
+}
+
+fn t_VkPipelineRasterizationDepthClipStateCreateInfoEXT(
+    r: &mut dyn Resolve,
+    v: &mut VkPipelineRasterizationDepthClipStateCreateInfoEXT,
+) -> Result<(), ExecError> {
+    if !(v.flags & !0x0_u32 == 0) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkPipelineRasterizationDepthClipStateCreateInfoEXT.flags", v.flags
+        )));
+    }
+    Ok(())
+}
+
+fn t_VkPipelineRasterizationLineStateCreateInfo(
+    r: &mut dyn Resolve,
+    v: &mut VkPipelineRasterizationLineStateCreateInfo,
+) -> Result<(), ExecError> {
+    if !(e_VkLineRasterizationMode(v.line_rasterization_mode)) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkPipelineRasterizationLineStateCreateInfo.lineRasterizationMode",
+            v.line_rasterization_mode
+        )));
+    }
+    Ok(())
+}
+
+fn t_VkPipelineRasterizationProvokingVertexStateCreateInfoEXT(
+    r: &mut dyn Resolve,
+    v: &mut VkPipelineRasterizationProvokingVertexStateCreateInfoEXT,
+) -> Result<(), ExecError> {
+    if !(e_VkProvokingVertexModeEXT(v.provoking_vertex_mode)) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkPipelineRasterizationProvokingVertexStateCreateInfoEXT.provokingVertexMode",
+            v.provoking_vertex_mode
+        )));
+    }
+    Ok(())
+}
+
 fn t_VkPipelineRasterizationStateCreateInfo(
     r: &mut dyn Resolve,
     v: &mut VkPipelineRasterizationStateCreateInfo,
 ) -> Result<(), ExecError> {
     for link in v.p_next.iter_mut() {
-        match link {
-            other => {
-                return Err(r.link(
-                    "VkPipelineRasterizationStateCreateInfo",
-                    ChainLink::structure_type(other),
-                ))
-            }
-        }
+        match link { VkPipelineRasterizationStateCreateInfoNext::VkPipelineRasterizationStateStreamCreateInfoEXT(x) => { if !(r.enabled("VK_EXT_transform_feedback")) { return Err(r.link("VkPipelineRasterizationStateCreateInfo", VkPipelineRasterizationStateStreamCreateInfoEXT::STRUCTURE_TYPE)); } t_VkPipelineRasterizationStateStreamCreateInfoEXT(r, x)? } VkPipelineRasterizationStateCreateInfoNext::VkPipelineRasterizationDepthClipStateCreateInfoEXT(x) => { if !(r.enabled("VK_EXT_depth_clip_enable")) { return Err(r.link("VkPipelineRasterizationStateCreateInfo", VkPipelineRasterizationDepthClipStateCreateInfoEXT::STRUCTURE_TYPE)); } t_VkPipelineRasterizationDepthClipStateCreateInfoEXT(r, x)? } VkPipelineRasterizationStateCreateInfoNext::VkPipelineRasterizationLineStateCreateInfo(x) => { if !(r.enabled("VK_EXT_line_rasterization") || r.enabled("VK_KHR_line_rasterization")) { return Err(r.link("VkPipelineRasterizationStateCreateInfo", VkPipelineRasterizationLineStateCreateInfo::STRUCTURE_TYPE)); } t_VkPipelineRasterizationLineStateCreateInfo(r, x)? } VkPipelineRasterizationStateCreateInfoNext::VkPipelineRasterizationProvokingVertexStateCreateInfoEXT(x) => { if !(r.enabled("VK_EXT_provoking_vertex")) { return Err(r.link("VkPipelineRasterizationStateCreateInfo", VkPipelineRasterizationProvokingVertexStateCreateInfoEXT::STRUCTURE_TYPE)); } t_VkPipelineRasterizationProvokingVertexStateCreateInfoEXT(r, x)? } other => return Err(r.link("VkPipelineRasterizationStateCreateInfo", ChainLink::structure_type(other))), }
     }
     if !(v.flags & !0x0_u32 == 0) {
         return Err(r.invalid(format!(
@@ -1097,7 +1184,7 @@ fn t_VkPipelineDynamicStateCreateInfo(
         )));
     }
     for x in v.p_dynamic_states.iter().flatten() {
-        if !(e_VkDynamicState(*x)) {
+        if !(e_VkDynamicState(*x) || x_VkDynamicState(&*r, *x)) {
             return Err(r.invalid(format!(
                 "{} = {:#x} is not a Vulkan 1.3 value",
                 "VkPipelineDynamicStateCreateInfo.pDynamicStates", *x
@@ -1367,6 +1454,55 @@ fn t_VkSamplerReductionModeCreateInfo(
     Ok(())
 }
 
+fn t_VkSamplerCustomBorderColorCreateInfoEXT(
+    r: &mut dyn Resolve,
+    v: &mut VkSamplerCustomBorderColorCreateInfoEXT,
+) -> Result<(), ExecError> {
+    if !(e_VkFormat(v.format)) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkSamplerCustomBorderColorCreateInfoEXT.format", v.format
+        )));
+    }
+    Ok(())
+}
+
+fn t_VkComponentMapping(r: &mut dyn Resolve, v: &mut VkComponentMapping) -> Result<(), ExecError> {
+    if !(e_VkComponentSwizzle(v.r)) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkComponentMapping.r", v.r
+        )));
+    }
+    if !(e_VkComponentSwizzle(v.g)) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkComponentMapping.g", v.g
+        )));
+    }
+    if !(e_VkComponentSwizzle(v.b)) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkComponentMapping.b", v.b
+        )));
+    }
+    if !(e_VkComponentSwizzle(v.a)) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkComponentMapping.a", v.a
+        )));
+    }
+    Ok(())
+}
+
+fn t_VkSamplerBorderColorComponentMappingCreateInfoEXT(
+    r: &mut dyn Resolve,
+    v: &mut VkSamplerBorderColorComponentMappingCreateInfoEXT,
+) -> Result<(), ExecError> {
+    t_VkComponentMapping(r, &mut v.components)?;
+    Ok(())
+}
+
 fn t_VkSamplerCreateInfo(
     r: &mut dyn Resolve,
     v: &mut VkSamplerCreateInfo,
@@ -1378,6 +1514,24 @@ fn t_VkSamplerCreateInfo(
             }
             VkSamplerCreateInfoNext::VkSamplerReductionModeCreateInfo(x) => {
                 t_VkSamplerReductionModeCreateInfo(r, x)?
+            }
+            VkSamplerCreateInfoNext::VkSamplerCustomBorderColorCreateInfoEXT(x) => {
+                if !(r.enabled("VK_EXT_custom_border_color")) {
+                    return Err(r.link(
+                        "VkSamplerCreateInfo",
+                        VkSamplerCustomBorderColorCreateInfoEXT::STRUCTURE_TYPE,
+                    ));
+                }
+                t_VkSamplerCustomBorderColorCreateInfoEXT(r, x)?
+            }
+            VkSamplerCreateInfoNext::VkSamplerBorderColorComponentMappingCreateInfoEXT(x) => {
+                if !(r.enabled("VK_EXT_border_color_swizzle")) {
+                    return Err(r.link(
+                        "VkSamplerCreateInfo",
+                        VkSamplerBorderColorComponentMappingCreateInfoEXT::STRUCTURE_TYPE,
+                    ));
+                }
+                t_VkSamplerBorderColorComponentMappingCreateInfoEXT(r, x)?
             }
             other => return Err(r.link("VkSamplerCreateInfo", ChainLink::structure_type(other))),
         }
@@ -2066,25 +2220,25 @@ fn t_VkSubpassDependency(
     r: &mut dyn Resolve,
     v: &mut VkSubpassDependency,
 ) -> Result<(), ExecError> {
-    if !(v.src_stage_mask & !0x1ffff_u32 == 0) {
+    if !(v.src_stage_mask & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkSubpassDependency.srcStageMask", v.src_stage_mask
         )));
     }
-    if !(v.dst_stage_mask & !0x1ffff_u32 == 0) {
+    if !(v.dst_stage_mask & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkSubpassDependency.dstStageMask", v.dst_stage_mask
         )));
     }
-    if !(v.src_access_mask & !0x1ffff_u32 == 0) {
+    if !(v.src_access_mask & !(0x1ffff_u32 | m_VkAccessFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkSubpassDependency.srcAccessMask", v.src_access_mask
         )));
     }
-    if !(v.dst_access_mask & !0x1ffff_u32 == 0) {
+    if !(v.dst_access_mask & !(0x1ffff_u32 | m_VkAccessFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkSubpassDependency.dstAccessMask", v.dst_access_mask
@@ -2279,6 +2433,13 @@ fn t_VkCommandBufferAllocateInfo(
     Ok(())
 }
 
+fn t_VkCommandBufferInheritanceConditionalRenderingInfoEXT(
+    r: &mut dyn Resolve,
+    v: &mut VkCommandBufferInheritanceConditionalRenderingInfoEXT,
+) -> Result<(), ExecError> {
+    Ok(())
+}
+
 fn t_VkCommandBufferInheritanceRenderingInfo(
     r: &mut dyn Resolve,
     v: &mut VkCommandBufferInheritanceRenderingInfo,
@@ -2339,17 +2500,7 @@ fn t_VkCommandBufferInheritanceInfo(
     v: &mut VkCommandBufferInheritanceInfo,
 ) -> Result<(), ExecError> {
     for link in v.p_next.iter_mut() {
-        match link {
-            VkCommandBufferInheritanceInfoNext::VkCommandBufferInheritanceRenderingInfo(x) => {
-                t_VkCommandBufferInheritanceRenderingInfo(r, x)?
-            }
-            other => {
-                return Err(r.link(
-                    "VkCommandBufferInheritanceInfo",
-                    ChainLink::structure_type(other),
-                ))
-            }
-        }
+        match link { VkCommandBufferInheritanceInfoNext::VkCommandBufferInheritanceConditionalRenderingInfoEXT(x) => { if !(r.enabled("VK_EXT_conditional_rendering")) { return Err(r.link("VkCommandBufferInheritanceInfo", VkCommandBufferInheritanceConditionalRenderingInfoEXT::STRUCTURE_TYPE)); } t_VkCommandBufferInheritanceConditionalRenderingInfoEXT(r, x)? } VkCommandBufferInheritanceInfoNext::VkCommandBufferInheritanceRenderingInfo(x) => t_VkCommandBufferInheritanceRenderingInfo(r, x)?, other => return Err(r.link("VkCommandBufferInheritanceInfo", ChainLink::structure_type(other))), }
     }
     v.render_pass.0 = r.handle(
         Kind::RenderPass,
@@ -2497,13 +2648,13 @@ fn t_VkImageResolve(r: &mut dyn Resolve, v: &mut VkImageResolve) -> Result<(), E
 }
 
 fn t_VkMemoryBarrier(r: &mut dyn Resolve, v: &mut VkMemoryBarrier) -> Result<(), ExecError> {
-    if !(v.src_access_mask & !0x1ffff_u32 == 0) {
+    if !(v.src_access_mask & !(0x1ffff_u32 | m_VkAccessFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkMemoryBarrier.srcAccessMask", v.src_access_mask
         )));
     }
-    if !(v.dst_access_mask & !0x1ffff_u32 == 0) {
+    if !(v.dst_access_mask & !(0x1ffff_u32 | m_VkAccessFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkMemoryBarrier.dstAccessMask", v.dst_access_mask
@@ -2553,6 +2704,25 @@ fn t_VkImageMemoryBarrier(
     }
     v.image.0 = r.handle(Kind::Image, v.image.0, false, "VkImageMemoryBarrier.image")?;
     t_VkImageSubresourceRange(r, &mut v.subresource_range)?;
+    Ok(())
+}
+
+fn t_VkConditionalRenderingBeginInfoEXT(
+    r: &mut dyn Resolve,
+    v: &mut VkConditionalRenderingBeginInfoEXT,
+) -> Result<(), ExecError> {
+    v.buffer.0 = r.handle(
+        Kind::Buffer,
+        v.buffer.0,
+        false,
+        "VkConditionalRenderingBeginInfoEXT.buffer",
+    )?;
+    if !(v.flags & !0x1_u32 == 0) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkConditionalRenderingBeginInfoEXT.flags", v.flags
+        )));
+    }
     Ok(())
 }
 
@@ -2706,34 +2876,6 @@ fn t_VkDescriptorUpdateTemplateCreateInfo(
         true,
         "VkDescriptorUpdateTemplateCreateInfo.pipelineLayout",
     )?;
-    Ok(())
-}
-
-fn t_VkComponentMapping(r: &mut dyn Resolve, v: &mut VkComponentMapping) -> Result<(), ExecError> {
-    if !(e_VkComponentSwizzle(v.r)) {
-        return Err(r.invalid(format!(
-            "{} = {:#x} is not a Vulkan 1.3 value",
-            "VkComponentMapping.r", v.r
-        )));
-    }
-    if !(e_VkComponentSwizzle(v.g)) {
-        return Err(r.invalid(format!(
-            "{} = {:#x} is not a Vulkan 1.3 value",
-            "VkComponentMapping.g", v.g
-        )));
-    }
-    if !(e_VkComponentSwizzle(v.b)) {
-        return Err(r.invalid(format!(
-            "{} = {:#x} is not a Vulkan 1.3 value",
-            "VkComponentMapping.b", v.b
-        )));
-    }
-    if !(e_VkComponentSwizzle(v.a)) {
-        return Err(r.invalid(format!(
-            "{} = {:#x} is not a Vulkan 1.3 value",
-            "VkComponentMapping.a", v.a
-        )));
-    }
     Ok(())
 }
 
@@ -3005,25 +3147,25 @@ fn t_VkSubpassDescription2(
 }
 
 fn t_VkMemoryBarrier2(r: &mut dyn Resolve, v: &mut VkMemoryBarrier2) -> Result<(), ExecError> {
-    if !(v.src_stage_mask & !0x7f0001ffff_u64 == 0) {
+    if !(v.src_stage_mask & !(0x7f0001ffff_u64 | m_VkPipelineStageFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkMemoryBarrier2.srcStageMask", v.src_stage_mask
         )));
     }
-    if !(v.src_access_mask & !0x70001ffff_u64 == 0) {
+    if !(v.src_access_mask & !(0x70001ffff_u64 | m_VkAccessFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkMemoryBarrier2.srcAccessMask", v.src_access_mask
         )));
     }
-    if !(v.dst_stage_mask & !0x7f0001ffff_u64 == 0) {
+    if !(v.dst_stage_mask & !(0x7f0001ffff_u64 | m_VkPipelineStageFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkMemoryBarrier2.dstStageMask", v.dst_stage_mask
         )));
     }
-    if !(v.dst_access_mask & !0x70001ffff_u64 == 0) {
+    if !(v.dst_access_mask & !(0x70001ffff_u64 | m_VkAccessFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkMemoryBarrier2.dstAccessMask", v.dst_access_mask
@@ -3042,25 +3184,25 @@ fn t_VkSubpassDependency2(
             other => return Err(r.link("VkSubpassDependency2", ChainLink::structure_type(other))),
         }
     }
-    if !(v.src_stage_mask & !0x1ffff_u32 == 0) {
+    if !(v.src_stage_mask & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkSubpassDependency2.srcStageMask", v.src_stage_mask
         )));
     }
-    if !(v.dst_stage_mask & !0x1ffff_u32 == 0) {
+    if !(v.dst_stage_mask & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkSubpassDependency2.dstStageMask", v.dst_stage_mask
         )));
     }
-    if !(v.src_access_mask & !0x1ffff_u32 == 0) {
+    if !(v.src_access_mask & !(0x1ffff_u32 | m_VkAccessFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkSubpassDependency2.srcAccessMask", v.src_access_mask
         )));
     }
-    if !(v.dst_access_mask & !0x1ffff_u32 == 0) {
+    if !(v.dst_access_mask & !(0x1ffff_u32 | m_VkAccessFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkSubpassDependency2.dstAccessMask", v.dst_access_mask
@@ -3553,25 +3695,25 @@ fn t_VkBufferMemoryBarrier2(
             other => return Err(r.link("VkBufferMemoryBarrier2", ChainLink::structure_type(other))),
         }
     }
-    if !(v.src_stage_mask & !0x7f0001ffff_u64 == 0) {
+    if !(v.src_stage_mask & !(0x7f0001ffff_u64 | m_VkPipelineStageFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkBufferMemoryBarrier2.srcStageMask", v.src_stage_mask
         )));
     }
-    if !(v.src_access_mask & !0x70001ffff_u64 == 0) {
+    if !(v.src_access_mask & !(0x70001ffff_u64 | m_VkAccessFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkBufferMemoryBarrier2.srcAccessMask", v.src_access_mask
         )));
     }
-    if !(v.dst_stage_mask & !0x7f0001ffff_u64 == 0) {
+    if !(v.dst_stage_mask & !(0x7f0001ffff_u64 | m_VkPipelineStageFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkBufferMemoryBarrier2.dstStageMask", v.dst_stage_mask
         )));
     }
-    if !(v.dst_access_mask & !0x70001ffff_u64 == 0) {
+    if !(v.dst_access_mask & !(0x70001ffff_u64 | m_VkAccessFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkBufferMemoryBarrier2.dstAccessMask", v.dst_access_mask
@@ -3595,25 +3737,25 @@ fn t_VkImageMemoryBarrier2(
             other => return Err(r.link("VkImageMemoryBarrier2", ChainLink::structure_type(other))),
         }
     }
-    if !(v.src_stage_mask & !0x7f0001ffff_u64 == 0) {
+    if !(v.src_stage_mask & !(0x7f0001ffff_u64 | m_VkPipelineStageFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkImageMemoryBarrier2.srcStageMask", v.src_stage_mask
         )));
     }
-    if !(v.src_access_mask & !0x70001ffff_u64 == 0) {
+    if !(v.src_access_mask & !(0x70001ffff_u64 | m_VkAccessFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkImageMemoryBarrier2.srcAccessMask", v.src_access_mask
         )));
     }
-    if !(v.dst_stage_mask & !0x7f0001ffff_u64 == 0) {
+    if !(v.dst_stage_mask & !(0x7f0001ffff_u64 | m_VkPipelineStageFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkImageMemoryBarrier2.dstStageMask", v.dst_stage_mask
         )));
     }
-    if !(v.dst_access_mask & !0x70001ffff_u64 == 0) {
+    if !(v.dst_access_mask & !(0x70001ffff_u64 | m_VkAccessFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkImageMemoryBarrier2.dstAccessMask", v.dst_access_mask
@@ -3707,7 +3849,7 @@ fn t_VkSemaphoreSubmitInfo(
         false,
         "VkSemaphoreSubmitInfo.semaphore",
     )?;
-    if !(v.stage_mask & !0x7f0001ffff_u64 == 0) {
+    if !(v.stage_mask & !(0x7f0001ffff_u64 | m_VkPipelineStageFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkSemaphoreSubmitInfo.stageMask", v.stage_mask
@@ -5023,7 +5165,7 @@ fn t_CmdBindVertexBuffers(
         )));
     }
     for h in a.p_buffers.iter_mut().flatten() {
-        h.0 = r.handle(Kind::Buffer, h.0, false, "vkCmdBindVertexBuffers.pBuffers")?;
+        h.0 = r.handle(Kind::Buffer, h.0, true, "vkCmdBindVertexBuffers.pBuffers")?;
     }
     if let Some(x) = &a.p_offsets {
         chk_len(
@@ -5576,7 +5718,7 @@ fn t_CmdSetEvent(r: &mut dyn Resolve, a: &mut CmdSetEventArgs) -> Result<(), Exe
         "vkCmdSetEvent.commandBuffer",
     )?;
     a.event.0 = r.handle(Kind::Event, a.event.0, false, "vkCmdSetEvent.event")?;
-    if !(a.stage_mask & !0x1ffff_u32 == 0) {
+    if !(a.stage_mask & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "vkCmdSetEvent.stageMask", a.stage_mask
@@ -5593,7 +5735,7 @@ fn t_CmdResetEvent(r: &mut dyn Resolve, a: &mut CmdResetEventArgs) -> Result<(),
         "vkCmdResetEvent.commandBuffer",
     )?;
     a.event.0 = r.handle(Kind::Event, a.event.0, false, "vkCmdResetEvent.event")?;
-    if !(a.stage_mask & !0x1ffff_u32 == 0) {
+    if !(a.stage_mask & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "vkCmdResetEvent.stageMask", a.stage_mask
@@ -5626,13 +5768,13 @@ fn t_CmdWaitEvents(r: &mut dyn Resolve, a: &mut CmdWaitEventsArgs) -> Result<(),
     for h in a.p_events.iter_mut().flatten() {
         h.0 = r.handle(Kind::Event, h.0, false, "vkCmdWaitEvents.pEvents")?;
     }
-    if !(a.src_stage_mask & !0x1ffff_u32 == 0) {
+    if !(a.src_stage_mask & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "vkCmdWaitEvents.srcStageMask", a.src_stage_mask
         )));
     }
-    if !(a.dst_stage_mask & !0x1ffff_u32 == 0) {
+    if !(a.dst_stage_mask & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "vkCmdWaitEvents.dstStageMask", a.dst_stage_mask
@@ -5702,13 +5844,13 @@ fn t_CmdPipelineBarrier(
         false,
         "vkCmdPipelineBarrier.commandBuffer",
     )?;
-    if !(a.src_stage_mask & !0x1ffff_u32 == 0) {
+    if !(a.src_stage_mask & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "vkCmdPipelineBarrier.srcStageMask", a.src_stage_mask
         )));
     }
-    if !(a.dst_stage_mask & !0x1ffff_u32 == 0) {
+    if !(a.dst_stage_mask & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "vkCmdPipelineBarrier.dstStageMask", a.dst_stage_mask
@@ -5812,6 +5954,35 @@ fn t_CmdEndQuery(r: &mut dyn Resolve, a: &mut CmdEndQueryArgs) -> Result<(), Exe
     Ok(())
 }
 
+fn t_CmdBeginConditionalRenderingEXT(
+    r: &mut dyn Resolve,
+    a: &mut CmdBeginConditionalRenderingEXTArgs,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdBeginConditionalRenderingEXT.commandBuffer",
+    )?;
+    if let Some(x) = a.p_conditional_rendering_begin.as_mut() {
+        t_VkConditionalRenderingBeginInfoEXT(r, x)?;
+    }
+    Ok(())
+}
+
+fn t_CmdEndConditionalRenderingEXT(
+    r: &mut dyn Resolve,
+    a: &mut CmdEndConditionalRenderingEXTArgs,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdEndConditionalRenderingEXT.commandBuffer",
+    )?;
+    Ok(())
+}
+
 fn t_CmdResetQueryPool(
     r: &mut dyn Resolve,
     a: &mut CmdResetQueryPoolArgs,
@@ -5841,7 +6012,7 @@ fn t_CmdWriteTimestamp(
         false,
         "vkCmdWriteTimestamp.commandBuffer",
     )?;
-    if !((a.pipeline_stage as u32) & !0x1ffff_u32 == 0) {
+    if !((a.pipeline_stage as u32) & !(0x1ffff_u32 | m_VkPipelineStageFlagBits(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "vkCmdWriteTimestamp.pipelineStage", a.pipeline_stage
@@ -6292,6 +6463,213 @@ fn t_CmdDrawIndexedIndirectCount(
     Ok(())
 }
 
+fn t_CmdBindTransformFeedbackBuffersEXT(
+    r: &mut dyn Resolve,
+    a: &mut CmdBindTransformFeedbackBuffersEXTArgs,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdBindTransformFeedbackBuffersEXT.commandBuffer",
+    )?;
+    if let Some(x) = &a.p_buffers {
+        chk_len(
+            r,
+            "vkCmdBindTransformFeedbackBuffersEXT.pBuffers",
+            x.len(),
+            u64::from(a.binding_count),
+        )?;
+    }
+    if a.p_buffers.is_none() && u64::from(a.binding_count) != 0 {
+        return Err(r.invalid(format!(
+            "{} is null with a nonzero count",
+            "vkCmdBindTransformFeedbackBuffersEXT.pBuffers"
+        )));
+    }
+    for h in a.p_buffers.iter_mut().flatten() {
+        h.0 = r.handle(
+            Kind::Buffer,
+            h.0,
+            false,
+            "vkCmdBindTransformFeedbackBuffersEXT.pBuffers",
+        )?;
+    }
+    if let Some(x) = &a.p_offsets {
+        chk_len(
+            r,
+            "vkCmdBindTransformFeedbackBuffersEXT.pOffsets",
+            x.len(),
+            u64::from(a.binding_count),
+        )?;
+    }
+    if a.p_offsets.is_none() && u64::from(a.binding_count) != 0 {
+        return Err(r.invalid(format!(
+            "{} is null with a nonzero count",
+            "vkCmdBindTransformFeedbackBuffersEXT.pOffsets"
+        )));
+    }
+    if let Some(x) = &a.p_sizes {
+        chk_len(
+            r,
+            "vkCmdBindTransformFeedbackBuffersEXT.pSizes",
+            x.len(),
+            u64::from(a.binding_count),
+        )?;
+    }
+    Ok(())
+}
+
+fn t_CmdBeginTransformFeedbackEXT(
+    r: &mut dyn Resolve,
+    a: &mut CmdBeginTransformFeedbackEXTArgs,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdBeginTransformFeedbackEXT.commandBuffer",
+    )?;
+    if let Some(x) = &a.p_counter_buffers {
+        chk_len(
+            r,
+            "vkCmdBeginTransformFeedbackEXT.pCounterBuffers",
+            x.len(),
+            u64::from(a.counter_buffer_count),
+        )?;
+    }
+    for h in a.p_counter_buffers.iter_mut().flatten() {
+        h.0 = r.handle(
+            Kind::Buffer,
+            h.0,
+            true,
+            "vkCmdBeginTransformFeedbackEXT.pCounterBuffers",
+        )?;
+    }
+    if let Some(x) = &a.p_counter_buffer_offsets {
+        chk_len(
+            r,
+            "vkCmdBeginTransformFeedbackEXT.pCounterBufferOffsets",
+            x.len(),
+            u64::from(a.counter_buffer_count),
+        )?;
+    }
+    Ok(())
+}
+
+fn t_CmdEndTransformFeedbackEXT(
+    r: &mut dyn Resolve,
+    a: &mut CmdEndTransformFeedbackEXTArgs,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdEndTransformFeedbackEXT.commandBuffer",
+    )?;
+    if let Some(x) = &a.p_counter_buffers {
+        chk_len(
+            r,
+            "vkCmdEndTransformFeedbackEXT.pCounterBuffers",
+            x.len(),
+            u64::from(a.counter_buffer_count),
+        )?;
+    }
+    for h in a.p_counter_buffers.iter_mut().flatten() {
+        h.0 = r.handle(
+            Kind::Buffer,
+            h.0,
+            true,
+            "vkCmdEndTransformFeedbackEXT.pCounterBuffers",
+        )?;
+    }
+    if let Some(x) = &a.p_counter_buffer_offsets {
+        chk_len(
+            r,
+            "vkCmdEndTransformFeedbackEXT.pCounterBufferOffsets",
+            x.len(),
+            u64::from(a.counter_buffer_count),
+        )?;
+    }
+    Ok(())
+}
+
+fn t_CmdBeginQueryIndexedEXT(
+    r: &mut dyn Resolve,
+    a: &mut CmdBeginQueryIndexedEXTArgs,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdBeginQueryIndexedEXT.commandBuffer",
+    )?;
+    a.query_pool.0 = r.handle(
+        Kind::QueryPool,
+        a.query_pool.0,
+        false,
+        "vkCmdBeginQueryIndexedEXT.queryPool",
+    )?;
+    if !(a.flags & !0x1_u32 == 0) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "vkCmdBeginQueryIndexedEXT.flags", a.flags
+        )));
+    }
+    Ok(())
+}
+
+fn t_CmdEndQueryIndexedEXT(
+    r: &mut dyn Resolve,
+    a: &mut CmdEndQueryIndexedEXTArgs,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdEndQueryIndexedEXT.commandBuffer",
+    )?;
+    a.query_pool.0 = r.handle(
+        Kind::QueryPool,
+        a.query_pool.0,
+        false,
+        "vkCmdEndQueryIndexedEXT.queryPool",
+    )?;
+    Ok(())
+}
+
+fn t_CmdDrawIndirectByteCountEXT(
+    r: &mut dyn Resolve,
+    a: &mut CmdDrawIndirectByteCountEXTArgs,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdDrawIndirectByteCountEXT.commandBuffer",
+    )?;
+    a.counter_buffer.0 = r.handle(
+        Kind::Buffer,
+        a.counter_buffer.0,
+        false,
+        "vkCmdDrawIndirectByteCountEXT.counterBuffer",
+    )?;
+    Ok(())
+}
+
+fn t_CmdSetLineStipple(
+    r: &mut dyn Resolve,
+    a: &mut CmdSetLineStippleArgs,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdSetLineStipple.commandBuffer",
+    )?;
+    Ok(())
+}
+
 fn t_CmdSetCullMode(r: &mut dyn Resolve, a: &mut CmdSetCullModeArgs) -> Result<(), ExecError> {
     a.command_buffer.0 = r.handle(
         Kind::CommandBuffer,
@@ -6428,7 +6806,7 @@ fn t_CmdBindVertexBuffers2(
         )));
     }
     for h in a.p_buffers.iter_mut().flatten() {
-        h.0 = r.handle(Kind::Buffer, h.0, false, "vkCmdBindVertexBuffers2.pBuffers")?;
+        h.0 = r.handle(Kind::Buffer, h.0, true, "vkCmdBindVertexBuffers2.pBuffers")?;
     }
     if let Some(x) = &a.p_offsets {
         chk_len(
@@ -6788,7 +7166,7 @@ fn t_CmdResetEvent2(r: &mut dyn Resolve, a: &mut CmdResetEvent2Args) -> Result<(
         "vkCmdResetEvent2.commandBuffer",
     )?;
     a.event.0 = r.handle(Kind::Event, a.event.0, false, "vkCmdResetEvent2.event")?;
-    if !(a.stage_mask & !0x7f0001ffff_u64 == 0) {
+    if !(a.stage_mask & !(0x7f0001ffff_u64 | m_VkPipelineStageFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "vkCmdResetEvent2.stageMask", a.stage_mask
@@ -6890,7 +7268,7 @@ fn t_CmdWriteTimestamp2(
         false,
         "vkCmdWriteTimestamp2.commandBuffer",
     )?;
-    if !(a.stage & !0x7f0001ffff_u64 == 0) {
+    if !(a.stage & !(0x7f0001ffff_u64 | m_VkPipelineStageFlagBits2(&*r)) == 0) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "vkCmdWriteTimestamp2.stage", a.stage
@@ -7024,6 +7402,8 @@ pub fn translate(r: &mut dyn Resolve, command: &mut Command<'_>) -> Result<(), E
         Command::CmdPipelineBarrier(a) => t_CmdPipelineBarrier(r, a),
         Command::CmdBeginQuery(a) => t_CmdBeginQuery(r, a),
         Command::CmdEndQuery(a) => t_CmdEndQuery(r, a),
+        Command::CmdBeginConditionalRenderingEXT(a) => t_CmdBeginConditionalRenderingEXT(r, a),
+        Command::CmdEndConditionalRenderingEXT(a) => t_CmdEndConditionalRenderingEXT(r, a),
         Command::CmdResetQueryPool(a) => t_CmdResetQueryPool(r, a),
         Command::CmdWriteTimestamp(a) => t_CmdWriteTimestamp(r, a),
         Command::CmdCopyQueryPoolResults(a) => t_CmdCopyQueryPoolResults(r, a),
@@ -7050,6 +7430,15 @@ pub fn translate(r: &mut dyn Resolve, command: &mut Command<'_>) -> Result<(), E
         Command::SignalSemaphore(a) => t_SignalSemaphore(r, a),
         Command::CmdDrawIndirectCount(a) => t_CmdDrawIndirectCount(r, a),
         Command::CmdDrawIndexedIndirectCount(a) => t_CmdDrawIndexedIndirectCount(r, a),
+        Command::CmdBindTransformFeedbackBuffersEXT(a) => {
+            t_CmdBindTransformFeedbackBuffersEXT(r, a)
+        }
+        Command::CmdBeginTransformFeedbackEXT(a) => t_CmdBeginTransformFeedbackEXT(r, a),
+        Command::CmdEndTransformFeedbackEXT(a) => t_CmdEndTransformFeedbackEXT(r, a),
+        Command::CmdBeginQueryIndexedEXT(a) => t_CmdBeginQueryIndexedEXT(r, a),
+        Command::CmdEndQueryIndexedEXT(a) => t_CmdEndQueryIndexedEXT(r, a),
+        Command::CmdDrawIndirectByteCountEXT(a) => t_CmdDrawIndirectByteCountEXT(r, a),
+        Command::CmdSetLineStipple(a) => t_CmdSetLineStipple(r, a),
         Command::CmdSetCullMode(a) => t_CmdSetCullMode(r, a),
         Command::CmdSetFrontFace(a) => t_CmdSetFrontFace(r, a),
         Command::CmdSetPrimitiveTopology(a) => t_CmdSetPrimitiveTopology(r, a),
@@ -7233,6 +7622,12 @@ pub fn dispatchable(command: &Command<'_>) -> Option<(Kind, u64)> {
         Command::CmdPipelineBarrier(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdBeginQuery(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdEndQuery(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
+        Command::CmdBeginConditionalRenderingEXT(a) => {
+            Some((Kind::CommandBuffer, a.command_buffer.0))
+        }
+        Command::CmdEndConditionalRenderingEXT(a) => {
+            Some((Kind::CommandBuffer, a.command_buffer.0))
+        }
         Command::CmdResetQueryPool(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdWriteTimestamp(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdCopyQueryPoolResults(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
@@ -7297,9 +7692,18 @@ pub fn dispatchable(command: &Command<'_>) -> Option<(Kind, u64)> {
         Command::SignalSemaphore(a) => Some((Kind::Device, a.device.0)),
         Command::CmdDrawIndirectCount(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdDrawIndexedIndirectCount(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
+        Command::CmdBindTransformFeedbackBuffersEXT(a) => {
+            Some((Kind::CommandBuffer, a.command_buffer.0))
+        }
+        Command::CmdBeginTransformFeedbackEXT(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
+        Command::CmdEndTransformFeedbackEXT(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
+        Command::CmdBeginQueryIndexedEXT(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
+        Command::CmdEndQueryIndexedEXT(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
+        Command::CmdDrawIndirectByteCountEXT(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::GetBufferOpaqueCaptureAddress(a) => Some((Kind::Device, a.device.0)),
         Command::GetBufferDeviceAddress(a) => Some((Kind::Device, a.device.0)),
         Command::GetDeviceMemoryOpaqueCaptureAddress(a) => Some((Kind::Device, a.device.0)),
+        Command::CmdSetLineStipple(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::GetPhysicalDeviceToolProperties(a) => {
             Some((Kind::PhysicalDevice, a.physical_device.0))
         }
@@ -7594,6 +7998,7 @@ pub fn is_pass_through(command: &Command<'_>) -> bool {
             | Command::CmdResetEvent(_)
             | Command::CmdWaitEvents(_)
             | Command::CmdPipelineBarrier(_)
+            | Command::CmdEndConditionalRenderingEXT(_)
             | Command::CmdNextSubpass(_)
             | Command::CmdEndRenderPass(_)
             | Command::TrimCommandPool(_)
@@ -7923,6 +8328,8 @@ pub const TRANSLATED: &[&str] = &[
     "vkCmdPipelineBarrier",
     "vkCmdBeginQuery",
     "vkCmdEndQuery",
+    "vkCmdBeginConditionalRenderingEXT",
+    "vkCmdEndConditionalRenderingEXT",
     "vkCmdResetQueryPool",
     "vkCmdWriteTimestamp",
     "vkCmdCopyQueryPoolResults",
@@ -7949,6 +8356,13 @@ pub const TRANSLATED: &[&str] = &[
     "vkSignalSemaphore",
     "vkCmdDrawIndirectCount",
     "vkCmdDrawIndexedIndirectCount",
+    "vkCmdBindTransformFeedbackBuffersEXT",
+    "vkCmdBeginTransformFeedbackEXT",
+    "vkCmdEndTransformFeedbackEXT",
+    "vkCmdBeginQueryIndexedEXT",
+    "vkCmdEndQueryIndexedEXT",
+    "vkCmdDrawIndirectByteCountEXT",
+    "vkCmdSetLineStipple",
     "vkCmdSetCullMode",
     "vkCmdSetFrontFace",
     "vkCmdSetPrimitiveTopology",
@@ -8012,6 +8426,7 @@ pub const PASS_THROUGH: &[&str] = &[
     "vkCmdResetEvent",
     "vkCmdWaitEvents",
     "vkCmdPipelineBarrier",
+    "vkCmdEndConditionalRenderingEXT",
     "vkCmdNextSubpass",
     "vkCmdEndRenderPass",
     "vkTrimCommandPool",
@@ -8041,3 +8456,83 @@ pub const PASS_THROUGH: &[&str] = &[
     "vkCmdPipelineBarrier2",
     "vkCmdEndRendering",
 ];
+
+/// The admitted extensions that bring `command`, for one outside core 1.0-1.3
+/// (`policy::ADMITTED_EXTENSIONS`): the device it is dispatched on must have
+/// enabled one of them. Empty for a core command.
+#[must_use]
+pub fn extensions_of(command: &Command<'_>) -> &'static [&'static str] {
+    match command {
+        Command::CmdBeginConditionalRenderingEXT(_) => &["VK_EXT_conditional_rendering"],
+        Command::CmdEndConditionalRenderingEXT(_) => &["VK_EXT_conditional_rendering"],
+        Command::CmdBindTransformFeedbackBuffersEXT(_) => &["VK_EXT_transform_feedback"],
+        Command::CmdBeginTransformFeedbackEXT(_) => &["VK_EXT_transform_feedback"],
+        Command::CmdEndTransformFeedbackEXT(_) => &["VK_EXT_transform_feedback"],
+        Command::CmdBeginQueryIndexedEXT(_) => &["VK_EXT_transform_feedback"],
+        Command::CmdEndQueryIndexedEXT(_) => &["VK_EXT_transform_feedback"],
+        Command::CmdDrawIndirectByteCountEXT(_) => &["VK_EXT_transform_feedback"],
+        Command::CmdSetLineStipple(_) => {
+            &["VK_EXT_line_rasterization", "VK_KHR_line_rasterization"]
+        }
+        _ => &[],
+    }
+}
+
+/// Whether `v` is a `VkDynamicState` value an admitted extension the device enabled adds.
+fn x_VkDynamicState(r: &dyn Resolve, v: i32) -> bool {
+    (r.enabled("VK_EXT_line_rasterization") || r.enabled("VK_KHR_line_rasterization"))
+        && matches!(v, 1000259000)
+}
+
+/// Whether `v` is a `VkQueryType` value an admitted extension the device enabled adds.
+fn x_VkQueryType(r: &dyn Resolve, v: i32) -> bool {
+    r.enabled("VK_EXT_transform_feedback") && matches!(v, 1000028004)
+}
+
+/// The `VkAccessFlagBits` bits the admitted extensions the device enabled add.
+fn m_VkAccessFlagBits(r: &dyn Resolve) -> u32 {
+    let mut m = 0;
+    if r.enabled("VK_EXT_conditional_rendering") {
+        m |= 0x100000_u32;
+    }
+    if r.enabled("VK_EXT_transform_feedback") {
+        m |= 0xe000000_u32;
+    }
+    m
+}
+
+/// The `VkAccessFlagBits2` bits the admitted extensions the device enabled add.
+fn m_VkAccessFlagBits2(r: &dyn Resolve) -> u64 {
+    let mut m = 0;
+    if r.enabled("VK_EXT_conditional_rendering") {
+        m |= 0x100000_u64;
+    }
+    if r.enabled("VK_EXT_transform_feedback") {
+        m |= 0xe000000_u64;
+    }
+    m
+}
+
+/// The `VkPipelineStageFlagBits` bits the admitted extensions the device enabled add.
+fn m_VkPipelineStageFlagBits(r: &dyn Resolve) -> u32 {
+    let mut m = 0;
+    if r.enabled("VK_EXT_conditional_rendering") {
+        m |= 0x40000_u32;
+    }
+    if r.enabled("VK_EXT_transform_feedback") {
+        m |= 0x1000000_u32;
+    }
+    m
+}
+
+/// The `VkPipelineStageFlagBits2` bits the admitted extensions the device enabled add.
+fn m_VkPipelineStageFlagBits2(r: &dyn Resolve) -> u64 {
+    let mut m = 0;
+    if r.enabled("VK_EXT_conditional_rendering") {
+        m |= 0x40000_u64;
+    }
+    if r.enabled("VK_EXT_transform_feedback") {
+        m |= 0x1000000_u64;
+    }
+    m
+}

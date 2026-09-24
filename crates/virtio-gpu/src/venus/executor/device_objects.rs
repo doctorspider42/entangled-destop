@@ -177,6 +177,62 @@ impl<H: HostVulkan> Resolve for Resolver<'_, H> {
     fn link(&self, parent: &'static str, stype: i32) -> ExecError {
         super::context::unimplemented_link(self.command, parent, stype)
     }
+
+    fn enabled(&self, extension: &'static str) -> bool {
+        self.objects
+            .device(self.device)
+            .is_ok_and(|d| d.enabled(extension))
+    }
+}
+
+/// The limits of the admitted extensions a command is bounded by (stage
+/// 5c), as the guest was told them — zero for an extension the host lacks.
+#[derive(Debug, Clone, Copy, Default)]
+struct ExtensionLimits {
+    /// `VkPhysicalDeviceTransformFeedbackPropertiesEXT`.
+    tf_streams: u32,
+    tf_buffers: u32,
+    tf_buffer_size: u64,
+    tf_buffer_data_stride: u32,
+    /// `maxVertexAttribDivisor`, of either divisor properties structure.
+    max_divisor: u32,
+    /// `maxCustomBorderColorSamplers`.
+    custom_border_samplers: u32,
+}
+
+impl ExtensionLimits {
+    fn of(guest: &super::policy::GuestDevice) -> Self {
+        use crate::venus::protocol::VkPhysicalDeviceProperties2Next as N;
+        let mut out = Self::default();
+        for link in &guest.properties.p_next {
+            match link {
+                N::VkPhysicalDeviceTransformFeedbackPropertiesEXT(p) => {
+                    out.tf_streams = p.max_transform_feedback_streams;
+                    out.tf_buffers = p.max_transform_feedback_buffers;
+                    out.tf_buffer_size = p.max_transform_feedback_buffer_size;
+                    out.tf_buffer_data_stride = p.max_transform_feedback_buffer_data_stride;
+                }
+                N::VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT(p) => {
+                    out.max_divisor = out.max_divisor.max(p.max_vertex_attrib_divisor);
+                }
+                N::VkPhysicalDeviceVertexAttributeDivisorProperties(p) => {
+                    out.max_divisor = out.max_divisor.max(p.max_vertex_attrib_divisor);
+                }
+                N::VkPhysicalDeviceCustomBorderColorPropertiesEXT(p) => {
+                    out.custom_border_samplers = p.max_custom_border_color_samplers;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// `vkCmdSetLineStipple` / `VkPipelineRasterizationLineStateCreateInfo`:
+/// `lineStippleFactor` must be in `[1, 256]`
+/// (`VUID-vkCmdSetLineStipple-lineStippleFactor-02776`).
+fn stipple_factor_ok(factor: u32) -> bool {
+    (1..=256).contains(&factor)
 }
 
 fn ranges_overflow(offset: u64, size: u64, total: u64) -> bool {
@@ -221,7 +277,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::CreateDescriptorUpdateTemplate(_) => {
                 self.create(command, Kind::DescriptorUpdateTemplate, Facts::None, 0)
             }
-            Command::CreateSampler(_) => self.create(command, Kind::Sampler, Facts::None, 0),
+            Command::CreateSampler(args) => self.create_sampler(args.device.0, command),
             Command::CreateSamplerYcbcrConversion(_) => {
                 self.create(command, Kind::SamplerYcbcrConversion, Facts::None, 0)
             }
@@ -238,8 +294,9 @@ impl<H: HostVulkan> VulkanContext<H> {
                         .flat_map(|i| i.p_stages.iter().flatten()),
                 )?;
                 let limits = self.limits(NAME, args.device.0)?.clone();
+                let ext = self.extension_limits(NAME, args.device.0)?;
                 for info in args.p_create_infos.iter().flatten() {
-                    check_graphics_state(NAME, info, &limits)?;
+                    check_graphics_state(NAME, info, &limits, &ext)?;
                 }
                 let facts = Facts::Pipeline {
                     bind_point: BIND_GRAPHICS,
@@ -310,10 +367,11 @@ impl<H: HostVulkan> VulkanContext<H> {
                 let facts = Facts::QueryPool {
                     query_type: info.query_type,
                     count: info.query_count,
-                    values: if info.query_type == QUERY_PIPELINE_STATISTICS {
-                        info.pipeline_statistics.count_ones()
-                    } else {
-                        1
+                    values: match info.query_type {
+                        QUERY_PIPELINE_STATISTICS => info.pipeline_statistics.count_ones(),
+                        // Primitives written and primitives needed (stage 5c).
+                        super::policy::QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM => 2,
+                        _ => 1,
                     },
                 };
                 self.create(command, Kind::QueryPool, facts, 0)
@@ -1129,6 +1187,144 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.pass_through(command)
             }
 
+            // ------------------------ stage 5c: the admitted extensions
+            Command::CmdBindTransformFeedbackBuffersEXT(args) => {
+                const NAME: &str = "vkCmdBindTransformFeedbackBuffersEXT";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                let ext = self.extension_limits(NAME, device)?;
+                if ranges_overflow(
+                    u64::from(args.first_binding),
+                    u64::from(args.binding_count),
+                    u64::from(ext.tf_buffers),
+                ) {
+                    return Err(invalid(
+                        NAME,
+                        format!(
+                            "bindings {}+{} past maxTransformFeedbackBuffers {}",
+                            args.first_binding, args.binding_count, ext.tf_buffers
+                        ),
+                    ));
+                }
+                let offsets = args.p_offsets.as_deref().unwrap_or_default();
+                for (index, buffer) in args.p_buffers.iter().flatten().enumerate() {
+                    let (size, usage) = self.buffer_size_usage(NAME, device, buffer.0)?;
+                    let offset = offsets.get(index).copied().unwrap_or(0);
+                    let range = args
+                        .p_sizes
+                        .as_deref()
+                        .and_then(|s| s.get(index))
+                        .copied()
+                        .unwrap_or(WHOLE_SIZE);
+                    let bad = usage & super::policy::BUFFER_USAGE_TRANSFORM_FEEDBACK == 0
+                        || offset % 4 != 0
+                        || offset >= size
+                        || (range != WHOLE_SIZE
+                            && (range > ext.tf_buffer_size
+                                || ranges_overflow(offset, range, size)));
+                    if bad {
+                        return Err(invalid(
+                            NAME,
+                            "a transform feedback binding that is not a 4-aligned range inside a \
+                             TRANSFORM_FEEDBACK buffer, or past maxTransformFeedbackBufferSize",
+                        ));
+                    }
+                }
+                self.pass_through(command)
+            }
+            Command::CmdBeginTransformFeedbackEXT(args) => {
+                const NAME: &str = "vkCmdBeginTransformFeedbackEXT";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                self.check_counter_buffers(
+                    NAME,
+                    device,
+                    (args.first_counter_buffer, args.counter_buffer_count),
+                    args.p_counter_buffers.as_deref(),
+                    args.p_counter_buffer_offsets.as_deref(),
+                )?;
+                self.pass_through(command)
+            }
+            Command::CmdEndTransformFeedbackEXT(args) => {
+                const NAME: &str = "vkCmdEndTransformFeedbackEXT";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                self.check_counter_buffers(
+                    NAME,
+                    device,
+                    (args.first_counter_buffer, args.counter_buffer_count),
+                    args.p_counter_buffers.as_deref(),
+                    args.p_counter_buffer_offsets.as_deref(),
+                )?;
+                self.pass_through(command)
+            }
+            Command::CmdBeginQueryIndexedEXT(args) => {
+                self.check_indexed_query(
+                    "vkCmdBeginQueryIndexedEXT",
+                    args.command_buffer.0,
+                    args.query_pool.0,
+                    args.query,
+                    args.index,
+                )?;
+                self.pass_through(command)
+            }
+            Command::CmdEndQueryIndexedEXT(args) => {
+                self.check_indexed_query(
+                    "vkCmdEndQueryIndexedEXT",
+                    args.command_buffer.0,
+                    args.query_pool.0,
+                    args.query,
+                    args.index,
+                )?;
+                self.pass_through(command)
+            }
+            Command::CmdDrawIndirectByteCountEXT(args) => {
+                const NAME: &str = "vkCmdDrawIndirectByteCountEXT";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                let ext = self.extension_limits(NAME, device)?;
+                let (size, _) = self.buffer_size_usage(NAME, device, args.counter_buffer.0)?;
+                if args.counter_buffer_offset % 4 != 0
+                    || ranges_overflow(args.counter_buffer_offset, 4, size)
+                    || args.vertex_stride == 0
+                    || args.vertex_stride > ext.tf_buffer_data_stride
+                {
+                    return Err(invalid(
+                        NAME,
+                        "a byte counter outside its buffer, or a vertex stride of 0 or past \
+                         maxTransformFeedbackBufferDataStride",
+                    ));
+                }
+                self.pass_through(command)
+            }
+            Command::CmdBeginConditionalRenderingEXT(args) => {
+                const NAME: &str = "vkCmdBeginConditionalRenderingEXT";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                let Some(begin) = &args.p_conditional_rendering_begin else {
+                    return Err(invalid(NAME, "pConditionalRenderingBegin is null"));
+                };
+                let (size, usage) = self.buffer_size_usage(NAME, device, begin.buffer.0)?;
+                if usage & super::policy::BUFFER_USAGE_CONDITIONAL_RENDERING == 0
+                    || begin.offset % 4 != 0
+                    || ranges_overflow(begin.offset, 4, size)
+                {
+                    return Err(invalid(
+                        NAME,
+                        "a predicate that is not 4 aligned bytes inside a CONDITIONAL_RENDERING \
+                         buffer",
+                    ));
+                }
+                self.pass_through(command)
+            }
+            Command::CmdSetLineStipple(args) => {
+                if !stipple_factor_ok(args.line_stipple_factor) {
+                    return Err(invalid(
+                        "vkCmdSetLineStipple",
+                        format!(
+                            "lineStippleFactor {} is outside [1, 256]",
+                            args.line_stipple_factor
+                        ),
+                    ));
+                }
+                self.pass_through(command)
+            }
+
             other if generated::is_pass_through(other) => self.pass_through(other),
             other => self.dispatch_extension(other),
         }
@@ -1171,9 +1367,23 @@ impl<H: HostVulkan> VulkanContext<H> {
             .device_and_guest(device)
             .map_err(id_error(name))?;
         let wanted = generated::min_api(command);
+        if wanted == 0 {
+            // An admitted extension's command (stage 5c): served on a device
+            // the guest enabled one of the extensions that bring it on — the
+            // host device was created with it, so its entry point exists.
+            let brought = generated::extensions_of(command);
+            let device_object = self.objects.device(device).map_err(id_error(name))?;
+            if !brought.is_empty() && brought.iter().any(|e| device_object.enabled(e)) {
+                return Ok(());
+            }
+            return Err(ExecError::NotEnabled {
+                command: name,
+                extensions: brought,
+            });
+        }
         let have = guest.api_version();
         let version = |v: u32| (v >> 22, (v >> 12) & 0x3ff);
-        if wanted == 0 || version(wanted) > version(have) {
+        if version(wanted) > version(have) {
             let (major, minor) = version(wanted);
             return Err(ExecError::TooNew {
                 command: name,
@@ -1359,6 +1569,10 @@ impl<H: HostVulkan> VulkanContext<H> {
         if kind == Kind::DescriptorPool {
             self.objects.forget_pool_children(id);
         }
+        if object.facts == Facts::CustomBorderSampler {
+            let device = self.objects.device_mut(device).map_err(id_error(name))?;
+            device.custom_border_samplers = device.custom_border_samplers.saturating_sub(1);
+        }
         let host = self.objects.device(device).map_err(id_error(name))?;
         self.host.destroy_object(&host.host, kind, object.host);
         Ok(())
@@ -1409,6 +1623,165 @@ impl<H: HostVulkan> VulkanContext<H> {
             .device_and_guest(device)
             .map_err(id_error(command))?;
         Ok(&guest.properties.properties.limits)
+    }
+
+    /// The admitted extensions' limits of `device`, as the guest was told
+    /// them (stage 5c).
+    fn extension_limits(
+        &self,
+        command: &'static str,
+        device: u64,
+    ) -> Result<ExtensionLimits, ExecError> {
+        let (_, guest) = self
+            .objects
+            .device_and_guest(device)
+            .map_err(id_error(command))?;
+        Ok(ExtensionLimits::of(guest))
+    }
+
+    /// Whether `device` was created with robustness2's `nullDescriptor`.
+    fn null_descriptor(&self, command: &'static str, device: u64) -> Result<bool, ExecError> {
+        Ok(self
+            .objects
+            .device(device)
+            .map_err(id_error(command))?
+            .null_descriptor)
+    }
+
+    /// Buffer `id`'s size and usage.
+    fn buffer_size_usage(
+        &self,
+        command: &'static str,
+        device: u64,
+        id: u64,
+    ) -> Result<(u64, u32), ExecError> {
+        let buffer = self.objects.buffer(device, id).map_err(id_error(command))?;
+        Ok((buffer.size, buffer.usage))
+    }
+
+    /// `vkCreateSampler` (stage 5c: custom border colours). A sampler with
+    /// one — a custom border colour value, or a chained
+    /// `VkSamplerCustomBorderColorCreateInfoEXT` — takes one of the device's
+    /// `maxCustomBorderColorSamplers` entries, which a driver keeps in a
+    /// fixed table (`VUID-VkSamplerCreateInfo-None-04012`); past them it is
+    /// refused, and the entry is given back when the sampler goes.
+    fn create_sampler(&mut self, device: u64, command: &mut Command<'_>) -> Result<(), ExecError> {
+        use crate::venus::protocol::VkSamplerCreateInfoNext as N;
+        const NAME: &str = "vkCreateSampler";
+        let Command::CreateSampler(args) = &*command else {
+            return Err(invalid(NAME, "not a vkCreateSampler"));
+        };
+        let custom = args.p_create_info.as_ref().is_some_and(|info| {
+            super::policy::is_custom_border_color(info.border_color)
+                || info
+                    .p_next
+                    .iter()
+                    .any(|l| matches!(l, N::VkSamplerCustomBorderColorCreateInfoEXT(_)))
+        });
+        let id = args.p_sampler.map_or(0, |h| h.0);
+        if !custom {
+            return self.create(command, Kind::Sampler, Facts::None, 0);
+        }
+        let limit = self.extension_limits(NAME, device)?.custom_border_samplers;
+        let live = self
+            .objects
+            .device(device)
+            .map_err(id_error(NAME))?
+            .custom_border_samplers;
+        if live >= limit {
+            return Err(invalid(
+                NAME,
+                format!("a custom border colour sampler past maxCustomBorderColorSamplers {limit}"),
+            ));
+        }
+        self.create(command, Kind::Sampler, Facts::CustomBorderSampler, 0)?;
+        if self.objects.raw(Kind::Sampler, device, id).is_ok() {
+            let device = self.objects.device_mut(device).map_err(id_error(NAME))?;
+            device.custom_border_samplers = device.custom_border_samplers.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Counter buffers of `vkCmd{Begin,End}TransformFeedbackEXT`: inside
+    /// `maxTransformFeedbackBuffers`, and each one named 4 aligned bytes
+    /// inside a `TRANSFORM_FEEDBACK_COUNTER` buffer (a null one means none).
+    fn check_counter_buffers(
+        &self,
+        command: &'static str,
+        device: u64,
+        (first, count): (u32, u32),
+        buffers: Option<&[crate::venus::protocol::VkBuffer]>,
+        offsets: Option<&[u64]>,
+    ) -> Result<(), ExecError> {
+        let ext = self.extension_limits(command, device)?;
+        if ranges_overflow(
+            u64::from(first),
+            u64::from(count),
+            u64::from(ext.tf_buffers),
+        ) {
+            return Err(invalid(
+                command,
+                format!(
+                    "counter buffers {first}+{count} past maxTransformFeedbackBuffers {}",
+                    ext.tf_buffers
+                ),
+            ));
+        }
+        let offsets = offsets.unwrap_or_default();
+        for (index, buffer) in buffers.unwrap_or_default().iter().enumerate() {
+            if buffer.0 == 0 {
+                continue;
+            }
+            let (size, usage) = self.buffer_size_usage(command, device, buffer.0)?;
+            let offset = offsets.get(index).copied().unwrap_or(0);
+            if usage & super::policy::BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER == 0
+                || offset % 4 != 0
+                || ranges_overflow(offset, 4, size)
+            {
+                return Err(invalid(
+                    command,
+                    "a counter that is not 4 aligned bytes inside a TRANSFORM_FEEDBACK_COUNTER \
+                     buffer",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `vkCmd{Begin,End}QueryIndexedEXT`: the query inside its pool, and the
+    /// index a transform feedback stream the device has — 0 for any other
+    /// query type (`VUID-vkCmdBeginQueryIndexedEXT-queryType-06692`).
+    fn check_indexed_query(
+        &self,
+        command: &'static str,
+        cb: u64,
+        pool: u64,
+        query: u32,
+        index: u32,
+    ) -> Result<(), ExecError> {
+        let device = self.cmd_device(command, cb)?;
+        self.check_queries(command, device, pool, query, 1)?;
+        let query_type = match self
+            .objects
+            .raw(Kind::QueryPool, device, pool)
+            .map_err(id_error(command))?
+            .facts
+        {
+            Facts::QueryPool { query_type, .. } => query_type,
+            _ => return Err(invalid(command, "not a query pool")),
+        };
+        let streams = if query_type == super::policy::QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM {
+            self.extension_limits(command, device)?.tf_streams
+        } else {
+            1
+        };
+        if index >= streams {
+            return Err(invalid(
+                command,
+                format!("index {index} of a query pool of {streams} streams"),
+            ));
+        }
+        Ok(())
     }
 
     fn buffer_size(&self, command: &'static str, device: u64, id: u64) -> Result<u64, ExecError> {
@@ -1711,6 +2084,10 @@ impl<H: HostVulkan> VulkanContext<H> {
         }
         let count = usize::try_from(write.descriptor_count).unwrap_or(usize::MAX);
         let whole = |len: Option<usize>| len == Some(count);
+        // robustness2's `nullDescriptor` (stage 5c): a null view or buffer is
+        // a descriptor that reads zero, which Zink binds for every unbound
+        // slot.
+        let null_ok = self.null_descriptor(NAME, device)?;
         match write.descriptor_type {
             d::SAMPLER
             | d::COMBINED_IMAGE_SAMPLER
@@ -1722,7 +2099,9 @@ impl<H: HostVulkan> VulkanContext<H> {
                 if !whole(write.p_image_info.as_ref().map(Vec::len)) {
                     return Err(invalid(NAME, "an image write without its pImageInfo"));
                 }
-                if write.descriptor_type != d::SAMPLER && infos.iter().any(|i| i.image_view.0 == 0)
+                if write.descriptor_type != d::SAMPLER
+                    && !null_ok
+                    && infos.iter().any(|i| i.image_view.0 == 0)
                 {
                     return Err(invalid(NAME, "an image descriptor with no image view"));
                 }
@@ -1730,7 +2109,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             d::UNIFORM_TEXEL_BUFFER | d::STORAGE_TEXEL_BUFFER => {
                 let views = write.p_texel_buffer_view.as_deref().unwrap_or_default();
                 if !whole(write.p_texel_buffer_view.as_ref().map(Vec::len))
-                    || views.iter().any(|v| v.0 == 0)
+                    || (!null_ok && views.iter().any(|v| v.0 == 0))
                 {
                     return Err(invalid(NAME, "a texel buffer write without its views"));
                 }
@@ -1743,6 +2122,16 @@ impl<H: HostVulkan> VulkanContext<H> {
                     return Err(invalid(NAME, "a buffer write without its pBufferInfo"));
                 }
                 for info in write.p_buffer_info.iter().flatten() {
+                    if info.buffer.0 == 0 && null_ok {
+                        // VUID-VkDescriptorBufferInfo-buffer-02999.
+                        if info.offset != 0 || info.range != WHOLE_SIZE {
+                            return Err(invalid(
+                                NAME,
+                                "a null buffer descriptor with an offset or a range",
+                            ));
+                        }
+                        continue;
+                    }
                     let size = self.buffer_size(NAME, device, info.buffer.0)?;
                     let range_bad = info.range != WHOLE_SIZE
                         && (info.range == 0 || ranges_overflow(info.offset, info.range, size));
@@ -1790,9 +2179,22 @@ impl<H: HostVulkan> VulkanContext<H> {
         }
         let buffers = buffers.unwrap_or_default();
         let offsets = offsets.unwrap_or_default();
+        let null_ok = self.null_descriptor(command, device)?;
         for (index, buffer) in buffers.iter().enumerate() {
-            let size = self.buffer_size(command, device, buffer.0)?;
             let offset = offsets.get(index).copied().unwrap_or(0);
+            if buffer.0 == 0 {
+                // A null vertex buffer reads zero with robustness2's
+                // `nullDescriptor`, and its offset must be 0
+                // (`VUID-vkCmdBindVertexBuffers-pBuffers-04001/04002`).
+                if !null_ok || offset != 0 {
+                    return Err(invalid(
+                        command,
+                        "a null vertex buffer without nullDescriptor, or with an offset",
+                    ));
+                }
+                continue;
+            }
+            let size = self.buffer_size(command, device, buffer.0)?;
             let range = sizes
                 .and_then(|s| s.get(index))
                 .copied()
@@ -2157,7 +2559,10 @@ fn check_graphics_state(
     command: &'static str,
     info: &crate::venus::protocol::VkGraphicsPipelineCreateInfo<'_>,
     limits: &crate::venus::protocol::VkPhysicalDeviceLimits,
+    ext: &ExtensionLimits,
 ) -> Result<(), ExecError> {
+    use crate::venus::protocol::VkPipelineRasterizationStateCreateInfoNext as R;
+    use crate::venus::protocol::VkPipelineVertexInputStateCreateInfoNext as V;
     let mut stages = 0u32;
     for stage in info.p_stages.iter().flatten() {
         let bit = u32::try_from(stage.stage).unwrap_or(0);
@@ -2186,6 +2591,53 @@ fn check_graphics_state(
                 command,
                 "vertex input past the device's binding or attribute limits",
             ));
+        }
+        // Stage 5c: divisors name bindings a driver indexes by.
+        for link in &vi.p_next {
+            let V::VkPipelineVertexInputDivisorStateCreateInfo(d) = link;
+            if d.vertex_binding_divisor_count > bindings
+                || d.p_vertex_binding_divisors
+                    .iter()
+                    .flatten()
+                    .any(|b| b.binding >= bindings || b.divisor > ext.max_divisor)
+            {
+                return Err(invalid(
+                    command,
+                    "a vertex divisor past maxVertexInputBindings or maxVertexAttribDivisor",
+                ));
+            }
+        }
+    }
+    // Stage 5c: the rasterization state's extension structures.
+    for link in info
+        .p_rasterization_state
+        .iter()
+        .flat_map(|r| r.p_next.iter())
+    {
+        match link {
+            R::VkPipelineRasterizationStateStreamCreateInfoEXT(s)
+                if s.rasterization_stream >= ext.tf_streams =>
+            {
+                return Err(invalid(
+                    command,
+                    format!(
+                        "rasterization stream {} past maxTransformFeedbackStreams {}",
+                        s.rasterization_stream, ext.tf_streams
+                    ),
+                ));
+            }
+            R::VkPipelineRasterizationLineStateCreateInfo(l)
+                if l.stippled_line_enable != 0 && !stipple_factor_ok(l.line_stipple_factor) =>
+            {
+                return Err(invalid(
+                    command,
+                    format!(
+                        "lineStippleFactor {} is outside [1, 256]",
+                        l.line_stipple_factor
+                    ),
+                ));
+            }
+            _ => {}
         }
     }
     if let Some(vp) = &info.p_viewport_state {

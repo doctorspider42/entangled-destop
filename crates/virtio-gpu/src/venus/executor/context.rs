@@ -30,17 +30,17 @@ use crate::venus::protocol::{
     GetPhysicalDeviceProperties2Args, GetPhysicalDevicePropertiesArgs,
     GetPhysicalDeviceQueueFamilyProperties2Args, VkDeviceCreateInfoNext, VkDeviceQueueInfo2Next,
     VkImageCreateInfo, VkImageCreateInfoNext, VkImageFormatProperties2,
-    VkImageMemoryRequirementsInfo2Next, VkPhysicalDevice, VkPhysicalDeviceGroupProperties,
-    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceImageFormatInfo2Next,
-    VkQueueFamilyProperties2, VkResult, VK_ERROR_EXTENSION_NOT_PRESENT,
-    VK_ERROR_FEATURE_NOT_PRESENT, VK_ERROR_INITIALIZATION_FAILED, VK_ERROR_LAYER_NOT_PRESENT,
-    VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_UNKNOWN, VK_INCOMPLETE, VK_SHARING_MODE_CONCURRENT,
-    VK_SUCCESS,
+    VkImageFormatProperties2Next, VkImageMemoryRequirementsInfo2Next, VkPhysicalDevice,
+    VkPhysicalDeviceGroupProperties, VkPhysicalDeviceImageFormatInfo2,
+    VkPhysicalDeviceImageFormatInfo2Next, VkQueueFamilyProperties2, VkResult,
+    VK_ERROR_EXTENSION_NOT_PRESENT, VK_ERROR_FEATURE_NOT_PRESENT, VK_ERROR_FORMAT_NOT_SUPPORTED,
+    VK_ERROR_INITIALIZATION_FAILED, VK_ERROR_LAYER_NOT_PRESENT, VK_ERROR_OUT_OF_HOST_MEMORY,
+    VK_ERROR_UNKNOWN, VK_INCOMPLETE, VK_SHARING_MODE_CONCURRENT, VK_SUCCESS,
 };
 use crate::venus::wire::Encoder;
 
 use super::host::{DeviceRequest, HostVulkan, InstanceRequest, QueueRequest};
-use super::memory::{guest_type_bits, image_facts, image_planes};
+use super::memory::{external_handle_types, external_type_bits, image_facts, image_planes};
 use super::objects::{
     CreatedQueue, DeviceChild, DeviceObject, ExposedDevice, IdError, ImageObject, Kind, Objects,
     Pending, QueueObject,
@@ -91,6 +91,16 @@ pub enum ExecError {
         major: u32,
         /// Its core minor version.
         minor: u32,
+    },
+    /// An admitted extension's command on a device the guest enabled none of
+    /// the extensions that bring it on (stage 5c): its host entry point may
+    /// not exist.
+    #[error("{command} needs one of {extensions:?}, which its device did not enable")]
+    NotEnabled {
+        /// The command.
+        command: &'static str,
+        /// The extensions that bring it.
+        extensions: &'static [&'static str],
     },
     /// A semaphore used in a way its type or state forbids (stage 5b.3): a
     /// binary wait with no signal before it, a signal of a binary semaphore
@@ -199,6 +209,10 @@ pub struct VulkanContext<H: HostVulkan> {
     /// The stop signal of the ring whose command is executing, for a wait
     /// that must give up when the ring is torn down.
     pub(super) stop: Option<crate::venus::service::StopSignal>,
+    /// The host blobs this context may reach (its rings' [`ContextBlobs`]):
+    /// where an import of a blob of memory finds its pages (stage 5c).
+    /// `None` until a ring of the context exists.
+    pub(super) blobs: Option<crate::venus::renderer::ContextBlobs>,
 }
 
 impl<H: HostVulkan> VulkanContext<H> {
@@ -219,6 +233,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             lost: false,
             budget,
             stop: None,
+            blobs: None,
         }
     }
 
@@ -346,6 +361,9 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::EnumerateDeviceExtensionProperties(args) => self.device_extensions(args),
             Command::GetPhysicalDeviceExternalSemaphoreProperties(args) => {
                 self.external_semaphore_properties(args)
+            }
+            Command::GetPhysicalDeviceExternalBufferProperties(args) => {
+                self.external_buffer_properties(args)
             }
             Command::GetPhysicalDeviceFormatProperties2(args) => self.format_properties(args),
             Command::GetPhysicalDeviceImageFormatProperties2(args) => {
@@ -846,6 +864,66 @@ impl<H: HostVulkan> VulkanContext<H> {
         Ok(())
     }
 
+    /// `vkGetPhysicalDeviceExternalBufferProperties` (stage 5c): Mesa
+    /// 26.0.8 sends it for every handle type it supports, rewritten to the
+    /// renderer's `DMA_BUF` (`vn_physical_device.c:2900-2955`), and gets
+    /// [`policy::external_memory_properties`] — exportable and importable
+    /// exactly when such a buffer can live in our pages. Every other handle
+    /// type (a core 1.3 one) is answered "nothing": no other is served. The
+    /// flags and usage must be ones the device could create a buffer with.
+    fn external_buffer_properties(
+        &mut self,
+        args: &mut crate::venus::protocol::GetPhysicalDeviceExternalBufferPropertiesArgs,
+    ) -> Result<(), ExecError> {
+        const NAME: &str = "vkGetPhysicalDeviceExternalBufferProperties";
+        let Some(info) = &args.p_external_buffer_info else {
+            return Err(invalid(NAME, "pExternalBufferInfo is null"));
+        };
+        let (instance, device) = self
+            .objects
+            .physical(args.physical_device.0)
+            .map_err(id_error(NAME))?;
+        let handle = u32::try_from(info.handle_type).unwrap_or(0);
+        let known_handle = handle.is_power_of_two()
+            && (handle & !policy::EXTERNAL_MEMORY_HANDLE_CORE == 0
+                || handle == policy::MEMORY_HANDLE_DMA_BUF);
+        if !known_handle {
+            return Err(invalid(NAME, format!("handle type {handle:#x}")));
+        }
+        let advertised = |name: &str| policy::has_extension(&device.guest.extensions, name);
+        let usage_known = policy::BUFFER_USAGE_CORE
+            | policy::BUFFER_USAGE_DEVICE_ADDRESS
+            | policy::buffer_usage_of_extensions(advertised);
+        if info.usage == 0
+            || info.usage & !usage_known != 0
+            || info.flags & !policy::BUFFER_CREATE_CORE != 0
+        {
+            return Err(invalid(
+                NAME,
+                format!("usage {:#x} or flags {:#x}", info.usage, info.flags),
+            ));
+        }
+        let answer = if handle == policy::MEMORY_HANDLE_DMA_BUF {
+            policy::external_memory_properties(self.host.buffer_importable(
+                instance,
+                device.host,
+                info.flags,
+                info.usage,
+            ))
+        } else {
+            crate::venus::protocol::VkExternalMemoryProperties {
+                external_memory_features: 0,
+                export_from_imported_handle_types: 0,
+                compatible_handle_types: handle,
+            }
+        };
+        args.p_external_buffer_properties =
+            Some(crate::venus::protocol::VkExternalBufferProperties {
+                external_memory_properties: answer,
+            });
+        Ok(())
+    }
+
     /// `vkGetPhysicalDeviceFormatProperties2`, forwarded with a checked
     /// format.
     fn format_properties(
@@ -885,11 +963,76 @@ impl<H: HostVulkan> VulkanContext<H> {
             .objects
             .physical(args.physical_device.0)
             .map_err(id_error(NAME))?;
-        if let Some(out) = args.p_image_format_properties.as_mut() {
+        let dma_buf = info.p_next.iter().any(|link| {
+            matches!(link,
+                VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceExternalImageFormatInfo(e)
+                    if u32::try_from(e.handle_type).ok() == Some(policy::MEMORY_HANDLE_DMA_BUF))
+        });
+        let Some(out) = args.p_image_format_properties.as_mut() else {
+            return Ok(());
+        };
+        if !dma_buf {
             args.ret = self
                 .host
                 .image_format_properties(instance, device.host, info, out);
+            return Ok(());
         }
+        // `DMA_BUF` (stage 5c; Mesa 26.0.8 answers it itself for every
+        // tiling but DRM modifiers, `vn_physical_device.c:2812-2817`, so only
+        // another guest driver sends it): asked of the host as our pages
+        // (`HOST_ALLOCATION`), and answered as a dma-buf of them —
+        // supported exactly when the host would import our pages for such
+        // an image.
+        let mut query = info.clone();
+        for link in &mut query.p_next {
+            if let VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceExternalImageFormatInfo(
+                e,
+            ) = link
+            {
+                e.handle_type = policy::MEMORY_HANDLE_HOST_ALLOCATION as i32;
+            }
+        }
+        // The host's external answer is needed whether or not the guest
+        // chained one.
+        let mut probe = out.clone();
+        if !probe.p_next.iter().any(|l| {
+            matches!(
+                l,
+                VkImageFormatProperties2Next::VkExternalImageFormatProperties(_)
+            )
+        }) {
+            probe.p_next.push(
+                VkImageFormatProperties2Next::VkExternalImageFormatProperties(Default::default()),
+            );
+        }
+        let ret = self
+            .host
+            .image_format_properties(instance, device.host, &query, &mut probe);
+        let importable = probe.p_next.iter().any(|l| {
+            matches!(l,
+                VkImageFormatProperties2Next::VkExternalImageFormatProperties(p)
+                    if p.external_memory_properties.external_memory_features
+                        & policy::MEMORY_FEATURE_IMPORTABLE != 0)
+        });
+        out.image_format_properties = probe.image_format_properties.clone();
+        for link in &mut out.p_next {
+            let stype = ChainLink::structure_type(link);
+            if let Some(answer) = probe
+                .p_next
+                .iter()
+                .find(|l| ChainLink::structure_type(*l) == stype)
+            {
+                *link = answer.clone();
+            }
+            if let VkImageFormatProperties2Next::VkExternalImageFormatProperties(p) = link {
+                p.external_memory_properties = policy::external_memory_properties(importable);
+            }
+        }
+        args.ret = if ret == VK_SUCCESS && !importable {
+            VK_ERROR_FORMAT_NOT_SUPPORTED
+        } else {
+            ret
+        };
         Ok(())
     }
 
@@ -979,9 +1122,13 @@ impl<H: HostVulkan> VulkanContext<H> {
         // Extensions: only what we advertised, plus our own — and never an
         // emulated one (`VK_KHR_external_semaphore_fd`, which Mesa adds for
         // every device an application wants a swapchain on,
-        // `vn_device.c:333-337`): the host driver may not have it, and what
-        // it stands for is this renderer's to do, not the driver's.
+        // `vn_device.c:333-337`, and the two dma-buf ones it adds beside it,
+        // `:318-330`): the host driver may not have it, and what it stands
+        // for is this renderer's to do, not the driver's. Every name the
+        // guest enabled is recorded, emulated ones included: the admitted
+        // extensions' commands, values and structures are judged by it.
         let mut extensions: Vec<String> = Vec::new();
+        let mut enabled: Vec<String> = Vec::new();
         for name in info
             .pp_enabled_extension_names
             .as_deref()
@@ -994,14 +1141,21 @@ impl<H: HostVulkan> VulkanContext<H> {
                     .any(|e| policy::c_name(&e.extension_name) == name.as_bytes())
             });
             match advertised {
-                Some(name) if policy::is_emulated_extension(name) => {}
-                Some(name) => extensions.push(name.to_owned()),
+                Some(name) if policy::is_emulated_extension(name) => {
+                    enabled.push(name.to_owned());
+                }
+                Some(name) => {
+                    enabled.push(name.to_owned());
+                    extensions.push(name.to_owned());
+                }
                 None => {
                     args.ret = VK_ERROR_EXTENSION_NOT_PRESENT;
                     return Ok(());
                 }
             }
         }
+        enabled.sort_unstable();
+        enabled.dedup();
         if !extensions.iter().any(|e| e == policy::EXTERNAL_MEMORY_HOST) {
             extensions.push(policy::EXTERNAL_MEMORY_HOST.to_owned());
         }
@@ -1032,6 +1186,17 @@ impl<H: HostVulkan> VulkanContext<H> {
             }
             _ => false,
         });
+        // robustness2's `nullDescriptor` (stage 5c) counts only with one of
+        // the extensions that define it enabled.
+        let robustness2 = enabled
+            .iter()
+            .any(|e| e == "VK_EXT_robustness2" || e == "VK_KHR_robustness2");
+        let null_descriptor = robustness2
+            && info.p_next.iter().any(|link| {
+                matches!(link,
+                    VkDeviceCreateInfoNext::VkPhysicalDeviceRobustness2FeaturesKHR(f)
+                        if f.null_descriptor != 0)
+            });
         for link in &info.p_next {
             match link {
                 VkDeviceCreateInfoNext::VkDeviceGroupDeviceCreateInfo(g) => {
@@ -1058,11 +1223,16 @@ impl<H: HostVulkan> VulkanContext<H> {
                     chain.push(link.clone());
                 }
                 other => {
-                    wanted.push((
-                        ChainLink::structure_type(other),
-                        words(|enc| other.encode_body(enc, false)),
-                    ));
-                    chain.push(link.clone());
+                    let stype = ChainLink::structure_type(other);
+                    wanted.push((stype, words(|enc| other.encode_body(enc, false))));
+                    // An admitted extension's feature structure (stage 5c)
+                    // reaches the driver only with one of the extensions that
+                    // define it enabled: the driver is owed no structure of
+                    // an extension it was not asked for. Its features are
+                    // still judged against what the guest was told.
+                    if extension_enabled_for(stype, &enabled) {
+                        chain.push(link.clone());
+                    }
                 }
             }
         }
@@ -1141,6 +1311,9 @@ impl<H: HostVulkan> VulkanContext<H> {
                         queues: created,
                         group_size,
                         buffer_device_address,
+                        extensions: enabled,
+                        null_descriptor,
+                        custom_border_samplers: 0,
                     },
                 );
                 args.ret = VK_SUCCESS;
@@ -1355,7 +1528,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             .objects
             .physical(device.physical)
             .map_err(id_error(NAME))?;
-        check_image_create_info(NAME, info, &exposed.guest)?;
+        let external = check_image_create_info(NAME, info, &exposed.guest, device.dma_buf())?;
         if !image_limits_hold(&*self.host, instance, exposed.host, info) {
             return Err(invalid(
                 NAME,
@@ -1378,6 +1551,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                         host: image,
                         facts: image_facts(info, planes),
                         host_memory,
+                        external,
                         bound_planes: 0,
                     },
                 );
@@ -1452,14 +1626,29 @@ impl<H: HostVulkan> VulkanContext<H> {
         if let Some(out) = args.p_memory_requirements.as_mut() {
             self.host
                 .image_memory_requirements(&device.host, image.host, plane, out);
-            out.memory_requirements.memory_type_bits = guest_type_bits(
+            out.memory_requirements.memory_type_bits = external_type_bits(
                 guest,
                 image.host_memory,
+                image.external,
                 out.memory_requirements.memory_type_bits,
             );
         }
         Ok(())
     }
+}
+
+/// Whether a chained structure of type `stype` may reach the driver on a
+/// device the guest enabled `enabled` on: always for a core one (up to 1.3),
+/// and for one an admitted extension adds, only with one of the extensions
+/// that bring it enabled.
+fn extension_enabled_for(stype: i32, enabled: &[String]) -> bool {
+    crate::venus::protocol::info::structure(stype).is_none_or(|s| {
+        s.core
+            .is_some_and(|core| core <= policy::ADMITTED_CHAIN_API)
+            || s.extensions
+                .iter()
+                .any(|e| policy::PROTOCOL_EXTENSIONS.contains(e) || enabled.iter().any(|x| x == e))
+    })
 }
 
 /// A structure's wire body, as the bytes the generated encoder writes: for a
@@ -1511,7 +1700,9 @@ fn check_image_format_info(
     for link in &info.p_next {
         match link {
             VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceExternalImageFormatInfo(e) => {
-                if !policy::is_handle_type_bit(e.handle_type) {
+                let dma_buf =
+                    u32::try_from(e.handle_type).ok() == Some(policy::MEMORY_HANDLE_DMA_BUF);
+                if !policy::is_handle_type_bit(e.handle_type) && !dma_buf {
                     return Err(invalid(
                         command,
                         format!("handle type {:#x}", e.handle_type),
@@ -1585,12 +1776,19 @@ pub(super) fn image_limits_hold<H: HostVulkan>(
         && limits.sample_counts & samples != 0
 }
 
-/// The checks `vkCreateImage` gets before the driver sees its create info.
+/// The checks `vkCreateImage` gets before the driver sees its create info,
+/// on a device that did (`dma_buf`) or did not enable the emulated dma-buf
+/// external memory. Answers whether the image is created for `DMA_BUF`
+/// export (stage 5c) — which Zink asks for every shared image, whatever the
+/// image-format query said (`zink_resource.c:1336-1340`, `:1504`, `OPAQUE_FD`
+/// rewritten to `DMA_BUF` by Mesa's venus): it is created as any image is,
+/// and an export of its memory succeeds exactly when that memory is ours.
 pub(super) fn check_image_create_info(
     command: &'static str,
     info: &VkImageCreateInfo,
     guest: &GuestDevice,
-) -> Result<(), ExecError> {
+    dma_buf: bool,
+) -> Result<bool, ExecError> {
     if info.flags & !policy::IMAGE_CREATE_CORE != 0 || info.flags & policy::IMAGE_CREATE_SPARSE != 0
     {
         return Err(invalid(command, format!("flags {:#x}", info.flags)));
@@ -1636,15 +1834,11 @@ pub(super) fn check_image_create_info(
             ));
         }
     }
+    let mut external = false;
     for link in &info.p_next {
         match link {
             VkImageCreateInfoNext::VkExternalMemoryImageCreateInfo(e) => {
-                if e.handle_types != 0 {
-                    return Err(invalid(
-                        command,
-                        "external memory handle types, with no external-memory extension advertised",
-                    ));
-                }
+                external |= external_handle_types(command, e.handle_types, dma_buf)?;
             }
             VkImageCreateInfoNext::VkImageFormatListCreateInfo(l) => {
                 check_view_formats(command, l.p_view_formats.as_deref())?;
@@ -1661,5 +1855,5 @@ pub(super) fn check_image_create_info(
             }
         }
     }
-    Ok(())
+    Ok(external)
 }

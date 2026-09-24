@@ -1911,8 +1911,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // its ring blob to its context, and the renderer has no 3D handle for
         // it, exactly like the kernel's 2D console framebuffer (ADR-0004's
         // mixed-namespace amendment).
-        let owned_2d =
-            self.resources.get(cmd.resource_id).is_some() || self.blobs.owns(cmd.resource_id);
+        let blob = self.blobs.owns(cmd.resource_id);
+        let owned_2d = self.resources.get(cmd.resource_id).is_some() || blob;
         let gpu = self.three_d_mut(kind)?;
         // A **detach** from a context that no longer exists is nothing, so it
         // answers OK. Observed on every Venus boot of Ubuntu 26.04 (VEN-2003):
@@ -1933,6 +1933,13 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if owned_2d {
             if !gpu.has_context(ctx_id) {
                 return Err(CommandError::UnknownContext(ctx_id));
+            }
+            if blob {
+                // The renderer learns of it: an attached blob of another
+                // context's Vulkan memory is one this context may import
+                // (EPIC 20 stage 5c; the guest kernel attaches a GEM object
+                // to the context of every file that opens a handle to it).
+                gpu.ctx_attach_blob(ctx_id, cmd.resource_id, attach);
             }
             tracing::debug!(
                 ctx = ctx_id,

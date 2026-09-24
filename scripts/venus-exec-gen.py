@@ -4,26 +4,34 @@
 Two files, from one model:
 
 * crates/virtio-gpu/src/venus/executor/generated.rs -- portable, no `unsafe`:
-  for every core Vulkan 1.0-1.3 command the executor serves by translation
-  ([generated] and [handwritten] in tools/venus-protocol/executor-classes.txt),
-  the walk that replaces every guest object id in its inputs -- nested in
-  structures, in arrays of structures, in pNext links -- by the host handle a
-  `Resolve` answers (typed, parented, 0 only where vk.xml says the handle may
-  be null), range-checks every enum and flag word against the values core
-  Vulkan 1.0-1.3 defines (vk.xml, `<feature>` <= 1.3), and checks every array
-  against the count it travels with. Plus the per-command tables the executor
-  needs: which object a command is dispatched on, which core version brought
-  it, its `VkResult`, and its output handles.
+  for every core Vulkan 1.0-1.3 command, and every command of an admitted
+  device extension (policy.rs `ADMITTED_EXTENSIONS`, stage 5c), the executor
+  serves by translation ([generated] and [handwritten] in
+  tools/venus-protocol/executor-classes.txt), the walk that replaces every
+  guest object id in its inputs -- nested in structures, in arrays of
+  structures, in pNext links -- by the host handle a `Resolve` answers
+  (typed, parented, 0 only where vk.xml says the handle may be null),
+  range-checks every enum and flag word against the values core Vulkan
+  1.0-1.3 defines (vk.xml, `<feature>` <= 1.3) plus the values an admitted
+  extension adds once the device enabled it (`Resolve::enabled`), refuses a
+  chained structure of an admitted extension the device did not enable, and
+  checks every array against the count it travels with. Plus the
+  per-command tables the executor needs: which object a command is
+  dispatched on, which core version or admitted extensions brought it, its
+  `VkResult`, and its output handles.
 * crates/virtio-gpu/src/host_vulkan/calls.rs -- the one place the translated
   command becomes a driver call: every structure rebuilt as its `ash` twin in
   an arena (pointers into arena-owned copies, pNext links chained in the
-  guest's order), the core entry point called through `ash`'s function table,
-  and the outputs (handles, blobs, structures) written back into the command.
+  guest's order), the core entry point called through `ash`'s function table
+  (an extension's through `ExtTables`, the tables of the admitted extensions
+  the device was created with), and the outputs (handles, blobs, structures)
+  written back into the command.
 
 Nothing here decides policy. Which commands are served, and how, is the
 classification file; what a hand-written command checks beyond this is
 executor code. The script refuses to run when the classification does not
-cover every core <= 1.3 command of the protocol exactly once, or when its two
+cover every core <= 1.3 command of the protocol, and every command of an
+admitted extension, exactly once, or when its two
 hand-written sections disagree with the `match` arms that implement them.
 
 Needs Python 3.8+ with Mako (tools/venus-protocol/rust_protocol.py imports
@@ -65,7 +73,15 @@ OUT_HOST = ROOT / 'crates' / 'virtio-gpu' / 'src' / 'host_vulkan' / 'calls.rs'
 
 MAX_CORE = (1, 3)
 ADMITTED_API = (1 << 22) | (3 << 12)
-ADMITTED_EXTENSIONS = {'VK_EXT_command_serialization', 'VK_MESA_venus_protocol'}
+# The executor's chain policy (policy.rs `ADMITTED_EXTENSIONS`), read out of
+# policy.rs as the bridge generator reads it. The two venus protocol
+# extensions' commands are the transport's and `dispatch_extension`'s; every
+# other admitted extension's commands are served here, classified in
+# executor-classes.txt like the core ones, and gated on the device having
+# enabled the extension.
+ADMITTED_EXTENSIONS = set(ashgen.policy_list('ADMITTED_EXTENSIONS'))
+PROTOCOL_EXTENSIONS = set(ashgen.policy_list('PROTOCOL_EXTENSIONS'))
+SCOPE_EXTENSIONS = sorted(ADMITTED_EXTENSIONS - PROTOCOL_EXTENSIONS)
 
 # Handles vk.xml lets be null that the executor requires anyway, because a
 # driver handed VK_NULL_HANDLE there by a guest dereferences it:
@@ -76,7 +92,9 @@ ADMITTED_EXTENSIONS = {'VK_EXT_command_serialization', 'VK_MESA_venus_protocol'}
 # * null set layouts and bound sets are graphics-pipeline-library only;
 # * a null immutable sampler is never valid (the array itself is ignored for
 #   other descriptor types, and Mesa sends it null then);
-# * null index and vertex buffers need maintenance6 / nullDescriptor.
+# * a null index buffer needs maintenance6.
+# (A null vertex buffer is legal with robustness2's nullDescriptor, which a
+# guest may enable since stage 5c; the executor checks that by hand.)
 REQUIRED_HANDLES = {
     ('VkPipelineShaderStageCreateInfo', 'module'),
     ('VkComputePipelineCreateInfo', 'layout'),
@@ -86,8 +104,6 @@ REQUIRED_HANDLES = {
     ('VkDescriptorSetLayoutBinding', 'pImmutableSamplers'),
     ('vkCmdBindDescriptorSets', 'pDescriptorSets'),
     ('vkCmdBindIndexBuffer', 'buffer'),
-    ('vkCmdBindVertexBuffers', 'pBuffers'),
-    ('vkCmdBindVertexBuffers2', 'pBuffers'),
 }
 
 # Enum types that are not the guest's to range-check here.
@@ -167,10 +183,14 @@ def for_vulkan(e):
 
 
 def core_enums(vk_xml):
-    """Every enum and bitmask type's values in core Vulkan <= 1.3, and each
-    Flags type's FlagBits."""
+    """Every enum and bitmask type's values in core Vulkan <= 1.3, each Flags
+    type's FlagBits, and the values the admitted extensions add
+    (`ext_values`: type -> [(value, gate)], `gate` the extensions a device
+    must have enabled for the value to be legal, as a disjunction of
+    conjunctions)."""
     root = ET.parse(vk_xml).getroot()
     values, bitwidth = {}, {}
+    everything = {}  # enum name -> value, wherever vk.xml defines it
     for enums in root.findall('enums'):
         if enums.get('type') not in ('enum', 'bitmask'):
             continue
@@ -183,11 +203,11 @@ def core_enums(vk_xml):
             v = enum_value(e, None)
             if v is not None:
                 d[e.get('name')] = v
+                everything[e.get('name')] = v
     for feat in root.findall('feature'):
         if not for_vulkan(feat) or 'vulkan' not in feat.get('api', 'vulkan').split(','):
             continue
-        if tuple(int(x) for x in feat.get('number').split('.')) > MAX_CORE:
-            continue
+        core = tuple(int(x) for x in feat.get('number').split('.')) <= MAX_CORE
         for req in feat.findall('require'):
             if not for_vulkan(req):
                 continue
@@ -197,7 +217,100 @@ def core_enums(vk_xml):
                     continue
                 v = enum_value(e, None)
                 if v is not None:
-                    values.setdefault(ext, {})[e.get('name')] = v
+                    everything[e.get('name')] = v
+                    if core:
+                        values.setdefault(ext, {})[e.get('name')] = v
+    extensions = root.find('extensions').findall('extension')
+    for x in extensions:
+        for req in x.findall('require'):
+            for e in req.findall('enum'):
+                if e.get('extends') and not e.get('alias') and for_vulkan(e):
+                    v = enum_value(e, x.get('number'))
+                    if v is not None:
+                        everything[e.get('name')] = v
+    promoted = {}
+    for x in extensions:
+        to = x.get('promotedto') or ''
+        m = re.fullmatch(r'VK_VERSION_(\d+)_(\d+)', to)
+        if m:
+            promoted[x.get('name')] = (int(m.group(1)), int(m.group(2)))
+
+    def atom(name):
+        """None: never; frozenset(): always; {E}: once E is enabled."""
+        m = re.fullmatch(r'VK_VERSION_(\d+)_(\d+)', name)
+        if m:
+            return frozenset() if (int(m.group(1)), int(m.group(2))) <= MAX_CORE else None
+        if name in SCOPE_EXTENSIONS:
+            return frozenset([name])
+        if name in promoted and promoted[name] <= MAX_CORE:
+            return frozenset()
+        return None
+
+    def dnf(text):
+        """`depends` (',' or, '+' and, parentheses) as a list of conjunctions
+        that can hold, each the set of scope extensions it needs."""
+        tokens = re.findall(r'[(),+]|[A-Za-z0-9_]+', text)
+        pos = [0]
+
+        def peek():
+            return tokens[pos[0]] if pos[0] < len(tokens) else None
+
+        def take():
+            pos[0] += 1
+            return tokens[pos[0] - 1]
+
+        def factor():
+            if peek() == '(':
+                take()
+                out = expr()
+                take()
+                return out
+            a = atom(take())
+            return [] if a is None else [a]
+
+        def term():
+            out = factor()
+            while peek() == '+':
+                take()
+                rhs = factor()
+                out = [a | b for a in out for b in rhs]
+            return out
+
+        def expr():
+            out = term()
+            while peek() == ',':
+                take()
+                out = out + term()
+            return out
+
+        return expr()
+
+    ext_values = {}
+    for x in extensions:
+        own = atom(x.get('name'))
+        if own is None:
+            continue
+        for req in x.findall('require'):
+            if not for_vulkan(req):
+                continue
+            gate = [own]
+            if req.get('depends'):
+                gate = [own | c for c in dnf(req.get('depends'))]
+            if not gate:
+                continue
+            for e in req.findall('enum'):
+                ext = e.get('extends')
+                if not ext or not for_vulkan(e):
+                    continue
+                v = everything.get(e.get('alias')) if e.get('alias') else enum_value(e, x.get('number'))
+                if v is None or v in values.get(ext, {}).values():
+                    continue
+                if any(not c for c in gate):
+                    # Needs no scope extension: a promoted extension's
+                    # value, which core <= 1.3 either has (caught above) or
+                    # does not, and then stays outside what is checked in.
+                    continue
+                ext_values.setdefault(ext, []).append((v, [sorted(c) for c in gate]))
     flagbits = {}
     for t in root.find('types').findall('type'):
         if t.get('category') != 'bitmask':
@@ -207,7 +320,7 @@ def core_enums(vk_xml):
             continue
         bits = t.get('requires') or t.get('bitvalues')
         flagbits[name] = bits
-    return values, bitwidth, flagbits
+    return values, bitwidth, flagbits, ext_values
 
 
 def ranges(values):
@@ -257,7 +370,23 @@ def ash_sources():
     for m in FN_TABLE_RE.finditer((src / 'tables.rs').read_text(encoding='utf-8')):
         for fm in re.finditer(r'pub (\w+): PFN_(vk\w+),', m.group(2)):
             tables[fm.group(2)] = ('fp_v1_%s' % m.group(1), fm.group(1))
-    return structs, unions, pfns, tables
+    # Every extension's device-level function table
+    # (`ash::<vendor>::<name>::DeviceFn`): extension name -> (module path,
+    # {entry point name: field}).
+    ext_tables = {}
+    text = (src / 'extensions_generated.rs').read_text(encoding='utf-8')
+    heads = list(re.finditer(r'#\[doc = "(VK_\w+)"\]\n    pub mod (\w+) \{', text))
+    for i, h in enumerate(heads):
+        body = text[h.end():heads[i + 1].start() if i + 1 < len(heads) else len(text)]
+        fn = re.search(r'pub struct DeviceFn \{\n(.*?)^\s*\}', body, re.M | re.S)
+        if not fn:
+            continue
+        vendor = h.group(1).split('_')[1].lower()
+        fields = {}
+        for fm in re.finditer(r'(\w+): unsafe \{.*?b"(vk\w+)\\0"', body, re.S):
+            fields[fm.group(2)] = fm.group(1)
+        ext_tables[h.group(1)] = ('%s::%s' % (vendor, h.group(2)), fields)
+    return structs, unions, pfns, tables, ext_tables
 
 
 # ------------------------------------------------------------ the model
@@ -267,7 +396,7 @@ class Gen:
         self.classes = parse_classes()
         self.m = rp.Model(rp.Selection.parse(SELECTION))
         self.r = rp.Rust(self.m)
-        self.values, self.bitwidth, self.flagbits = core_enums(rp.vp.VN_PROTOCOL_VK_XML)
+        self.values, self.bitwidth, self.flagbits, self.ext_values = core_enums(rp.vp.VN_PROTOCOL_VK_XML)
         self.kinds = kind_variants()
         self.core = {}
         for feat in self.m.reg.features:
@@ -276,14 +405,39 @@ class Gen:
                 if ty.category == VkType.COMMAND:
                     if ty.name not in self.core or ver < self.core[ty.name]:
                         self.core[ty.name] = ver
+        exts = {e.name: e for e in self.m.reg.extensions}
+        for name in SCOPE_EXTENSIONS:
+            if name not in exts:
+                sys.exit('venus-exec-gen: admitted extension %s is not in the registry' % name)
+        # The commands an admitted extension adds that core <= 1.3 does not
+        # have, and the admitted extensions that add each.
+        self.ext_cmds = {}
+        for c in self.m.commands:
+            if c.name in self.core and self.core[c.name] <= MAX_CORE:
+                continue
+            brought = [name for name in SCOPE_EXTENSIONS
+                       if c in exts[name].types
+                       or any(c in types for types in exts[name].optional_types.values())]
+            if brought:
+                self.ext_cmds[c.name] = brought
         self.inscope = [c for c in self.m.commands
-                        if c.name in self.core and self.core[c.name] <= MAX_CORE]
+                        if (c.name in self.core and self.core[c.name] <= MAX_CORE)
+                        or c.name in self.ext_cmds]
         self.check_classes()
+        # Filled while the bodies are emitted: the enum types and FlagBits
+        # types whose admitted-extension values need an `x_` / `m_` helper.
+        self.enums_used = set()
+        self.masks_used = {}
         self.served = [c for c in self.inscope if c.name in self.cls_translated]
         self.origins = {name: (packed, exts)
                         for (_v, name, _s, packed, exts) in self.m.structure_origins()}
         self.input_structs = self.reach(self.served)
-        self.structs, self.unions, self.pfns, self.tables = ash_sources()
+        self.structs, self.unions, self.pfns, self.tables, self.ext_tables = ash_sources()
+        self.cmd_aliases = {}
+        root = ET.parse(rp.vp.VN_PROTOCOL_VK_XML).getroot()
+        for cmd in root.find('commands').findall('command'):
+            if cmd.get('alias'):
+                self.cmd_aliases.setdefault(cmd.get('alias'), []).append(cmd.get('name'))
 
     # ---- classification ---------------------------------------------------
 
@@ -293,11 +447,12 @@ class Gen:
         for sec, entries in self.classes.items():
             for n in entries:
                 if n not in names:
-                    sys.exit('%s: [%s] %s is not a core <= 1.3 command of the protocol' % (CLASSES, sec, n))
+                    sys.exit('%s: [%s] %s is not a core <= 1.3 or admitted-extension command of the protocol'
+                             % (CLASSES, sec, n))
                 listed.add(n)
         missing = sorted(names - listed)
         if missing:
-            sys.exit('%s: core commands in no section: %s' % (CLASSES, ', '.join(missing)))
+            sys.exit('%s: commands in no section: %s' % (CLASSES, ', '.join(missing)))
         for sec, fn in (('bespoke', 'dispatch'), ('handwritten', 'dispatch_objects')):
             want = sorted(n[2:] for n in self.classes[sec])
             path, arms = match_arms(fn)
@@ -358,9 +513,48 @@ class Gen:
             return True
         return not f.can_validate
 
+    def link_gate(self, ty):
+        """The admitted (non-protocol) extensions a chained structure `ty` is
+        refused without, or [] for one core up to 1.3 or the protocol's own."""
+        o = self.origins.get(ty.name)
+        if o is None:
+            return []
+        packed, exts = o
+        if packed is not None and packed <= ADMITTED_API:
+            return []
+        return sorted(set(exts) & set(SCOPE_EXTENSIONS))
+
+    def gated(self, name):
+        """The admitted extensions' values of enum or FlagBits type `name`,
+        merged per value: value -> set of conjunctions (tuples of names)."""
+        out = {}
+        for v, gate in self.ext_values.get(name, []):
+            out.setdefault(v, set()).update(tuple(c) for c in gate)
+        return out
+
+    @staticmethod
+    def gate_expr(conjunctions):
+        """A Rust expression over `r` true when a device enabled every
+        extension of one of `conjunctions`."""
+        alts = []
+        for c in sorted(conjunctions):
+            alts.append(' && '.join('r.enabled("%s")' % e for e in c))
+        return ' || '.join('(%s)' % a if ' && ' in a else a for a in alts)
+
+    def mask_expr(self, bits, mask, wide):
+        """The bits a flag word of FlagBits type `bits` may carry: the core
+        `mask`, and — through an `m_` helper — whatever the device's enabled
+        admitted extensions add."""
+        suffix = 'u64' if wide else 'u32'
+        if bits and self.gated(bits):
+            self.masks_used[bits] = wide
+            return '(%#x_%s | m_%s(&*r))' % (mask, suffix, bits)
+        return '%#x_%s' % (mask, suffix)
+
     def enum_check(self, owner, f, value):
         """A boolean Rust expression that is true when `value` is allowed,
-        or None when the field is not checked."""
+        or None when the field is not checked. A value an admitted
+        extension adds is allowed on a device that enabled it (`r.enabled`)."""
         ty = f.elem.ty
         if f.elem.kind != rp.Elem.SCALAR or not f.can_validate:
             return None
@@ -378,13 +572,18 @@ class Gen:
                 # mask, and not 0 unless 0 is a core value (NONE) or the
                 # member is optional.
                 zero_ok = 0 in vals.values() or f.optional
-                if self.bitwidth.get(ty.name, 32) == 64:
-                    expr = '%s & !%#x_u64 == 0' % (value, mask)
+                wide = self.bitwidth.get(ty.name, 32) == 64
+                allowed = self.mask_expr(ty.name, mask, wide)
+                if wide:
+                    expr = '%s & !%s == 0' % (value, allowed)
                 else:
-                    expr = '(%s as u32) & !%#x_u32 == 0' % (value, mask)
+                    expr = '(%s as u32) & !%s == 0' % (value, allowed)
                 if not zero_ok:
                     expr = '%s != 0 && %s' % (value, expr)
                 return expr
+            if self.gated(ty.name):
+                self.enums_used.add(ty.name)
+                return '(e_%s(%s) || x_%s(&*r, %s))' % (ty.name, value, ty.name, value)
             return 'e_%s(%s)' % (ty.name, value)
         if ty.category == VkType.BITMASK:
             bits = self.flagbits.get(ty.name)
@@ -392,9 +591,8 @@ class Gen:
             if bits:
                 for v in self.values.get(bits, {}).values():
                     mask |= v
-            if self.m._primitive_of(ty) == 'uint64_t':
-                return '%s & !%#x_u64 == 0' % (value, mask)
-            return '%s & !%#x_u32 == 0' % (value, mask)
+            wide = self.m._primitive_of(ty) == 'uint64_t'
+            return '%s & !%s == 0' % (value, self.mask_expr(bits, mask, wide))
         return None
 
     # ---- executor side ----------------------------------------------------
@@ -494,6 +692,10 @@ class Gen:
         w('    fn invalid(&self, what: String) -> ExecError;')
         w('    /// A refusal of a chained structure the executor does not admit.')
         w('    fn link(&self, parent: &\'static str, stype: i32) -> ExecError;')
+        w('    /// Whether the device the command is translated against enabled')
+        w('    /// `extension`: a value or a chained structure an admitted extension adds')
+        w('    /// is refused on a device that did not (`policy::ADMITTED_EXTENSIONS`).')
+        w('    fn enabled(&self, extension: &\'static str) -> bool;')
         w('}')
         w('')
         w('fn chk_len(r: &dyn Resolve, what: &\'static str, len: usize, count: u64) -> Result<(), ExecError> {')
@@ -535,7 +737,14 @@ class Gen:
             if chain:
                 arms = []
                 for c in chain:
-                    if self.admitted(c):
+                    if not self.admitted(c):
+                        continue
+                    gate = self.link_gate(c)
+                    if gate:
+                        cond = ' || '.join('r.enabled("%s")' % e for e in gate)
+                        arms.append('%sNext::%s(x) => { if !(%s) { return Err(r.link("%s", %s::STRUCTURE_TYPE)); } t_%s(r, x)? }'
+                                    % (ty.name, c.name, cond, ty.name, c.name, c.name))
+                    else:
                         arms.append('%sNext::%s(x) => t_%s(r, x)?,' % (ty.name, c.name, c.name))
                 arms.append('other => return Err(r.link("%s", ChainLink::structure_type(other))),' % ty.name)
                 body.append('for link in v.p_next.iter_mut() { match link { %s } }' % ' '.join(arms))
@@ -592,7 +801,8 @@ class Gen:
         w('    match command {')
         by_ver = {}
         for c in self.inscope:
-            by_ver.setdefault(self.core[c.name], []).append(c)
+            if c.name in self.core and self.core[c.name] <= MAX_CORE:
+                by_ver.setdefault(self.core[c.name], []).append(c)
         for ver in sorted(by_ver):
             w('        %s => %d,' % (' | '.join('Command::%s(_)' % c.name[2:] for c in by_ver[ver]),
                                      (ver[0] << 22) | (ver[1] << 12)))
@@ -654,12 +864,57 @@ class Gen:
         w('/// Commands served by translation and the host call alone.')
         w('pub const PASS_THROUGH: &[&str] = &[%s];' % ', '.join('"%s"' % c.name for c in gen))
         w('')
+        w('/// The admitted extensions that bring `command`, for one outside core 1.0-1.3')
+        w('/// (`policy::ADMITTED_EXTENSIONS`): the device it is dispatched on must have')
+        w('/// enabled one of them. Empty for a core command.')
+        w('#[must_use]')
+        w('pub fn extensions_of(command: &Command<\'_>) -> &\'static [&\'static str] {')
+        w('    match command {')
+        for c in self.inscope:
+            if c.name in self.ext_cmds:
+                w('        Command::%s(_) => &[%s],' % (c.name[2:], ', '.join('"%s"' % e for e in self.ext_cmds[c.name])))
+        w('        _ => &[],')
+        w('    }')
+        w('}')
+        w('')
+        for name in sorted(self.enums_used):
+            w('/// Whether `v` is a `%s` value an admitted extension the device enabled adds.' % name)
+            w('fn x_%s(r: &dyn Resolve, v: i32) -> bool {' % name)
+            by_gate = {}
+            for value, gate in sorted(self.gated(name).items()):
+                by_gate.setdefault(tuple(sorted(gate)), []).append(value)
+            alts = []
+            for gate, vs in sorted(by_gate.items()):
+                pats = ' | '.join(('%d' % a) if a == b else '%d..=%d' % (a, b) for a, b in ranges(vs))
+                cond = self.gate_expr(gate)
+                if ' || ' in cond:
+                    cond = '(%s)' % cond
+                alts.append('%s && matches!(v, %s)' % (cond, pats))
+            if len(alts) > 1:
+                alts = ['(%s)' % a for a in alts]
+            w('    %s' % ' || '.join(alts))
+            w('}')
+            w('')
+        for name, wide in sorted(self.masks_used.items()):
+            ty = 'u64' if wide else 'u32'
+            w('/// The `%s` bits the admitted extensions the device enabled add.' % name)
+            w('fn m_%s(r: &dyn Resolve) -> %s {' % (name, ty))
+            w('    let mut m = 0;')
+            by_gate = {}
+            for value, gate in sorted(self.gated(name).items()):
+                key = tuple(sorted(gate))
+                by_gate[key] = by_gate.get(key, 0) | value
+            for gate, bits in sorted(by_gate.items()):
+                w('    if %s { m |= %#x_%s; }' % (self.gate_expr(gate), bits, ty))
+            w('    m')
+            w('}')
+            w('')
         return '\n'.join(out) + '\n'
 
     # ---- host side --------------------------------------------------------
 
     def ash_struct(self, ty):
-        name = ty.name[2:]
+        name = ashgen.resolve_ash_name(ty.name, self.structs) if ty.category != VkType.UNION else ty.name[2:]
         if ty.category == VkType.UNION:
             if name not in self.unions:
                 sys.exit('venus-exec-gen: no ash union %s' % name)
@@ -906,6 +1161,39 @@ class Gen:
             w('')
         for ty in out_structs:
             emit_out(ty)
+        # the admitted extensions' function tables
+        tabled = []
+        for name in SCOPE_EXTENSIONS:
+            if not any(name in exts for exts in self.ext_cmds.values()):
+                continue
+            if name not in self.ext_tables:
+                sys.exit('venus-exec-gen: %s has commands and no ash device function table' % name)
+            tabled.append(name)
+        w('/// The device-level entry points of every admitted extension with commands')
+        w('/// (`policy::ADMITTED_EXTENSIONS`), for the ones the host device was created')
+        w('/// with: `None` for one it was not, whose entry points may not exist.')
+        w('#[derive(Clone, Default)]')
+        w('pub struct ExtTables {')
+        for name in tabled:
+            path, _ = self.ext_tables[name]
+            w('    /// `%s`, when the device enabled it.' % name)
+            w('    pub %s: Option<ash::%s::Device>,' % (path.replace('::', '_'), path))
+        w('}')
+        w('')
+        w('impl ExtTables {')
+        w('    /// The tables of every extension `enabled` says the device was created')
+        w('    /// with, resolved from it.')
+        w('    #[must_use]')
+        w('    pub fn load(instance: &ash::Instance, device: &ash::Device, enabled: &dyn Fn(&str) -> bool) -> Self {')
+        w('        Self {')
+        for name in tabled:
+            path, _ = self.ext_tables[name]
+            w('            %s: enabled("%s").then(|| ash::%s::Device::new(instance, device)),' % (
+                path.replace('::', '_'), name, path))
+        w('        }')
+        w('    }')
+        w('}')
+        w('')
         # command calls
         for c in self.served:
             self.emit_call(w, c)
@@ -923,14 +1211,17 @@ class Gen:
         w('/// agrees with its array; the command is core in `device`\'s version; and the')
         w('/// caller holds the external synchronisation Vulkan requires for the objects it')
         w('/// names (the executor\'s context lock). Translation establishes all but the')
-        w('/// last two, which the executor does.')
-        w('pub unsafe fn call(device: &ash::Device, command: &mut Command<\'_>) -> Result<(), CallError> {')
+        w('/// last two, which the executor does. An admitted extension\'s command is')
+        w('/// called only through `ext`, whose table exists only for an extension the')
+        w('/// device was created with, and the executor calls it only on a device the')
+        w('/// guest enabled that extension on.')
+        w('pub unsafe fn call(device: &ash::Device, ext: &ExtTables, command: &mut Command<\'_>) -> Result<(), CallError> {')
         w('    let mut arena = Arena::default();')
         w('    // SAFETY: this function\'s own contract, passed on to the one arm taken.')
         w('    unsafe {')
         w('        match command {')
         for c in self.served:
-            w('            Command::%s(args) => call_%s(device, &mut arena, args),' % (c.name[2:], c.name[2:]))
+            w('            Command::%s(args) => call_%s(device, ext, &mut arena, args),' % (c.name[2:], c.name[2:]))
         w('            other => Err(CallError::NoCall(other.name())),')
         w('        }')
         w('    }')
@@ -939,10 +1230,33 @@ class Gen:
 
     def emit_call(self, w, c):
         fields = self.m.fields[c]
-        if c.name not in self.tables:
-            sys.exit('venus-exec-gen: %s has no ash function table entry' % c.name)
-        table, fn = self.tables[c.name]
-        params, ret = self.pfns[c.name]
+        names = [c.name] + self.cmd_aliases.get(c.name, [])
+        if c.name in self.ext_cmds:
+            # Through the table of whichever admitted extension that brings
+            # it the device was created with.
+            sources = []
+            for ext in self.ext_cmds[c.name]:
+                if ext not in self.ext_tables:
+                    continue
+                path, fns = self.ext_tables[ext]
+                for n in names:
+                    if n in fns:
+                        sources.append((path.replace('::', '_'), fns[n]))
+                        break
+            if not sources:
+                sys.exit('venus-exec-gen: %s has no ash extension function table entry' % c.name)
+            lookup = '.or_else(|| '.join(
+                'ext.%s.as_ref().map(|t| t.fp().%s)' % src for src in sources) + ')' * (len(sources) - 1)
+            fn_expr = None
+        else:
+            if c.name not in self.tables:
+                sys.exit('venus-exec-gen: %s has no ash function table entry' % c.name)
+            table, fn = self.tables[c.name]
+            lookup = None
+        pfn = next((n for n in names if n in self.pfns), None)
+        if pfn is None:
+            sys.exit('venus-exec-gen: %s has no ash PFN' % c.name)
+        params, ret = self.pfns[pfn]
         if len(params) != len(fields):
             sys.exit('venus-exec-gen: %s: %d ash parameters, %d protocol fields' % (c.name, len(params), len(fields)))
         acc = lambda n: 'args.' + n
@@ -1024,8 +1338,12 @@ class Gen:
                 continue
             pre.append('let p%d = %s;' % (i, e))
             exprs[i] = 'p%d' % i
-        call = '(device.%s().%s)(%s)' % (table, fn, ', '.join(exprs))
-        w('unsafe fn call_%s(device: &ash::Device, a: &mut Arena, args: &mut %s%s) -> Result<(), CallError> {' % (
+        if lookup is None:
+            call = '(device.%s().%s)(%s)' % (table, fn, ', '.join(exprs))
+        else:
+            pre.insert(0, 'let f = %s.ok_or(CallError::NoCall("%s"))?;' % (lookup, c.name))
+            call = '(f)(%s)' % ', '.join(exprs)
+        w('unsafe fn call_%s(device: &ash::Device, ext: &ExtTables, a: &mut Arena, args: &mut %s%s) -> Result<(), CallError> {' % (
             c.name[2:], self.r.command_args_name(c), self.lt(c)))
         for p in pre:
             w('    ' + p)

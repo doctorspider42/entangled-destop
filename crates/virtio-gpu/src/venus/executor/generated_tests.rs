@@ -16,6 +16,8 @@ use crate::venus::protocol::*;
 struct Mock {
     known: HashMap<u64, Kind>,
     asked: Vec<&'static str>,
+    /// The extensions "the device" enabled (stage 5c).
+    extensions: Vec<&'static str>,
 }
 
 impl Mock {
@@ -23,6 +25,7 @@ impl Mock {
         Self {
             known: objects.iter().copied().collect(),
             asked: Vec::new(),
+            extensions: Vec::new(),
         }
     }
 }
@@ -71,6 +74,10 @@ impl Resolve for Mock {
 
     fn link(&self, parent: &'static str, stype: i32) -> ExecError {
         super::context::unimplemented_link("test", parent, stype)
+    }
+
+    fn enabled(&self, extension: &'static str) -> bool {
+        self.extensions.contains(&extension)
     }
 }
 

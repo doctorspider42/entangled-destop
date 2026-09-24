@@ -35,6 +35,37 @@
 //! import for simply never sees a host-visible type. The same filtered bits
 //! judge every bind.
 //!
+//! # External memory: `DMA_BUF`, emulated (stage 5c)
+//!
+//! A Windows host has no dma-buf, and the guest is told it has
+//! (`VK_EXT_external_memory_dma_buf`, emulated, `policy`), because Mesa
+//! 26.0.8's venus offers `VK_KHR_external_memory_fd` — which Zink's DRM
+//! screen needs — only on such a renderer. What a `DMA_BUF` is here is what a
+//! blob of this renderer already is: **our pages**. So:
+//!
+//! * a buffer or an image created for `DMA_BUF` is created as every resource
+//!   is — for host allocations when the driver may import them for it — and
+//!   one that can take our pages asks for them alone ([`external_type_bits`]),
+//!   so memory allocated for it can be exported;
+//! * an **export** allocation (`VkExportMemoryAllocateInfo{DMA_BUF}`) is an
+//!   ordinary allocation: on a host-visible type it is our pages, and the
+//!   blob Mesa makes of it at once (`vn_device_memory_alloc_export`) is those
+//!   pages, as for any mapped memory; on any other type there are no pages to
+//!   share, the blob is refused, and the guest's `vkAllocateMemory` answers
+//!   `VK_ERROR_OUT_OF_DEVICE_MEMORY` (`virtgpu_bo_create_from_device_memory`)
+//!   and frees the memory — refused in Vulkan terms;
+//! * an **import** (`VkImportMemoryResourceInfoMESA`) must name a blob of
+//!   memory of this renderer that this context made or is attached to
+//!   ([`ContextBlobs::memory`](crate::venus::renderer::ContextBlobs::memory)),
+//!   and becomes a new `VkDeviceMemory` importing **the same pages**
+//!   (`VK_EXT_external_memory_host` again): both memories see one set of
+//!   bytes. Its lifetime is the pages' `Arc`, which the import holds, so the
+//!   exporter's memory, blob or whole context may go first and the pages stay
+//!   exactly as long as something imported them; they are charged to the
+//!   budget once, when they were first allocated. Anything else is
+//!   `VK_ERROR_INVALID_EXTERNAL_HANDLE`, vkr's answer for a resource it
+//!   cannot import.
+//!
 //! # Asynchrony
 //!
 //! Mesa 26.0.8 allocates memory, creates buffers on a requirements-cache hit,
@@ -93,6 +124,64 @@ pub fn guest_type_bits(guest: &GuestDevice, host_memory: bool, bits: u32) -> u32
     }
 }
 
+/// [`guest_type_bits`] for a resource created for `DMA_BUF` export
+/// (`external`, stage 5c): when it can take our pages, **only** the types
+/// that are our pages, because an export of any other is refused — so what
+/// the guest allocates for it is memory it can share. One that cannot take
+/// our pages keeps its bits, and an export of its memory is refused.
+#[must_use]
+pub fn external_type_bits(
+    guest: &GuestDevice,
+    host_memory: bool,
+    external: bool,
+    bits: u32,
+) -> u32 {
+    let bits = guest_type_bits(guest, host_memory, bits);
+    let ours = bits & guest.host_visible_types();
+    if external && host_memory && ours != 0 {
+        ours
+    } else {
+        bits
+    }
+}
+
+/// The handle types a `VkExternalMemory{Buffer,Image}CreateInfo` may name on
+/// `device`: none, or `DMA_BUF` once the guest enabled the emulated
+/// dma-buf extension (Mesa rewrites every handle type an application names
+/// to the renderer's, `vn_buffer.c:386-396`, `vn_image.c:687-692`). Answers
+/// whether it names `DMA_BUF`.
+///
+/// # Errors
+/// Any other handle type: no correct guest sends one, because no other is
+/// the renderer's.
+pub(super) fn external_handle_types(
+    command: &'static str,
+    handle_types: u32,
+    device_enabled_dma_buf: bool,
+) -> Result<bool, ExecError> {
+    match handle_types {
+        0 => Ok(false),
+        policy::MEMORY_HANDLE_DMA_BUF if device_enabled_dma_buf => Ok(true),
+        other => Err(invalid(
+            command,
+            format!(
+                "external memory handle types {other:#x}: DMA_BUF is the only one, and only on a \
+                 device that enabled VK_EXT_external_memory_dma_buf"
+            ),
+        )),
+    }
+}
+
+impl<H: HostVulkan> DeviceObject<H> {
+    /// Whether the guest enabled the emulated dma-buf external memory on
+    /// this device (either of the two names Mesa enables together,
+    /// `vn_device.c:318-330`).
+    #[must_use]
+    pub fn dma_buf(&self) -> bool {
+        self.enabled(policy::EXTERNAL_MEMORY_DMA_BUF) || self.enabled(policy::EXTERNAL_MEMORY_FD)
+    }
+}
+
 /// How many memory planes a format has (1 for everything but the
 /// multi-planar YCbCr formats of 1.1 and 1.3).
 #[must_use]
@@ -137,19 +226,22 @@ fn requirements() -> VkMemoryRequirements2 {
 impl<H: HostVulkan> VulkanContext<H> {
     // ---------------------------------------------------------- memory
 
-    /// `vkAllocateMemory`. See the module docs for the two paths.
+    /// `vkAllocateMemory`. See the module docs for the two paths, and for
+    /// the external memory of stage 5c.
     ///
     /// Answered in Vulkan terms, as vkr answers: a type index past the
     /// device's is `VK_ERROR_UNKNOWN`; a size past the heap, or past what is
     /// left of the renderer's host-visible budget, is
     /// `VK_ERROR_OUT_OF_DEVICE_MEMORY` (the answer a driver gives for an
     /// exhausted heap); a host allocator that refuses is
-    /// `VK_ERROR_OUT_OF_HOST_MEMORY`; an export of a handle type or an import
-    /// of a resource (`VkImportMemoryResourceInfoMESA`, which Mesa sends only
-    /// for a dma-buf import or guest vram, neither of which exists here) is
-    /// `VK_ERROR_INVALID_EXTERNAL_HANDLE` — vkr's answer for a resource it
-    /// cannot import. Fatal: a zero size, a flag or feature the guest was not
-    /// offered, a dedicated resource of another device or two of them.
+    /// `VK_ERROR_OUT_OF_HOST_MEMORY`; an export of a handle type other than
+    /// the emulated `DMA_BUF`, or of `DMA_BUF` on a device that did not enable
+    /// it, and an import (`VkImportMemoryResourceInfoMESA`) of anything but a
+    /// blob of this renderer's memory this context may reach
+    /// ([`Self::import_memory`]) is `VK_ERROR_INVALID_EXTERNAL_HANDLE` —
+    /// vkr's answer for a resource it cannot import. Fatal: a zero size, a
+    /// flag or feature the guest was not offered, a dedicated resource of
+    /// another device or two of them.
     pub(super) fn allocate_memory(
         &mut self,
         args: &mut AllocateMemoryArgs,
@@ -192,12 +284,17 @@ impl<H: HostVulkan> VulkanContext<H> {
 
         let mut flags = None;
         let mut dedicated = None;
+        let mut import = None;
         for link in &info.p_next {
             match link {
                 VkMemoryAllocateInfoNext::VkExportMemoryAllocateInfo(e) => {
-                    // Mesa rewrites an export to the renderer's handle type,
-                    // which is none here, so a correct guest sends 0.
-                    if e.handle_types != 0 {
+                    // Mesa rewrites an export to the renderer's handle type
+                    // (`vn_device_memory_fix_alloc_info`): `DMA_BUF`, the
+                    // emulated one, on a device that enabled it. Nothing
+                    // more to do for it here — see the module docs.
+                    let ok = e.handle_types == 0
+                        || (e.handle_types == policy::MEMORY_HANDLE_DMA_BUF && device.dma_buf());
+                    if !ok {
                         args.ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
                         return Ok(());
                     }
@@ -266,20 +363,17 @@ impl<H: HostVulkan> VulkanContext<H> {
                     }
                 }
                 VkMemoryAllocateInfoNext::VkImportMemoryResourceInfoMESA(r) => {
-                    tracing::info!(
-                        ctx_id = self.ctx_id,
-                        resource = r.resource_id,
-                        "vkAllocateMemory importing a virtio-gpu resource, which this renderer \
-                         cannot"
-                    );
-                    args.ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-                    return Ok(());
+                    import = Some(r.resource_id);
                 }
             }
         }
         if !self.objects.has_room() {
             args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
             return Ok(());
+        }
+        if let Some(resource_id) = import {
+            let property_flags = ty.property_flags;
+            return self.import_memory(args, id, resource_id, property_flags, flags);
         }
 
         let host_visible = ty.property_flags & policy::MEMORY_PROPERTY_HOST_VISIBLE != 0;
@@ -362,6 +456,162 @@ impl<H: HostVulkan> VulkanContext<H> {
             }
             Err(ret) => args.ret = ret,
         }
+        Ok(())
+    }
+
+    /// `vkAllocateMemory` with a `VkImportMemoryResourceInfoMESA` (stage 5c):
+    /// a new memory importing the pages of blob `resource_id` — a blob of
+    /// memory of this renderer, this context's own or attached to it — as a
+    /// host-visible type the host accepts those pages for, no larger than the
+    /// blob. The import holds the pages' `Arc` (module docs); no blob can be
+    /// made of it again, because the guest already has one. Anything else is
+    /// `VK_ERROR_INVALID_EXTERNAL_HANDLE`, logged with why.
+    fn import_memory(
+        &mut self,
+        args: &mut AllocateMemoryArgs,
+        id: u64,
+        resource_id: u32,
+        property_flags: u32,
+        flags: Option<(u32, u32)>,
+    ) -> Result<(), ExecError> {
+        const NAME: &str = "vkAllocateMemory";
+        let device_id = args.device.0;
+        let Some(info) = &args.p_allocate_info else {
+            return Err(invalid(NAME, "pAllocateInfo is null"));
+        };
+        let (type_index, size) = (info.memory_type_index, info.allocation_size);
+        let (device, guest) = self
+            .objects
+            .device_and_guest(device_id)
+            .map_err(id_error(NAME))?;
+        let refuse = |why: &str| {
+            tracing::info!(
+                ctx_id = self.ctx_id,
+                resource = resource_id,
+                why,
+                "vkAllocateMemory import of a virtio-gpu resource refused"
+            );
+            VK_ERROR_INVALID_EXTERNAL_HANDLE
+        };
+        let blob = match (device.dma_buf(), self.blobs.as_ref()) {
+            (false, _) => Err("the device did not enable VK_EXT_external_memory_dma_buf"),
+            (true, None) => Err("the context has no blobs"),
+            (true, Some(blobs)) => blobs
+                .memory(resource_id)
+                .map_err(|_| "not a blob of this renderer's memory this context may reach"),
+        };
+        let blob = match blob {
+            Ok(blob) => blob,
+            Err(why) => {
+                args.ret = refuse(why);
+                return Ok(());
+            }
+        };
+        let pages = blob.pages;
+        let align = guest.import_alignment.max(1);
+        if property_flags & policy::MEMORY_PROPERTY_HOST_VISIBLE == 0 {
+            args.ret = refuse("its type is not one of our pages");
+            return Ok(());
+        }
+        if size > blob.size
+            || size > pages.mapped_len()
+            || pages.host_addr() % align != 0
+            || pages.mapped_len() % align != 0
+        {
+            args.ret = refuse("its size or its pages do not fit the import");
+            return Ok(());
+        }
+        let bits = match self.host.host_pointer_types(&device.host, &pages) {
+            Ok(bits) => bits,
+            Err(ret) => {
+                args.ret = ret;
+                return Ok(());
+            }
+        };
+        if bits & 1u32.checked_shl(type_index).unwrap_or(0) == 0 {
+            args.ret = refuse("the host will not import those pages as that type");
+            return Ok(());
+        }
+        let request = MemoryRequest {
+            size: pages.mapped_len(),
+            type_index,
+            import: Some(Arc::clone(&pages)),
+            flags,
+            dedicated: None,
+        };
+        match self.host.allocate_memory(&device.host, &request) {
+            Ok(memory) => {
+                tracing::debug!(
+                    ctx_id = self.ctx_id,
+                    resource = resource_id,
+                    owner = blob.owner,
+                    size,
+                    "vkAllocateMemory imported a blob of memory: the same pages"
+                );
+                self.objects.insert_memory(
+                    id,
+                    MemoryObject {
+                        device: device_id,
+                        host: memory,
+                        size,
+                        type_index,
+                        property_flags,
+                        pages: Some(pages),
+                        exported: true,
+                        dedicated: None,
+                        allocate_flags: flags.map_or(0, |(f, _)| f),
+                    },
+                );
+                args.ret = VK_SUCCESS;
+            }
+            Err(ret) => args.ret = ret,
+        }
+        Ok(())
+    }
+
+    /// `vkGetMemoryResourcePropertiesMESA` (stage 5c), which Mesa sends
+    /// before importing a dma-buf (`vn_get_memory_dma_buf_properties`,
+    /// `vn_device_memory.c:574-605`): for a blob of this renderer's memory
+    /// this context may import ([`Self::import_memory`]'s rule), the types
+    /// its pages may be imported as — the host-visible ones the host accepts
+    /// them for — and its size; `VK_ERROR_INVALID_EXTERNAL_HANDLE` for
+    /// anything else, as vkr answers a resource it cannot import. (vkr is
+    /// fatal for a resource the context does not hold at all; here that is
+    /// the same answer, because a guest cannot tell a resource that exists
+    /// but is not ours from one that is not attached yet.)
+    pub(super) fn memory_resource_properties(
+        &mut self,
+        args: &mut crate::venus::protocol::GetMemoryResourcePropertiesMESAArgs,
+    ) -> Result<(), ExecError> {
+        use crate::venus::protocol::VkMemoryResourcePropertiesMESANext as N;
+        const NAME: &str = "vkGetMemoryResourcePropertiesMESA";
+        let (device, guest) = self
+            .objects
+            .device_and_guest(args.device.0)
+            .map_err(id_error(NAME))?;
+        let blob = match (device.dma_buf(), self.blobs.as_ref()) {
+            (true, Some(blobs)) => blobs.memory(args.resource_id).ok(),
+            _ => None,
+        };
+        let Some(blob) = blob else {
+            args.ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            return Ok(());
+        };
+        let bits = match self.host.host_pointer_types(&device.host, &blob.pages) {
+            Ok(bits) => bits & guest.host_visible_types(),
+            Err(ret) => {
+                args.ret = ret;
+                return Ok(());
+            }
+        };
+        if let Some(out) = args.p_memory_resource_properties.as_mut() {
+            out.memory_type_bits = bits;
+            for link in &mut out.p_next {
+                let N::VkMemoryResourceAllocationSizePropertiesMESA(size) = link;
+                size.allocation_size = blob.size;
+            }
+        }
+        args.ret = VK_SUCCESS;
         Ok(())
     }
 
@@ -449,12 +699,13 @@ impl<H: HostVulkan> VulkanContext<H> {
     // --------------------------------------------------------- buffers
 
     /// The checks a `VkBufferCreateInfo` gets before the driver sees it.
+    /// Answers whether it is created for `DMA_BUF` export (stage 5c).
     fn check_buffer_info(
         command: &'static str,
         info: &VkBufferCreateInfo,
         device: &DeviceObject<H>,
         guest: &GuestDevice,
-    ) -> Result<(), ExecError> {
+    ) -> Result<bool, ExecError> {
         if info.flags & !policy::BUFFER_CREATE_CORE != 0
             || info.flags & policy::BUFFER_CREATE_SPARSE != 0
             || info.flags & policy::BUFFER_CREATE_CAPTURE_REPLAY != 0
@@ -470,7 +721,9 @@ impl<H: HostVulkan> VulkanContext<H> {
         if info.size == 0 {
             return Err(invalid(command, "size is 0"));
         }
-        let usage_known = policy::BUFFER_USAGE_CORE | policy::BUFFER_USAGE_DEVICE_ADDRESS;
+        let usage_known = policy::BUFFER_USAGE_CORE
+            | policy::BUFFER_USAGE_DEVICE_ADDRESS
+            | policy::buffer_usage_of_extensions(|e| device.enabled(e));
         if info.usage == 0 || info.usage & !usage_known != 0 {
             return Err(invalid(command, format!("usage {:#x}", info.usage)));
         }
@@ -496,16 +749,11 @@ impl<H: HostVulkan> VulkanContext<H> {
                 ));
             }
         }
+        let mut external = false;
         for link in &info.p_next {
             match link {
                 VkBufferCreateInfoNext::VkExternalMemoryBufferCreateInfo(e) => {
-                    if e.handle_types != 0 {
-                        return Err(invalid(
-                            command,
-                            "external memory handle types, with no external-memory extension \
-                             advertised",
-                        ));
-                    }
+                    external |= external_handle_types(command, e.handle_types, device.dma_buf())?;
                 }
                 VkBufferCreateInfoNext::VkBufferOpaqueCaptureAddressCreateInfo(c) => {
                     if c.opaque_capture_address != 0 {
@@ -524,7 +772,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 }
             }
         }
-        Ok(())
+        Ok(external)
     }
 
     /// `vkCreateBuffer`: checked, then created able to take our imported
@@ -543,7 +791,7 @@ impl<H: HostVulkan> VulkanContext<H> {
         let Some(info) = &args.p_create_info else {
             return Err(invalid(NAME, "pCreateInfo is null"));
         };
-        Self::check_buffer_info(NAME, info, device, guest)?;
+        let external = Self::check_buffer_info(NAME, info, device, guest)?;
         if !self.objects.has_room() {
             args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
             return Ok(());
@@ -562,6 +810,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                         usage: info.usage,
                         flags: info.flags,
                         host_memory,
+                        external,
                         bound: None,
                     },
                 );
@@ -608,9 +857,10 @@ impl<H: HostVulkan> VulkanContext<H> {
             .map_err(id_error(command))?;
         self.host
             .buffer_memory_requirements(&device.host, buffer.host, out);
-        out.memory_requirements.memory_type_bits = guest_type_bits(
+        out.memory_requirements.memory_type_bits = external_type_bits(
             guest,
             buffer.host_memory,
+            buffer.external,
             out.memory_requirements.memory_type_bits,
         );
         Ok(())
@@ -674,15 +924,19 @@ impl<H: HostVulkan> VulkanContext<H> {
             return Err(invalid(NAME, "pInfo or its pCreateInfo is null"));
         };
         require_1_3(NAME, guest)?;
-        Self::check_buffer_info(NAME, info, device, guest)?;
+        let external = Self::check_buffer_info(NAME, info, device, guest)?;
         let host_memory =
             self.host
                 .buffer_accepts_host_memory(&device.host, info.flags, info.usage);
         if let Some(out) = args.p_memory_requirements.as_mut() {
             self.host
                 .device_buffer_memory_requirements(&device.host, info, host_memory, out);
-            out.memory_requirements.memory_type_bits =
-                guest_type_bits(guest, host_memory, out.memory_requirements.memory_type_bits);
+            out.memory_requirements.memory_type_bits = external_type_bits(
+                guest,
+                host_memory,
+                external,
+                out.memory_requirements.memory_type_bits,
+            );
         }
         Ok(())
     }
@@ -741,7 +995,12 @@ impl<H: HostVulkan> VulkanContext<H> {
         self.host
             .buffer_memory_requirements(&device.host, buffer.host, &mut req);
         let req = req.memory_requirements;
-        let bits = guest_type_bits(guest, buffer.host_memory, req.memory_type_bits);
+        let bits = external_type_bits(
+            guest,
+            buffer.host_memory,
+            buffer.external,
+            req.memory_type_bits,
+        );
         let fits = bind
             .memory_offset
             .checked_add(req.size)
@@ -1014,7 +1273,12 @@ impl<H: HostVulkan> VulkanContext<H> {
         self.host
             .image_memory_requirements(&device.host, image.host, None, &mut out);
         let mut req = out.memory_requirements;
-        req.memory_type_bits = guest_type_bits(guest, image.host_memory, req.memory_type_bits);
+        req.memory_type_bits = external_type_bits(
+            guest,
+            image.host_memory,
+            image.external,
+            req.memory_type_bits,
+        );
         if args.p_memory_requirements.is_some() {
             args.p_memory_requirements = Some(req);
         }
@@ -1042,7 +1306,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             .physical(device.physical)
             .map_err(id_error(NAME))?;
         require_1_3(NAME, &exposed.guest)?;
-        check_image_create_info(NAME, create, &exposed.guest)?;
+        let external = check_image_create_info(NAME, create, &exposed.guest, device.dma_buf())?;
         if !image_limits_hold(&*self.host, instance, exposed.host, create) {
             return Err(invalid(
                 NAME,
@@ -1072,9 +1336,10 @@ impl<H: HostVulkan> VulkanContext<H> {
                 plane,
                 out,
             );
-            out.memory_requirements.memory_type_bits = guest_type_bits(
+            out.memory_requirements.memory_type_bits = external_type_bits(
                 &exposed.guest,
                 host_memory,
+                external,
                 out.memory_requirements.memory_type_bits,
             );
         }
@@ -1154,7 +1419,12 @@ impl<H: HostVulkan> VulkanContext<H> {
         self.host
             .image_memory_requirements(&device.host, image.host, plane, &mut req);
         let req = req.memory_requirements;
-        let bits = guest_type_bits(guest, image.host_memory, req.memory_type_bits);
+        let bits = external_type_bits(
+            guest,
+            image.host_memory,
+            image.external,
+            req.memory_type_bits,
+        );
         let fits = bind
             .memory_offset
             .checked_add(req.size)

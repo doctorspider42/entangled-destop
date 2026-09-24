@@ -108,6 +108,10 @@ pub struct HostDevice {
     /// `vkGetMemoryHostPointerPropertiesEXT`, resolved from the device (the
     /// renderer enables `VK_EXT_external_memory_host` on every one).
     host_pointer_properties: Option<vk::PFN_vkGetMemoryHostPointerPropertiesEXT>,
+    /// The entry points of the admitted extensions the device was created
+    /// with (stage 5c), resolved from it: what their commands are called
+    /// through.
+    ext: calls::ExtTables,
 }
 
 /// A host `VkDeviceMemory`, and — for an import — the pages the driver
@@ -336,13 +340,22 @@ impl HostVulkan for AshVulkan {
         device: vk::PhysicalDevice,
     ) -> HostDeviceInfo {
         let api = Self::device_api(instance, device);
+        // SAFETY: `device` is ours; the call only writes its results.
+        let extensions: Vec<VkExtensionProperties> =
+            unsafe { instance.enumerate_device_extension_properties(device) }
+                .unwrap_or_default()
+                .iter()
+                .map(VkExtensionProperties::from_ash)
+                .collect();
+        let has = |name: &str| has_extension(&extensions, name);
         let (properties, features) = if api >= vk::API_VERSION_1_1 {
-            // SAFETY: `device` is ours, and `api` gates every chained
-            // structure to what its version knows (see `convert`).
+            // SAFETY: `device` is ours, and `api` and the device's own
+            // extension list gate every chained structure to what it knows
+            // (see `convert`).
             unsafe {
                 (
-                    convert::query_properties2(instance, device, api),
-                    convert::query_features2(instance, device, api),
+                    convert::query_properties2(instance, device, api, &has),
+                    convert::query_features2(instance, device, api, &has),
                 )
             }
         } else {
@@ -365,22 +378,15 @@ impl HostVulkan for AshVulkan {
             )
         };
         // SAFETY: `device` is ours; each call only writes its results.
-        let (families, memory, extensions) = unsafe {
+        let (families, memory) = unsafe {
             (
                 instance.get_physical_device_queue_family_properties(device),
                 instance.get_physical_device_memory_properties(device),
-                instance
-                    .enumerate_device_extension_properties(device)
-                    .unwrap_or_default(),
             )
         };
         let queue_families: Vec<VkQueueFamilyProperties> = families
             .iter()
             .map(VkQueueFamilyProperties::from_ash)
-            .collect();
-        let extensions: Vec<VkExtensionProperties> = extensions
-            .iter()
-            .map(VkExtensionProperties::from_ash)
             .collect();
         let host_import = (api >= vk::API_VERSION_1_1
             && has_extension(&extensions, EXTERNAL_MEMORY_HOST))
@@ -593,6 +599,29 @@ impl HostVulkan for AshVulkan {
         }
     }
 
+    fn buffer_importable(
+        &self,
+        instance: &ash::Instance,
+        device: vk::PhysicalDevice,
+        flags: u32,
+        usage: u32,
+    ) -> bool {
+        let info = vk::PhysicalDeviceExternalBufferInfo::default()
+            .flags(vk::BufferCreateFlags::from_raw(flags))
+            .usage(vk::BufferUsageFlags::from_raw(usage))
+            .handle_type(HOST_ALLOCATION);
+        let mut out = vk::ExternalBufferProperties::default();
+        // SAFETY: `device` is ours; flags and usage were checked against what
+        // the device may create; `info` and `out` are locals; a core 1.1
+        // entry point of an instance made at 1.3.
+        unsafe {
+            instance.get_physical_device_external_buffer_properties(device, &info, &mut out);
+        }
+        out.external_memory_properties
+            .external_memory_features
+            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    }
+
     fn create_device(
         &self,
         instance: &ash::Instance,
@@ -664,11 +693,15 @@ impl HostVulkan for AshVulkan {
                 >(raw)
             }
         });
+        let ext = calls::ExtTables::load(instance, &created, &|name| {
+            request.extensions.iter().any(|e| e == name)
+        });
         Ok(HostDevice {
             device: created,
             instance: instance.clone(),
             physical: device,
             host_pointer_properties,
+            ext,
         })
     }
 
@@ -1158,7 +1191,7 @@ impl HostVulkan for AshVulkan {
         // the executor refused it unless it is core in the device's version
         // (`generated::min_api`), and the executor's context lock is held,
         // which is the external synchronisation every object named needs.
-        unsafe { calls::call(&device.device, command) }
+        unsafe { calls::call(&device.device, &device.ext, command) }
     }
 
     fn destroy_object(&self, device: &HostDevice, kind: Kind, raw: u64) {
@@ -1260,8 +1293,8 @@ fn with_image_create_info<T>(
     let mut stencil = None;
     for link in &info.p_next {
         match link {
-            // The guest's is always empty (the executor refuses any handle
-            // type); ours replaces it.
+            // The guest's is empty or the emulated `DMA_BUF` (stage 5c), which
+            // on this host is our pages: ours replaces it.
             VkImageCreateInfoNext::VkExternalMemoryImageCreateInfo(_) => {}
             VkImageCreateInfoNext::VkImageFormatListCreateInfo(l) => {
                 list = Some(
@@ -1325,8 +1358,9 @@ fn with_buffer_create_info<T>(
     let families: Vec<u32> = info.p_queue_family_indices.clone().unwrap_or_default();
     for link in &info.p_next {
         match link {
-            // Both are empty by the time they get here (a handle type and a
-            // capture address are refused first), so neither is forwarded.
+            // Neither is forwarded: a handle type is empty or the emulated
+            // `DMA_BUF` (our pages, which `external` below stands for), and a
+            // capture address is refused first.
             VkBufferCreateInfoNext::VkExternalMemoryBufferCreateInfo(_)
             | VkBufferCreateInfoNext::VkBufferOpaqueCaptureAddressCreateInfo(_) => {}
             _ => return Err(VK_ERROR_INITIALIZATION_FAILED),

@@ -371,6 +371,16 @@ pub trait Renderer3d: Send {
         Err(CommandError::UnsupportedBlobMem(args.blob_mem))
     }
 
+    /// `CTX_ATTACH_RESOURCE` (`attach`) or `CTX_DETACH_RESOURCE` of a blob
+    /// resource on context `ctx_id`, which the device otherwise answers
+    /// itself (a blob id is the device's, not the renderer's 3D table's).
+    /// The default: nothing. The Venus renderer records it — an attached
+    /// blob of another context's memory is one this context may import
+    /// (EPIC 20 stage 5c).
+    fn ctx_attach_blob(&mut self, ctx_id: u32, resource_id: u32, attach: bool) {
+        let _ = (ctx_id, resource_id, attach);
+    }
+
     /// Drops a renderer-side blob (`RESOURCE_UNREF` on a host blob).
     fn destroy_blob(&mut self, resource_id: u32) {
         let _ = resource_id;
@@ -648,6 +658,12 @@ impl Gpu3d {
             return Err(CommandError::UnknownContext(ctx_id));
         }
         self.renderer.create_blob(ctx_id, args, mem, entries)
+    }
+
+    /// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` of a blob resource,
+    /// forwarded to the renderer ([`Renderer3d::ctx_attach_blob`]).
+    pub fn ctx_attach_blob(&mut self, ctx_id: u32, resource_id: u32, attach: bool) {
+        self.renderer.ctx_attach_blob(ctx_id, resource_id, attach);
     }
 
     /// Drops a host-side blob.

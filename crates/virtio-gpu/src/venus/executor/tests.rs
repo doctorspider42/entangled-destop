@@ -76,7 +76,9 @@ fn the_whole_vulkaninfo_bring_up_is_answered_the_way_mesa_decodes_it() {
     };
     let p = p.p_properties.unwrap();
     assert_eq!(c_name(&p.device_name), b"NVIDIA GeForce RTX 2070");
-    assert_eq!(p.vendor_id, 0x10de);
+    // Stage 5c: shown as the virtio device it is (`policy::shape_identity`).
+    assert_eq!(p.vendor_id, 0x1af4);
+    assert_eq!(p.device_id, 0x1f02);
     assert_eq!(p.api_version, vk_make_api_version(0, 1, 3, 312));
 
     // Rows 7–8: only what this renderer serves is advertised — the host's
@@ -93,8 +95,9 @@ fn the_whole_vulkaninfo_bring_up_is_answered_the_way_mesa_decodes_it() {
         panic!()
     };
     // Stage 5b.3: the host's VK_KHR_synchronization2, and the emulated
-    // VK_KHR_external_semaphore_fd; nothing else of the host's list.
-    assert_eq!((x.ret, x.p_property_count), (VK_SUCCESS, Some(2)));
+    // VK_KHR_external_semaphore_fd; stage 5c: and the emulated dma-buf pair.
+    // Nothing else of the host's list.
+    assert_eq!((x.ret, x.p_property_count), (VK_SUCCESS, Some(4)));
 
     // Row 9: Features2 with the chain Mesa builds at 1.3 (prepended, so
     // 1.3 first); sparse masked, the rest passed through, order kept.
@@ -963,11 +966,12 @@ fn admitted_names<N: ChainLink<'static>>() -> Vec<&'static str> {
 }
 
 #[test]
-fn the_links_this_stage_admits_are_exactly_the_ones_the_bring_up_protocol_decoded() {
+fn the_links_admitted_are_the_bring_up_ones_and_the_admitted_extensions_structures() {
     // The pNext whitelists of the bring-up commands as the generator emitted
     // them with `[api] 1.3` and the two venus extensions, before it
-    // generated the whole protocol: the executor's policy must keep
-    // admitting exactly these, whatever the decoder now accepts.
+    // generated the whole protocol — and, since stage 5c, the structures of
+    // `policy::ADMITTED_EXTENSIONS` and nothing more: the executor's policy
+    // must admit exactly these, whatever the decoder now accepts.
     let sorted = |mut v: Vec<&'static str>| {
         v.sort_unstable();
         v
@@ -1008,6 +1012,16 @@ fn the_links_this_stage_admits_are_exactly_the_ones_the_bring_up_protocol_decode
         "VkPhysicalDeviceSynchronization2Features",
         "VkPhysicalDeviceShaderIntegerDotProductFeatures",
         "VkPhysicalDeviceDynamicRenderingFeatures",
+        // Stage 5c.
+        "VkPhysicalDeviceTransformFeedbackFeaturesEXT",
+        "VkPhysicalDeviceConditionalRenderingFeaturesEXT",
+        "VkPhysicalDeviceDepthClipEnableFeaturesEXT",
+        "VkPhysicalDeviceVertexAttributeDivisorFeatures",
+        "VkPhysicalDeviceLineRasterizationFeatures",
+        "VkPhysicalDeviceCustomBorderColorFeaturesEXT",
+        "VkPhysicalDeviceBorderColorSwizzleFeaturesEXT",
+        "VkPhysicalDeviceRobustness2FeaturesKHR",
+        "VkPhysicalDeviceProvokingVertexFeaturesEXT",
     ];
     let mut device = features.to_vec();
     device.extend([
@@ -1043,6 +1057,14 @@ fn the_links_this_stage_admits_are_exactly_the_ones_the_bring_up_protocol_decode
             "VkPhysicalDeviceVulkan12Properties",
             "VkPhysicalDeviceVulkan13Properties",
             "VkPhysicalDeviceShaderIntegerDotProductProperties",
+            // Stage 5c.
+            "VkPhysicalDeviceTransformFeedbackPropertiesEXT",
+            "VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT",
+            "VkPhysicalDeviceVertexAttributeDivisorProperties",
+            "VkPhysicalDeviceLineRasterizationProperties",
+            "VkPhysicalDeviceCustomBorderColorPropertiesEXT",
+            "VkPhysicalDeviceRobustness2PropertiesKHR",
+            "VkPhysicalDeviceProvokingVertexPropertiesEXT",
         ])
     );
     assert_eq!(
@@ -1125,17 +1147,29 @@ fn the_advertised_extensions_are_only_the_served_and_the_emulated_ones() {
         }
         ext
     };
+    // Stage 5c: an admitted extension and a promoted one pass through; the
+    // swapchain (the guest's own) and one no stage serves do not.
     let host = [
         named(b"VK_KHR_swapchain"),
         named(b"VK_EXT_custom_border_color"),
         named(b"VK_KHR_timeline_semaphore"),
+        named(b"VK_EXT_mesh_shader"),
     ];
     let shown = super::policy::advertised_extensions(&host, super::policy::MAX_API_VERSION);
     let names: Vec<&[u8]> = shown
         .iter()
         .map(|e| super::policy::c_name(&e.extension_name))
         .collect();
-    assert_eq!(names, vec![b"VK_KHR_external_semaphore_fd".as_slice()]);
+    assert_eq!(
+        names,
+        vec![
+            b"VK_EXT_custom_border_color".as_slice(),
+            b"VK_KHR_timeline_semaphore".as_slice(),
+            b"VK_KHR_external_semaphore_fd".as_slice(),
+            b"VK_EXT_external_memory_dma_buf".as_slice(),
+            b"VK_KHR_external_memory_fd".as_slice(),
+        ]
+    );
 }
 
 #[test]
