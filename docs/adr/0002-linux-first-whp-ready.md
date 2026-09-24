@@ -478,3 +478,64 @@ work is not: the `init` cross-builds from Windows with
 `rustup target add x86_64-unknown-linux-musl` and
 `RUSTFLAGS="-Clinker=rust-lld -Clink-self-contained=yes"`, and the `cpio`/`gzip`
 packing is one WSL command. The `whp-backend` skill carries the exact recipe.
+
+## Amendment, 2026-09-24 — a host waker on WHP: the machine layer's last missing worker
+
+Phase 3 and phase 4 closed the kick half of the port by *not* porting it:
+with no ioeventfd, every queue notify runs on the vCPU thread that took the
+exit, and nothing registered at an absolute address means nothing to rebase.
+That was complete for work a *guest* starts. It was not complete for work the
+*host* finishes. `virtio_core::HostWaker` is how a device with asynchronous
+host work (a GPU fence retiring on a renderer thread) asks to be called back
+"from its ordinary worker context, exactly as if the guest had kicked it" —
+and on KVM that context is the ioeventfd worker, whose queue-0 eventfd a wake
+simply writes. The synchronous-kick attach paths had no worker, so they
+installed no waker, and every device on WHP ran on its no-waker fallback. For
+the Venus renderer that fallback signalled each queue-timeline fence before the
+GPU work it guards had run: 77 004 times in one GNOME desktop run (ADR-0004,
+the 2026-09-24 capacity amendment).
+
+**What the machine layer now provides.** `machine_x86::host_wake::HostWakeService`,
+portable, one per synchronous-kick bus (`VirtioMmioBus::attach_userspace*` and
+`VirtioPciBus::attach_userspace*`):
+
+- every device gets a waker before it moves into its transport, as the KVM
+  path's `DeferredWaker` is handed over; a wake before the thread starts is
+  kept;
+- a wake of slot *n* makes one machine-owned thread (`virtio-wake-mmio` /
+  `virtio-wake-pci`) call `transport.lock().queue_notify(0)` — the entry point
+  the KVM worker calls, under the same mutex a vCPU takes, so the device is
+  serialised against guest kicks as it is on KVM, and the interrupt it raises
+  goes through the same userspace IOAPIC / `UserspaceMsiSink` line a
+  vCPU-thread notify would use. Off-vCPU interrupt injection was already
+  proven by virtio-net's receive worker on this host;
+- wakes coalesce: a per-slot pending bit, and only the wake that sets it
+  touches the condvar, so a burst is one notify (two at most, if one lands
+  while the first is being served);
+- ADR-0005's obligations, as the ioeventfd workers meet them: the pause gate
+  before the transport lock and outside every device lock, with the pass held
+  across the notify; `reset()` stops and joins the thread, drops the old
+  boot's wakes and starts a fresh one (safe on a paused VM, because stopping
+  pairs the flag with `Quiesce::wake`); `shutdown()` joins and lets go of the
+  transports, idempotent, and also runs from `Drop`. A wake is a request for
+  service, not state, so a snapshot carries none (ADR-0006).
+
+**Neither backend's API changed.** The service is additive to both buses, the
+KVM constructors are untouched (`host_wake: None` there), and nothing in
+`vmm_core` knows it exists. The one KVM configuration that still has no
+worker, `ENTANGLED_QUEUE_NOTIFY=sync`, keeps its inert `DeferredWaker`, and
+that is now a *documented* state rather than a fallback anyone may lean on:
+`HostWaker`'s contract says a device must be correct when its waker never
+fires — whatever it holds is served at the guest's next kick, later but never
+wrongly. The Venus renderer no longer signals a ring fence because no waker
+was installed (ADR-0004).
+
+Evidence: `machine_x86::host_wake` unit tests and `tests/host_wake_bus.rs`
+(both transports, both hosts: foreign-thread wake → queue-0 notify on the
+service thread with the interrupt delivered through the userspace irqchip,
+coalescing, no notify while paused, a paused reset that joins, a shutdown that
+leaves the bus the transports' only owner), and on WHP itself
+`vmm-core --test whp_virtio_blk`'s second boot, whose disk serves *none* of its
+requests on the kicking vCPU — every kick becomes a wake, and the guest still
+reads its 8 MiB, interrupt-completed (66 kicks, 66 notifies from the host-wake
+thread, 64 interrupts).

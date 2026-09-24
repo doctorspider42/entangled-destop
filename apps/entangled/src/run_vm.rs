@@ -42,16 +42,53 @@ use virtio_core::VirtioDevice;
 use vmm_core::hv::{GuestClock, HostIrqChip, X86CpuState};
 use vmm_core::{Lifecycle, MachineConfig, RunOutcome, VmState};
 
-/// Where the Venus transport capture writes the guest's command stream, and
+/// Where the Venus transport capture writes the guest's command streams, and
 /// the switch that turns that renderer on at all (EPIC 20 phase 4, ADR-0004).
 ///
 /// Diagnostic, so it lives here rather than in a profile: what it attaches
-/// serves the Venus capset and a command ring and executes no Vulkan, so a
-/// guest reaches the ring and then waits for a reply that never comes. That is
-/// the point of the stage — the capture is how we learn what Mesa's driver
-/// really sends, which no amount of reading the reference can answer — but it
-/// is not a thing a profile should be able to ask for by accident.
+/// serves the Venus capset and command rings and executes no Vulkan, so a
+/// guest reaches its ring, sends its first command, and is told the ring is
+/// fatal (its driver aborts on "ring fatal error"). That is the point of the
+/// stage — the capture is how we learn what Mesa's driver really sends, which
+/// no amount of reading the reference can answer — but it is not a thing a
+/// profile should be able to ask for by accident.
+///
+/// The value is a path *prefix*: every ring the guest creates writes its own
+/// file, `<value>.ctx<N>.ring<M>.bin`, where `N` is the virtio-gpu context id
+/// (one per guest `VkInstance`) and `M` counts the rings this VM run has
+/// created, from 0, in creation order — the guest's ring handle is a pointer
+/// value and is logged beside the path instead. Each file holds the reply
+/// bookkeeping the capture consumed, then the first command it could not
+/// answer and the rest of that batch. A file from an earlier run with the same
+/// name is overwritten.
 const VENUS_CAPTURE_ENV: &str = "ENTANGLED_VENUS_CAPTURE";
+
+/// The switch for the Venus **executor** (EPIC 20 stage 5a.3, ADR-0004):
+/// `ENTANGLED_VENUS=vulkan` attaches the renderer that executes a guest's
+/// Vulkan bring-up on the host GPU and answers it. Diagnostic, and an
+/// environment variable, for the reason [`VENUS_CAPTURE_ENV`] is; the capture
+/// wins if both are set. The run fails before the guest boots if the host has
+/// no Vulkan loader or no device the executor would expose.
+const VENUS_ENV: &str = "ENTANGLED_VENUS";
+
+/// The Venus renderer's host-visible window: the profile's
+/// `[display] host_visible_mib`, else the renderer's default (ADR-0004, the
+/// capacity amendment).
+fn venus_host_visible_bytes(display: &control_api::DisplaySection) -> u64 {
+    display
+        .host_visible_mib
+        .map_or(virtio_gpu::VENUS_HOST_VISIBLE_BYTES, |mib| {
+            u64::from(mib) << 20
+        })
+}
+
+/// The capture file for the `seq`-th ring of a run, on context `ctx_id`: see
+/// [`VENUS_CAPTURE_ENV`].
+fn venus_capture_path(prefix: &std::path::Path, ctx_id: u32, seq: u64) -> PathBuf {
+    let mut name = prefix.as_os_str().to_owned();
+    name.push(format!(".ctx{ctx_id}.ring{seq}.bin"));
+    PathBuf::from(name)
+}
 
 /// Set by the SIGINT/SIGTERM (Linux) or console-control (Windows) handler; the
 /// run loop polls it (MVP-1204).
@@ -319,40 +356,95 @@ fn build_devices(
     // have meant a schema every profile, the manager and the installer's tests
     // would inherit, for something two stages from now deletes. The precedent
     // is `ENTANGLED_GPU_FENCES`, which is diagnostic in the same way.
-    if let Some(path) = std::env::var_os(VENUS_CAPTURE_ENV) {
-        let path = PathBuf::from(path);
-        let file = std::fs::File::create(&path)
-            .map_err(|e| format!("cannot write the Venus capture to {}: {e}", path.display()))?;
+    if let Some(prefix) = std::env::var_os(VENUS_CAPTURE_ENV) {
+        let prefix = PathBuf::from(prefix);
+        // The files are made per ring, long after this point; a directory that
+        // is not there is worth failing the run for now rather than refusing
+        // every ring later.
+        let dir = match prefix.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        if !dir.is_dir() {
+            return Err(format!(
+                "cannot write the Venus capture under {}: {} is not a directory",
+                prefix.display(),
+                dir.display()
+            ));
+        }
         tracing::warn!(
-            path = %path.display(),
-            "attaching the Venus TRANSPORT renderer: it advertises the Venus capset and              captures the guest's command stream, and executes no Vulkan — a guest will              reach a command ring and then block on its first reply"
+            prefix = %prefix.display(),
+            "attaching the Venus TRANSPORT renderer: it advertises the Venus capset and              captures each command ring to <prefix>.ctx<N>.ring<M>.bin, and executes no              Vulkan — a guest will reach a ring, send its first command, and be told the              ring is fatal"
         );
-        let mut renderer = virtio_gpu::VenusRenderer::new(virtio_gpu::WriteSink::new(file));
-        // Tell the guest to assume every Vulkan extension is served, rather
-        // than handing it an enumerated-but-empty list.
+        let mut next_ring = 0u64;
+        let sinks = move |ctx_id: u32,
+                          ring: u64|
+              -> std::io::Result<virtio_gpu::WriteSink<std::fs::File>> {
+            let seq = next_ring;
+            next_ring += 1;
+            let path = venus_capture_path(&prefix, ctx_id, seq);
+            let file = std::fs::File::create(&path).inspect_err(|error| {
+                tracing::error!(path = %path.display(), %error, "cannot create a Venus ring capture");
+            })?;
+            tracing::info!(
+                path = %path.display(),
+                ctx_id,
+                ring = format_args!("{ring:#x}"),
+                "capturing a Venus command ring"
+            );
+            Ok(virtio_gpu::WriteSink::new(file))
+        };
+        // The capset is `VenusCapset::new()`'s, unchanged: an enumerated
+        // extension mask of exactly the extensions whose structures the
+        // executor admits (stage 5b.1; virglrenderer advertises everything
+        // its protocol decodes, `vkr_renderer.c:40-48`). The
+        // all-zero "assume every extension" mask this stage once sent had no
+        // reference precedent (ADR-0004, correction of 2026-09-23).
         //
-        // `VenusCapset::new()` is honest — it says "we support no optional
-        // extension" — and honest is what a *renderer* should be. This one
-        // executes nothing, so honesty here is a lie of a different kind: it
-        // makes Mesa's venus driver decline before it has sent us a single
-        // byte, and the whole point of this stage is to find out what it
-        // sends. The permissive form is what virglrenderer effectively
-        // advertises too (`venus_hw.h`: with the sentinel clear "all the
-        // extensions are assumed to be supported by the renderer side
-        // protocol").
-        let mut capset = virtio_gpu::venus::capset::VenusCapset::new();
-        capset.extensions = virtio_gpu::venus::capset::ExtensionMask::GUEST_ASSUMES_EVERYTHING;
-        // `supports_multiple_timelines` stays as `VenusCapset::new()` left it
-        // — false — even though claiming it was the obvious next guess when a
-        // guest declined us. `virtio_gpu::fence` is one FIFO retiring in
-        // submission order, and Mesa's venus driver binds every `VkQueue` to a
-        // `ring_idx` at creation: a renderer that promises per-queue timelines
-        // and then retires everything in one order does not fail loudly, it
-        // returns the wrong fence to the wrong queue. Advertising a capability
-        // to coax a guest past a gate is how a capture run turns into a
-        // haunting later, and this one was never consulted anyway — the ICD
-        // that declined us had not been loaded at all.
-        renderer.set_capset(capset);
+        // `supports_multiple_timelines` is false for a capture: it runs no
+        // queue that could retire a fence on one
+        // (`SinkFactory::retires_ring_fences`; the executing renderer below
+        // says true, stage 5b.3).
+        let renderer = virtio_gpu::VenusRenderer::new(sinks)
+            .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
+        let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
+        gpu.set_refresh_hz(cfg.display.refresh_hz);
+        gpu.set_frame_stats(cfg.display.frame_stats.clone());
+        devices.push(Box::new(gpu));
+    } else if let Some(mode) = std::env::var_os(VENUS_ENV) {
+        // The Venus executor (EPIC 20 stage 5a.3): the renderer that answers,
+        // on the host GPU. Diagnostic for the same reason the capture is — an
+        // environment variable, not a profile key — and refused up front on a
+        // host with no device it would expose, rather than attached to answer
+        // a guest's first enumeration with nothing.
+        if mode != "vulkan" {
+            return Err(format!(
+                "{VENUS_ENV}={} is not a Venus renderer this build has; the one there is is \"vulkan\"",
+                mode.to_string_lossy()
+            ));
+        }
+        let host = virtio_gpu::host_vulkan::AshVulkan::load()
+            .map_err(|why| format!("{VENUS_ENV}=vulkan, but {why}"))?;
+        let shown = host
+            .usable_devices()
+            .map_err(|why| format!("{VENUS_ENV}=vulkan, but {why}"))?;
+        for device in &shown {
+            tracing::info!(
+                device = %device.name(),
+                importable_memory_types = format_args!("{:#x}", device.importable),
+                "a Venus guest will see this host Vulkan device"
+            );
+        }
+        tracing::warn!(
+            "attaching the Venus EXECUTING renderer (stage 5b.3): it answers the Vulkan 1.3 \
+             bring-up, device memory, buffers, images, pipelines, descriptors, render passes, \
+             dynamic rendering, command buffers, queue submission with fences and semaphores, \
+             the sync-file semaphore import a guest swapchain needs, and fences on every \
+             queue's timeline, on the host GPU"
+        );
+        let renderer =
+            virtio_gpu::VenusRenderer::new(virtio_gpu::ExecutorFactory::new(Arc::new(host)))
+                .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
         let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
         gpu.set_refresh_hz(cfg.display.refresh_hz);
         gpu.set_frame_stats(cfg.display.frame_stats.clone());
@@ -1584,6 +1676,14 @@ mod host_api {
         /// The clock is read last of the small state, as close as possible to
         /// the memory dump it will be restored alongside.
         fn save_machine(&self, cpus: &[X86CpuState], path: &Path) -> Result<String, String> {
+            // Before anything is read or written: a device holding host state
+            // the file cannot carry (a Venus context's host Vulkan objects,
+            // stage 5a.3) refuses the whole snapshot, by name, rather than
+            // letting it be written without that state.
+            let refusals = self.bus.snapshot_refusals();
+            if !refusals.is_empty() {
+                return Err(format!("cannot snapshot this VM: {}", refusals.join("; ")));
+            }
             // Read before the dump, while the numbers still describe the same
             // instant. Never fatal: this is an instrument, and a VM must not
             // fail to suspend because one could not be read.
@@ -2421,7 +2521,52 @@ fn extend_cmdline(configured: &str, clauses: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{direct_linux_cmdline, extend_cmdline};
+    use super::{direct_linux_cmdline, extend_cmdline, venus_host_visible_bytes};
+
+    /// `control_api` states the Venus window's default and bounds without the
+    /// device or machine crates; this is the place that sees all three. The
+    /// default is the renderer's, the largest window the profile allows is
+    /// the largest shared-memory BAR the machine places, and the key reaches
+    /// the renderer in bytes.
+    #[test]
+    fn the_host_visible_window_setting_agrees_with_the_renderer_and_the_machine() {
+        assert_eq!(
+            u64::from(control_api::DEFAULT_HOST_VISIBLE_MIB) << 20,
+            virtio_gpu::VENUS_HOST_VISIBLE_BYTES
+        );
+        assert_eq!(
+            u64::from(control_api::MAX_HOST_VISIBLE_MIB) << 20,
+            machine_x86::layout::MAX_SHM_BAR_BYTES
+        );
+        let mut display = control_api::DisplaySection::default();
+        assert_eq!(
+            venus_host_visible_bytes(&display),
+            virtio_gpu::VENUS_HOST_VISIBLE_BYTES
+        );
+        display.host_visible_mib = Some(256);
+        assert_eq!(venus_host_visible_bytes(&display), 256 << 20);
+    }
+
+    /// Every blob a Venus client maps is one hypervisor range, and the
+    /// window's range cap is `vmm_core`'s while the per-client shares are the
+    /// renderer's. A client at both of its shares must leave most of the
+    /// ranges to the rest of the desktop — the pattern every cap sized for a
+    /// desktop follows (ADR-0004, the capacity amendment).
+    #[test]
+    fn one_venus_client_at_its_shares_leaves_most_of_the_window_ranges() {
+        const ONE_CLIENT: usize = virtio_gpu::venus::renderer::MAX_RING_BLOBS_PER_CONTEXT
+            + virtio_gpu::venus::renderer::MAX_MEMORY_BLOBS_PER_CONTEXT;
+        const { assert!(ONE_CLIENT * 2 <= vmm_core::MAX_HOST_RANGES) };
+        // And the device's own bookkeeping never binds before the renderer's.
+        const { assert!(vmm_core::MAX_HOST_RANGES <= virtio_gpu::MAX_HOST_VISIBLE_MAPPINGS) };
+        const {
+            assert!(
+                virtio_gpu::venus::renderer::MAX_RING_BLOBS
+                    + virtio_gpu::venus::renderer::MAX_MEMORY_BLOBS
+                    <= virtio_gpu::MAX_BLOB_RESOURCES
+            )
+        };
+    }
 
     /// `control_api` bounds `memory_mib` but deliberately does not depend on
     /// the machine crate, so this is the place that sees both: the largest

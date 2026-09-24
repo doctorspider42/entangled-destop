@@ -748,6 +748,11 @@ impl TransportState {
 
     // --------------------------------------------------- suspend and restore
 
+    /// The device's [`crate::VirtioDevice::snapshot_refusal`] (ADR-0006).
+    pub fn snapshot_refusal(&self) -> Option<String> {
+        self.device.snapshot_refusal()
+    }
+
     /// Everything this slot is, for a snapshot (ADR-0006).
     ///
     /// Called with the VM paused, so nothing is mid-request and the queue

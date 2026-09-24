@@ -42,6 +42,25 @@
 //!   comes from a [`RingLayout`]; see "bounds" below.
 //! * [`Publication`] — the proof that pages are currently in front of a guest.
 //!   Holding one keeps the pages alive; dropping one takes them back down.
+//! * [`RingPages::write_bytes`] / [`RingPages::read_bytes`] — bounded byte
+//!   copies into and out of any host blob, which is how the executor's replies
+//!   reach a guest's reply window (stage 5a.3) without a `&mut [u8]` ever
+//!   being formed over memory the guest can see, and without a second
+//!   `unsafe` anywhere else in the family.
+//! * [`RingPages::for_memory`] and [`PageBudget`] — the same allocation, sized
+//!   and aligned for a host-visible `VkDeviceMemory` (stage 5b.1). The
+//!   executor imports these pages into the host driver with
+//!   `VK_EXT_external_memory_host` and a `HOST3D` blob of that memory wraps
+//!   **the same `Arc`**, so the guest's mapping and the GPU's view are one
+//!   set of bytes — the configuration ADR-0004 measured coherent on WHP. The
+//!   budget is charged when they are allocated and refunded only when the
+//!   last `Arc` goes, however many holders (the Vulkan memory object, the
+//!   blob, a publication) there were.
+//! * [`PrivatePages`] — the same allocation made for the host alone (the
+//!   scanout device's staging buffer, stage S2b): marked host-private when it
+//!   is allocated, refused by [`RingPages::publish`] and by every control-word
+//!   accessor, and the only pages with a plain bulk read,
+//!   [`PrivatePages::read_rows`]. See "Host-private pages" below.
 //!
 //! # The lifetime obligation, and how it is discharged
 //!
@@ -60,6 +79,16 @@
 //! `Arc` afterwards (a `Drop` impl runs before the value's fields are dropped),
 //! so the order is always *unmap, then free*, and it holds on an unwinding path
 //! too.
+//!
+//! The same argument covers device-memory pages (stage 5b.1), which have
+//! **three** kinds of holder instead of two: the executor's `VkDeviceMemory`
+//! (and the host driver's import of it, which `host_vulkan` keeps an `Arc`
+//! beside and releases only after `vkFreeMemory` has returned), the blob that
+//! names the memory, and the publication that maps the blob. Any of them may
+//! go first — the guest frees memory while its blob is still mapped, or
+//! destroys the blob while the memory is still bound to a buffer — and the
+//! pages are freed only when the last one has, so neither the partition nor
+//! the GPU can ever be left looking at memory the allocator has reused.
 //!
 //! What the type system cannot carry, and what a caller therefore owes:
 //!
@@ -106,6 +135,16 @@
 //! exactly. The reasoning is repeated here so that a later reader with a
 //! benchmark does not "optimise" it away:
 //!
+//! **`status` is never stored whole.** It is the one control word both sides
+//! write: the host sets and clears `IDLE`, `FATAL` and `ALIVE`, and the guest
+//! clears `ALIVE` with its own atomic AND when its watchdog arms. Every host
+//! write to it is therefore [`RingPages::set_status_bits`] or
+//! [`RingPages::clear_status_bits`] — `fetch_or`/`fetch_and` of the named bits,
+//! as the reference's `vkr_ring_set_status_bits` is — and the [`RingBacking`]
+//! trait offers no whole-word store for it at all. A store computed from a
+//! host-side picture of the word would resurrect a bit the guest had just
+//! cleared or erase one the monitor had just set.
+//!
 //! **All three control words are accessed [`SeqCst`].** The reference is weaker
 //! — release on `head`, acquire on `tail` — and we could be too, *except* that
 //! [`RingPump::enter_idle`] publishes `STATUS_IDLE` and then loads `tail`. A
@@ -134,12 +173,43 @@
 //! writer is undefined behaviour, while a racing relaxed atomic load is merely
 //! an unspecified *value*, which is exactly what the pump's shadow copy is
 //! designed to cope with.
+//!
+//! # Host-private pages
+//!
+//! The byte-at-a-time relaxed loads above are the price of a concurrent
+//! writer, and a 1080p frame is eight million of them (2.65 ms of a 4.1 ms
+//! scanout flush, ADR-0004 S2b). The scanout device's staging buffer has no
+//! such writer: the GPU copies the frame into it, the device waits for the
+//! copy's fence, and only then reads — and no guest ever maps it. So it gets
+//! a plain `memcpy`, and the reasons that is sound are carried by types and
+//! checks rather than by the caller's good intentions:
+//!
+//! * **Guest-visible pages never get the fast read.** It exists only on
+//!   [`PrivatePages`], whose one constructor allocates fresh pages; there is
+//!   no conversion from a [`RingPages`], so no ring, reply window or blob can
+//!   ever be read that way (compile-fail examples on [`PrivatePages`]).
+//! * **Private pages are never shown to a guest.** The host driver's import
+//!   needs the `Arc<RingPages>` ([`PrivatePages::import_pages`]), so the pages
+//!   are marked host-private at allocation, a mark that is never cleared, and
+//!   [`RingPages::publish`] — the only route to [`ShmBacking::map_host`] —
+//!   refuses them.
+//! * **No host thread writes them during a read.** Every CPU access this
+//!   module makes to host-private bytes — [`RingPages::write_bytes`],
+//!   [`RingPages::read_bytes`], [`RingBacking::read_buffer`] and the plain
+//!   read itself — holds one lock the pages own, and no `&AtomicU32` into them
+//!   is ever handed out (the control-word accessor refuses them).
+//! * **The GPU has finished.** The one condition no type can carry: the pages'
+//!   holder reads only after waiting for the device work that writes them, as
+//!   the scanout device does (`vkWaitForFences` returned `VK_SUCCESS`, and
+//!   work it gave up on is waited for before anything new is submitted). It is
+//!   the same obligation the host driver's `free_memory` already keeps for
+//!   every import.
 
 use std::alloc::{alloc_zeroed, dealloc, Layout, LayoutError};
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use thiserror::Error;
 use virtio_core::{ShmBacking, ShmMapError};
@@ -167,6 +237,118 @@ pub const MAX_RESOURCE_BYTES: u64 = 2 * super::ring::MAX_BUFFER_BYTES;
 /// those units. A host reporting something *smaller* would not change what the
 /// hypervisor demands, so the queried value is only ever rounded up.
 pub const MIN_PAGE_BYTES: usize = 4096;
+
+/// The largest alignment [`RingPages::for_memory`] will honour: a host
+/// driver's `minImportedHostPointerAlignment` past 2 MiB is one the executor
+/// does not trust with a guest's allocation (the RTX 2070 says 4 KiB).
+pub const MAX_MEMORY_ALIGNMENT: u64 = 2 << 20;
+
+/// A renderer-wide cap on bytes of host pages, shared by every allocation
+/// charged to it and refunded only when an allocation is actually freed.
+///
+/// A guest-sized allocation names host memory, so it is bounded twice: per
+/// allocation by the budget's whole limit, and across allocations by what is
+/// left of it. The refund happens in [`RingPages`]'s `Drop`, after the pages
+/// are back with the allocator — so pages kept alive by a blob or a mapping
+/// after their `VkDeviceMemory` was freed still count, and a guest cannot
+/// free-and-reallocate its way past the cap while it keeps the old pages
+/// mapped.
+///
+/// A budget may be a **share** of another ([`PageBudget::share`]): a charge
+/// then has to fit both, so one venus context is held to its share and every
+/// context together to the renderer-wide whole — the pattern the host-blob
+/// caps follow (`super::renderer::MAX_RING_BLOB_BYTES_PER_CONTEXT`).
+#[derive(Debug)]
+pub struct PageBudget {
+    limit: u64,
+    used: AtomicU64,
+    /// The budget this one is a share of, charged and refunded with it.
+    whole: Option<Arc<PageBudget>>,
+}
+
+impl PageBudget {
+    /// A budget of `limit` bytes, none of them used.
+    #[must_use]
+    pub fn new(limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            used: AtomicU64::new(0),
+            whole: None,
+        })
+    }
+
+    /// A share of `whole` of at most `limit` bytes: a charge to it must fit
+    /// under `limit` **and** in what is left of `whole`, and a refund goes
+    /// back to both.
+    #[must_use]
+    pub fn share(whole: &Arc<Self>, limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            limit: limit.min(whole.limit),
+            used: AtomicU64::new(0),
+            whole: Some(Arc::clone(whole)),
+        })
+    }
+
+    /// The cap.
+    #[must_use]
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// Bytes charged and not yet refunded.
+    #[must_use]
+    pub fn used(&self) -> u64 {
+        self.used.load(Ordering::Acquire)
+    }
+
+    /// Take `bytes` out of the budget — and out of the whole it is a share
+    /// of — or refuse without taking anything from either.
+    fn try_charge(&self, bytes: u64) -> bool {
+        let charged = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.limit)
+            })
+            .is_ok();
+        if !charged {
+            return false;
+        }
+        match &self.whole {
+            Some(whole) if !whole.try_charge(bytes) => {
+                self.refund_own(bytes);
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// Give `bytes` back, to the whole as well. Saturating: a refund can only
+    /// follow its charge.
+    fn refund(&self, bytes: u64) {
+        self.refund_own(bytes);
+        if let Some(whole) = &self.whole {
+            whole.refund(bytes);
+        }
+    }
+
+    /// `(used, limit)` of whichever level refuses `bytes` — the share, or
+    /// the whole behind it — for the refusal's message.
+    fn refuser(&self, bytes: u64) -> (u64, u64) {
+        let used = self.used();
+        match &self.whole {
+            Some(whole) if used.saturating_add(bytes) <= self.limit => whole.refuser(bytes),
+            _ => (used, self.limit),
+        }
+    }
+
+    fn refund_own(&self, bytes: u64) {
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+}
 
 /// Why a set of ring pages could not be allocated, or could not be used with a
 /// particular [`RingLayout`].
@@ -198,6 +380,11 @@ pub enum ShmemError {
 
     #[error("the host could not allocate {size:#x} bytes aligned to {align:#x}")]
     OutOfMemory { size: u64, align: u64 },
+
+    #[error(
+        "{size:#x} more bytes of host pages would pass the {limit:#x}-byte budget ({used:#x} already in use)"
+    )]
+    OverBudget { size: u64, used: u64, limit: u64 },
 
     #[error(
         "the {region} region ends at {end:#x}, past the {size:#x}-byte \
@@ -234,6 +421,12 @@ pub enum ShmemError {
         align = CONTROL_WORD_LEN
     )]
     MisalignedExtraWrite { offset: u64, at: u64 },
+
+    #[error(
+        "a {len:#x}-byte copy at offset {offset:#x} does not fit the {size:#x}-byte \
+         resource these pages are"
+    )]
+    BytesOutsideResource { offset: u64, len: u64, size: u64 },
 
     #[error(transparent)]
     Pump(#[from] PumpError),
@@ -376,13 +569,26 @@ pub struct RingPages {
     /// Set the first time an accessor is handed an offset that is not inside
     /// [`Self::declared`]. See [`Self::is_poisoned`].
     poisoned: AtomicBool,
+    /// The budget these pages were charged to and how much, refunded in
+    /// [`Drop`] once the pages are back with the allocator. `None` for ring
+    /// blobs, which the renderer budgets itself.
+    charge: Option<(Arc<PageBudget>, u64)>,
+    /// `Some` exactly for pages [`PrivatePages`] allocated, set at allocation
+    /// and never changed: the mark that makes [`publish`](Self::publish) and
+    /// the control-word accessor refuse them, and the lock every CPU access
+    /// to their bytes holds (module docs, "Host-private pages").
+    host_private: Option<Mutex<()>>,
 }
 
-// SAFETY: `RingPages` is a plain owned allocation plus two integers. Every
-// access to the bytes through a shared reference goes through `AtomicU32` or
-// `AtomicU8`, so concurrent use from several threads is data-race free by
-// construction; the pointer is set once at construction and never changed, and
-// the only `&mut self` method is `drop`, which Rust already makes exclusive.
+// SAFETY: `RingPages` is a plain owned allocation plus two integers, a flag,
+// an optional `Arc` of a budget made of atomics (itself `Send + Sync`) and an
+// optional `Mutex<()>` (`Send + Sync`). Every access to the bytes through a
+// shared reference goes through `AtomicU32` or `AtomicU8` — or, for
+// host-private pages only, is a plain read made while holding their lock,
+// which every other access to them holds too — so concurrent use from several
+// threads is data-race free by construction; the pointer is set once at
+// construction and never changed, and the only `&mut self` method is `drop`,
+// which Rust already makes exclusive.
 // The guest writes the same bytes from outside the Rust abstract machine, which
 // no `Send`/`Sync` reasoning can cover and which is the reason the pump copies
 // into a shadow before decoding.
@@ -417,41 +623,153 @@ impl RingPages {
                 max: MAX_RESOURCE_BYTES,
             });
         }
+        let (alloc, _) = Self::layout(size, page_size())?;
+        Self::allocate(alloc, size, None, false)
+    }
 
-        let page = page_size();
-        let page_u64 = page as u64;
+    /// Allocate the pages behind one host-visible `VkDeviceMemory` of `size`
+    /// bytes (stage 5b.1): zeroed, aligned to `align` (the host driver's
+    /// `minImportedHostPointerAlignment`, raised to at least a page), and
+    /// **rounded up to a whole multiple of it**, because an import must cover
+    /// whole aligned units. The rounded length is both
+    /// [`resource_len`](Self::resource_len) and
+    /// [`mapped_len`](Self::mapped_len): every byte of it is ours and every
+    /// byte of it is what the driver imports.
+    ///
+    /// The rounded length is charged to `budget` before anything is
+    /// allocated and refunded when the pages are freed.
+    ///
+    /// # Errors
+    ///
+    /// [`ShmemError::ZeroSized`]; [`ShmemError::UnusableLayout`] for an
+    /// alignment that is not a power of two or is past
+    /// [`MAX_MEMORY_ALIGNMENT`]; [`ShmemError::TooLarge`] for a size past the
+    /// budget's whole limit; [`ShmemError::OverBudget`] when what is left of
+    /// it is too little; [`ShmemError::OutOfMemory`] when the allocator
+    /// refuses (the charge is given back).
+    pub fn for_memory(size: u64, align: u64, budget: &Arc<PageBudget>) -> Result<Self, ShmemError> {
+        Self::memory_pages(size, align, budget, false)
+    }
+
+    /// [`for_memory`](Self::for_memory), marked host-private or not.
+    fn memory_pages(
+        size: u64,
+        align: u64,
+        budget: &Arc<PageBudget>,
+        host_private: bool,
+    ) -> Result<Self, ShmemError> {
+        if size == 0 {
+            return Err(ShmemError::ZeroSized);
+        }
+        let page = page_size() as u64;
+        if !align.is_power_of_two() || align > MAX_MEMORY_ALIGNMENT {
+            return Err(ShmemError::UnusableLayout { size, align });
+        }
+        let align = align.max(page);
+        let rounded = size
+            .checked_next_multiple_of(align)
+            .ok_or(ShmemError::UnusableLayout { size, align })?;
+        if rounded > budget.limit() {
+            return Err(ShmemError::TooLarge {
+                size: rounded,
+                max: budget.limit(),
+            });
+        }
+        let align_usize =
+            usize::try_from(align).map_err(|_| ShmemError::UnusableLayout { size, align })?;
+        let (alloc, rounded) = Self::layout(rounded, align_usize)?;
+        if !budget.try_charge(rounded) {
+            let (used, limit) = budget.refuser(rounded);
+            return Err(ShmemError::OverBudget {
+                size: rounded,
+                used,
+                limit,
+            });
+        }
+        let charge = (Arc::clone(budget), rounded);
+        match Self::allocate(alloc, rounded, Some(charge), host_private) {
+            Ok(pages) => Ok(pages),
+            // `allocate` hands the charge back only by dropping it unused, so
+            // refund here: nothing was allocated.
+            Err(error) => {
+                budget.refund(rounded);
+                Err(error)
+            }
+        }
+    }
+
+    /// `size` rounded up to `align` (a power of two, at least a page) as an
+    /// allocation layout, and the rounded length.
+    fn layout(size: u64, align: usize) -> Result<(Layout, u64), ShmemError> {
+        let align_u64 = align as u64;
         let bytes = size
-            .checked_next_multiple_of(page_u64)
+            .checked_next_multiple_of(align_u64)
             .and_then(|rounded| usize::try_from(rounded).ok())
             .ok_or(ShmemError::UnusableLayout {
                 size,
-                align: page_u64,
+                align: align_u64,
             })?;
-        let alloc = Layout::from_size_align(bytes, page).map_err(|_: LayoutError| {
+        let alloc = Layout::from_size_align(bytes, align).map_err(|_: LayoutError| {
             ShmemError::UnusableLayout {
                 size: bytes as u64,
-                align: page_u64,
+                align: align_u64,
             }
         })?;
+        Ok((alloc, bytes as u64))
+    }
 
-        // SAFETY: `alloc` has a non-zero size (`size >= 1` rounded up to a
-        // page), which is `alloc_zeroed`'s one precondition. The returned
+    /// Allocate `alloc` zeroed, declaring `declared` bytes of it.
+    fn allocate(
+        alloc: Layout,
+        declared: u64,
+        charge: Option<(Arc<PageBudget>, u64)>,
+        host_private: bool,
+    ) -> Result<Self, ShmemError> {
+        let page_u64 = alloc.align() as u64;
+        let bytes = alloc.size();
+
+        // SAFETY: `alloc` has a non-zero size (both constructors refuse a
+        // zero `size` and round it *up* to a page or more), which is
+        // `alloc_zeroed`'s one precondition. The returned
         // pointer is either null — handled immediately below — or the base of
         // `alloc.size()` readable, writable, zeroed bytes aligned to
         // `alloc.align()`, owned by this value until `Drop` hands the same
         // `Layout` back to `dealloc`.
         let raw = unsafe { alloc_zeroed(alloc) };
-        let ptr = NonNull::new(raw).ok_or(ShmemError::OutOfMemory {
-            size: bytes as u64,
-            align: page_u64,
-        })?;
+        let Some(ptr) = NonNull::new(raw) else {
+            // Dropping the unused charge refunds nothing (only `RingPages`'
+            // own `Drop` does); the caller that took it gives it back.
+            drop(charge);
+            return Err(ShmemError::OutOfMemory {
+                size: bytes as u64,
+                align: page_u64,
+            });
+        };
 
         Ok(Self {
             ptr,
             alloc,
-            declared: size,
+            declared,
             poisoned: AtomicBool::new(false),
+            charge,
+            host_private: host_private.then(|| Mutex::new(())),
         })
+    }
+
+    /// Whether these pages were made by [`PrivatePages`]: never shown to a
+    /// guest, never a ring. Fixed at allocation.
+    #[must_use]
+    pub fn is_host_private(&self) -> bool {
+        self.host_private.is_some()
+    }
+
+    /// For host-private pages, their lock, held by every CPU access to their
+    /// bytes; `None` for any other pages. A poisoned lock is taken anyway:
+    /// it guards no invariant of its own, only the exclusion.
+    fn private_access(&self) -> Option<MutexGuard<'_, ()>> {
+        self.host_private
+            .as_ref()
+            .map(|lock| lock.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// The resource size a [`RingLayout`] must have been validated against for
@@ -584,15 +902,53 @@ impl RingPages {
         window: Arc<dyn ShmBacking>,
         offset: u64,
     ) -> Result<Publication, ShmMapError> {
+        self.publish_len(window, offset, self.mapped_len())
+    }
+
+    /// [`publish`](Self::publish) of only the first `len` bytes: how a blob
+    /// of a `VkDeviceMemory` is shown, whose span in the window is the blob's
+    /// size (the allocation rounded to a 4 KiB page) while the pages behind
+    /// it may be rounded further, to the driver's import alignment. A prefix
+    /// of our own allocation is still every byte ours.
+    ///
+    /// # Errors
+    ///
+    /// As [`publish`](Self::publish), and [`ShmMapError::Refused`] for a
+    /// `len` that is zero, not a whole number of [`MIN_PAGE_BYTES`] pages, or
+    /// longer than [`mapped_len`](Self::mapped_len) — and for
+    /// [host-private](Self::is_host_private) pages, always: a plain read of
+    /// them is sound only because no guest can reach them, and this is the
+    /// only way one could.
+    pub fn publish_len(
+        self: &Arc<Self>,
+        window: Arc<dyn ShmBacking>,
+        offset: u64,
+        len: u64,
+    ) -> Result<Publication, ShmMapError> {
+        if self.is_host_private() {
+            tracing::error!(
+                offset,
+                len,
+                "host-private pages were offered to a guest; they are never shown to one"
+            );
+            return Err(ShmMapError::Refused(
+                "host-private pages are never shown to a guest".into(),
+            ));
+        }
         // Branch on the mode rather than discover it from an error, as
         // `ShmBacking::host_mapped`'s docs require.
         if !window.host_mapped() {
             return Err(ShmMapError::Unsupported);
         }
-        let len = self.mapped_len();
-        // SAFETY: `host_addr()` is the base of exactly `len` readable, writable
-        // bytes — `alloc_zeroed` gave us them and nothing hands them back until
-        // `Drop`. They stay mapped at that address until the matching
+        if len == 0 || len % MIN_PAGE_BYTES as u64 != 0 || len > self.mapped_len() {
+            return Err(ShmMapError::Refused(format!(
+                "a {len:#x}-byte span is not a whole number of pages inside these {:#x} bytes",
+                self.mapped_len()
+            )));
+        }
+        // SAFETY: `host_addr()` is the base of at least `len` readable, writable
+        // bytes (`len <= mapped_len()`, checked above) — `alloc_zeroed` gave
+        // us them and nothing hands them back until `Drop`. They stay mapped at that address until the matching
         // `unmap_host` returns because the `Publication` built below owns an
         // `Arc<Self>`: `Publication::drop` calls `unmap_host` and its fields —
         // including that `Arc`, and therefore the earliest possible `dealloc` —
@@ -733,6 +1089,117 @@ impl RingPages {
         Ok(())
     }
 
+    /// Copy `src` into these pages at resource offset `offset`: how a Venus
+    /// reply reaches the guest (EPIC 20 stage 5a.3).
+    ///
+    /// A reply window is a range of a host blob the guest named with
+    /// `vkSetReplyCommandStreamMESA`; the caller has already bounded the write
+    /// by that window, and this bounds it again by the resource, so no
+    /// combination of guest numbers can reach past the allocation.
+    ///
+    /// The bytes are stored one [`AtomicU8`] at a time, [`Relaxed`]: the guest
+    /// may be reading (or, if it is hostile, writing) the same bytes right
+    /// now, and a plain `&mut [u8]` over guest-visible memory would be a data
+    /// race. No ordering is needed here because none is promised here: the
+    /// ring worker stores `head` [`SeqCst`](Ordering::SeqCst) only after every
+    /// reply of the batch is written, and that store is what orders these
+    /// bytes before the guest's acquire load of `head` (spec §5).
+    ///
+    /// # Errors
+    ///
+    /// [`ShmemError::BytesOutsideResource`] when `offset + src.len()` passes
+    /// [`resource_len`](Self::resource_len); nothing is written then.
+    pub fn write_bytes(&self, offset: u64, src: &[u8]) -> Result<(), ShmemError> {
+        let base = self.byte_range(offset, src.len())?;
+        // Host-private pages: excluded from a plain read in progress.
+        let _access = self.private_access();
+        // SAFETY: `byte_range` established `base + src.len() <=
+        // self.declared <= self.alloc.size()`, so every byte touched below is
+        // inside our own live allocation and `add(base + i)` stays within one
+        // allocated object for every `i` in `0..src.len()`. `AtomicU8` needs no
+        // alignment beyond a byte. The stores are atomic because the guest may
+        // be touching these bytes concurrently; a racing relaxed atomic store
+        // is defined, a plain write through a slice would not be.
+        unsafe {
+            let base = self.ptr.as_ptr().add(base);
+            for (i, byte) in src.iter().enumerate() {
+                AtomicU8::from_ptr(base.add(i)).store(*byte, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy `dst.len()` bytes out of these pages at resource offset `offset`,
+    /// with the same bounds and the same relaxed atomic loads as
+    /// [`RingBacking::read_buffer`]. The values may be anything a guest wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`ShmemError::BytesOutsideResource`]; `dst` is left as it was.
+    pub fn read_bytes(&self, offset: u64, dst: &mut [u8]) -> Result<(), ShmemError> {
+        let base = self.byte_range(offset, dst.len())?;
+        let _access = self.private_access();
+        // SAFETY: as in `write_bytes`: `byte_range` keeps every byte inside
+        // the live allocation, and the loads are relaxed atomics because the
+        // guest may be storing to the same bytes.
+        unsafe {
+            let base = self.ptr.as_ptr().add(base);
+            for (i, slot) in dst.iter_mut().enumerate() {
+                *slot = AtomicU8::from_ptr(base.add(i)).load(Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    /// `offset` as a host index, once `offset + len` is proven inside the
+    /// declared resource.
+    fn byte_range(&self, offset: u64, len: usize) -> Result<usize, ShmemError> {
+        let len64 = len as u64;
+        offset
+            .checked_add(len64)
+            .filter(|end| *end <= self.declared)
+            .and_then(|_| usize::try_from(offset).ok())
+            .ok_or(ShmemError::BytesOutsideResource {
+                offset,
+                len: len64,
+                size: self.declared,
+            })
+    }
+
+    /// A test playing the guest: store a 32-bit word the way the guest's
+    /// driver stores `tail`, through the same accessor the host's own words
+    /// use. Refuses (returns `false`) rather than panicking on a bad offset.
+    #[cfg(test)]
+    pub(crate) fn guest_store_word(&self, offset: u64, value: u32) -> bool {
+        match self.word(offset, Writer::Guest) {
+            Some(word) => {
+                word.store(value, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A test playing the guest: clear `bits` of a 32-bit word with an atomic
+    /// AND, the way the guest's watchdog clears `ALIVE` in `status`.
+    #[cfg(test)]
+    pub(crate) fn guest_clear_word_bits(&self, offset: u64, bits: u32) -> bool {
+        match self.word(offset, Writer::Guest) {
+            Some(word) => {
+                word.fetch_and(!bits, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A test playing the guest: load a 32-bit word (`head`, `status`).
+    #[cfg(test)]
+    pub(crate) fn guest_load_word(&self, offset: u64) -> Option<u32> {
+        self.word(offset, Writer::Guest)
+            .map(|word| word.load(Ordering::SeqCst))
+    }
+
     /// One control word as an atomic, or `None` — loudly — if the offset is not
     /// inside these pages.
     ///
@@ -757,6 +1224,18 @@ impl RingPages {
             .is_some_and(|end| end <= self.declared);
         let aligned = offset % CONTROL_WORD_LEN == 0;
         let byte = usize::try_from(offset).ok();
+        if self.is_host_private() {
+            // A control word is an `&AtomicU32` that outlives any lock, which
+            // a plain read of these bytes could then race; and host-private
+            // pages are no ring, so no word of them is a control word.
+            self.poison();
+            tracing::error!(
+                writer = ?writer,
+                offset,
+                "a Venus ring control word was asked of host-private pages, which are no ring"
+            );
+            return None;
+        }
         let (true, true, Some(byte)) = (fits, aligned, byte) else {
             self.poison();
             tracing::error!(
@@ -799,6 +1278,7 @@ impl fmt::Debug for RingPages {
             .field("mapped_len", &self.mapped_len())
             .field("page_size", &self.alloc.align())
             .field("poisoned", &self.is_poisoned())
+            .field("host_private", &self.is_host_private())
             .finish()
     }
 }
@@ -813,6 +1293,38 @@ impl Drop for RingPages {
         // reaching this drop at all means every publication has already been
         // dropped and every `unmap_host` has already returned.
         unsafe { dealloc(self.ptr.as_ptr(), self.alloc) }
+        if let Some((budget, bytes)) = self.charge.take() {
+            budget.refund(bytes);
+        }
+    }
+}
+
+impl RingPages {
+    /// Atomically OR `bits` into a ring's `status` word, returning the value it
+    /// held before (or [`POISON_WORD`] if the word is not inside these pages).
+    ///
+    /// `status` is the one control word both sides write — the host sets and
+    /// clears `IDLE`, `FATAL` and `ALIVE`, the guest clears `ALIVE` with its own
+    /// `atomic_fetch_and` when its watchdog arms (`vn_common.c:229-243`) — so
+    /// every host write to it is a read-modify-write of named bits, never a
+    /// store of a whole value. [`SeqCst`](Ordering::SeqCst), like every other
+    /// control-word access here: the idle handshake is this write followed by a
+    /// load of `tail`, and only a full barrier orders those two.
+    ///
+    /// Callable from any thread: the ring worker and the context's monitor
+    /// both use it on the same word at once, which is exactly the case a
+    /// read-modify-write exists for.
+    pub fn set_status_bits(&self, status: &HostWord, bits: u32) -> u32 {
+        self.word(status.store_offset(), status.writer())
+            .map_or(POISON_WORD, |w| w.fetch_or(bits, Ordering::SeqCst))
+    }
+
+    /// Atomically clear `bits` in a ring's `status` word, returning the value
+    /// it held before. The counterpart of
+    /// [`set_status_bits`](Self::set_status_bits), with the same reasoning.
+    pub fn clear_status_bits(&self, status: &HostWord, bits: u32) -> u32 {
+        self.word(status.store_offset(), status.writer())
+            .map_or(POISON_WORD, |w| w.fetch_and(!bits, Ordering::SeqCst))
     }
 }
 
@@ -827,10 +1339,18 @@ impl RingBacking for RingPages {
             .map_or(POISON_WORD, |w| w.load(Ordering::SeqCst))
     }
 
-    fn store_host_word(&self, word: &HostWord, value: u32) {
-        if let Some(w) = self.word(word.store_offset(), word.writer()) {
+    fn store_head(&self, head: &HostWord, value: u32) {
+        if let Some(w) = self.word(head.store_offset(), head.writer()) {
             w.store(value, Ordering::SeqCst);
         }
+    }
+
+    fn set_status_bits(&self, status: &HostWord, bits: u32) {
+        let _previous = RingPages::set_status_bits(self, status, bits);
+    }
+
+    fn clear_status_bits(&self, status: &HostWord, bits: u32) {
+        let _previous = RingPages::clear_status_bits(self, status, bits);
     }
 
     fn read_buffer(&self, buffer: &Region, offset: u64, dst: &mut [u8]) {
@@ -864,6 +1384,7 @@ impl RingBacking for RingPages {
             return;
         };
 
+        let _access = self.private_access();
         // SAFETY: `start + dst.len() <= self.declared <= self.alloc.size()`, so
         // every byte touched below is inside our own live allocation, and
         // `base.add(i)` therefore stays within one allocated object for every
@@ -921,7 +1442,8 @@ impl Publication {
         self.offset
     }
 
-    /// How many bytes were published: always [`RingPages::mapped_len`].
+    /// How many bytes were published: [`RingPages::mapped_len`], or the
+    /// prefix [`RingPages::publish_len`] was asked for.
     #[must_use]
     pub fn len(&self) -> u64 {
         self.len
@@ -954,6 +1476,208 @@ impl Drop for Publication {
         // fields. `unmap_host` is infallible by design, so there is no path
         // where this returns with the mapping still up.
         self.window.unmap_host(self.offset);
+    }
+}
+
+/// Host pages no guest can ever see — the scanout device's staging buffer
+/// (stage S2b) — and the one plain bulk read in this module,
+/// [`read_rows`](Self::read_rows). See the module docs, "Host-private pages".
+///
+/// Built only by [`for_memory`](Self::for_memory), which allocates fresh
+/// pages and marks them host-private; the mark is never cleared. So:
+///
+/// Pages that may be guest-visible never become private — there is no
+/// conversion from a [`RingPages`], and the fields are not public:
+///
+/// ```compile_fail
+/// use virtio_gpu::venus::shmem::{PrivatePages, RingPages};
+/// let ring = RingPages::new(4096).unwrap();
+/// let _ = PrivatePages::from(ring);
+/// ```
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use virtio_gpu::venus::shmem::{PrivatePages, RingPages};
+/// let _ = PrivatePages { pages: Arc::new(RingPages::new(4096).unwrap()) };
+/// ```
+///
+/// The plain read is not offered on any other pages:
+///
+/// ```compile_fail
+/// use virtio_gpu::venus::shmem::RingPages;
+/// let ring = RingPages::new(4096).unwrap();
+/// let mut out = Vec::new();
+/// ring.read_rows(0, 16, 16, 1, &mut out).unwrap();
+/// ```
+///
+/// And private pages have no `publish` of their own; the pages
+/// [`import_pages`](Self::import_pages) lends the driver refuse one (a
+/// runtime refusal, in the only path to a guest mapping):
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use virtio_gpu::venus::shmem::{PageBudget, PrivatePages};
+/// fn show(window: Arc<dyn virtio_core::ShmBacking>) {
+///     let budget = PageBudget::new(1 << 20);
+///     let private = PrivatePages::for_memory(4096, 4096, &budget).unwrap();
+///     let _ = private.publish(window, 0);
+/// }
+/// ```
+///
+/// What does compile:
+///
+/// ```
+/// use virtio_gpu::venus::shmem::{PageBudget, PrivatePages};
+/// let budget = PageBudget::new(1 << 20);
+/// let private = PrivatePages::for_memory(4096, 4096, &budget).unwrap();
+/// private.import_pages().write_bytes(0, &[1, 2, 3, 4]).unwrap();
+/// let mut out = Vec::new();
+/// private.read_rows(0, 4, 4, 1, &mut out).unwrap();
+/// assert_eq!(out, [1, 2, 3, 4]);
+/// ```
+///
+/// Cloning shares the pages (and their lock); it makes no new ones.
+#[derive(Debug, Clone)]
+pub struct PrivatePages {
+    /// Always [`RingPages::is_host_private`].
+    pages: Arc<RingPages>,
+}
+
+impl PrivatePages {
+    /// Allocate host-private pages for one host-visible `VkDeviceMemory` of
+    /// `size` bytes: exactly [`RingPages::for_memory`] — zeroed, aligned,
+    /// rounded to the alignment and charged to `budget` until freed — and
+    /// marked host-private.
+    ///
+    /// # Errors
+    ///
+    /// As [`RingPages::for_memory`].
+    pub fn for_memory(size: u64, align: u64, budget: &Arc<PageBudget>) -> Result<Self, ShmemError> {
+        let pages = RingPages::memory_pages(size, align, budget, true)?;
+        Ok(Self {
+            pages: Arc::new(pages),
+        })
+    }
+
+    /// The pages, for the host driver to import
+    /// (`VK_EXT_external_memory_host`) and keep alive until `vkFreeMemory`
+    /// has returned. They are [host-private](RingPages::is_host_private):
+    /// [`RingPages::publish`] refuses them, no control word of them is ever
+    /// handed out, and every CPU access through them takes the lock
+    /// [`read_rows`](Self::read_rows) holds.
+    #[must_use]
+    pub fn import_pages(&self) -> &Arc<RingPages> {
+        &self.pages
+    }
+
+    /// [`RingPages::mapped_len`].
+    #[must_use]
+    pub fn mapped_len(&self) -> u64 {
+        self.pages.mapped_len()
+    }
+
+    /// Replace `out`'s contents with `rows` rows of `row_len` bytes, the
+    /// first at resource offset `offset` and each next one `stride` bytes on:
+    /// one plain copy of the whole span when `stride == row_len` (packed
+    /// rows), one per row otherwise.
+    ///
+    /// The bounds are those of [`RingPages::read_bytes`], on the last byte
+    /// the rows touch: `offset + stride × (rows − 1) + row_len` must be within
+    /// [`RingPages::resource_len`], computed without overflow.
+    ///
+    /// **The caller's one obligation**, the one no type can carry: no device
+    /// work that writes these pages is executing — the scanout device reads
+    /// only once the copy's fence has signalled. Guests and host threads are
+    /// excluded by construction (module docs, "Host-private pages").
+    ///
+    /// # Errors
+    ///
+    /// [`ShmemError::BytesOutsideResource`] for rows past the resource (or a
+    /// span that overflows), `out` then untouched;
+    /// [`ShmemError::OutOfMemory`] when `out` cannot grow to
+    /// `rows × row_len` bytes, `out` then empty.
+    pub fn read_rows(
+        &self,
+        offset: u64,
+        stride: u64,
+        row_len: usize,
+        rows: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), ShmemError> {
+        let pages = &*self.pages;
+        let row64 = row_len as u64;
+        let outside = |len: u64| ShmemError::BytesOutsideResource {
+            offset,
+            len,
+            size: pages.declared,
+        };
+        let total = row_len.checked_mul(rows).ok_or(outside(u64::MAX))?;
+        // The bytes from the first row's start to the last row's end.
+        let span = match rows.checked_sub(1) {
+            None => 0,
+            Some(_) if row_len == 0 => 0,
+            Some(last) => (last as u64)
+                .checked_mul(stride)
+                .and_then(|to_last| to_last.checked_add(row64))
+                .ok_or(outside(u64::MAX))?,
+        };
+        let span_len = usize::try_from(span).map_err(|_| outside(span))?;
+        let start = pages.byte_range(offset, span_len)?;
+        out.clear();
+        if total == 0 {
+            return Ok(());
+        }
+        out.try_reserve_exact(total)
+            .map_err(|_| ShmemError::OutOfMemory {
+                size: total as u64,
+                align: 1,
+            })?;
+
+        let access = pages.private_access();
+        debug_assert!(access.is_some(), "PrivatePages are always host-private");
+        // SAFETY: the slice is inside one live allocation: `byte_range`
+        // established `start + span_len <= declared <= alloc.size()`, and
+        // `self.pages` keeps the allocation alive for the borrow. Every byte
+        // is initialised (`alloc_zeroed`) and `u8` needs no alignment.
+        // Nothing mutates these bytes while the slice lives, for each writer
+        // there could be:
+        // * a guest: never. The pages were marked host-private at allocation
+        //   (`for_memory` is the only constructor, and the mark is never
+        //   cleared), and `publish_len` — the only path to `map_host`, the only
+        //   way host pages reach a guest — refuses them.
+        // * a host thread: every CPU access this module makes to host-private
+        //   bytes (`write_bytes`, `read_bytes`, `read_buffer`) holds the same
+        //   lock, which `access` holds until after the copy; `word` refuses
+        //   host-private pages, so no `&AtomicU32` into them exists to race
+        //   with. Mixing those atomic accesses with this plain read is sound
+        //   because the lock orders them. The only other route is the raw
+        //   pointer of `as_ptr`, whose use needs an `unsafe` block of its own;
+        //   the one outside this file hands it to the host driver, which is
+        //   the next case.
+        // * the GPU, through the driver's import: `read_rows`' documented
+        //   precondition, kept by its one caller — the scanout device reads
+        //   only after `vkWaitForFences` has returned `VK_SUCCESS` for the
+        //   copy, behind a `TRANSFER_WRITE → HOST_READ` barrier, and waits for
+        //   any copy it gave up on before submitting another.
+        let bytes = unsafe { std::slice::from_raw_parts(pages.ptr.as_ptr().add(start), span_len) };
+        if stride == row64 {
+            out.extend_from_slice(bytes);
+        } else {
+            for row in 0..rows {
+                let at = (row as u64)
+                    .checked_mul(stride)
+                    .and_then(|at| usize::try_from(at).ok());
+                let line = at.and_then(|at| bytes.get(at..at.checked_add(row_len)?));
+                let Some(line) = line else {
+                    // Unreachable: every row ends inside the span.
+                    out.clear();
+                    return Err(outside(span));
+                };
+                out.extend_from_slice(line);
+            }
+        }
+        drop(access);
+        Ok(())
     }
 }
 
@@ -1218,24 +1942,30 @@ mod tests {
             .accepts(&layout)
             .expect("the layout is this resource's");
 
-        // The host's two words: stored through the type-stated store path, read
-        // back both through the loader and out of the raw bytes, so a store to
-        // the wrong offset cannot hide behind a load from the same wrong one.
-        for (word, value) in [
-            (layout.head(), 0x1234_5678u32),
-            (layout.status(), 0x0000_0003),
-            (layout.head(), u32::MAX),
-            (layout.status(), 0),
-        ] {
-            pages.store_host_word(&word, value);
-            assert_eq!(pages.load_host_word(&word), value);
+        // `head`: stored through the type-stated store path, read back both
+        // through the loader and out of the raw bytes, so a store to the wrong
+        // offset cannot hide behind a load from the same wrong one.
+        let head = layout.head();
+        for value in [0x1234_5678u32, u32::MAX, 0] {
+            pages.store_head(&head, value);
+            assert_eq!(pages.load_host_word(&head), value);
             assert_eq!(
-                peek(&pages, word.offset(), 4),
+                peek(&pages, head.offset(), 4),
                 value.to_le_bytes(),
-                "the {:#x} word did not land where it was addressed",
-                word.offset()
+                "head did not land where it was addressed"
             );
         }
+
+        // `status`: never stored, only read-modify-written, bit by bit — and
+        // each write returns what the word held before it.
+        let status = layout.status();
+        assert_eq!(pages.set_status_bits(&status, 0x3), 0);
+        assert_eq!(pages.set_status_bits(&status, 0x4), 0x3);
+        assert_eq!(pages.clear_status_bits(&status, 0x1), 0x7);
+        assert_eq!(pages.load_host_word(&status), 0x6);
+        assert_eq!(peek(&pages, status.offset(), 4), 0x6u32.to_le_bytes());
+        assert_eq!(pages.clear_status_bits(&status, u32::MAX), 0x6);
+        assert_eq!(pages.load_host_word(&status), 0);
 
         // The guest's word: written the way the guest writes it, loaded the way
         // the host loads it. There is no `store_guest_word` and there cannot
@@ -1247,13 +1977,113 @@ mod tests {
         }
 
         // Three distinct words, not one aliased three ways.
-        pages.store_host_word(&layout.head(), 0xaaaa_aaaa);
-        pages.store_host_word(&layout.status(), 0xbbbb_bbbb);
+        pages.store_head(&layout.head(), 0xaaaa_aaaa);
+        pages.set_status_bits(&layout.status(), 0xbbbb_bbbb);
         guest_store(&pages, layout.tail().offset(), 0xcccc_cccc);
         assert_eq!(pages.load_host_word(&layout.head()), 0xaaaa_aaaa);
         assert_eq!(pages.load_guest_word(&layout.tail()), 0xcccc_cccc);
         assert_eq!(pages.load_host_word(&layout.status()), 0xbbbb_bbbb);
         assert!(!pages.is_poisoned());
+    }
+
+    /// Clear bits of a word the way the guest's watchdog does
+    /// (`vn_ring_unset_status_bits`): its own `atomic_fetch_and`.
+    fn guest_clear_bits(pages: &RingPages, offset: u64, bits: u32) {
+        let byte = usize::try_from(offset).expect("fixture offset fits a usize");
+        assert!(byte + 4 <= pages.mapped_len() as usize);
+        assert_eq!(offset % 4, 0);
+        // SAFETY: as `guest_store` — the assertions put the four bytes inside
+        // the live allocation on a 4-byte boundary, and `pages` outlives the
+        // borrow.
+        unsafe {
+            AtomicU32::from_ptr(pages.as_ptr().add(byte).cast::<u32>())
+                .fetch_and(!bits, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn the_guest_clearing_alive_and_the_host_toggling_idle_lose_no_bit() {
+        use crate::venus::pump::{STATUS_ALIVE, STATUS_FATAL, STATUS_IDLE};
+
+        let pages = RingPages::new(RESOURCE).expect("a page");
+        let status = layout().status();
+        let at = status.offset();
+        let read = |p: &RingPages| p.load_host_word(&status);
+
+        // Deterministic first, one interleaving at a time: the monitor asserts
+        // ALIVE, the ring worker publishes IDLE, the guest arms its watchdog,
+        // the worker wakes. A host that stored a whole word from its own
+        // picture would get one of these wrong.
+        pages.set_status_bits(&status, STATUS_ALIVE);
+        pages.set_status_bits(&status, STATUS_IDLE);
+        assert_eq!(read(&pages), STATUS_ALIVE | STATUS_IDLE);
+        guest_clear_bits(&pages, at, STATUS_ALIVE);
+        assert_eq!(read(&pages), STATUS_IDLE);
+        pages.clear_status_bits(&status, STATUS_IDLE);
+        assert_eq!(read(&pages), 0, "clearing IDLE must not bring ALIVE back");
+        pages.set_status_bits(&status, STATUS_FATAL);
+        pages.set_status_bits(&status, STATUS_ALIVE);
+        assert_eq!(read(&pages), STATUS_FATAL | STATUS_ALIVE);
+
+        // Then concurrently. The "host" toggles IDLE a great many times while
+        // the "guest" keeps clearing ALIVE and the "monitor" keeps setting it.
+        // FATAL was published before any of them started and must survive all
+        // of it, and the host's own bit must end where the host left it.
+        let pages = Arc::new(pages);
+        let rounds = 20_000;
+        std::thread::scope(|scope| {
+            let host = {
+                let pages = Arc::clone(&pages);
+                scope.spawn(move || {
+                    for _ in 0..rounds {
+                        pages.set_status_bits(&status, STATUS_IDLE);
+                        pages.clear_status_bits(&status, STATUS_IDLE);
+                    }
+                    pages.set_status_bits(&status, STATUS_IDLE);
+                })
+            };
+            let guest = {
+                let pages = Arc::clone(&pages);
+                scope.spawn(move || {
+                    for _ in 0..rounds {
+                        guest_clear_bits(&pages, at, STATUS_ALIVE);
+                        assert_ne!(
+                            pages.load_host_word(&status) & STATUS_FATAL,
+                            0,
+                            "FATAL was lost under the guest's clear"
+                        );
+                    }
+                })
+            };
+            let monitor = {
+                let pages = Arc::clone(&pages);
+                scope.spawn(move || {
+                    for _ in 0..rounds {
+                        let before = pages.set_status_bits(&status, STATUS_ALIVE);
+                        assert_ne!(before & STATUS_FATAL, 0, "FATAL was lost");
+                    }
+                })
+            };
+            host.join().expect("host thread");
+            guest.join().expect("guest thread");
+            monitor.join().expect("monitor thread");
+        });
+        let end = pages.load_host_word(&status);
+        assert_eq!(end & STATUS_FATAL, STATUS_FATAL, "FATAL survived");
+        assert_eq!(
+            end & STATUS_IDLE,
+            STATUS_IDLE,
+            "the host's last word stands"
+        );
+
+        // And with everyone stopped, one more of each lands exactly.
+        guest_clear_bits(&pages, at, STATUS_ALIVE);
+        assert_eq!(pages.load_host_word(&status) & STATUS_ALIVE, 0);
+        pages.set_status_bits(&status, STATUS_ALIVE);
+        assert_eq!(
+            pages.load_host_word(&status),
+            STATUS_FATAL | STATUS_IDLE | STATUS_ALIVE
+        );
     }
 
     #[test]
@@ -1593,7 +2423,12 @@ mod tests {
         assert_eq!(pages.load_host_word(&stray.head()), POISON_WORD);
         assert!(pages.is_poisoned());
         assert_eq!(pages.load_guest_word(&stray.tail()), POISON_WORD);
-        pages.store_host_word(&stray.status(), 0x1234);
+        pages.store_head(&stray.head(), 0x1234);
+        assert_eq!(pages.set_status_bits(&stray.status(), 0x1234), POISON_WORD);
+        assert_eq!(
+            pages.clear_status_bits(&stray.status(), 0x1234),
+            POISON_WORD
+        );
 
         // And the pump does refuse it, rather than adopting a ring whose words
         // are nowhere.
@@ -1695,13 +2530,158 @@ mod tests {
         assert_eq!(Arc::strong_count(published.pages()), 1);
         assert_eq!(published.pages().host_addr(), addr);
         let layout = layout();
-        published.pages().store_host_word(&layout.head(), 0x5eed);
+        published.pages().store_head(&layout.head(), 0x5eed);
         assert_eq!(published.pages().load_host_word(&layout.head()), 0x5eed);
 
         // Only dropping the publication unmaps — and the allocation outlives
         // that call, because `Drop::drop` runs before the `Arc` field does.
         drop(published);
         assert_eq!(window.events().last(), Some(&Event::Unmap { offset: 0 }));
+    }
+
+    // ------------------------------------------------ device-memory pages
+
+    #[test]
+    fn memory_pages_are_rounded_to_the_import_alignment_and_charged_until_freed() {
+        let budget = PageBudget::new(1 << 20);
+        let page = page_size() as u64;
+        // A 64 KiB import alignment: the size rounds to it, the base obeys it.
+        let pages =
+            Arc::new(RingPages::for_memory(0x1_0001, 0x1_0000, &budget).expect("fits the budget"));
+        assert_eq!(pages.resource_len(), 0x2_0000);
+        assert_eq!(pages.mapped_len(), 0x2_0000);
+        assert_eq!(pages.host_addr() % 0x1_0000, 0);
+        let addr = pages.host_addr();
+        assert_eq!(budget.used(), 0x2_0000);
+        // An alignment below a page is raised to one.
+        let small = RingPages::for_memory(1, 1, &budget).expect("a page");
+        assert_eq!(small.mapped_len(), page);
+        assert_eq!(budget.used(), 0x2_0000 + page);
+        drop(small);
+        assert_eq!(budget.used(), 0x2_0000);
+
+        // Every holder but the last may go; the charge stays until it does.
+        let blob = Arc::clone(&pages);
+        let window = Window::host_mapped();
+        let published = blob
+            .publish_len(Arc::clone(&window) as Arc<dyn ShmBacking>, 0, 0x1_1000)
+            .expect("a page-multiple prefix");
+        assert_eq!(published.len(), 0x1_1000);
+        drop(pages);
+        drop(blob);
+        assert_eq!(budget.used(), 0x2_0000, "the mapping still holds the pages");
+        drop(published);
+        assert_eq!(budget.used(), 0, "refunded once the last holder went");
+        assert_eq!(
+            window.events(),
+            vec![
+                Event::Map {
+                    offset: 0,
+                    addr,
+                    len: 0x1_1000
+                },
+                Event::Unmap { offset: 0 }
+            ]
+        );
+    }
+
+    /// A share is held to its own limit and to what is left of the whole,
+    /// and a refusal at either level charges neither.
+    #[test]
+    fn a_budget_share_is_bounded_by_itself_and_by_the_whole() {
+        let whole = PageBudget::new(0x6_0000);
+        let a = PageBudget::share(&whole, 0x4_0000);
+        let b = PageBudget::share(&whole, 0x4_0000);
+        let big = PageBudget::share(&whole, u64::MAX);
+        assert_eq!(
+            big.limit(),
+            0x6_0000,
+            "a share is never larger than its whole"
+        );
+
+        let a1 = RingPages::for_memory(0x3_0000, 4096, &a).expect("inside a's share");
+        // a's own share refuses, and says so with a's numbers.
+        assert_eq!(
+            RingPages::for_memory(0x2_0000, 4096, &a).map(|_| ()),
+            Err(ShmemError::OverBudget {
+                size: 0x2_0000,
+                used: 0x3_0000,
+                limit: 0x4_0000
+            })
+        );
+        // b's share has room, but the whole does not: the whole refuses.
+        assert_eq!(
+            RingPages::for_memory(0x4_0000, 4096, &b).map(|_| ()),
+            Err(ShmemError::OverBudget {
+                size: 0x4_0000,
+                used: 0x3_0000,
+                limit: 0x6_0000
+            })
+        );
+        assert_eq!((a.used(), b.used(), whole.used()), (0x3_0000, 0, 0x3_0000));
+        let b1 = RingPages::for_memory(0x3_0000, 4096, &b).expect("exactly the rest");
+        assert_eq!(whole.used(), 0x6_0000);
+
+        // A refund goes back to both levels.
+        drop(a1);
+        assert_eq!((a.used(), whole.used()), (0, 0x3_0000));
+        drop(b1);
+        assert_eq!((b.used(), whole.used()), (0, 0));
+    }
+
+    #[test]
+    fn memory_pages_past_the_budget_or_badly_aligned_are_refused_and_charge_nothing() {
+        let budget = PageBudget::new(0x4_0000);
+        let keep = RingPages::for_memory(0x3_0000, 4096, &budget).expect("fits");
+        assert_eq!(
+            RingPages::for_memory(0x2_0000, 4096, &budget).map(|_| ()),
+            Err(ShmemError::OverBudget {
+                size: 0x2_0000,
+                used: 0x3_0000,
+                limit: 0x4_0000
+            })
+        );
+        assert_eq!(budget.used(), 0x3_0000, "a refusal charges nothing");
+        assert_eq!(
+            RingPages::for_memory(0x4_0001, 4096, &budget).map(|_| ()),
+            Err(ShmemError::TooLarge {
+                size: 0x4_1000,
+                max: 0x4_0000
+            })
+        );
+        assert_eq!(
+            RingPages::for_memory(0, 4096, &budget).map(|_| ()),
+            Err(ShmemError::ZeroSized)
+        );
+        for align in [3, 0x3000, MAX_MEMORY_ALIGNMENT * 2] {
+            assert!(matches!(
+                RingPages::for_memory(4096, align, &budget),
+                Err(ShmemError::UnusableLayout { .. })
+            ));
+        }
+        assert!(matches!(
+            RingPages::for_memory(u64::MAX, 4096, &budget),
+            Err(ShmemError::UnusableLayout { .. })
+        ));
+        drop(keep);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_prefix_publication_is_whole_pages_inside_the_allocation() {
+        let budget = PageBudget::new(1 << 20);
+        let pages = Arc::new(RingPages::for_memory(0x2000, 4096, &budget).expect("fits"));
+        let window = Window::host_mapped();
+        for len in [0, 0x800, 0x2001, 0x3000] {
+            assert!(
+                matches!(
+                    pages.publish_len(Arc::clone(&window) as Arc<dyn ShmBacking>, 0, len),
+                    Err(ShmMapError::Refused(_))
+                ),
+                "{len:#x}"
+            );
+        }
+        assert!(window.events().is_empty(), "nothing refused was mapped");
     }
 
     // ------------------------------------------------------------ end to end
@@ -1810,5 +2790,205 @@ mod tests {
             !rendered.contains(&format!("{:x}", pages.host_addr())),
             "the host address appeared in a Debug rendering: {rendered}"
         );
+    }
+
+    // ------------------------------------------------------ host-private pages
+
+    /// Host-private pages of `size` bytes, filled with a pattern through the
+    /// import's (locked, atomic) write path, as the fake GPU fills them.
+    fn private_pattern(size: u64, budget: &Arc<PageBudget>) -> (PrivatePages, Vec<u8>) {
+        let pages = PrivatePages::for_memory(size, 4096, budget).expect("fits the budget");
+        let len = usize::try_from(pages.mapped_len()).expect("fits");
+        let pattern: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+        pages
+            .import_pages()
+            .write_bytes(0, &pattern)
+            .expect("inside");
+        (pages, pattern)
+    }
+
+    #[test]
+    fn private_rows_read_back_exactly_packed_in_one_block_and_strided_row_by_row() {
+        let budget = PageBudget::new(1 << 20);
+        let (pages, pattern) = private_pattern(0x2000, &budget);
+        let mut out = vec![0xee; 3];
+
+        // Packed: one block, the same bytes the atomic path reads.
+        pages.read_rows(0x10, 64, 64, 8, &mut out).expect("inside");
+        assert_eq!(out, pattern[0x10..0x10 + 512]);
+        let mut atomic = vec![0u8; 512];
+        pages
+            .import_pages()
+            .read_bytes(0x10, &mut atomic)
+            .expect("inside");
+        assert_eq!(out, atomic);
+
+        // Strided: each row from its own start, packed into `out`.
+        pages.read_rows(0x10, 100, 64, 8, &mut out).expect("inside");
+        let want: Vec<u8> = (0..8)
+            .flat_map(|r| pattern[0x10 + r * 100..0x10 + r * 100 + 64].to_vec())
+            .collect();
+        assert_eq!(out, want);
+
+        // One row: the stride is never used, however large.
+        pages
+            .read_rows(4, u64::MAX, 9, 1, &mut out)
+            .expect("inside");
+        assert_eq!(out, pattern[4..13]);
+
+        // Nothing asked, nothing read: `out` is emptied.
+        pages.read_rows(0, 64, 64, 0, &mut out).expect("no rows");
+        assert!(out.is_empty());
+        out.push(1);
+        pages.read_rows(0, 64, 0, 5, &mut out).expect("empty rows");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn private_rows_past_the_resource_are_refused_and_leave_out_untouched() {
+        let budget = PageBudget::new(1 << 20);
+        let (pages, pattern) = private_pattern(0x2000, &budget);
+        let size = pages.import_pages().resource_len();
+        assert_eq!(size, 0x2000);
+        let sentinel = vec![0xee; 7];
+        let mut out = sentinel.clone();
+
+        // The last byte the rows touch is the last byte of the resource: in.
+        let (stride, row, rows) = (256u64, 200usize, 4usize);
+        let last_end = stride * (rows as u64 - 1) + row as u64;
+        let exact = size - last_end;
+        pages
+            .read_rows(exact, stride, row, rows, &mut out)
+            .expect("ends exactly at the resource's end");
+        let at = usize::try_from(exact).expect("fits");
+        assert_eq!(out[..row], pattern[at..at + row]);
+
+        // One byte further, a huge offset, an overflowing span or total: out.
+        let refusals: [(u64, u64, usize, usize); 5] = [
+            (exact + 1, stride, row, rows),
+            (u64::MAX, 4, 4, 1),
+            (0, u64::MAX, 4, 2),
+            (0, 1 << 62, 4, 5),
+            (0, 4, usize::MAX, 2),
+        ];
+        for (offset, stride, row, rows) in refusals {
+            let mut out = sentinel.clone();
+            let refused = pages.read_rows(offset, stride, row, rows, &mut out);
+            assert!(
+                matches!(refused, Err(ShmemError::BytesOutsideResource { .. })),
+                "{offset:#x} {stride:#x} {row} {rows}: {refused:?}"
+            );
+            assert_eq!(out, sentinel, "a refused read leaves `out` as it was");
+        }
+    }
+
+    #[test]
+    fn private_pages_are_never_published_and_never_a_ring() {
+        let budget = PageBudget::new(1 << 20);
+        let pages = PrivatePages::for_memory(RESOURCE, 4096, &budget).expect("fits");
+        let lent = pages.import_pages();
+        assert!(lent.is_host_private());
+        assert!(!RingPages::for_memory(RESOURCE, 4096, &budget)
+            .expect("fits")
+            .is_host_private());
+        assert!(!RingPages::new(RESOURCE).expect("a page").is_host_private());
+        assert!(format!("{pages:?}").contains("host_private: true"));
+
+        // The only path to a guest mapping refuses them, whole or in part,
+        // and the window never hears of it.
+        let window = Window::host_mapped();
+        for refused in [
+            lent.publish(Arc::clone(&window) as Arc<dyn ShmBacking>, 0),
+            lent.publish_len(Arc::clone(&window) as Arc<dyn ShmBacking>, 0, 0x1000),
+        ] {
+            assert!(
+                matches!(refused, Err(ShmMapError::Refused(_))),
+                "{refused:?}"
+            );
+        }
+        assert!(window.events().is_empty());
+
+        // No control word of them is ever handed out: no ring over them, no
+        // extra-region store, no guest-played word.
+        assert!(!lent.is_poisoned());
+        assert!(lent.adopt(layout()).is_err());
+        assert!(lent.is_poisoned(), "asking is a host bug, and says so");
+        assert!(lent.store_extra(layout().extra(), 0, 0x1234_5678).is_err());
+        assert!(!lent.guest_store_word(0, 1));
+        assert_eq!(lent.guest_load_word(0), None);
+        // The bytes themselves are untouched by all of it.
+        let mut out = Vec::new();
+        pages.read_rows(0, 16, 16, 1, &mut out).expect("inside");
+        assert_eq!(out, [0; 16]);
+    }
+
+    #[test]
+    fn private_pages_are_charged_like_memory_pages_until_the_last_holder_goes() {
+        let budget = PageBudget::new(1 << 20);
+        let pages = PrivatePages::for_memory(0x1_0001, 0x1_0000, &budget).expect("fits");
+        assert_eq!(pages.mapped_len(), 0x2_0000);
+        assert_eq!(pages.import_pages().host_addr() % 0x1_0000, 0);
+        assert_eq!(budget.used(), 0x2_0000);
+        // The driver's import holds the pages past their `PrivatePages`.
+        let import = Arc::clone(pages.import_pages());
+        let copy = pages.clone();
+        drop(pages);
+        drop(copy);
+        assert_eq!(budget.used(), 0x2_0000);
+        drop(import);
+        assert_eq!(budget.used(), 0);
+        assert!(matches!(
+            PrivatePages::for_memory(2 << 20, 4096, &budget),
+            Err(ShmemError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            PrivatePages::for_memory(0, 4096, &budget),
+            Err(ShmemError::ZeroSized)
+        ));
+    }
+
+    #[test]
+    fn a_host_thread_writing_private_pages_never_tears_a_plain_read() {
+        // Every CPU access to host-private bytes takes one lock, so a whole
+        // write and a whole read exclude each other: a read sees one fill or
+        // the other, never a mix.
+        use std::sync::atomic::AtomicUsize;
+        let budget = PageBudget::new(1 << 20);
+        let len = 0x2000usize;
+        let pages = PrivatePages::for_memory(len as u64, 4096, &budget).expect("fits");
+        let lent = Arc::clone(pages.import_pages());
+        let stop = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(AtomicUsize::new(0));
+        let writer = {
+            let (stop, written) = (Arc::clone(&stop), Arc::clone(&written));
+            std::thread::spawn(move || {
+                let fills = [vec![0xaa; len], vec![0x55; len]];
+                while !stop.load(Ordering::Relaxed) {
+                    let n = written.load(Ordering::Relaxed);
+                    lent.write_bytes(0, &fills[n % 2]).expect("inside");
+                    written.store(n + 1, Ordering::Relaxed);
+                    // An unfair lock would otherwise let this loop starve
+                    // the reader.
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let mut out = Vec::new();
+        let mut reads = 0usize;
+        // Until both sides have done enough to have raced.
+        while reads < 50 || written.load(Ordering::Relaxed) < 50 {
+            pages
+                .read_rows(0, 1024, 1024, len / 1024, &mut out)
+                .expect("inside");
+            let first = out[0];
+            assert!(
+                out.iter().all(|b| *b == first),
+                "a read saw a write half done"
+            );
+            reads += 1;
+            std::thread::yield_now();
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("the writer");
     }
 }

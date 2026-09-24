@@ -343,13 +343,17 @@ pub struct VenusCapset {
     /// Each `VkQueue` gets its own virtio-gpu fence timeline, named by the
     /// header's `ring_idx` (`ring_idx == 0` is reserved for CPU fences).
     ///
-    /// **False for us**, and this one is a device capability rather than a
-    /// renderer capability: [`FenceQueue`](crate::FenceQueue) retires fences
-    /// strictly in submission order on one timeline. Advertising per-queue
-    /// timelines over a single FIFO would let a guest wait on a later queue's
-    /// fence that cannot retire until an unrelated earlier queue's does.
-    /// Flipping this to `true` means giving the fence table one FIFO per
-    /// `ring_idx` first.
+    /// It takes two things, and both exist since EPIC 20 stage 5b.3: a device
+    /// whose fence table keeps one FIFO per `(context, ring_idx)`
+    /// ([`FenceQueue`](crate::FenceQueue) and
+    /// [`FenceTimeline`](crate::FenceTimeline)), so a later queue's fence
+    /// never waits behind an unrelated earlier queue's; and a renderer that
+    /// retires a fence on a queue's timeline when that queue's work is done.
+    /// [`Self::new`] says **false**, because a renderer that executes nothing
+    /// (a capture) has no queue to retire one on; the Venus renderer sets it
+    /// from its sink factory (`SinkFactory::retires_ring_fences`), which is
+    /// **true** for the executor. Mesa only asserts the bit and binds every
+    /// queue to a timeline regardless.
     ///
     /// Note again that this `ring_idx` is *not* the Venus command ring of
     /// [`super::ring`]; see the module docs.
@@ -384,9 +388,23 @@ impl VenusCapset {
     ///
     /// The protocol versions are fixed by the ICD we have to satisfy; the
     /// three capability flags are this VMM's honest answers (see each field).
-    /// The extension mask is enumerated and empty: a renderer that really can
-    /// execute Vulkan replaces it with its host driver's list, and until one
-    /// does, promising nothing optional is the answer that cannot lie.
+    /// The extension mask is enumerated — sentinel set — and holds exactly the
+    /// extensions whose chained structures the executor **admits**
+    /// ([`admitted_extension_mask`](super::executor::policy::admitted_extension_mask)):
+    /// the two venus protocol extensions and every extension promoted into
+    /// core 1.1–1.3 that brought a structure with it, derived from the same
+    /// rule the executor judges each chain by.
+    ///
+    /// This is narrower than virglrenderer, which advertises everything its
+    /// protocol decodes (`vkr_renderer.c:40-48`) because it hands every
+    /// decoded structure to the driver. The mask gates only which structures
+    /// the guest's *encoder* may send (`vn_cs_renderer_protocol_has_extension`),
+    /// dropping the rest silently — so a bit here obliges the executor to
+    /// accept that extension's structures (a decoded one it does not admit is
+    /// fatal), and a missing bit drops even a core structure the guest gates on
+    /// its original extension (`VkPhysicalDeviceSynchronization2Features` on
+    /// bit 315). Which extensions a device *offers* is the executor's
+    /// `vkEnumerateDeviceExtensionProperties` answer, a separate question.
     pub fn new() -> Self {
         Self {
             wire_format_version: Self::WIRE_FORMAT_VERSION,
@@ -395,7 +413,7 @@ impl VenusCapset {
                 Self::VK_EXT_COMMAND_SERIALIZATION_SPEC_VERSION,
             vk_mesa_venus_protocol_spec_version: Self::VK_MESA_VENUS_PROTOCOL_SPEC_VERSION,
             supports_blob_id_0: true,
-            extensions: ExtensionMask::ENUMERATED,
+            extensions: super::executor::policy::admitted_extension_mask(),
             allow_vk_wait_syncs: true,
             supports_multiple_timelines: false,
             use_guest_vram: false,
@@ -633,7 +651,11 @@ mod tests {
     fn the_extension_mask_occupies_words_five_to_thirty_six() {
         // One bit in the first mask word and one in the last, so both ends of
         // the array are pinned.
+        // From an empty enumerated mask: the default one carries the
+        // decodable transport extensions (word 12), which is not what this
+        // test is about.
         let mut capset = VenusCapset::new();
+        capset.extensions = ExtensionMask::ENUMERATED;
         capset.enable_extension(1).expect("extension 1");
         capset.enable_extension(MAX_EXTENSION_NUMBER).expect("1023");
 
@@ -867,9 +889,21 @@ mod tests {
         // A blocking wait blocks virglrenderer's render-server process, not a
         // queue-serving thread of this device (ADR-0004).
         assert_eq!(words[word::ALLOW_VK_WAIT_SYNCS], 1);
-        // One fence timeline, because FenceQueue retires strictly in
-        // submission order. See the field docs before flipping this.
+        // No queue timelines by default: a renderer that executes nothing has
+        // no queue to retire a fence on. The executing one turns this on
+        // (`VenusRenderer::new`, from its factory); see the field docs.
         assert_eq!(words[word::SUPPORTS_MULTIPLE_TIMELINES], 0);
+        // Exactly what the executor admits, sentinel set — never the all-zero
+        // "assume everything" mask, and no longer the whole decodable table.
+        assert_eq!(
+            words[word::EXTENSION_MASK1..word::EXTENSION_MASK1 + EXTENSION_MASK_WORDS],
+            *super::super::executor::policy::admitted_extension_mask().words()
+        );
+        assert!(capset.extensions.is_enumerated());
+        assert_ne!(
+            capset.extensions.words(),
+            &super::super::protocol::info::DECODABLE_EXTENSION_MASK
+        );
     }
 
     #[test]

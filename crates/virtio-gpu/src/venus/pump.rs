@@ -16,9 +16,14 @@
 //! # The protocol in one paragraph
 //!
 //! Three lock-free 32-bit atomics live in the shared resource beside the
-//! command buffer. **The host stores `head` and `status`; the guest stores
-//! `tail`** — [`RingLayout`] already encodes that in the type system, and so
-//! does [`RingBacking`] below. There is no length prefix anywhere: the amount
+//! command buffer. **The host stores `head`; the guest stores `tail`; and
+//! `status` is shared** — the host sets and clears `IDLE`, `FATAL` and `ALIVE`
+//! in it, and the guest clears `ALIVE` itself when its watchdog arms
+//! (`vn_common.c:229-243`). [`RingLayout`] encodes the first two in the type
+//! system, and [`RingBacking`] below adds the third: the only operations it
+//! offers on `status` are atomic read-modify-writes of named bits, because a
+//! plain store of the whole word would race with the guest's `fetch_and` and
+//! silently undo it. There is no length prefix anywhere: the amount
 //! of work waiting is `tail - cur` in **wrapping `u32` arithmetic**, where
 //! `cur` is how far the host has consumed. Both counters are free-running byte
 //! counts, not indices — a byte's position in the buffer is `offset & (size -
@@ -102,34 +107,21 @@
 //!   lives here, where the waiting happens.
 //! * a **sink that makes no progress**, which must not become a spin. See
 //!   [`Pass::Stalled`] and [`Pass::Deadlocked`].
+//! * a **sink that cannot answer** what it was given. It says so with
+//!   [`Batch::fatal_after`]: the pump advances `head` over exactly the prefix
+//!   the sink did handle, publishes `FATAL`, and stops. `head` never moves past
+//!   a command whose reply was not written, because the guest reads a moved
+//!   `head` as "your reply is ready" (`vn_ring.c:147-206`).
 //!
 //! # What is deliberately not here
 //!
 //! The thread, the backoff, the condition variable, the `virtio_core::Quiesce`
-//! gate and the `save`/`load` pair (ADR-0005, ADR-0006). A driver built on this
-//! needs to persist exactly two things across a snapshot — [`RingPump::cursor`]
-//! and [`RingPump::status`] — plus the layout it was built from; the shadow is
-//! scratch and is refilled from the ring on the next pass.
-//!
-//! The reference's loop, for whoever writes that thread:
-//!
-//! ```text
-//! loop {
-//!     if now >= last_progress + pump.idle_timeout() {
-//!         match pump.enter_idle(&backing) {          // publishes IDLE, then
-//!             Idle::Park => { block_until_notified(); // RE-READS tail
-//!                             pump.leave_idle(&backing);
-//!                             last_progress = now; }
-//!             Idle::WorkArrived => {}                // IDLE already taken down
-//!         }
-//!     }
-//!     match pump.pump(&backing, &mut sink)? {
-//!         Pass::Progress { .. } => last_progress = now,
-//!         Pass::Idle | Pass::Stalled { .. } => relax(),
-//!         Pass::Deadlocked { .. } => break,
-//!     }
-//! }
-//! ```
+//! gate and the `save`/`load` pair (ADR-0005, ADR-0006). The first four are
+//! [`super::service`], which runs the reference's loop over this type. A driver
+//! built on this needs to persist exactly two things across a snapshot —
+//! [`RingPump::cursor`] and [`RingPump::status`] — plus the layout it was
+//! built from; the shadow is scratch and is refilled from the ring on the next
+//! pass.
 //!
 //! The order inside `enter_idle` is the part that is easy to get wrong and
 //! impossible to debug: publish IDLE *first*, then re-read `tail`. Publishing
@@ -155,9 +147,13 @@ pub const STATUS_FATAL: u32 = 0x0000_0002;
 ///
 /// Defined here for completeness and never set by this module: in the
 /// reference it is `vkr_context`'s monitor that sets it, one level above the
-/// ring (`vkr_context.c`, `vkr_ring_set_status_bits(ring, ALIVE)`), because the
-/// question it answers is "is the ring thread still running", which a ring
-/// cannot answer about itself.
+/// ring (`vkr_context.c:507-545`, `vkr_ring_set_status_bits(ring, ALIVE)`),
+/// and here it is [`super::service::RingMonitor`]. It has to be a separate
+/// thread: the question it answers is "is the host still there", and a ring
+/// worker busy inside one long command cannot answer that about itself.
+///
+/// The guest clears this bit with its own atomic AND, which is why nothing in
+/// this crate ever stores the status word whole.
 pub const STATUS_ALIVE: u32 = 0x0000_0004;
 
 /// The longest the guest may ask the host to keep polling before parking.
@@ -200,14 +196,15 @@ pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 ///   mapping down while a pump is live is the owner's bug to avoid, which is
 ///   why these methods cannot fail: a backing that might vanish is not a
 ///   backing, it is a lifetime problem to solve one level up.
-/// * **Sequentially consistent** loads and stores of the control words. The
-///   reference is weaker — release on `head`, acquire on `tail`, `seq_cst`
-///   read-modify-write on `status` — and we could be too, except that the idle
-///   handshake in [`RingPump::enter_idle`] is a store to `status` followed by a
-///   load of `tail`, the one pairing that release/acquire does not order. On
-///   both of our hosts (x86-64, always) `SeqCst` costs a plain `mov` on the
-///   load and an `xchg` on the store, and buying the `StoreLoad` barrier
-///   outright is cheaper than reasoning about which call site needs it.
+/// * **Sequentially consistent** loads, stores and read-modify-writes of the
+///   control words. The reference is weaker on `head` and `tail` — release and
+///   acquire — and we could be too, except that the idle handshake in
+///   [`RingPump::enter_idle`] is a write to `status` followed by a load of
+///   `tail`, the one pairing that release/acquire does not order. On both of
+///   our hosts (x86-64, always) `SeqCst` costs a plain `mov` on the load, an
+///   `xchg` on the store and a `lock`ed instruction on the read-modify-write,
+///   and buying the `StoreLoad` barrier outright is cheaper than reasoning
+///   about which call site needs it.
 /// * **A whole-buffer read that cannot tear into host memory.** The bytes may
 ///   be changing under the copy — that is the guest's privilege and the reason
 ///   the shadow exists — so the implementation must perform the copy in a way
@@ -216,21 +213,41 @@ pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 ///
 /// # Who may write what
 ///
-/// The type-state from [`super::ring`] comes through here intact: there is a
-/// store for a [`HostWord`] and there is no store for a [`GuestWord`], so a
-/// backing implementation cannot be asked to write the tail even by mistake.
+/// The type-state from [`super::ring`] comes through here intact: there is no
+/// write of any kind for a [`GuestWord`], so a backing implementation cannot be
+/// asked to write the tail even by mistake.
+///
+/// The two host words are not written alike. `head` is the host's alone and is
+/// stored whole ([`store_head`](Self::store_head)). `status` is *shared*: the
+/// guest clears `ALIVE` in it with an atomic AND while the host sets and
+/// clears `IDLE`, `FATAL` and `ALIVE`, so the only writes offered for it are
+/// [`set_status_bits`](Self::set_status_bits) and
+/// [`clear_status_bits`](Self::clear_status_bits) — `fetch_or`/`fetch_and`,
+/// never a store. A whole-word store computed from a host-side mirror would
+/// resurrect a bit the guest had just cleared, or erase one another host thread
+/// had just set, and nothing in the protocol would ever notice.
 pub trait RingBacking {
-    /// Load one of the words the **host** owns (`head`, `status`).
+    /// Load one of the words the **host** writes (`head`, `status`).
     ///
-    /// Used once, at construction, to check the guest zeroed them.
+    /// Used at construction to check the guest zeroed them, and for
+    /// diagnostics.
     fn load_host_word(&self, word: &HostWord) -> u32;
 
     /// Load the word the **guest** owns (`tail`).
     fn load_guest_word(&self, word: &GuestWord) -> u32;
 
-    /// Store to one of the words the **host** owns. There is no counterpart
-    /// for [`GuestWord`], and that is the point.
-    fn store_host_word(&self, word: &HostWord, value: u32);
+    /// Store `head`. Only ever called with the layout's `head` word; `status`
+    /// has its own read-modify-write operations below and must never be
+    /// stored whole.
+    fn store_head(&self, head: &HostWord, value: u32);
+
+    /// Atomically OR `bits` into the `status` word (`fetch_or`, sequentially
+    /// consistent).
+    fn set_status_bits(&self, status: &HostWord, bits: u32);
+
+    /// Atomically clear `bits` in the `status` word (`fetch_and(!bits)`,
+    /// sequentially consistent).
+    fn clear_status_bits(&self, status: &HostWord, bits: u32);
 
     /// Copy `dst.len()` bytes out of the command buffer, starting `offset`
     /// bytes into it, filling `dst` completely.
@@ -256,6 +273,12 @@ pub struct Batch<'a> {
 }
 
 impl<'a> Batch<'a> {
+    /// A batch over arbitrary bytes, for a test that drives a sink directly.
+    #[cfg(test)]
+    pub(crate) fn for_test(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
     /// The bytes, in ring order: index 0 is the byte at the pump's cursor, and
     /// a batch that wrapped the end of the buffer has already been spliced
     /// back into one contiguous run.
@@ -280,8 +303,11 @@ impl<'a> Batch<'a> {
     /// Report that the first `n` bytes were consumed, clamped to the batch.
     #[must_use]
     pub fn consumed(&self, n: usize) -> Consumed {
-        let n = n.min(self.bytes.len());
-        Consumed(u32::try_from(n).unwrap_or(0))
+        Consumed {
+            bytes: self.clamp(n),
+            fatal: false,
+            blocked: false,
+        }
     }
 
     /// Report that the whole batch was consumed.
@@ -295,20 +321,85 @@ impl<'a> Batch<'a> {
     /// guest produces more; see [`Pass::Stalled`].
     #[must_use]
     pub fn nothing(&self) -> Consumed {
-        Consumed(0)
+        self.consumed(0)
+    }
+
+    /// Report that the first `n` bytes (clamped to the batch) were handled,
+    /// and that what follows them is something this sink **cannot answer** —
+    /// so the ring is dead.
+    ///
+    /// The pump then advances `head` over those `n` bytes and no further,
+    /// publishes [`STATUS_FATAL`], and refuses every later pass. `n` may be
+    /// zero. This is the only honest answer a sink has for a command it
+    /// cannot execute: consuming it would move `head` past a command whose
+    /// reply was never written, which the guest reads as "done" and then
+    /// decodes a reply window of zeroes; refusing it without saying so hangs
+    /// the guest until its watchdog gives up.
+    #[must_use]
+    pub fn fatal_after(&self, n: usize) -> Consumed {
+        Consumed {
+            bytes: self.clamp(n),
+            fatal: true,
+            blocked: false,
+        }
+    }
+
+    /// Report that the first `n` bytes (clamped to the batch) were handled,
+    /// and that the command after them is **waiting on something outside the
+    /// ring** — `vkWaitVirtqueueSeqnoMESA`, whose seqno arrives on the
+    /// context stream.
+    ///
+    /// The pump advances `head` over the `n` bytes and answers
+    /// [`Pass::Blocked`]. Unlike [`nothing`](Self::nothing) it does **not**
+    /// remember the `tail`: the same bytes are offered again on the next
+    /// pass, because what changes the answer is not the guest's `tail` but
+    /// the other stream. That is what lets the worker give the pause gate its
+    /// pass back between looks instead of holding it for the whole wait
+    /// (ADR-0005).
+    #[must_use]
+    pub fn blocked(&self, n: usize) -> Consumed {
+        Consumed {
+            bytes: self.clamp(n),
+            fatal: false,
+            blocked: true,
+        }
+    }
+
+    /// `n`, clamped to the batch and to a `u32` — which the batch always fits,
+    /// since it is at most one ring buffer of at most 16 MiB.
+    fn clamp(&self, n: usize) -> u32 {
+        u32::try_from(n.min(self.bytes.len())).unwrap_or(0)
     }
 }
 
-/// How many bytes of a [`Batch`] a sink took. Constructible only from the batch
-/// it answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Consumed(u32);
+/// How many bytes of a [`Batch`] a sink took, and whether the ring survives
+/// what came after them. Constructible only from the batch it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Consumed {
+    bytes: u32,
+    fatal: bool,
+    blocked: bool,
+}
 
 impl Consumed {
     /// The count, in bytes.
     #[must_use]
     pub fn bytes(self) -> u32 {
-        self.0
+        self.bytes
+    }
+
+    /// Whether the sink declared the ring dead after [`bytes`](Self::bytes);
+    /// see [`Batch::fatal_after`].
+    #[must_use]
+    pub fn is_fatal(self) -> bool {
+        self.fatal
+    }
+
+    /// Whether the sink is waiting on something outside the ring after
+    /// [`bytes`](Self::bytes); see [`Batch::blocked`].
+    #[must_use]
+    pub fn is_blocked(self) -> bool {
+        self.blocked
     }
 }
 
@@ -322,9 +413,17 @@ impl Consumed {
 /// yet hold a whole unit of work. It is not an error, and it does not cost a
 /// spin: the pump will not re-offer the same bytes until the guest's `tail`
 /// moves (see [`Pass::Stalled`]).
+///
+/// Returning [`Batch::fatal_after`] is the correct answer to a command the sink
+/// can decode but not answer — see there.
 pub trait RingSink {
     /// Take some prefix of `batch` and say how much.
     fn consume(&mut self, batch: Batch<'_>) -> Consumed;
+
+    /// The worker's stop request, handed over once before the worker starts.
+    /// A sink that may block inside [`consume`](Self::consume) keeps it and
+    /// gives up when it is raised; the default has no use for it.
+    fn attach_stop(&mut self, _stop: super::service::StopSignal) {}
 }
 
 /// What one pass over the ring did.
@@ -368,6 +467,22 @@ pub enum Pass {
     Deadlocked {
         /// How many bytes were on offer. Always the buffer's full length.
         offered: u32,
+    },
+
+    /// The sink took `consumed` of the `offered` bytes (possibly none) and is
+    /// waiting on something outside the ring before it can take the command
+    /// after them ([`Batch::blocked`]). `head` was republished if `consumed`
+    /// is not zero. Not a stall: nothing is remembered, and the next pass
+    /// offers the rest again whether or not `tail` has moved — so the driver
+    /// should wait for whatever the sink is waiting on (the worker: its
+    /// doorbell, which the context stream rings) before pumping again. Not a
+    /// deadlock either, even on a full ring: the thing that unblocks it does
+    /// not need ring space.
+    Blocked {
+        /// How many bytes the guest had waiting.
+        offered: u32,
+        /// How many of them the sink took before the blocked command.
+        consumed: u32,
     },
 }
 
@@ -414,6 +529,12 @@ pub enum PumpError {
     )]
     UnusableBuffer { size: u64 },
 
+    #[error(
+        "the sink handled {consumed:#x} of the {offered:#x} bytes on offer and cannot answer \
+         what follows them, so the ring is dead"
+    )]
+    SinkFatal { offered: u32, consumed: u32 },
+
     #[error("the ring has been marked fatal and will consume nothing further")]
     Fatal,
 }
@@ -438,13 +559,16 @@ pub struct RingPump {
     /// Bytes consumed since the ring was created, wrapping. Published verbatim
     /// as `head`.
     cur: u32,
-    /// Our mirror of the status word.
+    /// The status bits **this pump** has published: [`STATUS_IDLE`] and
+    /// [`STATUS_FATAL`], never [`STATUS_ALIVE`].
     ///
-    /// The reference uses `atomic_fetch_or`/`atomic_fetch_and` on the shared
-    /// word; we keep the value host-side and store it whole. The read-modify-
-    /// write buys nothing once [`super::ring`] has established that the host is
-    /// the only writer — and preserving bits a misbehaving guest scribbled into
-    /// a word it does not own is not a property worth having.
+    /// A mirror of the pump's own intent, not of the shared word. The shared
+    /// word also carries `ALIVE`, which the monitor sets from another thread
+    /// and the guest clears with its own atomic AND, so it is only ever
+    /// changed with `fetch_or`/`fetch_and` of the one bit being changed — as
+    /// the reference does (`vkr_ring_set_status_bits`). An earlier version of
+    /// this file stored the mirror whole, on the grounds that the host was the
+    /// only writer; the guest's watchdog makes that false.
     status: u32,
     /// The host-private copy the sink is handed. Grows to the largest batch
     /// seen and never past `buffer_size`; a ring that only ever carries small
@@ -535,7 +659,9 @@ impl RingPump {
         self.cur
     }
 
-    /// The status word as the host last published it.
+    /// The status bits this pump has published ([`STATUS_IDLE`],
+    /// [`STATUS_FATAL`]). Not a read of the shared word, which may also carry
+    /// the monitor's [`STATUS_ALIVE`].
     #[must_use]
     pub fn status(&self) -> u32 {
         self.status
@@ -562,28 +688,33 @@ impl RingPump {
     /// not this layer's.
     pub fn mark_fatal(&mut self, backing: &impl RingBacking) {
         self.fatal = true;
-        self.set_status(backing, self.status | STATUS_FATAL);
+        self.set_bits(backing, STATUS_FATAL);
     }
 
     /// Return the ring to power-on: cursor and status zeroed on both sides,
     /// shadow dropped, fatal cleared (ADR-0005).
     ///
-    /// The two host-owned words are stored, not merely forgotten — a reboot
-    /// that leaves a stale `head` in shared memory is exactly the haunting
-    /// ADR-0005 is about, and a guest that re-creates its ring re-runs the
-    /// zeroed check in [`new`](Self::new).
+    /// The two host-written words are zeroed in shared memory, not merely
+    /// forgotten — a reboot that leaves a stale `head` in shared memory is
+    /// exactly the haunting ADR-0005 is about, and a guest that re-creates its
+    /// ring re-runs the zeroed check in [`new`](Self::new).
+    ///
+    /// The owner must have stopped everything else that writes `status` —
+    /// the ring's monitor — first, or `ALIVE` can land again straight after.
     pub fn reset(&mut self, backing: &impl RingBacking) {
         self.cur = 0;
         self.stalled_at = None;
         self.fatal = false;
         self.shadow = Vec::new();
         self.status = 0;
-        // Unconditionally, unlike `set_status`: a reset is the one moment the
+        // Unconditionally, unlike `set_bits`: a reset is the one moment the
         // host's mirror of shared memory is worth distrusting, because the
         // guest that is being reset may have scribbled on words it does not
         // own, and "power-on" has to mean the bytes, not our opinion of them.
-        backing.store_host_word(&self.layout.head(), 0);
-        backing.store_host_word(&self.layout.status(), 0);
+        // Every bit is cleared by read-modify-write like any other status
+        // update, so there is still no whole-word store of `status` anywhere.
+        backing.store_head(&self.layout.head(), 0);
+        backing.clear_status_bits(&self.layout.status(), u32::MAX);
     }
 
     /// Make one pass over the ring.
@@ -596,9 +727,12 @@ impl RingPump {
     /// # Errors
     ///
     /// [`PumpError::TailOutOfRange`] when the guest claims more bytes than the
-    /// ring can hold — which is also how a backwards `tail` arrives. The ring
-    /// is marked fatal, so the error is reported once and every later call
-    /// answers [`PumpError::Fatal`].
+    /// ring can hold — which is also how a backwards `tail` arrives — and
+    /// [`PumpError::SinkFatal`] when the sink answered with
+    /// [`Batch::fatal_after`], in which case `head` has been advanced over the
+    /// prefix the sink handled and no further. Either way the ring is marked
+    /// fatal, so the error is reported once and every later call answers
+    /// [`PumpError::Fatal`].
     pub fn pump(
         &mut self,
         backing: &impl RingBacking,
@@ -638,15 +772,45 @@ impl RingPump {
         }
 
         self.fill_shadow(backing, claimed);
-        let taken = sink
-            .consume(Batch {
-                bytes: &self.shadow,
-            })
-            .0;
+        let answer = sink.consume(Batch {
+            bytes: &self.shadow,
+        });
         // `Consumed` can only be built from the batch it answers, so this
         // cannot exceed `claimed`. Clamped anyway: the alternative to a
         // redundant `min` here is a cursor that runs past the guest's tail.
-        let taken = taken.min(claimed);
+        let taken = answer.bytes().min(claimed);
+
+        if answer.is_fatal() {
+            // Everything the sink did answer is released to the guest — those
+            // commands are finished — and not one byte more: the command at
+            // the new `head` is the one nobody will ever answer, and a `head`
+            // past it would tell the guest its reply is ready.
+            if taken != 0 {
+                self.cur = self.cur.wrapping_add(taken);
+                backing.store_head(&self.layout.head(), self.cur);
+            }
+            self.mark_fatal(backing);
+            return Err(PumpError::SinkFatal {
+                offered: claimed,
+                consumed: taken,
+            });
+        }
+
+        if answer.is_blocked() {
+            // Waiting on the other stream, not on the guest's `tail`: the
+            // next pass must offer these bytes again, so nothing is
+            // remembered about them. What was handled before the wait is
+            // released as usual.
+            self.stalled_at = None;
+            if taken != 0 {
+                self.cur = self.cur.wrapping_add(taken);
+                backing.store_head(&self.layout.head(), self.cur);
+            }
+            return Ok(Pass::Blocked {
+                offered: claimed,
+                consumed: taken,
+            });
+        }
 
         if taken == 0 {
             self.stalled_at = Some(tail);
@@ -655,7 +819,7 @@ impl RingPump {
 
         self.stalled_at = None;
         self.cur = self.cur.wrapping_add(taken);
-        backing.store_host_word(&self.layout.head(), self.cur);
+        backing.store_head(&self.layout.head(), self.cur);
         Ok(Pass::Progress {
             offered: claimed,
             consumed: taken,
@@ -676,21 +840,19 @@ impl RingPump {
     /// them is the busy loop this exists to prevent. Any *new* byte moves
     /// `tail` and wakes the ring normally.
     pub fn enter_idle(&mut self, backing: &impl RingBacking) -> Idle {
-        self.set_status(backing, self.status | STATUS_IDLE);
+        self.set_bits(backing, STATUS_IDLE);
         let tail = backing.load_guest_word(&self.layout.tail());
         if tail == self.cur || self.stalled_at == Some(tail) {
             Idle::Park
         } else {
-            self.set_status(backing, self.status & !STATUS_IDLE);
+            self.clear_bits(backing, STATUS_IDLE);
             Idle::WorkArrived
         }
     }
 
     /// Take [`STATUS_IDLE`] back down after waking from a park. Idempotent.
     pub fn leave_idle(&mut self, backing: &impl RingBacking) {
-        if self.is_idle() {
-            self.set_status(backing, self.status & !STATUS_IDLE);
-        }
+        self.clear_bits(backing, STATUS_IDLE);
     }
 
     /// A refused batch, told apart from one that can never be un-refused.
@@ -702,19 +864,29 @@ impl RingPump {
         }
     }
 
-    /// Store the status word and remember what we stored. Skips the store when
-    /// nothing changes, so a driver polling the idle path does not put a
-    /// pointless `xchg` on a word the guest is reading.
+    /// Publish `bits` with a `fetch_or` and remember that we did. Skips the
+    /// write when this pump already published them, so a driver polling the
+    /// idle path does not put a pointless locked instruction on a word the
+    /// guest is reading.
     ///
     /// Skipping it also skips the `StoreLoad` barrier
     /// [`enter_idle`](Self::enter_idle) relies on, which is safe for the only
     /// case that can reach it: the bit is already published, so the guest is
     /// already ringing the doorbell for every store it makes, and there is no
-    /// wakeup left to lose.
-    fn set_status(&mut self, backing: &impl RingBacking, value: u32) {
-        if self.status != value {
-            self.status = value;
-            backing.store_host_word(&self.layout.status(), value);
+    /// wakeup left to lose. (Nothing but this pump ever clears `IDLE` or
+    /// `FATAL`; the guest's only write to the word clears `ALIVE`.)
+    fn set_bits(&mut self, backing: &impl RingBacking, bits: u32) {
+        if self.status & bits != bits {
+            self.status |= bits;
+            backing.set_status_bits(&self.layout.status(), bits);
+        }
+    }
+
+    /// Take `bits` down with a `fetch_and`, if this pump had published them.
+    fn clear_bits(&mut self, backing: &impl RingBacking, bits: u32) {
+        if self.status & bits != 0 {
+            self.status &= !bits;
+            backing.clear_status_bits(&self.layout.status(), bits);
         }
     }
 
@@ -767,7 +939,9 @@ mod tests {
     enum Op {
         LoadHost(u64),
         LoadGuest(u64),
-        StoreHost(u64, u32),
+        StoreHead(u64, u32),
+        SetBits(u64, u32),
+        ClearBits(u64, u32),
         ReadBuffer(u64, usize),
     }
 
@@ -876,9 +1050,18 @@ mod tests {
             self.ops()
                 .into_iter()
                 .filter_map(|op| match op {
-                    Op::StoreHost(at, v) if at == word => Some(v),
+                    Op::StoreHead(at, v) if at == word => Some(v),
                     _ => None,
                 })
+                .collect()
+        }
+
+        /// Every read-modify-write of the status word, in order. There is no
+        /// whole-word store of `status` to look for: the trait has none.
+        fn status_writes(&self) -> Vec<Op> {
+            self.ops()
+                .into_iter()
+                .filter(|op| matches!(op, Op::SetBits(..) | Op::ClearBits(..)))
                 .collect()
         }
     }
@@ -896,10 +1079,22 @@ mod tests {
             self.word(at)
         }
 
-        fn store_host_word(&self, word: &HostWord, value: u32) {
-            let at = word.store_offset();
-            self.inner.borrow_mut().log.push(Op::StoreHost(at, value));
+        fn store_head(&self, head: &HostWord, value: u32) {
+            let at = head.store_offset();
+            self.inner.borrow_mut().log.push(Op::StoreHead(at, value));
             self.poke(at, value);
+        }
+
+        fn set_status_bits(&self, status: &HostWord, bits: u32) {
+            let at = status.store_offset();
+            self.inner.borrow_mut().log.push(Op::SetBits(at, bits));
+            self.poke(at, self.word(at) | bits);
+        }
+
+        fn clear_status_bits(&self, status: &HostWord, bits: u32) {
+            let at = status.store_offset();
+            self.inner.borrow_mut().log.push(Op::ClearBits(at, bits));
+            self.poke(at, self.word(at) & !bits);
         }
 
         fn read_buffer(&self, buffer: &Region, offset: u64, dst: &mut [u8]) {
@@ -1589,6 +1784,183 @@ mod tests {
         assert_eq!(pump.pump(&*ring, &mut greedy), Ok(Pass::Idle));
     }
 
+    // ------------------------------------------------- a sink that is waiting
+
+    #[test]
+    fn a_blocked_sink_releases_what_it_handled_and_is_offered_the_rest_again() {
+        // `vkWaitVirtqueueSeqnoMESA`: the answer depends on the context
+        // stream, not on `tail`, so unlike a stall nothing is remembered and
+        // the same bytes come back on the next pass.
+        struct Waits(usize, usize);
+        impl RingSink for Waits {
+            fn consume(&mut self, batch: Batch<'_>) -> Consumed {
+                self.1 += 1;
+                batch.blocked(self.0)
+            }
+        }
+        let ring = MockRing::new();
+        let mut pump = pump_on(&ring);
+        ring.produce(0, b"doneWAIT");
+        ring.set_tail(8);
+        let mut sink = Waits(4, 0);
+        assert_eq!(
+            pump.pump(&*ring, &mut sink),
+            Ok(Pass::Blocked {
+                offered: 8,
+                consumed: 4
+            })
+        );
+        assert_eq!(ring.head(), 4);
+        sink.0 = 0;
+        assert_eq!(
+            pump.pump(&*ring, &mut sink),
+            Ok(Pass::Blocked {
+                offered: 4,
+                consumed: 0
+            })
+        );
+        assert_eq!(sink.1, 2, "re-offered with tail unmoved");
+        assert_eq!(pump.enter_idle(&*ring), Idle::WorkArrived);
+
+        // A full ring behind a wait is not a deadlock: what unblocks it
+        // needs no ring space.
+        let ring = MockRing::new();
+        let mut pump = pump_on(&ring);
+        ring.set_tail(BUFFER);
+        let mut sink = Waits(0, 0);
+        assert_eq!(
+            pump.pump(&*ring, &mut sink),
+            Ok(Pass::Blocked {
+                offered: BUFFER,
+                consumed: 0
+            })
+        );
+        assert!(!pump.is_fatal());
+        assert_eq!(ring.status() & STATUS_FATAL, 0);
+    }
+
+    // ------------------------------------------------- a sink that cannot answer
+
+    #[test]
+    fn a_sink_that_cannot_answer_stops_the_ring_with_head_on_the_unanswered_command() {
+        // Two commands, the sink answers the first (six bytes) and cannot
+        // answer the second. `head` must land exactly between them: past the
+        // one that is finished, and never past the one that is not — the
+        // guest reads a moved `head` as "your reply is ready".
+        let ring = MockRing::new();
+        let mut pump = pump_on(&ring);
+        ring.produce(0, b"answerQUESTION");
+        ring.set_tail(14);
+
+        /// Answers the first `n` bytes and declares the rest unanswerable.
+        struct FatalAfter(usize, usize);
+        impl RingSink for FatalAfter {
+            fn consume(&mut self, batch: Batch<'_>) -> Consumed {
+                self.1 += 1;
+                batch.fatal_after(self.0)
+            }
+        }
+
+        let mut honest = FatalAfter(6, 0);
+        assert_eq!(
+            pump.pump(&*ring, &mut honest),
+            Err(PumpError::SinkFatal {
+                offered: 14,
+                consumed: 6
+            })
+        );
+        assert_eq!(honest.1, 1);
+        assert_eq!(ring.head(), 6);
+        assert_eq!(pump.cursor(), 6);
+        assert!(pump.is_fatal());
+        assert_eq!(ring.status() & STATUS_FATAL, STATUS_FATAL);
+
+        // And it stays stopped: nothing is re-offered, head does not move.
+        ring.produce(14, b"more");
+        ring.set_tail(18);
+        assert_eq!(pump.pump(&*ring, &mut honest), Err(PumpError::Fatal));
+        assert_eq!(honest.1, 1);
+        assert_eq!(ring.head(), 6);
+    }
+
+    #[test]
+    fn a_sink_that_cannot_answer_the_first_command_leaves_head_untouched() {
+        struct Nope;
+        impl RingSink for Nope {
+            fn consume(&mut self, batch: Batch<'_>) -> Consumed {
+                batch.fatal_after(0)
+            }
+        }
+        let ring = MockRing::new();
+        let mut pump = pump_on(&ring);
+        ring.produce(0, b"unanswerable");
+        ring.set_tail(12);
+        ring.clear_ops();
+
+        assert_eq!(
+            pump.pump(&*ring, &mut Nope),
+            Err(PumpError::SinkFatal {
+                offered: 12,
+                consumed: 0
+            })
+        );
+        // Not even a store of the unchanged head: the only write is FATAL.
+        assert!(ring.stores_to(0).is_empty());
+        assert_eq!(ring.status_writes(), vec![Op::SetBits(8, STATUS_FATAL)]);
+        assert_eq!(ring.head(), 0);
+    }
+
+    #[test]
+    fn a_fatal_answer_cannot_claim_more_than_the_batch_either() {
+        struct Greedy;
+        impl RingSink for Greedy {
+            fn consume(&mut self, batch: Batch<'_>) -> Consumed {
+                batch.fatal_after(usize::MAX)
+            }
+        }
+        let ring = MockRing::new();
+        let mut pump = pump_on(&ring);
+        ring.produce(0, b"four");
+        ring.set_tail(4);
+        assert_eq!(
+            pump.pump(&*ring, &mut Greedy),
+            Err(PumpError::SinkFatal {
+                offered: 4,
+                consumed: 4
+            })
+        );
+        assert_eq!(ring.head(), 4);
+    }
+
+    // ---------------------------------------------- a status word that is shared
+
+    #[test]
+    fn the_pump_never_disturbs_a_status_bit_it_does_not_own() {
+        // The monitor sets ALIVE from another thread and the guest clears it
+        // with its own atomic AND. Every write the pump makes to the word is a
+        // read-modify-write of its own bit, so neither of those is undone.
+        let ring = MockRing::new();
+        let mut pump = pump_on(&ring);
+        let status = ring.layout().status();
+
+        // The monitor says ALIVE; the pump goes idle and wakes. ALIVE stays.
+        ring.set_status_bits(&status, STATUS_ALIVE);
+        assert_eq!(pump.enter_idle(&*ring), Idle::Park);
+        assert_eq!(ring.status(), STATUS_ALIVE | STATUS_IDLE);
+        pump.leave_idle(&*ring);
+        assert_eq!(ring.status(), STATUS_ALIVE);
+
+        // The guest arms its watchdog and clears ALIVE; the pump's next
+        // write must not bring it back from a stale picture of the word.
+        ring.clear_status_bits(&status, STATUS_ALIVE);
+        assert_eq!(pump.enter_idle(&*ring), Idle::Park);
+        assert_eq!(ring.status(), STATUS_IDLE);
+        pump.mark_fatal(&*ring);
+        assert_eq!(ring.status(), STATUS_IDLE | STATUS_FATAL);
+        // …and ALIVE is still nobody's business of the pump's.
+        assert_eq!(pump.status() & STATUS_ALIVE, 0);
+    }
+
     // ------------------------------------------------------------ going idle
 
     #[test]
@@ -1603,7 +1975,7 @@ mod tests {
         // stores its tail, and the host parks on work that is already there.
         assert_eq!(
             ring.ops(),
-            vec![Op::StoreHost(8, STATUS_IDLE), Op::LoadGuest(4)]
+            vec![Op::SetBits(8, STATUS_IDLE), Op::LoadGuest(4)]
         );
         assert!(pump.is_idle());
         assert_eq!(ring.status(), STATUS_IDLE);
@@ -1614,7 +1986,7 @@ mod tests {
         // Idempotent: a second wake does not store again.
         ring.clear_ops();
         pump.leave_idle(&*ring);
-        assert!(ring.stores_to(8).is_empty());
+        assert!(ring.status_writes().is_empty());
     }
 
     #[test]
@@ -1632,7 +2004,10 @@ mod tests {
         assert_eq!(pump.enter_idle(&*ring), Idle::WorkArrived);
         // Idle went up and came straight back down, and the driver must not
         // block.
-        assert_eq!(ring.stores_to(8), vec![STATUS_IDLE, 0]);
+        assert_eq!(
+            ring.status_writes(),
+            vec![Op::SetBits(8, STATUS_IDLE), Op::ClearBits(8, STATUS_IDLE)]
+        );
         assert!(!pump.is_idle());
         assert_eq!(ring.status(), 0);
 
@@ -1777,6 +2152,7 @@ mod tests {
                     }
                     Pass::Idle => assert_eq!(produced, delivered),
                     Pass::Stalled { .. } | Pass::Deadlocked { .. } => assert_eq!(taken, 0),
+                    Pass::Blocked { .. } => panic!("this sink never blocks"),
                 }
                 assert!(ok, "the sink was handed a byte out of stream order");
                 delivered = delivered.wrapping_add(u32::try_from(taken).unwrap_or(0));

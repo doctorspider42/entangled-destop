@@ -1269,3 +1269,568 @@ fn an_unbacked_window_still_maps_but_has_no_pages() {
         "the reservation is bookkeeping and works with or without pages"
     );
 }
+
+// ============================== renderer-blob scanout (GNOME on the GPU, S2a)
+
+/// `SET_SCANOUT_BLOB` of a **renderer** blob and the `RESOURCE_FLUSH` that
+/// follows it — what a guest compositor on the GPU sends on every page flip.
+///
+/// The renderer is a fake around the Venus loopback: it implements
+/// [`Renderer3d::scanout_blob`] (accepting or refusing on command, and
+/// recording every question it was asked) and answers
+/// [`Renderer3d::read_rect_bgra`] for an accepted blob with a pattern that
+/// names each pixel's framebuffer coordinates and its resource, so a test can
+/// tell exactly which pixels of which buffer reached the window.
+mod renderer_blob_scanout {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use super::*;
+    use virtio_core::HostWaker;
+    use virtio_gpu::blob::{BlobMapping, BlobSupport};
+    use virtio_gpu::protocol::{MemEntry, ResourceCreate3d, ResourceCreateBlob, Transfer3d};
+    use virtio_gpu::renderer::CapsetInfo;
+    use virtio_gpu::{CommandError, GpuState, ScanoutBlobSpec, FORMAT_B8G8R8X8_UNORM};
+
+    /// What the fake saw, shared with the test.
+    #[derive(Debug, Default)]
+    struct Log {
+        /// Every `scanout_blob` call, accepted or not.
+        asked: Vec<(u32, ScanoutBlobSpec)>,
+        /// Every `read_rect_bgra` of a blob it had accepted.
+        reads: Vec<(u32, Rect)>,
+        /// Refuse the next `scanout_blob` calls.
+        refuse: bool,
+    }
+
+    type Shared = Arc<Mutex<Log>>;
+
+    struct ScanoutRenderer {
+        inner: NullRenderer,
+        log: Shared,
+        /// The layout accepted per resource — one per buffer, as the trait
+        /// asks of a real renderer.
+        accepted: HashMap<u32, ScanoutBlobSpec>,
+    }
+
+    impl ScanoutRenderer {
+        fn new() -> (Self, Shared) {
+            let log = Shared::default();
+            let renderer = Self {
+                inner: NullRenderer::with_venus(),
+                log: Arc::clone(&log),
+                accepted: HashMap::new(),
+            };
+            (renderer, log)
+        }
+    }
+
+    /// The pixel the fake renders at framebuffer `(x, y)` of `resource`,
+    /// BGRA: blue = x, green = y, red = resource, X = 0.
+    fn pattern_bgra(resource: u32, x: u32, y: u32) -> [u8; 4] {
+        [x as u8, y as u8, resource as u8, 0]
+    }
+
+    /// The same pixel as the window's RGBA screenshot shows it (the X byte
+    /// ignored, drawn opaque).
+    fn pattern_rgba(resource: u32, x: u32, y: u32) -> [u8; 4] {
+        [resource as u8, y as u8, x as u8, 0xff]
+    }
+
+    impl Renderer3d for ScanoutRenderer {
+        fn capsets(&self) -> &[CapsetInfo] {
+            self.inner.capsets()
+        }
+        fn capset(&mut self, id: u32, version: u32) -> Result<Vec<u8>, CommandError> {
+            self.inner.capset(id, version)
+        }
+        fn ctx_create(
+            &mut self,
+            ctx_id: u32,
+            capset_id: u32,
+            name: &str,
+        ) -> Result<(), CommandError> {
+            self.inner.ctx_create(ctx_id, capset_id, name)
+        }
+        fn ctx_destroy(&mut self, ctx_id: u32) {
+            self.inner.ctx_destroy(ctx_id);
+        }
+        fn resource_create_3d(&mut self, args: &ResourceCreate3d) -> Result<(), CommandError> {
+            self.inner.resource_create_3d(args)
+        }
+        fn resource_unref(&mut self, resource_id: u32) {
+            self.inner.resource_unref(resource_id);
+        }
+        fn ctx_attach_resource(&mut self, ctx_id: u32, resource_id: u32) {
+            self.inner.ctx_attach_resource(ctx_id, resource_id);
+        }
+        fn ctx_detach_resource(&mut self, ctx_id: u32, resource_id: u32) {
+            self.inner.ctx_detach_resource(ctx_id, resource_id);
+        }
+        fn attach_backing(
+            &mut self,
+            resource_id: u32,
+            mem: &Arc<GuestMem>,
+            entries: &[MemEntry],
+        ) -> Result<(), CommandError> {
+            self.inner.attach_backing(resource_id, mem, entries)
+        }
+        fn detach_backing(&mut self, resource_id: u32) {
+            self.inner.detach_backing(resource_id);
+        }
+        fn transfer_to_host(&mut self, ctx_id: u32, xfer: &Transfer3d) -> Result<(), CommandError> {
+            self.inner.transfer_to_host(ctx_id, xfer)
+        }
+        fn transfer_from_host(
+            &mut self,
+            ctx_id: u32,
+            xfer: &Transfer3d,
+        ) -> Result<(), CommandError> {
+            self.inner.transfer_from_host(ctx_id, xfer)
+        }
+        fn submit(&mut self, ctx_id: u32, stream: &[u8]) -> Result<(), CommandError> {
+            self.inner.submit(ctx_id, stream)
+        }
+        fn read_rect_bgra(
+            &mut self,
+            resource_id: u32,
+            rect: Rect,
+            out: &mut Vec<u8>,
+        ) -> Result<(), CommandError> {
+            let Some(spec) = self.accepted.get(&resource_id).copied() else {
+                return self.inner.read_rect_bgra(resource_id, rect, out);
+            };
+            assert!(
+                rect.fits_within(spec.width, spec.height),
+                "the device read {rect:?} outside the accepted {spec:?}"
+            );
+            self.log.lock().unwrap().reads.push((resource_id, rect));
+            out.clear();
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    out.extend_from_slice(&pattern_bgra(resource_id, x, y));
+                }
+            }
+            Ok(())
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+            self.accepted.clear();
+        }
+        fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
+            self.inner.set_host_waker(waker);
+        }
+        fn blob_support(&self) -> BlobSupport {
+            self.inner.blob_support()
+        }
+        fn create_blob(
+            &mut self,
+            ctx_id: u32,
+            args: &ResourceCreateBlob,
+            mem: &Arc<GuestMem>,
+            entries: &[MemEntry],
+        ) -> Result<(), CommandError> {
+            self.inner.create_blob(ctx_id, args, mem, entries)
+        }
+        fn destroy_blob(&mut self, resource_id: u32) {
+            self.accepted.remove(&resource_id);
+            self.inner.destroy_blob(resource_id);
+        }
+        fn map_blob(
+            &mut self,
+            resource_id: u32,
+            offset: u64,
+            size: u64,
+        ) -> Result<BlobMapping, CommandError> {
+            self.inner.map_blob(resource_id, offset, size)
+        }
+        fn unmap_blob(&mut self, resource_id: u32, offset: u64) {
+            self.inner.unmap_blob(resource_id, offset);
+        }
+        fn set_host_visible(&mut self, backing: Arc<dyn virtio_core::ShmBacking>) {
+            self.inner.set_host_visible(backing);
+        }
+        fn scanout_blob(
+            &mut self,
+            resource_id: u32,
+            spec: &ScanoutBlobSpec,
+        ) -> Result<(), CommandError> {
+            let mut log = self.log.lock().unwrap();
+            log.asked.push((resource_id, *spec));
+            if log.refuse {
+                return Err(CommandError::BadBlobMem {
+                    blob_mem: BLOB_MEM_HOST3D,
+                    reason: "refused by the test renderer",
+                });
+            }
+            self.accepted.insert(resource_id, *spec);
+            Ok(())
+        }
+    }
+
+    fn harness(width: u32, height: u32) -> (Harness, Shared) {
+        let (renderer, log) = ScanoutRenderer::new();
+        (
+            Harness::with_renderer(width, height, Box::new(renderer)),
+            log,
+        )
+    }
+
+    /// A GPU compositor's scanout buffer, as the guest kernel creates it:
+    /// `HOST3D` + `SHAREABLE`, never `MAPPABLE`, no page list.
+    fn scanout_buffer(id: u32, pages: u64) -> Request {
+        create_blob(
+            id,
+            BLOB_MEM_HOST3D,
+            BLOB_FLAG_USE_SHAREABLE,
+            0x5ca0_0000 + u64::from(id),
+            pages * BLOB_PAGE_SIZE,
+            &[],
+        )
+    }
+
+    /// The flip the Linux driver sends: the whole framebuffer shown,
+    /// `B8G8R8X8`, a stride of `stride` bytes at offset 0.
+    fn flip(id: u32, width: u32, height: u32, stride: u32) -> Request {
+        set_scanout_blob(
+            0,
+            id,
+            rect(0, 0, width, height),
+            width,
+            height,
+            FORMAT_B8G8R8X8_UNORM,
+            stride,
+            0,
+        )
+    }
+
+    fn spec(width: u32, height: u32, stride: u32) -> ScanoutBlobSpec {
+        ScanoutBlobSpec {
+            format: FORMAT_B8G8R8X8_UNORM,
+            width,
+            height,
+            stride,
+            offset: 0,
+        }
+    }
+
+    /// The whole window as RGBA rows: `(width, height, bytes)`.
+    type Frame = (u32, u32, Vec<u8>);
+
+    fn frame(h: &Harness) -> Frame {
+        let png_bytes = h.display.screenshot_png().expect("screenshot encodes");
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png_bytes));
+        let mut reader = decoder.read_info().expect("png parses");
+        let mut buf = vec![0u8; reader.output_buffer_size().expect("sane png size")];
+        let info = reader.next_frame(&mut buf).expect("png decodes");
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        buf.truncate(info.width as usize * info.height as usize * 4);
+        (info.width, info.height, buf)
+    }
+
+    fn pixel(frame: &Frame, x: u32, y: u32) -> [u8; 4] {
+        let at = (y as usize * frame.0 as usize + x as usize) * 4;
+        frame.2[at..at + 4].try_into().expect("in range")
+    }
+
+    fn reads(log: &Shared) -> Vec<(u32, Rect)> {
+        std::mem::take(&mut log.lock().unwrap().reads)
+    }
+
+    fn asked(log: &Shared) -> usize {
+        log.lock().unwrap().asked.len()
+    }
+
+    /// The renderer decides: a renderer blob is bound only when the renderer
+    /// accepts its layout, a refusal is answered in band and binds nothing,
+    /// and the device's own bounds are checked *before* the renderer is ever
+    /// asked.
+    #[test]
+    fn a_renderer_blob_is_scanned_out_only_when_the_renderer_accepts_it() {
+        let (mut h, log) = harness(8, 6);
+        assert_ok(&h.run(&scanout_buffer(40, 1)));
+
+        log.lock().unwrap().refuse = true;
+        assert_err(&h.run(&flip(40, 8, 6, 32)), resp::ERR_INVALID_PARAMETER);
+        assert_eq!(asked(&log), 1, "the renderer was asked");
+        // Nothing is bound: the flush is an offscreen no-op, no readback.
+        assert_ok(&h.run(&resource_flush(40, rect(0, 0, 8, 6))));
+        assert!(reads(&log).is_empty(), "a refused blob was read back");
+
+        // The device's bounds come first; none of these reaches the renderer.
+        let bad_layouts = [
+            // A row does not fit the stride.
+            flip(40, 8, 6, 31),
+            // Six rows of 1 KiB overrun the one-page blob.
+            flip(40, 8, 6, 1024),
+            // No framebuffer at all.
+            flip(40, 0, 6, 32),
+            // The visible region leaves the framebuffer.
+            set_scanout_blob(0, 40, rect(4, 0, 8, 6), 8, 6, FORMAT_B8G8R8X8_UNORM, 32, 0),
+            // The plane offset pushes the image past the blob.
+            set_scanout_blob(
+                0,
+                40,
+                rect(0, 0, 8, 6),
+                8,
+                6,
+                FORMAT_B8G8R8X8_UNORM,
+                32,
+                4000,
+            ),
+            // Not BGRA.
+            set_scanout_blob(0, 40, rect(0, 0, 8, 6), 8, 6, 67, 32, 0),
+            // A framebuffer past the per-image pixel bound.
+            set_scanout_blob(
+                0,
+                40,
+                rect(0, 0, 1, 1),
+                u32::MAX / 4,
+                2,
+                FORMAT_B8G8R8X8_UNORM,
+                u32::MAX - 3,
+                0,
+            ),
+        ];
+        for bad in bad_layouts {
+            let response = h.run(&bad);
+            assert_ne!(response.kind(), resp::OK_NODATA, "{bad:?} was accepted");
+        }
+        assert_eq!(asked(&log), 1, "a malformed layout reached the renderer");
+
+        log.lock().unwrap().refuse = false;
+        assert_ok(&h.run(&flip(40, 8, 6, 32)));
+        assert_eq!(
+            log.lock().unwrap().asked.last().copied(),
+            Some((40, spec(8, 6, 32)))
+        );
+        assert_eq!(h.display.resolution(), (8, 6), "the mode follows the flip");
+        assert!(!h.needs_reset());
+    }
+
+    /// A compositor flips between two buffers on every frame. Each layout is
+    /// asked about once; a flip to a buffer the renderer already accepted is
+    /// a table lookup. A changed layout is asked again.
+    #[test]
+    fn repeated_flips_ask_the_renderer_only_when_a_layout_changes() {
+        let (mut h, log) = harness(8, 6);
+        assert_ok(&h.run(&scanout_buffer(41, 1)));
+        assert_ok(&h.run(&scanout_buffer(42, 1)));
+
+        for _ in 0..5 {
+            for id in [41, 42] {
+                assert_ok(&h.run(&flip(id, 8, 6, 32)));
+                assert_ok(&h.run(&resource_flush(id, rect(0, 0, 8, 6))));
+                assert_eq!(reads(&log), vec![(id, rect(0, 0, 8, 6))]);
+            }
+        }
+        assert_eq!(asked(&log), 2, "one question per buffer, not per flip");
+
+        // The same buffer and layout, a different visible region: the layout
+        // did not change, so the renderer is not asked.
+        assert_ok(&h.run(&set_scanout_blob(
+            0,
+            41,
+            rect(0, 0, 4, 4),
+            8,
+            6,
+            FORMAT_B8G8R8X8_UNORM,
+            32,
+            0,
+        )));
+        assert_eq!(asked(&log), 2);
+        assert_eq!(h.display.resolution(), (4, 4));
+
+        // A changed layout (a wider stride, a new mode) is asked again.
+        assert_ok(&h.run(&flip(41, 8, 6, 64)));
+        assert_ok(&h.run(&flip(41, 6, 4, 64)));
+        assert_eq!(
+            log.lock().unwrap().asked[2..],
+            [(41, spec(8, 6, 64)), (41, spec(6, 4, 64))]
+        );
+        // …and a refused change keeps the layout that was accepted before.
+        log.lock().unwrap().refuse = true;
+        assert_err(&h.run(&flip(41, 8, 6, 128)), resp::ERR_INVALID_PARAMETER);
+        assert_ok(&h.run(&resource_flush(41, rect(0, 0, 6, 4))));
+        assert_eq!(reads(&log), vec![(41, rect(0, 0, 6, 4))]);
+        assert!(!h.needs_reset());
+    }
+
+    /// The flush reads the renderer's pixels for exactly the flushed rect,
+    /// clipped to the scanout, and puts them exactly where the window shows
+    /// them — and nothing else changes.
+    #[test]
+    fn a_flush_delivers_exactly_the_renderers_pixels_for_the_flushed_rect() {
+        let (mut h, log) = harness(8, 6);
+        assert_ok(&h.run(&scanout_buffer(43, 1)));
+        assert_ok(&h.run(&flip(43, 8, 6, 32)));
+        let before = frame(&h);
+        assert_eq!((before.0, before.1), (8, 6));
+
+        // A partial rect: only those pixels, only those bytes read.
+        let damage = rect(2, 1, 3, 2);
+        assert_ok(&h.run(&resource_flush(43, damage)));
+        assert_eq!(reads(&log), vec![(43, damage)]);
+        let after = frame(&h);
+        for y in 0..6 {
+            for x in 0..8 {
+                let inside = (2..5).contains(&x) && (1..3).contains(&y);
+                let expected = if inside {
+                    pattern_rgba(43, x, y)
+                } else {
+                    pixel(&before, x, y)
+                };
+                assert_eq!(pixel(&after, x, y), expected, "pixel ({x}, {y})");
+            }
+        }
+
+        // The whole framebuffer.
+        assert_ok(&h.run(&resource_flush(43, rect(0, 0, 8, 6))));
+        assert_eq!(reads(&log), vec![(43, rect(0, 0, 8, 6))]);
+        let full = frame(&h);
+        for y in 0..6 {
+            for x in 0..8 {
+                assert_eq!(pixel(&full, x, y), pattern_rgba(43, x, y));
+            }
+        }
+
+        // A scanout showing only part of the framebuffer: a flush of all of
+        // it reads just the visible part and lands at the window's origin.
+        assert_ok(&h.run(&set_scanout_blob(
+            0,
+            43,
+            rect(2, 1, 4, 4),
+            8,
+            6,
+            FORMAT_B8G8R8X8_UNORM,
+            32,
+            0,
+        )));
+        assert_eq!(h.display.resolution(), (4, 4));
+        assert_ok(&h.run(&resource_flush(43, rect(0, 0, 8, 6))));
+        assert_eq!(reads(&log), vec![(43, rect(2, 1, 4, 4))]);
+        let clipped = frame(&h);
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(pixel(&clipped, x, y), pattern_rgba(43, x + 2, y + 1));
+            }
+        }
+        // Damage entirely outside the visible part reads nothing…
+        assert_ok(&h.run(&resource_flush(43, rect(0, 0, 2, 6))));
+        assert!(reads(&log).is_empty());
+        // …and damage outside the framebuffer is the guest's error.
+        assert_err(
+            &h.run(&resource_flush(43, rect(0, 0, 9, 6))),
+            resp::ERR_INVALID_PARAMETER,
+        );
+        assert!(reads(&log).is_empty());
+        assert!(!h.needs_reset());
+    }
+
+    /// The binding's lifetime: an unref of the blob on screen disables the
+    /// scanout (as for a 2D resource), `SET_SCANOUT` with resource 0 does,
+    /// and a device reset forgets the binding *and* every accepted layout.
+    #[test]
+    fn unref_disable_and_reset_all_end_a_renderer_blob_scanout() {
+        let (mut h, log) = harness(8, 6);
+
+        // Unref while on screen.
+        assert_ok(&h.run(&scanout_buffer(44, 1)));
+        assert_ok(&h.run(&flip(44, 8, 6, 32)));
+        assert_ok(&h.run(&resource_unref(44)));
+        assert_err(
+            &h.run(&resource_flush(44, rect(0, 0, 8, 6))),
+            resp::ERR_INVALID_RESOURCE_ID,
+        );
+        // The id is free again, and a new blob under it is not on screen —
+        // nor does it inherit the old one's accepted layout.
+        assert_ok(&h.run(&scanout_buffer(44, 1)));
+        assert_ok(&h.run(&resource_flush(44, rect(0, 0, 8, 6))));
+        assert!(reads(&log).is_empty(), "an unref'd scanout was still read");
+        assert_ok(&h.run(&flip(44, 8, 6, 32)));
+        assert_eq!(asked(&log), 2, "a new blob's layout is asked afresh");
+
+        // SET_SCANOUT with resource 0 disables.
+        let disable = Request::new(cmd::SET_SCANOUT)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .u32(0);
+        assert_ok(&h.run(&disable));
+        assert_ok(&h.run(&resource_flush(44, rect(0, 0, 8, 6))));
+        assert!(reads(&log).is_empty(), "a disabled scanout was still read");
+        // Re-binding the same buffer asks nothing: its layout is known.
+        assert_ok(&h.run(&flip(44, 8, 6, 32)));
+        assert_eq!(asked(&log), 2);
+        assert_ok(&h.run(&resource_flush(44, rect(0, 0, 8, 6))));
+        assert_eq!(reads(&log).len(), 1);
+
+        // Device reset: binding, blobs and layouts all gone.
+        h.driver_reset();
+        assert_ok(&h.run(&scanout_buffer(44, 1)));
+        assert_ok(&h.run(&resource_flush(44, rect(0, 0, 8, 6))));
+        assert!(reads(&log).is_empty(), "a reset left the scanout bound");
+        assert_ok(&h.run(&flip(44, 8, 6, 32)));
+        assert_eq!(asked(&log), 3, "a reset forgot the accepted layout");
+        assert!(!h.needs_reset());
+    }
+
+    /// Guest-memory blobs never reach the new hook, and a renderer without
+    /// it still refuses a host blob exactly as before.
+    #[test]
+    fn guest_blobs_keep_their_path_and_the_default_renderer_still_refuses() {
+        let (mut h, log) = harness(4, 4);
+        h.write_mem(FB_ADDR, &RED_BGRA.repeat(16));
+        assert_ok(&h.run(&guest_blob(45)));
+        assert_ok(&h.run(&flip(45, 4, 4, 16)));
+        assert_ok(&h.run(&resource_flush(45, rect(0, 0, 4, 4))));
+        assert_eq!(h.px(3, 3), RED_RGBA, "guest pages, gathered by the device");
+        assert_eq!(asked(&log), 0, "a guest blob went to the renderer");
+        assert!(reads(&log).is_empty());
+
+        // The default `Renderer3d::scanout_blob`, on both host blob types.
+        let mut h = Harness::venus(4, 4);
+        assert_ok(&h.run(&scanout_buffer(46, 1)));
+        assert_ok(&h.run(&create_blob(
+            47,
+            BLOB_MEM_HOST3D_GUEST,
+            BLOB_FLAG_USE_SHAREABLE,
+            0x47,
+            BLOB_PAGE_SIZE,
+            &[(FB_ADDR, BLOB_PAGE_SIZE as u32)],
+        )));
+        for id in [46, 47] {
+            assert_err(&h.run(&flip(id, 4, 4, 16)), resp::ERR_INVALID_PARAMETER);
+        }
+        assert!(!h.needs_reset());
+    }
+
+    /// A suspend with a renderer blob on screen is a suspend with a 3D
+    /// resource on screen (ADR-0006): the binding is recorded as host-owned,
+    /// the blob is counted, and a restore rebinds nothing and reads nothing —
+    /// the window keeps its initial frame until the driver, told the device
+    /// needs a reset, programs a new one.
+    #[test]
+    fn a_snapshot_treats_a_renderer_blob_scanout_as_host_owned() {
+        let (mut h, _log) = harness(8, 6);
+        assert_ok(&h.run(&scanout_buffer(48, 1)));
+        assert_ok(&h.run(&flip(48, 8, 6, 32)));
+        assert_ok(&h.run(&resource_flush(48, rect(0, 0, 8, 6))));
+
+        let saved = h.transport.save();
+        let state = GpuState::decode(&saved.device).expect("the device state decodes");
+        let scanout = state.scanout.expect("the binding is recorded");
+        assert_eq!(scanout.resource_id, 48);
+        assert!(scanout.source.is_host_owned(), "{:?}", scanout.source);
+        assert_eq!(state.live_blobs, 1);
+
+        let (mut restored, log) = harness(8, 6);
+        let blank = frame(&restored);
+        restored.transport.load(&saved).expect("the snapshot loads");
+        assert_eq!(asked(&log), 0, "a restore asked the renderer about a blob");
+        assert!(reads(&log).is_empty(), "a restore read a renderer blob");
+        assert_eq!(frame(&restored), blank, "a restore presented host pixels");
+    }
+}

@@ -215,6 +215,17 @@ impl MachineBus {
         }
     }
 
+    /// Every reason a snapshot taken now would lose state a resumed guest
+    /// would notice (ADR-0006), empty when there is none. Asked before
+    /// [`Self::save_state`], so a refused snapshot writes nothing.
+    pub fn snapshot_refusals(&self) -> Vec<String> {
+        let mut refusals = self.virtio.snapshot_refusals();
+        if let Some(pci) = &self.pci {
+            refusals.extend(pci.snapshot_refusals());
+        }
+        refusals
+    }
+
     /// Everything on this bus, for a snapshot (ADR-0006).
     ///
     /// The mirror image of [`Self::reset_devices`], device for device. Called

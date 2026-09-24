@@ -155,6 +155,10 @@ pub enum CommandError {
 
     #[error("resource {0} is a blob and does not support this command")]
     NotABlobCommand(u32),
+
+    // ---------------------- renderer-blob scanout (GNOME on the GPU, S2b)
+    #[error("blob {resource_id} cannot be scanned out with that layout: {reason}")]
+    ScanoutLayout { resource_id: u32, reason: String },
 }
 
 impl CommandError {
@@ -190,7 +194,9 @@ impl CommandError {
             | Self::BadBlobFlags(_)
             | Self::BadBlobSize(_)
             | Self::BadBlobMapping { .. }
-            | Self::BlobMappingOverlap { .. } => resp::ERR_INVALID_PARAMETER,
+            | Self::BlobMappingOverlap { .. }
+            // S2b: a scanout layout that is not the image the blob holds.
+            | Self::ScanoutLayout { .. } => resp::ERR_INVALID_PARAMETER,
 
             Self::ZeroResourceId
             | Self::UnknownResource(_)

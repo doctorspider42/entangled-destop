@@ -4511,8 +4511,10 @@ dependencies = [
 name = "virtio-gpu"
 version = "0.2.0"
 dependencies = [
+ "ash",
  "display",
  "libloading",
+ "naga 26.0.0",
  "png",
  "thiserror 2.0.20",
  "tracing",

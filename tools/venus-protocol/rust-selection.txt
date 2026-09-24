@@ -1,0 +1,56 @@
+# What `rust_protocol.py` generates Rust for. Read by `scripts/venus-gen.py`.
+#
+# Three sections. A line is one entry; `#` starts a comment; blank lines are
+# ignored. Order within a section does not matter: output order follows the
+# registry, so re-sorting this file changes nothing. `*` alone in a section
+# selects everything that section can hold, and is the default: this file
+# exists so that "what do we decode" stays a question with a one-file
+# answer, and so that a narrower build (a fuzz target, a bisection) is one
+# edit away.
+#
+# [api]         The newest core Vulkan version whose structures a pNext chain
+#               may carry (`*`: the newest vk.xml knows, 1.4 at git-70991d4c).
+#               The capset's `vk_xml_version` is what gates the guest's
+#               encoder (`vn_protocol.py` get_type_condition); decoding more
+#               than it lets the guest send is harmless.
+#
+# [extensions]  Extensions whose structures chains may carry, on top of
+#               [api] (`*`: all of vn_protocol.py's VK_XML_EXTENSION_LIST).
+#               Exactly this set is what info.rs publishes as the *decodable*
+#               extension mask, which the capset advertises so that the guest
+#               never encodes a structure this host cannot decode (spec §6).
+#               With `*` in both sections every pNext whitelist is exactly the
+#               protocol's own.
+#
+# [commands]    Commands to generate args decoders and reply encoders for
+#               (`*`: every serializable command of the protocol). Every
+#               structure they reach — by member, by pointer, or through a
+#               pNext chain permitted by the two sections above — is
+#               generated with them. `-name` takes a command out of `*`.
+#
+# Decoding a command is not implementing it: the executor refuses every
+# decodable command it has no handler for, and every chained structure its
+# policy does not admit (venus/executor/policy.rs), as fatal.
+
+[api]
+*
+
+[extensions]
+*
+
+[commands]
+*
+# The transport commands a ring or a context stream carries are hand-written
+# in venus/transport.rs, and a dispatcher routes them there by opcode before
+# the generated decoder is asked. These are exactly its `Opcode`s
+# (protocol/tests.rs checks the two lists against each other).
+-vkSetReplyCommandStreamMESA
+-vkSeekReplyCommandStreamMESA
+-vkExecuteCommandStreamsMESA
+-vkCreateRingMESA
+-vkDestroyRingMESA
+-vkNotifyRingMESA
+-vkWriteRingExtraMESA
+-vkSubmitVirtqueueSeqnoMESA
+-vkWaitVirtqueueSeqnoMESA
+-vkWaitRingSeqnoMESA

@@ -562,7 +562,7 @@ let clauses = virtio.cmdline_clauses();           // goes on the kernel cmdline
 let bus = MachineBus::with_virtio(serial, virtio).with_irqchip(Arc::clone(&irqchip));
 ```
 
-Two things to know:
+Three things to know:
 
 - **Kicks are synchronous, and that is fine so far.** There is no ioeventfd, so a
   `QUEUE_NOTIFY` write is a full exit *plus* instruction emulation, and the device
@@ -572,6 +572,20 @@ Two things to know:
   binding) would remove the emulation and the serialisation, but nothing yet needs
   it. Re-take the number with `--test whp_virtio_blk -- --nocapture` before
   deciding otherwise.
+- **Host wakeups have a thread of their own (2026-09-24).** No ioeventfd
+  worker means nothing to serve a device's `virtio_core::HostWaker`, and until
+  then the synchronous-kick buses handed out **none** — so every device ran on
+  its no-waker fallback, and Venus signalled every queue-timeline fence before
+  its GPU work had run (ADR-0002's 2026-09-24 amendment). Now both
+  `attach_userspace*` constructors run one `machine_x86::host_wake::HostWakeService`
+  per bus: a wake makes thread `virtio-wake-mmio`/`-pci` call
+  `transport.lock().queue_notify(0)`, pause-gated before the lock, joined and
+  restarted by the bus `reset()`, joined by `shutdown()`/`Drop`. Nothing in
+  `run_vm` had to change: `bus.set_quiesce` and the bus lifecycle reach it.
+  Proof on the real hypervisor: `--test whp_virtio_blk`'s second boot serves
+  every disk request from that thread and nothing from the kicking vCPU. That
+  test (and `whp_virtio_pci`) wants `artifacts/tests/test-root.raw`; any raw
+  file of 8 MiB or more will do, since the probe only reads.
 - **virtio-pci got the same split in phase 4** — `VirtioPciBus::attach_userspace`
   next to the KVM `attach`, sharing one `attach_function` body. The rebasing
   problem *dissolved* rather than got solved: with synchronous kicks nothing is

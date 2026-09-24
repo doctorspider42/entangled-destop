@@ -64,6 +64,7 @@ use crate::protocol::{
     MemEntry, BLOB_FLAG_MASK, BLOB_FLAG_USE_CROSS_DEVICE, BLOB_FLAG_USE_MAPPABLE, BLOB_MEM_GUEST,
     BLOB_MEM_HOST3D, BLOB_MEM_HOST3D_GUEST, MAP_CACHE_CACHED, MAP_CACHE_MASK, MAP_CACHE_WC,
 };
+use crate::renderer::ScanoutBlobSpec;
 
 /// Granularity of everything in the host-visible window. Blob sizes and map
 /// offsets are multiples of this, because the guest maps the window with its
@@ -72,7 +73,10 @@ pub const BLOB_PAGE_SIZE: u64 = 4096;
 
 /// Most live blob resources. Venus allocates one per `VkDeviceMemory` plus a
 /// handful of rings per context; a busy Vulkan application holds hundreds.
-pub const MAX_BLOB_RESOURCES: usize = 4096;
+/// Twice what it was (4096), so that the Venus renderer's own caps — 1024
+/// host blobs and 4096 memory blobs, each with a per-context share — are the
+/// ones that bind and name the client that hit them.
+pub const MAX_BLOB_RESOURCES: usize = 8192;
 
 /// Largest single blob, in bytes. A Vulkan heap allocation for a 4K
 /// framebuffer set is tens of MiB; 1 GiB is far past anything legitimate and
@@ -80,8 +84,11 @@ pub const MAX_BLOB_RESOURCES: usize = 4096;
 pub const MAX_BLOB_BYTES: u64 = 1 << 30;
 
 /// Total size of all live blobs. Bounds what one guest can make the host
-/// promise across every blob at once.
-pub const MAX_TOTAL_BLOB_BYTES: u64 = 4 << 30;
+/// promise across every blob at once. Twice what it was (4 GiB): a Venus
+/// guest's host blobs (1 GiB) and host-visible memory (2 GiB) are bounded by
+/// the renderer, and its exported device-local memory — every Wayland
+/// client's buffers on a GPU desktop — comes on top of them.
+pub const MAX_TOTAL_BLOB_BYTES: u64 = 8 << 30;
 
 /// Entries in one `RESOURCE_CREATE_BLOB` page list. The same bound the 2D
 /// attach-backing path uses, restated here because the command is a different
@@ -90,7 +97,8 @@ pub const MAX_BLOB_ENTRIES: u32 = 16 * 1024;
 
 /// Live mappings the host-visible window tracks at once. Each is an entry in
 /// an ordered map, so this bounds the bookkeeping a guest can force by mapping
-/// thousands of tiny blobs.
+/// thousands of tiny blobs. No lower than `vmm_core::MAX_HOST_RANGES`, so the
+/// hypervisor's bound is the one a Venus guest meets.
 pub const MAX_HOST_VISIBLE_MAPPINGS: usize = 4096;
 
 /// Which blob memory types a renderer can serve, and whether it has a
@@ -192,6 +200,12 @@ pub struct BlobResource {
     backing_len: u64,
     /// Offset inside the host-visible window while mapped.
     mapped_at: Option<u64>,
+    /// The scanout layout the renderer last accepted for this blob
+    /// ([`Renderer3d::scanout_blob`](crate::renderer::Renderer3d::scanout_blob)),
+    /// for a renderer blob. Kept here so it dies with the blob: a compositor
+    /// flips between a few buffers, and `SET_SCANOUT_BLOB` of a buffer whose
+    /// layout was already accepted must not ask the renderer again.
+    scanout_spec: Option<ScanoutBlobSpec>,
 }
 
 impl BlobResource {
@@ -238,6 +252,11 @@ impl BlobResource {
     /// Where in the host-visible window this blob is mapped, if it is.
     pub fn mapped_at(&self) -> Option<u64> {
         self.mapped_at
+    }
+
+    /// The scanout layout the renderer accepted for this blob, if any.
+    pub fn scanout_spec(&self) -> Option<ScanoutBlobSpec> {
+        self.scanout_spec
     }
 }
 
@@ -581,6 +600,7 @@ impl BlobTable {
                 backing,
                 backing_len,
                 mapped_at: None,
+                scanout_spec: None,
             },
         );
         Ok(())
@@ -638,6 +658,13 @@ impl BlobTable {
     pub fn commit_mapping(&mut self, id: u32, offset: u64) {
         if let Some(blob) = self.resources.get_mut(&id) {
             blob.mapped_at = Some(offset);
+        }
+    }
+
+    /// Records the scanout layout the renderer accepted for blob `id`.
+    pub fn set_scanout_spec(&mut self, id: u32, spec: ScanoutBlobSpec) {
+        if let Some(blob) = self.resources.get_mut(&id) {
+            blob.scanout_spec = Some(spec);
         }
     }
 

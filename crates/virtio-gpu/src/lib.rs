@@ -69,6 +69,7 @@ pub mod device;
 pub mod edid;
 pub mod error;
 pub mod fence;
+pub mod host_vulkan;
 pub mod null_renderer;
 pub mod pacing;
 pub mod protocol;
@@ -91,21 +92,25 @@ pub use device::{
     NUM_QUEUES, NUM_SCANOUTS, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
 };
 pub use error::CommandError;
-pub use fence::{FenceQueue, MAX_PENDING_FENCES};
+pub use fence::{FenceQueue, FenceTimeline, MAX_PENDING_FENCES};
 pub use null_renderer::{
     loopback_signature, NullRenderer, LOOPBACK_MAGIC, LOOPBACK_SIGNATURE_LEN,
     NULL_HOST_VISIBLE_BYTES,
 };
 pub use pacing::{FramePacing, PacingReport};
 pub use protocol::{cmd, resp, CtrlHdr, Rect, FLAG_FENCE, FLAG_INFO_RING_IDX};
-pub use renderer::{CapsetInfo, FenceOutcome, Gpu3d, Renderer3d, ScanoutExport};
+pub use renderer::{CapsetInfo, FenceOutcome, Gpu3d, Renderer3d, ScanoutBlobSpec, ScanoutExport};
 // The Venus transport half (EPIC 20 phase 4). Named at the top level because
 // `entangled run` builds one; everything under `venus::` stays reachable by
 // path, because the layers below are what a *test* reaches for, not a caller.
 pub use resource::{Resource, ResourceTable};
 pub use save::{GpuState, GpuStateError, SavedResource, SavedScanout};
 pub use sink::{ScanoutSink, SinkError};
-pub use venus::renderer::{CaptureSink, VenusError, VenusRenderer, WriteSink};
+pub use venus::executor::ExecutorFactory;
+pub use venus::renderer::{
+    CaptureSink, FactoryUsage, SinkFactory, VenusError, VenusRenderer, VenusUsage, WriteSink,
+    VENUS_HOST_VISIBLE_BYTES,
+};
 
 /// `VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM` (MVP-809): 32-bit little-endian pixels in
 /// byte order B, G, R, A — the guest's `DRM_FORMAT_ARGB8888`.

@@ -13,6 +13,8 @@ tracing.workspace = true
 virtio-core.workspace = true
 virtio-queue.workspace = true
 vm-memory.workspace = true
+# Host Vulkan for the Venus executor (`host_vulkan`), dlopened at run time.
+ash.workspace = true
 
 # The real 3D renderer (ADR-0004) dlopens libvirglrenderer at runtime; the
 # loader itself is the only build-time dependency, and only on Linux.
@@ -48,6 +50,10 @@ virtio-core = { workspace = true, features = ["test-utils"] }
 # the host through the [`ScanoutSink`] trait.
 display.workspace = true
 png.workspace = true
+# The real-GPU tests of stage 5b.2 compile vk-smoke's WGSL shaders to SPIR-V
+# at test time, as vk-smoke's build.rs does. Already in the graph through
+# wgpu; MIT OR Apache-2.0.
+naga = { workspace = true, features = ["wgsl-in", "spv-out"] }
 
 [lints]
 workspace = true

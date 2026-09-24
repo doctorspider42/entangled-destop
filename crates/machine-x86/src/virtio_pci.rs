@@ -98,6 +98,7 @@ use virtio_core::pci as vpci;
 use virtio_core::transport::TransportError;
 use virtio_core::{GuestMem, PciTransport, VirtioDevice};
 
+use crate::host_wake::HostWakeService;
 use crate::irqchip::{IrqChipError, UserspaceIrqChip};
 #[cfg(target_os = "linux")]
 use crate::irqfd::{IrqFdError, IrqFdLine};
@@ -281,6 +282,10 @@ pub struct VirtioPciBus {
     #[cfg(target_os = "linux")]
     mode: QueueNotifyMode,
     interrupts: PciInterruptMode,
+    /// The host-wake worker of a synchronous-kick bus
+    /// ([`Self::attach_userspace`]); `None` on the KVM path, whose ioeventfd
+    /// workers serve wakes themselves (see [`crate::host_wake`]).
+    host_wake: Option<HostWakeService<PciTransport>>,
 }
 
 /// One function's host-neutral pieces, built by [`VirtioPciBus::attach_function`]
@@ -302,6 +307,7 @@ impl VirtioPciBus {
             #[cfg(target_os = "linux")]
             mode: QueueNotifyMode::Synchronous,
             interrupts: PciInterruptMode::default(),
+            host_wake: None,
         }
     }
 
@@ -384,6 +390,7 @@ impl VirtioPciBus {
             slots: Vec::with_capacity(devices.len()),
             mode,
             interrupts,
+            host_wake: None,
         };
         let mut apertures = shm
             .as_ref()
@@ -471,7 +478,10 @@ impl VirtioPciBus {
     /// * there is no ioeventfd, so every kick is a full exit served inline on
     ///   the vCPU thread — and *because* every kick is decoded against the
     ///   BAR's current base ([`crate::pci::PciRoot::locate_mmio`]), the
-    ///   ioeventfd rebasing dance does not exist here rather than being missed.
+    ///   ioeventfd rebasing dance does not exist here rather than being missed;
+    /// * and with no worker to serve a device's [`virtio_core::HostWaker`], the
+    ///   bus runs one [`HostWakeService`] thread instead: every device gets a
+    ///   waker whose wake is a queue-0 notify from it.
     ///
     /// Portable on purpose: it compiles and is exercised on Linux too, which is
     /// what keeps its unit tests running in CI on both hosts.
@@ -514,11 +524,13 @@ impl VirtioPciBus {
             #[cfg(target_os = "linux")]
             mode: QueueNotifyMode::Synchronous,
             interrupts,
+            host_wake: None,
         };
+        let host_wake = HostWakeService::new(devices.len());
         let mut apertures = shm
             .as_ref()
             .map(|s| layout::Mmio64Allocator::for_guest(s.mem_bytes));
-        for (slot, device) in devices.into_iter().enumerate() {
+        for (slot, mut device) in devices.into_iter().enumerate() {
             let bar_base = layout::pci_bar_slot(slot as u64);
             let gsi = layout::virtio_irq(slot).ok_or(VirtioPciAttachError::Bus {
                 slot,
@@ -527,6 +539,9 @@ impl VirtioPciBus {
             let line = irqchip
                 .virtio_line(slot)
                 .map_err(|source| VirtioPciAttachError::IrqChip { slot, source })?;
+            // Before the device disappears into its transport, like the KVM
+            // path's `DeferredWaker`; a wake before the thread starts is kept.
+            device.set_host_waker(host_wake.waker(slot));
 
             let built = bus.attach_function(
                 slot,
@@ -558,6 +573,8 @@ impl VirtioPciBus {
                 shm: built.shm,
             });
         }
+        host_wake.start(bus.slots.iter().map(|s| Arc::clone(&s.transport)).collect());
+        bus.host_wake = Some(host_wake);
         Ok(bus)
     }
 
@@ -771,6 +788,9 @@ impl VirtioPciBus {
                 notifier.set_quiesce(Arc::clone(&quiesce));
             }
         }
+        if let Some(host_wake) = &self.host_wake {
+            host_wake.set_quiesce(quiesce);
+        }
     }
 
     /// Machine reset (ADR-0005): every function's configuration space back to
@@ -783,7 +803,14 @@ impl VirtioPciBus {
     /// config space without re-basing and the kicks of the next boot land at an
     /// address nothing is listening to — a device that enumerates, negotiates
     /// and then never completes a request.
+    ///
+    /// The host-wake thread, where there is one, is stopped and joined first
+    /// and restarted empty: a wake of the boot being reset must not reach the
+    /// next one's driver.
     pub fn reset(&self) {
+        if let Some(host_wake) = &self.host_wake {
+            host_wake.reset();
+        }
         for slot in &self.slots {
             match slot.transport.lock() {
                 Ok(mut transport) => transport.power_on_reset(),
@@ -807,6 +834,21 @@ impl VirtioPciBus {
         // window left mapped across a reboot is host memory visible to a guest
         // that has not yet enumerated the bus.
         self.reconcile_shm();
+    }
+
+    /// Every function on this bus whose device would refuse a snapshot now,
+    /// each as its own sentence (ADR-0006).
+    pub fn snapshot_refusals(&self) -> Vec<String> {
+        self.slots
+            .iter()
+            .filter_map(|slot| match slot.transport.lock() {
+                Ok(transport) => transport.snapshot_refusal(),
+                Err(_) => Some(format!(
+                    "the virtio-pci transport of device {} is poisoned",
+                    slot.device_number
+                )),
+            })
+            .collect()
     }
 
     /// Every function on this bus, for a snapshot (ADR-0006).
@@ -921,8 +963,8 @@ impl VirtioPciBus {
     ///
     /// Idempotent, and also run from `Drop`, so "closing the VM leaves no device
     /// threads behind" holds even on an error path that never gets here. A bus
-    /// whose kicks are synchronous owns no threads and no registrations, so
-    /// there is nothing to undo.
+    /// whose kicks are synchronous owns no registrations, only its host-wake
+    /// thread, which is joined here.
     pub fn shutdown(&self) {
         #[cfg(target_os = "linux")]
         for slot in &self.slots {
@@ -930,6 +972,14 @@ impl VirtioPciBus {
                 notifier.shutdown();
             }
         }
+        if let Some(host_wake) = &self.host_wake {
+            host_wake.shutdown();
+        }
+    }
+
+    /// The host-wake worker of a synchronous-kick bus, if this is one.
+    pub fn host_wake(&self) -> Option<&HostWakeService<PciTransport>> {
+        self.host_wake.as_ref()
     }
 
     // ------------------------------------------------------------- dispatch

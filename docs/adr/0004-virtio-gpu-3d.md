@@ -1330,7 +1330,8 @@ discharges it for a blob mapping, and every path that calls
 
 KVM needed the only real bookkeeping: a memory slot is identified by number, so
 `Vm::create_shm_window` reserves `1 + MAX_HOST_RANGES` of them per window and
-the mapper allocates out of that pool. `MAX_HOST_RANGES` (64) is therefore not a
+the mapper allocates out of that pool. `MAX_HOST_RANGES` (64 then, 1024 since the
+2026-09-24 amendment on caps sized for one client) is therefore not a
 bookkeeping bound like the device's `MAX_HOST_VISIBLE_MAPPINGS` (4096) — it is
 the number of *hypervisor objects* a guest can make the host create, and past it
 a map fails in band. WHP addresses a range by its address and needed nothing; it
@@ -1568,7 +1569,8 @@ is set.
    VirGL / none" line the phase-1 list asked for has something to say — and it
    should say which library it found and where, because on a machine with both
    0.9.1 and a self-built 1.1.0 the difference is invisible otherwise.
-6. **`MAX_HOST_RANGES` is 64 and untested against a demanding guest.** A
+6. **`MAX_HOST_RANGES` is 64 and untested against a demanding guest.** (Found
+   and raised to 1024: the 2026-09-24 amendment on caps sized for one client.) A
    Vulkan application with many host-visible `VkDeviceMemory` allocations will
    find it. Raising it is a one-constant change (KVM's slot limit is far
    higher), but the honest move is to measure a real application first and set
@@ -1912,3 +1914,2312 @@ eliminate is eliminated against nothing.
 - **One sink for all rings**, so a multi-ring capture interleaves into soup.
 - **`allow_vk_wait_syncs`**, which belongs with the threading model rather than
   with the capset that advertises it.
+
+## Amendment, 2026-09-23 — the guest can see NVIDIA Vulkan memory under WHP
+
+Venus maps host `VkDeviceMemory` straight into guest-physical space. On KVM
+that works because KVM maps any host VA; on WHP nobody had measured whether
+memory the NVIDIA driver owns, or has imported, survives `WHvMapGpaRange` with
+coherent data both ways. Everything in phase 5 that touches memory rested on
+that, so it was measured before anything was built on it
+(`F:\VMs\Entangled\probes\host-visible-memory\`, RTX 2070, driver 580.88,
+Windows 10 Home).
+
+### It works, in every case tried
+
+Two candidates, 2 MiB each, one row per memory type and order:
+
+- **A — the driver's memory:** `vkAllocateMemory` + `vkMapMemory`, then
+  `WHvMapGpaRange` of that pointer, for every `HOST_VISIBLE` type (3, 4, and
+  the 214 MiB `DEVICE_LOCAL|HOST_VISIBLE` type 5).
+- **B — our pages, imported:** `VirtualAlloc`, then
+  `VK_EXT_external_memory_host`. Only types 3 and 4 accept a host pointer
+  (`memoryTypeBits = 0x18`, alignment 4 KiB). Both orders were tried: import
+  then map, and map then import.
+
+Every row: allocation `VK_SUCCESS`, mapping `S_OK`, and host-CPU → guest,
+GPU → guest, guest → GPU and unmap/remap (a different allocation at the same
+GPA, never stale) all correct. Each step used its own pattern, and a stale
+value would have been named as such. This held over six full runs, with the
+guest's caches both disabled and enabled, and I reproduced it independently.
+
+### What differs is speed, and the type decides it
+
+Guest access, in TSC ticks per dword (plain guest RAM ≈ 2.2):
+
+| backing | guest read | guest store | note |
+|---|---|---|---|
+| A, type 4 (cached) | ≈ 2–3 | ≈ 2–3 | full speed |
+| B, type 3 or 4 (our pages) | ≈ 2–6 | ≈ 2–5 | full speed, even as type 3 |
+| A, type 3 (driver WC) | ≈ 300–500 | ≈ 180–380 | host stores 3–5: **write-combining is lost in the guest** |
+| A, type 5 (BAR) | ≈ 2000 | ≈ 30–200 | reads as slow as the host's own; one run landed in system memory |
+
+The guest's own cache settings changed nothing. On this host the host-side
+mapping decides the memory type.
+
+`WHvMapGpaRange` of 2 MiB takes a median of 24–39 µs, and `WHvUnmapGpaRange`
+55–116 µs.
+
+### Consequences for the renderer
+
+- **Guest-visible memory of types 3 and 4 is backed by our own pages,
+  imported.** That is the fast row, and the VMM owns the pages and their
+  lifetime — which is also what save/restore (ADR-0006) and the guest-untrusted
+  rules want: freeing a guest's allocation can never leave the partition
+  mapping a page the driver has recycled.
+- **Type 5 is the open question.** It cannot be imported. Mapped from the
+  driver it is correct but slow, and its placement is not stable. Either the
+  renderer hides it from the guest (advertising a subset of memory properties
+  is legitimate), or it forwards it for write-only uploads. That is decided
+  with a real workload, not now.
+- **Mappings are not free.** At tens of µs each, the renderer maps whole
+  `VkDeviceMemory` objects, never sub-ranges per access. A guest allocator that
+  suballocates, as every serious one does, keeps the count low.
+
+Untested: the driver migrating type 5 memory under pressure while it is
+mapped, allocations much larger than 2 MiB, and a Linux guest's own PAT
+choices.
+
+## Correction, 2026-09-23 — what the phase-4 bytes actually were
+
+A reading of Mesa 26.2.3 and virglrenderer 1.1.0 against the phase-4 run
+(`spec-phase5-bringup.md`, kept with the session's research notes) shows that
+three things written in the phase-4 amendment were wrong. They are kept above
+as written, as this ADR does with its other wrong guesses, and corrected here.
+
+- **The two `SetReply`s were not a retry.** A reply window comes from a
+  sequential pool created per `VkInstance` (`vn_renderer_util.c:94-116`,
+  `vn_instance.c:315-316`), and each `VkInstance` is its own virtio-gpu
+  context with its own ring. Two windows, both at offset 0, therefore mean two
+  instances in two contexts. They landed in one file because the capture sink
+  fed every ring into it.
+- **The abort was not "no reply"; it was our doorbell model.** Mesa submits
+  `SetReply` and the command it precedes as two ring submissions with nothing
+  between them. It rings the doorbell at most once per millisecond
+  (`vn_ring.c:478-489`) and relies on the host polling for the `idleTimeout` it
+  passed at ring creation. Our renderer drained once on the doorbell, published
+  `IDLE` and never looked again, so `vkEnumerateInstanceVersion` (opcode 137,
+  16 bytes) sat unread in each ring. About 3.5 s later Mesa's watchdog found
+  `VK_RING_STATUS_ALIVE_BIT_MESA` never set and aborted
+  (`vn_common.c:229-283`). Stage 5a.1 fixes both: a ring worker that polls for
+  `idleTimeout`, and an `ALIVE` monitor.
+- **virglrenderer does not leave the extension-mask sentinel clear.** It sets
+  it, over an enumerated mask of exactly what its protocol decodes
+  (`vkr_renderer.c:40-48`). The permissive mask in `run_vm.rs` therefore has no
+  reference precedent, and it goes once the generated protocol (stage 5a.2)
+  provides the table to enumerate from.
+
+And one refinement of "a diagnostic's silence is only evidence once you have
+seen it speak". `VN_DEBUG` was silent because it *could not* speak: every
+`vn_log` is `MESA_LOG_DEBUG` (`vn_common.c:92-99`), and a release Mesa defaults
+to `MESA_LOG_INFO` (`util/log.c:134-137`). Guest probes need
+`MESA_LOG_LEVEL=debug` alongside `VN_DEBUG`. The lesson stands. The
+`EACCES` on `/dev/dri/renderD128` stands too — it was measured with raw ioctls,
+not inferred from silence.
+
+## Amendment, 2026-09-23 — stage 5a.1, the ring service
+
+The two faults the correction above names are fixed in
+`crates/virtio-gpu/src/venus/service.rs`, and one debt from "What phase 4 does
+not have" is paid.
+
+- **Every ring has a worker thread**, faithful to `vkr_ring_thread`
+  (`vkr_ring.c:241-335`): pump while there is progress; with none, keep
+  polling `tail` (sixteen yields, then `vkr_ring_relax`'s doubling sleeps,
+  never past the deadline) until `idleTimeout` has passed since the last
+  progress; publish `IDLE`, re-read `tail`, and take `IDLE` back down if work
+  arrived; otherwise park until the doorbell, and take `IDLE` down on waking.
+  `vkNotifyRingMESA` now only wakes the worker; the device's queue worker never
+  touches ring pages. The decisions are a pure state machine (`RingService`)
+  over an injected clock, tested deterministically, including the exact Mesa
+  shape: `SetReply` rings, the command a few microseconds later does not, both
+  are consumed.
+- **Every context with a monitored ring has an `ALIVE` monitor**
+  (`vkr_context.c:507-545`), at the shortest period any of its rings asked
+  for, floored at 1 ms (`MIN_MONITOR_PERIOD`) so a guest cannot make it spin; a
+  period of zero refuses the ring, as the reference does. It is a separate
+  thread because a worker stuck in one long command cannot report on itself,
+  and a test holds a worker inside its sink to prove `ALIVE` keeps coming.
+- **`status` is only ever read-modify-written.** The guest clears `ALIVE`
+  with its own atomic AND (`vn_common.c:229-243`), so the pump's old
+  whole-word store from a host-side mirror would have raced it. `RingBacking`
+  now offers `store_head` and `set_status_bits`/`clear_status_bits`
+  (`fetch_or`/`fetch_and`, `SeqCst`) and no whole-word store of `status`.
+- **A sink decides how far `head` moves, and can end the ring.**
+  `Batch::fatal_after(n)` advances `head` over `n` bytes and no further,
+  publishes `FATAL` and stops the worker — never past a command whose reply was
+  not written (spec §5 item 4). The capture sinks use it: they consume and
+  record `SetReply`/`SeekReply`, and at the first command they would have to
+  answer they record it and the rest of the batch and declare the ring fatal.
+  Against a real guest the capture should be `SetReply` (36 B) +
+  `vkEnumerateInstanceVersion` (16 B), and the guest should abort on "ring
+  fatal error" at once rather than on its 3.5 s watchdog.
+
+  **Measured on 2026-09-23** (Ubuntu guest, root, `MESA_LOG_LEVEL=debug
+  VN_DEBUG=init,result`): the capture is exactly those 52 bytes, the second
+  command byte-for-byte `89 00 00 00 01 00 00 00 01 00 00 00 00 00 00 00`, and
+  the renderer logs FATAL after `0x24` of `0x34` bytes. Mesa, now able to
+  speak, reports `connected to renderer`, wire format 1, vk.xml 1.3.269 and
+  protocol spec 2, and then `aborting on ring fatal error at iter 4096`.
+  The abort reason is the one predicted; its timing is not. Mesa reads the
+  status word only at the same iteration where the watchdog would check
+  `ALIVE`, so it still comes about 3.5 s in. What changed is *why* it aborts.
+- **One sink per ring.** `VenusRenderer` takes a `SinkFactory`
+  (`(ctx_id, ring) -> io::Result<S>`), and `ENTANGLED_VENUS_CAPTURE` is now a
+  prefix: each ring writes `<prefix>.ctx<N>.ring<M>.bin`, `M` counting the
+  run's rings from 0. The "one sink for all rings" debt above is gone.
+- **ADR-0005 is honoured by both threads**: a `Quiesce` pass before every
+  pass, outside every lock, and stop-and-join on `vkDestroyRingMESA`,
+  `ctx_destroy`, blob destruction and `reset` — including on a paused VM.
+
+Still owed: replies (5a.2 onwards), and `save`/`load` for rings (ADR-0006).
+
+One risk the reference shares and this stage does not fix: the idle
+handshake assumes the host's `idleTimeout` is at least as long, in real time,
+as the guest's one-millisecond doorbell rate limit. A host clock that runs
+fast — WSL's does, by up to 3.8 % — can publish `IDLE` a few tens of
+microseconds before the guest is allowed to ring again; a submission in that
+gap is announced by no doorbell, and the ring parks on it while the monitor
+keeps the watchdog quiet. The wake-up latency of a real doorbell normally
+covers the gap. If a guest is ever seen hanging with `IDLE` up and
+`tail != head`, a bounded park (re-check `tail` every few milliseconds) is the
+cheap fix.
+
+## Amendment, 2026-09-23 — stage 5a.3, the executor
+
+The renderer stops capturing and answers. `crates/virtio-gpu/src/venus/executor/`
+is a `SinkFactory` whose per-ring sink decodes each command with the generated
+protocol, executes it, writes the reply into the guest's reply window and only
+then lets `head` move; `crates/virtio-gpu/src/host_vulkan/` is the host side,
+over `ash` 0.38 loaded at run time (`Entry::load`, nothing linked). It is
+attached with `ENTANGLED_VENUS=vulkan` — diagnostic, an environment variable,
+for the capture's reason — and the run is refused before the guest boots if
+the host has no device the executor would expose.
+
+- **The host is a trait.** `HostVulkan` covers exactly this stage's calls and
+  speaks the generated protocol structures, so the object table, the id rules,
+  every policy and every reply shape are tested against a fake on every host;
+  the `ash` side is the only code that turns a validated value into a driver
+  structure, and it is outside `venus` so that family's only `unsafe` stays in
+  `shmem`. The ~1500-field bridge between the two is generated
+  (`scripts/venus-ash-gen.py`, from the protocol and ash's own definitions).
+- **Object ids** are virglrenderer's rules plus the ones it leaves to the
+  driver: unique per context whatever the type, typed lookups, parents
+  recorded and checked, destruction in dependency order on `vkDestroy*`,
+  context destruction and device reset. Anything wrong is fatal to the context
+  and to the ring, with `head` left on the offending command.
+- **Replies** go into a `HOST3D` blob of the same context, bounded by the
+  window (stricter than vkr, which bounds by the resource), under the blob
+  directory's lock, so a blob destroyed while it is the window is never
+  written again.
+- **What the guest is shown, where it differs from vkr:** CPU devices hidden;
+  `apiVersion` capped at 1.3 in `Properties2` as well as in `Properties`;
+  sparse features reported false (no sparse command exists here, and
+  vulkaninfo enables what it is offered); device extensions limited to what the
+  protocol decodes, which today is none; and the memory policy below.
+- **Memory.** Type indices are the host's. Every type that does not accept an
+  import of our own pages (`vkGetMemoryHostPointerPropertiesEXT` on a
+  `RingPages` allocation, through a throwaway device) loses
+  `HOST_VISIBLE|HOST_COHERENT|HOST_CACHED`; a device without
+  `VK_EXT_external_memory_host`, or left with no coherent host-visible type, is
+  not exposed. On the RTX 2070 (driver 580.88), from the real-GPU test:
+
+  | type | heap | host flags | guest flags |
+  |---|---|---|---|
+  | 0 | 1 | — | — |
+  | 1 | 0 | `DEVICE_LOCAL` | `DEVICE_LOCAL` |
+  | 2 | 0 | `DEVICE_LOCAL` | `DEVICE_LOCAL` |
+  | 3 | 1 | `HOST_VISIBLE\|HOST_COHERENT` | same |
+  | 4 | 1 | `HOST_VISIBLE\|HOST_COHERENT\|HOST_CACHED` | same |
+  | 5 | 2 | `DEVICE_LOCAL\|HOST_VISIBLE\|HOST_COHERENT` (the BAR) | `DEVICE_LOCAL` |
+
+  `memoryTypeBits` importable from host allocations: `0x18`, as the
+  2026-09-23 probe measured by hand.
+- **The capset** now carries the enumerated mask of what the protocol decodes,
+  sentinel set, as virglrenderer does; the "assume everything" override is
+  gone from `run_vm.rs`.
+- **Snapshots** are refused by name while a Venus context holds host Vulkan
+  objects: `VirtioDevice::snapshot_refusal` (default `None`), asked by
+  `MachineBus::snapshot_refusals` before anything is written.
+
+Owed by the next stage: `supports_multiple_timelines` is still false, and
+release Mesa binds every queue to a fence timeline in 1..63 regardless; the
+executor records each queue's `ring_idx`, and `virtio_gpu::fence` needs one FIFO
+per `ring_idx` before `vkQueueSubmit` can retire a guest fence and the capset
+bit can flip. `vkExecuteCommandStreamsMESA` (commands over 8 KiB) is refused.
+
+## Amendment, 2026-09-23 — a Linux guest on WHP sees the RTX 2070 through our own renderer
+
+Stage 5a's milestone, measured in the Ubuntu guest (Mesa 26.0.8, root,
+`VK_DRIVER_FILES` = venus only, `MESA_LOG_LEVEL=debug VN_DEBUG=init,result`),
+against the executing renderer (`ENTANGLED_VENUS=vulkan`, commit `f3cf3ae`):
+
+```
+$ vulkaninfo --summary                       # exit 0
+GPU0:
+    apiVersion   = 1.2.0
+    vendorID     = 0x10de
+    deviceType   = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    deviceName   = Virtio-GPU Venus (NVIDIA GeForce RTX 2070)
+    driverName   = venus
+    driverInfo   = Mesa 26.0.8-1ubuntu0.3
+```
+
+With every ICD visible, the loader orders the venus device first and llvmpipe
+second. The renderer logged no refusal and no FATAL. Mesa logged
+`renderer instance version 1.3.309`.
+
+So every piece written for this stage has now run against the real thing:
+the capset, the transport, the ring worker and its monitor, the generated
+protocol, the object table and the host-Vulkan executor, on WHP and on the
+host's own GPU. No other process and no C renderer sits in the path.
+
+### Open
+
+- **`apiVersion 1.2.0`, not 1.3.** We answer with the host's version capped at
+  1.3, and the Mesa 26.2.3 source clamps only to 1.3 at the lowest
+  (`vn_physical_device.c:528-541`). The guest runs 26.0.8, whose clamps may
+  differ; the exact `.0` patch suggests a deliberate clamp rather than our
+  number passed through. The prime suspect is the enumerated extension mask
+  (sentinel set, only the two protocol extensions). Mesa checks the renderer's
+  protocol knowledge of an extension before encoding its structs, and every
+  1.3-core struct belongs to an extension that was promoted into 1.3. The
+  answer is to read the guest's own `vn_physical_device.c` for 26.0.8 and a
+  full, non-summary `vulkaninfo` dump.
+- **No device extensions are advertised.** That is enough for this milestone
+  and not enough for anything that presents: WSI, and Zink's GL on top of
+  Vulkan, both need extensions, and the protocol has to be able to decode them
+  before we may say so.
+- **`vkGetPhysicalDeviceImageFormatProperties2` returned
+  `VK_ERROR_FORMAT_NOT_SUPPORTED`** once during vulkaninfo's probing. That is a
+  legitimate answer to a probe, but it should be checked against the host's own
+  answer for the same query.
+
+### Resolved — why the guest said 1.2, and why that is also the swapchain
+
+Read from the guest's exact Mesa, 26.0.8 (Ubuntu's `-1ubuntu0.3` patches
+nothing in venus):
+
+- **The clamp.** `vn_physical_device_sanitize_properties` clamps the device to
+  1.2 whenever `VK_KHR_synchronization2` is not exposed
+  (`vn_physical_device.c:538-543`).
+- **Why sync2 was missing.** It is a pass-through extension, so it needs our
+  `vkEnumerateDeviceExtensionProperties` to list it, and ours is empty. On WSI
+  builds, which Ubuntu's is, it is additionally gated on
+  `renderer_sync_fd.semaphore_importable` (`:1262-1271`, `:1328`).
+- **What that needs from us.** The guest sets `semaphore_importable` only when
+  we list `VK_KHR_external_semaphore_fd` and answer
+  `vkGetPhysicalDeviceExternalSemaphoreProperties(SYNC_FD)` with `IMPORTABLE`
+  (`:1124-1141`).
+- **The same gate hides `VK_KHR_swapchain`.** In 26.0.8,
+  `semaphore_importable` also decides whether the guest exposes
+  `VK_KHR_swapchain` at all (`:1212-1224`).
+
+So the guest's Vulkan version and its ability to present rest on one thing:
+**sync_fd semaphore import, which a Windows host does not have and our
+renderer must emulate.** virglrenderer does it with a real sync_fd. We need:
+
+- `vkImportSemaphoreResourceMESA(resourceId 0)` = "signal the semaphore now"
+  (`vn_queue.c:398-414`), emulated by an empty signalling submit;
+- `vkWaitSemaphoreResourceMESA` = "consume the pending payload"
+  (`vn_queue.c:2489-2490`);
+- a synthesized `SYNC_FD` properties reply;
+- `VK_KHR_external_semaphore_fd` stripped from `vkCreateDevice`, and
+  `VkExportSemaphoreCreateInfo{SYNC_FD}` stripped from `vkCreateSemaphore`,
+  before they reach the host driver.
+
+My hypothesis above, that the extension mask caused this, was wrong. The mask
+is read in exactly one place, `vn_cs_renderer_protocol_has_extension`
+(`vn_cs.h:102-105`). The generated guest encoders use it to decide whether to
+*send* an extension's `pNext` structs, and silently drop the ones whose bit is
+clear. A mask bit therefore obliges the renderer to decode, never to support,
+and the real risk runs the other way: an extension we enumerate without its bit
+has its structs dropped on the floor.
+
+Two more 26.0.8 facts that shape the next stage:
+
+- **`supports_multiple_timelines` is only asserted, and asserts are compiled
+  out.** The guest always creates 64 rings and binds every queue to a
+  `ring_idx` (`vn_renderer_virtgpu.c:1497-1500`, `vn_device.c:83-99`). Per-ring
+  fences are owed whatever we advertise.
+- **26.0.8 still uses fence feedback**: extra command buffers writing into
+  `HOST_VISIBLE|HOST_COHERENT` memory (`vn_feedback.c:74-77`), plus async
+  `vkWaitForFences`/`vkWaitSemaphores` that the renderer must truly block on
+  (`vn_queue.c:1759`, `:2243`).
+
+## Amendment, 2026-09-24 — stage 5b.1, device memory, buffers and images
+
+The executor now allocates and frees device memory, creates buffers, binds
+buffers and images, answers every memory-requirements query and creates buffer
+and image views (`venus/executor/memory.rs`), and a `HOST3D` blob whose
+`blob_id` names a `VkDeviceMemory` is **that memory's pages**. This is the
+memory model the 2026-09-23 measurement chose, built.
+
+- **Guest-visible memory is our pages, imported.** An allocation of a type the
+  guest sees as `HOST_VISIBLE` (types 3 and 4 on the RTX 2070) is a
+  `RingPages::for_memory` allocation — zeroed, aligned to the driver's
+  `minImportedHostPointerAlignment`, rounded up to a multiple of it — checked
+  against `vkGetMemoryHostPointerPropertiesEXT` for the guest's type index and
+  imported with `VK_EXT_external_memory_host` (`HOST_ALLOCATION`). Every other
+  type is a plain `vkAllocateMemory`, and no blob can be made of it.
+- **The blob is the same `Arc`.** `RESOURCE_CREATE_BLOB` with a `blob_id`
+  asks the factory (`SinkFactory::export_memory`) for that context's memory;
+  it must be host-visible, the blob's size must be the allocation rounded to
+  4 KiB (what the guest kernel sends), and — as in vkr — a memory is exported
+  once. Mapping publishes exactly the blob's span of those pages
+  (`RingPages::publish_len`), so the guest's mapping and the GPU's view are one
+  set of bytes. `blob_id` 0 stays plain shared memory for rings and replies.
+- **Lifetime.** The pages have three holders — the host memory object
+  (`host_vulkan::HostMemory`, which releases its `Arc` only after
+  `vkFreeMemory` has returned, and after `vkDeviceWaitIdle` for an import),
+  the blob, and the publication — and are freed when the last goes, whichever
+  order the guest frees in. Mesa's own order (unref the bo, then
+  `vkFreeMemory` into the ring) races on the host by construction, and both
+  orders are tested. A partition can never map pages the allocator has
+  reused, and a GPU can never write pages the executor has let go of.
+- **Budget.** 1 GiB of imported pages renderer-wide
+  (`executor::MAX_HOST_VISIBLE_BYTES`, a `shmem::PageBudget` shared by every
+  context), charged at allocation and refunded only when the pages are freed,
+  so freeing memory while its blob stays mapped does not free budget. Past it
+  an allocation answers `VK_ERROR_OUT_OF_DEVICE_MEMORY`. Device-local memory
+  is the driver's to bound; a size past its heap gets the same answer before
+  the driver is asked.
+- **What a resource may be bound to.** Binding imported memory is valid only
+  for a resource created for that handle type. Every buffer and image is
+  created with a `VkExternalMemory*CreateInfo{HOST_ALLOCATION}` when the driver
+  reports the handle type `IMPORTABLE` for it, and its `memoryTypeBits` name
+  the host-visible types only then. On the RTX 2070 a transfer buffer may live
+  in types 3 and 4 (`memoryTypeBits = 0x1b`); an image the driver will not
+  import for never sees them. Every bind is judged against the same filtered
+  bits, the offset against the alignment and the requirement against the
+  guest's allocation size, before the driver is asked.
+- **The capset's extension mask is now what the executor admits** — the two
+  venus extensions plus every extension that adds a structure the chain
+  policy admits (core 1.1–1.3), 60 in all, derived from the same table and
+  rule (`policy::admitted_extension_numbers`). That includes
+  `VK_KHR_synchronization2` (315) and `VK_KHR_dynamic_rendering` (45), on which
+  the guest gates core-1.3 structures, and was checked against every
+  `vn_cs_renderer_protocol_has_extension` gate in Mesa 26.0.8's driver
+  headers: each gated structure the executor admits has its bit. It is
+  narrower than virglrenderer's (everything its protocol decodes), because
+  here a decoded structure outside the admitted set is fatal.
+- **`vkWaitRingSeqnoMESA` is served** on the context stream: the device waits
+  (bounded, 5 s) until the ring's `head` passes the seqno. Mesa sends it
+  before creating the blob of memory it allocated without a reply
+  (`vn_device_memory_wait_alloc`); without it the blob could arrive before the
+  ring worker had executed the allocation.
+
+Where this differs from vkr, beyond the memory model: every bind, view and
+requirements query is validated before the driver sees it (vkr trusts the
+driver); `bufferDeviceAddressCaptureReplay` is reported false, and so
+`vkGetBufferOpaqueCaptureAddress`, `vkGetDeviceMemoryOpaqueCaptureAddress` and
+any nonzero opaque capture address are refused; `vkGetDeviceMemoryCommitment`
+is forwarded only for a lazily allocated type and answers 0 otherwise; a
+ring cannot be built on a blob of Vulkan memory.
+
+What Mesa 26.0.8 sends, and what it gets: `vkAllocateMemory` without a reply,
+`VkMemoryAllocateFlagsInfo`, `VkMemoryDedicatedAllocateInfo` and an
+`VkExportMemoryAllocateInfo` it has rewritten to handle types 0 (all served);
+`VkImportMemoryResourceInfoMESA` only for a dma-buf import or guest vram,
+neither of which exists here (`VK_ERROR_INVALID_EXTERNAL_HANDLE`, as vkr
+answers a resource it cannot import); the blob lazily, at the first
+`vkMapMemory`, as `HOST3D`/`MAPPABLE` with `blob_id` = the memory's id;
+`vkCreateBuffer` + `vkGetBufferMemoryRequirements2` (with
+`VkMemoryDedicatedRequirements`) or, on its requirements-cache hit, the create
+alone; `vkBindBufferMemory2`, `vkBindImageMemory2`, `vkCreateImageView` and
+`vkCreateBufferView` without replies; `vkGetDevice{Buffer,Image}MemoryRequirements`
+(refused on a device below 1.3, where the entry point may not exist);
+`vkGetImageSubresourceLayout` for linear images. A `vkBindImageMemory2` with no
+memory is its WSI path and needs a swapchain nothing here offers yet.
+
+**Measured on the RTX 2070** (driver 580.88, Windows,
+`host_vulkan::tests::the_host_gpu_fills_a_buffer_and_the_guest_reads_it_through_the_blob`):
+for each of types 3 and 4, a 64 KiB transfer buffer allocated and bound through
+the executor, its memory's blob mapped into a window, the guest's bytes
+overwritten by the **host GPU** (`vkCmdFillBuffer` through a test-only submit
+path, `AshVulkan::fill_buffer`), and all 16384 words read back through the
+blob's pages as the guest sees them, 0 wrong.
+
+Owed by the next stages: queue submission (5b.3), whose command buffers are
+what will use this memory, and the sync_fd semaphore emulation that unlocks
+sync2 and the swapchain (the 2026-09-23 finding); `save`/`load` for memory,
+which a snapshot still refuses by name while any host Vulkan object or any
+imported page is alive.
+
+## Amendment, 2026-09-24 — stage 5b.2, pipelines, command buffers and fenced submission
+
+The executor now serves every core Vulkan 1.0–1.3 command a guest needs to
+build pipelines, descriptors, render passes, framebuffers, query pools and
+events, to record command buffers — every core `vkCmd*`, secondaries included —
+and to submit them with an optional binary fence and wait for it. Command
+streams too large for the ring arrive through `vkExecuteCommandStreamsMESA`,
+which is served. Semaphores remain stage 5b.3.
+
+### The mechanical majority is generated
+
+`scripts/venus-exec-gen.py` (a sibling of `venus-ash-gen.py`, reading the same
+`rust_protocol.py` model as the protocol, `vk.xml`, and ash's sources) writes
+two files from a checked-in classification of all 211 core ≤ 1.3 commands the
+protocol decodes (`tools/venus-protocol/executor-classes.txt`: 41 *bespoke* —
+stages 5a.3/5b.1 —, 85 *hand-written*, 56 *generated*, 29 *refused*):
+
+- `venus/executor/generated.rs`, portable and without `unsafe`: for the 141
+  commands served by translation, the walk that replaces every guest id in the
+  inputs — nested in structures, in arrays, in admitted pNext links — by the
+  host handle, through a `Resolve` the context implements (typed, of the
+  command's device, 0 only where vk.xml says `optional`/`noautovalidity`, with
+  a short list of handles vk.xml lets be null that a driver would dereference:
+  a stage's module, a pipeline's layout, `vkUpdateDescriptorSets`' `dstSet`,
+  set layouts, bound sets, index and vertex buffers); every enum checked
+  against the values core 1.0–1.3 defines and every flag word against the core
+  bits (from `vk.xml`'s `<feature>` blocks, not from the extensions); every
+  array against the count it travels with. Plus the tables the executor asks:
+  a command's dispatchable, its core version, its `VkResult`, its output
+  handles.
+- `host_vulkan/calls.rs`: the one place a translated command becomes a driver
+  call. Each structure is rebuilt as its `ash` twin in an arena
+  (`host_vulkan/arena.rs`) — every pointer into an arena-owned copy that
+  outlives the call, pNext links in the guest's order — and the entry point is
+  called through `ash`'s function table; outputs are written back. The one
+  `unsafe` contract is the translation's.
+
+The *generated* commands are exactly that; the *hand-written* ones add what
+only the context knows (`venus/executor/device_objects.rs`, `submit.rs`):
+binding the guest's ids to what a create made and taking them out on destroy,
+facts about objects later commands are judged by, bounds, submission's
+bookkeeping. `--check` runs in CI beside the other two generators; the script
+also refuses a classification that disagrees with the executor's `match` arms.
+
+### Validation posture
+
+1. **Typed ids everywhere**: an unknown id, one of another type, or one of
+   another device is fatal to the context, however deep in a structure it is.
+2. **Enum and flag ranges**: core Vulkan 1.3 values only — no device extension
+   is advertised, so an extension's value is no correct guest's.
+3. **Structural bounds** — counts, sizes, offsets into objects the renderer
+   knows, and indices into the fixed-size state a driver keeps on the host:
+   buffer ranges of fills, updates, copies, indirect draws and dispatches,
+   vertex and index bindings, descriptor buffer ranges and query-result copies
+   against the buffer's size; query ranges against the pool; descriptor writes
+   and copies against the set layout's bindings (the consecutive-binding rule
+   included, variable-count bindings at the count allocated); one dynamic
+   offset per dynamic descriptor bound; sets against the pipeline layout;
+   attachment references, preserve indices, dependencies and multiview arrays
+   inside their render pass; a framebuffer made for as many attachments as its
+   pass, and a clear value for every attachment a begin clears; viewports,
+   scissors, vertex bindings and attributes, colour attachments and push
+   constants within the device's limits; specialization entries inside their
+   data; one shader stage of each kind; a command no newer than the device's
+   version as the guest sees it (its entry point may not exist).
+4. **Past that, the driver**, as in vkr: full valid-usage checking is not the
+   goal. Two known edges: a buffer–image copy's footprint beyond its first
+   byte (it depends on format and extent; a transfer is not covered by
+   robustness either), and "ignored-if" pointers a driver reads anyway.
+5. **Containment**: every host device is created with `robustBufferAccess`
+   when it supports it, whatever the guest enabled, so a shader's stray buffer
+   access stays inside its buffer. The guest is not told: it enabled what it
+   enabled, and a robust device only behaves better. vkr enables none.
+
+### Submission, fences and waits
+
+What Mesa 26.0.8 sends (read from `vn_queue.c`, `vn_feedback.c`,
+`vn_command_buffer.c`, `vn_ring.c`): a recording is encoded locally and sent at
+`vkEndCommandBuffer` as one submission, through `vkExecuteCommandStreamsMESA`
+when it is over the ring's 8 KiB direct size (as is any large single command);
+`vkQueueSubmit` asynchronously (`vkQueueSubmit2` only with sync2, which the
+guest does not have yet); **no semaphore on any plain submit** (only the
+sparse path adds one); a fenced submit carries the fence's **feedback command
+buffer**, recorded once at `vkCreateFence` (barrier, `vkCmdFillBuffer` of
+`VK_SUCCESS` into the fence's slot of a host-visible feedback buffer, barrier
+to `HOST`) and resubmitted unchanged; the guest polls that slot and, once it
+reads signalled, sends an **asynchronous** `vkWaitForFences(1, fence, VK_TRUE,
+UINT64_MAX)`; `vkGetFenceStatus` only without feedback; `vkQueueWaitIdle` and
+`vkDeviceWaitIdle` never (vkr refuses both). All of it is served: the
+feedback command buffers are just more command buffers writing memory the guest
+maps (5b.1), and tested so, with the real GPU writing the slot the guest reads.
+
+- **Waits are real, and sliced.** `vkWaitForFences` is waited for on the ring
+  worker, in 20 ms slices with the context lock released between them, the
+  guest's timeout honoured to the slice (`UINT64_MAX` is forever); a ring being
+  torn down stops within a slice. The context's `ALIVE` monitor runs apart from
+  the worker and keeps the guest's watchdog fed meanwhile (tested with a GPU
+  that never finishes). `vkQueueWaitIdle`/`vkDeviceWaitIdle` are served from
+  each queue's record of pending work.
+- **Nothing is freed under the GPU.** Each queue records the fence of its
+  newest fenced submit (which covers every earlier batch) and whether an
+  unfenced submit followed. Every destroy, free and pool reset waits for that
+  record to clear first — the fence, or the queue going idle — so a guest that
+  destroys what a pending submission uses gets a wait, not a host driver
+  freeing memory under the GPU; Mesa's own order (wait, then destroy) never
+  waits. Device and context teardown wait for the device to go idle, as vkr.
+- **A lost device** (`VK_ERROR_DEVICE_LOST` from any call) is answered — the
+  command that met it is replied to and consumed — and the context is then
+  fatal. The VMM stays up; the objects are destroyed as ever.
+- **Pausing**: a slice-waiting ring holds its ADR-0005 pass for the whole wait,
+  so a pause during one is the bounded "pausing anyway" of
+  `Quiesce::wait_until_idle`. GPU work already submitted cannot be paused in
+  any case; a snapshot still refuses while any host Vulkan object is alive.
+
+### Where this differs from vkr
+
+`vkExecuteCommandStreamsMESA` copies each stream before decoding (vkr decodes
+in place while the guest may write), bounds the bytes one call names (64 MiB)
+and refuses a dependency that does not point forward (vkr ignores them); waits
+are sliced and `vkQueueWaitIdle`/`vkDeviceWaitIdle` are served; a lost device
+ends the context; destroys wait for pending work; every check in the posture
+above is ours; `vkFree{CommandBuffers,DescriptorSets}` must name the pool the
+objects came from; a pipeline call that fails partway destroys what it did make
+(vkr leaks it); `robustBufferAccess` is on; semaphores are refused (5b.3).
+
+### Measured on the RTX 2070
+
+Driven through a real ring with the generated driver-side encoder, exactly as
+the guest would (`host_vulkan::pipeline_tests`, driver 580.88, Windows):
+vk-smoke check 4 plus a fence feedback buffer — 16384 words through the blob,
+0 wrong, the feedback slot reads `VK_SUCCESS`; check 5 — vk-smoke's compute
+shader over 1 Mi elements, 0 wrong; check 6 — vk-smoke's triangle through a
+classic render pass, **256×256 exact, `fnv1a=0x2678f2a0e39fba1b`**, the
+checksum vk-smoke's README gives for the bare RTX 2070; a 293 872-byte shader
+module through `vkExecuteCommandStreamsMESA`, run over 4096 elements, 0 wrong;
+200 fenced submits, each waited for as Mesa waits, no word lost.
+
+### vk-smoke in the guest
+
+Checks 4, 5, 6 and 9 need nothing past this stage; 7 skips (the guest reports
+1.2). **Check 8 creates a timeline semaphore** — asynchronously, so its refusal
+makes the context fatal and the guest's next ring wait finds the ring dead —
+so run `--checks 4,5,6,7,9` to see 9; in the default order 8 ends the run.
+Nothing before check 8 names a semaphore.
+
+## Amendment, 2026-09-24 — a Linux guest renders on the host GPU, with exact pixels
+
+The guest acceptance for 5b.1 and 5b.2 was `guest/vk-smoke` inside the Ubuntu
+guest (Mesa 26.0.8 venus, root, fetched over usernet) against the executing
+renderer (commit `3f68f67`), run with `--checks 1,2,3,4,5,6,7,9`. Check 8
+needs semaphores, which are stage 5b.3, and refusing them ends the context:
+
+```
+SMOKE 1 instance     PASS  "Virtio-GPU Venus (NVIDIA GeForce RTX 2070)" apiVersion=1.2.0
+SMOKE 2 device       PASS
+SMOKE 3 host-memory  PASS  1 MiB, type 3, write/unmap/remap/read back
+SMOKE 4 transfer     PASS  fill x3 + update + 2-region copy of 64 KiB verified
+SMOKE 5 compute      PASS  1048576 elements, all f(i) correct
+SMOKE 6 graphics     PASS  256x256 exact, fnv1a=0x2678f2a0e39fba1b
+SMOKE 7 dynamic-rendering  SKIP  (guest reports 1.2 — stage 5b.3)
+SMOKE 9 many-submits PASS  1000 submits, 1000 fences, none lost
+SMOKE DONE pass=7 fail=0 skip=2
+```
+
+After 5b.1 alone, checks 1–3 passed and the renderer refused
+`vkAllocateCommandBuffers` by name, exactly where that stage ended.
+
+The triangle's checksum is **the one the same binary produces on the bare RTX
+2070 on the host**, so the guest's pixels are bit-identical to native. The
+renderer logged no refusal.
+
+### Observed, not yet understood: GPU time
+
+GPU time from the smoke test's own timestamps is far higher in the guest than
+native: 24 ms against 0.64 ms for compute, and 12.9 ms against 0.20 ms for the
+triangle. The prime suspect is placement. The 5a.3 memory policy hides
+`HOST_VISIBLE` on the BAR type, so every buffer the guest wants mapped lands in
+system memory (type 3), and the GPU reads and writes it across PCIe. The fix,
+if that is it, is a real workload decision: which types to expose, and whether
+a guest's storage buffers belong in memory the guest never maps. This is a
+performance item, not a correctness one.
+
+## Amendment, 2026-09-24 — stage 5b.3, semaphores, sync-file emulation, queue timelines and Vulkan 1.3
+
+The executor now serves semaphores, the sync-file semaphore import Mesa's WSI
+rests on, and virtio-gpu fences on every queue's `ring_idx` timeline, and it
+advertises `VK_KHR_synchronization2`. Against Mesa 26.0.8 that is what turns
+the guest's device into **Vulkan 1.3 with `VK_KHR_swapchain`**: the three
+gates of "Resolved — why the guest said 1.2" are now open.
+
+### What the guest is shown
+
+| extension | how | what it obliges the renderer to |
+|---|---|---|
+| `VK_KHR_synchronization2` | passed through, on a device of 1.3 or newer | every command it adds is core 1.3 (`vkQueueSubmit2`, `vkCmdPipelineBarrier2`, `vkCmd{Set,Reset,Wait}Event{s}2`, `vkCmdWriteTimestamp2`, the KHR aliases encoded as the core commands), all served; its structures are core 1.3 (`VkDependencyInfo`, `Vk*MemoryBarrier2`, `VkSubmitInfo2`, `VkSemaphoreSubmitInfo`, `VkCommandBufferSubmitInfo`, `VkPhysicalDeviceSynchronization2Features`) and admitted; capset bit 315, already set by 5b.1 |
+| `VK_KHR_external_semaphore_fd` | **emulated**, advertised whatever the host has | the `SYNC_FD` answer below; stripped from `vkCreateDevice` (Mesa adds it for every device an application wants a swapchain on, `vn_device.c:333-337`) and `VkExportSemaphoreCreateInfo{SYNC_FD}` stripped from `vkCreateSemaphore`, before the driver sees either; `vkImportSemaphoreResourceMESA` and `vkWaitSemaphoreResourceMESA`. Its own two commands are never sent (Mesa implements them itself) and it chains no structure, so it needs no capset bit |
+
+`vkGetPhysicalDeviceExternalSemaphoreProperties(SYNC_FD)` answers
+**`IMPORTABLE` only** for a binary semaphore (compatible type `SYNC_FD`,
+nothing exportable), and nothing for a timeline one; every other handle type
+gets the host driver's own answer. `IMPORTABLE` is what sets
+`renderer_sync_fd.semaphore_importable` (`vn_physical_device.c:1124-1141`),
+and that one flag is the gate on sync2 (`:1262-1271`, and with it 1.3,
+`:538-543`) and on the swapchain (`:1212-1224`). `EXPORTABLE` would also make
+the guest offer `VK_KHR_external_semaphore_fd` to its applications
+(`:1173-1179`), whose `vkGetSemaphoreFdKHR` exports through a fence on the
+queue's timeline and `vkWaitSemaphoreResourceMESA`; both are implemented and
+tested, but nothing in 1.3 or the swapchain needs an application to export a
+sync file, so the promise is not made. It is one constant to flip.
+
+The executor's version gate is now the guest's version as Mesa 26.0.8 will
+show it — the host's capped at 1.3, and 1.2 when sync2 is not advertised — so
+a core-1.3 command passes exactly when the guest can have one of its own to
+send. On the RTX 2070 that is 1.3 (`apiVersion 1.3.312` from the host's 1.4;
+the guest clamps it to 1.3.0 because protocol spec 2 cannot carry host image
+copy, `:535-536`). Features2 and Properties2 answer every 1.3 structure from
+the host's chain (`VkPhysicalDeviceVulkan13Features`/`Properties`, and the
+individual sync2, dynamic-rendering and maintenance4 structures).
+
+### What the guest sends on the WSI and sync-file paths, and what each becomes
+
+Read from 26.0.8's `vn_queue.c` and `vn_wsi.c`. Without a dma-buf export the
+guest's common WSI runs in its software mode (`vn_wsi.c:134-139`): images are
+copied by the CPU, and the renderer sees ordinary submits and fences.
+
+| guest | when | here |
+|---|---|---|
+| `vkCreateSemaphore` (binary; timeline with `VkSemaphoreTypeCreateInfo`; `VkExportSemaphoreCreateInfo` if the application asked) | async | created; `SYNC_FD` stripped from the export, any other type must be one the host exports |
+| `vkQueueSubmit`/`vkQueueSubmit2` with waits and signals | async; `Submit2` once the device is 1.3 (`vn_device.c:554`) | translated; timeline values and device-group indices checked against the counts a driver indexes by; each binary semaphore's state tracked (below) |
+| `vkImportSemaphoreResourceMESA`, resource 0 | before a submit that waits on a semaphore whose temporary payload was an imported sync file the guest already waited for itself (`vn_queue.c:387-417`) — every acquired swapchain image | **recorded, not performed**: the semaphore has a signalled temporary payload, and the next wait consumes it — a submit's wait on it is taken out of the batch before the host sees it |
+| `vkWaitSemaphoreResourceMESA` | `vkGetSemaphoreFdKHR` (`:2440-2495`), which needs an exportable renderer (not offered) | the temporary payload consumed if there is one, otherwise the permanent one with an empty submit that waits on it |
+| execbuffer with a fence on the queue's `ring_idx`, carrying `vkWaitRingSeqnoMESA` | `vn_create_sync_file`, the same exports | a host fence on the bound queue, retired by the queue's fence thread |
+| `vkWaitSemaphores(UINT64_MAX)` async, `vkGetSemaphoreCounterValue`, `vkSignalSemaphore` | timeline feedback read signalled; feedback off; host signal | a real wait in 20 ms slices off the context lock, like `vkWaitForFences`; passed through; timeline semaphores only |
+| `vkImportFenceResourceMESA`, `vkResetFenceResourceMESA` | never; only with an exportable sync-file fence, not advertised | refused |
+
+Why the import is bookkeeping and not the "empty signalling submit" the
+2026-09-23 finding suggested: vkr imports a sync file of `-1` as a
+*temporary* payload, and a signalling submit gets that wrong three ways — it
+waits behind the queue's earlier work, it changes the *permanent* payload a
+temporary import must leave alone, and when the permanent payload is already
+signalled it is a signal of a signalled binary semaphore, which a driver need
+not survive. Dropping the consuming wait is exactly what waiting on a
+signalled temporary payload means. The same per-semaphore record refuses a
+binary wait with no signal submitted before it (a GPU that waits forever) and
+a second signal of a signalled binary semaphore, before the driver sees them.
+
+### Fences on a queue's timeline, and the waiter model
+
+`virtio_gpu::fence` keeps one FIFO per timeline — the device's
+(`VIRTIO_GPU_FLAG_INFO_RING_IDX` clear: every virgl fence, unchanged) and one
+per `(context, ring_idx)` — in one bounded table, so a retirement completes
+only its own timeline's prefix and the cap, the watchdog and a reset's drain
+stay what they were. A renderer names the timeline through additive
+`Renderer3d` methods whose defaults are the old behaviour, so virgl's fences
+are untouched. `ring_idx` 0 is the context's CPU timeline and, as in vkr, is
+signalled at once (the context commands before it have run). Every other
+`ring_idx` goes to the executor: an empty `vkQueueSubmit` with a host fence
+on the queue bound to it (a fence on a timeline no queue is bound to is
+refused, as vkr refuses it, and the device answers it at once), handed to
+**that queue's fence thread**, started by its first fence, which waits for
+the FIFO's head in 50 ms slices, destroys the host fence and records the
+retirement for the device, then wakes it. As vkr: one thread per queue,
+because the ring workers must not block and one `vkWaitForFences` covers one
+device and one fence at a time; a single poller would add latency to every
+fence or leave a signalled one waiting behind another queue.
+
+- **ADR-0005.** The fence thread touches no guest memory and takes no lock
+  the executor or the device holds; the guest sees a retirement only when the
+  device's (gated) queue worker writes the held response, so it takes no pass,
+  and a pause neither waits for it nor breaks it. `vkDestroyDevice`, context
+  destruction and reset stop and join every fence thread of the device (one
+  slice), wait for the device to go idle, then destroy the fences still queued
+  and retire them in order, as vkr does when a queue goes; a reset then drops
+  every retirement of the old boot, so none can complete a new boot's fence of
+  the same id. Tested on a paused VM.
+- **ADR-0006.** A snapshot is refused by name while any ring fence is queued
+  or retired and not yet collected, before the executor's own refusal of live
+  host objects.
+- The capset's `supports_multiple_timelines` is now true for the executing
+  renderer (false for a capture, which has no queue); Mesa only asserts it.
+
+### Core 1.3 coverage
+
+Every core 1.3 command the protocol decodes is served except two:
+`vkGetDeviceImageSparseMemoryRequirements` (every sparse feature is reported
+false) and `vkGetPhysicalDeviceToolProperties` (answered by the guest driver
+itself). Of the rest, `vkQueueSubmit2`, `vkCmdBeginRendering`,
+`vkCmdBindVertexBuffers2`, `vkCmdCopy{Buffer,BufferToImage,ImageToBuffer}2`,
+`vkCmdSet{Viewport,Scissor}WithCount`, `vkCmdWriteTimestamp2` and the private
+data commands are hand-written with bounds; `vkGetDevice{Buffer,Image}MemoryRequirements`
+are bespoke (5b.1); the rest pass through the generated translation. Dynamic
+rendering is bounded as a render pass is: colour attachments inside
+`maxColorAttachments` in `vkCmdBeginRendering`, `VkPipelineRenderingCreateInfo`
+and an inherited `VkCommandBufferInheritanceRenderingInfo`
+(`vkBeginCommandBuffer` is hand-written for it), a view mask inside
+`maxMultiviewViewCount`, a layer count and a render area; every view is a
+typed id of the device.
+
+### Measured on the RTX 2070
+
+Driven through a real ring with the generated driver-side encoder, as the
+guest would (`host_vulkan::pipeline_tests`, driver 580.88, Windows): the
+device shown as `apiVersion 1.3.312` with `VK_KHR_synchronization2` and
+`VK_KHR_external_semaphore_fd`, `SYNC_FD` features `0x2`; vk-smoke check 7 —
+the triangle through `vkCmdBeginRendering`, its transitions through
+`vkCmdPipelineBarrier2`, submitted with `vkQueueSubmit2` — **256×256 exact,
+`fnv1a=0xd79d631c4d62403b`**, the checksum of the bare RTX 2070; check 8 — a
+timeline semaphore across two submits, the host's wait for 2 in 7.1 ms,
+counter 2, 0 words wrong, then `vkQueueWaitIdle` and `vkDeviceWaitIdle`; the
+WSI sequence (three frames of import, render signalling a binary semaphore,
+the present's `vkQueueSubmit2` waiting on it with a fence, then a sync-file
+export) with no refusal; and a fence on timeline 1 retired 82 ms after a
+submit of eight 32 MiB fills, with all 8 388 608 words already written.
+
+Owed: the guest acceptance (vk-smoke all nine checks with the guest at 1.3,
+and `vulkaninfo` listing `VK_KHR_swapchain` and `VK_KHR_synchronization2`),
+and presenting through a real swapchain, which in the guest's software WSI
+is CPU copies — correct, and slow.
+
+## Amendment, 2026-09-24 — Vulkan 1.3 in the guest, all nine checks, and a swapchain
+
+Guest acceptance for 5b.3, run the same way as the one above (commit
+`06b9754`, full `vk-smoke`, no `--checks`):
+
+```
+SMOKE 1 instance          PASS  "Virtio-GPU Venus (NVIDIA GeForce RTX 2070)" apiVersion=1.3.0
+SMOKE 2 device            PASS  timeline_semaphore=core, dynamic_rendering=core
+SMOKE 3 host-memory       PASS
+SMOKE 4 transfer          PASS
+SMOKE 5 compute           PASS  1048576 elements, all f(i) correct
+SMOKE 6 graphics          PASS  fnv1a=0x2678f2a0e39fba1b
+SMOKE 7 dynamic-rendering PASS  fnv1a=0xd79d631c4d62403b
+SMOKE 8 timeline-sync     PASS  A signals 1, B waits 1 and signals 2, counter=2
+SMOKE 9 many-submits      PASS  1000 submits, 1000 fences, none lost
+SMOKE DONE pass=9 fail=0 skip=0
+```
+
+The guest's own `vulkaninfo` now reports `apiVersion = 1.3.0` for the venus
+device and lists **`VK_KHR_swapchain`** (revision 70) and
+`VK_KHR_synchronization2`. That is the gate diagnosed above, opened by the
+sync_fd emulation. Both triangle checksums match the bare RTX 2070 on the
+host. The renderer logged no refusal.
+
+`1.3.0`, not `1.3.x`, is Mesa's own clamp for venus protocol spec version 2
+(`vn_physical_device.c:535-536`). Going past it needs protocol v3 and its
+host-image-copy obligations, which nothing needs yet.
+
+With a swapchain exposed, a Vulkan application in the guest can now present.
+Without dma-buf, Mesa's WSI takes its software path (`vn_wsi.c:134`): it renders
+on the GPU and copies the result into shared memory for the guest's display
+server. That is the next thing to measure.
+
+## Amendment, 2026-09-24 — vkcube on the guest's desktop, rendered by the host GPU
+
+The first real Vulkan *application* in the guest. Ubuntu 26.04 GNOME, logged
+in automatically on `seat0` under Wayland; `vkcube --wsi wayland` run as the
+session's user:
+
+```
+Selected GPU 0: Virtio-GPU Venus (NVIDIA GeForce RTX 2070), type: DiscreteGpu
+```
+
+It stayed up for the whole run (several minutes), the renderer logged no
+refusal, and the VMM's own screenshot shows the textured LunarG cube
+spinning in a window on the GNOME desktop. The path is this ADR's whole
+stack on WHP: the guest's Mesa venus driver, our transport and ring, the
+generated protocol, the executor on the RTX 2070, and our imported pages
+mapped through WHP. Because we export no dma-buf, Mesa's WSI takes its
+software path (`vn_wsi.c:134`): the GPU renders, the frame is copied into
+`wl_shm`, and the guest's own compositor puts it on the existing 2D scanout.
+
+### The bug the first run found
+
+The first attempt died at once. We refused `vkCreateCommandPool` on queue
+family 1, because the device had been created with a queue in family 0 only.
+That check was stricter than the spec: `queueFamilyIndex` need only name one of
+the *physical* device's families
+(`VUID-vkCreateCommandPool-queueFamilyIndex-01937`). Mesa's WSI relies on
+exactly that — `wsi_swapchain_init` makes a blit pool for every family,
+whether a queue exists on it or not. The check now follows the spec, and a
+protected pool still needs a protected queue on its family. The case is pinned
+by `a_command_pool_may_name_any_family_of_the_physical_device_as_mesa_wsi_does`.
+
+It is the first bug a real *application* found that none of our tests,
+the guest-side smoke test included, could have found. That is the argument
+for running real applications next, rather than growing the smoke test.
+
+### What this does not yet show
+
+- **GNOME itself is not on the GPU.** `gnome-shell` maps only `dri_gbm.so`;
+  its GL runs in software. A composited desktop on the GPU means GL on
+  Vulkan (Zink) over venus, and Zink with GBM/KMS needs dma-buf-shaped
+  exports that this renderer does not make.
+- **Every frame crosses the CPU twice**: guest WSI copy into `wl_shm`, then
+  the compositor's scanout upload on the host. It is correct, and far from
+  the zero-copy path the 2026-09-16 amendments measured.
+- **Frame rate** has not been measured.
+
+## Amendment, 2026-09-24 — OpenGL is not on the GPU yet, and why
+
+`glmark2-wayland` with `MESA_LOADER_DRIVER_OVERRIDE=zink` ran for minutes at
+roughly 280 FPS, which looked like success. It was not: its own
+`GL_RENDERER` line says `llvmpipe (LLVM 21.1.8, 256 bits)`, and so does
+`eglinfo` for every profile. The override failed silently and GL fell back
+to software. The lesson is the one ADR-0004 recorded for `VN_DEBUG`: read
+the renderer string before believing a frame rate.
+
+Mesa said why when asked (`MESA_LOG_LEVEL=debug`, surfaceless EGL):
+`ZINK: failed to choose pdev`. Read from Mesa 26.0.8:
+
+- **The DRM identity.** On the EGL/GBM path, zink is handed the render
+  node and picks the Vulkan device whose `VkPhysicalDeviceDrmPropertiesEXT`
+  names that node (`zink_screen.c:1660-1685`, `:1736-1777`). Venus normally
+  reports the virtgpu node, but `vn_wsi_init` zeroes the DRM and PCI identity
+  and hides `EXT_physical_device_drm` whenever `vendorID == 0x10de`
+  (`vn_wsi.c:155-174`). That quirk exists for a real NVIDIA GPU visible to a
+  guest's WSI. We pass the host's vendor ID through, so zink never finds its
+  device.
+- **Then extension *strings*.** zink requires `VK_KHR_maintenance1`,
+  `create_renderpass2`, `imageless_framebuffer`, `dynamic_rendering` and
+  `descriptor_update_template` by name. Core 1.3 promotion does not count
+  (`zink_device_info.py:506-525`). It also requires `nullDescriptor` from
+  robustness2 (`zink_screen.c:3458-3461`).
+- **Then `VK_KHR_external_memory_fd`** (`zink_screen.c:3862-3866`), which
+  venus exposes only if the renderer advertises
+  `VK_EXT_external_memory_dma_buf` (`vn_physical_device.c:1040-1051`).
+- **GL version gates** beyond that: transform feedback, depth clip and
+  vertex divisor for 3.3; the `maintenance2` string for 4.0; a *reported*
+  `robustBufferAccess` for 4.3; the `draw_indirect_count` string for 4.6.
+
+Separately, venus decides software WSI (the `wl_shm` path vkcube uses) from
+`driverID`/`driverVersion`, not from `vendorID`: NVIDIA below 590.48.1, or no
+dma-buf advertised (`vn_wsi.c:134-139`). Advertising an emulated dma-buf would
+therefore flip WSI onto a path this renderer cannot serve the day the host
+driver reaches 590.48, unless the reported version is held below it.
+
+Stage 5c takes these in order: report the virtio vendor ID (`0x1af4`) for an
+NVIDIA host, hold the reported driver version under the dma-buf-WSI line,
+advertise and serve the extensions above, and emulate
+`VK_EXT_external_memory_dma_buf` over our own pages.
+
+## Amendment, 2026-09-24 — stage 5c: the identity, Zink's extensions, and dma-buf over our pages
+
+Stage 5c is the list above, built. None of it is guest acceptance yet: the
+RTX 2070 runs every new path through a real ring (below), and `eglinfo` and
+`glmark2-wayland` under `MESA_LOADER_DRIVER_OVERRIDE=zink` are the next
+measurement. Two citations above, corrected from 26.0.8: the five extensions
+Zink requires by name are declared at `zink_device_info.py:62-63, 93-94,
+180-183, 203-206, 313-314` and refused at `:755-758`, and
+`zink_get_display_device` is `zink_screen.c:1666-1685`.
+
+### The identity (`policy::shape_identity`)
+
+- **`vendorID` `0x10de` is shown as `0x1af4`**, the virtio PCI vendor —
+  Mesa's `VIRTGPU_PCI_VENDOR_ID`, what the guest's render node really is
+  (`vn_renderer_virtgpu.c:44`, `:1461`). `deviceID`, `deviceName`,
+  `driverID` and `driverVersion` stay the host's. The `vn_wsi_init` quirk is
+  for a real NVIDIA GPU visible to the guest's window system; ours is a
+  virtual device, and what the NVIDIA workarounds of Zink and of venus itself
+  key on is `driverID` (`zink_screen.c:2943`, `vn_query_pool.c:135`), which
+  is kept. With the quirk not triggered, venus reports the virtgpu node's DRM
+  numbers and `EXT_physical_device_drm`, and Zink's match has something to
+  match.
+- **An NVIDIA `driverVersion` at or past 590.48.01 is shown as 590.48.0.0**
+  (`VN_MAKE_NVIDIA_VERSION`, `vn_common.h:76-78`: 10, 8, 8 and 6 bits; the
+  RTX 2070's 580.88 is `0x91160000`, which its `vulkaninfo` prints as
+  2434138112). Venus keeps its software WSI for an NVIDIA driver below that
+  line even when the renderer lists dma-buf (`vn_wsi.c:134-139`), and the
+  guest shows applications its own `driverVersion` anyway
+  (`vn_physical_device.c:550-554`). Today's 580.88 is untouched. **Removing
+  the cap is the switch that turns dma-buf WSI on**, once this renderer has a
+  dma-buf path to present through.
+- **A non-NVIDIA host is not offered the dma-buf pair**
+  (`policy::keeps_software_wsi`, `advertised_extensions_on`). For any other
+  driver the same line of `vn_wsi.c` puts venus's WSI on its native dma-buf
+  path the moment dma-buf is listed, and that path exports device-local,
+  optimal-tiling swapchain images this renderer cannot make: advertising it
+  there would trade a working swapchain for Zink's DRM screen. On such a host
+  Zink stays on the guest's software GL until dma-buf WSI exists. This
+  refines the stage-5c design, which named only the NVIDIA case.
+
+### What the guest is shown (`policy`)
+
+On the RTX 2070 (Windows, 580.88), from
+`host_vulkan::pipeline_tests::the_host_gpu_is_shown_what_zink_needs`: **71
+device extensions**, `apiVersion 1.3.312`, vendor `0x1af4`, device `0x1f02`,
+`driverVersion 0x91160000`.
+
+| kind | extensions | what it obliges the renderer to |
+|---|---|---|
+| promoted to 1.1–1.3, passed through (`PROMOTED_EXTENSIONS`: 58, of which the RTX 2070 has 57 — not `EXT_texture_compression_astc_hdr`) | 1.1: `16bit_storage`, `bind_memory2`, `dedicated_allocation`, `descriptor_update_template`, `external_{fence,memory,semaphore}`, `get_memory_requirements2`, `maintenance1/2/3`, `multiview`, `relaxed_block_layout`, `sampler_ycbcr_conversion`, `shader_draw_parameters`, `storage_buffer_storage_class`, `variable_pointers`; 1.2: `8bit_storage`, `buffer_device_address`, `create_renderpass2`, `depth_stencil_resolve`, `draw_indirect_count`, `driver_properties`, `image_format_list`, `imageless_framebuffer`, `sampler_mirror_clamp_to_edge`, `separate_depth_stencil_layouts`, `shader_atomic_int64`, `shader_float16_int8`, `shader_float_controls`, `shader_subgroup_extended_types`, `spirv_1_4`, `timeline_semaphore`, `uniform_buffer_standard_layout`, `vulkan_memory_model`, `EXT_descriptor_indexing`, `EXT_host_query_reset`, `EXT_sampler_filter_minmax`, `EXT_scalar_block_layout`, `EXT_separate_stencil_usage`, `EXT_shader_viewport_index_layer`; 1.3: `copy_commands2`, `dynamic_rendering`, `format_feature_flags2`, `maintenance4`, `shader_integer_dot_product`, `shader_non_semantic_info`, `shader_terminate_invocation`, `synchronization2`, `zero_initialize_workgroup_memory`, `EXT_image_robustness`, `EXT_inline_uniform_block`, `EXT_pipeline_creation_cache_control`, `EXT_pipeline_creation_feedback`, `EXT_private_data`, `EXT_shader_demote_to_helper_invocation`, `EXT_subgroup_size_control`, `EXT_texture_compression_astc_hdr` | nothing new: every command is core in that version and encoded as the core command, every own structure is core and admitted — the rule the list is drawn up by, from vk.xml. Out by the same rule: `KHR_device_group` (swapchain interactions), and `EXT_4444_formats`, `EXT_extended_dynamic_state`, `EXT_extended_dynamic_state2`, `EXT_texel_buffer_alignment`, `EXT_ycbcr_2plane_444_formats` (feature structures that were not promoted). `descriptor_update_template` is in because its one non-core command needs `KHR_push_descriptor`, not offered. Each only on a device of its version or newer |
+| admitted, passed through (`ADMITTED_EXTENSIONS`) | `EXT_robustness2` (`KHR_` where the host has it; the RTX 2070 has not), `EXT_transform_feedback`, `EXT_conditional_rendering`, `EXT_line_rasterization` and `KHR_`, `EXT_vertex_attribute_divisor` and `KHR_`, `EXT_depth_clip_enable`, `EXT_provoking_vertex`, `EXT_custom_border_color`, `EXT_border_color_swizzle` | their 25 structures, each admitted only on a device that enabled an extension bringing it; their feature and property structures queried from the host (gated on the host reporting the extension — the host instance is 1.3, and several are 1.4 names); their commands served (below); their enum values and flag bits legal once enabled |
+| emulated | `KHR_external_semaphore_fd` (5b.3), `EXT_external_memory_dma_buf`, `KHR_external_memory_fd` | the emulation below; all three stripped from a device create before the host sees it. `KHR_external_memory_fd` is listed because venus adds it with dma-buf to every device create that wants a swapchain or an fd (`vn_device.c:318-330`) |
+
+The capset's enumerated mask is still derived from the admitted structures:
+72 extensions (60, and the twelve admitted device extensions). The generators
+read `ADMITTED_EXTENSIONS` out of `policy.rs`, so the bridge, the translation
+and the policy are one list. `robustBufferAccess` is *reported* as the host
+reports it (Zink's GL 4.3 gate), and forced on every host device as before,
+which `robustBufferAccess2` needs.
+
+### Commands and bounds
+
+The nine new commands are classified in `executor-classes.txt` and go
+through the generated translation and host call like every other; the host
+call reaches the driver through `calls::ExtTables`, the `ash` tables of the
+admitted extensions the host device was created with. An extension command
+on a device that enabled none of its extensions is refused
+(`ExecError::NotEnabled`), and so are its structures (the generated chain
+walk) and its values (generated `x_`/`m_` helpers over `Resolve::enabled`,
+from vk.xml's extension `<require>` blocks and their `depends` — so sync2's
+transform-feedback stage and access bits are legal exactly with transform
+feedback).
+
+| command | bounded by hand |
+|---|---|
+| `vkCmdBindTransformFeedbackBuffersEXT` | bindings inside `maxTransformFeedbackBuffers`; each buffer `TRANSFORM_FEEDBACK`, its offset 4-aligned inside it, its range inside it and inside `maxTransformFeedbackBufferSize` |
+| `vkCmd{Begin,End}TransformFeedbackEXT` | counter slots inside the limit; each non-null counter 4 aligned bytes inside a `TRANSFORM_FEEDBACK_COUNTER` buffer |
+| `vkCmd{Begin,End}QueryIndexedEXT` | the query inside its pool; the index a stream the device has for a stream query, 0 otherwise (a stream pool's results are two values a query) |
+| `vkCmdDrawIndirectByteCountEXT` | the counter 4 aligned bytes inside its buffer; a stride in `1..=maxTransformFeedbackBufferDataStride` |
+| `vkCmdBeginConditionalRenderingEXT` | the predicate 4 aligned bytes inside a `CONDITIONAL_RENDERING` buffer (`End` is generated) |
+| `vkCmdSetLineStipple` | a factor in `[1, 256]`, as in `VkPipelineRasterizationLineStateCreateInfo` |
+
+Beyond the commands: a rasterization stream inside
+`maxTransformFeedbackStreams`; vertex divisors naming bindings inside
+`maxVertexInputBindings`, divisors inside `maxVertexAttribDivisor`; no more
+live custom-border-colour samplers than `maxCustomBorderColorSamplers`, a
+driver's fixed table; with robustness2's `nullDescriptor`, a null image
+view, texel view, buffer (offset 0, whole range) or vertex buffer (offset 0)
+is the guest's to send — Zink binds one for every unbound slot — and without
+it they are refused as before. A feature structure of an extension the guest
+did not enable is judged, and never forwarded.
+
+### `VK_EXT_external_memory_dma_buf`, emulated over our pages
+
+A dma-buf here is what a blob of this renderer already is: our pages.
+
+- **Queries.** `vkGetPhysicalDeviceExternalBufferProperties(DMA_BUF)`
+  answers `EXPORTABLE | IMPORTABLE`, compatible with and exportable from
+  `DMA_BUF`, exactly when the host would import our pages for such a buffer
+  (`HOST_ALLOCATION` `IMPORTABLE`), and nothing otherwise; every other handle
+  type is answered nothing. An image query with `DMA_BUF` — which 26.0.8
+  answers itself as unsupported for every tiling but DRM modifiers
+  (`vn_physical_device.c:2812-2817`), so only another guest driver would send
+  it — is asked of the host as `HOST_ALLOCATION` and answered the same way,
+  or `VK_ERROR_FORMAT_NOT_SUPPORTED`.
+- **Resources.** `VkExternalMemory{Buffer,Image}CreateInfo{DMA_BUF}` is
+  accepted on a device that enabled dma-buf (any other handle type is fatal).
+  The host resource is created as every resource is, for host allocations
+  when the host allows, and one that can take our pages then asks for them
+  alone in its `memoryTypeBits`. Zink creates every shared image this way,
+  with the `OPAQUE_FD` venus rewrites to `DMA_BUF`, and asks no format query
+  first (`zink_resource.c:1336-1340`, `:1504`).
+- **Exports.** `VkExportMemoryAllocateInfo{DMA_BUF}` is an ordinary
+  allocation. On a host-visible type it is our pages, and the blob Mesa makes
+  of it at once (`vn_device_memory_alloc_export`) is those pages, as for any
+  mapped memory. On any other type there is nothing to share: the memory is
+  made, its blob refused, and the guest's `vkAllocateMemory` answers
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` and frees it — refused in Vulkan terms. (Not
+  making the memory would make the guest's following free fatal.)
+- **Imports.** `vkGetMemoryResourcePropertiesMESA` and
+  `VkImportMemoryResourceInfoMESA` take a blob of `VkDeviceMemory` of this
+  renderer that the context made or is **attached** to, and nothing else
+  (`VK_ERROR_INVALID_EXTERNAL_HANDLE`, vkr's answer for a resource it cannot
+  import; vkr is fatal for a resource the context does not hold, which a
+  guest cannot tell from one not attached yet). The import is a new
+  `VkDeviceMemory` importing **the same pages** with
+  `VK_EXT_external_memory_host`, as a host-visible type the host accepts them
+  for, no larger than the blob; no blob is made of it again. Cross-context
+  sharing reaches the renderer as `CTX_ATTACH_RESOURCE`, which the guest
+  kernel sends when another process opens a GEM handle of the dma-buf: the
+  device used to answer a blob's attach alone, and now tells the renderer too
+  (`Renderer3d::ctx_attach_blob`, a no-op by default). Memory blobs live in
+  the blob directory beside rings and reply windows, and can never be bound
+  as either.
+- **Lifetime.** The import holds the pages' `Arc`, taken under the
+  directory lock, like the exporting memory, its blob and its publication;
+  the pages go when the last holder does, and the budget is charged once, at
+  the first allocation. The exporter may free its memory, destroy its blob or
+  its whole context first: the importer's GPU keeps writing pages that exist,
+  and a partition never maps pages the allocator reused (tested in that
+  order). A detach afterwards stops new imports and changes nothing for one
+  made.
+- **Left out**: `EXT_image_drm_format_modifier` and `EXT_queue_family_foreign`
+  (GNOME on the GPU is a later stage). Without the first Zink has no dma-buf
+  modifier queries and cannot export an image it did not create exportable
+  (`zink_screen.c:3613`, `zink_resource.c:1960-1962`); without the second its
+  `dmabuf` capability is 0 (`zink_screen.c:1128-1136`), so it offers no PRIME
+  import or export — EGL dma-buf image import and GBM buffer sharing are off
+  — while rendering into its own images and presenting through kopper's
+  (software) Vulkan swapchain are not affected.
+
+### Measured on the RTX 2070
+
+Driven through real rings with the generated driver-side encoder
+(`host_vulkan::pipeline_tests`, driver 580.88, Windows):
+
+- **Transform feedback.** A hand-assembled SPIR-V vertex shader (`Xfb`,
+  `XfbBuffer 0`, stride 16) writing `(i, 2i, 7, 1)`, one triangle with
+  rasterizer discard under dynamic rendering with no attachment, captured
+  into host-visible memory: `[0,0,7,1, 1,2,7,1, 2,4,7,1]`, nothing past it,
+  and the end counter at 48 bytes.
+- **Conditional rendering.** vk-smoke's compute shader over 4096 elements
+  inside `vkCmdBeginConditionalRenderingEXT`, the predicate written through
+  the blob: 0 — all 4096 untouched; 1 — all 4096 written.
+- **dma-buf across two contexts.** Context 1 exports 64 KiB for a `DMA_BUF`
+  buffer and writes a pattern through its blob; context 2, attached, imports
+  it on its own device, copies it into a buffer of its own and fills the
+  import: 16384 words of context 1's read by context 2, 0 wrong, and context
+  2's fill read back through context 1's blob, 0 wrong. One set of pages, two
+  `VkDevice`s importing it.
+
+### What the guest should report
+
+Zink's own gates for GL 4.6 are met on this device as the guest will see it
+(`draw_indirect_count`, transform feedback with 4 streams and 4 buffers,
+`robustBufferAccess` with `robustImageAccess2`, the `maintenance2` string,
+depth clip, vertex divisors). The expectation for the guest acceptance:
+`eglinfo` names `zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070)
+(MESA_VENUS))` with OpenGL 4.6 core and compatibility profiles and OpenGL ES
+3.2 — to be read from the run, not assumed.
+
+## Amendment, 2026-09-24 — OpenGL runs on the host GPU; a window does not yet
+
+After stage 5c and two fixes that only real zink traffic could find, the
+guest's GL runs on the RTX 2070. With `MESA_LOADER_DRIVER_OVERRIDE=zink`,
+surfaceless EGL gives:
+
+```
+OpenGL core profile renderer: zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070) (MESA_VENUS))
+```
+
+— core, compatibility and ES, all on our device.
+
+### The two fixes
+
+- **A bind is judged against what the host allocated.** Venus computes a
+  buffer's memory requirements from a per-usage cache as
+  `align(size, cached.alignment)` (`vn_buffer.c:136-146`), an
+  implementation-defined rule. On this host a 4-byte buffer really needs
+  16 bytes at alignment 16, so the guest allocated 4 bytes and bound 16.
+  vkr does not check and the driver allocates in pages, so nobody else
+  notices. The check exists to protect the host allocation, so it now
+  measures that: a non-dedicated allocation is rounded up to a blob page on
+  the host, host-visible memory already is whole pages, and binds are
+  judged against `MemoryObject::host_size`.
+- **A size query ignores the size it is handed.** The generated host call for
+  `vkGetPipelineCacheData` bounded `*pDataSize` even when `pData` was NULL —
+  the size query, whose input the spec says is ignored, and which carries
+  whatever the app's variable held. `vkGetQueryPoolResults` shared the
+  pattern. The fix is in `scripts/venus-exec-gen.py`, so it covers both.
+
+Each fix has a test that fails without it. The pipeline-cache one runs on the
+real RTX 2070, where the cache header is 36 bytes.
+
+### What still falls back
+
+The Wayland EGL platform creates the zink screen, then fails at
+`dri2_setup_device` ("DRI2: failed to setup EGLDevice",
+`platform_wayland.c:2737-2740`) and drops to llvmpipe. libdrm is not the
+cause: a guest probe shows `drmGetDevice2` on both `card0` and `renderD128`
+equal to the only `drmGetDevices2` entry. So the fd EGL holds at that point
+is not the node libdrm describes. The next question is which device the
+software-rendered GNOME compositor hands its clients through `linux-dmabuf`.
+The durable answer is GNOME itself on the GPU, which is the next stage in any
+case.
+
+## Amendment, 2026-09-24 — stage S1 of "GNOME on the GPU": shared device-local memory, LINEAR modifiers, foreign queues, exportable sync files
+
+GNOME's compositor, Mutter, draws through GBM on `card0`. With Zink forced
+in its place (a driconf `dri_driver=zink` entry), four things stood between
+this renderer and a GPU-composited desktop. Each was read from Mesa 26.0.8,
+Mutter 50.1 and Linux 7.0, and each citation below was checked:
+
+1. **No `VK_EXT_queue_family_foreign`.** Zink's dma-buf capability needs it
+   (`zink_screen.c:1128-1133`). Without that capability GBM has no export
+   (`gbm_dri.c:1242-1247`), so it makes every `gbm_bo` a dumb buffer
+   (`:902-903`). The host has the extension; policy did not pass it through.
+2. **No `VK_EXT_image_drm_format_modifier`.** Mutter asks for scanout
+   surfaces without modifiers, because the virtio kernel driver offers no
+   `IN_FORMATS`. Zink therefore makes them optimal and not exportable. At
+   export it rebuilds each one as a DRM-modifier image with the list
+   `[LINEAR]` and copies into it (`zink_resource.c:1744-1768`). Asking the
+   exported handle for its stride needs the extension too (`:1958-1964`,
+   `zink_resource_get_param`).
+3. **Memory.** Zink places every non-staging image in device-local memory
+   (`zink_resource.c:1443-1446`) and fails when no type matches
+   (`:1047-1076`). Stage 5c's dma-buf existed only in our pages. Those are not
+   device-local. On the RTX 2070 an optimal image cannot live in them, and a
+   linear one cannot be a colour attachment in any scanout format (measured,
+   below). So every export was refused.
+4. **Fences.** `EGL_ANDROID_native_fence_sync` needs the guest's
+   `VK_KHR_external_semaphore_fd`. Venus offers that extension only when a
+   `SYNC_FD` semaphore is also exportable (`vn_physical_device.c:1173-1179`).
+   Stage 5b.3 answered "importable" only.
+
+The design that removes all four: **device-local memory that can be exported
+is the dma-buf.** On the host it is `OPAQUE_WIN32` memory, backed by a blob
+with no pages that the guest cannot map. Another context imports it through
+the NT handle. A LINEAR modifier is emulated as one **canonical optimal
+image**, so the exporter's image and the importer's image have the same
+layout. The code is `venus/executor/{memory,modifier}.rs`,
+`host_vulkan/mod.rs` and `venus/renderer.rs`.
+
+### What the guest is shown
+
+| extension | how | when |
+|---|---|---|
+| `VK_EXT_queue_family_foreign` | passed through, and enabled on the host device | the host has it, **and** device-local memory can be exported, **and** the dma-buf pair is shown |
+| `VK_EXT_image_drm_format_modifier` (spec 2) | **emulated**: stripped from the host's device create, answered by the executor | the same condition |
+| `VK_KHR_external_semaphore_fd` | emulated as before, and now `EXPORTABLE` (`policy::SYNC_FD_EXPORTABLE`) | always |
+| `VK_KHR_external_memory_win32` | host-only: enabled on every host device that has it, never shown to the guest | — |
+
+"Device-local memory can be exported" is `GuestDevice::memory_export`. It
+means the host lists `VK_KHR_external_memory_win32` and reports the
+`deviceUUID`/`driverUUID` that an import is checked against. A Linux host
+never meets this condition: its drivers have no `OPAQUE_WIN32`, and
+`AshVulkan` resolves the Win32 entry point only under `cfg!(windows)`. A
+Linux host therefore gets neither extension, and GBM keeps its dumb
+buffers. Showing the extensions there would turn every GBM allocation into
+a failing export. The capset mask gains bit 159: without that bit the
+guest's encoder drops the modifier structures. It gains no bit for
+queue-family-foreign, which chains no structure. That brings the mask to 73
+extensions.
+
+### Handle blobs
+
+An export allocation (`VkExportMemoryAllocateInfo{DMA_BUF}`) on a type that
+is not our pages is allocated on the host with
+`VkExportMemoryAllocateInfo{OPAQUE_WIN32}`. Its host size is rounded to a
+blob page. It is **never dedicated on the host**; the guest's own dedication
+is still recorded for its binds. An import of opaque memory must match the
+export's dedication, and neither side can always name the other's image.
+Leaving dedication off both sides makes them agree by construction. The
+canonical image requires a type that is not dedicated-only. A canonical
+image that the host would still want dedicated memory for is refused with
+`VK_ERROR_OUT_OF_DEVICE_MEMORY`.
+
+The blob Mesa makes of that memory straight away (`vn_device_memory_alloc_export`:
+`HOST3D`, `SHAREABLE`, not `MAPPABLE`) is a **handle blob**
+(`ExportedMemory::Handle`). At blob creation the executor calls
+`vkGetMemoryWin32HandleKHR` and keeps the NT handle together with the
+export's type, host size and UUIDs (`memory::HandleExport`), type-erased
+inside the renderer's blob directory. The blob has no pages. The renderer
+refuses `RESOURCE_MAP_BLOB` of it (`VenusError::HandleBlobNotMappable`,
+answered `BlobNotMappable`), and the device layer already refuses to map a
+blob without `MAPPABLE`. Ownership and attachment follow stage 5c's rules
+for page blobs.
+
+**Lifetime.** An NT handle to exported memory references the allocation's
+payload by itself. The exporting memory, its device and its whole context
+may therefore go first, and the blob can still be imported, exactly as a
+dma-buf outlives the process that exported it. An import references the
+payload too, so the blob may go after it. The handle is closed
+(`SharedMemoryHandle`'s `Drop`, `CloseHandle`) when the last `Arc` of it
+goes: the blob's, or an import's that is in progress. Neither closing the
+handle nor an import needs the exporter's device to still exist. That order
+is the real-GPU test below.
+
+**Two deviations from the brief**, both deliberate:
+
+- *The handle is taken when the blob is created, not when it is imported.*
+  If it were taken at import, the exporter's memory would have to outlive
+  every import still to come, and a dma-buf promises the opposite.
+- *A handle blob outlives its context until the guest unrefs the resource*,
+  as a page blob does. The guest kernel frees the resource when the last GEM
+  reference goes. Another process — Mutter, holding a client's buffer — may
+  keep it longer than the client lives. Imported memories go with their
+  context (`destroy_all`). A reset drops every blob and closes every handle.
+
+### Imports (`VkImportMemoryResourceInfoMESA` of a handle blob)
+
+The import must be on a device that enabled dma-buf and can export at all,
+from a context the blob belongs to or is attached to. The importer's
+`deviceUUID` and `driverUUID` must be the exporter's. The type must be the
+export's own; `vkGetMemoryResourcePropertiesMESA` answers exactly that bit,
+with the blob's size. The size must be no more than the blob. The host is
+then handed `VkImportMemoryWin32HandleInfoKHR`, with the export's own
+allocation size and type (an opaque handle type requires both) and without
+dedication. Anything else is `VK_ERROR_INVALID_EXTERNAL_HANDLE`, logged with
+the reason, as vkr answers. On an import, venus passes the application's
+export info through unrewritten (Zink names `OPAQUE_FD | DMA_BUF`). That is
+accepted and ignored: no blob is ever made of an import. Exportable memory
+and imported memory each bind only to a resource created for a host handle
+(`VUID-vkBindImageMemory-memory-02728`, `-02989`, and the buffer
+equivalents). Otherwise the bind is fatal.
+
+### Resources
+
+A buffer or image created for `DMA_BUF` still takes our pages whenever the
+host will import them for it. Those are resources the guest may map, and the
+page-type restriction of `memory::external_type_bits` stays. A `DMA_BUF`
+resource our pages cannot hold is now created for `OPAQUE_WIN32`, provided
+the host answers `EXPORTABLE | IMPORTABLE` and not dedicated-only for it
+(`ResourceMemory::Handle`). Such a resource sees only device-local types.
+Zink's shared optimal images are one example: venus rewrites their
+`OPAQUE_FD` to `DMA_BUF`. `vkGetPhysicalDeviceExternalBufferProperties(DMA_BUF)`
+answers shareable when either kind of memory can hold the buffer.
+
+### The canonical image, and every lie it tells
+
+The module docs of `executor::modifier` are the full account. In short, for
+a scanout format `F` — `B8G8R8A8_UNORM`/`_SRGB`, `R8G8B8A8_UNORM`/`_SRGB`,
+`A2R10G10B10`, `A2B10G10R10` — and an extent `W×H`, the host image is always
+the same:
+
+- 2D, `W×H×1`, one level, one layer, one sample, `OPTIMAL`, `EXCLUSIVE`;
+- `MUTABLE_FORMAT` with the list `[F, F']` when `F` has an sRGB/UNORM twin
+  `F'` (as Zink creates every shareable image of such a format), otherwise
+  no flags;
+- the usage **superset** derived from `F`'s optimal features: transfers,
+  sampled, storage, colour and input attachment. The host is asked for it
+  with `OPAQUE_WIN32` and the list, and storage is dropped if refused (as it
+  is for sRGB on the RTX 2070);
+- `OPAQUE_WIN32` external memory.
+
+The guest's own usage, flags and view formats must fit inside these, or the
+create is fatal. Nothing else it chose reaches the host. An exporter creating
+with `…ListCreateInfoEXT` and an importer creating with
+`…ExplicitCreateInfoEXT` therefore produce byte-identical host create infos.
+The lies:
+
+1. **LINEAR is optimal.** It cannot be observed: nothing can map the memory.
+   A guest that `mmap`s the "LINEAR" dma-buf fails visibly and does not see
+   wrong pixels.
+2. **LINEAR's features are the optimal ones.** They are reported less storage
+   when the superset lost it, and less `DISJOINT`. They are the features the
+   host image really has.
+3. **The plane layout is synthesized.** `MEMORY_PLANE_0` gives offset 0 and
+   `rowPitch = W × 4` rounded up to 256. The size is `rowPitch × H`, which is
+   not the real allocation's size. Instead, memory requirements are raised
+   to at least that size, so the blob is never smaller than the pitch implies,
+   as the guest kernel checks for a framebuffer. An importer's explicit plane
+   must be offset 0 at that same pitch; any other layout is answered
+   `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`.
+4. **The image is mutable, and has usage the guest did not ask for.** Both are
+   supersets.
+5. **Only single-level, single-layer, single-sample, exclusive 2D images.**
+   The format query says so; any other request is refused.
+
+Any other modifier is `VK_ERROR_FORMAT_NOT_SUPPORTED` in the query and fatal
+in a create.
+
+### Barriers with foreign queue families
+
+`vkCmdPipelineBarrier`, `vkCmdPipelineBarrier2`, `vkCmdWaitEvents`,
+`vkCmdWaitEvents2` and `vkCmdSetEvent2` moved from *generated* to
+*hand-written*. Each queue family pair of each buffer or image barrier must
+now be one of: a family of the device, `IGNORED`, `EXTERNAL`, or `FOREIGN`
+on a device that enabled `VK_EXT_queue_family_foreign`. A pair must never be
+a transfer between the two external families (`-04065`). `vkCmdSetEvent2`
+may make no transfer at all (`VUID-vkCmdSetEvent2-srcQueueFamilyIndex-03842`).
+**Before this stage the indices reached the driver unjudged**, and an
+out-of-range family was left for the driver to survive.
+
+### `SYNC_FD`, exportable
+
+The flip is one constant. An application's `vkGetSemaphoreFdKHR` on a
+device-only payload (`vn_queue.c:2440-2495`) becomes `vn_create_sync_file`
+(`:1873-1910`): a virtio-gpu execbuffer on the `ring_idx` of the queue that
+last signalled the semaphore, carrying `vkWaitRingSeqnoMESA`. This renderer
+executes it as a wait for the ring position, then a host fence on that
+queue, retired by the queue's fence thread. `vkWaitSemaphoreResourceMESA`
+follows, which the executor serves as an empty submit that consumes the
+payload. On an imported payload, `vkImportSemaphoreResourceMESA(0)` comes
+first. All of these were served since 5b.3. A fake test now runs them in
+the order Mesa does.
+
+### What Mesa, Zink and GBM will send, and what each becomes
+
+| guest | here |
+|---|---|
+| `vkGetPhysicalDeviceFormatProperties2` + `VkDrmFormatModifierPropertiesListEXT` (capacity 128, `zink_init_format_props`) | one entry, LINEAR, one plane, the optimal features; none for a format that is not a scanout format |
+| `vkGetPhysicalDeviceImageFormatProperties2` + `VkPhysicalDeviceImageDrmFormatModifierInfoEXT` (`check_ici`, `zink_resource.c:335-395`) | the canonical image's host limits at 1/1/1, or `FORMAT_NOT_SUPPORTED` |
+| `vkCreateImage`, DRM tiling, `DMA_BUF` external, `[LINEAR]` list, `MUTABLE` + `[F, F']` (the export rebuild) | the canonical optimal image, created for `OPAQUE_WIN32` |
+| `vkGetImageDrmFormatModifierPropertiesEXT` | LINEAR |
+| `vkGetImageSubresourceLayout(MEMORY_PLANE_0)` (stride and offset) | the synthesized plane |
+| `vkAllocateMemory` + export `DMA_BUF` + dedicated, device-local type; then `RESOURCE_CREATE_BLOB` `SHAREABLE` | exportable host memory; a handle blob |
+| `vkGetMemoryFdKHR` / `drmPrimeFDToHandle` (Mutter's `gbm_bo_get_handle`) | guest-side only: the same GEM resource |
+| another process: `CTX_ATTACH_RESOURCE`, `vkGetMemoryResourcePropertiesMESA`, `vkCreateImage` explicit LINEAR, `vkAllocateMemory` + `VkImportMemoryResourceInfoMESA` | attach; the export's type bit; the same canonical image; a Win32 import |
+| barriers to and from `VK_QUEUE_FAMILY_FOREIGN_EXT` | passed through, judged |
+| `vkGetSemaphoreFdKHR` (`EGL_ANDROID_native_fence_sync`) | a ring fence, then `vkWaitSemaphoreResourceMESA` |
+
+### Measured on the RTX 2070
+
+The test is
+`host_vulkan::pipeline_tests::a_linear_modifier_image_rendered_by_one_context_is_read_back_exactly_by_another`
+(driver 580.88, Windows), driven through real rings with the generated
+driver-side encoder.
+
+Context 1 is shown LINEAR for RGBA8 with tiling features `0x1dd83`, which
+includes the colour attachment linear tiling lacks. It creates the
+canonical image, gets an exportable allocation of `0x40000` bytes (256 ×
+1024-byte pitch), and makes the handle blob; mapping the blob is refused.
+It then renders vk-smoke's check-6 triangle through a render pass and
+releases the image to `FOREIGN`.
+
+Context 2 attaches and is answered exactly the export's type. It creates the
+same image explicitly LINEAR at pitch 1024, gets the same requirements, and
+imports and binds. **Context 1 then destroys its whole instance, and the
+blob is destroyed**, so the import alone holds the allocation. Context 2
+acquires the image from `FOREIGN` and copies it into our pages. The result
+is `256x256 exact, 6 probes ok, px red/green/blue/clear=8362/8363/8363/40448,
+fnv1a=0x2678f2a0e39fba1b`: vk-smoke's checksum for the bare RTX 2070,
+rendered by one guest process and read back by another through device-local
+memory neither can map.
+
+### Owed
+
+- **Guest acceptance.** GNOME with `dri_driver=zink`: `gbm_bo`s from Zink,
+  and Mutter's framebuffers made of handle blobs.
+- **Scanout of a handle blob.** Mutter's `drmModeAddFB2` of such a blob
+  reaches the device as `SET_SCANOUT_BLOB`. The host renderer must read the
+  image through Vulkan: the handle is exactly what it imports. That is the
+  scanout-blob hook being built beside this stage; the pitch the guest
+  passes is the synthesized one and says nothing about the bytes.
+- A Linux host's equivalent (`OPAQUE_FD` from a real GPU) is not built.
+  There this stage advertises nothing.
+- `save`/`load`: a snapshot is refused by name while a handle blob lives,
+  even after every Vulkan object has gone.
+
+## Amendment, 2026-09-24 — GNOME on the GPU, S2a: the device scans out renderer blobs
+
+A GPU-composited guest desktop (Mutter over GBM → zink → venus) puts its
+frames on screen through **renderer blobs**. Each scanout buffer is a guest
+`VkDeviceMemory` that the kernel wraps in a `RESOURCE_CREATE_BLOB` with
+`BLOB_MEM_HOST3D` and `SHAREABLE`, never `MAPPABLE`. Every page flip is then
+`SET_SCANOUT_BLOB` (`B8G8R8X8`, the framebuffer's width and height,
+`strides[0]`, `offsets[0]`) followed by an unfenced `RESOURCE_FLUSH`, with no
+transfer (Linux 7.0 `virtgpu_plane.c:267-305`, `virtgpu_vq.c:1459-1493`). Until
+now the device refused `SET_SCANOUT_BLOB` for anything but a guest-memory blob.
+S2a is the device and trait half. The Venus renderer's implementation is a
+later stage.
+
+- **The hook is additive.** `Renderer3d::scanout_blob(resource_id,
+  &ScanoutBlobSpec) -> Result<(), CommandError>`, where `ScanoutBlobSpec` is
+  `{format, width, height, stride, offset}`. The default refuses with the
+  error the device answered before (`ERR_INVALID_PARAMETER`), so virgl, the
+  loopback and the isolated renderer are unchanged. The isolated renderer does
+  not forward the hook: that would need a new request in its protocol, and it
+  has no host blob memory worth reading back.
+- **The pixels come through `read_rect_bgra`**, with no new read call. An
+  accepted `scanout_blob` promises that `read_rect_bgra(resource_id, rect)`
+  now reads that layout, until the next accepted spec for that resource,
+  `destroy_blob` or `reset`. The flush path is the one 3D scanouts already
+  use: clip to the scanout, read into the device's reused buffer, then
+  `update_scanout`. `display` did not change. A second read call would only
+  pass the spec again on every frame, and the renderer is already required to
+  keep it.
+- **One spec per buffer.** A compositor alternates between two or three
+  buffers on every flip. The device therefore stores the accepted spec on the
+  blob, not on the scanout. Flipping to a buffer whose layout is already
+  accepted makes no renderer call. A changed layout is asked again. A refusal
+  keeps the previous acceptance and the previous binding. After the first
+  renderer-blob scanout, which is logged once at info, re-binds log at debug.
+- **Bounds before the renderer.** The device checks the rect against the
+  framebuffer, the framebuffer against `MAX_RESOURCE_PIXELS`, the stride
+  against a row (`width × 4`), and `offset + stride × height` against the
+  blob's declared size, all in u64. Flush damage is checked against the
+  declared framebuffer. The renderer's answer must be exactly
+  `rect.width × rect.height × 4` bytes, or the flush fails in band.
+- **Lifetimes follow the other sources.** `RESOURCE_UNREF` of the blob on
+  screen disables the scanout. `SET_SCANOUT`/`SET_SCANOUT_BLOB` with resource
+  0 disables it. A device reset drops the binding, the blobs and every accepted
+  layout. A lost renderer (GPU-012) drops a renderer-blob scanout, as it drops
+  a 3D one. `HOST3D_GUEST` blobs take the renderer path too: their pixels are
+  the renderer's as well.
+- **Snapshots** (ADR-0006) record the binding as a blob scanout, which is
+  host-owned. A restore rebinds nothing and reads nothing, the window keeps its
+  initial frame, and the blob counts in `live_blobs`, so the driver is told to
+  start again. This matches a 3D-resource scanout. The readback runs on the
+  gated queue worker inside a trait call, so it needs no `Quiesce` of its own.
+
+Pinned by the `renderer_blob_scanout` tests in `tests/gpu_blob.rs`. They use a
+fake renderer whose readback encodes each pixel's coordinates and resource.
+
+**What the Venus renderer owes for this to work:**
+
+1. `scanout_blob`: accept a blob that is one of its `VkDeviceMemory` blobs
+   and is at least `offset + stride × height` bytes on the host, then record
+   the spec per resource.
+2. `read_rect_bgra` for such a resource: copy the rows of `rect` out of that
+   memory (`offset + y × stride + x × 4`) as packed BGRA.
+3. `destroy_blob` and `reset`: forget the spec.
+
+## Amendment, 2026-09-24 — GNOME on the GPU, S2b: the Venus renderer serves the scanout
+
+S2a gave the device a way to ask a renderer for a renderer blob's pixels.
+S2b is the Venus renderer's answer, for both kinds of blob its memory
+makes. The code is `venus/renderer.rs` (the judgement and the page path),
+`venus/executor/scanout.rs` (the handle path), and the recording in
+`venus/executor/{memory,device_objects,modifier}.rs`.
+
+### What the guest does, verified
+
+- **The release.** At the end of every batch Zink releases each exported
+  image out of its instance (`zink_batch.c:900-934`): one image barrier with
+  `oldLayout == newLayout == res->layout`, so no layout change — whatever
+  layout the frame left the image in. `srcAccessMask` is its last access and
+  `dstAccessMask` 0. `dstStageMask` is `ALL_COMMANDS`. `srcQueueFamilyIndex`
+  is its queue's family and `dstQueueFamilyIndex` is
+  `VK_QUEUE_FAMILY_FOREIGN_EXT`. The layout is therefore not a constant.
+  After a render pass it is the pass's final layout. After a blit it is
+  `TRANSFER_DST`. On a driver Zink runs with `general_layout` it is
+  `GENERAL` (`zink_screen.c:3134-3143`).
+- **The fence.** Mutter 50.1 commits a KMS update only once the update's
+  `sync_fd` — the frame's `EGL_ANDROID_native_fence_sync` fence
+  (`meta-onscreen-native.c:1812-1822`) — is readable
+  (`meta-kms-impl-device.c:2089-2116`). By the time `SET_SCANOUT_BLOB` and
+  `RESOURCE_FLUSH` arrive, the release has executed on the host GPU. The
+  host's copy needs no semaphore of its own.
+- **The format.** GBM's `XRGB8888` is Mesa's `BGRX8888_UNORM`
+  (`dri_helpers.c:434`), which Zink emulates as `B8G8R8A8_UNORM`
+  (`zink_format.c:176`). The kernel sends it as `B8G8R8X8_UNORM`.
+
+### Page blobs
+
+A blob of host-visible memory is our pages. It is accepted when
+`offset + stride × (height − 1) + width × 4 <= pages.mapped_len()`, computed
+in u64. That is the last byte the image touches, so the check is exact at
+the end rather than `stride × height`. It is read row by row through
+`RingPages::read_bytes` into the device's buffer, packed. A ring or reply
+blob (`blob_id` 0) is not an image and is refused.
+
+### Handle blobs: the canonical image, recorded
+
+The guest's pitch for a handle blob is synthesized and says nothing about
+the bytes (S1). The only authority on the layout is the canonical image
+bound to the memory, so the blob must know which image that is.
+
+- **What is recorded.** `modifier::CanonicalImage`: format, flags, view
+  formats, usage superset, width and height. That is exactly what the host
+  create info is built from (`CanonicalImage::create_info`, which the
+  exporter, every importer and the scanout device all call). The record
+  also holds the bind's `memoryOffset`, the context and image ids, and a
+  `Weak` of a token the image object owns.
+- **When.** At every successful bind of a canonical image to handle memory:
+  the exporting memory, or an import of a handle blob. Memory keeps a `Weak`
+  of the handle its blob holds (`SharedRef`). The directory finds the blob
+  by that handle's identity, through an index keyed by the handle's address,
+  never by a resource id a guest could reuse. Mesa makes the blob inside
+  `vkAllocateMemory`, before the bind. An application that binds first gets
+  its images recorded when the blob is made: `export_memory` records the
+  images already bound, pending in the directory until the renderer inserts
+  the blob straight after, where they are adopted.
+- **Lifetime.** The record is updated under the directory lock. It lives
+  exactly as long as the image object: the token dies with it, whichever
+  path destroys it (`vkDestroyImage`, device teardown, context teardown, a
+  reset), and dead records are pruned. At most `MAX_SCANOUT_IMAGES` (8) are
+  kept per blob, oldest first out. Pending records are capped at 64.
+  `forget_context` drops a context's records. Removing the blob drops its
+  records and its index entry.
+- **The release, recorded too.** Every image barrier of a recorded canonical
+  image that releases it out of the instance (to `FOREIGN` or `EXTERNAL`,
+  from a family of the device) sets the blob's last release: the layout and
+  the family. It is recorded when the barrier is recorded, which for a
+  flipped frame is before the flip. It is kept per blob, not per image,
+  because it describes the payload.
+
+`scanout_blob` of a handle blob is accepted only when a live record
+matches the spec: the format is BGRA-ordered (`B8G8R8A8_UNORM` or `_SRGB` —
+the same bytes; a scanout samples nothing), the extent is the
+framebuffer's, and both the plane offset and the bind offset are 0. The
+stride must be exactly the synthesized pitch. An RGBA-ordered canonical
+image under a BGRA scanout is **refused, not swizzled**: the device accepts
+only the two BGRA formats, so it would be a guest naming the wrong fourcc.
+Anything else is `ERR_INVALID_PARAMETER` (`CommandError::ScanoutLayout`),
+logged with the reason ("no canonical DRM-modifier image is bound to its
+memory", "stride 7936 is not the 7680-byte pitch…"). A refusal keeps the
+previous acceptance.
+
+### The scanout device
+
+One host `VkDevice` owned by the renderer's factory (`ExecutorFactory`),
+not by any guest context, so nothing a guest does to its own objects
+reaches it. It is created lazily by the first handle-blob scanout, on the
+physical device whose `deviceUUID`/`driverUUID` are the export's. It has
+one queue (the first graphics family, else the first with transfers), one
+command pool, one command buffer, one fence, and three extensions:
+`VK_KHR_external_memory_win32`, `VK_EXT_external_memory_host` and
+`VK_EXT_queue_family_foreign`.
+
+For each blob it keeps an import: the export's NT handle imported
+(`VkImportMemoryWin32HandleInfoKHR`, the export's own size and type,
+undedicated). **Exactly the canonical image** on record is created over it
+and bound at 0, and it has a staging buffer of `width × height × 4` bytes of
+our own pages, charged to the renderer's 1 GiB host-visible budget. At most
+`MAX_SCANOUT_TARGETS` (4) are kept, the least recently read evicted first. A
+compositor flips between two or three; an evicted one is simply made again
+by the next read.
+
+**One read**, on the one command buffer, fenced:
+
+| | `src` family | `dst` family | `oldLayout` | `newLayout` | stages | access |
+|---|---|---|---|---|---|---|
+| acquire | the release's (`FOREIGN`) | ours | the release's layout `L` | `L` if `GENERAL` or `TRANSFER_SRC`, else `TRANSFER_SRC` | `TOP_OF_PIPE` → `TRANSFER` | 0 → `TRANSFER_READ` |
+| copy | `vkCmdCopyImageToBuffer` of the rect, packed | | | | | |
+| release | ours | the release's | the copy layout | `L` | `TRANSFER` → `BOTTOM_OF_PIPE` | 0 → 0 |
+
+A buffer barrier beside the release (`TRANSFER_WRITE` → `HOST_READ`) makes
+the copy visible to the host. The old layout is never `UNDEFINED`, which
+would discard the frame. Releasing back in `L` makes the guest's next
+acquire (`oldLayout = res->layout`, from `FOREIGN`) exactly consistent. A
+release in a layout the device will not acquire from is refused before
+anything is recorded: `UNDEFINED`, `PREINITIALIZED`, the two
+`synchronization2` layouts (not enabled here), or any extension layout. So
+is a read before any release has been recorded.
+
+The fence is waited for `SCANOUT_WAIT` (100 ms) at most. On a timeout the
+flush fails in band, the window keeps its frame, and the next read first
+waits (bounded) for that work. A lost device fails the flush and drops the
+whole scanout device; the next scanout makes a new one. Only then are the
+rows read out of the staging pages through the bounded
+`RingPages::read_bytes`.
+
+### Lifecycle
+
+- **No thread of its own.** The readback runs inside `read_rect_bgra` on the
+  device's gated queue worker, as S2a said, so there is no new `Quiesce`
+  obligation.
+- **Unref.** `destroy_blob` of a handle blob drops its import, image and
+  staging buffer (`SinkFactory::forget_scanout`). A changed spec replaces
+  the import once the new one is complete.
+- **Reset.** `reset()` drops every import. **The `VkDevice` itself is
+  kept.** After that it holds nothing of any guest, and a rebooted desktop
+  scans out again within seconds; re-creating a device on every reboot
+  would only be a stall. It goes when the renderer does, when it is lost,
+  or when a blob of another GPU is scanned out.
+- **Snapshots.** Unchanged. A handle blob already refuses a snapshot by
+  name. A page-blob scanout's memory is a live executor object, which
+  refuses one too; the device-side record is S2a's.
+
+### Measured on the RTX 2070
+
+The test is
+`host_vulkan::pipeline_tests::a_handle_blob_flip_reads_back_the_frame_through_the_renderers_scanout_device`,
+driver 580.88 on Windows, through the renderer's `scanout_blob` and
+`read_rect_bgra`. That is the whole Venus path the device calls. A real
+`GpuDevice` needs a guest ring the test harness does not reach, so the
+device half stays S2a's fake-renderer tests. Context 1 exports a 256×256
+LINEAR BGRA8 buffer, blob before bind as Mesa does, renders vk-smoke's
+check-6 triangle and releases it as Zink does. The renderer reads back
+`256x256 exact, 6 probes ok, px red/green/blue/clear=8362/8363/8363/40448`,
+BGRA `fnv1a=0x9a880db295ee1483`. Swizzled back to RGBA that is
+`0x2678f2a0e39fba1b`, vk-smoke's checksum. The guest then re-acquires the
+buffer from `FOREIGN`, draws check 7's clear and releases it again. The
+second flush reads the new frame (BGRA `0x4c1a0a49e1373503`, RGBA
+`0xd79d631c4d62403b`), so the acquire/release cycle repeats.
+
+Per flush:
+
+| | 256×256 | 1920×1080 |
+|---|---:|---:|
+| release build, median (min–max) | 0.19 ms (0.18–0.34) | 4.1 ms (3.8–6.4) |
+| debug build, median | 9.6 ms | 278 ms |
+| first read (import, image, staging), release | 0.52 ms | — |
+
+At 1080p, 2.65 ms of the 4.1 ms is the relaxed byte-at-a-time copy out of
+the staging pages (measured alone). The GPU copy, the submit and the fence
+are the other ~1.5 ms. This is the copy path, option (a) of the research.
+
+### Queries are questions (found by kmscube on this stage's parent)
+
+Zink's format table probes formats outside core 1.3. It asked
+`vkGetPhysicalDeviceFormatProperties2` about `VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR`
+(1000470000, maintenance5), and the executor killed the context: every GL
+client on Zink died at startup. A query about a value some extension
+defines but this device does not serve is now answered, and never sent to
+the driver:
+
+- `vkGetPhysicalDeviceFormatProperties2`: no features in the base structure
+  and in every chained one; modifier lists come back empty.
+- `vkGetPhysicalDeviceImageFormatProperties2`: `VK_ERROR_FORMAT_NOT_SUPPORTED`
+  for a non-core format, DRM-modifier tiling without the extension shown,
+  an extension's usage, flag, view format, stencil usage or handle type.
+- `vkGetPhysicalDeviceExternalSemaphoreProperties` of an extension's handle
+  type, and `vkGetPhysicalDeviceExternalBufferProperties` of an extension's
+  handle type, usage or flag: "nothing".
+- `vkGetPhysicalDeviceSparseImageFormatProperties(2)`: no entries, since no
+  sparse feature is shown. `vkGetPhysicalDeviceExternalFenceProperties`:
+  nothing, since no external fence is served. All three used to be refused
+  as unimplemented.
+
+What no Vulkan defines (an image type of 7), or what valid usage forbids
+outright (usage 0, two handle bits, a modifier structure without its
+tiling), stays fatal. So does **creating** an image or view of any value
+outside what is served. Pinned by `venus::executor::query_tests`.
+
+### Owed
+
+- **Guest acceptance**: kmscube, then GNOME with `dri_driver=zink` (the
+  coordinator's run).
+- **Zero-copy** (a later stage). Short of that, a word-wise copy out of the
+  staging pages, which have no concurrent host writer, would take about
+  2 ms off a 1080p flush.
+- The release layout is the one **recorded** last. A command buffer
+  recorded once and submitted many times with different releases is not
+  followed; Zink records one per batch.
+- A Linux host (`OPAQUE_FD`) has no handle blobs, so no handle-blob scanout
+  either.
+
+## Amendment, 2026-09-24 — GNOME on the GPU: measured in the guest
+
+After S1, S2a and S2b (commit `96815a2`), in the Ubuntu 26.04 guest on WHP
+with `ENTANGLED_VENUS=vulkan`:
+
+**`kmscube -D /dev/dri/card0`** (GBM → zink → our Venus → KMS, no Mutter),
+zink forced by `MESA_LOADER_DRIVER_OVERRIDE`:
+
+```
+renderer: "zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070) (MESA_VENUS))"
+display extensions: ... EGL_ANDROID_native_fence_sync ...
+Rendered 5052 frames in 86.48 sec (58.4 fps)          # 1920x1080
+```
+
+The host logged `virtio-gpu is scanning out a renderer blob: the guest
+composites on the GPU resource=31 width=1920 height=1080 stride=7680`, with
+flips alternating between resources 31 and 32, and frame pacing at 60 fps.
+The VMM's screenshot shows the cube. A temporary pixel probe on the flush path
+read back the grey clear (`0xFF7F7F7F`) and a centre pixel that changed every
+sample.
+
+**GNOME Shell on zink**, enabled by a driconf entry scoped to the compositor
+alone:
+
+```xml
+<!-- /etc/drirc in the guest -->
+<driconf>
+  <device driver="loader" kernel_driver="virtio_gpu">
+    <application name="gnome-shell on zink" executable="gnome-shell">
+      <option name="dri_driver" value="zink" />
+    </application>
+  </device>
+</driconf>
+```
+
+After a `gdm3` restart:
+
+- `gnome-shell` maps `libvulkan_virtio.so`, and its journal still says
+  `Created gbm renderer for '/dev/dri/card0'` — now on zink instead of
+  kms_swrast.
+- Mutter advertises **`zwp_linux_dmabuf_v1` version 5, main device `0xE280`**
+  (226:128, the render node). It advertised version 3 with no device while it
+  rendered in software. That was the reason Wayland GL clients could not find
+  their EGL device.
+- **`glmark2-wayland`** (zink via `MESA_LOADER_DRIVER_OVERRIDE`) under it:
+  `GL_RENDERER: zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070))`,
+  **`GL_VERSION: 4.6 (Compatibility Profile)`**, 110–131 FPS in `build`, in a
+  window on the GPU-composited desktop. The VMM screenshot shows it.
+- The host scanned out a renderer blob. Desktop frame pacing was about 30 fps
+  while glmark2 ran.
+
+### What this took, and what it does not yet do
+
+The whole path is ours. Mesa's zink turns GL into Vulkan in the guest, and
+venus serialises it. On the host, our transport, generated protocol and
+executor run it on the RTX 2070. The scanout buffers are device-local memory
+shared between contexts through Win32 handles, dressed as LINEAR dma-bufs. The
+renderer's own scanout device reads each flipped frame back, and the existing
+display path shows it.
+
+Not yet:
+
+- **Clients still need the override.** Only `gnome-shell` is on zink by
+  driconf. Dropping `executable=` from the entry should give every GL app zink,
+  but that has not been measured.
+- **Every frame is copied twice.** The GPU readback is ~4 ms at 1080p (2.65 ms
+  of it a byte-wise copy out of the staging pages), then the CPU mirror feeds
+  the texture upload. Vulkan clients add their own software-WSI copy into
+  `wl_shm`. Zero-copy presentation (option (c): the shared handle straight
+  into wgpu) is the next performance step.
+- **The guest must be configured**: the driconf file, and render-node access
+  for serial-console tools (ADR above). Nothing installs either yet.
+
+## Amendment, 2026-09-24 — two fixes found by guest traffic on the GPU desktop
+
+With GNOME composited on the GPU and GL clients on zink, the guest sent two
+things the executor refused. Each refusal ended the context.
+
+### `vkWaitVirtqueueSeqnoMESA` inside a ring
+
+This is Mesa's *roundtrip* (`vn_ring_roundtrip`, `vn_ring.c:744-767`). The
+guest puts `vkSubmitVirtqueueSeqnoMESA(ring, n)` on the virtqueue, then
+`vkWaitVirtqueueSeqnoMESA(n)` in the ring. The ring must run nothing after
+the wait until the device worker has run everything queued before the
+submit. Mesa 26.0.8 sends one:
+
+- before importing a dma-buf as memory (`vn_device_memory_import_dma_buf`),
+- before `vkGetMemoryFdPropertiesKHR` of a dma-buf
+  (`vn_get_memory_dma_buf_properties`),
+- when allocating exportable memory (`vn_device_memory_alloc_export`); that
+  one is waited for in `vn_FreeMemory`,
+- when a map of freshly made memory fails (`vn_MapMemory2`).
+
+The first two name a resource the virtqueue has only just created. Its other
+callers need guest VRAM, which this device does not offer. So advertising
+dma-buf is what started the traffic.
+
+What we do, following virglrenderer (`vkr_transport.c`, `vkr_ring.c`):
+
+- **Submit.** A submit on the context stream stores `n` as the ring's
+  virtqueue seqno (`renderer::VirtqueueSeqno`) and rings the ring's
+  doorbell. An unknown ring is refused. A submit inside a ring is still
+  fatal.
+- **Compare.** Values are compared as plain `u64`, as vkr does (`seqno <
+  n`). Mesa counts from 1 per ring, so the counter does not wrap, and a
+  submit overwrites the stored value rather than raising it.
+- **Wait.** A wait whose value has not arrived is **not** waited out inside
+  the sink. The sink returns everything before the wait with the new
+  `Batch::blocked`. The pump publishes `head` up to the wait and remembers no
+  stall. The worker gives back its pause-gate pass and sleeps on its
+  doorbell (`service::Step::Blocked`, at most `MAX_BLOCKED_WAIT` = 100 ms per
+  sleep, as a safety net). Then it decodes the wait again. `IDLE` stays down
+  meanwhile, as in vkr.
+- **Why not block in place.** The submit usually sits behind the device
+  worker, and a pause gates that worker. A ring that waited while holding
+  its pass would have kept the pause from settling. This way a pause
+  settles, a reset or context teardown joins the worker at once, and the
+  `ALIVE` monitor keeps the guest's watchdog quiet.
+- **No time limit, as in vkr.** A wait held for more than
+  `VIRTQUEUE_WAIT_WARN_AFTER` (5 s) is logged once.
+- **Nested.** Inside `vkExecuteCommandStreamsMESA` the wait cannot be handed
+  back, so there it waits in place and checks the stop signal between short
+  sleeps. Mesa never sends it there: a 16-byte command always goes into the
+  ring directly.
+
+A wait on the context stream stays refused. It would block the worker that
+has to deliver the submit.
+
+`vkWaitRingSeqnoMESA` is unchanged. Suppose a context-side wait asks for a
+ring position past a pending virtqueue wait, and the submit comes later on
+the same virtqueue. That would deadlock in vkr. Here it times out after
+`WAIT_RING_SEQNO_TIMEOUT` instead. Mesa always queues the submit before it
+writes the ring wait, so FIFO order rules this out.
+
+Pinned by `venus::executor::seqno_tests`, `pump` and `service` tests.
+
+### pNext chains deeper than 32 links
+
+`vkGetPhysicalDeviceFeatures2` was refused with "deeper than 32 links". The
+executor serves 44 structures under `VkPhysicalDeviceFeatures2`, 27 under
+`VkPhysicalDeviceProperties2` and 47 under `VkDeviceCreateInfo`. Zink chains
+all it knows in one query, and then again in `vkCreateDevice`.
+
+The decoder runs before the executor's policy, so its bound must cover what
+the generated protocol admits: 117, 51 and 120. `wire::MAX_PNEXT_DEPTH` is
+now **256**, more than twice the longest chain that can be decoded. It is a
+stack bound only. Two other bounds hold the content:
+
+- the duplicate-`sType` refusal limits a valid chain to what its parent
+  admits;
+- each decoded link is now charged to the command's allocation budget
+  (`Decoder::charge`).
+
+The generated code reaches the limit only through `wire`, so regenerating
+changed nothing. All three generators pass `--check`. On the host side
+(`host_vulkan`), chains are built from one fixed field per admitted
+structure, so the guest's chain length never reaches them.
+
+`venus::executor::query_tests` pins:
+
+- queries with every served structure chained,
+- a device created with its whole chain,
+- refusals past the cap and of duplicates,
+- that the cap stays at least twice the longest decodable chain.
+
+## Amendment, 2026-09-24 — two caps sized for one client, found by a desktop
+
+`vkcube --wsi wayland` died in `demo_prepare_swapchain` (`Assertion '!err'`,
+`cube.c:1533`) whenever it ran beside glmark2 under the GPU-composited GNOME.
+It ran fine alone. Nothing in the executor answered an error; the failure was
+one layer down, in two caps that had been sized for a single Vulkan client.
+Since stage 5c every GL client is a venus instance of its own (gnome-shell,
+both gnome-initial-setup processes, glmark2), and each keeps its rings,
+command-stream pools and mapped memory for as long as it lives.
+
+**The evidence, in order.** Guest side, with `MESA_LOG_LEVEL=debug
+VN_DEBUG=wsi,result`:
+
+```
+MESA-VIRTIO: debug: mmap failed: gpu_fd=4, handle=11, size=1000000, offset=..., err=Invalid argument
+MESA-VIRTIO: debug: vn_MapMemory2: VK_ERROR_MEMORY_MAP_FAILED
+MESA-VIRTIO: debug: vn_CreateSwapchainKHR: VK_ERROR_MEMORY_MAP_FAILED
+```
+
+The 1 000 000-byte memory is the 500×500 swapchain's blit buffer. The venus
+WSI is on its software path (`driverVersion` 580.88 < 590.48.1,
+`vn_wsi.c:134-139`), so it maps host-visible memory for every image. The host
+refused the `RESOURCE_MAP_BLOB` behind that `mmap`:
+
+```
+virtio-gpu command rejected command=0x0208 response=0x1200 error=... the
+shared-memory window refused the pages of resource 201: ... this window
+already holds 64 renderer ranges
+```
+
+At that moment the window held exactly 64 ranges: gnome-shell 24,
+gnome-initial-setup 3 + 15, vkcube 10, glmark2 12, 128 MiB of the 256 MiB
+window. `vmm_core::MAX_HOST_RANGES` was 64. Item 6 of the VEN-2003 list
+predicted it; this is the demanding guest it asked for.
+
+A few milliseconds earlier the Venus renderer had refused glmark2's next
+8 MiB command-stream chunk (`vn_instance.c:328`: the pool grows in 8 MiB
+chunks). It refused 23 times in 20 ms: 23 host blobs held 60.5 MiB against a
+renderer-wide `MAX_RING_BLOB_BYTES` of 64 MiB. That cap assumed "a venus ring
+is ~1 MiB", but gnome-shell alone held 26 MiB. The guest kernel does not wait
+for `RESOURCE_CREATE_BLOB`'s answer, so venus sees such a refusal only when a
+later map fails. Neither refusal is fatal to a context, so the host log had no
+"could not be answered". The virtio-gpu debug line said only "host resource
+memory is exhausted". The renderer now logs, at debug, which cap refused a
+blob and what the context and the renderer held.
+
+**The fix.**
+
+- `MAX_HOST_RANGES` is **1024**, sixteen per venus context at the 64-context
+  cap. On KVM each range is a memory slot. `Vm::create_shm_window` now
+  reserves no more than `KVM_CAP_NR_MEMSLOTS` leaves, keeping 16 back for the
+  firmware ROMs mapped after it. A map past that is refused in band, as one
+  past the constant is. This matters on a 509-slot kernel. WHP has no pool.
+- Host blobs have a **per-context** share (`MAX_RING_BLOBS_PER_CONTEXT` 64,
+  `MAX_RING_BLOB_BYTES_PER_CONTEXT` 128 MiB) and a renderer-wide cap
+  (`MAX_RING_BLOBS` 1024, `MAX_RING_BLOB_BYTES` 1 GiB). The renderer-wide
+  byte cap matches the executor's `MAX_HOST_VISIBLE_BYTES`. One hungry client
+  is now refused at its own share and can no longer take the rest from
+  everyone else.
+
+Pinned by `shm::tests::a_gpu_composited_desktop_fits_in_the_renderer_ranges`
+and by two `venus::renderer` tests:
+`a_gpu_composited_desktop_of_venus_clients_fits_in_the_host_blob_budget`
+replays the five clients' measured blobs, and
+`one_context_cannot_take_the_host_blob_budget_from_the_rest` runs at a
+shrunken scale. Both regression tests fail at the old values.
+
+**Measured after it**, same guest and same pair: vkcube ("Selected GPU 0:
+Virtio-GPU Venus (NVIDIA GeForce RTX 2070)") was still running after 60 s
+beside glmark2 on zink (GL 4.6, ~100 FPS). The peak was 69 ranges, 148.6 MiB
+mapped and 74.7 MiB of host blobs, with no refusal of any kind. vk-smoke
+passed 9/9.
+
+**The next cap in line** is the window itself:
+`VENUS_HOST_VISIBLE_BYTES` (256 MiB), 58 % full with four clients. Past it the
+guest kernel's own allocator of the BAR fails the map. Raising it costs
+guest-physical address space and, on Windows, commit charge for the window's
+unshown allocation. Measure a busier desktop before choosing the number.
+`MAX_RINGS` is a bound from the same one-client era: 32 renderer-wide
+against 64 contexts, one host thread each. Each GTK4 app is a venus instance
+too.
+
+## Amendment, 2026-09-24 — capacity: every cap measured against a desktop
+
+The previous amendment raised two caps and named the next ones. This stage
+measured all of them on the same guest (Ubuntu 26.04, Mesa 26.0.8, GNOME
+composited through zink, `ENTANGLED_VENUS=vulkan`, WHP, RTX 2070) against a
+desktop of clients at once: gnome-shell, both gnome-initial-setup processes,
+three `glmark2-wayland --swap-mode fifo` (build, texture, jellyfish), two
+`vkcube --wsi wayland`, `eglgears_wayland`, `gnome-text-editor` and
+`gnome-calculator` (both GTK4, on `GskGLRenderer` over zink), started one every
+5 s. Then half closed and started again, all closed, all at once, and vkmark.
+
+### The usage log
+
+`VenusRenderer::usage()` counts everything a cap bounds, renderer-wide and the
+largest per context, together with the factory's half (`FactoryUsage`:
+host-visible bytes, objects, fence threads, pending ring fences, scanout
+targets). `peak_usage()` keeps the maximum since the last reset. Both are
+logged at debug on target `virtio_gpu::venus::usage` when a context comes or
+goes, when a peak rises, and at most every 10 s when the usage changed. The
+periodic look is taken from the virtqueue submit, the scanout readback and the
+fence poll, sampled at most every 2 s. A refused blob map is logged too, with
+what the window held. `RUST_LOG=info,virtio_gpu::venus=debug` is enough to
+measure a desktop.
+
+### What the desktop held
+
+Final run, 14 clients (13 contexts at once), no refusal while they ran. All 8
+apps were alive after 3 minutes. glmark2 ran at 20–22 FPS in each of the three
+windows, and the desktop composited at ~33 fps (virtio-gpu frame pacing).
+
+| Cap | Old | Desktop peak (final run) | New | What bounds one hostile guest |
+|---|---|---|---|---|
+| `MAX_VENUS_CONTEXTS` | 64 | 13–14 | 64 (unchanged) | itself; `Gpu3d` 128 behind it |
+| `MAX_RINGS_PER_CONTEXT` | 8 | 3 | 32 | itself |
+| `MAX_RINGS` | 32 | 23 (24 in the first run) | 256 | itself: 256 ring workers + 64 monitors |
+| `MAX_FENCE_THREADS` (new) | none (64 × 63 possible) | 0 | 256 | itself; a context alone ≤ 63 (`ring_idx`) |
+| `MAX_RING_BLOBS` / per context | 1024 / 64 | 67 / 9 | unchanged | the per-context share |
+| `MAX_RING_BLOB_BYTES` / per context | 1 GiB / 128 MiB | 172 MiB / 28 MiB | unchanged | the per-context share |
+| `MAX_MEMORY_BLOBS` / per context | 4096 / none | 94 / 15 | 4096 / 1024 | the per-context share |
+| executor `MAX_HOST_VISIBLE_BYTES` / per context | 1 GiB / none | 160 MiB / 40 MiB | 2 GiB / 1 GiB | `PageBudget::share` |
+| `vmm_core::MAX_HOST_RANGES` | 1024 | 155 | 4096 | memory-blob and host-blob shares: one context ≤ 1088 |
+| window (`VENUS_HOST_VISIBLE_BYTES`) | 256 MiB | 305 MiB mapped | 4 GiB, `[display] host_visible_mib` | budgets: 1 GiB host blobs + 2 GiB memory |
+| device `MAX_BLOB_RESOURCES` | 4096 | 158 | 8192 | the renderer's caps, which now bind first |
+| device `MAX_TOTAL_BLOB_BYTES` | 4 GiB | 330 MiB | 8 GiB | the renderer's budgets + device-local exports |
+| `MAX_OBJECTS_PER_CONTEXT` | 65536 | 1830 (7202 in all; 4657 in the runaway compositor) | unchanged | itself; nothing renderer-wide (see below) |
+| `fence::MAX_PENDING_FENCES` | 64 | 0 held | unchanged | itself |
+| `MAX_SCANOUT_TARGETS` (LRU) | 4 | 3 | unchanged | eviction, not refusal |
+
+Rings, measured per client: one 128 KiB instance ring
+(`vn_instance_init_ring`), plus one 16 KiB ring for every thread that ever
+created a pipeline or read a pipeline cache (`vn_tls_get_ring`,
+`vn_common.c:295-347`), kept until that thread exits. That is 1 to 3 per client
+here. A client that compiles pipelines on a worker pool has one ring per
+worker, and DXVK sizes its pool to the vCPUs. So a game on a 16-vCPU guest
+needs 16 rings, past the old per-context 8. Beside this desktop it also
+needs more than the 8 of the old 32 that were left.
+`a_gpu_composited_desktop_and_a_game_fit_in_the_ring_caps` replays the
+measured rings plus that game, and it fails at the old values. A refused ring
+cannot be reported to the guest: `vkCreateRingMESA` has no reply, and the
+guest then waits on a ring nobody reads.
+
+Fence threads were bounded only per context (one per `ring_idx`, 63), so 64
+contexts could have made the host run 4032 threads. `MAX_FENCE_THREADS` is the
+renderer-wide count. Past it the fence is refused and the device answers it at
+once, as for a full queue. A slot is given back after its thread is joined.
+Mesa 26.0.8 on this path never used one (see the waker below).
+
+### The window
+
+The guest kernel needs nothing of its size. `virtio_gpu` requests the region
+and carves it with a `drm_mm` (`virtgpu_kms.c:178-195`); only the PCI BAR must
+be a power of two, and `machine_x86::shm::plan` rounds it. What a larger window
+cost was the host allocation behind it. `SharedWindow::new_host_mapped` used to
+allocate the window's own pages even though they are never shown to a guest.
+On Windows, `vm-memory`'s `VirtualAlloc(MEM_COMMIT)` makes that the window's
+length in commit charge. A host-mapped window now allocates nothing. Its
+length is held to the same rules
+(`a_host_mapped_window_allocates_nothing_but_keeps_the_length_rules`), so a
+window costs guest-physical address space and nothing else on either host.
+
+The default is **4 GiB**. It holds everything the budgets admit at once: 1 GiB
+of host blobs and 2 GiB of host-visible memory. So the window is never the cap
+that bites first; at 256 MiB, and at 1 GiB in the first stress run, it was.
+4 GiB is also what QEMU's documentation gives a Venus guest (`hostmem=4G`). It
+needed `machine_x86::layout::MAX_SHM_BAR_BYTES` 1 → 4 GiB and the 64-bit
+aperture 16 → 64 GiB (the `const` assertion: one maximum BAR per slot plus an
+alignment gap). At the top of a 4 GiB guest the aperture ends at 69 GiB, far
+inside the firmware's 2^46. A profile can choose the size:
+`[display] host_visible_mib`, a power of two from 64 to 4096, absent by
+default, so existing profiles serialise byte-identically.
+`entangled::run_vm::tests::the_host_visible_window_setting_agrees_with_the_renderer_and_the_machine`
+holds the three crates' numbers together.
+
+### Shares, not only totals
+
+Every renderer-wide cap that one client can fill now has a per-context share
+under it, following the host-blob caps of the previous amendment:
+
+- host-visible memory, through `PageBudget::share`: a charge must fit the
+  context's share and what is left of the whole, and a refund goes to both;
+- memory blobs (`MAX_MEMORY_BLOBS_PER_CONTEXT`);
+- and through those two, the window's hypervisor ranges. One context at both
+  of its blob shares holds at most 1088 of the 4096 ranges
+  (`one_venus_client_at_its_shares_leaves_most_of_the_window_ranges`).
+
+Malicious-guest tests: `one_context_cannot_take_the_host_visible_budget_from_the_rest`,
+`one_context_cannot_take_the_memory_blobs_from_the_rest`,
+`a_budget_share_is_bounded_by_itself_and_by_the_whole`,
+`fence_threads_are_capped_across_every_context_and_given_back`.
+
+What a hostile guest can make the host commit is 1 GiB of host blobs and 2 GiB
+of host-visible pages. That is up from 2 GiB in all, and still less than the
+RAM of a 4 GiB guest. What it can make the host run is 256 ring workers,
+64 monitors and 256 fence threads, all parked unless it produces. Raising
+`MAX_RINGS` 8× also multiplies the transient per-command decode budget
+(`wire::MAX_TEMP_ALLOC_BYTES`, 1 GiB, reset per command and per ring worker),
+which is per thread and has no renderer-wide pool. Host Vulkan objects are
+likewise bounded only per context (65536 × 64). Neither was reached; both are
+recorded here as unbounded renderer-wide.
+
+### The compositor that runs away
+
+Every one of the six stress runs eventually lost the whole desktop to one
+client, gnome-shell; the final run only after its three-minute phase. It began allocating a fresh host-visible buffer of a client's
+frame size, 60–80 per second, and freed none. The sizes were 1 921 024 bytes
+(an 800×600 glmark2 frame), 3 842 048 bytes (vkmark) and 2 MiB. It went on
+until some cap refused the next allocation or map. Mesa allocates
+asynchronously, so the refusal surfaces as the next `vkBindBufferMemory2`
+naming memory that does not exist, which ends gnome-shell's context and with
+it every client's Wayland connection.
+
+| Run | Caps | Trigger | gnome-shell held | Refused by |
+|---|---|---|---|---|
+| 1 | 1 GiB budget, 1 GiB window | 9 clients started at once, vkmark mailbox | 878 MiB in ~6 s | renderer-wide budget |
+| 2 | 3 GiB, 4 GiB window | same | 2.56 GiB, 888 ranges | `MAX_HOST_RANGES` (1024) |
+| 3 | 2 GiB / 1 GiB share | same, glmark2 FIFO | 1 GiB | its share |
+| 4 | 3 GiB, no share | staggered start, vkmark last | 2.85 GiB in 14 s | renderer-wide budget |
+| 5, 6 | final | ~25 s after closing half the clients | 1 GiB | its share |
+
+No budget absorbs this: it grows at 150–250 MiB/s until something refuses.
+Per zink's source, a staging buffer is freed only when its batch completes. A
+freed one stays cached for up to a second. A batch is forced out only at 80 %
+of the device-local heaps, 6.4 GB on this card (`zink_batch.c:1024`,
+`zink_bo.c:1400`). So the guest will hold whatever an unflushed compositor
+accumulates. With shares, the runaway client is refused at its share and the
+other clients keep what they hold. That is all a cap can do. Two leads for the
+stage that takes this on:
+
+- The runs reproduce it: with glmark2 jellyfish, vkcube and gnome-calculator
+  still up, it starts ~25 s after the other five clients close.
+- **Venus queue fences retire synchronously on WHP.** 77 004 times in the final
+  run: `no host waker: a venus queue fence completes synchronously ctx_id=3
+  ring_idx=1`. `attach_userspace_with_shm` never hands a device a
+  `HostWaker` (the KVM path does, through `DeferredWaker`), so every fence
+  gnome-shell puts on its queue's timeline is signalled before the GPU work
+  it guards has run. Whether that is what lets the compositor race ahead of
+  its own batches is not yet shown. It is a correctness bug either way.
+
+### Leaks
+
+None found. In the final run every counter came back when clients went:
+closing 6 of 13 contexts took rings 23 → 12, host blobs 67 → 36,
+memory blobs 91 → 51, window 155 → 84 ranges and 157 → 105 MiB of
+host-visible memory. With the desktop alone again (3 contexts, after
+gnome-shell was restarted) it read 5 rings, 8 threads, 16 host blobs,
+21–24 memory blobs, 34–37 ranges and 52–58 MiB. The first baseline was 5, 8,
+14, 21, 32 ranges and 68 MiB. The guest's own allocator agrees:
+`virtio-gpu-host-visible-mm` read 75 MiB used at the baseline, 304 MiB with
+the desktop up, and 73–78 MiB after everything closed. When the last
+context of a run goes, the next context starts from zero blobs.
+
+### Next limits
+
+In order:
+
+1. The compositor runaway above, and the missing WHP waker.
+2. The runaway's other face: host-visible allocation throughput. Every staging
+   buffer is a page allocation, a driver import and a hypervisor map.
+3. Renderer-wide bounds for host Vulkan objects and for transient decode
+   memory, both still per-context and per-thread only.
+
+## Amendment, 2026-09-24 — no early fences: WHP gets a host waker, and the runaway is the idle blank
+
+The capacity amendment above left two leads for the compositor runaway. The
+first, the missing WHP waker, is closed here; it turned out not to be the
+runaway's cause, and the second measurement names what is.
+
+### Fences are never answered before their work
+
+`VenusRenderer::create_fence_on` used to answer a `ring_idx` ≥ 1 fence
+signalled at once when the device had no host waker, on the theory that
+nothing would ever collect a deferred one. Every device on WHP had no waker
+(ADR-0002, the 2026-09-24 amendment), so on that host every fence a guest put
+on a queue's timeline told it the GPU work was done before it had run —
+77 004 of them in the capacity run's final desktop. That fallback is gone.
+A ring fence now goes to its queue's fence thread with or without a waker;
+the waker only decides how soon the device hears of the retirement — at once,
+or at the next poll, which every notify makes. The device timeline keeps its
+phase-1 fallback (one host GL context runs in order, so nothing can overtake
+it); a ring timeline is a `VkQueue` running on its own and has no such
+excuse. Ring 0 (the context's CPU timeline) and fences with no `ring_idx`
+are unchanged: signalled once the context commands before them ran (5b.3).
+The one remaining "signalled at once" is a fence on a context already fatal or
+a device lost, whose work will never run; `RingFenceCounts` counts both
+answers and the usage log carries them (`ring_fences_deferred`,
+`ring_fences_signalled_unrunnable`).
+
+The machine layer now gives WHP a waker (`machine_x86::host_wake`), so both
+hosts defer. Measured in the same stress desktop (Ubuntu 26.04, GNOME on
+zink, WHP, RTX 2070, 13 contexts at the peak):
+
+| | before (capacity run 6) | now |
+|---|---|---|
+| ring fences answered before their work | 78 979 | **0** |
+| ring fences deferred to a fence thread | 0 | 84 308 |
+| answered at once as unrunnable | — | 0 |
+| peak pending ring fences | 0 | 1 |
+| device fence wait, mean / max | — | 331 µs / 33 ms, no watchdog timeout |
+| desktop composite, 13 contexts | ~33 fps | 35–38 fps |
+| glmark2 (FIFO), each of 3 windows | 20–22 FPS | 21–23 FPS |
+| vk-smoke | 9/9 | 9/9 |
+
+Tests: `without_a_waker_a_timeline_fence_stays_pending_until_the_work_is_done_and_the_device_polls`
+(fake Vulkan, a stuck queue), `without_a_waker_a_ring_fence_is_held_until_its_work_is_done_and_the_next_kick_collects_it`
+(the device over a real virtqueue), and the 5b.3 real-GPU test on the RTX 2070
+both ways: `a_timeline_fence_retires_after_the_real_gpu_work_before_it` and
+`without_a_waker_a_timeline_fence_still_waits_for_the_real_gpu_work` — a
+32 MiB fill, every word present when the fence is collected, ~38 ms after
+the submit either way.
+
+### The runaway persists, and it starts when the screen blanks
+
+Deferring the fences did not change the runaway: gnome-shell's context again
+went from 50 memory blobs to 561 (1 066 MiB) in ten seconds and was refused at
+its 1 GiB share (`size=1920000`, then `vkBindBufferMemory2 … names no
+VkDeviceMemory`), which ended its context and the session. What the new run
+added is *when*. The log line just before it, every time:
+
+| Run | `virtio-gpu scanout disabled` | first refusal | gdm (re)start → blank |
+|---|---|---|---|
+| capacity 5 | 16:48:07 | 16:48:15 | 5 min 22 s |
+| capacity 6 | 17:05:00 | 17:05:10 | 5 min 21 s |
+| this run | 18:12:10.19 | 18:12:17.77 | 5 min 22 s |
+| this run, the restarted session | 18:17:34 | (VM powered off) | 5 min 11 s |
+
+The last virtio-gpu frame was presented at 18:12:08; the scanout was
+disabled at 18:12:10; the allocations began in the same second. A scanout
+the guest turns off five minutes after its session starts, again five
+minutes after the next one, with no input in between, is GNOME's idle blank:
+the guest reads `idle-delay` `uint32 300`, `idle-dim` and `lock-enabled`
+true. mutter turns the CRTC off.
+
+A second run, with a per-ring command histogram (a diagnostic build, not
+kept) and only three clients (glmark2 jellyfish, vkcube, gnome-calculator),
+reproduced it — blank at 18:52:31.36, gnome-shell refused at 18:52:41.75 —
+and shows what gnome-shell's context does on either side of the blank:
+
+| per second | desktop painting | after the blank |
+|---|---|---|
+| `vkQueueSubmit` / `vkWaitSemaphores` | ~270 / ~270 | **0** (one submit in ten seconds) |
+| `vkCreateBuffer` / `vkDestroyBuffer` | ~570 / ~570 | 160 / 0 |
+| `vkAllocateMemory` | 0 (sub-allocated) | ~100 |
+| `vkCreateImage` + `vkBindImageMemory2` | 0 | ~80 |
+| destroys or frees of any kind | balanced | **0** |
+
+So after the blank every client commit (~80/s across the three) gets a new
+image, two new buffers and ~1.25 new host-visible allocations — the upload
+of that frame, 800 × 600 × 4 = 1 920 000 bytes for glmark2, 2 MiB slabs
+beside them — and none of it is ever submitted, so none of it is ever done
+and zink frees none of it: zink releases a batch's resources only when the
+batch completes, and its own backstop flush is at 80 % of the device-local
+heaps (6.4 GB here), far above the 1 GiB share at which this renderer
+refuses. The one submit after the blank (timeline value 71 543 on
+gnome-shell's semaphore) was waited on by the host and completed; nothing
+was pending on any fence, semaphore or ring fence of ours when the share
+refused. The runaway is the guest compositor holding every upload of a
+blanked screen, and the fences were never part of it.
+
+What is ours and what is not:
+
+- The blank itself is guest policy, and a `SET_SCANOUT` of resource 0 is
+  honoured correctly.
+- The unbounded hold is mutter + zink behaviour: the same compositor on zink
+  over any Vulkan driver would hold until zink's 80 % flush.
+- The *crash* is the interaction with our share: zink sizes its backstop from
+  the device-local heap sizes the guest is told, which are the host GPU's
+  (8 GB), not the budget this renderer enforces. Reporting heap sizes that reflect the budget
+  (or a `VK_EXT_memory_budget` that does) would let zink flush before the
+  refusal, but it changes what every guest application is told about VRAM,
+  so it is a decision for the stage that takes this on, not a contained fix.
+
+Also seen in the first run, from the client side: two
+glmark2 processes whose compositor had died kept allocating and freeing a
+1 921 024-byte host-visible buffer per frame, ~155/s each, for eight minutes
+— freed every time, so not a leak, but the host-visible allocation throughput
+the "next limits" list names.
+
+Next limits, revised:
+
+1. The blanked-compositor hold: heap sizes or a memory budget that make zink
+   flush before the share refuses, or a guest-side setting for the demo
+   image (`idle-delay 0`) in the meantime.
+2. Host-visible allocation throughput (unchanged).
+3. Renderer-wide bounds for host Vulkan objects and transient decode memory
+   (unchanged).
+
+## Amendment, 2026-09-24 — honest heaps, and why they do not stop the blanked compositor
+
+The amendment above left "heap sizes or a memory budget that make zink flush
+before the share refuses" as the first next limit. This stage makes the heaps
+honest, reads what Zink actually does with them, and measures both that and a
+deliberately dishonest variant in the guest. Neither stops the runaway.
+
+### The heaps a guest is told
+
+`policy::guest_heaps`, applied per context when its instance first enumerates
+devices: every heap holding a type the guest sees as `HOST_VISIBLE` — after
+`guest_memory` only the types backed by our imported pages — reports
+`min(host size, the context's host-visible share)`. Every other heap keeps the
+host's size. Type indices, type flags and heap flags are unchanged. On the RTX
+2070 the guest's `vulkaninfo` now reads:
+
+| heap | flags | host | guest |
+|---|---|---|---|
+| 0 | `DEVICE_LOCAL` | 7.82 GiB | 7.82 GiB |
+| 1 | — (types 0, 3, 4; 3 and 4 are our pages) | 31.94 GiB | **1024 MiB** |
+| 2 | `DEVICE_LOCAL` (the BAR, type 5, no longer host visible) | 214 MiB | 214 MiB |
+
+Device-local heaps are left alone because nothing of ours bounds them per
+context: device-local memory is not charged to any budget, the driver refuses
+past its own heap, and a context may allocate all of it. `VK_EXT_memory_budget`
+is neither advertised (it is not in `ADMITTED_EXTENSIONS`, and Mesa 26.0.8's
+venus offers it only under `VN_DEBUG=mem_budget`, `vn_physical_device.c:1426`)
+nor admitted as a chain link, so no budget can disagree with the heaps; the
+guest's `vulkaninfo` lists no `VK_EXT_memory_budget`. The per-context share
+stays 1 GiB (below).
+
+What the honest heap changes: a Vulkan client that sizes its staging or budget
+from heap sizes is told the number it will be refused at, and Zink itself reads
+this heap for the largest single allocation it tries (`zink_bo.c:288-292`),
+the size of its BO cache (an eighth of all heaps, `zink_bo.c:1396-1402`) and
+its buffer-size caps (`zink_screen.c:455-470`). The refusal is exactly where
+the heap is full
+(`the_heap_of_our_pages_is_the_share_and_is_full_where_the_share_refuses`).
+
+### What Zink's backstop reads
+
+Zink (Mesa 26.0.8) has one memory-driven flush:
+
+- `clamp_video_mem = total_video_mem * 0.8` (`zink_screen.c:3633-3634`), where
+  `total_video_mem` is the sum of the heaps with `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT`
+  and nothing else (`get_video_mem`, `zink_screen.c:272-281`).
+- Every buffer or image object a batch references adds its size to
+  `bs->resource_size`, host-visible or not (`zink_batch.c:1066-1069`, both the
+  synchronized and the unsynchronized lists, `:1143`).
+- When that reaches `clamp_video_mem`, `check_oom_flush` sets `oom_flush` and
+  `oom_stall` (`zink_batch.c:1024-1031`). Nothing flushes there. The batch is
+  flushed at the next *synchronized* buffer↔image copy (`zink_context.c:5108`),
+  `resource_copy_region` (`:5297`) or framebuffer change (`:4183`).
+- `u_threaded_context`'s mapped-bytes limit (a quarter of guest RAM,
+  `zink_context.c:5960`) counts `buffer_map`/`texture_map` only; a
+  `texture_subdata` never touches it.
+
+So the system heap — the one holding our pages — never enters the backstop.
+With honest heaps it stays at 0.8 × (8 394 899 456 + 224 395 264) =
+**6 895 435 776 bytes**. In the runaway each client commit is a 1 920 000-byte
+staging buffer plus an image of the same size, so the backstop is 1796 uploads
+away and the share refuses the 560th
+(`a_blanked_compositor_meets_its_share_long_before_zinks_backstop`). The
+previous amendment's premise — that heap sizes reflecting the budget would let
+Zink flush first — holds only for the device-local heaps, and only if a flush
+point comes.
+
+### Measured: neither heap policy survives the blank
+
+Three guest runs, WHP, RTX 2070, Ubuntu 26.04 with GNOME on zink,
+`idle-delay` set to 60 as the session user (read back as `uint32 60`),
+glmark2 jellyfish + vkcube + gnome-calculator (GTK4):
+
+| run | heaps told | Zink backstop | blank → refusal | what happened |
+|---|---|---|---|---|
+| A: honest | 7.82 GiB / 1 GiB / 214 MiB | 6.90 GB | 7.7 s | 106 → 990 MB in 6 s, no drop, refused at the share |
+| B: device-local scaled (diagnostic build only) | 1.22 GiB / 1 GiB / 33 MiB | 1.00 GiB | 24.5 s | one flush: 862 → 247 MB at +6 s, then 247 MB → 1.09 GB in 16 s with no second flush, refused at the share |
+| C: honest, the committed build | as A | 6.90 GB | 8.5 s | 125 MB → 1.14 GB in 8 s, refused at the share |
+
+Each refusal was `vkBindBufferMemory2 … names no VkDeviceMemory` on
+gnome-shell's context, which ended it; gnome-shell was gone at the first
+check a minute into the blank, vkcube asserted in `demo_prepare_swapchain` and
+gnome-calculator reported "Lost connection to Wayland compositor"; glmark2
+survived. The wake (`org.gnome.ScreenSaver.SetActive false` and
+`loginctl unlock-sessions`) therefore had no session to wake. vk-smoke on the
+committed build: 9/9.
+
+Run B is the informative one. Zink's backstop *did* fire once it was put under
+the share — so `resource_size` does grow with these uploads — but only when
+gnome-shell next reached a flush point, which a blanked mutter does only
+sporadically. The likely reason, from the source rather than measured: a
+texture no batch holds takes `u_threaded_context`'s unsynchronized
+`texture_subdata` path (`can_unsync`, `u_threaded_context.c`
+`tc_texture_subdata`), and Zink records that copy without the flush check
+(`zink_context.c:5108` requires `!unsync`). After the one flush the next did
+not come within 16 s, while the hold grew again at ~50 MB/s. No backstop size can bound that: even a backstop of
+zero bytes leaves the time between two flush points to the share, and the
+diagnostic run of the amendment above saw one submit in ten seconds.
+
+### Decisions
+
+- **Heaps stay honest: our-pages heap = the share, device-local = the host's.**
+  Shrinking device-local heaps is not honest (nothing of ours bounds them), it
+  would tell every Vulkan client that budgets from heap sizes to put its
+  overflow in system-memory types — our pages here, the budget we refuse
+  from — and run B shows it does not fix the
+  runaway anyway. It was a diagnostic override only and is not in the tree.
+- **The share stays 1 GiB.** The runaway grows at 50–150 MB/s for as long as
+  the compositor reaches no flush point, which is unbounded; a larger share only
+  delays the refusal and raises what a hostile guest pins (2 GiB renderer-wide).
+- The context-creation log now says what the guest was told:
+  `heaps=[…] host_visible_share=… zink_flush_threshold=…`.
+
+### Next limits, revised
+
+1. The blanked-compositor hold is not the renderer's to size away. What can
+   end it is guest-side: `idle-delay 0` (no blank) on the demo image, or a
+   mutter/Zink that flushes uploads while the CRTC is off. On the renderer side
+   the only remaining lever is making a refused allocation survivable, which
+   Mesa's asynchronous `vkAllocateMemory` makes a protocol change, not a policy.
+2. Host-visible allocation throughput (unchanged).
+3. Renderer-wide bounds for host Vulkan objects and transient decode memory
+   (unchanged).

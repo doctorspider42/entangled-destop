@@ -123,13 +123,35 @@ pub const COMMAND_GENERATE_REPLY: u32 = 0x0000_0001;
 /// pool.
 pub const MAX_TEMP_ALLOC_BYTES: usize = 1 << 30;
 
-/// Links a pNext chain may have before it is refused.
+/// Links a pNext chain may have before it is refused: 256.
 ///
 /// Ours, not the reference's: `vn_decode_*_pnext_temp` recurses per link with
 /// no limit, and every link the guest writes costs it twelve bytes of ring
-/// buffer against one host stack frame. Real Vulkan chains are a handful of
-/// links deep, so this is far above anything a driver produces.
-pub const MAX_PNEXT_DEPTH: u32 = 32;
+/// buffer against one host stack frame. This is a **stack** bound, and only
+/// that — what bounds a chain's *content* is that no `sType` may appear in it
+/// twice ([`crate::venus::protocol::ProtocolError::DuplicatePnextStype`]),
+/// so a valid chain is never longer than its parent admits, and that every
+/// link decoded is charged to the command's allocation budget
+/// ([`Decoder::charge`]).
+///
+/// It used to be 32, on the theory that real chains are a handful of links
+/// deep. They are not: a guest shown 70-odd extensions asks
+/// `vkGetPhysicalDeviceFeatures2` about dozens of feature structures in one
+/// chain (zink does), and creates its device with the same chain, and the
+/// 33rd link killed the context. The executor serves 44 structures under
+/// `VkPhysicalDeviceFeatures2`, 27 under `VkPhysicalDeviceProperties2` and 47
+/// under `VkDeviceCreateInfo` — the longest chains the capset lets a guest
+/// send — but this decoder runs before the executor's policy and must walk
+/// whatever the generated protocol admits: 117, 51 and 120 (the most any
+/// parent admits). A nested chain (a structure inside a link) continues the
+/// same count. So the bound is the longest *decodable* chain with more than
+/// twice its length to spare, for the structures the next Vulkan releases
+/// add; a decodable link the executor does not serve is then refused by name
+/// rather than as "too deep". 256 frames of this recursion are a few tens of
+/// KiB of a thread's stack.
+/// `venus::executor::query_tests` pins that it stays at least twice the
+/// longest admitted chain.
+pub const MAX_PNEXT_DEPTH: u32 = 256;
 
 /// Why a Venus command stream could not be decoded, or a reply encoded.
 ///
@@ -390,6 +412,26 @@ impl<'a> Decoder<'a> {
     #[must_use]
     pub fn fatal_error(&self) -> Option<WireError> {
         self.fatal
+    }
+
+    /// Charge `bytes` of host storage the caller keeps for this command to the
+    /// allocation budget, as [`Decoder::repeat`] charges an array's — for
+    /// storage that grows one element at a time: a pNext chain's links.
+    ///
+    /// # Errors
+    /// [`WireError::AllocationBudgetExhausted`] past the budget (the stream
+    /// is then fatal), or [`WireError::Poisoned`].
+    pub fn charge(&mut self, bytes: usize) -> Result<(), WireError> {
+        self.guard()?;
+        if bytes > self.budget {
+            let budget = self.budget;
+            return self.fail(WireError::AllocationBudgetExhausted {
+                wanted: bytes,
+                budget,
+            });
+        }
+        self.budget -= bytes;
+        Ok(())
     }
 
     /// Give the next command a full allocation budget again, as
@@ -2158,7 +2200,7 @@ mod tests {
         // The reference recurses once per link with no cap at all. At twelve
         // bytes per link a 16 MiB ring buffer names over a million of them,
         // and the host has one stack.
-        let links: Vec<(i32, u32)> = (0..64).map(|i| (1_000_001, i)).collect();
+        let links: Vec<(i32, u32)> = (0..MAX_PNEXT_DEPTH * 2).map(|i| (1_000_001, i)).collect();
         let mut enc = Encoder::new();
         encode_chain(&mut enc, &links).expect("deep chain");
         let bytes = enc.finish().expect("finish");

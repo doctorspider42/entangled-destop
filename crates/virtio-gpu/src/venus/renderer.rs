@@ -3,14 +3,22 @@
 //! guest wants its ring in, decodes the context command stream and pumps the
 //! ring (EPIC 20, ADR-0004).
 //!
-//! **It executes no Vulkan.** This is the transport half and nothing else: a
-//! real Mesa `venus` guest can get all the way to handing us a command ring and
-//! writing commands into it, and what happens to those bytes is a
-//! [`RingSink`] the caller supplies — [`CaptureSink`] for a test, [`WriteSink`]
-//! for `entangled run` writing a capture file. Nothing here decodes a Vulkan
+//! **It executes no Vulkan itself.** This is the transport half: a real Mesa
+//! `venus` guest can get all the way to handing us a command ring and writing
+//! commands into it, and what happens to those bytes is a [`RingSink`] per
+//! ring, made by a [`SinkFactory`] the caller supplies — [`CaptureSink`] for a
+//! test, [`WriteSink`] for `entangled run` writing one capture file per ring,
+//! or [`ExecutorFactory`](super::executor::ExecutorFactory)'s sink, which
+//! executes and answers (stage 5a.3). Nothing in this file decodes a Vulkan
 //! command, and deliberately so: everything up to the ring is pure logic over
 //! bytes and is provable on a host with no GPU at all, which is the whole
 //! reason the seam is drawn where [`super`]'s docs draw it.
+//!
+//! What a sink needs beyond its bytes it gets through the factory: a
+//! [`RingEnv`] per ring, whose [`ContextBlobs`] is the context's view of the
+//! host blobs — where an executing sink writes its replies — and the
+//! `context_created` / `context_destroyed` / `reset` hooks, each called only
+//! once every ring worker it concerns has been joined.
 //!
 //! # The guest's route through here
 //!
@@ -23,59 +31,87 @@
 //!    allocate [`RingPages`] for it here, because a ring's three control words
 //!    are lock-free atomics both sides hammer and only host-owned pages
 //!    published with [`RingPages::publish`] can express that (see
-//!    [`super::shmem`]).
+//!    [`super::shmem`]). That is `blob_id` 0. A blob with any other
+//!    `blob_id` names a `VkDeviceMemory` of the same context, and gets no new
+//!    pages: [`SinkFactory::export_memory`] hands back **the pages that
+//!    memory already is** (stage 5b.1), so mapping the blob shows the guest
+//!    exactly the bytes the GPU uses — or, for exportable device-local
+//!    memory, a host handle to it (stage S1): a **handle blob**
+//!    ([`ExportedMemory::Handle`]), which has no pages, is refused if mapped,
+//!    and is what another context attached to it imports.
 //! 4. `RESOURCE_MAP_BLOB` — the pages go in front of the guest at the window
 //!    offset it named, and the [`Publication`] that keeps them alive is held
 //!    beside them.
 //! 5. `SUBMIT_3D` carrying `vkCreateRingMESA` — the guest's proposed layout is
 //!    judged by [`RingLayout::new`] against the size of *these* pages and
 //!    adopted with [`RingPages::adopt`], which re-checks it against the
-//!    allocation before a [`RingPump`] ever indexes anything.
-//! 6. `SUBMIT_3D` carrying `vkNotifyRingMESA` — the doorbell. We consume
-//!    everything the guest has produced, then publish
-//!    [`STATUS_IDLE`](super::pump::STATUS_IDLE) again.
+//!    allocation before a [`RingPump`] ever indexes anything. The ring then
+//!    gets its own [`RingWorker`] thread and, if the guest chained a
+//!    `VkRingMonitorInfoMESA`, a place on its context's [`RingMonitor`].
+//! 6. `SUBMIT_3D` carrying `vkNotifyRingMESA` — the doorbell. It wakes the
+//!    ring's worker and does nothing else: the device's queue worker never
+//!    touches ring pages.
 //!
-//! # The doorbell is pumped synchronously, and there is no thread
+//! # Every ring is served by its own thread
 //!
-//! The ring protocol says the host publishes `IDLE` and then blocks until it is
-//! notified; a guest that sees `IDLE` rings the doorbell for every batch it
-//! writes. **A host that is always idle is therefore one the guest always
-//! notifies**, and that is the design here:
-//! [`STATUS_IDLE`](super::pump::STATUS_IDLE) is published as
-//! soon as a ring is created and republished at the end of every doorbell, so
-//! `vkNotifyRingMESA` arriving on the context stream is our only cue, and we
-//! consume everything available before returning from
-//! [`submit`](Renderer3d::submit).
+//! [`super::service`] has the whole argument. In short: Mesa rings the
+//! doorbell at most once a millisecond and relies on the host polling for the
+//! `idleTimeout` it passed at ring creation, so a host that only looks when
+//! the doorbell rings misses the second of every pair of submissions — which
+//! is how the previous, synchronous design of this file left a real guest's
+//! first Vulkan command unread until its watchdog aborted. The worker polls
+//! for `idleTimeout`, publishes `IDLE`, re-reads `tail`, and only then parks;
+//! the context's monitor sets `ALIVE` for the guest's watchdog.
 //!
-//! Publishing idle is not an optimisation to skip — it is what makes the design
-//! work at all. A host that consumed on the doorbell but never advertised
-//! `IDLE` would be a host whose guest never rings it, and the ring would sit
-//! full while both sides waited for the other.
+//! What those threads cost this file:
 //!
-//! What this costs: **a vCPU exit per submission**. The guest's producer thread
-//! rings the doorbell through `SUBMIT_3D`, which is a virtqueue round trip, for
-//! work a polling host thread would have picked up with no exit at all. A later
-//! design will want that back, and when it takes it, it inherits two
-//! obligations this file does not have:
+//! * **ADR-0005's [`Quiesce`] gate.** Both kinds of thread write guest-visible
+//!   pages, so both take it before every pass, outside every lock. The gate is
+//!   the device's, handed over with [`set_quiesce`](Renderer3d::set_quiesce);
+//!   until then it is a gate that never closes, which is what a renderer with
+//!   no VM around it wants.
+//! * **Joins on every teardown path.** `vkDestroyRingMESA`, `ctx_destroy`,
+//!   destroying a ring's blob and [`reset`](Renderer3d::reset) all stop and
+//!   join the threads they end, and none of them can deadlock: the threads take
+//!   no lock the renderer holds, and a thread parked at the pause gate is woken
+//!   to notice it is being stopped. [`VenusRenderer::live_threads`] is how a
+//!   test proves it.
+//! * **ADR-0006's `save`/`load` pair is still owed.** There is host state here
+//!   a resumed guest would notice missing: per ring, [`RingPump::cursor`] and
+//!   [`RingPump::status`], plus the layout, the monitor period and the window
+//!   offset each set of pages was published at. It is not implemented because
+//!   nothing in this file is reachable from a shipping VM yet — the renderer is
+//!   opt-in and diagnostic; a factory whose sinks hold host Vulkan objects
+//!   refuses a snapshot by name ([`SinkFactory::snapshot_refusal`]) — but a
+//!   snapshot taken over a live ring
+//!   without it would resume a guest whose `head` says one thing and whose host
+//!   cursor says another, which is the quietest possible corruption.
 //!
-//! * **ADR-0005's [`Quiesce`](virtio_core::Quiesce) gate.** No host thread of
-//!   ours touches guest memory here: every access to the ring happens inside a
-//!   device call, on the device's own queue worker, which a pause already
-//!   stops between commands. A pump thread would be a second toucher of guest
-//!   memory and would have to take the gate — outside the device lock — before
-//!   every pass.
-//! * **ADR-0006's `save`/`load` pair.** There is host state here a resumed
-//!   guest would notice missing: per ring, [`RingPump::cursor`] and
-//!   [`RingPump::status`] (the pump's own docs say so), plus the layout and the
-//!   window offset each set of pages was published at. It is not implemented
-//!   because nothing in this file is reachable from a shipping VM yet — the
-//!   renderer is opt-in and executes nothing — but a snapshot taken over a live
-//!   ring without it would resume a guest whose `head` says one thing and whose
-//!   host cursor says another, which is the quietest possible corruption.
+//! The `reset()` half of ADR-0005 *is* implemented: it stops and joins every
+//! thread, then drops every context, ring, publication and page, so a rebooted
+//! guest finds no stale `head` in shared memory because it finds no shared
+//! memory at all.
 //!
-//! The `reset()` half of ADR-0005 *is* implemented: it drops every context,
-//! ring, publication and page, so a rebooted guest finds no stale `head` in
-//! shared memory because it finds no shared memory at all.
+//! # Scanout of its own blobs (stage S2b of "GNOME on the GPU")
+//!
+//! [`Renderer3d::scanout_blob`] and [`Renderer3d::read_rect_bgra`] serve a
+//! guest compositor's flips (ADR-0004's S2b amendment):
+//!
+//! * a **page blob** (host-visible memory: our pages) is accepted when the
+//!   image fits the pages — `offset + stride × (height − 1) + width × 4`, in
+//!   u64 — and read row by row out of them;
+//! * a **handle blob** is accepted only when a canonical DRM-modifier image
+//!   recorded on it ([`ScanoutImage`], put there by the executor when the
+//!   image was bound to the memory) is exactly the image the spec describes
+//!   ([`scanout_mismatch`]), and is read by the factory
+//!   ([`SinkFactory::read_scanout`]) — for the executor, through a scanout
+//!   device of the renderer's own, between an acquire and a release that
+//!   match the guest's last recorded release ([`ScanoutRelease`]);
+//! * anything else is refused, and a refusal keeps the last acceptance.
+//!
+//! The directory is where the image and the release are recorded, under its
+//! lock, found by the handle's identity ([`SharedRef`]) rather than by a
+//! guest id.
 //!
 //! # Every guest-supplied id is a name, never an index
 //!
@@ -96,11 +132,12 @@
 //!   that carried it is poisoned, and every later `SUBMIT_3D` on it is refused
 //!   with [`VenusError::ContextPoisoned`] rather than decoded from a position
 //!   nobody can justify.
-//! * A **ring** whose guest published an impossible `tail` is marked fatal by
-//!   [`RingPump`] itself, which tells the guest's driver to give up instead of
-//!   waiting on a `head` that will never move. We keep the dead pump exactly
-//!   where it is: a later doorbell answers [`PumpError::Fatal`], and no code
-//!   path here rebuilds a pump over a ring that has already failed.
+//! * A **ring** whose guest published an impossible `tail`, or whose sink met
+//!   a command it cannot answer, is marked fatal by its worker, which tells the
+//!   guest's driver to give up instead of waiting on a `head` that will never
+//!   move, and ends. We keep the dead ring exactly where it is: a later
+//!   doorbell answers [`VenusError::RingStopped`], and no code path here
+//!   rebuilds a pump over a ring that has already failed.
 //!
 //! A *content* refusal — a ring layout that does not fit, a duplicate ring id —
 //! is different, and is not sticky: the bytes were well formed, we simply will
@@ -110,32 +147,55 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use thiserror::Error;
-use virtio_core::{GuestMem, ShmBacking};
+use virtio_core::{GuestMem, HostWaker, Quiesce, ShmBacking};
 
 use crate::blob::{BlobMapping, BlobSupport};
 use crate::error::CommandError;
 use crate::protocol::{
     MemEntry, Rect, ResourceCreate3d, ResourceCreateBlob, Transfer3d, BLOB_MEM_HOST3D,
 };
-use crate::renderer::{CapsetInfo, Renderer3d};
+use crate::renderer::{CapsetInfo, FenceOutcome, FenceTimeline, Renderer3d, ScanoutBlobSpec};
 
 use super::capset::{VenusCapset, VENUS_CAPSET_LEN, VENUS_CAPSET_MAX_VERSION};
-use super::pump::{Batch, Consumed, Idle, Pass, PumpError, RingPump, RingSink};
+use super::executor::modifier::CanonicalImage;
+#[cfg(doc)]
+use super::pump::RingPump;
+use super::pump::{Batch, Consumed, RingBacking, RingSink};
 use super::ring::{RingCreateInfo, RingLayout, RingLayoutError};
+use super::service::{monitor_period, LiveThreads, RingMonitor, RingService, RingWorker};
 use super::shmem::{Publication, RingPages, ShmemError};
-use super::transport::{Opcode, TransportCommand, TransportError, TransportStream};
+use super::transport::{
+    Opcode, TransportCommand, TransportError, TransportRequest, TransportStream,
+};
+use super::wire::WireError;
 
-/// Size of the host-visible window this renderer asks the machine layer for.
+/// Size of the host-visible window this renderer asks the machine layer for,
+/// unless the profile says otherwise (`[display] host_visible_mib`,
+/// [`VenusRenderer::with_host_visible_bytes`]).
 ///
-/// It is a *window*, not an allocation: nothing is committed until a guest maps
-/// a blob into it, and what lands there is the [`RingPages`] of whichever blob
-/// it named. 256 MiB is what the portable loopback declares too, and is large
-/// enough that a guest's mapping offsets are realistic rather than all crammed
-/// against zero.
-pub const VENUS_HOST_VISIBLE_BYTES: u64 = 256 << 20;
+/// It is a *window*, not an allocation: nothing is committed until a guest
+/// maps a blob into it, and what lands there is the [`RingPages`] of whichever
+/// blob it named. The window has no pages of its own on either host
+/// (`vmm_core::SharedWindow::new_host_mapped`), so its size costs
+/// guest-physical address space in the 64-bit aperture and nothing else.
+///
+/// It was 256 MiB, and a GPU-composited GNOME desktop filled 58 % of it with
+/// four clients (ADR-0004). Every Mesa venus client keeps its rings, its
+/// command-stream pools and every host-visible allocation it maps mapped
+/// here for as long as it lives, and the guest kernel's allocator of the BAR
+/// fails the `mmap` of whatever does not fit — which a compositor does not
+/// survive. 4 GiB holds everything the renderer's budgets admit at once
+/// ([`MAX_RING_BLOB_BYTES`] of host blobs and the executor's
+/// `MAX_HOST_VISIBLE_BYTES` of memory), so the window is never the cap that
+/// bites first; it is also what QEMU's documentation gives a Venus guest
+/// (`hostmem=4G`). The guest kernel needs no particular size (it carves the
+/// region with a `drm_mm`); the BAR is a power of two, so this is one.
+pub const VENUS_HOST_VISIBLE_BYTES: u64 = 4 << 30;
 
 /// Most venus contexts this renderer keeps at once.
 ///
@@ -147,10 +207,16 @@ pub const MAX_VENUS_CONTEXTS: usize = 64;
 
 /// Most rings one context may hold open.
 ///
-/// Mesa creates one ring per `vn_ring`, which is one per device connection plus
-/// a small number for its own internal queues; a guest asking for more than a
-/// handful is not a guest doing graphics.
-pub const MAX_RINGS_PER_CONTEXT: usize = 8;
+/// Mesa 26.0.8 creates one 128 KiB ring per `VkInstance`
+/// (`vn_instance_init_ring`) and one 16 KiB ring for every thread that ever
+/// creates a pipeline or reads a pipeline cache (`vn_tls_get_ring`,
+/// `vn_common.c:295-347`), kept until that thread exits. Measured on the
+/// GPU-composited desktop (ADR-0004, the capacity amendment): one to three
+/// per client. A client that compiles pipelines on a worker pool has one per
+/// worker — DXVK sizes its pool to the vCPUs — and past this cap its next
+/// worker's ring is refused, which the guest sees as a ring that never
+/// answers. It was 8; 32 is a 31-thread compile pool.
+pub const MAX_RINGS_PER_CONTEXT: usize = 32;
 
 /// Most rings across all contexts.
 ///
@@ -160,30 +226,113 @@ pub const MAX_RINGS_PER_CONTEXT: usize = 8;
 /// [`super::ring::MAX_BUFFER_BYTES`] (16 MiB) each. This is the bound that
 /// makes the worst case a number: 32 × 16 MiB of host shadow, and only for a
 /// guest that really wrote that many bytes.
-pub const MAX_RINGS: usize = 32;
-
-/// Most host blobs this renderer backs with pages at once.
-pub const MAX_RING_BLOBS: usize = 64;
-
-/// Most host bytes this renderer will allocate across all live blobs.
 ///
-/// A ring's shared-memory resource is a guest-chosen size, so it is a guest
-/// value naming a host allocation twice over: per blob,
-/// [`super::shmem::MAX_RESOURCE_BYTES`] caps one; this caps their sum. A real
-/// venus ring is ~1 MiB, so 64 MiB is two orders of magnitude of headroom and
-/// still a number a host can afford to lose to a hostile guest.
-pub const MAX_RING_BLOB_BYTES: u64 = 64 << 20;
-
-/// Most passes one doorbell makes over one ring before giving up on it.
+/// It is also the bound on host threads: every ring has its own worker
+/// ([`super::service::RingWorker`]), plus at most one `ALIVE` monitor per
+/// context, so a guest can make this renderer run at most `MAX_RINGS` +
+/// [`MAX_VENUS_CONTEXTS`] threads (and the executor's `MAX_FENCE_THREADS`),
+/// all of them parked or sleeping unless the guest is producing.
 ///
-/// Every pass that continues the loop consumed at least one byte, so a guest
-/// that stops producing ends the loop immediately and a well-behaved one needs
-/// one or two passes. The cap exists for the guest that keeps producing from
-/// another vCPU while we drain: without it, one `vkNotifyRingMESA` could hold
-/// the device's queue worker for as long as the guest cared to feed it.
-/// Exhausting it marks the ring fatal — telling the driver to give up — rather
-/// than returning quietly and leaving work nobody will ever be asked for again.
-pub const MAX_DOORBELL_PASSES: usize = 1024;
+/// It was 32 against 64 contexts. The measured desktop of fourteen clients
+/// held 24; one game-sized client with a compile pool needs more than the
+/// remaining 8 alone. 256 is four per context at the context cap, eight
+/// clients at their whole [`MAX_RINGS_PER_CONTEXT`]. A shadow buffer is no
+/// longer the worst case it once was: each is bounded by its ring's own
+/// buffer, and those are host blobs, inside [`MAX_RING_BLOB_BYTES`].
+pub const MAX_RINGS: usize = 256;
+
+/// Most host blobs (`blob_id` 0: rings, reply windows, command-stream
+/// pools) this renderer backs with pages at once, across every context.
+///
+/// Sized for a desktop, not for one client. With GNOME composited through
+/// Zink every GL client is a venus instance of its own, and a Mesa 26.0.8
+/// venus instance holds several of these for as long as it lives — measured
+/// on the Ubuntu 26.04 guest, 2026-09-24: gnome-shell 7 (a 132 KiB ring, a
+/// 20 KiB one, two 1 MiB pools and three 8 MiB command-stream chunks,
+/// `vn_instance.c:328-332`), glmark2, vkcube and gnome-initial-setup 3 to 5
+/// each. The per-context caps ([`MAX_RING_BLOBS_PER_CONTEXT`],
+/// [`MAX_RING_BLOB_BYTES_PER_CONTEXT`]) keep one hungry client from taking
+/// this from the rest.
+pub const MAX_RING_BLOBS: usize = 1024;
+
+/// Most host blobs one venus context holds at once — see [`MAX_RING_BLOBS`].
+/// Nine times the most any client was measured to hold.
+pub const MAX_RING_BLOBS_PER_CONTEXT: usize = 64;
+
+/// Most blobs of `VkDeviceMemory` this renderer holds at once.
+///
+/// They allocate nothing — their pages are the memory's, charged to the
+/// executor's budget — so this bounds only the table: Mesa makes one per
+/// host-visible allocation it maps, and 4096 is the `maxMemoryAllocationCount`
+/// most drivers report.
+pub const MAX_MEMORY_BLOBS: usize = 4096;
+
+/// Most blobs of `VkDeviceMemory` one venus context holds at once — see
+/// [`MAX_MEMORY_BLOBS`].
+///
+/// Each one a guest maps is also one hypervisor range of the window
+/// (`vmm_core::MAX_HOST_RANGES`), so this share is what keeps one client from
+/// taking the ranges from the rest: the runaway compositor of ADR-0004's
+/// capacity amendment held 888 of them. The measured desktop held 94 in all.
+/// A quarter of [`MAX_MEMORY_BLOBS`].
+pub const MAX_MEMORY_BLOBS_PER_CONTEXT: usize = 1024;
+
+/// Most host bytes this renderer will allocate across all live host blobs.
+///
+/// A host blob's size is guest-chosen, so it is a guest value naming a host
+/// allocation twice over: per blob, [`super::shmem::MAX_RESOURCE_BYTES`] caps
+/// one; this caps their sum, and [`MAX_RING_BLOB_BYTES_PER_CONTEXT`] one
+/// context's share of it.
+///
+/// It was 64 MiB, on the belief that "a real venus ring is ~1 MiB". A venus
+/// *instance* is more than its ring: its command-stream pool grows in 8 MiB
+/// chunks, and freed chunks stay cached for 3 s (`vn_renderer_internal.c`).
+/// On the GPU-composited GNOME desktop gnome-shell alone held 26 MiB, five
+/// clients 60.5 MiB, and the next 8 MiB chunk glmark2 asked for was refused —
+/// 23 times in 20 ms. 1 GiB is what a hostile guest can make this host commit
+/// for host blobs (beside the executor's
+/// [`super::executor::MAX_HOST_VISIBLE_BYTES`] for memory), and six times
+/// what a busy desktop was measured to use (fourteen clients: 171 MiB).
+pub const MAX_RING_BLOB_BYTES: u64 = 1 << 30;
+
+/// Most host-blob bytes one venus context holds at once — see
+/// [`MAX_RING_BLOB_BYTES`]. Sixteen command-stream chunks, five times
+/// gnome-shell's measured 26 MiB.
+pub const MAX_RING_BLOB_BYTES_PER_CONTEXT: u64 = 128 << 20;
+
+/// The host-blob caps one renderer enforces: the constants above, unless a
+/// test shrinks them to make the global caps reachable without allocating a
+/// gigabyte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostBlobLimits {
+    blobs: usize,
+    bytes: u64,
+    blobs_per_context: usize,
+    bytes_per_context: u64,
+}
+
+impl Default for HostBlobLimits {
+    fn default() -> Self {
+        Self {
+            blobs: MAX_RING_BLOBS,
+            bytes: MAX_RING_BLOB_BYTES,
+            blobs_per_context: MAX_RING_BLOBS_PER_CONTEXT,
+            bytes_per_context: MAX_RING_BLOB_BYTES_PER_CONTEXT,
+        }
+    }
+}
+
+/// Canonical images one handle blob keeps on record (stage S2b): the
+/// exporter's and a few importers'. Past it the oldest is forgotten — each
+/// record is a claim about the same payload, so any one of them describes it.
+pub const MAX_SCANOUT_IMAGES: usize = 8;
+
+/// How long a `vkWaitRingSeqnoMESA` on the context stream waits for its ring
+/// before refusing. The device's queue worker is blocked for as long as it
+/// waits, so it is bounded — generously, because what it waits for is a
+/// command the ring worker is executing now (Mesa sends it before making a
+/// blob of memory it allocated asynchronously, `vn_device_memory_wait_alloc`).
+pub const WAIT_RING_SEQNO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The capsets this renderer serves: Venus, and nothing else.
 ///
@@ -201,11 +350,1226 @@ const CAPSETS: [CapsetInfo; 1] = [CapsetInfo {
 
 // ---------------------------------------------------------------- the sinks
 
-/// A [`RingSink`] that appends every byte it is offered to a shared buffer.
+/// Makes the [`RingSink`] for each ring a guest creates: one sink per ring,
+/// never one shared by all of them.
 ///
-/// Cloning one clones the *handle*: the renderer takes a clone and the test
-/// keeps another, which is what makes the captured bytes readable after the
-/// sink has been moved into a `Box<dyn Renderer3d>`.
+/// Each ring's sink lives on that ring's worker thread, so it must be `Send`
+/// and own everything it touches. A closure `FnMut(ctx_id, ring) ->
+/// io::Result<S>` is a factory; so is [`CaptureSink::factory`].
+///
+/// A factory that fails refuses the `vkCreateRingMESA` that asked, by name
+/// ([`VenusError::SinkUnavailable`]): a ring with nowhere to put its bytes is
+/// not one to adopt and then quietly drop the bytes of.
+pub trait SinkFactory: Send {
+    /// The sink every ring gets.
+    type Sink: RingSink + Send + 'static;
+
+    /// The sink for ring `ring` (the guest's handle) of context `ctx_id`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever stopped the sink being made — for `entangled run`, a capture
+    /// file that could not be created.
+    fn sink_for(&mut self, ctx_id: u32, ring: u64) -> io::Result<Self::Sink>;
+
+    /// The sink for a ring, given everything the renderer can hand it beyond
+    /// the bytes: the context's host blobs, where an executing sink writes
+    /// its replies. The renderer calls this, never
+    /// [`sink_for`](Self::sink_for) directly; the default forwards to it, so
+    /// a capture ignores what it has no use for.
+    ///
+    /// # Errors
+    ///
+    /// As [`sink_for`](Self::sink_for).
+    fn sink_for_ring(&mut self, env: RingEnv) -> io::Result<Self::Sink> {
+        self.sink_for(env.ctx_id, env.ring)
+    }
+
+    /// What `VkDeviceMemory` `blob_id` of context `ctx_id` is, for a
+    /// `HOST3D` blob of `size` bytes naming it: its pages (stage 5b.1) —
+    /// which the renderer publishes exactly when the blob is mapped, so the
+    /// guest sees the bytes the host driver imported — or, for exportable
+    /// device-local memory, a host handle to it (stage S1): a blob that is
+    /// never mapped, and that another context may import.
+    ///
+    /// # Errors
+    ///
+    /// Why no such blob can be made — no such memory in that context, a type
+    /// that is neither ours nor exportable, a size that is not the
+    /// allocation's, a blob made of it already. The default: this factory
+    /// holds no Vulkan memory.
+    fn export_memory(
+        &mut self,
+        ctx_id: u32,
+        blob_id: u64,
+        size: u64,
+    ) -> Result<ExportedMemory, String> {
+        let _ = size;
+        Err(format!(
+            "venus context {ctx_id} has no Vulkan memory {blob_id:#x}: this renderer executes \
+             no Vulkan"
+        ))
+    }
+
+    /// A venus context was created. Called before any of its rings exist.
+    fn context_created(&mut self, _ctx_id: u32) {}
+
+    /// A venus context is gone. Called **after** every ring worker of it has
+    /// been stopped and joined, so nothing of the context is running and a
+    /// factory that keeps per-context state (host Vulkan objects) may destroy
+    /// it without racing a sink.
+    fn context_destroyed(&mut self, _ctx_id: u32) {}
+
+    /// The device reset (ADR-0005). Called after every context has been
+    /// dropped and every thread joined; a factory holding host state must
+    /// leave none behind.
+    fn reset(&mut self) {}
+
+    /// Why a snapshot taken now would lose something a resumed guest would
+    /// notice (ADR-0006), or `None` if it would not. A factory whose sinks
+    /// hold host Vulkan objects must refuse by name: those cannot be written
+    /// to a file.
+    fn snapshot_refusal(&self) -> Option<String> {
+        None
+    }
+
+    /// Whether this factory retires virtio-gpu fences on a context's
+    /// `ring_idx` timelines ([`Self::create_ring_fence`]) — what the capset's
+    /// `supports_multiple_timelines` says (stage 5b.3). The default: no.
+    fn retires_ring_fences(&self) -> bool {
+        false
+    }
+
+    /// A virtio-gpu fence on `fence.ring_idx` (1..64) of `fence.ctx_id`: it
+    /// retires once the work submitted so far to the `VkQueue` the guest
+    /// bound to that timeline is done, reported through `retire` from
+    /// whichever thread sees it ([`FenceRetirer::retire`]).
+    /// [`FenceOutcome::Signalled`] when it is already past (a lost device).
+    ///
+    /// Called on the device's queue worker, after the context commands
+    /// before the fence have been executed.
+    ///
+    /// # Errors
+    /// Why no host queue can carry it — vkr refuses a fence on a timeline no
+    /// queue is bound to (`vkr_context_submit_fence`). The default: this
+    /// factory executes no Vulkan.
+    fn create_ring_fence(
+        &mut self,
+        fence: RingFence,
+        retire: &FenceRetirer,
+    ) -> Result<FenceOutcome, String> {
+        let _ = (fence, retire);
+        Err("this renderer executes no Vulkan, so no queue is bound to any ring_idx".into())
+    }
+
+    /// Ring fences created and not yet retired.
+    fn pending_ring_fences(&self) -> usize {
+        0
+    }
+
+    /// Stage S2b: get ready to read handle blob `target.resource_id` back as
+    /// `target.spec`, the renderer having judged the spec against the
+    /// canonical image recorded on the blob (`target.image`) — for the
+    /// executor, import the blob's handle on the renderer's own scanout
+    /// device and create exactly that image over it. Replaces whatever this
+    /// resource had prepared only on success.
+    ///
+    /// # Errors
+    /// Why the blob cannot be read back on this host. The default: this
+    /// factory executes no Vulkan.
+    fn prepare_scanout(&mut self, target: &ScanoutTarget) -> Result<(), String> {
+        let _ = target;
+        Err("this renderer executes no Vulkan, so a handle blob cannot be read back".into())
+    }
+
+    /// Stage S2b: `rect` of a prepared (or evicted, and so prepared again)
+    /// handle blob's image as packed BGRA, exactly `rect.width *
+    /// rect.height * 4` bytes into `out`, acquiring the image from the
+    /// guest's last recorded release and handing it back the same way.
+    ///
+    /// # Errors
+    /// Why not: a GPU that did not finish in time, a lost device, a host
+    /// refusal. The default: this factory executes no Vulkan.
+    fn read_scanout(
+        &mut self,
+        target: &ScanoutTarget,
+        release: ScanoutRelease,
+        rect: Rect,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let _ = (target, release, rect, out);
+        Err("this renderer executes no Vulkan, so a handle blob cannot be read back".into())
+    }
+
+    /// Stage S2b: resource `resource_id` is gone (or scanned out no more):
+    /// whatever was prepared for it goes.
+    fn forget_scanout(&mut self, resource_id: u32) {
+        let _ = resource_id;
+    }
+
+    /// Resources with a prepared scanout right now — a diagnostic.
+    fn scanout_targets(&self) -> usize {
+        0
+    }
+
+    /// What this factory holds right now, for the renderer's usage log
+    /// ([`VenusUsage`]). The default knows only what the trait already says.
+    fn usage(&self) -> FactoryUsage {
+        FactoryUsage {
+            pending_ring_fences: self.pending_ring_fences(),
+            scanout_targets: self.scanout_targets(),
+            ..FactoryUsage::default()
+        }
+    }
+}
+
+/// What a [`SinkFactory`] holds right now: the executor's half of
+/// [`VenusUsage`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FactoryUsage {
+    /// Host pages behind host-visible Vulkan memory, every context together
+    /// (against the executor's `MAX_HOST_VISIBLE_BYTES`).
+    pub host_visible_bytes: u64,
+    /// The most of those one context holds (against its share).
+    pub max_context_host_visible_bytes: u64,
+    /// Guest-visible Vulkan objects, every context together.
+    pub objects: usize,
+    /// The most one context holds (against `MAX_OBJECTS_PER_CONTEXT`).
+    pub max_context_objects: usize,
+    /// Host fence threads: one per queue that has carried a ring fence.
+    pub fence_threads: usize,
+    /// Ring fences waiting on the host GPU.
+    pub pending_ring_fences: usize,
+    /// Handle blobs prepared for scanout on the renderer's own device.
+    pub scanout_targets: usize,
+}
+
+impl FactoryUsage {
+    /// Field by field, the larger of the two.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            host_visible_bytes: self.host_visible_bytes.max(other.host_visible_bytes),
+            max_context_host_visible_bytes: self
+                .max_context_host_visible_bytes
+                .max(other.max_context_host_visible_bytes),
+            objects: self.objects.max(other.objects),
+            max_context_objects: self.max_context_objects.max(other.max_context_objects),
+            fence_threads: self.fence_threads.max(other.fence_threads),
+            pending_ring_fences: self.pending_ring_fences.max(other.pending_ring_fences),
+            scanout_targets: self.scanout_targets.max(other.scanout_targets),
+        }
+    }
+}
+
+/// Everything this renderer holds that a cap bounds, right now — or, as
+/// [`VenusRenderer::peak_usage`], the most of each it has held since the last
+/// reset. Logged at debug (target `virtio_gpu::venus::usage`) when a context
+/// comes or goes and when a peak rises, so a desktop can be measured against
+/// the caps rather than guessed at (ADR-0004, the capacity amendment).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VenusUsage {
+    /// Live venus contexts ([`MAX_VENUS_CONTEXTS`]).
+    pub contexts: usize,
+    /// Live rings, every context together ([`MAX_RINGS`]).
+    pub rings: usize,
+    /// The most rings one context holds ([`MAX_RINGS_PER_CONTEXT`]).
+    pub max_context_rings: usize,
+    /// Ring workers and `ALIVE` monitors running.
+    pub threads: usize,
+    /// Host blobs ([`MAX_RING_BLOBS`]).
+    pub host_blobs: usize,
+    /// Their bytes ([`MAX_RING_BLOB_BYTES`]).
+    pub host_blob_bytes: u64,
+    /// The most host blobs one context holds ([`MAX_RING_BLOBS_PER_CONTEXT`]).
+    pub max_context_host_blobs: usize,
+    /// The most host-blob bytes one context holds
+    /// ([`MAX_RING_BLOB_BYTES_PER_CONTEXT`]).
+    pub max_context_host_blob_bytes: u64,
+    /// Blobs of `VkDeviceMemory` with pages ([`MAX_MEMORY_BLOBS`]).
+    pub memory_blobs: usize,
+    /// The most of those one context holds
+    /// ([`MAX_MEMORY_BLOBS_PER_CONTEXT`]).
+    pub max_context_memory_blobs: usize,
+    /// Handle blobs: exported device-local memory.
+    pub handle_blobs: usize,
+    /// Every blob of this renderer, of any kind (each one of the device's
+    /// `MAX_BLOB_RESOURCES`).
+    pub blobs: usize,
+    /// Their sizes (against the device's `MAX_TOTAL_BLOB_BYTES`).
+    pub blob_bytes: u64,
+    /// Blobs published into the host-visible window (each one hypervisor
+    /// range, against `vmm_core::MAX_HOST_RANGES`).
+    pub window_ranges: usize,
+    /// Their bytes, against the window's length.
+    pub window_bytes: u64,
+    /// The most window ranges one context's blobs hold.
+    pub max_context_window_ranges: usize,
+    /// The most window bytes one context's blobs hold.
+    pub max_context_window_bytes: u64,
+    /// The highest window offset any of them reaches: how far into the
+    /// window the guest kernel's allocator has had to go.
+    pub window_top: u64,
+    /// The factory's half.
+    pub factory: FactoryUsage,
+}
+
+impl VenusUsage {
+    /// Field by field, the larger of the two.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            contexts: self.contexts.max(other.contexts),
+            rings: self.rings.max(other.rings),
+            max_context_rings: self.max_context_rings.max(other.max_context_rings),
+            threads: self.threads.max(other.threads),
+            host_blobs: self.host_blobs.max(other.host_blobs),
+            host_blob_bytes: self.host_blob_bytes.max(other.host_blob_bytes),
+            max_context_host_blobs: self
+                .max_context_host_blobs
+                .max(other.max_context_host_blobs),
+            max_context_host_blob_bytes: self
+                .max_context_host_blob_bytes
+                .max(other.max_context_host_blob_bytes),
+            memory_blobs: self.memory_blobs.max(other.memory_blobs),
+            max_context_memory_blobs: self
+                .max_context_memory_blobs
+                .max(other.max_context_memory_blobs),
+            handle_blobs: self.handle_blobs.max(other.handle_blobs),
+            blobs: self.blobs.max(other.blobs),
+            blob_bytes: self.blob_bytes.max(other.blob_bytes),
+            window_ranges: self.window_ranges.max(other.window_ranges),
+            window_bytes: self.window_bytes.max(other.window_bytes),
+            max_context_window_ranges: self
+                .max_context_window_ranges
+                .max(other.max_context_window_ranges),
+            max_context_window_bytes: self
+                .max_context_window_bytes
+                .max(other.max_context_window_bytes),
+            window_top: self.window_top.max(other.window_top),
+            factory: self.factory.max(other.factory),
+        }
+    }
+}
+
+/// How often the renderer looks at its usage between the events that change
+/// its structure, so a peak reached by traffic alone (objects, fences,
+/// host-visible memory) is still seen and logged.
+const USAGE_SAMPLE_PERIOD: Duration = Duration::from_secs(2);
+
+/// How often the periodic look may log a usage that changed without a peak
+/// rising.
+const USAGE_LOG_PERIOD: Duration = Duration::from_secs(10);
+
+/// A handle blob to read back, as the renderer accepted it (stage S2b,
+/// [`SinkFactory::prepare_scanout`]).
+#[derive(Debug, Clone)]
+pub struct ScanoutTarget {
+    /// The blob.
+    pub resource_id: u32,
+    /// Its host handle.
+    pub handle: SharedHandle,
+    /// The canonical image recorded on it that the spec matched.
+    pub image: CanonicalImage,
+    /// The accepted layout.
+    pub spec: ScanoutBlobSpec,
+}
+
+// ------------------------------------------------------------ ring fences
+
+/// A virtio-gpu fence on one of a context's `ring_idx` timelines (EPIC 20
+/// stage 5b.3; the kernel's per-`(context, ring_idx)` fence context).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingFence {
+    /// The context.
+    pub ctx_id: u32,
+    /// The timeline, 1..64 (0 is the CPU's, which never reaches a factory).
+    pub ring_idx: u8,
+    /// The fence id, as the device keys it.
+    pub fence_id: u32,
+}
+
+/// Most retired ring fences held for the device at once. The device asks
+/// for a fence only while its own table ([`crate::MAX_PENDING_FENCES`]) has
+/// room and collects retirements whenever it is woken, so this is only ever
+/// reached by retirements nobody is waiting for any more (the device's
+/// watchdog already answered them); the oldest of those are dropped.
+pub const MAX_RETIRED_RING_FENCES: usize = 4 * crate::MAX_PENDING_FENCES;
+
+/// How the renderer answered the fences on a context's `ring_idx` timelines
+/// 1..64 (stage 5b.3), since it was created: diagnostics, logged with the
+/// usage line (target `virtio_gpu::venus::usage`).
+///
+/// There is no "answered early" counter because there is no such answer any
+/// more: until 2026-09-24 a device with no host waker — every device on WHP —
+/// had each of these fences signalled at once, before the GPU work it guards
+/// had run (77 004 of them in one desktop run). Now a fence is either
+/// deferred until its queue's work is done, or answered at once because that
+/// work will never run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RingFenceCounts {
+    /// Handed to the queue's fence thread; retired after the work before it.
+    pub deferred: u64,
+    /// Answered signalled without waiting, because the context is already
+    /// fatal or the device is lost: nothing more will ever run on it.
+    pub signalled_unrunnable: u64,
+}
+
+#[derive(Default)]
+struct RetireState {
+    retired: Mutex<Vec<RingFence>>,
+    waker: Mutex<Option<Arc<dyn HostWaker>>>,
+}
+
+/// Where a [`SinkFactory`] reports ring fences it has retired: a list the
+/// device collects on its (pause-gated) queue worker through
+/// [`Renderer3d::poll_fence_timelines`], and the device's [`HostWaker`] to
+/// ask it to. Cheap to clone; every clone is the same list.
+///
+/// The thread that retires touches no guest memory — the guest learns of a
+/// retirement only when the device's worker writes the held response — so
+/// it needs no pass of the pause gate (ADR-0005's row for renderer threads).
+#[derive(Clone, Default)]
+pub struct FenceRetirer(Arc<RetireState>);
+
+impl fmt::Debug for FenceRetirer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FenceRetirer")
+            .field("retired", &self.len())
+            .field("waker", &self.has_waker())
+            .finish()
+    }
+}
+
+impl FenceRetirer {
+    fn retired(&self) -> std::sync::MutexGuard<'_, Vec<RingFence>> {
+        self.0
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn waker(&self) -> Option<Arc<dyn HostWaker>> {
+        self.0
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Report `fence` retired, and wake the device to collect it.
+    pub fn retire(&self, fence: RingFence) {
+        {
+            let mut retired = self.retired();
+            if retired.len() >= MAX_RETIRED_RING_FENCES {
+                retired.remove(0);
+            }
+            retired.push(fence);
+        }
+        if let Some(waker) = self.waker() {
+            waker.wake();
+        }
+    }
+
+    /// Everything retired since the last call, oldest first.
+    pub fn take(&self) -> Vec<RingFence> {
+        std::mem::take(&mut *self.retired())
+    }
+
+    /// Retired fences not collected yet.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.retired().len()
+    }
+
+    /// Whether nothing is waiting to be collected.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether the device has handed over a waker. Without one a retirement
+    /// is still recorded, and collected the next time the device polls — a
+    /// fence is never answered before its work because nobody would say when
+    /// it finished (2026-09-24, ADR-0004).
+    #[must_use]
+    pub fn has_waker(&self) -> bool {
+        self.waker().is_some()
+    }
+
+    /// Install the device's waker.
+    pub fn set_waker(&self, waker: Arc<dyn HostWaker>) {
+        *self
+            .0
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker);
+    }
+
+    fn clear(&self) {
+        self.retired().clear();
+    }
+}
+
+/// What the renderer hands a [`SinkFactory`] for a new ring.
+#[derive(Debug, Clone)]
+pub struct RingEnv {
+    /// The context the ring belongs to.
+    pub ctx_id: u32,
+    /// The guest's handle for the ring.
+    pub ring: u64,
+    /// The host blobs this ring's context may name as a reply window.
+    pub blobs: ContextBlobs,
+    /// The ring's virtqueue seqno, which the context stream records and the
+    /// ring's `vkWaitVirtqueueSeqnoMESA` waits for.
+    pub virtqueue_seqno: Arc<VirtqueueSeqno>,
+}
+
+/// One ring's **virtqueue seqno** (`vkr_ring::virtqueue_seqno`): the value
+/// the last `vkSubmitVirtqueueSeqnoMESA` for it recorded, which a
+/// `vkWaitVirtqueueSeqnoMESA` inside the ring waits for.
+///
+/// It is Mesa's *roundtrip* (`vn_ring_roundtrip`, `vn_ring.c:744-767`): the
+/// guest puts the submit on the virtqueue behind the commands the ring has
+/// to see done — a dma-buf's `RESOURCE_CREATE_BLOB`, before the ring's
+/// `vkAllocateMemory` imports it — and the wait in the ring, so the ring
+/// runs no further until the device worker has got that far. The value is
+/// a free-running 64-bit count per ring from 1 (`roundtrip_next`); both
+/// sides compare it as vkr does, as a plain `u64` (`virtqueue_seqno <
+/// seqno` in `vkr_ring_wait_virtqueue_seqno`), and a submit overwrites
+/// rather than raises it, as vkr's does.
+///
+/// Written by the device worker, read by the ring's worker; the store is a
+/// release and the load an acquire, so everything the device worker did
+/// before the submit — the blob it created — is visible to the ring that
+/// sees the value.
+#[derive(Debug, Default)]
+pub struct VirtqueueSeqno(AtomicU64);
+
+impl VirtqueueSeqno {
+    /// `vkSubmitVirtqueueSeqnoMESA`: record `seqno`.
+    pub fn submit(&self, seqno: u64) {
+        self.0.store(seqno, Ordering::Release);
+    }
+
+    /// Whether a `vkWaitVirtqueueSeqnoMESA(seqno)` may go on.
+    #[must_use]
+    pub fn reached(&self, seqno: u64) -> bool {
+        self.0.load(Ordering::Acquire) >= seqno
+    }
+
+    /// The value recorded last (0 before any).
+    #[must_use]
+    pub fn current(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+// ------------------------------------------------- blobs a sink may write
+
+/// Why a reply window could not be bound or written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ReplyBlobError {
+    /// The resource is not a host blob this renderer holds.
+    #[error("resource {0} is not a host blob")]
+    NotAHostBlob(u32),
+    /// The blob belongs to another context.
+    #[error("resource {resource_id} belongs to venus context {owner}, not to {ctx_id}")]
+    Foreign {
+        /// The blob named.
+        resource_id: u32,
+        /// Its context.
+        owner: u32,
+        /// The context that named it.
+        ctx_id: u32,
+    },
+    /// `offset + size` passes the end of the blob.
+    #[error("a {size:#x}-byte window at {offset:#x} does not fit the {blob:#x}-byte resource {resource_id}")]
+    OutsideBlob {
+        /// The blob named.
+        resource_id: u32,
+        /// The window's offset.
+        offset: u64,
+        /// The window's size.
+        size: u64,
+        /// The blob's size.
+        blob: u64,
+    },
+    /// The blob was destroyed (or replaced by another under the same id)
+    /// since the window was bound.
+    #[error("resource {0} was destroyed while it was a reply window")]
+    Gone(u32),
+}
+
+/// A bound reply window's blob, as the directory knew it when it was bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobRef {
+    /// The resource id.
+    pub resource_id: u32,
+    /// Which incarnation of that id: a blob destroyed and re-created under
+    /// the same id is a different one, and a window on the old one is gone.
+    pub generation: u64,
+}
+
+#[derive(Debug)]
+struct DirectoryEntry {
+    ctx_id: u32,
+    backing: ExportedMemory,
+    generation: u64,
+    /// `Some` for a blob of `VkDeviceMemory` (stage 5c): its size, and the
+    /// other contexts it is attached to (`CTX_ATTACH_RESOURCE`) — the ones
+    /// that may import it. `None` for a ring or reply blob.
+    memory: Option<MemoryEntry>,
+}
+
+impl DirectoryEntry {
+    /// The pages of a ring, reply or page blob; `None` for a handle blob.
+    fn pages(&self) -> Option<&Arc<RingPages>> {
+        self.backing.pages()
+    }
+}
+
+#[derive(Debug, Default)]
+struct MemoryEntry {
+    size: u64,
+    attached: Vec<u32>,
+    /// Stage S2b, handle blobs only: the canonical images bound to the
+    /// payload, newest last, at most [`MAX_SCANOUT_IMAGES`].
+    images: Vec<ScanoutImage>,
+    /// Stage S2b: the last release of the payload out of the instance
+    /// recorded by any context whose canonical image is on record here.
+    release: Option<ScanoutRelease>,
+}
+
+/// A handle blob's host handle **without holding it open** (stage S2b): what
+/// a `VkDeviceMemory` keeps of the handle its blob holds, to find that blob
+/// again by identity when a canonical image is bound to it.
+#[derive(Clone)]
+pub struct SharedRef(Weak<dyn std::any::Any + Send + Sync>);
+
+impl SharedRef {
+    /// A reference to `handle`.
+    #[must_use]
+    pub fn of(handle: &SharedHandle) -> Self {
+        Self(Arc::downgrade(&handle.0))
+    }
+
+    /// Whether `handle` is the handle this refers to.
+    #[must_use]
+    pub fn is(&self, handle: &SharedHandle) -> bool {
+        std::ptr::addr_eq(Weak::as_ptr(&self.0), Arc::as_ptr(&handle.0))
+    }
+
+    /// Whether the handle is still held by anything (a blob, an import in
+    /// progress).
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+
+    /// The handle's address: its key in the directory's index. Stable, and
+    /// never another handle's, while this reference exists — a `Weak` keeps
+    /// the allocation (not the value) from being reused.
+    fn key(&self) -> usize {
+        Weak::as_ptr(&self.0).cast::<()>() as usize
+    }
+}
+
+impl SharedHandle {
+    /// [`SharedRef::key`] of this handle.
+    fn key(&self) -> usize {
+        Arc::as_ptr(&self.0).cast::<()>() as usize
+    }
+}
+
+impl fmt::Debug for SharedRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SharedRef(..)")
+    }
+}
+
+/// One canonical image bound to a handle blob's payload (stage S2b).
+#[derive(Debug, Clone)]
+pub struct ScanoutImage {
+    /// The context whose image it is.
+    pub ctx_id: u32,
+    /// The image's guest id there.
+    pub image: u64,
+    /// `memoryOffset` of the bind.
+    pub offset: u64,
+    /// The image exactly.
+    pub canonical: CanonicalImage,
+    /// Alive as long as the image is.
+    pub alive: Weak<()>,
+}
+
+impl ScanoutImage {
+    /// Whether the image still exists.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.alive.strong_count() > 0
+    }
+}
+
+/// How the guest last released a handle blob's image out of its instance
+/// (stage S2b): the layout it left it in and the family it released it to
+/// (`VK_QUEUE_FAMILY_FOREIGN_EXT`, or `VK_QUEUE_FAMILY_EXTERNAL`). The
+/// scanout device acquires from exactly this and releases back to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanoutRelease {
+    /// `newLayout` of the release.
+    pub layout: i32,
+    /// `dstQueueFamilyIndex` of the release.
+    pub family: u32,
+}
+
+/// A host handle to exportable device-local memory (stage S1), as the
+/// executor made it: opaque to the renderer — it only holds and hands it
+/// out — and the executor's to look inside (it knows its host's type).
+/// Dropping the last clone closes the handle.
+#[derive(Clone)]
+pub struct SharedHandle(pub Arc<dyn std::any::Any + Send + Sync>);
+
+impl fmt::Debug for SharedHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SharedHandle(..)")
+    }
+}
+
+/// What a blob of `VkDeviceMemory` is made of
+/// ([`SinkFactory::export_memory`]).
+#[derive(Debug, Clone)]
+pub enum ExportedMemory {
+    /// Host-visible memory (stage 5b.1): our imported pages, which a mapping
+    /// of the blob shows the guest.
+    Pages(Arc<RingPages>),
+    /// Exportable device-local memory (stage S1): a **handle blob**. No
+    /// pages — the guest can never map it (`RESOURCE_MAP_BLOB` is refused) —
+    /// and a host handle to the allocation, which another context attached
+    /// to the blob imports into its own device. The handle holds the
+    /// allocation, so the blob outlives the exporting memory, its device and
+    /// its context, as a dma-buf outlives its exporter.
+    Handle(SharedHandle),
+}
+
+impl ExportedMemory {
+    /// The pages, for a page blob.
+    #[must_use]
+    pub fn pages(&self) -> Option<&Arc<RingPages>> {
+        match self {
+            Self::Pages(pages) => Some(pages),
+            Self::Handle(_) => None,
+        }
+    }
+}
+
+/// A blob of `VkDeviceMemory` a context may import as memory of its own
+/// (`VkImportMemoryResourceInfoMESA`, stages 5c and S1): the same `Arc` of
+/// pages, or of the host handle, the blob holds.
+#[derive(Debug, Clone)]
+pub struct MemoryBlob {
+    /// Its pages or its handle.
+    pub backing: ExportedMemory,
+    /// The blob's size (the allocation rounded to 4 KiB).
+    pub size: u64,
+    /// The context whose memory it is a blob of.
+    pub owner: u32,
+}
+
+#[derive(Debug, Default)]
+struct DirectoryState {
+    blobs: HashMap<u32, DirectoryEntry>,
+    next_generation: u64,
+    /// Stage S2b: every live handle blob by its handle's address
+    /// ([`SharedRef::key`]), so a bind or a release finds its blob at once.
+    by_handle: HashMap<usize, u32>,
+    /// Stage S2b: canonical images recorded against a handle whose blob is
+    /// not in the directory yet — the exporter's image, bound before Mesa's
+    /// `RESOURCE_CREATE_BLOB` of its memory arrived — adopted by that blob
+    /// when it is inserted. At most [`MAX_SCANOUT_IMAGES`] × 8, the dead
+    /// pruned first.
+    pending: Vec<(SharedRef, ScanoutImage)>,
+}
+
+impl DirectoryState {
+    /// The handle blob holding `shared`, if it is in the directory.
+    fn handle_entry(&mut self, shared: &SharedRef) -> Option<&mut DirectoryEntry> {
+        let id = *self.by_handle.get(&shared.key())?;
+        self.blobs
+            .get_mut(&id)
+            .filter(|entry| matches!(&entry.backing, ExportedMemory::Handle(h) if shared.is(h)))
+    }
+}
+
+/// Take a removed entry's handle out of the index, if the index still
+/// names that entry's handle.
+fn forget_handle(by_handle: &mut HashMap<usize, u32>, entry: &DirectoryEntry) {
+    if let ExportedMemory::Handle(handle) = &entry.backing {
+        by_handle.remove(&handle.key());
+    }
+}
+
+/// Add `image` to a handle blob's record: a record of the same image
+/// replaces the old one, the dead go, and past [`MAX_SCANOUT_IMAGES`] the
+/// oldest.
+fn push_image(images: &mut Vec<ScanoutImage>, image: ScanoutImage) {
+    images.retain(|r| r.is_alive() && !(r.ctx_id == image.ctx_id && r.image == image.image));
+    if images.len() >= MAX_SCANOUT_IMAGES {
+        images.remove(0);
+    }
+    images.push(image);
+}
+
+/// Every host blob the renderer holds, shared with the ring workers behind a
+/// lock so a sink can write a reply into one.
+///
+/// The renderer inserts on `RESOURCE_CREATE_BLOB` and removes on destroy and
+/// reset; a sink writes **under the same lock**, so a blob that has been
+/// removed can never be written afterwards — the removal either happened
+/// before the write (which then finds the blob gone and refuses) or waits for
+/// it. That is the whole of the "destroyed while it is the reply window"
+/// case, which virglrenderer tolerates by unbinding the stream
+/// (`vkr_cs_encoder_check_stream`); a later reply with no window is then
+/// fatal, as there.
+#[derive(Debug, Clone, Default)]
+pub struct BlobDirectory(Arc<Mutex<DirectoryState>>);
+
+impl BlobDirectory {
+    fn with<T>(&self, f: impl FnOnce(&mut DirectoryState) -> T) -> T {
+        match self.0.lock() {
+            Ok(mut guard) => f(&mut guard),
+            Err(poisoned) => f(&mut poisoned.into_inner()),
+        }
+    }
+
+    fn insert(&self, resource_id: u32, ctx_id: u32, pages: Arc<RingPages>) {
+        self.insert_entry(resource_id, ctx_id, ExportedMemory::Pages(pages), None);
+    }
+
+    fn insert_memory(&self, resource_id: u32, ctx_id: u32, backing: ExportedMemory, size: u64) {
+        self.insert_entry(
+            resource_id,
+            ctx_id,
+            backing,
+            Some(MemoryEntry {
+                size,
+                ..MemoryEntry::default()
+            }),
+        );
+    }
+
+    fn insert_entry(
+        &self,
+        resource_id: u32,
+        ctx_id: u32,
+        backing: ExportedMemory,
+        memory: Option<MemoryEntry>,
+    ) {
+        self.with(|state| {
+            state.next_generation = state.next_generation.wrapping_add(1);
+            let generation = state.next_generation;
+            let mut memory = memory;
+            if let (ExportedMemory::Handle(handle), Some(memory)) = (&backing, memory.as_mut()) {
+                // Stage S2b: the images bound to this memory before its blob
+                // existed are this blob's now.
+                state.by_handle.insert(handle.key(), resource_id);
+                let pending = std::mem::take(&mut state.pending);
+                for (shared, image) in pending {
+                    if shared.is(handle) {
+                        push_image(&mut memory.images, image);
+                    } else if shared.is_alive() && image.is_alive() {
+                        state.pending.push((shared, image));
+                    }
+                }
+            }
+            if let Some(old) = state.blobs.insert(
+                resource_id,
+                DirectoryEntry {
+                    ctx_id,
+                    backing,
+                    generation,
+                    memory,
+                },
+            ) {
+                forget_handle(&mut state.by_handle, &old);
+            }
+        });
+    }
+
+    /// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` of a blob of memory:
+    /// whether context `ctx_id` may import it. Nothing for any other blob.
+    fn attach(&self, resource_id: u32, ctx_id: u32, attach: bool) {
+        self.with(|state| {
+            let Some(memory) = state
+                .blobs
+                .get_mut(&resource_id)
+                .and_then(|e| e.memory.as_mut())
+            else {
+                return;
+            };
+            memory.attached.retain(|c| *c != ctx_id);
+            // Bounded by the contexts a renderer holds.
+            if attach && memory.attached.len() < MAX_VENUS_CONTEXTS {
+                memory.attached.push(ctx_id);
+            }
+        });
+    }
+
+    /// Forget context `ctx_id` in every attachment list and every scanout
+    /// record: it is gone.
+    fn forget_context(&self, ctx_id: u32) {
+        self.with(|state| {
+            for entry in state.blobs.values_mut() {
+                if let Some(memory) = entry.memory.as_mut() {
+                    memory.attached.retain(|c| *c != ctx_id);
+                    memory.images.retain(|r| r.ctx_id != ctx_id && r.is_alive());
+                }
+            }
+        });
+    }
+
+    /// Stage S2b: what handle blob `resource_id` holds for a scanout — its
+    /// handle, the canonical images still alive on record (newest first) and
+    /// the last release. `None` for anything that is not a handle blob.
+    fn scanout_state(
+        &self,
+        resource_id: u32,
+    ) -> Option<(SharedHandle, Vec<ScanoutImage>, Option<ScanoutRelease>)> {
+        self.with(|state| {
+            let entry = state.blobs.get_mut(&resource_id)?;
+            let ExportedMemory::Handle(handle) = &entry.backing else {
+                return None;
+            };
+            let handle = handle.clone();
+            let memory = entry.memory.as_mut()?;
+            memory.images.retain(ScanoutImage::is_alive);
+            let images = memory.images.iter().rev().cloned().collect();
+            Some((handle, images, memory.release))
+        })
+    }
+
+    fn remove(&self, resource_id: u32) {
+        self.with(|state| {
+            if let Some(old) = state.blobs.remove(&resource_id) {
+                forget_handle(&mut state.by_handle, &old);
+            }
+        });
+    }
+
+    fn clear(&self) {
+        self.with(|state| {
+            state.blobs.clear();
+            state.by_handle.clear();
+            state.pending.clear();
+        });
+    }
+
+    /// The part of the directory context `ctx_id` may reach.
+    #[must_use]
+    pub fn for_context(&self, ctx_id: u32) -> ContextBlobs {
+        ContextBlobs {
+            ctx_id,
+            directory: self.clone(),
+        }
+    }
+}
+
+/// The host blobs one context may name: its own, and the kernel's (context
+/// 0), exactly the blobs a ring of it may be built on.
+#[derive(Debug, Clone)]
+pub struct ContextBlobs {
+    ctx_id: u32,
+    directory: BlobDirectory,
+}
+
+impl ContextBlobs {
+    /// Judge a `vkSetReplyCommandStreamMESA`: the resource must be a host blob
+    /// of this context and `offset + size` must fit it (`vkr_transport.c:14-29`,
+    /// `vkr_cs.c:10-38`).
+    ///
+    /// # Errors
+    /// [`ReplyBlobError`] naming the rule broken.
+    pub fn bind(
+        &self,
+        resource_id: u32,
+        offset: u64,
+        size: u64,
+    ) -> Result<BlobRef, ReplyBlobError> {
+        self.directory.with(|state| {
+            let entry = state
+                .blobs
+                .get(&resource_id)
+                .filter(|entry| entry.memory.is_none())
+                .ok_or(ReplyBlobError::NotAHostBlob(resource_id))?;
+            if entry.ctx_id != 0 && entry.ctx_id != self.ctx_id {
+                return Err(ReplyBlobError::Foreign {
+                    resource_id,
+                    owner: entry.ctx_id,
+                    ctx_id: self.ctx_id,
+                });
+            }
+            let blob = entry
+                .pages()
+                .ok_or(ReplyBlobError::NotAHostBlob(resource_id))?
+                .resource_len();
+            if offset.checked_add(size).is_none_or(|end| end > blob) {
+                return Err(ReplyBlobError::OutsideBlob {
+                    resource_id,
+                    offset,
+                    size,
+                    blob,
+                });
+            }
+            Ok(BlobRef {
+                resource_id,
+                generation: entry.generation,
+            })
+        })
+    }
+
+    /// Copy `size` bytes at `offset` of host blob `resource_id` out, under
+    /// the directory lock: a `vkExecuteCommandStreamsMESA` stream. The same
+    /// rules as [`Self::bind`] (a blob of this context or the kernel's, the
+    /// range inside it, `vkr_cs_decoder_set_resource_stream`); the copy is
+    /// private, so a guest still writing the blob changes nothing the
+    /// executor has begun to decode.
+    ///
+    /// # Errors
+    /// [`ReplyBlobError`] naming the rule broken.
+    pub fn read(
+        &self,
+        resource_id: u32,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, ReplyBlobError> {
+        let blob = self.bind(resource_id, offset, size)?;
+        let len = usize::try_from(size).map_err(|_| ReplyBlobError::OutsideBlob {
+            resource_id,
+            offset,
+            size,
+            blob: 0,
+        })?;
+        self.directory.with(|state| {
+            let entry = state
+                .blobs
+                .get(&resource_id)
+                .filter(|entry| entry.generation == blob.generation)
+                .ok_or(ReplyBlobError::Gone(resource_id))?;
+            let pages = entry
+                .pages()
+                .ok_or(ReplyBlobError::NotAHostBlob(resource_id))?;
+            let mut bytes = vec![0u8; len];
+            pages
+                .read_bytes(offset, &mut bytes)
+                .map_err(|_| ReplyBlobError::OutsideBlob {
+                    resource_id,
+                    offset,
+                    size,
+                    blob: pages.resource_len(),
+                })?;
+            Ok(bytes)
+        })
+    }
+
+    /// The pages or the host handle of blob `resource_id` for an import as
+    /// memory of this context (stages 5c and S1): a blob of `VkDeviceMemory`
+    /// of **this renderer**, made by this context or attached to it
+    /// (`CTX_ATTACH_RESOURCE`, which the guest kernel sends when a process
+    /// opens a GEM handle of another's dma-buf). The answer is the same `Arc`
+    /// the blob holds, taken under the directory lock, so what it names lives
+    /// as long as the import needs it whatever the exporter, its blob or its
+    /// context do afterwards.
+    ///
+    /// # Errors
+    /// [`ReplyBlobError::NotAHostBlob`] for anything else — no such blob,
+    /// or a ring or reply blob — and [`ReplyBlobError::Foreign`] for a blob
+    /// of memory this context may not reach.
+    pub fn memory(&self, resource_id: u32) -> Result<MemoryBlob, ReplyBlobError> {
+        self.directory.with(|state| {
+            let entry = state
+                .blobs
+                .get(&resource_id)
+                .ok_or(ReplyBlobError::NotAHostBlob(resource_id))?;
+            let memory = entry
+                .memory
+                .as_ref()
+                .ok_or(ReplyBlobError::NotAHostBlob(resource_id))?;
+            if entry.ctx_id != self.ctx_id && !memory.attached.contains(&self.ctx_id) {
+                return Err(ReplyBlobError::Foreign {
+                    resource_id,
+                    owner: entry.ctx_id,
+                    ctx_id: self.ctx_id,
+                });
+            }
+            Ok(MemoryBlob {
+                backing: entry.backing.clone(),
+                size: memory.size,
+                owner: entry.ctx_id,
+            })
+        })
+    }
+
+    /// Stage S2b: record `image` — a canonical image bound to memory whose
+    /// handle is `shared` — on the handle blob holding that handle, under the
+    /// directory lock. The blob is found by the handle's identity, never by
+    /// an id, so a blob id reused since cannot be confused with it. A handle
+    /// whose blob is not in the directory yet keeps the record pending for
+    /// it (the exporter's bind comes before `RESOURCE_CREATE_BLOB` when an
+    /// application binds first); a handle nothing holds any more records
+    /// nothing. A record of the same image replaces the old one; past
+    /// [`MAX_SCANOUT_IMAGES`] the oldest goes.
+    pub fn record_scanout_image(&self, shared: &SharedRef, image: ScanoutImage) {
+        self.directory.with(|state| {
+            if let Some(memory) = state
+                .handle_entry(shared)
+                .and_then(|entry| entry.memory.as_mut())
+            {
+                push_image(&mut memory.images, image);
+                return;
+            }
+            if !shared.is_alive() {
+                return;
+            }
+            state.pending.retain(|(s, i)| s.is_alive() && i.is_alive());
+            if state.pending.len() >= MAX_SCANOUT_IMAGES * 8 {
+                state.pending.remove(0);
+            }
+            state.pending.push((shared.clone(), image));
+        });
+    }
+
+    /// Stage S2b: a release out of the instance — to `family`, left in
+    /// `layout` — of a canonical image bound to memory whose handle is
+    /// `shared`, under the directory lock. Nothing if its blob is gone.
+    pub fn record_release(&self, shared: &SharedRef, layout: i32, family: u32) {
+        self.directory.with(|state| {
+            if let Some(memory) = state
+                .handle_entry(shared)
+                .and_then(|entry| entry.memory.as_mut())
+            {
+                memory.release = Some(ScanoutRelease { layout, family });
+            }
+        });
+    }
+
+    /// Write `bytes` at resource offset `at` of the blob `blob` names, under
+    /// the directory lock.
+    ///
+    /// # Errors
+    /// [`ReplyBlobError::Gone`] if that blob no longer exists, and
+    /// [`ReplyBlobError::OutsideBlob`] if the bytes do not fit it.
+    pub fn write(&self, blob: BlobRef, at: u64, bytes: &[u8]) -> Result<(), ReplyBlobError> {
+        self.directory.with(|state| {
+            let entry = state
+                .blobs
+                .get(&blob.resource_id)
+                .filter(|entry| entry.generation == blob.generation)
+                .ok_or(ReplyBlobError::Gone(blob.resource_id))?;
+            let pages = entry
+                .pages()
+                .ok_or(ReplyBlobError::NotAHostBlob(blob.resource_id))?;
+            pages
+                .write_bytes(at, bytes)
+                .map_err(|_| ReplyBlobError::OutsideBlob {
+                    resource_id: blob.resource_id,
+                    offset: at,
+                    size: bytes.len() as u64,
+                    blob: pages.resource_len(),
+                })
+        })
+    }
+}
+
+impl<F, S> SinkFactory for F
+where
+    F: FnMut(u32, u64) -> io::Result<S> + Send,
+    S: RingSink + Send + 'static,
+{
+    type Sink = S;
+
+    fn sink_for(&mut self, ctx_id: u32, ring: u64) -> io::Result<S> {
+        self(ctx_id, ring)
+    }
+}
+
+/// Whether a capture can honestly consume a transport command it found **in a
+/// ring**: only the two that do nothing but move the reply cursor, and only
+/// when they ask for no reply of their own.
+///
+/// Everything else is a request for work — `vkExecuteCommandStreamsMESA` runs
+/// commands out of another buffer, and every command outside the transport
+/// set is a Vulkan call — and consuming a request for work moves `head` past
+/// it, which the guest reads as "your reply is written". The context-only
+/// commands are refused here as the reference refuses them on a ring
+/// (`vkr_transport.c`'s `is_dispatched_from_vkr_context`).
+fn capture_may_consume(request: &TransportRequest) -> bool {
+    !request.wants_reply()
+        && matches!(
+            request.command,
+            TransportCommand::SetReplyCommandStream { .. }
+                | TransportCommand::SeekReplyCommandStream { .. }
+        )
+}
+
+/// The honest answer of a sink that can execute nothing: consume the reply
+/// bookkeeping at the front of the batch, record it, and stop at the first
+/// command that would need an answer — recording what that command and the
+/// rest of the batch were, so the capture shows what the guest asked, and
+/// declaring the ring dead so the guest's driver aborts at once instead of
+/// waiting out its watchdog.
+///
+/// A command that is merely *incomplete* — the batch ends inside it, which a
+/// guest that stores `tail` after writing never produces but which the
+/// protocol allows — is left for the next pass rather than judged.
+fn capture_batch(batch: Batch<'_>, mut record: impl FnMut(&[u8])) -> Consumed {
+    let bytes = batch.bytes();
+    let mut stream = TransportStream::new(bytes);
+    let mut done = 0usize;
+    loop {
+        match stream.next_command() {
+            None => return batch.consumed(done),
+            Some(Ok(request)) if capture_may_consume(&request) => {
+                let end = stream.position().min(bytes.len());
+                record(bytes.get(done..end).unwrap_or_default());
+                done = end;
+            }
+            Some(Err(TransportError::Wire(WireError::Truncated { .. }))) => {
+                return batch.consumed(done);
+            }
+            Some(Ok(_) | Err(_)) => {
+                let rest = bytes.get(done..).unwrap_or_default();
+                let opcode = rest
+                    .get(..4)
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                    .map(u32::from_le_bytes);
+                tracing::warn!(
+                    opcode,
+                    at = done,
+                    recorded = rest.len(),
+                    "the Venus capture reached a command it cannot answer; the ring is \
+                     declared fatal so the guest aborts rather than waits"
+                );
+                record(rest);
+                return batch.fatal_after(done);
+            }
+        }
+    }
+}
+
+/// A [`RingSink`] that records into a shared buffer, and answers the ring
+/// honestly: see [`capture_batch`].
+///
+/// It consumes `vkSetReplyCommandStreamMESA`/`vkSeekReplyCommandStreamMESA` and
+/// records them; at the first command it would have to answer — every Vulkan
+/// command — it records that command **and the rest of the batch** (so the
+/// capture shows what the guest asked), leaves `head` in front of it, and
+/// declares the ring fatal. A real Mesa guest therefore aborts on "ring fatal
+/// error" at once, with `SetReply` + its first command in the capture, instead
+/// of waiting out a 3.5 s watchdog on a `head` that never moves.
+///
+/// Cloning one clones the *handle*: [`factory`](Self::factory) hands every ring
+/// a clone of the same buffer, which is right for a test driving one ring and
+/// wrong for anything else — `entangled run` uses one [`WriteSink`] per ring.
 #[derive(Debug, Clone, Default)]
 pub struct CaptureSink {
     captured: Arc<Mutex<Vec<u8>>>,
@@ -218,25 +1582,31 @@ impl CaptureSink {
         Self::default()
     }
 
-    /// A copy of everything consumed so far, in ring order.
+    /// A [`SinkFactory`] handing every ring a clone of this handle.
+    pub fn factory(&self) -> impl SinkFactory<Sink = Self> {
+        let capture = self.clone();
+        move |_ctx_id: u32, _ring: u64| Ok(capture.clone())
+    }
+
+    /// A copy of everything recorded so far, in ring order.
     #[must_use]
     pub fn bytes(&self) -> Vec<u8> {
         self.with(|buf| buf.clone())
     }
 
-    /// How many bytes have been consumed.
+    /// How many bytes have been recorded.
     #[must_use]
     pub fn len(&self) -> usize {
         self.with(|buf| buf.len())
     }
 
-    /// Whether nothing has been consumed yet.
+    /// Whether nothing has been recorded yet.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Drop everything captured so far.
+    /// Drop everything recorded so far.
     pub fn clear(&self) {
         self.with(|buf| buf.clear());
     }
@@ -254,18 +1624,22 @@ impl CaptureSink {
 
 impl RingSink for CaptureSink {
     fn consume(&mut self, batch: Batch<'_>) -> Consumed {
-        self.with(|buf| buf.extend_from_slice(batch.bytes()));
-        batch.all()
+        capture_batch(batch, |bytes| self.with(|buf| buf.extend_from_slice(bytes)))
     }
 }
 
-/// A [`RingSink`] that writes the ring's bytes to anything `std::io::Write` —
-/// a file, for `entangled run` capturing a guest's Venus stream.
+/// A [`RingSink`] that writes a ring's bytes to anything `std::io::Write` — a
+/// file, for `entangled run` capturing a guest's Venus stream, one per ring.
 ///
-/// A write that fails does **not** stall the ring. The bytes are still reported
-/// consumed, because refusing them would freeze the guest's Vulkan driver over
-/// a host-side file error it can neither see nor fix; the failure is logged
-/// once and latched in [`failed`](Self::failed) instead.
+/// It answers the ring exactly as [`CaptureSink`] does ([`capture_batch`]):
+/// reply bookkeeping consumed and written, then the first command it cannot
+/// answer written together with the rest of its batch, and the ring declared
+/// fatal.
+///
+/// A write that fails does **not** change that answer. The bookkeeping is still
+/// reported consumed, because refusing it would freeze the guest's Vulkan
+/// driver over a host-side file error it can neither see nor fix; the failure
+/// is logged once and latched in [`failed`](Self::failed) instead.
 #[derive(Debug)]
 pub struct WriteSink<W> {
     out: W,
@@ -289,7 +1663,7 @@ impl<W: io::Write> WriteSink<W> {
         self.written
     }
 
-    /// Whether any write has failed. The ring kept running regardless.
+    /// Whether any write has failed. The ring's answer did not change.
     #[must_use]
     pub fn failed(&self) -> bool {
         self.failed
@@ -305,18 +1679,28 @@ impl<W: io::Write> WriteSink<W> {
     pub fn into_inner(self) -> W {
         self.out
     }
-}
 
-impl<W: io::Write> RingSink for WriteSink<W> {
-    fn consume(&mut self, batch: Batch<'_>) -> Consumed {
-        self.written = self.written.saturating_add(batch.len() as u64);
-        if let Err(error) = self.out.write_all(batch.bytes()) {
+    fn record(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.written = self.written.saturating_add(bytes.len() as u64);
+        // Flushed per record: a guest that aborts on the fatal ring usually
+        // takes the VM run down soon after, and a capture still sitting in a
+        // buffer is a capture that was never taken.
+        let result = self.out.write_all(bytes).and_then(|()| self.out.flush());
+        if let Err(error) = result {
             if !self.failed {
                 tracing::error!(%error, "the Venus ring capture could not be written");
             }
             self.failed = true;
         }
-        batch.all()
+    }
+}
+
+impl<W: io::Write> RingSink for WriteSink<W> {
+    fn consume(&mut self, batch: Batch<'_>) -> Consumed {
+        capture_batch(batch, |bytes| self.record(bytes))
     }
 }
 
@@ -439,32 +1823,47 @@ pub enum VenusError {
     #[error(transparent)]
     Shmem(#[from] ShmemError),
 
-    /// The ring protocol refused a pass — an impossible `tail`, or a ring
-    /// already written off.
-    #[error(transparent)]
-    Pump(#[from] PumpError),
-
-    /// The sink took nothing from a full ring, so nothing can ever arrive to
-    /// unstick it ([`Pass::Deadlocked`]). The ring is marked fatal.
-    #[error(
-        "the ring {ring:#x} is full and its sink consumed none of the {offered:#x} bytes in it"
-    )]
-    RingDeadlocked {
-        /// The ring that stalled.
+    /// A doorbell for a ring whose worker has stopped for good — an impossible
+    /// `tail`, a full ring its sink could not take anything from, or a command
+    /// its sink could not answer. `FATAL` is already published in the ring.
+    #[error("venus context {ctx_id}'s ring {ring:#x} has stopped for good and FATAL is published")]
+    RingStopped {
+        /// The context that rang.
+        ctx_id: u32,
+        /// The dead ring.
         ring: u64,
-        /// How many bytes were on offer — always the buffer's full length.
-        offered: u32,
     },
 
-    /// One doorbell made [`MAX_DOORBELL_PASSES`] passes and the guest was still
-    /// producing. The ring is marked fatal.
-    #[error(
-        "one doorbell on ring {ring:#x} made {MAX_DOORBELL_PASSES} passes and the guest was \
-         still producing; the ring is written off rather than held open"
-    )]
-    DoorbellExhausted {
-        /// The ring that would not drain.
+    /// `vkCreateRingMESA` chaining a `VkRingMonitorInfoMESA` with a reporting
+    /// period of zero, which the reference refuses too
+    /// (`vkr_transport.c:228-232`): a period of nothing is not one anybody can
+    /// keep.
+    #[error("ring {ring:#x} on venus context {ctx_id} asked for an ALIVE period of zero")]
+    ZeroMonitorPeriod {
+        /// The context that asked.
+        ctx_id: u32,
+        /// The ring it was creating.
         ring: u64,
+    },
+
+    /// The [`SinkFactory`] could not make a sink for a new ring.
+    #[error("no sink could be made for ring {ring:#x} on venus context {ctx_id}: {reason}")]
+    SinkUnavailable {
+        /// The context that asked.
+        ctx_id: u32,
+        /// The ring it was creating.
+        ring: u64,
+        /// What the factory said.
+        reason: String,
+    },
+
+    /// The host would not start a ring worker or monitor thread.
+    #[error("the host could not start a venus {what} thread: {reason}")]
+    ThreadSpawn {
+        /// Which kind of thread.
+        what: &'static str,
+        /// What the OS said.
+        reason: String,
     },
 
     /// A blob memory type this renderer does not serve.
@@ -484,8 +1883,74 @@ pub enum VenusError {
     UnknownBlob(u32),
 
     /// The [`MAX_RING_BLOBS`] cap.
-    #[error("the host limit of {MAX_RING_BLOBS} venus host blobs is reached")]
-    TooManyBlobs,
+    #[error("the host limit of {max} venus host blobs is reached")]
+    TooManyBlobs {
+        /// [`MAX_RING_BLOBS`].
+        max: usize,
+    },
+
+    /// The [`MAX_RING_BLOBS_PER_CONTEXT`] cap.
+    #[error("venus context {ctx_id} already holds the {max} host blobs one context may")]
+    TooManyContextBlobs {
+        /// The context.
+        ctx_id: u32,
+        /// [`MAX_RING_BLOBS_PER_CONTEXT`].
+        max: usize,
+    },
+
+    /// The [`MAX_MEMORY_BLOBS`] cap.
+    #[error("the host limit of {MAX_MEMORY_BLOBS} blobs of Vulkan memory is reached")]
+    TooManyMemoryBlobs,
+
+    /// The [`MAX_MEMORY_BLOBS_PER_CONTEXT`] cap.
+    #[error(
+        "venus context {ctx_id} already holds the {max} blobs of Vulkan memory one context may"
+    )]
+    TooManyContextMemoryBlobs {
+        /// The context.
+        ctx_id: u32,
+        /// [`MAX_MEMORY_BLOBS_PER_CONTEXT`].
+        max: usize,
+    },
+
+    /// A blob naming a `VkDeviceMemory` that cannot be one.
+    #[error("resource {resource_id} cannot be a blob of Vulkan memory {blob_id:#x}: {reason}")]
+    MemoryBlob {
+        /// The blob.
+        resource_id: u32,
+        /// The memory it named.
+        blob_id: u64,
+        /// What the executor said.
+        reason: String,
+    },
+
+    /// `RESOURCE_MAP_BLOB` of a handle blob (stage S1): device-local memory
+    /// the guest cannot map — its type is not host-visible, and there are no
+    /// pages of ours behind it to publish.
+    #[error(
+        "resource {0} is exportable device-local Vulkan memory, which has no pages the guest \
+         could map"
+    )]
+    HandleBlobNotMappable(u32),
+
+    /// `vkCreateRingMESA` over a blob of Vulkan memory: a ring lives in
+    /// pages of its own.
+    #[error("resource {0} is a blob of Vulkan memory, and a ring lives in a blob of its own")]
+    RingOnDeviceMemory(u32),
+
+    /// `vkWaitRingSeqnoMESA` for a seqno its ring cannot reach, or did not
+    /// reach in [`WAIT_RING_SEQNO_TIMEOUT`].
+    #[error("ring {ring:#x} of venus context {ctx_id} did not reach seqno {seqno:#x}: {why}")]
+    RingSeqno {
+        /// The context.
+        ctx_id: u32,
+        /// The ring.
+        ring: u64,
+        /// The seqno.
+        seqno: u64,
+        /// Why not.
+        why: &'static str,
+    },
 
     /// The [`MAX_RING_BLOB_BYTES`] budget.
     #[error(
@@ -496,6 +1961,20 @@ pub enum VenusError {
         /// The size asked for.
         size: u64,
         /// [`MAX_RING_BLOB_BYTES`].
+        max: u64,
+    },
+
+    /// The [`MAX_RING_BLOB_BYTES_PER_CONTEXT`] budget.
+    #[error(
+        "a {size:#x}-byte blob would take venus context {ctx_id} past the {max:#x} bytes of \
+         host blobs one context may hold"
+    )]
+    ContextBlobBudget {
+        /// The context.
+        ctx_id: u32,
+        /// The size asked for.
+        size: u64,
+        /// [`MAX_RING_BLOB_BYTES_PER_CONTEXT`].
         max: u64,
     },
 
@@ -533,6 +2012,38 @@ pub enum VenusError {
     /// A classic-3D command on a renderer that serves only Venus.
     #[error("this renderer serves only Venus contexts and has no {0}")]
     NoClassic3d(&'static str),
+
+    /// A virtio-gpu fence on a `ring_idx` timeline the factory could not
+    /// put on a host queue (stage 5b.3): no queue bound to it, no context,
+    /// or a factory that executes no Vulkan.
+    #[error("a fence on ring_idx {ring_idx} of venus context {ctx_id}: {why}")]
+    RingFence {
+        /// The context.
+        ctx_id: u32,
+        /// The timeline.
+        ring_idx: u8,
+        /// Why.
+        why: String,
+    },
+
+    /// A `SET_SCANOUT_BLOB` layout this renderer cannot read back (stage
+    /// S2b).
+    #[error("resource {resource_id} cannot be scanned out with that layout: {reason}")]
+    ScanoutRefused {
+        /// The blob.
+        resource_id: u32,
+        /// Why.
+        reason: String,
+    },
+
+    /// A scanout readback that failed on the host (stage S2b).
+    #[error("the scanout readback of resource {resource_id} failed: {reason}")]
+    ScanoutRead {
+        /// The blob.
+        resource_id: u32,
+        /// Why.
+        reason: String,
+    },
 }
 
 impl From<VenusError> for CommandError {
@@ -567,29 +2078,103 @@ impl From<VenusError> for CommandError {
             }
             VenusError::UnknownRingResource(id)
             | VenusError::UnknownBlob(id)
-            | VenusError::BlobCarriesPages(id) => Self::UnknownResource(id),
+            | VenusError::BlobCarriesPages(id)
+            | VenusError::RingOnDeviceMemory(id) => Self::UnknownResource(id),
+            VenusError::MemoryBlob { .. } => {
+                Self::InvalidStream("a blob names Vulkan memory it cannot be")
+            }
+            VenusError::RingSeqno { .. } => {
+                Self::InvalidStream("a venus ring did not reach the seqno waited for")
+            }
             VenusError::ForeignRingResource { resource_id, .. } => {
                 Self::UnknownResource(resource_id)
             }
             VenusError::Layout(_) | VenusError::Shmem(_) => {
                 Self::InvalidStream("the proposed venus ring layout is not one this host serves")
             }
-            VenusError::Pump(_)
-            | VenusError::RingDeadlocked { .. }
-            | VenusError::DoorbellExhausted { .. } => {
+            VenusError::RingStopped { .. } => {
                 Self::InvalidStream("the venus ring protocol was violated and the ring is dead")
+            }
+            VenusError::ZeroMonitorPeriod { .. } => {
+                Self::InvalidStream("a venus ring asked for an ALIVE period of zero")
+            }
+            VenusError::SinkUnavailable { .. } | VenusError::ThreadSpawn { .. } => {
+                Self::Renderer(err.to_string())
             }
             VenusError::UnsupportedBlobMem(blob_mem) => Self::UnsupportedBlobMem(blob_mem),
             VenusError::DuplicateBlob(id) => Self::DuplicateResource(id),
-            VenusError::TooManyBlobs | VenusError::BlobBudget { .. } => Self::OutOfMemory,
+            VenusError::TooManyBlobs { .. }
+            | VenusError::TooManyContextBlobs { .. }
+            | VenusError::TooManyMemoryBlobs
+            | VenusError::TooManyContextMemoryBlobs { .. }
+            | VenusError::BlobBudget { .. }
+            | VenusError::ContextBlobBudget { .. } => Self::OutOfMemory,
             VenusError::BlobAlreadyMapped(id) => Self::BlobAlreadyMapped(id),
+            VenusError::HandleBlobNotMappable(id) => Self::BlobNotMappable(id),
             VenusError::BlobSpanMismatch { .. } | VenusError::WindowRefused { .. } => {
                 Self::Renderer(err.to_string())
             }
             VenusError::NoWindow => Self::NoHostVisibleWindow,
-            VenusError::NoClassic3d(_) => Self::Renderer(err.to_string()),
+            VenusError::NoClassic3d(_) | VenusError::RingFence { .. } => {
+                Self::Renderer(err.to_string())
+            }
+            VenusError::ScanoutRefused {
+                resource_id,
+                reason,
+            } => Self::ScanoutLayout {
+                resource_id,
+                reason,
+            },
+            VenusError::ScanoutRead { .. } => Self::Renderer(err.to_string()),
         }
     }
+}
+
+/// Why a canonical image recorded on a handle blob is not the image a
+/// `SET_SCANOUT_BLOB` of `spec` describes (stage S2b), or `None` when it is.
+///
+/// The format must be BGRA-ordered — `B8G8R8A8_UNORM` or its sRGB twin
+/// ([`CanonicalImage::is_bgra8`]), which is what GBM's `XRGB8888` and
+/// `ARGB8888` are to Zink — because the device accepts only the two BGRA
+/// scanout formats: an RGBA-ordered image under one would be a guest that
+/// named the wrong fourcc, and is refused rather than silently swizzled. The
+/// extent must be the framebuffer's, and the plane the one the guest was
+/// told for this image (`executor::modifier`, lie 3): offset 0 — in the
+/// blob and in the memory the image is bound at — and exactly the
+/// synthesized row pitch. The pitch is metadata, never an address: the
+/// pixels are read through the image.
+#[must_use]
+pub fn scanout_mismatch(image: &ScanoutImage, spec: &ScanoutBlobSpec) -> Option<String> {
+    let canonical = &image.canonical;
+    if spec.format != crate::FORMAT_B8G8R8X8_UNORM && spec.format != crate::FORMAT_B8G8R8A8_UNORM {
+        return Some(format!("scanout format {} is not a BGRA one", spec.format));
+    }
+    if !canonical.is_bgra8() {
+        return Some(format!(
+            "the image bound to it is of VkFormat {}, not B8G8R8A8 (UNORM or SRGB)",
+            canonical.format
+        ));
+    }
+    if (canonical.width, canonical.height) != (spec.width, spec.height) {
+        return Some(format!(
+            "the image bound to it is {}x{}, the framebuffer {}x{}",
+            canonical.width, canonical.height, spec.width, spec.height
+        ));
+    }
+    if image.offset != 0 || spec.offset != 0 {
+        return Some(format!(
+            "plane 0 at offset {} of a blob whose image is bound at {}: the plane is at 0",
+            spec.offset, image.offset
+        ));
+    }
+    let pitch = canonical.layout().row_pitch;
+    if u64::from(spec.stride) != pitch {
+        return Some(format!(
+            "stride {} is not the {pitch}-byte pitch the guest was told for the image",
+            spec.stride
+        ));
+    }
+    None
 }
 
 // ---------------------------------------------------------------- the state
@@ -602,31 +2187,78 @@ struct RingBlob {
     /// [`super::shmem`]'s lifetime argument — so it is never bypassed by
     /// holding the address anywhere else.
     publication: Option<Publication>,
-    /// The allocation. Rings built on it hold their own `Arc`.
-    pages: Arc<RingPages>,
+    /// The allocation — pages, or for a handle blob the host handle. Rings
+    /// built on pages hold their own `Arc`.
+    backing: ExportedMemory,
     /// The context the blob was created on; `0` is the kernel's own.
     ctx_id: u32,
     /// The renderer-side name the guest minted it under.
     blob_id: u64,
-    /// The size the guest asked for, which is [`RingPages::resource_len`].
+    /// The size the guest asked for: [`RingPages::resource_len`] for a
+    /// ring blob, the span a memory blob's mapping covers for one of those.
     size: u64,
+    /// Whether the pages are the blob's own (`blob_id` 0), a
+    /// `VkDeviceMemory`'s, or no pages at all.
+    kind: BlobKind,
+    /// Stage S2b: the layout a `SET_SCANOUT_BLOB` of this blob was accepted
+    /// as, and — for a handle blob — the canonical image it matched.
+    scanout: Option<AcceptedScanout>,
+}
+
+/// A scanout layout the renderer accepted for one blob (stage S2b).
+#[derive(Debug, Clone)]
+struct AcceptedScanout {
+    spec: ScanoutBlobSpec,
+    /// The canonical image the spec matched; `None` for a page blob.
+    image: Option<CanonicalImage>,
+}
+
+impl RingBlob {
+    /// The pages, for every blob but a handle blob.
+    fn pages(&self) -> Option<&Arc<RingPages>> {
+        self.backing.pages()
+    }
+}
+
+/// What a host blob's pages are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobKind {
+    /// Allocated for the blob (`blob_id` 0): rings and reply windows.
+    Shm,
+    /// A `VkDeviceMemory`'s imported pages, shared with the executor.
+    Memory,
+    /// Exportable device-local `VkDeviceMemory` (stage S1): a host handle,
+    /// no pages, never mapped.
+    Handle,
 }
 
 /// One live command ring.
 struct Ring {
     /// The pages it lives in. An `Arc`, so a ring keeps its own memory alive
     /// even if the blob is destroyed out from under it before we tear the ring
-    /// down.
+    /// down — and the worker holds one too, for the same reason.
     pages: Arc<RingPages>,
     /// The resource the guest named, so destroying that blob can take its rings
     /// with it.
     resource_id: u32,
-    /// The head/tail protocol. Never rebuilt: once this is fatal it stays
-    /// fatal, which is what the module docs promise.
-    pump: RingPump,
+    /// Where the control words are, for diagnostics and for the monitor.
+    layout: RingLayout,
+    /// Whether the context's monitor is keeping this ring alive.
+    monitored: bool,
+    /// What `vkSubmitVirtqueueSeqnoMESA` records for the ring; its sink
+    /// holds the other reference.
+    virtqueue_seqno: Arc<VirtqueueSeqno>,
+    /// The thread that owns the ring's [`RingPump`] and sink. Never restarted:
+    /// once the ring is fatal the worker has ended, and it stays ended, which
+    /// is what the module docs promise. Dropping it stops and joins it.
+    worker: RingWorker,
 }
 
 /// One venus context.
+///
+/// Dropping one stops and joins every thread it owns. Its [`Drop`] signals
+/// every ring's worker first and only then lets the fields join them one by
+/// one, so the stops overlap instead of queueing.
 struct Context {
     /// Always [`crate::CAPSET_VENUS`]; kept so a diagnostic can say what a
     /// context was created as rather than what we assume.
@@ -635,24 +2267,100 @@ struct Context {
     rings: HashMap<u64, Ring>,
     /// Set once a transport stream on this context refused something.
     poisoned: bool,
+    /// The `ALIVE` monitor, started by the first ring that asked for one and
+    /// kept until the context goes, as the reference keeps it.
+    monitor: Option<RingMonitor>,
+}
+
+impl Context {
+    /// Take `ring` out of this context. Its monitor stops writing its status
+    /// word *before* this returns (see [`RingMonitor::unwatch`]); its worker is
+    /// still running and is the caller's to stop.
+    fn take_ring(&mut self, ring: u64) -> Option<Ring> {
+        let taken = self.rings.remove(&ring)?;
+        if taken.monitored {
+            if let Some(monitor) = &self.monitor {
+                monitor.unwatch(ring);
+            }
+        }
+        Some(taken)
+    }
+
+    /// Ask every ring's worker to stop, without waiting for any of them.
+    fn signal_stop(&self) {
+        for ring in self.rings.values() {
+            ring.worker.signal_stop();
+        }
+    }
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        self.signal_stop();
+    }
 }
 
 /// The transport-half Venus renderer. See the module docs.
-pub struct VenusRenderer<S> {
-    sink: S,
+pub struct VenusRenderer<F> {
+    /// Makes each new ring's sink.
+    sinks: F,
     capset: VenusCapset,
     /// The host-visible window, once the machine layer has supplied one.
     window: Option<Arc<dyn ShmBacking>>,
     blobs: HashMap<u32, RingBlob>,
-    /// Sum of [`RingBlob::size`], against [`MAX_RING_BLOB_BYTES`].
+    /// The same blobs, shared with the ring workers so an executing sink can
+    /// write replies into them; kept in step with `blobs`.
+    directory: BlobDirectory,
+    /// Sum of [`RingBlob::size`] over ring blobs, against
+    /// [`MAX_RING_BLOB_BYTES`].
     blob_bytes: u64,
+    /// Ring blobs, against [`MAX_RING_BLOBS`].
+    shm_blobs: usize,
+    /// Ring blobs and their bytes per creating context, against
+    /// [`MAX_RING_BLOBS_PER_CONTEXT`] and [`MAX_RING_BLOB_BYTES_PER_CONTEXT`].
+    /// Keyed by the blob's `ctx_id` and kept until its last blob goes, so a
+    /// destroyed context's blobs still count against its id.
+    host_blob_use: HashMap<u32, (usize, u64)>,
+    /// The caps the four counters above are held to.
+    host_blob_limits: HostBlobLimits,
+    /// Memory blobs, against [`MAX_MEMORY_BLOBS`].
+    memory_blobs: usize,
+    /// Memory blobs per creating context, against
+    /// [`MAX_MEMORY_BLOBS_PER_CONTEXT`]; kept until its last blob goes, as
+    /// `host_blob_use` is.
+    memory_blob_use: HashMap<u32, usize>,
     contexts: HashMap<u32, Context>,
-    /// Transport commands accepted but not executed (reply streams, seqnos):
-    /// a diagnostic, and what a test asserts to show they were not refused.
+    /// Transport commands accepted but not executed (reply streams on the
+    /// context stream): a diagnostic, and what a test asserts to show they
+    /// were not refused.
     observed: u64,
+    /// The VM's pause gate, which every ring worker and monitor takes before
+    /// it touches a ring (ADR-0005). An always-open gate until the device
+    /// hands over its own.
+    quiesce: Arc<Quiesce>,
+    /// Every ring worker and monitor this renderer has running.
+    live: LiveThreads,
+    /// Ring fences the factory retired, for the device to collect (stage
+    /// 5b.3).
+    retirer: FenceRetirer,
+    /// How the ring fences asked for so far were answered.
+    ring_fences: RingFenceCounts,
+    /// The most of everything a cap bounds this renderer has held since the
+    /// last reset ([`VenusUsage`]).
+    peak: VenusUsage,
+    /// Whether `peak` rose since it was last logged.
+    peak_unlogged: bool,
+    /// When usage was last sampled by the periodic look.
+    sampled: Option<std::time::Instant>,
+    /// The usage the last log line reported, and when: the periodic look
+    /// logs a change at most every [`USAGE_LOG_PERIOD`].
+    logged: (VenusUsage, Option<std::time::Instant>),
+    /// The host-visible window this renderer asks for
+    /// ([`VENUS_HOST_VISIBLE_BYTES`] unless the profile says otherwise).
+    host_visible_bytes: u64,
 }
 
-impl<S> fmt::Debug for VenusRenderer<S> {
+impl<F> fmt::Debug for VenusRenderer<F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VenusRenderer")
             .field("contexts", &self.contexts.len())
@@ -661,28 +2369,61 @@ impl<S> fmt::Debug for VenusRenderer<S> {
             .field("blob_bytes", &self.blob_bytes)
             .field("window", &self.window.as_ref().map(|w| w.len()))
             .field("observed", &self.observed)
+            .field("threads", &self.live.count())
             .finish()
     }
 }
 
-impl<S> VenusRenderer<S> {
-    /// A renderer that feeds every ring's bytes to `sink`.
+impl<F> VenusRenderer<F> {
+    /// A renderer that asks `sinks` for one [`RingSink`] per ring the guest
+    /// creates — see [`SinkFactory`].
     ///
-    /// One sink serves every ring of every context, in the order the bytes were
-    /// consumed. Nothing in the protocol labels a batch with its ring, so a
-    /// caller that needs them told apart wants one renderer per capture, or a
-    /// sink that is handed that structure some other way — which is a real
-    /// limitation of this seam and is written down rather than papered over.
-    pub fn new(sink: S) -> Self {
+    /// Each ring's bytes go to its own sink, on its own worker thread, so rings
+    /// from different contexts (different guest `VkInstance`s) never interleave.
+    pub fn new(sinks: F) -> Self
+    where
+        F: SinkFactory,
+    {
+        let mut capset = VenusCapset::new();
+        // Per-queue fence timelines are honest exactly when the factory
+        // retires them; the device keeps one fence FIFO per
+        // `(context, ring_idx)` either way (`crate::fence`).
+        capset.supports_multiple_timelines = sinks.retires_ring_fences();
         Self {
-            sink,
-            capset: VenusCapset::new(),
+            sinks,
+            capset,
             window: None,
             blobs: HashMap::new(),
+            directory: BlobDirectory::default(),
             blob_bytes: 0,
+            shm_blobs: 0,
+            host_blob_use: HashMap::new(),
+            host_blob_limits: HostBlobLimits::default(),
+            memory_blobs: 0,
+            memory_blob_use: HashMap::new(),
             contexts: HashMap::new(),
             observed: 0,
+            quiesce: Quiesce::new(),
+            live: LiveThreads::new(),
+            retirer: FenceRetirer::default(),
+            ring_fences: RingFenceCounts::default(),
+            peak: VenusUsage::default(),
+            peak_unlogged: false,
+            sampled: None,
+            logged: (VenusUsage::default(), None),
+            host_visible_bytes: VENUS_HOST_VISIBLE_BYTES,
         }
+    }
+
+    /// Ask for a host-visible window of `len` bytes instead of
+    /// [`VENUS_HOST_VISIBLE_BYTES`] (`[display] host_visible_mib`). Takes
+    /// effect in [`Renderer3d::blob_support`], so it must be set before the
+    /// device is built. `len` is host configuration, validated with the
+    /// profile; the machine layer refuses a window it cannot place.
+    #[must_use]
+    pub fn with_host_visible_bytes(mut self, len: u64) -> Self {
+        self.host_visible_bytes = len;
+        self
     }
 
     /// The capset this renderer advertises. [`VenusCapset::new`] by default.
@@ -695,16 +2436,6 @@ impl<S> VenusRenderer<S> {
     /// execute Vulkan says so here rather than by editing this file.
     pub fn set_capset(&mut self, capset: VenusCapset) {
         self.capset = capset;
-    }
-
-    /// The sink, for a caller that kept no handle of its own.
-    pub fn sink(&self) -> &S {
-        &self.sink
-    }
-
-    /// The sink, mutably.
-    pub fn sink_mut(&mut self) -> &mut S {
-        &mut self.sink
     }
 
     /// Live venus contexts.
@@ -725,20 +2456,93 @@ impl<S> VenusRenderer<S> {
         self.blobs.len()
     }
 
+    /// Shrink the host-blob caps, so a test can reach the renderer-wide ones
+    /// without allocating a gigabyte.
+    #[cfg(test)]
+    fn set_host_blob_limits(&mut self, limits: HostBlobLimits) {
+        self.host_blob_limits = limits;
+    }
+
+    /// The pages behind a host blob, for a test playing the guest.
+    #[cfg(test)]
+    pub(crate) fn blob_pages(&self, resource_id: u32) -> Option<Arc<RingPages>> {
+        self.blobs
+            .get(&resource_id)
+            .and_then(RingBlob::pages)
+            .map(Arc::clone)
+    }
+
+    /// Live handle blobs (stage S1): device-local memory exported as a host
+    /// handle, which a snapshot cannot carry.
+    #[must_use]
+    pub fn handle_blob_count(&self) -> usize {
+        self.blobs
+            .values()
+            .filter(|blob| blob.kind == BlobKind::Handle)
+            .count()
+    }
+
+    /// The factory, for a test that inspects what it holds.
+    #[cfg(test)]
+    pub(crate) fn factory(&self) -> &F {
+        &self.sinks
+    }
+
     /// Transport commands that were decoded and accepted without being
-    /// executed — the reply-stream and seqno commands this renderer carries but
-    /// has no Vulkan to perform.
+    /// executed — the reply-stream commands the context stream carries but
+    /// serves only on a ring.
     #[must_use]
     pub fn observed_commands(&self) -> u64 {
         self.observed
     }
 
-    /// The pump cursor and status word of one ring, for diagnostics and for the
-    /// two values ADR-0006 would have to persist.
+    /// One ring's `head` and `status` words as they are in shared memory right
+    /// now — `head` is the pump's cursor, which with the status is what
+    /// ADR-0006 would have to persist. The status includes the monitor's
+    /// `ALIVE` and anything the guest has cleared.
     #[must_use]
     pub fn ring_state(&self, ctx_id: u32, ring: u64) -> Option<(u32, u32)> {
         let ring = self.contexts.get(&ctx_id)?.rings.get(&ring)?;
-        Some((ring.pump.cursor(), ring.pump.status()))
+        Some((
+            ring.pages.load_host_word(&ring.layout.head()),
+            ring.pages.load_host_word(&ring.layout.status()),
+        ))
+    }
+
+    /// Whether a ring's worker has stopped for good (`FATAL` published).
+    #[must_use]
+    pub fn ring_stopped(&self, ctx_id: u32, ring: u64) -> Option<bool> {
+        let ring = self.contexts.get(&ctx_id)?.rings.get(&ring)?;
+        Some(ring.worker.has_ended())
+    }
+
+    /// The `ALIVE` period a context's monitor is keeping, if it has one.
+    #[must_use]
+    pub fn monitor_period(&self, ctx_id: u32) -> Option<Duration> {
+        self.contexts
+            .get(&ctx_id)?
+            .monitor
+            .as_ref()
+            .map(RingMonitor::period)
+    }
+
+    /// Whether the device has handed this renderer a host waker.
+    #[must_use]
+    pub fn has_host_waker(&self) -> bool {
+        self.retirer.has_waker()
+    }
+
+    /// How the ring fences asked for so far were answered ([`RingFenceCounts`]).
+    #[must_use]
+    pub fn ring_fence_counts(&self) -> RingFenceCounts {
+        self.ring_fences
+    }
+
+    /// Ring workers and monitors running right now. Zero after a
+    /// [`reset`](Renderer3d::reset), which joins them all.
+    #[must_use]
+    pub fn live_threads(&self) -> usize {
+        self.live.count()
     }
 
     // ------------------------------------------------------------ contexts
@@ -760,6 +2564,7 @@ impl<S> VenusRenderer<S> {
                 capset_id,
                 rings: HashMap::new(),
                 poisoned: false,
+                monitor: None,
             },
         );
         Ok(())
@@ -773,8 +2578,8 @@ impl<S> VenusRenderer<S> {
 
     // --------------------------------------------------------------- blobs
 
-    /// `RESOURCE_CREATE_BLOB` for a host blob: allocate the pages a ring will
-    /// live in.
+    /// `RESOURCE_CREATE_BLOB` for a host blob with `blob_id` 0: allocate the
+    /// pages a ring or a reply window will live in.
     ///
     /// Only [`BLOB_MEM_HOST3D`] is served. `HOST3D_GUEST` would hand us guest
     /// pages *as well*, and a ring cannot live in them — the control words are
@@ -783,6 +2588,67 @@ impl<S> VenusRenderer<S> {
     /// ignoring half of what the guest asked for.
     fn create_host_blob(
         &mut self,
+        ctx_id: u32,
+        args: &ResourceCreateBlob,
+        entries: &[MemEntry],
+    ) -> Result<(), VenusError> {
+        self.check_host_blob(ctx_id, args, entries)?;
+        let limits = self.host_blob_limits;
+        // The context's own share first: a client that has used its share is
+        // told so by name, and cannot take the rest from everyone else.
+        let (held, held_bytes) = self.host_blob_use.get(&ctx_id).copied().unwrap_or((0, 0));
+        if held >= limits.blobs_per_context {
+            return Err(VenusError::TooManyContextBlobs {
+                ctx_id,
+                max: limits.blobs_per_context,
+            });
+        }
+        if held_bytes.saturating_add(args.size) > limits.bytes_per_context {
+            return Err(VenusError::ContextBlobBudget {
+                ctx_id,
+                size: args.size,
+                max: limits.bytes_per_context,
+            });
+        }
+        if self.shm_blobs >= limits.blobs {
+            return Err(VenusError::TooManyBlobs { max: limits.blobs });
+        }
+        if self.blob_bytes.saturating_add(args.size) > limits.bytes {
+            return Err(VenusError::BlobBudget {
+                size: args.size,
+                max: limits.bytes,
+            });
+        }
+
+        // The size is guest-chosen, and `RingPages::new` is where that is
+        // bounded and refused by name rather than believed.
+        let pages = Arc::new(RingPages::new(args.size)?);
+        self.blob_bytes = self.blob_bytes.saturating_add(args.size);
+        self.shm_blobs = self.shm_blobs.saturating_add(1);
+        let share = self.host_blob_use.entry(ctx_id).or_default();
+        share.0 = share.0.saturating_add(1);
+        share.1 = share.1.saturating_add(args.size);
+        self.directory
+            .insert(args.resource_id, ctx_id, Arc::clone(&pages));
+        self.blobs.insert(
+            args.resource_id,
+            RingBlob {
+                publication: None,
+                backing: ExportedMemory::Pages(pages),
+                ctx_id,
+                blob_id: args.blob_id,
+                size: args.size,
+                kind: BlobKind::Shm,
+                scanout: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// What every host blob must be, whichever pages it gets: `HOST3D`, no
+    /// guest pages, a live context (or the kernel's), an unused id.
+    fn check_host_blob(
+        &self,
         ctx_id: u32,
         args: &ResourceCreateBlob,
         entries: &[MemEntry],
@@ -799,30 +2665,6 @@ impl<S> VenusRenderer<S> {
         if self.blobs.contains_key(&args.resource_id) {
             return Err(VenusError::DuplicateBlob(args.resource_id));
         }
-        if self.blobs.len() >= MAX_RING_BLOBS {
-            return Err(VenusError::TooManyBlobs);
-        }
-        if self.blob_bytes.saturating_add(args.size) > MAX_RING_BLOB_BYTES {
-            return Err(VenusError::BlobBudget {
-                size: args.size,
-                max: MAX_RING_BLOB_BYTES,
-            });
-        }
-
-        // The size is guest-chosen, and `RingPages::new` is where that is
-        // bounded and refused by name rather than believed.
-        let pages = Arc::new(RingPages::new(args.size)?);
-        self.blob_bytes = self.blob_bytes.saturating_add(args.size);
-        self.blobs.insert(
-            args.resource_id,
-            RingBlob {
-                publication: None,
-                pages,
-                ctx_id,
-                blob_id: args.blob_id,
-                size: args.size,
-            },
-        );
         Ok(())
     }
 
@@ -848,31 +2690,353 @@ impl<S> VenusRenderer<S> {
                 actual: blob.size,
             });
         }
-        let publication =
-            blob.pages
-                .publish(window, offset)
-                .map_err(|err| VenusError::WindowRefused {
-                    resource_id,
-                    reason: err.to_string(),
-                })?;
-        blob.publication = Some(publication);
+        // A ring blob shows all of its pages; a memory blob shows the span
+        // the device reserved for it, which its pages may run past (they are
+        // rounded to the driver's import alignment) — a prefix of our own
+        // allocation, so still nothing but ours. A handle blob has no pages:
+        // device-local memory the guest can never map (stage S1).
+        let published = match (blob.kind, &blob.backing) {
+            (BlobKind::Shm, ExportedMemory::Pages(pages)) => pages.publish(window, offset),
+            (BlobKind::Memory, ExportedMemory::Pages(pages)) => {
+                pages.publish_len(window, offset, blob.size)
+            }
+            _ => return Err(VenusError::HandleBlobNotMappable(resource_id)),
+        };
+        let publication = published.map_err(|err| VenusError::WindowRefused {
+            resource_id,
+            reason: err.to_string(),
+        })?;
         tracing::debug!(
             resource = resource_id,
             blob_id = blob.blob_id,
             offset = format_args!("{offset:#x}"),
-            len = blob.pages.mapped_len(),
-            "venus ring pages published into the shared-memory window"
+            len = publication.len(),
+            kind = ?blob.kind,
+            "venus blob pages published into the shared-memory window"
         );
-        // The bytes behind the window are plain host RAM, so cached is the
-        // truthful answer; a real Venus renderer's host-visible heap would be
-        // write-combining and would say so.
+        blob.publication = Some(publication);
+        // The bytes behind the window are plain host RAM — ours, for a ring
+        // and for imported memory alike — so cached is the truthful answer.
+        // ADR-0004's measurement: our pages run at full speed in the guest
+        // even as the driver's write-combined type 3, because the host-side
+        // mapping decides the memory type.
         Ok(BlobMapping::CACHED)
     }
 
     // --------------------------------------------------------------- rings
 }
 
-impl<S: RingSink> VenusRenderer<S> {
+impl<F: SinkFactory> VenusRenderer<F> {
+    /// Everything a cap bounds, as it is right now.
+    #[must_use]
+    pub fn usage(&self) -> VenusUsage {
+        let mut usage = VenusUsage {
+            contexts: self.contexts.len(),
+            threads: self.live.count(),
+            host_blobs: self.shm_blobs,
+            host_blob_bytes: self.blob_bytes,
+            memory_blobs: self.memory_blobs,
+            factory: self.sinks.usage(),
+            ..VenusUsage::default()
+        };
+        for context in self.contexts.values() {
+            usage.rings = usage.rings.saturating_add(context.rings.len());
+            usage.max_context_rings = usage.max_context_rings.max(context.rings.len());
+        }
+        for (blobs, bytes) in self.host_blob_use.values() {
+            usage.max_context_host_blobs = usage.max_context_host_blobs.max(*blobs);
+            usage.max_context_host_blob_bytes = usage.max_context_host_blob_bytes.max(*bytes);
+        }
+        // Per context: memory blobs, window ranges, window bytes.
+        let mut per_context: HashMap<u32, (usize, usize, u64)> = HashMap::new();
+        for blob in self.blobs.values() {
+            usage.blobs = usage.blobs.saturating_add(1);
+            usage.blob_bytes = usage.blob_bytes.saturating_add(blob.size);
+            let share = per_context.entry(blob.ctx_id).or_default();
+            match blob.kind {
+                BlobKind::Handle => {
+                    usage.handle_blobs = usage.handle_blobs.saturating_add(1);
+                    share.0 = share.0.saturating_add(1);
+                }
+                BlobKind::Memory => share.0 = share.0.saturating_add(1),
+                BlobKind::Shm => {}
+            }
+            if let Some(publication) = &blob.publication {
+                usage.window_ranges = usage.window_ranges.saturating_add(1);
+                usage.window_bytes = usage.window_bytes.saturating_add(publication.len());
+                usage.window_top = usage
+                    .window_top
+                    .max(publication.offset().saturating_add(publication.len()));
+                share.1 = share.1.saturating_add(1);
+                share.2 = share.2.saturating_add(publication.len());
+            }
+        }
+        for (memory_blobs, ranges, bytes) in per_context.into_values() {
+            usage.max_context_memory_blobs = usage.max_context_memory_blobs.max(memory_blobs);
+            usage.max_context_window_ranges = usage.max_context_window_ranges.max(ranges);
+            usage.max_context_window_bytes = usage.max_context_window_bytes.max(bytes);
+        }
+        usage
+    }
+
+    /// The most of everything a cap bounds this renderer has held since the
+    /// last reset, as far as its samples saw.
+    #[must_use]
+    pub fn peak_usage(&self) -> VenusUsage {
+        self.peak
+    }
+
+    /// Look at the usage now and raise the peak with it.
+    fn sample_usage(&mut self) -> VenusUsage {
+        let now = self.usage();
+        let peak = self.peak.max(now);
+        if peak != self.peak {
+            self.peak = peak;
+            self.peak_unlogged = true;
+        }
+        now
+    }
+
+    /// Sample, and log the usage and the peak, because `event` happened.
+    fn log_usage(&mut self, event: &'static str, ctx_id: u32) {
+        let now = self.sample_usage();
+        self.peak_unlogged = false;
+        self.logged = (now, Some(std::time::Instant::now()));
+        let peak = self.peak;
+        tracing::debug!(
+            target: "virtio_gpu::venus::usage",
+            event,
+            ctx_id,
+            contexts = now.contexts,
+            rings = now.rings,
+            threads = now.threads,
+            fence_threads = now.factory.fence_threads,
+            host_blobs = now.host_blobs,
+            host_blob_bytes = now.host_blob_bytes,
+            memory_blobs = now.memory_blobs,
+            handle_blobs = now.handle_blobs,
+            blobs = now.blobs,
+            blob_bytes = now.blob_bytes,
+            window_ranges = now.window_ranges,
+            window_bytes = now.window_bytes,
+            host_visible_bytes = now.factory.host_visible_bytes,
+            objects = now.factory.objects,
+            pending_ring_fences = now.factory.pending_ring_fences,
+            ring_fences_deferred = self.ring_fences.deferred,
+            ring_fences_signalled_unrunnable = self.ring_fences.signalled_unrunnable,
+            peak_contexts = peak.contexts,
+            peak_rings = peak.rings,
+            peak_context_rings = peak.max_context_rings,
+            peak_threads = peak.threads,
+            peak_fence_threads = peak.factory.fence_threads,
+            peak_host_blobs = peak.host_blobs,
+            peak_host_blob_bytes = peak.host_blob_bytes,
+            peak_context_host_blobs = peak.max_context_host_blobs,
+            peak_context_host_blob_bytes = peak.max_context_host_blob_bytes,
+            peak_memory_blobs = peak.memory_blobs,
+            peak_context_memory_blobs = peak.max_context_memory_blobs,
+            peak_handle_blobs = peak.handle_blobs,
+            peak_blobs = peak.blobs,
+            peak_blob_bytes = peak.blob_bytes,
+            peak_window_ranges = peak.window_ranges,
+            peak_window_bytes = peak.window_bytes,
+            peak_context_window_ranges = peak.max_context_window_ranges,
+            peak_context_window_bytes = peak.max_context_window_bytes,
+            peak_window_top = peak.window_top,
+            peak_host_visible_bytes = peak.factory.host_visible_bytes,
+            peak_context_host_visible_bytes = peak.factory.max_context_host_visible_bytes,
+            peak_objects = peak.factory.objects,
+            peak_context_objects = peak.factory.max_context_objects,
+            peak_pending_ring_fences = peak.factory.pending_ring_fences,
+            peak_scanout_targets = peak.factory.scanout_targets,
+            "venus usage"
+        );
+    }
+
+    /// The periodic look, taken from the paths a running guest keeps calling
+    /// (its virtqueue submits, the scanout readback, the fence poll): at
+    /// most every [`USAGE_SAMPLE_PERIOD`]. It logs
+    /// when a peak rose since the last line, or — at most every
+    /// [`USAGE_LOG_PERIOD`] — when the usage changed, so the log shows what
+    /// the renderer holds between contexts coming and going (a leak shows as
+    /// a level that does not come back down).
+    fn tick_usage(&mut self) {
+        let at = std::time::Instant::now();
+        if self
+            .sampled
+            .is_some_and(|then| at.saturating_duration_since(then) < USAGE_SAMPLE_PERIOD)
+        {
+            return;
+        }
+        self.sampled = Some(at);
+        let now = self.sample_usage();
+        let (logged, when) = self.logged;
+        let due = when.is_none_or(|then| at.saturating_duration_since(then) >= USAGE_LOG_PERIOD);
+        if self.peak_unlogged {
+            self.log_usage("peak", 0);
+        } else if due && now != logged {
+            self.log_usage("changed", 0);
+        }
+    }
+
+    /// `SET_SCANOUT_BLOB` of a blob of this renderer (stage S2b,
+    /// [`Renderer3d::scanout_blob`]): see the module docs' scanout section.
+    fn accept_scanout(
+        &mut self,
+        resource_id: u32,
+        spec: &ScanoutBlobSpec,
+    ) -> Result<(), VenusError> {
+        let refused = |reason: String| VenusError::ScanoutRefused {
+            resource_id,
+            reason,
+        };
+        let blob = self
+            .blobs
+            .get(&resource_id)
+            .ok_or(VenusError::UnknownBlob(resource_id))?;
+        let image = match (blob.kind, &blob.backing) {
+            (BlobKind::Memory, ExportedMemory::Pages(pages)) => {
+                // `offset + stride × (height − 1) + width × 4`, in u64: the
+                // last byte a row of the image touches.
+                let last = u64::from(spec.stride)
+                    .checked_mul(u64::from(spec.height.saturating_sub(1)))
+                    .and_then(|rows| rows.checked_add(u64::from(spec.offset)))
+                    .and_then(|at| at.checked_add(u64::from(spec.width).checked_mul(4)?));
+                match last {
+                    Some(end) if spec.width > 0 && spec.height > 0 && end <= pages.mapped_len() => {}
+                    _ => {
+                        return Err(refused(format!(
+                            "{}x{} at stride {} from offset {} does not fit the {:#x} host bytes                              of the memory",
+                            spec.width,
+                            spec.height,
+                            spec.stride,
+                            spec.offset,
+                            pages.mapped_len()
+                        )))
+                    }
+                }
+                None
+            }
+            (BlobKind::Handle, ExportedMemory::Handle(_)) => {
+                let (handle, images, _) = self
+                    .directory
+                    .scanout_state(resource_id)
+                    .ok_or_else(|| refused("the handle blob is not in the directory".into()))?;
+                let Some(newest) = images.first() else {
+                    return Err(refused(
+                        "no canonical DRM-modifier image is bound to its memory, so nothing says                          how its bytes are laid out"
+                            .into(),
+                    ));
+                };
+                let Some(matched) = images
+                    .iter()
+                    .find(|image| scanout_mismatch(image, spec).is_none())
+                else {
+                    return Err(refused(
+                        scanout_mismatch(newest, spec).unwrap_or_else(|| "no image matches".into()),
+                    ));
+                };
+                let target = ScanoutTarget {
+                    resource_id,
+                    handle,
+                    image: matched.canonical.clone(),
+                    spec: *spec,
+                };
+                self.sinks.prepare_scanout(&target).map_err(refused)?;
+                Some(target.image)
+            }
+            _ => {
+                return Err(refused(
+                    "a ring or reply blob is not an image; only a blob of Vulkan memory is".into(),
+                ))
+            }
+        };
+        if let Some(blob) = self.blobs.get_mut(&resource_id) {
+            blob.scanout = Some(AcceptedScanout { spec: *spec, image });
+        }
+        Ok(())
+    }
+
+    /// `read_rect_bgra` of a blob accepted for scanout (stage S2b).
+    fn read_scanout(
+        &mut self,
+        resource_id: u32,
+        rect: Rect,
+        out: &mut Vec<u8>,
+    ) -> Result<(), VenusError> {
+        let failed = |reason: String| VenusError::ScanoutRead {
+            resource_id,
+            reason,
+        };
+        let blob = self
+            .blobs
+            .get(&resource_id)
+            .ok_or(VenusError::UnknownBlob(resource_id))?;
+        let accepted = blob
+            .scanout
+            .clone()
+            .ok_or(VenusError::UnknownBlob(resource_id))?;
+        let spec = accepted.spec;
+        if !rect.fits_within(spec.width, spec.height) {
+            return Err(failed(format!(
+                "the {}x{} rect at ({}, {}) is outside the {}x{} image",
+                rect.width, rect.height, rect.x, rect.y, spec.width, spec.height
+            )));
+        }
+        let row = usize::try_from(u64::from(rect.width) * 4)
+            .map_err(|_| failed("a row larger than this host addresses".into()))?;
+        let len = usize::try_from(rect.pixels().saturating_mul(4))
+            .map_err(|_| failed("a rect larger than this host addresses".into()))?;
+        match (&blob.backing, accepted.image) {
+            (ExportedMemory::Pages(pages), None) => {
+                out.clear();
+                out.try_reserve_exact(len)
+                    .map_err(|_| failed(format!("{len} bytes of readback buffer")))?;
+                out.resize(len, 0);
+                for (y, dst) in (rect.y..).zip(out.chunks_exact_mut(row.max(1))) {
+                    // Bounded by `accept_scanout`'s check of the whole image
+                    // against the pages, and again by `read_bytes` itself.
+                    let at = u64::from(spec.offset)
+                        + u64::from(y) * u64::from(spec.stride)
+                        + u64::from(rect.x) * 4;
+                    pages
+                        .read_bytes(at, dst)
+                        .map_err(|error| failed(error.to_string()))?;
+                }
+                Ok(())
+            }
+            (ExportedMemory::Handle(handle), Some(image)) => {
+                let release = self
+                    .directory
+                    .scanout_state(resource_id)
+                    .and_then(|(_, _, release)| release)
+                    .ok_or_else(|| {
+                        failed(
+                            "the guest has not released its image to a queue family outside                              its instance yet, so there is no frame to acquire"
+                                .into(),
+                        )
+                    })?;
+                let target = ScanoutTarget {
+                    resource_id,
+                    handle: handle.clone(),
+                    image,
+                    spec,
+                };
+                self.sinks
+                    .read_scanout(&target, release, rect, out)
+                    .map_err(failed)?;
+                if out.len() != len {
+                    return Err(failed(format!(
+                        "the scanout device returned {} bytes for {len}",
+                        out.len()
+                    )));
+                }
+                Ok(())
+            }
+            _ => Err(failed("the accepted layout does not match the blob".into())),
+        }
+    }
+
     /// `SUBMIT_3D` on a venus context: decode the transport stream and act.
     ///
     /// A **decode** refusal poisons the context (see the module docs); an
@@ -930,7 +3094,12 @@ impl<S: RingSink> VenusRenderer<S> {
     /// Perform one decoded transport command.
     fn execute(&mut self, ctx_id: u32, command: TransportCommand) -> Result<(), VenusError> {
         match command {
-            TransportCommand::CreateRing { ring, info, .. } => self.create_ring(ctx_id, ring, info),
+            TransportCommand::CreateRing {
+                ring,
+                info,
+                monitor_period_us,
+                ..
+            } => self.create_ring(ctx_id, ring, info, monitor_period_us),
             TransportCommand::DestroyRing { ring } => self.destroy_ring(ctx_id, ring),
             TransportCommand::NotifyRing { ring, .. } => self.doorbell(ctx_id, ring),
             // The `extra` region is host-written: the protocol stores one `u32`
@@ -952,16 +3121,21 @@ impl<S: RingSink> VenusRenderer<S> {
             TransportCommand::WaitVirtqueueSeqno { .. } => Err(VenusError::RingOnlyCommand(
                 Opcode::WaitVirtqueueSeqno.name(),
             )),
-            // Carried, counted and not executed: these are the reply-stream and
-            // seqno commands, and every one of them is about Vulkan work this
-            // renderer does not do. Refusing them would stop a real guest before
-            // it ever built its ring, which is the one thing this renderer
-            // exists to let it do.
+            TransportCommand::WaitRingSeqno { ring, seqno } => {
+                self.wait_ring_seqno(ctx_id, ring, seqno)
+            }
+            TransportCommand::SubmitVirtqueueSeqno { ring, seqno } => {
+                self.submit_virtqueue_seqno(ctx_id, ring, seqno)
+            }
+            // Carried, counted and not executed: the reply-stream commands
+            // belong on a ring, where an executing sink serves them; on the
+            // context stream they are about Vulkan work this stream does not
+            // do. Refusing them would stop a real guest before it ever built
+            // its ring, which is the one thing this renderer exists to let it
+            // do.
             TransportCommand::SetReplyCommandStream { .. }
             | TransportCommand::SeekReplyCommandStream { .. }
-            | TransportCommand::ExecuteCommandStreams { .. }
-            | TransportCommand::SubmitVirtqueueSeqno { .. }
-            | TransportCommand::WaitRingSeqno { .. } => {
+            | TransportCommand::ExecuteCommandStreams { .. } => {
                 self.observed = self.observed.saturating_add(1);
                 Ok(())
             }
@@ -969,13 +3143,20 @@ impl<S: RingSink> VenusRenderer<S> {
     }
 
     /// `vkCreateRingMESA`: judge the proposed layout against the pages it
-    /// claims to live in, adopt it, and publish `IDLE` so the guest knows to
-    /// ring the doorbell.
+    /// claims to live in, adopt it, and start its service — a worker thread
+    /// that owns the pump and the ring's sink, and, when the guest chained a
+    /// `VkRingMonitorInfoMESA`, a place on the context's `ALIVE` monitor.
+    ///
+    /// The ring starts **polling**, not idle, as virglrenderer's ring thread
+    /// does: work the guest queued before we looked, or writes right after
+    /// creating the ring, is picked up without a doorbell, and `IDLE` goes up
+    /// only once `idleTimeout` has passed with nothing to do.
     fn create_ring(
         &mut self,
         ctx_id: u32,
         ring: u64,
         info: RingCreateInfo,
+        monitor_period_us: Option<u32>,
     ) -> Result<(), VenusError> {
         let context = self
             .contexts
@@ -990,6 +3171,12 @@ impl<S: RingSink> VenusRenderer<S> {
         if self.ring_count() >= MAX_RINGS {
             return Err(VenusError::TooManyRings);
         }
+        let monitor = match monitor_period_us {
+            None => None,
+            Some(us) => {
+                Some(monitor_period(us).ok_or(VenusError::ZeroMonitorPeriod { ctx_id, ring })?)
+            }
+        };
 
         let resource_id = info.resource_id;
         let blob = self
@@ -1006,7 +3193,10 @@ impl<S: RingSink> VenusRenderer<S> {
                 ctx_id,
             });
         }
-        let pages = Arc::clone(&blob.pages);
+        let pages = match (blob.kind, blob.pages()) {
+            (BlobKind::Shm, Some(pages)) => Arc::clone(pages),
+            _ => return Err(VenusError::RingOnDeviceMemory(resource_id)),
+        };
 
         // Two judgements, and they are not the same one twice: `RingLayout`
         // proves the five regions fit the `resource_size` it is *told*, and
@@ -1014,127 +3204,167 @@ impl<S: RingSink> VenusRenderer<S> {
         // pump can index anything. Handing the first the pages' own length is
         // what makes the second a formality rather than the only real check.
         let layout = RingLayout::new(info, pages.resource_len())?;
-        let mut pump = pages.adopt(layout)?;
+        let pump = pages.adopt(layout)?;
 
-        // Publish IDLE now, before the guest has written a byte. A guest that
-        // finds the host not-idle assumes it is being polled and rings no
-        // doorbell — and nothing here polls.
-        //
-        // A guest that had already published an impossible `tail` fails here,
-        // and the ring is never recorded. That is not a way to retry into a
-        // fresh pump either: the pass marked the ring fatal in the bytes
-        // themselves, so a second `vkCreateRingMESA` over the same pages is
-        // refused for control words that are not zeroed.
-        Self::drain(ring, &mut pump, &pages, &mut self.sink)?;
+        let virtqueue_seqno = Arc::new(VirtqueueSeqno::default());
+        let env = RingEnv {
+            ctx_id,
+            ring,
+            blobs: self.directory.for_context(ctx_id),
+            virtqueue_seqno: Arc::clone(&virtqueue_seqno),
+        };
+        let sink = self
+            .sinks
+            .sink_for_ring(env)
+            .map_err(|error| VenusError::SinkUnavailable {
+                ctx_id,
+                ring,
+                reason: error.to_string(),
+            })?;
+
+        let quiesce = Arc::clone(&self.quiesce);
+        let live = self.live.clone();
+        // The context was live at the top of this function and nothing between
+        // here and there can have removed it; `ok_or` rather than an `if let`
+        // so that a future rearrangement is a refusal instead of a ring the
+        // guest believes in and we do not hold.
+        let context = self
+            .contexts
+            .get_mut(&ctx_id)
+            .ok_or(VenusError::UnknownContext(ctx_id))?;
+        if let (Some(period), None) = (monitor, context.monitor.as_ref()) {
+            let started = RingMonitor::spawn(
+                format!("venus-mon-{ctx_id}"),
+                period,
+                Arc::clone(&quiesce),
+                &live,
+            )
+            .map_err(|error| VenusError::ThreadSpawn {
+                what: "ring monitor",
+                reason: error.to_string(),
+            })?;
+            context.monitor = Some(started);
+        }
+
+        let worker = RingWorker::spawn(
+            format!("venus-ring-{ctx_id}"),
+            RingService::new(pump, sink, Duration::ZERO),
+            Arc::clone(&pages),
+            quiesce,
+            &live,
+        )
+        .map_err(|error| VenusError::ThreadSpawn {
+            what: "ring worker",
+            reason: error.to_string(),
+        })?;
+
+        let monitored = match (monitor, context.monitor.as_ref()) {
+            (Some(period), Some(running)) => {
+                running.watch(ring, Arc::clone(&pages), layout.status(), period);
+                true
+            }
+            _ => false,
+        };
 
         tracing::debug!(
             ctx_id,
             ring = format_args!("{ring:#x}"),
             resource = resource_id,
-            buffer = pump.buffer_len(),
+            buffer = layout.buffer().len(),
             idle_timeout_ns = info.idle_timeout_ns,
-            "venus command ring adopted"
+            monitor_period_us,
+            "venus command ring adopted and its worker started"
         );
-        // The context was live at the top of this function and nothing between
-        // here and there can have removed it; `ok_or` rather than an `if let`
-        // so that a future rearrangement is a refusal instead of a ring the
-        // guest believes in and we do not hold.
-        self.contexts
-            .get_mut(&ctx_id)
-            .ok_or(VenusError::UnknownContext(ctx_id))?
-            .rings
-            .insert(
-                ring,
-                Ring {
-                    pages,
-                    resource_id,
-                    pump,
-                },
-            );
+        context.rings.insert(
+            ring,
+            Ring {
+                pages,
+                resource_id,
+                layout,
+                monitored,
+                virtqueue_seqno,
+                worker,
+            },
+        );
+        self.sample_usage();
         Ok(())
     }
 
-    /// `vkDestroyRingMESA`.
+    /// `vkDestroyRingMESA`: take the ring off the monitor, stop and join its
+    /// worker, and zero its words.
     ///
     /// A ring that is still healthy has its host words zeroed on the way out,
     /// so a guest that builds a new ring over the same bytes finds the
     /// power-on state [`RingPump::new`] insists on (ADR-0005's "no stale word
-    /// in shared memory"). A ring that was marked **fatal** keeps its
-    /// `STATUS_FATAL` bit: the guest is entitled to read why its ring died, and
-    /// a resource that produced an impossible `tail` is not one to hand back
-    /// looking fresh.
+    /// in shared memory"). The monitor is taken off first, synchronously, so
+    /// that `ALIVE` cannot land again after the zeroing. A ring that was marked
+    /// **fatal** keeps its `STATUS_FATAL` bit: the guest is entitled to read
+    /// why its ring died, and a resource that produced an impossible `tail` is
+    /// not one to hand back looking fresh.
     fn destroy_ring(&mut self, ctx_id: u32, ring: u64) -> Result<(), VenusError> {
         let context = self
             .contexts
             .get_mut(&ctx_id)
             .ok_or(VenusError::UnknownContext(ctx_id))?;
-        let mut dead = context
-            .rings
-            .remove(&ring)
+        let Ring { pages, worker, .. } = context
+            .take_ring(ring)
             .ok_or(VenusError::UnknownRing { ctx_id, ring })?;
-        if !dead.pump.is_fatal() {
-            dead.pump.reset(&*dead.pages);
+        match worker.stop() {
+            Some(mut pump) if !pump.is_fatal() => pump.reset(&*pages),
+            Some(_) => {}
+            // Only a panicked worker hands nothing back, and nothing in it
+            // should be able to panic. Its words are left as they are rather
+            // than zeroed by a second path that bypasses the pump.
+            None => tracing::error!(
+                ctx_id,
+                ring = format_args!("{ring:#x}"),
+                "a venus ring worker was lost; its words were not reset"
+            ),
         }
         Ok(())
     }
 
-    /// `vkNotifyRingMESA`: consume everything the guest has produced.
+    /// `vkNotifyRingMESA`: wake the ring's worker. Nothing else — the ring is
+    /// the worker's, and this runs on the device's queue worker.
+    ///
+    /// A doorbell for a ring whose worker has already stopped for good is
+    /// answered with [`VenusError::RingStopped`]: the guest has `FATAL` in its
+    /// status word already, and saying so again is more honest than pretending
+    /// the doorbell did something.
     fn doorbell(&mut self, ctx_id: u32, ring: u64) -> Result<(), VenusError> {
-        // Field-by-field so the sink and the ring table are two disjoint
-        // borrows rather than one of `self`.
-        let Self { contexts, sink, .. } = self;
-        let context = contexts
-            .get_mut(&ctx_id)
+        let context = self
+            .contexts
+            .get(&ctx_id)
             .ok_or(VenusError::UnknownContext(ctx_id))?;
         let live = context
             .rings
-            .get_mut(&ring)
+            .get(&ring)
             .ok_or(VenusError::UnknownRing { ctx_id, ring })?;
-        Self::drain(ring, &mut live.pump, &live.pages, sink)
-    }
-
-    /// Pump one ring until it has nothing more to offer, and leave
-    /// [`STATUS_IDLE`](super::pump::STATUS_IDLE) published.
-    ///
-    /// The loop ends only on [`Idle::Park`], which is the pump's own statement
-    /// that `IDLE` is up *and* a re-read of `tail` confirmed there is nothing to
-    /// do. [`Idle::WorkArrived`] means the guest produced between the last pass
-    /// and the publication — the lost-wakeup case — and `IDLE` has already been
-    /// taken back down, so the only correct answer is to go round again rather
-    /// than return with work waiting and no doorbell coming.
-    fn drain(
-        ring: u64,
-        pump: &mut RingPump,
-        pages: &RingPages,
-        sink: &mut S,
-    ) -> Result<(), VenusError> {
-        for _ in 0..MAX_DOORBELL_PASSES {
-            match pump.pump(pages, sink)? {
-                Pass::Progress { .. } => continue,
-                Pass::Idle | Pass::Stalled { .. } => match pump.enter_idle(pages) {
-                    Idle::Park => return Ok(()),
-                    Idle::WorkArrived => continue,
-                },
-                Pass::Deadlocked { offered } => {
-                    // The sink took nothing from a full ring, so nothing can
-                    // ever arrive to unstick it. The pump reports it rather
-                    // than deciding; the decision is that a guest waiting on a
-                    // `head` that cannot move should be told, not hung.
-                    pump.mark_fatal(pages);
-                    return Err(VenusError::RingDeadlocked { ring, offered });
-                }
-            }
+        if live.worker.has_ended() {
+            return Err(VenusError::RingStopped { ctx_id, ring });
         }
-        pump.mark_fatal(pages);
-        Err(VenusError::DoorbellExhausted { ring })
+        live.worker.notify();
+        Ok(())
     }
 
-    /// Drop every ring built on `resource_id`, wherever it lives.
+    /// Stop and drop every ring built on `resource_id`, wherever it lives.
     fn drop_rings_on(&mut self, resource_id: u32) {
         for context in self.contexts.values_mut() {
-            context
+            let doomed: Vec<u64> = context
                 .rings
-                .retain(|_, ring| ring.resource_id != resource_id);
+                .iter()
+                .filter(|(_, ring)| ring.resource_id == resource_id)
+                .map(|(handle, _)| *handle)
+                .collect();
+            for handle in &doomed {
+                if let Some(ring) = context.rings.get(handle) {
+                    ring.worker.signal_stop();
+                }
+            }
+            for handle in doomed {
+                // Dropping the worker joins it.
+                drop(context.take_ring(handle));
+            }
         }
     }
 
@@ -1142,14 +3372,189 @@ impl<S: RingSink> VenusRenderer<S> {
     /// pages, and every ring that was built on them.
     fn drop_blob(&mut self, resource_id: u32) {
         if let Some(blob) = self.blobs.remove(&resource_id) {
-            self.blob_bytes = self.blob_bytes.saturating_sub(blob.size);
-            self.drop_rings_on(resource_id);
+            match blob.kind {
+                BlobKind::Shm => {
+                    // Out of the sinks' reach first: after this returns no
+                    // reply can land in these pages, whichever ring was about
+                    // to write one.
+                    self.directory.remove(resource_id);
+                    self.blob_bytes = self.blob_bytes.saturating_sub(blob.size);
+                    self.shm_blobs = self.shm_blobs.saturating_sub(1);
+                    if let Some(share) = self.host_blob_use.get_mut(&blob.ctx_id) {
+                        share.0 = share.0.saturating_sub(1);
+                        share.1 = share.1.saturating_sub(blob.size);
+                        if share.0 == 0 {
+                            self.host_blob_use.remove(&blob.ctx_id);
+                        }
+                    }
+                    self.drop_rings_on(resource_id);
+                }
+                // Neither a reply window nor a ring can be one; its pages go
+                // back to the executor's memory object, or — if that was
+                // freed first — to the allocator, once the publication below
+                // has unmapped them.
+                // A handle blob's handle is closed when the last `Arc` of it
+                // goes — this one, or an import being made right now; an
+                // import already made references the allocation itself.
+                BlobKind::Memory | BlobKind::Handle => {
+                    // No new import can take the pages after this; an
+                    // import made already holds its own `Arc` of them.
+                    self.directory.remove(resource_id);
+                    self.memory_blobs = self.memory_blobs.saturating_sub(1);
+                    if let Some(held) = self.memory_blob_use.get_mut(&blob.ctx_id) {
+                        *held = held.saturating_sub(1);
+                        if *held == 0 {
+                            self.memory_blob_use.remove(&blob.ctx_id);
+                        }
+                    }
+                    // Stage S2b: the scanout device's import of it goes too.
+                    if blob.kind == BlobKind::Handle {
+                        self.sinks.forget_scanout(resource_id);
+                    }
+                }
+            }
             drop(blob);
+        }
+    }
+
+    /// `RESOURCE_CREATE_BLOB` with a `blob_id`: a blob of `VkDeviceMemory`
+    /// `blob_id` of context `ctx_id`, wrapping the pages the executor already
+    /// imported for it (`vkr_context_create_resource_from_device_memory`).
+    fn create_memory_blob(
+        &mut self,
+        ctx_id: u32,
+        args: &ResourceCreateBlob,
+        entries: &[MemEntry],
+    ) -> Result<(), VenusError> {
+        self.check_host_blob(ctx_id, args, entries)?;
+        // The context's share first, as for host blobs.
+        let held = self.memory_blob_use.get(&ctx_id).copied().unwrap_or(0);
+        if held >= MAX_MEMORY_BLOBS_PER_CONTEXT {
+            return Err(VenusError::TooManyContextMemoryBlobs {
+                ctx_id,
+                max: MAX_MEMORY_BLOBS_PER_CONTEXT,
+            });
+        }
+        if self.memory_blobs >= MAX_MEMORY_BLOBS {
+            return Err(VenusError::TooManyMemoryBlobs);
+        }
+        let backing = self
+            .sinks
+            .export_memory(ctx_id, args.blob_id, args.size)
+            .map_err(|reason| VenusError::MemoryBlob {
+                resource_id: args.resource_id,
+                blob_id: args.blob_id,
+                reason,
+            })?;
+        let kind = match backing {
+            ExportedMemory::Pages(_) => BlobKind::Memory,
+            ExportedMemory::Handle(_) => BlobKind::Handle,
+        };
+        self.memory_blobs = self.memory_blobs.saturating_add(1);
+        let held = self.memory_blob_use.entry(ctx_id).or_default();
+        *held = held.saturating_add(1);
+        // In the directory too, where another context attached to it may
+        // find it to import (stages 5c and S1) — and never as a reply window.
+        self.directory
+            .insert_memory(args.resource_id, ctx_id, backing.clone(), args.size);
+        self.blobs.insert(
+            args.resource_id,
+            RingBlob {
+                publication: None,
+                backing,
+                ctx_id,
+                blob_id: args.blob_id,
+                size: args.size,
+                kind,
+                scanout: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// `vkSubmitVirtqueueSeqnoMESA` on the context stream
+    /// (`vkr_dispatch_vkSubmitVirtqueueSeqnoMESA`): record `seqno` as the
+    /// ring's virtqueue seqno and ring its doorbell, so a worker blocked in
+    /// `vkWaitVirtqueueSeqnoMESA` looks again now rather than at the end of
+    /// its wait ([`super::service::Step::Blocked`]). This runs on the device
+    /// worker, after every virtqueue command before it — which is the whole
+    /// point of the command. An unknown ring is refused, as vkr refuses it.
+    fn submit_virtqueue_seqno(
+        &mut self,
+        ctx_id: u32,
+        ring: u64,
+        seqno: u64,
+    ) -> Result<(), VenusError> {
+        let context = self
+            .contexts
+            .get(&ctx_id)
+            .ok_or(VenusError::UnknownContext(ctx_id))?;
+        let live = context
+            .rings
+            .get(&ring)
+            .ok_or(VenusError::UnknownRing { ctx_id, ring })?;
+        live.virtqueue_seqno.submit(seqno);
+        live.worker.notify();
+        Ok(())
+    }
+
+    /// `vkWaitRingSeqnoMESA` on the context stream
+    /// (`vkr_context_wait_ring_seqno`): block until the ring's `head` has
+    /// reached `seqno` — its worker has executed every command before it.
+    ///
+    /// Mesa sends it before making a blob of memory it allocated without a
+    /// reply (`vn_device_memory_wait_alloc`), so the blob's
+    /// `RESOURCE_CREATE_BLOB`, which follows on the same virtqueue, finds the
+    /// memory the ring made. A seqno past the ring's `tail` can never be
+    /// reached and is refused at once, as vkr's ring thread refuses it; a
+    /// ring that has died, or that has not got there in
+    /// [`WAIT_RING_SEQNO_TIMEOUT`], is refused too. Seqnos compare as the
+    /// wrapping 32-bit ring positions they are (`vkr_seqno_ge`).
+    fn wait_ring_seqno(&mut self, ctx_id: u32, ring: u64, seqno: u64) -> Result<(), VenusError> {
+        let context = self
+            .contexts
+            .get(&ctx_id)
+            .ok_or(VenusError::UnknownContext(ctx_id))?;
+        let live = context
+            .rings
+            .get(&ring)
+            .ok_or(VenusError::UnknownRing { ctx_id, ring })?;
+        // The ring position is 32 bits; vkr compares the low half too.
+        let target = seqno as u32;
+        let reached = |position: u32| position.wrapping_sub(target) <= i32::MAX as u32;
+        let refuse = |why| VenusError::RingSeqno {
+            ctx_id,
+            ring,
+            seqno,
+            why,
+        };
+        if !reached(live.pages.load_guest_word(&live.layout.tail())) {
+            return Err(refuse("the ring's tail is short of it"));
+        }
+        live.worker.notify();
+        let deadline = std::time::Instant::now() + WAIT_RING_SEQNO_TIMEOUT;
+        let mut spins = 0u32;
+        loop {
+            if reached(live.pages.load_host_word(&live.layout.head())) {
+                return Ok(());
+            }
+            if live.worker.has_ended() {
+                return Err(refuse("the ring stopped first"));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(refuse("the wait timed out"));
+            }
+            spins = spins.saturating_add(1);
+            if spins < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_micros(100));
+            }
         }
     }
 }
 
-impl<S: RingSink + Send> Renderer3d for VenusRenderer<S> {
+impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
     fn capsets(&self) -> &[CapsetInfo] {
         &CAPSETS
     }
@@ -1163,14 +3568,24 @@ impl<S: RingSink + Send> Renderer3d for VenusRenderer<S> {
 
     fn ctx_create(&mut self, ctx_id: u32, capset_id: u32, name: &str) -> Result<(), CommandError> {
         self.create_context(ctx_id, capset_id)?;
+        self.sinks.context_created(ctx_id);
         tracing::debug!(ctx_id, capset_id, name, "venus context created");
+        self.log_usage("context created", ctx_id);
         Ok(())
     }
 
     fn ctx_destroy(&mut self, ctx_id: u32) {
-        // Dropping the context drops its rings; the pages behind them belong to
-        // the blobs and stay until those are destroyed or the device resets.
-        self.contexts.remove(&ctx_id);
+        // Dropping the context stops and joins its ring workers and its
+        // monitor, then drops its rings; the pages behind them belong to the
+        // blobs and stay until those are destroyed or the device resets.
+        if self.contexts.remove(&ctx_id).is_some() {
+            // Only now, with every ring of it joined, may the factory tear
+            // down what its sinks shared (host Vulkan objects).
+            self.sinks.context_destroyed(ctx_id);
+            // A context id the guest reuses starts with no attachments.
+            self.directory.forget_context(ctx_id);
+            self.log_usage("context destroyed", ctx_id);
+        }
     }
 
     fn resource_create_3d(&mut self, _args: &ResourceCreate3d) -> Result<(), CommandError> {
@@ -1182,6 +3597,14 @@ impl<S: RingSink + Send> Renderer3d for VenusRenderer<S> {
     fn ctx_attach_resource(&mut self, _ctx_id: u32, _resource_id: u32) {}
 
     fn ctx_detach_resource(&mut self, _ctx_id: u32, _resource_id: u32) {}
+
+    /// A blob attached to or detached from a venus context (stage 5c): for a
+    /// blob of `VkDeviceMemory`, whether that context may import it.
+    fn ctx_attach_blob(&mut self, ctx_id: u32, resource_id: u32, attach: bool) {
+        if self.contexts.contains_key(&ctx_id) || !attach {
+            self.directory.attach(resource_id, ctx_id, attach);
+        }
+    }
 
     fn attach_backing(
         &mut self,
@@ -1203,27 +3626,181 @@ impl<S: RingSink + Send> Renderer3d for VenusRenderer<S> {
     }
 
     fn submit(&mut self, ctx_id: u32, stream: &[u8]) -> Result<(), CommandError> {
+        self.tick_usage();
         self.dispatch(ctx_id, stream)?;
         Ok(())
     }
 
+    /// Only a blob accepted for scanout ([`Self::scanout_blob`]) has pixels
+    /// to read (stage S2b); there is no other resource here.
     fn read_rect_bgra(
         &mut self,
         resource_id: u32,
-        _rect: Rect,
-        _out: &mut Vec<u8>,
+        rect: Rect,
+        out: &mut Vec<u8>,
     ) -> Result<(), CommandError> {
-        Err(CommandError::UnknownResource(resource_id))
+        self.tick_usage();
+        self.read_scanout(resource_id, rect, out).map_err(|error| {
+            tracing::debug!(resource = resource_id, %error, "venus scanout readback failed");
+            error.into()
+        })
+    }
+
+    /// Stage S2b: a page blob is accepted when the image fits its pages; a
+    /// handle blob when a canonical image recorded on it is exactly the
+    /// image the spec describes ([`scanout_mismatch`]) and the factory could
+    /// prepare the renderer's own read of it. A refusal keeps what was
+    /// accepted before.
+    fn scanout_blob(
+        &mut self,
+        resource_id: u32,
+        spec: &ScanoutBlobSpec,
+    ) -> Result<(), CommandError> {
+        self.accept_scanout(resource_id, spec).map_err(|error| {
+            tracing::warn!(resource = resource_id, ?spec, %error, "venus scanout refused");
+            error.into()
+        })
     }
 
     fn reset(&mut self) {
-        // Order is not load-bearing for safety — every `Publication` unmaps
-        // before its pages are freed, whatever drops it — but it is for
-        // clarity: rings first, then the pages they pointed at.
+        // Every thread first — signalled all at once so the joins overlap,
+        // then joined as the contexts drop — so that nothing is writing a ring
+        // by the time the pages go. Order is not load-bearing for memory
+        // safety — every thread holds its own `Arc` of its pages, and every
+        // `Publication` unmaps before its pages are freed — but it is for
+        // "reset means stopped": a worker still running after `reset` returns
+        // would be a thread of the old boot writing the new one's memory.
+        for context in self.contexts.values() {
+            context.signal_stop();
+        }
         self.contexts.clear();
+        // Every thread is joined: the factory's shared state can go — and
+        // with it every host queue's fence thread, joined by the factory,
+        // whose last retirements belong to the boot that ends here: the
+        // device drops its held responses on reset, and a stale retirement
+        // must not complete a new boot's fence of the same id.
+        self.sinks.reset();
+        self.retirer.clear();
+        self.directory.clear();
         self.blobs.clear();
         self.blob_bytes = 0;
+        self.shm_blobs = 0;
+        self.host_blob_use.clear();
+        self.memory_blobs = 0;
+        self.memory_blob_use.clear();
         self.observed = 0;
+        self.peak = VenusUsage::default();
+        self.peak_unlogged = false;
+        self.sampled = None;
+        self.logged = (VenusUsage::default(), None);
+    }
+
+    fn snapshot_refusal(&self) -> Option<String> {
+        let pending = self.sinks.pending_ring_fences() + self.retirer.len();
+        if pending > 0 {
+            // A held response is a descriptor chain the guest is waiting on
+            // for GPU work this process owns; a restored VM would wait for a
+            // host fence nothing will ever signal.
+            return Some(format!(
+                "{pending} virtio-gpu fences on Venus queue timelines are waiting for host GPU \
+                 work, which a snapshot cannot carry"
+            ));
+        }
+        let handles = self.handle_blob_count();
+        if handles > 0 {
+            // Stage S1: a handle blob can outlive every Vulkan object — the
+            // exporter's memory freed, its context gone — and it is still a
+            // dma-buf the guest holds, of device-local memory only the host
+            // driver can read.
+            return Some(format!(
+                "{handles} Venus blobs are exported device-local GPU memory the guest holds as \
+                 dma-bufs, which a snapshot cannot carry"
+            ));
+        }
+        self.sinks.snapshot_refusal()
+    }
+
+    fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
+        self.retirer.set_waker(waker);
+    }
+
+    /// Stage 5b.3. A fence without a `ring_idx` is on the device's timeline
+    /// and, as before, already signalled: the context commands before it
+    /// have been executed by the time the device asks. `ring_idx` 0 is the
+    /// context's CPU timeline, retired the same way for the same reason
+    /// (`vkr_context_submit_fence`). Every other `ring_idx` goes to the
+    /// factory, which puts a host fence on the queue bound to it, and the
+    /// fence is pending until that queue's work before it is done — **with or
+    /// without a waker**. The waker only decides how soon the device hears of
+    /// the retirement: at once, or the next time it polls. Answering a fence
+    /// signalled because no waker was installed would tell the guest its GPU
+    /// work is finished before it has run, which is what every WHP guest was
+    /// told until the machine layer gave that host a waker (2026-09-24).
+    fn create_fence_on(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: Option<u8>,
+        fence_id: u32,
+    ) -> Result<(FenceTimeline, FenceOutcome), CommandError> {
+        let Some(ring_idx) = ring_idx else {
+            return Ok((FenceTimeline::Device, FenceOutcome::Signalled));
+        };
+        let timeline = FenceTimeline::Ring { ctx_id, ring_idx };
+        if ring_idx == 0 {
+            return Ok((timeline, FenceOutcome::Signalled));
+        }
+        if !self.contexts.contains_key(&ctx_id) {
+            return Err(VenusError::UnknownContext(ctx_id).into());
+        }
+        let fence = RingFence {
+            ctx_id,
+            ring_idx,
+            fence_id,
+        };
+        match self.sinks.create_ring_fence(fence, &self.retirer) {
+            Ok(outcome) => {
+                match outcome {
+                    FenceOutcome::Pending => {
+                        self.ring_fences.deferred = self.ring_fences.deferred.saturating_add(1);
+                    }
+                    FenceOutcome::Signalled => {
+                        self.ring_fences.signalled_unrunnable =
+                            self.ring_fences.signalled_unrunnable.saturating_add(1);
+                        tracing::debug!(
+                            ctx_id,
+                            ring_idx,
+                            fence_id,
+                            "a venus queue fence on a fatal context or a lost device is \
+                             signalled at once: its work will never run"
+                        );
+                    }
+                }
+                Ok((timeline, outcome))
+            }
+            Err(why) => Err(VenusError::RingFence {
+                ctx_id,
+                ring_idx,
+                why,
+            }
+            .into()),
+        }
+    }
+
+    fn poll_fence_timelines(&mut self, _still_pending: usize) -> Vec<(FenceTimeline, u32)> {
+        self.tick_usage();
+        self.retirer
+            .take()
+            .into_iter()
+            .map(|f| {
+                (
+                    FenceTimeline::Ring {
+                        ctx_id: f.ctx_id,
+                        ring_idx: f.ring_idx,
+                    },
+                    f.fence_id,
+                )
+            })
+            .collect()
     }
 
     fn blob_support(&self) -> BlobSupport {
@@ -1232,7 +3809,7 @@ impl<S: RingSink + Send> Renderer3d for VenusRenderer<S> {
             // itself. Saying yes costs nothing and lets a guest use them.
             guest: true,
             host3d: true,
-            host_visible_bytes: Some(VENUS_HOST_VISIBLE_BYTES),
+            host_visible_bytes: Some(self.host_visible_bytes),
             // The bytes a guest reads through this window are *our* pages, put
             // there one blob at a time by `RingPages::publish`. That is the
             // whole mechanism a command ring needs, and it is exclusive with a
@@ -1248,14 +3825,37 @@ impl<S: RingSink + Send> Renderer3d for VenusRenderer<S> {
         _mem: &Arc<GuestMem>,
         entries: &[MemEntry],
     ) -> Result<(), CommandError> {
-        self.create_host_blob(ctx_id, args, entries)?;
+        // `blob_id` 0 is plain shared memory (vkr: `!blob_id && flags ==
+        // MAPPABLE`); anything else names a `VkDeviceMemory`.
+        let created = if args.blob_id == 0 {
+            self.create_host_blob(ctx_id, args, entries)
+        } else {
+            self.create_memory_blob(ctx_id, args, entries)
+        };
+        if let Err(error) = created {
+            // The device logs the refusal too, but only as the virtio-gpu
+            // response code it becomes; which cap it was is said here.
+            tracing::debug!(
+                ctx_id,
+                resource = args.resource_id,
+                blob_id = args.blob_id,
+                size = args.size,
+                host_blobs = self.shm_blobs,
+                host_blob_bytes = self.blob_bytes,
+                memory_blobs = self.memory_blobs,
+                %error,
+                "venus blob refused"
+            );
+            return Err(error.into());
+        }
         tracing::debug!(
             ctx_id,
             resource = args.resource_id,
             blob_id = args.blob_id,
             size = args.size,
-            "venus host blob allocated"
+            "venus host blob created"
         );
+        self.sample_usage();
         Ok(())
     }
 
@@ -1269,7 +3869,27 @@ impl<S: RingSink + Send> Renderer3d for VenusRenderer<S> {
         offset: u64,
         size: u64,
     ) -> Result<BlobMapping, CommandError> {
-        Ok(self.map_host_blob(resource_id, offset, size)?)
+        let mapping = self.map_host_blob(resource_id, offset, size);
+        match &mapping {
+            Ok(_) => {
+                self.sample_usage();
+            }
+            Err(error) => {
+                // As for a refused create: the device logs only the response
+                // code, and the guest learns of it as an `mmap` failure.
+                let usage = self.usage();
+                tracing::debug!(
+                    resource = resource_id,
+                    offset = format_args!("{offset:#x}"),
+                    size,
+                    window_ranges = usage.window_ranges,
+                    window_bytes = usage.window_bytes,
+                    %error,
+                    "venus blob map refused"
+                );
+            }
+        }
+        Ok(mapping?)
     }
 
     fn unmap_blob(&mut self, resource_id: u32, offset: u64) {
@@ -1290,6 +3910,13 @@ impl<S: RingSink + Send> Renderer3d for VenusRenderer<S> {
             ),
             None => {}
         }
+    }
+
+    fn set_quiesce(&mut self, quiesce: Arc<Quiesce>) {
+        // Rings already running keep the gate they were started with; the
+        // device hands this over at activation, before a guest can have
+        // created any.
+        self.quiesce = quiesce;
     }
 
     fn set_host_visible(&mut self, backing: Arc<dyn virtio_core::ShmBacking>) {
@@ -1313,20 +3940,27 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+    use std::sync::Condvar;
+    use std::time::Instant;
 
     use virtio_core::{ShmAccessError, ShmMapError};
 
     use crate::protocol::{BLOB_FLAG_USE_MAPPABLE, BLOB_MEM_HOST3D_GUEST};
     use crate::renderer::Gpu3d;
-    use crate::venus::pump::{STATUS_FATAL, STATUS_IDLE};
+    use crate::venus::pump::{
+        PumpError, MAX_IDLE_TIMEOUT, STATUS_ALIVE, STATUS_FATAL, STATUS_IDLE,
+    };
+    use crate::venus::service::MIN_MONITOR_PERIOD;
     use crate::venus::shmem::MAX_RESOURCE_BYTES;
-    use crate::venus::transport::STYPE_RING_CREATE_INFO_MESA;
+    use crate::venus::transport::{STYPE_RING_CREATE_INFO_MESA, STYPE_RING_MONITOR_INFO_MESA};
     use crate::venus::wire::{CommandHeader, Encoder, WireError};
 
     /// The blob every fixture puts its ring in: one 4 KiB page.
     const RESOURCE: u64 = 0x1000;
     /// A deliberately small command buffer, so a wrap is a few bytes away.
     const BUFFER: u64 = 64;
+    /// Where the fixture's command buffer starts inside the blob.
+    const BUFFER_OFFSET: u64 = 16;
     /// Where inside the window the guest asks for its blob.
     const WINDOW_OFFSET: u64 = 0x2_0000;
     /// The context id the fixtures use.
@@ -1335,6 +3969,26 @@ mod tests {
     const RESOURCE_ID: u32 = 9;
     /// The ring handle the fixtures mint.
     const RING: u64 = 0xdead_beef_0000_0001;
+    /// The three control words, as the fixture layout places them.
+    const HEAD: u64 = 0;
+    const TAIL: u64 = 4;
+    const STATUS: u64 = 8;
+
+    /// `vkEnumerateInstanceVersion` exactly as Mesa 26 encodes it: opcode 137,
+    /// `GENERATE_REPLY`, a present `pApiVersion` (spec §0.7).
+    const ENUMERATE_INSTANCE_VERSION: [u8; 16] =
+        [0x89, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+
+    /// Wait — generously — for `cond`, failing with `what` if it never holds.
+    /// Every real-thread test here goes through this, so a slow machine costs
+    /// time, never a flake.
+    fn eventually(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     // ---------------------------------------------------------- a fake window
 
@@ -1447,13 +4101,14 @@ mod tests {
     ///
     /// Everything below is what a guest's `vn_ring` does — aligned atomic stores
     /// to `tail`, relaxed byte stores into the command buffer, atomic loads of
-    /// `head` and `status` — performed from outside the renderer, through the
-    /// published mapping, exactly as a guest reaches them.
+    /// `head` and `status`, and the watchdog's atomic AND on `status` —
+    /// performed from outside the renderer, through the published mapping,
+    /// exactly as a guest reaches them.
     #[derive(Debug, Clone, Copy)]
     struct GuestView(u64);
 
     impl GuestView {
-        fn store_word(self, offset: u64, value: u32) {
+        fn word(self, offset: u64) -> &'static AtomicU32 {
             let at = usize::try_from(offset).expect("a fixture offset fits a usize");
             assert!(offset % 4 == 0 && offset + 4 <= RESOURCE);
             // SAFETY: `self.0` is the base of a live `RingPages` allocation of
@@ -1461,39 +4116,52 @@ mod tests {
             // holds the blob that owns it for as long as this value is used —
             // and the assertion above keeps the four bytes inside that
             // allocation and on a 4-byte boundary, which is `AtomicU32`'s
-            // alignment requirement.
-            unsafe {
-                AtomicU32::from_ptr((self.0 as *mut u8).add(at).cast::<u32>())
-                    .store(value, Ordering::SeqCst);
-            }
+            // alignment requirement. The `'static` is a test convenience: no
+            // fixture uses a view after its rig is dropped.
+            unsafe { AtomicU32::from_ptr((self.0 as *mut u8).add(at).cast::<u32>()) }
+        }
+
+        fn store_word(self, offset: u64, value: u32) {
+            self.word(offset).store(value, Ordering::SeqCst);
         }
 
         fn load_word(self, offset: u64) -> u32 {
-            let at = usize::try_from(offset).expect("a fixture offset fits a usize");
-            assert!(offset % 4 == 0 && offset + 4 <= RESOURCE);
-            // SAFETY: as `store_word` directly above.
-            unsafe {
-                AtomicU32::from_ptr((self.0 as *mut u8).add(at).cast::<u32>())
-                    .load(Ordering::SeqCst)
-            }
+            self.word(offset).load(Ordering::SeqCst)
+        }
+
+        /// The guest's watchdog arming: `vn_ring_unset_status_bits`.
+        fn clear_status_bits(self, bits: u32) {
+            self.word(STATUS).fetch_and(!bits, Ordering::SeqCst);
         }
 
         /// Write command bytes at a free-running ring offset, masked and
         /// wrapping the end of the buffer the way the guest's producer does.
-        fn produce(self, buffer_offset: u64, buffer_size: u64, at: u64, bytes: &[u8]) {
+        fn produce(self, at: u64, bytes: &[u8]) {
             for (i, byte) in bytes.iter().enumerate() {
-                let position = (at + i as u64) % buffer_size;
-                let index = buffer_offset + position;
+                let position = (at + i as u64) % BUFFER;
+                let index = BUFFER_OFFSET + position;
                 assert!(index < RESOURCE);
                 let index = usize::try_from(index).expect("a fixture offset fits a usize");
-                // SAFETY: as `store_word`; the assertion keeps the byte inside
-                // the live allocation, and `AtomicU8` needs no alignment beyond
-                // a byte.
+                // SAFETY: as `word`; the assertion keeps the byte inside the
+                // live allocation, and `AtomicU8` needs no alignment beyond a
+                // byte.
                 unsafe {
                     AtomicU8::from_ptr((self.0 as *mut u8).add(index))
                         .store(*byte, Ordering::Relaxed);
                 }
             }
+        }
+
+        /// One Mesa ring submission: write at the current `tail`, then store
+        /// the new `tail`. Answers whether the guest would now ring the
+        /// doorbell — whether it saw `IDLE` (ignoring Mesa's rate limit, which
+        /// the tests that care about it model themselves).
+        fn submit(self, bytes: &[u8]) -> bool {
+            let tail = self.load_word(TAIL);
+            self.produce(u64::from(tail), bytes);
+            let len = u32::try_from(bytes.len()).expect("a fixture batch fits a u32");
+            self.store_word(TAIL, tail.wrapping_add(len));
+            self.load_word(STATUS) & STATUS_IDLE != 0
         }
     }
 
@@ -1505,13 +4173,15 @@ mod tests {
             resource_id: RESOURCE_ID,
             offset: 0,
             size: RESOURCE,
+            // One microsecond: the worker parks almost at once, so a test can
+            // wait for IDLE rather than for a timeout.
             idle_timeout_ns: 1_000,
-            head_offset: 0,
-            tail_offset: 4,
-            status_offset: 8,
-            buffer_offset: 16,
+            head_offset: HEAD,
+            tail_offset: TAIL,
+            status_offset: STATUS,
+            buffer_offset: BUFFER_OFFSET,
             buffer_size: BUFFER,
-            extra_offset: 16 + BUFFER,
+            extra_offset: BUFFER_OFFSET + BUFFER,
             extra_size: 4,
         }
     }
@@ -1528,8 +4198,13 @@ mod tests {
     }
 
     /// `vkCreateRingMESA` on the wire: the handle, a present pointer, the
-    /// `sType`, an empty pNext chain, then the body in wire order.
-    fn create_ring_stream(ring: u64, info: RingCreateInfo) -> Vec<u8> {
+    /// `sType`, the pNext chain — empty, or one `VkRingMonitorInfoMESA` — then
+    /// the body in wire order.
+    fn create_ring_stream_with(
+        ring: u64,
+        info: RingCreateInfo,
+        monitor_us: Option<u32>,
+    ) -> Vec<u8> {
         let mut enc = Encoder::new();
         let put = |result: Result<(), WireError>| result.expect("the fixture encodes");
         put(enc.command_header(CommandHeader {
@@ -1539,7 +4214,16 @@ mod tests {
         put(enc.handle(ring));
         put(enc.simple_pointer(true));
         put(enc.i32(STYPE_RING_CREATE_INFO_MESA));
-        put(enc.simple_pointer(false));
+        match monitor_us {
+            None => put(enc.simple_pointer(false)),
+            Some(period) => {
+                // One link: marker, sType, its own (empty) chain, its body.
+                put(enc.simple_pointer(true));
+                put(enc.i32(STYPE_RING_MONITOR_INFO_MESA));
+                put(enc.simple_pointer(false));
+                put(enc.u32(period));
+            }
+        }
         put(enc.flags(info.flags));
         put(enc.u32(info.resource_id));
         for value in [
@@ -1557,6 +4241,10 @@ mod tests {
             put(enc.u64(value));
         }
         enc.finish().expect("the fixture encodes")
+    }
+
+    fn create_ring_stream(ring: u64, info: RingCreateInfo) -> Vec<u8> {
+        create_ring_stream_with(ring, info, None)
     }
 
     fn notify_stream(ring: u64) -> Vec<u8> {
@@ -1583,19 +4271,85 @@ mod tests {
         enc.finish().expect("encode")
     }
 
+    /// `vkSetReplyCommandStreamMESA` as a guest writes it into a ring: 36
+    /// bytes (spec §2.1).
+    fn set_reply(resource_id: u32, offset: u64, size: u64) -> Vec<u8> {
+        let mut enc = Encoder::new();
+        enc.command_header(CommandHeader {
+            opcode: Opcode::SetReplyCommandStream.as_u32(),
+            flags: 0,
+        })
+        .expect("encode");
+        enc.simple_pointer(true).expect("encode");
+        enc.u32(resource_id).expect("encode");
+        enc.size(offset).expect("encode");
+        enc.size(size).expect("encode");
+        let bytes = enc.finish().expect("encode");
+        assert_eq!(bytes.len(), 36);
+        bytes
+    }
+
+    // ---------------------------------------------------------------- the sinks
+
+    /// A sink that takes every byte it is offered and keeps them — the
+    /// transport tests' stand-in for a renderer that could answer anything, so
+    /// they can use arbitrary bytes rather than real Vulkan commands.
+    #[derive(Debug, Clone, Default)]
+    struct Tap(Arc<Mutex<Vec<u8>>>);
+
+    impl Tap {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().expect("uncontended").clone()
+        }
+
+        fn len(&self) -> usize {
+            self.bytes().len()
+        }
+
+        fn factory(&self) -> impl SinkFactory<Sink = Self> {
+            let tap = self.clone();
+            move |_ctx_id: u32, _ring: u64| Ok(tap.clone())
+        }
+    }
+
+    impl RingSink for Tap {
+        fn consume(&mut self, batch: Batch<'_>) -> Consumed {
+            self.0
+                .lock()
+                .expect("uncontended")
+                .extend_from_slice(batch.bytes());
+            batch.all()
+        }
+    }
+
+    /// A writer the test can read back while the sink that owns a clone of it
+    /// lives on a ring worker.
+    #[derive(Debug, Clone, Default)]
+    struct SharedVec(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedVec {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("uncontended").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     // ------------------------------------------------------------- the fixture
 
     /// A renderer with a window, a venus context and a mapped ring blob —
     /// everything a guest does before its first `vkCreateRingMESA`.
-    struct Rig<S> {
-        renderer: VenusRenderer<S>,
+    struct Rig<F> {
+        renderer: VenusRenderer<F>,
         window: Arc<Window>,
         mem: Arc<GuestMem>,
     }
 
-    impl<S: RingSink + Send> Rig<S> {
-        fn new(sink: S) -> Self {
-            let mut renderer = VenusRenderer::new(sink);
+    impl<F: SinkFactory> Rig<F> {
+        fn new(sinks: F) -> Self {
+            let mut renderer = VenusRenderer::new(sinks);
             let window = Window::host_mapped();
             let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
 
@@ -1626,12 +4380,24 @@ mod tests {
         }
 
         fn produce(&self, at: u64, bytes: &[u8]) {
-            self.guest().produce(16, BUFFER, at, bytes);
+            self.guest().produce(at, bytes);
+        }
+
+        fn head(&self) -> u32 {
+            self.guest().load_word(HEAD)
+        }
+
+        fn status(&self) -> u32 {
+            self.guest().load_word(STATUS)
         }
 
         fn create_ring(&mut self) {
+            self.create_ring_with(ring_info(), None);
+        }
+
+        fn create_ring_with(&mut self, info: RingCreateInfo, monitor_us: Option<u32>) {
             self.renderer
-                .submit(CTX, &create_ring_stream(RING, ring_info()))
+                .submit(CTX, &create_ring_stream_with(RING, info, monitor_us))
                 .expect("the fixture layout fits these pages");
         }
 
@@ -1640,20 +4406,38 @@ mod tests {
                 .submit(CTX, &notify_stream(RING))
                 .expect("the doorbell");
         }
+
+        fn wait_head(&self, head: u32) {
+            eventually(&format!("head {head}"), || self.head() == head);
+        }
+
+        fn wait_parked(&self) {
+            eventually("the ring to publish IDLE", || {
+                self.status() & STATUS_IDLE != 0
+            });
+        }
+
+        fn wait_fatal(&self) {
+            eventually("the ring to publish FATAL", || {
+                self.status() & STATUS_FATAL != 0
+            });
+            eventually("the worker to end", || {
+                self.renderer.ring_stopped(CTX, RING) == Some(true)
+            });
+        }
     }
 
-    /// The common case: a rig whose sink is a [`CaptureSink`] the test keeps a
-    /// handle to.
-    fn capture_rig() -> (Rig<CaptureSink>, CaptureSink) {
-        let capture = CaptureSink::new();
-        (Rig::new(capture.clone()), capture)
+    /// The common case: a rig whose rings all feed one [`Tap`] the test keeps.
+    fn tap_rig() -> (Rig<impl SinkFactory<Sink = Tap>>, Tap) {
+        let tap = Tap::default();
+        (Rig::new(tap.factory()), tap)
     }
 
     // -------------------------------------------------------- what we advertise
 
     #[test]
     fn the_only_capset_is_venus_and_it_is_the_one_mesa_reads() {
-        let mut renderer = VenusRenderer::new(CaptureSink::new());
+        let mut renderer = VenusRenderer::new(CaptureSink::new().factory());
         assert_eq!(renderer.capsets().len(), 1);
         let info = renderer.capsets()[0];
         assert_eq!(info.id, crate::CAPSET_VENUS);
@@ -1687,7 +4471,7 @@ mod tests {
 
         // And the validation front in front of it agrees: a venus context is a
         // real context type here, a virgl one is not.
-        let mut gpu = Gpu3d::new(Box::new(VenusRenderer::new(CaptureSink::new())));
+        let mut gpu = Gpu3d::new(Box::new(VenusRenderer::new(CaptureSink::new().factory())));
         assert!(gpu.serves_venus());
         assert!(gpu.has_context_types());
         assert_eq!(gpu.num_capsets(), 1);
@@ -1707,7 +4491,7 @@ mod tests {
 
     #[test]
     fn the_blob_support_is_a_host_mapped_window_because_a_ring_needs_one() {
-        let renderer = VenusRenderer::new(CaptureSink::new());
+        let renderer = VenusRenderer::new(CaptureSink::new().factory());
         let support = renderer.blob_support();
         assert!(support.any());
         assert!(support.host3d);
@@ -1716,11 +4500,30 @@ mod tests {
         assert!(support.accepts(BLOB_MEM_HOST3D));
     }
 
+    /// The window is sized for what the renderer lets a guest map at once:
+    /// every host blob and every page of host-visible memory together fit in
+    /// the default window, so the window is never the cap that bites first
+    /// (it was, at 256 MiB and then at 1 GiB, on the GPU-composited desktop).
+    /// A profile may ask for another size (`[display] host_visible_mib`).
+    #[test]
+    fn the_default_window_holds_everything_the_budgets_admit_and_a_profile_may_resize_it() {
+        const {
+            assert!(
+                MAX_RING_BLOB_BYTES + super::super::executor::MAX_HOST_VISIBLE_BYTES
+                    <= VENUS_HOST_VISIBLE_BYTES
+            )
+        };
+        const { assert!(VENUS_HOST_VISIBLE_BYTES.is_power_of_two(), "a BAR is") };
+        let renderer =
+            VenusRenderer::new(CaptureSink::new().factory()).with_host_visible_bytes(256 << 20);
+        assert_eq!(renderer.blob_support().host_visible_bytes, Some(256 << 20));
+    }
+
     // ----------------------------------------------------------- the whole flow
 
     #[test]
     fn a_guest_builds_a_ring_and_every_byte_it_writes_reaches_the_sink() {
-        let (mut rig, capture) = capture_rig();
+        let (mut rig, tap) = tap_rig();
 
         // The pages really went into the window: whole, and at the offset the
         // guest named.
@@ -1733,98 +4536,147 @@ mod tests {
 
         rig.create_ring();
         assert_eq!(rig.renderer.ring_count(), 1);
+        assert_eq!(rig.renderer.live_threads(), 1, "one worker, no monitor");
 
-        // IDLE is published before the guest has written a byte. Without it the
-        // guest would never ring the doorbell, and nothing here polls.
-        assert_eq!(guest.load_word(8), STATUS_IDLE);
-        assert_eq!(guest.load_word(0), 0, "head starts at zero");
+        // Nothing to do for a whole `idleTimeout`: IDLE goes up, so the guest
+        // knows to ring the doorbell.
+        rig.wait_parked();
+        assert_eq!(guest.load_word(HEAD), 0, "head starts at zero");
 
         // Eleven bytes, then the doorbell.
-        rig.produce(0, b"hello venus");
-        guest.store_word(4, 11);
+        assert!(
+            guest.submit(b"hello venus"),
+            "a parked ring asks for a doorbell"
+        );
         rig.doorbell();
-
-        assert_eq!(capture.bytes(), b"hello venus".to_vec());
-        assert_eq!(guest.load_word(0), 11, "head follows the sink");
-        assert_eq!(guest.load_word(8), STATUS_IDLE, "still idle afterwards");
+        rig.wait_head(11);
+        assert_eq!(tap.bytes(), b"hello venus".to_vec());
+        rig.wait_parked();
         assert_eq!(rig.renderer.ring_state(CTX, RING), Some((11, STATUS_IDLE)));
 
         // A second batch, continuing from the cursor and wrapping the end of the
         // 64-byte buffer — spliced back into one run by the pump.
         let more: Vec<u8> = (0u8..60).collect();
-        rig.produce(11, &more);
-        guest.store_word(4, 71);
+        guest.submit(&more);
         rig.doorbell();
-
+        rig.wait_head(71);
         let mut want = b"hello venus".to_vec();
         want.extend_from_slice(&more);
-        assert_eq!(capture.bytes(), want);
-        assert_eq!(guest.load_word(0), 71);
+        assert_eq!(tap.bytes(), want);
 
-        // Tearing a healthy ring down zeroes the words the guest polls: a reboot
-        // that leaves a stale `head` in shared memory is ADR-0005's haunting.
+        // Tearing a healthy ring down joins its worker and zeroes the words the
+        // guest polls: a reboot that leaves a stale `head` in shared memory is
+        // ADR-0005's haunting.
         rig.renderer
             .submit(CTX, &destroy_stream(RING))
             .expect("the ring is torn down");
         assert_eq!(rig.renderer.ring_count(), 0);
-        assert_eq!(guest.load_word(0), 0);
-        assert_eq!(guest.load_word(8), 0);
+        assert_eq!(rig.renderer.live_threads(), 0, "the worker was joined");
+        assert_eq!(guest.load_word(HEAD), 0);
+        assert_eq!(guest.load_word(STATUS), 0);
     }
 
     #[test]
     fn one_doorbell_consumes_everything_that_arrived_since_the_last_one() {
-        let (mut rig, capture) = capture_rig();
+        let (mut rig, tap) = tap_rig();
         rig.create_ring();
+        rig.wait_parked();
         let guest = rig.guest();
 
         // Three separate productions, one doorbell.
         rig.produce(0, b"aaa");
         rig.produce(3, b"bbbb");
         rig.produce(7, b"cc");
-        guest.store_word(4, 9);
+        guest.store_word(TAIL, 9);
         rig.doorbell();
-        assert_eq!(capture.bytes(), b"aaabbbbcc".to_vec());
+        rig.wait_head(9);
+        assert_eq!(tap.bytes(), b"aaabbbbcc".to_vec());
 
         // A doorbell with nothing waiting is legal and consumes nothing.
+        rig.wait_parked();
         rig.doorbell();
-        assert_eq!(capture.len(), 9);
-        assert_eq!(guest.load_word(8), STATUS_IDLE);
-
-        // The capture handle is shared, so clearing it is visible at both ends.
-        capture.clear();
-        rig.produce(9, b"dd");
-        guest.store_word(4, 11);
-        rig.doorbell();
-        assert_eq!(capture.bytes(), b"dd".to_vec());
+        rig.wait_parked();
+        assert_eq!(tap.len(), 9);
     }
 
     #[test]
-    fn several_transport_commands_in_one_stream_are_all_executed() {
-        let (mut rig, capture) = capture_rig();
-
-        // The guest queued work before the host ever looked at the ring, which
-        // the protocol allows: `tail` is the guest's word.
+    fn work_queued_before_or_straight_after_ring_creation_needs_no_doorbell() {
+        // The ring starts polling, as virglrenderer's does: `tail` is the
+        // guest's word, and it may have queued work before the host looked.
+        let (mut rig, tap) = tap_rig();
         rig.produce(0, b"early");
-        rig.guest().store_word(4, 5);
+        rig.guest().store_word(TAIL, 5);
 
         let mut stream = create_ring_stream(RING, ring_info());
         stream.extend_from_slice(&notify_stream(RING));
         stream.extend_from_slice(&notify_stream(RING));
         rig.renderer.submit(CTX, &stream).expect("all three");
 
-        assert_eq!(capture.bytes(), b"early".to_vec());
+        rig.wait_head(5);
+        assert_eq!(tap.bytes(), b"early".to_vec());
         assert_eq!(rig.renderer.ring_count(), 1);
     }
 
+    /// The fix this stage exists for, with real threads: two submissions
+    /// inside one `idleTimeout`, and only the first rang the doorbell — which
+    /// is what Mesa's one-per-millisecond rate limit makes of every
+    /// reply-bearing command. The previous, synchronous renderer consumed the
+    /// first, republished IDLE and never looked at the second.
     #[test]
-    fn a_refused_command_does_not_swallow_the_doorbell_behind_it() {
+    fn two_submissions_with_one_doorbell_are_both_consumed_by_the_worker() {
+        let window = MAX_IDLE_TIMEOUT;
+        for attempt in 0..3 {
+            let (mut rig, tap) = tap_rig();
+            rig.create_ring_with(
+                RingCreateInfo {
+                    idle_timeout_ns: u64::try_from(window.as_nanos()).expect("fits"),
+                    ..ring_info()
+                },
+                None,
+            );
+            rig.wait_parked();
+            let guest = rig.guest();
+
+            // Submission one sees IDLE and rings.
+            assert!(guest.submit(&set_reply(3, 0, 20)));
+            rig.doorbell();
+            rig.wait_head(36);
+            let seen = Instant::now();
+
+            // Submission two, rate-limited: no doorbell, whatever the status.
+            guest.submit(&ENUMERATE_INSTANCE_VERSION);
+            if seen.elapsed() > window / 2 {
+                // The test thread was descheduled for half the window; the
+                // worker may legitimately have parked. Inconclusive — go again
+                // rather than flake.
+                eprintln!("attempt {attempt}: descheduled, retrying");
+                continue;
+            }
+            rig.wait_head(52);
+            let mut want = set_reply(3, 0, 20);
+            want.extend_from_slice(&ENUMERATE_INSTANCE_VERSION);
+            assert_eq!(tap.bytes(), want);
+            // And with a whole window of nothing, it parks again.
+            rig.wait_parked();
+            return;
+        }
+        panic!("three attempts in a row were descheduled for half a 100 ms window");
+    }
+
+    #[test]
+    fn a_parked_ring_waits_for_its_doorbell_and_a_refused_command_does_not_swallow_it() {
         // A guest batches its ring commands, so a content refusal must not turn
         // into a silently skipped `vkNotifyRingMESA` — which the guest would
         // experience as a hang rather than as an error.
-        let (mut rig, capture) = capture_rig();
+        let (mut rig, tap) = tap_rig();
         rig.create_ring();
+        rig.wait_parked();
+
+        // Parked means parked: a submission with no doorbell stays unread.
         rig.produce(0, b"behind it");
-        rig.guest().store_word(4, 9);
+        rig.guest().store_word(TAIL, 9);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(rig.head(), 0, "a parked ring consumed without a doorbell");
 
         // A duplicate ring handle (refused), then the doorbell (performed).
         let mut stream = create_ring_stream(RING, ring_info());
@@ -1837,12 +4689,98 @@ mod tests {
             }),
             "the command is answered with the first refusal"
         );
-        assert_eq!(capture.bytes(), b"behind it".to_vec());
+        rig.wait_head(9);
+        assert_eq!(tap.bytes(), b"behind it".to_vec());
+    }
+
+    #[test]
+    fn each_ring_gets_its_own_sink_and_they_never_interleave() {
+        // Two contexts — two guest `VkInstance`s — one ring each. The phase-4
+        // capture put both into one file; here each has its own.
+        let made: Arc<Mutex<Vec<(u32, u64, Tap)>>> = Arc::default();
+        let factory = {
+            let made = Arc::clone(&made);
+            move |ctx_id: u32, ring: u64| {
+                let tap = Tap::default();
+                made.lock()
+                    .expect("uncontended")
+                    .push((ctx_id, ring, tap.clone()));
+                Ok(tap)
+            }
+        };
+        let mut rig = Rig::new(factory);
+        rig.renderer
+            .ctx_create(2, crate::CAPSET_VENUS, "second")
+            .expect("a second context");
+        rig.renderer
+            .create_blob(2, &blob_args(21, RESOURCE), &rig.mem, &[])
+            .expect("its blob");
+        rig.renderer
+            .map_blob(21, WINDOW_OFFSET + 0x1_0000, RESOURCE)
+            .expect("published");
+        let second = GuestView(
+            rig.window
+                .mapped_at(WINDOW_OFFSET + 0x1_0000)
+                .expect("published"),
+        );
+
+        rig.create_ring();
+        rig.renderer
+            .dispatch(
+                2,
+                &create_ring_stream(
+                    RING + 1,
+                    RingCreateInfo {
+                        resource_id: 21,
+                        ..ring_info()
+                    },
+                ),
+            )
+            .expect("the second ring");
+
+        rig.guest().submit(b"first");
+        second.submit(b"SECOND");
+        rig.doorbell();
+        rig.renderer
+            .dispatch(2, &notify_stream(RING + 1))
+            .expect("its doorbell");
+        rig.wait_head(5);
+        eventually("the second ring's head", || second.load_word(HEAD) == 6);
+
+        let made = made.lock().expect("uncontended");
+        assert_eq!(made.len(), 2);
+        for (ctx_id, ring, tap) in made.iter() {
+            match (*ctx_id, *ring) {
+                (CTX, RING) => assert_eq!(tap.bytes(), b"first".to_vec()),
+                (2, r) if r == RING + 1 => assert_eq!(tap.bytes(), b"SECOND".to_vec()),
+                other => panic!("a sink was made for {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_ring_whose_sink_cannot_be_made_is_refused_by_name() {
+        let mut rig = Rig::new(|_ctx_id: u32, _ring: u64| -> io::Result<Tap> {
+            Err(io::Error::other("the capture directory is gone"))
+        });
+        assert!(matches!(
+            rig.renderer
+                .dispatch(CTX, &create_ring_stream(RING, ring_info())),
+            Err(VenusError::SinkUnavailable {
+                ctx_id: CTX,
+                ring: RING,
+                ..
+            })
+        ));
+        assert_eq!(rig.renderer.ring_count(), 0);
+        assert_eq!(rig.renderer.live_threads(), 0);
+        // Nothing was written into the ring either: it is still a fresh one.
+        assert_eq!(rig.status(), 0);
     }
 
     #[test]
     fn the_commands_this_renderer_carries_but_cannot_perform_are_answered_honestly() {
-        let (mut rig, _capture) = capture_rig();
+        let (mut rig, _tap) = tap_rig();
 
         // Carried and counted: refusing these would stop a real guest before it
         // ever built a ring.
@@ -1902,7 +4840,7 @@ mod tests {
 
     #[test]
     fn a_ring_whose_layout_does_not_fit_the_pages_is_refused_by_name() {
-        let (mut rig, _capture) = capture_rig();
+        let (mut rig, _tap) = tap_rig();
 
         // A buffer that starts inside the resource and ends past it.
         let overhanging = RingCreateInfo {
@@ -1965,7 +4903,7 @@ mod tests {
 
         // A ring whose host-owned words are not zeroed: the guest is either
         // confused about who owns them or trying to start the host mid-stream.
-        rig.guest().store_word(0, 1);
+        rig.guest().store_word(HEAD, 1);
         assert!(matches!(
             rig.renderer
                 .dispatch(CTX, &create_ring_stream(RING, ring_info())),
@@ -1973,18 +4911,30 @@ mod tests {
                 PumpError::ControlWordsNotZeroed { .. }
             )))
         ));
-        rig.guest().store_word(0, 0);
+        rig.guest().store_word(HEAD, 0);
 
-        // None of that left a ring behind, and the context is still usable — a
-        // refused layout is a content refusal, not a framing one.
+        // A monitor asking for an ALIVE period of zero, which the reference
+        // refuses too.
+        assert_eq!(
+            rig.renderer
+                .dispatch(CTX, &create_ring_stream_with(RING, ring_info(), Some(0))),
+            Err(VenusError::ZeroMonitorPeriod {
+                ctx_id: CTX,
+                ring: RING
+            })
+        );
+
+        // None of that left a ring or a thread behind, and the context is still
+        // usable — a refused layout is a content refusal, not a framing one.
         assert_eq!(rig.renderer.ring_count(), 0);
+        assert_eq!(rig.renderer.live_threads(), 0);
         rig.create_ring();
         assert_eq!(rig.renderer.ring_count(), 1);
     }
 
     #[test]
     fn a_ring_can_only_be_built_on_a_blob_its_own_context_owns() {
-        let (mut rig, _capture) = capture_rig();
+        let (mut rig, _tap) = tap_rig();
 
         // A resource that is no blob of ours at all.
         let elsewhere = RingCreateInfo {
@@ -2025,7 +4975,7 @@ mod tests {
 
     #[test]
     fn two_rings_cannot_share_one_handle_and_a_doorbell_needs_a_ring() {
-        let (mut rig, _capture) = capture_rig();
+        let (mut rig, _tap) = tap_rig();
         rig.create_ring();
 
         assert_eq!(
@@ -2037,6 +4987,7 @@ mod tests {
             })
         );
         assert_eq!(rig.renderer.ring_count(), 1, "the first ring is untouched");
+        assert_eq!(rig.renderer.live_threads(), 1, "and no second worker");
 
         // A doorbell for a handle nobody minted.
         assert_eq!(
@@ -2070,7 +5021,7 @@ mod tests {
 
     #[test]
     fn a_context_that_was_never_created_gets_nothing() {
-        let (mut rig, _capture) = capture_rig();
+        let (mut rig, _tap) = tap_rig();
         assert!(matches!(
             rig.renderer.submit(99, &notify_stream(RING)),
             Err(CommandError::UnknownContext(99))
@@ -2086,10 +5037,13 @@ mod tests {
             Err(CommandError::UnknownContext(99))
         ));
 
-        // A destroyed context takes its rings with it and stops answering.
-        rig.create_ring();
+        // A destroyed context takes its rings — and their threads — with it and
+        // stops answering.
+        rig.create_ring_with(ring_info(), Some(3_000_000));
+        assert_eq!(rig.renderer.live_threads(), 2, "a worker and a monitor");
         rig.renderer.ctx_destroy(CTX);
         assert_eq!(rig.renderer.ring_count(), 0);
+        assert_eq!(rig.renderer.live_threads(), 0, "both were joined");
         assert!(matches!(
             rig.renderer.submit(CTX, &notify_stream(RING)),
             Err(CommandError::UnknownContext(CTX))
@@ -2100,7 +5054,7 @@ mod tests {
 
     #[test]
     fn a_blob_cannot_be_mapped_twice_and_only_its_own_offset_unmaps_it() {
-        let (mut rig, _capture) = capture_rig();
+        let (mut rig, _tap) = tap_rig();
         assert!(matches!(
             rig.renderer.map_blob(RESOURCE_ID, 0x4_0000, RESOURCE),
             Err(CommandError::BlobAlreadyMapped(RESOURCE_ID))
@@ -2148,7 +5102,7 @@ mod tests {
 
     #[test]
     fn the_blob_types_and_sizes_this_renderer_will_not_back_are_refused() {
-        let (mut rig, _capture) = capture_rig();
+        let (mut rig, _tap) = tap_rig();
 
         // `HOST3D_GUEST` would carry guest pages too, and a ring cannot live in
         // them: its control words are atomics the host performs its own accesses
@@ -2191,8 +5145,9 @@ mod tests {
             );
         }
 
-        // The total-bytes budget: what stops a guest turning blob creation into
-        // host memory exhaustion.
+        // A context's byte budget: what stops one guest process turning blob
+        // creation into host memory exhaustion (the renderer-wide budget
+        // behind it: `one_context_cannot_take_the_host_blob_budget_from_the_rest`).
         let chunk = 8u64 << 20;
         let mut created = 0u32;
         loop {
@@ -2208,7 +5163,7 @@ mod tests {
         }
         assert_eq!(
             u64::from(created),
-            (MAX_RING_BLOB_BYTES - RESOURCE) / chunk,
+            (MAX_RING_BLOB_BYTES_PER_CONTEXT - RESOURCE) / chunk,
             "the budget is exact, and the fixture's own blob counts against it"
         );
 
@@ -2220,13 +5175,18 @@ mod tests {
     }
 
     #[test]
-    fn destroying_a_blob_takes_its_rings_and_its_mapping_with_it() {
-        let (mut rig, _capture) = capture_rig();
-        rig.create_ring();
+    fn destroying_a_blob_takes_its_rings_their_threads_and_its_mapping_with_it() {
+        let (mut rig, _tap) = tap_rig();
+        rig.create_ring_with(ring_info(), Some(3_000_000));
 
         rig.renderer.destroy_blob(RESOURCE_ID);
         assert_eq!(rig.renderer.blob_count(), 0);
         assert_eq!(rig.renderer.ring_count(), 0, "the ring went with its pages");
+        assert_eq!(
+            rig.renderer.live_threads(),
+            1,
+            "the worker was joined; the context's monitor stays with the context"
+        );
         assert_eq!(
             rig.window.events().last(),
             Some(&Event::Unmap {
@@ -2246,7 +5206,7 @@ mod tests {
     #[test]
     fn without_a_host_mapped_window_there_is_nowhere_to_put_the_pages() {
         let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
-        let mut renderer = VenusRenderer::new(CaptureSink::new());
+        let mut renderer = VenusRenderer::new(CaptureSink::new().factory());
         renderer
             .ctx_create(CTX, crate::CAPSET_VENUS, "venus")
             .expect("a context");
@@ -2273,7 +5233,7 @@ mod tests {
 
     #[test]
     fn a_stream_that_refuses_once_poisons_its_context_for_good() {
-        let (mut rig, _capture) = capture_rig();
+        let (mut rig, _tap) = tap_rig();
 
         // An opcode with no decoder. A Venus stream has no length field, so this
         // is not a command to step over — it is the end of the stream.
@@ -2329,7 +5289,7 @@ mod tests {
 
     #[test]
     fn a_truncated_command_is_a_refusal_rather_than_a_guess() {
-        let (mut rig, _capture) = capture_rig();
+        let (mut rig, _tap) = tap_rig();
         let mut short = create_ring_stream(RING, ring_info());
         short.truncate(short.len() - 4);
         assert!(matches!(
@@ -2345,36 +5305,35 @@ mod tests {
 
     #[test]
     fn a_ring_the_guest_lied_to_is_dead_and_stays_dead() {
-        let (mut rig, capture) = capture_rig();
+        let (mut rig, tap) = tap_rig();
         rig.create_ring();
+        rig.wait_parked();
         let guest = rig.guest();
 
         // A tail claiming more bytes than the ring can possibly hold — which is
         // also how a backwards tail arrives, in wrapping arithmetic.
-        guest.store_word(4, 0x7fff_ffff);
-        assert!(matches!(
-            rig.renderer.dispatch(CTX, &notify_stream(RING)),
-            Err(VenusError::Pump(PumpError::TailOutOfRange { .. }))
-        ));
+        guest.store_word(TAIL, 0x7fff_ffff);
+        rig.doorbell();
         // The guest is told, so its driver aborts instead of waiting on a head
-        // that will never move again.
-        assert_eq!(guest.load_word(8) & STATUS_FATAL, STATUS_FATAL);
-        assert_eq!(guest.load_word(0), 0, "nothing was consumed");
-        assert!(capture.is_empty());
+        // that will never move again, and the worker ends.
+        rig.wait_fatal();
+        assert_eq!(guest.load_word(HEAD), 0, "nothing was consumed");
+        assert_eq!(tap.len(), 0);
+        assert_eq!(rig.renderer.live_threads(), 0, "the worker ended");
 
         // And the ring stays dead: a legal tail afterwards changes nothing, and
         // nothing here rebuilds a pump over a ring that has already failed.
-        guest.store_word(4, 4);
+        guest.store_word(TAIL, 4);
         rig.produce(0, b"late");
         assert_eq!(
             rig.renderer.dispatch(CTX, &notify_stream(RING)),
-            Err(VenusError::Pump(PumpError::Fatal))
+            Err(VenusError::RingStopped {
+                ctx_id: CTX,
+                ring: RING
+            })
         );
-        assert!(capture.is_empty());
-        assert_eq!(
-            rig.renderer.ring_state(CTX, RING).map(|(cur, _)| cur),
-            Some(0)
-        );
+        assert_eq!(tap.len(), 0);
+        assert_eq!(rig.head(), 0);
 
         // Destroying a fatal ring leaves its FATAL bit standing: the guest is
         // entitled to read why its ring died, and a resource that produced an
@@ -2382,7 +5341,7 @@ mod tests {
         rig.renderer
             .dispatch(CTX, &destroy_stream(RING))
             .expect("it can still be torn down");
-        assert_eq!(guest.load_word(8) & STATUS_FATAL, STATUS_FATAL);
+        assert_eq!(guest.load_word(STATUS) & STATUS_FATAL, STATUS_FATAL);
     }
 
     #[test]
@@ -2396,35 +5355,34 @@ mod tests {
             }
         }
 
-        let mut rig = Rig::new(Refuses);
+        let mut rig = Rig::new(|_: u32, _: u64| Ok(Refuses));
         rig.create_ring();
+        rig.wait_parked();
         let guest = rig.guest();
 
         // A partial batch is a stall, not a failure: the guest may yet produce
-        // the rest, and the pump will not re-offer the same bytes meanwhile.
+        // the rest, and the ring parks on it rather than spinning.
         rig.produce(0, &[7u8; 8]);
-        guest.store_word(4, 8);
-        rig.renderer
-            .dispatch(CTX, &notify_stream(RING))
-            .expect("a stall is not a failure");
-        assert_eq!(guest.load_word(8), STATUS_IDLE);
+        guest.store_word(TAIL, 8);
+        rig.doorbell();
+        std::thread::sleep(Duration::from_millis(20));
+        rig.wait_parked();
+        assert_eq!(rig.renderer.ring_stopped(CTX, RING), Some(false));
 
         // A *full* ring the sink refuses is a dead end — the guest cannot
         // produce past `head + size`, and `head` only moves when the sink
         // consumes. Say so rather than let the guest wait forever.
-        guest.store_word(4, BUFFER as u32);
-        assert!(matches!(
-            rig.renderer.dispatch(CTX, &notify_stream(RING)),
-            Err(VenusError::RingDeadlocked { ring: RING, .. })
-        ));
-        assert_eq!(guest.load_word(8) & STATUS_FATAL, STATUS_FATAL);
+        guest.store_word(TAIL, BUFFER as u32);
+        rig.doorbell();
+        rig.wait_fatal();
+        assert_eq!(rig.head(), 0);
     }
 
     // ---------------------------------------------------------------- the caps
 
     #[test]
     fn the_context_cap_and_the_context_id_rules_hold() {
-        let mut renderer = VenusRenderer::new(CaptureSink::new());
+        let mut renderer = VenusRenderer::new(CaptureSink::new().factory());
         for id in 1..=MAX_VENUS_CONTEXTS as u32 {
             renderer
                 .ctx_create(id, crate::CAPSET_VENUS, "")
@@ -2452,47 +5410,254 @@ mod tests {
     #[test]
     fn the_blob_count_cap_holds() {
         let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
-        let mut renderer = VenusRenderer::new(CaptureSink::new());
+        let mut renderer = VenusRenderer::new(CaptureSink::new().factory());
         renderer
             .ctx_create(CTX, crate::CAPSET_VENUS, "")
             .expect("a context");
         // 64 × 4 KiB is 256 KiB, comfortably under the byte budget, so this is
         // the count cap and nothing else.
-        for id in 1..=MAX_RING_BLOBS as u32 {
+        for id in 1..=MAX_RING_BLOBS_PER_CONTEXT as u32 {
             renderer
                 .create_blob(CTX, &blob_args(id, RESOURCE), &mem, &[])
                 .expect("under the cap");
         }
-        assert_eq!(renderer.blob_count(), MAX_RING_BLOBS);
+        assert_eq!(renderer.blob_count(), MAX_RING_BLOBS_PER_CONTEXT);
         assert!(matches!(
             renderer.create_blob(CTX, &blob_args(9999, RESOURCE), &mem, &[]),
             Err(CommandError::OutOfMemory)
         ));
+        // The cap is the context's: another one still gets blobs.
+        renderer
+            .ctx_create(CTX + 1, crate::CAPSET_VENUS, "")
+            .expect("a second context");
+        renderer
+            .create_blob(CTX + 1, &blob_args(9999, RESOURCE), &mem, &[])
+            .expect("a second context's share is its own");
+    }
+
+    /// The host blobs each Mesa 26.0.8 venus instance held on the
+    /// GPU-composited GNOME desktop (Ubuntu 26.04, 2026-09-24) when glmark2's
+    /// next 8 MiB command-stream chunk was refused: rings (132 KiB, 20 KiB),
+    /// the reply and command-stream pools (1 MiB each) and 8 MiB
+    /// command-stream chunks (`vn_instance.c:328-332`).
+    const GNOME_SHELL: &[u64] = &[
+        20 << 10,
+        132 << 10,
+        1 << 20,
+        1 << 20,
+        8 << 20,
+        8 << 20,
+        8 << 20,
+    ];
+    const INITIAL_SETUP_A: &[u64] = &[132 << 10, 1 << 20, 1 << 20];
+    const INITIAL_SETUP_B: &[u64] = &[20 << 10, 132 << 10, 1 << 20, 1 << 20, 8 << 20];
+    const VKCUBE: &[u64] = &[132 << 10, 1 << 20, 8 << 20];
+    const GLMARK2: &[u64] = &[20 << 10, 132 << 10, 1 << 20, 1 << 20, 8 << 20];
+
+    /// The regression: five venus clients held 23 host blobs and 60.5 MiB,
+    /// and the renderer-wide 64 MiB budget refused glmark2's next 8 MiB
+    /// chunk. The guest kernel does not wait for `RESOURCE_CREATE_BLOB`'s
+    /// answer, so venus found out only when the map of that blob failed.
+    #[test]
+    fn a_gpu_composited_desktop_of_venus_clients_fits_in_the_host_blob_budget() {
+        let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
+        let mut renderer = VenusRenderer::new(CaptureSink::new().factory());
+        let clients = [
+            GNOME_SHELL,
+            INITIAL_SETUP_A,
+            INITIAL_SETUP_B,
+            VKCUBE,
+            GLMARK2,
+        ];
+        let mut id = 1u32;
+        for (ctx, blobs) in (1u32..).zip(clients) {
+            renderer
+                .ctx_create(ctx, crate::CAPSET_VENUS, "")
+                .expect("a context");
+            for size in blobs {
+                renderer
+                    .create_blob(ctx, &blob_args(id, *size), &mem, &[])
+                    .expect("what the desktop held");
+                id += 1;
+            }
+        }
+        // glmark2's next chunk, and one more for everyone after it.
+        for ctx in [5u32, 5, 1, 2, 3, 4] {
+            renderer
+                .create_blob(ctx, &blob_args(id, 8 << 20), &mem, &[])
+                .unwrap_or_else(|e| panic!("context {ctx}'s next 8 MiB chunk was refused: {e}"));
+            id += 1;
+        }
     }
 
     #[test]
-    fn the_ring_caps_hold_per_context_and_overall() {
+    fn one_context_cannot_take_the_host_blob_budget_from_the_rest() {
         let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
-        let mut renderer = VenusRenderer::new(CaptureSink::new());
+        let mut renderer = VenusRenderer::new(CaptureSink::new().factory());
+        // Scaled down so the renderer-wide caps are reachable without
+        // allocating a gigabyte; the rule is the same at any scale.
+        renderer.set_host_blob_limits(HostBlobLimits {
+            blobs: 6,
+            bytes: 14 * RESOURCE,
+            blobs_per_context: 4,
+            bytes_per_context: 5 * RESOURCE,
+        });
+        for ctx in 1..=4 {
+            renderer
+                .ctx_create(ctx, crate::CAPSET_VENUS, "")
+                .expect("a context");
+        }
+        let mut create = |ctx: u32, id: u32, size: u64| {
+            renderer.create_blob(ctx, &blob_args(id, size), &mem, &[])
+        };
+
+        // A context's bytes: 4 pages, then 2 more would pass its 5.
+        create(1, 1, 4 * RESOURCE).expect("under its share");
+        assert!(matches!(
+            create(1, 2, 2 * RESOURCE),
+            Err(CommandError::OutOfMemory)
+        ));
+        // A context's count: its fifth blob, however small.
+        for id in 3..=6 {
+            create(2, id, RESOURCE).expect("under its count");
+        }
+        assert!(matches!(
+            create(2, 7, RESOURCE),
+            Err(CommandError::OutOfMemory)
+        ));
+        // Neither refusal cost context 3 anything...
+        create(3, 8, 5 * RESOURCE).expect("its own share");
+        // ...but the renderer-wide count still binds: six blobs are live.
+        assert!(matches!(
+            create(4, 9, RESOURCE),
+            Err(CommandError::OutOfMemory)
+        ));
+
+        // Freeing one gives its slot back to whoever asks next, and its bytes
+        // back to its context.
+        renderer.destroy_blob(1);
+        renderer
+            .create_blob(1, &blob_args(10, 2 * RESOURCE), &mem, &[])
+            .expect("its share was refunded");
+        // 2 + 4 + 5 = 11 pages live in 6 blobs. Free one of context 2's, and
+        // 5 more pages are inside context 4's share but past the
+        // renderer-wide 14; 4 more are exactly up to it.
+        renderer.destroy_blob(3);
+        assert!(matches!(
+            renderer.create_blob(4, &blob_args(11, 5 * RESOURCE), &mem, &[]),
+            Err(CommandError::OutOfMemory)
+        ));
+        renderer
+            .create_blob(4, &blob_args(11, 4 * RESOURCE), &mem, &[])
+            .expect("exactly up to the renderer-wide byte cap");
+
+        renderer.reset();
+        renderer
+            .ctx_create(1, crate::CAPSET_VENUS, "")
+            .expect("a context after the reset");
+        renderer
+            .create_blob(1, &blob_args(12, 5 * RESOURCE), &mem, &[])
+            .expect("a reset forgets every share");
+    }
+
+    /// The rings each Mesa 26.0.8 venus client held on the GPU-composited
+    /// GNOME desktop under the capacity stress (Ubuntu 26.04, 2026-09-24):
+    /// one 128 KiB instance ring, plus one 16 KiB ring per thread that ever
+    /// created a pipeline (`vn_tls_get_ring`, `vn_common.c:295-347`), kept
+    /// until that thread exits. Fourteen clients, 24 rings.
+    const DESKTOP_RINGS: &[(&str, usize)] = &[
+        ("gnome-shell", 2),
+        ("gnome-initial-setup", 2),
+        ("gnome-initial-setup", 2),
+        ("vkcube", 1),
+        ("vkcube", 1),
+        ("vkmark", 1),
+        ("eglgears_wayland", 2),
+        ("glmark2-wayland", 2),
+        ("glmark2-wayland", 2),
+        ("glmark2-wayland", 2),
+        ("gnome-calculator", 1),
+        ("gnome-calculator", 3),
+        ("gnome-text-editor", 1),
+        ("gnome-text-editor", 2),
+    ];
+
+    /// The regression the ring caps were raised for. The measured desktop
+    /// held 24 of the 32 rings the renderer allowed, and one game-sized
+    /// Vulkan client that compiles pipelines on a worker pool (one TLS ring
+    /// per worker: DXVK sizes its pool to the vCPUs) needs more rings than
+    /// the old per-context 8 and more than the 8 left over. Both fail at the
+    /// old values (32 renderer-wide, 8 per context).
+    #[test]
+    fn a_gpu_composited_desktop_and_a_game_fit_in_the_ring_caps() {
+        let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
+        let mut renderer = VenusRenderer::new(CaptureSink::new().factory());
+        let window = Window::host_mapped();
+        renderer.set_host_visible(Arc::clone(&window) as Arc<dyn ShmBacking>);
+        // A game on a 16-vCPU guest: its instance ring and 15 workers'.
+        const GAME: (&str, usize) = ("a Vulkan game", 16);
+        let mut resource = 0u32;
+        let clients = DESKTOP_RINGS.iter().copied().chain([GAME]);
+        for (ctx_id, (who, rings)) in (1u32..).zip(clients) {
+            renderer
+                .ctx_create(ctx_id, crate::CAPSET_VENUS, who)
+                .expect("a context");
+            for slot in 0..rings as u64 {
+                resource += 1;
+                renderer
+                    .create_blob(ctx_id, &blob_args(resource, RESOURCE), &mem, &[])
+                    .expect("a ring's blob");
+                let info = RingCreateInfo {
+                    resource_id: resource,
+                    ..ring_info()
+                };
+                renderer
+                    .dispatch(ctx_id, &create_ring_stream(slot, info))
+                    .unwrap_or_else(|e| panic!("{who}'s ring {slot} was refused: {e}"));
+            }
+        }
+        let measured: usize = DESKTOP_RINGS.iter().map(|(_, rings)| rings).sum();
+        assert_eq!(measured, 24);
+        assert_eq!(renderer.ring_count(), measured + GAME.1);
+        assert!(
+            renderer.ring_count() > 32 && GAME.1 > 8,
+            "past both old caps"
+        );
+        let usage = renderer.usage();
+        assert_eq!(usage.max_context_rings, GAME.1);
+        assert_eq!(usage.contexts, DESKTOP_RINGS.len() + 1);
+        renderer.reset();
+        assert_eq!(renderer.live_threads(), 0);
+    }
+
+    #[test]
+    fn the_ring_caps_hold_per_context_and_overall_and_bound_the_threads() {
+        let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
+        let mut renderer = VenusRenderer::new(CaptureSink::new().factory());
         let window = Window::host_mapped();
         renderer.set_host_visible(Arc::clone(&window) as Arc<dyn ShmBacking>);
 
         // One blob per ring: two rings in one resource would have to overlap,
         // and the layout fixture is deliberately the same shape every time.
-        let mut resource = 0u32;
-        let mut blob_for = |renderer: &mut VenusRenderer<CaptureSink>, ctx: u32| {
-            resource += 1;
+        fn blob_for<F: SinkFactory>(
+            renderer: &mut VenusRenderer<F>,
+            mem: &Arc<GuestMem>,
+            resource: &mut u32,
+            ctx: u32,
+        ) -> u32 {
+            *resource += 1;
             renderer
-                .create_blob(ctx, &blob_args(resource, RESOURCE), &mem, &[])
+                .create_blob(ctx, &blob_args(*resource, RESOURCE), mem, &[])
                 .expect("a blob");
-            resource
-        };
+            *resource
+        }
+        let mut resource = 0u32;
 
         renderer
             .ctx_create(CTX, crate::CAPSET_VENUS, "")
             .expect("a context");
         for slot in 0..MAX_RINGS_PER_CONTEXT as u64 {
-            let resource_id = blob_for(&mut renderer, CTX);
+            let resource_id = blob_for(&mut renderer, &mem, &mut resource, CTX);
             let info = RingCreateInfo {
                 resource_id,
                 ..ring_info()
@@ -2501,7 +5666,7 @@ mod tests {
                 .dispatch(CTX, &create_ring_stream(slot, info))
                 .expect("under the per-context cap");
         }
-        let spare = blob_for(&mut renderer, CTX);
+        let spare = blob_for(&mut renderer, &mem, &mut resource, CTX);
         assert_eq!(
             renderer.dispatch(
                 CTX,
@@ -2524,7 +5689,7 @@ mod tests {
                 .ctx_create(ctx_id, crate::CAPSET_VENUS, "")
                 .expect("a context");
             for slot in 0..MAX_RINGS_PER_CONTEXT as u64 {
-                let resource_id = blob_for(&mut renderer, ctx_id);
+                let resource_id = blob_for(&mut renderer, &mem, &mut resource, ctx_id);
                 let info = RingCreateInfo {
                     resource_id,
                     ..ring_info()
@@ -2535,20 +5700,33 @@ mod tests {
                     Err(other) => panic!("unexpected refusal: {other}"),
                 }
             }
-            assert!(ctx_id < 16, "the global ring cap never bit");
+            assert!(
+                ctx_id <= CTX + (MAX_RINGS / MAX_RINGS_PER_CONTEXT) as u32 + 1,
+                "the global ring cap never bit"
+            );
         }
         assert_eq!(renderer.ring_count(), MAX_RINGS);
+        // One worker per ring, and the cap on rings is the cap on threads.
+        assert_eq!(renderer.live_threads(), MAX_RINGS);
+        renderer.reset();
+        assert_eq!(renderer.live_threads(), 0);
     }
 
     // --------------------------------------------------------------- the reset
 
     #[test]
-    fn a_device_reset_takes_every_page_back_out_of_the_guest() {
-        let (mut rig, _capture) = capture_rig();
-        rig.create_ring();
+    fn a_device_reset_joins_every_thread_and_takes_every_page_back_out_of_the_guest() {
+        let (mut rig, _tap) = tap_rig();
+        rig.create_ring_with(ring_info(), Some(3_000_000));
+        assert_eq!(rig.renderer.live_threads(), 2);
 
         rig.renderer.reset();
 
+        assert_eq!(
+            rig.renderer.live_threads(),
+            0,
+            "reset left a thread running"
+        );
         assert_eq!(rig.renderer.context_count(), 0);
         assert_eq!(rig.renderer.ring_count(), 0);
         assert_eq!(rig.renderer.blob_count(), 0);
@@ -2572,22 +5750,289 @@ mod tests {
             .map_blob(RESOURCE_ID, WINDOW_OFFSET, RESOURCE)
             .expect("a fresh publication");
         rig.create_ring();
-        assert_eq!(rig.guest().load_word(8), STATUS_IDLE);
+        rig.wait_parked();
+    }
+
+    #[test]
+    fn a_reset_while_the_vm_is_paused_still_joins_every_thread() {
+        // ADR-0005: a reset runs on a quiesced VM, and a worker parked at the
+        // pause gate must still be able to leave, or the reset deadlocks.
+        let gate = Quiesce::new();
+        let (mut rig, _tap) = tap_rig();
+        rig.renderer.set_quiesce(Arc::clone(&gate));
+        rig.create_ring_with(ring_info(), Some(1_000));
+        rig.wait_parked();
+
+        gate.pause();
+        assert!(gate.wait_until_idle(Duration::from_secs(5)));
+        // Give both threads work that would need a pass: a doorbell for the
+        // worker, and the monitor's next period.
+        rig.guest().submit(b"frozen");
+        rig.doorbell();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let started = Instant::now();
+        rig.renderer.reset();
+        assert_eq!(rig.renderer.live_threads(), 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a paused reset took {:?}",
+            started.elapsed()
+        );
+        assert!(gate.is_paused(), "the reset opened the gate to get out");
+    }
+
+    // ----------------------------------------------------------- the pause gate
+
+    #[test]
+    fn a_paused_vm_gets_no_ring_pass_until_it_resumes() {
+        let gate = Quiesce::new();
+        let (mut rig, tap) = tap_rig();
+        rig.renderer.set_quiesce(Arc::clone(&gate));
+        rig.create_ring();
+        rig.wait_parked();
+
+        gate.pause();
+        assert!(gate.wait_until_idle(Duration::from_secs(5)));
+        assert!(rig.guest().submit(b"while paused"));
+        // The doorbell itself touches no ring memory, so it is fine on a
+        // paused VM; it only wakes a worker that then waits at the gate.
+        rig.doorbell();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(rig.head(), 0, "the worker wrote guest memory while paused");
+        assert_eq!(tap.len(), 0);
+        assert_eq!(
+            rig.status(),
+            STATUS_IDLE,
+            "even waking (IDLE down) is a write, and it waited too"
+        );
+
+        gate.resume();
+        rig.wait_head(12);
+        assert_eq!(tap.bytes(), b"while paused".to_vec());
+    }
+
+    // ------------------------------------------------------------- the monitor
+
+    #[test]
+    fn a_monitored_ring_gets_alive_back_every_time_the_guest_clears_it() {
+        let (mut rig, _tap) = tap_rig();
+        // Mesa asks for 3 s; ask for 1 µs to prove the floor is what is kept,
+        // and to make the test quick.
+        rig.create_ring_with(ring_info(), Some(1));
+        assert_eq!(rig.renderer.monitor_period(CTX), Some(MIN_MONITOR_PERIOD));
+        assert_eq!(rig.renderer.live_threads(), 2);
+        let guest = rig.guest();
+        let alive = || guest.load_word(STATUS) & STATUS_ALIVE != 0;
+
+        eventually("the first ALIVE", alive);
+        for _ in 0..5 {
+            guest.clear_status_bits(STATUS_ALIVE);
+            eventually("ALIVE after the watchdog cleared it", alive);
+        }
+
+        // Destroying the ring takes it off the monitor first, so the zeroed
+        // status stays zero — a new ring built on the same bytes must find
+        // them zeroed, and a late ALIVE would get it refused.
+        rig.renderer
+            .submit(CTX, &destroy_stream(RING))
+            .expect("destroyed");
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(guest.load_word(STATUS), 0);
+        rig.create_ring_with(ring_info(), Some(1));
+        eventually("ALIVE on the new ring", alive);
+    }
+
+    #[test]
+    fn an_unmonitored_ring_is_never_given_alive() {
+        let (mut rig, _tap) = tap_rig();
+        rig.create_ring();
+        assert_eq!(rig.renderer.monitor_period(CTX), None);
+        rig.wait_parked();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(rig.status() & STATUS_ALIVE, 0);
+    }
+
+    /// The reason the monitor is its own thread: a ring worker busy inside one
+    /// long command cannot report on itself, and that is exactly when the
+    /// guest has been waiting longest.
+    #[test]
+    fn alive_keeps_coming_while_the_ring_worker_is_stuck_in_its_sink() {
+        #[derive(Clone, Default)]
+        struct Gate(Arc<(Mutex<(bool, bool)>, Condvar)>);
+        impl Gate {
+            fn entered(&self) -> bool {
+                self.0 .0.lock().expect("uncontended").0
+            }
+            fn release(&self) {
+                self.0 .0.lock().expect("uncontended").1 = true;
+                self.0 .1.notify_all();
+            }
+        }
+        /// Blocks inside `consume` until released: a command that takes a
+        /// very long time to execute.
+        struct Slow(Gate);
+        impl RingSink for Slow {
+            fn consume(&mut self, batch: Batch<'_>) -> Consumed {
+                let (lock, cond) = &*self.0 .0;
+                let mut state = lock.lock().expect("uncontended");
+                state.0 = true;
+                while !state.1 {
+                    state = cond.wait(state).expect("uncontended");
+                }
+                batch.all()
+            }
+        }
+
+        let gate = Gate::default();
+        let mut rig = Rig::new({
+            let gate = gate.clone();
+            move |_: u32, _: u64| Ok(Slow(gate.clone()))
+        });
+        rig.create_ring_with(ring_info(), Some(1_000));
+        let guest = rig.guest();
+        let alive = || guest.load_word(STATUS) & STATUS_ALIVE != 0;
+
+        guest.submit(b"a very long command");
+        eventually("the worker to be inside the sink", || gate.entered());
+        for _ in 0..3 {
+            guest.clear_status_bits(STATUS_ALIVE);
+            eventually("ALIVE while the worker is busy", alive);
+        }
+        assert_eq!(rig.head(), 0, "the worker really was still busy");
+
+        gate.release();
+        rig.wait_head(19);
     }
 
     // --------------------------------------------------------------- the sinks
 
     #[test]
-    fn the_write_sink_carries_the_ring_into_a_writer() {
-        let mut rig = Rig::new(WriteSink::new(Vec::new()));
+    fn the_capture_records_set_reply_and_the_command_it_cannot_answer_then_fails_the_ring() {
+        // What a real Mesa guest's first ring traffic is (spec §0.4): a 36-byte
+        // `SetReply` and a 16-byte `vkEnumerateInstanceVersion`.
+        let capture = CaptureSink::new();
+        let mut rig = Rig::new(capture.factory());
         rig.create_ring();
-        rig.produce(0, b"to a file");
-        rig.guest().store_word(4, 9);
+        rig.wait_parked();
+        let guest = rig.guest();
+
+        let mut want = set_reply(10, 0, 20);
+        guest.submit(&want);
+        guest.submit(&ENUMERATE_INSTANCE_VERSION);
+        want.extend_from_slice(&ENUMERATE_INSTANCE_VERSION);
         rig.doorbell();
 
-        assert_eq!(rig.renderer.sink().written(), 9);
-        assert!(!rig.renderer.sink().failed());
-        assert_eq!(rig.renderer.sink().writer().as_slice(), b"to a file");
+        // The guest aborts on "ring fatal error" at once, instead of a 3.5 s
+        // watchdog.
+        rig.wait_fatal();
+        // `head` moved past the `SetReply` — it is finished — and not past the
+        // command nobody answered.
+        assert_eq!(rig.head(), 36);
+        // And the capture holds exactly what the guest asked.
+        assert_eq!(capture.bytes(), want);
+        assert_eq!(capture.len(), 52);
+    }
+
+    #[test]
+    fn the_capture_consumes_reply_bookkeeping_and_waits_for_a_command_to_be_whole() {
+        let capture = CaptureSink::new();
+        let mut rig = Rig::new(capture.factory());
+        rig.create_ring();
+        rig.wait_parked();
+        let guest = rig.guest();
+
+        // A `SetReply`, then only half of the next command's header — which a
+        // guest that stores `tail` last never produces, but may.
+        let reply = set_reply(10, 0, 20);
+        guest.submit(&reply);
+        guest.submit(&ENUMERATE_INSTANCE_VERSION[..4]);
+        rig.doorbell();
+        rig.wait_head(36);
+        rig.wait_parked();
+        assert_eq!(
+            rig.status() & STATUS_FATAL,
+            0,
+            "an incomplete command is not judged"
+        );
+        assert_eq!(capture.bytes(), reply);
+
+        // The rest arrives: now it is a whole command nobody can answer.
+        guest.submit(&ENUMERATE_INSTANCE_VERSION[4..]);
+        rig.doorbell();
+        rig.wait_fatal();
+        assert_eq!(rig.head(), 36);
+        let mut want = reply;
+        want.extend_from_slice(&ENUMERATE_INSTANCE_VERSION);
+        assert_eq!(capture.bytes(), want);
+    }
+
+    #[test]
+    fn the_capture_refuses_transport_commands_that_are_requests_for_work() {
+        // `vkExecuteCommandStreamsMESA` runs commands out of another buffer, and
+        // a context-only command has no business in a ring; consuming either
+        // would move `head` past work nobody did.
+        for opcode in [Opcode::ExecuteCommandStreams, Opcode::DestroyRing] {
+            let capture = CaptureSink::new();
+            let mut rig = Rig::new(capture.factory());
+            rig.create_ring();
+            rig.wait_parked();
+            let guest = rig.guest();
+
+            let mut enc = Encoder::new();
+            enc.command_header(CommandHeader {
+                opcode: opcode.as_u32(),
+                flags: 0,
+            })
+            .expect("encode");
+            match opcode {
+                Opcode::ExecuteCommandStreams => {
+                    // One stream, no reply positions, no dependencies, flags 0.
+                    enc.u32(1).expect("encode");
+                    enc.u64(1).expect("encode");
+                    enc.u32(10).expect("encode");
+                    enc.size(0).expect("encode");
+                    enc.size(16).expect("encode");
+                    enc.u64(0).expect("encode");
+                    enc.u32(0).expect("encode");
+                    enc.u64(0).expect("encode");
+                    enc.flags(0).expect("encode");
+                }
+                _ => enc.handle(RING).expect("encode"),
+            }
+            let command = enc.finish().expect("encode");
+            guest.submit(&command);
+            rig.doorbell();
+            rig.wait_fatal();
+            assert_eq!(rig.head(), 0, "{} was consumed", opcode.name());
+            assert_eq!(
+                capture.bytes(),
+                command,
+                "{} was not recorded",
+                opcode.name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_write_sink_carries_each_ring_into_its_own_writer() {
+        let out = SharedVec::default();
+        let mut rig = Rig::new({
+            let out = out.clone();
+            move |_: u32, _: u64| Ok(WriteSink::new(out.clone()))
+        });
+        rig.create_ring();
+        rig.wait_parked();
+        let guest = rig.guest();
+
+        let mut want = set_reply(10, 0, 20);
+        guest.submit(&want);
+        guest.submit(&ENUMERATE_INSTANCE_VERSION);
+        want.extend_from_slice(&ENUMERATE_INSTANCE_VERSION);
+        rig.doorbell();
+        rig.wait_fatal();
+        assert_eq!(rig.head(), 36);
+        assert_eq!(*out.0.lock().expect("uncontended"), want);
     }
 
     #[test]
@@ -2603,16 +6048,47 @@ mod tests {
             }
         }
 
-        let mut rig = Rig::new(WriteSink::new(Broken));
+        let mut rig = Rig::new(|_: u32, _: u64| Ok(WriteSink::new(Broken)));
         rig.create_ring();
-        rig.produce(0, b"lost");
-        rig.guest().store_word(4, 4);
+        rig.wait_parked();
+        rig.guest().submit(&set_reply(10, 0, 20));
         rig.doorbell();
 
-        assert!(rig.renderer.sink().failed());
         // The bytes are gone, but the ring moved on: a guest's Vulkan driver
         // cannot see a host file error and must not be frozen by one.
-        assert_eq!(rig.guest().load_word(0), 4);
-        assert_eq!(rig.guest().load_word(8), STATUS_IDLE);
+        rig.wait_head(36);
+        rig.wait_parked();
+        assert_eq!(rig.status() & STATUS_FATAL, 0);
+    }
+
+    #[test]
+    fn the_capture_logic_answers_a_batch_without_any_threads() {
+        // `capture_batch` directly: the bookkeeping is consumed, the first real
+        // command and everything after it recorded, and the ring declared dead
+        // after the bookkeeping.
+        let mut batch = set_reply(1, 0, 20);
+        batch.extend_from_slice(&set_reply(1, 20, 28));
+        batch.extend_from_slice(&ENUMERATE_INSTANCE_VERSION);
+        batch.extend_from_slice(b"trailing");
+        let mut recorded = Vec::new();
+        let consumed = capture_batch(Batch::for_test(&batch), |b| recorded.extend_from_slice(b));
+        assert!(consumed.is_fatal());
+        assert_eq!(consumed.bytes(), 72);
+        assert_eq!(recorded, batch);
+
+        // Bookkeeping alone is consumed whole and is not fatal.
+        let only = set_reply(1, 0, 20);
+        let mut recorded = Vec::new();
+        let consumed = capture_batch(Batch::for_test(&only), |b| recorded.extend_from_slice(b));
+        assert!(!consumed.is_fatal());
+        assert_eq!(consumed.bytes(), 36);
+        assert_eq!(recorded, only);
+
+        // A reply-bearing `SetReply` is not bookkeeping.
+        let mut flagged = set_reply(1, 0, 20);
+        flagged[4] = 1;
+        let consumed = capture_batch(Batch::for_test(&flagged), |_| {});
+        assert!(consumed.is_fatal());
+        assert_eq!(consumed.bytes(), 0);
     }
 }

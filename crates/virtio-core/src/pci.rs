@@ -682,6 +682,11 @@ impl PciTransport {
         self.state.save()
     }
 
+    /// Why this slot's device would refuse a snapshot now (ADR-0006).
+    pub fn snapshot_refusal(&self) -> Option<String> {
+        self.state.snapshot_refusal()
+    }
+
     /// Puts a saved slot back. See [`TransportState::load`] for the order and
     /// for what a refusal means.
     pub fn load(

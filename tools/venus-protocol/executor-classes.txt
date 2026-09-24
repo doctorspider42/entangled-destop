@@ -1,0 +1,283 @@
+# How the Venus executor serves every core Vulkan 1.0-1.3 command the
+# protocol decodes, and every command of an admitted device extension
+# (venus/executor/policy.rs `ADMITTED_EXTENSIONS`, stage 5c). Read by
+# `scripts/venus-exec-gen.py`, which refuses to run unless every such command
+# is in exactly one section, and unless the two hand-written sections agree
+# with the `match` arms that implement them.
+#
+# A line is one command; `#` starts a comment. An admitted extension's
+# command is served only on a device the guest enabled one of the extensions
+# that bring it on (`generated::extensions_of`). The promoted extensions
+# advertised add no command outside core 1.3 that a guest sends (their KHR
+# aliases are encoded as the core commands), the emulated sync-file and
+# dma-buf ones add none the guest sends either, and the venus protocol's own
+# vkImportSemaphoreResourceMESA,
+# vkWaitSemaphoreResourceMESA and vkGetMemoryResourcePropertiesMESA are served
+# by hand (executor/submit.rs, `dispatch_extension`), and so is the emulated
+# VK_EXT_image_drm_format_modifier's vkGetImageDrmFormatModifierPropertiesEXT
+# (stage S1; its structures are policy.rs `EMULATED_STRUCTURE_EXTENSIONS`,
+# never forwarded); every other extension command stays refused as
+# "decodable but not implemented".
+#
+# [bespoke]      Stages 5a.3 and 5b.1: hand-written end to end, host call
+#                included (`VulkanContext::dispatch` in executor/context.rs,
+#                `HostVulkan`'s typed methods). Also the list
+#                scripts/venus-ash-gen.py builds its bridge for.
+# [handwritten]  Stage 5b.2 commands whose executor logic is written by hand
+#                (`VulkanContext::dispatch_objects`, executor/device_objects.rs
+#                and executor/submit.rs): object bookkeeping, bounds against
+#                objects the renderer knows, submission, waits. Every one of
+#                them still uses the generated translation (ids to host
+#                handles, enum and flag checks, counts) and the generated host
+#                call.
+# [generated]    Pure pass-through: the generated translation, the generated
+#                host call, nothing else. No bookkeeping, nothing to bound.
+# [refused]      Decodable core commands refused on purpose, fatal like any
+#                unimplemented one. The comment says why.
+
+[bespoke]
+vkEnumerateInstanceVersion
+vkCreateInstance
+vkDestroyInstance
+vkEnumeratePhysicalDevices
+vkEnumeratePhysicalDeviceGroups
+vkGetPhysicalDeviceProperties
+vkGetPhysicalDeviceProperties2
+vkGetPhysicalDeviceFeatures2
+vkGetPhysicalDeviceQueueFamilyProperties2
+vkGetPhysicalDeviceMemoryProperties2
+vkEnumerateDeviceExtensionProperties
+vkGetPhysicalDeviceExternalSemaphoreProperties  # SYNC_FD synthesized (5b.3)
+vkGetPhysicalDeviceExternalBufferProperties     # DMA_BUF emulated (5c)
+vkGetPhysicalDeviceFormatProperties2
+vkGetPhysicalDeviceImageFormatProperties2
+# Queries answered without the host (S2b): no sparse residency is shown, so
+# no entries; no external fence is served, so nothing.
+vkGetPhysicalDeviceSparseImageFormatProperties
+vkGetPhysicalDeviceSparseImageFormatProperties2
+vkGetPhysicalDeviceExternalFenceProperties
+vkCreateDevice
+vkDestroyDevice
+vkGetDeviceQueue2
+vkCreateCommandPool
+vkDestroyCommandPool
+vkCreateImage
+vkDestroyImage
+vkGetImageMemoryRequirements2
+vkAllocateMemory
+vkFreeMemory
+vkGetDeviceMemoryCommitment
+vkCreateBuffer
+vkDestroyBuffer
+vkGetBufferMemoryRequirements
+vkGetBufferMemoryRequirements2
+vkGetDeviceBufferMemoryRequirements
+vkBindBufferMemory
+vkBindBufferMemory2
+vkGetBufferDeviceAddress
+vkCreateBufferView
+vkDestroyBufferView
+vkGetImageMemoryRequirements
+vkGetDeviceImageMemoryRequirements
+vkBindImageMemory
+vkBindImageMemory2
+vkGetImageSubresourceLayout
+vkCreateImageView
+vkDestroyImageView
+
+[handwritten]
+# Objects: a create binds the guest's id(s), a destroy takes them out, and
+# both know the object's parent; some keep facts later commands are judged by.
+vkCreateShaderModule            # codeSize a multiple of 4, bounded
+vkDestroyShaderModule
+vkCreatePipelineLayout
+vkDestroyPipelineLayout
+vkCreateDescriptorSetLayout
+vkDestroyDescriptorSetLayout
+vkCreateDescriptorPool
+vkDestroyDescriptorPool         # its sets go with it
+vkResetDescriptorPool           # and here too
+vkAllocateDescriptorSets        # ids bound to the pool
+vkFreeDescriptorSets            # each set must be of the named pool
+vkUpdateDescriptorSets          # the array the descriptor type reads is there
+vkCreateDescriptorUpdateTemplate
+vkDestroyDescriptorUpdateTemplate
+vkCreateSampler
+vkDestroySampler
+vkCreateSamplerYcbcrConversion
+vkDestroySamplerYcbcrConversion
+vkCreatePipelineCache
+vkDestroyPipelineCache
+vkGetPipelineCacheData          # the size the guest asks for is bounded
+vkCreateGraphicsPipelines       # several ids per call, some may fail
+vkCreateComputePipelines
+vkDestroyPipeline
+vkCreateRenderPass
+vkCreateRenderPass2
+vkDestroyRenderPass
+vkCreateFramebuffer
+vkDestroyFramebuffer
+vkCreateQueryPool               # keeps its query count
+vkDestroyQueryPool
+vkGetQueryPoolResults           # the range inside the pool, the size bounded
+vkResetQueryPool
+vkCreateEvent
+vkDestroyEvent
+vkCreatePrivateDataSlot
+vkDestroyPrivateDataSlot
+vkSetPrivateData                # objectHandle is an id of objectType
+vkGetPrivateData
+# Command buffers and pools.
+vkBeginCommandBuffer            # inherited rendering inside maxColorAttachments (5b.3)
+vkAllocateCommandBuffers        # ids bound to the pool, with their level
+vkFreeCommandBuffers
+vkResetCommandPool
+vkResetCommandBuffer
+# Fences, submission and waits.
+vkCreateFence
+vkDestroyFence
+vkResetFences
+vkWaitForFences                 # a real wait, in slices, off the context lock
+vkCreateSemaphore               # binary or timeline; SYNC_FD export stripped (5b.3)
+vkDestroySemaphore
+vkGetSemaphoreCounterValue      # timeline only
+vkWaitSemaphores                # timeline only; sliced like vkWaitForFences
+vkSignalSemaphore               # timeline only
+vkQueueSubmit                   # semaphore state, counts, temporary payloads (5b.3)
+vkQueueSubmit2
+vkQueueWaitIdle
+vkDeviceWaitIdle
+# Recording commands bounded against the objects they name, or against the
+# fixed-size state a driver keeps on the host (viewports, push constants).
+vkCmdBindPipeline               # the pipeline's own bind point
+vkCmdBindDescriptorSets         # sets inside the layout, one offset per dynamic descriptor
+vkCmdBeginRenderPass            # framebuffer and pass agree, a clear value per cleared attachment
+vkCmdBeginRenderPass2
+vkCmdBeginRendering             # colour attachments, view mask, layers, area (5b.3)
+vkCmdBindIndexBuffer            # offset inside the buffer
+vkCmdBindVertexBuffers          # binding range and offsets
+vkCmdBindVertexBuffers2
+vkCmdSetViewport                # inside maxViewports
+vkCmdSetScissor
+vkCmdSetViewportWithCount
+vkCmdSetScissorWithCount
+vkCmdPushConstants              # inside maxPushConstantsSize
+vkCmdFillBuffer                 # the range inside the buffer
+vkCmdUpdateBuffer
+vkCmdCopyBuffer
+vkCmdCopyBuffer2
+vkCmdCopyBufferToImage          # the buffer offset inside the buffer
+vkCmdCopyBufferToImage2
+vkCmdCopyImageToBuffer
+vkCmdCopyImageToBuffer2
+vkCmdDrawIndirect               # the whole indirect range inside the buffer
+vkCmdDrawIndexedIndirect
+vkCmdDrawIndirectCount
+vkCmdDrawIndexedIndirectCount
+vkCmdDispatchIndirect
+vkCmdBeginQuery                 # queries inside the pool
+vkCmdEndQuery
+vkCmdResetQueryPool
+vkCmdWriteTimestamp
+vkCmdWriteTimestamp2
+vkCmdCopyQueryPoolResults
+vkCmdClearAttachments           # attachment indices inside maxColorAttachments
+vkCmdSetDeviceMask              # inside the device group
+vkCmdExecuteCommands            # secondaries only
+# Stage 5c: the admitted extensions' commands that name buffers, queries or
+# indices into the driver's fixed-size state.
+vkCmdBindTransformFeedbackBuffersEXT    # bindings inside maxTransformFeedbackBuffers, ranges inside the buffers
+vkCmdBeginTransformFeedbackEXT          # counter buffers inside the limit, 4 bytes inside each
+vkCmdEndTransformFeedbackEXT
+vkCmdBeginQueryIndexedEXT               # the query inside the pool, the stream inside maxTransformFeedbackStreams
+vkCmdEndQueryIndexedEXT
+vkCmdDrawIndirectByteCountEXT           # the counter inside its buffer, the stride inside the limit
+vkCmdBeginConditionalRenderingEXT       # the predicate's 4 bytes inside a CONDITIONAL_RENDERING buffer
+vkCmdSetLineStipple                     # factor in [1, 256]
+# Stage S1: every buffer and image barrier's queue family pair judged before
+# the driver indexes by it (VK_QUEUE_FAMILY_FOREIGN_EXT only with
+# VK_EXT_queue_family_foreign enabled).
+vkCmdPipelineBarrier
+vkCmdPipelineBarrier2
+vkCmdWaitEvents
+vkCmdWaitEvents2
+vkCmdSetEvent2                  # and no ownership transfer at all
+
+[generated]
+vkEndCommandBuffer
+vkTrimCommandPool
+vkMergePipelineCaches
+vkGetFenceStatus
+vkGetEventStatus
+vkSetEvent
+vkResetEvent
+vkGetRenderAreaGranularity
+vkGetDescriptorSetLayoutSupport
+vkGetDeviceGroupPeerMemoryFeatures
+vkCmdSetLineWidth
+vkCmdSetDepthBias
+vkCmdSetBlendConstants
+vkCmdSetDepthBounds
+vkCmdSetStencilCompareMask
+vkCmdSetStencilWriteMask
+vkCmdSetStencilReference
+vkCmdDraw
+vkCmdDrawIndexed
+vkCmdDispatch
+vkCmdDispatchBase
+vkCmdCopyImage
+vkCmdCopyImage2
+vkCmdBlitImage
+vkCmdBlitImage2
+vkCmdClearColorImage
+vkCmdClearDepthStencilImage
+vkCmdResolveImage
+vkCmdResolveImage2
+vkCmdSetEvent
+vkCmdResetEvent
+vkCmdResetEvent2
+vkCmdNextSubpass
+vkCmdNextSubpass2
+vkCmdEndRenderPass
+vkCmdEndRenderPass2
+vkCmdEndRendering
+vkCmdSetCullMode
+vkCmdSetFrontFace
+vkCmdSetPrimitiveTopology
+vkCmdSetDepthTestEnable
+vkCmdSetDepthWriteEnable
+vkCmdSetDepthCompareOp
+vkCmdSetDepthBoundsTestEnable
+vkCmdSetStencilTestEnable
+vkCmdSetStencilOp
+vkCmdSetRasterizerDiscardEnable
+vkCmdSetDepthBiasEnable
+vkCmdSetPrimitiveRestartEnable
+vkCmdEndConditionalRenderingEXT
+
+[refused]
+# Sparse resources: every sparse feature is reported false (policy::mask_features).
+vkGetImageSparseMemoryRequirements
+vkGetImageSparseMemoryRequirements2
+vkGetDeviceImageSparseMemoryRequirements
+vkQueueBindSparse
+# The 1.0 forms of queries Mesa only ever asks in their 1.1 form.
+vkGetPhysicalDeviceFeatures
+vkGetPhysicalDeviceQueueFamilyProperties
+vkGetPhysicalDeviceMemoryProperties
+vkGetPhysicalDeviceFormatProperties
+vkGetPhysicalDeviceImageFormatProperties
+# Answered by the guest driver itself; vkr refuses vkGetDeviceQueue too.
+vkEnumerateInstanceLayerProperties
+vkEnumerateInstanceExtensionProperties
+vkEnumerateDeviceLayerProperties
+vkGetDeviceQueue
+vkGetPhysicalDeviceToolProperties
+# Host-visible memory is the renderer's own coherent pages: nothing to map,
+# unmap, flush or invalidate on the host (ADR-0004, 2026-09-23).
+vkUnmapMemory
+vkFlushMappedMemoryRanges
+vkInvalidateMappedMemoryRanges
+# bufferDeviceAddressCaptureReplay is reported false.
+vkGetBufferOpaqueCaptureAddress
+vkGetDeviceMemoryOpaqueCaptureAddress

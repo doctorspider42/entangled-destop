@@ -13,6 +13,7 @@ pub mod wsl_engine;
 pub use config::{
     BootMode, BootSection, CdromSection, ConfigError, DiskSection, DisplaySection, GamepadBackend,
     GamepadSection, NetworkBackend, NetworkSection, SoundBackend, SoundSection, VirglIsolation,
-    VirtioTransport, VmConfig, DEFAULT_REFRESH_HZ, MAX_GAMEPAD_PLAYERS, MAX_MEMORY_MIB,
-    MAX_REFRESH_HZ, MIN_MEMORY_MIB, MIN_REFRESH_HZ,
+    VirtioTransport, VmConfig, DEFAULT_HOST_VISIBLE_MIB, DEFAULT_REFRESH_HZ, MAX_GAMEPAD_PLAYERS,
+    MAX_HOST_VISIBLE_MIB, MAX_MEMORY_MIB, MAX_REFRESH_HZ, MIN_HOST_VISIBLE_MIB, MIN_MEMORY_MIB,
+    MIN_REFRESH_HZ,
 };

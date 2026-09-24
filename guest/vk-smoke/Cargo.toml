@@ -1,0 +1,33 @@
+# Standalone guest-side tool (not a workspace member): a Vulkan smoke test that
+# runs *inside* a guest and proves the GPU behind it really did the work. It is
+# the acceptance test for the Venus renderer's phase-5 stages. See README.md.
+
+[package]
+name = "vk-smoke"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# Its own workspace, so the repo's root workspace neither claims nor rejects it.
+[workspace]
+
+[dependencies]
+# Same ash as the workspace lockfile. `loaded` = the Vulkan loader is dlopen'd
+# at run time (libvulkan.so.1 / vulkan-1.dll), so the binary links nothing
+# Vulkan and starts even where no loader is installed (check 1 then FAILs).
+ash = { version = "=0.38.0", default-features = false, features = ["loaded", "debug", "std"] }
+
+[build-dependencies]
+# WGSL -> SPIR-V at build time: nobody needs the Vulkan SDK or glslang.
+# Same version as the workspace lockfile (naga 25.0.1).
+naga = { version = "=25.0.1", default-features = false, features = ["wgsl-in", "spv-out"] }
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true
+# Unwinding stays on: each check runs under catch_unwind, so a bug in one check
+# is reported as that check's FAIL instead of ending the run.
+panic = "unwind"

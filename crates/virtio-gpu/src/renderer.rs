@@ -33,6 +33,7 @@ use virtio_core::{GuestMem, HostWaker};
 
 use crate::blob::{BlobMapping, BlobSupport};
 use crate::error::CommandError;
+pub use crate::fence::FenceTimeline;
 use crate::protocol::{Box3d, MemEntry, Rect, ResourceCreate3d, ResourceCreateBlob, Transfer3d};
 
 /// Most rendering contexts a guest may hold open at once. Each mesa process
@@ -216,12 +217,50 @@ pub trait Renderer3d: Send {
     /// Hands the renderer the device's [`HostWaker`], which it may use to ask
     /// for a [`Self::poll_fences`] call from the device's worker context.
     ///
-    /// A renderer that gets no waker (or is given one that cannot deliver)
-    /// must keep answering [`Self::create_fence`] with
-    /// [`FenceOutcome::Signalled`] — i.e. stay on phase 1's synchronous
-    /// model — because nothing would ever complete a deferred response.
+    /// Both hosts' machine layers install one on every device (KVM: the
+    /// ioeventfd worker's queue-0 eventfd; WHP: `machine_x86::host_wake`).
+    /// Without one, a deferred response is still completed — the device
+    /// polls on every notify — just not until the guest next kicks it.
+    ///
+    /// What a renderer may do without a waker depends on the timeline. On the
+    /// **device timeline** a renderer may stay on phase 1's synchronous model
+    /// and answer [`Self::create_fence`] with [`FenceOutcome::Signalled`]:
+    /// every command there runs on one host context in submission order, so
+    /// nothing the guest does next can overtake it. A **ring timeline**
+    /// ([`Self::create_fence_on`] with `ring_idx` ≥ 1) has no such ordering —
+    /// it is a host `VkQueue` running on its own — so its fence must stay
+    /// pending until the work before it is done, waker or not. Signalling it
+    /// early tells the guest its GPU work is finished before it has run.
     fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
         let _ = waker;
+    }
+
+    /// Hands the renderer the VM's pause gate (ADR-0005), from the device's
+    /// `activate`.
+    ///
+    /// A renderer that runs threads of its own which touch guest-visible
+    /// memory — the Venus renderer's ring workers and `ALIVE` monitors write
+    /// ring pages the guest maps — must take
+    /// [`Quiesce::wait_while_paused`](virtio_core::Quiesce::wait_while_paused)
+    /// before every pass, outside any lock the device holds, or "paused" is a
+    /// lie. The default ignores it: a renderer that only works inside trait
+    /// calls is already behind the gated queue worker.
+    fn set_quiesce(&mut self, quiesce: Arc<virtio_core::Quiesce>) {
+        let _ = quiesce;
+    }
+
+    /// Why a snapshot taken now would lose host state a resumed guest would
+    /// notice missing (ADR-0006), or `None`.
+    ///
+    /// The device already records how many 3D contexts were open and tells a
+    /// restored driver to start again; that is honest for state a restart
+    /// rebuilds. A renderer holding **host Vulkan objects** a guest believes
+    /// in (the Venus executor, stage 5a.3) is different — those ids are baked
+    /// into the guest's own driver state and cannot be written to a file — so
+    /// it refuses the snapshot by name here instead. The default refuses
+    /// nothing.
+    fn snapshot_refusal(&self) -> Option<String> {
+        None
     }
 
     /// Creates host fence `fence_id` on `ctx_id`'s timeline, covering
@@ -253,6 +292,39 @@ pub trait Renderer3d: Send {
         Vec::new()
     }
 
+    /// [`Self::create_fence`] for a command whose header named a fence
+    /// timeline (`VIRTIO_GPU_FLAG_INFO_RING_IDX`, `ring_idx` = `Some`), or
+    /// none: which timeline the fence is on, and whether it is already
+    /// signalled (EPIC 20 stage 5b.3).
+    ///
+    /// The default is every renderer's behaviour before per-context
+    /// timelines existed, and still virgl's: the `ring_idx` is ignored, the
+    /// fence goes on the device's one timeline, and [`Self::create_fence`]
+    /// decides. A renderer that answers [`FenceTimeline::Ring`] here must
+    /// report that fence's retirement through [`Self::poll_fence_timelines`]
+    /// on the same timeline, and — waker or no waker (see
+    /// [`Self::set_host_waker`]) — only once the work before it has run.
+    fn create_fence_on(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: Option<u8>,
+        fence_id: u32,
+    ) -> Result<(FenceTimeline, FenceOutcome), CommandError> {
+        let _ = ring_idx;
+        self.create_fence(ctx_id, fence_id)
+            .map(|outcome| (FenceTimeline::Device, outcome))
+    }
+
+    /// [`Self::poll_fences`] with each retired fence's timeline. The default
+    /// puts every id [`Self::poll_fences`] reports on the device's timeline,
+    /// which is where [`Self::create_fence_on`]'s default put them.
+    fn poll_fence_timelines(&mut self, still_pending: usize) -> Vec<(FenceTimeline, u32)> {
+        self.poll_fences(still_pending)
+            .into_iter()
+            .map(|id| (FenceTimeline::Device, id))
+            .collect()
+    }
+
     // -------------------------------- zero-copy scanout (ADR-0004 phase 2)
 
     /// Exports the scanout resource as a host dmabuf, when the renderer has a
@@ -265,6 +337,62 @@ pub trait Renderer3d: Send {
     fn export_scanout(&mut self, resource_id: u32) -> Option<ScanoutExport> {
         let _ = resource_id;
         None
+    }
+
+    /// `SET_SCANOUT_BLOB` of a **renderer blob** (`BLOB_MEM_HOST3D` or
+    /// `BLOB_MEM_HOST3D_GUEST`): can this renderer present `resource_id`'s
+    /// bytes laid out as `spec`? (EPIC 20, "GNOME on the GPU" S2a.)
+    ///
+    /// This is how a guest compositor on the GPU puts its frames on screen:
+    /// Mutter over GBM → zink → venus allocates each scanout buffer as a
+    /// `VkDeviceMemory`, the guest kernel wraps it in a `HOST3D` +
+    /// `SHAREABLE` blob (never `MAPPABLE` — the guest does not map it), and
+    /// every page flip is `SET_SCANOUT_BLOB` naming that blob followed by an
+    /// unfenced `RESOURCE_FLUSH`, with no transfer in between.
+    ///
+    /// The device has already checked, before calling:
+    ///
+    /// * `resource_id` is a live blob of a host memory type, created through
+    ///   [`Self::create_blob`] and not yet [`Self::destroy_blob`]ed;
+    /// * `spec.format` is `FORMAT_B8G8R8X8_UNORM` or `FORMAT_B8G8R8A8_UNORM`,
+    ///   and planes 1–3 are unused;
+    /// * `spec.width`/`spec.height` are non-zero and at most
+    ///   [`crate::MAX_RESOURCE_PIXELS`] pixels between them;
+    /// * `spec.stride >= spec.width * 4`, and
+    ///   `spec.offset + spec.stride * spec.height` fits inside the blob's
+    ///   declared size — all in `u64`.
+    ///
+    /// What is left is the renderer's own question: does it hold memory under
+    /// that blob it can read those rows out of (for Venus: is the blob a
+    /// `VkDeviceMemory` this renderer can copy from, and is it at least that
+    /// large on the host)? `Ok` promises that **[`Self::read_rect_bgra`] on
+    /// `resource_id` now reads this layout**: until the next accepted
+    /// `scanout_blob` for the same resource, [`Self::destroy_blob`] or
+    /// [`Self::reset`], `read_rect_bgra(resource_id, rect, out)` must fill
+    /// `out` with `rect` of the `spec.width` × `spec.height` image (the device
+    /// has checked that it lies inside) as tightly packed BGRA rows,
+    /// `rect.width * rect.height * 4` bytes. The X byte of a `B8G8R8X8` image
+    /// is insignificant — the display draws every pixel opaque.
+    ///
+    /// A renderer keeps **one spec per resource**, not one for the device: a
+    /// compositor flips between two or three buffers, and the device asks
+    /// again only when a buffer's layout changes, not on every flip. A
+    /// refusal leaves whatever this resource had accepted before in force;
+    /// the device keeps its old binding and answers the guest in band.
+    ///
+    /// The default refuses, with exactly the error the device answered before
+    /// this hook existed — the answer of every renderer that cannot read a
+    /// host blob back (virgl, the isolated renderer, the loopback).
+    fn scanout_blob(
+        &mut self,
+        resource_id: u32,
+        spec: &ScanoutBlobSpec,
+    ) -> Result<(), CommandError> {
+        let _ = (resource_id, spec);
+        Err(CommandError::BadBlobMem {
+            blob_mem: crate::protocol::BLOB_MEM_HOST3D,
+            reason: "only a guest-memory blob can be scanned out on this host",
+        })
     }
 
     // ------------------------------------- blob resources (EPIC 20/VEN-2001)
@@ -308,6 +436,16 @@ pub trait Renderer3d: Send {
     ) -> Result<(), CommandError> {
         let _ = (ctx_id, args, mem, entries);
         Err(CommandError::UnsupportedBlobMem(args.blob_mem))
+    }
+
+    /// `CTX_ATTACH_RESOURCE` (`attach`) or `CTX_DETACH_RESOURCE` of a blob
+    /// resource on context `ctx_id`, which the device otherwise answers
+    /// itself (a blob id is the device's, not the renderer's 3D table's).
+    /// The default: nothing. The Venus renderer records it — an attached
+    /// blob of another context's memory is one this context may import
+    /// (EPIC 20 stage 5c).
+    fn ctx_attach_blob(&mut self, ctx_id: u32, resource_id: u32, attach: bool) {
+        let _ = (ctx_id, resource_id, attach);
     }
 
     /// Drops a renderer-side blob (`RESOURCE_UNREF` on a host blob).
@@ -396,6 +534,28 @@ pub struct ScanoutExport {
     pub fourcc: u32,
     /// DRM format modifier (tiling/compression). `0` is linear.
     pub modifier: u64,
+}
+
+/// How a guest laid a renderer blob out for scanout
+/// ([`Renderer3d::scanout_blob`]): the plane-0 fields of `SET_SCANOUT_BLOB`.
+///
+/// A blob has no geometry of its own, so this *is* its image for as long as
+/// it is being scanned out. The scanout rectangle (which part of the image
+/// the display shows) is the device's business and not part of it: two flips
+/// of one buffer with different visible regions are the same layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanoutBlobSpec {
+    /// `FORMAT_B8G8R8X8_UNORM` or `FORMAT_B8G8R8A8_UNORM` — the only two the
+    /// device accepts, and the Linux driver sends the first.
+    pub format: u32,
+    /// Framebuffer width in pixels.
+    pub width: u32,
+    /// Framebuffer height in pixels.
+    pub height: u32,
+    /// Bytes per row of plane 0 (`strides[0]`).
+    pub stride: u32,
+    /// Byte offset of plane 0 inside the blob (`offsets[0]`).
+    pub offset: u32,
 }
 
 /// Structural validation of a `SUBMIT_3D` stream (GPU-007).
@@ -587,6 +747,12 @@ impl Gpu3d {
             return Err(CommandError::UnknownContext(ctx_id));
         }
         self.renderer.create_blob(ctx_id, args, mem, entries)
+    }
+
+    /// `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE` of a blob resource,
+    /// forwarded to the renderer ([`Renderer3d::ctx_attach_blob`]).
+    pub fn ctx_attach_blob(&mut self, ctx_id: u32, resource_id: u32, attach: bool) {
+        self.renderer.ctx_attach_blob(ctx_id, resource_id, attach);
     }
 
     /// Drops a host-side blob.
@@ -866,9 +1032,32 @@ impl Gpu3d {
         self.renderer.create_fence(ctx_id, fence_id)
     }
 
+    /// [`Self::create_fence`] with the header's fence timeline, when it named
+    /// one ([`Renderer3d::create_fence_on`]).
+    ///
+    /// # Errors
+    /// An unknown context, or the renderer's refusal.
+    pub fn create_fence_on(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: Option<u8>,
+        fence_id: u32,
+    ) -> Result<(FenceTimeline, FenceOutcome), CommandError> {
+        if ctx_id != 0 && !self.contexts.contains_key(&ctx_id) {
+            return Err(CommandError::UnknownContext(ctx_id));
+        }
+        self.renderer.create_fence_on(ctx_id, ring_idx, fence_id)
+    }
+
     /// Host fences that have retired since the last call, oldest first.
     pub fn poll_fences(&mut self, still_pending: usize) -> Vec<u32> {
         self.renderer.poll_fences(still_pending)
+    }
+
+    /// Host fences that have retired since the last call, with their
+    /// timelines, oldest first within each.
+    pub fn poll_fence_timelines(&mut self, still_pending: usize) -> Vec<(FenceTimeline, u32)> {
+        self.renderer.poll_fence_timelines(still_pending)
     }
 
     /// Installs the device's host waker on the renderer.
@@ -876,10 +1065,68 @@ impl Gpu3d {
         self.renderer.set_host_waker(waker);
     }
 
+    /// Installs the VM's pause gate on the renderer (ADR-0005).
+    pub fn set_quiesce(&mut self, quiesce: Arc<virtio_core::Quiesce>) {
+        self.renderer.set_quiesce(quiesce);
+    }
+
+    /// [`Renderer3d::snapshot_refusal`] of the renderer.
+    pub fn snapshot_refusal(&self) -> Option<String> {
+        self.renderer.snapshot_refusal()
+    }
+
     /// Installs the shared-memory window's host pages on the renderer
     /// (VEN-2001 phase 2).
     pub fn set_host_visible(&mut self, backing: Arc<dyn virtio_core::ShmBacking>) {
         self.renderer.set_host_visible(backing);
+    }
+
+    /// Asks the renderer whether it can present a renderer blob with this
+    /// layout ([`Renderer3d::scanout_blob`]). The device owns the blob table
+    /// and has validated `spec` against it; this front only forwards.
+    pub fn scanout_blob(
+        &mut self,
+        resource_id: u32,
+        spec: &ScanoutBlobSpec,
+    ) -> Result<(), CommandError> {
+        self.renderer.scanout_blob(resource_id, spec)
+    }
+
+    /// Scanout readback of a renderer blob the renderer accepted as `spec`:
+    /// `rect` of that image as packed BGRA.
+    ///
+    /// The rect is checked against the spec here, and the renderer's answer
+    /// is checked for length afterwards — a renderer that returns the wrong
+    /// number of bytes is a host bug, and the sink must never be handed a
+    /// buffer that disagrees with the rect it is told to draw.
+    pub fn read_scanout_blob(
+        &mut self,
+        resource_id: u32,
+        spec: &ScanoutBlobSpec,
+        rect: Rect,
+        out: &mut Vec<u8>,
+    ) -> Result<(), CommandError> {
+        if !rect.fits_within(spec.width, spec.height) {
+            return Err(CommandError::RectOutOfBounds {
+                rect,
+                width: spec.width,
+                height: spec.height,
+            });
+        }
+        self.renderer.read_rect_bgra(resource_id, rect, out)?;
+        let expected = rect
+            .pixels()
+            .saturating_mul(u64::from(crate::BYTES_PER_PIXEL));
+        if out.len() as u64 != expected {
+            return Err(CommandError::Renderer(format!(
+                "scanout readback of blob {resource_id} returned {} bytes for a {}x{} rect \
+                 ({expected} expected)",
+                out.len(),
+                rect.width,
+                rect.height
+            )));
+        }
+        Ok(())
     }
 
     /// Zero-copy export of a scanout resource, when the host can do it.

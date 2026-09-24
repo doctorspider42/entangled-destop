@@ -384,6 +384,11 @@ impl MmioTransport {
         self.state.save()
     }
 
+    /// Why this slot's device would refuse a snapshot now (ADR-0006).
+    pub fn snapshot_refusal(&self) -> Option<String> {
+        self.state.snapshot_refusal()
+    }
+
     /// Puts a saved slot back. See [`TransportState::load`] for the order and
     /// for what a refusal means.
     pub fn load(
@@ -429,6 +434,7 @@ mod tests {
         resets: usize,
         notifies: NotifyLog,
         activated_queues: usize,
+        refusal: Option<String>,
     }
 
     impl Default for TestDevice {
@@ -446,6 +452,7 @@ mod tests {
                 resets: 0,
                 notifies: NotifyLog::default(),
                 activated_queues: 0,
+                refusal: None,
             }
         }
     }
@@ -522,6 +529,10 @@ mod tests {
             self.acked = None;
             self.activated_queues = 0;
         }
+
+        fn snapshot_refusal(&self) -> Option<String> {
+            self.refusal.clone()
+        }
     }
 
     fn transport_with(device: TestDevice) -> (MmioTransport, Arc<TestIrqLine>) {
@@ -545,6 +556,22 @@ mod tests {
 
     fn write_reg(transport: &mut MmioTransport, offset: u64, value: u32) {
         transport.write(offset, &value.to_le_bytes());
+    }
+
+    /// ADR-0006: a device's refusal reaches whoever asks the transport, word
+    /// for word, and a device that has none refuses nothing.
+    #[test]
+    fn a_snapshot_refusal_is_the_device_s_own_sentence() {
+        let (transport, _) = transport();
+        assert_eq!(transport.snapshot_refusal(), None);
+        let (transport, _) = transport_with(TestDevice {
+            refusal: Some("host GPU objects cannot be saved".into()),
+            ..TestDevice::default()
+        });
+        assert_eq!(
+            transport.snapshot_refusal().as_deref(),
+            Some("host GPU objects cannot be saved")
+        );
     }
 
     /// The behaviour that was a real bug fix once and must not regress: a

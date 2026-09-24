@@ -1,0 +1,577 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<registry>
+    <comment>
+Copyright 2020 Google LLC
+
+SPDX-License-Identifier: Apache-2.0 OR MIT
+    </comment>
+
+    <comment>
+This file, VK_EXT_command_serialization.xml, provides definitions for
+VK_EXT_command_serialization. These definitions are used by Vulkan
+virtualization or remoting, and are not exposed to applications.
+    </comment>
+
+    <types>
+        <type requires="VkCommandFlagBitsEXT"             category="bitmask">typedef <type>VkFlags</type> <name>VkCommandFlagsEXT</name>;</type>
+
+        <type name="VkCommandTypeEXT" category="enum"/>
+        <type name="VkCommandFlagBitsEXT" category="enum"/>
+    </types>
+
+    <enums name="VkCommandTypeEXT" type="enum">
+        <comment>VK_BASE_VERSION_1_0</comment>
+        <enum value="0"     name="VK_COMMAND_TYPE_vkCreateInstance_EXT"/>
+        <enum value="1"     name="VK_COMMAND_TYPE_vkDestroyInstance_EXT"/>
+        <enum value="2"     name="VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT"/>
+        <enum value="3"     name="VK_COMMAND_TYPE_vkGetPhysicalDeviceFeatures_EXT"/>
+        <enum value="4"     name="VK_COMMAND_TYPE_vkGetPhysicalDeviceFormatProperties_EXT"/>
+        <enum value="5"     name="VK_COMMAND_TYPE_vkGetPhysicalDeviceImageFormatProperties_EXT"/>
+        <enum value="6"     name="VK_COMMAND_TYPE_vkGetPhysicalDeviceProperties_EXT"/>
+        <enum value="7"     name="VK_COMMAND_TYPE_vkGetPhysicalDeviceQueueFamilyProperties_EXT"/>
+        <enum value="8"     name="VK_COMMAND_TYPE_vkGetPhysicalDeviceMemoryProperties_EXT"/>
+        <enum value="9"     name="VK_COMMAND_TYPE_vkGetInstanceProcAddr_EXT"/>
+        <enum value="10"    name="VK_COMMAND_TYPE_vkGetDeviceProcAddr_EXT"/>
+        <enum value="11"    name="VK_COMMAND_TYPE_vkCreateDevice_EXT"/>
+        <enum value="12"    name="VK_COMMAND_TYPE_vkDestroyDevice_EXT"/>
+        <enum value="13"    name="VK_COMMAND_TYPE_vkEnumerateInstanceExtensionProperties_EXT"/>
+        <enum value="14"    name="VK_COMMAND_TYPE_vkEnumerateDeviceExtensionProperties_EXT"/>
+        <enum value="15"    name="VK_COMMAND_TYPE_vkEnumerateInstanceLayerProperties_EXT"/>
+        <enum value="16"    name="VK_COMMAND_TYPE_vkEnumerateDeviceLayerProperties_EXT"/>
+        <enum value="17"    name="VK_COMMAND_TYPE_vkGetDeviceQueue_EXT"/>
+        <enum value="18"    name="VK_COMMAND_TYPE_vkQueueSubmit_EXT"/>
+        <enum value="19"    name="VK_COMMAND_TYPE_vkQueueWaitIdle_EXT"/>
+        <enum value="20"    name="VK_COMMAND_TYPE_vkDeviceWaitIdle_EXT"/>
+        <enum value="21"    name="VK_COMMAND_TYPE_vkAllocateMemory_EXT"/>
+        <enum value="22"    name="VK_COMMAND_TYPE_vkFreeMemory_EXT"/>
+        <enum value="23"    name="VK_COMMAND_TYPE_vkMapMemory_EXT"/>
+        <enum value="24"    name="VK_COMMAND_TYPE_vkUnmapMemory_EXT"/>
+        <enum value="25"    name="VK_COMMAND_TYPE_vkFlushMappedMemoryRanges_EXT"/>
+        <enum value="26"    name="VK_COMMAND_TYPE_vkInvalidateMappedMemoryRanges_EXT"/>
+        <enum value="27"    name="VK_COMMAND_TYPE_vkGetDeviceMemoryCommitment_EXT"/>
+        <enum value="28"    name="VK_COMMAND_TYPE_vkBindBufferMemory_EXT"/>
+        <enum value="29"    name="VK_COMMAND_TYPE_vkBindImageMemory_EXT"/>
+        <enum value="30"    name="VK_COMMAND_TYPE_vkGetBufferMemoryRequirements_EXT"/>
+        <enum value="31"    name="VK_COMMAND_TYPE_vkGetImageMemoryRequirements_EXT"/>
+        <enum value="32"    name="VK_COMMAND_TYPE_vkGetImageSparseMemoryRequirements_EXT"/>
+        <enum value="33"    name="VK_COMMAND_TYPE_vkGetPhysicalDeviceSparseImageFormatProperties_EXT"/>
+        <enum value="34"    name="VK_COMMAND_TYPE_vkQueueBindSparse_EXT"/>
+        <enum value="35"    name="VK_COMMAND_TYPE_vkCreateFence_EXT"/>
+        <enum value="36"    name="VK_COMMAND_TYPE_vkDestroyFence_EXT"/>
+        <enum value="37"    name="VK_COMMAND_TYPE_vkResetFences_EXT"/>
+        <enum value="38"    name="VK_COMMAND_TYPE_vkGetFenceStatus_EXT"/>
+        <enum value="39"    name="VK_COMMAND_TYPE_vkWaitForFences_EXT"/>
+        <enum value="40"    name="VK_COMMAND_TYPE_vkCreateSemaphore_EXT"/>
+        <enum value="41"    name="VK_COMMAND_TYPE_vkDestroySemaphore_EXT"/>
+        <enum value="47"    name="VK_COMMAND_TYPE_vkCreateQueryPool_EXT"/>
+        <enum value="48"    name="VK_COMMAND_TYPE_vkDestroyQueryPool_EXT"/>
+        <enum value="49"    name="VK_COMMAND_TYPE_vkGetQueryPoolResults_EXT"/>
+        <enum value="50"    name="VK_COMMAND_TYPE_vkCreateBuffer_EXT"/>
+        <enum value="51"    name="VK_COMMAND_TYPE_vkDestroyBuffer_EXT"/>
+        <enum value="54"    name="VK_COMMAND_TYPE_vkCreateImage_EXT"/>
+        <enum value="55"    name="VK_COMMAND_TYPE_vkDestroyImage_EXT"/>
+        <enum value="56"    name="VK_COMMAND_TYPE_vkGetImageSubresourceLayout_EXT"/>
+        <enum value="57"    name="VK_COMMAND_TYPE_vkCreateImageView_EXT"/>
+        <enum value="58"    name="VK_COMMAND_TYPE_vkDestroyImageView_EXT"/>
+        <enum value="85"    name="VK_COMMAND_TYPE_vkCreateCommandPool_EXT"/>
+        <enum value="86"    name="VK_COMMAND_TYPE_vkDestroyCommandPool_EXT"/>
+        <enum value="87"    name="VK_COMMAND_TYPE_vkResetCommandPool_EXT"/>
+        <enum value="88"    name="VK_COMMAND_TYPE_vkAllocateCommandBuffers_EXT"/>
+        <enum value="89"    name="VK_COMMAND_TYPE_vkFreeCommandBuffers_EXT"/>
+        <enum value="90"    name="VK_COMMAND_TYPE_vkBeginCommandBuffer_EXT"/>
+        <enum value="91"    name="VK_COMMAND_TYPE_vkEndCommandBuffer_EXT"/>
+        <enum value="92"    name="VK_COMMAND_TYPE_vkResetCommandBuffer_EXT"/>
+        <enum value="112"   name="VK_COMMAND_TYPE_vkCmdCopyBuffer_EXT"/>
+        <enum value="113"   name="VK_COMMAND_TYPE_vkCmdCopyImage_EXT"/>
+        <enum value="115"   name="VK_COMMAND_TYPE_vkCmdCopyBufferToImage_EXT"/>
+        <enum value="116"   name="VK_COMMAND_TYPE_vkCmdCopyImageToBuffer_EXT"/>
+        <enum value="117"   name="VK_COMMAND_TYPE_vkCmdUpdateBuffer_EXT"/>
+        <enum value="118"   name="VK_COMMAND_TYPE_vkCmdFillBuffer_EXT"/>
+        <enum value="126"   name="VK_COMMAND_TYPE_vkCmdPipelineBarrier_EXT"/>
+        <enum value="127"   name="VK_COMMAND_TYPE_vkCmdBeginQuery_EXT"/>
+        <enum value="128"   name="VK_COMMAND_TYPE_vkCmdEndQuery_EXT"/>
+        <enum value="129"   name="VK_COMMAND_TYPE_vkCmdResetQueryPool_EXT"/>
+        <enum value="130"   name="VK_COMMAND_TYPE_vkCmdWriteTimestamp_EXT"/>
+        <enum value="131"   name="VK_COMMAND_TYPE_vkCmdCopyQueryPoolResults_EXT"/>
+        <enum value="136"   name="VK_COMMAND_TYPE_vkCmdExecuteCommands_EXT"/>
+
+        <comment>VK_COMPUTE_VERSION_1_0</comment>
+        <enum value="42"    name="VK_COMMAND_TYPE_vkCreateEvent_EXT"/>
+        <enum value="43"    name="VK_COMMAND_TYPE_vkDestroyEvent_EXT"/>
+        <enum value="44"    name="VK_COMMAND_TYPE_vkGetEventStatus_EXT"/>
+        <enum value="45"    name="VK_COMMAND_TYPE_vkSetEvent_EXT"/>
+        <enum value="46"    name="VK_COMMAND_TYPE_vkResetEvent_EXT"/>
+        <enum value="52"    name="VK_COMMAND_TYPE_vkCreateBufferView_EXT"/>
+        <enum value="53"    name="VK_COMMAND_TYPE_vkDestroyBufferView_EXT"/>
+        <enum value="59"    name="VK_COMMAND_TYPE_vkCreateShaderModule_EXT"/>
+        <enum value="60"    name="VK_COMMAND_TYPE_vkDestroyShaderModule_EXT"/>
+        <enum value="61"    name="VK_COMMAND_TYPE_vkCreatePipelineCache_EXT"/>
+        <enum value="62"    name="VK_COMMAND_TYPE_vkDestroyPipelineCache_EXT"/>
+        <enum value="63"    name="VK_COMMAND_TYPE_vkGetPipelineCacheData_EXT"/>
+        <enum value="64"    name="VK_COMMAND_TYPE_vkMergePipelineCaches_EXT"/>
+        <enum value="66"    name="VK_COMMAND_TYPE_vkCreateComputePipelines_EXT"/>
+        <enum value="67"    name="VK_COMMAND_TYPE_vkDestroyPipeline_EXT"/>
+        <enum value="68"    name="VK_COMMAND_TYPE_vkCreatePipelineLayout_EXT"/>
+        <enum value="69"    name="VK_COMMAND_TYPE_vkDestroyPipelineLayout_EXT"/>
+        <enum value="70"    name="VK_COMMAND_TYPE_vkCreateSampler_EXT"/>
+        <enum value="71"    name="VK_COMMAND_TYPE_vkDestroySampler_EXT"/>
+        <enum value="72"    name="VK_COMMAND_TYPE_vkCreateDescriptorSetLayout_EXT"/>
+        <enum value="73"    name="VK_COMMAND_TYPE_vkDestroyDescriptorSetLayout_EXT"/>
+        <enum value="74"    name="VK_COMMAND_TYPE_vkCreateDescriptorPool_EXT"/>
+        <enum value="75"    name="VK_COMMAND_TYPE_vkDestroyDescriptorPool_EXT"/>
+        <enum value="76"    name="VK_COMMAND_TYPE_vkResetDescriptorPool_EXT"/>
+        <enum value="77"    name="VK_COMMAND_TYPE_vkAllocateDescriptorSets_EXT"/>
+        <enum value="78"    name="VK_COMMAND_TYPE_vkFreeDescriptorSets_EXT"/>
+        <enum value="79"    name="VK_COMMAND_TYPE_vkUpdateDescriptorSets_EXT"/>
+        <enum value="93"    name="VK_COMMAND_TYPE_vkCmdBindPipeline_EXT"/>
+        <enum value="103"   name="VK_COMMAND_TYPE_vkCmdBindDescriptorSets_EXT"/>
+        <enum value="119"   name="VK_COMMAND_TYPE_vkCmdClearColorImage_EXT"/>
+        <enum value="110"   name="VK_COMMAND_TYPE_vkCmdDispatch_EXT"/>
+        <enum value="111"   name="VK_COMMAND_TYPE_vkCmdDispatchIndirect_EXT"/>
+        <enum value="123"   name="VK_COMMAND_TYPE_vkCmdSetEvent_EXT"/>
+        <enum value="124"   name="VK_COMMAND_TYPE_vkCmdResetEvent_EXT"/>
+        <enum value="125"   name="VK_COMMAND_TYPE_vkCmdWaitEvents_EXT"/>
+        <enum value="132"   name="VK_COMMAND_TYPE_vkCmdPushConstants_EXT"/>
+
+        <comment>VK_GRAPHICS_VERSION_1_0</comment>
+        <enum value="65"    name="VK_COMMAND_TYPE_vkCreateGraphicsPipelines_EXT"/>
+        <enum value="80"    name="VK_COMMAND_TYPE_vkCreateFramebuffer_EXT"/>
+        <enum value="81"    name="VK_COMMAND_TYPE_vkDestroyFramebuffer_EXT"/>
+        <enum value="82"    name="VK_COMMAND_TYPE_vkCreateRenderPass_EXT"/>
+        <enum value="83"    name="VK_COMMAND_TYPE_vkDestroyRenderPass_EXT"/>
+        <enum value="84"    name="VK_COMMAND_TYPE_vkGetRenderAreaGranularity_EXT"/>
+        <enum value="94"    name="VK_COMMAND_TYPE_vkCmdSetViewport_EXT"/>
+        <enum value="95"    name="VK_COMMAND_TYPE_vkCmdSetScissor_EXT"/>
+        <enum value="96"    name="VK_COMMAND_TYPE_vkCmdSetLineWidth_EXT"/>
+        <enum value="97"    name="VK_COMMAND_TYPE_vkCmdSetDepthBias_EXT"/>
+        <enum value="98"    name="VK_COMMAND_TYPE_vkCmdSetBlendConstants_EXT"/>
+        <enum value="99"    name="VK_COMMAND_TYPE_vkCmdSetDepthBounds_EXT"/>
+        <enum value="100"   name="VK_COMMAND_TYPE_vkCmdSetStencilCompareMask_EXT"/>
+        <enum value="101"   name="VK_COMMAND_TYPE_vkCmdSetStencilWriteMask_EXT"/>
+        <enum value="102"   name="VK_COMMAND_TYPE_vkCmdSetStencilReference_EXT"/>
+        <enum value="104"   name="VK_COMMAND_TYPE_vkCmdBindIndexBuffer_EXT"/>
+        <enum value="105"   name="VK_COMMAND_TYPE_vkCmdBindVertexBuffers_EXT"/>
+        <enum value="106"   name="VK_COMMAND_TYPE_vkCmdDraw_EXT"/>
+        <enum value="107"   name="VK_COMMAND_TYPE_vkCmdDrawIndexed_EXT"/>
+        <enum value="108"   name="VK_COMMAND_TYPE_vkCmdDrawIndirect_EXT"/>
+        <enum value="109"   name="VK_COMMAND_TYPE_vkCmdDrawIndexedIndirect_EXT"/>
+        <enum value="114"   name="VK_COMMAND_TYPE_vkCmdBlitImage_EXT"/>
+        <enum value="120"   name="VK_COMMAND_TYPE_vkCmdClearDepthStencilImage_EXT"/>
+        <enum value="121"   name="VK_COMMAND_TYPE_vkCmdClearAttachments_EXT"/>
+        <enum value="122"   name="VK_COMMAND_TYPE_vkCmdResolveImage_EXT"/>
+        <enum value="133"   name="VK_COMMAND_TYPE_vkCmdBeginRenderPass_EXT"/>
+        <enum value="134"   name="VK_COMMAND_TYPE_vkCmdNextSubpass_EXT"/>
+        <enum value="135"   name="VK_COMMAND_TYPE_vkCmdEndRenderPass_EXT"/>
+
+        <comment>VK_VERSION_1_0</comment>
+
+        <comment>VK_BASE_VERSION_1_1</comment>
+        <enum value="137"   name="VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT"/>
+        <enum value="138"   name="VK_COMMAND_TYPE_vkBindBufferMemory2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkBindBufferMemory2KHR_EXT" alias="VK_COMMAND_TYPE_vkBindBufferMemory2_EXT"/>
+        <enum value="139"   name="VK_COMMAND_TYPE_vkBindImageMemory2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkBindImageMemory2KHR_EXT" alias="VK_COMMAND_TYPE_vkBindImageMemory2_EXT"/>
+        <enum value="140"   name="VK_COMMAND_TYPE_vkGetDeviceGroupPeerMemoryFeatures_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetDeviceGroupPeerMemoryFeaturesKHR_EXT" alias="VK_COMMAND_TYPE_vkGetDeviceGroupPeerMemoryFeatures_EXT"/>
+        <enum value="141"   name="VK_COMMAND_TYPE_vkCmdSetDeviceMask_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetDeviceMaskKHR_EXT" alias="VK_COMMAND_TYPE_vkCmdSetDeviceMask_EXT"/>
+        <enum value="143"   name="VK_COMMAND_TYPE_vkEnumeratePhysicalDeviceGroups_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkEnumeratePhysicalDeviceGroupsKHR_EXT" alias="VK_COMMAND_TYPE_vkEnumeratePhysicalDeviceGroups_EXT"/>
+        <enum value="144"   name="VK_COMMAND_TYPE_vkGetImageMemoryRequirements2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetImageMemoryRequirements2KHR_EXT" alias="VK_COMMAND_TYPE_vkGetImageMemoryRequirements2_EXT"/>
+        <enum value="145"   name="VK_COMMAND_TYPE_vkGetBufferMemoryRequirements2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetBufferMemoryRequirements2KHR_EXT" alias="VK_COMMAND_TYPE_vkGetBufferMemoryRequirements2_EXT"/>
+        <enum value="146"   name="VK_COMMAND_TYPE_vkGetImageSparseMemoryRequirements2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetImageSparseMemoryRequirements2KHR_EXT" alias="VK_COMMAND_TYPE_vkGetImageSparseMemoryRequirements2_EXT"/>
+        <enum value="147"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceFeatures2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceFeatures2KHR_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceFeatures2_EXT"/>
+        <enum value="148"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceProperties2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceProperties2KHR_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceProperties2_EXT"/>
+        <enum value="149"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceFormatProperties2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceFormatProperties2KHR_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceFormatProperties2_EXT"/>
+        <enum value="150"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceImageFormatProperties2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceImageFormatProperties2KHR_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceImageFormatProperties2_EXT"/>
+        <enum value="151"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceQueueFamilyProperties2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceQueueFamilyProperties2KHR_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceQueueFamilyProperties2_EXT"/>
+        <enum value="152"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceMemoryProperties2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceMemoryProperties2KHR_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceMemoryProperties2_EXT"/>
+        <enum value="153"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceSparseImageFormatProperties2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceSparseImageFormatProperties2KHR_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceSparseImageFormatProperties2_EXT"/>
+        <enum value="154"   name="VK_COMMAND_TYPE_vkTrimCommandPool_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkTrimCommandPoolKHR_EXT" alias="VK_COMMAND_TYPE_vkTrimCommandPool_EXT"/>
+        <enum value="155"   name="VK_COMMAND_TYPE_vkGetDeviceQueue2_EXT"/>
+        <enum value="161"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceExternalBufferProperties_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceExternalBufferPropertiesKHR_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceExternalBufferProperties_EXT"/>
+        <enum value="162"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceExternalFenceProperties_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceExternalFencePropertiesKHR_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceExternalFenceProperties_EXT"/>
+        <enum value="163"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceExternalSemaphoreProperties_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceExternalSemaphorePropertiesKHR_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceExternalSemaphoreProperties_EXT"/>
+
+        <comment>VK_COMPUTE_VERSION_1_1</comment>
+        <enum value="142"   name="VK_COMMAND_TYPE_vkCmdDispatchBase_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdDispatchBaseKHR_EXT" alias="VK_COMMAND_TYPE_vkCmdDispatchBase_EXT"/>
+        <enum value="158"   name="VK_COMMAND_TYPE_vkCreateDescriptorUpdateTemplate_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCreateDescriptorUpdateTemplateKHR_EXT" alias="VK_COMMAND_TYPE_vkCreateDescriptorUpdateTemplate_EXT"/>
+        <enum value="159"   name="VK_COMMAND_TYPE_vkDestroyDescriptorUpdateTemplate_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkDestroyDescriptorUpdateTemplateKHR_EXT" alias="VK_COMMAND_TYPE_vkDestroyDescriptorUpdateTemplate_EXT"/>
+        <enum value="160"   name="VK_COMMAND_TYPE_vkUpdateDescriptorSetWithTemplate_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkUpdateDescriptorSetWithTemplateKHR_EXT" alias="VK_COMMAND_TYPE_vkUpdateDescriptorSetWithTemplate_EXT"/>
+        <enum value="164"   name="VK_COMMAND_TYPE_vkGetDescriptorSetLayoutSupport_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetDescriptorSetLayoutSupportKHR_EXT" alias="VK_COMMAND_TYPE_vkGetDescriptorSetLayoutSupport_EXT"/>
+        <enum value="156"   name="VK_COMMAND_TYPE_vkCreateSamplerYcbcrConversion_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCreateSamplerYcbcrConversionKHR_EXT" alias="VK_COMMAND_TYPE_vkCreateSamplerYcbcrConversion_EXT"/>
+        <enum value="157"   name="VK_COMMAND_TYPE_vkDestroySamplerYcbcrConversion_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkDestroySamplerYcbcrConversionKHR_EXT" alias="VK_COMMAND_TYPE_vkDestroySamplerYcbcrConversion_EXT"/>
+
+        <comment>VK_GRAPHICS_VERSION_1_1</comment>
+
+        <comment>VK_VERSION_1_1</comment>
+
+        <comment>VK_BASE_VERSION_1_2</comment>
+        <enum value="171"   name="VK_COMMAND_TYPE_vkResetQueryPool_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkResetQueryPoolEXT_EXT" alias="VK_COMMAND_TYPE_vkResetQueryPool_EXT"/>
+        <enum value="172"   name="VK_COMMAND_TYPE_vkGetSemaphoreCounterValue_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetSemaphoreCounterValueKHR_EXT" alias="VK_COMMAND_TYPE_vkGetSemaphoreCounterValue_EXT"/>
+        <enum value="173"   name="VK_COMMAND_TYPE_vkWaitSemaphores_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkWaitSemaphoresKHR_EXT" alias="VK_COMMAND_TYPE_vkWaitSemaphores_EXT"/>
+        <enum value="174"   name="VK_COMMAND_TYPE_vkSignalSemaphore_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkSignalSemaphoreKHR_EXT" alias="VK_COMMAND_TYPE_vkSignalSemaphore_EXT"/>
+        <enum value="175"   name="VK_COMMAND_TYPE_vkGetBufferDeviceAddress_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetBufferDeviceAddressKHR_EXT" alias="VK_COMMAND_TYPE_vkGetBufferDeviceAddress_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetBufferDeviceAddressEXT_EXT" alias="VK_COMMAND_TYPE_vkGetBufferDeviceAddress_EXT"/>
+        <enum value="176"   name="VK_COMMAND_TYPE_vkGetBufferOpaqueCaptureAddress_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetBufferOpaqueCaptureAddressKHR_EXT" alias="VK_COMMAND_TYPE_vkGetBufferOpaqueCaptureAddress_EXT"/>
+        <enum value="177"   name="VK_COMMAND_TYPE_vkGetDeviceMemoryOpaqueCaptureAddress_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetDeviceMemoryOpaqueCaptureAddressKHR_EXT" alias="VK_COMMAND_TYPE_vkGetDeviceMemoryOpaqueCaptureAddress_EXT"/>
+
+        <comment>VK_COMPUTE_VERSION_1_2</comment>
+
+        <comment>VK_GRAPHICS_VERSION_1_2</comment>
+        <enum value="165"   name="VK_COMMAND_TYPE_vkCmdDrawIndirectCount_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdDrawIndirectCountKHR_EXT" alias="VK_COMMAND_TYPE_vkCmdDrawIndirectCount_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdDrawIndirectCountAMD_EXT" alias="VK_COMMAND_TYPE_vkCmdDrawIndirectCount_EXT"/>
+        <enum value="166"   name="VK_COMMAND_TYPE_vkCmdDrawIndexedIndirectCount_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdDrawIndexedIndirectCountKHR_EXT" alias="VK_COMMAND_TYPE_vkCmdDrawIndexedIndirectCount_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdDrawIndexedIndirectCountAMD_EXT" alias="VK_COMMAND_TYPE_vkCmdDrawIndexedIndirectCount_EXT"/>
+        <enum value="167"   name="VK_COMMAND_TYPE_vkCreateRenderPass2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCreateRenderPass2KHR_EXT" alias="VK_COMMAND_TYPE_vkCreateRenderPass2_EXT"/>
+        <enum value="168"   name="VK_COMMAND_TYPE_vkCmdBeginRenderPass2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdBeginRenderPass2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdBeginRenderPass2_EXT"/>
+        <enum value="169"   name="VK_COMMAND_TYPE_vkCmdNextSubpass2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdNextSubpass2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdNextSubpass2_EXT"/>
+        <enum value="170"   name="VK_COMMAND_TYPE_vkCmdEndRenderPass2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdEndRenderPass2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdEndRenderPass2_EXT"/>
+
+        <comment>VK_VERSION_1_2</comment>
+
+        <comment>VK_BASE_VERSION_1_3</comment>
+        <enum value="196"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceToolProperties_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceToolPropertiesEXT_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceToolProperties_EXT"/>
+        <enum value="197"   name="VK_COMMAND_TYPE_vkCreatePrivateDataSlot_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCreatePrivateDataSlotEXT_EXT" alias="VK_COMMAND_TYPE_vkCreatePrivateDataSlot_EXT"/>
+        <enum value="198"   name="VK_COMMAND_TYPE_vkDestroyPrivateDataSlot_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkDestroyPrivateDataSlotEXT_EXT" alias="VK_COMMAND_TYPE_vkDestroyPrivateDataSlot_EXT"/>
+        <enum value="199"   name="VK_COMMAND_TYPE_vkSetPrivateData_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkSetPrivateDataEXT_EXT" alias="VK_COMMAND_TYPE_vkSetPrivateData_EXT"/>
+        <enum value="200"   name="VK_COMMAND_TYPE_vkGetPrivateData_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPrivateDataEXT_EXT" alias="VK_COMMAND_TYPE_vkGetPrivateData_EXT"/>
+        <enum value="204"   name="VK_COMMAND_TYPE_vkCmdPipelineBarrier2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdPipelineBarrier2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdPipelineBarrier2_EXT"/>
+        <enum value="205"   name="VK_COMMAND_TYPE_vkCmdWriteTimestamp2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdWriteTimestamp2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdWriteTimestamp2_EXT"/>
+        <enum value="206"   name="VK_COMMAND_TYPE_vkQueueSubmit2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkQueueSubmit2KHR_EXT" alias="VK_COMMAND_TYPE_vkQueueSubmit2_EXT"/>
+        <enum value="207"   name="VK_COMMAND_TYPE_vkCmdCopyBuffer2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdCopyBuffer2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdCopyBuffer2_EXT"/>
+        <enum value="208"   name="VK_COMMAND_TYPE_vkCmdCopyImage2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdCopyImage2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdCopyImage2_EXT"/>
+        <enum value="209"   name="VK_COMMAND_TYPE_vkCmdCopyBufferToImage2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdCopyBufferToImage2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdCopyBufferToImage2_EXT"/>
+        <enum value="210"   name="VK_COMMAND_TYPE_vkCmdCopyImageToBuffer2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdCopyImageToBuffer2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdCopyImageToBuffer2_EXT"/>
+        <enum value="230"   name="VK_COMMAND_TYPE_vkGetDeviceBufferMemoryRequirements_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetDeviceBufferMemoryRequirementsKHR_EXT" alias="VK_COMMAND_TYPE_vkGetDeviceBufferMemoryRequirements_EXT"/>
+        <enum value="231"   name="VK_COMMAND_TYPE_vkGetDeviceImageMemoryRequirements_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetDeviceImageMemoryRequirementsKHR_EXT" alias="VK_COMMAND_TYPE_vkGetDeviceImageMemoryRequirements_EXT"/>
+        <enum value="232"   name="VK_COMMAND_TYPE_vkGetDeviceImageSparseMemoryRequirements_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetDeviceImageSparseMemoryRequirementsKHR_EXT" alias="VK_COMMAND_TYPE_vkGetDeviceImageSparseMemoryRequirements_EXT"/>
+
+        <comment>VK_COMPUTE_VERSION_1_3</comment>
+        <enum value="201"   name="VK_COMMAND_TYPE_vkCmdSetEvent2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetEvent2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdSetEvent2_EXT"/>
+        <enum value="202"   name="VK_COMMAND_TYPE_vkCmdResetEvent2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdResetEvent2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdResetEvent2_EXT"/>
+        <enum value="203"   name="VK_COMMAND_TYPE_vkCmdWaitEvents2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdWaitEvents2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdWaitEvents2_EXT"/>
+
+        <comment>VK_GRAPHICS_VERSION_1_3</comment>
+        <enum value="211"   name="VK_COMMAND_TYPE_vkCmdBlitImage2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdBlitImage2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdBlitImage2_EXT"/>
+        <enum value="212"   name="VK_COMMAND_TYPE_vkCmdResolveImage2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdResolveImage2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdResolveImage2_EXT"/>
+        <enum value="213"   name="VK_COMMAND_TYPE_vkCmdBeginRendering_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdBeginRenderingKHR_EXT" alias="VK_COMMAND_TYPE_vkCmdBeginRendering_EXT"/>
+        <enum value="214"   name="VK_COMMAND_TYPE_vkCmdEndRendering_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdEndRenderingKHR_EXT" alias="VK_COMMAND_TYPE_vkCmdEndRendering_EXT"/>
+        <enum value="215"   name="VK_COMMAND_TYPE_vkCmdSetCullMode_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetCullModeEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetCullMode_EXT"/>
+        <enum value="216"   name="VK_COMMAND_TYPE_vkCmdSetFrontFace_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetFrontFaceEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetFrontFace_EXT"/>
+        <enum value="217"   name="VK_COMMAND_TYPE_vkCmdSetPrimitiveTopology_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetPrimitiveTopologyEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetPrimitiveTopology_EXT"/>
+        <enum value="218"   name="VK_COMMAND_TYPE_vkCmdSetViewportWithCount_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetViewportWithCountEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetViewportWithCount_EXT"/>
+        <enum value="219"   name="VK_COMMAND_TYPE_vkCmdSetScissorWithCount_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetScissorWithCountEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetScissorWithCount_EXT"/>
+        <enum value="220"   name="VK_COMMAND_TYPE_vkCmdBindVertexBuffers2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdBindVertexBuffers2EXT_EXT" alias="VK_COMMAND_TYPE_vkCmdBindVertexBuffers2_EXT"/>
+        <enum value="221"   name="VK_COMMAND_TYPE_vkCmdSetDepthTestEnable_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetDepthTestEnableEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetDepthTestEnable_EXT"/>
+        <enum value="222"   name="VK_COMMAND_TYPE_vkCmdSetDepthWriteEnable_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetDepthWriteEnableEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetDepthWriteEnable_EXT"/>
+        <enum value="223"   name="VK_COMMAND_TYPE_vkCmdSetDepthCompareOp_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetDepthCompareOpEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetDepthCompareOp_EXT"/>
+        <enum value="224"   name="VK_COMMAND_TYPE_vkCmdSetDepthBoundsTestEnable_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetDepthBoundsTestEnableEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetDepthBoundsTestEnable_EXT"/>
+        <enum value="225"   name="VK_COMMAND_TYPE_vkCmdSetStencilTestEnable_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetStencilTestEnableEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetStencilTestEnable_EXT"/>
+        <enum value="226"   name="VK_COMMAND_TYPE_vkCmdSetStencilOp_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetStencilOpEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetStencilOp_EXT"/>
+        <enum value="227"   name="VK_COMMAND_TYPE_vkCmdSetRasterizerDiscardEnable_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetRasterizerDiscardEnableEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetRasterizerDiscardEnable_EXT"/>
+        <enum value="228"   name="VK_COMMAND_TYPE_vkCmdSetDepthBiasEnable_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetDepthBiasEnableEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetDepthBiasEnable_EXT"/>
+        <enum value="229"   name="VK_COMMAND_TYPE_vkCmdSetPrimitiveRestartEnable_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetPrimitiveRestartEnableEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetPrimitiveRestartEnable_EXT"/>
+
+        <comment>VK_VERSION_1_3</comment>
+
+        <comment>VK_BASE_VERSION_1_4</comment>
+        <enum value="285"   name="VK_COMMAND_TYPE_vkMapMemory2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkMapMemory2KHR_EXT" alias="VK_COMMAND_TYPE_vkMapMemory2_EXT"/>
+        <enum value="286"   name="VK_COMMAND_TYPE_vkUnmapMemory2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkUnmapMemory2KHR_EXT" alias="VK_COMMAND_TYPE_vkUnmapMemory2_EXT"/>
+        <enum value="281"   name="VK_COMMAND_TYPE_vkGetDeviceImageSubresourceLayout_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetDeviceImageSubresourceLayoutKHR_EXT" alias="VK_COMMAND_TYPE_vkGetDeviceImageSubresourceLayout_EXT"/>
+        <enum value="282"   name="VK_COMMAND_TYPE_vkGetImageSubresourceLayout2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetImageSubresourceLayout2KHR_EXT" alias="VK_COMMAND_TYPE_vkGetImageSubresourceLayout2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetImageSubresourceLayout2EXT_EXT" alias="VK_COMMAND_TYPE_vkGetImageSubresourceLayout2_EXT"/>
+        <enum value="293"   name="VK_COMMAND_TYPE_vkCopyMemoryToImage_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCopyMemoryToImageEXT_EXT" alias="VK_COMMAND_TYPE_vkCopyMemoryToImage_EXT"/>
+        <enum value="294"   name="VK_COMMAND_TYPE_vkCopyImageToMemory_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCopyImageToMemoryEXT_EXT" alias="VK_COMMAND_TYPE_vkCopyImageToMemory_EXT"/>
+        <enum value="295"   name="VK_COMMAND_TYPE_vkCopyImageToImage_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCopyImageToImageEXT_EXT" alias="VK_COMMAND_TYPE_vkCopyImageToImage_EXT"/>
+        <enum value="296"   name="VK_COMMAND_TYPE_vkTransitionImageLayout_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkTransitionImageLayoutEXT_EXT" alias="VK_COMMAND_TYPE_vkTransitionImageLayout_EXT"/>
+
+        <comment>VK_COMPUTE_VERSION_1_4</comment>
+        <enum value="249"   name="VK_COMMAND_TYPE_vkCmdPushDescriptorSet_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdPushDescriptorSetKHR_EXT" alias="VK_COMMAND_TYPE_vkCmdPushDescriptorSet_EXT"/>
+        <enum value="250"   name="VK_COMMAND_TYPE_vkCmdPushDescriptorSetWithTemplate_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdPushDescriptorSetWithTemplateKHR_EXT" alias="VK_COMMAND_TYPE_vkCmdPushDescriptorSetWithTemplate_EXT"/>
+        <enum value="289"   name="VK_COMMAND_TYPE_vkCmdBindDescriptorSets2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdBindDescriptorSets2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdBindDescriptorSets2_EXT"/>
+        <enum value="290"   name="VK_COMMAND_TYPE_vkCmdPushConstants2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdPushConstants2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdPushConstants2_EXT"/>
+        <enum value="291"   name="VK_COMMAND_TYPE_vkCmdPushDescriptorSet2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdPushDescriptorSet2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdPushDescriptorSet2_EXT"/>
+        <enum value="292"   name="VK_COMMAND_TYPE_vkCmdPushDescriptorSetWithTemplate2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdPushDescriptorSetWithTemplate2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdPushDescriptorSetWithTemplate2_EXT"/>
+
+        <comment>VK_GRAPHICS_VERSION_1_4</comment>
+        <enum value="237"   name="VK_COMMAND_TYPE_vkCmdSetLineStipple_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetLineStippleKHR_EXT" alias="VK_COMMAND_TYPE_vkCmdSetLineStipple_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetLineStippleEXT_EXT" alias="VK_COMMAND_TYPE_vkCmdSetLineStipple_EXT"/>
+        <enum value="279"   name="VK_COMMAND_TYPE_vkCmdBindIndexBuffer2_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdBindIndexBuffer2KHR_EXT" alias="VK_COMMAND_TYPE_vkCmdBindIndexBuffer2_EXT"/>
+        <enum value="280"   name="VK_COMMAND_TYPE_vkGetRenderingAreaGranularity_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetRenderingAreaGranularityKHR_EXT" alias="VK_COMMAND_TYPE_vkGetRenderingAreaGranularity_EXT"/>
+        <enum value="287"   name="VK_COMMAND_TYPE_vkCmdSetRenderingAttachmentLocations_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetRenderingAttachmentLocationsKHR_EXT" alias="VK_COMMAND_TYPE_vkCmdSetRenderingAttachmentLocations_EXT"/>
+        <enum value="288"   name="VK_COMMAND_TYPE_vkCmdSetRenderingInputAttachmentIndices_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkCmdSetRenderingInputAttachmentIndicesKHR_EXT" alias="VK_COMMAND_TYPE_vkCmdSetRenderingInputAttachmentIndices_EXT"/>
+
+        <comment>VK_VERSION_1_4</comment>
+
+        <comment>VK_EXT_transform_feedback</comment>
+        <enum value="181"   name="VK_COMMAND_TYPE_vkCmdBindTransformFeedbackBuffersEXT_EXT"/>
+        <enum value="182"   name="VK_COMMAND_TYPE_vkCmdBeginTransformFeedbackEXT_EXT"/>
+        <enum value="183"   name="VK_COMMAND_TYPE_vkCmdEndTransformFeedbackEXT_EXT"/>
+        <enum value="184"   name="VK_COMMAND_TYPE_vkCmdBeginQueryIndexedEXT_EXT"/>
+        <enum value="185"   name="VK_COMMAND_TYPE_vkCmdEndQueryIndexedEXT_EXT"/>
+        <enum value="186"   name="VK_COMMAND_TYPE_vkCmdDrawIndirectByteCountEXT_EXT"/>
+
+        <comment>VK_KHR_external_memory_fd</comment>
+        <enum value="193"   name="VK_COMMAND_TYPE_vkGetMemoryFdKHR_EXT"/>
+        <enum value="194"   name="VK_COMMAND_TYPE_vkGetMemoryFdPropertiesKHR_EXT"/>
+
+        <comment>VK_KHR_external_semaphore_fd</comment>
+        <enum value="242"   name="VK_COMMAND_TYPE_vkImportSemaphoreFdKHR_EXT"/>
+        <enum value="243"   name="VK_COMMAND_TYPE_vkGetSemaphoreFdKHR_EXT"/>
+
+        <comment>VK_EXT_conditional_rendering</comment>
+        <enum value="240"   name="VK_COMMAND_TYPE_vkCmdBeginConditionalRenderingEXT_EXT"/>
+        <enum value="241"   name="VK_COMMAND_TYPE_vkCmdEndConditionalRenderingEXT_EXT"/>
+
+        <comment>VK_KHR_external_fence_fd</comment>
+        <enum value="238"   name="VK_COMMAND_TYPE_vkImportFenceFdKHR_EXT"/>
+        <enum value="239"   name="VK_COMMAND_TYPE_vkGetFenceFdKHR_EXT"/>
+
+        <comment>VK_EXT_descriptor_heap</comment>
+        <enum value="337"   name="VK_COMMAND_TYPE_vkWriteSamplerDescriptorsEXT_EXT"/>
+        <enum value="338"   name="VK_COMMAND_TYPE_vkWriteResourceDescriptorsEXT_EXT"/>
+        <enum value="339"   name="VK_COMMAND_TYPE_vkCmdBindSamplerHeapEXT_EXT"/>
+        <enum value="340"   name="VK_COMMAND_TYPE_vkCmdBindResourceHeapEXT_EXT"/>
+        <enum value="341"   name="VK_COMMAND_TYPE_vkCmdPushDataEXT_EXT"/>
+        <enum value="342"   name="VK_COMMAND_TYPE_vkGetImageOpaqueCaptureDataEXT_EXT"/>
+        <enum value="343"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceDescriptorSizeEXT_EXT"/>
+        <enum value="344"   name="VK_COMMAND_TYPE_vkRegisterCustomBorderColorEXT_EXT"/>
+        <enum value="345"   name="VK_COMMAND_TYPE_vkUnregisterCustomBorderColorEXT_EXT"/>
+
+        <comment>VK_EXT_sample_locations</comment>
+        <enum value="283"   name="VK_COMMAND_TYPE_vkCmdSetSampleLocationsEXT_EXT"/>
+        <enum value="284"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceMultisamplePropertiesEXT_EXT"/>
+
+        <comment>VK_KHR_acceleration_structure</comment>
+        <enum value="304"   name="VK_COMMAND_TYPE_vkCreateAccelerationStructureKHR_EXT"/>
+        <enum value="305"   name="VK_COMMAND_TYPE_vkDestroyAccelerationStructureKHR_EXT"/>
+        <enum value="306"   name="VK_COMMAND_TYPE_vkCmdBuildAccelerationStructuresKHR_EXT"/>
+        <enum value="307"   name="VK_COMMAND_TYPE_vkCmdBuildAccelerationStructuresIndirectKHR_EXT"/>
+        <enum value="308"   name="VK_COMMAND_TYPE_vkBuildAccelerationStructuresKHR_EXT"/>
+        <enum value="309"   name="VK_COMMAND_TYPE_vkCopyAccelerationStructureKHR_EXT"/>
+        <enum value="310"   name="VK_COMMAND_TYPE_vkCopyAccelerationStructureToMemoryKHR_EXT"/>
+        <enum value="311"   name="VK_COMMAND_TYPE_vkCopyMemoryToAccelerationStructureKHR_EXT"/>
+        <enum value="312"   name="VK_COMMAND_TYPE_vkWriteAccelerationStructuresPropertiesKHR_EXT"/>
+        <enum value="313"   name="VK_COMMAND_TYPE_vkCmdCopyAccelerationStructureKHR_EXT"/>
+        <enum value="314"   name="VK_COMMAND_TYPE_vkCmdCopyAccelerationStructureToMemoryKHR_EXT"/>
+        <enum value="315"   name="VK_COMMAND_TYPE_vkCmdCopyMemoryToAccelerationStructureKHR_EXT"/>
+        <enum value="316"   name="VK_COMMAND_TYPE_vkGetAccelerationStructureDeviceAddressKHR_EXT"/>
+        <enum value="317"   name="VK_COMMAND_TYPE_vkCmdWriteAccelerationStructuresPropertiesKHR_EXT"/>
+        <enum value="318"   name="VK_COMMAND_TYPE_vkGetDeviceAccelerationStructureCompatibilityKHR_EXT"/>
+        <enum value="319"   name="VK_COMMAND_TYPE_vkGetAccelerationStructureBuildSizesKHR_EXT"/>
+
+        <comment>VK_KHR_ray_tracing_pipeline</comment>
+        <enum value="320"   name="VK_COMMAND_TYPE_vkCmdTraceRaysKHR_EXT"/>
+        <enum value="321"   name="VK_COMMAND_TYPE_vkCreateRayTracingPipelinesKHR_EXT"/>
+        <enum value="322"   name="VK_COMMAND_TYPE_vkGetRayTracingShaderGroupHandlesKHR_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetRayTracingShaderGroupHandlesNV_EXT" alias="VK_COMMAND_TYPE_vkGetRayTracingShaderGroupHandlesKHR_EXT"/>
+        <enum value="323"   name="VK_COMMAND_TYPE_vkGetRayTracingCaptureReplayShaderGroupHandlesKHR_EXT"/>
+        <enum value="324"   name="VK_COMMAND_TYPE_vkCmdTraceRaysIndirectKHR_EXT"/>
+        <enum value="325"   name="VK_COMMAND_TYPE_vkGetRayTracingShaderGroupStackSizeKHR_EXT"/>
+        <enum value="326"   name="VK_COMMAND_TYPE_vkCmdSetRayTracingPipelineStackSizeKHR_EXT"/>
+
+        <comment>VK_EXT_image_drm_format_modifier</comment>
+        <enum value="187"   name="VK_COMMAND_TYPE_vkGetImageDrmFormatModifierPropertiesEXT_EXT"/>
+
+        <comment>VK_EXT_calibrated_timestamps</comment>
+        <enum value="235"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT_EXT" alias="VK_COMMAND_TYPE_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR_EXT"/>
+        <enum value="236"   name="VK_COMMAND_TYPE_vkGetCalibratedTimestampsKHR_EXT"/>
+        <enum               name="VK_COMMAND_TYPE_vkGetCalibratedTimestampsEXT_EXT" alias="VK_COMMAND_TYPE_vkGetCalibratedTimestampsKHR_EXT"/>
+
+        <comment>VK_KHR_fragment_shading_rate</comment>
+        <enum value="277"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceFragmentShadingRatesKHR_EXT"/>
+        <enum value="278"   name="VK_COMMAND_TYPE_vkCmdSetFragmentShadingRateKHR_EXT"/>
+
+        <comment>VK_KHR_deferred_host_operations</comment>
+        <enum value="299"   name="VK_COMMAND_TYPE_vkCreateDeferredOperationKHR_EXT"/>
+        <enum value="300"   name="VK_COMMAND_TYPE_vkDestroyDeferredOperationKHR_EXT"/>
+        <enum value="301"   name="VK_COMMAND_TYPE_vkGetDeferredOperationMaxConcurrencyKHR_EXT"/>
+        <enum value="302"   name="VK_COMMAND_TYPE_vkGetDeferredOperationResultKHR_EXT"/>
+        <enum value="303"   name="VK_COMMAND_TYPE_vkDeferredOperationJoinKHR_EXT"/>
+
+        <comment>VK_EXT_depth_bias_control</comment>
+        <enum value="328"   name="VK_COMMAND_TYPE_vkCmdSetDepthBias2EXT_EXT"/>
+
+        <comment>VK_EXT_mesh_shader</comment>
+        <enum value="332"   name="VK_COMMAND_TYPE_vkCmdDrawMeshTasksEXT_EXT"/>
+        <enum value="333"   name="VK_COMMAND_TYPE_vkCmdDrawMeshTasksIndirectEXT_EXT"/>
+        <enum value="334"   name="VK_COMMAND_TYPE_vkCmdDrawMeshTasksIndirectCountEXT_EXT"/>
+
+        <comment>VK_EXT_vertex_input_dynamic_state</comment>
+        <enum value="255"   name="VK_COMMAND_TYPE_vkCmdSetVertexInputEXT_EXT"/>
+
+        <comment>VK_EXT_extended_dynamic_state2</comment>
+        <enum value="233"   name="VK_COMMAND_TYPE_vkCmdSetPatchControlPointsEXT_EXT"/>
+        <enum value="234"   name="VK_COMMAND_TYPE_vkCmdSetLogicOpEXT_EXT"/>
+
+        <comment>VK_EXT_color_write_enable</comment>
+        <enum value="254"   name="VK_COMMAND_TYPE_vkCmdSetColorWriteEnableEXT_EXT"/>
+
+        <comment>VK_KHR_ray_tracing_maintenance1</comment>
+        <enum value="327"   name="VK_COMMAND_TYPE_vkCmdTraceRaysIndirect2KHR_EXT"/>
+
+        <comment>VK_EXT_multi_draw</comment>
+        <enum value="247"   name="VK_COMMAND_TYPE_vkCmdDrawMultiEXT_EXT"/>
+        <enum value="248"   name="VK_COMMAND_TYPE_vkCmdDrawMultiIndexedEXT_EXT"/>
+
+        <comment>VK_EXT_extended_dynamic_state3</comment>
+        <enum value="257"   name="VK_COMMAND_TYPE_vkCmdSetDepthClampEnableEXT_EXT"/>
+        <enum value="258"   name="VK_COMMAND_TYPE_vkCmdSetPolygonModeEXT_EXT"/>
+        <enum value="259"   name="VK_COMMAND_TYPE_vkCmdSetRasterizationSamplesEXT_EXT"/>
+        <enum value="260"   name="VK_COMMAND_TYPE_vkCmdSetSampleMaskEXT_EXT"/>
+        <enum value="261"   name="VK_COMMAND_TYPE_vkCmdSetAlphaToCoverageEnableEXT_EXT"/>
+        <enum value="262"   name="VK_COMMAND_TYPE_vkCmdSetAlphaToOneEnableEXT_EXT"/>
+        <enum value="263"   name="VK_COMMAND_TYPE_vkCmdSetLogicOpEnableEXT_EXT"/>
+        <enum value="264"   name="VK_COMMAND_TYPE_vkCmdSetColorBlendEnableEXT_EXT"/>
+        <enum value="265"   name="VK_COMMAND_TYPE_vkCmdSetColorBlendEquationEXT_EXT"/>
+        <enum value="266"   name="VK_COMMAND_TYPE_vkCmdSetColorWriteMaskEXT_EXT"/>
+        <enum value="256"   name="VK_COMMAND_TYPE_vkCmdSetTessellationDomainOriginEXT_EXT"/>
+        <enum value="267"   name="VK_COMMAND_TYPE_vkCmdSetRasterizationStreamEXT_EXT"/>
+        <enum value="268"   name="VK_COMMAND_TYPE_vkCmdSetConservativeRasterizationModeEXT_EXT"/>
+        <enum value="269"   name="VK_COMMAND_TYPE_vkCmdSetExtraPrimitiveOverestimationSizeEXT_EXT"/>
+        <enum value="270"   name="VK_COMMAND_TYPE_vkCmdSetDepthClipEnableEXT_EXT"/>
+        <enum value="271"   name="VK_COMMAND_TYPE_vkCmdSetSampleLocationsEnableEXT_EXT"/>
+        <enum value="272"   name="VK_COMMAND_TYPE_vkCmdSetColorBlendAdvancedEXT_EXT"/>
+        <enum value="273"   name="VK_COMMAND_TYPE_vkCmdSetProvokingVertexModeEXT_EXT"/>
+        <enum value="274"   name="VK_COMMAND_TYPE_vkCmdSetLineRasterizationModeEXT_EXT"/>
+        <enum value="275"   name="VK_COMMAND_TYPE_vkCmdSetLineStippleEnableEXT_EXT"/>
+        <enum value="276"   name="VK_COMMAND_TYPE_vkCmdSetDepthClipNegativeOneToOneEXT_EXT"/>
+
+        <comment>VK_KHR_cooperative_matrix</comment>
+        <enum value="331"   name="VK_COMMAND_TYPE_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR_EXT"/>
+
+        <comment>VK_EXT_attachment_feedback_loop_dynamic_state</comment>
+        <enum value="329"   name="VK_COMMAND_TYPE_vkCmdSetAttachmentFeedbackLoopEnableEXT_EXT"/>
+
+        <comment>VK_EXT_depth_clamp_control</comment>
+        <enum value="330"   name="VK_COMMAND_TYPE_vkCmdSetDepthClampRangeEXT_EXT"/>
+
+        <comment>VK_MESA_venus_protocol</comment>
+        <enum value="178"   name="VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT"/>
+        <enum value="179"   name="VK_COMMAND_TYPE_vkSeekReplyCommandStreamMESA_EXT"/>
+        <enum value="180"   name="VK_COMMAND_TYPE_vkExecuteCommandStreamsMESA_EXT"/>
+        <enum value="188"   name="VK_COMMAND_TYPE_vkCreateRingMESA_EXT"/>
+        <enum value="189"   name="VK_COMMAND_TYPE_vkDestroyRingMESA_EXT"/>
+        <enum value="190"   name="VK_COMMAND_TYPE_vkNotifyRingMESA_EXT"/>
+        <enum value="191"   name="VK_COMMAND_TYPE_vkWriteRingExtraMESA_EXT"/>
+        <enum value="192"   name="VK_COMMAND_TYPE_vkGetMemoryResourcePropertiesMESA_EXT"/>
+        <enum value="244"   name="VK_COMMAND_TYPE_vkResetFenceResourceMESA_EXT"/>
+        <enum value="245"   name="VK_COMMAND_TYPE_vkWaitSemaphoreResourceMESA_EXT"/>
+        <enum value="246"   name="VK_COMMAND_TYPE_vkImportSemaphoreResourceMESA_EXT"/>
+        <enum value="251"   name="VK_COMMAND_TYPE_vkSubmitVirtqueueSeqnoMESA_EXT"/>
+        <enum value="252"   name="VK_COMMAND_TYPE_vkWaitVirtqueueSeqnoMESA_EXT"/>
+        <enum value="253"   name="VK_COMMAND_TYPE_vkWaitRingSeqnoMESA_EXT"/>
+        <enum value="297"   name="VK_COMMAND_TYPE_vkCopyImageToMemoryMESA_EXT"/>
+        <enum value="298"   name="VK_COMMAND_TYPE_vkCopyMemoryToImageMESA_EXT"/>
+        <enum value="335"   name="VK_COMMAND_TYPE_vkWriteSamplerDescriptorMESA_EXT"/>
+        <enum value="336"   name="VK_COMMAND_TYPE_vkWriteResourceDescriptorMESA_EXT"/>
+    </enums>
+
+    <enums name="VkCommandFlagBitsEXT" type="bitmask">
+        <enum bitpos="0"    name="VK_COMMAND_GENERATE_REPLY_BIT_EXT"/>
+    </enums>
+
+    <extensions>
+        <extension name="VK_EXT_command_serialization" number="384" type="instance" author="EXT" contact="Chia-I Wu @olvaffe1, Yiwei Zhang @zzyiwei" supported="vulkan">
+            <require>
+                <enum value="1"                                             name="VK_EXT_COMMAND_SERIALIZATION_SPEC_VERSION"/>
+                <enum value="&quot;VK_EXT_command_serialization&quot;"      name="VK_EXT_COMMAND_SERIALIZATION_EXTENSION_NAME"/>
+                <type name="VkCommandTypeEXT"/>
+                <type name="VkCommandFlagsEXT"/>
+                <type name="VkCommandFlagBitsEXT"/>
+            </require>
+        </extension>
+    </extensions>
+</registry>

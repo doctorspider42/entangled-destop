@@ -196,6 +196,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             virgl_isolation: control_api::VirglIsolation::default(),
             refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             frame_stats: None,
+            host_visible_mib: None,
         },
         // The installer has nothing to say; the *installed* profile below is
         // where the card and the pad belong.
@@ -299,6 +300,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             virgl_isolation: control_api::VirglIsolation::default(),
             refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             frame_stats: None,
+            host_visible_mib: None,
         },
         // A desktop with no sound is not a desktop (GAME-2102). `auto` never
         // fails a run: a host with no audio device gets a card that plays into

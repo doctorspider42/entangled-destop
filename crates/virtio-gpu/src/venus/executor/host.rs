@@ -1,0 +1,602 @@
+//! The host Vulkan the executor drives, as a trait, so that everything above
+//! it — the object table, the id rules, the policies and the reply shapes —
+//! is provable on a host with no GPU. Stages 5a.3 and 5b.1 have one typed
+//! method per call; stage 5b.2's ~140 commands go through one generic
+//! [`HostVulkan::call`], fed a command the generated translation has already
+//! turned into host handles and checked ([`super::generated`]).
+//!
+//! The trait speaks the **generated protocol structures**, not `ash`'s. That
+//! is the seam's whole point: a fake implements it by filling in plain Rust
+//! values, and the one real implementation
+//! ([`crate::host_vulkan::AshVulkan`]) is the only code that ever converts a
+//! guest-shaped value into a driver-shaped one. Nothing reaches an
+//! implementation that the executor has not already validated — ids resolved
+//! to host objects, enums and flag words range-checked, counts clamped.
+//!
+//! Host objects are associated types and are **owned** by whoever holds them:
+//! `destroy_*` takes the value, so an object cannot be destroyed twice or used
+//! after destruction without the executor's table having handed it out twice,
+//! which it cannot.
+
+use std::fmt;
+use std::sync::Arc;
+
+use super::objects::Kind;
+use crate::venus::protocol::{
+    Command, VkBufferCreateInfo, VkBufferViewCreateInfo, VkCommandPoolCreateInfo,
+    VkDeviceCreateInfoNext, VkExtensionProperties, VkExternalSemaphoreProperties, VkFormat,
+    VkFormatProperties2, VkImageAspectFlagBits, VkImageCreateInfo, VkImageFormatProperties2,
+    VkImageSubresource, VkImageViewCreateInfo, VkMemoryRequirements2, VkPhysicalDeviceFeatures,
+    VkPhysicalDeviceFeatures2, VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceMemoryProperties,
+    VkPhysicalDeviceProperties2, VkQueueFamilyProperties, VkResult, VkSubresourceLayout,
+};
+use crate::venus::shmem::RingPages;
+
+/// Everything the host says about one physical device, gathered once when
+/// a guest instance first enumerates (properties and features are invariant,
+/// which is why virglrenderer caches them too).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HostDeviceInfo {
+    /// `vkGetPhysicalDeviceProperties2` with every structure the protocol can
+    /// carry in that chain and the device's version knows, in any order.
+    pub properties: VkPhysicalDeviceProperties2,
+    /// `vkGetPhysicalDeviceFeatures2`, likewise.
+    pub features: VkPhysicalDeviceFeatures2,
+    /// `vkGetPhysicalDeviceQueueFamilyProperties`.
+    pub queue_families: Vec<VkQueueFamilyProperties>,
+    /// `vkGetPhysicalDeviceMemoryProperties`, exactly as the host reports it.
+    pub memory: VkPhysicalDeviceMemoryProperties,
+    /// `vkEnumerateDeviceExtensionProperties(NULL layer)`.
+    pub extensions: Vec<VkExtensionProperties>,
+    /// The memory types that accept an import of **our own host pages**
+    /// (`VK_EXT_external_memory_host`, `HOST_ALLOCATION`), as the
+    /// `memoryTypeBits` `vkGetMemoryHostPointerPropertiesEXT` answers. `None`
+    /// when the device lacks the extension or the probe failed — and such a
+    /// device is not exposed, because nothing it could map is memory the VMM
+    /// owns (ADR-0004, 2026-09-23).
+    pub host_import_types: Option<u32>,
+    /// `VkPhysicalDeviceExternalMemoryHostPropertiesEXT::minImportedHostPointerAlignment`,
+    /// 0 when unknown.
+    pub host_import_alignment: u64,
+}
+
+/// One `VkPhysicalDeviceGroupProperties`, host side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostGroup<P> {
+    /// The group's members, as host handles.
+    pub members: Vec<P>,
+    /// `subsetAllocation`.
+    pub subset_allocation: bool,
+}
+
+/// The application identity a guest instance asked for, validated as UTF-8.
+/// Forwarded because drivers key application profiles on it, as
+/// virglrenderer forwards it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InstanceRequest {
+    /// `pApplicationName`.
+    pub application_name: Option<String>,
+    /// `applicationVersion`.
+    pub application_version: u32,
+    /// `pEngineName`.
+    pub engine_name: Option<String>,
+    /// `engineVersion`.
+    pub engine_version: u32,
+}
+
+/// One `VkDeviceQueueCreateInfo`, validated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueRequest {
+    /// `flags` (zero or `VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT`).
+    pub flags: u32,
+    /// `queueFamilyIndex`, inside the host's family count.
+    pub family: u32,
+    /// `pQueuePriorities`, one per queue, each in `[0, 1]`.
+    pub priorities: Vec<f32>,
+}
+
+/// A `vkCreateDevice`, rebuilt from the decoded structures and validated —
+/// never the guest's bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceRequest<P> {
+    /// The queues, at most one entry per `(family, flags)`.
+    pub queues: Vec<QueueRequest>,
+    /// Extensions to enable: the guest's (each one we advertised) plus the
+    /// ones the renderer needs for itself.
+    pub extensions: Vec<String>,
+    /// `pEnabledFeatures`.
+    pub features: Option<VkPhysicalDeviceFeatures>,
+    /// The feature and private-data structures of the pNext chain.
+    /// `VkDeviceGroupDeviceCreateInfo` is never in here: it carries handles,
+    /// which arrive translated in [`DeviceRequest::group`].
+    pub chain: Vec<VkDeviceCreateInfoNext>,
+    /// `VkDeviceGroupDeviceCreateInfo::pPhysicalDevices`, as host handles.
+    pub group: Option<Vec<P>>,
+}
+
+/// The resource a `VkMemoryDedicatedAllocateInfo` names, as host handles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dedicated<B, I> {
+    /// A buffer.
+    Buffer(B),
+    /// An image.
+    Image(I),
+}
+
+/// What memory a buffer or an image is created able to be bound to: the
+/// `VkExternalMemory{Buffer,Image}CreateInfo` it gets on the host. Binding
+/// imported or exportable memory is valid only for a resource created for
+/// that handle type (`VUID-vkBindBufferMemory-memory-02985`, `-02727`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceMemory {
+    /// No external memory: plain device memory.
+    Plain,
+    /// `HOST_ALLOCATION`: our own imported pages.
+    HostPages,
+    /// `OPAQUE_WIN32` (stage S1): exportable device-local memory, or an
+    /// import of such memory from another host device of the same GPU.
+    Handle,
+}
+
+/// A `vkAllocateMemory`, rebuilt from the decoded structures and validated.
+///
+/// At most one of `import`, `export_handle` and `import_handle` is set, and
+/// `dedicated` never with any of them.
+#[derive(Debug, Clone)]
+pub struct MemoryRequest<B, I, S> {
+    /// `allocationSize` as the host is asked for it: the guest's, or — for
+    /// an import — the whole of `import`, which is the guest's rounded up to
+    /// the driver's import alignment.
+    pub size: u64,
+    /// `memoryTypeIndex`, the host's own (the guest sees the same indices).
+    pub type_index: u32,
+    /// Our pages, to import with `VK_EXT_external_memory_host`
+    /// (`HOST_ALLOCATION_BIT_EXT`). The host keeps this `Arc` for as long as
+    /// the memory object lives and drops it only after `vkFreeMemory` has
+    /// returned, so the driver can never be left importing freed pages.
+    pub import: Option<Arc<RingPages>>,
+    /// `VkMemoryAllocateFlagsInfo`: `(flags, deviceMask)`.
+    pub flags: Option<(u32, u32)>,
+    /// `VkMemoryDedicatedAllocateInfo`, never with an import.
+    pub dedicated: Option<Dedicated<B, I>>,
+    /// Stage S1: allocated exportable as a host handle
+    /// (`VkExportMemoryAllocateInfo{OPAQUE_WIN32}`), for
+    /// [`HostVulkan::export_memory_handle`].
+    pub export_handle: bool,
+    /// Stage S1: an import of another host device's exported memory
+    /// (`VkImportMemoryWin32HandleInfoKHR{OPAQUE_WIN32}`), `size` and
+    /// `type_index` those of the export, as an opaque handle type requires.
+    /// The payload is referenced by the new memory itself; the handle is
+    /// only read during the call.
+    pub import_handle: Option<Arc<S>>,
+}
+
+/// One `VkBindImageMemoryInfo`, host side.
+#[derive(Debug)]
+pub struct ImageBind<'m, I, M> {
+    /// The image.
+    pub image: I,
+    /// The memory.
+    pub memory: &'m M,
+    /// `memoryOffset`.
+    pub offset: u64,
+    /// A chained `VkBindImagePlaneMemoryInfo`'s plane, for a disjoint image.
+    pub plane: Option<VkImageAspectFlagBits>,
+}
+
+/// A host object as the raw `u64` every Vulkan handle is: what translation
+/// ([`super::generated`]) puts in place of a guest id, and what the generated
+/// host call turns back into a typed handle.
+pub trait RawHandle {
+    /// The handle's value.
+    fn raw(&self) -> u64;
+}
+
+impl RawHandle for u64 {
+    fn raw(&self) -> u64 {
+        *self
+    }
+}
+
+/// Why a generated host call did not reach the driver. Every one is a
+/// disagreement between the translated command and the host's own checks,
+/// and the command is refused, fatal to the context, with nothing called.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CallError {
+    /// The command has no generated call.
+    #[error("{0} has no generated host call")]
+    NoCall(&'static str),
+    /// A chained structure the executor does not admit reached the host.
+    #[error("{parent} chains sType {stype}, which the host call does not build")]
+    Link {
+        /// The structure whose chain carried it.
+        parent: &'static str,
+        /// Its `sType`.
+        stype: i32,
+    },
+    /// An array that disagrees with its count.
+    #[error("{what} disagrees with its count")]
+    Count {
+        /// The field.
+        what: &'static str,
+    },
+    /// An output larger than the host will allocate for one call.
+    #[error("{what} asks for more than the host allocates for one call")]
+    TooLarge {
+        /// The field.
+        what: &'static str,
+    },
+}
+
+/// The host Vulkan calls this stage makes. See the module docs.
+///
+/// Every method is infallible where the Vulkan call is, and returns the
+/// driver's `VkResult` where it is not; a result is handed to the guest as
+/// the command's return value, never turned into a fatal error, because a
+/// driver refusing a well-formed request is an answer, not a protocol fault.
+pub trait HostVulkan: Send + Sync + 'static {
+    /// A host `VkInstance` together with whatever calling it needs.
+    type Instance: Send + 'static;
+    /// A host `VkPhysicalDevice`.
+    type PhysicalDevice: Copy + Eq + Send + fmt::Debug + 'static;
+    /// A host `VkDevice` together with whatever calling it needs. Shared
+    /// with the fence threads of its queues (stage 5b.3), which only wait on
+    /// and destroy fences of their own through it.
+    type Device: Send + Sync + 'static;
+    /// A host `VkQueue`.
+    type Queue: Copy + Send + RawHandle + 'static;
+    /// A host `VkCommandPool`.
+    type CommandPool: Copy + Send + RawHandle + 'static;
+    /// A host `VkImage`.
+    type Image: Copy + Send + RawHandle + 'static;
+    /// A host `VkDeviceMemory` together with whatever keeps it valid (the
+    /// imported pages' `Arc`). Owned: [`HostVulkan::free_memory`] takes it.
+    type Memory: Send + RawHandle + 'static;
+    /// A host `VkBuffer`.
+    type Buffer: Copy + Send + RawHandle + 'static;
+    /// A host `VkBufferView`.
+    type BufferView: Copy + Send + RawHandle + 'static;
+    /// A host `VkImageView`.
+    type ImageView: Copy + Send + RawHandle + 'static;
+    /// An owned host handle to the payload of exportable device-local memory
+    /// (stage S1: an NT handle on Windows, closed when this is dropped). It
+    /// keeps the allocation alive by itself — the exporting memory, its
+    /// device and its instance may all be gone — which is what a dma-buf
+    /// is to its exporter, and what lets the blob outlive both.
+    type SharedMemory: Send + Sync + 'static;
+
+    /// `vkEnumerateInstanceVersion` of the host loader.
+    ///
+    /// # Errors
+    /// The loader's `VkResult`.
+    fn instance_version(&self) -> Result<u32, VkResult>;
+
+    /// `vkCreateInstance` at Vulkan 1.3, no layers, and only the instance
+    /// extensions the renderer itself needs (none, this stage).
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn create_instance(&self, request: &InstanceRequest) -> Result<Self::Instance, VkResult>;
+
+    /// `vkDestroyInstance`. Every child has already been destroyed.
+    fn destroy_instance(&self, instance: Self::Instance);
+
+    /// `vkEnumeratePhysicalDevices`, all of them.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn enumerate_physical_devices(
+        &self,
+        instance: &Self::Instance,
+    ) -> Result<Vec<Self::PhysicalDevice>, VkResult>;
+
+    /// Everything [`HostDeviceInfo`] holds, for one device.
+    fn describe_physical_device(
+        &self,
+        instance: &Self::Instance,
+        device: Self::PhysicalDevice,
+    ) -> HostDeviceInfo;
+
+    /// `vkEnumeratePhysicalDeviceGroups`, all of them.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn physical_device_groups(
+        &self,
+        instance: &Self::Instance,
+    ) -> Result<Vec<HostGroup<Self::PhysicalDevice>>, VkResult>;
+
+    /// `vkGetPhysicalDeviceFormatProperties2`, filling `out` and exactly the
+    /// output links it already carries.
+    fn format_properties(
+        &self,
+        instance: &Self::Instance,
+        device: Self::PhysicalDevice,
+        format: VkFormat,
+        out: &mut VkFormatProperties2,
+    );
+
+    /// `vkGetPhysicalDeviceImageFormatProperties2`, filling `out` and exactly
+    /// the output links it already carries.
+    fn image_format_properties(
+        &self,
+        instance: &Self::Instance,
+        device: Self::PhysicalDevice,
+        info: &VkPhysicalDeviceImageFormatInfo2,
+        out: &mut VkImageFormatProperties2,
+    ) -> VkResult;
+
+    /// `vkGetPhysicalDeviceExternalSemaphoreProperties` for `handle_type`,
+    /// of a timeline semaphore when `timeline`: the host driver's own answer.
+    fn external_semaphore_properties(
+        &self,
+        instance: &Self::Instance,
+        device: Self::PhysicalDevice,
+        handle_type: u32,
+        timeline: bool,
+    ) -> VkExternalSemaphoreProperties;
+
+    /// Whether a buffer of these `flags` and `usage` on physical device
+    /// `device` may be bound to an import of our own pages
+    /// (`vkGetPhysicalDeviceExternalBufferProperties` answers
+    /// `HOST_ALLOCATION` `IMPORTABLE`): what a `DMA_BUF` buffer query is
+    /// answered by (stage 5c).
+    fn buffer_importable(
+        &self,
+        instance: &Self::Instance,
+        device: Self::PhysicalDevice,
+        flags: u32,
+        usage: u32,
+    ) -> bool;
+
+    /// Whether a buffer of these `flags` and `usage` on physical device
+    /// `device` may live in exportable device-local memory (stage S1):
+    /// `vkGetPhysicalDeviceExternalBufferProperties(OPAQUE_WIN32)` answers
+    /// `EXPORTABLE | IMPORTABLE` and not `DEDICATED_ONLY` (the renderer never
+    /// dedicates an exportable allocation, so exporter and importer agree by
+    /// construction). `false` on a host that cannot export at all.
+    fn buffer_exportable(
+        &self,
+        instance: &Self::Instance,
+        device: Self::PhysicalDevice,
+        flags: u32,
+        usage: u32,
+    ) -> bool;
+
+    /// `vkCreateDevice`.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn create_device(
+        &self,
+        instance: &Self::Instance,
+        device: Self::PhysicalDevice,
+        request: &DeviceRequest<Self::PhysicalDevice>,
+    ) -> Result<Self::Device, VkResult>;
+
+    /// `vkDestroyDevice`. Every child has already been destroyed.
+    fn destroy_device(&self, device: Self::Device);
+
+    /// `vkGetDeviceQueue2` for a queue the device was created with.
+    fn device_queue(
+        &self,
+        device: &Self::Device,
+        flags: u32,
+        family: u32,
+        index: u32,
+    ) -> Self::Queue;
+
+    /// `vkCreateCommandPool`.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn create_command_pool(
+        &self,
+        device: &Self::Device,
+        info: &VkCommandPoolCreateInfo,
+    ) -> Result<Self::CommandPool, VkResult>;
+
+    /// `vkDestroyCommandPool`.
+    fn destroy_command_pool(&self, device: &Self::Device, pool: Self::CommandPool);
+
+    /// Whether an image created from `info` may be bound to our imported
+    /// pages — `VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT` is
+    /// `IMPORTABLE` for it — so that it is created ready for them and its
+    /// requirements may name the host-visible types.
+    fn image_accepts_host_memory(&self, device: &Self::Device, info: &VkImageCreateInfo) -> bool;
+
+    /// `vkCreateImage` from a validated create info and its chain, created
+    /// with the `VkExternalMemoryImageCreateInfo` `memory` names (the
+    /// guest's own is never forwarded), as binding such memory requires.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn create_image(
+        &self,
+        device: &Self::Device,
+        info: &VkImageCreateInfo,
+        memory: ResourceMemory,
+    ) -> Result<Self::Image, VkResult>;
+
+    /// `vkDestroyImage`.
+    fn destroy_image(&self, device: &Self::Device, image: Self::Image);
+
+    /// `vkGetImageMemoryRequirements2`, filling `out` and exactly the output
+    /// links it already carries. `plane` is a chained
+    /// `VkImagePlaneMemoryRequirementsInfo`.
+    fn image_memory_requirements(
+        &self,
+        device: &Self::Device,
+        image: Self::Image,
+        plane: Option<VkImageAspectFlagBits>,
+        out: &mut VkMemoryRequirements2,
+    );
+
+    /// `vkGetDeviceImageMemoryRequirements` for an image that
+    /// [`create_image`](Self::create_image) would make of `info` and
+    /// `memory`, filling `out` and exactly the output links it carries.
+    fn device_image_memory_requirements(
+        &self,
+        device: &Self::Device,
+        info: &VkImageCreateInfo,
+        memory: ResourceMemory,
+        plane: Option<VkImageAspectFlagBits>,
+        out: &mut VkMemoryRequirements2,
+    );
+
+    /// `vkGetImageSubresourceLayout` for a linear image.
+    fn image_subresource_layout(
+        &self,
+        device: &Self::Device,
+        image: Self::Image,
+        subresource: &VkImageSubresource,
+    ) -> VkSubresourceLayout;
+
+    /// `vkBindImageMemory2`, every bind validated.
+    fn bind_image_memory(
+        &self,
+        device: &Self::Device,
+        binds: &[ImageBind<'_, Self::Image, Self::Memory>],
+    ) -> VkResult;
+
+    /// `vkCreateImageView` of `image` from a validated create info.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn create_image_view(
+        &self,
+        device: &Self::Device,
+        image: Self::Image,
+        info: &VkImageViewCreateInfo,
+    ) -> Result<Self::ImageView, VkResult>;
+
+    /// `vkDestroyImageView`.
+    fn destroy_image_view(&self, device: &Self::Device, view: Self::ImageView);
+
+    // ------------------------------------------------------------- memory
+
+    /// `vkGetMemoryHostPointerPropertiesEXT` for `pages`: the memory types
+    /// they may be imported into.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn host_pointer_types(&self, device: &Self::Device, pages: &RingPages)
+        -> Result<u32, VkResult>;
+
+    /// `vkAllocateMemory`.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn allocate_memory(
+        &self,
+        device: &Self::Device,
+        request: &MemoryRequest<Self::Buffer, Self::Image, Self::SharedMemory>,
+    ) -> Result<Self::Memory, VkResult>;
+
+    /// `vkGetMemoryWin32HandleKHR(OPAQUE_WIN32)` (stage S1) of `memory`,
+    /// allocated with [`MemoryRequest::export_handle`]: an owned handle to
+    /// its payload, which another host device of the same GPU imports.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`, or `VK_ERROR_FEATURE_NOT_PRESENT` on a host
+    /// that cannot export.
+    fn export_memory_handle(
+        &self,
+        device: &Self::Device,
+        memory: &Self::Memory,
+    ) -> Result<Self::SharedMemory, VkResult>;
+
+    /// `vkFreeMemory`. For imported memory the host waits for the device to
+    /// go idle first: pages the GPU may still be writing are not pages the
+    /// executor may let go of.
+    fn free_memory(&self, device: &Self::Device, memory: Self::Memory);
+
+    /// `vkGetDeviceMemoryCommitment`, for a lazily allocated type.
+    fn memory_commitment(&self, device: &Self::Device, memory: &Self::Memory) -> u64;
+
+    // ------------------------------------------------------------ buffers
+
+    /// Whether a buffer of these `flags` and `usage` may be bound to our
+    /// imported pages; see [`image_accepts_host_memory`](Self::image_accepts_host_memory).
+    fn buffer_accepts_host_memory(&self, device: &Self::Device, flags: u32, usage: u32) -> bool;
+
+    /// `vkCreateBuffer` from a validated create info; `memory` as for
+    /// [`create_image`](Self::create_image).
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn create_buffer(
+        &self,
+        device: &Self::Device,
+        info: &VkBufferCreateInfo,
+        memory: ResourceMemory,
+    ) -> Result<Self::Buffer, VkResult>;
+
+    /// `vkDestroyBuffer`.
+    fn destroy_buffer(&self, device: &Self::Device, buffer: Self::Buffer);
+
+    /// `vkGetBufferMemoryRequirements2`, filling `out` and exactly the output
+    /// links it already carries.
+    fn buffer_memory_requirements(
+        &self,
+        device: &Self::Device,
+        buffer: Self::Buffer,
+        out: &mut VkMemoryRequirements2,
+    );
+
+    /// `vkGetDeviceBufferMemoryRequirements` for the buffer
+    /// [`create_buffer`](Self::create_buffer) would make of the same
+    /// arguments.
+    fn device_buffer_memory_requirements(
+        &self,
+        device: &Self::Device,
+        info: &VkBufferCreateInfo,
+        memory: ResourceMemory,
+        out: &mut VkMemoryRequirements2,
+    );
+
+    /// `vkBindBufferMemory2`, every bind validated: `(buffer, memory,
+    /// offset)`.
+    fn bind_buffer_memory(
+        &self,
+        device: &Self::Device,
+        binds: &[(Self::Buffer, &Self::Memory, u64)],
+    ) -> VkResult;
+
+    /// `vkGetBufferDeviceAddress`, for a buffer created with
+    /// `SHADER_DEVICE_ADDRESS` usage on a device with `bufferDeviceAddress`.
+    fn buffer_device_address(&self, device: &Self::Device, buffer: Self::Buffer) -> u64;
+
+    /// `vkCreateBufferView` of `buffer` from a validated create info.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`.
+    fn create_buffer_view(
+        &self,
+        device: &Self::Device,
+        buffer: Self::Buffer,
+        info: &VkBufferViewCreateInfo,
+    ) -> Result<Self::BufferView, VkResult>;
+
+    /// `vkDestroyBufferView`.
+    fn destroy_buffer_view(&self, device: &Self::Device, view: Self::BufferView);
+
+    // ------------------------------------------------------- stage 5b.2
+
+    /// Call the driver for `command`, whose inputs the executor translated
+    /// ([`super::generated::translate`]): every guest id replaced by the
+    /// host handle it names, every value checked. Outputs — created handles,
+    /// results, blobs, structures — are written back into `command`.
+    ///
+    /// # Errors
+    /// [`CallError`]: nothing reached the driver.
+    fn call(&self, device: &Self::Device, command: &mut Command<'_>) -> Result<(), CallError>;
+
+    /// Destroy one stage-5b.2 object of `kind` (never a command buffer or a
+    /// descriptor set, which their pools free), host handle `raw`, created
+    /// on `device` through [`call`](Self::call).
+    fn destroy_object(&self, device: &Self::Device, kind: Kind, raw: u64);
+
+    /// `vkDeviceWaitIdle`, before anything is torn down under the GPU.
+    fn device_wait_idle(&self, device: &Self::Device) -> VkResult;
+}

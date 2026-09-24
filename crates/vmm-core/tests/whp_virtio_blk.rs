@@ -26,17 +26,19 @@
 
 #![cfg(windows)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use linux_boot::{BootConfig, GUEST_READY_MARKER};
 use machine_x86::boot as x86_boot;
 use machine_x86::bus::MachineBus;
+use machine_x86::host_wake::HOST_WAKE_THREAD_PREFIX;
 use machine_x86::irqchip::UserspaceIrqChip;
 use machine_x86::layout;
 use machine_x86::serial::SerialConsole;
 use machine_x86::virtio::VirtioMmioBus;
-use virtio_core::VirtioDevice;
+use virtio_core::{HostWaker, VirtioDevice};
 use vmm_core::whp::{WhpHypervisor, WhpOptions, WhpPartition, WHP_ENABLE_HINT};
 use vmm_core::RunOutcome;
 
@@ -56,13 +58,132 @@ const BENCH_MIB: u64 = 8;
 /// interrupts delivered through the userspace IOAPIC.
 #[test]
 fn virtio_blk_on_mmio_serves_the_guest_on_whp() {
+    run_blkbench("synchronous", |block| Box::new(block));
+}
+
+/// The host waker on WHP (ADR-0002, 2026-09-24): the same boot, with a disk
+/// that serves **none** of its requests on the vCPU thread that kicked it —
+/// every kick is turned into a host wake, and the request is served when the
+/// machine's host-wake thread calls queue 0 back. The guest reading its whole
+/// disk, interrupt-completed, proves that a wake from a foreign thread
+/// reaches the device through the transport and that the interrupts it
+/// raises from that thread reach the guest through the userspace IOAPIC.
+/// Before that thread existed a device on this host never got a waker at all.
+#[test]
+fn virtio_blk_served_only_from_the_host_wake_thread_serves_the_guest_on_whp() {
+    let served = Arc::new(ServedCounts::default());
+    let counts = Arc::clone(&served);
+    let ran = run_blkbench("host-wake", move |block| {
+        Box::new(ServedByHostWake {
+            inner: block,
+            waker: None,
+            counts,
+        })
+    });
+    if !ran {
+        return;
+    }
+    let from_wake = served.from_wake.load(Ordering::Acquire);
+    let kicks = served.kicks.load(Ordering::Acquire);
+    eprintln!(
+        "{kicks} guest kicks turned into host wakes, {from_wake} notifies from the host-wake thread"
+    );
+    assert!(kicks > 0, "the guest never kicked the disk");
+    assert!(
+        from_wake > 0,
+        "no request was served from the host-wake thread"
+    );
+    assert_eq!(
+        served.unwoken.load(Ordering::Acquire),
+        0,
+        "the machine handed the device no waker"
+    );
+}
+
+#[derive(Default)]
+struct ServedCounts {
+    /// Guest kicks, each answered with a host wake instead of any work.
+    kicks: AtomicU64,
+    /// Notifies that came from the host-wake thread and did the work.
+    from_wake: AtomicU64,
+    /// Kicks that arrived with no waker to hand them to.
+    unwoken: AtomicU64,
+}
+
+/// A virtio-blk that defers every guest kick to the machine's host-wake
+/// thread (see the test above).
+struct ServedByHostWake {
+    inner: virtio_block::BlockDevice,
+    waker: Option<Arc<dyn HostWaker>>,
+    counts: Arc<ServedCounts>,
+}
+
+impl VirtioDevice for ServedByHostWake {
+    fn device_type(&self) -> virtio_core::DeviceType {
+        self.inner.device_type()
+    }
+    fn queue_max_sizes(&self) -> &[u16] {
+        self.inner.queue_max_sizes()
+    }
+    fn device_features(&self) -> u64 {
+        self.inner.device_features()
+    }
+    fn ack_features(&mut self, negotiated: u64) -> bool {
+        self.inner.ack_features(negotiated)
+    }
+    fn read_config(&self, offset: u64, data: &mut [u8]) {
+        self.inner.read_config(offset, data);
+    }
+    fn write_config(&mut self, offset: u64, data: &[u8]) {
+        self.inner.write_config(offset, data);
+    }
+    fn activate(
+        &mut self,
+        resources: virtio_core::DeviceResources,
+    ) -> Result<(), virtio_core::DeviceError> {
+        self.inner.activate(resources)
+    }
+    fn notify(&mut self, queue_index: u16) -> Result<(), virtio_core::DeviceError> {
+        let on_wake_thread = std::thread::current()
+            .name()
+            .is_some_and(|name| name.starts_with(HOST_WAKE_THREAD_PREFIX));
+        if on_wake_thread {
+            self.counts.from_wake.fetch_add(1, Ordering::AcqRel);
+            return self.inner.notify(queue_index);
+        }
+        match &self.waker {
+            Some(waker) => {
+                self.counts.kicks.fetch_add(1, Ordering::AcqRel);
+                waker.wake();
+                Ok(())
+            }
+            None => {
+                self.counts.unwoken.fetch_add(1, Ordering::AcqRel);
+                self.inner.notify(queue_index)
+            }
+        }
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn set_host_waker(&mut self, waker: Arc<dyn HostWaker>) {
+        self.waker = Some(waker);
+    }
+}
+
+/// Boots the blkbench guest with the disk `wrap` makes, and asserts the
+/// probe's verdict. `false` when it skipped.
+fn run_blkbench(
+    label: &str,
+    wrap: impl FnOnce(virtio_block::BlockDevice) -> Box<dyn VirtioDevice>,
+) -> bool {
     let _guard = whp_guard();
     let hv = match WhpHypervisor::open() {
         Ok(hv) => hv,
         Err(e) => {
             eprintln!("skipping: {e}");
             eprintln!("(to run this test: {WHP_ENABLE_HINT})");
-            return;
+            return false;
         }
     };
     let (Some((kernel, which)), Some(initramfs), Some(disk)) = (
@@ -74,7 +195,7 @@ fn virtio_blk_on_mmio_serves_the_guest_on_whp() {
             "skipping: test artifacts missing — build artifacts/bootstrap/vmlinuz, \
              scripts/build-test-initramfs.sh and a raw disk at artifacts/tests/test-root.raw"
         );
-        return;
+        return false;
     };
     eprintln!("booting the {which} kernel with {} on mmio", disk.display());
 
@@ -89,7 +210,7 @@ fn virtio_blk_on_mmio_serves_the_guest_on_whp() {
     // Read-only on purpose: the probe only reads, and the image is a shared
     // artifact that a test must not modify.
     let block = virtio_block::BlockDevice::open(&disk, false).expect("open the raw disk image");
-    let devices: Vec<Box<dyn VirtioDevice>> = vec![Box::new(block)];
+    let devices: Vec<Box<dyn VirtioDevice>> = vec![wrap(block)];
 
     let mem = Arc::new(partition.memory().clone());
     let virtio = VirtioMmioBus::attach_userspace(mem, devices, &irqchip)
@@ -202,7 +323,7 @@ fn virtio_blk_on_mmio_serves_the_guest_on_whp() {
     // device then runs on the vCPU thread. Printed rather than asserted — a
     // threshold would only encode this host's speed.
     eprintln!(
-        "WHP synchronous virtio-mmio kicks: {bytes} bytes in {ms} ms = {kib_per_s} KiB/s, \
+        "WHP {label} virtio-mmio kicks: {bytes} bytes in {ms} ms = {kib_per_s} KiB/s, \
          {irqs} interrupts on the virtio line"
     );
 
@@ -231,4 +352,5 @@ fn virtio_blk_on_mmio_serves_the_guest_on_whp() {
     );
     drop(partition);
     drop(irqchip);
+    true
 }

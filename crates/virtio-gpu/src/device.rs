@@ -47,7 +47,7 @@ use vm_memory::{Bytes, GuestAddress};
 
 use crate::blob::{BlobSupport, BlobTable, MAX_BLOB_ENTRIES};
 use crate::error::CommandError;
-use crate::fence::{FenceQueue, MAX_PENDING_FENCES};
+use crate::fence::{FenceQueue, FenceTimeline, MAX_PENDING_FENCES};
 use crate::pacing::FramePacing;
 use crate::protocol::{
     capset_info_body, cmd, config_bytes, display_info_body, edid_body, map_info_body, resp,
@@ -57,7 +57,7 @@ use crate::protocol::{
     TransferToHost2d, UpdateCursor, BLOB_MEM_GUEST, CONFIG_LEN, MEM_ENTRY_LEN,
 };
 use crate::renderer::FenceOutcome;
-use crate::renderer::{Gpu3d, Renderer3d, MAX_SUBMIT_BYTES};
+use crate::renderer::{Gpu3d, Renderer3d, ScanoutBlobSpec, MAX_SUBMIT_BYTES};
 use crate::resource::{ResourceTable, MAX_BACKING_ENTRIES};
 use crate::sink::ScanoutSink;
 use crate::{
@@ -274,6 +274,15 @@ enum ScanoutSource {
         /// Byte offset of the plane inside the blob.
         offset: u32,
     },
+    /// A **renderer** blob (`HOST3D`/`HOST3D_GUEST`): the pixels are the
+    /// renderer's — for Venus, a guest `VkDeviceMemory` a GPU compositor
+    /// rendered into — and flushes read back through
+    /// [`Renderer3d::read_rect_bgra`] in the layout the renderer accepted
+    /// ([`Renderer3d::scanout_blob`]).
+    RendererBlob {
+        /// The layout `SET_SCANOUT_BLOB` declared and the renderer accepted.
+        spec: ScanoutBlobSpec,
+    },
 }
 
 /// What the guest bound to scanout 0.
@@ -287,10 +296,14 @@ struct ScanoutBinding {
 }
 
 impl ScanoutBinding {
-    /// Whether the 3D renderer owns this binding — the question GPU-012's
-    /// degrade path asks.
-    fn is_three_d(&self) -> bool {
-        matches!(self.source, ScanoutSource::ThreeD)
+    /// Whether the 3D renderer owns this binding's pixels — the question
+    /// GPU-012's degrade path asks. A renderer blob is the renderer's as much
+    /// as a 3D resource is.
+    fn is_renderer_owned(&self) -> bool {
+        matches!(
+            self.source,
+            ScanoutSource::ThreeD | ScanoutSource::RendererBlob { .. }
+        )
     }
 }
 
@@ -376,6 +389,11 @@ pub struct GpuDevice<S: ScanoutSink> {
     /// exactly once.
     restored_3d_lost: bool,
     restored_3d_reported: bool,
+    /// Whether a renderer blob has been scanned out since the last reset —
+    /// the one-time info line for the GPU-composited desktop (S2a). Every
+    /// later flip logs at debug: the guest sends `SET_SCANOUT_BLOB` on every
+    /// one.
+    renderer_blob_scanned_out: bool,
     /// Frame-interval statistics of the scanout path (phase 2 measurement).
     pacing: FramePacing,
     /// Where `--frame-stats` mirrors those statistics as JSON, if anywhere.
@@ -435,6 +453,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             renderer_loss_reported: false,
             restored_3d_lost: false,
             restored_3d_reported: false,
+            renderer_blob_scanned_out: false,
             pacing: FramePacing::new(),
             frame_stats: None,
             refresh_hz: crate::edid::DEFAULT_REFRESH_HZ,
@@ -920,14 +939,14 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // until it retires (ADR-0004 phase 2). Over the cap — or with no room
         // recorded — the response goes out now, which is phase 1's model and
         // strictly safer than pinning more chains.
-        if let Some(fence_id) = fence {
+        if let Some((timeline, fence_id)) = fence {
             let pending = PendingResponse {
                 head,
                 writable: writable.to_vec(),
                 hdr: resp_hdr,
                 body,
             };
-            match self.pending_fences.push(fence_id, pending) {
+            match self.pending_fences.push(timeline, fence_id, pending) {
                 Ok(()) => {
                     self.fence_stats.deferred = self.fence_stats.deferred.saturating_add(1);
                     self.fence_stats.peak_pending =
@@ -960,13 +979,16 @@ impl<S: ScanoutSink> GpuDevice<S> {
     }
 
     /// Whether this command's response must wait for a host fence, and on
-    /// which fence id (ADR-0004 phase 2).
+    /// which timeline and fence id (ADR-0004 phase 2; the timeline since
+    /// EPIC 20 stage 5b.3: the header's `ring_idx` when it carries
+    /// `VIRTIO_GPU_FLAG_INFO_RING_IDX`, as the guest kernel keeps one fence
+    /// context per `(context, ring_idx)`).
     ///
     /// `None` — answer now — for everything that is not a fenced 3D command,
     /// for a command that failed (a fence on a rejected command has nothing
     /// to wait for: the driver must see the error immediately), and whenever
     /// the renderer says the fence is already signalled.
-    fn fence_for(&mut self, hdr: &CtrlHdr, code: u32) -> Option<u32> {
+    fn fence_for(&mut self, hdr: &CtrlHdr, code: u32) -> Option<(FenceTimeline, u32)> {
         if !hdr.wants_fence() || !FENCED_3D_COMMANDS.contains(&hdr.kind) {
             return None;
         }
@@ -1002,9 +1024,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // and the pending table is 64 deep, so the truncation cannot alias
         // anything that matters.
         let fence_id = hdr.fence_id as u32;
-        match gpu.create_fence(hdr.ctx_id, fence_id) {
-            Ok(FenceOutcome::Pending) => Some(fence_id),
-            Ok(FenceOutcome::Signalled) => {
+        let ring_idx =
+            (hdr.flags & crate::protocol::FLAG_INFO_RING_IDX != 0).then_some(hdr.ring_idx);
+        match gpu.create_fence_on(hdr.ctx_id, ring_idx, fence_id) {
+            Ok((timeline, FenceOutcome::Pending)) => Some((timeline, fence_id)),
+            Ok((_, FenceOutcome::Signalled)) => {
                 self.fence_stats.synchronous = self.fence_stats.synchronous.saturating_add(1);
                 None
             }
@@ -1016,6 +1040,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 tracing::warn!(
                     ctx = hdr.ctx_id,
                     fence = fence_id,
+                    ring_idx = ?ring_idx,
                     %error,
                     "virtio-gpu could not create a host fence; completing synchronously"
                 );
@@ -1056,12 +1081,12 @@ impl<S: ScanoutSink> GpuDevice<S> {
         }
         let pending = self.pending_fences.len();
         let retired = match self.three_d.as_mut() {
-            Some(gpu) => gpu.poll_fences(pending),
+            Some(gpu) => gpu.poll_fence_timelines(pending),
             None => Vec::new(),
         };
         let mut done: Vec<(Duration, PendingResponse)> = Vec::new();
-        for fence_id in retired {
-            done.extend(self.pending_fences.complete(fence_id));
+        for (timeline, fence_id) in retired {
+            done.extend(self.pending_fences.complete(timeline, fence_id));
         }
         self.fence_stats.retired = self.fence_stats.retired.saturating_add(done.len() as u64);
         for (waited, _) in &done {
@@ -1140,7 +1165,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // Dropping the renderer releases the host GL state (and, for an
         // isolated renderer, the dead worker's socket).
         self.three_d = None;
-        if self.scanout.is_some_and(|s| s.is_three_d()) {
+        if self.scanout.is_some_and(|s| s.is_renderer_owned()) {
             tracing::warn!("the scanout was a renderer resource; the window keeps its last frame");
             self.scanout = None;
         }
@@ -1576,14 +1601,28 @@ impl<S: ScanoutSink> GpuDevice<S> {
             rect,
             source,
         });
-        tracing::info!(
-            scanout = scanout_id,
-            resource = resource_id,
-            width = rect.width,
-            height = rect.height,
-            source = ?source,
-            "virtio-gpu scanout set"
-        );
+        if matches!(source, ScanoutSource::RendererBlob { .. }) {
+            // A GPU compositor re-binds on every page flip; `info` here would
+            // be sixty lines a second. The first one is announced by
+            // `set_scanout_blob`, a mode change by the display itself.
+            tracing::debug!(
+                scanout = scanout_id,
+                resource = resource_id,
+                width = rect.width,
+                height = rect.height,
+                source = ?source,
+                "virtio-gpu scanout set"
+            );
+        } else {
+            tracing::info!(
+                scanout = scanout_id,
+                resource = resource_id,
+                width = rect.width,
+                height = rect.height,
+                source = ?source,
+                "virtio-gpu scanout set"
+            );
+        }
         Ok(Reply::ok())
     }
 
@@ -1655,6 +1694,14 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // against is the one `SET_SCANOUT_BLOB` declared for it.
         let (width, height, three_d) = if self.blobs.owns(cmd.resource_id) {
             match self.scanout {
+                // A renderer blob's image is the framebuffer the guest
+                // declared, and the kernel's damage rects are in its
+                // coordinates.
+                Some(ScanoutBinding {
+                    resource_id,
+                    source: ScanoutSource::RendererBlob { spec },
+                    ..
+                }) if resource_id == cmd.resource_id => (spec.width, spec.height, true),
                 Some(s) if s.resource_id == cmd.resource_id => {
                     (s.rect.x + s.rect.width, s.rect.y + s.rect.height, false)
                 }
@@ -1724,6 +1771,22 @@ impl<S: ScanoutSink> GpuDevice<S> {
                         .update_scanout(dst_x, dst_y, clip.width, clip.height, &scratch)
                         .map_err(|error| CommandError::Display(error.to_string()))
                 });
+            self.flush_buf = scratch;
+            outcome?;
+        } else if let ScanoutSource::RendererBlob { spec } = scanout.source {
+            // S2a: a GPU compositor's frame. The pixels live in the renderer
+            // (a guest `VkDeviceMemory`); read the clipped rect back in the
+            // layout it accepted, into the buffer reused frame to frame, and
+            // push it down the same sink every other path uses.
+            let mut scratch = std::mem::take(&mut self.flush_buf);
+            let read = self
+                .three_d_mut(cmd::RESOURCE_FLUSH)
+                .and_then(|gpu| gpu.read_scanout_blob(cmd.resource_id, &spec, clip, &mut scratch));
+            let outcome = read.and_then(|()| {
+                self.display
+                    .update_scanout(dst_x, dst_y, clip.width, clip.height, &scratch)
+                    .map_err(|error| CommandError::Display(error.to_string()))
+            });
             self.flush_buf = scratch;
             outcome?;
         } else if three_d {
@@ -1905,8 +1968,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // its ring blob to its context, and the renderer has no 3D handle for
         // it, exactly like the kernel's 2D console framebuffer (ADR-0004's
         // mixed-namespace amendment).
-        let owned_2d =
-            self.resources.get(cmd.resource_id).is_some() || self.blobs.owns(cmd.resource_id);
+        let blob = self.blobs.owns(cmd.resource_id);
+        let owned_2d = self.resources.get(cmd.resource_id).is_some() || blob;
         let gpu = self.three_d_mut(kind)?;
         // A **detach** from a context that no longer exists is nothing, so it
         // answers OK. Observed on every Venus boot of Ubuntu 26.04 (VEN-2003):
@@ -1927,6 +1990,13 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if owned_2d {
             if !gpu.has_context(ctx_id) {
                 return Err(CommandError::UnknownContext(ctx_id));
+            }
+            if blob {
+                // The renderer learns of it: an attached blob of another
+                // context's Vulkan memory is one this context may import
+                // (EPIC 20 stage 5c; the guest kernel attaches a GEM object
+                // to the context of every file that opens a handle to it).
+                gpu.ctx_attach_blob(ctx_id, cmd.resource_id, attach);
             }
             tracing::debug!(
                 ctx = ctx_id,
@@ -2153,15 +2223,19 @@ impl<S: ScanoutSink> GpuDevice<S> {
         Ok(Reply::ok())
     }
 
-    /// `SET_SCANOUT_BLOB`: bind a guest-memory blob to scanout 0.
+    /// `SET_SCANOUT_BLOB`: bind a blob to scanout 0.
     ///
     /// This is the one blob command with a *format*, because a blob has none
     /// of its own — the guest declares width, height, format and per-plane
     /// strides here. Only single-plane BGRA is accepted (the same two layouts
-    /// the 2D path takes), and only for a blob whose bytes are guest pages:
-    /// presenting a host3d blob would need the zero-copy export this host
-    /// cannot do (ADR-0004 phase 2's dmabuf probe), and pretending otherwise
-    /// would show the guest a black screen instead of an error.
+    /// the 2D path takes).
+    ///
+    /// A guest-memory blob's pixels are guest pages, and flushes gather them
+    /// here. A renderer blob's pixels are the renderer's (S2a: a GPU
+    /// compositor's `VkDeviceMemory`); it is bound only if the renderer says
+    /// it can read that layout back ([`Renderer3d::scanout_blob`]), and every
+    /// renderer that cannot keeps answering the in-band error this command
+    /// always gave host blobs — never a black screen the guest believes in.
     fn set_scanout_blob(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
         let kind = cmd::SET_SCANOUT_BLOB;
         let cmd = SetScanoutBlob::parse(buf)
@@ -2188,6 +2262,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
             .blobs_mut(kind)?
             .get(cmd.resource_id)
             .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
+        if blob.is_host() {
+            // S2a: the renderer owns these bytes (a GPU compositor's
+            // `VkDeviceMemory`); it decides whether it can present them.
+            return self.set_scanout_renderer_blob(&cmd);
+        }
         if blob.blob_mem() != BLOB_MEM_GUEST {
             return Err(CommandError::BadBlobMem {
                 blob_mem: blob.blob_mem(),
@@ -2234,6 +2313,92 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 stride: cmd.strides[0],
                 offset: cmd.offsets[0],
             },
+        )
+    }
+
+    /// `SET_SCANOUT_BLOB` of a renderer blob (`HOST3D`/`HOST3D_GUEST`) — a
+    /// GPU compositor's page flip (S2a). The format and planes were checked
+    /// by the caller.
+    ///
+    /// The layout is bounded here against everything the device knows — the
+    /// scanout rect inside the framebuffer, the framebuffer inside
+    /// [`crate::MAX_RESOURCE_PIXELS`], a stride that holds a row, and the
+    /// whole plane inside the blob's declared size — and only then is the
+    /// renderer asked whether it can read it ([`Renderer3d::scanout_blob`]).
+    ///
+    /// The guest sends this on **every** flip, alternating between two or
+    /// three buffers, so the renderer's acceptance is remembered per blob: a
+    /// flip to a buffer whose layout was already accepted costs a table
+    /// lookup and no renderer call, and only a changed layout is asked again.
+    fn set_scanout_renderer_blob(&mut self, cmd: &SetScanoutBlob) -> Result<Reply, CommandError> {
+        let blob = self
+            .blobs
+            .get(cmd.resource_id)
+            .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
+        let geometry = CommandError::BadGeometry {
+            width: cmd.width,
+            height: cmd.height,
+        };
+        if !cmd.rect.fits_within(cmd.width, cmd.height) {
+            return Err(CommandError::RectOutOfBounds {
+                rect: cmd.rect,
+                width: cmd.width,
+                height: cmd.height,
+            });
+        }
+        if u64::from(cmd.width) * u64::from(cmd.height) > crate::MAX_RESOURCE_PIXELS {
+            return Err(geometry);
+        }
+        let min_stride = u64::from(cmd.width) * u64::from(crate::BYTES_PER_PIXEL);
+        let stride = u64::from(cmd.strides[0]);
+        if stride < min_stride {
+            return Err(geometry);
+        }
+        let needed = u64::from(cmd.offsets[0])
+            .checked_add(stride.saturating_mul(u64::from(cmd.height)))
+            .ok_or(geometry)?;
+        if needed > blob.size() {
+            return Err(CommandError::ShortBacking {
+                need: needed,
+                have: blob.size(),
+            });
+        }
+        let spec = ScanoutBlobSpec {
+            format: cmd.format,
+            width: cmd.width,
+            height: cmd.height,
+            stride: cmd.strides[0],
+            offset: cmd.offsets[0],
+        };
+        if blob.scanout_spec() != Some(spec) {
+            self.three_d_mut(cmd::SET_SCANOUT_BLOB)?
+                .scanout_blob(cmd.resource_id, &spec)?;
+            self.blobs.set_scanout_spec(cmd.resource_id, spec);
+            tracing::debug!(
+                resource = cmd.resource_id,
+                spec = ?spec,
+                "virtio-gpu renderer accepted a scanout blob layout"
+            );
+        }
+        if !self.renderer_blob_scanned_out {
+            self.renderer_blob_scanned_out = true;
+            tracing::info!(
+                resource = cmd.resource_id,
+                width = spec.width,
+                height = spec.height,
+                stride = spec.stride,
+                format = spec.format,
+                "virtio-gpu is scanning out a renderer blob: the guest composites on the GPU"
+            );
+        }
+        // Still re-bound every time: a mode check and a record, no renderer
+        // call — and the same resolution follow-up the 2D path gives a
+        // re-issued SET_SCANOUT.
+        self.bind_scanout(
+            cmd.scanout_id,
+            cmd.resource_id,
+            cmd.rect,
+            ScanoutSource::RendererBlob { spec },
         )
     }
 
@@ -2454,6 +2619,12 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
                 actual: resources.queues.len(),
             });
         }
+        // The renderer is the only thing here with host threads of its own
+        // that touch guest-visible memory (the Venus ring workers and
+        // monitors), so it is the one that needs the pause gate.
+        if let Some(gpu) = self.three_d.as_mut() {
+            gpu.set_quiesce(Arc::clone(&resources.quiesce));
+        }
         let mut queues = resources.queues.into_iter();
         self.control = queues.next();
         self.cursor = queues.next();
@@ -2569,6 +2740,16 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
     /// treated exactly like 3D contexts: the count goes in the file, and a
     /// restored device that finds a non-zero one tells the driver to start
     /// again.
+    /// The renderer's refusal, if it holds host state a snapshot would lose
+    /// (a Venus context's host Vulkan objects). Everything else this device
+    /// owns is either saved or honestly counted — see [`Self::save_device`].
+    fn snapshot_refusal(&self) -> Option<String> {
+        self.three_d
+            .as_ref()
+            .and_then(Gpu3d::snapshot_refusal)
+            .map(|why| format!("virtio-gpu: {why}"))
+    }
+
     fn save_device(&self) -> Vec<u8> {
         let state = crate::save::GpuState {
             events_read: self.events_read,
@@ -2598,6 +2779,15 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
                     ScanoutSource::Blob { stride, offset } => {
                         crate::save::SavedScanoutSource::Blob { stride, offset }
                     }
+                    // Recorded as the blob it is, which a restore treats
+                    // exactly like a 3D-resource scanout: host-owned, not
+                    // rebound, the window keeps its initial frame — and the
+                    // blob itself is counted in `live_blobs`, which tells the
+                    // restored driver to start again.
+                    ScanoutSource::RendererBlob { spec } => crate::save::SavedScanoutSource::Blob {
+                        stride: spec.stride,
+                        offset: spec.offset,
+                    },
                 },
             }),
         };
@@ -2771,6 +2961,7 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         // The driver has done what it was told; the restore's warning is spent.
         self.restored_3d_lost = false;
         self.restored_3d_reported = false;
+        self.renderer_blob_scanned_out = false;
     }
 }
 
