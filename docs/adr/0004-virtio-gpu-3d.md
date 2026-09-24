@@ -3544,3 +3544,76 @@ outside what is served. Pinned by `venus::executor::query_tests`.
   followed; Zink records one per batch.
 - A Linux host (`OPAQUE_FD`) has no handle blobs, so no handle-blob scanout
   either.
+
+## Amendment, 2026-09-24 — GNOME on the GPU: measured in the guest
+
+After S1, S2a and S2b (commit `96815a2`), in the Ubuntu 26.04 guest on WHP
+with `ENTANGLED_VENUS=vulkan`:
+
+**`kmscube -D /dev/dri/card0`** (GBM → zink → our Venus → KMS, no Mutter),
+zink forced by `MESA_LOADER_DRIVER_OVERRIDE`:
+
+```
+renderer: "zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070) (MESA_VENUS))"
+display extensions: ... EGL_ANDROID_native_fence_sync ...
+Rendered 5052 frames in 86.48 sec (58.4 fps)          # 1920x1080
+```
+
+The host logged `virtio-gpu is scanning out a renderer blob: the guest
+composites on the GPU resource=31 width=1920 height=1080 stride=7680`, with
+flips alternating between resources 31 and 32, and frame pacing at 60 fps.
+The VMM's screenshot shows the cube. A temporary pixel probe on the flush path
+read back the grey clear (`0xFF7F7F7F`) and a centre pixel that changed every
+sample.
+
+**GNOME Shell on zink**, enabled by a driconf entry scoped to the compositor
+alone:
+
+```xml
+<!-- /etc/drirc in the guest -->
+<driconf>
+  <device driver="loader" kernel_driver="virtio_gpu">
+    <application name="gnome-shell on zink" executable="gnome-shell">
+      <option name="dri_driver" value="zink" />
+    </application>
+  </device>
+</driconf>
+```
+
+After a `gdm3` restart:
+
+- `gnome-shell` maps `libvulkan_virtio.so`, and its journal still says
+  `Created gbm renderer for '/dev/dri/card0'` — now on zink instead of
+  kms_swrast.
+- Mutter advertises **`zwp_linux_dmabuf_v1` version 5, main device `0xE280`**
+  (226:128, the render node). It advertised version 3 with no device while it
+  rendered in software. That was the reason Wayland GL clients could not find
+  their EGL device.
+- **`glmark2-wayland`** (zink via `MESA_LOADER_DRIVER_OVERRIDE`) under it:
+  `GL_RENDERER: zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070))`,
+  **`GL_VERSION: 4.6 (Compatibility Profile)`**, 110–131 FPS in `build`, in a
+  window on the GPU-composited desktop. The VMM screenshot shows it.
+- The host scanned out a renderer blob. Desktop frame pacing was about 30 fps
+  while glmark2 ran.
+
+### What this took, and what it does not yet do
+
+The whole path is ours. Mesa's zink turns GL into Vulkan in the guest, and
+venus serialises it. On the host, our transport, generated protocol and
+executor run it on the RTX 2070. The scanout buffers are device-local memory
+shared between contexts through Win32 handles, dressed as LINEAR dma-bufs. The
+renderer's own scanout device reads each flipped frame back, and the existing
+display path shows it.
+
+Not yet:
+
+- **Clients still need the override.** Only `gnome-shell` is on zink by
+  driconf. Dropping `executable=` from the entry should give every GL app zink,
+  but that has not been measured.
+- **Every frame is copied twice.** The GPU readback is ~4 ms at 1080p (2.65 ms
+  of it a byte-wise copy out of the staging pages), then the CPU mirror feeds
+  the texture upload. Vulkan clients add their own software-WSI copy into
+  `wl_shm`. Zero-copy presentation (option (c): the shared handle straight
+  into wgpu) is the next performance step.
+- **The guest must be configured**: the driconf file, and render-node access
+  for serial-console tools (ADR above). Nothing installs either yet.
