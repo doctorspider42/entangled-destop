@@ -77,12 +77,17 @@ pub const SHM_PAGE_SIZE: u64 = 4096;
 /// host-visible allocation it maps mapped for as long as it lives. Measured on
 /// the Ubuntu 26.04 guest (2026-09-24): gnome-shell 24 ranges,
 /// gnome-initial-setup 18, glmark2 12, vkcube 10 — 64 in all, at which point
-/// vkcube's next swapchain could not map its buffers and died. 1024 is sixteen
-/// per venus context at the renderer's 64-context cap. On KVM each is a memory
-/// slot; `Vm::create_shm_window` reserves no more than the host's
+/// vkcube's next swapchain could not map its buffers and died. Then 1024; a
+/// desktop of thirteen contexts held 155, and a compositor whose host-visible
+/// allocations ran away held 888 of the 1024 before the next map was refused
+/// (ADR-0004, the capacity amendment). 4096 is four times what one venus
+/// context may map at its shares (`MAX_RING_BLOBS_PER_CONTEXT` +
+/// `MAX_MEMORY_BLOBS_PER_CONTEXT` in `virtio_gpu`), so one client cannot take
+/// the ranges from the rest. On KVM each is a memory slot (a current kernel
+/// has 32764); `Vm::create_shm_window` reserves no more than the host's
 /// `KVM_CAP_NR_MEMSLOTS` leaves, and a map past that is refused like one past
-/// this.
-pub const MAX_HOST_RANGES: usize = 1024;
+/// this. WHP addresses a range by its GPA and has no pool to size.
+pub const MAX_HOST_RANGES: usize = 4096;
 
 /// Largest window this VMM will allocate, as a sanity bound on a host
 /// configuration value: 4 GiB. A window is committed host memory, so a typo in
@@ -109,6 +114,21 @@ impl HostShmRegion {
     /// at most [`MAX_SHM_WINDOW_BYTES`]. All three are host configuration
     /// errors — nothing a guest can influence — so they are checked once, here.
     pub fn new(len: u64) -> Result<Self, VmmError> {
+        Self::check_len(len)?;
+        let size = usize::try_from(len)
+            .map_err(|_| VmmError::GuestMemory(format!("window of {len} bytes overflows usize")))?;
+        let mapping = MmapRegion::<()>::new(size).map_err(|e| {
+            VmmError::GuestMemory(format!(
+                "cannot allocate a {len}-byte shared-memory window: {e}"
+            ))
+        })?;
+        Ok(Self { mapping, len })
+    }
+
+    /// The three rules on a window's length — non-zero, whole
+    /// [`SHM_PAGE_SIZE`] pages, at most [`MAX_SHM_WINDOW_BYTES`] — which a
+    /// host-mapped window is held to without allocating anything.
+    fn check_len(len: u64) -> Result<(), VmmError> {
         if len == 0 || len % SHM_PAGE_SIZE != 0 {
             return Err(VmmError::GuestMemory(format!(
                 "a shared-memory window must be a non-zero multiple of {SHM_PAGE_SIZE} bytes \
@@ -121,14 +141,7 @@ impl HostShmRegion {
                  maximum"
             )));
         }
-        let size = usize::try_from(len)
-            .map_err(|_| VmmError::GuestMemory(format!("window of {len} bytes overflows usize")))?;
-        let mapping = MmapRegion::<()>::new(size).map_err(|e| {
-            VmmError::GuestMemory(format!(
-                "cannot allocate a {len}-byte shared-memory window: {e}"
-            ))
-        })?;
-        Ok(Self { mapping, len })
+        Ok(())
     }
 
     /// Length of the window in bytes.
@@ -379,7 +392,11 @@ impl GpaMapper for UnmappedGpaMapper {
 /// it frees, and it refuses to place a window at an address a hypervisor
 /// cannot map.
 pub struct SharedWindow {
-    region: HostShmRegion,
+    /// The window's own pages: `None` for a host-mapped window, which never
+    /// shows them to a guest ([`SharedWindow::new_host_mapped`]).
+    region: Option<HostShmRegion>,
+    /// Length in bytes, validated as [`HostShmRegion::new`] validates it.
+    len: u64,
     mapper: Arc<dyn GpaMapper>,
     /// Whether the guest sees this window's *own* pages (VEN-2001) or ranges
     /// the 3D renderer supplies one blob at a time (VEN-2003). See
@@ -404,7 +421,7 @@ struct Placement {
 impl std::fmt::Debug for SharedWindow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedWindow")
-            .field("len", &self.region.len())
+            .field("len", &self.len)
             .field("backend", &self.mapper.backend())
             .field("host_mapped", &self.host_mapped)
             .field("placed_at", &self.placed_at())
@@ -423,7 +440,8 @@ impl SharedWindow {
     /// reachable through an address the guest has not been told about.
     pub fn new(len: u64, mapper: Arc<dyn GpaMapper>) -> Result<Self, VmmError> {
         Ok(Self {
-            region: HostShmRegion::new(len)?,
+            region: Some(HostShmRegion::new(len)?),
+            len,
             mapper,
             host_mapped: false,
             placed: Mutex::new(Placement::default()),
@@ -447,15 +465,22 @@ impl SharedWindow {
     /// around the hole, per mapping, which is more slots and more failure modes
     /// than mapping only what the renderer actually owns.
     ///
-    /// The allocation still happens, and is still the window's length: it is
-    /// what `HostShmRegion::new` validates the length against, it is what
-    /// [`len`](Self::len) reports, and it costs nothing a host notices
-    /// (untouched anonymous pages). Host-side [`read`](Self::read) /
-    /// [`write`](Self::write) / [`fill`](Self::fill) are refused on such a
-    /// window, because writing bytes no guest can see is worse than an error.
+    /// Nothing is allocated for the window itself. Its length is held to the
+    /// same rules as an allocated window's, but no pages stand behind it:
+    /// they could never be shown to a guest, and on Windows an untouched
+    /// `VirtualAlloc(MEM_COMMIT)` of the window's length is still that much
+    /// commit charge — a 1 GiB window would have cost 1 GiB of the host's
+    /// commit limit for nothing (ADR-0004, the capacity amendment). What a
+    /// larger window costs is guest-physical address space inside the 64-bit
+    /// aperture, and nothing on the host until a blob is mapped. Host-side
+    /// [`read`](Self::read) / [`write`](Self::write) / [`fill`](Self::fill)
+    /// are refused on such a window, because writing bytes no guest can see is
+    /// worse than an error.
     pub fn new_host_mapped(len: u64, mapper: Arc<dyn GpaMapper>) -> Result<Self, VmmError> {
+        HostShmRegion::check_len(len)?;
         Ok(Self {
-            region: HostShmRegion::new(len)?,
+            region: None,
+            len,
             mapper,
             host_mapped: true,
             placed: Mutex::new(Placement::default()),
@@ -464,7 +489,7 @@ impl SharedWindow {
 
     /// Length of the window in bytes.
     pub fn len(&self) -> u64 {
-        self.region.len()
+        self.len
     }
 
     /// Never true — see [`HostShmRegion::is_empty`].
@@ -534,8 +559,8 @@ impl SharedWindow {
                     );
                 }
             }
-        } else {
-            self.mapper.map_range(gpa, self.region.range())?;
+        } else if let Some(region) = &self.region {
+            self.mapper.map_range(gpa, region.range())?;
         }
         placed.base = Some(gpa);
         tracing::debug!(
@@ -660,29 +685,28 @@ impl SharedWindow {
 
     /// Host-side read out of the window (see [`HostShmRegion::read`]).
     pub fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), ShmAccessError> {
-        self.own_pages(offset, buf.len() as u64)?;
-        self.region.read(offset, buf)
+        self.own_pages(offset, buf.len() as u64)?.read(offset, buf)
     }
 
     /// Host-side write into the window.
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), ShmAccessError> {
-        self.own_pages(offset, data.len() as u64)?;
-        self.region.write(offset, data)
+        self.own_pages(offset, data.len() as u64)?
+            .write(offset, data)
     }
 
     /// Host-side fill, used to clear a span before a guest is allowed to see it.
     pub fn fill(&self, offset: u64, len: u64, byte: u8) -> Result<(), ShmAccessError> {
-        self.own_pages(offset, len)?;
-        self.region.fill(offset, len, byte)
+        self.own_pages(offset, len)?.fill(offset, len, byte)
     }
 
-    /// Refuses host access to a window whose bytes are the renderer's, where a
-    /// write would land in pages no guest can see.
-    fn own_pages(&self, offset: u64, len: u64) -> Result<(), ShmAccessError> {
-        if self.host_mapped {
-            return Err(ShmAccessError::HostMapped { offset, len });
+    /// The window's own pages, or the refusal of host access to a window
+    /// whose bytes are the renderer's, where a write would land in pages no
+    /// guest can see.
+    fn own_pages(&self, offset: u64, len: u64) -> Result<&HostShmRegion, ShmAccessError> {
+        match &self.region {
+            Some(region) if !self.host_mapped => Ok(region),
+            _ => Err(ShmAccessError::HostMapped { offset, len }),
         }
-        Ok(())
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Placement>, HvError> {
@@ -938,6 +962,40 @@ mod tests {
     /// Everything the layer below the device still has to check for itself:
     /// the offset, the renderer's own alignment, the span, the count and
     /// overlap.
+    /// A host-mapped window never shows its own pages, so it has none: the
+    /// largest window this VMM allows costs no host memory — and, on Windows,
+    /// no commit charge — while its length is still held to the same rules.
+    #[test]
+    fn a_host_mapped_window_allocates_nothing_but_keeps_the_length_rules() {
+        let window =
+            SharedWindow::new_host_mapped(MAX_SHM_WINDOW_BYTES, Arc::new(UnmappedGpaMapper))
+                .expect("a window of the largest length");
+        assert!(
+            window.region.is_none(),
+            "no pages behind a host-mapped window"
+        );
+        assert_eq!(window.len(), MAX_SHM_WINDOW_BYTES);
+        let mut buf = [0u8; 4];
+        assert!(matches!(
+            window.read(0, &mut buf),
+            Err(ShmAccessError::HostMapped { .. })
+        ));
+        assert!(matches!(
+            window.fill(0, PAGE, 0),
+            Err(ShmAccessError::HostMapped { .. })
+        ));
+        for bad in [0, PAGE + 1, MAX_SHM_WINDOW_BYTES + PAGE] {
+            assert!(
+                SharedWindow::new_host_mapped(bad, Arc::new(UnmappedGpaMapper)).is_err(),
+                "{bad} bytes"
+            );
+        }
+        let own = SharedWindow::new(2 * PAGE, Arc::new(UnmappedGpaMapper)).expect("own pages");
+        assert!(own.region.is_some());
+        own.write(PAGE, b"venus")
+            .expect("its own pages are writable");
+    }
+
     #[test]
     fn a_host_mapped_window_bounds_every_range_it_is_offered() {
         let window = SharedWindow::new_host_mapped(16 * PAGE, Arc::new(UnmappedGpaMapper)).unwrap();
@@ -1022,13 +1080,16 @@ mod tests {
             .expect("room again");
     }
 
-    /// The regression: GNOME composited through Zink, with gnome-shell,
-    /// gnome-initial-setup, glmark2 and vkcube running, held 64 renderer
-    /// ranges, and the 65th — vkcube's next swapchain buffer — was refused
-    /// (2026-09-24). A desktop four times that busy must fit.
+    /// The regression, twice: GNOME composited through Zink, with
+    /// gnome-shell, gnome-initial-setup, glmark2 and vkcube running, held 64
+    /// renderer ranges, and the 65th — vkcube's next swapchain buffer — was
+    /// refused (2026-09-24). Then the capacity stress: a desktop of thirteen
+    /// contexts held 155, and a compositor that ran away held 888 more before
+    /// the 1024 cap refused it. Both must fit, beside each other; the
+    /// renderer's per-context shares are what stop one client there.
     #[test]
     fn a_gpu_composited_desktop_fits_in_the_renderer_ranges() {
-        const DESKTOP: u64 = 4 * 64;
+        const DESKTOP: u64 = 155 + 888;
         let window =
             SharedWindow::new_host_mapped((DESKTOP + 1) * PAGE, Arc::new(UnmappedGpaMapper))
                 .unwrap();

@@ -255,6 +255,113 @@ fn destroying_the_blob_first_leaves_the_memory_whole() {
 
 // ---------------------------------------------------------- the budget
 
+/// Each context holds a share of the renderer-wide budget, as each holds a
+/// share of the host-blob caps: one hungry guest process is refused at its
+/// share, and cannot take the whole from every other client on the desktop.
+#[test]
+fn one_context_cannot_take_the_host_visible_budget_from_the_rest() {
+    use crate::venus::renderer::SinkFactory;
+
+    let host = Arc::new(FakeVulkan::standard());
+    let mut h = Harness::with_factory(ExecutorFactory::with_budgets(
+        Arc::clone(&host),
+        4 * SIZE,
+        3 * SIZE,
+    ));
+    with_device(&mut h);
+    let call = |h: &mut Harness<FakeVulkan>, id: u64, size: u64| {
+        let Command::AllocateMemory(a) = h
+            .call(&allocate(DEVICE, id, size, HOST_COHERENT_TYPE, Vec::new()))
+            .expect("answered")
+        else {
+            panic!("wrong reply")
+        };
+        a.ret
+    };
+    assert_eq!(
+        call(&mut h, MEMORY, 3 * SIZE),
+        VK_SUCCESS,
+        "its whole share"
+    );
+    assert_eq!(
+        call(&mut h, MEMORY + 1, SIZE),
+        VK_ERROR_OUT_OF_DEVICE_MEMORY,
+        "past its share, though the renderer has room"
+    );
+
+    // Another guest process gets what is left of the whole, and no more.
+    h.use_context(2);
+    with_device(&mut h);
+    assert_eq!(call(&mut h, MEMORY, SIZE), VK_SUCCESS);
+    assert_eq!(
+        call(&mut h, MEMORY + 1, SIZE),
+        VK_ERROR_OUT_OF_DEVICE_MEMORY,
+        "inside its share, but the renderer-wide budget is spent"
+    );
+    let usage = h.renderer.factory().usage();
+    assert_eq!(usage.host_visible_bytes, 4 * SIZE);
+    assert_eq!(usage.max_context_host_visible_bytes, 3 * SIZE);
+
+    // Freeing refunds the share and the whole alike.
+    h.use_context(CTX);
+    h.send(&free(DEVICE, MEMORY)).expect("free");
+    h.use_context(2);
+    assert_eq!(call(&mut h, MEMORY + 2, 2 * SIZE), VK_SUCCESS);
+    assert_eq!(h.renderer.factory().host_visible_bytes(), 3 * SIZE);
+    assert!(!h.fatal());
+}
+
+/// Blobs of `VkDeviceMemory` are counted per context as well as in all
+/// (`MAX_MEMORY_BLOBS_PER_CONTEXT` under `MAX_MEMORY_BLOBS`). Each mapped one
+/// is a hypervisor range, so the share is also what keeps one client from
+/// taking the window's ranges from every other: the GPU-composited desktop's
+/// compositor held 888 of them when its staging uploads ran away (ADR-0004,
+/// the capacity amendment).
+#[test]
+fn one_context_cannot_take_the_memory_blobs_from_the_rest() {
+    use crate::venus::renderer::{MAX_MEMORY_BLOBS, MAX_MEMORY_BLOBS_PER_CONTEXT};
+
+    let (mut h, _) = standard();
+    const PAGE: u64 = 4096;
+    let blob_mem = |h: &mut Harness<FakeVulkan>, ctx: u32, id: u64, res: u32| {
+        h.send(&allocate(DEVICE, id, PAGE, HOST_COHERENT_TYPE, Vec::new()))
+            .expect("allocate");
+        h.memory_blob(ctx, res, id, PAGE)
+    };
+    let mut res = 5000u32;
+    for i in 0..MAX_MEMORY_BLOBS_PER_CONTEXT as u64 {
+        res += 1;
+        blob_mem(&mut h, CTX, MEMORY + 0x10 * (i + 1), res).expect("inside the share");
+    }
+    res += 1;
+    assert!(
+        matches!(
+            blob_mem(&mut h, CTX, MEMORY + 0x10 * 0x10_0000, res),
+            Err(crate::error::CommandError::OutOfMemory)
+        ),
+        "past the context's share"
+    );
+    assert!(!h.fatal(), "a refused blob is not a ring fault");
+
+    // Another guest process still gets blobs of its own memory.
+    h.use_context(2);
+    with_device(&mut h);
+    res += 1;
+    blob_mem(&mut h, 2, MEMORY, res).expect("its own share");
+    assert_eq!(
+        h.renderer.usage().max_context_memory_blobs,
+        MAX_MEMORY_BLOBS_PER_CONTEXT
+    );
+    const { assert!(MAX_MEMORY_BLOBS_PER_CONTEXT <= MAX_MEMORY_BLOBS / 4) };
+}
+
+/// The shipped share leaves room for the rest of a desktop: a client at its
+/// share still leaves most of the renderer-wide budget to the others.
+#[test]
+fn the_host_visible_share_is_a_fraction_of_the_whole() {
+    const { assert!(super::MAX_HOST_VISIBLE_BYTES_PER_CONTEXT <= super::MAX_HOST_VISIBLE_BYTES / 2) };
+}
+
 #[test]
 fn the_host_visible_budget_is_renderer_wide_and_answered_in_vulkan_terms() {
     let host = Arc::new(FakeVulkan::standard());

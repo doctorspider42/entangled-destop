@@ -353,9 +353,10 @@ pub const PCI_MMIO_HOLE_SIZE: u64 = VIRTIO_MMIO_BASE - PCI_MMIO_HOLE_BASE;
 // was rejected precisely because the firmware would move the BAR out of it:
 // EDK2 allocates from `Pci64Base` upwards, and `Pci64Base` follows RAM.
 //
-// The aperture is deliberately larger than what it holds (16 GiB for one
-// 256 MiB window today), for the same reason the 32-bit one is: it has to
-// cover everywhere a firmware may legitimately re-align a BAR to.
+// The aperture is deliberately larger than what it holds (64 GiB for one
+// Venus window of at most 4 GiB today), for the same reason the 32-bit one
+// is: it has to cover everywhere a firmware may legitimately re-align a BAR
+// to.
 //
 // It is *not* as large as the firmware's own — EDK2 publishes
 // `Pci64Size=0x3FFEC0000000`, everything up to 2^46, and `PciBusDxe` allocates
@@ -365,13 +366,22 @@ pub const PCI_MMIO_HOLE_SIZE: u64 = VIRTIO_MMIO_BASE - PCI_MMIO_HOLE_BASE;
 // by `crate::shm::ShmWindow::follow` and the guest gets no `resource2`. Hence
 // the sizing rule below, which is arithmetic rather than a round number.
 
-/// Largest single shared-memory BAR this machine will place: 1 GiB.
+/// Largest single shared-memory BAR this machine will place: 4 GiB.
 ///
 /// A BAR is naturally aligned to its own size, so this also bounds how far
 /// into the aperture the first allocation can be pushed by alignment.
-pub const MAX_SHM_BAR_BYTES: u64 = 1 << 30;
+///
+/// It was 1 GiB. A GPU-composited desktop filled a Venus host-visible window
+/// of that size (ADR-0004, the capacity amendment): every client keeps its
+/// rings and every host-visible allocation it maps in the window, and a
+/// window that is full fails the guest's `mmap` — which a compositor does not
+/// survive. 4 GiB is what QEMU's
+/// documentation gives a Venus guest (`hostmem=4G`) and
+/// `vmm_core::MAX_SHM_WINDOW_BYTES`; it costs guest-physical address space
+/// and nothing else, because a host-mapped window has no pages of its own.
+pub const MAX_SHM_BAR_BYTES: u64 = 4 << 30;
 
-/// Size of the 64-bit MMIO aperture starting at [`pci_mmio64_base`]: 16 GiB.
+/// Size of the 64-bit MMIO aperture starting at [`pci_mmio64_base`]: 64 GiB.
 ///
 /// A power of two, so the `_CRS` window is one clean descriptor, but checked
 /// against the budget it claims to cover rather than picked to look tidy: the
@@ -384,7 +394,10 @@ pub const MAX_SHM_BAR_BYTES: u64 = 1 << 30;
 /// and was wrong on its own terms — eight 1 GiB windows do not fit in 4 GiB.
 /// Nothing hit it, because one device declares a region today, which is
 /// precisely the kind of bug that waits for the day a second one does.
-pub const PCI_MMIO64_SIZE: u64 = 16 << 30;
+///
+/// It was 16 GiB while the BAR cap was 1 GiB. At the top of a 4 GiB guest it
+/// ends at 69 GiB, far inside the 2^46 the firmware addresses.
+pub const PCI_MMIO64_SIZE: u64 = 64 << 30;
 
 const _: () = assert!(
     PCI_MMIO64_SIZE >= (PCI_MMIO_SLOTS + 1) * MAX_SHM_BAR_BYTES,

@@ -182,11 +182,18 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_gpu::remote::MAX_FRAME_BYTES` | 40 MiB | bytes in one message either way across the renderer-process boundary, refused *before* reserving | `remote::tests::an_oversized_length_header_is_refused_before_allocating`, fuzz target `gpu_remote_protocol` |
 | `virtio_gpu::remote::protocol::REMOTE_XFER_WINDOW` / `REMOTE_MAX_BACKING` | 8 MiB / 64 MiB | backing bytes per transfer across that boundary / shadow backing per resource | `gpu_remote::the_isolated_renderer_serves_the_whole_3d_path` (round trip), server-side refusal |
 | `virtio_gpu::renderer::MAX_3D_WIDTH` / `MAX_3D_DIM` / `MAX_3D_ARRAY` / `MAX_3D_LAST_LEVEL` / `MAX_3D_SAMPLES` | 2²⁸ / 16384 / 2048 / 15 / 32 | per-axis geometry of one `RESOURCE_CREATE_3D` | `gpu_3d::a_malicious_3d_guest_is_answered_in_band` |
-| `virtio_gpu::blob::MAX_BLOB_RESOURCES` | 4096 | live blob resources (VEN-2001) | `blob::tests::the_resource_count_and_byte_budgets_hold`, fuzz target `gpu_blob` |
+| `virtio_gpu::blob::MAX_BLOB_RESOURCES` | 8192 | live blob resources (VEN-2001); above the Venus renderer's own blob caps so theirs bind and name the client | `blob::tests::the_resource_count_and_byte_budgets_hold`, fuzz target `gpu_blob` |
 | `virtio_gpu::blob::MAX_BLOB_BYTES` | 1 GiB | size of one blob; also the size the helper re-checks on its own side | `blob::tests::sizes_must_be_whole_pages_inside_the_budget`, `gpu_blob::a_malicious_blob_guest_is_answered_in_band` |
-| `virtio_gpu::blob::MAX_TOTAL_BLOB_BYTES` | 4 GiB | bytes promised across every live blob | `blob::tests::the_resource_count_and_byte_budgets_hold` (asserts the budget is exact) |
+| `virtio_gpu::blob::MAX_TOTAL_BLOB_BYTES` | 8 GiB | bytes promised across every live blob (a Venus guest's 1 GiB of host blobs and 2 GiB of host-visible memory, plus exported device-local buffers) | `blob::tests::the_resource_count_and_byte_budgets_hold` (asserts the budget is exact) |
 | `virtio_gpu::blob::MAX_BLOB_ENTRIES` | 16384 | page-list entries in one `RESOURCE_CREATE_BLOB` | `gpu_blob::a_malicious_blob_guest_is_answered_in_band` (a lying `nr_entries` and an overflowing one) |
-| `virtio_gpu::blob::MAX_HOST_VISIBLE_MAPPINGS` | 4096 | live mappings the host-visible window tracks | fuzz target `gpu_blob` |
+| `virtio_gpu::blob::MAX_HOST_VISIBLE_MAPPINGS` | 4096 | live mappings the host-visible window tracks; never below `vmm_core::MAX_HOST_RANGES` | fuzz target `gpu_blob`, `entangled::run_vm::tests::one_venus_client_at_its_shares_leaves_most_of_the_window_ranges` |
+| `virtio_gpu::venus::renderer::VENUS_HOST_VISIBLE_BYTES` | 4 GiB (profile: `[display] host_visible_mib`, 64..=4096, a power of two) | the Venus host-visible window, guest-visible as BAR 2; holds every host blob and host-visible byte the budgets admit, so it never bites first. No host pages behind it | `venus::renderer::tests::the_default_window_holds_everything_the_budgets_admit_and_a_profile_may_resize_it`, `control_api::config::tests::the_host_visible_window_is_a_power_of_two_inside_the_bar_cap` |
+| `vmm_core::shm::MAX_HOST_RANGES` | 4096 | renderer ranges (hypervisor mappings) in one window; four times what one Venus context may map at its shares | `vmm_core::shm::tests::{renderer_ranges_are_bounded, a_gpu_composited_desktop_fits_in_the_renderer_ranges}` |
+| `virtio_gpu::venus::executor::MAX_HOST_VISIBLE_BYTES` / `_PER_CONTEXT` | 2 GiB / 1 GiB | host pages behind host-visible Vulkan memory, every context / one context (`PageBudget::share`) | `venus::shmem::tests::a_budget_share_is_bounded_by_itself_and_by_the_whole`, `executor::memory_tests::one_context_cannot_take_the_host_visible_budget_from_the_rest` |
+| `virtio_gpu::venus::renderer::MAX_MEMORY_BLOBS` / `_PER_CONTEXT` | 4096 / 1024 | blobs of `VkDeviceMemory` (each mapped one is a window range) | `executor::memory_tests::one_context_cannot_take_the_memory_blobs_from_the_rest` |
+| `virtio_gpu::venus::renderer::MAX_RING_BLOBS(_BYTES)` / `_PER_CONTEXT` | 1024, 1 GiB / 64, 128 MiB | host blobs: rings, reply and command-stream pools | `venus::renderer::tests::{a_gpu_composited_desktop_of_venus_clients_fits_in_the_host_blob_budget, one_context_cannot_take_the_host_blob_budget_from_the_rest}` |
+| `virtio_gpu::venus::renderer::MAX_RINGS` / `MAX_RINGS_PER_CONTEXT` | 256 / 32 | rings, and with them ring-worker threads (one TLS ring per guest thread that creates pipelines) | `venus::renderer::tests::{a_gpu_composited_desktop_and_a_game_fit_in_the_ring_caps, the_ring_caps_hold_per_context_and_overall_and_bound_the_threads}` |
+| `virtio_gpu::venus::executor::timeline::MAX_FENCE_THREADS` | 256 | host fence threads, every context together (one context alone could have 63) | `executor::sync_tests::fence_threads_are_capped_across_every_context_and_given_back` |
 | `virtio_gpu::blob::BLOB_PAGE_SIZE` | 4096 | granularity every blob size and map offset must be a multiple of | `blob::tests::window_reservations_cannot_overlap_or_run_off_the_end` |
 | `virtio_gpu::MAX_COMMAND_BYTES_BLOB` | 256 KiB + 56 B | gather cap once blob resources are offered — 24 bytes above the 2D cap, because a full-length `RESOURCE_CREATE_BLOB` really is 24 bytes longer than a full-length attach-backing | `virtio_gpu::device::tests::command_buffer_bound_matches_the_entry_limit` (compile-time `assert!`s in `device.rs`) |
 | `virtio_gpu::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick (controlq and cursorq) | same shape as the blk budget test |
@@ -219,8 +226,8 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_core::pci::VIRTIO_PCI_BAR_SIZE` | 32 KiB | guest-addressable register space per pci device; every capability's `offset + length` must fit | `virtio_core::pci::tests::capability_records_describe_the_real_bar_layout`, `regions_do_not_overlap_and_the_common_struct_fits` |
 | `virtio_core::ShmRegion::len` | non-zero | a declared shared-memory region must have a length; zero is refused at construction because "present with length 0" is the state the all-ones convention exists to avoid | `virtio_core::transport::tests::a_zero_length_shm_region_is_refused` |
 | `vmm_core::shm::MAX_SHM_WINDOW_BYTES` | 4 GiB | host memory one shared-memory window may commit; a host-configuration bound, not a guest one | `vmm_core::shm::tests::a_window_must_be_whole_pages_and_bounded` |
-| `machine_x86::layout::MAX_SHM_BAR_BYTES` | 1 GiB | one device's shared-memory BAR, which also bounds how far alignment can push the first allocation into the aperture. Checked on the running **sum** inside `shm::plan`'s loop, *before* `next_power_of_two` sees it — that method panics in debug and wraps to zero in release above 2^63, and a region length is not always this crate's value (an isolated renderer decodes it off the helper's pipe) | `machine_x86::shm::tests::a_plan_refuses_what_no_bar_could_carry` |
-| `machine_x86::layout::PCI_MMIO64_SIZE` | 16 GiB | the 64-bit aperture, starting at the top of RAM; a BAR outside it is **never mapped**, which is what stops a guest parking host pages over its own RAM. Derived, not picked: a `const` assertion holds it at ≥ `(PCI_MMIO_SLOTS + 1) × MAX_SHM_BAR_BYTES`, since a naturally aligned allocator needs one max window per slot plus one alignment gap. It is *narrower* than EDK2's own `Pci64Size` (2^46), so a firmware that ever placed a window past `pci_mmio64_end` would get a silent refusal | `machine_x86::shm::tests::a_bar_outside_the_aperture_is_never_mapped`, `shm_bus::a_window_the_guest_moves_out_of_the_aperture_is_unmapped` |
+| `machine_x86::layout::MAX_SHM_BAR_BYTES` | 4 GiB | one device's shared-memory BAR, which also bounds how far alignment can push the first allocation into the aperture. Checked on the running **sum** inside `shm::plan`'s loop, *before* `next_power_of_two` sees it — that method panics in debug and wraps to zero in release above 2^63, and a region length is not always this crate's value (an isolated renderer decodes it off the helper's pipe) | `machine_x86::shm::tests::a_plan_refuses_what_no_bar_could_carry` |
+| `machine_x86::layout::PCI_MMIO64_SIZE` | 64 GiB | the 64-bit aperture, starting at the top of RAM; a BAR outside it is **never mapped**, which is what stops a guest parking host pages over its own RAM. Derived, not picked: a `const` assertion holds it at ≥ `(PCI_MMIO_SLOTS + 1) × MAX_SHM_BAR_BYTES`, since a naturally aligned allocator needs one max window per slot plus one alignment gap. It is *narrower* than EDK2's own `Pci64Size` (2^46), so a firmware that ever placed a window past `pci_mmio64_end` would get a silent refusal | `machine_x86::shm::tests::a_bar_outside_the_aperture_is_never_mapped`, `shm_bus::a_window_the_guest_moves_out_of_the_aperture_is_unmapped` |
 | `virtio_core::ShmBacking` accesses | the **region's** length, not the BAR's | every host-side read/write/fill is bounded in u64 against the span the device declared, so one region cannot be reached through another's offsets | `machine_x86::shm::tests::a_region_backing_cannot_reach_another_region`, fuzz target `gpu_blob` |
 | `virtio_core::msix::MAX_MSIX_VECTORS` | 256 | *derived* (table region ÷ 16 B); vectors one function may publish, so `queues + 1` must fit or the transport refuses the device | `virtio_core::msix::tests::table_size_for_*`, `virtio_core::pci::tests::a_device_with_more_queues_than_msix_vectors_is_refused` |
 | `machine_x86::pci::MAX_PCI_DEVICES` | 9 | config spaces, BAR windows and IOAPIC pins on the root bus (8 devices + the host bridge) | `machine_x86::pci::tests::the_bus_is_bounded` |
@@ -415,7 +422,7 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   `unmap_blob`, `destroy_blob`, `reset` and `Drop` all go through it. A device
   reset unmaps immediately (safe from any thread) even though the library-side
   teardown is deferred to the worker thread.
-- `MAX_HOST_RANGES` (`vmm_core`, 1024) bounds **hypervisor objects**, not
+- `MAX_HOST_RANGES` (`vmm_core`, 4096) bounds **hypervisor objects**, not
   bookkeeping: KVM reserves `1 + MAX_HOST_RANGES` memory-slot numbers per window
   (fewer when `KVM_CAP_NR_MEMSLOTS` is short, keeping 16 for the ROMs mapped
   after it) and allocates from that pool, so a guest that maps blobs without
@@ -431,6 +438,19 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   cap (the Venus renderer's `MAX_RING_BLOB*_PER_CONTEXT`), and measure the
   real desktop before choosing the numbers (ADR-0004, amendment on caps sized
   for one client).
+- **Measure with the usage log, and read a runaway for what it is.** The
+  renderer logs every cap-bound quantity, current and peak, at debug on target
+  `virtio_gpu::venus::usage` (`VenusRenderer::usage` / `peak_usage`) when a
+  context comes or goes, when a peak rises and every 10 s when it changed.
+  With GNOME on zink, gnome-shell sometimes starts allocating a fresh
+  host-visible buffer of a client's frame size 60–80 times a second and frees
+  none, until whichever cap comes first — 1 GiB, 3 GiB, the window's ranges. No budget absorbs that; the
+  per-context shares are what keep such a client from taking everything from
+  everyone else (ADR-0004, the capacity amendment).
+- **A host-mapped window has no pages of its own.** `SharedWindow::
+  new_host_mapped` allocates nothing, so a Venus window's size costs
+  guest-physical address space only; on Windows an untouched
+  `VirtualAlloc(MEM_COMMIT)` of it would still have been commit charge.
 - An **isolated** renderer (GPU-012) withholds the window entirely
   (`host_visible_bytes: None`): an `Arc` does not cross a pipe and a pointer in
   the helper's address space names nothing in the VMM's. The guest is told at

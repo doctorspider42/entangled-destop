@@ -302,6 +302,20 @@ pub struct DisplaySection {
     /// per-window `info` log happens either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_stats: Option<PathBuf>,
+    /// Size of the virtio-gpu host-visible window, in MiB: the part of the
+    /// device's shared-memory BAR a 3D renderer maps its blobs into (ADR-0004,
+    /// the capacity amendment). Absent means the renderer's own default
+    /// ([`DEFAULT_HOST_VISIBLE_MIB`] for the Venus renderer). Every rendering
+    /// client in the guest keeps its command rings and every host-visible
+    /// allocation it maps in this window, so a desktop of GPU clients needs
+    /// hundreds of MiB of it. Guest-visible: it is the BAR's size.
+    ///
+    /// A power of two from [`MIN_HOST_VISIBLE_MIB`] to [`MAX_HOST_VISIBLE_MIB`]:
+    /// a PCI BAR is a power of two anyway, and the machine caps one device's
+    /// shared-memory BAR at 4 GiB. It costs guest-physical address space, not
+    /// host memory — nothing is mapped until the guest maps a blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_visible_mib: Option<u32>,
 }
 
 /// Bounds on [`DisplaySection::refresh_hz`], mirroring `virtio_gpu::edid`'s
@@ -311,6 +325,16 @@ pub const MIN_REFRESH_HZ: u32 = 24;
 pub const MAX_REFRESH_HZ: u32 = 240;
 /// What a profile that says nothing gets: what a physical monitor would.
 pub const DEFAULT_REFRESH_HZ: u32 = 60;
+
+/// Bounds on [`DisplaySection::host_visible_mib`]. The top is
+/// `machine_x86::layout::MAX_SHM_BAR_BYTES`, restated here because this crate
+/// validates the same profile on every host without the machine crate.
+pub const MIN_HOST_VISIBLE_MIB: u32 = 64;
+pub const MAX_HOST_VISIBLE_MIB: u32 = 4096;
+/// The Venus renderer's window when a profile does not say
+/// (`virtio_gpu::venus::renderer::VENUS_HOST_VISIBLE_BYTES`, which a test in
+/// `entangled` holds equal to this).
+pub const DEFAULT_HOST_VISIBLE_MIB: u32 = 4096;
 
 impl Default for DisplaySection {
     fn default() -> Self {
@@ -322,6 +346,7 @@ impl Default for DisplaySection {
             virgl_isolation: VirglIsolation::default(),
             refresh_hz: DEFAULT_REFRESH_HZ,
             frame_stats: None,
+            host_visible_mib: None,
         }
     }
 }
@@ -548,6 +573,17 @@ impl VmConfig {
                 self.display.refresh_hz
             ));
         }
+        if let Some(mib) = self.display.host_visible_mib {
+            if !mib.is_power_of_two()
+                || !(MIN_HOST_VISIBLE_MIB..=MAX_HOST_VISIBLE_MIB).contains(&mib)
+            {
+                return err(format!(
+                    "display.host_visible_mib {mib} must be a power of two from \
+                     {MIN_HOST_VISIBLE_MIB} to {MAX_HOST_VISIBLE_MIB}: it is the size of a PCI \
+                     BAR, and one device's shared-memory BAR is at most 4 GiB"
+                ));
+            }
+        }
         // Per-backend network keys, same policy as the boot section: the wrong
         // key is refused rather than ignored, so a profile that names a TAP
         // interface under backend = "usernet" fails loudly instead of quietly
@@ -692,6 +728,43 @@ scale = 1.0
             VmConfig::from_toml(&text).expect("round-trips").gamepad,
             cfg.gamepad
         );
+    }
+
+    /// `[display] host_visible_mib`: absent stays absent (a profile written
+    /// before it keeps its bytes), a power of two inside the BAR cap is taken,
+    /// anything else is refused by name.
+    #[test]
+    fn the_host_visible_window_is_a_power_of_two_inside_the_bar_cap() {
+        let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).expect("parses");
+        assert_eq!(cfg.display.host_visible_mib, None);
+        let text = toml::to_string(&cfg).expect("serialises");
+        assert!(
+            !text.contains("host_visible_mib"),
+            "no key invented: {text}"
+        );
+
+        for mib in [MIN_HOST_VISIBLE_MIB, 256, 512, MAX_HOST_VISIBLE_MIB] {
+            let text = format!("{BACKLOG_EXAMPLE}host_visible_mib = {mib}\n");
+            let cfg = VmConfig::from_toml(&text).unwrap_or_else(|e| panic!("{mib}: {e}"));
+            assert_eq!(cfg.display.host_visible_mib, Some(mib));
+            let back = toml::to_string(&cfg).expect("serialises");
+            assert_eq!(
+                VmConfig::from_toml(&back).expect("round-trips").display,
+                cfg.display
+            );
+        }
+        for mib in [0, 32, 100, 768, 8192, u32::MAX] {
+            let text = format!("{BACKLOG_EXAMPLE}host_visible_mib = {mib}\n");
+            let err = VmConfig::from_toml(&text).expect_err("refused");
+            assert!(err.to_string().contains("host_visible_mib"), "{mib}: {err}");
+        }
+        const {
+            assert!(DEFAULT_HOST_VISIBLE_MIB.is_power_of_two());
+            assert!(
+                DEFAULT_HOST_VISIBLE_MIB >= MIN_HOST_VISIBLE_MIB
+                    && DEFAULT_HOST_VISIBLE_MIB <= MAX_HOST_VISIBLE_MIB
+            );
+        };
     }
 
     #[test]

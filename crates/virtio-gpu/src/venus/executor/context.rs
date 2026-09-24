@@ -208,9 +208,13 @@ pub struct VulkanContext<H: HostVulkan> {
     /// is answered, and the context goes fatal straight after
     /// ([`Self::take_lost`]).
     pub(super) lost: bool,
-    /// The renderer-wide budget every host-visible allocation's pages are
-    /// charged to ([`super::MAX_HOST_VISIBLE_BYTES`]).
+    /// The budget every host-visible allocation's pages are charged to: the
+    /// context's share ([`super::MAX_HOST_VISIBLE_BYTES_PER_CONTEXT`]) of the
+    /// renderer-wide one ([`super::MAX_HOST_VISIBLE_BYTES`]).
     pub(super) budget: Arc<PageBudget>,
+    /// The executor's fence threads, every context together
+    /// ([`super::timeline::MAX_FENCE_THREADS`]).
+    pub(super) fence_threads: Arc<super::timeline::FenceThreads>,
     /// The stop signal of the ring whose command is executing, for a wait
     /// that must give up when the ring is torn down.
     pub(super) stop: Option<crate::venus::service::StopSignal>,
@@ -228,8 +232,25 @@ impl<H: HostVulkan> VulkanContext<H> {
     }
 
     /// An empty context on `host`, charging host-visible memory to `budget`
-    /// — the one every context of a renderer shares.
+    /// — its share of the one every context of a renderer shares.
     pub fn with_budget(ctx_id: u32, host: Arc<H>, budget: Arc<PageBudget>) -> Self {
+        Self::with_limits(
+            ctx_id,
+            host,
+            budget,
+            super::timeline::FenceThreads::new(super::timeline::MAX_FENCE_THREADS),
+        )
+    }
+
+    /// An empty context on `host`, charging host-visible memory to `budget`
+    /// and its fence threads to `fence_threads` — both shared with every
+    /// other context of the executor.
+    pub fn with_limits(
+        ctx_id: u32,
+        host: Arc<H>,
+        budget: Arc<PageBudget>,
+        fence_threads: Arc<super::timeline::FenceThreads>,
+    ) -> Self {
         Self {
             ctx_id,
             host,
@@ -237,6 +258,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             fatal: false,
             lost: false,
             budget,
+            fence_threads,
             stop: None,
             blobs: None,
         }

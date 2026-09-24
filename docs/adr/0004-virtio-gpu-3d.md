@@ -3793,3 +3793,184 @@ unshown allocation. Measure a busier desktop before choosing the number.
 `MAX_RINGS` is a bound from the same one-client era: 32 renderer-wide
 against 64 contexts, one host thread each. Each GTK4 app is a venus instance
 too.
+
+## Amendment, 2026-09-24 — capacity: every cap measured against a desktop
+
+The previous amendment raised two caps and named the next ones. This stage
+measured all of them on the same guest (Ubuntu 26.04, Mesa 26.0.8, GNOME
+composited through zink, `ENTANGLED_VENUS=vulkan`, WHP, RTX 2070) against a
+desktop of clients at once: gnome-shell, both gnome-initial-setup processes,
+three `glmark2-wayland --swap-mode fifo` (build, texture, jellyfish), two
+`vkcube --wsi wayland`, `eglgears_wayland`, `gnome-text-editor` and
+`gnome-calculator` (both GTK4, on `GskGLRenderer` over zink), started one every
+5 s. Then half closed and started again, all closed, all at once, and vkmark.
+
+### The usage log
+
+`VenusRenderer::usage()` counts everything a cap bounds, renderer-wide and the
+largest per context, together with the factory's half (`FactoryUsage`:
+host-visible bytes, objects, fence threads, pending ring fences, scanout
+targets). `peak_usage()` keeps the maximum since the last reset. Both are
+logged at debug on target `virtio_gpu::venus::usage` when a context comes or
+goes, when a peak rises, and at most every 10 s when the usage changed. The
+periodic look is taken from the virtqueue submit, the scanout readback and the
+fence poll, sampled at most every 2 s. A refused blob map is logged too, with
+what the window held. `RUST_LOG=info,virtio_gpu::venus=debug` is enough to
+measure a desktop.
+
+### What the desktop held
+
+Final run, 14 clients (13 contexts at once), no refusal while they ran. All 8
+apps were alive after 3 minutes. glmark2 ran at 20–22 FPS in each of the three
+windows, and the desktop composited at ~33 fps (virtio-gpu frame pacing).
+
+| Cap | Old | Desktop peak (final run) | New | What bounds one hostile guest |
+|---|---|---|---|---|
+| `MAX_VENUS_CONTEXTS` | 64 | 13–14 | 64 (unchanged) | itself; `Gpu3d` 128 behind it |
+| `MAX_RINGS_PER_CONTEXT` | 8 | 3 | 32 | itself |
+| `MAX_RINGS` | 32 | 23 (24 in the first run) | 256 | itself: 256 ring workers + 64 monitors |
+| `MAX_FENCE_THREADS` (new) | none (64 × 63 possible) | 0 | 256 | itself; a context alone ≤ 63 (`ring_idx`) |
+| `MAX_RING_BLOBS` / per context | 1024 / 64 | 67 / 9 | unchanged | the per-context share |
+| `MAX_RING_BLOB_BYTES` / per context | 1 GiB / 128 MiB | 172 MiB / 28 MiB | unchanged | the per-context share |
+| `MAX_MEMORY_BLOBS` / per context | 4096 / none | 94 / 15 | 4096 / 1024 | the per-context share |
+| executor `MAX_HOST_VISIBLE_BYTES` / per context | 1 GiB / none | 160 MiB / 40 MiB | 2 GiB / 1 GiB | `PageBudget::share` |
+| `vmm_core::MAX_HOST_RANGES` | 1024 | 155 | 4096 | memory-blob and host-blob shares: one context ≤ 1088 |
+| window (`VENUS_HOST_VISIBLE_BYTES`) | 256 MiB | 305 MiB mapped | 4 GiB, `[display] host_visible_mib` | budgets: 1 GiB host blobs + 2 GiB memory |
+| device `MAX_BLOB_RESOURCES` | 4096 | 158 | 8192 | the renderer's caps, which now bind first |
+| device `MAX_TOTAL_BLOB_BYTES` | 4 GiB | 330 MiB | 8 GiB | the renderer's budgets + device-local exports |
+| `MAX_OBJECTS_PER_CONTEXT` | 65536 | 1830 (7202 in all; 4657 in the runaway compositor) | unchanged | itself; nothing renderer-wide (see below) |
+| `fence::MAX_PENDING_FENCES` | 64 | 0 held | unchanged | itself |
+| `MAX_SCANOUT_TARGETS` (LRU) | 4 | 3 | unchanged | eviction, not refusal |
+
+Rings, measured per client: one 128 KiB instance ring
+(`vn_instance_init_ring`), plus one 16 KiB ring for every thread that ever
+created a pipeline or read a pipeline cache (`vn_tls_get_ring`,
+`vn_common.c:295-347`), kept until that thread exits. That is 1 to 3 per client
+here. A client that compiles pipelines on a worker pool has one ring per
+worker, and DXVK sizes its pool to the vCPUs. So a game on a 16-vCPU guest
+needs 16 rings, past the old per-context 8. Beside this desktop it also
+needs more than the 8 of the old 32 that were left.
+`a_gpu_composited_desktop_and_a_game_fit_in_the_ring_caps` replays the
+measured rings plus that game, and it fails at the old values. A refused ring
+cannot be reported to the guest: `vkCreateRingMESA` has no reply, and the
+guest then waits on a ring nobody reads.
+
+Fence threads were bounded only per context (one per `ring_idx`, 63), so 64
+contexts could have made the host run 4032 threads. `MAX_FENCE_THREADS` is the
+renderer-wide count. Past it the fence is refused and the device answers it at
+once, as for a full queue. A slot is given back after its thread is joined.
+Mesa 26.0.8 on this path never used one (see the waker below).
+
+### The window
+
+The guest kernel needs nothing of its size. `virtio_gpu` requests the region
+and carves it with a `drm_mm` (`virtgpu_kms.c:178-195`); only the PCI BAR must
+be a power of two, and `machine_x86::shm::plan` rounds it. What a larger window
+cost was the host allocation behind it. `SharedWindow::new_host_mapped` used to
+allocate the window's own pages even though they are never shown to a guest.
+On Windows, `vm-memory`'s `VirtualAlloc(MEM_COMMIT)` makes that the window's
+length in commit charge. A host-mapped window now allocates nothing. Its
+length is held to the same rules
+(`a_host_mapped_window_allocates_nothing_but_keeps_the_length_rules`), so a
+window costs guest-physical address space and nothing else on either host.
+
+The default is **4 GiB**. It holds everything the budgets admit at once: 1 GiB
+of host blobs and 2 GiB of host-visible memory. So the window is never the cap
+that bites first; at 256 MiB, and at 1 GiB in the first stress run, it was.
+4 GiB is also what QEMU's documentation gives a Venus guest (`hostmem=4G`). It
+needed `machine_x86::layout::MAX_SHM_BAR_BYTES` 1 → 4 GiB and the 64-bit
+aperture 16 → 64 GiB (the `const` assertion: one maximum BAR per slot plus an
+alignment gap). At the top of a 4 GiB guest the aperture ends at 69 GiB, far
+inside the firmware's 2^46. A profile can choose the size:
+`[display] host_visible_mib`, a power of two from 64 to 4096, absent by
+default, so existing profiles serialise byte-identically.
+`entangled::run_vm::tests::the_host_visible_window_setting_agrees_with_the_renderer_and_the_machine`
+holds the three crates' numbers together.
+
+### Shares, not only totals
+
+Every renderer-wide cap that one client can fill now has a per-context share
+under it, following the host-blob caps of the previous amendment:
+
+- host-visible memory, through `PageBudget::share`: a charge must fit the
+  context's share and what is left of the whole, and a refund goes to both;
+- memory blobs (`MAX_MEMORY_BLOBS_PER_CONTEXT`);
+- and through those two, the window's hypervisor ranges. One context at both
+  of its blob shares holds at most 1088 of the 4096 ranges
+  (`one_venus_client_at_its_shares_leaves_most_of_the_window_ranges`).
+
+Malicious-guest tests: `one_context_cannot_take_the_host_visible_budget_from_the_rest`,
+`one_context_cannot_take_the_memory_blobs_from_the_rest`,
+`a_budget_share_is_bounded_by_itself_and_by_the_whole`,
+`fence_threads_are_capped_across_every_context_and_given_back`.
+
+What a hostile guest can make the host commit is 1 GiB of host blobs and 2 GiB
+of host-visible pages. That is up from 2 GiB in all, and still less than the
+RAM of a 4 GiB guest. What it can make the host run is 256 ring workers,
+64 monitors and 256 fence threads, all parked unless it produces. Raising
+`MAX_RINGS` 8× also multiplies the transient per-command decode budget
+(`wire::MAX_TEMP_ALLOC_BYTES`, 1 GiB, reset per command and per ring worker),
+which is per thread and has no renderer-wide pool. Host Vulkan objects are
+likewise bounded only per context (65536 × 64). Neither was reached; both are
+recorded here as unbounded renderer-wide.
+
+### The compositor that runs away
+
+Every one of the six stress runs eventually lost the whole desktop to one
+client, gnome-shell; the final run only after its three-minute phase. It began allocating a fresh host-visible buffer of a client's
+frame size, 60–80 per second, and freed none. The sizes were 1 921 024 bytes
+(an 800×600 glmark2 frame), 3 842 048 bytes (vkmark) and 2 MiB. It went on
+until some cap refused the next allocation or map. Mesa allocates
+asynchronously, so the refusal surfaces as the next `vkBindBufferMemory2`
+naming memory that does not exist, which ends gnome-shell's context and with
+it every client's Wayland connection.
+
+| Run | Caps | Trigger | gnome-shell held | Refused by |
+|---|---|---|---|---|
+| 1 | 1 GiB budget, 1 GiB window | 9 clients started at once, vkmark mailbox | 878 MiB in ~6 s | renderer-wide budget |
+| 2 | 3 GiB, 4 GiB window | same | 2.56 GiB, 888 ranges | `MAX_HOST_RANGES` (1024) |
+| 3 | 2 GiB / 1 GiB share | same, glmark2 FIFO | 1 GiB | its share |
+| 4 | 3 GiB, no share | staggered start, vkmark last | 2.85 GiB in 14 s | renderer-wide budget |
+| 5, 6 | final | ~25 s after closing half the clients | 1 GiB | its share |
+
+No budget absorbs this: it grows at 150–250 MiB/s until something refuses.
+Per zink's source, a staging buffer is freed only when its batch completes. A
+freed one stays cached for up to a second. A batch is forced out only at 80 %
+of the device-local heaps, 6.4 GB on this card (`zink_batch.c:1024`,
+`zink_bo.c:1400`). So the guest will hold whatever an unflushed compositor
+accumulates. With shares, the runaway client is refused at its share and the
+other clients keep what they hold. That is all a cap can do. Two leads for the
+stage that takes this on:
+
+- The runs reproduce it: with glmark2 jellyfish, vkcube and gnome-calculator
+  still up, it starts ~25 s after the other five clients close.
+- **Venus queue fences retire synchronously on WHP.** 77 004 times in the final
+  run: `no host waker: a venus queue fence completes synchronously ctx_id=3
+  ring_idx=1`. `attach_userspace_with_shm` never hands a device a
+  `HostWaker` (the KVM path does, through `DeferredWaker`), so every fence
+  gnome-shell puts on its queue's timeline is signalled before the GPU work
+  it guards has run. Whether that is what lets the compositor race ahead of
+  its own batches is not yet shown. It is a correctness bug either way.
+
+### Leaks
+
+None found. In the final run every counter came back when clients went:
+closing 6 of 13 contexts took rings 23 → 12, host blobs 67 → 36,
+memory blobs 91 → 51, window 155 → 84 ranges and 157 → 105 MiB of
+host-visible memory. With the desktop alone again (3 contexts, after
+gnome-shell was restarted) it read 5 rings, 8 threads, 16 host blobs,
+21–24 memory blobs, 34–37 ranges and 52–58 MiB. The first baseline was 5, 8,
+14, 21, 32 ranges and 68 MiB. The guest's own allocator agrees:
+`virtio-gpu-host-visible-mm` read 75 MiB used at the baseline, 304 MiB with
+the desktop up, and 73–78 MiB after everything closed. When the last
+context of a run goes, the next context starts from zero blobs.
+
+### Next limits
+
+In order:
+
+1. The compositor runaway above, and the missing WHP waker.
+2. The runaway's other face: host-visible allocation throughput. Every staging
+   buffer is a page allocation, a driver import and a hypervisor map.
+3. Renderer-wide bounds for host Vulkan objects and for transient decode
+   memory, both still per-context and per-thread only.

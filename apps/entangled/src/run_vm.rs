@@ -71,6 +71,17 @@ const VENUS_CAPTURE_ENV: &str = "ENTANGLED_VENUS_CAPTURE";
 /// no Vulkan loader or no device the executor would expose.
 const VENUS_ENV: &str = "ENTANGLED_VENUS";
 
+/// The Venus renderer's host-visible window: the profile's
+/// `[display] host_visible_mib`, else the renderer's default (ADR-0004, the
+/// capacity amendment).
+fn venus_host_visible_bytes(display: &control_api::DisplaySection) -> u64 {
+    display
+        .host_visible_mib
+        .map_or(virtio_gpu::VENUS_HOST_VISIBLE_BYTES, |mib| {
+            u64::from(mib) << 20
+        })
+}
+
 /// The capture file for the `seq`-th ring of a run, on context `ctx_id`: see
 /// [`VENUS_CAPTURE_ENV`].
 fn venus_capture_path(prefix: &std::path::Path, ctx_id: u32, seq: u64) -> PathBuf {
@@ -394,7 +405,8 @@ fn build_devices(
         // queue that could retire a fence on one
         // (`SinkFactory::retires_ring_fences`; the executing renderer below
         // says true, stage 5b.3).
-        let renderer = virtio_gpu::VenusRenderer::new(sinks);
+        let renderer = virtio_gpu::VenusRenderer::new(sinks)
+            .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
         let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
         gpu.set_refresh_hz(cfg.display.refresh_hz);
         gpu.set_frame_stats(cfg.display.frame_stats.clone());
@@ -431,7 +443,8 @@ fn build_devices(
              queue's timeline, on the host GPU"
         );
         let renderer =
-            virtio_gpu::VenusRenderer::new(virtio_gpu::ExecutorFactory::new(Arc::new(host)));
+            virtio_gpu::VenusRenderer::new(virtio_gpu::ExecutorFactory::new(Arc::new(host)))
+                .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
         let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
         gpu.set_refresh_hz(cfg.display.refresh_hz);
         gpu.set_frame_stats(cfg.display.frame_stats.clone());
@@ -2508,7 +2521,52 @@ fn extend_cmdline(configured: &str, clauses: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{direct_linux_cmdline, extend_cmdline};
+    use super::{direct_linux_cmdline, extend_cmdline, venus_host_visible_bytes};
+
+    /// `control_api` states the Venus window's default and bounds without the
+    /// device or machine crates; this is the place that sees all three. The
+    /// default is the renderer's, the largest window the profile allows is
+    /// the largest shared-memory BAR the machine places, and the key reaches
+    /// the renderer in bytes.
+    #[test]
+    fn the_host_visible_window_setting_agrees_with_the_renderer_and_the_machine() {
+        assert_eq!(
+            u64::from(control_api::DEFAULT_HOST_VISIBLE_MIB) << 20,
+            virtio_gpu::VENUS_HOST_VISIBLE_BYTES
+        );
+        assert_eq!(
+            u64::from(control_api::MAX_HOST_VISIBLE_MIB) << 20,
+            machine_x86::layout::MAX_SHM_BAR_BYTES
+        );
+        let mut display = control_api::DisplaySection::default();
+        assert_eq!(
+            venus_host_visible_bytes(&display),
+            virtio_gpu::VENUS_HOST_VISIBLE_BYTES
+        );
+        display.host_visible_mib = Some(256);
+        assert_eq!(venus_host_visible_bytes(&display), 256 << 20);
+    }
+
+    /// Every blob a Venus client maps is one hypervisor range, and the
+    /// window's range cap is `vmm_core`'s while the per-client shares are the
+    /// renderer's. A client at both of its shares must leave most of the
+    /// ranges to the rest of the desktop — the pattern every cap sized for a
+    /// desktop follows (ADR-0004, the capacity amendment).
+    #[test]
+    fn one_venus_client_at_its_shares_leaves_most_of_the_window_ranges() {
+        const ONE_CLIENT: usize = virtio_gpu::venus::renderer::MAX_RING_BLOBS_PER_CONTEXT
+            + virtio_gpu::venus::renderer::MAX_MEMORY_BLOBS_PER_CONTEXT;
+        const { assert!(ONE_CLIENT * 2 <= vmm_core::MAX_HOST_RANGES) };
+        // And the device's own bookkeeping never binds before the renderer's.
+        const { assert!(vmm_core::MAX_HOST_RANGES <= virtio_gpu::MAX_HOST_VISIBLE_MAPPINGS) };
+        const {
+            assert!(
+                virtio_gpu::venus::renderer::MAX_RING_BLOBS
+                    + virtio_gpu::venus::renderer::MAX_MEMORY_BLOBS
+                    <= virtio_gpu::MAX_BLOB_RESOURCES
+            )
+        };
+    }
 
     /// `control_api` bounds `memory_mib` but deliberately does not depend on
     /// the machine crate, so this is the place that sees both: the largest

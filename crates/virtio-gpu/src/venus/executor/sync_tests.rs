@@ -839,6 +839,47 @@ fn ring_0_and_a_fence_without_a_ring_are_signalled_and_an_unbound_ring_is_refuse
     assert!(!h.fatal(), "a refused fence does not end the context");
 }
 
+/// The fence threads are counted across every context of the executor
+/// (`timeline::MAX_FENCE_THREADS`): one context's per-`ring_idx` bound alone
+/// would let 64 guest processes make the host run 64 × 63 threads. Past the
+/// cap the fence is refused and the device answers it at once; a queue that
+/// already has its thread keeps using it; a destroyed context gives its
+/// threads back.
+#[test]
+fn fence_threads_are_capped_across_every_context_and_given_back() {
+    let host = Arc::new(FakeVulkan::standard());
+    let mut h =
+        Harness::with_factory(super::ExecutorFactory::new(Arc::clone(&host)).with_fence_threads(1));
+    two_queues(&mut h);
+    h.renderer
+        .create_fence_on(CTX, Some(1), 1)
+        .expect("the first queue's thread");
+    assert_eq!(h.renderer.factory().usage().fence_threads, 1);
+    assert!(
+        h.renderer.create_fence_on(CTX, Some(2), 2).is_err(),
+        "a second thread is past the cap"
+    );
+    h.renderer
+        .create_fence_on(CTX, Some(1), 3)
+        .expect("the queue that has a thread keeps using it");
+
+    // Another context is held to the same count.
+    h.use_context(2);
+    with_device(&mut h);
+    assert!(h.renderer.create_fence_on(2, Some(1), 4).is_err());
+    assert!(!h.fatal(), "a refused fence does not end the context");
+
+    // The first context goes, and with it its thread's slot.
+    h.use_context(CTX);
+    h.renderer.ctx_destroy(CTX);
+    assert_eq!(h.renderer.factory().usage().fence_threads, 0);
+    h.use_context(2);
+    h.renderer
+        .create_fence_on(2, Some(1), 5)
+        .expect("the slot came back");
+    let _ = collect(&mut h, 3, Duration::from_secs(5));
+}
+
 #[test]
 fn without_a_waker_a_timeline_fence_is_signalled_at_once() {
     let host = Arc::new(FakeVulkan::standard());

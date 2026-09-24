@@ -174,14 +174,28 @@ use super::transport::{
 };
 use super::wire::WireError;
 
-/// Size of the host-visible window this renderer asks the machine layer for.
+/// Size of the host-visible window this renderer asks the machine layer for,
+/// unless the profile says otherwise (`[display] host_visible_mib`,
+/// [`VenusRenderer::with_host_visible_bytes`]).
 ///
-/// It is a *window*, not an allocation: nothing is committed until a guest maps
-/// a blob into it, and what lands there is the [`RingPages`] of whichever blob
-/// it named. 256 MiB is what the portable loopback declares too, and is large
-/// enough that a guest's mapping offsets are realistic rather than all crammed
-/// against zero.
-pub const VENUS_HOST_VISIBLE_BYTES: u64 = 256 << 20;
+/// It is a *window*, not an allocation: nothing is committed until a guest
+/// maps a blob into it, and what lands there is the [`RingPages`] of whichever
+/// blob it named. The window has no pages of its own on either host
+/// (`vmm_core::SharedWindow::new_host_mapped`), so its size costs
+/// guest-physical address space in the 64-bit aperture and nothing else.
+///
+/// It was 256 MiB, and a GPU-composited GNOME desktop filled 58 % of it with
+/// four clients (ADR-0004). Every Mesa venus client keeps its rings, its
+/// command-stream pools and every host-visible allocation it maps mapped
+/// here for as long as it lives, and the guest kernel's allocator of the BAR
+/// fails the `mmap` of whatever does not fit — which a compositor does not
+/// survive. 4 GiB holds everything the renderer's budgets admit at once
+/// ([`MAX_RING_BLOB_BYTES`] of host blobs and the executor's
+/// `MAX_HOST_VISIBLE_BYTES` of memory), so the window is never the cap that
+/// bites first; it is also what QEMU's documentation gives a Venus guest
+/// (`hostmem=4G`). The guest kernel needs no particular size (it carves the
+/// region with a `drm_mm`); the BAR is a power of two, so this is one.
+pub const VENUS_HOST_VISIBLE_BYTES: u64 = 4 << 30;
 
 /// Most venus contexts this renderer keeps at once.
 ///
@@ -193,10 +207,16 @@ pub const MAX_VENUS_CONTEXTS: usize = 64;
 
 /// Most rings one context may hold open.
 ///
-/// Mesa creates one ring per `vn_ring`, which is one per device connection plus
-/// a small number for its own internal queues; a guest asking for more than a
-/// handful is not a guest doing graphics.
-pub const MAX_RINGS_PER_CONTEXT: usize = 8;
+/// Mesa 26.0.8 creates one 128 KiB ring per `VkInstance`
+/// (`vn_instance_init_ring`) and one 16 KiB ring for every thread that ever
+/// creates a pipeline or reads a pipeline cache (`vn_tls_get_ring`,
+/// `vn_common.c:295-347`), kept until that thread exits. Measured on the
+/// GPU-composited desktop (ADR-0004, the capacity amendment): one to three
+/// per client. A client that compiles pipelines on a worker pool has one per
+/// worker — DXVK sizes its pool to the vCPUs — and past this cap its next
+/// worker's ring is refused, which the guest sees as a ring that never
+/// answers. It was 8; 32 is a 31-thread compile pool.
+pub const MAX_RINGS_PER_CONTEXT: usize = 32;
 
 /// Most rings across all contexts.
 ///
@@ -210,9 +230,16 @@ pub const MAX_RINGS_PER_CONTEXT: usize = 8;
 /// It is also the bound on host threads: every ring has its own worker
 /// ([`super::service::RingWorker`]), plus at most one `ALIVE` monitor per
 /// context, so a guest can make this renderer run at most `MAX_RINGS` +
-/// [`MAX_VENUS_CONTEXTS`] threads, all of them parked or sleeping unless the
-/// guest is producing.
-pub const MAX_RINGS: usize = 32;
+/// [`MAX_VENUS_CONTEXTS`] threads (and the executor's `MAX_FENCE_THREADS`),
+/// all of them parked or sleeping unless the guest is producing.
+///
+/// It was 32 against 64 contexts. The measured desktop of fourteen clients
+/// held 24; one game-sized client with a compile pool needs more than the
+/// remaining 8 alone. 256 is four per context at the context cap, eight
+/// clients at their whole [`MAX_RINGS_PER_CONTEXT`]. A shadow buffer is no
+/// longer the worst case it once was: each is bounded by its ring's own
+/// buffer, and those are host blobs, inside [`MAX_RING_BLOB_BYTES`].
+pub const MAX_RINGS: usize = 256;
 
 /// Most host blobs (`blob_id` 0: rings, reply windows, command-stream
 /// pools) this renderer backs with pages at once, across every context.
@@ -240,6 +267,16 @@ pub const MAX_RING_BLOBS_PER_CONTEXT: usize = 64;
 /// most drivers report.
 pub const MAX_MEMORY_BLOBS: usize = 4096;
 
+/// Most blobs of `VkDeviceMemory` one venus context holds at once — see
+/// [`MAX_MEMORY_BLOBS`].
+///
+/// Each one a guest maps is also one hypervisor range of the window
+/// (`vmm_core::MAX_HOST_RANGES`), so this share is what keeps one client from
+/// taking the ranges from the rest: the runaway compositor of ADR-0004's
+/// capacity amendment held 888 of them. The measured desktop held 94 in all.
+/// A quarter of [`MAX_MEMORY_BLOBS`].
+pub const MAX_MEMORY_BLOBS_PER_CONTEXT: usize = 1024;
+
 /// Most host bytes this renderer will allocate across all live host blobs.
 ///
 /// A host blob's size is guest-chosen, so it is a guest value naming a host
@@ -252,10 +289,10 @@ pub const MAX_MEMORY_BLOBS: usize = 4096;
 /// chunks, and freed chunks stay cached for 3 s (`vn_renderer_internal.c`).
 /// On the GPU-composited GNOME desktop gnome-shell alone held 26 MiB, five
 /// clients 60.5 MiB, and the next 8 MiB chunk glmark2 asked for was refused —
-/// 23 times in 20 ms. 1 GiB is the same bound the executor puts on
-/// host-visible Vulkan memory ([`super::executor::MAX_HOST_VISIBLE_BYTES`]):
-/// what a hostile guest can make this host commit, and six times what a busy
-/// desktop was measured to use.
+/// 23 times in 20 ms. 1 GiB is what a hostile guest can make this host commit
+/// for host blobs (beside the executor's
+/// [`super::executor::MAX_HOST_VISIBLE_BYTES`] for memory), and six times
+/// what a busy desktop was measured to use (fourteen clients: 171 MiB).
 pub const MAX_RING_BLOB_BYTES: u64 = 1 << 30;
 
 /// Most host-blob bytes one venus context holds at once — see
@@ -474,7 +511,155 @@ pub trait SinkFactory: Send {
     fn scanout_targets(&self) -> usize {
         0
     }
+
+    /// What this factory holds right now, for the renderer's usage log
+    /// ([`VenusUsage`]). The default knows only what the trait already says.
+    fn usage(&self) -> FactoryUsage {
+        FactoryUsage {
+            pending_ring_fences: self.pending_ring_fences(),
+            scanout_targets: self.scanout_targets(),
+            ..FactoryUsage::default()
+        }
+    }
 }
+
+/// What a [`SinkFactory`] holds right now: the executor's half of
+/// [`VenusUsage`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FactoryUsage {
+    /// Host pages behind host-visible Vulkan memory, every context together
+    /// (against the executor's `MAX_HOST_VISIBLE_BYTES`).
+    pub host_visible_bytes: u64,
+    /// The most of those one context holds (against its share).
+    pub max_context_host_visible_bytes: u64,
+    /// Guest-visible Vulkan objects, every context together.
+    pub objects: usize,
+    /// The most one context holds (against `MAX_OBJECTS_PER_CONTEXT`).
+    pub max_context_objects: usize,
+    /// Host fence threads: one per queue that has carried a ring fence.
+    pub fence_threads: usize,
+    /// Ring fences waiting on the host GPU.
+    pub pending_ring_fences: usize,
+    /// Handle blobs prepared for scanout on the renderer's own device.
+    pub scanout_targets: usize,
+}
+
+impl FactoryUsage {
+    /// Field by field, the larger of the two.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            host_visible_bytes: self.host_visible_bytes.max(other.host_visible_bytes),
+            max_context_host_visible_bytes: self
+                .max_context_host_visible_bytes
+                .max(other.max_context_host_visible_bytes),
+            objects: self.objects.max(other.objects),
+            max_context_objects: self.max_context_objects.max(other.max_context_objects),
+            fence_threads: self.fence_threads.max(other.fence_threads),
+            pending_ring_fences: self.pending_ring_fences.max(other.pending_ring_fences),
+            scanout_targets: self.scanout_targets.max(other.scanout_targets),
+        }
+    }
+}
+
+/// Everything this renderer holds that a cap bounds, right now — or, as
+/// [`VenusRenderer::peak_usage`], the most of each it has held since the last
+/// reset. Logged at debug (target `virtio_gpu::venus::usage`) when a context
+/// comes or goes and when a peak rises, so a desktop can be measured against
+/// the caps rather than guessed at (ADR-0004, the capacity amendment).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VenusUsage {
+    /// Live venus contexts ([`MAX_VENUS_CONTEXTS`]).
+    pub contexts: usize,
+    /// Live rings, every context together ([`MAX_RINGS`]).
+    pub rings: usize,
+    /// The most rings one context holds ([`MAX_RINGS_PER_CONTEXT`]).
+    pub max_context_rings: usize,
+    /// Ring workers and `ALIVE` monitors running.
+    pub threads: usize,
+    /// Host blobs ([`MAX_RING_BLOBS`]).
+    pub host_blobs: usize,
+    /// Their bytes ([`MAX_RING_BLOB_BYTES`]).
+    pub host_blob_bytes: u64,
+    /// The most host blobs one context holds ([`MAX_RING_BLOBS_PER_CONTEXT`]).
+    pub max_context_host_blobs: usize,
+    /// The most host-blob bytes one context holds
+    /// ([`MAX_RING_BLOB_BYTES_PER_CONTEXT`]).
+    pub max_context_host_blob_bytes: u64,
+    /// Blobs of `VkDeviceMemory` with pages ([`MAX_MEMORY_BLOBS`]).
+    pub memory_blobs: usize,
+    /// The most of those one context holds
+    /// ([`MAX_MEMORY_BLOBS_PER_CONTEXT`]).
+    pub max_context_memory_blobs: usize,
+    /// Handle blobs: exported device-local memory.
+    pub handle_blobs: usize,
+    /// Every blob of this renderer, of any kind (each one of the device's
+    /// `MAX_BLOB_RESOURCES`).
+    pub blobs: usize,
+    /// Their sizes (against the device's `MAX_TOTAL_BLOB_BYTES`).
+    pub blob_bytes: u64,
+    /// Blobs published into the host-visible window (each one hypervisor
+    /// range, against `vmm_core::MAX_HOST_RANGES`).
+    pub window_ranges: usize,
+    /// Their bytes, against the window's length.
+    pub window_bytes: u64,
+    /// The most window ranges one context's blobs hold.
+    pub max_context_window_ranges: usize,
+    /// The most window bytes one context's blobs hold.
+    pub max_context_window_bytes: u64,
+    /// The highest window offset any of them reaches: how far into the
+    /// window the guest kernel's allocator has had to go.
+    pub window_top: u64,
+    /// The factory's half.
+    pub factory: FactoryUsage,
+}
+
+impl VenusUsage {
+    /// Field by field, the larger of the two.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            contexts: self.contexts.max(other.contexts),
+            rings: self.rings.max(other.rings),
+            max_context_rings: self.max_context_rings.max(other.max_context_rings),
+            threads: self.threads.max(other.threads),
+            host_blobs: self.host_blobs.max(other.host_blobs),
+            host_blob_bytes: self.host_blob_bytes.max(other.host_blob_bytes),
+            max_context_host_blobs: self
+                .max_context_host_blobs
+                .max(other.max_context_host_blobs),
+            max_context_host_blob_bytes: self
+                .max_context_host_blob_bytes
+                .max(other.max_context_host_blob_bytes),
+            memory_blobs: self.memory_blobs.max(other.memory_blobs),
+            max_context_memory_blobs: self
+                .max_context_memory_blobs
+                .max(other.max_context_memory_blobs),
+            handle_blobs: self.handle_blobs.max(other.handle_blobs),
+            blobs: self.blobs.max(other.blobs),
+            blob_bytes: self.blob_bytes.max(other.blob_bytes),
+            window_ranges: self.window_ranges.max(other.window_ranges),
+            window_bytes: self.window_bytes.max(other.window_bytes),
+            max_context_window_ranges: self
+                .max_context_window_ranges
+                .max(other.max_context_window_ranges),
+            max_context_window_bytes: self
+                .max_context_window_bytes
+                .max(other.max_context_window_bytes),
+            window_top: self.window_top.max(other.window_top),
+            factory: self.factory.max(other.factory),
+        }
+    }
+}
+
+/// How often the renderer looks at its usage between the events that change
+/// its structure, so a peak reached by traffic alone (objects, fences,
+/// host-visible memory) is still seen and logged.
+const USAGE_SAMPLE_PERIOD: Duration = Duration::from_secs(2);
+
+/// How often the periodic look may log a usage that changed without a peak
+/// rising.
+const USAGE_LOG_PERIOD: Duration = Duration::from_secs(10);
 
 /// A handle blob to read back, as the renderer accepted it (stage S2b,
 /// [`SinkFactory::prepare_scanout`]).
@@ -1697,6 +1882,17 @@ pub enum VenusError {
     #[error("the host limit of {MAX_MEMORY_BLOBS} blobs of Vulkan memory is reached")]
     TooManyMemoryBlobs,
 
+    /// The [`MAX_MEMORY_BLOBS_PER_CONTEXT`] cap.
+    #[error(
+        "venus context {ctx_id} already holds the {max} blobs of Vulkan memory one context may"
+    )]
+    TooManyContextMemoryBlobs {
+        /// The context.
+        ctx_id: u32,
+        /// [`MAX_MEMORY_BLOBS_PER_CONTEXT`].
+        max: usize,
+    },
+
     /// A blob naming a `VkDeviceMemory` that cannot be one.
     #[error("resource {resource_id} cannot be a blob of Vulkan memory {blob_id:#x}: {reason}")]
     MemoryBlob {
@@ -1890,6 +2086,7 @@ impl From<VenusError> for CommandError {
             VenusError::TooManyBlobs { .. }
             | VenusError::TooManyContextBlobs { .. }
             | VenusError::TooManyMemoryBlobs
+            | VenusError::TooManyContextMemoryBlobs { .. }
             | VenusError::BlobBudget { .. }
             | VenusError::ContextBlobBudget { .. } => Self::OutOfMemory,
             VenusError::BlobAlreadyMapped(id) => Self::BlobAlreadyMapped(id),
@@ -2108,6 +2305,10 @@ pub struct VenusRenderer<F> {
     host_blob_limits: HostBlobLimits,
     /// Memory blobs, against [`MAX_MEMORY_BLOBS`].
     memory_blobs: usize,
+    /// Memory blobs per creating context, against
+    /// [`MAX_MEMORY_BLOBS_PER_CONTEXT`]; kept until its last blob goes, as
+    /// `host_blob_use` is.
+    memory_blob_use: HashMap<u32, usize>,
     contexts: HashMap<u32, Context>,
     /// Transport commands accepted but not executed (reply streams on the
     /// context stream): a diagnostic, and what a test asserts to show they
@@ -2122,6 +2323,19 @@ pub struct VenusRenderer<F> {
     /// Ring fences the factory retired, for the device to collect (stage
     /// 5b.3).
     retirer: FenceRetirer,
+    /// The most of everything a cap bounds this renderer has held since the
+    /// last reset ([`VenusUsage`]).
+    peak: VenusUsage,
+    /// Whether `peak` rose since it was last logged.
+    peak_unlogged: bool,
+    /// When usage was last sampled by the periodic look.
+    sampled: Option<std::time::Instant>,
+    /// The usage the last log line reported, and when: the periodic look
+    /// logs a change at most every [`USAGE_LOG_PERIOD`].
+    logged: (VenusUsage, Option<std::time::Instant>),
+    /// The host-visible window this renderer asks for
+    /// ([`VENUS_HOST_VISIBLE_BYTES`] unless the profile says otherwise).
+    host_visible_bytes: u64,
 }
 
 impl<F> fmt::Debug for VenusRenderer<F> {
@@ -2164,12 +2378,29 @@ impl<F> VenusRenderer<F> {
             host_blob_use: HashMap::new(),
             host_blob_limits: HostBlobLimits::default(),
             memory_blobs: 0,
+            memory_blob_use: HashMap::new(),
             contexts: HashMap::new(),
             observed: 0,
             quiesce: Quiesce::new(),
             live: LiveThreads::new(),
             retirer: FenceRetirer::default(),
+            peak: VenusUsage::default(),
+            peak_unlogged: false,
+            sampled: None,
+            logged: (VenusUsage::default(), None),
+            host_visible_bytes: VENUS_HOST_VISIBLE_BYTES,
         }
+    }
+
+    /// Ask for a host-visible window of `len` bytes instead of
+    /// [`VENUS_HOST_VISIBLE_BYTES`] (`[display] host_visible_mib`). Takes
+    /// effect in [`Renderer3d::blob_support`], so it must be set before the
+    /// device is built. `len` is host configuration, validated with the
+    /// profile; the machine layer refuses a window it cannot place.
+    #[must_use]
+    pub fn with_host_visible_bytes(mut self, len: u64) -> Self {
+        self.host_visible_bytes = len;
+        self
     }
 
     /// The capset this renderer advertises. [`VenusCapset::new`] by default.
@@ -2461,6 +2692,156 @@ impl<F> VenusRenderer<F> {
 }
 
 impl<F: SinkFactory> VenusRenderer<F> {
+    /// Everything a cap bounds, as it is right now.
+    #[must_use]
+    pub fn usage(&self) -> VenusUsage {
+        let mut usage = VenusUsage {
+            contexts: self.contexts.len(),
+            threads: self.live.count(),
+            host_blobs: self.shm_blobs,
+            host_blob_bytes: self.blob_bytes,
+            memory_blobs: self.memory_blobs,
+            factory: self.sinks.usage(),
+            ..VenusUsage::default()
+        };
+        for context in self.contexts.values() {
+            usage.rings = usage.rings.saturating_add(context.rings.len());
+            usage.max_context_rings = usage.max_context_rings.max(context.rings.len());
+        }
+        for (blobs, bytes) in self.host_blob_use.values() {
+            usage.max_context_host_blobs = usage.max_context_host_blobs.max(*blobs);
+            usage.max_context_host_blob_bytes = usage.max_context_host_blob_bytes.max(*bytes);
+        }
+        // Per context: memory blobs, window ranges, window bytes.
+        let mut per_context: HashMap<u32, (usize, usize, u64)> = HashMap::new();
+        for blob in self.blobs.values() {
+            usage.blobs = usage.blobs.saturating_add(1);
+            usage.blob_bytes = usage.blob_bytes.saturating_add(blob.size);
+            let share = per_context.entry(blob.ctx_id).or_default();
+            match blob.kind {
+                BlobKind::Handle => {
+                    usage.handle_blobs = usage.handle_blobs.saturating_add(1);
+                    share.0 = share.0.saturating_add(1);
+                }
+                BlobKind::Memory => share.0 = share.0.saturating_add(1),
+                BlobKind::Shm => {}
+            }
+            if let Some(publication) = &blob.publication {
+                usage.window_ranges = usage.window_ranges.saturating_add(1);
+                usage.window_bytes = usage.window_bytes.saturating_add(publication.len());
+                usage.window_top = usage
+                    .window_top
+                    .max(publication.offset().saturating_add(publication.len()));
+                share.1 = share.1.saturating_add(1);
+                share.2 = share.2.saturating_add(publication.len());
+            }
+        }
+        for (memory_blobs, ranges, bytes) in per_context.into_values() {
+            usage.max_context_memory_blobs = usage.max_context_memory_blobs.max(memory_blobs);
+            usage.max_context_window_ranges = usage.max_context_window_ranges.max(ranges);
+            usage.max_context_window_bytes = usage.max_context_window_bytes.max(bytes);
+        }
+        usage
+    }
+
+    /// The most of everything a cap bounds this renderer has held since the
+    /// last reset, as far as its samples saw.
+    #[must_use]
+    pub fn peak_usage(&self) -> VenusUsage {
+        self.peak
+    }
+
+    /// Look at the usage now and raise the peak with it.
+    fn sample_usage(&mut self) -> VenusUsage {
+        let now = self.usage();
+        let peak = self.peak.max(now);
+        if peak != self.peak {
+            self.peak = peak;
+            self.peak_unlogged = true;
+        }
+        now
+    }
+
+    /// Sample, and log the usage and the peak, because `event` happened.
+    fn log_usage(&mut self, event: &'static str, ctx_id: u32) {
+        let now = self.sample_usage();
+        self.peak_unlogged = false;
+        self.logged = (now, Some(std::time::Instant::now()));
+        let peak = self.peak;
+        tracing::debug!(
+            target: "virtio_gpu::venus::usage",
+            event,
+            ctx_id,
+            contexts = now.contexts,
+            rings = now.rings,
+            threads = now.threads,
+            fence_threads = now.factory.fence_threads,
+            host_blobs = now.host_blobs,
+            host_blob_bytes = now.host_blob_bytes,
+            memory_blobs = now.memory_blobs,
+            handle_blobs = now.handle_blobs,
+            blobs = now.blobs,
+            blob_bytes = now.blob_bytes,
+            window_ranges = now.window_ranges,
+            window_bytes = now.window_bytes,
+            host_visible_bytes = now.factory.host_visible_bytes,
+            objects = now.factory.objects,
+            pending_ring_fences = now.factory.pending_ring_fences,
+            peak_contexts = peak.contexts,
+            peak_rings = peak.rings,
+            peak_context_rings = peak.max_context_rings,
+            peak_threads = peak.threads,
+            peak_fence_threads = peak.factory.fence_threads,
+            peak_host_blobs = peak.host_blobs,
+            peak_host_blob_bytes = peak.host_blob_bytes,
+            peak_context_host_blobs = peak.max_context_host_blobs,
+            peak_context_host_blob_bytes = peak.max_context_host_blob_bytes,
+            peak_memory_blobs = peak.memory_blobs,
+            peak_context_memory_blobs = peak.max_context_memory_blobs,
+            peak_handle_blobs = peak.handle_blobs,
+            peak_blobs = peak.blobs,
+            peak_blob_bytes = peak.blob_bytes,
+            peak_window_ranges = peak.window_ranges,
+            peak_window_bytes = peak.window_bytes,
+            peak_context_window_ranges = peak.max_context_window_ranges,
+            peak_context_window_bytes = peak.max_context_window_bytes,
+            peak_window_top = peak.window_top,
+            peak_host_visible_bytes = peak.factory.host_visible_bytes,
+            peak_context_host_visible_bytes = peak.factory.max_context_host_visible_bytes,
+            peak_objects = peak.factory.objects,
+            peak_context_objects = peak.factory.max_context_objects,
+            peak_pending_ring_fences = peak.factory.pending_ring_fences,
+            peak_scanout_targets = peak.factory.scanout_targets,
+            "venus usage"
+        );
+    }
+
+    /// The periodic look, taken from the paths a running guest keeps calling
+    /// (its virtqueue submits, the scanout readback, the fence poll): at
+    /// most every [`USAGE_SAMPLE_PERIOD`]. It logs
+    /// when a peak rose since the last line, or — at most every
+    /// [`USAGE_LOG_PERIOD`] — when the usage changed, so the log shows what
+    /// the renderer holds between contexts coming and going (a leak shows as
+    /// a level that does not come back down).
+    fn tick_usage(&mut self) {
+        let at = std::time::Instant::now();
+        if self
+            .sampled
+            .is_some_and(|then| at.saturating_duration_since(then) < USAGE_SAMPLE_PERIOD)
+        {
+            return;
+        }
+        self.sampled = Some(at);
+        let now = self.sample_usage();
+        let (logged, when) = self.logged;
+        let due = when.is_none_or(|then| at.saturating_duration_since(then) >= USAGE_LOG_PERIOD);
+        if self.peak_unlogged {
+            self.log_usage("peak", 0);
+        } else if due && now != logged {
+            self.log_usage("changed", 0);
+        }
+    }
+
     /// `SET_SCANOUT_BLOB` of a blob of this renderer (stage S2b,
     /// [`Renderer3d::scanout_blob`]): see the module docs' scanout section.
     fn accept_scanout(
@@ -2868,6 +3249,7 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 worker,
             },
         );
+        self.sample_usage();
         Ok(())
     }
 
@@ -2982,6 +3364,12 @@ impl<F: SinkFactory> VenusRenderer<F> {
                     // import made already holds its own `Arc` of them.
                     self.directory.remove(resource_id);
                     self.memory_blobs = self.memory_blobs.saturating_sub(1);
+                    if let Some(held) = self.memory_blob_use.get_mut(&blob.ctx_id) {
+                        *held = held.saturating_sub(1);
+                        if *held == 0 {
+                            self.memory_blob_use.remove(&blob.ctx_id);
+                        }
+                    }
                     // Stage S2b: the scanout device's import of it goes too.
                     if blob.kind == BlobKind::Handle {
                         self.sinks.forget_scanout(resource_id);
@@ -3002,6 +3390,14 @@ impl<F: SinkFactory> VenusRenderer<F> {
         entries: &[MemEntry],
     ) -> Result<(), VenusError> {
         self.check_host_blob(ctx_id, args, entries)?;
+        // The context's share first, as for host blobs.
+        let held = self.memory_blob_use.get(&ctx_id).copied().unwrap_or(0);
+        if held >= MAX_MEMORY_BLOBS_PER_CONTEXT {
+            return Err(VenusError::TooManyContextMemoryBlobs {
+                ctx_id,
+                max: MAX_MEMORY_BLOBS_PER_CONTEXT,
+            });
+        }
         if self.memory_blobs >= MAX_MEMORY_BLOBS {
             return Err(VenusError::TooManyMemoryBlobs);
         }
@@ -3018,6 +3414,8 @@ impl<F: SinkFactory> VenusRenderer<F> {
             ExportedMemory::Handle(_) => BlobKind::Handle,
         };
         self.memory_blobs = self.memory_blobs.saturating_add(1);
+        let held = self.memory_blob_use.entry(ctx_id).or_default();
+        *held = held.saturating_add(1);
         // In the directory too, where another context attached to it may
         // find it to import (stages 5c and S1) — and never as a reply window.
         self.directory
@@ -3135,6 +3533,7 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         self.create_context(ctx_id, capset_id)?;
         self.sinks.context_created(ctx_id);
         tracing::debug!(ctx_id, capset_id, name, "venus context created");
+        self.log_usage("context created", ctx_id);
         Ok(())
     }
 
@@ -3148,6 +3547,7 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
             self.sinks.context_destroyed(ctx_id);
             // A context id the guest reuses starts with no attachments.
             self.directory.forget_context(ctx_id);
+            self.log_usage("context destroyed", ctx_id);
         }
     }
 
@@ -3189,6 +3589,7 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
     }
 
     fn submit(&mut self, ctx_id: u32, stream: &[u8]) -> Result<(), CommandError> {
+        self.tick_usage();
         self.dispatch(ctx_id, stream)?;
         Ok(())
     }
@@ -3201,6 +3602,7 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         rect: Rect,
         out: &mut Vec<u8>,
     ) -> Result<(), CommandError> {
+        self.tick_usage();
         self.read_scanout(resource_id, rect, out).map_err(|error| {
             tracing::debug!(resource = resource_id, %error, "venus scanout readback failed");
             error.into()
@@ -3248,7 +3650,12 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         self.shm_blobs = 0;
         self.host_blob_use.clear();
         self.memory_blobs = 0;
+        self.memory_blob_use.clear();
         self.observed = 0;
+        self.peak = VenusUsage::default();
+        self.peak_unlogged = false;
+        self.sampled = None;
+        self.logged = (VenusUsage::default(), None);
     }
 
     fn snapshot_refusal(&self) -> Option<String> {
@@ -3329,6 +3736,7 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
     }
 
     fn poll_fence_timelines(&mut self, _still_pending: usize) -> Vec<(FenceTimeline, u32)> {
+        self.tick_usage();
         self.retirer
             .take()
             .into_iter()
@@ -3350,7 +3758,7 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
             // itself. Saying yes costs nothing and lets a guest use them.
             guest: true,
             host3d: true,
-            host_visible_bytes: Some(VENUS_HOST_VISIBLE_BYTES),
+            host_visible_bytes: Some(self.host_visible_bytes),
             // The bytes a guest reads through this window are *our* pages, put
             // there one blob at a time by `RingPages::publish`. That is the
             // whole mechanism a command ring needs, and it is exclusive with a
@@ -3396,6 +3804,7 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
             size = args.size,
             "venus host blob created"
         );
+        self.sample_usage();
         Ok(())
     }
 
@@ -3409,7 +3818,27 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         offset: u64,
         size: u64,
     ) -> Result<BlobMapping, CommandError> {
-        Ok(self.map_host_blob(resource_id, offset, size)?)
+        let mapping = self.map_host_blob(resource_id, offset, size);
+        match &mapping {
+            Ok(_) => {
+                self.sample_usage();
+            }
+            Err(error) => {
+                // As for a refused create: the device logs only the response
+                // code, and the guest learns of it as an `mmap` failure.
+                let usage = self.usage();
+                tracing::debug!(
+                    resource = resource_id,
+                    offset = format_args!("{offset:#x}"),
+                    size,
+                    window_ranges = usage.window_ranges,
+                    window_bytes = usage.window_bytes,
+                    %error,
+                    "venus blob map refused"
+                );
+            }
+        }
+        Ok(mapping?)
     }
 
     fn unmap_blob(&mut self, resource_id: u32, offset: u64) {
@@ -4018,6 +4447,25 @@ mod tests {
         assert!(support.host_mapped, "a ring's atomics are host pages");
         assert_eq!(support.host_visible_bytes, Some(VENUS_HOST_VISIBLE_BYTES));
         assert!(support.accepts(BLOB_MEM_HOST3D));
+    }
+
+    /// The window is sized for what the renderer lets a guest map at once:
+    /// every host blob and every page of host-visible memory together fit in
+    /// the default window, so the window is never the cap that bites first
+    /// (it was, at 256 MiB and then at 1 GiB, on the GPU-composited desktop).
+    /// A profile may ask for another size (`[display] host_visible_mib`).
+    #[test]
+    fn the_default_window_holds_everything_the_budgets_admit_and_a_profile_may_resize_it() {
+        const {
+            assert!(
+                MAX_RING_BLOB_BYTES + super::super::executor::MAX_HOST_VISIBLE_BYTES
+                    <= VENUS_HOST_VISIBLE_BYTES
+            )
+        };
+        const { assert!(VENUS_HOST_VISIBLE_BYTES.is_power_of_two(), "a BAR is") };
+        let renderer =
+            VenusRenderer::new(CaptureSink::new().factory()).with_host_visible_bytes(256 << 20);
+        assert_eq!(renderer.blob_support().host_visible_bytes, Some(256 << 20));
     }
 
     // ----------------------------------------------------------- the whole flow
@@ -5061,6 +5509,76 @@ mod tests {
             .expect("a reset forgets every share");
     }
 
+    /// The rings each Mesa 26.0.8 venus client held on the GPU-composited
+    /// GNOME desktop under the capacity stress (Ubuntu 26.04, 2026-09-24):
+    /// one 128 KiB instance ring, plus one 16 KiB ring per thread that ever
+    /// created a pipeline (`vn_tls_get_ring`, `vn_common.c:295-347`), kept
+    /// until that thread exits. Fourteen clients, 24 rings.
+    const DESKTOP_RINGS: &[(&str, usize)] = &[
+        ("gnome-shell", 2),
+        ("gnome-initial-setup", 2),
+        ("gnome-initial-setup", 2),
+        ("vkcube", 1),
+        ("vkcube", 1),
+        ("vkmark", 1),
+        ("eglgears_wayland", 2),
+        ("glmark2-wayland", 2),
+        ("glmark2-wayland", 2),
+        ("glmark2-wayland", 2),
+        ("gnome-calculator", 1),
+        ("gnome-calculator", 3),
+        ("gnome-text-editor", 1),
+        ("gnome-text-editor", 2),
+    ];
+
+    /// The regression the ring caps were raised for. The measured desktop
+    /// held 24 of the 32 rings the renderer allowed, and one game-sized
+    /// Vulkan client that compiles pipelines on a worker pool (one TLS ring
+    /// per worker: DXVK sizes its pool to the vCPUs) needs more rings than
+    /// the old per-context 8 and more than the 8 left over. Both fail at the
+    /// old values (32 renderer-wide, 8 per context).
+    #[test]
+    fn a_gpu_composited_desktop_and_a_game_fit_in_the_ring_caps() {
+        let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
+        let mut renderer = VenusRenderer::new(CaptureSink::new().factory());
+        let window = Window::host_mapped();
+        renderer.set_host_visible(Arc::clone(&window) as Arc<dyn ShmBacking>);
+        // A game on a 16-vCPU guest: its instance ring and 15 workers'.
+        const GAME: (&str, usize) = ("a Vulkan game", 16);
+        let mut resource = 0u32;
+        let clients = DESKTOP_RINGS.iter().copied().chain([GAME]);
+        for (ctx_id, (who, rings)) in (1u32..).zip(clients) {
+            renderer
+                .ctx_create(ctx_id, crate::CAPSET_VENUS, who)
+                .expect("a context");
+            for slot in 0..rings as u64 {
+                resource += 1;
+                renderer
+                    .create_blob(ctx_id, &blob_args(resource, RESOURCE), &mem, &[])
+                    .expect("a ring's blob");
+                let info = RingCreateInfo {
+                    resource_id: resource,
+                    ..ring_info()
+                };
+                renderer
+                    .dispatch(ctx_id, &create_ring_stream(slot, info))
+                    .unwrap_or_else(|e| panic!("{who}'s ring {slot} was refused: {e}"));
+            }
+        }
+        let measured: usize = DESKTOP_RINGS.iter().map(|(_, rings)| rings).sum();
+        assert_eq!(measured, 24);
+        assert_eq!(renderer.ring_count(), measured + GAME.1);
+        assert!(
+            renderer.ring_count() > 32 && GAME.1 > 8,
+            "past both old caps"
+        );
+        let usage = renderer.usage();
+        assert_eq!(usage.max_context_rings, GAME.1);
+        assert_eq!(usage.contexts, DESKTOP_RINGS.len() + 1);
+        renderer.reset();
+        assert_eq!(renderer.live_threads(), 0);
+    }
+
     #[test]
     fn the_ring_caps_hold_per_context_and_overall_and_bound_the_threads() {
         let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
@@ -5131,7 +5649,10 @@ mod tests {
                     Err(other) => panic!("unexpected refusal: {other}"),
                 }
             }
-            assert!(ctx_id < 16, "the global ring cap never bit");
+            assert!(
+                ctx_id <= CTX + (MAX_RINGS / MAX_RINGS_PER_CONTEXT) as u32 + 1,
+                "the global ring cap never bit"
+            );
         }
         assert_eq!(renderer.ring_count(), MAX_RINGS);
         // One worker per ring, and the cap on rings is the cap on threads.

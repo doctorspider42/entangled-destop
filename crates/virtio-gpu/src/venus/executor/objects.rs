@@ -1032,6 +1032,16 @@ impl<H: HostVulkan> Objects<H> {
             .map(|(id, _)| *id)
     }
 
+    /// Queues with a fence thread of their own (stage 5b.3): one per queue
+    /// that has carried a ring fence, for as long as the queue lives.
+    #[must_use]
+    pub fn fence_threads(&self) -> usize {
+        self.queues
+            .values()
+            .filter(|queue| queue.sync.is_some())
+            .count()
+    }
+
     /// Ring fences created on every queue and not yet retired.
     #[must_use]
     pub fn pending_ring_fences(&self) -> usize {

@@ -1064,12 +1064,20 @@ impl<H: HostVulkan> VulkanContext<H> {
             .is_none()
         {
             let handle = Arc::clone(&self.objects.device(device).map_err(|e| e.to_string())?.host);
+            let slot = self.fence_threads.take().ok_or_else(|| {
+                format!(
+                    "the host already runs the {} fence threads it allows every guest process \
+                     together",
+                    self.fence_threads.limit()
+                )
+            })?;
             let sync = QueueSync::spawn(
                 Arc::clone(&self.host),
                 handle,
                 retire.clone(),
                 self.ctx_id,
                 fence.ring_idx,
+                slot,
             )
             .map_err(|e| {
                 format!(

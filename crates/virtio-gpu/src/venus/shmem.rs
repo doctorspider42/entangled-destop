@@ -253,10 +253,17 @@ pub const MAX_MEMORY_ALIGNMENT: u64 = 2 << 20;
 /// after their `VkDeviceMemory` was freed still count, and a guest cannot
 /// free-and-reallocate its way past the cap while it keeps the old pages
 /// mapped.
+///
+/// A budget may be a **share** of another ([`PageBudget::share`]): a charge
+/// then has to fit both, so one venus context is held to its share and every
+/// context together to the renderer-wide whole — the pattern the host-blob
+/// caps follow (`super::renderer::MAX_RING_BLOB_BYTES_PER_CONTEXT`).
 #[derive(Debug)]
 pub struct PageBudget {
     limit: u64,
     used: AtomicU64,
+    /// The budget this one is a share of, charged and refunded with it.
+    whole: Option<Arc<PageBudget>>,
 }
 
 impl PageBudget {
@@ -266,6 +273,19 @@ impl PageBudget {
         Arc::new(Self {
             limit,
             used: AtomicU64::new(0),
+            whole: None,
+        })
+    }
+
+    /// A share of `whole` of at most `limit` bytes: a charge to it must fit
+    /// under `limit` **and** in what is left of `whole`, and a refund goes
+    /// back to both.
+    #[must_use]
+    pub fn share(whole: &Arc<Self>, limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            limit: limit.min(whole.limit),
+            used: AtomicU64::new(0),
+            whole: Some(Arc::clone(whole)),
         })
     }
 
@@ -281,17 +301,47 @@ impl PageBudget {
         self.used.load(Ordering::Acquire)
     }
 
-    /// Take `bytes` out of the budget, or refuse without taking anything.
+    /// Take `bytes` out of the budget — and out of the whole it is a share
+    /// of — or refuse without taking anything from either.
     fn try_charge(&self, bytes: u64) -> bool {
-        self.used
+        let charged = self
+            .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|total| *total <= self.limit)
             })
-            .is_ok()
+            .is_ok();
+        if !charged {
+            return false;
+        }
+        match &self.whole {
+            Some(whole) if !whole.try_charge(bytes) => {
+                self.refund_own(bytes);
+                false
+            }
+            _ => true,
+        }
     }
 
-    /// Give `bytes` back. Saturating: a refund can only follow its charge.
+    /// Give `bytes` back, to the whole as well. Saturating: a refund can only
+    /// follow its charge.
     fn refund(&self, bytes: u64) {
+        self.refund_own(bytes);
+        if let Some(whole) = &self.whole {
+            whole.refund(bytes);
+        }
+    }
+
+    /// `(used, limit)` of whichever level refuses `bytes` — the share, or
+    /// the whole behind it — for the refusal's message.
+    fn refuser(&self, bytes: u64) -> (u64, u64) {
+        let used = self.used();
+        match &self.whole {
+            Some(whole) if used.saturating_add(bytes) <= self.limit => whole.refuser(bytes),
+            _ => (used, self.limit),
+        }
+    }
+
+    fn refund_own(&self, bytes: u64) {
         let _ = self
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -629,10 +679,11 @@ impl RingPages {
             usize::try_from(align).map_err(|_| ShmemError::UnusableLayout { size, align })?;
         let (alloc, rounded) = Self::layout(rounded, align_usize)?;
         if !budget.try_charge(rounded) {
+            let (used, limit) = budget.refuser(rounded);
             return Err(ShmemError::OverBudget {
                 size: rounded,
-                used: budget.used(),
-                limit: budget.limit(),
+                used,
+                limit,
             });
         }
         let charge = (Arc::clone(budget), rounded);
@@ -2532,6 +2583,50 @@ mod tests {
                 Event::Unmap { offset: 0 }
             ]
         );
+    }
+
+    /// A share is held to its own limit and to what is left of the whole,
+    /// and a refusal at either level charges neither.
+    #[test]
+    fn a_budget_share_is_bounded_by_itself_and_by_the_whole() {
+        let whole = PageBudget::new(0x6_0000);
+        let a = PageBudget::share(&whole, 0x4_0000);
+        let b = PageBudget::share(&whole, 0x4_0000);
+        let big = PageBudget::share(&whole, u64::MAX);
+        assert_eq!(
+            big.limit(),
+            0x6_0000,
+            "a share is never larger than its whole"
+        );
+
+        let a1 = RingPages::for_memory(0x3_0000, 4096, &a).expect("inside a's share");
+        // a's own share refuses, and says so with a's numbers.
+        assert_eq!(
+            RingPages::for_memory(0x2_0000, 4096, &a).map(|_| ()),
+            Err(ShmemError::OverBudget {
+                size: 0x2_0000,
+                used: 0x3_0000,
+                limit: 0x4_0000
+            })
+        );
+        // b's share has room, but the whole does not: the whole refuses.
+        assert_eq!(
+            RingPages::for_memory(0x4_0000, 4096, &b).map(|_| ()),
+            Err(ShmemError::OverBudget {
+                size: 0x4_0000,
+                used: 0x3_0000,
+                limit: 0x6_0000
+            })
+        );
+        assert_eq!((a.used(), b.used(), whole.used()), (0x3_0000, 0, 0x3_0000));
+        let b1 = RingPages::for_memory(0x3_0000, 4096, &b).expect("exactly the rest");
+        assert_eq!(whole.used(), 0x6_0000);
+
+        // A refund goes back to both levels.
+        drop(a1);
+        assert_eq!((a.used(), whole.used()), (0, 0x3_0000));
+        drop(b1);
+        assert_eq!((b.used(), whole.used()), (0, 0));
     }
 
     #[test]

@@ -203,8 +203,8 @@ use super::pump::{Batch, Consumed, RingSink};
 #[cfg(doc)]
 use super::renderer::VenusRenderer;
 use super::renderer::{
-    BlobRef, ContextBlobs, ExportedMemory, ReplyBlobError, RingEnv, ScanoutRelease, ScanoutTarget,
-    SinkFactory, VirtqueueSeqno,
+    BlobRef, ContextBlobs, ExportedMemory, FactoryUsage, ReplyBlobError, RingEnv, ScanoutRelease,
+    ScanoutTarget, SinkFactory, VirtqueueSeqno,
 };
 use super::service::StopSignal;
 use super::shmem::PageBudget;
@@ -343,19 +343,36 @@ pub enum SinkError {
 }
 
 /// The renderer-wide cap on host pages behind `HOST_VISIBLE` guest memory:
-/// 1 GiB.
+/// 2 GiB, of which one context may hold
+/// [`MAX_HOST_VISIBLE_BYTES_PER_CONTEXT`].
 ///
 /// Every byte of it is host RAM the guest chose the size of, pinned by the
 /// host driver while imported, so it is bounded like every other guest-sized
-/// allocation — per allocation by the whole cap and across allocations by
-/// what is left of it. 1 GiB is four times the shared-memory window a guest
-/// can map at once ([`super::renderer::VENUS_HOST_VISIBLE_BYTES`], 256 MiB),
-/// which leaves room for staging memory that is allocated but not mapped,
-/// and is a loss a 16 GiB host can afford to a hostile guest. Past it an
-/// allocation answers `VK_ERROR_OUT_OF_DEVICE_MEMORY`: to the guest the
-/// host-visible heap is full. Device-local memory is not charged; the
+/// allocation — per allocation by the context's share and across allocations
+/// by what is left of the share and of the whole. Past either an allocation
+/// answers `VK_ERROR_OUT_OF_DEVICE_MEMORY`. Mesa 26.0.8 allocates
+/// asynchronously, so the guest learns of it only when it next names the
+/// memory, and that command is fatal to its context: a refusal here costs the
+/// client its Vulkan connection. Device-local memory is not charged; the
 /// driver's own heap bounds it.
-pub const MAX_HOST_VISIBLE_BYTES: u64 = 1 << 30;
+///
+/// It was 1 GiB, one budget for every client. Measured on the GPU-composited
+/// GNOME desktop (ADR-0004, the capacity amendment): the thirteen contexts of
+/// a desktop of GL, GTK4 and Vulkan clients held 160 MiB between them. Then
+/// the compositor, gnome-shell, ran away: it allocated a fresh buffer of a
+/// client's frame size 60–80 times a second and freed none, until whichever
+/// cap came first — 1 GiB, 3 GiB, the window's ranges. No budget absorbs
+/// that, and without a share it took every byte from every other client
+/// first. 2 GiB with a 1 GiB share is thirteen times
+/// the measured desktop, room for a game-sized client's staging and upload
+/// heaps beside it, and what a hostile guest can pin of this host alongside
+/// its [`super::renderer::MAX_RING_BLOB_BYTES`] of host blobs — both inside
+/// the default window ([`super::renderer::VENUS_HOST_VISIBLE_BYTES`]).
+pub const MAX_HOST_VISIBLE_BYTES: u64 = 2 << 30;
+
+/// The most of [`MAX_HOST_VISIBLE_BYTES`] one venus context may hold: half,
+/// so a client that runs away leaves the rest of the desktop its other half.
+pub const MAX_HOST_VISIBLE_BYTES_PER_CONTEXT: u64 = 1 << 30;
 
 /// The reply window a ring's encoder points at (`vkr_cs_encoder`'s stream).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -851,7 +868,12 @@ impl<H: HostVulkan> RingSink for ExecutingSink<H> {
 pub struct ExecutorFactory<H: HostVulkan> {
     host: Arc<H>,
     contexts: HashMap<u32, Arc<Mutex<VulkanContext<H>>>>,
+    /// The renderer-wide host-visible budget ([`MAX_HOST_VISIBLE_BYTES`]).
     budget: Arc<PageBudget>,
+    /// Each context's share of it ([`MAX_HOST_VISIBLE_BYTES_PER_CONTEXT`]).
+    context_share: u64,
+    /// Fence threads, every context together ([`timeline::MAX_FENCE_THREADS`]).
+    fence_threads: Arc<timeline::FenceThreads>,
     /// The renderer's own scanout device (stage S2b), once a handle blob
     /// has been scanned out.
     scanout: Option<scanout::ScanoutDevice<H>>,
@@ -874,12 +896,21 @@ impl<H: HostVulkan> ExecutorFactory<H> {
     }
 
     /// An executor over `host` whose host-visible memory is capped at
-    /// `limit` bytes instead of [`MAX_HOST_VISIBLE_BYTES`].
+    /// `limit` bytes instead of [`MAX_HOST_VISIBLE_BYTES`], each context
+    /// still held to [`MAX_HOST_VISIBLE_BYTES_PER_CONTEXT`] of it.
     pub fn with_budget(host: Arc<H>, limit: u64) -> Self {
+        Self::with_budgets(host, limit, MAX_HOST_VISIBLE_BYTES_PER_CONTEXT)
+    }
+
+    /// An executor over `host` whose host-visible memory is capped at
+    /// `limit` bytes in all and `share` bytes per context.
+    pub fn with_budgets(host: Arc<H>, limit: u64, share: u64) -> Self {
         Self {
             host,
             contexts: HashMap::new(),
             budget: PageBudget::new(limit),
+            context_share: share,
+            fence_threads: timeline::FenceThreads::new(timeline::MAX_FENCE_THREADS),
             scanout: None,
         }
     }
@@ -915,6 +946,15 @@ impl<H: HostVulkan> ExecutorFactory<H> {
     #[cfg(test)]
     pub(crate) fn scanout(&self) -> Option<&scanout::ScanoutDevice<H>> {
         self.scanout.as_ref()
+    }
+
+    /// Cap the fence threads at `limit` instead of
+    /// [`timeline::MAX_FENCE_THREADS`], so a test can reach the cap. Only
+    /// before any context exists.
+    #[cfg(test)]
+    pub(crate) fn with_fence_threads(mut self, limit: usize) -> Self {
+        self.fence_threads = timeline::FenceThreads::new(limit);
+        self
     }
 
     /// Bytes of host pages behind host-visible memory right now — every
@@ -964,11 +1004,14 @@ impl<H: HostVulkan> ExecutorFactory<H> {
     fn context(&mut self, ctx_id: u32) -> Arc<Mutex<VulkanContext<H>>> {
         let host = &self.host;
         let budget = &self.budget;
+        let share = self.context_share;
+        let fence_threads = &self.fence_threads;
         Arc::clone(self.contexts.entry(ctx_id).or_insert_with(|| {
-            Arc::new(Mutex::new(VulkanContext::with_budget(
+            Arc::new(Mutex::new(VulkanContext::with_limits(
                 ctx_id,
                 Arc::clone(host),
-                Arc::clone(budget),
+                PageBudget::share(budget, share),
+                Arc::clone(fence_threads),
             )))
         }))
     }
@@ -1092,6 +1135,28 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
             .values()
             .map(|context| lock(context).objects.pending_ring_fences())
             .sum()
+    }
+
+    fn usage(&self) -> FactoryUsage {
+        let mut usage = FactoryUsage {
+            host_visible_bytes: self.budget.used(),
+            fence_threads: self.fence_threads.live(),
+            scanout_targets: self.scanout_targets(),
+            ..FactoryUsage::default()
+        };
+        for context in self.contexts.values() {
+            let context = lock(context);
+            let objects = context.object_count();
+            usage.objects = usage.objects.saturating_add(objects);
+            usage.max_context_objects = usage.max_context_objects.max(objects);
+            usage.max_context_host_visible_bytes = usage
+                .max_context_host_visible_bytes
+                .max(context.budget.used());
+            usage.pending_ring_fences = usage
+                .pending_ring_fences
+                .saturating_add(context.objects.pending_ring_fences());
+        }
+        usage
     }
 
     fn snapshot_refusal(&self) -> Option<String> {

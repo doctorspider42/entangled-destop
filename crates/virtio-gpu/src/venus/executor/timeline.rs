@@ -64,6 +64,7 @@
 //! refuses the next one (the device then answers it at once).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -82,6 +83,75 @@ pub const SYNC_SLICE: Duration = Duration::from_millis(50);
 /// Most virtio-gpu fences one queue holds unretired: twice the device's
 /// whole table.
 pub const MAX_RING_FENCES_PER_QUEUE: usize = 2 * crate::MAX_PENDING_FENCES;
+
+/// Most fence threads one executor runs, every context together.
+///
+/// A queue gets its thread with its first ring fence and keeps it for as long
+/// as it lives. One context can have at most one per `ring_idx` (1..64,
+/// [`super::context::MAX_RING_IDX`]); nothing but this bounded the sum, so a
+/// guest of [`crate::venus::renderer::MAX_VENUS_CONTEXTS`] contexts could have
+/// made this host run 64 × 63 threads. A Mesa 26.0.8 client fences on the
+/// one or two queues it uses; 256 is four per context at the context cap
+/// (ADR-0004, the capacity amendment). Past it the fence is refused and the
+/// device answers it at once, as for a full queue.
+pub const MAX_FENCE_THREADS: usize = 256;
+
+/// The fence threads of one executor, counted against [`MAX_FENCE_THREADS`].
+#[derive(Debug)]
+pub struct FenceThreads {
+    live: AtomicUsize,
+    limit: usize,
+}
+
+impl FenceThreads {
+    /// A count of none, capped at `limit`.
+    #[must_use]
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            live: AtomicUsize::new(0),
+            limit,
+        })
+    }
+
+    /// Fence threads running (or about to be started) now.
+    #[must_use]
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// The cap.
+    #[must_use]
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// A slot for one more thread, or `None` at the cap. The slot is given
+    /// back when it drops — after the thread it was taken for is joined.
+    #[must_use]
+    pub fn take(self: &Arc<Self>) -> Option<FenceThreadSlot> {
+        self.live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < self.limit).then_some(live + 1)
+            })
+            .ok()
+            .map(|_| FenceThreadSlot(Arc::clone(self)))
+    }
+}
+
+/// One fence thread's place in [`FenceThreads`].
+#[derive(Debug)]
+pub struct FenceThreadSlot(Arc<FenceThreads>);
+
+impl Drop for FenceThreadSlot {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                Some(live.saturating_sub(1))
+            });
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Entry {
@@ -114,6 +184,9 @@ pub struct QueueSync<H: HostVulkan> {
     retire: FenceRetirer,
     ctx_id: u32,
     ring_idx: u8,
+    /// Its place in the executor's [`FenceThreads`]; declared after
+    /// `thread`, and dropped only after [`Drop`] has joined it.
+    _slot: FenceThreadSlot,
     _host: std::marker::PhantomData<fn() -> H>,
 }
 
@@ -157,6 +230,7 @@ impl<H: HostVulkan> QueueSync<H> {
         retire: FenceRetirer,
         ctx_id: u32,
         ring_idx: u8,
+        slot: FenceThreadSlot,
     ) -> std::io::Result<Self> {
         let shared = Arc::new(Shared::default());
         let thread = {
@@ -172,6 +246,7 @@ impl<H: HostVulkan> QueueSync<H> {
             retire,
             ctx_id,
             ring_idx,
+            _slot: slot,
             _host: std::marker::PhantomData,
         })
     }

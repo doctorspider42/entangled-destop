@@ -107,7 +107,10 @@ pub use resource::{Resource, ResourceTable};
 pub use save::{GpuState, GpuStateError, SavedResource, SavedScanout};
 pub use sink::{ScanoutSink, SinkError};
 pub use venus::executor::ExecutorFactory;
-pub use venus::renderer::{CaptureSink, SinkFactory, VenusError, VenusRenderer, WriteSink};
+pub use venus::renderer::{
+    CaptureSink, FactoryUsage, SinkFactory, VenusError, VenusRenderer, VenusUsage, WriteSink,
+    VENUS_HOST_VISIBLE_BYTES,
+};
 
 /// `VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM` (MVP-809): 32-bit little-endian pixels in
 /// byte order B, G, R, A — the guest's `DRM_FORMAT_ARGB8888`.
