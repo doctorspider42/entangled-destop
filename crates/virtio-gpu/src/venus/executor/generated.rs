@@ -7996,8 +7996,6 @@ pub fn is_pass_through(command: &Command<'_>) -> bool {
             | Command::CmdResolveImage(_)
             | Command::CmdSetEvent(_)
             | Command::CmdResetEvent(_)
-            | Command::CmdWaitEvents(_)
-            | Command::CmdPipelineBarrier(_)
             | Command::CmdEndConditionalRenderingEXT(_)
             | Command::CmdNextSubpass(_)
             | Command::CmdEndRenderPass(_)
@@ -8022,10 +8020,7 @@ pub fn is_pass_through(command: &Command<'_>) -> bool {
             | Command::CmdCopyImage2(_)
             | Command::CmdBlitImage2(_)
             | Command::CmdResolveImage2(_)
-            | Command::CmdSetEvent2(_)
             | Command::CmdResetEvent2(_)
-            | Command::CmdWaitEvents2(_)
-            | Command::CmdPipelineBarrier2(_)
             | Command::CmdEndRendering(_)
     )
 }
@@ -8424,8 +8419,6 @@ pub const PASS_THROUGH: &[&str] = &[
     "vkCmdResolveImage",
     "vkCmdSetEvent",
     "vkCmdResetEvent",
-    "vkCmdWaitEvents",
-    "vkCmdPipelineBarrier",
     "vkCmdEndConditionalRenderingEXT",
     "vkCmdNextSubpass",
     "vkCmdEndRenderPass",
@@ -8450,10 +8443,7 @@ pub const PASS_THROUGH: &[&str] = &[
     "vkCmdCopyImage2",
     "vkCmdBlitImage2",
     "vkCmdResolveImage2",
-    "vkCmdSetEvent2",
     "vkCmdResetEvent2",
-    "vkCmdWaitEvents2",
-    "vkCmdPipelineBarrier2",
     "vkCmdEndRendering",
 ];
 

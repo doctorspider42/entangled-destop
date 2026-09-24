@@ -1055,6 +1055,26 @@ pub fn image_barrier2(
     src: (u64, u64),
     dst: (u64, u64),
 ) -> Command<'static> {
+    image_barrier2_families(
+        cb,
+        image,
+        layouts,
+        src,
+        dst,
+        (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED),
+    )
+}
+
+/// [`image_barrier2`] with an ownership transfer between `families`
+/// (stage S1: `VK_QUEUE_FAMILY_FOREIGN_EXT` and the like).
+pub fn image_barrier2_families(
+    cb: u64,
+    image: u64,
+    layouts: (i32, i32),
+    src: (u64, u64),
+    dst: (u64, u64),
+    families: (u32, u32),
+) -> Command<'static> {
     Command::CmdPipelineBarrier2(CmdPipelineBarrier2Args {
         command_buffer: VkCommandBuffer(cb),
         p_dependency_info: Some(VkDependencyInfo {
@@ -1072,8 +1092,8 @@ pub fn image_barrier2(
                 dst_access_mask: dst.1,
                 old_layout: layouts.0,
                 new_layout: layouts.1,
-                src_queue_family_index: QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: QUEUE_FAMILY_IGNORED,
+                src_queue_family_index: families.0,
+                dst_queue_family_index: families.1,
                 image: VkImage(image),
                 subresource_range: color_range(),
             }]),

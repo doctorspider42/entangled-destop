@@ -123,9 +123,27 @@ pub enum Dedicated<B, I> {
     Image(I),
 }
 
+/// What memory a buffer or an image is created able to be bound to: the
+/// `VkExternalMemory{Buffer,Image}CreateInfo` it gets on the host. Binding
+/// imported or exportable memory is valid only for a resource created for
+/// that handle type (`VUID-vkBindBufferMemory-memory-02985`, `-02727`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceMemory {
+    /// No external memory: plain device memory.
+    Plain,
+    /// `HOST_ALLOCATION`: our own imported pages.
+    HostPages,
+    /// `OPAQUE_WIN32` (stage S1): exportable device-local memory, or an
+    /// import of such memory from another host device of the same GPU.
+    Handle,
+}
+
 /// A `vkAllocateMemory`, rebuilt from the decoded structures and validated.
+///
+/// At most one of `import`, `export_handle` and `import_handle` is set, and
+/// `dedicated` never with any of them.
 #[derive(Debug, Clone)]
-pub struct MemoryRequest<B, I> {
+pub struct MemoryRequest<B, I, S> {
     /// `allocationSize` as the host is asked for it: the guest's, or — for
     /// an import — the whole of `import`, which is the guest's rounded up to
     /// the driver's import alignment.
@@ -141,6 +159,16 @@ pub struct MemoryRequest<B, I> {
     pub flags: Option<(u32, u32)>,
     /// `VkMemoryDedicatedAllocateInfo`, never with an import.
     pub dedicated: Option<Dedicated<B, I>>,
+    /// Stage S1: allocated exportable as a host handle
+    /// (`VkExportMemoryAllocateInfo{OPAQUE_WIN32}`), for
+    /// [`HostVulkan::export_memory_handle`].
+    pub export_handle: bool,
+    /// Stage S1: an import of another host device's exported memory
+    /// (`VkImportMemoryWin32HandleInfoKHR{OPAQUE_WIN32}`), `size` and
+    /// `type_index` those of the export, as an opaque handle type requires.
+    /// The payload is referenced by the new memory itself; the handle is
+    /// only read during the call.
+    pub import_handle: Option<Arc<S>>,
 }
 
 /// One `VkBindImageMemoryInfo`, host side.
@@ -230,6 +258,12 @@ pub trait HostVulkan: Send + Sync + 'static {
     type BufferView: Copy + Send + RawHandle + 'static;
     /// A host `VkImageView`.
     type ImageView: Copy + Send + RawHandle + 'static;
+    /// An owned host handle to the payload of exportable device-local memory
+    /// (stage S1: an NT handle on Windows, closed when this is dropped). It
+    /// keeps the allocation alive by itself — the exporting memory, its
+    /// device and its instance may all be gone — which is what a dma-buf
+    /// is to its exporter, and what lets the blob outlive both.
+    type SharedMemory: Send + Sync + 'static;
 
     /// `vkEnumerateInstanceVersion` of the host loader.
     ///
@@ -315,6 +349,20 @@ pub trait HostVulkan: Send + Sync + 'static {
         usage: u32,
     ) -> bool;
 
+    /// Whether a buffer of these `flags` and `usage` on physical device
+    /// `device` may live in exportable device-local memory (stage S1):
+    /// `vkGetPhysicalDeviceExternalBufferProperties(OPAQUE_WIN32)` answers
+    /// `EXPORTABLE | IMPORTABLE` and not `DEDICATED_ONLY` (the renderer never
+    /// dedicates an exportable allocation, so exporter and importer agree by
+    /// construction). `false` on a host that cannot export at all.
+    fn buffer_exportable(
+        &self,
+        instance: &Self::Instance,
+        device: Self::PhysicalDevice,
+        flags: u32,
+        usage: u32,
+    ) -> bool;
+
     /// `vkCreateDevice`.
     ///
     /// # Errors
@@ -357,9 +405,9 @@ pub trait HostVulkan: Send + Sync + 'static {
     /// requirements may name the host-visible types.
     fn image_accepts_host_memory(&self, device: &Self::Device, info: &VkImageCreateInfo) -> bool;
 
-    /// `vkCreateImage` from a validated create info and its chain; with
-    /// `host_memory`, created with a `VkExternalMemoryImageCreateInfo` for
-    /// host allocations, as binding imported memory requires.
+    /// `vkCreateImage` from a validated create info and its chain, created
+    /// with the `VkExternalMemoryImageCreateInfo` `memory` names (the
+    /// guest's own is never forwarded), as binding such memory requires.
     ///
     /// # Errors
     /// The driver's `VkResult`.
@@ -367,7 +415,7 @@ pub trait HostVulkan: Send + Sync + 'static {
         &self,
         device: &Self::Device,
         info: &VkImageCreateInfo,
-        host_memory: bool,
+        memory: ResourceMemory,
     ) -> Result<Self::Image, VkResult>;
 
     /// `vkDestroyImage`.
@@ -386,12 +434,12 @@ pub trait HostVulkan: Send + Sync + 'static {
 
     /// `vkGetDeviceImageMemoryRequirements` for an image that
     /// [`create_image`](Self::create_image) would make of `info` and
-    /// `host_memory`, filling `out` and exactly the output links it carries.
+    /// `memory`, filling `out` and exactly the output links it carries.
     fn device_image_memory_requirements(
         &self,
         device: &Self::Device,
         info: &VkImageCreateInfo,
-        host_memory: bool,
+        memory: ResourceMemory,
         plane: Option<VkImageAspectFlagBits>,
         out: &mut VkMemoryRequirements2,
     );
@@ -442,8 +490,21 @@ pub trait HostVulkan: Send + Sync + 'static {
     fn allocate_memory(
         &self,
         device: &Self::Device,
-        request: &MemoryRequest<Self::Buffer, Self::Image>,
+        request: &MemoryRequest<Self::Buffer, Self::Image, Self::SharedMemory>,
     ) -> Result<Self::Memory, VkResult>;
+
+    /// `vkGetMemoryWin32HandleKHR(OPAQUE_WIN32)` (stage S1) of `memory`,
+    /// allocated with [`MemoryRequest::export_handle`]: an owned handle to
+    /// its payload, which another host device of the same GPU imports.
+    ///
+    /// # Errors
+    /// The driver's `VkResult`, or `VK_ERROR_FEATURE_NOT_PRESENT` on a host
+    /// that cannot export.
+    fn export_memory_handle(
+        &self,
+        device: &Self::Device,
+        memory: &Self::Memory,
+    ) -> Result<Self::SharedMemory, VkResult>;
 
     /// `vkFreeMemory`. For imported memory the host waits for the device to
     /// go idle first: pages the GPU may still be writing are not pages the
@@ -459,7 +520,7 @@ pub trait HostVulkan: Send + Sync + 'static {
     /// imported pages; see [`image_accepts_host_memory`](Self::image_accepts_host_memory).
     fn buffer_accepts_host_memory(&self, device: &Self::Device, flags: u32, usage: u32) -> bool;
 
-    /// `vkCreateBuffer` from a validated create info; `host_memory` as for
+    /// `vkCreateBuffer` from a validated create info; `memory` as for
     /// [`create_image`](Self::create_image).
     ///
     /// # Errors
@@ -468,7 +529,7 @@ pub trait HostVulkan: Send + Sync + 'static {
         &self,
         device: &Self::Device,
         info: &VkBufferCreateInfo,
-        host_memory: bool,
+        memory: ResourceMemory,
     ) -> Result<Self::Buffer, VkResult>;
 
     /// `vkDestroyBuffer`.
@@ -490,7 +551,7 @@ pub trait HostVulkan: Send + Sync + 'static {
         &self,
         device: &Self::Device,
         info: &VkBufferCreateInfo,
-        host_memory: bool,
+        memory: ResourceMemory,
         out: &mut VkMemoryRequirements2,
     );
 

@@ -344,6 +344,30 @@ pub struct MemoryObject<H: HostVulkan> {
     pub dedicated: Option<DedicatedTo>,
     /// `VkMemoryAllocateFlagsInfo::flags`, 0 without one.
     pub allocate_flags: u32,
+    /// Whether it is exportable device-local memory or an import of such
+    /// memory (stage S1): either may be bound only to a resource created for
+    /// it (`handle` on the buffer or image).
+    pub handle: MemoryHandle,
+}
+
+/// What a `VkDeviceMemory` is to a host handle (stage S1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryHandle {
+    /// Nothing: plain memory, or our pages.
+    None,
+    /// Allocated exportable (`OPAQUE_WIN32`): a blob of it is a handle blob.
+    Exportable,
+    /// An import of another context's handle blob.
+    Imported,
+}
+
+impl MemoryHandle {
+    /// Whether the memory is either: a resource bound to it must have been
+    /// created for `OPAQUE_WIN32`.
+    #[must_use]
+    pub fn is_handle(self) -> bool {
+        self != Self::None
+    }
 }
 
 /// Where a buffer or an image plane is bound.
@@ -374,6 +398,11 @@ pub struct BufferObject<H: HostVulkan> {
     /// [`Self::host_memory`], its `memoryTypeBits` name our pages alone
     /// (`memory::external_type_bits`).
     pub external: bool,
+    /// Whether it was created for `OPAQUE_WIN32` (stage S1): a `DMA_BUF`
+    /// buffer that cannot take our pages, on a host that can export
+    /// device-local memory for it. Exportable and imported device-local
+    /// memory binds only to such a resource.
+    pub handle: bool,
     /// Its binding, once bound. A buffer is bound at most once.
     pub bound: Option<Binding>,
 }
@@ -414,6 +443,12 @@ pub struct ImageObject<H: HostVulkan> {
     pub host_memory: bool,
     /// As [`BufferObject::external`].
     pub external: bool,
+    /// As [`BufferObject::handle`]: every DRM-modifier image is.
+    pub handle: bool,
+    /// For an image of `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` (stage S1,
+    /// `executor::modifier`): the synthesized LINEAR plane it is shown as. Its
+    /// host image is the canonical optimal one.
+    pub modifier: Option<super::modifier::ModifierLayout>,
     /// Bit `n` set once plane `n` is bound (bit 0 for a non-disjoint image).
     pub bound_planes: u32,
 }

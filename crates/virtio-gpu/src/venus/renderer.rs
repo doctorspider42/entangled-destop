@@ -35,7 +35,10 @@
 //!    `blob_id` names a `VkDeviceMemory` of the same context, and gets no new
 //!    pages: [`SinkFactory::export_memory`] hands back **the pages that
 //!    memory already is** (stage 5b.1), so mapping the blob shows the guest
-//!    exactly the bytes the GPU uses.
+//!    exactly the bytes the GPU uses — or, for exportable device-local
+//!    memory, a host handle to it (stage S1): a **handle blob**
+//!    ([`ExportedMemory::Handle`]), which has no pages, is refused if mapped,
+//!    and is what another context attached to it imports.
 //! 4. `RESOURCE_MAP_BLOB` — the pages go in front of the guest at the window
 //!    offset it named, and the [`Publication`] that keeps them alive is held
 //!    beside them.
@@ -266,22 +269,25 @@ pub trait SinkFactory: Send {
         self.sink_for(env.ctx_id, env.ring)
     }
 
-    /// The pages behind `VkDeviceMemory` `blob_id` of context `ctx_id`, for
-    /// a `HOST3D` blob of `size` bytes naming it (stage 5b.1). The renderer
-    /// publishes exactly these pages when the blob is mapped, so the guest
-    /// sees the bytes the host driver imported.
+    /// What `VkDeviceMemory` `blob_id` of context `ctx_id` is, for a
+    /// `HOST3D` blob of `size` bytes naming it: its pages (stage 5b.1) —
+    /// which the renderer publishes exactly when the blob is mapped, so the
+    /// guest sees the bytes the host driver imported — or, for exportable
+    /// device-local memory, a host handle to it (stage S1): a blob that is
+    /// never mapped, and that another context may import.
     ///
     /// # Errors
     ///
     /// Why no such blob can be made — no such memory in that context, a type
-    /// the guest cannot map, a size that is not the allocation's, a blob made
-    /// of it already. The default: this factory holds no Vulkan memory.
+    /// that is neither ours nor exportable, a size that is not the
+    /// allocation's, a blob made of it already. The default: this factory
+    /// holds no Vulkan memory.
     fn export_memory(
         &mut self,
         ctx_id: u32,
         blob_id: u64,
         size: u64,
-    ) -> Result<Arc<RingPages>, String> {
+    ) -> Result<ExportedMemory, String> {
         let _ = size;
         Err(format!(
             "venus context {ctx_id} has no Vulkan memory {blob_id:#x}: this renderer executes \
@@ -522,12 +528,19 @@ pub struct BlobRef {
 #[derive(Debug)]
 struct DirectoryEntry {
     ctx_id: u32,
-    pages: Arc<RingPages>,
+    backing: ExportedMemory,
     generation: u64,
     /// `Some` for a blob of `VkDeviceMemory` (stage 5c): its size, and the
     /// other contexts it is attached to (`CTX_ATTACH_RESOURCE`) — the ones
     /// that may import it. `None` for a ring or reply blob.
     memory: Option<MemoryEntry>,
+}
+
+impl DirectoryEntry {
+    /// The pages of a ring, reply or page blob; `None` for a handle blob.
+    fn pages(&self) -> Option<&Arc<RingPages>> {
+        self.backing.pages()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -536,13 +549,53 @@ struct MemoryEntry {
     attached: Vec<u32>,
 }
 
-/// A blob of `VkDeviceMemory` pages a context may import as memory of its
-/// own (`VkImportMemoryResourceInfoMESA`, stage 5c): the same `Arc` the
-/// exporting memory, its blob and its publication hold.
+/// A host handle to exportable device-local memory (stage S1), as the
+/// executor made it: opaque to the renderer — it only holds and hands it
+/// out — and the executor's to look inside (it knows its host's type).
+/// Dropping the last clone closes the handle.
+#[derive(Clone)]
+pub struct SharedHandle(pub Arc<dyn std::any::Any + Send + Sync>);
+
+impl fmt::Debug for SharedHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SharedHandle(..)")
+    }
+}
+
+/// What a blob of `VkDeviceMemory` is made of
+/// ([`SinkFactory::export_memory`]).
+#[derive(Debug, Clone)]
+pub enum ExportedMemory {
+    /// Host-visible memory (stage 5b.1): our imported pages, which a mapping
+    /// of the blob shows the guest.
+    Pages(Arc<RingPages>),
+    /// Exportable device-local memory (stage S1): a **handle blob**. No
+    /// pages — the guest can never map it (`RESOURCE_MAP_BLOB` is refused) —
+    /// and a host handle to the allocation, which another context attached
+    /// to the blob imports into its own device. The handle holds the
+    /// allocation, so the blob outlives the exporting memory, its device and
+    /// its context, as a dma-buf outlives its exporter.
+    Handle(SharedHandle),
+}
+
+impl ExportedMemory {
+    /// The pages, for a page blob.
+    #[must_use]
+    pub fn pages(&self) -> Option<&Arc<RingPages>> {
+        match self {
+            Self::Pages(pages) => Some(pages),
+            Self::Handle(_) => None,
+        }
+    }
+}
+
+/// A blob of `VkDeviceMemory` a context may import as memory of its own
+/// (`VkImportMemoryResourceInfoMESA`, stages 5c and S1): the same `Arc` of
+/// pages, or of the host handle, the blob holds.
 #[derive(Debug, Clone)]
 pub struct MemoryBlob {
-    /// The pages.
-    pub pages: Arc<RingPages>,
+    /// Its pages or its handle.
+    pub backing: ExportedMemory,
     /// The blob's size (the allocation rounded to 4 KiB).
     pub size: u64,
     /// The context whose memory it is a blob of.
@@ -578,14 +631,14 @@ impl BlobDirectory {
     }
 
     fn insert(&self, resource_id: u32, ctx_id: u32, pages: Arc<RingPages>) {
-        self.insert_entry(resource_id, ctx_id, pages, None);
+        self.insert_entry(resource_id, ctx_id, ExportedMemory::Pages(pages), None);
     }
 
-    fn insert_memory(&self, resource_id: u32, ctx_id: u32, pages: Arc<RingPages>, size: u64) {
+    fn insert_memory(&self, resource_id: u32, ctx_id: u32, backing: ExportedMemory, size: u64) {
         self.insert_entry(
             resource_id,
             ctx_id,
-            pages,
+            backing,
             Some(MemoryEntry {
                 size,
                 attached: Vec::new(),
@@ -597,7 +650,7 @@ impl BlobDirectory {
         &self,
         resource_id: u32,
         ctx_id: u32,
-        pages: Arc<RingPages>,
+        backing: ExportedMemory,
         memory: Option<MemoryEntry>,
     ) {
         self.with(|state| {
@@ -607,7 +660,7 @@ impl BlobDirectory {
                 resource_id,
                 DirectoryEntry {
                     ctx_id,
-                    pages,
+                    backing,
                     generation,
                     memory,
                 },
@@ -697,7 +750,10 @@ impl ContextBlobs {
                     ctx_id: self.ctx_id,
                 });
             }
-            let blob = entry.pages.resource_len();
+            let blob = entry
+                .pages()
+                .ok_or(ReplyBlobError::NotAHostBlob(resource_id))?
+                .resource_len();
             if offset.checked_add(size).is_none_or(|end| end > blob) {
                 return Err(ReplyBlobError::OutsideBlob {
                     resource_id,
@@ -741,26 +797,30 @@ impl ContextBlobs {
                 .get(&resource_id)
                 .filter(|entry| entry.generation == blob.generation)
                 .ok_or(ReplyBlobError::Gone(resource_id))?;
+            let pages = entry
+                .pages()
+                .ok_or(ReplyBlobError::NotAHostBlob(resource_id))?;
             let mut bytes = vec![0u8; len];
-            entry.pages.read_bytes(offset, &mut bytes).map_err(|_| {
-                ReplyBlobError::OutsideBlob {
+            pages
+                .read_bytes(offset, &mut bytes)
+                .map_err(|_| ReplyBlobError::OutsideBlob {
                     resource_id,
                     offset,
                     size,
-                    blob: entry.pages.resource_len(),
-                }
-            })?;
+                    blob: pages.resource_len(),
+                })?;
             Ok(bytes)
         })
     }
 
-    /// The pages of blob `resource_id` for an import as memory of this
-    /// context (stage 5c): a blob of `VkDeviceMemory` of **this renderer**,
-    /// made by this context or attached to it (`CTX_ATTACH_RESOURCE`, which
-    /// the guest kernel sends when a process opens a GEM handle of another's
-    /// dma-buf). The answer is the same `Arc` the blob holds, taken under the
-    /// directory lock, so the pages live as long as the import whatever the
-    /// exporter, its blob or its context do afterwards.
+    /// The pages or the host handle of blob `resource_id` for an import as
+    /// memory of this context (stages 5c and S1): a blob of `VkDeviceMemory`
+    /// of **this renderer**, made by this context or attached to it
+    /// (`CTX_ATTACH_RESOURCE`, which the guest kernel sends when a process
+    /// opens a GEM handle of another's dma-buf). The answer is the same `Arc`
+    /// the blob holds, taken under the directory lock, so what it names lives
+    /// as long as the import needs it whatever the exporter, its blob or its
+    /// context do afterwards.
     ///
     /// # Errors
     /// [`ReplyBlobError::NotAHostBlob`] for anything else — no such blob,
@@ -784,7 +844,7 @@ impl ContextBlobs {
                 });
             }
             Ok(MemoryBlob {
-                pages: Arc::clone(&entry.pages),
+                backing: entry.backing.clone(),
                 size: memory.size,
                 owner: entry.ctx_id,
             })
@@ -804,14 +864,16 @@ impl ContextBlobs {
                 .get(&blob.resource_id)
                 .filter(|entry| entry.generation == blob.generation)
                 .ok_or(ReplyBlobError::Gone(blob.resource_id))?;
-            entry
-                .pages
+            let pages = entry
+                .pages()
+                .ok_or(ReplyBlobError::NotAHostBlob(blob.resource_id))?;
+            pages
                 .write_bytes(at, bytes)
                 .map_err(|_| ReplyBlobError::OutsideBlob {
                     resource_id: blob.resource_id,
                     offset: at,
                     size: bytes.len() as u64,
-                    blob: entry.pages.resource_len(),
+                    blob: pages.resource_len(),
                 })
         })
     }
@@ -1238,6 +1300,15 @@ pub enum VenusError {
         reason: String,
     },
 
+    /// `RESOURCE_MAP_BLOB` of a handle blob (stage S1): device-local memory
+    /// the guest cannot map — its type is not host-visible, and there are no
+    /// pages of ours behind it to publish.
+    #[error(
+        "resource {0} is exportable device-local Vulkan memory, which has no pages the guest \
+         could map"
+    )]
+    HandleBlobNotMappable(u32),
+
     /// `vkCreateRingMESA` over a blob of Vulkan memory: a ring lives in
     /// pages of its own.
     #[error("resource {0} is a blob of Vulkan memory, and a ring lives in a blob of its own")]
@@ -1379,6 +1450,7 @@ impl From<VenusError> for CommandError {
             | VenusError::TooManyMemoryBlobs
             | VenusError::BlobBudget { .. } => Self::OutOfMemory,
             VenusError::BlobAlreadyMapped(id) => Self::BlobAlreadyMapped(id),
+            VenusError::HandleBlobNotMappable(id) => Self::BlobNotMappable(id),
             VenusError::BlobSpanMismatch { .. } | VenusError::WindowRefused { .. } => {
                 Self::Renderer(err.to_string())
             }
@@ -1400,8 +1472,9 @@ struct RingBlob {
     /// [`super::shmem`]'s lifetime argument — so it is never bypassed by
     /// holding the address anywhere else.
     publication: Option<Publication>,
-    /// The allocation. Rings built on it hold their own `Arc`.
-    pages: Arc<RingPages>,
+    /// The allocation — pages, or for a handle blob the host handle. Rings
+    /// built on pages hold their own `Arc`.
+    backing: ExportedMemory,
     /// The context the blob was created on; `0` is the kernel's own.
     ctx_id: u32,
     /// The renderer-side name the guest minted it under.
@@ -1409,9 +1482,16 @@ struct RingBlob {
     /// The size the guest asked for: [`RingPages::resource_len`] for a
     /// ring blob, the span a memory blob's mapping covers for one of those.
     size: u64,
-    /// Whether the pages are the blob's own (`blob_id` 0) or a
-    /// `VkDeviceMemory`'s.
+    /// Whether the pages are the blob's own (`blob_id` 0), a
+    /// `VkDeviceMemory`'s, or no pages at all.
     kind: BlobKind,
+}
+
+impl RingBlob {
+    /// The pages, for every blob but a handle blob.
+    fn pages(&self) -> Option<&Arc<RingPages>> {
+        self.backing.pages()
+    }
 }
 
 /// What a host blob's pages are.
@@ -1421,6 +1501,9 @@ enum BlobKind {
     Shm,
     /// A `VkDeviceMemory`'s imported pages, shared with the executor.
     Memory,
+    /// Exportable device-local `VkDeviceMemory` (stage S1): a host handle,
+    /// no pages, never mapped.
+    Handle,
 }
 
 /// One live command ring.
@@ -1602,7 +1685,18 @@ impl<F> VenusRenderer<F> {
     pub(crate) fn blob_pages(&self, resource_id: u32) -> Option<Arc<RingPages>> {
         self.blobs
             .get(&resource_id)
-            .map(|blob| Arc::clone(&blob.pages))
+            .and_then(RingBlob::pages)
+            .map(Arc::clone)
+    }
+
+    /// Live handle blobs (stage S1): device-local memory exported as a host
+    /// handle, which a snapshot cannot carry.
+    #[must_use]
+    pub fn handle_blob_count(&self) -> usize {
+        self.blobs
+            .values()
+            .filter(|blob| blob.kind == BlobKind::Handle)
+            .count()
     }
 
     /// The factory, for a test that inspects what it holds.
@@ -1725,7 +1819,7 @@ impl<F> VenusRenderer<F> {
             args.resource_id,
             RingBlob {
                 publication: None,
-                pages,
+                backing: ExportedMemory::Pages(pages),
                 ctx_id,
                 blob_id: args.blob_id,
                 size: args.size,
@@ -1783,10 +1877,14 @@ impl<F> VenusRenderer<F> {
         // A ring blob shows all of its pages; a memory blob shows the span
         // the device reserved for it, which its pages may run past (they are
         // rounded to the driver's import alignment) — a prefix of our own
-        // allocation, so still nothing but ours.
-        let published = match blob.kind {
-            BlobKind::Shm => blob.pages.publish(window, offset),
-            BlobKind::Memory => blob.pages.publish_len(window, offset, blob.size),
+        // allocation, so still nothing but ours. A handle blob has no pages:
+        // device-local memory the guest can never map (stage S1).
+        let published = match (blob.kind, &blob.backing) {
+            (BlobKind::Shm, ExportedMemory::Pages(pages)) => pages.publish(window, offset),
+            (BlobKind::Memory, ExportedMemory::Pages(pages)) => {
+                pages.publish_len(window, offset, blob.size)
+            }
+            _ => return Err(VenusError::HandleBlobNotMappable(resource_id)),
         };
         let publication = published.map_err(|err| VenusError::WindowRefused {
             resource_id,
@@ -1966,10 +2064,10 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 ctx_id,
             });
         }
-        if blob.kind == BlobKind::Memory {
-            return Err(VenusError::RingOnDeviceMemory(resource_id));
-        }
-        let pages = Arc::clone(&blob.pages);
+        let pages = match (blob.kind, blob.pages()) {
+            (BlobKind::Shm, Some(pages)) => Arc::clone(pages),
+            _ => return Err(VenusError::RingOnDeviceMemory(resource_id)),
+        };
 
         // Two judgements, and they are not the same one twice: `RingLayout`
         // proves the five regions fit the `resource_size` it is *told*, and
@@ -2155,7 +2253,10 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 // back to the executor's memory object, or — if that was
                 // freed first — to the allocator, once the publication below
                 // has unmapped them.
-                BlobKind::Memory => {
+                // A handle blob's handle is closed when the last `Arc` of it
+                // goes — this one, or an import being made right now; an
+                // import already made references the allocation itself.
+                BlobKind::Memory | BlobKind::Handle => {
                     // No new import can take the pages after this; an
                     // import made already holds its own `Arc` of them.
                     self.directory.remove(resource_id);
@@ -2179,7 +2280,7 @@ impl<F: SinkFactory> VenusRenderer<F> {
         if self.memory_blobs >= MAX_MEMORY_BLOBS {
             return Err(VenusError::TooManyMemoryBlobs);
         }
-        let pages = self
+        let backing = self
             .sinks
             .export_memory(ctx_id, args.blob_id, args.size)
             .map_err(|reason| VenusError::MemoryBlob {
@@ -2187,20 +2288,24 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 blob_id: args.blob_id,
                 reason,
             })?;
+        let kind = match backing {
+            ExportedMemory::Pages(_) => BlobKind::Memory,
+            ExportedMemory::Handle(_) => BlobKind::Handle,
+        };
         self.memory_blobs = self.memory_blobs.saturating_add(1);
         // In the directory too, where another context attached to it may
-        // find it to import (stage 5c) — and never as a reply window.
+        // find it to import (stages 5c and S1) — and never as a reply window.
         self.directory
-            .insert_memory(args.resource_id, ctx_id, Arc::clone(&pages), args.size);
+            .insert_memory(args.resource_id, ctx_id, backing.clone(), args.size);
         self.blobs.insert(
             args.resource_id,
             RingBlob {
                 publication: None,
-                pages,
+                backing,
                 ctx_id,
                 blob_id: args.blob_id,
                 size: args.size,
-                kind: BlobKind::Memory,
+                kind,
             },
         );
         Ok(())
@@ -2381,6 +2486,17 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
             return Some(format!(
                 "{pending} virtio-gpu fences on Venus queue timelines are waiting for host GPU \
                  work, which a snapshot cannot carry"
+            ));
+        }
+        let handles = self.handle_blob_count();
+        if handles > 0 {
+            // Stage S1: a handle blob can outlive every Vulkan object — the
+            // exporter's memory freed, its context gone — and it is still a
+            // dma-buf the guest holds, of device-local memory only the host
+            // driver can read.
+            return Some(format!(
+                "{handles} Venus blobs are exported device-local GPU memory the guest holds as \
+                 dma-bufs, which a snapshot cannot carry"
             ));
         }
         self.sinks.snapshot_refusal()

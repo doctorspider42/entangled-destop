@@ -3,7 +3,7 @@
 //! a test can prove teardown leaves none.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::venus::capset::vk_make_api_version;
@@ -13,7 +13,7 @@ use crate::venus::shmem::RingPages;
 use super::generated;
 use super::host::{
     CallError, DeviceRequest, HostDeviceInfo, HostGroup, HostVulkan, ImageBind, InstanceRequest,
-    MemoryRequest, RawHandle,
+    MemoryRequest, RawHandle, ResourceMemory,
 };
 use super::objects::Kind;
 use super::policy::{name_array, EXTERNAL_MEMORY_HOST};
@@ -323,6 +323,38 @@ pub struct FakeMemory {
     pub size: u64,
     /// The imported pages.
     pub pages: Option<Arc<RingPages>>,
+    /// Allocated exportable (stage S1): a handle may be taken of it.
+    pub exportable: bool,
+}
+
+/// The fake's exported handle (stage S1): the exporting memory's handle, its
+/// type and size, and a count of live handles a test can read.
+#[derive(Debug)]
+pub struct FakeShared {
+    /// The exporting `VkDeviceMemory`'s host handle: the payload.
+    pub memory: u64,
+    /// Its `memoryTypeIndex`.
+    pub type_index: u32,
+    /// Its `allocationSize`.
+    pub size: u64,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for FakeShared {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One import of an exported handle, as the fake driver saw it (stage S1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandleImport {
+    /// The exporting memory (the payload).
+    pub payload: u64,
+    /// `allocationSize` of the import.
+    pub size: u64,
+    /// `memoryTypeIndex` of the import.
+    pub type_index: u32,
 }
 
 #[derive(Debug, Default)]
@@ -336,6 +368,16 @@ struct Live {
     buffer_binds: Vec<(u64, u64, u64)>,
     image_binds: Vec<(u64, u64, u64)>,
     host_memory_resources: Vec<(&'static str, bool)>,
+    /// Every buffer and image created and the external memory it was made
+    /// for (stage S1).
+    resource_memories: Vec<(&'static str, ResourceMemory)>,
+    /// Every allocation made exportable, by host handle, with its type
+    /// (stage S1).
+    exportable_allocations: Vec<(u64, u32)>,
+    /// Every handle import (stage S1).
+    handle_imports: Vec<HandleImport>,
+    /// Every `vkCreateImage` that reached the host.
+    image_infos: Vec<ImageInfo>,
     buffer_sizes: HashMap<u64, u64>,
     /// Every stage-5b.2 call and destroy, in order: `"vkCmdDraw"`,
     /// `"destroy VkPipeline"`, `"device idle"`.
@@ -389,6 +431,41 @@ pub struct FakeVulkan {
     /// What `vkGetPhysicalDeviceExternalBufferProperties(HOST_ALLOCATION)`
     /// answers for every buffer: importable (`true`, the default) or not.
     pub buffer_imports: AtomicBool,
+    /// What `vkGetPhysicalDeviceExternalBufferProperties(OPAQUE_WIN32)`
+    /// answers for every buffer (stage S1): exportable and importable
+    /// (`true`, the default) or nothing.
+    pub buffer_exports: AtomicBool,
+    /// Whether an optimal image may be `OPAQUE_WIN32` exportable (stage S1,
+    /// default `true`). An sRGB format never may with storage usage, as on
+    /// the RTX 2070.
+    pub image_exports: AtomicBool,
+    /// Whether an image needs dedicated memory (stage S1, default `false`):
+    /// what `requiresDedicatedAllocation` answers for images.
+    pub image_requires_dedicated: AtomicBool,
+    /// The optimal tiling features every format but `UNDEFINED` has
+    /// (`0x1_d401` by default: sampled, blits, transfers, no attachments).
+    pub format_features: AtomicU32,
+    /// Exported handles alive right now (stage S1).
+    shared_live: Arc<AtomicUsize>,
+}
+
+/// One `vkCreateImage` as the fake host saw it (stage S1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInfo {
+    /// `format`.
+    pub format: i32,
+    /// `extent.width`, `extent.height`.
+    pub extent: (u32, u32),
+    /// `flags`.
+    pub flags: u32,
+    /// `usage`.
+    pub usage: u32,
+    /// `tiling`.
+    pub tiling: i32,
+    /// A chained `VkImageFormatListCreateInfo`'s formats.
+    pub view_formats: Vec<i32>,
+    /// What external memory it was created for.
+    pub memory: ResourceMemory,
 }
 
 impl std::fmt::Debug for FakeVulkan {
@@ -415,7 +492,44 @@ impl FakeVulkan {
             stuck_queues: Mutex::new(std::collections::HashSet::new()),
             on_call: Mutex::new(None),
             buffer_imports: AtomicBool::new(true),
+            buffer_exports: AtomicBool::new(true),
+            image_exports: AtomicBool::new(true),
+            image_requires_dedicated: AtomicBool::new(false),
+            format_features: AtomicU32::new(0x1_d401),
+            shared_live: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Exported handles alive right now (stage S1): every one a blob or an
+    /// import in progress holds.
+    #[must_use]
+    pub fn live_shared_handles(&self) -> usize {
+        self.shared_live.load(Ordering::SeqCst)
+    }
+
+    /// Every buffer and image created and the external memory it was made
+    /// for (stage S1).
+    #[must_use]
+    pub fn resource_memories(&self) -> Vec<(&'static str, ResourceMemory)> {
+        self.with(|live| live.resource_memories.clone())
+    }
+
+    /// Every allocation made exportable, as `(host handle, type)` (stage S1).
+    #[must_use]
+    pub fn exportable_allocations(&self) -> Vec<(u64, u32)> {
+        self.with(|live| live.exportable_allocations.clone())
+    }
+
+    /// Every handle import the fake driver saw (stage S1).
+    #[must_use]
+    pub fn handle_imports(&self) -> Vec<HandleImport> {
+        self.with(|live| live.handle_imports.clone())
+    }
+
+    /// Every image create info that reached the host (stage S1).
+    #[must_use]
+    pub fn image_infos(&self) -> Vec<ImageInfo> {
+        self.with(|live| live.image_infos.clone())
     }
 
     /// The RTX-2070-shaped GPU and a CPU device beside it.
@@ -880,8 +994,9 @@ fn buffer_requirements(size: u64, out: &mut VkMemoryRequirements2) {
     }
 }
 
-/// The fake's image requirements: 1 MiB, 1 KiB aligned, every type.
-fn image_requirements(out: &mut VkMemoryRequirements2) {
+/// The fake's image requirements: 1 MiB, 1 KiB aligned, every type;
+/// dedication preferred, and required with `requires`.
+fn image_requirements(out: &mut VkMemoryRequirements2, requires: bool) {
     out.memory_requirements = VkMemoryRequirements {
         size: 1 << 20,
         alignment: 1024,
@@ -890,7 +1005,7 @@ fn image_requirements(out: &mut VkMemoryRequirements2) {
     for link in &mut out.p_next {
         let VkMemoryRequirements2Next::VkMemoryDedicatedRequirements(d) = link;
         d.prefers_dedicated_allocation = 1;
-        d.requires_dedicated_allocation = 0;
+        d.requires_dedicated_allocation = u32::from(requires);
     }
 }
 
@@ -905,6 +1020,7 @@ impl HostVulkan for FakeVulkan {
     type Buffer = u64;
     type BufferView = u64;
     type ImageView = u64;
+    type SharedMemory = FakeShared;
 
     fn instance_version(&self) -> Result<u32, VkResult> {
         Ok(self.version)
@@ -945,7 +1061,11 @@ impl HostVulkan for FakeVulkan {
         format: VkFormat,
         out: &mut VkFormatProperties2,
     ) {
-        let features = if format == 0 { 0 } else { 0x1_d401 };
+        let features = if format == 0 {
+            0
+        } else {
+            self.format_features.load(Ordering::SeqCst)
+        };
         out.format_properties = VkFormatProperties {
             linear_tiling_features: features & 0xff,
             optimal_tiling_features: features,
@@ -982,20 +1102,37 @@ impl HostVulkan for FakeVulkan {
             max_resource_size: 1 << 31,
         };
         // As a driver that imports host allocations for linear images only
-        // (`image_accepts_host_memory`), and knows no other external type.
+        // (`image_accepts_host_memory`), exports `OPAQUE_WIN32` for optimal
+        // ones (stage S1) — never an sRGB image with storage, which the
+        // RTX 2070 refuses — and knows no other external type.
         let external = info.p_next.iter().find_map(|l| match l {
             VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceExternalImageFormatInfo(e) => {
                 Some(e.handle_type)
             }
             _ => None,
         });
+        let srgb_storage = matches!(info.format, 43 | 50) && info.usage & 0x8 != 0;
+        if external == Some(0x2) && srgb_storage {
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        }
         for link in &mut out.p_next {
             if let VkImageFormatProperties2Next::VkExternalImageFormatProperties(p) = link {
                 let importable = external == Some(0x80) && info.tiling == 1;
-                p.external_memory_properties = VkExternalMemoryProperties {
-                    external_memory_features: if importable { 0x4 } else { 0 },
-                    export_from_imported_handle_types: 0,
-                    compatible_handle_types: if importable { 0x80 } else { 0 },
+                let exportable = external == Some(0x2)
+                    && info.tiling == 0
+                    && self.image_exports.load(Ordering::SeqCst);
+                p.external_memory_properties = if exportable {
+                    VkExternalMemoryProperties {
+                        external_memory_features: 0x6,
+                        export_from_imported_handle_types: 0x2,
+                        compatible_handle_types: 0x2,
+                    }
+                } else {
+                    VkExternalMemoryProperties {
+                        external_memory_features: if importable { 0x4 } else { 0 },
+                        export_from_imported_handle_types: 0,
+                        compatible_handle_types: if importable { 0x80 } else { 0 },
+                    }
                 };
             }
         }
@@ -1023,6 +1160,10 @@ impl HostVulkan for FakeVulkan {
 
     fn buffer_importable(&self, _instance: &u64, _device: usize, _flags: u32, _usage: u32) -> bool {
         self.buffer_imports.load(Ordering::SeqCst)
+    }
+
+    fn buffer_exportable(&self, _instance: &u64, _device: usize, _flags: u32, _usage: u32) -> bool {
+        self.buffer_exports.load(Ordering::SeqCst)
     }
 
     fn create_device(
@@ -1065,12 +1206,31 @@ impl HostVulkan for FakeVulkan {
     fn create_image(
         &self,
         _device: &u64,
-        _info: &VkImageCreateInfo,
-        host_memory: bool,
+        info: &VkImageCreateInfo,
+        memory: ResourceMemory,
     ) -> Result<u64, VkResult> {
+        let view_formats = info
+            .p_next
+            .iter()
+            .find_map(|l| match l {
+                VkImageCreateInfoNext::VkImageFormatListCreateInfo(l) => l.p_view_formats.clone(),
+                _ => None,
+            })
+            .unwrap_or_default();
         self.with(|live| {
             live.images += 1;
-            live.host_memory_resources.push(("image", host_memory));
+            live.host_memory_resources
+                .push(("image", memory == ResourceMemory::HostPages));
+            live.resource_memories.push(("image", memory));
+            live.image_infos.push(ImageInfo {
+                format: info.format,
+                extent: (info.extent.width, info.extent.height),
+                flags: info.flags,
+                usage: info.usage,
+                tiling: info.tiling,
+                view_formats,
+                memory,
+            });
         });
         Ok(self.create("image"))
     }
@@ -1086,18 +1246,18 @@ impl HostVulkan for FakeVulkan {
         _plane: Option<VkImageAspectFlagBits>,
         out: &mut VkMemoryRequirements2,
     ) {
-        image_requirements(out);
+        image_requirements(out, self.image_requires_dedicated.load(Ordering::SeqCst));
     }
 
     fn device_image_memory_requirements(
         &self,
         _device: &u64,
         _info: &VkImageCreateInfo,
-        _host_memory: bool,
+        _memory: ResourceMemory,
         _plane: Option<VkImageAspectFlagBits>,
         out: &mut VkMemoryRequirements2,
     ) {
-        image_requirements(out);
+        image_requirements(out, self.image_requires_dedicated.load(Ordering::SeqCst));
     }
 
     fn image_subresource_layout(
@@ -1149,8 +1309,25 @@ impl HostVulkan for FakeVulkan {
     fn allocate_memory(
         &self,
         _device: &u64,
-        request: &MemoryRequest<u64, u64>,
+        request: &MemoryRequest<u64, u64, FakeShared>,
     ) -> Result<FakeMemory, VkResult> {
+        assert!(
+            u8::from(request.import.is_some())
+                + u8::from(request.export_handle)
+                + u8::from(request.import_handle.is_some())
+                <= 1,
+            "at most one kind of external memory per allocation"
+        );
+        if let Some(shared) = &request.import_handle {
+            // An opaque import must match its export, or a real driver
+            // refuses it (or worse).
+            assert_eq!(
+                (request.size, request.type_index),
+                (shared.size, shared.type_index),
+                "an opaque import at the export's own size and type"
+            );
+            assert!(request.dedicated.is_none(), "exports are never dedicated");
+        }
         let handle = self.create("memory");
         self.with(|live| {
             live.allocations
@@ -1162,11 +1339,47 @@ impl HostVulkan for FakeVulkan {
                     pages: Arc::downgrade(pages),
                 });
             }
+            if request.export_handle {
+                assert!(request.dedicated.is_none(), "exports are never dedicated");
+                live.exportable_allocations
+                    .push((handle, request.type_index));
+            }
+            if let Some(shared) = &request.import_handle {
+                live.handle_imports.push(HandleImport {
+                    payload: shared.memory,
+                    size: request.size,
+                    type_index: request.type_index,
+                });
+            }
         });
         Ok(FakeMemory {
             handle,
             size: request.size,
             pages: request.import.clone(),
+            exportable: request.export_handle,
+        })
+    }
+
+    fn export_memory_handle(
+        &self,
+        _device: &u64,
+        memory: &FakeMemory,
+    ) -> Result<FakeShared, VkResult> {
+        if !memory.exportable {
+            return Err(VK_ERROR_FEATURE_NOT_PRESENT);
+        }
+        let type_index = self.with(|live| {
+            live.exportable_allocations
+                .iter()
+                .find(|(h, _)| *h == memory.handle)
+                .map_or(0, |(_, t)| *t)
+        });
+        self.shared_live.fetch_add(1, Ordering::SeqCst);
+        Ok(FakeShared {
+            memory: memory.handle,
+            type_index,
+            size: memory.size,
+            live: Arc::clone(&self.shared_live),
         })
     }
 
@@ -1186,18 +1399,20 @@ impl HostVulkan for FakeVulkan {
     }
 
     fn buffer_accepts_host_memory(&self, _device: &u64, _flags: u32, _usage: u32) -> bool {
-        true
+        self.buffer_imports.load(Ordering::SeqCst)
     }
 
     fn create_buffer(
         &self,
         _device: &u64,
         info: &VkBufferCreateInfo,
-        host_memory: bool,
+        memory: ResourceMemory,
     ) -> Result<u64, VkResult> {
         let handle = self.create("buffer");
         self.with(|live| {
-            live.host_memory_resources.push(("buffer", host_memory));
+            live.host_memory_resources
+                .push(("buffer", memory == ResourceMemory::HostPages));
+            live.resource_memories.push(("buffer", memory));
             live.buffer_sizes.insert(handle, info.size);
         });
         Ok(handle)
@@ -1221,7 +1436,7 @@ impl HostVulkan for FakeVulkan {
         &self,
         _device: &u64,
         info: &VkBufferCreateInfo,
-        _host_memory: bool,
+        _memory: ResourceMemory,
         out: &mut VkMemoryRequirements2,
     ) {
         buffer_requirements(info.size, out);

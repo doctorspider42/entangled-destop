@@ -9,11 +9,15 @@
 # command is served only on a device the guest enabled one of the extensions
 # that bring it on (`generated::extensions_of`). The promoted extensions
 # advertised add no command outside core 1.3 that a guest sends (their KHR
-# aliases are encoded as the core commands), the emulated ones add none the
-# guest sends either, and the venus protocol's own vkImportSemaphoreResourceMESA,
+# aliases are encoded as the core commands), the emulated sync-file and
+# dma-buf ones add none the guest sends either, and the venus protocol's own
+# vkImportSemaphoreResourceMESA,
 # vkWaitSemaphoreResourceMESA and vkGetMemoryResourcePropertiesMESA are served
-# by hand (executor/submit.rs, `dispatch_extension`); every other extension
-# command stays refused as "decodable but not implemented".
+# by hand (executor/submit.rs, `dispatch_extension`), and so is the emulated
+# VK_EXT_image_drm_format_modifier's vkGetImageDrmFormatModifierPropertiesEXT
+# (stage S1; its structures are policy.rs `EMULATED_STRUCTURE_EXTENSIONS`,
+# never forwarded); every other extension command stays refused as
+# "decodable but not implemented".
 #
 # [bespoke]      Stages 5a.3 and 5b.1: hand-written end to end, host call
 #                included (`VulkanContext::dispatch` in executor/context.rs,
@@ -185,6 +189,14 @@ vkCmdEndQueryIndexedEXT
 vkCmdDrawIndirectByteCountEXT           # the counter inside its buffer, the stride inside the limit
 vkCmdBeginConditionalRenderingEXT       # the predicate's 4 bytes inside a CONDITIONAL_RENDERING buffer
 vkCmdSetLineStipple                     # factor in [1, 256]
+# Stage S1: every buffer and image barrier's queue family pair judged before
+# the driver indexes by it (VK_QUEUE_FAMILY_FOREIGN_EXT only with
+# VK_EXT_queue_family_foreign enabled).
+vkCmdPipelineBarrier
+vkCmdPipelineBarrier2
+vkCmdWaitEvents
+vkCmdWaitEvents2
+vkCmdSetEvent2                  # and no ownership transfer at all
 
 [generated]
 vkEndCommandBuffer
@@ -217,13 +229,8 @@ vkCmdClearDepthStencilImage
 vkCmdResolveImage
 vkCmdResolveImage2
 vkCmdSetEvent
-vkCmdSetEvent2
 vkCmdResetEvent
 vkCmdResetEvent2
-vkCmdWaitEvents
-vkCmdWaitEvents2
-vkCmdPipelineBarrier
-vkCmdPipelineBarrier2
 vkCmdNextSubpass
 vkCmdNextSubpass2
 vkCmdEndRenderPass

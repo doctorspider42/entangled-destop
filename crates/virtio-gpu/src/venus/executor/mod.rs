@@ -32,6 +32,16 @@
 //! renderer-wide budget, [`MAX_HOST_VISIBLE_BYTES`], until the last holder of
 //! them — memory object, blob or mapping — is gone.
 //!
+//! # Memory the guest shares but never maps (stage S1)
+//!
+//! Device-local memory allocated for export is allocated exportable on the
+//! host (`OPAQUE_WIN32`, where the host has `VK_KHR_external_memory_win32`),
+//! and its blob is a **handle blob**: a host handle to the allocation, no
+//! pages, refused if mapped. Another context attached to the blob imports it
+//! into its own device ([`memory`]'s module docs), and a DRM-modifier image
+//! over it is the same canonical optimal image on both sides ([`modifier`]).
+//! That is the dma-buf GNOME's compositor and its GL clients pass around.
+//!
 //! # What makes a ring fatal
 //!
 //! Anything the sink cannot answer — bytes that do not decode, a command
@@ -106,6 +116,7 @@ pub mod device_objects;
 pub mod generated;
 pub mod host;
 pub mod memory;
+pub mod modifier;
 pub mod objects;
 pub mod policy;
 pub mod submit;
@@ -123,6 +134,8 @@ pub(crate) mod harness;
 mod memory_tests;
 #[cfg(test)]
 pub(crate) mod recording;
+#[cfg(test)]
+mod s1_tests;
 #[cfg(test)]
 mod submit_tests;
 #[cfg(test)]
@@ -145,9 +158,13 @@ use super::protocol::{command_type_name, Command, ProtocolError};
 use super::pump::{Batch, Consumed, RingSink};
 #[cfg(doc)]
 use super::renderer::VenusRenderer;
-use super::renderer::{BlobRef, ContextBlobs, ReplyBlobError, RingEnv, SinkFactory};
+use super::renderer::{
+    BlobRef, ContextBlobs, ExportedMemory, ReplyBlobError, RingEnv, SinkFactory,
+};
 use super::service::StopSignal;
-use super::shmem::{PageBudget, RingPages};
+use super::shmem::PageBudget;
+#[cfg(doc)]
+use super::shmem::RingPages;
 use super::transport::{
     CommandStreamDependency, CommandStreamDescription, Opcode, TransportCommand, TransportError,
     TransportStream,
@@ -814,7 +831,7 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         ctx_id: u32,
         blob_id: u64,
         size: u64,
-    ) -> Result<Arc<RingPages>, String> {
+    ) -> Result<ExportedMemory, String> {
         // Only a context that exists: a blob of another context's memory
         // finds nothing, because each context has its own table.
         let context = self

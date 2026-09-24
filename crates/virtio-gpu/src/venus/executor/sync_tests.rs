@@ -510,8 +510,13 @@ fn the_sync_fd_properties_are_synthesized_and_every_other_type_is_the_hosts() {
             sync_fd.compatible_handle_types,
             sync_fd.export_from_imported_handle_types
         ),
-        (policy::SEMAPHORE_FEATURE_IMPORTABLE, 0x10, 0),
-        "IMPORTABLE, which is what Mesa 26.0.8 gates sync2 and the swapchain on"
+        (
+            policy::SEMAPHORE_FEATURE_IMPORTABLE | policy::SEMAPHORE_FEATURE_EXPORTABLE,
+            0x10,
+            0x10
+        ),
+        "IMPORTABLE, which is what Mesa 26.0.8 gates sync2 and the swapchain on, and \
+         (stage S1) EXPORTABLE, which it gates VK_KHR_external_semaphore_fd on"
     );
     assert_eq!(
         query(&mut h, 0x10, true),

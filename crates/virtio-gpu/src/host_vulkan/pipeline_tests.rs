@@ -720,7 +720,10 @@ fn the_host_gpu_is_shown_as_1_3_with_sync2_and_an_importable_sync_fd() {
     assert_eq!((version >> 22, (version >> 12) & 0x3ff), (1, 3));
     assert!(names.iter().any(|n| n == "VK_KHR_synchronization2"));
     assert!(names.iter().any(|n| n == "VK_KHR_external_semaphore_fd"));
-    assert_eq!(sync_fd.external_semaphore_features, 0x2, "IMPORTABLE");
+    assert_eq!(
+        sync_fd.external_semaphore_features, 0x3,
+        "IMPORTABLE, and (stage S1) EXPORTABLE"
+    );
 }
 
 /// vk-smoke check 7: the triangle through `vkCmdBeginRendering` (core 1.3,
@@ -1153,6 +1156,14 @@ const ZINK_DEVICE_EXTENSIONS: &[&str] = &[
 /// command buffers.
 fn setup_zink(h: &mut Harness<AshVulkan>) {
     boot(h);
+    zink_device(h, &[]);
+}
+
+/// [`setup_zink`]'s device, pool, queue and command buffers on a booted
+/// context, with `extra` extensions beside Zink's.
+fn zink_device(h: &mut Harness<AshVulkan>, extra: &[&'static str]) {
+    let mut names: Vec<&'static str> = ZINK_DEVICE_EXTENSIONS.to_vec();
+    names.extend_from_slice(extra);
     let mut create = create_device(
         PHYSICAL,
         DEVICE,
@@ -1187,13 +1198,8 @@ fn setup_zink(h: &mut Harness<AshVulkan>) {
     );
     if let Command::CreateDevice(a) = &mut create {
         let info = a.p_create_info.as_mut().unwrap();
-        info.enabled_extension_count = ZINK_DEVICE_EXTENSIONS.len() as u32;
-        info.pp_enabled_extension_names = Some(
-            ZINK_DEVICE_EXTENSIONS
-                .iter()
-                .map(|e| e.as_bytes())
-                .collect(),
-        );
+        info.enabled_extension_count = names.len() as u32;
+        info.pp_enabled_extension_names = Some(names.iter().map(|e| e.as_bytes()).collect());
     }
     let Command::CreateDevice(d) = h.call(&create).unwrap() else {
         panic!()
@@ -1431,6 +1437,12 @@ fn the_host_gpu_is_shown_what_zink_needs() {
             assert!(has(name), "{name}");
         }
         assert!(p.driver_version < crate::venus::executor::policy::NVIDIA_DMA_BUF_WSI_DRIVER);
+        // Stage S1: where device-local memory can leave the device (an NT
+        // handle, so Windows), GNOME's two as well.
+        if cfg!(windows) {
+            assert!(has("VK_EXT_queue_family_foreign"));
+            assert!(has("VK_EXT_image_drm_format_modifier"));
+        }
     }
     assert!(!has("VK_KHR_swapchain") && !has("VK_EXT_external_memory_host"));
 }
@@ -1839,4 +1851,436 @@ fn a_pipeline_cache_size_query_ignores_the_size_it_was_handed() {
     }))
     .unwrap();
     teardown(h);
+}
+
+// --------------------------------------------------------------- stage S1
+
+/// `VK_QUEUE_FAMILY_FOREIGN_EXT`.
+const FOREIGN: u32 = !2;
+/// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`.
+const DRM_TILING: i32 = 1_000_158_000;
+/// `VK_FORMAT_R8G8B8A8_SRGB`: RGBA8's twin.
+const RGBA8_SRGB: i32 = 43;
+
+/// The device extensions the guest is shown, by name.
+fn device_extension_names(h: &mut Harness<AshVulkan>) -> Vec<String> {
+    let Command::EnumerateDeviceExtensionProperties(c) = h
+        .call(&Command::EnumerateDeviceExtensionProperties(
+            EnumerateDeviceExtensionPropertiesArgs {
+                physical_device: VkPhysicalDevice(PHYSICAL),
+                p_layer_name: None,
+                p_property_count: Some(0),
+                p_properties: None,
+                ret: 0,
+            },
+        ))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let n = c.p_property_count.unwrap();
+    let Command::EnumerateDeviceExtensionProperties(e) = h
+        .call(&Command::EnumerateDeviceExtensionProperties(
+            EnumerateDeviceExtensionPropertiesArgs {
+                physical_device: VkPhysicalDevice(PHYSICAL),
+                p_layer_name: None,
+                p_property_count: Some(n),
+                p_properties: Some(vec![VkExtensionProperties::default(); n as usize]),
+                ret: 0,
+            },
+        ))
+        .unwrap()
+    else {
+        panic!()
+    };
+    e.p_properties
+        .unwrap()
+        .iter()
+        .map(|x| {
+            String::from_utf8_lossy(crate::venus::executor::policy::c_name(&x.extension_name))
+                .into_owned()
+        })
+        .collect()
+}
+
+/// A 256×256 RGBA8 DRM-modifier image of `usage`, named LINEAR by a list
+/// (the exporter, as Zink rebuilds a GBM buffer for export: mutable with its
+/// sRGB twin) or explicitly at a pitch (the importer, as Zink imports a
+/// dma-buf).
+fn linear_image(usage: u32, explicit_pitch: Option<u64>) -> VkImageCreateInfo<'static> {
+    let mut p_next = vec![VkImageCreateInfoNext::VkExternalMemoryImageCreateInfo(
+        VkExternalMemoryImageCreateInfo {
+            handle_types: 0x200,
+        },
+    )];
+    let flags = match explicit_pitch {
+        None => {
+            p_next.push(VkImageCreateInfoNext::VkImageFormatListCreateInfo(
+                VkImageFormatListCreateInfo {
+                    view_format_count: 2,
+                    p_view_formats: Some(vec![RGBA8, RGBA8_SRGB]),
+                },
+            ));
+            p_next.push(
+                VkImageCreateInfoNext::VkImageDrmFormatModifierListCreateInfoEXT(
+                    VkImageDrmFormatModifierListCreateInfoEXT {
+                        drm_format_modifier_count: 1,
+                        p_drm_format_modifiers: Some(vec![0]),
+                    },
+                ),
+            );
+            0x8 // MUTABLE_FORMAT
+        }
+        Some(pitch) => {
+            p_next.push(
+                VkImageCreateInfoNext::VkImageDrmFormatModifierExplicitCreateInfoEXT(
+                    VkImageDrmFormatModifierExplicitCreateInfoEXT {
+                        drm_format_modifier: 0,
+                        drm_format_modifier_plane_count: 1,
+                        p_plane_layouts: Some(vec![VkSubresourceLayout {
+                            row_pitch: pitch,
+                            ..Default::default()
+                        }]),
+                    },
+                ),
+            );
+            0
+        }
+    };
+    VkImageCreateInfo {
+        p_next,
+        flags,
+        image_type: 1,
+        format: RGBA8,
+        extent: VkExtent3D {
+            width: raster::SIZE,
+            height: raster::SIZE,
+            depth: 1,
+        },
+        mip_levels: 1,
+        array_layers: 1,
+        samples: 1,
+        tiling: DRM_TILING,
+        usage,
+        ..Default::default()
+    }
+}
+
+/// Stage S1 on the host GPU, across two guest processes, exactly as GNOME's
+/// buffers go: context 1 creates a LINEAR DRM-modifier image — the
+/// canonical optimal image on the host — in exportable device-local memory
+/// (`VkExportMemoryAllocateInfo{DMA_BUF}`, dedicated as Zink allocates it),
+/// makes the handle blob Mesa makes of it, renders vk-smoke's triangle into
+/// it through a render pass and releases it to `VK_QUEUE_FAMILY_FOREIGN_EXT`.
+/// Context 2, attached, imports the blob (`VkImportMemoryResourceInfoMESA`),
+/// creates "the same" image explicitly LINEAR at the pitch context 1 was
+/// told, and — after context 1 has destroyed everything it had and the blob
+/// is gone — acquires it from `FOREIGN`, copies it into a buffer of our pages
+/// and reads back vk-smoke's check-6 triangle, every pixel against the CPU
+/// reference and the checksum the bare RTX 2070 gives. Skips on a host that
+/// cannot export device-local memory (no `VK_KHR_external_memory_win32`).
+#[test]
+fn a_linear_modifier_image_rendered_by_one_context_is_read_back_exactly_by_another() {
+    const SIZE: u32 = raster::SIZE;
+    const IMG: u64 = 0x400;
+    const IMG_MEM: u64 = 0x401;
+    const VIEW: u64 = 0x402;
+    const RES: u32 = 95;
+    const IMPORTED: u64 = 0x500;
+    const IMPORTED_MEM: u64 = 0x501;
+    const S1: &[&str] = &[
+        "VK_EXT_queue_family_foreign",
+        "VK_EXT_image_drm_format_modifier",
+    ];
+    let Some(host) = host() else { return };
+    let mut h = Harness::new(host);
+    boot(&mut h);
+    let shown = device_extension_names(&mut h);
+    if !S1.iter().all(|n| shown.iter().any(|s| s == n)) {
+        eprintln!("skipping: this host cannot export device-local memory (stage S1)");
+        return;
+    }
+    zink_device(&mut h, S1);
+    let types = memory_types(&mut h);
+
+    // The modifier the guest is shown for RGBA8, asked as Zink asks it.
+    let Command::GetPhysicalDeviceFormatProperties2(f) = h
+        .call(&Command::GetPhysicalDeviceFormatProperties2(
+            GetPhysicalDeviceFormatProperties2Args {
+                physical_device: VkPhysicalDevice(PHYSICAL),
+                format: RGBA8,
+                p_format_properties: Some(VkFormatProperties2 {
+                    p_next: vec![
+                        VkFormatProperties2Next::VkDrmFormatModifierPropertiesListEXT(
+                            VkDrmFormatModifierPropertiesListEXT {
+                                drm_format_modifier_count: 128,
+                                p_drm_format_modifier_properties: Some(Vec::new()),
+                            },
+                        ),
+                    ],
+                    ..Default::default()
+                }),
+            },
+        ))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let f = f.p_format_properties.unwrap();
+    let VkFormatProperties2Next::VkDrmFormatModifierPropertiesListEXT(list) = &f.p_next[0] else {
+        panic!()
+    };
+    let linear = list.p_drm_format_modifier_properties.clone().unwrap();
+    assert_eq!(list.drm_format_modifier_count, 1);
+    assert_eq!(
+        (
+            linear[0].drm_format_modifier,
+            linear[0].drm_format_modifier_plane_count
+        ),
+        (0, 1)
+    );
+    assert_eq!(
+        linear[0].drm_format_modifier_tiling_features & 0x80,
+        0x80,
+        "LINEAR carries the optimal features: a colour attachment"
+    );
+
+    // Context 1: the export.
+    let Command::CreateImage(i) = h
+        .call(&create_image(DEVICE, IMG, linear_image(0x10 | 0x1, None)))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(i.ret, VK_SUCCESS, "the canonical image");
+    let Command::GetImageMemoryRequirements2(r) =
+        h.call(&memory_requirements(DEVICE, IMG)).unwrap()
+    else {
+        panic!()
+    };
+    let req = r.p_memory_requirements.unwrap().memory_requirements;
+    let ty = pick_type(&types, req.memory_type_bits, MEM_PROPERTY_DEVICE_LOCAL);
+    h.send(&allocate(
+        DEVICE,
+        IMG_MEM,
+        req.size,
+        ty,
+        vec![
+            VkMemoryAllocateInfoNext::VkExportMemoryAllocateInfo(VkExportMemoryAllocateInfo {
+                handle_types: 0x200,
+            }),
+            VkMemoryAllocateInfoNext::VkMemoryDedicatedAllocateInfo(
+                VkMemoryDedicatedAllocateInfo {
+                    image: VkImage(IMG),
+                    buffer: VkBuffer(0),
+                },
+            ),
+        ],
+    ))
+    .unwrap();
+    h.send(&bind_image(DEVICE, IMG, IMG_MEM, 0)).unwrap();
+    let blob = req.size.next_multiple_of(4096);
+    h.memory_blob(CTX, RES, IMG_MEM, blob)
+        .expect("a handle blob of the exported memory");
+    assert!(
+        h.renderer.map_blob(RES, 0x80_0000, blob).is_err(),
+        "never mappable"
+    );
+    let Command::GetImageSubresourceLayout(l) = h
+        .call(&Command::GetImageSubresourceLayout(
+            GetImageSubresourceLayoutArgs {
+                device: VkDevice(DEVICE),
+                image: VkImage(IMG),
+                p_subresource: Some(VkImageSubresource {
+                    aspect_mask: 0x80, // MEMORY_PLANE_0
+                    mip_level: 0,
+                    array_layer: 0,
+                }),
+                p_layout: Some(Default::default()),
+            },
+        ))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let plane = l.p_layout.unwrap();
+    assert_eq!(plane.row_pitch, 1024, "256 × 4, 256-aligned");
+    eprintln!(
+        "LINEAR on RGBA8: tiling features {:#x}; blob {:#x} bytes of type {ty} \
+         (requirement {:#x}), pitch {}",
+        linear[0].drm_format_modifier_tiling_features, blob, req.size, plane.row_pitch
+    );
+
+    // It renders the triangle and releases the image to FOREIGN.
+    h.send(&create_image_view(DEVICE, VIEW, IMG, RGBA8))
+        .unwrap();
+    let vertices = buffer(&mut h, 0x410, 60, USAGE_VERTEX, true);
+    vertices.write_words(&raster::vertex_data().map(f32::to_bits));
+    h.send(&create_render_pass(DEVICE, RENDER_PASS, RGBA8))
+        .unwrap();
+    h.send(&create_framebuffer(
+        DEVICE,
+        FRAMEBUFFER,
+        RENDER_PASS,
+        VIEW,
+        SIZE,
+    ))
+    .unwrap();
+    h.send(&create_shader_module(DEVICE, SHADER, &spirv(TRIANGLE_WGSL)))
+        .unwrap();
+    h.send(&create_pipeline_layout(DEVICE, PIPELINE_LAYOUT, &[]))
+        .unwrap();
+    h.send(&create_triangle_pipeline(
+        DEVICE,
+        PIPELINE,
+        SHADER,
+        PIPELINE_LAYOUT,
+        RENDER_PASS,
+        SIZE,
+    ))
+    .unwrap();
+    submit_zink(
+        &mut h,
+        &[
+            begin(CB),
+            begin_render_pass(CB, RENDER_PASS, FRAMEBUFFER, SIZE, raster::CLEAR_6),
+            bind_pipeline(CB, 0, PIPELINE),
+            bind_vertex_buffer(CB, vertices.id),
+            draw(CB, 3),
+            end_render_pass(CB),
+            image_barrier2_families(
+                CB,
+                IMG,
+                (LAYOUT_TRANSFER_SRC, LAYOUT_TRANSFER_SRC),
+                (STAGE2_COLOR_OUTPUT, ACCESS2_COLOR_WRITE),
+                (STAGE2_NONE, 0),
+                (0, FOREIGN),
+            ),
+            end(CB),
+        ],
+        CB,
+        FENCE,
+    );
+
+    // Context 2: attached, it imports the blob and makes "the same" image.
+    h.use_context(2);
+    boot(&mut h);
+    zink_device(&mut h, S1);
+    h.renderer.ctx_attach_blob(2, RES, true);
+    let Command::GetMemoryResourcePropertiesMESA(props) = h
+        .call(&Command::GetMemoryResourcePropertiesMESA(
+            GetMemoryResourcePropertiesMESAArgs {
+                device: VkDevice(DEVICE),
+                resource_id: RES,
+                p_memory_resource_properties: Some(VkMemoryResourcePropertiesMESA {
+                    p_next: Vec::new(),
+                    memory_type_bits: 0,
+                }),
+                ret: 0,
+            },
+        ))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(props.ret, VK_SUCCESS, "the same GPU, so importable");
+    let bits = props.p_memory_resource_properties.unwrap().memory_type_bits;
+    assert_eq!(bits, 1 << ty, "exactly the export's type");
+    let Command::CreateImage(i) = h
+        .call(&create_image(
+            DEVICE,
+            IMPORTED,
+            linear_image(0x1, Some(plane.row_pitch)),
+        ))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(i.ret, VK_SUCCESS, "the same canonical image");
+    let Command::GetImageMemoryRequirements2(r) =
+        h.call(&memory_requirements(DEVICE, IMPORTED)).unwrap()
+    else {
+        panic!()
+    };
+    let req2 = r.p_memory_requirements.unwrap().memory_requirements;
+    assert_eq!(req2.size, req.size, "identical requirements");
+    assert_ne!(req2.memory_type_bits & bits, 0);
+    h.send(&allocate(
+        DEVICE,
+        IMPORTED_MEM,
+        req2.size,
+        ty,
+        vec![
+            VkMemoryAllocateInfoNext::VkImportMemoryResourceInfoMESA(
+                VkImportMemoryResourceInfoMESA { resource_id: RES },
+            ),
+            VkMemoryAllocateInfoNext::VkMemoryDedicatedAllocateInfo(
+                VkMemoryDedicatedAllocateInfo {
+                    image: VkImage(IMPORTED),
+                    buffer: VkBuffer(0),
+                },
+            ),
+        ],
+    ))
+    .unwrap();
+    h.send(&bind_image(DEVICE, IMPORTED, IMPORTED_MEM, 0))
+        .unwrap();
+    assert!(!h.fatal(), "imported and bound");
+
+    // The exporter goes first: its whole instance, then the blob (the
+    // handle closed). The import alone holds the allocation now.
+    h.use_context(CTX);
+    h.send(&Command::DestroyInstance(DestroyInstanceArgs {
+        instance: VkInstance(INSTANCE),
+    }))
+    .unwrap();
+    h.renderer.destroy_blob(RES);
+    h.use_context(2);
+
+    // Context 2 acquires it from FOREIGN and reads it back.
+    let bytes = u64::from(SIZE * SIZE * 4);
+    let readback = buffer(&mut h, 0x520, bytes, USAGE_TRANSFER_DST, true);
+    readback.write_words(&vec![0xdead_beef; (bytes / 4) as usize]);
+    submit_zink(
+        &mut h,
+        &[
+            begin(CB),
+            image_barrier2_families(
+                CB,
+                IMPORTED,
+                (LAYOUT_TRANSFER_SRC, LAYOUT_TRANSFER_SRC),
+                (STAGE2_NONE, 0),
+                (STAGE2_TRANSFER, ACCESS2_TRANSFER_READ),
+                (FOREIGN, 0),
+            ),
+            copy_image_to_buffer(CB, IMPORTED, readback.id, SIZE),
+            buffer_barrier(
+                CB,
+                readback.id,
+                (STAGE_TRANSFER, ACCESS_TRANSFER_WRITE),
+                (STAGE_HOST, ACCESS_HOST_READ),
+            ),
+            end(CB),
+        ],
+        CB,
+        FENCE,
+    );
+    let mut got = vec![0u8; bytes as usize];
+    readback.pages().read_bytes(0, &mut got).unwrap();
+    match raster::verify(&got, raster::CLEAR_6) {
+        Ok(detail) => eprintln!("S1 across contexts: {detail}"),
+        Err(why) => panic!("context 2 read the wrong image: {why}"),
+    }
+    let sum = raster::checksum(&got);
+    eprintln!("S1 across contexts: fnv1a={sum:#018x}");
+    assert_eq!(
+        sum, 0x2678_f2a0_e39f_ba1b,
+        "vk-smoke check 6's checksum on the bare RTX 2070"
+    );
+    h.send(&Command::DestroyInstance(DestroyInstanceArgs {
+        instance: VkInstance(INSTANCE),
+    }))
+    .unwrap();
+    assert_eq!(h.renderer.factory().host_objects(), 0);
+    assert!(!h.fatal());
 }

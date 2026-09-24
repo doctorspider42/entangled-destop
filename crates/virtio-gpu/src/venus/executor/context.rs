@@ -30,17 +30,22 @@ use crate::venus::protocol::{
     GetPhysicalDeviceProperties2Args, GetPhysicalDevicePropertiesArgs,
     GetPhysicalDeviceQueueFamilyProperties2Args, VkDeviceCreateInfoNext, VkDeviceQueueInfo2Next,
     VkImageCreateInfo, VkImageCreateInfoNext, VkImageFormatProperties2,
-    VkImageFormatProperties2Next, VkImageMemoryRequirementsInfo2Next, VkPhysicalDevice,
-    VkPhysicalDeviceGroupProperties, VkPhysicalDeviceImageFormatInfo2,
-    VkPhysicalDeviceImageFormatInfo2Next, VkQueueFamilyProperties2, VkResult,
-    VK_ERROR_EXTENSION_NOT_PRESENT, VK_ERROR_FEATURE_NOT_PRESENT, VK_ERROR_FORMAT_NOT_SUPPORTED,
-    VK_ERROR_INITIALIZATION_FAILED, VK_ERROR_LAYER_NOT_PRESENT, VK_ERROR_OUT_OF_HOST_MEMORY,
-    VK_ERROR_UNKNOWN, VK_INCOMPLETE, VK_SHARING_MODE_CONCURRENT, VK_SUCCESS,
+    VkImageFormatProperties2Next, VkImageMemoryRequirementsInfo2Next, VkMemoryRequirements2,
+    VkMemoryRequirements2Next, VkPhysicalDevice, VkPhysicalDeviceGroupProperties,
+    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceImageFormatInfo2Next,
+    VkQueueFamilyProperties2, VkResult, VK_ERROR_EXTENSION_NOT_PRESENT,
+    VK_ERROR_FEATURE_NOT_PRESENT, VK_ERROR_FORMAT_NOT_SUPPORTED, VK_ERROR_INITIALIZATION_FAILED,
+    VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT, VK_ERROR_LAYER_NOT_PRESENT,
+    VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_UNKNOWN, VK_INCOMPLETE,
+    VK_SHARING_MODE_CONCURRENT, VK_SUCCESS,
 };
 use crate::venus::wire::Encoder;
 
-use super::host::{DeviceRequest, HostVulkan, InstanceRequest, QueueRequest};
-use super::memory::{external_handle_types, external_type_bits, image_facts, image_planes};
+use super::host::{DeviceRequest, HostVulkan, InstanceRequest, QueueRequest, ResourceMemory};
+use super::memory::{
+    external_handle_types, external_type_bits, image_facts, image_planes, resource_memory,
+};
+use super::modifier::{self, ModifierLayout};
 use super::objects::{
     CreatedQueue, DeviceChild, DeviceObject, ExposedDevice, IdError, ImageObject, Kind, Objects,
     Pending, QueueObject,
@@ -868,7 +873,8 @@ impl<H: HostVulkan> VulkanContext<H> {
     /// 26.0.8 sends it for every handle type it supports, rewritten to the
     /// renderer's `DMA_BUF` (`vn_physical_device.c:2900-2955`), and gets
     /// [`policy::external_memory_properties`] — exportable and importable
-    /// exactly when such a buffer can live in our pages. Every other handle
+    /// exactly when such a buffer can live in our pages or (stage S1) in
+    /// device-local memory the host exports as `OPAQUE_WIN32`. Every other handle
     /// type (a core 1.3 one) is answered "nothing": no other is served. The
     /// flags and usage must be ones the device could create a buffer with.
     fn external_buffer_properties(
@@ -904,12 +910,18 @@ impl<H: HostVulkan> VulkanContext<H> {
             ));
         }
         let answer = if handle == policy::MEMORY_HANDLE_DMA_BUF {
-            policy::external_memory_properties(self.host.buffer_importable(
-                instance,
-                device.host,
-                info.flags,
-                info.usage,
-            ))
+            // Our pages, or (stage S1) exportable device-local memory.
+            let shareable =
+                self.host
+                    .buffer_importable(instance, device.host, info.flags, info.usage)
+                    || (device.guest.memory_export
+                        && self.host.buffer_exportable(
+                            instance,
+                            device.host,
+                            info.flags,
+                            info.usage,
+                        ));
+            policy::external_memory_properties(shareable)
         } else {
             crate::venus::protocol::VkExternalMemoryProperties {
                 external_memory_features: 0,
@@ -925,11 +937,19 @@ impl<H: HostVulkan> VulkanContext<H> {
     }
 
     /// `vkGetPhysicalDeviceFormatProperties2`, forwarded with a checked
-    /// format.
+    /// format — and, stage S1, `VkDrmFormatModifierPropertiesListEXT` and
+    /// `…List2EXT` answered here: one entry, `DRM_FORMAT_MOD_LINEAR` with one
+    /// plane and the canonical image's optimal features, for a scanout format
+    /// whose canonical image this host can make, on a device shown the
+    /// emulated extension; none for anything else (`executor::modifier`).
     fn format_properties(
         &mut self,
         args: &mut GetPhysicalDeviceFormatProperties2Args,
     ) -> Result<(), ExecError> {
+        use crate::venus::protocol::{
+            VkDrmFormatModifierProperties2EXT, VkDrmFormatModifierPropertiesEXT,
+            VkFormatProperties2Next as N,
+        };
         const NAME: &str = "vkGetPhysicalDeviceFormatProperties2";
         if !policy::is_core_format(args.format) {
             return Err(invalid(
@@ -941,9 +961,61 @@ impl<H: HostVulkan> VulkanContext<H> {
             .objects
             .physical(args.physical_device.0)
             .map_err(id_error(NAME))?;
-        if let Some(out) = args.p_format_properties.as_mut() {
-            self.host
-                .format_properties(instance, device.host, args.format, out);
+        let Some(out) = args.p_format_properties.as_mut() else {
+            return Ok(());
+        };
+        self.host
+            .format_properties(instance, device.host, args.format, out);
+        let asks = out.p_next.iter().any(|l| {
+            matches!(
+                l,
+                N::VkDrmFormatModifierPropertiesListEXT(_)
+                    | N::VkDrmFormatModifierPropertiesList2EXT(_)
+            )
+        });
+        if !asks {
+            return Ok(());
+        }
+        let canonical =
+            policy::has_extension(&device.guest.extensions, policy::IMAGE_DRM_FORMAT_MODIFIER)
+                .then(|| {
+                    modifier::canonical_format(&*self.host, instance, device.host, args.format)
+                })
+                .flatten();
+        for link in &mut out.p_next {
+            match link {
+                N::VkDrmFormatModifierPropertiesListEXT(list) => {
+                    let entries: Vec<VkDrmFormatModifierPropertiesEXT> = canonical
+                        .iter()
+                        .map(|c| VkDrmFormatModifierPropertiesEXT {
+                            drm_format_modifier: modifier::DRM_FORMAT_MOD_LINEAR,
+                            drm_format_modifier_plane_count: 1,
+                            drm_format_modifier_tiling_features: c.features,
+                        })
+                        .collect();
+                    fill_modifier_list(
+                        &mut list.drm_format_modifier_count,
+                        &mut list.p_drm_format_modifier_properties,
+                        entries,
+                    );
+                }
+                N::VkDrmFormatModifierPropertiesList2EXT(list) => {
+                    let entries: Vec<VkDrmFormatModifierProperties2EXT> = canonical
+                        .iter()
+                        .map(|c| VkDrmFormatModifierProperties2EXT {
+                            drm_format_modifier: modifier::DRM_FORMAT_MOD_LINEAR,
+                            drm_format_modifier_plane_count: 1,
+                            drm_format_modifier_tiling_features: c.features2,
+                        })
+                        .collect();
+                    fill_modifier_list(
+                        &mut list.drm_format_modifier_count,
+                        &mut list.p_drm_format_modifier_properties,
+                        entries,
+                    );
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -958,11 +1030,24 @@ impl<H: HostVulkan> VulkanContext<H> {
         let Some(info) = &args.p_image_format_info else {
             return Err(invalid(NAME, "pImageFormatInfo is null"));
         };
-        check_image_format_info(NAME, info)?;
         let (instance, device) = self
             .objects
             .physical(args.physical_device.0)
             .map_err(id_error(NAME))?;
+        let drm =
+            policy::has_extension(&device.guest.extensions, policy::IMAGE_DRM_FORMAT_MODIFIER);
+        check_image_format_info(NAME, info, drm)?;
+        if info.tiling == modifier::IMAGE_TILING_DRM_FORMAT_MODIFIER {
+            let answer = modifier::image_format_properties(
+                &*self.host,
+                instance,
+                device.host,
+                info,
+                args.p_image_format_properties.as_mut(),
+            );
+            args.ret = answer;
+            return Ok(());
+        }
         let dma_buf = info.p_next.iter().any(|link| {
             matches!(link,
                 VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceExternalImageFormatInfo(e)
@@ -1158,6 +1243,12 @@ impl<H: HostVulkan> VulkanContext<H> {
         enabled.dedup();
         if !extensions.iter().any(|e| e == policy::EXTERNAL_MEMORY_HOST) {
             extensions.push(policy::EXTERNAL_MEMORY_HOST.to_owned());
+        }
+        // Stage S1: exportable device-local memory, and its imports, rest on
+        // the host's own external-memory extension, which the guest is never
+        // shown.
+        if guest.memory_export {
+            extensions.push(policy::EXTERNAL_MEMORY_WIN32.to_owned());
         }
 
         // Features: never more than the guest was told.
@@ -1528,7 +1619,11 @@ impl<H: HostVulkan> VulkanContext<H> {
             .objects
             .physical(device.physical)
             .map_err(id_error(NAME))?;
-        let external = check_image_create_info(NAME, info, &exposed.guest, device.dma_buf())?;
+        let check = check_image_create_info(NAME, info, &exposed.guest, ImageRules::of(device))?;
+        if let Some(choice) = &check.modifier {
+            return self.create_modifier_image(args, choice);
+        }
+        let external = check.external;
         if !image_limits_hold(&*self.host, instance, exposed.host, info) {
             return Err(invalid(
                 NAME,
@@ -1542,7 +1637,15 @@ impl<H: HostVulkan> VulkanContext<H> {
             return Ok(());
         }
         let host_memory = self.host.image_accepts_host_memory(&device.host, info);
-        match self.host.create_image(&device.host, info, host_memory) {
+        // Stage S1: a `DMA_BUF` image our pages cannot hold lives in
+        // exportable device-local memory, where the host can export it.
+        let handle = external
+            && !host_memory
+            && image_exportable(&*self.host, instance, exposed.host, &exposed.guest, info);
+        match self
+            .host
+            .create_image(&device.host, info, resource_memory(host_memory, handle))
+        {
             Ok(image) => {
                 self.objects.insert_image(
                     id,
@@ -1552,6 +1655,8 @@ impl<H: HostVulkan> VulkanContext<H> {
                         facts: image_facts(info, planes),
                         host_memory,
                         external,
+                        handle,
+                        modifier: None,
                         bound_planes: 0,
                     },
                 );
@@ -1559,6 +1664,182 @@ impl<H: HostVulkan> VulkanContext<H> {
             }
             Err(ret) => args.ret = ret,
         }
+        Ok(())
+    }
+
+    /// The host create info of a DRM-modifier image (stage S1): the
+    /// canonical optimal image of its format and extent
+    /// (`executor::modifier`), once the guest's own create info is inside
+    /// every rule the emulation holds it to — 2D, one level, one layer, one
+    /// sample, exclusive; a scanout format this host makes canonical; usage,
+    /// flags and view formats inside the canonical ones. `Ok(Err(ret))` is
+    /// an answer rather than a refusal: an explicit plane layout that is not
+    /// the synthesized one (`VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`).
+    ///
+    /// # Errors
+    /// Fatal: a create info no correct guest sends after the format query.
+    pub(super) fn modifier_create_info(
+        &self,
+        command: &'static str,
+        physical: u64,
+        info: &VkImageCreateInfo,
+        choice: &ModifierChoice,
+    ) -> Result<Result<(VkImageCreateInfo<'static>, ModifierLayout), VkResult>, ExecError> {
+        let (instance, exposed) = self.objects.physical(physical).map_err(id_error(command))?;
+        if info.image_type != 1
+            || info.extent.depth != 1
+            || info.mip_levels != 1
+            || info.array_layers != 1
+            || info.samples != 1
+            || info.sharing_mode != modifier::SHARING_MODE_EXCLUSIVE
+        {
+            return Err(invalid(
+                command,
+                "a DRM format modifier image that is not a 2D, single-level, single-layer, \
+                 single-sample, exclusive image",
+            ));
+        }
+        let Some(canonical) =
+            modifier::canonical_format(&*self.host, instance, exposed.host, info.format)
+        else {
+            return Err(invalid(
+                command,
+                format!(
+                    "format {} has no DRM format modifier on this host",
+                    info.format
+                ),
+            ));
+        };
+        let mut view_formats = None;
+        for link in &info.p_next {
+            match link {
+                VkImageCreateInfoNext::VkImageFormatListCreateInfo(l) => {
+                    view_formats = Some(l.p_view_formats.as_deref().unwrap_or_default());
+                }
+                VkImageCreateInfoNext::VkImageStencilUsageCreateInfo(_) => {
+                    return Err(invalid(
+                        command,
+                        "a stencil usage on a colour DRM format modifier image",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if !canonical.admits(info.flags, view_formats) {
+            return Err(invalid(
+                command,
+                format!(
+                    "flags {:#x} or view formats outside the canonical image's",
+                    info.flags
+                ),
+            ));
+        }
+        if info.usage & !canonical.usage != 0 {
+            return Err(invalid(
+                command,
+                format!(
+                    "usage {:#x} outside the canonical image's {:#x}",
+                    info.usage, canonical.usage
+                ),
+            ));
+        }
+        let layout = ModifierLayout::new(info.extent.width, info.extent.height);
+        if let ModifierChoice::Explicit(plane) = choice {
+            if plane.offset != 0 || plane.row_pitch != layout.row_pitch {
+                return Ok(Err(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT));
+            }
+        }
+        let host =
+            canonical.create_info(info.extent.width, info.extent.height, info.initial_layout);
+        if !image_limits_hold(&*self.host, instance, exposed.host, &host) {
+            return Err(invalid(
+                command,
+                "the canonical image is outside what the host reports for it",
+            ));
+        }
+        Ok(Ok((host, layout)))
+    }
+
+    /// `vkCreateImage` of a DRM-modifier image (stage S1): the canonical
+    /// host image ([`Self::modifier_create_info`]), created for
+    /// `OPAQUE_WIN32`, recorded with the guest's own create info (its views
+    /// and commands are judged by it) and the synthesized plane. A canonical
+    /// image the host would still want dedicated memory for is refused
+    /// (`VK_ERROR_OUT_OF_DEVICE_MEMORY`): its memory is exported undedicated.
+    fn create_modifier_image(
+        &mut self,
+        args: &mut CreateImageArgs,
+        choice: &ModifierChoice,
+    ) -> Result<(), ExecError> {
+        const NAME: &str = "vkCreateImage";
+        let device_id = args.device.0;
+        let id = args.p_image.map(|h| h.0).unwrap_or(0);
+        let Some(info) = &args.p_create_info else {
+            return Err(invalid(NAME, "pCreateInfo is null"));
+        };
+        let physical = self
+            .objects
+            .device(device_id)
+            .map_err(id_error(NAME))?
+            .physical;
+        let (host_info, layout) = match self.modifier_create_info(NAME, physical, info, choice)? {
+            Ok(created) => created,
+            Err(ret) => {
+                args.ret = ret;
+                return Ok(());
+            }
+        };
+        if !self.objects.has_room() {
+            args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+            return Ok(());
+        }
+        let device = self.objects.device(device_id).map_err(id_error(NAME))?;
+        let image = match self
+            .host
+            .create_image(&device.host, &host_info, ResourceMemory::Handle)
+        {
+            Ok(image) => image,
+            Err(ret) => {
+                args.ret = ret;
+                return Ok(());
+            }
+        };
+        let mut req = VkMemoryRequirements2 {
+            p_next: vec![VkMemoryRequirements2Next::VkMemoryDedicatedRequirements(
+                Default::default(),
+            )],
+            ..Default::default()
+        };
+        self.host
+            .image_memory_requirements(&device.host, image, None, &mut req);
+        let dedicated_only = req.p_next.iter().any(|l| {
+            let VkMemoryRequirements2Next::VkMemoryDedicatedRequirements(d) = l;
+            d.requires_dedicated_allocation != 0
+        });
+        if dedicated_only {
+            tracing::warn!(
+                ctx_id = self.ctx_id,
+                format = info.format,
+                "the host requires dedicated memory for a canonical modifier image"
+            );
+            self.host.destroy_image(&device.host, image);
+            args.ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            return Ok(());
+        }
+        self.objects.insert_image(
+            id,
+            ImageObject {
+                device: device_id,
+                host: image,
+                facts: image_facts(info, 1),
+                host_memory: false,
+                external: true,
+                handle: true,
+                modifier: Some(layout),
+                bound_planes: 0,
+            },
+        );
+        args.ret = VK_SUCCESS;
         Ok(())
     }
 
@@ -1632,9 +1913,54 @@ impl<H: HostVulkan> VulkanContext<H> {
                 image.external,
                 out.memory_requirements.memory_type_bits,
             );
+            if let Some(layout) = image.modifier {
+                let req = &mut out.memory_requirements;
+                req.size = layout.requirement(req.size, req.alignment);
+            }
         }
         Ok(())
     }
+}
+
+/// The rules a `VkImageCreateInfo` is judged by on one device: whether it
+/// enabled the emulated dma-buf external memory (stage 5c) and the emulated
+/// DRM format modifiers (stage S1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ImageRules {
+    /// `VK_EXT_external_memory_dma_buf` (or `VK_KHR_external_memory_fd`).
+    pub dma_buf: bool,
+    /// `VK_EXT_image_drm_format_modifier`.
+    pub drm_modifier: bool,
+}
+
+impl ImageRules {
+    /// The rules of `device`.
+    pub(super) fn of<H: HostVulkan>(device: &DeviceObject<H>) -> Self {
+        Self {
+            dma_buf: device.dma_buf(),
+            drm_modifier: device.enabled(policy::IMAGE_DRM_FORMAT_MODIFIER),
+        }
+    }
+}
+
+/// How a DRM-modifier image names its modifier (stage S1): a list the
+/// implementation picks from — `DRM_FORMAT_MOD_LINEAR` alone here — or an
+/// explicit LINEAR with its one plane's layout.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum ModifierChoice {
+    /// `VkImageDrmFormatModifierListCreateInfoEXT`, every entry LINEAR.
+    List,
+    /// `VkImageDrmFormatModifierExplicitCreateInfoEXT` of LINEAR, one plane.
+    Explicit(crate::venus::protocol::VkSubresourceLayout),
+}
+
+/// What [`check_image_create_info`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ImageCheck {
+    /// Created for `DMA_BUF` export.
+    pub external: bool,
+    /// A DRM-modifier image, and how it named LINEAR.
+    pub modifier: Option<ModifierChoice>,
 }
 
 /// Whether a chained structure of type `stype` may reach the driver on a
@@ -1649,6 +1975,22 @@ fn extension_enabled_for(stype: i32, enabled: &[String]) -> bool {
                 .iter()
                 .any(|e| policy::PROTOCOL_EXTENSIONS.contains(e) || enabled.iter().any(|x| x == e))
     })
+}
+
+/// The count protocol of a DRM format modifier list (stage S1): with no
+/// array, how many entries there are; with one, as many as its capacity
+/// (`count`, the skeleton carries no elements) holds, and the count of those
+/// — the reply must carry an array exactly its count long.
+fn fill_modifier_list<T>(count: &mut u32, array: &mut Option<Vec<T>>, entries: Vec<T>) {
+    match array {
+        None => *count = u32::try_from(entries.len()).unwrap_or(0),
+        Some(slots) => {
+            let room = usize::try_from(*count).unwrap_or(usize::MAX);
+            let n = room.min(entries.len());
+            *slots = entries.into_iter().take(n).collect();
+            *count = u32::try_from(n).unwrap_or(0);
+        }
+    }
 }
 
 /// A structure's wire body, as the bytes the generated encoder writes: for a
@@ -1677,18 +2019,36 @@ fn subset(requested: &[u8], reported: &[u8]) -> bool {
 }
 
 /// The checks `vkGetPhysicalDeviceImageFormatProperties2` gets before the
-/// driver sees its info.
+/// driver sees its info, on a physical device that is (`drm`) or is not
+/// shown the emulated `VK_EXT_image_drm_format_modifier` (stage S1): its
+/// tiling and its `VkPhysicalDeviceImageDrmFormatModifierInfoEXT` come
+/// together or not at all (`VUID-VkPhysicalDeviceImageFormatInfo2-tiling-02249`).
 fn check_image_format_info(
     command: &'static str,
     info: &VkPhysicalDeviceImageFormatInfo2,
+    drm: bool,
 ) -> Result<(), ExecError> {
+    let drm_tiling = drm && info.tiling == modifier::IMAGE_TILING_DRM_FORMAT_MODIFIER;
     if !policy::is_core_format(info.format)
         || !policy::is_image_type(info.type_)
-        || !policy::is_image_tiling(info.tiling)
+        || !(policy::is_image_tiling(info.tiling) || drm_tiling)
     {
         return Err(invalid(
             command,
-            "format, type or tiling outside Vulkan 1.3",
+            "format, type or tiling outside Vulkan 1.3 and the extensions shown",
+        ));
+    }
+    let modifier_info = info.p_next.iter().any(|l| {
+        matches!(
+            l,
+            VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceImageDrmFormatModifierInfoEXT(_)
+        )
+    });
+    if modifier_info != drm_tiling {
+        return Err(invalid(
+            command,
+            "VkPhysicalDeviceImageDrmFormatModifierInfoEXT is chained exactly for DRM format \
+             modifier tiling, on a device shown the extension",
         ));
     }
     if info.usage == 0 || info.usage & !policy::IMAGE_USAGE_CORE != 0 {
@@ -1714,6 +2074,15 @@ fn check_image_format_info(
             }
             VkPhysicalDeviceImageFormatInfo2Next::VkImageStencilUsageCreateInfo(s) => {
                 check_usage(command, s.stencil_usage)?;
+            }
+            VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceImageDrmFormatModifierInfoEXT(
+                m,
+            ) => {
+                // Judged as a query (`modifier::image_format_properties`);
+                // only the value ranges are checked here.
+                if !policy::is_sharing_mode(m.sharing_mode) {
+                    return Err(invalid(command, "a sharing mode outside Vulkan 1.3"));
+                }
             }
             other => {
                 return Err(unimplemented_link(
@@ -1743,6 +2112,61 @@ fn check_view_formats(command: &'static str, formats: Option<&[i32]>) -> Result<
         return Err(invalid(command, "a view format outside Vulkan 1.3"));
     }
     Ok(())
+}
+
+/// Whether an image of `info` may live in exportable device-local memory
+/// (stage S1): the device can export at all ([`GuestDevice::memory_export`]),
+/// and the host answers `OPAQUE_WIN32` `EXPORTABLE | IMPORTABLE`, not
+/// dedicated-only, for its format, type, tiling, usage, flags and view
+/// formats.
+pub(super) fn image_exportable<H: HostVulkan>(
+    host: &H,
+    instance: &H::Instance,
+    physical: H::PhysicalDevice,
+    guest: &GuestDevice,
+    info: &VkImageCreateInfo,
+) -> bool {
+    if !guest.memory_export {
+        return false;
+    }
+    let mut p_next = vec![
+        VkPhysicalDeviceImageFormatInfo2Next::VkPhysicalDeviceExternalImageFormatInfo(
+            crate::venus::protocol::VkPhysicalDeviceExternalImageFormatInfo {
+                handle_type: policy::MEMORY_HANDLE_OPAQUE_WIN32 as i32,
+            },
+        ),
+    ];
+    for link in &info.p_next {
+        if let VkImageCreateInfoNext::VkImageFormatListCreateInfo(l) = link {
+            p_next
+                .push(VkPhysicalDeviceImageFormatInfo2Next::VkImageFormatListCreateInfo(l.clone()));
+        }
+    }
+    let query = VkPhysicalDeviceImageFormatInfo2 {
+        p_next,
+        format: info.format,
+        type_: info.image_type,
+        tiling: info.tiling,
+        usage: info.usage,
+        flags: info.flags,
+    };
+    let mut out = VkImageFormatProperties2 {
+        p_next: vec![
+            VkImageFormatProperties2Next::VkExternalImageFormatProperties(Default::default()),
+        ],
+        image_format_properties: Default::default(),
+    };
+    if host.image_format_properties(instance, physical, &query, &mut out) != VK_SUCCESS {
+        return false;
+    }
+    out.p_next.iter().any(|l| {
+        let VkImageFormatProperties2Next::VkExternalImageFormatProperties(p) = l else {
+            return false;
+        };
+        let features = p.external_memory_properties.external_memory_features;
+        let want = policy::MEMORY_FEATURE_EXPORTABLE | policy::MEMORY_FEATURE_IMPORTABLE;
+        features & want == want && features & policy::MEMORY_FEATURE_DEDICATED_ONLY == 0
+    })
 }
 
 /// Whether an image of `info` is inside what the host's own
@@ -1777,18 +2201,25 @@ pub(super) fn image_limits_hold<H: HostVulkan>(
 }
 
 /// The checks `vkCreateImage` gets before the driver sees its create info,
-/// on a device that did (`dma_buf`) or did not enable the emulated dma-buf
-/// external memory. Answers whether the image is created for `DMA_BUF`
-/// export (stage 5c) — which Zink asks for every shared image, whatever the
-/// image-format query said (`zink_resource.c:1336-1340`, `:1504`, `OPAQUE_FD`
-/// rewritten to `DMA_BUF` by Mesa's venus): it is created as any image is,
-/// and an export of its memory succeeds exactly when that memory is ours.
+/// on a device under `rules`. Answers whether the image is created for
+/// `DMA_BUF` export (stage 5c) — which Zink asks for every shared image,
+/// whatever the image-format query said (`zink_resource.c:1336-1340`,
+/// `:1504`, `OPAQUE_FD` rewritten to `DMA_BUF` by Mesa's venus): it is
+/// created as any image is, and an export of its memory succeeds exactly
+/// when that memory is ours — and whether it is a DRM-modifier image (stage
+/// S1), whose modifier must be `DRM_FORMAT_MOD_LINEAR`, named by exactly one
+/// of a list and an explicit create info (`VUID-VkImageCreateInfo-tiling-02261`,
+/// `-pNext-02262`), the explicit one of one plane with a zero size, array
+/// pitch and depth pitch (`VUID-VkImageDrmFormatModifierExplicitCreateInfoEXT-size-02267`
+/// and the two after it).
 pub(super) fn check_image_create_info(
     command: &'static str,
     info: &VkImageCreateInfo,
     guest: &GuestDevice,
-    dma_buf: bool,
-) -> Result<bool, ExecError> {
+    rules: ImageRules,
+) -> Result<ImageCheck, ExecError> {
+    let drm_tiling =
+        rules.drm_modifier && info.tiling == modifier::IMAGE_TILING_DRM_FORMAT_MODIFIER;
     if info.flags & !policy::IMAGE_CREATE_CORE != 0 || info.flags & policy::IMAGE_CREATE_SPARSE != 0
     {
         return Err(invalid(command, format!("flags {:#x}", info.flags)));
@@ -1802,7 +2233,7 @@ pub(super) fn check_image_create_info(
     if info.format == 0
         || !policy::is_core_format(info.format)
         || !policy::is_image_type(info.image_type)
-        || !policy::is_image_tiling(info.tiling)
+        || !(policy::is_image_tiling(info.tiling) || drm_tiling)
         || !policy::is_sharing_mode(info.sharing_mode)
         || !policy::is_sample_count(info.samples)
         || !policy::is_initial_layout(info.initial_layout)
@@ -1835,16 +2266,55 @@ pub(super) fn check_image_create_info(
         }
     }
     let mut external = false;
+    let mut chosen: Vec<ModifierChoice> = Vec::new();
+    let not_linear = |what: &str| {
+        invalid(
+            command,
+            format!(
+                "{what}: DRM_FORMAT_MOD_LINEAR is the only modifier offered, and only for DRM \
+                 format modifier tiling"
+            ),
+        )
+    };
     for link in &info.p_next {
         match link {
             VkImageCreateInfoNext::VkExternalMemoryImageCreateInfo(e) => {
-                external |= external_handle_types(command, e.handle_types, dma_buf)?;
+                external |= external_handle_types(command, e.handle_types, rules.dma_buf)?;
             }
             VkImageCreateInfoNext::VkImageFormatListCreateInfo(l) => {
                 check_view_formats(command, l.p_view_formats.as_deref())?;
             }
             VkImageCreateInfoNext::VkImageStencilUsageCreateInfo(s) => {
                 check_usage(command, s.stencil_usage)?;
+            }
+            VkImageCreateInfoNext::VkImageDrmFormatModifierListCreateInfoEXT(l) => {
+                let list = l.p_drm_format_modifiers.as_deref().unwrap_or_default();
+                if !drm_tiling
+                    || list.is_empty()
+                    || list.iter().any(|m| *m != modifier::DRM_FORMAT_MOD_LINEAR)
+                {
+                    return Err(not_linear("a modifier list"));
+                }
+                chosen.push(ModifierChoice::List);
+            }
+            VkImageCreateInfoNext::VkImageDrmFormatModifierExplicitCreateInfoEXT(e) => {
+                let planes = e.p_plane_layouts.as_deref().unwrap_or_default();
+                if !drm_tiling || e.drm_format_modifier != modifier::DRM_FORMAT_MOD_LINEAR {
+                    return Err(not_linear("an explicit modifier"));
+                }
+                let [plane] = planes else {
+                    return Err(invalid(
+                        command,
+                        "an explicit LINEAR modifier of other than one plane",
+                    ));
+                };
+                if plane.size != 0 || plane.array_pitch != 0 || plane.depth_pitch != 0 {
+                    return Err(invalid(
+                        command,
+                        "an explicit plane layout with a size, array pitch or depth pitch",
+                    ));
+                }
+                chosen.push(ModifierChoice::Explicit(plane.clone()));
             }
             other => {
                 return Err(unimplemented_link(
@@ -1855,5 +2325,16 @@ pub(super) fn check_image_create_info(
             }
         }
     }
-    Ok(external)
+    let modifier = match (drm_tiling, chosen.len()) {
+        (false, _) => None,
+        (true, 1) => chosen.pop(),
+        (true, _) => {
+            return Err(invalid(
+                command,
+                "DRM format modifier tiling needs exactly one of a modifier list and an \
+                 explicit modifier",
+            ))
+        }
+    };
+    Ok(ImageCheck { external, modifier })
 }

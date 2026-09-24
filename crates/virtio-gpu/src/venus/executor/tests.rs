@@ -901,17 +901,16 @@ fn a_decodable_command_without_a_handler_is_refused_as_not_implemented() {
 
 #[test]
 fn a_chained_structure_this_stage_does_not_implement_is_fatal_and_never_reaches_the_host() {
-    let drm = || {
-        VkImageCreateInfoNext::VkImageDrmFormatModifierListCreateInfoEXT(
-            VkImageDrmFormatModifierListCreateInfoEXT {
-                drm_format_modifier_count: 1,
-                p_drm_format_modifiers: Some(vec![0]),
-            },
-        )
+    // Opaque capture data, which no admitted extension brings:
+    // until stage S1 this was a DRM modifier list, which is admitted now.
+    let capture = || {
+        VkImageCreateInfoNext::VkOpaqueCaptureDataCreateInfoEXT(VkOpaqueCaptureDataCreateInfoEXT {
+            p_data: None,
+        })
     };
     // It decodes: the protocol admits it in VkImageCreateInfo's chain.
     let info = VkImageCreateInfo {
-        p_next: vec![drm()],
+        p_next: vec![capture()],
         ..image_info()
     };
     let bytes = call_bytes(&create_image(DEVICE, IMAGE, info.clone()));
@@ -925,8 +924,8 @@ fn a_chained_structure_this_stage_does_not_implement_is_fatal_and_never_reaches_
         Err(super::ExecError::UnimplementedLink {
             command: "vkCreateImage",
             parent: "VkImageCreateInfo",
-            stype: VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
-            name: "VkImageDrmFormatModifierListCreateInfoEXT",
+            stype: VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT,
+            name: "VkOpaqueCaptureDataCreateInfoEXT",
         })
     );
 
@@ -1067,9 +1066,15 @@ fn the_links_admitted_are_the_bring_up_ones_and_the_admitted_extensions_structur
             "VkPhysicalDeviceProvokingVertexPropertiesEXT",
         ])
     );
+    // Stage S1: the emulated VK_EXT_image_drm_format_modifier's structures,
+    // answered by the executor itself.
     assert_eq!(
         admitted_names::<VkFormatProperties2Next>(),
-        ["VkFormatProperties3"]
+        sorted(vec![
+            "VkFormatProperties3",
+            "VkDrmFormatModifierPropertiesListEXT",
+            "VkDrmFormatModifierPropertiesList2EXT",
+        ])
     );
     assert_eq!(
         admitted_names::<VkPhysicalDeviceImageFormatInfo2Next>(),
@@ -1077,6 +1082,7 @@ fn the_links_admitted_are_the_bring_up_ones_and_the_admitted_extensions_structur
             "VkPhysicalDeviceExternalImageFormatInfo",
             "VkImageFormatListCreateInfo",
             "VkImageStencilUsageCreateInfo",
+            "VkPhysicalDeviceImageDrmFormatModifierInfoEXT",
         ])
     );
     assert_eq!(
@@ -1096,6 +1102,8 @@ fn the_links_admitted_are_the_bring_up_ones_and_the_admitted_extensions_structur
             "VkExternalMemoryImageCreateInfo",
             "VkImageFormatListCreateInfo",
             "VkImageStencilUsageCreateInfo",
+            "VkImageDrmFormatModifierListCreateInfoEXT",
+            "VkImageDrmFormatModifierExplicitCreateInfoEXT",
         ])
     );
     assert_eq!(

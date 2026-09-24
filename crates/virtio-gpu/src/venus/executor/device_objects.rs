@@ -235,6 +235,45 @@ fn stipple_factor_ok(factor: u32) -> bool {
     (1..=256).contains(&factor)
 }
 
+/// Every `(src, dst)` queue family pair of a 1.0 barrier command's buffer
+/// and image barriers.
+fn barrier_families(
+    buffers: Option<&[crate::venus::protocol::VkBufferMemoryBarrier]>,
+    images: Option<&[crate::venus::protocol::VkImageMemoryBarrier]>,
+) -> Vec<(u32, u32)> {
+    let buffers = buffers
+        .unwrap_or_default()
+        .iter()
+        .map(|b| (b.src_queue_family_index, b.dst_queue_family_index));
+    let images = images
+        .unwrap_or_default()
+        .iter()
+        .map(|b| (b.src_queue_family_index, b.dst_queue_family_index));
+    buffers.chain(images).collect()
+}
+
+/// [`barrier_families`] of sync2 dependency infos.
+fn dependency_families<'a>(
+    infos: impl Iterator<Item = &'a crate::venus::protocol::VkDependencyInfo>,
+) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for info in infos {
+        out.extend(
+            info.p_buffer_memory_barriers
+                .iter()
+                .flatten()
+                .map(|b| (b.src_queue_family_index, b.dst_queue_family_index)),
+        );
+        out.extend(
+            info.p_image_memory_barriers
+                .iter()
+                .flatten()
+                .map(|b| (b.src_queue_family_index, b.dst_queue_family_index)),
+        );
+    }
+    out
+}
+
 fn ranges_overflow(offset: u64, size: u64, total: u64) -> bool {
     offset.checked_add(size).is_none_or(|end| end > total)
 }
@@ -1325,9 +1364,108 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.pass_through(command)
             }
 
+            // ------------- barriers: queue family ownership (stage S1)
+            Command::CmdPipelineBarrier(args) => {
+                const NAME: &str = "vkCmdPipelineBarrier";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                let pairs = barrier_families(
+                    args.p_buffer_memory_barriers.as_deref(),
+                    args.p_image_memory_barriers.as_deref(),
+                );
+                self.check_families(NAME, device, &pairs, false)?;
+                self.pass_through(command)
+            }
+            Command::CmdWaitEvents(args) => {
+                const NAME: &str = "vkCmdWaitEvents";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                let pairs = barrier_families(
+                    args.p_buffer_memory_barriers.as_deref(),
+                    args.p_image_memory_barriers.as_deref(),
+                );
+                self.check_families(NAME, device, &pairs, false)?;
+                self.pass_through(command)
+            }
+            Command::CmdPipelineBarrier2(args) => {
+                const NAME: &str = "vkCmdPipelineBarrier2";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                let pairs = dependency_families(args.p_dependency_info.iter());
+                self.check_families(NAME, device, &pairs, false)?;
+                self.pass_through(command)
+            }
+            Command::CmdWaitEvents2(args) => {
+                const NAME: &str = "vkCmdWaitEvents2";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                let pairs = dependency_families(args.p_dependency_infos.iter().flatten());
+                self.check_families(NAME, device, &pairs, false)?;
+                self.pass_through(command)
+            }
+            Command::CmdSetEvent2(args) => {
+                const NAME: &str = "vkCmdSetEvent2";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                let pairs = dependency_families(args.p_dependency_info.iter());
+                // A set transfers nothing: its barriers' two families are
+                // equal (`VUID-vkCmdSetEvent2-srcQueueFamilyIndex-03842`).
+                self.check_families(NAME, device, &pairs, true)?;
+                self.pass_through(command)
+            }
+
             other if generated::is_pass_through(other) => self.pass_through(other),
             other => self.dispatch_extension(other),
         }
+    }
+
+    /// The queue family indices of a command's buffer and image barriers
+    /// (stage S1), each `(src, dst)` pair judged before the driver indexes
+    /// its per-family state by them: a family of the device, or
+    /// `VK_QUEUE_FAMILY_IGNORED`, or `VK_QUEUE_FAMILY_EXTERNAL` (core 1.1), or
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` on a device that enabled
+    /// `VK_EXT_queue_family_foreign` (`VUID-VkImageMemoryBarrier-srcQueueFamilyIndex-09100`
+    /// and its twins) — never a transfer between the two external ones
+    /// (`-04065`), and with `equal`, no transfer at all. Before stage S1 the
+    /// barriers were passed through unjudged: an out-of-range family was the
+    /// driver's to survive.
+    ///
+    /// # Errors
+    /// Fatal, as a value no correct guest sends.
+    fn check_families(
+        &self,
+        command: &'static str,
+        device: u64,
+        pairs: &[(u32, u32)],
+        equal: bool,
+    ) -> Result<(), ExecError> {
+        use super::policy::{QUEUE_FAMILY_EXTERNAL, QUEUE_FAMILY_FOREIGN, QUEUE_FAMILY_IGNORED};
+        let (object, guest) = self
+            .objects
+            .device_and_guest(device)
+            .map_err(id_error(command))?;
+        let foreign = object.enabled(super::policy::QUEUE_FAMILY_FOREIGN_EXT);
+        let named = |f: u32| {
+            f == QUEUE_FAMILY_IGNORED
+                || f == QUEUE_FAMILY_EXTERNAL
+                || (foreign && f == QUEUE_FAMILY_FOREIGN)
+                || guest.has_family(f)
+        };
+        let external = |f: u32| f == QUEUE_FAMILY_EXTERNAL || f == QUEUE_FAMILY_FOREIGN;
+        for &(src, dst) in pairs {
+            if !named(src) || !named(dst) {
+                return Err(invalid(
+                    command,
+                    format!(
+                        "queue family indices {src:#x} -> {dst:#x}: each must be one of the \
+                         device's families, IGNORED, EXTERNAL, or FOREIGN on a device that \
+                         enabled VK_EXT_queue_family_foreign"
+                    ),
+                ));
+            }
+            if src != dst && (external(src) && external(dst) || equal) {
+                return Err(invalid(
+                    command,
+                    format!("an ownership transfer {src:#x} -> {dst:#x} the command cannot make"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------ the three steps

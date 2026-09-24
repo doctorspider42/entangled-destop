@@ -888,7 +888,15 @@ fn dma_buf_buffer_queries_answer_for_our_pages_and_nothing_else() {
         answer(&mut h, dma_buf, 0x3),
         policy::external_memory_properties(true)
     );
+    // Stage S1: a buffer our pages cannot hold is still shareable where the
+    // host exports device-local memory for it — and nothing where neither.
     host.buffer_imports
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        answer(&mut h, dma_buf, 0x3),
+        policy::external_memory_properties(true)
+    );
+    host.buffer_exports
         .store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         answer(&mut h, dma_buf, 0x3),
@@ -1098,13 +1106,16 @@ fn properties_of(h: &mut Harness<FakeVulkan>, resource_id: u32) -> (i32, u32, u6
 }
 
 #[test]
-fn an_export_of_our_pages_is_a_blob_and_one_of_device_local_memory_is_not() {
+fn an_export_of_our_pages_is_a_page_blob_and_one_of_device_local_memory_a_handle_blob() {
     let (mut h, host) = zink();
     let pages = export(&mut h);
     assert_eq!(pages.mapped_len(), SIZE);
     assert!(!h.fatal());
-    // Device-local: allocated, and its blob refused — the guest's
-    // vkAllocateMemory then fails in Vulkan terms and frees it.
+    // Device-local: stage 5c refused its blob (no pages to share); on a
+    // host that exports device-local memory (this one has
+    // VK_KHR_external_memory_win32) it is a handle blob since stage S1 —
+    // made, and never mapped. The refusal on a host that cannot export is
+    // `s1_tests::a_device_local_export_without_a_handle_capable_host_is_refused_as_before`.
     h.send(&allocate(
         DEVICE,
         0x701,
@@ -1113,10 +1124,12 @@ fn an_export_of_our_pages_is_a_blob_and_one_of_device_local_memory_is_not() {
         vec![export_info()],
     ))
     .expect("the allocation itself");
-    assert!(
-        h.memory_blob(CTX, 71, 0x701, SIZE).is_err(),
-        "no pages to share"
-    );
+    h.memory_blob(CTX, 71, 0x701, SIZE)
+        .expect("a handle blob of device-local memory");
+    assert!(h.renderer.map_blob(71, MAP_AT + SIZE, SIZE).is_err());
+    assert_eq!(host.live_shared_handles(), 1);
+    h.renderer.destroy_blob(71);
+    assert_eq!(host.live_shared_handles(), 0);
     h.send(&free(DEVICE, 0x701)).expect("the guest frees it");
     assert!(!h.fatal());
     // Another handle type is VK_ERROR_INVALID_EXTERNAL_HANDLE: the memory is

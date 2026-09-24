@@ -38,6 +38,14 @@
 //!   and [`HostVulkan::free_memory`] drops it only after `vkFreeMemory` has
 //!   returned (and after the device went idle), so the driver never holds a
 //!   pointer into pages that have been freed.
+//! * **Exported handles are owned once** (stage S1, Windows only). Exportable
+//!   device-local memory is allocated `OPAQUE_WIN32` on a device created with
+//!   `VK_KHR_external_memory_win32`; `vkGetMemoryWin32HandleKHR` hands this
+//!   process an NT handle, which [`SharedMemoryHandle`] owns and closes on
+//!   drop, and an import (`VkImportMemoryWin32HandleInfoKHR`) only reads it
+//!   during the call — the import references the payload itself. Off Windows
+//!   no device enables the extension, and every export or import is refused
+//!   before a driver sees it.
 //!
 //! # Stage 5b.2: the generated calls
 //!
@@ -64,7 +72,7 @@ use ash::vk::{self, Handle};
 
 use crate::venus::executor::host::{
     CallError, Dedicated, DeviceRequest, HostDeviceInfo, HostGroup, HostVulkan, ImageBind,
-    InstanceRequest, MemoryRequest, RawHandle,
+    InstanceRequest, MemoryRequest, RawHandle, ResourceMemory,
 };
 use crate::venus::executor::objects::Kind;
 use crate::venus::executor::policy::{has_extension, EXTERNAL_MEMORY_HOST};
@@ -98,9 +106,14 @@ const MAX_IMPORT_ALIGNMENT: u64 = 2 << 20;
 const HOST_ALLOCATION: vk::ExternalMemoryHandleTypeFlags =
     vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
 
+/// The handle type exportable device-local memory is exported and imported
+/// as (stage S1): an NT handle, on Windows only.
+const OPAQUE_WIN32: vk::ExternalMemoryHandleTypeFlags =
+    vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32;
+
 /// A host `VkDevice`, and what calling it needs beyond `ash`'s table: its
 /// instance and physical device (for the external-memory queries a resource
-/// is created by) and the one extension entry point the renderer calls.
+/// is created by) and the extension entry points the renderer calls.
 pub struct HostDevice {
     device: ash::Device,
     instance: ash::Instance,
@@ -108,6 +121,10 @@ pub struct HostDevice {
     /// `vkGetMemoryHostPointerPropertiesEXT`, resolved from the device (the
     /// renderer enables `VK_EXT_external_memory_host` on every one).
     host_pointer_properties: Option<vk::PFN_vkGetMemoryHostPointerPropertiesEXT>,
+    /// `vkGetMemoryWin32HandleKHR`, resolved from a device created with
+    /// `VK_KHR_external_memory_win32` (stage S1): `None` everywhere else,
+    /// and a device-local export is then refused.
+    memory_win32_handle: Option<vk::PFN_vkGetMemoryWin32HandleKHR>,
     /// The entry points of the admitted extensions the device was created
     /// with (stage 5c), resolved from it: what their commands are called
     /// through.
@@ -119,6 +136,34 @@ pub struct HostDevice {
 pub struct HostMemory {
     memory: vk::DeviceMemory,
     pages: Option<Arc<RingPages>>,
+}
+
+/// An owned NT handle to exportable device-local memory (stage S1), from
+/// `vkGetMemoryWin32HandleKHR(OPAQUE_WIN32)`. It references the allocation's
+/// payload by itself, so the exporting memory, device and instance may all
+/// go first; an import made from it references the payload too, so it may
+/// be closed right after. Closed on drop (`CloseHandle`: an NT handle's
+/// import does not take ownership of it). Never made off Windows.
+#[derive(Debug)]
+pub struct SharedMemoryHandle {
+    handle: vk::HANDLE,
+}
+
+impl Drop for SharedMemoryHandle {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::{CloseHandle, HANDLE};
+            // SAFETY: `handle` is the NT handle `vkGetMemoryWin32HandleKHR`
+            // returned to this process, owned by this value alone (it is
+            // never copied out, and an import only reads it during its
+            // `vkAllocateMemory`), and closed exactly once, here.
+            let closed = unsafe { CloseHandle(HANDLE(self.handle as *mut c_void)) };
+            if let Err(error) = closed {
+                tracing::warn!(%error, "an exported memory handle could not be closed");
+            }
+        }
+    }
 }
 
 /// The host's Vulkan loader. See the module docs.
@@ -291,6 +336,7 @@ impl HostVulkan for AshVulkan {
     type Buffer = vk::Buffer;
     type BufferView = vk::BufferView;
     type ImageView = vk::ImageView;
+    type SharedMemory = SharedMemoryHandle;
 
     fn instance_version(&self) -> Result<u32, VkResult> {
         // SAFETY: a global command with no arguments but the out value.
@@ -622,6 +668,34 @@ impl HostVulkan for AshVulkan {
             .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
     }
 
+    fn buffer_exportable(
+        &self,
+        instance: &ash::Instance,
+        device: vk::PhysicalDevice,
+        flags: u32,
+        usage: u32,
+    ) -> bool {
+        if !cfg!(windows) {
+            // No NT handles to export: refused cleanly, never asked.
+            return false;
+        }
+        let info = vk::PhysicalDeviceExternalBufferInfo::default()
+            .flags(vk::BufferCreateFlags::from_raw(flags))
+            .usage(vk::BufferUsageFlags::from_raw(usage))
+            .handle_type(OPAQUE_WIN32);
+        let mut out = vk::ExternalBufferProperties::default();
+        // SAFETY: `device` is ours; flags and usage were checked against what
+        // the device may create; `info` and `out` are locals; a core 1.1
+        // entry point of an instance made at 1.3.
+        unsafe {
+            instance.get_physical_device_external_buffer_properties(device, &info, &mut out);
+        }
+        let features = out.external_memory_properties.external_memory_features;
+        features.contains(
+            vk::ExternalMemoryFeatureFlags::EXPORTABLE | vk::ExternalMemoryFeatureFlags::IMPORTABLE,
+        ) && !features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY)
+    }
+
     fn create_device(
         &self,
         instance: &ash::Instance,
@@ -696,11 +770,42 @@ impl HostVulkan for AshVulkan {
         let ext = calls::ExtTables::load(instance, &created, &|name| {
             request.extensions.iter().any(|e| e == name)
         });
+        // Stage S1: only a device created with the extension has the entry
+        // point, and only on Windows is its handle a thing this process can
+        // own and close.
+        let win32 = cfg!(windows)
+            && request
+                .extensions
+                .iter()
+                .any(|e| e == crate::venus::executor::policy::EXTERNAL_MEMORY_WIN32);
+        let memory_win32_handle = if win32 {
+            // SAFETY: `created` is a live device made with
+            // `VK_KHR_external_memory_win32` enabled, and the name is a
+            // NUL-terminated literal.
+            let raw = unsafe {
+                instance
+                    .get_device_proc_addr(created.handle(), c"vkGetMemoryWin32HandleKHR".as_ptr())
+            };
+            raw.map(|raw| {
+                // SAFETY: the loader returned this pointer for exactly this
+                // entry point, whose C signature `PFN_vkGetMemoryWin32HandleKHR`
+                // is; both are `extern "system"` function pointers of one ABI.
+                unsafe {
+                    std::mem::transmute::<
+                        unsafe extern "system" fn(),
+                        vk::PFN_vkGetMemoryWin32HandleKHR,
+                    >(raw)
+                }
+            })
+        } else {
+            None
+        };
         Ok(HostDevice {
             device: created,
             instance: instance.clone(),
             physical: device,
             host_pointer_properties,
+            memory_win32_handle,
             ext,
         })
     }
@@ -778,9 +883,9 @@ impl HostVulkan for AshVulkan {
         &self,
         device: &HostDevice,
         info: &VkImageCreateInfo,
-        host_memory: bool,
+        memory: ResourceMemory,
     ) -> Result<vk::Image, VkResult> {
-        with_image_create_info(info, host_memory, |create| {
+        with_image_create_info(info, memory, |create| {
             // SAFETY: `device` is ours; every field was range-checked and the
             // image checked against the host's own format limits; the create
             // info, its chain and its slices are locals of the helper that
@@ -822,13 +927,13 @@ impl HostVulkan for AshVulkan {
         &self,
         device: &HostDevice,
         info: &VkImageCreateInfo,
-        host_memory: bool,
+        memory: ResourceMemory,
         plane: Option<VkImageAspectFlagBits>,
         out: &mut VkMemoryRequirements2,
     ) {
         let aspect =
             vk::ImageAspectFlags::from_raw(plane.and_then(|p| u32::try_from(p).ok()).unwrap_or(0));
-        let _ = with_image_create_info(info, host_memory, |create| {
+        let _ = with_image_create_info(info, memory, |create| {
             let query = vk::DeviceImageMemoryRequirements::default()
                 .create_info(create)
                 .plane_aspect(aspect);
@@ -988,12 +1093,25 @@ impl HostVulkan for AshVulkan {
     fn allocate_memory(
         &self,
         device: &HostDevice,
-        request: &MemoryRequest<vk::Buffer, vk::Image>,
+        request: &MemoryRequest<vk::Buffer, vk::Image, SharedMemoryHandle>,
     ) -> Result<HostMemory, VkResult> {
+        let win32 = device.memory_win32_handle.is_some();
+        if (request.export_handle || request.import_handle.is_some()) && !win32 {
+            // A device that cannot export cannot import either (stage S1).
+            return Err(VK_ERROR_FEATURE_NOT_PRESENT);
+        }
         let mut import = request.import.as_ref().map(|pages| {
             vk::ImportMemoryHostPointerInfoEXT::default()
                 .handle_type(HOST_ALLOCATION)
                 .host_pointer(pages.as_ptr().cast::<c_void>())
+        });
+        let mut export_handle = request
+            .export_handle
+            .then(|| vk::ExportMemoryAllocateInfo::default().handle_types(OPAQUE_WIN32));
+        let mut import_handle = request.import_handle.as_ref().map(|shared| {
+            vk::ImportMemoryWin32HandleInfoKHR::default()
+                .handle_type(OPAQUE_WIN32)
+                .handle(shared.handle)
         });
         let mut flags = request.flags.map(|(flags, mask)| {
             vk::MemoryAllocateFlagsInfo::default()
@@ -1016,6 +1134,12 @@ impl HostVulkan for AshVulkan {
         if let Some(d) = dedicated.as_mut() {
             info = info.push_next(d);
         }
+        if let Some(e) = export_handle.as_mut() {
+            info = info.push_next(e);
+        }
+        if let Some(i) = import_handle.as_mut() {
+            info = info.push_next(i);
+        }
         // SAFETY: `device` is ours; the type index, size, flags and dedicated
         // resource were checked by the executor. For an import, the pointer
         // is the base of `pages`, aligned to `minImportedHostPointerAlignment`
@@ -1023,8 +1147,13 @@ impl HostVulkan for AshVulkan {
         // long, and the executor asked `vkGetMemoryHostPointerPropertiesEXT`
         // that the type accepts it. Those pages outlive the import: the
         // `HostMemory` built below holds an `Arc` of them, which
-        // `free_memory` releases only after `vkFreeMemory` has returned.
-        // Every chained structure is a local that outlives the call.
+        // `free_memory` releases only after `vkFreeMemory` has returned. An
+        // export (stage S1) is of `OPAQUE_WIN32` on a device created with
+        // `VK_KHR_external_memory_win32` (checked above); an import of one
+        // is of a live NT handle the request's `Arc` keeps open for the call,
+        // exported by a device of the same GPU and driver (the executor
+        // compared their UUIDs), at the export's own size and type. Every
+        // chained structure is a local that outlives the call.
         let memory = unsafe { device.device.allocate_memory(&info, None) }.map_err(result_code)?;
         Ok(HostMemory {
             memory,
@@ -1047,6 +1176,34 @@ impl HostVulkan for AshVulkan {
         unsafe { device.device.free_memory(memory.memory, None) };
         // Only now may the imported pages go (if this was their last holder).
         drop(memory.pages);
+    }
+
+    fn export_memory_handle(
+        &self,
+        device: &HostDevice,
+        memory: &HostMemory,
+    ) -> Result<SharedMemoryHandle, VkResult> {
+        let Some(get) = device.memory_win32_handle else {
+            return Err(VK_ERROR_FEATURE_NOT_PRESENT);
+        };
+        let info = vk::MemoryGetWin32HandleInfoKHR::default()
+            .memory(memory.memory)
+            .handle_type(OPAQUE_WIN32);
+        let mut handle: vk::HANDLE = 0;
+        // SAFETY: `get` is the device's own entry point; `memory` was
+        // allocated on `device` with `VkExportMemoryAllocateInfo{OPAQUE_WIN32}`
+        // (the executor asks only of such memory); `info` and `handle` are
+        // locals of the right types that outlive the call. The NT handle
+        // written is this process's, and owned from here by the value made
+        // of it, which closes it.
+        let result = unsafe { get(device.device.handle(), &info, &mut handle) };
+        if result != vk::Result::SUCCESS {
+            return Err(result_code(result));
+        }
+        if handle == 0 {
+            return Err(VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        }
+        Ok(SharedMemoryHandle { handle })
     }
 
     fn memory_commitment(&self, device: &HostDevice, memory: &HostMemory) -> u64 {
@@ -1077,9 +1234,9 @@ impl HostVulkan for AshVulkan {
         &self,
         device: &HostDevice,
         info: &VkBufferCreateInfo,
-        host_memory: bool,
+        memory: ResourceMemory,
     ) -> Result<vk::Buffer, VkResult> {
-        with_buffer_create_info(info, host_memory, |create| {
+        with_buffer_create_info(info, memory, |create| {
             // SAFETY: `device` is ours; every field was checked; the create
             // info and its chain are locals of the helper that outlive the
             // call.
@@ -1110,10 +1267,10 @@ impl HostVulkan for AshVulkan {
         &self,
         device: &HostDevice,
         info: &VkBufferCreateInfo,
-        host_memory: bool,
+        memory: ResourceMemory,
         out: &mut VkMemoryRequirements2,
     ) {
-        let _ = with_buffer_create_info(info, host_memory, |create| {
+        let _ = with_buffer_create_info(info, memory, |create| {
             let query = vk::DeviceBufferMemoryRequirements::default().create_info(create);
             with_requirements(out, |head| {
                 // SAFETY: the executor asks this only of a device of Vulkan
@@ -1275,17 +1432,26 @@ fn with_requirements(
     }
 }
 
+/// The `VkExternalMemory*CreateInfo::handleTypes` of a resource created for
+/// `memory`, if it gets one.
+fn handle_types(memory: ResourceMemory) -> Option<vk::ExternalMemoryHandleTypeFlags> {
+    match memory {
+        ResourceMemory::Plain => None,
+        ResourceMemory::HostPages => Some(HOST_ALLOCATION),
+        ResourceMemory::Handle => Some(OPAQUE_WIN32),
+    }
+}
+
 /// Build the `ash` create info of a checked `VkImageCreateInfo` — with a
-/// `VkExternalMemoryImageCreateInfo` for host allocations when
-/// `host_memory` — and run `f` on it while every structure it points at is
-/// alive.
+/// `VkExternalMemoryImageCreateInfo` of `memory`'s handle type — and run `f`
+/// on it while every structure it points at is alive.
 ///
 /// # Errors
 /// `VK_ERROR_INITIALIZATION_FAILED` for a link the executor does not admit
 /// (it refuses those first; one reaching here is not built).
 fn with_image_create_info<T>(
     info: &VkImageCreateInfo,
-    host_memory: bool,
+    memory: ResourceMemory,
     f: impl FnOnce(&vk::ImageCreateInfo<'_>) -> T,
 ) -> Result<T, VkResult> {
     let families: Vec<u32> = info.p_queue_family_indices.clone().unwrap_or_default();
@@ -1294,7 +1460,8 @@ fn with_image_create_info<T>(
     for link in &info.p_next {
         match link {
             // The guest's is empty or the emulated `DMA_BUF` (stage 5c), which
-            // on this host is our pages: ours replaces it.
+            // on this host is our pages or (stage S1) an NT handle: ours
+            // replaces it.
             VkImageCreateInfoNext::VkExternalMemoryImageCreateInfo(_) => {}
             VkImageCreateInfoNext::VkImageFormatListCreateInfo(l) => {
                 list = Some(
@@ -1312,8 +1479,8 @@ fn with_image_create_info<T>(
             _ => return Err(VK_ERROR_INITIALIZATION_FAILED),
         }
     }
-    let mut external = host_memory
-        .then(|| vk::ExternalMemoryImageCreateInfo::default().handle_types(HOST_ALLOCATION));
+    let mut external =
+        handle_types(memory).map(|h| vk::ExternalMemoryImageCreateInfo::default().handle_types(h));
     let mut list_info = list
         .as_deref()
         .map(|formats| vk::ImageFormatListCreateInfo::default().view_formats(formats));
@@ -1352,7 +1519,7 @@ fn with_image_create_info<T>(
 /// As there.
 fn with_buffer_create_info<T>(
     info: &VkBufferCreateInfo,
-    host_memory: bool,
+    memory: ResourceMemory,
     f: impl FnOnce(&vk::BufferCreateInfo<'_>) -> T,
 ) -> Result<T, VkResult> {
     let families: Vec<u32> = info.p_queue_family_indices.clone().unwrap_or_default();
@@ -1366,8 +1533,8 @@ fn with_buffer_create_info<T>(
             _ => return Err(VK_ERROR_INITIALIZATION_FAILED),
         }
     }
-    let mut external = host_memory
-        .then(|| vk::ExternalMemoryBufferCreateInfo::default().handle_types(HOST_ALLOCATION));
+    let mut external =
+        handle_types(memory).map(|h| vk::ExternalMemoryBufferCreateInfo::default().handle_types(h));
     let mut create = vk::BufferCreateInfo::default()
         .flags(vk::BufferCreateFlags::from_raw(info.flags))
         .size(info.size)

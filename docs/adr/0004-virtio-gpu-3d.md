@@ -3010,3 +3010,257 @@ is not the node libdrm describes. The next question is which device the
 software-rendered GNOME compositor hands its clients through `linux-dmabuf`.
 The durable answer is GNOME itself on the GPU, which is the next stage in any
 case.
+
+## Amendment, 2026-09-24 — stage S1 of "GNOME on the GPU": shared device-local memory, LINEAR modifiers, foreign queues, exportable sync files
+
+GNOME's compositor, Mutter, draws through GBM on `card0`. With Zink forced
+in its place (a driconf `dri_driver=zink` entry), four things stood between
+this renderer and a GPU-composited desktop. Each was read from Mesa 26.0.8,
+Mutter 50.1 and Linux 7.0, and each citation below was checked:
+
+1. **No `VK_EXT_queue_family_foreign`.** Zink's dma-buf capability needs it
+   (`zink_screen.c:1128-1133`). Without that capability GBM has no export
+   (`gbm_dri.c:1242-1247`), so it makes every `gbm_bo` a dumb buffer
+   (`:902-903`). The host has the extension; policy did not pass it through.
+2. **No `VK_EXT_image_drm_format_modifier`.** Mutter asks for scanout
+   surfaces without modifiers, because the virtio kernel driver offers no
+   `IN_FORMATS`. Zink therefore makes them optimal and not exportable. At
+   export it rebuilds each one as a DRM-modifier image with the list
+   `[LINEAR]` and copies into it (`zink_resource.c:1744-1768`). Asking the
+   exported handle for its stride needs the extension too (`:1958-1964`,
+   `zink_resource_get_param`).
+3. **Memory.** Zink places every non-staging image in device-local memory
+   (`zink_resource.c:1443-1446`) and fails when no type matches
+   (`:1047-1076`). Stage 5c's dma-buf existed only in our pages. Those are not
+   device-local. On the RTX 2070 an optimal image cannot live in them, and a
+   linear one cannot be a colour attachment in any scanout format (measured,
+   below). So every export was refused.
+4. **Fences.** `EGL_ANDROID_native_fence_sync` needs the guest's
+   `VK_KHR_external_semaphore_fd`. Venus offers that extension only when a
+   `SYNC_FD` semaphore is also exportable (`vn_physical_device.c:1173-1179`).
+   Stage 5b.3 answered "importable" only.
+
+The design that removes all four: **device-local memory that can be exported
+is the dma-buf.** On the host it is `OPAQUE_WIN32` memory, backed by a blob
+with no pages that the guest cannot map. Another context imports it through
+the NT handle. A LINEAR modifier is emulated as one **canonical optimal
+image**, so the exporter's image and the importer's image have the same
+layout. The code is `venus/executor/{memory,modifier}.rs`,
+`host_vulkan/mod.rs` and `venus/renderer.rs`.
+
+### What the guest is shown
+
+| extension | how | when |
+|---|---|---|
+| `VK_EXT_queue_family_foreign` | passed through, and enabled on the host device | the host has it, **and** device-local memory can be exported, **and** the dma-buf pair is shown |
+| `VK_EXT_image_drm_format_modifier` (spec 2) | **emulated**: stripped from the host's device create, answered by the executor | the same condition |
+| `VK_KHR_external_semaphore_fd` | emulated as before, and now `EXPORTABLE` (`policy::SYNC_FD_EXPORTABLE`) | always |
+| `VK_KHR_external_memory_win32` | host-only: enabled on every host device that has it, never shown to the guest | — |
+
+"Device-local memory can be exported" is `GuestDevice::memory_export`. It
+means the host lists `VK_KHR_external_memory_win32` and reports the
+`deviceUUID`/`driverUUID` that an import is checked against. A Linux host
+never meets this condition: its drivers have no `OPAQUE_WIN32`, and
+`AshVulkan` resolves the Win32 entry point only under `cfg!(windows)`. A
+Linux host therefore gets neither extension, and GBM keeps its dumb
+buffers. Showing the extensions there would turn every GBM allocation into
+a failing export. The capset mask gains bit 159: without that bit the
+guest's encoder drops the modifier structures. It gains no bit for
+queue-family-foreign, which chains no structure. That brings the mask to 73
+extensions.
+
+### Handle blobs
+
+An export allocation (`VkExportMemoryAllocateInfo{DMA_BUF}`) on a type that
+is not our pages is allocated on the host with
+`VkExportMemoryAllocateInfo{OPAQUE_WIN32}`. Its host size is rounded to a
+blob page. It is **never dedicated on the host**; the guest's own dedication
+is still recorded for its binds. An import of opaque memory must match the
+export's dedication, and neither side can always name the other's image.
+Leaving dedication off both sides makes them agree by construction. The
+canonical image requires a type that is not dedicated-only. A canonical
+image that the host would still want dedicated memory for is refused with
+`VK_ERROR_OUT_OF_DEVICE_MEMORY`.
+
+The blob Mesa makes of that memory straight away (`vn_device_memory_alloc_export`:
+`HOST3D`, `SHAREABLE`, not `MAPPABLE`) is a **handle blob**
+(`ExportedMemory::Handle`). At blob creation the executor calls
+`vkGetMemoryWin32HandleKHR` and keeps the NT handle together with the
+export's type, host size and UUIDs (`memory::HandleExport`), type-erased
+inside the renderer's blob directory. The blob has no pages. The renderer
+refuses `RESOURCE_MAP_BLOB` of it (`VenusError::HandleBlobNotMappable`,
+answered `BlobNotMappable`), and the device layer already refuses to map a
+blob without `MAPPABLE`. Ownership and attachment follow stage 5c's rules
+for page blobs.
+
+**Lifetime.** An NT handle to exported memory references the allocation's
+payload by itself. The exporting memory, its device and its whole context
+may therefore go first, and the blob can still be imported, exactly as a
+dma-buf outlives the process that exported it. An import references the
+payload too, so the blob may go after it. The handle is closed
+(`SharedMemoryHandle`'s `Drop`, `CloseHandle`) when the last `Arc` of it
+goes: the blob's, or an import's that is in progress. Neither closing the
+handle nor an import needs the exporter's device to still exist. That order
+is the real-GPU test below.
+
+**Two deviations from the brief**, both deliberate:
+
+- *The handle is taken when the blob is created, not when it is imported.*
+  If it were taken at import, the exporter's memory would have to outlive
+  every import still to come, and a dma-buf promises the opposite.
+- *A handle blob outlives its context until the guest unrefs the resource*,
+  as a page blob does. The guest kernel frees the resource when the last GEM
+  reference goes. Another process — Mutter, holding a client's buffer — may
+  keep it longer than the client lives. Imported memories go with their
+  context (`destroy_all`). A reset drops every blob and closes every handle.
+
+### Imports (`VkImportMemoryResourceInfoMESA` of a handle blob)
+
+The import must be on a device that enabled dma-buf and can export at all,
+from a context the blob belongs to or is attached to. The importer's
+`deviceUUID` and `driverUUID` must be the exporter's. The type must be the
+export's own; `vkGetMemoryResourcePropertiesMESA` answers exactly that bit,
+with the blob's size. The size must be no more than the blob. The host is
+then handed `VkImportMemoryWin32HandleInfoKHR`, with the export's own
+allocation size and type (an opaque handle type requires both) and without
+dedication. Anything else is `VK_ERROR_INVALID_EXTERNAL_HANDLE`, logged with
+the reason, as vkr answers. On an import, venus passes the application's
+export info through unrewritten (Zink names `OPAQUE_FD | DMA_BUF`). That is
+accepted and ignored: no blob is ever made of an import. Exportable memory
+and imported memory each bind only to a resource created for a host handle
+(`VUID-vkBindImageMemory-memory-02728`, `-02989`, and the buffer
+equivalents). Otherwise the bind is fatal.
+
+### Resources
+
+A buffer or image created for `DMA_BUF` still takes our pages whenever the
+host will import them for it. Those are resources the guest may map, and the
+page-type restriction of `memory::external_type_bits` stays. A `DMA_BUF`
+resource our pages cannot hold is now created for `OPAQUE_WIN32`, provided
+the host answers `EXPORTABLE | IMPORTABLE` and not dedicated-only for it
+(`ResourceMemory::Handle`). Such a resource sees only device-local types.
+Zink's shared optimal images are one example: venus rewrites their
+`OPAQUE_FD` to `DMA_BUF`. `vkGetPhysicalDeviceExternalBufferProperties(DMA_BUF)`
+answers shareable when either kind of memory can hold the buffer.
+
+### The canonical image, and every lie it tells
+
+The module docs of `executor::modifier` are the full account. In short, for
+a scanout format `F` — `B8G8R8A8_UNORM`/`_SRGB`, `R8G8B8A8_UNORM`/`_SRGB`,
+`A2R10G10B10`, `A2B10G10R10` — and an extent `W×H`, the host image is always
+the same:
+
+- 2D, `W×H×1`, one level, one layer, one sample, `OPTIMAL`, `EXCLUSIVE`;
+- `MUTABLE_FORMAT` with the list `[F, F']` when `F` has an sRGB/UNORM twin
+  `F'` (as Zink creates every shareable image of such a format), otherwise
+  no flags;
+- the usage **superset** derived from `F`'s optimal features: transfers,
+  sampled, storage, colour and input attachment. The host is asked for it
+  with `OPAQUE_WIN32` and the list, and storage is dropped if refused (as it
+  is for sRGB on the RTX 2070);
+- `OPAQUE_WIN32` external memory.
+
+The guest's own usage, flags and view formats must fit inside these, or the
+create is fatal. Nothing else it chose reaches the host. An exporter creating
+with `…ListCreateInfoEXT` and an importer creating with
+`…ExplicitCreateInfoEXT` therefore produce byte-identical host create infos.
+The lies:
+
+1. **LINEAR is optimal.** It cannot be observed: nothing can map the memory.
+   A guest that `mmap`s the "LINEAR" dma-buf fails visibly and does not see
+   wrong pixels.
+2. **LINEAR's features are the optimal ones.** They are reported less storage
+   when the superset lost it, and less `DISJOINT`. They are the features the
+   host image really has.
+3. **The plane layout is synthesized.** `MEMORY_PLANE_0` gives offset 0 and
+   `rowPitch = W × 4` rounded up to 256. The size is `rowPitch × H`, which is
+   not the real allocation's size. Instead, memory requirements are raised
+   to at least that size, so the blob is never smaller than the pitch implies,
+   as the guest kernel checks for a framebuffer. An importer's explicit plane
+   must be offset 0 at that same pitch; any other layout is answered
+   `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`.
+4. **The image is mutable, and has usage the guest did not ask for.** Both are
+   supersets.
+5. **Only single-level, single-layer, single-sample, exclusive 2D images.**
+   The format query says so; any other request is refused.
+
+Any other modifier is `VK_ERROR_FORMAT_NOT_SUPPORTED` in the query and fatal
+in a create.
+
+### Barriers with foreign queue families
+
+`vkCmdPipelineBarrier`, `vkCmdPipelineBarrier2`, `vkCmdWaitEvents`,
+`vkCmdWaitEvents2` and `vkCmdSetEvent2` moved from *generated* to
+*hand-written*. Each queue family pair of each buffer or image barrier must
+now be one of: a family of the device, `IGNORED`, `EXTERNAL`, or `FOREIGN`
+on a device that enabled `VK_EXT_queue_family_foreign`. A pair must never be
+a transfer between the two external families (`-04065`). `vkCmdSetEvent2`
+may make no transfer at all (`VUID-vkCmdSetEvent2-srcQueueFamilyIndex-03842`).
+**Before this stage the indices reached the driver unjudged**, and an
+out-of-range family was left for the driver to survive.
+
+### `SYNC_FD`, exportable
+
+The flip is one constant. An application's `vkGetSemaphoreFdKHR` on a
+device-only payload (`vn_queue.c:2440-2495`) becomes `vn_create_sync_file`
+(`:1873-1910`): a virtio-gpu execbuffer on the `ring_idx` of the queue that
+last signalled the semaphore, carrying `vkWaitRingSeqnoMESA`. This renderer
+executes it as a wait for the ring position, then a host fence on that
+queue, retired by the queue's fence thread. `vkWaitSemaphoreResourceMESA`
+follows, which the executor serves as an empty submit that consumes the
+payload. On an imported payload, `vkImportSemaphoreResourceMESA(0)` comes
+first. All of these were served since 5b.3. A fake test now runs them in
+the order Mesa does.
+
+### What Mesa, Zink and GBM will send, and what each becomes
+
+| guest | here |
+|---|---|
+| `vkGetPhysicalDeviceFormatProperties2` + `VkDrmFormatModifierPropertiesListEXT` (capacity 128, `zink_init_format_props`) | one entry, LINEAR, one plane, the optimal features; none for a format that is not a scanout format |
+| `vkGetPhysicalDeviceImageFormatProperties2` + `VkPhysicalDeviceImageDrmFormatModifierInfoEXT` (`check_ici`, `zink_resource.c:335-395`) | the canonical image's host limits at 1/1/1, or `FORMAT_NOT_SUPPORTED` |
+| `vkCreateImage`, DRM tiling, `DMA_BUF` external, `[LINEAR]` list, `MUTABLE` + `[F, F']` (the export rebuild) | the canonical optimal image, created for `OPAQUE_WIN32` |
+| `vkGetImageDrmFormatModifierPropertiesEXT` | LINEAR |
+| `vkGetImageSubresourceLayout(MEMORY_PLANE_0)` (stride and offset) | the synthesized plane |
+| `vkAllocateMemory` + export `DMA_BUF` + dedicated, device-local type; then `RESOURCE_CREATE_BLOB` `SHAREABLE` | exportable host memory; a handle blob |
+| `vkGetMemoryFdKHR` / `drmPrimeFDToHandle` (Mutter's `gbm_bo_get_handle`) | guest-side only: the same GEM resource |
+| another process: `CTX_ATTACH_RESOURCE`, `vkGetMemoryResourcePropertiesMESA`, `vkCreateImage` explicit LINEAR, `vkAllocateMemory` + `VkImportMemoryResourceInfoMESA` | attach; the export's type bit; the same canonical image; a Win32 import |
+| barriers to and from `VK_QUEUE_FAMILY_FOREIGN_EXT` | passed through, judged |
+| `vkGetSemaphoreFdKHR` (`EGL_ANDROID_native_fence_sync`) | a ring fence, then `vkWaitSemaphoreResourceMESA` |
+
+### Measured on the RTX 2070
+
+The test is
+`host_vulkan::pipeline_tests::a_linear_modifier_image_rendered_by_one_context_is_read_back_exactly_by_another`
+(driver 580.88, Windows), driven through real rings with the generated
+driver-side encoder.
+
+Context 1 is shown LINEAR for RGBA8 with tiling features `0x1dd83`, which
+includes the colour attachment linear tiling lacks. It creates the
+canonical image, gets an exportable allocation of `0x40000` bytes (256 ×
+1024-byte pitch), and makes the handle blob; mapping the blob is refused.
+It then renders vk-smoke's check-6 triangle through a render pass and
+releases the image to `FOREIGN`.
+
+Context 2 attaches and is answered exactly the export's type. It creates the
+same image explicitly LINEAR at pitch 1024, gets the same requirements, and
+imports and binds. **Context 1 then destroys its whole instance, and the
+blob is destroyed**, so the import alone holds the allocation. Context 2
+acquires the image from `FOREIGN` and copies it into our pages. The result
+is `256x256 exact, 6 probes ok, px red/green/blue/clear=8362/8363/8363/40448,
+fnv1a=0x2678f2a0e39fba1b`: vk-smoke's checksum for the bare RTX 2070,
+rendered by one guest process and read back by another through device-local
+memory neither can map.
+
+### Owed
+
+- **Guest acceptance.** GNOME with `dri_driver=zink`: `gbm_bo`s from Zink,
+  and Mutter's framebuffers made of handle blobs.
+- **Scanout of a handle blob.** Mutter's `drmModeAddFB2` of such a blob
+  reaches the device as `SET_SCANOUT_BLOB`. The host renderer must read the
+  image through Vulkan: the handle is exactly what it imports. That is the
+  scanout-blob hook being built beside this stage; the pitch the guest
+  passes is the synthesized one and says nothing about the bytes.
+- A Linux host's equivalent (`OPAQUE_FD` from a real GPU) is not built.
+  There this stage advertises nothing.
+- `save`/`load`: a snapshot is refused by name while a handle blob lives,
+  even after every Vulkan object has gone.

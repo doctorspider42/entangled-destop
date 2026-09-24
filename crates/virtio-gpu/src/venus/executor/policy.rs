@@ -38,7 +38,11 @@
 //!   `VK_KHR_swapchain` only on a renderer that can import a sync file
 //!   ([`external_semaphore_properties`]), and the `KHR_external_memory_fd`
 //!   Zink's DRM screen needs only on one that lists dma-buf. vkr advertises
-//!   what the host driver has.
+//!   what the host driver has. Stage S1 ("GNOME on the GPU") adds
+//!   `VK_EXT_queue_family_foreign`, passed through, and
+//!   `VK_EXT_image_drm_format_modifier`, emulated with `DRM_FORMAT_MOD_LINEAR`
+//!   alone (`executor::modifier`) — both only where device-local memory can
+//!   be exported as a host handle ([`GuestDevice::memory_export`]).
 //! * **The identity is shaped** ([`shape_identity`], stage 5c): an NVIDIA
 //!   device is shown with the virtio PCI vendor, and an NVIDIA driver new
 //!   enough for venus's dma-buf WSI is shown just below it. vkr forwards
@@ -408,6 +412,49 @@ pub const EXTERNAL_MEMORY_DMA_BUF: &str = "VK_EXT_external_memory_dma_buf";
 /// guest sends, and its two commands are Mesa's own.
 pub const EXTERNAL_MEMORY_FD: &str = "VK_KHR_external_memory_fd";
 
+/// `VK_EXT_queue_family_foreign` (stage S1): **passed through** from the
+/// host, on a device whose dma-buf is exportable device-local memory
+/// ([`advertised_extensions_on`]). It adds no structure and no command; what
+/// it obliges the renderer to is `VK_QUEUE_FAMILY_FOREIGN_EXT` in a barrier's
+/// queue family indices, which the executor admits exactly on a device that
+/// enabled it (`executor::device_objects`). Zink's dma-buf capability — and
+/// with it every GBM buffer that is not a dumb buffer — needs it
+/// (`zink_screen.c:1128-1133`, `gbm_dri.c:902-903`, `:1242-1247`).
+pub const QUEUE_FAMILY_FOREIGN_EXT: &str = "VK_EXT_queue_family_foreign";
+
+/// `VK_EXT_image_drm_format_modifier` (stage S1): **emulated**, and only
+/// with `DRM_FORMAT_MOD_LINEAR` — realised on the host as a canonical
+/// optimal-tiling image in exportable device-local memory
+/// (`executor::modifier`, which lists every lie that takes). Advertised
+/// where `VK_EXT_queue_family_foreign` is. Its structures are admitted
+/// ([`EMULATED_STRUCTURE_EXTENSIONS`]) and answered by the executor itself;
+/// its one command, `vkGetImageDrmFormatModifierPropertiesEXT`, is too. The
+/// host driver never sees any of it.
+pub const IMAGE_DRM_FORMAT_MODIFIER: &str = "VK_EXT_image_drm_format_modifier";
+
+/// `VK_KHR_external_memory_win32`: the host extension a device-local export
+/// rests on (stage S1). Enabled on every host device that has it; never
+/// shown to the guest, whose protocol cannot carry it.
+pub const EXTERNAL_MEMORY_WIN32: &str = "VK_KHR_external_memory_win32";
+
+/// Emulated extensions whose chained structures the executor answers
+/// itself, never forwarding them: admitted by [`admits_link`] (and so given
+/// their capset bit, without which the guest's encoder drops them), judged by
+/// hand in the bespoke commands that carry them. Not read by the generators:
+/// no generated or hand-written translation carries one.
+pub const EMULATED_STRUCTURE_EXTENSIONS: &[&str] = &[IMAGE_DRM_FORMAT_MODIFIER];
+
+/// `VK_QUEUE_FAMILY_IGNORED`.
+pub const QUEUE_FAMILY_IGNORED: u32 = !0;
+/// `VK_QUEUE_FAMILY_EXTERNAL` (core 1.1).
+pub const QUEUE_FAMILY_EXTERNAL: u32 = !1;
+/// `VK_QUEUE_FAMILY_FOREIGN_EXT`.
+pub const QUEUE_FAMILY_FOREIGN: u32 = !2;
+
+/// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT`: what a device-local
+/// `DMA_BUF` export or import is on the host (stage S1).
+pub const MEMORY_HANDLE_OPAQUE_WIN32: u32 = 0x2;
+
 /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`: the renderer's handle
 /// type as the guest sees it.
 pub const MEMORY_HANDLE_DMA_BUF: u32 = 0x200;
@@ -440,26 +487,39 @@ pub const EMULATED_EXTENSIONS: &[(&str, u32)] = &[
     (EXTERNAL_SEMAPHORE_FD, 1),
     (EXTERNAL_MEMORY_DMA_BUF, 1),
     (EXTERNAL_MEMORY_FD, 1),
+    // Spec version 2: `VkDrmFormatModifierPropertiesList2EXT` is answered too.
+    (IMAGE_DRM_FORMAT_MODIFIER, 2),
 ];
+
+/// Whether a binary `SYNC_FD` semaphore is shown `EXPORTABLE` as well as
+/// `IMPORTABLE` (stage S1 flipped it; 5b.3 left it off). **The one constant**
+/// the 2026-09-24 amendment promised: the export path — a virtio-gpu fence on
+/// the queue's `ring_idx` carrying `vkWaitRingSeqnoMESA`, then
+/// `vkWaitSemaphoreResourceMESA` — was implemented and tested then.
+pub const SYNC_FD_EXPORTABLE: bool = true;
 
 /// What `vkGetPhysicalDeviceExternalSemaphoreProperties` answers.
 ///
-/// **`SYNC_FD` is synthesized**: `IMPORTABLE` for a binary semaphore, with
-/// `SYNC_FD` its one compatible type, and nothing for a timeline one (a sync
-/// file is binary). That is exactly what Mesa 26.0.8 needs to set
+/// **`SYNC_FD` is synthesized**: `IMPORTABLE | EXPORTABLE` for a binary
+/// semaphore, with `SYNC_FD` its one compatible type and exportable from an
+/// import of itself, and nothing for a timeline one (a sync file is binary).
+/// `IMPORTABLE` is what Mesa 26.0.8 needs to set
 /// `renderer_sync_fd.semaphore_importable` (`vn_physical_device.c:1124-1141`),
 /// which is the gate on `VK_KHR_synchronization2` — and with it Vulkan 1.3 —
 /// and on `VK_KHR_swapchain` (`:1212-1224`, `:1262-1271`). A Windows driver
 /// answers 0 for it; this renderer emulates the one import Mesa makes
 /// (`vkImportSemaphoreResourceMESA` with resource 0, a signalled payload).
 ///
-/// **Not `EXPORTABLE`.** With it the guest would also expose
-/// `VK_KHR_external_semaphore_fd` to its own applications (`:1173-1179`),
-/// whose `vkGetSemaphoreFdKHR` rests on a virtio-gpu fence per queue and
-/// `vkWaitSemaphoreResourceMESA`. Both are implemented, but nothing in the
-/// guest's Vulkan 1.3 or its swapchain needs an application to export a
-/// sync file, and an export is a promise to a consumer outside Vulkan this
-/// renderer has never been tested against; so it is not made.
+/// **`EXPORTABLE`** ([`SYNC_FD_EXPORTABLE`], stage S1) is what makes the
+/// guest offer `VK_KHR_external_semaphore_fd` to its own applications
+/// (`:1173-1179`) — Zink's `EGL_ANDROID_native_fence_sync` rests on it. An
+/// application's `vkGetSemaphoreFdKHR` (`vn_queue.c:2440-2495`) becomes a
+/// virtio-gpu execbuffer with a fence on the `ring_idx` of the queue that
+/// last signalled the semaphore, carrying `vkWaitRingSeqnoMESA`
+/// (`vn_create_sync_file`, `:1873-1910`) — a host fence on that queue
+/// (`executor::timeline`) — then `vkImportSemaphoreResourceMESA` (resource 0)
+/// if the payload was an imported sync file, and `vkWaitSemaphoreResourceMESA`,
+/// which consumes the payload on the host (`executor::submit`).
 ///
 /// Every other handle type gets the host's own answer (`host`).
 #[must_use]
@@ -474,30 +534,40 @@ pub fn external_semaphore_properties(
     if timeline {
         return VkExternalSemaphoreProperties::default();
     }
+    let (features, from_imported) = if SYNC_FD_EXPORTABLE {
+        (
+            SEMAPHORE_FEATURE_IMPORTABLE | SEMAPHORE_FEATURE_EXPORTABLE,
+            SEMAPHORE_HANDLE_SYNC_FD,
+        )
+    } else {
+        (SEMAPHORE_FEATURE_IMPORTABLE, 0)
+    };
     VkExternalSemaphoreProperties {
-        export_from_imported_handle_types: 0,
+        export_from_imported_handle_types: from_imported,
         compatible_handle_types: SEMAPHORE_HANDLE_SYNC_FD,
-        external_semaphore_features: SEMAPHORE_FEATURE_IMPORTABLE,
+        external_semaphore_features: features,
     }
 }
 
 /// What a `DMA_BUF` external-memory query answers (stage 5c), for a buffer
-/// or an image whose host twin would take an import of our own pages
-/// (`host_importable`: the host answers `HOST_ALLOCATION` `IMPORTABLE` for
-/// it).
+/// or an image that can be shared (`shareable`): its host twin would take an
+/// import of our own pages (the host answers `HOST_ALLOCATION` `IMPORTABLE`
+/// for it), or — stage S1 — it can live in exportable device-local memory
+/// (the host answers `OPAQUE_WIN32` `EXPORTABLE | IMPORTABLE`, not
+/// dedicated-only, on a device that can export at all).
 ///
-/// A `DMA_BUF` here is a blob of this renderer's pages: an export is memory
-/// the guest can map, whose blob is those pages; an import is such a blob,
-/// imported again. So the honest answer is **exportable and importable
-/// exactly when the resource can live in those pages**, and nothing
-/// otherwise — what vkr gets from a Linux driver for a resource it cannot
-/// share. The shape is vkr's (the driver's answer passed through): `DMA_BUF`
-/// compatible with itself, and exportable from an import of itself. Mesa
-/// 26.0.8 then widens the compatible types to its own supported set
-/// (`vn_physical_device.c:2950-2953`).
+/// A `DMA_BUF` here is a blob of this renderer: our pages, which the guest
+/// can map, or a host handle to device-local memory, which it cannot; an
+/// import is such a blob, imported again. So the honest answer is
+/// **exportable and importable exactly when the resource can live in one of
+/// those**, and nothing otherwise — what vkr gets from a Linux driver for a
+/// resource it cannot share. The shape is vkr's (the driver's answer passed
+/// through): `DMA_BUF` compatible with itself, and exportable from an import
+/// of itself. Mesa 26.0.8 then widens the compatible types to its own
+/// supported set (`vn_physical_device.c:2950-2953`).
 #[must_use]
-pub fn external_memory_properties(host_importable: bool) -> VkExternalMemoryProperties {
-    if !host_importable {
+pub fn external_memory_properties(shareable: bool) -> VkExternalMemoryProperties {
+    if !shareable {
         return VkExternalMemoryProperties {
             external_memory_features: 0,
             export_from_imported_handle_types: 0,
@@ -539,41 +609,55 @@ pub fn passes_through(name: &str, api: u32) -> bool {
 ///   version this renderer implements (clamped to the protocol's too).
 ///
 /// Every structure they bring is inside [`admits_link`]. This is the set
-/// for a device whose guest WSI stays on its software path
-/// ([`advertised_extensions_on`]).
+/// for a device whose guest WSI stays on its software path, and which can
+/// export device-local memory exactly when the host lists
+/// `VK_KHR_external_memory_win32` ([`advertised_extensions_on`]).
 #[must_use]
 pub fn advertised_extensions(
     host: &[VkExtensionProperties],
     api: u32,
 ) -> Vec<VkExtensionProperties> {
-    advertised_extensions_on(host, api, true)
+    advertised_extensions_on(host, api, true, has_extension(host, EXTERNAL_MEMORY_WIN32))
 }
 
 /// [`advertised_extensions`] for a device whose identity does
 /// (`software_wsi`) or does not keep Mesa 26.0.8's WSI on its software
-/// path ([`keeps_software_wsi`]).
+/// path ([`keeps_software_wsi`]), and which can (`memory_export`) or cannot
+/// export device-local memory as a host handle ([`GuestDevice::memory_export`]).
 ///
-/// **The emulated dma-buf pair is advertised only where it does.** Listing
-/// `VK_EXT_external_memory_dma_buf` is also what moves venus's WSI to its
-/// native dma-buf path (`vn_wsi.c:134-139`) — swapchain images exported to
-/// the guest's compositor as dma-bufs of device-local, optimal-tiling
-/// memory, which this renderer cannot make — for every renderer but an
-/// NVIDIA driver older than 590.48.01, which [`shape_identity`] makes every
-/// NVIDIA driver look like. On any other host the pair would trade a
-/// working swapchain for Zink's DRM screen, so it is not offered there, and
-/// Zink there stays on the guest's software GL until dma-buf WSI exists.
+/// **The emulated dma-buf pair is advertised only where the WSI stays
+/// software.** Listing `VK_EXT_external_memory_dma_buf` is also what moves
+/// venus's WSI to its native dma-buf path (`vn_wsi.c:134-139`) — swapchain
+/// images exported to the guest's compositor as dma-bufs — for every
+/// renderer but an NVIDIA driver older than 590.48.01, which
+/// [`shape_identity`] makes every NVIDIA driver look like. On any other host
+/// the pair would trade a working swapchain for Zink's DRM screen, so it is
+/// not offered there, and Zink there stays on the guest's software GL.
+///
+/// **`VK_EXT_queue_family_foreign` and the emulated
+/// `VK_EXT_image_drm_format_modifier` (stage S1) go with the pair, and only
+/// where device-local memory can be exported too.** Together with the pair
+/// they turn on Zink's dma-buf capability, and GBM then allocates every
+/// buffer through Zink instead of as a dumb buffer (`gbm_dri.c:902-903`); a
+/// host whose device-local memory cannot leave its device (a Linux host
+/// here: no `OPAQUE_WIN32`) would fail every such allocation, so it keeps
+/// the dumb buffers.
 #[must_use]
 pub fn advertised_extensions_on(
     host: &[VkExtensionProperties],
     api: u32,
     software_wsi: bool,
+    memory_export: bool,
 ) -> Vec<VkExtensionProperties> {
+    let gnome_on_gpu = software_wsi && memory_export;
     let mut out: Vec<VkExtensionProperties> = host
         .iter()
         .filter_map(|ext| {
             let name = std::str::from_utf8(c_name(&ext.extension_name)).ok()?;
             let known = EXTENSIONS.iter().find(|e| e.name == name)?;
-            (known.decodable && passes_through(name, api)).then(|| VkExtensionProperties {
+            let served =
+                passes_through(name, api) || (gnome_on_gpu && name == QUEUE_FAMILY_FOREIGN_EXT);
+            (known.decodable && served).then(|| VkExtensionProperties {
                 extension_name: ext.extension_name,
                 spec_version: ext.spec_version.min(known.spec_version),
             })
@@ -584,6 +668,9 @@ pub fn advertised_extensions_on(
             continue;
         };
         if !software_wsi && (*name == EXTERNAL_MEMORY_DMA_BUF || *name == EXTERNAL_MEMORY_FD) {
+            continue;
+        }
+        if !gnome_on_gpu && *name == IMAGE_DRM_FORMAT_MODIFIER {
             continue;
         }
         out.retain(|e| c_name(&e.extension_name) != name.as_bytes());
@@ -604,15 +691,18 @@ pub fn is_emulated_extension(name: &str) -> bool {
 
 /// Whether a chained structure of type `stype` is one this stage accepts:
 /// core Vulkan 1.0 to [`ADMITTED_CHAIN_API`], or added by one of
-/// [`ADMITTED_EXTENSIONS`]. Everything else the protocol can chain decodes,
-/// and is refused here. (A device-level structure of an extension is further
-/// refused on a device that did not enable an extension that brings it —
-/// the generated translation's rule, `executor::generated`.)
+/// [`ADMITTED_EXTENSIONS`] or [`EMULATED_STRUCTURE_EXTENSIONS`]. Everything
+/// else the protocol can chain decodes, and is refused here. (A device-level
+/// structure of an extension is further refused on a device that did not
+/// enable an extension that brings it — the generated translation's rule,
+/// `executor::generated`, and by hand for an emulated one.)
 #[must_use]
 pub fn admits_link(stype: i32) -> bool {
     info::structure(stype).is_some_and(|s| {
         s.core.is_some_and(|core| core <= ADMITTED_CHAIN_API)
-            || s.extensions.iter().any(|e| ADMITTED_EXTENSIONS.contains(e))
+            || s.extensions.iter().any(|e| {
+                ADMITTED_EXTENSIONS.contains(e) || EMULATED_STRUCTURE_EXTENSIONS.contains(e)
+            })
     })
 }
 
@@ -733,6 +823,13 @@ pub struct GuestDevice {
     /// `minImportedHostPointerAlignment`: what the executor rounds and
     /// aligns the pages of a host-visible allocation to.
     pub import_alignment: u64,
+    /// Whether device-local memory of this device can be exported as a host
+    /// handle and imported by another host device of the same GPU (stage
+    /// S1): the host has `VK_KHR_external_memory_win32` and reports the
+    /// `deviceUUID`/`driverUUID` an import is checked against. Whether a
+    /// given resource may then live in such memory is the host's answer for
+    /// `OPAQUE_WIN32`, asked per resource.
+    pub memory_export: bool,
 }
 
 impl GuestDevice {
@@ -797,6 +894,20 @@ impl GuestDevice {
             N::VkPhysicalDeviceBufferDeviceAddressFeatures(f) => f.buffer_device_address != 0,
             _ => false,
         })
+    }
+
+    /// `(deviceUUID, driverUUID)`, from whichever structure carries them:
+    /// what a device-local import is checked against (stage S1).
+    #[must_use]
+    pub fn uuids(&self) -> Option<([u8; 16], [u8; 16])> {
+        device_uuids(&self.properties)
+    }
+
+    /// Whether `family` names one of this device's queue families (a real
+    /// index, not one of the special values).
+    #[must_use]
+    pub fn has_family(&self, family: u32) -> bool {
+        usize::try_from(family).is_ok_and(|f| f < self.queue_families.len())
     }
 
     /// The feature bit `protectedMemory` as the guest is told it, from
@@ -887,6 +998,23 @@ pub fn shape_identity(properties: &mut VkPhysicalDeviceProperties2) {
     }
 }
 
+/// `(deviceUUID, driverUUID)` of a device's properties chain, from
+/// `VkPhysicalDeviceIDProperties` or `VkPhysicalDeviceVulkan11Properties`.
+#[must_use]
+pub fn device_uuids(properties: &VkPhysicalDeviceProperties2) -> Option<([u8; 16], [u8; 16])> {
+    use crate::venus::protocol::VkPhysicalDeviceProperties2Next as N;
+    let id = properties.p_next.iter().find_map(|link| match link {
+        N::VkPhysicalDeviceIDProperties(p) => Some((p.device_uuid, p.driver_uuid)),
+        _ => None,
+    });
+    id.or_else(|| {
+        properties.p_next.iter().find_map(|link| match link {
+            N::VkPhysicalDeviceVulkan11Properties(p) => Some((p.device_uuid, p.driver_uuid)),
+            _ => None,
+        })
+    })
+}
+
 /// Whether Mesa 26.0.8's venus keeps its WSI on the software path for a
 /// device shown with `properties` even when the renderer lists
 /// `VK_EXT_external_memory_dma_buf`: an NVIDIA driver older than 590.48.01
@@ -941,10 +1069,13 @@ pub fn expose(info: HostDeviceInfo) -> Result<GuestDevice, Hidden> {
     shape_identity(&mut properties);
     let mut features = info.features;
     mask_features(&mut features);
+    let memory_export = has_extension(&info.extensions, EXTERNAL_MEMORY_WIN32)
+        && device_uuids(&properties).is_some();
     let extensions = advertised_extensions_on(
         &info.extensions,
         properties.properties.api_version,
         keeps_software_wsi(&properties),
+        memory_export,
     );
     Ok(GuestDevice {
         properties,
@@ -955,6 +1086,7 @@ pub fn expose(info: HostDeviceInfo) -> Result<GuestDevice, Hidden> {
         host_memory: info.memory,
         importable,
         import_alignment,
+        memory_export,
     })
 }
 
@@ -1276,16 +1408,19 @@ mod tests {
             "VK_EXT_extended_dynamic_state",
             "VK_EXT_4444_formats",
             "VK_KHR_maintenance5",
-            "VK_EXT_image_drm_format_modifier",
-            "VK_EXT_queue_family_foreign",
             "VK_KHR_push_descriptor",
             "VK_EXT_calibrated_timestamps",
             "VK_KHR_external_memory_win32",
         ];
         let mut host_names = everything.clone();
         host_names.extend(refused);
+        // Stage S1: with `VK_KHR_external_memory_win32` on the host,
+        // queue_family_foreign is passed through, and the host's own
+        // drm_format_modifier (had it one) gives way to the emulated one.
+        host_names.extend([QUEUE_FAMILY_FOREIGN_EXT, IMAGE_DRM_FORMAT_MODIFIER]);
         let host = named(&host_names);
         let mut want: Vec<String> = everything.iter().map(|n| (*n).to_owned()).collect();
+        want.push(QUEUE_FAMILY_FOREIGN_EXT.to_owned());
         for (name, _) in EMULATED_EXTENSIONS {
             want.push((*name).to_owned());
         }
@@ -1315,11 +1450,14 @@ mod tests {
             assert!(want.iter().any(|w| w == name), "{name}");
         }
 
-        // A host with only some of them: only those, and the emulated ones.
+        // A host with only some of them: only those, and the emulated ones —
+        // and without VK_KHR_external_memory_win32, neither of stage S1's,
+        // even where the host has queue_family_foreign.
         let some = named(&[
             "VK_KHR_maintenance1",
             "VK_EXT_transform_feedback",
             "VK_KHR_swapchain",
+            QUEUE_FAMILY_FOREIGN_EXT,
         ]);
         assert_eq!(
             advertised_names(&some, MAX_API_VERSION),
@@ -1461,13 +1599,20 @@ mod tests {
             extension_name: name_array(TRANSFORM_FEEDBACK),
             spec_version: 1,
         }];
-        let on_other = advertised_extensions_on(&host, MAX_API_VERSION, false);
+        let on_other = advertised_extensions_on(&host, MAX_API_VERSION, false, true);
         assert!(has_extension(&on_other, TRANSFORM_FEEDBACK));
         assert!(has_extension(&on_other, EXTERNAL_SEMAPHORE_FD));
         assert!(!has_extension(&on_other, EXTERNAL_MEMORY_DMA_BUF));
         assert!(!has_extension(&on_other, EXTERNAL_MEMORY_FD));
-        let on_nvidia = advertised_extensions_on(&host, MAX_API_VERSION, true);
+        assert!(
+            !has_extension(&on_other, IMAGE_DRM_FORMAT_MODIFIER),
+            "stage S1 goes with the dma-buf pair"
+        );
+        let on_nvidia = advertised_extensions_on(&host, MAX_API_VERSION, true, false);
         assert!(has_extension(&on_nvidia, EXTERNAL_MEMORY_DMA_BUF));
+        assert!(!has_extension(&on_nvidia, IMAGE_DRM_FORMAT_MODIFIER));
+        let exporting = advertised_extensions_on(&host, MAX_API_VERSION, true, true);
+        assert!(has_extension(&exporting, IMAGE_DRM_FORMAT_MODIFIER));
     }
 
     /// Stage 5c: a `DMA_BUF` query answers exportable and importable
@@ -1531,8 +1676,11 @@ mod tests {
         assert!(!is_emulated_extension(SYNCHRONIZATION_2));
     }
 
+    /// Stage S1 flipped `EXPORTABLE` on: a binary `SYNC_FD` semaphore is
+    /// importable and exportable, and exportable from an import of itself.
     #[test]
-    fn the_sync_fd_answer_is_importable_for_binary_only_and_other_types_are_the_hosts() {
+    fn the_sync_fd_answer_is_importable_and_exportable_for_binary_only_and_other_types_are_the_hosts(
+    ) {
         let host = || VkExternalSemaphoreProperties {
             export_from_imported_handle_types: 0x2,
             compatible_handle_types: 0x2,
@@ -1541,10 +1689,13 @@ mod tests {
         let binary = external_semaphore_properties(SEMAPHORE_HANDLE_SYNC_FD, false, host);
         assert_eq!(
             binary.external_semaphore_features,
-            SEMAPHORE_FEATURE_IMPORTABLE
+            SEMAPHORE_FEATURE_IMPORTABLE | SEMAPHORE_FEATURE_EXPORTABLE
         );
         assert_eq!(binary.compatible_handle_types, SEMAPHORE_HANDLE_SYNC_FD);
-        assert_eq!(binary.export_from_imported_handle_types, 0);
+        assert_eq!(
+            binary.export_from_imported_handle_types,
+            SEMAPHORE_HANDLE_SYNC_FD
+        );
         let timeline = external_semaphore_properties(SEMAPHORE_HANDLE_SYNC_FD, true, host);
         assert_eq!(timeline, VkExternalSemaphoreProperties::default());
         let opaque = external_semaphore_properties(0x2, false, host);
@@ -1613,12 +1764,19 @@ mod tests {
                     .any(|s| admits_link(s.stype) && s.extensions.contains(&ext.name));
             assert!(admitted, "{}", ext.name);
         }
-        // 60 until stage 5b.3, and the twelve admitted device extensions.
-        assert_eq!(numbers.len(), 72);
+        // 60 until stage 5b.3, the twelve admitted device extensions, and
+        // (stage S1) the emulated VK_EXT_image_drm_format_modifier, whose
+        // structures the guest's encoder drops without it.
+        assert!(numbers.contains(&159), "VK_EXT_image_drm_format_modifier");
+        assert!(
+            !numbers.contains(&127),
+            "VK_EXT_queue_family_foreign chains nothing"
+        );
+        assert_eq!(numbers.len(), 73);
         let mask = admitted_extension_mask();
         assert!(mask.is_enumerated());
         let set: u32 = mask.words().iter().map(|w| w.count_ones()).sum();
-        assert_eq!(set, 73, "72 extensions and the sentinel");
+        assert_eq!(set, 74, "73 extensions and the sentinel");
         for name in ADMITTED_EXTENSIONS {
             let number = info::extension(name).expect("known").number;
             assert!(mask.is_enabled(number), "{name}'s bit is in the capset");
