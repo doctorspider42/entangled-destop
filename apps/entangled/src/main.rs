@@ -296,8 +296,8 @@ enum DiskCommand {
 #[derive(Args)]
 pub struct InstallArgs {
     /// Distribution to install: "debian" (d-i, direct kernel boot), "ubuntu"
-    /// (live-server ISO through UEFI, unattended autoinstall) or "fedora"
-    /// (Everything netinst through UEFI, unattended kickstart).
+    /// (the live-server or Desktop ISO through UEFI, unattended autoinstall)
+    /// or "fedora" (Everything netinst through UEFI, unattended kickstart).
     pub distro: String,
     /// Target RAW disk image; created if missing. Defaults to
     /// <vm dir>/<name>.raw, where the VM directory is the manager's
@@ -307,8 +307,12 @@ pub struct InstallArgs {
     pub disk: Option<PathBuf>,
     #[arg(long, default_value = "gtk-netboot")]
     pub variant: String,
-    /// Fully automated installation with the built-in Weston test profile
-    /// (assets/preseed/auto-weston.cfg).
+    /// Fully automated installation with the distribution's built-in profile:
+    /// Debian's Weston test preseed (assets/preseed/auto-weston.cfg); for
+    /// Ubuntu, the desktop autoinstall (assets/autoinstall/ubuntu-desktop.yaml)
+    /// when the ISO's file name says `desktop` and the server one
+    /// (assets/autoinstall/ubuntu-server.yaml) otherwise; Fedora's
+    /// Workstation kickstart (assets/kickstart/fedora-workstation.ks).
     #[arg(long)]
     pub auto: bool,
     /// Custom preseed file appended to the installer initrd (Debian only).
@@ -317,7 +321,8 @@ pub struct InstallArgs {
     /// Custom autoinstall configuration for Ubuntu: a `#cloud-config` document
     /// whose `autoinstall:` key holds subiquity's directives. Placed on the
     /// NoCloud seed volume in place of the built-in profile
-    /// (assets/autoinstall/ubuntu-server.yaml).
+    /// (assets/autoinstall/ubuntu-desktop.yaml for a Desktop ISO,
+    /// assets/autoinstall/ubuntu-server.yaml otherwise).
     #[arg(long, conflicts_with = "preseed")]
     pub autoinstall: Option<PathBuf>,
     /// Custom kickstart for Fedora: Anaconda's automation language. Placed on
@@ -658,5 +663,49 @@ fn resume(args: ResumeArgs) -> Result<(), String> {
              or a Windows host with the Windows Hypervisor Platform",
             cfg.name
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory as _;
+
+    /// `install --help` is how a newcomer learns which answer file `--auto`
+    /// uses. It once named only Debian's preseed for `--auto` and only the
+    /// server autoinstall for `--autoinstall`, long after a Desktop ISO had
+    /// its own built-in profile (found by the fresh `install ubuntu --venus`
+    /// acceptance). Every built-in profile must be named, and every file the
+    /// help names must exist.
+    #[test]
+    fn install_help_names_every_builtin_profile_and_only_real_files() {
+        let mut cli = Cli::command();
+        let install = cli
+            .find_subcommand_mut("install")
+            .expect("an install subcommand");
+        let help = install.render_long_help().to_string();
+        for profile in [
+            "assets/preseed/auto-weston.cfg",
+            "assets/autoinstall/ubuntu-desktop.yaml",
+            "assets/autoinstall/ubuntu-server.yaml",
+            "assets/kickstart/fedora-workstation.ks",
+        ] {
+            assert!(
+                help.contains(profile),
+                "install --help omits {profile}:\n{help}"
+            );
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let named: Vec<&str> = help
+            .split(|c: char| c.is_whitespace() || "(),;`".contains(c))
+            .filter(|word| word.starts_with("assets/"))
+            .collect();
+        assert!(!named.is_empty(), "{help}");
+        for path in named {
+            assert!(
+                root.join(path).is_file(),
+                "install --help names {path}, which is not there"
+            );
+        }
     }
 }
