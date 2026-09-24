@@ -2662,3 +2662,36 @@ Owed: the guest acceptance (vk-smoke all nine checks with the guest at 1.3,
 and `vulkaninfo` listing `VK_KHR_swapchain` and `VK_KHR_synchronization2`),
 and presenting through a real swapchain, which in the guest's software WSI
 is CPU copies — correct, and slow.
+
+## Amendment, 2026-09-24 — Vulkan 1.3 in the guest, all nine checks, and a swapchain
+
+Guest acceptance for 5b.3, run the same way as the one above (commit
+`06b9754`, full `vk-smoke`, no `--checks`):
+
+```
+SMOKE 1 instance          PASS  "Virtio-GPU Venus (NVIDIA GeForce RTX 2070)" apiVersion=1.3.0
+SMOKE 2 device            PASS  timeline_semaphore=core, dynamic_rendering=core
+SMOKE 3 host-memory       PASS
+SMOKE 4 transfer          PASS
+SMOKE 5 compute           PASS  1048576 elements, all f(i) correct
+SMOKE 6 graphics          PASS  fnv1a=0x2678f2a0e39fba1b
+SMOKE 7 dynamic-rendering PASS  fnv1a=0xd79d631c4d62403b
+SMOKE 8 timeline-sync     PASS  A signals 1, B waits 1 and signals 2, counter=2
+SMOKE 9 many-submits      PASS  1000 submits, 1000 fences, none lost
+SMOKE DONE pass=9 fail=0 skip=0
+```
+
+The guest's own `vulkaninfo` now reports `apiVersion = 1.3.0` for the venus
+device and lists **`VK_KHR_swapchain`** (revision 70) and
+`VK_KHR_synchronization2`. That is the gate diagnosed above, opened by the
+sync_fd emulation. Both triangle checksums match the bare RTX 2070 on the
+host. The renderer logged no refusal.
+
+`1.3.0`, not `1.3.x`, is Mesa's own clamp for venus protocol spec version 2
+(`vn_physical_device.c:535-536`). Going past it needs protocol v3 and its
+host-image-copy obligations, which nothing needs yet.
+
+With a swapchain exposed, a Vulkan application in the guest can now present.
+Without dma-buf, Mesa's WSI takes its software path (`vn_wsi.c:134`): it renders
+on the GPU and copies the result into shared memory for the guest's display
+server. That is the next thing to measure.
