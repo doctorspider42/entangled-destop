@@ -328,6 +328,62 @@ pub trait Renderer3d: Send {
         None
     }
 
+    /// `SET_SCANOUT_BLOB` of a **renderer blob** (`BLOB_MEM_HOST3D` or
+    /// `BLOB_MEM_HOST3D_GUEST`): can this renderer present `resource_id`'s
+    /// bytes laid out as `spec`? (EPIC 20, "GNOME on the GPU" S2a.)
+    ///
+    /// This is how a guest compositor on the GPU puts its frames on screen:
+    /// Mutter over GBM → zink → venus allocates each scanout buffer as a
+    /// `VkDeviceMemory`, the guest kernel wraps it in a `HOST3D` +
+    /// `SHAREABLE` blob (never `MAPPABLE` — the guest does not map it), and
+    /// every page flip is `SET_SCANOUT_BLOB` naming that blob followed by an
+    /// unfenced `RESOURCE_FLUSH`, with no transfer in between.
+    ///
+    /// The device has already checked, before calling:
+    ///
+    /// * `resource_id` is a live blob of a host memory type, created through
+    ///   [`Self::create_blob`] and not yet [`Self::destroy_blob`]ed;
+    /// * `spec.format` is `FORMAT_B8G8R8X8_UNORM` or `FORMAT_B8G8R8A8_UNORM`,
+    ///   and planes 1–3 are unused;
+    /// * `spec.width`/`spec.height` are non-zero and at most
+    ///   [`crate::MAX_RESOURCE_PIXELS`] pixels between them;
+    /// * `spec.stride >= spec.width * 4`, and
+    ///   `spec.offset + spec.stride * spec.height` fits inside the blob's
+    ///   declared size — all in `u64`.
+    ///
+    /// What is left is the renderer's own question: does it hold memory under
+    /// that blob it can read those rows out of (for Venus: is the blob a
+    /// `VkDeviceMemory` this renderer can copy from, and is it at least that
+    /// large on the host)? `Ok` promises that **[`Self::read_rect_bgra`] on
+    /// `resource_id` now reads this layout**: until the next accepted
+    /// `scanout_blob` for the same resource, [`Self::destroy_blob`] or
+    /// [`Self::reset`], `read_rect_bgra(resource_id, rect, out)` must fill
+    /// `out` with `rect` of the `spec.width` × `spec.height` image (the device
+    /// has checked that it lies inside) as tightly packed BGRA rows,
+    /// `rect.width * rect.height * 4` bytes. The X byte of a `B8G8R8X8` image
+    /// is insignificant — the display draws every pixel opaque.
+    ///
+    /// A renderer keeps **one spec per resource**, not one for the device: a
+    /// compositor flips between two or three buffers, and the device asks
+    /// again only when a buffer's layout changes, not on every flip. A
+    /// refusal leaves whatever this resource had accepted before in force;
+    /// the device keeps its old binding and answers the guest in band.
+    ///
+    /// The default refuses, with exactly the error the device answered before
+    /// this hook existed — the answer of every renderer that cannot read a
+    /// host blob back (virgl, the isolated renderer, the loopback).
+    fn scanout_blob(
+        &mut self,
+        resource_id: u32,
+        spec: &ScanoutBlobSpec,
+    ) -> Result<(), CommandError> {
+        let _ = (resource_id, spec);
+        Err(CommandError::BadBlobMem {
+            blob_mem: crate::protocol::BLOB_MEM_HOST3D,
+            reason: "only a guest-memory blob can be scanned out on this host",
+        })
+    }
+
     // ------------------------------------- blob resources (EPIC 20/VEN-2001)
 
     /// Which blob memory types this renderer serves, and whether it has a
@@ -467,6 +523,28 @@ pub struct ScanoutExport {
     pub fourcc: u32,
     /// DRM format modifier (tiling/compression). `0` is linear.
     pub modifier: u64,
+}
+
+/// How a guest laid a renderer blob out for scanout
+/// ([`Renderer3d::scanout_blob`]): the plane-0 fields of `SET_SCANOUT_BLOB`.
+///
+/// A blob has no geometry of its own, so this *is* its image for as long as
+/// it is being scanned out. The scanout rectangle (which part of the image
+/// the display shows) is the device's business and not part of it: two flips
+/// of one buffer with different visible regions are the same layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanoutBlobSpec {
+    /// `FORMAT_B8G8R8X8_UNORM` or `FORMAT_B8G8R8A8_UNORM` — the only two the
+    /// device accepts, and the Linux driver sends the first.
+    pub format: u32,
+    /// Framebuffer width in pixels.
+    pub width: u32,
+    /// Framebuffer height in pixels.
+    pub height: u32,
+    /// Bytes per row of plane 0 (`strides[0]`).
+    pub stride: u32,
+    /// Byte offset of plane 0 inside the blob (`offsets[0]`).
+    pub offset: u32,
 }
 
 /// Structural validation of a `SUBMIT_3D` stream (GPU-007).
@@ -990,6 +1068,54 @@ impl Gpu3d {
     /// (VEN-2001 phase 2).
     pub fn set_host_visible(&mut self, backing: Arc<dyn virtio_core::ShmBacking>) {
         self.renderer.set_host_visible(backing);
+    }
+
+    /// Asks the renderer whether it can present a renderer blob with this
+    /// layout ([`Renderer3d::scanout_blob`]). The device owns the blob table
+    /// and has validated `spec` against it; this front only forwards.
+    pub fn scanout_blob(
+        &mut self,
+        resource_id: u32,
+        spec: &ScanoutBlobSpec,
+    ) -> Result<(), CommandError> {
+        self.renderer.scanout_blob(resource_id, spec)
+    }
+
+    /// Scanout readback of a renderer blob the renderer accepted as `spec`:
+    /// `rect` of that image as packed BGRA.
+    ///
+    /// The rect is checked against the spec here, and the renderer's answer
+    /// is checked for length afterwards — a renderer that returns the wrong
+    /// number of bytes is a host bug, and the sink must never be handed a
+    /// buffer that disagrees with the rect it is told to draw.
+    pub fn read_scanout_blob(
+        &mut self,
+        resource_id: u32,
+        spec: &ScanoutBlobSpec,
+        rect: Rect,
+        out: &mut Vec<u8>,
+    ) -> Result<(), CommandError> {
+        if !rect.fits_within(spec.width, spec.height) {
+            return Err(CommandError::RectOutOfBounds {
+                rect,
+                width: spec.width,
+                height: spec.height,
+            });
+        }
+        self.renderer.read_rect_bgra(resource_id, rect, out)?;
+        let expected = rect
+            .pixels()
+            .saturating_mul(u64::from(crate::BYTES_PER_PIXEL));
+        if out.len() as u64 != expected {
+            return Err(CommandError::Renderer(format!(
+                "scanout readback of blob {resource_id} returned {} bytes for a {}x{} rect \
+                 ({expected} expected)",
+                out.len(),
+                rect.width,
+                rect.height
+            )));
+        }
+        Ok(())
     }
 
     /// Zero-copy export of a scanout resource, when the host can do it.

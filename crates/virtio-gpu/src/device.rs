@@ -57,7 +57,7 @@ use crate::protocol::{
     TransferToHost2d, UpdateCursor, BLOB_MEM_GUEST, CONFIG_LEN, MEM_ENTRY_LEN,
 };
 use crate::renderer::FenceOutcome;
-use crate::renderer::{Gpu3d, Renderer3d, MAX_SUBMIT_BYTES};
+use crate::renderer::{Gpu3d, Renderer3d, ScanoutBlobSpec, MAX_SUBMIT_BYTES};
 use crate::resource::{ResourceTable, MAX_BACKING_ENTRIES};
 use crate::sink::ScanoutSink;
 use crate::{
@@ -274,6 +274,15 @@ enum ScanoutSource {
         /// Byte offset of the plane inside the blob.
         offset: u32,
     },
+    /// A **renderer** blob (`HOST3D`/`HOST3D_GUEST`): the pixels are the
+    /// renderer's — for Venus, a guest `VkDeviceMemory` a GPU compositor
+    /// rendered into — and flushes read back through
+    /// [`Renderer3d::read_rect_bgra`] in the layout the renderer accepted
+    /// ([`Renderer3d::scanout_blob`]).
+    RendererBlob {
+        /// The layout `SET_SCANOUT_BLOB` declared and the renderer accepted.
+        spec: ScanoutBlobSpec,
+    },
 }
 
 /// What the guest bound to scanout 0.
@@ -287,10 +296,14 @@ struct ScanoutBinding {
 }
 
 impl ScanoutBinding {
-    /// Whether the 3D renderer owns this binding — the question GPU-012's
-    /// degrade path asks.
-    fn is_three_d(&self) -> bool {
-        matches!(self.source, ScanoutSource::ThreeD)
+    /// Whether the 3D renderer owns this binding's pixels — the question
+    /// GPU-012's degrade path asks. A renderer blob is the renderer's as much
+    /// as a 3D resource is.
+    fn is_renderer_owned(&self) -> bool {
+        matches!(
+            self.source,
+            ScanoutSource::ThreeD | ScanoutSource::RendererBlob { .. }
+        )
     }
 }
 
@@ -376,6 +389,11 @@ pub struct GpuDevice<S: ScanoutSink> {
     /// exactly once.
     restored_3d_lost: bool,
     restored_3d_reported: bool,
+    /// Whether a renderer blob has been scanned out since the last reset —
+    /// the one-time info line for the GPU-composited desktop (S2a). Every
+    /// later flip logs at debug: the guest sends `SET_SCANOUT_BLOB` on every
+    /// one.
+    renderer_blob_scanned_out: bool,
     /// Frame-interval statistics of the scanout path (phase 2 measurement).
     pacing: FramePacing,
     /// Where `--frame-stats` mirrors those statistics as JSON, if anywhere.
@@ -435,6 +453,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             renderer_loss_reported: false,
             restored_3d_lost: false,
             restored_3d_reported: false,
+            renderer_blob_scanned_out: false,
             pacing: FramePacing::new(),
             frame_stats: None,
             refresh_hz: crate::edid::DEFAULT_REFRESH_HZ,
@@ -1146,7 +1165,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // Dropping the renderer releases the host GL state (and, for an
         // isolated renderer, the dead worker's socket).
         self.three_d = None;
-        if self.scanout.is_some_and(|s| s.is_three_d()) {
+        if self.scanout.is_some_and(|s| s.is_renderer_owned()) {
             tracing::warn!("the scanout was a renderer resource; the window keeps its last frame");
             self.scanout = None;
         }
@@ -1582,14 +1601,28 @@ impl<S: ScanoutSink> GpuDevice<S> {
             rect,
             source,
         });
-        tracing::info!(
-            scanout = scanout_id,
-            resource = resource_id,
-            width = rect.width,
-            height = rect.height,
-            source = ?source,
-            "virtio-gpu scanout set"
-        );
+        if matches!(source, ScanoutSource::RendererBlob { .. }) {
+            // A GPU compositor re-binds on every page flip; `info` here would
+            // be sixty lines a second. The first one is announced by
+            // `set_scanout_blob`, a mode change by the display itself.
+            tracing::debug!(
+                scanout = scanout_id,
+                resource = resource_id,
+                width = rect.width,
+                height = rect.height,
+                source = ?source,
+                "virtio-gpu scanout set"
+            );
+        } else {
+            tracing::info!(
+                scanout = scanout_id,
+                resource = resource_id,
+                width = rect.width,
+                height = rect.height,
+                source = ?source,
+                "virtio-gpu scanout set"
+            );
+        }
         Ok(Reply::ok())
     }
 
@@ -1661,6 +1694,14 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // against is the one `SET_SCANOUT_BLOB` declared for it.
         let (width, height, three_d) = if self.blobs.owns(cmd.resource_id) {
             match self.scanout {
+                // A renderer blob's image is the framebuffer the guest
+                // declared, and the kernel's damage rects are in its
+                // coordinates.
+                Some(ScanoutBinding {
+                    resource_id,
+                    source: ScanoutSource::RendererBlob { spec },
+                    ..
+                }) if resource_id == cmd.resource_id => (spec.width, spec.height, true),
                 Some(s) if s.resource_id == cmd.resource_id => {
                     (s.rect.x + s.rect.width, s.rect.y + s.rect.height, false)
                 }
@@ -1730,6 +1771,22 @@ impl<S: ScanoutSink> GpuDevice<S> {
                         .update_scanout(dst_x, dst_y, clip.width, clip.height, &scratch)
                         .map_err(|error| CommandError::Display(error.to_string()))
                 });
+            self.flush_buf = scratch;
+            outcome?;
+        } else if let ScanoutSource::RendererBlob { spec } = scanout.source {
+            // S2a: a GPU compositor's frame. The pixels live in the renderer
+            // (a guest `VkDeviceMemory`); read the clipped rect back in the
+            // layout it accepted, into the buffer reused frame to frame, and
+            // push it down the same sink every other path uses.
+            let mut scratch = std::mem::take(&mut self.flush_buf);
+            let read = self
+                .three_d_mut(cmd::RESOURCE_FLUSH)
+                .and_then(|gpu| gpu.read_scanout_blob(cmd.resource_id, &spec, clip, &mut scratch));
+            let outcome = read.and_then(|()| {
+                self.display
+                    .update_scanout(dst_x, dst_y, clip.width, clip.height, &scratch)
+                    .map_err(|error| CommandError::Display(error.to_string()))
+            });
             self.flush_buf = scratch;
             outcome?;
         } else if three_d {
@@ -2166,15 +2223,19 @@ impl<S: ScanoutSink> GpuDevice<S> {
         Ok(Reply::ok())
     }
 
-    /// `SET_SCANOUT_BLOB`: bind a guest-memory blob to scanout 0.
+    /// `SET_SCANOUT_BLOB`: bind a blob to scanout 0.
     ///
     /// This is the one blob command with a *format*, because a blob has none
     /// of its own — the guest declares width, height, format and per-plane
     /// strides here. Only single-plane BGRA is accepted (the same two layouts
-    /// the 2D path takes), and only for a blob whose bytes are guest pages:
-    /// presenting a host3d blob would need the zero-copy export this host
-    /// cannot do (ADR-0004 phase 2's dmabuf probe), and pretending otherwise
-    /// would show the guest a black screen instead of an error.
+    /// the 2D path takes).
+    ///
+    /// A guest-memory blob's pixels are guest pages, and flushes gather them
+    /// here. A renderer blob's pixels are the renderer's (S2a: a GPU
+    /// compositor's `VkDeviceMemory`); it is bound only if the renderer says
+    /// it can read that layout back ([`Renderer3d::scanout_blob`]), and every
+    /// renderer that cannot keeps answering the in-band error this command
+    /// always gave host blobs — never a black screen the guest believes in.
     fn set_scanout_blob(&mut self, buf: &[u8]) -> Result<Reply, CommandError> {
         let kind = cmd::SET_SCANOUT_BLOB;
         let cmd = SetScanoutBlob::parse(buf)
@@ -2201,6 +2262,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
             .blobs_mut(kind)?
             .get(cmd.resource_id)
             .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
+        if blob.is_host() {
+            // S2a: the renderer owns these bytes (a GPU compositor's
+            // `VkDeviceMemory`); it decides whether it can present them.
+            return self.set_scanout_renderer_blob(&cmd);
+        }
         if blob.blob_mem() != BLOB_MEM_GUEST {
             return Err(CommandError::BadBlobMem {
                 blob_mem: blob.blob_mem(),
@@ -2247,6 +2313,92 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 stride: cmd.strides[0],
                 offset: cmd.offsets[0],
             },
+        )
+    }
+
+    /// `SET_SCANOUT_BLOB` of a renderer blob (`HOST3D`/`HOST3D_GUEST`) — a
+    /// GPU compositor's page flip (S2a). The format and planes were checked
+    /// by the caller.
+    ///
+    /// The layout is bounded here against everything the device knows — the
+    /// scanout rect inside the framebuffer, the framebuffer inside
+    /// [`crate::MAX_RESOURCE_PIXELS`], a stride that holds a row, and the
+    /// whole plane inside the blob's declared size — and only then is the
+    /// renderer asked whether it can read it ([`Renderer3d::scanout_blob`]).
+    ///
+    /// The guest sends this on **every** flip, alternating between two or
+    /// three buffers, so the renderer's acceptance is remembered per blob: a
+    /// flip to a buffer whose layout was already accepted costs a table
+    /// lookup and no renderer call, and only a changed layout is asked again.
+    fn set_scanout_renderer_blob(&mut self, cmd: &SetScanoutBlob) -> Result<Reply, CommandError> {
+        let blob = self
+            .blobs
+            .get(cmd.resource_id)
+            .ok_or(CommandError::UnknownResource(cmd.resource_id))?;
+        let geometry = CommandError::BadGeometry {
+            width: cmd.width,
+            height: cmd.height,
+        };
+        if !cmd.rect.fits_within(cmd.width, cmd.height) {
+            return Err(CommandError::RectOutOfBounds {
+                rect: cmd.rect,
+                width: cmd.width,
+                height: cmd.height,
+            });
+        }
+        if u64::from(cmd.width) * u64::from(cmd.height) > crate::MAX_RESOURCE_PIXELS {
+            return Err(geometry);
+        }
+        let min_stride = u64::from(cmd.width) * u64::from(crate::BYTES_PER_PIXEL);
+        let stride = u64::from(cmd.strides[0]);
+        if stride < min_stride {
+            return Err(geometry);
+        }
+        let needed = u64::from(cmd.offsets[0])
+            .checked_add(stride.saturating_mul(u64::from(cmd.height)))
+            .ok_or(geometry)?;
+        if needed > blob.size() {
+            return Err(CommandError::ShortBacking {
+                need: needed,
+                have: blob.size(),
+            });
+        }
+        let spec = ScanoutBlobSpec {
+            format: cmd.format,
+            width: cmd.width,
+            height: cmd.height,
+            stride: cmd.strides[0],
+            offset: cmd.offsets[0],
+        };
+        if blob.scanout_spec() != Some(spec) {
+            self.three_d_mut(cmd::SET_SCANOUT_BLOB)?
+                .scanout_blob(cmd.resource_id, &spec)?;
+            self.blobs.set_scanout_spec(cmd.resource_id, spec);
+            tracing::debug!(
+                resource = cmd.resource_id,
+                spec = ?spec,
+                "virtio-gpu renderer accepted a scanout blob layout"
+            );
+        }
+        if !self.renderer_blob_scanned_out {
+            self.renderer_blob_scanned_out = true;
+            tracing::info!(
+                resource = cmd.resource_id,
+                width = spec.width,
+                height = spec.height,
+                stride = spec.stride,
+                format = spec.format,
+                "virtio-gpu is scanning out a renderer blob: the guest composites on the GPU"
+            );
+        }
+        // Still re-bound every time: a mode check and a record, no renderer
+        // call — and the same resolution follow-up the 2D path gives a
+        // re-issued SET_SCANOUT.
+        self.bind_scanout(
+            cmd.scanout_id,
+            cmd.resource_id,
+            cmd.rect,
+            ScanoutSource::RendererBlob { spec },
         )
     }
 
@@ -2627,6 +2779,15 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
                     ScanoutSource::Blob { stride, offset } => {
                         crate::save::SavedScanoutSource::Blob { stride, offset }
                     }
+                    // Recorded as the blob it is, which a restore treats
+                    // exactly like a 3D-resource scanout: host-owned, not
+                    // rebound, the window keeps its initial frame — and the
+                    // blob itself is counted in `live_blobs`, which tells the
+                    // restored driver to start again.
+                    ScanoutSource::RendererBlob { spec } => crate::save::SavedScanoutSource::Blob {
+                        stride: spec.stride,
+                        offset: spec.offset,
+                    },
                 },
             }),
         };
@@ -2800,6 +2961,7 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         // The driver has done what it was told; the restore's warning is spent.
         self.restored_3d_lost = false;
         self.restored_3d_reported = false;
+        self.renderer_blob_scanned_out = false;
     }
 }
 

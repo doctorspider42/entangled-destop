@@ -64,6 +64,7 @@ use crate::protocol::{
     MemEntry, BLOB_FLAG_MASK, BLOB_FLAG_USE_CROSS_DEVICE, BLOB_FLAG_USE_MAPPABLE, BLOB_MEM_GUEST,
     BLOB_MEM_HOST3D, BLOB_MEM_HOST3D_GUEST, MAP_CACHE_CACHED, MAP_CACHE_MASK, MAP_CACHE_WC,
 };
+use crate::renderer::ScanoutBlobSpec;
 
 /// Granularity of everything in the host-visible window. Blob sizes and map
 /// offsets are multiples of this, because the guest maps the window with its
@@ -192,6 +193,12 @@ pub struct BlobResource {
     backing_len: u64,
     /// Offset inside the host-visible window while mapped.
     mapped_at: Option<u64>,
+    /// The scanout layout the renderer last accepted for this blob
+    /// ([`Renderer3d::scanout_blob`](crate::renderer::Renderer3d::scanout_blob)),
+    /// for a renderer blob. Kept here so it dies with the blob: a compositor
+    /// flips between a few buffers, and `SET_SCANOUT_BLOB` of a buffer whose
+    /// layout was already accepted must not ask the renderer again.
+    scanout_spec: Option<ScanoutBlobSpec>,
 }
 
 impl BlobResource {
@@ -238,6 +245,11 @@ impl BlobResource {
     /// Where in the host-visible window this blob is mapped, if it is.
     pub fn mapped_at(&self) -> Option<u64> {
         self.mapped_at
+    }
+
+    /// The scanout layout the renderer accepted for this blob, if any.
+    pub fn scanout_spec(&self) -> Option<ScanoutBlobSpec> {
+        self.scanout_spec
     }
 }
 
@@ -581,6 +593,7 @@ impl BlobTable {
                 backing,
                 backing_len,
                 mapped_at: None,
+                scanout_spec: None,
             },
         );
         Ok(())
@@ -638,6 +651,13 @@ impl BlobTable {
     pub fn commit_mapping(&mut self, id: u32, offset: u64) {
         if let Some(blob) = self.resources.get_mut(&id) {
             blob.mapped_at = Some(offset);
+        }
+    }
+
+    /// Records the scanout layout the renderer accepted for blob `id`.
+    pub fn set_scanout_spec(&mut self, id: u32, spec: ScanoutBlobSpec) {
+        if let Some(blob) = self.resources.get_mut(&id) {
+            blob.scanout_spec = Some(spec);
         }
     }
 
