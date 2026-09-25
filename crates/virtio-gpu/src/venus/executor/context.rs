@@ -222,6 +222,16 @@ pub struct VulkanContext<H: HostVulkan> {
     /// where an import of a blob of memory finds its pages (stage 5c).
     /// `None` until a ring of the context exists.
     pub(super) blobs: Option<crate::venus::renderer::ContextBlobs>,
+    /// Which shared payloads each command buffer's recording touches
+    /// ([`super::writes`]).
+    pub(super) recordings: super::writes::Recordings,
+    /// The executor's table of running touches of shared payloads, every
+    /// context's and the scanout device's ([`super::writes`]).
+    pub(super) payloads: Arc<super::writes::Payloads>,
+    /// What this context's claims have waited for.
+    pub(super) shared_waits: super::writes::SharedWaits,
+    /// Whether "submits go unordered" has been logged for this context.
+    pub(super) unordered_logged: bool,
 }
 
 impl<H: HostVulkan> VulkanContext<H> {
@@ -261,6 +271,10 @@ impl<H: HostVulkan> VulkanContext<H> {
             fence_threads,
             stop: None,
             blobs: None,
+            recordings: super::writes::Recordings::default(),
+            payloads: super::writes::Payloads::new(),
+            shared_waits: super::writes::SharedWaits::default(),
+            unordered_logged: false,
         }
     }
 
@@ -314,6 +328,8 @@ impl<H: HostVulkan> VulkanContext<H> {
     pub fn destroy_all(&mut self) {
         let host = Arc::clone(&self.host);
         self.objects.destroy_all(&host);
+        self.recordings = super::writes::Recordings::default();
+        self.payloads.forget_context(self.ctx_id);
     }
 
     /// Execute one decoded command, filling its outputs in place.
@@ -1513,6 +1529,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             .map_err(id_error("vkDestroyDevice"))?;
         let host = Arc::clone(&self.host);
         self.objects.destroy_device(&host, args.device.0);
+        self.prune_recordings();
         Ok(())
     }
 
@@ -1588,6 +1605,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 family: info.queue_family_index,
                 pending: Pending::default(),
                 sync: None,
+                marks: 0,
             },
         );
         Ok(())
@@ -1688,6 +1706,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             let device = self.objects.device(args.device.0).map_err(id_error(NAME))?;
             self.host.destroy_command_pool(&device.host, pool);
         }
+        self.prune_recordings();
         Ok(())
     }
 

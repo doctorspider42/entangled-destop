@@ -1181,40 +1181,47 @@ fn setup_zink(h: &mut Harness<AshVulkan>) {
 /// [`setup_zink`]'s device, pool, queue and command buffers on a booted
 /// context, with `extra` extensions beside Zink's.
 fn zink_device(h: &mut Harness<AshVulkan>, extra: &[&'static str]) {
+    zink_device_with(h, extra, Vec::new());
+}
+
+/// [`zink_device`], with `links` chained after Zink's feature structures.
+fn zink_device_with(
+    h: &mut Harness<AshVulkan>,
+    extra: &[&'static str],
+    links: Vec<VkDeviceCreateInfoNext>,
+) {
     let mut names: Vec<&'static str> = ZINK_DEVICE_EXTENSIONS.to_vec();
     names.extend_from_slice(extra);
-    let mut create = create_device(
-        PHYSICAL,
-        DEVICE,
-        vec![
-            VkDeviceCreateInfoNext::VkPhysicalDeviceVulkan13Features(
-                VkPhysicalDeviceVulkan13Features {
-                    dynamic_rendering: 1,
-                    synchronization2: 1,
-                    ..Default::default()
-                },
-            ),
-            VkDeviceCreateInfoNext::VkPhysicalDeviceTransformFeedbackFeaturesEXT(
-                VkPhysicalDeviceTransformFeedbackFeaturesEXT {
-                    transform_feedback: 1,
-                    geometry_streams: 0,
-                },
-            ),
-            VkDeviceCreateInfoNext::VkPhysicalDeviceConditionalRenderingFeaturesEXT(
-                VkPhysicalDeviceConditionalRenderingFeaturesEXT {
-                    conditional_rendering: 1,
-                    inherited_conditional_rendering: 0,
-                },
-            ),
-            VkDeviceCreateInfoNext::VkPhysicalDeviceRobustness2FeaturesKHR(
-                VkPhysicalDeviceRobustness2FeaturesKHR {
-                    robust_buffer_access2: 1,
-                    robust_image_access2: 1,
-                    null_descriptor: 1,
-                },
-            ),
-        ],
-    );
+    let mut chain = vec![
+        VkDeviceCreateInfoNext::VkPhysicalDeviceVulkan13Features(
+            VkPhysicalDeviceVulkan13Features {
+                dynamic_rendering: 1,
+                synchronization2: 1,
+                ..Default::default()
+            },
+        ),
+        VkDeviceCreateInfoNext::VkPhysicalDeviceTransformFeedbackFeaturesEXT(
+            VkPhysicalDeviceTransformFeedbackFeaturesEXT {
+                transform_feedback: 1,
+                geometry_streams: 0,
+            },
+        ),
+        VkDeviceCreateInfoNext::VkPhysicalDeviceConditionalRenderingFeaturesEXT(
+            VkPhysicalDeviceConditionalRenderingFeaturesEXT {
+                conditional_rendering: 1,
+                inherited_conditional_rendering: 0,
+            },
+        ),
+        VkDeviceCreateInfoNext::VkPhysicalDeviceRobustness2FeaturesKHR(
+            VkPhysicalDeviceRobustness2FeaturesKHR {
+                robust_buffer_access2: 1,
+                robust_image_access2: 1,
+                null_descriptor: 1,
+            },
+        ),
+    ];
+    chain.extend(links);
+    let mut create = create_device(PHYSICAL, DEVICE, chain);
     if let Command::CreateDevice(a) = &mut create {
         let info = a.p_create_info.as_mut().unwrap();
         info.enabled_extension_count = names.len() as u32;
@@ -3050,4 +3057,358 @@ fn a_handle_blob_flip_reads_back_the_frame_through_the_renderers_scanout_device(
     assert_eq!(h.renderer.factory().host_objects(), 0);
     h.renderer.reset();
     assert!(!h.fatal());
+}
+
+/// A 1920×1080 frame of `clears` full-image clears, each after a barrier on
+/// the one before (so they run in order), every one a different colour and
+/// the last `last`: acquired from `FOREIGN` first and released to it after,
+/// as Zink's batch does. Heavy on purpose — tens of milliseconds of GPU time
+/// in one submit.
+fn heavy_frame(image: u64, clears: u32, last: [f32; 4]) -> Vec<Command<'static>> {
+    let mut commands = vec![
+        begin(CB),
+        image_barrier2_families(
+            CB,
+            image,
+            (LAYOUT_TRANSFER_DST, LAYOUT_TRANSFER_DST),
+            (STAGE2_NONE, 0),
+            (STAGE2_TRANSFER, 0x1000),
+            (FOREIGN, 0),
+        ),
+    ];
+    for i in 0..clears {
+        let colour = if i + 1 == clears {
+            last
+        } else {
+            let v = (i % 200) as f32 / 255.0;
+            [v, 1.0 - v, 0.5, 1.0]
+        };
+        commands.push(image_barrier2(
+            CB,
+            image,
+            (LAYOUT_TRANSFER_DST, LAYOUT_TRANSFER_DST),
+            (STAGE2_TRANSFER, 0x1000),
+            (STAGE2_TRANSFER, 0x1000),
+        ));
+        commands.push(Command::CmdClearColorImage(CmdClearColorImageArgs {
+            command_buffer: VkCommandBuffer(CB),
+            image: VkImage(image),
+            image_layout: LAYOUT_TRANSFER_DST,
+            p_color: Some(VkClearColorValue::Float32(colour)),
+            range_count: 1,
+            p_ranges: Some(vec![color_range()]),
+        }));
+    }
+    commands.push(image_barrier2_families(
+        CB,
+        image,
+        (LAYOUT_TRANSFER_DST, LAYOUT_TRANSFER_DST),
+        (STAGE2_TRANSFER, 0x1000),
+        (STAGE2_NONE, 0),
+        (0, FOREIGN),
+    ));
+    commands.push(end(CB));
+    commands
+}
+
+/// The scanout tear, on the host GPU (ADR-0004, "the scanout tear"):
+/// context 1 renders a heavy 1920×1080 frame into its scanout buffer — some
+/// 40 ms of ordered full-image clears in one submit, the last one a known
+/// colour — and flips at once, without waiting, as a compositor whose flip
+/// the kernel does not fence can. The renderer's scanout read runs on a
+/// device of its own; before the fix it acquired the image from `FOREIGN`
+/// with nothing ordering it after context 1's queue, and read whatever
+/// clear the GPU had reached. Now it must return the finished frame, every
+/// pixel the last colour, and never an earlier one. Five times over, and
+/// once more after a warm frame to time the clears. Skips on a host that
+/// cannot export device-local memory.
+#[test]
+fn a_heavy_frame_flipped_at_once_is_read_back_complete_never_partial() {
+    use crate::protocol::Rect;
+    use crate::renderer::ScanoutBlobSpec;
+    const IMG: u64 = 0x700;
+    const IMG_MEM: u64 = 0x701;
+    const RES: u32 = 97;
+    const S1: &[&str] = &[
+        "VK_EXT_queue_family_foreign",
+        "VK_EXT_image_drm_format_modifier",
+    ];
+    let Some(host) = host() else { return };
+    let mut h = Harness::new(host);
+    boot(&mut h);
+    let shown = device_extension_names(&mut h);
+    if !S1.iter().all(|n| shown.iter().any(|s| s == n)) {
+        eprintln!("skipping: this host cannot export device-local memory (stage S1)");
+        return;
+    }
+    zink_device(&mut h, S1);
+    let (w, hh) = (1920u32, 1080u32);
+    let pitch = scanout_export(&mut h, (IMG, IMG_MEM, RES), (w, hh), 0x10 | 0x1 | 0x2);
+    // A first frame from UNDEFINED, waited for, to leave the image
+    // TRANSFER_DST and time one clear.
+    let warm = 200u32;
+    let mut first = heavy_frame(IMG, warm, [0.0, 0.0, 0.0, 1.0]);
+    if let Command::CmdPipelineBarrier2(a) = &mut first[1] {
+        if let Some(b) = a
+            .p_dependency_info
+            .as_mut()
+            .and_then(|d| d.p_image_memory_barriers.as_mut())
+            .and_then(|b| b.first_mut())
+        {
+            b.old_layout = LAYOUT_UNDEFINED;
+            b.src_queue_family_index = u32::MAX;
+            b.dst_queue_family_index = u32::MAX;
+        }
+    }
+    let start = std::time::Instant::now();
+    submit_frame(&mut h, &first, 0xf8);
+    let per_clear = start.elapsed() / warm;
+    // Some 40 ms of GPU work: long against a copy, short of SCANOUT_WAIT.
+    let clears = u32::try_from(
+        (std::time::Duration::from_millis(40).as_nanos() / per_clear.as_nanos().max(1))
+            .clamp(200, 20_000),
+    )
+    .unwrap_or(200);
+    eprintln!("tear: {per_clear:?} per clear, {clears} clears per frame");
+    h.renderer
+        .scanout_blob(
+            RES,
+            &ScanoutBlobSpec {
+                format: crate::FORMAT_B8G8R8X8_UNORM,
+                width: w,
+                height: hh,
+                stride: pitch as u32,
+                offset: 0,
+            },
+        )
+        .expect("the 1080p flip");
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: w,
+        height: hh,
+    };
+    for (round, last) in [
+        [1.0f32, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [1.0, 1.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0, 1.0],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            h.submit_recording(&heavy_frame(IMG, clears, last)),
+            Outcome::Consumed
+        );
+        // No fence and no wait: the flip follows the submit at once.
+        h.send(&queue_submit(QUEUE, &[CB], 0)).unwrap();
+        let start = std::time::Instant::now();
+        let mut got = Vec::new();
+        h.renderer
+            .read_rect_bgra(RES, whole, &mut got)
+            .expect("the read waits for the frame, well inside its bound");
+        let waited = start.elapsed();
+        let texel = raster::clear_rgba8(last);
+        let texel = [texel[2], texel[1], texel[0], texel[3]];
+        let wrong = got.chunks_exact(4).filter(|p| *p != texel).count();
+        eprintln!("tear: round {round}: read after {waited:?}, {wrong} pixels not the last clear");
+        assert_eq!(got.len(), (w * hh * 4) as usize);
+        assert_eq!(wrong, 0, "round {round}: a frame the GPU had not finished");
+        // Idle before the command buffer is recorded again.
+        h.send(&create_fence(DEVICE, 0xf9, false)).unwrap();
+        h.send(&queue_submit(QUEUE, &[], 0xf9)).unwrap();
+        h.send(&wait_fences(DEVICE, &[0xf9], u64::MAX)).unwrap();
+        h.send(&destroy_fence(DEVICE, 0xf9)).unwrap();
+    }
+    h.renderer.destroy_blob(RES);
+    h.send(&Command::DestroyInstance(DestroyInstanceArgs {
+        instance: VkInstance(INSTANCE),
+    }))
+    .unwrap();
+    assert_eq!(h.renderer.factory().host_objects(), 0);
+    h.renderer.reset();
+    assert!(!h.fatal());
+}
+
+/// The scanout tear's root cause, on the host GPU (ADR-0004): Zink sets the
+/// primitive topology dynamically only on a device showing
+/// `VK_EXT_extended_dynamic_state` with its feature bit; without it, it keeps
+/// a `TRIANGLE_LIST` pipeline bound for a `TRIANGLE_FAN` draw, and a GNOME
+/// window — one Cogl quad, a four-vertex fan — came out as its first
+/// triangle. Here, as Zink with the extension does: the device is shown the
+/// extension and the bit, is created with both, a pipeline is made with the
+/// topology dynamic (`TRIANGLE_LIST` as its class), and a four-vertex quad
+/// is drawn after `vkCmdSetPrimitiveTopology(TRIANGLE_FAN)` — every pixel
+/// covered. The same draw as a list covers half: the dynamic state reaches
+/// the driver.
+#[test]
+fn a_quad_drawn_as_a_fan_through_the_dynamic_topology_covers_every_pixel() {
+    const SIZE: u32 = raster::SIZE;
+    const IMG: u64 = 0x400;
+    const IMG_MEM: u64 = 0x401;
+    const VIEW: u64 = 0x402;
+    const EDS: &str = "VK_EXT_extended_dynamic_state";
+    const DYNAMIC_PRIMITIVE_TOPOLOGY: i32 = 1_000_267_002;
+    let Some(host) = host() else { return };
+    let mut h = Harness::new(host);
+    boot(&mut h);
+    let shown = device_extension_names(&mut h);
+    if !shown.iter().any(|s| s == "VK_EXT_robustness2") {
+        eprintln!("skipping: not a device Zink runs on");
+        return;
+    }
+    assert!(
+        shown.iter().any(|s| s == EDS),
+        "{EDS} is shown wherever the host has it"
+    );
+    let mut query = VkPhysicalDeviceFeatures2::default();
+    query.p_next.push(
+        VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceExtendedDynamicStateFeaturesEXT(
+            VkPhysicalDeviceExtendedDynamicStateFeaturesEXT::default(),
+        ),
+    );
+    let Command::GetPhysicalDeviceFeatures2(f) = h
+        .call(&Command::GetPhysicalDeviceFeatures2(
+            GetPhysicalDeviceFeatures2Args {
+                physical_device: VkPhysicalDevice(PHYSICAL),
+                p_features: Some(query),
+            },
+        ))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let bit = f.p_features.unwrap().p_next.iter().find_map(|l| match l {
+        VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceExtendedDynamicStateFeaturesEXT(e) => {
+            Some(e.extended_dynamic_state)
+        }
+        _ => None,
+    });
+    assert_eq!(
+        bit,
+        Some(1),
+        "Zink's condition: $feats.extendedDynamicState"
+    );
+    zink_device_with(
+        &mut h,
+        &[EDS],
+        vec![
+            VkDeviceCreateInfoNext::VkPhysicalDeviceExtendedDynamicStateFeaturesEXT(
+                VkPhysicalDeviceExtendedDynamicStateFeaturesEXT {
+                    extended_dynamic_state: 1,
+                },
+            ),
+        ],
+    );
+    let types = memory_types(&mut h);
+    let info = VkImageCreateInfo {
+        image_type: 1,
+        format: RGBA8,
+        extent: VkExtent3D {
+            width: SIZE,
+            height: SIZE,
+            depth: 1,
+        },
+        mip_levels: 1,
+        array_layers: 1,
+        samples: 1,
+        tiling: 0,
+        usage: 0x10 | 0x1, // COLOR_ATTACHMENT | TRANSFER_SRC
+        ..Default::default()
+    };
+    let Command::CreateImage(i) = h.call(&create_image(DEVICE, IMG, info)).unwrap() else {
+        panic!()
+    };
+    assert_eq!(i.ret, VK_SUCCESS);
+    let Command::GetImageMemoryRequirements2(r) =
+        h.call(&memory_requirements(DEVICE, IMG)).unwrap()
+    else {
+        panic!()
+    };
+    let req = r.p_memory_requirements.unwrap().memory_requirements;
+    let ty = pick_type(&types, req.memory_type_bits, MEM_PROPERTY_DEVICE_LOCAL);
+    h.send(&allocate(DEVICE, IMG_MEM, req.size, ty, Vec::new()))
+        .unwrap();
+    h.send(&bind_image(DEVICE, IMG, IMG_MEM, 0)).unwrap();
+    h.send(&create_image_view(DEVICE, VIEW, IMG, RGBA8))
+        .unwrap();
+    // A full-viewport quad in fan order, white.
+    let quad: [f32; 20] = [
+        -1.0, -1.0, 1.0, 1.0, 1.0, //
+        1.0, -1.0, 1.0, 1.0, 1.0, //
+        1.0, 1.0, 1.0, 1.0, 1.0, //
+        -1.0, 1.0, 1.0, 1.0, 1.0,
+    ];
+    let vertices = buffer(&mut h, 0x410, 80, USAGE_VERTEX, true);
+    vertices.write_words(&quad.map(f32::to_bits));
+    let bytes = u64::from(SIZE * SIZE * 4);
+    let readback = buffer(&mut h, 0x420, bytes, USAGE_TRANSFER_DST, true);
+    h.send(&create_render_pass(DEVICE, RENDER_PASS, RGBA8))
+        .unwrap();
+    h.send(&create_framebuffer(
+        DEVICE,
+        FRAMEBUFFER,
+        RENDER_PASS,
+        VIEW,
+        SIZE,
+    ))
+    .unwrap();
+    h.send(&create_shader_module(DEVICE, SHADER, &spirv(TRIANGLE_WGSL)))
+        .unwrap();
+    h.send(&create_pipeline_layout(DEVICE, PIPELINE_LAYOUT, &[]))
+        .unwrap();
+    let mut pipeline =
+        create_triangle_pipeline(DEVICE, PIPELINE, SHADER, PIPELINE_LAYOUT, RENDER_PASS, SIZE);
+    if let Command::CreateGraphicsPipelines(a) = &mut pipeline {
+        for info in a.p_create_infos.iter_mut().flatten() {
+            info.p_dynamic_state = Some(VkPipelineDynamicStateCreateInfo {
+                flags: 0,
+                dynamic_state_count: 1,
+                p_dynamic_states: Some(vec![DYNAMIC_PRIMITIVE_TOPOLOGY]),
+            });
+        }
+    }
+    h.send(&pipeline).unwrap();
+    assert!(!h.fatal(), "every object was accepted");
+    let black = [0.0f32, 0.0, 0.0, 1.0];
+    let uncovered = |h: &mut Harness<AshVulkan>, topology: i32, fence: u64| -> usize {
+        let outcome = h.submit_recording(&[
+            begin(CB),
+            begin_render_pass(CB, RENDER_PASS, FRAMEBUFFER, SIZE, black),
+            bind_pipeline(CB, 0, PIPELINE),
+            Command::CmdSetPrimitiveTopology(CmdSetPrimitiveTopologyArgs {
+                command_buffer: VkCommandBuffer(CB),
+                primitive_topology: topology,
+            }),
+            bind_vertex_buffer(CB, vertices.id),
+            draw(CB, 4),
+            end_render_pass(CB),
+            copy_image_to_buffer(CB, IMG, readback.id, SIZE),
+            buffer_barrier(
+                CB,
+                readback.id,
+                (STAGE_TRANSFER, ACCESS_TRANSFER_WRITE),
+                (STAGE_HOST, ACCESS_HOST_READ),
+            ),
+            end(CB),
+        ]);
+        assert_eq!(outcome, Outcome::Consumed);
+        submit_and_wait(h, &[CB], fence);
+        h.send(&destroy_fence(DEVICE, fence)).unwrap();
+        let mut got = vec![0u8; bytes as usize];
+        readback.pages().read_bytes(0, &mut got).unwrap();
+        got.chunks_exact(4).filter(|p| p[0] < 128).count()
+    };
+    let fan = uncovered(&mut h, 5, 0xe0); // TRIANGLE_FAN
+    let list = uncovered(&mut h, 3, 0xe1); // TRIANGLE_LIST
+    let total = (SIZE * SIZE) as usize;
+    eprintln!("dynamic topology: fan leaves {fan} of {total} pixels, list {list}");
+    assert_eq!(fan, 0, "a fan quad covers every pixel");
+    assert!(
+        list > total / 3 && list < total * 2 / 3,
+        "the same four vertices as a list are one triangle: {list} of {total}"
+    );
+    teardown(h);
 }

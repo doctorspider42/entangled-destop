@@ -327,7 +327,10 @@ builds it instead (~2.5 min).
 On Windows there is no `fetch-ubuntu-iso.sh` — it is a bash script. Either run
 it once in WSL (the cache is `%LOCALAPPDATA%\entangled` on Windows and
 `~/.cache/entangled` on Linux, so copy the ISO across), or download the ISO
-yourself and pass `--iso <path>` to the install command below.
+yourself and pass `--iso <path>` to the install command below. **An ISO
+given with `--iso` is used as it is**: the install command checks nothing about
+it, so the signature and checksum checks above are yours to make — compare its
+SHA-256 (`Get-FileHash` in PowerShell) with Canonical's signed `SHA256SUMS`.
 
 **2. Install.** One command; it creates the disk, generates the unattended
 answer file, boots the installer, types the installer's kernel command line into
@@ -364,7 +367,9 @@ entangled run ~/entangled-vms/ubuntu.toml
 
 The first boot takes a couple of minutes: cloud-init generates SSH host keys,
 and a machine with no network card waits out two systemd timeouts before the
-login prompt. Add `--headless` to keep it on the terminal instead of opening a
+login prompt. The built-in answer files create one user, **`entangled` with the
+password `entangled`** (a sudoer, in both the server and the desktop profile)
+— a demo credential, so change it with `passwd` on any machine you keep. Add `--headless` to keep it on the terminal instead of opening a
 window.
 
 **For a desktop rather than a server**, fetch the Desktop ISO and point the same
@@ -415,6 +420,14 @@ finished machine:
 `--venus` needs `--auto` with the Desktop ISO, or an `--autoinstall` file with a
 `late-commands:` list for it to extend; it refuses a server ISO, which has no
 GNOME to put on the GPU.
+
+The first boot ends at GDM's login screen, already composited on the GPU; log
+in as `entangled`, password `entangled`. Measured on Windows (RTX 2070) with the
+Ubuntu 26.04.1 Desktop ISO: the install took 10 min 38 s, and the installed
+guest reached its login prompt about 40 s after `entangled run`. The written
+profile has no `[network]` section, like every `install ubuntu` profile; add
+`backend = "usernet"` under `[network]` for a machine that can reach the
+internet.
 
 **The host needs a Vulkan device** with `VK_EXT_external_memory_host`, and on
 Windows `VK_KHR_external_memory_win32` for GNOME itself to composite on the GPU.

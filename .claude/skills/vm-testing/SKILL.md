@@ -794,6 +794,15 @@ The desktop profile is 4096 MiB (the high-RAM split: RAM above the 32-bit MMIO
 hole continues at 4 GiB) and reaches the GNOME live session in a few minutes of
 llvmpipe; `--screenshot-after N` writes the scanout as PNG after N seconds and
 refreshes it every 20 s, which is how an unattended graphical boot is watched.
+`--screenshot-every MS` (with `--screenshot-after`) turns that into a burst:
+one PNG every MS milliseconds, each to its own numbered file
+(`<stem>-0001.png`, ...) beside `--screenshot` — what counting torn frames
+needs, since copying the one refreshed file races its writer. A 1080p PNG takes
+~0.3 s to encode, so 1000 ms gives a frame about every 1.3 s. Look at a torn
+GNOME-on-the-GPU frame before blaming timing: every such tear in ADR-0004's
+"scanout tear" amendment was a pipeline of the wrong primitive topology
+(Zink's no-extended-dynamic-state path), deterministic in the guest's command
+stream, not a race.
 
 Two `#[ignore]`d tests pin this path:
 

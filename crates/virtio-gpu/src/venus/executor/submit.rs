@@ -239,7 +239,13 @@ impl<H: HostVulkan> VulkanContext<H> {
     }
 
     /// `vkWaitForFences` on host handles, for the executor's own waits.
-    fn host_wait_fences(&mut self, device: u64, fences: &[u64], all: bool, timeout: u64) -> i32 {
+    pub(super) fn host_wait_fences(
+        &mut self,
+        device: u64,
+        fences: &[u64],
+        all: bool,
+        timeout: u64,
+    ) -> i32 {
         let mut command = Command::WaitForFences(WaitForFencesArgs {
             device: VkDevice(device),
             fence_count: u32::try_from(fences.len()).unwrap_or(u32::MAX),
@@ -997,7 +1003,15 @@ impl<H: HostVulkan> VulkanContext<H> {
                     .host,
             ),
         };
-        self.pass_through(command)?;
+        // Shared payloads first: no other owner's work on them may still be
+        // running when this starts (`super::writes`). The mark follows the
+        // submit whatever the driver answers, so the claim always ends.
+        let claim = self.claim_payloads(queue, &buffers);
+        let passed = self.pass_through(command);
+        if let Some(claim) = claim {
+            self.submit_mark(claim);
+        }
+        passed?;
         if generated::result_of(command) == Some(VK_SUCCESS) {
             for (id, state) in states {
                 self.set_semaphore_state(device, id, state);
@@ -1018,6 +1032,39 @@ impl<H: HostVulkan> VulkanContext<H> {
     }
 
     // ------------------------------------------------------- ring fences
+
+    /// Start queue `queue`'s fence thread ([`super::timeline`]) if it has
+    /// none: for its first ring fence, or its first mark
+    /// ([`super::writes`]).
+    ///
+    /// # Errors
+    /// The executor already runs [`super::timeline::MAX_FENCE_THREADS`], or
+    /// the thread did not start.
+    pub(super) fn start_queue_sync(&mut self, queue: u64) -> Result<(), String> {
+        let (device, ring_idx) = {
+            let q = self.objects.queue(queue).map_err(|e| e.to_string())?;
+            if q.sync.is_some() {
+                return Ok(());
+            }
+            (q.device, q.ring_idx)
+        };
+        let handle = Arc::clone(&self.objects.device(device).map_err(|e| e.to_string())?.host);
+        let slot = self.fence_threads.take().ok_or_else(|| {
+            format!(
+                "the host already runs the {} fence threads it allows every guest process \
+                 together",
+                self.fence_threads.limit()
+            )
+        })?;
+        let ring = u8::try_from(ring_idx).unwrap_or(u8::MAX);
+        let sync = QueueSync::spawn(Arc::clone(&self.host), handle, self.ctx_id, ring, slot)
+            .map_err(|e| format!("the fence thread of ring_idx {ring_idx} did not start: {e}"))?;
+        self.objects
+            .queue_mut(queue)
+            .map_err(|e| e.to_string())?
+            .sync = Some(sync);
+        Ok(())
+    }
 
     /// A virtio-gpu fence on `fence.ring_idx` (stage 5b.3): an empty submit
     /// with a host fence on the queue bound to it, handed to the queue's
@@ -1056,40 +1103,7 @@ impl<H: HostVulkan> VulkanContext<H> {
         };
         // The thread first: once the submit is in, the fence must have a
         // waiter, or it could only be destroyed after a device-wide wait.
-        if self
-            .objects
-            .queue(queue)
-            .map_err(|e| e.to_string())?
-            .sync
-            .is_none()
-        {
-            let handle = Arc::clone(&self.objects.device(device).map_err(|e| e.to_string())?.host);
-            let slot = self.fence_threads.take().ok_or_else(|| {
-                format!(
-                    "the host already runs the {} fence threads it allows every guest process \
-                     together",
-                    self.fence_threads.limit()
-                )
-            })?;
-            let sync = QueueSync::spawn(
-                Arc::clone(&self.host),
-                handle,
-                retire.clone(),
-                self.ctx_id,
-                fence.ring_idx,
-                slot,
-            )
-            .map_err(|e| {
-                format!(
-                    "the fence thread of ring_idx {} did not start: {e}",
-                    fence.ring_idx
-                )
-            })?;
-            self.objects
-                .queue_mut(queue)
-                .map_err(|e| e.to_string())?
-                .sync = Some(sync);
-        }
+        self.start_queue_sync(queue)?;
         let mut create = Command::CreateFence(CreateFenceArgs {
             device: VkDevice(0),
             p_create_info: Some(VkFenceCreateInfo {
@@ -1137,7 +1151,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             .queue(queue)
             .ok()
             .and_then(|q| q.sync.as_ref())
-            .is_some_and(|s| s.push(fence.fence_id, host_fence));
+            .is_some_and(|s| s.push(fence.fence_id, host_fence, retire));
         if !pushed {
             // Cannot happen: room was checked and only a device teardown,
             // which takes the thread first, stops one. Wait it out rather

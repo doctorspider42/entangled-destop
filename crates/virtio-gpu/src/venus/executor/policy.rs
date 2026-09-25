@@ -327,6 +327,17 @@ pub const PROTOCOL_EXTENSIONS: &[&str] =
 ///   — structures only; a divisor's binding inside the device's limits.
 /// * `VK_EXT_custom_border_color` — structures and two border colours; no
 ///   more live samplers with one than `maxCustomBorderColorSamplers`.
+/// * `VK_EXT_extended_dynamic_state` — its feature structure only: its
+///   twelve commands were promoted to 1.3 and are encoded as the core ones
+///   (the same command types), which the executor serves on a 1.3 device.
+///   Zink needs the extension **by name** and the feature bit
+///   (`zink_device_info.py`, `$feats.extendedDynamicState`) to set the
+///   primitive topology dynamically; without it Zink takes its
+///   `ZINK_NO_DYNAMIC_STATE` path, which keeps a `TRIANGLE_LIST` pipeline
+///   bound for a `TRIANGLE_FAN` draw (a topology change inside one
+///   rasterisation class is not a pipeline change there, `zink_draw.cpp:
+///   676-733`), so every single-quad fan Cogl draws — a GNOME window — came
+///   out as its first triangle (ADR-0004, "the scanout tear").
 pub const ADMITTED_EXTENSIONS: &[&str] = &[
     "VK_EXT_command_serialization",
     "VK_MESA_venus_protocol",
@@ -334,6 +345,7 @@ pub const ADMITTED_EXTENSIONS: &[&str] = &[
     "VK_EXT_conditional_rendering",
     "VK_EXT_custom_border_color",
     "VK_EXT_depth_clip_enable",
+    "VK_EXT_extended_dynamic_state",
     "VK_EXT_line_rasterization",
     "VK_EXT_provoking_vertex",
     "VK_EXT_robustness2",
@@ -355,11 +367,13 @@ pub const ADMITTED_EXTENSIONS: &[&str] = &[
 /// * `VK_KHR_device_group` also adds swapchain interactions
 ///   (`VkImageSwapchainCreateInfoKHR`, `vkAcquireNextImage2KHR`) no stage
 ///   serves;
-/// * `VK_EXT_4444_formats`, `VK_EXT_extended_dynamic_state`,
-///   `VK_EXT_extended_dynamic_state2`, `VK_EXT_texel_buffer_alignment` and
-///   `VK_EXT_ycbcr_2plane_444_formats` keep a feature structure that was not
-///   promoted (and `extended_dynamic_state2` two commands that were not), so
-///   advertising them would promise structures the executor refuses;
+/// * `VK_EXT_4444_formats`, `VK_EXT_extended_dynamic_state2`,
+///   `VK_EXT_texel_buffer_alignment` and `VK_EXT_ycbcr_2plane_444_formats`
+///   keep a feature structure that was not promoted (and
+///   `extended_dynamic_state2` two commands that were not), so advertising
+///   them would promise structures the executor refuses
+///   (`VK_EXT_extended_dynamic_state`, which is the same case, is an
+///   [`ADMITTED_EXTENSIONS`] one: its structure is admitted);
 /// * `VK_KHR_descriptor_update_template` is in, because its one non-core
 ///   command, `vkCmdPushDescriptorSetWithTemplateKHR`, exists only with
 ///   `VK_KHR_push_descriptor`, which is not advertised.
@@ -1670,7 +1684,6 @@ mod tests {
             "VK_KHR_swapchain",
             EXTERNAL_MEMORY_HOST,
             "VK_KHR_device_group",
-            "VK_EXT_extended_dynamic_state",
             "VK_EXT_4444_formats",
             "VK_KHR_maintenance5",
             "VK_KHR_push_descriptor",
@@ -1767,7 +1780,7 @@ mod tests {
                 );
             }
         }
-        for name in ["VK_EXT_4444_formats", "VK_EXT_extended_dynamic_state"] {
+        for name in ["VK_EXT_4444_formats", "VK_EXT_extended_dynamic_state2"] {
             assert!(
                 info::STRUCTURES
                     .iter()
@@ -2065,6 +2078,7 @@ mod tests {
             (29, "VK_EXT_transform_feedback"),
             (82, "VK_EXT_conditional_rendering"),
             (287, "VK_EXT_robustness2"),
+            (268, "VK_EXT_extended_dynamic_state"),
             (260, "VK_EXT_line_rasterization"),
             (535, "VK_KHR_line_rasterization"),
         ] {
@@ -2076,7 +2090,7 @@ mod tests {
         for (number, name) in [
             (126, "VK_EXT_external_memory_dma_buf"),
             (75, "VK_KHR_external_memory_fd"),
-            (268, "VK_EXT_extended_dynamic_state"),
+            (378, "VK_EXT_extended_dynamic_state2"),
             (471, "VK_KHR_maintenance5"),
             (1, "VK_KHR_swapchain"),
             (158 + 1000, "no such extension"),
@@ -2097,19 +2111,19 @@ mod tests {
                     .any(|s| admits_link(s.stype) && s.extensions.contains(&ext.name));
             assert!(admitted, "{}", ext.name);
         }
-        // 60 until stage 5b.3, the twelve admitted device extensions, and
-        // (stage S1) the emulated VK_EXT_image_drm_format_modifier, whose
+        // 60 until stage 5b.3, the admitted device extensions, and (stage
+        // S1) the emulated VK_EXT_image_drm_format_modifier, whose
         // structures the guest's encoder drops without it.
         assert!(numbers.contains(&159), "VK_EXT_image_drm_format_modifier");
         assert!(
             !numbers.contains(&127),
             "VK_EXT_queue_family_foreign chains nothing"
         );
-        assert_eq!(numbers.len(), 73);
+        assert_eq!(numbers.len(), 74);
         let mask = admitted_extension_mask();
         assert!(mask.is_enumerated());
         let set: u32 = mask.words().iter().map(|w| w.count_ones()).sum();
-        assert_eq!(set, 74, "73 extensions and the sentinel");
+        assert_eq!(set, 75, "74 extensions and the sentinel");
         for name in ADMITTED_EXTENSIONS {
             let number = info::extension(name).expect("known").number;
             assert!(mask.is_enabled(number), "{name}'s bit is in the capset");

@@ -36,6 +36,16 @@
 //!   default here — `policy::external_semaphore_properties`) has none, and
 //!   at most one per bound queue otherwise (fewer than 64 per context).
 //!
+//! # Marks
+//!
+//! The same FIFO carries the **marks** of submits that touched a shared
+//! payload ([`super::writes`]): an empty submit's host fence, like a ring
+//! fence's, but completing a serial of the queue's [`Progress`] instead of
+//! retiring a virtio-gpu fence. A queue's first mark starts its thread just
+//! as a first ring fence does. Marks are not counted as pending fences —
+//! no guest waits on one — and a thread that goes completes its whole
+//! progress, so no waiter is left waiting on a queue that is gone.
+//!
 //! # What the thread may touch
 //!
 //! A host fence it owns, the device it waits on (an `Arc`, whose other holder
@@ -153,16 +163,32 @@ impl Drop for FenceThreadSlot {
     }
 }
 
+/// One host fence the thread waits for: a virtio-gpu fence's, or the mark
+/// of a submit that touched a handle blob ([`super::writes`]).
 #[derive(Debug, Clone, Copy)]
-struct Entry {
-    fence_id: u32,
-    host: u64,
+enum Entry {
+    /// Retired as virtio-gpu fence `fence_id` once `host` signals.
+    Ring { fence_id: u32, host: u64 },
+    /// Completes serial `serial` of the queue's [`Progress`] once `host`
+    /// signals.
+    Mark { serial: u64, host: u64 },
+}
+
+impl Entry {
+    fn host(self) -> u64 {
+        match self {
+            Self::Ring { host, .. } | Self::Mark { host, .. } => host,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct List {
     entries: VecDeque<Entry>,
     stop: bool,
+    /// Where virtio-gpu fences are retired: given with the first one, since
+    /// a queue whose first entry was a mark had none to give.
+    retire: Option<FenceRetirer>,
 }
 
 #[derive(Debug, Default)]
@@ -181,7 +207,8 @@ impl Shared {
 pub struct QueueSync<H: HostVulkan> {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
-    retire: FenceRetirer,
+    /// How far the queue's tracked submits have finished ([`super::writes`]).
+    progress: Arc<Progress>,
     ctx_id: u32,
     ring_idx: u8,
     /// Its place in the executor's [`FenceThreads`]; declared after
@@ -227,23 +254,23 @@ impl<H: HostVulkan> QueueSync<H> {
     pub fn spawn(
         host: Arc<H>,
         device: Arc<H::Device>,
-        retire: FenceRetirer,
         ctx_id: u32,
         ring_idx: u8,
         slot: FenceThreadSlot,
     ) -> std::io::Result<Self> {
         let shared = Arc::new(Shared::default());
+        let progress = Arc::new(Progress::default());
         let thread = {
             let shared = Arc::clone(&shared);
-            let retire = retire.clone();
+            let progress = Arc::clone(&progress);
             std::thread::Builder::new()
                 .name(format!("venus-fence-{ctx_id}-{ring_idx}"))
-                .spawn(move || run(&*host, &device, &shared, &retire, ctx_id, ring_idx))?
+                .spawn(move || run(&*host, &device, &shared, &progress, ctx_id, ring_idx))?
         };
         Ok(Self {
             shared,
             thread: Some(thread),
-            retire,
+            progress,
             ctx_id,
             ring_idx,
             _slot: slot,
@@ -252,18 +279,55 @@ impl<H: HostVulkan> QueueSync<H> {
     }
 
     /// Queue host fence `host` (already submitted to the queue) for
-    /// virtio-gpu fence `fence_id`. `false` when the queue holds
-    /// [`MAX_RING_FENCES_PER_QUEUE`] already — which the caller checks with
-    /// [`Self::has_room`] before it submits anything.
-    pub fn push(&self, fence_id: u32, host: u64) -> bool {
+    /// virtio-gpu fence `fence_id`, retired through `retire`. `false` when
+    /// the queue holds [`MAX_RING_FENCES_PER_QUEUE`] already — which the
+    /// caller checks with [`Self::has_room`] before it submits anything.
+    pub fn push(&self, fence_id: u32, host: u64, retire: &FenceRetirer) -> bool {
         let mut list = self.shared.lock();
         if list.entries.len() >= MAX_RING_FENCES_PER_QUEUE || list.stop {
             return false;
         }
-        list.entries.push_back(Entry { fence_id, host });
+        list.retire.get_or_insert_with(|| retire.clone());
+        list.entries.push_back(Entry::Ring { fence_id, host });
         drop(list);
         self.shared.changed.notify_all();
         true
+    }
+
+    /// Queue host fence `host` — submitted to the queue straight after a
+    /// tracked submit — as the mark of serial `serial` ([`super::writes`]),
+    /// waiting until `deadline` at most for room. `false` if there was none,
+    /// or the thread is stopping: the caller owns the fence again.
+    pub fn push_mark(&self, serial: u64, host: u64, deadline: std::time::Instant) -> bool {
+        let mut list = self.shared.lock();
+        loop {
+            if list.stop {
+                return false;
+            }
+            if list.entries.len() < MAX_RING_FENCES_PER_QUEUE {
+                break;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            list = self
+                .shared
+                .changed
+                .wait_timeout(list, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        list.entries.push_back(Entry::Mark { serial, host });
+        drop(list);
+        self.shared.changed.notify_all();
+        true
+    }
+
+    /// How far the queue's tracked submits have finished.
+    #[must_use]
+    pub fn progress(&self) -> &Arc<Progress> {
+        &self.progress
     }
 
     /// Whether another fence fits.
@@ -272,10 +336,16 @@ impl<H: HostVulkan> QueueSync<H> {
         self.shared.lock().entries.len() < MAX_RING_FENCES_PER_QUEUE
     }
 
-    /// Fences queued and not retired.
+    /// Virtio-gpu fences queued and not retired. Marks are not counted: no
+    /// guest waits on one.
     #[must_use]
     pub fn pending(&self) -> usize {
-        self.shared.lock().entries.len()
+        self.shared
+            .lock()
+            .entries
+            .iter()
+            .filter(|e| matches!(e, Entry::Ring { .. }))
+            .count()
     }
 
     /// Ask the thread to stop, without waiting for it.
@@ -302,14 +372,27 @@ impl<H: HostVulkan> QueueSync<H> {
     /// still queued and retire its virtio-gpu fence, oldest first.
     pub fn finish(mut self, host: &H, device: &H::Device) {
         self.join();
-        let entries: Vec<Entry> = self.shared.lock().entries.drain(..).collect();
+        let (entries, retire) = {
+            let mut list = self.shared.lock();
+            (
+                list.entries.drain(..).collect::<Vec<_>>(),
+                list.retire.clone(),
+            )
+        };
         for entry in entries {
-            host.destroy_object(device, Kind::Fence, entry.host);
-            self.retire.retire(RingFence {
-                ctx_id: self.ctx_id,
-                ring_idx: self.ring_idx,
-                fence_id: entry.fence_id,
-            });
+            host.destroy_object(device, Kind::Fence, entry.host());
+            match entry {
+                Entry::Ring { fence_id, .. } => {
+                    if let Some(retire) = &retire {
+                        retire.retire(RingFence {
+                            ctx_id: self.ctx_id,
+                            ring_idx: self.ring_idx,
+                            fence_id,
+                        });
+                    }
+                }
+                Entry::Mark { serial, .. } => self.progress.complete(serial),
+            }
         }
     }
 }
@@ -319,6 +402,64 @@ impl<H: HostVulkan> Drop for QueueSync<H> {
         // Only reached without `finish` when the queue's table entry goes
         // some other way; the thread must still not outlive its device.
         self.join();
+        // Nothing of this queue is waited for after this: a touch still on
+        // record as running must not hold a waiter to its deadline.
+        self.progress.complete(u64::MAX);
+    }
+}
+
+/// How far one queue's tracked submits have finished ([`super::writes`]):
+/// the serial of the newest whose mark has signalled, and a condition
+/// variable to sleep on. Shared by `Arc` with every record of a touch on the
+/// queue, so a waiter needs neither the lock of the queue's context nor a
+/// handle of its device.
+#[derive(Debug, Default)]
+pub struct Progress {
+    completed: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl Progress {
+    fn lock(&self) -> MutexGuard<'_, u64> {
+        self.completed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The serial up to which every tracked submit has finished.
+    #[must_use]
+    pub fn completed(&self) -> u64 {
+        *self.lock()
+    }
+
+    /// Serial `serial`, and so every one before it, has finished.
+    pub fn complete(&self, serial: u64) {
+        let mut completed = self.lock();
+        if serial > *completed {
+            *completed = serial;
+            drop(completed);
+            self.changed.notify_all();
+        }
+    }
+
+    /// Wait until serial `serial` has finished, until `deadline` at most:
+    /// whether it has.
+    pub fn wait(&self, serial: u64, deadline: std::time::Instant) -> bool {
+        let mut completed = self.lock();
+        loop {
+            if *completed >= serial {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            completed = self
+                .changed
+                .wait_timeout(completed, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
     }
 }
 
@@ -327,7 +468,7 @@ fn run<H: HostVulkan>(
     host: &H,
     device: &H::Device,
     shared: &Shared,
-    retire: &FenceRetirer,
+    progress: &Progress,
     ctx_id: u32,
     ring_idx: u8,
 ) {
@@ -347,7 +488,7 @@ fn run<H: HostVulkan>(
                     .unwrap_or_else(PoisonError::into_inner);
             }
         };
-        let ret = wait(host, device, head.host, SYNC_SLICE);
+        let ret = wait(host, device, head.host(), SYNC_SLICE);
         if ret == VK_TIMEOUT {
             continue;
         }
@@ -362,14 +503,26 @@ fn run<H: HostVulkan>(
                 "a venus queue fence could not be waited for; retiring it"
             );
         }
-        host.destroy_object(device, Kind::Fence, head.host);
-        retire.retire(RingFence {
-            ctx_id,
-            ring_idx,
-            fence_id: head.fence_id,
-        });
+        host.destroy_object(device, Kind::Fence, head.host());
+        match head {
+            Entry::Ring { fence_id, .. } => {
+                let retire = shared.lock().retire.clone();
+                if let Some(retire) = retire {
+                    retire.retire(RingFence {
+                        ctx_id,
+                        ring_idx,
+                        fence_id,
+                    });
+                }
+            }
+            Entry::Mark { serial, .. } => {
+                progress.complete(serial);
+            }
+        }
         // Taken off the list only after the retirement is recorded, so that
         // a snapshot asking in between counts it twice rather than never.
         shared.lock().entries.pop_front();
+        // Room for a mark waiting on a full queue.
+        shared.changed.notify_all();
     }
 }

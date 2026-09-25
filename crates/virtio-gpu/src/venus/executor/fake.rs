@@ -438,6 +438,9 @@ pub fn texel(x: u32, y: u32) -> [u8; 4] {
     ]
 }
 
+/// What marks a stuck fence as its device's rather than its queue's.
+const STUCK_DEVICE: u64 = 1 << 63;
+
 /// The fake host. See the module docs.
 pub struct FakeVulkan {
     /// What `vkEnumerateInstanceVersion` answers.
@@ -458,6 +461,11 @@ pub struct FakeVulkan {
     /// Host queues whose work never finishes until
     /// [`FakeVulkan::release_queue`] (stage 5b.3).
     pub stuck_queues: Mutex<std::collections::HashSet<u64>>,
+    /// Host devices whose submitted work never finishes until
+    /// [`FakeVulkan::release_device`]: every queue of the fake has the same
+    /// handles on every device, so this is how one context's GPU is stuck
+    /// and another's is not.
+    pub stuck_devices: Mutex<std::collections::HashSet<u64>>,
     /// Called with every stage-5b.2 command's name as it reaches the host.
     #[allow(clippy::type_complexity)]
     pub on_call: Mutex<Option<Box<dyn FnMut(&str) + Send>>>,
@@ -523,6 +531,7 @@ impl FakeVulkan {
             stuck: AtomicBool::new(false),
             lost: AtomicBool::new(false),
             stuck_queues: Mutex::new(std::collections::HashSet::new()),
+            stuck_devices: Mutex::new(std::collections::HashSet::new()),
             on_call: Mutex::new(None),
             buffer_imports: AtomicBool::new(true),
             buffer_exports: AtomicBool::new(true),
@@ -783,6 +792,25 @@ impl FakeVulkan {
         self.with(|live| live.stuck_fences.retain(|_, q| *q != queue));
     }
 
+    /// Make every submit on host device `device` never finish until
+    /// released.
+    pub fn stick_device(&self, device: u64) {
+        self.stuck_devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(device);
+    }
+
+    /// Let host device `device`'s work finish.
+    pub fn release_device(&self, device: u64) {
+        self.stuck_devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&device);
+        let tag = STUCK_DEVICE | device;
+        self.with(|live| live.stuck_fences.retain(|_, q| *q != tag));
+    }
+
     fn queue_stuck(&self, queue: u64) -> bool {
         self.stuck_queues
             .lock()
@@ -961,7 +989,14 @@ impl FakeVulkan {
                 if lost {
                     return lost_ret;
                 }
-                let signalled = self.with(|live| live.fences.get(&a.fence.0).copied());
+                // A fence of a stuck queue, or of a stuck GPU, has not
+                // signalled, whatever the fake recorded when it was submitted.
+                let signalled = self.with(|live| {
+                    live.fences
+                        .get(&a.fence.0)
+                        .copied()
+                        .filter(|_| !stuck && !live.stuck_fences.contains_key(&a.fence.0))
+                });
                 if signalled == Some(true) {
                     VK_SUCCESS
                 } else {
@@ -1574,7 +1609,7 @@ impl HostVulkan for FakeVulkan {
         self.destroy("buffer view");
     }
 
-    fn call(&self, _device: &u64, command: &mut Command<'_>) -> Result<(), CallError> {
+    fn call(&self, device: &u64, command: &mut Command<'_>) -> Result<(), CallError> {
         let name = command.name();
         if let Some(hook) = self
             .on_call
@@ -1614,6 +1649,22 @@ impl HostVulkan for FakeVulkan {
             _ => None,
         };
         let ret = self.serve(command);
+        let submitted_fence = match &*command {
+            Command::QueueSubmit(a) => a.fence.0,
+            Command::QueueSubmit2(a) => a.fence.0,
+            _ => 0,
+        };
+        let device_stuck = self
+            .stuck_devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(device);
+        if submitted_fence != 0 && device_stuck && ret == VK_SUCCESS {
+            self.with(|live| {
+                live.stuck_fences
+                    .insert(submitted_fence, STUCK_DEVICE | *device)
+            });
+        }
         generated::set_result(command, ret);
         if ret >= 0 {
             if let Some((kind, slots)) = generated::output_handles(command) {

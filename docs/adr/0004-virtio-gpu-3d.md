@@ -4605,7 +4605,197 @@ investigated.
 
 - The prime path (above): a `DMA_BUF` buffer that can be device-local.
 - The host window's copy of a scanout can tear (above, pre-existing).
+  **Resolved** by the next amendment: it was no copy tearing, but Zink drawing
+  window quads with a pipeline of the wrong topology.
 - Explicit sync (`wp_linux_drm_syncobj`) needs venus timeline-semaphore
   export, which venus does not offer.
 - A Linux host keeps the software WSI (`GuestWsi::Software`), as it has no
   device-local export.
+
+## Amendment, 2026-09-25 — the scanout tear: a pipeline of the wrong topology, and host-side ordering of shared images
+
+Every screenshot of the GPU-composited desktop with a GL client running showed
+the client's window split along the diagonal of its quad. One triangle was
+drawn. The other showed an older frame, or what lay behind the window. S5
+recorded this as "the host window's copy of a scanout can tear" and suspected
+an unfenced `RESOURCE_FLUSH`. What was measured says it was neither a copy nor
+a race. The cause is in the guest's command stream: Zink, on its path for
+devices without extended dynamic state, draws a four-vertex `TRIANGLE_FAN`
+with a `TRIANGLE_LIST` pipeline. This renderer put Zink on that path by not
+advertising `VK_EXT_extended_dynamic_state`. The fix advertises it. Along the
+way the investigation found real host-side ordering gaps between devices that
+share an image, and those are closed too.
+
+### What was measured, in order
+
+The setup: Ubuntu 26.04, GNOME 50 composited on the RTX 2070 through Zink,
+WHP, and glmark2 `jellyfish` (and `clear`) on top of vkcube. The host was
+instrumented for the investigation, the guest was driven over the serial
+console, and screenshots were taken in bursts (below).
+
+1. **The scanout copy never met running work.** Every host submit whose
+   command buffers barrier a handle blob's canonical image was followed by a
+   fence of the executor's own (a *mark*, below). Every scanout read checked
+   the marks of the compositor's last touch of that buffer. Across 6 874 reads
+   and then 6 355 reads, none found that touch still running, either before
+   the read or after the copy. Mutter's own ordering holds: it flips a frame
+   only once the frame's fence has signalled.
+2. **Clients and the compositor did overlap on the host.** In one minute, a
+   client's submit touching its swapchain image started 183 times while the
+   compositor's batch sampling that image was still running on the host GPU.
+   The running batch finished a median 0.68 ms later, at most 3.4 ms. In the
+   other direction, the compositor's submit started 310 times on an image the
+   client was still rendering into. This is a hole in the guest's implicit
+   sync. Zink puts its batch's fence on a dma-buf only after venus has waited
+   for the batch on the CPU (`zink_batch.c:829-839` → `vn_GetSemaphoreFdKHR`
+   → `vn_wsi_sync_wait`). Mutter releases a client's buffer as soon as a newer
+   one is applied, so the client can reuse it before the fence is there.
+3. **Ordering those overlaps did not remove the tear.** With both kinds
+   ordered on the host (543 waits, none timed out), 9 of 37 frames still had
+   a whole window triangle missing. With **every submit of every context
+   waiting for its queue to go idle**, 17 of 26 frames did. No GPU
+   concurrency was left, so the tear could not be a race.
+4. **The client's buffers were whole.** The composite and every glmark2
+   swapchain image were dumped at the same instants, each read back through
+   the scanout device. The client images were complete, with alpha 229–248 in
+   both halves. The composite from the same moment lacked the window's
+   upper-right triangle.
+5. **The compositor drew a fan with a list pipeline.** Logging gnome-shell's
+   recordings for 40 s found 1 752 draws of 4 vertices (Cogl's single-quad
+   `TRIANGLE_FAN`) bound to pipeline `0xc58`. That pipeline was created
+   `TRIANGLE_LIST` and also served the frame's 12- and 24-index lists. Another
+   1 557 four-vertex draws used fan pipelines. No pipeline had a dynamic
+   topology, and no `vkCmdSetPrimitiveTopology` was ever sent. Four vertices
+   as a list make one triangle, `(0, 1, 2)`. Triangle `(0, 2, 3)` is never
+   drawn, and that part of the window keeps whatever the buffer held there
+   before.
+
+### Why Zink does that
+
+Zink sets `VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY` only when the device lists
+`VK_EXT_extended_dynamic_state` **by name** and reports `extendedDynamicState`
+(`zink_device_info.py`). Promotion to core 1.3 does not count for Zink,
+because the feature structure was never promoted. This renderer refused the
+extension, since its feature structure was not admitted (the note on promoted
+extensions in `policy`). So Zink ran `ZINK_NO_DYNAMIC_STATE`. On that path a
+draw fetches a new pipeline when the *rasterisation class* changes
+(`prim_changed`, `zink_draw.cpp:676-733`), but not when the topology changes
+inside a class. A fan drawn after a list keeps the list pipeline. Every
+current driver has the extension, so in practice the path is untested.
+glmark2 runs on Zink as well, so its own jellyfish went through the same path.
+
+### The fix: `VK_EXT_extended_dynamic_state` is an admitted extension
+
+The extension is now in `policy::ADMITTED_EXTENSIONS`. Its feature structure
+is admitted in feature queries and in device creation, and the generated
+bridge (`host_vulkan/convert.rs`) carries it. Its twelve commands are core
+1.3 with the same venus command types, so the executor already served them.
+The capset mask gains its bit (268). Zink now creates every pipeline with a
+dynamic topology and sets the topology per draw. In the same desktop, all 17
+of gnome-shell's pipelines were dynamic, and it sent 9 441
+`vkCmdSetPrimitiveTopology` in 40 s.
+
+### Host-side ordering of shared images anyway (`executor::writes`)
+
+The gaps in 1 and 2 are real on their own. Nothing on the host ordered one
+`VkDevice`'s work on a shared payload after another's: every acquire from
+`FOREIGN` has `srcStageMask = TOP_OF_PIPE`. The rule now, whatever the guest
+does: **a submission touching a handle blob's payload starts only once every
+other owner's submissions touching it have finished on the host GPU.** The
+scanout copy counts as one of those owners.
+
+- **Touches.** An image barrier on a canonical image in exported memory marks
+  its command buffer as touching that payload. A primary inherits its
+  secondaries' touches through `vkCmdExecuteCommands`. Begin, reset and free
+  forget them.
+- **Marks.** A touching submit takes its queue's next serial. It is followed,
+  on the same host queue, by an empty `vkQueueSubmit` with a host fence. The
+  queue's fence thread waits for that fence beside the ring fences and
+  advances the queue's `Progress`. A waiter therefore needs neither the
+  context's lock nor its device.
+- **Claims.** One `Payloads` table is shared by every context and by the
+  scanout device. Before a touching submit reaches the driver, it claims its
+  payloads. If another owner's touch is still running, the claim waits for it,
+  bounded by `SHARED_WAIT` (100 ms), and then records its own touch. The check
+  and the record are one step, under the table's lock. A guest submit whose
+  wait times out goes ahead unordered and is counted
+  (`VulkanContext::shared_waits`). A claim waits only for work that has
+  already been submitted. The only possible cycle runs through timeline
+  semaphores that a blocked context would have to signal, and the bound
+  breaks it.
+- **The scanout read** claims its blob before the copy and completes its
+  touch after the copy's fence, so no guest submit touching the buffer can
+  start during the copy. If the claim times out, the flush fails in band and
+  the window keeps its previous frame.
+
+The read is split into `scanout::ScanoutDevice::copy` and
+`CopiedRect::collect`. The CPU copy out of the staging pages runs after the
+scanout device's touch has completed.
+
+### Tests
+
+- `executor::order_tests`, on the fake host (which gains `stick_device`, and
+  whose `vkGetFenceStatus` now honours stuck fences):
+  - While the device that ran the last submit touching the scanout buffer is
+    stuck, the read fails in band within the bound and records no copy. Once
+    the device finishes, the read succeeds.
+  - A submit that does not touch the buffer, or a command buffer begun again
+    after a touch, is not waited for.
+  - A secondary's touch counts as its primary's.
+  - A client's submit on an image another context is still sampling waits
+    until the bound. If that context's GPU finishes after 20 ms, the submit
+    waits only until then.
+  - While the scanout copy runs, it is a running touch of its own.
+  - Marks are destroyed with their device.
+- `a_heavy_frame_flipped_at_once_is_read_back_complete_never_partial`, on
+  the real GPU. About 280 ordered full-image clears of a 1080p scanout
+  buffer, the last one a known colour, are submitted unfenced and read back at
+  once, five times. With the ordering, every read took 2.2–3.1 ms and returned
+  0 wrong pixels. With the ordering switched off (temporarily, for this
+  measurement), round 1 returned 1 357 824 of 2 073 600 pixels that were not
+  the last clear.
+- `a_quad_drawn_as_a_fan_through_the_dynamic_topology_covers_every_pixel`,
+  on the real GPU. The device is shown the extension and its feature bit and
+  is created with both. A pipeline with dynamic topology draws four vertices
+  after `vkCmdSetPrimitiveTopology(TRIANGLE_FAN)`, and 0 of 65 536 pixels are
+  left uncovered. The same draw as a list leaves 32 640 uncovered.
+- The `policy` and `tests` checks: the advertised set, the admitted links and
+  the capset bits now include the extension.
+
+### Guest acceptance
+
+`entangled run --screenshot-after 50 --screenshot-every 1000` writes one PNG
+about every 1.3 s. The run covers a minute of glmark2 `jellyfish` (800×600)
+over vkcube. Every frame was inspected by eye, and a detector checked each for
+a missing window triangle.
+
+Each run is one boot of the same guest, then 60 s of glmark2 over vkcube,
+with one PNG every 1.3 s. "Before" is this commit with the extension hidden
+and the ordering switched off (a temporary toggle, removed again). "After" is
+this commit. The runs alternated old, new, old, new.
+
+| run | frames | torn (by eye) | a window triangle missing (detector) | glmark2 FPS (six 10 s scenes) | desktop composite fps, median |
+|---|---:|---:|---:|---|---:|
+| before 1 | 48 | **48** | 20 | 110–125 | 55.8 |
+| before 2 | 49 | **49** | 0 (all were "old frame" tears) | 113–122 | 56.6 |
+| after 1 | 49 | **0** | 0 | 110–124 | 58.0 |
+| after 2 | 49 | **0** | 0 | 91–170 | 52.9 |
+| after, release build `entangled-tear.exe` | 47 | **0** | 0 | 89–111 | 37.5 |
+
+Every "before" frame is torn, in one of two ways. Either the window's
+upper-right triangle shows vkcube and the wallpaper, or it shows an older
+jellyfish frame. The jellyfish also barely moves, because most of what is on
+screen is stale. After the fix, no frame is torn, and the jellyfish bobs
+through its whole range. Neither the extension nor the ordering changes the
+frame rate: the alternated runs are within each other's spread, and the lower
+release-build run was a slow boot, with its composite rate lower from the
+first second. The claims waited 543 times in a minute, never for long, and
+never to the bound.
+
+### Still owed
+
+- Zink's `ZINK_NO_DYNAMIC_STATE` bug is upstream's. A device without the
+  extension still hits it. Any other extension Zink needs by name should be
+  checked against what this renderer shows.
+- `--screenshot-every` keeps writing until the VM stops, so a probe has to
+  pick its window of frames by file time.

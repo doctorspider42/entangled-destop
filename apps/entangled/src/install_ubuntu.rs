@@ -280,7 +280,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             tail(&log, 25)
         ));
     }
-    for marker in INSTALL_MARKERS {
+    for marker in install_markers(builtin) {
         if !log.contains(marker) {
             tracing::warn!(marker, "the installer transcript is missing a usual marker");
         }
@@ -431,14 +431,32 @@ fn venus_preflight(
 /// Lines that a healthy unattended run produces. Their absence does not fail the
 /// install — the disk is the source of truth — but it is worth saying so, because
 /// it usually means the automation took a different path than intended.
-const INSTALL_MARKERS: &[&str] = &[
-    // GRUB accepted the typed boot command.
-    "autoinstall",
-    // cloud-init found the seed volume.
-    "cloud-init",
-    // curtin ran.
-    "curtin",
-];
+///
+/// They depend on the ISO. The live-server installer logs subiquity's and
+/// curtin's progress on ttyS0; the Desktop ISO's runs the same subiquity as
+/// a service of its `ubuntu-desktop-bootstrap` snap and prints neither on the
+/// console, so `curtin` never appears there, and a successful desktop install
+/// warned that it was missing until the fresh `install ubuntu --venus`
+/// acceptance read its transcript (0 hits in 186 KiB). What the desktop
+/// transcript does show is systemd starting that service.
+fn install_markers(profile: seed::BuiltinProfile) -> &'static [&'static str] {
+    match profile {
+        seed::BuiltinProfile::Server => &[
+            // GRUB accepted the typed boot command.
+            "autoinstall",
+            // cloud-init found the seed volume.
+            "cloud-init",
+            // curtin ran.
+            "curtin",
+        ],
+        seed::BuiltinProfile::Desktop => &[
+            "autoinstall",
+            "cloud-init",
+            // The desktop installer's subiquity service started.
+            "subiquity-server",
+        ],
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Typing at GRUB
@@ -636,6 +654,24 @@ mod tests {
     /// `--venus` is refused where it could only half-work: no seed to
     /// configure the guest from, or the built-in *server* profile, whose
     /// install would fail at the schema late-command twenty minutes in.
+    /// A successful desktop install must not warn: its transcript never
+    /// mentions curtin. These are lines of the Desktop ISO's real transcript
+    /// (Ubuntu 26.04.1), with the systemd colour codes stripped.
+    #[test]
+    fn desktop_install_markers_are_ones_its_transcript_prints() {
+        let desktop_transcript =
+            "grub> linux /casper/vmlinuz autoinstall console=ttyS0,115200n8 ---
+[   32.924591] cloud-init[464]:   en_US.UTF-8... done
+[  OK  ] Started snap.ubuntu-desktop-bootst…desktop-bootstrap.subiquity-server.
+[  632.206442] reboot: Power down
+";
+        for marker in install_markers(seed::BuiltinProfile::Desktop) {
+            assert!(desktop_transcript.contains(marker), "{marker}");
+        }
+        assert!(!install_markers(seed::BuiltinProfile::Desktop).contains(&"curtin"));
+        assert!(install_markers(seed::BuiltinProfile::Server).contains(&"curtin"));
+    }
+
     #[test]
     fn venus_needs_a_seed_and_a_desktop() {
         use seed::BuiltinProfile::{Desktop, Server};
