@@ -559,12 +559,17 @@ fn build_devices(
         tracing::info!(
             source = %asked_by,
             host_visible_mib = venus_host_visible_bytes(&cfg.display) >> 20,
+            gpu_memory_mib = ?cfg.display.gpu_memory_mib,
             "attaching the Venus EXECUTING renderer: the guest's Vulkan, and its OpenGL \
              through Zink, run on the host GPU"
         );
-        let renderer =
-            virtio_gpu::VenusRenderer::new(virtio_gpu::ExecutorFactory::new(Arc::new(host)))
-                .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
+        // `[display] gpu_memory_mib`: the device-local memory every context
+        // together may allocate per heap; absent, three quarters of each
+        // (ADR-0004, the resource-exhaustion amendment).
+        let sinks = virtio_gpu::ExecutorFactory::new(Arc::new(host))
+            .with_gpu_memory(cfg.display.gpu_memory_mib.map(|mib| u64::from(mib) << 20));
+        let renderer = virtio_gpu::VenusRenderer::new(sinks)
+            .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
         let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
         gpu.set_refresh_hz(cfg.display.refresh_hz);
         gpu.set_frame_stats(cfg.display.frame_stats.clone());

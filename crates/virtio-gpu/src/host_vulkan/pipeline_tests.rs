@@ -606,7 +606,12 @@ const LAYOUT_TRANSFER_SRC: i32 = 6;
 /// `VK_KHR_external_semaphore_fd` among the extensions, the second never
 /// reaching the driver.
 fn setup_1_3(host: Arc<AshVulkan>) -> Harness<AshVulkan> {
-    let mut h = Harness::new(host);
+    setup_1_3_on(Harness::new(host))
+}
+
+/// [`setup_1_3`] on a harness the test built (a factory with caps of its
+/// own).
+fn setup_1_3_on(mut h: Harness<AshVulkan>) -> Harness<AshVulkan> {
     boot(&mut h);
     let mut create = create_device(
         PHYSICAL,
@@ -3813,5 +3818,91 @@ fn a_quad_drawn_as_a_fan_through_the_dynamic_topology_covers_every_pixel() {
         list > total / 3 && list < total * 2 / 3,
         "the same four vertices as a list are one triangle: {list} of {total}"
     );
+    teardown(h);
+}
+
+/// The device-local cap on the real GPU (ADR-0004, the resource-exhaustion
+/// amendment): with every context held to 512 MiB of VRAM per heap, one
+/// context is shown — and gets — three quarters of it, a 64 MiB allocation
+/// past that answers `VK_ERROR_OUT_OF_DEVICE_MEMORY` before the driver is
+/// asked, and the device keeps working: freed memory is allocatable again,
+/// and the GPU still fills a buffer the guest reads back, every word.
+#[test]
+fn allocating_past_the_device_local_cap_is_out_of_device_memory_and_the_gpu_keeps_working() {
+    const CAP: u64 = 512 << 20;
+    const CHUNK: u64 = 64 << 20;
+    const SIZE: u64 = 64 << 10;
+    const WORDS: usize = (SIZE / 4) as usize;
+    let Some(host) = host() else { return };
+    let mut h = setup_1_3_on(Harness::with_factory(
+        crate::venus::executor::ExecutorFactory::new(Arc::clone(&host)).with_gpu_memory(Some(CAP)),
+    ));
+    let types = memory_types(&mut h);
+    let ty = (0..types.memory_type_count)
+        .find(|i| {
+            let t = &types.memory_types[*i as usize];
+            t.property_flags == MEM_PROPERTY_DEVICE_LOCAL
+                && types.memory_heaps[t.heap_index as usize].flags & 0x1 != 0
+        })
+        .expect("a device-local type");
+    let heap = types.memory_heaps[types.memory_types[ty as usize].heap_index as usize].size;
+    assert_eq!(heap, CAP / 4 * 3, "the guest is told its share");
+
+    let mut made = Vec::new();
+    let refused = loop {
+        let id = 0x7000 + made.len() as u64;
+        let Command::AllocateMemory(a) = h
+            .call(&allocate(DEVICE, id, CHUNK, ty, Vec::new()))
+            .unwrap()
+        else {
+            panic!()
+        };
+        if a.ret != VK_SUCCESS {
+            break a.ret;
+        }
+        made.push(id);
+        assert!(made.len() <= 6, "past the share");
+    };
+    eprintln!(
+        "device-local type {ty}: {} x 64 MiB allocated, the next answered {refused}",
+        made.len()
+    );
+    assert_eq!(refused, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    assert_eq!(made.len(), 6, "384 MiB, the share of 512");
+    assert!(!h.fatal(), "a refusal is an answer");
+
+    for id in made.drain(..) {
+        h.send(&free(DEVICE, id)).unwrap();
+    }
+    let Command::AllocateMemory(a) = h
+        .call(&allocate(DEVICE, 0x7100, CHUNK, ty, Vec::new()))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(a.ret, VK_SUCCESS, "freed memory is allocatable again");
+    h.send(&free(DEVICE, 0x7100)).unwrap();
+
+    let out = buffer(&mut h, 0x610, SIZE, USAGE_TRANSFER_DST, true);
+    out.write_words(&vec![0; WORDS]);
+    let tw = (STAGE_TRANSFER, ACCESS_TRANSFER_WRITE);
+    let hr = (STAGE_HOST, ACCESS_HOST_READ);
+    assert_eq!(
+        h.submit_recording(&[
+            begin(CB),
+            fill(CB, out.id, 0, WHOLE_SIZE, 0x5eed_f00d),
+            buffer_barrier(CB, out.id, tw, hr),
+            end(CB),
+        ]),
+        Outcome::Consumed
+    );
+    submit_and_wait(&mut h, &[CB], FENCE);
+    let wrong = out
+        .read_words(WORDS)
+        .iter()
+        .filter(|w| **w != 0x5eed_f00d)
+        .count();
+    eprintln!("after the refusal the GPU filled {WORDS} words, {wrong} wrong");
+    assert_eq!(wrong, 0);
     teardown(h);
 }

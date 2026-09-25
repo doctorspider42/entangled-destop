@@ -1617,3 +1617,26 @@ fn an_application_sync_file_export_is_a_ring_fence_then_the_semaphore_wait() {
     assert!(last.2.is_empty(), "and nothing signalled");
     assert!(!h.fatal());
 }
+
+/// Exported device-local memory lives as long as its handle blob does, so
+/// its device-local charge does too (ADR-0004, the resource-exhaustion
+/// amendment): freeing the memory leaves it charged while the blob holds the
+/// allocation, and the blob going gives it back.
+#[test]
+fn a_handle_blob_keeps_its_device_local_charge_until_it_goes() {
+    use crate::venus::renderer::SinkFactory;
+    let (mut h, _host) = s1();
+    let blob = export(&mut h);
+    let held = || h.renderer.factory().usage().limits.device_local_bytes;
+    let charged = held();
+    assert!(charged >= blob, "{charged} for a {blob}-byte blob");
+    h.send(&destroy_image(DEVICE, EXPORTER)).unwrap();
+    h.send(&free(DEVICE, EXPORTED_MEM)).unwrap();
+    let held = h.renderer.factory().usage().limits.device_local_bytes;
+    assert_eq!(
+        held, charged,
+        "the blob holds the allocation, and its charge"
+    );
+    h.renderer.destroy_blob(EXPORTED_RES);
+    assert_eq!(h.renderer.factory().usage().limits.device_local_bytes, 0);
+}

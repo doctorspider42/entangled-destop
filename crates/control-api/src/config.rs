@@ -371,6 +371,19 @@ pub struct DisplaySection {
     /// host memory — nothing is mapped until the guest maps a blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_visible_mib: Option<u32>,
+    /// Device-local (VRAM) memory every Venus client of the guest together
+    /// may allocate on each device-local heap of the host GPU, in MiB
+    /// (ADR-0004, the resource-exhaustion amendment). Absent means the
+    /// renderer's default: three quarters of each heap, which leaves the
+    /// host's own desktop the rest. Never more than the heap, whatever it
+    /// says; one client may hold three quarters of it, and that is the heap
+    /// size the guest is shown.
+    ///
+    /// From [`MIN_GPU_MEMORY_MIB`] to [`MAX_GPU_MEMORY_MIB`]. Host memory,
+    /// not guest address space: it is what a hostile or runaway guest can
+    /// take of the host's VRAM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_mib: Option<u32>,
 }
 
 /// Bounds on [`DisplaySection::refresh_hz`], mirroring `virtio_gpu::edid`'s
@@ -386,6 +399,11 @@ pub const DEFAULT_REFRESH_HZ: u32 = 60;
 /// validates the same profile on every host without the machine crate.
 pub const MIN_HOST_VISIBLE_MIB: u32 = 64;
 pub const MAX_HOST_VISIBLE_MIB: u32 = 4096;
+/// Bounds on [`DisplaySection::gpu_memory_mib`]: a desktop needs a few
+/// hundred MiB, and no GPU a host has is 1 TiB.
+pub const MIN_GPU_MEMORY_MIB: u32 = 256;
+pub const MAX_GPU_MEMORY_MIB: u32 = 1 << 20;
+
 /// The Venus renderer's window when a profile does not say
 /// (`virtio_gpu::venus::renderer::VENUS_HOST_VISIBLE_BYTES`, which a test in
 /// `entangled` holds equal to this).
@@ -403,6 +421,7 @@ impl Default for DisplaySection {
             refresh_hz: DEFAULT_REFRESH_HZ,
             frame_stats: None,
             host_visible_mib: None,
+            gpu_memory_mib: None,
         }
     }
 }
@@ -702,6 +721,15 @@ impl VmConfig {
                 ));
             }
         }
+        if let Some(mib) = self.display.gpu_memory_mib {
+            if !(MIN_GPU_MEMORY_MIB..=MAX_GPU_MEMORY_MIB).contains(&mib) {
+                return err(format!(
+                    "display.gpu_memory_mib {mib} must be from {MIN_GPU_MEMORY_MIB} to \
+                     {MAX_GPU_MEMORY_MIB}: it is the host VRAM the guest's Vulkan may allocate \
+                     per heap (never more than the heap itself)"
+                ));
+            }
+        }
         // Per-backend network keys, same policy as the boot section: the wrong
         // key is refused rather than ignored, so a profile that names a TAP
         // interface under backend = "usernet" fails loudly instead of quietly
@@ -913,6 +941,31 @@ scale = 1.0
                     && DEFAULT_HOST_VISIBLE_MIB <= MAX_HOST_VISIBLE_MIB
             );
         };
+    }
+
+    /// `[display] gpu_memory_mib`: absent stays absent, inside its bounds is
+    /// taken, anything else is refused by name.
+    #[test]
+    fn the_gpu_memory_cap_is_optional_and_bounded() {
+        let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).expect("parses");
+        assert_eq!(cfg.display.gpu_memory_mib, None);
+        let text = toml::to_string(&cfg).expect("serialises");
+        assert!(!text.contains("gpu_memory_mib"), "no key invented: {text}");
+        for mib in [MIN_GPU_MEMORY_MIB, 3000, 6144, MAX_GPU_MEMORY_MIB] {
+            let text = format!("{BACKLOG_EXAMPLE}gpu_memory_mib = {mib}\n");
+            let cfg = VmConfig::from_toml(&text).unwrap_or_else(|e| panic!("{mib}: {e}"));
+            assert_eq!(cfg.display.gpu_memory_mib, Some(mib));
+            let back = toml::to_string(&cfg).expect("serialises");
+            assert_eq!(
+                VmConfig::from_toml(&back).expect("round-trips").display,
+                cfg.display
+            );
+        }
+        for mib in [0, 255, MAX_GPU_MEMORY_MIB + 1, u32::MAX] {
+            let text = format!("{BACKLOG_EXAMPLE}gpu_memory_mib = {mib}\n");
+            let err = VmConfig::from_toml(&text).expect_err("refused");
+            assert!(err.to_string().contains("gpu_memory_mib"), "{mib}: {err}");
+        }
     }
 
     /// `[display] venus`: off unless asked for, never written while off (an

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use checks::Out;
 use gpu::Opts;
 
-const CHECKS: [(u32, &str); 9] = [
+const CHECKS: [(u32, &str); 10] = [
     (1, "instance"),
     (2, "device"),
     (3, "host-memory"),
@@ -35,6 +35,7 @@ const CHECKS: [(u32, &str); 9] = [
     (7, "dynamic-rendering"),
     (8, "timeline-sync"),
     (9, "many-submits"),
+    (10, "exhaust"),
 ];
 
 fn name(id: u32) -> &'static str {
@@ -183,7 +184,7 @@ const USAGE: &str =
                      CPU devices included                 env VK_SMOKE_DEVICE_INDEX
   --allow-cpu        let automatic selection pick a CPU device (lavapipe/llvmpipe)
                      when nothing else is present        env VK_SMOKE_ALLOW_CPU=1
-  --checks LIST      run only these of checks 3..9 (1 and 2 always run)
+  --checks LIST      run only these of checks 3..10 (1 and 2 always run; 10 only if named)
                                                           env VK_SMOKE_CHECKS
   --timeout-secs N   per-wait GPU timeout, default 10; the watchdog ends a check
                      that makes no progress for 2N+10 s   env VK_SMOKE_TIMEOUT_SECS
@@ -310,7 +311,7 @@ fn main() {
     };
 
     type Check = fn(&gpu::Gpu) -> Result<Out, String>;
-    let later: [(u32, Check); 7] = [
+    let later: [(u32, Check); 8] = [
         (3, checks::host_memory),
         (4, checks::transfer),
         (5, checks::compute),
@@ -318,8 +319,14 @@ fn main() {
         (7, checks::dynamic_rendering),
         (8, checks::sync),
         (9, checks::many_submits),
+        (10, checks::exhaust),
     ];
     for (id, check) in later {
+        // Check 10 is hostile on purpose: it runs only when named.
+        if id == 10 && opts.checks.is_none() {
+            report(id, Status::Skip, "hostile; only with --checks 10");
+            continue;
+        }
         if opts.checks.as_ref().is_some_and(|list| !list.contains(&id)) {
             report(id, Status::Skip, "not selected (--checks)");
             continue;

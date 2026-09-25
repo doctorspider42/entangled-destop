@@ -160,6 +160,7 @@ pub mod context;
 pub mod device_objects;
 pub mod generated;
 pub mod host;
+pub mod limits;
 pub mod memory;
 pub mod modifier;
 pub mod objects;
@@ -177,6 +178,8 @@ pub(crate) mod fake;
 mod generated_tests;
 #[cfg(test)]
 pub(crate) mod harness;
+#[cfg(test)]
+mod limits_tests;
 #[cfg(test)]
 mod memory_tests;
 #[cfg(test)]
@@ -306,6 +309,20 @@ pub enum SinkError {
     /// `vkExecuteCommandStreamsMESA` naming no stream (`vkr_transport.c`).
     #[error("vkExecuteCommandStreamsMESA names no stream")]
     NoStreams,
+    /// The copy of a command stream would take the context past its share
+    /// of the decode pool, or the renderer past the pool
+    /// ([`limits::Class::DecodeBytes`]).
+    #[error("command stream {index}: copying its {wanted:#x} bytes would take the decode pool past its cap ({used:#x} held of {limit:#x})")]
+    DecodePool {
+        /// Which stream.
+        index: usize,
+        /// Its size.
+        wanted: u64,
+        /// What the refusing level held.
+        used: u64,
+        /// Its cap.
+        limit: u64,
+    },
     /// More bytes than [`MAX_STREAM_BYTES`].
     #[error(
         "vkExecuteCommandStreamsMESA names {total:#x} bytes, past the {MAX_STREAM_BYTES:#x} it may"
@@ -417,6 +434,13 @@ pub struct ExecutingSink<H: HostVulkan> {
     /// The wait the ring is blocked in, if it is: the seqno, since when, and
     /// whether that has been logged. Diagnostics only.
     blocked: Option<(u64, Instant, bool)>,
+    /// The context's share of the renderer's decode pool
+    /// ([`limits::Class::DecodeBytes`]): every decode and every copied
+    /// command stream of this ring is charged to it while it runs.
+    decode_pool: Arc<PageBudget>,
+    /// The most one command of this ring has decoded to, for a test.
+    #[cfg(test)]
+    pub(crate) peak_decode: usize,
 }
 
 impl<H: HostVulkan> std::fmt::Debug for ExecutingSink<H> {
@@ -450,7 +474,16 @@ enum Step {
 
 impl<H: HostVulkan> ExecutingSink<H> {
     fn new(env: RingEnv, context: Arc<Mutex<VulkanContext<H>>>) -> Self {
+        let decode_pool = Arc::clone(
+            lock(&context)
+                .objects
+                .limits()
+                .share(limits::Class::DecodeBytes),
+        );
         Self {
+            decode_pool,
+            #[cfg(test)]
+            peak_decode: 0,
             ctx_id: env.ctx_id,
             ring: env.ring,
             context,
@@ -483,8 +516,13 @@ impl<H: HostVulkan> ExecutingSink<H> {
             return self.transport(rest, nested);
         }
 
-        let mut dec = Decoder::new(rest);
-        let (header, mut command) = match Command::decode_next(&mut dec) {
+        let mut dec = Decoder::with_pool(rest, limits::MAX_COMMAND_DECODE_BYTES, &self.decode_pool);
+        let decoded = Command::decode_next(&mut dec);
+        #[cfg(test)]
+        {
+            self.peak_decode = self.peak_decode.max(dec.peak_alloc());
+        }
+        let (header, mut command) = match decoded {
             Ok(decoded) => decoded,
             Err(ProtocolError::Wire(WireError::Truncated { .. })) => return Step::Incomplete,
             Err(error) => {
@@ -507,6 +545,7 @@ impl<H: HostVulkan> ExecutingSink<H> {
         } else {
             let mut context = lock(&self.context);
             context.stop = Some(self.stop.clone());
+            context.command_bytes = used;
             context.execute(&mut command).map(|()| true)
         };
         match executed {
@@ -695,6 +734,17 @@ impl<H: HostVulkan> ExecutingSink<H> {
             if desc.size == 0 {
                 continue;
             }
+            // The copy is held while its commands run: charged to the decode
+            // pool with them, given back when the stream is done.
+            let _copy = self
+                .decode_pool
+                .charge(desc.size)
+                .map_err(|(used, limit)| SinkError::DecodePool {
+                    index,
+                    wanted: desc.size,
+                    used,
+                    limit,
+                })?;
             let bytes = self
                 .blobs
                 .read(desc.resource_id, desc.offset, desc.size)
@@ -877,6 +927,102 @@ impl<H: HostVulkan> RingSink for ExecutingSink<H> {
     }
 }
 
+/// Contexts' devices whose GPU work had not finished when the context went
+/// ([`objects::TEARDOWN_WAIT`]) — work waiting on a timeline value or an
+/// event nothing will ever signal, or a very long dispatch. Nothing of them
+/// may be destroyed under the GPU, and the thread tearing the context down
+/// is the device's own worker, so they are **parked** here instead of waited
+/// for: still charged to every cap they held (so a guest cannot free its way
+/// past a cap by parking), looked at again whenever a context comes or goes
+/// and at the usage log's periodic look, and destroyed once idle (or lost).
+/// ADR-0004, the resource-exhaustion amendment.
+pub struct Graveyard<H: HostVulkan> {
+    parked: Mutex<Vec<Parked<H>>>,
+}
+
+struct Parked<H: HostVulkan> {
+    ctx_id: u32,
+    objects: objects::Objects<H>,
+    since: Instant,
+}
+
+impl<H: HostVulkan> std::fmt::Debug for Graveyard<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Graveyard")
+            .field("parked", &self.len())
+            .finish()
+    }
+}
+
+impl<H: HostVulkan> Graveyard<H> {
+    /// An empty graveyard.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            parked: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<Parked<H>>> {
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Park what is left of context `ctx_id`'s table after a teardown that
+    /// found a device busy.
+    pub fn park(&self, ctx_id: u32, objects: objects::Objects<H>) {
+        tracing::warn!(
+            ctx_id,
+            devices = objects.device_count(),
+            objects = objects.len(),
+            "a Venus context went while its GPU work had not finished; its devices are parked, \
+             still charged, until that work is done (ADR-0004, the resource-exhaustion amendment)"
+        );
+        self.lock().push(Parked {
+            ctx_id,
+            objects,
+            since: Instant::now(),
+        });
+    }
+
+    /// Destroy every parked table whose devices are idle (or lost) now,
+    /// without waiting. Answers how many are still parked.
+    pub fn reap(&self, host: &H) -> usize {
+        let mut parked = self.lock();
+        parked.retain_mut(|p| {
+            let busy = p.objects.destroy_all(host, Duration::ZERO) == objects::Teardown::Busy;
+            if !busy {
+                tracing::info!(
+                    ctx_id = p.ctx_id,
+                    parked_ms = p.since.elapsed().as_millis(),
+                    "a parked Venus context's GPU work finished; its devices are destroyed"
+                );
+            }
+            busy
+        });
+        parked.len()
+    }
+
+    /// Parked tables.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether nothing is parked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Host devices parked, every table together.
+    #[must_use]
+    pub fn devices(&self) -> usize {
+        self.lock().iter().map(|p| p.objects.device_count()).sum()
+    }
+}
+
 /// The [`SinkFactory`] of the executing renderer. See the module docs.
 pub struct ExecutorFactory<H: HostVulkan> {
     host: Arc<H>,
@@ -887,6 +1033,11 @@ pub struct ExecutorFactory<H: HostVulkan> {
     context_share: u64,
     /// Fence threads, every context together ([`timeline::MAX_FENCE_THREADS`]).
     fence_threads: Arc<timeline::FenceThreads>,
+    /// Every other cap, renderer-wide, which each context gets its shares of
+    /// ([`limits`]).
+    limits: Arc<limits::Limits>,
+    /// Devices a context's teardown found busy ([`Graveyard`]).
+    graveyard: Arc<Graveyard<H>>,
     /// The renderer's own scanout device (stage S2b), once a handle blob
     /// has been scanned out.
     scanout: Option<scanout::ScanoutDevice<H>>,
@@ -936,6 +1087,8 @@ impl<H: HostVulkan> ExecutorFactory<H> {
             budget: PageBudget::new(limit),
             context_share: share,
             fence_threads: timeline::FenceThreads::new(timeline::MAX_FENCE_THREADS),
+            limits: limits::Limits::new(limits::Caps::default()),
+            graveyard: Graveyard::new(),
             scanout: None,
             payloads: writes::Payloads::new(),
             scanout_progress: Arc::new(writes::Progress::default()),
@@ -976,6 +1129,31 @@ impl<H: HostVulkan> ExecutorFactory<H> {
     #[cfg(test)]
     pub(crate) fn scanout(&self) -> Option<&scanout::ScanoutDevice<H>> {
         self.scanout.as_ref()
+    }
+
+    /// Hold every context to `caps` instead of the defaults
+    /// ([`limits::Caps::default`]). Only before any context exists: a
+    /// context keeps the shares it was made with.
+    #[must_use]
+    pub fn with_caps(mut self, caps: limits::Caps) -> Self {
+        self.limits = limits::Limits::new(caps);
+        self
+    }
+
+    /// Device-local memory every context together may allocate, per heap
+    /// (`[display] gpu_memory_mib`): `None` for the default,
+    /// [`limits::DEVICE_LOCAL_WHOLE`] of each heap. Only before any context
+    /// exists.
+    #[must_use]
+    pub fn with_gpu_memory(self, bytes: Option<u64>) -> Self {
+        let caps = self.limits.caps().clone().with_device_local(bytes);
+        self.with_caps(caps)
+    }
+
+    /// The renderer-wide caps and what they hold.
+    #[must_use]
+    pub fn limits(&self) -> &Arc<limits::Limits> {
+        &self.limits
     }
 
     /// Cap the fence threads at `limit` instead of
@@ -1043,14 +1221,18 @@ impl<H: HostVulkan> ExecutorFactory<H> {
         let share = self.context_share;
         let fence_threads = &self.fence_threads;
         let payloads = &self.payloads;
+        let limits = &self.limits;
+        let graveyard = &self.graveyard;
         Arc::clone(self.contexts.entry(ctx_id).or_insert_with(|| {
-            let mut context = VulkanContext::with_limits(
+            let mut context = VulkanContext::with_caps(
                 ctx_id,
                 Arc::clone(host),
                 PageBudget::share(budget, share),
                 Arc::clone(fence_threads),
+                limits.context(),
             );
             context.payloads = Arc::clone(payloads);
+            context.graveyard = Arc::clone(graveyard);
             Arc::new(Mutex::new(context))
         }))
     }
@@ -1074,6 +1256,7 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
     }
 
     fn context_created(&mut self, ctx_id: u32) {
+        self.graveyard.reap(&self.host);
         let _ = self.context(ctx_id);
     }
 
@@ -1096,12 +1279,16 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         if let Some(context) = self.contexts.remove(&ctx_id) {
             lock(&context).destroy_all();
         }
+        self.graveyard.reap(&self.host);
     }
 
     fn reset(&mut self) {
         for (_, context) in self.contexts.drain() {
             lock(&context).destroy_all();
         }
+        // A parked device outlives the reset (it cannot be destroyed under
+        // the GPU) and keeps its charges; the next look destroys it.
+        self.graveyard.reap(&self.host);
         // Stage S2b: every import goes; the scanout device stays (it holds
         // nothing of any guest after this — `scanout`'s module docs).
         if let Some(device) = self.scanout.as_mut() {
@@ -1273,10 +1460,16 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
             host_visible_bytes: self.budget.used(),
             fence_threads: self.fence_threads.live(),
             scanout_targets: self.scanout_targets(),
+            limits: self.limits.usage(),
+            parked_devices: self
+                .graveyard
+                .reap(&self.host)
+                .max(self.graveyard.devices()),
             ..FactoryUsage::default()
         };
         for context in self.contexts.values() {
             let context = lock(context);
+            usage.limits.note_context(&context.objects.limits().usage());
             let objects = context.object_count();
             usage.objects = usage.objects.saturating_add(objects);
             usage.max_context_objects = usage.max_context_objects.max(objects);
@@ -1291,6 +1484,13 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
     }
 
     fn snapshot_refusal(&self) -> Option<String> {
+        if !self.graveyard.is_empty() {
+            return Some(format!(
+                "the Venus executor holds {} parked host Vulkan devices whose GPU work has not \
+                 finished, and host GPU objects cannot be written to a snapshot",
+                self.graveyard.devices()
+            ));
+        }
         let objects = self.host_objects();
         let pages = self.budget.used();
         if objects == 0 && pages > 0 {

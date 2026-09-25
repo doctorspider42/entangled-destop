@@ -5572,3 +5572,277 @@ the logs and screenshots are kept.
   has; it does not yet.
 - **The installed Ubuntu profile has no `[network]`** (the ea87ee4 guide
   already says so). Unchanged here: it is a different decision.
+
+## Amendment, 2026-09-25 — resource exhaustion: every host object a guest makes is capped, charged where it is held, and given back
+
+The threat model is two guests at once. One is root in its VM. The other is
+an unprivileged process inside it that can open the render node. Either can
+send any Venus stream it likes. The host has to stay usable through that:
+its desktop, other host applications on the GPU, the VMM's own window and
+the guest's other contexts. The capacity amendment bounded what the
+*renderer* holds: rings, blobs, the window and host-visible pages. It named
+what stayed unbounded: host Vulkan objects renderer-wide, device-local
+memory, and transient decode memory. This stage bounds those, after an audit
+of everything a guest can make the host allocate.
+
+### The audit
+
+"Before" is the tree at `bebe7d1`. "Now" is this stage.
+
+| Host resource | Created at | Before | Now | Exhausted, the guest sees |
+|---|---|---|---|---|
+| venus contexts | `VenusRenderer::ctx_create` | `MAX_VENUS_CONTEXTS` 64 (`Gpu3d` 128 behind it) | unchanged | `CTX_CREATE` refused in band |
+| rings, ring worker threads | `vkCreateRingMESA` | `MAX_RINGS` 256 / `MAX_RINGS_PER_CONTEXT` 32 | unchanged | the ring is refused. It has no reply, so the guest waits on a ring nobody reads (capacity amendment) |
+| `ALIVE` monitors | one per context with a monitored ring | ≤ contexts, period ≥ 1 ms | unchanged | — |
+| fence threads | first ring fence on a queue | `MAX_FENCE_THREADS` 256 | unchanged | the fence is answered at once, as for a full queue |
+| pending fences | `SUBMIT_3D` with a fence, ring fences | `MAX_PENDING_FENCES` 64 per device, `MAX_RING_FENCES_PER_QUEUE` 128, watchdog 2 s | unchanged | the fence completes synchronously |
+| ring and reply shmem, command-stream pools | `RESOURCE_CREATE_BLOB` (`blob_id` 0) | `MAX_RING_BLOBS(_BYTES)` 1024 / 1 GiB, per context 64 / 128 MiB | unchanged | the blob is refused, and a later `mmap` fails with `EINVAL` |
+| a ring's shadow copy | `pump` | ≤ its ring's buffer, ≤ 16 MiB (`ring::MAX_BUFFER_BYTES`), inside the host-blob budget | unchanged | — |
+| host-visible pages (our imports) | `vkAllocateMemory` of a host-visible type | `MAX_HOST_VISIBLE_BYTES` 2 GiB / 1 GiB share | unchanged, and now also charged for host RAM the driver allocates for any heap that is not device local | `VK_ERROR_OUT_OF_DEVICE_MEMORY` |
+| **device-local memory** | `vkAllocateMemory` of a device-local type (plain or exportable) | **nothing of ours**: the driver's heap only | per heap of each GPU: ¾ of the heap for every context together, ¾ of that per context. A profile may set the whole (`[display] gpu_memory_mib`). Held by the memory object, its handle blob and every import of it | `VK_ERROR_OUT_OF_DEVICE_MEMORY`, and the heap the guest is told is its share |
+| memory objects (a WDDM allocation each) | `vkAllocateMemory` | `MAX_OBJECTS_PER_CONTEXT` 65 536 only | 4096 / 16 384 | `VK_ERROR_TOO_MANY_OBJECTS` |
+| **host Vulkan objects** of every kind | every `vkCreate*`/`vkAllocate*` | 65 536 per context, **nothing renderer-wide** | 65 536 per context, 262 144 in all; per-kind caps below | `VK_ERROR_OUT_OF_HOST_MEMORY` |
+| `VkDevice` | `vkCreateDevice` | table only | 4 / 64 | `VK_ERROR_OUT_OF_HOST_MEMORY` |
+| instances, physical devices, queues | create / enumerate / `vkGetDeviceQueue2` | 1 per context / the host's / the device's queues | counted, bounded by construction | — |
+| pipelines, shader modules, command buffers, fences, semaphores, events | create/allocate | table only | 16 384 / 65 536 each | `VK_ERROR_OUT_OF_HOST_MEMORY` |
+| descriptor pools, query pools, command pools, pipeline caches | create | table only | 4096 / 16 384; 1024 / 4096; 1024 / 4096; 256 / 2048 | `VK_ERROR_OUT_OF_HOST_MEMORY` |
+| SPIR-V and pipeline-cache data a driver copies | `vkCreateShaderModule`, `vkCreatePipelineCache` | 64 MiB per module (`MAX_SHADER_BYTES`), nothing in total | + 256 MiB per context / 1 GiB in all, held by the object | `VK_ERROR_OUT_OF_HOST_MEMORY` |
+| descriptor-pool memory a driver allocates up front | `vkCreateDescriptorPool` | nothing | `maxSets` + Σ `descriptorCount`: 8 Mi / 32 Mi | `VK_ERROR_OUT_OF_DEVICE_MEMORY` |
+| query-pool memory | `vkCreateQueryPool` | nothing | slots × values: 1 Mi / 4 Mi | `VK_ERROR_OUT_OF_DEVICE_MEMORY` |
+| custom-border-colour samplers | `vkCreateSampler` | `maxCustomBorderColorSamplers` per device | unchanged | — |
+| **command recording** | every `vkCmd*` | nothing: a buffer recorded with millions of commands grows the driver's memory without bound | wire bytes of every recorded command (≥ 64 each), held by the command buffer until begun again, reset or freed: 256 MiB / 1 GiB | a `vkCmd*` has no result: **the context ends** |
+| **decode memory** of one command | `Command::decode_next` | 1 GiB per command (`MAX_TEMP_ALLOC_BYTES`, the reference's), **nothing across rings** (256 × 1 GiB) | 256 MiB per command (`MAX_COMMAND_DECODE_BYTES`), and every command's decode and every copied stream of `vkExecuteCommandStreamsMESA` held against 512 MiB per context / 2 GiB in all while it runs | the command cannot be answered: **the context ends** |
+| a stream `vkExecuteCommandStreamsMESA` copies | `ContextBlobs::read` | 64 MiB per call (`MAX_STREAM_BYTES`) | + the decode pool | **the context ends** |
+| output arrays of one call (query results, cache data) | host call | 64 MiB (`MAX_OUTPUT_BYTES`), 65 536 handles | unchanged, per call, per ring worker | — |
+| waits | `vkWaitForFences`, `vkWaitSemaphores`, `vkWaitVirtqueueSeqnoMESA` | sliced, on the ring's own worker, forever if the guest asks | unchanged: the guest's own ring, and its monitor keeps `ALIVE` | — |
+| **GPU work that never finishes** at teardown | context destroy, device reset | `vkDeviceWaitIdle`, **unbounded, on the device worker** | a bounded idle (`HostVulkan::device_idle_within`, 500 ms), then the devices are **parked**, still charged (`executor::Graveyard`) | the device worker is never held; the host objects are destroyed once idle |
+| a lost device | any call | the context ends after the answer, for results of generated calls | the same for every host call (allocations, binds, images, buffers, views) | the command's own answer, then the ring is FATAL |
+| GPU time (an endless shader) | `vkQueueSubmit` | nothing; Windows' TDR resets the GPU, and the driver answers `VK_ERROR_DEVICE_LOST` | unchanged, and contained (below). Not triggered here | the context's device is lost |
+
+### What is capped, and why these numbers
+
+All the caps are in one file, `venus::executor::limits`. They are shares and
+wholes of one `PageBudget` each, the rule host-visible pages have followed
+since the capacity amendment. A charge has to fit the context's share and
+what is left of the renderer-wide whole, and a refund goes back to both. One
+context that runs away is refused at its share, so the rest of the guest
+keeps what it holds. Every context together is refused at the whole, so the
+host keeps the rest.
+
+- **Device-local memory is a part of the host's heap.** The whole is three
+  quarters of each device-local heap, and a context may hold three quarters
+  of that. On the RTX 2070 that is 6 GiB for the guest and 4.4 GiB for any one
+  client. That leaves 2 GiB to the host, whose desktop used 1.5–1.8 GiB of
+  VRAM when measured (1531 MiB before the VM, 1713 MiB with the GPU desktop
+  up). The share is what the guest is told the heap's size is
+  (`policy::guest_heaps`), so a driver that budgets from heap sizes plans
+  within what it will get. Zink's memory-pressure backstop is 80 % of the
+  device-local heaps it is shown, so it now sits under what the context may
+  allocate. The honest-heaps amendment kept device-local heaps at the host's
+  size because nothing bounded them per context. Now something does, and the
+  heap says so. `[display] gpu_memory_mib` (256 to 1 Mi, absent by default,
+  serialised only when set) sets the whole per heap, never past the heap.
+  Budgets are per heap and per GPU (`deviceUUID`): the BAR heap and VRAM are
+  separate, and so are two GPUs.
+- **The counts are generous fixed numbers.** Each per-context cap is at
+  least 25 times the heaviest context measured (peaks below). The exception
+  is devices: a context makes one, and gets four. The renderer-wide count is
+  four times the per-context one, sixteen times for devices. They bound a
+  hostile guest, not a busy one.
+- **Costs are charged by what holds them.** A shader module's SPIR-V, a
+  descriptor pool's capacity, a query pool's slots and a command buffer's
+  recording are each charged when the object is made. The charge is held by
+  the object's table entry (`objects::KindTable`). Every path that lets the
+  entry go refunds it, with no bookkeeping to forget: a `vkDestroy*`, a pool
+  freeing its children, `vkDestroyDevice` taking everything with it, a
+  context destroyed, a device reset. Device memory holds its own charge
+  (`MemoryObject::charge`), shared by `Arc` with the handle blob and every
+  import. An exported allocation lives as long as any of them, and so does
+  its charge.
+- **What cannot be answered ends the context.** A refused create answers its
+  `VkResult`. Mesa creates and allocates without a reply, so a refusal the
+  guest never reads leaves the object absent, and the next command that names
+  it ends that context. vkr behaves the same way when its driver refuses.
+  Recording and decoding have no `VkResult` of their own: past their caps the
+  context is fatal. It is always the context and never the renderer.
+
+### Teardown is bounded, and what is still busy is parked
+
+`vkDeviceWaitIdle` does not return while a queue waits on a timeline value
+nothing will signal, and a guest can submit such a wait in one call. Context
+teardown ran it on the device's worker thread, the thread that serves the
+virtqueues and the scanout. Now teardown asks `HostVulkan::device_idle_within`.
+On `ash` that is an empty fenced submit on every queue, waited on for at most
+`objects::TEARDOWN_WAIT` (500 ms), with the probe fences kept for the next
+look. A context whose devices are still busy is **parked**
+(`executor::Graveyard`): what is left of its table stays, still charged, so a
+guest cannot free its way past a cap by parking. It is looked at again,
+without waiting, whenever a context comes or goes and at every usage sample,
+and it is destroyed once it is idle or lost. A guest's `vkDestroyDevice` of a
+busy device waits in 100 ms slices while its ring is not being torn down,
+the same way every destroy already waits for its work (`settle`).
+
+**Measured on the RTX 2070, and a warning.** A queue whose only work waits on
+an unsignalled timeline value was *busy* after 100.6 ms, where
+`vkDeviceWaitIdle` would never return. It was idle once the value was
+signalled. Run alone, the test passed every time. Run beside another test's
+device doing real GPU work in the same process, it hung twice in seven runs.
+Both test threads stayed inside the driver, and the process would not
+terminate: two such processes were still alive, unkillable, when this was
+written. So a pending wait-before-signal can wedge the NVIDIA driver
+process-wide, and here the process is the VMM. The test is not in the tree.
+The parking above keeps the device worker from waiting on such a queue. It
+cannot keep another thread's driver call from blocking behind one. See
+"Still unbounded".
+
+### A lost device is contained
+
+`VK_ERROR_DEVICE_LOST` used to end the context only when a generated call
+returned it. Now the result of every command is looked at, hand-written host
+calls included: `vkAllocateMemory`, binds, images, buffers, views and command
+pools. The command that met the loss is answered and consumed, and the
+context goes fatal at once. The fake host injects the loss per device and at
+a named call (`FakeVulkan::lose_at`). The test loses the device at each of
+`vkQueueSubmit`, `vkWaitForFences`, `vkAllocateMemory`, `vkCreateBuffer`,
+`vkBindBufferMemory2`, `vkCreateImage`, `vkCreateFence` and
+`vkCreateShaderModule`. Every time, only that context ends, the other context
+creates objects as before, the lost context's charges go with it, and nothing
+panics. The renderer's own scanout device has had its own loss path since
+S2b: it is dropped and made again at the next scanout. A real TDR was not
+triggered on this machine (an nvlddmkm fault has bugchecked it once).
+
+### Tests
+
+- `executor::limits_tests`: a counted kind refused at its share and given
+  back on destroy; memory objects answering `VK_ERROR_TOO_MANY_OBJECTS` and
+  devices `VK_ERROR_OUT_OF_HOST_MEMORY`; SPIR-V bytes, descriptor capacity
+  and query slots refused before the host sees them and given back; the table
+  bounded per context and renderer-wide; one context at a cap costing another
+  nothing; a recording past its cap ending the context, and a new begin
+  giving the old recording back; every implicit free (command buffers with
+  their pool, sets with theirs, everything with its device, the context, a
+  reset) giving back every charge; device-local memory refused at the share
+  and at the whole, the guest told the share, a free giving it back; the
+  driver's own host RAM charged to the host-visible share; the loss matrix
+  above; a context whose GPU work never finishes parked in bounded time,
+  still charged, and reaped once idle; a decode past the pool ending its
+  context with nothing left charged; a command stream past the pool refused
+  before it is copied; one command's decode bounded whatever count it
+  declares (a 2⁴⁰-word claim behind 64 KiB costs under 4 KiB; the peak is
+  asserted).
+- `s1_tests::a_handle_blob_keeps_its_device_local_charge_until_it_goes`.
+- `wire::tests::a_pooled_decode_takes_from_the_pool_and_gives_it_back`.
+- `limits::tests` (classes, heap parts, share/whole refusal levels, per-GPU
+  heaps), `policy::tests::device_local_heaps_report_the_contexts_share_of_them`,
+  `control_api::config::tests::the_gpu_memory_cap_is_optional_and_bounded`.
+- Real GPU, self-skipping:
+  `host_vulkan::pipeline_tests::allocating_past_the_device_local_cap_is_out_of_device_memory_and_the_gpu_keeps_working`.
+  With the whole at 512 MiB, the guest is shown a 384 MiB heap. Six 64 MiB
+  allocations are made, and the seventh answers `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+  (-2) before the driver sees it. After the frees a new one succeeds, and the
+  GPU fills 16 384 words the guest reads back, 0 wrong.
+- The fake now writes `VK_NULL_HANDLE` into a failed create's outputs, as a
+  driver does. Before, the guest's id stayed there and was "destroyed".
+
+### Guest acceptance
+
+The Ubuntu 26.04 guest (Mesa 26.0.8, GNOME on Zink) on WHP with the RTX 2070
+(driver 580.88) ran with `[display] venus = true` and the default caps, from
+the profile `venus-ubuntu-net-profile.toml`, with
+`RUST_LOG=info,virtio_gpu::venus::usage=debug`. The driver script was
+`scratchpad/rx/drive.ps1`. The hostile client is vk-smoke's new check 10
+(`exhaust`), run as root. It allocates device-local memory in 64 MiB pieces
+until refused, holds it for 40 s, and frees it. Then it creates 4 KiB buffers
+until refused and destroys them all.
+
+| | host VRAM (`nvidia-smi`) | GNOME composite (virtio-gpu pacing) | glmark2 on Zink |
+|---|---|---|---|
+| before the VM | 1531 MiB | — | — |
+| desktop up | 1713 MiB | 59.2 fps (min window 56.1) | build 619, jellyfish 599 |
+| + vkcube | 1721 MiB | | |
+| hostile client holding, synchronous | **6205 MiB** of 8192 | **59.2 fps** (min window 52.9) | jellyfish **590**, run meanwhile |
+| after it exits | 1725 MiB | | |
+| hostile client, Mesa's asynchronous default | 6207 MiB | 59.6 fps (one 2 s window at 40 fps as its context went) | |
+| after it is killed | 1719 MiB | | jellyfish 623, build 630 |
+
+- **Synchronous** (`VN_PERF=no_async_mem_alloc,no_async_buffer_create`): the
+  guest was told its heap is 4503 MiB. It got 70 × 64 MiB = 4480 MiB, and the
+  71st allocation answered `VK_ERROR_OUT_OF_DEVICE_MEMORY`. The host logged
+  it once at `info`: `used=4697620480 limit=4722130944 what="device-local"`.
+  After the memory was freed, 65 529 buffers were created and the next
+  answered `VK_ERROR_OUT_OF_HOST_MEMORY` at the context's 65 536 objects.
+  vk-smoke printed `SMOKE 10 … PASS` and exited 0. (The check's name was
+  missing from vk-smoke's list and printed as `?`; it is fixed.)
+- **Asynchronous** (Mesa's default): the guest saw no error. 256 × 64 MiB
+  "succeeded" in the guest, and the host kept 4480 MiB of them. At the first
+  free of a refused allocation the ring went FATAL
+  (`vkFreeMemory: object id 0x4e names no VkDeviceMemory`), Mesa aborted the
+  process (exit 134), and the context's memory went back to the host with
+  it.
+- Throughout, gnome-shell kept its pid (1700), vkcube kept running, and the
+  host kept about 2 GiB of VRAM free. The screenshot taken while the hostile
+  client held its 4.4 GiB shows glmark2 jellyfish composited normally.
+  glmark2 moved within its usual noise (recent runs: build 609–758,
+  jellyfish 569–720).
+
+**Measured peaks**, GNOME + glmark2 build/jellyfish + vkcube, before the
+hostile client ran, renderer-wide / most in one context. Counts and bytes are
+high-water marks (`PageBudget::peak`), so a decode that lives a millisecond
+is counted too.
+
+| class | peak (all / one context) | cap (context / all) |
+|---|---|---|
+| objects | 1802 / 1533 | 65 536 / 262 144 |
+| devices | 3 / 1 | 4 / 64 |
+| memory objects | 44 / 30 | 4096 / 16 384 |
+| pipelines | 25 / 17 | 16 384 / 65 536 |
+| shader modules | 34 / 20 | 16 384 / 65 536 |
+| pipeline caches | 18 / 10 | 256 / 2048 |
+| descriptor pools | 63 / 39 | 4096 / 16 384 |
+| query pools | 0 / 0 | 1024 / 4096 |
+| command pools | 48 / 28 | 1024 / 4096 |
+| command buffers | 89 / 47 | 16 384 / 65 536 |
+| fences / semaphores / events | 8 / 6, 26 / 16, 0 | 16 384 / 65 536 each |
+| SPIR-V + cache bytes | 1.43 MB / 675 KB | 256 MiB / 1 GiB |
+| descriptors (pool capacity) | 104 500 / 60 500 | 8 Mi / 32 Mi |
+| query slots | 0 | 1 Mi / 4 Mi |
+| recorded command bytes | 338 KB / 338 KB | 256 MiB / 1 GiB |
+| decode bytes in flight | 605 KB / 605 KB | 512 MiB / 2 GiB |
+| device-local bytes | 166 MB / 148 MB | 4.4 GiB per context, 5.9 GiB in all (RTX 2070, heap 0) |
+
+The usage log carries all of this as `limits=` and `peak_limits=`. Each class
+reads `now/high-water/most-of-one-context`, then `device_local_bytes`, and
+`parked_devices` follows.
+
+### Still unbounded, or only partly
+
+- **A wait-before-signal can wedge the driver** (above). Parking keeps the
+  device worker out of it, and the guest cannot make a teardown wait for it.
+  But every other thread of the VMM that calls the NVIDIA driver may block
+  behind such a queue: the other contexts' ring workers, the scanout device,
+  the display's presenter. What this needs is either a submit-time refusal
+  of timeline waits past any value signalled or submitted to be signalled
+  (which Zink's patterns must be checked against first), or host-side
+  signalling of such values at teardown. Neither is done.
+- **Parked devices keep their charges.** That is deliberate, but a guest can
+  park devices up to the renderer-wide device cap (64). From then on every
+  new `vkCreateDevice` in the guest is refused until the parked work
+  finishes, which for a wait on a value nobody will signal is never. The host
+  is safe. The guest's own new clients are not.
+- **Many contexts can take a whole.** Shares protect every context from any
+  *one* other. A process that opens several render-node contexts can take
+  the renderer-wide whole of any class, device-local memory included (6 GiB
+  on this card), and leave the rest of the guest refused. The host keeps its
+  quarter.
+- **Per call, not pooled**: the output arrays of one host call
+  (`MAX_OUTPUT_BYTES` 64 MiB, per ring worker) and the ring shadows (inside
+  the host-blob budget). Both are bounded, but neither is in the decode pool.
+- **Driver-internal memory beyond what is charged**: a pipeline's compiled
+  code, a device's own state and an image's metadata are bounded only by the
+  counts. No byte figure for them is known to us.
+- **GPU time**: an endless shader is bounded only by Windows' TDR, which then
+  loses the device (contained, above). Queue priority between guest
+  contexts and the host desktop is not ours to set on WDDM, and it was not
+  measured under a hostile shader.
+- **Host-visible allocation throughput** (from the capacity amendment) is
+  unchanged.

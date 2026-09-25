@@ -611,4 +611,37 @@ pub trait HostVulkan: Send + Sync + 'static {
 
     /// `vkDeviceWaitIdle`, before anything is torn down under the GPU.
     fn device_wait_idle(&self, device: &Self::Device) -> VkResult;
+
+    /// Whether everything submitted to `queues` of `device` has finished,
+    /// waiting at most `timeout`: a bounded `vkDeviceWaitIdle`, so that a
+    /// device whose GPU work waits on something that will never come (a
+    /// timeline value no one signals, an event no one sets) cannot hold up
+    /// the thread tearing it down (ADR-0004, the resource-exhaustion
+    /// amendment). A host that cannot bound the wait answers as
+    /// [`device_wait_idle`](Self::device_wait_idle) does, which is the
+    /// default.
+    fn device_idle_within(
+        &self,
+        device: &Self::Device,
+        queues: &[Self::Queue],
+        timeout: std::time::Duration,
+    ) -> Idle {
+        let _ = (queues, timeout);
+        if self.device_wait_idle(device) == crate::venus::protocol::VK_ERROR_DEVICE_LOST {
+            Idle::Lost
+        } else {
+            Idle::Idle
+        }
+    }
+}
+
+/// What [`HostVulkan::device_idle_within`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Idle {
+    /// Every queue is idle: the device may be torn down.
+    Idle,
+    /// The device is lost: nothing on it runs, and it may be torn down.
+    Lost,
+    /// Work is still running, or waiting, after the timeout.
+    Busy,
 }

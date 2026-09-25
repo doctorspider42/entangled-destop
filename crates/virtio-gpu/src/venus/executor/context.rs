@@ -36,8 +36,8 @@ use crate::venus::protocol::{
     VkQueueFamilyProperties2, VkResult, VK_ERROR_EXTENSION_NOT_PRESENT,
     VK_ERROR_FEATURE_NOT_PRESENT, VK_ERROR_FORMAT_NOT_SUPPORTED, VK_ERROR_INITIALIZATION_FAILED,
     VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT, VK_ERROR_LAYER_NOT_PRESENT,
-    VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_UNKNOWN, VK_INCOMPLETE,
-    VK_SHARING_MODE_CONCURRENT, VK_SUCCESS,
+    VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_UNKNOWN, VK_INCOMPLETE, VK_SHARING_MODE_CONCURRENT,
+    VK_SUCCESS,
 };
 use crate::venus::wire::Encoder;
 
@@ -119,6 +119,17 @@ pub enum ExecError {
         /// What was wrong.
         what: &'static str,
     },
+    /// A cap refused something a command with no `VkResult` needed — the
+    /// commands recorded into a command buffer past its context's recording
+    /// bytes (ADR-0004, the resource-exhaustion amendment). With no result
+    /// to answer, the context ends, as Vulkan leaves nothing else to do.
+    #[error("{command}: {refused}")]
+    Refused {
+        /// The command.
+        command: &'static str,
+        /// Which cap, and what it held.
+        refused: super::limits::Refusal,
+    },
     /// A second `vkCreateInstance` on one context (`vkr_instance.c:87-90`).
     #[error("vkCreateInstance on a context that already has instance {0:#x}")]
     SecondInstance(u64),
@@ -185,6 +196,34 @@ pub(super) fn unimplemented_link(
     }
 }
 
+/// How long one look at a device the guest destroys waits for its GPU work
+/// before the ring's stop signal is looked at again.
+const DESTROY_DEVICE_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// What one recorded command is charged at least, whatever its wire size (a
+/// test that executes a command directly passes none): a driver's own record
+/// of a command is tens of bytes.
+pub const MIN_RECORDED_COMMAND_BYTES: usize = 64;
+
+/// The `VkResult` `command` answers: the generated table's, and the
+/// hand-written host calls' that table does not list — what a lost device can
+/// come back through.
+fn result_of(command: &Command<'_>) -> Option<VkResult> {
+    match command {
+        Command::AllocateMemory(a) => Some(a.ret),
+        Command::BindBufferMemory(a) => Some(a.ret),
+        Command::BindBufferMemory2(a) => Some(a.ret),
+        Command::BindImageMemory(a) => Some(a.ret),
+        Command::BindImageMemory2(a) => Some(a.ret),
+        Command::CreateImage(a) => Some(a.ret),
+        Command::CreateBuffer(a) => Some(a.ret),
+        Command::CreateImageView(a) => Some(a.ret),
+        Command::CreateBufferView(a) => Some(a.ret),
+        Command::CreateCommandPool(a) => Some(a.ret),
+        other => super::generated::result_of(other),
+    }
+}
+
 pub(super) fn invalid(command: &'static str, what: impl Into<String>) -> ExecError {
     ExecError::Invalid {
         command,
@@ -232,6 +271,19 @@ pub struct VulkanContext<H: HostVulkan> {
     pub(super) shared_waits: super::writes::SharedWaits,
     /// Whether "submits go unordered" has been logged for this context.
     pub(super) unordered_logged: bool,
+    /// The classes of [`super::limits`] a refusal has been logged for at
+    /// `info` (once per class per context; `debug` after that, so a guest
+    /// looping into a cap cannot flood the host log).
+    pub(super) refusals_logged: std::cell::RefCell<HashSet<super::limits::Class>>,
+    /// Wire bytes of the command executing: what a recorded `vkCmd*` is
+    /// charged to its command buffer ([`super::limits::Class::RecordingBytes`]).
+    pub(super) command_bytes: usize,
+    /// Whether an allocation refused at its heap's budget has been logged at
+    /// `info` for this context.
+    pub(super) device_local_refused: std::cell::Cell<bool>,
+    /// Where a teardown puts devices whose GPU work had not finished
+    /// ([`super::Graveyard`]), shared with the executor.
+    pub(super) graveyard: Arc<super::Graveyard<H>>,
 }
 
 impl<H: HostVulkan> VulkanContext<H> {
@@ -261,10 +313,29 @@ impl<H: HostVulkan> VulkanContext<H> {
         budget: Arc<PageBudget>,
         fence_threads: Arc<super::timeline::FenceThreads>,
     ) -> Self {
+        Self::with_caps(
+            ctx_id,
+            host,
+            budget,
+            fence_threads,
+            super::limits::ContextLimits::default(),
+        )
+    }
+
+    /// [`Self::with_limits`], charging every object, cost and device-local
+    /// byte to `limits` — its shares of the executor's
+    /// [`super::limits::Limits`].
+    pub fn with_caps(
+        ctx_id: u32,
+        host: Arc<H>,
+        budget: Arc<PageBudget>,
+        fence_threads: Arc<super::timeline::FenceThreads>,
+        limits: super::limits::ContextLimits,
+    ) -> Self {
         Self {
             ctx_id,
             host,
-            objects: Objects::default(),
+            objects: Objects::with_limits(limits),
             fatal: false,
             lost: false,
             budget,
@@ -275,7 +346,65 @@ impl<H: HostVulkan> VulkanContext<H> {
             payloads: super::writes::Payloads::new(),
             shared_waits: super::writes::SharedWaits::default(),
             unordered_logged: false,
+            refusals_logged: std::cell::RefCell::new(HashSet::new()),
+            command_bytes: 0,
+            device_local_refused: std::cell::Cell::new(false),
+            graveyard: super::Graveyard::new(),
         }
+    }
+
+    /// Charge a command recorded into a command buffer to that buffer
+    /// ([`super::limits::Class::RecordingBytes`]): its wire size, at least
+    /// [`MIN_RECORDED_COMMAND_BYTES`]. `vkBeginCommandBuffer` and
+    /// `vkResetCommandBuffer` give back what the buffer held first. An id the
+    /// dispatch will refuse is left to it.
+    ///
+    /// # Errors
+    /// [`ExecError::Refused`] past the context's or the renderer's cap: a
+    /// `vkCmd*` has no result, so the context ends.
+    fn charge_recording(&mut self, command: &Command<'_>) -> Result<(), ExecError> {
+        let Some((Kind::CommandBuffer, cb)) = super::generated::dispatchable(command) else {
+            return Ok(());
+        };
+        if self.objects.check(cb, Kind::CommandBuffer).is_err() {
+            return Ok(());
+        }
+        if matches!(
+            command,
+            Command::BeginCommandBuffer(_) | Command::ResetCommandBuffer(_)
+        ) {
+            self.objects.clear_extra(cb);
+        }
+        let cost =
+            u64::try_from(self.command_bytes.max(MIN_RECORDED_COMMAND_BYTES)).unwrap_or(u64::MAX);
+        self.objects
+            .charge_extra(cb, super::limits::Class::RecordingBytes, cost)
+            .map_err(|refused| ExecError::Refused {
+                command: command.name(),
+                refused,
+            })
+    }
+
+    /// What a create refused by a cap answers ([`super::limits::Refusal::result`]),
+    /// logged: at `info` the first time a class refuses this context, at
+    /// `debug` after that.
+    pub(super) fn refuse(
+        &self,
+        command: &'static str,
+        refused: &super::limits::Refusal,
+    ) -> VkResult {
+        if self.refusals_logged.borrow_mut().insert(refused.class) {
+            tracing::info!(
+                ctx_id = self.ctx_id,
+                command,
+                %refused,
+                "a Venus create was refused at a cap; the guest is answered in Vulkan terms \
+                 (ADR-0004, the resource-exhaustion amendment)"
+            );
+        } else {
+            tracing::debug!(ctx_id = self.ctx_id, command, %refused, "a Venus create was refused at a cap");
+        }
+        refused.result()
     }
 
     /// Whether a command has seen `VK_ERROR_DEVICE_LOST` since the last ask;
@@ -327,7 +456,18 @@ impl<H: HostVulkan> VulkanContext<H> {
     /// destruction and device reset; the table is empty afterwards.
     pub fn destroy_all(&mut self) {
         let host = Arc::clone(&self.host);
-        self.objects.destroy_all(&host);
+        if self
+            .objects
+            .destroy_all(&host, super::objects::TEARDOWN_WAIT)
+            == super::objects::Teardown::Busy
+        {
+            // Its GPU work has not finished: what it needs goes to the
+            // graveyard, still charged, and the context starts empty on the
+            // same shares.
+            let fresh = Objects::with_limits(self.objects.limits().clone());
+            let parked = std::mem::replace(&mut self.objects, fresh);
+            self.graveyard.park(self.ctx_id, parked);
+        }
         self.recordings = super::writes::Recordings::default();
         self.payloads.forget_context(self.ctx_id);
     }
@@ -342,11 +482,19 @@ impl<H: HostVulkan> VulkanContext<H> {
         }
         let result = match unadmitted_link(command) {
             Some(error) => Err(error),
-            None => self.dispatch(command),
+            None => self
+                .charge_recording(command)
+                .and_then(|()| self.dispatch(command)),
         };
+        // A create that did not bind all it reserved gives the rest back.
+        self.objects.release_reserved();
         if result.is_err() {
             self.fatal = true;
         }
+        // Wherever the driver's answer came from — a generated call, or one of
+        // the hand-written host calls (an allocation, a bind, an image) — a
+        // lost device ends the context once this command is answered.
+        self.note_result(command.name(), result_of(command));
         result
     }
 
@@ -576,6 +724,7 @@ impl<H: HostVulkan> VulkanContext<H> {
         let host = Arc::clone(&self.host);
         let ctx_id = self.ctx_id;
         let share = self.budget.limit();
+        let caps = self.objects.limits().renderer().caps().clone();
         let object = self
             .objects
             .instance_mut(instance)
@@ -595,9 +744,12 @@ impl<H: HostVulkan> VulkanContext<H> {
                     .into_owned();
             match policy::expose(info) {
                 Ok(mut guest) => {
-                    // What this context can hold of the heap of our pages
-                    // (`policy::guest_heaps`): its host-visible share.
-                    guest.memory = policy::guest_heaps(&guest.memory, share);
+                    // What this context can hold of each heap
+                    // (`policy::guest_heaps`): its host-visible share of host
+                    // RAM, its device-local share of each heap of VRAM.
+                    guest.memory = policy::guest_heaps(&guest.memory, share, |heap| {
+                        caps.device_local_share(heap)
+                    });
                     let heaps: Vec<u64> = guest
                         .memory
                         .memory_heaps
@@ -1452,8 +1604,8 @@ impl<H: HostVulkan> VulkanContext<H> {
             }
         }
 
-        if !self.objects.has_room() {
-            args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+        if let Err(refused) = self.objects.reserve(Kind::Device, 1) {
+            args.ret = self.refuse("vkCreateDevice", &refused);
             return Ok(());
         }
         // Containment for what the checks let past (stage 5b.2, ADR-0004):
@@ -1528,7 +1680,22 @@ impl<H: HostVulkan> VulkanContext<H> {
             .device(args.device.0)
             .map_err(id_error("vkDestroyDevice"))?;
         let host = Arc::clone(&self.host);
-        self.objects.destroy_device(&host, args.device.0);
+        // Its GPU work first, as every destroy waits for it (`settle`); a
+        // ring torn down meanwhile stops waiting and leaves the device to the
+        // context's teardown, which parks it if it is still busy.
+        while self
+            .objects
+            .destroy_device(&host, args.device.0, DESTROY_DEVICE_SLICE)
+            == super::objects::Teardown::Busy
+        {
+            if self
+                .stop
+                .as_ref()
+                .is_some_and(crate::venus::service::StopSignal::is_stopping)
+            {
+                break;
+            }
+        }
         self.prune_recordings();
         Ok(())
     }
@@ -1665,8 +1832,8 @@ impl<H: HostVulkan> VulkanContext<H> {
                 ),
             ));
         }
-        if !self.objects.has_room() {
-            args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+        if let Err(refused) = self.objects.reserve(Kind::CommandPool, 1) {
+            args.ret = self.refuse("vkCreateCommandPool", &refused);
             return Ok(());
         }
         match self.host.create_command_pool(&device.host, info) {
@@ -1742,8 +1909,8 @@ impl<H: HostVulkan> VulkanContext<H> {
         }
         let planes = image_planes(NAME, info)?;
 
-        if !self.objects.has_room() {
-            args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+        if let Err(refused) = self.objects.reserve(Kind::Image, 1) {
+            args.ret = self.refuse("vkCreateImage", &refused);
             return Ok(());
         }
         let host_memory = self.host.image_accepts_host_memory(&device.host, info);
@@ -1906,8 +2073,8 @@ impl<H: HostVulkan> VulkanContext<H> {
                     return Ok(());
                 }
             };
-        if !self.objects.has_room() {
-            args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+        if let Err(refused) = self.objects.reserve(Kind::Image, 1) {
+            args.ret = self.refuse("vkCreateImage", &refused);
             return Ok(());
         }
         let device = self.objects.device(device_id).map_err(id_error(NAME))?;

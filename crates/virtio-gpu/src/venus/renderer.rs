@@ -577,6 +577,12 @@ pub struct FactoryUsage {
     pub pending_ring_fences: usize,
     /// Handle blobs prepared for scanout on the renderer's own device.
     pub scanout_targets: usize,
+    /// Everything the executor's caps bound (`executor::limits`), in all and
+    /// the most of one context.
+    pub limits: crate::venus::executor::limits::LimitUsage,
+    /// Host devices parked because their GPU work had not finished when
+    /// their context went (`executor::Graveyard`).
+    pub parked_devices: usize,
 }
 
 impl FactoryUsage {
@@ -593,6 +599,8 @@ impl FactoryUsage {
             fence_threads: self.fence_threads.max(other.fence_threads),
             pending_ring_fences: self.pending_ring_fences.max(other.pending_ring_fences),
             scanout_targets: self.scanout_targets.max(other.scanout_targets),
+            limits: self.limits.max(other.limits),
+            parked_devices: self.parked_devices.max(other.parked_devices),
         }
     }
 }
@@ -2900,6 +2908,9 @@ impl<F: SinkFactory> VenusRenderer<F> {
             peak_context_objects = peak.factory.max_context_objects,
             peak_pending_ring_fences = peak.factory.pending_ring_fences,
             peak_scanout_targets = peak.factory.scanout_targets,
+            limits = %now.factory.limits,
+            parked_devices = now.factory.parked_devices,
+            peak_limits = %peak.factory.limits,
             "venus usage"
         );
     }
