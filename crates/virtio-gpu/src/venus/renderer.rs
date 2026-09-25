@@ -970,14 +970,14 @@ impl SharedRef {
     /// The handle's address: its key in the directory's index. Stable, and
     /// never another handle's, while this reference exists — a `Weak` keeps
     /// the allocation (not the value) from being reused.
-    fn key(&self) -> usize {
+    pub(crate) fn key(&self) -> usize {
         Weak::as_ptr(&self.0).cast::<()>() as usize
     }
 }
 
 impl SharedHandle {
     /// [`SharedRef::key`] of this handle.
-    fn key(&self) -> usize {
+    pub(crate) fn key(&self) -> usize {
         Arc::as_ptr(&self.0).cast::<()>() as usize
     }
 }

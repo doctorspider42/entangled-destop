@@ -44,7 +44,12 @@
 //!
 //! # One read
 //!
-//! On the one command buffer, fenced:
+//! First the factory **claims** the blob's payload ([`super::writes`]):
+//! every guest submission that touched it has finished on the host GPU, and
+//! none that touches it starts until the copy has — the guest's own flip
+//! ordering is not relied on. A claim that cannot be had within
+//! [`SCANOUT_WAIT`] fails the flush before anything is recorded. Then, on
+//! the one command buffer, fenced:
 //!
 //! 1. **acquire** — `srcQueueFamilyIndex` the family the guest released to,
 //!    `dstQueueFamilyIndex` ours, `oldLayout` the layout it released in
@@ -700,7 +705,7 @@ impl<H: HostVulkan> ScanoutDevice<H> {
     }
 
     /// Read `rect` of `target`'s image as packed BGRA into `out`: see the
-    /// module docs.
+    /// module docs. [`Self::copy`], then [`CopiedRect::collect`].
     ///
     /// # Errors
     /// [`ScanoutError`]; `out` is then unspecified.
@@ -711,6 +716,23 @@ impl<H: HostVulkan> ScanoutDevice<H> {
         rect: Rect,
         out: &mut Vec<u8>,
     ) -> Result<(), ScanoutError> {
+        self.copy(target, release, rect)?.collect(out)
+    }
+
+    /// The GPU half of a read: `rect` of `target`'s image copied into its
+    /// staging pages, and the copy finished. The rows are then taken out of
+    /// the pages by [`CopiedRect::collect`], which needs nothing of the GPU —
+    /// so a caller holding guest contexts still for the copy
+    /// ([`super::writes`]) can let them go first.
+    ///
+    /// # Errors
+    /// [`ScanoutError`].
+    pub fn copy(
+        &mut self,
+        target: &ScanoutTarget,
+        release: ScanoutRelease,
+        rect: Rect,
+    ) -> Result<CopiedRect, ScanoutError> {
         use policy::{QUEUE_FAMILY_EXTERNAL, QUEUE_FAMILY_FOREIGN};
         let copy = copy_layout(release.layout).ok_or_else(|| {
             refused(format!(
@@ -918,12 +940,33 @@ impl<H: HostVulkan> ScanoutDevice<H> {
                 )));
             }
         }
-        // The fence has signalled: the copy is done and visible to the host,
-        // and nothing else writes these pages — `read_rows`' precondition.
-        pages
-            .read_rows(0, row as u64, row, rows, out)
-            .map_err(|e| refused(format!("the staging pages: {e}")))?;
-        Ok(())
+        Ok(CopiedRect { pages, row, rows })
+    }
+}
+
+/// A rect a [`ScanoutDevice::copy`] has finished copying into its staging
+/// pages: packed rows of `row` bytes.
+#[derive(Debug)]
+pub struct CopiedRect {
+    pages: PrivatePages,
+    row: usize,
+    rows: usize,
+}
+
+impl CopiedRect {
+    /// The rows, as packed BGRA, into `out`.
+    ///
+    /// # Errors
+    /// [`ScanoutError::Refused`] if the pages cannot be read; `out` is then
+    /// unspecified.
+    pub fn collect(self, out: &mut Vec<u8>) -> Result<(), ScanoutError> {
+        // The copy's fence has signalled: it is done and visible to the
+        // host, and nothing else writes these pages — `read_rows`'
+        // precondition. The next copy into them is this device's, which
+        // cannot start before its caller is done with this one.
+        self.pages
+            .read_rows(0, self.row as u64, self.row, self.rows, out)
+            .map_err(|e| refused(format!("the staging pages: {e}")))
     }
 }
 

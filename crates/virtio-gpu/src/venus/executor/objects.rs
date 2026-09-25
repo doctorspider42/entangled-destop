@@ -264,6 +264,10 @@ pub struct QueueObject<H: HostVulkan> {
     /// The thread retiring virtio-gpu fences on its `ring_idx` (stage
     /// 5b.3), started by the first one.
     pub sync: Option<QueueSync<H>>,
+    /// The serial of its newest submit that touched a shared payload
+    /// ([`super::writes`]); its fence thread's progress says how far they
+    /// have finished.
+    pub marks: u64,
 }
 
 /// What the executor knows of the work a queue may still be running: enough
@@ -1133,6 +1137,16 @@ impl<H: HostVulkan> Objects<H> {
     /// As [`Self::image`].
     pub fn raw(&self, kind: Kind, device: u64, id: u64) -> Result<&RawObject, IdError> {
         child_in(&self.raw, &self.kinds, kind, device, id)
+    }
+
+    /// The command buffers of pool `pool` of `device`, by guest id.
+    #[must_use]
+    pub fn children_of_pool(&self, device: u64, pool: u64) -> Vec<u64> {
+        self.raw
+            .iter()
+            .filter(|(_, o)| o.kind == Kind::CommandBuffer && o.device == device && o.pool == pool)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// The stage-5b.2 object `id` names, whatever its device: how a command

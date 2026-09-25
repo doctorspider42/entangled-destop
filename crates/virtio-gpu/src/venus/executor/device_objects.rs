@@ -304,6 +304,26 @@ fn dependency_releases<'a>(
     out
 }
 
+/// The images a command's image barriers name, by guest id: what the
+/// scanout ordering records as touched ([`super::writes`]).
+fn barrier_images(images: Option<&[crate::venus::protocol::VkImageMemoryBarrier]>) -> Vec<u64> {
+    images
+        .unwrap_or_default()
+        .iter()
+        .map(|b| b.image.0)
+        .collect()
+}
+
+/// [`barrier_images`] of sync2 dependency infos.
+fn dependency_images<'a>(
+    infos: impl Iterator<Item = &'a crate::venus::protocol::VkDependencyInfo>,
+) -> Vec<u64> {
+    infos
+        .flat_map(|info| info.p_image_memory_barriers.iter().flatten())
+        .map(|b| b.image.0)
+        .collect()
+}
+
 /// [`barrier_families`] of sync2 dependency infos.
 fn dependency_families<'a>(
     infos: impl Iterator<Item = &'a crate::venus::protocol::VkDependencyInfo>,
@@ -723,10 +743,22 @@ impl<H: HostVulkan> VulkanContext<H> {
                     .flatten()
                     .map(|c| c.0)
                     .collect();
-                self.free_children(command, Kind::CommandBuffer, device, pool, &buffers)
+                self.free_children(command, Kind::CommandBuffer, device, pool, &buffers)?;
+                self.forget_recordings(&buffers);
+                Ok(())
             }
-            Command::ResetCommandPool(_) | Command::ResetCommandBuffer(_) => {
-                self.pass_through(command)
+            Command::ResetCommandBuffer(args) => {
+                let cb = args.command_buffer.0;
+                self.pass_through(command)?;
+                self.forget_recordings(&[cb]);
+                Ok(())
+            }
+            Command::ResetCommandPool(args) => {
+                let (device, pool) = (args.device.0, args.command_pool.0);
+                self.pass_through(command)?;
+                let children = self.objects.children_of_pool(device, pool);
+                self.forget_recordings(&children);
+                Ok(())
             }
             Command::BeginCommandBuffer(args) => {
                 // A secondary recorded for dynamic rendering (stage 5b.3)
@@ -751,7 +783,10 @@ impl<H: HostVulkan> VulkanContext<H> {
                         "inherited rendering with more colour attachments than maxColorAttachments",
                     ));
                 }
-                self.pass_through(command)
+                let cb = args.command_buffer.0;
+                self.pass_through(command)?;
+                self.forget_recordings(&[cb]);
+                Ok(())
             }
             Command::CmdBeginRendering(args) => {
                 const NAME: &str = "vkCmdBeginRendering";
@@ -1275,7 +1310,16 @@ impl<H: HostVulkan> VulkanContext<H> {
                         ));
                     }
                 }
-                self.pass_through(command)
+                let primary = args.command_buffer.0;
+                let secondaries: Vec<u64> = args
+                    .p_command_buffers
+                    .iter()
+                    .flatten()
+                    .map(|c| c.0)
+                    .collect();
+                self.pass_through(command)?;
+                self.inherit_recordings(primary, &secondaries);
+                Ok(())
             }
 
             // ------------------------ stage 5c: the admitted extensions
@@ -1425,9 +1469,14 @@ impl<H: HostVulkan> VulkanContext<H> {
                     args.p_image_memory_barriers.as_deref(),
                 );
                 let releases = image_releases(args.p_image_memory_barriers.as_deref());
+                let (cb, images) = (
+                    args.command_buffer.0,
+                    barrier_images(args.p_image_memory_barriers.as_deref()),
+                );
                 self.check_families(NAME, device, &pairs, false)?;
                 self.pass_through(command)?;
                 self.note_releases(device, &releases);
+                self.note_touches(device, cb, &images);
                 Ok(())
             }
             Command::CmdWaitEvents(args) => {
@@ -1438,9 +1487,14 @@ impl<H: HostVulkan> VulkanContext<H> {
                     args.p_image_memory_barriers.as_deref(),
                 );
                 let releases = image_releases(args.p_image_memory_barriers.as_deref());
+                let (cb, images) = (
+                    args.command_buffer.0,
+                    barrier_images(args.p_image_memory_barriers.as_deref()),
+                );
                 self.check_families(NAME, device, &pairs, false)?;
                 self.pass_through(command)?;
                 self.note_releases(device, &releases);
+                self.note_touches(device, cb, &images);
                 Ok(())
             }
             Command::CmdPipelineBarrier2(args) => {
@@ -1448,9 +1502,14 @@ impl<H: HostVulkan> VulkanContext<H> {
                 let device = self.cmd_device(NAME, args.command_buffer.0)?;
                 let pairs = dependency_families(args.p_dependency_info.iter());
                 let releases = dependency_releases(args.p_dependency_info.iter());
+                let (cb, images) = (
+                    args.command_buffer.0,
+                    dependency_images(args.p_dependency_info.iter()),
+                );
                 self.check_families(NAME, device, &pairs, false)?;
                 self.pass_through(command)?;
                 self.note_releases(device, &releases);
+                self.note_touches(device, cb, &images);
                 Ok(())
             }
             Command::CmdWaitEvents2(args) => {
@@ -1458,9 +1517,14 @@ impl<H: HostVulkan> VulkanContext<H> {
                 let device = self.cmd_device(NAME, args.command_buffer.0)?;
                 let pairs = dependency_families(args.p_dependency_infos.iter().flatten());
                 let releases = dependency_releases(args.p_dependency_infos.iter().flatten());
+                let (cb, images) = (
+                    args.command_buffer.0,
+                    dependency_images(args.p_dependency_infos.iter().flatten()),
+                );
                 self.check_families(NAME, device, &pairs, false)?;
                 self.pass_through(command)?;
                 self.note_releases(device, &releases);
+                self.note_touches(device, cb, &images);
                 Ok(())
             }
             Command::CmdSetEvent2(args) => {

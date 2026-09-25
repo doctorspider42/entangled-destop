@@ -1309,6 +1309,27 @@ impl ToAsh for VkPhysicalDeviceDynamicRenderingFeatures {
     }
 }
 
+impl FromAsh<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT<'_>>
+    for VkPhysicalDeviceExtendedDynamicStateFeaturesEXT
+{
+    fn from_ash(src: &vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT<'_>) -> Self {
+        Self {
+            extended_dynamic_state: src.extended_dynamic_state,
+        }
+    }
+}
+
+impl ToAsh for VkPhysicalDeviceExtendedDynamicStateFeaturesEXT {
+    type Ash = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT<'static>;
+    fn to_ash(&self) -> vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT<'static> {
+        let src = self;
+        vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {
+            extended_dynamic_state: src.extended_dynamic_state,
+            ..Default::default()
+        }
+    }
+}
+
 impl FromAsh<vk::PhysicalDeviceExternalBufferInfo<'_>> for VkPhysicalDeviceExternalBufferInfo {
     fn from_ash(src: &vk::PhysicalDeviceExternalBufferInfo<'_>) -> Self {
         Self {
@@ -4138,14 +4159,15 @@ pub unsafe fn query_features2(
     let mut l33 = vk::PhysicalDeviceVulkan13Features::default();
     let mut l34 = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
     let mut l35 = vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT::default();
-    let mut l36 = vk::PhysicalDeviceZeroInitializeWorkgroupMemoryFeatures::default();
-    let mut l37 = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
-    let mut l38 = vk::PhysicalDeviceImageRobustnessFeatures::default();
-    let mut l39 = vk::PhysicalDeviceShaderTerminateInvocationFeatures::default();
-    let mut l40 = vk::PhysicalDeviceSynchronization2Features::default();
-    let mut l41 = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
-    let mut l42 = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
-    let mut l43 = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+    let mut l36 = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
+    let mut l37 = vk::PhysicalDeviceZeroInitializeWorkgroupMemoryFeatures::default();
+    let mut l38 = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+    let mut l39 = vk::PhysicalDeviceImageRobustnessFeatures::default();
+    let mut l40 = vk::PhysicalDeviceShaderTerminateInvocationFeatures::default();
+    let mut l41 = vk::PhysicalDeviceSynchronization2Features::default();
+    let mut l42 = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
+    let mut l43 = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+    let mut l44 = vk::PhysicalDeviceDynamicRenderingFeatures::default();
     let on0 = api >= vk::API_VERSION_1_3;
     let on1 = api >= vk::API_VERSION_1_1;
     let on2 = api >= vk::API_VERSION_1_1;
@@ -4182,14 +4204,15 @@ pub unsafe fn query_features2(
     let on33 = api >= vk::API_VERSION_1_3;
     let on34 = has("VK_EXT_custom_border_color");
     let on35 = has("VK_EXT_border_color_swizzle");
-    let on36 = api >= vk::API_VERSION_1_3;
-    let on37 = has("VK_EXT_robustness2") || has("VK_KHR_robustness2");
-    let on38 = api >= vk::API_VERSION_1_3;
+    let on36 = has("VK_EXT_extended_dynamic_state");
+    let on37 = api >= vk::API_VERSION_1_3;
+    let on38 = has("VK_EXT_robustness2") || has("VK_KHR_robustness2");
     let on39 = api >= vk::API_VERSION_1_3;
     let on40 = api >= vk::API_VERSION_1_3;
-    let on41 = has("VK_EXT_provoking_vertex");
-    let on42 = api >= vk::API_VERSION_1_3;
+    let on41 = api >= vk::API_VERSION_1_3;
+    let on42 = has("VK_EXT_provoking_vertex");
     let on43 = api >= vk::API_VERSION_1_3;
+    let on44 = api >= vk::API_VERSION_1_3;
     let mut head = vk::PhysicalDeviceFeatures2::default();
     if on0 {
         head = head.push_next(&mut l0);
@@ -4322,6 +4345,9 @@ pub unsafe fn query_features2(
     }
     if on43 {
         head = head.push_next(&mut l43);
+    }
+    if on44 {
+        head = head.push_next(&mut l44);
     }
     // SAFETY: the caller vouches for `pd`; `head` and every structure
     // chained onto it are locals of this function, correctly typed and
@@ -4584,57 +4610,64 @@ pub unsafe fn query_features2(
     }
     if on36 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures(
-                VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures::from_ash(&l36),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceExtendedDynamicStateFeaturesEXT(
+                VkPhysicalDeviceExtendedDynamicStateFeaturesEXT::from_ash(&l36),
             ),
         );
     }
     if on37 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceRobustness2FeaturesKHR(
-                VkPhysicalDeviceRobustness2FeaturesKHR::from_ash(&l37),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures(
+                VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures::from_ash(&l37),
             ),
         );
     }
     if on38 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceImageRobustnessFeatures(
-                VkPhysicalDeviceImageRobustnessFeatures::from_ash(&l38),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceRobustness2FeaturesKHR(
+                VkPhysicalDeviceRobustness2FeaturesKHR::from_ash(&l38),
             ),
         );
     }
     if on39 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderTerminateInvocationFeatures(
-                VkPhysicalDeviceShaderTerminateInvocationFeatures::from_ash(&l39),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceImageRobustnessFeatures(
+                VkPhysicalDeviceImageRobustnessFeatures::from_ash(&l39),
             ),
         );
     }
     if on40 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceSynchronization2Features(
-                VkPhysicalDeviceSynchronization2Features::from_ash(&l40),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderTerminateInvocationFeatures(
+                VkPhysicalDeviceShaderTerminateInvocationFeatures::from_ash(&l40),
             ),
         );
     }
     if on41 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceProvokingVertexFeaturesEXT(
-                VkPhysicalDeviceProvokingVertexFeaturesEXT::from_ash(&l41),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceSynchronization2Features(
+                VkPhysicalDeviceSynchronization2Features::from_ash(&l41),
             ),
         );
     }
     if on42 {
         p_next.push(
-            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderIntegerDotProductFeatures(
-                VkPhysicalDeviceShaderIntegerDotProductFeatures::from_ash(&l42),
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceProvokingVertexFeaturesEXT(
+                VkPhysicalDeviceProvokingVertexFeaturesEXT::from_ash(&l42),
             ),
         );
     }
     if on43 {
         p_next.push(
+            VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceShaderIntegerDotProductFeatures(
+                VkPhysicalDeviceShaderIntegerDotProductFeatures::from_ash(&l43),
+            ),
+        );
+    }
+    if on44 {
+        p_next.push(
             VkPhysicalDeviceFeatures2Next::VkPhysicalDeviceDynamicRenderingFeatures(
-                VkPhysicalDeviceDynamicRenderingFeatures::from_ash(&l43),
+                VkPhysicalDeviceDynamicRenderingFeatures::from_ash(&l44),
             ),
         );
     }
@@ -5039,14 +5072,15 @@ pub struct DeviceLinks {
     l35: Option<vk::PhysicalDeviceVulkan13Features<'static>>,
     l36: Option<vk::PhysicalDeviceCustomBorderColorFeaturesEXT<'static>>,
     l37: Option<vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT<'static>>,
-    l38: Option<vk::PhysicalDeviceZeroInitializeWorkgroupMemoryFeatures<'static>>,
-    l39: Option<vk::PhysicalDeviceRobustness2FeaturesEXT<'static>>,
-    l40: Option<vk::PhysicalDeviceImageRobustnessFeatures<'static>>,
-    l41: Option<vk::PhysicalDeviceShaderTerminateInvocationFeatures<'static>>,
-    l42: Option<vk::PhysicalDeviceSynchronization2Features<'static>>,
-    l43: Option<vk::PhysicalDeviceProvokingVertexFeaturesEXT<'static>>,
-    l44: Option<vk::PhysicalDeviceShaderIntegerDotProductFeatures<'static>>,
-    l45: Option<vk::PhysicalDeviceDynamicRenderingFeatures<'static>>,
+    l38: Option<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT<'static>>,
+    l39: Option<vk::PhysicalDeviceZeroInitializeWorkgroupMemoryFeatures<'static>>,
+    l40: Option<vk::PhysicalDeviceRobustness2FeaturesEXT<'static>>,
+    l41: Option<vk::PhysicalDeviceImageRobustnessFeatures<'static>>,
+    l42: Option<vk::PhysicalDeviceShaderTerminateInvocationFeatures<'static>>,
+    l43: Option<vk::PhysicalDeviceSynchronization2Features<'static>>,
+    l44: Option<vk::PhysicalDeviceProvokingVertexFeaturesEXT<'static>>,
+    l45: Option<vk::PhysicalDeviceShaderIntegerDotProductFeatures<'static>>,
+    l46: Option<vk::PhysicalDeviceDynamicRenderingFeatures<'static>>,
 }
 
 impl DeviceLinks {
@@ -5171,29 +5205,32 @@ impl DeviceLinks {
                 VkDeviceCreateInfoNext::VkPhysicalDeviceBorderColorSwizzleFeaturesEXT(v) => {
                     out.l37 = Some(v.to_ash())
                 }
+                VkDeviceCreateInfoNext::VkPhysicalDeviceExtendedDynamicStateFeaturesEXT(v) => {
+                    out.l38 = Some(v.to_ash())
+                }
                 VkDeviceCreateInfoNext::VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures(
                     v,
-                ) => out.l38 = Some(v.to_ash()),
+                ) => out.l39 = Some(v.to_ash()),
                 VkDeviceCreateInfoNext::VkPhysicalDeviceRobustness2FeaturesKHR(v) => {
-                    out.l39 = Some(v.to_ash())
-                }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceImageRobustnessFeatures(v) => {
                     out.l40 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceShaderTerminateInvocationFeatures(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceImageRobustnessFeatures(v) => {
                     out.l41 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceSynchronization2Features(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceShaderTerminateInvocationFeatures(v) => {
                     out.l42 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceProvokingVertexFeaturesEXT(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceSynchronization2Features(v) => {
                     out.l43 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceShaderIntegerDotProductFeatures(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceProvokingVertexFeaturesEXT(v) => {
                     out.l44 = Some(v.to_ash())
                 }
-                VkDeviceCreateInfoNext::VkPhysicalDeviceDynamicRenderingFeatures(v) => {
+                VkDeviceCreateInfoNext::VkPhysicalDeviceShaderIntegerDotProductFeatures(v) => {
                     out.l45 = Some(v.to_ash())
+                }
+                VkDeviceCreateInfoNext::VkPhysicalDeviceDynamicRenderingFeatures(v) => {
+                    out.l46 = Some(v.to_ash())
                 }
                 VkDeviceCreateInfoNext::VkDeviceGroupDeviceCreateInfo(_) => {}
                 other => return Err(ChainLink::structure_type(other)),
@@ -5340,6 +5377,9 @@ impl DeviceLinks {
             info = info.push_next(l);
         }
         if let Some(l) = self.l45.as_mut() {
+            info = info.push_next(l);
+        }
+        if let Some(l) = self.l46.as_mut() {
             info = info.push_next(l);
         }
         info

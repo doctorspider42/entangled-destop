@@ -1021,6 +1021,8 @@ fn the_links_admitted_are_the_bring_up_ones_and_the_admitted_extensions_structur
         "VkPhysicalDeviceBorderColorSwizzleFeaturesEXT",
         "VkPhysicalDeviceRobustness2FeaturesKHR",
         "VkPhysicalDeviceProvokingVertexFeaturesEXT",
+        // The scanout tear: Zink's dynamic primitive topology.
+        "VkPhysicalDeviceExtendedDynamicStateFeaturesEXT",
     ];
     let mut device = features.to_vec();
     device.extend([

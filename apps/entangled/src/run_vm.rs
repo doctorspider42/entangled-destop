@@ -1094,6 +1094,21 @@ impl Drop for LifecycleSupervisor {
 pub struct ScreenshotRequest {
     pub after: Duration,
     pub path: PathBuf,
+    /// `--screenshot-every`: write every this often, each to its own
+    /// numbered file ([`burst_path`]), instead of refreshing `path` every
+    /// [`SCREENSHOT_REFRESH`].
+    pub burst: Option<Duration>,
+}
+
+/// The `n`th file of a screenshot burst: `<stem>-<n:04>.<ext>` beside `path`.
+fn burst_path(path: &std::path::Path, n: u32) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map_or_else(|| "screenshot".into(), |s| s.to_string_lossy().into_owned());
+    let ext = path
+        .extension()
+        .map_or_else(|| "png".into(), |s| s.to_string_lossy().into_owned());
+    path.with_file_name(format!("{stem}-{n:04}.{ext}"))
 }
 
 /// How often the debug screenshot is refreshed after its first write.
@@ -1212,17 +1227,25 @@ pub fn run_with(
             .name("screenshot-timer".into())
             .spawn(move || {
                 std::thread::sleep(request.after);
+                let mut n = 0u32;
                 loop {
-                    match handle.screenshot(&request.path) {
+                    let path = match request.burst {
+                        Some(_) => {
+                            n = n.saturating_add(1);
+                            burst_path(&request.path, n)
+                        }
+                        None => request.path.clone(),
+                    };
+                    match handle.screenshot(&path) {
                         Ok(()) => {
-                            tracing::info!(path = %request.path.display(), "debug screenshot written")
+                            tracing::info!(path = %path.display(), "debug screenshot written")
                         }
                         Err(e) => {
-                            tracing::warn!(path = %request.path.display(), error = %e,
+                            tracing::warn!(path = %path.display(), error = %e,
                                 "debug screenshot failed")
                         }
                     }
-                    std::thread::sleep(SCREENSHOT_REFRESH);
+                    std::thread::sleep(request.burst.unwrap_or(SCREENSHOT_REFRESH));
                 }
             })
             .map_err(|e| format!("cannot spawn the screenshot timer: {e}"))?;

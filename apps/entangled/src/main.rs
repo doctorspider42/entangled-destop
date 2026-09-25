@@ -130,6 +130,12 @@ enum Command {
         /// entangled-screenshot-<name>.png in the working directory.
         #[arg(long, requires = "screenshot_after")]
         screenshot: Option<PathBuf>,
+        /// Debug: a burst instead of one refreshed file — after
+        /// --screenshot-after, write a PNG every MS milliseconds, each to its
+        /// own numbered file (<stem>-0001.png, ...) beside --screenshot, so
+        /// a probe can count frames without racing the writer.
+        #[arg(long, value_name = "MS", requires = "screenshot_after")]
+        screenshot_every: Option<u64>,
         /// Mirror the virtio-gpu frame statistics into a JSON file, rewritten
         /// every 120 presented frames (GAME-2105, ADR-0004).
         ///
@@ -463,6 +469,7 @@ fn run(command: Command) -> Result<(), String> {
             cdrom,
             screenshot_after,
             screenshot,
+            screenshot_every,
             frame_stats,
             control_stdin,
             snapshot,
@@ -486,6 +493,7 @@ fn run(command: Command) -> Result<(), String> {
                     path: screenshot.unwrap_or_else(|| {
                         PathBuf::from(format!("entangled-screenshot-{}.png", cfg.name))
                     }),
+                    burst: screenshot_every.map(std::time::Duration::from_millis),
                 });
                 let snapshot = Some(
                     snapshot.unwrap_or_else(|| crate::snapshot::default_path(&config, &cfg.name)),
@@ -507,6 +515,7 @@ fn run(command: Command) -> Result<(), String> {
                     headless,
                     screenshot_after,
                     screenshot,
+                    screenshot_every,
                     control_stdin,
                     snapshot,
                 );
@@ -634,6 +643,7 @@ fn resume(args: ResumeArgs) -> Result<(), String> {
             path: screenshot.unwrap_or_else(|| {
                 PathBuf::from(format!("entangled-resume-{}.png", info.metadata.vm_name))
             }),
+            burst: None,
         });
         run_vm::run(
             cfg,

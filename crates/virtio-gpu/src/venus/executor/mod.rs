@@ -159,6 +159,7 @@ pub mod policy;
 pub mod scanout;
 pub mod submit;
 pub mod timeline;
+pub mod writes;
 
 #[cfg(test)]
 mod ext_tests;
@@ -170,6 +171,8 @@ mod generated_tests;
 pub(crate) mod harness;
 #[cfg(test)]
 mod memory_tests;
+#[cfg(test)]
+mod order_tests;
 #[cfg(test)]
 mod query_tests;
 #[cfg(test)]
@@ -879,6 +882,13 @@ pub struct ExecutorFactory<H: HostVulkan> {
     /// The renderer's own scanout device (stage S2b), once a handle blob
     /// has been scanned out.
     scanout: Option<scanout::ScanoutDevice<H>>,
+    /// Every context's and the scanout device's running touches of shared
+    /// payloads ([`writes`]).
+    payloads: Arc<writes::Payloads>,
+    /// The scanout device's touches: one serial per copy, completed when the
+    /// copy is.
+    scanout_progress: Arc<writes::Progress>,
+    scanout_serial: u64,
 }
 
 impl<H: HostVulkan> std::fmt::Debug for ExecutorFactory<H> {
@@ -914,6 +924,9 @@ impl<H: HostVulkan> ExecutorFactory<H> {
             context_share: share,
             fence_threads: timeline::FenceThreads::new(timeline::MAX_FENCE_THREADS),
             scanout: None,
+            payloads: writes::Payloads::new(),
+            scanout_progress: Arc::new(writes::Progress::default()),
+            scanout_serial: 0,
         }
     }
 
@@ -979,6 +992,12 @@ impl<H: HostVulkan> ExecutorFactory<H> {
         })
     }
 
+    /// The table of running touches of shared payloads, for a test.
+    #[cfg(test)]
+    pub(crate) fn payloads(&self) -> Arc<writes::Payloads> {
+        Arc::clone(&self.payloads)
+    }
+
     /// The host this executor drives.
     #[must_use]
     pub fn host(&self) -> &Arc<H> {
@@ -1008,13 +1027,16 @@ impl<H: HostVulkan> ExecutorFactory<H> {
         let budget = &self.budget;
         let share = self.context_share;
         let fence_threads = &self.fence_threads;
+        let payloads = &self.payloads;
         Arc::clone(self.contexts.entry(ctx_id).or_insert_with(|| {
-            Arc::new(Mutex::new(VulkanContext::with_limits(
+            let mut context = VulkanContext::with_limits(
                 ctx_id,
                 Arc::clone(host),
                 PageBudget::share(budget, share),
                 Arc::clone(fence_threads),
-            )))
+            );
+            context.payloads = Arc::clone(payloads);
+            Arc::new(Mutex::new(context))
         }))
     }
 }
@@ -1091,8 +1113,34 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         rect: crate::protocol::Rect,
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
-        let device = self.scanout_device(target)?;
-        match device.read(target, release, rect, out) {
+        // The blob's payload claimed for the copy: every guest submission
+        // touching it finished first, and none starts until the copy has
+        // (`writes`'s module docs).
+        let payload = crate::venus::renderer::SharedRef::of(&target.handle);
+        self.scanout_serial += 1;
+        let serial = self.scanout_serial;
+        let claimed = self.payloads.claim(
+            std::slice::from_ref(&payload),
+            writes::Owner::Scanout,
+            serial,
+            &self.scanout_progress,
+            Instant::now() + scanout::SCANOUT_WAIT,
+            false,
+        );
+        if claimed.timed_out {
+            return Err(format!(
+                "the guest's GPU work on the scanout buffer did not finish within {:?}",
+                scanout::SCANOUT_WAIT
+            ));
+        }
+        let copied = self
+            .scanout_device(target)
+            .map_err(scanout::ScanoutError::Refused)
+            .and_then(|device| device.copy(target, release, rect));
+        // Done on the GPU — or given up on, when the flush fails and nothing
+        // it read is shown.
+        self.scanout_progress.complete(serial);
+        match copied.and_then(|c| c.collect(out)) {
             Ok(()) => Ok(()),
             Err(scanout::ScanoutError::Lost(why)) => {
                 // Dropped now, made again by the next scanout.
