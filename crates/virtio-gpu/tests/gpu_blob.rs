@@ -1301,6 +1301,14 @@ mod renderer_blob_scanout {
         reads: Vec<(u32, Rect)>,
         /// Refuse the next `scanout_blob` calls.
         refuse: bool,
+        /// Grant a lease (zero-copy presentation) on every accepted blob.
+        lease: bool,
+        /// The size the leased image claims, when not the framebuffer's.
+        lease_size: Option<(u32, u32)>,
+        /// Leases asked for.
+        leases: usize,
+        /// Leases whose claim ended (dropped by the device).
+        ended: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     type Shared = Arc<Mutex<Log>>;
@@ -1449,6 +1457,49 @@ mod renderer_blob_scanout {
         }
         fn set_host_visible(&mut self, backing: Arc<dyn virtio_core::ShmBacking>) {
             self.inner.set_host_visible(backing);
+        }
+        fn begin_shared_scanout(
+            &mut self,
+            resource_id: u32,
+        ) -> Result<Option<virtio_gpu::SharedScanoutLease>, CommandError> {
+            let mut log = self.log.lock().unwrap();
+            log.leases += 1;
+            let Some(spec) = self.accepted.get(&resource_id).copied() else {
+                return Ok(None);
+            };
+            if !log.lease {
+                return Ok(None);
+            }
+            let (width, height) = log.lease_size.unwrap_or((spec.width, spec.height));
+            let image = Arc::new(virtio_gpu::SharedScanoutImage {
+                serial: resource_id.into(),
+                resource_id,
+                handle: virtio_gpu::ExternalHandle::placeholder(),
+                handle_type: virtio_gpu::shared::HANDLE_TYPE_OPAQUE_WIN32,
+                allocation_size: u64::from(spec.stride) * u64::from(spec.height),
+                memory_type_index: 1,
+                device_uuid: [1; 16],
+                driver_uuid: [2; 16],
+                info: virtio_gpu::SharedImageInfo {
+                    format: virtio_gpu::shared::VK_FORMAT_B8G8R8A8_UNORM,
+                    flags: 0,
+                    view_formats: Vec::new(),
+                    usage: 0x1,
+                    width,
+                    height,
+                },
+            });
+            let ended = Arc::clone(&log.ended);
+            Ok(Some(virtio_gpu::SharedScanoutLease::new(
+                image,
+                virtio_gpu::ImageRelease {
+                    layout: 6,
+                    family: virtio_gpu::shared::QUEUE_FAMILY_FOREIGN,
+                },
+                move || {
+                    ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+            )))
         }
         fn scanout_blob(
             &mut self,
@@ -1832,5 +1883,307 @@ mod renderer_blob_scanout {
         assert_eq!(asked(&log), 0, "a restore asked the renderer about a blob");
         assert!(reads(&log).is_empty(), "a restore read a renderer blob");
         assert_eq!(frame(&restored), blank, "a restore presented host pixels");
+    }
+
+    // ------------------------------- zero-copy presentation (ADR-0004)
+
+    use display::shared::{SharedPresenter, SharedStats, SharedTexture};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use virtio_gpu::SharedPresent;
+
+    /// A display GPU as the device sees it: every frame it is handed, what
+    /// it answers (scripted, `Presented` once the script runs out), what it
+    /// was told to forget, and — for a screenshot — a flat colour.
+    #[derive(Default)]
+    struct FakePresenter {
+        frames: Mutex<Vec<(u32, Rect, Rect)>>,
+        script: Mutex<std::collections::VecDeque<SharedPresent>>,
+        forgets: Mutex<Vec<Option<u32>>>,
+        shown: AtomicBool,
+        /// The renderer's lease-ended count at each present: the claim must
+        /// still be held while the display copies.
+        ended_during: Mutex<Vec<usize>>,
+        ended: Mutex<Option<Arc<AtomicUsize>>>,
+        /// The visible region of the last frame, for `read_back`.
+        last: Mutex<Option<Rect>>,
+        /// Keep the leases (a copy still on the GPU) instead of dropping them
+        /// on return.
+        hold: AtomicBool,
+        held: Mutex<Vec<virtio_gpu::SharedScanoutLease>>,
+    }
+
+    const SHOWN_BGRA: [u8; 4] = [0x33, 0x22, 0x11, 0xff];
+
+    impl SharedPresenter for FakePresenter {
+        fn present(
+            &self,
+            frame: &virtio_gpu::SharedScanoutFrame,
+            lease: virtio_gpu::SharedScanoutLease,
+        ) -> SharedPresent {
+            self.frames.lock().unwrap().push((
+                frame.image.resource_id,
+                frame.visible,
+                frame.damage,
+            ));
+            *self.last.lock().unwrap() = Some(frame.visible);
+            if let Some(ended) = self.ended.lock().unwrap().as_ref() {
+                self.ended_during
+                    .lock()
+                    .unwrap()
+                    .push(ended.load(Ordering::SeqCst));
+            }
+            let outcome = self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(SharedPresent::Presented);
+            if outcome == SharedPresent::Presented {
+                self.shown.store(true, Ordering::SeqCst);
+            }
+            // A real display drops the lease once its copy has run.
+            if self.hold.load(Ordering::SeqCst) {
+                self.held.lock().unwrap().push(lease);
+            } else {
+                drop(lease);
+            }
+            outcome
+        }
+        fn forget(&self, resource_id: Option<u32>) {
+            self.forgets.lock().unwrap().push(resource_id);
+        }
+        fn deactivate(&self) {
+            self.shown.store(false, Ordering::SeqCst);
+        }
+        fn current(&self) -> Option<SharedTexture> {
+            None
+        }
+        fn shown(&self) -> bool {
+            self.shown.load(Ordering::SeqCst)
+        }
+        fn read_back(&self) -> Result<(u32, u32, Vec<u8>), display::DisplayError> {
+            let visible = self.last.lock().unwrap().expect("a frame");
+            Ok((
+                visible.width,
+                visible.height,
+                SHOWN_BGRA.repeat((visible.width * visible.height) as usize),
+            ))
+        }
+        fn stats(&self) -> SharedStats {
+            SharedStats::default()
+        }
+    }
+
+    /// A harness whose renderer leases every accepted blob and whose display
+    /// has `presenter`.
+    fn sharing(width: u32, height: u32) -> (Harness, Shared, Arc<FakePresenter>) {
+        let (h, log) = harness(width, height);
+        log.lock().unwrap().lease = true;
+        let presenter = Arc::new(FakePresenter::default());
+        *presenter.ended.lock().unwrap() = Some(Arc::clone(&log.lock().unwrap().ended));
+        h.display
+            .attach_presenter(Some(Arc::clone(&presenter) as Arc<dyn SharedPresenter>));
+        (h, log, presenter)
+    }
+
+    fn frames(p: &FakePresenter) -> Vec<(u32, Rect, Rect)> {
+        std::mem::take(&mut p.frames.lock().unwrap())
+    }
+
+    fn ended(log: &Shared) -> usize {
+        log.lock().unwrap().ended.load(Ordering::SeqCst)
+    }
+
+    fn leases(log: &Shared) -> usize {
+        log.lock().unwrap().leases
+    }
+
+    /// A flush of a handle blob with a display that shares: the renderer
+    /// leases the image, the display is handed the frame — the visible
+    /// region and the damage in the framebuffer's coordinates — while the
+    /// lease's claim is held, and the claim ends right after, once per
+    /// flush. Nothing is read back and the mirror is not written; the
+    /// screenshot is the display GPU's frame.
+    #[test]
+    fn a_shared_flip_is_handed_to_the_display_and_never_read_back() {
+        let (mut h, log, presenter) = sharing(8, 6);
+        assert_ok(&h.run(&scanout_buffer(50, 1)));
+        assert_ok(&h.run(&flip(50, 8, 6, 32)));
+        for damage in [rect(0, 0, 8, 6), rect(2, 1, 3, 2)] {
+            assert_ok(&h.run(&resource_flush(50, damage)));
+            assert_eq!(frames(&presenter), vec![(50, rect(0, 0, 8, 6), damage)]);
+        }
+        assert!(reads(&log).is_empty(), "a shared frame was read back");
+        assert_eq!(leases(&log), 2);
+        assert_eq!(ended(&log), 2, "every claim ended");
+        assert_eq!(
+            *presenter.ended_during.lock().unwrap(),
+            vec![0, 1],
+            "each claim was still held while the display copied"
+        );
+        assert_eq!(h.display.stats().updates, 0, "the mirror was not written");
+        let shot = frame(&h);
+        assert_eq!(pixel(&shot, 5, 4), [0x11, 0x22, 0x33, 0xff]);
+
+        // A panned scanout: the frame names the visible region, and damage
+        // outside it reaches nobody.
+        assert_ok(&h.run(&set_scanout_blob(
+            0,
+            50,
+            rect(2, 1, 4, 4),
+            8,
+            6,
+            FORMAT_B8G8R8X8_UNORM,
+            32,
+            0,
+        )));
+        assert_ok(&h.run(&resource_flush(50, rect(0, 0, 8, 6))));
+        assert_eq!(
+            frames(&presenter),
+            vec![(50, rect(2, 1, 4, 4), rect(2, 1, 4, 4))]
+        );
+        assert_ok(&h.run(&resource_flush(50, rect(0, 0, 2, 6))));
+        assert!(frames(&presenter).is_empty());
+        assert!(reads(&log).is_empty());
+        assert!(!h.needs_reset());
+    }
+
+    /// The display's refusals: one for now serves that flush through the copy
+    /// path and the next flush asks again; one for good serves it through
+    /// the copy path and no lease is ever asked again (until a reset). A
+    /// failure fails the flush in band and reads nothing.
+    #[test]
+    fn a_declined_frame_takes_the_copy_path_and_a_failed_one_fails_in_band() {
+        let (mut h, log, presenter) = sharing(8, 6);
+        assert_ok(&h.run(&scanout_buffer(51, 1)));
+        assert_ok(&h.run(&flip(51, 8, 6, 32)));
+        let damage = rect(1, 1, 2, 2);
+
+        presenter
+            .script
+            .lock()
+            .unwrap()
+            .push_back(SharedPresent::not_now("not yet"));
+        assert_ok(&h.run(&resource_flush(51, damage)));
+        assert_eq!(reads(&log), vec![(51, damage)], "the copy path served it");
+        assert_ok(&h.run(&resource_flush(51, damage)));
+        assert!(reads(&log).is_empty(), "the next one was shared again");
+
+        presenter
+            .script
+            .lock()
+            .unwrap()
+            .push_back(SharedPresent::Failed("the GPU hung".into()));
+        assert_err(
+            &h.run(&resource_flush(51, damage)),
+            resp::ERR_INVALID_PARAMETER,
+        );
+        assert!(reads(&log).is_empty(), "a failed present is not read back");
+
+        presenter
+            .script
+            .lock()
+            .unwrap()
+            .push_back(SharedPresent::never("another GPU"));
+        let asked_before = leases(&log);
+        // After shared presents the mirror is stale: the first copy-path
+        // flush reads the whole visible region, not the damage.
+        assert_ok(&h.run(&resource_flush(51, damage)));
+        assert_eq!(reads(&log), vec![(51, rect(0, 0, 8, 6))]);
+        for _ in 0..3 {
+            assert_ok(&h.run(&resource_flush(51, damage)));
+        }
+        assert_eq!(reads(&log), vec![(51, damage); 3]);
+        assert_eq!(
+            leases(&log),
+            asked_before + 1,
+            "a permanent refusal stops the asking"
+        );
+        assert_eq!(ended(&log), leases(&log), "every lease's claim ended");
+
+        // A reset is a new driver: shared presentation is tried again.
+        h.driver_reset();
+        assert_ok(&h.run(&scanout_buffer(51, 1)));
+        assert_ok(&h.run(&flip(51, 8, 6, 32)));
+        assert_ok(&h.run(&resource_flush(51, damage)));
+        assert!(reads(&log).is_empty());
+        assert_eq!(frames(&presenter).last().map(|f| f.2), Some(damage));
+        assert!(!h.needs_reset());
+    }
+
+    /// No presenter, no lease: the device does not ask the renderer at all,
+    /// and every flush is read back. A lease whose image is not the
+    /// framebuffer is a renderer bug the copy path absorbs.
+    #[test]
+    fn without_a_presenter_no_lease_is_asked_and_a_wrong_image_is_read_back() {
+        let (mut h, log) = harness(8, 6);
+        log.lock().unwrap().lease = true;
+        assert_ok(&h.run(&scanout_buffer(52, 1)));
+        assert_ok(&h.run(&flip(52, 8, 6, 32)));
+        assert_ok(&h.run(&resource_flush(52, rect(0, 0, 8, 6))));
+        assert_eq!(leases(&log), 0);
+        assert_eq!(reads(&log).len(), 1);
+
+        let (mut h, log, presenter) = sharing(8, 6);
+        log.lock().unwrap().lease_size = Some((16, 6));
+        assert_ok(&h.run(&scanout_buffer(52, 1)));
+        assert_ok(&h.run(&flip(52, 8, 6, 32)));
+        assert_ok(&h.run(&resource_flush(52, rect(0, 0, 8, 6))));
+        assert!(
+            frames(&presenter).is_empty(),
+            "a wrong image reached the display"
+        );
+        assert_eq!(reads(&log).len(), 1);
+        assert_eq!(ended(&log), 1, "and its claim ended");
+    }
+
+    /// What the display imported goes with the resource: an unref of the
+    /// blob, a disabled scanout and a device reset each tell it to forget
+    /// (the frame it shows is its own copy and stays).
+    #[test]
+    fn the_display_forgets_its_imports_on_unref_disable_and_reset() {
+        let (mut h, _log, presenter) = sharing(8, 6);
+        assert_ok(&h.run(&scanout_buffer(53, 1)));
+        assert_ok(&h.run(&flip(53, 8, 6, 32)));
+        assert_ok(&h.run(&resource_flush(53, rect(0, 0, 8, 6))));
+        assert_ok(&h.run(&resource_unref(53)));
+        assert_eq!(*presenter.forgets.lock().unwrap(), vec![Some(53)]);
+
+        assert_ok(&h.run(&scanout_buffer(54, 1)));
+        assert_ok(&h.run(&flip(54, 8, 6, 32)));
+        assert_ok(&h.run(&set_scanout_blob(
+            0,
+            0,
+            rect(0, 0, 0, 0),
+            0,
+            0,
+            FORMAT_B8G8R8X8_UNORM,
+            0,
+            0,
+        )));
+        assert_eq!(presenter.forgets.lock().unwrap().last(), Some(&None));
+        h.driver_reset();
+        assert_eq!(presenter.forgets.lock().unwrap().last(), Some(&None));
+        assert!(presenter.shown(), "the display keeps showing its copy");
+    }
+
+    /// The device never waits for the display's GPU: it hands over the lease
+    /// with the frame, and the claim ends when the display drops it — after
+    /// the flush, once its copy has run — not when the flush is answered.
+    #[test]
+    fn the_display_ends_the_claim_when_its_copy_has_run_not_the_device() {
+        let (mut h, log, presenter) = sharing(8, 6);
+        presenter.hold.store(true, Ordering::SeqCst);
+        assert_ok(&h.run(&scanout_buffer(55, 1)));
+        assert_ok(&h.run(&flip(55, 8, 6, 32)));
+        for _ in 0..3 {
+            assert_ok(&h.run(&resource_flush(55, rect(0, 0, 8, 6))));
+        }
+        assert_eq!(leases(&log), 3);
+        assert_eq!(ended(&log), 0, "the device ended a claim the display holds");
+        let held = std::mem::take(&mut *presenter.held.lock().unwrap());
+        assert_eq!(held.len(), 3);
+        drop(held);
+        assert_eq!(ended(&log), 3, "dropping the leases ends the claims");
     }
 }

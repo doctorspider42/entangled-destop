@@ -394,6 +394,16 @@ pub struct GpuDevice<S: ScanoutSink> {
     /// later flip logs at debug: the guest sends `SET_SCANOUT_BLOB` on every
     /// one.
     renderer_blob_scanned_out: bool,
+    /// Whether the display's own copy of the scanout came from the last
+    /// shared present (ADR-0004, zero-copy presentation): its CPU mirror is
+    /// then stale, so a flush that falls back to the copy path reads the
+    /// whole visible region, not just the damage.
+    shared_active: bool,
+    /// The display declined shared presentation for good: stop asking until
+    /// the next reset.
+    shared_declined: bool,
+    /// Whether the first shared present since the last reset was logged.
+    shared_logged: bool,
     /// Frame-interval statistics of the scanout path (phase 2 measurement).
     pacing: FramePacing,
     /// Where `--frame-stats` mirrors those statistics as JSON, if anywhere.
@@ -454,6 +464,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
             restored_3d_lost: false,
             restored_3d_reported: false,
             renderer_blob_scanned_out: false,
+            shared_active: false,
+            shared_declined: false,
+            shared_logged: false,
             pacing: FramePacing::new(),
             frame_stats: None,
             refresh_hz: crate::edid::DEFAULT_REFRESH_HZ,
@@ -1169,6 +1182,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
             tracing::warn!("the scanout was a renderer resource; the window keeps its last frame");
             self.scanout = None;
         }
+        // Every image the display imported was the renderer's.
+        self.display.forget_shared(None);
+        self.shared_active = false;
         tracing::error!(
             released = held.len(),
             fence_stats = ?self.fence_stats,
@@ -1404,6 +1420,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 }
                 gpu.destroy_blob(cmd.resource_id);
             }
+            // Whatever the display imported of it goes too (ADR-0004,
+            // zero-copy presentation); what it shows is its own copy.
+            self.display.forget_shared(Some(cmd.resource_id));
         } else {
             match self.three_d.as_mut() {
                 Some(gpu) if gpu.owns(cmd.resource_id) => gpu.resource_unref(cmd.resource_id)?,
@@ -1545,6 +1564,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if cmd.resource_id == 0 {
             if self.scanout.take().is_some() {
                 tracing::info!(scanout = cmd.scanout_id, "virtio-gpu scanout disabled");
+                self.display.forget_shared(None);
             }
             return Ok(Reply::ok());
         }
@@ -1775,20 +1795,32 @@ impl<S: ScanoutSink> GpuDevice<S> {
             outcome?;
         } else if let ScanoutSource::RendererBlob { spec } = scanout.source {
             // S2a: a GPU compositor's frame. The pixels live in the renderer
-            // (a guest `VkDeviceMemory`); read the clipped rect back in the
-            // layout it accepted, into the buffer reused frame to frame, and
-            // push it down the same sink every other path uses.
-            let mut scratch = std::mem::take(&mut self.flush_buf);
-            let read = self
-                .three_d_mut(cmd::RESOURCE_FLUSH)
-                .and_then(|gpu| gpu.read_scanout_blob(cmd.resource_id, &spec, clip, &mut scratch));
-            let outcome = read.and_then(|()| {
-                self.display
-                    .update_scanout(dst_x, dst_y, clip.width, clip.height, &scratch)
-                    .map_err(|error| CommandError::Display(error.to_string()))
-            });
-            self.flush_buf = scratch;
-            outcome?;
+            // (a guest `VkDeviceMemory`). First the shared path: hand the
+            // display the image itself, which it copies on the GPU
+            // (ADR-0004, zero-copy presentation).
+            if !self.present_shared(cmd.resource_id, &spec, scanout.rect, clip)? {
+                // The copy path: read the clipped rect back in the layout the
+                // renderer accepted, into the buffer reused frame to frame,
+                // and push it down the same sink every other path uses. After
+                // a shared present the display's mirror holds an older frame,
+                // so this one read is of the whole visible region.
+                let (src, x, y) = if std::mem::take(&mut self.shared_active) {
+                    (scanout.rect, 0, 0)
+                } else {
+                    (clip, dst_x, dst_y)
+                };
+                let mut scratch = std::mem::take(&mut self.flush_buf);
+                let read = self.three_d_mut(cmd::RESOURCE_FLUSH).and_then(|gpu| {
+                    gpu.read_scanout_blob(cmd.resource_id, &spec, src, &mut scratch)
+                });
+                let outcome = read.and_then(|()| {
+                    self.display
+                        .update_scanout(x, y, src.width, src.height, &scratch)
+                        .map_err(|error| CommandError::Display(error.to_string()))
+                });
+                self.flush_buf = scratch;
+                outcome?;
+            }
         } else if three_d {
             // GPU-010: the rendered pixels live in the host renderer; read
             // the dirty rect back as BGRA and push it down the same sink.
@@ -1852,6 +1884,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 pixels = report.pixels_mean,
                 service_mean_ms = report.service_mean_us as f64 / 1000.0,
                 service_max_ms = report.service_max_us as f64 / 1000.0,
+                // Of the window's flushes, how many the display took on its
+                // GPU (ADR-0004, zero-copy presentation).
+                shared = report.shared,
                 fence_deferred = fences.deferred,
                 fence_mean_wait_us = fences.mean_wait_us(),
                 fence_max_wait_us = fences.wait_us_max,
@@ -2246,6 +2281,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if cmd.resource_id == 0 {
             if self.scanout.take().is_some() {
                 tracing::info!(scanout = cmd.scanout_id, "virtio-gpu scanout disabled");
+                self.display.forget_shared(None);
             }
             return Ok(Reply::ok());
         }
@@ -2400,6 +2436,89 @@ impl<S: ScanoutSink> GpuDevice<S> {
             cmd.rect,
             ScanoutSource::RendererBlob { spec },
         )
+    }
+
+    /// The shared path of a renderer-blob flush (ADR-0004, zero-copy
+    /// presentation): a lease on the image from the renderer, and the frame
+    /// with the lease to the display, which drops the lease — ending the
+    /// renderer's claim — once its GPU copy has finished. `Ok(true)` when the
+    /// display took it, `Ok(false)` when the copy path must serve this
+    /// flush.
+    ///
+    /// `visible` is the bound region of the framebuffer and `damage` the
+    /// flushed rect clipped to it, both already validated against `spec`.
+    fn present_shared(
+        &mut self,
+        resource_id: u32,
+        spec: &ScanoutBlobSpec,
+        visible: Rect,
+        damage: Rect,
+    ) -> Result<bool, CommandError> {
+        if self.shared_declined || !self.display.accepts_shared_scanout() {
+            return Ok(false);
+        }
+        let Some(gpu) = self.three_d.as_mut() else {
+            return Ok(false);
+        };
+        let Some(lease) = gpu.begin_shared_scanout(resource_id)? else {
+            return Ok(false);
+        };
+        // The renderer's image is the framebuffer the guest declared, or the
+        // frame's coordinates mean nothing to it: a renderer bug, and the
+        // copy path (which checks its own answer) serves the flush instead.
+        if (lease.image.info.width, lease.image.info.height) != (spec.width, spec.height) {
+            tracing::warn!(
+                resource = resource_id,
+                image = format_args!("{}x{}", lease.image.info.width, lease.image.info.height),
+                framebuffer = format_args!("{}x{}", spec.width, spec.height),
+                "the renderer's shared image is not the framebuffer; using the copy path"
+            );
+            return Ok(false);
+        }
+        let frame = crate::shared::SharedScanoutFrame {
+            image: std::sync::Arc::clone(&lease.image),
+            release: lease.release,
+            visible,
+            damage,
+        };
+        // The display holds the lease until its copy has run on the GPU; this
+        // worker goes on at once.
+        let outcome = self.display.present_shared(&frame, lease);
+        match outcome {
+            crate::shared::SharedPresent::Presented => {
+                self.shared_active = true;
+                self.pacing.note_shared();
+                if !self.shared_logged {
+                    self.shared_logged = true;
+                    tracing::info!(
+                        resource = resource_id,
+                        width = visible.width,
+                        height = visible.height,
+                        "virtio-gpu presents the renderer's scanout through the display's GPU: \
+                         no readback, no CPU copy"
+                    );
+                }
+                Ok(true)
+            }
+            crate::shared::SharedPresent::Declined { reason, retry } => {
+                if retry {
+                    tracing::debug!(
+                        resource = resource_id,
+                        %reason,
+                        "the display declined a shared present; this flush takes the copy path"
+                    );
+                } else {
+                    self.shared_declined = true;
+                    tracing::info!(
+                        %reason,
+                        "the display cannot present the renderer's scanout itself; every \
+                         flush takes the copy path"
+                    );
+                }
+                Ok(false)
+            }
+            crate::shared::SharedPresent::Failed(reason) => Err(CommandError::Display(reason)),
+        }
     }
 
     /// Gathers `rect` out of a blob's guest pages as packed BGRA rows.
@@ -2962,6 +3081,12 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         self.restored_3d_lost = false;
         self.restored_3d_reported = false;
         self.renderer_blob_scanned_out = false;
+        // The display lets go of every image of the old boot; it keeps
+        // showing its own copy of the last frame.
+        self.display.forget_shared(None);
+        self.shared_active = false;
+        self.shared_declined = false;
+        self.shared_logged = false;
     }
 }
 

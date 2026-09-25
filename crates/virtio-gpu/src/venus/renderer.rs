@@ -509,6 +509,39 @@ pub trait SinkFactory: Send {
         let _ = resource_id;
     }
 
+    /// Zero-copy presentation (ADR-0004): the handle blob `target` names as
+    /// an image a presenter on the same GPU can import — an owned
+    /// **duplicate** of its memory's handle, the export's size, memory type
+    /// and UUIDs, and the canonical image's exact create info. Asked once
+    /// per accepted layout; the renderer keeps the answer.
+    ///
+    /// # Errors
+    /// Why not (a host that cannot duplicate the handle). The default: this
+    /// factory executes no Vulkan.
+    fn share_scanout(
+        &mut self,
+        target: &ScanoutTarget,
+    ) -> Result<crate::shared::SharedScanoutImage, String> {
+        let _ = target;
+        Err("this renderer executes no Vulkan, so no handle blob can be shared".into())
+    }
+
+    /// Zero-copy presentation (ADR-0004): claim `target`'s payload for a
+    /// presenter's copy, as [`Self::read_scanout`] claims it for its own —
+    /// every guest submission touching it has finished, and none that
+    /// touches it starts until the returned function is called.
+    ///
+    /// # Errors
+    /// Why not: the guest's GPU work on it did not finish in time. The
+    /// default: this factory executes no Vulkan.
+    fn claim_scanout(
+        &mut self,
+        target: &ScanoutTarget,
+    ) -> Result<Box<dyn FnOnce() + Send>, String> {
+        let _ = target;
+        Err("this renderer executes no Vulkan, so no handle blob can be shared".into())
+    }
+
     /// Resources with a prepared scanout right now — a diagnostic.
     fn scanout_targets(&self) -> usize {
         0
@@ -1247,6 +1280,18 @@ impl BlobDirectory {
             memory.images.retain(ScanoutImage::is_alive);
             let images = memory.images.iter().rev().cloned().collect();
             Some((handle, images, memory.release))
+        })
+    }
+
+    /// The last release recorded on handle blob `resource_id`, if any —
+    /// [`Self::scanout_state`] without copying the images out.
+    fn scanout_release(&self, resource_id: u32) -> Option<ScanoutRelease> {
+        self.with(|state| {
+            let entry = state.blobs.get(&resource_id)?;
+            if !matches!(entry.backing, ExportedMemory::Handle(_)) {
+                return None;
+            }
+            entry.memory.as_ref()?.release
         })
     }
 
@@ -2213,6 +2258,10 @@ struct AcceptedScanout {
     spec: ScanoutBlobSpec,
     /// The canonical image the spec matched; `None` for a page blob.
     image: Option<CanonicalImage>,
+    /// Zero-copy presentation: the image as a presenter imports it, made at
+    /// the first shared present of this layout — `Some(None)` once the
+    /// factory could not share it, so it is not asked again.
+    shared: Option<Option<Arc<crate::shared::SharedScanoutImage>>>,
 }
 
 impl RingBlob {
@@ -2954,9 +3003,81 @@ impl<F: SinkFactory> VenusRenderer<F> {
             }
         };
         if let Some(blob) = self.blobs.get_mut(&resource_id) {
-            blob.scanout = Some(AcceptedScanout { spec: *spec, image });
+            blob.scanout = Some(AcceptedScanout {
+                spec: *spec,
+                image,
+                shared: None,
+            });
         }
         Ok(())
+    }
+
+    /// [`Renderer3d::begin_shared_scanout`] of a blob accepted for scanout:
+    /// a handle blob's image, shared once per accepted layout, and a claim
+    /// on its payload for the presenter's copy. `None` for anything the copy
+    /// path must serve — a page blob, a frame never released, an image the
+    /// factory cannot share.
+    fn begin_shared(
+        &mut self,
+        resource_id: u32,
+    ) -> Result<Option<crate::shared::SharedScanoutLease>, VenusError> {
+        let Some(release) = self.directory.scanout_release(resource_id) else {
+            // Not a handle blob, or no frame released yet: the readback
+            // answers the flush (and says which).
+            return Ok(None);
+        };
+        let Some(blob) = self.blobs.get_mut(&resource_id) else {
+            return Ok(None);
+        };
+        let (ExportedMemory::Handle(handle), Some(accepted)) = (&blob.backing, &mut blob.scanout)
+        else {
+            return Ok(None);
+        };
+        let Some(image) = accepted.image.clone() else {
+            return Ok(None);
+        };
+        let target = ScanoutTarget {
+            resource_id,
+            handle: handle.clone(),
+            image,
+            spec: accepted.spec,
+        };
+        let shared = match &accepted.shared {
+            Some(Some(shared)) => Arc::clone(shared),
+            Some(None) => return Ok(None),
+            None => match self.sinks.share_scanout(&target) {
+                Ok(shared) => {
+                    let shared = Arc::new(shared);
+                    accepted.shared = Some(Some(Arc::clone(&shared)));
+                    shared
+                }
+                Err(reason) => {
+                    tracing::info!(
+                        resource = resource_id,
+                        %reason,
+                        "venus: this scanout buffer cannot be shared with the display; its \
+                         flips are read back"
+                    );
+                    accepted.shared = Some(None);
+                    return Ok(None);
+                }
+            },
+        };
+        let done = self
+            .sinks
+            .claim_scanout(&target)
+            .map_err(|reason| VenusError::ScanoutRead {
+                resource_id,
+                reason,
+            })?;
+        Ok(Some(crate::shared::SharedScanoutLease::new(
+            shared,
+            crate::shared::ImageRelease {
+                layout: release.layout,
+                family: release.family,
+            },
+            done,
+        )))
     }
 
     /// `read_rect_bgra` of a blob accepted for scanout (stage S2b).
@@ -3664,6 +3785,21 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
     ) -> Result<(), CommandError> {
         self.accept_scanout(resource_id, spec).map_err(|error| {
             tracing::warn!(resource = resource_id, ?spec, %error, "venus scanout refused");
+            error.into()
+        })
+    }
+
+    /// Zero-copy presentation (ADR-0004): a handle blob accepted for
+    /// scanout, leased to the display with the same claim on its payload the
+    /// readback takes (`executor::writes`). A page blob, or an image the
+    /// factory cannot share, is `None` — the readback serves it.
+    fn begin_shared_scanout(
+        &mut self,
+        resource_id: u32,
+    ) -> Result<Option<crate::shared::SharedScanoutLease>, CommandError> {
+        self.tick_usage();
+        self.begin_shared(resource_id).map_err(|error| {
+            tracing::debug!(resource = resource_id, %error, "venus shared scanout failed");
             error.into()
         })
     }

@@ -65,7 +65,9 @@
 //!   handle of its device.
 //! * **Claims.** Every executor shares one [`Payloads`] table: per payload,
 //!   each owner's newest touch as `(serial, progress)` — an owner is a queue
-//!   of a context, or the scanout device. Before a touching submit is passed
+//!   of a context, the scanout device, or a presenter (the display copying
+//!   the image on its own GPU, ADR-0004's zero-copy presentation, whose touch
+//!   lasts until it drops its lease, after the flush). Before a touching submit is passed
 //!   to the driver, its context **claims** the payloads it touches: under the
 //!   table's lock, if another owner's touch is still running the claim waits
 //!   for it (bounded by [`SHARED_WAIT`]) and tries again; once none is, it
@@ -75,7 +77,10 @@
 //!   [`super::scanout::SCANOUT_WAIT`], after which the flush fails in band
 //!   and the window keeps its frame) and completes its touch once the copy's
 //!   fence has signalled — so no guest submission touching the buffer starts
-//!   under the copy either.
+//!   under the copy either. A presenter's lease claims the same way and
+//!   completes its touch when the display drops it, once its copy has run.
+//!   It has its own serials and progress: its touch outlives the flush, and
+//!   the scanout device's synchronous reads must not complete it early.
 //!
 //! A mark covers exactly the work before it on its queue; the wait is for
 //! the other owner's touches, not a device or a queue going idle. Two claims
@@ -144,13 +149,18 @@ pub enum Owner {
     },
     /// The renderer's scanout device ([`super::scanout`]).
     Scanout,
+    /// A presenter's copy (ADR-0004, zero-copy presentation): the display
+    /// copying the image on its own GPU, under a lease that may outlive the
+    /// flush — so an owner of its own, with a progress of its own, which the
+    /// scanout device's synchronous reads can never complete early.
+    Presenter,
 }
 
 impl Owner {
     fn context(self) -> Option<u32> {
         match self {
             Self::Queue { ctx_id, .. } => Some(ctx_id),
-            Self::Scanout => None,
+            Self::Scanout | Self::Presenter => None,
         }
     }
 }

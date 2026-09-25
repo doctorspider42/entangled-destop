@@ -23,7 +23,9 @@ re-check after touching features).
   winit — put new window behaviour here, not in the event loop.
 - `display::DisplayConfig` mirrors the `[display]` section of the VM config.
 - `DisplayHandle` implements `virtio_gpu::ScanoutSink`, which is the whole of
-  what the GPU device sees (`resolution`, `set_resolution`, `update_scanout`);
+  what the GPU device sees (`resolution`, `set_resolution`, `update_scanout`,
+  the cursor plane, and — for zero-copy presentation — `accepts_shared_scanout`,
+  `present_shared`, `forget_shared`; see the section below);
   `DisplayHandle::detached(w, h)` is the windowless version used by tests.
 - Guest side constants live in `virtio-gpu` (`FORMAT_B8G8R8A8_UNORM` /
   `FORMAT_B8G8R8X8_UNORM`, both 4-byte BGRA) and
@@ -45,6 +47,76 @@ re-check after touching features).
   `SurfaceError::Lost/Outdated`; on resize recompute `letterbox` — guest
   resolution does not change in MVP (resize-triggered guest mode change is
   MVP-813, P1).
+
+## Zero-copy presentation of a renderer's scanout (ADR-0004, 2026-09-25)
+
+When the guest composites on the GPU (GNOME on Zink over Venus), its scanout
+buffers are **handle blobs**: exportable device-local memory on the host GPU.
+On Windows the display takes them on its own GPU instead of the CPU mirror:
+`present_shared(frame, lease)` imports the renderer's duplicated NT handle once
+per image (`SharedScanoutImage::serial`), and each flip copies the damage **on
+the GPU** into a texture of the display's own (`gpu_scanout::GpuScanout`).
+The window samples that texture, and nothing goes through the CPU. The code is
+`crates/display/src/{shared,gpu_scanout,present}.rs`; the portable types are
+`virtio_gpu::shared`.
+
+- **It needs the Vulkan backend.** A DX12 device cannot import a Vulkan
+  `OPAQUE_WIN32` allocation. `DisplayHost::with_shared_scanout(true)` (set by
+  `entangled run` for the Venus executor on Windows) tries
+  `Backends::VULKAN` first, opened through wgpu-hal's `open_with_callback`
+  with `Features::VULKAN_EXTERNAL_MEMORY_WIN32` **plus**
+  `VK_EXT_queue_family_foreign`: the guest releases every scanout buffer to
+  `FOREIGN`, wgpu does not enable that extension, and acquiring from `FOREIGN`
+  without it is invalid. Failure falls back to the old backend order, and so
+  to the copy path. 2D-only VMs keep the default order. A headless VM gets an
+  off-screen presenter (`DisplayHandle::attach_offscreen_gpu`) that does
+  exactly what the window's does, so `--headless` runs measure the real path.
+  `ENTANGLED_SCANOUT_PATH=copy` turns it all off: that is the A/B switch.
+- **Never make a guest image a wgpu texture.** `create_texture_from_hal`
+  starts the texture in wgpu's `UNINITIALIZED` state. wgpu's first use then
+  records a barrier from `VK_IMAGE_LAYOUT_UNDEFINED`, which lets the driver
+  discard the guest's pixels, on an image the guest's queue family still
+  owns. That is why the display **copies** into a texture it owns rather than
+  sampling the import. The raw acquire/copy/release goes into a wgpu encoder
+  through `CommandEncoder::as_hal_mut`, so wgpu's submission order holds.
+- **The texture's layout invariant.** The display's shared texture is cleared
+  and moved to `RESOURCE` once, when it is made. wgpu only ever uses it as
+  `RESOURCE` (sampling, and the screenshot's draw), and every raw copy leaves
+  it in `SHADER_READ_ONLY_OPTIMAL`. So wgpu's tracker and the real layout
+  never disagree. A new wgpu operation on that texture must keep this, or end
+  with `transition_resources(... RESOURCE)`.
+- **Never block in `device.poll(Wait)` on a hot path.** wgpu-core holds its
+  fence lock across the wait, and `Queue::submit` takes it, so a blocking wait
+  stalls every submit, the window's frame included. The presenter's retirer
+  polls (`PollType::Poll`) every 250 µs while a copy is outstanding. The only
+  blocking wait is before destroying an import, which is rare.
+- **The device's worker never waits for the GPU.** `present_shared` returns
+  once the copy is submitted. The `lease` (the renderer's claim on the
+  payload, `executor::writes`, `Owner::Presenter`) goes to the retirer, which
+  drops it once the copy has run. The synchronous first version cost 1.2–2.9 ms
+  per flip under load: the copy queued behind the desktop's own GPU work at
+  idle clocks.
+- **The cursor plane over a shared frame is drawn by the GPU**
+  (`present::CursorOverlay`, `cursor.wgsl`, premultiplied source-over). No CPU
+  mirror holds the pixels under it. Over the mirror it is still composited on
+  the CPU.
+- **Which source is shown**: the last update decides. A mirror update or a mode
+  change deactivates the shared texture. A shared present makes it current,
+  and its first copy after the mirror is of the whole visible region.
+- **Screenshots of a shared frame** draw the texture into an off-screen target
+  through the window's own `ImagePipeline` (nearest, 1:1), read it back, and
+  composite the mirror's cursor plane on the CPU. `DisplayHandle::screenshot_bgra`
+  gives the pixels without PNG.
+- **Diagnostics**: the window's `display statistics` line carries
+  `shared_fps` (and `uploads_per_s` drops to 0). `display: shared scanout
+  statistics` every 600 presents gives submit time, submit-to-retired GPU time
+  (`gpu_mean_ms`), full copies, imports, refusals and abandoned copies. The
+  device's pacing report carries `shared` per window.
+- **virtio-gpu's own lib tests driving a `DisplayHandle`** hit the dev-dependency
+  cycle: inside that test build, `crate::shared::*` is a *second* copy of the
+  types `display` links. `display` re-exports its `virtio_gpu` (`#[doc(hidden)]`)
+  so the real-GPU test can build the display's frame and lease
+  (`pipeline_tests::for_the_display`).
 
 ## Input capture (host half of EPIC 9)
 
@@ -158,6 +230,10 @@ Rules to keep when extending this:
 - Wayland vs X11 differences (scale factors) — trust winit, don't
   special-case; HiDPI: window inner size is physical pixels. Decorations and
   the cursor are the exceptions — see the next section.
+- **Grabbing the Windows screen from PowerShell to check what the window shows**
+  needs `SetProcessDPIAware()` first. This machine's monitor is 3840×2160 at
+  scale 3, and a DPI-unaware `CopyFromScreen` returns the top-left 1280×720
+  physical pixels without saying so.
 
 ## Wayland/WSLg: decorations, cursor, resize (learned fixing the EPIC 15 demo bugs)
 

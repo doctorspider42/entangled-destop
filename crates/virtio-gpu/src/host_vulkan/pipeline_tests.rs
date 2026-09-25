@@ -2781,9 +2781,13 @@ fn timed_reads(
 }
 
 fn report(what: &str, times: &[std::time::Duration]) {
+    report_as("S2b", what, times);
+}
+
+fn report_as(stage: &str, what: &str, times: &[std::time::Duration]) {
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
-        "S2b {what}: {} reads, min {:.3} ms, median {:.3} ms, max {:.3} ms",
+        "{stage} {what}: {} reads, min {:.3} ms, median {:.3} ms, max {:.3} ms",
         times.len(),
         ms(times[0]),
         ms(times[times.len() / 2]),
@@ -3050,6 +3054,405 @@ fn a_handle_blob_flip_reads_back_the_frame_through_the_renderers_scanout_device(
     h.renderer.destroy_blob(RES);
     h.renderer.destroy_blob(BIG_RES);
     assert_eq!(h.renderer.factory().scanout_targets(), 0);
+    h.send(&Command::DestroyInstance(DestroyInstanceArgs {
+        instance: VkInstance(INSTANCE),
+    }))
+    .unwrap();
+    assert_eq!(h.renderer.factory().host_objects(), 0);
+    h.renderer.reset();
+    assert!(!h.fatal());
+}
+
+/// `lease`'s frame, and the lease itself, as `display` takes them.
+///
+/// This test build is a second copy of `virtio-gpu` beside the one `display`
+/// links (a dev-dependency cycle), so the lease's types are not the display's.
+/// Everything is plain data except the handle, which is duplicated once more —
+/// exactly what the renderer did to make the lease's own — and the claim,
+/// which the display's lease carries by owning this one: dropping it ends the
+/// renderer's claim, as dropping the real one would.
+#[cfg(windows)]
+fn for_the_display(
+    lease: crate::shared::SharedScanoutLease,
+    visible: crate::protocol::Rect,
+    damage: crate::protocol::Rect,
+) -> (
+    display::virtio_gpu::SharedScanoutFrame,
+    display::virtio_gpu::SharedScanoutLease,
+) {
+    use display::virtio_gpu as lib;
+    use std::os::windows::io::BorrowedHandle;
+    let image = &lease.image;
+    let raw = image.handle.raw().expect("a real handle");
+    // SAFETY: `raw` is the lease's own open duplicate, borrowed only for the
+    // duplication below while `lease` (and so the handle) is alive.
+    let owned = unsafe { BorrowedHandle::borrow_raw(raw) }
+        .try_clone_to_owned()
+        .expect("DuplicateHandle");
+    let rect = |r: crate::protocol::Rect| lib::Rect {
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: r.height,
+    };
+    let frame = lib::SharedScanoutFrame {
+        image: Arc::new(lib::SharedScanoutImage {
+            serial: image.serial,
+            resource_id: image.resource_id,
+            handle: lib::ExternalHandle::from_owned(owned),
+            handle_type: image.handle_type,
+            allocation_size: image.allocation_size,
+            memory_type_index: image.memory_type_index,
+            device_uuid: image.device_uuid,
+            driver_uuid: image.driver_uuid,
+            info: lib::SharedImageInfo {
+                format: image.info.format,
+                flags: image.info.flags,
+                view_formats: image.info.view_formats.clone(),
+                usage: image.info.usage,
+                width: image.info.width,
+                height: image.info.height,
+            },
+        }),
+        release: lib::ImageRelease {
+            layout: lease.release.layout,
+            family: lease.release.family,
+        },
+        visible: rect(visible),
+        damage: rect(damage),
+    };
+    let lib_lease =
+        lib::SharedScanoutLease::new(Arc::clone(&frame.image), frame.release, move || drop(lease));
+    (frame, lib_lease)
+}
+
+/// The times of `n` shared presents of `rect` of `resource` to `display`,
+/// each under a lease taken exactly as the device takes it, sorted.
+#[cfg(windows)]
+fn timed_presents(
+    h: &mut Harness<AshVulkan>,
+    display: &display::DisplayHandle,
+    resource: u32,
+    (visible, damage): (crate::protocol::Rect, crate::protocol::Rect),
+    n: usize,
+) -> Vec<std::time::Duration> {
+    use display::virtio_gpu::ScanoutSink as _;
+    let mut times = Vec::with_capacity(n);
+    for _ in 0..n {
+        let start = std::time::Instant::now();
+        let lease = h
+            .renderer
+            .begin_shared_scanout(resource)
+            .expect("the claim")
+            .expect("a lease on a handle blob");
+        let (frame, lease) = for_the_display(lease, visible, damage);
+        assert_eq!(
+            display.present_shared(&frame, lease),
+            display::virtio_gpu::SharedPresent::Presented
+        );
+        times.push(start.elapsed());
+    }
+    times.sort();
+    times
+}
+
+/// Zero-copy presentation on the host GPU (ADR-0004, "zero-copy presentation
+/// of the GPU-composited desktop"), as GNOME's flips go: context 1 (the
+/// compositor, on Zink) exports a 256×256 LINEAR BGRA8 scanout buffer —
+/// the canonical optimal image in exportable device-local memory — renders
+/// vk-smoke's check-6 triangle into it and releases it to
+/// `VK_QUEUE_FAMILY_FOREIGN_EXT` as Zink does. The renderer accepts the flip
+/// and **leases** the image; a display with a GPU of its own (the off-screen
+/// presenter a headless VM gets, `DisplayHandle::attach_offscreen_gpu`)
+/// imports the duplicated handle onto its own wgpu Vulkan device, acquires
+/// the image from `FOREIGN`, copies it on the GPU into its texture and hands
+/// it back; the screenshot then samples that texture into an off-screen
+/// target through the window's own image pipeline and reads it back: every
+/// pixel against the CPU reference in BGRA order, and vk-smoke's checksum.
+///
+/// Then: the guest acquires the buffer back from `FOREIGN` (so the display's
+/// release was consistent), draws check 7's clear and releases it; a second
+/// present shows it. A third frame (check 6 again) presented with a small
+/// damage rect changes exactly that rect — the texture is current, so only
+/// the damage is copied. Last, at 1080p, the per-flush host time of the
+/// shared present against the copy path's readback, back to back. Skips on
+/// a host that cannot export device-local memory, or whose display cannot
+/// share. Windows only: the only host whose renderer makes handle blobs.
+#[cfg(windows)]
+#[test]
+fn a_handle_blob_flip_is_presented_by_the_displays_own_gpu_exactly() {
+    use crate::protocol::Rect;
+    use crate::renderer::ScanoutBlobSpec;
+    use display::virtio_gpu::ScanoutSink as _;
+    use display::virtio_gpu::SharedPresent;
+    const SIZE: u32 = raster::SIZE;
+    const IMG: u64 = 0x400;
+    const IMG_MEM: u64 = 0x401;
+    const VIEW: u64 = 0x402;
+    const RES: u32 = 95;
+    const BIG: u64 = 0x600;
+    const BIG_MEM: u64 = 0x601;
+    const BIG_RES: u32 = 96;
+    const S1: &[&str] = &[
+        "VK_EXT_queue_family_foreign",
+        "VK_EXT_image_drm_format_modifier",
+    ];
+    let Some(host) = host() else { return };
+    let mut h = Harness::new(host);
+    boot(&mut h);
+    let shown = device_extension_names(&mut h);
+    if !S1.iter().all(|n| shown.iter().any(|s| s == n)) {
+        eprintln!("skipping: this host cannot export device-local memory (stage S1)");
+        return;
+    }
+    let display = display::DisplayHandle::detached(SIZE, SIZE).expect("a detached display");
+    if let Err(why) = display.attach_offscreen_gpu() {
+        eprintln!("skipping: the display cannot share ({why})");
+        return;
+    }
+    assert!(display.accepts_shared_scanout());
+    zink_device(&mut h, S1);
+
+    let pitch = scanout_export(
+        &mut h,
+        (IMG, IMG_MEM, RES),
+        (SIZE, SIZE),
+        0x10 | 0x1 | 0x2, // COLOR_ATTACHMENT | TRANSFER_SRC | TRANSFER_DST
+    );
+    h.send(&create_image_view(DEVICE, VIEW, IMG, BGRA8))
+        .unwrap();
+    let vertices = buffer(&mut h, 0x410, 60, USAGE_VERTEX, true);
+    vertices.write_words(&raster::vertex_data().map(f32::to_bits));
+    h.send(&create_render_pass(DEVICE, RENDER_PASS, BGRA8))
+        .unwrap();
+    h.send(&create_framebuffer(
+        DEVICE,
+        FRAMEBUFFER,
+        RENDER_PASS,
+        VIEW,
+        SIZE,
+    ))
+    .unwrap();
+    h.send(&create_shader_module(DEVICE, SHADER, &spirv(TRIANGLE_WGSL)))
+        .unwrap();
+    h.send(&create_pipeline_layout(DEVICE, PIPELINE_LAYOUT, &[]))
+        .unwrap();
+    h.send(&create_triangle_pipeline(
+        DEVICE,
+        PIPELINE,
+        SHADER,
+        PIPELINE_LAYOUT,
+        RENDER_PASS,
+        SIZE,
+    ))
+    .unwrap();
+    // A frame as Zink draws one: the pass leaves the image
+    // TRANSFER_SRC_OPTIMAL and the batch releases it in that layout.
+    let frame = |clear: [f32; 4], acquire: bool| {
+        let mut commands = vec![begin(CB)];
+        if acquire {
+            commands.push(image_barrier2_families(
+                CB,
+                IMG,
+                (LAYOUT_TRANSFER_SRC, LAYOUT_TRANSFER_SRC),
+                (STAGE2_NONE, 0),
+                (STAGE2_COLOR_OUTPUT, ACCESS2_COLOR_WRITE),
+                (FOREIGN, 0),
+            ));
+        }
+        commands.extend([
+            begin_render_pass(CB, RENDER_PASS, FRAMEBUFFER, SIZE, clear),
+            bind_pipeline(CB, 0, PIPELINE),
+            bind_vertex_buffer(CB, vertices.id),
+            draw(CB, 3),
+            end_render_pass(CB),
+            image_barrier2_families(
+                CB,
+                IMG,
+                (LAYOUT_TRANSFER_SRC, LAYOUT_TRANSFER_SRC),
+                (STAGE2_COLOR_OUTPUT, ACCESS2_COLOR_WRITE),
+                (STAGE2_NONE, 0),
+                (0, FOREIGN),
+            ),
+            end(CB),
+        ]);
+        commands
+    };
+    submit_frame(&mut h, &frame(raster::CLEAR_6, false), 0xf0);
+    let spec = ScanoutBlobSpec {
+        format: crate::FORMAT_B8G8R8X8_UNORM,
+        width: SIZE,
+        height: SIZE,
+        stride: pitch as u32,
+        offset: 0,
+    };
+    h.renderer
+        .scanout_blob(RES, &spec)
+        .expect("the canonical image on record matches the flip");
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: SIZE,
+        height: SIZE,
+    };
+    let present = |h: &mut Harness<AshVulkan>, damage: Rect| {
+        let lease = h
+            .renderer
+            .begin_shared_scanout(RES)
+            .expect("the claim")
+            .expect("a lease on a handle blob");
+        assert_eq!(lease.image.info.width, SIZE);
+        assert!(!lease.image.handle.is_placeholder(), "a real duplicate");
+        let (shared, lease) = for_the_display(lease, whole, damage);
+        display.present_shared(&shared, lease)
+    };
+    let first = std::time::Instant::now();
+    assert_eq!(present(&mut h, whole), SharedPresent::Presented);
+    let first = first.elapsed();
+    let (w, hh, got) = display
+        .screenshot_bgra()
+        .expect("the shared frame, read back");
+    assert_eq!((w, hh), (SIZE, SIZE));
+    let want6 = bgra_of(&raster::reference(raster::CLEAR_6));
+    match raster::verify(&bgra_of(&got), raster::CLEAR_6) {
+        Ok(detail) => eprintln!("zero-copy frame 1 (check 6): {detail}"),
+        Err(why) => panic!("the display showed the wrong frame: {why}"),
+    }
+    let sum6 = raster::checksum(&got);
+    eprintln!("zero-copy frame 1: BGRA fnv1a={sum6:#018x}, first present {first:?}");
+    assert_eq!(sum6, raster::checksum(&want6), "vk-smoke check 6, in BGRA");
+
+    // The guest takes the buffer back from FOREIGN — the display's release
+    // left it exactly where the guest's acquire expects it — draws the next
+    // frame and releases it again.
+    submit_frame(&mut h, &frame(raster::CLEAR_7, true), 0xf1);
+    assert_eq!(present(&mut h, whole), SharedPresent::Presented);
+    let (_, _, got) = display.screenshot_bgra().unwrap();
+    match raster::verify(&bgra_of(&got), raster::CLEAR_7) {
+        Ok(detail) => eprintln!("zero-copy frame 2 (check 7 clear): {detail}"),
+        Err(why) => panic!("the second present showed a stale frame: {why}"),
+    }
+    let want7 = bgra_of(&raster::reference(raster::CLEAR_7));
+    assert_eq!(raster::checksum(&got), raster::checksum(&want7));
+
+    // A damage rect alone: the texture holds frame 2, so only the damage
+    // of frame 3 (check 6 again) is copied.
+    submit_frame(&mut h, &frame(raster::CLEAR_6, true), 0xf2);
+    let part = Rect {
+        x: 100,
+        y: 30,
+        width: 17,
+        height: 9,
+    };
+    assert_eq!(present(&mut h, part), SharedPresent::Presented);
+    let (_, _, got) = display.screenshot_bgra().unwrap();
+    let mut expect = want7.clone();
+    for y in part.y..part.y + part.height {
+        let at = ((y * SIZE + part.x) * 4) as usize;
+        let len = (part.width * 4) as usize;
+        expect[at..at + len].copy_from_slice(&want6[at..at + len]);
+    }
+    assert_eq!(got, expect, "exactly the damage of frame 3 over frame 2");
+    let stats = display.shared_stats().expect("a presenter");
+    assert_eq!(stats.presented, 3);
+    assert_eq!(stats.full_copies, 1, "only the first, into a new texture");
+    assert_eq!(stats.imports, 1);
+
+    // 1080p: a cleared buffer, released as Zink leaves a blit target; the
+    // shared present and the readback, back to back.
+    let (bw, bh) = (1920u32, 1080u32);
+    let big_pitch = scanout_export(&mut h, (BIG, BIG_MEM, BIG_RES), (bw, bh), 0x10 | 0x1 | 0x2);
+    let colour = [0.2f32, 0.6, 0.4, 1.0];
+    submit_frame(
+        &mut h,
+        &[
+            begin(CB),
+            image_barrier2(
+                CB,
+                BIG,
+                (0, LAYOUT_TRANSFER_DST),
+                (STAGE2_NONE, 0),
+                (STAGE2_TRANSFER, 0x1000),
+            ),
+            Command::CmdClearColorImage(CmdClearColorImageArgs {
+                command_buffer: VkCommandBuffer(CB),
+                image: VkImage(BIG),
+                image_layout: LAYOUT_TRANSFER_DST,
+                p_color: Some(VkClearColorValue::Float32(colour)),
+                range_count: 1,
+                p_ranges: Some(vec![color_range()]),
+            }),
+            image_barrier2_families(
+                CB,
+                BIG,
+                (LAYOUT_TRANSFER_DST, LAYOUT_TRANSFER_DST),
+                (STAGE2_TRANSFER, 0x1000),
+                (STAGE2_NONE, 0),
+                (0, FOREIGN),
+            ),
+            end(CB),
+        ],
+        0xf3,
+    );
+    h.renderer
+        .scanout_blob(
+            BIG_RES,
+            &ScanoutBlobSpec {
+                format: crate::FORMAT_B8G8R8X8_UNORM,
+                width: bw,
+                height: bh,
+                stride: big_pitch as u32,
+                offset: 0,
+            },
+        )
+        .expect("the 1080p flip");
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width: bw,
+        height: bh,
+    };
+    let big = display::DisplayHandle::detached(bw, bh).unwrap();
+    big.attach_offscreen_gpu().expect("a second presenter");
+    let shared = timed_presents(&mut h, &big, BIG_RES, (full, full), 30);
+    report_as("zero-copy", "1920x1080 per flush (shared present)", &shared);
+    let (read, copied) = timed_reads(&mut h, BIG_RES, full, 30);
+    report_as(
+        "zero-copy",
+        "1920x1080 per flush (copy path readback)",
+        &copied,
+    );
+    let (_, _, got) = big.screenshot_bgra().unwrap();
+    let texel = raster::clear_rgba8(colour);
+    let texel = [texel[2], texel[1], texel[0], 0xff];
+    assert!(
+        got.chunks_exact(4).all(|p| p == texel),
+        "every 1080p pixel is the clear colour in BGRA"
+    );
+    assert!(read.chunks_exact(4).all(|p| p[..3] == texel[..3]));
+    let damage = Rect {
+        x: 720,
+        y: 405,
+        width: 480,
+        height: 270,
+    };
+    let small = timed_presents(&mut h, &big, BIG_RES, (full, damage), 30);
+    report_as(
+        "zero-copy",
+        "480x270 damage of 1920x1080 per flush (shared present)",
+        &small,
+    );
+
+    // Unref: the imports go with the resource; the texture stays shown.
+    display.forget_shared(Some(RES));
+    big.forget_shared(None);
+    h.renderer.destroy_blob(RES);
+    h.renderer.destroy_blob(BIG_RES);
+    let (_, _, still) = display.screenshot_bgra().unwrap();
+    assert_eq!(
+        still, expect,
+        "the display keeps its own copy of the last frame"
+    );
     h.send(&Command::DestroyInstance(DestroyInstanceArgs {
         instance: VkInstance(INSTANCE),
     }))

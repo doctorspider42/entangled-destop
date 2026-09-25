@@ -52,6 +52,28 @@ struct CursorPlane {
     y: i64,
     hot_x: u32,
     hot_y: u32,
+    /// Changes whenever the image does, so a GPU copy of it is re-uploaded
+    /// only then ([`Scanout::cursor_image`]).
+    serial: u64,
+}
+
+/// The cursor plane as the window's GPU overlay draws it (zero-copy
+/// presentation, where no CPU mirror holds the pixels beneath it): the raw
+/// premultiplied image and where its top-left lands, unclipped.
+#[derive(Debug, Clone, Copy)]
+pub struct CursorImage<'a> {
+    /// Top-left corner in scanout coordinates (negative off the left/top edge).
+    pub x: i64,
+    /// See `x`.
+    pub y: i64,
+    /// Image width.
+    pub width: u32,
+    /// Image height.
+    pub height: u32,
+    /// `width * height * 4` bytes, BGRA, premultiplied.
+    pub pixels: &'a [u8],
+    /// Changes whenever the image does.
+    pub serial: u64,
 }
 
 impl CursorPlane {
@@ -88,6 +110,8 @@ pub struct Scanout {
     generation: u64,
     /// The cursor plane, when the guest is showing one.
     cursor: Option<CursorPlane>,
+    /// The next cursor image's [`CursorPlane::serial`].
+    cursor_serial: u64,
     stats: ScanoutStats,
 }
 
@@ -107,6 +131,7 @@ impl Scanout {
             }),
             generation: 0,
             cursor: None,
+            cursor_serial: 0,
             stats: ScanoutStats::default(),
         })
     }
@@ -276,6 +301,7 @@ impl Scanout {
             });
         }
         self.dirty_under_cursor();
+        self.cursor_serial = self.cursor_serial.wrapping_add(1);
         self.cursor = Some(CursorPlane {
             width,
             height,
@@ -284,6 +310,7 @@ impl Scanout {
             y: i64::from(y) - i64::from(hot_y),
             hot_x,
             hot_y,
+            serial: self.cursor_serial,
         });
         self.dirty_under_cursor();
         Ok(())
@@ -309,6 +336,32 @@ impl Scanout {
     /// Whether a cursor plane is currently shown.
     pub fn cursor_visible(&self) -> bool {
         self.cursor.is_some()
+    }
+
+    /// The cursor plane's raw image and position, for a GPU overlay; `None`
+    /// when no cursor is shown.
+    pub fn cursor_image(&self) -> Option<CursorImage<'_>> {
+        self.cursor.as_ref().map(|c| CursorImage {
+            x: c.x,
+            y: c.y,
+            width: c.width,
+            height: c.height,
+            pixels: &c.pixels,
+            serial: c.serial,
+        })
+    }
+
+    /// A detached scanout of `pixels` (tightly packed BGRA, this scanout's
+    /// size) carrying **this** scanout's cursor plane: the base of a
+    /// screenshot of a frame the mirror does not hold (zero-copy
+    /// presentation), whose [`Self::cursor_overlay`] then composites exactly
+    /// as the mirror's own screenshots do.
+    pub fn with_base(&self, pixels: &[u8]) -> Result<Scanout, DisplayError> {
+        let mut out = Scanout::new(self.width, self.height)?;
+        out.update(0, 0, self.width, self.height, pixels)?;
+        out.cursor = self.cursor.clone();
+        out.cursor_serial = self.cursor_serial;
+        Ok(out)
     }
 
     /// The visible part of the cursor composited over the guest pixels:

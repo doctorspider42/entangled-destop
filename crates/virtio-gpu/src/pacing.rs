@@ -214,6 +214,12 @@ pub struct PacingReport {
     /// path that cannot keep up.
     pub service_mean_us: u64,
     pub service_max_us: u64,
+    /// Flushes of the window the device served through the **shared** path
+    /// (ADR-0004, zero-copy presentation): the display copied the frame on
+    /// the GPU instead of the renderer reading it back. The rest went through
+    /// the copy path, so `service` is the shared path's cost exactly when this
+    /// equals the frames of the window.
+    pub shared: u64,
 }
 
 /// Microseconds as frames per second, rounded to one decimal.
@@ -253,7 +259,7 @@ impl PacingReport {
              \"low_1_fps\":{:.1},\"low_1_us\":{},\"low_01_fps\":{:.1},\"low_01_us\":{},\
              \"late\":{},\"idle_gaps\":{},\"duplicate\":{},\"dropped\":{},\
              \"quiet_mean_us\":{},\"quiet_max_us\":{},\"submit_mean_us\":{},\
-             \"commands_mean\":{},\"pixels_mean\":{},\"service_mean_us\":{},\"service_max_us\":{}",
+             \"commands_mean\":{},\"pixels_mean\":{},\"service_mean_us\":{},\"service_max_us\":{},             \"shared\":{}",
             self.intervals,
             self.fps(),
             self.mean_us,
@@ -274,6 +280,7 @@ impl PacingReport {
             self.pixels_mean,
             self.service_mean_us,
             self.service_max_us,
+            self.shared,
         );
     }
 }
@@ -300,6 +307,8 @@ struct Stats {
     service_sum_us: u64,
     service_max_us: u64,
     pixels: u64,
+    /// Flushes served through the shared path.
+    shared: u64,
 }
 
 impl Stats {
@@ -363,6 +372,7 @@ impl Stats {
         self.service_sum_us = 0;
         self.service_max_us = 0;
         self.pixels = 0;
+        self.shared = 0;
     }
 
     fn report(&self) -> Option<PacingReport> {
@@ -394,6 +404,7 @@ impl Stats {
                 .checked_div(self.service_count)
                 .unwrap_or(0),
             service_max_us: self.service_max_us,
+            shared: self.shared,
         })
     }
 }
@@ -412,6 +423,8 @@ pub struct FramePacing {
     /// asked the device to move.
     flush_start: Option<Instant>,
     flush_pixels: u64,
+    /// Whether the current flush went through the shared path.
+    flush_shared: bool,
     /// Control commands since the previous present.
     commands: u64,
     /// Frames recorded since the last report, including the ones whose
@@ -436,6 +449,7 @@ impl FramePacing {
             first_cmd: None,
             flush_start: None,
             flush_pixels: 0,
+            flush_shared: false,
             commands: 0,
             since_report: 0,
         }
@@ -466,9 +480,21 @@ impl FramePacing {
         self.flush_pixels = pixels;
     }
 
+    /// Marks the current flush as served through the shared path (the
+    /// display copied the frame on the GPU), counted in
+    /// [`PacingReport::shared`].
+    #[inline]
+    pub fn note_shared(&mut self) {
+        self.flush_shared = true;
+    }
+
     /// Records a present at `now`, returning a report every [`REPORT_EVERY`]
     /// presents.
     pub fn record(&mut self, now: Instant) -> Option<PacingReport> {
+        if std::mem::take(&mut self.flush_shared) {
+            self.window.shared = self.window.shared.saturating_add(1);
+            self.lifetime.shared = self.lifetime.shared.saturating_add(1);
+        }
         let first_cmd = self.first_cmd.take();
         let flush_start = self.flush_start.take();
         let pixels = std::mem::take(&mut self.flush_pixels);
@@ -796,5 +822,34 @@ mod tests {
         assert!(text.contains("\"fps\":30.3"), "{text}");
         assert!(text.contains("\"duplicate\":1"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shared_flushes_are_counted_per_window_and_for_the_run() {
+        let base = Instant::now();
+        let mut pacing = FramePacing::new();
+        let mut last = None;
+        for index in 0..REPORT_EVERY {
+            if index % 3 != 0 {
+                pacing.note_shared();
+            }
+            let now = base + Duration::from_micros(16_667 * index);
+            last = pacing.record(now).or(last);
+        }
+        let report = last.expect("a report");
+        assert_eq!(report.shared, REPORT_EVERY - REPORT_EVERY.div_ceil(3));
+        assert_eq!(pacing.lifetime().expect("the run").shared, report.shared);
+        // A present not noted is not counted, and the note does not leak into
+        // the next one.
+        pacing.note_shared();
+        pacing.record(base + Duration::from_micros(16_667 * REPORT_EVERY));
+        pacing.record(base + Duration::from_micros(16_667 * (REPORT_EVERY + 1)));
+        assert_eq!(pacing.report().expect("a window").shared, 1);
+        let mut json = String::new();
+        report.write_json(&mut json);
+        assert!(
+            json.contains(&format!("\"shared\":{}", report.shared)),
+            "{json}"
+        );
     }
 }

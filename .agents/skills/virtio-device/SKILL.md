@@ -524,6 +524,21 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   can pick belongs in `modifier::SCANOUT_FORMATS`. Check a client with
   `WAYLAND_DEBUG=client`: `zwp_linux_buffer_params_v1#N.add(...)`, not
   `wl_shm#N.create_pool`.
+- **The desktop's flips are presented by the display's own GPU on Windows**
+  (ADR-0004, zero-copy presentation). A renderer-blob flush first asks
+  `Renderer3d::begin_shared_scanout` for a **lease**: the image, its
+  duplicated NT handle and create info, the guest's release, and a claim on
+  the payload (`writes::Owner::Presenter`). It then hands the lease to
+  `ScanoutSink::present_shared`, which keeps it until its GPU copy has run.
+  The copy path (`read_rect_bgra`) serves anything the sink declines. After a
+  shared present, the first copy-path flush reads the whole visible region,
+  because the mirror is stale. Both the renderer hook and the sink methods are
+  additive defaults, so a new renderer or sink owes nothing. A new *owner* of
+  shared payloads needs its own serials and `Progress`: a watermark shared
+  with a synchronous owner completes the other's touches early (why
+  `Presenter` is not `Scanout`). `ENTANGLED_SCANOUT_PATH=copy` is the A/B
+  switch. Grep the log for `presents the renderer's scanout through the
+  display's GPU` (once per boot) and `shared=` in the pacing lines.
 
 ## Per-device references
 
