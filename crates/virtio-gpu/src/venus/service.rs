@@ -28,8 +28,9 @@
 //!
 //! 1. pump; while that makes progress, keep going;
 //! 2. with no progress, keep polling `tail` — yielding, then sleeping with a
-//!    growing backoff, never a hot spin — until `idleTimeout` has passed since
-//!    the last progress;
+//!    growing backoff — until `idleTimeout` has passed since the last
+//!    progress (on a host whose sleeps are coarse, the first
+//!    [`HOST_SPIN`] of that is yields alone: see below);
 //! 3. then publish `IDLE`, **re-read `tail`**, and if work arrived in between,
 //!    take `IDLE` back down and go to 1;
 //! 4. otherwise park until a doorbell, a stop or a reset; on waking, take
@@ -38,6 +39,25 @@
 //! The decisions are [`RingService`], a pure state machine over an injected
 //! clock, so every one of them is tested deterministically; [`RingWorker`] is
 //! the thin thread around it.
+//!
+//! # Why Windows polls by yielding (ADR-0004, 2026-09-25)
+//!
+//! vkr's backoff assumes a sleep lasts about what it asked for: on Linux a
+//! 10 µs `usleep` is over in well under 0.1 ms. On Windows the shortest
+//! sleep there is lasts 0.35–0.6 ms whatever is asked (a high-resolution
+//! waitable timer, which `std::thread::sleep` uses; measured on the RTX 2070
+//! machine, Windows 10), and a condition-variable timeout rounds up to the
+//! 15.6 ms system tick. Mesa's `idleTimeout` is 1 ms (`vn_ring.c:18`), so
+//! a Windows worker spent most of that window asleep, and each of the
+//! several ring submissions a guest makes around one `vkQueueSubmit`
+//! (destroys, allocations, the recording, the submit) waited up to half a
+//! millisecond to be seen: an empty submit's round trip was 0.7–2.0 ms in
+//! the guest against 0.4 ms with a yielding worker, and glmark2 ran at a
+//! third of the frame rate. So on Windows the worker polls by yielding for
+//! [`HOST_SPIN`] after its last progress — the whole of Mesa's window — and
+//! only then starts vkr's backoff. The price is a core kept busy for at
+//! most that long after each burst of guest work; an idle guest costs
+//! nothing, because a ring with nothing to do parks.
 //!
 //! # Why a second thread for `ALIVE`
 //!
@@ -111,6 +131,21 @@ const BUSY_WAIT_ORDER: u32 = 4;
 /// The first backoff sleep, doubled every time the poll count doubles:
 /// `vkr_ring_relax`'s `base_sleep_us`.
 const BASE_SLEEP: Duration = Duration::from_micros(10);
+
+/// How long after its last progress a ring is polled by yielding alone,
+/// before [`relax_backoff`]'s sleeps begin (module docs, "Why Windows polls
+/// by yielding").
+///
+/// Zero on Linux, which keeps vkr's backoff exactly. On Windows 2 ms: all of
+/// Mesa's 1 ms `idleTimeout`, with room to spare, and nothing near the
+/// [`super::pump::MAX_IDLE_TIMEOUT`] a guest may ask for — past this the
+/// backoff sleeps as vkr's does, however long the guest asked the host to
+/// keep polling.
+pub const HOST_SPIN: Duration = if cfg!(windows) {
+    Duration::from_millis(2)
+} else {
+    Duration::ZERO
+};
 
 /// Below this, a poll sleeps with `thread::sleep` (high resolution on both
 /// hosts); at or above it, on the worker's condition variable, so that a stop
@@ -225,6 +260,9 @@ pub struct RingService<S> {
     last_progress: Duration,
     /// Polls in a row that found nothing, for [`relax_backoff`].
     relax_iter: u32,
+    /// How long after the last progress a poll only yields, without
+    /// advancing `relax_iter` ([`HOST_SPIN`] for a live worker).
+    spin: Duration,
     /// `IDLE` is up and the ring is waiting for a doorbell.
     parked: bool,
     /// Set once the ring is dead; every later step answers it.
@@ -243,9 +281,20 @@ impl<S: RingSink> RingService<S> {
             sink,
             last_progress: now,
             relax_iter: 0,
+            spin: Duration::ZERO,
             parked: false,
             stopped: None,
         }
+    }
+
+    /// Poll by yielding alone for `spin` after every progress (and every
+    /// wake), and only then start [`relax_backoff`]. [`new`](Self::new)
+    /// starts with none, which is vkr's backoff exactly; the renderer's
+    /// workers use [`HOST_SPIN`].
+    #[must_use]
+    pub fn with_spin(mut self, spin: Duration) -> Self {
+        self.spin = spin;
+        self
     }
 
     /// The pump, for its cursor, status and layout.
@@ -370,6 +419,11 @@ impl<S: RingSink> RingService<S> {
         if left.is_zero() {
             // Due to go idle; the next step publishes `IDLE`.
             return Step::Again;
+        }
+        if now.saturating_sub(self.last_progress) < self.spin {
+            // Still in the hot window: yield, and leave the backoff where it
+            // is, so it starts from the beginning once the window is over.
+            return Step::Poll(Duration::ZERO);
         }
         self.relax_iter = self.relax_iter.saturating_add(1);
         Step::Poll(relax_backoff(self.relax_iter).min(left))
@@ -1125,6 +1179,93 @@ mod tests {
             "parked at {now:?}, before the timeout"
         );
         assert_eq!(ring.status(), STATUS_IDLE);
+    }
+
+    // ------------------------------------------------ the spin window
+
+    /// Step `svc` every 10 µs from `from` until it parks or `until`: the time
+    /// and length of the first poll that sleeps, and how many yields came
+    /// before it.
+    fn first_sleep<S: RingSink>(
+        svc: &mut RingService<S>,
+        ring: &Guest,
+        from: Duration,
+        until: Duration,
+    ) -> (Option<(Duration, Duration)>, u32) {
+        let mut now = from;
+        let mut yields = 0;
+        while now < until {
+            match svc.step(now, ring) {
+                Step::Poll(backoff) if backoff.is_zero() => yields += 1,
+                Step::Poll(backoff) => return (Some((now, backoff)), yields),
+                Step::Again => {}
+                Step::Park => break,
+                other => panic!("unexpected {other:?}"),
+            }
+            now += us(10);
+        }
+        (None, yields)
+    }
+
+    #[test]
+    fn a_spinning_ring_yields_for_its_window_and_then_starts_vkrs_backoff_from_the_beginning() {
+        let ring = Guest::new(MAX_IDLE_TIMEOUT);
+        let spin = Duration::from_millis(2);
+        let mut svc = ring
+            .service(Swallow::default(), Duration::ZERO)
+            .with_spin(spin);
+        let (first, yields) = first_sleep(&mut svc, &ring, Duration::ZERO, MAX_IDLE_TIMEOUT);
+        let (at, backoff) = first.expect("it sleeps once the window is over");
+        // 200 polls in the window, then vkr's fifteen yields, then its first
+        // sleep — 10 µs, not whatever the window's polls would have grown it to.
+        assert_eq!(yields, 200 + 15);
+        assert!(at >= spin, "slept at {at:?}, inside the window");
+        assert_eq!(backoff, us(10));
+        assert_eq!(ring.status(), 0, "not idle");
+    }
+
+    #[test]
+    fn progress_opens_the_spin_window_again() {
+        let ring = Guest::new(MAX_IDLE_TIMEOUT);
+        let spin = Duration::from_millis(2);
+        let mut svc = ring
+            .service(Swallow::default(), Duration::ZERO)
+            .with_spin(spin);
+        let (first, _) = first_sleep(&mut svc, &ring, Duration::ZERO, MAX_IDLE_TIMEOUT);
+        let (at, _) = first.expect("a sleep after the first window");
+        // Work five milliseconds in: the next polls yield again, for a whole
+        // window from that progress.
+        let work = at + Duration::from_millis(3);
+        ring.submit(b"work");
+        assert_eq!(svc.step(work, &ring), Step::Again);
+        let (again, yields) = first_sleep(&mut svc, &ring, work + us(10), MAX_IDLE_TIMEOUT);
+        let (at, backoff) = again.expect("a sleep after the second window");
+        assert!(at >= work + spin, "slept at {at:?}, inside the new window");
+        assert_eq!(backoff, us(10));
+        assert!(yields >= 199, "{yields} yields");
+    }
+
+    #[test]
+    fn with_mesas_timeout_a_spinning_ring_never_sleeps_and_still_parks_on_time() {
+        let ring = Guest::new(TIMEOUT);
+        let mut svc = ring
+            .service(Swallow::default(), Duration::ZERO)
+            .with_spin(Duration::from_millis(2));
+        let (first, yields) = first_sleep(&mut svc, &ring, Duration::ZERO, us(5000));
+        assert_eq!(first, None, "no poll inside Mesa's 1 ms window sleeps");
+        assert_eq!(yields, 100);
+        assert_eq!(ring.status(), STATUS_IDLE, "parked at the timeout, as ever");
+        assert!(svc.is_parked());
+    }
+
+    #[test]
+    fn the_host_spin_covers_mesas_window_only_where_sleeps_are_coarse() {
+        if cfg!(windows) {
+            assert!(HOST_SPIN >= TIMEOUT, "all of Mesa's 1 ms idleTimeout");
+            assert!(HOST_SPIN < MAX_IDLE_TIMEOUT);
+        } else {
+            assert_eq!(HOST_SPIN, Duration::ZERO, "vkr's backoff, exactly");
+        }
     }
 
     // -------------------------------------------------- the idle contract

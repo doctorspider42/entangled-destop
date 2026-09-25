@@ -202,10 +202,8 @@ pub fn transfer(gpu: &Gpu) -> Result<Out, String> {
         return Err(bad);
     }
     Ok(Out::Pass(format!(
-        "fill x3 + update + 2-region copy of 64 KiB (src type {}, dst type {}) verified, GPU time {}",
-        src.mem_type,
-        dst.mem_type,
-        ms(elapsed)
+        "fill x3 + update + 2-region copy of 64 KiB (src type {}, dst type {}) verified, {}",
+        src.mem_type, dst.mem_type, elapsed
     )))
 }
 
@@ -238,6 +236,14 @@ pub fn compute(gpu: &Gpu) -> Result<Out, String> {
         NONE,
     )?;
     buf.write_u32s(0, &vec![0xffff_ffff; N as usize]);
+    // The same dispatch into memory the guest never maps, to tell what the
+    // placement of `buf` costs from what the dispatch does.
+    let local = scope.buffer(
+        u64::from(N) * 4,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+        DEVICE_LOCAL,
+        NONE,
+    )?;
 
     let module = scope.shader(COMPUTE_SPV)?;
     let bindings = [vk::DescriptorSetLayoutBinding::default()
@@ -258,41 +264,54 @@ pub fn compute(gpu: &Gpu) -> Result<Out, String> {
     scope.defer(move |d| unsafe { d.destroy_descriptor_set_layout(set_layout, None) });
     let sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::STORAGE_BUFFER,
-        descriptor_count: 1,
+        descriptor_count: 2,
     }];
     // SAFETY: see above.
     let pool = unsafe {
         dev.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
-                .max_sets(1)
+                .max_sets(2)
                 .pool_sizes(&sizes),
             None,
         )
     }
     .vk("vkCreateDescriptorPool")?;
-    // SAFETY: see above; destroying the pool frees its set.
+    // SAFETY: see above; destroying the pool frees its sets.
     scope.defer(move |d| unsafe { d.destroy_descriptor_pool(pool, None) });
     let layouts = [set_layout];
     // SAFETY: see above.
-    let set = unsafe {
+    let sets = unsafe {
         dev.allocate_descriptor_sets(
             &vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(pool)
-                .set_layouts(&layouts),
+                .set_layouts(&[set_layout, set_layout]),
         )
     }
-    .vk("vkAllocateDescriptorSets")?[0];
+    .vk("vkAllocateDescriptorSets")?;
+    let (set, local_set) = (sets[0], sets[1]);
     let buf_info = [vk::DescriptorBufferInfo {
         buffer: buf.buffer,
         offset: 0,
         range: vk::WHOLE_SIZE,
     }];
-    let write = [vk::WriteDescriptorSet::default()
-        .dst_set(set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(&buf_info)];
-    // SAFETY: `set` is live and not in use.
+    let local_info = [vk::DescriptorBufferInfo {
+        buffer: local.buffer,
+        offset: 0,
+        range: vk::WHOLE_SIZE,
+    }];
+    let write = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buf_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(local_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&local_info),
+    ];
+    // SAFETY: both sets are live and not in use.
     unsafe { dev.update_descriptor_sets(&write, &[]) };
     // SAFETY: see above.
     let layout = unsafe {
@@ -317,7 +336,7 @@ pub fn compute(gpu: &Gpu) -> Result<Out, String> {
     // SAFETY: see above.
     scope.defer(move |d| unsafe { d.destroy_pipeline(pipeline, None) });
 
-    let elapsed = gpu.one_shot("compute", |dev, cb| {
+    let dispatch = |dev: &ash::Device, cb: vk::CommandBuffer, set: vk::DescriptorSet| {
         // SAFETY: `cb` is recording; pipeline, layout and set are compatible.
         unsafe {
             dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -331,6 +350,9 @@ pub fn compute(gpu: &Gpu) -> Result<Out, String> {
             );
             dev.cmd_dispatch(cb, N / WG, 1, 1);
         }
+    };
+    let elapsed = gpu.one_shot("compute", |dev, cb| {
+        dispatch(dev, cb, set);
         buffer_barrier(
             dev,
             cb,
@@ -346,10 +368,46 @@ pub fn compute(gpu: &Gpu) -> Result<Out, String> {
     if let Some(bad) = mismatches(&got, |i| compute_f(i as u32)) {
         return Err(bad);
     }
+
+    // The device-local variant, then its result copied into `buf` (timed
+    // too: 4 MiB written by the GPU into host-visible memory) and verified.
+    let local_elapsed = gpu.one_shot("compute (device-local)", |dev, cb| {
+        dispatch(dev, cb, local_set);
+    })?;
+    buf.write_u32s(0, &vec![0xffff_ffff; N as usize]);
+    let copy_elapsed = gpu.one_shot("copy device-local -> host-visible", |dev, cb| {
+        buffer_barrier(
+            dev,
+            cb,
+            local.buffer,
+            (
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_WRITE,
+            ),
+            TRANSFER_READ,
+        );
+        let region = [vk::BufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size: u64::from(N) * 4,
+        }];
+        // SAFETY: `cb` is recording; both buffers hold N words.
+        unsafe { dev.cmd_copy_buffer(cb, local.buffer, buf.buffer, &region) };
+        buffer_barrier(dev, cb, buf.buffer, TRANSFER_WRITE, HOST_READ);
+    })?;
+    let got = buf.read_u32s(N as usize);
+    if let Some(bad) = mismatches(&got, |i| compute_f(i as u32)) {
+        return Err(format!("device-local variant: {bad}"));
+    }
     Ok(Out::Pass(format!(
-        "{N} elements, {} workgroups of {WG}, all f(i) correct, GPU time {}",
+        "{N} elements, {} workgroups of {WG}, all f(i) correct, buffer type {}, {}; device-local (type {}): {}; 4 MiB copy device-local -> type {}: {}",
         N / WG,
-        ms(elapsed)
+        buf.mem_type,
+        elapsed,
+        local.mem_type,
+        local_elapsed,
+        buf.mem_type,
+        copy_elapsed
     )))
 }
 
@@ -763,8 +821,8 @@ fn render_triangle(gpu: &Gpu, target: Target<'_>, clear: [f32; 4]) -> Result<Str
     let got = readback.read_bytes(bytes as usize);
     let detail = raster::verify(&got, clear)?;
     Ok(format!(
-        "{detail}, image memory type {mem_type}, GPU time {}",
-        ms(elapsed)
+        "{detail}, image memory type {mem_type}, vertex buffer type {}, readback type {}, {}",
+        vbuf.mem_type, readback.mem_type, elapsed
     ))
 }
 

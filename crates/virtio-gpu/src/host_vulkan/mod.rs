@@ -1624,6 +1624,8 @@ impl AshVulkan {
 }
 
 #[cfg(test)]
+mod perf_tests;
+#[cfg(test)]
 mod pipeline_tests;
 #[cfg(test)]
 mod tests;

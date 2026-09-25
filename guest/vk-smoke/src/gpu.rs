@@ -72,6 +72,9 @@ pub struct Opts {
     /// Highest (major, minor) to request, below the default 1.3: makes a 1.3
     /// device take the 1.2/1.1 paths (KHR extensions) a Venus guest takes.
     pub api_cap: Option<(u32, u32)>,
+    /// How many times checks 4-7 submit their work (the first submit and
+    /// `repeat - 1` warm ones), see [`Timing`].
+    pub repeat: u32,
 }
 
 /// What check 1 hands to check 2.
@@ -286,6 +289,95 @@ pub enum DynRender {
     Khr(ash::khr::dynamic_rendering::Device),
 }
 
+/// A two-query timestamp pool and what it takes to turn ticks into time.
+pub struct Stamps {
+    pub pool: vk::QueryPool,
+    /// `VkPhysicalDeviceLimits::timestampPeriod`: nanoseconds per tick.
+    pub period_ns: f64,
+    /// The queue family's `timestampValidBits` as a mask.
+    pub mask: u64,
+}
+
+/// One submit, timed two ways: `wall` from `vkQueueSubmit` to the fence
+/// wait returning (what the application sees: submission, the GPU, and the
+/// signal travelling back), `gpu_ms` between a `TOP_OF_PIPE` timestamp
+/// written before the work and a `BOTTOM_OF_PIPE` one after it (what the GPU
+/// spent).
+#[derive(Clone, Copy)]
+pub struct Sample {
+    pub wall: Duration,
+    pub gpu_ms: Option<f64>,
+}
+
+/// A check's work submitted [`Opts::repeat`] times, then as many empty
+/// command buffers (the round trip with no work in it).
+///
+/// The first submit is not the same measurement as the others: in a Venus
+/// guest every object the check created just before it — memory, buffers,
+/// pipelines — was sent to the host without waiting for a reply, and the
+/// host executes them in ring order *before* the submit. So the first `wall`
+/// includes creating the check's objects on the host; the warm ones do not.
+pub struct Timing {
+    pub first: Sample,
+    pub warm: Vec<Sample>,
+    pub empty: Vec<Duration>,
+}
+
+fn median(mut v: Vec<f64>) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f64::total_cmp);
+    Some(v[v.len() / 2])
+}
+
+fn ms_of(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+impl Timing {
+    /// The median warm wall time, in ms.
+    pub fn warm_wall_ms(&self) -> Option<f64> {
+        median(self.warm.iter().map(|s| ms_of(s.wall)).collect())
+    }
+
+    /// The median warm GPU (timestamp) time, in ms.
+    pub fn warm_gpu_ms(&self) -> Option<f64> {
+        median(self.warm.iter().filter_map(|s| s.gpu_ms).collect())
+    }
+}
+
+impl std::fmt::Display for Timing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let opt = |v: Option<f64>| v.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3} ms"));
+        // "GPU time" stays the first submit's wall time, as it always was.
+        write!(f, "GPU time {:.2} ms", ms_of(self.first.wall))?;
+        write!(
+            f,
+            " (first submit, wall; timestamps {})",
+            opt(self.first.gpu_ms)
+        )?;
+        if !self.warm.is_empty() {
+            write!(
+                f,
+                "; warm x{}: wall {}, timestamps {}",
+                self.warm.len(),
+                opt(self.warm_wall_ms()),
+                opt(self.warm_gpu_ms())
+            )?;
+        }
+        if !self.empty.is_empty() {
+            write!(
+                f,
+                "; empty submit x{}: wall {}",
+                self.empty.len(),
+                opt(median(self.empty.iter().map(|d| ms_of(*d)).collect()))
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// What check 2 hands to every later check.
 pub struct Gpu {
     pub device: ash::Device,
@@ -298,6 +390,10 @@ pub struct Gpu {
     pub timeline: Option<Timeline>,
     pub dynrender: Option<DynRender>,
     pub timeout_ns: u64,
+    /// Timestamp queries on the queue, when its family has them.
+    pub stamps: Option<Stamps>,
+    /// See [`Opts::repeat`].
+    pub repeat: u32,
     /// Set once a wait has timed out. From then on nothing is destroyed —
     /// freeing objects the GPU may still be using is undefined behaviour, and
     /// a smoke test that leaks is better than one that crashes the driver.
@@ -413,6 +509,38 @@ pub fn check_device(p: &Picked, opts: &Opts) -> Result<(String, Gpu), String> {
             return Err(format!("vkCreateCommandPool: {}", result_name(e)));
         }
     };
+    let valid_bits = families[family as usize].timestamp_valid_bits;
+    let period_ns = f64::from(p.props.limits.timestamp_period);
+    println!(
+        "# timestamps: timestampValidBits {valid_bits}, timestampPeriod {period_ns} ns, timestampComputeAndGraphics {}",
+        p.props.limits.timestamp_compute_and_graphics
+    );
+    let stamps = if valid_bits > 0 && period_ns > 0.0 {
+        let info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(2);
+        // SAFETY: a valid device and create info.
+        match unsafe { device.create_query_pool(&info, None) } {
+            Ok(pool) => Some(Stamps {
+                pool,
+                period_ns,
+                mask: if valid_bits >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << valid_bits) - 1
+                },
+            }),
+            Err(e) => {
+                println!(
+                    "# vkCreateQueryPool(TIMESTAMP): {}, no GPU timestamps",
+                    result_name(e)
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     // SAFETY: `p.phys` belongs to `inst`.
     let mem = unsafe { inst.get_physical_device_memory_properties(p.phys) };
     for i in 0..mem.memory_type_count as usize {
@@ -469,6 +597,8 @@ pub fn check_device(p: &Picked, opts: &Opts) -> Result<(String, Gpu), String> {
         timeline,
         dynrender,
         timeout_ns: u64::try_from(opts.timeout.as_nanos()).unwrap_or(u64::MAX),
+        stamps,
+        repeat: opts.repeat.max(1),
         hung: Cell::new(false),
     };
     Ok((detail, gpu))
@@ -510,13 +640,34 @@ impl Gpu {
         }
     }
 
-    /// Records one primary command buffer, submits it with a fence and waits.
-    /// Returns how long the submit took to complete.
+    /// Records one primary command buffer, submits it with a fence and waits,
+    /// [`Gpu::repeat`] times, then submits as many empty ones; see [`Timing`].
     pub fn one_shot(
         &self,
         what: &str,
-        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
-    ) -> Result<Duration, String> {
+        record: impl Fn(&ash::Device, vk::CommandBuffer),
+    ) -> Result<Timing, String> {
+        let first = self.submit_timed(what, &record)?;
+        let mut warm = Vec::new();
+        for _ in 1..self.repeat {
+            warm.push(self.submit_timed(what, &record)?);
+        }
+        let mut empty = Vec::new();
+        if self.repeat > 1 {
+            for _ in 0..self.repeat {
+                empty.push(self.submit_timed("empty submit", &|_, _| {})?.wall);
+            }
+        }
+        Ok(Timing { first, warm, empty })
+    }
+
+    /// One recording between two timestamps, submitted with a fence and
+    /// waited for.
+    fn submit_timed(
+        &self,
+        what: &str,
+        record: &dyn Fn(&ash::Device, vk::CommandBuffer),
+    ) -> Result<Sample, String> {
         let mut scope = Scope::new(self);
         let cb = scope.command_buffer()?;
         let dev = &self.device;
@@ -524,7 +675,22 @@ impl Gpu {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         // SAFETY: `cb` is a fresh primary command buffer of this device.
         unsafe { dev.begin_command_buffer(cb, &begin) }.vk("vkBeginCommandBuffer")?;
+        if let Some(ts) = &self.stamps {
+            // SAFETY: `cb` is recording, outside any render pass; the pool
+            // holds two timestamp queries of this device, not in use (every
+            // earlier submit was waited for).
+            unsafe {
+                dev.cmd_reset_query_pool(cb, ts.pool, 0, 2);
+                dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, ts.pool, 0);
+            }
+        }
         record(dev, cb);
+        if let Some(ts) = &self.stamps {
+            // SAFETY: as above; query 1 was reset in this command buffer.
+            unsafe {
+                dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, ts.pool, 1)
+            };
+        }
         // SAFETY: recording was begun above.
         unsafe { dev.end_command_buffer(cb) }.vk("vkEndCommandBuffer")?;
         let fence = scope.fence(false)?;
@@ -534,7 +700,27 @@ impl Gpu {
         // SAFETY: `cb` is executable, `fence` unsignalled, both of this device.
         unsafe { dev.queue_submit(self.queue, &submit, fence) }.vk("vkQueueSubmit")?;
         self.wait_fences(&[fence], what)?;
-        Ok(t0.elapsed())
+        let wall = t0.elapsed();
+        let gpu_ms = match &self.stamps {
+            None => None,
+            Some(ts) => {
+                let mut ticks = [0u64; 2];
+                // SAFETY: both queries were written by the submit waited for
+                // above; two u64 results with TYPE_64.
+                unsafe {
+                    dev.get_query_pool_results(
+                        ts.pool,
+                        0,
+                        &mut ticks,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                }
+                .vk("vkGetQueryPoolResults")?;
+                let delta = ticks[1].wrapping_sub(ticks[0]) & ts.mask;
+                Some(delta as f64 * ts.period_ns / 1e6)
+            }
+        };
+        Ok(Sample { wall, gpu_ms })
     }
 }
 
@@ -777,6 +963,9 @@ impl Drop for Gpu {
         // pool's command buffers are freed with it.
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(ts) = &self.stamps {
+                self.device.destroy_query_pool(ts.pool, None);
+            }
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
         }

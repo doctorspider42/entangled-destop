@@ -167,7 +167,9 @@ use super::executor::modifier::CanonicalImage;
 use super::pump::RingPump;
 use super::pump::{Batch, Consumed, RingBacking, RingSink};
 use super::ring::{RingCreateInfo, RingLayout, RingLayoutError};
-use super::service::{monitor_period, LiveThreads, RingMonitor, RingService, RingWorker};
+use super::service::{
+    monitor_period, LiveThreads, RingMonitor, RingService, RingWorker, HOST_SPIN,
+};
 use super::shmem::{Publication, RingPages, ShmemError};
 use super::transport::{
     Opcode, TransportCommand, TransportError, TransportRequest, TransportStream,
@@ -3248,7 +3250,7 @@ impl<F: SinkFactory> VenusRenderer<F> {
 
         let worker = RingWorker::spawn(
             format!("venus-ring-{ctx_id}"),
-            RingService::new(pump, sink, Duration::ZERO),
+            RingService::new(pump, sink, Duration::ZERO).with_spin(HOST_SPIN),
             Arc::clone(&pages),
             quiesce,
             &live,
@@ -3532,7 +3534,8 @@ impl<F: SinkFactory> VenusRenderer<F> {
             return Err(refuse("the ring's tail is short of it"));
         }
         live.worker.notify();
-        let deadline = std::time::Instant::now() + WAIT_RING_SEQNO_TIMEOUT;
+        let started = std::time::Instant::now();
+        let deadline = started + WAIT_RING_SEQNO_TIMEOUT;
         let mut spins = 0u32;
         loop {
             if reached(live.pages.load_host_word(&live.layout.head())) {
@@ -3544,8 +3547,11 @@ impl<F: SinkFactory> VenusRenderer<F> {
             if std::time::Instant::now() >= deadline {
                 return Err(refuse("the wait timed out"));
             }
+            // Yield while the worker is most likely about to get there — for
+            // `HOST_SPIN` on a host whose shortest sleep is half a
+            // millisecond (`service` module docs) — then sleep between looks.
             spins = spins.saturating_add(1);
-            if spins < 64 {
+            if spins < 64 || started.elapsed() < HOST_SPIN {
                 std::thread::yield_now();
             } else {
                 std::thread::sleep(Duration::from_micros(100));
