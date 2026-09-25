@@ -74,6 +74,10 @@ const TAP_GUEST_DNS: &str = "1.1.1.1";
 /// from any working directory.
 const AUTO_PRESEED: &str = include_str!("../../../assets/preseed/auto-weston.cfg");
 
+/// The installed Debian machine's memory when `--memory-mib` asked for less:
+/// what its profile always had.
+const INSTALLED_MEMORY_MIB: u64 = 2048;
+
 // ---------------------------------------------------------------------------
 // The one per-host choice: which network the installer gets
 // ---------------------------------------------------------------------------
@@ -167,6 +171,33 @@ pub fn net_plan(choice: &str, interface: &str) -> Result<NetPlan, String> {
 // ---------------------------------------------------------------------------
 // Where the machine goes
 // ---------------------------------------------------------------------------
+
+/// vCPUs of the *installed* machine: `--vcpus` when given, otherwise
+/// `host_logical_cpus` through [`control_api::default_vcpus`] (half the host,
+/// 2 to 8) — the same rule the manager's wizard starts from. The installer VMs
+/// keep their fixed 2: every install time on record was measured with it, and
+/// the installer is not the machine it installs.
+pub fn installed_vcpus(args: &InstallArgs, host_logical_cpus: usize) -> u32 {
+    args.vcpus
+        .unwrap_or_else(|| control_api::default_vcpus(host_logical_cpus))
+}
+
+/// [`installed_vcpus`] on this host, logged, because a derived number in a
+/// profile should say where it came from.
+pub fn installed_vcpus_here(args: &InstallArgs) -> u32 {
+    let host = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+    let vcpus = installed_vcpus(args, host);
+    if args.vcpus.is_some() {
+        tracing::info!(vcpus, "installed machine: --vcpus");
+    } else {
+        tracing::info!(
+            vcpus,
+            host_logical_cpus = host,
+            "installed machine: half the host's logical CPUs, 2 to 8 (--vcpus to choose)"
+        );
+    }
+    vcpus
+}
 
 /// The VM's name: `--name`, else the disk file's stem, else the distribution.
 ///
@@ -367,8 +398,11 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     // 6. Write the runnable profile (MVP-1009).
     let profile = VmConfig {
         name: vm_name.clone(),
-        memory_mib: 2048,
-        vcpus: 2,
+        // An explicit --memory-mib above the old fixed 2048 carries through,
+        // as it does for Ubuntu and Fedora; below it (clap's 1536 included)
+        // the machine keeps what its profile always had.
+        memory_mib: args.memory_mib.max(INSTALLED_MEMORY_MIB),
+        vcpus: installed_vcpus_here(args),
         transport: VirtioTransport::default(),
         boot: BootSection {
             mode: BootMode::DirectLinux,
@@ -792,6 +826,7 @@ mod tests {
             firmware: None,
             size: "20G".into(),
             memory_mib: 2048,
+            vcpus: None,
             interface: "entangled0".into(),
             network: crate::DEFAULT_NETWORK.into(),
             name: name.map(str::to_string),

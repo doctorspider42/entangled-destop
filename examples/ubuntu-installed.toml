@@ -38,7 +38,9 @@
 # stdout. The virtio-gpu window shows tty1, which is where you actually log in.
 name = "ubuntu"
 memory_mib = 2048
-vcpus = 2
+# `entangled install` writes half the installing host's logical CPUs, 2 to 8
+# (`--vcpus N` to choose); this file shows a 16-thread host's.
+vcpus = 8
 # Mandatory in uefi mode: EDK2's CloudHv build has no virtio-mmio driver at all,
 # so on any other transport the firmware would find no disk to boot.
 transport = "pci"
@@ -54,9 +56,11 @@ nvram = "/home/you/entangled-vms/ubuntu.nvram"
 path = "/home/you/entangled-vms/ubuntu.raw"
 writable = true
 
+# 1920x1080, what every installed profile gets. The guest's desktop takes its
+# size from here: the EDID's preferred mode is this one.
 [display]
-width = 1280
-height = 800
+width = 1920
+height = 1080
 scale = 1.0
 
 # A sound card (GAME-2102). Off unless a profile asks: the device is attached

@@ -1,7 +1,10 @@
 //! SMP on WHP (backlog WHP-1703): a two-vCPU Linux guest boots natively on
-//! Windows and brings its application processor up.
+//! Windows and brings its application processor up — and so does an
+//! eight-vCPU one, the most `control_api::default_vcpus` gives an installed
+//! machine, so the default a user gets without asking is one this host has
+//! booted (seven APs through the userspace IOAPIC, one MADT, one MP table).
 //!
-//! The evidence is the kernel's own line, `smpboot: Total of 2 processors
+//! The evidence is the kernel's own line, `smpboot: Total of N processors
 //! activated`, which it only prints once the AP has executed the real-mode
 //! trampoline, switched to long mode, joined the scheduler and answered the BSP's
 //! synchronisation. A guest whose AP never starts does not fail — it boots
@@ -37,13 +40,10 @@ use vmm_core::{MachineConfig, RunOutcome};
 mod whp_common;
 use whp_common::{artifact, dump_log, kernel, tail, whp_guard, Capture, BOOT_DEADLINE};
 
-const SMP_MACHINE: MachineConfig = MachineConfig {
-    memory_mib: 512,
-    vcpu_count: 2,
-};
-
-/// What the kernel prints once the AP is up and counted.
-const SMP_MARKER: &str = "smpboot: Total of 2 processors activated";
+/// What the kernel prints once every AP is up and counted.
+fn smp_marker(vcpus: u32) -> String {
+    format!("smpboot: Total of {vcpus} processors activated")
+}
 
 /// What it prints instead when the AP never answered, after a ten-second wait.
 const AP_TIMEOUT_MARKER: &str = "failed to report alive state";
@@ -52,6 +52,23 @@ const AP_TIMEOUT_MARKER: &str = "failed to report alive state";
 /// with both processors online.
 #[test]
 fn two_processors_come_up_on_whp() {
+    boot_with(2);
+}
+
+/// The installed-profile default's ceiling (`control_api::MAX_DEFAULT_VCPUS`,
+/// restated: vmm-core sits below control-api):
+/// every processor a user gets without passing `--vcpus` comes up.
+#[test]
+fn the_default_vcpu_ceiling_comes_up_on_whp() {
+    boot_with(8);
+}
+
+fn boot_with(vcpu_count: u32) {
+    let smp_machine = MachineConfig {
+        memory_mib: 512,
+        vcpu_count,
+    };
+    let smp_marker = smp_marker(vcpu_count);
     let _guard = whp_guard();
     let hv = match WhpHypervisor::open() {
         Ok(hv) => hv,
@@ -67,16 +84,16 @@ fn two_processors_come_up_on_whp() {
         eprintln!("skipping: test artifacts missing");
         return;
     };
-    eprintln!("booting the {which} kernel with 2 vCPUs");
+    eprintln!("booting the {which} kernel with {vcpu_count} vCPUs");
 
-    let mut partition = WhpPartition::with_options(&hv, &SMP_MACHINE, WhpOptions::for_guest())
+    let mut partition = WhpPartition::with_options(&hv, &smp_machine, WhpOptions::for_guest())
         .expect("WHP partition with a local APIC");
-    // Both tables describe two CPUs, which is what makes the kernel look for an
-    // AP in the first place.
-    machine_x86::mptable::write(partition.memory(), SMP_MACHINE.vcpu_count).unwrap();
-    machine_x86::acpi::write(partition.memory(), SMP_MACHINE.vcpu_count).unwrap();
+    // Both tables describe every CPU, which is what makes the kernel look for
+    // an AP in the first place.
+    machine_x86::mptable::write(partition.memory(), smp_machine.vcpu_count).unwrap();
+    machine_x86::acpi::write(partition.memory(), smp_machine.vcpu_count).unwrap();
 
-    let irqchip = UserspaceIrqChip::new(partition.interrupt_delivery(), SMP_MACHINE.vcpu_count)
+    let irqchip = UserspaceIrqChip::new(partition.interrupt_delivery(), smp_machine.vcpu_count)
         .expect("userspace irqchip");
     let capture = Capture::default();
     let serial = SerialConsole::with_trigger(irqchip.serial_line(), Box::new(capture.clone()));
@@ -87,11 +104,11 @@ fn two_processors_come_up_on_whp() {
         initramfs: Some(initramfs),
         cmdline: "console=ttyS0 earlyprintk=serial panic=1 reboot=k".into(),
     };
-    let loaded = linux_boot::load(partition.memory(), &boot, SMP_MACHINE.memory_mib << 20)
+    let loaded = linux_boot::load(partition.memory(), &boot, smp_machine.memory_mib << 20)
         .expect("bzImage + initramfs load");
 
     let mut vcpus = partition.take_vcpus();
-    assert_eq!(vcpus.len(), 2);
+    assert_eq!(vcpus.len(), vcpu_count as usize);
     // Only the BSP; see the module docs.
     {
         let bsp = &mut vcpus[0];
@@ -107,7 +124,7 @@ fn two_processors_come_up_on_whp() {
     while start.elapsed() < BOOT_DEADLINE {
         let text = capture.text();
         ready |= text.contains(GUEST_READY_MARKER);
-        smp |= text.contains(SMP_MARKER);
+        smp |= text.contains(&smp_marker);
         // The kernel gives an AP ten seconds and then carries on with one CPU, so
         // its own complaint ends the wait too — there is nothing more to learn by
         // sitting out the deadline.
@@ -156,7 +173,7 @@ fn two_processors_come_up_on_whp() {
     // the kernel's own complaint quoted back when it is missing.
     assert!(
         smp,
-        "the application processor never came up (looking for {SMP_MARKER:?}); \
+        "an application processor never came up (looking for {smp_marker:?}); \
          processor state was:\n  {}\nserial tail:\n{}",
         state.join("\n  "),
         tail(&text, 60)
@@ -167,9 +184,9 @@ fn two_processors_come_up_on_whp() {
         tail(&text, 40)
     );
 
-    // Both vCPU threads must end cleanly — including the AP, whose thread is
-    // blocked *inside* `WHvRunVirtualProcessor` until it is cancelled.
-    assert_eq!(outcomes.len(), 2);
+    // Every vCPU thread must end cleanly — including the APs, whose threads
+    // are blocked *inside* `WHvRunVirtualProcessor` until they are cancelled.
+    assert_eq!(outcomes.len(), vcpu_count as usize);
     for (index, outcome) in outcomes.into_iter().enumerate() {
         let outcome = outcome.unwrap_or_else(|e| panic!("vcpu {index} failed: {e}"));
         assert!(

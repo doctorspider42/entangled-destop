@@ -841,7 +841,22 @@ list: `/etc/drirc` sending every GL client to Zink, a
 `90_entangled-venus.gschema.override` with `idle-delay 0`, its
 `glib-compile-schemas`, and `usermod -aG render <identity.username>`. The
 written profile gets `[display] venus = true` and at least 4096 MiB. The
-installer VM itself stays 2D. Check the items in `<name>-seed.iso`'s
+installer VM itself stays 2D, 2 vCPUs, 1280×800.
+
+**What every installed profile gets** (Ubuntu, Fedora, Debian): a 1920×1080
+display (`DisplaySection::default()`) and `control_api::host_default_vcpus()`
+vCPUs — half the host's logical CPUs, 2 to 8 — unless `--vcpus N` says
+otherwise. Until 2026-09-25 Ubuntu and Fedora wrote 1280×800 and every
+installer wrote 2 vCPUs; nothing had chosen either (ADR-0004, "installed
+profiles"). The guest needs no monitor config for 1080p: GNOME takes the
+EDID's preferred mode, which is the profile's size. Check it in the guest with
+`cat /sys/class/drm/card*-*/modes` (first line `1920x1080`) and `nproc`. The
+8-vCPU ceiling is pinned as booting by
+`cargo test -p vmm-core --test whp_smp` (WHP, passing) and
+`cargo test -p boot-tests --test acpi the_default_vcpu_ceiling_comes_up`
+(KVM). The KVM one has only self-skipped so far — check `ls /dev/kvm` in WSL
+before trusting a green Linux gate: on 2026-09-25 it was missing, and every KVM
+test "passed" in 0.03 s. Check the items in `<name>-seed.iso`'s
 user-data, and on the installed guest check that `/proc/$(pgrep -x
 gnome-shell)/maps` has `libvulkan_virtio`. The exact text is pinned by
 `seed::tests::venus_late_commands_are_exact_and_first`. On 2026-09-24 the
@@ -851,8 +866,14 @@ read `uint32 0`, and the drirc parsed identically to the one GNOME ran on.
 The render-group item is safe where it sits: subiquity's postinstall creates the
 identity user (11:04:52 in that guest's installer log) before
 `subiquity/Late/run_user_supplied` starts (11:05:00).
-A full `install ubuntu --venus` run has not been made yet: there was no
-Desktop ISO on the machine.
+Full `install ubuntu --venus` runs from the Ubuntu 26.04.1 Desktop ISO on
+WHP: 10 min 38 s (2026-09-25, ea87ee4) and 11 min 41 s with the 1080p /
+half-the-host profile, whose first boot showed `smp: Brought up 1 node, 8
+CPUs`, `nproc` 8, modes `1920x1080` and GDM on the GPU at that size
+(ADR-0004, "installed profiles"). The written profile has no `[network]`, so a
+probe that needs packages boots a copy with `backend = "usernet"`. glmark2
+numbers do not measure vCPUs: two boots at one count differ by as much as
+2, 4 and 8 do. A parallel job (`xargs -P $(nproc)` over `sha256sum`) does.
 
 **Three files come out of an install, and all three matter:**
 

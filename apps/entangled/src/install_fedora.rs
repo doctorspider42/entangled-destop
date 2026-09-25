@@ -72,7 +72,7 @@ use control_api::{
 };
 
 use crate::disk;
-use crate::install::{net_plan, target_disk, vm_name, NetAddress};
+use crate::install::{installed_vcpus_here, net_plan, target_disk, vm_name, NetAddress};
 use crate::paths;
 use crate::run_vm::{self, Automation};
 use crate::seed;
@@ -316,7 +316,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     let profile = VmConfig {
         name: vm_name.clone(),
         memory_mib: args.memory_mib.max(INSTALLED_MEMORY_MIB),
-        vcpus: 2,
+        vcpus: installed_vcpus_here(args),
         transport: VirtioTransport::Pci,
         boot: BootSection {
             mode: BootMode::Uefi,
@@ -330,17 +330,10 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         }],
         cdrom: None,
         network: net.section.clone(),
-        display: DisplaySection {
-            width: 1280,
-            height: 800,
-            scale: 1.0,
-            virgl: false,
-            virgl_isolation: control_api::VirglIsolation::default(),
-            venus: false,
-            refresh_hz: control_api::DEFAULT_REFRESH_HZ,
-            frame_stats: None,
-            host_visible_mib: None,
-        },
+        // 1920x1080, the size the project targets (CLAUDE.md) and what the
+        // Debian profile always had. 1280x800 was the installer's size carried
+        // over, not a decision (install_ubuntu::installed_display says more).
+        display: DisplaySection::default(),
         // A desktop with no sound is not a desktop (GAME-2102). `auto` never
         // fails a run: a host with no audio device gets a card that plays into
         // silence, and the guest still enumerates one.

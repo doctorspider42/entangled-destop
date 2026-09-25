@@ -95,6 +95,34 @@ fn guest_finds_our_acpi_tables_and_the_madt_topology() {
     );
 }
 
+/// The most vCPUs an installed profile gets without `--vcpus`
+/// (`control_api::MAX_DEFAULT_VCPUS`): every one of them must come up, from
+/// the MADT, with no AP timing out — a default nobody asked for has to be one
+/// this machine has booted.
+#[test]
+fn the_default_vcpu_ceiling_comes_up() {
+    let Some(spec) = spec() else { return };
+    let vcpus = control_api::MAX_DEFAULT_VCPUS;
+    let outcome = boot_once(&spec.with_vcpus(vcpus)).expect("boot failed");
+    let log = &outcome.serial;
+    assert!(outcome.reached_ready(), "serial log:\n{log}");
+    for line in log
+        .lines()
+        .filter(|l| l.contains("CPUs") || l.contains("smpboot"))
+    {
+        println!("{}", line.trim());
+    }
+    assert!(
+        log.contains(&format!("Brought up 1 node, {vcpus} CPUs"))
+            || log.contains(&format!("Total of {vcpus} processors activated")),
+        "not every vCPU came up; serial log:\n{log}"
+    );
+    assert!(
+        !log.contains("failed to report alive state") && !log.contains("Not responding"),
+        "an application processor timed out; serial log:\n{log}"
+    );
+}
+
 /// A single-vCPU boot must report exactly one CPU: an MADT that over-reported
 /// would make the kernel wait for CPUs that never come up.
 #[test]
