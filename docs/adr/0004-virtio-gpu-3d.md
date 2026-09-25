@@ -2528,6 +2528,11 @@ if that is it, is a real workload decision: which types to expose, and whether
 a guest's storage buffers belong in memory the guest never maps. This is a
 performance item, not a correctness one.
 
+**Resolved 2026-09-25** (the GPU-time amendment at the end): placement was not
+it. Those numbers were wall times, not GPU times; they were host pipeline
+compiles, a ring worker whose sleeps Windows rounds up to half a millisecond,
+and an idle-clocked GPU.
+
 ## Amendment, 2026-09-24 — stage 5b.3, semaphores, sync-file emulation, queue timelines and Vulkan 1.3
 
 The executor now serves semaphores, the sync-file semaphore import Mesa's WSI
@@ -4799,3 +4804,191 @@ never to the bound.
   checked against what this renderer shows.
 - `--screenshot-every` keeps writing until the VM stops, so a probe has to
   pick its window of frames by file time.
+
+## Amendment, 2026-09-25 — GPU time in the guest: not placement, but compiles, a sleeping ring worker and idle clocks
+
+The 5b.2 amendment recorded vk-smoke's "GPU time" in the Ubuntu guest at 24 ms
+against 0.64 ms natively for the 1 Mi-element compute check, and 12.3–12.9 ms
+against 0.20 ms for the 256×256 triangle. It guessed placement: mapped
+buffers land in system memory (type 3) and the GPU works on them across
+PCIe. That guess was wrong, and so was the premise. vk-smoke's "GPU time"
+was never GPU time. It was the wall time from `vkQueueSubmit` to
+`vkWaitForFences` returning, for the first and only submit of each check.
+
+### What vk-smoke measures now
+
+Checks 4–7 submit their work `--repeat N` times (default 10) and then N empty
+command buffers. Each submit is timed two ways. **Wall** is the old number.
+**Timestamps** come from a `TOP_OF_PIPE`/`BOTTOM_OF_PIPE` `vkCmdWriteTimestamp`
+pair around the work, in the same command buffer. The first submit is
+reported apart from the median of the warm ones. Check 5 also runs its
+dispatch into a device-local buffer and times a 4 MiB copy from there into
+the host-visible buffer. Checks 6 and 7 print the memory type of every
+buffer. `# timestamps:` prints the queue family's `timestampValidBits` and
+the device's `timestampPeriod`, which the guest sees as the host's: 64 bits
+and 1 ns (README, "Timing").
+
+The same Vulkan runs on the host with no guest, in
+`host_vulkan::perf_tests`. It uses the compute shader and a 4 MiB copy,
+timed by timestamps. Each buffer placement the renderer can give a guest is
+tried: the driver's host-visible types 3 and 4, **our pages imported** with
+`VK_EXT_external_memory_host` exactly as `RingPages::for_memory` makes them,
+and device-local memory. Buffers are created with and without the
+`VkExternalMemoryBufferCreateInfo{HOST_ALLOCATION}` the executor adds, on a
+device with and without the `robustBufferAccess` the executor forces on, and
+with the submits back to back or 2 ms apart.
+
+### Three causes, each measured
+
+The guest is Ubuntu 26.04 with Mesa 26.0.8 on WHP, and the host GPU is the
+RTX 2070 with driver 580.88. `nvidia-smi` logged the host GPU's P-state
+every 50–200 ms throughout.
+
+1. **The first submit carries the host's pipeline compiles.** Mesa creates
+   memory, buffers, descriptor sets and pipelines without waiting for a
+   reply, and the ring executes them before the submit that follows. On a
+   VMM binary the NVIDIA driver has not seen, its shader cache is cold, which
+   costs 10–15 ms. Compute's first submit took 17.25 and 11.89 ms and the
+   triangle's 13.75 and 12.50 ms on two fresh executables. The same checks in
+   the same VM a second time, or on a second run of the same executable,
+   took 1.0–4.0 ms. Check 7 builds the same pipeline as check 6 and was never
+   slow. Natively the compile happens inside `vkCreate*Pipelines`, before
+   the timer starts. This one is **inherent**. It happens once per binary,
+   and it is what any native application's first run costs as well.
+2. **Every round trip waited on a ring worker asleep.** The worker follows
+   vkr and polls for Mesa's 1 ms `idleTimeout` (`vn_ring.c:18`) with a 10 µs
+   backoff that doubles. On Linux a 10 µs sleep lasts about 90 µs (WSL,
+   measured). **On Windows the shortest sleep there is lasts 0.35–0.6 ms**,
+   whatever is asked for: 10 µs took 350 µs and 160 µs took 565 µs. A
+   `Condvar::wait_timeout` of 1–5 ms took 15.5 ms. So around each
+   `vkQueueSubmit` the guest makes several ring submissions: destroys, a
+   command buffer, a fence, the recording and the submit. Each waited up to
+   half a millisecond to be noticed. An empty submit took 0.66–2.0 ms against
+   0.06–0.09 ms natively. A worker that only yields, a temporary experiment,
+   brought that to 0.40 ms and doubled glmark2. **This one is ours, and it is
+   fixed** (below).
+3. **The GPU ran the guest's work at idle clocks.** Natively, creating a
+   device puts the RTX 2070 in P0 (1410 MHz core, 7000 MHz memory) for about
+   2 s, and vk-smoke's checks run inside that window. The guest's
+   `vkCreateDevice` is a *late* device in a long-lived process, and it gets
+   no such boost. In `perf_tests`, a device created first in its process
+   dispatched in 0.026 ms, and one created after 5 s of an idle GPU took
+   0.258 ms. vk-smoke's sparse guest work ran entirely at **P8, 300–330 MHz
+   core and 405 MHz memory**. That makes the timestamps 3–10× native:
+   device-local dispatch 0.28–0.34 ms against 0.026, the triangle 0.10–0.11
+   against 0.029–0.034, and the 4 MiB copy 1.27 against 0.32. We then held
+   the GPU in P0 with a native process looping on the host during a guest
+   run. **Every guest timestamp then matched native to the microsecond**:
+   transfer 0.015, compute into type 3 0.322, device-local dispatch 0.026,
+   the copy 0.322, the triangle 0.029 and dynamic rendering 0.028 ms. This
+   one is the host driver's power management, not the renderer.
+
+The suspects, one by one:
+
+| suspect | verdict | evidence |
+|---|---|---|
+| `timestampPeriod` / `timestampValidBits` | the host's, unchanged | 1 ns and 64 bits in the guest and natively |
+| the executor between the timestamp pair | inserts nothing | guest commands go one-to-one into one host command buffer (`host_vulkan::calls`). The only injected submit is the empty mark after a submit that touches a *shared* payload (`executor::writes`), and vk-smoke has none. Mesa's fence-feedback command buffer is a separate one after the timed one |
+| `robustBufferAccess` | costs nothing measurable | `perf_tests`, every placement, on and off: equal |
+| our imported pages | as fast for the GPU as the driver's own | at P0, 13.0 GB/s for the copy and 0.322 ms for the dispatch, into imported pages of either type and into the driver's types 3 and 4 alike |
+| `HOST_ALLOCATION` create info on a buffer | costs nothing | device-local 0.026 ms / 134 GB/s with it and without it |
+| placement in system memory | real, and the same natively | 0.322 ms against 0.026 ms device-local, in the guest at P0 and natively. It is vk-smoke's own choice of a mapped storage buffer, not the renderer's |
+| clocks | the whole GPU-side gap | above |
+
+### The fix: the ring worker yields on Windows (`service::HOST_SPIN`)
+
+`RingService::with_spin(d)` polls by yielding alone for `d` after each
+progress (and after each wake). It does not advance the backoff during that
+window, so vkr's backoff starts from the beginning once the window is over.
+`HOST_SPIN` is 2 ms on Windows. That covers all of Mesa's 1 ms window, and
+the ring still parks at `idleTimeout`. On Linux it is zero, which is vkr's
+backoff exactly. The renderer's workers use it. The `vkWaitRingSeqnoMESA`
+wait on the device side uses it too: it yields for `HOST_SPIN` before its
+100 µs sleeps.
+
+Tests (`venus::service`, on every host):
+- A spinning ring yields for its whole window and then starts vkr's backoff
+  at 10 µs, not at wherever 200 window polls would have grown it.
+- Progress opens the window again.
+- With Mesa's 1 ms timeout, a spinning ring never sleeps and still publishes
+  `IDLE` and parks on time.
+- `HOST_SPIN` covers Mesa's window on Windows and is zero elsewhere.
+
+The existing tests keep `RingService::new`'s vkr behaviour and pass
+unchanged.
+
+The window's cost is a core kept busy for up to 1 ms after each burst of
+guest work. An idle desktop cost the same as before (0.03–0.05 cores of the
+VMM against 0.03–0.07). glmark2 with FIFO pacing rose from 0.72–0.77 to
+1.08–1.11 cores, at 49–50 FPS before and 50–55 after. Shorter windows were
+tried in the guest with a temporary override: **100 µs** gave `build` 239 FPS
+and off-screen `jellyfish` 1319, and **300 µs** gave 332 and 2024. Neither
+saved CPU at FIFO pace (1.05 and 0.98 cores). So the window is Mesa's whole
+idle period.
+
+### Before and after, in the guest
+
+vk-smoke `--repeat 40`, medians of the 39 warm submits and the 40 empty ones,
+in ms. "Before" is `82357a9`, "after" is this change, both on one guest
+image. "At P0" is the after build with the host GPU held in P0 by a native
+process. The native column is the same binary on the host.
+
+| check | native wall / timestamps | before: wall / timestamps / empty | after: wall / timestamps / empty | after, at P0: wall / timestamps / empty |
+|---|---|---|---|---|
+| 4 transfer | 0.083 / 0.016 | 1.873 / 0.052 / 0.776 | **0.430** / 0.050 / **0.450** | 0.382 / 0.015 / 0.152 |
+| 5 compute (type 3) | 0.386 / 0.322 | 2.995 / 1.261 / 1.002 | **2.599** / 1.261 / **0.431** | 0.648 / 0.322 / 0.142 |
+| 5 compute (device-local) | 0.089 / 0.026 | 1.687 / 0.341 / 1.218 | **0.698** / 0.316 / **0.411** | 0.382 / 0.026 / 0.147 |
+| 5 4 MiB copy to type 3 | 0.386 / 0.323 | 2.464 / 1.275 / 0.664 | **1.605** / 1.264 / **0.381** | 0.622 / 0.322 / 0.102 |
+| 6 graphics | 0.108 / 0.034 | 0.678 / 0.097 / 0.662 | **0.394** / 0.098 / **0.372** | 0.380 / 0.029 / 0.162 |
+| 7 dynamic rendering | 0.099 / 0.029 | 0.700 / 0.097 / 0.669 | **0.372** / 0.097 / **0.372** | 0.383 / 0.028 / 0.349 |
+
+Runs with `--repeat 10` spread more: before, empty submits took 0.46–2.0 ms,
+and after, 0.37–0.94 ms. One after-run dispatched compute at 6.3 ms of
+timestamps in the middle of a P-state change.
+
+glmark2 on Zink over Venus, 800×600, each scene 10 s and run alone, as the
+desktop user under GNOME. Two runs of each build:
+
+| scene | before | after | after, GPU held at P0 |
+|---|---|---|---|
+| `build` | 175, 127 | **452, 457** | 537 |
+| `jellyfish` | 114, 138 | **412, 452** | 522 |
+| `--off-screen build` | 1320, 1475 | **2781, 2795** | 2740 |
+| `--off-screen jellyfish` | 1218, 1389 | **2741, 2712** | 2533 |
+| VMM CPU, on-screen / off-screen | 0.81–0.94 / 0.48–0.52 cores | 2.1–2.2 / 1.4 cores | 2.5 / 1.5 cores |
+
+CPU per frame fell on-screen, from 6–7 ms to about 5 ms. Apart from the
+VMM's own start, the GPU stays at P8/P5 through glmark2 (at most 825 MHz core
+and 810 MHz memory) both before and after.
+Holding P0 adds 15–18 % on screen and nothing off-screen, where the round
+trip still dominates.
+
+### What remains, and the design questions it answers
+
+- **The round trip is still about 0.37 ms against 0.07 ms native** (0.10–0.16 at
+  P0). With the worker yielding, the plateau is the guest's own fence wait.
+  Mesa's fence profile of `vn_relax` yields 15 times and then sleeps 160 µs
+  at a time (`vn_common.c:206-221`; the base is a constant, not an
+  environment variable), plus the exits of the ring doorbell. It is not the
+  renderer's to change.
+- **Which memory types the guest should get for resources it never maps**:
+  no change. Such resources already see only device-local types (the
+  vk-smoke image took type 1, and so did its device-local buffers). Mapped
+  memory is our imported pages, which cost the GPU nothing over the driver's
+  own system memory. The 12× between system memory and VRAM is the
+  application's choice, and it is the same natively. Type 5 (the BAR) stays
+  hidden as host-visible. The 2026-09-23 probe found it slow and unstable
+  for guest reads.
+- **Clocks** are the host driver's to decide. What we can do is give the
+  driver less idle time to read: every microsecond of round trip removed
+  makes the guest's work denser. A user can also set the NVIDIA "Power
+  management mode" to "Prefer maximum performance" for the VMM executable.
+  The P0 rows above are what that setting buys. It is not the renderer's to
+  set, and `entangled doctor` does not report it yet.
+- **Owed**: the Linux/KVM host was not re-measured. `HOST_SPIN` is zero
+  there and nothing changes, but vkr's 10 µs sleeps on a real Linux host
+  were not timed against a guest. The ring's other timed waits still have
+  Windows' granularity: a blocked ring's condition-variable wait, which a
+  doorbell normally ends, and the nested `vkWaitVirtqueueSeqnoMESA` wait's
+  1 ms sleeps, which Mesa never sends. Neither is on a path vk-smoke or
+  glmark2 takes.

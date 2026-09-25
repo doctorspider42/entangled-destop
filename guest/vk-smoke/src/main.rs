@@ -177,7 +177,7 @@ fn start_watchdog(limit: Duration) {
 
 const USAGE: &str =
     "usage: vk-smoke [--device-index N] [--allow-cpu] [--checks 3,5,6] [--timeout-secs N]
-                [--api-cap 1.2]
+                [--api-cap 1.2] [--repeat N]
 
   --device-index N   test physical device N (as listed in the '# device[N]' lines),
                      CPU devices included                 env VK_SMOKE_DEVICE_INDEX
@@ -189,7 +189,11 @@ const USAGE: &str =
                      that makes no progress for 2N+10 s   env VK_SMOKE_TIMEOUT_SECS
   --api-cap M.N      request at most Vulkan M.N (default 1.3), to take the 1.2 or 1.1
                      code paths (KHR extensions) on a newer device
-                                                          env VK_SMOKE_API_CAP";
+                                                          env VK_SMOKE_API_CAP
+  --repeat N         checks 4-7 submit their work N times (default 10) and then N
+                     empty command buffers; each is timed by wall clock and by
+                     GPU timestamps, the first apart from the warm rest
+                                                          env VK_SMOKE_REPEAT";
 
 fn parse_opts() -> Result<Opts, String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
@@ -198,6 +202,7 @@ fn parse_opts() -> Result<Opts, String> {
     let mut checks = env("VK_SMOKE_CHECKS");
     let mut timeout = env("VK_SMOKE_TIMEOUT_SECS");
     let mut api_cap = env("VK_SMOKE_API_CAP");
+    let mut repeat = env("VK_SMOKE_REPEAT");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| args.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -207,6 +212,7 @@ fn parse_opts() -> Result<Opts, String> {
             "--checks" => checks = Some(value("--checks")?),
             "--timeout-secs" => timeout = Some(value("--timeout-secs")?),
             "--api-cap" => api_cap = Some(value("--api-cap")?),
+            "--repeat" => repeat = Some(value("--repeat")?),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -249,8 +255,18 @@ fn parse_opts() -> Result<Opts, String> {
             parsed.ok_or_else(|| format!("bad --api-cap {v:?}, want MAJOR.MINOR like 1.2"))
         })
         .transpose()?;
+    let repeat = repeat
+        .map(|v| {
+            v.trim()
+                .parse::<u32>()
+                .map_err(|e| format!("bad repeat count {v:?}: {e}"))
+        })
+        .transpose()?
+        .unwrap_or(10)
+        .max(1);
     Ok(Opts {
         api_cap,
+        repeat,
         device_index,
         allow_cpu,
         timeout: Duration::from_secs(secs.max(1)),

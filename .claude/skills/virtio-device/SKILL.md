@@ -447,6 +447,24 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   none, until whichever cap comes first — 1 GiB, 3 GiB, the window's ranges. No budget absorbs that; the
   per-context shares are what keep such a client from taking everything from
   everyone else (ADR-0004, the capacity amendment).
+- **A timed wait on Windows is not the time it asks for.** A
+  `std::thread::sleep` of 10–160 µs lasts 0.35–0.6 ms there, and a
+  `Condvar::wait_timeout` of 1–5 ms lasts 15.6 ms (the system tick); on Linux
+  (WSL) both land within ~0.1 ms of the request. Anything that polls guest
+  memory on a latency path must yield, not sleep, for the window that
+  matters: the Venus ring worker yields for `venus::service::HOST_SPIN`
+  (2 ms on Windows, zero on Linux) after its last progress, and that alone
+  took an empty `vkQueueSubmit` round trip from 1.5–2 ms to 0.4 ms and
+  glmark2 on Zink from ~150 to ~450 FPS (ADR-0004, the GPU-time amendment of
+  2026-09-25). Put numbers on a host-side wait's real length before trusting
+  its backoff.
+- **Read GPU timestamps next to the GPU's P-state.** A native process gets
+  full clocks for ~2 s from its first device; a guest's device is a late
+  device in a long-lived VMM, and the RTX 2070 ran vk-smoke's sparse guest
+  work at P8 (300 MHz core, 405 MHz memory): 3–10× the native timestamps, all
+  of it clocks. `nvidia-smi --query-gpu=pstate,clocks.gr,clocks.mem
+  --format=csv -lms 50` on the host shows it; `host_vulkan::perf_tests`
+  measures every memory placement the renderer can give a guest.
 - **A host-mapped window has no pages of its own.** `SharedWindow::
   new_host_mapped` allocates nothing, so a Venus window's size costs
   guest-physical address space only; on Windows an untouched

@@ -63,6 +63,41 @@ check 7 (clear 0.6,0.4,0.2): red/green/blue/clear = 8362/8363/8363/40448 px, fnv
 | `--checks 3,5,6` | `VK_SMOKE_CHECKS` | run only these of 3..9 (1 and 2 always run) |
 | `--timeout-secs N` | `VK_SMOKE_TIMEOUT_SECS` | per-wait GPU timeout, default 10 s; a timeout is a FAIL and from then on nothing is destroyed (the GPU may still use it) |
 | `--api-cap 1.2` | `VK_SMOKE_API_CAP` | request at most that Vulkan version, so a 1.3 device takes the 1.2/1.1 paths (KHR extensions) the way a Venus guest reporting 1.2 does |
+| `--repeat N` | `VK_SMOKE_REPEAT` | checks 4–7 submit their work N times (default 10), then N empty command buffers; see "Timing" |
+
+## Timing
+
+Checks 4–7 time every submit two ways, and print both:
+
+```text
+GPU time 13.75 ms (first submit, wall; timestamps 0.126 ms); warm x9: wall 2.136 ms, timestamps 0.112 ms; empty submit x10: wall 1.921 ms
+```
+
+- **wall** is `vkQueueSubmit` to `vkWaitForFences` returning: submission, the
+  GPU, and the signal coming back. "GPU time" is the first submit's wall time,
+  as it always was. It is **not** GPU time: in a Venus guest every object the
+  check created just before — memory, buffers, pipelines — went to the host
+  without a reply, and the host creates them, compiling pipelines, before it
+  gets to the submit. So the first wall time includes the host's pipeline
+  compiles (a cold NVIDIA shader cache on a new VMM binary: 10–15 ms), and
+  only the warm ones (the median of the other N−1) measure a submit.
+- **timestamps** is `vkCmdWriteTimestamp` `TOP_OF_PIPE` before the work and
+  `BOTTOM_OF_PIPE` after it in the same command buffer: what the GPU spent.
+  The query pool exists when the queue family has `timestampValidBits`; the
+  `# timestamps:` line prints the family's bits and `timestampPeriod`.
+- **empty submit** is the round trip with no work: the latency floor.
+
+Check 5 also runs the dispatch into a **device-local** buffer and times a
+4 MiB copy from it into the host-visible one, which separates what the
+buffer's placement costs from what the dispatch costs. Checks 6 and 7 print
+the memory types of the image, the vertex buffer and the readback buffer.
+
+A GPU's clocks change the timestamps several-fold. A native process gets
+full clocks for about two seconds from creating its device; a guest's device
+is created inside a VMM that has had its own for a long time, and an RTX 2070
+runs a guest's sparse work at idle clocks (P8, 300 MHz core, 405 MHz memory)
+where the native run gets P0. `nvidia-smi --query-gpu=pstate,clocks.gr,clocks.mem
+--format=csv -lms 50` on the host shows which (ADR-0004, 2026-09-25).
 
 A watchdog ends any check that makes no progress for `2 × timeout + 10 s`
 (`vkQueueWaitIdle` has no timeout of its own, and a broken renderer can block
