@@ -4,6 +4,15 @@
 //! uploads only the dirty rect of the scanout mirror and draws it into the
 //! letterboxed viewport with a full-screen triangle; the letterbox bars are the
 //! attachment's black clear color.
+//!
+//! When the scanout is a renderer's shared image (ADR-0004, zero-copy
+//! presentation, [`crate::shared`]) the frame instead samples the shared
+//! presenter's texture — already on this device, copied there on the GPU —
+//! and the cursor plane is drawn over it by the GPU ([`CursorOverlay`]),
+//! since no CPU mirror holds the pixels beneath it. Shared presentation needs
+//! wgpu's **Vulkan** backend, so a window asked for it
+//! ([`crate::DisplayHost::with_shared_scanout`]) tries that backend first and
+//! falls back to the usual order, and the copy path, if it cannot.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +20,9 @@ use std::time::{Duration, Instant};
 use virtio_gpu::BYTES_PER_PIXEL;
 use winit::window::Window;
 
+use crate::present::{CursorOverlay, ImagePipeline};
 use crate::scanout::Scanout;
+use crate::shared::{SharedSlot, SharedTexture};
 use crate::{DisplayError, Viewport};
 
 /// Renderer counters for the periodic diagnostics event (backlog MVP-708).
@@ -29,6 +40,9 @@ pub struct FrameStats {
     pub texture_allocations: u64,
     /// Surface reconfigurations after `Lost`/`Outdated`.
     pub surface_recoveries: u64,
+    /// Frames drawn from a renderer's shared image rather than the mirror
+    /// (ADR-0004, zero-copy presentation).
+    pub shared_frames: u64,
 }
 
 /// Logs FPS and copy statistics once per second (backlog MVP-708).
@@ -62,8 +76,12 @@ impl StatsReporter {
         let bytes = stats
             .bytes_uploaded
             .saturating_sub(self.previous.bytes_uploaded);
+        let shared = stats
+            .shared_frames
+            .saturating_sub(self.previous.shared_frames);
         tracing::info!(
             fps = format_args!("{:.1}", frames as f64 / secs),
+            shared_fps = format_args!("{:.1}", shared as f64 / secs),
             uploads_per_s = format_args!("{:.1}", uploads as f64 / secs),
             upload_mib_per_s = format_args!("{:.2}", bytes as f64 / secs / (1024.0 * 1024.0)),
             skipped = stats.skipped.saturating_sub(self.previous.skipped),
@@ -87,11 +105,14 @@ pub(crate) struct Renderer {
     config: wgpu::SurfaceConfiguration,
     /// False while the window is zero-sized: no surface, nothing to present.
     configured: bool,
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+    image: ImagePipeline,
+    cursor: CursorOverlay,
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    /// The shared presenter's texture this frame draws, and the bind group
+    /// sampling it (rebuilt when its generation changes); `None` while the
+    /// mirror is what the scanout shows.
+    shared: Option<(SharedTexture, wgpu::BindGroup)>,
     /// Size of the currently allocated scanout texture.
     texture_size: (u32, u32),
     /// Scanout generation the texture was allocated for.
@@ -104,17 +125,26 @@ impl Renderer {
     ///
     /// Blocking on adapter/device creation happens here, at init time, and never
     /// again — the event loop must not block on GPU or guest state.
+    ///
+    /// With `shared`, the window prefers the Vulkan backend and, when it gets
+    /// a device that can import a renderer's scanout buffers, installs its
+    /// shared presenter in the slot (ADR-0004, zero-copy presentation).
     pub(crate) fn new(
         window: Arc<Window>,
         guest_w: u32,
         guest_h: u32,
+        shared: Option<&SharedSlot>,
     ) -> Result<Self, DisplayError> {
         let Gpu {
             surface,
             adapter,
             device,
             queue,
-        } = init_gpu(&window)?;
+            shareable,
+        } = init_gpu(&window, shared.is_some())?;
+        if let Some(slot) = shared {
+            install_presenter(slot, shareable, &device, &queue);
+        }
 
         let caps = surface.get_capabilities(&adapter);
         let format = pick_surface_format(&caps).ok_or(DisplayError::UnsupportedSurface)?;
@@ -135,72 +165,15 @@ impl Renderer {
             view_formats: Vec::new(),
         };
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("present.wgsl"));
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("scanout-bind-group-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("scanout-pipeline-layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("scanout-present"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-            cache: None,
-        });
         // Linear filtering so a scaled scanout is smooth (MVP-705).
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("scanout-sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
+        let image = ImagePipeline::new(&device, format, wgpu::FilterMode::Linear);
+        let cursor = CursorOverlay::new(&device, format);
 
         let texture = create_scanout_texture(&device, guest_w, guest_h);
-        let bind_group = create_bind_group(&device, &bind_group_layout, &texture, &sampler);
+        let bind_group = image.bind(
+            &device,
+            &texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        );
 
         let mut renderer = Self {
             surface,
@@ -209,11 +182,11 @@ impl Renderer {
             queue,
             config,
             configured: false,
-            pipeline,
-            bind_group_layout,
-            sampler,
+            image,
+            cursor,
             texture,
             bind_group,
+            shared: None,
             texture_size: (guest_w, guest_h),
             generation: 0,
             stats: FrameStats {
@@ -265,10 +238,38 @@ impl Renderer {
         self.configured = true;
     }
 
+    /// Chooses what the next frame draws: the shared presenter's texture when
+    /// it is what the scanout shows (and then the cursor plane is drawn over
+    /// it by the GPU), else the mirror. The mirror's texture is kept up to date
+    /// either way ([`Self::upload`]), so switching back shows no stale rect.
+    pub(crate) fn prepare(&mut self, scanout: &mut Scanout, shared: Option<SharedTexture>) {
+        let shared = shared.filter(|s| s.size == scanout.size());
+        self.upload(scanout, shared.is_none());
+        let Some(texture) = shared else {
+            self.shared = None;
+            return;
+        };
+        let rebuilt = match self.shared.take() {
+            Some((old, bind)) if old.generation == texture.generation => (texture, bind),
+            _ => {
+                let bind = self.image.bind(&self.device, &texture.view);
+                (texture, bind)
+            }
+        };
+        self.shared = Some(rebuilt);
+        self.cursor.prepare(
+            &self.device,
+            &self.queue,
+            scanout.cursor_image(),
+            scanout.size(),
+        );
+    }
+
     /// Uploads the scanout's dirty rect into the texture, reallocating first if
-    /// the guest changed resolution (backlog MVP-703/704), then paints the
-    /// cursor plane over it (MVP-812).
-    pub(crate) fn upload(&mut self, scanout: &mut Scanout) {
+    /// the guest changed resolution (backlog MVP-703/704), then — when
+    /// `with_cursor`, i.e. the mirror is what is drawn — paints the cursor
+    /// plane over it (MVP-812).
+    pub(crate) fn upload(&mut self, scanout: &mut Scanout, with_cursor: bool) {
         let (guest_w, guest_h) = scanout.size();
         if scanout.generation() != self.generation || (guest_w, guest_h) != self.texture_size {
             if !self.reallocate_texture(guest_w, guest_h) {
@@ -321,6 +322,9 @@ impl Renderer {
         // case and typically 16 KiB, orders below one base frame. The mirror
         // marks the vacated area dirty on every cursor change, which is what
         // restores the base pixels underneath.
+        if !with_cursor {
+            return;
+        }
         if let Some((rect, pixels)) = scanout.cursor_overlay() {
             if !rect.fits_within(self.texture_size.0, self.texture_size.1) {
                 return;
@@ -368,11 +372,11 @@ impl Renderer {
             return false;
         }
         self.texture = create_scanout_texture(&self.device, width, height);
-        self.bind_group = create_bind_group(
+        self.bind_group = self.image.bind(
             &self.device,
-            &self.bind_group_layout,
-            &self.texture,
-            &self.sampler,
+            &self
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default()),
         );
         self.texture_size = (width, height);
         self.stats.texture_allocations += 1;
@@ -387,9 +391,11 @@ impl Renderer {
             self.stats.skipped += 1;
             return Ok(());
         }
+        let shared = u64::from(self.shared.is_some());
         match self.frame(viewport) {
             Ok(()) => {
                 self.stats.frames += 1;
+                self.stats.shared_frames += shared;
                 Ok(())
             }
             Err(err @ (wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated)) => {
@@ -398,6 +404,7 @@ impl Renderer {
                 match self.frame(viewport) {
                     Ok(()) => {
                         self.stats.frames += 1;
+                        self.stats.shared_frames += shared;
                         Ok(())
                     }
                     Err(err) => {
@@ -461,9 +468,17 @@ impl Renderer {
                     1.0,
                 );
                 pass.set_scissor_rect(viewport.x, viewport.y, width, height);
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_pipeline(&self.image.pipeline);
+                match &self.shared {
+                    Some((_, bind)) => pass.set_bind_group(0, bind, &[]),
+                    None => pass.set_bind_group(0, &self.bind_group, &[]),
+                }
                 pass.draw(0..3, 0..1);
+                if self.shared.is_some() {
+                    // No CPU mirror holds the pixels under the cursor: the GPU
+                    // draws it over the shared frame.
+                    self.cursor.draw(&mut pass);
+                }
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -478,6 +493,35 @@ struct Gpu {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Whether the device was opened to import a renderer's scanout buffers
+    /// (ADR-0004, zero-copy presentation).
+    shareable: bool,
+}
+
+/// Installs the window's shared presenter in `slot` when its device can be
+/// one, and says either way.
+fn install_presenter(
+    slot: &SharedSlot,
+    shareable: bool,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    if !shareable {
+        tracing::info!(
+            "the window's GPU cannot import the renderer's scanout buffers; every frame of \
+             the GPU desktop is read back and uploaded (the copy path)"
+        );
+        return;
+    }
+    #[cfg(windows)]
+    match crate::gpu_scanout::GpuScanout::new(device.clone(), queue.clone()) {
+        Ok(presenter) => slot.set(Some(Arc::new(presenter))),
+        Err(why) => {
+            tracing::warn!(%why, "no shared presenter; the GPU desktop takes the copy path")
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (slot, device, queue);
 }
 
 /// Brings up a backend for `window`.
@@ -487,17 +531,32 @@ struct Gpu {
 /// advertises itself first and then loses its device on creation, so "the
 /// adapter exists" is not enough — a backend counts as usable only once a
 /// device came out of it.
-fn init_gpu(window: &Arc<Window>) -> Result<Gpu, DisplayError> {
+///
+/// `shared` (a renderer that can hand the window its scanout buffers, ADR-0004)
+/// puts a shareable **Vulkan** device first on Windows — a DX12 device cannot
+/// import a Vulkan `OPAQUE_WIN32` allocation — and if that fails, the usual
+/// order follows and the GPU desktop takes the copy path. A `WGPU_BACKEND`
+/// the user set still wins; a Vulkan one is opened shareable too.
+fn init_gpu(window: &Arc<Window>, shared: bool) -> Result<Gpu, DisplayError> {
+    let shared = shared && cfg!(windows);
     let attempts = match wgpu::Backends::from_env() {
-        Some(mask) => vec![mask],
-        None => vec![wgpu::Backends::PRIMARY, wgpu::Backends::SECONDARY],
+        Some(mask) => vec![(mask, shared && mask.contains(wgpu::Backends::VULKAN))],
+        None if shared => vec![
+            (wgpu::Backends::VULKAN, true),
+            (wgpu::Backends::PRIMARY, false),
+            (wgpu::Backends::SECONDARY, false),
+        ],
+        None => vec![
+            (wgpu::Backends::PRIMARY, false),
+            (wgpu::Backends::SECONDARY, false),
+        ],
     };
     let mut last = None;
-    for backends in attempts {
-        match init_backend(window, backends) {
+    for (backends, shareable) in attempts {
+        match init_backend(window, backends, shareable) {
             Ok(gpu) => return Ok(gpu),
             Err(err) => {
-                tracing::warn!(?backends, %err, "backend unusable; trying the next one");
+                tracing::warn!(?backends, shareable, %err, "backend unusable; trying the next one");
                 last = Some(err);
             }
         }
@@ -505,7 +564,34 @@ fn init_gpu(window: &Arc<Window>) -> Result<Gpu, DisplayError> {
     Err(last.unwrap_or(DisplayError::UnsupportedSurface))
 }
 
-fn init_backend(window: &Arc<Window>, backends: wgpu::Backends) -> Result<Gpu, DisplayError> {
+/// The device of `adapter`: a shareable one (see [`init_gpu`]) when asked and
+/// possible, else wgpu's ordinary one. `Err` only for a shareable device that
+/// could not be had, so [`init_gpu`] moves on to the next backend.
+fn request_device(
+    adapter: &wgpu::Adapter,
+    shareable: bool,
+) -> Result<(wgpu::Device, wgpu::Queue), DisplayError> {
+    #[cfg(windows)]
+    if shareable {
+        return crate::gpu_scanout::request_device(adapter, "entangled-display")
+            .map_err(DisplayError::SharedDevice);
+    }
+    let _ = shareable;
+    Ok(pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("entangled-display"),
+            required_features: wgpu::Features::empty(),
+            required_limits: adapter.limits(),
+            ..Default::default()
+        },
+    ))?)
+}
+
+fn init_backend(
+    window: &Arc<Window>,
+    backends: wgpu::Backends,
+    shareable: bool,
+) -> Result<Gpu, DisplayError> {
     let mut descriptor = wgpu::InstanceDescriptor::from_env_or_default();
     descriptor.backends = backends;
     let instance = wgpu::Instance::new(&descriptor);
@@ -526,12 +612,7 @@ fn init_backend(window: &Arc<Window>, backends: wgpu::Backends) -> Result<Gpu, D
     };
     let info = adapter.get_info();
 
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("entangled-display"),
-        required_features: wgpu::Features::empty(),
-        required_limits: adapter.limits(),
-        ..Default::default()
-    }))?;
+    let (device, queue) = request_device(&adapter, shareable)?;
     // A validation error on a guest-driven copy must not abort the host.
     device.on_uncaptured_error(Box::new(|err| {
         tracing::error!(%err, "wgpu reported an uncaptured error");
@@ -543,6 +624,7 @@ fn init_backend(window: &Arc<Window>, backends: wgpu::Backends) -> Result<Gpu, D
         device_type = ?info.device_type,
         driver = %info.driver,
         driver_info = %info.driver_info,
+        shareable,
         "wgpu adapter selected"
     );
     if info.device_type == wgpu::DeviceType::Cpu {
@@ -553,6 +635,7 @@ fn init_backend(window: &Arc<Window>, backends: wgpu::Backends) -> Result<Gpu, D
         adapter,
         device,
         queue,
+        shareable,
     })
 }
 
@@ -574,29 +657,6 @@ fn create_scanout_texture(device: &wgpu::Device, width: u32, height: u32) -> wgp
             | wgpu::TextureUsages::COPY_DST
             | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
-    })
-}
-
-fn create_bind_group(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    texture: &wgpu::Texture,
-    sampler: &wgpu::Sampler,
-) -> wgpu::BindGroup {
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("scanout-bind-group"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
     })
 }
 

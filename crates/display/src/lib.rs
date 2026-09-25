@@ -24,6 +24,9 @@
 //!   initial geometry (EPIC 15).
 //! - [`scanout`]: the CPU-side BGRA mirror, dirty rects and PNG screenshots.
 //! - `renderer` (private): the `wgpu` surface, scanout texture and pipeline.
+//! - [`shared`]: presenting a renderer's scanout image without reading it back
+//!   (ADR-0004, zero-copy presentation) — on Windows, `gpu_scanout` imports it
+//!   onto the display's own Vulkan device and copies each frame on the GPU.
 //! - [`input`]: winit events → [`virtio_input::InputEvent`] batches, plus the
 //!   grab state machine and reserved shortcuts.
 //! - [`keymap`]: winit physical key → Linux `KEY_*` table (MVP-902).
@@ -75,12 +78,16 @@
 #![deny(missing_docs)]
 
 mod error;
+#[cfg(windows)]
+mod gpu_scanout;
 mod handle;
 mod host;
 pub mod input;
 pub mod keymap;
+mod present;
 mod renderer;
 pub mod scanout;
+pub mod shared;
 mod sync;
 pub mod ux;
 pub mod viewport;
@@ -90,9 +97,17 @@ pub use handle::DisplayHandle;
 pub use host::DisplayHost;
 pub use input::{ControlEvent, ControlQueue, InputCapture, InputQueue, KeyOutcome, WindowAction};
 pub use renderer::FrameStats;
-pub use scanout::{Scanout, ScanoutStats, SharedScanout};
+pub use scanout::{CursorImage, Scanout, ScanoutStats, SharedScanout};
+pub use shared::{SharedSlot, SharedStats};
 pub use ux::{viewport_for, ScaleMode, WindowStatus};
 pub use viewport::{letterbox, DisplayConfig, Viewport};
+
+/// The `virtio-gpu` this crate was built against, by name — for the one place
+/// that needs it spelled out: `virtio-gpu`'s own real-GPU tests, which drive
+/// a `DisplayHandle` from inside that crate's test build, where their
+/// `crate::` types are a second copy of these (a dev-dependency cycle).
+#[doc(hidden)]
+pub use virtio_gpu;
 
 /// Upper bound on one scanout, shared with `virtio-gpu`'s resource limit: a
 /// guest cannot make the host allocate an absurd framebuffer.

@@ -4992,3 +4992,378 @@ trip still dominates.
   doorbell normally ends, and the nested `vkWaitVirtqueueSeqnoMESA` wait's
   1 ms sleeps, which Mesa never sends. Neither is on a path vk-smoke or
   glmark2 takes.
+
+## Amendment, 2026-09-25 — zero-copy presentation: the display takes the scanout on its own GPU
+
+Until now every flip of the GPU-composited desktop went through the CPU three
+times. The renderer's scanout device copied the handle blob's image into
+host-private staging pages and waited for it; the device copied those pages
+into its flush buffer and then into the display's CPU mirror; and the window
+uploaded the mirror into a texture with `write_texture`. In the guest that was
+about 4 ms of the device's queue worker per 1080p flip (measured below), all
+of it on the path every other virtio-gpu command waits behind.
+
+The frames are on the host GPU already, in exportable device-local memory the
+display's own GPU can import (the 2026-09-16 amendment measured that path end
+to end in a probe). This stage builds it. When the scanout is a handle blob on
+a Windows host, the device hands the display **the image itself**, and the
+display copies the flip's damage **on its own GPU** into a texture it samples.
+There is no readback, no CPU copy and no upload, and the device's worker no
+longer waits for the GPU. Every other scanout keeps the copy path: 2D
+resources, guest-memory blobs, page blobs, Linux hosts, a display without a
+shareable GPU, and any refusal or failure along the way.
+
+```text
+ RESOURCE_FLUSH of a handle blob (device queue worker)
+   Renderer3d::begin_shared_scanout ──▶ SharedScanoutLease
+       claim of the payload as Owner::Presenter (executor::writes)
+   ScanoutSink::present_shared(frame, lease)            display (Windows)
+       import once per image (duplicated NT handle, canonical image)
+       one command buffer on the display's wgpu Vulkan queue:
+         acquire from FOREIGN ─ vkCmdCopyImage(damage) ─ release to FOREIGN
+       submit; return Presented                  ◀── ~0.12 ms per flip
+   retirer thread: copy done on the GPU ─▶ lease dropped ─▶ claim ends
+ window thread: samples the display's texture (+ the cursor plane)
+```
+
+### The design points, decided
+
+**1. The interface is new and additive.** `Renderer3d::begin_shared_scanout(resource_id)
+-> Result<Option<SharedScanoutLease>, CommandError>` defaults to `Ok(None)`.
+On the sink side, `ScanoutSink::accepts_shared_scanout`, `present_shared(frame,
+lease) -> SharedPresent` and `forget_shared(resource)` default to "never",
+"declined for good" and "nothing". So every other renderer and sink is the copy
+path without a line changed. The portable types are in `virtio_gpu::shared`:
+
+- `SharedScanoutImage` holds the handle, the export's `allocationSize` and
+  `memoryTypeIndex`, the exporting GPU's `deviceUUID`/`driverUUID`, and the
+  canonical create info (`SharedImageInfo`: format, flags, view-format list,
+  usage superset, extent — `CanonicalImage` field for field). The handle is
+  an `ExternalHandle`: an owned NT handle, which on Windows is a
+  `DuplicateHandle` of the renderer's own, so the two handles' lifetimes are
+  independent. Each image has a process-unique `serial`, which is what an
+  importer caches by. The renderer makes one per accepted layout of a blob, at
+  its first shared present, and hands it out by `Arc` on every flip.
+- `SharedScanoutLease` is the image, the guest's last recorded release
+  (layout and family, stage S2b), and the renderer's **claim**. The claim is
+  ended when the lease is dropped.
+- `SharedScanoutFrame` is the image plus the visible region and the damage,
+  both in framebuffer coordinates. `SharedPresent` is `Presented`,
+  `Declined { retry }` or `Failed`.
+
+`Renderer3d::export_scanout` stays as it was: dma-buf-shaped and never
+called. It is the seam for a Linux host with a DRM node, whose importer needs a
+fourcc and a modifier. An opaque Vulkan import needs none of those. It needs
+the exact create info, the allocation's size and type, the GPU's identity,
+queue-family ownership, and a claim against guest GPU work. Folding one into
+the other would have changed a signature for no caller. A Linux `OPAQUE_FD`
+path, when there is one, fits the new shape (`ExternalHandle` gains a unix
+payload).
+
+The display matches the adapter before it imports anything
+(`display::shared::judge`). Another GPU or driver is `Declined { retry: false }`,
+and the device stops asking until the next reset. Every other doubt is declined
+*for now* and the copy path serves that flush: a handle type it does not know,
+a non-BGRA format, an image past `maxImageDimension2D`, a visible region or
+damage outside the image, a release it will not acquire from, an import that
+failed (remembered by serial). A frame whose image is not the framebuffer the
+guest declared never reaches the display: the device checks that first.
+
+**2. The display runs on wgpu's Vulkan backend exactly when it can share.**
+A DX12 device cannot import a Vulkan `OPAQUE_WIN32` allocation. So
+`DisplayHost::with_shared_scanout(true)` — which `entangled run` sets when the
+GPU plan is the Venus executor on Windows — makes the window try
+`Backends::VULKAN` first. It opens the device through wgpu-hal's
+`open_with_callback`, with `Features::VULKAN_EXTERNAL_MEMORY_WIN32` and one
+extension added, `VK_EXT_queue_family_foreign`: the guest releases every
+scanout buffer to `FOREIGN`, and acquiring from that family needs it. wgpu
+enables neither by itself. The device is wrapped with
+`Adapter::create_device_from_hal`. If any of that fails, the old order follows
+(`PRIMARY`, then `SECONDARY`) with a warning, and the GPU desktop takes the
+copy path. A 2D-only VM, a virgl VM or a Linux host is unchanged: the default
+backend order is untouched, so nothing there needs measuring. A `WGPU_BACKEND`
+the user set still wins, and a Vulkan one is opened shareable. A headless VM
+gets an off-screen presenter of its own (`DisplayHandle::attach_offscreen_gpu`).
+It opens a Vulkan device the same way, with no surface, so `--headless` runs
+exercise the same path as a window does (the headline measurements below
+are headless; the windowed ones follow). `ENTANGLED_SCANOUT_PATH=copy` turns the whole thing off. That is the
+A/B switch and the escape hatch.
+
+**3. Ownership and ordering: the display copies, it does not sample in place.**
+Sampling the imported image directly was the plan, and it is not what was
+built. The reason is wgpu's tracker. `create_texture_from_hal` registers a
+texture in the `UNINITIALIZED` state, and wgpu's first use of it records a
+barrier from `VK_IMAGE_LAYOUT_UNDEFINED`, which lets the driver discard the
+contents. That happens on the guest's image, while the guest's queue family
+still owns it. There is no public way to tell wgpu that a texture is already
+in a layout. So the image the guest renders into is never a wgpu texture.
+The display owns a plain wgpu texture of the scanout's size. It is cleared
+and moved to wgpu's `RESOURCE` state once, when it is made. Each flip copies
+into it with raw commands recorded into a wgpu encoder
+(`CommandEncoder::as_hal_mut`), so wgpu's own submission order holds. On one
+command buffer:
+
+| | image | `src` family | `dst` family | `oldLayout` | `newLayout` | access |
+|---|---|---|---|---|---|---|
+| acquire | the guest's | the release's (`FOREIGN`) | the display's | the release's `L` | `L` if `GENERAL`/`TRANSFER_SRC`, else `TRANSFER_SRC` | 0 → `TRANSFER_READ` |
+| out of `RESOURCE` | the display's | — | — | `SHADER_READ_ONLY` | `TRANSFER_DST` | `MEMORY_WRITE` → `TRANSFER_WRITE` |
+| `vkCmdCopyImage` of the damage (the whole visible region into a texture that does not hold the frame before) | | | | | | |
+| release | the guest's | the display's | the release's | the copy layout | `L` | 0 → 0 |
+| back to `RESOURCE` | the display's | — | — | `TRANSFER_DST` | `SHADER_READ_ONLY` | `TRANSFER_WRITE` → `SHADER_READ \| TRANSFER_READ` |
+
+The first barrier pair is `ALL_COMMANDS → TRANSFER`, the second
+`TRANSFER → ALL_COMMANDS`. The guest image's barriers are the renderer's
+scanout device's exactly, and they already had a real-GPU test behind them.
+The display texture's invariant is that wgpu only ever uses it as `RESOURCE`
+(sampling, and the screenshot's draw), and every raw copy leaves it in
+`SHADER_READ_ONLY_OPTIMAL`. So wgpu records no barrier on it and never
+disagrees with the real layout. Because the copy and the window's draws are on
+one queue, a draw sees either the whole previous frame or the whole new one,
+never half a copy.
+
+Why this is correct against the guest:
+
+- **Before the copy.** `begin_shared_scanout` claims the payload in the
+  shared-payload table of `executor::writes`, as a new owner,
+  `Owner::Presenter`. Every guest submission touching the buffer must have
+  finished on the host GPU first. The wait is bounded by `SCANOUT_WAIT`
+  (100 ms), and past it the flush fails in band, as the readback's does.
+  Mutter flips only frames whose fence has signalled, so in the guest this
+  wait finds nothing running (as the tear amendment measured for the
+  readback).
+- **During the copy.** The claim is held until the copy has **finished on
+  the GPU**. Any guest submission touching the buffer meanwhile waits for it
+  (bounded by `SHARED_WAIT`, then unordered and counted, exactly as for any
+  other owner). So the guest's next acquire from `FOREIGN` never overtakes the
+  display's release.
+- **Why a new owner.** The presenter's claim outlives the flush. The scanout
+  device's reads are synchronous and complete their touch at once. With one
+  owner and one watermark progress, a readback of another buffer would mark
+  the presenter's outstanding copy complete. With two, each completes only its
+  own, and a readback of the same buffer waits for the presenter's copy, as it
+  must.
+- **After the copy.** The guest's buffer is free again after the copy. It is
+  never held for the window's frame: the window samples the display's own
+  texture. A compositor that re-renders into a buffer the moment it has
+  flipped away from it therefore never waits for the host's vsync.
+
+**The worker does not wait for the GPU.** The first version waited, bounded,
+for each copy before returning. The copy itself is tens of microseconds on an
+idle GPU (0.2 ms per flush in the real-GPU test). In the guest, though, it
+queues behind the desktop's own GPU work at the idle clocks that work leaves
+the RTX 2070 at (the previous amendment), and that took 1.2–2.9 ms per flush
+(`zc1` below). Now `present_shared` takes the lease by value and returns once
+the copy is **submitted**. The lease goes to the presenter's **retirer**, a
+thread that polls wgpu while a copy is outstanding and drops each lease, in
+submission order, once its copy has finished. It never makes a blocking wait:
+wgpu-core holds its fence lock across one, which would stall every submit,
+the window's included. It polls every 250 µs, which Windows makes about half a
+millisecond. A lease is only ever wanted back a frame later. The bounds are
+kept:
+
+- A copy not finished within `COPY_WAIT` (100 ms) has its lease dropped anyway,
+  with a warning, counted `abandoned`. That is the readback's own behaviour on
+  a timeout.
+- A present that finds such a copy, or `MAX_IN_FLIGHT` (8) outstanding,
+  fails in band.
+- Destroying an import waits out whatever is outstanding first. That is the
+  one blocking wait, and it is rare: an unref, an eviction, the presenter
+  going away.
+
+The retirer touches no guest memory. It only ends claims, which are host
+state. So it owes no `Quiesce`.
+
+**4. Lifetimes.** Imports are cached by serial, at most `MAX_SHARED_IMPORTS`
+(4), least recently presented first out. A new layout of the same resource
+replaces its old import. The device calls `forget_shared` on `RESOURCE_UNREF`
+of a blob, on a disabled scanout (`SET_SCANOUT`/`SET_SCANOUT_BLOB` with
+resource 0), on a device reset and on a lost renderer (GPU-012). What the
+window shows is the display's own texture, so it survives all four: a paused
+or reset VM keeps its last frame. The duplicated handle lives in the image,
+whose `Arc` the lease holds only until its copy has run. An NT-handle import
+takes no ownership and references the payload itself, so the display's
+imports are independent of the blob, the handle and the exporting context.
+ADR-0005: presents run inside the device's gated queue worker, and a handle
+blob is host GPU memory, not guest memory. So pausing needs nothing new, and
+the window of a paused VM keeps showing its texture. ADR-0006: a handle blob
+already refuses a snapshot by name. Nothing new is saved, and a restored
+guest's first flip after its driver restarts goes shared again. The device's
+refusal state (`shared_declined`) and "the mirror is stale" state
+(`shared_active`) both reset with the device.
+
+The mirror becomes stale when frames go shared. The display shows whichever
+source was updated last. A mirror update or a mode change makes the mirror
+current again and deactivates the shared texture. A shared present makes the
+texture current. Two rules keep the switch from showing stale pixels:
+
+- The first shared present into a texture that is not current copies the whole
+  visible region.
+- The first copy-path flush after a shared present reads the whole visible
+  region back, not just the damage (`GpuDevice::shared_active`).
+
+**5. Screenshots are what the window draws.** With a shared frame shown,
+`--screenshot`/`--screenshot-every` (`DisplayHandle::screenshot_png`, and the
+new `screenshot_bgra`) draw the display's texture into an off-screen
+`Bgra8Unorm` target through the window's own image pipeline (`present.wgsl`,
+nearest sampling at 1:1) and read it back. The hardware cursor is then
+composited over it on the CPU from the mirror's cursor plane, as it is over
+the mirror (`Scanout::with_base`). In the window the cursor plane is drawn by
+the GPU over a shared frame (`cursor.wgsl`: one premultiplied source-over
+quad), because no CPU mirror holds the pixels beneath it. Over the mirror it
+is composited on the CPU as before.
+
+**6. Pacing.** The device's pacing report gains `shared`: how many of the
+window's flushes the display took (the log line and `--frame-stats` both carry
+it). `service` stays the device's own time per flush. For a shared flush that
+is the claim, the lease and the submit. GPU completion is reported by the
+presenter itself, every 600 presents (`display: shared scanout statistics`):
+submit time, submit-to-retired time (`gpu_mean_ms`), full copies, imports,
+refusals, failures and abandoned copies. The window's own statistics gain
+`shared_fps`.
+
+### Tests
+
+- `virtio_gpu::shared`: the switch's spellings, a lease ends its claim exactly
+  once, serials never repeat, placeholders name nothing.
+- `tests/gpu_blob.rs` (`renderer_blob_scanout`, a fake renderer and a fake
+  presenter, portable):
+  - a shared flip is handed over with the visible region and damage in
+    framebuffer coordinates while the claim is held, and is never read back
+    (the mirror is not written, and the screenshot is the presenter's);
+  - declined for now takes the copy path for one flush; declined for good stops
+    the asking until a reset; failed fails in band; the first copy-path flush
+    after shared presents reads the whole visible region;
+  - no presenter means no lease is asked, and a lease whose image is not the
+    framebuffer is read back instead;
+  - imports are forgotten on unref, disable and reset;
+  - the claim ends when the display drops the lease, not when the flush is
+    answered.
+- `executor::order_tests` (fake host):
+  - the lease carries the canonical image, the export's size, type and GPU and
+    Zink's release, and is the presenter's running touch;
+  - a guest submission touching the buffer waits for it until the bound, and
+    goes ahead as soon as it is dropped;
+  - a readback of the same buffer meanwhile waits for it and does not end it;
+  - a lease over a frame still running on the GPU fails within the bound and
+    claims nothing;
+  - one shared image per accepted layout, and none after `destroy_blob`.
+- `display::shared`, `display::present`, `display::handle`:
+  - the release-layout rule (the scanout device's, verbatim), and every
+    `judge` refusal and its permanence;
+  - the copy region (damage when current, the visible region otherwise,
+    panned scanouts) and the cursor quad's clip-space mapping;
+  - the slot shared by every handle clone, and "the last update decides"
+    across mirror updates, mode changes and screenshots (the cursor
+    composited over a shared frame).
+- `run_vm`: only the Venus executor on Windows shares, and `copy` turns it off.
+- Real GPU, `host_vulkan::pipeline_tests::a_handle_blob_flip_is_presented_by_the_displays_own_gpu_exactly`
+  (Windows, self-skipping). Context 1 exports a 256×256 LINEAR BGRA8 scanout
+  buffer, renders vk-smoke's check-6 triangle and releases it to `FOREIGN` as
+  Zink does. The renderer leases it, and an off-screen display presenter
+  imports the duplicated handle onto its own wgpu Vulkan device, acquires,
+  copies and releases. The screenshot samples the display's texture into an
+  off-screen target and reads it back. The result is `256x256 exact, 6 probes
+  ok`, BGRA `fnv1a=0x9a880db295ee1483` (vk-smoke's `0x2678f2a0e39fba1b` in
+  RGBA).
+  - The guest then re-acquires the buffer from `FOREIGN`, which proves the
+    display's release consistent, and draws check 7's clear: the second
+    present shows exactly that (`0xd79d631c4d62403b`).
+  - A third frame with a 17×9 damage rect changes exactly those pixels.
+  - After unref and teardown, the display still shows its own copy.
+  - At 1080p, back to back in one process on an idle GPU, the median per
+    flush is a shared present 0.150 ms and a copy-path readback 1.611 ms.
+    A 480×270 damage shared present is 0.148 ms. This is a debug build.
+
+### Measured in the guest
+
+Ubuntu 26.04, GNOME 50 composited on the RTX 2070 through Zink, WHP, headless
+(the off-screen presenter), release build `entangled-zc.exe`, one boot per run,
+`ENTANGLED_SCANOUT_PATH` the only difference. Each run is an idle desktop (15 s),
+glmark2 `build` and `jellyfish` on screen (10 s each, 800×600), then vkcube and
+glmark2 `jellyfish` together for 60 s under `--screenshot-every 1000`. The
+per-flush times are the device's pacing windows (`service`, mean of every
+120-flip window) with the desktop at 60 Hz. GNOME damages the whole 1080p
+frame on every flip. `zc1` is the first, synchronous version (the worker
+waited for the copy), kept for the argument above.
+
+Headless (the off-screen presenter; `service` = the device's mean per-flush
+time, glmark2 `build` / `jellyfish` / the minute over vkcube; CPU = cores of
+the VMM process over the same phases):
+
+| run | path | per-flip host time, ms | desktop fps (median) | glmark2 `build` / `jellyfish` | glmark2 over vkcube (6 × 10 s) | VMM CPU, cores | CPU per glmark2 frame (`build`) |
+|---|---|---|---|---|---|---|---|
+| `copy1` | copy | 4.61 / 4.25 / 4.02 | 60 / 60 / 59.5 | 424 / 446 | 443–489 | 2.10 / 2.21 / 2.72 | 4.95 ms |
+| `zc1` | shared, worker waits for the copy | 2.48 / 2.41 / 1.41 | 59.8 / 59.5 / 58.6 | 532 / 551 | 537–648 | 2.40 / 2.47 / 3.05 | 4.51 ms |
+| `zc2` | shared | **0.117 / 0.120 / 0.144** | 60 / 59.5 / 59.5 | **685 / 677** | **631–709** | 2.59 / 2.63 / 3.20 | **3.78 ms** |
+| `copy2` | copy | 5.01 / 4.95 / 4.35 | 60 / 59.5 / 59.5 | 412 / 369 | 405–432 | 2.06 / 2.07 / 2.68 | 5.00 ms |
+| `zc3` | shared | **0.136 / 0.136 / 0.155** | 60 / 59.5 / 59.5 | **758 / 720** | **669–732** | 2.67 / 2.64 / 3.24 | **3.52 ms** |
+
+The idle desktop cost 0.02–0.03 cores in every run. The worst single flush
+in a pacing window was 8.4–13.8 ms on the copy path and 0.5–7.2 ms on the
+shared path (the rare import or first-texture flush).
+
+- **Per-flip host time** fell from 4.0–5.0 ms on the copy path to 0.12–0.16 ms
+  on the shared path: a claim, a lease and a submit. The GPU finishes the copy
+  a mean 1.7–2.2 ms after the submit (at most ~10 ms) under glmark2. That is
+  the time the synchronous version spent waiting, and it is now nobody's
+  wait: 0 copies abandoned, 0 refusals, 0 failures, 3 imports and 1 full copy
+  per boot.
+- **The desktop** holds 60 Hz (median 59.5–60 per phase) in every run. It is
+  paced by the EDID, and the guest composites at the refresh rate either way.
+  The gain goes to the clients.
+- **glmark2** rises by 50–95 % headless and 30–45 % windowed: the
+  control queue no longer spends 3–5 ms of every 16.7 in the scanout. The
+  synchronous version gained 25–30 %.
+- **CPU.** The VMM uses 0.2–0.6 cores more in total, because the guest does
+  more work: the same glmark2 draws 1.5–1.9× the frames. Per frame it uses
+  24–30 % less (5.0 → 3.5–3.8 ms of VMM CPU per glmark2 frame). The idle
+  desktop is unchanged. A window also drops its 120 uploads a second
+  (476 MiB/s of `write_texture`), which headless runs never paid.
+- **Tearing and pixels.** The tear detector of the 2026-09-25 amendment finds no
+  window triangle missing in any run, and every burst frame was looked at in
+  grids. Outside the animated window, a burst frame of the copy path and the
+  shared path at the same point of the run is pixel-identical (1 503 760
+  pixels, 0 differing, the cursor included).
+
+Windowed, on the user's 3840×2160 desktop (the window maximized, scaled
+×1.83). The copy path's window runs wgpu's default DX12 device, and the shared
+path's runs the shareable Vulkan one; that is the real A/B. The two modes are
+not comparable with each other: the copy path's flush is 2.9 ms windowed
+against 4–5 ms headless, so a window apparently leaves the GPU in a faster
+state. This was not measured further.
+
+| run | path | per-flip host time, ms | desktop fps (median) | glmark2 `build` / `jellyfish` | over vkcube | VMM CPU, cores | window uploads |
+|---|---|---|---|---|---|---|---|
+| `win-copy` | copy (DX12 window) | 2.98 / 2.85 / 2.86 | 60 / 60 / 58.5 | 540 / 513 | 502–539 | 2.55 / 2.55 / 2.89 | 120/s, 476 MiB/s |
+| `win-zc` | shared (Vulkan window) | 0.148 / 0.143 / 0.141 | 60 / 60 / 57.1 | 711 / 721 | 723–784 | 2.81 / 2.81 / 3.18 | 0 (`shared_fps` 60) |
+| `win-zc2` | shared (Vulkan window) | 0.149 / 0.148 / 0.140 | 60 / 60 / 59.5 | 764 / 750 | 725–760 | 2.69 / 2.81 / 3.16 | 0 (`shared_fps` 60) |
+
+The window shows the same frame either way. The Windows screen was grabbed
+DPI-aware at the same point of both runs, and the window's image compared
+outside the animated window and the clock: 4 522 200 pixels, 450 differing,
+by at most 2 (linear filtering), the cursor included. So the GPU cursor
+overlay matches the CPU composite. The window's statistics show
+`shared_fps=60`, `uploads_per_s=0` all through the GPU desktop: 5 651 of
+5 754 frames came from the shared texture. The rest are the boot's 2D
+console, which is still the mirror.
+
+Evidence: `F:\VMs\Entangled\zc\<run>\` (the burst `shot-NNNN.png`, the
+Windows screen grabs `screen-N.png`, `run.log`, `drive.trace`,
+`frames.json`), and the burst grids in `F:\VMs\Entangled\zc\grids\`.
+
+### Owed
+
+- **Sampling in place.** One GPU copy per flip remains: the guest's image into
+  the display's texture, VRAM to VRAM. It could go if wgpu let an imported
+  texture start in a known layout, or if the window drew the imported image
+  with a raw pipeline. Neither is worth it: the copy is GPU time nobody waits
+  for, and it keeps the guest's buffer free of the window's frame.
+- **Linux hosts.** Linux has no handle blobs (`OPAQUE_FD` from a real GPU is
+  not built), so nothing is shared there. The seam is portable; the importer is
+  `#[cfg(windows)]`.
+- **Multiple GPUs.** The window takes wgpu's default adapter. On a host whose
+  default adapter is not the renderer's GPU, the display declines for good and
+  the copy path serves every flip. Nothing yet steers the window's adapter to
+  the renderer's `deviceUUID`.
+- **The copy path's CPU halves** (`PrivatePages`, the mirror, the upload) are
+  unchanged, for every scanout the shared path does not take.

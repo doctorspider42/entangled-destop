@@ -255,6 +255,42 @@ fn open_presentation(cfg: &VmConfig, headless: bool) -> Result<Presentation, Str
         .map_err(|e| e.to_string())
 }
 
+/// Whether the display should be given a GPU that presents the renderer's
+/// scanout buffers itself (ADR-0004, zero-copy presentation): the Venus
+/// executor, on a Windows host, unless the copy path was asked for.
+fn shares_scanout(plan: &GpuPlan, path: virtio_gpu::ScanoutPath) -> bool {
+    matches!(plan, GpuPlan::Venus(_)) && cfg!(windows) && path == virtio_gpu::ScanoutPath::Shared
+}
+
+/// Gives the presentation what shared presentation needs, and says so: the
+/// window tries a Vulkan device that can import the renderer's scanout
+/// buffers when it opens; a headless display gets an off-screen one now. A
+/// display that cannot is not an error — the copy path serves every frame.
+fn share_scanout(presentation: &mut Presentation) {
+    match presentation {
+        Presentation::Windowed(host) => {
+            host.set_shared_scanout(true);
+            tracing::info!(
+                "the window will present the renderer's scanout buffers on its own GPU \
+                 (zero-copy presentation; {}=copy turns it off)",
+                virtio_gpu::SCANOUT_PATH_ENV
+            );
+        }
+        Presentation::Headless(handle) => match handle.attach_offscreen_gpu() {
+            Ok(()) => tracing::info!(
+                "the headless display presents the renderer's scanout buffers on an \
+                 off-screen GPU of its own (zero-copy presentation; {}=copy turns it off)",
+                virtio_gpu::SCANOUT_PATH_ENV
+            ),
+            Err(error) => tracing::info!(
+                %error,
+                "the headless display has no GPU of its own; every frame of the GPU desktop \
+                 is read back (the copy path)"
+            ),
+        },
+    }
+}
+
 /// A host-side script: given everything the guest has printed on ttyS0 so far,
 /// the bytes to type back at it (or `None` to keep waiting).
 pub type SerialScript = Box<dyn FnMut(&str) -> Option<Vec<u8>> + Send>;
@@ -322,6 +358,10 @@ struct BuiltDevices {
     /// carrying `CONFIG_IP_PNP` (harmlessly ignored otherwise). A UEFI guest
     /// gets nothing — the firmware owns the command line there.
     net_cmdline: Option<String>,
+    /// Whether the GPU's renderer can hand the display its scanout buffers
+    /// (ADR-0004, zero-copy presentation): the Venus executor on a Windows
+    /// host, unless [`virtio_gpu::SCANOUT_PATH_ENV`] asked for the copy path.
+    shares_scanout: bool,
 }
 
 /// One virtio-blk device per `[[disk]]` entry, the configured network backend,
@@ -423,6 +463,9 @@ fn build_devices(
         std::env::var_os(VENUS_CAPTURE_ENV),
         std::env::var_os(VENUS_ENV),
     )?;
+    // Zero-copy presentation (ADR-0004): only the executing Venus renderer
+    // makes handle blobs, and only on Windows can the display import them.
+    let shares_scanout = shares_scanout(&plan, virtio_gpu::ScanoutPath::from_env());
     // The Venus transport capture (EPIC 20 phase 4), ahead of everything else
     // because it is not a variant of 3D — it is a different renderer entirely.
     //
@@ -680,6 +723,7 @@ fn build_devices(
     Ok(BuiltDevices {
         devices,
         net_cmdline,
+        shares_scanout,
     })
 }
 
@@ -1201,7 +1245,7 @@ pub fn run_with(
     };
 
     // Presentation before devices: the GPU device is built around the handle.
-    let presentation = open_presentation(&cfg, headless)?;
+    let mut presentation = open_presentation(&cfg, headless)?;
     let display_handle = match &presentation {
         Presentation::Windowed(host) => host.handle(),
         Presentation::Headless(handle) => handle.clone(),
@@ -1218,6 +1262,9 @@ pub fn run_with(
         (Some(k), Some(t)) => (k, t),
         _ => return Err("input devices were not built".into()),
     };
+    if built.shares_scanout {
+        share_scanout(&mut presentation);
+    }
 
     // The debug screenshot timer (--screenshot-after). Detached on purpose:
     // waiting for it would hold a finished VM open for the rest of the timer.
@@ -2621,8 +2668,8 @@ fn extend_cmdline(configured: &str, clauses: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        direct_linux_cmdline, extend_cmdline, gpu_plan, venus_host_visible_bytes, GpuPlan,
-        VenusSource,
+        direct_linux_cmdline, extend_cmdline, gpu_plan, shares_scanout, venus_host_visible_bytes,
+        GpuPlan, VenusSource,
     };
     use control_api::{DisplaySection, GpuRenderer};
     use std::ffi::OsString;
@@ -2817,5 +2864,22 @@ mod tests {
             with_lookalike.contains("ip=192.168.74.15"),
             "{with_lookalike}"
         );
+    }
+
+    /// Zero-copy presentation (ADR-0004) is the executing Venus renderer's on
+    /// a Windows host only, and `ENTANGLED_SCANOUT_PATH=copy` turns it off.
+    #[test]
+    fn only_the_venus_executor_on_windows_shares_its_scanout() {
+        use virtio_gpu::ScanoutPath;
+        let venus = GpuPlan::Venus(VenusSource::Profile);
+        assert_eq!(shares_scanout(&venus, ScanoutPath::Shared), cfg!(windows));
+        assert!(!shares_scanout(&venus, ScanoutPath::Copy));
+        for plan in [
+            GpuPlan::TwoD,
+            GpuPlan::Virgl,
+            GpuPlan::Capture(std::path::PathBuf::from("x")),
+        ] {
+            assert!(!shares_scanout(&plan, ScanoutPath::Shared), "{plan:?}");
+        }
     }
 }

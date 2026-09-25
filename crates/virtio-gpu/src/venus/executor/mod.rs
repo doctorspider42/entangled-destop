@@ -147,6 +147,14 @@
 //! through a device of the renderer's own ([`scanout`]), made the first time
 //! one is scanned out, on the GPU the blob was exported from. It is not any
 //! context's: no guest teardown reaches it.
+//!
+//! Or, on a display that can take the image itself (zero-copy presentation,
+//! ADR-0004), the factory **shares** it: `share_scanout` makes the image an
+//! importer can take (a `DuplicateHandle` of the blob's NT handle through
+//! [`host::HostVulkan::share_memory_handle`], the export's size, type and GPU, the
+//! canonical create info) and `claim_scanout` claims the payload for the
+//! display's copy as [`writes::Owner::Presenter`], until the display drops
+//! the lease.
 
 pub mod context;
 pub mod device_objects;
@@ -889,6 +897,11 @@ pub struct ExecutorFactory<H: HostVulkan> {
     /// copy is.
     scanout_progress: Arc<writes::Progress>,
     scanout_serial: u64,
+    /// A presenter's touches (zero-copy presentation): one serial per lease,
+    /// completed when the presenter drops it — after the flush, once its copy
+    /// has run — and in order, since its copies run in order on its queue.
+    presenter_progress: Arc<writes::Progress>,
+    presenter_serial: u64,
 }
 
 impl<H: HostVulkan> std::fmt::Debug for ExecutorFactory<H> {
@@ -927,6 +940,8 @@ impl<H: HostVulkan> ExecutorFactory<H> {
             payloads: writes::Payloads::new(),
             scanout_progress: Arc::new(writes::Progress::default()),
             scanout_serial: 0,
+            presenter_progress: Arc::new(writes::Progress::default()),
+            presenter_serial: 0,
         }
     }
 
@@ -1156,6 +1171,72 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         if let Some(device) = self.scanout.as_mut() {
             device.forget(resource_id);
         }
+    }
+
+    fn share_scanout(
+        &mut self,
+        target: &ScanoutTarget,
+    ) -> Result<crate::shared::SharedScanoutImage, String> {
+        let export = target
+            .handle
+            .0
+            .downcast_ref::<memory::HandleExport<H>>()
+            .ok_or("a handle this host did not make")?;
+        let handle = self
+            .host
+            .share_memory_handle(&export.shared)
+            .ok_or("this host cannot duplicate an exported memory handle")?;
+        let image = &target.image;
+        Ok(crate::shared::SharedScanoutImage {
+            serial: crate::shared::SharedScanoutImage::next_serial(),
+            resource_id: target.resource_id,
+            handle,
+            handle_type: crate::shared::HANDLE_TYPE_OPAQUE_WIN32,
+            allocation_size: export.size,
+            memory_type_index: export.type_index,
+            device_uuid: export.uuids.0,
+            driver_uuid: export.uuids.1,
+            info: crate::shared::SharedImageInfo {
+                format: image.format,
+                flags: image.flags,
+                view_formats: image.view_formats.clone(),
+                usage: image.usage,
+                width: image.width,
+                height: image.height,
+            },
+        })
+    }
+
+    fn claim_scanout(
+        &mut self,
+        target: &ScanoutTarget,
+    ) -> Result<Box<dyn FnOnce() + Send>, String> {
+        // The claim the readback takes (`read_scanout`), as an owner of its
+        // own: the presenter's copy runs on another device and outlives the
+        // flush (the lease is dropped once it has run), so a readback of the
+        // same buffer meanwhile must wait for it — and must not complete its
+        // touch, which one shared progress would.
+        let payload = crate::venus::renderer::SharedRef::of(&target.handle);
+        self.presenter_serial += 1;
+        let serial = self.presenter_serial;
+        let claimed = self.payloads.claim(
+            std::slice::from_ref(&payload),
+            writes::Owner::Presenter,
+            serial,
+            &self.presenter_progress,
+            Instant::now() + scanout::SCANOUT_WAIT,
+            false,
+        );
+        if claimed.timed_out {
+            // Recorded nothing; the serial is only never waited for.
+            self.presenter_progress.complete(serial);
+            return Err(format!(
+                "the guest's GPU work on the scanout buffer did not finish within {:?}",
+                scanout::SCANOUT_WAIT
+            ));
+        }
+        let progress = Arc::clone(&self.presenter_progress);
+        Ok(Box::new(move || progress.complete(serial)))
     }
 
     fn scanout_targets(&self) -> usize {

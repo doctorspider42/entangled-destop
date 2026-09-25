@@ -1206,6 +1206,27 @@ impl HostVulkan for AshVulkan {
         Ok(SharedMemoryHandle { handle })
     }
 
+    #[cfg(windows)]
+    fn share_memory_handle(
+        &self,
+        shared: &SharedMemoryHandle,
+    ) -> Option<crate::shared::ExternalHandle> {
+        use std::os::windows::io::BorrowedHandle;
+        // SAFETY: `shared.handle` is the NT handle `vkGetMemoryWin32HandleKHR`
+        // returned to this process, owned by `shared` and open for as long as
+        // `shared` lives — which outlasts this call, since it is borrowed —
+        // and it is not the pseudo-handle -1 (`export_memory_handle` refuses
+        // a null one, and the driver hands out real handles only).
+        let borrowed = unsafe { BorrowedHandle::borrow_raw(shared.handle as *mut c_void) };
+        match borrowed.try_clone_to_owned() {
+            Ok(owned) => Some(crate::shared::ExternalHandle::from_owned(owned)),
+            Err(error) => {
+                tracing::warn!(%error, "an exported memory handle could not be duplicated");
+                None
+            }
+        }
+    }
+
     fn memory_commitment(&self, device: &HostDevice, memory: &HostMemory) -> u64 {
         // SAFETY: `memory` is of `device` and of a lazily allocated type (the
         // executor asks nothing else).

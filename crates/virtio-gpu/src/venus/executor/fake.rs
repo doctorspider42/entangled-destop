@@ -1162,6 +1162,14 @@ impl HostVulkan for FakeVulkan {
     type ImageView = u64;
     type SharedMemory = FakeShared;
 
+    /// A placeholder: the fake's payloads are no OS objects, and a presenter
+    /// refuses to import one — enough to drive a shared present's lease and
+    /// claim without a GPU.
+    fn share_memory_handle(&self, shared: &FakeShared) -> Option<crate::shared::ExternalHandle> {
+        let _ = shared;
+        Some(crate::shared::ExternalHandle::placeholder())
+    }
+
     fn instance_version(&self) -> Result<u32, VkResult> {
         Ok(self.version)
     }

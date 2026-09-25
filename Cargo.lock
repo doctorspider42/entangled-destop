@@ -1097,6 +1097,7 @@ dependencies = [
 name = "display"
 version = "0.2.0"
 dependencies = [
+ "ash",
  "png",
  "pollster",
  "thiserror 2.0.20",

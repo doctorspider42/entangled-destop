@@ -84,4 +84,14 @@ pub enum DisplayError {
     /// Writing a screenshot to disk failed.
     #[error("screenshot io failed: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The GPU device shared presentation needs (ADR-0004, zero-copy
+    /// presentation) could not be had; the display falls back to another
+    /// backend and the copy path.
+    #[error("no device for shared presentation: {0}")]
+    SharedDevice(String),
+
+    /// Something the shared presenter was asked for failed on its GPU.
+    #[error("shared presentation failed: {0}")]
+    Shared(String),
 }

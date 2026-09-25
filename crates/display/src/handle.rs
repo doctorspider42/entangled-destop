@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use winit::event_loop::EventLoopProxy;
 
 use crate::scanout::{lock_scanout, Scanout, ScanoutStats, SharedScanout};
+use crate::shared::{SharedSlot, SharedStats};
 use crate::DisplayError;
 
 /// Wakeups the event loop understands.
@@ -97,11 +98,19 @@ impl Waker {
 pub struct DisplayHandle {
     scanout: SharedScanout,
     waker: Waker,
+    /// The display's shared presenter, once it has one (ADR-0004, zero-copy
+    /// presentation): the window fills it when its GPU is up, a headless
+    /// display with [`Self::attach_offscreen_gpu`].
+    shared: SharedSlot,
 }
 
 impl DisplayHandle {
-    pub(crate) fn new(scanout: SharedScanout, waker: Waker) -> Self {
-        Self { scanout, waker }
+    pub(crate) fn new(scanout: SharedScanout, waker: Waker, shared: SharedSlot) -> Self {
+        Self {
+            scanout,
+            waker,
+            shared,
+        }
     }
 
     /// A handle with no window behind it: updates and screenshots work, wakeups
@@ -113,7 +122,52 @@ impl DisplayHandle {
     /// open a window.
     pub fn detached(width: u32, height: u32) -> Result<Self, DisplayError> {
         let scanout = Arc::new(Mutex::new(Scanout::new(width, height)?));
-        Ok(Self::new(scanout, Waker::detached()))
+        Ok(Self::new(scanout, Waker::detached(), SharedSlot::default()))
+    }
+
+    /// Gives a display with no window a GPU of its own for **shared
+    /// presentation** (ADR-0004, zero-copy presentation): a renderer's scanout
+    /// buffers are then imported onto an off-screen Vulkan device and each
+    /// flipped frame is copied there on the GPU, exactly as a window's would
+    /// be, and screenshots read that copy back. Without it a headless display
+    /// takes every frame through the copy path.
+    ///
+    /// Windows only, where renderers share handle blobs; elsewhere, and on a
+    /// host whose GPU cannot import them, an error that says why.
+    pub fn attach_offscreen_gpu(&self) -> Result<(), DisplayError> {
+        #[cfg(windows)]
+        {
+            let presenter = crate::gpu_scanout::GpuScanout::open_offscreen()
+                .map_err(DisplayError::SharedDevice)?;
+            self.shared.set(Some(Arc::new(presenter)));
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            Err(DisplayError::SharedDevice(
+                "shared presentation is built for Windows hosts only".into(),
+            ))
+        }
+    }
+
+    /// Installs `presenter` as this display's shared presenter (every clone of
+    /// the handle, and the window, see it): what
+    /// [`Self::attach_offscreen_gpu`] does with the GPU one, and what a test
+    /// does with a fake. `None` removes it — every flush then takes the copy
+    /// path.
+    pub fn attach_presenter(&self, presenter: Option<Arc<dyn crate::shared::SharedPresenter>>) {
+        self.shared.set(presenter);
+    }
+
+    /// Whether this display presents a renderer's scanout itself (it has a
+    /// shared presenter).
+    pub fn shares_scanout(&self) -> bool {
+        self.shared.get().is_some()
+    }
+
+    /// The shared presenter's counters, if it has one.
+    pub fn shared_stats(&self) -> Option<SharedStats> {
+        self.shared.get().map(|p| p.stats())
     }
 
     /// Copies a `width`×`height` block of tightly packed BGRA pixels
@@ -135,6 +189,10 @@ impl DisplayHandle {
             let mut scanout = lock_scanout(&self.scanout);
             scanout.update(x, y, width, height, data)?;
         }
+        // The mirror is what the scanout shows now.
+        if let Some(presenter) = self.shared.get() {
+            presenter.deactivate();
+        }
         self.waker.wake();
         Ok(())
     }
@@ -146,6 +204,9 @@ impl DisplayHandle {
         {
             let mut scanout = lock_scanout(&self.scanout);
             scanout.set_resolution(width, height)?;
+        }
+        if let Some(presenter) = self.shared.get() {
+            presenter.deactivate();
         }
         tracing::info!(width, height, "guest scanout resolution changed");
         self.waker.wake();
@@ -181,6 +242,16 @@ impl DisplayHandle {
     pub fn screenshot_png(&self) -> Result<Vec<u8>, DisplayError> {
         let snapshot = self.snapshot()?;
         snapshot.to_png()
+    }
+
+    /// The current scanout as tightly packed BGRA, `(width, height, pixels)`,
+    /// with the cursor plane composited in — what [`Self::screenshot_png`]
+    /// encodes, for a caller that compares pixels rather than files. A shared
+    /// frame is read back from the display's GPU.
+    pub fn screenshot_bgra(&self) -> Result<(u32, u32, Vec<u8>), DisplayError> {
+        let snapshot = self.snapshot()?;
+        let (width, height) = snapshot.size();
+        Ok((width, height, snapshot.pixels().to_vec()))
     }
 
     /// Writes a PNG screenshot of the current scanout to `path`.
@@ -243,7 +314,30 @@ impl DisplayHandle {
     /// Detached copy of the current scanout with the cursor plane composited
     /// in — screenshots must show what the window shows; the lock is released
     /// before the caller does anything slow with it.
+    ///
+    /// A shared frame (ADR-0004, zero-copy presentation) is not in the mirror:
+    /// it is drawn on the display's GPU into an off-screen target through the
+    /// window's own image pipeline and read back, and the cursor is composited
+    /// over it on the CPU exactly as it is over the mirror.
     fn snapshot(&self) -> Result<Scanout, DisplayError> {
+        if let Some(presenter) = self.shared.get() {
+            if presenter.shown() {
+                let (width, height, pixels) = presenter.read_back()?;
+                let based = {
+                    let scanout = lock_scanout(&self.scanout);
+                    (scanout.size() == (width, height)).then(|| scanout.with_base(&pixels))
+                };
+                if let Some(based) = based {
+                    let mut snapshot = based?;
+                    if let Some((rect, composited)) = snapshot.cursor_overlay() {
+                        snapshot.update(rect.x, rect.y, rect.width, rect.height, &composited)?;
+                    }
+                    return Ok(snapshot);
+                }
+                // A mode change raced the read: the mirror's frame is the
+                // current one.
+            }
+        }
         let (width, height, pixels, overlay) = {
             let scanout = lock_scanout(&self.scanout);
             let (w, h) = scanout.size();
@@ -302,6 +396,38 @@ impl virtio_gpu::ScanoutSink for DisplayHandle {
     fn hide_cursor(&self) -> Result<(), virtio_gpu::SinkError> {
         DisplayHandle::hide_cursor(self);
         Ok(())
+    }
+
+    fn accepts_shared_scanout(&self) -> bool {
+        self.shares_scanout()
+    }
+
+    fn present_shared(
+        &self,
+        frame: &virtio_gpu::SharedScanoutFrame,
+        lease: virtio_gpu::SharedScanoutLease,
+    ) -> virtio_gpu::SharedPresent {
+        let Some(presenter) = self.shared.get() else {
+            return virtio_gpu::SharedPresent::not_now("the display's GPU is not up yet");
+        };
+        let (w, h) = self.resolution();
+        if (frame.visible.width, frame.visible.height) != (w, h) {
+            return virtio_gpu::SharedPresent::not_now(format!(
+                "a {}x{} frame on a {w}x{h} scanout",
+                frame.visible.width, frame.visible.height
+            ));
+        }
+        let presented = presenter.present(frame, lease);
+        if presented == virtio_gpu::SharedPresent::Presented {
+            self.waker.wake();
+        }
+        presented
+    }
+
+    fn forget_shared(&self, resource_id: Option<u32>) {
+        if let Some(presenter) = self.shared.get() {
+            presenter.forget(resource_id);
+        }
     }
 }
 
@@ -362,5 +488,154 @@ mod tests {
         handle.update_scanout(0, 0, 1, 1, &[0, 0, 0, 0]).unwrap();
         let after = handle.screenshot_png().unwrap();
         assert_ne!(before, after);
+    }
+
+    // ------------------------------------------ shared presentation
+
+    use crate::shared::{SharedPresenter, SharedStats, SharedTexture};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use virtio_gpu::shared::{
+        ExternalHandle, ImageRelease, SharedImageInfo, SharedScanoutImage,
+        HANDLE_TYPE_OPAQUE_WIN32, QUEUE_FAMILY_FOREIGN, VK_FORMAT_B8G8R8A8_UNORM,
+    };
+    use virtio_gpu::{Rect, SharedPresent, SharedScanoutFrame, SharedScanoutLease};
+
+    fn lease(frame: &SharedScanoutFrame) -> SharedScanoutLease {
+        SharedScanoutLease::unclaimed(Arc::clone(&frame.image), frame.release)
+    }
+
+    fn present(sink: &dyn ScanoutSink, frame: &SharedScanoutFrame) -> SharedPresent {
+        sink.present_shared(frame, lease(frame))
+    }
+
+    #[derive(Default)]
+    struct Fake {
+        presents: AtomicUsize,
+        shown: AtomicBool,
+    }
+
+    impl SharedPresenter for Fake {
+        fn present(
+            &self,
+            _frame: &SharedScanoutFrame,
+            _lease: SharedScanoutLease,
+        ) -> SharedPresent {
+            self.presents.fetch_add(1, Ordering::SeqCst);
+            self.shown.store(true, Ordering::SeqCst);
+            SharedPresent::Presented
+        }
+        fn forget(&self, _resource_id: Option<u32>) {}
+        fn deactivate(&self) {
+            self.shown.store(false, Ordering::SeqCst);
+        }
+        fn current(&self) -> Option<SharedTexture> {
+            None
+        }
+        fn shown(&self) -> bool {
+            self.shown.load(Ordering::SeqCst)
+        }
+        fn read_back(&self) -> Result<(u32, u32, Vec<u8>), DisplayError> {
+            Ok((4, 2, [9u8, 8, 7, 0xff].repeat(8)))
+        }
+        fn stats(&self) -> SharedStats {
+            SharedStats::default()
+        }
+    }
+
+    fn frame(width: u32, height: u32) -> SharedScanoutFrame {
+        let visible = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        SharedScanoutFrame {
+            image: Arc::new(SharedScanoutImage {
+                serial: SharedScanoutImage::next_serial(),
+                resource_id: 3,
+                handle: ExternalHandle::placeholder(),
+                handle_type: HANDLE_TYPE_OPAQUE_WIN32,
+                allocation_size: 4096,
+                memory_type_index: 0,
+                device_uuid: [0; 16],
+                driver_uuid: [0; 16],
+                info: SharedImageInfo {
+                    format: VK_FORMAT_B8G8R8A8_UNORM,
+                    flags: 0,
+                    view_formats: Vec::new(),
+                    usage: 1,
+                    width,
+                    height,
+                },
+            }),
+            release: ImageRelease {
+                layout: 6,
+                family: QUEUE_FAMILY_FOREIGN,
+            },
+            visible,
+            damage: visible,
+        }
+    }
+
+    /// No presenter: nothing is accepted, and a frame handed over anyway is
+    /// declined for now (the window's GPU may still come up).
+    #[test]
+    fn a_display_without_a_presenter_declines_for_now() {
+        let handle = DisplayHandle::detached(4, 2).unwrap();
+        let sink: &dyn ScanoutSink = &handle;
+        assert!(!sink.accepts_shared_scanout());
+        assert!(matches!(
+            present(sink, &frame(4, 2)),
+            SharedPresent::Declined { retry: true, .. }
+        ));
+        sink.forget_shared(None);
+        #[cfg(not(windows))]
+        assert!(handle.attach_offscreen_gpu().is_err());
+    }
+
+    /// With one: a frame of the scanout's size is presented, one of another
+    /// size never reaches it; a mirror update or a mode change makes the
+    /// mirror what is shown again; and a screenshot of a shared frame is the
+    /// presenter's pixels with the mirror's cursor plane composited over.
+    #[test]
+    fn the_last_update_decides_what_is_shown_and_screenshots_follow_it() {
+        let handle = DisplayHandle::detached(4, 2).unwrap();
+        let fake = Arc::new(Fake::default());
+        handle.attach_presenter(Some(Arc::clone(&fake) as Arc<dyn SharedPresenter>));
+        let sink: &dyn ScanoutSink = &handle;
+        assert!(sink.accepts_shared_scanout());
+        assert!(handle.shares_scanout());
+        assert!(matches!(
+            present(sink, &frame(8, 2)),
+            SharedPresent::Declined { retry: true, .. }
+        ));
+        assert_eq!(fake.presents.load(Ordering::SeqCst), 0);
+        assert_eq!(present(sink, &frame(4, 2)), SharedPresent::Presented);
+        assert!(fake.shown());
+
+        // The screenshot is the shared frame, the cursor over it.
+        handle
+            .set_cursor(1, 1, 0, 0, 3, 1, &[0xff, 0xff, 0xff, 0xff])
+            .unwrap();
+        let (w, h, pixels) = handle.screenshot_bgra().unwrap();
+        assert_eq!((w, h), (4, 2));
+        assert_eq!(&pixels[..4], &[9, 8, 7, 0xff], "the presenter's pixels");
+        let cursor_at = (4 + 3) * 4;
+        assert_eq!(
+            &pixels[cursor_at..cursor_at + 4],
+            &[0xff, 0xff, 0xff, 0xff],
+            "the cursor plane over them"
+        );
+
+        // A mirror update: the mirror is shown again.
+        handle.update_scanout(0, 0, 1, 1, &[1, 2, 3, 4]).unwrap();
+        assert!(!fake.shown());
+        let (_, _, pixels) = handle.screenshot_bgra().unwrap();
+        assert_eq!(&pixels[..4], &[1, 2, 3, 4], "the mirror's pixels");
+        assert_eq!(present(sink, &frame(4, 2)), SharedPresent::Presented);
+        handle.set_resolution(8, 8).unwrap();
+        assert!(!fake.shown(), "a mode change shows the (new) mirror");
+        handle.attach_presenter(None);
+        assert!(!handle.shares_scanout());
     }
 }

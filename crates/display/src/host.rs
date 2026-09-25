@@ -20,6 +20,7 @@ use crate::input::{
 };
 use crate::renderer::{FrameStats, Renderer, StatsReporter};
 use crate::scanout::{lock_scanout, Scanout, SharedScanout};
+use crate::shared::SharedSlot;
 use crate::ux::{self, ScaleMode, WindowStatus};
 use crate::{DisplayConfig, DisplayError, DisplayHandle, Viewport};
 
@@ -46,6 +47,12 @@ pub struct DisplayHost {
     control: ControlQueue,
     waker: Waker,
     event_loop: EventLoop<HostEvent>,
+    /// Where the window's shared presenter goes (ADR-0004, zero-copy
+    /// presentation), shared with every [`DisplayHandle`].
+    shared: SharedSlot,
+    /// Whether the window should open a GPU that can present a renderer's
+    /// scanout itself ([`Self::with_shared_scanout`]).
+    share: bool,
 }
 
 impl DisplayHost {
@@ -65,7 +72,30 @@ impl DisplayHost {
             control: ControlQueue::new(),
             waker,
             event_loop,
+            shared: SharedSlot::default(),
+            share: false,
         })
+    }
+
+    /// Asks the window for **shared presentation** (ADR-0004, zero-copy
+    /// presentation of the GPU-composited desktop): a GPU of the display's own
+    /// that imports a renderer's scanout buffers and copies each flipped frame
+    /// on the GPU, instead of the renderer reading it back and the window
+    /// uploading it. It needs wgpu's Vulkan backend, which the window then
+    /// tries first — on a VM whose renderer can hand its scanout over (the
+    /// Venus renderer on Windows); a 2D-only VM keeps the default backend
+    /// order. If the Vulkan device cannot be had, or cannot import, the window
+    /// opens as it always has and every frame takes the copy path.
+    #[must_use]
+    pub fn with_shared_scanout(mut self, share: bool) -> Self {
+        self.share = share;
+        self
+    }
+
+    /// [`Self::with_shared_scanout`] in place, for a caller that learns only
+    /// after building the host whether its renderer can share.
+    pub fn set_shared_scanout(&mut self, share: bool) {
+        self.share = share;
     }
 
     /// Overrides the window title (usually `entangled: <vm id>`).
@@ -77,7 +107,11 @@ impl DisplayHost {
 
     /// The device-facing scanout API. Clone freely; safe to use from any thread.
     pub fn handle(&self) -> DisplayHandle {
-        DisplayHandle::new(Arc::clone(&self.scanout), self.waker.clone())
+        DisplayHandle::new(
+            Arc::clone(&self.scanout),
+            self.waker.clone(),
+            self.shared.clone(),
+        )
     }
 
     /// The captured guest input stream, for the `virtio-input` devices.
@@ -106,11 +140,15 @@ impl DisplayHost {
             control,
             waker,
             event_loop,
+            shared,
+            share,
         } = self;
         let mut app = App {
             config,
             title,
             scanout,
+            shared,
+            share,
             capture: InputCapture::new(events, control.clone()),
             control,
             waker,
@@ -140,6 +178,10 @@ struct App {
     config: DisplayConfig,
     title: String,
     scanout: SharedScanout,
+    /// The shared presenter's slot (ADR-0004, zero-copy presentation).
+    shared: SharedSlot,
+    /// Whether to open a GPU for it.
+    share: bool,
     capture: InputCapture,
     control: ControlQueue,
     waker: Waker,
@@ -244,7 +286,12 @@ impl App {
             scale_factor = window.scale_factor(),
             "window created"
         );
-        let renderer = Renderer::new(Arc::clone(&window), self.guest_size.0, self.guest_size.1)?;
+        let renderer = Renderer::new(
+            Arc::clone(&window),
+            self.guest_size.0,
+            self.guest_size.1,
+            self.share.then_some(&self.shared),
+        )?;
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.recompute_viewport();
@@ -312,13 +359,16 @@ impl App {
             renderer.resize(win_w, win_h);
         }
         // The guest may have changed resolution since the last frame. The lock
-        // is held only for the upload (a `memcpy` into a staging buffer).
-        let shared = Arc::clone(&self.scanout);
+        // is held only for the upload (a `memcpy` into a staging buffer). A
+        // renderer's shared frame, when that is what the scanout shows, is
+        // already on the GPU (ADR-0004, zero-copy presentation).
+        let shared_frame = self.shared.get().and_then(|p| p.current());
+        let mirror = Arc::clone(&self.scanout);
         let guest_size = {
-            let mut scanout = lock_scanout(&shared);
+            let mut scanout = lock_scanout(&mirror);
             let size = scanout.size();
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.upload(&mut scanout);
+                renderer.prepare(&mut scanout, shared_frame);
             }
             size
         };
@@ -705,6 +755,7 @@ impl ApplicationHandler<HostEvent> for App {
         let scanout = lock_scanout(&self.scanout).stats();
         tracing::info!(
             frames = stats.frames,
+            shared_frames = stats.shared_frames,
             skipped = stats.skipped,
             uploads = stats.uploads,
             upload_mib = format_args!("{:.1}", stats.bytes_uploaded as f64 / (1024.0 * 1024.0)),

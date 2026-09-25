@@ -506,6 +506,18 @@ pub trait HostVulkan: Send + Sync + 'static {
         memory: &Self::Memory,
     ) -> Result<Self::SharedMemory, VkResult>;
 
+    /// An owned **duplicate** of `shared`'s OS handle, for a presenter in
+    /// this process to import on its own device (ADR-0004, zero-copy
+    /// presentation) — the duplicate lives on its own terms, so the blob's
+    /// handle may close first. `None` on a host that cannot (the default).
+    fn share_memory_handle(
+        &self,
+        shared: &Self::SharedMemory,
+    ) -> Option<crate::shared::ExternalHandle> {
+        let _ = shared;
+        None
+    }
+
     /// `vkFreeMemory`. For imported memory the host waits for the device to
     /// go idle first: pages the GPU may still be writing are not pages the
     /// executor may let go of.

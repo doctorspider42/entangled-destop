@@ -32,6 +32,13 @@ wgpu.workspace = true
 pollster.workspace = true
 png.workspace = true
 
+# Zero-copy presentation of a renderer's scanout (ADR-0004): the raw Vulkan
+# half of importing an OPAQUE_WIN32 allocation onto wgpu's own Vulkan device
+# (`gpu_scanout`). The same ash wgpu-hal already links (MIT OR Apache-2.0),
+# reached through `Device::as_hal`; nothing loads a second Vulkan loader.
+[target.'cfg(windows)'.dependencies]
+ash.workspace = true
+
 [dev-dependencies]
 tracing-subscriber.workspace = true
 

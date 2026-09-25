@@ -77,6 +77,7 @@ pub mod remote;
 pub mod renderer;
 pub mod resource;
 pub mod save;
+pub mod shared;
 pub mod sink;
 pub mod venus;
 #[cfg(target_os = "linux")]
@@ -105,6 +106,10 @@ pub use renderer::{CapsetInfo, FenceOutcome, Gpu3d, Renderer3d, ScanoutBlobSpec,
 // path, because the layers below are what a *test* reaches for, not a caller.
 pub use resource::{Resource, ResourceTable};
 pub use save::{GpuState, GpuStateError, SavedResource, SavedScanout};
+pub use shared::{
+    ExternalHandle, ImageRelease, ScanoutPath, SharedImageInfo, SharedPresent, SharedScanoutFrame,
+    SharedScanoutImage, SharedScanoutLease, SCANOUT_PATH_ENV,
+};
 pub use sink::{ScanoutSink, SinkError};
 pub use venus::executor::ExecutorFactory;
 pub use venus::renderer::{

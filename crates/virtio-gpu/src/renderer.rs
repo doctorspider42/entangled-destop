@@ -395,6 +395,32 @@ pub trait Renderer3d: Send {
         })
     }
 
+    /// Zero-copy presentation (ADR-0004, [`crate::shared`]): a **lease** on
+    /// the image behind `resource_id` — a blob this renderer accepted for
+    /// scanout ([`Self::scanout_blob`]) — so the device can hand the display
+    /// the image itself instead of reading it back.
+    ///
+    /// The lease carries an owned duplicate of the memory's OS handle,
+    /// everything an import must match (size, memory type, the GPU's UUIDs,
+    /// the exact image create info) and the guest's last release of it. While
+    /// it lives, the renderer's ordering of shared payloads
+    /// (`venus::executor::writes`) counts the presenter as a reader: guest GPU
+    /// work on the payload had finished before it was granted, and none
+    /// starts until it is dropped — the same claim [`Self::read_rect_bgra`]'s
+    /// readback makes. The device drops it once the display's copy is done.
+    ///
+    /// `Ok(None)` — the default, and the answer for a page blob, a host with
+    /// no shareable memory, or a handle that could not be duplicated — means
+    /// the copy path serves this flush. An error is what the readback would
+    /// have failed with (the claim timed out): the flush fails in band.
+    fn begin_shared_scanout(
+        &mut self,
+        resource_id: u32,
+    ) -> Result<Option<crate::shared::SharedScanoutLease>, CommandError> {
+        let _ = resource_id;
+        Ok(None)
+    }
+
     // ------------------------------------- blob resources (EPIC 20/VEN-2001)
 
     /// Which blob memory types this renderer serves, and whether it has a
@@ -1127,6 +1153,16 @@ impl Gpu3d {
             )));
         }
         Ok(())
+    }
+
+    /// A lease on a renderer blob's image for shared presentation
+    /// ([`Renderer3d::begin_shared_scanout`]). The device owns the blob table
+    /// and the binding; this front only forwards.
+    pub fn begin_shared_scanout(
+        &mut self,
+        resource_id: u32,
+    ) -> Result<Option<crate::shared::SharedScanoutLease>, CommandError> {
+        self.renderer.begin_shared_scanout(resource_id)
     }
 
     /// Zero-copy export of a scanout resource, when the host can do it.

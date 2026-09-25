@@ -23,6 +23,8 @@
 
 use thiserror::Error;
 
+use crate::shared::SharedPresent;
+
 /// The host side refused a scanout update.
 ///
 /// Deliberately opaque: rejections come from the display implementation (a rect
@@ -99,6 +101,52 @@ pub trait ScanoutSink: Send {
 
     /// Hides the cursor plane (`UPDATE_CURSOR` with resource 0).
     fn hide_cursor(&self) -> Result<(), SinkError>;
+
+    // ------------------------- shared presentation (ADR-0004, zero-copy)
+
+    /// Whether [`Self::present_shared`] could take a frame right now — a
+    /// cheap question the device asks before it asks the renderer for a
+    /// lease, so a sink that never shares costs the copy path nothing. The
+    /// default: never.
+    fn accepts_shared_scanout(&self) -> bool {
+        false
+    }
+
+    /// Present a renderer's image instead of pixels ([`crate::shared`]): copy
+    /// `frame.damage` of `frame.image` — or more, if the sink's own copy of
+    /// the frame needs it — into the sink's copy of the scanout on the GPU,
+    /// ordered by the guest's release (`frame.release`).
+    ///
+    /// `lease` is the renderer's claim on the image's payload: while it
+    /// lives, no guest GPU work touching the image starts. The sink keeps it
+    /// until its copy has **finished** on the GPU and drops it then — which
+    /// may be after this call has returned [`SharedPresent::Presented`], so
+    /// the device's queue worker never waits for the GPU. Declining or
+    /// failing drops it before returning.
+    ///
+    /// The device has validated the frame against the scanout: `visible` is
+    /// the bound region of a `frame.image.info.width` × `height` image, its
+    /// size the current resolution, and `damage` lies inside it. Everything
+    /// about the *host* — the image's GPU, its handle, whether it imports —
+    /// is the sink's to judge, and any doubt is
+    /// [`SharedPresent::Declined`]: the copy path serves the flush.
+    ///
+    /// The default declines for good.
+    fn present_shared(
+        &self,
+        frame: &crate::shared::SharedScanoutFrame,
+        lease: crate::shared::SharedScanoutLease,
+    ) -> SharedPresent {
+        let _ = (frame, lease);
+        SharedPresent::never("this display has no GPU of its own")
+    }
+
+    /// Resource `resource_id` (every one, for `None`) is gone or no longer
+    /// scanned out: whatever the sink imported of it goes. What the sink
+    /// shows is its own copy and stays. The default holds nothing.
+    fn forget_shared(&self, resource_id: Option<u32>) {
+        let _ = resource_id;
+    }
 }
 
 /// Blanket forwarding so a device can be handed `&`-shared or boxed sinks.
@@ -141,6 +189,22 @@ impl<S: ScanoutSink + ?Sized> ScanoutSink for Box<S> {
 
     fn hide_cursor(&self) -> Result<(), SinkError> {
         (**self).hide_cursor()
+    }
+
+    fn accepts_shared_scanout(&self) -> bool {
+        (**self).accepts_shared_scanout()
+    }
+
+    fn present_shared(
+        &self,
+        frame: &crate::shared::SharedScanoutFrame,
+        lease: crate::shared::SharedScanoutLease,
+    ) -> SharedPresent {
+        (**self).present_shared(frame, lease)
+    }
+
+    fn forget_shared(&self, resource_id: Option<u32>) {
+        (**self).forget_shared(resource_id);
     }
 }
 
@@ -203,5 +267,8 @@ mod tests {
         let error = sink.move_cursor(1, 1).expect_err("Nothing refuses");
         assert_eq!(error.to_string(), "no cursor plane");
         assert!(sink.hide_cursor().is_ok());
+        // The shared-presentation defaults: never, and forgetting is free.
+        assert!(!sink.accepts_shared_scanout());
+        sink.forget_shared(None);
     }
 }

@@ -449,3 +449,180 @@ fn marks_go_with_their_device() {
     drop(h);
     assert_eq!(host.live_objects(), 0, "nothing left on the host");
 }
+
+/// Zero-copy presentation (ADR-0004): a lease on the scanout buffer for the
+/// display is a claim of the presenter's, the readback's rule for a copy
+/// that outlives the flush. It is
+/// granted with everything an importer must match — the canonical image,
+/// the export's size and memory type, its GPU, and the guest's last release —
+/// and while it lives a guest submission touching the buffer waits for it
+/// (bounded), going ahead as soon as it is dropped.
+#[test]
+fn a_shared_present_lease_is_the_presenters_claim_until_it_is_dropped() {
+    let (mut h, host, blob) = compositor_with_blob();
+    let p = payload(&h);
+    assert!(
+        h.renderer
+            .begin_shared_scanout(EXPORTED_RES)
+            .expect("no claim to wait for")
+            .is_none(),
+        "a lease on a frame never released"
+    );
+    zink_batch(&mut h, EXPORTER);
+    settle(&h, &p);
+
+    let lease = h
+        .renderer
+        .begin_shared_scanout(EXPORTED_RES)
+        .expect("the claim")
+        .expect("a lease on a released handle blob");
+    let image = Arc::clone(&lease.image);
+    assert_eq!(image.resource_id, EXPORTED_RES);
+    assert!(
+        image.handle.is_placeholder(),
+        "the fake's payloads are no OS objects"
+    );
+    assert_eq!(image.handle_type, crate::shared::HANDLE_TYPE_OPAQUE_WIN32);
+    assert_eq!(image.memory_type_index, super::s1_tests::DEVICE_LOCAL_TYPE);
+    assert!(image.allocation_size <= blob && image.allocation_size > 0);
+    assert_eq!((image.info.width, image.info.height), (W, H));
+    assert!(image.info.is_bgra8());
+    assert_eq!(
+        image.info.flags & 0x8,
+        0x8,
+        "the canonical image is mutable"
+    );
+    assert_eq!(image.info.view_formats.len(), 2, "with its UNORM/sRGB list");
+    assert_eq!(
+        lease.release,
+        crate::shared::ImageRelease {
+            layout: LAYOUT_COLOR_ATTACHMENT,
+            family: FOREIGN
+        },
+        "the release Zink's batch recorded"
+    );
+    assert_eq!(
+        h.renderer.factory().payloads().running(&p),
+        vec![Owner::Presenter],
+        "the lease is the presenter's running touch"
+    );
+    // A readback of the same buffer meanwhile waits for the presenter's copy
+    // (and fails within the bound, the lease being held), and does not end
+    // the presenter's touch with its own.
+    let start = Instant::now();
+    assert!(read(&mut h, rect(0, 0, 1, 1)).is_err());
+    assert!(start.elapsed() >= SCANOUT_WAIT);
+    assert_eq!(
+        h.renderer.factory().payloads().running(&p),
+        vec![Owner::Presenter]
+    );
+
+    // The guest renders into the buffer again while the display holds it:
+    // held until the bound, then unordered and counted.
+    let start = Instant::now();
+    zink_batch(&mut h, EXPORTER);
+    assert!(start.elapsed() >= SHARED_WAIT, "it waited");
+    assert_eq!(
+        waits(&h, CTX),
+        SharedWaits {
+            waited: 1,
+            timed_out: 1
+        }
+    );
+    drop(lease);
+    settle(&h, &p);
+
+    // Dropped while the guest waits: the guest goes ahead then.
+    let lease = h
+        .renderer
+        .begin_shared_scanout(EXPORTED_RES)
+        .unwrap()
+        .unwrap();
+    assert!(
+        Arc::ptr_eq(&lease.image, &image),
+        "one shared image per accepted layout, not one per flip"
+    );
+    let released = Arc::new(AtomicBool::new(false));
+    let dropper = {
+        let released = Arc::clone(&released);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            released.store(true, Ordering::SeqCst);
+            drop(lease);
+        })
+    };
+    let start = Instant::now();
+    zink_batch(&mut h, EXPORTER);
+    assert!(
+        released.load(Ordering::SeqCst),
+        "it went ahead under the lease"
+    );
+    assert!(start.elapsed() < SHARED_WAIT, "and no later than the drop");
+    dropper.join().unwrap();
+    assert_eq!(
+        waits(&h, CTX),
+        SharedWaits {
+            waited: 2,
+            timed_out: 1
+        }
+    );
+    let _ = host;
+}
+
+/// A lease is not granted over running guest work: while the guest's last
+/// frame on the buffer is still on the host GPU, the lease fails within the
+/// bound — the flush fails in band, as the readback's would — and nothing is
+/// left claimed; once it has finished, the lease is granted. A destroyed blob
+/// has no lease, and a re-accepted layout a new image.
+#[test]
+fn a_lease_waits_for_the_guests_frame_and_goes_with_the_blob() {
+    let (mut h, host) = compositor();
+    let device = host_device(&h, CTX);
+    let p = payload(&h);
+    host.stick_device(device);
+    zink_batch(&mut h, EXPORTER);
+    let start = Instant::now();
+    let err = h
+        .renderer
+        .begin_shared_scanout(EXPORTED_RES)
+        .expect_err("the frame is still on the GPU");
+    assert!(err.to_string().contains("did not finish"), "{err}");
+    assert!(start.elapsed() >= SCANOUT_WAIT && start.elapsed() < SCANOUT_WAIT * 10);
+    assert_eq!(
+        h.renderer.factory().payloads().running(&p),
+        vec![Owner::Queue {
+            ctx_id: CTX,
+            queue: QUEUE
+        }],
+        "the failed lease claimed nothing"
+    );
+    host.release_device(device);
+    settle(&h, &p);
+    let first = h
+        .renderer
+        .begin_shared_scanout(EXPORTED_RES)
+        .unwrap()
+        .expect("finished now");
+    let serial = first.image.serial;
+    drop(first);
+
+    // The same layout accepted again is the same image; a reset is a new
+    // boot, and its first flip a new one.
+    h.renderer.scanout_blob(EXPORTED_RES, &flip()).unwrap();
+    let again = h
+        .renderer
+        .begin_shared_scanout(EXPORTED_RES)
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        again.image.serial, serial,
+        "an accepted layout is shared anew (the renderer's record is replaced)"
+    );
+    drop(again);
+    h.renderer.destroy_blob(EXPORTED_RES);
+    assert!(h
+        .renderer
+        .begin_shared_scanout(EXPORTED_RES)
+        .unwrap()
+        .is_none());
+}
