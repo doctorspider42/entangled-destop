@@ -71,7 +71,7 @@ use std::sync::Arc;
 use ash::vk::{self, Handle};
 
 use crate::venus::executor::host::{
-    CallError, Dedicated, DeviceRequest, HostDeviceInfo, HostGroup, HostVulkan, ImageBind,
+    CallError, Dedicated, DeviceRequest, HostDeviceInfo, HostGroup, HostVulkan, Idle, ImageBind,
     InstanceRequest, MemoryRequest, RawHandle, ResourceMemory,
 };
 use crate::venus::executor::objects::Kind;
@@ -129,6 +129,11 @@ pub struct HostDevice {
     /// with (stage 5c), resolved from it: what their commands are called
     /// through.
     ext: calls::ExtTables,
+    /// Fences of empty submits [`HostVulkan::device_idle_within`] put on
+    /// each queue and found still pending: looked at again by the next call
+    /// rather than submitted anew, and destroyed once signalled (or with the
+    /// device).
+    probes: std::sync::Mutex<Vec<vk::Fence>>,
 }
 
 /// A host `VkDeviceMemory`, and — for an import — the pages the driver
@@ -807,17 +812,91 @@ impl HostVulkan for AshVulkan {
             host_pointer_properties,
             memory_win32_handle,
             ext,
+            probes: std::sync::Mutex::new(Vec::new()),
         })
     }
 
     fn destroy_device(&self, device: HostDevice) {
-        // SAFETY: the executor destroyed every child first; the value is
+        let probes = std::mem::take(
+            &mut *device
+                .probes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        // SAFETY: the executor destroyed every child first, and destroys a
+        // device only once `device_idle_within` found it idle or lost (so
+        // every probe fence is signalled or lost with it); the value is
         // consumed. Waiting for idle first is what vkr does on its worker
-        // thread; this stage submits nothing, so it returns at once.
+        // thread, and returns at once here.
         unsafe {
             let _ = device.device.device_wait_idle();
+            for fence in probes {
+                device.device.destroy_fence(fence, None);
+            }
             device.device.destroy_device(None);
         }
+    }
+
+    fn device_idle_within(
+        &self,
+        device: &HostDevice,
+        queues: &[vk::Queue],
+        timeout: std::time::Duration,
+    ) -> Idle {
+        let d = &device.device;
+        let mut probes = device
+            .probes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if probes.is_empty() {
+            for queue in queues {
+                // SAFETY: a plain fence of our own device.
+                let fence = match unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None) } {
+                    Ok(fence) => fence,
+                    Err(vk::Result::ERROR_DEVICE_LOST) => return Idle::Lost,
+                    // No fence to probe with: fall back to the unbounded
+                    // wait, as a host without this method would.
+                    Err(_) => break,
+                };
+                // SAFETY: `queue` is a queue of `d` (the executor's table),
+                // externally synchronised by the context lock the caller
+                // holds, with the queue's fence thread joined; an empty
+                // submit signals `fence` once everything submitted to the
+                // queue before it has finished.
+                match unsafe { d.queue_submit(*queue, &[], fence) } {
+                    Ok(()) => probes.push(fence),
+                    Err(error) => {
+                        // SAFETY: never submitted.
+                        unsafe { d.destroy_fence(fence, None) };
+                        if error == vk::Result::ERROR_DEVICE_LOST {
+                            return Idle::Lost;
+                        }
+                    }
+                }
+            }
+            if probes.is_empty() {
+                // SAFETY: as in `device_wait_idle`.
+                return match unsafe { d.device_wait_idle() } {
+                    Err(vk::Result::ERROR_DEVICE_LOST) => Idle::Lost,
+                    _ => Idle::Idle,
+                };
+            }
+        }
+        let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        // SAFETY: fences of `d`, each submitted once by the loop above.
+        let idle = match unsafe { d.wait_for_fences(&probes, true, nanos) } {
+            Ok(()) => Idle::Idle,
+            Err(vk::Result::ERROR_DEVICE_LOST) => Idle::Lost,
+            // Timed out — or the wait itself failed, and nothing says the
+            // fences are done: keep them, and look again next time.
+            Err(_) => return Idle::Busy,
+        };
+        for fence in probes.drain(..) {
+            // SAFETY: signalled (or the device is lost, and nothing of it
+            // runs): no pending submission uses the fence.
+            unsafe { d.destroy_fence(fence, None) };
+        }
+        idle
     }
 
     fn device_queue(&self, device: &HostDevice, flags: u32, family: u32, index: u32) -> vk::Queue {

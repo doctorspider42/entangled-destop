@@ -41,6 +41,7 @@ use crate::venus::protocol::{
 use super::context::{id_error, invalid, ExecError, VulkanContext};
 use super::generated::{self, Resolve};
 use super::host::{HostVulkan, RawHandle};
+use super::limits::Class;
 use super::objects::{Facts, IdError, Kind, Objects, RawObject};
 
 /// `VK_WHOLE_SIZE`.
@@ -368,7 +369,12 @@ impl<H: HostVulkan> VulkanContext<H> {
                         ),
                     ));
                 }
-                self.create(command, Kind::ShaderModule, Facts::None, 0)
+                self.create_costing(
+                    command,
+                    Kind::ShaderModule,
+                    Facts::None,
+                    (Class::ShaderBytes, size),
+                )
             }
             Command::CreatePipelineLayout(args) => {
                 let facts = self.pipeline_layout_facts(args)?;
@@ -383,7 +389,21 @@ impl<H: HostVulkan> VulkanContext<H> {
                 let facts = Facts::DescriptorPool {
                     free_individual: flags & POOL_FREE_DESCRIPTOR_SET != 0,
                 };
-                self.create(command, Kind::DescriptorPool, facts, 0)
+                // What a driver allocates for the pool up front: its sets and
+                // every descriptor (bytes, for an inline uniform block).
+                let capacity = args.p_create_info.as_ref().map_or(0, |i| {
+                    i.p_pool_sizes
+                        .iter()
+                        .flatten()
+                        .map(|p| u64::from(p.descriptor_count))
+                        .fold(u64::from(i.max_sets), u64::saturating_add)
+                });
+                self.create_costing(
+                    command,
+                    Kind::DescriptorPool,
+                    facts,
+                    (Class::Descriptors, capacity),
+                )
             }
             Command::CreateDescriptorUpdateTemplate(_) => {
                 self.create(command, Kind::DescriptorUpdateTemplate, Facts::None, 0)
@@ -392,8 +412,18 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::CreateSamplerYcbcrConversion(_) => {
                 self.create(command, Kind::SamplerYcbcrConversion, Facts::None, 0)
             }
-            Command::CreatePipelineCache(_) => {
-                self.create(command, Kind::PipelineCache, Facts::None, 0)
+            Command::CreatePipelineCache(args) => {
+                // The initial data, which a driver copies and keeps.
+                let size = args
+                    .p_create_info
+                    .as_ref()
+                    .map_or(0, |i| i.initial_data_size);
+                self.create_costing(
+                    command,
+                    Kind::PipelineCache,
+                    Facts::None,
+                    (Class::ShaderBytes, size),
+                )
             }
             Command::CreateGraphicsPipelines(args) => {
                 const NAME: &str = "vkCreateGraphicsPipelines";
@@ -475,17 +505,20 @@ impl<H: HostVulkan> VulkanContext<H> {
                 if info.query_count == 0 {
                     return Err(invalid("vkCreateQueryPool", "queryCount is 0"));
                 }
+                let values = match info.query_type {
+                    QUERY_PIPELINE_STATISTICS => info.pipeline_statistics.count_ones(),
+                    // Primitives written and primitives needed (stage 5c).
+                    super::policy::QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM => 2,
+                    _ => 1,
+                };
+                // The pool's slots, which a driver backs with memory up front.
+                let slots = u64::from(info.query_count).saturating_mul(u64::from(values.max(1)));
                 let facts = Facts::QueryPool {
                     query_type: info.query_type,
                     count: info.query_count,
-                    values: match info.query_type {
-                        QUERY_PIPELINE_STATISTICS => info.pipeline_statistics.count_ones(),
-                        // Primitives written and primitives needed (stage 5c).
-                        super::policy::QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM => 2,
-                        _ => 1,
-                    },
+                    values,
                 };
-                self.create(command, Kind::QueryPool, facts, 0)
+                self.create_costing(command, Kind::QueryPool, facts, (Class::Queries, slots))
             }
             Command::CreateEvent(_) => self.create(command, Kind::Event, Facts::None, 0),
             Command::CreatePrivateDataSlot(_) => {
@@ -758,6 +791,11 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.pass_through(command)?;
                 let children = self.objects.children_of_pool(device, pool);
                 self.forget_recordings(&children);
+                // Their recordings are gone with the reset, and so is what
+                // they were charged (`limits::Class::RecordingBytes`).
+                for child in &children {
+                    self.objects.clear_extra(*child);
+                }
                 Ok(())
             }
             Command::BeginCommandBuffer(args) => {
@@ -1723,7 +1761,7 @@ impl<H: HostVulkan> VulkanContext<H> {
     /// context is fatal from the next one on (see the module docs of
     /// [`super`]).
     pub(super) fn note_result(&mut self, command: &'static str, ret: Option<i32>) {
-        if ret == Some(crate::venus::protocol::VK_ERROR_DEVICE_LOST) {
+        if ret == Some(crate::venus::protocol::VK_ERROR_DEVICE_LOST) && !self.lost {
             tracing::warn!(
                 ctx_id = self.ctx_id,
                 command,
@@ -1783,9 +1821,10 @@ impl<H: HostVulkan> VulkanContext<H> {
                 return Err(invalid(name, format!("id {id:#x} is named twice")));
             }
         }
-        if self.objects.len().saturating_add(ids.len()) > super::objects::MAX_OBJECTS_PER_CONTEXT {
+        if let Err(refused) = self.objects.reserve(kind, ids.len()) {
             // What a driver out of room says; nothing is created.
-            generated::set_result(command, crate::venus::protocol::VK_ERROR_OUT_OF_HOST_MEMORY);
+            let ret = self.refuse(name, &refused);
+            generated::set_result(command, ret);
             zero_outputs(command);
             return Ok(());
         }
@@ -1837,6 +1876,41 @@ impl<H: HostVulkan> VulkanContext<H> {
             for (slot, id) in slots.into_iter().zip(&bound) {
                 *slot = *id;
             }
+        }
+        Ok(())
+    }
+
+    /// [`Self::create`] of one object that costs `amount` of `class` beyond
+    /// its count ([`super::limits`]): charged before the host is asked, and
+    /// held by the object's table entry from then on. Refused at a cap, the
+    /// create answers the class's [`Refusal::result`](super::limits::Refusal::result)
+    /// and nothing reaches the host.
+    pub(super) fn create_costing(
+        &mut self,
+        command: &mut Command<'_>,
+        kind: Kind,
+        facts: Facts,
+        (class, amount): (super::limits::Class, u64),
+    ) -> Result<(), ExecError> {
+        let name = command.name();
+        let charge = match self.objects.limits().charge(class, amount) {
+            Ok(charge) => charge,
+            Err(refused) => {
+                self.device_of(command)?;
+                let ret = self.refuse(name, &refused);
+                generated::set_result(command, ret);
+                zero_outputs(command);
+                return Ok(());
+            }
+        };
+        self.create(command, kind, facts, 0)?;
+        let bound = generated::output_handles(command)
+            .and_then(|(_, slots)| slots.first().map(|h| **h))
+            .unwrap_or(0);
+        // The entry takes the charge over; a create that bound nothing
+        // drops it here, which gives it back.
+        if bound != 0 {
+            self.objects.set_extra(bound, class, charge);
         }
         Ok(())
     }

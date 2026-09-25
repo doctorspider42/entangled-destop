@@ -26,16 +26,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use super::host::HostVulkan;
+use super::host::{HostVulkan, Idle};
+use super::limits::{class_of, Class, ContextLimits, Refusal};
 use super::policy::GuestDevice;
 use super::timeline::QueueSync;
-use crate::venus::shmem::RingPages;
+use crate::venus::shmem::{Charge, RingPages};
 
-/// Most objects one context may hold. A guest id names a host allocation,
-/// so the table is bounded like every other guest-sized thing in this crate;
-/// past it a create answers `VK_ERROR_OUT_OF_HOST_MEMORY`, which is what a
-/// driver out of room says.
+/// Most objects one context may hold by default ([`Class::Objects`] in
+/// [`super::limits`], where every other cap on the table lives too). A guest
+/// id names a host allocation, so the table is bounded like every other
+/// guest-sized thing in this crate; past it a create answers
+/// `VK_ERROR_OUT_OF_HOST_MEMORY`, which is what a driver out of room says.
 pub const MAX_OBJECTS_PER_CONTEXT: usize = 1 << 16;
 
 /// The object types this stage can create.
@@ -357,6 +360,13 @@ pub struct MemoryObject<H: HostVulkan> {
     /// import imported. How a bind of a canonical image to this memory finds
     /// the blob to record itself on.
     pub shared: Option<crate::venus::renderer::SharedRef>,
+    /// What the allocation is charged to (ADR-0004, the resource-exhaustion
+    /// amendment): its heap's device-local share, or the host-visible share
+    /// for a plain allocation of host RAM; `None` for our pages (charged by
+    /// the pages themselves) and for an import of our pages. Shared with a
+    /// handle blob made of it and with every import of that blob, because
+    /// the allocation lives as long as any of them does.
+    pub charge: Option<Arc<Charge>>,
 }
 
 /// A canonical image recorded on a handle blob (stage S2b).
@@ -720,9 +730,96 @@ impl<H: HostVulkan> Child for ImageObject<H> {
     }
 }
 
+/// One id's entry: its kind, and what it is charged for ([`super::limits`]):
+/// one object, one of its kind's class, and whatever else it costs. Every
+/// charge goes back when the entry leaves the table, by whatever path.
+#[derive(Debug)]
+struct Entry {
+    kind: Kind,
+    _object: Charge,
+    _class: Charge,
+    /// Its cost beyond its count (SPIR-V, descriptors, query slots,
+    /// recorded commands), of [`Entry::extra_class`].
+    extra: Charge,
+    extra_class: Option<Class>,
+}
+
+/// The id → kind map every table lookup checks first, and the one place the
+/// table's charges are taken and given back (see [`super::limits`]).
+#[derive(Debug)]
+pub struct KindTable {
+    map: HashMap<u64, Entry>,
+    limits: ContextLimits,
+    /// Charges taken ahead of a create by [`Objects::reserve`], one unit per
+    /// object the create may bind: `(objects, class)` per kind. What a
+    /// create does not bind is given back by [`Objects::release_reserved`].
+    ///
+    /// A cell, so a create can reserve while it still holds references into
+    /// the table (its device, its physical device's facts).
+    reserved: std::cell::RefCell<HashMap<Kind, (Charge, Charge)>>,
+}
+
+impl KindTable {
+    fn new(limits: ContextLimits) -> Self {
+        Self {
+            map: HashMap::new(),
+            limits,
+            reserved: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn insert(&mut self, id: u64, kind: Kind) {
+        let (object, class) = match self.reserved.get_mut().get_mut(&kind) {
+            Some((object, class)) if object.amount() > 0 => (object.split(1), class.split(1)),
+            // Nothing reserved: bounded by construction (an instance, the
+            // physical devices the host has, the queues a device was made
+            // with), counted anyway.
+            _ => (
+                self.limits.charge_anyway(Class::Objects, 1),
+                class_of(kind).map_or_else(Charge::none, |c| self.limits.charge_anyway(c, 1)),
+            ),
+        };
+        self.map.insert(
+            id,
+            Entry {
+                kind,
+                _object: object,
+                _class: class,
+                extra: Charge::none(),
+                extra_class: None,
+            },
+        );
+    }
+
+    fn remove(&mut self, id: &u64) -> Option<Kind> {
+        self.map.remove(id).map(|entry| entry.kind)
+    }
+
+    fn get(&self, id: &u64) -> Option<&Kind> {
+        self.map.get(id).map(|entry| &entry.kind)
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Kind> {
+        self.map.values().map(|entry| &entry.kind)
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.reserved.get_mut().clear();
+    }
+}
+
 /// The table. See the module docs.
 pub struct Objects<H: HostVulkan> {
-    kinds: HashMap<u64, Kind>,
+    kinds: KindTable,
     instance: Option<(u64, InstanceObject<H>)>,
     physical: HashMap<u64, usize>,
     devices: HashMap<u64, DeviceObject<H>>,
@@ -738,8 +835,16 @@ pub struct Objects<H: HostVulkan> {
 
 impl<H: HostVulkan> Default for Objects<H> {
     fn default() -> Self {
+        Self::with_limits(ContextLimits::default())
+    }
+}
+
+impl<H: HostVulkan> Objects<H> {
+    /// An empty table charging `limits`.
+    #[must_use]
+    pub fn with_limits(limits: ContextLimits) -> Self {
         Self {
-            kinds: HashMap::new(),
+            kinds: KindTable::new(limits),
             instance: None,
             physical: HashMap::new(),
             devices: HashMap::new(),
@@ -758,7 +863,7 @@ impl<H: HostVulkan> Default for Objects<H> {
 /// `id` of `kind` in `map`, which must belong to `device`.
 fn child_in<'a, T: Child>(
     map: &'a HashMap<u64, T>,
-    kinds: &HashMap<u64, Kind>,
+    kinds: &KindTable,
     kind: Kind,
     device: u64,
     id: u64,
@@ -782,7 +887,7 @@ fn child_in<'a, T: Child>(
 /// [`child_in`], mutably.
 fn child_in_mut<'a, T: Child>(
     map: &'a mut HashMap<u64, T>,
-    kinds: &HashMap<u64, Kind>,
+    kinds: &KindTable,
     kind: Kind,
     device: u64,
     id: u64,
@@ -808,7 +913,7 @@ fn child_in_mut<'a, T: Child>(
 /// `VK_NULL_HANDLE` is a no-op in Vulkan.
 fn take_in<T: Child>(
     map: &mut HashMap<u64, T>,
-    kinds: &mut HashMap<u64, Kind>,
+    kinds: &mut KindTable,
     kind: Kind,
     device: u64,
     id: u64,
@@ -821,7 +926,7 @@ fn take_in<T: Child>(
     Ok(map.remove(&id))
 }
 
-fn check_kind(kinds: &HashMap<u64, Kind>, id: u64, kind: Kind) -> Result<(), IdError> {
+fn check_kind(kinds: &KindTable, id: u64, kind: Kind) -> Result<(), IdError> {
     if id == 0 {
         return Err(IdError::Zero(kind.name()));
     }
@@ -860,10 +965,100 @@ impl<H: HostVulkan> Objects<H> {
         self.kinds.is_empty()
     }
 
-    /// Whether another object fits under [`MAX_OBJECTS_PER_CONTEXT`].
+    /// The context's shares of every cap ([`super::limits`]).
     #[must_use]
-    pub fn has_room(&self) -> bool {
-        self.kinds.len() < MAX_OBJECTS_PER_CONTEXT
+    pub fn limits(&self) -> &ContextLimits {
+        &self.kinds.limits
+    }
+
+    /// The same, mutably (device-local shares are made on first use).
+    pub fn limits_mut(&mut self) -> &mut ContextLimits {
+        &mut self.kinds.limits
+    }
+
+    /// Take room for `count` more objects of `kind` — of the context's and
+    /// the renderer's objects, and of the kind's class where it has one —
+    /// ahead of the host call that makes them. What the call does not bind
+    /// is given back by [`Self::release_reserved`], which the executor calls
+    /// after every command.
+    ///
+    /// # Errors
+    /// The refusal, whose [`Refusal::result`] is what the create answers;
+    /// nothing is taken.
+    pub fn reserve(&self, kind: Kind, count: usize) -> Result<(), Refusal> {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        let limits = &self.kinds.limits;
+        let mut reserved = self.kinds.reserved.borrow_mut();
+        match reserved.get_mut(&kind) {
+            Some((object, class)) => {
+                limits.grow(Class::Objects, object, count)?;
+                if let Some(of) = class_of(kind) {
+                    if let Err(refused) = limits.grow(of, class, count) {
+                        object.shrink_to(object.amount().saturating_sub(count));
+                        return Err(refused);
+                    }
+                }
+            }
+            None => {
+                let object = limits.charge(Class::Objects, count)?;
+                let class = match class_of(kind) {
+                    Some(of) => limits.charge(of, count)?,
+                    None => Charge::none(),
+                };
+                reserved.insert(kind, (object, class));
+            }
+        }
+        Ok(())
+    }
+
+    /// Give back every reservation no create bound.
+    pub fn release_reserved(&mut self) {
+        self.kinds.reserved.get_mut().clear();
+    }
+
+    /// Charge `amount` of `class` to object `id`'s entry, on top of what it
+    /// already carries (one class per entry: a later charge of another
+    /// class replaces nothing and is refused as a host bug would be).
+    ///
+    /// # Errors
+    /// The refusal; the entry is unchanged.
+    pub fn charge_extra(&mut self, id: u64, class: Class, amount: u64) -> Result<(), Refusal> {
+        let KindTable { limits, map, .. } = &mut self.kinds;
+        let Some(entry) = map.get_mut(&id) else {
+            return Ok(());
+        };
+        match entry.extra_class {
+            Some(held) if held == class => limits.grow(class, &mut entry.extra, amount),
+            _ => {
+                entry.extra = limits.charge(class, amount)?;
+                entry.extra_class = Some(class);
+                Ok(())
+            }
+        }
+    }
+
+    /// Hand object `id`'s entry `charge`, of `class`, in place of whatever
+    /// it carried beyond its count.
+    pub fn set_extra(&mut self, id: u64, class: Class, charge: Charge) {
+        if let Some(entry) = self.kinds.map.get_mut(&id) {
+            entry.extra = charge;
+            entry.extra_class = Some(class);
+        }
+    }
+
+    /// Give back everything object `id`'s entry carries beyond its count
+    /// (a command buffer begun again or reset).
+    pub fn clear_extra(&mut self, id: u64) {
+        if let Some(entry) = self.kinds.map.get_mut(&id) {
+            entry.extra = Charge::none();
+            entry.extra_class = None;
+        }
+    }
+
+    /// What object `id`'s entry carries beyond its count.
+    #[must_use]
+    pub fn extra(&self, id: u64) -> u64 {
+        self.kinds.map.get(&id).map_or(0, |e| e.extra.amount())
     }
 
     /// Check that `id` may name a new object: nonzero and unused.
@@ -1417,36 +1612,61 @@ impl<H: HostVulkan> Objects<H> {
     // ----------------------------------------------------------- teardown
 
     /// Destroy device `id` and everything under it, in dependency order:
-    /// views, images, buffers, memory, pools, queues, then the device.
-    /// Unknown ids are the caller's to have refused.
-    pub fn destroy_device(&mut self, host: &H, id: u64) {
-        let Some(device) = self.devices.remove(&id) else {
-            return;
+    /// views, images, buffers, memory, pools, queues, then the device —
+    /// once its GPU work has finished, waiting at most `timeout` for that.
+    /// [`Teardown::Busy`] if it has not: nothing is destroyed and the device
+    /// stays in the table, its fence threads stopped, for the caller to try
+    /// again or to park ([`super::Graveyard`]). Unknown ids are the caller's
+    /// to have refused.
+    pub fn destroy_device(&mut self, host: &H, id: u64, timeout: Duration) -> Teardown {
+        let Some(device) = self.devices.get(&id) else {
+            return Teardown::Done;
         };
-        self.kinds.remove(&id);
         // The fence threads of its queues first (stage 5b.3): each is told
         // to stop, then joined — within one wait slice, and none takes a lock
         // the caller holds — so none is waiting on the device when it goes.
-        let mut syncs: Vec<QueueSync<H>> = self
+        let mut syncs: Vec<(u64, QueueSync<H>)> = self
             .queues
-            .values_mut()
-            .filter(|queue| queue.device == id)
-            .filter_map(|queue| queue.sync.take())
+            .iter_mut()
+            .filter(|(_, queue)| queue.device == id)
+            .filter_map(|(qid, queue)| queue.sync.take().map(|sync| (*qid, sync)))
             .collect();
-        for sync in &syncs {
+        for (_, sync) in &syncs {
             sync.signal_stop();
         }
-        for sync in &mut syncs {
+        for (_, sync) in &mut syncs {
             sync.join();
         }
         // Nothing may be freed under work the GPU is still doing: vkr waits
-        // on its worker thread the same way (`vkr_device_destroy`). A lost
-        // device answers at once, and its objects may still be destroyed.
-        let _ = host.device_wait_idle(&device.host);
+        // on its worker thread the same way (`vkr_device_destroy`), without
+        // a bound. Here the wait is bounded: a queue whose work waits on a
+        // timeline value no one will signal never goes idle, and the thread
+        // tearing a context down is the device's own worker. A lost device
+        // answers at once, and its objects may still be destroyed.
+        let queues: Vec<H::Queue> = self
+            .queues
+            .values()
+            .filter(|queue| queue.device == id)
+            .map(|queue| queue.host)
+            .collect();
+        if host.device_idle_within(&device.host, &queues, timeout) == Idle::Busy {
+            // The stopped fence threads go back with their queues; they are
+            // finished when the device is.
+            for (qid, sync) in syncs {
+                if let Some(queue) = self.queues.get_mut(&qid) {
+                    queue.sync = Some(sync);
+                }
+            }
+            return Teardown::Busy;
+        }
+        let Some(device) = self.devices.remove(&id) else {
+            return Teardown::Done;
+        };
+        self.kinds.remove(&id);
         // The fences the threads had not seen signal have now (the device is
         // idle): destroyed, and retired in order, as vkr retires a queue's
         // outstanding syncs when it goes (`vkr_queue_sync_thread_fini`).
-        for sync in syncs {
+        for (_, sync) in syncs {
             sync.finish(host, &device.host);
         }
         let raw = children_of(&self.raw, id);
@@ -1532,14 +1752,25 @@ impl<H: HostVulkan> Objects<H> {
                 "a host VkDevice is still shared at destruction and is leaked"
             ),
         }
+        Teardown::Done
     }
 
-    /// Destroy the instance and everything under it. After this the table is
-    /// empty and holds no host object.
-    pub fn destroy_all(&mut self, host: &H) {
+    /// Destroy the instance and everything under it, each device once its
+    /// GPU work has finished, waiting at most `timeout` in all. After
+    /// [`Teardown::Done`] the table is empty and holds no host object; after
+    /// [`Teardown::Busy`] it holds the devices whose work had not finished,
+    /// and the physical devices and the instance they need, and nothing else.
+    pub fn destroy_all(&mut self, host: &H, timeout: Duration) -> Teardown {
+        let deadline = Instant::now() + timeout;
         let devices: Vec<u64> = self.devices.keys().copied().collect();
+        let mut busy = false;
         for id in devices {
-            self.destroy_device(host, id);
+            let left = deadline.saturating_duration_since(Instant::now());
+            busy |= self.destroy_device(host, id, left) == Teardown::Busy;
+        }
+        if busy {
+            // A device of the instance lives on: so does the instance.
+            return Teardown::Busy;
         }
         for id in self.physical.drain().map(|(id, _)| id) {
             self.kinds.remove(&id);
@@ -1558,5 +1789,29 @@ impl<H: HostVulkan> Objects<H> {
         self.buffer_views.clear();
         self.image_views.clear();
         self.raw.clear();
+        Teardown::Done
+    }
+
+    /// Host devices the table holds.
+    #[must_use]
+    pub fn device_count(&self) -> usize {
+        self.devices.len()
     }
 }
+
+/// What a teardown did ([`Objects::destroy_device`], [`Objects::destroy_all`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Teardown {
+    /// Everything asked for is destroyed.
+    Done,
+    /// A device's GPU work had not finished within the time given: it, and
+    /// what it needs, are still in the table.
+    Busy,
+}
+
+/// How long a context's teardown waits for its devices' GPU work before it
+/// parks them ([`super::Graveyard`]): half a second, far past any frame, and
+/// short enough that the device worker tearing the context down is not held
+/// up by a guest whose GPU work waits forever.
+pub const TEARDOWN_WAIT: Duration = Duration::from_millis(500);

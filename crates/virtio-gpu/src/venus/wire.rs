@@ -209,6 +209,20 @@ pub enum WireError {
         budget: usize,
     },
 
+    #[error(
+        "decoding this command would need {wanted} more temporary bytes, and the decode pool it \
+         shares holds {used} of {limit}"
+    )]
+    DecodePoolExhausted {
+        /// Host bytes the array or link would cost.
+        wanted: usize,
+        /// What the refusing level of the pool held (the context's share or
+        /// the renderer-wide whole, `executor::limits::Class::DecodeBytes`).
+        used: u64,
+        /// Its cap.
+        limit: u64,
+    },
+
     #[error("the host could not allocate the {wanted} bytes a guest-declared array needs")]
     OutOfMemory {
         /// Host bytes the allocator refused.
@@ -354,6 +368,13 @@ pub struct Decoder<'a> {
     initial_budget: usize,
     /// How deep the pNext recursion currently is.
     depth: u32,
+    /// What this decode holds of a pool it shares with every other command
+    /// in flight ([`Decoder::with_pool`]), given back when the decoder is
+    /// dropped or its budget reset. `None`: no pool.
+    pool: Option<crate::venus::shmem::Charge>,
+    /// The most this decoder's current command has been charged: what a test
+    /// asserts a hostile stream could not make it allocate past.
+    peak: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -367,7 +388,57 @@ impl<'a> Decoder<'a> {
             budget: MAX_TEMP_ALLOC_BYTES,
             initial_budget: MAX_TEMP_ALLOC_BYTES,
             depth: 0,
+            pool: None,
+            peak: 0,
         }
+    }
+
+    /// A decoder whose every charge is also taken from `pool` — a budget
+    /// every command in flight shares (the executor's per-context share of
+    /// its renderer-wide decode pool) — and given back when the decoder is
+    /// dropped or its budget reset. `budget` bounds one command, as in
+    /// [`Decoder::with_alloc_budget`].
+    #[must_use]
+    pub fn with_pool(
+        bytes: &'a [u8],
+        budget: usize,
+        pool: &std::sync::Arc<crate::venus::shmem::PageBudget>,
+    ) -> Self {
+        Self {
+            pool: pool.charge(0).ok(),
+            ..Self::with_alloc_budget(bytes, budget)
+        }
+    }
+
+    /// The most host bytes one command of this decoder has been charged
+    /// since it was made or its budget last reset.
+    #[must_use]
+    pub fn peak_alloc(&self) -> usize {
+        self.peak
+    }
+
+    /// Take `bytes` from the per-command budget and from the pool, or
+    /// refuse — the stream is then fatal — taking nothing.
+    fn take_alloc(&mut self, bytes: usize) -> Result<(), WireError> {
+        if bytes > self.budget {
+            let budget = self.budget;
+            return self.fail(WireError::AllocationBudgetExhausted {
+                wanted: bytes,
+                budget,
+            });
+        }
+        if let Some(pool) = self.pool.as_mut() {
+            if let Err((used, limit)) = pool.grow(u64::try_from(bytes).unwrap_or(u64::MAX)) {
+                return self.fail(WireError::DecodePoolExhausted {
+                    wanted: bytes,
+                    used,
+                    limit,
+                });
+            }
+        }
+        self.budget -= bytes;
+        self.peak = self.peak.max(self.initial_budget - self.budget);
+        Ok(())
     }
 
     /// A decoder with a smaller allocation budget than the protocol's maximum.
@@ -423,15 +494,7 @@ impl<'a> Decoder<'a> {
     /// is then fatal), or [`WireError::Poisoned`].
     pub fn charge(&mut self, bytes: usize) -> Result<(), WireError> {
         self.guard()?;
-        if bytes > self.budget {
-            let budget = self.budget;
-            return self.fail(WireError::AllocationBudgetExhausted {
-                wanted: bytes,
-                budget,
-            });
-        }
-        self.budget -= bytes;
-        Ok(())
+        self.take_alloc(bytes)
     }
 
     /// Give the next command a full allocation budget again, as
@@ -439,6 +502,10 @@ impl<'a> Decoder<'a> {
     /// fatal flag — the reference never clears its own either.
     pub fn reset_alloc_budget(&mut self) {
         self.budget = self.initial_budget;
+        self.peak = 0;
+        if let Some(pool) = self.pool.as_mut() {
+            pool.shrink_to(0);
+        }
     }
 
     /// Poison the stream from a layer above this one — an opcode with no
@@ -1012,7 +1079,7 @@ impl<'a> Decoder<'a> {
             let _: TryReserveError = err;
             return self.fail(WireError::OutOfMemory { wanted });
         }
-        self.budget -= wanted;
+        self.take_alloc(wanted)?;
         Ok(out)
     }
 
@@ -1820,6 +1887,53 @@ mod tests {
             before,
             "a refused array must cost nothing"
         );
+    }
+
+    /// A decode charged to a shared pool (the executor's decode share) takes
+    /// from it exactly what the per-command budget does, refuses past it
+    /// without taking anything, and gives it all back when reset or dropped;
+    /// a count the stream cannot hold costs it nothing at all.
+    #[test]
+    fn a_pooled_decode_takes_from_the_pool_and_gives_it_back() {
+        let pool = crate::venus::shmem::PageBudget::new(96);
+        let bytes = vec![0u8; 4096];
+        {
+            let mut d = Decoder::with_pool(&bytes, 1 << 20, &pool);
+            d.u32_array(16).expect("64 bytes");
+            assert_eq!(pool.used(), 64);
+            assert_eq!(d.peak_alloc(), 64);
+            let err = d.u32_array(16).expect_err("another 64 is past the pool");
+            assert!(
+                matches!(
+                    err,
+                    WireError::DecodePoolExhausted {
+                        wanted: 64,
+                        used: 64,
+                        limit: 96
+                    }
+                ),
+                "{err}"
+            );
+            assert!(d.is_fatal());
+            assert_eq!(pool.used(), 64, "a refusal takes nothing");
+        }
+        assert_eq!(pool.used(), 0, "dropped: given back");
+
+        let mut d = Decoder::with_pool(&bytes, 1 << 20, &pool);
+        d.u32_array(8).expect("32 bytes");
+        d.reset_alloc_budget();
+        assert_eq!((pool.used(), d.peak_alloc()), (0, 0), "reset: given back");
+
+        // Four hundred million elements declared behind 4 KiB of stream.
+        let mut d = Decoder::with_pool(&bytes, 1 << 20, &pool);
+        let err = d
+            .u32_array(400_000_000)
+            .expect_err("longer than the stream");
+        assert!(
+            matches!(err, WireError::ArrayLongerThanStream { .. }),
+            "{err}"
+        );
+        assert_eq!((pool.used(), d.peak_alloc()), (0, 0));
     }
 
     #[test]

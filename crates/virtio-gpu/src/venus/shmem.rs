@@ -262,6 +262,8 @@ pub const MAX_MEMORY_ALIGNMENT: u64 = 2 << 20;
 pub struct PageBudget {
     limit: u64,
     used: AtomicU64,
+    /// The most `used` has ever been: a high-water mark, for the usage log.
+    peak: AtomicU64,
     /// The budget this one is a share of, charged and refunded with it.
     whole: Option<Arc<PageBudget>>,
 }
@@ -273,6 +275,7 @@ impl PageBudget {
         Arc::new(Self {
             limit,
             used: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
             whole: None,
         })
     }
@@ -285,6 +288,7 @@ impl PageBudget {
         Arc::new(Self {
             limit: limit.min(whole.limit),
             used: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
             whole: Some(Arc::clone(whole)),
         })
     }
@@ -301,6 +305,14 @@ impl PageBudget {
         self.used.load(Ordering::Acquire)
     }
 
+    /// The most ever charged at once: what a usage log reports as a peak,
+    /// which no periodic sample of [`Self::used`] would catch for a charge
+    /// that lives a millisecond (a command's decode).
+    #[must_use]
+    pub fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Acquire)
+    }
+
     /// Take `bytes` out of the budget — and out of the whole it is a share
     /// of — or refuse without taking anything from either.
     fn try_charge(&self, bytes: u64) -> bool {
@@ -308,11 +320,12 @@ impl PageBudget {
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|total| *total <= self.limit)
-            })
-            .is_ok();
-        if !charged {
+            });
+        let Ok(before) = charged else {
             return false;
-        }
+        };
+        self.peak
+            .fetch_max(before.saturating_add(bytes), Ordering::AcqRel);
         match &self.whole {
             Some(whole) if !whole.try_charge(bytes) => {
                 self.refund_own(bytes);
@@ -347,6 +360,132 @@ impl PageBudget {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 Some(used.saturating_sub(bytes))
             });
+    }
+
+    /// Take `amount` out of the budget as a [`Charge`] that gives it back
+    /// when dropped — or `Err((used, limit))` of whichever level refused
+    /// (the share, or the whole behind it), taking nothing.
+    ///
+    /// # Errors
+    /// The refusing level's use and limit.
+    pub fn charge(self: &Arc<Self>, amount: u64) -> Result<Charge, (u64, u64)> {
+        if self.try_charge(amount) {
+            Ok(Charge {
+                budget: Some(Arc::clone(self)),
+                amount,
+            })
+        } else {
+            Err(self.refuser(amount))
+        }
+    }
+
+    /// Take `amount` whatever the limit says — for what is bounded by
+    /// construction elsewhere (a queue the guest fetches, a physical device
+    /// the host enumerates) but should still show in the count.
+    #[must_use]
+    pub fn charge_anyway(self: &Arc<Self>, amount: u64) -> Charge {
+        self.force(amount);
+        Charge {
+            budget: Some(Arc::clone(self)),
+            amount,
+        }
+    }
+
+    fn force(&self, amount: u64) {
+        let before = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_add(amount))
+            })
+            .unwrap_or_default();
+        self.peak
+            .fetch_max(before.saturating_add(amount), Ordering::AcqRel);
+        if let Some(whole) = &self.whole {
+            whole.force(amount);
+        }
+    }
+
+    /// The budget this one is a share of, if it is one.
+    #[must_use]
+    pub fn whole(&self) -> Option<&Arc<Self>> {
+        self.whole.as_ref()
+    }
+}
+
+/// An amount taken out of a [`PageBudget`] (and the whole it is a share of),
+/// given back exactly once: when the charge is dropped. Held by whatever the
+/// amount stands for — a table entry, a memory object, a decode — so every
+/// path that lets that go, however implicit, refunds it (ADR-0004, the
+/// resource-exhaustion amendment: "no leak path").
+#[derive(Debug, Default)]
+pub struct Charge {
+    budget: Option<Arc<PageBudget>>,
+    amount: u64,
+}
+
+impl Charge {
+    /// A charge of nothing, against nothing.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// What it holds.
+    #[must_use]
+    pub fn amount(&self) -> u64 {
+        self.amount
+    }
+
+    /// The budget it is charged to.
+    #[must_use]
+    pub fn budget(&self) -> Option<&Arc<PageBudget>> {
+        self.budget.as_ref()
+    }
+
+    /// Take `more` out of the same budget into this charge.
+    ///
+    /// # Errors
+    /// As [`PageBudget::charge`]; this charge is unchanged. A charge against
+    /// nothing grows without limit.
+    pub fn grow(&mut self, more: u64) -> Result<(), (u64, u64)> {
+        match &self.budget {
+            Some(budget) if !budget.try_charge(more) => Err(budget.refuser(more)),
+            _ => {
+                self.amount = self.amount.saturating_add(more);
+                Ok(())
+            }
+        }
+    }
+
+    /// Give back everything past `keep`.
+    pub fn shrink_to(&mut self, keep: u64) {
+        let back = self.amount.saturating_sub(keep);
+        if back > 0 {
+            if let Some(budget) = &self.budget {
+                budget.refund(back);
+            }
+            self.amount -= back;
+        }
+    }
+
+    /// Move `amount` (at most what it holds) out into a charge of its own on
+    /// the same budget.
+    #[must_use]
+    pub fn split(&mut self, amount: u64) -> Self {
+        let amount = amount.min(self.amount);
+        self.amount -= amount;
+        Self {
+            budget: self.budget.clone(),
+            amount,
+        }
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.budget {
+            budget.refund(self.amount);
+        }
     }
 }
 

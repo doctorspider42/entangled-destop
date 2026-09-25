@@ -189,11 +189,15 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_gpu::blob::MAX_HOST_VISIBLE_MAPPINGS` | 4096 | live mappings the host-visible window tracks; never below `vmm_core::MAX_HOST_RANGES` | fuzz target `gpu_blob`, `entangled::run_vm::tests::one_venus_client_at_its_shares_leaves_most_of_the_window_ranges` |
 | `virtio_gpu::venus::renderer::VENUS_HOST_VISIBLE_BYTES` | 4 GiB (profile: `[display] host_visible_mib`, 64..=4096, a power of two) | the Venus host-visible window, guest-visible as BAR 2; holds every host blob and host-visible byte the budgets admit, so it never bites first. No host pages behind it | `venus::renderer::tests::the_default_window_holds_everything_the_budgets_admit_and_a_profile_may_resize_it`, `control_api::config::tests::the_host_visible_window_is_a_power_of_two_inside_the_bar_cap` |
 | `vmm_core::shm::MAX_HOST_RANGES` | 4096 | renderer ranges (hypervisor mappings) in one window; four times what one Venus context may map at its shares | `vmm_core::shm::tests::{renderer_ranges_are_bounded, a_gpu_composited_desktop_fits_in_the_renderer_ranges}` |
-| `virtio_gpu::venus::executor::MAX_HOST_VISIBLE_BYTES` / `_PER_CONTEXT` | 2 GiB / 1 GiB | host pages behind host-visible Vulkan memory, every context / one context (`PageBudget::share`) | `venus::shmem::tests::a_budget_share_is_bounded_by_itself_and_by_the_whole`, `executor::memory_tests::one_context_cannot_take_the_host_visible_budget_from_the_rest` |
+| `virtio_gpu::venus::executor::MAX_HOST_VISIBLE_BYTES` / `_PER_CONTEXT` | 2 GiB / 1 GiB | host pages behind host-visible Vulkan memory, and host RAM the driver allocates for a heap that is not device local, every context / one context (`PageBudget::share`) | `venus::shmem::tests::a_budget_share_is_bounded_by_itself_and_by_the_whole`, `executor::memory_tests::one_context_cannot_take_the_host_visible_budget_from_the_rest` |
 | `virtio_gpu::venus::renderer::MAX_MEMORY_BLOBS` / `_PER_CONTEXT` | 4096 / 1024 | blobs of `VkDeviceMemory` (each mapped one is a window range) | `executor::memory_tests::one_context_cannot_take_the_memory_blobs_from_the_rest` |
 | `virtio_gpu::venus::renderer::MAX_RING_BLOBS(_BYTES)` / `_PER_CONTEXT` | 1024, 1 GiB / 64, 128 MiB | host blobs: rings, reply and command-stream pools | `venus::renderer::tests::{a_gpu_composited_desktop_of_venus_clients_fits_in_the_host_blob_budget, one_context_cannot_take_the_host_blob_budget_from_the_rest}` |
 | `virtio_gpu::venus::renderer::MAX_RINGS` / `MAX_RINGS_PER_CONTEXT` | 256 / 32 | rings, and with them ring-worker threads (one TLS ring per guest thread that creates pipelines) | `venus::renderer::tests::{a_gpu_composited_desktop_and_a_game_fit_in_the_ring_caps, the_ring_caps_hold_per_context_and_overall_and_bound_the_threads}` |
 | `virtio_gpu::venus::executor::timeline::MAX_FENCE_THREADS` | 256 | host fence threads, every context together (one context alone could have 63) | `executor::sync_tests::fence_threads_are_capped_across_every_context_and_given_back` |
+| `virtio_gpu::venus::executor::limits::Class` (`Caps::default`) | per context / renderer-wide: objects 65 536 / 262 144; devices 4 / 64; memory objects 4096 / 16 384; pipelines, shader modules, command buffers, fences, semaphores, events 16 384 / 65 536; descriptor pools 4096 / 16 384; pipeline caches 256 / 2048; query and command pools 1024 / 4096; SPIR-V + cache bytes 256 MiB / 1 GiB; descriptors (pool `maxSets` + counts) 8 Mi / 32 Mi; query slots 1 Mi / 4 Mi; recorded command bytes 256 MiB / 1 GiB; decode bytes in flight 512 MiB / 2 GiB | every host object and every cost one carries, charged by the table entry that holds it (`objects::KindTable`), so every implicit free refunds; exhausted → the create's `VkResult` (`OUT_OF_HOST_MEMORY`, `TOO_MANY_OBJECTS` for memory, `OUT_OF_DEVICE_MEMORY` for descriptors and queries), or the context ends where the command has none (a `vkCmd*`, a decode) | `executor::limits_tests::*`, `executor::limits::tests::*` |
+| `virtio_gpu::venus::executor::limits::DEVICE_LOCAL_WHOLE` / `DEVICE_LOCAL_SHARE` (profile: `[display] gpu_memory_mib`, 256..=1 Mi) | ¾ of each device-local heap / ¾ of that | plain `vkAllocateMemory` of VRAM, per heap of each GPU, held by the memory object and by any handle blob or import of it; the guest's heap size is the share (`policy::guest_heaps`); a heap that is not device local is charged to the host-visible share | `executor::limits_tests::device_local_memory_is_refused_at_the_share_and_the_whole_and_given_back`, `s1_tests::a_handle_blob_keeps_its_device_local_charge_until_it_goes`, `host_vulkan::pipeline_tests::allocating_past_the_device_local_cap_is_out_of_device_memory_and_the_gpu_keeps_working` (real GPU) |
+| `virtio_gpu::venus::executor::limits::MAX_COMMAND_DECODE_BYTES` | 256 MiB | host bytes one command's decode may allocate (also taken from the context's `DecodeBytes` share while it runs, with the copies `vkExecuteCommandStreamsMESA` makes) | `executor::limits_tests::{one_commands_decode_is_bounded_whatever_count_it_declares, a_decode_past_the_pool_ends_its_context_and_gives_the_pool_back}`, `wire::tests::a_pooled_decode_takes_from_the_pool_and_gives_it_back` |
+| `virtio_gpu::venus::executor::objects::TEARDOWN_WAIT` | 500 ms | how long a context teardown waits for its devices' GPU work (`HostVulkan::device_idle_within`) before it parks them, still charged, in the `Graveyard` | `executor::limits_tests::a_context_whose_gpu_work_never_finishes_is_parked_not_waited_for` |
 | `virtio_gpu::blob::BLOB_PAGE_SIZE` | 4096 | granularity every blob size and map offset must be a multiple of | `blob::tests::window_reservations_cannot_overlap_or_run_off_the_end` |
 | `virtio_gpu::MAX_COMMAND_BYTES_BLOB` | 256 KiB + 56 B | gather cap once blob resources are offered — 24 bytes above the 2D cap, because a full-length `RESOURCE_CREATE_BLOB` really is 24 bytes longer than a full-length attach-backing | `virtio_gpu::device::tests::command_buffer_bound_matches_the_entry_limit` (compile-time `assert!`s in `device.rs`) |
 | `virtio_gpu::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick (controlq and cursorq) | same shape as the blk budget test |
@@ -447,6 +451,29 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   none, until whichever cap comes first — 1 GiB, 3 GiB, the window's ranges. No budget absorbs that; the
   per-context shares are what keep such a client from taking everything from
   everyone else (ADR-0004, the capacity amendment).
+- **Every host object a guest makes is charged where it is held**
+  (ADR-0004, the resource-exhaustion amendment). The executor's caps live
+  in one place, `venus::executor::limits`: a per-context share and a
+  renderer-wide whole per class (`PageBudget::share`, as the host-visible
+  pages always were), charged by the object table's entry
+  (`objects::KindTable`) — so a pool freeing its children, a device taking
+  everything with it, a context going and a reset all refund, with no
+  bookkeeping to forget. A new create path reserves before the host call
+  (`Objects::reserve`, released after every command) and answers the
+  refusal's `VkResult`; a new cost an object carries goes on its entry
+  (`create_costing`, `charge_extra`); new device memory holds its charge in
+  the memory object (`MemoryObject::charge`), shared with anything that keeps
+  the allocation alive. Mesa allocates and creates asynchronously, so a
+  refusal the guest never reads ends that client's context at its next use
+  of the id — the client, not the renderer.
+- **A teardown never waits for the GPU without a bound.** A queue whose work
+  waits on a timeline value nothing signals never goes idle, and the thread
+  tearing a context down is the device's worker: `destroy_all` waits
+  `TEARDOWN_WAIT` and parks what is still busy (`executor::Graveyard`,
+  reaped whenever a context comes or goes and at the usage look). On the
+  RTX 2070 a test process with such a wait on one device and GPU work on
+  another hung twice in seven runs, in the driver, unkillably: do not write
+  a real-GPU test that leaves a wait-before-signal pending.
 - **A timed wait on Windows is not the time it asks for.** A
   `std::thread::sleep` of 10–160 µs lasts 0.35–0.6 ms there, and a
   `Condvar::wait_timeout` of 1–5 ms lasts 15.6 ms (the system tick); on Linux

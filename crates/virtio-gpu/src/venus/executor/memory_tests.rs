@@ -366,7 +366,7 @@ fn the_host_visible_share_is_a_fraction_of_the_whole() {
 /// share, and a client that allocates there and never frees — the compositor
 /// after GNOME's idle blank (ADR-0004) — is refused exactly when it has filled
 /// the heap it was told: the heap is the truth, not the host's system memory.
-/// Device-local heaps stay the host's; nothing of ours bounds them.
+/// Device-local heaps are the context's share of them (`limits`).
 #[test]
 fn the_heap_of_our_pages_is_the_share_and_is_full_where_the_share_refuses() {
     const SHARE: u64 = 16 * SIZE;
@@ -386,7 +386,10 @@ fn the_heap_of_our_pages_is_the_share_and_is_full_where_the_share_refuses() {
     // The fake's heap 1 (16 GiB of system memory) holds types 3 and 4, the
     // importable ones; heap 0 (8 GiB) the device-local types and the BAR.
     assert_eq!(told.memory_heaps[1].size, SHARE);
-    assert_eq!(told.memory_heaps[0].size, 8 << 30);
+    assert_eq!(
+        told.memory_heaps[0].size,
+        super::limits::Caps::default().device_local_share(8 << 30)
+    );
     let flags: Vec<u32> = told.memory_types[..6]
         .iter()
         .map(|t| t.property_flags)

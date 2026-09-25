@@ -488,6 +488,20 @@ pub struct FakeVulkan {
     pub format_features: AtomicU32,
     /// Exported handles alive right now (stage S1).
     shared_live: Arc<AtomicUsize>,
+    /// Host devices that are lost (ADR-0004, the resource-exhaustion
+    /// amendment): every call on one that has a result answers
+    /// `VK_ERROR_DEVICE_LOST`, as a real device after a TDR does.
+    pub lost_devices: Mutex<std::collections::HashSet<u64>>,
+    /// The next call of this name loses the device it is made on
+    /// ([`FakeVulkan::lose_at`]).
+    lose_at: Mutex<Option<String>>,
+    /// Host devices whose GPU work never finishes for
+    /// `device_idle_within`: a queue that waits on a timeline value nothing
+    /// signals ([`FakeVulkan::wedge_device`]).
+    wedged_devices: Mutex<std::collections::HashSet<u64>>,
+    /// The largest allocation the fake driver makes before it answers
+    /// `VK_ERROR_OUT_OF_DEVICE_MEMORY` itself (default: unlimited).
+    pub driver_heap_limit: std::sync::atomic::AtomicU64,
 }
 
 /// One `vkCreateImage` as the fake host saw it (stage S1).
@@ -539,7 +553,67 @@ impl FakeVulkan {
             image_requires_dedicated: AtomicBool::new(false),
             format_features: AtomicU32::new(0x1_d401),
             shared_live: Arc::new(AtomicUsize::new(0)),
+            lost_devices: Mutex::new(std::collections::HashSet::new()),
+            lose_at: Mutex::new(None),
+            wedged_devices: Mutex::new(std::collections::HashSet::new()),
+            driver_heap_limit: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
+    }
+
+    /// Lose the host device of the next call named `name` (a `vk*` command
+    /// name; `vkAllocateMemory`, `vkCreateImage`, `vkCreateBuffer`,
+    /// `vkBindBufferMemory2` and `vkBindImageMemory2` for the hand-written
+    /// host calls): that call and every later one on the device answer
+    /// `VK_ERROR_DEVICE_LOST`. Other devices are untouched.
+    pub fn lose_at(&self, name: &str) {
+        *self
+            .lose_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(name.to_owned());
+    }
+
+    /// Whether host device `device` is lost, losing it first if `name` is
+    /// the call [`Self::lose_at`] named.
+    fn lost_on(&self, device: u64, name: &str) -> bool {
+        let mut at = self
+            .lose_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut lost = self
+            .lost_devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if at.as_deref() == Some(name) {
+            *at = None;
+            lost.insert(device);
+        }
+        lost.contains(&device)
+    }
+
+    /// Whether host device `device` is lost.
+    #[must_use]
+    pub fn device_lost(&self, device: u64) -> bool {
+        self.lost_devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&device)
+    }
+
+    /// Make host device `device` never go idle for `device_idle_within`,
+    /// until [`Self::unwedge_device`].
+    pub fn wedge_device(&self, device: u64) {
+        self.wedged_devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(device);
+    }
+
+    /// Let host device `device` go idle.
+    pub fn unwedge_device(&self, device: u64) {
+        self.wedged_devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&device);
     }
 
     /// Exported handles alive right now (stage S1): every one a blob or an
@@ -691,6 +765,12 @@ impl FakeVulkan {
     #[must_use]
     pub fn device_requests(&self) -> Vec<DeviceRequest<usize>> {
         self.with(|live| live.devices.iter().map(|(_, r)| r.clone()).collect())
+    }
+
+    /// Every host device made, oldest first, as its handle.
+    #[must_use]
+    pub fn device_handles(&self) -> Vec<u64> {
+        self.with(|live| live.devices.iter().map(|(h, _)| *h).collect())
     }
 
     /// How many `vkCreateImage`s reached the host.
@@ -1353,10 +1433,13 @@ impl HostVulkan for FakeVulkan {
 
     fn create_image(
         &self,
-        _device: &u64,
+        device: &u64,
         info: &VkImageCreateInfo,
         memory: ResourceMemory,
     ) -> Result<u64, VkResult> {
+        if self.lost_on(*device, "vkCreateImage") {
+            return Err(VK_ERROR_DEVICE_LOST);
+        }
         let view_formats = info
             .p_next
             .iter()
@@ -1425,9 +1508,12 @@ impl HostVulkan for FakeVulkan {
 
     fn bind_image_memory(
         &self,
-        _device: &u64,
+        device: &u64,
         binds: &[ImageBind<'_, u64, FakeMemory>],
     ) -> VkResult {
+        if self.lost_on(*device, "vkBindImageMemory2") {
+            return VK_ERROR_DEVICE_LOST;
+        }
         self.with(|live| {
             for bind in binds {
                 live.image_binds
@@ -1456,9 +1542,15 @@ impl HostVulkan for FakeVulkan {
 
     fn allocate_memory(
         &self,
-        _device: &u64,
+        device: &u64,
         request: &MemoryRequest<u64, u64, FakeShared>,
     ) -> Result<FakeMemory, VkResult> {
+        if self.lost_on(*device, "vkAllocateMemory") {
+            return Err(VK_ERROR_DEVICE_LOST);
+        }
+        if request.size > self.driver_heap_limit.load(Ordering::SeqCst) {
+            return Err(VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        }
         assert!(
             u8::from(request.import.is_some())
                 + u8::from(request.export_handle)
@@ -1553,10 +1645,13 @@ impl HostVulkan for FakeVulkan {
 
     fn create_buffer(
         &self,
-        _device: &u64,
+        device: &u64,
         info: &VkBufferCreateInfo,
         memory: ResourceMemory,
     ) -> Result<u64, VkResult> {
+        if self.lost_on(*device, "vkCreateBuffer") {
+            return Err(VK_ERROR_DEVICE_LOST);
+        }
         let handle = self.create("buffer");
         self.with(|live| {
             live.host_memory_resources
@@ -1591,7 +1686,10 @@ impl HostVulkan for FakeVulkan {
         buffer_requirements(info.size, out);
     }
 
-    fn bind_buffer_memory(&self, _device: &u64, binds: &[(u64, &FakeMemory, u64)]) -> VkResult {
+    fn bind_buffer_memory(&self, device: &u64, binds: &[(u64, &FakeMemory, u64)]) -> VkResult {
+        if self.lost_on(*device, "vkBindBufferMemory2") {
+            return VK_ERROR_DEVICE_LOST;
+        }
         self.with(|live| {
             for (buffer, memory, offset) in binds {
                 live.buffer_binds.push((*buffer, memory.handle, *offset));
@@ -1656,7 +1754,11 @@ impl HostVulkan for FakeVulkan {
             }),
             _ => None,
         };
-        let ret = self.serve(command);
+        let ret = if self.lost_on(*device, name) && generated::result_of(command).is_some() {
+            VK_ERROR_DEVICE_LOST
+        } else {
+            self.serve(command)
+        };
         let submitted_fence = match &*command {
             Command::QueueSubmit(a) => a.fence.0,
             Command::QueueSubmit2(a) => a.fence.0,
@@ -1674,6 +1776,15 @@ impl HostVulkan for FakeVulkan {
             });
         }
         generated::set_result(command, ret);
+        if ret < 0 {
+            // As a driver: a failed create writes VK_NULL_HANDLE, not the
+            // guest's id the translation left in the slot.
+            if let Some((_, slots)) = generated::output_handles(command) {
+                for slot in slots {
+                    *slot = 0;
+                }
+            }
+        }
         if ret >= 0 {
             if let Some((kind, slots)) = generated::output_handles(command) {
                 for slot in slots {
@@ -1710,15 +1821,38 @@ impl HostVulkan for FakeVulkan {
         self.destroy(kind.name());
     }
 
-    fn device_wait_idle(&self, _device: &u64) -> VkResult {
+    fn device_wait_idle(&self, device: &u64) -> VkResult {
         self.with(|live| {
             live.calls.push("device idle".to_owned());
             live.finish_all();
         });
-        if self.lost.load(Ordering::SeqCst) {
+        if self.lost.load(Ordering::SeqCst) || self.device_lost(*device) {
             VK_ERROR_DEVICE_LOST
         } else {
             VK_SUCCESS
+        }
+    }
+
+    fn device_idle_within(
+        &self,
+        device: &u64,
+        _queues: &[u64],
+        _timeout: std::time::Duration,
+    ) -> super::host::Idle {
+        if self
+            .wedged_devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(device)
+            && !self.device_lost(*device)
+        {
+            self.with(|live| live.calls.push("device busy".to_owned()));
+            return super::host::Idle::Busy;
+        }
+        if self.device_wait_idle(device) == VK_ERROR_DEVICE_LOST {
+            super::host::Idle::Lost
+        } else {
+            super::host::Idle::Idle
         }
     }
 }

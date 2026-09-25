@@ -230,6 +230,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             frame_stats: None,
             host_visible_mib: None,
+            gpu_memory_mib: None,
         },
         // The installer has nothing to say; the *installed* profile below is
         // where the card and the pad belong.

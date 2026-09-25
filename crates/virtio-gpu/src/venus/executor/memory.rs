@@ -124,7 +124,7 @@ use crate::venus::protocol::{
     VK_ERROR_UNKNOWN, VK_SHARING_MODE_CONCURRENT, VK_SUCCESS,
 };
 use crate::venus::renderer::{ExportedMemory, ScanoutImage, SharedHandle, SharedRef};
-use crate::venus::shmem::{RingPages, ShmemError};
+use crate::venus::shmem::{Charge, RingPages, ShmemError};
 
 #[cfg(doc)]
 use crate::venus::shmem::PageBudget;
@@ -159,6 +159,9 @@ pub struct HandleExport<H: HostVulkan> {
     pub size: u64,
     /// The exporting device's `(deviceUUID, driverUUID)`.
     pub uuids: ([u8; 16], [u8; 16]),
+    /// The export's device-local charge: the allocation stays while the
+    /// handle does, so the charge does too, and every import holds it.
+    pub charge: Option<Arc<Charge>>,
 }
 
 /// Record canonical image `id` of context `ctx_id` on the handle blob holding
@@ -204,6 +207,22 @@ pub fn resource_memory(host_memory: bool, handle: bool) -> ResourceMemory {
 
 /// `VK_WHOLE_SIZE`.
 const WHOLE_SIZE: u64 = u64::MAX;
+
+/// Which host GPU a device-local budget is for: its `deviceUUID`, or — for a
+/// driver that reports none — its vendor and device ids.
+#[must_use]
+pub fn heap_gpu(guest: &GuestDevice) -> [u8; 16] {
+    guest.uuids().map_or_else(
+        || {
+            let mut id = [0u8; 16];
+            let props = &guest.properties.properties;
+            id[..4].copy_from_slice(&props.vendor_id.to_le_bytes());
+            id[4..8].copy_from_slice(&props.device_id.to_le_bytes());
+            id
+        },
+        |(device, _)| device,
+    )
+}
 /// `VK_REMAINING_MIP_LEVELS` / `VK_REMAINING_ARRAY_LAYERS`.
 const REMAINING: u32 = u32::MAX;
 
@@ -459,8 +478,8 @@ impl<H: HostVulkan> VulkanContext<H> {
                 }
             }
         }
-        if !self.objects.has_room() {
-            args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+        if let Err(refused) = self.objects.reserve(Kind::DeviceMemory, 1) {
+            args.ret = self.refuse("vkAllocateMemory", &refused);
             return Ok(());
         }
         if let Some(resource_id) = import {
@@ -578,6 +597,19 @@ impl<H: HostVulkan> VulkanContext<H> {
             (None, request)
         };
         let host_size = request.size;
+        // Our pages are charged by the pages; anything else is charged here,
+        // before the driver is asked.
+        let charge = if pages.is_some() {
+            None
+        } else {
+            match self.charge_allocation(guest, ty.heap_index, host_size) {
+                Ok(charge) => Some(Arc::new(charge)),
+                Err(ret) => {
+                    args.ret = ret;
+                    return Ok(());
+                }
+            }
+        };
         match self.host.allocate_memory(&device.host, &request) {
             Ok(memory) => {
                 self.objects.insert_memory(
@@ -600,6 +632,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                         },
                         // Stage S2b: the handle, once its blob is made.
                         shared: None,
+                        charge,
                     },
                 );
                 args.ret = VK_SUCCESS;
@@ -607,6 +640,68 @@ impl<H: HostVulkan> VulkanContext<H> {
             Err(ret) => args.ret = ret,
         }
         Ok(())
+    }
+
+    /// Charge a plain allocation of `bytes` in heap `heap_index` of `guest`
+    /// (ADR-0004, the resource-exhaustion amendment): a device-local heap to
+    /// this context's share of that heap of that GPU
+    /// ([`super::limits::ContextLimits::device_local`], sized from the
+    /// host's heap), any other heap — host RAM the driver allocates — to the
+    /// context's host-visible share, which our pages are charged to too.
+    ///
+    /// # Errors
+    /// `VK_ERROR_OUT_OF_DEVICE_MEMORY` past either share or its whole: what a
+    /// driver answers for an exhausted heap.
+    fn charge_allocation(
+        &self,
+        guest: &GuestDevice,
+        heap_index: u32,
+        bytes: u64,
+    ) -> Result<Charge, crate::venus::protocol::VkResult> {
+        let heap = usize::try_from(heap_index)
+            .ok()
+            .and_then(|h| guest.host_memory.memory_heaps.get(h))
+            .cloned()
+            .unwrap_or_default();
+        let device_local = heap.flags & policy::MEMORY_HEAP_DEVICE_LOCAL != 0;
+        let budget = if device_local {
+            self.objects
+                .limits()
+                .device_local((heap_gpu(guest), heap_index), heap.size)
+        } else {
+            Arc::clone(&self.budget)
+        };
+        budget.charge(bytes).map_err(|(used, limit)| {
+            let first = !self.device_local_refused.replace(true);
+            let what = if device_local {
+                "device-local"
+            } else {
+                "host RAM"
+            };
+            if first {
+                tracing::info!(
+                    ctx_id = self.ctx_id,
+                    bytes,
+                    heap = heap_index,
+                    used,
+                    limit,
+                    what,
+                    "a Venus allocation was refused at its heap's budget; the guest is answered \
+                     VK_ERROR_OUT_OF_DEVICE_MEMORY (ADR-0004, the resource-exhaustion amendment)"
+                );
+            } else {
+                tracing::debug!(
+                    ctx_id = self.ctx_id,
+                    bytes,
+                    heap = heap_index,
+                    used,
+                    limit,
+                    what,
+                    "a Venus allocation was refused at its heap's budget"
+                );
+            }
+            VK_ERROR_OUT_OF_DEVICE_MEMORY
+        })
     }
 
     /// `vkAllocateMemory` with a `VkImportMemoryResourceInfoMESA` (stage 5c):
@@ -732,6 +827,8 @@ impl<H: HostVulkan> VulkanContext<H> {
                         allocate_flags: flags.map_or(0, |(f, _)| f),
                         handle: MemoryHandle::None,
                         shared: None,
+                        // The pages are charged once, when first allocated.
+                        charge: None,
                     },
                 );
                 args.ret = VK_SUCCESS;
@@ -850,6 +947,8 @@ impl<H: HostVulkan> VulkanContext<H> {
                         allocate_flags: flags.map_or(0, |(f, _)| f),
                         handle: MemoryHandle::Imported,
                         shared: Some(SharedRef::of(shared)),
+                        // The export's charge: the allocation is one.
+                        charge: export.charge.clone(),
                     },
                 );
                 args.ret = VK_SUCCESS;
@@ -1016,6 +1115,7 @@ impl<H: HostVulkan> VulkanContext<H> {
         // must outlive this memory, its device and its context as one does.
         let (device_id, type_index, host_size) =
             (memory.device, memory.type_index, memory.host_size);
+        let charge = memory.charge.clone();
         let (device, guest) = self
             .objects
             .device_and_guest(device_id)
@@ -1036,6 +1136,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             type_index,
             size: host_size,
             uuids,
+            charge,
         }));
         let memory = self
             .objects
@@ -1193,8 +1294,8 @@ impl<H: HostVulkan> VulkanContext<H> {
             return Err(invalid(NAME, "pCreateInfo is null"));
         };
         let external = Self::check_buffer_info(NAME, info, device, guest)?;
-        if !self.objects.has_room() {
-            args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+        if let Err(refused) = self.objects.reserve(Kind::Buffer, 1) {
+            args.ret = self.refuse("vkCreateBuffer", &refused);
             return Ok(());
         }
         let (host_memory, handle) = self.buffer_memory_kind(device_id, info, external)?;
@@ -1617,8 +1718,8 @@ impl<H: HostVulkan> VulkanContext<H> {
                  a format outside Vulkan 1.3",
             ));
         }
-        if !self.objects.has_room() {
-            args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+        if let Err(refused) = self.objects.reserve(Kind::BufferView, 1) {
+            args.ret = self.refuse("vkCreateBufferView", &refused);
             return Ok(());
         }
         match self
@@ -2165,8 +2266,8 @@ impl<H: HostVulkan> VulkanContext<H> {
         if !image.fully_bound() {
             return Err(invalid(NAME, "a view of an image that is not bound"));
         }
-        if !self.objects.has_room() {
-            args.ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+        if let Err(refused) = self.objects.reserve(Kind::ImageView, 1) {
+            args.ret = self.refuse("vkCreateImageView", &refused);
             return Ok(());
         }
         match self.host.create_image_view(&device.host, image.host, info) {

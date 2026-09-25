@@ -1116,3 +1116,120 @@ mod tests {
         assert_ne!(super::compute_f(0), 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 10. exhaust (hostile; only when `--checks` names it)
+
+/// A hostile client, as far as a well-formed one can be: device-local
+/// memory in 64 MiB allocations until the renderer refuses (at most
+/// 16 GiB), held for `VK_SMOKE_HOLD_SECS` seconds while the host watches,
+/// then every one freed; then 4 KiB buffers until refused (at most 200 000),
+/// all destroyed. PASS when both are refused with the answer Vulkan gives —
+/// `VK_ERROR_OUT_OF_DEVICE_MEMORY` / `VK_ERROR_TOO_MANY_OBJECTS`, and
+/// `VK_ERROR_OUT_OF_HOST_MEMORY` — and FAIL if either never is.
+///
+/// Mesa's venus allocates and creates *asynchronously*: the guest sees an
+/// error only with `VN_PERF=no_async_mem_alloc,no_async_buffer_create`.
+/// Without it, what the renderer refused is simply absent, and the first
+/// free of an absent allocation ends the context (Mesa aborts the process
+/// on "ring fatal error"): the other way a hostile client ends.
+pub fn exhaust(gpu: &Gpu) -> Result<Out, String> {
+    const CHUNK: u64 = 64 << 20;
+    const MAX_CHUNKS: usize = 256;
+    const MAX_BUFFERS: usize = 200_000;
+    let dev = &gpu.device;
+    let hold = std::env::var("VK_SMOKE_HOLD_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let ty = (0..gpu.mem.memory_type_count)
+        .find(|&i| gpu.mem.memory_types[i as usize].property_flags == DEVICE_LOCAL)
+        .or_else(|| gpu.mem_type(u32::MAX, DEVICE_LOCAL, NONE))
+        .ok_or("no device-local memory type")?;
+    let heap = gpu.mem.memory_heaps[gpu.mem.memory_types[ty as usize].heap_index as usize].size;
+    println!(
+        "# exhaust: type {ty}, its heap told as {} MiB",
+        heap >> 20
+    );
+    let t0 = Instant::now();
+    let mut chunks = Vec::new();
+    let mut memory_refusal = None;
+    while chunks.len() < MAX_CHUNKS {
+        let info = vk::MemoryAllocateInfo::default()
+            .allocation_size(CHUNK)
+            .memory_type_index(ty);
+        // SAFETY: valid device and allocate info.
+        match unsafe { dev.allocate_memory(&info, None) } {
+            Ok(m) => chunks.push(m),
+            Err(e) => {
+                memory_refusal = Some(e);
+                break;
+            }
+        }
+    }
+    println!(
+        "EXHAUST memory: {} x 64 MiB = {} MiB in {} ms, then {}",
+        chunks.len(),
+        chunks.len() as u64 * 64,
+        t0.elapsed().as_millis(),
+        memory_refusal.map_or("no refusal".to_owned(), result_name)
+    );
+    let held_mib = chunks.len() as u64 * 64;
+    if hold > 0 {
+        println!("EXHAUST holding {hold} s");
+        std::thread::sleep(std::time::Duration::from_secs(hold));
+    }
+    for m in chunks.drain(..) {
+        // SAFETY: allocated above, bound to nothing, freed once.
+        unsafe { dev.free_memory(m, None) };
+    }
+    println!("EXHAUST memory freed");
+
+    let info = vk::BufferCreateInfo::default()
+        .size(4096)
+        .usage(vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let t0 = Instant::now();
+    let mut buffers = Vec::new();
+    let mut object_refusal = None;
+    while buffers.len() < MAX_BUFFERS {
+        // SAFETY: valid device and create info.
+        match unsafe { dev.create_buffer(&info, None) } {
+            Ok(b) => buffers.push(b),
+            Err(e) => {
+                object_refusal = Some(e);
+                break;
+            }
+        }
+    }
+    println!(
+        "EXHAUST buffers: {} in {} ms, then {}",
+        buffers.len(),
+        t0.elapsed().as_millis(),
+        object_refusal.map_or("no refusal".to_owned(), result_name)
+    );
+    let made = buffers.len();
+    for b in buffers.drain(..) {
+        // SAFETY: created above, destroyed once.
+        unsafe { dev.destroy_buffer(b, None) };
+    }
+    println!("EXHAUST buffers destroyed");
+    let memory_ok = matches!(
+        memory_refusal,
+        Some(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_TOO_MANY_OBJECTS)
+    );
+    let objects_ok = matches!(
+        object_refusal,
+        Some(vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+    );
+    if memory_ok && objects_ok {
+        Ok(Out::Pass(format!(
+            "memory refused after {held_mib} MiB, objects after {made} buffers"
+        )))
+    } else {
+        Err(format!(
+            "memory {:?}, objects {:?}: a hostile client must be refused",
+            memory_refusal, object_refusal
+        ))
+    }
+}
