@@ -387,6 +387,16 @@ the 2048 MiB default afterwards. `--auto` picks the built-in *desktop* answer
 file for an ISO whose name says `desktop` (Canonical's names do), and the
 server one otherwise.
 
+Every installed machine (Ubuntu, Fedora and Debian alike) gets a **1920×1080**
+display and **half this host's logical CPUs as vCPUs, at least 2 and at most
+8**; `install ubuntu` ends by saying what the profile got (`machine: 8 vCPUs,
+4096 MiB, 1920x1080` for `--venus` on a 24-thread host). Pass `--vcpus N` to choose instead
+(1 to 64). The installer VM itself always runs on 2 vCPUs at 1280×800, which is
+why the install looks smaller than the machine it produces. The profile is
+written for the host that installed it; moved to a smaller one, edit `vcpus`.
+GNOME takes its screen size from the display's EDID, so the desktop comes up
+at 1920×1080 with nothing configured in the guest.
+
 ### A GPU-accelerated desktop (Venus)
 
 Add `--venus` to the desktop install and the machine comes out with its desktop
@@ -749,7 +759,7 @@ database; the profile an install writes is small enough to read:
 ```toml
 name = "ubuntu"
 memory_mib = 2048
-vcpus = 2
+vcpus = 8
 transport = "pci"
 
 [boot]
@@ -763,8 +773,8 @@ path = "/home/you/entangled-vms/ubuntu.raw"
 writable = true
 
 [display]
-width = 1280
-height = 800
+width = 1920
+height = 1080
 scale = 1.0
 
 [sound]
@@ -773,6 +783,9 @@ enabled = true
 [gamepad]
 enabled = true
 ```
+
+`vcpus` is the installing host's half (here a 16-thread one); see the install
+section above.
 
 An installed machine gets the sound card and the gamepad switched on for you —
 both with `backend = "auto"`, which is the setting that can never be the reason
@@ -942,8 +955,10 @@ what makes it unrestorable.
 
 **Create machine** opens a four-step wizard — *System*, *Hardware*, *Storage*,
 *Review*. You pick Debian or Ubuntu and its installer media, name the machine
-and size its memory and vCPUs, either create a new sparse disk or install onto
-an existing image, and then read a summary before anything happens. The last
+and size its memory and vCPUs (the vCPU slider starts where `entangled install`
+would: half this host's logical CPUs, 2 to 8), either create a new sparse disk
+or install onto an existing image, and then read a summary before anything
+happens. The last
 step has an *Advanced: command preview* section showing the exact
 `entangled install …` command it is about to run, which is the honest way to
 learn the CLI.
@@ -1136,7 +1151,7 @@ configuration:
 | `entangled fetch firmware`, `bash guest/firmware/build-cloudhv.sh`, `scripts/fetch-ubuntu-iso.sh`, `scripts/fetch-fedora-iso.sh` | the commands' own documented invocations; the fetch was run end to end against the published layout on 2026-09-09, and the firmware and the Ubuntu ISO were both present and used on the machine this guide was written on |
 | `entangled fetch debian …`, `install debian …` | from the CLI's help output and the Debian install path's documentation; not re-run for this guide |
 | `entangled install ubuntu --iso <desktop iso> …` | the server command with the flags the CLI documents; the Desktop variant is what `tests/boot/tests/desktop_gnome.rs` boots, but this exact line was not re-run for the guide |
-| `entangled install ubuntu --iso <desktop iso> … --auto --venus --headless` | **not run end to end**: there was no Desktop ISO on the machine this was written on. The four late-commands it adds are pinned byte for byte by `seed::tests::venus_late_commands_are_exact_and_first`, and on 2026-09-24 they were run in the existing Venus guest against a scratch `/target`. `glib-compile-schemas --strict` accepted the override against the guest's real schemas, `gsettings` read `uint32 0` from it, and the drirc parsed to the same elements as the one GNOME was running on |
+| `entangled install ubuntu --iso <desktop iso> … --auto --venus --headless` | run end to end on Windows (RTX 2070) from the Ubuntu 26.04.1 Desktop ISO, twice on 2026-09-25: 10 min 38 s, then 11 min 41 s with the 1920×1080 / half-the-host profile. The second wrote `vcpus = 8` on a 24-thread host and printed the `machine:` line quoted above; its first boot reached GDM on the GPU at 1920×1080 with 8 CPUs up (ADR-0004, "installed profiles"). The four late-commands are also pinned byte for byte by `seed::tests::venus_late_commands_are_exact_and_first` |
 | `[display] venus = true`, the `3D` lines of `entangled doctor` | the profile key: a copy of the Venus guest's profile with only `venus = true` added, run on Windows/WHP without `ENTANGLED_VENUS`. It logged `attaching the Venus EXECUTING renderer … source=[display] venus = true`, and `gnome-shell` mapped `libvulkan_virtio`. The doctor output is this machine's (RTX 2070), pasted as printed |
 | `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All` | the standard Windows spelling of the feature this project requires; the feature is enabled on the development host |
 | the clock-drift numbers | `cargo test -p boot-tests --test soak -- --ignored --nocapture` on the Linux host and `cargo test -p vmm-core --test whp_clock -- --nocapture` on the Windows one, plus three 900 s control runs pinning the guest to `tsc`, `kvm-clock` and `acpi_pm`, and three measurements of the WSL host's own clock against Windows QPC and against its wall clock; the numbers are those runs' own output, and both tests pass |

@@ -353,6 +353,10 @@ pub struct InstallArgs {
     /// Installer VM memory in MiB.
     #[arg(long, default_value_t = 1536)]
     pub memory_mib: u64,
+    /// vCPUs of the installed machine. Defaults to half this host's logical
+    /// CPUs, at least 2 and at most 8. The installer VM itself always runs on 2.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+    pub vcpus: Option<u32>,
     /// Host TAP interface (see scripts/setup-tap.sh), for --network tap.
     #[arg(long, default_value = "entangled0")]
     pub interface: String,
@@ -717,5 +721,31 @@ mod tests {
                 "install --help names {path}, which is not there"
             );
         }
+    }
+
+    /// `--vcpus` is optional (absent = derived from the host) and bounded the
+    /// way a profile is, so a typo fails at the command line rather than
+    /// after a twenty-minute install writes a profile `run` refuses.
+    #[test]
+    fn install_vcpus_is_optional_and_bounded_like_a_profile() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["entangled", "install", "ubuntu", "--auto"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Command::Install(args) => args.vcpus,
+                _ => panic!("not an install"),
+            })
+        };
+        assert_eq!(parse(&[]).expect("no flag"), None);
+        assert_eq!(parse(&["--vcpus", "6"]).expect("six"), Some(6));
+        assert_eq!(parse(&["--vcpus", "64"]).expect("the ceiling"), Some(64));
+        assert!(parse(&["--vcpus", "0"]).is_err());
+        assert!(parse(&["--vcpus", "65"]).is_err());
+        let help = Cli::command()
+            .find_subcommand_mut("install")
+            .expect("install")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--vcpus"), "{help}");
     }
 }

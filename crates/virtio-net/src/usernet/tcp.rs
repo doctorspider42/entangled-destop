@@ -835,11 +835,36 @@ mod tests {
         }
 
         /// SYN, SYN-ACK, ACK.
+        ///
+        /// It throws away what the NAT sent, so it is only for tests whose host
+        /// connect cannot fail inside it. A refusal can: on Linux loopback it is
+        /// back before the first poll whenever the test thread is descheduled
+        /// for a moment, and the RST it produces rides on one of these two
+        /// polls — see `a_connection_the_host_refuses_reaches_the_guest_as_a_reset`.
         fn handshake(&mut self) {
             self.send(true, false, false, &[]);
             let _ = self.poll();
             self.send(false, true, false, &[]);
             let _ = self.poll();
+        }
+
+        /// Hands this peer's flow a host connect that has already failed, as if
+        /// the connect thread had answered just before the NAT's next poll. The
+        /// timing a real refusal only sometimes has, on demand: the flow must
+        /// have been opened with [`HostAccess::Offline`], so no connect thread
+        /// exists to answer first.
+        fn host_connect_fails(&mut self, kind: ErrorKind) {
+            let (sender, receiver) = mpsc::channel();
+            let _ = sender.send(Err(std::io::Error::from(kind)));
+            let port = self.port;
+            let flow = self
+                .nat
+                .flows
+                .iter_mut()
+                .find(|flow| flow.guest_port == port)
+                .expect("the SYN opened a flow");
+            assert!(flow.connecting.is_none(), "an offline flow has no connect");
+            flow.connecting = Some(receiver);
         }
     }
 
@@ -1288,6 +1313,18 @@ mod tests {
     /// This is what the retirement reorder in [`TcpNat::poll`] buys: `abort()`
     /// only moves smoltcp to `Closed`, and a socket removed from the set before
     /// the next dispatch never emits the reset it was aborted to send.
+    ///
+    /// The NAT promises the reset, not *when* it comes, so this test watches
+    /// every segment from the very first poll. It used to run
+    /// [`GuestPeer::handshake`] first and assert the flow was still open after
+    /// it — a window the product never promised. On Linux loopback the refusal
+    /// is immediate, and whenever the test thread was descheduled between the
+    /// SYN and its first poll (a loaded `cargo test --workspace`, 8 runs in 200
+    /// under 48 busy threads on a 24-thread host) the connect had already failed
+    /// by then: the NAT sent SYN-ACK and RST in that one poll, retired the flow,
+    /// and `handshake` threw the RST away. The product was right; the test had
+    /// stopped looking. Both orderings are now also pinned deterministically, by
+    /// the two `a_refusal_that_lands_*` tests below.
     #[test]
     fn a_connection_the_host_refuses_reaches_the_guest_as_a_reset() {
         use std::net::TcpListener;
@@ -1305,7 +1342,8 @@ mod tests {
             remote,
             41400,
         );
-        peer.handshake();
+        peer.send(true, false, false, &[]);
+        // Only a poll retires a flow, so this holds however fast the refusal is.
         assert_eq!(peer.nat.flow_count(), 1, "the SYN opened a flow");
 
         // A wall-clock deadline rather than a poll count: how long the host
@@ -1313,17 +1351,27 @@ mod tests {
         // hosts (immediate on Linux loopback, a SYN retransmit or two on
         // Windows), and the worst case is the connect timing out — which the
         // flow answers the same way, one second later.
+        let mut saw_syn_ack = false;
         let mut saw_reset = false;
+        let mut sent_ack = false;
         let deadline = StdInstant::now() + CONNECT_TIMEOUT + Duration::from_secs(5);
         while StdInstant::now() < deadline {
             for segment in peer.poll() {
+                saw_syn_ack |= segment.syn && segment.ack;
                 saw_reset |= segment.rst;
             }
             if saw_reset && peer.nat.flow_count() == 0 {
                 break;
             }
+            // The guest completes its half of the handshake, as a real one
+            // would once the SYN-ACK is in — unless it has been reset already.
+            if saw_syn_ack && !sent_ack {
+                peer.send(false, true, false, &[]);
+                sent_ack = true;
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert!(saw_syn_ack, "the guest's SYN must be answered first");
         assert!(
             saw_reset,
             "a refused host connect must be answered with an RST, not with silence"
@@ -1333,6 +1381,68 @@ mod tests {
             0,
             "a refused connection must not hold a flow slot"
         );
+        assert_eq!(peer.nat.retired(), 1, "the flow was retired, not lost");
+    }
+
+    /// **The fast refusal, on demand**: the host connect has failed before the
+    /// NAT's first poll ever sees the guest's SYN — Linux loopback's
+    /// `ECONNREFUSED` when the pump is a moment late. That one poll must answer
+    /// the SYN *and* reset it, in that order, before the flow's slot goes back:
+    /// the flow is retired inside the same poll, so a reset left for later
+    /// would never be sent at all.
+    #[test]
+    fn a_refusal_that_lands_with_the_syn_still_reaches_the_guest_as_a_reset() {
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::Offline),
+            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 11), 80),
+            41410,
+        );
+        peer.send(true, false, false, &[]);
+        peer.host_connect_fails(ErrorKind::ConnectionRefused);
+
+        let segments = peer.poll();
+        let syn_ack = segments.iter().position(|s| s.syn && s.ack);
+        let reset = segments.iter().position(|s| s.rst);
+        assert!(
+            syn_ack.is_some() && reset.is_some() && syn_ack < reset,
+            "the one poll must answer the SYN and then reset it: {segments:?}"
+        );
+        assert_eq!(peer.nat.flow_count(), 0, "the refused flow is retired");
+        assert_eq!(peer.nat.retired(), 1);
+
+        // The guest's ACK of that SYN-ACK finds no flow, and is reset again
+        // rather than opening anything.
+        peer.send(false, true, false, &[]);
+        let late = peer.poll();
+        assert!(
+            late.iter().any(|s| s.rst),
+            "an ACK for a refused flow is reset: {late:?}"
+        );
+        assert_eq!(peer.nat.flow_count(), 0);
+    }
+
+    /// **The slow refusal, on demand**: the guest's handshake is complete and
+    /// the connection looks established when the host connect fails — what
+    /// Windows does, refusing only after its SYN retransmits, and what a
+    /// timed-out connect looks like everywhere.
+    #[test]
+    fn a_refusal_that_lands_after_the_handshake_reaches_the_guest_as_a_reset() {
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::Offline),
+            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 12), 80),
+            41420,
+        );
+        peer.handshake();
+        assert_eq!(peer.nat.flow_count(), 1, "the handshake left the flow open");
+
+        peer.host_connect_fails(ErrorKind::ConnectionRefused);
+        let segments = peer.poll();
+        assert!(
+            segments.iter().any(|s| s.rst),
+            "a refusal after the handshake must reset the connection: {segments:?}"
+        );
+        assert_eq!(peer.nat.flow_count(), 0, "the refused flow is retired");
+        assert_eq!(peer.nat.retired(), 1);
     }
 
     /// A guest that walks away â€” reset, rebooted, or simply gone â€” must not hold

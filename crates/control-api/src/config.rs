@@ -30,6 +30,47 @@ pub const MIN_MEMORY_MIB: u64 = 128;
 /// crate; control-api deliberately does not depend on it.
 pub const MAX_MEMORY_MIB: u64 = 65536;
 
+/// Fewest vCPUs [`default_vcpus`] gives a new machine: what every installed
+/// profile got before the default was derived, and still the floor on a small
+/// host.
+pub const MIN_DEFAULT_VCPUS: u32 = 2;
+
+/// Most vCPUs [`default_vcpus`] gives a new machine. Not a machine limit (the
+/// MP table and the MADT describe up to 254, and a profile may say up to 64):
+/// 8 is the largest count measured (ADR-0004, "installed profiles"): the
+/// installed GNOME desktop and a test kernel on WHP, with the same boot
+/// written for KVM (`boot-tests`, `acpi`). There it
+/// still scaled parallel work (6.3x one CPU on 8 jobs) and cost the idle
+/// desktop nothing; nothing past it has been measured, and a desktop guest
+/// wider than 8 would mostly be taking cores from the VMM's own threads.
+pub const MAX_DEFAULT_VCPUS: u32 = 8;
+
+/// The vCPUs a newly installed machine gets when nobody chose a number: half
+/// the host's logical CPUs, clamped to
+/// [`MIN_DEFAULT_VCPUS`]..=[`MAX_DEFAULT_VCPUS`].
+///
+/// Half, because each vCPU is a host thread that is busy whenever the guest
+/// is, and the VMM's own threads (the GPU renderer and its ring workers, the
+/// display, the block and network workers) and the host's desktop need the
+/// other half: a GNOME desktop on the GPU keeps the VMM process at 2.6-3.2
+/// cores beside its vCPUs (ADR-0004, the zero-copy amendment). `0` — a host
+/// that could not say — gets the floor.
+///
+/// Both surfaces call this: `entangled install` for the profile it writes,
+/// and the manager for its wizard's default, so a machine made either way on
+/// one host gets the same number.
+pub fn default_vcpus(host_logical_cpus: usize) -> u32 {
+    let half = u32::try_from(host_logical_cpus / 2).unwrap_or(u32::MAX);
+    half.clamp(MIN_DEFAULT_VCPUS, MAX_DEFAULT_VCPUS)
+}
+
+/// [`default_vcpus`] for the host this process runs on
+/// (`std::thread::available_parallelism`, which honours a CPU affinity mask
+/// and, inside WSL, is the WSL VM's processor count).
+pub fn host_default_vcpus() -> u32 {
+    default_vcpus(std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VmConfig {
@@ -789,6 +830,36 @@ scale = 1.0
             Some("entangled0")
         );
         assert_eq!(cfg.display.width, 1920);
+    }
+
+    /// Half the host, never fewer than the old fixed 2 and never more than 8,
+    /// with the host count injected so the rule is pinned on every machine.
+    #[test]
+    fn default_vcpus_is_half_the_host_clamped_to_2_through_8() {
+        for (host, vcpus) in [
+            (0, 2), // a host that could not say
+            (1, 2),
+            (2, 2),
+            (4, 2),
+            (5, 2),
+            (6, 3),
+            (8, 4),
+            (12, 6),
+            (16, 8),
+            (24, 8), // this project's Windows host, a 12-core Threadripper
+            (128, 8),
+            (usize::MAX, 8),
+        ] {
+            assert_eq!(default_vcpus(host), vcpus, "{host} logical CPUs");
+        }
+        assert_eq!(default_vcpus(0), MIN_DEFAULT_VCPUS);
+        assert_eq!(default_vcpus(usize::MAX), MAX_DEFAULT_VCPUS);
+        // Whatever this host is, the answer is one a profile may carry.
+        let here = host_default_vcpus();
+        assert!((MIN_DEFAULT_VCPUS..=MAX_DEFAULT_VCPUS).contains(&here));
+        let mut cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).expect("parses");
+        cfg.vcpus = MAX_DEFAULT_VCPUS;
+        cfg.validate().expect("the ceiling is a valid profile");
     }
 
     /// A profile written before the gamepad existed must keep describing

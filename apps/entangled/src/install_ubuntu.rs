@@ -51,7 +51,7 @@ use control_api::{
 };
 
 use crate::disk;
-use crate::install::{target_disk, vm_name};
+use crate::install::{installed_vcpus_here, target_disk, vm_name};
 use crate::paths;
 use crate::run_vm::{self, Automation};
 use crate::seed;
@@ -308,41 +308,85 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     //    firmware finds \\EFI\\ubuntu\\shimx64.efi through the Boot#### entry
     //    grub-install wrote into the NVRAM store, which is why `nvram` is the
     //    key that makes this profile work more than once.
+    let profile = installed_profile(
+        args,
+        &vm_name,
+        firmware,
+        nvram.clone(),
+        target.clone(),
+        installed_vcpus_here(args),
+    );
+    let profile_path = target.with_file_name(format!("{vm_name}.toml"));
+    let text = toml::to_string_pretty(&profile).map_err(|e| e.to_string())?;
+    std::fs::write(&profile_path, text)
+        .map_err(|e| format!("cannot write {}: {e}", profile_path.display()))?;
+
+    println!(
+        "installed:  GPT with an ESP on /dev/vda{} ({} MiB) and root on /dev/vda{}{}\n\
+         nvram:      {}\n\
+         transcript: {}\n\
+         profile:    {}\n\
+         machine:    {} vCPUs, {} MiB, {}x{}\n\
+         run it:     entangled run {}",
+        install.esp.index,
+        install.esp.sectors() * diskfs::SECTOR / (1 << 20),
+        install.root.index,
+        install
+            .root_uuid
+            .as_deref()
+            .map(|u| format!(" (ext4 UUID {u})"))
+            .unwrap_or_default(),
+        nvram.display(),
+        transcript.display(),
+        profile_path.display(),
+        profile.vcpus,
+        profile.memory_mib,
+        profile.display.width,
+        profile.display.height,
+        profile_path.display()
+    );
+    if args.venus {
+        println!(
+            "gpu:        [display] venus = true — GNOME and every GL client on Zink over the \
+             host GPU (the guest's /etc/drirc), no idle blank"
+        );
+    }
+    Ok(())
+}
+
+/// The profile that boots the *installed* system, with its vCPU count already
+/// decided ([`crate::install::installed_vcpus`]) so a test can inject one.
+fn installed_profile(
+    args: &InstallArgs,
+    vm_name: &str,
+    firmware: PathBuf,
+    nvram: PathBuf,
+    target: PathBuf,
+    vcpus: u32,
+) -> VmConfig {
     let installed_memory = if args.venus {
         VENUS_MEMORY_MIB
     } else {
         INSTALLED_MEMORY_MIB
     };
-    let profile = VmConfig {
-        name: vm_name.clone(),
+    VmConfig {
+        name: vm_name.to_string(),
         memory_mib: args.memory_mib.max(installed_memory),
-        vcpus: 2,
+        vcpus,
         transport: VirtioTransport::Pci,
         boot: BootSection {
             mode: BootMode::Uefi,
             firmware: Some(firmware),
-            nvram: Some(nvram.clone()),
+            nvram: Some(nvram),
             ..BootSection::default()
         },
         disks: vec![DiskSection {
-            path: target.clone(),
+            path: target,
             writable: true,
         }],
         cdrom: None,
         network: None,
-        display: DisplaySection {
-            width: 1280,
-            height: 800,
-            scale: 1.0,
-            virgl: false,
-            virgl_isolation: control_api::VirglIsolation::default(),
-            // The GPU desktop the seed's late-commands just configured the
-            // guest for (ADR-0004, "how a user turns it on").
-            venus: args.venus,
-            refresh_hz: control_api::DEFAULT_REFRESH_HZ,
-            frame_stats: None,
-            host_visible_mib: None,
-        },
+        display: installed_display(args.venus),
         // A desktop with no sound is not a desktop (GAME-2102). `auto` never
         // fails a run: a host with no audio device gets a card that plays into
         // silence, and the guest still enumerates one.
@@ -361,38 +405,25 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             players: 1,
             backend: GamepadBackend::Auto,
         },
-    };
-    let profile_path = target.with_file_name(format!("{vm_name}.toml"));
-    let text = toml::to_string_pretty(&profile).map_err(|e| e.to_string())?;
-    std::fs::write(&profile_path, text)
-        .map_err(|e| format!("cannot write {}: {e}", profile_path.display()))?;
-
-    println!(
-        "installed:  GPT with an ESP on /dev/vda{} ({} MiB) and root on /dev/vda{}{}\n\
-         nvram:      {}\n\
-         transcript: {}\n\
-         profile:    {}\n\
-         run it:     entangled run {}",
-        install.esp.index,
-        install.esp.sectors() * diskfs::SECTOR / (1 << 20),
-        install.root.index,
-        install
-            .root_uuid
-            .as_deref()
-            .map(|u| format!(" (ext4 UUID {u})"))
-            .unwrap_or_default(),
-        nvram.display(),
-        transcript.display(),
-        profile_path.display(),
-        profile_path.display()
-    );
-    if args.venus {
-        println!(
-            "gpu:        [display] venus = true — GNOME and every GL client on Zink over the \
-             host GPU (the guest's /etc/drirc), no idle blank"
-        );
     }
-    Ok(())
+}
+
+/// The installed machine's display: 1920x1080 — the size the project targets
+/// (CLAUDE.md) and the one GNOME comes up in, since the guest builds its
+/// monitor from the EDID's preferred mode — with the GPU desktop the seed's
+/// late-commands configured the guest for when `--venus` asked (ADR-0004,
+/// "how a user turns it on").
+///
+/// It used to be 1280x800 for every machine, carried over from the installer
+/// VM when this command installed only servers. Nothing chose it, and nothing
+/// needs it: the 2D path keeps a 1080p GNOME at its refresh rate on both hosts
+/// (ADR-0004, "installed profiles"), and the Debian profile has always been
+/// 1080p. The installer VM keeps 1280x800: it is not the machine.
+fn installed_display(venus: bool) -> DisplaySection {
+    DisplaySection {
+        venus,
+        ..DisplaySection::default()
+    }
 }
 
 /// Whether `--venus` can do what it says, before any disk is written to.
@@ -682,6 +713,92 @@ mod tests {
         assert!(venus_preflight(true, false, Desktop).is_ok());
         // A custom autoinstall is its author's: the ISO's name says nothing.
         assert!(venus_preflight(true, true, Server).is_ok());
+    }
+
+    fn desktop_args(venus: bool) -> InstallArgs {
+        InstallArgs {
+            distro: "ubuntu".into(),
+            disk: Some(PathBuf::from("desktop.raw")),
+            variant: "gtk-netboot".into(),
+            auto: true,
+            preseed: None,
+            autoinstall: None,
+            kickstart: None,
+            iso: Some(PathBuf::from("ubuntu-26.04.1-desktop-amd64.iso")),
+            firmware: None,
+            size: "40G".into(),
+            // clap's default: nobody passed --memory-mib.
+            memory_mib: 1536,
+            vcpus: None,
+            interface: "entangled0".into(),
+            network: crate::DEFAULT_NETWORK.into(),
+            name: None,
+            headless: true,
+            venus,
+        }
+    }
+
+    fn profile_for(args: &InstallArgs, host_logical_cpus: usize) -> VmConfig {
+        installed_profile(
+            args,
+            "desktop",
+            PathBuf::from("CLOUDHV.fd"),
+            PathBuf::from("desktop.nvram"),
+            PathBuf::from("desktop.raw"),
+            crate::install::installed_vcpus(args, host_logical_cpus),
+        )
+    }
+
+    /// What `install ubuntu --venus --auto` used to write on this project's
+    /// 24-thread host: 1280x800 and 2 vCPUs, for a GNOME desktop on the GPU.
+    /// Now 1920x1080 and half the host (8), with the memory floors unchanged,
+    /// and the profile reads back as exactly what was written.
+    #[test]
+    fn the_installed_desktop_is_1080p_with_half_the_host() {
+        for venus in [true, false] {
+            let args = desktop_args(venus);
+            let cfg = profile_for(&args, 24);
+            assert_eq!((cfg.display.width, cfg.display.height), (1920, 1080));
+            assert_eq!(cfg.display.venus, venus);
+            assert_eq!(cfg.vcpus, 8, "24 logical CPUs, venus={venus}");
+            assert_eq!(
+                cfg.memory_mib,
+                if venus {
+                    VENUS_MEMORY_MIB
+                } else {
+                    INSTALLED_MEMORY_MIB
+                }
+            );
+
+            let text = toml::to_string_pretty(&cfg).expect("serialises");
+            let back = VmConfig::from_toml(&text).expect("the written profile is valid");
+            assert_eq!(back, cfg, "{text}");
+            assert!(text.contains("width = 1920") && text.contains("height = 1080"));
+            assert!(text.contains("vcpus = 8"), "{text}");
+            // An older engine must still read a 2D profile (ADR-0004).
+            assert_eq!(text.contains("venus"), venus, "{text}");
+        }
+        // A small host keeps the old 2.
+        assert_eq!(profile_for(&desktop_args(true), 2).vcpus, 2);
+        assert_eq!(profile_for(&desktop_args(true), 6).vcpus, 3);
+    }
+
+    /// Explicit flags are the user's: `--vcpus` wins over the host in both
+    /// directions, and `--memory-mib` above a floor carries through.
+    #[test]
+    fn explicit_vcpus_and_memory_win() {
+        let mut args = desktop_args(true);
+        args.vcpus = Some(3);
+        args.memory_mib = 8192;
+        let cfg = profile_for(&args, 24);
+        assert_eq!(cfg.vcpus, 3);
+        assert_eq!(cfg.memory_mib, 8192);
+        args.vcpus = Some(12);
+        assert_eq!(
+            profile_for(&args, 4).vcpus,
+            12,
+            "past the default's ceiling"
+        );
     }
 
     #[test]

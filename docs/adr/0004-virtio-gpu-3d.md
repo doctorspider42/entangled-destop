@@ -5367,3 +5367,208 @@ Windows screen grabs `screen-N.png`, `run.log`, `drive.trace`,
   the renderer's `deviceUUID`.
 - **The copy path's CPU halves** (`PrivatePages`, the mirror, the upload) are
   unchanged, for every scanout the shared path does not take.
+
+## Amendment, 2026-09-25 — installed profiles: 1920×1080 and half the host
+
+The fresh `install ubuntu --venus` acceptance (ea87ee4) installed a GPU desktop
+whose profile said `width = 1280`, `height = 800` and `vcpus = 2`. The MVP
+target is a 1920×1080 window, and a GNOME desktop composited on the GPU is not
+a two-CPU machine. Every installer now writes the same shape:
+
+| key | was | is | from |
+|---|---|---|---|
+| `[display]` | 1280×800 (Ubuntu, Fedora); 1920×1080 (Debian) | 1920×1080, all three | `DisplaySection::default()` |
+| `vcpus` | 2, all three | half the host's logical CPUs, clamped to 2..=8, or `--vcpus N` | `control_api::default_vcpus` |
+| `memory_mib` | 2048 (4096 with `--venus`); Debian ignored `--memory-mib` | unchanged, and Debian now honours `--memory-mib` above 2048 | the installers |
+
+The installer VMs keep 2 vCPUs and 1280×800. Every install time on record was
+measured that way, and the installer is not the machine it installs. The
+manager's wizard starts its vCPU slider on the same function, so a machine made
+in the GUI and one made with the CLI get the same number on one host.
+
+### Why 1280×800 was there, and why it goes
+
+Nothing chose it. It came in with the first `install ubuntu` (d2de3a6), which
+installed a live-server to a text console, and it was copied into the Fedora
+installer. No commit message, ADR or skill gives a reason. The Debian profile
+has always been `DisplaySection::default()`, 1080p. The one limit that could
+have applied is 2D bandwidth, a CPU copy of every flip. It was measured on WHP
+with the Desktop ISO's live session in 2D, 8 vCPUs, `--cdrom`, the same run at
+two sizes:
+
+| size | desktop fps (median of 17–19 pacing windows) | device time per flip |
+|---|---|---|
+| 1280×800 | 30.0 | 0.51 ms |
+| 1920×1080 | 30.0 | 1.14 ms |
+
+The 2D desktop runs at its own rate (llvmpipe, 30 fps) at either size. The
+larger scanout costs 0.6 ms more per flip, of a 33 ms period. The KVM host
+measured the same 1080p live session at 29.9 fps (run E above). Nothing on the
+2D path needs the small size, so the 2D profile changes too. The GPU path was
+never limited either: zero-copy (the amendment above) made a 1080p flip
+0.12–0.16 ms.
+
+The guest needs nothing configured for it. The EDID's preferred mode is the
+profile's size, and GNOME builds its monitor from the EDID, so the installed
+desktop comes up at 1920×1080. The late-commands write no `monitors.xml`.
+
+### Why half the host, 2 to 8
+
+Each vCPU is a host thread that is busy whenever the guest is. The VMM's own
+threads need cores too: the renderer and its ring workers, the display, the
+block and network workers. A GNOME desktop on the GPU keeps the VMM process at
+2.3–3.2 cores beside its vCPUs (below). So is the host's own desktop. Half
+the host leaves the other half for them. The floor of 2 is the old fixed value,
+so a small host is no worse off. The ceiling of 8 is the largest count
+measured. `--vcpus N` (1 to 64, as a profile allows) overrides it.
+
+`std::thread::available_parallelism` is the input: a CPU-affinity mask narrows
+it, and inside WSL it is the WSL VM's processor count. The profile keeps the
+number of the host that installed it; a disk moved to a smaller host keeps its
+`vcpus` until someone edits it. That is the same trade every other key of an
+installed profile makes.
+
+The machine supports far more than 8. The MP table and the MADT describe up to
+254 processors, the profile allows 64, WHP's partition takes the count as
+`ProcessorCount` with no INIT/SIPI code (WHP-1703), and the userspace IOAPIC's
+id is `vcpu_count`, above every LAPIC id. Eight is pinned as booting:
+`whp_smp::the_default_vcpu_ceiling_comes_up_on_whp` brings up 8 processors
+from a test kernel (4.2 s to ready, 8 clean vCPU exits), and
+`acpi::the_default_vcpu_ceiling_comes_up` asks the same of KVM. That one has
+not run yet: WSL on this machine had no `/dev/kvm` on the day, so every KVM
+test of the gate self-skipped (see Owed).
+
+### Measured: the GPU desktop at 2, 4 and 8 vCPUs
+
+WHP, RTX 2070, the working Venus guest (`venus-ubuntu-net-profile.toml`,
+1920×1080, 4096 MiB) with only `vcpus` changed, one boot per run, the release
+build of this change. Each run is the zero-copy amendment's sequence: idle desktop
+15 s, glmark2 `build` and `jellyfish` (10 s each, 800×600), then vkcube and
+glmark2 `jellyfish` together for 60 s. Headless.
+
+| run | vCPUs | glmark2 `build` / `jellyfish` | over vkcube (6 samples) | VMM cores: idle / `build` / over vkcube | desktop fps (median) |
+|---|---|---|---|---|---|
+| v2a | 2 | 529 / 522 | 337–536 | 0.35 / 2.31 / 2.60 | 59.6 |
+| v2b | 2 | 610 / 590 | 471–504 | 0.05 / 2.39 / 2.56 | 59.9 |
+| v4a | 4 | 653 / 612 | 596–666 | 0.07 / 2.69 / 2.99 | 59.5 |
+| v4b | 4 | 524 / 559 | 505–544 | 0.05 / 2.51 / 2.83 | 59.5 |
+| v8a | 8 | 596 / 552 | 287–646 | 0.05 / 2.87 / 3.20 | 59.5 |
+| v8b | 8 | 639 / 608 | 533–684 | 0.07 / 2.74 / 3.13 | 59.0 |
+
+- **glmark2 does not measure vCPUs.** One client and a compositor, bound by
+  the renderer's queue and the GPU's clocks. The two runs at one count differ
+  by as much as different counts do (4 vCPUs: 653 and 524). The zero-copy
+  amendment's own runs, at 4 vCPUs, read 685 and 758. The brief for this
+  change remembered those as 2-vCPU numbers; they were taken at 4, on this
+  guest, whose profile said 4.
+- **Parallel work does.** Eight jobs of 768 MiB through `sha256sum`, fired
+  with `xargs -P $(nproc)`, one boot per count:
+
+  | vCPUs | wall time | one job alone | speed-up over one job ×8 |
+  |---|---|---|---|
+  | 2 | 14.12 s | 3.48 s | 2.0× |
+  | 4 | 6.85 s | 3.24 s | 3.8× |
+  | 8 | 4.05 s | 3.21 s | 6.3× |
+
+  That is compiling, unpacking, a browser's processes or a game's worker
+  pool: what the desktop does besides drawing.
+- **Width costs the idle desktop nothing.** 0.05–0.07 cores of the VMM idle
+  at every count (v2a's 0.35 was the boot still settling), 59–60 fps. Under
+  load the VMM uses 0.3–0.6 cores more at 8 than at 2, for the same GPU work.
+- **Memory is not the limit.** The guest's `MemTotal` is 3 393–3 395 MiB of
+  the 4096 configured. The desktop used
+  1 007–1 028 MiB idle and 841–888 MiB under vkcube + glmark2, with
+  2 364–2 554 MiB available and no swap used, at every count. The 4096 floor
+  stays.
+- `venus-ubuntu login:` on the serial console 19–25 s after the run started, at
+  every count.
+
+Evidence: `F:\VMs\Entangled\vd\<run>\` (`run.log`, `drive.trace`,
+`frames.json`, `load.png`), `c2`/`c4`/`c8` for the parallel runs,
+`live2d`/`live2d-800` for the 2D sizes.
+
+### Measured: a fresh install
+
+`entangled install ubuntu --iso ubuntu-26.04.1-desktop-amd64.iso --disk
+…\fresh-vd\gpu-desktop.raw --size 40G --auto --venus --headless`, this
+change's release build, WHP, 24 logical CPUs, no `ENTANGLED_VENUS`. It took
+11 min 41 s (10 min 38 s in the ea87ee4 acceptance: the installer VM is the
+same, and the difference is the host). It logged `installed machine: half the
+host's logical CPUs, 2 to 8 (--vcpus to choose) vcpus=8 host_logical_cpus=24`
+and ended with `machine:    8 vCPUs, 4096 MiB, 1920x1080`. The profile it
+wrote says `vcpus = 8`, `width = 1920`, `height = 1080`, `venus = true`.
+
+- **First boot, the profile as written.** `gpu-desktop login:` 29 s after the
+  run started. The guest kernel printed `smp: Brought up 1 node, 8 CPUs`,
+  `nproc` said 8, the connector's modes were `1920x1080` and nothing else, and
+  the device logged `the guest composites on the GPU resource=9 width=1920
+  height=1080`. GDM's greeter is on the GPU at 1920×1080
+  (`fresh-vd\boot1\greeter.png`). The eight sha256 jobs above took 4.59 s
+  (3.44 s for one), as on the other guest.
+- **Then a copy with `[network] backend = "usernet"`**, as before (the written
+  profile has none). The driver installed `glmark2-wayland vulkan-tools
+  mesa-utils`, turned on GDM autologin (a test-only change) and ran the
+  sequence above: a GNOME 50 session at 1920×1080 with glmark2 on Zink over
+  Venus (`fresh-vd\boot2\session.png`, `load.png`). The same disk was then
+  booted at 8 and at 2 vCPUs, twice each (`vcpus` the only difference):
+
+  | run | vCPUs | glmark2 `build` / `jellyfish` | over vkcube | desktop fps over vkcube (median / worst window) | VMM cores: `build` / over vkcube |
+  |---|---|---|---|---|---|
+  | boot2 | 8 | 609 / 569 | 685–723 | 52.6 / 50 | 2.74 / 3.12 |
+  | boot4-v8 | 8 | 648 / 622 | 615–664 | 55.8 / 49 | 2.70 / 3.00 |
+  | boot3-v2 | 2 | 437 / 454 | 413–450 | 59.5 / 56 | 2.21 / 2.49 |
+  | boot5-v2 | 2 | 572 / 525 | 313–478 | 58.5 / 56 | 2.38 / 2.63 |
+
+  On this guest the width shows where two clients and a compositor share the
+  guest: vkcube with glmark2 over it runs 615–723 at 8 vCPUs and 313–478 at
+  2. The compositor pays for it. With the clients no longer held back by the
+  guest's CPUs, GNOME's own rate under two uncapped benchmarks fell from
+  58.5–59.5 to 52.6–55.8 fps. At 2 vCPUs the clients were the ones waiting.
+  The other guest did not show it (58.1–59.5 at 8), and this one also had
+  Software Updater checking 196 updates in the background of both 8-vCPU
+  boots, so how much of the drop is the width is not settled. Idle, both
+  counts hold 60 Hz. The idle desktop cost 0.03–0.05 cores either way. Memory
+  under the load: 842–908 MiB used, 2 485–2 552 MiB available, no swap.
+
+Evidence: `F:\VMs\Entangled\fresh-vd\` (the install's `install-stdout.log`
+and profile, `boot1`…`boot5-v2`). The 40 GiB disk was deleted afterwards;
+the logs and screenshots are kept.
+
+### Tests
+
+- `control_api::config::tests::default_vcpus_is_half_the_host_clamped_to_2_through_8`
+  injects host counts from 0 to `usize::MAX`.
+- `install_ubuntu::tests::the_installed_desktop_is_1080p_with_half_the_host`
+  builds the installed profile for a 24-thread host with and without `--venus`:
+  1920×1080, 8 vCPUs, the memory floors, a TOML round trip to an equal
+  `VmConfig`, and no `venus` key in the 2D one.
+  `explicit_vcpus_and_memory_win` holds `--vcpus` over the host in both
+  directions.
+- `tests::install_vcpus_is_optional_and_bounded_like_a_profile` (the CLI):
+  absent is `None`, 0 and 65 are refused.
+- The manager: `settings::tests::the_vcpu_default_follows_the_host_unless_someone_chose_one`.
+  `Settings::default_vcpus` is now an `Option`, absent meaning the host's
+  default. A file that says `2` loads as absent, because every earlier manager
+  wrote that 2 on every save and no control ever set it. This machine's own
+  `manager.toml` had one. Taken as a choice, it would have kept the manager
+  stamping 2 vCPUs over the CLI's number (`discovery::apply_resources`) on every
+  machine it made.
+- The 8-vCPU boots above, one per host.
+
+### Owed
+
+- **The compositor under uncapped clients.** Nothing in the renderer puts
+  GNOME's frame ahead of a benchmark's. At 8 vCPUs two unthrottled clients
+  took 4–7 fps from the compositor on one guest. A desktop that runs a game
+  would notice. That is a queue-priority question for the renderer, not a
+  reason to hold the guest at 2 CPUs.
+- **The KVM half of the 8-vCPU boot.** `acpi::the_default_vcpu_ceiling_comes_up`
+  passed by self-skipping: WSL had no `/dev/kvm` when the Linux gate ran.
+  It needs one run on a host with KVM. The MADT and MP table are the same
+  code on both hosts, and the KVM desktop test (`desktop_gnome`) already
+  brings up 4, so a failure would be a surprise; but 8 has not been seen.
+- **Moving a disk to a smaller host** keeps the installing host's `vcpus`.
+  `entangled run` could warn when a profile asks for more vCPUs than the host
+  has; it does not yet.
+- **The installed Ubuntu profile has no `[network]`** (the ea87ee4 guide
+  already says so). Unchanged here: it is a different decision.

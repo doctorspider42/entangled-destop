@@ -68,7 +68,14 @@ pub struct Settings {
     pub animations_enabled: bool,
     /// Wizard defaults.
     pub default_memory_mib: u64,
-    pub default_vcpus: u32,
+    /// The wizard's vCPU default. `None` — what a settings file says by
+    /// leaving the key out — is the CLI's own rule for an installed profile,
+    /// [`control_api::host_default_vcpus`] (half this host's logical CPUs, 2
+    /// to 8), so a machine made here gets the number `entangled install`
+    /// would have chosen; [`Self::wizard_vcpus`] resolves it. A number is a
+    /// fixed choice. See [`STALE_VCPUS_DEFAULT`] for why a `2` is not one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_vcpus: Option<u32>,
     pub default_disk_gib: u64,
     pub default_variant: String,
     /// Which hypervisor a new machine uses. On Linux there is only one answer;
@@ -100,7 +107,7 @@ impl Default for Settings {
             check_updates_on_startup: true,
             animations_enabled: true,
             default_memory_mib: 2048,
-            default_vcpus: 2,
+            default_vcpus: None,
             default_disk_gib: 16,
             default_variant: "text-netboot".to_string(),
             default_backend: Backend::Native,
@@ -111,7 +118,25 @@ impl Default for Settings {
     }
 }
 
+/// The fixed vCPU default every settings file was saved with before the
+/// default followed the host: `Settings::default()` said `default_vcpus = 2`,
+/// and every save wrote it out, though no control in the manager ever set it
+/// (the wizard's slider sets one machine, not the default). So a `2` in a
+/// file is that old default, not a choice, and loading it as a choice would
+/// keep an upgraded manager stamping 2 vCPUs over the CLI's derived number on
+/// every new machine — exactly the profile this default was changed to stop
+/// writing. It loads as "follow the host"; any other number is someone's edit
+/// and is kept.
+pub const STALE_VCPUS_DEFAULT: u32 = 2;
+
 impl Settings {
+    /// The vCPUs the wizard opens on: the configured number, or the CLI's
+    /// derived default for this host.
+    pub fn wizard_vcpus(&self) -> u32 {
+        self.default_vcpus
+            .unwrap_or_else(control_api::host_default_vcpus)
+    }
+
     /// Reads the settings file, falling back to defaults when it does not
     /// exist yet. A malformed file is an error — silently resetting somebody's
     /// VM directory would be worse.
@@ -141,6 +166,13 @@ impl Settings {
                 "default_memory_mib exceeds what the machine can build; clamping"
             );
             settings.default_memory_mib = control_api::MAX_MEMORY_MIB;
+        }
+        if settings.default_vcpus == Some(STALE_VCPUS_DEFAULT) {
+            tracing::info!(
+                "default_vcpus = 2 is the old fixed default; the wizard now follows the host \
+                 (half its logical CPUs, 2 to 8)"
+            );
+            settings.default_vcpus = None;
         }
         Ok(settings)
     }
@@ -254,7 +286,7 @@ mod tests {
             check_updates_on_startup: false,
             animations_enabled: false,
             default_memory_mib: 3072,
-            default_vcpus: 4,
+            default_vcpus: Some(4),
             default_disk_gib: 40,
             default_variant: "gtk-netboot".into(),
             default_backend: Backend::Wsl,
@@ -317,6 +349,44 @@ mod tests {
         assert_eq!(back.vm_dir, settings.vm_dir);
     }
 
+    /// The wizard and `entangled install` agree on a new machine's vCPUs:
+    /// a fresh settings file follows the host and does not pin it, a file
+    /// saved with the old fixed `2` (this project's own Windows host had one)
+    /// follows the host too, and a number anyone actually wrote is kept.
+    #[test]
+    fn the_vcpu_default_follows_the_host_unless_someone_chose_one() {
+        let dir = temp_dir("settings-vcpus");
+        let path = dir.join("manager.toml");
+
+        let fresh = Settings::default();
+        assert_eq!(fresh.wizard_vcpus(), control_api::host_default_vcpus());
+        fresh.save_to(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("default_vcpus"), "{text}");
+        assert_eq!(Settings::load_from(&path).expect("load"), fresh);
+
+        // A file as every earlier manager wrote it.
+        std::fs::write(
+            &path,
+            "vm_dir = 'F:\\VMs\\Entangled'\ndefault_memory_mib = 2048\ndefault_vcpus = 2\n",
+        )
+        .expect("write");
+        let old = Settings::load_from(&path).expect("load");
+        assert_eq!(old.default_vcpus, None);
+        assert_eq!(old.wizard_vcpus(), control_api::host_default_vcpus());
+        assert_eq!(old.default_memory_mib, 2048);
+
+        for chosen in [1, 6, 12] {
+            let settings = Settings {
+                default_vcpus: Some(chosen),
+                ..Settings::default()
+            };
+            settings.save_to(&path).expect("save");
+            let back = Settings::load_from(&path).expect("load");
+            assert_eq!(back.wizard_vcpus(), chosen);
+        }
+    }
+
     #[test]
     fn missing_file_yields_defaults() {
         let dir = temp_dir("settings-missing");
@@ -332,7 +402,8 @@ mod tests {
 
         let loaded = Settings::load_from(&path).expect("load");
         assert_eq!(loaded.vm_dir, PathBuf::from("/tmp/only-this"));
-        assert_eq!(loaded.default_vcpus, Settings::default().default_vcpus);
+        assert_eq!(loaded.default_vcpus, None);
+        assert_eq!(loaded.wizard_vcpus(), control_api::host_default_vcpus());
         assert_eq!(loaded.default_variant, Settings::default().default_variant);
         // A settings file written before the update check existed keeps the
         // check ON — the toggle is opt-out, not opt-in.

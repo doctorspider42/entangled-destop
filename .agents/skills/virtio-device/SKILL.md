@@ -594,6 +594,15 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
     that dispatch never sends it — a guest whose host connect was refused got
     silence and waited out its own SYN timeout. Same reordering is what lets the
     ACK for a guest's final FIN go out before its socket disappears.
+    The corollary for tests: a refusal can be back **before the first poll**
+    (Linux loopback is immediate; the test thread only has to be descheduled
+    between SYN and poll), and then that one poll emits SYN-ACK *and* RST and
+    retires the flow. A test that runs `GuestPeer::handshake()` — which discards
+    what it polls — and then expects the flow to still be open is asserting a
+    window the NAT never promised; it failed 8 runs in 200 under CPU load. Watch
+    every segment from the first poll, and pin orderings deterministically with
+    `GuestPeer::host_connect_fails` on an `Offline` NAT instead of racing a real
+    socket.
   - **Every socket carries a keep-alive pair** (`FLOW_KEEPALIVE`,
     `FLOW_IDLE_TIMEOUT`). Nothing in TCP notices a peer that stops existing, and
     the guest is a peer that can: a reboot, a device reset, a paused VM. Without

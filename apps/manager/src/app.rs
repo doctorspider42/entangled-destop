@@ -479,6 +479,10 @@ impl ManagerApp {
         let mut settings = if mock_mode {
             Settings {
                 vm_dir: PathBuf::from("mock-vms"),
+                // The wizard's vCPU default follows the host; a mock session
+                // pretends to be an 8-thread one, so its screenshots are the
+                // same on every machine.
+                default_vcpus: Some(control_api::default_vcpus(8)),
                 ..Settings::default()
             }
         } else {
@@ -754,7 +758,7 @@ impl ManagerApp {
             machine: NewMachine {
                 name,
                 memory_mib: self.settings.default_memory_mib,
-                vcpus: self.settings.default_vcpus,
+                vcpus: self.settings.wizard_vcpus(),
                 disk_gib: self.settings.default_disk_gib,
                 disk_path: String::new(),
                 disk_mode: launcher::DiskMode::CreateNew,

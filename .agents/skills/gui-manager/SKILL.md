@@ -148,9 +148,25 @@ that does nothing on the reviewed command line is worse than an absent one.
 `--network` is never passed either: the CLI's per-host default (TAP on Linux,
 usernet on Windows) is right on both hosts and a pinned GUI value would be wrong
 on one. The CLI writes
-the profile itself, but hardcodes its resource defaults, so on success the
+the profile itself with its own resource defaults, so on success the
 manager stamps the wizard's memory/vCPU choice onto the profile
-(`discovery::apply_resources`). While the install runs the VM has no profile
+(`discovery::apply_resources`). `--vcpus` is deliberately **not** passed: the
+manager may be driving an older WSL engine that has no such flag, and the stamp
+already does the job.
+
+**The two defaults must agree, and the vCPU one is shared code.** A new machine
+gets `control_api::host_default_vcpus()` — half the host's logical CPUs,
+clamped to 2..=8 — from `entangled install` (for the profile it writes) and
+from the wizard (`Settings::wizard_vcpus`, the slider's starting value). The
+display is 1920×1080 either way, since the wizard has no display step and the
+CLI writes `DisplaySection::default()`. `Settings::default_vcpus` is an
+`Option`: absent means "follow the host" and is not written back. A settings
+file that says `default_vcpus = 2` loads as absent (`STALE_VCPUS_DEFAULT`),
+because every earlier manager wrote that 2 on every save, with no control
+anywhere that set it — the development host's own `manager.toml` had it. Taking
+it as a choice kept an upgraded manager stamping 2 vCPUs over the CLI's 8.
+`--mock` pins the default to an 8-thread host's 4, so screenshots stay
+identical everywhere. While the install runs the VM has no profile
 yet, so `PendingInstall` gives it a card with the Installing badge.
 
 ## Form conventions — read before adding any field
