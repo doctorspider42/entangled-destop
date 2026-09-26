@@ -240,15 +240,17 @@ than pinned.
 
 - Unlike the Ubuntu install, the Fedora one is **online**: a netinst downloads
   ~2 GiB of RPMs, so `--network none` is refused and the wall-clock time is the
-  mirror's, not the VMM's. That difference has a sharp edge: `--network`
-  defaults to a host **TAP** on Linux, which is state somebody has to create as
-  root (`scripts/setup-tap.sh`). The Ubuntu install never meets it because its
-  installer VM has no network at all; the Fedora one dies half a second in with
-  `cannot attach to TAP interface entangled0: Operation not permitted`. On this
-  machine the command is therefore
-  `entangled install fedora --auto --network usernet` — user-mode NAT inside the
-  process, no host setup — and `install_fedora` now appends that advice to the
-  failure rather than leaving the bare errno.
+  mirror's, not the VMM's. That difference had a sharp edge until ADR-0002's
+  installed-network amendment: `--network` defaulted to a host **TAP** on
+  Linux, which is state somebody has to create as root
+  (`scripts/setup-tap.sh`), and the Fedora install died half a second in with
+  `cannot attach to TAP interface entangled0: Operation not permitted`. The
+  default is now `usernet` on both hosts — user-mode NAT inside the process, no
+  host setup — and `--network tap` is the explicit choice; `install_fedora`
+  still appends the usernet advice to a TAP failure rather than leaving the
+  bare errno. The installer VM and the installed profile share one MAC
+  (`NetPlan::machine_section`), so anything Anaconda keys to the NIC's address
+  carries over.
 - Fedora's default layout roots on **btrfs**, so `find_uefi_install` returns no
   `root_uuid` — that is expected, not a failure. The ESP and the NVRAM
   `Boot####` entry are what make the disk bootable.

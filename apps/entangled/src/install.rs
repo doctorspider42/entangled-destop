@@ -10,10 +10,15 @@
 //!
 //! | | Linux (KVM) | Windows (WHP) |
 //! |---|---|---|
-//! | Default network | `tap` (`scripts/setup-tap.sh`), static netcfg | `usernet` (user-mode NAT in-process), static netcfg from its own config |
-//! | `--network tap` | the host interface | refused: [`NETWORK_TAP_UNAVAILABLE`] |
+//! | Default network | `usernet` (user-mode NAT in-process), static netcfg from its own config | ditto |
+//! | `--network tap` | the host interface (`scripts/setup-tap.sh`) | refused: [`NETWORK_TAP_UNAVAILABLE`] |
 //! | Bootstrap kernel (Debian) | `guest/bootstrap-kernel/build.sh`, or the same download | `entangled fetch bootstrap-kernel` — the kernel build is Linux-only, so Windows downloads the published one ([`crate::bootstrap`]) |
 //! | Ubuntu | offline install off the verified ISO — identical on both | ditto |
+//!
+//! Every installed profile carries the chosen network as a `[network]` section
+//! with a MAC of the machine's own ([`NetPlan::machine_section`]) — Ubuntu's
+//! too, although its installer VM runs offline (ADR-0002, the
+//! installed-network amendment).
 //!
 //! Nothing else is host-specific, and in particular nothing here mounts
 //! anything: the installer writes the disk from *inside* the guest, and the host
@@ -108,6 +113,25 @@ pub struct NetAddress {
     pub gateway: String,
     pub netmask: String,
     pub dns: String,
+}
+
+impl NetPlan {
+    /// The plan's `[network]` for the machine on `disk`: the backend it chose
+    /// (and TAP's interface) with a MAC of the machine's own,
+    /// [`control_api::new_machine_mac`]. The installer VM and the installed
+    /// machine get the same one — the installer's NIC *is* the machine's, so a
+    /// guest configuration keyed to its address carries over. `None` for
+    /// `--network none`.
+    pub fn machine_section(&self, vm_name: &str, disk: &Path) -> Option<NetworkSection> {
+        self.section.as_ref().map(|section| {
+            NetworkSection::for_new_machine(
+                section.backend,
+                section.interface.clone(),
+                vm_name,
+                disk,
+            )
+        })
+    }
 }
 
 /// Resolves `--network <choice>` for this host.
@@ -349,6 +373,9 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         tracing::info!(disk = %target.display(), bytes, "created target disk");
     }
 
+    // The machine's NIC, for the installer and the installed profile alike.
+    let network = net.machine_section(&vm_name, &target);
+
     // 3. Preseed (MVP-1010) and command line (MVP-1003).
     // A preseed is ALWAYS appended to the initrd: at minimum it carries the
     // virtio_mmio modprobe (see EARLY_MODPROBE_PRESEED — the d-i kernel
@@ -392,7 +419,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             writable: true,
         }],
         cdrom: None,
-        network: net.section.clone(),
+        network: network.clone(),
         display: DisplaySection::default(),
         // The installer has nothing to say; the *installed* profile below is
         // where the card and the pad belong.
@@ -459,7 +486,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             writable: true,
         }],
         cdrom: None,
-        network: net.section.clone(),
+        network,
         display: DisplaySection {
             refresh_hz: installed_refresh_hz_here(args),
             ..DisplaySection::default()
@@ -830,12 +857,62 @@ mod tests {
                 .expect("a [network] section");
             assert_eq!(section.backend, NetworkBackend::Tap);
             assert_eq!(section.interface.as_deref(), Some("entangled0"));
-            assert_eq!(crate::DEFAULT_NETWORK, "tap");
         } else {
             let message = plan.expect_err("TAP cannot resolve on a host with no TAP");
             assert_eq!(message, NETWORK_TAP_UNAVAILABLE);
             assert!(message.contains("--network usernet"), "{message}");
-            assert_eq!(crate::DEFAULT_NETWORK, "usernet");
+        }
+    }
+
+    /// No flag means usernet on *both* hosts — the one backend that needs no
+    /// host setup — and it is the model's own default, so the CLI and the
+    /// config crate cannot disagree about what a new machine gets.
+    #[test]
+    fn the_default_network_is_usernet_on_every_host() {
+        assert_eq!(crate::DEFAULT_NETWORK, "usernet");
+        assert_eq!(
+            crate::DEFAULT_NETWORK,
+            control_api::DEFAULT_NEW_MACHINE_NETWORK.to_string()
+        );
+        let plan = net_plan(crate::DEFAULT_NETWORK, "entangled0").expect("resolves everywhere");
+        assert_eq!(
+            plan.section.as_ref().map(|s| s.backend),
+            Some(NetworkBackend::Usernet)
+        );
+    }
+
+    /// Each `--network` choice, as the machine's `[network]`: the backend it
+    /// named, TAP's interface and nothing for usernet, and one MAC per
+    /// machine — the same for its installer VM and its profile, different for
+    /// another machine. The section is valid in a profile as written.
+    #[test]
+    fn each_network_choice_becomes_the_machines_section() {
+        let disk = Path::new("vms").join("work.raw");
+        let mut choices = vec![("usernet", Some(NetworkBackend::Usernet)), ("none", None)];
+        if cfg!(target_os = "linux") {
+            choices.push(("tap", Some(NetworkBackend::Tap)));
+        }
+        for (choice, backend) in choices {
+            let plan = net_plan(choice, "entangled0").expect(choice);
+            let section = plan.machine_section("work", &disk);
+            assert_eq!(section.as_ref().map(|s| s.backend), backend, "{choice}");
+            let Some(section) = section else { continue };
+            assert_eq!(
+                section.interface.as_deref(),
+                (backend == Some(NetworkBackend::Tap)).then_some("entangled0"),
+                "{choice}"
+            );
+            assert_eq!(
+                section.mac.as_deref(),
+                Some(control_api::new_machine_mac("work", &disk).as_str())
+            );
+            assert_eq!(plan.machine_section("work", &disk), Some(section.clone()));
+            assert_ne!(
+                plan.machine_section("other", &disk).and_then(|s| s.mac),
+                section.mac,
+                "another machine, another MAC"
+            );
+            assert!(section.mac_octets().expect("a valid MAC").is_some());
         }
     }
 

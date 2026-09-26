@@ -414,8 +414,11 @@ fn build_devices(
     // virtio-net from the [network] section (MVP-505, WHP-1704).
     let mut net_cmdline = None;
     if let Some(net) = &cfg.network {
-        let mac = match &net.mac {
-            Some(text) => parse_mac(text)?,
+        // The profile's own MAC (every installed machine has one, and the
+        // config already validated it), else the name-derived address every
+        // profile without one has always had.
+        let mac = match net.mac_octets().map_err(|e| e.to_string())? {
+            Some(octets) => virtio_net::MacAddr(octets),
             None => virtio_net::MacAddr::derive(&cfg.name),
         };
         match net.backend {
@@ -2640,25 +2643,6 @@ fn refuse_nvram_with_reset_vector(cfg: &VmConfig) -> Result<(), String> {
         );
     }
     Ok(())
-}
-
-/// Parses a "52:00:ab:01:02:03"-style MAC from the VM config.
-fn parse_mac(text: &str) -> Result<virtio_net::MacAddr, String> {
-    let mut bytes = [0u8; 6];
-    let mut count = 0;
-    for (i, part) in text.split(':').enumerate() {
-        if i >= 6 {
-            count = 7;
-            break;
-        }
-        bytes[i] =
-            u8::from_str_radix(part, 16).map_err(|_| format!("invalid MAC address '{text}'"))?;
-        count = i + 1;
-    }
-    if count != 6 {
-        return Err(format!("invalid MAC address '{text}': expected 6 octets"));
-    }
-    Ok(virtio_net::MacAddr(bytes))
 }
 
 /// Appends the `virtio_mmio.device=` clauses to the configured kernel command

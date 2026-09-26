@@ -281,7 +281,7 @@ same shape `run_vm` uses — one shared body, the differences named in one place
 
 | | Linux (KVM) | Windows (WHP) |
 |---|---|---|
-| `install --network` default | `tap` | `usernet` |
+| `install --network` default | `tap` (`usernet` since the 2026-09-26 installed-network amendment) | `usernet` |
 | `--network tap` | the host interface | typed refusal naming `--network usernet` |
 | Debian bootstrap kernel | `guest/bootstrap-kernel/build.sh`, or the same download | `entangled fetch bootstrap-kernel` — no cross build, so the release pipeline builds it once on Linux and every host downloads it |
 | Everything else | identical | identical |
@@ -539,3 +539,225 @@ leaves the bus the transports' only owner), and on WHP itself
 requests on the kicking vCPU — every kick becomes a wake, and the guest still
 reads its 8 MiB, interrupt-completed (66 kicks, 66 notifies from the host-wake
 thread, 64 interrupts).
+
+## Amendment, 2026-09-26 — installed machines are networked by default: usernet on both hosts
+
+ADR-0004's installed-profile amendment listed it as owed: *the installed
+Ubuntu profile has no `[network]` section*. It was worse than one missing
+section, and it was a per-host question, which is why it is answered here.
+
+### What each path wrote
+
+| | Installer VM | Installed profile | Default `--network` |
+|---|---|---|---|
+| `install debian` | the `--network` backend, static netcfg on the kernel command line | the same section, no MAC | `tap` on Linux, `usernet` on Windows |
+| `install fedora` | ditto, static in the kickstart | ditto | ditto |
+| `install ubuntu` | **no NIC** (offline by design) | **no `[network]` at all**; `--network` was accepted and ignored | ditto, ignored |
+| manager's New machine | drives the CLI; never passed `--network` | whatever the engine wrote | the engine's |
+
+A profile without `[network]` means no virtio-net device at `run`: the guest
+has no NIC. So every Ubuntu machine — the GPU desktop included — booted with
+no network, and on Linux the Debian and Fedora defaults were a TAP that
+`scripts/setup-tap.sh` has to create as root, so a fresh Linux host failed
+those installs half a second in. The hand-added `backend = "usernet"` in the
+comparison profile (`venus-ubuntu-net-profile.toml`) was how every probe that
+needed packages got them.
+
+### The decision
+
+**Every installed machine gets `[network] backend = "usernet"` and a MAC of
+its own, on both hosts, unless `--network` says otherwise.**
+
+- *usernet on Linux too.* It is the only backend that needs nothing from the
+  host: no interface made as root, no DHCP server beside it, no
+  administrator. TAP on Linux needs `setup-tap.sh` once *and*, for a guest
+  that asks DHCP for its address (Ubuntu, and Fedora after install), a DHCP
+  server on the segment that the project does not ship. A default that fails
+  on a fresh host, or boots a guest with no address, is not a default. TAP
+  stays one flag away: `--network tap [--interface <if>]`, Linux only, as
+  before. `main::DEFAULT_NETWORK` is now one string, and it is
+  `control_api::DEFAULT_NEW_MACHINE_NETWORK` spelled for clap (a test holds
+  them equal).
+- *A MAC in the profile.* `control_api::new_machine_mac(name, disk)`: FNV-1a
+  over the name and the disk path, `52:…` (locally administered, unicast —
+  the prefix `virtio_net::MacAddr::derive` uses). Written once, so it survives
+  renaming the machine; unique per machine, because no two machines share a
+  disk, so two `ubuntu` profiles in two VM directories still differ (which
+  matters on a TAP bridge); deterministic, so a reinstall onto the same disk
+  keeps the address a guest configuration may be keyed to. The installer VM
+  and the installed machine share it (`NetPlan::machine_section`) — the
+  installer's NIC *is* the machine's. `mac` is now validated at load
+  (`control_api::parse_mac`: six hex octets, unicast, not zero) rather than at
+  `run`, so the manager's editor shows the same refusal; a profile without
+  one keeps the name-derived address it always had.
+- *The Ubuntu installer stays offline.* Everything it installs comes from the
+  verified ISO, so the install is reproducible and takes the time it was
+  measured at, and no mirror, `updates: security` download or language-pack
+  fetch can change what was tested. The machine updates the way any Ubuntu
+  does, with `apt`, once it runs. So `--network` means "the machine's
+  network" for all three installers; Debian and Fedora also install over it.
+- *The guest configures the NIC itself.* The Desktop install needs nothing:
+  NetworkManager brings up any wired NIC by DHCP (`Wired connection 1`, with
+  subiquity's own `01-network-manager-all.yaml`). A *server* install that saw
+  no NIC configures none, so the server profile's late-commands write
+  `/etc/netplan/90-entangled.yaml`: DHCP on `match: name: "en*"` — by pattern,
+  because the NIC's PCI slot and so its `enp0sN` name follow the disks, and
+  the installer has two more of those — `optional: true`, mode 0600. The
+  Debian and Fedora guests keep the static address their installer was
+  preseeded with, which is the usernet guest address the DHCP server hands
+  out anyway.
+- *Existing profiles are untouched.* A profile without `[network]` still means
+  no NIC; nothing rewrites it. The one exception is the manager's own install
+  flow, which now passes `--network usernet` explicitly (a WSL engine may be
+  an older release whose Linux default was TAP) and, if the profile the
+  engine wrote has no `[network]` (an Ubuntu install by such an engine),
+  stamps the section a current engine writes, in the same
+  `discovery::apply_resources` pass that already stamps memory, vCPUs and
+  refresh. The editor already offers backend, interface and MAC, so the
+  default is one the UI can show.
+
+### What the guest can reach, and what it cannot
+
+Unchanged by design, and now written down in the user guide:
+
+- One segment, `192.168.74.0/24`: the guest is `.15` by DHCP (one-hour
+  lease), the process is `.1` — router, DHCP server and DNS server. Each VM
+  has its own segment.
+- **Reachable:** outbound TCP anywhere; DNS over UDP and TCP, relayed to
+  `1.1.1.1`; a ping of `.1`. Also the host's *non-loopback* addresses and its
+  LAN, exactly as any LAN machine reaches them — a host service bound to a LAN
+  address or `0.0.0.0` is reachable at that address.
+- **Refused by the NAT:** anything on the guest's own segment (the process
+  itself — except DNS, below), loopback `127.0.0.0/8`, and now also
+  `0.0.0.0` (Linux connects a socket aimed at it to the local host, so it was
+  a loopback bypass on a Linux host), broadcast and multicast. A host service
+  bound to `127.0.0.1` only is unreachable from the guest by every address.
+- **Not carried:** UDP other than DHCP and DNS (no NTP — the guest reports
+  `NTPSynchronized=no` — no QUIC, no games), ICMP past the gateway, IPv6 (the
+  guest has only a link-local address and no route, so programs use IPv4;
+  `curl -6` fails in 1 ms rather than hanging), anything inbound (no port
+  forwarding).
+
+### Two DNS bugs, found reading the relay before the acceptance
+
+- **The relay read upstream answers into 512 bytes.** Every stub resolver asks
+  for more through EDNS0 (systemd-resolved advertises 1232), and a longer
+  answer is *discarded* on Windows (`recv_from` fails with `WSAEMSGSIZE` and
+  the datagram is gone) and cut short on Linux, so an answer past 512 bytes
+  never arrived and the lookup timed out. The relay now reads the whole datagram; one
+  too long for a frame (1472 bytes of DNS) goes back as the header and
+  question with TC set, no records — RFC 1035's truncation, walked with every
+  read bounds-checked because the upstream is as untrusted as the guest.
+- **The resolver's answer to TC is TCP to its DNS server** — `192.168.74.1:53`
+  — which the NAT refused as host-local. That one flow is now opened, and
+  carried to the configured upstream: an address the host chose, never one
+  the guest named. Every other gateway port stays refused.
+
+### Measured on this Windows host (2026-09-26, release build)
+
+A fresh `install ubuntu --venus --auto --headless` from the 26.04.1 Desktop
+ISO into `F:\VMs\Entangled\netdef`, no `--network`: **13 min 39 s**, and the
+summary says `network: usernet — user-mode NAT, the guest takes its address
+by DHCP; MAC 52:ad:f5:d7:2e:58`. The written profile has
+`[network] backend = "usernet"`, `mac = "52:ad:f5:d7:2e:58"`. Then `run` of
+that profile, unchanged, driven over the serial console
+(`F:\VMs\Entangled\probes\net\`). Every row but the throughput is from the
+boot before the throughput fix below; the throughput row is the final build
+on the same disk:
+
+| Check | Result |
+|---|---|
+| address | host: `granted the guest a DHCP lease mac=52-ad-f5-d7-2e-58 ip=192.168.74.15`; guest: `enp0s2=192.168.74.15/24`, `default via 192.168.74.1 proto dhcp`, NetworkManager's `Wired connection 1`, lease 3600 s, DNS `192.168.74.1` |
+| DNS | resolved's link DNS `192.168.74.1`; `deb.debian.org`, `archive.ubuntu.com`, `www.mozilla.org` resolve (A and AAAA) |
+| big DNS | `dig +ignore TXT microsoft.com`: `flags: qr tc`, 42 bytes — the relay's truncation; without `+ignore`: `Truncated, retrying in TCP mode`, 58 answers, 4575 bytes; `dig +tcp @192.168.74.1` answers |
+| HTTPS | `curl -I` of `https://archive.ubuntu.com`, `https://deb.debian.org/debian/`, `https://www.mozilla.org/`: 200 |
+| apt | `apt-get update` rc 0 (`resolute`, `-updates`, `-security`), `apt-get install curl bind9-dnsutils` rc 0; GNOME's Software Updater found 198 updates on its own |
+| Firefox | `https://www.debian.org/` rendered on the GPU desktop (screenshot `netdef\firefox-3.png`), 22 established HTTPS flows |
+| isolation | host listener on `127.0.0.1:8765`: from the guest `192.168.74.1:8765` refused (rc 7), `192.168.233.1:8765` reset (rc 56, nothing listens there), `127.0.0.1:8765` is the guest's own loopback (rc 7); the listener's log shows no guest request. A listener bound to the host-only `192.168.233.1:8000` is reachable (200) |
+| not carried | ping `1.1.1.1` 100 % loss, ping `.1` answered, `NTPSynchronized=no`, `curl -6` fails at once |
+| throughput | final build: 1 GiB over HTTPS from `proof.ovh.net` at **53.2 MB/s** (20.2 s), 100 MB from Hetzner at 51.0 MB/s; the host itself, minutes earlier: 83.8 and 90.0 MB/s. `entangled.exe` used 13.8 s of CPU over the 21.2 s download — 65 % of one core of 24, the guest's vCPU time (its TLS included) counted in — and 2-4 % idle. Before the fix below: **1.4-1.9 MB/s**, 10-13 % of a core. The same boot re-ran DNS (a 1187-byte TXT answer over UDP, the TC/TCP round trip) and `curl -I` on the final build |
+
+### A third bug the measurement found: two segments a tick
+
+The first acceptance run downloaded at 1.4-1.8 MB/s against a host line doing
+51 MB/s. The guest's own TCP said why (`ss -ti` 15 s into a download): about
+1300 segments a second, whatever the file — a packet-rate ceiling, not a
+bandwidth one. smoltcp's `Interface::poll` dispatches each socket once, one
+TCP segment per flow, and `TcpNat::poll` called it twice a pump tick (~1.4 ms
+on this host, measured). `TcpNat::poll_with_budget` now runs `poll_egress`
+again while it produces, up to `MAX_SEGMENTS_PER_POLL` (64) and never past
+the room left in the guest's queue, so a burst is paced rather than dropped
+at `MAX_QUEUED_FRAMES`. The flow buffer then bounds a tick, so it went from
+16 KiB to 256 KiB (32 MiB at the 64-flow cap). Each step measured on its own
+boot of the installed profile, 1 GiB download:
+
+| `FLOW_BUFFER` | segments per tick | guest MB/s | VMM CPU |
+|---|---|---|---|
+| 16 KiB | 2 | 1.8 | 10-12 % of a core |
+| 256 KiB | 2 | 1.9 | 13 % |
+| 16 KiB | ≤ 64 | 9.9 | 20 % |
+| 256 KiB | ≤ 64 | **52.3** | 46 % |
+| 256 KiB, read straight into smoltcp's ring (final) | ≤ 64 | **53.2** | 65 % |
+
+`a_bulk_download_is_not_held_to_one_segment_a_poll` pins it: a full 16 KiB
+window now leaves in one poll, and with the loop taken out the test sees two.
+
+### Boots that did not reach the network
+
+Two of the eight boots of the installed 8-vCPU profile that day panicked
+before any NIC was up: `..MP-BIOS bug: 8254 timer not connected to IO-APIC`,
+then `Kernel panic - not syncing: IO-APIC + timer doesn't work!` at
+0.001-0.002 s, on an idle host. Even the six good boots print `tsc: Unable to
+calibrate against PIT`, as the 4-vCPU refresh runs of the same day did in
+about half their boots without ever panicking. It is not this amendment's —
+the profiles that panicked and the ones that booted are the same file — but
+it is the first thing a user of an 8-vCPU installed machine on WHP would hit,
+so it is recorded here and owed below. It is not only a many-vCPU matter:
+the 1-vCPU direct-boot guest of `usernet_guest` panicked the same way in one
+gate run, with a WSL workspace build loading the host beside it (three
+reruns passed).
+
+### Tests
+
+- `control_api`: `a_new_machines_network_round_trips_for_each_backend`,
+  `a_new_machines_mac_is_stable_unique_and_valid` (1000 machines, no repeat),
+  `a_profiles_mac_is_validated_at_load`.
+- `entangled`: `the_default_network_is_usernet_on_every_host`,
+  `each_network_choice_becomes_the_machines_section`,
+  `the_installed_machine_is_networked_by_default` (Ubuntu profile, TOML round
+  trip, `none`, and `tap` on Linux),
+  `the_installed_server_configures_its_nic_by_dhcp` (the folded late-command,
+  server only, the installer still offline); the ignored `ubuntu_install`
+  end-to-end now asserts the written `[network]`.
+- `entangled-manager`: the install command line carries `--network usernet`;
+  `apply_resources_networks_a_machine_an_older_engine_left_offline`.
+- `virtio-net`: `host_local_destinations_are_refused` (now with `0.0.0.0`,
+  `127.1.2.3`, broadcast, multicast, three ports each),
+  `dns_over_tcp_to_the_gateway_reaches_the_upstream_resolver`,
+  `a_dns_answer_longer_than_512_bytes_is_delivered_whole`,
+  `a_dns_answer_too_long_for_a_frame_is_truncated_with_tc`,
+  `a_malformed_long_dns_answer_is_dropped_not_misread`,
+  `a_bulk_download_is_not_held_to_one_segment_a_poll`.
+
+### Owed
+
+- **The 8254 under WHP** (above): `check_timer()` failed in two of eight
+  8-vCPU boots and one loaded 1-vCPU test boot, and PIT calibration fails in
+  most boots. The userspace PIT's catch-up (`MAX_CATCHUP_EDGES`) and its
+  thread's scheduling against the vCPU threads and host load are where to
+  look first (whp-backend skill, 8254 notes).
+- **DNS goes to `1.1.1.1`, not the host's resolver.** A network that blocks
+  outside DNS, a VPN's internal zone, `/etc/hosts` and `.local` names do not
+  resolve in the guest. Reading the host's resolvers (`/etc/resolv.conf`,
+  `GetAdaptersAddresses`) is a contained change to `UserNetConfig`; so is a
+  `[network] dns` key, which the manager would then have to show.
+- **No port forwarding, no NTP, no IPv6, no ICMP past the gateway** — each a
+  separate feature of the NAT, none needed to reach the internet.
+- **The server path is not acceptance-tested here**: this host has only the
+  Desktop ISO. The netplan late-command is asserted byte for byte and its
+  folding modelled, but no installed server has DHCPed with it yet; the
+  ignored `ubuntu_install` end-to-end is the test that would.
+- **TAP is unmeasured on this machine**: WSL has no `/dev/kvm` here. The TAP
+  path's code did not change beyond the MAC it is now given.
+- **Upload throughput** (guest → host) was not measured; it rides the same
+  loop and buffer, so it should have moved with the download.

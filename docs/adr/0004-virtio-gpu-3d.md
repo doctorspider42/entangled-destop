@@ -5572,8 +5572,12 @@ the logs and screenshots are kept.
 - **Moving a disk to a smaller host** keeps the installing host's `vcpus`.
   `entangled run` could warn when a profile asks for more vCPUs than the host
   has; it does not yet.
-- **The installed Ubuntu profile has no `[network]`** (the ea87ee4 guide
-  already says so). Unchanged here: it is a different decision.
+- ~~**The installed Ubuntu profile has no `[network]`**~~ (the ea87ee4 guide
+  already says so). Unchanged here: it is a different decision. *Closed
+  2026-09-26 by ADR-0002's installed-network amendment: every installed
+  profile — this one included — gets `[network] backend = "usernet"` and a
+  MAC of its own on both hosts, and the fresh `install ubuntu --venus` guest
+  ran `apt update` and Firefox on it as written.*
 
 ## Amendment, 2026-09-25 — resource exhaustion: every host object a guest makes is capped, charged where it is held, and given back
 

@@ -1,6 +1,6 @@
 //! The `entangled run <file>.toml` configuration format (backlog MVP-1201).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -276,10 +276,111 @@ pub struct NetworkSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<String>,
     /// Optional fixed MAC ("52:00:…"); derived from the VM name when absent.
+    /// Every machine `entangled install` creates has one written
+    /// ([`new_machine_mac`]), so it survives a rename; a profile without one
+    /// keeps the name-derived address it always had.
     pub mac: Option<String>,
 }
 
+/// What a newly created machine is networked with when nobody chose: the
+/// user-mode NAT, on both hosts (ADR-0002, the installed-network amendment).
+/// It is the one backend that needs nothing from the host — no interface made
+/// as root, no DHCP server beside it, no administrator — and the only one
+/// Windows has; TAP stays one flag away (`--network tap`) on Linux.
+pub const DEFAULT_NEW_MACHINE_NETWORK: NetworkBackend = NetworkBackend::Usernet;
+
+/// The MAC a new machine is given, written into its profile once and then
+/// never derived again.
+///
+/// Locally administered and unicast (`52:…`, the prefix
+/// `virtio_net::MacAddr::derive` uses), and a hash of the machine's name *and*
+/// its disk: two machines on one host never share a disk, so two profiles
+/// that happen to share a name (`ubuntu` in two VM directories) still get two
+/// addresses — which matters on a TAP bridge, where both are on one segment.
+/// Deterministic rather than random so a reinstall onto the same disk keeps
+/// the address its guest's network configuration may have been keyed to.
+pub fn new_machine_mac(vm_name: &str, disk: &Path) -> String {
+    // FNV-1a; no cryptographic requirement, only spread.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let disk = disk.to_string_lossy();
+    for byte in b"entangled-mac\0"
+        .iter()
+        .chain(vm_name.as_bytes())
+        .chain(b"\0")
+        .chain(disk.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    let h = hash.to_le_bytes();
+    format_mac([0x52, h[0], h[1], h[2], h[3], h[4]])
+}
+
+/// `aa:bb:cc:dd:ee:ff`, lower case — the spelling a profile carries.
+pub fn format_mac(octets: [u8; 6]) -> String {
+    octets
+        .iter()
+        .map(|o| format!("{o:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Parses a profile's `mac`: six colon-separated hex octets, unicast and not
+/// all zeroes — the only addresses a NIC may have. Refused at load rather than
+/// at `run`, so the manager's editor shows the same error before a start does.
+pub fn parse_mac(text: &str) -> Result<[u8; 6], ConfigError> {
+    let invalid = |why: &str| {
+        ConfigError::Invalid(format!(
+            "network.mac '{text}' {why}: expected six hex octets such as \"52:54:00:12:34:56\""
+        ))
+    };
+    let parts: Vec<&str> = text.trim().split(':').collect();
+    if parts.len() != 6 {
+        return Err(invalid("does not have six octets"));
+    }
+    let mut octets = [0u8; 6];
+    for (octet, part) in octets.iter_mut().zip(&parts) {
+        if part.is_empty() || part.len() > 2 {
+            return Err(invalid("is not hexadecimal"));
+        }
+        *octet = u8::from_str_radix(part, 16).map_err(|_| invalid("is not hexadecimal"))?;
+    }
+    if octets[0] & 0x01 != 0 {
+        return Err(invalid("is a multicast address, which no NIC may have"));
+    }
+    if octets == [0; 6] {
+        return Err(invalid("is all zeroes"));
+    }
+    Ok(octets)
+}
+
 impl NetworkSection {
+    /// The `[network]` a machine `entangled install` creates is given:
+    /// `backend` (with `interface` for TAP) and a [`new_machine_mac`], so the
+    /// guest's NIC keeps one address for the life of the machine.
+    pub fn for_new_machine(
+        backend: NetworkBackend,
+        interface: Option<String>,
+        vm_name: &str,
+        disk: &Path,
+    ) -> Self {
+        Self {
+            backend,
+            interface: match backend {
+                NetworkBackend::Tap => interface,
+                // Refused by validation for this backend: the segment lives
+                // inside the process and touches no host interface.
+                NetworkBackend::Usernet => None,
+            },
+            mac: Some(new_machine_mac(vm_name, disk)),
+        }
+    }
+
+    /// The configured MAC as octets, `None` when the profile names none.
+    pub fn mac_octets(&self) -> Result<Option<[u8; 6]>, ConfigError> {
+        self.mac.as_deref().map(parse_mac).transpose()
+    }
+
     /// The TAP interface name, for `backend = "tap"` callers. Validation
     /// guarantees it is present for that backend; this accessor keeps the error
     /// typed for callers that build a section by hand.
@@ -750,6 +851,7 @@ impl VmConfig {
                     }
                 }
             }
+            network.mac_octets()?;
         }
         // Per-mode boot keys: reject the *wrong* key instead of ignoring it,
         // so a profile that names a kernel under mode = "uefi" fails loudly
@@ -1592,5 +1694,109 @@ path = "/home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-desktop-amd64.iso"
             VmConfig::from_toml(&typo),
             Err(ConfigError::Parse(_))
         ));
+    }
+
+    /// A new machine's `[network]`, for each backend: usernet drops the
+    /// interface (validation would refuse it), TAP keeps it, both carry a MAC
+    /// — and each survives a TOML round trip exactly, as the installer writes
+    /// and `run` reads it.
+    #[test]
+    fn a_new_machines_network_round_trips_for_each_backend() {
+        let disk = Path::new("vms").join("work.raw");
+        for (backend, interface) in [
+            (NetworkBackend::Usernet, None),
+            (NetworkBackend::Tap, Some("entangled0")),
+        ] {
+            let section = NetworkSection::for_new_machine(
+                backend,
+                Some("entangled0".to_string()),
+                "work",
+                &disk,
+            );
+            assert_eq!(section.backend, backend);
+            assert_eq!(section.interface.as_deref(), interface, "{backend}");
+            let mac = section.mac.clone().expect("a new machine has a MAC");
+            assert_eq!(mac, new_machine_mac("work", &disk));
+
+            let mut cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
+            cfg.network = Some(section);
+            let text = toml::to_string_pretty(&cfg).unwrap();
+            assert!(text.contains(&format!("backend = \"{backend}\"")), "{text}");
+            assert!(text.contains(&format!("mac = \"{mac}\"")), "{text}");
+            assert_eq!(
+                text.contains("interface ="),
+                interface.is_some(),
+                "{backend}: {text}"
+            );
+            assert_eq!(VmConfig::from_toml(&text).unwrap(), cfg, "{text}");
+        }
+        assert_eq!(DEFAULT_NEW_MACHINE_NETWORK, NetworkBackend::Usernet);
+    }
+
+    /// The MAC is stable (same machine, same address, every time), unique
+    /// per machine (another name *or* another disk is another address), and
+    /// always an address a NIC may have: locally administered, unicast.
+    #[test]
+    fn a_new_machines_mac_is_stable_unique_and_valid() {
+        let disk = |dir: &str, file: &str| Path::new(dir).join(file);
+        let a = new_machine_mac("ubuntu", &disk("vms", "ubuntu.raw"));
+        assert_eq!(a, new_machine_mac("ubuntu", &disk("vms", "ubuntu.raw")));
+        let mut seen = std::collections::HashSet::new();
+        for (name, dir, file) in [
+            ("ubuntu", "vms", "ubuntu.raw"),
+            // Same name, another VM directory: two machines.
+            ("ubuntu", "other", "ubuntu.raw"),
+            ("ubuntu-2", "vms", "ubuntu.raw"),
+            ("debian", "vms", "debian.raw"),
+            ("gpu-desktop", "vms", "gpu-desktop.raw"),
+        ] {
+            let mac = new_machine_mac(name, &disk(dir, file));
+            assert!(seen.insert(mac.clone()), "{name} in {dir}: {mac} repeats");
+            let octets = parse_mac(&mac).expect("a valid MAC");
+            assert_eq!(octets[0], 0x52, "{mac}: locally administered, unicast");
+            assert_eq!(format_mac(octets), mac);
+        }
+        // A thousand machines in one directory, no two alike.
+        let many: std::collections::HashSet<String> = (0..1000)
+            .map(|i| new_machine_mac(&format!("vm{i}"), &disk("vms", &format!("vm{i}.raw"))))
+            .collect();
+        assert_eq!(many.len(), 1000);
+    }
+
+    /// A profile's MAC is checked at load: six hex octets, unicast, not zero.
+    /// Upper case and an unpadded octet are fine; they are still an address.
+    #[test]
+    fn a_profiles_mac_is_validated_at_load() {
+        let with_mac = |mac: &str| {
+            BACKLOG_EXAMPLE.replace(
+                "interface = \"entangled0\"",
+                &format!("interface = \"entangled0\"\nmac = \"{mac}\""),
+            )
+        };
+        for good in ["52:54:00:12:34:56", "52:54:00:AB:cd:1", "02:00:00:00:00:01"] {
+            let cfg = VmConfig::from_toml(&with_mac(good)).expect(good);
+            assert!(cfg.network.unwrap().mac_octets().unwrap().is_some());
+        }
+        for (bad, why) in [
+            ("52:54:00:12:34", "six octets"),
+            ("52:54:00:12:34:56:78", "six octets"),
+            ("52:54:00:12:34:zz", "hexadecimal"),
+            ("52:54:00:12:34:123", "hexadecimal"),
+            ("52-54-00-12-34-56", "six octets"),
+            ("53:54:00:12:34:56", "multicast"),
+            ("ff:ff:ff:ff:ff:ff", "multicast"),
+            ("00:00:00:00:00:00", "zeroes"),
+        ] {
+            let error = VmConfig::from_toml(&with_mac(bad)).expect_err(bad);
+            let ConfigError::Invalid(message) = error else {
+                panic!("{bad}: expected a validation error, got {error:?}");
+            };
+            assert!(message.contains(why), "{bad}: {message}");
+            assert!(message.contains("network.mac"), "{bad}: {message}");
+        }
+        // No MAC at all is still a valid profile: `run` derives one from the
+        // name, as it always has.
+        let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
+        assert_eq!(cfg.network.unwrap().mac_octets().unwrap(), None);
     }
 }

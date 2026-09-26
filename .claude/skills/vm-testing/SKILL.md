@@ -981,8 +981,10 @@ Full `install ubuntu --venus` runs from the Ubuntu 26.04.1 Desktop ISO on
 WHP: 10 min 38 s (2026-09-25, ea87ee4) and 11 min 41 s with the 1080p /
 half-the-host profile, whose first boot showed `smp: Brought up 1 node, 8
 CPUs`, `nproc` 8, modes `1920x1080` and GDM on the GPU at that size
-(ADR-0004, "installed profiles"). The written profile has no `[network]`, so a
-probe that needs packages boots a copy with `backend = "usernet"`. glmark2
+(ADR-0004, "installed profiles"). Since ADR-0002's installed-network
+amendment the written profile has `[network] backend = "usernet"` with a MAC
+of its own, so a probe that needs packages boots the profile itself; a disk
+installed before that still needs a copy with the section added. glmark2
 numbers do not measure vCPUs: two boots at one count differ by as much as
 2, 4 and 8 do. A parallel job (`xargs -P $(nproc)` over `sha256sum`) does.
 
@@ -1046,6 +1048,38 @@ The installed system talks on ttyS0 because the autoinstall profile's
 `update-grub`; there is no autoinstall key for the target's kernel command line.
 GRUB's own menu is on the serial line for the same reason, which is how a failure
 to load the kernel stays visible.
+
+### The installed machine's network (ADR-0002, installed network)
+
+Every installed profile has `[network] backend = "usernet"` and a `mac`, so
+the acceptance is: `run` the profile *as written* and prove the guest's
+network from inside. The probe pair is `F:\VMs\Entangled\probes\net\`
+(`drive.ps1` on the host, `net.sh` fetched by the guest from a
+`python -m http.server --bind 192.168.233.1` — the VMnet1 address, because
+usernet refuses the host's loopback): address and lease, DNS (including a
+TC/TCP round trip with `dig`), `apt`, `curl -I`, throughput with the VMM's
+CPU sampled around each download (`drive-cpu.ps1`), the isolation matrix
+against a `127.0.0.1`-only listener, and Firefox on the GPU desktop with a
+screenshot. What a healthy run shows is in the ADR amendment's table.
+
+Three traps, each of which cost a boot:
+
+- **A `tail -F` of the driver's trace locks it on Windows.** Git bash's tail
+  holds the file so `Add-Content` fails ("being used by another process"),
+  and a monitor that outlives its task keeps doing so. Poll the trace with
+  `grep -c`/`sed -n` in a loop instead, and give the driver's `Note` a retry.
+- **PowerShell variables are case-insensitive.** A `param([string]$Out)` is
+  the same variable as the `$out = [Console]::Out` the driver writes the
+  VM's stdin with, and every `Send` then fails with "does not contain a
+  method named 'WriteLine'" — on stderr, where nothing is watching.
+- **Two of eight 8-vCPU boots on 2026-09-26 panicked at `check_timer()`**
+  (`..MP-BIOS bug: 8254 timer not connected to IO-APIC`, then `IO-APIC +
+  timer doesn't work!`, at 0.001-0.002 s), with the host idle — and so did
+  one `usernet_guest` test run (a 1-vCPU direct-boot guest) while a WSL
+  workspace build ran beside it; three reruns passed. Even the good
+  boots print `tsc: Unable to calibrate against PIT`. Retry the boot; it is
+  not a network failure — the NIC is not up yet — and it is open (see the
+  whp-backend skill's 8254 notes).
 
 ### Reading the host log, not just the guest's
 

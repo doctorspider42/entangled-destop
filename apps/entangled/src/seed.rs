@@ -792,6 +792,43 @@ mod tests {
         assert!(text.contains("password: \"$6$"));
     }
 
+    /// The installed server configures the NIC its profile gives it: the
+    /// server profile's late-commands write a netplan file that DHCPs any
+    /// `en*` interface (the NIC's name follows its PCI slot, which the
+    /// installer's extra disks move), marked optional and 0600. The desktop
+    /// profile writes none: NetworkManager does that job there, and a
+    /// networkd file would take the NIC away from it.
+    #[test]
+    fn the_installed_server_configures_its_nic_by_dhcp() {
+        const NETPLAN: &str = "/target/etc/netplan/90-entangled.yaml";
+        let server = user_data("srv", None, BuiltinProfile::Server).unwrap();
+        let start = server.find("    - >-\n      printf '%s\\n'\n      '# Entangled: DHCP");
+        let start = start.expect("the netplan late-command");
+        let end = server[start..]
+            .find(NETPLAN)
+            .expect("written to the target")
+            + start;
+        let folded: Vec<&str> = server[start..end].lines().skip(1).map(str::trim).collect();
+        let folded = folded.join(" ");
+        assert_eq!(
+            folded,
+            "printf '%s\\n' '# Entangled: DHCP on the VM profile NIC (ADR-0002, installed \
+             network)' 'network:' '  version: 2' '  ethernets:' '    entangled:' \
+             '      match:' '        name: \"en*\"' '      dhcp4: true' \
+             '      optional: true' >"
+        );
+        assert!(server.contains(&format!("    - chmod 600 {NETPLAN}\n")));
+        // After update-grub, so the serial-console edits are untouched.
+        assert!(server.find("update-grub").unwrap() < start);
+
+        let desktop = user_data("gpu", None, BuiltinProfile::Desktop).unwrap();
+        assert!(!desktop.contains("90-entangled.yaml"), "{desktop}");
+        // And the installer itself stays offline on both.
+        for text in [&server, &desktop] {
+            assert!(text.contains("  network:\n    version: 2\n    ethernets: {}\n"));
+        }
+    }
+
     /// The Desktop ISO gets the desktop profile, by Canonical's file name;
     /// anything else keeps the server profile `--auto` always meant.
     #[test]

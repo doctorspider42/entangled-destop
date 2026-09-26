@@ -209,7 +209,8 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_input::gamepad::evdev::MAX_EVENTS_PER_POLL` | 256 | host `input_event` records folded into one `PadState` per tick; the remainder waits for the next one rather than being dropped | `virtio_input::gamepad::evdev::tests::one_poll_folds_a_bounded_number_of_events_and_leaves_the_rest` |
 | `virtio_net::MAX_FRAME_LEN` / `MAX_BUFFER_LEN` | 1514 / 1526 | bytes staged per frame, either direction | `net_queue::{tx_oversized_frames_are_dropped, an_oversized_host_frame_is_dropped_before_the_ring, rx_chain_too_small_for_the_frame_drops_it}` |
 | `virtio_net::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick | same shape as the blk budget test |
-| `virtio_net::usernet::MAX_FLOWS` | 64 | concurrent guest TCP connections the NAT terminates; each is two 16 KiB socket buffers and, briefly, one connect thread | `usernet::tcp::tests::{the_flow_count_is_capped, a_full_flow_table_refuses_politely_and_then_recovers}`, fuzz target `usernet_frames` |
+| `virtio_net::usernet::MAX_FLOWS` | 64 | concurrent guest TCP connections the NAT terminates; each is two `FLOW_BUFFER` (256 KiB) socket buffers, 32 MiB at the cap and, briefly, one connect thread | `usernet::tcp::tests::{the_flow_count_is_capped, a_full_flow_table_refuses_politely_and_then_recovers}`, fuzz target `usernet_frames` |
+| `virtio_net::usernet::MAX_SEGMENTS_PER_POLL` | 64 | datagrams one `TcpNat::poll` emits, and never more than the room left in the guest's queue (`poll_with_budget`); bounded work per pump tick | `usernet::tcp::tests::a_bulk_download_is_not_held_to_one_segment_a_poll` |
 | `virtio_net::usernet::FLOW_IDLE_TIMEOUT` / `FLOW_KEEPALIVE` | 60 s / 15 s | how long a flow may go unanswered by the guest before it is aborted and its slot returned. Not a size bound but a *liveness* one, and load-bearing for the same reason: a guest that stops existing (reboot, reset, pause) otherwise holds all 64 for the life of the process | `usernet::tcp::tests::{a_flow_the_guest_abandons_is_retired_by_the_keepalive, a_full_flow_table_refuses_politely_and_then_recovers}` |
 | `virtio_net::usernet::MAX_QUEUED_FRAMES` | 256 | frames queued for a guest that has stopped draining its RX queue | `usernet::tests::the_guest_queue_is_bounded`, fuzz target `usernet_frames` |
 | `virtio_net::usernet::MAX_DNS_QUERIES` / `DNS_QUERY_TTL` | 64 / 5 s | outstanding forwarded DNS queries, and how long one is remembered — the guest picks how many it sends | `usernet::tests::a_guest_dns_query_is_forwarded_and_its_answer_comes_back` (the round trip), oldest-first eviction in `DnsRelay::forward` |
@@ -690,7 +691,12 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
 - **net** (EPIC 5): TX before RX (easier to debug); `virtio_net_hdr` is 12
   bytes with num_buffers when MRG_RXBUF — MVP negotiates **no offloads, no
   mergeable buffers, no multiqueue**: correct first, fast later. MAC from
-  `virtio_net::MacAddr::derive(vm_name)` unless pinned in config.
+  the profile's `[network] mac` (validated at load by
+  `control_api::parse_mac`: six octets, unicast, not zero), else
+  `virtio_net::MacAddr::derive(vm_name)`. Every machine `entangled install`
+  makes has one written (`control_api::new_machine_mac(name, disk)`), so an
+  installed guest's NIC address survives a rename (ADR-0002, the
+  installed-network amendment).
   Two backends behind `NetBackend`: `tap` (Linux) and `usernet`, the in-process
   smoltcp NAT that is the only one on Windows. **The NAT's close path needs a
   workload that closes thousands of connections before you can call it done** —
@@ -735,10 +741,28 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
     That is the opposite of the TAP path, where the guest's own segments are
     bridged onto that uplink and the nftables clamp in `scripts/setup-tap.sh`
     is what keeps them from being dropped.
+  - **smoltcp sends one segment per socket per `Interface::poll`.** The NAT
+    polled twice a tick, so a bulk download was held to two segments a tick —
+    1.4-1.9 MB/s in a real guest against a 51-84 MB/s host line, and a bigger
+    buffer alone changed nothing (1.9). `TcpNat::poll_with_budget` now reruns
+    `poll_egress` while it produces, up to `MAX_SEGMENTS_PER_POLL` and the
+    guest queue's room; with 256 KiB flow buffers a 1 GiB download runs at
+    52 MB/s (16 KiB and the loop: 9.9 — one buffer per tick). The guest's own
+    `ss -ti` (`segs_in`, `rcv_rtt`) is what gave the per-tick ceiling away:
+    ~1300 segments/s is a packet-rate limit, not a bandwidth one.
   - **UDP is DHCP and DNS and nothing else.** There is no general UDP NAT, so
     QUIC, NTP and mDNS do not work through this backend; anything else on UDP
     is counted as `dropped_unsupported`. A test says so, and it is the test that
     has to change the day one is added.
+  - **DNS answers are whatever size the upstream sends.** The relay reads the
+    whole datagram (it used to read 512 bytes, which on Windows *discards* a
+    longer one with `WSAEMSGSIZE` — and every EDNS0 query invites one); an
+    answer too long for one frame goes back as header + question with TC set
+    (`truncated_dns_reply`, bounds-checked: the upstream is untrusted too), and
+    the resolver's TCP retry to `192.168.74.1:53` is the one gateway flow the
+    NAT opens, carried to `dns_upstream`. Every other gateway port, loopback,
+    `0.0.0.0` (Linux connects it to the local host), broadcast and multicast
+    stay refused (`host_local_destinations_are_refused`).
 - **gpu** (EPIC 8): wire format in `virtio_gpu::protocol` (constants, `CtrlHdr`,
   one struct per command, lengths asserted at compile time), host resources in
   `virtio_gpu::resource`, device in `virtio_gpu::device`. Only the two

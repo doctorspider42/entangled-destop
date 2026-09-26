@@ -46,7 +46,14 @@
 //!   ([`UserNetConfig::is_local`]) is refused. Otherwise `192.168.74.1` â€” or any
 //!   other address the host happens to answer on â€” would be reachable from inside
 //!   the guest, and a guest reaching *host-local* services is the whole class of bug
-//!   user-mode networking is supposed to avoid;
+//!   user-mode networking is supposed to avoid. Loopback (`127.0.0.0/8`) and
+//!   `0.0.0.0` — which Linux connects to the local host — are refused for the
+//!   same reason, and broadcast and multicast because no TCP peer has one. The
+//!   one exception is DNS over TCP to the gateway's port 53, which is carried to
+//!   the configured upstream resolver, never to anything on this host the guest
+//!   could name. The host's *other* addresses are not refused: a service bound
+//!   to a LAN address (or `0.0.0.0`) is reachable from the guest exactly as it
+//!   is from any machine on that LAN, and one bound to loopback only is not;
 //! * make this module index a buffer with a guest-supplied number. Every header read
 //!   here goes through `smoltcp::wire`'s checked accessors.
 
@@ -71,10 +78,31 @@ use crate::frame::{ETH_HEADER_LEN, MAX_FRAME_LEN};
 /// one connect thread.
 pub const MAX_FLOWS: usize = 64;
 
-/// Per-direction socket buffer for one flow. 16 KiB is a window big enough that a
-/// package download is not round-trip bound, and 64 flows of it is 2 MiB â€” bounded,
-/// and bounded by *us* rather than by the guest.
-pub const FLOW_BUFFER: usize = 16 * 1024;
+/// Per-direction socket buffer for one flow, and so the most one flow has in
+/// flight: the guest's ACKs reach smoltcp one pump tick after the segments
+/// they answer, so a download moves at most this much per tick.
+///
+/// It was 16 KiB, on the reasoning that that was "a window big enough that a
+/// package download is not round-trip bound". The round trip that bounds it is
+/// the pump's, not the wire's, and a 1 GiB download in a Windows-hosted guest
+/// measured (ADR-0002, the installed-network amendment; host line 52-84 MB/s):
+///
+/// | buffer | segments per tick | guest MB/s |
+/// |---|---|---|
+/// | 16 KiB | 2 (one per smoltcp poll) | 1.4-1.9 |
+/// | 256 KiB | 2 | 1.9 |
+/// | 16 KiB | up to [`MAX_SEGMENTS_PER_POLL`] | 9.9 |
+/// | 256 KiB | up to [`MAX_SEGMENTS_PER_POLL`] | 52 |
+///
+/// 64 flows of two is 32 MiB — still bounded, and bounded by *us* rather than
+/// by the guest; a flow's buffers are allocated when its SYN arrives and freed
+/// when it retires.
+pub const FLOW_BUFFER: usize = 256 * 1024;
+
+/// The most datagrams one [`TcpNat::poll`] emits: a quarter of the guest's
+/// queue ([`super::MAX_QUEUED_FRAMES`]), so a tick is bounded work and several
+/// busy flows cannot fill the queue between two RX drains.
+pub const MAX_SEGMENTS_PER_POLL: usize = 64;
 
 /// How long a host connect is given before the flow is abandoned.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -334,10 +362,25 @@ impl TcpNat {
             // A retransmitted SYN. smoltcp's socket is already listening for it.
             return false;
         }
+        // DNS over TCP to the gateway is the one host-side service a guest may
+        // reach: the resolver it was handed by DHCP falls back to TCP for an
+        // answer too long for UDP (the relay sets TC on one), and a refusal
+        // there is a lookup that fails for no reason the guest can see. The
+        // flow goes to the configured upstream — an address the *host* chose,
+        // never one the guest named.
+        let dns_over_tcp = ip.dst_addr == self.config.gateway && packet.dst_port() == 53;
         // A guest must not be able to reach services bound on the host's own
-        // loopback or LAN addresses through the NAT.
+        // loopback through the NAT, nor anything on its own segment (which is
+        // this process). `0.0.0.0` is loopback in disguise — Linux connects a
+        // socket aimed at it to the local host — and broadcast and multicast
+        // are not a peer a TCP connection can have.
         if self.access == HostAccess::Routed
-            && (self.config.is_local(ip.dst_addr) || ip.dst_addr.is_loopback())
+            && !dns_over_tcp
+            && (self.config.is_local(ip.dst_addr)
+                || ip.dst_addr.is_loopback()
+                || ip.dst_addr.is_unspecified()
+                || ip.dst_addr.is_broadcast()
+                || ip.dst_addr.is_multicast())
         {
             tracing::debug!(
                 remote = %remote,
@@ -376,7 +419,11 @@ impl TcpNat {
             None
         } else {
             let (sender, connecting) = mpsc::channel();
-            let target = SocketAddr::V4(remote);
+            let target = if dns_over_tcp {
+                self.config.dns_upstream
+            } else {
+                SocketAddr::V4(remote)
+            };
             if let Err(error) = std::thread::Builder::new()
                 .name("usernet-connect".into())
                 .spawn(move || {
@@ -414,6 +461,25 @@ impl TcpNat {
     /// One pass: move bytes in both directions, run smoltcp, and hand every
     /// datagram it produced to `emit` wrapped in an Ethernet header for `guest_mac`.
     pub fn poll(&mut self, guest_mac: EthernetAddress, emit: &mut dyn FnMut(Vec<u8>)) {
+        self.poll_with_budget(guest_mac, MAX_SEGMENTS_PER_POLL, emit);
+    }
+
+    /// [`Self::poll`], emitting at most about `budget` datagrams — the room the
+    /// caller has left in the guest's queue, so a burst is paced rather than
+    /// dropped at [`super::MAX_QUEUED_FRAMES`].
+    ///
+    /// smoltcp's `Interface::poll` dispatches each socket **once**: one TCP
+    /// segment per flow per call. Two calls per pump tick held a bulk download
+    /// at two segments a tick — 1.4-1.9 MB/s on a line doing 51 MB/s, measured
+    /// in a Windows-hosted guest whose TCP counted ~1300 segments a second
+    /// (ADR-0002, the installed-network amendment). So egress is run again
+    /// while it still produces, up to the budget.
+    pub fn poll_with_budget(
+        &mut self,
+        guest_mac: EthernetAddress,
+        budget: usize,
+        emit: &mut dyn FnMut(Vec<u8>),
+    ) {
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         let finished = self.service_flows();
@@ -427,6 +493,22 @@ impl TcpNat {
         // until its own SYN timeout expires.
         self.iface
             .poll(self.now(), &mut self.device, &mut self.sockets);
+        // More segments for flows that have more to send, one per flow per
+        // round; bounded by the budget and by the rounds, so one tick is
+        // bounded work whatever the guest's window says.
+        let budget = budget.min(MAX_SEGMENTS_PER_POLL);
+        for _ in 0..budget {
+            if self.device.tx.len() >= budget {
+                break;
+            }
+            let queued = self.device.tx.len();
+            let _ = self
+                .iface
+                .poll_egress(self.now(), &mut self.device, &mut self.sockets);
+            if self.device.tx.len() == queued {
+                break;
+            }
+        }
         self.retire(finished);
 
         while let Some(datagram) = self.device.tx.pop_front() {
@@ -518,21 +600,41 @@ impl TcpNat {
                 });
             }
 
-            // host -> guest, bounded by the room in the socket's send buffer.
+            // host -> guest, bounded by the room in the socket's send buffer, and
+            // read straight into it: no buffer of our own and no copy, which at
+            // 256 KiB a flow and a tick every millisecond or so is most of what
+            // the pump would otherwise spend. The free space is a ring and may
+            // wrap, so a read that filled the first part is followed by one for
+            // the rest.
             if socket.can_send() && !flow.host_eof {
-                let room = socket.send_capacity() - socket.send_queue();
-                if room > 0 {
-                    let mut buf = vec![0u8; room.min(FLOW_BUFFER)];
-                    match stream.read(&mut buf) {
-                        Ok(0) => flow.host_eof = true,
-                        Ok(read) => {
-                            let _ = socket.send_slice(&buf[..read]);
+                for _ in 0..2 {
+                    let read = socket.send(|window| {
+                        if window.is_empty() {
+                            // No room: not an end of stream, and not a read.
+                            return (0, Ok(None));
                         }
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => (),
-                        Err(error) => {
+                        let room = window.len();
+                        match stream.read(window) {
+                            Ok(read) => (read, Ok(Some((read, room)))),
+                            Err(error) => (0, Err(error)),
+                        }
+                    });
+                    match read {
+                        Ok(Ok(Some((0, _)))) => {
+                            flow.host_eof = true;
+                            break;
+                        }
+                        // Filled the contiguous part: there may be more room.
+                        Ok(Ok(Some((read, room)))) if read == room => {}
+                        Ok(Ok(_)) => break,
+                        Ok(Err(error)) if error.kind() == ErrorKind::WouldBlock => break,
+                        Ok(Err(error)) => {
                             tracing::debug!(remote = %flow.remote, %error, "host read failed");
                             flow.host_eof = true;
+                            break;
                         }
+                        // The socket cannot send in its state; nothing to read for.
+                        Err(_) => break,
                     }
                 }
             }
@@ -674,15 +776,78 @@ mod tests {
             config().gateway,
             Ipv4Address::new(192, 168, 74, 200),
             Ipv4Address::new(127, 0, 0, 1),
+            Ipv4Address::new(127, 1, 2, 3),
+            // Linux connects a socket aimed at 0.0.0.0 to the local host.
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::BROADCAST,
+            Ipv4Address::new(224, 0, 0, 251),
         ] {
-            let bytes = datagram(dst, 40002, 22, true, false);
-            let (ip, payload) = ip_and_payload(&bytes);
-            assert!(
-                !nat.from_guest(&ip, &bytes, &payload),
-                "{dst} must not be reachable from the guest"
-            );
+            for port in [22, 53, 80] {
+                if dst == config().gateway && port == 53 {
+                    continue; // DNS over TCP, below
+                }
+                let bytes = datagram(dst, 40002, port, true, false);
+                let (ip, payload) = ip_and_payload(&bytes);
+                assert!(
+                    !nat.from_guest(&ip, &bytes, &payload),
+                    "{dst}:{port} must not be reachable from the guest"
+                );
+            }
         }
         assert_eq!(nat.flow_count(), 0);
+    }
+
+    /// DNS over TCP to the gateway — what a resolver does with an answer the
+    /// relay marked truncated — is the one gateway service a guest may open,
+    /// and it is carried to the configured upstream resolver: here a listener
+    /// the test owns, standing in for it. Every other gateway port stays shut.
+    #[test]
+    fn dns_over_tcp_to_the_gateway_reaches_the_upstream_resolver() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a local listener");
+        let upstream = listener.local_addr().expect("the listener has an address");
+        let config = config().with_dns_upstream(upstream);
+        // The production policy: the gateway is refused, except for this.
+        let mut peer = GuestPeer::new(
+            TcpNat::new(config),
+            SocketAddrV4::new(config.gateway, 53),
+            42000,
+        );
+        peer.send(true, false, false, &[]);
+        assert_eq!(
+            peer.nat.flow_count(),
+            1,
+            "the SYN to gateway:53 opened a flow"
+        );
+        let handshake = peer.poll();
+        assert!(
+            handshake.iter().any(|s| s.syn && s.ack),
+            "the guest's SYN must be answered: {handshake:?}"
+        );
+        listener
+            .set_nonblocking(true)
+            .expect("a non-blocking listener");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok(_) => break,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the flow never reached the upstream resolver"
+                    );
+                    let _ = peer.poll();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        }
+
+        let mut nat = TcpNat::new(config);
+        let bytes = datagram(config.gateway, 42001, 5353, true, false);
+        let (ip, payload) = ip_and_payload(&bytes);
+        assert!(!nat.from_guest(&ip, &bytes, &payload), "only port 53");
     }
 
     /// A guest opening connections in a loop must not be able to grow host state
@@ -904,6 +1069,48 @@ mod tests {
     /// sure of binding, which is exactly why the host-local guard has a test-only
     /// escape (see [`HostAccess::HostLocal`]) â€” the guard itself is asserted by
     /// `host_local_destinations_are_refused`.
+    #[test]
+    fn a_bulk_download_is_not_held_to_one_segment_a_poll() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a local listener");
+        let SocketAddr::V4(remote) = listener.local_addr().expect("an address") else {
+            unreachable!("bound to an IPv4 address")
+        };
+        let mut peer = GuestPeer::new(
+            TcpNat::with_access(config(), HostAccess::HostLocal),
+            remote,
+            41500,
+        );
+        peer.handshake();
+        let (mut stream, _) = listener.accept().expect("the NAT connects to the listener");
+        // More than the peer's 16 KiB window, so the NAT always has more to send.
+        stream
+            .write_all(&vec![0x5a; 256 * 1024])
+            .expect("the host sends a bulk reply");
+
+        let mut most = 0;
+        let mut received = 0;
+        for _ in 0..400 {
+            let segments = peer.poll();
+            let data = segments.iter().filter(|s| !s.payload.is_empty()).count();
+            received += segments.iter().map(|s| s.payload.len()).sum::<usize>();
+            most = most.max(data);
+            if most >= 8 {
+                break;
+            }
+            peer.send(false, true, false, &[]);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // One segment per flow per smoltcp poll, twice a tick, was the old
+        // ceiling (~2 MB/s in a real guest). A full 16 KiB window is eleven
+        // segments, and they now leave in one poll.
+        assert!(
+            most >= 8,
+            "at most {most} data segments left in one poll ({received} bytes seen)"
+        );
+    }
+
     #[test]
     fn a_guest_connection_reaches_a_host_listener_and_bytes_cross_both_ways() {
         use std::net::TcpListener;

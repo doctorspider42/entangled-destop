@@ -330,6 +330,17 @@ fn ubuntu_installs_unattended_and_the_installed_system_boots() {
         "the installed profile carries the target disk only — no ISO, no seed"
     );
     assert_eq!(cfg.disks[0].path, disk);
+    // Networked by default (ADR-0002, the installed-network amendment): the
+    // user-mode NAT with a MAC of the machine's own, on both hosts.
+    let network = cfg
+        .network
+        .as_ref()
+        .expect("a [network] section by default");
+    assert_eq!(network.backend, control_api::NetworkBackend::Usernet);
+    assert_eq!(
+        network.mac.as_deref(),
+        Some(control_api::new_machine_mac("e2e-ubuntu", &disk).as_str())
+    );
     assert_eq!(
         std::fs::metadata(&nvram).expect("the NVRAM file").len(),
         machine_x86::layout::PFLASH_NVRAM_SIZE

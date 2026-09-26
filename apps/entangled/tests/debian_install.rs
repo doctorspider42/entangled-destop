@@ -257,9 +257,9 @@ fn debian_installs_unattended_and_the_installed_system_boots() {
     }
 
     // ---- the install ----
-    // `--network` is left to the per-host default: TAP on Linux, the in-process
-    // user-mode NAT on Windows. Pinning it here would be wrong on one host, and
-    // on Windows would name a backend that does not exist.
+    // `--network` is left to its default, the in-process user-mode NAT on both
+    // hosts (ADR-0002, the installed-network amendment): the default is what
+    // this test is about, and it needs no host setup on either.
     let started = Instant::now();
     let (ok, host_log) = run_cli(
         &[
