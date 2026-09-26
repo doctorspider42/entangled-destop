@@ -375,7 +375,8 @@ pub struct InstallArgs {
     /// Ubuntu Desktop only: install a GPU desktop on the Venus renderer. The
     /// written profile gets `[display] venus = true` (and at least 4096 MiB),
     /// and the autoinstall's own late-commands configure the guest for it —
-    /// GNOME and every GL client on Zink (/etc/drirc), no idle blank, and the
+    /// GNOME and every GL client on Zink (/etc/drirc, and the session's
+    /// environment for snaps such as Firefox), no idle blank, and the
     /// desktop user in `render`. Needs --auto (with the Desktop ISO) or
     /// --autoinstall; `entangled doctor` says whether this host can serve it.
     #[arg(long)]

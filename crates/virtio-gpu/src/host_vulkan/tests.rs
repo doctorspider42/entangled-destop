@@ -124,8 +124,11 @@ fn the_bring_up_runs_on_the_host_gpu_and_names_it_as_ash_does() {
     };
     eprintln!("{name}: memoryTypeBits importable from host allocations = {importable:#x}");
     eprintln!("type | heap | host flags | guest flags");
-    assert_eq!(guest.memory_type_count, host_memory.memory_type_count);
-    for i in 0..guest.memory_type_count as usize {
+    // The host's types, and at most one more: device-local memory the guest
+    // may map, our pages (`policy::visible_vram`, ADR-0004 2026-09-26).
+    let appended = guest.memory_type_count - host_memory.memory_type_count;
+    assert!(appended <= 1, "{appended} types appended");
+    for i in 0..host_memory.memory_type_count as usize {
         let (h_ty, g_ty) = (&host_memory.memory_types[i], &guest.memory_types[i]);
         eprintln!(
             "{i:>4} | {:>4} | {:#010x} | {:#010x}",
@@ -144,6 +147,37 @@ fn the_bring_up_runs_on_the_host_gpu_and_names_it_as_ash_does() {
     assert!(crate::venus::executor::policy::has_coherent_host_type(
         &guest
     ));
+    let visible_vram = |ty: &crate::venus::protocol::VkMemoryType| ty.property_flags & 0x3 == 0x3;
+    let shown = guest.memory_types[..guest.memory_type_count as usize]
+        .iter()
+        .filter(|ty| visible_vram(ty))
+        .count();
+    assert!(
+        shown >= 1,
+        "the guest always has DEVICE_LOCAL | HOST_VISIBLE memory"
+    );
+    if appended == 1 {
+        let last = &guest.memory_types[host_memory.memory_type_count as usize];
+        assert_eq!(
+            last.property_flags, 0x7,
+            "DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT"
+        );
+        assert_eq!(
+            last.heap_index, host_memory.memory_heap_count,
+            "a heap of its own"
+        );
+        assert_eq!(guest.memory_heap_count, host_memory.memory_heap_count + 1);
+        let heap = &guest.memory_heaps[last.heap_index as usize];
+        assert_eq!(heap.flags, 0x1);
+        assert!(heap.size <= crate::venus::executor::policy::VISIBLE_VRAM_HEAP_BYTES);
+        eprintln!(
+            "{:>4} | {:>4} | (appended) | {:#010x}, heap of {} MiB",
+            host_memory.memory_type_count,
+            last.heap_index,
+            last.property_flags,
+            heap.size >> 20
+        );
+    }
     if name.contains("RTX 2070") && guest.memory_type_count >= 6 {
         // The 2026-09-23 probe: 3 and 4 import our pages, 5 (the BAR) cannot.
         assert_eq!(importable & 0x38, 0x18);
@@ -154,6 +188,10 @@ fn the_bring_up_runs_on_the_host_gpu_and_names_it_as_ash_does() {
             guest.memory_types[5].property_flags & MEMORY_PROPERTY_HOST_ANY,
             0
         );
+        // With the BAR hidden the card has no DEVICE_LOCAL | HOST_VISIBLE
+        // type of its own, so the guest is given one: type 6, 3's pages.
+        assert_eq!(guest.memory_type_count, 7);
+        assert_eq!(guest.memory_types[6].property_flags, 0x7);
     }
 
     // Features and properties through their chains, then the rest of the
@@ -318,6 +356,16 @@ fn the_host_gpu_fills_a_buffer_and_the_guest_reads_it_through_the_blob() {
         .filter(|i| memory.memory_types[*i as usize].property_flags & coherent == coherent)
         .collect();
     assert!(!candidates.is_empty(), "a host-visible coherent type");
+    // One of them is device local: type 6 on the RTX 2070, which is type 3's
+    // pages (`policy::visible_vram`, ADR-0004 2026-09-26), or a type the
+    // host itself makes device local and host visible. The GPU writes it and
+    // the guest reads it like any other.
+    assert!(
+        candidates
+            .iter()
+            .any(|i| memory.memory_types[*i as usize].property_flags & 0x1 != 0),
+        "a DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT type among {candidates:?}"
+    );
     for (round, type_index) in candidates.into_iter().enumerate() {
         let res = MEM_RES + u32::try_from(round).unwrap();
         let Command::CreateBuffer(b) = h

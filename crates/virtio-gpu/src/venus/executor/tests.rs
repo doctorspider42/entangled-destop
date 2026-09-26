@@ -186,7 +186,9 @@ fn the_whole_vulkaninfo_bring_up_is_answered_the_way_mesa_decodes_it() {
     assert_eq!(families[1].queue_family_properties.queue_flags, 0xc);
 
     // Row 13: the memory policy. Indices unchanged; the BAR type (5) is no
-    // longer host visible; 3 and 4, which import our pages, still are.
+    // longer host visible; 3 and 4, which import our pages, still are; and
+    // 6, in a heap of its own, is device-local memory the guest may map —
+    // type 3's pages (ADR-0004, the 2026-09-26 amendment on Firefox).
     let mem = Command::GetPhysicalDeviceMemoryProperties2(GetPhysicalDeviceMemoryProperties2Args {
         physical_device: VkPhysicalDevice(PHYSICAL),
         p_memory_properties: Some(Default::default()),
@@ -195,12 +197,14 @@ fn the_whole_vulkaninfo_bring_up_is_answered_the_way_mesa_decodes_it() {
         panic!()
     };
     let m = m.p_memory_properties.unwrap().memory_properties;
-    assert_eq!(m.memory_type_count, 6);
-    let flags: Vec<u32> = m.memory_types[..6]
+    assert_eq!(m.memory_type_count, 7);
+    let flags: Vec<u32> = m.memory_types[..7]
         .iter()
         .map(|t| t.property_flags)
         .collect();
-    assert_eq!(flags, vec![0x1, 0x1, 0x1, 0x6, 0xe, 0x1]);
+    assert_eq!(flags, vec![0x1, 0x1, 0x1, 0x6, 0xe, 0x1, 0x7]);
+    assert_eq!((m.memory_heap_count, m.memory_types[6].heap_index), (3, 2));
+    assert_eq!(m.memory_heaps[2].flags, 0x1, "a device-local heap");
     assert!(super::policy::has_coherent_host_type(&m));
 
     // Rows 14–15: groups; the second call's id-0 slots are filled in.

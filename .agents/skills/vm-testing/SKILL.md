@@ -904,13 +904,34 @@ install, ~2.5 min from `entangled run` to `ubuntu login:` (most of it cloud-init
 generating SSH host keys on first boot). The automated form of both halves is
 `cargo test -p entangled --test ubuntu_install -- --ignored --nocapture`.
 
+**Firefox is a snap, and its GL is not the system's** (ADR-0004, the
+2026-09-26 amendment on Firefox). It brings Mesa 25.2.8 from the `gpu-2404`
+content snap, whose wrapper sets `DRIRC_CONFIGDIR`, and then Mesa never reads
+`/etc/drirc`. It goes to Zink only through the session's
+`MESA_LOADER_DRIVER_OVERRIDE` (`/etc/environment.d`). A probe launches it
+inside the desktop session with `systemd-run --user … firefox --profile P
+URL`, so it gets the user manager's environment as a click on its icon would.
+Use a **fresh profile per run**: Firefox's crash guard remembers a GL crash
+in a profile and turns acceleration off there for good. To get the
+llvmpipe baseline on a guest that has the variable, launch through `env -u
+MESA_LOADER_DRIVER_OVERRIDE`, never with the variable set empty: 25.2.8's
+loader takes an empty override as a driver name. Read `about:support`
+(`Compositing` says `WebRender` or `WebRender (Software)`) and the WebGL
+renderer string before believing a frame rate. The probe pages and the guest
+script are `F:\VMs\Entangled\probes\ffz\`, served over usernet from the host
+(`python -m http.server 8000` in that directory; the guest reaches it at
+`192.168.233.1:8000`); each page reports its rAF frame statistics to the
+server's log as `/report?…` requests.
+
 **`--auto` follows the ISO.** An ISO whose file name says `desktop` gets the
 built-in desktop profile (`assets/autoinstall/ubuntu-desktop.yaml`,
 `ubuntu-desktop-minimal`). Anything else gets the server one. **`--venus`**
-(desktop only, and it needs a seed) adds four late-commands at the head of the
-list: `/etc/drirc` sending every GL client to Zink, a
-`90_entangled-venus.gschema.override` with `idle-delay 0`, its
-`glib-compile-schemas`, and `usermod -aG render <identity.username>`. The
+(desktop only, and it needs a seed) adds six late-commands at the head of the
+list: `/etc/drirc` sending every GL client to Zink,
+`/etc/environment.d/90-entangled-venus.conf` with
+`MESA_LOADER_DRIVER_OVERRIDE=zink` (and the `mkdir` before it) for the
+session's snaps, a `90_entangled-venus.gschema.override` with `idle-delay 0`,
+its `glib-compile-schemas`, and `usermod -aG render <identity.username>`. The
 written profile gets `[display] venus = true` and at least 4096 MiB. The
 installer VM itself stays 2D, 2 vCPUs, 1280×800.
 

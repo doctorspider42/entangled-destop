@@ -16,6 +16,14 @@
 //! guest maps and what the GPU reads and writes are one set of bytes. Every
 //! other type is a plain `vkAllocateMemory`, and no blob can be made of it.
 //!
+//! One guest type has no host type of its own index: the `DEVICE_LOCAL |
+//! HOST_VISIBLE | HOST_COHERENT` type [`policy::visible_vram`] appends when
+//! the host shows the guest none (ADR-0004, the 2026-09-26 amendment on
+//! Firefox). It is our pages like the others, imported as its backing type
+//! ([`GuestDevice::host_type`]); a resource that may be bound to the backing
+//! type may be bound to it ([`GuestDevice::guest_bits`]), and its charge is
+//! the host-visible share's.
+//!
 //! This is where the renderer differs most from vkr, which allocates the
 //! driver's own memory and exports it as a dma-buf or opaque fd for the VMM
 //! to map. There is no fd to hand a WHP partition, and a mapping of the
@@ -228,10 +236,13 @@ const REMAINING: u32 = u32::MAX;
 
 /// The `memoryTypeBits` a resource may be bound to, from what the host
 /// reports: only types the guest sees, and — unless the resource was created
-/// able to take our imported pages — none of the host-visible ones.
+/// able to take our imported pages — none of the host-visible ones. A
+/// resource that may take our pages as the backing type of
+/// [`GuestDevice::visible_vram`] may take that type too
+/// ([`GuestDevice::guest_bits`]).
 #[must_use]
 pub fn guest_type_bits(guest: &GuestDevice, host_memory: bool, bits: u32) -> u32 {
-    let bits = bits & guest.all_types();
+    let bits = guest.guest_bits(bits) & guest.all_types();
     if host_memory {
         bits
     } else {
@@ -545,10 +556,14 @@ impl<H: HostVulkan> VulkanContext<H> {
                     return Ok(());
                 }
             };
-            if bits & 1u32.checked_shl(type_index).unwrap_or(0) == 0 {
+            // The type the pages are imported as: the guest's, or the
+            // backing type of the one `policy::visible_vram` added.
+            let host_type = guest.host_type(type_index);
+            if bits & 1u32.checked_shl(host_type).unwrap_or(0) == 0 {
                 tracing::warn!(
                     ctx_id = self.ctx_id,
                     type_index,
+                    host_type,
                     importable = format_args!("{bits:#x}"),
                     "the host will not import these pages as the type the guest chose"
                 );
@@ -557,7 +572,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             }
             let request = MemoryRequest {
                 size: pages.mapped_len(),
-                type_index,
+                type_index: host_type,
                 import: Some(Arc::clone(&pages)),
                 flags,
                 // A dedicated import is one more thing for a driver to
@@ -790,13 +805,14 @@ impl<H: HostVulkan> VulkanContext<H> {
                 return Ok(());
             }
         };
-        if bits & 1u32.checked_shl(type_index).unwrap_or(0) == 0 {
+        let host_type = guest.host_type(type_index);
+        if bits & 1u32.checked_shl(host_type).unwrap_or(0) == 0 {
             args.ret = refuse("the host will not import those pages as that type");
             return Ok(());
         }
         let request = MemoryRequest {
             size: pages.mapped_len(),
-            type_index,
+            type_index: host_type,
             import: Some(Arc::clone(&pages)),
             flags,
             dedicated: None,
@@ -989,7 +1005,7 @@ impl<H: HostVulkan> VulkanContext<H> {
         let bits = match &blob.backing {
             ExportedMemory::Pages(pages) => match self.host.host_pointer_types(&device.host, pages)
             {
-                Ok(bits) => bits & guest.host_visible_types(),
+                Ok(bits) => guest.guest_bits(bits) & guest.host_visible_types(),
                 Err(ret) => {
                     args.ret = ret;
                     return Ok(());

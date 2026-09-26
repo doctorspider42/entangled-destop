@@ -125,6 +125,28 @@ pub const VENUS_DRIRC: &[&str] = &[
     "</driconf>",
 ];
 
+/// Where the GPU desktop's session environment goes in the target: a
+/// `systemd` `environment.d(5)` file, which the user manager reads at the
+/// start of every login and hands to everything the session starts —
+/// gnome-shell, Xwayland and each application launched from GNOME.
+pub const VENUS_ENVIRONMENT_D: &str = "/etc/environment.d/90-entangled-venus.conf";
+
+/// Its lines. [`VENUS_DRIRC`] is not enough for a **snap**: the snap's own
+/// Mesa (Firefox brings Mesa 25.2.8 from the `gpu-2404` content snap) is
+/// started with `DRIRC_CONFIGDIR` pointing into the snap, and Mesa's driconf
+/// reads that directory *instead of* `/etc/drirc` (`xmlconfig.c`,
+/// `driParseConfigFiles`), so it picks virgl, finds no virgl context on the
+/// host and falls back to llvmpipe. The loader's override is read before
+/// driconf (`loader_get_driver_for_fd`) and snapd passes the session's
+/// environment through, so every GL client of the session — snaps and
+/// system ones alike — goes to Zink (ADR-0004, the 2026-09-26 amendment on
+/// Firefox). A session without Venus under it meets the same fallback as the
+/// drirc's: Zink finds no Vulkan device and Mesa uses software.
+pub const VENUS_ENVIRONMENT_LINES: &[&str] = &[
+    "# Entangled GPU desktop: every GL client of the session on zink, snaps included (ADR-0004)",
+    "MESA_LOADER_DRIVER_OVERRIDE=zink",
+];
+
 /// Where the GPU desktop's GSettings default goes in the target, and what it
 /// says. A vendor override rather than a dconf database: it needs no dconf
 /// profile (Ubuntu ships none for users) and survives package upgrades, which
@@ -238,9 +260,13 @@ pub fn user_data(
 /// console afterwards:
 ///
 /// 1. [`VENUS_DRIRC`] as `/etc/drirc`: GNOME Shell and every GL client on Zink.
-/// 2. [`VENUS_GSCHEMA_LINES`] as [`VENUS_GSCHEMA_OVERRIDE`], compiled in the
+/// 2. [`VENUS_ENVIRONMENT_LINES`] as [`VENUS_ENVIRONMENT_D`] (its directory
+///    made first: Ubuntu ships none): the same for every client of the
+///    desktop session, including a snap's own Mesa, which never reads
+///    `/etc/drirc`.
+/// 3. [`VENUS_GSCHEMA_LINES`] as [`VENUS_GSCHEMA_OVERRIDE`], compiled in the
 ///    target: no idle blank.
-/// 3. `user` in `render`. A graphical session reaches `/dev/dri/renderD128`
+/// 4. `user` in `render`. A graphical session reaches `/dev/dri/renderD128`
 ///    by logind's ACL without it; a serial or SSH login — which is how every
 ///    Vulkan probe of this project reaches the guest — does not, and gets an
 ///    `EACCES` that reads like a renderer bug.
@@ -255,6 +281,8 @@ pub fn venus_late_commands(user: &str) -> Vec<String> {
     };
     vec![
         printf(VENUS_DRIRC, "/etc/drirc"),
+        "mkdir -p /target/etc/environment.d".to_string(),
+        printf(VENUS_ENVIRONMENT_LINES, VENUS_ENVIRONMENT_D),
         printf(VENUS_GSCHEMA_LINES, VENUS_GSCHEMA_OVERRIDE),
         "curtin in-target -- glib-compile-schemas /usr/share/glib-2.0/schemas".to_string(),
         format!("curtin in-target -- usermod -aG render {user}"),
@@ -784,7 +812,7 @@ mod tests {
         assert!(server.contains("id: ubuntu-server-minimal"));
     }
 
-    /// What `--venus` adds to the built-in profiles, byte for byte: four
+    /// What `--venus` adds to the built-in profiles, byte for byte: six
     /// items at the head of `late-commands`, at the list's own indentation,
     /// before the serial-console items that were already there.
     #[test]
@@ -801,6 +829,12 @@ mod tests {
       '  </device>'
       '</driconf>'
       > /target/etc/drirc
+    - mkdir -p /target/etc/environment.d
+    - >-
+      printf '%s\n'
+      '# Entangled GPU desktop: every GL client of the session on zink, snaps included (ADR-0004)'
+      'MESA_LOADER_DRIVER_OVERRIDE=zink'
+      > /target/etc/environment.d/90-entangled-venus.conf
     - >-
       printf '%s\n'
       '# Entangled GPU desktop: no idle blank (ADR-0004)'
@@ -815,7 +849,7 @@ mod tests {
             let text = with_venus_guest(&plain).expect("venus added");
             assert!(text.contains(EXPECTED), "{profile:?}:\n{text}");
             assert_eq!(text.matches("late-commands:").count(), 1);
-            // Nothing else moved: taking the four items out gives the
+            // Nothing else moved: taking the six items out gives the
             // original back.
             let items: String = venus_late_commands("entangled")
                 .iter()
@@ -836,7 +870,11 @@ mod tests {
     /// lines. Single quotes delimit every line, so none may contain one.
     #[test]
     fn the_folded_commands_write_exactly_the_files() {
-        for line in VENUS_DRIRC.iter().chain(VENUS_GSCHEMA_LINES) {
+        for line in VENUS_DRIRC
+            .iter()
+            .chain(VENUS_ENVIRONMENT_LINES)
+            .chain(VENUS_GSCHEMA_LINES)
+        {
             assert!(!line.contains('\''), "{line}");
         }
         let fold = |command: &str| {
@@ -856,15 +894,33 @@ mod tests {
             fold(&commands[0]),
             format!("printf '%s\\n' {} > /target/etc/drirc", quoted(VENUS_DRIRC))
         );
+        assert_eq!(commands[1], "mkdir -p /target/etc/environment.d");
         assert_eq!(
-            fold(&commands[1]),
+            fold(&commands[2]),
+            format!(
+                "printf '%s\\n' {} > /target{VENUS_ENVIRONMENT_D}",
+                quoted(VENUS_ENVIRONMENT_LINES)
+            )
+        );
+        // environment.d(5): KEY=VALUE lines and comments, nothing to expand
+        // or quote.
+        for line in VENUS_ENVIRONMENT_LINES {
+            let assignment = line.split_once('=').is_some_and(|(key, value)| {
+                !key.is_empty()
+                    && key.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+                    && !value.contains(['$', '"', ' ', '\\'])
+            });
+            assert!(line.starts_with('#') || assignment, "{line}");
+        }
+        assert_eq!(
+            fold(&commands[3]),
             format!(
                 "printf '%s\\n' {} > /target{VENUS_GSCHEMA_OVERRIDE}",
                 quoted(VENUS_GSCHEMA_LINES)
             )
         );
         assert_eq!(
-            commands[3],
+            commands[5],
             "curtin in-target -- usermod -aG render desk_user-1"
         );
         // Leading spaces of an XML line sit inside its quotes, so folding

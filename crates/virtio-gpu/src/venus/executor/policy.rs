@@ -87,6 +87,8 @@ pub const MIN_API_VERSION: u32 = vk_make_api_version(0, 1, 1, 0);
 /// `VK_PHYSICAL_DEVICE_TYPE_CPU`.
 pub const PHYSICAL_DEVICE_TYPE_CPU: i32 = 4;
 
+/// `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT`.
+pub const MEMORY_PROPERTY_DEVICE_LOCAL: u32 = 0x1;
 /// `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT`.
 pub const MEMORY_PROPERTY_HOST_VISIBLE: u32 = 0x2;
 /// `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`.
@@ -152,8 +154,9 @@ pub fn name_array(name: &str) -> [u8; 256] {
 /// driver's own BAR memory (the 214 MiB `DEVICE_LOCAL|HOST_VISIBLE` type on
 /// the RTX 2070) cannot be imported into.
 ///
-/// Nothing is ever *added*: an importable type the host does not call
-/// host-visible stays as the host describes it.
+/// Nothing is ever *added* here: an importable type the host does not call
+/// host-visible stays as the host describes it. The one type the guest sees
+/// that the host has not is appended afterwards, by [`visible_vram`].
 #[must_use]
 pub fn guest_memory(
     host: &VkPhysicalDeviceMemoryProperties,
@@ -170,6 +173,122 @@ pub fn guest_memory(
     out
 }
 
+/// The size of the heap [`visible_vram`] adds, before a context's
+/// host-visible share caps it ([`guest_heaps`]).
+///
+/// A non-ReBAR discrete GPU shows 256 MiB here (214 MiB on the RTX 2070, the
+/// BAR its driver keeps). Zink reads two thresholds off this heap
+/// (Mesa 25.2.8 and 26.0.8 alike): at or under 256 MiB on an NVIDIA
+/// `driverID` it releases its whole buffer cache before every small
+/// allocation there (`zink_bo.c:622-630`, "nvidia has fat textures"), which
+/// here would turn cached pages into fresh imports; past 90 % of the largest
+/// device-local heap it assumes ReBAR (`zink_screen.c:3420-3428`) and maps
+/// every buffer directly. 512 MiB is between the two for any device-local
+/// share this renderer tells a guest of a real GPU, and is still a small
+/// heap: what a guest puts here is our pages, charged to its host-visible
+/// share, not VRAM.
+pub const VISIBLE_VRAM_HEAP_BYTES: u64 = 512 << 20;
+
+/// `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`: what [`visible_vram`] adds.
+pub const VISIBLE_VRAM_FLAGS: u32 =
+    MEMORY_PROPERTY_DEVICE_LOCAL | MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_COHERENT;
+
+/// The one memory type the guest is shown that the host does not have
+/// (ADR-0004, the 2026-09-26 amendment on Firefox): `DEVICE_LOCAL |
+/// HOST_VISIBLE | HOST_COHERENT`, in a `DEVICE_LOCAL` heap of its own, both
+/// appended after the host's — **our pages**, imported as the host type
+/// `backing`, exactly like the host-visible types [`guest_memory`] keeps.
+///
+/// Why it exists: [`guest_memory`] takes the host bits off the BAR type (WHP
+/// cannot back a guest mapping with the driver's BAR memory), which leaves a
+/// discrete GPU with no `DEVICE_LOCAL | HOST_VISIBLE` type at all — a table
+/// no desktop GPU has. Zink asks for exactly that for every
+/// `PIPE_USAGE_DEFAULT` and `DYNAMIC` buffer (`zink_resource.c:1219-1225`),
+/// falls back to plain device-local types when none exists
+/// (`zink_screen.c:3401-3418`; line numbers of 25.2.8), and then maps such a
+/// buffer anyway on a persistent or write-only map (`zink_buffer_map`,
+/// `zink_resource.c:2319-2481`: only a discard or a read goes through
+/// staging) — `vkMapMemory` of memory that is not `HOST_VISIBLE`, which
+/// fails, and the application writes through a NULL mapping. The code is
+/// the same in Mesa 25.2.8, 26.0.8 and main.
+///
+/// `DEVICE_LOCAL` is a performance hint, and an integrated GPU sets it on
+/// system memory. Appended last, the type is the first choice only of an
+/// allocator that asks for device-local *and* host-visible memory: every
+/// first-match allocator (Zink's heap maps, Mesa's WSI, `vn_feedback`)
+/// still finds VRAM first for device-local and the host's own types first
+/// for host-visible. Vulkan's ordering rule holds: no earlier type's flags
+/// are a strict superset of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisibleVram {
+    /// The guest's index of the type: the host's type count.
+    pub type_index: u32,
+    /// The guest's index of its heap: the host's heap count.
+    pub heap_index: u32,
+    /// The host type its pages are imported as: the first type the guest
+    /// sees as `HOST_VISIBLE | HOST_COHERENT` (one the host imports our
+    /// pages for).
+    pub backing: u32,
+}
+
+impl VisibleVram {
+    /// The type's bit in a guest `memoryTypeBits`.
+    #[must_use]
+    pub fn bit(self) -> u32 {
+        1u32.checked_shl(self.type_index).unwrap_or(0)
+    }
+
+    /// The backing type's bit in a host `memoryTypeBits`.
+    #[must_use]
+    pub fn backing_bit(self) -> u32 {
+        1u32.checked_shl(self.backing).unwrap_or(0)
+    }
+}
+
+/// Append [`VisibleVram`] to `memory` (a [`guest_memory`] table) when it has
+/// no `DEVICE_LOCAL | HOST_VISIBLE` type of its own, and says where it went.
+///
+/// Nothing is appended when such a type is already there (a unified-memory
+/// GPU whose host-visible types are importable), when no type is
+/// `HOST_VISIBLE | HOST_COHERENT` to back it, or when the table has no room
+/// (32 types, 16 heaps).
+#[must_use]
+pub fn visible_vram(memory: &mut VkPhysicalDeviceMemoryProperties) -> Option<VisibleVram> {
+    let types = usize::try_from(memory.memory_type_count).ok()?;
+    let heaps = usize::try_from(memory.memory_heap_count).ok()?;
+    if types >= memory.memory_types.len() || heaps >= memory.memory_heaps.len() {
+        return None;
+    }
+    let visible_vram = MEMORY_PROPERTY_DEVICE_LOCAL | MEMORY_PROPERTY_HOST_VISIBLE;
+    let coherent = MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_COHERENT;
+    let table = memory.memory_types.get(..types)?;
+    if table
+        .iter()
+        .any(|ty| ty.property_flags & visible_vram == visible_vram)
+    {
+        return None;
+    }
+    let backing = table
+        .iter()
+        .position(|ty| ty.property_flags & coherent == coherent)?;
+    let out = VisibleVram {
+        type_index: u32::try_from(types).ok()?,
+        heap_index: u32::try_from(heaps).ok()?,
+        backing: u32::try_from(backing).ok()?,
+    };
+    *memory.memory_types.get_mut(types)? = crate::venus::protocol::VkMemoryType {
+        property_flags: VISIBLE_VRAM_FLAGS,
+        heap_index: out.heap_index,
+    };
+    *memory.memory_heaps.get_mut(heaps)? = crate::venus::protocol::VkMemoryHeap {
+        size: VISIBLE_VRAM_HEAP_BYTES,
+        flags: MEMORY_HEAP_DEVICE_LOCAL,
+    };
+    memory.memory_type_count += 1;
+    memory.memory_heap_count += 1;
+    Some(out)
+}
+
 /// The heap sizes a guest sees: at most what its allocations there could
 /// ever be backed by, which is what the executor charges them to
 /// (`executor::limits`, ADR-0004, the resource-exhaustion amendment):
@@ -180,7 +299,10 @@ pub fn guest_memory(
 ///   `min(host size, host_visible_limit)`;
 /// * a `DEVICE_LOCAL` heap reports `min(host size, device_local_share(host
 ///   size))`, the context's share of that heap, plus the host-visible share
-///   if the heap also holds types that are our pages (a unified-memory GPU).
+///   if the heap also holds types that are our pages (a unified-memory GPU);
+/// * a `DEVICE_LOCAL` heap that holds nothing but our pages — the one
+///   [`visible_vram`] adds — reports `min(its size, host_visible_limit)`:
+///   its allocations are charged to the host-visible share and nothing else.
 ///
 /// A heap no type lives in keeps its size. Type indices, flags and heap flags
 /// are unchanged. vkr forwards the host's heaps.
@@ -208,13 +330,16 @@ pub fn guest_heaps(
         let in_heap = |ty: &&crate::venus::protocol::VkMemoryType| {
             usize::try_from(ty.heap_index).is_ok_and(|h| h == index)
         };
-        let mut types_here = memory.memory_types.iter().take(types).filter(in_heap);
+        let types_here = memory.memory_types.iter().take(types).filter(in_heap);
         if types_here.clone().next().is_none() {
             continue;
         }
-        let holds_host_visible =
-            types_here.any(|ty| ty.property_flags & MEMORY_PROPERTY_HOST_VISIBLE != 0);
-        let cap = if heap.flags & MEMORY_HEAP_DEVICE_LOCAL != 0 {
+        let visible = |ty: &crate::venus::protocol::VkMemoryType| {
+            ty.property_flags & MEMORY_PROPERTY_HOST_VISIBLE != 0
+        };
+        let holds_host_visible = types_here.clone().any(visible);
+        let only_host_visible = types_here.clone().all(visible);
+        let cap = if heap.flags & MEMORY_HEAP_DEVICE_LOCAL != 0 && !only_host_visible {
             let device_local = device_local_share(heap.size);
             if holds_host_visible {
                 device_local.saturating_add(host_visible_limit)
@@ -222,6 +347,9 @@ pub fn guest_heaps(
                 device_local
             }
         } else {
+            // Host RAM, or a heap every allocation of which is our pages
+            // ([`visible_vram`]'s, or a unified-memory GPU's that is all
+            // host visible): the host-visible share.
             host_visible_limit
         };
         heap.size = heap.size.min(cap);
@@ -998,6 +1126,10 @@ pub struct GuestDevice {
     /// The guest WSI path the identity and the extensions were shaped for
     /// (stage S5).
     pub wsi: GuestWsi,
+    /// The `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` type appended to
+    /// [`Self::memory`], if one was ([`visible_vram`]). The only guest type
+    /// index that is not also the host's.
+    pub visible_vram: Option<VisibleVram>,
 }
 
 impl GuestDevice {
@@ -1025,6 +1157,29 @@ impl GuestDevice {
                     .and_then(|i| 1u32.checked_shl(i))
                     .unwrap_or(0)
             })
+    }
+
+    /// The host memory type an allocation of guest type `type_index` is made
+    /// as: the same index, except for [`Self::visible_vram`]'s type, whose
+    /// pages are imported as its backing type.
+    #[must_use]
+    pub fn host_type(&self, type_index: u32) -> u32 {
+        match self.visible_vram {
+            Some(vram) if vram.type_index == type_index => vram.backing,
+            _ => type_index,
+        }
+    }
+
+    /// A host `memoryTypeBits` in guest terms: [`Self::visible_vram`]'s bit
+    /// is set wherever its backing type's is — memory of that type is those
+    /// pages, so whatever may be bound to the one may be bound to the other.
+    /// Idempotent, so bits already in guest terms pass unchanged.
+    #[must_use]
+    pub fn guest_bits(&self, host_bits: u32) -> u32 {
+        match self.visible_vram {
+            Some(vram) if host_bits & vram.backing_bit() != 0 => host_bits | vram.bit(),
+            _ => host_bits,
+        }
     }
 
     /// Every memory type index the guest sees, as a bit mask.
@@ -1236,10 +1391,11 @@ pub fn expose(info: HostDeviceInfo) -> Result<GuestDevice, Hidden> {
     {
         return Err(Hidden::NoHostImport);
     }
-    let memory = guest_memory(&info.memory, importable);
+    let mut memory = guest_memory(&info.memory, importable);
     if !has_coherent_host_type(&memory) {
         return Err(Hidden::NoCoherentHostMemory);
     }
+    let visible_vram = visible_vram(&mut memory);
     let mut properties = info.properties;
     properties.properties.api_version =
         cap_minor(properties.properties.api_version, MAX_API_VERSION);
@@ -1266,6 +1422,7 @@ pub fn expose(info: HostDeviceInfo) -> Result<GuestDevice, Hidden> {
         import_alignment,
         memory_export,
         wsi,
+        visible_vram,
     })
 }
 
@@ -1616,6 +1773,104 @@ mod tests {
             zink_flush_threshold(&guest),
             (sizes[0] + sizes[2]) / 5 * 4 + (sizes[0] + sizes[2]) % 5 * 4 / 5
         );
+    }
+
+    /// The RTX 2070 with its BAR hidden has no `DEVICE_LOCAL | HOST_VISIBLE`
+    /// type, which Zink maps buffers of (ADR-0004, 2026-09-26): one is
+    /// appended, type 3's pages, in a device-local heap of its own that the
+    /// context is told is at most its host-visible share.
+    #[test]
+    fn a_gpu_whose_bar_is_hidden_is_given_visible_vram_of_our_pages() {
+        let mut guest = guest_memory(&rtx_2070(), 0x18);
+        let vram = visible_vram(&mut guest).expect("appended");
+        assert_eq!(
+            vram,
+            VisibleVram {
+                type_index: 6,
+                heap_index: 3,
+                backing: 3
+            }
+        );
+        assert_eq!((guest.memory_type_count, guest.memory_heap_count), (7, 4));
+        assert_eq!(guest.memory_types[6].property_flags, VISIBLE_VRAM_FLAGS);
+        assert_eq!(guest.memory_types[6].heap_index, 3);
+        assert_eq!(
+            guest.memory_heaps[3],
+            VkMemoryHeap {
+                size: VISIBLE_VRAM_HEAP_BYTES,
+                flags: MEMORY_HEAP_DEVICE_LOCAL
+            }
+        );
+        // Once is enough: the table has one now.
+        assert_eq!(visible_vram(&mut guest.clone()), None);
+        // The heap: the share when smaller, never the device-local share.
+        let caps = super::super::limits::Caps::default();
+        let told = guest_heaps(&guest, 256 << 20, |h| caps.device_local_share(h));
+        assert_eq!(told.memory_heaps[3].size, 256 << 20);
+        let told = guest_heaps(&guest, 1 << 30, |h| caps.device_local_share(h));
+        assert_eq!(told.memory_heaps[3].size, VISIBLE_VRAM_HEAP_BYTES);
+        assert_eq!(told.memory_heaps[1].size, 1 << 30);
+        // Zink's backstop now counts it too: 80 % of it more.
+        let before = zink_flush_threshold(&guest_heaps(
+            &guest_memory(&rtx_2070(), 0x18),
+            1 << 30,
+            |h| caps.device_local_share(h),
+        ));
+        let more = zink_flush_threshold(&told) - before;
+        assert!(
+            more.abs_diff(VISIBLE_VRAM_HEAP_BYTES / 5 * 4) <= 1,
+            "{more}"
+        );
+    }
+
+    #[test]
+    fn no_visible_vram_where_the_guest_has_some_or_nothing_can_back_it() {
+        // A unified-memory GPU whose device-local types are importable.
+        let mut uma = guest_memory(&memory(&[0x7, 0xf]), 0x3);
+        assert_eq!(visible_vram(&mut uma), None);
+        assert_eq!(uma.memory_type_count, 2);
+        // No coherent host-visible type to be the pages.
+        let mut none = guest_memory(&rtx_2070(), 0);
+        assert_eq!(visible_vram(&mut none), None);
+        // A full table.
+        let mut full = memory(&[0x6; 32]);
+        full.memory_heap_count = 1;
+        assert_eq!(visible_vram(&mut full), None);
+        let mut heaps_full = memory(&[0x1, 0x6]);
+        heaps_full.memory_heap_count = 16;
+        assert_eq!(visible_vram(&mut heaps_full), None);
+    }
+
+    #[test]
+    fn the_visible_vram_type_is_its_backing_type_to_the_host() {
+        let device = GuestDevice {
+            properties: VkPhysicalDeviceProperties2::default(),
+            features: VkPhysicalDeviceFeatures2::default(),
+            queue_families: Vec::new(),
+            memory: VkPhysicalDeviceMemoryProperties::default(),
+            host_memory: VkPhysicalDeviceMemoryProperties::default(),
+            extensions: Vec::new(),
+            importable: 0x18,
+            import_alignment: 4096,
+            memory_export: false,
+            wsi: GuestWsi::Software,
+            visible_vram: Some(VisibleVram {
+                type_index: 6,
+                heap_index: 3,
+                backing: 3,
+            }),
+        };
+        assert_eq!(device.host_type(6), 3);
+        assert_eq!(device.host_type(3), 3);
+        assert_eq!(device.host_type(1), 1);
+        assert_eq!(device.guest_bits(0x1b), 0x5b, "type 3 may be bound: 6 may");
+        assert_eq!(device.guest_bits(0x13), 0x13, "no type 3, no type 6");
+        assert_eq!(device.guest_bits(0x5b), 0x5b, "idempotent");
+        let none = GuestDevice {
+            visible_vram: None,
+            ..device
+        };
+        assert_eq!((none.host_type(6), none.guest_bits(0x1b)), (6, 0x1b));
     }
 
     #[test]
