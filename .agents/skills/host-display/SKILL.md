@@ -139,6 +139,54 @@ The window samples that texture, and nothing goes through the CPU. The code is
   so the real-GPU test can build the display's frame and lease
   (`pipeline_tests::for_the_display`).
 
+## The GPU boost (ADR-0004, the GPU-boost amendment of 2026-09-26)
+
+The guest's GPU work runs on the renderer's own Vulkan devices in bursts a
+frame apart, and NVIDIA's driver reads that as a mostly idle GPU (P5/P8). The
+one request an application may make for more is `VK_NV_low_latency2`'s
+`vkSetLatencySleepModeNV` with `lowLatencyBoost`, and it is per swapchain:
+only the window has one. On the RTX 2070 (580.88) it holds the **whole GPU**
+at P0 while it is set — the renderer's devices included, and even with
+nothing submitted — so the window asks for it only while the guest uses the
+GPU (`display::boost`, `display::latency`):
+
+- The shareable Vulkan device (`gpu_scanout::request_device(.., latency)`)
+  enables `VK_NV_low_latency2` + `VK_KHR_present_id` when the adapter has
+  both; `latency::LatencyBoost` makes the call on wgpu's own swapchain
+  (`Surface::as_hal::<Vulkan>()` → `raw_swapchain()`), and the renderer
+  applies it again after **every configure** — a new swapchain starts off.
+- **Activity** is a flip reaching the display (`Waker::frame`) or a
+  `SUBMIT_3D` reaching the device (`ScanoutSink::gpu_work`, an atomic store).
+  `App::about_to_wait` asks `BoostGate::wants`; while boosting it sleeps with
+  `ControlFlow::WaitUntil(end of hold)`, and while not it **arms** the
+  activity so the next submit sends one `HostEvent::GpuActive` — one wakeup
+  per idle-to-active transition, never one per submit. Arm, then look at the
+  activity again: a submit between the two would otherwise wake no one.
+- `boost::ACTIVE_HOLD` is 1 s; the driver keeps P0 about 1.8 s longer by
+  itself after the request is withdrawn, and the next request reaches P0
+  within one 50 ms NVML sample.
+- **Never pass NULL** for `pSleepModeInfo`: the spec says it switches
+  everything off, and NVIDIA 580.88 crashes inside the call. Off is an explicit
+  structure with every member false.
+- `[display] gpu_boost = false` or `ENTANGLED_GPU_BOOST=off` turn it off;
+  `=always` sets it once and leaves it (measurement only: an idle desktop
+  then sits at P0). A headless VM has no swapchain and no boost, and neither
+  has the copy path's non-shareable device or a non-NVIDIA driver.
+- The `display statistics` line carries `gpu_boost`, `gpu_boost_raised`,
+  `gpu_boost_on_s` and `gpu_boost_failed`; `RUST_LOG=display::renderer=debug`
+  logs each transition.
+- The measurement tool is `F:\VMs\Entangled\probes\boost\` — `gpu-boost-probe`
+  (two devices in one process, NVML sampled every 50 ms) for the host alone,
+  and `runboost.sh`/`drive.ps1`/`summ.py` for guest A/B boots.
+- **A flicker report: grab the screen before blaming the present mode.**
+  `F:\VMs\Entangled\probes\boost\grab.ps1` grabs the VM window's client area ~20 times a
+  second and logs luma, black fraction and frame-to-frame change (`fl.py`
+  finds alternations). On 2026-09-26 Mailbox, Fifo, FifoRelaxed and the copy
+  path all grabbed clean; the probe's strobing content (the CSS page, the
+  overview toggled every 0.8 s) and a VRR panel are what remained (ADR-0004,
+  the GPU-boost amendment). Keep windowed probe content calm while the user
+  is at the screen.
+
 ## Input capture (host half of EPIC 9)
 
 - Keyboard: use winit **physical keys** (scancodes), not logical keys, and

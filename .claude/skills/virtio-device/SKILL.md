@@ -541,6 +541,14 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   of it clocks. `nvidia-smi --query-gpu=pstate,clocks.gr,clocks.mem
   --format=csv -lms 50` on the host shows it; `host_vulkan::perf_tests`
   measures every memory placement the renderer can give a guest.
+- **The clocks are the window's to ask for, not the renderer's.** The
+  renderer's devices have no swapchain, and every `VK_NV_low_latency2` call
+  but the out-of-band queue marker takes one (`VK_EXT_headless_surface` does
+  not exist on Windows). The window's boost on its own swapchain is GPU-wide,
+  so the device only reports the guest's work: `ScanoutSink::gpu_work` on
+  every accepted `SUBMIT_3D` (default no-op; an atomic store in
+  `display`). Power throttling off and a HIGH GPU scheduling priority moved
+  no clock (ADR-0004, the GPU-boost amendment).
 - **A host-mapped window has no pages of its own.** `SharedWindow::
   new_host_mapped` allocates nothing, so a Venus window's size costs
   guest-physical address space only; on Windows an untouched
