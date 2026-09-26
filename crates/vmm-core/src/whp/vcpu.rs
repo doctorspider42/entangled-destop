@@ -10,6 +10,7 @@
 //! | `X64IoPortAccess` | [`ExitHandler::io_out`] / [`ExitHandler::io_in`], then RIP advanced by the exit context's instruction length; string/`REP` forms go through the instruction emulator |
 //! | `MemoryAccess` | `WHvEmulatorTryMmioEmulation`, whose callbacks reach [`ExitHandler::mmio_read`]/[`ExitHandler::mmio_write`] |
 //! | `X64Cpuid` | this machine's CPUID policy applied on top of WHP's default result, then RIP advanced |
+//! | `X64ApicEoi` | [`ExitHandler::apic_eoi`] with the vector — the guest EOI'd an interrupt requested level-triggered, which only the userspace IOAPIC's listening pins (the 8254's) are; a trap, so no RIP to advance |
 //! | `UnrecoverableException`, `InvalidVpRegisterValue` | [`RunOutcome::Shutdown`] (the triple-fault equivalent) |
 //! | `Canceled` | re-check the stop flag, then re-enter or return [`RunOutcome::Stopped`] |
 //! | `None` | re-enter (WHP reports it for internal reschedules) |
@@ -40,11 +41,11 @@ use windows::Win32::System::Hypervisor::{
     WHvCancelRunVirtualProcessor, WHvDeleteVirtualProcessor, WHvGetVirtualProcessorRegisters,
     WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
     WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonNone,
-    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonX64Cpuid,
-    WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess, WHvSetVirtualProcessorRegisters,
-    WHvX64RegisterApicBase, WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx,
-    WHvX64RegisterRdx, WHvX64RegisterRip, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME,
-    WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
+    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonX64ApicEoi,
+    WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess,
+    WHvSetVirtualProcessorRegisters, WHvX64RegisterApicBase, WHvX64RegisterRax, WHvX64RegisterRbx,
+    WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip, WHV_PARTITION_HANDLE,
+    WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
 };
 
 use crate::hv::{
@@ -83,10 +84,11 @@ pub struct WhpVcpu {
 impl WhpVcpu {
     pub(super) fn new(partition: Arc<Partition>, index: u32) -> Result<Self, VmmError> {
         create_virtual_processor(partition.handle(), index)?;
+        let cpuid = CpuidPolicy::with_clocks(index, partition.clocks());
         let mut vcpu = Self {
             index,
             partition,
-            cpuid: CpuidPolicy::new(index),
+            cpuid,
             pristine: None,
         };
         vcpu.pristine = vcpu.capture_pristine();
@@ -458,6 +460,14 @@ impl WhpVcpu {
                     self.handle_mmio(&exit, handler, &mut emulator)?
                 }
                 WHvRunVpExitReasonX64Cpuid => self.handle_cpuid(&exit)?,
+                // The guest's EOI of an interrupt requested level-triggered:
+                // a trap after the write, so nothing to complete here.
+                WHvRunVpExitReasonX64ApicEoi => {
+                    // SAFETY: `ExitReason == WHvRunVpExitReasonX64ApicEoi`
+                    // selects the `ApicEoi` arm of the exit context union.
+                    let eoi = unsafe { exit.Anonymous.ApicEoi };
+                    handler.apic_eoi((eoi.InterruptVector & 0xff) as u8);
+                }
                 // Kicked by `WHvCancelRunVirtualProcessor`, or an internal
                 // reschedule: re-check the stop flag and continue.
                 WHvRunVpExitReasonCanceled | WHvRunVpExitReasonNone => continue,
@@ -764,7 +774,7 @@ impl ResettableVcpu for WhpVcpu {
                     .map_err(|e| HvError::Registers(e.to_string()))?;
             }
         }
-        self.cpuid = CpuidPolicy::new(self.index);
+        self.cpuid = CpuidPolicy::with_clocks(self.index, self.partition.clocks());
         Ok(())
     }
 }

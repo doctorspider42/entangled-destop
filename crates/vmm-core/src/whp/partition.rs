@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, MmapRegion};
 use windows::Win32::System::Hypervisor::{
-    WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeProcessorVendor, WHvCreatePartition,
+    WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeInterruptClockFrequency,
+    WHvCapabilityCodeProcessorClockFrequency, WHvCapabilityCodeProcessorVendor, WHvCreatePartition,
     WHvCreateVirtualProcessor, WHvDeletePartition, WHvGetCapability, WHvMapGpaRange,
     WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagTrackDirtyPages,
     WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidExitList,
@@ -18,6 +19,7 @@ use windows::Win32::System::Hypervisor::{
 use crate::hv::{DirtyLog, DirtyPages, DirtyTracking, HvError, MachineConfig, DIRTY_PAGE_SIZE};
 use crate::memory::{create_guest_memory, GuestMem};
 use crate::shm::SharedWindow;
+use crate::whp::cpuid::GuestClocks;
 use crate::whp::interrupt::{HaltGate, WhpInterruptDelivery};
 use crate::whp::regs::{seg_from_whp, zeroed_value, Aligned16};
 use crate::whp::vcpu::{get_regs_raw, WhpVcpu};
@@ -41,6 +43,14 @@ pub struct WhpCapabilities {
     pub hypervisor_present: bool,
     /// CPU vendor as WHP reports it, `None` when the query failed.
     pub processor_vendor: Option<&'static str>,
+    /// The guest TSC's frequency in Hz
+    /// (`WHvCapabilityCodeProcessorClockFrequency`), `None` when this WHP does
+    /// not report it.
+    pub tsc_hz: Option<u64>,
+    /// The local APIC timer's input frequency in Hz
+    /// (`WHvCapabilityCodeInterruptClockFrequency`), `None` when this WHP does
+    /// not report it.
+    pub apic_timer_hz: Option<u64>,
 }
 
 impl WhpCapabilities {
@@ -136,14 +146,44 @@ impl WhpHypervisor {
         } else {
             None
         };
+        // Windows builds that predate the two frequency capabilities fail the
+        // call, which is the `None`.
+        let tsc_hz = hypervisor_present
+            .then(|| {
+                // SAFETY: `WHvCapabilityCodeProcessorClockFrequency` is documented
+                // to write a `UINT64`, for which all-zero is valid.
+                unsafe { get_capability::<u64>(WHvCapabilityCodeProcessorClockFrequency) }
+            })
+            .and_then(Result::ok)
+            .filter(|&hz| hz != 0);
+        let apic_timer_hz = hypervisor_present
+            .then(|| {
+                // SAFETY: `WHvCapabilityCodeInterruptClockFrequency` is documented
+                // to write a `UINT64`, for which all-zero is valid.
+                unsafe { get_capability::<u64>(WHvCapabilityCodeInterruptClockFrequency) }
+            })
+            .and_then(Result::ok)
+            .filter(|&hz| hz != 0);
         Ok(WhpCapabilities {
             hypervisor_present,
             processor_vendor,
+            tsc_hz,
+            apic_timer_hz,
         })
     }
 
     pub fn capabilities(&self) -> &WhpCapabilities {
         &self.capabilities
+    }
+
+    /// The clocks a guest on this host runs at, for the CPUID timing leaves
+    /// ([`crate::whp::cpuid`]); `None` unless WHP reports both.
+    pub fn guest_clocks(&self) -> Option<GuestClocks> {
+        Some(GuestClocks {
+            tsc_hz: self.capabilities.tsc_hz?,
+            apic_timer_hz: self.capabilities.apic_timer_hz?,
+            intel: self.capabilities.processor_vendor == Some("Intel"),
+        })
     }
 }
 
@@ -214,6 +254,9 @@ pub struct Partition {
     halt_gate: Arc<HaltGate>,
     /// Number of virtual processors, fixed before `WHvSetupPartition`.
     vcpu_count: u32,
+    /// What the CPUID timing leaves report; `None` without the CPUID policy
+    /// or when WHP does not report its clocks.
+    clocks: Option<GuestClocks>,
     /// Firmware ROM mappings (EPIC 18): the WHP peer of [`crate::Vm`]'s ROM
     /// slots. Deliberately *not* part of `memory` — a ROM is not guest RAM and
     /// must never show up in a memory map. Held here so the host mapping
@@ -249,6 +292,10 @@ impl Partition {
 
     pub(super) fn halt_gate(&self) -> &Arc<HaltGate> {
         &self.halt_gate
+    }
+
+    pub(super) fn clocks(&self) -> Option<GuestClocks> {
+        self.clocks
     }
 }
 
@@ -337,7 +384,7 @@ impl WhpPartition {
     /// Local APIC emulation and the CPUID exit list are both properties, so a
     /// guest's shape is fixed here and cannot be changed later.
     pub fn with_options(
-        _hv: &WhpHypervisor,
+        hv: &WhpHypervisor,
         cfg: &MachineConfig,
         options: WhpOptions,
     ) -> Result<Self, VmmError> {
@@ -366,6 +413,7 @@ impl WhpPartition {
             options,
             halt_gate: Arc::new(HaltGate::default()),
             vcpu_count: cfg.vcpu_count,
+            clocks: options.cpuid_policy.then(|| hv.guest_clocks()).flatten(),
             roms: Mutex::new(Vec::new()),
         });
 

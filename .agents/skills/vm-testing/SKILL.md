@@ -68,7 +68,8 @@ unit tests live with their crates.
   WHP side natively: `cargo test --workspace` in PowerShell runs the whole
   suite including the `whp_*` acceptance boots (`whp_boot`, `whp_virtio_blk`,
   `whp_virtio_pci`, `whp_smp`, `whp_usernet`, `whp_uefi`), each self-skipping
-  without the optional feature or the artifacts.
+  without the optional feature or the artifacts. `whp_timer` is `#[ignore]`d:
+  see "The WHP timer boot loop" below.
 - CI: standard GitHub runners now expose `/dev/kvm` on Linux; tier 3-4 tests
   run there, tiers 5-6 are scheduled jobs. The `windows-latest` job builds,
   lints and tests the workspace and asserts the `whp_*` self-skip path stays a
@@ -458,6 +459,41 @@ The queue-notify measurement uses the same harness:
 ```bash
 cargo test -p boot-tests --test notify_bench -- --ignored --nocapture
 ```
+
+## The WHP timer boot loop (`whp_timer`, 2026-09-26)
+
+One boot proves nothing about a timing race. `crates/vmm-core/tests/whp_timer.rs`
+boots the SMP test guest N times and fails on the first
+`..MP-BIOS bug: 8254 timer not connected to IO-APIC` — `check_timer()`'s first
+attempt failing, which is how the userspace 8254's lost ticks showed before they
+became a panic (ADR-0002, the 8254 amendment). It prints the TSC calibration
+path of every boot and asserts "no calibration at all" on Intel hosts only (on
+AMD Linux always calibrates, and the PIT half can fail on exit latency alone).
+
+```powershell
+$env:ENTANGLED_TIMER_BUSY = "all"                    # one spinning thread per logical CPU
+$env:ENTANGLED_TIMER_KERNEL = "F:\ubuntu-vmlinuz"    # casper/vmlinuz: HZ=1000
+$env:ENTANGLED_TIMER_BOOTS = "20"; $env:ENTANGLED_TIMER_VCPUS = "8"
+cargo test --release -p vmm-core --test whp_timer -- --ignored --nocapture
+```
+
+Two things make it bite, both learned the hard way:
+
+- **Load the host.** An idle host reproduced nothing in 60 direct boots; 24
+  spinning threads on 24 logical CPUs gave 37 `check_timer()` failures in 60.
+  The installed desktop's "idle host" had a VMware VM and PCSX2 beside it.
+- **Use a HZ=1000 kernel.** `timer_irq_works()` waits `40e9 / HZ` TSC cycles
+  for five ticks — 11.4 ms at HZ=1000, 45 ms at HZ=250 — so a HZ=250 kernel
+  gives the bug four times the slack. Ubuntu's `casper/vmlinuz` boots the test
+  initramfs to the marker in ~11 s.
+
+The same loop outside cargo — any profile, any binary, one process per boot,
+host load per process recorded — is how the before/after table was made:
+`entangled run --headless` on a direct-Linux profile with `panic=0
+apic=verbose`, kill after the ready marker or a timeout, grep the serial log.
+For an installed UEFI desktop, stop the VM at `Freeing unused kernel image`:
+everything the timer can break has happened by then, and the initramfs has not
+mounted anything, so killing it cannot hurt the disk.
 
 ## Endurance: the soak (MVP-1404)
 

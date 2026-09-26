@@ -48,7 +48,7 @@ mod regs;
 mod snapshot;
 mod vcpu;
 
-pub use cpuid::{CpuidPolicy, CpuidResult, CPUID_EXIT_LEAVES};
+pub use cpuid::{tsc_crystal_ratio, CpuidPolicy, CpuidResult, GuestClocks, CPUID_EXIT_LEAVES};
 pub use interrupt::{HaltGate, WhpInterruptDelivery, HALT_POLL};
 pub use partition::{WhpCapabilities, WhpHypervisor, WhpOptions, WhpPartition, WHP_ENABLE_HINT};
 pub use vcpu::{
