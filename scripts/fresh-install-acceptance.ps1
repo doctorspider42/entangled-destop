@@ -66,6 +66,14 @@
     `bash scripts/fetch-ubuntu-iso.sh`, so passing --iso by hand is the
     documented path and this parameter is that path.
 
+.PARAMETER Venus
+    Make the `guest` stage the GPU desktop: `install ubuntu --venus` from an
+    Ubuntu DESKTOP ISO (pass it as -Iso) onto a 40G disk, and a boot that must
+    reach both the login prompt and GDM composited on the host GPU through the
+    Venus renderer, with the display taking the scanout zero-copy. Needs a
+    Vulkan GPU the renderer accepts (`entangled doctor` says `venus ready`).
+    The install takes 11-12 minutes on an RTX 2070 host.
+
 .PARAMETER AppDir
     Test an installation that is ALREADY on this machine instead of installing
     one — typically `C:\Program Files\Entangled Desktop`. Everything else is
@@ -89,13 +97,20 @@
 
 .EXAMPLE
     # The whole thing a CI runner can do (no hypervisor needed):
-    pwsh -File scripts\fresh-install-acceptance.ps1
+    powershell -File scripts\fresh-install-acceptance.ps1
 
 .EXAMPLE
     # Everything, including taking a machine from nothing to a login prompt:
-    pwsh -File scripts\fresh-install-acceptance.ps1 -Tag v0.2.44 `
+    powershell -File scripts\fresh-install-acceptance.ps1 -Tag v0.2.44 `
         -Stages download,install,tree,doctor,fetch,engine,guest `
         -Iso "$env:LOCALAPPDATA\entangled\ubuntu\26.04\ubuntu-26.04-live-server-amd64.iso"
+
+.EXAMPLE
+    # The GPU desktop: install ubuntu --venus from the Desktop ISO, then boot
+    # it until GDM is composited on the host GPU:
+    powershell -File scripts\fresh-install-acceptance.ps1 -Tag v0.2.49 `
+        -Stages download,install,tree,doctor,fetch,engine,guest -Venus `
+        -Iso F:\ubuntu-26.04.1-desktop-amd64.iso
 
 .NOTES
     Needs administrator rights: the installer is PrivilegesRequired=admin.
@@ -106,9 +121,12 @@
 param(
     [string] $Tag = 'latest',
     [string] $Root,
-    [ValidateSet('download', 'install', 'tree', 'doctor', 'fetch', 'engine', 'guest')]
+    # Validated below rather than by ValidateSet: `powershell -File` and
+    # `pwsh -File` both hand `-Stages a,b` over as the ONE string "a,b", which
+    # a ValidateSet refuses. Only `&` from inside PowerShell splits it.
     [string[]] $Stages = @('download', 'install', 'tree', 'doctor', 'fetch', 'engine'),
     [string] $Iso,
+    [switch] $Venus,
     [string] $AppDir,
     [switch] $KeepInstalled,
     [string] $JsonReport
@@ -119,6 +137,18 @@ $ErrorActionPreference = 'Stop'
 # `reg query` on a key that is not there is an answer, not an error, and
 # PowerShell 7.4 turns a non-zero native exit code into a terminating one.
 $PSNativeCommandUseErrorActionPreference = $false
+# Windows PowerShell 5.1 is what a stock Windows 10/11 has, and this script
+# runs on it as well as on PowerShell 7 (fresh-install.yml runs it on 5.1):
+# no ternaries or ??, no Process.Kill(bool), and NO NON-ASCII CHARACTERS in
+# code. 5.1 reads a BOM-less script as ANSI, so an em dash's UTF-8 bytes end
+# in 0x94, which it decodes as a right double quote and takes as the end of a
+# double-quoted string. Comments may keep theirs; strings may not. Get-Content
+# has the same default, so every read of what the program printed (UTF-8, em
+# dashes and all) names -Encoding UTF8.
+# 5.1 also draws a progress bar per chunk of a download, which makes one take
+# minutes, and on an older .NET Framework may not offer TLS 1.2 by default.
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 # The repository the release comes from. Spelled out rather than derived from
 # `git remote`, because this script must run where there is no checkout.
@@ -156,7 +186,7 @@ function Assert-Check {
         [Parameter(Mandatory)] [bool] $Condition,
         [string] $Detail = ''
     )
-    Add-Check -Name $Name -Status ($Condition ? 'PASS' : 'FAIL') -Detail $Detail
+    Add-Check -Name $Name -Status $(if ($Condition) { 'PASS' } else { 'FAIL' }) -Detail $Detail
     return $Condition
 }
 
@@ -165,6 +195,33 @@ function Write-Stage {
     Write-Host ''
     Write-Host "== $Name " -ForegroundColor Cyan -NoNewline
     Write-Host ('=' * [Math]::Max(0, 60 - $Name.Length)) -ForegroundColor Cyan
+}
+
+<#
+    Runs a native command whose stderr is part of its answer, and returns its
+    exit code. `reg query` on a missing key and `reg import` on success both
+    write to stderr, and Windows PowerShell 5.1 turns every stderr line into
+    an ErrorRecord, which $ErrorActionPreference = 'Stop' makes terminating.
+#>
+function Invoke-Native {
+    param([Parameter(Mandatory)][string] $Exe, [Parameter(ValueFromRemainingArguments)][string[]] $Rest)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Exe @Rest 2>&1 | Out-Null; return $LASTEXITCODE }
+    finally { $ErrorActionPreference = $prev }
+}
+
+<#
+    Ends a process and everything it started. Process.Kill(bool) is .NET Core
+    3+, so Windows PowerShell 5.1 asks taskkill instead.
+#>
+function Stop-ProcessTree {
+    param([Parameter(Mandatory)] $Process)
+    try {
+        if ($PSVersionTable.PSVersion.Major -ge 7) { $Process.Kill($true) }
+        else { Invoke-Native taskkill.exe /T /F /PID $Process.Id | Out-Null }
+    }
+    catch { }
 }
 
 # ---------------------------------------------------------------------------
@@ -277,7 +334,11 @@ function Invoke-Stranger {
         [Parameter(Mandatory)] [string] $WorkDir,
         [int] $TimeoutSec = 120,
         [string] $Log,
-        [string] $UntilMarker
+        # Every one of these must have appeared before the wait ends early.
+        [string[]] $UntilMarker,
+        # How long the program keeps running after the markers, before it is
+        # ended: a screenshot is only rewritten every ~20 s.
+        [int] $LingerSec = 0
     )
 
     if (-not $Log) {
@@ -290,32 +351,36 @@ function Invoke-Stranger {
     try {
         $proc = Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $WorkDir `
             -NoNewWindow -PassThru -RedirectStandardOutput $Log -RedirectStandardError $errLog
+        # Windows PowerShell 5.1 only records a -PassThru process's exit code
+        # if something held its handle before it exited.
+        $null = $proc.Handle
         $deadline = (Get-Date).AddSeconds($TimeoutSec)
         $sawMarker = $false
         while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
             if ($UntilMarker) {
-                $sofar = ConvertTo-PlainText (Get-Content -Raw -LiteralPath $Log -ErrorAction SilentlyContinue)
-                if ($sofar -and $sofar.Contains($UntilMarker)) { $sawMarker = $true; break }
+                $sofar = ConvertTo-PlainText (Get-Content -Raw -Encoding UTF8 -LiteralPath $Log -ErrorAction SilentlyContinue)
+                if ($sofar -and -not ($UntilMarker | Where-Object { -not $sofar.Contains($_) })) { $sawMarker = $true; break }
             }
             Start-Sleep -Milliseconds 500
         }
+        if ($sawMarker -and $LingerSec -gt 0) { $proc.WaitForExit($LingerSec * 1000) | Out-Null }
         $timedOut = $false
         if (-not $proc.HasExited) {
             if (-not $sawMarker) { $timedOut = $true }
             # A headless VM has no window and no shutdown command on its
             # control channel, so this is how the boot check ends — the same
             # thing apps/entangled/tests/ubuntu_install.rs does.
-            try { $proc.Kill($true) } catch { }
+            Stop-ProcessTree $proc
             $proc.WaitForExit(30000) | Out-Null
         }
-        $err = (Get-Content -Raw -LiteralPath $errLog -ErrorAction SilentlyContinue) ?? ''
+        $err = [string](Get-Content -Raw -Encoding UTF8 -LiteralPath $errLog -ErrorAction SilentlyContinue)
         if ($err) { Add-Content -LiteralPath $Log -Value $err }
         Remove-Item -LiteralPath $errLog -ErrorAction SilentlyContinue
         # The escapes are stripped from what callers match against; the log
         # file on disk keeps every byte the guest sent.
-        $out = ConvertTo-PlainText (((Get-Content -Raw -LiteralPath $Log -ErrorAction SilentlyContinue) ?? '') + $err)
+        $out = ConvertTo-PlainText ([string](Get-Content -Raw -Encoding UTF8 -LiteralPath $Log -ErrorAction SilentlyContinue) + $err)
         return @{
-            ExitCode   = ($proc.HasExited ? $proc.ExitCode : -1)
+            ExitCode   = $(if ($proc.HasExited) { $proc.ExitCode } else { -1 })
             Output     = $out
             TimedOut   = $timedOut
             SawMarker  = $sawMarker
@@ -339,7 +404,7 @@ $Root = [System.IO.Path]::GetFullPath($Root)
 # The {app} under test: the scratch one this run installs, or an existing
 # installation named by -AppDir.
 $ExistingApp = [bool] $AppDir
-$AppDir = $ExistingApp ? [System.IO.Path]::GetFullPath($AppDir) : (Join-Path $Root 'app')
+$AppDir = if ($ExistingApp) { [System.IO.Path]::GetFullPath($AppDir) } else { Join-Path $Root 'app' }
 $DownloadDir  = Join-Path $Root 'download'
 $ProfileDir   = Join-Path $Root 'profile'      # the throwaway USERPROFILE
 $CwdDir       = Join-Path $Root 'cwd'          # a working directory with no repo
@@ -371,6 +436,10 @@ $Entangled = Join-Path $AppDir 'entangled.exe'
 $Firmware  = Join-Path $AppDir 'artifacts\firmware\CLOUDHV.fd'
 
 $order = @('download', 'install', 'tree', 'doctor', 'fetch', 'engine', 'guest')
+$Stages = @($Stages | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+foreach ($stage in $Stages) {
+    if ($order -notcontains $stage) { throw "unknown stage '$stage': the stages are $($order -join ', ')" }
+}
 $run = [ordered]@{}
 foreach ($stage in $order) { $run[$stage] = ($Stages -contains $stage) }
 if ($ExistingApp) {
@@ -383,11 +452,11 @@ if ($ExistingApp) {
 }
 
 Write-Host ''
-Write-Host 'Entangled Desktop — fresh-install acceptance' -ForegroundColor White
+Write-Host 'Entangled Desktop - fresh-install acceptance' -ForegroundColor White
 Write-Host "  repository : $Repo"
 Write-Host "  tag        : $Tag"
 Write-Host "  scratch    : $Root"
-Write-Host "  installation: $AppDir$($ExistingApp ? ' (existing, -AppDir)' : ' (installed by this run)')"
+Write-Host "  installation: $AppDir$(if ($ExistingApp) { ' (existing, -AppDir)' } else { ' (installed by this run)' })"
 Write-Host "  stages     : $(($order | Where-Object { $run[$_] }) -join ', ')"
 
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -411,19 +480,21 @@ $script:Setup = $null
 $script:Version = $null
 
 if ($run['download']) {
-    Write-Stage 'download — the artifact a stranger gets'
+    Write-Stage 'download - the artifact a stranger gets'
 
     # Unauthenticated, over the same public URL a browser would use. If this
     # ever needs a token again, the repository went private and every newcomer
     # is blocked — which is a finding, not a reason to add one here.
-    $api = ($Tag -eq 'latest') ?
-        "https://api.github.com/repos/$Repo/releases/latest" :
+    $api = if ($Tag -eq 'latest') {
+        "https://api.github.com/repos/$Repo/releases/latest"
+    } else {
         "https://api.github.com/repos/$Repo/releases/tags/$Tag"
+    }
     $headers = @{ 'User-Agent' = 'entangled-fresh-install-acceptance'; 'Accept' = 'application/vnd.github+json' }
-    $release = Invoke-RestMethod -Uri $api -Headers $headers -MaximumRedirection 5
+    $release = Invoke-RestMethod -Uri $api -Headers $headers -MaximumRedirection 5 -UseBasicParsing
     $script:Version = ($release.tag_name -replace '^v', '')
     Add-Check -Name 'the release resolves without credentials' -Status 'PASS' `
-        -Detail "$($release.tag_name) — $($release.name)"
+        -Detail "$($release.tag_name) - $($release.name)"
 
     $asset = $release.assets | Where-Object { $_.name -like 'entangled-desktop-*-setup.exe' } | Select-Object -First 1
     if (-not (Assert-Check -Name 'the release carries a Windows setup .exe' -Condition ($null -ne $asset) `
@@ -437,7 +508,7 @@ if ($run['download']) {
     }
     else {
         Write-Host "  downloading $($asset.name) ($([math]::Round($asset.size/1MB,1)) MiB)..."
-        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $script:Setup -Headers $headers
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $script:Setup -Headers $headers -UseBasicParsing
     }
     $len = (Get-Item $script:Setup).Length
     Assert-Check -Name 'the setup .exe downloaded whole' -Condition ($len -eq $asset.size) `
@@ -447,7 +518,7 @@ if ($run['download']) {
     # a check that pretended otherwise would be the lie. Record what arrived.
     $sig = Get-AuthenticodeSignature $script:Setup
     Add-Check -Name 'code signature' -Status 'INFO' `
-        -Detail "$($sig.Status) — the project ships unsigned binaries (docs/user-guide.md)"
+        -Detail "$($sig.Status) - the project ships unsigned binaries (docs/user-guide.md)"
 }
 else {
     $script:Setup = Get-ChildItem -Path $DownloadDir -Filter 'entangled-desktop-*-setup.exe' -ErrorAction SilentlyContinue |
@@ -466,10 +537,9 @@ else {
 function Backup-ExistingInstallation {
     $found = @()
     foreach ($key in $UninstallKeys) {
-        $out = & reg.exe query $key 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        if ((Invoke-Native reg.exe query $key) -eq 0) {
             $file = Join-Path $BackupDir (($key -replace '[\\{}]', '_') + '.reg')
-            & reg.exe export $key $file /y | Out-Null
+            Invoke-Native reg.exe export $key $file /y | Out-Null
             $found += $file
         }
     }
@@ -491,14 +561,14 @@ function Backup-ExistingInstallation {
     }
     else {
         Add-Check -Name 'no existing installation on this host' -Status 'INFO' `
-            -Detail 'nothing to protect — this is what a CI runner looks like'
+            -Detail 'nothing to protect - this is what a CI runner looks like'
     }
     return $found.Count -gt 0
 }
 
 function Restore-ExistingInstallation {
     foreach ($file in (Get-ChildItem -Path $BackupDir -Filter '*.reg' -ErrorAction SilentlyContinue)) {
-        & reg.exe import $file.FullName 2>&1 | Out-Null
+        Invoke-Native reg.exe import $file.FullName | Out-Null
     }
     $savedGroup = Join-Path $BackupDir 'StartMenu'
     if (Test-Path $savedGroup) {
@@ -515,7 +585,7 @@ function Restore-ExistingInstallation {
 $script:HadExisting = $false
 
 if ($run['install']) {
-    Write-Stage 'install — /VERYSILENT into a scratch {app}'
+    Write-Stage 'install - /VERYSILENT into a scratch {app}'
     if (-not $script:Setup -or -not (Test-Path $script:Setup)) { throw 'no setup .exe; run the download stage' }
 
     $script:HadExisting = Backup-ExistingInstallation
@@ -546,7 +616,7 @@ if ($run['install']) {
 # ---------------------------------------------------------------------------
 
 if ($run['tree']) {
-    Write-Stage 'tree — what the installer actually shipped'
+    Write-Stage 'tree - what the installer actually shipped'
 
     foreach ($rel in @('entangled.exe', 'entangled-manager.exe', 'entangled.ico',
             'LICENSE', 'THIRD-PARTY-NOTICES.txt', 'README.md')) {
@@ -562,9 +632,9 @@ if ($run['tree']) {
     # failed on the day that installer shipped.
     $haveFw = Test-Path $Firmware
     Assert-Check -Name 'REGRESSION: the UEFI firmware ships with the installer' -Condition $haveFw `
-        -Detail ($haveFw ?
-            "$Firmware ($((Get-Item $Firmware).Length) bytes)" :
-            "MISSING — every UEFI guest is impossible without it. installer\entangled.iss must ship {#FirmwareDir}\CLOUDHV.fd with NO skipifsourcedoesntexist") | Out-Null
+        -Detail $(if ($haveFw) {
+            "$Firmware ($((Get-Item $Firmware).Length) bytes)" } else {
+            "MISSING - every UEFI guest is impossible without it. installer\entangled.iss must ship {#FirmwareDir}\CLOUDHV.fd with NO skipifsourcedoesntexist" }) | Out-Null
     if ($haveFw) {
         # 4 MiB exactly, because that is what a pflash-backed CloudHv build is
         # and a truncated one boots to nothing.
@@ -572,10 +642,10 @@ if ($run['tree']) {
             -Condition ((Get-Item $Firmware).Length -eq 4MB) `
             -Detail "sha256 $((Get-FileHash $Firmware -Algorithm SHA256).Hash.ToLower())" | Out-Null
         Add-Check -Name 'firmware provenance note' `
-            -Status ((Test-Path "$Firmware.provenance") ? 'PASS' : 'INFO') `
-            -Detail ((Test-Path "$Firmware.provenance") ?
-                ((Get-Content -Raw "$Firmware.provenance").Trim() -replace "`r?`n", '; ') :
-                'no .provenance beside the firmware (optional: only /DFirmwareDir builds lack one)')
+            -Status $(if (Test-Path "$Firmware.provenance") { 'PASS' } else { 'INFO' }) `
+            -Detail $(if (Test-Path "$Firmware.provenance") {
+                (Get-Content -Raw "$Firmware.provenance").Trim() -replace "`r?`n", '; ' } else {
+                'no .provenance beside the firmware (optional: only /DFirmwareDir builds lack one)' })
     }
 
     # It must be at the path the resolver searches, which is relative to the
@@ -600,7 +670,7 @@ while ($probe) {
     $probe = $probe.Parent
 }
 Assert-Check -Name 'the working directory has no repository at or above it' -Condition ($null -eq $repoAbove) `
-    -Detail ($repoAbove ? "found a checkout at $repoAbove — the checkout fallback could answer for the installation" : $CwdDir) | Out-Null
+    -Detail $(if ($repoAbove) { "found a checkout at $repoAbove - the checkout fallback could answer for the installation" } else { $CwdDir }) | Out-Null
 
 # ---------------------------------------------------------------------------
 # Stage: doctor
@@ -609,7 +679,7 @@ Assert-Check -Name 'the working directory has no repository at or above it' -Con
 $script:DoctorOut = ''
 
 if ($run['doctor']) {
-    Write-Stage 'doctor — what a newcomer is told about their host'
+    Write-Stage 'doctor - what a newcomer is told about their host'
     if (-not (Test-Path $Entangled)) { throw "no $Entangled; run the install stage" }
 
     # NOT $version: PowerShell variable names are case-insensitive and an `if`
@@ -630,9 +700,9 @@ if ($run['doctor']) {
     $doctor.Output -split "`r?`n" | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
 
     $hypervisorOk = $doctor.ExitCode -eq 0
-    Add-Check -Name 'hypervisor verdict' -Status ($hypervisorOk ? 'PASS' : 'INFO') `
-        -Detail ($hypervisorOk ? 'this host can run VMs' :
-            'this host cannot run VMs (a GitHub runner never can) — the inventory below must be reported anyway')
+    Add-Check -Name 'hypervisor verdict' -Status $(if ($hypervisorOk) { 'PASS' } else { 'INFO' }) `
+        -Detail $(if ($hypervisorOk) { 'this host can run VMs' } else {
+            'this host cannot run VMs (a GitHub runner never can) - the inventory below must be reported anyway' })
 
     # doctor must answer the inventory questions whether or not the hypervisor
     # is usable. Before this was true, the host that most needed the answer —
@@ -640,9 +710,9 @@ if ($run['doctor']) {
     # line and an error, and CI could assert nothing at all.
     Assert-Check -Name 'doctor reports the install inventory even without a hypervisor' `
         -Condition ($doctor.Output -match '(?m)^\s*install\s+:') `
-        -Detail ($hypervisorOk ?
-            'the "install :" section is the portable half of doctor' :
-            'this host has no hypervisor and doctor printed no inventory — a release older than the doctor change in apps/entangled/src/doctor.rs report(), which prints what the host HAS before it fails on what it cannot do') | Out-Null
+        -Detail $(if ($hypervisorOk) {
+            'the "install :" section is the portable half of doctor' } else {
+            'this host has no hypervisor and doctor printed no inventory - a release older than the doctor change in apps/entangled/src/doctor.rs report(), which prints what the host HAS before it fails on what it cannot do' }) | Out-Null
 
     # ---- REGRESSION 1, the resolver half ---------------------------------
     # The file being present is half the bug; the program looking there is the
@@ -651,7 +721,7 @@ if ($run['doctor']) {
     $fwLine = ($doctor.Output -split "`r?`n" | Where-Object { $_ -match '^\s*firmware\s' } | Select-Object -First 1)
     Assert-Check -Name 'REGRESSION: doctor resolves the firmware, from this installation' `
         -Condition ($null -ne $fwLine -and $fwLine -match 'from this installation') `
-        -Detail ($fwLine ?? 'no firmware line in the output at all') | Out-Null
+        -Detail $(if ($fwLine) { $fwLine } else { 'no firmware line in the output at all' }) | Out-Null
     if ($fwLine) {
         Assert-Check -Name 'the firmware doctor found is the one that was installed' `
             -Condition ($fwLine -match [regex]::Escape($AppDir)) `
@@ -670,7 +740,7 @@ if ($run['doctor']) {
     for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*wsl\s+\S') { $wslIdx = $i; break } }
     if ($wslIdx -lt 0) {
         Assert-Check -Name 'REGRESSION: doctor answers for the WSL (KVM) engine' -Condition $false `
-            -Detail 'no "wsl" engine line — the backend that used to die with `execvpe entangled failed 2` is unreported' | Out-Null
+            -Detail 'no "wsl" engine line - the backend that used to die with `execvpe entangled failed 2` is unreported' | Out-Null
     }
     else {
         $wslLine = $lines[$wslIdx].Trim()
@@ -696,18 +766,42 @@ if ($run['doctor']) {
         }
     }
 
+    # 3D. On Windows the Venus renderer is inside entangled.exe and needs only
+    # the host's own Vulkan driver, so nothing has to ship for it; what doctor
+    # owes is an answer. A runner has no GPU, so there it is "unavailable" and
+    # still a pass; a -Venus run needs "ready", or its guest stage cannot work.
+    $idx3d = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*3D\s+:') { $idx3d = $i; break } }
+    if ($idx3d -lt 0) {
+        Assert-Check -Name 'doctor answers for 3D' -Condition $false -Detail 'no "3D :" line' | Out-Null
+    }
+    else {
+        $block3d = @($lines[$idx3d])
+        for ($j = $idx3d + 1; $j -lt $lines.Count -and $lines[$j] -match '^\s{8,}\S' -and $lines[$j] -notmatch '^\s*\S+\s*:'; $j++) {
+            $block3d += $lines[$j]
+        }
+        $venusReady = ($block3d -join "`n") -match 'venus\s+ready'
+        $detail3d = ($block3d | ForEach-Object { $_.Trim() }) -join "`n"
+        if ($Venus) {
+            Assert-Check -Name 'doctor reports Venus ready on this host' -Condition $venusReady -Detail $detail3d | Out-Null
+        }
+        else {
+            Add-Check -Name 'doctor answers for 3D' -Status 'PASS' -Detail $detail3d
+        }
+    }
+
     # The scrub took: a newcomer's machines go into THEIR profile, not into the
     # developer's ~/entangled-vms. If this fails, every other check in this
     # script was reading the developer's environment.
     $vmLine = ($lines | Where-Object { $_ -match '^\s*VM directory' } | Select-Object -First 1)
     Assert-Check -Name 'the per-user profile really is empty and scratch' `
         -Condition ($null -ne $vmLine -and $vmLine -match [regex]::Escape($ProfileDir)) `
-        -Detail ($vmLine ?? 'no VM directory line') | Out-Null
+        -Detail $(if ($vmLine) { $vmLine } else { 'no VM directory line' }) | Out-Null
 
     $isoLine = ($lines | Where-Object { $_ -match '^\s*ubuntu ISO' } | Select-Object -First 1)
     $isoEmpty = ($null -ne $isoLine) -and ($isoLine -match 'MISSING')
     Add-Check -Name 'the media cache starts empty, the way a newcomer''s does' `
-        -Status ($isoEmpty ? 'PASS' : 'INFO') -Detail ($isoLine ?? '')
+        -Status $(if ($isoEmpty) { 'PASS' } else { 'INFO' }) -Detail ([string]$isoLine)
 }
 
 # ---------------------------------------------------------------------------
@@ -715,7 +809,7 @@ if ($run['doctor']) {
 # ---------------------------------------------------------------------------
 
 if ($run['fetch']) {
-    Write-Stage 'fetch — `entangled fetch firmware`, with no token'
+    Write-Stage 'fetch - `entangled fetch firmware`, with no token'
 
     $fetch = Invoke-Stranger -Exe $Entangled -Arguments @('fetch', 'firmware') `
         -ProfileVars $StrangerProfile -WorkDir $CwdDir -TimeoutSec 300
@@ -727,7 +821,7 @@ if ($run['fetch']) {
         $cached = Get-ChildItem -Recurse -Path (Join-Path $StrangerProfile.LOCALAPPDATA 'entangled\firmware') `
             -Filter 'CLOUDHV.fd' -ErrorAction SilentlyContinue | Select-Object -First 1
         Assert-Check -Name 'the fetched firmware lands in the (empty) verified cache' -Condition ($null -ne $cached) `
-            -Detail ($cached ? $cached.FullName : '') | Out-Null
+            -Detail $(if ($cached) { $cached.FullName } else { '' }) | Out-Null
         if ($cached -and (Test-Path $Firmware)) {
             # release.yml's firmware job downloads the pinned asset and refuses
             # to build an installer around anything else, so these two SHOULD
@@ -742,7 +836,7 @@ if ($run['fetch']) {
                     -Status 'PASS' -Detail $pinnedHash
             }
             else {
-                $detail = "different builds — this setup predates the published firmware" +
+                $detail = "different builds - this setup predates the published firmware" +
                     "`n  published $pinnedHash" +
                     "`n  installed $shippedHash" +
                     "`nrelease.yml pins them together from now on"
@@ -758,7 +852,7 @@ if ($run['fetch']) {
 # ---------------------------------------------------------------------------
 
 if ($run['engine']) {
-    Write-Stage 'engine — the Linux half the installer cannot ship'
+    Write-Stage 'engine - the Linux half the installer cannot ship'
 
     # The command the manager's button and the installer's optional task both
     # run must exist in the SHIPPED binary. Checked with --help so nothing is
@@ -768,10 +862,10 @@ if ($run['engine']) {
     $hasWslCli = $help.ExitCode -eq 0 -and $help.Output -match '--distro'
     Assert-Check -Name 'REGRESSION: the shipped CLI can install the Linux engine into WSL' `
         -Condition $hasWslCli `
-        -Detail ($hasWslCli ?
-            'entangled wsl install-engine — what the manager button and the installer task both run' :
+        -Detail $(if ($hasWslCli) {
+            'entangled wsl install-engine - what the manager button and the installer task both run' } else {
             "this release has no 'wsl' subcommand, so installer/entangled.iss's optional task would exit -1 and the manager's Settings button is the only way in:`n" +
-            (($help.Output -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 3) -join "`n")) | Out-Null
+            (($help.Output -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 3) -join "`n") }) | Out-Null
 
     # The installer offers the same thing at install time. Read out of the
     # setup log, which records the task list even when nothing was selected.
@@ -784,7 +878,7 @@ if ($run['engine']) {
         # evidence about the run rather than about the command line.
         Assert-Check -Name 'this run did NOT touch the WSL engine' `
             -Condition ($log -notmatch 'WSL engine setup:') `
-            -Detail '/MERGETASKS=!wslengine — the user''s distribution is left exactly as it was' | Out-Null
+            -Detail '/MERGETASKS=!wslengine - the user''s distribution is left exactly as it was' | Out-Null
     }
 
     # And the release publishes the asset the download needs. Same
@@ -792,11 +886,11 @@ if ($run['engine']) {
     if ($script:Version) {
         try {
             $headers = @{ 'User-Agent' = 'entangled-fresh-install-acceptance'; 'Accept' = 'application/vnd.github+json' }
-            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/tags/v$($script:Version)" -Headers $headers
+            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/tags/v$($script:Version)" -Headers $headers -UseBasicParsing
             $asset = $rel.assets | Where-Object { $_.name -eq 'entangled-linux-x86_64' }
             Assert-Check -Name 'the release publishes the Linux engine the installer will download' `
                 -Condition ($null -ne $asset) `
-                -Detail ($asset ? "$($asset.name), $([math]::Round($asset.size/1MB,1)) MiB" : 'no entangled-linux-x86_64 asset') | Out-Null
+                -Detail $(if ($asset) { "$($asset.name), $([math]::Round($asset.size/1MB,1)) MiB" } else { 'no entangled-linux-x86_64 asset' }) | Out-Null
         }
         catch {
             Add-Check -Name 'the release publishes the Linux engine' -Status 'FAIL' -Detail $_.Exception.Message
@@ -809,7 +903,7 @@ if ($run['engine']) {
 # ---------------------------------------------------------------------------
 
 if ($run['guest']) {
-    Write-Stage 'guest — from nothing to a login prompt'
+    Write-Stage 'guest - from nothing to a login prompt'
 
     if (-not $Iso) {
         # A newcomer on Windows has no `bash scripts/fetch-ubuntu-iso.sh`; the
@@ -821,17 +915,23 @@ if ($run['guest']) {
     }
     else {
         New-Item -ItemType Directory -Force -Path $VmDir | Out-Null
-        $disk = Join-Path $VmDir 'fresh-ubuntu.raw'
-        $profileToml = Join-Path $VmDir 'fresh-ubuntu.toml'
+        # The disk's name is the guest's hostname, and so the login marker.
+        $vmName = if ($Venus) { 'fresh-desktop' } else { 'fresh-ubuntu' }
+        $disk = Join-Path $VmDir "$vmName.raw"
+        $profileToml = Join-Path $VmDir "$vmName.toml"
+        $installArgs = @('install', 'ubuntu', '--disk', $disk, '--size', $(if ($Venus) { '40G' } else { '16G' }),
+            '--auto', '--headless', '--iso', $Iso)
+        if ($Venus) { $installArgs += '--venus' }
 
-        Write-Host "  installing Ubuntu Server (up to 40 minutes)..." -ForegroundColor DarkGray
+        Write-Host "  installing Ubuntu $(if ($Venus) { 'Desktop with --venus' } else { 'Server' }) (up to 40 minutes)..." -ForegroundColor DarkGray
+        $installStart = Get-Date
         $install = Invoke-Stranger -Exe $Entangled -ProfileVars $StrangerProfile -WorkDir $CwdDir -TimeoutSec (45 * 60) `
-            -Log (Join-Path $script:LogDir 'guest-install.log') `
-            -Arguments @('install', 'ubuntu', '--disk', $disk, '--size', '16G', '--auto', '--headless', '--iso', $Iso)
+            -Log (Join-Path $script:LogDir 'guest-install.log') -Arguments $installArgs
+        $installTime = (Get-Date) - $installStart
 
         $installedOk = ($install.ExitCode -eq 0) -and (Test-Path $profileToml)
         Assert-Check -Name 'a UEFI machine installs from nothing, on a fresh installation' -Condition $installedOk `
-            -Detail "exit $($install.ExitCode); log $($install.Log)" | Out-Null
+            -Detail "exit $($install.ExitCode) after $([math]::Round($installTime.TotalMinutes, 1)) min; log $($install.Log)" | Out-Null
 
         if ($installedOk) {
             # Nothing in the generated profile may point back at a checkout.
@@ -839,14 +939,37 @@ if ($run['guest']) {
             Add-Check -Name 'generated profile' -Status 'INFO' -Detail $toml.Trim()
             Assert-Check -Name 'the machine boots via UEFI with a persistent NVRAM store' `
                 -Condition ($toml -match 'mode\s*=\s*"uefi"' -and $toml -match 'nvram') -Detail '' | Out-Null
+            # bebe7d1: every installed profile is the MVP's 1920x1080 window and
+            # half the host's logical CPUs, 2 to 8 (control_api::default_vcpus).
+            # It used to be 1280x800 and 2 vCPUs, which nothing ever chose.
+            $wantVcpus = [Math]::Min(8, [Math]::Max(2, [int][Math]::Floor([Environment]::ProcessorCount / 2)))
+            $gotVcpus = if ($toml -match '(?m)^\s*vcpus\s*=\s*(\d+)') { [int]$Matches[1] } else { $null }
+            Assert-Check -Name 'the installed profile is 1920x1080' `
+                -Condition ($toml -match '(?m)^\s*width\s*=\s*1920\s*$' -and $toml -match '(?m)^\s*height\s*=\s*1080\s*$') `
+                -Detail '[display] width/height' | Out-Null
+            Assert-Check -Name "the installed profile has half the host's CPUs" -Condition ($gotVcpus -eq $wantVcpus) `
+                -Detail "vcpus = $gotVcpus; this host has $([Environment]::ProcessorCount) logical CPUs, so $wantVcpus" | Out-Null
+            if ($Venus) {
+                Assert-Check -Name 'the installed profile turns Venus on' `
+                    -Condition ($toml -match '(?m)^\s*venus\s*=\s*true\s*$') -Detail '[display] venus = true' | Out-Null
+            }
 
+            # A Venus boot is done when GDM is on the GPU as well as when the
+            # console has a login prompt. The hostname-qualified marker is one
+            # "Last login:" can never match.
+            $markers = @("$vmName login:")
+            if ($Venus) { $markers += 'the guest composites on the GPU' }
+            $shot = Join-Path $script:LogDir 'guest-boot.png'
             Write-Host '  booting what was installed (up to 6 minutes)...' -ForegroundColor DarkGray
+            $bootStart = Get-Date
             $boot = Invoke-Stranger -Exe $Entangled -ProfileVars $StrangerProfile -WorkDir $CwdDir -TimeoutSec (6 * 60) `
-                -Log (Join-Path $script:LogDir 'guest-boot.log') -UntilMarker 'login:' `
-                -Arguments @('run', '--headless', $profileToml)
+                -Log (Join-Path $script:LogDir 'guest-boot.log') -UntilMarker $markers -LingerSec $(if ($Venus) { 40 } else { 0 }) `
+                -Arguments @('run', '--headless', '--screenshot-after', '45', '--screenshot', $shot, $profileToml)
+            $bootTime = (Get-Date) - $bootStart
 
-            Assert-Check -Name 'the installed system reaches a login prompt' -Condition $boot.SawMarker `
-                -Detail (($boot.Output -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6) -join "`n") | Out-Null
+            Assert-Check -Name 'the installed system reaches a login prompt' -Condition ($boot.Output.Contains("$vmName login:")) `
+                -Detail ("after $([math]::Round($bootTime.TotalSeconds)) s`n" +
+                    (($boot.Output -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6) -join "`n")) | Out-Null
             # Each one proves the step before it could not have been skipped:
             # the firmware loaded the *installed* bootloader out of the
             # persisted NVRAM entry (with no Boot#### it would fall back to
@@ -856,6 +979,28 @@ if ($run['guest']) {
                     'serial-getty@ttyS0')) {
                 Assert-Check -Name "boot chain: $needle" `
                     -Condition ($boot.Output.Contains($needle)) -Detail '' | Out-Null
+            }
+            if ($Venus) {
+                # The GPU desktop, from the VMM's own log: the renderer found a
+                # device, the display imports scanouts onto its own GPU, and
+                # the guest's compositor scans out a renderer blob at the
+                # profile's size. No manual guest configuration and no
+                # ENTANGLED_VENUS: the profile alone asked for all of it.
+                $lines = $boot.Output -split "`r?`n"
+                $venusChecks = @(
+                    @{ n = 'the renderer shows the guest a host Vulkan device'; m = 'a Venus guest will see this host Vulkan device'; also = '' },
+                    @{ n = 'the Venus executing renderer is attached, asked for by the profile'; m = 'attaching the Venus EXECUTING renderer'; also = 'venus = true' },
+                    @{ n = 'the display presents zero-copy, on its own GPU'; m = 'zero-copy presentation'; also = '' },
+                    @{ n = 'GDM composites on the GPU at 1920x1080'; m = 'the guest composites on the GPU'; also = 'width=1920 height=1080' })
+                foreach ($c in $venusChecks) {
+                    $hit = $lines | Where-Object { $_.Contains($c.m) } | Select-Object -First 1
+                    $ok = [bool]$hit -and (-not $c.also -or $hit.Contains($c.also))
+                    Assert-Check -Name "venus: $($c.n)" -Condition $ok `
+                        -Detail $(if ($hit) { ($hit -replace '^.*?INFO\s+', '').Trim() } else { "no '$($c.m)' in $($boot.Log)" }) | Out-Null
+                }
+                Assert-Check -Name 'venus: no developer override was needed' `
+                    -Condition (-not $boot.Output.Contains('developer override')) -Detail 'no ENTANGLED_VENUS line in the log' | Out-Null
+                Add-Check -Name 'venus: screenshot of the greeter' -Status $(if (Test-Path $shot) { 'INFO' } else { 'SKIP' }) -Detail $shot
             }
         }
     }
@@ -892,15 +1037,15 @@ else {
     if ($script:HadExisting) {
         Restore-ExistingInstallation
         $back = $false
-        foreach ($key in $UninstallKeys) { & reg.exe query $key 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { $back = $true } }
+        foreach ($key in $UninstallKeys) { if ((Invoke-Native reg.exe query $key) -eq 0) { $back = $true } }
         $group = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Entangled Desktop'
         Assert-Check -Name "the user's own installation is registered again" -Condition $back -Detail '' | Out-Null
         Assert-Check -Name "the user's Start Menu entries are back" -Condition (Test-Path $group) -Detail $group | Out-Null
         $real = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$AppId" -ErrorAction SilentlyContinue)
         if ($real) {
             Add-Check -Name 'restored registration points at the real installation' `
-                -Status (($real.InstallLocation -notmatch [regex]::Escape($Root)) ? 'PASS' : 'FAIL') `
-                -Detail "$($real.DisplayName) $($real.DisplayVersion) — $($real.InstallLocation)"
+                -Status $(if ($real.InstallLocation -notmatch [regex]::Escape($Root)) { 'PASS' } else { 'FAIL' }) `
+                -Detail "$($real.DisplayName) $($real.DisplayVersion) - $($real.InstallLocation)"
         }
     }
     # The logs are the evidence; keep them and drop everything else.
