@@ -73,16 +73,17 @@ use clap::{Args, Parser, Subcommand};
 /// `ENTANGLED_VERSION` when set, the workspace version otherwise (build.rs).
 const VERSION: &str = env!("ENTANGLED_VERSION");
 
-/// `install --network`'s default: a host TAP on Linux (which is what every
-/// existing script and profile expects), the in-process user-mode NAT on
-/// Windows, which has no TAP and no GPL-free driver that could give it one
-/// (ADR-0002). Declared here rather than in `install` because clap needs it on
-/// every host, including one with no hypervisor backend at all.
-pub const DEFAULT_NETWORK: &str = if cfg!(target_os = "linux") {
-    "tap"
-} else {
-    "usernet"
-};
+/// `install --network`'s default: the in-process user-mode NAT on both hosts
+/// ([`control_api::DEFAULT_NEW_MACHINE_NETWORK`]). It needs nothing from the
+/// host — no TAP interface made as root, no DHCP server beside one, no
+/// administrator — so a machine made with no flags has a working network on
+/// either host, and it is the only backend Windows has (ADR-0002). Until the
+/// installed-network amendment Linux defaulted to `tap`, which failed any
+/// install on a host without `scripts/setup-tap.sh` and gave an Ubuntu guest
+/// (which configures itself by DHCP) no address even on one with it; TAP is
+/// now `--network tap`. Declared here rather than in `install` because clap
+/// needs it on every host, including one with no hypervisor backend at all.
+pub const DEFAULT_NETWORK: &str = "usernet";
 
 #[derive(Parser)]
 #[command(
@@ -371,10 +372,12 @@ pub struct InstallArgs {
     /// Host TAP interface (see scripts/setup-tap.sh), for --network tap.
     #[arg(long, default_value = "entangled0")]
     pub interface: String,
-    /// Installer network: "tap" (a host interface, Linux only), "usernet"
-    /// (user-mode NAT inside this process — no host setup, no administrator) or
-    /// "none" (offline; Ubuntu installs offline anyway). Defaults to tap on
-    /// Linux and usernet on Windows, which has no TAP.
+    /// The machine's network, written into the installed profile's
+    /// `[network]` with a MAC of its own: "usernet" (the default — user-mode
+    /// NAT inside this process, no host setup, no administrator), "tap" (a
+    /// host interface, Linux only; see scripts/setup-tap.sh) or "none". Debian
+    /// and Fedora install over it too; Ubuntu installs offline from its ISO
+    /// and only the installed machine gets it.
     #[arg(long, default_value = DEFAULT_NETWORK)]
     pub network: String,
     /// VM/profile name (defaults to the disk file stem).

@@ -484,6 +484,116 @@ fn a_dns_answer_from_the_wrong_source_is_not_delivered() {
     );
 }
 
+/// A DNS message: `id`, flags, one question for `name` (type A, class IN),
+/// `answers` claimed in the header and `extra` bytes of "records" after it.
+fn dns_message(id: u16, flags: u16, name: &str, answers: u16, extra: usize) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.extend_from_slice(&id.to_be_bytes());
+    m.extend_from_slice(&flags.to_be_bytes());
+    m.extend_from_slice(&1u16.to_be_bytes());
+    m.extend_from_slice(&answers.to_be_bytes());
+    m.extend_from_slice(&0u16.to_be_bytes());
+    m.extend_from_slice(&1u16.to_be_bytes());
+    for label in name.split('.') {
+        m.push(u8::try_from(label.len()).expect("a short label"));
+        m.extend_from_slice(label.as_bytes());
+    }
+    m.push(0);
+    m.extend_from_slice(&[0, 1, 0, 1]);
+    m.extend(std::iter::repeat_n(0xa5, extra));
+    m
+}
+
+/// Asks the relay one question and has the fake resolver answer `answer`,
+/// returning what the relay would deliver to the guest.
+fn relay_round_trip(answer: &[u8]) -> Option<Vec<u8>> {
+    let resolver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a fake resolver");
+    resolver
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("a read timeout can be set");
+    let mut relay = DnsRelay::new(resolver.local_addr().expect("an address"));
+    assert!(relay.forward(5353, &answer[..2]));
+    let mut buf = [0u8; 64];
+    let (_, from) = resolver.recv_from(&mut buf).expect("the query arrives");
+    resolver.send_to(answer, from).expect("answer the query");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some((port, reply)) = relay.poll() {
+            assert_eq!(port, 5353);
+            return Some(reply);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// **An answer longer than 512 bytes arrives whole.** Resolvers ask for up to
+/// 1232 or 4096 bytes through EDNS0, and the relay used to read into a 512-byte
+/// buffer — which on Windows *discards* a longer datagram (`WSAEMSGSIZE`) and on
+/// Linux cuts it short. Either way a CDN name with a long CNAME chain did not
+/// resolve.
+#[test]
+fn a_dns_answer_longer_than_512_bytes_is_delivered_whole() {
+    let answer = dns_message(0x4242, 0x8180, "www.example.com", 9, 1100);
+    assert!(answer.len() > 512 && answer.len() <= MAX_DNS_TO_GUEST);
+    assert_eq!(relay_round_trip(&answer).as_deref(), Some(&answer[..]));
+}
+
+/// **An answer too long for one frame comes back truncated, as DNS says.** The
+/// segment has no fragmentation, so a 3000-byte answer cannot reach the guest
+/// as it is. It gets the header with TC set and its own question, no records —
+/// what a resolver answers by retrying over TCP, which the NAT carries to the
+/// upstream (`tcp::tests::dns_over_tcp_to_the_gateway_reaches_the_upstream_resolver`).
+#[test]
+fn a_dns_answer_too_long_for_a_frame_is_truncated_with_tc() {
+    let answer = dns_message(0x4343, 0x8180, "big.example.org", 40, 3000);
+    let question_end = 12 + "big.example.org".len() + 2 + 4;
+    let reply = relay_round_trip(&answer).expect("a truncated reply, not silence");
+    assert_eq!(reply.len(), question_end);
+    assert_eq!(&reply[..2], &answer[..2], "the transaction id");
+    assert_eq!(
+        reply[2],
+        answer[2] | 0x02,
+        "TC set, the rest of the flags kept"
+    );
+    assert_eq!(reply[3], answer[3]);
+    assert_eq!(&reply[4..6], &[0, 1], "the question count");
+    assert_eq!(&reply[6..12], &[0; 6], "no records claimed");
+    assert_eq!(
+        &reply[12..],
+        &answer[12..question_end],
+        "the question verbatim"
+    );
+    assert!(reply.len() <= MAX_DNS_TO_GUEST);
+}
+
+/// The truncation walks upstream bytes, which are as untrusted as the guest's:
+/// a question that runs off the end, a reserved label type, a header that is
+/// not there at all — each is `None` (dropped), never a panic or an overread.
+/// A compression pointer ends a name, as it does in any DNS message.
+#[test]
+fn a_malformed_long_dns_answer_is_dropped_not_misread() {
+    assert_eq!(truncated_dns_reply(&[0x12, 0x34, 0x81]), None);
+    let mut off_the_end = dns_message(1, 0x8180, "a.example", 1, 0);
+    off_the_end.truncate(15);
+    assert_eq!(truncated_dns_reply(&off_the_end), None);
+    let mut reserved = dns_message(1, 0x8180, "a.example", 1, 0);
+    reserved[12] = 0x41; // 0b01 in the top bits: a reserved label type
+    assert_eq!(truncated_dns_reply(&reserved), None);
+    let mut many_questions = dns_message(1, 0x8180, "a.example", 1, 0);
+    many_questions[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
+    assert_eq!(truncated_dns_reply(&many_questions), None);
+
+    let mut pointer = dns_message(7, 0x8180, "x", 1, 2000)[..12].to_vec();
+    pointer.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+    pointer.extend(std::iter::repeat_n(0, 2000));
+    let reply = truncated_dns_reply(&pointer).expect("a pointer ends the name");
+    assert_eq!(reply.len(), 18);
+    assert_eq!(reply[2] & 0x02, 0x02);
+}
+
 /// **UDP is DHCP and DNS, and nothing else.** There is no general UDP NAT here:
 /// anything else the guest sends over UDP is counted as unsupported and dropped,
 /// which means QUIC, NTP, mDNS and games are unreachable through this backend.

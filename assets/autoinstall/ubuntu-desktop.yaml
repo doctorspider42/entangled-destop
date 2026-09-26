@@ -25,6 +25,9 @@ autoinstall:
     layout: us
   timezone: Etc/UTC
 
+  # No NIC in the installer, as on the server. The installed desktop gets one
+  # from its profile's [network] section, and NetworkManager configures it by
+  # DHCP with no netplan file of ours (unlike the server's late-commands).
   network:
     version: 2
     ethernets: {}

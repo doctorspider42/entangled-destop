@@ -63,10 +63,12 @@ Nothing in the installer is Windows-specific. What made it Linux-only was a
 reasoning are in ADR-0002's phase-5 amendment. Two things worth knowing here:
 
 - **The Ubuntu install is offline by design**, so the NAT is not on its critical
-  path at all. `--network` only matters for `install debian`, which is d-i and
-  downloads everything; there `usernet`'s address comes from
-  `virtio_net::UserNetConfig` so the `[network]` section and the
-  `netcfg/get_ipaddress=` clause cannot disagree.
+  path at all — the installer VM has no NIC. `--network` (default `usernet` on
+  both hosts since ADR-0002's installed-network amendment) is written into the
+  *installed* profile, with a MAC of its own, and the installed guest DHCPs on
+  it. For `install debian`, which is d-i and downloads everything, `usernet`'s
+  address comes from `virtio_net::UserNetConfig` so the `[network]` section and
+  the `netcfg/get_ipaddress=` clause cannot disagree.
 - **A profile's own `ip=` clause now wins** over the backend's appended one
   (`run_vm::host_api::direct_linux_cmdline`), which is what makes `ip=dhcp`
   askable — the one way to exercise the usernet DHCP server from a real kernel

@@ -21,6 +21,20 @@
 //! alternative is repacking media whose whole value is that its provenance was
 //! verified.
 //!
+//! # The network: none for the installer, one for the machine
+//!
+//! The installer VM has no NIC. The install is offline by design — every
+//! package comes from the verified ISO's own pool, so it is reproducible, it
+//! takes the ten minutes it was measured at, and no mirror or `updates:
+//! security` download can change what was tested — and the installed machine
+//! gets updates the way any Ubuntu does, with `apt` once it runs. What the
+//! installer does not need, the machine does: the written profile carries
+//! `--network` (usernet unless told otherwise) as a `[network]` section with a
+//! MAC of its own, and the guest configures that NIC by DHCP — NetworkManager
+//! on the Desktop ISO's install, a netplan file the server profile's
+//! late-commands write on the server's (ADR-0002, the installed-network
+//! amendment).
+//!
 //! # Why GRUB gets typed at
 //!
 //! subiquity finds the seed on its own (cloud-init matches the `CIDATA` label),
@@ -47,11 +61,13 @@ use std::path::PathBuf;
 
 use control_api::{
     BootMode, BootSection, DiskSection, DisplaySection, GamepadBackend, GamepadSection,
-    SoundBackend, SoundSection, VirtioTransport, VmConfig,
+    NetworkBackend, NetworkSection, SoundBackend, SoundSection, VirtioTransport, VmConfig,
 };
 
 use crate::disk;
-use crate::install::{installed_refresh_hz_here, installed_vcpus_here, target_disk, vm_name};
+use crate::install::{
+    installed_refresh_hz_here, installed_vcpus_here, net_plan, target_disk, vm_name,
+};
 use crate::paths;
 use crate::run_vm::{self, Automation};
 use crate::seed;
@@ -76,6 +92,24 @@ const INSTALLED_MEMORY_MIB: u64 = 2048;
 const VENUS_MEMORY_MIB: u64 = 4096;
 
 pub fn run(args: &InstallArgs) -> Result<(), String> {
+    // 0. The installed machine's network. Resolved first, like Debian's and
+    //    Fedora's, so `--network tap` on Windows costs nothing but the message
+    //    — although only the machine gets it: the installer runs offline (see
+    //    the module docs).
+    let net = net_plan(&args.network, &args.interface)?;
+    if net
+        .section
+        .as_ref()
+        .is_some_and(|s| s.backend == NetworkBackend::Tap)
+    {
+        tracing::warn!(
+            interface = %args.interface,
+            "an installed Ubuntu configures its NIC by DHCP, and a TAP segment has no DHCP \
+             server unless one is run beside it (scripts/setup-tap.sh --dnsmasq); \
+             --network usernet needs none"
+        );
+    }
+
     // 1. Firmware. Named first because it is the one artifact a fresh host may
     //    not have, and the error has to say how to get it — in terms of what
     //    the person in front of the machine can do (crate::firmware).
@@ -216,6 +250,8 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         .flatten()
         .collect(),
         cdrom: None,
+        // Offline by design (see the module docs): the machine gets its NIC,
+        // the installer does not.
         network: None,
         display: DisplaySection {
             width: 1280,
@@ -315,6 +351,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         firmware,
         nvram.clone(),
         target.clone(),
+        net.machine_section(&vm_name, &target),
         installed_vcpus_here(args),
         installed_refresh_hz_here(args),
     );
@@ -329,6 +366,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
          transcript: {}\n\
          profile:    {}\n\
          machine:    {} vCPUs, {} MiB, {}x{} at {} Hz\n\
+         network:    {}\n\
          run it:     entangled run {}",
         install.esp.index,
         install.esp.sectors() * diskfs::SECTOR / (1 << 20),
@@ -346,6 +384,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         profile.display.width,
         profile.display.height,
         profile.display.refresh_hz,
+        network_summary(profile.network.as_ref()),
         profile_path.display()
     );
     if args.venus {
@@ -358,15 +397,38 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// The profile that boots the *installed* system, with its vCPU count and
-/// refresh rate already decided ([`crate::install::installed_vcpus`],
-/// [`crate::install::installed_refresh_hz`]) so a test can inject them.
+/// The `network:` line of the install summary.
+fn network_summary(network: Option<&NetworkSection>) -> String {
+    match network {
+        None => "none (--network none)".to_string(),
+        Some(section) => {
+            let mac = section.mac.as_deref().unwrap_or("derived from the name");
+            match section.backend {
+                NetworkBackend::Usernet => format!(
+                    "usernet — user-mode NAT, the guest takes its address by DHCP; MAC {mac}"
+                ),
+                NetworkBackend::Tap => format!(
+                    "tap on {} — needs a DHCP server on that segment; MAC {mac}",
+                    section.interface.as_deref().unwrap_or("?")
+                ),
+            }
+        }
+    }
+}
+
+/// The profile that boots the *installed* system, with its network, vCPU
+/// count and refresh rate already decided
+/// ([`crate::install::NetPlan::machine_section`],
+/// [`crate::install::installed_vcpus`], [`crate::install::installed_refresh_hz`])
+/// so a test can inject them.
+#[allow(clippy::too_many_arguments)]
 fn installed_profile(
     args: &InstallArgs,
     vm_name: &str,
     firmware: PathBuf,
     nvram: PathBuf,
     target: PathBuf,
+    network: Option<NetworkSection>,
     vcpus: u32,
     refresh_hz: u32,
 ) -> VmConfig {
@@ -391,7 +453,7 @@ fn installed_profile(
             writable: true,
         }],
         cdrom: None,
-        network: None,
+        network,
         display: installed_display(args.venus, refresh_hz),
         // A desktop with no sound is not a desktop (GAME-2102). `auto` never
         // fails a run: a host with no audio device gets a card that plays into
@@ -770,6 +832,9 @@ mod tests {
             PathBuf::from("CLOUDHV.fd"),
             PathBuf::from("desktop.nvram"),
             PathBuf::from("desktop.raw"),
+            net_plan(&args.network, &args.interface)
+                .expect("a network this host has")
+                .machine_section("desktop", std::path::Path::new("desktop.raw")),
             crate::install::installed_vcpus(args, host_logical_cpus),
             crate::install::installed_refresh_hz(args, monitor_hz),
         )
@@ -864,6 +929,53 @@ mod tests {
             12,
             "past the default's ceiling"
         );
+    }
+
+    /// The installed machine has a network by default — the gap the
+    /// installed-network amendment closed: usernet with a MAC of its own,
+    /// valid as written and read back exactly. `--network none` still means
+    /// none; on Linux `--network tap` names its interface.
+    #[test]
+    fn the_installed_machine_is_networked_by_default() {
+        let args = desktop_args(true);
+        let cfg = profile_for(&args, 24);
+        let network = cfg
+            .network
+            .as_ref()
+            .expect("a [network] section by default");
+        assert_eq!(network.backend, NetworkBackend::Usernet);
+        assert_eq!(network.interface, None);
+        let mac = network.mac.clone().expect("a MAC of its own");
+        assert_eq!(
+            mac,
+            control_api::new_machine_mac("desktop", std::path::Path::new("desktop.raw"))
+        );
+        let text = toml::to_string_pretty(&cfg).expect("serialises");
+        assert!(
+            text.contains(&format!(
+                "[network]\nbackend = \"usernet\"\nmac = \"{mac}\""
+            )),
+            "{text}"
+        );
+        assert_eq!(VmConfig::from_toml(&text).expect("valid"), cfg);
+        assert!(network_summary(cfg.network.as_ref()).starts_with("usernet"));
+
+        let mut offline = desktop_args(true);
+        offline.network = "none".into();
+        let cfg = profile_for(&offline, 24);
+        assert_eq!(cfg.network, None);
+        assert!(!toml::to_string_pretty(&cfg).unwrap().contains("[network]"));
+        assert!(network_summary(None).starts_with("none"));
+
+        if cfg!(target_os = "linux") {
+            let mut tap = desktop_args(true);
+            tap.network = "tap".into();
+            let cfg = profile_for(&tap, 24);
+            let network = cfg.network.as_ref().expect("a tap section");
+            assert_eq!(network.backend, NetworkBackend::Tap);
+            assert_eq!(network.interface.as_deref(), Some("entangled0"));
+            assert!(network_summary(Some(network)).contains("DHCP server"));
+        }
     }
 
     #[test]

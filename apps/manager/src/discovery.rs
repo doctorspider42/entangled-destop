@@ -313,7 +313,12 @@ pub fn delete(
 /// wizard's choices survive the install (the CLI hardcodes 2048 MiB / 2 vCPUs),
 /// and `[display] refresh_hz` with this host's monitor default: the CLI
 /// derives the same number natively, but a WSL engine sees no monitor and
-/// writes 60 (ADR-0004, the high-refresh amendment). Every other key is kept.
+/// writes 60 (ADR-0004, the high-refresh amendment). And the machine's
+/// network, when the profile has none: the wizard always asks for
+/// [`control_api::DEFAULT_NEW_MACHINE_NETWORK`], so a missing `[network]` means
+/// an engine older than ADR-0002's installed-network amendment (whose Ubuntu
+/// profiles had none), and the machine gets what a current engine writes —
+/// usernet with a MAC of its own. Every other key is kept.
 pub fn apply_resources(
     profile: &Path,
     memory_mib: u64,
@@ -322,12 +327,28 @@ pub fn apply_resources(
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(profile).map_err(|e| e.to_string())?;
     let mut cfg = VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
-    if cfg.memory_mib == memory_mib && cfg.vcpus == vcpus && cfg.display.refresh_hz == refresh_hz {
+    if cfg.memory_mib == memory_mib
+        && cfg.vcpus == vcpus
+        && cfg.display.refresh_hz == refresh_hz
+        && cfg.network.is_some()
+    {
         return Ok(());
     }
     cfg.memory_mib = memory_mib;
     cfg.vcpus = vcpus;
     cfg.display.refresh_hz = refresh_hz;
+    if cfg.network.is_none() {
+        let disk = cfg
+            .disks
+            .first()
+            .map_or_else(|| profile.to_path_buf(), |d| d.path.clone());
+        cfg.network = Some(control_api::NetworkSection::for_new_machine(
+            control_api::DEFAULT_NEW_MACHINE_NETWORK,
+            None,
+            &cfg.name,
+            &disk,
+        ));
+    }
     let out = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
     std::fs::write(profile, out).map_err(|e| e.to_string())
 }
@@ -703,6 +724,38 @@ interface = "entangled0"
             "boot section preserved"
         );
         assert!(text.contains("entangled0"), "network section preserved");
+    }
+
+    /// A profile an older engine wrote without `[network]` (every Ubuntu
+    /// install before the installed-network amendment) gets the one a current
+    /// engine writes: usernet, with the MAC `entangled install` would have
+    /// given that machine. One that has a network keeps it, untouched.
+    #[test]
+    fn apply_resources_networks_a_machine_an_older_engine_left_offline() {
+        let dir = temp_dir("apply-network");
+        let profile = write_vm(&dir, "offline", 128);
+        let text = std::fs::read_to_string(&profile).expect("read");
+        let mut cfg = VmConfig::from_toml(&text).expect("valid");
+        cfg.network = None;
+        std::fs::write(&profile, toml::to_string_pretty(&cfg).unwrap()).expect("write");
+
+        apply_resources(&profile, cfg.memory_mib, cfg.vcpus, cfg.display.refresh_hz)
+            .expect("apply");
+        let after = VmConfig::from_toml(&std::fs::read_to_string(&profile).unwrap()).unwrap();
+        let network = after.network.expect("a [network] section now");
+        assert_eq!(network.backend, control_api::NetworkBackend::Usernet);
+        assert_eq!(network.interface, None);
+        assert_eq!(
+            network.mac,
+            Some(control_api::new_machine_mac("offline", &cfg.disks[0].path))
+        );
+
+        // A tap profile stays tap: only a missing section is filled.
+        let tap = write_vm(&dir, "wired", 128);
+        let before = std::fs::read_to_string(&tap).unwrap();
+        let cfg = VmConfig::from_toml(&before).unwrap();
+        apply_resources(&tap, cfg.memory_mib, cfg.vcpus, cfg.display.refresh_hz).unwrap();
+        assert_eq!(std::fs::read_to_string(&tap).unwrap(), before);
     }
 
     #[test]

@@ -38,9 +38,13 @@ autoinstall:
     layout: us
   timezone: Etc/UTC
 
-  # No NIC at all. An empty netplan is valid and means "configure nothing",
-  # which is what an offline install wants; the installed system can be given a
-  # network later through the VM profile's [network] section.
+  # The *installer* has no NIC at all. An empty netplan is valid and means
+  # "configure nothing", which is what an offline install wants. The installed
+  # system does get one — `entangled install` writes a [network] section into
+  # its profile — and the late-commands below give it the netplan file that
+  # configures it, because an installer that saw no NIC configures none.
+  # (The Desktop profile needs no such file: NetworkManager brings up any
+  # wired NIC it finds by DHCP on its own.)
   network:
     version: 2
     ethernets: {}
@@ -114,6 +118,26 @@ autoinstall:
       'GRUB_TIMEOUT_STYLE=menu'
       >> /target/etc/default/grub
     - curtin in-target -- update-grub
+    # The installed server's network: DHCP on whatever virtio NIC the VM
+    # profile's [network] section gives it (usernet's DHCP server, by default).
+    # Matched by name pattern rather than by name, because the NIC's PCI slot
+    # — and so its enp0sN name — follows the disks, and the installed machine
+    # has fewer disks than the installer. `optional` so a profile with no
+    # [network] at all does not hold the boot in systemd-networkd-wait-online.
+    # 0600: netplan warns about (and future releases refuse) a readable file.
+    - >-
+      printf '%s\n'
+      '# Entangled: DHCP on the VM profile NIC (ADR-0002, installed network)'
+      'network:'
+      '  version: 2'
+      '  ethernets:'
+      '    entangled:'
+      '      match:'
+      '        name: "en*"'
+      '      dhcp4: true'
+      '      optional: true'
+      > /target/etc/netplan/90-entangled.yaml
+    - chmod 600 /target/etc/netplan/90-entangled.yaml
 
   # Power off rather than reboot when the install finishes: an orderly systemd
   # poweroff writes S5 to the ACPI PM1a control register, which this machine

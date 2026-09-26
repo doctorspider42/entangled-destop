@@ -222,10 +222,11 @@ sudo scripts/setup-tap.sh --down             # remove it again
   `interface = "entangled1"` in its profile).
 - *No such device* — it was never created, or a reboot removed it.
 
-Or sidestep all of it: `backend = "usernet"` in the profile (`--network usernet`
-for an install) runs a NAT inside the `entangled` process. No host interface, no
-root, works identically on both hosts. It does outbound TCP, UDP, DHCP and DNS;
-what it does not do is let anything connect *in*.
+Or sidestep all of it: `backend = "usernet"` in the profile — what every
+install writes unless it was given `--network tap` — runs a NAT inside the
+`entangled` process. No host interface, no root, works identically on both
+hosts. It does outbound TCP, DHCP and DNS (no other UDP); what it does not do
+is let anything connect *in*. See the user guide's *Networking* section.
 
 ## The guest filesystem is corrupt
 

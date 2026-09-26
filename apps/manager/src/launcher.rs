@@ -318,9 +318,12 @@ impl NewMachine {
 /// (`artifacts/bootstrap/vmlinuz`, `artifacts/firmware/CLOUDHV.fd`), and writes
 /// the firmware path into the profile it generates.
 ///
-/// `--network` is deliberately not passed: the CLI's per-host default is the
-/// right answer (TAP on Linux, the in-process user-mode NAT on Windows), and a
-/// GUI that pinned it would be wrong on one of the two hosts.
+/// `--network` is passed as [`control_api::DEFAULT_NEW_MACHINE_NETWORK`] —
+/// usernet, the default the CLI itself has on both hosts since ADR-0002's
+/// installed-network amendment. Spelled out because the engine may be an older
+/// WSL release whose own default was TAP on Linux, which fails on a host
+/// without `scripts/setup-tap.sh`; every release since phase 5 knows usernet.
+/// The editor offers the other choices once the machine exists.
 pub fn install_spec(
     runner: &Runner,
     vm_dir: &Path,
@@ -360,6 +363,8 @@ pub fn install_spec(
     if machine.headless {
         args.push("--headless".to_string());
     }
+    args.push("--network".to_string());
+    args.push(control_api::DEFAULT_NEW_MACHINE_NETWORK.to_string());
 
     let (program, args) = runner.command(&cwd, args)?;
     Ok(TaskSpec {
@@ -717,8 +722,8 @@ mod tests {
             line.contains("--size 20G") && line.contains("--name demo"),
             "{line}"
         );
-        // The network is the CLI's per-host decision, never the GUI's.
-        assert!(!line.contains("--network"), "{line}");
+        // The one default on both hosts, spelled out for an older engine.
+        assert!(line.contains("--network usernet"), "{line}");
     }
 
     /// Which artifact blocks which installer. The Ubuntu path must not be gated

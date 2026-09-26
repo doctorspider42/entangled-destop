@@ -271,7 +271,7 @@ entangled doctor
     bootstrap initrd artifacts/bootstrap/initrd.img (197 KiB)
     ubuntu ISO      /home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-live-server-amd64.iso (2.7 GiB)
     VM directory    /home/you/entangled-vms (781 GiB free of 1007 GiB)
-    network         --network tap by default on this host
+    network         --network usernet by default on this host
 host looks ready to run VMs
 ```
 
@@ -365,9 +365,11 @@ and leaves four files beside the disk:
 entangled run ~/entangled-vms/ubuntu.toml
 ```
 
-The first boot takes a couple of minutes: cloud-init generates SSH host keys,
-and a machine with no network card waits out two systemd timeouts before the
-login prompt. The built-in answer files create one user, **`entangled` with the
+The first boot takes a couple of minutes while cloud-init generates SSH host
+keys. The machine has a network card — every installed machine does, on the
+user-mode NAT (see [Networking](#networking)) — and takes its address by DHCP,
+so `apt update` works from the first login even though the install itself
+never touched the network. The built-in answer files create one user, **`entangled` with the
 password `entangled`** (a sudoer, in both the server and the desktop profile)
 — a demo credential, so change it with `passwd` on any machine you keep. Add `--headless` to keep it on the terminal instead of opening a
 window.
@@ -447,10 +449,11 @@ GNOME to put on the GPU.
 The first boot ends at GDM's login screen, already composited on the GPU; log
 in as `entangled`, password `entangled`. Measured on Windows (RTX 2070) with the
 Ubuntu 26.04.1 Desktop ISO: the install took 10 min 38 s, and the installed
-guest reached its login prompt about 40 s after `entangled run`. The written
-profile has no `[network]` section, like every `install ubuntu` profile; add
-`backend = "usernet"` under `[network]` for a machine that can reach the
-internet.
+guest reached its login prompt about 40 s after `entangled run`. Like every
+installed machine it has a network card on the user-mode NAT, so Firefox and
+`apt` reach the internet from the first login (see [Networking](#networking)).
+Profiles written before that — by an older `entangled` — have no `[network]`
+section; add `backend = "usernet"` under `[network]` to give one a card.
 
 **The host needs a Vulkan device** with `VK_EXT_external_memory_host`, and on
 Windows `VK_KHR_external_memory_win32` for GNOME itself to composite on the GPU.
@@ -509,9 +512,9 @@ suspended while the guest holds GPU objects (which, with a desktop, is always):
 ## Quickstart: Fedora Workstation
 
 Same shape, one difference that matters: the Fedora netinst image installs *from
-the network*, so the installer VM needs one. `--network usernet` gives it a
-user-mode NAT that runs inside the `entangled` process — no TAP, no root, no
-host configuration.
+the network*, so the installer VM needs one. The default, `--network usernet`,
+gives it a user-mode NAT that runs inside the `entangled` process — no TAP, no
+root, no host configuration — and the installed machine keeps it.
 
 ```bash
 bash scripts/fetch-fedora-iso.sh netinst      # once, ~1.2 GiB, verified
@@ -555,7 +558,7 @@ entangled run ~/entangled-vms/debian.toml
 ```
 
 ```powershell
-# The same commands on Windows, where --network usernet is the default.
+# The same commands on Windows. --network usernet is the default on both hosts.
 entangled fetch bootstrap-kernel
 entangled install debian --disk C:\Users\you\entangled-vms\debian.raw --size 32G --auto
 entangled run C:\Users\you\entangled-vms\debian.toml
@@ -570,8 +573,12 @@ outcome, and `--refresh` re-checks the signed sums, which is how a new point
 release is picked up.
 
 The Debian installer needs a package mirror, so this path needs working
-networking: `--network usernet` for the in-process NAT, or `--network tap` with
-a host interface created once by `scripts/setup-tap.sh`.
+networking: the default `--network usernet` (the in-process NAT), or
+`--network tap` with a host interface created once by `scripts/setup-tap.sh`
+(Linux). d-i configures the installed system with a static address on the
+segment it installed over, so a Debian machine installed on one backend keeps
+that address — moving it to the other means editing
+`/etc/network/interfaces` in the guest as well as the profile.
 
 ### The guest bootstrap artifacts
 
@@ -761,6 +768,79 @@ get as far as asking for rumble, whatever the host could do with the request.
 Both halves of that are checked against a real guest kernel on every test run,
 so the day it changes, we will be told.
 
+### Networking
+
+Every machine `entangled install` makes has a network card, and unless you
+pass `--network` it is on the **user-mode NAT** (`usernet`), on Linux and on
+Windows alike. It needs nothing from the host — no interface created as root,
+no DHCP server, no administrator — and the profile says so, with a MAC
+address of the machine's own:
+
+```toml
+[network]
+backend = "usernet"
+mac = "52:ad:f5:d7:2e:58"  # written once at install, derived from name and disk
+```
+
+The MAC is fixed at install so the guest's view of its card never changes: it
+survives renaming the machine and is different for every machine, including
+two with the same name in different directories. A profile without `mac` gets
+one derived from the machine's name, as before.
+
+`--network` chooses something else at install time, and the manager's editor
+(*Network & display*) changes it afterwards:
+
+| `--network` | The machine gets |
+|---|---|
+| `usernet` (default) | the in-process NAT, below |
+| `tap` | the host TAP interface `--interface` (default `entangled0`), made once by `scripts/setup-tap.sh`. Linux only. A TAP segment has no DHCP server unless you run one (`scripts/setup-tap.sh --dnsmasq` prints the configuration), so an Ubuntu or Fedora guest, which asks DHCP for its address, needs one |
+| `none` | no network card at all. Refused for Debian and Fedora, whose installers download everything |
+
+The Ubuntu *installer* runs with no network card whatever `--network` says:
+everything it installs comes from the verified ISO, which keeps the install
+reproducible and its time the ten minutes it was measured at. Updates come
+afterwards, through `apt`, like on any Ubuntu. Debian and Fedora install over
+the network they are given.
+
+**What the guest sees.** One Ethernet segment, `192.168.74.0/24`, with one
+other host on it: the `entangled` process at `192.168.74.1`, which is the
+guest's router, DHCP server and DNS server. The guest is always
+`192.168.74.15`, leased for an hour, whatever the host's own network looks
+like. Two machines each have their own segment and cannot see each other.
+
+**What works:** outbound TCP to anywhere — the web, `apt`, `git`, `ssh` out —
+and DNS, over UDP and TCP, which the NAT relays to `1.1.1.1`. A ping of
+`192.168.74.1` is answered.
+
+**What does not:** UDP other than DHCP and DNS (so no NTP — the guest's clock
+comes from the host's RTC at boot and `timedatectl` reports it unsynchronised;
+no QUIC, which browsers fall back from to TCP; no game traffic), a ping to
+anything past the gateway, IPv6 (the guest has a link-local address only, and
+programs use IPv4), and anything *inbound*: there is no port forwarding yet.
+
+**What the guest can reach on the host.** Not the host's loopback: a service
+bound to `127.0.0.1` on the host is invisible from the guest, whether it asks
+for `127.0.0.1` (its own loopback), `192.168.74.1` (refused by the NAT) or the
+host's LAN address (nothing listens there). A service bound to one of the
+host's other addresses, or to all of them (`0.0.0.0`), *is* reachable — at
+that address, exactly as it is from any other machine on that network — and
+so is the rest of the host's LAN. That is the same exposure as any machine on
+the LAN has, not more; the NAT only closes the doors a LAN machine could not
+open.
+
+**DNS goes to `1.1.1.1`**, not to the host's own resolver: on a network that
+blocks outside DNS servers (some corporate ones do), names do not resolve in
+the guest even though the host resolves them. Names only the host's resolver
+knows (a VPN's internal zone, `/etc/hosts`, a `.local` name) do not resolve
+either.
+
+**How fast.** Measured on the Windows development host: a 1 GiB HTTPS
+download ran at **53 MB/s** in the guest, where the host itself fetched the
+same file at 84 MB/s a few minutes earlier, and the `entangled` process used
+about half to two thirds of one CPU core doing it (46-65 %, the guest's own
+vCPU time included; 2-4 % with the guest idle). Until this build a download was held to
+about 1.5-2 MB/s by the NAT itself.
+
 ### Without a window
 
 ```bash
@@ -867,8 +947,10 @@ Things worth knowing about the shape:
   (`/dev/vda`, `/dev/vdb`, …). `writable = false` is enforced twice: the file is
   opened read-only *and* the device advertises itself as read-only and fails
   writes.
-- **`[network]`** picks `backend = "tap"` (Linux only) or `"usernet"`; omit the
-  section for a machine with no network card.
+- **`[network]`** picks `backend = "tap"` (Linux only, with `interface`) or
+  `"usernet"`, and optionally a fixed `mac` (six hex octets, unicast; installed
+  machines have one written). Omit the section for a machine with no network
+  card. See [Networking](#networking).
 - **`[display]`** sets the initial scanout size (`width`, `height`) and window
   `scale`; the guest can change modes within it. `venus = true` asks for the
   GPU desktop — Vulkan, and OpenGL through Zink, on the host's Vulkan device,
@@ -1156,13 +1238,15 @@ configuration:
    suspend — so the file is about the size of the guest's touched RAM.
 7. **A resumed guest loses some things by construction**: network connections,
    3D contexts, in-flight audio, and the wall clock (the RTC comes from the host,
-   so a guest suspended for an hour resumes an hour behind and corrects itself
-   over NTP).
+   so a guest suspended for an hour resumes an hour behind; over NTP it corrects
+   itself, but the user-mode NAT carries no NTP, so on `usernet` it stays behind
+   until its next boot).
 8. **TAP networking is Linux-only.** On Windows the user-mode NAT is the only
-   backend — which is also the option that needs no administrator anywhere.
-   The NAT does outbound TCP, UDP, DHCP and DNS; it is not a general-purpose
-   router, and nothing reaches the guest from outside without port forwarding
-   it does not yet have.
+   backend — which is also the option that needs no administrator anywhere,
+   and the default on both hosts. The NAT does outbound TCP, DHCP and DNS
+   (to `1.1.1.1`, not the host's resolver); no other UDP, no IPv6, no ping
+   past the gateway, and nothing reaches the guest from outside without port
+   forwarding it does not yet have. See [Networking](#networking).
 9. **The Windows binaries are unsigned, unverifiable and not on `PATH`.**
     SmartScreen warns, the UAC prompt says *Publisher: Unknown*, and the release
     publishes no checksum or signature to check the download against.

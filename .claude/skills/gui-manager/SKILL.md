@@ -142,14 +142,19 @@ field is empty, and to say *which* firmware a profile with a stale path will
 actually start on, because the CLI falls through rather than refusing.
 The resulting `entangled install <debian|ubuntu> --disk <path> --size <n>G
 [--variant <v>] --memory-mib <max(1536, m)> --name <name> [--iso <path>]
-[--auto] [--headless]` is spawned with the configured working directory.
-`--variant` is Debian-only — `install ubuntu` ignores the flag, and a setting
-that does nothing on the reviewed command line is worse than an absent one.
-`--network` is never passed either: the CLI's per-host default (TAP on Linux,
-usernet on Windows) is right on both hosts and a pinned GUI value would be wrong
-on one. The CLI writes
+[--auto] [--headless] --network usernet` is spawned with the configured
+working directory. `--variant` is Debian-only — `install ubuntu` ignores the
+flag, and a setting that does nothing on the reviewed command line is worse
+than an absent one. `--network` is always
+`control_api::DEFAULT_NEW_MACHINE_NETWORK` (usernet): it is the CLI's own
+default on both hosts since ADR-0002's installed-network amendment, and it is
+spelled out because a WSL engine may be an older release whose Linux default
+was TAP. The CLI writes
 the profile itself with its own resource defaults, so on success the
-manager stamps the wizard's memory/vCPU choice onto the profile
+manager stamps the wizard's memory/vCPU choice onto the profile — and, if the
+profile has no `[network]` (an engine from before that amendment wrote Ubuntu
+profiles without one), the section a current engine would have written:
+usernet plus `control_api::new_machine_mac(name, disk)`
 (`discovery::apply_resources`). `--vcpus` is deliberately **not** passed: the
 manager may be driving an older WSL engine that has no such flag, and the stamp
 already does the job.

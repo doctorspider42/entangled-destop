@@ -156,6 +156,8 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         disk::create_raw(&target, bytes).map_err(|e| e.to_string())?;
         tracing::info!(disk = %target.display(), bytes, "created target disk");
     }
+    // The machine's NIC, for the installer and the installed profile alike.
+    let network = net.machine_section(&vm_name, &target);
 
     // 4. The kickstart volume. Written next to the disk so a failed install can
     //    be inspected — and re-run — without regenerating anything.
@@ -221,7 +223,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         .flatten()
         .collect(),
         cdrom: None,
-        network: net.section.clone(),
+        network: network.clone(),
         display: DisplaySection {
             width: 1280,
             height: 800,
@@ -332,7 +334,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             writable: true,
         }],
         cdrom: None,
-        network: net.section.clone(),
+        network,
         // 1920x1080, the size the project targets (CLAUDE.md) and what the
         // Debian profile always had. 1280x800 was the installer's size carried
         // over, not a decision (install_ubuntu::installed_display says more).
@@ -619,8 +621,9 @@ fn cached_netinst() -> Option<PathBuf> {
 /// Why the installer VM never got going, with the one piece of advice that is
 /// almost always the answer on a fresh Linux host.
 ///
-/// `--network` defaults to a host TAP there, and a TAP is state somebody has to
-/// create as root (`scripts/setup-tap.sh`). The Ubuntu install never meets this
+/// `--network tap` names a host TAP, and a TAP is state somebody has to create
+/// as root (`scripts/setup-tap.sh`) — it was the Linux default until ADR-0002's
+/// installed-network amendment made usernet the default on both hosts. The Ubuntu install never meets this
 /// because its installer VM has no network at all; a netinst cannot do that, so
 /// the first thing an unprepared host sees is an opaque "Operation not
 /// permitted" half a second in. Say what to type instead of leaving the errno
@@ -629,10 +632,10 @@ fn installer_failure(network: &str, interface: &str, error: &str) -> String {
     if network.eq_ignore_ascii_case("tap") {
         format!(
             "installer VM failed: {error}\n\
-             A Fedora netinst must have a network, and --network defaults to the host TAP \
-             interface '{interface}' on Linux. Either create it (bash scripts/setup-tap.sh) \
-             or pass --network usernet, which is user-mode NAT inside this process and needs \
-             no host setup at all."
+             A Fedora netinst must have a network, and --network tap names the host TAP \
+             interface '{interface}'. Either create it (bash scripts/setup-tap.sh) or pass \
+             --network usernet (the default), which is user-mode NAT inside this process and \
+             needs no host setup at all."
         )
     } else {
         format!("installer VM failed: {error}")
@@ -823,8 +826,8 @@ mod tests {
         assert!(text.contains("rootpw --lock"));
     }
 
-    /// The TAP default is the one failure every unprepared Linux host hits, and
-    /// it hits it in the first second — so the message has to carry the fix.
+    /// TAP is the one failure every unprepared Linux host hits, and it hits it
+    /// in the first second — so the message has to carry the fix.
     #[test]
     fn a_tap_installer_failure_names_the_alternative() {
         let tap = installer_failure(

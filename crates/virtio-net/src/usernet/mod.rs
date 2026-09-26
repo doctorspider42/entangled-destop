@@ -229,6 +229,11 @@ impl ToGuest {
         true
     }
 
+    /// Frames waiting now.
+    fn len(&self) -> usize {
+        self.frames.lock().map_or(0, |frames| frames.len())
+    }
+
     fn pop(&self, buf: &mut [u8]) -> Option<usize> {
         let mut frames = self.frames.lock().ok()?;
         let frame = frames.pop_front()?;
@@ -281,6 +286,10 @@ struct DnsRelay {
     socket: Option<UdpSocket>,
     upstream: SocketAddr,
     queries: VecDeque<DnsQuery>,
+    /// The receive buffer, [`MAX_DNS_DATAGRAM`] bytes, made once with the
+    /// socket: the pump polls every tick, and a 64 KiB allocation per tick
+    /// would be the relay's whole cost.
+    buf: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -296,6 +305,7 @@ impl DnsRelay {
             socket: None,
             upstream,
             queries: VecDeque::new(),
+            buf: Vec::new(),
         }
     }
 
@@ -352,18 +362,29 @@ impl DnsRelay {
     fn poll(&mut self) -> Option<(u16, Vec<u8>)> {
         self.expire();
         let socket = self.socket.as_ref()?;
-        // A DNS reply over UDP is capped at 512 bytes without EDNS0, and this relay
-        // does not advertise a larger receive size on the guest's behalf; anything
-        // longer is truncated by the host stack, which is exactly what a resolver
-        // handles by retrying over TCP.
-        let mut buf = vec![0u8; 512];
-        let (len, from) = socket.recv_from(&mut buf).ok()?;
+        // The whole datagram, however large. The guest's query usually carries an
+        // EDNS0 option asking for up to 1232 or 4096 bytes, and the upstream
+        // answers to that size. A 512-byte buffer — what this relay had — loses
+        // every such answer: Windows fails the read (`WSAEMSGSIZE`) and discards
+        // the datagram, Linux silently cuts it into a message that no longer
+        // parses. Either way the lookup times out. What does not fit in one of
+        // the guest's frames is sent back truncated with TC set instead, which a
+        // resolver answers by asking again over TCP (see `tcp::TcpNat`).
+        if self.buf.len() != MAX_DNS_DATAGRAM {
+            self.buf = vec![0u8; MAX_DNS_DATAGRAM];
+        }
+        let (len, from) = socket.recv_from(&mut self.buf).ok()?;
         if from != self.upstream {
             // Not from the resolver we asked. Dropped rather than delivered: this
             // socket is only ever used for one destination.
             return None;
         }
-        buf.truncate(len);
+        let message = self.buf.get(..len)?;
+        let buf = if message.len() > MAX_DNS_TO_GUEST {
+            truncated_dns_reply(message)?
+        } else {
+            message.to_vec()
+        };
         let &[hi, lo, ..] = buf.get(..2)? else {
             return None;
         };
@@ -382,6 +403,59 @@ impl DnsRelay {
     fn is_busy(&self) -> bool {
         !self.queries.is_empty()
     }
+}
+
+/// The largest datagram the relay reads from the upstream resolver: all of one.
+const MAX_DNS_DATAGRAM: usize = 65_535;
+
+/// The largest DNS message one frame to the guest can carry: the frame less
+/// its Ethernet, IPv4 and UDP headers. The segment has no fragmentation.
+pub const MAX_DNS_TO_GUEST: usize = MAX_FRAME_LEN - ETH_HEADER_LEN - 20 - 8;
+
+/// A DNS answer too long for the guest's segment, cut down to what RFC 1035
+/// §4.2.1 says to send instead: the header with TC ("truncated") set and the
+/// question, no records. A resolver retries such an answer over TCP, and a
+/// stub resolver (glibc) only accepts it if the question matches its own, so
+/// the question section is kept verbatim — walked label by label with every
+/// read bounds-checked, because the upstream is as untrusted as the guest.
+/// `None` for a message whose question cannot be walked: it is dropped, which
+/// the guest sees as a lost reply and retries.
+fn truncated_dns_reply(message: &[u8]) -> Option<Vec<u8>> {
+    const HEADER: usize = 12;
+    let header = message.get(..HEADER)?;
+    let questions = u16::from_be_bytes([header[4], header[5]]);
+    let mut at = HEADER;
+    for _ in 0..questions {
+        // QNAME: length-prefixed labels ending in a zero byte, or in a
+        // two-byte compression pointer (0b11 in the top bits).
+        loop {
+            let len = *message.get(at)?;
+            match len {
+                0 => {
+                    at += 1;
+                    break;
+                }
+                l if l & 0xc0 == 0xc0 => {
+                    at += 2;
+                    break;
+                }
+                l if l & 0xc0 != 0 => return None,
+                l => at += 1 + usize::from(l),
+            }
+            if at > MAX_DNS_TO_GUEST {
+                return None;
+            }
+        }
+        at += 4; // QTYPE, QCLASS
+    }
+    let mut reply = message.get(..at)?.to_vec();
+    if reply.len() > MAX_DNS_TO_GUEST {
+        return None;
+    }
+    reply[2] |= 0x02; // TC
+                      // ANCOUNT, NSCOUNT, ARCOUNT: nothing follows the question now.
+    reply[6..HEADER].fill(0);
+    Some(reply)
 }
 
 /// The router: everything that decides what a frame means.
@@ -708,8 +782,9 @@ impl Router {
             );
         }
         if let Some(dst_mac) = self.guest_mac {
+            let room = MAX_QUEUED_FRAMES.saturating_sub(out.len());
             self.tcp
-                .poll(dst_mac, &mut |frame| queue(out, stats, frame));
+                .poll_with_budget(dst_mac, room, &mut |frame| queue(out, stats, frame));
         }
         self.dns.is_busy() || self.tcp.is_busy()
     }
