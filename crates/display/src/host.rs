@@ -53,6 +53,9 @@ pub struct DisplayHost {
     /// Whether the window should open a GPU that can present a renderer's
     /// scanout itself ([`Self::with_shared_scanout`]).
     share: bool,
+    /// The refresh rate the guest is told (`[display] refresh_hz`), to say
+    /// how it sits against the window's monitor ([`Self::with_guest_refresh`]).
+    guest_refresh_hz: Option<u32>,
 }
 
 impl DisplayHost {
@@ -74,7 +77,19 @@ impl DisplayHost {
             event_loop,
             shared: SharedSlot::default(),
             share: false,
+            guest_refresh_hz: None,
         })
+    }
+
+    /// Tells the window the refresh rate the guest's EDID advertises, so it
+    /// can say — once, when it opens — what that rate looks like on the
+    /// monitor it opened on (ADR-0004, the high-refresh amendment): a warning
+    /// when the guest composites more frames than the monitor can show, a
+    /// note on the cadence otherwise ([`crate::refresh::refresh_sentence`]).
+    #[must_use]
+    pub fn with_guest_refresh(mut self, refresh_hz: u32) -> Self {
+        self.guest_refresh_hz = Some(refresh_hz);
+        self
     }
 
     /// Asks the window for **shared presentation** (ADR-0004, zero-copy
@@ -142,6 +157,7 @@ impl DisplayHost {
             event_loop,
             shared,
             share,
+            guest_refresh_hz,
         } = self;
         let mut app = App {
             config,
@@ -165,6 +181,8 @@ impl DisplayHost {
             mode: ScaleMode::default(),
             reporter: StatsReporter::default(),
             fatal: None,
+            guest_refresh_hz,
+            seen_frames: 0,
         };
         event_loop.run_app(&mut app)?;
         match app.fatal.take() {
@@ -229,6 +247,11 @@ struct App {
     mode: ScaleMode,
     reporter: StatsReporter,
     fatal: Option<DisplayError>,
+    /// The guest's advertised refresh, for the one sentence at window
+    /// creation.
+    guest_refresh_hz: Option<u32>,
+    /// Guest frames already accounted for ([`Waker::frames`]).
+    seen_frames: u64,
 }
 
 impl App {
@@ -280,12 +303,24 @@ impl App {
             window.set_cursor(cursors.arrow.clone());
         }
         let size = window.inner_size();
+        let monitor_mhz = window
+            .current_monitor()
+            .or_else(|| event_loop.primary_monitor())
+            .and_then(|m| m.refresh_rate_millihertz());
         tracing::info!(
             width = size.width,
             height = size.height,
             scale_factor = window.scale_factor(),
+            monitor_hz = monitor_mhz.map(|m| f64::from(m) / 1000.0),
             "window created"
         );
+        if let Some(guest_hz) = self.guest_refresh_hz {
+            match crate::refresh::refresh_sentence(guest_hz, monitor_mhz) {
+                Some((true, sentence)) => tracing::warn!("{sentence}"),
+                Some((false, sentence)) => tracing::info!("{sentence}"),
+                None => {}
+            }
+        }
         let renderer = Renderer::new(
             Arc::clone(&window),
             self.guest_size.0,
@@ -343,8 +378,23 @@ impl App {
         self.sync_cursor();
     }
 
-    /// Uploads the dirty rect and presents (backlog MVP-704/705/706).
+    /// One redraw, and the guest frames it accounts for: every frame
+    /// published since the last draw but the newest was never drawn, and the
+    /// newest neither if nothing was presented ([`FrameStats::unshown`]).
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
+        let published = self.waker.frames();
+        let arrived = published.saturating_sub(self.seen_frames);
+        self.seen_frames = published;
+        let before = self.frame_stats().frames;
+        self.draw_frame(event_loop);
+        let presented = self.frame_stats().frames > before;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.note_guest_frames(arrived, presented);
+        }
+    }
+
+    /// Uploads the dirty rect and presents (backlog MVP-704/705/706).
+    fn draw_frame(&mut self, event_loop: &ActiveEventLoop) {
         self.waker.clear();
         if self.renderer.is_none() {
             return;
@@ -756,6 +806,8 @@ impl ApplicationHandler<HostEvent> for App {
         tracing::info!(
             frames = stats.frames,
             shared_frames = stats.shared_frames,
+            guest_frames = stats.guest_frames,
+            unshown = stats.unshown,
             skipped = stats.skipped,
             uploads = stats.uploads,
             upload_mib = format_args!("{:.1}", stats.bytes_uploaded as f64 / (1024.0 * 1024.0)),

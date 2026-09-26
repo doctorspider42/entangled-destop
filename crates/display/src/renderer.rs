@@ -21,6 +21,7 @@ use virtio_gpu::BYTES_PER_PIXEL;
 use winit::window::Window;
 
 use crate::present::{CursorOverlay, ImagePipeline};
+use crate::refresh::{choose_present_mode, PresentPreference};
 use crate::scanout::Scanout;
 use crate::shared::{SharedSlot, SharedTexture};
 use crate::{DisplayError, Viewport};
@@ -43,6 +44,26 @@ pub struct FrameStats {
     /// Frames drawn from a renderer's shared image rather than the mirror
     /// (ADR-0004, zero-copy presentation).
     pub shared_frames: u64,
+    /// Guest frames that reached the display: flushes of the scanout, shared
+    /// or copied (cursor moves are not frames). Against [`Self::frames`] this
+    /// is the window's side of the guest's flip rate.
+    pub guest_frames: u64,
+    /// Guest frames the window never drew: superseded by a newer one before
+    /// the window got to it (the host monitor is slower than the guest, or
+    /// the window was blocked), or arriving while it was minimized or
+    /// occluded. With a `Mailbox` swapchain the compositor can still drop a
+    /// drawn frame at its own vblank, which no counter here sees.
+    pub unshown: u64,
+    /// Time spent acquiring the next swapchain image, summed, in
+    /// microseconds: where a FIFO swapchain makes the window wait for a host
+    /// vblank.
+    pub acquire_us: u64,
+    /// The longest single acquire, in microseconds.
+    pub acquire_max_us: u64,
+    /// Time spent in the present call itself, summed, in microseconds.
+    pub present_us: u64,
+    /// The longest single present call, in microseconds.
+    pub present_max_us: u64,
 }
 
 /// Logs FPS and copy statistics once per second (backlog MVP-708).
@@ -79,9 +100,33 @@ impl StatsReporter {
         let shared = stats
             .shared_frames
             .saturating_sub(self.previous.shared_frames);
+        let guest = stats
+            .guest_frames
+            .saturating_sub(self.previous.guest_frames);
+        let unshown = stats.unshown.saturating_sub(self.previous.unshown);
+        let per_frame = |now: u64, before: u64| {
+            if frames == 0 {
+                0.0
+            } else {
+                now.saturating_sub(before) as f64 / frames as f64 / 1000.0
+            }
+        };
+        let acquire_ms = per_frame(stats.acquire_us, self.previous.acquire_us);
+        let present_ms = per_frame(stats.present_us, self.previous.present_us);
         tracing::info!(
             fps = format_args!("{:.1}", frames as f64 / secs),
             shared_fps = format_args!("{:.1}", shared as f64 / secs),
+            // The guest's frames against the window's presents (ADR-0004,
+            // the high-refresh amendment).
+            guest_fps = format_args!("{:.1}", guest as f64 / secs),
+            unshown_per_s = format_args!("{:.1}", unshown as f64 / secs),
+            // Where the window thread waits per frame: the swapchain acquire
+            // (a FIFO host vblank) and the present call (ADR-0004, the
+            // high-refresh amendment). The maxima are for the whole run.
+            acquire_ms = format_args!("{acquire_ms:.3}"),
+            acquire_max_ms = format_args!("{:.3}", stats.acquire_max_us as f64 / 1000.0),
+            present_ms = format_args!("{present_ms:.3}"),
+            present_max_ms = format_args!("{:.3}", stats.present_max_us as f64 / 1000.0),
             uploads_per_s = format_args!("{:.1}", uploads as f64 / secs),
             upload_mib_per_s = format_args!("{:.2}", bytes as f64 / secs / (1024.0 * 1024.0)),
             skipped = stats.skipped.saturating_sub(self.previous.skipped),
@@ -120,6 +165,41 @@ pub(crate) struct Renderer {
     stats: FrameStats,
 }
 
+/// The surface configuration of a window: its present mode is chosen
+/// ([`crate::refresh::choose_present_mode`]), never `AutoVsync`.
+fn surface_config(
+    caps: &wgpu::SurfaceCapabilities,
+    format: wgpu::TextureFormat,
+    size: winit::dpi::PhysicalSize<u32>,
+    preference: PresentPreference,
+) -> wgpu::SurfaceConfiguration {
+    let alpha_mode = caps
+        .alpha_modes
+        .first()
+        .copied()
+        .unwrap_or(wgpu::CompositeAlphaMode::Auto);
+    let present_mode = choose_present_mode(&caps.present_modes, preference);
+    tracing::info!(
+        ?present_mode,
+        ?preference,
+        available = ?caps.present_modes,
+        "window present mode (ENTANGLED_PRESENT_MODE to choose)"
+    );
+    wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width: size.width.max(1),
+        height: size.height.max(1),
+        present_mode,
+        // Two frames queued at most: with `Mailbox` the newest replaces the
+        // queued one, so this bounds latency without ever making the window
+        // wait; with `Fifo` it is how far the window may run ahead.
+        desired_maximum_frame_latency: 2,
+        alpha_mode,
+        view_formats: Vec::new(),
+    }
+}
+
 impl Renderer {
     /// Creates the GPU state for `window` and a `guest_w`×`guest_h` scanout.
     ///
@@ -148,22 +228,8 @@ impl Renderer {
 
         let caps = surface.get_capabilities(&adapter);
         let format = pick_surface_format(&caps).ok_or(DisplayError::UnsupportedSurface)?;
-        let alpha_mode = caps
-            .alpha_modes
-            .first()
-            .copied()
-            .unwrap_or(wgpu::CompositeAlphaMode::Auto);
         let size = window.inner_size();
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 2,
-            alpha_mode,
-            view_formats: Vec::new(),
-        };
+        let config = surface_config(&caps, format, size, PresentPreference::from_env());
 
         // Linear filtering so a scaled scanout is smooth (MVP-705).
         let image = ImagePipeline::new(&device, format, wgpu::FilterMode::Linear);
@@ -203,6 +269,14 @@ impl Renderer {
         self.stats
     }
 
+    /// Counts `arrived` guest frames against one draw: all but the newest
+    /// were never drawn, and the newest too when nothing was presented.
+    pub(crate) fn note_guest_frames(&mut self, arrived: u64, presented: bool) {
+        self.stats.guest_frames = self.stats.guest_frames.saturating_add(arrived);
+        let shown = u64::from(presented).min(arrived);
+        self.stats.unshown = self.stats.unshown.saturating_add(arrived - shown);
+    }
+
     /// Reconfigures the surface for a new window size. A zero-sized window
     /// (minimized) leaves the surface unconfigured and presenting disabled
     /// (backlog MVP-706).
@@ -232,6 +306,11 @@ impl Renderer {
                 tracing::warn!(?format, "surface format changed after loss");
                 self.config.format = format;
             }
+        }
+        if !caps.present_modes.contains(&self.config.present_mode) {
+            self.config.present_mode =
+                choose_present_mode(&caps.present_modes, PresentPreference::from_env());
+            tracing::warn!(present_mode = ?self.config.present_mode, "present mode changed after loss");
         }
         self.stats.surface_recoveries += 1;
         self.surface.configure(&self.device, &self.config);
@@ -425,7 +504,11 @@ impl Renderer {
     }
 
     fn frame(&mut self, viewport: Viewport) -> Result<(), wgpu::SurfaceError> {
+        let acquire = Instant::now();
         let frame = self.surface.get_current_texture()?;
+        let us = micros(acquire.elapsed());
+        self.stats.acquire_us = self.stats.acquire_us.saturating_add(us);
+        self.stats.acquire_max_us = self.stats.acquire_max_us.max(us);
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -482,9 +565,17 @@ impl Renderer {
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
+        let present = Instant::now();
         frame.present();
+        let us = micros(present.elapsed());
+        self.stats.present_us = self.stats.present_us.saturating_add(us);
+        self.stats.present_max_us = self.stats.present_max_us.max(us);
         Ok(())
     }
+}
+
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// The GPU objects one window needs, all tied to the same backend.

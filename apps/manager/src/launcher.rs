@@ -269,6 +269,13 @@ pub struct NewMachine {
     pub name: String,
     pub memory_mib: u64,
     pub vcpus: u32,
+    /// The installed machine's `[display] refresh_hz`: this host's monitor
+    /// through [`control_api::refresh::default_refresh_hz`], the rule
+    /// `entangled install` follows — written into the profile after the
+    /// install ([`crate::discovery::apply_resources`]), because a WSL engine
+    /// cannot see the Windows monitor the window will open on, and an older
+    /// engine has no `--refresh-hz` to be told.
+    pub refresh_hz: u32,
     pub disk_gib: u64,
     /// Empty means `<name>.raw` inside the manager's VM directory.
     pub disk_path: String,
@@ -632,6 +639,7 @@ mod tests {
             name: "demo".into(),
             memory_mib: 4096,
             vcpus: 4,
+            refresh_hz: 60,
             disk_gib: 20,
             disk_path: String::new(),
             disk_mode: DiskMode::CreateNew,

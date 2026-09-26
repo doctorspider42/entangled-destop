@@ -282,8 +282,19 @@ struct Harness {
 
 impl Harness {
     fn new(width: u32, height: u32) -> Self {
+        Self::with_device(width, height, |_| {})
+    }
+
+    /// A harness whose device is configured by `configure` before the
+    /// transport takes it (the refresh rate, the frame statistics file).
+    fn with_device(
+        width: u32,
+        height: u32,
+        configure: impl FnOnce(&mut GpuDevice<DisplayHandle>),
+    ) -> Self {
         let display = DisplayHandle::detached(width, height).expect("detached display");
-        let device = GpuDevice::new(display.clone());
+        let mut device = GpuDevice::new(display.clone());
+        configure(&mut device);
         let mem = Arc::new(guest_memory(MEM_SIZE));
         let irq = Arc::new(TestIrqLine::default());
         let transport = MmioTransport::new(0, Box::new(device), Arc::clone(&mem), irq.clone())
@@ -1067,6 +1078,85 @@ fn get_edid_returns_a_valid_block_for_the_scanout() {
         &h.run_with_capacity(&request, 2048),
         resp::ERR_INVALID_SCANOUT_ID,
     );
+}
+
+/// Decodes the refresh rate of an EDID's preferred detailed timing, in Hz,
+/// the way DRM computes a mode's vrefresh (pixel clock over total pixels).
+fn edid_refresh_hz(edid: &[u8]) -> f64 {
+    let d = &edid[54..72];
+    let clock = f64::from(u32::from(d[0]) | (u32::from(d[1]) << 8)) * 10_000.0;
+    let h_active = u32::from(d[2]) | ((u32::from(d[4]) >> 4) << 8);
+    let h_blank = u32::from(d[3]) | ((u32::from(d[4]) & 0x0F) << 8);
+    let v_active = u32::from(d[5]) | ((u32::from(d[7]) >> 4) << 8);
+    let v_blank = u32::from(d[6]) | ((u32::from(d[7]) & 0x0F) << 8);
+    clock / f64::from((h_active + h_blank) * (v_active + v_blank))
+}
+
+/// `[display] refresh_hz` reaches the guest: the EDID the driver reads has
+/// the rate the profile asked for as its preferred timing, at every rate the
+/// installers derive from a host monitor (ADR-0004, the high-refresh
+/// amendment), and an out-of-range one is clamped rather than sent broken.
+#[test]
+fn get_edid_advertises_the_configured_refresh() {
+    for (asked, advertised) in [
+        (60, 60),
+        (120, 120),
+        (144, 144),
+        (165, 165),
+        (240, 240),
+        (500, 240),
+        (1, 24),
+    ] {
+        let mut h = Harness::with_device(1920, 1080, |gpu| gpu.set_refresh_hz(asked));
+        let request = Request::new(cmd::GET_EDID).u32(0).u32(0);
+        let response = h.run_with_capacity(&request, 2048);
+        assert_eq!(response.kind(), resp::OK_EDID, "{asked} Hz");
+        let edid = &response.body()[8..8 + 128];
+        let sum: u8 = edid.iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+        assert_eq!(sum, 0, "{asked} Hz: checksum");
+        let hz = edid_refresh_hz(edid);
+        assert!(
+            (hz - f64::from(advertised)).abs() < 0.01,
+            "asked {asked} Hz, advertised {hz}"
+        );
+    }
+}
+
+/// The frame statistics follow the advertised refresh: `--frame-stats` is
+/// rewritten every two seconds of refresh slots — 120 flushes at 60 Hz, 480
+/// at 240 — and says which period its counters were measured against.
+#[test]
+fn frame_statistics_are_windowed_by_the_advertised_refresh() {
+    for (hz, window, period_us) in [(60u32, 120u32, 16_666u32), (240, 480, 4_166)] {
+        let dir = std::env::temp_dir().join(format!(
+            "entangled-gpu-queue-pacing-{}-{hz}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("frames.json");
+        let _ = std::fs::remove_file(&path);
+        let stats = path.clone();
+        let mut h = Harness::with_device(16, 16, move |gpu| {
+            gpu.set_refresh_hz(hz);
+            gpu.set_frame_stats(Some(stats));
+        });
+        h.setup_scanout(1, 16, 16, FB_ADDR);
+        for flush in 0..window {
+            assert!(!path.exists(), "{hz} Hz: no report before flush {flush}");
+            assert_ok(&h.run(&resource_flush(1, rect(0, 0, 16, 16))));
+        }
+        let text = std::fs::read_to_string(&path).expect("a report after the window");
+        assert!(
+            text.contains(&format!("\"refresh_us\": {period_us},")),
+            "{hz} Hz: {text}"
+        );
+        assert!(
+            text.contains(&format!("\"intervals\":{}", window - 1)),
+            "{hz} Hz: one window of intervals: {text}"
+        );
+        assert!(text.contains("\"stddev_us\":"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[test]

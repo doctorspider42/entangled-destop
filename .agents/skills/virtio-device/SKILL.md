@@ -818,8 +818,14 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
     Each interval is split into **quiet** (the guest asked for nothing),
     **submit** (guest → device) and **service** (the device's own cost); the
     three sum to the interval, which is what makes an attribution an argument.
-    Use it for any GPU before/after — and see the host-display skill for the
-    two things it has already caught.
+    Everything that depends on the refresh follows `[display] refresh_hz`
+    (`GpuDevice::set_refresh_hz` → `FramePacing::set_refresh`): the slot
+    counters, `late` (1.2 periods) and the report window (two seconds of
+    slots, never under 120 frames). The report carries `stddev_us` and
+    `jitter_us` (mean |Δn − Δn−1|) and the log line its `refresh_hz`. With a
+    client on screen `submit` covers the client's traffic too, so it does not
+    isolate the compositor. Use it for any GPU before/after — and see the
+    host-display skill for the things it has already caught.
   - **The scanout reply is the one message worth hand-optimising.** A present
     flushes the *whole* screen (the guest double-buffers, so DRM widens the
     damage to the plane), which is 7.9 MiB at 1080p, once per frame, across

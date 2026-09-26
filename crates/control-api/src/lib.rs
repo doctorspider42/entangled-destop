@@ -3,6 +3,10 @@
 
 mod config;
 pub mod control;
+/// The refresh rate a new machine's virtual monitor gets: the host monitor's,
+/// rounded and clamped ([`refresh::default_refresh_hz`]); the host query is
+/// behind the `host-display` feature.
+pub mod refresh;
 pub mod wsl;
 /// Getting a Linux engine into WSL: the pinned download, the digest check and
 /// the copy into the distribution. Behind the `engine-install` feature, which

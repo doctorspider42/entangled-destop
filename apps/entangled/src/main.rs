@@ -357,6 +357,17 @@ pub struct InstallArgs {
     /// CPUs, at least 2 and at most 8. The installer VM itself always runs on 2.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
     pub vcpus: Option<u32>,
+    /// Refresh rate of the installed machine's virtual monitor, in Hz
+    /// (`[display] refresh_hz`, 24 to 240): the rate the guest's compositor
+    /// draws at. Defaults to this host's primary monitor, rounded to a
+    /// standard rate: its own rate up to 144 Hz, and above that the largest
+    /// whole fraction of it at or below 144 (a 240 Hz monitor gets 120) — 60
+    /// when it cannot be read, as inside WSL. The installer VM itself always
+    /// runs at 60.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(
+        i64::from(control_api::MIN_REFRESH_HZ)..=i64::from(control_api::MAX_REFRESH_HZ)
+    ))]
+    pub refresh_hz: Option<u32>,
     /// Host TAP interface (see scripts/setup-tap.sh), for --network tap.
     #[arg(long, default_value = "entangled0")]
     pub interface: String,
@@ -748,5 +759,32 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(help.contains("--vcpus"), "{help}");
+    }
+
+    #[test]
+    fn install_refresh_hz_is_optional_and_bounded_like_a_profile() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["entangled", "install", "ubuntu", "--auto"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Command::Install(args) => args.refresh_hz,
+                _ => panic!("not an install"),
+            })
+        };
+        assert_eq!(parse(&[]).expect("no flag"), None);
+        assert_eq!(parse(&["--refresh-hz", "144"]).expect("144"), Some(144));
+        assert_eq!(parse(&["--refresh-hz", "24"]).expect("the floor"), Some(24));
+        assert_eq!(
+            parse(&["--refresh-hz", "240"]).expect("the ceiling"),
+            Some(240)
+        );
+        assert!(parse(&["--refresh-hz", "23"]).is_err());
+        assert!(parse(&["--refresh-hz", "241"]).is_err());
+        let help = Cli::command()
+            .find_subcommand_mut("install")
+            .expect("install")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--refresh-hz"), "{help}");
     }
 }

@@ -12,7 +12,7 @@
 //! waits on guest state, and a guest that transfers 1000 rects between two
 //! frames costs one upload, not 1000.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use winit::event_loop::EventLoopProxy;
@@ -36,6 +36,10 @@ pub(crate) enum HostEvent {
 pub(crate) struct Waker {
     proxy: Option<EventLoopProxy<HostEvent>>,
     pending: Arc<AtomicBool>,
+    /// Guest frames published since the display came up (every flush of the
+    /// scanout, shared or copied), so the window can count the ones it
+    /// never drew ([`crate::FrameStats::unshown`]).
+    frames: Arc<AtomicU64>,
 }
 
 impl Waker {
@@ -43,6 +47,7 @@ impl Waker {
         Self {
             proxy: Some(proxy),
             pending: Arc::new(AtomicBool::new(false)),
+            frames: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -50,6 +55,7 @@ impl Waker {
         Self {
             proxy: None,
             pending: Arc::new(AtomicBool::new(false)),
+            frames: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -71,6 +77,17 @@ impl Waker {
             self.pending.store(false, Ordering::Release);
             tracing::trace!("redraw wakeup dropped: event loop has exited");
         }
+    }
+
+    /// A guest frame was published: counted, then [`Self::wake`].
+    pub(crate) fn frame(&self) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        self.wake();
+    }
+
+    /// Guest frames published so far.
+    pub(crate) fn frames(&self) -> u64 {
+        self.frames.load(Ordering::Relaxed)
     }
 
     /// Marks the pending wakeup consumed; called by the event loop per frame.
@@ -193,7 +210,7 @@ impl DisplayHandle {
         if let Some(presenter) = self.shared.get() {
             presenter.deactivate();
         }
-        self.waker.wake();
+        self.waker.frame();
         Ok(())
     }
 
@@ -419,7 +436,7 @@ impl virtio_gpu::ScanoutSink for DisplayHandle {
         }
         let presented = presenter.present(frame, lease);
         if presented == virtio_gpu::SharedPresent::Presented {
-            self.waker.wake();
+            self.waker.frame();
         }
         presented
     }

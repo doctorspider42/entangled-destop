@@ -241,8 +241,13 @@ fn open_presentation(cfg: &VmConfig, headless: bool) -> Result<Presentation, Str
                      Ctrl+Alt+G toggles, F11 fullscreen, Ctrl+Alt+O 1:1, \
                      Ctrl+Alt+P pauses, Ctrl+Alt+R reboots, Ctrl+Alt+Q shuts down"
                 );
+                // The window says, once it knows its monitor, what the
+                // guest's refresh looks like there — and warns when the guest
+                // is told a faster rate than the monitor can show (ADR-0004,
+                // the high-refresh amendment).
                 return Ok(Presentation::Windowed(Box::new(
-                    host.with_title(format!("Entangled Desktop — {}", cfg.name)),
+                    host.with_title(format!("Entangled Desktop — {}", cfg.name))
+                        .with_guest_refresh(cfg.display.refresh_hz),
                 )));
             }
             Err(e) => {
