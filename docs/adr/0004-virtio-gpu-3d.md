@@ -3192,7 +3192,9 @@ The lies:
    The format query says so; any other request is refused.
 
 Any other modifier is `VK_ERROR_FORMAT_NOT_SUPPORTED` in the query and fatal
-in a create.
+in a create. (**Amended** by "X11 applications", 2026-09-26: a modifier list
+that names LINEAR among others is answered LINEAR; only a list without LINEAR,
+or an explicit other modifier, is still fatal.)
 
 ### Barriers with foreign queue families
 
@@ -6153,3 +6155,178 @@ twice; figures from the second run):
   first, and waits after a reset in the same buffer are refused. A more
   exotic pattern that no conformant program needs would be held until the
   host sets the event, never handed to the driver.
+
+## Amendment, 2026-09-26 — X11 applications: a modifier list is the implementation's to pick from
+
+The fresh-install acceptance of release v0.2.49 found it. On the GPU desktop
+(GNOME on Zink on Venus), within a second of the first X client starting
+Xwayland, the host logged `a Venus command could not be answered; the ring
+and its context are fatal … vkCreateImage: a modifier list:
+DRM_FORMAT_MOD_LINEAR is the only modifier offered, and only for DRM format
+modifier tiling`. gnome-shell then logged `X Wayland crashed; attempting to
+recover`, and every X client failed with `unable to open display :0`.
+Wayland clients were unaffected.
+
+### What was sent (captured)
+
+The run was repeated on the same guest (Ubuntu 26.04, Mesa 26.0.8, Xwayland
+24.1.10, mutter 50.1), with a temporary build that logged every DRM-tiling
+image query and create info. The evidence is kept in
+`F:\VMs\Entangled\xw\cap1\xwdiag-capture.txt`. The context that died was
+Xwayland's glamor. Its first pixmap is a 1×1 probe. What it sent, in order:
+
+1. `vkGetPhysicalDeviceFormatProperties2` + `VkDrmFormatModifierPropertiesListEXT`
+   for `B8G8R8A8_UNORM` (44): one entry, LINEAR, one plane, features
+   `0x1dd83`. Our superset for it is usage `0x9f`, with flags
+   `MUTABLE` and the list `[44, 50]`.
+2. `vkGetPhysicalDeviceImageFormatProperties2`: DRM tiling,
+   `VkPhysicalDeviceImageDrmFormatModifierInfoEXT{LINEAR, EXCLUSIVE}`, a view
+   format list `[44, 50]`, usage `0x97` (transfers, sampled, colour and input
+   attachment) and flags `MUTABLE`. We answered **`VK_SUCCESS`**, with a
+   32768² limit, one level, one layer and one sample.
+3. `vkCreateImage`. The chain was `VkImageDrmFormatModifierListCreateInfoEXT`
+   of **`[0, 0x00ffffffffffffff]`**, i.e. `[LINEAR, DRM_FORMAT_MOD_INVALID]`,
+   then `VkExternalMemoryImageCreateInfo{DMA_BUF}`, then
+   `VkImageFormatListCreateInfo[44, 50]`. The image was 1×1, one level, one
+   layer, one sample, format 44, usage `0x97`, flags `MUTABLE`, exclusive and
+   `UNDEFINED`. **This create was fatal.**
+
+Everything about it was inside the emulation except the list. After the fix
+the same session also showed Xwayland importing clients' buffers. Those
+imports use an explicit LINEAR at the client's pitch (1074×818 at 4352)
+with `MUTABLE` and `[44, 50]`, and swapchain images come with
+`MUTABLE | EXTENDED_USAGE | ALIAS`. Both were already accepted.
+
+### Why the list looks like that
+
+Mutter's dma-buf table adds `DRM_FORMAT_MOD_INVALID` to every format after
+the modifiers EGL reports (`add_format`, `meta-wayland-dma-buf.c:1759-1765`).
+Here EGL reports only our LINEAR, so every format reads `[LINEAR, INVALID]`.
+Xwayland passes a format's modifiers on as they are
+(`xwayland-dmabuf.c:277-290`), then `gbm_bo_create_with_modifiers2`
+(`xwayland-glamor-gbm.c:357-369`). Zink asks the format query about the
+modifier it picked, LINEAR, alone (`set_image_usage`,
+`zink_resource.c:586-610`). It then chains its frontend's **whole** list into
+the create (`:1364-1369`). DRI3 clients get the same list from Xwayland, so
+glxgears' back buffers would have been fatal too.
+
+### Root cause
+
+We advertised LINEAR and answered the query for it, but a create was only
+accepted when the list held LINEAR and nothing else. The query and the create
+disagreed. The extension gives the choice of modifier from a list to the
+implementation, and every driver Zink runs on picks the one it supports. Our
+check made "a list naming a modifier we never offered" fatal. That was right
+for an explicit modifier and wrong for a list.
+
+### The fix (`executor::context::check_image_create_info`)
+
+- A `VkImageDrmFormatModifierListCreateInfoEXT` that names LINEAR anywhere is
+  answered LINEAR. The image is the same canonical optimal image as for
+  `[LINEAR]`, with byte-identical host create infos.
+  `vkGetImageDrmFormatModifierPropertiesEXT` reports LINEAR, and the plane is
+  the synthesized one. So the guest only ever sees the modifier it was
+  offered.
+- Still fatal, as a guest that ignored the query's answer is: a list without
+  LINEAR (`[INVALID]`, only foreign modifiers, or empty), an explicit modifier
+  other than LINEAR, and a list or explicit modifier on an image whose tiling
+  is not DRM. Choosing among foreign modifiers is not something the list
+  permits. The messages now say which of these it was, and a refused list is
+  logged with its length and first entries.
+- Nothing else about the emulation changed. Usage, flags and view formats
+  are still held to the canonical ones. An explicit plane at a different
+  pitch is still answered `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`,
+  not refused. `vkGetDeviceImageMemoryRequirements` shares the check, so it
+  takes the same lists.
+
+### Tests (`executor::x11_tests`, fake host)
+
+- `xwaylands_glamor_probe_is_answered_linear_from_mutters_list` replays the
+  capture: the format list, the query, then the create with
+  `[LINEAR, INVALID]` in glamor's chain order. It checks the canonical host
+  image, that LINEAR is reported, and the 256-byte plane.
+- `a_list_naming_linear_among_others_is_the_same_image_as_linear_alone`
+  covers `[INVALID, LINEAR]`, `[X_TILED, LINEAR, NV_BLOCK]` and
+  `[LINEAR, LINEAR]`. Each gives the same host create info and requirements
+  as `[LINEAR]`, including through `vkGetDeviceImageMemoryRequirements`.
+- `a_modifier_the_device_never_offered_is_still_refused_alone` covers the
+  refusals above. It also checks that LINEAR's company does not excuse a usage
+  outside the superset, or a list on an optimal image.
+- `xwayland_imports_an_x_clients_buffer_as_the_same_canonical_image` has two
+  contexts. The X client exports a 1074×818 buffer made from Mutter's list.
+  Xwayland imports it explicitly at 4352: a wrong pitch is answered, not
+  fatal, and the right pitch gives the identical host image, imported and
+  bound.
+- `everything_the_format_queries_advertise_a_create_accepts` is the property
+  the bug broke. It covers every scanout format plus four others and eight
+  kinds of flags and view lists. For usage it takes each core bit alone, and
+  the combinations clients send. Wherever the LINEAR query answers
+  `VK_SUCCESS`, the create must succeed and be reported LINEAR. The four
+  namings (`[LINEAR]`, Mutter's list, foreign modifiers around LINEAR, and
+  explicit at the synthesized pitch) are rotated through the matrix. For the
+  usage Zink derives from the advertised features, all four must give one
+  host image. A format is listed LINEAR exactly when some query of it
+  succeeds. Acceptance is monotone in usage, so single bits and maximal
+  combinations sample it. Each harness call is a real ring round trip, and
+  the full 255-usage cross product took six minutes in a debug build. This
+  sample takes 19 s.
+- `s1_tests::every_modifier_image_outside_the_emulation_is_refused` asserted
+  the bug: it refused `[LINEAR, other]` as fatal. It now refuses a list
+  without LINEAR.
+
+Four of the five new tests fail without the fix. The refusal test and the
+updated S1 case pass either way, as refusals should.
+
+### Guest acceptance
+
+The guest was the same, on WHP with the RTX 2070 (580.88) and 4 vCPUs, using
+`F:\VMs\Entangled\venus-ubuntu-net-profile.toml` (`[display] venus = true`),
+headless with `--screenshot-every 2000`. The drivers are in the task's
+scratchpad (`xw/drive.ps1`, `xw/run.sh`), and the guest half is
+`F:\VMs\Entangled\probes\xw\xw.sh`. There were four boots of the fixed build
+(`acc1`, `acc2`, `x11b`, `bg` under `F:\VMs\Entangled\xw\`).
+
+- `glxinfo -B`: `direct rendering: Yes`, `Accelerated: yes`, renderer `zink
+  Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070) (MESA_VENUS))`,
+  OpenGL 4.6 core. It was the same at the end of each session.
+- glxgears on X11: 58.4–60.0 FPS with the default swap interval, and
+  554–644 FPS with `vblank_mode=0` (5 s windows, `x11b`).
+- `vkcube --wsi xcb` ran on `Virtio-GPU Venus (NVIDIA GeForce RTX 2070)`.
+  gnome-calculator and gnome-text-editor ran with `GDK_BACKEND=x11`. With
+  `GDK_DEBUG=opengl`, GTK reported EGL 1.5 on `/dev/dri/renderD128`, so GTK
+  on X11 draws with GL, through Zink.
+- Xwayland kept one pid for each whole session: glxinfo, three glxgears
+  runs, vkcube, the two GTK apps, and Wayland glmark2 before and after.
+- **The host log had no `could not be answered` line and no fatal line in any
+  of the four boots.** No Venus warning was logged at all.
+- Screenshots: `acc1\accept-glxgears.png`, `acc1\accept-x11-all.png`
+  (glxgears, vkcube X11, calculator and text editor) and
+  `x11b\x11b-firefox.png` (calculator on X11). The tear check from `82357a9`
+  used burst frames 2 s apart: `acc1\tear-grid-gears.png` (8 frames of
+  glxgears) and `acc1\tear-grid-x11.png` (12 frames of glxgears over vkcube).
+  Every frame was whole, with no split and no garbage. The frames differ from
+  each other, so the windows were animating.
+- Wayland was unchanged. glmark2-wayland scored build 613, jellyfish 610
+  before X11 and 682, 647 after (`acc1`, with the VMware tenant at 19–38 %
+  GPU). In `acc2`, with the tenant at 2 %, it scored 655, 663 before and 627,
+  638 after. The desktop composited at 54.4 and 54.7 fps over each whole run
+  (`frames.json`). That is inside the spread the wait-before-signal amendment
+  measured (570–707 for a quiet run), and this change touches no path those
+  benchmarks run.
+
+### Still open
+
+- **Firefox on X11 is not verified.** The Ubuntu Firefox is a snap. Started
+  from the serial console with `MOZ_ENABLE_WAYLAND=0`, it failed with `Error:
+  cannot open display: :0`. That happened with Mutter's cookie in
+  `XAUTHORITY`, in `~/.Xauthority`, and in the snap's own directory, after
+  snapd's mount-namespace warnings. It never reached GL, and the host logged
+  nothing, so this is the snap's X access from a non-session shell, not the
+  renderer. A Firefox started from the desktop is owed.
+- **A background remnant beside a window, not X11-specific.** When a window
+  covers part of Ubuntu's wallpaper logo, the logo is hidden, except for its
+  rays inside the window's left shadow. Those stay on screen until the window
+  goes. `bg\bg-compare.png` shows the same for the Wayland and the X11
+  gnome-calculator. A wider text editor covers the logo whole. Whether this
+  is Mutter's damage or this renderer's scanout was not established.
+- No glmark2 on X11: `glmark2-x11` is not installed in the image.
