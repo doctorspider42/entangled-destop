@@ -1,6 +1,7 @@
 //! vk-smoke: a guest-side Vulkan smoke test.
 //!
-//! Runs nine numbered checks, in dependency order, and prints one line each:
+//! Runs eleven numbered checks (10 and 11 only when named), in dependency
+//! order, and prints one line each:
 //!
 //! ```text
 //! SMOKE <n> <name> PASS|FAIL|SKIP <detail>
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant};
 use checks::Out;
 use gpu::Opts;
 
-const CHECKS: [(u32, &str); 10] = [
+const CHECKS: [(u32, &str); 11] = [
     (1, "instance"),
     (2, "device"),
     (3, "host-memory"),
@@ -36,6 +37,7 @@ const CHECKS: [(u32, &str); 10] = [
     (8, "timeline-sync"),
     (9, "many-submits"),
     (10, "exhaust"),
+    (11, "wait-before-signal"),
 ];
 
 fn name(id: u32) -> &'static str {
@@ -184,7 +186,7 @@ const USAGE: &str =
                      CPU devices included                 env VK_SMOKE_DEVICE_INDEX
   --allow-cpu        let automatic selection pick a CPU device (lavapipe/llvmpipe)
                      when nothing else is present        env VK_SMOKE_ALLOW_CPU=1
-  --checks LIST      run only these of checks 3..10 (1 and 2 always run; 10 only if named)
+  --checks LIST      run only these of checks 3..11 (1 and 2 always run; 10, 11 only if named)
                                                           env VK_SMOKE_CHECKS
   --timeout-secs N   per-wait GPU timeout, default 10; the watchdog ends a check
                      that makes no progress for 2N+10 s   env VK_SMOKE_TIMEOUT_SECS
@@ -311,7 +313,7 @@ fn main() {
     };
 
     type Check = fn(&gpu::Gpu) -> Result<Out, String>;
-    let later: [(u32, Check); 8] = [
+    let later: [(u32, Check); 9] = [
         (3, checks::host_memory),
         (4, checks::transfer),
         (5, checks::compute),
@@ -320,11 +322,12 @@ fn main() {
         (8, checks::sync),
         (9, checks::many_submits),
         (10, checks::exhaust),
+        (11, checks::wait_before_signal),
     ];
     for (id, check) in later {
-        // Check 10 is hostile on purpose: it runs only when named.
-        if id == 10 && opts.checks.is_none() {
-            report(id, Status::Skip, "hostile; only with --checks 10");
+        // Checks 10 and 11 are hostile on purpose: they run only when named.
+        if id >= 10 && opts.checks.is_none() {
+            report(id, Status::Skip, &format!("hostile; only with --checks {id}"));
             continue;
         }
         if opts.checks.as_ref().is_some_and(|list| !list.contains(&id)) {

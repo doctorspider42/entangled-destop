@@ -86,12 +86,23 @@
 //!
 //! # Waits
 //!
-//! `vkWaitForFences`, `vkWaitSemaphores`, `vkQueueWaitIdle` and
-//! `vkDeviceWaitIdle` are waited for
+//! `vkWaitForFences`, `vkWaitSemaphores`, `vkQueueWaitIdle`,
+//! `vkDeviceWaitIdle` and `vkGetQueryPoolResults(WAIT)` are waited for
 //! on this thread, in slices of [`submit::WAIT_SLICE`] with the context lock
-//! released in between ([`submit`]'s module docs). The context's ring monitor
-//! keeps `ALIVE` set meanwhile; a ring being torn down stops waiting within a
-//! slice, without consuming the command.
+//! released in between ([`submit`]'s module docs) — or, when the answer is
+//! behind work the executor holds back, in naps of [`hold::NAP`] that never
+//! reach the driver. The context's ring monitor keeps `ALIVE` set meanwhile;
+//! a ring being torn down stops waiting within a slice, without consuming the
+//! command.
+//!
+//! # No wait before its signal (ADR-0004, the wait-before-signal amendment)
+//!
+//! A submit whose waits nothing already submitted can satisfy — a timeline
+//! value past every signal the driver has, a binary semaphore whose signal is
+//! itself held, an event nobody has set — is held on the host with the rest
+//! of its queue behind it, and released in order once covered ([`hold`]).
+//! The driver never sees such a wait, so no queue of it waits for ever and
+//! no other thread of the VMM can block behind one.
 //!
 //! # Roundtrips: `vkWaitVirtqueueSeqnoMESA` (found by GNOME on the GPU)
 //!
@@ -159,6 +170,7 @@
 pub mod context;
 pub mod device_objects;
 pub mod generated;
+pub mod hold;
 pub mod host;
 pub mod limits;
 pub mod memory;
@@ -178,6 +190,8 @@ pub(crate) mod fake;
 mod generated_tests;
 #[cfg(test)]
 pub(crate) mod harness;
+#[cfg(test)]
+mod hold_tests;
 #[cfg(test)]
 mod limits_tests;
 #[cfg(test)]
@@ -575,10 +589,11 @@ impl<H: HostVulkan> ExecutingSink<H> {
                     .saturating_sub(start.elapsed())
                     .min(submit::WAIT_SLICE)
             });
-            let done = {
+            let (done, nap) = {
                 let mut context = lock(&self.context);
                 context.stop = Some(self.stop.clone());
-                context.execute_wait(command, slice)?
+                let done = context.execute_wait(command, slice)?;
+                (done, context.take_nap())
             };
             if done {
                 return Ok(true);
@@ -589,6 +604,12 @@ impl<H: HostVulkan> ExecutingSink<H> {
             }
             if self.stop.is_stopping() {
                 return Ok(false);
+            }
+            if nap {
+                // Nothing the driver could do yet: the answer is behind held
+                // work (`hold`). Off the lock, so the ring that will cover
+                // it can run.
+                std::thread::sleep(hold::NAP);
             }
         }
     }
@@ -1053,6 +1074,9 @@ pub struct ExecutorFactory<H: HostVulkan> {
     /// has run — and in order, since its copies run in order on its queue.
     presenter_progress: Arc<writes::Progress>,
     presenter_serial: u64,
+    /// What holding back uncovered submits did, every context together
+    /// ([`hold`]).
+    hold_stats: Arc<hold::HoldStats>,
 }
 
 impl<H: HostVulkan> std::fmt::Debug for ExecutorFactory<H> {
@@ -1095,6 +1119,7 @@ impl<H: HostVulkan> ExecutorFactory<H> {
             scanout_serial: 0,
             presenter_progress: Arc::new(writes::Progress::default()),
             presenter_serial: 0,
+            hold_stats: Arc::new(hold::HoldStats::default()),
         }
     }
 
@@ -1185,6 +1210,20 @@ impl<H: HostVulkan> ExecutorFactory<H> {
         })
     }
 
+    /// Run `f` on context `ctx_id` with it borrowed mutably — as another
+    /// ring of the context would, between the harness ring's commands.
+    #[cfg(test)]
+    pub(crate) fn with_context_mut<T>(
+        &self,
+        ctx_id: u32,
+        f: impl FnOnce(&mut VulkanContext<H>) -> T,
+    ) -> Option<T> {
+        self.contexts.get(&ctx_id).map(|context| {
+            let mut guard = lock(context);
+            f(&mut guard)
+        })
+    }
+
     /// The table of running touches of shared payloads, for a test.
     #[cfg(test)]
     pub(crate) fn payloads(&self) -> Arc<writes::Payloads> {
@@ -1223,6 +1262,7 @@ impl<H: HostVulkan> ExecutorFactory<H> {
         let payloads = &self.payloads;
         let limits = &self.limits;
         let graveyard = &self.graveyard;
+        let hold_stats = &self.hold_stats;
         Arc::clone(self.contexts.entry(ctx_id).or_insert_with(|| {
             let mut context = VulkanContext::with_caps(
                 ctx_id,
@@ -1233,6 +1273,7 @@ impl<H: HostVulkan> ExecutorFactory<H> {
             );
             context.payloads = Arc::clone(payloads);
             context.graveyard = Arc::clone(graveyard);
+            context.hold_stats = Arc::clone(hold_stats);
             Arc::new(Mutex::new(context))
         }))
     }
@@ -1451,7 +1492,7 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
     fn pending_ring_fences(&self) -> usize {
         self.contexts
             .values()
-            .map(|context| lock(context).objects.pending_ring_fences())
+            .map(|context| lock(context).pending_ring_fences())
             .sum()
     }
 
@@ -1465,6 +1506,7 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
                 .graveyard
                 .reap(&self.host)
                 .max(self.graveyard.devices()),
+            holds: self.hold_stats.counts(),
             ..FactoryUsage::default()
         };
         for context in self.contexts.values() {
@@ -1478,7 +1520,7 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
                 .max(context.budget.used());
             usage.pending_ring_fences = usage
                 .pending_ring_fences
-                .saturating_add(context.objects.pending_ring_fences());
+                .saturating_add(context.pending_ring_fences());
         }
         usage
     }

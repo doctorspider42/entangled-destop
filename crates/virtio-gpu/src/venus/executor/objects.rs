@@ -620,6 +620,23 @@ pub enum Facts {
     /// A sampler with a custom border colour (stage 5c): one entry of its
     /// device's `maxCustomBorderColorSamplers`, given back when it goes.
     CustomBorderSampler,
+    /// An event, and what the host has been asked to do to it
+    /// ([`super::hold`]).
+    Event(EventState),
+}
+
+/// What the executor knows of a `VkEvent` ([`super::hold`]): its state as
+/// the host has been asked to leave it, in the order the host saw it — a
+/// host `vkSetEvent`/`vkResetEvent`, or the last set or reset of a submit
+/// that reached the driver.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EventState {
+    /// Set, as far as the driver has been told: a GPU wait on it will pass.
+    pub set: bool,
+    /// Work that reached the driver waits on it having been set before the
+    /// submit (a wait on a set from outside its command buffer), and may
+    /// still be running: a reset of it waits for that work first.
+    pub waiters: bool,
 }
 
 /// What the executor knows of a semaphore (stage 5b.3).
@@ -634,8 +651,9 @@ pub enum Facts {
 /// invalid usage, and is refused before it reaches either.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SemaphoreState {
-    /// `VK_SEMAPHORE_TYPE_TIMELINE`. Nothing else is tracked for one: its
-    /// waits may precede their signals, and its value is the host's.
+    /// `VK_SEMAPHORE_TYPE_TIMELINE`. Its waits may precede their signals in
+    /// the guest's order; the driver never sees one that does
+    /// ([`super::hold`]).
     pub timeline: bool,
     /// Binary: a signal operation was submitted and no wait has consumed
     /// it yet (its permanent payload is, or will be, signalled).
@@ -643,6 +661,14 @@ pub struct SemaphoreState {
     /// Binary: a signalled temporary payload is imported, and the next wait
     /// consumes it instead of the permanent one.
     pub temporary: bool,
+    /// Timeline: the highest value a signal of which has reached the
+    /// driver — its initial value, a submitted signal, a `vkSignalSemaphore`
+    /// ([`super::hold`]). A driver wait on anything above it is held.
+    pub host_value: u64,
+    /// Binary: a signal has reached the driver and no wait that reached it
+    /// has consumed it ([`super::hold`]). `pending` is the same in the
+    /// guest's order, which runs ahead of this one while submits are held.
+    pub host_pending: bool,
 }
 
 impl SemaphoreState {

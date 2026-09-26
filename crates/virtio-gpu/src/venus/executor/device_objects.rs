@@ -40,6 +40,7 @@ use crate::venus::protocol::{
 
 use super::context::{id_error, invalid, ExecError, VulkanContext};
 use super::generated::{self, Resolve};
+use super::hold::EventOp;
 use super::host::{HostVulkan, RawHandle};
 use super::limits::Class;
 use super::objects::{Facts, IdError, Kind, Objects, RawObject};
@@ -520,7 +521,22 @@ impl<H: HostVulkan> VulkanContext<H> {
                 };
                 self.create_costing(command, Kind::QueryPool, facts, (Class::Queries, slots))
             }
-            Command::CreateEvent(_) => self.create(command, Kind::Event, Facts::None, 0),
+            Command::CreateEvent(_) => self.create(
+                command,
+                Kind::Event,
+                Facts::Event(super::objects::EventState::default()),
+                0,
+            ),
+            // The host's own set and reset (`super::hold`): a set releases
+            // what waits on it, a reset waits for work that waits on it.
+            Command::SetEvent(args) => {
+                let (device, event) = (args.device.0, args.event.0);
+                self.host_event(command, device, event, true)
+            }
+            Command::ResetEvent(args) => {
+                let (device, event) = (args.device.0, args.event.0);
+                self.host_event(command, device, event, false)
+            }
             Command::CreatePrivateDataSlot(_) => {
                 self.create(command, Kind::PrivateDataSlot, Facts::None, 0)
             }
@@ -596,8 +612,16 @@ impl<H: HostVulkan> VulkanContext<H> {
                 let Some(info) = &args.p_signal_info else {
                     return Err(invalid(NAME, "pSignalInfo is null"));
                 };
-                self.require_timeline(NAME, args.device.0, info.semaphore.0)?;
-                self.pass_through(command)
+                let (device, semaphore, value) = (args.device.0, info.semaphore.0, info.value);
+                self.require_timeline(NAME, device, semaphore)?;
+                self.pass_through(command)?;
+                // A signal the host has now: whatever it covers goes
+                // (`super::hold`).
+                if generated::result_of(command) == Some(crate::venus::protocol::VK_SUCCESS) {
+                    self.host_signalled(device, semaphore, value);
+                    self.release_held()?;
+                }
+                Ok(())
             }
 
             // ------------------------------------------- descriptor sets
@@ -699,24 +723,13 @@ impl<H: HostVulkan> VulkanContext<H> {
 
             // ------------------------------------------------ queries
             Command::GetQueryPoolResults(args) => {
-                const NAME: &str = "vkGetQueryPoolResults";
-                let size = self.query_results_size(
-                    NAME,
-                    args.device.0,
-                    args.query_pool.0,
-                    (args.first_query, args.query_count),
-                    args.stride,
-                    args.flags,
-                )?;
-                if size > args.data_size {
-                    return Err(invalid(
-                        NAME,
-                        format!(
-                            "{size} bytes of results do not fit dataSize {}",
-                            args.data_size
-                        ),
-                    ));
+                if args.flags & super::submit::QUERY_RESULT_WAIT != 0 {
+                    // A wait: the ring worker polls it (`super::submit`).
+                    return self
+                        .wait_slice(command, std::time::Duration::ZERO)
+                        .map(|_| ());
                 }
+                self.check_query_results("vkGetQueryPoolResults", args)?;
                 self.pass_through(command)
             }
             Command::ResetQueryPool(args) => {
@@ -1355,8 +1368,10 @@ impl<H: HostVulkan> VulkanContext<H> {
                     .flatten()
                     .map(|c| c.0)
                     .collect();
+                let events = self.plan_inherited_events(NAME, primary, &secondaries)?;
                 self.pass_through(command)?;
                 self.inherit_recordings(primary, &secondaries);
+                self.store_event_uses(primary, events);
                 Ok(())
             }
 
@@ -1529,8 +1544,16 @@ impl<H: HostVulkan> VulkanContext<H> {
                     args.command_buffer.0,
                     barrier_images(args.p_image_memory_barriers.as_deref()),
                 );
+                let waits: Vec<(u64, EventOp)> = args
+                    .p_events
+                    .iter()
+                    .flatten()
+                    .map(|e| (e.0, EventOp::Wait))
+                    .collect();
                 self.check_families(NAME, device, &pairs, false)?;
+                let uses = self.plan_event_ops(NAME, cb, &waits)?;
                 self.pass_through(command)?;
+                self.store_event_uses(cb, uses);
                 self.note_releases(device, &releases);
                 self.note_touches(device, cb, &images);
                 Ok(())
@@ -1559,8 +1582,16 @@ impl<H: HostVulkan> VulkanContext<H> {
                     args.command_buffer.0,
                     dependency_images(args.p_dependency_infos.iter().flatten()),
                 );
+                let waits: Vec<(u64, EventOp)> = args
+                    .p_events
+                    .iter()
+                    .flatten()
+                    .map(|e| (e.0, EventOp::Wait))
+                    .collect();
                 self.check_families(NAME, device, &pairs, false)?;
+                let uses = self.plan_event_ops(NAME, cb, &waits)?;
                 self.pass_through(command)?;
+                self.store_event_uses(cb, uses);
                 self.note_releases(device, &releases);
                 self.note_touches(device, cb, &images);
                 Ok(())
@@ -1569,10 +1600,23 @@ impl<H: HostVulkan> VulkanContext<H> {
                 const NAME: &str = "vkCmdSetEvent2";
                 let device = self.cmd_device(NAME, args.command_buffer.0)?;
                 let pairs = dependency_families(args.p_dependency_info.iter());
+                let (cb, event) = (args.command_buffer.0, args.event.0);
                 // A set transfers nothing: its barriers' two families are
                 // equal (`VUID-vkCmdSetEvent2-srcQueueFamilyIndex-03842`).
                 self.check_families(NAME, device, &pairs, true)?;
-                self.pass_through(command)
+                self.record_event_op(NAME, cb, event, EventOp::Set, command)
+            }
+            Command::CmdSetEvent(args) => {
+                let (cb, event) = (args.command_buffer.0, args.event.0);
+                self.record_event_op("vkCmdSetEvent", cb, event, EventOp::Set, command)
+            }
+            Command::CmdResetEvent(args) => {
+                let (cb, event) = (args.command_buffer.0, args.event.0);
+                self.record_event_op("vkCmdResetEvent", cb, event, EventOp::Reset, command)
+            }
+            Command::CmdResetEvent2(args) => {
+                let (cb, event) = (args.command_buffer.0, args.event.0);
+                self.record_event_op("vkCmdResetEvent2", cb, event, EventOp::Reset, command)
             }
 
             other if generated::is_pass_through(other) => self.pass_through(other),
@@ -2706,6 +2750,52 @@ impl<H: HostVulkan> VulkanContext<H> {
     ) -> Result<(), ExecError> {
         let device = self.cmd_device(command, cb)?;
         self.check_queries(command, device, pool, first, count)
+    }
+
+    /// A set or reset of `event` recorded into `cb` (`super::hold`): judged
+    /// against what the buffer did to it so far, passed through, noted.
+    fn record_event_op(
+        &mut self,
+        name: &'static str,
+        cb: u64,
+        event: u64,
+        op: EventOp,
+        command: &mut Command<'_>,
+    ) -> Result<(), ExecError> {
+        let uses = self.plan_event_ops(name, cb, &[(event, op)])?;
+        self.pass_through(command)?;
+        self.store_event_uses(cb, uses);
+        Ok(())
+    }
+
+    /// `vkGetQueryPoolResults`' range, stride and `dataSize`, before the
+    /// driver writes a byte.
+    ///
+    /// # Errors
+    /// Fatal, as a value no correct guest sends.
+    pub(super) fn check_query_results(
+        &self,
+        command: &'static str,
+        args: &crate::venus::protocol::GetQueryPoolResultsArgs,
+    ) -> Result<(), ExecError> {
+        let size = self.query_results_size(
+            command,
+            args.device.0,
+            args.query_pool.0,
+            (args.first_query, args.query_count),
+            args.stride,
+            args.flags,
+        )?;
+        if size > args.data_size {
+            return Err(invalid(
+                command,
+                format!(
+                    "{size} bytes of results do not fit dataSize {}",
+                    args.data_size
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// The bytes `count` results from `first` take at `stride` with

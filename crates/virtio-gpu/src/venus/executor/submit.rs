@@ -39,11 +39,21 @@
 //!   with a fence of its own (vkr refuses both as blocking calls). They are
 //!   served here anyway, with the pending-work record below.
 //!
+//! # No wait reaches the driver before its signal
+//!
+//! Every submit goes through [`super::hold`]: one whose waits are not yet
+//! covered by signals the driver already has — a timeline value past every
+//! signal submitted, a binary semaphore whose signal is itself held, an event
+//! nobody has set — is held on the host with everything behind it on its
+//! queue, and released in order once they are. The module docs there have
+//! the argument; here it is one call, [`VulkanContext::enqueue`].
+//!
 //! # Semaphores: what the host sees, and what it does not
 //!
 //! A timeline semaphore is the host's: its value, signals and waits go to
-//! the driver as they are. A binary one is too, with two exceptions this
-//! file tracks per semaphore ([`SemaphoreState`]):
+//! the driver as they are, once covered ([`super::hold`]). A binary one is
+//! too, with two exceptions this file tracks per semaphore
+//! ([`SemaphoreState`]):
 //!
 //! * **`vkImportSemaphoreResourceMESA(resource 0)` is a temporary import of
 //!   an already-signalled payload** (vkr imports a sync file of `-1`). A
@@ -68,7 +78,9 @@
 //!
 //! # Waiting
 //!
-//! Every wait is a real wait on the host, in slices: the ring worker
+//! Every wait is a real wait on the host, in slices — or, when its answer
+//! is behind held work, a nap off the context lock ([`super::hold`]): the
+//! ring worker
 //! ([`super::ExecutingSink`]) asks for one slice at a time with the context
 //! lock released between them, so another ring of the context is never held
 //! up by more than a slice, a ring being torn down stops waiting within one,
@@ -105,15 +117,17 @@ use std::time::Duration;
 
 use crate::renderer::FenceOutcome;
 use crate::venus::protocol::{
-    Command, CreateFenceArgs, DeviceWaitIdleArgs, ImportSemaphoreResourceMESAArgs, QueueSubmitArgs,
-    QueueWaitIdleArgs, VkDevice, VkFence, VkFenceCreateInfo, VkQueue, VkSemaphore, VkSubmitInfo,
-    VkSubmitInfoNext, WaitForFencesArgs, WaitSemaphoreResourceMESAArgs, VK_ERROR_DEVICE_LOST,
-    VK_ERROR_UNKNOWN, VK_SUCCESS, VK_TIMEOUT,
+    Command, CreateFenceArgs, DeviceWaitIdleArgs, GetQueryPoolResultsArgs,
+    ImportSemaphoreResourceMESAArgs, QueueSubmitArgs, QueueWaitIdleArgs, VkDevice, VkFence,
+    VkFenceCreateInfo, VkQueue, VkSemaphore, VkSubmitInfo, VkSubmitInfoNext, WaitForFencesArgs,
+    WaitSemaphoreResourceMESAArgs, VK_ERROR_DEVICE_LOST, VK_ERROR_UNKNOWN, VK_NOT_READY,
+    VK_SUCCESS, VK_TIMEOUT,
 };
 use crate::venus::renderer::{FenceRetirer, RingFence};
 
 use super::context::{id_error, invalid, ExecError, VulkanContext};
 use super::generated;
+use super::hold::Enqueued;
 use super::host::{HostVulkan, RawHandle};
 use super::objects::{Facts, Kind, Pending, SemaphoreState};
 use super::timeline::QueueSync;
@@ -133,6 +147,13 @@ const SETTLE_SLICE: Duration = Duration::from_millis(100);
 /// `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT`: what an emulated wait blocks.
 const STAGE_ALL_COMMANDS: u32 = 0x1_0000;
 
+/// `VK_QUERY_RESULT_WAIT_BIT`: a wait inside the driver with no timeout,
+/// which the executor emulates by polling ([`super::hold`]).
+pub const QUERY_RESULT_WAIT: u32 = 0x2;
+
+/// `VK_SEMAPHORE_WAIT_ANY_BIT`.
+const SEMAPHORE_WAIT_ANY: u32 = 0x1;
+
 fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
@@ -146,7 +167,7 @@ pub fn is_wait(command: &Command<'_>) -> bool {
             | Command::WaitSemaphores(_)
             | Command::QueueWaitIdle(_)
             | Command::DeviceWaitIdle(_)
-    )
+    ) || matches!(command, Command::GetQueryPoolResults(a) if a.flags & QUERY_RESULT_WAIT != 0)
 }
 
 /// How long the guest let `command` wait: `None` for "until it is done"
@@ -364,6 +385,26 @@ impl<H: HostVulkan> VulkanContext<H> {
         match command {
             Command::WaitForFences(args) => {
                 let device = args.device.0;
+                if !self.holds.is_empty() {
+                    // A fence of a held submit is not the driver's yet.
+                    let held: Vec<bool> = args
+                        .p_fences
+                        .iter()
+                        .flatten()
+                        .map(|f| self.holds.holds_fence(f.0))
+                        .collect();
+                    let blocked = if args.wait_all != 0 || held.len() == 1 {
+                        held.iter().any(|h| *h)
+                    } else {
+                        !held.is_empty() && held.iter().all(|h| *h)
+                    };
+                    if blocked {
+                        let mut ret = args.ret;
+                        let done = self.nap_or_time_out(args.timeout, &mut ret);
+                        args.ret = ret;
+                        return Ok(done);
+                    }
+                }
                 let mut attempt = Command::WaitForFences(WaitForFencesArgs {
                     timeout: nanos(slice).min(args.timeout),
                     ..args.clone()
@@ -398,6 +439,26 @@ impl<H: HostVulkan> VulkanContext<H> {
                     for id in info.p_semaphores.iter().flatten() {
                         self.require_timeline(NAME, device, id.0)?;
                     }
+                    // A value no submitted signal reaches is not waited for
+                    // in the driver: its signal may be held, or not sent yet.
+                    let covered: Vec<bool> = info
+                        .p_semaphores
+                        .iter()
+                        .flatten()
+                        .zip(info.p_values.iter().flatten())
+                        .map(|(s, v)| self.timeline_covered(device, s.0, *v))
+                        .collect();
+                    let blocked = if info.flags & SEMAPHORE_WAIT_ANY != 0 {
+                        !covered.is_empty() && !covered.iter().any(|c| *c)
+                    } else {
+                        covered.iter().any(|c| !*c)
+                    };
+                    if blocked {
+                        let mut ret = args.ret;
+                        let done = self.nap_or_time_out(args.timeout, &mut ret);
+                        args.ret = ret;
+                        return Ok(done);
+                    }
                 }
                 let mut attempt =
                     Command::WaitSemaphores(crate::venus::protocol::WaitSemaphoresArgs {
@@ -417,6 +478,10 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.objects
                     .queue(args.queue.0)
                     .map_err(id_error("vkQueueWaitIdle"))?;
+                if self.holds.holds_queue(args.queue.0) {
+                    self.nap = true;
+                    return Ok(false);
+                }
                 match self.queue_idle_slice(args.queue.0, slice) {
                     Some(ret) => {
                         args.ret = ret;
@@ -431,6 +496,10 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.objects
                     .device(device)
                     .map_err(id_error("vkDeviceWaitIdle"))?;
+                if self.holds.holds_device(device) {
+                    self.nap = true;
+                    return Ok(false);
+                }
                 let queues = self.objects.queues_of(device);
                 let unfenced = queues
                     .iter()
@@ -459,6 +528,31 @@ impl<H: HostVulkan> VulkanContext<H> {
                 }
                 args.ret = ret;
                 self.note_result("vkDeviceWaitIdle", Some(ret));
+                Ok(true)
+            }
+            Command::GetQueryPoolResults(args) => {
+                // `WAIT` has no timeout in the driver: a query reset and never
+                // issued is a wait for ever there, with the context lock
+                // held. Polled here instead, without it.
+                self.check_query_results("vkGetQueryPoolResults", args)?;
+                let mut attempt = Command::GetQueryPoolResults(GetQueryPoolResultsArgs {
+                    flags: args.flags & !QUERY_RESULT_WAIT,
+                    ..args.clone()
+                });
+                self.pass_through(&mut attempt)?;
+                let Command::GetQueryPoolResults(answer) = attempt else {
+                    return Err(invalid("vkGetQueryPoolResults", "not a query"));
+                };
+                if answer.ret == VK_NOT_READY && !slice.is_zero() {
+                    self.nap = true;
+                    return Ok(false);
+                }
+                args.ret = if answer.ret == VK_NOT_READY {
+                    VK_TIMEOUT
+                } else {
+                    answer.ret
+                };
+                args.p_data = answer.p_data;
                 Ok(true)
             }
             other => Err(ExecError::NotImplemented {
@@ -501,9 +595,15 @@ impl<H: HostVulkan> VulkanContext<H> {
         }
     }
 
+    /// The guest-order half of a semaphore's state (`pending`,
+    /// `temporary`) as a planned submit left it; the host's half
+    /// ([`super::hold`]) is the driver's order and is kept.
     fn set_semaphore_state(&mut self, device: u64, id: u64, state: SemaphoreState) {
         if let Ok(object) = self.objects.raw_mut(Kind::Semaphore, device, id) {
-            object.facts = Facts::Semaphore(state);
+            if let Facts::Semaphore(old) = &mut object.facts {
+                old.pending = state.pending;
+                old.temporary = state.temporary;
+            }
         }
     }
 
@@ -544,11 +644,15 @@ impl<H: HostVulkan> VulkanContext<H> {
             return Err(invalid(NAME, "pCreateInfo is null"));
         };
         let mut timeline = false;
+        let mut initial = 0;
         for link in &info.p_next {
             if let N::VkSemaphoreTypeCreateInfo(t) = link {
                 match t.semaphore_type {
                     super::policy::SEMAPHORE_TYPE_BINARY => {}
-                    super::policy::SEMAPHORE_TYPE_TIMELINE => timeline = true,
+                    super::policy::SEMAPHORE_TYPE_TIMELINE => {
+                        timeline = true;
+                        initial = t.initial_value;
+                    }
                     other => return Err(invalid(NAME, format!("semaphore type {other}"))),
                 }
             }
@@ -588,6 +692,7 @@ impl<H: HostVulkan> VulkanContext<H> {
         }
         let state = SemaphoreState {
             timeline,
+            host_value: if timeline { initial } else { 0 },
             ..SemaphoreState::default()
         };
         self.create(command, Kind::Semaphore, Facts::Semaphore(state), 0)
@@ -660,24 +765,15 @@ impl<H: HostVulkan> VulkanContext<H> {
             .first()
             .copied()
             .ok_or_else(|| invalid(NAME, "the device has no queue the guest fetched"))?;
-        let host_queue = self
-            .objects
-            .queue(queue)
-            .map_err(id_error(NAME))?
-            .host
-            .raw();
-        let host_semaphore = self
-            .objects
-            .raw(Kind::Semaphore, device, id)
-            .map_err(id_error(NAME))?
-            .host;
+        // An empty submit waiting on the permanent payload, by guest id, the
+        // way a guest's own submit goes: held if its signal is still held.
         let mut submit = Command::QueueSubmit(QueueSubmitArgs {
-            queue: VkQueue(host_queue),
+            queue: VkQueue(queue),
             submit_count: 1,
             p_submits: Some(vec![VkSubmitInfo {
                 p_next: Vec::new(),
                 wait_semaphore_count: 1,
-                p_wait_semaphores: Some(vec![VkSemaphore(host_semaphore)]),
+                p_wait_semaphores: Some(vec![VkSemaphore(id)]),
                 p_wait_dst_stage_mask: Some(vec![STAGE_ALL_COMMANDS]),
                 command_buffer_count: 0,
                 p_command_buffers: None,
@@ -687,12 +783,11 @@ impl<H: HostVulkan> VulkanContext<H> {
             fence: VkFence(0),
             ret: VK_ERROR_UNKNOWN,
         });
-        self.host_call(device, &mut submit)?;
-        if generated::result_of(&submit) == Some(VK_SUCCESS) {
+        if matches!(
+            self.enqueue(queue, device, &mut submit)?,
+            Enqueued::Held | Enqueued::Submitted(VK_SUCCESS)
+        ) {
             self.set_semaphore_state(device, id, state);
-            if let Ok(q) = self.objects.queue_mut(queue) {
-                q.pending.unfenced = true;
-            }
         }
         Ok(())
     }
@@ -942,7 +1037,7 @@ impl<H: HostVulkan> VulkanContext<H> {
         let device = self.objects.queue(queue).map_err(id_error(name))?.device;
         let group = self.group_size(name, device)?;
         let mut states: HashMap<u64, SemaphoreState> = HashMap::new();
-        let (fence, buffers, batches) = match command {
+        let (fence, buffers) = match command {
             Command::QueueSubmit(a) => {
                 for submit in a.p_submits.iter_mut().flatten() {
                     self.plan_submit(name, device, group, submit, &mut states)?;
@@ -954,7 +1049,6 @@ impl<H: HostVulkan> VulkanContext<H> {
                         .iter()
                         .flat_map(|s| s.p_command_buffers.iter().flatten().map(|c| c.0))
                         .collect::<Vec<_>>(),
-                    submits.len(),
                 )
             }
             Command::QueueSubmit2(a) => {
@@ -973,7 +1067,6 @@ impl<H: HostVulkan> VulkanContext<H> {
                                 .map(|c| c.command_buffer.0)
                         })
                         .collect::<Vec<_>>(),
-                    submits.len(),
                 )
             }
             other => {
@@ -994,38 +1087,20 @@ impl<H: HostVulkan> VulkanContext<H> {
                 ));
             }
         }
-        let fence_host = match fence {
-            0 => None,
-            id => Some(
-                self.objects
-                    .raw(Kind::Fence, device, id)
-                    .map_err(id_error(name))?
-                    .host,
-            ),
-        };
-        // Shared payloads first: no other owner's work on them may still be
-        // running when this starts (`super::writes`). The mark follows the
-        // submit whatever the driver answers, so the claim always ends.
-        let claim = self.claim_payloads(queue, &buffers);
-        let passed = self.pass_through(command);
-        if let Some(claim) = claim {
-            self.submit_mark(claim);
+        if fence != 0 {
+            self.objects
+                .raw(Kind::Fence, device, fence)
+                .map_err(id_error(name))?;
         }
-        passed?;
-        if generated::result_of(command) == Some(VK_SUCCESS) {
+        // To the driver if every wait is covered, held otherwise
+        // (`super::hold`). A held submit is the guest's as much as one the
+        // driver took: its semaphores are in the state it leaves them in.
+        if matches!(
+            self.enqueue(queue, device, command)?,
+            Enqueued::Held | Enqueued::Submitted(VK_SUCCESS)
+        ) {
             for (id, state) in states {
                 self.set_semaphore_state(device, id, state);
-            }
-            let q = self.objects.queue_mut(queue).map_err(id_error(name))?;
-            match fence_host {
-                Some(host) => {
-                    q.pending = Pending {
-                        fence: Some((fence, host)),
-                        unfenced: false,
-                    }
-                }
-                None if batches > 0 => q.pending.unfenced = true,
-                None => {}
             }
         }
         Ok(())
@@ -1090,6 +1165,25 @@ impl<H: HostVulkan> VulkanContext<H> {
             .objects
             .queue_on_ring(u32::from(fence.ring_idx))
             .ok_or_else(|| format!("no VkQueue is bound to ring_idx {}", fence.ring_idx))?;
+        if self.holds.holds_queue(queue) {
+            // Behind held work: answered only after it (`super::hold`).
+            let device = self.objects.queue(queue).map_err(|e| e.to_string())?.device;
+            return self.hold_ring_fence(queue, device, fence, retire);
+        }
+        self.ring_fence_now(queue, fence, retire)
+    }
+
+    /// [`Self::create_ring_fence`] on `queue`, which has nothing held: the
+    /// host fence and its empty submit, handed to the fence thread.
+    ///
+    /// # Errors
+    /// As [`Self::create_ring_fence`].
+    pub(super) fn ring_fence_now(
+        &mut self,
+        queue: u64,
+        fence: RingFence,
+        retire: &FenceRetirer,
+    ) -> Result<FenceOutcome, String> {
         let (device, host_queue) = {
             let q = self.objects.queue(queue).map_err(|e| e.to_string())?;
             if q.sync.as_ref().is_some_and(|s| !s.has_room()) {
