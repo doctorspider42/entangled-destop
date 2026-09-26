@@ -147,6 +147,14 @@ pub trait ScanoutSink: Send {
     fn forget_shared(&self, resource_id: Option<u32>) {
         let _ = resource_id;
     }
+
+    /// The guest submitted GPU work (`SUBMIT_3D`: a Venus ring's doorbell, a
+    /// virgl command stream). A hint for a host that keeps its GPU's clocks
+    /// up while the guest uses it (ADR-0004, the GPU-boost amendment); flips
+    /// are the other half of that signal and arrive through the calls above.
+    /// Called on the device's queue worker for every submit, so it must cost
+    /// no more than an atomic store. The default ignores it.
+    fn gpu_work(&self) {}
 }
 
 /// Blanket forwarding so a device can be handed `&`-shared or boxed sinks.

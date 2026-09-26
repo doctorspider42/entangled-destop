@@ -7,6 +7,7 @@
 //! [`InputQueue`].
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
@@ -14,6 +15,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::monitor::MonitorHandle;
 use winit::window::{CursorGrabMode, CustomCursor, Fullscreen, Window, WindowId};
 
+use crate::boost::{BoostGate, BoostPolicy};
 use crate::handle::{HostEvent, Waker};
 use crate::input::{
     ControlEvent, ControlQueue, InputCapture, InputQueue, KeyOutcome, WindowAction,
@@ -56,6 +58,9 @@ pub struct DisplayHost {
     /// The refresh rate the guest is told (`[display] refresh_hz`), to say
     /// how it sits against the window's monitor ([`Self::with_guest_refresh`]).
     guest_refresh_hz: Option<u32>,
+    /// When the window asks the GPU driver for its clocks
+    /// ([`Self::with_gpu_boost`]).
+    boost: BoostPolicy,
 }
 
 impl DisplayHost {
@@ -78,6 +83,7 @@ impl DisplayHost {
             shared: SharedSlot::default(),
             share: false,
             guest_refresh_hz: None,
+            boost: BoostPolicy::Off,
         })
     }
 
@@ -111,6 +117,24 @@ impl DisplayHost {
     /// after building the host whether its renderer can share.
     pub fn set_shared_scanout(&mut self, share: bool) {
         self.share = share;
+    }
+
+    /// When the window asks the host GPU driver for its clocks
+    /// ([`crate::boost`], ADR-0004, the GPU-boost amendment): while the guest
+    /// uses the GPU, always, or never (the default of a host built without
+    /// this). It needs the shareable Vulkan device of
+    /// [`Self::with_shared_scanout`] and a driver with `VK_NV_low_latency2`;
+    /// anywhere else it is a no-op. [`crate::boost::GPU_BOOST_ENV`] overrides
+    /// it.
+    #[must_use]
+    pub fn with_gpu_boost(mut self, policy: BoostPolicy) -> Self {
+        self.set_gpu_boost(policy);
+        self
+    }
+
+    /// [`Self::with_gpu_boost`] in place.
+    pub fn set_gpu_boost(&mut self, policy: BoostPolicy) {
+        self.boost = policy;
     }
 
     /// Overrides the window title (usually `entangled: <vm id>`).
@@ -158,6 +182,7 @@ impl DisplayHost {
             shared,
             share,
             guest_refresh_hz,
+            boost,
         } = self;
         let mut app = App {
             config,
@@ -183,6 +208,7 @@ impl DisplayHost {
             fatal: None,
             guest_refresh_hz,
             seen_frames: 0,
+            boost: BoostGate::new(boost.with_env()),
         };
         event_loop.run_app(&mut app)?;
         match app.fatal.take() {
@@ -252,6 +278,8 @@ struct App {
     guest_refresh_hz: Option<u32>,
     /// Guest frames already accounted for ([`Waker::frames`]).
     seen_frames: u64,
+    /// When to ask the GPU driver for its clocks ([`crate::boost`]).
+    boost: BoostGate,
 }
 
 impl App {
@@ -326,6 +354,7 @@ impl App {
             self.guest_size.0,
             self.guest_size.1,
             self.share.then_some(&self.shared),
+            self.boost.policy(),
         )?;
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -453,7 +482,45 @@ impl App {
         }
         let stats = self.frame_stats();
         let input = self.capture.events().stats();
-        self.reporter.maybe_report(stats, input);
+        let boost = self
+            .renderer
+            .as_ref()
+            .map(Renderer::boost_stats)
+            .unwrap_or_default();
+        self.reporter.maybe_report(stats, input, boost);
+    }
+
+    /// Asks the GPU driver for its clocks while the guest uses the GPU, and
+    /// withdraws the request once it has not for a while ([`crate::boost`]).
+    /// Runs whenever the event loop is about to sleep; while the boost is up
+    /// it makes the loop wake at the end of the hold, and while it is down it
+    /// arms the activity so the next submit or flip wakes the loop.
+    fn steer_boost(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if !renderer.can_boost() {
+            return;
+        }
+        let activity = self.waker.activity();
+        let now = Instant::now();
+        let mut wants = self.boost.wants(now, activity.last());
+        if wants {
+            activity.disarm();
+        } else {
+            activity.arm();
+            // An activity between the look above and the arming woke no
+            // one: look once more, after arming.
+            wants = self.boost.wants(Instant::now(), activity.last());
+            if wants {
+                activity.disarm();
+            }
+        }
+        renderer.set_boost(wants);
+        match self.boost.next_change(Instant::now(), activity.last()) {
+            Some(at) if wants => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            _ => event_loop.set_control_flow(ControlFlow::Wait),
+        }
     }
 
     /// Applies a reserved shortcut's effect to the window (backlog MVP-907,
@@ -679,6 +746,10 @@ impl ApplicationHandler<HostEvent> for App {
         }
     }
 
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.steer_boost(event_loop);
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -703,6 +774,8 @@ impl ApplicationHandler<HostEvent> for App {
                     window.request_redraw();
                 }
             }
+            // `about_to_wait` looks at the activity; the wakeup was the point.
+            HostEvent::GpuActive => {}
             HostEvent::Shutdown => {
                 tracing::info!("shutdown requested; closing the window");
                 event_loop.exit();

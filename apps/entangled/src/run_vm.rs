@@ -271,10 +271,15 @@ fn shares_scanout(plan: &GpuPlan, path: virtio_gpu::ScanoutPath) -> bool {
 /// window tries a Vulkan device that can import the renderer's scanout
 /// buffers when it opens; a headless display gets an off-screen one now. A
 /// display that cannot is not an error — the copy path serves every frame.
-fn share_scanout(presentation: &mut Presentation) {
+///
+/// The window also asks the GPU driver for its clocks while the guest draws,
+/// unless the profile's `gpu_boost = false` says otherwise (ADR-0004, the
+/// GPU-boost amendment). A headless display has no swapchain to ask on.
+fn share_scanout(presentation: &mut Presentation, gpu_boost: Option<bool>) {
     match presentation {
         Presentation::Windowed(host) => {
             host.set_shared_scanout(true);
+            host.set_gpu_boost(display::BoostPolicy::from_profile(gpu_boost));
             tracing::info!(
                 "the window will present the renderer's scanout buffers on its own GPU \
                  (zero-copy presentation; {}=copy turns it off)",
@@ -1276,7 +1281,7 @@ pub fn run_with(
         _ => return Err("input devices were not built".into()),
     };
     if built.shares_scanout {
-        share_scanout(&mut presentation);
+        share_scanout(&mut presentation, cfg.display.gpu_boost);
     }
 
     // The debug screenshot timer (--screenshot-after). Detached on purpose:

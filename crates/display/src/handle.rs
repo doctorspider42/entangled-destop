@@ -14,6 +14,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use winit::event_loop::EventLoopProxy;
 
@@ -26,6 +27,9 @@ use crate::DisplayError;
 pub(crate) enum HostEvent {
     /// The scanout changed (or someone asked for a redraw).
     Redraw,
+    /// The guest used the GPU while the window was not boosting it
+    /// ([`crate::boost`]): look again.
+    GpuActive,
     /// Tear the window down and return from [`crate::DisplayHost::run`].
     Shutdown,
 }
@@ -40,6 +44,63 @@ pub(crate) struct Waker {
     /// scanout, shared or copied), so the window can count the ones it
     /// never drew ([`crate::FrameStats::unshown`]).
     frames: Arc<AtomicU64>,
+    /// When the guest last used the GPU, for the boost ([`crate::boost`]).
+    activity: Arc<Activity>,
+}
+
+/// When the guest last used the GPU — a flip reached the display or a
+/// `SUBMIT_3D` the device — as the window's GPU boost reads it
+/// ([`crate::boost`], ADR-0004, the GPU-boost amendment).
+///
+/// Written by device threads (an atomic store per event), read by the
+/// window. `armed` is how the window, once it has let the boost go, asks to
+/// be woken by the next activity: one wakeup per idle-to-active transition,
+/// never one per submit.
+#[derive(Debug)]
+pub(crate) struct Activity {
+    base: Instant,
+    /// Nanoseconds after `base` of the latest activity, plus one; 0: none.
+    last: AtomicU64,
+    armed: AtomicBool,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            last: AtomicU64::new(0),
+            armed: AtomicBool::new(false),
+        }
+    }
+
+    /// Records activity now; whether the window asked to be woken for it.
+    fn note(&self) -> bool {
+        let ns = u64::try_from(self.base.elapsed().as_nanos())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1);
+        self.last.fetch_max(ns, Ordering::SeqCst);
+        self.armed.swap(false, Ordering::SeqCst)
+    }
+
+    /// The latest activity, if any.
+    pub(crate) fn last(&self) -> Option<Instant> {
+        match self.last.load(Ordering::SeqCst) {
+            0 => None,
+            ns => Some(self.base + Duration::from_nanos(ns - 1)),
+        }
+    }
+
+    /// The window is not boosting: wake it at the next activity. The caller
+    /// looks at [`Self::last`] again *after* arming, so an activity that
+    /// landed in between is not lost.
+    pub(crate) fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// The window is boosting: activity needs no wakeup.
+    pub(crate) fn disarm(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Waker {
@@ -48,6 +109,7 @@ impl Waker {
             proxy: Some(proxy),
             pending: Arc::new(AtomicBool::new(false)),
             frames: Arc::new(AtomicU64::new(0)),
+            activity: Arc::new(Activity::new()),
         }
     }
 
@@ -56,6 +118,7 @@ impl Waker {
             proxy: None,
             pending: Arc::new(AtomicBool::new(false)),
             frames: Arc::new(AtomicU64::new(0)),
+            activity: Arc::new(Activity::new()),
         }
     }
 
@@ -79,10 +142,31 @@ impl Waker {
         }
     }
 
-    /// A guest frame was published: counted, then [`Self::wake`].
+    /// A guest frame was published: counted, noted as GPU activity, then
+    /// [`Self::wake`] (which is also what an armed boost needs).
     pub(crate) fn frame(&self) {
         self.frames.fetch_add(1, Ordering::Relaxed);
+        self.activity.note();
         self.wake();
+    }
+
+    /// The guest submitted GPU work ([`virtio_gpu::ScanoutSink::gpu_work`]):
+    /// noted, and the window woken only if it asked to be.
+    pub(crate) fn gpu_work(&self) {
+        if !self.activity.note() {
+            return;
+        }
+        let Some(proxy) = &self.proxy else {
+            return;
+        };
+        if proxy.send_event(HostEvent::GpuActive).is_err() {
+            tracing::trace!("GPU activity wakeup dropped: event loop has exited");
+        }
+    }
+
+    /// The guest's GPU activity, as the window reads it.
+    pub(crate) fn activity(&self) -> &Activity {
+        &self.activity
     }
 
     /// Guest frames published so far.
@@ -446,6 +530,10 @@ impl virtio_gpu::ScanoutSink for DisplayHandle {
             presenter.forget(resource_id);
         }
     }
+
+    fn gpu_work(&self) {
+        self.waker.gpu_work();
+    }
 }
 
 /// A display rejection as the GPU device sees it: a message it turns into
@@ -654,5 +742,63 @@ mod tests {
         assert!(!fake.shown(), "a mode change shows the (new) mirror");
         handle.attach_presenter(None);
         assert!(!handle.shares_scanout());
+    }
+
+    #[test]
+    fn guest_frames_and_submits_are_gpu_activity() {
+        let handle = DisplayHandle::detached(4, 2).unwrap();
+        let activity = handle.waker.activity();
+        assert_eq!(activity.last(), None, "nothing yet");
+        let before = Instant::now();
+        let sink: &dyn ScanoutSink = &handle;
+        sink.gpu_work();
+        let first = activity.last().expect("a submit is activity");
+        assert!(first >= before);
+        std::thread::sleep(Duration::from_millis(2));
+        handle.update_scanout(0, 0, 1, 1, &[1, 2, 3, 4]).unwrap();
+        let second = activity.last().expect("a flip is activity");
+        assert!(second > first, "the latest wins");
+        // A cursor move or a redraw request is not the guest using the GPU.
+        handle.move_cursor(1, 1);
+        handle.request_redraw();
+        assert_eq!(activity.last(), Some(second));
+    }
+
+    #[test]
+    fn an_armed_window_is_woken_once_per_idle_to_active_transition() {
+        let activity = Activity::new();
+        assert!(!activity.note(), "not armed: no wakeup");
+        activity.arm();
+        assert!(activity.note(), "the first activity after arming wakes");
+        assert!(!activity.note(), "and only the first");
+        assert!(!activity.note());
+        activity.arm();
+        activity.disarm();
+        assert!(!activity.note(), "a boosting window is never woken");
+    }
+
+    #[test]
+    fn activity_never_goes_backwards_across_threads() {
+        let activity = Arc::new(Activity::new());
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let activity = Arc::clone(&activity);
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        activity.note();
+                    }
+                })
+            })
+            .collect();
+        let mut seen = None;
+        for _ in 0..1000 {
+            let now = activity.last();
+            assert!(now >= seen, "went backwards");
+            seen = now;
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(activity.last().is_some());
     }
 }

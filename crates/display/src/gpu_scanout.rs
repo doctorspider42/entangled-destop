@@ -113,12 +113,19 @@ const REPORT_EVERY: u64 = 600;
 /// scanout buffers: the Vulkan backend with `VK_KHR_external_memory_win32`
 /// and `VK_EXT_queue_family_foreign`. See the module docs.
 ///
+/// With `latency`, it also enables `VK_NV_low_latency2` and the
+/// `VK_KHR_present_id` it requires ([`crate::latency::EXTENSIONS`]) when the
+/// adapter has both — the window's GPU boost (ADR-0004, the GPU-boost
+/// amendment); an adapter without them opens as before, and the window then
+/// has no boost to ask for.
+///
 /// # Errors
 /// Why not, as a sentence: not a Vulkan adapter, an extension missing, a
 /// driver refusal.
 pub fn request_device(
     adapter: &wgpu::Adapter,
     label: &'static str,
+    latency: bool,
 ) -> Result<(wgpu::Device, wgpu::Queue), String> {
     let features = wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
     if !adapter.features().contains(features) {
@@ -136,16 +143,29 @@ pub fn request_device(
         {
             return Err("the adapter has no VK_EXT_queue_family_foreign".into());
         }
+        let caps = hal.physical_device_capabilities();
+        // `VK_NV_low_latency2` also requires Vulkan 1.2 (or
+        // `VK_KHR_timeline_semaphore`): the physical device's version.
+        let latency = latency
+            && caps.properties().api_version >= vk::API_VERSION_1_2
+            && crate::latency::EXTENSIONS
+                .iter()
+                .all(|name| caps.supports_extension(name));
         let hints = wgpu::MemoryHints::default();
         let add_foreign: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> = Box::new(
-            |args: wgpu::hal::vulkan::CreateDeviceCallbackArgs<'_, '_, '_>| {
+            move |args: wgpu::hal::vulkan::CreateDeviceCallbackArgs<'_, '_, '_>| {
                 args.extensions.push(ash::ext::queue_family_foreign::NAME);
+                if latency {
+                    args.extensions.extend(crate::latency::EXTENSIONS);
+                }
             },
         );
         // SAFETY: `features` are the adapter's own (checked above), and the
-        // callback only *adds* an extension the adapter supports (checked
+        // callback only *adds* extensions the adapter supports (checked
         // above), which `open_with_callback` allows; the device it opens is
         // handed straight to `create_device_from_hal` on the same adapter.
+        // `VK_NV_low_latency2`'s own requirements, a Vulkan 1.2 device and
+        // `VK_KHR_present_id`, are checked above and enabled beside it.
         unsafe { hal.open_with_callback(features, &hints, Some(add_foreign)) }
             .map_err(|e| format!("the Vulkan device could not be opened ({e})"))?
     };
@@ -479,7 +499,7 @@ impl GpuScanout {
             compatible_surface: None,
         }))
         .map_err(|e| format!("no Vulkan adapter ({e})"))?;
-        let (device, queue) = request_device(&adapter, "entangled-display-offscreen")?;
+        let (device, queue) = request_device(&adapter, "entangled-display-offscreen", false)?;
         device.on_uncaptured_error(Box::new(|err| {
             tracing::error!(%err, "wgpu reported an uncaptured error (off-screen presenter)");
         }));

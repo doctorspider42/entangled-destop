@@ -27,6 +27,9 @@
 //! - [`shared`]: presenting a renderer's scanout image without reading it back
 //!   (ADR-0004, zero-copy presentation) — on Windows, `gpu_scanout` imports it
 //!   onto the display's own Vulkan device and copies each frame on the GPU.
+//! - [`boost`]: when the window asks the GPU driver for its clocks while the
+//!   guest draws (ADR-0004, the GPU-boost amendment) — on Windows, `latency`
+//!   makes the `VK_NV_low_latency2` request on the window's swapchain.
 //! - [`input`]: winit events → [`virtio_input::InputEvent`] batches, plus the
 //!   grab state machine and reserved shortcuts.
 //! - [`keymap`]: winit physical key → Linux `KEY_*` table (MVP-902).
@@ -77,6 +80,7 @@
 
 #![deny(missing_docs)]
 
+pub mod boost;
 mod error;
 #[cfg(windows)]
 mod gpu_scanout;
@@ -84,6 +88,8 @@ mod handle;
 mod host;
 pub mod input;
 pub mod keymap;
+#[cfg(windows)]
+mod latency;
 mod present;
 pub mod refresh;
 mod renderer;
@@ -93,6 +99,7 @@ mod sync;
 pub mod ux;
 pub mod viewport;
 
+pub use boost::BoostPolicy;
 pub use error::DisplayError;
 pub use handle::DisplayHandle;
 pub use host::DisplayHost;
