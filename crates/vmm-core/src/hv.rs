@@ -257,6 +257,20 @@ pub trait ExitHandler: Send {
     fn reset_requested(&self) -> bool {
         false
     }
+
+    /// The guest wrote EOI for `vector`, and the hypervisor reported it.
+    ///
+    /// Only WHP does, and only for interrupts requested as level-triggered
+    /// (`WHvRunVpExitReasonX64ApicEoi`), which the userspace IOAPIC does for
+    /// the pins that asked to hear about EOIs — the 8254, which re-injects the
+    /// timer ticks a guest missed one EOI at a time. KVM keeps EOIs inside its
+    /// in-kernel irqchip and never calls this. The default ignores it.
+    ///
+    /// Called on the vCPU thread before the guest is re-entered; it may
+    /// request another interrupt, which is then pending when the guest resumes.
+    fn apic_eoi(&mut self, vector: u8) {
+        let _ = vector;
+    }
 }
 
 /// Register-level access to one virtual CPU, implemented per hypervisor.

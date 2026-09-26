@@ -235,6 +235,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             frame_stats: None,
             host_visible_mib: None,
             gpu_memory_mib: None,
+            gpu_boost: None,
         },
         // The installer has nothing to say; the *installed* profile below is
         // where the card and the pad belong.

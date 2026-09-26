@@ -38,13 +38,21 @@
 //!
 //! # Deliberate simplifications
 //!
-//! * **No EOI tracking / remote IRR.** A real IOAPIC latches a level-triggered
-//!   interrupt until the local APIC broadcasts the EOI, which WHP can report
-//!   (`WHvRunVpExitReasonX64ApicEoi`). Every line this machine owns is an
+//! * **No remote IRR.** A real IOAPIC latches a level-triggered interrupt until
+//!   the local APIC broadcasts the EOI. Every line this machine owns is an
 //!   edge-triggered ISA-style pin — the 8254 on pin 2, the UART on pin 4, virtio
-//!   on 5.. — so nothing needs re-assertion, and turning the EOI exit on for all
-//!   of them would only cost exits. This is the same call the KVM path already
-//!   made for its irqfds (`crate::irqfd`).
+//!   on 5.. — so nothing needs re-assertion. This is the same call the KVM path
+//!   already made for its irqfds (`crate::irqfd`).
+//! * **EOI notification for the pins that ask for it.** One device does need to
+//!   know when the guest has *taken* its interrupt: the 8254, which re-injects
+//!   the channel-0 edges a stalled host thread or a descheduled vCPU made the
+//!   guest miss (see [`crate::irqchip::pit`]). A pin with an [`EoiListener`] is
+//!   requested from the local APIC as **level**-triggered — that is what makes
+//!   WHP report the guest's EOI (`WHvRunVpExitReasonX64ApicEoi`), and the run
+//!   loop hands it to [`IoApic::eoi`]. The trigger mode only sets the vector's
+//!   TMR bit in the local APIC; Linux's edge flow (`apic_ack_edge`) never reads
+//!   it. KVM's in-kernel IOAPIC does the same for its PIT with an EOI-exit bitmap
+//!   and an ack notifier, which WHP has no equivalent of.
 //! * **A masked pin latches one pending edge.** Hardware loses an edge that
 //!   arrives while the pin is masked. We remember it and deliver on unmask,
 //!   because losing one is not symmetric in consequence: Linux masks and unmasks
@@ -55,7 +63,7 @@
 //!   active-low ISA line.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use virtio_core::interrupt::{InterruptError, IrqLine};
 use vmm_core::hv::{
@@ -122,6 +130,26 @@ pub struct IoApic {
     /// cheapest way for a test or `entangled doctor` to tell "the device never
     /// raised its line" from "the guest never unmasked the pin".
     delivered: AtomicU32,
+    /// One bit per pin that has an [`EoiListener`] — read on every delivery, so
+    /// kept out of the listener table's lock.
+    listened: AtomicU32,
+    /// The listeners themselves. `Weak`, because the device that listens also
+    /// holds the pin's [`IoApicLine`] and with it an `Arc` of this IOAPIC.
+    listeners: Mutex<Vec<Option<Weak<dyn EoiListener>>>>,
+}
+
+/// A device that wants to know when the guest has taken the interrupt its pin
+/// raised — the 8254's lost-tick re-injection (see the module notes).
+///
+/// Both methods are called on a vCPU thread, never under the IOAPIC lock, and
+/// may raise the pin again from inside.
+pub trait EoiListener: Send + Sync {
+    /// The guest wrote EOI for the vector this pin is routed to.
+    fn eoi(&self);
+    /// The guest unmasked the pin. Edges that arrive while a pin is masked are
+    /// lost on hardware (bar the one this model latches), so a device keeping
+    /// count of owed interrupts forgets them here.
+    fn unmasked(&self);
 }
 
 impl IoApic {
@@ -138,7 +166,67 @@ impl IoApic {
             }),
             delivery,
             delivered: AtomicU32::new(0),
+            listened: AtomicU32::new(0),
+            listeners: Mutex::new((0..REDIRECTION_ENTRIES).map(|_| None).collect()),
         })
+    }
+
+    /// Registers `listener` for pin `pin`: from now on the pin is delivered as
+    /// level-triggered, so the guest's EOI comes back through [`Self::eoi`].
+    pub fn listen(&self, pin: u8, listener: Weak<dyn EoiListener>) -> Result<(), IoApicError> {
+        let index = usize::from(pin);
+        if index >= REDIRECTION_ENTRIES {
+            return Err(IoApicError::NoSuchPin(pin));
+        }
+        match self.listeners.lock() {
+            Ok(mut listeners) => listeners[index] = Some(listener),
+            Err(_) => {
+                tracing::error!("IOAPIC listener table is poisoned; pin {pin} gets no EOIs");
+                return Ok(());
+            }
+        }
+        self.listened
+            .fetch_or(1 << u32::from(pin), Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn listener(&self, pin: usize) -> Option<Arc<dyn EoiListener>> {
+        if self.listened.load(Ordering::Acquire) & (1 << pin) == 0 {
+            return None;
+        }
+        self.listeners
+            .lock()
+            .ok()
+            .and_then(|listeners| listeners.get(pin).cloned().flatten())
+            .and_then(|weak| weak.upgrade())
+    }
+
+    /// The guest wrote EOI for `vector` (WHP's `X64ApicEoi` exit): tells every
+    /// listening pin routed to that vector.
+    ///
+    /// Only pins with a listener are delivered level-triggered, so only their
+    /// vectors produce the exit — but the vector is guest-programmed and two
+    /// pins may share one, so every match is told.
+    pub fn eoi(&self, vector: u8) {
+        let listened = self.listened.load(Ordering::Acquire);
+        if listened == 0 {
+            return;
+        }
+        let pins: Vec<usize> = {
+            let Ok(state) = self.state.lock() else {
+                tracing::error!("IOAPIC lock is poisoned; dropping an EOI");
+                return;
+            };
+            (0..REDIRECTION_ENTRIES)
+                .filter(|&pin| listened & (1 << pin) != 0)
+                .filter(|&pin| state.redirection[pin] & RTE_VECTOR == u64::from(vector))
+                .collect()
+        };
+        for pin in pins {
+            if let Some(listener) = self.listener(pin) {
+                listener.eoi();
+            }
+        }
     }
 
     /// True when `addr` falls in the IOAPIC's register window.
@@ -265,13 +353,17 @@ impl IoApic {
             }
             decode(entry)
         };
-        self.deliver(request)
+        self.deliver(pin, request)
     }
 
-    fn deliver(&self, request: Option<InterruptRequest>) -> Result<(), InterruptError> {
-        let Some(request) = request else {
+    fn deliver(&self, pin: u8, request: Option<InterruptRequest>) -> Result<(), InterruptError> {
+        let Some(mut request) = request else {
             return Ok(());
         };
+        if self.listened.load(Ordering::Acquire) & (1 << u32::from(pin)) != 0 {
+            // So the local APIC reports the EOI (see the module notes).
+            request.trigger = TriggerMode::Level;
+        }
         self.delivery
             .request(&request)
             .map_err(|e| InterruptError::Signal(e.to_string()))?;
@@ -332,7 +424,13 @@ impl IoApic {
                 _ => None,
             }
         };
-        if let Some(pin) = released {
+        let Some((pin, latched)) = released else {
+            return;
+        };
+        if let Some(listener) = self.listener(usize::from(pin)) {
+            listener.unmasked();
+        }
+        if latched {
             let request = match self.state.lock() {
                 Ok(state) => state
                     .redirection
@@ -341,7 +439,7 @@ impl IoApic {
                     .and_then(decode),
                 Err(_) => None,
             };
-            if let Err(e) = self.deliver(request) {
+            if let Err(e) = self.deliver(pin, request) {
                 tracing::warn!(pin, error = %e, "delivering a latched IOAPIC edge failed");
             }
         }
@@ -368,9 +466,9 @@ fn read_register(state: &IoApicState) -> u32 {
     }
 }
 
-/// Serves a write of the register named by `IOREGSEL`. Returns the pin whose
-/// latched edge was just released, if any.
-fn write_register(state: &mut IoApicState, value: u32) -> Option<u8> {
+/// Serves a write of the register named by `IOREGSEL`. Returns the pin the write
+/// just unmasked, if any, and whether that released a latched edge.
+fn write_register(state: &mut IoApicState, value: u32) -> Option<(u8, bool)> {
     match state.select {
         REG_ID => {
             state.id = ((value >> 24) & 0x0f) as u8;
@@ -390,12 +488,12 @@ fn write_register(state: &mut IoApicState, value: u32) -> Option<u8> {
             *entry &= !RTE_READ_ONLY;
             let now_masked = *entry & RTE_MASK != 0;
             let pin = u8::try_from(pin).ok()?;
-            let latched = state.pending & (1 << u32::from(pin)) != 0;
-            if was_masked && !now_masked && latched {
-                state.pending &= !(1 << u32::from(pin));
-                return Some(pin);
+            if !(was_masked && !now_masked) {
+                return None;
             }
-            None
+            let latched = state.pending & (1 << u32::from(pin)) != 0;
+            state.pending &= !(1 << u32::from(pin));
+            Some((pin, latched))
         }
     }
 }
@@ -705,5 +803,98 @@ mod tests {
         route(&apic, 4, 0x31);
         assert!(apic.pulse(4).is_err());
         assert_eq!(apic.delivered(), 0);
+    }
+
+    #[derive(Default)]
+    struct Ears {
+        eois: AtomicU32,
+        unmasks: AtomicU32,
+    }
+
+    impl EoiListener for Ears {
+        fn eoi(&self) {
+            self.eois.fetch_add(1, Ordering::AcqRel);
+        }
+        fn unmasked(&self) {
+            self.unmasks.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn listen(apic: &IoApic, pin: u8) -> Arc<Ears> {
+        let ears = Arc::new(Ears::default());
+        let listener: Arc<dyn EoiListener> = ears.clone();
+        apic.listen(pin, Arc::downgrade(&listener)).unwrap();
+        ears
+    }
+
+    /// A pin with a listener is requested level-triggered — the only way WHP
+    /// reports the EOI — and the others keep the trigger mode the guest wrote.
+    #[test]
+    fn a_listened_pin_is_delivered_level_triggered() {
+        let (apic, rec) = chip();
+        let _ears = listen(&apic, 2);
+        route(&apic, 2, 0x30);
+        route(&apic, 4, 0x34);
+        apic.pulse(2).unwrap();
+        apic.pulse(4).unwrap();
+        let requests = rec.requests.lock().unwrap();
+        assert_eq!(requests[0].vector, 0x30);
+        assert_eq!(requests[0].trigger, TriggerMode::Level);
+        assert_eq!(requests[1].vector, 0x34);
+        assert_eq!(requests[1].trigger, TriggerMode::Edge);
+    }
+
+    /// An EOI for the vector a listened pin is routed to reaches its listener;
+    /// an EOI for any other vector does not.
+    #[test]
+    fn an_eoi_reaches_the_pin_routed_to_that_vector() {
+        let (apic, _rec) = chip();
+        let ears = listen(&apic, 2);
+        route(&apic, 2, 0x30);
+        apic.eoi(0x31);
+        assert_eq!(ears.eois.load(Ordering::Acquire), 0);
+        apic.eoi(0x30);
+        assert_eq!(ears.eois.load(Ordering::Acquire), 1);
+        // Re-routed by the guest: the EOI follows the redirection table.
+        route(&apic, 2, 0x40);
+        apic.eoi(0x30);
+        apic.eoi(0x40);
+        assert_eq!(ears.eois.load(Ordering::Acquire), 2);
+    }
+
+    /// The listener hears every unmask — with or without a latched edge — and
+    /// before that edge goes out, so it can forget its debt first.
+    #[test]
+    fn an_unmask_is_reported_to_the_listener() {
+        let (apic, rec) = chip();
+        let ears = listen(&apic, 2);
+        write_reg(&apic, REG_REDIRECTION_BASE + 2 * 2, 0x30 | RTE_MASK as u32);
+        route(&apic, 2, 0x30);
+        assert_eq!(ears.unmasks.load(Ordering::Acquire), 1);
+        assert!(rec.requests.lock().unwrap().is_empty());
+        // Rewriting an unmasked entry is not an unmask.
+        route(&apic, 2, 0x30);
+        assert_eq!(ears.unmasks.load(Ordering::Acquire), 1);
+
+        write_reg(&apic, REG_REDIRECTION_BASE + 2 * 2, 0x30 | RTE_MASK as u32);
+        apic.pulse(2).unwrap();
+        route(&apic, 2, 0x30);
+        assert_eq!(ears.unmasks.load(Ordering::Acquire), 2);
+        let requests = rec.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "the latched edge still goes out");
+        assert_eq!(requests[0].trigger, TriggerMode::Level);
+    }
+
+    /// A listener that has gone away is simply not called; the pin keeps
+    /// working.
+    #[test]
+    fn a_dropped_listener_is_harmless() {
+        let (apic, rec) = chip();
+        drop(listen(&apic, 2));
+        route(&apic, 2, 0x30);
+        apic.pulse(2).unwrap();
+        apic.eoi(0x30);
+        assert_eq!(rec.requests.lock().unwrap().len(), 1);
+        assert!(apic.listen(24, Weak::<Ears>::new()).is_err());
     }
 }

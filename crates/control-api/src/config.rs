@@ -485,6 +485,19 @@ pub struct DisplaySection {
     /// take of the host's VRAM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_memory_mib: Option<u32>,
+    /// Whether the window asks the host GPU driver for its clocks while the
+    /// guest draws (ADR-0004, the GPU-boost amendment): NVIDIA's
+    /// `VK_NV_low_latency2` boost on the window's swapchain, held while the
+    /// guest submits GPU work or flips and for a second after. It raises the
+    /// GPU from P5/P8 to P0 for the renderer's work too, at the price of the
+    /// watts P0 costs while the guest draws. Absent means the default, on;
+    /// `false` turns it off. Only the Venus GPU desktop has a renderer to
+    /// boost, so `true` beside `venus = false` is refused. A host without the
+    /// extension (another vendor, Linux today) ignores it.
+    ///
+    /// Not written when absent: an older engine denies unknown keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_boost: Option<bool>,
 }
 
 /// Bounds on [`DisplaySection::refresh_hz`], mirroring `virtio_gpu::edid`'s
@@ -523,6 +536,7 @@ impl Default for DisplaySection {
             frame_stats: None,
             host_visible_mib: None,
             gpu_memory_mib: None,
+            gpu_boost: None,
         }
     }
 }
@@ -822,6 +836,14 @@ impl VmConfig {
                 ));
             }
         }
+        if self.display.gpu_boost == Some(true) && !self.display.venus {
+            return err(
+                "display.gpu_boost = true asks the host GPU driver for its clocks while the \
+                 guest's GPU work runs, but only the Venus GPU desktop (display.venus = true) \
+                 runs any on the host GPU; set venus = true or drop gpu_boost"
+                    .into(),
+            );
+        }
         if let Some(mib) = self.display.gpu_memory_mib {
             if !(MIN_GPU_MEMORY_MIB..=MAX_GPU_MEMORY_MIB).contains(&mib) {
                 return err(format!(
@@ -1068,6 +1090,44 @@ scale = 1.0
             let err = VmConfig::from_toml(&text).expect_err("refused");
             assert!(err.to_string().contains("gpu_memory_mib"), "{mib}: {err}");
         }
+    }
+
+    /// `[display] gpu_boost`: absent stays absent and is never written, both
+    /// values round-trip beside `venus = true`, `false` is always allowed, and
+    /// `true` without the GPU desktop is refused by name.
+    #[test]
+    fn the_gpu_boost_is_optional_and_only_asked_for_with_venus() {
+        let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).expect("parses");
+        assert_eq!(cfg.display.gpu_boost, None);
+        let text = toml::to_string(&cfg).expect("serialises");
+        assert!(!text.contains("gpu_boost"), "no key invented: {text}");
+        for value in [true, false] {
+            let text = format!("{BACKLOG_EXAMPLE}venus = true\ngpu_boost = {value}\n");
+            let cfg = VmConfig::from_toml(&text).unwrap_or_else(|e| panic!("{value}: {e}"));
+            assert_eq!(cfg.display.gpu_boost, Some(value));
+            let back = toml::to_string(&cfg).expect("serialises");
+            assert!(back.contains(&format!("gpu_boost = {value}")), "{back}");
+            assert_eq!(
+                VmConfig::from_toml(&back).expect("round-trips").display,
+                cfg.display
+            );
+        }
+        let off = format!("{BACKLOG_EXAMPLE}gpu_boost = false\n");
+        assert_eq!(
+            VmConfig::from_toml(&off)
+                .expect("off is always fine")
+                .display
+                .gpu_boost,
+            Some(false)
+        );
+        let lonely = format!("{BACKLOG_EXAMPLE}gpu_boost = true\n");
+        let error = VmConfig::from_toml(&lonely).expect_err("no renderer to boost");
+        assert!(
+            error.to_string().contains("gpu_boost") && error.to_string().contains("venus"),
+            "{error}"
+        );
+        let typo = format!("{BACKLOG_EXAMPLE}venus = true\ngpu_boost = \"max\"\n");
+        assert!(VmConfig::from_toml(&typo).is_err(), "a boolean, not a word");
     }
 
     /// `[display] venus`: off unless asked for, never written while off (an

@@ -2113,6 +2113,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
             .ok_or_else(|| truncated(cmd::SUBMIT_3D, buf.len(), CmdSubmit3d::LEN + declared))?;
         let ctx_id = hdr.ctx_id;
         self.three_d_mut(cmd::SUBMIT_3D)?.submit(ctx_id, stream)?;
+        // The host may keep its GPU's clocks up while the guest uses it
+        // (ADR-0004, the GPU-boost amendment).
+        self.display.gpu_work();
         tracing::trace!(ctx = ctx_id, bytes = declared, "virtio-gpu 3D submit");
         Ok(Reply::ok())
     }
@@ -3212,6 +3215,95 @@ mod tests {
             GpuDevice::with_renderer(NoSink, Box::new(crate::null_renderer::NullRenderer::new()));
         assert_eq!(three_d.max_command_bytes(), MAX_COMMAND_BYTES_3D);
         assert_ne!(three_d.device_features() & crate::VIRTIO_GPU_F_VIRGL, 0);
+    }
+
+    /// Every accepted `SUBMIT_3D` tells the sink the guest used the GPU (the
+    /// host's GPU boost, ADR-0004); a refused one does not.
+    #[test]
+    fn an_accepted_submit_is_reported_to_the_sink_as_gpu_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(Arc<AtomicUsize>);
+        impl crate::sink::ScanoutSink for Counting {
+            fn resolution(&self) -> (u32, u32) {
+                (64, 64)
+            }
+            fn set_resolution(&self, _: u32, _: u32) -> Result<(), crate::sink::SinkError> {
+                Ok(())
+            }
+            fn update_scanout(
+                &self,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: &[u8],
+            ) -> Result<(), crate::sink::SinkError> {
+                Ok(())
+            }
+            fn set_cursor(
+                &self,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: u32,
+                _: &[u8],
+            ) -> Result<(), crate::sink::SinkError> {
+                Ok(())
+            }
+            fn move_cursor(&self, _: u32, _: u32) -> Result<(), crate::sink::SinkError> {
+                Ok(())
+            }
+            fn hide_cursor(&self) -> Result<(), crate::sink::SinkError> {
+                Ok(())
+            }
+            fn gpu_work(&self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let work = Arc::new(AtomicUsize::new(0));
+        let mut device = GpuDevice::with_renderer(
+            Counting(Arc::clone(&work)),
+            Box::new(crate::null_renderer::NullRenderer::new()),
+        );
+        let mem = Arc::new(virtio_core::testing::guest_memory(1 << 20));
+        let hdr = |kind: u32, ctx_id: u32| CtrlHdr {
+            kind,
+            flags: 0,
+            fence_id: 0,
+            ctx_id,
+            ring_idx: 0,
+        };
+        let with_hdr = |kind: u32, ctx_id: u32, body: &[u8]| {
+            let mut buf = hdr(kind, ctx_id).to_bytes().to_vec();
+            buf.extend_from_slice(body);
+            buf
+        };
+        let mut create = vec![0u8; 8 + 64];
+        create[0..4].copy_from_slice(&4u32.to_le_bytes());
+        create[8..12].copy_from_slice(b"test");
+        let created = device.dispatch(
+            &mem,
+            &hdr(cmd::CTX_CREATE, 1),
+            &with_hdr(cmd::CTX_CREATE, 1, &create),
+        );
+        assert_eq!(created.code, resp::OK_NODATA);
+        assert_eq!(work.load(Ordering::Relaxed), 0, "a context is not work");
+
+        // An empty stream: `size` 0, padding 0.
+        let submit = with_hdr(cmd::SUBMIT_3D, 1, &[0u8; 8]);
+        let reply = device.dispatch(&mem, &hdr(cmd::SUBMIT_3D, 1), &submit);
+        assert_eq!(reply.code, resp::OK_NODATA);
+        assert_eq!(work.load(Ordering::Relaxed), 1);
+
+        // A submit to a context that does not exist is refused, and is not work.
+        let stray = with_hdr(cmd::SUBMIT_3D, 9, &[0u8; 8]);
+        let reply = device.dispatch(&mem, &hdr(cmd::SUBMIT_3D, 9), &stray);
+        assert_ne!(reply.code, resp::OK_NODATA);
+        assert_eq!(work.load(Ordering::Relaxed), 1);
     }
 
     #[test]

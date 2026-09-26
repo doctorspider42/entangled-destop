@@ -23,6 +23,12 @@ kvm-ioctls.workspace = true
 kvm-bindings.workspace = true
 vmm-sys-util.workspace = true
 
+# One call: the userspace 8254's timer thread raises its own priority
+# (`irqchip::pit::PitTimer`), because a loaded Windows host otherwise serves its
+# wake-ups later than the guest's `check_timer()` waits.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Threading"] }
+
 [dev-dependencies]
 # Split-ring and guest-memory helpers, used by the queue-notify integration test
 # (Linux) and by the portable `virtio` unit tests (both hosts).

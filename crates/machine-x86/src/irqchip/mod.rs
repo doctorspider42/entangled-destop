@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex};
 use virtio_core::interrupt::IrqLine;
 use vmm_core::hv::InterruptDelivery;
 
-use self::ioapic::{IoApic, IoApicError};
+use self::ioapic::{EoiListener, IoApic, IoApicError};
 use self::pic::Pic8259;
 use self::pit::{Pit, PitTimer};
 
@@ -101,6 +101,10 @@ impl UserspaceIrqChip {
     ) -> Result<Arc<Self>, IrqChipError> {
         let ioapic = IoApic::new(delivery, u8::try_from(vcpu_count).unwrap_or(u8::MAX));
         let pit = Pit::new(ioapic.line(TIMER_PIN)?);
+        // The 8254 re-injects the IRQ 0 edges the guest missed, one per EOI
+        // (`pit`'s "Lost-tick re-injection"), so pin 2 reports them back.
+        let listener: Arc<dyn EoiListener> = pit.clone();
+        ioapic.listen(TIMER_PIN, Arc::downgrade(&listener))?;
         let timer = PitTimer::start(Arc::clone(&pit)).map_err(IrqChipError::TimerThread)?;
         Ok(Arc::new(Self {
             ioapic,
@@ -268,6 +272,12 @@ impl UserspaceIrqChip {
 
     pub fn mmio_read(&self, addr: u64, data: &mut [u8]) {
         self.ioapic.mmio_read(addr, data);
+    }
+
+    /// The guest wrote EOI for `vector` — WHP's `X64ApicEoi` exit, which only
+    /// the pins with an [`EoiListener`] produce (today: the 8254's).
+    pub fn eoi(&self, vector: u8) {
+        self.ioapic.eoi(vector);
     }
 }
 

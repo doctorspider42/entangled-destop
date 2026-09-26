@@ -741,11 +741,10 @@ reruns passed).
 
 ### Owed
 
-- **The 8254 under WHP** (above): `check_timer()` failed in two of eight
+- ~~**The 8254 under WHP**~~ (above): `check_timer()` failed in two of eight
   8-vCPU boots and one loaded 1-vCPU test boot, and PIT calibration fails in
-  most boots. The userspace PIT's catch-up (`MAX_CATCHUP_EDGES`) and its
-  thread's scheduling against the vCPU threads and host load are where to
-  look first (whp-backend skill, 8254 notes).
+  most boots. **Closed** for the panic by the amendment below, which also says
+  why the calibration line stays on AMD hosts.
 - **DNS goes to `1.1.1.1`, not the host's resolver.** A network that blocks
   outside DNS, a VPN's internal zone, `/etc/hosts` and `.local` names do not
   resolve in the guest. Reading the host's resolvers (`/etc/resolv.conf`,
@@ -761,3 +760,211 @@ reruns passed).
   path's code did not change beyond the MAC it is now given.
 - **Upload throughput** (guest → host) was not measured; it rides the same
   loop and buffer, so it should have moved with the download.
+
+## Amendment, 2026-09-26 (later) — the 8254 under WHP: lost ticks are re-injected, and the guest is told its clocks
+
+The installed-network amendment above owed it: an installed 8-vCPU Ubuntu
+desktop panicked with `IO-APIC + timer doesn't work!` in two of eight boots,
+and PIT calibration failed in most. This closes the panic and records what
+could not be closed.
+
+### Reproduction
+
+`casper/vmlinuz` from the Ubuntu 26.04.1 ISO (Linux 7.0.12, HZ=1000) booted
+directly with the test initramfs reaches the marker in ~11 s, so the loop
+needs no disk: `entangled run --headless` on a direct-Linux profile,
+`apic=verbose`, `panic=0`, one boot after another. Idle, 8 vCPUs: 0 panics in
+20, PIT calibration failed in 9. With 24 spinning threads on the host's 24
+logical CPUs: **8 panics and 9 `MP-BIOS bug` lines in 20.** The installed
+desktop's rate on an "idle" host sits between the two — the host is not idle
+when a VMware VM and PCSX2 share it.
+
+### What the host traces showed
+
+A temporary tracer (not committed) time-stamped every IRQ 0 edge, every write
+of IOAPIC pin 2's redirection entry and every port read of the 8254, from the
+host side, on a writer thread of its own:
+
+- `check_timer()` unmasks pin 2 and waits 11.6 ms of wall time (`40e9 / HZ`
+  TSC cycles at 3.5 GHz) before re-masking it. In the failing boots **no edge
+  at all** was raised inside that window: the PIT thread asked for a 0.2–0.9 ms
+  sleep and got 16–21 ms (`slow-sleep 0x406c 468` — 16 492 µs for 468 µs
+  asked). Its next wake-up then raised the 16 owed edges back to back.
+- The local APIC has one pending bit per vector, so those 16 were one
+  interrupt. `tick_periodic()` counts interrupts, so jiffies stayed behind for
+  good, and each of `check_timer()`'s four attempts saw at most one or two.
+  That matches the panic's own timestamps: `0.001000`–`0.004000` s at the
+  panic are jiffies-derived (the TSC is not calibrated yet), i.e. one to four
+  jiffies in ~45 ms of attempts.
+- A descheduled vCPU coalesces the same way even when the timer thread keeps
+  perfect time: edges raised while it is off the CPU merge in its IRR.
+
+The PIT's *counters* were never the problem: the model computes them from host
+time, and when calibration passes it lands within 0.2 % of WHP's own figure
+for the TSC. What fails
+calibration is exit latency: a port-`0x61` read is a WHP exit of ~5.7 µs at
+best and 25–150 µs whenever the host preempts the vCPU thread, and
+`pit_calibrate_tsc()` rejects a run in which one read took 10× the fastest
+(`max/min=26.5` in a failing run, `4.2` in a passing one).
+`quick_pit_calibrate()` needs its edge uncertainty — four exits — under 24 µs
+and has not succeeded once on this host.
+
+### The decision
+
+**The userspace 8254 re-injects lost ticks the way KVM's in-kernel PIT does
+(`reinject`), and its thread runs at the top of the normal priority class.**
+
+- Owed edges are counted (`MAX_CATCHUP_EDGES`, now 32) and raised **one at a
+  time, the next only when the guest has EOI'd the last.** The EOI comes from
+  WHP: IOAPIC pin 2 carries an `EoiListener`, a listened pin is requested
+  level-triggered, and a level request is what makes WHP exit with
+  `WHvRunVpExitReasonX64ApicEoi`. `ExitHandler::apic_eoi` is a new default-no-op
+  method on the neutral trait — additive, KVM never calls it (its irqchip keeps
+  EOIs in the kernel), and neither backend's API changed. The EOI raises the
+  next owed edge on the vCPU thread before it re-enters, so a stall's backlog
+  arrives as separate jiffies within microseconds of the vCPU running again.
+- An edge the guest does not take within `ACK_TIMEOUT` (100 ms) is written
+  off; the count is forgotten on a channel-0 reprogram, a pin unmask (hardware
+  loses edges at a masked pin, and KVM's PIT resets its re-injection state on unmask too), reset,
+  resume and restore. Owed edges are not part of the snapshot format.
+- `PitTimer` sets `THREAD_PRIORITY_TIME_CRITICAL` on Windows (one
+  `#[cfg(windows)]` call; `machine-x86` gains a Windows-only `windows`
+  dependency with `Win32_System_Threading`). It is awake a few microseconds a
+  millisecond.
+
+Rejected: raising `MAX_CATCHUP_EDGES` alone (a burst is still one interrupt);
+pacing the burst on a timer (a descheduled vCPU still merges it); making the
+vCPU threads high-priority (the guest would then starve the desktop it runs
+on).
+
+**The guest is told its clocks through CPUID where a guest will listen.**
+WHP reports the TSC's frequency (`WHvCapabilityCodeProcessorClockFrequency`,
+3 500 047 429 Hz) and the APIC timer's (`…InterruptClockFrequency`, 200 MHz).
+The policy now answers `0x4000_0000.EAX = 0x4000_0010` (signature still
+empty), zeroes Hyper-V's `0x4000_0001`–`0x4000_000f`, puts TSC kHz and APIC kHz
+in the generic timing leaf `0x4000_0010`, and — on Intel hosts only — fills leaf
+`0x15` with the APIC timer as the crystal, so Linux's `native_calibrate_tsc()`
+sets `TSC_KNOWN_FREQ` and a `lapic_timer_period` that matches WHP's timer.
+
+What that does *not* do, and the reason it is written down: **on an AMD host no
+leaf reaches Linux.** `native_calibrate_tsc()` and `cpu_khz_from_cpuid()` are
+Intel-only, and Linux 7.0 reads `0x4000_0010` only for VMware and ACRN. KVM
+guests are told through kvmclock, Hyper-V guests through synthetic frequency
+MSRs; this WHP (Windows 10 19045) offers no synthetic-feature bank at all.
+Impersonating VMware or ACRN was rejected. So on this host PIT calibration still
+fails in some boots, and Linux falls back to the PM timer, which lands within
+0.2 % of the real frequency. That line is cosmetic; the panic is not.
+
+The KVM path is unchanged: nothing in its CPUID, its irqchip or its run loop
+moved.
+
+### Measured on this Windows host (2026-09-26, release build, direct boot)
+
+Ubuntu 26.04.1's own kernel (7.0.12, HZ=1000) booted directly with the test
+initramfs, `entangled run --headless`, one process per boot. "Loaded" is 24
+spinning threads on the 24 logical CPUs (they got 15–18 cores' worth; the rest
+went to the VM). Host load per batch was recorded; beside the batch it was
+under one core in total (the agent sessions, `dllhost`, an idle VMware VM).
+
+| vCPUs | host | boots | `check_timer()` failed (`MP-BIOS bug`) before → after | panicked before → after | PIT calibration failed before → after |
+|---|---|---|---|---|---|
+| 8 | loaded | 20 | **9 → 0** | **8 → 0** (+1 hung boot → 0) | 1 of 11 that got there → 6 of 20 |
+| 4 | loaded | 20 | **12 → 0** | **9 → 0** | 4 of 11 → 9 of 20 |
+| 2 | loaded | 10 | **7 → 0** | **6 → 0** | 1 of 4 → 1 of 10 |
+| 1 | loaded | 10 | **9 → 0** | **6 → 0** | 1 of 4 → 2 of 10 |
+| 8 | idle | 20 | 0 → 0 | 0 → 0 | 9 → 8 |
+| 4 | idle | 20 | 0 → 0 | 0 → 0 | 13 → 12 |
+| 2 | idle | 10 | 0 → 0 | 0 → 0 | 4 → 0 (one boot's PM-timer reference failed instead, and the PIT was used) |
+| 1 | idle | 10 | 0 → 0 | 0 → 0 | 4 → 4 |
+
+The panic is gone at every processor count, and it was never a many-vCPU
+matter: a loaded host panicked the 1-vCPU guest six times in ten. The idle
+host here reproduced no panic in the direct boot; the installed desktop's two
+in eight came from a host that was idle only by its user's standard. PIT
+calibration is unchanged, as the analysis above says it must be: when it
+passes it lands on 3 496.7–3 503.0 MHz, when it fails the PM timer lands on
+3 494.4–3 500.3 MHz (WHP says 3 500.047; both within 0.16 %). The APIC timer calibration that follows `check_timer()`
+became exact under load: `calibration result: 199999` against WHP's 200 MHz.
+
+### The installed desktop
+
+A fresh `entangled install ubuntu --venus --auto` (26.04.1 Desktop, installed
+by the fixed build in 11 min 49 s, 8 vCPUs, UEFI, GRUB, the installed 7.0
+kernel), each boot stopped at `Freeing unused kernel image` — past
+`check_timer()`, both TSC calibrations, the APIC timer calibration and SMP
+bring-up, before the initramfs mounts anything:
+
+| vCPUs | host | boots | `MP-BIOS bug` | panicked | all CPUs up | PIT calibration failed |
+|---|---|---|---|---|---|---|
+| 8 | idle, before | 20 | 0 | 0 | 20 | 8 |
+| 8 | idle, after | 20 | 0 | 0 | 20 | 15 |
+| 4 | idle, after | 20 | 0 | 0 | 20 | 13 |
+| 8 | 24 busy threads, before | 20 | **15** | **13** | 5 | 0 of 5 |
+| 8 | 24 busy threads, after | 23 | **0** | **0** | 21 | 1 of 21 |
+
+Two of the loaded "after" boots were still in the firmware or at the GRUB
+menu when the 90 s window closed (a killed boot leaves GRUB's `recordfail`
+set, and GRUB then waits); three more with a 200 s window all reached the
+kernel. "Idle" beside these batches meant the agent sessions, an idle VMware
+VM and a scanner application — under two cores in total.
+
+Then one full boot to the desktop with the fixed build: GRUB, login on the
+serial console, `gdm.service` and `graphical.target` active, `gnome-shell`
+running and the scanout on a renderer blob (`the guest composites on the
+GPU`). Over the following **625 s** the guest's `date` advanced 625.009 s
+against the host's 625.044 s (56 ppm, no NTP in the guest) and its uptime
+625.00 s; the kernel log gained no `clocksource`, `unstable` or `skew` line
+after boot. The clocksource was `acpi_pm` throughout — see "Found, and open".
+
+### Tests
+
+- `machine_x86::irqchip::pit`: the local APIC modelled as one pending bit and
+  the guest as "take, count a jiffy, EOI" — `a_late_wake_raises_one_edge_not_the_backlog`,
+  `a_descheduled_vcpu_still_passes_timer_irq_works`,
+  `delayed_polling_loses_no_jiffies`, `a_long_stall_is_capped_and_repaid_one_edge_at_a_time`,
+  `an_untaken_edge_is_written_off_after_the_ack_timeout`,
+  `tick_asks_to_come_back_when_something_is_due`,
+  `unmasking_forgets_owed_edges`, `reprogramming_channel0_forgets_owed_edges`,
+  `reset_and_resume_forget_owed_edges` — eight of them fail against the old
+  model (run with the same tests on the pre-fix `pit.rs`); and for the counter
+  itself `mode2_counter_reloads_every_period`,
+  `mode0_wraps_past_terminal_count_and_out_stays_high`,
+  `a_second_latch_does_not_overwrite_an_unread_one`, `readback_latches_the_count`.
+- `machine_x86::irqchip::ioapic`: `a_listened_pin_is_delivered_level_triggered`,
+  `an_eoi_reaches_the_pin_routed_to_that_vector`,
+  `an_unmask_is_reported_to_the_listener`, `a_dropped_listener_is_harmless`.
+- `vmm_core::whp::cpuid`: the timing leaf, the hidden Hyper-V leaves, leaf
+  `0x15` on Intel only, and `leaf_0x15_gives_linux_the_tsc_in_its_own_arithmetic`
+  (Linux's 32-bit `crystal_khz * ebx / eax`, five clock pairs, never
+  overflowing, within 20 ppm).
+- `vmm-core/tests/whp_timer.rs` (`#[ignore]`d boot loop, knobs in the file):
+  with Ubuntu's kernel, 8 vCPUs and 24 busy threads **in the test process**,
+  the pre-fix tree failed 4 of 10 boots (3 panics); the fixed one passed 10 of
+  10 — 20 of 20 across two runs, after a first run showed one boot still
+  booting at the old 90 s deadline and it became 180 s.
+
+### Found, and open
+
+- **An SMP guest on this AMD host runs on `acpi_pm`, not the TSC.** WHP does
+  not offer invariant TSC here (`WHvCapabilityCodeProcessorFeaturesBanks` bank
+  1 = `0x4`: `ClZero` only, no `TscInvariantSupport`), and the topology leaves
+  describe every vCPU as its own package (`CPU topo: Max. logical packages:
+  8`). With both, Linux's `unsynchronized_tsc()` is true on AMD: `tsc: Marking
+  TSC unstable due to TSCs unsynchronized`, and every `clock_gettime` in the
+  guest is a port exit. Unchanged by this amendment and not a correctness bug,
+  but likely the cheapest large win left for the desktop: describe one package
+  of N cores in the topology leaves, or assert invariance ourselves if WHP's
+  TSC is in fact invariant (it is on this host's hardware).
+- **A 1-vCPU guest loses the TSC too, for a different reason.** Its topology
+  is one package, so the TSC survives `unsynchronized_tsc()` — and then the
+  clocksource watchdog marks `tsc-early` unstable in 9 of 10 idle boots
+  (before and after this change alike): `refined-jiffies` measured 495 ms
+  while the TSC measured 742 ms. Jiffies run a third slow in that window,
+  before any clocksource is selected. The likely cause, not yet measured: a
+  halted vCPU waits on the halt gate, which only our own injections and the
+  10 ms `HALT_POLL` wake — not WHP's in-hypervisor LAPIC timer — so every idle
+  tick is served late. Worth its own investigation.
+- **Intel hosts are unmeasured.** The leaf-`0x15` path is unit-tested against
+  Linux's own 32-bit arithmetic; no Intel WHP host has booted with it.
+- **KVM-host validation**: nothing KVM-side changed, and WSL here has no
+  `/dev/kvm` to show it.

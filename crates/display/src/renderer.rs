@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use virtio_gpu::BYTES_PER_PIXEL;
 use winit::window::Window;
 
+use crate::boost::{BoostPolicy, BoostStats};
 use crate::present::{CursorOverlay, ImagePipeline};
 use crate::refresh::{choose_present_mode, PresentPreference};
 use crate::scanout::Scanout;
@@ -86,7 +87,12 @@ impl Default for StatsReporter {
 
 impl StatsReporter {
     /// Emits a `tracing` event if the reporting interval has elapsed.
-    pub fn maybe_report(&mut self, stats: FrameStats, input: crate::input::InputStats) {
+    pub fn maybe_report(
+        &mut self,
+        stats: FrameStats,
+        input: crate::input::InputStats,
+        boost: BoostStats,
+    ) {
         let elapsed = self.last.elapsed();
         if elapsed < self.interval {
             return;
@@ -134,6 +140,12 @@ impl StatsReporter {
             surface_recoveries = stats.surface_recoveries,
             input_batches = input.batches,
             input_dropped = input.dropped,
+            // The GPU boost (ADR-0004, the GPU-boost amendment): whether it
+            // is asked for now, how often it was, and for how long in all.
+            gpu_boost = boost.on,
+            gpu_boost_raised = boost.raised,
+            gpu_boost_on_s = format_args!("{:.1}", boost.on_ms as f64 / 1000.0),
+            gpu_boost_failed = boost.failed,
             "display statistics"
         );
         self.previous = stats;
@@ -163,6 +175,16 @@ pub(crate) struct Renderer {
     /// Scanout generation the texture was allocated for.
     generation: u64,
     stats: FrameStats,
+    /// The driver's GPU boost on this window's swapchain (ADR-0004, the
+    /// GPU-boost amendment); `None` where it cannot be asked for.
+    #[cfg(windows)]
+    latency: Option<crate::latency::LatencyBoost>,
+    /// Whether the boost is asked for — what the host wants, re-applied to
+    /// every new swapchain.
+    boost_on: bool,
+    /// Since when, while it is.
+    boost_since: Option<Instant>,
+    boost_stats: BoostStats,
 }
 
 /// The surface configuration of a window: its present mode is chosen
@@ -209,11 +231,15 @@ impl Renderer {
     /// With `shared`, the window prefers the Vulkan backend and, when it gets
     /// a device that can import a renderer's scanout buffers, installs its
     /// shared presenter in the slot (ADR-0004, zero-copy presentation).
+    ///
+    /// `boost` says whether its device should be able to ask the driver for
+    /// its clocks ([`crate::boost`]); only the shareable Vulkan device can.
     pub(crate) fn new(
         window: Arc<Window>,
         guest_w: u32,
         guest_h: u32,
         shared: Option<&SharedSlot>,
+        boost: BoostPolicy,
     ) -> Result<Self, DisplayError> {
         let Gpu {
             surface,
@@ -221,7 +247,27 @@ impl Renderer {
             device,
             queue,
             shareable,
-        } = init_gpu(&window, shared.is_some())?;
+        } = init_gpu(&window, shared.is_some(), boost.enabled())?;
+        #[cfg(windows)]
+        let latency = if boost.enabled() && shareable {
+            let latency = crate::latency::LatencyBoost::new(&device);
+            if latency.is_some() {
+                tracing::info!(
+                    ?boost,
+                    "the window can ask the GPU driver for its clocks while the guest draws \
+                     (VK_NV_low_latency2 boost; [display] gpu_boost = false or {}=off turns it \
+                     off)",
+                    crate::boost::GPU_BOOST_ENV
+                );
+            } else {
+                tracing::info!(
+                    "the window's GPU has no VK_NV_low_latency2: no GPU boost to ask for"
+                );
+            }
+            latency
+        } else {
+            None
+        };
         if let Some(slot) = shared {
             install_presenter(slot, shareable, &device, &queue);
         }
@@ -259,6 +305,11 @@ impl Renderer {
                 texture_allocations: 1,
                 ..FrameStats::default()
             },
+            #[cfg(windows)]
+            latency,
+            boost_on: false,
+            boost_since: None,
+            boost_stats: BoostStats::default(),
         };
         renderer.resize(size.width, size.height);
         Ok(renderer)
@@ -267,6 +318,63 @@ impl Renderer {
     /// Current statistics snapshot.
     pub(crate) fn stats(&self) -> FrameStats {
         self.stats
+    }
+
+    /// Whether this window can ask the driver for its clocks at all.
+    pub(crate) fn can_boost(&self) -> bool {
+        #[cfg(windows)]
+        return self.latency.is_some();
+        #[cfg(not(windows))]
+        false
+    }
+
+    /// Asks the driver for its clocks (`on`) or withdraws the request
+    /// ([`crate::boost`]). Idempotent; a request that cannot be made now (no
+    /// swapchain yet) is counted and made again at the next configure.
+    pub(crate) fn set_boost(&mut self, on: bool) {
+        if on == self.boost_on || !self.can_boost() {
+            return;
+        }
+        self.boost_on = on;
+        let now = Instant::now();
+        if on {
+            self.boost_stats.raised += 1;
+            self.boost_since = Some(now);
+        } else if let Some(since) = self.boost_since.take() {
+            self.boost_stats.on_ms = self
+                .boost_stats
+                .on_ms
+                .saturating_add(millis(now.duration_since(since)));
+        }
+        self.apply_boost();
+        tracing::debug!(on, "GPU boost");
+    }
+
+    /// The boost's counters, `on_ms` including the current stretch.
+    pub(crate) fn boost_stats(&self) -> BoostStats {
+        let mut stats = self.boost_stats;
+        stats.on = self.boost_on;
+        if let Some(since) = self.boost_since {
+            stats.on_ms = stats.on_ms.saturating_add(millis(since.elapsed()));
+        }
+        stats
+    }
+
+    /// Tells the current swapchain what `boost_on` says: after a change,
+    /// and after every configure (a new swapchain starts with it off).
+    fn apply_boost(&mut self) {
+        #[cfg(windows)]
+        if let Some(latency) = &self.latency {
+            if !self.configured {
+                return;
+            }
+            if let Err(why) = latency.apply(&self.surface, self.boost_on) {
+                self.boost_stats.failed += 1;
+                if self.boost_stats.failed <= 3 {
+                    tracing::warn!(%why, on = self.boost_on, "the GPU boost request failed");
+                }
+            }
+        }
     }
 
     /// Counts `arrived` guest frames against one draw: all but the newest
@@ -296,6 +404,9 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.configured = true;
+        if self.boost_on {
+            self.apply_boost();
+        }
     }
 
     /// Re-queries the surface capabilities and reconfigures after a loss.
@@ -315,6 +426,9 @@ impl Renderer {
         self.stats.surface_recoveries += 1;
         self.surface.configure(&self.device, &self.config);
         self.configured = true;
+        if self.boost_on {
+            self.apply_boost();
+        }
     }
 
     /// Chooses what the next frame draws: the shared presenter's texture when
@@ -578,6 +692,10 @@ fn micros(d: Duration) -> u64 {
     u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// The GPU objects one window needs, all tied to the same backend.
 struct Gpu {
     surface: wgpu::Surface<'static>,
@@ -628,7 +746,10 @@ fn install_presenter(
 /// import a Vulkan `OPAQUE_WIN32` allocation — and if that fails, the usual
 /// order follows and the GPU desktop takes the copy path. A `WGPU_BACKEND`
 /// the user set still wins; a Vulkan one is opened shareable too.
-fn init_gpu(window: &Arc<Window>, shared: bool) -> Result<Gpu, DisplayError> {
+///
+/// `latency` asks the shareable device for the GPU boost's extension too
+/// ([`crate::boost`]).
+fn init_gpu(window: &Arc<Window>, shared: bool, latency: bool) -> Result<Gpu, DisplayError> {
     let shared = shared && cfg!(windows);
     let attempts = match wgpu::Backends::from_env() {
         Some(mask) => vec![(mask, shared && mask.contains(wgpu::Backends::VULKAN))],
@@ -644,7 +765,7 @@ fn init_gpu(window: &Arc<Window>, shared: bool) -> Result<Gpu, DisplayError> {
     };
     let mut last = None;
     for (backends, shareable) in attempts {
-        match init_backend(window, backends, shareable) {
+        match init_backend(window, backends, shareable, latency) {
             Ok(gpu) => return Ok(gpu),
             Err(err) => {
                 tracing::warn!(?backends, shareable, %err, "backend unusable; trying the next one");
@@ -661,13 +782,14 @@ fn init_gpu(window: &Arc<Window>, shared: bool) -> Result<Gpu, DisplayError> {
 fn request_device(
     adapter: &wgpu::Adapter,
     shareable: bool,
+    latency: bool,
 ) -> Result<(wgpu::Device, wgpu::Queue), DisplayError> {
     #[cfg(windows)]
     if shareable {
-        return crate::gpu_scanout::request_device(adapter, "entangled-display")
+        return crate::gpu_scanout::request_device(adapter, "entangled-display", latency)
             .map_err(DisplayError::SharedDevice);
     }
-    let _ = shareable;
+    let _ = (shareable, latency);
     Ok(pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("entangled-display"),
@@ -682,6 +804,7 @@ fn init_backend(
     window: &Arc<Window>,
     backends: wgpu::Backends,
     shareable: bool,
+    latency: bool,
 ) -> Result<Gpu, DisplayError> {
     let mut descriptor = wgpu::InstanceDescriptor::from_env_or_default();
     descriptor.backends = backends;
@@ -703,7 +826,7 @@ fn init_backend(
     };
     let info = adapter.get_info();
 
-    let (device, queue) = request_device(&adapter, shareable)?;
+    let (device, queue) = request_device(&adapter, shareable, latency)?;
     // A validation error on a guest-driven copy must not abort the host.
     device.on_uncaptured_error(Box::new(|err| {
         tracing::error!(%err, "wgpu reported an uncaptured error");

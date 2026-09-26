@@ -39,8 +39,48 @@
 //!
 //! Only channel 0 has an output pin wired anywhere: IRQ 0, which the machine
 //! routes to IOAPIC pin 2 exactly as the MP table and MADT say (PC convention).
-//! [`Pit::tick`] delivers the edges that came due and reports when the next one
+//! [`Pit::tick`] counts the edges that came due and reports when the next one
 //! is, and [`PitTimer`] is the host thread that calls it.
+//!
+//! # Lost-tick re-injection
+//!
+//! A guest in periodic mode counts *interrupts*, not time: `tick_periodic()`
+//! adds one jiffy per IRQ 0. So every edge the guest does not take is a jiffy
+//! it never gets back, and `timer_irq_works()` — five jiffies inside
+//! `40e9 / HZ` TSC cycles, 11.4 ms at HZ=1000 on a 3.5 GHz part — fails when
+//! enough of them go missing. On a real PC nothing goes missing. Here two
+//! things lose them, both measured on a loaded Windows host (ADR-0002,
+//! 2026-09-26 amendment):
+//!
+//! - **The host thread oversleeps.** A 0.5 ms `sleep` on a Windows host with
+//!   every core busy returned after 16–21 ms; the guest's whole
+//!   `check_timer()` window passed with no edge at all.
+//! - **Edges delivered together are one interrupt.** The local APIC holds one
+//!   pending bit per vector. The old catch-up raised up to sixteen owed edges
+//!   back to back after such a stall, and the guest took one or two of them. A
+//!   vCPU the host has descheduled coalesces the same way, however well the
+//!   timer thread keeps time.
+//!
+//! So the 8254 keeps a count of **owed** edges and raises them one at a time,
+//! the next only once the guest has taken the last: the pin listens for the
+//! guest's EOI ([`EoiListener`], which the IOAPIC gets from WHP's `X64ApicEoi`
+//! exit), and the EOI raises the next owed edge straight from the vCPU thread.
+//! That is KVM's in-kernel PIT policy (`reinject`, on by default) and it is
+//! what makes the backlog of a stall arrive as separate jiffies within
+//! microseconds of the vCPU running again. Without an EOI ever seen — a host or
+//! a test that cannot report one — owed edges go out one per timer wake-up,
+//! [`CATCHUP_SPACING`] apart, which at least never raises two at once.
+//!
+//! Bounds, so a guest cannot make host state grow: at most
+//! [`MAX_CATCHUP_EDGES`] are owed; an edge the guest has not taken within
+//! [`ACK_TIMEOUT`] (interrupts off, pin masked) is written off; and both the
+//! count and the outstanding edge are forgotten when the guest reprograms
+//! channel 0 or unmasks the pin — edges that arrive at a masked pin are lost on
+//! hardware too.
+//!
+//! The thread itself runs at the host's highest non-realtime priority on
+//! Windows ([`PitTimer`]), because a timer thread that the scheduler serves
+//! last is what produced the empty windows in the first place.
 //!
 //! # Modes
 //!
@@ -56,6 +96,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use virtio_core::interrupt::IrqLine;
+
+use super::ioapic::EoiListener;
 
 /// The 8254's input frequency: 1.193182 MHz (14.31818 MHz / 12).
 pub const PIT_FREQUENCY_HZ: u64 = 1_193_182;
@@ -74,22 +116,36 @@ const CHANNELS: usize = 3;
 /// A reload of 0 means 65536 on an 8254.
 const FULL_RELOAD: u64 = 0x1_0000;
 
-/// Upper bound on edges delivered for one [`Pit::tick`] call.
+/// Most channel-0 edges the 8254 owes the guest at once (see "Lost-tick
+/// re-injection" above); a longer stall is written off and the schedule
+/// resynchronised on the current time.
 ///
-/// A host thread that was descheduled for a second while the guest had channel 0
-/// running at 1 kHz would otherwise owe a thousand interrupts, and delivering
-/// them back to back is both useless (the guest cannot tell) and a way for a
-/// stalled host to burn the vCPU on interrupt entry. Linux's clock is monotonic
-/// but not obliged to be complete; other VMMs coalesce the same way.
+/// A host thread descheduled for a second while the guest had channel 0 at
+/// 1 kHz would otherwise owe a thousand interrupts, which is no use to anyone.
+/// Thirty-two is sized against what was measured rather than rounded: on a
+/// Windows host with every core busy the timer thread overslept by up to 21 ms,
+/// and a vCPU thread can lose one or two ~15.6 ms scheduling quanta. At the
+/// `HZ=1000` of Ubuntu's kernels that is up to ~31 owed edges, and
+/// `timer_irq_works()` needs only five of them back — the rest keep jiffies
+/// honest for the APIC timer calibration that follows. Each is delivered only
+/// after the guest has taken the previous one, so repaying all 32 costs the
+/// guest a few tens of microseconds, not an interrupt storm.
+const MAX_CATCHUP_EDGES: u32 = 32;
+
+/// How long a raised edge may stay untaken before the 8254 writes it off and
+/// raises the next.
 ///
-/// Sixteen is chosen against the *host's* sleep granularity rather than a round
-/// number: measured on Windows 11, `std::thread::sleep` overshoots a 1 ms request
-/// by about half a millisecond (it rides a high-resolution waitable timer), and a
-/// loaded host can miss a full scheduling quantum of ~15 ms. At the x86_64
-/// defconfig's `HZ=1000` that is 15 owed edges, so the cap has to sit above it or
-/// the guest's jiffies would drift permanently behind — which is exactly the
-/// failure `timer_irq_works()` reports as "8254 timer not connected to IO-APIC".
-const MAX_CATCHUP_EDGES: u32 = 16;
+/// Long enough to wait out the cases where the guest *will* take it — a vCPU
+/// the host descheduled for a quantum or two, interrupts disabled around
+/// `pit_calibrate_tsc()`'s 50 ms loop — so those edges are repaid rather than
+/// dropped; short enough that an edge the guest will never take (the pin
+/// masked, a guest that never EOIs) cannot hold the rest up for long.
+pub const ACK_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Spacing between owed edges when no EOI is available to pace them (see
+/// "Lost-tick re-injection"). Longer than a guest takes to handle a timer
+/// interrupt, so two owed edges do not merge in the local APIC.
+pub const CATCHUP_SPACING: Duration = Duration::from_micros(250);
 
 /// `0x61` bits the guest may write: channel 2 gate (0) and speaker data (1).
 const NMI_WRITE_MASK: u8 = 0x03;
@@ -286,6 +342,31 @@ struct PitState {
     /// Host tick count at which channel 0's next output edge is due, while it
     /// has one.
     next_edge_ticks: Option<u64>,
+    /// Channel-0 edges that came due and have not been raised yet — the lost
+    /// ticks the guest is still owed. At most [`MAX_CATCHUP_EDGES`].
+    owed: u32,
+    /// When the edge most recently raised was raised, while the guest has not
+    /// taken it (no EOI yet). `None` when nothing is outstanding.
+    in_flight: Option<u64>,
+}
+
+impl PitState {
+    fn new() -> Self {
+        Self {
+            channels: [Channel::new(true), Channel::new(true), Channel::new(false)],
+            nmi_control: 0,
+            next_edge_ticks: None,
+            owed: 0,
+            in_flight: None,
+        }
+    }
+
+    /// Forgets every owed and outstanding edge: channel 0 was reprogrammed,
+    /// the pin unmasked, the VM reset, resumed or restored.
+    fn forgive(&mut self) {
+        self.owed = 0;
+        self.in_flight = None;
+    }
 }
 
 /// The machine's 8254.
@@ -304,6 +385,9 @@ pub struct Pit {
     /// but delivers nothing, and [`Pit::set_paused`] re-arms the schedule on the
     /// way out.
     paused: AtomicBool,
+    /// Set by the first EOI the guest reports ([`EoiListener::eoi`]): from then
+    /// on owed edges are paced by EOIs, before it by [`CATCHUP_SPACING`].
+    acks_seen: AtomicBool,
 }
 
 /// The PIT's time source. Real by default; a test drives it by hand so counter
@@ -339,15 +423,12 @@ impl Pit {
 
     fn with_clock(irq0: Arc<dyn IrqLine>, clock: Clock) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(PitState {
-                channels: [Channel::new(true), Channel::new(true), Channel::new(false)],
-                nmi_control: 0,
-                next_edge_ticks: None,
-            }),
+            state: Mutex::new(PitState::new()),
             irq0,
             clock,
             edges: AtomicU64::new(0),
             paused: AtomicBool::new(false),
+            acks_seen: AtomicBool::new(false),
         })
     }
 
@@ -386,6 +467,7 @@ impl Pit {
         if state.next_edge_ticks.is_some() {
             state.next_edge_ticks = next_edge(&state.channels[0], now);
         }
+        state.forgive();
     }
 
     /// True while [`Self::set_paused`] has channel-0 delivery stopped.
@@ -405,9 +487,7 @@ impl Pit {
             tracing::error!("PIT lock is poisoned; the channels stay as they were");
             return;
         };
-        state.channels = [Channel::new(true), Channel::new(true), Channel::new(false)];
-        state.nmi_control = 0;
-        state.next_edge_ticks = None;
+        *state = PitState::new();
     }
 
     /// The three channels and the NMI/speaker byte, for a snapshot (ADR-0006).
@@ -418,6 +498,10 @@ impl Pit {
     /// written down is how long ago each channel was armed and how long until
     /// the next edge, and the restore anchors both to its own epoch. A guest
     /// half-way through a 10 ms tick comes back half-way through it.
+    ///
+    /// Owed edges are not saved: a restored guest has been gone for as long
+    /// as the snapshot sat on disk, and the restore resynchronises channel 0
+    /// on the new host's time exactly as a resume does.
     pub fn save_state(&self) -> crate::state::SavedPit {
         let now = self.clock.ticks();
         let Ok(state) = self.state.lock() else {
@@ -492,6 +576,7 @@ impl Pit {
         state.next_edge_ticks = saved
             .ticks_to_next_edge
             .map(|remaining| now.saturating_add(remaining));
+        state.forgive();
         Ok(())
     }
 
@@ -521,6 +606,7 @@ impl Pit {
                     channel.write_counter(value, now);
                     if index == 0 {
                         state.next_edge_ticks = next_edge(&state.channels[0], now);
+                        state.forgive();
                     }
                 }
             }
@@ -552,9 +638,11 @@ impl Pit {
         }
     }
 
-    /// Delivers every channel-0 output edge that has come due and returns how
-    /// long until the next one, or `None` when channel 0 has no pending edge
-    /// (never programmed, gated off, or a one-shot that already fired).
+    /// Counts the channel-0 output edges that have come due, raises the next
+    /// owed one if the guest has taken the last (see "Lost-tick re-injection"),
+    /// and returns how long until this needs calling again — or `None` when
+    /// channel 0 has nothing pending at all (never programmed, gated off, a
+    /// one-shot that already fired and was taken).
     ///
     /// Split out from the timer thread so the edge arithmetic is testable without
     /// waiting on a real clock.
@@ -566,26 +654,26 @@ impl Pit {
             return None;
         }
         let now = self.clock.ticks();
-        let edges = {
+        let raise = {
             let Ok(mut state) = self.state.lock() else {
                 tracing::error!("PIT lock is poisoned; channel 0 stops ticking");
                 return None;
             };
-            let mut edges = 0;
+            let mut came_due = 0;
             while let Some(due) = state.next_edge_ticks {
                 if due > now {
                     break;
                 }
-                edges += 1;
+                came_due += 1;
                 let channel = &state.channels[0];
                 state.next_edge_ticks = if channel.is_periodic() {
                     Some(due + channel.reload_ticks())
                 } else {
                     None
                 };
-                if edges >= MAX_CATCHUP_EDGES {
-                    // Skip whatever else is owed: resynchronise on the current
-                    // time instead of delivering a backlog.
+                if state.owed + came_due >= MAX_CATCHUP_EDGES {
+                    // Write off whatever else is owed: resynchronise on the
+                    // current time instead of carrying a backlog.
                     if let Some(due) = state.next_edge_ticks {
                         if due <= now {
                             state.next_edge_ticks = next_edge(&state.channels[0], now);
@@ -594,18 +682,96 @@ impl Pit {
                     break;
                 }
             }
-            edges
+            state.owed = (state.owed + came_due).min(MAX_CATCHUP_EDGES);
+            self.take_owed(&mut state, now)
         };
-        for _ in 0..edges {
-            if let Err(e) = self.irq0.trigger() {
-                tracing::warn!(error = %e, "raising PIT IRQ 0 failed");
-                break;
-            }
-            self.edges.fetch_add(1, Ordering::AcqRel);
+        if raise {
+            self.raise();
         }
         let state = self.state.lock().ok()?;
-        let due = state.next_edge_ticks?;
-        Some(ticks_to_duration(due.saturating_sub(self.clock.ticks())))
+        let now = self.clock.ticks();
+        let next_due = state.next_edge_ticks.map(|due| due.saturating_sub(now));
+        let next_owed = (state.owed > 0).then(|| match state.in_flight {
+            // Paced by the guest's EOI, which raises the next edge itself; the
+            // thread only has to come back if that never arrives.
+            Some(since) if self.acks_seen.load(Ordering::Acquire) => since
+                .saturating_add(duration_to_ticks(ACK_TIMEOUT))
+                .saturating_sub(now),
+            _ => duration_to_ticks(CATCHUP_SPACING),
+        });
+        let wait = match (next_due, next_owed) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b)?,
+        };
+        Some(ticks_to_duration(wait))
+    }
+
+    /// Takes one owed edge for raising, if one may go now: always when the
+    /// guest has never reported an EOI (one per call, which is what spaces them
+    /// out), and otherwise only once the last one raised has been taken or
+    /// written off after [`ACK_TIMEOUT`].
+    fn take_owed(&self, state: &mut PitState, now: u64) -> bool {
+        if state.owed == 0 {
+            return false;
+        }
+        if self.acks_seen.load(Ordering::Acquire) {
+            if let Some(since) = state.in_flight {
+                if now.saturating_sub(since) < duration_to_ticks(ACK_TIMEOUT) {
+                    return false;
+                }
+            }
+        }
+        state.owed -= 1;
+        state.in_flight = Some(now);
+        true
+    }
+
+    /// Raises one channel-0 edge on IRQ 0. Never under the PIT lock: the line
+    /// reaches the IOAPIC and the hypervisor.
+    fn raise(&self) {
+        match self.irq0.trigger() {
+            Ok(()) => {
+                self.edges.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(e) => tracing::warn!(error = %e, "raising PIT IRQ 0 failed"),
+        }
+    }
+
+    /// Channel-0 edges owed to the guest and not raised yet. Diagnostics and
+    /// tests.
+    pub fn owed(&self) -> u32 {
+        self.state.lock().map_or(0, |state| state.owed)
+    }
+}
+
+/// The guest's side of re-injection: IOAPIC pin 2 tells the 8254 when IRQ 0
+/// has been taken.
+impl EoiListener for Pit {
+    fn eoi(&self) {
+        self.acks_seen.store(true, Ordering::Release);
+        if self.is_paused() {
+            return;
+        }
+        let now = self.clock.ticks();
+        let raise = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            state.in_flight = None;
+            self.take_owed(&mut state, now)
+        };
+        if raise {
+            // On the vCPU thread, between the EOI and re-entering the guest:
+            // the next owed jiffy is pending before the guest runs another
+            // instruction of the code that was waiting for it.
+            self.raise();
+        }
+    }
+
+    fn unmasked(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.forgive();
+        }
     }
 }
 
@@ -655,6 +821,7 @@ fn command(state: &mut PitState, value: u8, now: u64) {
     channel.read_hi_next = false;
     if index == 0 {
         state.next_edge_ticks = None;
+        state.forgive();
     }
 }
 
@@ -676,6 +843,11 @@ fn next_edge(channel: &Channel, now: u64) -> Option<u64> {
     }
 }
 
+fn duration_to_ticks(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos() * u128::from(PIT_FREQUENCY_HZ) / 1_000_000_000)
+        .unwrap_or(u64::MAX)
+}
+
 fn ticks_to_duration(ticks: u64) -> Duration {
     Duration::from_nanos(
         u64::try_from(u128::from(ticks) * 1_000_000_000 / u128::from(PIT_FREQUENCY_HZ))
@@ -691,6 +863,13 @@ fn ticks_to_duration(ticks: u64) -> Duration {
 /// latency on the very first tick is invisible next to the tens of milliseconds
 /// `check_timer()` allows. Joining on `Drop` is what guarantees the thread cannot
 /// outlive the interrupt line it triggers.
+///
+/// On Windows the thread runs at `THREAD_PRIORITY_TIME_CRITICAL`, the top of the
+/// normal priority class. It is awake for a few microseconds a millisecond, and
+/// at normal priority a host with every core busy served its wake-ups 16–21 ms
+/// late — longer than the whole of `check_timer()`'s window (ADR-0002,
+/// 2026-09-26 amendment). Linux has no userspace 8254 to run: KVM's is in the
+/// kernel.
 pub struct PitTimer {
     stop: Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -711,6 +890,7 @@ impl PitTimer {
         let handle = std::thread::Builder::new()
             .name("pit".into())
             .spawn(move || {
+                raise_timer_thread_priority();
                 while !flag.load(Ordering::Acquire) {
                     let sleep = pit.tick().unwrap_or(IDLE_POLL).max(MIN_SLEEP);
                     std::thread::sleep(sleep.min(IDLE_POLL));
@@ -722,6 +902,25 @@ impl PitTimer {
         })
     }
 }
+
+/// See [`PitTimer`]: the one thing on this machine whose lateness the guest
+/// counts.
+#[cfg(windows)]
+fn raise_timer_thread_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    // SAFETY: `GetCurrentThread` returns the calling thread's pseudo-handle,
+    // which needs no closing and is valid for as long as the thread runs —
+    // and it is only used here, on that thread.
+    let result = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "could not raise the PIT thread's priority");
+    }
+}
+
+#[cfg(not(windows))]
+fn raise_timer_thread_priority() {}
 
 impl Drop for PitTimer {
     fn drop(&mut self) {
@@ -830,15 +1029,22 @@ mod tests {
         );
     }
 
-    /// A host stall must not turn into an interrupt storm.
+    /// A host stall must not turn into an interrupt storm: what it owes is
+    /// capped, repaid one edge per call, and the schedule resynchronises.
     #[test]
-    fn a_long_stall_coalesces_instead_of_flooding() {
+    fn a_long_stall_is_capped_and_repaid_one_edge_at_a_time() {
         let h = Harness::new();
         h.program_channel0_periodic(LATCH_250HZ);
         h.advance(PIT_FREQUENCY_HZ * 5); // five seconds of missed edges
         h.pit.tick();
+        assert_eq!(h.irqs(), 1, "one edge per call, never a burst");
+        assert_eq!(h.pit.owed(), MAX_CATCHUP_EDGES - 1);
+        for _ in 1..MAX_CATCHUP_EDGES {
+            h.pit.tick();
+        }
         assert_eq!(h.irqs(), u64::from(MAX_CATCHUP_EDGES));
-        // And the timer resynchronises rather than staying behind forever.
+        assert_eq!(h.pit.owed(), 0);
+        // And the timer resynchronised rather than staying behind forever.
         h.advance(u64::from(LATCH_250HZ));
         h.pit.tick();
         assert_eq!(h.irqs(), u64::from(MAX_CATCHUP_EDGES) + 1);
@@ -1022,5 +1228,297 @@ mod tests {
         let delivered = irq.0.load(Ordering::Acquire);
         assert!(delivered > 4, "only {delivered} edges in 100 ms at 1 kHz");
         assert_eq!(delivered, pit.edges());
+    }
+
+    /// Ubuntu's kernels run at HZ=1000: `PIT_TICK_RATE / 1000`.
+    const LATCH_1000HZ: u16 = 1193;
+
+    /// The part of a local APIC one vector sees: a single pending bit. Two
+    /// edges raised before the guest takes the first are one interrupt —
+    /// which is the whole of the problem re-injection solves.
+    #[derive(Default)]
+    struct FakeLapic {
+        irr: AtomicBool,
+        raised: AtomicU64,
+    }
+
+    impl IrqLine for FakeLapic {
+        fn trigger(&self) -> Result<(), InterruptError> {
+            self.raised.fetch_add(1, Ordering::AcqRel);
+            self.irr.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    /// A guest with interrupts enabled, counting jiffies the way
+    /// `tick_periodic()` does: one per interrupt taken, EOI after each.
+    struct Guest {
+        pit: Arc<Pit>,
+        lapic: Arc<FakeLapic>,
+        jiffies: u64,
+    }
+
+    impl Guest {
+        fn new() -> Self {
+            let lapic = Arc::new(FakeLapic::default());
+            let pit = Pit::with_clock(lapic.clone(), Clock::Fake(AtomicU64::new(0)));
+            pit.io_write(COMMAND_PORT, 0x34);
+            pit.io_write(PIT_PORT_BASE, (LATCH_1000HZ & 0xff) as u8);
+            pit.io_write(PIT_PORT_BASE, (LATCH_1000HZ >> 8) as u8);
+            Self {
+                pit,
+                lapic,
+                jiffies: 0,
+            }
+        }
+
+        fn advance(&self, ticks: u64) {
+            match &self.pit.clock {
+                Clock::Fake(now) => {
+                    now.fetch_add(ticks, Ordering::AcqRel);
+                }
+                Clock::Host(_) => unreachable!("test guest uses the fake clock"),
+            }
+        }
+
+        /// The vCPU runs: it takes whatever is pending, and every EOI may make
+        /// the next owed edge pending straight away.
+        fn run(&mut self) {
+            while self.lapic.irr.swap(false, Ordering::AcqRel) {
+                self.jiffies += 1;
+                self.pit.eoi();
+            }
+        }
+
+        /// The host timer thread wakes once, then the vCPU runs.
+        fn host_wakes_then_guest_runs(&mut self) {
+            self.pit.tick();
+            self.run();
+        }
+    }
+
+    /// The regression the 2026-09-26 panics came from: a timer thread that
+    /// woke late raised everything it owed at once, and the local APIC made
+    /// one interrupt of it. One call must raise one edge.
+    #[test]
+    fn a_late_wake_raises_one_edge_not_the_backlog() {
+        let mut guest = Guest::new();
+        guest.advance(u64::from(LATCH_1000HZ) * 12); // 12 ms oversleep
+        guest.pit.tick();
+        assert_eq!(guest.lapic.raised.load(Ordering::Acquire), 1);
+        assert_eq!(guest.pit.owed(), 11);
+        guest.run();
+        // The EOIs repaid the rest back to back, each its own interrupt.
+        assert_eq!(guest.jiffies, 12);
+    }
+
+    /// `timer_irq_works()` with the vCPU descheduled for most of its window:
+    /// the edges the PIT raised while the guest was not running must still
+    /// arrive as separate jiffies once it runs again — KVM's `reinject`.
+    #[test]
+    fn a_descheduled_vcpu_still_passes_timer_irq_works() {
+        let mut guest = Guest::new();
+        // check_timer() unmasks the pin and the vCPU runs for a millisecond.
+        guest.advance(u64::from(LATCH_1000HZ));
+        guest.host_wakes_then_guest_runs();
+        let t1 = guest.jiffies;
+        // Then the host takes the vCPU away for 10 ms while the timer thread
+        // keeps perfect time.
+        for _ in 0..10 {
+            guest.advance(u64::from(LATCH_1000HZ));
+            guest.pit.tick();
+        }
+        // 11.4 ms into the window (40e9 / HZ cycles at 3.5 GHz) it is back.
+        guest.run();
+        assert!(
+            guest.jiffies > t1 + 4,
+            "timer_irq_works() fails: only {} jiffies after the vCPU came back",
+            guest.jiffies - t1
+        );
+        assert_eq!(guest.jiffies - t1, 10, "no tick lost at all");
+    }
+
+    /// A host that wakes the timer thread every 3 ms instead of every 1 ms
+    /// (a loaded host's normal case) must not cost the guest two jiffies in
+    /// three.
+    #[test]
+    fn delayed_polling_loses_no_jiffies() {
+        let mut guest = Guest::new();
+        for _ in 0..100 {
+            guest.advance(u64::from(LATCH_1000HZ) * 3);
+            guest.host_wakes_then_guest_runs();
+        }
+        assert_eq!(guest.jiffies, 300);
+    }
+
+    /// An edge the guest never takes (interrupts off, or it simply never
+    /// EOIs) must not hold the rest up for ever: after `ACK_TIMEOUT` it is
+    /// written off and the next goes out.
+    #[test]
+    fn an_untaken_edge_is_written_off_after_the_ack_timeout() {
+        let mut guest = Guest::new();
+        guest.advance(u64::from(LATCH_1000HZ));
+        guest.host_wakes_then_guest_runs(); // an EOI: paced by EOIs from here
+        let raised = || guest.lapic.raised.load(Ordering::Acquire);
+        let before = raised();
+        guest.advance(u64::from(LATCH_1000HZ));
+        guest.pit.tick();
+        assert_eq!(raised(), before + 1);
+        // No EOI: nothing more goes out however many edges come due...
+        let timeout = duration_to_ticks(ACK_TIMEOUT);
+        let period = u64::from(LATCH_1000HZ);
+        for _ in 0..(timeout / period - 1) {
+            guest.advance(period);
+            guest.pit.tick();
+        }
+        assert_eq!(raised(), before + 1, "raised again before the timeout");
+        assert!(guest.pit.owed() <= MAX_CATCHUP_EDGES);
+        // ...until the timeout, and then only one.
+        guest.advance(2 * period);
+        guest.pit.tick();
+        assert_eq!(raised(), before + 2);
+    }
+
+    /// The wake-up `tick` asks for: the next due edge normally, the EOI
+    /// timeout while an edge is outstanding and more are owed, and
+    /// `CATCHUP_SPACING` when there is no EOI to pace by.
+    #[test]
+    fn tick_asks_to_come_back_when_something_is_due() {
+        let h = Harness::new();
+        h.program_channel0_periodic(LATCH_250HZ);
+        let first = h.pit.tick().unwrap();
+        assert_eq!(first, ticks_to_duration(u64::from(LATCH_250HZ)));
+        h.advance(u64::from(LATCH_250HZ) * 3);
+        let wait = h.pit.tick().unwrap();
+        assert_eq!(h.pit.owed(), 2);
+        assert!(
+            wait <= CATCHUP_SPACING,
+            "owed edges without EOIs wait {wait:?}, not CATCHUP_SPACING"
+        );
+
+        let mut guest = Guest::new();
+        guest.advance(u64::from(LATCH_1000HZ));
+        guest.host_wakes_then_guest_runs();
+        guest.advance(u64::from(LATCH_1000HZ) * 3);
+        let wait = guest.pit.tick().unwrap(); // one out, two owed, no EOI yet
+        assert!(
+            wait <= ticks_to_duration(u64::from(LATCH_1000HZ)),
+            "the next due edge still bounds the wait: {wait:?}"
+        );
+    }
+
+    /// Edges that came due while the pin was masked are lost on hardware; a
+    /// guest that unmasks must not get a burst of stale ticks.
+    #[test]
+    fn unmasking_forgets_owed_edges() {
+        let guest = Guest::new();
+        guest.advance(u64::from(LATCH_1000HZ) * 8);
+        guest.pit.tick();
+        assert_eq!(guest.pit.owed(), 7);
+        guest.pit.unmasked();
+        assert_eq!(guest.pit.owed(), 0);
+    }
+
+    /// A new channel-0 programming starts a new count; the old one's debt
+    /// is void.
+    #[test]
+    fn reprogramming_channel0_forgets_owed_edges() {
+        let guest = Guest::new();
+        guest.advance(u64::from(LATCH_1000HZ) * 8);
+        guest.pit.tick();
+        assert!(guest.pit.owed() > 0);
+        guest.pit.io_write(COMMAND_PORT, 0x34);
+        assert_eq!(guest.pit.owed(), 0);
+        guest.pit.io_write(PIT_PORT_BASE, 0xa9);
+        guest.pit.io_write(PIT_PORT_BASE, 0x04);
+        assert_eq!(guest.pit.owed(), 0);
+    }
+
+    /// Reset and resume start clean too (ADR-0005).
+    #[test]
+    fn reset_and_resume_forget_owed_edges() {
+        let guest = Guest::new();
+        guest.advance(u64::from(LATCH_1000HZ) * 8);
+        guest.pit.tick();
+        guest.pit.set_paused(true);
+        guest.pit.set_paused(false);
+        assert_eq!(guest.pit.owed(), 0);
+        guest.advance(u64::from(LATCH_1000HZ) * 8);
+        guest.pit.tick();
+        guest.pit.reset();
+        assert_eq!(guest.pit.owed(), 0);
+        assert_eq!(
+            guest.pit.tick(),
+            None,
+            "reset leaves channel 0 unprogrammed"
+        );
+    }
+
+    /// Mode 2 (what `clockevent_i8253` programs): the counter runs from the
+    /// reload down to 1 and reloads, every period.
+    #[test]
+    fn mode2_counter_reloads_every_period() {
+        let h = Harness::new();
+        h.program_channel0_periodic(1000);
+        let read = |h: &Harness| {
+            h.pit.io_write(COMMAND_PORT, 0x00); // latch channel 0
+            let lo = h.pit.io_read(PIT_PORT_BASE);
+            let hi = h.pit.io_read(PIT_PORT_BASE);
+            u16::from_le_bytes([lo, hi])
+        };
+        assert_eq!(read(&h), 1000);
+        h.advance(999);
+        assert_eq!(read(&h), 1);
+        h.advance(1);
+        assert_eq!(read(&h), 1000, "reloaded at terminal count");
+        h.advance(1000 * 7 + 250);
+        assert_eq!(read(&h), 750);
+    }
+
+    /// Mode 0 (channel 2 in `pit_calibrate_tsc()`): past terminal count the
+    /// counter wraps to 0xffff and keeps counting, and OUT stays high.
+    #[test]
+    fn mode0_wraps_past_terminal_count_and_out_stays_high() {
+        let h = Harness::new();
+        h.pit.io_write(NMI_STATUS_PORT, 0x01);
+        h.pit.io_write(COMMAND_PORT, 0xb0);
+        h.pit.io_write(PIT_PORT_BASE + 2, 0x00);
+        h.pit.io_write(PIT_PORT_BASE + 2, 0x01); // 0x100 ticks
+        h.advance(0x100 + 0x10);
+        h.pit.io_write(COMMAND_PORT, 0x80); // latch channel 2
+        let lo = h.pit.io_read(PIT_PORT_BASE + 2);
+        let hi = h.pit.io_read(PIT_PORT_BASE + 2);
+        assert_eq!(u16::from_le_bytes([lo, hi]), 0xfff0);
+        assert_ne!(h.pit.io_read(NMI_STATUS_PORT) & NMI_OUT2, 0);
+    }
+
+    /// A second latch command before the first latched value was read is
+    /// ignored, as on the 8254: the guest reads the value it latched first.
+    #[test]
+    fn a_second_latch_does_not_overwrite_an_unread_one() {
+        let h = Harness::new();
+        h.program_channel0_periodic(0);
+        h.advance(0x100);
+        h.pit.io_write(COMMAND_PORT, 0x00);
+        h.advance(0x100);
+        h.pit.io_write(COMMAND_PORT, 0x00);
+        let lo = h.pit.io_read(PIT_PORT_BASE);
+        let hi = h.pit.io_read(PIT_PORT_BASE);
+        assert_eq!(u16::from_le_bytes([lo, hi]), 0xff00);
+    }
+
+    /// The read-back command's count latch (`pit_read_status()` style) works
+    /// like the plain latch.
+    #[test]
+    fn readback_latches_the_count() {
+        let h = Harness::new();
+        h.program_channel0_periodic(0x2000);
+        h.advance(0x0123);
+        // Read-back: count only (bit 5 clear, bit 4 set), channel 0 (bit 1).
+        h.pit.io_write(COMMAND_PORT, 0xc0 | 0x10 | 0x02);
+        h.advance(0x0400);
+        let lo = h.pit.io_read(PIT_PORT_BASE);
+        let hi = h.pit.io_read(PIT_PORT_BASE);
+        assert_eq!(u16::from_le_bytes([lo, hi]), 0x2000 - 0x0123);
     }
 }

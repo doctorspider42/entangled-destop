@@ -582,4 +582,13 @@ impl ExitHandler for MachineBus {
     fn reset_requested(&self) -> bool {
         self.reset.is_reset_requested()
     }
+
+    /// The userspace IOAPIC's EOI listeners — the 8254's lost-tick
+    /// re-injection. Only WHP reports EOIs; on KVM the in-kernel irqchip keeps
+    /// them and this is never called.
+    fn apic_eoi(&mut self, vector: u8) {
+        if let Some(irqchip) = &self.irqchip {
+            irqchip.eoi(vector);
+        }
+    }
 }

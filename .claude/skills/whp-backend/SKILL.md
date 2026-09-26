@@ -274,6 +274,7 @@ what most of this machine's lines are.
 | `X64IoPortAccess` | `ExitHandler::io_out`/`io_in`, then RIP += instruction length, and RAX write-back for `IN`. String/`REP` forms go to `WHvEmulatorTryIoEmulation` |
 | `MemoryAccess` | `WHvEmulatorTryMmioEmulation`; an *execute* fault is reported as an error instead (a bad jump target, not MMIO) |
 | `X64Cpuid` | `CpuidPolicy::apply` on top of `DefaultResultRax..Rdx`, then write RAX–RDX and advance RIP |
+| `X64ApicEoi` | `ExitHandler::apic_eoi(vector)`: the guest EOI'd an interrupt that was requested **level**-triggered — only the userspace IOAPIC's listening pins (the 8254's) are. A trap after the write: nothing to advance |
 | `UnrecoverableException`, `InvalidVpRegisterValue` | `RunOutcome::Shutdown` — the triple-fault equivalent |
 | `Canceled`, `None` | re-check the stop flag, then re-enter or `RunOutcome::Stopped` |
 | anything else | `VmmError::Vcpu` naming the reason and RIP |
@@ -358,11 +359,18 @@ topology `mptable` and `acpi` already publish, so a guest cannot see two
 different machines. `IOREGSEL` at +0x00, `IOWIN` at +0x10, 32-bit accesses only.
 Two deliberate deviations from hardware, both load-bearing:
 
-- **No remote IRR / EOI tracking.** A real IOAPIC latches a level-triggered
-  interrupt until the local APIC broadcasts the EOI, which WHP can report
-  (`WHvRunVpExitReasonX64ApicEoi`). Every line this machine owns is an edge on an
-  ISA-style pin, so nothing needs re-assertion and turning the EOI exit on would
-  only cost exits. Same call the KVM irqfd path already made.
+- **No remote IRR.** A real IOAPIC latches a level-triggered interrupt until
+  the local APIC broadcasts the EOI. Every line this machine owns is an edge on
+  an ISA-style pin, so nothing needs re-assertion. Same call the KVM irqfd path
+  already made.
+- **EOIs for the pins that ask.** `IoApic::listen(pin, Weak<dyn EoiListener>)`
+  makes a pin deliver as *level* at the local APIC — WHP's only way to report an
+  EOI (`WHvRunVpExitReasonX64ApicEoi`) — and `IoApic::eoi(vector)` tells the
+  listener, plus an `unmasked()` call on every unmask. The 8254 is the one
+  listener (its lost-tick re-injection, below). The TMR bit this sets is never
+  read by Linux's edge flow (`apic_ack_edge`). A level request on any *other*
+  pin — a guest-programmed level RTE — now also produces the exit, and it is
+  handled (ignored) instead of ending the run loop with "unhandled exit 9".
 - **A masked pin latches one pending edge**, delivered on unmask. Hardware loses
   it. The asymmetry is deliberate: Linux masks and unmasks IRQ 0 repeatedly in
   `check_timer()`, and a UART THRE edge lost inside a mask window stalls the
@@ -399,20 +407,75 @@ Two consumers, in this order:
    APIC timer.
 
 Only channel 0 has an output pin wired anywhere (IRQ 0 → `TIMER_PIN` = 2).
-`Pit::tick` delivers the edges that came due and reports when the next one is;
+`Pit::tick` counts the edges that came due and raises the next owed one;
 `PitTimer` is the host thread that calls it and joins on drop.
 
-`MAX_CATCHUP_EDGES` is 16, sized against the *host's* sleep granularity rather
-than a round number: Rust's `thread::sleep` on Windows 11 rides a
-high-resolution waitable timer and overshoots a 1 ms request by ~0.5 ms
-(measured), but a loaded host can miss a ~15 ms quantum, which is 15 owed edges
-at the x86_64 defconfig's `HZ=1000`. Below that the guest's jiffies drift
-permanently behind, which is exactly what `timer_irq_works()` reports as a broken
-8254.
+#### Lost ticks, and why the 8254 re-injects them (2026-09-26)
+
+A guest in periodic mode counts **interrupts**, not time — `tick_periodic()`
+adds one jiffy per IRQ 0 — and `timer_irq_works()` waits `40e9 / HZ` TSC
+cycles: **11.4 ms** at Ubuntu's HZ=1000 on this 3.5 GHz host, for five of them.
+Every IRQ 0 on WHP is raised by a host thread and injected through
+`WHvRequestInterrupt`, and two things lost them (host traces with the TSC
+windows marked, `ADR-0002`'s 2026-09-26 amendment):
+
+- **The timer thread overslept.** At normal priority, on a host with every
+  core busy, a 0.5 ms `sleep` came back after 16–21 ms. The panicking boots
+  show *no edge at all* between the RTE unmask and the re-mask 11.6 ms later.
+- **Edges raised together are one interrupt.** The old catch-up raised up to
+  16 owed edges back to back; the local APIC has one pending bit per vector,
+  so the guest took one. A vCPU thread the host deschedules coalesces them the
+  same way, however well the timer keeps time.
+
+The fix is both halves, KVM's in-kernel PIT policy (`reinject`) in userspace:
+
+1. **Owed edges, raised one per EOI.** `PitState::owed` counts edges that came
+   due; one is raised, and the next only when the guest has *taken* it. The
+   IOAPIC pin has an `EoiListener`: a listened pin is requested
+   **level-triggered**, which is what makes WHP report the guest's EOI
+   (`WHvRunVpExitReasonX64ApicEoi`, a base exit reason — no extended-exit bit),
+   the run loop hands the vector to `ExitHandler::apic_eoi`, and the PIT raises
+   the next owed edge **on the vCPU thread** before it re-enters: the backlog of
+   a stall arrives as separate jiffies within microseconds. Measured: an EOI
+   comes back 20–45 µs after the raise.
+2. **The thread runs at `THREAD_PRIORITY_TIME_CRITICAL`** on Windows, so a busy
+   host serves its wake-ups first. It is awake microseconds a millisecond.
+
+Bounds: `MAX_CATCHUP_EDGES` = 32 owed (a 21 ms oversleep plus a descheduled
+quantum at HZ=1000; `timer_irq_works()` needs five), `ACK_TIMEOUT` = 100 ms
+before an untaken edge is written off (long enough to repay the edges of
+`pit_calibrate_tsc()`'s 50 ms interrupts-off loop, short enough that a masked
+pin does not hold anything up), and the count is **forgotten** on a channel-0
+reprogram, a pin unmask (hardware loses edges at a masked pin), reset, resume
+and restore. Before the first EOI is ever seen, owed edges go out one per timer
+wake-up, `CATCHUP_SPACING` (250 µs) apart — never two at once.
+
+Result, Ubuntu's 7.0 kernel (HZ=1000) direct-booted with the test initramfs,
+24 spinning host threads on 24 logical CPUs, 1/2/4/8 vCPUs, 60 boots each way:
+**37 `check_timer()` failures and 29 panics before, 0 and 0 after.** An idle
+host reproduced neither, before or after (60 boots each); the full table is in
+ADR-0002's amendment. The installed 8-vCPU desktop numbers are there too.
+
+**PIT calibration can still fail, and that is not a bug in the 8254.**
+`pit_calibrate_tsc()` rejects a run where any one port-`0x61` read took 10× the
+fastest; a WHP port exit is ~6 µs at best and 25–150 µs when the host preempts
+the vCPU (measured per read: `min 5.7 µs`, `max 151 µs`), and
+`quick_pit_calibrate()` needs the whole edge uncertainty under ~24 µs, which four
+6 µs exits already exceed — it has not succeeded once here. Linux then uses the
+PM timer (`tsc: using PMTIMER reference calibration`), within 0.2 % of WHP's
+3 500 047 kHz. What would skip calibration is a known frequency, and on **AMD**
+Linux has no leaf to read one from (see the CPUID policy's timing leaves).
 
 The clock is injectable (`Clock::Fake`, `#[cfg(test)]`) so counter and edge
-arithmetic is asserted deterministically instead of by sleeping. One test does
-use the real clock, to prove the conversion is right.
+arithmetic is asserted deterministically instead of by sleeping. The
+re-injection tests model the local APIC as one pending bit and the guest as
+"take, count a jiffy, EOI" (`FakeLapic`, `Guest`); `a_late_wake_raises_one_edge_not_the_backlog`,
+`a_descheduled_vcpu_still_passes_timer_irq_works` and
+`delayed_polling_loses_no_jiffies` fail on the old model. One test uses the real
+clock, to prove the conversion is right. `cargo test -p vmm-core --test
+whp_timer -- --ignored` boots the SMP guest N times, optionally under host load
+(`ENTANGLED_TIMER_BUSY=all`) and with another kernel (`ENTANGLED_TIMER_KERNEL`),
+and fails on the first `8254 timer not connected`.
 
 ### PIC design notes
 
@@ -473,8 +536,9 @@ including the feature bits WHP masks for its own reasons.
 `DefaultResultRax..Rdx`, which makes the policy a *diff*, the same shape as the
 KVM path's edit of `KVM_GET_SUPPORTED_CPUID`.
 
-Six leaves in `CPUID_EXIT_LEAVES`; keep the list short, every entry costs an exit
-each time the guest reads it. Five mirror `vmm_core::Vcpu::new` exactly:
+23 leaves in `CPUID_EXIT_LEAVES`. An entry costs an exit only when the guest
+*reads* that leaf, so keep the list to leaves the policy changes. Five mirror
+`vmm_core::Vcpu::new` exactly:
 
 | Leaf | Change |
 |---|---|
@@ -482,13 +546,52 @@ each time the guest reads it. Five mirror `vmm_core::Vcpu::new` exactly:
 | `0xb`, `0x1f`, `0x8000_0026` | `EDX = vp_index` (x2APIC id) |
 | `0x8000_001e` | `EAX = vp_index` (AMD extended APIC id — the one Linux trusts with TOPOEXT) |
 
-The sixth is the one place the hosts legitimately differ: **`0x4000_0000` is
-zeroed.** A WHP partition runs on Hyper-V, and a guest that sees `"Microsoft Hv"`
-starts using synthetic MSRs an exo-partition does not implement. With an empty
-hypervisor interface and the hypervisor-present bit still set,
-`detect_hypervisor_vendor()` finds no match and the guest takes the architectural
-paths — hence `Booting paravirtualized kernel on bare hardware` in the log, and
-no kvmclock (there is none to have).
+The hypervisor range is the one place the hosts legitimately differ: **the
+`0x4000_0000` signature is zeroed.** A WHP partition runs on Hyper-V, and a guest
+that sees `"Microsoft Hv"` starts using synthetic MSRs an exo-partition does not
+implement. With an empty hypervisor interface and the hypervisor-present bit
+still set, `detect_hypervisor_vendor()` finds no match and the guest takes the
+architectural paths — hence `Booting paravirtualized kernel on bare hardware` in
+the log, and no kvmclock (there is none to have). (This host has no
+`WHvCapabilityCodeSyntheticProcessorFeaturesBanks` either, so real Hyper-V
+enlightenments are not on offer.)
+
+### Timing leaves (2026-09-26)
+
+WHP reports both clocks a guest would otherwise measure:
+`WHvCapabilityCodeProcessorClockFrequency` (TSC, 3 500 047 429 Hz here) and
+`WHvCapabilityCodeInterruptClockFrequency` (the local APIC timer, 200 MHz).
+`WhpHypervisor::guest_clocks()` reads them; the partition hands them to every
+vCPU's `CpuidPolicy::with_clocks`:
+
+| Leaf | With clocks known |
+|---|---|
+| `0x4000_0000` | `EAX = 0x4000_0010`, signature still empty |
+| `0x4000_0001`–`0x4000_000f` | zeroed — Hyper-V's own interface leaves must not show through an empty signature |
+| `0x4000_0010` | `EAX` TSC kHz, `EBX` APIC timer kHz (the generic timing leaf; FreeBSD and XNU read it for any hypervisor) |
+| `0x15` | **Intel only**: crystal = the APIC timer (Linux sets `lapic_timer_period` from it), ratio TSC/crystal chosen so Linux's 32-bit `crystal_khz * ebx / eax` cannot overflow — 10 ppm here |
+
+The finding worth keeping: **on an AMD host no CPUID leaf tells Linux the TSC
+frequency.** `native_calibrate_tsc()` and `cpu_khz_from_cpuid()` return 0 unless
+the vendor is Intel, and Linux 7.0 reads `0x4000_0010` only as VMware or ACRN
+(checked in `arch/x86/kernel/{tsc.c,cpu/vmware.c,cpu/acrn.c}` at v7.0). KVM
+guests skip calibration through kvmclock, Hyper-V guests through the frequency
+MSRs; a WHP guest on AMD calibrates against the 8254 and, when that fails on
+exit latency, the PM timer — accurate, and not the panic (see the PIT notes).
+Impersonating VMware or ACRN would fix the log line and change what
+`systemd-detect-virt` and the guest's drivers believe; it was rejected.
+
+Also found, and **open**: WHP here does not offer invariant TSC
+(`WHvCapabilityCodeProcessorFeaturesBanks` bank 1 is `0x4`, i.e. `ClZero` only,
+no `TscInvariantSupport`), and our topology leaves describe every vCPU as its own
+package (`CPU topo: Max. logical packages: 8`). On AMD that makes
+`unsynchronized_tsc()` true for any SMP guest: `tsc: Marking TSC unstable due to
+TSCs unsynchronized`, clocksource `acpi_pm`, and every `clock_gettime` a port
+exit. A one-vCPU guest passes that check and then loses the TSC to the
+clocksource watchdog in 9 of 10 boots (`refined-jiffies` 495 ms vs the TSC's
+742 ms: jiffies run a third slow before a clocksource is chosen) — suspected,
+not measured: a halted vCPU sleeps on the halt gate until one of *our*
+injections or `HALT_POLL`, and WHP's in-hypervisor LAPIC timer is neither.
 
 MSR exits are deliberately **off**: WHP's own MSR policy is better than one we
 would write, and unknown MSRs already `#GP` to the guest, which Linux's safe

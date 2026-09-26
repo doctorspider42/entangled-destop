@@ -7343,3 +7343,424 @@ Evidence: `F:\VMs\Entangled\hz\<run>\` (`run.log`, `drive.trace`, `smi.csv`,
 `frames.json`, the screenshots `vk.png`/`glf.png`, and for windowed runs the
 Windows screen grab `vk-screen.png`). `summ.py <run>` and `table.py <run>` in
 the probe directory reproduce every row.
+
+## Amendment, 2026-09-26 — the GPU's clocks: what an application may ask for, and the boost the window asks for
+
+Every amendment since the GPU-time one (2026-09-25) has found the RTX 2070 at
+P5 or P8 under the guest's work: 300–885 MHz core, 405–810 MHz memory, where
+the guest's GPU time is 3–10× its P0 time and every round trip is slower. The
+guest's work is sparse, and it runs on the renderer's own devices, late in a
+long-lived process. Holding P0 with a native process on the host made every
+guest timestamp native and added 15–18 % to on-screen glmark2. The NVIDIA
+"Prefer maximum performance" setting would do the same, but it is a driver
+setting, and this amendment asks what an **application** may legitimately
+request through APIs instead. No driver, power or NVIDIA profile setting was
+changed.
+
+In short: one request works, and it is strong. `VK_NV_low_latency2`'s
+`lowLatencyBoost` on the window's swapchain holds the whole GPU at P0 while it
+is set — the renderer's devices included, whether or not anything is
+submitted. So the window now asks for it while the guest uses the GPU, and
+lets go a second after. Nothing else an application may call moved a clock.
+
+### What the driver offers
+
+`vulkaninfo` and the probe below, on driver 580.88:
+
+| extension | RTX 2070 |
+|---|---|
+| `VK_NV_low_latency2` | yes, revision 2 |
+| `VK_KHR_present_id` (which it requires) | yes |
+| `VK_NV_low_latency` | yes |
+| `VK_EXT_headless_surface` (instance) | **no** |
+
+The list is the physical device's, so the renderer's devices could enable it
+as well as the display's. The display's wgpu device gets it through wgpu-hal's
+device-creation callback, as `VK_EXT_queue_family_foreign` does
+(`gpu_scanout::request_device`).
+
+What the extension can be asked:
+
+* `vkSetLatencySleepModeNV(device, swapchain, info)`: `lowLatencyMode`,
+  `lowLatencyBoost`, `minimumIntervalUs`. The spec: "If `lowLatencyMode` is
+  false, `lowLatencyBoost` will still hint to the GPU to increase its power
+  state".
+* `vkLatencySleepNV` and `vkSetLatencyMarkerNV`, both per swapchain.
+* `vkQueueNotifyOutOfBandNV`, per queue: it marks a queue's work as outside
+  the frame for the latency pacing. It is no request for clocks.
+
+The renderer's devices have no swapchain, and without
+`VK_EXT_headless_surface` a Windows device can have one only on a window. So
+the boost can only be asked for on a swapchain. Which swapchain it is turns out
+not to matter (below).
+
+### The probe
+
+`F:\VMs\Entangled\probes\boost\` holds `gpu-boost-probe`, a standalone ash
+program shaped like `entangled run`: two `VkDevice`s on the one GPU in one
+process. The "display" device has a window (640×360, never activated), a
+MAILBOX swapchain, and a clear presented at 60 Hz, optionally with
+`VK_NV_low_latency2`. The "renderer" device has no swapchain. It submits a
+16 MiB fill and copy every 16.7 ms, timed by GPU timestamps and by
+submit-to-fence wall time. NVML samples the P-state, the clocks, the
+utilization and the power every 50 ms. Phases switch the sleep mode at run
+time. Every figure below is the mean over a 20 s phase minus its first 3 s
+(`F:\VMs\Entangled\boost\host-probe.txt`, `h1.csv`–`h3.csv`).
+
+**The host was not quiet.** Three to five PCSX2 instances ran as batch jobs
+(`-batch -nogui`, homebrew test runs) throughout this amendment's
+measurements. They held the GPU at 18–43 % utilization and often at P0 by
+themselves, and C++ builds loaded the CPUs. The VMware guest was closed. So
+"base" below is not the P8 of a quiet desktop. It is whatever the other
+tenants left, and every comparison was repeated in one process, back to back.
+
+### What the boost does
+
+On the display's swapchain (`h1`, `h2`), "work" being the renderer device's
+fill and copy:
+
+| phase | who submits | P-states | SM / memory MHz | power | work GPU time, median / p90 |
+|---|---|---|---|---:|---|
+| base (sleep mode all off) | both | P0 57–76 %, P3, P5 | 968–1159 / 5391–6119 | 52.5–56.2 W | 170–183 / 278–1419 µs |
+| `lowLatencyMode` alone | both | P0 78 %, P3, P5 | 1136 / 6050 | 55.2 W | 180 / 1197 µs |
+| **boost** | both | **P0 100 %** | **1410 / 7000** | 59.7–60.9 W | **150 / 155 µs** |
+| mode + boost | both | P0 100 % | 1410 / 7000 | 59.7 W | 151 / 155 µs |
+| base | renderer only, the window presents nothing | P0 54–61 %, P3, P5 | 1032–1068 / 4650–6027 | 50.2–55.7 W | 176–183 / 258–3047 µs |
+| **boost** | renderer only | **P0 100 %** | 1410 / 7000 | 60.1–60.5 W | 150–151 / 155 µs |
+| base | nobody | P0 34–71 %, P5, P8 | 892–1064 / 3032–5896 | 45.4–53.9 W | — |
+| **boost** | **nobody** | **P0 100 %** | 1410 / 7000 | 59.2 W | — |
+
+What that says:
+
+* **The boost is GPU-wide, not per context.** Set on the display device's
+  swapchain, it gave the renderer device's work P0 even while the display
+  presented nothing. The GPU time settled at 150 µs, and the tail went: p90
+  155 µs against up to 3 ms.
+* **It is a hold, not a hint scaled to load.** With nothing submitted by the
+  probe at all it still held P0 1410/7000, about 5–14 W above the same
+  phase without it on this host.
+* It takes effect at once. From P5 (525 MHz / 810 MHz) the next NVML sample,
+  50–70 ms later, reads P0 1410/7000 every time. Withdrawn, the driver keeps
+  P0 for about 1.8 s by itself and then falls (P5 930–1035 MHz at
+  +1.79–1.81 s).
+* `lowLatencyMode` alone does nothing measurable to the clocks, and adding
+  it to the boost adds nothing. `vkLatencySleepNV` pacing was not needed.
+* The swapchain needs nothing special. wgpu cannot chain
+  `VkSwapchainLatencyCreateInfoNV`, and a swapchain created with it
+  (`--latency-ci`) behaved exactly as one created without it. A swapchain of
+  the renderer's own device, on a window never shown and never presented to,
+  gave the same P0 (`h3`). No present is needed at all.
+* **A NULL `pSleepModeInfo` crashes the driver.** The spec allows NULL to
+  switch everything off. On 580.88 `vkSetLatencySleepModeNV(dev, sc, NULL)` is
+  an access violation inside the driver, every time. Off is sent as a
+  structure with every member false.
+
+### The other candidates
+
+Measured with the same probe, without `VK_NV_low_latency2`. Each variant ran
+as its own process, twice, interleaved:
+
+| variant | P-states (both / renderer only) | SM / memory MHz | work p90 |
+|---|---|---|---|
+| none | P0 51–61 % / 49–53 % | 1012–1132 / 5764–5866 | 235–2516 µs |
+| `SetProcessInformation(ProcessPowerThrottling)`, execution speed never throttled | P0 60–65 % / 54–60 % | 1044–1176 / 5852–6009 | 232–2079 µs |
+| `D3DKMTSetProcessSchedulingPriorityClass(HIGH)` | P0 59–64 % / 54–62 % | 941–1049 / 5539–5735 | 1363–1857 µs |
+
+Both calls succeed without elevation, and neither moves a clock. That is what
+they are for. Power throttling is the CPU's EcoQoS, and the VMM is a
+foreground process the scheduler does not throttle anyway. The GPU
+scheduling priority orders contexts on the GPU and does not touch the
+P-state. Neither was implemented.
+
+* `IDXGIDevice1::SetMaximumFrameLatency` is DXGI's. The window presents
+  through Vulkan, where wgpu's `desired_maximum_frame_latency` is already 2
+  (the high-refresh amendment), and a frame-queue depth is not a clock
+  request.
+* NVAPI's `NvAPI_D3D_SetSleepMode` is Reflex for D3D. `nvapi64.dll` is in
+  System32 and needs no elevation, but no crate binds it, and its entry points
+  are reached through `nvapi_QueryInterface` by the numeric ids in NVIDIA's
+  headers. It would only matter for the D3D12 fallback window, which opens
+  when the shareable Vulkan device cannot be had. On this host that never
+  happens, and without that device the renderer's scanout takes the copy path
+  anyway. It was not tried.
+
+### Why the driver clocks down, and why batching would not change it
+
+At 60 Hz GNOME's frame is a few hundred microseconds of GPU work. The
+presenter's copy retires about 1 ms after submit (the zero-copy amendment),
+and the guest's own compositing is of the same order. That is a GPU a few
+per cent busy, and a driver that decides P-states from utilization sees an
+idle GPU. That is correct, and it costs nothing at 60 Hz: the refresh
+amendment measured 60.0 frames a second at P8.
+
+Coalescing the device's small submits, or the presenter's copy with guest
+work, would shorten the idle gaps between submits. It would not change how
+much of each sampling window the GPU is busy, which is what the driver reads.
+The only way to raise utilization is more GPU work, and that would be waste.
+`VK_KHR_push_descriptor` (the CSS amendment's open item) cuts ring commands
+and host CPU per frame. It is not expected to change the clocks either.
+
+The probe's "renderer only" rows show the shape. 16 MiB every frame is about
+1 % of the GPU's time at P0, and without the boost the driver left it at
+P0/P3/P5 by turns, with a p90 up to twenty times the median.
+
+### What the window does (`display::boost`, `display::latency`)
+
+The boost is GPU-wide and the display's swapchain is enough, so the renderer
+asks for nothing. The window asks, and only while the guest uses the GPU:
+
+* **The device.** `gpu_scanout::request_device(.., latency)` adds
+  `VK_NV_low_latency2` and `VK_KHR_present_id` to the shareable Vulkan
+  device when the adapter has both and a Vulkan 1.2 API. It uses wgpu-hal's
+  creation callback, as for `VK_EXT_queue_family_foreign`.
+  `latency::LatencyBoost` loads the extension's functions from wgpu's raw
+  device. It makes the call on wgpu's own swapchain
+  (`Surface::as_hal::<Vulkan>()` → `raw_swapchain()`), with
+  `lowLatencyMode` off and `lowLatencyBoost` on or off, never NULL. A
+  reconfigured surface is a new swapchain whose sleep mode is off, so the
+  renderer applies it again after every configure.
+* **Activity** is a flip that reached the display (`Waker::frame`, shared or
+  copied) or a `SUBMIT_3D` the device accepted. `ScanoutSink::gpu_work` is
+  new, additive, a no-op by default, and in `display` an atomic store. A Venus
+  guest rings its doorbell with a `SUBMIT_3D` whenever its ring worker has
+  parked, so work without a flip counts too. vk-smoke never flips, and still
+  had the boost before its first timed submit (below).
+* **The gate** (`BoostGate`, pure): wanted while the last activity is less
+  than `ACTIVE_HOLD` old, 1 s. The event loop asks it in `about_to_wait`.
+  While the boost is up, the loop sleeps until the hold ends
+  (`ControlFlow::WaitUntil`). While it is down, the loop **arms** the
+  activity, and only the first submit or flip after that sends a wakeup
+  (`HostEvent::GpuActive`). That is one wakeup per idle-to-active
+  transition, never one per submit. The window looks at the activity again
+  after arming, so a submit in between is not lost.
+* **The default is on, gated**, for the window of the Venus GPU desktop.
+  `[display] gpu_boost = false` turns it off. It is optional and never
+  written when absent, and `true` beside `venus = false` is refused, since
+  there is nothing to boost. `ENTANGLED_GPU_BOOST=off|active|always`
+  overrides the profile for A/B runs. `always` sets the boost once and leaves
+  it, for measurement only.
+* **Where it does nothing:** a headless VM (no swapchain), the copy path's
+  ordinary device, a driver without the extension (other vendors, Linux
+  today), and 2D VMs. Everything outside `#[cfg(windows)]` builds and tests
+  on both hosts.
+* The `display statistics` line carries `gpu_boost`, `gpu_boost_raised`,
+  `gpu_boost_on_s` and `gpu_boost_failed`, and
+  `RUST_LOG=display::renderer=debug` logs each transition.
+
+A headless VM could be given the boost through a swapchain on a hidden
+window (`h3` shows that it works). It was left out: nobody watches a headless
+VM, and a hidden window in a process without an event loop is a second
+window lifecycle to own.
+
+### In the guest
+
+`F:\VMs\Entangled\probes\boost\` again: `runboost.sh` boots the working Venus
+guest (`venus-ubuntu-net-profile.toml`, a copy per refresh rate) windowed on
+WHP with `ENTANGLED_GPU_BOOST` set, `drive.ps1` drives it over the serial
+console, and `summ.py --table` makes the rows. The binary is
+`entangled-boost2.exe`, built from this change. `off` is the baseline, the
+behaviour before it. The phases: an idle desktop (20 s), vk-smoke checks 4–7
+with `--repeat 40`, glmark2 `build` and `jellyfish` (10 s each, on screen,
+uncapped), vkcube FIFO (12 s), the CSS page of the CSS amendment in Firefox
+(10 s, 60 Hz only), and the idle desktop again (20 s). `nvidia-smi` logged
+the P-state, the clocks, the utilization and `power.draw` every 200 ms, and
+`tenants.ps1` logged every tenant's CPU every 2 s. The runs were interleaved
+off/active.
+
+vk-smoke's figures are warm medians of timestamps: compute into type 3 /
+compute device-local / the triangle, then the empty submit's wall time. "idle
+after" is the 20 s after the last workload.
+
+| run | boost | Hz | vk-smoke ts (ms) | empty submit (ms) | glmark2 build / jellyfish | vkcube flips/s | CSS flips/s | GPU in vkcube: P0, MHz, W | GPU in jellyfish: P0, W | idle after: P-states, W | PCSX2 cores |
+|---|---|---:|---|---|---|---:|---:|---|---|---|---:|
+| `o60a` | off | 60 | 0.325/0.035/0.032 | 0.428 | 479 / 554 | 59.5 | 27.5 | 71 %, 1127/6053, 54.3 W | 100 %, 87.2 W | P0 28 % P5 53 % P8 19 %, 39.6 W | 1.8 |
+| `a60a` | active | 60 | 0.326/0.026/0.029 | 0.387 | 590 / 591 | 59.5 | 24.2 | 100 %, 1410/7000, 59.3 W | 100 %, 86.5 W | P5 70 % P8 30 %, 34.2 W | 1.4 |
+| `o60b` | off | 60 | 1.259/0.307/0.054 | 0.472 | 542 / 443 | 59.6 | 13.5 | 30 %, 884/2642, 42.8 W | 92 %, 56.6 W | P8 100 %, 29.7 W | 0.6 |
+| `a60b` | active | 60 | 0.321/0.026/0.029 | 0.384 | 491 / 746 | 59.8 | 30.1 | 100 %, 1410/7000, 58.9 W | 100 %, 61.1 W | P0 14 % P5 4 % P8 82 %, 27.5 W | 0.0 |
+| `o60c` | off | 60 | 1.267/0.303/0.101 | 0.476 | 633 / 428 | 59.9 | 28.0 | 0 %, 751/810, 35.2 W | 79 %, 51.7 W | P5 10 % P8 90 %, 29.3 W | 0.5 |
+| `a60c` | active | 60 | 0.322/0.026/0.029 | 0.373 | 750 / 729 | 59.9 | 26.3 | 100 %, 1410/7000, 59.0 W | 100 %, 84.0 W | P0 52 % P5 47 %, 48.1 W ‡ | 2.7 |
+| `o120b` | off | 120 | 0.325/0.031/0.031 | 0.444 | 458 / 451 | 119.8 | — | 100 %, 1408/7000, 61.4 W | 100 %, 89.6 W | P0 63 % P5 37 %, 49.3 W | 1.4 |
+| `a120a` | active | 120 | 0.331/0.025/0.030 | 0.394 | 473 / 550 | 118.4 | — | 100 %, 1410/7000, 60.8 W | 100 %, 85.4 W | P0 17 % P5 83 %, 38.7 W | 1.4 |
+| `a120b` | active | 120 | 0.324/0.026/0.029 | 0.375 | 528 / 464 | 117.1 | — | 100 %, 1457/7000, 62.0 W | 100 %, 89.0 W | P0 11 % P5 46 % P8 43 %, 34.9 W | 1.4 |
+| `al60a` † | always | 60 | — | — | — | 10.8 | — | 100 %, 1410/7000, 56.4 W | — | P0 100 %, 55.9 W | 0.0 |
+| native, host (the GPU-time amendment) | | | 0.322/0.026/0.029 | 0.07 | | | | | | | |
+
+‡ PCSX2 was running 2.7 cores and holding the GPU itself.
+† `always` ran only an idle desktop and vkcube, and the host was saturated
+then (22 of 24 cores busy, a scanner application in the foreground: vkcube
+made 10.8 frames a second). Its row is only for the idle power.
+`o120a` is not a result: the desktop's user closed the VM's window 10 s into
+it.
+
+What the boost buys, at 60 Hz:
+
+* **The guest's GPU time is the host's own.** With the boost, every warm
+  vk-smoke timestamp in all four boosted 60 Hz runs equals the native
+  figures: compute 0.321–0.326 ms, device-local 0.026 ms, the triangle
+  0.029 ms. Without it, 2 of 3 runs read 1.26 / 0.30 / 0.05–0.10 ms, the
+  P8 figures of the GPU-time amendment. The third (`o60a`) ran while PCSX2
+  held P0.
+* **Round trips shorten a little.** The empty submit takes 0.373–0.387 ms
+  against 0.428–0.476 ms. The rest is the guest's fence wait (the GPU-time
+  amendment).
+* **GPU-bound work gets faster where the baseline was clocked down.**
+  jellyfish scored 591 / 746 / 729 against 554 / 443 / 428, a mean of +45 %.
+  build scored 590 / 491 / 750 against 479 / 542 / 633, +11 %, within this
+  host's noise. In every boosted run glmark2 ran at P0 throughout; unboosted,
+  jellyfish at P0 79–100 % and build at P0 15–100 %.
+* **A frame-paced desktop gains no frames, only clocks.** vkcube made
+  59.5–59.9 flips a second either way. The CSS page made 24.2 / 30.1 / 26.3
+  against 27.5 / 13.5 / 28.0 flips, which is noise (the page is ring-bound,
+  the CSS amendment). vkcube moved from P5/P8 at 35–54 W to P0 at 59 W.
+
+At 120 Hz the desktop's own load keeps the driver at P0 (the high-refresh
+amendment), so there is little to add. vkcube and glmark2 sat at P0 100 % in
+all three runs, and scores and power were the same within noise. That is
+this host's default refresh (240 Hz monitor → 120).
+
+**Power, honestly.** While the guest draws at 60 Hz, the boost costs what P0
+costs: vkcube at 58.9–59.3 W against 35.2–54.3 W, **+5 to +24 W**. More, the
+lower the baseline's clock. While the desktop is idle it costs nothing: the
+idle desktop after the workloads fell to P5/P8 at 27.5–38.7 W in every
+boosted run but `a60c`, where PCSX2 held the GPU. `always`, the ungated
+request, kept an idle desktop at P0 and 55.9–57.0 W, **about +25 W against
+the 27.5–35 W of a gated idle desktop**. That is the whole reason for the
+gate, and what a per-application "Prefer maximum performance" profile would
+cost too. The VMM's CPU did not change (vkcube: 0.97–1.18 cores at 60 Hz,
+1.94–2.02 at 120, either way).
+
+The gate works as designed. vk-smoke never flips, and its doorbells raised
+the boost 44–51 ms after the driver typed the command, before the check's
+first timed submit. `a60b` asked 11 times over 100 s of boosted time and
+never failed (`gpu_boost_raised=11 gpu_boost_on_s=100.1
+gpu_boost_failed=0`).
+
+The host was not quiet here either. PCSX2 batch runs (0–2.7 cores, some of
+the GPU) came and went between boots, and the row says how much. The
+three-way spread of the unboosted rows is mostly that.
+
+### A flicker report, not reproduced
+
+During the first windowed boot of this probe (`o60a`, boost off) the user
+reported heavy flicker on the screen. The high-refresh amendment's switch from
+`AutoVsync` (`FifoRelaxed`) to `Mailbox` was the first suspect. It was chased
+before any other measurement:
+
+* `probes\boost\grab.ps1` grabs the VM window's client area from the screen,
+  about 20 times a second, as composed by DWM with whatever overlaps it. For
+  each grab it records the mean luma, the near-black fraction and the mean
+  change from the grab before. `fl.py` counts large steps and reversals, the
+  mark of an alternation.
+* Five boots, the binary of `b5b4bda` (`entangled-hz3.exe`) unless noted.
+  Each measured an idle desktop, vkcube (FIFO), the Activities overview and
+  glmark2, 5 s each: `Mailbox` (the default), `ENTANGLED_PRESENT_MODE=fifo`,
+  `=auto` (the old `FifoRelaxed`), `ENTANGLED_SCANOUT_PATH=copy`. Grabs were
+  also taken live during a boost run (`live-a60a`: vkcube, Firefox starting,
+  the CSS page).
+* **No grab in any mode showed an alternation, a black frame or a stale
+  frame.** Idle desktop: the same luma in every grab. vkcube and glmark2:
+  changes of 0.1–0.8 luma levels, the moving object. The overview: its
+  zoom-out and zoom-in, as smooth ramps. The window's own counters in the
+  reported boot agreed: no guest frame unshown, no surface recoveries, no
+  skipped frames (`display statistics`, `o60a`).
+
+Two explanations remain, and neither is a bug in the present path:
+
+* **The probe's content.** The CSS page is a stress page: 180 boxes pulse
+  between 40 and 100 % opacity every 1.7 s, twelve white bars sweep the
+  screen every 2 s, and Firefox shows it at 15–28 frames a second. The
+  refresh probe's plan toggles the overview every 0.8 s. Both look like
+  strobing to someone in front of the screen. The rest of this amendment's
+  boots dropped the overview toggling and kept the CSS page at 60 Hz only.
+* **The panel.** One of the host's monitors is an ASUS VG259QM, a
+  variable-refresh panel, and Windows' "variable refresh rate" optimization
+  is on (`VRROptimizeEnable=1`). If VRR engages for the window, a frame rate
+  that swings between 0.1 and 60 frames a second can make a VRR panel's
+  brightness flicker at low refresh. That flicker would be in the panel, where
+  a screen grab cannot see it. Whether VRR engaged for the window, or which
+  monitor it was on, was not established, and no setting was changed to find
+  out.
+
+Evidence: `F:\VMs\Entangled\flicker\` (`results.txt`, and per boot the grab
+CSVs and every fifth grab as PNG).
+
+### The default, and the NVIDIA profile
+
+The boost is **on by default, gated**, for the window of the Venus GPU
+desktop, because of these tables:
+
+* It never costs anything while the desktop is idle.
+* At this host's default refresh (120 Hz) it costs nothing while the desktop
+  draws, because the driver is at P0 anyway.
+* At 60 Hz it trades 5–24 W, while something moves, for the host GPU's real
+  speed: native GPU times, and up to half again in GPU-bound work.
+
+`gpu_boost = false` is the opt-out for a user who would rather have the
+watts, a laptop on battery for one.
+
+A button that writes an NVIDIA driver profile ("Power management mode: Prefer
+maximum performance" for the VMM through NVAPI's DRS) is **not worth it**. It
+would change a driver setting, which this project does not do, and a write
+to the driver's settings store may need elevation (not tried). It would buy nothing the boost does not: the P0 rows of the
+GPU-time amendment are the boost's rows here. And it holds P0 whenever the
+process has the GPU, idle included, which is the `always` row: about +25 W on
+an idle desktop. A gate is what makes the clocks affordable, and only an API
+the application calls can have one.
+
+### Tests
+
+* `display::boost::tests`:
+  - the profile key's mapping (absent is the gated default, `false` is off);
+  - every environment spelling, and nonsense refused;
+  - `Off` never wants the boost and `Always` always does;
+  - `WhileActive` wants it for exactly the hold after the last activity, and
+    names the end of the hold as its next change;
+  - activity at 60 Hz keeps it up without a gap and lets go after the hold;
+  - an activity stamped after the window's `now` (another thread) saturates.
+* `display::handle::tests`:
+  - flips and submits are activity, and a cursor move or a redraw request is
+    not;
+  - an armed window is woken once per idle-to-active transition, and a
+    boosting one never;
+  - the activity never goes backwards under four writer threads.
+* `virtio_gpu::device::tests::an_accepted_submit_is_reported_to_the_sink_as_gpu_work`:
+  a `SUBMIT_3D` to a live context calls `gpu_work` once, and one to a context
+  that does not exist does not.
+* `control_api::config::tests::the_gpu_boost_is_optional_and_only_asked_for_with_venus`:
+  absent is never written, both values round-trip beside `venus = true`,
+  `false` is always accepted, `true` without venus is refused by name, and a
+  word is not a boolean.
+* The Vulkan half has no automated test. A real-GPU test would need a
+  window and a swapchain in the test process, and what it would check, the
+  driver's clocks, only NVML can read. The probe (`gpu-boost-probe`, both
+  swapchain variants, the NULL crash) and the guest boots above are its
+  evidence.
+
+### Still open
+
+* **A quiet host.** Every number here was taken beside PCSX2 batch runs that
+  used up to 43 % of the GPU and up to 2.7 cores, and the desktop's user was
+  working throughout. The boosted rows are steady, because the boost pins the
+  clocks. The unboosted ones scatter with the other tenants. On a quiet host
+  the 60 Hz baseline would be P8 in every run, and the boost's gain and its
+  power cost would both sit at the top of the ranges above.
+* **120 Hz has one unboosted boot**, `o120b`. `o120a` was closed by the user
+  10 s in, and no more windowed boots were started while the user sat at the
+  screen.
+* **The Linux/KVM host.** `VK_NV_low_latency2` exists in NVIDIA's Linux
+  driver too, but the window there is not the shareable Vulkan device this
+  hangs on, and nothing was measured. The code is `#[cfg(windows)]` and a
+  no-op elsewhere.
+* **A headless VM** has no boost. A hidden window's swapchain would work
+  (`h3`).
+* **The hold** (1 s) was not tuned. The driver adds its own 1.8 s, so an idle
+  desktop is back at P5/P8 about 3 s after its last frame.
+* **The flicker report** is not reproduced (above). If it recurs, a phone
+  camera at 240 frames a second shows what a screen grab cannot: panel VRR
+  flicker.
+
+Evidence: `F:\VMs\Entangled\boost\` (`host-probe.txt`, `h1.csv`–`h3.csv` and
+their `.work.csv`, and per boot `run.log`, `drive.trace`, `smi.csv`,
+`tenants.csv`, `frames.json`) and `F:\VMs\Entangled\flicker\`. The probe
+sources are in `F:\VMs\Entangled\probes\boost\`, and `summ.py --table <runs>`
+reproduces the guest table.
