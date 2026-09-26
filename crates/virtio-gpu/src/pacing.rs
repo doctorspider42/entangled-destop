@@ -39,8 +39,10 @@
 //!
 //! A mean hides everything that makes a desktop feel broken, so the report
 //! also carries the classic pair of tail figures — the mean of the slowest
-//! 1 % and 0.1 % of intervals, quoted as fps — plus two counters defined
-//! against the refresh period the EDID advertises ([`REFRESH_PERIOD`]):
+//! 1 % and 0.1 % of intervals, quoted as fps — two jitter figures (the
+//! intervals' standard deviation, and the mean change from one interval to
+//! the next), and two counters defined against the refresh period the EDID
+//! advertises ([`FramePacing::set_refresh`], [`REFRESH_PERIOD`] until then):
 //!
 //! * **duplicate** — refresh slots in which the guest presented nothing, so
 //!   the host has to show the previous image again. A guest at half the
@@ -48,6 +50,20 @@
 //! * **dropped** — presents that landed inside the same refresh slot as the
 //!   one before, so the earlier image was replaced before any display could
 //!   have shown it. Work the guest did for nobody.
+//!
+//! Both are the *guest's* view: a virtual monitor refreshing at the advertised
+//! rate. Whether the host's own monitor shows each frame is the window's
+//! business, and its statistics count it (`display statistics`: `guest_fps`
+//! against `fps`, and `unshown_per_s`) — a guest told 240 Hz on a 60 Hz host
+//! monitor reports no drops here and has three frames in four never shown.
+//!
+//! # Everything that depends on the refresh follows it
+//!
+//! A frame is `late` past 1.2 refresh periods (20 ms at 60 Hz, [`FRAME_BUDGET`];
+//! 5 ms at 240 Hz), and a report covers two seconds of refresh slots
+//! ([`REPORT_EVERY`] frames at 60 Hz, 480 at 240 Hz). Before the refresh became
+//! a profile key both were 60 Hz constants, which at 240 Hz reported every
+//! half second and called a frame that missed three slots on time.
 //!
 //! Portable, allocation-free on the hot path and unit-tested; the device logs
 //! a report every [`REPORT_EVERY`] frames at `info`, and `--frame-stats`
@@ -57,26 +73,55 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// Frames between reports. At 60 Hz this is one report every two seconds —
-/// often enough to see a phase change (GDM → session → an app starting),
-/// rare enough to keep the log readable.
+/// Frames between reports at the default 60 Hz: one report every two seconds
+/// — often enough to see a phase change (GDM → session → an app starting),
+/// rare enough to keep the log readable. A faster advertised refresh keeps
+/// the two seconds ([`report_every`]); a slower one keeps this floor.
 pub const REPORT_EVERY: u64 = 120;
 
-/// An interval longer than this counts as `late`. 20 ms is a 50 Hz frame: a
-/// compositor targeting 60 Hz that misses this missed its deadline.
+/// How long a report window lasts, in refresh slots' time.
+const REPORT_SECONDS: u64 = 2;
+
+/// An interval longer than this counts as `late` at the default 60 Hz. 20 ms
+/// is 1.2 periods: a compositor targeting 60 Hz that misses this missed its
+/// deadline. At another refresh the budget is the same 1.2 periods
+/// ([`late_budget_us`]).
 pub const FRAME_BUDGET: Duration = Duration::from_millis(20);
+
+/// Presents per report for a refresh period: two seconds of slots, and never
+/// fewer than [`REPORT_EVERY`].
+pub fn report_every(refresh: Duration) -> u64 {
+    let period = refresh.as_nanos();
+    if period == 0 {
+        return REPORT_EVERY;
+    }
+    // Rounded: 2 s of a 120 Hz period (8 333 333 ns) is 240 slots, not 241.
+    let slots = (u128::from(REPORT_SECONDS) * 1_000_000_000 + period / 2) / period;
+    u64::try_from(slots).unwrap_or(u64::MAX).max(REPORT_EVERY)
+}
+
+/// The `late` threshold for a refresh period, in microseconds: 1.2 periods,
+/// which is [`FRAME_BUDGET`] at 60 Hz. A zero period falls back to it.
+pub fn late_budget_us(refresh_us: u64) -> u64 {
+    if refresh_us == 0 {
+        return micros(FRAME_BUDGET);
+    }
+    refresh_us.saturating_mul(6) / 5
+}
 
 /// Intervals longer than this are not frame pacing at all — an idle desktop
 /// that presents nothing for a second, a session switch, a guest that was
 /// suspended — and would poison min/mean/late. They are counted separately.
 pub const IDLE_GAP: Duration = Duration::from_millis(500);
 
-/// The refresh period the guest is told about: [`crate::edid`] advertises
-/// 60 Hz, and `dropped`/`duplicate` are counted against it.
+/// The refresh period a new [`FramePacing`] counts against: the default
+/// 60 Hz of [`crate::edid::DEFAULT_REFRESH_HZ`]. The device replaces it with
+/// the advertised one (`[display] refresh_hz`, [`FramePacing::set_refresh`]).
 pub const REFRESH_PERIOD: Duration = Duration::from_nanos(16_666_667);
 
-/// Histogram bucket width. 100 µs is a hundredth of a 60 Hz frame — finer
-/// than any conclusion drawn from these numbers.
+/// Histogram bucket width. 100 µs is a hundredth of a 60 Hz frame and a
+/// fortieth of a 240 Hz one — finer than any conclusion drawn from these
+/// numbers.
 const BUCKET_US: u64 = 100;
 
 /// Buckets before the overflow bin: 0…200 ms, which covers everything short
@@ -183,7 +228,15 @@ pub struct PacingReport {
     pub low_1_us: u64,
     /// Mean of the slowest 0.1 % of intervals.
     pub low_01_us: u64,
-    /// Intervals over [`FRAME_BUDGET`].
+    /// Standard deviation of the intervals: how far a frame strays from
+    /// the window's mean. A guest paced by its refresh reads tens of
+    /// microseconds; one alternating between two cadences reads half their
+    /// difference.
+    pub stddev_us: u64,
+    /// Mean change from one interval to the next, |Δn − Δn−1|: the judder a
+    /// viewer sees. A guest at a steady half rate has none, however late.
+    pub jitter_us: u64,
+    /// Intervals over 1.2 refresh periods ([`late_budget_us`]).
     pub late: u64,
     /// Gaps over [`IDLE_GAP`], excluded from the statistics above.
     pub idle_gaps: u64,
@@ -257,9 +310,11 @@ impl PacingReport {
             out,
             "\"intervals\":{},\"fps\":{:.1},\"mean_us\":{},\"min_us\":{},\"max_us\":{},\
              \"low_1_fps\":{:.1},\"low_1_us\":{},\"low_01_fps\":{:.1},\"low_01_us\":{},\
+             \"stddev_us\":{},\"jitter_us\":{},\
              \"late\":{},\"idle_gaps\":{},\"duplicate\":{},\"dropped\":{},\
              \"quiet_mean_us\":{},\"quiet_max_us\":{},\"submit_mean_us\":{},\
-             \"commands_mean\":{},\"pixels_mean\":{},\"service_mean_us\":{},\"service_max_us\":{},             \"shared\":{}",
+             \"commands_mean\":{},\"pixels_mean\":{},\"service_mean_us\":{},\"service_max_us\":{},\
+             \"shared\":{}",
             self.intervals,
             self.fps(),
             self.mean_us,
@@ -269,6 +324,8 @@ impl PacingReport {
             self.low_1_us,
             self.low_01_fps(),
             self.low_01_us,
+            self.stddev_us,
+            self.jitter_us,
             self.late,
             self.idle_gaps,
             self.duplicate,
@@ -293,6 +350,13 @@ struct Stats {
     sum_us: u64,
     min_us: u64,
     max_us: u64,
+    /// Sum of squared intervals (µs²), for the standard deviation.
+    sum_sq: u128,
+    /// The window's previous interval, and the summed change between
+    /// consecutive ones.
+    prev_us: Option<u64>,
+    delta_sum_us: u64,
+    deltas: u64,
     late: u64,
     idle_gaps: u64,
     duplicate: u64,
@@ -321,8 +385,13 @@ impl Stats {
             self.min_us.min(us)
         };
         self.max_us = self.max_us.max(us);
+        self.sum_sq = self.sum_sq.saturating_add(u128::from(us) * u128::from(us));
+        if let Some(prev) = self.prev_us.replace(us) {
+            self.delta_sum_us = self.delta_sum_us.saturating_add(prev.abs_diff(us));
+            self.deltas = self.deltas.saturating_add(1);
+        }
         self.hist.record(us);
-        if Duration::from_micros(us) > FRAME_BUDGET {
+        if us > late_budget_us(refresh_us) {
             self.late = self.late.saturating_add(1);
         }
         // Rounded, so a 16.6 ms interval is one slot and a 33.3 ms one is
@@ -359,6 +428,10 @@ impl Stats {
         self.sum_us = 0;
         self.min_us = 0;
         self.max_us = 0;
+        self.sum_sq = 0;
+        self.prev_us = None;
+        self.delta_sum_us = 0;
+        self.deltas = 0;
         self.late = 0;
         self.idle_gaps = 0;
         self.duplicate = 0;
@@ -383,13 +456,19 @@ impl Stats {
         // presents whose service time or phases were never recorded (a flush
         // of an offscreen resource, the first frame), so none of them is
         // assumed non-zero.
+        let mean_us = self.sum_us / self.intervals;
+        // Var = E[x²] − E[x]², in µs²; clamped at zero against the rounding.
+        let mean_sq = self.sum_sq / u128::from(self.intervals);
+        let variance = mean_sq.saturating_sub(u128::from(mean_us) * u128::from(mean_us));
         Some(PacingReport {
             intervals: self.intervals,
-            mean_us: self.sum_us / self.intervals,
+            mean_us,
             min_us: self.min_us,
             max_us: self.max_us,
             low_1_us: self.hist.slowest_mean_us(LOW_1_PPM),
             low_01_us: self.hist.slowest_mean_us(LOW_01_PPM),
+            stddev_us: isqrt(variance),
+            jitter_us: self.delta_sum_us.checked_div(self.deltas).unwrap_or(0),
             late: self.late,
             idle_gaps: self.idle_gaps,
             duplicate: self.duplicate,
@@ -409,10 +488,28 @@ impl Stats {
     }
 }
 
+/// Integer square root, rounded down (the standard deviation's; `u128`
+/// because a window of 200 ms intervals squares past `u64`).
+fn isqrt(value: u128) -> u64 {
+    if value == 0 {
+        return 0;
+    }
+    // Newton's method from an over-estimate converges from above.
+    let mut x = value;
+    let mut y = x.div_ceil(2);
+    while y < x {
+        x = y;
+        y = (x + value / x) / 2;
+    }
+    u64::try_from(x).unwrap_or(u64::MAX)
+}
+
 /// Rolling frame-interval accumulator. One per scanout.
 #[derive(Debug)]
 pub struct FramePacing {
     refresh_us: u64,
+    /// Presents per report ([`report_every`] of the refresh).
+    report_every: u64,
     window: Stats,
     lifetime: Stats,
     /// When the previous present was answered.
@@ -443,6 +540,7 @@ impl FramePacing {
     pub fn new() -> Self {
         Self {
             refresh_us: u64::try_from(REFRESH_PERIOD.as_micros()).unwrap_or(0),
+            report_every: report_every(REFRESH_PERIOD),
             window: Stats::default(),
             lifetime: Stats::default(),
             last: None,
@@ -455,11 +553,18 @@ impl FramePacing {
         }
     }
 
-    /// Counts the refresh period `dropped`/`duplicate` are measured against
-    /// (the guest's advertised mode). A zero period disables both counters
-    /// rather than dividing by it.
+    /// Sets the refresh period `dropped`, `duplicate` and `late` are measured
+    /// against (the guest's advertised mode), and sizes the report window to
+    /// two seconds of it. A zero period disables the slot counters rather
+    /// than dividing by it, and keeps the 60 Hz budget and window.
     pub fn set_refresh(&mut self, refresh: Duration) {
         self.refresh_us = u64::try_from(refresh.as_micros()).unwrap_or(0);
+        self.report_every = report_every(refresh);
+    }
+
+    /// Presents per report at the current refresh.
+    pub fn report_interval(&self) -> u64 {
+        self.report_every
     }
 
     /// Notes one control-queue command. Cheap by construction: the clock is
@@ -488,8 +593,8 @@ impl FramePacing {
         self.flush_shared = true;
     }
 
-    /// Records a present at `now`, returning a report every [`REPORT_EVERY`]
-    /// presents.
+    /// Records a present at `now`, returning a report every
+    /// [`Self::report_interval`] presents.
     pub fn record(&mut self, now: Instant) -> Option<PacingReport> {
         if std::mem::take(&mut self.flush_shared) {
             self.window.shared = self.window.shared.saturating_add(1);
@@ -529,7 +634,7 @@ impl FramePacing {
 
         self.last = Some(now);
         self.since_report = self.since_report.saturating_add(1);
-        if self.since_report < REPORT_EVERY {
+        if self.since_report < self.report_every {
             return None;
         }
         let report = self.window.report();
@@ -556,12 +661,19 @@ impl FramePacing {
     /// Writes the latest window and the whole run to `path` as JSON, so two
     /// runs can be compared with a diff.
     ///
-    /// Called once per report window (every [`REPORT_EVERY`] frames, ~2 s at
-    /// 60 Hz), which means the file is current whatever ends the VM — a clean
-    /// power-off, a Ctrl+C, or a crash.
+    /// Called once per report window (two seconds of refresh slots, 120 frames
+    /// at 60 Hz), which means the file is current whatever ends the VM — a
+    /// clean power-off, a Ctrl+C, or a crash.
     pub fn write_json(&self, path: &Path, window: Option<&PacingReport>) -> std::io::Result<()> {
         let mut out = String::with_capacity(1024);
-        out.push_str("{\n  \"window\": ");
+        {
+            use std::fmt::Write;
+            // A String's Write is infallible. The period the counters were
+            // measured against, so runs at different rates are never compared
+            // as if they were one.
+            let _ = write!(out, "{{\n  \"refresh_us\": {},", self.refresh_us);
+        }
+        out.push_str("\n  \"window\": ");
         match window {
             Some(report) => {
                 out.push('{');
@@ -627,6 +739,144 @@ mod tests {
         // The window was reset by the report; the run's totals are not.
         assert!(pacing.report().is_none());
         assert_eq!(pacing.totals(), (REPORT_EVERY - 1, 0));
+    }
+
+    /// The advertised refresh a profile can ask for above 60 Hz: the rate,
+    /// the slot counters, the late budget and the two-second report window
+    /// all follow it, and a guest locked to its refresh reads no jitter.
+    #[test]
+    fn steady_guests_at_120_144_and_240_hz_report_their_rate_every_two_seconds() {
+        for (hz, period_us, window) in [
+            (120u64, 8_333u64, 240u64),
+            (144, 6_944, 288),
+            (240, 4_167, 480),
+        ] {
+            let base = Instant::now();
+            let mut pacing = FramePacing::new();
+            pacing.set_refresh(Duration::from_nanos(1_000_000_000 / hz));
+            assert_eq!(
+                pacing.report_interval(),
+                window,
+                "{hz} Hz: two seconds of slots"
+            );
+            let mut report = None;
+            for index in 0..window {
+                let now = base + Duration::from_micros(period_us * index);
+                if let Some(r) = pacing.record(now) {
+                    assert!(report.is_none(), "{hz} Hz: one report per window");
+                    report = Some(r);
+                }
+            }
+            let report = report.expect("a report after two seconds of slots");
+            assert_eq!(report.intervals, window - 1, "{hz} Hz");
+            assert_eq!(report.mean_us, period_us, "{hz} Hz");
+            assert_eq!(report.fps(), hz as f64, "{hz} Hz");
+            assert_eq!(
+                (report.duplicate, report.dropped, report.late),
+                (0, 0, 0),
+                "{hz} Hz: one present per slot, none late"
+            );
+            assert_eq!((report.stddev_us, report.jitter_us), (0, 0), "{hz} Hz");
+        }
+    }
+
+    /// At 240 Hz a frame that misses one slot is late — 8.3 ms, which the
+    /// old fixed 20 ms budget called on time — and a guest at half the
+    /// advertised rate duplicates one slot per frame, as at 60 Hz.
+    #[test]
+    fn at_240_hz_the_late_budget_is_five_milliseconds() {
+        let refresh = Duration::from_nanos(1_000_000_000 / 240);
+        assert_eq!(late_budget_us(4_166), 4_999);
+        assert_eq!(late_budget_us(16_666), 19_999, "1.2 periods at 60 Hz");
+        assert_eq!(late_budget_us(0), 20_000, "no period: the 60 Hz budget");
+
+        let base = Instant::now();
+        let mut pacing = FramePacing::new();
+        pacing.set_refresh(refresh);
+        let mut now = base;
+        pacing.record(now);
+        for index in 0..100u64 {
+            // 99 on time, one that missed a slot.
+            now += Duration::from_micros(if index == 40 { 8_333 } else { 4_167 });
+            pacing.record(now);
+        }
+        let report = pacing.report().expect("intervals recorded");
+        assert_eq!((report.late, report.duplicate, report.dropped), (1, 1, 0));
+
+        let mut half = FramePacing::new();
+        half.set_refresh(refresh);
+        for index in 0..101u64 {
+            half.record(base + Duration::from_micros(8_333 * index));
+        }
+        let report = half.report().expect("intervals recorded");
+        assert_eq!(report.fps(), 120.0);
+        assert_eq!(
+            (report.duplicate, report.late, report.dropped),
+            (100, 100, 0)
+        );
+        assert_eq!(report.jitter_us, 0, "a steady half rate does not judder");
+    }
+
+    /// A present counts as dropped when it lands under half a slot after the
+    /// one before: at 120 Hz, 4.2 ms apart rounds to one slot, 2 ms to none.
+    #[test]
+    fn presents_under_half_a_slot_apart_are_dropped() {
+        let base = Instant::now();
+        let mut pacing = FramePacing::new();
+        pacing.set_refresh(Duration::from_nanos(1_000_000_000 / 120));
+        for index in 0..101u64 {
+            pacing.record(base + Duration::from_micros(4_167 * index));
+        }
+        let report = pacing.report().expect("intervals recorded");
+        assert_eq!(report.dropped, 0, "4.2 ms rounds to one 8.3 ms slot");
+        // Rounded to the nearest slot, 4.167 of 8.333 ms is one: the counter
+        // calls a present early only below half a slot. Two presents 2 ms
+        // apart are the unambiguous case.
+        let mut burst = FramePacing::new();
+        burst.set_refresh(Duration::from_nanos(1_000_000_000 / 120));
+        for index in 0..101u64 {
+            burst.record(base + Duration::from_micros(2_000 * index));
+        }
+        assert_eq!(burst.report().expect("recorded").dropped, 100);
+    }
+
+    /// Two cadences alternating (a 240 Hz guest that makes every other
+    /// slot): the standard deviation is half their difference, the judder
+    /// their whole difference.
+    #[test]
+    fn alternating_cadences_read_as_jitter() {
+        let base = Instant::now();
+        let mut pacing = FramePacing::new();
+        pacing.set_refresh(Duration::from_nanos(1_000_000_000 / 240));
+        let mut now = base;
+        pacing.record(now);
+        for index in 0..100u64 {
+            now += Duration::from_micros(if index % 2 == 0 { 4_000 } else { 8_000 });
+            pacing.record(now);
+        }
+        let report = pacing.report().expect("intervals recorded");
+        assert_eq!(report.mean_us, 6_000);
+        assert_eq!(report.stddev_us, 2_000);
+        assert_eq!(report.jitter_us, 4_000);
+        let mut json = String::new();
+        report.write_json(&mut json);
+        assert!(
+            json.contains("\"stddev_us\":2000,\"jitter_us\":4000"),
+            "{json}"
+        );
+        assert!(
+            !json.contains("  "),
+            "no stray whitespace in the JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn integer_square_root_is_exact_and_rounds_down() {
+        for (value, root) in [(0u128, 0u64), (1, 1), (3, 1), (4, 2), (15, 3), (16, 4)] {
+            assert_eq!(isqrt(value), root, "{value}");
+        }
+        assert_eq!(isqrt(u128::from(u64::MAX) * u128::from(u64::MAX)), u64::MAX);
+        assert_eq!(isqrt(4_000_000), 2_000);
     }
 
     /// The signature of the bug this module was extended for: a guest at
@@ -819,6 +1069,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("json readable");
         assert!(text.contains("\"window\""), "{text}");
         assert!(text.contains("\"run\""), "{text}");
+        assert!(text.contains("\"refresh_us\": 16666,"), "{text}");
         assert!(text.contains("\"fps\":30.3"), "{text}");
         assert!(text.contains("\"duplicate\":1"), "{text}");
         std::fs::remove_dir_all(&dir).ok();

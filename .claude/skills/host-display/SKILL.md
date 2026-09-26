@@ -126,7 +126,10 @@ The window samples that texture, and nothing goes through the CPU. The code is
   composite the mirror's cursor plane on the CPU. `DisplayHandle::screenshot_bgra`
   gives the pixels without PNG.
 - **Diagnostics**: the window's `display statistics` line carries
-  `shared_fps` (and `uploads_per_s` drops to 0). `display: shared scanout
+  `shared_fps` (and `uploads_per_s` drops to 0), `guest_fps` (every flush the
+  display received, shared or copied) against `fps` (what the window
+  presented), `unshown_per_s` (guest frames superseded before a draw) and the
+  window thread's `acquire_ms`/`present_ms` per frame. `display: shared scanout
   statistics` every 600 presents gives submit time, submit-to-retired GPU time
   (`gpu_mean_ms`), full copies, imports, refusals and abandoned copies. The
   device's pacing report carries `shared` per window.
@@ -212,8 +215,12 @@ Rules to keep when extending this:
   `update_scanout` is a `memcpy` plus a wake, and the guest never waits for it
   — so the only place that sees every guest frame is the `RESOURCE_FLUSH` path.
   `entangled run --frame-stats <PATH>` writes mean/fps, 1 % and 0.1 % lows,
-  duplicate and dropped slots, and the quiet/submit/service split, every 120
-  frames. Take a before *and* an after with it, back to back, and record which
+  the intervals' standard deviation and frame-to-frame jitter, duplicate and
+  dropped slots, and the quiet/submit/service split, every two seconds of the
+  advertised refresh (120 frames at 60 Hz, 480 at 240). `late` is 1.2 refresh
+  periods, not a fixed 20 ms, and the file names its `refresh_us`. Those
+  counters are the guest's view; whether the host monitor showed a frame is
+  the window's `guest_fps`/`unshown_per_s`. Take a before *and* an after with it, back to back, and record which
   host GL and which build profile produced them (ADR-0004's 2026-09-08
   amendment exists because an earlier measurement did not).
 
@@ -224,11 +231,41 @@ Rules to keep when extending this:
   the frame it *sleeps out the remainder* and presents on the period exactly
   (measured 16.665 ms at 60 Hz, 8.341 ms at 120 Hz, zero duplicate slots), and
   it will not present faster whatever the host can do. `[display] refresh_hz`
-  (24..=240, default 60) is that number; `virtio_gpu::edid` encodes it and the
-  pacing counters are defined against it. Past the deadline the guest does
-  *not* halve — it stops sleeping and runs work-bound, so raising `refresh_hz`
-  buys nothing for a guest that is already flat out. Check `quiet` in the frame
+  (24..=240) is that number; `virtio_gpu::edid` encodes it and the pacing
+  counters are defined against it. Past the deadline the guest does *not*
+  halve — it stops sleeping and runs work-bound, so raising `refresh_hz` buys
+  nothing for a guest that is already flat out. Check `quiet` in the frame
   stats before reaching for the knob.
+- **A new machine's refresh follows the host monitor, not 60** (ADR-0004, the
+  high-refresh amendment): `control_api::refresh::default_refresh_hz` — the
+  monitor's rate, snapped to a standard one, up to the 144 Hz the GPU desktop
+  keeps up with, and above that the largest whole fraction of it (240 → 120).
+  Mutter takes whatever the EDID says at every rate up to 240 (the KMS CRTC
+  and `DisplayConfig.GetCurrentState` agree), but GNOME on the GPU fills only
+  47–76 % of 240 Hz slots, at random — interval sd 2–2.8 ms, visible judder —
+  and 97–100 % at 60, 120 and 144 (sd 0.2–1.3 ms). A guest frame rate that is
+  not a whole fraction of the monitor's judders by construction (144 on 240
+  shows frames for 2, 2, 1 refreshes). The window says which case it is in
+  when it opens (`display::refresh::refresh_sentence`), and warns when the
+  profile asks for more than the monitor shows.
+- **The window never presents with `AutoVsync`** (`display::refresh`). wgpu
+  resolves it to `FifoRelaxed` on NVIDIA Vulkan, which tears whenever the
+  window presents slower than the monitor — always, for a guest slower than
+  the host. The default is `Mailbox` (never waits, never tears), else `Fifo`;
+  `ENTANGLED_PRESENT_MODE=mailbox|fifo|relaxed|immediate|auto` is the A/B
+  switch. At 240 Hz on the RTX 2070 the three modes gave the same spread of
+  guest rates (112–183), so the choice is correctness, not speed. A FIFO
+  surface that fills makes the acquire wait while wgpu-core holds the device's
+  fence lock, which every `Queue::submit` — the shared presenter's copy on the
+  virtio-gpu worker included — needs; do not make the window block on vblank.
+- **Measure windowed runs twice, and note what else runs.** On this desktop a
+  VMware guest (25–40 % of the GPU) and PCSX2 (1–2 cores) ran through every
+  2026-09-26 measurement, and 240 Hz runs fell into a slow state — GNOME at
+  half the rate, every host call (the guest's `QueueSubmit`, the presenter's
+  submit) twice as slow — in five of fifteen boots, windowed or not, whatever
+  the present mode. The probe
+  (`F:\VMs\Entangled\probes\hz\`) records the foreground process and both
+  tenants' CPU per phase.
 - Don't create the wgpu device per frame or per transfer; one device+queue
   per window, staging buffers pooled.
 - A rapid resize drag delivers many `Resized` events between frames.

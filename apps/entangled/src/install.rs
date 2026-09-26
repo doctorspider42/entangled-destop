@@ -199,6 +199,42 @@ pub fn installed_vcpus_here(args: &InstallArgs) -> u32 {
     vcpus
 }
 
+/// The installed machine's `[display] refresh_hz`: `--refresh-hz` when given,
+/// otherwise `monitor_hz` (the host's primary monitor, `None` when it could
+/// not be read) through [`control_api::refresh::default_refresh_hz`] —
+/// rounded to a standard rate, its own up to 144 Hz and a whole fraction of
+/// it above, the rule the manager's wizard follows too (ADR-0004, the
+/// high-refresh amendment). The installer VMs keep 60: they are not the
+/// machine.
+pub fn installed_refresh_hz(args: &InstallArgs, monitor_hz: Option<f64>) -> u32 {
+    args.refresh_hz
+        .unwrap_or_else(|| control_api::refresh::default_refresh_hz(monitor_hz))
+}
+
+/// [`installed_refresh_hz`] on this host, logged with where the number came
+/// from.
+pub fn installed_refresh_hz_here(args: &InstallArgs) -> u32 {
+    if let Some(refresh_hz) = args.refresh_hz {
+        tracing::info!(refresh_hz, "installed machine: --refresh-hz");
+        return refresh_hz;
+    }
+    let monitor = control_api::refresh::host_monitor();
+    let refresh_hz = installed_refresh_hz(args, monitor.as_ref().map(|m| m.refresh_hz));
+    match &monitor {
+        Some(monitor) => tracing::info!(
+            refresh_hz,
+            monitor_hz = monitor.refresh_hz,
+            source = %monitor.source,
+            "installed machine: the host monitor's refresh, up to the 144 Hz the GPU desktop              keeps up with and a whole fraction of it above (--refresh-hz to choose)"
+        ),
+        None => tracing::info!(
+            refresh_hz,
+            "installed machine: no host monitor to read, so 60 Hz (--refresh-hz to choose)"
+        ),
+    }
+    refresh_hz
+}
+
 /// The VM's name: `--name`, else the disk file's stem, else the distribution.
 ///
 /// In that order because the name is what every derived file is called, and a
@@ -424,7 +460,10 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         }],
         cdrom: None,
         network: net.section.clone(),
-        display: DisplaySection::default(),
+        display: DisplaySection {
+            refresh_hz: installed_refresh_hz_here(args),
+            ..DisplaySection::default()
+        },
         // A desktop with no sound is not a desktop (GAME-2102). `auto` never
         // fails a run: a host with no audio device gets a card that plays into
         // silence, and the guest still enumerates one.
@@ -827,6 +866,7 @@ mod tests {
             size: "20G".into(),
             memory_mib: 2048,
             vcpus: None,
+            refresh_hz: None,
             interface: "entangled0".into(),
             network: crate::DEFAULT_NETWORK.into(),
             name: name.map(str::to_string),

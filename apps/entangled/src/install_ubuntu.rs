@@ -51,7 +51,7 @@ use control_api::{
 };
 
 use crate::disk;
-use crate::install::{installed_vcpus_here, target_disk, vm_name};
+use crate::install::{installed_refresh_hz_here, installed_vcpus_here, target_disk, vm_name};
 use crate::paths;
 use crate::run_vm::{self, Automation};
 use crate::seed;
@@ -316,6 +316,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         nvram.clone(),
         target.clone(),
         installed_vcpus_here(args),
+        installed_refresh_hz_here(args),
     );
     let profile_path = target.with_file_name(format!("{vm_name}.toml"));
     let text = toml::to_string_pretty(&profile).map_err(|e| e.to_string())?;
@@ -327,7 +328,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
          nvram:      {}\n\
          transcript: {}\n\
          profile:    {}\n\
-         machine:    {} vCPUs, {} MiB, {}x{}\n\
+         machine:    {} vCPUs, {} MiB, {}x{} at {} Hz\n\
          run it:     entangled run {}",
         install.esp.index,
         install.esp.sectors() * diskfs::SECTOR / (1 << 20),
@@ -344,6 +345,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         profile.memory_mib,
         profile.display.width,
         profile.display.height,
+        profile.display.refresh_hz,
         profile_path.display()
     );
     if args.venus {
@@ -356,8 +358,9 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// The profile that boots the *installed* system, with its vCPU count already
-/// decided ([`crate::install::installed_vcpus`]) so a test can inject one.
+/// The profile that boots the *installed* system, with its vCPU count and
+/// refresh rate already decided ([`crate::install::installed_vcpus`],
+/// [`crate::install::installed_refresh_hz`]) so a test can inject them.
 fn installed_profile(
     args: &InstallArgs,
     vm_name: &str,
@@ -365,6 +368,7 @@ fn installed_profile(
     nvram: PathBuf,
     target: PathBuf,
     vcpus: u32,
+    refresh_hz: u32,
 ) -> VmConfig {
     let installed_memory = if args.venus {
         VENUS_MEMORY_MIB
@@ -388,7 +392,7 @@ fn installed_profile(
         }],
         cdrom: None,
         network: None,
-        display: installed_display(args.venus),
+        display: installed_display(args.venus, refresh_hz),
         // A desktop with no sound is not a desktop (GAME-2102). `auto` never
         // fails a run: a host with no audio device gets a card that plays into
         // silence, and the guest still enumerates one.
@@ -421,9 +425,17 @@ fn installed_profile(
 /// needs it: the 2D path keeps a 1080p GNOME at its refresh rate on both hosts
 /// (ADR-0004, "installed profiles"), and the Debian profile has always been
 /// 1080p. The installer VM keeps 1280x800: it is not the machine.
-fn installed_display(venus: bool) -> DisplaySection {
+///
+/// The refresh follows the host monitor ([`control_api::refresh::default_refresh_hz`]:
+/// its rate up to the 144 Hz the GPU desktop keeps up with, a whole fraction
+/// of it above that), unless `--refresh-hz` chose one (ADR-0004, the
+/// high-refresh amendment): the guest composites at the rate its EDID
+/// advertises, and a rate that divides the window's monitor's puts each guest
+/// frame on screen for the same number of host refreshes.
+fn installed_display(venus: bool, refresh_hz: u32) -> DisplaySection {
     DisplaySection {
         venus,
+        refresh_hz,
         ..DisplaySection::default()
     }
 }
@@ -732,6 +744,7 @@ mod tests {
             // clap's default: nobody passed --memory-mib.
             memory_mib: 1536,
             vcpus: None,
+            refresh_hz: None,
             interface: "entangled0".into(),
             network: crate::DEFAULT_NETWORK.into(),
             name: None,
@@ -741,6 +754,16 @@ mod tests {
     }
 
     fn profile_for(args: &InstallArgs, host_logical_cpus: usize) -> VmConfig {
+        profile_on(args, host_logical_cpus, Some(60.0))
+    }
+
+    /// The installed profile on a host with `host_logical_cpus` threads and a
+    /// primary monitor at `monitor_hz` (`None`: none could be read).
+    fn profile_on(
+        args: &InstallArgs,
+        host_logical_cpus: usize,
+        monitor_hz: Option<f64>,
+    ) -> VmConfig {
         installed_profile(
             args,
             "desktop",
@@ -748,7 +771,47 @@ mod tests {
             PathBuf::from("desktop.nvram"),
             PathBuf::from("desktop.raw"),
             crate::install::installed_vcpus(args, host_logical_cpus),
+            crate::install::installed_refresh_hz(args, monitor_hz),
         )
+    }
+
+    /// The installed desktop follows the host monitor's refresh (ADR-0004,
+    /// the high-refresh amendment): a 144 Hz panel gets 144, a 120 Hz one
+    /// 120; this project's 239.76 Hz panel (which Windows reports as 239)
+    /// gets 120, the whole fraction of it the GPU desktop keeps up with, as a
+    /// 360 Hz one does; a host with no monitor to read (WSL) gets the 60 every
+    /// profile had. `--refresh-hz` wins in both directions, and the profile
+    /// reads back as written.
+    #[test]
+    fn the_installed_desktop_runs_at_the_host_monitors_refresh() {
+        for (monitor, want) in [
+            (Some(239.0), 120),
+            (Some(143.9), 144),
+            (Some(119.88), 120),
+            (Some(59.94), 60),
+            (Some(360.0), 120),
+            (Some(165.0), 144),
+            (Some(50.0), 60),
+            (None, 60),
+        ] {
+            let cfg = profile_on(&desktop_args(true), 24, monitor);
+            assert_eq!(cfg.display.refresh_hz, want, "{monitor:?}");
+            let text = toml::to_string_pretty(&cfg).expect("serialises");
+            assert!(text.contains(&format!("refresh_hz = {want}")), "{text}");
+            let back = VmConfig::from_toml(&text).expect("the written profile is valid");
+            assert_eq!(back, cfg, "{text}");
+        }
+        let mut args = desktop_args(true);
+        args.refresh_hz = Some(75);
+        assert_eq!(profile_on(&args, 24, Some(239.0)).display.refresh_hz, 75);
+        args.refresh_hz = Some(240);
+        assert_eq!(profile_on(&args, 24, Some(60.0)).display.refresh_hz, 240);
+        args.refresh_hz = Some(30);
+        assert_eq!(
+            profile_on(&args, 24, None).display.refresh_hz,
+            30,
+            "below the default's floor, as a profile may"
+        );
     }
 
     /// What `install ubuntu --venus --auto` used to write on this project's

@@ -388,10 +388,17 @@ file for an ISO whose name says `desktop` (Canonical's names do), and the
 server one otherwise.
 
 Every installed machine (Ubuntu, Fedora and Debian alike) gets a **1920×1080**
-display and **half this host's logical CPUs as vCPUs, at least 2 and at most
-8**; `install ubuntu` ends by saying what the profile got (`machine: 8 vCPUs,
-4096 MiB, 1920x1080` for `--venus` on a 24-thread host). Pass `--vcpus N` to choose instead
-(1 to 64). The installer VM itself always runs on 2 vCPUs at 1280×800, which is
+display at **this host's monitor refresh rate**, and **half this host's logical
+CPUs as vCPUs, at least 2 and at most 8**; `install ubuntu` ends by saying what
+the profile got (`machine: 8 vCPUs, 4096 MiB, 1920x1080 at 240 Hz` for
+`--venus` on a 24-thread host with a 240 Hz monitor). Pass `--vcpus N` to
+choose instead (1 to 64), and `--refresh-hz N` for the refresh (24 to 240).
+The refresh is the primary monitor's, rounded to the rate monitors are sold at
+(Windows reports a 239.76 Hz panel as 239, which becomes 240; 59.94 becomes 60)
+and kept within 60 to 240. A host with no monitor to read — WSL, a headless
+server — gets 60, what every machine had before; the manager, which runs on
+Windows, writes the Windows monitor's rate into machines it creates through a
+WSL engine. See [Refresh rate](#refresh-rate) for what the number does. The installer VM itself always runs on 2 vCPUs at 1280×800, which is
 why the install looks smaller than the machine it produces. The profile is
 written for the host that installed it; moved to a smaller one, edit `vcpus`.
 GNOME takes its screen size from the display's EDID, so the desktop comes up
@@ -652,6 +659,42 @@ until you ask it not to.
 The window title says whether input is grabbed. Losing focus releases the grab
 and every key the guest was told is down.
 
+### Refresh rate
+
+The guest's display has a refresh rate like any monitor, `[display]
+refresh_hz` in the profile (24 to 240), and the guest's desktop draws at it:
+GNOME makes one frame per refresh while anything moves, and none while nothing
+does. A rate above 60 makes motion smoother and costs host CPU only while the
+desktop animates — an idle desktop costs the same at any rate.
+
+A new machine gets a rate that follows **this host's primary monitor**
+(`entangled install`, and the manager's New Machine): the monitor's own rate
+up to 144 Hz, and above that the largest whole fraction of it — a 240 Hz
+monitor gets 120, so every guest frame stays on screen for exactly two of its
+refreshes. `--refresh-hz N` chooses instead, and a profile that says a number
+keeps it. Existing profiles are never changed.
+
+Why not simply 240 on a 240 Hz monitor: measured on an RTX 2070 (ADR-0004, the
+high-refresh amendment), the GPU desktop keeps 120 and 144 Hz — 97 to 100 % of
+the frames, a steady rhythm — but reaches only 112 to 183 frames a second when
+told 240, missing refreshes at random, which the eye reads as judder. Ask for
+240 if the extra frames matter more to you than an even rhythm. What you see
+with other combinations:
+
+| guest `refresh_hz` | on a 240 Hz monitor | on a 60 Hz monitor |
+|---|---|---|
+| 60 | each frame for 4 refreshes: even, 60 frames a second | one frame per refresh |
+| 120 | each frame for 2 refreshes: even | the window shows 60 of every 120 frames; the guest does the rest of the work for nothing |
+| 144 | frames for 2, 2, 1 refreshes: a slight, regular judder | as above, 60 of 144 |
+| 240 | up to one frame per refresh, but the GPU desktop misses some at random | as above, 60 of 240 |
+
+The window says which case it is in when it opens (`the guest's 120 Hz on a
+240.0 Hz monitor: each guest frame shows for 2 refreshes, an even cadence`)
+and warns when the profile asks for more than the monitor can show. The
+window never tears the guest's image: it presents in mailbox mode, or waits
+for the monitor where mailbox is not offered (`ENTANGLED_PRESENT_MODE=fifo`
+forces the latter).
+
 ### Gamepads
 
 A machine can have controllers as well as a keyboard and a pointer. They are
@@ -737,8 +780,11 @@ entangled run --frame-stats frames.json ~/entangled-vms/desktop.toml
 `--screenshot-after N` writes a PNG of the scanout N seconds in (and refreshes
 it periodically), which is how an unattended graphical boot is watched.
 `--frame-stats` mirrors the GPU's frame statistics — mean interval and fps, 1 %
-and 0.1 % lows, duplicate and dropped frames — into a JSON file rewritten every
-120 frames, for comparing two runs with a diff.
+and 0.1 % lows, the intervals' standard deviation and frame-to-frame jitter,
+duplicate and dropped frames — into a JSON file rewritten every two seconds of
+the guest's refresh (120 frames at 60 Hz, 480 at 240), for comparing two runs
+with a diff. `duplicate`, `dropped` and `late` are counted against the refresh
+the guest is told (`refresh_us` in the file), not the host monitor's.
 
 ### Driving a VM from another program
 
@@ -828,8 +874,9 @@ Things worth knowing about the shape:
   GPU desktop — Vulkan, and OpenGL through Zink, on the host's Vulkan device,
   either host (see [A GPU-accelerated desktop](#a-gpu-accelerated-desktop-venus));
   `virgl = true` asks for OpenGL through virglrenderer (Linux hosts only); one
-  or the other, not both. `refresh_hz` sets the refresh rate the guest is told
-  about, which is the ceiling its compositor paces itself to.
+  or the other, not both. `refresh_hz` (24 to 240) sets the refresh rate the
+  guest is told about, which is the ceiling its compositor paces itself to;
+  see [Refresh rate](#refresh-rate).
 - **`[sound]`** is off unless you add it: `enabled = true` and a `backend` of
   `"auto"` (whatever the host has), `"null"`, `"alsa"` or `"wasapi"`. `auto`
   never stops a machine from starting; a named backend the host cannot open

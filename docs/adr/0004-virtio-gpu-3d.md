@@ -7039,3 +7039,303 @@ rate over that window, "rAF" the page's own report.
   `vkQueueWaitIdle`/`vkDeviceWaitIdle` of an unfenced queue is closed. The
   executor no longer calls either on the driver, except as the fallback when
   the driver refuses a mark.
+
+## Amendment, 2026-09-26 — the GPU desktop at the host monitor's refresh
+
+GAME-2105 made the advertised refresh a profile key and showed a 2D guest
+following it to 120 Hz. Every GPU-desktop measurement since has been taken at
+60. This host's monitor is 1920×1080 at 239.76 Hz (Windows says 239) on the
+RTX 2070, and a new machine still got 60. This amendment measures the GPU
+desktop at 60, 120, 144 and 240 Hz, headless and windowed, fixes what was ours,
+and derives the default from the host's monitor.
+
+In short: the guest takes whatever the EDID says, at every rate. GNOME on the
+GPU keeps 60, 120 and 144 Hz with a steady rhythm. At 240 Hz it reaches 112 to
+183 frames a second and misses slots at random. Nothing of ours limits that:
+the device serves a flip in 0.13–0.30 ms and the renderer's ring worker is a
+quarter busy. What was ours was 60 Hz written into the pacing statistics, and a
+window that presented with `AutoVsync`, which is `FifoRelaxed` here and can
+tear.
+The default is now the monitor's rate up to 144 Hz and, above it, the largest
+whole fraction of it: 120 on this host.
+
+### How it was measured
+
+`F:\VMs\Entangled\probes\hz\` (the `vm-testing` skill has the details). One
+boot per run of the working Venus guest (`venus-ubuntu-net-profile.toml`,
+Ubuntu 26.04, GNOME 50 on Zink over Venus, 4 vCPUs, WHP, NVIDIA 580.88). A copy
+of the profile set the rate; the original was not edited. Each boot logged in on
+the serial console and measured, in 10–12 s windows:
+
+* `idle`: nothing moving.
+* `ov`: the Activities overview shown and hidden every 0.8 s, through
+  `org.gnome.Shell.OverviewActive`.
+* `vk`: vkcube, FIFO, in a 500×500 window.
+* `glf`, `glu`: glmark2 `build` with `--swap-mode=fifo`, and uncapped.
+
+Flips are the renderer's `venus scanout flips`. The pacing figures are the
+device's windows, and the window's are its `display statistics`. `nvidia-smi`
+was logged every 500 ms, and the VMM's CPU was read from the process. The `b`
+runs are `entangled-hz0.exe`, built at `e8d7c2b`. The `n` and `r` runs are
+`hz1`, this change before the window timed its acquire and present. The `a`
+runs are `hz2`, this change with an older default rule, which only matters at
+install. `f120w` is the final build, `hz3`.
+
+The host was not quiet, and the numbers carry it. A VMware guest held the GPU
+at 25–40 % utilization throughout (P0 before every boot). From 12:50 the
+driver also recorded, per phase, the foreground process and the other tenants'
+CPU: VMware used 0.03–6 cores, PCSX2 was emulating a game at 1.1–1.9 cores, and
+the desktop's user was working in an RDP client and an editor. So the GPU
+clocks below are partly the other tenants', and runs vary more than their
+settings do. Every comparison was repeated.
+
+### The guest takes the advertised mode, at every rate
+
+| `refresh_hz` | connector's modes | KMS CRTC mode (debugfs) | Mutter `GetCurrentState`, current |
+|---|---|---|---|
+| 60 | `1920x1080` | `"1920x1080": 60 140400 …` | `1920x1080@60.000` |
+| 120 | `1920x1080` | `"1920x1080": 120 280800 …` | `1920x1080@120.000` |
+| 144 | `1920x1080` | `"1920x1080": 144 336960 …` | `1920x1080@144.000` |
+| 240 | `1920x1080` | `"1920x1080": 240 561600 …` | `1920x1080@240.000` |
+
+The same at the end of each boot. The EDID's 10 kHz clock is exact at 1080p at
+all four rates, and the device test now checks them through the queue.
+
+### Before and after
+
+vkcube and glmark2 FIFO show the compositor's own rate. The client can only
+present once per refresh, so a missed slot is GNOME's. The "sd" column is the
+standard deviation of the flip interval, and "jit" the mean change from one
+interval to the next. Both are new in the pacing report. Before this change
+they could not be read (—). CPU is the VMM process, vCPU threads included,
+during vkcube. GPU is the P-states seen during vkcube, with the mean core and
+memory clock and the utilization, which includes the VMware tenant's
+25–40 %.
+
+| run | Hz | mode | vkcube flips/s | sd / jit ms | glmark2 FIFO (flips/s) | glmark2 uncapped | overview flips/s | window presents/s | VMM cores | GPU |
+|---|---:|---|---:|---|---:|---:|---:|---|---:|---|
+| `b60h` | 60 | headless | 59.8 | — | 59 (60.0) | 602 | 26.0 | — | 0.97 | P8 420/405 MHz, 27 % |
+| `b120h` | 120 | headless | 117.0 | — | 107 (112.8) | 294 | 46.0 | — | 1.99 | P0,P5 950/2873, 34 % |
+| `b144h` | 144 | headless | 142.3 | — | 135 (138.6) | 376 | 57.0 | — | 2.41 | P0,P3,P5 1181/5627, 29 % |
+| `b240h` | 240 | headless | 165.0 | — | 154 (163.6) | 311 | 73.7 | — | 2.66 | P0,P5 1662/6742, 35 % |
+| `b60w` | 60 | window | 59.9 | — | 59 (60.0) | 623 | 25.7 | 59.9 | 1.22 | P5,P8 791/793, 32 % |
+| `b120w` | 120 | window | 119.6 | — | 112 (117.3) | 508 | 47.4 | **110.9** | 1.92 | P0 1496/7000, 31 % |
+| `b144w` | 144 | window | 133.9 | — | 137 (142.0) | 301 | 55.2 | 133.9 | 2.16 | P0,P3,P5 1048/5119, 31 % |
+| `b240w` | 240 | window | **119.4** | — | 105 (109.3) | 179 | 57.1 | 119.8 | 2.54 | P0 1643/7000, 38 % |
+| `a60h` | 60 | headless | 59.7 | 1.36 / 0.51 | 59 (59.8) | 541 | 26.3 | — | 1.38 | P0,P3,P5 1287/6557, 29 % |
+| `a120h` | 120 | headless | 114.3 | 1.89 / 1.36 | 117 (120.2) | 373 | 49.1 | — | 2.12 | P0,P3,P5 1034/5286, 30 % |
+| `a144h` | 144 | headless | 138.6 | 1.32 / 1.00 | 139 (142.0) | 233 | 54.8 | — | 2.11 | P0,P5 1301/6462, 30 % |
+| `a240h` | 240 | headless | ~123 ‡ | 2.0–2.1 / 2.0–2.3 | 105 (107.0) | 161 | 50.0 | — | — ‡ | P5 780–825/810, 35–38 % |
+| `a60w` | 60 | window | 59.9 | 0.66 / 0.31 | 59 (60.0) | 803 | 27.7 | 59.9 | 0.96 | P5 829/810, 39 % |
+| `a120w` | 120 | window | 119.2 | 0.62 / 0.37 | 116 (120.0) | 514 | 52.9 | 119.1 | 1.97 | P0,P5 1121/6226, 32 % |
+| `a144w` | 144 | window | 143.0 | 0.88 / 0.61 | 138 (140.5) | 336 | 57.5 | 142.9 | 2.38 | P0,P5 1258/6742, 35 % |
+| `a240w` | 240 | window | 148.2 | 2.16 / 2.76 | 129 (136.6) | 36 † | 61.4 | 148.9 | 2.57 | P0 1473/7000, 37 % |
+| `a240w2` | 240 | window | 144.2 | 1.99 / 2.38 | 150 (153.0) | 200 | 59.2 | 145.4 | 2.75 | P0 1353/7000, 38 % |
+| `f120w` | 120 | window | 119.8 | 0.43 / 0.33 | 116 (120.0) | 437 | 52.8 | 119.7 | 1.95 | P0,P3,P5 1067/5940, 29 % |
+
+† The desktop's user switched to the VMware player during that phase, and
+VMware went from 0.03 to 1.4 cores. Not a result.
+‡ The guest's end-of-phase line never reached the serial console, so the
+phase has no CPU figure. The flips come from the renderer's counter and the
+device's pacing windows over the phase. VMware was using 6 host cores.
+
+With glmark2 FIFO at 120 and 144 Hz the interval deviation is 0.2–0.6 ms
+windowed and 0.5–0.6 ms headless. With vkcube it is 0.6–1.9 ms. At 240 Hz
+every run reads 2.0–2.8 ms with either client: half a period. The idle desktop
+costs 0.06–0.13 cores at every rate, because GNOME flips nothing when nothing
+moves.
+
+### What limits each rate
+
+* **60, 120 and 144 Hz: nothing.** The guest fills 97–100 % of the slots with
+  a vsync'd client. The misses are a few a second, shared with the other
+  tenants.
+* **240 Hz: the guest's own frame.** gnome-shell's main thread is running
+  62–65 % of the time and waits the rest. The whole process uses 0.87–0.97
+  guest cores, and the guest is 29–38 % busy on 4 vCPUs. The host side has
+  room. The device serves a flip in 0.13–0.30 ms (`service`, max 1.2 ms). The
+  shared presenter's copy is done on the GPU 0.9–1.1 ms after submit (at
+  most 7–54 ms). gnome-shell's ring worker pumps 25 % of the time, and its
+  sync-file waits on the device worker take 0.07 ms on average. What is left
+  is the round trips of a Zink frame on Venus: per flip, six
+  `vkGetImageSubresourceLayout` replies, two `vkWaitSemaphores`, four
+  sync-file waits and about 75 commands. GNOME's frame then takes 4–8 ms, and
+  it misses the 4.17 ms slot at random.
+* **240 Hz, 5 of 15 boots: a slow state.** In 4 of 12 windowed boots
+  (`b240w`, `n240w-auto`, `n240w-mbox`, `r240w-mbox-a`) and 1 of 3 headless
+  (`a240h`), GNOME ran at about half the advertised rate, 112–125 flips a
+  second. The other windowed boots ran at 135–183 and the other headless ones
+  at 138–165. The state did not follow the present mode (below), and it
+  happens without a window. What did follow it is the cost of every host call.
+  gnome-shell's `vkQueueSubmit` took 0.18 ms against 0.09. Its ring worker was
+  busy 1.3 ms per frame against 0.6. The presenter's submit took 0.25–0.28 ms
+  against 0.13–0.18. That is the host being slower. The foreground and the
+  tenants were changing through those runs, and in `a240h` the GPU sat in P5
+  with VMware at 6 cores. Where the window thread was timed (the `a` runs), it
+  spent 0.04–0.06 ms in the acquire and 0.3–0.5 ms in the present per
+  frame.
+
+### Candidates, one by one
+
+| candidate | verdict | evidence |
+|---|---|---|
+| pacing assumptions hardcoded to 60 | **ours, fixed** | `late` was a fixed 20 ms: at 240 Hz a frame that missed three slots was on time. A report came every 120 frames, four a second at 240. |
+| a timer or vblank emulation in the device | none exists | `RESOURCE_FLUSH` is answered once the copy is submitted. The guest's page flip completes then. Mutter paces itself to the EDID's mode. |
+| the retirer's 8 outstanding copies, the 100 ms bounds | never reached | 0 abandoned, 0 failed and 0 declined in every run. The copy is retired 0.9–1.1 ms after submit at every rate. A flip every 4.17 ms has at most 1–2 copies outstanding. |
+| the ring worker's spin (`HOST_SPIN`) | a cost, not a limit | The worker yields about 450 ms per 2 s on gnome-shell's ring at 170 flips a second. It is the CPU that grows with the rate (below). |
+| fence latency | not a limit | The device worker's sync-file waits average 0.07 ms per wait (max 0.5–3.5 ms). The pacing's `service` is 0.13–0.30 ms. |
+| the window's present path (`AutoVsync`, frame latency) | **ours, fixed** | `AutoVsync` is `FifoRelaxed` on this NVIDIA Vulkan surface (`available=[Fifo, FifoRelaxed, Mailbox, Immediate]`), which tears when the window presents late. The measured guest rate does not depend on the mode (below). |
+| how the device answers `RESOURCE_FLUSH` fences | not a limit | The flush is not deferred. The shared path answers after the submit, as before. |
+
+### The present mode, measured
+
+At 240 Hz windowed, with `ENTANGLED_PRESENT_MODE` the only difference and one
+boot per run in an interleaved order, vkcube flips per second:
+
+| mode | runs | vkcube flips/s | glmark2 FIFO |
+|---|---|---|---|
+| `auto` (`FifoRelaxed`, the old behaviour) | `n240w-auto`, `r240w-auto-a`, `r240w-auto-b` | 116.3, 164.6, 182.8 | 98, 146, 161 |
+| `mailbox` | `n240w-mbox`, `r240w-mbox-a`, `r240w-mbox-b` | 119.2, 112.5, 178.3 | 101, 100, 153 |
+| `fifo` | `n240w-fifo`, `r240w-fifo-a`, `r240w-fifo-b` | 176.2, 154.1, 135.3 | 159, 139, 138 |
+
+Every mode has fast and slow runs, so the mode is chosen for what it can do
+wrong (`display::refresh`):
+
+* `FifoRelaxed` and `Immediate` tear. A guest slower than the monitor makes
+  every present late, and a late relaxed present goes out at once, mid-scan.
+  A composed window hides this. Borderless fullscreen does not.
+* `Fifo` makes the window wait for a vblank once its queue is full, which
+  happens when the guest is faster than the monitor. wgpu-core holds the
+  device's fence lock across that acquire, and every `Queue::submit` takes it,
+  the shared presenter's copy on the virtio-gpu worker included. This was read
+  from wgpu 26's source, not measured: no allowed profile outruns a 240 Hz
+  monitor.
+* `Mailbox` never waits and never tears. It is the default, and a surface
+  without it gets `Fifo`.
+
+The window now counts what it shows. `guest_fps` is every flush it received,
+`fps` is what it presented, and `unshown_per_s` counts guest frames superseded
+before a draw. After the change these agree at every rate (at most 0.5
+unshown a second). Before it, in `b120w`, the window presented 110.9 frames a
+second while the guest flipped 119.6.
+
+### What the user sees when the rates differ
+
+* **The guest at the monitor's rate:** one frame per refresh. A 240 Hz
+  guest on this 239.76 Hz panel slips one frame every 4 s. At 240 the guest
+  cannot fill the slots anyway.
+* **A whole fraction of the monitor** (120 or 60 on 240): each frame shows
+  for exactly 2 or 4 refreshes. That is an even rhythm, and what the default
+  picks.
+* **Another fraction** (144 on 240): frames show for 2, 2, 1 refreshes. That
+  is a regular judder of a third of a frame's time, on a steady guest.
+* **Faster than the monitor** (240 on a 60 Hz monitor): the window shows 60
+  of 240. The guest composites the rest for nobody, at about 16 ms of VMM CPU
+  per frame. `entangled run` warns, naming the profile value that fixes it.
+  This host could not show the case: its monitor is the fastest a profile may
+  ask for, and changing the host's display mode was not ours to do. So
+  `unshown_per_s` at a faster guest rests on its unit semantics, not a
+  measurement.
+
+When the window opens it logs one sentence: `the guest's 120 Hz on a 240.0 Hz
+monitor: each guest frame shows for 2 refreshes, an even cadence`. It is a
+warning when the guest is the faster of the two. winit reported this monitor
+as 240.0 Hz.
+
+### The default (`control_api::refresh::default_refresh_hz`)
+
+1. Read the primary monitor's rate. Windows uses `EnumDisplaySettingsW`, which
+   reports whole hertz rounded down, so 239.76 reads 239. Linux uses the first
+   connected DRM connector's EDID. WSL has none, so it gives 60.
+2. Snap the rate to a standard one within 1.5 % (239 is 240, 59.94 is 60,
+   143.9 is 144), otherwise round to whole hertz.
+3. At or below 144 Hz (`SUSTAINED_REFRESH_HZ`), that rate.
+4. Above it, the largest whole fraction `rate / k` in 60..=144 Hz: 240 → 120,
+   360 → 120, 180 → 90. A rate without one (165) gets 144.
+5. Never below 60.
+
+The reason is the tables. Told 240, the guest delivered 47–76 % of it,
+irregularly. Told 120, it delivered 95–100 %, evenly on a 240 Hz monitor. The
+CPU follows the frames delivered: during vkcube the VMM spent 0.96–1.38 cores
+at 60, 1.9–2.1 at 120, 2.1–2.4 at 144 and 2.5–3.6 at 240. That is about 16 ms
+of VMM CPU per guest frame, and nothing while idle. The desktop's compositing
+also takes GPU and ring time from uncapped clients. glmark2 uncapped scored
+541–803 at 60, 294–514 at 120, 233–376 at 144 and 151–341 at 240, with the
+tenants' noise on top.
+
+`entangled install` writes the rule's number unless `--refresh-hz` (24–240) is
+given. It logs which: `installed machine: the host monitor's refresh …
+monitor_hz=239 source=the primary display (EnumDisplaySettings)`.
+`install ubuntu` prints `machine: 8 vCPUs, 4096 MiB, 1920x1080 at 120 Hz`. The
+manager's new machine takes the same function on its own host and writes the
+result into the profile after the install (`discovery::apply_resources`,
+beside memory and vCPUs). This matters for a WSL engine, which has no monitor
+to read and writes 60, while its window opens on the Windows monitor.
+Existing profiles are never touched. A profile's own value, 240 included, is
+used as written.
+
+### GPU clocks
+
+No driver or system setting was changed. Per run, during vkcube (P-state,
+mean core/memory clock):
+
+* **60 Hz**: P8 at 420/405 MHz (`b60h`), P5/P8 at 790/790 (`b60w`), P5 at
+  830/810 (`a60w`). The guest still made 60.0 frames with glmark2 FIFO
+  (interval sd 0.24 ms). At 60 the low clocks cost nothing measurable in
+  frame rate. `a60h` read P0 because the VMware tenant was using 6 cores.
+* **120 Hz and up**: P0 by itself (with P3/P5 dips) at 950–1880 MHz core and
+  up to 7000 MHz memory. The desktop's own load keeps the GPU clocked. "Prefer
+  maximum performance" would add little to the frame rate at these rates.
+
+The 2026-09-25 amendment measured what a held P0 buys (15–18 % for on-screen
+glmark2). It was not re-measured here. The other tenants also raised the
+clocks, so a clean A/B needs a quiet host.
+
+### Tests
+
+* `virtio_gpu::pacing`: steady guests at 120, 144 and 240 Hz report their rate
+  every two seconds of slots, with no duplicates, drops or late frames and zero
+  jitter. At 240 Hz a frame that missed one slot is late (budget 4.999 ms,
+  19.999 at 60). A guest at half the advertised rate duplicates one slot per
+  frame and does not judder. Alternating cadences read as sd and jitter. The
+  JSON carries `refresh_us`, `stddev_us` and `jitter_us` and has no stray
+  whitespace. `isqrt` is exact.
+* `tests/gpu_queue.rs`: `GET_EDID` through the queue advertises 60, 120,
+  144, 165 and 240 Hz as asked, and clamps 500 to 240 and 1 to 24. The frame
+  statistics file appears after 120 flushes at 60 Hz and 480 at 240, naming
+  its period.
+* `control_api::refresh`: standard rates snap. The whole-fraction rule is
+  checked for 150–1000 Hz. Clamping holds, nonsense rates give 60, and the
+  EDID parser handles good and broken blocks. This host's own default is a
+  valid profile rate.
+* `install_ubuntu`: the installed profile at injected monitor rates (239 →
+  120, 143.9 → 144, 360 → 120, 165 → 144, none → 60), a TOML round trip, and
+  `--refresh-hz` winning in both directions. The CLI parses `--refresh-hz`
+  within 24..=240.
+* The manager: `apply_resources` writes the refresh beside memory and vCPUs
+  and keeps the rest.
+* `display::refresh`: the present-mode choice (never automatic, never relaxed
+  by default), the environment spellings, and the monitor sentences (match,
+  faster, slower even and uneven).
+
+### Still open
+
+* **240 Hz is the guest's frame.** Fewer round trips per Zink frame would move
+  it: six `vkGetImageSubresourceLayout` replies per flip are a query Mesa's
+  venus could cache. That is Mesa's to change. The executor's per-command cost
+  (the CSS amendment) is the renderer's.
+* **The slow windowed state** was not explained beyond "every host call costs
+  twice as much". It needs a quiet host: no VMware guest on the GPU and no
+  emulator in the foreground.
+* **A guest faster than the monitor** was not measured (see above). Nor was
+  borderless fullscreen, where `FifoRelaxed` would have torn.
+* **The Linux/KVM host** was not measured. The EDID query there reads the DRM
+  connector, and winit's monitor handle is what the window's sentence uses on
+  both hosts.
+* **The manager does not show `refresh_hz` yet.** It writes the default, and
+  the editor keeps whatever a profile says.
+
+Evidence: `F:\VMs\Entangled\hz\<run>\` (`run.log`, `drive.trace`, `smi.csv`,
+`frames.json`, the screenshots `vk.png`/`glf.png`, and for windowed runs the
+Windows screen grab `vk-screen.png`). `summ.py <run>` and `table.py <run>` in
+the probe directory reproduce every row.

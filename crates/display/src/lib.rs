@@ -85,6 +85,7 @@ mod host;
 pub mod input;
 pub mod keymap;
 mod present;
+pub mod refresh;
 mod renderer;
 pub mod scanout;
 pub mod shared;

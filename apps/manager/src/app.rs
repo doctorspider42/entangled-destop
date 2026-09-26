@@ -759,6 +759,14 @@ impl ManagerApp {
                 name,
                 memory_mib: self.settings.default_memory_mib,
                 vcpus: self.settings.wizard_vcpus(),
+                // The host monitor's rate, as `entangled install` derives it
+                // (ADR-0004, the high-refresh amendment); a mock session is
+                // a 60 Hz host on every machine, like its 8 threads.
+                refresh_hz: if self.mock_mode {
+                    control_api::refresh::default_refresh_hz(None)
+                } else {
+                    control_api::refresh::host_default_refresh_hz().0
+                },
                 disk_gib: self.settings.default_disk_gib,
                 disk_path: String::new(),
                 disk_mode: launcher::DiskMode::CreateNew,
@@ -1246,13 +1254,16 @@ impl ManagerApp {
         if let Some(pending) = pending {
             if !pending.applied {
                 pending.applied = true;
-                let (profile, memory, vcpus) = (
+                let (profile, memory, vcpus, refresh_hz) = (
                     pending.profile_path.clone(),
                     pending.machine.memory_mib,
                     pending.machine.vcpus,
+                    pending.machine.refresh_hz,
                 );
-                match discovery::apply_resources(&profile, memory, vcpus) {
-                    Ok(()) => message.push_str(&format!(" ({memory} MiB, {vcpus} vCPU)")),
+                match discovery::apply_resources(&profile, memory, vcpus, refresh_hz) {
+                    Ok(()) => {
+                        message.push_str(&format!(" ({memory} MiB, {vcpus} vCPU, {refresh_hz} Hz)"))
+                    }
                     Err(e) => {
                         self.toast(
                             ToastLevel::Warn,

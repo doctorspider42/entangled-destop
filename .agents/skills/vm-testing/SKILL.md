@@ -293,6 +293,25 @@ strip first.
 A check named `REGRESSION:` is one of the two evening bugs. If one of those
 goes red, the shipped product is broken for every new user, not flaky.
 
+## Measuring the GPU desktop's refresh (ADR-0004, the high-refresh amendment)
+
+`F:\VMs\Entangled\probes\hz\` drives the Venus demo guest over
+`--control-stdin`: `runhz.sh <tag> <refresh_hz> <headless|window> [exe] [plan]`
+writes a copy of `venus-ubuntu-net-profile.toml` with the rate (never edit the
+original), logs `nvidia-smi` every 500 ms, and `drive.ps1` runs the plan:
+`idle`, `ov` (the overview in and out through `org.gnome.Shell.OverviewActive`,
+which gdbus may set), `vk` (vkcube FIFO), `glf`/`glu` (glmark2
+`--swap-mode=fifo` / uncapped), `vs` (vkcube with the thread sampler). The
+guest script `hz.sh` is served from the host's VMnet1 address
+(`python -m http.server 8000 --bind 192.168.233.1`): usernet refuses the
+guest a connection to the host's loopback by design, so a server on
+127.0.0.1 is never reached. `modes` prints the connector's modes, the KMS
+CRTC mode from debugfs and Mutter's `GetCurrentState`. `summ.py <tag>…` turns
+a run into flips/s, pacing mean/min/max/sd/jitter, duplicates, window presents
+against guest frames, VMM CPU, GPU P-state and clocks per phase. Traps: a
+PowerShell function named `Measure` is shadowed by the `measure` alias
+(`Measure-Object`), so phases silently did nothing until it was renamed.
+
 ## Guest test images
 
 - Built from `guest/` configs (EPIC 11: reproducible bootstrap kernel +

@@ -72,7 +72,9 @@ use control_api::{
 };
 
 use crate::disk;
-use crate::install::{installed_vcpus_here, net_plan, target_disk, vm_name, NetAddress};
+use crate::install::{
+    installed_refresh_hz_here, installed_vcpus_here, net_plan, target_disk, vm_name, NetAddress,
+};
 use crate::paths;
 use crate::run_vm::{self, Automation};
 use crate::seed;
@@ -334,7 +336,11 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         // 1920x1080, the size the project targets (CLAUDE.md) and what the
         // Debian profile always had. 1280x800 was the installer's size carried
         // over, not a decision (install_ubuntu::installed_display says more).
-        display: DisplaySection::default(),
+        // At the host monitor's refresh (ADR-0004, the high-refresh amendment).
+        display: DisplaySection {
+            refresh_hz: installed_refresh_hz_here(args),
+            ..DisplaySection::default()
+        },
         // A desktop with no sound is not a desktop (GAME-2102). `auto` never
         // fails a run: a host with no audio device gets a card that plays into
         // silence, and the guest still enumerates one.

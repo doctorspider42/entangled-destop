@@ -1217,6 +1217,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
     }
 
     /// Mirrors the frame statistics into `path` as JSON, rewritten every
+    /// report window — two seconds of the advertised refresh, at least
     /// [`crate::pacing::REPORT_EVERY`] frames (`entangled run --frame-stats`).
     ///
     /// The log already carries every window; the file exists so two runs can
@@ -1235,8 +1236,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
     /// whose per-frame work overruns one advertised period presents in the
     /// next one, so 60 Hz turns any frame costing more than 16.7 ms into
     /// exactly 30 fps (GAME-2105 — the measurement is in ADR-0004). The same
-    /// value defines the `duplicate` and `dropped` counters, so the report
-    /// stays honest when a profile changes it.
+    /// value defines the `duplicate`, `dropped` and `late` counters and the
+    /// report window (two seconds of it), so the report stays honest when a
+    /// profile changes it.
     ///
     /// Out-of-range values are refused by `control_api`'s validation; a zero
     /// here would make the EDID unencodable and `GET_EDID` answer an error, so
@@ -1871,6 +1873,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 max_ms = report.max_us as f64 / 1000.0,
                 low_1_fps = report.low_1_fps(),
                 low_01_fps = report.low_01_fps(),
+                stddev_ms = report.stddev_us as f64 / 1000.0,
+                jitter_ms = report.jitter_us as f64 / 1000.0,
+                // The advertised refresh the slot counters and `late` are
+                // measured against.
+                refresh_hz = self.refresh_hz,
                 late = report.late,
                 idle_gaps = report.idle_gaps,
                 duplicate = report.duplicate,

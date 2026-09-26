@@ -310,15 +310,24 @@ pub fn delete(
 }
 
 /// Rewrites `memory_mib`/`vcpus` in a profile the CLI just wrote, so the
-/// wizard's choices survive the install (the CLI hardcodes 2048 MiB / 2 vCPUs).
-pub fn apply_resources(profile: &Path, memory_mib: u64, vcpus: u32) -> Result<(), String> {
+/// wizard's choices survive the install (the CLI hardcodes 2048 MiB / 2 vCPUs),
+/// and `[display] refresh_hz` with this host's monitor default: the CLI
+/// derives the same number natively, but a WSL engine sees no monitor and
+/// writes 60 (ADR-0004, the high-refresh amendment). Every other key is kept.
+pub fn apply_resources(
+    profile: &Path,
+    memory_mib: u64,
+    vcpus: u32,
+    refresh_hz: u32,
+) -> Result<(), String> {
     let text = std::fs::read_to_string(profile).map_err(|e| e.to_string())?;
     let mut cfg = VmConfig::from_toml(&text).map_err(|e| e.to_string())?;
-    if cfg.memory_mib == memory_mib && cfg.vcpus == vcpus {
+    if cfg.memory_mib == memory_mib && cfg.vcpus == vcpus && cfg.display.refresh_hz == refresh_hz {
         return Ok(());
     }
     cfg.memory_mib = memory_mib;
     cfg.vcpus = vcpus;
+    cfg.display.refresh_hz = refresh_hz;
     let out = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
     std::fs::write(profile, out).map_err(|e| e.to_string())
 }
@@ -677,15 +686,18 @@ interface = "entangled0"
     }
 
     #[test]
-    fn apply_resources_rewrites_only_memory_and_vcpus() {
+    fn apply_resources_rewrites_only_memory_vcpus_and_the_refresh() {
         let dir = temp_dir("apply-resources");
         let profile = write_vm(&dir, "resized", 128);
-        apply_resources(&profile, 3072, 6).expect("apply");
+        apply_resources(&profile, 3072, 6, 240).expect("apply");
 
         let entry = load_profile(&profile, None).expect("reload");
         assert_eq!(entry.memory_mib, 3072);
         assert_eq!(entry.vcpus, 6);
         let text = std::fs::read_to_string(&profile).expect("read");
+        let cfg = VmConfig::from_toml(&text).expect("a valid profile");
+        assert_eq!(cfg.display.refresh_hz, 240);
+        assert_eq!((cfg.display.width, cfg.display.height), (1920, 1080));
         assert!(
             text.contains("root=UUID=deadbeef"),
             "boot section preserved"
