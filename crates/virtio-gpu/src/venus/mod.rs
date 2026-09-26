@@ -64,6 +64,7 @@
 
 pub mod capset;
 pub mod executor;
+pub mod profile;
 pub mod protocol;
 pub mod pump;
 pub mod renderer;

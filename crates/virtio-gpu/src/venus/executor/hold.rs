@@ -101,7 +101,7 @@ use super::context::{invalid, ExecError, VulkanContext};
 use super::generated;
 use super::host::HostVulkan;
 use super::limits::Class;
-use super::objects::{EventState, Facts, Kind, Pending, SemaphoreState};
+use super::objects::{EventState, Facts, Kind, SemaphoreState};
 
 /// How long a ring worker sleeps, with the context lock released, before it
 /// asks again about a wait whose answer is behind held work.
@@ -736,7 +736,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::QueueSubmit2(a) => a.fence.0,
             _ => 0,
         };
-        let fence_host = match fence {
+        let guest_fence = match fence {
             0 => None,
             id => Some(
                 self.objects
@@ -752,26 +752,21 @@ impl<H: HostVulkan> VulkanContext<H> {
         // submit whatever the driver answers, so the claim always ends.
         let claim = self.claim_payloads(queue, &buffers);
         let passed = self.pass_through(command);
+        let submitted = passed.is_ok() && generated::result_of(command) == Some(VK_SUCCESS);
+        if submitted {
+            self.clock_submitted(queue, fence, guest_fence.unwrap_or(0));
+            if self.objects.doomed() != 0 {
+                // What the GPU has finished meanwhile frees the doomed even
+                // when the guest destroys nothing more.
+                self.poll_clocks(device);
+            }
+        }
         if let Some(claim) = claim {
             self.submit_mark(claim);
         }
         passed?;
-        if generated::result_of(command) == Some(VK_SUCCESS) {
+        if submitted {
             self.commit_host(device, ops);
-            let q = self
-                .objects
-                .queue_mut(queue)
-                .map_err(super::context::id_error(name))?;
-            match fence_host {
-                Some(host) => {
-                    q.pending = Pending {
-                        fence: Some((fence, host)),
-                        unfenced: false,
-                    }
-                }
-                None if !ops.is_empty() => q.pending.unfenced = true,
-                None => {}
-            }
         }
         Ok(())
     }

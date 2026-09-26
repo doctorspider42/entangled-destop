@@ -2422,6 +2422,9 @@ pub struct VenusRenderer<F> {
     /// The host-visible window this renderer asks for
     /// ([`VENUS_HOST_VISIBLE_BYTES`] unless the profile says otherwise).
     host_visible_bytes: u64,
+    /// The device side of the frame profile, when [`super::profile::enabled`]
+    /// said so at creation (ADR-0004, the CSS amendment).
+    profile: Option<Box<super::profile::DeviceProfile>>,
 }
 
 impl<F> fmt::Debug for VenusRenderer<F> {
@@ -2476,6 +2479,7 @@ impl<F> VenusRenderer<F> {
             sampled: None,
             logged: (VenusUsage::default(), None),
             host_visible_bytes: VENUS_HOST_VISIBLE_BYTES,
+            profile: super::profile::enabled().then(Box::default),
         }
     }
 
@@ -3246,7 +3250,12 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 ..
             } => self.create_ring(ctx_id, ring, info, monitor_period_us),
             TransportCommand::DestroyRing { ring } => self.destroy_ring(ctx_id, ring),
-            TransportCommand::NotifyRing { ring, .. } => self.doorbell(ctx_id, ring),
+            TransportCommand::NotifyRing { ring, .. } => {
+                if let Some(profile) = self.profile.as_deref_mut() {
+                    profile.context(ctx_id).doorbells += 1;
+                }
+                self.doorbell(ctx_id, ring)
+            }
             // The `extra` region is host-written: the protocol stores one `u32`
             // there for the guest to poll. `RingLayout` hands out its bounds but
             // no typed store for it — `store_host_word` takes a `HostWord`,
@@ -3267,9 +3276,21 @@ impl<F: SinkFactory> VenusRenderer<F> {
                 Opcode::WaitVirtqueueSeqno.name(),
             )),
             TransportCommand::WaitRingSeqno { ring, seqno } => {
-                self.wait_ring_seqno(ctx_id, ring, seqno)
+                let started = self.profile.is_some().then(std::time::Instant::now);
+                let result = self.wait_ring_seqno(ctx_id, ring, seqno);
+                if let (Some(profile), Some(started)) = (self.profile.as_deref_mut(), started) {
+                    let took = started.elapsed();
+                    let calls = profile.context(ctx_id);
+                    calls.ring_waits += 1;
+                    calls.ring_wait_time += took;
+                    calls.ring_wait_max = calls.ring_wait_max.max(took);
+                }
+                result
             }
             TransportCommand::SubmitVirtqueueSeqno { ring, seqno } => {
+                if let Some(profile) = self.profile.as_deref_mut() {
+                    profile.context(ctx_id).virtqueue_seqnos += 1;
+                }
                 self.submit_virtqueue_seqno(ctx_id, ring, seqno)
             }
             // Carried, counted and not executed: the reply-stream commands
@@ -3392,7 +3413,7 @@ impl<F: SinkFactory> VenusRenderer<F> {
         }
 
         let worker = RingWorker::spawn(
-            format!("venus-ring-{ctx_id}"),
+            format!("venus-ring-{ctx_id}-{ring:x}"),
             RingService::new(pump, sink, Duration::ZERO).with_spin(HOST_SPIN),
             Arc::clone(&pages),
             quiesce,
@@ -3776,7 +3797,15 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
 
     fn submit(&mut self, ctx_id: u32, stream: &[u8]) -> Result<(), CommandError> {
         self.tick_usage();
-        self.dispatch(ctx_id, stream)?;
+        let started = self.profile.is_some().then(std::time::Instant::now);
+        let result = self.dispatch(ctx_id, stream);
+        if let (Some(profile), Some(started)) = (self.profile.as_deref_mut(), started) {
+            let calls = profile.context(ctx_id);
+            calls.submits += 1;
+            calls.submit_time += started.elapsed();
+            profile.log_if_due();
+        }
+        result?;
         Ok(())
     }
 
@@ -3789,6 +3818,9 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         out: &mut Vec<u8>,
     ) -> Result<(), CommandError> {
         self.tick_usage();
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.flip();
+        }
         self.read_scanout(resource_id, rect, out).map_err(|error| {
             tracing::debug!(resource = resource_id, %error, "venus scanout readback failed");
             error.into()
@@ -3820,6 +3852,9 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         resource_id: u32,
     ) -> Result<Option<crate::shared::SharedScanoutLease>, CommandError> {
         self.tick_usage();
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.flip();
+        }
         self.begin_shared(resource_id).map_err(|error| {
             tracing::debug!(resource = resource_id, %error, "venus shared scanout failed");
             error.into()
@@ -3921,6 +3956,9 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
             ring_idx,
             fence_id,
         };
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.context(ctx_id).ring_fences += 1;
+        }
         match self.sinks.create_ring_fence(fence, &self.retirer) {
             Ok(outcome) => {
                 match outcome {
@@ -3989,6 +4027,9 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         _mem: &Arc<GuestMem>,
         entries: &[MemEntry],
     ) -> Result<(), CommandError> {
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.context(ctx_id).blob_creates += 1;
+        }
         // `blob_id` 0 is plain shared memory (vkr: `!blob_id && flags ==
         // MAPPABLE`); anything else names a `VkDeviceMemory`.
         let created = if args.blob_id == 0 {
@@ -4035,7 +4076,17 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         offset: u64,
         size: u64,
     ) -> Result<BlobMapping, CommandError> {
+        let started = self.profile.is_some().then(std::time::Instant::now);
         let mapping = self.map_host_blob(resource_id, offset, size);
+        if let (Some(started), Some(ctx_id)) =
+            (started, self.blobs.get(&resource_id).map(|b| b.ctx_id))
+        {
+            if let Some(profile) = self.profile.as_deref_mut() {
+                let calls = profile.context(ctx_id);
+                calls.blob_maps += 1;
+                calls.blob_map_time += started.elapsed();
+            }
+        }
         match &mapping {
             Ok(_) => {
                 self.sample_usage();
@@ -4062,6 +4113,9 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         let Some(blob) = self.blobs.get_mut(&resource_id) else {
             return;
         };
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.context(blob.ctx_id).blob_unmaps += 1;
+        }
         match blob.publication.as_ref().map(Publication::offset) {
             Some(at) if at == offset => {
                 // Dropping it calls `unmap_host` and only then releases the

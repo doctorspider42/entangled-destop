@@ -501,8 +501,12 @@ fn a_submit_to_a_lost_device_is_consumed_then_the_ring_is_fatal() {
 
 // ------------------------------------------- nothing freed under the GPU
 
+/// What a fenced submission may use outlives it on the host, and the
+/// destroy waits for nothing (ADR-0004, the amendment on CSS pages): the
+/// object is destroyed once the guest's own fence, which the clock stands
+/// on, has signalled.
 #[test]
-fn destroying_what_a_fenced_submission_may_use_waits_for_its_fence_first() {
+fn destroying_what_a_fenced_submission_may_use_waits_for_nothing_and_outlives_it() {
     let (mut h, host) = setup();
     host.hold.store(true, Ordering::SeqCst);
     buffer(&mut h, BUF);
@@ -517,36 +521,82 @@ fn destroying_what_a_fenced_submission_may_use_waits_for_its_fence_first() {
         pipeline_layout: VkPipelineLayout(PIPELINE_LAYOUT),
     }))
     .unwrap();
+    assert_eq!(host.called("vkWaitForFences"), 0, "nothing waited");
+    assert_eq!(host.called("destroy VkPipelineLayout"), 0, "not yet");
+    assert_eq!(host.held(), 1, "and the GPU is still at it");
+    // The id is gone at once.
+    let start = h.tail();
+    assert_eq!(
+        h.send(&Command::DestroyPipelineLayout(DestroyPipelineLayoutArgs {
+            device: VkDevice(DEVICE),
+            pipeline_layout: VkPipelineLayout(PIPELINE_LAYOUT),
+        })),
+        Err(start),
+        "a destroyed id is unknown"
+    );
+    h.renderer.reset();
     let calls = host.calls();
     assert!(
-        index_of(&calls, "vkWaitForFences") < index_of(&calls, "destroy VkPipelineLayout"),
-        "waited, then destroyed: {calls:?}"
+        index_of(&calls, "device idle") < index_of(&calls, "destroy VkPipelineLayout"),
+        "destroyed once the GPU was done: {calls:?}"
     );
-    assert_eq!(host.held(), 0);
-    // With nothing in flight a destroy waits for nothing.
-    let waits = host.called("vkWaitForFences");
+    assert_eq!(host.live_objects(), 0);
+}
+
+/// The same once the guest waits for its fence: the host sees it signalled
+/// and destroys what was doomed behind it, then and there.
+#[test]
+fn a_doomed_object_goes_when_the_guest_waits_for_its_fence() {
+    let (mut h, host) = setup();
+    host.hold.store(true, Ordering::SeqCst);
+    buffer(&mut h, BUF);
+    record_fill(&mut h, CB, BUF);
+    h.send(&create_fence(DEVICE, FENCE, false)).unwrap();
+    h.send(&queue_submit(QUEUE, &[CB], FENCE)).unwrap();
+    let buffers = host.live("buffer");
     h.send(&destroy_buffer(DEVICE, BUF)).unwrap();
-    assert_eq!(host.called("vkWaitForFences"), waits);
+    assert_eq!(host.live("buffer"), buffers, "doomed, not destroyed");
+    h.send(&wait_fences(DEVICE, &[FENCE], u64::MAX)).unwrap();
+    assert_eq!(host.live("buffer"), buffers - 1, "gone with the fence");
     assert!(!h.fatal());
 }
 
+/// An unfenced submit reaches the driver as the guest sent it. A destroy
+/// behind it puts a mark on the queue — an empty submit with a fence of the
+/// executor's own — so what it may use is doomed, not waited for, and
+/// neither the queue's idle nor the device's is ever asked.
 #[test]
-fn destroying_after_an_unfenced_submit_waits_for_the_queue() {
+fn a_destroy_behind_an_unfenced_submit_marks_the_queue_and_never_waits() {
     let (mut h, host) = setup();
     host.hold.store(true, Ordering::SeqCst);
     buffer(&mut h, BUF);
     h.send(&create_pipeline_layout(DEVICE, PIPELINE_LAYOUT, &[]))
         .unwrap();
     record_fill(&mut h, CB, BUF);
+    let fences = host.called("vkCreateFence");
     h.send(&queue_submit(QUEUE, &[CB], 0)).unwrap();
+    assert_eq!(
+        host.called("vkCreateFence"),
+        fences,
+        "a submit costs nothing extra"
+    );
+    assert_eq!(host.called("vkQueueSubmit"), 1);
     h.send(&Command::DestroyPipelineLayout(DestroyPipelineLayoutArgs {
         device: VkDevice(DEVICE),
         pipeline_layout: VkPipelineLayout(PIPELINE_LAYOUT),
     }))
     .unwrap();
-    let calls = host.calls();
-    assert!(index_of(&calls, "vkQueueWaitIdle") < index_of(&calls, "destroy VkPipelineLayout"));
+    assert_eq!(host.called("vkCreateFence"), fences + 1, "the mark's fence");
+    assert_eq!(host.called("vkQueueSubmit"), 2, "and its empty submit");
+    assert_eq!(host.held(), 1, "which the fake GPU has not reached");
+    for never in ["vkQueueWaitIdle", "vkDeviceWaitIdle", "vkWaitForFences"] {
+        assert_eq!(host.called(never), 0, "{never}");
+    }
+    assert_eq!(host.called("destroy VkPipelineLayout"), 0);
     assert!(!h.fatal());
+    h.renderer.reset();
+    assert_eq!(host.called("destroy VkPipelineLayout"), 1);
+    assert_eq!(host.live_objects(), 0, "the clock's fence too");
 }
 
 #[test]
@@ -702,10 +752,12 @@ fn queue_and_device_idle_are_served_from_what_was_submitted() {
         panic!()
     };
     assert_eq!(d.ret, VK_SUCCESS);
+    assert_eq!(host.held(), 0, "the unfenced submit is done too");
     assert_eq!(
-        host.called("vkDeviceWaitIdle"),
-        1,
-        "an unfenced submit needs the device's own"
+        host.called("vkDeviceWaitIdle") + host.called("vkQueueWaitIdle"),
+        0,
+        "an unfenced submit is waited for by the clock's fence, never by the \
+         driver's idle, which has no timeout"
     );
     assert!(!h.fatal());
 }

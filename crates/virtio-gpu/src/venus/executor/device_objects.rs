@@ -1791,12 +1791,15 @@ impl<H: HostVulkan> VulkanContext<H> {
     ) -> Result<(), ExecError> {
         let name = command.name();
         let host = self.objects.device(device).map_err(id_error(name))?;
-        self.host
-            .call(&host.host, command)
-            .map_err(|error| ExecError::HostCall {
-                command: name,
-                error,
-            })?;
+        let started = self.host_time.is_some().then(std::time::Instant::now);
+        let called = self.host.call(&host.host, command);
+        if let (Some(total), Some(started)) = (self.host_time.as_mut(), started) {
+            *total += started.elapsed();
+        }
+        called.map_err(|error| ExecError::HostCall {
+            command: name,
+            error,
+        })?;
         self.note_result(name, generated::result_of(command));
         Ok(())
     }
@@ -1960,32 +1963,36 @@ impl<H: HostVulkan> VulkanContext<H> {
     }
 
     /// Every simple `vkDestroy*`: id 0 is a no-op; otherwise the object must
-    /// be a `kind` of `device`, and it is destroyed after any work that may
-    /// still use it (vkr destroys at once; see [`Self::settle`]).
+    /// be a `kind` of `device`, and it is destroyed on the host once any work
+    /// that may still use it has finished, without the guest waiting for
+    /// that (vkr destroys at once; see [`Self::retire_object`]).
     fn destroy(&mut self, kind: Kind, device: u64, id: u64) -> Result<(), ExecError> {
         let name = kind.name();
         self.objects.device(device).map_err(id_error(name))?;
         if id == 0 {
             return Ok(());
         }
-        self.objects.raw(kind, device, id).map_err(id_error(name))?;
-        self.settle(device);
-        let Some(object) = self
+        let custom_border = self
             .objects
-            .take_raw(kind, device, id)
+            .raw(kind, device, id)
+            .map_err(id_error(name))?
+            .facts
+            == Facts::CustomBorderSampler;
+        if kind == Kind::DescriptorPool {
+            self.objects.forget_pool_children(id);
+        }
+        let Some((object, held)) = self
+            .objects
+            .take_to_doom(kind, device, id)
             .map_err(id_error(name))?
         else {
             return Ok(());
         };
-        if kind == Kind::DescriptorPool {
-            self.objects.forget_pool_children(id);
-        }
-        if object.facts == Facts::CustomBorderSampler {
+        if custom_border {
             let device = self.objects.device_mut(device).map_err(id_error(name))?;
             device.custom_border_samplers = device.custom_border_samplers.saturating_sub(1);
         }
-        let host = self.objects.device(device).map_err(id_error(name))?;
-        self.host.destroy_object(&host.host, kind, object.host);
+        self.retire_object(device, object, held);
         Ok(())
     }
 

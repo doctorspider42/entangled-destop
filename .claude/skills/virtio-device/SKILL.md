@@ -467,6 +467,35 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   the allocation alive. Mesa allocates and creates asynchronously, so a
   refusal the guest never reads ends that client's context at its next use
   of the id — the client, not the renderer.
+- **A destroy never waits for the GPU** (ADR-0004, the amendment on CSS
+  pages). Every queue has a `objects::Clock`: each submit that reaches the
+  driver takes a serial, the guest's fence stands for it when there is one,
+  and a *mark* (an empty submit with a host fence of ours) is added only when
+  something needs to know about serials nothing covers yet. A destroy or
+  free with work in flight takes the object out of the table at once and
+  **dooms** it (`objects::Doomed`): destroyed on the host once every serial
+  in flight at the time has finished (`vkGetFenceStatus`, never a wait), at
+  device teardown at the latest, still charged to its caps until then. New
+  destroy paths go through `Objects::take_to_doom` + `retire_object`, never
+  `settle` + an immediate host destroy: Zink destroys hundreds of buffers a
+  frame, each of a batch that has finished while the next one runs, and the
+  old wait-for-the-queue before each put a whole frame of GPU time into the
+  ring (a third of a CSS page's ring time in Firefox). What must see finished
+  work before it acts — a pool reset, freeing command buffers or descriptor
+  sets, an event reset something waits on, a fence reset — still `settle`s,
+  on the clock's fences, never on the driver's unbounded queue idle.
+- **Profile a frame before guessing** (ADR-0004, the amendment on CSS pages):
+  `RUST_LOG=info,virtio_gpu::venus::profile=debug` logs every 2 s, per ring,
+  each command's count, host time, longest and replies, the decode time and
+  the driver's share (`venus ring commands`); per ring worker the time
+  pumping, yielding, sleeping, parked and blocked (`venus ring worker`); per
+  context the device worker's transport and blob calls, its
+  `vkWaitRingSeqnoMESA` waits included (`venus device calls`); and the
+  scanout flips per second (`venus scanout flips`). Off, it costs one branch
+  per command. **A page's `requestAnimationFrame` rate is not what the user
+  sees**: Firefox's compositor animates CSS off the main thread, and with
+  software WebRender a CSS page ticked rAF at 52 fps while GNOME flipped 4.4
+  frames a second. Count flips for a window that is the only thing moving.
 - **A teardown never waits for the GPU without a bound.** A queue whose work
   waits on a timeline value nothing signals never goes idle, and the thread
   tearing a context down is the device's worker: `destroy_all` waits

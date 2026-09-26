@@ -183,6 +183,8 @@ pub mod timeline;
 pub mod writes;
 
 #[cfg(test)]
+mod clock_tests;
+#[cfg(test)]
 mod ext_tests;
 #[cfg(test)]
 pub(crate) mod fake;
@@ -232,6 +234,7 @@ pub use context::{ExecError, VulkanContext};
 pub use host::{HostDeviceInfo, HostVulkan};
 pub use policy::GuestDevice;
 
+use super::profile;
 use super::protocol::{command_type_name, Command, ProtocolError};
 use super::pump::{Batch, Consumed, RingSink};
 #[cfg(doc)]
@@ -456,6 +459,9 @@ pub struct ExecutingSink<H: HostVulkan> {
     /// ([`limits::Class::DecodeBytes`]): every decode and every copied
     /// command stream of this ring is charged to it while it runs.
     decode_pool: Arc<PageBudget>,
+    /// The ring's frame profile, when [`profile::enabled`] said so at
+    /// adoption (ADR-0004, the CSS amendment).
+    profile: Option<Box<profile::CommandProfile>>,
     /// The most one command of this ring has decoded to, for a test.
     #[cfg(test)]
     pub(crate) peak_decode: usize,
@@ -510,6 +516,7 @@ impl<H: HostVulkan> ExecutingSink<H> {
             stop: StopSignal::never(),
             virtqueue_seqno: env.virtqueue_seqno,
             blocked: None,
+            profile: profile::enabled().then(Box::default),
         }
     }
 
@@ -534,6 +541,7 @@ impl<H: HostVulkan> ExecutingSink<H> {
             return self.transport(rest, nested);
         }
 
+        let decode_started = self.profile.is_some().then(Instant::now);
         let mut dec = Decoder::with_pool(rest, limits::MAX_COMMAND_DECODE_BYTES, &self.decode_pool);
         let decoded = Command::decode_next(&mut dec);
         #[cfg(test)]
@@ -553,18 +561,29 @@ impl<H: HostVulkan> ExecutingSink<H> {
         };
         let used = dec.position();
         let name = command.name();
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.record_decode(decode_started.map(|t| t.elapsed()));
+        }
         // A reply with nowhere to go is refused before anything runs, so a
         // refused command has no side effect on the host either.
         if header.wants_reply() && self.window.is_none() {
             return fatal(SinkError::NoReplyWindow(name));
         }
+        let started = self.profile.is_some().then(Instant::now);
         let executed = if submit::is_wait(&command) {
             self.wait(&mut command)
         } else {
             let mut context = lock(&self.context);
             context.stop = Some(self.stop.clone());
             context.command_bytes = used;
-            context.execute(&mut command).map(|()| true)
+            if self.profile.is_some() {
+                context.host_time = Some(Duration::ZERO);
+            }
+            let done = context.execute(&mut command).map(|()| true);
+            if let Some(profile) = self.profile.as_deref_mut() {
+                profile.record_host(context.host_time.take().unwrap_or_default());
+            }
+            done
         };
         match executed {
             Err(error) => return fatal(error.into()),
@@ -575,6 +594,9 @@ impl<H: HostVulkan> ExecutingSink<H> {
             if let Err(error) = self.reply(&command) {
                 return fatal(error);
             }
+        }
+        if let (Some(profile), Some(started)) = (self.profile.as_deref_mut(), started) {
+            profile.record(opcode, name, header.wants_reply(), started.elapsed());
         }
         if lock(&self.context).take_lost() {
             return Step::DoneThenFatal(used);
@@ -688,11 +710,16 @@ impl<H: HostVulkan> ExecutingSink<H> {
                 if nested {
                     return fatal(SinkError::NestedStreams);
                 }
-                return match self.execute_streams(
-                    &streams,
-                    reply_positions.as_deref(),
-                    &dependencies,
-                ) {
+                let started = self.profile.is_some().then(Instant::now);
+                let result =
+                    self.execute_streams(&streams, reply_positions.as_deref(), &dependencies);
+                if let (Some(profile), Some(started)) = (self.profile.as_deref_mut(), started) {
+                    let bytes = streams
+                        .iter()
+                        .fold(0u64, |sum, s| sum.saturating_add(s.size));
+                    profile.record_streams(bytes, started.elapsed());
+                }
+                return match result {
                     Ok(StepOf::Done(())) => Step::Done(stream.position()),
                     Ok(StepOf::DoneThenFatal(())) => Step::DoneThenFatal(stream.position()),
                     Ok(StepOf::Stopped) => Step::Stopped,
@@ -915,6 +942,9 @@ enum StepOf<T> {
 
 impl<H: HostVulkan> RingSink for ExecutingSink<H> {
     fn consume(&mut self, batch: Batch<'_>) -> Consumed {
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.log_if_due(self.ctx_id, self.ring);
+        }
         let bytes = batch.bytes();
         let mut done = 0usize;
         loop {

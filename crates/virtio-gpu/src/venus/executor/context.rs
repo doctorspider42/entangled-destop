@@ -47,8 +47,8 @@ use super::memory::{
 };
 use super::modifier::{self, CanonicalImage, ModifierLayout};
 use super::objects::{
-    CreatedQueue, DeviceChild, DeviceObject, ExposedDevice, IdError, ImageObject, Kind, Objects,
-    Pending, QueueObject,
+    Clock, CreatedQueue, DeviceChild, DeviceObject, ExposedDevice, IdError, ImageObject, Kind,
+    Objects, QueueObject,
 };
 use super::policy::{self, GuestDevice, MAX_API_VERSION, MIN_API_VERSION};
 
@@ -292,6 +292,9 @@ pub struct VulkanContext<H: HostVulkan> {
     /// The last wait slice found nothing the driver could do yet: the ring
     /// worker naps before the next ([`super::hold::NAP`]).
     pub(super) nap: bool,
+    /// Time spent in the driver's calls since the frame profile last took
+    /// it, when the profile is on ([`crate::venus::profile`]).
+    pub(super) host_time: Option<std::time::Duration>,
 }
 
 impl<H: HostVulkan> VulkanContext<H> {
@@ -361,6 +364,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             holds: super::hold::Holds::default(),
             hold_stats: Arc::new(super::hold::HoldStats::default()),
             nap: false,
+            host_time: None,
         }
     }
 
@@ -450,6 +454,13 @@ impl<H: HostVulkan> VulkanContext<H> {
     #[must_use]
     pub fn object_count(&self) -> usize {
         self.objects.len()
+    }
+
+    /// Host objects the guest destroyed that wait for the GPU before they
+    /// go ([`super::objects::Doomed`]).
+    #[must_use]
+    pub fn doomed_objects(&self) -> usize {
+        self.objects.doomed()
     }
 
     /// Whether the context went fatal.
@@ -1789,7 +1800,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 host: host_queue,
                 ring_idx,
                 family: info.queue_family_index,
-                pending: Pending::default(),
+                clock: Clock::default(),
                 sync: None,
                 marks: 0,
             },
@@ -1872,8 +1883,8 @@ impl<H: HostVulkan> VulkanContext<H> {
     }
 
     /// `vkDestroyCommandPool`; `VK_NULL_HANDLE` is a no-op. Its command
-    /// buffers go with it (the driver frees them), after any work that may
-    /// still be running them.
+    /// buffers go with it (the driver frees them), once any work that may
+    /// still be running them has finished ([`Self::retire_object`]).
     fn destroy_command_pool(&mut self, args: &DestroyCommandPoolArgs) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyCommandPool";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
@@ -1881,16 +1892,14 @@ impl<H: HostVulkan> VulkanContext<H> {
             self.objects
                 .pool(args.device.0, args.command_pool.0)
                 .map_err(id_error(NAME))?;
-            self.settle(args.device.0);
             self.objects.forget_pool_children(args.command_pool.0);
         }
-        if let Some(pool) = self
+        if let Some((pool, held)) = self
             .objects
-            .take_pool(args.device.0, args.command_pool.0)
+            .take_to_doom(Kind::CommandPool, args.device.0, args.command_pool.0)
             .map_err(id_error(NAME))?
         {
-            let device = self.objects.device(args.device.0).map_err(id_error(NAME))?;
-            self.host.destroy_command_pool(&device.host, pool);
+            self.retire_object(args.device.0, pool, held);
         }
         self.prune_recordings();
         Ok(())
@@ -2153,15 +2162,14 @@ impl<H: HostVulkan> VulkanContext<H> {
     fn destroy_image(&mut self, args: &DestroyImageArgs) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyImage";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
-        // Nothing the GPU may still be using is freed under it.
-        self.settle(args.device.0);
-        if let Some(image) = self
+        // Nothing the GPU may still be using is freed under it, and the
+        // guest does not wait for that either.
+        if let Some((image, held)) = self
             .objects
-            .take_image(args.device.0, args.image.0)
+            .take_to_doom(Kind::Image, args.device.0, args.image.0)
             .map_err(id_error(NAME))?
         {
-            let device = self.objects.device(args.device.0).map_err(id_error(NAME))?;
-            self.host.destroy_image(&device.host, image);
+            self.retire_object(args.device.0, image, held);
         }
         Ok(())
     }

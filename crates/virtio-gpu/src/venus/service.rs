@@ -105,6 +105,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use virtio_core::Quiesce;
 
+use super::profile::{WorkerProfile, WorkerState};
 use super::pump::{Idle, Pass, PumpError, RingBacking, RingPump, RingSink, STATUS_ALIVE};
 use super::ring::HostWord;
 use super::shmem::RingPages;
@@ -706,6 +707,13 @@ fn serve<S: RingSink>(
 ) -> RingPump {
     let origin = Instant::now();
     let keep_going = || !shared.stopping();
+    // The frame profile (ADR-0004, the CSS amendment): off unless its target
+    // was enabled when the ring was adopted.
+    let mut profile = super::profile::enabled().then(WorkerProfile::new);
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("venus-ring")
+        .to_owned();
     loop {
         // ADR-0005: the pass is taken before the ring is touched, held for
         // exactly one step, and never while parked or sleeping.
@@ -718,16 +726,38 @@ fn serve<S: RingSink>(
         }
         let step = service.step(now, pages);
         drop(pass);
+        let mut mark = |state: WorkerState, since: Duration| {
+            if let Some(profile) = profile.as_mut() {
+                profile.add(state, origin.elapsed().saturating_sub(since));
+            }
+        };
+        mark(WorkerState::Pumping, now);
 
         match step {
             Step::Again => {}
-            Step::Poll(backoff) => shared.pause_for(backoff),
+            Step::Poll(backoff) => {
+                let since = origin.elapsed();
+                shared.pause_for(backoff);
+                let state = if backoff.is_zero() {
+                    WorkerState::Yielding
+                } else {
+                    WorkerState::Sleeping
+                };
+                mark(state, since);
+            }
             // The pass was dropped above: a blocked ring holds none while it
             // waits, so a pause settles and a reset joins while the value it
             // waits for is still behind the (gated) device worker.
-            Step::Blocked(limit) => shared.wait_blocked(limit),
+            Step::Blocked(limit) => {
+                let since = origin.elapsed();
+                shared.wait_blocked(limit);
+                mark(WorkerState::Blocked, since);
+            }
             Step::Park => {
-                if !shared.wait_for_doorbell() {
+                let since = origin.elapsed();
+                let rung = shared.wait_for_doorbell();
+                mark(WorkerState::Parked, since);
+                if !rung {
                     break;
                 }
                 // Waking writes `status`, so it is a pass of its own.
@@ -745,6 +775,9 @@ fn serve<S: RingSink>(
                 );
                 break;
             }
+        }
+        if let Some(profile) = profile.as_mut() {
+            profile.log_if_due(&name);
         }
     }
     service.into_parts().0

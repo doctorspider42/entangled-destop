@@ -4081,3 +4081,94 @@ fn wait_before_signal_on_the_real_gpu() {
     h.use_context(2);
     teardown(h);
 }
+
+// ------------------------------------- doomed objects (the CSS amendment)
+
+/// Zink's pattern on the real GPU, and its hostile edge (ADR-0004, the
+/// amendment on CSS pages): a submit that keeps the GPU busy (3 GiB of
+/// fills) reads a buffer the guest destroys, with its memory, right after
+/// submitting. The destroy waits for nothing — measured against the GPU time
+/// it would have waited for before — and the host object outlives the
+/// submit, so what the copy read is still right when the guest looks.
+#[test]
+fn a_buffer_destroyed_under_a_running_submit_outlives_it_and_the_destroy_waits_for_nothing() {
+    const BIG: u64 = 64 << 20;
+    const SMALL: u64 = 64 << 10;
+    const WORDS: usize = (SMALL / 4) as usize;
+    let Some(host) = host() else { return };
+    let mut h = setup(host);
+    let busy = buffer(&mut h, 0x600, BIG, USAGE_TRANSFER_DST, false);
+    let src = buffer(
+        &mut h,
+        0x610,
+        SMALL,
+        USAGE_TRANSFER_SRC | USAGE_TRANSFER_DST,
+        false,
+    );
+    let dst = buffer(&mut h, 0x620, SMALL, USAGE_TRANSFER_DST, true);
+    dst.write_words(&vec![0; WORDS]);
+    let tw = (STAGE_TRANSFER, ACCESS_TRANSFER_WRITE);
+    let tr = (STAGE_TRANSFER, ACCESS_TRANSFER_READ);
+    let hr = (STAGE_HOST, ACCESS_HOST_READ);
+    let mut recording = vec![begin(CB), fill(CB, src.id, 0, WHOLE_SIZE, 0x5eed_c0de)];
+    // Enough GPU time that a wait for it would show: 48 fills of 64 MiB.
+    for i in 0..48u32 {
+        recording.push(fill(CB, busy.id, 0, WHOLE_SIZE, i));
+        recording.push(buffer_barrier(CB, busy.id, tw, tw));
+    }
+    recording.push(buffer_barrier(CB, src.id, tw, tr));
+    recording.push(copy_buffer(CB, src.id, dst.id, &[(0, 0, SMALL)]));
+    recording.push(buffer_barrier(CB, dst.id, tw, hr));
+    recording.push(end(CB));
+    assert_eq!(h.submit_recording(&recording), Outcome::Consumed);
+
+    // The same work once, waited for, to know what a wait would cost.
+    let start = std::time::Instant::now();
+    submit_and_wait(&mut h, &[CB], FENCE);
+    let gpu = start.elapsed();
+
+    dst.write_words(&vec![0; WORDS]);
+    h.send(&queue_submit(QUEUE, &[CB], 0)).unwrap();
+    let start = std::time::Instant::now();
+    h.send(&destroy_buffer(DEVICE, src.id)).unwrap();
+    h.send(&Command::FreeMemory(FreeMemoryArgs {
+        device: VkDevice(DEVICE),
+        memory: VkDeviceMemory(src.id | 0x1000),
+    }))
+    .unwrap();
+    let destroy = start.elapsed();
+    let doomed = h
+        .renderer
+        .factory()
+        .with_context(h.ctx, |c| c.doomed_objects())
+        .expect("the context");
+    let Command::QueueWaitIdle(q) = h
+        .call(&Command::QueueWaitIdle(QueueWaitIdleArgs {
+            queue: VkQueue(QUEUE),
+            ret: 0,
+        }))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(q.ret, VK_SUCCESS);
+    let got = dst.read_words(WORDS);
+    let wrong = got.iter().filter(|w| **w != 0x5eed_c0de).count();
+    let left = h
+        .renderer
+        .factory()
+        .with_context(h.ctx, |c| c.doomed_objects())
+        .expect("the context");
+    eprintln!(
+        "doomed: the work {gpu:?} on the GPU, the destroy and free {destroy:?}, {doomed} doomed \
+         while it ran and {left} after; {wrong} of {WORDS} words wrong"
+    );
+    assert_eq!(wrong, 0, "the copy read the buffer the guest had destroyed");
+    assert_eq!(left, 0, "gone once the queue was idle");
+    assert!(
+        destroy < gpu / 2 || doomed == 0,
+        "the destroy did not wait for the GPU ({destroy:?} against {gpu:?})"
+    );
+    assert!(!h.fatal());
+    teardown(h);
+}

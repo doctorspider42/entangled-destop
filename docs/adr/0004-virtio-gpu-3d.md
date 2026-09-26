@@ -6746,7 +6746,10 @@ both present before this change (`ff\shared`, `ff\diag5`).
 - **CSS-heavy pages are slower in hardware WebRender than in software**
   (above). Measure where a frame's time goes (ring round trips, fence waits,
   presentation) before changing anything; the GPU's idle clocks
-  (2026-09-25) may be part of it.
+  (2026-09-25) may be part of it. *Measured by the next amendment: they are not. In software the page
+  showed 4.4 frames a second while its rAF ticked at 52; on Zink it showed
+  25.5, held back by a wait for the GPU before every destroy, which is fixed
+  (29.7–33.0).*
 - **Existing disks** installed with `--venus` before this change need the
   environment file by hand and a new login. `F:\VMs\Entangled\venus-ubuntu.raw`
   has it now (written by `run1`).
@@ -6755,3 +6758,284 @@ both present before this change (`ff\shared`, `ff\diag5`).
 - The old page's rate stays in the 30s on both paths (the amendment above
   measured 36–45 in software). Its number counts from page load, and it was
   not investigated further.
+
+## Amendment, 2026-09-26 — CSS pages in hardware WebRender: a frame's profile, and a destroy that waited for the GPU
+
+The Firefox amendment left one item open. A CSS page (180 animated boxes, blur,
+`backdrop-filter`) measured 39.9–47.4 fps under hardware WebRender on Zink
+against 51.7–59.7 fps in software, with the GPU 37 % busy at P5. This
+amendment profiles that frame end to end, on both sides, and finds two
+things. The comparison measured the wrong number. And the renderer did have
+a cost of its own, a wait for the GPU before every destroy, which is fixed.
+
+### The number was the wrong one
+
+The pages report `requestAnimationFrame` intervals. Firefox animates
+`transform` and `opacity` on its compositor, off the main thread, so rAF
+counts the refresh driver's ticks, not composited frames. The frames the
+user sees are the flips of GNOME's scanout. The Firefox window is the only
+thing moving, so every flip is one Firefox frame. The renderer now counts
+them (`venus scanout flips`, below). Same boot, same page, both modes
+(`F:\VMs\Entangled\css\p1`):
+
+| Firefox mode | rAF fps | flips per second (visible frames) | Firefox's `Renderer` thread (guest, sampled) |
+|---|---:|---:|---|
+| software WebRender (llvmpipe) | 52.6 | **4.4** | 100 % running: SWGL rasterizes on one core |
+| hardware WebRender (Zink on Venus), before this change | 36.9 | **25.5** | 42 % running, 34 % in `clock_nanosleep` (venus waiting on fence feedback), 21 % in `futex` (waiting for Zink's driver thread) |
+
+In software the page shows 4.4 frames a second while rAF ticks at 52, which
+is Firefox's behaviour. Hardware WebRender was already 5.8× faster where it
+counts. It was still far from 60 fps, though, and the rest of this
+amendment is about why.
+
+### The frame profile
+
+`RUST_LOG=info,virtio_gpu::venus::profile=debug` (new, `venus::profile`;
+off, it costs one branch per command) logs every 2 s:
+
+- per ring: each command's count, host time, longest, and how many the guest
+  waited on for a reply; the decode time; and the driver's share of the
+  commands' time (`venus ring commands`);
+- per ring worker: the time spent pumping, yielding, sleeping, parked on the
+  doorbell and blocked on the virtqueue, and the number of parks
+  (`venus ring worker`);
+- per context, the device worker's calls: `SUBMIT_3D`s, doorbells,
+  `vkWaitRingSeqnoMESA` waits (count, total, longest), virtqueue seqnos, ring
+  fences, and blob creates, maps and unmaps (`venus device calls`);
+- the scanout flips per second (`venus scanout flips`).
+
+The guest half is a thread sampler (`F:\VMs\Entangled\probes\css\sample.py`,
+run as root). It reads every Firefox, gnome-shell and Xwayland thread's
+state, syscall and `wchan` about every 30 ms for 4 s. The driver and page
+scripts are in `F:\VMs\Entangled\probes\css\` and the run evidence in
+`F:\VMs\Entangled\css\`.
+
+A CSS frame of Firefox, before this change (2 s windows, WHP, RTX 2070 at
+P5, VMware idle):
+
+| where | what | per 2 s |
+|---|---|---|
+| Firefox's ring (context 6) | commands, **all without replies** | 338 000–421 000, about 7 400 a frame |
+| | ring worker pumping / parked | 1 481–1 803 ms / 99–386 ms: **77–90 % busy** |
+| | `vkDestroyBuffer` | 30 000–37 000 calls, **509–637 ms**, average 16 µs, longest 9.5–18.3 ms |
+| | `vkUpdateDescriptorSets`, `vkCmdPipelineBarrier2`, `vkCmdBindDescriptorSets`, `vkCmdBindVertexBuffers2`, `vkCmdBeginRendering` | 159–195, 82–101, 81–99, 57–70, 54–67 ms |
+| | `vkCreateBuffer` + `vkBindBufferMemory2` | 30 000–37 000 each, 55–75 ms |
+| | command streams (`vkExecuteCommandStreamsMESA`) | 91–114, 15–19 MB |
+| Firefox's device calls | `SUBMIT_3D`s (doorbells only), ring waits, ring fences, blobs | 125–160 doorbells, **no** ring waits, no ring fences, no blobs |
+| gnome-shell (context 3) | ring | 4 000–5 300 commands, 70–87 ms |
+| | device worker's `vkWaitRingSeqnoMESA` for its sync files | 90–115 waits, 28–32 ms, longest 0.6–3.5 ms |
+| scanout | flips | 45–57: 22.5–28.5 fps |
+
+Firefox's frame made **no** round trip: not one reply, no sync file, no
+blob. Firefox waited in the guest for fences through venus's feedback slots
+(the `Renderer` thread's `clock_nanosleep`, `vn_relax`). The fences waited
+for work that was still in the ring: the ring worker was busy 77–90 % of the
+time executing 7 400 commands a frame. A third of that time went to
+`vkDestroyBuffer`.
+
+WebGL (the 4096-triangle page, same boot) is the contrast. It made 13 000–
+15 000 commands a second, the ring was busy 15–18 %, and it flipped 52 times
+a second.
+
+### Cause 1, ours: every destroy waited for the queue
+
+`VulkanContext::settle` ran before every destroy and free. It kept "nothing
+freed under the GPU" by waiting until the queue's record of pending work had
+cleared. A submit without a fence, which is every submit Zink makes (it
+tracks batches with a timeline semaphore), could only be cleared by the
+driver's `vkQueueWaitIdle`, under the context lock and without a bound.
+Zink's buffer invalidation (`invalidate_buffer`, `zink_resource.c:2155-2198`
+in 25.2.8) gives a buffer in use a new `VkBuffer` on every
+`glBufferData`/discarding map. WebRender re-uploads its instance data every
+frame, so the old ones are destroyed about 600 times a frame, each of a
+batch that finished while the next one runs. So the first destroy after each
+submit waited for the frame being drawn, and the ring stopped for that
+frame's GPU time. That is the 9.5–18 ms longest `vkDestroyBuffer`.
+
+**The fix: a clock per queue, and doomed objects** (`objects::Clock`,
+`objects::Doomed`, `VulkanContext::retire_object`):
+
+- Every submit that reaches the driver takes the queue's next serial. A
+  fence covers everything submitted before it on its queue, so the clock
+  keeps the fences that stand for serials. The guest's own fence stands for
+  its submit's serial. A **mark**, an empty submit with a host fence of the
+  executor's, is added only when something needs to know about serials no
+  fence covers yet: a destroy behind them, or a wait for them. A guest that
+  never destroys anything while its GPU is busy costs the driver nothing
+  more than before. `vkGetFenceStatus` never blocks, so a destroy can ask
+  how far the GPU has got without waiting.
+- A destroy or free while work is in flight takes the object out of the
+  table at once, so its id is gone as the guest expects, and **dooms** it.
+  The object is destroyed on the host once every serial in flight at the
+  time has finished. The clocks are asked at the next destroy, at every
+  submit while anything is doomed, after every successful guest fence wait,
+  and at device teardown after the device is idle, at the latest. A doomed
+  object keeps its table entry's charges, and memory its own, until then. So
+  what a guest can have waiting to be destroyed is bounded by the caps on
+  what it may have at all (`doomed_objects_count_against_the_objects_cap`).
+- This covers buffers, images, views, memory, command pools and every
+  simple `vkDestroy*`, fences and semaphores included. A guest fence the
+  clock stands on stays valid for as long as the clock needs it: destroying
+  it dooms it, and a reset of a fence still in flight waits for its submit
+  first (after asking the clock, so a fence the host has seen signalled
+  waits for nothing).
+- What must see finished work before it acts still waits: a descriptor or
+  command pool reset, freeing command buffers or sets, an event reset that
+  submitted work waits on, `vkQueueWaitIdle`/`vkDeviceWaitIdle`. They wait
+  on the clock's fences, in slices, and never call the driver's unbounded
+  `vkQueueWaitIdle`/`vkDeviceWaitIdle` any more. That closes the wait-before-
+  signal amendment's open item on those two calls, apart from a mark the
+  driver refuses (out of memory), where the queue idle is the fallback.
+- Bounds: at most `MAX_CLOCK_IN_FLIGHT` (256) fences stand per queue. Past
+  that, the newest guest fence stands in for the one before it, which makes
+  the clock coarser but never wrong. The same number of guest fences is
+  remembered for resets; past that, a reset waits for the queue. A mark past
+  the bound waits for the oldest. That is finite, because every wait the
+  driver holds is covered (`hold`), and only a guest that destroys behind
+  hundreds of unfinished submits reaches it. Recycled mark fences: at most
+  16 spare per queue.
+
+After (`p3`, same image, VMware idle): `vkDestroyBuffer` takes **1.7–1.9 µs**
+on average, the longest 0.15–0.22 ms, and 62–76 ms per 2 s. That is 6–7 % of
+the commands' time instead of 40–42 %.
+
+### Cause 2, ours, what is left: about 3 µs a command, 7 400 commands a frame
+
+With the wait gone the ring is still 63–76 % busy on the CSS page. The time
+is spread across every command (`p3`, per 2 s: 383 000–503 000 commands):
+
+| part | per 2 s | per command |
+|---|---:|---:|
+| decode (`Command::decode_next`, the decode pool's charges) | 192–234 ms | 0.47–0.50 µs |
+| the executor's own work: dispatch, id translation, checks, charges, the generated conversion | about 600–730 ms | about 1.4–1.6 µs |
+| the driver's calls (NVIDIA 580.88) | 330–495 ms | 0.8–1.1 µs |
+| the pump and the stream copies | about 145–160 ms | |
+
+`vkUpdateDescriptorSets` (4.4–5.9 µs, 870 a frame), `vkCmdPipelineBarrier2`
+and `vkCmdBindDescriptorSets` (3–4 µs) lead. A native Zink pays about a
+tenth of that for these commands. They are all asynchronous, so the cost is
+throughput, not latency: the ring must get through a frame's commands before
+the GPU can start on it. Two ways to shrink it, not taken here:
+
+- **Fewer commands: `VK_KHR_push_descriptor`.** Zink pushes its uniform set
+  with `vkCmdPushDescriptorSetWithTemplateKHR` when the device has the
+  extension. The executor refuses it (`policy`: no generated translation or
+  host call for `vkCmdPushDescriptorSet` yet), so Zink allocates, updates and
+  binds a set instead: about 870 `vkUpdateDescriptorSets` and as many
+  `vkCmdBindDescriptorSets` a frame, together a third of the ring's time.
+  Serving it needs the generated bridge and `check_write`'s validation for
+  the pushed writes. Owed.
+- **Cheaper commands**: a sampling profile of the ring worker, which needs an
+  elevated ETW session on this host (not available to the agent). Owed.
+
+### Cause 3, Mesa's: the volume
+
+About 600 `vkCreateBuffer`/`vkBindBufferMemory2`/`vkDestroyBuffer` triples a
+frame are Zink's buffer invalidation (above). Each is a host call through
+Venus where a native driver pays a slab allocation. Zink has no knob that
+keeps the orphaning off. `ZINK_DESCRIPTORS=db` would move descriptor updates
+into memory, but it needs `VK_EXT_descriptor_buffer`, which venus does not
+support (`vn_physical_device.c` has no such entry). No guest setting was
+added: nothing measured made one safe and helpful.
+
+### Cause 4, not the cause: GPU time and clocks
+
+The GPU sat at P5 (675–885 MHz), 33–40 % busy, during the CSS page before
+and after. With the ring the bottleneck, idle clocks are the *consequence*:
+the driver sees a GPU that waits for work. Holding P0 was not re-measured;
+the 2026-09-25 amendment has what it buys glmark2.
+
+### Measured
+
+WHP, RTX 2070 (driver 580.88), Ubuntu 26.04 guest (4 vCPUs, GNOME on Zink),
+Firefox snap 154.0 (Mesa 25.2.8), profile `venus-ubuntu-net-profile.toml`, the
+frame profile on in both binaries. "Before" is the renderer at `823e8d3`
+with only the counters added (`entangled-css.exe`), and "after" is this
+change (`entangled-css4.exe`). There were six boots under
+`F:\VMs\Entangled\css\`. `p1` and `p3` ran with the VMware VM on the host
+idle (0–1 % GPU before the boot). `a1`, `b1`, `a2`, `b2` alternated while it
+used 20–37 % of the GPU throughout, and there every number moves with it.
+Each page is measured over 10 s after 4 s of warm-up. "flips" is the scanout's
+rate over that window, "rAF" the page's own report.
+
+| page | before: `p1`; `a1`, `a2` | after: `p3`; `b1`, `b2` |
+|---|---|---|
+| CSS, flips per second | 25.5; 25.5 and 17.3, 23.9 and 26.3 (mean 23.7) | **29.7 and 33.0; 19.7 and 26.3, 29.9 and 30.3 (mean 28.2)** |
+| CSS, rAF | 36.9; 38.6 and 30.2, 39.0 and 37.9 | 37.0 and 44.8; 30.4 and 28.3, 42.5 and 43.9 |
+| CSS, Firefox's ring busy (worst 2 s) | 90 %; 87 and 78, 86 and 88 % | 76 and 81 %; 78 and 81, 79 and 78 % |
+| CSS in software (llvmpipe), flips / rAF | 4.4 / 52.6 | 4.5 / 52.8 (`p2`) |
+| WebGL 2, flips / rAF | 52.4 / 55.1; 41.5 / 47.8, 47.2 / 52.0 | 46.6 / 54.9; 54.0 / 52.3, 49.8 / 55.6 |
+| scrolling, flips / rAF | —; 35.4 / 34.8, 53.4 / 47.6 | 57.2 / 47.3 (`p2`); 57.4 / 47.0, 57.9 / 50.7 |
+| VP8 video (30 fps), flips / rAF | —; 28.3 / 59.1, 29.6 / 59.7 | 29.7 / 60.0, 29.8 / 59.5 |
+| glmark2 `build` / `jellyfish` | 681 / 686; 404 / 418, 655 / 626 | **780 / 774 and 697 / 718; 698 / 670, 704 / 640** |
+| GNOME composite during glmark2 | 60 fps | 60 fps |
+| idle desktop, VMM | 0.07 cores | 0.06 cores |
+
+- **The CSS page shows about a fifth more frames** (means 23.7 → 28.2 flips
+  a second, and 25.5 → 29.7–33.0 on the quiet host). That is 6–7× what
+  software WebRender shows (4.4). Its rAF rate is within noise.
+- **Nothing regressed.** glmark2 is up on the quiet host (681/686 →
+  780/774 and 697/718). WebGL, scrolling and video are unchanged within the
+  tenant's noise. Scrolling is if anything smoother (53–58 flips against
+  35–53).
+- **The ring is still the bottleneck on the CSS page** (76–81 % busy), now
+  for the per-command costs of cause 2. The GPU stayed at P5, 33–40 % busy.
+
+### Tests
+
+- `executor::clock_tests` (fake host):
+  - Zink's pattern: 200 destroys behind a running batch, none waits, all
+    charged until the batch ends, then all go with their charges.
+  - A destroy with nothing in flight is immediate.
+  - The next submit frees the doomed once the GPU is done, without a guest
+    wait.
+  - A guest fence destroyed while its submit runs outlives it, and the clock
+    keeps asking it.
+  - A reset of a fence in flight waits for its submit first; one seen
+    signalled waits for nothing.
+  - The marks' fences are reused: 50 frames make at most two.
+  - The fences standing per queue are bounded, and a forgotten fence's
+    reset waits for the queue.
+  - Teardown destroys the doomed and the clock's fences.
+  - Doomed objects count against the objects cap and give their room back
+    when they go.
+- `submit_tests`, updated to the new contract: what a fenced submission may
+  use outlives it and nothing waits; a doomed object goes when the guest
+  waits for its fence; a destroy behind an unfenced submit marks the queue
+  and never waits; `vkQueueWaitIdle`/`vkDeviceWaitIdle` are served by the
+  clock and never reach the driver's idle.
+- `profile::tests`: a window's sums and its ordering.
+- Real GPU (self-skipping):
+  `host_vulkan::pipeline_tests::a_buffer_destroyed_under_a_running_submit_outlives_it_and_the_destroy_waits_for_nothing`.
+  A submit keeps the GPU busy with 3 GiB of fills and reads a buffer that
+  the guest then destroys and frees at once. On the RTX 2070 the work took
+  20.4 ms of GPU time and the destroy and free 4.0 ms. That 4.0 ms is the
+  harness's two ring round trips in a debug build, and nothing waited. The
+  copy read all 16 384 words right, and nothing was left doomed once the
+  queue was idle.
+
+### Still open
+
+- **Ours: the executor's per-command cost** (about 3 µs a command
+  including decode and driver, 7 400 commands a Firefox CSS frame). Two
+  steps, in order: serve `VK_KHR_push_descriptor`, which Zink uses instead
+  of an update and a bind of its uniform set per state change
+  (`zink_descriptors.c:1444-1461` in 26.0.8) and which is about a third of
+  this page's ring time; then an ETW sampling profile of the ring worker (an
+  elevated session) before touching the decode or the translation.
+- **Mesa's: Zink's buffer orphaning.** About 600 `VkBuffer`s a frame are
+  created, bound and destroyed for WebRender's per-frame uploads. There is no
+  knob to change it, and venus has no descriptor buffers for
+  `ZINK_DESCRIPTORS=db`.
+- **Firefox's: rAF is not the frame rate.** Probes that compare modes should
+  count flips. Software WebRender's 4.4 frames a second on this page is its
+  own.
+- **A clean A/B.** Four of the six boots shared the GPU with a VMware VM. The
+  quiet pair agrees with the mean of the rest, but a small effect on WebGL
+  or video could hide in that noise.
+- **The Linux/KVM host** was not measured. The change is portable and has
+  no host-specific part.
+- The wait-before-signal amendment's open item on
+  `vkQueueWaitIdle`/`vkDeviceWaitIdle` of an unfenced queue is closed. The
+  executor no longer calls either on the driver, except as the fallback when
+  the driver refuses a mark.

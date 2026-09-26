@@ -1043,15 +1043,14 @@ impl<H: HostVulkan> VulkanContext<H> {
     pub(super) fn free_memory(&mut self, args: &FreeMemoryArgs) -> Result<(), ExecError> {
         const NAME: &str = "vkFreeMemory";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
-        // Nothing the GPU may still be using is freed under it.
-        self.settle(args.device.0);
-        if let Some(memory) = self
+        // Nothing the GPU may still be using is freed under it, and the
+        // guest does not wait for that either.
+        if let Some((memory, held)) = self
             .objects
-            .take_memory(args.device.0, args.memory.0)
+            .take_to_doom(Kind::DeviceMemory, args.device.0, args.memory.0)
             .map_err(id_error(NAME))?
         {
-            let device = self.objects.device(args.device.0).map_err(id_error(NAME))?;
-            self.host.free_memory(&device.host, memory.host);
+            self.retire_object(args.device.0, memory, held);
         }
         Ok(())
     }
@@ -1345,15 +1344,14 @@ impl<H: HostVulkan> VulkanContext<H> {
     pub(super) fn destroy_buffer(&mut self, args: &DestroyBufferArgs) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyBuffer";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
-        // Nothing the GPU may still be using is freed under it.
-        self.settle(args.device.0);
-        if let Some(buffer) = self
+        // Nothing the GPU may still be using is freed under it, and the
+        // guest does not wait for that either.
+        if let Some((buffer, held)) = self
             .objects
-            .take_buffer(args.device.0, args.buffer.0)
+            .take_to_doom(Kind::Buffer, args.device.0, args.buffer.0)
             .map_err(id_error(NAME))?
         {
-            let device = self.objects.device(args.device.0).map_err(id_error(NAME))?;
-            self.host.destroy_buffer(&device.host, buffer);
+            self.retire_object(args.device.0, buffer, held);
         }
         Ok(())
     }
@@ -1765,15 +1763,14 @@ impl<H: HostVulkan> VulkanContext<H> {
     ) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyBufferView";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
-        // Nothing the GPU may still be using is freed under it.
-        self.settle(args.device.0);
-        if let Some(view) = self
+        // Nothing the GPU may still be using is freed under it, and the
+        // guest does not wait for that either.
+        if let Some((view, held)) = self
             .objects
-            .take_buffer_view(args.device.0, args.buffer_view.0)
+            .take_to_doom(Kind::BufferView, args.device.0, args.buffer_view.0)
             .map_err(id_error(NAME))?
         {
-            let device = self.objects.device(args.device.0).map_err(id_error(NAME))?;
-            self.host.destroy_buffer_view(&device.host, view);
+            self.retire_object(args.device.0, view, held);
         }
         Ok(())
     }
@@ -2310,15 +2307,14 @@ impl<H: HostVulkan> VulkanContext<H> {
     ) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyImageView";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
-        // Nothing the GPU may still be using is freed under it.
-        self.settle(args.device.0);
-        if let Some(view) = self
+        // Nothing the GPU may still be using is freed under it, and the
+        // guest does not wait for that either.
+        if let Some((view, held)) = self
             .objects
-            .take_image_view(args.device.0, args.image_view.0)
+            .take_to_doom(Kind::ImageView, args.device.0, args.image_view.0)
             .map_err(id_error(NAME))?
         {
-            let device = self.objects.device(args.device.0).map_err(id_error(NAME))?;
-            self.host.destroy_image_view(&device.host, view);
+            self.retire_object(args.device.0, view, held);
         }
         Ok(())
     }
