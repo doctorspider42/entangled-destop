@@ -262,8 +262,10 @@ pub struct QueueObject<H: HostVulkan> {
     pub ring_idx: u32,
     /// Its queue family.
     pub family: u32,
-    /// What is known of the work submitted to it (stage 5b.2).
-    pub pending: Pending,
+    /// What is known of the work submitted to it: every submit that reached
+    /// the driver, numbered, with a host fence of the executor's own
+    /// (ADR-0004, the amendment on CSS pages).
+    pub clock: Clock,
     /// The thread retiring virtio-gpu fences on its `ring_idx` (stage
     /// 5b.3), started by the first one.
     pub sync: Option<QueueSync<H>>,
@@ -273,26 +275,151 @@ pub struct QueueObject<H: HostVulkan> {
     pub marks: u64,
 }
 
-/// What the executor knows of the work a queue may still be running: enough
-/// to wait for all of it before anything that work may use is destroyed.
+/// What the executor knows of the work a queue may still be running
+/// (ADR-0004, the amendment on CSS pages).
 ///
-/// A `vkQueueSubmit` fence covers every batch submitted to the queue before
-/// it, so the fence of the newest fenced submit stands for the queue's whole
-/// past — until an unfenced submit follows it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Pending {
-    /// The newest submit's fence, `(guest id, host handle)`.
-    pub fence: Option<(u64, u64)>,
-    /// Whether a submit without a fence came after it: only the queue going
-    /// idle can tell when that one is done.
-    pub unfenced: bool,
+/// Every submit that reaches the driver takes the queue's next **serial**.
+/// A fence covers every batch submitted to its queue before it, so a fence
+/// signalled behind serial `n` means everything up to `n` is done. The clock
+/// keeps the fences that stand for serials: the guest's own, when a submit
+/// carries one, and a **mark** of the executor's — an empty submit with a
+/// host fence — only when something needs to know about serials no fence
+/// covers yet (a destroy behind them, a wait for them). So a guest that
+/// never destroys anything while its GPU is busy costs the driver nothing
+/// extra. Asking is `vkGetFenceStatus`, which never blocks, so a destroy can
+/// tell what is still running without waiting for it ([`Doomed`]). A guest
+/// fence the clock stands on stays valid for as long as it does: destroying
+/// it dooms it like anything else, and resetting it waits for its submit
+/// first.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Clock {
+    /// The serial of the newest submit that reached the driver.
+    pub submitted: u64,
+    /// The newest serial known to have finished on the GPU.
+    pub completed: u64,
+    /// `(serial, host fence, whether the fence is ours)`, oldest first: the
+    /// fences standing for serials not yet known finished.
+    pub in_flight: std::collections::VecDeque<(u64, u64, bool)>,
+    /// Signalled fences, reset, for the next submits.
+    pub spare: Vec<u64>,
+    /// Guest fences handed to submits still in flight, `(guest id, serial)`:
+    /// resetting one of them waits for its submit first.
+    pub guest_fences: Vec<(u64, u64)>,
+    /// Whether `guest_fences` overflowed since the queue was last idle: a
+    /// reset of any fence then waits for the queue.
+    pub forgot_fences: bool,
 }
 
-impl Pending {
-    /// Whether anything may still be running.
+impl Clock {
+    /// Whether anything submitted may still be running.
     #[must_use]
-    pub fn any(&self) -> bool {
-        self.fence.is_some() || self.unfenced
+    pub fn busy(&self) -> bool {
+        self.completed < self.submitted
+    }
+
+    /// Whether a fence already stands for the newest serial.
+    #[must_use]
+    pub fn covered(&self) -> bool {
+        self.in_flight.back().map_or(self.completed, |(s, _, _)| *s) >= self.submitted
+    }
+
+    /// Everything up to `serial` is done. Answers the executor's own fences
+    /// that covered it, oldest first, for the caller to reset and keep; the
+    /// guest's are the guest's.
+    pub fn complete_through(&mut self, serial: u64) -> Vec<u64> {
+        let mut done = Vec::new();
+        while let Some(&(s, fence, ours)) = self.in_flight.front() {
+            if s > serial {
+                break;
+            }
+            self.in_flight.pop_front();
+            if ours {
+                done.push(fence);
+            }
+        }
+        self.completed = self.completed.max(serial);
+        self.guest_fences.retain(|(_, s)| *s > serial);
+        if !self.busy() {
+            self.forgot_fences = false;
+        }
+        done
+    }
+
+    /// Every host fence of the executor's the clock holds, for teardown.
+    pub fn drain_fences(&mut self) -> Vec<u64> {
+        let mut all: Vec<u64> = self
+            .in_flight
+            .drain(..)
+            .filter(|(_, _, ours)| *ours)
+            .map(|(_, f, _)| f)
+            .collect();
+        all.append(&mut self.spare);
+        self.guest_fences.clear();
+        self.completed = self.submitted;
+        all
+    }
+}
+
+/// A host object the guest has destroyed while work that may use it was
+/// still on the GPU (ADR-0004, the amendment on CSS pages): out of the table
+/// at once — its id is gone, as the guest expects — and destroyed on the
+/// host once every submit that was in flight at the time has finished. It
+/// keeps its charges ([`super::limits`]) until then, so what a guest can
+/// have waiting here is bounded by the caps on what it can have at all.
+pub struct Doomed<H: HostVulkan> {
+    /// Its device's guest id.
+    pub device: u64,
+    /// `(queue, serial)` that must have finished first.
+    pub after: Vec<(u64, u64)>,
+    /// The host object.
+    pub object: DoomedObject<H>,
+    _held: Held,
+}
+
+/// The host object a [`Doomed`] entry destroys.
+pub enum DoomedObject<H: HostVulkan> {
+    /// Any of the stage-5b.2 kinds, by raw handle.
+    Raw(RawObject),
+    /// A `VkImage`.
+    Image(H::Image),
+    /// A `VkBuffer`.
+    Buffer(H::Buffer),
+    /// A `VkBufferView`.
+    BufferView(H::BufferView),
+    /// A `VkImageView`.
+    ImageView(H::ImageView),
+    /// A `VkDeviceMemory`, with what it holds (pages, charges).
+    Memory(MemoryObject<H>),
+    /// A `VkCommandPool`, whose command buffers go with it.
+    Pool(H::CommandPool),
+}
+
+impl<H: HostVulkan> DoomedObject<H> {
+    /// Destroy it on the host, now.
+    pub fn destroy(self, host: &H, device: &H::Device) {
+        match self {
+            Self::Raw(raw) => host.destroy_object(device, raw.kind, raw.host),
+            Self::Image(image) => host.destroy_image(device, image),
+            Self::Buffer(buffer) => host.destroy_buffer(device, buffer),
+            Self::BufferView(view) => host.destroy_buffer_view(device, view),
+            Self::ImageView(view) => host.destroy_image_view(device, view),
+            // The table's hold on the pages goes with it; a blob's stays.
+            Self::Memory(memory) => host.free_memory(device, memory.host),
+            Self::Pool(pool) => host.destroy_command_pool(device, pool),
+        }
+    }
+}
+
+/// An id's charges, kept past its entry ([`Doomed`]): given back when this
+/// drops.
+#[derive(Debug)]
+pub struct Held(Option<Entry>);
+
+impl Held {
+    /// Whether it holds an entry's charges.
+    #[must_use]
+    pub fn holds(&self) -> bool {
+        self.0.is_some()
     }
 }
 
@@ -821,6 +948,11 @@ impl KindTable {
         self.map.remove(id).map(|entry| entry.kind)
     }
 
+    /// Take `id`'s entry out, charges and all ([`Held`]).
+    fn take(&mut self, id: &u64) -> Option<Entry> {
+        self.map.remove(id)
+    }
+
     fn get(&self, id: &u64) -> Option<&Kind> {
         self.map.get(id).map(|entry| &entry.kind)
     }
@@ -857,6 +989,9 @@ pub struct Objects<H: HostVulkan> {
     buffer_views: HashMap<u64, ViewObject<H::BufferView>>,
     image_views: HashMap<u64, ViewObject<H::ImageView>>,
     raw: HashMap<u64, RawObject>,
+    /// Destroyed by the guest, possibly still in use on the GPU, in the
+    /// order the guest destroyed them ([`Doomed`]).
+    doomed: Vec<Doomed<H>>,
 }
 
 impl<H: HostVulkan> Default for Objects<H> {
@@ -882,6 +1017,7 @@ impl<H: HostVulkan> Objects<H> {
             buffer_views: HashMap::new(),
             image_views: HashMap::new(),
             raw: HashMap::new(),
+            doomed: Vec::new(),
         }
     }
 }
@@ -1635,6 +1771,115 @@ impl<H: HostVulkan> Objects<H> {
         .map(|view| view.map(|v| v.host))
     }
 
+    // ------------------------------------------------------------- doomed
+
+    /// Take `id` (a `kind` of `device`) out of the table without destroying
+    /// it on the host: its host object, and its charges ([`Doomed`]). The
+    /// caller does whatever else the destroy owes the table first (a pool's
+    /// children) and then destroys the object or dooms it.
+    ///
+    /// # Errors
+    /// As [`Self::image`], for `kind`.
+    pub fn take_to_doom(
+        &mut self,
+        kind: Kind,
+        device: u64,
+        id: u64,
+    ) -> Result<Option<(DoomedObject<H>, Held)>, IdError> {
+        if id == 0 {
+            return Ok(None);
+        }
+        let object = match kind {
+            Kind::Image => {
+                child_in(&self.images, &self.kinds, kind, device, id)?;
+                self.images.remove(&id).map(|o| DoomedObject::Image(o.host))
+            }
+            Kind::Buffer => {
+                child_in(&self.buffers, &self.kinds, kind, device, id)?;
+                self.buffers
+                    .remove(&id)
+                    .map(|o| DoomedObject::Buffer(o.host))
+            }
+            Kind::BufferView => {
+                child_in(&self.buffer_views, &self.kinds, kind, device, id)?;
+                self.buffer_views
+                    .remove(&id)
+                    .map(|o| DoomedObject::BufferView(o.host))
+            }
+            Kind::ImageView => {
+                child_in(&self.image_views, &self.kinds, kind, device, id)?;
+                self.image_views
+                    .remove(&id)
+                    .map(|o| DoomedObject::ImageView(o.host))
+            }
+            Kind::DeviceMemory => {
+                child_in(&self.memories, &self.kinds, kind, device, id)?;
+                self.memories.remove(&id).map(DoomedObject::Memory)
+            }
+            Kind::CommandPool => {
+                child_in(&self.pools, &self.kinds, kind, device, id)?;
+                self.pools.remove(&id).map(|o| DoomedObject::Pool(o.host))
+            }
+            _ => {
+                child_in(&self.raw, &self.kinds, kind, device, id)?;
+                self.raw.remove(&id).map(DoomedObject::Raw)
+            }
+        };
+        let held = Held(self.kinds.take(&id));
+        Ok(object.map(|o| (o, held)))
+    }
+
+    /// Keep `object` until every `(queue, serial)` in `after` has finished.
+    pub fn doom(
+        &mut self,
+        device: u64,
+        after: Vec<(u64, u64)>,
+        object: DoomedObject<H>,
+        held: Held,
+    ) {
+        self.doomed.push(Doomed {
+            device,
+            after,
+            object,
+            _held: held,
+        });
+    }
+
+    /// Objects waiting for the GPU before they are destroyed.
+    #[must_use]
+    pub fn doomed(&self) -> usize {
+        self.doomed.len()
+    }
+
+    /// Destroy every doomed object whose submits have all finished, by the
+    /// queues' clocks. Answers how many went.
+    pub fn reap_doomed(&mut self, host: &H) -> usize {
+        if self.doomed.is_empty() {
+            return 0;
+        }
+        let queues = &self.queues;
+        let ready = |d: &Doomed<H>| {
+            d.after.iter().all(|(queue, serial)| {
+                queues
+                    .get(queue)
+                    .is_none_or(|q| q.clock.completed >= *serial)
+            })
+        };
+        let (gone, kept): (Vec<Doomed<H>>, Vec<Doomed<H>>) = std::mem::take(&mut self.doomed)
+            .into_iter()
+            .partition(ready);
+        self.doomed = kept;
+        let count = gone.len();
+        for d in gone {
+            // A device's doomed objects go before the device does, so it is
+            // always there.
+            if let Some(device) = self.devices.get(&d.device) {
+                d.object.destroy(host, &device.host);
+            }
+        }
+        count
+    }
+
     // ----------------------------------------------------------- teardown
 
     /// Destroy device `id` and everything under it, in dependency order:
@@ -1694,6 +1939,21 @@ impl<H: HostVulkan> Objects<H> {
         // outstanding syncs when it goes (`vkr_queue_sync_thread_fini`).
         for (_, sync) in syncs {
             sync.finish(host, &device.host);
+        }
+        // What the guest destroyed while the GPU was still at it goes first,
+        // in the order it was destroyed; the device is idle now.
+        let (doomed, rest): (Vec<Doomed<H>>, Vec<Doomed<H>>) = std::mem::take(&mut self.doomed)
+            .into_iter()
+            .partition(|d| d.device == id);
+        self.doomed = rest;
+        for d in doomed {
+            d.object.destroy(host, &device.host);
+        }
+        // The queues' clock fences: nothing waits on them any more.
+        for queue in self.queues.values_mut().filter(|q| q.device == id) {
+            for fence in queue.clock.drain_fences() {
+                host.destroy_object(&device.host, Kind::Fence, fence);
+            }
         }
         let raw = children_of(&self.raw, id);
         // Pool children leave the table only: their pools free them.

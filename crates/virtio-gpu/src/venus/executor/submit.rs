@@ -88,18 +88,30 @@
 //! the slice. The context's monitor thread keeps setting `ALIVE` in the
 //! ring's status meanwhile: it runs apart from the worker for exactly this.
 //!
-//! # Nothing is freed under the GPU
+//! # Nothing is freed under the GPU, and nothing waits for it either
 //!
 //! Vulkan makes destroying an object a pending submission still uses the
 //! application's mistake, and vkr lets the driver meet it. Here every queue
-//! keeps a record of what it may still be running ([`Pending`]): the fence
-//! of its newest fenced submit, which covers every earlier batch of the
-//! queue, and whether an unfenced submit came after. Every destroy, free and
-//! pool reset first waits for the record to clear ([`VulkanContext::settle`])
-//! — the fence if that is all, the queue going idle if not — so the host
-//! never frees an object while a submission may use it, at the price of a
-//! wait only when the guest destroys something while work is in flight
-//! (Mesa's own pattern — wait for the fence, then destroy — never waits).
+//! keeps a [`Clock`]: every submit that reaches the driver takes the queue's
+//! next serial and carries a host fence of the executor's own — in the
+//! guest's empty fence slot, or on an empty submit right behind it — so
+//! `vkGetFenceStatus`, which never blocks, says how far each queue has got.
+//!
+//! A **destroy** or **free** while work is in flight does not wait for it
+//! (ADR-0004, the amendment on CSS pages). The object leaves the table at
+//! once and is *doomed* ([`super::objects::Doomed`]): destroyed on the host
+//! once every submit that was in flight when the guest destroyed it has
+//! finished, and at device teardown, after the device is idle, at the
+//! latest. Zink destroys hundreds of buffers a frame, each of a batch that
+//! finished while the next one runs; waiting for the queue before each —
+//! what this did until then — put a whole frame of GPU time into the ring,
+//! and a CSS page in Firefox spent a third of its ring's time there.
+//!
+//! What must see finished work before it acts still waits
+//! ([`VulkanContext::settle`]): a pool reset, a free of command buffers or
+//! descriptor sets, a reset of an event something waits on, a reset of a
+//! fence still in flight. It waits for the queues' newest fences, never for
+//! the driver's queue idle, so every wait here is sliced and bounded.
 //! Device teardown waits for the device to go idle first, as vkr does.
 //!
 //! # Virtio-gpu fences on a queue's timeline
@@ -107,8 +119,8 @@
 //! [`VulkanContext::create_ring_fence`]: an empty submit with a host fence
 //! on the queue bound to the `ring_idx`, handed to that queue's fence thread
 //! ([`super::timeline`], which has the waiter model and its ADR-0005
-//! argument). Its host fence is the thread's alone, so it is not a
-//! [`Pending`] record: `settle` never waits on a fence another thread may be
+//! argument). Its host fence is the thread's alone, so it is not on the
+//! queue's [`Clock`]: `settle` never waits on a fence another thread may be
 //! destroying.
 
 use std::collections::HashMap;
@@ -117,11 +129,11 @@ use std::time::Duration;
 
 use crate::renderer::FenceOutcome;
 use crate::venus::protocol::{
-    Command, CreateFenceArgs, DeviceWaitIdleArgs, GetQueryPoolResultsArgs,
-    ImportSemaphoreResourceMESAArgs, QueueSubmitArgs, QueueWaitIdleArgs, VkDevice, VkFence,
-    VkFenceCreateInfo, VkQueue, VkSemaphore, VkSubmitInfo, VkSubmitInfoNext, WaitForFencesArgs,
-    WaitSemaphoreResourceMESAArgs, VK_ERROR_DEVICE_LOST, VK_ERROR_UNKNOWN, VK_NOT_READY,
-    VK_SUCCESS, VK_TIMEOUT,
+    Command, CreateFenceArgs, GetFenceStatusArgs, GetQueryPoolResultsArgs,
+    ImportSemaphoreResourceMESAArgs, QueueSubmitArgs, QueueWaitIdleArgs, ResetFencesArgs, VkDevice,
+    VkFence, VkFenceCreateInfo, VkQueue, VkSemaphore, VkSubmitInfo, VkSubmitInfoNext,
+    WaitForFencesArgs, WaitSemaphoreResourceMESAArgs, VK_ERROR_DEVICE_LOST, VK_ERROR_UNKNOWN,
+    VK_NOT_READY, VK_SUCCESS, VK_TIMEOUT,
 };
 use crate::venus::renderer::{FenceRetirer, RingFence};
 
@@ -129,7 +141,7 @@ use super::context::{id_error, invalid, ExecError, VulkanContext};
 use super::generated;
 use super::hold::Enqueued;
 use super::host::{HostVulkan, RawHandle};
-use super::objects::{Facts, Kind, Pending, SemaphoreState};
+use super::objects::{DoomedObject, Facts, Held, Kind, SemaphoreState};
 use super::timeline::QueueSync;
 
 #[cfg(doc)]
@@ -143,6 +155,14 @@ pub const WAIT_SLICE: Duration = Duration::from_millis(20);
 /// How long [`VulkanContext::settle`] waits on a fence in one go before it
 /// looks at the ring's stop signal again.
 const SETTLE_SLICE: Duration = Duration::from_millis(100);
+
+/// Most submits one queue's [`Clock`] has in flight. A submit past it first
+/// waits for the oldest, which is finite: no wait the driver holds is
+/// uncovered ([`super::hold`]). A frame of Zink is two or three.
+pub const MAX_CLOCK_IN_FLIGHT: usize = 256;
+
+/// Signalled clock fences one queue keeps for its next submits.
+const MAX_CLOCK_SPARE: usize = 16;
 
 /// `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT`: what an emulated wait blocks.
 const STAGE_ALL_COMMANDS: u32 = 0x1_0000;
@@ -281,10 +301,11 @@ impl<H: HostVulkan> VulkanContext<H> {
         }
     }
 
-    /// `vkQueueWaitIdle` on host queue `queue` of `device`.
-    fn host_queue_idle(&mut self, device: u64, queue: u64) -> i32 {
-        let mut command = Command::QueueWaitIdle(QueueWaitIdleArgs {
-            queue: VkQueue(queue),
+    /// `vkGetFenceStatus` on host fence `fence` of `device`.
+    fn host_fence_status(&mut self, device: u64, fence: u64) -> i32 {
+        let mut command = Command::GetFenceStatus(GetFenceStatusArgs {
+            device: VkDevice(device),
+            fence: VkFence(fence),
             ret: VK_ERROR_UNKNOWN,
         });
         match self.host_call(device, &mut command) {
@@ -293,43 +314,277 @@ impl<H: HostVulkan> VulkanContext<H> {
         }
     }
 
-    /// Wait for the work of queue `queue` to be done, in one slice of
-    /// `slice` at most when a fence stands for all of it. `Some(ret)` once
-    /// it is (the record then cleared), `None` if the slice ran out.
-    fn queue_idle_slice(&mut self, queue: u64, slice: Duration) -> Option<i32> {
-        let (device, host, pending) = match self.objects.queue(queue) {
-            Ok(q) => (q.device, q.host.raw(), q.pending),
-            Err(_) => return Some(VK_ERROR_UNKNOWN),
-        };
-        let ret = match pending {
-            Pending {
-                fence: None,
-                unfenced: false,
-            } => VK_SUCCESS,
-            Pending {
-                fence: Some((_, fence)),
-                unfenced: false,
-            } => {
-                let ret = self.host_wait_fences(device, &[fence], true, nanos(slice));
-                if ret == VK_TIMEOUT {
-                    return None;
-                }
-                ret
-            }
-            Pending { unfenced: true, .. } => self.host_queue_idle(device, host),
-        };
-        if let Ok(q) = self.objects.queue_mut(queue) {
-            q.pending = Pending::default();
+    /// Clock fences that have signalled: reset and kept for the next
+    /// submits, or destroyed past [`MAX_CLOCK_SPARE`] (and on a reset that
+    /// failed, when the driver says nothing more about them).
+    fn recycle_clock_fences(&mut self, queue: u64, device: u64, fences: Vec<u64>) {
+        if fences.is_empty() {
+            return;
         }
+        let room = self
+            .objects
+            .queue(queue)
+            .map_or(0, |q| MAX_CLOCK_SPARE.saturating_sub(q.clock.spare.len()));
+        let (keep, drop) = fences.split_at(room.min(fences.len()));
+        let mut reset = Command::ResetFences(ResetFencesArgs {
+            device: VkDevice(device),
+            fence_count: count_of(keep.len()),
+            p_fences: Some(keep.iter().copied().map(VkFence).collect()),
+            ret: VK_ERROR_UNKNOWN,
+        });
+        let kept = !keep.is_empty()
+            && self.host_call(device, &mut reset).is_ok()
+            && generated::result_of(&reset) == Some(VK_SUCCESS);
+        let destroy: Vec<u64> = if kept {
+            if let Ok(q) = self.objects.queue_mut(queue) {
+                q.clock.spare.extend_from_slice(keep);
+            }
+            drop.to_vec()
+        } else {
+            fences
+        };
+        if let Ok(d) = self.objects.device(device) {
+            for fence in destroy {
+                self.host.destroy_object(&d.host, Kind::Fence, fence);
+            }
+        }
+    }
+
+    /// A host fence for a mark: a spare, or a new one.
+    fn clock_fence(&mut self, queue: u64, device: u64) -> Option<u64> {
+        if let Some(fence) = self
+            .objects
+            .queue_mut(queue)
+            .ok()
+            .and_then(|q| q.clock.spare.pop())
+        {
+            return Some(fence);
+        }
+        let mut create = Command::CreateFence(CreateFenceArgs {
+            device: VkDevice(0),
+            p_create_info: Some(VkFenceCreateInfo {
+                p_next: Vec::new(),
+                flags: 0,
+            }),
+            p_fence: Some(VkFence(0)),
+            ret: VK_ERROR_UNKNOWN,
+        });
+        self.host_call(device, &mut create).ok()?;
+        match (&create, generated::result_of(&create)) {
+            (Command::CreateFence(a), Some(VK_SUCCESS)) => a.p_fence.map(|f| f.0),
+            _ => None,
+        }
+    }
+
+    /// Make sure a fence stands for `queue`'s newest serial: if none does,
+    /// a **mark** — an empty submit with a host fence of ours, which signals
+    /// once everything submitted before it has finished. `false` if the
+    /// driver would not take one (out of memory, or lost).
+    fn clock_mark(&mut self, queue: u64) -> bool {
+        let (device, host_queue, serial) = match self.objects.queue(queue) {
+            Ok(q) if q.clock.covered() => return true,
+            Ok(q) => (q.device, q.host.raw(), q.clock.submitted),
+            Err(_) => return false,
+        };
+        if !self.clock_room(queue) {
+            return false;
+        }
+        let Some(fence) = self.clock_fence(queue, device) else {
+            return false;
+        };
+        let mut submit = Command::QueueSubmit(QueueSubmitArgs {
+            queue: VkQueue(host_queue),
+            submit_count: 0,
+            p_submits: None,
+            fence: VkFence(fence),
+            ret: VK_ERROR_UNKNOWN,
+        });
+        let ok = self.host_call(device, &mut submit).is_ok()
+            && generated::result_of(&submit) == Some(VK_SUCCESS);
+        if let Ok(q) = self.objects.queue_mut(queue) {
+            if ok {
+                q.clock.in_flight.push_back((serial, fence, true));
+            } else {
+                q.clock.spare.push(fence);
+            }
+        }
+        ok
+    }
+
+    /// When the driver will not take a mark: the queue's idle, the one wait
+    /// left that needs no fence, and then everything is done.
+    fn clock_idle(&mut self, queue: u64) -> i32 {
+        let Ok((device, host_queue)) = self.objects.queue(queue).map(|q| (q.device, q.host.raw()))
+        else {
+            return VK_ERROR_UNKNOWN;
+        };
+        let mut idle = Command::QueueWaitIdle(QueueWaitIdleArgs {
+            queue: VkQueue(host_queue),
+            ret: VK_ERROR_UNKNOWN,
+        });
+        let ret = match self.host_call(device, &mut idle) {
+            Ok(()) => generated::result_of(&idle).unwrap_or(VK_ERROR_UNKNOWN),
+            Err(_) => VK_ERROR_UNKNOWN,
+        };
+        let done = self
+            .objects
+            .queue_mut(queue)
+            .map(|q| {
+                let submitted = q.clock.submitted;
+                q.clock.complete_through(submitted)
+            })
+            .unwrap_or_default();
+        self.recycle_clock_fences(queue, device, done);
+        ret
+    }
+
+    /// Before a mark of `queue`: with [`MAX_CLOCK_IN_FLIGHT`] fences
+    /// already standing, wait for the oldest, which is finite (no wait the
+    /// driver holds is uncovered, `super::hold`). Only a guest that destroys
+    /// behind hundreds of unfinished submits meets it. `false`: the ring is
+    /// being torn down.
+    fn clock_room(&mut self, queue: u64) -> bool {
+        loop {
+            let oldest = match self.objects.queue(queue) {
+                Ok(q) if q.clock.in_flight.len() >= MAX_CLOCK_IN_FLIGHT => {
+                    q.clock.in_flight.front().map_or(0, |(s, _, _)| *s)
+                }
+                _ => return true,
+            };
+            if self.clock_wait(queue, oldest, SETTLE_SLICE).is_none() && self.stopping() {
+                return false;
+            }
+        }
+    }
+
+    /// A submit of `queue` reached the driver: its serial, and the fence it
+    /// carried when the guest gave it one (`guest_fence`, the guest id, and
+    /// `host_fence`, its host handle). Past [`MAX_CLOCK_IN_FLIGHT`] standing
+    /// fences the newest guest fence stands in for the one before it, which
+    /// only makes the clock coarser, never wrong; past as many remembered
+    /// guest fences, a reset of any fence waits for the whole queue.
+    pub(super) fn clock_submitted(&mut self, queue: u64, guest_fence: u64, host_fence: u64) {
+        if let Ok(q) = self.objects.queue_mut(queue) {
+            q.clock.submitted += 1;
+            let serial = q.clock.submitted;
+            if guest_fence == 0 {
+                return;
+            }
+            if q.clock.in_flight.len() >= MAX_CLOCK_IN_FLIGHT
+                && q.clock.in_flight.back().is_some_and(|(_, _, ours)| !ours)
+            {
+                q.clock.in_flight.pop_back();
+            }
+            q.clock.in_flight.push_back((serial, host_fence, false));
+            if q.clock.guest_fences.len() >= MAX_CLOCK_IN_FLIGHT {
+                q.clock.guest_fences.remove(0);
+                q.clock.forgot_fences = true;
+            }
+            q.clock.guest_fences.push((guest_fence, serial));
+        }
+    }
+
+    /// Ask the driver, without waiting, how far every queue of `device` has
+    /// got; destroy what that finishes for the doomed. Answers whether any
+    /// clock moved.
+    pub(super) fn poll_clocks(&mut self, device: u64) -> bool {
+        let mut moved = false;
+        for queue in self.objects.queues_of(device) {
+            let in_flight: Vec<(u64, u64, bool)> = match self.objects.queue(queue) {
+                Ok(q) if q.clock.busy() => q.clock.in_flight.iter().copied().collect(),
+                _ => continue,
+            };
+            // Oldest first: a signalled fence covers every older one, and the
+            // first that has not signalled ends the look.
+            let mut reached = None;
+            for (serial, fence, _) in &in_flight {
+                if self.host_fence_status(device, *fence) != VK_SUCCESS {
+                    break;
+                }
+                reached = Some(*serial);
+            }
+            if let Some(serial) = reached {
+                let done = self
+                    .objects
+                    .queue_mut(queue)
+                    .map(|q| q.clock.complete_through(serial))
+                    .unwrap_or_default();
+                self.recycle_clock_fences(queue, device, done);
+                moved = true;
+            }
+        }
+        if moved {
+            self.objects.reap_doomed(&*self.host);
+        }
+        moved
+    }
+
+    /// Wait, one slice of `slice` at most, until `queue` has finished serial
+    /// `serial`. `Some(ret)` once it has (or the device is lost), `None` if
+    /// the slice ran out.
+    fn clock_wait(&mut self, queue: u64, serial: u64, slice: Duration) -> Option<i32> {
+        let standing = |ctx: &Self| match ctx.objects.queue(queue) {
+            Ok(q) if q.clock.completed >= serial => Err(VK_SUCCESS),
+            Ok(q) => Ok(q
+                .clock
+                .in_flight
+                .iter()
+                .find(|(s, _, _)| *s >= serial)
+                .map(|(_, f, _)| (q.device, *f))),
+            Err(_) => Err(VK_ERROR_UNKNOWN),
+        };
+        let (device, fence) = match standing(self) {
+            Err(ret) => return Some(ret),
+            Ok(Some(found)) => found,
+            // No fence stands for it yet: a mark does.
+            Ok(None) => {
+                if !self.clock_mark(queue) {
+                    return Some(self.clock_idle(queue));
+                }
+                match standing(self) {
+                    Err(ret) => return Some(ret),
+                    Ok(Some(found)) => found,
+                    Ok(None) => return Some(self.clock_idle(queue)),
+                }
+            }
+        };
+        let ret = self.host_wait_fences(device, &[fence], true, nanos(slice));
+        if ret == VK_TIMEOUT {
+            return None;
+        }
+        let done = self
+            .objects
+            .queue_mut(queue)
+            .map(|q| {
+                if ret == VK_SUCCESS {
+                    q.clock.complete_through(serial)
+                } else {
+                    // A lost device: nothing it had runs any more, and its
+                    // fences are not reused.
+                    let _ = q.clock.drain_fences();
+                    Vec::new()
+                }
+            })
+            .unwrap_or_default();
+        self.recycle_clock_fences(queue, device, done);
+        self.objects.reap_doomed(&*self.host);
         Some(ret)
     }
 
+    /// Wait for the work of queue `queue` to be done, in one slice of
+    /// `slice` at most. `Some(ret)` once it is, `None` if the slice ran out.
+    fn queue_idle_slice(&mut self, queue: u64, slice: Duration) -> Option<i32> {
+        let submitted = match self.objects.queue(queue) {
+            Ok(q) => q.clock.submitted,
+            Err(_) => return Some(VK_ERROR_UNKNOWN),
+        };
+        self.clock_wait(queue, submitted, slice)
+    }
+
     /// Wait until nothing submitted to `device` may still be running —
-    /// before anything that work may use is destroyed, freed or reset. See
-    /// the module docs. Gives up (and lets the destroy go ahead) only when
-    /// the ring is being torn down, whose context teardown waits for the
-    /// whole device anyway, or when the device is lost, when the driver
-    /// allows destroying everything.
+    /// before what must see that work finished acts (see the module docs).
+    /// Gives up only when the ring is being torn down, whose context teardown
+    /// waits for the whole device anyway; a lost device answers at once.
     pub(super) fn settle(&mut self, device: u64) {
         for queue in self.objects.queues_of(device) {
             loop {
@@ -345,9 +600,58 @@ impl<H: HostVulkan> VulkanContext<H> {
         }
     }
 
-    /// `vkResetFences`: a fence a queue's record stands on is waited for
-    /// first — resetting one still pending is the guest's error, and would
-    /// leave the record waiting on a fence nothing will signal.
+    /// `object`, just taken out of the table by a destroy or free of
+    /// `device`: destroyed on the host now if nothing submitted may still
+    /// use it, otherwise doomed until what was in flight has finished (see
+    /// the module docs). Never waits.
+    pub(super) fn retire_object(&mut self, device: u64, object: DoomedObject<H>, held: Held) {
+        self.poll_clocks(device);
+        let queues = self.objects.queues_of(device);
+        let mut marked = false;
+        for queue in &queues {
+            let Ok(q) = self.objects.queue(*queue) else {
+                continue;
+            };
+            if !q.clock.busy() || q.clock.covered() {
+                continue;
+            }
+            // Something must be able to say when the newest serial is done:
+            // a mark. A driver that will not take one is waited for
+            // instead, as before the clock.
+            if self.clock_mark(*queue) {
+                marked = true;
+            } else {
+                let _ = self.clock_idle(*queue);
+            }
+        }
+        if marked {
+            // A GPU with nothing left to do has reached the mark already.
+            self.poll_clocks(device);
+        }
+        let after: Vec<(u64, u64)> = queues
+            .into_iter()
+            .filter_map(|queue| {
+                self.objects
+                    .queue(queue)
+                    .ok()
+                    .filter(|q| q.clock.busy())
+                    .map(|q| (queue, q.clock.submitted))
+            })
+            .collect();
+        if after.is_empty() {
+            if let Ok(d) = self.objects.device(device) {
+                object.destroy(&*self.host, &d.host);
+            }
+            drop(held);
+            return;
+        }
+        self.objects.doom(device, after, object, held);
+    }
+
+    /// `vkResetFences`: a fence of a submit still in flight is waited for
+    /// first — resetting one still pending is the guest's error, and the
+    /// driver would then be handed an unsignalled fence a submit still
+    /// signals.
     pub(super) fn reset_fences(&mut self, command: &mut Command<'_>) -> Result<(), ExecError> {
         let Command::ResetFences(args) = command else {
             return Err(ExecError::NotImplemented {
@@ -356,15 +660,42 @@ impl<H: HostVulkan> VulkanContext<H> {
         };
         let device = args.device.0;
         let fences: Vec<u64> = args.p_fences.iter().flatten().map(|f| f.0).collect();
-        let tracked = self.objects.queues_of(device).into_iter().any(|q| {
+        // The newest serial each queue still has one of these fences on.
+        let tracked = |ctx: &Self| -> Vec<(u64, u64)> {
+            ctx.objects
+                .queues_of(device)
+                .into_iter()
+                .filter_map(|queue| {
+                    let q = ctx.objects.queue(queue).ok()?;
+                    q.clock
+                        .guest_fences
+                        .iter()
+                        .filter(|(id, serial)| *serial > q.clock.completed && fences.contains(id))
+                        .map(|(_, serial)| *serial)
+                        .max()
+                        .map(|serial| (queue, serial))
+                })
+                .collect()
+        };
+        let forgot = self.objects.queues_of(device).into_iter().any(|queue| {
             self.objects
-                .queue(q)
-                .ok()
-                .and_then(|q| q.pending.fence)
-                .is_some_and(|(id, _)| fences.contains(&id))
+                .queue(queue)
+                .is_ok_and(|q| q.clock.forgot_fences && q.clock.busy())
         });
-        if tracked {
+        if forgot {
+            // Too many fences in flight to have remembered them all.
+            self.poll_clocks(device);
             self.settle(device);
+        } else if !tracked(self).is_empty() {
+            // Usually the guest saw it signalled first: then asking is all.
+            self.poll_clocks(device);
+            for (queue, serial) in tracked(self) {
+                while self.clock_wait(queue, serial, SETTLE_SLICE).is_none() {
+                    if self.stopping() {
+                        break;
+                    }
+                }
+            }
         }
         self.pass_through(command)
     }
@@ -416,19 +747,10 @@ impl<H: HostVulkan> VulkanContext<H> {
                     return Ok(false);
                 }
                 args.ret = ret;
-                if ret == VK_SUCCESS && (args.wait_all != 0 || args.fence_count == 1) {
-                    // The host has seen these fences signalled: a queue whose
-                    // record stood on one of them has nothing left before it.
-                    let fences: Vec<u64> = args.p_fences.iter().flatten().map(|f| f.0).collect();
-                    for queue in self.objects.queues_of(device) {
-                        if let Ok(q) = self.objects.queue_mut(queue) {
-                            if !q.pending.unfenced
-                                && q.pending.fence.is_some_and(|(id, _)| fences.contains(&id))
-                            {
-                                q.pending = Pending::default();
-                            }
-                        }
-                    }
+                if ret == VK_SUCCESS {
+                    // The GPU got somewhere: what it finished may free the
+                    // doomed.
+                    self.poll_clocks(device);
                 }
                 Ok(true)
             }
@@ -501,23 +823,6 @@ impl<H: HostVulkan> VulkanContext<H> {
                     return Ok(false);
                 }
                 let queues = self.objects.queues_of(device);
-                let unfenced = queues
-                    .iter()
-                    .any(|q| self.objects.queue(*q).is_ok_and(|q| q.pending.unfenced));
-                if unfenced {
-                    let mut idle = Command::DeviceWaitIdle(DeviceWaitIdleArgs {
-                        device: VkDevice(device),
-                        ret: VK_ERROR_UNKNOWN,
-                    });
-                    self.host_call(device, &mut idle)?;
-                    args.ret = generated::result_of(&idle).unwrap_or(VK_ERROR_UNKNOWN);
-                    for queue in queues {
-                        if let Ok(q) = self.objects.queue_mut(queue) {
-                            q.pending = Pending::default();
-                        }
-                    }
-                    return Ok(true);
-                }
                 let mut ret = VK_SUCCESS;
                 for queue in queues {
                     match self.queue_idle_slice(queue, slice) {
