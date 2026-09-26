@@ -1030,7 +1030,10 @@ fn a_dma_buf_buffer_asks_for_our_pages_alone() {
         .unwrap()
         .memory_requirements
         .memory_type_bits;
-    assert_eq!(bits, 0x18, "types 3 and 4, our pages, and nothing else");
+    assert_eq!(
+        bits, 0x58,
+        "types 3 and 4, our pages, and 6, the visible VRAM of those pages, and nothing else"
+    );
     assert_eq!(
         host.host_memory_resources().last(),
         Some(&("buffer", true)),
@@ -1158,7 +1161,7 @@ fn an_import_of_our_own_blob_is_the_same_pages() {
     let (mut h, host) = zink();
     let pages = export(&mut h);
     let (ret, bits, size) = properties_of(&mut h, EXPORTED_RES);
-    assert_eq!((ret, bits, size), (VK_SUCCESS, 0x18, SIZE));
+    assert_eq!((ret, bits, size), (VK_SUCCESS, 0x58, SIZE));
     h.send(&allocate(
         DEVICE,
         0x710,
@@ -1193,6 +1196,49 @@ fn an_import_of_our_own_blob_is_the_same_pages() {
     };
     h.send(&bind_buffers(DEVICE, &[(0x711, 0x710, 0)])).unwrap();
     assert!(!h.fatal());
+}
+
+/// The visible-VRAM type (6, `policy::visible_vram`, ADR-0004 2026-09-26)
+/// is our pages like type 3: exported, its blob is a page blob; imported as
+/// type 6, the host imports the same pages as type 3.
+#[test]
+fn the_visible_vram_type_exports_and_imports_as_the_pages_it_is() {
+    const VRAM_TYPE: u32 = 6;
+    let (mut h, host) = zink();
+    h.send(&allocate(
+        DEVICE,
+        EXPORTED,
+        SIZE,
+        VRAM_TYPE,
+        vec![export_info()],
+    ))
+    .expect("an export allocation of visible VRAM");
+    h.memory_blob(CTX, EXPORTED_RES, EXPORTED, SIZE)
+        .expect("a page blob, not a handle blob");
+    h.renderer
+        .map_blob(EXPORTED_RES, MAP_AT, SIZE)
+        .expect("mappable");
+    let pages = h.renderer.blob_pages(EXPORTED_RES).expect("its pages");
+    assert_eq!(host.live_shared_handles(), 0);
+    let (ret, bits, size) = properties_of(&mut h, EXPORTED_RES);
+    assert_eq!((ret, bits, size), (VK_SUCCESS, 0x58, SIZE));
+    h.send(&allocate(
+        DEVICE,
+        0x740,
+        SIZE,
+        VRAM_TYPE,
+        vec![import_info(EXPORTED_RES)],
+    ))
+    .expect("the import");
+    assert!(!h.fatal());
+    let allocations = host.allocations();
+    assert_eq!(
+        allocations[allocations.len() - 2..],
+        [(HOST_TYPE, SIZE, true), (HOST_TYPE, SIZE, true)],
+        "both are imports of our pages as type 3"
+    );
+    let last = host.imports().pop().expect("an import reached the host");
+    assert_eq!(last.addr, pages.host_addr(), "the same pages");
 }
 
 #[test]
@@ -1286,7 +1332,7 @@ fn another_context_imports_the_blob_only_once_it_is_attached_and_the_pages_outli
     h.renderer.ctx_attach_blob(2, EXPORTED_RES, true);
     assert_eq!(
         properties_of(&mut h, EXPORTED_RES),
-        (VK_SUCCESS, 0x18, SIZE)
+        (VK_SUCCESS, 0x58, SIZE)
     );
     h.send(&allocate(
         DEVICE,

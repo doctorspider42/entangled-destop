@@ -472,7 +472,7 @@ fn the_host_visible_budget_is_renderer_wide_and_answered_in_vulkan_terms() {
         call(&mut h, MEMORY + 4, 1 << 40, DEVICE_LOCAL_TYPE),
         VK_ERROR_OUT_OF_DEVICE_MEMORY
     );
-    assert_eq!(call(&mut h, MEMORY + 5, SIZE, 6), VK_ERROR_UNKNOWN);
+    assert_eq!(call(&mut h, MEMORY + 5, SIZE, 7), VK_ERROR_UNKNOWN);
     assert_eq!(call(&mut h, MEMORY + 6, SIZE, 31), VK_ERROR_UNKNOWN);
 
     // Freeing gives it back; a second context shares the same budget.
@@ -759,7 +759,8 @@ fn an_image_the_driver_cannot_import_for_never_sees_a_host_visible_type() {
             .expect("filled")
             .memory_requirements
             .memory_type_bits,
-        0x3f
+        0x7f,
+        "the host's 0x3f, and 6: the visible VRAM of type 3's pages"
     );
     assert_eq!(
         host.host_memory_resources(),
@@ -1030,7 +1031,7 @@ fn the_device_level_requirements_are_checked_and_filtered_like_the_objects() {
         panic!("wrong reply")
     };
     let r = r.p_memory_requirements.expect("filled").memory_requirements;
-    assert_eq!((r.size, r.alignment, r.memory_type_bits), (1024, 256, 0x3f));
+    assert_eq!((r.size, r.alignment, r.memory_type_bits), (1024, 256, 0x7f));
 
     let image = Command::GetDeviceImageMemoryRequirements(GetDeviceImageMemoryRequirementsArgs {
         device: VkDevice(DEVICE),

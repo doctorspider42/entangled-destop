@@ -558,7 +558,27 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
 - A guest needs its GL sent to Zink and its idle blank off for the desktop.
   `install ubuntu --venus` writes both through the autoinstall
   (`seed::venus_late_commands`). An existing guest is configured by hand, as
-  the user guide's "A GPU-accelerated desktop" says.
+  the user guide's "A GPU-accelerated desktop" says. Zink needs **two**
+  switches: `/etc/drirc` for the system's Mesa, and
+  `MESA_LOADER_DRIVER_OVERRIDE=zink` in the session's `environment.d` for a
+  snap's own Mesa, which a `DRIRC_CONFIGDIR` in its wrapper keeps from ever
+  reading `/etc/drirc` (ADR-0004, the 2026-09-26 amendment on Firefox).
+- **The guest always has `DEVICE_LOCAL | HOST_VISIBLE` memory.** Hiding the
+  BAR type (WHP cannot back a guest mapping with the driver's BAR) left the
+  RTX 2070 with none, and Zink then maps buffers it put in plain device-local
+  memory (a persistent or write-only `zink_buffer_map` of a `DEFAULT` or
+  `DYNAMIC` buffer; Mesa 25.2.8, 26.0.8 and main alike): the blob is refused,
+  `vkMapMemory` fails and the application writes through NULL.
+  `policy::visible_vram` appends one `DEVICE_LOCAL | HOST_VISIBLE |
+  HOST_COHERENT` type in a device-local heap of its own (512 MiB, capped at
+  the host-visible share), backed by our pages imported as the first
+  coherent host-visible type. It is the **only guest type index that is not
+  the host's**: allocate and import through `GuestDevice::host_type`, and
+  turn every host `memoryTypeBits` into guest terms through
+  `GuestDevice::guest_bits` (which `memory::guest_type_bits` does). A new
+  path that hands the host a guest type index, or the guest a host bit mask,
+  without them is a bug that the fake tests in `executor::vram_tests` catch
+  only if you add a case.
 - **Clients present through dma-buf** (ADR-0004, S5) on a host that exports
   device-local memory: `policy::GuestWsi` shows an NVIDIA driver at venus's
   590.48.1 gate, and swapchains are S1's canonical LINEAR images. Two traps

@@ -417,6 +417,12 @@ finished machine:
 - the guest gets `/etc/drirc` sending every GL client on a virtio-gpu device to
   Zink (without it Mesa picks the virgl driver, which this renderer does not
   serve, and GNOME falls back to software);
+- the desktop session gets `MESA_LOADER_DRIVER_OVERRIDE=zink`, from
+  `/etc/environment.d/90-entangled-venus.conf`. Snaps need it: Firefox is a
+  snap that brings its own Mesa, and that Mesa never reads `/etc/drirc`, so
+  without the variable Firefox draws in software. With it, `about:support`
+  says `WebRender` (not `WebRender (Software)`) and WebGL runs on `zink
+  Vulkan 1.3(Virtio-GPU Venus (…))`;
 - GNOME's idle blank is turned off, by a GSettings default
   (`/usr/share/glib-2.0/schemas/90_entangled-venus.gschema.override`,
   `idle-delay 0`). **Keep it off.** A blanked GNOME on Zink keeps every
@@ -467,7 +473,16 @@ printf '%s\n' '[org.gnome.desktop.session]' 'idle-delay=uint32 0' \
   > /usr/share/glib-2.0/schemas/90_entangled-venus.gschema.override
 glib-compile-schemas /usr/share/glib-2.0/schemas
 usermod -aG render "$USER_NAME"
+mkdir -p /etc/environment.d
+printf '%s\n' 'MESA_LOADER_DRIVER_OVERRIDE=zink' \
+  > /etc/environment.d/90-entangled-venus.conf
 ```
+
+A guest installed with `--venus` before 2026-09-26 has everything but the last
+file. Add it as above and log out and in again (or reboot) to put Firefox on
+the GPU; the host side needs a build from that date or later too, whose guests
+see a `DEVICE_LOCAL | HOST_VISIBLE` memory type (`vulkaninfo` lists it last),
+because Firefox's Zink crashes without one.
 
 ```xml
 <driconf>
@@ -1151,7 +1166,7 @@ configuration:
 | `entangled fetch firmware`, `bash guest/firmware/build-cloudhv.sh`, `scripts/fetch-ubuntu-iso.sh`, `scripts/fetch-fedora-iso.sh` | the commands' own documented invocations; the fetch was run end to end against the published layout on 2026-09-09, and the firmware and the Ubuntu ISO were both present and used on the machine this guide was written on |
 | `entangled fetch debian …`, `install debian …` | from the CLI's help output and the Debian install path's documentation; not re-run for this guide |
 | `entangled install ubuntu --iso <desktop iso> …` | the server command with the flags the CLI documents; the Desktop variant is what `tests/boot/tests/desktop_gnome.rs` boots, but this exact line was not re-run for the guide |
-| `entangled install ubuntu --iso <desktop iso> … --auto --venus --headless` | run end to end on Windows (RTX 2070) from the Ubuntu 26.04.1 Desktop ISO, twice on 2026-09-25: 10 min 38 s, then 11 min 41 s with the 1920×1080 / half-the-host profile. The second wrote `vcpus = 8` on a 24-thread host and printed the `machine:` line quoted above; its first boot reached GDM on the GPU at 1920×1080 with 8 CPUs up (ADR-0004, "installed profiles"). The four late-commands are also pinned byte for byte by `seed::tests::venus_late_commands_are_exact_and_first` |
+| `entangled install ubuntu --iso <desktop iso> … --auto --venus --headless` | run end to end on Windows (RTX 2070) from the Ubuntu 26.04.1 Desktop ISO, twice on 2026-09-25: 10 min 38 s, then 11 min 41 s with the 1920×1080 / half-the-host profile. The second wrote `vcpus = 8` on a 24-thread host and printed the `machine:` line quoted above; its first boot reached GDM on the GPU at 1920×1080 with 8 CPUs up (ADR-0004, "installed profiles"). The late-commands (six since 2026-09-26) are also pinned byte for byte by `seed::tests::venus_late_commands_are_exact_and_first` |
 | `[display] venus = true`, the `3D` lines of `entangled doctor` | the profile key: a copy of the Venus guest's profile with only `venus = true` added, run on Windows/WHP without `ENTANGLED_VENUS`. It logged `attaching the Venus EXECUTING renderer … source=[display] venus = true`, and `gnome-shell` mapped `libvulkan_virtio`. The doctor output is this machine's (RTX 2070), pasted as printed |
 | `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All` | the standard Windows spelling of the feature this project requires; the feature is enabled on the development host |
 | the clock-drift numbers | `cargo test -p boot-tests --test soak -- --ignored --nocapture` on the Linux host and `cargo test -p vmm-core --test whp_clock -- --nocapture` on the Windows one, plus three 900 s control runs pinning the guest to `tsc`, `kvm-clock` and `acpi_pm`, and three measurements of the WSL host's own clock against Windows QPC and against its wall clock; the numbers are those runs' own output, and both tests pass |

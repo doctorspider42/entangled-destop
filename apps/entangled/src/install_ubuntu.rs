@@ -349,7 +349,8 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     if args.venus {
         println!(
             "gpu:        [display] venus = true — GNOME and every GL client on Zink over the \
-             host GPU (the guest's /etc/drirc), no idle blank"
+             host GPU (the guest's /etc/drirc, and its session environment for snaps), no idle \
+             blank"
         );
     }
     Ok(())

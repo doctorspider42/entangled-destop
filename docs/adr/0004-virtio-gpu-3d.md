@@ -6477,7 +6477,281 @@ warning or fatal line on the host in any of them.
   non-host-visible type is understood. A guest memory table with a real
   `DEVICE_LOCAL | HOST_VISIBLE` type would sidestep that fallback, but WHP
   cannot back guest mappings with the driver's BAR memory (the 2026-09-23
-  amendment), so there is none to offer.
+  amendment), so there is none to offer. *Closed the same day by the next
+  amendment: the type is offered, and it is our pages; the mapping was not
+  Zink 25.2's alone (26.0.8 and main have the same code), and the snap's
+  Mesa reaches Zink through the session's environment.*
 - An X11 Firefox started from its desktop icon inherits the same launcher.
   On this desktop that is Wayland Firefox, which is the default and works. An
   X11 Firefox needs the launcher bypass above.
+
+## Amendment, 2026-09-26 — Firefox on the GPU: device-local memory the guest may map, and Zink for the session's snaps
+
+The amendment above left Firefox in software, for two reasons that turned
+out to be independent: the snap's Mesa never chose Zink, and when forced to,
+Zink mapped memory that was not host visible. Both are fixed here, one on
+each side. Firefox (snap 154.0, rev 8763, Mesa 25.2.8 from `gpu-2404`) now
+composites with hardware WebRender, and its WebGL runs on `zink Vulkan
+1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070) (MESA_VENUS))`.
+
+### Why the snap's Mesa never chose Zink
+
+The snap's command chain runs `$SNAP/gpu-2404/bin/gpu-2404-provider-wrapper`,
+which exports `DRIRC_CONFIGDIR=$SNAP/gpu-2404/drirc.d` so that its Mesa finds
+its own defaults (read in the guest: `snap run --shell firefox -c env`). Mesa's
+driconf then reads that directory **instead of** both `$datadir/drirc.d` and
+`/etc/drirc` (`xmlconfig.c:1261-1267`, `driParseConfigFiles`, the same in
+25.2.8 and 26.0.8), and only `$HOME/.drirc` besides, where `HOME` is
+`~/snap/firefox/common`. `/etc/drirc` is readable inside the snap; it is simply
+not asked. The loader's choice runs in this order: `MESA_LOADER_DRIVER_OVERRIDE`,
+then driconf's `dri_driver`, then the PCI table, then the kernel driver's name
+(`loader_get_driver_for_fd`, `loader.c:765-790` in 25.2.8). For `virtio_gpu`
+that is virgl, whose winsys finds `No virgl contexts available on host` (we
+serve Venus only), and EGL falls back to swrast. So the fix has to come
+before driconf, or into the snap's `$HOME`.
+
+### Why forced Zink crashed
+
+Zink asks for `DEVICE_LOCAL | HOST_VISIBLE` memory for every buffer of
+`PIPE_USAGE_DEFAULT` and `PIPE_USAGE_DYNAMIC` (`zink_resource.c:1218-1225` in
+25.2.8; `:1215-1222` in 26.0.8): glBufferData's static and dynamic hints, and
+glBufferStorage without `CLIENT_STORAGE`. When the device has no such type,
+the heap map copies the plain device-local types into that heap
+(`zink_screen.c:3401-3418`; `:3479-3496`), and the allocation lands in
+memory that cannot be mapped. The resource is then marked
+`!host_visible` and `DONT_MAP_DIRECTLY`, but `zink_buffer_map`
+(`zink_resource.c:2319-2481`) sends only a discard or a read through a
+staging buffer. A write-only map without a discard, or any persistent map,
+falls through to `map_resource`, whose `assert(res->obj->host_visible)` is
+compiled out of a release build. That is `vkMapMemory` of device-local
+memory, `ZINK: vkMapMemory failed (VK_ERROR_MEMORY_MAP_FAILED)`, a NULL
+mapping handed to the application, and Firefox's status 11. Venus adds
+nothing of its own: `vn_physical_device_init_memory_properties` passes the
+renderer's types through (identical in 25.2.8 and 26.0.8), and `vn_MapMemory2`
+does not check the type; it asks for a blob, which we refuse, and returns
+`VK_ERROR_MEMORY_MAP_FAILED`. Which of the two maps Firefox made was not
+traced. The allocation was 2 MiB, not dedicated, of type 1, and its blob
+followed 2 ms later.
+
+So the answer to "a Zink 25.2 bug, or an assumption that a DL|HV type
+exists?" is both, and it is not 25.2's alone. `zink_bo.c`, `zink_resource.c`
+and `zink_screen.c` of 25.2.8 (fetched from the `mesa-25.2.8` tag, which
+matches the three files the earlier session had) differ from 26.0.8 in 69,
+87 and 257 diff lines, none of them in the heap map, the buffer heaps or
+this map path, and Mesa main is the same. The fallback exists, so Zink
+tolerates the table when it *allocates*; the map path assumes the table has
+the type. Every real device does: a non-ReBAR desktop GPU has its 256 MiB
+BAR, a ReBAR one its whole VRAM, and an integrated GPU, lavapipe and the
+RTX 2070 on the host all have one. The system Mesa's Zink would crash
+Firefox in the same way. GNOME, GTK and glmark2 never map a `DEFAULT`
+buffer like that, which is why the desktop never showed it.
+
+### Options
+
+| option | verdict |
+|---|---|
+| a `DEVICE_LOCAL \| HOST_VISIBLE \| HOST_COHERENT` type of **our pages** | **chosen** (below) |
+| the host's BAR type (5) for real | refused: WHP cannot back a guest mapping with it reliably — guest reads at ~2000 ticks a dword and one run placed it in system memory (2026-09-23) — and the VMM would not own the pages its partition maps |
+| real VRAM with a host-visible shadow | refused: `HOST_COHERENT` means a guest write is visible to the next submit with no flush, so every mapped range would be copied to VRAM at every submit (the guest's writes cannot be seen without dirty tracking), and GPU writes copied back at every fence; the cost and the races are the renderer's for every mapped buffer |
+| only the guest side: get the snap's Mesa to Zink | necessary, not sufficient: with it and today's memory table Firefox dies at start (measured below, the `36c7d85` build) |
+| no guest-side change, a newer `gpu-2404` | nothing to wait for: the map path is unchanged on main |
+
+### The type (`policy::visible_vram`)
+
+When the table the guest sees (`guest_memory`) has no `DEVICE_LOCAL |
+HOST_VISIBLE` type, `expose` appends one: flags `0x7`, in a `DEVICE_LOCAL` heap
+of its own, both after the host's (RTX 2070: **type 6, heap 3**). It is our
+pages, imported as the first type the guest sees as `HOST_VISIBLE |
+HOST_COHERENT` (type 3). It is the only guest type index that is not the
+host's: `GuestDevice::host_type` turns it into its backing type wherever the
+executor allocates or imports, and `GuestDevice::guest_bits` sets its bit in
+every host `memoryTypeBits` that has the backing type's, so a resource that
+may take type 3's pages may take type 6 and nothing else may. Nothing is
+appended on a device that already has such a type, has no coherent
+host-visible type, or has a full table.
+
+- **Allocation choices.** Appended last, it is the first choice only of an
+  allocator that asks for device-local and host-visible memory together:
+  Zink's `DEVICE_LOCAL_VISIBLE` heap (buffers of `DEFAULT` and `DYNAMIC`
+  usage), and a VMA-style "device local, preferably mappable" request. Every
+  first-match allocator still finds VRAM first for device-local memory (Zink's
+  image heap map is `[1, 2, 5, 6]`, Mesa's WSI, `vn_feedback`) and types 3 and
+  4 first for host-visible memory (Zink's staging heap is `[3, 4, 6]`). **Render
+  targets never land here** on the RTX 2070: an optimal image cannot take our
+  pages, so its bits never include type 3 or 6. What moves is what real
+  non-ReBAR hardware puts in its BAR: Zink's vertex, index, uniform and
+  dynamic buffers, now in system memory the GPU reads over PCIe, as on an
+  integrated GPU. Vulkan's ordering rule holds: no earlier type is a strict
+  superset of `0x7`.
+- **The heap's size** is `VISIBLE_VRAM_HEAP_BYTES`, 512 MiB, capped at the
+  context's host-visible share by `guest_heaps` (a device-local heap that
+  holds nothing but our pages is the host-visible share's, not the
+  device-local share's). 512 is chosen against two thresholds Zink reads off
+  this heap: at or under 256 MiB on an NVIDIA `driverID` it releases its whole
+  buffer cache before every small allocation there (`zink_bo.c:622-630`, the
+  same in both versions), which here would turn cached pages into fresh
+  imports, and past 90 % of the largest device-local heap it assumes ReBAR and
+  maps every buffer directly (`zink_screen.c:3420-3428`). It adds 80 % of
+  itself to Zink's memory-pressure backstop and leaves the smallest buffer heap
+  (`get_smallest_buffer_heap`, the BAR's 120 MiB) where it was.
+- **Accounting** (`limits`): an allocation of it is charged to the context's
+  host-visible share, like types 3 and 4, and never to device-local memory.
+  There is no separate cap at the heap's size. Zink does not budget its heaps,
+  and a refused allocation is asynchronous (Mesa allocates without a reply),
+  so a tighter cap would only end contexts sooner. The heap the guest is told
+  is a promise below what it gets, never above.
+- **What a heavy GL client now costs**: its `DEFAULT` buffers meet the
+  host-visible share (1 GiB per context, 2 GiB in all) instead of its
+  device-local share (4.4 GiB). The desktop is far from it: the peaks of the
+  Firefox + GNOME + glmark2 boot below were 136 MB of our pages renderer-wide
+  and 62 MB in one context.
+
+A `vkMapMemory` of device-local memory that is not host visible — types 1, 2
+and 5 — is still refused at its blob, as it must be.
+
+### Zink for the session's snaps (`seed::VENUS_ENVIRONMENT_D`)
+
+`install ubuntu --venus` now writes `/etc/environment.d/90-entangled-venus.conf`
+with `MESA_LOADER_DRIVER_OVERRIDE=zink` (after a `mkdir -p`: Ubuntu ships no
+`/etc/environment.d`). The user manager reads it at every login, so
+gnome-shell, Xwayland and everything launched from the desktop inherit it,
+and snapd passes it into a snap unchanged. It sits beside the drirc, which
+keeps covering the system Mesa outside the session (a serial or SSH login).
+
+- **Why this and not the alternatives.** `~/snap/firefox/common/.drirc` is
+  per user and per snap, and the installer would have to create a snap's home
+  before the snap ever ran. `gpu-2404` has no provider setting for the
+  driver, and `snap set` has no environment. `/etc/environment` would reach
+  every PAM login, which is broader than the desktop needs.
+- **Side effects.** The override is not scoped to `virtio_gpu` the way the
+  drirc is, but on this guest the two say the same for every system GL
+  client: Zink. What is new is the snaps (Firefox, and any `gpu-2404` or
+  `gnome-4x` snap) and Chromium-based applications, whose ANGLE reaches Mesa
+  through EGL (none on this image). A session without Venus under it (a 2D or
+  virgl profile) meets the fallback the drirc already has: Zink finds no
+  Vulkan device and Mesa uses software. **Never set the variable empty**: Mesa
+  25.2.8's loader takes an empty override as a driver name (26.0.8 ignores it).
+  To get the snap's own choice back for one application, `env -u
+  MESA_LOADER_DRIVER_OVERRIDE`.
+- **Existing disks** need the file by hand (the user guide's "An existing
+  machine"), then a new login.
+
+### Tests
+
+- `vram_tests` (fake host): the table the guest is told (7 types, `0x7` last in
+  a device-local heap of 512 MiB, the ordering rule); an allocation of type 6
+  imported as type 3, bound, mapped as the same pages, charged to the
+  host-visible share with no device-local byte, and kept by its mapping after
+  a free; plain device-local and BAR slabs still refused a blob; optimal
+  images and buffers the driver will not import for never offered type 6, and
+  a bind outside the bits fatal; one share for heaps 1 and 3 together, the
+  heap equal to a small share; type 6 refused in Vulkan terms when its backing
+  type will not take the pages.
+- `ext_tests::the_visible_vram_type_exports_and_imports_as_the_pages_it_is`: a
+  dma-buf export of type 6 is a page blob, and its import as type 6 is the same
+  pages as type 3.
+- `policy::tests`: the RTX 2070 given type 6 / heap 3 / backing 3, the heap at
+  the share, the backstop; no type where one exists, where nothing can back it,
+  or with a full table; `host_type` and `guest_bits`.
+- Updated for the new table: `tests::the_whole_vulkaninfo_bring_up…`, two
+  `memory_tests` and three `ext_tests` (`memoryTypeBits` gain bit 6).
+- Real GPU (self-skipping without one):
+  `host_vulkan::tests::the_bring_up_runs_on_the_host_gpu…` asserts the appended
+  type and its heap on the host's own table, and
+  `the_host_gpu_fills_a_buffer_and_the_guest_reads_it_through_the_blob` now
+  runs type 6 through the whole path — on the RTX 2070, 16 384 words written
+  by the GPU into a type-6 buffer and read back through the blob, 0 wrong.
+- `seed::tests`: the six late-commands byte for byte, their folding, and the
+  environment file's lines as `environment.d(5)` requires.
+
+### Guest acceptance
+
+WHP, RTX 2070 (driver 580.88), Ubuntu 26.04 guest (4 vCPUs, 4 GiB, GNOME on
+Zink), profile `venus-ubuntu-net-profile.toml`. VMware Player was running on
+the host throughout (`vmware-vmx`, `mksSandbox`); the GPU sat at P8/P5
+(300–780 MHz). Four boots under `F:\VMs\Entangled\ffz\` (`run1`–`run4new`),
+driven by `scratchpad/ffz/drive.ps1` with the guest script and pages in
+`F:\VMs\Entangled\probes\ffz\`. Firefox runs in the desktop session with a
+fresh profile per launch, Wayland unless noted. Each page reports its rAF
+frame statistics over 10 s after 3 s of warm-up. CPU is the guest's
+`/proc/stat` and Firefox's processes over the same 10 s, and the VMM
+process's host CPU time over that window. The window is about 1280×970, so
+the pages are cropped.
+
+`about:support` (`run2\plain2-support.png`, `run1\zink-support.png`):
+**Compositing `WebRender`**, WebGL renderer `zink Vulkan 1.3(Virtio-GPU Venus
+(NVIDIA GeForce RTX 2070) (MESA_VENUS))`, 4.6 core, Mesa 25.2.8. In software
+(`run2\llvm-support.png`): `WebRender (Software)`, `llvmpipe (LLVM 20.1.2,
+256 bits)`.
+
+| page | llvmpipe (the snap's own choice) | Zink on Venus (as installed now) |
+|---|---|---|
+| WebGL 2, 4096 instanced triangles, 1600×900 canvas | **12.8 fps**, p95 150 ms; guest 84.6 %, Firefox 2.89 cores; VMM 3.58 cores | **54.6 / 56.1 fps**, p95 17–33 ms; guest 36–44 %, Firefox 0.69–0.95; VMM 2.19–2.91 |
+| the same on X11 (launcher bypass) | — | 57.7 fps, p95 17 ms, two X windows; guest 45.8 %, Firefox 0.77 |
+| the old WebGL page (a triangle, fps from page load) | 35.5 / 36.3 fps; guest 66–68 %, Firefox 1.92–2.02; VMM 3.04–3.13 | 33.1 fps; guest 38.1 %, Firefox 0.71; VMM 2.46 |
+| CSS: 180 animated boxes, blur, backdrop-filter | 59.7 / 51.7 fps, p95 21–33 ms; guest 42–52 %, Firefox 1.31–1.63; VMM 1.91–2.13 | **47.4 / 42.2 / 39.9 fps**, p95 40–52 ms; guest 43–58 %, Firefox 1.00–1.11; VMM 2.63–3.19 |
+| VP8 1280×720 video at 1600×900 | 59.5 fps, 16 of 300 frames dropped; guest 83 %, Firefox 1.42; VMM 3.14 | 59.6 fps, 6–8 of 302 dropped; guest 73–78 %, Firefox 1.27; VMM 3.14–3.22 |
+| scrolling, 1500 rows, 12 px a frame | 58.0 fps, p95 24 ms; guest 64 %, Firefox 1.61; VMM 3.05 | 56.6 / 57.1 fps, p95 25–27 ms; guest 71 %, Firefox 1.33; VMM 3.35–3.51 |
+
+Screenshots of each, taken during its measurement, are `run2\<mode>-<page>.png`
+and `run4new\x11-webgl.png`. Every page rendered correctly, and the burst
+frames looked at (`run2\shot-0070` to `-0090`, one every 3 s across the four
+pages) show no tear.
+
+- **WebGL is the win**: 4.3× the frame rate at a third of the guest's CPU.
+  The old page's triangle is too light to separate the two; its number
+  includes page load and, on Zink, pipeline creation through the ring, and
+  its CPU is where the difference shows.
+- **CSS is slower on the GPU**, by 20–30 %, at no lower CPU. The GPU was at
+  P5 and 37 % busy (`run4new`, `GPUCLK`), so it is not throughput. The likely
+  cost is round trips inside each frame (every Zink flush and fence wait is
+  a ring round trip, 0.4 ms at best, the 2026-09-25 amendment), not measured
+  here. It is the open item below.
+- **Video and scrolling are even**, with fewer dropped video frames on the
+  GPU.
+
+**The guest half alone is not enough.** The same disk (environment file in
+place) on the build before this change, `36c7d85` (`run3base`): Firefox exits
+at start with `ZINK: vkMapMemory failed (VK_ERROR_MEMORY_MAP_FAILED)`, and the
+guest's dmesg shows `response 0x1205 (command 0x10c)` seven times.
+
+**The environment is the session's.** After a reboot with the file in place,
+the user manager and gnome-shell's own environment carry
+`MESA_LOADER_DRIVER_OVERRIDE=zink` (`RPTC`), and a Firefox launched with no
+variable of its own maps `libvulkan_virtio` and reports Zink.
+
+**The desktop and the other clients are unchanged or better.** The same boot
+order on each build (`run3base`, then `run4new`):
+
+| | `36c7d85` | this change |
+|---|---|---|
+| glmark2 `build`, two runs | 643, 642 | **762, 743** |
+| glmark2 `jellyfish`, two runs | 652, 664 | **763, 747** |
+| VMM during glmark2 | 2.65–2.75 cores | 2.82–2.96 cores |
+| GNOME composite during glmark2 (virtio-gpu pacing) | 59.3 fps, min 54.8 | 59.1 fps, min 52.6 |
+| vkcube: composite / VMM | 59.7 fps / 1.20 cores | 59.8 fps / 0.98 cores |
+| idle desktop, VMM | 0.03 cores | 0.04–0.05 cores |
+
+`run2` scored `build` 735 and 798, `jellyfish` 762 and 789. The glmark2 gain is
+the likely effect of Zink mapping its dynamic buffers directly instead of
+staging them. It was not isolated further.
+
+The host logs have no fatal line, no refused map (no `0x1205` in any guest
+dmesg on this build), and nothing at `WARN` but the guest's own virtio-snd
+`PREPARE` misuse and the `WHvCancelRunVirtualProcessor` lines at power-off,
+both present before this change (`ff\shared`, `ff\diag5`).
+
+### Still open
+
+- **CSS-heavy pages are slower in hardware WebRender than in software**
+  (above). Measure where a frame's time goes (ring round trips, fence waits,
+  presentation) before changing anything; the GPU's idle clocks
+  (2026-09-25) may be part of it.
+- **Existing disks** installed with `--venus` before this change need the
+  environment file by hand and a new login. `F:\VMs\Entangled\venus-ubuntu.raw`
+  has it now (written by `run1`).
+- An X11 Firefox still needs the launcher bypass (above); on X11 it is on Zink
+  too.
+- The old page's rate stays in the 30s on both paths (the amendment above
+  measured 36–45 in software). Its number counts from page load, and it was
+  not investigated further.
