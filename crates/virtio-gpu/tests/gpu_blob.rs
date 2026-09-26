@@ -2048,6 +2048,38 @@ mod renderer_blob_scanout {
         assert!(!h.needs_reset());
     }
 
+    /// A compositor flipping between two scanout buffers A, B, A with
+    /// partial damage: every flip reaches the display as the buffer flushed,
+    /// with the damage exactly as the guest sent it. That damage is frame
+    /// damage — relative to the frame shown before, whichever buffer it was
+    /// in — and the display's texture holds that frame
+    /// (`display::shared::copy_region`), so the device must neither widen nor
+    /// narrow it per buffer.
+    #[test]
+    fn a_flip_between_buffers_hands_each_flush_its_own_damage() {
+        let (mut h, log, presenter) = sharing(8, 6);
+        assert_ok(&h.run(&scanout_buffer(53, 1)));
+        assert_ok(&h.run(&scanout_buffer(54, 1)));
+        let visible = rect(0, 0, 8, 6);
+        let flips = [
+            (53, visible),
+            (54, rect(2, 1, 3, 2)),
+            (53, rect(5, 3, 2, 2)),
+            (54, rect(0, 5, 8, 1)),
+        ];
+        for (id, damage) in flips {
+            assert_ok(&h.run(&flip(id, 8, 6, 32)));
+            assert_ok(&h.run(&resource_flush(id, damage)));
+            // A flush of the buffer that is *not* on screen reaches nobody.
+            let other = if id == 53 { 54 } else { 53 };
+            assert_ok(&h.run(&resource_flush(other, visible)));
+            assert_eq!(frames(&presenter), vec![(id, visible, damage)]);
+        }
+        assert!(reads(&log).is_empty(), "no flip was read back");
+        assert_eq!(ended(&log), leases(&log), "every lease's claim ended");
+        assert!(!h.needs_reset());
+    }
+
     /// The display's refusals: one for now serves that flush through the copy
     /// path and the next flush asks again; one for good serves it through
     /// the copy path and no lease is ever asked again (until a reset). A

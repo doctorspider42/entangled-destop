@@ -4003,6 +4003,8 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
                 ctx_id,
                 resource = args.resource_id,
                 blob_id = args.blob_id,
+                blob_mem = args.blob_mem,
+                blob_flags = format_args!("{:#x}", args.blob_flags),
                 size = args.size,
                 host_blobs = self.shm_blobs,
                 host_blob_bytes = self.blob_bytes,

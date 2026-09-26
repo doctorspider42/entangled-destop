@@ -6322,11 +6322,162 @@ scratchpad (`xw/drive.ps1`, `xw/run.sh`), and the guest half is
   `XAUTHORITY`, in `~/.Xauthority`, and in the snap's own directory, after
   snapd's mount-namespace warnings. It never reached GL, and the host logged
   nothing, so this is the snap's X access from a non-session shell, not the
-  renderer. A Firefox started from the desktop is owed.
+  renderer. A Firefox started from the desktop is owed. *(Closed by the next
+  amendment. The snap's launcher forces `GDK_BACKEND=wayland`, and Firefox
+  runs on X11 once that is bypassed.)*
 - **A background remnant beside a window, not X11-specific.** When a window
   covers part of Ubuntu's wallpaper logo, the logo is hidden, except for its
   rays inside the window's left shadow. Those stay on screen until the window
   goes. `bg\bg-compare.png` shows the same for the Wayland and the X11
   gnome-calculator. A wider text editor covers the logo whole. Whether this
   is Mutter's damage or this renderer's scanout was not established.
+  *(Closed by the next amendment. It is the wallpaper itself: the logo is
+  wider than the calculator.)*
 - No glmark2 on X11: `glmark2-x11` is not installed in the image.
+
+## Amendment, 2026-09-26 — the logo beside a window is the wallpaper, and Firefox on the GPU desktop
+
+The X11 amendment left two things open: a "background remnant" beside a
+window, and Firefox on X11. Neither needed a change to the VMM. This records
+the evidence, the tests that now pin the scanout's damage contract, and what
+Firefox actually runs on.
+
+### The remnant is Ubuntu's wallpaper
+
+The suspicion was the zero-copy path's damage-only copy. The display copies
+only a flush's rect when its texture is current. If a compositor flips between
+buffers A, B, A and the damage were relative to *that buffer's* last contents,
+the texture would keep stale pixels. The evidence says otherwise, four ways:
+
+1. **Geometry.** On the empty desktop (`xw\bg\bg-none.png`) the logo's bright
+   pixels span x 742–1177, which is 436 px, centred. gnome-calculator spans
+   x 814–1172, which is 359 px. So 72 px of rays show on the left and 5 px on
+   the right, which is why the rays looked like they sat "in the left shadow".
+   They are the part of the logo the window does not cover.
+2. **Pixels.** In `bg-wayland-calculator.png`, every column from x 700 to
+   793 is bit-identical to the empty desktop over y 250–880, rays included.
+   That is 37 800 of 37 800 pixels in x 700–760 alone. From x 794 to 812 (the
+   shadow), the frame is the empty desktop scaled by a smooth factor. The
+   factor falls from 0.9995 to 0.872, and each column's spread is at most
+   0.022, on rays and background alike. That is a shadow composited over the
+   *current* wallpaper. A stale remnant would differ from the wallpaper, not
+   match it. After every window closed (`bg` shots 5–6, 15–18 and 25), the
+   screen was the empty desktop again except for 73 pixels: the clock's
+   minute digit.
+3. **A/B against the guest's buffer.** The same scene was run on both paths
+   (`F:\VMs\Entangled\ff\shared\` and `...\ff\copy\`, with
+   `ENTANGLED_SCANOUT_PATH=copy`). On the copy path the screenshot is the
+   renderer's readback of the guest's own scanout blob. The two differ only
+   in the clock and the text caret: 123, 92, 73 and 73 pixels for calculator,
+   calculator plus editor, editor, and nothing.
+4. **The damage-only copy never ran.** Every `display: shared scanout
+   statistics` line of the acceptance boots reads `mpix` = 1244.2 per 600
+   presents, with `full_copies=1`. That is exactly 1920 × 1080 per flip. The
+   guest kernel (7.0) sends the whole plane whenever the framebuffer changes
+   (`drm_plane_state.ignore_damage_clips`, which virtio-gpu has set since 6.8
+   because hosts like QEMU keep per-buffer copies), and GNOME flips every
+   frame.
+
+Mutter is not at fault either: it composited the correct frame.
+
+### The damage contract, now pinned
+
+Suppose a guest kernel does forward partial damage across a flip. The rect is
+then *frame* damage: what changed since the frame shown before, whichever
+buffer held it. The display's texture and the device's CPU mirror are
+per-plane targets holding exactly that frame. So copying the rect from the
+buffer being flushed is right, and per-resource tracking would add nothing.
+Two tests pin this:
+
+- `display::shared::tests::a_flip_sequence_with_frame_damage_leaves_the_texture_equal_to_the_buffer_shown`
+  models the texture and applies `copy_region` to a flip A (whole), B (a
+  window appears), A (the window moves; A is two frames old and repaired by
+  the compositor). The texture must equal the buffer on screen after each
+  flip. It also checks that a texture the mirror was shown over is repaired
+  only by the whole visible region.
+- `gpu_blob::renderer_blob_scanout::a_flip_between_buffers_hands_each_flush_its_own_damage`
+  flips a sharing device between two handle blobs with partial damage. Each
+  flush reaches the display as its own buffer with the damage the guest sent,
+  unwidened. A flush of the buffer not on screen reaches nobody.
+
+A real-GPU A/B/A test was not added. The `pipeline_tests` zero-copy harness
+exports one scanout image, and a second one means doubling its setup, while
+the contract under test is not GPU-specific.
+
+The `venus blob refused` debug line now carries `blob_mem` and `blob_flags`.
+Finding the Firefox refusal below took a debug build without them.
+
+### Firefox (snap 154.0, rev 8763)
+
+The guest's Firefox is the snap. It brings its own Mesa from the `gpu-2404`
+content snap (`mesa-2404`, **Mesa 25.2.8**), not the system's 26.0.8. The
+probe launches it inside the desktop session through the user's systemd
+manager, whose environment gnome-session filled: `systemd-run --user … firefox
+--profile …`. The guest half is `F:\VMs\Entangled\probes\ff\ff.sh`, and it
+loads a WebGL 2 page served from the host (`webgl.html`), which reports back
+through its own requests. The host half is the scratchpad's `ff/drive.ps1` and
+`ff/run.sh`. There were seven boots under `F:\VMs\Entangled\ff\`, and no
+warning or fatal line on the host in any of them.
+
+- **Wayland (the default): works, in software.** WebGL 2 renders
+  (`ff\shared\ff-wayland-webgl.png`), but the renderer is `llvmpipe (LLVM
+  20.1.2, 256 bits)`, at 36–40 rAF fps. `about:support#graphics`
+  (`ff-wayland-support.png`) shows compositing `WebRender (Software)` and
+  WebGL driver `Mesa -- llvmpipe`, 4.5 core, Mesa 25.2.8. With
+  `LIBGL_DEBUG=verbose` and `EGL_LOG_LEVEL=debug` the reason is plain. The
+  snap's loader picks `virtio_gpu`, says `No virgl contexts available on
+  host`, fails to create the DRI2 screen and falls back to swrast. The
+  `/etc/drirc` `dri_driver=zink` that GNOME relies on is not consulted. The
+  snap's Mesa reads `DRIRC_CONFIGDIR=$SNAP/gpu-2404/drirc.d` and
+  `~/snap/firefox/common/.drirc`.
+- **X11: works, in software, once the snap's launcher is bypassed.** The
+  snap's command chain sets `GDK_BACKEND=wayland` whenever `WAYLAND_DISPLAY`
+  is set, over the caller's own value, as `snap run --shell firefox -c env`
+  shows. So `MOZ_ENABLE_WAYLAND=0` asks GTK for X11 while GTK may only try
+  Wayland, and Firefox prints `Error: cannot open display: :0`. That was the
+  failure the X11 amendment recorded. Unsetting `WAYLAND_DISPLAY` for the unit
+  does not help, because the chain sets it back. Everything else about X11
+  inside the snap was fine. From inside the snap's confinement, a raw X11
+  connection setup with Mutter's cookie succeeds on the abstract and the path
+  socket. The snap's own libX11 `XOpenDisplay(":0")` and GTK 3
+  `gdk_display_open(":0")` both succeed. So does Firefox, run as
+  `$SNAP/usr/lib/firefox/firefox` under `snap run --shell` with
+  `GDK_BACKEND=x11 MOZ_ENABLE_WAYLAND=0` set after the chain. It then has two
+  X windows on Xwayland, and WebGL 2 renders (`ff\diag5\ff-x11s-webgl.png`,
+  `llvmpipe`, 45 rAF fps). `about:support` again shows `WebRender
+  (Software)` (`ff-x11s-support.png`), for the same loader reason. So Firefox
+  on X11 is verified, and it is not zink on Venus, just as on Wayland.
+- **Zink forced (`MESA_LOADER_DRIVER_OVERRIDE=zink`, Wayland): Firefox
+  crashes, and the guest driver is at fault.** Zink 25.2.8 logs `ZINK:
+  vkMapMemory failed (VK_ERROR_MEMORY_MAP_FAILED)` and Firefox exits with
+  status 11. A build that logged every `vkAllocateMemory` (`ff\diag2`) showed
+  the sequence. Memory `0x83` was allocated as type 1, `DEVICE_LOCAL` only
+  (flags `0x1`), with no export, 2 MiB and not dedicated. Two milliseconds
+  later came a `RESOURCE_CREATE_BLOB` of it, which is what venus sends on the
+  first `vkMapMemory` of a memory. It was refused: "of a type the guest cannot
+  map (flags 0x1) and was not allocated exportable". The refusal is right.
+  Mapping memory that is not `HOST_VISIBLE` is invalid usage, and that memory
+  has no pages the VMM could give the guest. The guest's view of memory
+  (`vulkaninfo` through the system Mesa) has no `DEVICE_LOCAL | HOST_VISIBLE`
+  type, because `policy::guest_memory` takes the host bits off the RTX
+  2070's BAR type. So Zink's `ZINK_HEAP_DEVICE_LOCAL_VISIBLE` falls back to
+  the plain device-local types (`zink_screen.c`'s missing-heap loop), and in
+  this Firefox workload Zink 25.2.8 mapped one of them. It is not known
+  whether 26.0.8's Zink does the same under Firefox, because the image has
+  no non-snap Firefox. GNOME, GTK and glmark2 on the system Mesa have never
+  produced this refusal. The guest shows the refusal only as
+  `virtio_gpu_dequeue_ctrl_func … response 0x1205 (command 0x10c)` in dmesg.
+
+### Still open
+
+- **Firefox is not accelerated on this guest.** Pointing the snap's Mesa at
+  Zink, with `~/snap/firefox/common/.drirc` or the loader override, would
+  trade llvmpipe for the crash above. That is not worth it until the
+  `gpu-2404` Mesa is newer, or until Zink 25.2's mapping of a
+  non-host-visible type is understood. A guest memory table with a real
+  `DEVICE_LOCAL | HOST_VISIBLE` type would sidestep that fallback, but WHP
+  cannot back guest mappings with the driver's BAR memory (the 2026-09-23
+  amendment), so there is none to offer.
+- An X11 Firefox started from its desktop icon inherits the same launcher.
+  On this desktop that is Wayland Firefox, which is the default and works. An
+  X11 Firefox needs the launcher bypass above.

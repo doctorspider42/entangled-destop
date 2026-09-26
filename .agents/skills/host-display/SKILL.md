@@ -103,6 +103,24 @@ The window samples that texture, and nothing goes through the CPU. The code is
 - **Which source is shown**: the last update decides. A mirror update or a mode
   change deactivates the shared texture. A shared present makes it current,
   and its first copy after the mirror is of the whole visible region.
+- **A flush's damage is frame damage, and the texture is a per-plane target.**
+  The rect is what changed since the frame shown before, whichever buffer that
+  was in, and the display's texture (and the CPU mirror) holds exactly that
+  frame. So a compositor flipping A, B, A needs no per-buffer bookkeeping:
+  copying the damage from the buffer flushed is right. Do not "fix" this with
+  per-resource tracking. In practice Linux's virtio-gpu driver sends the whole
+  plane whenever the framebuffer changes (`ignore_damage_clips`, since 6.8),
+  and GNOME flips every frame. The shared statistics line shows it: `mpix`
+  over `presented` is exactly 1920×1080. Pinned by
+  `shared::tests::a_flip_sequence_with_frame_damage_leaves_the_texture_equal_to_the_buffer_shown`.
+- **A "leftover" beside a window: check the wallpaper first.** Ubuntu's logo
+  is 436 px wide and the calculator 359 px, so its rays show at both edges
+  (72 px on the left, 5 on the right). This was reported as stale pixels, and
+  it was the live wallpaper under a correct shadow (ADR-0004, 2026-09-26). To
+  tell the two apart, diff against the empty desktop from the same boot. Stale
+  pixels differ from it, and the wallpaper is bit-identical outside the
+  shadow. Then A/B with `ENTANGLED_SCANOUT_PATH=copy`, whose screenshot is the
+  renderer's readback of the guest's own buffer.
 - **Screenshots of a shared frame** draw the texture into an off-screen target
   through the window's own `ImagePipeline` (nearest, 1:1), read it back, and
   composite the mirror's cursor plane on the CPU. `DisplayHandle::screenshot_bgra`
