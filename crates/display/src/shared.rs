@@ -509,6 +509,86 @@ mod tests {
         assert_eq!(copy_region(&f, false).dst, (0, 0));
     }
 
+    /// Applies [`copy_region`] to a model texture: `src` of `buffer` (an
+    /// image `width` wide) lands at `dst` of `texture` (as wide as the
+    /// visible region, which these tests keep at the image's origin).
+    fn apply(texture: &mut [u32], buffer: &[u32], width: u32, region: CopyRegion) {
+        for row in 0..region.src.height {
+            for col in 0..region.src.width {
+                let from = (region.src.y + row) * width + region.src.x + col;
+                let to = (region.dst.1 + row) * width + region.dst.0 + col;
+                texture[to as usize] = buffer[from as usize];
+            }
+        }
+    }
+
+    /// Paints `rect` of `buffer` with `value`.
+    fn paint(buffer: &mut [u32], width: u32, r: Rect, value: u32) {
+        for y in r.y..r.y + r.height {
+            for x in r.x..r.x + r.width {
+                buffer[(y * width + x) as usize] = value;
+            }
+        }
+    }
+
+    /// The damage a flip carries is *frame* damage — what changed since the
+    /// frame shown before it, whichever buffer that was — and the display's
+    /// texture is a per-plane target holding exactly that previous frame. So
+    /// a compositor flipping between two buffers A, B, A with partial damage
+    /// leaves the texture equal to the buffer on screen after every flip,
+    /// although A's damage on its second flip says nothing about the frame
+    /// B showed in between. (Linux's virtio-gpu driver sends the whole plane
+    /// whenever the framebuffer changes anyway — `ignore_damage_clips`, since
+    /// 6.8 — which is the stricter case of the same rule.)
+    #[test]
+    fn a_flip_sequence_with_frame_damage_leaves_the_texture_equal_to_the_buffer_shown() {
+        const W: u32 = 16;
+        const H: u32 = 8;
+        let len = (W * H) as usize;
+        let mut a = vec![1u32; len];
+        let mut b = vec![0u32; len];
+        let mut texture = vec![0xdead_beef_u32; len];
+        let mut f = frame(VK_FORMAT_B8G8R8A8_UNORM, ExternalHandle::placeholder());
+        f.visible = rect(0, 0, W, H);
+
+        // Frame 1 in A, the first shared present: the whole visible region.
+        f.damage = rect(0, 0, W, H);
+        apply(&mut texture, &a, W, copy_region(&f, false));
+        assert_eq!(texture, a);
+
+        // Frame 2 in B: the compositor repairs B (buffer age says B is
+        // stale everywhere) and tells the plane only what changed since
+        // frame 1 — a window at (2, 1).
+        let window = rect(2, 1, 5, 4);
+        b.copy_from_slice(&a);
+        paint(&mut b, W, window, 7);
+        f.damage = window;
+        apply(&mut texture, &b, W, copy_region(&f, true));
+        assert_eq!(texture, b);
+
+        // Frame 3 back in A: A is two frames old, so the compositor repaints
+        // the window's rect *and* the new change in A — the window moved to
+        // (9, 2) — but frame damage is only what differs from frame 2: the
+        // rect the window left and the rect it now covers.
+        let moved = rect(9, 2, 5, 4);
+        a.copy_from_slice(&b);
+        paint(&mut a, W, window, 1);
+        paint(&mut a, W, moved, 7);
+        for damage in [window, moved] {
+            f.damage = damage;
+            apply(&mut texture, &a, W, copy_region(&f, true));
+        }
+        assert_eq!(texture, a, "the texture is the buffer on screen");
+
+        // After the mirror was shown, a flip's damage is relative to a frame
+        // the texture never held: only the whole visible region repairs it.
+        let mut stale = texture.clone();
+        paint(&mut stale, W, rect(0, 0, W, H), 0);
+        f.damage = rect(0, 0, 1, 1);
+        apply(&mut stale, &a, W, copy_region(&f, false));
+        assert_eq!(stale, a);
+    }
+
     struct Fake;
 
     impl SharedPresenter for Fake {
