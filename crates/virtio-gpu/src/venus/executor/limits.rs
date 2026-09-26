@@ -35,6 +35,10 @@
 //! * **Transient decode memory** ([`Class::DecodeBytes`]): what one command's
 //!   decode allocates and the copies of the command streams a
 //!   `vkExecuteCommandStreamsMESA` runs, while that command is in flight.
+//! * **Held submits** ([`Class::HeldSubmits`], [`Class::HeldBytes`]): guest
+//!   submits the executor keeps back until the driver could meet their
+//!   waits ([`super::hold`]), by count and by wire bytes, until they are
+//!   released or dropped.
 //!
 //! # Leaks
 //!
@@ -95,10 +99,15 @@ pub enum Class {
     /// Host bytes decoded commands and copied command streams hold while
     /// they run.
     DecodeBytes,
+    /// Guest submits (and the virtio-gpu fences behind them) held on the
+    /// host until their waits can be met ([`super::hold`]).
+    HeldSubmits,
+    /// Wire bytes of those held submits.
+    HeldBytes,
 }
 
 /// How many classes there are.
-pub const CLASS_COUNT: usize = 18;
+pub const CLASS_COUNT: usize = 20;
 
 /// Every class, in [`Class::index`] order.
 pub const CLASSES: [Class; CLASS_COUNT] = [
@@ -120,6 +129,8 @@ pub const CLASSES: [Class; CLASS_COUNT] = [
     Class::Queries,
     Class::RecordingBytes,
     Class::DecodeBytes,
+    Class::HeldSubmits,
+    Class::HeldBytes,
 ];
 
 const MIB: u64 = 1 << 20;
@@ -148,6 +159,8 @@ impl Class {
             Self::Queries => 15,
             Self::RecordingBytes => 16,
             Self::DecodeBytes => 17,
+            Self::HeldSubmits => 18,
+            Self::HeldBytes => 19,
         }
     }
 
@@ -173,6 +186,8 @@ impl Class {
             Self::Queries => "queries",
             Self::RecordingBytes => "recording_bytes",
             Self::DecodeBytes => "decode_bytes",
+            Self::HeldSubmits => "held_submits",
+            Self::HeldBytes => "held_bytes",
         }
     }
 
@@ -210,6 +225,11 @@ impl Class {
             Self::Queries => (1 << 20, 4 << 20),
             Self::RecordingBytes => (256 * MIB, GIB),
             Self::DecodeBytes => (512 * MIB, 2 * GIB),
+            // A wait-before-signal holds a frame or two of submits (the
+            // desktop held none at all); a guest past these ends its context
+            // (`super::hold`'s module docs have the numbers).
+            Self::HeldSubmits => (1024, 4096),
+            Self::HeldBytes => (16 * MIB, 64 * MIB),
         }
     }
 

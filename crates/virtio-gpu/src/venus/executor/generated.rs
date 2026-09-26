@@ -7974,8 +7974,6 @@ pub fn is_pass_through(command: &Command<'_>) -> bool {
         command,
         Command::GetFenceStatus(_)
             | Command::GetEventStatus(_)
-            | Command::SetEvent(_)
-            | Command::ResetEvent(_)
             | Command::MergePipelineCaches(_)
             | Command::GetRenderAreaGranularity(_)
             | Command::EndCommandBuffer(_)
@@ -7994,8 +7992,6 @@ pub fn is_pass_through(command: &Command<'_>) -> bool {
             | Command::CmdClearColorImage(_)
             | Command::CmdClearDepthStencilImage(_)
             | Command::CmdResolveImage(_)
-            | Command::CmdSetEvent(_)
-            | Command::CmdResetEvent(_)
             | Command::CmdEndConditionalRenderingEXT(_)
             | Command::CmdNextSubpass(_)
             | Command::CmdEndRenderPass(_)
@@ -8020,7 +8016,6 @@ pub fn is_pass_through(command: &Command<'_>) -> bool {
             | Command::CmdCopyImage2(_)
             | Command::CmdBlitImage2(_)
             | Command::CmdResolveImage2(_)
-            | Command::CmdResetEvent2(_)
             | Command::CmdEndRendering(_)
     )
 }
@@ -8397,8 +8392,6 @@ pub const TRANSLATED: &[&str] = &[
 pub const PASS_THROUGH: &[&str] = &[
     "vkGetFenceStatus",
     "vkGetEventStatus",
-    "vkSetEvent",
-    "vkResetEvent",
     "vkMergePipelineCaches",
     "vkGetRenderAreaGranularity",
     "vkEndCommandBuffer",
@@ -8417,8 +8410,6 @@ pub const PASS_THROUGH: &[&str] = &[
     "vkCmdClearColorImage",
     "vkCmdClearDepthStencilImage",
     "vkCmdResolveImage",
-    "vkCmdSetEvent",
-    "vkCmdResetEvent",
     "vkCmdEndConditionalRenderingEXT",
     "vkCmdNextSubpass",
     "vkCmdEndRenderPass",
@@ -8443,7 +8434,6 @@ pub const PASS_THROUGH: &[&str] = &[
     "vkCmdCopyImage2",
     "vkCmdBlitImage2",
     "vkCmdResolveImage2",
-    "vkCmdResetEvent2",
     "vkCmdEndRendering",
 ];
 

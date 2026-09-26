@@ -333,6 +333,10 @@ impl Payloads {
 pub struct Recordings {
     /// By command buffer guest id.
     touches: HashMap<u64, Vec<SharedRef>>,
+    /// What each command buffer does to each event it names, by guest ids
+    /// ([`super::hold`]). Bounded by what it holds of the recording bytes:
+    /// every event command recorded is charged at least 64 bytes.
+    pub(super) events: HashMap<u64, HashMap<u64, super::hold::EventUse>>,
 }
 
 /// A claim a context made for one submit, to finish once the submit is in.
@@ -372,6 +376,7 @@ impl<H: HostVulkan> VulkanContext<H> {
     pub(super) fn forget_recordings(&mut self, cbs: &[u64]) {
         for cb in cbs {
             self.recordings.touches.remove(cb);
+            self.recordings.events.remove(cb);
         }
     }
 
@@ -381,6 +386,9 @@ impl<H: HostVulkan> VulkanContext<H> {
         let objects = &self.objects;
         self.recordings
             .touches
+            .retain(|cb, _| objects.raw_any(Kind::CommandBuffer, *cb).is_ok());
+        self.recordings
+            .events
             .retain(|cb, _| objects.raw_any(Kind::CommandBuffer, *cb).is_ok());
     }
 

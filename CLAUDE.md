@@ -63,7 +63,7 @@ served). The fresh-install acceptance installs a *published release* and runs
 it with an empty per-user profile — see the `vm-testing` skill:
 
 ```powershell
-pwsh -File scripts\fresh-install-acceptance.ps1          # elevated; the latest release
+powershell -File scripts\fresh-install-acceptance.ps1    # elevated; the latest release (5.1 or pwsh)
 ```
 ```bash
 bash scripts/fresh-install-acceptance.sh                 # the published Linux engine

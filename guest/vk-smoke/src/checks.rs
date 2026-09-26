@@ -1,4 +1,4 @@
-//! Checks 3 to 9. Each one is self-contained: it creates what it needs in a
+//! Checks 3 to 11. Each one is self-contained: it creates what it needs in a
 //! [`Scope`], proves one thing, and destroys everything on the way out.
 //!
 //! A check returns `Ok(Out::Pass(detail))`, `Ok(Out::Skip(reason))`, or
@@ -1231,5 +1231,157 @@ pub fn exhaust(gpu: &Gpu) -> Result<Out, String> {
             "memory {:?}, objects {:?}: a hostile client must be refused",
             memory_refusal, object_refusal
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 11. wait-before-signal (hostile half: only when named)
+
+/// A queue wait on a timeline value, twice. First the legitimate shape:
+/// submit a copy that waits on value 1 before anything signals it, then
+/// signal 1 from the host with `vkSignalSemaphore` — the copy must run, and
+/// its data must be right. Then the hostile one: a submit that waits on a
+/// value nothing will ever signal. Its fence must stay unsignalled (the
+/// renderer holds the submit host-side, where it harms nothing), and the
+/// process then leaves it pending for its exit to tear down — which the host
+/// must survive without its GPU wedging (ADR-0004, the wait-before-signal
+/// amendment). `VK_SMOKE_HOLD_SECS` keeps the hostile submit pending that
+/// long before the check returns.
+pub fn wait_before_signal(gpu: &Gpu) -> Result<Out, String> {
+    let Some(timeline) = &gpu.timeline else {
+        return Ok(Out::Skip("no timeline semaphores".into()));
+    };
+    const SIZE: u64 = 16 * 1024;
+    const WORDS: usize = (SIZE / 4) as usize;
+    let hold = std::env::var("VK_SMOKE_HOLD_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let dev = &gpu.device;
+    let mut scope = Scope::new(gpu);
+    let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+    let x = scope.buffer(SIZE, usage, NONE, DEVICE_LOCAL)?;
+    let h = scope.buffer(SIZE, vk::BufferUsageFlags::TRANSFER_DST, HV, NONE)?;
+    h.write_u32s(0, &vec![0; WORDS]);
+    let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+    let sem_info = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
+    // SAFETY: valid device; timeline semaphores were enabled in check 2.
+    let sem = unsafe { dev.create_semaphore(&sem_info, None) }.vk("vkCreateSemaphore(timeline)")?;
+    // SAFETY: destroyed once, after every submit using it completed (or
+    // never: the scope leaks everything once the device is marked hung).
+    scope.defer(move |d| unsafe { d.destroy_semaphore(sem, None) });
+    let cbs = scope.command_buffers(3)?;
+    record(gpu, cbs[0], |dev, cb| {
+        // SAFETY: `cb` is recording; whole-buffer fill.
+        unsafe { dev.cmd_fill_buffer(cb, x.buffer, 0, vk::WHOLE_SIZE, 0x0bad_5eed) };
+    })?;
+    record(gpu, cbs[1], |dev, cb| {
+        // SAFETY: `cb` is recording; same-size buffers.
+        unsafe {
+            dev.cmd_copy_buffer(
+                cb,
+                x.buffer,
+                h.buffer,
+                &[vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: SIZE,
+                }],
+            )
+        };
+        buffer_barrier(dev, cb, h.buffer, TRANSFER_WRITE, HOST_READ);
+    })?;
+    record(gpu, cbs[2], |dev, cb| {
+        // SAFETY: `cb` is recording; whole-buffer fill.
+        unsafe { dev.cmd_fill_buffer(cb, h.buffer, 0, vk::WHOLE_SIZE, 0xdead_dead) };
+        buffer_barrier(dev, cb, h.buffer, TRANSFER_WRITE, HOST_READ);
+    })?;
+    let filled = scope.fence(false)?;
+    let copied = scope.fence(false)?;
+    let never = scope.fence(false)?;
+    let submit = |cb: vk::CommandBuffer, wait: Option<u64>, fence: vk::Fence| {
+        let cb_arr = [cb];
+        let sems = [sem];
+        let values = [wait.unwrap_or(0)];
+        let stages = [vk::PipelineStageFlags::TRANSFER];
+        let mut tl = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+        let mut info = vk::SubmitInfo::default().command_buffers(&cb_arr);
+        if wait.is_some() {
+            info = info
+                .wait_semaphores(&sems)
+                .wait_dst_stage_mask(&stages)
+                .push_next(&mut tl);
+        }
+        // SAFETY: executable command buffer, unsignalled fence, both of this
+        // device; the wait, when there is one, is on a live timeline
+        // semaphore of this device.
+        unsafe { dev.queue_submit(gpu.queue, &[info], fence) }.vk("vkQueueSubmit")
+    };
+    submit(cbs[0], None, filled)?;
+    gpu.wait_fences(&[filled], "the fill")?;
+
+    // The legitimate wait-before-signal: the copy waits on 1, then the host
+    // signals 1.
+    submit(cbs[1], Some(1), copied)?;
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // SAFETY: the fence belongs to this device.
+    let early = unsafe { dev.get_fence_status(copied) }.vk("vkGetFenceStatus")?;
+    let signal = vk::SemaphoreSignalInfo::default().semaphore(sem).value(1);
+    let t0 = Instant::now();
+    // SAFETY: a live timeline semaphore at 0; 1 is past it.
+    unsafe {
+        match timeline {
+            Timeline::Core => dev.signal_semaphore(&signal),
+            Timeline::Khr(khr) => khr.signal_semaphore(&signal),
+        }
+    }
+    .vk("vkSignalSemaphore(1)")?;
+    gpu.wait_fences(&[copied], "the copy after vkSignalSemaphore")?;
+    let released = t0.elapsed();
+    if let Some(bad) = mismatches(&h.read_u32s(WORDS), |_| 0x0bad_5eed) {
+        return Err(format!("the copy released by vkSignalSemaphore: {bad}"));
+    }
+    println!(
+        "WAITSIGNAL legitimate: the fence read {} before the signal, the copy ran {} after it",
+        if early { "signalled" } else { "unsignalled" },
+        ms(released)
+    );
+    if early {
+        return Err("the copy's fence signalled before its wait was satisfied".into());
+    }
+
+    // The hostile one: a value nothing will ever signal.
+    let never_value = 1u64 << 40;
+    submit(cbs[2], Some(never_value), never)?;
+    let wait = std::time::Duration::from_secs(3);
+    let timeout = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX);
+    // SAFETY: the fence belongs to this device.
+    let waited = unsafe { dev.wait_for_fences(&[never], true, timeout) };
+    let untouched = mismatches(&h.read_u32s(WORDS), |_| 0x0bad_5eed).is_none();
+    let state = if untouched { "untouched" } else { "overwritten" };
+    println!(
+        "WAITSIGNAL hostile: a submit waiting on {never_value}, fence after {} s: {}, buffer {state}",
+        wait.as_secs(),
+        match waited {
+            Ok(()) => "signalled".to_owned(),
+            Err(e) => result_name(e),
+        },
+    );
+    if hold > 0 {
+        println!("WAITSIGNAL holding {hold} s");
+        std::thread::sleep(std::time::Duration::from_secs(hold));
+    }
+    // Nothing that submit names may be destroyed: it is still pending, and
+    // stays so until the process exits.
+    gpu.hung.set(true);
+    match waited {
+        Err(vk::Result::TIMEOUT) if untouched => Ok(Out::Pass(format!(
+            "vkSignalSemaphore released a waiting copy in {}, data ok; a wait on a value never \
+             signalled stays pending, left to process exit",
+            ms(released)
+        ))),
+        other => Err(format!("the never-signalled submit: {other:?}, buffer {state}")),
     }
 }

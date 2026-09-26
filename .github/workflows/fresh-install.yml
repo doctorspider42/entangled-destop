@@ -72,8 +72,21 @@ jobs:
       # it.
       - uses: actions/checkout@v4
 
-      - name: Fresh-install acceptance
+      # A stranger's Windows has Windows PowerShell 5.1 and no pwsh, and until
+      # 2026-09-26 this script did not even parse there (99 errors: ternaries,
+      # `??`, and an em dash 5.1 decodes as a closing quote). So it runs on 5.1
+      # here, the way the developer machine that runs its `guest` stage does,
+      # and pwsh only has to parse it.
+      - name: The acceptance script parses under PowerShell 7 too
         shell: pwsh
+        run: |
+          $errs = $null; $tokens = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path scripts\fresh-install-acceptance.ps1), [ref]$tokens, [ref]$errs)
+          if ($errs) { $errs | ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+
+      - name: Fresh-install acceptance
+        shell: powershell
         run: |
           $tag = '${{ github.event.inputs.tag }}'
           if (-not $tag) { $tag = 'latest' }

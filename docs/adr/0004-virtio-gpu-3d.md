@@ -5823,12 +5823,17 @@ reads `now/high-water/most-of-one-context`, then `device_local_bytes`, and
   the display's presenter. What this needs is either a submit-time refusal
   of timeline waits past any value signalled or submitted to be signalled
   (which Zink's patterns must be checked against first), or host-side
-  signalling of such values at teardown. Neither is done.
+  signalling of such values at teardown. Neither is done. *Closed on
+  2026-09-26 by a third way: such a submit is held on the host until its
+  wait is covered, and the driver never sees it (the wait-before-signal
+  amendment below).*
 - **Parked devices keep their charges.** That is deliberate, but a guest can
   park devices up to the renderer-wide device cap (64). From then on every
   new `vkCreateDevice` in the guest is refused until the parked work
   finishes, which for a wait on a value nobody will signal is never. The host
-  is safe. The guest's own new clients are not.
+  is safe. The guest's own new clients are not. *Since 2026-09-26 a wait on
+  a value nobody signals never reaches the driver, so it parks nothing; only
+  GPU work that really runs for ever (an endless shader, until TDR) can.*
 - **Many contexts can take a whole.** Shares protect every context from any
   *one* other. A process that opens several render-node contexts can take
   the renderer-wide whole of any class, device-local memory included (6 GiB
@@ -5846,3 +5851,305 @@ reads `now/high-water/most-of-one-context`, then `device_local_bytes`, and
   measured under a hostile shader.
 - **Host-visible allocation throughput** (from the capacity amendment) is
   unchanged.
+
+## Amendment, 2026-09-26 — wait-before-signal: the driver never sees a wait it cannot meet
+
+The resource-exhaustion amendment ended on this. A guest can submit, in one
+call, a queue wait on a timeline value nothing will ever signal. On the RTX
+2070 (driver 580.88) such a wait, pending on one `VkDevice` while another
+device of the same process did real GPU work, hung the process twice in
+seven runs: both threads were stuck inside the driver, and the process could
+not be killed until the host rebooted. Parking kept the device worker out of
+it, but in the VMM every other thread that calls the driver could block
+behind such a queue: the other contexts' ring workers, the scanout device and
+the display's presenter. One guest submission could wedge the host's whole
+GPU presence.
+
+Vulkan allows a timeline wait before its signal. The signal may come later
+from another queue, from `vkSignalSemaphore` on the host, or from an
+imported payload. Mesa and Zink rely on it, so refusing it is not an option.
+
+### Options, and the choice
+
+- **(a) Hold uncovered submits on the host.** Track, per semaphore, what the
+  *driver* has been asked to signal. A submit reaches the driver only once
+  every wait in it is covered. Until then it is held here with everything
+  behind it on its queue, and released in order when a covering signal is
+  submitted.
+- **(b) Signal from the host at a deadline or at teardown.** Rejected, for
+  four reasons. It does not close the hole: the driver holds the
+  unsatisfiable wait until the deadline, and the wedge was measured *during*
+  such a wait, from other threads, not at teardown. It is wrong for the
+  guest: a host signal of value `v` releases the guest's work before the
+  work it really waits for. And timeline values must only grow, so a later
+  guest signal of `v` or less becomes invalid usage handed to the driver. It
+  cannot express a binary semaphore at all, since there is no host signal
+  for one. And every waited value would need a host-side decision about
+  when "late" is, which no deadline gets right for a guest whose CPU signals
+  on user input.
+- **(c) Refuse, at submit, a timeline wait past every submitted signal.**
+  Rejected: it is valid Vulkan, and it would end the context of any client
+  that uses it.
+
+**(a) is what is built.** It is the same rule Mesa's common `vk_queue` uses
+for drivers that cannot wait before a signal
+(`VK_QUEUE_SUBMIT_MODE_THREADED`). Here it runs inline, on the thread that
+submits the covering signal, rather than on a submit thread. The guarantee is
+by induction: every submit the driver takes waits only on signals submitted
+before it, so the driver's dependencies all point backwards in submission
+order and every queue drains, bounded only by GPU time, which Windows' TDR
+bounds. No option (b) is needed on top, and none is done.
+
+### What covers a wait (`venus::executor::hold`)
+
+Coverage is tracked in the *driver's* order, beside the guest's. The two
+differ while submits are held.
+
+| wait | covered when | tracked in |
+|---|---|---|
+| timeline value `v` | `host_value >= v`: the semaphore's initial value, every signal of a submit that reached the driver, every `vkSignalSemaphore` | `SemaphoreState::host_value` |
+| binary semaphore | a signal reached the driver and no wait that reached it has consumed it | `SemaphoreState::host_pending` (`pending` stays the guest's order, which still refuses a binary wait with no signal at all) |
+| temporary imported payload (the sync-file emulation) | always: the wait is consumed before the host sees it, as before | `SemaphoreState::temporary` |
+| `vkCmdWaitEvents{,2}` on an event the command buffer did not set itself | the event is set, by a host `vkSetEvent` or by the last set or reset of a submitted command buffer | `EventUse` per command buffer, `EventState` per event |
+
+A submit's own earlier batches cover its later ones, as the driver meets
+them. Semaphores are never shared across devices or contexts here, so the
+record is per context. A semaphore is a child of its device in the object
+table. Nothing imports one: Mesa's venus imports only a sync file, which is
+the emulated payload, and every other handle type is at most exported, never
+imported. The renderer's own submits wait on nothing: ring fences, and the
+marks of shared-image ordering (`writes.rs`). The scanout device and the
+presenter's `Owner::Presenter` claims wait on the CPU, bounded, for fences of
+work the driver already holds. That work now always finishes.
+
+**Order.** A held submit holds every later submit of its queue behind it,
+host-side. So do the virtio-gpu fences on the queue's `ring_idx` timeline, so
+no fence is answered before the work it follows. Releasing runs the front of
+every queue whose front is covered, and repeats until nothing moves: a
+released submit's signals may cover another queue's front. `vkWaitSemaphoreResourceMESA`
+(a sync-file export) builds its empty waiting submit in guest ids now and
+goes the same way, so it waits behind a held signal instead of reaching the
+driver first.
+
+**Events.** A wait on an event that only the host sets is the same wait in
+another form. A command buffer's event commands are summed per event at
+record time: whether it waits before setting the event itself, whether it
+resets it, and the state it leaves behind. A wait on an event that the same
+command buffer reset, with no set between, can only be released by a host set
+racing the GPU, and is refused at record time (fatal). Resetting an event,
+from the host or from a submitted command buffer, while submitted work may
+still wait on it could make that wait never pass. So the reset first waits
+for the device's submitted work (`settle`), which is finite because the event
+is set and every wait the driver holds is covered.
+
+### Every wait inside the driver, and what bounds it
+
+| surface | before | now | bounded by |
+|---|---|---|---|
+| queue wait on a timeline value (`vkQueueSubmit`, `vkQueueSubmit2`) | to the driver as sent | held until covered | never in the driver uncovered |
+| queue wait on a binary semaphore | refused with no signal in the guest's order, otherwise to the driver even when the signal itself was not there yet | refused the same way; held while its signal is held | never in the driver uncovered |
+| `vkCmdWaitEvents{,2}` on an event set only by the host | to the driver | held until `vkSetEvent` or an earlier set covers it; reset-then-wait in one buffer refused; resets of waited events settle first | never in the driver uncovered |
+| `vkWaitSemaphores`, the guest's timeout | 20 ms driver slices, off the lock between, until the guest's timeout | an uncovered value is not asked of the driver: 1 ms naps off the lock (`hold::NAP`); a covered one as before | the guest's timeout on its own ring, and teardown within a slice. The driver waits only on values already submitted |
+| `vkWaitForFences`, the guest's timeout | 20 ms slices | a fence of a held submit naps; a timeout of 0 answers `VK_TIMEOUT` at once | as above |
+| `vkQueueWaitIdle`, `vkDeviceWaitIdle` | a fenced queue in slices; an unfenced one with the driver's idle, which has no timeout, under the context lock | a queue with held work naps; the driver's idle only once nothing of the queue is held | the GPU time of covered work, which TDR bounds; a guest waiting on its own held work waits on its own ring |
+| `vkGetQueryPoolResults(WAIT)` | the driver's wait, no timeout, under the context lock: for ever for a query reset and never issued | polled without `WAIT`, napping off the lock while `VK_NOT_READY` | the guest's own ring, for as long as it asks; teardown within a nap |
+| `vkWaitVirtqueueSeqnoMESA` | never in the driver | unchanged | its own ring |
+| teardown (`device_idle_within`) | 500 ms, then parked | unchanged, but held work is dropped first, so a never-signalled wait no longer makes a device busy | `TEARDOWN_WAIT` |
+| `settle` before a destroy | 100 ms slices until idle | unchanged; now always finite | GPU time |
+| shared-image claims, scanout and presenter claims | 100 ms | unchanged; the other owner's work now always finishes | `SHARED_WAIT`, `SCANOUT_WAIT`, `COPY_WAIT` |
+| a ring fence's fence thread | 50 ms slices on host fences | fences only of released work | the fence's work |
+| `vkQueueBindSparse` | refused (no sparse feature is shown) | unchanged | — |
+
+### Bounds, teardown and cost
+
+Every held item is charged to its context and the renderer.
+`limits::Class::HeldSubmits` counts held submits and ring fences, 1024 per
+context and 4096 in all. `Class::HeldBytes` counts their wire bytes (at least
+64 each), 16 MiB per context and 64 MiB in all. A submit has no `VkResult` to
+refuse with, so past either cap the context ends, like a recording past its
+cap. A ring fence past the cap is refused and the device answers it at once,
+as any refused fence is. A context that goes fatal, is destroyed or is reset,
+and a `vkDestroyDevice`, drop their held submits. Nothing of them reached the
+driver, so nothing waits for them. The ring fences behind those submits are
+retired at once (ADR-0005: a queue's fences are answered when it goes). A
+held submit that names an object the guest destroyed meanwhile ends the
+context at its release, when translation refuses it, as it would have been
+refused had it not waited.
+
+There is no deadline. A guest waiting on a value its own CPU signals later may
+wait as long as it likes. One waiting for ever holds only its own charges and
+its own ring, and its teardown no longer parks anything.
+
+With nothing held, the cost on the submit path is one pass over the submit's
+waits (a table lookup each, already made once by the planning), a map lookup
+per command buffer for events, and the `SyncOps` vector the pass reads. On the
+fake host the whole check takes 0.36 µs per submit of two waits and three
+command buffers in a release build, and 4.9 µs in a debug one
+(`the_cover_check_costs_microseconds_on_the_submit_path`, asserted below
+50 µs). In the guest nothing was held in normal use (below), so that check is
+the whole cost.
+
+The usage log (`virtio_gpu::venus::usage`) carries `holds_held`,
+`holds_released`, `holds_dropped`, `holds_ring_fences` and
+`holds_longest_us`, renderer-wide since the executor was made, and
+`held_submits` / `held_bytes` in `limits=`. The first hold of a context is
+logged at `info`, and later ones at `debug`.
+
+### Tests
+
+- `executor::hold_tests`, on the fake host. The fake driver now records every
+  wait it is handed that nothing submitted before could satisfy: a timeline
+  value past every submitted signal, a binary semaphore with no pending
+  signal, an event nobody set, and `vkGetQueryPoolResults(WAIT)` on queries
+  not ready (`FakeVulkan::unsatisfiable_waits`). Every test asserts that
+  list is empty. The tests cover:
+  - a wait released by a signal from another queue, with the signal
+    reaching the driver first;
+  - a wait released by `vkSignalSemaphore`, and not by a smaller value;
+  - a wait covered by the initial value;
+  - earlier batches of one submit covering later ones;
+  - a binary wait on a held signal held with it, and both released in
+    order;
+  - an imported payload never held, and kept in its queue's order behind
+    held work;
+  - a sync-file export of a held signal waiting behind it;
+  - per-queue order with a ring fence behind held work, which is not
+    answered until the work is released, while another queue is not held
+    up;
+  - `vkWaitForFences`, `vkWaitSemaphores` and `vkQueueWaitIdle` on held work
+    napping without the driver until another ring covers it;
+  - a never-signalled wait: another context works meanwhile, teardown
+    finishes under `TEARDOWN_WAIT` with nothing parked, the held ring fence
+    is answered, and every charge comes back;
+  - `vkDestroyDevice` and a reset dropping holds, and a fatal context
+    dropping them;
+  - a held submit naming a destroyed fence ending the context at release;
+  - the count and byte caps ending the context, with another context keeping
+    its share;
+  - binary refusal unchanged;
+  - an event set only by the host held until `vkSetEvent`; GPU-set events
+    and split barriers never held; a reset by a submitted buffer holding the
+    next wait; reset-then-wait refused before the driver sees it; a host
+    reset waiting for submitted work that waits on the event;
+  - `vkGetQueryPoolResults(WAIT)` polled: the driver never saw `WAIT`;
+  - the cost of the cover check.
+- `hold::tests`: the event-use sums, including a secondary's.
+- Real GPU:
+  `host_vulkan::pipeline_tests::a_wait_before_its_signal_never_reaches_the_driver_and_runs_once_signalled`.
+  It reproduces the scenario that wedged the driver, through the executor. A
+  copy waits on a timeline value nobody has signalled, on one `VkDevice`,
+  while a second context's device runs 64 fenced fill submits. Then
+  `vkSignalSemaphore` releases it. The test asserts the submit was held for
+  the whole time, then ran, with 0 of 16 384 words wrong. It runs in a child
+  process of the test binary with a 120 s kill timeout, because the failure it
+  guards against is a driver that no longer returns, and it self-skips
+  without a GPU. Measured on the RTX 2070: held 1.33 s and 1.00 s in two
+  runs, released, 0 wrong.
+  No test hands the driver an unsatisfiable wait, and none may.
+- vk-smoke check 11, `wait-before-signal`: hostile, and only when named in
+  `--checks`. The legitimate half is a copy that waits on 1 before anything
+  signals it: its fence must read unsignalled 200 ms later, and must signal
+  once the host's `vkSignalSemaphore(1)` arrives, with the copy's data
+  right. The hostile half submits a wait on 2⁴⁰. Its fence must still time
+  out after 3 s with its buffer untouched. It stays pending for
+  `VK_SMOKE_HOLD_SECS`, and the process then exits with it pending. On
+  lavapipe in WSL both halves pass (the copy ran 0.14 ms after the signal).
+
+### Guest acceptance
+
+The guest was Ubuntu 26.04 (Mesa 26.0.8, GNOME on Zink) on WHP with the RTX
+2070 (driver 580.88), 4 vCPUs, from the profile `venus-ubuntu-net-profile.toml`
+(`[display] venus = true`), headless, with
+`RUST_LOG=info,virtio_gpu::venus::usage=debug`. The driver scripts are in the
+task's scratchpad (`wbs/drive.ps1`, `wbs/run.sh`) and the guest half is in
+`F:\VMs\Entangled\probes\wbs\wbs.sh`. Each run is one boot: glmark2 build,
+jellyfish, build, jellyfish (10 s each), then vkcube. "Before" is two
+binaries. One is the release build the resource-exhaustion acceptance used.
+The other, `base`, is rebuilt here from `git archive HEAD`, the same code.
+The two are byte-for-byte the same size. "After" is this change. The runs
+alternated.
+
+**The host was not quiet.** A VMware VM on the same host used the RTX 2070 at
+15–39 % throughout (`nvidia-smi`, `vmware-vmx`/`mksSandbox`), and glmark2
+moved by a factor of two with it, whatever the binary:
+
+| run | binary | glmark2 build, jellyfish, build, jellyfish | composite fps, mean of 2 s windows |
+|---|---|---|---:|
+| old2 | before | 696, 677, 675, 705 | 57.2 |
+| new2 | after | 318, 321, 361, 290 | 55.8 |
+| old3 | before | 295, 451, 537, 584 | 56.7 |
+| new3 | after | 336, 331, 325, 312 | 55.7 |
+| old4 | before | 290, 281, 284, 282 | 54.8 |
+| new4 | after | 274, 253, 263, 223 | 55.7 |
+| old5 | before | 358, 358, 416, 384 | 56.8 |
+| new5 | after | 292, 283, 291, 320 | 55.7 |
+| old6 | before | 352, 300, 320, 309 | 55.7 |
+| new6 | after | 287, 286, 291, 285 | 56.1 |
+| old7 | before | 388, 379, 344, 260 | 56.1 |
+| base1 | before (rebuilt) | 704, 707, 574, 622 | 56.4 |
+| new7 | after | 570, 592, 593, 593 | 56.5 |
+| base2 | before (rebuilt) | 333, 300, 219, 203 | 55.4 |
+| new8 | after | 282, 259, 269, 254 | 55.2 |
+| base3 | before (rebuilt) | 298, 270, 276, 277 | 55.8 |
+| new9 | after | 589, 660, 698, 693 | 57.1 |
+| new10 (hostile run) | after | 533, 554, 516, 606 | 54.8 |
+
+In the quiet stretches both binaries reach the range recent runs measured
+(before: 704/707; after: 698/693; the resource-exhaustion amendment's build
+619–630 and jellyfish 599–623). In the loaded ones both sit at 250–400. The
+composite rate is the same, 55–57 fps, in every run. Nothing here points at a
+regression, and the change's own cost (above) is well under a microsecond per
+submit. A clean A/B needs a host without another GPU tenant, and that is owed.
+
+**Holds in normal use: none.** Across the eight runs of this change that did
+not run the hostile client, the usage log read `holds_held=0` from boot to
+power-off, and `holds_naps=0` in the four runs that had the counter. That
+covers GNOME, glmark2 build and jellyfish, vkcube, and vk-smoke checks 3–9
+(timeline sync and 1000 fenced submits among them). Zink and Mesa did not wait
+before a signal once. The only holds of the whole campaign were vk-smoke
+check 11's two.
+
+**The hostile client** (vk-smoke check 11, run as root, `VK_SMOKE_HOLD_SECS=40`,
+twice; figures from the second run):
+
+- The legitimate half: the copy's fence read unsignalled 200 ms after the
+  submit, and the copy ran 0.87 ms after `vkSignalSemaphore(1)` (12.8 ms in
+  the first run), with its data right. The usage log records it:
+  `holds_longest_us=200178`, the 200 ms the check waited before signalling.
+- The hostile half: a wait on 2⁴⁰. After 3 s the fence answered
+  `VK_TIMEOUT` and the buffer was untouched. The submit stayed held for the
+  40 s hold, and the process then exited with it pending. Its context's
+  teardown dropped it (`holds_dropped=1`), and `parked_devices` was 0 in
+  every usage line of the run. The host logged it once, at `info`:
+  `a Venus submit waits on something no submitted signal covers yet … ctx_id=6`.
+- Meanwhile gnome-shell kept its pid and vkcube kept running. The desktop
+  composited at 45.7–60 fps (2 s windows) while the submit was held. glmark2
+  jellyfish scored 605 while it was held, and 694 (build 633) after it went.
+- vk-smoke printed `SMOKE 11 wait-before-signal PASS` and exited 0.
+- Afterwards, with the VM gone, the real-GPU tests on the host both passed:
+  the presenter's `a_handle_blob_flip_is_presented_by_the_displays_own_gpu_exactly`,
+  and the wait-before-signal child test (held 1.00 s, 0 words wrong). The
+  driver was fine.
+
+### Still open
+
+- **A clean glmark2 A/B.** The alternated runs above were taken beside
+  another tenant of the GPU. They show no regression, but they cannot show a
+  small one.
+- **GPU time.** An endless shader is bounded only by Windows' TDR. Work the
+  driver holds is now always covered, so every other wait in this list is
+  bounded by that.
+- **`vkQueueWaitIdle`/`vkDeviceWaitIdle` of an unfenced queue** is still one
+  driver call under the context lock. It is finite now, but only as short as
+  the covered work in front of it. Mesa never sends either (it waits with a
+  fence of its own).
+- **A held submit's command buffers are not pinned.** A guest that frees or
+  re-records them while the submit is held gets the new recording, or its
+  context ends at release. That is Vulkan's invalid usage in either case, and
+  the host is unaffected.
+- **Events are summed per command buffer, not simulated.** A host
+  `vkResetEvent` racing a command buffer's own set is judged by the order the
+  host saw them in. The resets that could strand a wait wait for the device
+  first, and waits after a reset in the same buffer are refused. A more
+  exotic pattern that no conformant program needs would be held until the
+  host sets the event, never handed to the driver.

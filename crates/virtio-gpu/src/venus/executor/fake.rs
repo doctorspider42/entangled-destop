@@ -408,6 +408,22 @@ struct Live {
     /// The pages each memory imported, by host handle (stage S2b): where a
     /// copy into a buffer bound to it lands.
     memory_pages: HashMap<u64, Weak<RingPages>>,
+    /// Every wait a submit handed this driver that nothing submitted before
+    /// it could satisfy (`executor::hold`): a timeline value above every
+    /// signal submitted, a binary semaphore with no signal pending, an
+    /// event no one had set. A real driver waits on each of these forever;
+    /// the executor must never send one.
+    unsatisfiable: Vec<String>,
+    /// Binary semaphores with a signal submitted and not yet waited on.
+    binary_pending: std::collections::HashSet<u64>,
+    /// Every `vkGetQueryPoolResults`' flags, as the driver was handed them.
+    query_flags: Vec<u32>,
+    /// Each command buffer's event operations, in recording order:
+    /// `(event, op)` with op 0 set, 1 reset, 2 wait.
+    cb_events: HashMap<u64, Vec<(u64, u8)>>,
+    /// Events and whether they are set, as submitted work and the host
+    /// calls leave them.
+    events_set: HashMap<u64, bool>,
 }
 
 /// One image barrier as the fake host saw it (stage S2b), its masks widened
@@ -472,6 +488,10 @@ pub struct FakeVulkan {
     /// What `vkGetPhysicalDeviceExternalBufferProperties(HOST_ALLOCATION)`
     /// answers for every buffer: importable (`true`, the default) or not.
     pub buffer_imports: AtomicBool,
+    /// Every `vkGetQueryPoolResults` answers `VK_NOT_READY` while set, and
+    /// one with `VK_QUERY_RESULT_WAIT_BIT` is recorded as an unsatisfiable
+    /// wait: a real driver would wait inside the call for ever.
+    pub queries_not_ready: AtomicBool,
     /// What `vkGetPhysicalDeviceExternalBufferProperties(OPAQUE_WIN32)`
     /// answers for every buffer (stage S1): exportable and importable
     /// (`true`, the default) or nothing.
@@ -548,6 +568,7 @@ impl FakeVulkan {
             stuck_devices: Mutex::new(std::collections::HashSet::new()),
             on_call: Mutex::new(None),
             buffer_imports: AtomicBool::new(true),
+            queries_not_ready: AtomicBool::new(false),
             buffer_exports: AtomicBool::new(true),
             image_exports: AtomicBool::new(true),
             image_requires_dedicated: AtomicBool::new(false),
@@ -686,6 +707,67 @@ impl FakeVulkan {
                         dst: (b.dst_stage_mask, b.dst_access_mask),
                     });
                 }
+            }),
+            Command::BeginCommandBuffer(a) => self.with(|live| {
+                live.cb_events.remove(&a.command_buffer.0);
+            }),
+            Command::CmdSetEvent(a) => self.with(|live| {
+                live.cb_events
+                    .entry(a.command_buffer.0)
+                    .or_default()
+                    .push((a.event.0, 0));
+            }),
+            Command::CmdSetEvent2(a) => self.with(|live| {
+                live.cb_events
+                    .entry(a.command_buffer.0)
+                    .or_default()
+                    .push((a.event.0, 0));
+            }),
+            Command::CmdResetEvent(a) => self.with(|live| {
+                live.cb_events
+                    .entry(a.command_buffer.0)
+                    .or_default()
+                    .push((a.event.0, 1));
+            }),
+            Command::CmdResetEvent2(a) => self.with(|live| {
+                live.cb_events
+                    .entry(a.command_buffer.0)
+                    .or_default()
+                    .push((a.event.0, 1));
+            }),
+            Command::CmdWaitEvents(a) => self.with(|live| {
+                let ops = live.cb_events.entry(a.command_buffer.0).or_default();
+                for e in a.p_events.iter().flatten() {
+                    ops.push((e.0, 2));
+                }
+            }),
+            Command::CmdWaitEvents2(a) => self.with(|live| {
+                let ops = live.cb_events.entry(a.command_buffer.0).or_default();
+                for e in a.p_events.iter().flatten() {
+                    ops.push((e.0, 2));
+                }
+            }),
+            Command::CmdExecuteCommands(a) => self.with(|live| {
+                let inherited: Vec<(u64, u8)> = a
+                    .p_command_buffers
+                    .iter()
+                    .flatten()
+                    .filter_map(|c| live.cb_events.get(&c.0))
+                    .flatten()
+                    .copied()
+                    .collect();
+                if !inherited.is_empty() {
+                    live.cb_events
+                        .entry(a.command_buffer.0)
+                        .or_default()
+                        .extend(inherited);
+                }
+            }),
+            Command::SetEvent(a) => self.with(|live| {
+                live.events_set.insert(a.event.0, true);
+            }),
+            Command::ResetEvent(a) => self.with(|live| {
+                live.events_set.insert(a.event.0, false);
             }),
             Command::CmdCopyImageToBuffer(a) => {
                 let pages = self.with(|live| {
@@ -849,6 +931,26 @@ impl FakeVulkan {
         self.with(|live| live.semaphore_exports.clone())
     }
 
+    /// Every wait the driver was handed that nothing could satisfy (see
+    /// `Live::unsatisfiable`): empty, or the executor is broken.
+    #[must_use]
+    pub fn unsatisfiable_waits(&self) -> Vec<String> {
+        self.with(|live| live.unsatisfiable.clone())
+    }
+
+    /// Every `vkGetQueryPoolResults`' flags as the driver saw them.
+    #[must_use]
+    pub fn query_flags(&self) -> Vec<u32> {
+        self.with(|live| live.query_flags.clone())
+    }
+
+    /// Whether event `event` (a host handle) is set, as the fake driver was
+    /// told.
+    #[must_use]
+    pub fn event_set(&self, event: u64) -> bool {
+        self.with(|live| live.events_set.get(&event).copied().unwrap_or(false))
+    }
+
     /// A timeline semaphore's value on the fake GPU.
     #[must_use]
     pub fn timeline_value(&self, semaphore: u64) -> Option<u64> {
@@ -937,20 +1039,31 @@ impl FakeVulkan {
                         .flatten()
                         .map(|x| x.0)
                         .collect();
-                    let values: Vec<u64> = s
+                    let (wait_values, values): (Vec<u64>, Vec<u64>) = s
                         .p_next
                         .iter()
                         .find_map(|l| match l {
-                            VkSubmitInfoNext::VkTimelineSemaphoreSubmitInfo(t) => {
-                                t.p_signal_semaphore_values.clone()
-                            }
+                            VkSubmitInfoNext::VkTimelineSemaphoreSubmitInfo(t) => Some((
+                                t.p_wait_semaphore_values.clone().unwrap_or_default(),
+                                t.p_signal_semaphore_values.clone().unwrap_or_default(),
+                            )),
                             _ => None,
                         })
                         .unwrap_or_default();
+                    let cbs: Vec<u64> = s.p_command_buffers.iter().flatten().map(|c| c.0).collect();
                     self.with(|live| {
-                        for (sem, value) in signals.iter().zip(&values) {
-                            if let Some(v) = live.timelines.get_mut(sem) {
-                                *v = (*v).max(*value);
+                        let waited: Vec<(u64, u64)> = waits
+                            .iter()
+                            .enumerate()
+                            .map(|(i, sem)| (*sem, wait_values.get(i).copied().unwrap_or(0)))
+                            .collect();
+                        live.check_waits(a.queue.0, waited, &cbs);
+                        for (i, sem) in signals.iter().enumerate() {
+                            match live.timelines.get_mut(sem) {
+                                Some(v) => *v = (*v).max(values.get(i).copied().unwrap_or(0)),
+                                None => {
+                                    live.binary_pending.insert(*sem);
+                                }
                             }
                         }
                         live.semaphore_ops.push((a.queue.0, waits, signals));
@@ -1045,10 +1158,26 @@ impl FakeVulkan {
                         .flatten()
                         .map(|x| (x.semaphore.0, x.value))
                         .collect();
+                    let waited: Vec<(u64, u64)> = s
+                        .p_wait_semaphore_infos
+                        .iter()
+                        .flatten()
+                        .map(|x| (x.semaphore.0, x.value))
+                        .collect();
+                    let cbs: Vec<u64> = s
+                        .p_command_buffer_infos
+                        .iter()
+                        .flatten()
+                        .map(|c| c.command_buffer.0)
+                        .collect();
                     self.with(|live| {
+                        live.check_waits(a.queue.0, waited, &cbs);
                         for (sem, value) in &signals {
-                            if let Some(v) = live.timelines.get_mut(sem) {
-                                *v = (*v).max(*value);
+                            match live.timelines.get_mut(sem) {
+                                Some(v) => *v = (*v).max(*value),
+                                None => {
+                                    live.binary_pending.insert(*sem);
+                                }
                             }
                         }
                         live.semaphore_ops.push((
@@ -1157,6 +1286,24 @@ impl FakeVulkan {
                 self.with(|live| Self::forget_children(live, pool));
                 VK_SUCCESS
             }
+            Command::GetQueryPoolResults(a) => {
+                let not_ready = self.queries_not_ready.load(Ordering::SeqCst);
+                let flags = a.flags;
+                // As a driver writes them: `dataSize` bytes of results.
+                a.p_data = Some(vec![0; usize::try_from(a.data_size).unwrap_or(0)]);
+                self.with(|live| {
+                    live.query_flags.push(flags);
+                    if not_ready && flags & 0x2 != 0 {
+                        live.unsatisfiable
+                            .push("vkGetQueryPoolResults(WAIT) on queries not ready".into());
+                    }
+                });
+                if not_ready {
+                    VK_NOT_READY
+                } else {
+                    VK_SUCCESS
+                }
+            }
             _ => VK_SUCCESS,
         }
     }
@@ -1175,6 +1322,47 @@ impl FakeVulkan {
 }
 
 impl Live {
+    /// One batch's waits and command buffers, as the driver meets them:
+    /// every wait must be one something submitted before it satisfies.
+    fn check_waits(&mut self, queue: u64, waits: Vec<(u64, u64)>, cbs: &[u64]) {
+        for (sem, value) in waits {
+            match self.timelines.get(&sem) {
+                Some(reached) if *reached < value => self.unsatisfiable.push(format!(
+                    "queue {queue:#x}: timeline {sem:#x} value {value}, only {reached} submitted"
+                )),
+                Some(_) => {}
+                None => {
+                    if !self.binary_pending.remove(&sem) {
+                        self.unsatisfiable.push(format!(
+                            "queue {queue:#x}: binary {sem:#x} with no signal pending"
+                        ));
+                    }
+                }
+            }
+        }
+        for cb in cbs {
+            let ops = self.cb_events.get(cb).cloned().unwrap_or_default();
+            for (event, op) in ops {
+                match op {
+                    0 => {
+                        self.events_set.insert(event, true);
+                    }
+                    1 => {
+                        self.events_set.insert(event, false);
+                    }
+                    _ => {
+                        if !self.events_set.get(&event).copied().unwrap_or(false) {
+                            self.unsatisfiable.push(format!(
+                                "queue {queue:#x}: command buffer {cb:#x} waits on event \
+                                 {event:#x}, which nothing has set"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn finish(&mut self, fence: u64) {
         // A fence covers everything submitted before it.
         if let Some(at) = self.held.iter().position(|f| *f == fence) {

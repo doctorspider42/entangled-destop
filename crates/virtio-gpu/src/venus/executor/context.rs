@@ -284,6 +284,14 @@ pub struct VulkanContext<H: HostVulkan> {
     /// Where a teardown puts devices whose GPU work had not finished
     /// ([`super::Graveyard`]), shared with the executor.
     pub(super) graveyard: Arc<super::Graveyard<H>>,
+    /// Submits (and virtio-gpu fences) held back from the driver until
+    /// their waits are covered ([`super::hold`]).
+    pub(super) holds: super::hold::Holds,
+    /// What holding did, every context of the executor together.
+    pub(super) hold_stats: Arc<super::hold::HoldStats>,
+    /// The last wait slice found nothing the driver could do yet: the ring
+    /// worker naps before the next ([`super::hold::NAP`]).
+    pub(super) nap: bool,
 }
 
 impl<H: HostVulkan> VulkanContext<H> {
@@ -350,6 +358,9 @@ impl<H: HostVulkan> VulkanContext<H> {
             command_bytes: 0,
             device_local_refused: std::cell::Cell::new(false),
             graveyard: super::Graveyard::new(),
+            holds: super::hold::Holds::default(),
+            hold_stats: Arc::new(super::hold::HoldStats::default()),
+            nap: false,
         }
     }
 
@@ -447,14 +458,19 @@ impl<H: HostVulkan> VulkanContext<H> {
         self.fatal
     }
 
-    /// Mark the context fatal: every ring stops at its next command.
+    /// Mark the context fatal: every ring stops at its next command, and
+    /// nothing it held back will run ([`super::hold`]).
     pub fn set_fatal(&mut self) {
         self.fatal = true;
+        self.drop_held(None);
     }
 
     /// Destroy every host object, in dependency order. Used by context
     /// destruction and device reset; the table is empty afterwards.
     pub fn destroy_all(&mut self) {
+        // Held submits never reached the driver: dropped, and the fences
+        // behind them answered, before anything waits for the GPU.
+        self.drop_held(None);
         let host = Arc::clone(&self.host);
         if self
             .objects
@@ -489,7 +505,7 @@ impl<H: HostVulkan> VulkanContext<H> {
         // A create that did not bind all it reserved gives the rest back.
         self.objects.release_reserved();
         if result.is_err() {
-            self.fatal = true;
+            self.set_fatal();
         }
         // Wherever the driver's answer came from — a generated call, or one of
         // the hand-written host calls (an allocation, a bind, an image) — a
@@ -517,7 +533,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             None => self.wait_slice(command, slice),
         };
         if result.is_err() {
-            self.fatal = true;
+            self.set_fatal();
         }
         result
     }
@@ -1679,6 +1695,9 @@ impl<H: HostVulkan> VulkanContext<H> {
         self.objects
             .device(args.device.0)
             .map_err(id_error("vkDestroyDevice"))?;
+        // What its queues held back goes first: none of it reached the
+        // driver (`super::hold`).
+        self.drop_held(Some(args.device.0));
         let host = Arc::clone(&self.host);
         // Its GPU work first, as every destroy waits for it (`settle`); a
         // ring torn down meanwhile stops waiting and leaves the device to the

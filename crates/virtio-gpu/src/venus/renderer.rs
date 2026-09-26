@@ -583,6 +583,10 @@ pub struct FactoryUsage {
     /// Host devices parked because their GPU work had not finished when
     /// their context went (`executor::Graveyard`).
     pub parked_devices: usize,
+    /// What holding back submits whose waits were not yet covered did
+    /// (`executor::hold`), every context together since the executor was
+    /// made.
+    pub holds: crate::venus::executor::hold::HoldCounts,
 }
 
 impl FactoryUsage {
@@ -601,6 +605,7 @@ impl FactoryUsage {
             scanout_targets: self.scanout_targets.max(other.scanout_targets),
             limits: self.limits.max(other.limits),
             parked_devices: self.parked_devices.max(other.parked_devices),
+            holds: self.holds.max(other.holds),
         }
     }
 }
@@ -2910,6 +2915,12 @@ impl<F: SinkFactory> VenusRenderer<F> {
             peak_scanout_targets = peak.factory.scanout_targets,
             limits = %now.factory.limits,
             parked_devices = now.factory.parked_devices,
+            holds_held = now.factory.holds.held,
+            holds_released = now.factory.holds.released,
+            holds_dropped = now.factory.holds.dropped,
+            holds_ring_fences = now.factory.holds.ring_fences,
+            holds_longest_us = now.factory.holds.longest_us,
+            holds_naps = now.factory.holds.naps,
             peak_limits = %peak.factory.limits,
             "venus usage"
         );

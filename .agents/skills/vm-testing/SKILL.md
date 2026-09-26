@@ -104,9 +104,25 @@ Two scripts, one per host. Neither needs a hypervisor for its default stages.
 
 ```powershell
 # Windows, elevated (the installer is PrivilegesRequired=admin).
-pwsh -File scripts\fresh-install-acceptance.ps1                 # latest release
-pwsh -File scripts\fresh-install-acceptance.ps1 -Tag v0.2.44    # a specific one
+powershell -File scripts\fresh-install-acceptance.ps1                 # latest release
+powershell -File scripts\fresh-install-acceptance.ps1 -Tag v0.2.44    # a specific one
 ```
+
+**It runs on Windows PowerShell 5.1**, the one a stock Windows 10/11 has, and
+on pwsh 7 as well. Until 2026-09-26 it was pwsh-only and this machine has no
+pwsh, so the documented command could not run here at all: 99 parse errors on
+5.1. The rules that keep it portable are at the top of the script (no `? :`,
+no `??`, no `Process.Kill(bool)`, **no non-ASCII in code**: 5.1 reads a
+BOM-less script as ANSI and the last byte of an em dash's UTF-8 is 0x94, a
+closing double quote to it). CI runs it on 5.1 and only parses it on pwsh.
+`-Stages a,b` through `-File` is one string on both shells; the script splits
+it itself, so the lines below work as written.
+
+**The UAC prompt times out after ~2 minutes** and then reads as "canceled by
+the user". An agent running this at night gets three of those and no install.
+Check the console's idle time first (`GetLastInputInfo`) and launch the
+elevated part when someone is there to click; everything after `install` runs
+unelevated against `-AppDir <scratch>\app -KeepInstalled`.
 
 ```bash
 # Linux — the published entangled-linux-x86_64, which is also the binary
@@ -119,16 +135,60 @@ Releases, unauthenticated), `install` (`/VERYSILENT /DIR=<scratch>`), `tree`
 (what actually landed), `doctor`, `fetch`, `engine`, and the opt-in `guest`:
 
 ```powershell
-pwsh -File scripts\fresh-install-acceptance.ps1 -Tag v0.2.44 `
+powershell -File scripts\fresh-install-acceptance.ps1 -Tag v0.2.44 `
     -Stages download,install,tree,doctor,fetch,engine,guest `
     -Iso "$env:LOCALAPPDATA\entangled\ubuntu\26.04\ubuntu-26.04-live-server-amd64.iso"
+
+# The GPU desktop instead: install ubuntu --venus from the DESKTOP ISO.
+powershell -File scripts\fresh-install-acceptance.ps1 -Tag v0.2.49 `
+    -Stages download,install,tree,doctor,fetch,engine,guest -Venus `
+    -Iso F:\ubuntu-26.04.1-desktop-amd64.iso
 ```
 
 `guest` takes a machine from nothing to a login prompt on the installed
 program: ~15 min for the unattended Ubuntu install plus ~2 min to boot it. It
 needs a hypervisor and an ISO. There is no `bash scripts/fetch-ubuntu-iso.sh`
 on Windows, so `-Iso` is mandatory — which is itself the newcomer's path, and
-the reason the parameter exists rather than a download.
+the reason the parameter exists rather than a download. Both variants assert
+the installed profile's shape (1920×1080, half the host's CPUs clamped to
+2..8). `-Venus` also asserts `venus = true`, doctor's `venus ready`, and, from
+the first boot's own log, that the renderer was attached by the profile (no
+`ENTANGLED_VENUS`), that the display presents zero-copy, and that GDM scans
+out a renderer blob at 1920×1080 — the greeter composited on the GPU. What it
+cannot assert without driving the guest (a session, `glxinfo -B` naming Zink
+on Venus, the pacing report's `shared` counter moving, the caps' usage line)
+is a driven boot's job, below.
+
+**The driven boot of a fresh `--venus` install** (2026-09-26, v0.2.49, WHP,
+RTX 2070; install 16 min 20 s, the script's first boot 96 s to GDM on the GPU,
+later boots 21 s to `fresh-desktop login:`). Only the *installed*
+`entangled.exe`, the scrubbed profile, `RUST_LOG=info,virtio_gpu::venus::usage=debug`
+(the caps and peaks are a debug line; nothing about them is logged at info
+until one is hit), and a copy of the written profile with `[network] backend =
+"usernet"` (the written one has none, so apt cannot run). Then over
+`--control-stdin`: log in on ttyS0, `apt-get install mesa-utils vulkan-tools
+glmark2-wayland`, GDM autologin (test-only), and as the desktop user with
+`XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0`:
+`eglinfo -B -p wayland` (renderer `zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA
+GeForce RTX 2070) (MESA_VENUS))`), `vulkaninfo --summary` (`DRIVER_ID_MESA_VENUS`),
+then vkcube + glmark2 on screen so the compositor flips: pacing windows read
+`shared=120` of 120 and `display: shared scanout statistics` `declined=0
+failed=0 abandoned=0`. The drivers are kept beside the evidence
+(`F:\VMs\Entangled\fresh-v0249\evidence\drive.ps1`).
+
+**`glxinfo -B` does not work there, and it is not the harness.** X11 goes
+through Xwayland on demand, and in two boots out of two the host ended a
+context within a second of the X client starting Xwayland: `a Venus command could not be answered;
+the ring and its context are fatal … vkCreateImage: a modifier list:
+DRM_FORMAT_MOD_LINEAR is the only modifier offered, and only for DRM format
+modifier tiling`, then `unable to open display :0`. Wayland clients are
+unaffected. An X11 client on the GPU desktop is an open renderer bug (owed to
+the Venus executor), so ask the renderer with `eglinfo` until it is fixed, and
+read the host log for `FATAL` before blaming the guest's X setup. Two traps
+on the way there: gnome-shell's environment has no `XAUTHORITY` (Xwayland's
+is `/run/user/1000/.mutter-Xwaylandauth.*`), and a gnome-shell mapping
+`libvulkan_lvp` proves nothing — the loader maps every ICD; the renderer
+string does.
 
 ### What "stranger" means, mechanically
 
@@ -182,8 +242,19 @@ tasks out of the way, so nothing touches WSL either.
 run completes, plus daily and on demand. It covers: the release resolving and
 downloading without credentials, the setup installing unattended, the shipped
 tree (**the firmware regression, directly**), `doctor`'s inventory, `entangled
-fetch firmware` with an empty cache, and the `wsl install-engine` surface
-existing in the shipped binary.
+fetch firmware` with an empty cache, `entangled fetch virglrenderer` with an
+empty cache (Linux job), and the `wsl install-engine` surface existing in the
+shipped binary.
+
+The virglrenderer fetch is there because of the fourth shipped-product bug of
+this kind, found by the 2026-09-26 acceptance of v0.2.49: the pinned Venus
+renderer release had been published hours before, but
+`guest/virglrenderer/pinned.toml` still held its all-zero placeholder
+digests, so every download of it was deleted on a digest mismatch — the
+firmware's 2026-09-10 bug again, on the one artifact nothing fetched. **After
+a guest-artifact workflow publishes, commit the block its summary prints
+before the next release, and check a pin by fetching into an empty cache,
+never by looking at your own.**
 
 It cannot cover:
 

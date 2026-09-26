@@ -3906,3 +3906,178 @@ fn allocating_past_the_device_local_cap_is_out_of_device_memory_and_the_gpu_keep
     assert_eq!(wrong, 0);
     teardown(h);
 }
+
+// ------------------------------------- the wait-before-signal amendment
+
+/// Set in the child process [`a_wait_before_its_signal_never_reaches_the_driver_and_runs_once_signalled`]
+/// spawns, which does the GPU work.
+const WAIT_BEFORE_SIGNAL_CHILD: &str = "ENTANGLED_TEST_WAIT_BEFORE_SIGNAL_CHILD";
+
+/// The scenario that wedged the NVIDIA driver process-wide during the
+/// resource-exhaustion amendment — a queue wait on a timeline value nothing
+/// has signalled yet, on one `VkDevice`, while another device of the process
+/// does real GPU work — driven through the executor, which must hold the
+/// wait on the host so the driver never sees it (`executor::hold`). Then
+/// `vkSignalSemaphore` covers it, the submit is released, and the GPU runs
+/// it: every word it copies is checked.
+///
+/// Even so it runs in a child process with a hard kill timeout, because the
+/// failure it guards against is a driver that no longer returns: this
+/// process is never the one at risk. The child self-skips without a GPU.
+#[test]
+fn a_wait_before_its_signal_never_reaches_the_driver_and_runs_once_signalled() {
+    const NAME: &str = "host_vulkan::pipeline_tests::a_wait_before_its_signal_never_reaches_the_driver_and_runs_once_signalled";
+    if std::env::var_os(WAIT_BEFORE_SIGNAL_CHILD).is_some() {
+        wait_before_signal_on_the_real_gpu();
+        return;
+    }
+    let exe = std::env::current_exe().expect("the test binary");
+    let mut child = std::process::Command::new(exe)
+        .args([NAME, "--exact", "--nocapture", "--test-threads", "1"])
+        .env(WAIT_BEFORE_SIGNAL_CHILD, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the child test process");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the child's status") {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let output = child.wait_with_output().expect("the child's output");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for line in text
+        .lines()
+        .filter(|l| l.starts_with("wait-before-signal") || l.starts_with("skipping"))
+    {
+        eprintln!("child: {line}");
+    }
+    match status {
+        None => panic!("the child did not finish in 120 s — the driver wedged:\n{text}"),
+        Some(status) => assert!(status.success(), "the child failed ({status}):\n{text}"),
+    }
+}
+
+fn wait_before_signal_on_the_real_gpu() {
+    const SIZE: u64 = 64 * 1024;
+    const WORDS: usize = (SIZE / 4) as usize;
+    const T: u64 = 0x7600;
+    const F0: u64 = 0x7601;
+    const F1: u64 = 0x7602;
+    let Some(host) = host() else { return };
+    let mut h = setup_1_3(host);
+    let x = buffer(
+        &mut h,
+        0x6a10,
+        SIZE,
+        USAGE_TRANSFER_SRC | USAGE_TRANSFER_DST,
+        false,
+    );
+    let out = buffer(&mut h, 0x6a20, SIZE, USAGE_TRANSFER_DST, true);
+    out.write_words(&vec![0; WORDS]);
+    let hr = (STAGE_HOST, ACCESS_HOST_READ);
+    let tw = (STAGE_TRANSFER, ACCESS_TRANSFER_WRITE);
+    assert_eq!(
+        h.submit_recording(&[
+            begin(CB),
+            fill(CB, x.id, 0, WHOLE_SIZE, 0x5151_a5a5),
+            end(CB)
+        ]),
+        Outcome::Consumed
+    );
+    assert_eq!(
+        h.submit_recording(&[
+            begin(CB + 1),
+            copy_buffer(CB + 1, x.id, out.id, &[(0, 0, SIZE)]),
+            buffer_barrier(CB + 1, out.id, tw, hr),
+            end(CB + 1),
+        ]),
+        Outcome::Consumed
+    );
+    submit_and_wait(&mut h, &[CB], F0);
+    h.send(&create_semaphore(DEVICE, T, Some(0), 0)).unwrap();
+    h.send(&create_fence(DEVICE, F1, false)).unwrap();
+    // The copy waits on T = 1, which nothing has signalled.
+    h.send(&submit_semaphores(
+        QUEUE,
+        &[CB + 1],
+        &[(T, 1)],
+        &[],
+        true,
+        F1,
+    ))
+    .unwrap();
+    let held = |h: &Harness<AshVulkan>, ctx: u32| {
+        h.renderer
+            .factory()
+            .with_context(
+                ctx,
+                crate::venus::executor::context::VulkanContext::held_items,
+            )
+            .unwrap_or(0)
+    };
+    assert_eq!(held(&h, CTX), 1, "held on the host");
+    let held_at = std::time::Instant::now();
+
+    // Another context, another VkDevice, real GPU work meanwhile.
+    h.use_context(2);
+    let mut h = setup_1_3_on(h);
+    let words = buffer(&mut h, 0x6a30, 256 * 4, USAGE_TRANSFER_DST, true);
+    words.write_words(&vec![0; 256]);
+    let cbs: Vec<u64> = (0..64).map(|i| 0x7_1000 + i).collect();
+    h.send(&allocate_cbs(DEVICE, POOL, &cbs, false)).unwrap();
+    for (i, cb) in cbs.iter().enumerate() {
+        assert_eq!(
+            h.submit_recording(&[
+                begin(*cb),
+                fill(*cb, words.id, i as u64 * 4, 4, 0x7000_0000 | i as u32),
+                buffer_barrier(*cb, words.id, tw, hr),
+                end(*cb),
+            ]),
+            Outcome::Consumed
+        );
+        submit_and_wait(&mut h, &[*cb], 0x7_2000 + i as u64);
+    }
+    let other = words.read_words(64);
+    assert!((0..64).all(|i| other[i] == 0x7000_0000 | i as u32));
+    assert_eq!(held(&h, CTX), 1, "still held: nothing covered it");
+
+    // The host signals: the copy goes to the driver and runs.
+    h.use_context(CTX);
+    h.send(&signal_semaphore(DEVICE, T, 1)).unwrap();
+    assert_eq!(held(&h, CTX), 0, "released");
+    h.send(&wait_fences(DEVICE, &[F1], u64::MAX)).unwrap();
+    let wrong = out
+        .read_words(WORDS)
+        .iter()
+        .filter(|w| **w != 0x5151_a5a5)
+        .count();
+    let counts = {
+        use crate::venus::renderer::SinkFactory;
+        h.renderer.factory().usage().holds
+    };
+    eprintln!(
+        "wait-before-signal: held {:?} on the host while another device ran 64 fenced submits, \
+         released by vkSignalSemaphore, {wrong} of {WORDS} words wrong; holds {counts:?}",
+        held_at.elapsed()
+    );
+    assert_eq!(wrong, 0);
+    assert_eq!((counts.held, counts.released), (1, 1));
+    assert!(!h.fatal());
+    h.send(&Command::DestroyInstance(DestroyInstanceArgs {
+        instance: VkInstance(INSTANCE),
+    }))
+    .unwrap();
+    h.use_context(2);
+    teardown(h);
+}

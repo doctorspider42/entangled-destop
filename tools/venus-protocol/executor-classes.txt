@@ -202,6 +202,13 @@ vkCmdPipelineBarrier2
 vkCmdWaitEvents
 vkCmdWaitEvents2
 vkCmdSetEvent2                  # and no ownership transfer at all
+# The wait-before-signal amendment: every event operation is noted, so a
+# submit waiting on an event nobody set is held on the host (executor::hold).
+vkCmdSetEvent
+vkCmdResetEvent
+vkCmdResetEvent2
+vkSetEvent                      # releases the submits it covers
+vkResetEvent                    # waits for submitted work that waits on it
 
 [generated]
 vkEndCommandBuffer
@@ -209,8 +216,6 @@ vkTrimCommandPool
 vkMergePipelineCaches
 vkGetFenceStatus
 vkGetEventStatus
-vkSetEvent
-vkResetEvent
 vkGetRenderAreaGranularity
 vkGetDescriptorSetLayoutSupport
 vkGetDeviceGroupPeerMemoryFeatures
@@ -233,9 +238,6 @@ vkCmdClearColorImage
 vkCmdClearDepthStencilImage
 vkCmdResolveImage
 vkCmdResolveImage2
-vkCmdSetEvent
-vkCmdResetEvent
-vkCmdResetEvent2
 vkCmdNextSubpass
 vkCmdNextSubpass2
 vkCmdEndRenderPass
