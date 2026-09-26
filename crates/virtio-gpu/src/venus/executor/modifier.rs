@@ -88,8 +88,13 @@
 //!    more; one that does is refused.
 //!
 //! Anything but `DRM_FORMAT_MOD_LINEAR` is refused: the format query answers
-//! `VK_ERROR_FORMAT_NOT_SUPPORTED`, and a create naming another modifier is
-//! fatal, as a guest that ignored the query's answer is.
+//! `VK_ERROR_FORMAT_NOT_SUPPORTED`, and a create whose explicit modifier is
+//! another, or whose modifier list does not name LINEAR at all, is fatal, as
+//! a guest that ignored the query's answer is. A list that names LINEAR
+//! *among* others is the implementation's to pick from, and LINEAR is picked
+//! (and reported by `vkGetImageDrmFormatModifierPropertiesEXT`): Zink passes
+//! its frontend's list through unfiltered, and Xwayland's glamor hands it
+//! Mutter's `[LINEAR, DRM_FORMAT_MOD_INVALID]` (ADR-0004, "X11 applications").
 //!
 //! # The third party: the scanout device (stage S2b)
 //!

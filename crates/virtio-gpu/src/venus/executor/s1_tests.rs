@@ -32,11 +32,11 @@ pub(super) const H: u32 = 1080;
 /// 1920 × 4, already 256-aligned.
 pub(super) const PITCH: u64 = 7680;
 /// `rowPitch × height`, which the requirements are raised to.
-const PLANE: u64 = PITCH * H as u64;
+pub(super) const PLANE: u64 = PITCH * H as u64;
 
 pub(super) const MUTABLE: u32 = 0x8;
 pub(super) const USAGE_SAMPLED: u32 = 0x4;
-const USAGE_STORAGE: u32 = 0x8;
+pub(super) const USAGE_STORAGE: u32 = 0x8;
 pub(super) const USAGE_COLOR: u32 = 0x10;
 pub(super) const USAGE_TRANSFER: u32 = 0x1 | 0x2;
 /// What the fake's scanout formats support once they have attachments:
@@ -44,7 +44,8 @@ pub(super) const USAGE_TRANSFER: u32 = 0x1 | 0x2;
 pub(super) const SCANOUT_FEATURES: u32 = 0x1_d401 | 0x80 | 0x100 | 0x2;
 /// The superset those features give: transfers, sampled, storage, colour
 /// and input attachment.
-const SUPERSET: u32 = USAGE_TRANSFER | USAGE_SAMPLED | USAGE_STORAGE | USAGE_COLOR | 0x80;
+pub(super) const SUPERSET: u32 =
+    USAGE_TRANSFER | USAGE_SAMPLED | USAGE_STORAGE | USAGE_COLOR | 0x80;
 
 /// What a Zink device enables for GNOME on the GPU, as venus sends it.
 pub(super) const S1_EXTENSIONS: &[&str] = &[
@@ -133,14 +134,14 @@ pub(super) fn s1_with(exts: &[&'static str]) -> (Harness<FakeVulkan>, Arc<FakeVu
     (h, host)
 }
 
-fn fatal_on(h: &mut Harness<FakeVulkan>, command: &Command<'_>, what: &str) {
+pub(super) fn fatal_on(h: &mut Harness<FakeVulkan>, command: &Command<'_>, what: &str) {
     let head = h.call(command).expect_err(what);
     assert_eq!(head, h.last_start, "{what}: head stays before the command");
     assert!(h.fatal(), "{what}");
 }
 
 /// A fresh S1 harness per refusal, the refusal fatal to it.
-fn refused(command: Command<'static>, what: &str) {
+pub(super) fn refused(command: Command<'static>, what: &str) {
     let (mut h, _) = s1();
     fatal_on(&mut h, &command, what);
 }
@@ -282,7 +283,10 @@ pub(super) fn requirements(h: &mut Harness<FakeVulkan>, image: u64) -> VkMemoryR
     r.p_memory_requirements.unwrap().memory_requirements
 }
 
-fn resource_properties(h: &mut Harness<FakeVulkan>, resource_id: u32) -> (i32, u32, u64) {
+pub(super) fn resource_properties(
+    h: &mut Harness<FakeVulkan>,
+    resource_id: u32,
+) -> (i32, u32, u64) {
     let Command::GetMemoryResourcePropertiesMESA(p) = h
         .call(&Command::GetMemoryResourcePropertiesMESA(
             GetMemoryResourcePropertiesMESAArgs {
@@ -752,7 +756,7 @@ fn imports_of_a_handle_blob_are_refused_in_vulkan_terms() {
 
 // ------------------------------------------- the modifier, as it is queried
 
-fn format_query(format: i32, list2: bool, capacity: Option<u32>) -> Command<'static> {
+pub(super) fn format_query(format: i32, list2: bool, capacity: Option<u32>) -> Command<'static> {
     let link = if list2 {
         VkFormatProperties2Next::VkDrmFormatModifierPropertiesList2EXT(
             VkDrmFormatModifierPropertiesList2EXT {
@@ -784,7 +788,7 @@ fn format_query(format: i32, list2: bool, capacity: Option<u32>) -> Command<'sta
 }
 
 /// `(count, [(modifier, planes, features)])` of a format's modifier list.
-fn modifiers_of(
+pub(super) fn modifiers_of(
     h: &mut Harness<FakeVulkan>,
     format: i32,
     capacity: Option<u32>,
@@ -875,7 +879,7 @@ fn host_cannot_export_lists_nothing() {
     assert_eq!(modifiers_of(&mut h, BGRA, Some(4)), (0, Vec::new()));
 }
 
-fn image_query(
+pub(super) fn image_query(
     format: i32,
     usage: u32,
     flags: u32,
@@ -916,7 +920,7 @@ fn image_query(
     })
 }
 
-fn image_answer(
+pub(super) fn image_answer(
     h: &mut Harness<FakeVulkan>,
     command: &Command<'_>,
 ) -> (i32, VkImageFormatProperties2) {
@@ -1242,10 +1246,10 @@ fn every_modifier_image_outside_the_emulation_is_refused() {
                     USAGE_SAMPLED,
                     0,
                     None,
-                    Named::List(vec![0, 0x0300_0000_0000_0001]),
+                    Named::List(vec![0x0300_0000_0000_0001]),
                 ),
             ),
-            "a list with a modifier other than LINEAR",
+            "a list without LINEAR (with it, LINEAR is chosen: x11_tests)",
         ),
         (
             create_image(

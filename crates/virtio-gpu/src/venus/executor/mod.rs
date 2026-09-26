@@ -216,6 +216,8 @@ mod submit_tests;
 mod sync_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod x11_tests;
 
 use std::collections::HashMap;
 use std::io;

@@ -2250,11 +2250,13 @@ impl ImageRules {
 }
 
 /// How a DRM-modifier image names its modifier (stage S1): a list the
-/// implementation picks from — `DRM_FORMAT_MOD_LINEAR` alone here — or an
-/// explicit LINEAR with its one plane's layout.
+/// implementation picks from — `DRM_FORMAT_MOD_LINEAR`, the one modifier
+/// offered, whatever else the list names — or an explicit LINEAR with its
+/// one plane's layout.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum ModifierChoice {
-    /// `VkImageDrmFormatModifierListCreateInfoEXT`, every entry LINEAR.
+    /// `VkImageDrmFormatModifierListCreateInfoEXT` naming LINEAR, which is
+    /// chosen; its other entries are modifiers this device never offered.
     List,
     /// `VkImageDrmFormatModifierExplicitCreateInfoEXT` of LINEAR, one plane.
     Explicit(crate::venus::protocol::VkSubresourceLayout),
@@ -2565,9 +2567,10 @@ pub(super) fn image_limits_hold<H: HostVulkan>(
 /// `:1504`, `OPAQUE_FD` rewritten to `DMA_BUF` by Mesa's venus): it is
 /// created as any image is, and an export of its memory succeeds exactly
 /// when that memory is ours — and whether it is a DRM-modifier image (stage
-/// S1), whose modifier must be `DRM_FORMAT_MOD_LINEAR`, named by exactly one
-/// of a list and an explicit create info (`VUID-VkImageCreateInfo-tiling-02261`,
-/// `-pNext-02262`), the explicit one of one plane with a zero size, array
+/// S1), whose modifier is `DRM_FORMAT_MOD_LINEAR`, named by exactly one of a
+/// list and an explicit create info (`VUID-VkImageCreateInfo-tiling-02261`,
+/// `-pNext-02262`) — a list that includes LINEAR among anything else, LINEAR
+/// chosen from it, or an explicit LINEAR of one plane with a zero size, array
 /// pitch and depth pitch (`VUID-VkImageDrmFormatModifierExplicitCreateInfoEXT-size-02267`
 /// and the two after it).
 pub(super) fn check_image_create_info(
@@ -2625,13 +2628,10 @@ pub(super) fn check_image_create_info(
     }
     let mut external = false;
     let mut chosen: Vec<ModifierChoice> = Vec::new();
-    let not_linear = |what: &str| {
+    let not_drm_tiling = |what: &str| {
         invalid(
             command,
-            format!(
-                "{what}: DRM_FORMAT_MOD_LINEAR is the only modifier offered, and only for DRM \
-                 format modifier tiling"
-            ),
+            format!("{what} on an image whose tiling is not DRM format modifier tiling"),
         )
     };
     for link in &info.p_next {
@@ -2646,19 +2646,44 @@ pub(super) fn check_image_create_info(
                 check_usage(command, s.stencil_usage)?;
             }
             VkImageCreateInfoNext::VkImageDrmFormatModifierListCreateInfoEXT(l) => {
+                if !drm_tiling {
+                    return Err(not_drm_tiling("a modifier list"));
+                }
+                // The implementation picks from the list (the "X11
+                // applications" amendment of ADR-0004): LINEAR, the one
+                // modifier offered, whatever else the list names. Zink
+                // passes its frontend's list through unfiltered
+                // (`zink_resource.c:1364-1369`), and Xwayland's glamor hands
+                // it Mutter's, which ends every format with
+                // `DRM_FORMAT_MOD_INVALID` (`meta-wayland-dma-buf.c:1759-1765`).
                 let list = l.p_drm_format_modifiers.as_deref().unwrap_or_default();
-                if !drm_tiling
-                    || list.is_empty()
-                    || list.iter().any(|m| *m != modifier::DRM_FORMAT_MOD_LINEAR)
-                {
-                    return Err(not_linear("a modifier list"));
+                if !list.contains(&modifier::DRM_FORMAT_MOD_LINEAR) {
+                    return Err(invalid(
+                        command,
+                        format!(
+                            "a modifier list of {} without DRM_FORMAT_MOD_LINEAR, the only \
+                             modifier offered (first: {:#x?})",
+                            list.len(),
+                            &list[..list.len().min(4)]
+                        ),
+                    ));
                 }
                 chosen.push(ModifierChoice::List);
             }
             VkImageCreateInfoNext::VkImageDrmFormatModifierExplicitCreateInfoEXT(e) => {
                 let planes = e.p_plane_layouts.as_deref().unwrap_or_default();
-                if !drm_tiling || e.drm_format_modifier != modifier::DRM_FORMAT_MOD_LINEAR {
-                    return Err(not_linear("an explicit modifier"));
+                if !drm_tiling {
+                    return Err(not_drm_tiling("an explicit modifier"));
+                }
+                if e.drm_format_modifier != modifier::DRM_FORMAT_MOD_LINEAR {
+                    return Err(invalid(
+                        command,
+                        format!(
+                            "an explicit modifier {:#x}: DRM_FORMAT_MOD_LINEAR is the only \
+                             modifier offered",
+                            e.drm_format_modifier
+                        ),
+                    ));
                 }
                 let [plane] = planes else {
                     return Err(invalid(

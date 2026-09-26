@@ -570,6 +570,27 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   can pick belongs in `modifier::SCANOUT_FORMATS`. Check a client with
   `WAYLAND_DEBUG=client`: `zwp_linux_buffer_params_v1#N.add(...)`, not
   `wl_shm#N.create_pool`.
+- **What the format queries advertise, `vkCreateImage` must accept**
+  (ADR-0004, "X11 applications"). The two are judged by different code
+  (`modifier::image_format_properties` against `check_image_create_info` +
+  `modifier_create_info`), and the one time they disagreed it killed
+  Xwayland: glamor on Zink asked about LINEAR alone, was told yes, then
+  created with Mutter's whole list `[LINEAR, DRM_FORMAT_MOD_INVALID]` (Zink
+  chains its frontend's list unfiltered) and the context was made fatal. A
+  modifier list is the implementation's to pick from: LINEAR is chosen from
+  any list that names it; only a list without LINEAR, or an explicit
+  non-LINEAR modifier, is refused. `x11_tests::everything_the_format_queries_advertise_a_create_accepts`
+  holds query and create together over formats × usage × flags × the four
+  ways of naming LINEAR — extend its matrix when you add a scanout format, an
+  ignored flag or a new shape. Each harness call is a real ring round trip
+  (~2 ms), so sample monotone dimensions instead of enumerating them.
+- **X11 clients reach the GPU through Xwayland**, which Mutter starts on the
+  first X connection. In a serial-console probe take `XAUTHORITY` from
+  Xwayland's own `-auth` argument (`pgrep -a Xwayland`), not from
+  gnome-shell's environment, which predates it: without it `glxinfo` says
+  `unable to open display :0`, which is exactly what a crashed Xwayland says
+  too. The journal line that tells them apart is gnome-shell's
+  `X Wayland crashed; attempting to recover`.
 - **The desktop's flips are presented by the display's own GPU on Windows**
   (ADR-0004, zero-copy presentation). A renderer-blob flush first asks
   `Renderer3d::begin_shared_scanout` for a **lease**: the image, its
