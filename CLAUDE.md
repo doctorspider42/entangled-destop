@@ -31,8 +31,10 @@ Linux/KVM (the MVP target) and Windows/WHP both run `entangled install`, `run`,
 ISO, offline); `install debian` additionally needs the bootstrap kernel, which
 only *builds* on Linux but is published per release and downloaded by
 `entangled fetch bootstrap-kernel` on either host. On this Windows machine the
-Linux side runs in WSL Ubuntu (has `/dev/kvm` via nested virtualization) or the
-Dockerfile:
+Linux side runs in WSL Ubuntu or the Dockerfile — builds and non-KVM tests only:
+this Windows 10 / AMD host cannot give WSL `/dev/kvm` (WSL answers "nested
+virtualization is not supported on this machine"), so every KVM test self-skips
+here and needs a real Linux/KVM host:
 
 ```bash
 wsl -d Ubuntu -e bash -lc "cd /mnt/d/entangled-desktop && cargo test --workspace"

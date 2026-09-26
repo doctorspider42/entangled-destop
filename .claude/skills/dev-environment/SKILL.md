@@ -15,8 +15,11 @@ description: >
 
 Two supported hosts, both exercised for every change:
 
-- **Linux/KVM** lives in WSL Ubuntu (`wsl -d Ubuntu`, user `spider`, has
-  `/dev/kvm` via nested virtualization). This is the MVP target and the only
+- **Linux/KVM** lives in WSL Ubuntu (`wsl -d Ubuntu`, user `spider`). It has
+  **no `/dev/kvm`** on this Windows 10 / AMD host: WSL reports nested
+  virtualization as unsupported (checked 2026-09-26 with
+  `nestedVirtualization=true`; `.wslconfig` keeps `false`), so KVM tests
+  self-skip here and a KVM change needs a real Linux host to be verified. This is the MVP target and the only
   host for `entangled install`.
 - **Windows native** builds and tests the whole workspace too (WHP backend,
   manager, installer). cargo is on PATH in PowerShell. This machine has the
