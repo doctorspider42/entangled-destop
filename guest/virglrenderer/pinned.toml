@@ -44,14 +44,15 @@
 #   every fetch die on a mismatch and stopped `release.yml` building an
 #   installer at all.
 #
-# STATUS, 2026-09-16: the workflow below has never been run, so this tag has no
-#   release behind it and a fetch answers 404 with a message that says exactly
-#   that. The digests are placeholders and are *meant* to be wrong — they are
-#   the shape the pin takes, not a claim about any bytes. Run the workflow, then
-#   replace this whole block with what its summary prints, and delete this note.
-#   Until then the way in is a local build:
-#   `bash guest/virglrenderer/build-virglrenderer.sh`, then
-#   `ENTANGLED_VIRGL_DIR=<its lib dir>` or `ENTANGLED_VIRGL_LIB=<the .so>`.
+# WHAT THIS BLOCK WAS UNTIL 2026-09-26
+#   Placeholders (all-zero digests), from 0526b91 until the workflow first ran
+#   on 2026-09-25. It published `virglrenderer-1.1.0-1` from the same push as
+#   release v0.2.49, and nobody committed the block its summary printed, so
+#   v0.2.49 shipped with the zeros: `entangled fetch virglrenderer` downloaded
+#   the real library and deleted it on the digest mismatch, for everyone. The
+#   fresh-install acceptance found it; `scripts/fresh-install-acceptance.sh` now
+#   runs that fetch with an empty cache, the check the firmware pin already had.
+#   The digests below are the published assets' (the release's SHA256SUMS).
 
 tag = "virglrenderer-1.1.0-1"
 virglrenderer_version = "1.1.0"
@@ -60,10 +61,10 @@ source = "https://github.com/doctorspider42/entangled-destop/releases/tag/virglr
 
 [[assets]]
 name = "libvirglrenderer.so.1"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-bytes = 0
+sha256 = "e089546dc24a93645d6848467fe0570a79e234acb6ba8c74e58cd98571aa1d0c"
+bytes = 2089192
 
 [[assets]]
 name = "virgl_render_server"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-bytes = 0
+sha256 = "4370742836f5d88dd49d44697ed169cf44740a82a3f577f7293c543bd85cfffc"
+bytes = 1411600

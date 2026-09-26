@@ -233,6 +233,40 @@ else
   fi
 
   # ---------------------------------------------------------------------------
+  say "fetch virglrenderer — the Venus renderer, with no token"
+  # ---------------------------------------------------------------------------
+
+  # The same bargain as the firmware, and the same trap: the digests in
+  # guest/virglrenderer/pinned.toml are compiled in, and a host that already has
+  # a renderer in its cache never fetches. v0.2.49 shipped with the all-zero
+  # placeholder digests although the pinned release had been published the same
+  # day, so every download was deleted on a mismatch. This is the check that
+  # would have said so within minutes of the release.
+  stranger "$LOG_DIR/fetch-virgl.log" 300 -- "$engine" fetch virglrenderer
+  virgl_rc=$?
+  tail -3 "$LOG_DIR/fetch-virgl.log" | sed 's/^/         /'
+  check $virgl_rc "a newcomer with no GitHub credentials can fetch the Venus renderer" \
+    "$(tail -1 "$LOG_DIR/fetch-virgl.log" | cut -c1-300)"
+
+  vlib=$(find "$HOME_DIR/.cache/entangled/virglrenderer" -name 'libvirglrenderer.so.1' 2>/dev/null | head -1)
+  vsrv=$(find "$HOME_DIR/.cache/entangled/virglrenderer" -name 'virgl_render_server' 2>/dev/null | head -1)
+  if [ -n "$vlib" ] && [ -n "$vsrv" ] && [ -x "$vsrv" ]; then
+    check 0 "the library and its render server land in the (empty) verified cache" "$vlib"
+  else
+    check 1 "the library and its render server land in the (empty) verified cache" \
+      "lib=${vlib:-none} server=${vsrv:-none} — Venus in 1.1 does not work without the executable render server"
+  fi
+
+  stranger "$LOG_DIR/doctor-virgl.log" 240 -- "$engine" doctor
+  three_d=$(grep -E '^[[:space:]]*3D[[:space:]]*:' "$LOG_DIR/doctor-virgl.log" | head -1)
+  if printf '%s' "$three_d" | grep -q 'Venus — virglrenderer at .*(from the verified cache)'; then
+    check 0 "doctor now reports Venus, from the verified cache" "$(printf '%s' "$three_d" | sed 's/^ *//')"
+  else
+    check 1 "doctor now reports Venus, from the verified cache" \
+      "${three_d:-no 3D line} — a renderer doctor cannot find is a renderer run cannot load"
+  fi
+
+  # ---------------------------------------------------------------------------
   say "engine — the surface the Windows installer drives"
   # ---------------------------------------------------------------------------
 
