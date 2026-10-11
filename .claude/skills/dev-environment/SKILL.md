@@ -66,7 +66,12 @@ gh run view <run-id> --log-failed | grep -E "FAILED|panicked at|error" | head -4
 ```
 
 `CI` (`ci.yml`) is the one that gates; `Release` runs alongside it and
-publishes. If CI fails, fix it straight away — even when the failing test is
+publishes, and `Fresh install` follows the release (a few minutes later) —
+check that one too. A `Fresh install` failing in its download stage with
+`API rate limit exceeded for <ip>` is the shared runner's IP spending the
+unauthenticated 60 requests an hour (the script stays token-less on purpose);
+`gh run rerun <run-id> --failed` lands on another runner and is the fix — a
+real 404 or a missing asset is not. If CI fails, fix it straight away — even when the failing test is
 not yours, because `main` is red for everyone and the next release ships from
 it — then push the fix and watch that run too. Report the CI result (run link
 and verdict) to the user with the rest of the work; never report a push as
