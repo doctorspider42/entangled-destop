@@ -6113,7 +6113,12 @@ mod tests {
         let guest = rig.guest();
         let alive = || guest.load_word(STATUS) & STATUS_ALIVE != 0;
 
+        // Parked first, and woken the way a real guest wakes it: a test that
+        // submits without the doorbell passes only while the worker is still
+        // spinning, which a slow CI runner does not guarantee (2026-10-11).
+        rig.wait_parked();
         guest.submit(b"a very long command");
+        rig.doorbell();
         eventually("the worker to be inside the sink", || gate.entered());
         for _ in 0..3 {
             guest.clear_status_bits(STATUS_ALIVE);

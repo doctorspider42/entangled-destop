@@ -51,6 +51,27 @@ Full pre-merge verification checklist (both hosts): `cargo fmt --all --check`,
 --workspace`, `cargo deny check` (Linux is enough for deny; it is a license
 gate and licenses don't differ per OS).
 
+**After every push to `main`, check that CI passed — a push is not done until
+it is green.** Local green does not imply CI green: the runners are slower and
+smaller than this desktop, so timing races that never lose here lose there. On
+2026-10-11 a push that was green on both hosts here failed CI on both runners —
+a Venus renderer test submitted to a ring without ringing the doorbell and
+passed only while the worker was still spinning, which a slow runner does not
+guarantee. So after the push:
+
+```bash
+gh run list --branch main --limit 5                      # find the CI run for your merge commit
+gh run watch <run-id> --exit-status                      # blocks until it ends; run it in the background
+gh run view <run-id> --log-failed | grep -E "FAILED|panicked at|error" | head -40
+```
+
+`CI` (`ci.yml`) is the one that gates; `Release` runs alongside it and
+publishes. If CI fails, fix it straight away — even when the failing test is
+not yours, because `main` is red for everyone and the next release ships from
+it — then push the fix and watch that run too. Report the CI result (run link
+and verdict) to the user with the rest of the work; never report a push as
+finished while its CI is still running or red.
+
 ## Disk discipline — read this even if nothing else
 
 This machine has three chronically scarce disks and a history of self-inflicted
