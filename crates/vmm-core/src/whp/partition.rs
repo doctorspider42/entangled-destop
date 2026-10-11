@@ -19,7 +19,7 @@ use windows::Win32::System::Hypervisor::{
 use crate::hv::{DirtyLog, DirtyPages, DirtyTracking, HvError, MachineConfig, DIRTY_PAGE_SIZE};
 use crate::memory::{create_guest_memory, GuestMem};
 use crate::shm::SharedWindow;
-use crate::whp::cpuid::GuestClocks;
+use crate::whp::cpuid::{GuestClocks, PackageTopology};
 use crate::whp::interrupt::{HaltGate, WhpInterruptDelivery};
 use crate::whp::regs::{seg_from_whp, zeroed_value, Aligned16};
 use crate::whp::vcpu::{get_regs_raw, WhpVcpu};
@@ -185,6 +185,17 @@ impl WhpHypervisor {
             intel: self.capabilities.processor_vendor == Some("Intel"),
         })
     }
+
+    /// The topology the CPUID policy describes for `vcpus` processors on this
+    /// host: one package of single-threaded cores on AMD and Hygon, whose
+    /// Linux turns WHP's default answer into a package per vCPU and an
+    /// unsynchronized TSC ([`crate::whp::cpuid`], "One package, not `n`").
+    /// `None` on Intel, which describes topology through leaves the policy does
+    /// not rewrite.
+    pub fn guest_topology(&self, vcpus: u32) -> Option<PackageTopology> {
+        matches!(self.capabilities.processor_vendor, Some("AMD" | "Hygon"))
+            .then_some(PackageTopology { cores: vcpus })
+    }
 }
 
 /// What a partition needs switched on beyond the phase-1 minimum.
@@ -257,6 +268,9 @@ pub struct Partition {
     /// What the CPUID timing leaves report; `None` without the CPUID policy
     /// or when WHP does not report its clocks.
     clocks: Option<GuestClocks>,
+    /// What the CPUID topology leaves describe; `None` without the CPUID
+    /// policy or on Intel.
+    topology: Option<PackageTopology>,
     /// Firmware ROM mappings (EPIC 18): the WHP peer of [`crate::Vm`]'s ROM
     /// slots. Deliberately *not* part of `memory` — a ROM is not guest RAM and
     /// must never show up in a memory map. Held here so the host mapping
@@ -296,6 +310,10 @@ impl Partition {
 
     pub(super) fn clocks(&self) -> Option<GuestClocks> {
         self.clocks
+    }
+
+    pub(super) fn topology(&self) -> Option<PackageTopology> {
+        self.topology
     }
 }
 
@@ -414,6 +432,10 @@ impl WhpPartition {
             halt_gate: Arc::new(HaltGate::default()),
             vcpu_count: cfg.vcpu_count,
             clocks: options.cpuid_policy.then(|| hv.guest_clocks()).flatten(),
+            topology: options
+                .cpuid_policy
+                .then(|| hv.guest_topology(cfg.vcpu_count))
+                .flatten(),
             roms: Mutex::new(Vec::new()),
         });
 

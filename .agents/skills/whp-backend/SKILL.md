@@ -318,6 +318,16 @@ the boot working at all: with RIP left on the `hlt`, `default_idle()` would
 re-halt after every interrupt and never reach its `need_resched` check, and the
 guest would appear to hang at first idle.
 
+**Measured 2026-10-11 (Windows 10 19045, local APIC emulation on): the halt
+exit does not come at all.** A traced 2-vCPU boot of Ubuntu's 7.0 kernel made
+~200 000 exits and not one `X64Halt`; an idle 8-vCPU GNOME desktop logged fewer
+than 200 halts per vCPU in two minutes (instrumented, not committed). WHP blocks
+`hlt` inside `WHvRunVirtualProcessor` and wakes it for its own LAPIC timer, so
+an in-guest `sleep(1 ms)` takes 1.1–1.2 ms, not the 15.6 ms Windows' condvar
+granularity would give if the gate were serving it. The gate stays, correct and
+cheap, for the hosts and modes that do report the exit. Do not "fix" idle
+latency here before you have seen halts in `ENTANGLED_WHP_TRACE_EXITS`.
+
 ## Where the irqchip lives, and why
 
 `machine-x86::irqchip`, portable and tested on both hosts — **not**
@@ -536,7 +546,7 @@ including the feature bits WHP masks for its own reasons.
 `DefaultResultRax..Rdx`, which makes the policy a *diff*, the same shape as the
 KVM path's edit of `KVM_GET_SUPPORTED_CPUID`.
 
-23 leaves in `CPUID_EXIT_LEAVES`. An entry costs an exit only when the guest
+24 leaves in `CPUID_EXIT_LEAVES`. An entry costs an exit only when the guest
 *reads* that leaf, so keep the list to leaves the policy changes. Five mirror
 `vmm_core::Vcpu::new` exactly:
 
@@ -545,6 +555,15 @@ KVM path's edit of `KVM_GET_SUPPORTED_CPUID`.
 | `0x1` | `ECX[31] = 1` (hypervisor present); `EBX[31:24] = vp_index` (initial APIC id) |
 | `0xb`, `0x1f`, `0x8000_0026` | `EDX = vp_index` (x2APIC id) |
 | `0x8000_001e` | `EAX = vp_index` (AMD extended APIC id — the one Linux trusts with TOPOEXT) |
+
+On **AMD/Hygon** hosts the policy also describes the topology (see
+[One package](#one-package-not-n-2026-10-11)):
+
+| Leaf | Change |
+|---|---|
+| `0x1` | `EBX[23:16]` = `2^ceil(log2 n)` addressable ids, `EDX[28]` HTT = `n > 1` |
+| `0x8000_0008` | `ECX[7:0]` NC = `n - 1`, `ECX[15:12]` ApicIdSize = `ceil(log2 n)` |
+| `0x8000_001e` | `EBX` core id = `vp_index`, one thread per core; `ECX` node 0 of 1 |
 
 The hypervisor range is the one place the hosts legitimately differ: **the
 `0x4000_0000` signature is zeroed.** A WHP partition runs on Hyper-V, and a guest
@@ -581,17 +600,48 @@ exit latency, the PM timer — accurate, and not the panic (see the PIT notes).
 Impersonating VMware or ACRN would fix the log line and change what
 `systemd-detect-virt` and the guest's drivers believe; it was rejected.
 
-Also found, and **open**: WHP here does not offer invariant TSC
-(`WHvCapabilityCodeProcessorFeaturesBanks` bank 1 is `0x4`, i.e. `ClZero` only,
-no `TscInvariantSupport`), and our topology leaves describe every vCPU as its own
-package (`CPU topo: Max. logical packages: 8`). On AMD that makes
-`unsynchronized_tsc()` true for any SMP guest: `tsc: Marking TSC unstable due to
-TSCs unsynchronized`, clocksource `acpi_pm`, and every `clock_gettime` a port
-exit. A one-vCPU guest passes that check and then loses the TSC to the
-clocksource watchdog in 9 of 10 boots (`refined-jiffies` 495 ms vs the TSC's
-742 ms: jiffies run a third slow before a clocksource is chosen) — suspected,
-not measured: a halted vCPU sleeps on the halt gate until one of *our*
-injections or `HALT_POLL`, and WHP's in-hypervisor LAPIC timer is neither.
+### One package, not `n` (2026-10-11)
+
+WHP's defaults on this AMD host describe no topology: leaf `0x1` has HTT clear
+and a logical count of 0, `0x8000_0008.ECX` is 0 (one core), `0x8000_001e` is
+zero beyond the APIC id, while `0x8000_0001.ECX` *does* advertise TOPOEXT.
+Linux's `parse_8000_0008()` makes that a core shift of 0 — every APIC id its own
+package, `CPU topo: Max. logical packages: 8` — and on non-Intel parts
+`unsynchronized_tsc()` returns true for more than one package before it ever
+looks at the TSC: `tsc: Marking TSC unstable due to TSCs unsynchronized`,
+clocksource `acpi_pm` (the only one left in `available_clocksource`), and every
+`clock_gettime` a port exit to this process.
+
+`CpuidPolicy::with_topology(PackageTopology { cores: n })` describes one package
+of `n` single-threaded cores (table above). `WhpHypervisor::guest_topology`
+returns it for AMD and Hygon only; Intel is untouched because Linux never
+applies the multi-package rule there and describes Intel topology through
+`0x4`/`0xb`/`0x1f`. No invariant-TSC bit is claimed: WHP does not offer
+`TscInvariantSupport` here (bank 1 = `0x4`, `ClZero` only), and the topology
+alone is enough.
+
+Measured on the installed 8-vCPU Ubuntu 26.04 desktop, release build:
+
+| | before | after |
+|---|---|---|
+| `CPU topo` | 8 packages × 1 core | 1 package × 8 cores |
+| clocksource | `acpi_pm` | `tsc` (`Refined TSC clocksource calibration: 3500.047 MHz` — WHP's own figure) |
+| `time.monotonic_ns()` in Python, per call | **6 835 ns** | **112 ns** |
+
+The guest's own TSC warp check at AP bring-up passes (no `TSC synchronization`
+complaint) — every VP of a partition shares one offset on the host's TSC. It
+holds under load too: the same desktop with 24 spinning host threads on 24
+logical CPUs for ten minutes stayed on `tsc`, with no `unstable` line (Linux
+skipped one watchdog check as a `Long readout interval` and the refinement, so
+it kept the early 3499.875 MHz — 36 ppm off, harmless). The direct-boot timer
+loop (`whp_timer`, Ubuntu's 7.0 kernel) agrees at 1 and 8 vCPUs.
+
+The **1-vCPU watchdog loss** recorded in the 2026-09-26 work (`tsc-early`
+marked unstable against `refined-jiffies` in 9 of 10 idle boots) did not
+reproduce on 2026-10-11 *with or without* this change: 10 of 10 idle boots each
+way kept the TSC, and 3 of 5 under full host load. Whatever caused it then, it
+was not the topology, and the halt-gate theory offered for it is wrong (see
+the halt measurement above).
 
 MSR exits are deliberately **off**: WHP's own MSR policy is better than one we
 would write, and unknown MSRs already `#GP` to the guest, which Linux's safe

@@ -84,7 +84,8 @@ pub struct WhpVcpu {
 impl WhpVcpu {
     pub(super) fn new(partition: Arc<Partition>, index: u32) -> Result<Self, VmmError> {
         create_virtual_processor(partition.handle(), index)?;
-        let cpuid = CpuidPolicy::with_clocks(index, partition.clocks());
+        let cpuid =
+            CpuidPolicy::with_clocks(index, partition.clocks()).with_topology(partition.topology());
         let mut vcpu = Self {
             index,
             partition,
@@ -774,7 +775,8 @@ impl ResettableVcpu for WhpVcpu {
                     .map_err(|e| HvError::Registers(e.to_string()))?;
             }
         }
-        self.cpuid = CpuidPolicy::with_clocks(self.index, self.partition.clocks());
+        self.cpuid = CpuidPolicy::with_clocks(self.index, self.partition.clocks())
+            .with_topology(self.partition.topology());
         Ok(())
     }
 }

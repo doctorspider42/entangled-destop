@@ -968,3 +968,66 @@ after boot. The clocksource was `acpi_pm` throughout — see "Found, and open".
   Linux's own 32-bit arithmetic; no Intel WHP host has booted with it.
 - **KVM-host validation**: nothing KVM-side changed, and WSL here has no
   `/dev/kvm` to show it.
+
+## Amendment, 2026-10-11 — one package of N cores: the guest keeps its TSC
+
+The first item "found, and open" above is closed, and the second is withdrawn.
+
+### What was wrong
+
+WHP's CPUID defaults on this AMD host describe no topology: leaf `0x1` has HTT
+clear and a logical-processor count of 0, `0x8000_0008.ECX` is 0 (one core per
+package) and `0x8000_001e` is zero beyond the APIC id — while TOPOEXT is
+advertised. Linux's `parse_8000_0008()` derives a core shift of 0, so every
+APIC id is a package (`CPU topo: Max. logical packages: 8`), and on a non-Intel
+part `unsynchronized_tsc()` returns true for more than one package before it
+looks at anything else. The TSC is dropped, `acpi_pm` is the only clocksource
+left, and every `clock_gettime()` in the guest is a port-I/O exit served by this
+process.
+
+### The decision
+
+The CPUID policy describes what the machine is: **one package of N
+single-threaded cores, one node** (`whp::cpuid::PackageTopology`, leaves
+`0x1`, `0x8000_0008`, `0x8000_001e`), on AMD and Hygon hosts only. Intel hosts
+are untouched: Linux never applies the multi-package rule to Intel and reads
+Intel topology from `0x4`/`0xb`/`0x1f`, and no Intel WHP host was available.
+
+Not done, deliberately: claiming invariant TSC (`0x8000_0007.EDX[8]`). WHP does
+not offer it on this host (`TscInvariantSupport` absent), the topology alone is
+enough, and a bit we set ourselves is a promise about a hypervisor we do not
+control.
+
+### Measured on this Windows host (2026-10-11, release build)
+
+The installed Ubuntu 26.04 desktop, 8 vCPUs, logged in over the serial console:
+
+| | before | after |
+|---|---|---|
+| `CPU topo` | 8 packages × 1 core | 1 package × 8 cores |
+| clocksource | `acpi_pm` (only one available) | `tsc`, refined to 3500.047 MHz (WHP reports 3 500 047 kHz) |
+| `time.monotonic_ns()` from Python, per call | 6 835 ns | 112 ns |
+| `time.sleep(100 µs)`, median | 246 µs | 194 µs |
+
+Ten minutes of the same desktop with 24 spinning host threads on 24 logical
+CPUs kept `tsc` with no `unstable` line. The direct-boot timer loop
+(`whp_timer`, Ubuntu's 7.0 kernel) keeps it at 1 and 8 vCPUs on an idle host;
+under full host load, 1-vCPU boots lost it to the watchdog in 2 of 5.
+
+### Withdrawn
+
+- **The 1-vCPU watchdog loss** (9 of 10 idle boots on 2026-09-26) does not
+  reproduce today with *or without* this change — 10 of 10 idle boots kept the
+  TSC each way. It is not a topology effect.
+- **The halt-gate theory** for it is wrong: with local APIC emulation on, WHP
+  on this host does not report `hlt` at all (no `X64Halt` among ~200 000 exits
+  of a traced boot; fewer than 200 per vCPU in two minutes of an idle desktop).
+  It blocks inside `WHvRunVirtualProcessor` and serves its own LAPIC timer, and
+  an in-guest `sleep(1 ms)` takes 1.1–1.2 ms. A high-resolution halt wait was
+  built, measured as unnecessary, and not merged.
+
+### Still open
+
+- **KVM parity.** The KVM path's topology is unchanged and untested here (no
+  `/dev/kvm`); KVM guests use kvmclock and do not depend on it for time.
+- **Intel WHP hosts** remain unmeasured.

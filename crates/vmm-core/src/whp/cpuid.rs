@@ -29,6 +29,7 @@
 //! | `0x1` | `EBX[31:24] = vp_index` | the *initial APIC id*. Guest code that compares the CPUID identity against the local APIC's own id otherwise decides it is on an unknown processor; EDK2's `GetBspNumber()` asserts on it (UEFI-1802) |
 //! | `0xb`, `0x1f`, `0x8000_0026` | `EDX = vp_index` | the 32-bit x2APIC id in the topology leaves, same problem |
 //! | `0x8000_001e` | `EAX = vp_index` | AMD's extended APIC id, which with TOPOEXT present is the one Linux ends up trusting (`parse_8000_001e()` overwrites the leaf-1 id with it) |
+//! | `0x1`, `0x8000_0008`, `0x8000_001e` | AMD only: one package of `n` single-threaded cores | see "One package, not `n`" |
 //! | `0x4000_0000` | signature zeroed; `EAX` = `0x4000_0010` when the clocks are known, else 0 | **not** in the KVM policy, and the one place the two hosts legitimately differ — see below |
 //! | `0x4000_0001`–`0x4000_000f` | zeroed | Hyper-V's own interface leaves, which must not show through an empty signature |
 //! | `0x4000_0010` | `EAX` = TSC kHz, `EBX` = local APIC timer kHz | the generic timing leaf — see "Telling the guest its clocks" |
@@ -77,6 +78,27 @@
 //! 8254's delivery, fixed in `machine_x86::irqchip::pit`. KVM needs none of
 //! this: `KVM_GET_SUPPORTED_CPUID` carries kvmclock, which tells a Linux guest
 //! its TSC frequency through `kvm_get_tsc_khz()`.
+//!
+//! # One package, not `n`
+//!
+//! WHP's defaults on an AMD host describe no topology at all: leaf `0x1` has
+//! `HTT` clear and a logical-processor count of 0, `0x8000_0008.ECX` says one
+//! core (`NC = 0`, `ApicIdSize = 0`), and `0x8000_001e` is zero beyond the APIC
+//! id. Linux's `parse_8000_0008()` turns that into a core shift of 0, so every
+//! APIC id is a package of its own — `CPU topo: Max. logical packages: 8` for
+//! an 8-vCPU guest. On AMD that alone makes `unsynchronized_tsc()` true ("assume
+//! multi socket systems are not synchronized"): `tsc: Marking TSC unstable due
+//! to TSCs unsynchronized`, clocksource `acpi_pm`, and every `clock_gettime()`
+//! in the guest a port-I/O exit to this process.
+//!
+//! The guest's TSCs *are* synchronized — WHP gives every VP of a partition one
+//! offset on the host's TSC, and the guest's own warp check at AP bring-up
+//! agrees — so the topology is what is wrong. [`PackageTopology`] describes what
+//! the machine really is: `n` cores, one thread each, one package, one node. The
+//! APIC ids are already `0..n`, which is exactly the core numbering this
+//! encodes. Intel hosts are left alone: Linux never applies the multi-package
+//! rule to Intel, and Intel describes topology through leaves `0x4`/`0xb`/`0x1f`,
+//! not these.
 
 /// Leaves this machine intercepts. Ordered low to high for readability; WHP does
 /// not care about the order.
@@ -84,7 +106,7 @@
 /// Deliberately short: every entry costs a VM exit each time the guest reads it,
 /// and a guest reads CPUID a lot during boot. A leaf is here only because the
 /// policy above changes something in it.
-pub const CPUID_EXIT_LEAVES: [u32; 23] = [
+pub const CPUID_EXIT_LEAVES: [u32; 24] = [
     0x0000_0001,
     0x0000_000b,
     0x0000_0015,
@@ -109,6 +131,7 @@ pub const CPUID_EXIT_LEAVES: [u32; 23] = [
     0x4000_000e,
     0x4000_000f,
     0x4000_0010,
+    0x8000_0008,
     0x8000_001e,
     0x8000_0026,
 ];
@@ -177,6 +200,22 @@ const ZERO: CpuidResult = CpuidResult {
     edx: 0,
 };
 
+/// The shape [`CpuidPolicy`] describes on an AMD host: one package of `cores`
+/// single-threaded cores (see "One package, not `n`").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackageTopology {
+    /// Virtual processors in the partition, each one a core.
+    pub cores: u32,
+}
+
+impl PackageTopology {
+    /// Bits of the APIC id that number a core within the package —
+    /// `ceil(log2(cores))` — so the ids `0..cores` all share package 0.
+    pub fn core_id_bits(&self) -> u32 {
+        self.cores.max(1).next_power_of_two().trailing_zeros()
+    }
+}
+
 /// The four output registers of one `cpuid`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuidResult {
@@ -191,6 +230,7 @@ pub struct CpuidResult {
 pub struct CpuidPolicy {
     vp_index: u32,
     clocks: Option<GuestClocks>,
+    topology: Option<PackageTopology>,
 }
 
 impl CpuidPolicy {
@@ -200,12 +240,23 @@ impl CpuidPolicy {
         Self {
             vp_index,
             clocks: None,
+            topology: None,
         }
     }
 
     /// The policy with the timing leaves filled from `clocks`.
     pub fn with_clocks(vp_index: u32, clocks: Option<GuestClocks>) -> Self {
-        Self { vp_index, clocks }
+        Self {
+            vp_index,
+            clocks,
+            topology: None,
+        }
+    }
+
+    /// The same policy, also describing `topology` in the AMD topology leaves.
+    /// `None` leaves WHP's own answers there.
+    pub fn with_topology(self, topology: Option<PackageTopology>) -> Self {
+        Self { topology, ..self }
     }
 
     /// Applies the policy to what WHP would have reported for `leaf`/`subleaf`.
@@ -219,9 +270,38 @@ impl CpuidPolicy {
             0x0000_0001 if subleaf == 0 => {
                 result.ecx |= 1 << 31;
                 result.ebx = (result.ebx & 0x00ff_ffff) | (self.vp_index << 24);
+                if let Some(topology) = self.topology {
+                    // EBX[23:16]: addressable logical processor ids in the
+                    // package, valid when EDX[28] (HTT) is set. AMD's
+                    // CmpLegacy (0x8000_0001.ECX[1]) already says they are
+                    // cores, not threads.
+                    let ids = 1u32 << topology.core_id_bits();
+                    result.ebx = (result.ebx & 0xff00_ffff) | (ids.min(0xff) << 16);
+                    if topology.cores > 1 {
+                        result.edx |= 1 << 28;
+                    } else {
+                        result.edx &= !(1 << 28);
+                    }
+                }
             }
             0x0000_000b | 0x0000_001f | 0x8000_0026 => result.edx = self.vp_index,
-            0x8000_001e => result.eax = self.vp_index,
+            0x8000_0008 => {
+                if let Some(topology) = self.topology {
+                    // ECX[7:0] NC = cores - 1, ECX[15:12] ApicIdSize; the rest
+                    // of ECX (PerfTscSize) stays WHP's.
+                    let nc = topology.cores.clamp(1, 256) - 1;
+                    result.ecx = (result.ecx & !0xf0ff) | (topology.core_id_bits() << 12) | nc;
+                }
+            }
+            0x8000_001e => {
+                result.eax = self.vp_index;
+                if self.topology.is_some() {
+                    // EBX[7:0] core id, EBX[15:8] threads per core - 1 = 0;
+                    // ECX[7:0] node id 0, ECX[10:8] nodes per package - 1 = 0.
+                    result.ebx = (result.ebx & !0xffff) | (self.vp_index & 0xff);
+                    result.ecx &= !0x7ff;
+                }
+            }
             0x4000_0000 => {
                 result = CpuidResult {
                     eax: if self.clocks.is_some() {
@@ -282,12 +362,13 @@ mod tests {
     /// dead code the guest never reaches.
     #[test]
     fn every_leaf_the_policy_changes_is_intercepted() {
-        let policy = CpuidPolicy::new(1);
+        let policy = CpuidPolicy::new(1).with_topology(Some(PackageTopology { cores: 4 }));
         for leaf in [
             0x0000_0001u32,
             0x0000_000b,
             0x0000_001f,
             0x4000_0000,
+            0x8000_0008,
             0x8000_001e,
             0x8000_0026,
         ] {
@@ -342,9 +423,78 @@ mod tests {
         }
     }
 
-    /// AMD's extended APIC id lives in EAX, and core/node id in EBX/ECX must be
-    /// left alone: this machine has no topology to describe beyond "n independent
-    /// CPUs".
+    /// Linux's `parse_8000_0008()`: the core shift is `ApicIdSize`, or
+    /// `get_count_order(NC + 1)` when that is 0, and the package id is the APIC
+    /// id shifted right by it. Every vCPU must land in package 0, for every
+    /// count a profile can ask for.
+    #[test]
+    fn amd_topology_puts_every_vcpu_in_one_package() {
+        for cores in 1u32..=64 {
+            let topology = Some(PackageTopology { cores });
+            for vp in 0..cores {
+                let policy = CpuidPolicy::new(vp).with_topology(topology);
+                let ext = policy.apply(0x8000_0008, 0, ZERO);
+                let nc = ext.ecx & 0xff;
+                assert_eq!(nc + 1, cores, "NC for {cores} cores");
+                let mut shift = (ext.ecx >> 12) & 0xf;
+                if shift == 0 {
+                    shift = (nc + 1).next_power_of_two().trailing_zeros();
+                }
+                let topo = policy.apply(0x8000_001e, 0, ZERO);
+                assert_eq!(topo.eax, vp, "extended APIC id");
+                assert_eq!(topo.eax >> shift, 0, "vp {vp} of {cores} left package 0");
+                assert_eq!(topo.ebx & 0xff, vp, "core id");
+                assert_eq!((topo.ebx >> 8) & 0xff, 0, "one thread per core");
+                assert_eq!(topo.ecx & 0x7ff, 0, "one node, node 0");
+
+                let leaf1 = policy.apply(1, 0, ZERO);
+                assert!((leaf1.ebx >> 16) & 0xff >= cores, "logical ids for {cores}");
+                assert_eq!(leaf1.edx & (1 << 28) != 0, cores > 1, "HTT");
+                assert_eq!(leaf1.ebx >> 24, vp, "the initial APIC id survives");
+            }
+        }
+    }
+
+    /// The topology rewrite leaves every bit it does not own to WHP.
+    #[test]
+    fn amd_topology_keeps_whps_other_bits() {
+        let all = CpuidResult {
+            eax: u32::MAX,
+            ebx: u32::MAX,
+            ecx: u32::MAX,
+            edx: u32::MAX,
+        };
+        let policy = CpuidPolicy::new(5).with_topology(Some(PackageTopology { cores: 8 }));
+        let ext = policy.apply(0x8000_0008, 0, all);
+        assert_eq!(
+            ext.ecx, 0xffff_3f07,
+            "PerfTscSize and the reserved bits survive"
+        );
+        assert_eq!((ext.eax, ext.ebx, ext.edx), (all.eax, all.ebx, all.edx));
+        let topo = policy.apply(0x8000_001e, 0, all);
+        assert_eq!((topo.ebx, topo.ecx), (0xffff_0005, 0xffff_f800));
+        let leaf1 = policy.apply(1, 0, all);
+        assert_eq!((leaf1.ebx, leaf1.edx), (0x0508_ffff, u32::MAX));
+        let single = CpuidPolicy::new(0).with_topology(Some(PackageTopology { cores: 1 }));
+        assert_eq!(
+            single.apply(1, 0, all).edx & (1 << 28),
+            0,
+            "one core: no HTT"
+        );
+    }
+
+    /// Without a topology (Intel, or no CPUID policy) those leaves are WHP's.
+    #[test]
+    fn without_a_topology_whps_answers_stand() {
+        let policy = CpuidPolicy::new(1);
+        assert_eq!(policy.apply(0x8000_0008, 0, DEFAULT), DEFAULT);
+        let leaf1 = policy.apply(1, 0, DEFAULT);
+        assert_eq!(leaf1.ebx & 0x00ff_ffff, DEFAULT.ebx & 0x00ff_ffff);
+        assert_eq!(leaf1.edx, DEFAULT.edx);
+    }
+
+    /// AMD's extended APIC id lives in EAX; without a topology, core and node
+    /// id in EBX/ECX are WHP's.
     #[test]
     fn amd_extended_apic_id_lands_in_eax_only() {
         let result = CpuidPolicy::new(2).apply(0x8000_001e, 0, DEFAULT);
@@ -378,7 +528,7 @@ mod tests {
     #[test]
     fn unknown_leaves_pass_through() {
         let policy = CpuidPolicy::new(1);
-        for leaf in [0u32, 2, 7, 0x8000_0008, 0x4000_0011, 0xffff_ffff] {
+        for leaf in [0u32, 2, 7, 0x8000_0007, 0x4000_0011, 0xffff_ffff] {
             assert_eq!(policy.apply(leaf, 0, DEFAULT), DEFAULT, "leaf {leaf:#x}");
         }
     }
