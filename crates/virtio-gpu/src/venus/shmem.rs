@@ -315,6 +315,8 @@ impl PageBudget {
 
     /// Take `bytes` out of the budget — and out of the whole it is a share
     /// of — or refuse without taking anything from either.
+    // `fetch_update` is `try_update` from Rust 1.99, past the 1.85 MSRV.
+    #[allow(deprecated)]
     fn try_charge(&self, bytes: u64) -> bool {
         let charged = self
             .used
@@ -354,6 +356,8 @@ impl PageBudget {
         }
     }
 
+    // `fetch_update` is `try_update` from Rust 1.99, past the 1.85 MSRV.
+    #[allow(deprecated)]
     fn refund_own(&self, bytes: u64) {
         let _ = self
             .used
@@ -391,6 +395,8 @@ impl PageBudget {
         }
     }
 
+    // `fetch_update` is `try_update` from Rust 1.99, past the 1.85 MSRV.
+    #[allow(deprecated)]
     fn force(&self, amount: u64) {
         let before = self
             .used

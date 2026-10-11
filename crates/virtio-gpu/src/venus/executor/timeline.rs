@@ -138,6 +138,8 @@ impl FenceThreads {
     /// A slot for one more thread, or `None` at the cap. The slot is given
     /// back when it drops — after the thread it was taken for is joined.
     #[must_use]
+    // `fetch_update` is `try_update` from Rust 1.99, past the 1.85 MSRV.
+    #[allow(deprecated)]
     pub fn take(self: &Arc<Self>) -> Option<FenceThreadSlot> {
         self.live
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
@@ -153,6 +155,8 @@ impl FenceThreads {
 pub struct FenceThreadSlot(Arc<FenceThreads>);
 
 impl Drop for FenceThreadSlot {
+    // `fetch_update` is `try_update` from Rust 1.99, past the 1.85 MSRV.
+    #[allow(deprecated)]
     fn drop(&mut self) {
         let _ = self
             .0

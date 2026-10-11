@@ -232,6 +232,8 @@ impl Vm {
     /// `host_mapped` picks which kind: `false` is a window of our own pages,
     /// `true` is one whose bytes the 3D renderer supplies per blob mapping —
     /// see [`SharedWindow::new_host_mapped`].
+    // `fetch_update` is `try_update` from Rust 1.99, past the 1.85 MSRV.
+    #[allow(deprecated)]
     pub fn create_shm_window(
         &self,
         len: u64,
