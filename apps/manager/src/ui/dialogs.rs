@@ -1168,12 +1168,17 @@ fn edit_vm_body(
                     theme::VIOLET,
                 ),
                 (
-                    EditVmSection::NetworkDisplay,
-                    "Network & display",
+                    EditVmSection::DisplayGpu,
+                    "Display & GPU",
                     // One line at 184 px, which is what the card is: a second
-                    // line is clipped, and "3D" is the one word this list can
-                    // spare — it sits directly under Screen in the panel.
-                    "Network, screen, sound, gamepad",
+                    // line is clipped.
+                    "Screen, refresh, 3D, GPU limits",
+                    theme::accent(0.5),
+                ),
+                (
+                    EditVmSection::NetworkDevices,
+                    "Network & devices",
+                    "Network, sound, gamepad",
                     theme::OK,
                 ),
                 (
@@ -1191,7 +1196,7 @@ fn edit_vm_body(
         });
 
         ui.add_space(10.0);
-        let (rule, _) = ui.allocate_exact_size(Vec2::new(1.0, 352.0), egui::Sense::hover());
+        let (rule, _) = ui.allocate_exact_size(Vec2::new(1.0, 388.0), egui::Sense::hover());
         ui.painter().vline(
             rule.center().x,
             rule.y_range(),
@@ -1209,14 +1214,15 @@ fn edit_vm_body(
                     // Frame::show inherits the surrounding horizontal layout;
                     // this explicit column keeps fields vertical and bounded.
                     ui.set_width(500.0);
-                    ui.set_min_height(316.0);
+                    ui.set_min_height(352.0);
                     match selected {
                         EditVmSection::Hardware => edit_hardware(ui, &mut state.form, wsl_engine),
                         EditVmSection::BootMedia => {
                             edit_boot_media(ui, &mut state.form, actions);
                         }
-                        EditVmSection::NetworkDisplay => {
-                            edit_network_display(ui, &mut state.form);
+                        EditVmSection::DisplayGpu => edit_display_gpu(ui, &mut state.form),
+                        EditVmSection::NetworkDevices => {
+                            edit_network_devices(ui, &mut state.form);
                         }
                         EditVmSection::Storage => edit_storage(ui, &mut state.form, actions),
                     }
@@ -1612,12 +1618,145 @@ fn fix_button(ui: &mut egui::Ui, label: &str) -> bool {
 /// Network & display — and the two capability gates that used to be discovered
 /// at boot: TAP networking and 3D. Both are decided by the machine's backend,
 /// so both are answerable here, before anything is launched.
-fn edit_network_display(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
+fn edit_display_gpu(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
+    edit_panel_heading(
+        ui,
+        "Display & GPU",
+        "The guest's virtual monitor, and how much of this computer's graphics card it may use.",
+    );
+    ui::form_row(
+        ui,
+        "SCREEN",
+        "The size of the machine's virtual screen, in pixels. The window can be resized \
+         freely; this is what the guest itself believes it has.",
+        |ui, _| {
+            ui.add(egui::DragValue::new(&mut form.display_width).range(320..=7680));
+            ui.label(ui::faint("×"));
+            ui.add(egui::DragValue::new(&mut form.display_height).range(200..=4320));
+        },
+    );
+    ui.add_space(6.0);
+    ui::form_row(
+        ui,
+        "REFRESH",
+        "How often the virtual monitor says it refreshes. The guest's desktop draws in          step with it, so a frame that misses one refresh waits for the next: a higher          rate makes animation smoother and lowers latency. \"Match monitor\" picks this          computer's monitor rate — or, above 144 Hz, the largest even fraction of it — the          same rule a new machine gets.",
+        |ui, _| {
+            ui.add(
+                egui::DragValue::new(&mut form.refresh_hz)
+                    .range(control_api::MIN_REFRESH_HZ..=control_api::MAX_REFRESH_HZ)
+                    .suffix(" Hz"),
+            );
+            ui.add_space(6.0);
+            let monitor = form.monitor_refresh_hz;
+            if ui::ghost_button(
+                ui,
+                &format!("Match monitor ({monitor} Hz)"),
+                form.refresh_hz != monitor,
+                theme::CYAN,
+            )
+            .on_hover_text(
+                "This computer's primary monitor, snapped to a standard rate and held to                  what the GPU desktop keeps up with.",
+            )
+            .clicked()
+            {
+                form.refresh_hz = monitor;
+            }
+        },
+    );
+    ui.add_space(6.0);
+
+    let virgl_block = form.backend.gpu_block(GpuRenderer::Virgl);
+    if form.gpu == GpuRenderer::Virgl && virgl_block.is_some() {
+        // Unavailable here — and never silently left on, because the engine
+        // refuses to boot a profile that asks for 3D it cannot deliver.
+        form.gpu = GpuRenderer::TwoD;
+    }
+    ui::form_row(
+        ui,
+        "3D",
+        "Hardware-accelerated 3D inside the guest, using this computer's graphics card. \
+         Without it the guest still has a desktop, drawn by its own processor.",
+        |ui, field_w| {
+            egui::ComboBox::from_id_salt("edit-gpu")
+                .selected_text(gpu_label(form.gpu))
+                .width(ui::combo_width(field_w))
+                .show_ui(ui, |ui| {
+                    for choice in GpuRenderer::ALL {
+                        let block = form.backend.gpu_block(choice);
+                        let response = ui
+                            .add_enabled_ui(block.is_none(), |ui| {
+                                ui.selectable_value(&mut form.gpu, choice, gpu_label(choice))
+                            })
+                            .inner;
+                        match block {
+                            Some(reason) => response.on_disabled_hover_text(reason.long),
+                            None => response.on_hover_text(gpu_hint(choice)),
+                        };
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "If the host cannot provide the renderer chosen here, the machine \
+                     refuses to start rather than quietly falling back to software \
+                     rendering. `entangled doctor` (Diagnostics) says what this host has.",
+                );
+        },
+    );
+    if form.gpu == GpuRenderer::Venus {
+        ui::form_note(
+            ui,
+            RichText::new(
+                "The guest must be set up for it: `entangled install ubuntu --venus` does \
+                 that; see the user guide's \"A GPU desktop\".",
+            )
+            .color(theme::WARN)
+            .size(11.0),
+        );
+    }
+    if form.gpu == GpuRenderer::Venus {
+        ui.add_space(12.0);
+        ui::form_row(
+            ui,
+            "GPU BOOST",
+            "Asks the graphics driver to run the card at full clocks while the guest is              drawing, and lets it settle a second after it stops. Makes the guest's 3D              noticeably faster on a 60 Hz desktop and costs nothing while it is idle;              turn it off to save power. NVIDIA only — other cards ignore it.",
+            |ui, _| {
+                ui.checkbox(&mut form.gpu_boost, "Full GPU clocks while the guest draws");
+            },
+        );
+        ui.add_space(6.0);
+        ui::form_row(
+            ui,
+            "VIDEO MEMORY",
+            "The most of this computer's video memory the guest's programs may take              together. Unlimited, they get three quarters of it and your own desktop              keeps the rest; a cap protects the host from a guest that runs away with              memory. Never more than the card has, whatever it says.",
+            |ui, _| {
+                ui.checkbox(&mut form.gpu_memory_limit, "Cap at");
+                ui.add_enabled(
+                    form.gpu_memory_limit,
+                    egui::DragValue::new(&mut form.gpu_memory_mib)
+                        .range(control_api::MIN_GPU_MEMORY_MIB..=control_api::MAX_GPU_MEMORY_MIB)
+                        .speed(64.0)
+                        .suffix(" MiB"),
+                );
+            },
+        );
+        if form.gpu_memory_limit && form.gpu_memory_mib >= 1024 {
+            ui::form_note(
+                ui,
+                ui::faint(format!(
+                    "= {:.1} GiB",
+                    f64::from(form.gpu_memory_mib) / 1024.0
+                )),
+            );
+        }
+    }
+}
+
+fn edit_network_devices(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
     use crate::editor::NetworkChoice;
     edit_panel_heading(
         ui,
-        "Network & display",
-        "Connect the guest and choose how its desktop and its audio are presented.",
+        "Network & devices",
+        "Connect the guest, and give it a sound card and gamepads.",
     );
 
     let tap_block = form.backend.tap_block();
@@ -1686,71 +1825,7 @@ fn edit_network_display(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
             },
         );
     }
-
     ui.add_space(18.0);
-    ui::form_row(
-        ui,
-        "SCREEN",
-        "The size of the machine's virtual screen, in pixels. The window can be resized \
-         freely; this is what the guest itself believes it has.",
-        |ui, _| {
-            ui.add(egui::DragValue::new(&mut form.display_width).range(320..=7680));
-            ui.label(ui::faint("×"));
-            ui.add(egui::DragValue::new(&mut form.display_height).range(200..=4320));
-        },
-    );
-    ui.add_space(6.0);
-
-    let virgl_block = form.backend.gpu_block(GpuRenderer::Virgl);
-    if form.gpu == GpuRenderer::Virgl && virgl_block.is_some() {
-        // Unavailable here — and never silently left on, because the engine
-        // refuses to boot a profile that asks for 3D it cannot deliver.
-        form.gpu = GpuRenderer::TwoD;
-    }
-    ui::form_row(
-        ui,
-        "3D",
-        "Hardware-accelerated 3D inside the guest, using this computer's graphics card. \
-         Without it the guest still has a desktop, drawn by its own processor.",
-        |ui, field_w| {
-            egui::ComboBox::from_id_salt("edit-gpu")
-                .selected_text(gpu_label(form.gpu))
-                .width(ui::combo_width(field_w))
-                .show_ui(ui, |ui| {
-                    for choice in GpuRenderer::ALL {
-                        let block = form.backend.gpu_block(choice);
-                        let response = ui
-                            .add_enabled_ui(block.is_none(), |ui| {
-                                ui.selectable_value(&mut form.gpu, choice, gpu_label(choice))
-                            })
-                            .inner;
-                        match block {
-                            Some(reason) => response.on_disabled_hover_text(reason.long),
-                            None => response.on_hover_text(gpu_hint(choice)),
-                        };
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "If the host cannot provide the renderer chosen here, the machine \
-                     refuses to start rather than quietly falling back to software \
-                     rendering. `entangled doctor` (Diagnostics) says what this host has.",
-                );
-        },
-    );
-    if form.gpu == GpuRenderer::Venus {
-        ui::form_note(
-            ui,
-            RichText::new(
-                "The guest must be set up for it: `entangled install ubuntu --venus` does \
-                 that; see the user guide's \"A GPU desktop\".",
-            )
-            .color(theme::WARN)
-            .size(11.0),
-        );
-    }
-
-    ui.add_space(12.0);
     ui::form_row(
         ui,
         "SOUND",

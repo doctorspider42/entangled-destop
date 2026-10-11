@@ -669,7 +669,8 @@ and every key the guest was told is down.
 ### Refresh rate
 
 The guest's display has a refresh rate like any monitor, `[display]
-refresh_hz` in the profile (24 to 240), and the guest's desktop draws at it:
+refresh_hz` in the profile (24 to 240, or *Refresh* under *Display & GPU* in
+the manager's machine editor), and the guest's desktop draws at it:
 GNOME makes one frame per refresh while anything moves, and none while nothing
 does. A rate above 60 makes motion smoother and costs host CPU only while the
 desktop animates — an idle desktop costs the same at any rate.
@@ -679,7 +680,8 @@ A new machine gets a rate that follows **this host's primary monitor**
 up to 144 Hz, and above that the largest whole fraction of it — a 240 Hz
 monitor gets 120, so every guest frame stays on screen for exactly two of its
 refreshes. `--refresh-hz N` chooses instead, and a profile that says a number
-keeps it. Existing profiles are never changed.
+keeps it. Existing profiles are never changed — the editor's *Match monitor*
+button applies the same rule to one when you ask.
 
 Why not simply 240 on a 240 Hz monitor: measured on an RTX 2070 (ADR-0004, the
 high-refresh amendment), the GPU desktop keeps 120 and 144 Hz — 97 to 100 % of
@@ -716,7 +718,7 @@ enabled = true
 ```
 
 or tick *Give this machine gamepads* in the manager's machine editor, under
-*Network & display*, and pick a number of players next to it.
+*Network & devices*, and pick a number of players next to it.
 
 What the guest gets is an **Xbox 360-shaped pad**: eleven buttons, two sticks,
 two analogue triggers and a hat, with exactly the capability set that makes
@@ -788,7 +790,7 @@ two with the same name in different directories. A profile without `mac` gets
 one derived from the machine's name, as before.
 
 `--network` chooses something else at install time, and the manager's editor
-(*Network & display*) changes it afterwards:
+(*Network & devices*) changes it afterwards:
 
 | `--network` | The machine gets |
 |---|---|
@@ -1107,12 +1109,15 @@ step has an *Advanced: command preview* section showing the exact
 `entangled install …` command it is about to run, which is the honest way to
 learn the CLI.
 
-**Configure** (the machine editor) edits the profile in four sections, all saved
+**Configure** (the machine editor) edits the profile in five sections, all saved
 together: *Hardware* (memory, vCPUs, `mmio`/`pci`), *Boot & media* (direct-Linux
-kernel and command line, or UEFI firmware, NVRAM store and disc), *Network &
-display* (network backend and interface, MAC, screen size, 3D, sound and its
-output backend, and whether the machine gets a gamepad), *Storage* (the ordered
-list of disks — the order *is*
+kernel and command line, or UEFI firmware, NVRAM store and disc), *Display &
+GPU* (screen size, refresh rate with a *Match monitor* button, 3D, and for the
+GPU desktop the GPU boost — `gpu_boost`, on unless unticked — and an optional
+cap on the host video memory the guest may take, `gpu_memory_mib`; uncapped it
+is three quarters of the card), *Network & devices* (network backend and
+interface, MAC, sound and its output backend, and gamepads), *Storage* (the
+ordered list of disks — the order *is*
 `/dev/vda`, `/dev/vdb`, …). Edits go through the same validation `entangled run`
 would apply, before the file is written, so a profile the GUI saved always
 starts. A machine cannot be edited or deleted while it runs, and it cannot be

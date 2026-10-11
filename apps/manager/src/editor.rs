@@ -12,6 +12,10 @@ use control_api::{
 
 use crate::backend::Backend;
 
+/// What the VRAM cap field starts at when a profile has none: a figure that
+/// fits a desktop with room to spare on any GPU worth a GPU desktop.
+pub const DEFAULT_GPU_MEMORY_CAP_MIB: u32 = 4096;
+
 /// The network choice as the form shows it (a profile may have no `[network]`
 /// at all, which an `Option<NetworkSection>` models but a combo box cannot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +68,24 @@ pub struct EditForm {
     /// one renderer, and `control-api` refuses both switches at once.
     /// `virgl_isolation` and `host_visible_mib` stay in [`Self::base`].
     pub gpu: GpuRenderer,
+    /// `[display] refresh_hz`: what the virtual monitor's EDID advertises,
+    /// which the guest's compositor paces itself to.
+    pub refresh_hz: u32,
+    /// What "Match monitor" sets [`Self::refresh_hz`] to: this computer's
+    /// monitor through [`control_api::refresh::default_refresh_hz`], the rule
+    /// `entangled install` uses. Filled in by the app when the editor opens;
+    /// presentation only, never written.
+    pub monitor_refresh_hz: u32,
+    /// `[display] gpu_boost`, as the checkbox shows it: on unless the profile
+    /// says `false`. Only offered with the GPU desktop, the one renderer the
+    /// boost has anything to raise the clocks for.
+    pub gpu_boost: bool,
+    /// Whether `[display] gpu_memory_mib` is written at all: off is the
+    /// renderer's own default, three quarters of each VRAM heap.
+    pub gpu_memory_limit: bool,
+    /// The cap in MiB while [`Self::gpu_memory_limit`] is on; kept while it is
+    /// off so toggling it does not lose a typed value.
+    pub gpu_memory_mib: u32,
     /// `[sound] enabled` — whether the guest gets a virtio-snd card at all.
     pub sound: bool,
     /// `[sound] backend`. Kept across an on/off toggle, the way the profile
@@ -172,7 +194,9 @@ backend = "usernet"
 [display]
 width = 1920
 height = 1080
-virgl = true
+venus = true
+refresh_hz = 120
+gpu_memory_mib = 6144
 
 [sound]
 enabled = true
@@ -226,6 +250,14 @@ enabled = true
             display_width: cfg.display.width,
             display_height: cfg.display.height,
             gpu: cfg.display.gpu_renderer(),
+            refresh_hz: cfg.display.refresh_hz,
+            monitor_refresh_hz: control_api::DEFAULT_REFRESH_HZ,
+            gpu_boost: cfg.display.gpu_boost != Some(false),
+            gpu_memory_limit: cfg.display.gpu_memory_mib.is_some(),
+            gpu_memory_mib: cfg
+                .display
+                .gpu_memory_mib
+                .unwrap_or(DEFAULT_GPU_MEMORY_CAP_MIB),
             sound: cfg.sound.enabled,
             sound_backend: cfg.sound.backend,
             gamepad: cfg.gamepad.enabled,
@@ -278,6 +310,18 @@ enabled = true
         cfg.display.width = self.display_width;
         cfg.display.height = self.display_height;
         cfg.display.set_gpu_renderer(self.gpu);
+        cfg.display.refresh_hz = self.refresh_hz;
+        // On is the default and is not written (an older engine denies the
+        // key); an explicit `true` the profile already had is kept. `true`
+        // beside any other renderer is refused, so it never survives a switch.
+        cfg.display.gpu_boost = if !self.gpu_boost {
+            Some(false)
+        } else if self.gpu == GpuRenderer::Venus {
+            self.base.display.gpu_boost.filter(|on| *on)
+        } else {
+            None
+        };
+        cfg.display.gpu_memory_mib = self.gpu_memory_limit.then_some(self.gpu_memory_mib);
         cfg.sound = SoundSection {
             enabled: self.sound,
             backend: self.sound_backend,
@@ -402,6 +446,97 @@ interface = "entangled0"
         // Untouched parts survived.
         assert_eq!(cfg.boot.cmdline, "console=ttyS0 root=UUID=deadbeef rw");
         assert_eq!(cfg.disks.len(), 1);
+    }
+
+    /// The refresh rate round-trips, and "Match monitor" is a value the
+    /// profile can hold — never a key the engine does not know.
+    #[test]
+    fn the_refresh_rate_round_trips() {
+        let path = temp_profile("refresh");
+        let mut form = EditForm::from_profile(&path).expect("load");
+        assert_eq!(form.refresh_hz, control_api::DEFAULT_REFRESH_HZ);
+        assert!(!form.dirty());
+        form.refresh_hz = 120;
+        assert!(form.dirty());
+        form.save().expect("save");
+        assert_eq!(EditForm::from_profile(&path).unwrap().refresh_hz, 120);
+
+        form.refresh_hz = control_api::MAX_REFRESH_HZ + 1;
+        let error = form.to_config().expect_err("out of range");
+        assert!(error.contains("refresh_hz"), "{error}");
+    }
+
+    /// The boost is on by default and that default is not written; off is
+    /// written as `false`; and `true` never survives a switch away from the
+    /// GPU desktop, because the engine refuses it beside any other renderer.
+    #[test]
+    fn the_gpu_boost_writes_only_what_differs_from_the_default() {
+        let path = temp_profile("boost");
+        let mut form = EditForm::from_profile(&path).expect("load");
+        form.gpu = GpuRenderer::Venus;
+        assert!(form.gpu_boost, "on unless the profile says otherwise");
+        form.save().expect("save venus");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("gpu_boost"),
+            "the default is not written: {text}"
+        );
+
+        let mut form = EditForm::from_profile(&path).expect("reload");
+        form.gpu_boost = false;
+        form.save().expect("save off");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("gpu_boost = false"), "{text}");
+        let mut form = EditForm::from_profile(&path).expect("reload");
+        assert!(!form.gpu_boost);
+
+        // Off survives a renderer switch (`false` is valid anywhere)...
+        form.gpu = GpuRenderer::TwoD;
+        assert_eq!(form.to_config().unwrap().display.gpu_boost, Some(false));
+
+        // ...and an explicit `true` is kept with Venus and dropped without it.
+        std::fs::write(
+            &path,
+            format!("{PROFILE}\n[display]\nvenus = true\ngpu_boost = true\n"),
+        )
+        .unwrap();
+        let mut form = EditForm::from_profile(&path).expect("explicit true");
+        assert!(form.gpu_boost);
+        assert!(!form.dirty(), "loading must not rewrite the explicit true");
+        assert_eq!(form.to_config().unwrap().display.gpu_boost, Some(true));
+        form.gpu = GpuRenderer::TwoD;
+        let cfg = form
+            .to_config()
+            .expect("2D with the boost left on is valid");
+        assert_eq!(cfg.display.gpu_boost, None);
+    }
+
+    /// The VRAM cap is absent until asked for, keeps its number across an
+    /// off/on toggle, and is held to the engine's own bounds.
+    #[test]
+    fn the_video_memory_cap_is_opt_in_and_bounded() {
+        let path = temp_profile("vram");
+        let mut form = EditForm::from_profile(&path).expect("load");
+        assert!(!form.gpu_memory_limit);
+        assert_eq!(form.gpu_memory_mib, DEFAULT_GPU_MEMORY_CAP_MIB);
+        assert_eq!(form.to_config().unwrap().display.gpu_memory_mib, None);
+
+        form.gpu = GpuRenderer::Venus;
+        form.gpu_memory_limit = true;
+        form.gpu_memory_mib = 6144;
+        form.save().expect("save");
+        let mut form = EditForm::from_profile(&path).expect("reload");
+        assert!(form.gpu_memory_limit);
+        assert_eq!(form.gpu_memory_mib, 6144);
+
+        form.gpu_memory_limit = false;
+        assert_eq!(form.to_config().unwrap().display.gpu_memory_mib, None);
+        assert_eq!(form.gpu_memory_mib, 6144, "the typed value is kept");
+
+        form.gpu_memory_limit = true;
+        form.gpu_memory_mib = control_api::MIN_GPU_MEMORY_MIB - 1;
+        let error = form.to_config().expect_err("below the floor");
+        assert!(error.contains("gpu_memory_mib"), "{error}");
     }
 
     /// The 3D choice writes exactly one switch, and switching renderer

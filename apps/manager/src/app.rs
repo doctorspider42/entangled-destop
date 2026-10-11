@@ -171,7 +171,8 @@ pub struct EditVmState {
 pub enum EditVmSection {
     Hardware,
     BootMedia,
-    NetworkDisplay,
+    DisplayGpu,
+    NetworkDevices,
     Storage,
 }
 
@@ -638,6 +639,7 @@ impl ManagerApp {
             ScreenshotView::Main
             | ScreenshotView::Editor
             | ScreenshotView::EditorBoot
+            | ScreenshotView::EditorDisplay
             | ScreenshotView::EditorNetwork
             | ScreenshotView::EditorStorage => {}
         }
@@ -1130,7 +1132,8 @@ impl ManagerApp {
         let section = match self.screenshot_view {
             ScreenshotView::Editor => EditVmSection::Hardware,
             ScreenshotView::EditorBoot => EditVmSection::BootMedia,
-            ScreenshotView::EditorNetwork => EditVmSection::NetworkDisplay,
+            ScreenshotView::EditorDisplay => EditVmSection::DisplayGpu,
+            ScreenshotView::EditorNetwork => EditVmSection::NetworkDevices,
             ScreenshotView::EditorStorage => EditVmSection::Storage,
             _ => return,
         };
@@ -2242,6 +2245,14 @@ impl ManagerApp {
                 form.backend = self.backend_of(name);
                 form.base_backend = form.backend;
                 form.work_dir = self.settings.child_cwd();
+                // The rate "Match monitor" offers, by the rule `entangled
+                // install` uses; a mock session is a 60 Hz host, like the
+                // wizard's.
+                form.monitor_refresh_hz = if self.mock_mode {
+                    control_api::refresh::default_refresh_hz(None)
+                } else {
+                    control_api::refresh::host_default_refresh_hz().0
+                };
                 self.modal = Modal::EditVm(EditVmState {
                     form,
                     section: EditVmSection::Hardware,

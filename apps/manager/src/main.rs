@@ -91,6 +91,7 @@ enum ScreenshotView {
     /// because that is how the panels are actually reviewed.
     Editor,
     EditorBoot,
+    EditorDisplay,
     EditorNetwork,
     EditorStorage,
     Diagnostics,

@@ -215,6 +215,22 @@ the row has one). Stacked rows therefore line up on both edges.
 - Paths use `ui::path_row`, which is `form_row` + text field + Browse and
   returns `true` on click; the caller pushes `Action::PickPath(target)`.
 
+### 2a. A default is not written
+
+The manager may be driving an **older** engine (a WSL release), and every
+profile section denies unknown keys — so an editor field whose value is the
+engine's own default must leave the key *absent*, not spell the default out.
+`EditForm::to_config` is where this lives, and `Display & GPU` shows the
+pattern (2026-10-11): `gpu_boost` is a checkbox that is on unless the profile
+says `false`, writes nothing while ticked and `false` when not, keeps an
+explicit `true` only beside the GPU desktop (the engine refuses it elsewhere);
+`gpu_memory_mib` is a checkbox plus a number, absent until ticked, with the
+typed number kept across a toggle. Fields that only mean something with one
+renderer (boost, VRAM cap) are shown only with it, but their values ride
+through a renderer switch untouched. "Match monitor" on the refresh row is a
+*value* (`control_api::refresh::host_default_refresh_hz`, the install rule,
+read when the editor opens — 60 in `--mock`), never a key.
+
 ### 3. No path is typed unless the user wants to type it
 
 Every path in the product has a native picker (`picker.rs`, `rfd`), and the text
@@ -441,8 +457,8 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
   Linux engine), `wizard-wsl-review` (the same machine on the review step,
   where Create is unavailable), `settings`, `disks`, `snapshots`,
   `snapshot-delete`, `snapshot-discard`, `diagnostics`, and one per editor
-  section: `editor` (Hardware), `editor-boot`, `editor-network`,
-  `editor-storage`. **Every new
+  section: `editor` (Hardware), `editor-boot`, `editor-display` (Display &
+  GPU), `editor-network` (Network & devices), `editor-storage`. **Every new
   surface gets one**, or it cannot be reviewed.
 - Alignment regressions do not survive a look at the pixels but do survive a
   glance at the window. When touching form layout, measure: crop the PNG and
