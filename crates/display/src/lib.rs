@@ -97,6 +97,7 @@ pub mod resize;
 pub mod scanout;
 pub mod shared;
 mod sync;
+pub mod thumbnail;
 pub mod toolbar;
 pub mod ux;
 pub mod viewport;

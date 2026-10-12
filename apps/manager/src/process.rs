@@ -301,6 +301,12 @@ impl Task {
 
     /// Whether this VM has a lifecycle control channel (ADR-0005) — only an
     /// `entangled run` started with `--control-stdin` does.
+    /// Asks the engine for a new card picture (`thumbnail`, silent on
+    /// success); see `crate::thumbs`.
+    pub fn request_thumbnail(&self) -> bool {
+        self.send_control(control_api::control::CMD_THUMBNAIL)
+    }
+
     pub fn has_control(&self) -> bool {
         self.shared
             .control

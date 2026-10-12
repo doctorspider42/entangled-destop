@@ -922,7 +922,13 @@ entangled run --headless --control-stdin ~/entangled-vms/ubuntu.toml
 ```
 
 reads one lifecycle command per line on stdin: `pause`, `resume`, `reset`,
-`save [path]`, `type <text>` (types on the guest's serial console) and `status`.
+`save [path]`, `type <text>` (types on the guest's serial console), `status`,
+`shutdown` (presses the ACPI power button), `display WIDTHxHEIGHT` (asks the
+guest for another desktop size) and `thumbnail [path]`. The last one writes a
+picture of the screen, at most 480 pixels wide, to the path, or by default to
+`.thumbnails/<name>.png` beside the profile. It is the only command that
+answers nothing when it succeeds, because the manager sends it every three
+seconds.
 This is how the GUI manager's buttons work, and how the end-to-end tests log
 into a guest.
 
@@ -1144,8 +1150,16 @@ The clone gets a network address of its own, so both can run at once. Port
 forwards stay with the original, because two machines cannot own one host port,
 and a saved session is not copied. Inside, the clone is the same installation:
 same hostname, same accounts, same SSH host keys. Change those in the guest if
-the two will share a network others see. A card whose disk file has gone missing says so and offers no Start
-button.
+the two will share a network others see.
+
+A card whose disk file has gone missing says so and offers no Start button.
+
+**The card shows the machine's screen.** While a machine this manager started
+is running, its card carries a picture of the guest's screen, a few seconds
+old, in the space above the buttons. When the machine stops, the picture stays,
+dimmed: the screen as it was left. The pictures are small PNGs in
+`.thumbnails/` beside the profiles, and *Delete machine* removes them with
+everything else.
 
 Pause, Restart and Suspend need the control channel, which only exists for a VM
 *this manager started*; on a machine someone launched from a terminal they are

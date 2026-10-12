@@ -267,13 +267,14 @@ pub fn plan_delete(entry: &VmEntry, vm_dir: &Path) -> DeletePlan {
         }
     }
     // Byproducts of the install flow and our own logs, best-effort — plus the
-    // suspended session, which is bound to this machine's disks and useless the
+    // card's screen picture, and the suspended session, which is bound to this machine's disks and useless the
     // moment they are gone (ADR-0006).
     for byproduct in [
         vm_dir.join(format!("{}-install.log", entry.name)),
         vm_dir.join(format!("{}-run.log", entry.name)),
         vm_dir.join(format!("{}.install-initrd.img", entry.name)),
         crate::snapshots::path_for(entry),
+        crate::thumbs::path_for(&entry.profile_path, &entry.name),
     ] {
         if byproduct.exists() {
             plan.remove.push(byproduct);

@@ -272,10 +272,65 @@ fn vm_card(
             // that state was added — silently, because only a screenshot shows
             // it.
             let strip = measured_action_height(ui, app, vm, status, missing_disk, &path);
+            screen_picture(ui, app, vm, status, ui.available_height() - strip - 6.0);
             ui.add_space((ui.available_height() - strip).max(0.0));
             action_strip(ui, app, vm, status, missing_disk, &path, actions);
         },
     );
+}
+
+/// The machine's screen, in whatever room the card has left above its
+/// buttons: live (a few seconds old) while it runs, dimmed when it does not —
+/// the screen as it was left. Nothing at all when there is no picture or no
+/// room for a useful one.
+fn screen_picture(ui: &mut egui::Ui, app: &ManagerApp, vm: &VmEntry, status: Status, room: f32) {
+    let Some(texture) = app.thumbs.get(&vm.name) else {
+        return;
+    };
+    if room < 56.0 {
+        return;
+    }
+    let size = texture.size_vec2();
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return;
+    }
+    let scale = (ui.available_width() / size.x).min(room / size.y);
+    let shown = size * scale;
+    ui.add_space(4.0);
+    let (row, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), shown.y),
+        egui::Sense::hover(),
+    );
+    let rect = egui::Rect::from_center_size(row.center(), shown);
+    let live = status == Status::Running;
+    let tint = if live {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_gray(110)
+    };
+    egui::Image::new(texture)
+        .corner_radius(6)
+        .tint(tint)
+        .paint_at(ui, rect);
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::same(6),
+        egui::Stroke::new(
+            1.0_f32,
+            theme::accent(accent_for(&vm.name)).gamma_multiply(0.5),
+        ),
+        egui::StrokeKind::Outside,
+    );
+    let response = ui.interact(
+        rect,
+        ui.id().with(("screen", &vm.name)),
+        egui::Sense::hover(),
+    );
+    response.on_hover_text(if live {
+        "The screen, a few seconds ago"
+    } else {
+        "The screen as it was when the machine last ran here"
+    });
 }
 
 /// Lays the action strip out once, invisibly, to learn how tall it will be.

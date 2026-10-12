@@ -376,6 +376,21 @@ impl DisplayHandle {
         Ok((width, height, snapshot.pixels().to_vec()))
     }
 
+    /// Writes a small PNG of the current scanout (at most `max_width` wide,
+    /// cursor included) to `path`, atomically — the manager's card picture,
+    /// see [`crate::thumbnail`].
+    pub fn write_thumbnail(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        max_width: u32,
+    ) -> Result<(), DisplayError> {
+        let snapshot = self.snapshot()?;
+        let (width, height) = snapshot.size();
+        let (w, h, rgba) = crate::thumbnail::downscale(width, height, snapshot.pixels(), max_width)
+            .ok_or(DisplayError::Config("the scanout has no pixels to scale"))?;
+        crate::thumbnail::write_png_atomically(path.as_ref(), w, h, &rgba)
+    }
+
     /// Writes a PNG screenshot of the current scanout to `path`.
     pub fn screenshot(&self, path: impl AsRef<std::path::Path>) -> Result<(), DisplayError> {
         let path = path.as_ref();

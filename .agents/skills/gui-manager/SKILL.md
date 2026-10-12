@@ -566,6 +566,21 @@ The backend is manager state, so the manager copies the source's backend to
 the clone after it succeeds (`set_backend_for`). `suggest_clone_name` proposes
 `ubuntu-3` for `ubuntu-2`, not `ubuntu-2-2`.
 
+### The screen on the card (`thumbs.rs`, 2026-10-12)
+
+Every `thumbs::ASK_EVERY` (3 s) `refresh_thumbnails` sends `thumbnail` to each
+Running machine that has a control channel. The engine writes
+`control_api::control::thumbnail_path(<profile dir>, <name>)` (a 480-pixel PNG,
+written to a temporary file and renamed into place) and **answers nothing on
+success**, so the run log does not grow by one line every 3 s. The manager never
+sends a path: under WSL the engine sees the directory under another name, and
+both sides derive the same file from the profile. `Thumbs::refresh` stats the
+files once a second and decodes only those whose mtime changed.
+`cards::screen_picture` draws the picture in whatever height the card has left
+above the action strip (nothing below 56 px), dimmed when the machine is not
+running. `plan_delete` removes the file. `--mock` has no pictures, so
+screenshots stay identical.
+
 ### Cards that grow
 
 `horizontal_wrapped` only reports how many lines it took **after** it has drawn

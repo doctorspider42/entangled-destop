@@ -482,6 +482,8 @@ pub struct ManagerApp {
     screenshot_view: ScreenshotView,
     screenshot_surface_opened: bool,
     frame: u64,
+    /// Each machine's latest screen picture (`crate::thumbs`).
+    pub thumbs: crate::thumbs::Thumbs,
 }
 
 struct ScreenshotJob {
@@ -581,6 +583,7 @@ impl ManagerApp {
             .map(|engine| launcher::spawn_version_probe(engine.path.clone(), Arc::clone(&waker)));
 
         let mut app = Self {
+            thumbs: crate::thumbs::Thumbs::default(),
             mock_mode,
             view: View::default(),
             engine,
@@ -2447,6 +2450,33 @@ impl ManagerApp {
         }
     }
 
+    /// Asks every running machine for a new picture of its screen now and
+    /// then, and picks up the ones that arrived.
+    fn refresh_thumbnails(&mut self, ctx: &egui::Context) {
+        if self.mock_mode {
+            return;
+        }
+        let now = Instant::now();
+        if self.thumbs.due_to_ask(now) {
+            for vm in &self.scan.vms {
+                if self.status_of(&vm.name) != Status::Running {
+                    continue;
+                }
+                if let Some(task) = self.supervisor.active_task(&vm.name) {
+                    if task.has_control() {
+                        task.request_thumbnail();
+                    }
+                }
+            }
+        }
+        let vms = self
+            .scan
+            .vms
+            .iter()
+            .map(|vm| (vm.name.as_str(), vm.profile_path.as_path()));
+        self.thumbs.refresh(ctx, now, vms);
+    }
+
     /// The first free `<name>-N`: no machine, profile or disk by that name.
     fn suggest_clone_name(&self, source: &str, profile: &Path) -> String {
         let dir = profile.parent().unwrap_or(Path::new("."));
@@ -3356,6 +3386,7 @@ impl eframe::App for ManagerApp {
         self.collect_wsl_events();
         self.collect_move_events();
         self.collect_clone_events();
+        self.refresh_thumbnails(ctx);
         self.collect_engine_version();
         self.collect_picker();
         self.collect_diagnostics();

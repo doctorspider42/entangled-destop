@@ -888,6 +888,9 @@ pub const CONTROL_PREFIX: &str = control_api::control::PREFIX;
 /// | `save [path]` | suspend to `path` (or the profile's default) and exit |
 /// | `type <text>` | type `<text>` and Enter on the guest's serial console |
 /// | `status` | print the current [`RunState`](vmm_core::RunState) |
+/// | `thumbnail [path]` | write a small PNG of the screen (silent on success) |
+/// | `display WxH` | ask the guest for another desktop resolution |
+/// | `shutdown` | press the ACPI power button |
 ///
 /// `type` is the same host-to-guest path the unattended installer uses to drive
 /// GRUB (`MachineBus::push_serial_input`), exposed rather than kept private:
@@ -922,7 +925,7 @@ fn spawn_control_channel(
                 // cannot drift apart.
                 use control_api::control::{
                     CMD_DISPLAY, CMD_PAUSE, CMD_RESET, CMD_RESUME, CMD_SAVE, CMD_SHUTDOWN,
-                    CMD_STATUS, CMD_TYPE,
+                    CMD_STATUS, CMD_THUMBNAIL, CMD_TYPE,
                 };
                 match command {
                     "" => {}
@@ -930,10 +933,9 @@ fn spawn_control_channel(
                     CMD_RESUME => requests.resume.store(true, Ordering::Relaxed),
                     CMD_RESET => requests.reset.store(true, Ordering::Relaxed),
                     CMD_DISPLAY => {
-                        let size = argument
-                            .trim()
-                            .split_once('x')
-                            .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)));
+                        let size = argument.trim().split_once('x').and_then(|(w, h)| {
+                            Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
+                        });
                         match size {
                             Some((w, h)) => {
                                 display.request_guest_resolution(w, h);
@@ -944,10 +946,39 @@ fn spawn_control_channel(
                             }
                         }
                     }
+                    CMD_THUMBNAIL => {
+                        // Beside the profile, named for the snapshot's stem:
+                        // the default snapshot is `<profile dir>/<name>.esnap`.
+                        let path = match argument.trim() {
+                            "" => snapshot.as_ref().and_then(|s| {
+                                let name = s.file_stem()?.to_str()?;
+                                Some(control_api::control::thumbnail_path(
+                                    s.parent().unwrap_or(std::path::Path::new(".")),
+                                    name,
+                                ))
+                            }),
+                            given => Some(PathBuf::from(given)),
+                        };
+                        let Some(path) = path else {
+                            println!("{CONTROL_PREFIX} error thumbnail needs a path");
+                            continue;
+                        };
+                        if let Some(dir) = path.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        if let Err(error) =
+                            display.write_thumbnail(&path, display::thumbnail::MAX_WIDTH)
+                        {
+                            println!("{CONTROL_PREFIX} error thumbnail {error}");
+                        }
+                        // Silent on success, by contract (`CMD_THUMBNAIL`).
+                        continue;
+                    }
                     CMD_SHUTDOWN => {
                         if !requests.press_power_button() {
                             println!(
-                                "{CONTROL_PREFIX} note the guest has not enabled its power                                  button yet; the press is latched until it does"
+                                "{CONTROL_PREFIX} note the guest has not enabled its power \
+                                 button yet; the press is latched until it does"
                             );
                         }
                     }

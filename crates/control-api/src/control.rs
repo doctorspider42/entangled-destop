@@ -46,6 +46,20 @@ pub const CMD_SHUTDOWN: &str = "shutdown";
 /// Ask the guest for another desktop resolution, `display WIDTHxHEIGHT`: what
 /// resizing the window does, for a headless VM or a test.
 pub const CMD_DISPLAY: &str = "display";
+/// Write a small PNG of the guest's screen, `thumbnail [path]`; without a path
+/// it goes to [`thumbnail_path`] of the VM's snapshot location. Silent on
+/// success — the manager asks every few seconds, and an `ok` per ask would
+/// fill the run log.
+pub const CMD_THUMBNAIL: &str = "thumbnail";
+
+/// Where a machine's card picture lives: `.thumbnails/<name>.png` beside its
+/// profile. The engine derives it from the default snapshot path (which sits
+/// beside the profile as `<name>.esnap`) and the manager from the profile, so
+/// neither has to tell the other a path — which matters when the engine runs
+/// in WSL and sees the directory under another name.
+pub fn thumbnail_path(profile_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    profile_dir.join(".thumbnails").join(format!("{name}.png"))
+}
 
 /// One reply line, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]

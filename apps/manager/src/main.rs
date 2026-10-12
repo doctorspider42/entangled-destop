@@ -30,6 +30,7 @@ mod process;
 mod settings;
 mod snapshots;
 mod theme;
+mod thumbs;
 mod ui;
 mod update;
 mod wslengine;
