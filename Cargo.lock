@@ -4552,6 +4552,7 @@ dependencies = [
  "virtio-queue",
  "vm-memory 0.17.2",
  "vmm-sys-util",
+ "windows 0.62.2",
 ]
 
 [[package]]
