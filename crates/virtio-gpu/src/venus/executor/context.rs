@@ -409,10 +409,19 @@ impl<H: HostVulkan> VulkanContext<H> {
         refused: &super::limits::Refusal,
     ) -> VkResult {
         if self.refusals_logged.borrow_mut().insert(refused.class) {
+            // What fills the table, top five: the one fact a leak report needs.
+            let held: Vec<String> = self
+                .objects
+                .census()
+                .into_iter()
+                .take(5)
+                .map(|(kind, count)| format!("{kind}={count}"))
+                .collect();
             tracing::info!(
                 ctx_id = self.ctx_id,
                 command,
                 %refused,
+                held = held.join(" "),
                 "a Venus create was refused at a cap; the guest is answered in Vulkan terms \
                  (ADR-0004, the resource-exhaustion amendment)"
             );

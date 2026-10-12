@@ -913,6 +913,17 @@ pub struct KindTable {
 }
 
 impl KindTable {
+    /// How many objects of each kind the table holds, most first.
+    fn census(&self) -> Vec<(&'static str, usize)> {
+        let mut counts: HashMap<&'static str, usize> = HashMap::new();
+        for entry in self.map.values() {
+            *counts.entry(entry.kind.name()).or_default() += 1;
+        }
+        let mut counts: Vec<_> = counts.into_iter().collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        counts
+    }
+
     fn new(limits: ContextLimits) -> Self {
         Self {
             map: HashMap::new(),
@@ -1125,6 +1136,14 @@ impl<H: HostVulkan> Objects<H> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.kinds.is_empty()
+    }
+
+    /// The kinds the table holds and how many of each, most first: what a
+    /// refusal at the object cap logs, so a guest that leaks one kind is named
+    /// rather than guessed at.
+    #[must_use]
+    pub fn census(&self) -> Vec<(&'static str, usize)> {
+        self.kinds.census()
     }
 
     /// The context's shares of every cap ([`super::limits`]).
