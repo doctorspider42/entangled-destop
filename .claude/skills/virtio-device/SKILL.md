@@ -657,6 +657,24 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   `unable to open display :0`, which is exactly what a crashed Xwayland says
   too. The journal line that tells them apart is gnome-shell's
   `X Wayland crashed; attempting to recover`.
+- **Known flake: a handle blob read on another device under GPU load**
+  (measured 2026-10-13, RTX 2070, driver 580.88). Two real-GPU tests read
+  wrong content from an exported `OPAQUE_WIN32` allocation imported on a
+  second `VkDevice`:
+  - `a_frame_presented_through_dma_buf_wsi_is_read_exactly_by_the_compositor`
+    read **all zeros**: not the `0xdeadbeef` prefill, so the copy ran from
+    zeroed memory.
+  - `a_handle_blob_flip_reads_back_the_frame_through_the_renderers_scanout_device`
+    read a wrong frame.
+
+  Both fail only while the rest of the `host_vulkan` tests run in parallel:
+  1 of 5 full runs, 1 of 6 GPU-only runs, 0 of 3 with `--test-threads=1`,
+  and 0 of 20 runs of the one test alone. It is not the harness: waits with
+  an infinite timeout are unbounded, and `submit` is synchronous. The release
+  to `FOREIGN` and the fence wait are in place. Suspect the driver's or WDDM's
+  handling of a cross-device import while other devices come and go. Before
+  trusting zero-copy presentation under load, reproduce it in a two-process
+  test.
 - **The desktop's flips are presented by the display's own GPU on Windows**
   (ADR-0004, zero-copy presentation). A renderer-blob flush first asks
   `Renderer3d::begin_shared_scanout` for a **lease**: the image, its
