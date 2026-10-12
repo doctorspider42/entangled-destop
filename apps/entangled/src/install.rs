@@ -427,6 +427,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         // where the card and the pad belong.
         sound: SoundSection::default(),
         shares: Vec::new(),
+        reclaim_memory: false,
         gamepad: GamepadSection::default(),
     };
 
@@ -506,6 +507,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         // else, a host with no controller gets a pad that never moves, and one
         // plugged in later is picked up without restarting the VM.
         shares: Vec::new(),
+        reclaim_memory: false,
         gamepad: GamepadSection {
             enabled: true,
             // One pad. A second is a config edit away and costs another virtio

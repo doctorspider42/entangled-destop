@@ -1397,6 +1397,7 @@ dependencies = [
  "tracing-subscriber",
  "uefi-boot",
  "virtio-9p",
+ "virtio-balloon",
  "virtio-block",
  "virtio-core",
  "virtio-gpu",
@@ -4493,6 +4494,18 @@ dependencies = [
  "virtio-core",
  "virtio-queue",
  "vm-memory 0.17.2",
+]
+
+[[package]]
+name = "virtio-balloon"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "tracing",
+ "virtio-core",
+ "virtio-queue",
+ "vm-memory 0.17.2",
+ "windows 0.62.2",
 ]
 
 [[package]]

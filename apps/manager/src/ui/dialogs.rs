@@ -1380,6 +1380,15 @@ fn edit_hardware(
             );
         },
     );
+    ui::form_row(ui, "", "", |ui, _| {
+        ui.checkbox(
+            &mut form.reclaim_memory,
+            "Give memory the guest frees back to this computer",
+        )
+        .on_hover_text(
+            "Without it, memory the guest has used stays taken on this computer until the              machine stops, even after the guest frees it. With it, Linux guests report free              memory (in 2 MiB blocks, a moment after it is freed) and Entangled hands it back.              Costs one of the machine's eight device slots.",
+        );
+    });
     ui.add_space(6.0);
     ui::form_row(
         ui,

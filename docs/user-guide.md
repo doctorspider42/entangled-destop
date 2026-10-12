@@ -930,6 +930,25 @@ about half to two thirds of one CPU core doing it (46-65 %, the guest's own
 vCPU time included; 2-4 % with the guest idle). Until this build a download was held to
 about 1.5-2 MB/s by the NAT itself.
 
+### Giving memory back
+
+Once the guest has touched a page of its memory, the page stays taken on the
+host until the machine stops, even after the guest frees it. That is how a
+browser session that peaked at 6 GiB keeps 6 GiB of the host's RAM. Turn on
+*Configure → Hardware → Give memory the guest frees back to this computer*,
+or set it in the profile:
+
+```toml
+reclaim_memory = true
+```
+
+The guest's kernel then reports memory a moment after it is freed, in blocks
+of 2 MiB or more, and Entangled hands those blocks back to the host. Every
+Linux kernel since 5.7 can do this (`virtio_balloon`). On the installed Ubuntu
+desktop, 2 GiB allocated and then freed in the guest came off the host
+process's memory within 10 seconds. The option uses one of the machine's
+eight device slots, which is why it is off unless you turn it on.
+
 ### Shared folders
 
 A folder on the host can be opened inside the guest like a drive of its own:

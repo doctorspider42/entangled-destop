@@ -791,6 +791,14 @@ fn build_devices(
         devices.push(Box::new(device));
     }
 
+    // The balloon, for free page reporting only — and only when asked: it
+    // takes a slot, and a profile that never named it keeps the device list
+    // (and the guest-visible names) it always had.
+    if cfg.reclaim_memory {
+        tracing::info!("attaching virtio-balloon (the guest's free memory goes back to the host)");
+        devices.push(Box::new(virtio_balloon::BalloonDevice::new()));
+    }
+
     Ok(BuiltDevices {
         devices,
         net_cmdline,

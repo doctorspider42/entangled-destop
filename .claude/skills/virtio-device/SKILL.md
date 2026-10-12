@@ -207,6 +207,7 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_9p::server::MAX_FIDS` | 16384 | live fids one guest may hold (each may hold an open host file) | `virtio_9p::server::tests::the_fid_table_is_bounded` |
 | `virtio_9p::server::MAX_WALK` / `MAX_DIR_ENTRIES` | 16 / 65536 | names in one `Twalk`; entries one directory listing holds | `virtio_9p::server::tests::malformed_messages_are_answered_not_fatal` |
 | `control_api::MAX_SHARES` | 4 | `[[share]]` sections, each a device slot | `control_api` validation |
+| `virtio_balloon::CHAINS_PER_NOTIFY` / `PAGE` | 1024 / 4 KiB | chains returned per kick on any balloon queue; a reported range is discarded only in whole host pages inside one guest RAM region (`get_slice`) | `virtio_balloon::tests::{a_reported_range_is_discarded_page_aligned, a_range_outside_guest_ram_is_refused}` |
 | `virtio_input::MAX_PENDING_EVENTS` | 1024 | host-buffered input events while the guest is not draining (oldest dropped) | `input_queue::a_starved_queue_buffers_events_up_to_the_bound_and_drops_the_oldest` |
 | `virtio_input::config::PAYLOAD_MAX` | 128 | config-space payload bytes | `virtio_input::config::tests::{bitmap_drops_codes_beyond_the_payload, from_slice_truncates_at_the_payload_size}` |
 | `virtio_input::gamepad::MAX_EVENTS_PER_REPORT` | 20 | events one capture tick can push (11 buttons + 8 axes + the `SYN_REPORT`); *derived*, and what makes "one host tick is one bounded push" true by construction | `virtio_input::gamepad::tests::every_event_the_pump_can_produce_is_one_the_profile_advertises` (asserts the budget is exact) |
@@ -1010,6 +1011,20 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   lifecycle, both queue directions) and `snd_device` (arbitrary chains through a
   live transport whose streams the harness first drives to Running, so RX
   reaches the fill path rather than only the refusal path).
+- **balloon** (2026-10-13): `crates/virtio-balloon`, device type 5,
+  *free page reporting only*.
+  - It declares three queues (inflate, deflate, reporting) and refuses a
+    driver that does not negotiate `VIRTIO_BALLOON_F_REPORTING`. Linux
+    compacts the queue indices of absent features, so a driver without
+    reporting would set up two queues and fail activation.
+  - The device-writable segments of a reporting chain *are* the free memory.
+    Each one is discarded through `get_slice` (one region, bounds-checked),
+    in whole pages only: `madvise(MADV_DONTNEED)` on Linux,
+    `DiscardVirtualMemory` on Windows, where it works under a WHP mapping.
+  - `num_pages` stays 0, so the host never asks for an inflate.
+  - It is opt-in (`reclaim_memory`), because it takes a slot.
+  - Measured on WHP: 2 GiB freed in the guest left the host working set
+    within 10 s.
 - **9p** (shared folders, 2026-10-12): `crates/virtio-9p`, device type 9, one
   request queue, `VIRTIO_9P_MOUNT_TAG` with the tag in config space. The
   server is 9P2000.L on portable `std::fs`. Its security model is the whole

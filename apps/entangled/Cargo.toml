@@ -37,6 +37,7 @@ virtio-block.workspace = true
 virtio-net.workspace = true
 virtio-sound.workspace = true
 virtio-9p.workspace = true
+virtio-balloon.workspace = true
 virtio-gpu.workspace = true
 virtio-input.workspace = true
 display.workspace = true

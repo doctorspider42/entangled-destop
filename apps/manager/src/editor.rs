@@ -103,6 +103,8 @@ pub struct EditForm {
     /// `xinput` by hand keeps it across a toggle, and everyone else gets
     /// `auto`, which probes what this host has and never prevents a start.
     pub gamepad: bool,
+    /// `reclaim_memory`: the balloon's free page reporting.
+    pub reclaim_memory: bool,
 
     /// `[gamepad] players` — how many pads the guest gets, one virtio slot
     /// each. Only meaningful while [`Self::gamepad`] is on; kept across a
@@ -277,6 +279,7 @@ enabled = true
             sound: cfg.sound.enabled,
             sound_backend: cfg.sound.backend,
             gamepad: cfg.gamepad.enabled,
+            reclaim_memory: cfg.reclaim_memory,
             gamepad_players: cfg
                 .gamepad
                 .players
@@ -357,6 +360,7 @@ enabled = true
         // the form does not offer it and silently rewriting a field nobody was
         // shown is how a hand-edited profile loses its choice.
         cfg.gamepad.enabled = self.gamepad;
+        cfg.reclaim_memory = self.reclaim_memory;
         cfg.gamepad.players = self
             .gamepad_players
             .clamp(1, control_api::MAX_GAMEPAD_PLAYERS);

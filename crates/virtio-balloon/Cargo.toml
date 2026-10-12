@@ -1,0 +1,24 @@
+[package]
+name = "virtio-balloon"
+description = "virtio-balloon with free page reporting: the guest's free memory given back to the host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tracing.workspace = true
+virtio-core.workspace = true
+virtio-queue.workspace = true
+vm-memory.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+# DiscardVirtualMemory, for the pages the guest reports free.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Memory"] }
+
+[lints]
+workspace = true

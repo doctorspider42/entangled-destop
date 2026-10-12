@@ -107,6 +107,11 @@ pub struct VmConfig {
     /// virtio-9p device after every other device. None by default.
     #[serde(default, rename = "share", skip_serializing_if = "Vec::is_empty")]
     pub shares: Vec<ShareSection>,
+    /// Give the guest's free memory back to the host (virtio-balloon free page
+    /// reporting). Off by default: it takes one of the bus's device slots,
+    /// and an existing machine keeps exactly the hardware it had.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reclaim_memory: bool,
 }
 
 /// `[[share]]` — a host directory the guest mounts with
