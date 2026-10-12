@@ -1449,14 +1449,24 @@ pub fn run_with(
                         std::thread::sleep(Duration::from_millis(20));
                         continue;
                     };
-                    for batch in input_queue.drain_batches() {
+                    // Moves superseded within this pass are dropped, and each
+                    // device gets one push — one interrupt — per pass rather
+                    // than one per host mouse report (`coalesce_motion`).
+                    let mut keyboard = Vec::new();
+                    let mut pointer = Vec::new();
+                    for batch in virtio_input::coalesce_motion(input_queue.drain_batches()) {
                         let split = virtio_input::split_batch(&batch);
-                        if let Err(e) = keyboard_sink.push(&split.keyboard) {
-                            tracing::warn!(error = %e, "keyboard event delivery failed");
-                        }
-                        if let Err(e) = tablet_sink.push(&split.pointer) {
-                            tracing::warn!(error = %e, "pointer event delivery failed");
-                        }
+                        keyboard.extend(split.keyboard);
+                        pointer.extend(split.pointer);
+                    }
+                    if let Err(e) = keyboard_sink.push(&keyboard) {
+                        tracing::warn!(error = %e, "keyboard event delivery failed");
+                    }
+                    if !pointer.is_empty() {
+                        tracing::trace!(events = ?pointer, "pointer events to the tablet");
+                    }
+                    if let Err(e) = tablet_sink.push(&pointer) {
+                        tracing::warn!(error = %e, "pointer event delivery failed");
                     }
                     for event in control_queue.drain() {
                         note_control_event(event, &pump_requests, pump_snapshot.as_deref());

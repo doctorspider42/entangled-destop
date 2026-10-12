@@ -13,7 +13,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::monitor::MonitorHandle;
-use winit::window::{CursorGrabMode, CustomCursor, Fullscreen, Window, WindowId};
+use winit::window::{Cursor, CursorGrabMode, CustomCursor, Fullscreen, Window, WindowId};
 
 use crate::boost::{BoostGate, BoostPolicy};
 use crate::handle::{HostEvent, Waker};
@@ -210,6 +210,11 @@ impl DisplayHost {
             seen_frames: 0,
             boost: BoostGate::new(boost.with_env()),
         };
+        // Nothing here reads `DeviceEvent`s (pointer input is the window's
+        // `CursorMoved`), and on Windows winit otherwise registers raw input for
+        // every mouse: a 1000 Hz mouse then posts a `WM_INPUT` per report into
+        // the queue the redraws have to get through (see `user_event`).
+        event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
         event_loop.run_app(&mut app)?;
         match app.fatal.take() {
             Some(err) => Err(err),
@@ -241,9 +246,20 @@ struct App {
     grabbed: bool,
     /// Cursor visibility actually applied to the window (WIN-1501).
     cursor_visible: bool,
-    /// The two cursor images used on Wayland instead of `set_cursor_visible`
-    /// and `CursorIcon::Default`, created once with the window; `None` on
-    /// every other backend.
+    /// The two cursors used on Wayland and Windows instead of
+    /// `set_cursor_visible`, created once with the window; `None` on X11 and
+    /// macOS, where the flag does what it says.
+    ///
+    /// **Windows** cannot use `set_cursor_visible(false)` while the pointer is
+    /// grabbed: winit 0.30 treats "hidden + confined" as a request to pin the
+    /// cursor to one pixel in the middle of the client area
+    /// (`platform_impl/windows/window_state.rs`, `CursorFlags::refresh`), so
+    /// `CursorMoved` stops after one event at the window centre and the guest's
+    /// absolute pointer sits there forever — clicks arrive, motion never does
+    /// (found 2026-10-12: the tablet was sent the click position, then
+    /// 16384/16367, then only buttons). A transparent *image* leaves winit's
+    /// `HIDDEN` flag clear, the confinement is the whole client rect, and every
+    /// motion reaches the guest. Shown again, Windows' own arrow is fine.
     ///
     /// Hiding the cursor there cannot use `set_cursor_visible(false)`: winit
     /// maps it to `wl_pointer.set_cursor(nil)`, and WSLg's RDP-backed Weston
@@ -259,7 +275,7 @@ struct App {
     /// the window's own CSD frame (whose themed cursors fail the same way)
     /// leaves the user without a cursor over the decorations. So "visible"
     /// is a bundled arrow image, which takes the same always-honoured path.
-    cursors: Option<WaylandCursors>,
+    cursors: Option<HostCursors>,
     /// Title text actually applied to the window.
     ///
     /// Every `set_title` is an X11/Wayland round trip, and winit's X11 backend
@@ -322,13 +338,13 @@ impl App {
             .with_resizable(true)
             .with_maximized(initial.maximized);
         let window = Arc::new(event_loop.create_window(attributes)?);
-        self.cursors = WaylandCursors::new(event_loop);
+        self.cursors = HostCursors::new(event_loop);
         if let Some(cursors) = &self.cursors {
             // Establish a known pointer image right away: WSLg's RDP client
             // keeps the last pointer *across windows*, so without this a
             // hidden cursor from a previous run haunts the fresh window until
             // something else sets one.
-            window.set_cursor(cursors.arrow.clone());
+            window.set_cursor(cursors.shown.clone());
         }
         let size = window.inner_size();
         let monitor_mhz = window
@@ -568,7 +584,7 @@ impl App {
     /// after every pointer event: it only talks to winit when the decision
     /// actually flipped.
     ///
-    /// On Wayland both states are cursor *images* ([`WaylandCursors`]) rather
+    /// On Wayland and Windows both states are cursors ([`HostCursors`]) rather
     /// than `set_cursor_visible(false)` / `CursorIcon::Default` — see the
     /// [`App::cursors`] docs for the WSLg story. Everywhere else the plain
     /// visibility flag works and is kept.
@@ -583,7 +599,7 @@ impl App {
         };
         match (&self.cursors, visible) {
             (Some(cursors), false) => window.set_cursor(cursors.hidden.clone()),
-            (Some(cursors), true) => window.set_cursor(cursors.arrow.clone()),
+            (Some(cursors), true) => window.set_cursor(cursors.shown.clone()),
             (None, _) => window.set_cursor_visible(visible),
         }
         // Low frequency (only when crossing the image edge or changing the
@@ -627,17 +643,18 @@ impl App {
     }
 }
 
-/// The cursor images the Wayland path shows instead of toggling
+/// The cursors Wayland and Windows show instead of toggling
 /// `set_cursor_visible` (WIN-1501); see [`App::cursors`] for why both exist.
-struct WaylandCursors {
+struct HostCursors {
     /// A fully transparent 8×8 image: "hidden". 8×8 rather than 1×1 because
     /// tiny buffers have historically upset compositors; 256 bytes, once.
-    hidden: CustomCursor,
-    /// A bundled classic arrow: "visible". A cursor *image* rather than
-    /// `CursorIcon::Default` because named cursors need an XCursor theme the
+    hidden: Cursor,
+    /// "Visible". On Wayland a bundled classic arrow *image* rather than
+    /// `CursorIcon::Default`, because named cursors need an XCursor theme the
     /// host may not have (stock WSL roots don't), and a failed theme lookup
     /// no-ops silently — leaving the transparent image stuck on the pointer.
-    arrow: CustomCursor,
+    /// On Windows the system arrow, which is always there.
+    shown: Cursor,
 }
 
 /// The classic left-pointer, one row per line: `B` black, `W` white outline,
@@ -685,11 +702,10 @@ fn arrow_rgba() -> (Vec<u8>, u16, u16) {
     (rgba, width, height)
 }
 
-impl WaylandCursors {
+impl HostCursors {
     /// Builds both cursors, on Wayland only. `None` off Wayland (and if an
     /// image is rejected), which sends [`App::sync_cursor`] back to
-    /// `set_cursor_visible` — correct on Windows, macOS and X11, where the
-    /// flag works.
+    /// `set_cursor_visible` — correct on X11, where the flag works.
     #[cfg(target_os = "linux")]
     fn new(event_loop: &ActiveEventLoop) -> Option<Self> {
         use winit::platform::wayland::ActiveEventLoopExtWayland;
@@ -702,8 +718,8 @@ impl WaylandCursors {
         let arrow = CustomCursor::from_rgba(rgba, width, height, 0, 0);
         match (hidden, arrow) {
             (Ok(hidden), Ok(arrow)) => Some(Self {
-                hidden: event_loop.create_custom_cursor(hidden),
-                arrow: event_loop.create_custom_cursor(arrow),
+                hidden: event_loop.create_custom_cursor(hidden).into(),
+                shown: event_loop.create_custom_cursor(arrow).into(),
             }),
             (hidden, arrow) => {
                 let err = hidden.err().or(arrow.err());
@@ -716,9 +732,28 @@ impl WaylandCursors {
         }
     }
 
-    /// Non-Linux hosts: the plain visibility flag works everywhere winit runs
-    /// there.
-    #[cfg(not(target_os = "linux"))]
+    /// Windows: the transparent image, and the system arrow. Without them a
+    /// grabbed guest gets no pointer motion at all (see [`App::cursors`]), so
+    /// a rejected image is worth a warning.
+    #[cfg(windows)]
+    fn new(event_loop: &ActiveEventLoop) -> Option<Self> {
+        match CustomCursor::from_rgba(vec![0u8; 8 * 8 * 4], 8, 8, 0, 0) {
+            Ok(hidden) => Some(Self {
+                hidden: event_loop.create_custom_cursor(hidden).into(),
+                shown: Cursor::Icon(winit::window::CursorIcon::Default),
+            }),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "cannot build the transparent cursor; a grabbed guest will get no pointer motion"
+                );
+                None
+            }
+        }
+    }
+
+    /// Other hosts (macOS): the plain visibility flag works there.
+    #[cfg(not(any(target_os = "linux", windows)))]
     fn new(_event_loop: &ActiveEventLoop) -> Option<Self> {
         None
     }
@@ -769,8 +804,18 @@ impl ApplicationHandler<HostEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: HostEvent) {
         match event {
+            // On Windows a guest frame or a cursor move is drawn right here.
+            // `request_redraw` there is `WM_PAINT`, which Windows synthesises
+            // only once the thread's queue is empty — and a moving 1000 Hz
+            // mouse keeps it from being empty: the window then drew 30-50
+            // times a second while the guest produced 60-90 frames, and every
+            // cursor move made video and desktop stutter (found 2026-10-12).
+            // Elsewhere `request_redraw` is kept: on Wayland it is what ties a
+            // frame to the compositor's frame callback.
             HostEvent::Redraw => {
-                if let Some(window) = self.window.as_ref() {
+                if cfg!(windows) {
+                    self.draw(event_loop);
+                } else if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
                 }
             }

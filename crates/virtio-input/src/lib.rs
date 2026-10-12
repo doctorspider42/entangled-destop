@@ -296,6 +296,53 @@ impl InputEvent {
     }
 }
 
+/// True for a batch that only *moves* the absolute pointer: `EV_ABS` events
+/// and the `SYN_REPORT` that ends them, nothing else.
+fn is_motion_only(batch: &[InputEvent]) -> bool {
+    batch.iter().any(|e| e.event_type == ev::ABS)
+        && batch
+            .iter()
+            .all(|e| e.event_type == ev::ABS || e.is_syn_report())
+}
+
+/// Drops every pointer-motion batch that a later motion batch, with nothing
+/// in between, makes stale — keeping order and every key, button and wheel
+/// event exactly as captured.
+///
+/// The host window reports the mouse at its polling rate (250–1000 Hz on
+/// Windows), several times per guest frame, and a guest given each position
+/// separately takes an interrupt and a compositor pass for every one of them
+/// — on a GPU desktop that is the cursor hitching while it moves (found
+/// 2026-10-12). An absolute position supersedes the one before it, so only
+/// the last of a run matters; a click or a key between two moves ends the
+/// run, so the guest still sees the click where it happened.
+pub fn coalesce_motion(batches: Vec<Vec<InputEvent>>) -> Vec<Vec<InputEvent>> {
+    let mut out: Vec<Vec<InputEvent>> = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let motion = is_motion_only(&batch);
+        if motion && out.last().is_some_and(|last| is_motion_only(last)) {
+            if let Some(last) = out.last_mut() {
+                // Axes the newer batch leaves out keep the older value.
+                let mut merged: Vec<InputEvent> = last
+                    .iter()
+                    .copied()
+                    .filter(|old| {
+                        old.event_type == ev::ABS
+                            && !batch
+                                .iter()
+                                .any(|new| new.event_type == ev::ABS && new.code == old.code)
+                    })
+                    .collect();
+                merged.extend(batch);
+                *last = merged;
+            }
+        } else {
+            out.push(batch);
+        }
+    }
+    out
+}
+
 /// One captured batch, routed to the devices that advertise its events.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SplitBatch {
@@ -340,6 +387,85 @@ pub fn split_batch(batch: &[InputEvent]) -> SplitBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn motion(x: u32, y: u32) -> Vec<InputEvent> {
+        vec![
+            InputEvent {
+                event_type: ev::ABS,
+                code: abs::X,
+                value: x,
+            },
+            InputEvent {
+                event_type: ev::ABS,
+                code: abs::Y,
+                value: y,
+            },
+            InputEvent::SYN_REPORT,
+        ]
+    }
+
+    fn button(down: bool) -> Vec<InputEvent> {
+        vec![
+            InputEvent {
+                event_type: ev::KEY,
+                code: 0x110,
+                value: u32::from(down),
+            },
+            InputEvent::SYN_REPORT,
+        ]
+    }
+
+    /// A run of moves collapses to its last position; a click ends the run,
+    /// so the guest still sees it where it happened, and nothing else moves.
+    #[test]
+    fn motion_runs_collapse_to_their_last_position() {
+        let batches = vec![
+            motion(1, 1),
+            motion(2, 2),
+            motion(3, 3),
+            button(true),
+            motion(4, 4),
+            motion(5, 5),
+            button(false),
+        ];
+        assert_eq!(
+            coalesce_motion(batches),
+            vec![motion(3, 3), button(true), motion(5, 5), button(false)]
+        );
+    }
+
+    /// A move that reports one axis keeps the other axis of the move it
+    /// replaces: absolute positions are per axis.
+    #[test]
+    fn a_one_axis_move_keeps_the_other_axis() {
+        let x_only = vec![
+            InputEvent {
+                event_type: ev::ABS,
+                code: abs::X,
+                value: 9,
+            },
+            InputEvent::SYN_REPORT,
+        ];
+        let merged = coalesce_motion(vec![motion(1, 7), x_only]);
+        assert_eq!(merged.len(), 1);
+        let value_of = |code| {
+            merged[0]
+                .iter()
+                .rev()
+                .find(|e| e.event_type == ev::ABS && e.code == code)
+                .map(|e| e.value)
+        };
+        assert_eq!((value_of(abs::X), value_of(abs::Y)), (Some(9), Some(7)));
+        assert!(merged[0].last().is_some_and(|e| e.is_syn_report()));
+    }
+
+    /// Keys, wheel and empty input pass through untouched.
+    #[test]
+    fn non_motion_batches_are_never_merged() {
+        let keys = vec![button(true), button(false), button(true)];
+        assert_eq!(coalesce_motion(keys.clone()), keys);
+        assert!(coalesce_motion(Vec::new()).is_empty());
+    }
 
     #[test]
     fn abs_scaling_endpoints_and_center() {

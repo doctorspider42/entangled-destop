@@ -195,6 +195,12 @@ GPU (`display::boost`, `display::latency`):
 - Pointer: window position → `InputEvent::abs_from_window` against the
   *viewport* (subtract letterbox offsets, clamp) so the guest cursor matches
   the host cursor exactly over the image.
+- Pointer rate: the host reports the mouse at its polling rate (250–1000 Hz on
+  Windows), several times per guest frame. The run loop's input pump passes
+  each pass's batches through `virtio_input::coalesce_motion` (a run of
+  motion-only batches keeps only its last position; any key, button or wheel
+  event ends the run) and pushes each device **once** per pass — one
+  interrupt, not one per mouse report.
 - Focus loss: emit key-up for every pressed key (track a pressed-set) —
   acceptance criterion MVP-906.
 - `InputCapture` keeps **two** held-key sets and the distinction is load-bearing:
@@ -273,6 +279,39 @@ Rules to keep when extending this:
   amendment exists because an earlier measurement did not).
 
 ## Pitfalls
+
+### Windows: the pointer and the redraws (found 2026-10-12)
+
+Two bugs that only show on a Windows host, both invisible in any test that does
+not move a real mouse over a grabbed window:
+
+- **Hidden + confined pins the cursor to the window centre.** winit 0.30's
+  `CursorFlags::refresh` (`platform_impl/windows/window_state.rs`) treats a
+  grabbed (`Confined`) *and* hidden (`set_cursor_visible(false)`) cursor as a
+  request to clip it to one pixel in the middle of the client area. The guest
+  then gets the click position, then the centre (`ABS` 16384/16367), and no
+  motion ever after: the guest cursor sits mid-screen and "the mouse does not
+  work", while clicks and the keyboard do. `HostCursors` hides it with the
+  transparent image instead, so winit's `HIDDEN` flag stays clear and the clip
+  is the whole client rect. This had been broken since the grab existed.
+- **`request_redraw` starves under a moving mouse.** On Windows it is
+  `WM_PAINT`, synthesised only when the thread's queue is empty; a 1000 Hz
+  mouse (plus the raw-input `WM_INPUT` winit registers by default) keeps it
+  from being empty. Measured on the GPU desktop with a video playing: the
+  window drew 30–50 times a second and dropped 20–60 guest frames a second
+  (`unshown_per_s`) while the cursor moved, each draw costing well under a
+  millisecond — it simply was not asked. `user_event(HostEvent::Redraw)` now
+  draws directly on Windows (Linux keeps `request_redraw`, which on Wayland is
+  tied to the frame callback), and `listen_device_events(DeviceEvents::Never)`
+  drops raw input, which nothing here reads. After: 0.1 unshown frames a second
+  while moving, the window drawing 100+ times a second.
+
+Diagnose either with `RUST_LOG=entangled::run_vm=trace,virtio_gpu::device=trace`:
+`pointer events to the tablet` shows what the host sent, `virtio-gpu cursor
+moved` what the guest made of it; the window's own `display statistics` line
+(`fps` against `guest_fps`, `unshown_per_s`, `input_batches`) shows the
+redraw side. Both traces are per event — never leave them on while judging
+smoothness, they cost enough to stutter by themselves.
 
 - **The EDID's refresh rate is a hard ceiling on the guest's frame rate, and it
   is ours to choose.** The guest's compositor phase-locks to it: with slack in
@@ -368,7 +407,8 @@ that shaped the code, all verified against WSLg's protocol stream
   side never hides the Windows arrow, which then rides on top of the guest's
   own cursor. `host.rs` hides the pointer on Wayland by setting a fully
   transparent 8×8 `CustomCursor` instead (ordinary cursor-image path, honoured
-  everywhere); other platforms keep `set_cursor_visible`.
+  everywhere) — and on **Windows** too, for a different reason (Pitfalls,
+  "hidden + confined"); X11 and macOS keep `set_cursor_visible`.
 - **Named cursors can be silent no-ops.** `CursorIcon::*` needs an XCursor
   theme; a stock WSL root ships none (`/usr/share/icons/*/cursors` is empty),
   so `set_cursor(CursorIcon::Default)` sends nothing, and the CSD frame's own

@@ -852,6 +852,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if cursor.scanout_id >= NUM_SCANOUTS {
             return Err(CommandError::UnknownScanout(cursor.scanout_id));
         }
+        tracing::trace!(x = cursor.x, y = cursor.y, "virtio-gpu cursor moved");
         self.display
             .move_cursor(cursor.x, cursor.y)
             .map_err(|error| CommandError::Display(error.to_string()))
