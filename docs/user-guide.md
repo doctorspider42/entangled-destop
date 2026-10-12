@@ -690,8 +690,12 @@ cleanly the way a real computer does (a desktop may ask first). *Power off*
 stops the VM immediately and *Restart* reboots it; both ask for a second click
 within three seconds, because a stray click on either loses work.
 
-*Type the clipboard* (the clipboard icon) types the host clipboard's text into
-the guest as keystrokes. It works anywhere a keyboard does: a login screen,
+*Screenshot* (the camera) saves a PNG of the guest's screen, cursor included,
+in `Pictures\Entangled` on Windows (`~/Pictures/Entangled` on Linux). The
+title bar names the file for a few seconds.
+
+*Type the clipboard* (the clipboard icon, or `Ctrl+Alt+V`) types the host
+clipboard's text into the guest as keystrokes. It works anywhere a keyboard does: a login screen,
 GRUB, a text console, a password prompt. Nothing has to be installed in the
 guest, and shared clipboards do not work under Ubuntu's Wayland desktop anyway.
 Three limits:

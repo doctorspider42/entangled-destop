@@ -70,6 +70,47 @@ pub struct DisplayHost {
     typist: Option<virtio_input::Typist>,
 }
 
+/// Where the toolbar's screenshots go: `Pictures\Entangled` in the user's
+/// profile on Windows, `$XDG_PICTURES_DIR/Entangled` or `~/Pictures/Entangled`
+/// elsewhere.
+fn screenshot_dir() -> Option<std::path::PathBuf> {
+    let pictures = if cfg!(windows) {
+        std::env::var_os("USERPROFILE").map(|home| std::path::PathBuf::from(home).join("Pictures"))
+    } else {
+        std::env::var_os("XDG_PICTURES_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Pictures"))
+            })
+    }?;
+    Some(pictures.join("Entangled"))
+}
+
+/// `20261013-011502`: a UTC timestamp for a file name, from the Unix time.
+fn file_timestamp(now: std::time::SystemTime) -> String {
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}{month:02}{day:02}-{:02}{:02}{:02}",
+        rem / 3600,
+        (rem / 60) % 60,
+        rem % 60
+    )
+}
+
 impl DisplayHost {
     /// Whether the guest's resolution follows the window ([`crate::resize`]);
     /// on unless the profile says `follow_window = false`.
@@ -211,6 +252,12 @@ impl DisplayHost {
             follow_window,
             typist,
         } = self;
+        let shot = DisplayHandle::new(
+            Arc::clone(&scanout),
+            waker.clone(),
+            shared.clone(),
+            resolution.clone(),
+        );
         let mut app = App {
             config,
             title,
@@ -242,6 +289,8 @@ impl DisplayHost {
             follow_window,
             resize_pending: None,
             typist,
+            shot,
+            note: None,
         };
         // Nothing here reads `DeviceEvent`s (pointer input is the window's
         // `CursorMoved`), and on Windows winit otherwise registers raw input for
@@ -321,6 +370,10 @@ struct App {
     /// the new one ([`crate::resize::SETTLE`]).
     resize_pending: Option<Instant>,
     typist: Option<virtio_input::Typist>,
+    /// A handle on this window's own scanout, for the toolbar's screenshot.
+    shot: DisplayHandle,
+    /// A short note in the title ("screenshot saved") and when it expires.
+    note: Option<(String, Instant)>,
     /// Title text actually applied to the window.
     ///
     /// Every `set_title` is an X11/Wayland round trip, and winit's X11 backend
@@ -426,13 +479,17 @@ impl App {
     /// The title the window should currently carry (WIN-1502): the VM's own
     /// title plus what the user needs to know about the input state.
     fn window_title(&self) -> String {
-        ux::window_title(
+        let title = ux::window_title(
             &self.title,
             WindowStatus {
                 grabbed: self.grabbed,
                 mode: self.mode,
             },
-        )
+        );
+        match &self.note {
+            Some((note, _)) => format!("{title} — {note}"),
+            None => title,
+        }
     }
 
     /// Refreshes the title in place. Called only when the state behind it
@@ -604,6 +661,7 @@ impl App {
             }
             WindowAction::ToggleFullscreen => self.toggle_fullscreen(),
             WindowAction::ToggleScaleMode => self.toggle_scale_mode(),
+            WindowAction::TypeClipboard => self.type_clipboard(),
         }
     }
 
@@ -641,6 +699,59 @@ impl App {
                 }
             }
             ToolbarAction::TypeClipboard => self.type_clipboard(),
+            ToolbarAction::Screenshot => self.save_screenshot(),
+        }
+    }
+
+    /// Saves the guest's screen (cursor included) as a PNG in
+    /// [`screenshot_dir`], on a thread of its own — a shared frame is read
+    /// back from the GPU — and says where in the title for a few seconds.
+    fn save_screenshot(&mut self) {
+        let Some(dir) = screenshot_dir() else {
+            tracing::warn!("no Pictures folder to save a screenshot in");
+            return;
+        };
+        let name = self
+            .title
+            .rsplit('—')
+            .next()
+            .unwrap_or("guest")
+            .trim()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let path = dir.join(format!(
+            "{name}-{}.png",
+            file_timestamp(std::time::SystemTime::now())
+        ));
+        let handle = self.shot.clone();
+        let target = path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("screenshot".into())
+            .spawn(move || {
+                let saved = std::fs::create_dir_all(&dir)
+                    .map_err(DisplayError::from)
+                    .and_then(|()| handle.screenshot(&target));
+                if let Err(error) = saved {
+                    tracing::warn!(path = %target.display(), %error, "screenshot not saved");
+                }
+            });
+        if spawned.is_ok() {
+            let file = path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.note = Some((
+                format!("screenshot saved: {file}"),
+                Instant::now() + std::time::Duration::from_secs(4),
+            ));
+            self.update_title();
         }
     }
 
@@ -896,6 +1007,15 @@ impl ApplicationHandler<HostEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.steer_boost(event_loop);
+        if let Some((_, until)) = &self.note {
+            let until = *until;
+            if Instant::now() >= until {
+                self.note = None;
+                self.update_title();
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(until));
+            }
+        }
         if let Some(since) = self.resize_pending {
             let due = since + crate::resize::SETTLE;
             if Instant::now() >= due {
@@ -1106,6 +1226,14 @@ impl ApplicationHandler<HostEvent> for App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_screenshot_file_name_carries_the_utc_date_and_time() {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_760_000_000);
+        assert_eq!(super::file_timestamp(at), "20251009-085320");
+        let leap = std::time::UNIX_EPOCH + std::time::Duration::from_secs(951_782_400);
+        assert_eq!(super::file_timestamp(leap), "20000229-000000");
+    }
+
     use super::*;
 
     #[test]

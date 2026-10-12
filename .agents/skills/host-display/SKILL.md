@@ -234,6 +234,7 @@ window on the desktop.
 | `Ctrl+Alt+G` | explicit grab toggle |
 | `Ctrl+Alt+Q` | `ControlEvent::QuitRequested` — the supervisor decides |
 | `Ctrl+Alt+O` | 1:1 pixel mode toggle (`ScaleMode`) |
+| `Ctrl+Alt+V` | type the host clipboard into the guest (`virtio_input::typing`); modifiers handed back first |
 | `F11` | borderless fullscreen toggle; reserved even without modifiers |
 | `Ctrl+Alt+<anything else>` | forwarded to the guest verbatim (`Ctrl+Alt+F2` must reach Weston) |
 | focus loss | grab released, every guest-held key released |

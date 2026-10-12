@@ -61,6 +61,8 @@ pub enum Button {
     Fullscreen,
     /// Fit to the window, or 1:1 pixels.
     Scale,
+    /// Save a PNG of the guest's screen in the host's Pictures folder.
+    Screenshot,
     /// Type the host clipboard's text into the guest as keystrokes.
     TypeClipboard,
     /// Give the keyboard and pointer back to the host.
@@ -72,13 +74,14 @@ pub enum Button {
 impl Button {
     /// Left to right; a group gap separates the guest's lifecycle, the
     /// window's own controls and the plug.
-    pub const ALL: [Button; 9] = [
+    pub const ALL: [Button; 10] = [
         Button::Shutdown,
         Button::Restart,
         Button::Pause,
         Button::Suspend,
         Button::Fullscreen,
         Button::Scale,
+        Button::Screenshot,
         Button::TypeClipboard,
         Button::Release,
         Button::PowerOff,
@@ -103,7 +106,8 @@ impl Button {
             Button::Suspend => "SUSPEND TO DISK  CTRL+ALT+S",
             Button::Fullscreen => "FULLSCREEN  F11",
             Button::Scale => "FIT / 1:1  CTRL+ALT+O",
-            Button::TypeClipboard => "TYPE THE CLIPBOARD",
+            Button::Screenshot => "SCREENSHOT TO PICTURES",
+            Button::TypeClipboard => "TYPE THE CLIPBOARD  CTRL+ALT+V",
             Button::Release => "RELEASE INPUT  CTRL+ALT",
             Button::PowerOff => "POWER OFF (HARD)",
         }
@@ -127,6 +131,7 @@ impl Button {
             Button::Suspend => ToolbarAction::Suspend,
             Button::Fullscreen => ToolbarAction::ToggleFullscreen,
             Button::Scale => ToolbarAction::ToggleScale,
+            Button::Screenshot => ToolbarAction::Screenshot,
             Button::TypeClipboard => ToolbarAction::TypeClipboard,
             Button::Release => ToolbarAction::ReleaseInput,
             Button::PowerOff => ToolbarAction::PowerOff,
@@ -155,6 +160,8 @@ pub enum ToolbarAction {
     ReleaseInput,
     /// Type the host clipboard's text into the guest (`virtio_input::typing`).
     TypeClipboard,
+    /// Save a PNG of the guest's screen in the host's Pictures folder.
+    Screenshot,
 }
 
 /// A rectangle in physical window pixels.
@@ -696,6 +703,29 @@ fn draw_icon(canvas: &mut Canvas, button: Button, r: Rect, colour: [f32; 4], s: 
                 k_font,
                 colour,
             );
+        }
+        Button::Screenshot => {
+            // A camera: a rounded body, a lens, and the viewfinder bump.
+            let body = Rect {
+                x: c.0 - 6.0 * s,
+                y: c.1 - k + 2.0 * s,
+                w: 12.0 * s,
+                h: 2.0 * k - 3.0 * s,
+            };
+            let bump = Rect {
+                x: c.0 - 2.5 * s,
+                y: c.1 - k,
+                w: 5.0 * s,
+                h: 3.0 * s,
+            };
+            canvas.fill(r, colour, |x, y| {
+                let outline = sd_round_rect(x, y, body, 1.8 * s).abs() - t;
+                let bump = sd_round_rect(x, y, bump, 1.0 * s);
+                let lens_c = (c.0, c.1 + 1.0 * s);
+                let lens =
+                    (((x - lens_c.0).powi(2) + (y - lens_c.1).powi(2)).sqrt() - 2.6 * s).abs() - t;
+                outline.min(bump).min(lens)
+            });
         }
         Button::TypeClipboard => {
             // A clipboard: a board with a clip at the top and two lines of text.

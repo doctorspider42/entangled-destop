@@ -242,7 +242,7 @@ fn open_presentation(
                 // the title bar repeats the important half of this.
                 tracing::info!(
                     "window controls: click the image to grab input, Ctrl+Alt releases it, \
-                     Ctrl+Alt+G toggles, F11 fullscreen, Ctrl+Alt+O 1:1, \
+                     Ctrl+Alt+G toggles, F11 fullscreen, Ctrl+Alt+O 1:1, Ctrl+Alt+V types the clipboard, \
                      Ctrl+Alt+P pauses, Ctrl+Alt+R reboots, Ctrl+Alt+Q shuts down"
                 );
                 // The window says, once it knows its monitor, what the

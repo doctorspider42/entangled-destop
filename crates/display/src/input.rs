@@ -28,6 +28,7 @@
 //! | `Ctrl+Alt+S` | suspend the VM to its snapshot file ([`ControlEvent::SaveRequested`]) |
 //! | `F11` | toggle borderless fullscreen ([`WindowAction::ToggleFullscreen`]) |
 //! | `Ctrl+Alt+O` | toggle 1:1 pixel mode ([`WindowAction::ToggleScaleMode`]) |
+//! | `Ctrl+Alt+V` | type the host clipboard into the guest ([`WindowAction::TypeClipboard`]) |
 //!
 //! Every *other* `Ctrl+Alt+<key>` combination is forwarded verbatim, so the
 //! guest still gets `Ctrl+Alt+F2` (VT switch) and friends. The bare-modifier
@@ -154,6 +155,8 @@ pub enum WindowAction {
     ToggleFullscreen,
     /// `Ctrl+Alt+O`: switch between [`crate::ScaleMode`]s (WIN-1504).
     ToggleScaleMode,
+    /// `Ctrl+Alt+V`: type the host clipboard's text (`virtio_input::typing`).
+    TypeClipboard,
 }
 
 /// What happened to one key press/release or button event.
@@ -770,6 +773,12 @@ impl InputCapture {
                 Some(WindowAction::Quit)
             }
             KeyCode::KeyO => Some(WindowAction::ToggleScaleMode),
+            // The modifiers go back first: typed text under a held Ctrl+Alt
+            // would be a string of shortcuts.
+            KeyCode::KeyV => {
+                self.release_all();
+                Some(WindowAction::TypeClipboard)
+            }
             // Pause and reset (ADR-0005). Neither collides with anything the
             // guest is likely to want: `Ctrl+Alt+P` and `Ctrl+Alt+R` are not
             // VT switches (those are the function keys, still forwarded), and
@@ -1220,6 +1229,26 @@ mod tests {
     }
 
     // ---- Reserved shortcut routing ----------------------------------------
+
+    #[test]
+    fn ctrl_alt_v_types_the_clipboard_and_hands_the_modifiers_back() {
+        let mut c = grabbed_capture();
+        hold_ctrl_alt(&mut c);
+        let _ = c.events().drain();
+        assert_eq!(
+            press(&mut c, KeyCode::KeyV),
+            KeyOutcome::Reserved(WindowAction::TypeClipboard)
+        );
+        let sent: Vec<(u16, u32)> = c
+            .events()
+            .drain()
+            .iter()
+            .filter(|e| e.event_type == ev::KEY)
+            .map(|e| (e.code, e.value))
+            .collect();
+        // Ctrl and Alt released towards the guest; KEY_V (47) never sent.
+        assert_eq!(sent, vec![(KEY_LEFTCTRL, 0), (KEY_LEFTALT, 0)]);
+    }
 
     #[test]
     fn reserved_shortcuts_never_reach_the_guest() {
