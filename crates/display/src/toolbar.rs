@@ -61,6 +61,8 @@ pub enum Button {
     Fullscreen,
     /// Fit to the window, or 1:1 pixels.
     Scale,
+    /// Type the host clipboard's text into the guest as keystrokes.
+    TypeClipboard,
     /// Give the keyboard and pointer back to the host.
     Release,
     /// Stop the VM now (asks twice).
@@ -70,13 +72,14 @@ pub enum Button {
 impl Button {
     /// Left to right; a group gap separates the guest's lifecycle, the
     /// window's own controls and the plug.
-    pub const ALL: [Button; 8] = [
+    pub const ALL: [Button; 9] = [
         Button::Shutdown,
         Button::Restart,
         Button::Pause,
         Button::Suspend,
         Button::Fullscreen,
         Button::Scale,
+        Button::TypeClipboard,
         Button::Release,
         Button::PowerOff,
     ];
@@ -100,6 +103,7 @@ impl Button {
             Button::Suspend => "SUSPEND TO DISK  CTRL+ALT+S",
             Button::Fullscreen => "FULLSCREEN  F11",
             Button::Scale => "FIT / 1:1  CTRL+ALT+O",
+            Button::TypeClipboard => "TYPE THE CLIPBOARD",
             Button::Release => "RELEASE INPUT  CTRL+ALT",
             Button::PowerOff => "POWER OFF (HARD)",
         }
@@ -123,6 +127,7 @@ impl Button {
             Button::Suspend => ToolbarAction::Suspend,
             Button::Fullscreen => ToolbarAction::ToggleFullscreen,
             Button::Scale => ToolbarAction::ToggleScale,
+            Button::TypeClipboard => ToolbarAction::TypeClipboard,
             Button::Release => ToolbarAction::ReleaseInput,
             Button::PowerOff => ToolbarAction::PowerOff,
         }
@@ -148,6 +153,8 @@ pub enum ToolbarAction {
     ToggleScale,
     /// Release the input grab.
     ReleaseInput,
+    /// Type the host clipboard's text into the guest (`virtio_input::typing`).
+    TypeClipboard,
 }
 
 /// A rectangle in physical window pixels.
@@ -689,6 +696,33 @@ fn draw_icon(canvas: &mut Canvas, button: Button, r: Rect, colour: [f32; 4], s: 
                 k_font,
                 colour,
             );
+        }
+        Button::TypeClipboard => {
+            // A clipboard: a board with a clip at the top and two lines of text.
+            let board = Rect {
+                x: c.0 - 5.0 * s,
+                y: c.1 - k + 1.0 * s,
+                w: 10.0 * s,
+                h: 2.0 * k - 1.0 * s,
+            };
+            let clip = Rect {
+                x: c.0 - 2.5 * s,
+                y: c.1 - k - 0.5 * s,
+                w: 5.0 * s,
+                h: 3.0 * s,
+            };
+            canvas.fill(r, colour, |x, y| {
+                let outline = sd_round_rect(x, y, board, 1.5 * s).abs() - t;
+                let clip = sd_round_rect(x, y, clip, 1.0 * s);
+                let line1 = sd_segment(x, y, (c.0 - 2.5 * s, c.1), (c.0 + 2.5 * s, c.1)) - t;
+                let line2 = sd_segment(
+                    x,
+                    y,
+                    (c.0 - 2.5 * s, c.1 + 3.0 * s),
+                    (c.0 + 1.0 * s, c.1 + 3.0 * s),
+                ) - t;
+                outline.min(clip).min(line1).min(line2)
+            });
         }
         Button::Release => {
             // A mouse: rounded body, split at the top.

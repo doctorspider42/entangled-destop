@@ -462,6 +462,27 @@ channel's `display WxH`) is the headless way to exercise it. Note for HiDPI:
 a window on a 300 % 4K monitor asks for a 4K desktop — sharp, and heavy for
 the GPU desktop.
 
+## Typing text into the guest (`virtio_input::typing`, 2026-10-13)
+
+*Type the clipboard* (`Button::TypeClipboard`) reads the host clipboard with
+`arboard` (text only, no default features; eframe already links it). It
+releases the guest-held keys and queues the text on a `virtio_input::Typist`.
+`run_vm::spawn_typist` paces the queue into the keyboard at about 200
+characters a second, under a pause-gate pass. Three things to keep:
+
+- **The pacing.** The device bounds pending events at 1024, and one burst of
+  a long paste would drop keys.
+- **The US-layout map.** `key_for` covers printable ASCII, tab and newline.
+  Anything else is skipped and counted, never guessed.
+- **The caps.** `MAX_TYPED_CHARS` per request, and `MAX_QUEUED_BATCHES`
+  overall, refused whole rather than half-typed.
+
+The control channel's `paste <text>` (`
+` is Enter) reaches the same queue,
+which is also how a headless test verifies it. The control channel now reads
+bytes and decodes them lossily: `lines()` used to end the whole channel at the
+first line that was not UTF-8.
+
 ## The quick-actions bar (`toolbar.rs`, 2026-10-12)
 
 A VMware-style bar at the top edge: Shut down (ACPI power button), Restart,

@@ -77,9 +77,32 @@ pub struct VmEntry {
     /// warning: an installed Ubuntu needs `artifacts/firmware/CLOUDHV.fd`, and
     /// has no use for a bootstrap kernel.
     pub uefi: bool,
+    /// `[[share]]` folders, for the card's chip and *Open shared folder*.
+    pub shares: Vec<control_api::ShareSection>,
+    /// Port forwards that parse, for the card's chip and *Copy SSH command*.
+    pub forwards: Vec<control_api::PortForwardRule>,
 }
 
 impl VmEntry {
+    /// The command that reaches the guest's SSH server through a TCP forward
+    /// to port 22, if the machine has one.
+    pub fn ssh_command(&self) -> Option<String> {
+        let rule = self
+            .forwards
+            .iter()
+            .find(|r| !r.udp && r.guest_port == 22)?;
+        let host = match rule.bind {
+            std::net::IpAddr::V4(v4) if v4.is_unspecified() => "127.0.0.1".to_string(),
+            std::net::IpAddr::V6(v6) if v6.is_unspecified() => "::1".to_string(),
+            addr => addr.to_string(),
+        };
+        Some(if rule.host_port == 22 {
+            format!("ssh {host}")
+        } else {
+            format!("ssh -p {} {host}", rule.host_port)
+        })
+    }
+
     pub fn size_bytes(&self) -> u64 {
         self.disks.iter().map(|d| d.size_bytes).sum()
     }
@@ -189,6 +212,12 @@ fn entry_from_config(path: &Path, cfg: &VmConfig, work_dir: Option<&Path>) -> Vm
         network_interface: cfg.network.as_ref().and_then(|n| n.interface.clone()),
         disks,
         uefi: matches!(cfg.boot.mode, control_api::BootMode::Uefi),
+        shares: cfg.shares.clone(),
+        forwards: cfg
+            .network
+            .as_ref()
+            .and_then(|n| n.forwards().ok())
+            .unwrap_or_default(),
     }
 }
 

@@ -381,6 +381,8 @@ mod tests {
             network_interface: None,
             disks: Vec::new(),
             uefi: true,
+            shares: Vec::new(),
+            forwards: Vec::new(),
         }
     }
 

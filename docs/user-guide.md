@@ -690,6 +690,23 @@ cleanly the way a real computer does (a desktop may ask first). *Power off*
 stops the VM immediately and *Restart* reboots it; both ask for a second click
 within three seconds, because a stray click on either loses work.
 
+*Type the clipboard* (the clipboard icon) types the host clipboard's text into
+the guest as keystrokes. It works anywhere a keyboard does: a login screen,
+GRUB, a text console, a password prompt. Nothing has to be installed in the
+guest, and shared clipboards do not work under Ubuntu's Wayland desktop anyway.
+Three limits:
+
+- The keys are typed on a **US layout**, so the text comes out right when the
+  guest's keyboard is set to US, or to a layout that keeps US positions for
+  ASCII (Polish programmers', for one).
+- Characters with no US key are skipped. That means Polish letters, emoji and
+  other non-ASCII.
+- One paste types at most 4096 characters, at about 200 a second.
+
+A headless machine can be typed into over the control channel:
+`paste <text>`, with `
+` for Enter.
+
 ### Refresh rate
 
 The guest's display has a refresh rate like any monitor, `[display]
@@ -983,7 +1000,9 @@ entangled run --headless --control-stdin ~/entangled-vms/ubuntu.toml
 reads one lifecycle command per line on stdin: `pause`, `resume`, `reset`,
 `save [path]`, `type <text>` (types on the guest's serial console), `status`,
 `shutdown` (presses the ACPI power button), `display WIDTHxHEIGHT` (asks the
-guest for another desktop size) and `thumbnail [path]`. The last one writes a
+guest for another desktop size), `paste <text>` (types the text on the
+guest's keyboard; `
+` is Enter) and `thumbnail [path]`. The last one writes a
 picture of the screen, at most 480 pixels wide, to the path, or by default to
 `.thumbnails/<name>.png` beside the profile. It is the only command that
 answers nothing when it succeeds, because the manager sends it every three
@@ -1197,8 +1216,11 @@ state:
 plus **Configure** on every card — allowed while a machine is stopped or
 suspended, with the warning that changing its hardware is what makes a saved
 session unrestorable — and a **More** menu holding *Copy profile path*, *Open
-activity log*, *Forget the saved session* (when there is one), *Rename…*,
-*Clone…* and *Delete machine*.
+activity log*, *Copy SSH command* (when a TCP forward reaches the guest's
+port 22), *Open shared folder* (one entry per share), *Forget the saved
+session* (when there is one), *Rename…*, *Clone…* and *Delete machine*.
+Chips under the name show the shared folders and port forwards, listed in
+full on hover.
 
 **Rename…** changes a stopped machine's name. The profile is renamed to
 `<new>.toml`, and so are the disks and the UEFI store named after the machine.

@@ -224,7 +224,11 @@ enum Presentation {
     Headless(display::DisplayHandle),
 }
 
-fn open_presentation(cfg: &VmConfig, headless: bool) -> Result<Presentation, String> {
+fn open_presentation(
+    cfg: &VmConfig,
+    headless: bool,
+    typist: &virtio_input::Typist,
+) -> Result<Presentation, String> {
     let display_cfg = display::DisplayConfig {
         width: cfg.display.width,
         height: cfg.display.height,
@@ -248,7 +252,8 @@ fn open_presentation(cfg: &VmConfig, headless: bool) -> Result<Presentation, Str
                 return Ok(Presentation::Windowed(Box::new(
                     host.with_title(format!("Entangled Desktop — {}", cfg.name))
                         .with_guest_refresh(cfg.display.refresh_hz)
-                        .with_follow_window(cfg.display.follow_window != Some(false)),
+                        .with_follow_window(cfg.display.follow_window != Some(false))
+                        .with_typist(typist.clone()),
                 )));
             }
             Err(e) => {
@@ -915,6 +920,7 @@ pub const CONTROL_PREFIX: &str = control_api::control::PREFIX;
 /// | `type <text>` | type `<text>` and Enter on the guest's serial console |
 /// | `status` | print the current [`RunState`](vmm_core::RunState) |
 /// | `thumbnail [path]` | write a small PNG of the screen (silent on success) |
+/// | `paste <text>` | type `<text>` on the guest's keyboard (`\n` is Enter) |
 /// | `display WxH` | ask the guest for another desktop resolution |
 /// | `shutdown` | press the ACPI power button |
 ///
@@ -927,20 +933,65 @@ pub const CONTROL_PREFIX: &str = control_api::control::PREFIX;
 /// Unknown commands are reported and ignored — never fatal. The thread is
 /// detached: it ends when stdin closes, which for a child process is when its
 /// parent goes away.
+/// The thread that paces typed text ([`virtio_input::Typist`]) into the
+/// keyboard: a few batches every few milliseconds, about 200 characters a
+/// second, each delivery under a pause-gate pass like the input pump's — a
+/// paused VM's event ring is not written (ADR-0005), and what waits keeps
+/// waiting until it resumes.
+fn spawn_typist(
+    typist: virtio_input::Typist,
+    keyboard: virtio_input::InputHandle,
+    quiesce: Arc<virtio_core::Quiesce>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("typist".into())
+        .spawn(move || {
+            while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                if !typist.wait(Duration::from_millis(200)) {
+                    continue;
+                }
+                let Some(pass) = quiesce.try_enter() else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                let events = typist.take(4);
+                if let Err(error) = keyboard.push(&events) {
+                    tracing::warn!(%error, "typed keys could not be delivered");
+                }
+                drop(pass);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "cannot start the typist; typed text is not delivered");
+    }
+}
+
 fn spawn_control_channel(
     bus: MachineBus,
     requests: Arc<LifecycleRequests>,
     lifecycle: Arc<Lifecycle>,
     snapshot: Option<PathBuf>,
     display: display::DisplayHandle,
+    typist: virtio_input::Typist,
 ) {
     let spawned = std::thread::Builder::new()
         .name("control".into())
         .spawn(move || {
             use std::io::BufRead as _;
             let stdin = std::io::stdin();
-            for line in stdin.lock().lines() {
-                let Ok(line) = line else { break };
+            // Bytes, decoded lossily: one line that is not UTF-8 (a pasted
+            // text in the console's own code page) must cost that line, not
+            // end the channel — `lines()` stops at the first such error.
+            let mut stdin = stdin.lock();
+            let mut raw = Vec::new();
+            loop {
+                raw.clear();
+                match stdin.read_until(b'\n', &mut raw) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let line = String::from_utf8_lossy(&raw);
                 let line = line.trim();
                 let (command, argument) = match line.split_once(char::is_whitespace) {
                     Some((command, rest)) => (command, rest),
@@ -950,8 +1001,8 @@ fn spawn_control_channel(
                 // the writer at the other end of the pipe and the reader here
                 // cannot drift apart.
                 use control_api::control::{
-                    CMD_DISPLAY, CMD_PAUSE, CMD_RESET, CMD_RESUME, CMD_SAVE, CMD_SHUTDOWN,
-                    CMD_STATUS, CMD_THUMBNAIL, CMD_TYPE,
+                    CMD_DISPLAY, CMD_PASTE, CMD_PAUSE, CMD_RESET, CMD_RESUME, CMD_SAVE,
+                    CMD_SHUTDOWN, CMD_STATUS, CMD_THUMBNAIL, CMD_TYPE,
                 };
                 match command {
                     "" => {}
@@ -971,6 +1022,16 @@ fn spawn_control_channel(
                                 continue;
                             }
                         }
+                    }
+                    CMD_PASTE => {
+                        // `\n` in the argument is a newline: the channel is one
+                        // line per command.
+                        let text = argument.replace("\\n", "\n");
+                        let outcome = typist.type_text(&text);
+                        println!(
+                            "{CONTROL_PREFIX} typed {} skipped {} truncated {}",
+                            outcome.typed, outcome.skipped, outcome.truncated
+                        );
                     }
                     CMD_THUMBNAIL => {
                         // Beside the profile, named for the snapshot's stem:
@@ -1386,7 +1447,10 @@ pub fn run_with(
     };
 
     // Presentation before devices: the GPU device is built around the handle.
-    let mut presentation = open_presentation(&cfg, headless)?;
+    // Text typed into the guest as keystrokes: the toolbar's "type the
+    // clipboard" and the control channel's `paste` (`virtio_input::typing`).
+    let typist = virtio_input::Typist::new();
+    let mut presentation = open_presentation(&cfg, headless, &typist)?;
     let display_handle = match &presentation {
         Presentation::Windowed(host) => host.handle(),
         Presentation::Headless(handle) => handle.clone(),
@@ -1503,6 +1567,7 @@ pub fn run_with(
         Arc::clone(&requests),
         Arc::clone(&vm_state),
     );
+    spawn_typist(typist.clone(), keyboard_sink.clone(), Arc::clone(&quiesce));
     if control_stdin {
         spawn_control_channel(
             bus.clone(),
@@ -1510,6 +1575,7 @@ pub fn run_with(
             Arc::clone(&lifecycle),
             snapshot.clone(),
             display_handle.clone(),
+            typist,
         );
     }
 

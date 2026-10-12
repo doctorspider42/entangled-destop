@@ -1098,6 +1098,7 @@ dependencies = [
 name = "display"
 version = "0.2.0"
 dependencies = [
+ "arboard",
  "ash",
  "png",
  "pollster",

@@ -53,6 +53,7 @@
 pub mod config;
 pub mod device;
 pub mod gamepad;
+pub mod typing;
 
 pub use config::{DevIds, Profile, Selection};
 pub use device::{
@@ -62,6 +63,7 @@ pub use gamepad::{
     open_source, open_sources, GamepadCapture, GamepadError, GamepadSource, PadId, PadRoster,
     PadState, Poll, SourceChoice, SourceFactory, MAX_PLAYERS,
 };
+pub use typing::{TypeOutcome, Typist};
 
 /// Linux input event types (`EV_*` from `linux/input-event-codes.h`).
 pub mod ev {

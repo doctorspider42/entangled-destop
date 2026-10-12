@@ -51,6 +51,10 @@ pub const CMD_DISPLAY: &str = "display";
 /// success — the manager asks every few seconds, and an `ok` per ask would
 /// fill the run log.
 pub const CMD_THUMBNAIL: &str = "thumbnail";
+/// Type text on the guest's keyboard, `paste <text>`, US layout, `\n` for
+/// Enter; answered with how many characters were typed, skipped (no key) and
+/// truncated (past `virtio_input::typing::MAX_TYPED_CHARS`).
+pub const CMD_PASTE: &str = "paste";
 
 /// Where a machine's card picture lives: `.thumbnails/<name>.png` beside its
 /// profile. The engine derives it from the default snapshot path (which sits

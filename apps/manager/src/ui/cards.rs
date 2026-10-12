@@ -240,6 +240,34 @@ fn vm_card(
                 if crate::backend::Backend::Wsl.available_on_host() {
                     ui::chip(ui, backend.label(), theme::accent(0.5));
                 }
+                if !vm.shares.is_empty() {
+                    let tags: Vec<&str> = vm.shares.iter().map(|s| s.tag.as_str()).collect();
+                    let label = if vm.shares.len() == 1 {
+                        format!("share {}", tags[0])
+                    } else {
+                        format!("{} shares", vm.shares.len())
+                    };
+                    ui.scope(|ui| ui::chip(ui, &label, theme::CYAN))
+                        .response
+                        .on_hover_text(format!(
+                            "Shared folders, mounted in the guest by tag: {}",
+                            tags.join(", ")
+                        ));
+                }
+                if !vm.forwards.is_empty() {
+                    let list: Vec<String> = vm.forwards.iter().map(|r| r.to_string()).collect();
+                    let label = if vm.forwards.len() == 1 {
+                        format!("fwd {}", list[0])
+                    } else {
+                        format!("{} forwards", vm.forwards.len())
+                    };
+                    ui.scope(|ui| ui::chip(ui, &label, theme::VIOLET))
+                        .response
+                        .on_hover_text(format!(
+                            "Port forwards, host port to guest port: {}",
+                            list.join(", ")
+                        ));
+                }
             });
             ui.add_space(8.0);
 
@@ -558,6 +586,28 @@ fn action_strip(
             if ui.button("Copy profile path").clicked() {
                 actions.push(Action::CopyProfilePath(path.to_string()));
                 ui.close();
+            }
+            if let Some(ssh) = vm.ssh_command() {
+                if ui
+                    .button("Copy SSH command")
+                    .on_hover_text(format!(
+                        "{ssh} — through the machine's port forward to port 22"
+                    ))
+                    .clicked()
+                {
+                    actions.push(Action::CopyProfilePath(ssh));
+                    ui.close();
+                }
+            }
+            for share in &vm.shares {
+                if ui
+                    .button(format!("Open shared folder '{}'", share.tag))
+                    .on_hover_text(share.path.display().to_string())
+                    .clicked()
+                {
+                    actions.push(Action::Reveal(share.path.clone()));
+                    ui.close();
+                }
             }
             if let Some(task) = app
                 .supervisor

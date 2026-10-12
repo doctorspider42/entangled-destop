@@ -922,6 +922,8 @@ mod tests {
             network_interface: Some("entangled0".into()),
             disks: vec![],
             uefi: false,
+            shares: Vec::new(),
+            forwards: Vec::new(),
         }
     }
 

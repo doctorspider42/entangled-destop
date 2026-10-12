@@ -66,6 +66,8 @@ pub struct DisplayHost {
     resolution: crate::resize::ResolutionRequest,
     /// Whether the window asks at all ([`Self::with_follow_window`]).
     follow_window: bool,
+    /// Where "type the clipboard" sends its text ([`Self::with_typist`]).
+    typist: Option<virtio_input::Typist>,
 }
 
 impl DisplayHost {
@@ -74,6 +76,12 @@ impl DisplayHost {
     #[must_use]
     pub fn with_follow_window(mut self, follow: bool) -> Self {
         self.follow_window = follow;
+        self
+    }
+
+    /// Where the toolbar's "type the clipboard" sends its text.
+    pub fn with_typist(mut self, typist: virtio_input::Typist) -> Self {
+        self.typist = Some(typist);
         self
     }
     /// Builds the event loop and allocates the scanout mirror. Call on the main
@@ -98,6 +106,7 @@ impl DisplayHost {
             boost: BoostPolicy::Off,
             resolution: crate::resize::ResolutionRequest::default(),
             follow_window: true,
+            typist: None,
         })
     }
 
@@ -200,6 +209,7 @@ impl DisplayHost {
             boost,
             resolution,
             follow_window,
+            typist,
         } = self;
         let mut app = App {
             config,
@@ -231,6 +241,7 @@ impl DisplayHost {
             resolution,
             follow_window,
             resize_pending: None,
+            typist,
         };
         // Nothing here reads `DeviceEvent`s (pointer input is the window's
         // `CursorMoved`), and on Windows winit otherwise registers raw input for
@@ -309,6 +320,7 @@ struct App {
     /// When the window last changed size, until the guest has been asked for
     /// the new one ([`crate::resize::SETTLE`]).
     resize_pending: Option<Instant>,
+    typist: Option<virtio_input::Typist>,
     /// Title text actually applied to the window.
     ///
     /// Every `set_title` is an X11/Wayland round trip, and winit's X11 backend
@@ -628,7 +640,32 @@ impl App {
                     self.apply_action(action);
                 }
             }
+            ToolbarAction::TypeClipboard => self.type_clipboard(),
         }
+    }
+
+    /// Types the host clipboard's text into the guest. Held keys are released
+    /// first, so a Ctrl still down from the click's shortcut cannot turn the
+    /// text into a string of shortcuts.
+    fn type_clipboard(&mut self) {
+        let Some(typist) = self.typist.clone() else {
+            return;
+        };
+        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::warn!(%error, "the clipboard holds no text to type");
+                return;
+            }
+        };
+        self.capture.release_all();
+        let outcome = typist.type_text(&text);
+        tracing::info!(
+            typed = outcome.typed,
+            skipped = outcome.skipped,
+            truncated = outcome.truncated,
+            "typing the clipboard into the guest"
+        );
     }
 
     fn set_grab(&mut self, grabbed: bool) {

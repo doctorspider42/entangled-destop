@@ -34,6 +34,15 @@ pub fn scan() -> Scan {
             display: (2560, 1440),
             network_interface: Some("usernet".into()),
             uefi: false,
+            shares: vec![control_api::ShareSection {
+                path: root.join("projects"),
+                tag: "projects".into(),
+                read_only: false,
+            }],
+            forwards: ["2222:22", "0.0.0.0:8080:80"]
+                .iter()
+                .filter_map(|r| control_api::PortForwardRule::parse(r).ok())
+                .collect(),
             disks: vec![disk_info(&nebula_disk, 64 * GIB, 18 * GIB)],
         },
         VmEntry {
@@ -47,6 +56,8 @@ pub fn scan() -> Scan {
             // An installed Ubuntu boots through the firmware, so the mock has
             // one of each — the run pre-flight warns per boot mode.
             uefi: true,
+            shares: Vec::new(),
+            forwards: Vec::new(),
             disks: vec![disk_info(&ubuntu_disk, 32 * GIB, 9 * GIB)],
         },
         VmEntry {
@@ -58,6 +69,8 @@ pub fn scan() -> Scan {
             display: (1280, 800),
             network_interface: None,
             uefi: false,
+            shares: Vec::new(),
+            forwards: Vec::new(),
             disks: Vec::new(),
         },
         // The third resting state: stopped, but with a session on disk. Its
@@ -72,6 +85,8 @@ pub fn scan() -> Scan {
             display: (1920, 1080),
             network_interface: Some("usernet".into()),
             uefi: true,
+            shares: Vec::new(),
+            forwards: Vec::new(),
             disks: vec![disk_info(&aurora_disk, 40 * GIB, 11 * GIB)],
         },
         // And the state in between: on its way into a file.
@@ -84,6 +99,8 @@ pub fn scan() -> Scan {
             display: (1280, 800),
             network_interface: Some("usernet".into()),
             uefi: false,
+            shares: Vec::new(),
+            forwards: Vec::new(),
             disks: vec![disk_info(&orion_disk, 16 * GIB, 3 * GIB)],
         },
     ];

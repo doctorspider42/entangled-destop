@@ -44,16 +44,23 @@ pub(super) struct Echo {
 
 pub(super) struct Pinger {
     jobs: SyncSender<Echo>,
+    /// The workers' end of the queue, held here too so the queue exists for
+    /// as long as the pinger does, whatever the workers are doing.
+    _job_rx: Arc<Mutex<Receiver<Echo>>>,
     answers: Receiver<Echo>,
     dropped: u64,
 }
 
 impl Pinger {
     pub(super) fn new() -> Option<Self> {
+        Self::with_workers(WORKERS)
+    }
+
+    fn with_workers(workers: usize) -> Option<Self> {
         let (jobs, job_rx) = mpsc::sync_channel::<Echo>(MAX_IN_FLIGHT);
         let (answer_tx, answers) = mpsc::channel::<Echo>();
         let job_rx = Arc::new(Mutex::new(job_rx));
-        for n in 0..WORKERS {
+        for n in 0..workers {
             let job_rx = Arc::clone(&job_rx);
             let answer_tx = answer_tx.clone();
             let spawned = std::thread::Builder::new()
@@ -66,6 +73,7 @@ impl Pinger {
         }
         Some(Self {
             jobs,
+            _job_rx: job_rx,
             answers,
             dropped: 0,
         })
@@ -324,13 +332,15 @@ mod tests {
         assert_eq!(got.as_deref(), Some(&b"entangled"[..]));
     }
 
+    /// With no worker taking echoes off it, the queue holds exactly
+    /// [`MAX_IN_FLIGHT`] and drops the rest — deterministic, unlike relying on
+    /// workers to block (a host can refuse an unroutable send at once).
     #[test]
     fn the_queue_is_bounded() {
-        let Some(mut pinger) = Pinger::new() else {
+        let Some(mut pinger) = Pinger::with_workers(0) else {
             return;
         };
-        // TEST-NET-3 never answers, so every worker blocks and the queue fills.
-        for seq in 0..(MAX_IN_FLIGHT as u16 + WORKERS as u16 + 8) {
+        for seq in 0..(MAX_IN_FLIGHT as u16 + 8) {
             pinger.submit(Echo {
                 dst: Ipv4Addr::new(203, 0, 113, 77),
                 ident: 1,
@@ -338,6 +348,6 @@ mod tests {
                 data: vec![0; 8],
             });
         }
-        assert!(pinger.dropped() >= 8);
+        assert_eq!(pinger.dropped(), 8);
     }
 }

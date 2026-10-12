@@ -115,7 +115,7 @@ pub struct VmConfig {
 /// Each share is one virtio device, so it takes one of the bus's slots; the
 /// path is checked when the machine starts rather than when the profile is
 /// read, because a folder on a removable drive is an ordinary thing to share.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ShareSection {
     /// The host directory.
