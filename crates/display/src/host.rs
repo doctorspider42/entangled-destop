@@ -700,6 +700,14 @@ impl App {
             }
             ToolbarAction::TypeClipboard => self.type_clipboard(),
             ToolbarAction::Screenshot => self.save_screenshot(),
+            ToolbarAction::CtrlAltDel => {
+                // Through the typist, so it is paced and pause-gated like
+                // typed text; held keys go back first.
+                self.capture.release_all();
+                if let Some(typist) = &self.typist {
+                    typist.chord(&[29, 56, 111]);
+                }
+            }
         }
     }
 

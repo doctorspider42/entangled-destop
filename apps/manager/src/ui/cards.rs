@@ -587,6 +587,17 @@ fn action_strip(
                 actions.push(Action::CopyProfilePath(path.to_string()));
                 ui.close();
             }
+            let mut autostart = app.settings.autostart.contains(&vm.name);
+            if ui
+                .checkbox(&mut autostart, "Start when the manager opens")
+                .on_hover_text(
+                    "Boots this machine (or resumes its saved session) every time the \
+                     manager starts. A machine already running is left alone.",
+                )
+                .changed()
+            {
+                actions.push(Action::ToggleAutostart(vm.name.clone()));
+            }
             if let Some(ssh) = vm.ssh_command() {
                 if ui
                     .button("Copy SSH command")
@@ -606,6 +617,17 @@ fn action_strip(
                     .clicked()
                 {
                     actions.push(Action::Reveal(share.path.clone()));
+                    ui.close();
+                }
+                if ui
+                    .button(format!("Copy mount command for '{}'", share.tag))
+                    .on_hover_text("What to run inside the guest to open the folder")
+                    .clicked()
+                {
+                    actions.push(Action::CopyProfilePath(format!(
+                        "sudo mkdir -p /mnt/{tag} && sudo mount -t 9p -o                          trans=virtio,version=9p2000.L,msize=524288 {tag} /mnt/{tag}",
+                        tag = share.tag
+                    )));
                     ui.close();
                 }
             }

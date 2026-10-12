@@ -690,6 +690,10 @@ cleanly the way a real computer does (a desktop may ask first). *Power off*
 stops the VM immediately and *Restart* reboots it; both ask for a second click
 within three seconds, because a stray click on either loses work.
 
+*DEL* sends Ctrl+Alt+Del to the guest. Windows keeps that combination for
+itself when you press it, so this button is the only way to send it to the
+guest.
+
 *Screenshot* (the camera) saves a PNG of the guest's screen, cursor included,
 in `Pictures\Entangled` on Windows (`~/Pictures/Entangled` on Linux). The
 title bar names the file for a few seconds.
@@ -1223,6 +1227,11 @@ session unrestorable — and a **More** menu holding *Copy profile path*, *Open
 activity log*, *Copy SSH command* (when a TCP forward reaches the guest's
 port 22), *Open shared folder* (one entry per share), *Forget the saved
 session* (when there is one), *Rename…*, *Clone…* and *Delete machine*.
+
+*Start when the manager opens* in the same menu makes the manager start that
+machine every time it opens: a stopped machine boots, a suspended one resumes,
+and one that is already running is left alone. *Copy mount command* copies
+the line that mounts a share inside the guest.
 Chips under the name show the shared folders and port forwards, listed in
 full on hover.
 

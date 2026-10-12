@@ -588,6 +588,19 @@ has a snapshot (ADR-0006 fingerprints the disk paths). Afterwards it moves the
 backend setting, the logs and the picture, but only when no duplicate keeps
 the old name.
 
+### Autostart (`Settings::autostart`, 2026-10-13)
+
+The machines to start when the manager opens are a set of names in
+`manager.toml`. They are manager state, like `vm_backends`, never profile
+state. `ManagerApp::autostart` runs once, after the **first** scan:
+
+- a Stopped machine is started (`start`);
+- a Suspended one is resumed (`resume_vm`);
+- anything else is left alone.
+
+It never runs under `--mock` or `--screenshot`. Rename carries the entry to
+the new name, and delete removes it.
+
 ### The screen on the card (`thumbs.rs`, 2026-10-12)
 
 Every `thumbs::ASK_EVERY` (3 s) `refresh_thumbnails` sends `thumbnail` to each

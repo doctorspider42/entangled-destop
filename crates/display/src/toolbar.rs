@@ -63,6 +63,8 @@ pub enum Button {
     Scale,
     /// Save a PNG of the guest's screen in the host's Pictures folder.
     Screenshot,
+    /// Send Ctrl+Alt+Del, which the host keeps for itself when pressed.
+    CtrlAltDel,
     /// Type the host clipboard's text into the guest as keystrokes.
     TypeClipboard,
     /// Give the keyboard and pointer back to the host.
@@ -74,7 +76,7 @@ pub enum Button {
 impl Button {
     /// Left to right; a group gap separates the guest's lifecycle, the
     /// window's own controls and the plug.
-    pub const ALL: [Button; 10] = [
+    pub const ALL: [Button; 11] = [
         Button::Shutdown,
         Button::Restart,
         Button::Pause,
@@ -82,6 +84,7 @@ impl Button {
         Button::Fullscreen,
         Button::Scale,
         Button::Screenshot,
+        Button::CtrlAltDel,
         Button::TypeClipboard,
         Button::Release,
         Button::PowerOff,
@@ -107,6 +110,7 @@ impl Button {
             Button::Fullscreen => "FULLSCREEN  F11",
             Button::Scale => "FIT / 1:1  CTRL+ALT+O",
             Button::Screenshot => "SCREENSHOT TO PICTURES",
+            Button::CtrlAltDel => "SEND CTRL+ALT+DEL",
             Button::TypeClipboard => "TYPE THE CLIPBOARD  CTRL+ALT+V",
             Button::Release => "RELEASE INPUT  CTRL+ALT",
             Button::PowerOff => "POWER OFF (HARD)",
@@ -132,6 +136,7 @@ impl Button {
             Button::Fullscreen => ToolbarAction::ToggleFullscreen,
             Button::Scale => ToolbarAction::ToggleScale,
             Button::Screenshot => ToolbarAction::Screenshot,
+            Button::CtrlAltDel => ToolbarAction::CtrlAltDel,
             Button::TypeClipboard => ToolbarAction::TypeClipboard,
             Button::Release => ToolbarAction::ReleaseInput,
             Button::PowerOff => ToolbarAction::PowerOff,
@@ -162,6 +167,8 @@ pub enum ToolbarAction {
     TypeClipboard,
     /// Save a PNG of the guest's screen in the host's Pictures folder.
     Screenshot,
+    /// Press Ctrl+Alt+Del on the guest's keyboard.
+    CtrlAltDel,
 }
 
 /// A rectangle in physical window pixels.
@@ -694,6 +701,19 @@ fn draw_icon(canvas: &mut Canvas, button: Button, r: Rect, colour: [f32; 4], s: 
         Button::Scale => {
             let k_font = font_scale(s);
             let text = "1:1";
+            let (w, h) = text_size(text, k_font);
+            draw_text(
+                canvas,
+                text,
+                (c.0 - w / 2.0).round(),
+                (c.1 - h / 2.0).round(),
+                k_font,
+                colour,
+            );
+        }
+        Button::CtrlAltDel => {
+            let k_font = font_scale(s);
+            let text = "DEL";
             let (w, h) = text_size(text, k_font);
             draw_text(
                 canvas,

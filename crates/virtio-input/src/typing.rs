@@ -171,6 +171,25 @@ impl Typist {
         outcome
     }
 
+    /// Queues a chord: every key of `keys` pressed in order, then released in
+    /// reverse (`[29, 56, 111]` is Ctrl+Alt+Del). Answers whether it fitted.
+    pub fn chord(&self, keys: &[u16]) -> bool {
+        let Ok(mut queue) = self.inner.0.lock() else {
+            return false;
+        };
+        if keys.is_empty() || queue.len() + 2 * keys.len() > MAX_QUEUED_BATCHES {
+            return false;
+        }
+        for &code in keys {
+            queue.push_back(key_batch(code, true));
+        }
+        for &code in keys.iter().rev() {
+            queue.push_back(key_batch(code, false));
+        }
+        self.inner.1.notify_all();
+        true
+    }
+
     /// Up to `batches` batches, flattened into one event stream.
     pub fn take(&self, batches: usize) -> Vec<InputEvent> {
         let Ok(mut queue) = self.inner.0.lock() else {
@@ -243,6 +262,22 @@ mod tests {
         for batch in keystrokes("Hello, World!\n").0 {
             assert_eq!(batch.last(), Some(&InputEvent::SYN_REPORT));
         }
+    }
+
+    #[test]
+    fn a_chord_presses_in_order_and_releases_in_reverse() {
+        let typist = Typist::new();
+        assert!(typist.chord(&[29, 56, 111]));
+        let keys: Vec<(u16, u32)> = typist
+            .take(100)
+            .into_iter()
+            .filter(|e| e.event_type == ev::KEY)
+            .map(|e| (e.code, e.value))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![(29, 1), (56, 1), (111, 1), (111, 0), (56, 0), (29, 0)]
+        );
     }
 
     #[test]

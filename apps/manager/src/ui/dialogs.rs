@@ -1861,7 +1861,7 @@ fn edit_network_devices(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
                     ui.add(
                         egui::TextEdit::singleline(rule)
                             .desired_width(field_w - 84.0)
-                            .hint_text("host port:guest port"),
+                            .hint_text("host port:guest port  (udp: for UDP)"),
                     );
                     if ui::ghost_button(ui, "Remove", true, theme::TEXT_DIM).clicked() {
                         remove = Some(i);
@@ -2001,7 +2001,7 @@ fn edit_network_devices(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
 const FORWARD_TIP: &str = "Reach a service inside the machine from this computer. \"2222:22\" \
      makes port 2222 here reach the guest's SSH on port 22; it listens on 127.0.0.1, so only \
      this computer can use it. Put an address in front (\"0.0.0.0:8080:80\") to accept \
-     connections from your network too. Changes apply the next time the machine starts.";
+     connections from your network too, and \"udp:\" in front (\"udp:27015:27015\") for a      game server or anything else on UDP. Changes apply the next time the machine starts.";
 
 /// The picker's own text: "1 player", "2 players".
 fn players_label(players: u8) -> String {

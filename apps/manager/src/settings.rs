@@ -4,7 +4,7 @@
 //! configuration directory lives, and that is resolved from environment
 //! variables rather than a platform crate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,10 @@ pub struct Settings {
     /// honest default, because a Windows install ships no Linux binary and a
     /// developer's build lives wherever their target directory pointed.
     pub wsl_entangled: Option<String>,
+    /// Machines started (or resumed, if suspended) when the manager opens,
+    /// by name. Manager state for the same reason as [`Self::vm_backends`].
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub autostart: BTreeSet<String>,
 }
 
 impl Default for Settings {
@@ -114,6 +118,7 @@ impl Default for Settings {
             vm_backends: BTreeMap::new(),
             wsl_distro: DEFAULT_WSL_DISTRO.to_string(),
             wsl_entangled: None,
+            autostart: BTreeSet::new(),
         }
     }
 }
@@ -295,6 +300,7 @@ mod tests {
                 .collect(),
             wsl_distro: "Debian".into(),
             wsl_entangled: Some("/home/spider/bin/entangled".into()),
+            autostart: ["ubuntu-lab".to_string()].into_iter().collect(),
         };
 
         settings.save_to(&path).expect("save");

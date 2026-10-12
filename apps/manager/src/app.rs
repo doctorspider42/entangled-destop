@@ -363,6 +363,8 @@ pub enum Action {
     /// Give a stopped machine another name, and its files with it.
     AskRenameVm(PathBuf),
     SubmitRenameVm,
+    /// Start this machine whenever the manager opens, or stop doing so.
+    ToggleAutostart(String),
     // ---- Move to another drive ----------------------------------------------
     AskMoveDisk(PathBuf),
     SubmitMoveDisk,
@@ -497,6 +499,9 @@ pub struct ManagerApp {
     frame: u64,
     /// Each machine's latest screen picture (`crate::thumbs`).
     pub thumbs: crate::thumbs::Thumbs,
+    /// Whether the machines marked to start with the manager have been
+    /// started (once, after the first scan).
+    autostart_done: bool,
 }
 
 struct ScreenshotJob {
@@ -597,6 +602,7 @@ impl ManagerApp {
 
         let mut app = Self {
             thumbs: crate::thumbs::Thumbs::default(),
+            autostart_done: false,
             mock_mode,
             view: View::default(),
             engine,
@@ -1129,6 +1135,7 @@ impl ManagerApp {
                 Ok(scan) => {
                     self.scan = scan;
                     self.scan_error = None;
+                    self.autostart();
                 }
                 Err(message) => self.scan_error = Some(message),
             }
@@ -2006,6 +2013,9 @@ impl ManagerApp {
         match discovery::delete(&vm, &self.settings.vm_dir, busy, &typed) {
             Ok(removed) => {
                 self.modal = Modal::None;
+                if self.settings.autostart.remove(&name) {
+                    self.persist_settings_quietly();
+                }
                 self.toast(
                     ToastLevel::Success,
                     format!("deleted '{name}' ({} files)", removed.len()),
@@ -2463,6 +2473,50 @@ impl ManagerApp {
         }
     }
 
+    /// Starts the machines marked *Start when the manager opens*, once, after
+    /// the first scan: a stopped one boots, a suspended one resumes, and a
+    /// running one (started from somewhere else) is left alone.
+    fn autostart(&mut self) {
+        if self.autostart_done || self.mock_mode || self.screenshot.is_some() {
+            return;
+        }
+        self.autostart_done = true;
+        let names: Vec<String> = self
+            .scan
+            .vms
+            .iter()
+            .map(|vm| vm.name.clone())
+            .filter(|name| self.settings.autostart.contains(name))
+            .collect();
+        let mut started = 0;
+        for name in names {
+            match self.status_of(&name) {
+                Status::Stopped => {
+                    self.start(&name);
+                    started += 1;
+                }
+                Status::Suspended => {
+                    self.resume_vm(&name);
+                    started += 1;
+                }
+                _ => {}
+            }
+        }
+        if started > 0 {
+            self.toast(
+                ToastLevel::Info,
+                format!("starting {started} machine(s) set to start with the manager"),
+            );
+        }
+    }
+
+    fn toggle_autostart(&mut self, name: &str) {
+        if !self.settings.autostart.remove(name) {
+            self.settings.autostart.insert(name.to_string());
+        }
+        self.persist_settings_quietly();
+    }
+
     /// Asks every running machine for a new picture of its screen now and
     /// then, and picks up the ones that arrived.
     fn refresh_thumbnails(&mut self, ctx: &egui::Context) {
@@ -2581,8 +2635,12 @@ impl ManagerApp {
                 // A duplicate's backend stays with the name it leaves behind.
                 let backend = self.backend_of(&source);
                 self.settings.set_backend_for(&new_name, backend);
+                if self.settings.autostart.contains(&source) {
+                    self.settings.autostart.insert(new_name.clone());
+                }
                 if self.name_count(&source) <= 1 {
                     self.settings.vm_backends.remove(&source);
+                    self.settings.autostart.remove(&source);
                     let vm_dir = self.settings.vm_dir.clone();
                     for suffix in ["-run.log", "-install.log"] {
                         let _ = std::fs::rename(
@@ -3379,6 +3437,7 @@ impl ManagerApp {
             Action::SubmitCloneVm => self.submit_clone_vm(),
             Action::AskRenameVm(profile) => self.ask_rename_vm(&profile),
             Action::SubmitRenameVm => self.submit_rename_vm(),
+            Action::ToggleAutostart(name) => self.toggle_autostart(&name),
             Action::SubmitEditVm => self.submit_edit_vm(),
             Action::AskMoveDisk(path) => self.ask_move_disk(&path),
             Action::SubmitMoveDisk => self.submit_move_disk(),
