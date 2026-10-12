@@ -667,6 +667,20 @@ until you ask it not to.
 The window title says whether input is grabbed. Losing focus releases the grab
 and every key the guest was told is down.
 
+**The guest's resolution follows the window.** Resize it, maximise it or go
+fullscreen, and a moment after you stop the guest is asked for a desktop of
+exactly the window's size: GNOME switches to it and the image fills the window
+pixel for pixel instead of being scaled. The profile's `width`×`height` is the
+size the machine starts at. To keep it fixed whatever the window does:
+
+```toml
+[display]
+follow_window = false
+```
+
+A headless machine can be asked the same way over the control channel:
+`display 1600x900`.
+
 **The quick-actions bar** slides in when the pointer touches the top edge of a
 fullscreen window, or of a windowed one whose input is grabbed (the pointer is
 confined then, so it cannot be heading for the title bar). Over the bar you
@@ -824,9 +838,8 @@ like. Two machines each have their own segment and cannot see each other.
 DNS (below), inbound TCP through **port forwards** (below), and a ping of
 `192.168.74.1`.
 
-**What does not:** UDP other than DHCP and DNS (so no NTP — the guest's clock
-comes from the host's RTC at boot and `timedatectl` reports it unsynchronised;
-no QUIC, which browsers fall back from to TCP; no game traffic), a ping to
+**What does not:** UDP other than DHCP, DNS and NTP (so no QUIC, which
+browsers fall back from to TCP, and no game traffic), a ping to
 anything past the gateway, IPv6 (the guest has a link-local address only, and
 programs use IPv4), and anything inbound that is not forwarded.
 
@@ -847,6 +860,11 @@ all work in the guest exactly as on the host. Anything else (MX, TXT, SRV,
 reverse lookups) is relayed to the host's first DNS server — the one its
 network gave it, not a public resolver. `ENTANGLED_USERNET_DNS=relay` sends
 every query to that server instead, for comparison.
+
+**Time.** Every NTP request the guest makes — to `ntp.ubuntu.com` or
+whatever server it is configured with — is answered by the NAT from the
+host's clock, so `timedatectl` reports the guest's clock synchronised and it
+keeps the host's time. Keep the host's own clock right; the guest follows it.
 
 **Port forwards** reach a service inside the guest from the host:
 
@@ -1033,8 +1051,9 @@ deleting the source and updating the profiles that reference it.
 
 One hard rule the tooling cannot enforce for you: **never run two VMs on the
 same writable disk image.** Two guests with the same filesystem mounted
-read/write will corrupt it. Copy the image (sparsely, with its `.nvram`) if you
-want a second machine.
+read/write will corrupt it. The manager's *Clone…* copies a whole machine safely
+(see [The views](#the-views)); by hand, copy the image sparsely, with its
+`.nvram`.
 
 ## Pause, reboot, suspend and restore
 
@@ -1113,8 +1132,19 @@ state:
 plus **Configure** on every card — allowed while a machine is stopped or
 suspended, with the warning that changing its hardware is what makes a saved
 session unrestorable — and a **More** menu holding *Copy profile path*, *Open
-activity log*, *Forget the saved session* (when there is one) and *Delete
-machine*. A card whose disk file has gone missing says so and offers no Start
+activity log*, *Forget the saved session* (when there is one), *Clone…* and
+*Delete machine*.
+
+**Clone…** makes a second machine from a stopped one. It copies every writable
+disk next to the original, renamed for the new machine (`ubuntu.raw` →
+`ubuntu-2.raw`). Only the data the disk holds is copied, and the copy is
+verified against its source. It also copies the UEFI boot entries (the `.nvram`)
+and the settings. Read-only disks and the CD-ROM are shared rather than copied.
+The clone gets a network address of its own, so both can run at once. Port
+forwards stay with the original, because two machines cannot own one host port,
+and a saved session is not copied. Inside, the clone is the same installation:
+same hostname, same accounts, same SSH host keys. Change those in the guest if
+the two will share a network others see. A card whose disk file has gone missing says so and offers no Start
 button.
 
 Pause, Restart and Suspend need the control channel, which only exists for a VM

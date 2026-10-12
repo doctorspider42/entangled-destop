@@ -446,6 +446,22 @@ that shaped the code, all verified against WSLg's protocol stream
   screen. Coordinate math in host-side tooling must not assume the rect
   includes the titlebar.
 
+## The guest's resolution follows the window (`resize.rs`, 2026-10-12)
+
+`App` marks `resize_pending` on every `Resized`; `about_to_wait` asks once the
+size has held for `resize::SETTLE` (350 ms) — a drag delivers dozens of sizes
+a second, the guest must see one. `ResolutionRequest` is shared between the
+window and every `DisplayHandle`: the handle reports it as
+`ScanoutSink::preferred_resolution` (what `GET_DISPLAY_INFO` and the EDID
+say) and holds the device's `DisplayListener`, which sets
+`VIRTIO_GPU_EVENT_DISPLAY` and raises the config-change interrupt. Sizes are
+physical pixels, clamped to 640×480..=4096×2304 (the scanout resource bound)
+and even. `DisplayHost::with_follow_window(false)` / `[display] follow_window =
+false` turns it off; `DisplayHandle::request_guest_resolution` (the control
+channel's `display WxH`) is the headless way to exercise it. Note for HiDPI:
+a window on a 300 % 4K monitor asks for a 4K desktop — sharp, and heavy for
+the GPU desktop.
+
 ## The quick-actions bar (`toolbar.rs`, 2026-10-12)
 
 A VMware-style bar at the top edge: Shut down (ACPI power button), Restart,

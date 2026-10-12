@@ -13,18 +13,22 @@
 //! * [`refs`] — which VM profiles reference a disk (the `disk rm` guard).
 //! * [`relocate`] — sparse-preserving, verified move of an image (and its
 //!   sidecar) to another directory or drive.
+//! * [`clone`] — a whole machine copied under a new name: its writable disks
+//!   (through the same verified sparse copy), its NVRAM and a new profile.
 //!
 //! Portable by design (ADR-0002): the platform-specific parts (allocated
 //! size, sparse marking, allocated-range enumeration, free space) live behind
 //! small `cfg` functions with graceful fallbacks; all parsing and policy is
 //! plain std.
 
+pub mod clone;
 pub mod inspect;
 pub mod layout;
 pub mod ops;
 pub mod refs;
 pub mod relocate;
 
+pub use clone::{clone_machine, CloneError, CloneOutcome};
 pub use inspect::{inspect_disk, DiskReport, PartitionReport, TableKind};
 pub use layout::{
     find_installed_root, find_uefi_install, has_protective_mbr, parse_mbr, read_partition_table,

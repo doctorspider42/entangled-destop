@@ -61,9 +61,21 @@ pub struct DisplayHost {
     /// When the window asks the GPU driver for its clocks
     /// ([`Self::with_gpu_boost`]).
     boost: BoostPolicy,
+    /// The resolution the window asks the guest for, shared with every
+    /// [`DisplayHandle`] ([`crate::resize`]).
+    resolution: crate::resize::ResolutionRequest,
+    /// Whether the window asks at all ([`Self::with_follow_window`]).
+    follow_window: bool,
 }
 
 impl DisplayHost {
+    /// Whether the guest's resolution follows the window ([`crate::resize`]);
+    /// on unless the profile says `follow_window = false`.
+    #[must_use]
+    pub fn with_follow_window(mut self, follow: bool) -> Self {
+        self.follow_window = follow;
+        self
+    }
     /// Builds the event loop and allocates the scanout mirror. Call on the main
     /// thread; no window or GPU resource exists until [`DisplayHost::run`].
     pub fn new(config: DisplayConfig) -> Result<Self, DisplayError> {
@@ -84,6 +96,8 @@ impl DisplayHost {
             share: false,
             guest_refresh_hz: None,
             boost: BoostPolicy::Off,
+            resolution: crate::resize::ResolutionRequest::default(),
+            follow_window: true,
         })
     }
 
@@ -150,6 +164,7 @@ impl DisplayHost {
             Arc::clone(&self.scanout),
             self.waker.clone(),
             self.shared.clone(),
+            self.resolution.clone(),
         )
     }
 
@@ -183,6 +198,8 @@ impl DisplayHost {
             share,
             guest_refresh_hz,
             boost,
+            resolution,
+            follow_window,
         } = self;
         let mut app = App {
             config,
@@ -211,6 +228,9 @@ impl DisplayHost {
             boost: BoostGate::new(boost.with_env()),
             toolbar: crate::toolbar::Toolbar::new((config.width, config.height), 1.0),
             toolbar_press: false,
+            resolution,
+            follow_window,
+            resize_pending: None,
         };
         // Nothing here reads `DeviceEvent`s (pointer input is the window's
         // `CursorMoved`), and on Windows winit otherwise registers raw input for
@@ -283,6 +303,12 @@ struct App {
     /// A button press began on the toolbar, so its release is the toolbar's
     /// too and must not reach the guest.
     toolbar_press: bool,
+    /// What the window asks the guest's resolution to be ([`crate::resize`]).
+    resolution: crate::resize::ResolutionRequest,
+    follow_window: bool,
+    /// When the window last changed size, until the guest has been asked for
+    /// the new one ([`crate::resize::SETTLE`]).
+    resize_pending: Option<Instant>,
     /// Title text actually applied to the window.
     ///
     /// Every `set_title` is an X11/Wayland round trip, and winit's X11 backend
@@ -833,6 +859,18 @@ impl ApplicationHandler<HostEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.steer_boost(event_loop);
+        if let Some(since) = self.resize_pending {
+            let due = since + crate::resize::SETTLE;
+            if Instant::now() >= due {
+                self.resize_pending = None;
+                if let Some((w, h)) = self.window_size() {
+                    let (w, h) = crate::resize::guest_size_for_window(w, h);
+                    self.resolution.request(w, h);
+                }
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+            }
+        }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -893,6 +931,9 @@ impl ApplicationHandler<HostEvent> for App {
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
+                }
+                if self.follow_window && size.width > 0 && size.height > 0 {
+                    self.resize_pending = Some(Instant::now());
                 }
                 self.recompute_viewport();
                 tracing::debug!(

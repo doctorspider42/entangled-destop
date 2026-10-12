@@ -110,7 +110,7 @@ pub use shared::{
     ExternalHandle, ImageRelease, ScanoutPath, SharedImageInfo, SharedPresent, SharedScanoutFrame,
     SharedScanoutImage, SharedScanoutLease, SCANOUT_PATH_ENV,
 };
-pub use sink::{ScanoutSink, SinkError};
+pub use sink::{DisplayListener, ScanoutSink, SinkError};
 pub use venus::executor::ExecutorFactory;
 pub use venus::renderer::{
     CaptureSink, FactoryUsage, SinkFactory, VenusError, VenusRenderer, VenusUsage, WriteSink,

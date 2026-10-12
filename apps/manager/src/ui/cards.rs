@@ -524,6 +524,21 @@ fn action_strip(
             if ui
                 .add_enabled(
                     matches!(status, Status::Stopped | Status::Suspended),
+                    egui::Button::new("Clone…"),
+                )
+                .on_hover_text(
+                    "A second machine from this one: its disks copied (only the data \
+                     they hold), its UEFI boot entries, its settings, and a network \
+                     address of its own.",
+                )
+                .clicked()
+            {
+                actions.push(Action::AskCloneVm(vm.name.clone()));
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    matches!(status, Status::Stopped | Status::Suspended),
                     egui::Button::new("Delete machine"),
                 )
                 .clicked()

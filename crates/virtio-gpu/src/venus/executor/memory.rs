@@ -1344,6 +1344,20 @@ impl<H: HostVulkan> VulkanContext<H> {
     pub(super) fn destroy_buffer(&mut self, args: &DestroyBufferArgs) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyBuffer";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
+        // Its views go with it: unusable from here on, and a guest that never
+        // destroys them would fill the table (`Objects::views_of_buffer`).
+        if args.buffer.0 != 0 {
+            for view_id in self.objects.views_of_buffer(args.device.0, args.buffer.0) {
+                if let Some((view, held)) = self
+                    .objects
+                    .take_to_doom(Kind::BufferView, args.device.0, view_id)
+                    .map_err(id_error(NAME))?
+                {
+                    self.retire_object(args.device.0, view, held);
+                    self.objects.tombstone_view(view_id);
+                }
+            }
+        }
         // Nothing the GPU may still be using is freed under it, and the
         // guest does not wait for that either.
         if let Some((buffer, held)) = self
@@ -1763,6 +1777,11 @@ impl<H: HostVulkan> VulkanContext<H> {
     ) -> Result<(), ExecError> {
         const NAME: &str = "vkDestroyBufferView";
         self.objects.device(args.device.0).map_err(id_error(NAME))?;
+        // Already destroyed along with its buffer: what a driver does with a
+        // destroy of a view whose buffer is gone — nothing.
+        if self.objects.take_view_tombstone(args.buffer_view.0) {
+            return Ok(());
+        }
         // Nothing the GPU may still be using is freed under it, and the
         // guest does not wait for that either.
         if let Some((view, held)) = self

@@ -904,6 +904,10 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
     retired only when `consumed` has passed its `consume_at`, so it never
     carries bytes that do not exist; a STOP or RELEASE hands its buffers back
     with a **zero-length payload** rather than with whatever the ring holds.
+    (virtio-net's usernet answers **NTP** itself since 2026-10-12 —
+    `usernet::ntp`, any destination on port 123, a stratum-2 reply from the
+    host's clock sourced from the address asked — and resolves A/AAAA through
+    the host's resolver, `usernet::hostdns`; see ADR-0002's amendment.)
     **RELEASE keeps the stream's parameters** (`stream::transition` →
     `ParamsSet`): the spec allows SET PARAMETERS *or* PREPARE after it, and
     Linux's xrun recovery is STOP, RELEASE (`virtsnd_pcm_sync_stop`), then

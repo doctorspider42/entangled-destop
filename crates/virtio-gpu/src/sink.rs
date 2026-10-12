@@ -53,10 +53,29 @@ impl SinkError {
 /// thread) and must never panic on the values passed in: the rects come from
 /// the guest, even though the device has already validated them against the
 /// resource.
+/// Called when the host would like the guest to use another resolution
+/// ([`ScanoutSink::set_display_listener`]).
+pub type DisplayListener = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 pub trait ScanoutSink: Send {
     /// Current guest resolution, i.e. the size of the scanout the host is
-    /// presenting. Reported to the guest by `GET_DISPLAY_INFO`.
+    /// presenting.
     fn resolution(&self) -> (u32, u32);
+
+    /// The resolution the host would like the guest to use, which is what
+    /// `GET_DISPLAY_INFO` and the EDID's preferred timing report: the window's
+    /// size when the display follows the window, the current scanout's
+    /// otherwise.
+    fn preferred_resolution(&self) -> (u32, u32) {
+        self.resolution()
+    }
+
+    /// Registers what to call when [`Self::preferred_resolution`] changes: the
+    /// device raises `VIRTIO_GPU_EVENT_DISPLAY` with a config-change
+    /// interrupt, and the guest's driver asks for the display info again —
+    /// which is how a desktop follows a resized window. A sink whose preferred
+    /// resolution never changes ignores it.
+    fn set_display_listener(&self, _listener: DisplayListener) {}
 
     /// Changes the guest resolution (`SET_SCANOUT` with a differently sized
     /// region). The contents are undefined afterwards; the guest always
@@ -161,6 +180,14 @@ pub trait ScanoutSink: Send {
 impl<S: ScanoutSink + ?Sized> ScanoutSink for Box<S> {
     fn resolution(&self) -> (u32, u32) {
         (**self).resolution()
+    }
+
+    fn preferred_resolution(&self) -> (u32, u32) {
+        (**self).preferred_resolution()
+    }
+
+    fn set_display_listener(&self, listener: DisplayListener) {
+        (**self).set_display_listener(listener);
     }
 
     fn set_resolution(&self, width: u32, height: u32) -> Result<(), SinkError> {

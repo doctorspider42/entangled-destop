@@ -546,6 +546,26 @@ history. Four rules earned by building it:
   other engine (`/mnt/d/...` seen from Windows) is left to that engine rather
   than reported as a disk that has vanished — see `snapshots::nameable_here`.
 
+### Clone (`disk_image::clone`, 2026-10-12)
+
+*More → Clone…* is `Action::AskCloneVm` → `Modal::CloneVm`, and the copy runs on a
+`vm-clone` worker exactly like the move (`CloneEvent`, whole-percent progress,
+`CloseModal` refused while it runs). All the policy is in
+`disk_image::clone_machine`, not here, and it is unit-tested there:
+
+- writable disks are copied through `relocate::copy_verified` (sparse plus
+  digest re-read), read-only disks and the CD-ROM are shared;
+- `boot.nvram` follows its disk's new name, and a named store not yet written
+  gets a fresh path, never the source's;
+- new MAC (`new_machine_mac`), `forward` and `interface` cleared, all paths in
+  the new profile written absolute, and the profile created `create_new` so a
+  race never overwrites one;
+- any failure removes every file the call created.
+
+The backend is manager state, so the manager copies the source's backend to
+the clone after it succeeds (`set_backend_for`). `suggest_clone_name` proposes
+`ubuntu-3` for `ubuntu-2`, not `ubuntu-2-2`.
+
 ### Cards that grow
 
 `horizontal_wrapped` only reports how many lines it took **after** it has drawn

@@ -93,6 +93,7 @@ mod latency;
 mod present;
 pub mod refresh;
 mod renderer;
+pub mod resize;
 pub mod scanout;
 pub mod shared;
 mod sync;

@@ -280,6 +280,18 @@ pub fn move_disk(
     })
 }
 
+/// Copies `src` to a new `dst` sparse-preserving, fsyncs it and re-reads it
+/// against the source's digest: `Ok(Some(data_bytes))` when the copy is
+/// exact, `Ok(None)` when it is not. The caller removes `dst` on anything but
+/// `Ok(Some)`. Shared with [`crate::clone`].
+pub(crate) fn copy_verified(src: &Path, dst: &Path, progress: Progress) -> io::Result<Option<u64>> {
+    let (stats, ranges, digest) = sparse_copy(src, dst, progress)?;
+    if std::fs::metadata(dst)?.len() != stats.apparent_bytes {
+        return Ok(None);
+    }
+    Ok((hash_ranges(dst, &ranges)? == digest).then_some(stats.data_bytes))
+}
+
 /// Bytes the copy will actually move for `disk` — the allocated data. What the
 /// manager's move dialog shows next to the destination's free space.
 pub fn copy_bill(disk: &Path) -> Option<(u64 /* data */, u64 /* apparent */)> {

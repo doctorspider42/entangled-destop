@@ -7764,3 +7764,69 @@ their `.work.csv`, and per boot `run.log`, `drive.trace`, `smi.csv`,
 `tenants.csv`, `frames.json`) and `F:\VMs\Entangled\flicker\`. The probe
 sources are in `F:\VMs\Entangled\probes\boost\`, and `summ.py --table <runs>`
 reproduces the guest table.
+
+## Amendment, 2026-10-12 — Firefox's video and the view cap; the guest's desktop follows the window
+
+### A Venus context's views are not objects
+
+Firefox playing video (YouTube, or a local VP8 page) crashed after about
+seven minutes: `a Venus create was refused at a cap ... objects past the
+per-context cap (65536 held of 65536)`, then `vkBindBufferMemory2: object id
+... names no VkBuffer` — the guest never learns that an asynchronous create
+was refused, so its next command naming the object kills the ring. The cap
+refusal now logs what fills the table, with each kind's lifetime churn, and
+the first line said it all:
+
+```text
+held="VkBufferView=62882(+62882/-0) VkDescriptorSet=2200(+2200/-0) VkBuffer=88(+119005/-118917) ..."
+```
+
+Mesa's Zink holds one `VkBufferView` per distinct (buffer, format, offset,
+range) it ever used — it deduplicates by create info and never destroys
+them — and WebRender's streaming buffers give it a new offset every frame:
+about 145 views a second on fewer than a hundred live buffers, none ever
+destroyed. On a native driver that is a few hundred bytes a second of
+memory; here it reached the table's 65 536 in seven minutes.
+
+Two changes, both on the host:
+
+- **`Class::Views`** (`limits::table_class`): buffer and image views count
+  under a class of their own — 1 M per context, 4 M renderer-wide — instead
+  of the shared object cap. A view is a few dozen bytes of driver state; the
+  cap still bounds a hostile guest, and a leaking Zink now has hours, not
+  minutes.
+- **A buffer's views go with it** (`Objects::views_of_buffer`): a
+  `vkDestroyBuffer` dooms the buffer's views too, since a view of a destroyed
+  buffer can never be used again, and tombstones their ids
+  (`MAX_VIEW_TOMBSTONES`) so the guest's own late `vkDestroyBufferView` is
+  the no-op it is on a driver. It did not help this workload — Zink's views
+  are on buffers that stay alive — but it is correct and bounds the case
+  where they are not.
+
+Measured with `RUST_LOG=virtio_gpu::venus::executor::objects=debug`, which
+now prints the census every 8192 creations.
+
+After: the same page for twelve minutes, Firefox alive throughout, 114 620
+views held, no refusal and no dead ring. **The cost is real, though:** the
+host process grew about 11 MiB a minute while it played — roughly 1 KiB of
+host memory per leaked view (our table entry plus the driver's object) — so
+a million views is about a gigabyte and some two hours of video, after which
+the same refusal returns. Open: a real cure has to stop paying for views the
+guest will never use again — creating the host `VkBufferView` lazily at its
+first descriptor write and sharing one host view per (buffer, format,
+offset, range) across guest ids would bound host memory by what the GPU
+actually reads, at the price of tracking which descriptor sets hold which
+host view.
+
+### The guest's resolution follows the window
+
+`ScanoutSink::preferred_resolution` / `set_display_listener`: the window,
+350 ms after its size last changed, asks for a desktop of its size in
+physical pixels (`display::resize`, clamped to 640×480..=4096×2304, the
+scanout resource bound); the device reports it in `GET_DISPLAY_INFO` and as
+the EDID's preferred timing, sets `VIRTIO_GPU_EVENT_DISPLAY` and raises the
+config-change interrupt. Linux's virtio-gpu re-reads both and mutter switches
+to the new preferred mode. Measured on WHP with the installed Ubuntu desktop
+over the control channel's new `display WxH`: `GET_EDID width=1600
+height=900`, `events cleared clear=0x1`, and the next scanout set at
+1600×900 in the same second. `[display] follow_window = false` opts out.

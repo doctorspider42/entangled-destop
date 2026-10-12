@@ -247,7 +247,8 @@ fn open_presentation(cfg: &VmConfig, headless: bool) -> Result<Presentation, Str
                 // the high-refresh amendment).
                 return Ok(Presentation::Windowed(Box::new(
                     host.with_title(format!("Entangled Desktop — {}", cfg.name))
-                        .with_guest_refresh(cfg.display.refresh_hz),
+                        .with_guest_refresh(cfg.display.refresh_hz)
+                        .with_follow_window(cfg.display.follow_window != Some(false)),
                 )));
             }
             Err(e) => {
@@ -902,6 +903,7 @@ fn spawn_control_channel(
     requests: Arc<LifecycleRequests>,
     lifecycle: Arc<Lifecycle>,
     snapshot: Option<PathBuf>,
+    display: display::DisplayHandle,
 ) {
     let spawned = std::thread::Builder::new()
         .name("control".into())
@@ -919,14 +921,29 @@ fn spawn_control_channel(
                 // the writer at the other end of the pipe and the reader here
                 // cannot drift apart.
                 use control_api::control::{
-                    CMD_PAUSE, CMD_RESET, CMD_RESUME, CMD_SAVE, CMD_SHUTDOWN, CMD_STATUS,
-                    CMD_TYPE,
+                    CMD_DISPLAY, CMD_PAUSE, CMD_RESET, CMD_RESUME, CMD_SAVE, CMD_SHUTDOWN,
+                    CMD_STATUS, CMD_TYPE,
                 };
                 match command {
                     "" => {}
                     CMD_PAUSE => requests.pause.store(true, Ordering::Relaxed),
                     CMD_RESUME => requests.resume.store(true, Ordering::Relaxed),
                     CMD_RESET => requests.reset.store(true, Ordering::Relaxed),
+                    CMD_DISPLAY => {
+                        let size = argument
+                            .trim()
+                            .split_once('x')
+                            .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)));
+                        match size {
+                            Some((w, h)) => {
+                                display.request_guest_resolution(w, h);
+                            }
+                            None => {
+                                println!("{CONTROL_PREFIX} error display needs WIDTHxHEIGHT");
+                                continue;
+                            }
+                        }
+                    }
                     CMD_SHUTDOWN => {
                         if !requests.press_power_button() {
                             println!(
@@ -1435,6 +1452,7 @@ pub fn run_with(
             Arc::clone(&requests),
             Arc::clone(&lifecycle),
             snapshot.clone(),
+            display_handle.clone(),
         );
     }
 

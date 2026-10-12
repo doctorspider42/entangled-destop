@@ -43,6 +43,9 @@ pub const CMD_TYPE: &str = "type";
 /// ends when the guest powers off — or not, if its policy says otherwise; a
 /// caller that must have it stopped follows up with its own deadline.
 pub const CMD_SHUTDOWN: &str = "shutdown";
+/// Ask the guest for another desktop resolution, `display WIDTHxHEIGHT`: what
+/// resizing the window does, for a headless VM or a test.
+pub const CMD_DISPLAY: &str = "display";
 
 /// One reply line, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]

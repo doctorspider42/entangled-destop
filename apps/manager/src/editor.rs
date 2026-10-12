@@ -73,6 +73,9 @@ pub struct EditForm {
     /// `[display] refresh_hz`: what the virtual monitor's EDID advertises,
     /// which the guest's compositor paces itself to.
     pub refresh_hz: u32,
+    /// `[display] follow_window`, as the checkbox shows it: on unless the
+    /// profile says `false`.
+    pub follow_window: bool,
     /// What "Match monitor" sets [`Self::refresh_hz`] to: this computer's
     /// monitor through [`control_api::refresh::default_refresh_hz`], the rule
     /// `entangled install` uses. Filled in by the app when the editor opens;
@@ -259,6 +262,7 @@ enabled = true
             display_height: cfg.display.height,
             gpu: cfg.display.gpu_renderer(),
             refresh_hz: cfg.display.refresh_hz,
+            follow_window: cfg.display.follow_window != Some(false),
             monitor_refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             gpu_boost: cfg.display.gpu_boost != Some(false),
             gpu_memory_limit: cfg.display.gpu_memory_mib.is_some(),
@@ -326,6 +330,8 @@ enabled = true
         cfg.display.height = self.display_height;
         cfg.display.set_gpu_renderer(self.gpu);
         cfg.display.refresh_hz = self.refresh_hz;
+        // On is the default and is not written (older engines deny the key).
+        cfg.display.follow_window = (!self.follow_window).then_some(false);
         // On is the default and is not written (an older engine denies the
         // key); an explicit `true` the profile already had is kept. `true`
         // beside any other renderer is refused, so it never survives a switch.

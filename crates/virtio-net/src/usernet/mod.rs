@@ -59,6 +59,7 @@
 
 mod dhcp;
 pub mod hostdns;
+pub mod ntp;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod offline;
 mod tcp;
@@ -653,6 +654,24 @@ impl Router {
             UserNetStats::bump(&stats.dns_queries);
             self.dns.forward(udp.src_port, data);
             return;
+        }
+        // Any NTP server the guest asks is answered here, from the host's
+        // clock, as that server ([`ntp`]).
+        if udp.dst_port == ntp::PORT {
+            if let (Some(answer), Some(dst_mac)) = (
+                ntp::reply(data, std::time::SystemTime::now()),
+                self.guest_mac,
+            ) {
+                self.send_udp(
+                    out,
+                    stats,
+                    dst_mac,
+                    (ip.dst_addr, ntp::PORT),
+                    (ip.src_addr, udp.src_port),
+                    &answer,
+                );
+                return;
+            }
         }
         UserNetStats::bump(&stats.dropped_unsupported);
     }

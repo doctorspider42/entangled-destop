@@ -598,6 +598,13 @@ pub struct DisplaySection {
     /// Not written when absent: an older engine denies unknown keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_boost: Option<bool>,
+    /// Whether the guest's resolution follows the window: resizing it,
+    /// maximising or going fullscreen asks the guest for a desktop of the
+    /// window's size. Absent means on; `false` keeps `width`×`height` whatever
+    /// the window does. Not written when absent (older engines deny unknown
+    /// keys).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_window: Option<bool>,
 }
 
 /// Bounds on [`DisplaySection::refresh_hz`], mirroring `virtio_gpu::edid`'s
@@ -637,6 +644,7 @@ impl Default for DisplaySection {
             host_visible_mib: None,
             gpu_memory_mib: None,
             gpu_boost: None,
+            follow_window: None,
         }
     }
 }

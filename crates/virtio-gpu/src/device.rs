@@ -65,6 +65,10 @@ use crate::{
     VIRTIO_GPU_F_VIRGL,
 };
 
+/// `VIRTIO_GPU_EVENT_DISPLAY` in `events_read`: the display configuration
+/// changed, ask for it again.
+const EVENT_DISPLAY: u32 = 1 << 0;
+
 /// controlq and cursorq, in queue order (spec section 5.7.2).
 pub const NUM_QUEUES: usize = 2;
 /// Index of the control queue — all 2D commands arrive here.
@@ -355,10 +359,11 @@ pub struct GpuDevice<S: ScanoutSink> {
     /// does not go through the trait object per command.
     blob_support: BlobSupport,
     scanout: Option<ScanoutBinding>,
-    /// `events_read` of `struct virtio_gpu_config`. Nothing raises events in
-    /// the MVP (they are for hot-plugged displays / EDID changes), so this
-    /// stays zero; the write-to-clear path is implemented anyway.
-    events_read: u32,
+    /// `events_read` of `struct virtio_gpu_config`: `VIRTIO_GPU_EVENT_DISPLAY`
+    /// when the host's preferred resolution changed (the window was resized),
+    /// set by the display's listener on its own thread — hence atomic — and
+    /// cleared by the guest through `events_clear`.
+    events_read: Arc<std::sync::atomic::AtomicU32>,
     features: u64,
     acked_features: u64,
     /// Staging buffer for the gathered request, reused across commands.
@@ -446,7 +451,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             blobs: BlobTable::new(0),
             blob_support: BlobSupport::NONE,
             scanout: None,
-            events_read: 0,
+            events_read: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             // EDID (MVP-811) because GNOME/mutter builds its outputs from it;
             // no resource UUID / blob resources. VIRGL is added by
             // [`Self::with_renderer`] only.
@@ -1345,7 +1350,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
     /// `GET_DISPLAY_INFO` (MVP-802): one enabled scanout at the host window's
     /// current guest resolution.
     fn get_display_info(&self) -> Result<Reply, CommandError> {
-        let (width, height) = self.display.resolution();
+        let (width, height) = self.display.preferred_resolution();
         let modes = [DisplayOne {
             rect: Rect {
                 x: 0,
@@ -1371,7 +1376,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if cmd.scanout >= NUM_SCANOUTS {
             return Err(CommandError::UnknownScanout(cmd.scanout));
         }
-        let (width, height) = self.display.resolution();
+        let (width, height) = self.display.preferred_resolution();
         let block = crate::edid::edid_block(width, height, self.refresh_hz)
             .ok_or(CommandError::UnencodableMode { width, height })?;
         tracing::debug!(
@@ -2709,7 +2714,8 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
             .three_d
             .as_ref()
             .map_or(NUM_CAPSETS, |gpu| gpu.num_capsets());
-        let config = config_bytes(self.events_read, NUM_SCANOUTS, num_capsets);
+        let events = self.events_read.load(std::sync::atomic::Ordering::Acquire);
+        let config = config_bytes(events, NUM_SCANOUTS, num_capsets);
         debug_assert_eq!(config.len(), CONFIG_LEN);
         for (i, byte) in data.iter_mut().enumerate() {
             let index = offset.saturating_add(i as u64);
@@ -2728,7 +2734,8 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
             let mut raw = [0u8; 4];
             raw.copy_from_slice(data);
             let clear = u32::from_le_bytes(raw);
-            self.events_read &= !clear;
+            self.events_read
+                .fetch_and(!clear, std::sync::atomic::Ordering::AcqRel);
             tracing::debug!(
                 clear = format_args!("{clear:#x}"),
                 "virtio-gpu events cleared"
@@ -2759,6 +2766,18 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         self.control = queues.next();
         self.cursor = queues.next();
         self.mem = Some(resources.mem);
+        // A resized window reaches the guest as a display event: the bit, then
+        // the config-change interrupt that makes its driver read it.
+        {
+            let events = Arc::clone(&self.events_read);
+            let interrupt = Arc::clone(&resources.interrupt);
+            self.display.set_display_listener(Arc::new(move || {
+                events.fetch_or(EVENT_DISPLAY, std::sync::atomic::Ordering::AcqRel);
+                if let Err(error) = interrupt.signal_config_change() {
+                    tracing::debug!(%error, "virtio-gpu display event not signalled");
+                }
+            }));
+        }
         self.interrupt = Some(resources.interrupt);
         let (width, height) = self.display.resolution();
         tracing::info!(width, height, scanouts = NUM_SCANOUTS, "virtio-gpu ready");
@@ -2882,7 +2901,7 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
 
     fn save_device(&self) -> Vec<u8> {
         let state = crate::save::GpuState {
-            events_read: self.events_read,
+            events_read: self.events_read.load(std::sync::atomic::Ordering::Acquire),
             live_3d_contexts: self
                 .three_d
                 .as_ref()
@@ -2943,7 +2962,8 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         }
         let state = crate::save::GpuState::decode(bytes)
             .map_err(|e| DeviceError::Backend(e.to_string()))?;
-        self.events_read = state.events_read;
+        self.events_read
+            .store(state.events_read, std::sync::atomic::Ordering::Release);
 
         let mem = match self.mem.clone() {
             Some(mem) => mem,
@@ -3082,7 +3102,8 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         self.mem = None;
         self.interrupt = None;
         self.acked_features = 0;
-        self.events_read = 0;
+        self.events_read
+            .store(0, std::sync::atomic::Ordering::Release);
         self.scanout = None;
         self.resources.clear();
         self.blobs.clear();

@@ -594,9 +594,41 @@ fn a_malformed_long_dns_answer_is_dropped_not_misread() {
     assert_eq!(reply[2] & 0x02, 0x02);
 }
 
-/// **UDP is DHCP and DNS, and nothing else.** There is no general UDP NAT here:
-/// anything else the guest sends over UDP is counted as unsupported and dropped,
-/// which means QUIC, NTP, mDNS and games are unreachable through this backend.
+/// **NTP is answered from the host's clock**, as whatever server the guest
+/// asked: the reply comes from that address and port 123, and carries the
+/// guest's transmit timestamp back as its origin.
+#[test]
+fn an_ntp_request_is_answered_by_the_server_the_guest_asked() {
+    let backend = backend();
+    let config = *backend.config();
+    let server = Ipv4Address::new(185, 125, 190, 56);
+    let mut request = [0u8; super::ntp::LEN];
+    request[0] = (4 << 3) | 3;
+    request[40..48].copy_from_slice(&[9, 8, 7, 6, 5, 4, 3, 2]);
+    backend
+        .write_frame(&eth(
+            UserNetConfig::GATEWAY_MAC,
+            EthernetProtocol::Ipv4,
+            &guest_udp(config.guest, server, 40123, super::ntp::PORT, &request),
+        ))
+        .expect("never a host failure");
+    let frame = recv(&backend).expect("the server answered");
+    let eth = EthernetFrame::new_checked(&frame[..]).expect("ethernet");
+    let ip = Ipv4Packet::new_checked(eth.payload()).expect("ipv4");
+    assert_eq!(ip.src_addr(), server, "from the server the guest asked");
+    assert_eq!(ip.dst_addr(), config.guest);
+    let udp = UdpPacket::new_checked(ip.payload()).expect("udp");
+    assert_eq!((udp.src_port(), udp.dst_port()), (super::ntp::PORT, 40123));
+    let reply = udp.payload();
+    assert_eq!(reply.len(), super::ntp::LEN);
+    assert_eq!(reply[0] & 0x7, 4, "a server reply");
+    assert_eq!(&reply[24..32], &[9, 8, 7, 6, 5, 4, 3, 2], "origin echoed");
+}
+
+/// **UDP is DHCP, DNS and NTP, and nothing else.** There is no general UDP NAT
+/// here: anything else the guest sends over UDP — and a port-123 datagram that
+/// is not an NTP request — is counted as unsupported and dropped, which means
+/// QUIC, mDNS and games are unreachable through this backend.
 ///
 /// Written as a test rather than only as a comment because it is the kind of gap
 /// that is otherwise discovered by a user, and because the day a UDP NAT is added

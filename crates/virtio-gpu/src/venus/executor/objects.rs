@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::host::{HostVulkan, Idle};
-use super::limits::{class_of, Class, ContextLimits, Refusal};
+use super::limits::{class_of, table_class, Class, ContextLimits, Refusal};
 use super::policy::GuestDevice;
 use super::timeline::QueueSync;
 use crate::venus::shmem::{Charge, RingPages};
@@ -40,6 +40,10 @@ use crate::venus::shmem::{Charge, RingPages};
 /// guest-sized thing in this crate; past it a create answers
 /// `VK_ERROR_OUT_OF_HOST_MEMORY`, which is what a driver out of room says.
 pub const MAX_OBJECTS_PER_CONTEXT: usize = 1 << 16;
+
+/// Buffer-view ids remembered after the host destroyed them with their buffer
+/// ([`Objects::tombstone_view`]): eight bytes each, so 8 MiB at most.
+pub const MAX_VIEW_TOMBSTONES: usize = 1 << 20;
 
 /// The object types this stage can create.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -910,7 +914,16 @@ pub struct KindTable {
     /// A cell, so a create can reserve while it still holds references into
     /// the table (its device, its physical device's facts).
     reserved: std::cell::RefCell<HashMap<Kind, (Charge, Charge)>>,
+    /// Objects of each kind ever created and ever destroyed, for the census:
+    /// "held 53 902" says a table is full, "created 60 000, destroyed 6 098"
+    /// says whether the guest is destroying them at all.
+    churn: HashMap<Kind, (u64, u64)>,
+    /// Creations since the last periodic census line.
+    since_census: u64,
 }
+
+/// How many creations between two periodic census lines (`debug`).
+const CENSUS_EVERY: u64 = 8192;
 
 impl KindTable {
     /// How many objects of each kind the table holds, most first.
@@ -924,11 +937,31 @@ impl KindTable {
         counts
     }
 
+    /// `kind=held(+created/-destroyed)` for the five most-held kinds.
+    fn census_line(&self) -> String {
+        let mut held: HashMap<Kind, usize> = HashMap::new();
+        for entry in self.map.values() {
+            *held.entry(entry.kind).or_default() += 1;
+        }
+        let mut held: Vec<(Kind, usize)> = held.into_iter().collect();
+        held.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.name().cmp(b.0.name())));
+        held.iter()
+            .take(5)
+            .map(|(kind, n)| {
+                let (made, gone) = self.churn.get(kind).copied().unwrap_or((0, 0));
+                format!("{}={n}(+{made}/-{gone})", kind.name())
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn new(limits: ContextLimits) -> Self {
         Self {
             map: HashMap::new(),
             limits,
             reserved: std::cell::RefCell::new(HashMap::new()),
+            churn: HashMap::new(),
+            since_census: 0,
         }
     }
 
@@ -939,7 +972,7 @@ impl KindTable {
             // physical devices the host has, the queues a device was made
             // with), counted anyway.
             _ => (
-                self.limits.charge_anyway(Class::Objects, 1),
+                self.limits.charge_anyway(table_class(kind), 1),
                 class_of(kind).map_or_else(Charge::none, |c| self.limits.charge_anyway(c, 1)),
             ),
         };
@@ -953,15 +986,29 @@ impl KindTable {
                 extra_class: None,
             },
         );
+        self.churn.entry(kind).or_default().0 += 1;
+        self.since_census += 1;
+        if self.since_census >= CENSUS_EVERY {
+            self.since_census = 0;
+            tracing::debug!(held = self.map.len(), census = %self.census_line(), "venus objects");
+        }
+    }
+
+    fn gone(&mut self, kind: Kind) {
+        self.churn.entry(kind).or_default().1 += 1;
     }
 
     fn remove(&mut self, id: &u64) -> Option<Kind> {
-        self.map.remove(id).map(|entry| entry.kind)
+        let kind = self.map.remove(id).map(|entry| entry.kind)?;
+        self.gone(kind);
+        Some(kind)
     }
 
     /// Take `id`'s entry out, charges and all ([`Held`]).
     fn take(&mut self, id: &u64) -> Option<Entry> {
-        self.map.remove(id)
+        let entry = self.map.remove(id)?;
+        self.gone(entry.kind);
+        Some(entry)
     }
 
     fn get(&self, id: &u64) -> Option<&Kind> {
@@ -998,6 +1045,14 @@ pub struct Objects<H: HostVulkan> {
     memories: HashMap<u64, MemoryObject<H>>,
     buffers: HashMap<u64, BufferObject<H>>,
     buffer_views: HashMap<u64, ViewObject<H::BufferView>>,
+    /// Buffer views destroyed with their buffer ([`Self::views_of_buffer`]),
+    /// remembered so the guest's own `vkDestroyBufferView`, if it ever comes,
+    /// is the no-op it would be on a driver — oldest forgotten first, at
+    /// [`MAX_VIEW_TOMBSTONES`].
+    view_tombstones: (
+        std::collections::VecDeque<u64>,
+        std::collections::HashSet<u64>,
+    ),
     image_views: HashMap<u64, ViewObject<H::ImageView>>,
     raw: HashMap<u64, RawObject>,
     /// Destroyed by the guest, possibly still in use on the GPU, in the
@@ -1026,6 +1081,7 @@ impl<H: HostVulkan> Objects<H> {
             memories: HashMap::new(),
             buffers: HashMap::new(),
             buffer_views: HashMap::new(),
+            view_tombstones: Default::default(),
             image_views: HashMap::new(),
             raw: HashMap::new(),
             doomed: Vec::new(),
@@ -1146,6 +1202,12 @@ impl<H: HostVulkan> Objects<H> {
         self.kinds.census()
     }
 
+    /// [`Self::census`] with each kind's lifetime churn, one line.
+    #[must_use]
+    pub fn census_line(&self) -> String {
+        self.kinds.census_line()
+    }
+
     /// The context's shares of every cap ([`super::limits`]).
     #[must_use]
     pub fn limits(&self) -> &ContextLimits {
@@ -1172,7 +1234,7 @@ impl<H: HostVulkan> Objects<H> {
         let mut reserved = self.kinds.reserved.borrow_mut();
         match reserved.get_mut(&kind) {
             Some((object, class)) => {
-                limits.grow(Class::Objects, object, count)?;
+                limits.grow(table_class(kind), object, count)?;
                 if let Some(of) = class_of(kind) {
                     if let Err(refused) = limits.grow(of, class, count) {
                         object.shrink_to(object.amount().saturating_sub(count));
@@ -1181,7 +1243,7 @@ impl<H: HostVulkan> Objects<H> {
                 }
             }
             None => {
-                let object = limits.charge(Class::Objects, count)?;
+                let object = limits.charge(table_class(kind), count)?;
                 let class = match class_of(kind) {
                     Some(of) => limits.charge(of, count)?,
                     None => Charge::none(),
@@ -1741,6 +1803,48 @@ impl<H: HostVulkan> Objects<H> {
     // -------------------------------------------------------------- views
 
     /// Bind buffer view `id`. The caller has checked the id.
+    /// The buffer views of `buffer` on `device`: what a `vkDestroyBuffer`
+    /// takes with it. A view of a destroyed buffer can never be used again,
+    /// and a guest that never destroys it explicitly — Mesa's Zink, which
+    /// caches a view per buffer object and lets the object go — would
+    /// otherwise fill the object table with them: 62 882 views against 88
+    /// buffers after seven minutes of video in Firefox (2026-10-12), and the
+    /// next create refused at the cap killed the browser's context.
+    #[must_use]
+    pub fn views_of_buffer(&self, device: u64, buffer: u64) -> Vec<u64> {
+        self.buffer_views
+            .iter()
+            .filter(|(_, v)| v.device == device && v.parent == buffer)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Remembers buffer view `id` as destroyed by the host on the guest's
+    /// behalf.
+    pub fn tombstone_view(&mut self, id: u64) {
+        let (order, set) = &mut self.view_tombstones;
+        if set.insert(id) {
+            order.push_back(id);
+            while order.len() > MAX_VIEW_TOMBSTONES {
+                if let Some(old) = order.pop_front() {
+                    set.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// Whether `id` was a buffer view the host destroyed with its buffer;
+    /// forgets it, since a destroy is answered once.
+    pub fn take_view_tombstone(&mut self, id: u64) -> bool {
+        let (order, set) = &mut self.view_tombstones;
+        if set.remove(&id) {
+            order.retain(|old| *old != id);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn insert_buffer_view(&mut self, id: u64, view: ViewObject<H::BufferView>) {
         self.kinds.insert(id, Kind::BufferView);
         self.buffer_views.insert(id, view);

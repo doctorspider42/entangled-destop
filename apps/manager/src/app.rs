@@ -195,6 +195,26 @@ pub struct MoveDiskState {
     pub events: Option<mpsc::Receiver<MoveEvent>>,
 }
 
+/// Messages from the clone worker thread.
+pub enum CloneEvent {
+    Progress(u64, u64),
+    Done(Box<Result<disk_image::CloneOutcome, String>>),
+}
+
+/// "Clone this machine" dialog state.
+pub struct CloneVmState {
+    /// The machine being cloned.
+    pub source: String,
+    pub profile: PathBuf,
+    /// The new machine's name as typed.
+    pub name: String,
+    pub error: Option<String>,
+    /// `(copied, total)` while the worker runs.
+    pub progress: Option<(u64, u64)>,
+    pub running: bool,
+    pub events: Option<mpsc::Receiver<CloneEvent>>,
+}
+
 /// "Grow this disk" dialog state. Shrinking is not offered at all — the CLI
 /// refuses it because it would destroy whatever the guest put at the end of the
 /// image, and an action that can only fail does not belong in a GUI.
@@ -257,6 +277,7 @@ pub enum Modal {
     AttachDisk(AttachDiskState),
     EditVm(EditVmState),
     MoveDisk(MoveDiskState),
+    CloneVm(CloneVmState),
     ResizeDisk(ResizeDiskState),
     DeleteSnapshot(DeleteSnapshotState),
     DiscardSnapshot(DiscardSnapshotState),
@@ -326,6 +347,9 @@ pub enum Action {
     // ---- VM editor ---------------------------------------------------------
     AskEditVm(String),
     SubmitEditVm,
+    /// Copy a stopped machine (disks, NVRAM, profile) under a new name.
+    AskCloneVm(String),
+    SubmitCloneVm,
     // ---- Move to another drive ----------------------------------------------
     AskMoveDisk(PathBuf),
     SubmitMoveDisk,
@@ -2423,6 +2447,172 @@ impl ManagerApp {
         }
     }
 
+    /// The first free `<name>-N`: no machine, profile or disk by that name.
+    fn suggest_clone_name(&self, source: &str, profile: &Path) -> String {
+        let dir = profile.parent().unwrap_or(Path::new("."));
+        // `ubuntu-2` clones as `ubuntu-3`, not `ubuntu-2-2`.
+        let base = match source.rsplit_once('-') {
+            Some((stem, n)) if !stem.is_empty() && n.parse::<u32>().is_ok() => stem,
+            _ => source,
+        };
+        (2..1000)
+            .map(|n| format!("{base}-{n}"))
+            .find(|name| {
+                self.vm(name).is_none()
+                    && !dir.join(format!("{name}.toml")).exists()
+                    && !dir.join(format!("{name}.raw")).exists()
+            })
+            .unwrap_or_else(|| format!("{source}-copy"))
+    }
+
+    fn ask_clone_vm(&mut self, name: &str) {
+        if self.is_busy(name) {
+            self.toast(
+                ToastLevel::Warn,
+                format!("'{name}' is running — stop it before cloning"),
+            );
+            return;
+        }
+        let Some(vm) = self.vm(name) else {
+            self.toast(ToastLevel::Error, format!("'{name}' is gone from disk"));
+            return;
+        };
+        let profile = vm.profile_path.clone();
+        let suggested = self.suggest_clone_name(name, &profile);
+        self.modal = Modal::CloneVm(CloneVmState {
+            source: name.to_string(),
+            profile,
+            name: suggested,
+            error: None,
+            progress: None,
+            running: false,
+            events: None,
+        });
+    }
+
+    fn submit_clone_vm(&mut self) {
+        let Modal::CloneVm(state) = &self.modal else {
+            return;
+        };
+        if state.running {
+            return;
+        }
+        let source = state.source.clone();
+        let profile = state.profile.clone();
+        let new_name = state.name.trim().to_string();
+        let fail = |app: &mut Self, message: String| {
+            if let Modal::CloneVm(state) = &mut app.modal {
+                state.error = Some(message);
+            }
+        };
+        if let Err(e) = discovery::validate_name(&new_name) {
+            fail(self, e);
+            return;
+        }
+        if self.vm(&new_name).is_some() {
+            fail(self, format!("a machine named '{new_name}' already exists"));
+            return;
+        }
+        // The machine could have started since the dialog opened.
+        if self.is_busy(&source) {
+            fail(self, format!("'{source}' is running — stop it first"));
+            return;
+        }
+        if self.mock_mode {
+            self.modal = Modal::None;
+            self.toast(
+                ToastLevel::Success,
+                format!("mock: would clone '{source}' as '{new_name}'"),
+            );
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel::<CloneEvent>();
+        let waker = Arc::clone(&self.waker);
+        let builder = std::thread::Builder::new().name("vm-clone".to_string());
+        let spawned = builder.spawn(move || {
+            let progress_tx = tx.clone();
+            let progress_waker = Arc::clone(&waker);
+            // Whole-percent changes only, as the move does.
+            let mut last_percent = u64::MAX;
+            let mut progress = move |done: u64, total: u64| {
+                let percent = (done * 100).checked_div(total).unwrap_or(100);
+                if percent != last_percent {
+                    last_percent = percent;
+                    let _ = progress_tx.send(CloneEvent::Progress(done, total));
+                    progress_waker();
+                }
+            };
+            let result = disk_image::clone_machine(&profile, &new_name, &mut progress)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(CloneEvent::Done(Box::new(result)));
+            waker();
+        });
+        match spawned {
+            Ok(_) => {
+                if let Modal::CloneVm(state) = &mut self.modal {
+                    state.running = true;
+                    state.error = None;
+                    state.progress = Some((0, 0));
+                    state.events = Some(rx);
+                }
+            }
+            Err(e) => fail(self, format!("cannot start the clone worker: {e}")),
+        }
+    }
+
+    /// Drains the clone worker's channel; called once per frame.
+    fn collect_clone_events(&mut self) {
+        let Modal::CloneVm(state) = &mut self.modal else {
+            return;
+        };
+        let Some(events) = &state.events else { return };
+        let mut finished: Option<Result<disk_image::CloneOutcome, String>> = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                CloneEvent::Progress(done, total) => state.progress = Some((done, total)),
+                CloneEvent::Done(result) => finished = Some(*result),
+            }
+        }
+        match finished {
+            None => {}
+            Some(Ok(outcome)) => {
+                let source = state.source.clone();
+                let name = state.name.trim().to_string();
+                // The clone runs where its source runs: the backend is manager
+                // state, so the profile copy could not carry it.
+                let backend = self.backend_of(&source);
+                self.settings.set_backend_for(&name, backend);
+                self.persist_settings_quietly();
+                self.modal = Modal::None;
+                self.toast(
+                    ToastLevel::Success,
+                    format!(
+                        "cloned '{source}' as '{name}' — {} of data copied and verified",
+                        discovery::format_bytes(outcome.data_bytes)
+                    ),
+                );
+                if outcome.dropped_forwards > 0 {
+                    self.toast(
+                        ToastLevel::Warn,
+                        format!(
+                            "'{name}' has no port forwards — {} host port(s) stay with \
+                             '{source}'; add others in Configure",
+                            outcome.dropped_forwards
+                        ),
+                    );
+                }
+                self.request_scan(true);
+            }
+            Some(Err(message)) => {
+                state.running = false;
+                state.events = None;
+                state.progress = None;
+                state.error = Some(message);
+            }
+        }
+    }
+
     /// Drains the move worker's channel; called once per frame.
     fn collect_move_events(&mut self) {
         let Modal::MoveDisk(state) = &mut self.modal else {
@@ -2940,7 +3130,9 @@ impl ManagerApp {
             Action::CloseModal => {
                 // A move in flight owns its modal: the copy is running on the
                 // worker and closing the dialog would orphan its progress.
-                if !matches!(&self.modal, Modal::MoveDisk(state) if state.running) {
+                let copying = matches!(&self.modal, Modal::MoveDisk(state) if state.running)
+                    || matches!(&self.modal, Modal::CloneVm(state) if state.running);
+                if !copying {
                     self.modal = Modal::None;
                 }
             }
@@ -3013,6 +3205,8 @@ impl ManagerApp {
             } => self.detach_disk(&vm, &profile, &declared),
             Action::Reveal(path) => self.reveal(&path),
             Action::AskEditVm(name) => self.ask_edit_vm(&name),
+            Action::AskCloneVm(name) => self.ask_clone_vm(&name),
+            Action::SubmitCloneVm => self.submit_clone_vm(),
             Action::SubmitEditVm => self.submit_edit_vm(),
             Action::AskMoveDisk(path) => self.ask_move_disk(&path),
             Action::SubmitMoveDisk => self.submit_move_disk(),
@@ -3161,6 +3355,7 @@ impl eframe::App for ManagerApp {
         self.collect_update_events();
         self.collect_wsl_events();
         self.collect_move_events();
+        self.collect_clone_events();
         self.collect_engine_version();
         self.collect_picker();
         self.collect_diagnostics();

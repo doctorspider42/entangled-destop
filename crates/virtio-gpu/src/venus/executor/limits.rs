@@ -104,10 +104,17 @@ pub enum Class {
     HeldSubmits,
     /// Wire bytes of those held submits.
     HeldBytes,
+    /// `VkBufferView`s and `VkImageView`s: counted here *instead of*
+    /// [`Class::Objects`] ([`table_class`]). A view is a few dozen bytes of
+    /// driver state, and Mesa's Zink holds one per distinct (buffer, format,
+    /// offset, range) it ever used: Firefox playing video made 62 867 of them
+    /// on 91 buffers in seven minutes (2026-10-12), and under the shared
+    /// object cap its next `vkCreateBuffer` was refused and its context died.
+    Views,
 }
 
 /// How many classes there are.
-pub const CLASS_COUNT: usize = 20;
+pub const CLASS_COUNT: usize = 21;
 
 /// Every class, in [`Class::index`] order.
 pub const CLASSES: [Class; CLASS_COUNT] = [
@@ -131,6 +138,7 @@ pub const CLASSES: [Class; CLASS_COUNT] = [
     Class::DecodeBytes,
     Class::HeldSubmits,
     Class::HeldBytes,
+    Class::Views,
 ];
 
 const MIB: u64 = 1 << 20;
@@ -161,6 +169,7 @@ impl Class {
             Self::DecodeBytes => 17,
             Self::HeldSubmits => 18,
             Self::HeldBytes => 19,
+            Self::Views => 20,
         }
     }
 
@@ -188,6 +197,7 @@ impl Class {
             Self::DecodeBytes => "decode_bytes",
             Self::HeldSubmits => "held_submits",
             Self::HeldBytes => "held_bytes",
+            Self::Views => "views",
         }
     }
 
@@ -230,6 +240,9 @@ impl Class {
             // (`super::hold`'s module docs have the numbers).
             Self::HeldSubmits => (1024, 4096),
             Self::HeldBytes => (16 * MIB, 64 * MIB),
+            // Sixteen times the object cap per context: hours of a leaking
+            // Zink rather than minutes, still a bound on a hostile guest.
+            Self::Views => (1 << 20, 1 << 22),
         }
     }
 
@@ -246,8 +259,18 @@ impl Class {
     }
 }
 
+/// The class that counts table *entries* of `kind`: [`Class::Views`] for the
+/// two view kinds, [`Class::Objects`] for everything else.
+#[must_use]
+pub const fn table_class(kind: Kind) -> Class {
+    match kind {
+        Kind::BufferView | Kind::ImageView => Class::Views,
+        _ => Class::Objects,
+    }
+}
+
 /// The class a table entry of `kind` counts under besides
-/// [`Class::Objects`], if it has one.
+/// [`table_class`], if it has one.
 #[must_use]
 pub const fn class_of(kind: Kind) -> Option<Class> {
     match kind {
@@ -701,6 +724,17 @@ mod tests {
             Class::Objects.defaults().0,
             super::super::objects::MAX_OBJECTS_PER_CONTEXT as u64
         );
+    }
+
+    /// Views count under their own, larger cap and not under the object cap a
+    /// leaking Zink filled; every other kind still counts as an object.
+    #[test]
+    fn views_have_a_class_of_their_own() {
+        assert_eq!(table_class(Kind::BufferView), Class::Views);
+        assert_eq!(table_class(Kind::ImageView), Class::Views);
+        assert_eq!(table_class(Kind::Buffer), Class::Objects);
+        assert_eq!(table_class(Kind::DescriptorSet), Class::Objects);
+        assert!(Class::Views.defaults().0 >= 16 * Class::Objects.defaults().0);
     }
 
     #[test]

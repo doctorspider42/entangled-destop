@@ -755,6 +755,13 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             560.0,
             |ui| move_disk_body(ui, state, actions),
         ),
+        Modal::CloneVm(state) => frame(
+            ctx,
+            "clone-vm",
+            &format!("Clone {}", state.source),
+            520.0,
+            |ui| clone_vm_body(ui, state, actions),
+        ),
         Modal::ResizeDisk(state) => frame(
             ctx,
             "resize-disk",
@@ -1635,6 +1642,14 @@ fn edit_display_gpu(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
             ui.add(egui::DragValue::new(&mut form.display_height).range(200..=4320));
         },
     );
+    ui::form_row(ui, "", "", |ui, _| {
+        ui.checkbox(&mut form.follow_window, "Follow the window's size")
+            .on_hover_text(
+                "Resize, maximise or go fullscreen and the guest's desktop becomes \
+                     exactly the window's size, pixel for pixel. Off keeps the size above \
+                     whatever the window does, and scales the image instead.",
+            );
+    });
     ui.add_space(6.0);
     ui::form_row(
         ui,
@@ -2238,6 +2253,86 @@ fn move_disk_body(
                 "The copy is running; it finishes or rolls back on its own"
             } else {
                 "Close without moving anything"
+            })
+            .clicked()
+        {
+            actions.push(Action::CloseModal);
+        }
+    });
+}
+
+/// Cloning a machine: the new name, what gets copied, and the same progress
+/// bar the move uses.
+fn clone_vm_body(
+    ui: &mut egui::Ui,
+    state: &mut crate::app::CloneVmState,
+    actions: &mut Vec<Action>,
+) {
+    ui::form_scope(ui);
+    ui.label(ui::dim(
+        "Copies every writable disk next to the original (only the data it holds \
+         travels, and the copy is verified), the UEFI boot entries and the settings. \
+         The new machine gets its own network address; port forwards stay with the \
+         original. Saved sessions are not copied — the clone starts with a cold boot.",
+    ));
+    ui.add_space(12.0);
+    ui::form_row(
+        ui,
+        "NAME",
+        "The new machine's name — also its profile's and disks' file names. Inside the \
+         guest it is the same installation: same hostname and accounts.",
+        |ui, field_w| {
+            ui.add_enabled(
+                !state.running,
+                egui::TextEdit::singleline(&mut state.name).desired_width(field_w),
+            );
+        },
+    );
+    if let Some((done, total)) = state.progress {
+        ui.add_space(12.0);
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 14.0), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, egui::CornerRadius::same(7), theme::INSET);
+        let fraction = if total == 0 {
+            0.0
+        } else {
+            (done as f32 / total as f32).clamp(0.0, 1.0)
+        };
+        if fraction > 0.0 {
+            let fill = egui::Rect::from_min_size(
+                rect.min,
+                Vec2::new(rect.width() * fraction, rect.height()),
+            );
+            theme::gradient_rect(
+                painter,
+                fill,
+                theme::CYAN.gamma_multiply(0.9),
+                theme::VIOLET.gamma_multiply(0.9),
+            );
+        }
+        ui.label(ui::faint(format!(
+            "copied {} / {}",
+            format_bytes(done),
+            format_bytes(total)
+        )));
+    }
+    if let Some(error) = &state.error {
+        ui.add_space(8.0);
+        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+    }
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        let ready = !state.running && !state.name.trim().is_empty();
+        let label = if state.running { "Cloning…" } else { "Clone" };
+        if ui::ghost_button(ui, label, ready, theme::VIOLET).clicked() {
+            actions.push(Action::SubmitCloneVm);
+        }
+        if ui::ghost_button(ui, "Cancel", !state.running, theme::TEXT_DIM)
+            .on_hover_text(if state.running {
+                "The copy is running; it finishes or rolls back on its own"
+            } else {
+                "Close without cloning anything"
             })
             .clicked()
         {

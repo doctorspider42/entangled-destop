@@ -203,15 +203,31 @@ pub struct DisplayHandle {
     /// presentation): the window fills it when its GPU is up, a headless
     /// display with [`Self::attach_offscreen_gpu`].
     shared: SharedSlot,
+    /// The resolution the window asks the guest for ([`crate::resize`]).
+    resolution: crate::resize::ResolutionRequest,
 }
 
 impl DisplayHandle {
-    pub(crate) fn new(scanout: SharedScanout, waker: Waker, shared: SharedSlot) -> Self {
+    pub(crate) fn new(
+        scanout: SharedScanout,
+        waker: Waker,
+        shared: SharedSlot,
+        resolution: crate::resize::ResolutionRequest,
+    ) -> Self {
         Self {
             scanout,
             waker,
             shared,
+            resolution,
         }
+    }
+
+    /// Asks the guest for a `width`×`height` desktop, as the window does when
+    /// it is resized ([`crate::resize`]); the control channel's `display`
+    /// command and tests use it directly. Clamped to what a scanout can be.
+    pub fn request_guest_resolution(&self, width: u32, height: u32) -> bool {
+        let (width, height) = crate::resize::guest_size_for_window(width, height);
+        self.resolution.request(width, height)
     }
 
     /// A handle with no window behind it: updates and screenshots work, wakeups
@@ -223,7 +239,12 @@ impl DisplayHandle {
     /// open a window.
     pub fn detached(width: u32, height: u32) -> Result<Self, DisplayError> {
         let scanout = Arc::new(Mutex::new(Scanout::new(width, height)?));
-        Ok(Self::new(scanout, Waker::detached(), SharedSlot::default()))
+        Ok(Self::new(
+            scanout,
+            Waker::detached(),
+            SharedSlot::default(),
+            crate::resize::ResolutionRequest::default(),
+        ))
     }
 
     /// Gives a display with no window a GPU of its own for **shared
@@ -459,6 +480,16 @@ impl DisplayHandle {
 impl virtio_gpu::ScanoutSink for DisplayHandle {
     fn resolution(&self) -> (u32, u32) {
         DisplayHandle::resolution(self)
+    }
+
+    fn preferred_resolution(&self) -> (u32, u32) {
+        self.resolution
+            .preferred()
+            .unwrap_or_else(|| DisplayHandle::resolution(self))
+    }
+
+    fn set_display_listener(&self, listener: virtio_gpu::DisplayListener) {
+        self.resolution.set_listener(listener);
     }
 
     fn set_resolution(&self, width: u32, height: u32) -> Result<(), virtio_gpu::SinkError> {

@@ -1013,6 +1013,67 @@ fn a_texel_buffer_view_is_inside_a_bound_buffer() {
     fatal_on(&mut h, &view(BUFFER_VIEW + 1, SIZE - 256, 512));
 }
 
+/// A buffer's views go with it (`Objects::views_of_buffer`): Zink in a guest
+/// never destroys the views of buffers it lets go, and they filled the table.
+/// The guest's own later destroy of such a view is the no-op it would be on
+/// a driver; a destroy of a view that never existed is still refused.
+#[test]
+fn a_buffers_views_go_with_it_and_a_late_destroy_of_one_is_accepted() {
+    let (mut h, host) = standard();
+    h.call(&create_buffer(DEVICE, BUFFER, buffer_info(SIZE, 0x4)))
+        .expect("buffer");
+    h.send(&allocate(
+        DEVICE,
+        MEMORY,
+        SIZE,
+        DEVICE_LOCAL_TYPE,
+        Vec::new(),
+    ))
+    .expect("allocate");
+    h.send(&bind_buffers(DEVICE, &[(BUFFER, MEMORY, 0)]))
+        .expect("bind");
+    let view = |id: u64, offset: u64| {
+        Command::CreateBufferView(CreateBufferViewArgs {
+            device: VkDevice(DEVICE),
+            p_create_info: Some(VkBufferViewCreateInfo {
+                p_next: Vec::new(),
+                flags: 0,
+                buffer: VkBuffer(BUFFER),
+                format: RGBA8,
+                offset,
+                range: 256,
+            }),
+            p_view: Some(VkBufferView(id)),
+            ret: 0,
+        })
+    };
+    for (n, id) in [BUFFER_VIEW, BUFFER_VIEW + 1].into_iter().enumerate() {
+        let Command::CreateBufferView(v) = h.call(&view(id, 256 * n as u64)).expect("view") else {
+            panic!("wrong reply")
+        };
+        assert_eq!(v.ret, VK_SUCCESS);
+    }
+    assert_eq!(host.live("buffer view"), 2);
+
+    h.send(&destroy_buffer(DEVICE, BUFFER))
+        .expect("destroy the buffer");
+    assert_eq!(
+        host.live("buffer view"),
+        0,
+        "the views went with their buffer"
+    );
+
+    let destroy_view = |id: u64| {
+        Command::DestroyBufferView(DestroyBufferViewArgs {
+            device: VkDevice(DEVICE),
+            buffer_view: VkBufferView(id),
+        })
+    };
+    h.send(&destroy_view(BUFFER_VIEW))
+        .expect("a late destroy of a view that went with its buffer");
+    fatal_on(&mut h, &destroy_view(BUFFER_VIEW + 7));
+}
+
 #[test]
 fn the_device_level_requirements_are_checked_and_filtered_like_the_objects() {
     let (mut h, _) = standard();
