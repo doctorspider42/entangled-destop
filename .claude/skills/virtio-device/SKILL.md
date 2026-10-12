@@ -217,6 +217,9 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_net::usernet::MAX_FLOWS` | 64 | concurrent guest TCP connections the NAT terminates; each is two `FLOW_BUFFER` (256 KiB) socket buffers, 32 MiB at the cap and, briefly, one connect thread | `usernet::tcp::tests::{the_flow_count_is_capped, a_full_flow_table_refuses_politely_and_then_recovers}`, fuzz target `usernet_frames` |
 | `virtio_net::usernet::MAX_SEGMENTS_PER_POLL` | 64 | datagrams one `TcpNat::poll` emits, and never more than the room left in the guest's queue (`poll_with_budget`); bounded work per pump tick | `usernet::tcp::tests::a_bulk_download_is_not_held_to_one_segment_a_poll` |
 | `virtio_net::usernet::FLOW_IDLE_TIMEOUT` / `FLOW_KEEPALIVE` | 60 s / 15 s | how long a flow may go unanswered by the guest before it is aborted and its slot returned. Not a size bound but a *liveness* one, and load-bearing for the same reason: a guest that stops existing (reboot, reset, pause) otherwise holds all 64 for the life of the process | `usernet::tcp::tests::{a_flow_the_guest_abandons_is_retired_by_the_keepalive, a_full_flow_table_refuses_politely_and_then_recovers}` |
+| `virtio_net::usernet::udp::MAX_UDP_FLOWS` / `MAX_PEERS_PER_FLOW` / `MAX_FORWARD_PEERS` | 128 / 32 / 64 | guest UDP source ports with a host socket; peers one flow accepts answers from; host peers one inbound UDP forward maps | `usernet::udp::tests::the_flow_table_is_bounded`, `a_stranger_cannot_open_a_conversation` |
+| `virtio_net::usernet::udp::UDP_IDLE_TIMEOUT` / `MAX_DATAGRAMS_PER_POLL` | 90 s / 64 | an idle UDP flow is closed; datagrams one poll delivers (and never past the guest queue's room) | `usernet::udp::tests::*` |
+| `virtio_net::usernet::ping::MAX_IN_FLIGHT` / `WORKERS` / `ECHO_TIMEOUT` | 32 / 2 / 3 s | echoes past the gateway queued or in progress (excess dropped, `pings_dropped`); the threads that block on them; how long one waits | `usernet::ping::tests::the_queue_is_bounded`, `usernet::tests::a_ping_of_the_host_itself_is_refused` |
 | `virtio_net::usernet::MAX_QUEUED_FRAMES` | 256 | frames queued for a guest that has stopped draining its RX queue | `usernet::tests::the_guest_queue_is_bounded`, fuzz target `usernet_frames` |
 | `virtio_net::usernet::MAX_DNS_QUERIES` / `DNS_QUERY_TTL` | 64 / 5 s | outstanding forwarded DNS queries, and how long one is remembered — the guest picks how many it sends | `usernet::tests::a_guest_dns_query_is_forwarded_and_its_answer_comes_back` (the round trip), oldest-first eviction in `DnsRelay::forward` |
 | `virtio_sound::stream::MIN_PERIOD_BYTES` / `MAX_PERIOD_BYTES` | 64 / 64 KiB | one PCM period — and therefore both the payload of one playback message and the **room one capture buffer may grant** | `virtio_sound::stream::tests::period_and_buffer_geometry_is_bounded_and_never_divides_by_zero`, `snd_queue::{set_params_refuses_everything_the_device_never_advertised, capture_messages_the_stream_cannot_accept_are_answered_not_filled}` |
@@ -763,10 +766,18 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
     52 MB/s (16 KiB and the loop: 9.9 — one buffer per tick). The guest's own
     `ss -ti` (`segs_in`, `rcv_rtt`) is what gave the per-tick ceiling away:
     ~1300 segments/s is a packet-rate limit, not a bandwidth one.
-  - **UDP is DHCP, DNS and NTP and nothing else.** NTP is answered by the NAT
-    itself from the host's clock (`usernet::ntp`). There is no general UDP NAT,
-    so QUIC and mDNS do not work through this backend; anything else on UDP is
-    counted as `dropped_unsupported`. A test says so, and it is the test that
+  - **UDP has its own NAT** (`usernet::udp`, 2026-10-13). DHCP, DNS and NTP
+    are still answered by the router itself; every other datagram goes out
+    through one host socket per guest source port (endpoint-independent
+    mapping). Answers are address-and-port restricted: only from a peer that
+    flow has sent to. The host-local refusals match the TCP NAT's. Inbound
+    `udp:` forwards present each host peer as `gateway:port`. mDNS (multicast)
+    stays refused. The fuzz harness's router has an *offline* UDP NAT; keep it
+    that way (`offline.rs`).
+  - **Pings past the gateway use an unprivileged host echo** (`usernet::ping`):
+    `IcmpSendEcho` on Windows, and on Linux an `IPPROTO_ICMP` datagram socket.
+    They run on worker threads behind a bounded queue. The offline router sets
+    `ping_enabled = false`, so the fuzzer never pings anything. A test says so, and it is the test that
     has to change the day one is added.
   - **DNS answers are whatever size the upstream sends.** The relay reads the
     whole datagram (it used to read 512 bytes, which on Windows *discards* a

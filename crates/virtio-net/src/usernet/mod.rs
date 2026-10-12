@@ -62,7 +62,9 @@ pub mod hostdns;
 pub mod ntp;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod offline;
+pub mod ping;
 mod tcp;
+pub mod udp;
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -224,6 +226,8 @@ pub struct UserNetStats {
     pub dns_queries: AtomicU64,
     pub dns_replies: AtomicU64,
     pub tcp_flows: AtomicU64,
+    /// Guest datagrams the UDP NAT carried out (anything but DHCP, DNS, NTP).
+    pub udp_datagrams: AtomicU64,
 }
 
 impl UserNetStats {
@@ -511,6 +515,13 @@ struct Router {
     dhcp: dhcp::DhcpServer,
     dns: DnsRelay,
     tcp: TcpNat,
+    udp: udp::UdpNat,
+    /// Pings past the gateway ([`ping`]), started on the first one.
+    ping: Option<ping::Pinger>,
+    /// When the guest last pinged past the gateway: answers may still come.
+    last_ping: Option<Instant>,
+    /// `false` in the fuzz harness's offline router: no echo leaves.
+    ping_enabled: bool,
     /// The guest's MAC, learned from the first frame it sends. Needed to address
     /// anything *to* it, and learned rather than configured because the device's
     /// MAC is chosen by whoever built the VM.
@@ -523,6 +534,10 @@ impl Router {
             dhcp: dhcp::DhcpServer::new(config.gateway, config.guest, config.netmask, config.lease),
             dns: DnsRelay::new(config.dns_upstream, config.host_resolver),
             tcp: TcpNat::new(config),
+            udp: udp::UdpNat::new(config),
+            ping: None,
+            last_ping: None,
+            ping_enabled: true,
             guest_mac: None,
             config,
         }
@@ -673,6 +688,15 @@ impl Router {
                 return;
             }
         }
+        // Everything else goes through the UDP NAT ([`udp`]).
+        if self.udp.carry(
+            udp.src_port,
+            SocketAddrV4::new(ip.dst_addr, udp.dst_port),
+            data,
+        ) {
+            UserNetStats::bump(&stats.udp_datagrams);
+            return;
+        }
         UserNetStats::bump(&stats.dropped_unsupported);
     }
 
@@ -724,12 +748,6 @@ impl Router {
     /// is the first thing anybody does when a guest's network looks wrong, and an
     /// unanswered one sends them looking in the wrong place.
     fn handle_icmp(&mut self, ip: &Ipv4Repr, payload: &[u8], out: &ToGuest, stats: &UserNetStats) {
-        if ip.dst_addr != self.config.gateway {
-            // Pinging through the NAT would need a host raw socket, which needs
-            // privileges on both hosts. Out of scope, and counted so it is visible.
-            UserNetStats::bump(&stats.dropped_unsupported);
-            return;
-        }
         let caps = ChecksumCapabilities::default();
         let Ok(packet) = Icmpv4Packet::new_checked(payload) else {
             UserNetStats::bump(&stats.dropped_malformed);
@@ -744,17 +762,70 @@ impl Router {
             UserNetStats::bump(&stats.dropped_unsupported);
             return;
         };
+        if ip.dst_addr != self.config.gateway {
+            // Past the gateway: an unprivileged echo from the host ([`ping`]),
+            // never to an address on the host itself.
+            let dst = ip.dst_addr;
+            let host_local = self.config.is_local(dst)
+                || dst.is_loopback()
+                || dst.is_unspecified()
+                || dst.is_broadcast()
+                || dst.is_multicast();
+            if host_local || !self.ping_enabled || data.len() > ping::MAX_ECHO_DATA {
+                UserNetStats::bump(&stats.dropped_unsupported);
+                return;
+            }
+            if self.ping.is_none() {
+                self.ping = ping::Pinger::new();
+            }
+            if let Some(pinger) = self.ping.as_mut() {
+                pinger.submit(ping::Echo {
+                    dst,
+                    ident,
+                    seq: seq_no,
+                    data: data.to_vec(),
+                });
+                self.last_ping = Some(Instant::now());
+            }
+            return;
+        }
         let Some(dst_mac) = self.guest_mac else {
             return;
         };
+        self.send_echo_reply(
+            out,
+            stats,
+            dst_mac,
+            self.config.gateway,
+            ip.src_addr,
+            ident,
+            seq_no,
+            data,
+        );
+    }
+
+    /// An ICMP echo reply from `src` to the guest's `dst`.
+    #[allow(clippy::too_many_arguments)]
+    fn send_echo_reply(
+        &self,
+        out: &ToGuest,
+        stats: &UserNetStats,
+        dst_mac: EthernetAddress,
+        src: Ipv4Address,
+        dst: Ipv4Address,
+        ident: u16,
+        seq_no: u16,
+        data: &[u8],
+    ) {
+        let caps = ChecksumCapabilities::default();
         let reply = Icmpv4Repr::EchoReply {
             ident,
             seq_no,
             data,
         };
         let ip_repr = Ipv4Repr {
-            src_addr: self.config.gateway,
-            dst_addr: ip.src_addr,
+            src_addr: src,
+            dst_addr: dst,
             next_header: IpProtocol::Icmp,
             payload_len: reply.buffer_len(),
             hop_limit: 64,
@@ -847,8 +918,38 @@ impl Router {
             let room = MAX_QUEUED_FRAMES.saturating_sub(out.len());
             self.tcp
                 .poll_with_budget(dst_mac, room, &mut |frame| queue(out, stats, frame));
+            let room = MAX_QUEUED_FRAMES.saturating_sub(out.len());
+            let answers: Vec<ping::Echo> = match self.ping.as_mut() {
+                Some(pinger) => std::iter::from_fn(|| pinger.poll()).take(64).collect(),
+                None => Vec::new(),
+            };
+            for echo in answers {
+                self.send_echo_reply(
+                    out,
+                    stats,
+                    dst_mac,
+                    echo.dst,
+                    self.config.guest,
+                    echo.ident,
+                    echo.seq,
+                    &echo.data,
+                );
+            }
+            for datagram in self.udp.poll(room) {
+                self.send_udp(
+                    out,
+                    stats,
+                    dst_mac,
+                    (*datagram.src.ip(), datagram.src.port()),
+                    (self.config.guest, datagram.dst_port),
+                    &datagram.data,
+                );
+            }
         }
-        self.dns.is_busy() || self.tcp.is_busy()
+        let pinging = self
+            .last_ping
+            .is_some_and(|at| at.elapsed() < ping::ECHO_TIMEOUT + Duration::from_secs(1));
+        self.dns.is_busy() || self.tcp.is_busy() || self.udp.is_busy() || pinging
     }
 }
 
@@ -919,6 +1020,44 @@ impl UserNetBackend {
             Ok(mut router) => router.tcp.add_forward(forward),
             Err(_) => Err(std::io::Error::other("the usernet router lock is poisoned")),
         }
+    }
+
+    /// Starts an inbound UDP forward (a `udp:` rule); answers the address
+    /// bound.
+    pub fn forward_udp(&self, forward: PortForward) -> std::io::Result<std::net::SocketAddr> {
+        match self.router.lock() {
+            Ok(mut router) => router.udp.add_forward(forward),
+            Err(_) => Err(std::io::Error::other("the usernet router lock is poisoned")),
+        }
+    }
+
+    /// Guest UDP source ports with a host socket, out of [`udp::MAX_UDP_FLOWS`].
+    pub fn udp_flow_count(&self) -> usize {
+        self.router.lock().map(|r| r.udp.flow_count()).unwrap_or(0)
+    }
+
+    /// Host datagrams dropped (from a sender no guest flow had written to, or
+    /// too large for one frame), and guest flows refused at the limit.
+    pub fn udp_refusals(&self) -> (u64, u64) {
+        self.router
+            .lock()
+            .map(|r| {
+                (
+                    r.udp.dropped_unsolicited() + r.udp.dropped_oversize(),
+                    r.udp.refused_at_limit(),
+                )
+            })
+            .unwrap_or((0, 0))
+    }
+
+    /// Guest pings past the gateway dropped because [`ping::MAX_IN_FLIGHT`]
+    /// were already waiting.
+    pub fn pings_dropped(&self) -> u64 {
+        self.router
+            .lock()
+            .ok()
+            .and_then(|r| r.ping.as_ref().map(ping::Pinger::dropped))
+            .unwrap_or(0)
     }
 
     pub fn stats(&self) -> &Arc<UserNetStats> {

@@ -47,6 +47,8 @@ impl OfflineNet {
     pub fn with_config(config: UserNetConfig) -> Self {
         let mut router = Router::new(config);
         router.tcp = super::TcpNat::with_access(config, HostAccess::Offline);
+        router.udp = super::udp::UdpNat::with_access(config, HostAccess::Offline);
+        router.ping_enabled = false;
         Self {
             router,
             out: ToGuest::default(),

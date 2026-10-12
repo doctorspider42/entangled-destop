@@ -625,35 +625,39 @@ fn an_ntp_request_is_answered_by_the_server_the_guest_asked() {
     assert_eq!(&reply[24..32], &[9, 8, 7, 6, 5, 4, 3, 2], "origin echoed");
 }
 
-/// **UDP is DHCP, DNS and NTP, and nothing else.** There is no general UDP NAT
-/// here: anything else the guest sends over UDP — and a port-123 datagram that
-/// is not an NTP request — is counted as unsupported and dropped, which means
-/// QUIC, mDNS and games are unreachable through this backend.
-///
-/// Written as a test rather than only as a comment because it is the kind of gap
-/// that is otherwise discovered by a user, and because the day a UDP NAT is added
-/// this test is the one that has to change.
+/// **UDP beyond DHCP, DNS and NTP goes through the UDP NAT** (`udp`, since
+/// 2026-10-13): off-segment destinations are carried — QUIC, games, a port-123
+/// datagram that is not an NTP request — and host-local ones are refused and
+/// counted, as the TCP NAT refuses them. (Until then this test pinned the
+/// opposite: no general UDP at all.) The destinations are TEST-NET-3, so the
+/// datagrams that do leave go nowhere.
 #[test]
-fn udp_other_than_dhcp_and_dns_is_refused_rather_than_forwarded() {
+fn udp_beyond_the_routers_own_services_is_carried_and_host_local_udp_is_refused() {
     let backend = backend();
     let stats = backend.stats();
     let config = *backend.config();
-    for port in [443u16, 123, 5353, 27015] {
+    let send = |dst: Ipv4Address, port: u16| {
         backend
             .write_frame(&eth(
                 UserNetConfig::GATEWAY_MAC,
                 EthernetProtocol::Ipv4,
-                &guest_udp(
-                    config.guest,
-                    Ipv4Address::new(203, 0, 113, 1),
-                    40000,
-                    port,
-                    b"payload",
-                ),
+                &guest_udp(config.guest, dst, 40000, port, b"payload"),
             ))
             .expect("never a host failure");
+    };
+    for port in [443u16, 123, 27015] {
+        send(Ipv4Address::new(203, 0, 113, 1), port);
     }
-    assert_eq!(stats.dropped_unsupported.load(Ordering::Relaxed), 4);
+    assert_eq!(stats.udp_datagrams.load(Ordering::Relaxed), 3);
+    assert_eq!(backend.udp_flow_count(), 1, "one guest port, one flow");
+    for (dst, port) in [
+        (Ipv4Address::new(127, 0, 0, 1), 5353),
+        (config.gateway, 9),
+        (Ipv4Address::new(224, 0, 0, 251), 5353),
+    ] {
+        send(dst, port);
+    }
+    assert_eq!(stats.dropped_unsupported.load(Ordering::Relaxed), 3);
     assert_eq!(stats.dns_queries.load(Ordering::Relaxed), 0);
     assert_eq!(recv(&backend), None, "nothing is answered");
 }
@@ -773,4 +777,50 @@ fn dropping_the_backend_joins_the_pump() {
     std::thread::sleep(Duration::from_millis(30));
     drop(backend);
     assert!(before);
+}
+
+/// A ping past the gateway goes to the host's unprivileged echo
+/// ([`super::ping`]); one aimed at the host itself — loopback, the segment,
+/// broadcast — is refused before any echo is sent.
+#[test]
+fn a_ping_of_the_host_itself_is_refused() {
+    let backend = backend();
+    let config = *backend.config();
+    let stats = backend.stats();
+    let caps = ChecksumCapabilities::default();
+    for dst in [
+        Ipv4Address::new(127, 0, 0, 1),
+        Ipv4Address::new(192, 168, 74, 99),
+        Ipv4Address::BROADCAST,
+    ] {
+        let echo = Icmpv4Repr::EchoRequest {
+            ident: 1,
+            seq_no: 1,
+            data: b"x",
+        };
+        let ip_repr = Ipv4Repr {
+            src_addr: config.guest,
+            dst_addr: dst,
+            next_header: IpProtocol::Icmp,
+            payload_len: echo.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut body = vec![0u8; ip_repr.buffer_len() + ip_repr.payload_len];
+        let mut packet = Ipv4Packet::new_unchecked(&mut body[..]);
+        ip_repr.emit(&mut packet, &caps);
+        echo.emit(
+            &mut Icmpv4Packet::new_unchecked(packet.payload_mut()),
+            &caps,
+        );
+        backend
+            .write_frame(&eth(
+                UserNetConfig::GATEWAY_MAC,
+                EthernetProtocol::Ipv4,
+                &body,
+            ))
+            .expect("a frame is always accepted");
+    }
+    assert_eq!(stats.dropped_unsupported.load(Ordering::Relaxed), 3);
+    assert_eq!(backend.pings_dropped(), 0);
+    assert_eq!(recv(&backend), None);
 }

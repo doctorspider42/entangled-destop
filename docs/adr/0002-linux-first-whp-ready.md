@@ -1063,4 +1063,60 @@ Two of the NAT's open items, closed:
   of `http://127.0.0.1:18000/` reached `python3 -m http.server 8000` in the
   guest and returned its page.
 
-Still open: NTP, IPv6, ICMP past the gateway, UDP forwards.
+Still open: NTP, IPv6, ICMP past the gateway, UDP forwards. (NTP closed the
+same day: `usernet::ntp` answers every request from the host's clock.)
+
+## Amendment, 2026-10-13 — a UDP NAT, and UDP forwards
+
+`virtio_net::usernet::udp`. Every guest datagram the router does not answer
+itself (DHCP, DNS and NTP stay where they were) goes out through one host
+socket per guest source port. That is endpoint-independent mapping: one guest
+socket keeps one host port whoever it talks to, which games and STUN expect.
+Filtering is address-and-port restricted: a host datagram is delivered only if
+that flow has sent to exactly its sender. The host-local refusals are the TCP
+NAT's: the gateway, the segment, loopback, `0.0.0.0`, broadcast and multicast.
+
+Bounds:
+
+| What | Bound |
+|---|---|
+| flows | 128 (`MAX_UDP_FLOWS`) |
+| peers remembered per flow | 32 |
+| idle timeout | 90 s |
+| datagrams delivered per poll | 64, within the guest queue's room |
+| datagram size | refused if it would not fit one guest frame (no fragmentation; QUIC probes below it) |
+
+**Inbound UDP forwards** are `udp:` rules
+(`control_api::PortForwardRule::udp`, `UserNetBackend::forward_udp`). Each host
+peer is given a gateway port from 49152–65535. The guest sees the datagrams
+come from `192.168.74.1:<port>`, and its replies to that address leave through
+the forward's socket to that peer.
+
+The fuzz harness's router gets an offline UDP NAT, so arbitrary guest bytes
+never reach a real socket.
+
+Measured on WHP with the installed Ubuntu desktop:
+
+- A STUN binding request from the guest to `stun.l.google.com:19302` was
+  answered in 11.5 ms, transaction id intact.
+- With `forward = ["udp:127.0.0.1:27015:27015"]`, a host datagram reached a
+  Python echo in the guest as coming from `192.168.74.1:49152`, and the echo
+  came back to the host.
+
+The usernet test that pinned "no UDP beyond the router's own services" now
+pins the NAT instead.
+
+**`ping` past the gateway**, without privileges (`usernet::ping`). A raw ICMP
+socket needs admin rights on Windows and `CAP_NET_RAW` on Linux. Both hosts
+have an unprivileged echo instead:
+
+- Windows: `IcmpSendEcho`.
+- Linux: an `IPPROTO_ICMP` datagram socket, inside `ping_group_range`.
+
+The echo blocks, so it runs on two worker threads behind a 32-deep queue,
+started on the guest's first ping. Excess echoes are dropped and counted
+(`pings_dropped`). Each echo times out after 3 s. Host-local destinations are
+refused, and the reply carries the guest's own identifier, sequence and
+payload. Measured on WHP with the installed Ubuntu desktop: `ping -c 3 1.1.1.1` answered 3 of 3 (9.6–12.3 ms), `ping github.com` 2 of 2 (about 24 ms), and the gateway as before.
+
+Still open: IPv6, ICMP errors (TTL exceeded, so no `traceroute`).

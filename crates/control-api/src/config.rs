@@ -363,17 +363,22 @@ pub struct PortForwardRule {
     pub host_port: u16,
     /// The guest port it reaches.
     pub guest_port: u16,
+    /// A UDP forward (`udp:` prefix) rather than TCP.
+    pub udp: bool,
 }
 
 impl PortForwardRule {
-    /// `[tcp:][ADDRESS:]HOST_PORT:GUEST_PORT`, the address an IPv4 literal or a
-    /// bracketed IPv6 one (`[::1]:2222:22`).
+    /// `[tcp:|udp:][ADDRESS:]HOST_PORT:GUEST_PORT`, the address an IPv4 literal
+    /// or a bracketed IPv6 one (`[::1]:2222:22`).
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim();
-        let body = text.strip_prefix("tcp:").unwrap_or(text);
+        let (udp, body) = match text.strip_prefix("udp:") {
+            Some(body) => (true, body),
+            None => (false, text.strip_prefix("tcp:").unwrap_or(text)),
+        };
         let bad = || {
             format!(
-                "network.forward {text:?} is not [ADDRESS:]HOST_PORT:GUEST_PORT (\"2222:22\", \
+                "network.forward {text:?} is not [udp:][ADDRESS:]HOST_PORT:GUEST_PORT (\"2222:22\", \
                  \"0.0.0.0:8080:80\")"
             )
         };
@@ -397,6 +402,7 @@ impl PortForwardRule {
             bind,
             host_port,
             guest_port,
+            udp,
         })
     }
 
@@ -409,6 +415,9 @@ impl PortForwardRule {
 impl std::fmt::Display for PortForwardRule {
     /// The short form when the address is the default loopback one.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.udp {
+            f.write_str("udp:")?;
+        }
         match self.bind {
             std::net::IpAddr::V4(v4) if v4 == std::net::Ipv4Addr::LOCALHOST => {
                 write!(f, "{}:{}", self.host_port, self.guest_port)
@@ -504,7 +513,11 @@ impl NetworkSection {
         let mut rules: Vec<PortForwardRule> = Vec::with_capacity(self.forward.len());
         for text in &self.forward {
             let rule = PortForwardRule::parse(text).map_err(ConfigError::Invalid)?;
-            if rules.iter().any(|r| r.host_addr() == rule.host_addr()) {
+            // One TCP and one UDP listener may share an address and port.
+            if rules
+                .iter()
+                .any(|r| r.host_addr() == rule.host_addr() && r.udp == rule.udp)
+            {
                 return Err(ConfigError::Invalid(format!(
                     "network.forward listens on {} twice",
                     rule.host_addr()
@@ -1302,6 +1315,14 @@ scale = 1.0
         let v6 = PortForwardRule::parse("[::1]:2222:22").expect("ipv6");
         assert_eq!(v6.host_addr(), "[::1]:2222".parse().unwrap());
         assert_eq!(v6.to_string(), "[::1]:2222:22");
+        let udp = PortForwardRule::parse("udp:0.0.0.0:27015:27015").expect("udp");
+        assert!(udp.udp);
+        assert!(!wide.udp);
+        assert_eq!(udp.to_string(), "udp:0.0.0.0:27015:27015");
+        assert_eq!(
+            PortForwardRule::parse(&udp.to_string()).expect("round trip"),
+            udp
+        );
         for bad in [
             "22",
             "0:22",
@@ -1329,6 +1350,17 @@ scale = 1.0
         assert_eq!(rules.len(), 2);
         let twice = VmConfig::from_toml(&usernet("\"2222:22\", \"127.0.0.1:2222:80\""));
         assert!(twice.expect_err("duplicate").to_string().contains("twice"));
+        // A TCP and a UDP listener on one port are two forwards, not a clash.
+        let both = VmConfig::from_toml(&usernet("\"27015:27015\", \"udp:27015:27015\""));
+        assert_eq!(
+            both.expect("valid")
+                .network
+                .unwrap()
+                .forwards()
+                .unwrap()
+                .len(),
+            2
+        );
         let bad = VmConfig::from_toml(&usernet("\"ssh\""));
         assert!(bad
             .expect_err("bad rule")

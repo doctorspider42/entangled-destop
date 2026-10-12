@@ -834,14 +834,24 @@ guest's router, DHCP server and DNS server. The guest is always
 `192.168.74.15`, leased for an hour, whatever the host's own network looks
 like. Two machines each have their own segment and cannot see each other.
 
-**What works:** outbound TCP to anywhere — the web, `apt`, `git`, `ssh` out —
-DNS (below), inbound TCP through **port forwards** (below), and a ping of
-`192.168.74.1`.
+**What works:**
 
-**What does not:** UDP other than DHCP, DNS and NTP (so no QUIC, which
-browsers fall back from to TCP, and no game traffic), a ping to
-anything past the gateway, IPv6 (the guest has a link-local address only, and
-programs use IPv4), and anything inbound that is not forwarded.
+- outbound TCP to anywhere: the web, `apt`, `git`, `ssh` out;
+- outbound UDP to anywhere: QUIC (HTTP/3), games, voice calls, STUN;
+- DNS and time (below);
+- inbound TCP and UDP through **port forwards** (below);
+- `ping` to anywhere. The host sends the echo for the guest with its ordinary
+  user rights: `IcmpSendEcho` on Windows, and on Linux an ICMP datagram
+  socket. The Linux socket works where `net.ipv4.ping_group_range` includes
+  your group, which is the default on Ubuntu and Fedora.
+
+Answers to the guest's UDP come back only from the address and port it sent
+to. Nothing on the internet can start a UDP conversation with the guest unless
+a forward lets it in.
+
+**What does not:** IPv6 (the guest has a link-local address only, and
+programs use IPv4), `traceroute` (no TTL-exceeded messages come back), and
+anything inbound that is not forwarded.
 
 **What the guest can reach on the host.** Not the host's loopback: a service
 bound to `127.0.0.1` on the host is invisible from the guest, whether it asks
@@ -871,7 +881,7 @@ keeps the host's time. Keep the host's own clock right; the guest follows it.
 ```toml
 [network]
 backend = "usernet"
-forward = ["2222:22", "0.0.0.0:8080:80"]
+forward = ["2222:22", "0.0.0.0:8080:80", "udp:0.0.0.0:27015:27015"]
 ```
 
 `"2222:22"` makes `127.0.0.1:2222` on the host reach port 22 in the guest
@@ -882,6 +892,11 @@ connections from your network too. The guest sees the connection coming from
 when the machine starts and skipped; the machine still starts. The manager's
 editor has the same list under *Network & devices*. TCP only; `tap` machines
 have their own address on your network and need no forwards.
+
+`udp:` in front makes a forward UDP, for a game server or a voice relay
+running in the guest. Datagrams to the host port reach the guest's port as if
+they came from the gateway, and the guest's answers go back to whoever sent
+them. A TCP forward and a UDP forward may share a port number.
 
 **How fast.** Measured on the Windows development host: a 1 GiB HTTPS
 download ran at **53 MB/s** in the guest, where the host itself fetched the
@@ -1381,9 +1396,9 @@ configuration:
    until its next boot).
 8. **TAP networking is Linux-only.** On Windows the user-mode NAT is the only
    backend — which is also the option that needs no administrator anywhere,
-   and the default on both hosts. The NAT does outbound TCP, DHCP, DNS
-   through the host's resolver and inbound TCP port forwards; no other UDP,
-   no IPv6, no ping past the gateway. See [Networking](#networking).
+   and the default on both hosts. The NAT does outbound TCP and UDP, DHCP,
+   DNS through the host's resolver, NTP from the host's clock, and inbound
+   TCP and UDP port forwards, and pings to anywhere. It does not do IPv6. See [Networking](#networking).
 9. **The Windows binaries are unsigned, unverifiable and not on `PATH`.**
     SmartScreen warns, the UAC prompt says *Publisher: Unknown*, and the release
     publishes no checksum or signature to check the download against.
