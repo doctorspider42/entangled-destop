@@ -459,6 +459,27 @@ fn build_devices(
                     "attaching virtio-net device (user-mode NAT: DHCP, DNS relay, outbound TCP)"
                 );
                 net_cmdline = Some(backend.static_ip_cmdline());
+                // The profile's port forwards. One that cannot listen (a port
+                // already taken) is said loudly and skipped: the machine still
+                // starts, and every other forward still works.
+                for rule in net.forwards().map_err(|e| e.to_string())? {
+                    match backend.forward(virtio_net::PortForward {
+                        host: rule.host_addr(),
+                        guest_port: rule.guest_port,
+                    }) {
+                        Ok(bound) => tracing::info!(
+                            host = %bound,
+                            guest_port = rule.guest_port,
+                            "port forward: connections to the host address reach the guest"
+                        ),
+                        Err(error) => tracing::warn!(
+                            rule = %rule,
+                            %error,
+                            "port forward not started: cannot listen on {}",
+                            rule.host_addr()
+                        ),
+                    }
+                }
                 devices.push(Box::new(virtio_net::NetDevice::new(backend, mac)));
             }
         }

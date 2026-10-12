@@ -821,14 +821,14 @@ guest's router, DHCP server and DNS server. The guest is always
 like. Two machines each have their own segment and cannot see each other.
 
 **What works:** outbound TCP to anywhere — the web, `apt`, `git`, `ssh` out —
-and DNS, over UDP and TCP, which the NAT relays to `1.1.1.1`. A ping of
-`192.168.74.1` is answered.
+DNS (below), inbound TCP through **port forwards** (below), and a ping of
+`192.168.74.1`.
 
 **What does not:** UDP other than DHCP and DNS (so no NTP — the guest's clock
 comes from the host's RTC at boot and `timedatectl` reports it unsynchronised;
 no QUIC, which browsers fall back from to TCP; no game traffic), a ping to
 anything past the gateway, IPv6 (the guest has a link-local address only, and
-programs use IPv4), and anything *inbound*: there is no port forwarding yet.
+programs use IPv4), and anything inbound that is not forwarded.
 
 **What the guest can reach on the host.** Not the host's loopback: a service
 bound to `127.0.0.1` on the host is invisible from the guest, whether it asks
@@ -840,11 +840,30 @@ so is the rest of the host's LAN. That is the same exposure as any machine on
 the LAN has, not more; the NAT only closes the doors a LAN machine could not
 open.
 
-**DNS goes to `1.1.1.1`**, not to the host's own resolver: on a network that
-blocks outside DNS servers (some corporate ones do), names do not resolve in
-the guest even though the host resolves them. Names only the host's resolver
-knows (a VPN's internal zone, `/etc/hosts`, a `.local` name) do not resolve
-either.
+**DNS resolves the way the host does.** Address lookups (`A` and `AAAA`,
+which is what a browser, `apt` or `ssh` asks for) are answered by the host's
+own resolver, so a VPN's internal names, split DNS and the host's `hosts` file
+all work in the guest exactly as on the host. Anything else (MX, TXT, SRV,
+reverse lookups) is relayed to the host's first DNS server — the one its
+network gave it, not a public resolver. `ENTANGLED_USERNET_DNS=relay` sends
+every query to that server instead, for comparison.
+
+**Port forwards** reach a service inside the guest from the host:
+
+```toml
+[network]
+backend = "usernet"
+forward = ["2222:22", "0.0.0.0:8080:80"]
+```
+
+`"2222:22"` makes `127.0.0.1:2222` on the host reach port 22 in the guest
+(`ssh -p 2222 user@127.0.0.1`); it listens on loopback, so only this computer
+can use it. Put an address in front to listen elsewhere — `0.0.0.0` accepts
+connections from your network too. The guest sees the connection coming from
+`192.168.74.1`. A forward whose port is already taken on the host is reported
+when the machine starts and skipped; the machine still starts. The manager's
+editor has the same list under *Network & devices*. TCP only; `tap` machines
+have their own address on your network and need no forwards.
 
 **How fast.** Measured on the Windows development host: a 1 GiB HTTPS
 download ran at **53 MB/s** in the guest, where the host itself fetched the
@@ -1262,10 +1281,9 @@ configuration:
    until its next boot).
 8. **TAP networking is Linux-only.** On Windows the user-mode NAT is the only
    backend — which is also the option that needs no administrator anywhere,
-   and the default on both hosts. The NAT does outbound TCP, DHCP and DNS
-   (to `1.1.1.1`, not the host's resolver); no other UDP, no IPv6, no ping
-   past the gateway, and nothing reaches the guest from outside without port
-   forwarding it does not yet have. See [Networking](#networking).
+   and the default on both hosts. The NAT does outbound TCP, DHCP, DNS
+   through the host's resolver and inbound TCP port forwards; no other UDP,
+   no IPv6, no ping past the gateway. See [Networking](#networking).
 9. **The Windows binaries are unsigned, unverifiable and not on `PATH`.**
     SmartScreen warns, the UAC prompt says *Publisher: Unknown*, and the release
     publishes no checksum or signature to check the download against.

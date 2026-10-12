@@ -31,6 +31,14 @@ smoltcp.workspace = true
 libc.workspace = true
 vmm-sys-util.workspace = true
 
+# The host's DNS servers (`usernet::hostdns`), read with GetAdaptersAddresses.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
 [dev-dependencies]
 virtio-core = { workspace = true, features = ["test-utils"] }
 

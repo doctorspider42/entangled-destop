@@ -497,6 +497,14 @@ Two honesty rules the UI follows, and should keep following:
   flag drives is the button's label, which is all it can honestly claim. The
   VM's own answer is one `status` command away for anything that needs the truth.
 
+**Port forwards** (2026-10-12) live under Network & devices for a usernet
+machine: one text field per `[network] forward` rule, a Remove button each,
+"+ Add a forward", and under every rule either what it means ("127.0.0.1:2222
+on this computer reaches port 22 in the guest", from
+`control_api::PortForwardRule::parse`) or why it does not parse. A TAP machine
+writes no forwards (control-api refuses them there). egui's bundled font has
+no `✕` or `→`: write words.
+
 **Shut down** (2026-10-12) is the card's first button for a running machine:
 `Task::shutdown` writes `shutdown` (`control_api::control::CMD_SHUTDOWN`), the
 engine presses the guest's ACPI power button, and the card turns Stopped when

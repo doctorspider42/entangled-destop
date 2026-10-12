@@ -280,6 +280,82 @@ pub struct NetworkSection {
     /// ([`new_machine_mac`]), so it survives a rename; a profile without one
     /// keeps the name-derived address it always had.
     pub mac: Option<String>,
+    /// Inbound TCP port forwards, `usernet` only: `"2222:22"` makes the host's
+    /// `127.0.0.1:2222` reach the guest's port 22, `"0.0.0.0:8080:80"` listens
+    /// on every host address ([`PortForwardRule`]). Not written when empty: an
+    /// older engine denies unknown keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward: Vec<String>,
+}
+
+/// Most forwards one machine may have.
+pub const MAX_PORT_FORWARDS: usize = 32;
+
+/// One `[network] forward` entry, parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortForwardRule {
+    /// The host address the forward listens on; `127.0.0.1` unless the rule
+    /// names one, so a forward is reachable from this computer only unless
+    /// its author asked for more.
+    pub bind: std::net::IpAddr,
+    /// The host port.
+    pub host_port: u16,
+    /// The guest port it reaches.
+    pub guest_port: u16,
+}
+
+impl PortForwardRule {
+    /// `[tcp:][ADDRESS:]HOST_PORT:GUEST_PORT`, the address an IPv4 literal or a
+    /// bracketed IPv6 one (`[::1]:2222:22`).
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        let body = text.strip_prefix("tcp:").unwrap_or(text);
+        let bad = || {
+            format!(
+                "network.forward {text:?} is not [ADDRESS:]HOST_PORT:GUEST_PORT (\"2222:22\", \
+                 \"0.0.0.0:8080:80\")"
+            )
+        };
+        let (rest, guest) = body.rsplit_once(':').ok_or_else(bad)?;
+        let (bind, host) = match rest.rsplit_once(':') {
+            Some((bind, host)) if !bind.ends_with(':') => (Some(bind), host),
+            _ => (None, rest),
+        };
+        let port = |p: &str| p.parse::<u16>().ok().filter(|p| *p != 0);
+        let host_port = port(host).ok_or_else(bad)?;
+        let guest_port = port(guest).ok_or_else(bad)?;
+        let bind = match bind {
+            None => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Some(addr) => addr
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse()
+                .map_err(|_| bad())?,
+        };
+        Ok(Self {
+            bind,
+            host_port,
+            guest_port,
+        })
+    }
+
+    /// Where the host listens.
+    pub fn host_addr(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(self.bind, self.host_port)
+    }
+}
+
+impl std::fmt::Display for PortForwardRule {
+    /// The short form when the address is the default loopback one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.bind {
+            std::net::IpAddr::V4(v4) if v4 == std::net::Ipv4Addr::LOCALHOST => {
+                write!(f, "{}:{}", self.host_port, self.guest_port)
+            }
+            std::net::IpAddr::V4(v4) => write!(f, "{v4}:{}:{}", self.host_port, self.guest_port),
+            std::net::IpAddr::V6(v6) => write!(f, "[{v6}]:{}:{}", self.host_port, self.guest_port),
+        }
+    }
 }
 
 /// What a newly created machine is networked with when nobody chose: the
@@ -355,6 +431,29 @@ pub fn parse_mac(text: &str) -> Result<[u8; 6], ConfigError> {
 }
 
 impl NetworkSection {
+    /// The `forward` entries, parsed and checked: no more than
+    /// [`MAX_PORT_FORWARDS`], no host address and port twice.
+    pub fn forwards(&self) -> Result<Vec<PortForwardRule>, ConfigError> {
+        if self.forward.len() > MAX_PORT_FORWARDS {
+            return Err(ConfigError::Invalid(format!(
+                "network.forward has {} entries; at most {MAX_PORT_FORWARDS}",
+                self.forward.len()
+            )));
+        }
+        let mut rules: Vec<PortForwardRule> = Vec::with_capacity(self.forward.len());
+        for text in &self.forward {
+            let rule = PortForwardRule::parse(text).map_err(ConfigError::Invalid)?;
+            if rules.iter().any(|r| r.host_addr() == rule.host_addr()) {
+                return Err(ConfigError::Invalid(format!(
+                    "network.forward listens on {} twice",
+                    rule.host_addr()
+                )));
+            }
+            rules.push(rule);
+        }
+        Ok(rules)
+    }
+
     /// The `[network]` a machine `entangled install` creates is given:
     /// `backend` (with `interface` for TAP) and a [`new_machine_mac`], so the
     /// guest's NIC keeps one address for the life of the machine.
@@ -373,6 +472,7 @@ impl NetworkSection {
                 NetworkBackend::Usernet => None,
             },
             mac: Some(new_machine_mac(vm_name, disk)),
+            forward: Vec::new(),
         }
     }
 
@@ -863,6 +963,12 @@ impl VmConfig {
                     if network.interface.is_none() {
                         return err("network.interface is required for backend = \"tap\"".into());
                     }
+                    if !network.forward.is_empty() {
+                        return err("network.forward is only valid for backend = \"usernet\": \
+                             a TAP guest has its own address on the host's network, and a \
+                             service in it is reached there directly"
+                            .into());
+                    }
                 }
                 NetworkBackend::Usernet => {
                     if network.interface.is_some() {
@@ -874,6 +980,7 @@ impl VmConfig {
                 }
             }
             network.mac_octets()?;
+            network.forwards()?;
         }
         // Per-mode boot keys: reject the *wrong* key instead of ignoring it,
         // so a profile that names a kernel under mode = "uefi" fails loudly
@@ -1090,6 +1197,64 @@ scale = 1.0
             let err = VmConfig::from_toml(&text).expect_err("refused");
             assert!(err.to_string().contains("gpu_memory_mib"), "{mib}: {err}");
         }
+    }
+
+    /// The forward grammar: the short form listens on loopback, an address or
+    /// a bracketed IPv6 one widens it, and nonsense is refused by name.
+    #[test]
+    fn port_forward_rules_parse_and_print_back() {
+        let short = PortForwardRule::parse("2222:22").expect("short form");
+        assert_eq!(short.host_addr(), "127.0.0.1:2222".parse().unwrap());
+        assert_eq!(short.guest_port, 22);
+        assert_eq!(short.to_string(), "2222:22");
+        let wide = PortForwardRule::parse("tcp:0.0.0.0:8080:80").expect("with address");
+        assert_eq!(wide.host_addr(), "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(wide.to_string(), "0.0.0.0:8080:80");
+        let v6 = PortForwardRule::parse("[::1]:2222:22").expect("ipv6");
+        assert_eq!(v6.host_addr(), "[::1]:2222".parse().unwrap());
+        assert_eq!(v6.to_string(), "[::1]:2222:22");
+        for bad in [
+            "22",
+            "0:22",
+            "2222:0",
+            "70000:22",
+            "x:1:2",
+            "2222:22:33:44",
+            "",
+        ] {
+            assert!(PortForwardRule::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Forwards are usernet's, never duplicated, and not written when absent.
+    #[test]
+    fn port_forwards_are_validated_with_the_profile() {
+        let usernet = |forward: &str| {
+            format!(
+                "name = \"f\"\nmemory_mib = 1024\nvcpus = 1\n[boot]\nmode = \"direct-linux\"\n\
+                 kernel = \"k\"\n[network]\nbackend = \"usernet\"\nforward = [{forward}]\n"
+            )
+        };
+        let cfg = VmConfig::from_toml(&usernet("\"2222:22\", \"0.0.0.0:8080:80\"")).expect("valid");
+        let rules = cfg.network.as_ref().unwrap().forwards().expect("rules");
+        assert_eq!(rules.len(), 2);
+        let twice = VmConfig::from_toml(&usernet("\"2222:22\", \"127.0.0.1:2222:80\""));
+        assert!(twice.expect_err("duplicate").to_string().contains("twice"));
+        let bad = VmConfig::from_toml(&usernet("\"ssh\""));
+        assert!(bad
+            .expect_err("bad rule")
+            .to_string()
+            .contains("network.forward"));
+        // TAP: refused.
+        let tap = BACKLOG_EXAMPLE.to_string();
+        let tap = tap.replace(
+            "backend = \"tap\"",
+            "backend = \"tap\"\nforward = [\"2222:22\"]",
+        );
+        assert!(VmConfig::from_toml(&tap).is_err());
+        // Absent stays absent.
+        let plain = VmConfig::from_toml(BACKLOG_EXAMPLE).expect("parses");
+        assert!(!toml::to_string(&plain).unwrap().contains("forward"));
     }
 
     /// `[display] gpu_boost`: absent stays absent and is never written, both

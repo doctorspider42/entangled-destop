@@ -1825,6 +1825,58 @@ fn edit_network_devices(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
             },
         );
     }
+    if form.network == NetworkChoice::Usernet {
+        ui.add_space(6.0);
+        let mut remove = None;
+        for (i, rule) in form.forwards.iter_mut().enumerate() {
+            let (label, tip) = if i == 0 {
+                ("PORT FORWARDS", FORWARD_TIP)
+            } else {
+                ("", "")
+            };
+            ui::form_row(ui, label, tip, |ui, field_w| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(rule)
+                            .desired_width(field_w - 84.0)
+                            .hint_text("host port:guest port"),
+                    );
+                    if ui::ghost_button(ui, "Remove", true, theme::TEXT_DIM).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            });
+            if !rule.trim().is_empty() {
+                match control_api::PortForwardRule::parse(rule) {
+                    Ok(parsed) => ui::form_note(
+                        ui,
+                        ui::faint(format!(
+                            "{} on this computer reaches port {} in the guest",
+                            parsed.host_addr(),
+                            parsed.guest_port
+                        )),
+                    ),
+                    Err(error) => {
+                        ui::form_note(ui, RichText::new(error).color(theme::WARN).size(11.0))
+                    }
+                }
+            }
+        }
+        if let Some(i) = remove {
+            form.forwards.remove(i);
+        }
+        let (label, tip) = if form.forwards.is_empty() {
+            ("PORT FORWARDS", FORWARD_TIP)
+        } else {
+            ("", "")
+        };
+        ui::form_row(ui, label, tip, |ui, _| {
+            let full = form.forwards.len() >= control_api::MAX_PORT_FORWARDS;
+            if ui::ghost_button(ui, "+ Add a forward", !full, theme::CYAN).clicked() {
+                form.forwards.push(String::new());
+            }
+        });
+    }
     ui.add_space(18.0);
     ui::form_row(
         ui,
@@ -1922,6 +1974,12 @@ fn edit_network_devices(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
         );
     }
 }
+
+/// The explanation on the port-forward rows.
+const FORWARD_TIP: &str = "Reach a service inside the machine from this computer. \"2222:22\" \
+     makes port 2222 here reach the guest's SSH on port 22; it listens on 127.0.0.1, so only \
+     this computer can use it. Put an address in front (\"0.0.0.0:8080:80\") to accept \
+     connections from your network too. Changes apply the next time the machine starts.";
 
 /// The picker's own text: "1 player", "2 players".
 fn players_label(players: u8) -> String {

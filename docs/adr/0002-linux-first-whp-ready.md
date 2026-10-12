@@ -745,7 +745,8 @@ reruns passed).
   8-vCPU boots and one loaded 1-vCPU test boot, and PIT calibration fails in
   most boots. **Closed** for the panic by the amendment below, which also says
   why the calibration line stays on AMD hosts.
-- **DNS goes to `1.1.1.1`, not the host's resolver.** A network that blocks
+- ~~**DNS goes to `1.1.1.1`, not the host's resolver.**~~ Closed 2026-10-12,
+  see the amendment at the end. A network that blocks
   outside DNS, a VPN's internal zone, `/etc/hosts` and `.local` names do not
   resolve in the guest. Reading the host's resolvers (`/etc/resolv.conf`,
   `GetAdaptersAddresses`) is a contained change to `UserNetConfig`; so is a
@@ -1031,3 +1032,35 @@ under full host load, 1-vCPU boots lost it to the watchdog in 2 of 5.
 - **KVM parity.** The KVM path's topology is unchanged and untested here (no
   `/dev/kvm`); KVM guests use kvmclock and do not depend on it for time.
 - **Intel WHP hosts** remain unmeasured.
+
+## Amendment, 2026-10-12 — usernet resolves through the host, and forwards ports inward
+
+Two of the NAT's open items, closed:
+
+- **DNS through the host's resolver** (`virtio_net::usernet::hostdns`). `A`
+  and `AAAA` questions — a plain standard query, one question, labels of
+  letters, digits, `-` and `_`, at most a bare EDNS OPT — are answered by
+  `getaddrinfo` on a pool of four host threads behind a 64-entry queue, and
+  synthesised into a reply (TTL 30 s, NXDOMAIN when the host cannot resolve
+  the name). That is the only way a VPN's split DNS (NRPT rules on Windows,
+  per-link domains in systemd-resolved) and the host's `hosts` file reach the
+  guest: neither is visible to a relay that picked one server. Everything
+  else is relayed as before, now to the host's first DNS server
+  (`GetAdaptersAddresses` by interface metric on Windows, `/etc/resolv.conf`
+  on Linux) instead of `1.1.1.1`. Measured on this Windows host with the
+  installed Ubuntu desktop: the relay pointed at the LAN's own resolver, 64
+  address lookups during boot went through the host, an MX lookup was
+  relayed, and a guest `getent` for three public names answered.
+  `ENTANGLED_USERNET_DNS=relay` restores the single-server behaviour.
+- **Inbound TCP port forwards** (`[network] forward = ["2222:22", …]`,
+  `control_api::PortForwardRule`, `virtio_net::PortForward`). The host side is
+  a non-blocking listener of this process, accepted on the pump's ordinary
+  pass; each connection becomes a flow whose smoltcp socket *connects* to the
+  guest from the gateway's address (ports 49152–65535), and from there it is
+  the outbound flow's copy loop. The flow limit is shared. Listening defaults
+  to `127.0.0.1`; a profile names `0.0.0.0` to open it to the LAN. A forward
+  that cannot bind is a warning, not a failed start. Measured: a host fetch
+  of `http://127.0.0.1:18000/` reached `python3 -m http.server 8000` in the
+  guest and returned its page.
+
+Still open: NTP, IPv6, ICMP past the gateway, UDP forwards.

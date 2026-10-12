@@ -17,9 +17,9 @@ pub mod wsl_engine;
 pub use config::{
     default_vcpus, format_mac, host_default_vcpus, new_machine_mac, parse_mac, BootMode,
     BootSection, CdromSection, ConfigError, DiskSection, DisplaySection, GamepadBackend,
-    GamepadSection, GpuRenderer, NetworkBackend, NetworkSection, SoundBackend, SoundSection,
-    VirglIsolation, VirtioTransport, VmConfig, DEFAULT_HOST_VISIBLE_MIB,
+    GamepadSection, GpuRenderer, NetworkBackend, NetworkSection, PortForwardRule, SoundBackend,
+    SoundSection, VirglIsolation, VirtioTransport, VmConfig, DEFAULT_HOST_VISIBLE_MIB,
     DEFAULT_NEW_MACHINE_NETWORK, DEFAULT_REFRESH_HZ, MAX_DEFAULT_VCPUS, MAX_GAMEPAD_PLAYERS,
-    MAX_GPU_MEMORY_MIB, MAX_HOST_VISIBLE_MIB, MAX_MEMORY_MIB, MAX_REFRESH_HZ, MIN_DEFAULT_VCPUS,
-    MIN_GPU_MEMORY_MIB, MIN_HOST_VISIBLE_MIB, MIN_MEMORY_MIB, MIN_REFRESH_HZ,
+    MAX_GPU_MEMORY_MIB, MAX_HOST_VISIBLE_MIB, MAX_MEMORY_MIB, MAX_PORT_FORWARDS, MAX_REFRESH_HZ,
+    MIN_DEFAULT_VCPUS, MIN_GPU_MEMORY_MIB, MIN_HOST_VISIBLE_MIB, MIN_MEMORY_MIB, MIN_REFRESH_HZ,
 };

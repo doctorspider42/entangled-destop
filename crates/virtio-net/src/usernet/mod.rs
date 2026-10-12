@@ -58,6 +58,7 @@
 //! replacing it with epoll/IOCP is a contained change behind this module.
 
 mod dhcp;
+pub mod hostdns;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod offline;
 mod tcp;
@@ -80,7 +81,7 @@ use crate::backend::{NetBackend, NetError, Readiness};
 use crate::frame::{ETH_HEADER_LEN, MAX_FRAME_LEN};
 
 pub use dhcp::{Lease, CLIENT_PORT, SERVER_PORT};
-pub use tcp::{TcpNat, FLOW_IDLE_TIMEOUT, FLOW_KEEPALIVE, MAX_FLOWS};
+pub use tcp::{PortForward, TcpNat, FLOW_IDLE_TIMEOUT, FLOW_KEEPALIVE, MAX_FLOWS};
 
 /// Frames queued for the guest before the backend starts dropping them.
 ///
@@ -113,6 +114,12 @@ pub struct UserNetConfig {
     /// determined, otherwise a public one — see [`Self::default`].
     pub dns_upstream: SocketAddr,
     pub lease: Duration,
+    /// Answer `A`/`AAAA` questions through the host's own resolver
+    /// ([`hostdns`]) rather than the upstream server: what makes VPN split DNS
+    /// and the host's `hosts` file work in the guest. Off in
+    /// [`Self::default`] so unit tests never touch the host's resolver;
+    /// [`Self::for_host`] turns it on.
+    pub host_resolver: bool,
 }
 
 impl Default for UserNetConfig {
@@ -137,6 +144,7 @@ impl Default for UserNetConfig {
             netmask: Ipv4Address::new(255, 255, 255, 0),
             dns_upstream: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53)),
             lease: Duration::from_secs(3600),
+            host_resolver: false,
         }
     }
 }
@@ -162,6 +170,26 @@ impl UserNetConfig {
     pub fn with_dns_upstream(mut self, upstream: SocketAddr) -> Self {
         self.dns_upstream = upstream;
         self
+    }
+
+    /// What a VM gets: [`Self::default`]'s segment, names answered by the
+    /// host's resolver, and everything else relayed to the host's first DNS
+    /// server (a public one only when the host's cannot be read).
+    /// `ENTANGLED_USERNET_DNS=relay` keeps the old behaviour — every query to
+    /// one upstream server — for comparing the two.
+    pub fn for_host() -> Self {
+        let mut config = Self::default();
+        if let Some(upstream) = hostdns::host_dns_servers().into_iter().next() {
+            config.dns_upstream = upstream;
+        }
+        config.host_resolver =
+            std::env::var("ENTANGLED_USERNET_DNS").map_or(true, |mode| mode != "relay");
+        tracing::info!(
+            upstream = %config.dns_upstream,
+            host_resolver = config.host_resolver,
+            "usernet DNS"
+        );
+        config
     }
 }
 
@@ -285,6 +313,8 @@ impl ToGuest {
 struct DnsRelay {
     socket: Option<UdpSocket>,
     upstream: SocketAddr,
+    /// The host's resolver, for the questions it answers ([`hostdns`]).
+    host: Option<hostdns::HostResolver>,
     queries: VecDeque<DnsQuery>,
     /// The receive buffer, [`MAX_DNS_DATAGRAM`] bytes, made once with the
     /// socket: the pump polls every tick, and a 64 KiB allocation per tick
@@ -300,10 +330,11 @@ struct DnsQuery {
 }
 
 impl DnsRelay {
-    fn new(upstream: SocketAddr) -> Self {
+    fn new(upstream: SocketAddr, host_resolver: bool) -> Self {
         Self {
             socket: None,
             upstream,
+            host: host_resolver.then(|| hostdns::HostResolver::new(hostdns::system_lookup())),
             queries: VecDeque::new(),
             buf: Vec::new(),
         }
@@ -333,6 +364,11 @@ impl DnsRelay {
     /// Forwards one query. `payload` is the whole DNS message; its first two bytes
     /// are the transaction id, and a message too short to have one is not a query.
     fn forward(&mut self, guest_port: u16, payload: &[u8]) -> bool {
+        if let Some(host) = self.host.as_mut() {
+            if host.submit(guest_port, payload) {
+                return true;
+            }
+        }
         let Some(&[hi, lo, ..]) = payload.get(..2) else {
             return false;
         };
@@ -360,6 +396,9 @@ impl DnsRelay {
     /// One pending reply, if the upstream resolver has answered: the guest port to
     /// deliver it to and the message.
     fn poll(&mut self) -> Option<(u16, Vec<u8>)> {
+        if let Some(answer) = self.host.as_mut().and_then(hostdns::HostResolver::poll) {
+            return Some(answer);
+        }
         self.expire();
         let socket = self.socket.as_ref()?;
         // The whole datagram, however large. The guest's query usually carries an
@@ -402,6 +441,10 @@ impl DnsRelay {
 
     fn is_busy(&self) -> bool {
         !self.queries.is_empty()
+            || self
+                .host
+                .as_ref()
+                .is_some_and(hostdns::HostResolver::is_busy)
     }
 }
 
@@ -477,7 +520,7 @@ impl Router {
     fn new(config: UserNetConfig) -> Self {
         Self {
             dhcp: dhcp::DhcpServer::new(config.gateway, config.guest, config.netmask, config.lease),
-            dns: DnsRelay::new(config.dns_upstream),
+            dns: DnsRelay::new(config.dns_upstream, config.host_resolver),
             tcp: TcpNat::new(config),
             guest_mac: None,
             config,
@@ -840,13 +883,23 @@ impl UserNetBackend {
         })
     }
 
-    /// The default segment: `192.168.74.0/24`.
+    /// A backend for a VM: [`UserNetConfig::for_host`].
     pub fn with_defaults() -> Result<Self, NetError> {
-        Self::new(UserNetConfig::default())
+        Self::new(UserNetConfig::for_host())
     }
 
     pub fn config(&self) -> &UserNetConfig {
         &self.config
+    }
+
+    /// Starts an inbound port forward ([`PortForward`]); answers the address
+    /// actually bound, or why it could not be (a port in use, an address the
+    /// host does not have).
+    pub fn forward(&self, forward: PortForward) -> std::io::Result<std::net::SocketAddr> {
+        match self.router.lock() {
+            Ok(mut router) => router.tcp.add_forward(forward),
+            Err(_) => Err(std::io::Error::other("the usernet router lock is poisoned")),
+        }
     }
 
     pub fn stats(&self) -> &Arc<UserNetStats> {

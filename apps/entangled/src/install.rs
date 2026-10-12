@@ -152,6 +152,7 @@ pub fn net_plan(choice: &str, interface: &str) -> Result<NetPlan, String> {
                     backend: NetworkBackend::Tap,
                     interface: Some(interface.to_string()),
                     mac: None,
+                    forward: Vec::new(),
                 }),
                 address: Some(NetAddress {
                     ip: TAP_GUEST_IP.to_string(),
@@ -170,6 +171,7 @@ pub fn net_plan(choice: &str, interface: &str) -> Result<NetPlan, String> {
                     // is inside this process and touches no host interface.
                     interface: None,
                     mac: None,
+                    forward: Vec::new(),
                 }),
                 address: Some(NetAddress {
                     ip: net.guest.to_string(),

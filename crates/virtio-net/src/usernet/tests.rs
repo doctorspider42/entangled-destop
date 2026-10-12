@@ -462,7 +462,7 @@ fn a_guest_dns_query_is_forwarded_and_its_answer_comes_back() {
 fn a_dns_answer_from_the_wrong_source_is_not_delivered() {
     let resolver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a fake resolver");
     let upstream = resolver.local_addr().expect("the resolver has an address");
-    let mut relay = DnsRelay::new(upstream);
+    let mut relay = DnsRelay::new(upstream, false);
     assert!(relay.forward(5353, b"\x12\x34rest"));
 
     let mut buf = [0u8; 64];
@@ -511,7 +511,7 @@ fn relay_round_trip(answer: &[u8]) -> Option<Vec<u8>> {
     resolver
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("a read timeout can be set");
-    let mut relay = DnsRelay::new(resolver.local_addr().expect("an address"));
+    let mut relay = DnsRelay::new(resolver.local_addr().expect("an address"), false);
     assert!(relay.forward(5353, &answer[..2]));
     let mut buf = [0u8; 64];
     let (_, from) = resolver.recv_from(&mut buf).expect("the query arrives");

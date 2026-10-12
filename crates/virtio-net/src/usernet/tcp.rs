@@ -58,7 +58,7 @@
 //!   here goes through `smoltcp::wire`'s checked accessors.
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -184,6 +184,30 @@ impl TxToken for QueueTxToken<'_> {
     }
 }
 
+/// An inbound TCP port forward: connections to `host` on the host reach the
+/// guest's `guest_port` (2026-10-12).
+///
+/// The host side is an ordinary listening socket of this process; each
+/// connection it accepts becomes a flow like an outbound one, except that the
+/// smoltcp socket *connects* to the guest — from the gateway's address, so the
+/// guest sees its peer as `192.168.74.1` — instead of listening for it. The
+/// flow limit is shared with outbound connections, and nothing about the
+/// guest's traffic can open a listener: only the profile does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortForward {
+    /// Where the host listens: `127.0.0.1:2222` unless the profile says
+    /// otherwise.
+    pub host: SocketAddr,
+    /// The guest's port.
+    pub guest_port: u16,
+}
+
+/// The first local port an inbound flow uses on the gateway's side, and the
+/// range it cycles through.
+const INBOUND_PORTS: std::ops::RangeInclusive<u16> = 49152..=65535;
+/// Connections accepted per listener per tick: bounded work.
+const ACCEPTS_PER_TICK: usize = 8;
+
 /// One guest connection and the host socket it was translated into.
 struct Flow {
     handle: SocketHandle,
@@ -248,6 +272,10 @@ pub struct TcpNat {
     /// Flows retired since this NAT was built. With [`Self::flow_count`] it is the
     /// evidence a lifecycle test needs: slots given back, not merely never taken.
     retired: u64,
+    /// The profile's port forwards, listening ([`PortForward`]).
+    listeners: Vec<(TcpListener, PortForward)>,
+    /// The next gateway-side port an inbound flow tries.
+    next_inbound_port: u16,
 }
 
 impl TcpNat {
@@ -302,7 +330,111 @@ impl TcpNat {
             idle_timeout: FLOW_IDLE_TIMEOUT,
             refused_at_limit: 0,
             retired: 0,
+            listeners: Vec::new(),
+            next_inbound_port: *INBOUND_PORTS.start(),
         }
+    }
+
+    /// Starts listening for `forward`. Fails as `bind` does — a port in use,
+    /// an address the host does not have — and the caller says so to the user.
+    pub fn add_forward(&mut self, forward: PortForward) -> std::io::Result<SocketAddr> {
+        let listener = TcpListener::bind(forward.host)?;
+        listener.set_nonblocking(true)?;
+        let bound = listener.local_addr()?;
+        tracing::info!(host = %bound, guest_port = forward.guest_port, "usernet: forwarding a port");
+        self.listeners.push((listener, forward));
+        Ok(bound)
+    }
+
+    /// Accepts what the forwards' listeners have waiting and connects each to
+    /// the guest.
+    fn accept_forwards(&mut self) {
+        if self.access == HostAccess::Offline {
+            return;
+        }
+        let mut accepted: Vec<(TcpStream, PortForward)> = Vec::new();
+        for (listener, forward) in &self.listeners {
+            for _ in 0..ACCEPTS_PER_TICK {
+                match listener.accept() {
+                    Ok((stream, _)) => accepted.push((stream, *forward)),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        tracing::debug!(%error, "accepting a forwarded connection failed");
+                        break;
+                    }
+                }
+            }
+        }
+        for (stream, forward) in accepted {
+            self.open_inbound(stream, forward);
+        }
+    }
+
+    fn open_inbound(&mut self, stream: TcpStream, forward: PortForward) {
+        if self.flows.len() >= MAX_FLOWS {
+            self.refused_at_limit = self.refused_at_limit.saturating_add(1);
+            tracing::warn!("refusing a forwarded connection: the NAT is at its flow limit");
+            return;
+        }
+        if let Err(error) = stream.set_nonblocking(true) {
+            tracing::debug!(%error, "cannot make a forwarded connection non-blocking");
+            return;
+        }
+        let gateway = Ipv4Addr::from(self.config.gateway.octets());
+        let Some(local_port) = self.free_inbound_port(gateway) else {
+            return;
+        };
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; FLOW_BUFFER]),
+            tcp::SocketBuffer::new(vec![0u8; FLOW_BUFFER]),
+        );
+        socket.set_keep_alive(Some(self.keepalive.into()));
+        socket.set_timeout(Some(self.idle_timeout.into()));
+        if let Err(error) = socket.connect(
+            self.iface.context(),
+            (self.config.guest, forward.guest_port),
+            (self.config.gateway, local_port),
+        ) {
+            tracing::debug!(?error, "cannot connect a forwarded connection to the guest");
+            return;
+        }
+        let handle = self.sockets.add(socket);
+        tracing::debug!(
+            guest_port = forward.guest_port,
+            local_port,
+            "opened an inbound flow"
+        );
+        self.flows.push(Flow {
+            handle,
+            guest_port: forward.guest_port,
+            remote: SocketAddrV4::new(gateway, local_port),
+            connecting: None,
+            stream: Some(stream),
+            started: StdInstant::now(),
+            host_eof: false,
+            guest_eof: false,
+        });
+    }
+
+    /// A gateway-side port no live inbound flow is using.
+    fn free_inbound_port(&mut self, gateway: Ipv4Addr) -> Option<u16> {
+        let span = usize::from(INBOUND_PORTS.end() - INBOUND_PORTS.start()) + 1;
+        for _ in 0..span {
+            let port = self.next_inbound_port;
+            self.next_inbound_port = if port == *INBOUND_PORTS.end() {
+                *INBOUND_PORTS.start()
+            } else {
+                port + 1
+            };
+            let taken = self
+                .flows
+                .iter()
+                .any(|f| *f.remote.ip() == gateway && f.remote.port() == port);
+            if !taken {
+                return Some(port);
+            }
+        }
+        None
     }
 
     fn now(&self) -> Instant {
@@ -313,6 +445,14 @@ impl TcpNat {
     /// from.
     pub fn is_busy(&self) -> bool {
         !self.flows.is_empty()
+    }
+
+    /// The forwards that are listening, and where.
+    pub fn forwards(&self) -> Vec<(SocketAddr, u16)> {
+        self.listeners
+            .iter()
+            .filter_map(|(l, f)| l.local_addr().ok().map(|a| (a, f.guest_port)))
+            .collect()
     }
 
     pub fn flow_count(&self) -> usize {
@@ -480,6 +620,7 @@ impl TcpNat {
         budget: usize,
         emit: &mut dyn FnMut(Vec<u8>),
     ) {
+        self.accept_forwards();
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         let finished = self.service_flows();
@@ -1109,6 +1250,82 @@ mod tests {
             most >= 8,
             "at most {most} data segments left in one poll ({received} bytes seen)"
         );
+    }
+
+    #[test]
+    fn a_forwarded_host_port_reaches_the_guest_and_bytes_cross_both_ways() {
+        let mut nat = TcpNat::with_access(config(), HostAccess::HostLocal);
+        let bound = nat
+            .add_forward(PortForward {
+                host: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                guest_port: 22,
+            })
+            .expect("bind the forward");
+        assert_eq!(nat.forwards(), vec![(bound, 22)]);
+        let mut client = TcpStream::connect(bound).expect("connect to the forward");
+        client.write_all(b"ping").expect("write to the forward");
+
+        // The guest, as the server on port 22, facing the gateway's first
+        // inbound port.
+        let gateway = Ipv4Addr::from(config().gateway.octets());
+        let first = *INBOUND_PORTS.start();
+        let mut peer = GuestPeer::new(nat, SocketAddrV4::new(gateway, first), 22);
+        let mut syn_seen = false;
+        for _ in 0..200 {
+            if peer.poll().iter().any(|s| s.syn && !s.ack) {
+                syn_seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(syn_seen, "the NAT connects to the guest's port");
+        assert_eq!(peer.nat.flow_count(), 1);
+
+        // SYN-ACK; the NAT acknowledges and hands over what the client wrote.
+        peer.send(true, true, false, &[]);
+        let mut got = Vec::new();
+        for _ in 0..200 {
+            for s in peer.poll() {
+                got.extend_from_slice(&s.payload);
+            }
+            if got == b"ping" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(got, b"ping", "host -> guest");
+
+        peer.send(false, true, false, b"pong");
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("a read timeout can be set");
+        let mut answer = Vec::new();
+        for _ in 0..200 {
+            let _ = peer.poll();
+            let mut chunk = [0u8; 16];
+            if let Ok(read) = client.read(&mut chunk) {
+                answer.extend_from_slice(&chunk[..read]);
+                if answer.len() >= 4 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(answer, b"pong", "guest -> host");
+    }
+
+    /// A forward on a port that is already taken fails at bind, with the
+    /// error the user needs, rather than silently not forwarding.
+    #[test]
+    fn a_forward_on_a_taken_port_fails_loudly() {
+        let taken = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let mut nat = TcpNat::with_access(config(), HostAccess::HostLocal);
+        let error = nat
+            .add_forward(PortForward {
+                host: taken.local_addr().expect("address"),
+                guest_port: 80,
+            })
+            .expect_err("the port is taken");
+        assert_eq!(error.kind(), ErrorKind::AddrInUse);
     }
 
     #[test]

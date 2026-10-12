@@ -62,6 +62,8 @@ pub struct EditForm {
     pub network: NetworkChoice,
     pub interface: String,
     pub mac: String,
+    /// `[network] forward` rules, one text field each (usernet only).
+    pub forwards: Vec<String>,
     pub display_width: u32,
     pub display_height: u32,
     /// `[display] virgl` / `venus`, as the one choice they are: a device has
@@ -190,6 +192,7 @@ writable = true
 
 [network]
 backend = "usernet"
+forward = ["2222:22", "0.0.0.0:8080:80"]
 
 [display]
 width = 1920
@@ -247,6 +250,11 @@ enabled = true
                 .as_ref()
                 .and_then(|n| n.mac.clone())
                 .unwrap_or_default(),
+            forwards: cfg
+                .network
+                .as_ref()
+                .map(|n| n.forward.clone())
+                .unwrap_or_default(),
             display_width: cfg.display.width,
             display_height: cfg.display.height,
             gpu: cfg.display.gpu_renderer(),
@@ -300,11 +308,18 @@ enabled = true
                 interface: (!self.interface.trim().is_empty())
                     .then(|| self.interface.trim().to_string()),
                 mac: (!self.mac.trim().is_empty()).then(|| self.mac.trim().to_string()),
+                forward: Vec::new(),
             }),
             NetworkChoice::Usernet => Some(NetworkSection {
                 backend: NetworkBackend::Usernet,
                 interface: None,
                 mac: (!self.mac.trim().is_empty()).then(|| self.mac.trim().to_string()),
+                forward: self
+                    .forwards
+                    .iter()
+                    .map(|f| f.trim().to_string())
+                    .filter(|f| !f.is_empty())
+                    .collect(),
             }),
         };
         cfg.display.width = self.display_width;

@@ -61,7 +61,7 @@ pub use frame::{
     validate_rx_frame, validate_tx_buffer, FrameError, NetHeader, ETH_HEADER_LEN, MAX_BUFFER_LEN,
     MAX_FRAME_LEN, MTU, VIRTIO_NET_HDR_LEN,
 };
-pub use usernet::{UserNetBackend, UserNetConfig, UserNetStats};
+pub use usernet::{PortForward, UserNetBackend, UserNetConfig, UserNetStats};
 
 #[cfg(target_os = "linux")]
 pub use tap::TapBackend;
