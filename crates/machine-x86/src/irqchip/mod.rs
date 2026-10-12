@@ -141,6 +141,18 @@ impl UserspaceIrqChip {
         }
     }
 
+    /// The ACPI SCI: IOAPIC pin [`crate::layout::ACPI_SCI_GSI`], which the PM
+    /// block raises for the power button.
+    pub fn sci_line(&self) -> Arc<dyn IrqLine> {
+        match u8::try_from(crate::layout::ACPI_SCI_GSI)
+            .ok()
+            .and_then(|pin| self.ioapic.line(pin).ok())
+        {
+            Some(line) => line,
+            None => unreachable!("ACPI_SCI_GSI is within the IOAPIC's pin count"),
+        }
+    }
+
     /// The interrupt line for virtio-mmio (or virtio-pci) slot `slot`: IOAPIC pin
     /// [`crate::layout::virtio_irq`].
     ///

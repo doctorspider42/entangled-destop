@@ -497,6 +497,13 @@ Two honesty rules the UI follows, and should keep following:
   flag drives is the button's label, which is all it can honestly claim. The
   VM's own answer is one `status` command away for anything that needs the truth.
 
+**Shut down** (2026-10-12) is the card's first button for a running machine:
+`Task::shutdown` writes `shutdown` (`control_api::control::CMD_SHUTDOWN`), the
+engine presses the guest's ACPI power button, and the card turns Stopped when
+the process ends — there is no state to set, because the guest decides (a
+desktop may show its own dialog). Stop stays beside it, labelled for what it is:
+pulling the plug.
+
 `Task::send_control` drops the pipe on a write error, so a child that exited
 between the click and the write turns the buttons off instead of retrying into a
 broken pipe.

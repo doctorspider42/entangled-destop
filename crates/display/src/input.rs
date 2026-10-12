@@ -127,6 +127,10 @@ pub enum ControlEvent {
     /// comes back — which is *another* process, with another window, so there
     /// is nothing for this one to toggle back to.
     SaveRequested,
+    /// The window's "Shut down": press the guest's ACPI power button, so it
+    /// powers itself off cleanly. Unlike [`Self::QuitRequested`], nothing is
+    /// stopped by the host — the guest decides, and the VM ends when it does.
+    PowerButtonRequested,
 }
 
 /// A window-level effect the event loop has to apply (backlog EPIC 15).
@@ -700,6 +704,13 @@ impl InputCapture {
             tracing::debug!("focus lost: grab released");
             self.control.push(ControlEvent::GrabToggled(false));
         }
+    }
+
+    /// Releases the grab the way `Ctrl+Alt` does — every guest-held key handed
+    /// back as a key-up — and returns the window's action, or `None` when
+    /// nothing was grabbed. The toolbar's "release input" button.
+    pub fn release_grab(&mut self) -> Option<WindowAction> {
+        self.grabbed.then(|| self.set_grab(false))
     }
 
     /// Emits key-up for everything the guest believes is held, in one batch.

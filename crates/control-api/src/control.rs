@@ -39,6 +39,10 @@ pub const CMD_SAVE: &str = "save";
 pub const CMD_STATUS: &str = "status";
 /// Type text and Enter on the guest's serial console.
 pub const CMD_TYPE: &str = "type";
+/// Press the guest's ACPI power button: ask it to shut down cleanly. The VM
+/// ends when the guest powers off — or not, if its policy says otherwise; a
+/// caller that must have it stopped follows up with its own deadline.
+pub const CMD_SHUTDOWN: &str = "shutdown";
 
 /// One reply line, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]

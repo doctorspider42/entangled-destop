@@ -122,6 +122,8 @@ impl MachineBus {
     /// without in-kernel ones may do this: on KVM the 8259/8254 ports and the
     /// IOAPIC page are served in the kernel and must not be claimed here.
     pub fn with_irqchip(mut self, irqchip: Arc<UserspaceIrqChip>) -> Self {
+        // The power button's SCI is an IOAPIC pin like any other here.
+        self.acpi_pm.connect_sci(irqchip.sci_line());
         self.irqchip = Some(irqchip);
         self
     }

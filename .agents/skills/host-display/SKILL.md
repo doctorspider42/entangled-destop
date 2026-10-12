@@ -446,6 +446,35 @@ that shaped the code, all verified against WSLg's protocol stream
   screen. Coordinate math in host-side tooling must not assume the rect
   includes the titlebar.
 
+## The quick-actions bar (`toolbar.rs`, 2026-10-12)
+
+A VMware-style bar at the top edge: Shut down (ACPI power button), Restart,
+Pause, Suspend | Fullscreen, Fit/1:1, Release input | Power off.
+
+- **When it shows** is policy in `Toolbar::on_pointer`: only if the window is
+  fullscreen *or* grabbed (a confined pointer cannot be heading for the title
+  bar; an ungrabbed windowed one usually is), when the pointer is within
+  `REVEAL_EDGE` of the top; it hides once the pointer leaves the bar, its label
+  and `HIDE_MARGIN`. While the pointer is over the bar `captures_pointer()` is
+  true: `host.rs` withholds the motion and the clicks from the guest and
+  `sync_cursor` shows the host arrow.
+- **Restart and Power off ask twice** (`CONFIRM_WINDOW`, 3 s); the armed label
+  says "CLICK AGAIN TO …" in the warning colour.
+- **Drawing**: a premultiplied BGRA image rendered on the CPU whenever
+  `Toolbar::serial` changes (SDF icons, a 5×7 bitmap font scaled by a whole
+  factor: 2× at 100 %, 6× at 300 %) and drawn by a second
+  `present::CursorOverlay` over the *whole surface* after the frame
+  (`Renderer::set_toolbar`), so it ignores the letterbox. `CursorOverlay::place`
+  is the generic "image at a clip rect" both the cursor plane and the bar use.
+- **Reviewing it**: `ENTANGLED_TOOLBAR_PNG_DIR=<dir> cargo test -p display
+  --lib dump_toolbar_pngs -- --ignored` writes every hover state, at 1× and 2×,
+  over a grey background. There is no other way to look at it without a
+  human: the window cannot be driven from automation on WSLg, and on Windows
+  only by real mouse input.
+- Actions go where the shortcuts go: lifecycle ones as `ControlEvent`s
+  (`PowerButtonRequested` is new and has no shortcut), window ones applied in
+  place, Release through `InputCapture::release_grab`.
+
 ## Lifecycle shortcuts (ADR-0005)
 
 Two more reserved `Ctrl+Alt` chords, alongside `G` (grab), `Q` (shut down) and

@@ -764,9 +764,26 @@ struct LifecycleRequests {
     /// path and `Ctrl+Alt+S` uses the profile's default one; taking the last
     /// request wins is right for the same reason the flags coalesce.
     save: Mutex<Option<PathBuf>>,
+    /// The machine's ACPI PM block, for the power button — set once the
+    /// machine exists. Pressed directly rather than through the supervisor:
+    /// it touches no vCPU, only a register and the SCI.
+    power: std::sync::OnceLock<Arc<machine_x86::acpi::AcpiPmBlock>>,
 }
 
 impl LifecycleRequests {
+    /// The guest's power button ("Shut down" in the window, `shutdown` on the
+    /// control channel). Answers whether the guest had its ACPI button event
+    /// enabled — `false` early in boot, when the press is only latched.
+    fn press_power_button(&self) -> bool {
+        match self.power.get() {
+            Some(pm) => pm.press_power_button(),
+            None => {
+                tracing::warn!("power button pressed before the machine exists; ignored");
+                false
+            }
+        }
+    }
+
     fn request_save(&self, path: PathBuf) {
         match self.save.lock() {
             Ok(mut slot) => *slot = Some(path),
@@ -802,6 +819,9 @@ fn note_control_event(
         }
         display::ControlEvent::ResetRequested => {
             requests.reset.store(true, Ordering::Relaxed);
+        }
+        display::ControlEvent::PowerButtonRequested => {
+            requests.press_power_button();
         }
         display::ControlEvent::SaveRequested => match snapshot {
             Some(path) => {
@@ -878,13 +898,21 @@ fn spawn_control_channel(
                 // the writer at the other end of the pipe and the reader here
                 // cannot drift apart.
                 use control_api::control::{
-                    CMD_PAUSE, CMD_RESET, CMD_RESUME, CMD_SAVE, CMD_STATUS, CMD_TYPE,
+                    CMD_PAUSE, CMD_RESET, CMD_RESUME, CMD_SAVE, CMD_SHUTDOWN, CMD_STATUS,
+                    CMD_TYPE,
                 };
                 match command {
                     "" => {}
                     CMD_PAUSE => requests.pause.store(true, Ordering::Relaxed),
                     CMD_RESUME => requests.resume.store(true, Ordering::Relaxed),
                     CMD_RESET => requests.reset.store(true, Ordering::Relaxed),
+                    CMD_SHUTDOWN => {
+                        if !requests.press_power_button() {
+                            println!(
+                                "{CONTROL_PREFIX} note the guest has not enabled its power                                  button yet; the press is latched until it does"
+                            );
+                        }
+                    }
                     CMD_SAVE => {
                         let path = match argument.trim() {
                             "" => snapshot.clone(),
@@ -1374,6 +1402,7 @@ pub fn run_with(
     // `join_or_stop` polls must stay cheap: a pause that took a second would
     // otherwise be a second in which the console script stopped being typed.
     let requests = Arc::new(LifecycleRequests::default());
+    let _ = requests.power.set(Arc::clone(bus.acpi_pm()));
     let supervisor = LifecycleSupervisor::start(
         Arc::clone(&lifecycle),
         Arc::clone(&requests),
@@ -2229,6 +2258,15 @@ mod host {
             Some(flash) => bus.with_pflash(Arc::clone(flash)),
             None => bus,
         };
+        // The ACPI SCI the power button raises: an irqfd on GSI 13, which the
+        // in-kernel IOAPIC routes like every other ISA-range line.
+        match machine_x86::irqfd::IrqFdLine::new(&vm.fd_shared(), machine_x86::layout::ACPI_SCI_GSI)
+        {
+            Ok(line) => bus.acpi_pm().connect_sci(Arc::new(line)),
+            Err(error) => {
+                tracing::warn!(%error, "no ACPI SCI irqfd; the power button cannot interrupt the guest")
+            }
+        }
 
         // Boot mode dispatch (EPIC 18 / ADR-0003). Everything above this point —
         // memory, IRQ chip, serial, the whole virtio window — is identical for both

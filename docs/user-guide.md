@@ -662,9 +662,19 @@ until you ask it not to.
 | `Ctrl+Alt+O` | 1:1 pixel mode (no scaling) |
 | `F11` | borderless fullscreen |
 | any other `Ctrl+Alt+<key>` | forwarded to the guest, so `Ctrl+Alt+F2` still switches its console |
+| pointer at the top edge (fullscreen, or while grabbed) | the quick-actions bar: shut down, restart, pause/resume, suspend, fullscreen, fit/1:1, release input, power off |
 
 The window title says whether input is grabbed. Losing focus releases the grab
 and every key the guest was told is down.
+
+**The quick-actions bar** slides in when the pointer touches the top edge of a
+fullscreen window, or of a windowed one whose input is grabbed (the pointer is
+confined then, so it cannot be heading for the title bar). Over the bar you
+get the host's arrow and the guest gets nothing; move away and it hides.
+*Shut down* presses the machine's ACPI power button, so the guest powers off
+cleanly the way a real computer does (a desktop may ask first). *Power off*
+stops the VM immediately and *Restart* reboots it; both ask for a second click
+within three seconds, because a stray click on either loses work.
 
 ### Refresh rate
 
@@ -1012,6 +1022,10 @@ want a second machine.
 - **Pause** (`Ctrl+Alt+P`, or `pause` on the control channel) stops every vCPU
   and quiesces the devices, so nothing touches guest memory while it is frozen.
   Resume continues the same boot.
+- **Shut down** (the window's quick-actions bar, `shutdown` on the control
+  channel, or the manager's *Shut down*) presses the guest's ACPI power button.
+  The guest shuts itself down and the VM ends when it powers off. Before the
+  guest's ACPI driver is up the press is kept and delivered when it is.
 - **Reset** (`Ctrl+Alt+R`, or `reset`) reboots the machine in place, in the same
   process: the devices are returned to power-on state and the firmware runs
   again. A guest that reboots itself takes the same path.

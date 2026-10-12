@@ -279,6 +279,8 @@ pub enum Action {
     SaveSettings,
     Start(String),
     Stop(String),
+    /// Press a running VM's power button: the guest shuts itself down.
+    Shutdown(String),
     /// Freeze a running VM, or let a frozen one continue (ADR-0005).
     TogglePause(String),
     /// Reboot a running VM in place — the machine reset, not stop-then-start.
@@ -1494,6 +1496,36 @@ impl ManagerApp {
 
     /// Reboots a running VM in place: the same reset the guest's own Restart
     /// performs, in the same process and the same window.
+    /// Presses a running VM's ACPI power button. The guest powers off by
+    /// itself, so there is no state to set here: the card turns Stopped when
+    /// the process ends, as it would after the guest's own Shut Down.
+    fn shutdown(&mut self, name: &str) {
+        let Some(task) = self.supervisor.active_task(name) else {
+            self.toast(ToastLevel::Warn, format!("'{name}' is not running"));
+            return;
+        };
+        let (level, text) = if !task.has_control() {
+            (
+                ToastLevel::Warn,
+                format!("'{name}' has no control channel — it was not started from here"),
+            )
+        } else if task.shutdown() {
+            (
+                ToastLevel::Info,
+                format!(
+                    "asked '{name}' to shut down — a desktop may show its own dialog first; \
+                     Stop forces it"
+                ),
+            )
+        } else {
+            (
+                ToastLevel::Error,
+                format!("could not reach '{name}' to shut it down"),
+            )
+        };
+        self.toast(level, text);
+    }
+
     fn reset(&mut self, name: &str) {
         let Some(task) = self.supervisor.active_task(name) else {
             self.toast(ToastLevel::Warn, format!("'{name}' is not running"));
@@ -2667,6 +2699,10 @@ impl ManagerApp {
                 self.mock_statuses.insert(name.clone(), Status::Stopped);
                 self.toast(ToastLevel::Info, format!("Mock: stopped '{name}'"));
             }
+            Action::Shutdown(name) => {
+                self.mock_statuses.insert(name.clone(), Status::Stopped);
+                self.toast(ToastLevel::Info, format!("Mock: '{name}' shut down"));
+            }
             // Suspend and Resume move the fixture between the same two states
             // the real ones move a machine between — a snapshot row appearing
             // and disappearing — so the card states can be reviewed without a
@@ -2913,6 +2949,7 @@ impl ManagerApp {
             Action::SaveSettings => self.save_settings(),
             Action::Start(name) => self.start(&name),
             Action::Stop(name) => self.stop(&name),
+            Action::Shutdown(name) => self.shutdown(&name),
             Action::TogglePause(name) => self.toggle_pause(&name),
             Action::Reset(name) => self.reset(&name),
             Action::Suspend(name) => self.suspend(&name),

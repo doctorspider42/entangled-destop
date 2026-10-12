@@ -29,8 +29,10 @@
 //! rather than treated as "some kind of shutdown".
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use std::time::{Duration, Instant};
+use virtio_core::interrupt::IrqLine;
 
 use crate::layout;
 
@@ -85,6 +87,10 @@ const SLEEP_CTL_SLP_TYP_SHIFT: u32 = 2;
 const SLEEP_CTL_SLP_TYP_MASK: u8 = 0x7 << SLEEP_CTL_SLP_TYP_SHIFT;
 /// `SLP_EN` of `SLEEP_CONTROL_REG`: write-only, reads back zero.
 const SLEEP_CTL_SLP_EN: u8 = 1 << 5;
+
+/// `PWRBTN_STS` in `PM1a_STS` and `PWRBTN_EN` in `PM1a_EN` (ACPI 6.5 tables
+/// 4.13/4.14): the fixed-feature power button.
+const PM1_PWRBTN: u16 = 1 << 8;
 
 /// `WAK_STS` of `SLEEP_STATUS_REG`, write-1-to-clear.
 const SLEEP_STS_WAK: u8 = 1 << 7;
@@ -219,11 +225,24 @@ struct PmRegisters {
 }
 
 /// The ACPI fixed-feature register block.
-#[derive(Debug)]
 pub struct AcpiPmBlock {
     timer: AcpiPmTimer,
     regs: Mutex<PmRegisters>,
     shutdown: AtomicBool,
+    /// The SCI (GSI [`layout::ACPI_SCI_GSI`]), once the machine wires one:
+    /// an irqfd on KVM, an IOAPIC pin on the userspace irqchip. Without it the
+    /// power button still latches `PWRBTN_STS`, and a guest that polls finds it.
+    sci: Mutex<Option<Arc<dyn IrqLine>>>,
+}
+
+impl std::fmt::Debug for AcpiPmBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpiPmBlock")
+            .field("timer", &self.timer)
+            .field("regs", &self.regs)
+            .field("shutdown", &self.shutdown)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for AcpiPmBlock {
@@ -238,6 +257,47 @@ impl AcpiPmBlock {
             timer: AcpiPmTimer::new(),
             regs: Mutex::new(PmRegisters::default()),
             shutdown: AtomicBool::new(false),
+            sci: Mutex::new(None),
+        }
+    }
+
+    /// Wires the SCI the power button raises.
+    pub fn connect_sci(&self, line: Arc<dyn IrqLine>) {
+        *self.sci.lock().unwrap_or_else(PoisonError::into_inner) = Some(line);
+    }
+
+    /// Presses the fixed power button: what the host's "Shut down" does.
+    ///
+    /// Latches `PWRBTN_STS` and, when the guest has enabled `PWRBTN_EN`,
+    /// raises the SCI; the guest's ACPI driver then reads the status, clears
+    /// it and does whatever its policy says — Linux's `acpi_button` reports
+    /// `KEY_POWER`, and logind or the desktop powers off (or asks). Answers
+    /// whether the guest was listening: `false` before its ACPI driver has
+    /// enabled the event (early boot, firmware, a guest without ACPI), in
+    /// which case the press is latched for whoever enables it later.
+    pub fn press_power_button(&self) -> bool {
+        let listening = {
+            let mut regs = self.regs();
+            regs.pm1a_sts |= PM1_PWRBTN;
+            regs.pm1a_en & PM1_PWRBTN != 0
+        };
+        tracing::info!(listening, "ACPI power button pressed");
+        if listening {
+            self.raise_sci();
+        }
+        listening
+    }
+
+    fn raise_sci(&self) {
+        let line = self
+            .sci
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(line) = line {
+            if let Err(error) = line.trigger() {
+                tracing::warn!(%error, "cannot raise the ACPI SCI");
+            }
         }
     }
 
@@ -421,7 +481,17 @@ impl AcpiPmBlock {
             OFF_PM1A_STS => regs.pm1a_sts &= !u16::from(value),
             0x03 => regs.pm1a_sts &= !(u16::from(value) << 8),
             OFF_PM1A_EN => regs.pm1a_en = (regs.pm1a_en & 0xff00) | u16::from(value),
-            0x05 => regs.pm1a_en = (regs.pm1a_en & 0x00ff) | (u16::from(value) << 8),
+            0x05 => {
+                // Enabling an event whose status is already latched raises
+                // it — the level-triggered SCI a real chipset would hold up.
+                let was = regs.pm1a_en;
+                regs.pm1a_en = (regs.pm1a_en & 0x00ff) | (u16::from(value) << 8);
+                let newly = regs.pm1a_en & !was & regs.pm1a_sts & PM1_PWRBTN;
+                if newly != 0 {
+                    drop(regs);
+                    self.raise_sci();
+                }
+            }
             OFF_PM1A_CNT | 0x07 => {
                 let shift = if offset == OFF_PM1A_CNT { 0 } else { 8 };
                 let mask = 0xffu16 << shift;
@@ -553,6 +623,63 @@ mod tests {
         let mut data = [0u8; 2];
         pm.io_read(GPE0_PORT + 2, &mut data);
         assert_eq!(u16::from_le_bytes(data), 0x00ff);
+    }
+
+    /// Counts its triggers, standing in for the SCI.
+    #[derive(Default)]
+    struct CountingLine(std::sync::atomic::AtomicUsize);
+    impl IrqLine for CountingLine {
+        fn trigger(&self) -> Result<(), virtio_core::interrupt::InterruptError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn pm1_sts(pm: &AcpiPmBlock) -> u16 {
+        let mut data = [0u8; 2];
+        pm.io_read(PM1A_EVT_PORT, &mut data);
+        u16::from_le_bytes(data)
+    }
+
+    /// A press with the event enabled latches `PWRBTN_STS` and raises the SCI
+    /// once; the guest clears the status by writing it back.
+    #[test]
+    fn the_power_button_raises_the_sci_when_the_guest_listens() {
+        let pm = AcpiPmBlock::new();
+        let sci = Arc::new(CountingLine::default());
+        pm.connect_sci(sci.clone());
+        // ACPICA enables the fixed power button event.
+        pm.io_write(PM1A_EVT_PORT + 2, &PM1_PWRBTN.to_le_bytes());
+        assert!(pm.press_power_button());
+        assert_eq!(sci.0.load(Ordering::SeqCst), 1);
+        assert_ne!(pm1_sts(&pm) & PM1_PWRBTN, 0, "PWRBTN_STS latched");
+        pm.io_write(PM1A_EVT_PORT, &PM1_PWRBTN.to_le_bytes());
+        assert_eq!(pm1_sts(&pm) & PM1_PWRBTN, 0, "write-1-to-clear");
+    }
+
+    /// Pressed before the guest's ACPI driver is up: latched, no interrupt,
+    /// and delivered the moment the event is enabled.
+    #[test]
+    fn an_early_press_is_delivered_when_the_event_is_enabled() {
+        let pm = AcpiPmBlock::new();
+        let sci = Arc::new(CountingLine::default());
+        pm.connect_sci(sci.clone());
+        assert!(!pm.press_power_button());
+        assert_eq!(sci.0.load(Ordering::SeqCst), 0);
+        pm.io_write(PM1A_EVT_PORT + 2, &PM1_PWRBTN.to_le_bytes());
+        assert_eq!(sci.0.load(Ordering::SeqCst), 1);
+        // Rewriting the same enable does not raise it again.
+        pm.io_write(PM1A_EVT_PORT + 2, &PM1_PWRBTN.to_le_bytes());
+        assert_eq!(sci.0.load(Ordering::SeqCst), 1);
+    }
+
+    /// No SCI wired (a bare bus in a test): the press still latches.
+    #[test]
+    fn a_press_without_an_sci_still_latches() {
+        let pm = AcpiPmBlock::new();
+        pm.io_write(PM1A_EVT_PORT + 2, &PM1_PWRBTN.to_le_bytes());
+        assert!(pm.press_power_button());
+        assert_ne!(pm1_sts(&pm) & PM1_PWRBTN, 0);
     }
 
     /// `MicroSecondDelay()` spins until the timer has advanced far enough — a

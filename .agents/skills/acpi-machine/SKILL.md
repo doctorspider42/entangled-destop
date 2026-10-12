@@ -183,6 +183,27 @@ For a host-initiated shutdown (window close, SIGINT) the same latch is reachable
 as `bus.acpi_pm()`; setting it would let the guest's own vCPU notice on its next
 exit, which is a politer stop than `VcpuThreads::stop()`. Not wired yet.
 
+### The fixed power button (2026-10-12)
+
+The polite way for the *host* to end a VM: ask the guest. The FADT no longer
+sets `PWR_BUTTON` ("no power button"), so ACPICA registers the fixed-feature
+button (`ACPI: button: Power Button [PWRF]`, `LNXPWRBN:00`) and enables
+`PWRBTN_EN` (bit 8 of `PM1a_EN`). `AcpiPmBlock::press_power_button()` latches
+`PWRBTN_STS` (bit 8 of `PM1a_STS`, write-1-to-clear) and, if the event is
+enabled, triggers the **SCI** (GSI `layout::ACPI_SCI_GSI` = 13, level/active-high
+in the MADT override). Enabling the event while the status is already latched
+raises it too, so a press during early boot is delivered when the driver comes
+up. The SCI line is wired per host: `MachineBus::with_irqchip` connects the
+userspace IOAPIC's pin (`UserspaceIrqChip::sci_line`), and the KVM path in
+`run_vm` an irqfd on GSI 13.
+
+Who presses it: the window's toolbar ("Shut down", `ControlEvent::
+PowerButtonRequested`), the control channel's `shutdown` command, and the
+manager's **Shut down** button. Measured on WHP with the installed Ubuntu 26.04
+desktop: `ACPI power button pressed listening=true`, GNOME's end-session
+countdown (60 s), then `reboot: Power down` and the ordinary S5 latch. The KVM
+wiring is compiled but not exercised on this machine (no `/dev/kvm`).
+
 ## MADT / MP-table coexistence
 
 Both are published, and they describe the same machine by construction:

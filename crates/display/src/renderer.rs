@@ -164,6 +164,9 @@ pub(crate) struct Renderer {
     configured: bool,
     image: ImagePipeline,
     cursor: CursorOverlay,
+    /// The window's quick-actions bar (`crate::toolbar`), drawn over the
+    /// whole surface after the frame; armed only while it is visible.
+    toolbar: CursorOverlay,
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     /// The shared presenter's texture this frame draws, and the bind group
@@ -280,6 +283,7 @@ impl Renderer {
         // Linear filtering so a scaled scanout is smooth (MVP-705).
         let image = ImagePipeline::new(&device, format, wgpu::FilterMode::Linear);
         let cursor = CursorOverlay::new(&device, format);
+        let toolbar = CursorOverlay::new(&device, format);
 
         let texture = create_scanout_texture(&device, guest_w, guest_h);
         let bind_group = image.bind(
@@ -296,6 +300,7 @@ impl Renderer {
             configured: false,
             image,
             cursor,
+            toolbar,
             texture,
             bind_group,
             shared: None,
@@ -617,6 +622,34 @@ impl Renderer {
         }
     }
 
+    /// What the next frames draw over everything: the toolbar's picture, or
+    /// nothing. Placed in surface pixels, so it ignores the letterbox.
+    pub(crate) fn set_toolbar(&mut self, overlay: Option<&crate::toolbar::Overlay>) {
+        let Some(o) = overlay else {
+            self.toolbar
+                .place(&self.device, &self.queue, (0, 0, 0, &[]), [0.0; 4]);
+            return;
+        };
+        let (sw, sh) = (
+            f64::from(self.config.width.max(1)),
+            f64::from(self.config.height.max(1)),
+        );
+        let to_x = |px: f64| (px / sw * 2.0 - 1.0) as f32;
+        let to_y = |py: f64| (1.0 - py / sh * 2.0) as f32;
+        let rect = [
+            to_x(f64::from(o.x)),
+            to_y(f64::from(o.y)),
+            to_x(f64::from(o.x + o.width)),
+            to_y(f64::from(o.y + o.height)),
+        ];
+        self.toolbar.place(
+            &self.device,
+            &self.queue,
+            (o.serial, o.width, o.height, &o.pixels),
+            rect,
+        );
+    }
+
     fn frame(&mut self, viewport: Viewport) -> Result<(), wgpu::SurfaceError> {
         let acquire = Instant::now();
         let frame = self.surface.get_current_texture()?;
@@ -676,6 +709,12 @@ impl Renderer {
                     // draws it over the shared frame.
                     self.cursor.draw(&mut pass);
                 }
+            }
+            // The toolbar lives in window space, over the letterbox too.
+            if max_w > 0 && max_h > 0 {
+                pass.set_viewport(0.0, 0.0, max_w as f32, max_h as f32, 0.0, 1.0);
+                pass.set_scissor_rect(0, 0, max_w, max_h);
+                self.toolbar.draw(&mut pass);
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));

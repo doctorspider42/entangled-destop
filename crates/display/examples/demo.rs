@@ -155,7 +155,8 @@ fn guest_thread(
                 // shortcuts reach a supervisor at all (ADR-0005, ADR-0006).
                 ControlEvent::PauseToggleRequested
                 | ControlEvent::ResetRequested
-                | ControlEvent::SaveRequested => {
+                | ControlEvent::SaveRequested
+                | ControlEvent::PowerButtonRequested => {
                     tracing::info!(?event, "lifecycle request (no VM behind this demo)");
                 }
             }

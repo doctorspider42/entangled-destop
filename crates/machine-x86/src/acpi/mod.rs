@@ -335,7 +335,10 @@ fn gas_io(port: u16, bit_width: u8, access_size: u8) -> [u8; 12] {
 const FADT_WBINVD: u32 = 1 << 0;
 const FADT_PROC_C1: u32 = 1 << 2;
 const FADT_P_LVL2_UP: u32 = 1 << 3;
-/// "No power button device" — this machine has none.
+/// "No power button device". **Not** set: the PM block implements the fixed
+/// power button (`PWRBTN_STS`/`PWRBTN_EN` in PM1, raised on the SCI), which
+/// is what lets the host ask a guest to shut down cleanly.
+#[cfg(test)]
 const FADT_PWR_BUTTON: u32 = 1 << 4;
 /// "No sleep button device".
 const FADT_SLP_BUTTON: u32 = 1 << 5;
@@ -404,7 +407,6 @@ fn fadt(facs_addr: u64, dsdt_addr: u64) -> Vec<u8> {
         &(FADT_WBINVD
             | FADT_PROC_C1
             | FADT_P_LVL2_UP
-            | FADT_PWR_BUTTON
             | FADT_SLP_BUTTON
             | FADT_FIX_RTC
             | FADT_RESET_REG_SUP)
@@ -735,6 +737,11 @@ mod tests {
         assert_eq!(u32_at(fadt, 112) & (1 << 8), 0, "TMR_VAL_EXT must be clear");
         // Not hardware-reduced: Linux must take the PM1a_CNT path.
         assert_eq!(u32_at(fadt, 112) & (1 << 20), 0, "HW_REDUCED_ACPI clear");
+        assert_eq!(
+            u32_at(fadt, 112) & FADT_PWR_BUTTON,
+            0,
+            "the fixed power button is present (PWR_BUTTON clear)"
+        );
     }
 
     /// Every X_ block must agree with its 32-bit twin and with the *_LEN field,

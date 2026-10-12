@@ -384,14 +384,34 @@ fn action_strip(
                 }
             }
             Status::Running => {
-                if ui::ghost_button(ui, "Stop", true, theme::WARN).clicked() {
-                    actions.push(Action::Stop(vm.name.clone()));
-                }
                 // Pause and Restart (ADR-0005). Only for a VM this
                 // manager started: the control channel is a pipe to
                 // a child, so a VM launched from a terminal has
                 // none and the buttons say so rather than lying.
                 let controllable = app.has_control(&vm.name);
+                // Shut down first: the clean way out, which the guest
+                // performs itself (its ACPI power button).
+                if ui::ghost_button(ui, "Shut down", controllable, theme::CYAN)
+                    .on_hover_text(if controllable {
+                        "Press the machine's power button: it shuts itself down \
+                         cleanly, the way it would on real hardware. A desktop may ask \
+                         first."
+                    } else {
+                        "This VM was not started from here"
+                    })
+                    .clicked()
+                {
+                    actions.push(Action::Shutdown(vm.name.clone()));
+                }
+                if ui::ghost_button(ui, "Stop", true, theme::WARN)
+                    .on_hover_text(
+                        "Power the machine off now, like pulling the plug. Anything \
+                         the guest had not written to disk is lost.",
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::Stop(vm.name.clone()));
+                }
                 let paused = app.is_paused(&vm.name);
                 let label = if paused { "Resume" } else { "Pause" };
                 if ui::ghost_button(ui, label, controllable, theme::VIOLET)

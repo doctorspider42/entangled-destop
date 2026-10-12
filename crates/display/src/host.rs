@@ -209,6 +209,8 @@ impl DisplayHost {
             guest_refresh_hz,
             seen_frames: 0,
             boost: BoostGate::new(boost.with_env()),
+            toolbar: crate::toolbar::Toolbar::new((config.width, config.height), 1.0),
+            toolbar_press: false,
         };
         // Nothing here reads `DeviceEvent`s (pointer input is the window's
         // `CursorMoved`), and on Windows winit otherwise registers raw input for
@@ -276,6 +278,11 @@ struct App {
     /// leaves the user without a cursor over the decorations. So "visible"
     /// is a bundled arrow image, which takes the same always-honoured path.
     cursors: Option<HostCursors>,
+    /// The quick-actions bar at the top edge ([`crate::toolbar`]).
+    toolbar: crate::toolbar::Toolbar,
+    /// A button press began on the toolbar, so its release is the toolbar's
+    /// too and must not reach the guest.
+    toolbar_press: bool,
     /// Title text actually applied to the window.
     ///
     /// Every `set_title` is an X11/Wayland round trip, and winit's X11 backend
@@ -414,6 +421,9 @@ impl App {
     /// must not lag a resize by one motion event.
     fn recompute_viewport(&mut self) {
         let window_size = self.window_size();
+        if let (Some(size), Some(window)) = (window_size, self.window.as_ref()) {
+            self.toolbar.set_window(size, window.scale_factor());
+        }
         self.viewport = match window_size {
             Some((w, h)) => ux::viewport_for(self.mode, self.guest_size.0, self.guest_size.1, w, h),
             None => None,
@@ -488,6 +498,9 @@ impl App {
             self.capture.set_viewport(self.viewport);
             self.sync_cursor();
         }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_toolbar(self.toolbar.overlay());
+        }
         let outcome = match self.renderer.as_mut() {
             Some(renderer) => renderer.render(viewport),
             None => return,
@@ -556,6 +569,42 @@ impl App {
         }
     }
 
+    /// Draws now on Windows, asks for a redraw elsewhere: the same split as
+    /// `user_event`, for changes the window makes itself (the toolbar).
+    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if cfg!(windows) {
+            self.draw(event_loop);
+        } else if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    /// Carries out a toolbar click. The guest-lifecycle ones go to the VM
+    /// supervisor exactly as their shortcuts do, guest-held keys released
+    /// first; the window's own ones are applied here.
+    fn apply_toolbar(&mut self, action: crate::toolbar::ToolbarAction) {
+        use crate::toolbar::ToolbarAction;
+        let lifecycle = |app: &mut Self, event: ControlEvent| {
+            app.capture.release_all();
+            app.control.push(event);
+        };
+        tracing::info!(?action, "toolbar");
+        match action {
+            ToolbarAction::PowerButton => lifecycle(self, ControlEvent::PowerButtonRequested),
+            ToolbarAction::PowerOff => lifecycle(self, ControlEvent::QuitRequested),
+            ToolbarAction::PauseToggle => lifecycle(self, ControlEvent::PauseToggleRequested),
+            ToolbarAction::Reset => lifecycle(self, ControlEvent::ResetRequested),
+            ToolbarAction::Suspend => lifecycle(self, ControlEvent::SaveRequested),
+            ToolbarAction::ToggleFullscreen => self.toggle_fullscreen(),
+            ToolbarAction::ToggleScale => self.toggle_scale_mode(),
+            ToolbarAction::ReleaseInput => {
+                if let Some(action) = self.capture.release_grab() {
+                    self.apply_action(action);
+                }
+            }
+        }
+    }
+
     fn set_grab(&mut self, grabbed: bool) {
         if self.grabbed == grabbed {
             self.sync_cursor();
@@ -589,7 +638,8 @@ impl App {
     /// [`App::cursors`] docs for the WSLg story. Everywhere else the plain
     /// visibility flag works and is kept.
     fn sync_cursor(&mut self) {
-        let visible = self.capture.cursor_visible();
+        // Over the toolbar the user needs the host arrow, grabbed or not.
+        let visible = self.capture.cursor_visible() || self.toolbar.captures_pointer();
         if visible == self.cursor_visible {
             return;
         }
@@ -885,9 +935,22 @@ impl ApplicationHandler<HostEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.capture
-                    .on_pointer(self.viewport, position.x, position.y);
+                let serial = self.toolbar.serial();
+                let eligible = self.fullscreen || self.grabbed;
+                let over_bar = self.toolbar.on_pointer(
+                    position.x,
+                    position.y,
+                    eligible,
+                    std::time::Instant::now(),
+                );
+                if !over_bar {
+                    self.capture
+                        .on_pointer(self.viewport, position.x, position.y);
+                }
                 self.sync_cursor();
+                if self.toolbar.serial() != serial {
+                    self.redraw(event_loop);
+                }
             }
             WindowEvent::CursorEntered { .. } => {
                 self.capture.on_pointer_in_window(true);
@@ -895,9 +958,32 @@ impl ApplicationHandler<HostEvent> for App {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.capture.on_pointer_in_window(false);
+                let serial = self.toolbar.serial();
+                self.toolbar.hide();
                 self.sync_cursor();
+                if self.toolbar.serial() != serial {
+                    self.redraw(event_loop);
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // The toolbar takes every button over itself, and the release
+                // of a press that began there.
+                let pressed = state == winit::event::ElementState::Pressed;
+                if (pressed && self.toolbar.captures_pointer()) || (!pressed && self.toolbar_press)
+                {
+                    self.toolbar_press = pressed;
+                    if pressed && button == winit::event::MouseButton::Left {
+                        let serial = self.toolbar.serial();
+                        if let Some(action) = self.toolbar.on_click(std::time::Instant::now()) {
+                            self.apply_toolbar(action);
+                        }
+                        if self.toolbar.serial() != serial {
+                            self.redraw(event_loop);
+                        }
+                    }
+                    self.sync_cursor();
+                    return;
+                }
                 // A click on the guest image engages the grab (WIN-1502).
                 if let KeyOutcome::Reserved(action) = self.capture.on_button(button, state) {
                     self.apply_action(action);
@@ -911,6 +997,8 @@ impl ApplicationHandler<HostEvent> for App {
                 self.capture.on_focus(focused);
                 if !focused {
                     self.set_grab(false);
+                    self.toolbar.hide();
+                    self.toolbar_press = false;
                 }
                 self.sync_cursor();
             }

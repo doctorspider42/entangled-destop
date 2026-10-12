@@ -96,6 +96,7 @@ mod renderer;
 pub mod scanout;
 pub mod shared;
 mod sync;
+pub mod toolbar;
 pub mod ux;
 pub mod viewport;
 

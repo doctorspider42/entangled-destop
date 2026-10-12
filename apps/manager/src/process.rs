@@ -328,6 +328,14 @@ impl Task {
         true
     }
 
+    /// Presses the guest's ACPI power button: it shuts itself down cleanly,
+    /// and the VM ends when it powers off. The guest decides — a desktop may
+    /// ask first — so this is a request, not a stop; [`Self::request_stop`]
+    /// is still there for a guest that will not go.
+    pub fn shutdown(&self) -> bool {
+        self.send_control(control_api::control::CMD_SHUTDOWN)
+    }
+
     /// Reboots the VM in place (ADR-0005): the same machine reset the guest's
     /// own Restart performs, not a stop followed by a start.
     pub fn reset(&self) -> bool {

@@ -246,14 +246,36 @@ impl CursorOverlay {
         else {
             return;
         };
-        let expected = u64::from(cursor.width) * u64::from(cursor.height) * 4;
-        if cursor.pixels.len() as u64 != expected {
+        self.place(
+            device,
+            queue,
+            (cursor.serial, cursor.width, cursor.height, cursor.pixels),
+            rect,
+        );
+    }
+
+    /// Get ready to draw a premultiplied BGRA image — `(serial, width,
+    /// height, pixels)`, re-uploaded only when the serial changes — over the
+    /// clip-space `rect` (left, top, right, bottom) of whatever viewport the
+    /// draw happens in. The cursor plane and the window's toolbar both come
+    /// through here.
+    pub(crate) fn place(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        image: (u64, u32, u32, &[u8]),
+        rect: [f32; 4],
+    ) {
+        self.armed = false;
+        let (serial, width, height, pixels) = image;
+        let expected = u64::from(width) * u64::from(height) * 4;
+        if width == 0 || height == 0 || pixels.len() as u64 != expected {
             return;
         }
-        if self.image.as_ref().map(|(serial, _)| *serial) != Some(cursor.serial) {
+        if self.image.as_ref().map(|(s, _)| *s) != Some(serial) {
             let size = wgpu::Extent3d {
-                width: cursor.width,
-                height: cursor.height,
+                width,
+                height,
                 depth_or_array_layers: 1,
             };
             let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -273,11 +295,11 @@ impl CursorOverlay {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                cursor.pixels,
+                pixels,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(cursor.width * 4),
-                    rows_per_image: Some(cursor.height),
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
                 },
                 size,
             );
@@ -300,7 +322,7 @@ impl CursorOverlay {
                     },
                 ],
             });
-            self.image = Some((cursor.serial, bind));
+            self.image = Some((serial, bind));
         }
         let mut bytes = [0u8; 16];
         for (chunk, value) in bytes.chunks_exact_mut(4).zip(rect) {
