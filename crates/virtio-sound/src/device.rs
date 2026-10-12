@@ -809,9 +809,8 @@ impl SoundDevice {
                 let stream = &mut inner.streams[index];
                 stream.clear_audio();
                 stream.epoch = stream.epoch.wrapping_add(1);
-                if code == protocol::R_PCM_RELEASE {
-                    stream.params = None;
-                }
+                // RELEASE keeps `params`: the next PREPARE needs them
+                // (`stream::transition`).
             }
             _ => {}
         }

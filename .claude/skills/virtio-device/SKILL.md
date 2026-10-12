@@ -904,6 +904,13 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
     retired only when `consumed` has passed its `consume_at`, so it never
     carries bytes that do not exist; a STOP or RELEASE hands its buffers back
     with a **zero-length payload** rather than with whatever the ring holds.
+    **RELEASE keeps the stream's parameters** (`stream::transition` →
+    `ParamsSet`): the spec allows SET PARAMETERS *or* PREPARE after it, and
+    Linux's xrun recovery is STOP, RELEASE (`virtsnd_pcm_sync_stop`), then
+    PREPARE alone. Until 2026-10-12 RELEASE went back to `Unset`, that PREPARE
+    was refused ("PREPARE is not valid while the stream is Unset", 3351 times
+    in one session), the guest's sound died at its first underrun, and a
+    browser video waiting on its audio clock spun forever.
     A capture buffer also reserves its room (`Stream::promised`) the moment it
     is posted, which is what admission control bounds — `ring.len()` would be
     the wrong number, because it is empty when the reservation is made.

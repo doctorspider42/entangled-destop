@@ -956,10 +956,16 @@ fn the_stream_lifecycle_is_enforced_over_the_wire() {
         harness.pcm_command(protocol::R_PCM_RELEASE, 0),
         protocol::S_OK
     );
-    // Released: back to square one.
+    // Released, parameters kept: the spec allows PREPARE straight after
+    // RELEASE, and Linux's xrun recovery (STOP, RELEASE, PREPARE) depends on
+    // it — refusing it killed a guest's sound at its first underrun.
     assert_eq!(
         harness.pcm_command(protocol::R_PCM_PREPARE, 0),
-        protocol::S_BAD_MSG
+        protocol::S_OK
+    );
+    assert_eq!(
+        harness.pcm_command(protocol::R_PCM_START, 0),
+        protocol::S_OK
     );
 }
 

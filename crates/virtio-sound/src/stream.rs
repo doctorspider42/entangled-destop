@@ -368,12 +368,20 @@ pub fn validate_xfer(
 ///
 /// ```text
 ///   Unset ──SET_PARAMS──▶ ParamsSet ──PREPARE──▶ Prepared ──START──▶ Running
-///     ▲                       ▲                     │  ▲                │
-///     └────────RELEASE────────┴─────────────────────┘  └─────STOP───────┘
+///                             ▲                     │  ▲                │
+///                             └──────RELEASE────────┘  └─────STOP───────┘
 /// ```
+///
+/// `RELEASE` frees the host sink but **keeps the parameters**: the spec's
+/// lifecycle allows `SET PARAMETERS` *or* `PREPARE` after it, and Linux's
+/// driver relies on the second — after an xrun it sends STOP, then RELEASE
+/// (`virtsnd_pcm_sync_stop`), then only PREPARE. Returning to `Unset` refused
+/// that PREPARE, so a guest's sound died at its first underrun and anything
+/// waiting on its audio clock (a browser's video player) stalled for good
+/// (found 2026-10-12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StreamState {
-    /// No parameters set (power-on, and where `RELEASE` returns the stream).
+    /// No parameters set (power-on and device reset).
     #[default]
     Unset,
     /// Parameters accepted, hardware not yet claimed.
@@ -410,8 +418,9 @@ pub fn transition(state: StreamState, command: u32) -> Result<StreamState, Param
         (protocol::R_PCM_STOP, Running) => Ok(Prepared),
         // RELEASE from Running is tolerated — it implies a stop, and a driver
         // tearing down after an error should not be left with a stream it
-        // cannot free. From Unset there is nothing to release.
-        (protocol::R_PCM_RELEASE, ParamsSet | Prepared | Running) => Ok(Unset),
+        // cannot free. From Unset there is nothing to release. The parameters
+        // survive it (see the type's docs).
+        (protocol::R_PCM_RELEASE, ParamsSet | Prepared | Running) => Ok(ParamsSet),
         // SET_PARAMS while audio is flowing would change the frame size under
         // the pump; everything else is fair game.
         (protocol::R_PCM_SET_PARAMS, Unset | ParamsSet | Prepared) => Ok(ParamsSet),
@@ -643,8 +652,19 @@ mod tests {
         assert_eq!(transition(Prepared, protocol::R_PCM_PREPARE), Ok(Prepared));
         assert_eq!(transition(Prepared, protocol::R_PCM_START), Ok(Running));
         assert_eq!(transition(Running, protocol::R_PCM_STOP), Ok(Prepared));
-        assert_eq!(transition(Prepared, protocol::R_PCM_RELEASE), Ok(Unset));
-        assert_eq!(transition(Running, protocol::R_PCM_RELEASE), Ok(Unset));
+        assert_eq!(transition(Prepared, protocol::R_PCM_RELEASE), Ok(ParamsSet));
+        assert_eq!(transition(Running, protocol::R_PCM_RELEASE), Ok(ParamsSet));
+        // Linux's xrun recovery: STOP, RELEASE, then PREPARE with no new
+        // SET_PARAMS — the walk that used to be refused.
+        let mut state = Running;
+        for command in [
+            protocol::R_PCM_STOP,
+            protocol::R_PCM_RELEASE,
+            protocol::R_PCM_PREPARE,
+        ] {
+            state = transition(state, command).expect("xrun recovery");
+        }
+        assert_eq!(state, Prepared);
 
         // And refuses the ones it must, with BAD_MSG rather than a panic.
         for (state, command) in [
