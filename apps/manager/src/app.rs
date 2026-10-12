@@ -215,6 +215,15 @@ pub struct CloneVmState {
     pub events: Option<mpsc::Receiver<CloneEvent>>,
 }
 
+/// "Rename this machine" dialog state.
+pub struct RenameVmState {
+    pub source: String,
+    pub profile: PathBuf,
+    /// The new name as typed.
+    pub name: String,
+    pub error: Option<String>,
+}
+
 /// "Grow this disk" dialog state. Shrinking is not offered at all — the CLI
 /// refuses it because it would destroy whatever the guest put at the end of the
 /// image, and an action that can only fail does not belong in a GUI.
@@ -278,6 +287,7 @@ pub enum Modal {
     EditVm(EditVmState),
     MoveDisk(MoveDiskState),
     CloneVm(CloneVmState),
+    RenameVm(RenameVmState),
     ResizeDisk(ResizeDiskState),
     DeleteSnapshot(DeleteSnapshotState),
     DiscardSnapshot(DiscardSnapshotState),
@@ -350,6 +360,9 @@ pub enum Action {
     /// Copy a stopped machine (disks, NVRAM, profile) under a new name.
     AskCloneVm(String),
     SubmitCloneVm,
+    /// Give a stopped machine another name, and its files with it.
+    AskRenameVm(PathBuf),
+    SubmitRenameVm,
     // ---- Move to another drive ----------------------------------------------
     AskMoveDisk(PathBuf),
     SubmitMoveDisk,
@@ -2477,6 +2490,132 @@ impl ManagerApp {
         self.thumbs.refresh(ctx, now, vms);
     }
 
+    /// How many machines on the dashboard answer to `name`. More than one is a
+    /// problem: everything here — status, logs, snapshots, the card picture —
+    /// is keyed by the name, so the card says so and offers Rename.
+    pub fn name_count(&self, name: &str) -> usize {
+        self.scan.vms.iter().filter(|vm| vm.name == name).count()
+    }
+
+    fn ask_rename_vm(&mut self, profile: &Path) {
+        // By profile, not name: the duplicates this exists to fix share the
+        // name, and the card that was clicked is the one to rename.
+        let Some(vm) = self.scan.vms.iter().find(|vm| vm.profile_path == profile) else {
+            self.toast(ToastLevel::Error, "that machine is gone from disk");
+            return;
+        };
+        let name = vm.name.clone();
+        let profile = vm.profile_path.clone();
+        if self.is_busy(&name) {
+            self.toast(
+                ToastLevel::Warn,
+                format!("'{name}' is running — stop it before renaming"),
+            );
+            return;
+        }
+        if self.snapshot_for(&name).is_some() {
+            self.toast(
+                ToastLevel::Warn,
+                format!(
+                    "'{name}' has a saved session, which only goes back onto the files it \
+                     came off — resume it and shut it down, or forget the session, first"
+                ),
+            );
+            return;
+        }
+        // The profile's own file name is the likeliest intended name for a
+        // duplicate (`ubuntu-120.toml` that says `name = "ubuntu"`).
+        let suggested = profile
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|stem| *stem != name && discovery::validate_name(stem).is_ok())
+            .unwrap_or_else(|| name.clone());
+        self.modal = Modal::RenameVm(RenameVmState {
+            source: name,
+            profile,
+            name: suggested,
+            error: None,
+        });
+    }
+
+    fn submit_rename_vm(&mut self) {
+        let Modal::RenameVm(state) = &self.modal else {
+            return;
+        };
+        let source = state.source.clone();
+        let profile = state.profile.clone();
+        let new_name = state.name.trim().to_string();
+        let fail = |app: &mut Self, message: String| {
+            if let Modal::RenameVm(state) = &mut app.modal {
+                state.error = Some(message);
+            }
+        };
+        if let Err(e) = discovery::validate_name(&new_name) {
+            fail(self, e);
+            return;
+        }
+        if new_name == source {
+            fail(self, "that is already its name".into());
+            return;
+        }
+        if self.vm(&new_name).is_some() {
+            fail(self, format!("a machine named '{new_name}' already exists"));
+            return;
+        }
+        if self.is_busy(&source) {
+            fail(self, format!("'{source}' is running — stop it first"));
+            return;
+        }
+        if self.mock_mode {
+            self.modal = Modal::None;
+            self.toast(
+                ToastLevel::Success,
+                format!("mock: would rename '{source}' to '{new_name}'"),
+            );
+            return;
+        }
+        match disk_image::rename_machine(&profile, &new_name) {
+            Ok(outcome) => {
+                // What the manager derives from the name follows it, best
+                // effort: the backend choice, the logs and the card picture.
+                // A duplicate's backend stays with the name it leaves behind.
+                let backend = self.backend_of(&source);
+                self.settings.set_backend_for(&new_name, backend);
+                if self.name_count(&source) <= 1 {
+                    self.settings.vm_backends.remove(&source);
+                    let vm_dir = self.settings.vm_dir.clone();
+                    for suffix in ["-run.log", "-install.log"] {
+                        let _ = std::fs::rename(
+                            vm_dir.join(format!("{source}{suffix}")),
+                            vm_dir.join(format!("{new_name}{suffix}")),
+                        );
+                    }
+                    let _ = std::fs::rename(
+                        crate::thumbs::path_for(&profile, &source),
+                        crate::thumbs::path_for(&outcome.profile, &new_name),
+                    );
+                }
+                self.persist_settings_quietly();
+                self.modal = Modal::None;
+                self.toast(
+                    ToastLevel::Success,
+                    format!("'{source}' is now '{new_name}'"),
+                );
+                if !outcome.shared_disks.is_empty() {
+                    self.toast(
+                        ToastLevel::Warn,
+                        format!(
+                            "{} disk(s) kept their names — another machine uses them too",
+                            outcome.shared_disks.len()
+                        ),
+                    );
+                }
+                self.request_scan(true);
+            }
+            Err(e) => fail(self, e.to_string()),
+        }
+    }
+
     /// The first free `<name>-N`: no machine, profile or disk by that name.
     fn suggest_clone_name(&self, source: &str, profile: &Path) -> String {
         let dir = profile.parent().unwrap_or(Path::new("."));
@@ -3237,6 +3376,8 @@ impl ManagerApp {
             Action::AskEditVm(name) => self.ask_edit_vm(&name),
             Action::AskCloneVm(name) => self.ask_clone_vm(&name),
             Action::SubmitCloneVm => self.submit_clone_vm(),
+            Action::AskRenameVm(profile) => self.ask_rename_vm(&profile),
+            Action::SubmitRenameVm => self.submit_rename_vm(),
             Action::SubmitEditVm => self.submit_edit_vm(),
             Action::AskMoveDisk(path) => self.ask_move_disk(&path),
             Action::SubmitMoveDisk => self.submit_move_disk(),

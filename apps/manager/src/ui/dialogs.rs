@@ -755,6 +755,13 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             560.0,
             |ui| move_disk_body(ui, state, actions),
         ),
+        Modal::RenameVm(state) => frame(
+            ctx,
+            "rename-vm",
+            &format!("Rename {}", state.source),
+            480.0,
+            |ui| rename_vm_body(ui, state, actions),
+        ),
         Modal::CloneVm(state) => frame(
             ctx,
             "clone-vm",
@@ -2256,6 +2263,49 @@ fn move_disk_body(
             })
             .clicked()
         {
+            actions.push(Action::CloseModal);
+        }
+    });
+}
+
+/// Renaming a machine: one field, and what will follow the name.
+fn rename_vm_body(
+    ui: &mut egui::Ui,
+    state: &mut crate::app::RenameVmState,
+    actions: &mut Vec<Action>,
+) {
+    ui::form_scope(ui);
+    ui.label(ui::dim(
+        "The profile, and the disks and UEFI store named after the machine, are \
+         renamed with it. A disk another machine uses too keeps its name. The guest \
+         inside is not touched: its own hostname stays what it was.",
+    ));
+    ui.add_space(4.0);
+    ui.label(ui::faint(format!("− {}", state.profile.display())));
+    ui.add_space(12.0);
+    ui::form_row(
+        ui,
+        "NAME",
+        "Letters, digits, '-', '_' and '.', starting with a letter or digit.",
+        |ui, field_w| {
+            let response =
+                ui.add(egui::TextEdit::singleline(&mut state.name).desired_width(field_w));
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                actions.push(Action::SubmitRenameVm);
+            }
+        },
+    );
+    if let Some(error) = &state.error {
+        ui.add_space(8.0);
+        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+    }
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        let ready = !state.name.trim().is_empty();
+        if ui::ghost_button(ui, "Rename", ready, theme::VIOLET).clicked() {
+            actions.push(Action::SubmitRenameVm);
+        }
+        if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
             actions.push(Action::CloseModal);
         }
     });

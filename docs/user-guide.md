@@ -1138,8 +1138,20 @@ state:
 plus **Configure** on every card — allowed while a machine is stopped or
 suspended, with the warning that changing its hardware is what makes a saved
 session unrestorable — and a **More** menu holding *Copy profile path*, *Open
-activity log*, *Forget the saved session* (when there is one), *Clone…* and
-*Delete machine*.
+activity log*, *Forget the saved session* (when there is one), *Rename…*,
+*Clone…* and *Delete machine*.
+
+**Rename…** changes a stopped machine's name. The profile is renamed to
+`<new>.toml`, and so are the disks and the UEFI store named after the machine.
+A disk that another profile also uses keeps its name, so that machine still
+starts. The network address stays the same, and so does the hostname inside the
+guest. A machine with a saved session cannot be renamed, because a snapshot only
+goes back onto the files it was taken from.
+
+Everything the manager shows for a machine (its status, logs, saved session and
+screen picture) is keyed by the machine's name. So when two profiles in the VM
+directory have the same `name =`, both cards say so in orange: *2 profiles share
+this name — rename one*. This happens to profiles copied by hand.
 
 **Clone…** makes a second machine from a stopped one. It copies every writable
 disk next to the original, renamed for the new machine (`ubuntu.raw` →

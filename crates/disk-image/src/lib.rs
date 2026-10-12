@@ -15,6 +15,8 @@
 //!   sidecar) to another directory or drive.
 //! * [`clone`] — a whole machine copied under a new name: its writable disks
 //!   (through the same verified sparse copy), its NVRAM and a new profile.
+//! * [`rename`] — a machine's name changed everywhere it is spelled: the
+//!   profile's file name, and the disks and NVRAM named after it.
 //!
 //! Portable by design (ADR-0002): the platform-specific parts (allocated
 //! size, sparse marking, allocated-range enumeration, free space) live behind
@@ -27,6 +29,7 @@ pub mod layout;
 pub mod ops;
 pub mod refs;
 pub mod relocate;
+pub mod rename;
 
 pub use clone::{clone_machine, CloneError, CloneOutcome};
 pub use inspect::{inspect_disk, DiskReport, PartitionReport, TableKind};
@@ -42,6 +45,7 @@ pub use ops::{
 };
 pub use refs::{default_scan_dirs, find_references, remove_disk, ProfileRef, RemoveError};
 pub use relocate::{move_disk, MoveError, MoveOutcome};
+pub use rename::{rename_machine, RenameError, RenameOutcome};
 
 /// Shared synthetic-image builders for the tests of several modules.
 #[cfg(test)]

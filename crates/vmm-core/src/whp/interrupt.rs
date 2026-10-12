@@ -125,14 +125,26 @@ impl HaltGate {
             std::thread::sleep(timeout);
             return self.epoch();
         };
-        if self.epoch() != seen {
-            return self.epoch();
+        // A condition variable may wake spuriously, so the wait is a loop
+        // against a deadline: returning early with the epoch unmoved would be
+        // the caller's "timed out" for a wait that did not.
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = guard;
+        loop {
+            let epoch = self.epoch();
+            if epoch != seen {
+                return epoch;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return epoch;
+            }
+            guard = self
+                .woken
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
-        let (_guard, _timed_out) = self
-            .woken
-            .wait_timeout(guard, timeout)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.epoch()
     }
 }
 

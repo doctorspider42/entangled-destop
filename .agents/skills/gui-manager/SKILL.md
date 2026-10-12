@@ -566,6 +566,28 @@ The backend is manager state, so the manager copies the source's backend to
 the clone after it succeeds (`set_backend_for`). `suggest_clone_name` proposes
 `ubuntu-3` for `ubuntu-2`, not `ubuntu-2-2`.
 
+### Rename, and the name as the key (`disk_image::rename`, 2026-10-12)
+
+Everything in this crate is keyed by the machine's **name** (`status_of`, the
+supervisor, `<name>-run.log`, the snapshot, the card picture, `vm_backends`),
+not by its profile path. Two profiles with the same `name =` therefore share
+all of it, which happens when profiles are copied by hand. `name_count` makes
+the card say so, and *More → Rename…* is the fix. `Action::AskRenameVm` carries
+the **profile path**, not the name, because the clicked card is the one to
+rename and its name is ambiguous by definition. The dialog suggests the
+profile's file stem.
+
+`disk_image::rename_machine` renames the profile, plus every writable disk whose
+file name starts with the old name, plus that disk's `.nvram` sidecar.
+Exception: a disk another profile references
+(`refs::find_references`) **stays put**. It is reported in `shared_disks`, and
+the manager toasts it. All the renames are in one directory, and they are
+undone on failure. The MAC is kept. The new profile is written before the old
+one is removed. The manager refuses the rename while the machine is busy or
+has a snapshot (ADR-0006 fingerprints the disk paths). Afterwards it moves the
+backend setting, the logs and the picture, but only when no duplicate keeps
+the old name.
+
 ### The screen on the card (`thumbs.rs`, 2026-10-12)
 
 Every `thumbs::ASK_EVERY` (3 s) `refresh_thumbnails` sends `thumbnail` to each

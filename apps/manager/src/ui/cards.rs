@@ -258,6 +258,19 @@ fn vm_card(
             }
             let path = vm.profile_path.display().to_string();
             ui.label(ui::faint(shorten(&path, 46))).on_hover_text(&path);
+            let twins = app.name_count(&vm.name);
+            if twins > 1 {
+                ui.label(
+                    RichText::new(format!("{} profiles share this name — rename one", twins))
+                        .color(theme::WARN)
+                        .size(12.5),
+                )
+                .on_hover_text(
+                    "Status, logs, saved sessions and the screen picture all go by the \
+                     machine's name, so machines that share one get each other's. More → \
+                     Rename… gives this one its own.",
+                );
+            }
             live_stats_line(ui, app, vm, status, accent_at);
             suspend_line(ui, app, vm, status);
             ui.add_space(6.0);
@@ -574,6 +587,17 @@ fn action_strip(
                 if let Some(row) = app.snapshot_for(&vm.name) {
                     actions.push(Action::AskDeleteSnapshot(row.path.clone()));
                 }
+                ui.close();
+            }
+            if ui
+                .add_enabled(status == Status::Stopped, egui::Button::new("Rename…"))
+                .on_hover_text(
+                    "A new name for the machine, and for its profile and the disks \
+                     and UEFI store named after it.",
+                )
+                .clicked()
+            {
+                actions.push(Action::AskRenameVm(vm.profile_path.clone()));
                 ui.close();
             }
             if ui
