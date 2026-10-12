@@ -41,6 +41,7 @@ pub enum PickTarget {
     EditorNvram,
     EditorCdrom,
     EditorAddDisk,
+    EditorAddShare,
     MoveDestination,
 }
 
@@ -91,6 +92,11 @@ fn spec(target: PickTarget) -> Spec {
             title: "Choose a disk image",
             kind: Kind::File,
             filter: Some(DISK_FILTER),
+        },
+        PickTarget::EditorAddShare => Spec {
+            title: "Choose a folder to share with the machine",
+            kind: Kind::Directory,
+            filter: None,
         },
         PickTarget::EditorKernel => Spec {
             title: "Choose a Linux kernel image",
@@ -242,6 +248,7 @@ mod tests {
             PickTarget::EditorNvram,
             PickTarget::EditorCdrom,
             PickTarget::EditorAddDisk,
+            PickTarget::EditorAddShare,
             PickTarget::MoveDestination,
         ] {
             let spec = spec(target);

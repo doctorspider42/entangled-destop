@@ -1,0 +1,22 @@
+[package]
+name = "virtio-9p"
+description = "virtio-9p device: a host directory shared with the guest over 9P2000.L"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Free space for statfs, through the same portable helper the disk tools use.
+disk-image.workspace = true
+tracing.workspace = true
+virtio-core.workspace = true
+virtio-queue.workspace = true
+vm-memory.workspace = true
+
+[dev-dependencies]
+virtio-core = { workspace = true, features = ["test-utils"] }
+
+[lints]
+workspace = true

@@ -202,6 +202,11 @@ you add a device: a bound without an enforcing test is not done.
 | `virtio_gpu::blob::BLOB_PAGE_SIZE` | 4096 | granularity every blob size and map offset must be a multiple of | `blob::tests::window_reservations_cannot_overlap_or_run_off_the_end` |
 | `virtio_gpu::MAX_COMMAND_BYTES_BLOB` | 256 KiB + 56 B | gather cap once blob resources are offered — 24 bytes above the 2D cap, because a full-length `RESOURCE_CREATE_BLOB` really is 24 bytes longer than a full-length attach-backing | `virtio_gpu::device::tests::command_buffer_bound_matches_the_entry_limit` (compile-time `assert!`s in `device.rs`) |
 | `virtio_gpu::CHAINS_PER_NOTIFY` | 1024 | chains drained per kick (controlq and cursorq) | same shape as the blk budget test |
+| `virtio_9p::server::MAX_MSIZE` | 512 KiB | the negotiated 9P message size, and with it every read reply and readdir page | `virtio_9p::server::tests::malformed_messages_are_answered_not_fatal` (a read past msize is cut to it) |
+| `virtio_9p::device::MAX_REQUEST_BYTES` | msize + 4 KiB | bytes gathered from one request chain, refused *before* reading | `virtio_9p::device::gather` (checked against the chain walk's total) |
+| `virtio_9p::server::MAX_FIDS` | 16384 | live fids one guest may hold (each may hold an open host file) | `virtio_9p::server::tests::the_fid_table_is_bounded` |
+| `virtio_9p::server::MAX_WALK` / `MAX_DIR_ENTRIES` | 16 / 65536 | names in one `Twalk`; entries one directory listing holds | `virtio_9p::server::tests::malformed_messages_are_answered_not_fatal` |
+| `control_api::MAX_SHARES` | 4 | `[[share]]` sections, each a device slot | `control_api` validation |
 | `virtio_input::MAX_PENDING_EVENTS` | 1024 | host-buffered input events while the guest is not draining (oldest dropped) | `input_queue::a_starved_queue_buffers_events_up_to_the_bound_and_drops_the_oldest` |
 | `virtio_input::config::PAYLOAD_MAX` | 128 | config-space payload bytes | `virtio_input::config::tests::{bitmap_drops_codes_beyond_the_payload, from_slice_truncates_at_the_payload_size}` |
 | `virtio_input::gamepad::MAX_EVENTS_PER_REPORT` | 20 | events one capture tick can push (11 buttons + 8 axes + the `SYN_REPORT`); *derived*, and what makes "one host tick is one bounded push" true by construction | `virtio_input::gamepad::tests::every_event_the_pump_can_produce_is_one_the_profile_advertises` (asserts the budget is exact) |
@@ -758,9 +763,10 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
     52 MB/s (16 KiB and the loop: 9.9 — one buffer per tick). The guest's own
     `ss -ti` (`segs_in`, `rcv_rtt`) is what gave the per-tick ceiling away:
     ~1300 segments/s is a packet-rate limit, not a bandwidth one.
-  - **UDP is DHCP and DNS and nothing else.** There is no general UDP NAT, so
-    QUIC, NTP and mDNS do not work through this backend; anything else on UDP
-    is counted as `dropped_unsupported`. A test says so, and it is the test that
+  - **UDP is DHCP, DNS and NTP and nothing else.** NTP is answered by the NAT
+    itself from the host's clock (`usernet::ntp`). There is no general UDP NAT,
+    so QUIC and mDNS do not work through this backend; anything else on UDP is
+    counted as `dropped_unsupported`. A test says so, and it is the test that
     has to change the day one is added.
   - **DNS answers are whatever size the upstream sends.** The relay reads the
     whole datagram (it used to read 512 bytes, which on Windows *discards* a
@@ -975,6 +981,23 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   lifecycle, both queue directions) and `snd_device` (arbitrary chains through a
   live transport whose streams the harness first drives to Running, so RX
   reaches the fill path rather than only the refusal path).
+- **9p** (shared folders, 2026-10-12): `crates/virtio-9p`, device type 9, one
+  request queue, `VIRTIO_9P_MOUNT_TAG` with the tag in config space. The
+  server is 9P2000.L on portable `std::fs`. Its security model is the whole
+  point, and it rests on three rules in `server.rs`, each with a test:
+  - **A fid is a component list below the root**, never a host path.
+  - **Names are single components.** `valid_name` refuses `.`, `..`,
+    separators and NUL, and on Windows also `:`, device names and trailing
+    dots.
+  - **Every request re-`lstat`s every component and follows no symlink**
+    (`resolve`). That re-check is what defeats the trick of swapping a
+    directory for a link under a live fid, and it works because requests are
+    served one at a time inside `notify`.
+
+  Guest-created symlinks must be relative and must not contain `..`. Files
+  appear owned by the attaching uid. `snapshot_refusal` refuses a suspend
+  while any fid exists, because open host files cannot be saved. A device
+  reset clears every fid.
 - **input** (EPIC 9): event model in `virtio_input` (`ev`, `abs`, `btn`,
   `InputEvent`). Absolute pointer: window coords →
   `InputEvent::abs_from_window` (0..=32767). Every batch ends with

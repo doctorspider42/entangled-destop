@@ -1395,6 +1395,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uefi-boot",
+ "virtio-9p",
  "virtio-block",
  "virtio-core",
  "virtio-gpu",
@@ -4481,6 +4482,17 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtio-9p"
+version = "0.2.0"
+dependencies = [
+ "disk-image",
+ "tracing",
+ "virtio-core",
+ "virtio-queue",
+ "vm-memory 0.17.2",
+]
 
 [[package]]
 name = "virtio-bindings"

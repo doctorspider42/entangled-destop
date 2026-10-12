@@ -241,6 +241,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         // The installer has nothing to say; the *installed* profile below is
         // where the card and the pad belong.
         sound: SoundSection::default(),
+        shares: Vec::new(),
         gamepad: GamepadSection::default(),
     };
 
@@ -356,6 +357,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         // bargain as the sound card: `auto` costs a virtio slot and nothing
         // else, a host with no controller gets a pad that never moves, and one
         // plugged in later is picked up without restarting the VM.
+        shares: Vec::new(),
         gamepad: GamepadSection {
             enabled: true,
             // One pad. A second is a config edit away and costs another virtio

@@ -97,6 +97,7 @@ kernel and initramfs artifacts, and self-skips without them.
 | `crates/virtio-block` | virtio-blk device, RAW file backend | EPIC 4 |
 | `crates/virtio-net` | virtio-net device, TAP backend | EPIC 5 |
 | `crates/virtio-gpu` | virtio-gpu device: 2D scanout + VirGL 3D (`Renderer3d` trait, null renderer everywhere, virglrenderer dlopen'd on Linux — ADR-0004) | EPIC 8, GPU-001..012 |
+| `crates/virtio-9p` | shared folders: a host directory over 9P2000.L on virtio (`[[share]]`), confined to its root (no `..`, no symlink followed) | — |
 | `crates/virtio-input` | keyboard + absolute pointer devices | EPIC 9 |
 | `crates/virtio-sound` | virtio-snd playback: control/event/TX queues, PCM lifecycle, host sinks behind `AudioSink` (null/recording everywhere, ALSA dlopen'd on Linux, WASAPI on Windows) | EPIC 21, GAME-2102 |
 | `crates/display` | winit window, wgpu renderer, host input capture | EPIC 7 |

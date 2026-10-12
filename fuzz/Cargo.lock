@@ -751,6 +751,7 @@ dependencies = [
  "debian-media",
  "libfuzzer-sys",
  "machine-x86",
+ "virtio-9p",
  "virtio-block",
  "virtio-core",
  "virtio-gpu",
@@ -1156,6 +1157,7 @@ dependencies = [
  "vm-memory 0.17.2",
  "vmm-core",
  "vmm-sys-util",
+ "windows",
 ]
 
 [[package]]
@@ -2156,6 +2158,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "virtio-9p"
+version = "0.2.0"
+dependencies = [
+ "disk-image",
+ "tracing",
+ "virtio-core",
+ "virtio-queue",
+ "vm-memory 0.17.2",
+]
+
+[[package]]
 name = "virtio-bindings"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2222,6 +2235,7 @@ dependencies = [
  "virtio-queue",
  "vm-memory 0.17.2",
  "vmm-sys-util",
+ "windows",
 ]
 
 [[package]]

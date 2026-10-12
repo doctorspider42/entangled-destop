@@ -2119,6 +2119,124 @@ fn edit_storage(ui: &mut egui::Ui, form: &mut crate::editor::EditForm, actions: 
             form.add_disk.clear();
         }
     });
+
+    ui.add_space(18.0);
+    let mut remove = None;
+    for (index, share) in form.shares.iter_mut().enumerate() {
+        let (label, tip) = if index == 0 {
+            ("SHARED FOLDERS", SHARE_TIP)
+        } else {
+            ("", "")
+        };
+        ui::form_row(ui, label, tip, |ui, field_w| {
+            egui::Frame::new()
+                .fill(theme::INSET)
+                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
+                .inner_margin(egui::Margin::symmetric(9, 6))
+                .show(ui, |ui| {
+                    ui.set_width(field_w - 18.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut share.tag)
+                                .desired_width(96.0)
+                                .hint_text("tag"),
+                        )
+                        .on_hover_text("The name the guest mounts it by");
+                        let path = share.path.display().to_string();
+                        ui.label(
+                            RichText::new(shorten_middle(&path, 34))
+                                .color(theme::TEXT)
+                                .size(12.0),
+                        )
+                        .on_hover_text(path);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui::ghost_button(ui, "Remove", true, theme::WARN).clicked() {
+                                remove = Some(index);
+                            }
+                            ui.checkbox(&mut share.read_only, "Read-only");
+                        });
+                    });
+                });
+        });
+        if !control_api::valid_share_tag(&share.tag) {
+            ui::form_note(
+                ui,
+                RichText::new("a tag is letters, digits, '-', '_' or '.', up to 31 of them")
+                    .color(theme::WARN)
+                    .size(11.0),
+            );
+        } else {
+            ui::form_note(
+                ui,
+                ui::faint(format!(
+                    "in the guest: sudo mount -t 9p -o trans=virtio {} /mnt/{}",
+                    share.tag, share.tag
+                )),
+            );
+        }
+    }
+    if let Some(index) = remove {
+        form.shares.remove(index);
+    }
+    let full = form.shares.len() >= control_api::MAX_SHARES;
+    if ui::path_row(
+        ui,
+        if form.shares.is_empty() {
+            "SHARED FOLDERS"
+        } else {
+            ""
+        },
+        SHARE_TIP,
+        &mut form.add_share,
+        "choose a folder…",
+        !full,
+    ) {
+        actions.push(Action::PickPath(PickTarget::EditorAddShare));
+    }
+    let path = form.add_share.trim().to_string();
+    ui.horizontal(|ui| {
+        ui.add_space(ui::FORM_LABEL_W + ui.spacing().item_spacing.x);
+        if ui::ghost_button(ui, "Share it", !path.is_empty() && !full, theme::CYAN).clicked() {
+            let path = std::path::PathBuf::from(path);
+            // A tag of its own: the folder's name, numbered if taken.
+            let base = control_api::share_tag_for(&path);
+            let mut tag = base.clone();
+            let mut n = 2;
+            while form.shares.iter().any(|s| s.tag == tag) {
+                tag = format!("{}-{n}", &base[..base.len().min(28)]);
+                n += 1;
+            }
+            form.shares.push(control_api::ShareSection {
+                path,
+                tag,
+                read_only: false,
+            });
+            form.add_share.clear();
+        }
+    });
+}
+
+/// The explanation on the shared-folder rows.
+const SHARE_TIP: &str = "A folder on this computer the machine can open as a drive of \
+     its own. Each one is mounted inside the guest by its tag, for example \
+     `sudo mount -t 9p -o trans=virtio <tag> /mnt/<tag>` (or a line in /etc/fstab). \
+     Read-only lets the guest look but never change anything. Files appear to belong to \
+     whoever looks at them in the guest; what they can really do is what this computer \
+     lets Entangled do.";
+
+/// `C:\Users\…\Projects` — the start and the end of a long path.
+fn shorten_middle(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let head = max / 3;
+    let tail = max - head - 1;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
 }
 
 /// The move-to-another-drive dialog: destination, the space arithmetic

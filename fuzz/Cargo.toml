@@ -32,6 +32,7 @@ virtio-block = { path = "../crates/virtio-block" }
 virtio-input = { path = "../crates/virtio-input" }
 virtio-gpu = { path = "../crates/virtio-gpu" }
 virtio-sound = { path = "../crates/virtio-sound" }
+virtio-9p = { path = "../crates/virtio-9p" }
 # `fuzzing` exposes the offline NAT harness: the real router with no host
 # sockets, so a fuzzer cannot dial the internet.
 virtio-net = { path = "../crates/virtio-net", features = ["fuzzing"] }
@@ -136,6 +137,13 @@ bench = false
 [[bin]]
 name = "snapshot_parse"
 path = "fuzz_targets/snapshot_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ninep_server"
+path = "fuzz_targets/ninep_server.rs"
 test = false
 doc = false
 bench = false

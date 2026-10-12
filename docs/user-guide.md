@@ -890,6 +890,50 @@ about half to two thirds of one CPU core doing it (46-65 %, the guest's own
 vCPU time included; 2-4 % with the guest idle). Until this build a download was held to
 about 1.5-2 MB/s by the NAT itself.
 
+### Shared folders
+
+A folder on the host can be opened inside the guest like a drive of its own:
+
+```toml
+[[share]]
+path = 'D:\Projects'
+tag = "projects"
+# read_only = true      # the guest may look but never change anything
+```
+
+In the manager, this is *Configure → Storage → Shared folders*. Inside the
+guest, mount it by its tag:
+
+```bash
+sudo mkdir -p /mnt/projects
+sudo mount -t 9p -o trans=virtio,version=9p2000.L,msize=524288 projects /mnt/projects
+```
+
+To mount it at every boot, add this line to `/etc/fstab`:
+
+```text
+projects  /mnt/projects  9p  trans=virtio,version=9p2000.L,msize=524288,nofail  0  0
+```
+
+The protocol is 9P (virtio-9p). Ubuntu, Debian and Fedora kernels carry it,
+and nothing has to be installed in the guest. What to expect:
+
+- **Files belong to whoever looks.** Every file appears to be owned by the
+  guest user reading it, and is readable and writable by everyone (folders
+  can also be entered by everyone). The guest's own permission checks
+  therefore always pass. What the guest can really do to a file is what the
+  host lets Entangled do, because Entangled runs as you on the host. On a
+  read-only share, nothing shows as writable.
+- **The share is a fence.** The guest cannot reach outside the folder.
+  Entangled refuses `..` and never follows a symlink, including one placed in
+  the folder on the host. The guest can create symlinks only if the target is
+  relative and stays inside the share. On Windows, creating a symlink needs
+  Developer Mode.
+- **At most four shares per machine**, and each one takes one of the
+  machine's eight device slots.
+- **A mounted share cannot be suspended.** Its open files live on the host and
+  cannot go into a snapshot, so *Suspend* is refused until you `umount` it.
+
 ### Without a window
 
 ```bash

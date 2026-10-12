@@ -113,6 +113,10 @@ pub struct EditForm {
     pub disks: Vec<control_api::DiskSection>,
     /// Buffer for the "add disk" field.
     pub add_disk: String,
+    /// The `[[share]]` list: host folders the guest can mount.
+    pub shares: Vec<control_api::ShareSection>,
+    /// Buffer for the "share a folder" field.
+    pub add_share: String,
     /// Where this machine runs. Not part of the profile — see
     /// [`crate::settings::Settings::vm_backends`] — but edited here because it
     /// decides which of the other fields are even available.
@@ -279,6 +283,8 @@ enabled = true
                 .clamp(1, control_api::MAX_GAMEPAD_PLAYERS),
             disks: cfg.disks.clone(),
             add_disk: String::new(),
+            shares: cfg.shares.clone(),
+            add_share: String::new(),
             backend: Backend::Native,
             base_backend: Backend::Native,
             work_dir: PathBuf::from("."),
@@ -355,6 +361,7 @@ enabled = true
             .gamepad_players
             .clamp(1, control_api::MAX_GAMEPAD_PLAYERS);
         cfg.disks = self.disks.clone();
+        cfg.shares = self.shares.clone();
 
         let out = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
         VmConfig::from_toml(&out).map_err(|e| e.to_string())

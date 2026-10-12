@@ -103,6 +103,67 @@ pub struct VmConfig {
     /// [`GamepadSection`].
     #[serde(default)]
     pub gamepad: GamepadSection,
+    /// Host directories shared with the guest (`[[share]]`), each one a
+    /// virtio-9p device after every other device. None by default.
+    #[serde(default, rename = "share", skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<ShareSection>,
+}
+
+/// `[[share]]` — a host directory the guest mounts with
+/// `mount -t 9p -o trans=virtio <tag> <dir>`.
+///
+/// Each share is one virtio device, so it takes one of the bus's slots; the
+/// path is checked when the machine starts rather than when the profile is
+/// read, because a folder on a removable drive is an ordinary thing to share.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ShareSection {
+    /// The host directory.
+    pub path: PathBuf,
+    /// The name the guest mounts it by.
+    pub tag: String,
+    /// The guest may read but never change anything.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+}
+
+/// Shared folders one machine may have.
+pub const MAX_SHARES: usize = 4;
+/// The longest mount tag (what `virtio-9p` offers).
+pub const MAX_SHARE_TAG_LEN: usize = 31;
+
+/// Is `tag` a mount tag: ASCII letters, digits, `-`, `_` and `.`, at most
+/// [`MAX_SHARE_TAG_LEN`] bytes. The same rule `virtio_9p::valid_tag` applies.
+pub fn valid_share_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= MAX_SHARE_TAG_LEN
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// A mount tag for a folder: its name, made typeable, or `share`.
+pub fn share_tag_for(path: &Path) -> String {
+    let name: String = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(MAX_SHARE_TAG_LEN)
+        .collect();
+    let name = name.trim_matches('-').to_string();
+    if valid_share_tag(&name) {
+        name
+    } else {
+        "share".to_string()
+    }
 }
 
 /// The virtio transport a VM's devices are attached to (EPIC 3 / EPIC 19).
@@ -909,6 +970,26 @@ impl VmConfig {
         }
         if self.display.width == 0 || self.display.height == 0 {
             return err("display dimensions must be non-zero".into());
+        }
+        if self.shares.len() > MAX_SHARES {
+            return err(format!(
+                "{} [[share]] sections; at most {MAX_SHARES}",
+                self.shares.len()
+            ));
+        }
+        for (i, share) in self.shares.iter().enumerate() {
+            if !valid_share_tag(&share.tag) {
+                return err(format!(
+                    "share tag {:?} must be 1..={MAX_SHARE_TAG_LEN} letters, digits, '-', '_' or '.'",
+                    share.tag
+                ));
+            }
+            if share.path.as_os_str().is_empty() {
+                return err(format!("share {:?} has no path", share.tag));
+            }
+            if self.shares[..i].iter().any(|s| s.tag == share.tag) {
+                return err(format!("two shares are tagged {:?}", share.tag));
+            }
         }
         if !(1..=MAX_GAMEPAD_PLAYERS).contains(&self.gamepad.players) {
             return err(format!(

@@ -2858,6 +2858,7 @@ impl ManagerApp {
                 PickTarget::EditorNvram => Some(&mut state.form.nvram),
                 PickTarget::EditorCdrom => Some(&mut state.form.cdrom),
                 PickTarget::EditorAddDisk => Some(&mut state.form.add_disk),
+                PickTarget::EditorAddShare => Some(&mut state.form.add_share),
                 _ => None,
             },
             _ => None,

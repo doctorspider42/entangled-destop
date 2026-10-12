@@ -760,6 +760,26 @@ fn build_devices(
         }
     }
 
+    // Shared folders, last of all: a share added to a profile never renames a
+    // device the guest already knew.
+    for share in &cfg.shares {
+        let server = virtio_9p::Server::new(&share.path, share.read_only).map_err(|e| {
+            format!(
+                "cannot share {} as '{}': {e}",
+                share.path.display(),
+                share.tag
+            )
+        })?;
+        let device = virtio_9p::NinePDevice::new(&share.tag, server)?;
+        tracing::info!(
+            path = %share.path.display(),
+            tag = %share.tag,
+            read_only = share.read_only,
+            "attaching virtio-9p shared folder"
+        );
+        devices.push(Box::new(device));
+    }
+
     Ok(BuiltDevices {
         devices,
         net_cmdline,
