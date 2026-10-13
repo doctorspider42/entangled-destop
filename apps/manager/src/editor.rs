@@ -741,6 +741,9 @@ interface = "entangled0"
         // out to produce a profile the CLI would then refuse to start.
         let mut form = EditForm::from_profile(&path).expect("reload");
         form.gamepad_players = 99;
+        // Four players are four devices: without the NIC they still fit the
+        // bus's eight (the device count is validated too).
+        form.network = NetworkChoice::None;
         form.save().expect("save");
         let cfg = VmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).expect("reload");
         assert_eq!(cfg.gamepad.players, control_api::MAX_GAMEPAD_PLAYERS);

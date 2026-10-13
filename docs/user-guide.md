@@ -1431,6 +1431,13 @@ page** link otherwise, and **Skip** to hide the banner for this session.
 Everything here is a real limitation of the current build, not a caveat about
 configuration:
 
+0. **Eight devices per machine.** Each disk, the CD-ROM, the network card,
+   the GPU, the keyboard, the tablet, the sound card, each gamepad player,
+   each shared folder and memory reclaim is one device, and a machine has
+   eight slots. A profile that needs more is refused when it is loaded or
+   saved, with every device named. A start does not fail halfway because of
+   it.
+
 1. **No Windows guests.** Untested and unsupported; Linux guests are what CI
    boots.
 2. **The GPU desktop needs the guest's cooperation and a Vulkan host.**

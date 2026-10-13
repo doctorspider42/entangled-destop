@@ -134,6 +134,10 @@ pub struct ShareSection {
 
 /// Shared folders one machine may have.
 pub const MAX_SHARES: usize = 4;
+/// virtio devices one machine may have: the mmio bus's slots
+/// (`machine_x86::virtio::MAX_VIRTIO_SLOTS`) and the pci bus's device slots
+/// (`machine_x86::pci::MAX_PCI_DEVICES` less the host bridge) are both 8.
+pub const MAX_VIRTIO_DEVICES: usize = 8;
 /// The longest mount tag (what `virtio-9p` offers).
 pub const MAX_SHARE_TAG_LEN: usize = 31;
 
@@ -979,6 +983,34 @@ impl VmConfig {
         self.validate()
     }
 
+    /// The virtio devices `entangled run` attaches for this profile, by kind,
+    /// in its order: every disk, the CD-ROM, the NIC, the GPU, keyboard and
+    /// tablet (always), sound, each gamepad player, each share, the balloon.
+    pub fn virtio_devices(&self) -> Vec<&'static str> {
+        let mut out = vec!["disk"; self.disks.len()];
+        if self.cdrom.is_some() {
+            out.push("cdrom");
+        }
+        if self.network.is_some() {
+            out.push("network");
+        }
+        out.extend(["gpu", "keyboard", "tablet"]);
+        if self.sound.enabled {
+            out.push("sound");
+        }
+        if self.gamepad.enabled {
+            out.extend(std::iter::repeat_n(
+                "gamepad",
+                usize::from(self.gamepad.players.max(1)),
+            ));
+        }
+        out.extend(std::iter::repeat_n("share", self.shares.len()));
+        if self.reclaim_memory {
+            out.push("memory reclaim");
+        }
+        out
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let err = |m: String| Err(ConfigError::Invalid(m));
         if self.name.is_empty() {
@@ -1031,6 +1063,16 @@ impl VmConfig {
                 "gamepad.players {} outside supported range 1..={MAX_GAMEPAD_PLAYERS}; \
                  each player is one virtio slot, and eight is all there are",
                 self.gamepad.players
+            ));
+        }
+        let devices = self.virtio_devices();
+        if devices.len() > MAX_VIRTIO_DEVICES {
+            return err(format!(
+                "this machine needs {} devices ({}) and at most {MAX_VIRTIO_DEVICES} fit — turn one \
+                 of the optional ones off (sound, a gamepad player, a shared folder, memory \
+                 reclaim, a disk)",
+                devices.len(),
+                devices.join(", ")
             ));
         }
         if !(MIN_REFRESH_HZ..=MAX_REFRESH_HZ).contains(&self.display.refresh_hz) {
@@ -1546,9 +1588,20 @@ scale = 1.0
             "a profile that says nothing gets one"
         );
 
+        let base = VmConfig::from_toml(BACKLOG_EXAMPLE)
+            .expect("parses")
+            .virtio_devices()
+            .len();
         for players in 1..=MAX_GAMEPAD_PLAYERS {
             let text =
                 format!("{BACKLOG_EXAMPLE}\n[gamepad]\nenabled = true\nplayers = {players}\n");
+            // Each player is a device of its own; past the bus's slots the
+            // profile is refused by the device count instead.
+            if base + usize::from(players) > MAX_VIRTIO_DEVICES {
+                let error = VmConfig::from_toml(&text).expect_err("too many devices");
+                assert!(error.to_string().contains("at most 8 fit"), "{error}");
+                continue;
+            }
             let cfg = VmConfig::from_toml(&text).unwrap_or_else(|e| panic!("{players}: {e}"));
             assert_eq!(cfg.gamepad.players, players);
             // …and it survives a round trip through TOML.
@@ -2166,5 +2219,34 @@ path = "/home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-desktop-amd64.iso"
         // name, as it always has.
         let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
         assert_eq!(cfg.network.unwrap().mac_octets().unwrap(), None);
+    }
+
+    /// A profile that would need more devices than the bus has is refused
+    /// at load — in the editor, before a start fails on it — by count and by
+    /// name.
+    #[test]
+    fn a_profile_with_more_devices_than_slots_is_refused_naming_them() {
+        let mut cfg = VmConfig::from_toml(UBUNTU_ISO_EXAMPLE).expect("parses");
+        cfg.sound.enabled = true;
+        cfg.gamepad.enabled = true;
+        cfg.gamepad.players = 1;
+        cfg.reclaim_memory = true;
+        let fits = cfg.virtio_devices().len();
+        let text = toml::to_string(&cfg).unwrap();
+        if fits <= MAX_VIRTIO_DEVICES {
+            assert!(VmConfig::from_toml(&text).is_ok(), "{fits} devices fit");
+        }
+        while cfg.virtio_devices().len() <= MAX_VIRTIO_DEVICES {
+            cfg.shares.push(ShareSection {
+                path: PathBuf::from("/srv/x"),
+                tag: format!("s{}", cfg.shares.len()),
+                read_only: false,
+            });
+        }
+        let error =
+            VmConfig::from_toml(&toml::to_string(&cfg).unwrap()).expect_err("one device too many");
+        let message = error.to_string();
+        assert!(message.contains("at most 8 fit"), "{message}");
+        assert!(message.contains("memory reclaim"), "{message}");
     }
 }
