@@ -1669,6 +1669,30 @@ fn edit_display_gpu(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
     ui.add_space(6.0);
     ui::form_row(
         ui,
+        "TYPING",
+        "The keyboard layout set inside the guest, so \"type the clipboard\" (Ctrl+Alt+V) \
+         can type its letters. Polish (programmers) adds ą ć ę ł ń ó ś ź ż as AltGr + the \
+         letter.",
+        |ui, field_w| {
+            egui::ComboBox::from_id_salt("typing-layout")
+                .width(ui::combo_width(field_w))
+                .selected_text(match form.typing_layout.as_str() {
+                    "pl" => "Polish (programmers)",
+                    _ => "US",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut form.typing_layout, String::new(), "US");
+                    ui.selectable_value(
+                        &mut form.typing_layout,
+                        "pl".to_string(),
+                        "Polish (programmers)",
+                    );
+                });
+        },
+    );
+    ui.add_space(6.0);
+    ui::form_row(
+        ui,
         "REFRESH",
         "How often the virtual monitor says it refreshes. The guest's desktop draws in          step with it, so a frame that misses one refresh waits for the next: a higher          rate makes animation smoother and lowers latency. \"Match monitor\" picks this          computer's monitor rate — or, above 144 Hz, the largest even fraction of it — the          same rule a new machine gets.",
         |ui, _| {

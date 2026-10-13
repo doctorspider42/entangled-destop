@@ -684,7 +684,16 @@ pub struct DisplaySection {
     /// keys).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_window: Option<bool>,
+    /// The keyboard layout the guest is set to, for typing text into it
+    /// (the window's "type the clipboard", the control channel's `paste`):
+    /// `"us"` (absent) or `"pl"` (Polish programmers', whose letters with
+    /// diacritics are AltGr + the plain letter). Not written when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typing_layout: Option<String>,
 }
+
+/// The values [`DisplaySection::typing_layout`] accepts.
+pub const TYPING_LAYOUTS: [&str; 2] = ["us", "pl"];
 
 /// Bounds on [`DisplaySection::refresh_hz`], mirroring `virtio_gpu::edid`'s
 /// own limits — this crate must validate the same profile on every host, so
@@ -724,6 +733,7 @@ impl Default for DisplaySection {
             gpu_memory_mib: None,
             gpu_boost: None,
             follow_window: None,
+            typing_layout: None,
         }
     }
 }
@@ -988,6 +998,13 @@ impl VmConfig {
         }
         if self.display.width == 0 || self.display.height == 0 {
             return err("display dimensions must be non-zero".into());
+        }
+        if let Some(layout) = &self.display.typing_layout {
+            if !TYPING_LAYOUTS.contains(&layout.as_str()) {
+                return err(format!(
+                    "display.typing_layout {layout:?} is not one of {TYPING_LAYOUTS:?}"
+                ));
+            }
         }
         if self.shares.len() > MAX_SHARES {
             return err(format!(

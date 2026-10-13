@@ -707,8 +707,11 @@ Three limits:
 - The keys are typed on a **US layout**, so the text comes out right when the
   guest's keyboard is set to US, or to a layout that keeps US positions for
   ASCII (Polish programmers', for one).
-- Characters with no US key are skipped. That means Polish letters, emoji and
-  other non-ASCII.
+- If the guest uses the Polish programmers' layout, set *Configure → Display &
+  GPU → Typing* to Polish, or `typing_layout = "pl"` under `[display]`. Then
+  `ą ć ę ł ń ó ś ź ż` and their capitals are typed too, as AltGr plus the
+  letter.
+- Anything else without a key is skipped, such as emoji.
 - One paste types at most 4096 characters, at about 200 a second.
 
 A headless machine can be typed into over the control channel:

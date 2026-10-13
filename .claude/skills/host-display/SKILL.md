@@ -473,8 +473,12 @@ characters a second, under a pause-gate pass. Three things to keep:
 
 - **The pacing.** The device bounds pending events at 1024, and one burst of
   a long paste would drop keys.
-- **The US-layout map.** `key_for` covers printable ASCII, tab and newline.
-  Anything else is skipped and counted, never guessed.
+- **The layout maps.** US by default: `key_for` covers printable ASCII,
+  tab and newline. `[display] typing_layout = "pl"` (`Layout::Pl`,
+  `stroke_for`) adds `ąćęłńóśźż` and the capitals as `KEY_RIGHTALT` + the
+  letter (`ź` is AltGr+X, as on the layout). The modifiers go down before
+  the key and come up after it, each in its own `SYN` batch. Anything else
+  is skipped and counted, never guessed.
 - **The caps.** `MAX_TYPED_CHARS` per request, and `MAX_QUEUED_BATCHES`
   overall, refused whole rather than half-typed.
 

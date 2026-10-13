@@ -32,6 +32,78 @@ pub const MAX_TYPED_CHARS: usize = 4096;
 pub const MAX_QUEUED_BATCHES: usize = 4 * MAX_TYPED_CHARS;
 
 const KEY_LEFTSHIFT: u16 = 42;
+/// `KEY_RIGHTALT`: AltGr on every layout that has one.
+const KEY_RIGHTALT: u16 = 100;
+
+/// The guest keyboard layout typed text is mapped for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// US: printable ASCII, tab and newline.
+    #[default]
+    Us,
+    /// Polish programmers': the US keys, plus `ąćęłńóśźż` (and capitals) as
+    /// AltGr + the plain letter (`ź` is AltGr+X, as on the layout).
+    Pl,
+}
+
+impl Layout {
+    /// `"us"` or `"pl"`; anything else is US.
+    pub fn from_name(name: Option<&str>) -> Self {
+        match name {
+            Some("pl") => Layout::Pl,
+            _ => Layout::Us,
+        }
+    }
+}
+
+/// A key, and the modifiers it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stroke {
+    pub code: u16,
+    pub shift: bool,
+    pub altgr: bool,
+}
+
+/// The key for `c` on `layout`.
+pub fn stroke_for(c: char, layout: Layout) -> Option<Stroke> {
+    if let Some((code, shift)) = key_for(c) {
+        return Some(Stroke {
+            code,
+            shift,
+            altgr: false,
+        });
+    }
+    if layout != Layout::Pl {
+        return None;
+    }
+    let (base, shift) = match c {
+        'ą' => ('a', false),
+        'ć' => ('c', false),
+        'ę' => ('e', false),
+        'ł' => ('l', false),
+        'ń' => ('n', false),
+        'ó' => ('o', false),
+        'ś' => ('s', false),
+        'ź' => ('x', false),
+        'ż' => ('z', false),
+        'Ą' => ('a', true),
+        'Ć' => ('c', true),
+        'Ę' => ('e', true),
+        'Ł' => ('l', true),
+        'Ń' => ('n', true),
+        'Ó' => ('o', true),
+        'Ś' => ('s', true),
+        'Ź' => ('x', true),
+        'Ż' => ('z', true),
+        _ => return None,
+    };
+    let (code, _) = key_for(base)?;
+    Some(Stroke {
+        code,
+        shift,
+        altgr: true,
+    })
+}
 
 /// The US-layout key for `c`, and whether it needs Shift.
 pub fn key_for(c: char) -> Option<(u16, bool)> {
@@ -94,26 +166,38 @@ fn key_batch(code: u16, down: bool) -> Vec<InputEvent> {
     ]
 }
 
-/// The batches that type `text`, and how many characters had no key. A
-/// carriage return is dropped (a `\r\n` is one Enter).
+/// The batches that type `text` on the US layout, and how many characters
+/// had no key. A carriage return is dropped (a `\r\n` is one Enter).
 pub fn keystrokes(text: &str) -> (Vec<Vec<InputEvent>>, usize) {
+    keystrokes_for(text, Layout::Us)
+}
+
+/// [`keystrokes`] for `layout`: modifiers pressed before the key and released
+/// after it, each in a batch of its own.
+pub fn keystrokes_for(text: &str, layout: Layout) -> (Vec<Vec<InputEvent>>, usize) {
     let mut batches = Vec::new();
     let mut skipped = 0;
     for c in text.chars() {
         if c == '\r' {
             continue;
         }
-        let Some((code, shift)) = key_for(c) else {
+        let Some(stroke) = stroke_for(c, layout) else {
             skipped += 1;
             continue;
         };
-        if shift {
+        if stroke.altgr {
+            batches.push(key_batch(KEY_RIGHTALT, true));
+        }
+        if stroke.shift {
             batches.push(key_batch(KEY_LEFTSHIFT, true));
         }
-        batches.push(key_batch(code, true));
-        batches.push(key_batch(code, false));
-        if shift {
+        batches.push(key_batch(stroke.code, true));
+        batches.push(key_batch(stroke.code, false));
+        if stroke.shift {
             batches.push(key_batch(KEY_LEFTSHIFT, false));
+        }
+        if stroke.altgr {
+            batches.push(key_batch(KEY_RIGHTALT, false));
         }
     }
     (batches, skipped)
@@ -135,11 +219,20 @@ pub struct TypeOutcome {
 #[derive(Clone, Default)]
 pub struct Typist {
     inner: Arc<(Mutex<VecDeque<Vec<InputEvent>>>, Condvar)>,
+    layout: Layout,
 }
 
 impl Typist {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A typist mapping text for the guest's `layout`.
+    pub fn with_layout(layout: Layout) -> Self {
+        Self {
+            layout,
+            ..Self::default()
+        }
     }
 
     /// Queues `text` to be typed.
@@ -150,7 +243,7 @@ impl Typist {
             .filter(|c| *c != '\r')
             .take(MAX_TYPED_CHARS)
             .collect();
-        let (batches, skipped) = keystrokes(&head);
+        let (batches, skipped) = keystrokes_for(&head, self.layout);
         let mut outcome = TypeOutcome {
             typed: 0,
             skipped,
@@ -262,6 +355,32 @@ mod tests {
         for batch in keystrokes("Hello, World!\n").0 {
             assert_eq!(batch.last(), Some(&InputEvent::SYN_REPORT));
         }
+    }
+
+    #[test]
+    fn polish_letters_are_altgr_on_the_polish_layout_and_skipped_on_us() {
+        let keys = |text: &str, layout| -> Vec<(u16, u32)> {
+            keystrokes_for(text, layout)
+                .0
+                .into_iter()
+                .flatten()
+                .filter(|e| e.event_type == ev::KEY)
+                .map(|e| (e.code, e.value))
+                .collect()
+        };
+        assert_eq!(
+            keys("ą", Layout::Pl),
+            vec![(100, 1), (30, 1), (30, 0), (100, 0)]
+        );
+        assert_eq!(
+            keys("Ż", Layout::Pl),
+            vec![(100, 1), (42, 1), (44, 1), (44, 0), (42, 0), (100, 0)]
+        );
+        assert_eq!(keys("ź", Layout::Pl)[1], (45, 1), "AltGr+X");
+        assert_eq!(keystrokes_for("zażółć", Layout::Pl).1, 0);
+        assert_eq!(keystrokes_for("zażółć", Layout::Us).1, 4);
+        assert_eq!(Layout::from_name(Some("pl")), Layout::Pl);
+        assert_eq!(Layout::from_name(Some("de")), Layout::Us);
     }
 
     #[test]

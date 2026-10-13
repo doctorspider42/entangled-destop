@@ -1457,7 +1457,9 @@ pub fn run_with(
     // Presentation before devices: the GPU device is built around the handle.
     // Text typed into the guest as keystrokes: the toolbar's "type the
     // clipboard" and the control channel's `paste` (`virtio_input::typing`).
-    let typist = virtio_input::Typist::new();
+    let typist = virtio_input::Typist::with_layout(virtio_input::Layout::from_name(
+        cfg.display.typing_layout.as_deref(),
+    ));
     let mut presentation = open_presentation(&cfg, headless, &typist)?;
     let display_handle = match &presentation {
         Presentation::Windowed(host) => host.handle(),
