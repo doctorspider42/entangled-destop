@@ -16,6 +16,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
         supervisor,
         log_selected,
         log_follow,
+        console_input,
         ..
     } = app;
 
@@ -94,6 +95,26 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 return;
             };
             let (lines, dropped) = task.log_tail(VISIBLE_LINES);
+            // A running machine started here has a serial console to type on:
+            // the line goes to its ttyS0, Enter included (`type`).
+            if task.is_active() && task.has_control() {
+                ui.horizontal(|ui| {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(console_input)
+                            .desired_width(ui.available_width() - 80.0)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("type on the serial console, then Enter"),
+                    );
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let send = ui::ghost_button(ui, "Send", !console_input.is_empty(), theme::CYAN)
+                        .clicked();
+                    if (enter || send) && !console_input.is_empty() {
+                        actions.push(Action::TypeOnSerial(task.id, std::mem::take(console_input)));
+                        field.request_focus();
+                    }
+                });
+                ui.add_space(6.0);
+            }
 
             egui::Frame::new()
                 .fill(theme::INSET)

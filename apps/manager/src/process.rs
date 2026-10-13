@@ -301,6 +301,11 @@ impl Task {
 
     /// Whether this VM has a lifecycle control channel (ADR-0005) — only an
     /// `entangled run` started with `--control-stdin` does.
+    /// Types `text` and Enter on the guest's serial console (`type`).
+    pub fn type_on_serial(&self, text: &str) -> bool {
+        self.send_control(&format!("{} {text}", control_api::control::CMD_TYPE))
+    }
+
     /// Asks the engine for a new card picture (`thumbnail`, silent on
     /// success); see `crate::thumbs`.
     pub fn request_thumbnail(&self) -> bool {

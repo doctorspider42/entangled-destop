@@ -1358,7 +1358,13 @@ child process whose output is written to `<vm-dir>/<name>-run.log` or
 `<name>-install.log` and tailed live here. It opens by itself when an install
 starts and when something fails, and a failure gets one plain sentence of
 diagnosis appended — "the TAP interface is already held by another VM", "/dev/kvm
-is not usable", and so on.
+is not usable", and so on. While a machine started here runs, a field under
+its output types a line, Enter included, on the guest's serial console. That
+gives a login prompt on `ttyS0`, a shell on a headless machine, or GRUB before
+the graphics come up.
+
+**Dropping an installer image** (`.iso`) anywhere on the manager's window opens
+the new-machine wizard with that image already filled in.
 
 ### Where a machine runs, and why it remembers
 

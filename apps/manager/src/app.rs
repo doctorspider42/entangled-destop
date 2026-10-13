@@ -365,6 +365,10 @@ pub enum Action {
     SubmitRenameVm,
     /// Start this machine whenever the manager opens, or stop doing so.
     ToggleAutostart(String),
+    /// Type a line on a running machine's serial console.
+    TypeOnSerial(TaskId, String),
+    /// Files dropped on the window: an ISO opens the new-machine wizard.
+    FilesDropped(Vec<PathBuf>),
     // ---- Move to another drive ----------------------------------------------
     AskMoveDisk(PathBuf),
     SubmitMoveDisk,
@@ -465,6 +469,8 @@ pub struct ManagerApp {
     pub log_open: bool,
     pub log_selected: Option<TaskId>,
     pub log_follow: bool,
+    /// What is being typed into the selected machine's serial console.
+    pub console_input: String,
     /// A newer release the banner offers; `None` means none found (yet) or
     /// dismissed.
     pub update: Option<UpdateInfo>,
@@ -622,6 +628,7 @@ impl ManagerApp {
             log_open: false,
             log_selected: None,
             log_follow: true,
+            console_input: String::new(),
             update: None,
             update_downloading: false,
             update_check,
@@ -2510,6 +2517,41 @@ impl ManagerApp {
         }
     }
 
+    /// An ISO dropped on the window opens the new-machine wizard with it
+    /// filled in (or fills it in, if the wizard is open); anything else is
+    /// said to be not something the manager can use.
+    fn files_dropped(&mut self, paths: Vec<PathBuf>) {
+        let Some(iso) = paths
+            .into_iter()
+            .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso")))
+        else {
+            self.toast(
+                ToastLevel::Info,
+                "drop an installer image (.iso) to create a machine from it",
+            );
+            return;
+        };
+        if !matches!(self.modal, Modal::Wizard(_)) {
+            if self.modal.is_open() {
+                return;
+            }
+            self.open_wizard();
+        }
+        if let Modal::Wizard(state) = &mut self.modal {
+            state.machine.family = launcher::GuestFamily::Ubuntu;
+            state.machine.iso_path = iso.display().to_string();
+        }
+        self.toast(
+            ToastLevel::Info,
+            format!(
+                "creating a machine from {}",
+                iso.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ),
+        );
+    }
+
     fn toggle_autostart(&mut self, name: &str) {
         if !self.settings.autostart.remove(name) {
             self.settings.autostart.insert(name.to_string());
@@ -3438,6 +3480,16 @@ impl ManagerApp {
             Action::AskRenameVm(profile) => self.ask_rename_vm(&profile),
             Action::SubmitRenameVm => self.submit_rename_vm(),
             Action::ToggleAutostart(name) => self.toggle_autostart(&name),
+            Action::TypeOnSerial(id, text) => {
+                let sent = self
+                    .supervisor
+                    .task(id)
+                    .is_some_and(|task| task.type_on_serial(&text));
+                if !sent {
+                    self.toast(ToastLevel::Warn, "that machine has no console to type on");
+                }
+            }
+            Action::FilesDropped(paths) => self.files_dropped(paths),
             Action::SubmitEditVm => self.submit_edit_vm(),
             Action::AskMoveDisk(path) => self.ask_move_disk(&path),
             Action::SubmitMoveDisk => self.submit_move_disk(),
@@ -3609,6 +3661,16 @@ impl eframe::App for ManagerApp {
         self.stats = self.metrics.snapshot();
 
         let mut actions = Vec::new();
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            actions.push(Action::FilesDropped(dropped));
+        }
         ui::header::show(ctx, self, &mut actions);
         if self.log_open {
             ui::logpane::show(ctx, self, &mut actions);

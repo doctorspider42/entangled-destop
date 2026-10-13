@@ -667,6 +667,8 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
     zeroed memory.
   - `a_handle_blob_flip_reads_back_the_frame_through_the_renderers_scanout_device`
     read a wrong frame.
+  - `a_linear_modifier_image_rendered_by_one_context_is_read_back_exactly_by_another`
+    (S1, two contexts) failed the same way later the same night.
 
   Both fail only while the rest of the `host_vulkan` tests run in parallel:
   1 of 5 full runs, 1 of 6 GPU-only runs, 0 of 3 with `--test-threads=1`,
