@@ -68,6 +68,9 @@ pub struct DisplayHost {
     follow_window: bool,
     /// Where "type the clipboard" sends its text ([`Self::with_typist`]).
     typist: Option<virtio_input::Typist>,
+    /// Where the window's geometry is kept between runs
+    /// ([`Self::with_placement_file`]).
+    placement_file: Option<std::path::PathBuf>,
 }
 
 /// Where the toolbar's screenshots go: `Pictures\Entangled` in the user's
@@ -125,6 +128,13 @@ impl DisplayHost {
         self.typist = Some(typist);
         self
     }
+
+    /// Opens the window where it was last closed, and remembers where it is
+    /// closed this time, in `path` ([`crate::placement`]).
+    pub fn with_placement_file(mut self, path: std::path::PathBuf) -> Self {
+        self.placement_file = Some(path);
+        self
+    }
     /// Builds the event loop and allocates the scanout mirror. Call on the main
     /// thread; no window or GPU resource exists until [`DisplayHost::run`].
     pub fn new(config: DisplayConfig) -> Result<Self, DisplayError> {
@@ -148,6 +158,7 @@ impl DisplayHost {
             resolution: crate::resize::ResolutionRequest::default(),
             follow_window: true,
             typist: None,
+            placement_file: None,
         })
     }
 
@@ -251,6 +262,7 @@ impl DisplayHost {
             resolution,
             follow_window,
             typist,
+            placement_file,
         } = self;
         let shot = DisplayHandle::new(
             Arc::clone(&scanout),
@@ -291,6 +303,7 @@ impl DisplayHost {
             typist,
             shot,
             note: None,
+            placement_file,
         };
         // Nothing here reads `DeviceEvent`s (pointer input is the window's
         // `CursorMoved`), and on Windows winit otherwise registers raw input for
@@ -374,6 +387,7 @@ struct App {
     shot: DisplayHandle,
     /// A short note in the title ("screenshot saved") and when it expires.
     note: Option<(String, Instant)>,
+    placement_file: Option<std::path::PathBuf>,
     /// Title text actually applied to the window.
     ///
     /// Every `set_title` is an X11/Wayland round trip, and winit's X11 backend
@@ -426,7 +440,7 @@ impl App {
         // image usable and a maximized start when the guest is as big as the
         // screen.
         self.applied_title = self.window_title();
-        let attributes = Window::default_attributes()
+        let mut attributes = Window::default_attributes()
             .with_title(self.applied_title.clone())
             .with_inner_size(winit::dpi::LogicalSize::new(initial.width, initial.height))
             .with_min_inner_size(winit::dpi::LogicalSize::new(
@@ -435,6 +449,26 @@ impl App {
             ))
             .with_resizable(true)
             .with_maximized(initial.maximized);
+        // Where it was last closed, if that is still on a monitor.
+        let monitors: Vec<(i32, i32, u32, u32)> = event_loop
+            .available_monitors()
+            .map(|m| {
+                let (p, s) = (m.position(), m.size());
+                (p.x, p.y, s.width, s.height)
+            })
+            .collect();
+        if let Some(saved) = self
+            .placement_file
+            .as_deref()
+            .and_then(crate::placement::Placement::load)
+            .filter(|p| p.is_on(&monitors))
+        {
+            tracing::debug!(?saved, "opening the window where it was last closed");
+            attributes = attributes
+                .with_position(winit::dpi::PhysicalPosition::new(saved.x, saved.y))
+                .with_inner_size(winit::dpi::PhysicalSize::new(saved.width, saved.height))
+                .with_maximized(saved.maximized);
+        }
         let window = Arc::new(event_loop.create_window(attributes)?);
         self.cursors = HostCursors::new(event_loop);
         if let Some(cursors) = &self.cursors {
@@ -708,6 +742,46 @@ impl App {
                     typist.chord(&[29, 56, 111]);
                 }
             }
+        }
+    }
+
+    /// Remembers where the window is, for the next start
+    /// ([`crate::placement`]). Not while fullscreen or minimized: neither is
+    /// a place to come back to, so the last ordinary placement is kept.
+    fn save_placement(&self) {
+        let (Some(path), Some(window)) = (self.placement_file.as_deref(), self.window.as_ref())
+        else {
+            return;
+        };
+        if self.fullscreen || window.is_minimized() == Some(true) {
+            return;
+        }
+        let maximized = window.is_maximized();
+        // A maximized window's own size is the screen's; keep the ordinary
+        // size it had, if one was saved, so un-maximizing goes back to it.
+        let previous = crate::placement::Placement::load(path);
+        let size = window.inner_size();
+        let Ok(position) = window.outer_position() else {
+            return;
+        };
+        let placement = match (maximized, previous) {
+            (true, Some(previous)) => crate::placement::Placement {
+                maximized: true,
+                ..previous
+            },
+            _ => crate::placement::Placement {
+                x: position.x,
+                y: position.y,
+                width: size.width,
+                height: size.height,
+                maximized,
+            },
+        };
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        if let Err(error) = placement.save(path) {
+            tracing::debug!(path = %path.display(), %error, "window placement not saved");
         }
     }
 
@@ -1213,6 +1287,7 @@ impl ApplicationHandler<HostEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.save_placement();
         let stats = self.frame_stats();
         let scanout = lock_scanout(&self.scanout).stats();
         tracing::info!(

@@ -667,6 +667,12 @@ until you ask it not to.
 The window title says whether input is grabbed. Losing focus releases the grab
 and every key the guest was told is down.
 
+**The window opens where you left it.** Its size, position and whether it
+was maximized are kept in `.window/<name>.toml` beside the profile, saved when
+the window closes and read when it opens. A fullscreen or minimized window
+keeps the last ordinary placement, and a position that is no longer on any
+monitor (a laptop off its dock) is ignored.
+
 **The guest's resolution follows the window.** Resize it, maximise it or go
 fullscreen, and a moment after you stop the guest is asked for a desktop of
 exactly the window's size: GNOME switches to it and the image fills the window

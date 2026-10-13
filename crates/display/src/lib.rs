@@ -90,6 +90,7 @@ pub mod input;
 pub mod keymap;
 #[cfg(windows)]
 mod latency;
+pub mod placement;
 mod present;
 pub mod refresh;
 mod renderer;

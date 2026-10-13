@@ -463,6 +463,17 @@ channel's `display WxH`) is the headless way to exercise it. Note for HiDPI:
 a window on a 300 % 4K monitor asks for a 4K desktop — sharp, and heavy for
 the GPU desktop.
 
+## The window's placement (`placement.rs`, 2026-10-13)
+
+`DisplayHost::with_placement_file`: `run_vm` passes
+`control_api::control::window_path` (`.window/<name>.toml` beside the
+profile). `App::save_placement` runs in `exiting`. It skips a fullscreen or
+minimized window, and while maximized it keeps the ordinary size saved before
+it. `create_window` applies a saved placement only if `Placement::is_on` puts
+its title bar on a current monitor. The minimum inner size is logical, so on
+a 300 % monitor a saved 1280×720 opens at 1920×1080 physical. That is the
+floor working, not a restore bug (measured: the position came back exact).
+
 ## Typing text into the guest (`virtio_input::typing`, 2026-10-13)
 
 *Type the clipboard* (`Button::TypeClipboard`) reads the host clipboard with

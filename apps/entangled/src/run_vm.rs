@@ -228,6 +228,7 @@ fn open_presentation(
     cfg: &VmConfig,
     headless: bool,
     typist: &virtio_input::Typist,
+    placement: Option<PathBuf>,
 ) -> Result<Presentation, String> {
     let display_cfg = display::DisplayConfig {
         width: cfg.display.width,
@@ -249,12 +250,16 @@ fn open_presentation(
                 // guest's refresh looks like there — and warns when the guest
                 // is told a faster rate than the monitor can show (ADR-0004,
                 // the high-refresh amendment).
-                return Ok(Presentation::Windowed(Box::new(
-                    host.with_title(format!("Entangled Desktop — {}", cfg.name))
-                        .with_guest_refresh(cfg.display.refresh_hz)
-                        .with_follow_window(cfg.display.follow_window != Some(false))
-                        .with_typist(typist.clone()),
-                )));
+                let host = host
+                    .with_title(format!("Entangled Desktop — {}", cfg.name))
+                    .with_guest_refresh(cfg.display.refresh_hz)
+                    .with_follow_window(cfg.display.follow_window != Some(false))
+                    .with_typist(typist.clone());
+                let host = match placement {
+                    Some(path) => host.with_placement_file(path),
+                    None => host,
+                };
+                return Ok(Presentation::Windowed(Box::new(host)));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "cannot open a window, falling back to headless");
@@ -1460,7 +1465,15 @@ pub fn run_with(
     let typist = virtio_input::Typist::with_layout(virtio_input::Layout::from_name(
         cfg.display.typing_layout.as_deref(),
     ));
-    let mut presentation = open_presentation(&cfg, headless, &typist)?;
+    // The window's geometry lives beside the profile, named like the snapshot
+    // the profile's default one sits beside (`control_api::control::window_path`).
+    let placement = snapshot.as_ref().and_then(|s| {
+        Some(control_api::control::window_path(
+            s.parent().unwrap_or(std::path::Path::new(".")),
+            s.file_stem()?.to_str()?,
+        ))
+    });
+    let mut presentation = open_presentation(&cfg, headless, &typist, placement)?;
     let display_handle = match &presentation {
         Presentation::Windowed(host) => host.handle(),
         Presentation::Headless(handle) => handle.clone(),

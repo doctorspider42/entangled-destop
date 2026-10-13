@@ -65,6 +65,12 @@ pub fn thumbnail_path(profile_dir: &std::path::Path, name: &str) -> std::path::P
     profile_dir.join(".thumbnails").join(format!("{name}.png"))
 }
 
+/// Where a machine's window geometry is kept between runs:
+/// `.window/<name>.toml` beside its profile (`display::placement`).
+pub fn window_path(profile_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    profile_dir.join(".window").join(format!("{name}.toml"))
+}
+
 /// One reply line, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
