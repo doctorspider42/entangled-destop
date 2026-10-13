@@ -367,7 +367,8 @@ pub enum Action {
     ToggleAutostart(String),
     /// Type a line on a running machine's serial console.
     TypeOnSerial(TaskId, String),
-    /// Files dropped on the window: an ISO opens the new-machine wizard.
+    /// Files dropped on the window: an ISO opens the new-machine wizard, a
+    /// profile is imported.
     FilesDropped(Vec<PathBuf>),
     // ---- Move to another drive ----------------------------------------------
     AskMoveDisk(PathBuf),
@@ -2521,6 +2522,14 @@ impl ManagerApp {
     /// filled in (or fills it in, if the wizard is open); anything else is
     /// said to be not something the manager can use.
     fn files_dropped(&mut self, paths: Vec<PathBuf>) {
+        let is = |p: &Path, ext: &str| p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext));
+        let profiles: Vec<PathBuf> = paths.iter().filter(|p| is(p, "toml")).cloned().collect();
+        if !profiles.is_empty() {
+            for profile in profiles {
+                self.import_profile(&profile);
+            }
+            return;
+        }
         let Some(iso) = paths
             .into_iter()
             .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso")))
@@ -2550,6 +2559,29 @@ impl ManagerApp {
                     .unwrap_or_default()
             ),
         );
+    }
+
+    fn import_profile(&mut self, path: &Path) {
+        if self.mock_mode {
+            self.toast(
+                ToastLevel::Success,
+                format!("mock: would import {}", path.display()),
+            );
+            return;
+        }
+        match discovery::import_profile(path, &self.settings.vm_dir) {
+            Ok(imported) => {
+                self.toast(
+                    ToastLevel::Success,
+                    format!("imported as {}", imported.display()),
+                );
+                self.request_scan(true);
+            }
+            Err(e) => self.toast(
+                ToastLevel::Error,
+                format!("cannot import {}: {e}", path.display()),
+            ),
+        }
     }
 
     fn toggle_autostart(&mut self, name: &str) {
@@ -3002,6 +3034,7 @@ impl ManagerApp {
             // The engine picker is also reachable from the "engine missing"
             // banner, where no form exists to hold the answer. Applying it
             // straight away is the point of that button: one click, fixed.
+            None if target == PickTarget::ImportProfile => self.import_profile(&path),
             None if target == PickTarget::EngineBinary => {
                 self.settings.entangled_binary = Some(path);
                 self.persist_settings_quietly();

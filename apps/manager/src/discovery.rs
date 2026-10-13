@@ -542,6 +542,74 @@ fn write_validated(profile: &Path, cfg: &VmConfig) -> Result<(), String> {
     std::fs::write(profile, out).map_err(|e| e.to_string())
 }
 
+/// Brings a profile from anywhere into the VM directory, so the manager can
+/// see and run it: every path it names (disks, CD-ROM, kernel, initramfs,
+/// firmware, NVRAM, shared folders) is made absolute against the profile's
+/// own directory — the copy no longer sits beside the files it means — and
+/// the result is re-validated and written as `<vm_dir>/<name>.toml`, never
+/// over an existing file. The original is not touched. Answers the new path.
+pub fn import_profile(source: &Path, vm_dir: &Path) -> Result<PathBuf, String> {
+    let text = std::fs::read_to_string(source).map_err(|e| format!("cannot read it: {e}"))?;
+    let mut cfg = VmConfig::from_toml(&text).map_err(|e| format!("not a machine profile: {e}"))?;
+    let base = source
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let absolute = |p: &mut PathBuf| {
+        if p.is_relative() {
+            *p = base.join(&*p);
+        }
+    };
+    for disk in &mut cfg.disks {
+        absolute(&mut disk.path);
+    }
+    if let Some(cdrom) = &mut cfg.cdrom {
+        absolute(&mut cdrom.path);
+    }
+    for path in [
+        &mut cfg.boot.kernel,
+        &mut cfg.boot.initramfs,
+        &mut cfg.boot.firmware,
+        &mut cfg.boot.nvram,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        absolute(path);
+    }
+    for share in &mut cfg.shares {
+        absolute(&mut share.path);
+    }
+    let target = vm_dir.join(format!("{}.toml", cfg.name));
+    if same_file(source, &target) {
+        return Err("it is already in the VM directory".into());
+    }
+    let out = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    VmConfig::from_toml(&out).map_err(|e| format!("the imported profile is invalid: {e}"))?;
+    std::fs::create_dir_all(vm_dir).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => format!(
+                "{} already exists — a machine named '{}' is already here",
+                target.display(),
+                cfg.name
+            ),
+            _ => e.to_string(),
+        })?;
+    std::io::Write::write_all(&mut file, out.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(target)
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Names must be safe as both a file stem and a VM/hostname.
 pub fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
@@ -892,5 +960,31 @@ interface = "entangled0"
         assert!(validate_name("../escape").is_err());
         assert!(validate_name("sub/dir").is_err());
         assert!(validate_name(&"x".repeat(41)).is_err());
+    }
+
+    #[test]
+    fn an_imported_profile_points_at_its_files_from_the_vm_directory() {
+        let root = std::env::temp_dir().join(format!("manager-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let elsewhere = root.join("elsewhere");
+        let vm_dir = root.join("vms");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("lab.raw"), b"disk").unwrap();
+        let profile = elsewhere.join("lab.toml");
+        std::fs::write(
+            &profile,
+            "name = \"lab\"\nmemory_mib = 1024\nvcpus = 1\n[boot]\nmode = \"direct-linux\"\n\
+             kernel = \"vmlinuz\"\n[[disk]]\npath = \"lab.raw\"\nwritable = true\n",
+        )
+        .unwrap();
+        let imported = import_profile(&profile, &vm_dir).expect("import");
+        assert_eq!(imported, vm_dir.join("lab.toml"));
+        let cfg = VmConfig::from_toml(&std::fs::read_to_string(&imported).unwrap()).unwrap();
+        assert_eq!(cfg.disks[0].path, elsewhere.join("lab.raw"));
+        assert_eq!(cfg.boot.kernel, Some(elsewhere.join("vmlinuz")));
+        // Twice is refused, and the first copy is untouched.
+        let again = import_profile(&profile, &vm_dir).expect_err("already there");
+        assert!(again.contains("already"), "{again}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

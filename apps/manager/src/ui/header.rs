@@ -4,6 +4,7 @@ use egui::{Align, Layout, Rect, RichText, Stroke, StrokeKind, Vec2};
 
 use crate::app::{Action, ManagerApp, RefreshState};
 use crate::logo;
+use crate::picker::PickTarget;
 use crate::theme;
 use crate::ui;
 
@@ -55,6 +56,16 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
                     }
                     if ui::ghost_button(ui, "Settings", true, theme::TEXT_DIM).clicked() {
                         actions.push(Action::OpenSettings);
+                    }
+                    if ui::ghost_button(ui, "Import", true, theme::TEXT_DIM)
+                        .on_hover_text(
+                            "Bring in a machine profile (.toml) from another folder. It is \
+                             copied here with its paths made absolute; the files stay put. \
+                             Dropping a profile on the window does the same.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::PickPath(PickTarget::ImportProfile));
                     }
                     if app.mock_mode {
                         ui::chip(ui, "MOCK DATA", theme::WARN);

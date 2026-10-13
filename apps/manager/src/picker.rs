@@ -43,6 +43,8 @@ pub enum PickTarget {
     EditorAddDisk,
     EditorAddShare,
     MoveDestination,
+    /// The header's "Import machine": a profile from anywhere.
+    ImportProfile,
 }
 
 /// What kind of thing the dialog asks for.
@@ -92,6 +94,11 @@ fn spec(target: PickTarget) -> Spec {
             title: "Choose a disk image",
             kind: Kind::File,
             filter: Some(DISK_FILTER),
+        },
+        PickTarget::ImportProfile => Spec {
+            title: "Choose a machine profile to import",
+            kind: Kind::File,
+            filter: Some(("Machine profiles", &["toml"])),
         },
         PickTarget::EditorAddShare => Spec {
             title: "Choose a folder to share with the machine",
@@ -250,6 +257,7 @@ mod tests {
             PickTarget::EditorAddDisk,
             PickTarget::EditorAddShare,
             PickTarget::MoveDestination,
+            PickTarget::ImportProfile,
         ] {
             let spec = spec(target);
             assert!(!spec.title.is_empty(), "{target:?} has no title");

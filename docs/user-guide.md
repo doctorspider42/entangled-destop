@@ -1366,6 +1366,12 @@ the graphics come up.
 **Dropping an installer image** (`.iso`) anywhere on the manager's window opens
 the new-machine wizard with that image already filled in.
 
+**Import** (in the header), or dropping a profile (`.toml`) on the window,
+brings in a machine whose profile lives in another folder. The profile is
+copied into the VM directory as `<name>.toml`, with every path it names made
+absolute. The disks and the original profile stay where they are, and an
+existing profile is never overwritten.
+
 ### Where a machine runs, and why it remembers
 
 On Windows there are two ways to run a VM: **Windows (WHP)**, natively, and
