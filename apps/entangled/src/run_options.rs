@@ -2,6 +2,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Request a debug scanout capture after a delay, optionally repeated.
 #[derive(Debug, Clone)]
 pub struct ScreenshotRequest {
     pub after: Duration,
@@ -9,6 +10,12 @@ pub struct ScreenshotRequest {
     pub burst: Option<Duration>,
 }
 
+/// Everything about *how* to run a VM that is not the VM itself.
+///
+/// A struct rather than five more parameters: the run path has grown a
+/// lifecycle control channel, a debug screenshot and now a snapshot on either
+/// end of it, and a call site that reads `run_with(cfg, false, None, None,
+/// false, None, None)` tells the reader nothing.
 #[derive(Debug, Default)]
 pub struct RunOptions {
     pub headless: bool,

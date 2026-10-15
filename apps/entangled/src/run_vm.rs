@@ -1342,16 +1342,6 @@ impl Drop for LifecycleSupervisor {
     }
 }
 
-/// A debug screenshot: write the scanout as PNG `after` this much VM runtime,
-/// then refresh the same file every [`SCREENSHOT_REFRESH`] until the VM stops
-/// — so a slow graphical boot can be watched from outside by re-reading one
-/// path.
-///
-/// Best effort by design — the timer thread is detached, so a VM that stops
-/// before the first write simply never produces the file. It exists to give an
-/// unattended run (`--headless` on a CI box, a GNOME boot someone wants
-/// evidence of) an artifact without instrumenting the guest.
-
 /// The `n`th file of a screenshot burst: `<stem>-<n:04>.<ext>` beside `path`.
 fn burst_path(path: &std::path::Path, n: u32) -> PathBuf {
     let stem = path
@@ -1366,13 +1356,7 @@ fn burst_path(path: &std::path::Path, n: u32) -> PathBuf {
 /// How often the debug screenshot is refreshed after its first write.
 const SCREENSHOT_REFRESH: Duration = Duration::from_secs(20);
 
-/// Everything about *how* to run a VM that is not the VM itself.
-///
-/// A struct rather than five more parameters: the run path has grown a
-/// lifecycle control channel, a debug screenshot and now a snapshot on either
-/// end of it, and a call site that reads `run_with(cfg, false, None, None,
-/// false, None, None)` tells the reader nothing.
-
+/// Run a configured VM with the requested host controls and capture options.
 pub fn run(cfg: VmConfig, options: RunOptions) -> Result<(), String> {
     run_with(cfg, None, options).map(|_| ())
 }
