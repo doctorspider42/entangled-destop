@@ -106,7 +106,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                             .hint_text("type on the serial console, then Enter"),
                     );
                     let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let send = ui::ghost_button(ui, "Send", !console_input.is_empty(), theme::CYAN)
+                    let send = ui::ghost_button(ui, "Send", !console_input.is_empty(), theme::TEXT)
                         .clicked();
                     if (enter || send) && !console_input.is_empty() {
                         actions.push(Action::TypeOnSerial(task.id, std::mem::take(console_input)));

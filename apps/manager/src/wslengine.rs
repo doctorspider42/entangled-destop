@@ -78,23 +78,6 @@ pub enum Status {
 }
 
 impl Status {
-    /// True only when a machine may actually be started on this backend. An
-    /// unfinished check is not a yes.
-    pub fn usable(&self) -> bool {
-        matches!(self, Status::Ready(_))
-    }
-
-    /// The one line the wizard, the settings panel and the cards show. `None`
-    /// while nothing is known yet.
-    pub fn line(&self) -> Option<String> {
-        match self {
-            Status::Unknown => None,
-            Status::Checking => Some("checking the WSL engine…".to_string()),
-            Status::Ready(found) => Some(found.summary()),
-            Status::Failed(fault) => Some(fault.what.clone()),
-        }
-    }
-
     /// Whether "Install the Linux engine" makes sense right now.
     pub fn installable(&self) -> bool {
         matches!(self, Status::Failed(fault) if fault.fault.installable())
@@ -211,7 +194,7 @@ pub fn mock_status() -> Status {
         fault: Fault::NoEngine,
         what: "Ubuntu has no Entangled engine ('entangled' is not there)".to_string(),
         fix: "The Windows installer ships no Linux build: let the manager install one \
-              (Settings ▸ Linux engine), or point that setting at your own build."
+              (Settings > Linux engine), or point that setting at your own build."
             .to_string(),
     })
 }
@@ -241,12 +224,9 @@ mod tests {
     /// blur: only `Ready` is usable, and only a missing engine is installable.
     #[test]
     fn the_status_gates_are_exact() {
-        assert!(!Status::Unknown.usable());
-        assert!(!Status::Checking.usable());
         assert!(!Status::Unknown.installable());
 
         let missing = mock_status();
-        assert!(!missing.usable());
         assert!(missing.installable());
         assert!(missing
             .refusal()
@@ -269,9 +249,7 @@ mod tests {
             path: Some("/home/spider/.local/bin/entangled".into()),
             version: Some("0.2.137".into()),
         });
-        assert!(ready.usable());
         assert!(ready.refusal().is_none());
-        assert!(ready.line().expect("line").contains("0.2.137"));
     }
 
     /// A re-check is needed when the distribution or the engine path changes,

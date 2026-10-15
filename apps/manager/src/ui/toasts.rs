@@ -73,7 +73,7 @@ pub fn show(ctx: &egui::Context, toasts: &[Toast], actions: &mut Vec<Action>) {
 
 fn tint(level: ToastLevel) -> egui::Color32 {
     match level {
-        ToastLevel::Info => theme::CYAN,
+        ToastLevel::Info => theme::ACCENT,
         ToastLevel::Success => theme::OK,
         ToastLevel::Warn => theme::WARN,
         ToastLevel::Error => theme::ERR,

@@ -30,11 +30,12 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
         .frame(
             egui::Frame::new()
                 .fill(theme::BG_DEEP)
-                .inner_margin(egui::Margin::symmetric(22, 18)),
+                .inner_margin(egui::Margin::symmetric(super::cards::PAGE_X, 28)),
         )
         .show(ctx, |ui| {
             theme::paint_backdrop(ui);
             super::cards::banners(ui, app, actions);
+            ui::storage_header(ui, app, actions);
             toolbar(ui, app);
             ui.add_space(10.0);
 
@@ -56,12 +57,7 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
 /// question a list of large files is usually opened with.
 fn toolbar(ui: &mut egui::Ui, app: &ManagerApp) {
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("Saved sessions")
-                .size(19.0)
-                .color(theme::TEXT)
-                .strong(),
-        );
+        ui.label(ui::caption("Saved sessions"));
         ui.add_space(4.0);
         let count = app.scan.snapshots.len();
         ui.label(ui::dim(format!(
@@ -80,7 +76,7 @@ fn toolbar(ui: &mut egui::Ui, app: &ManagerApp) {
                 ui::chip(
                     ui,
                     &format!("{} on disk", format_bytes(allocated)),
-                    theme::VIOLET,
+                    theme::ACCENT,
                 );
                 ui::chip(
                     ui,
@@ -99,7 +95,6 @@ fn toolbar(ui: &mut egui::Ui, app: &ManagerApp) {
 
 fn snapshot_row(ui: &mut egui::Ui, app: &ManagerApp, row: &SnapshotRow, actions: &mut Vec<Action>) {
     let id = egui::Id::new(("snapshot-row", &row.path));
-    let accent_at = accent_for(&row.file_name);
     let verdict = app.snapshot_verdict(row);
     let vm_name = row.vm_name().unwrap_or("unknown machine").to_string();
     let busy = app.is_busy(&vm_name);
@@ -126,7 +121,7 @@ fn snapshot_row(ui: &mut egui::Ui, app: &ManagerApp, row: &SnapshotRow, actions:
         (probe.min_rect().height() + 2.0 * ui::CARD_PAD).max(ROW_HEIGHT)
     };
 
-    ui::card(ui, id, Vec2::new(width, height), accent_at, |ui, _| {
+    ui::card(ui, id, Vec2::new(width, height), |ui, _| {
         snapshot_row_body(ui, row, &verdict, &vm_name, busy, actions);
     });
 }
@@ -149,7 +144,7 @@ fn snapshot_row_body(
         );
         match &row.facts {
             Ok(facts) => {
-                ui::chip(ui, facts.host.as_str(), theme::CYAN);
+                ui::chip(ui, facts.host.as_str(), theme::ACCENT);
                 if verdict.resumable() {
                     ui::chip(ui, "resumable", theme::OK);
                 } else {
@@ -230,7 +225,7 @@ fn snapshot_row_body(
         } else {
             verdict.blocked.join("\n\n")
         };
-        if ui::ghost_button(ui, "Resume", resumable, theme::VIOLET)
+        if ui::ghost_button(ui, "Resume", resumable, theme::TEXT)
             .on_hover_text(hover)
             .clicked()
         {
@@ -258,16 +253,10 @@ fn empty_state(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
              window — and it appears here.",
         ));
         ui.add_space(14.0);
-        if ui::ghost_button(ui, "Machines view", true, theme::CYAN).clicked() {
+        if ui::ghost_button(ui, "Machines view", true, theme::TEXT).clicked() {
             actions.push(Action::SwitchView(View::Machines));
         }
     });
-}
-
-/// Stable per-file position on the accent ramp (same trick as the VM cards).
-fn accent_for(name: &str) -> f32 {
-    let sum: u32 = name.bytes().map(u32::from).sum();
-    (sum % 100) as f32 / 100.0
 }
 
 /// Middle-ellipsis keeping the *tail* (the file name matters most).
@@ -291,9 +280,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accents_are_stable_and_shortening_keeps_the_file_name() {
-        assert_eq!(accent_for("a.esnap"), accent_for("a.esnap"));
-        assert!((0.0..1.0).contains(&accent_for("ubuntu-lab.esnap")));
+    fn shortening_keeps_the_file_name() {
         let long = "D:/very/long/path/to/some/machine/ubuntu-lab.esnap";
         let short = shorten_start(long, 24);
         assert_eq!(short.chars().count(), 24);

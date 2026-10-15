@@ -73,6 +73,8 @@ struct Cli {
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum ScreenshotView {
     Main,
+    /// One machine's own page (the running one, when there is one).
+    Machine,
     Wizard,
     /// The wizard on the backend step with WSL chosen and no Linux engine
     /// installed: the state a fresh Windows install is in, and the one this

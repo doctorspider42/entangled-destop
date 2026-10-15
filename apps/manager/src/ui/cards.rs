@@ -1,21 +1,25 @@
-//! The machine grid (GUI-1601): one card per discovered VM, plus a card for a
-//! machine that is still being installed.
+//! All machines (GUI-1601): the running ones large, with their screen and live
+//! numbers, and everything else as a tile that opens the machine's own page.
+//! With no machines at all, the first-launch page instead.
 
-use egui::{Align, Layout, RichText, Vec2};
+use egui::{Align, Layout, Rect, RichText, Sense, Vec2};
 
-use crate::app::{Action, ManagerApp, Status};
+use crate::app::{Action, ManagerApp, Status, View};
 use crate::discovery::{format_bytes, VmEntry};
+use crate::launcher::GuestFamily;
 use crate::theme;
-use crate::ui;
+use crate::ui::{self, Icon};
 
-// Six lifecycle buttons do not fit on one line at [`theme::CARD_WIDTH`], and a
-// running machine now has six. The action row wraps instead, and the card is
-// tall enough for two lines under the tallest content any state produces — a
-// suspended machine with a wrapped chip row, a "saved 3 hours ago" line and a
-// reason it cannot go back.
-const CARD_HEIGHT: f32 = 340.0;
-/// Gap between two wrapped lines of card buttons.
-const ACTION_WRAP_GAP: f32 = 6.0;
+/// Horizontal page margin.
+pub(crate) const PAGE_X: i8 = 40;
+/// Smallest width a tile in the grid may take.
+const TILE_MIN_W: f32 = 260.0;
+/// Height of a tile's screen area.
+const TILE_SCREEN_H: f32 = 132.0;
+/// A whole tile: the screen plus two lines of text and their padding.
+const TILE_H: f32 = TILE_SCREEN_H + 86.0;
+/// Gap between tiles.
+const GAP: f32 = 16.0;
 
 pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
     let time = theme::animation_time(ctx);
@@ -24,67 +28,804 @@ pub fn show(ctx: &egui::Context, app: &ManagerApp, actions: &mut Vec<Action>) {
         .frame(
             egui::Frame::new()
                 .fill(theme::BG_DEEP)
-                .inner_margin(egui::Margin::symmetric(22, 18)),
+                .inner_margin(egui::Margin::symmetric(PAGE_X, 28)),
         )
         .show(ctx, |ui| {
             theme::paint_backdrop(ui);
-            banners(ui, app, actions);
-            dashboard_heading(ui, app);
-            ui.add_space(14.0);
-
+            if app.scan.vms.is_empty() && app.pending.is_empty() {
+                banners(ui, app, actions);
+                welcome(ui, app, actions);
+                return;
+            }
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.with_layout(
-                        Layout::left_to_right(Align::Min).with_main_wrap(true),
-                        |ui| {
-                            ui.spacing_mut().item_spacing = Vec2::new(16.0, 16.0);
-                            for vm in &app.scan.vms {
-                                vm_card(ui, app, vm, time, actions);
-                            }
-                            for pending in &app.pending {
-                                if app.scan.vms.iter().any(|vm| vm.name == pending.name) {
-                                    continue;
-                                }
-                                pending_card(ui, app, pending, time, actions);
-                            }
-                        },
-                    );
+                    banners(ui, app, actions);
+                    heading(ui, app, actions);
+                    ui.add_space(24.0);
 
-                    if app.scan.vms.is_empty() && app.pending.is_empty() {
-                        empty_state(ui, app, time, actions);
+                    let running: Vec<&VmEntry> = app
+                        .scan
+                        .vms
+                        .iter()
+                        .filter(|vm| app.status_of(&vm.name) == Status::Running)
+                        .collect();
+                    if !running.is_empty() {
+                        ui.label(ui::caption("Running now"));
+                        ui.add_space(10.0);
+                        for vm in &running {
+                            running_row(ui, app, vm, time, actions);
+                            ui.add_space(14.0);
+                        }
+                        ui.add_space(14.0);
                     }
+
+                    let rest: Vec<&VmEntry> = app
+                        .scan
+                        .vms
+                        .iter()
+                        .filter(|vm| app.status_of(&vm.name) != Status::Running)
+                        .collect();
+                    let pending: Vec<&crate::app::PendingInstall> = app
+                        .pending
+                        .iter()
+                        .filter(|p| !app.scan.vms.iter().any(|vm| vm.name == p.name))
+                        .collect();
+                    ui.label(ui::caption(if running.is_empty() {
+                        "Machines"
+                    } else {
+                        "Everything else"
+                    }));
+                    ui.add_space(10.0);
+                    tile_grid(ui, app, &rest, &pending, actions);
+
                     if !app.scan.problems.is_empty() {
                         problems(ui, app);
                     }
+                    ui.add_space(24.0);
                 });
         });
 }
 
-fn dashboard_heading(ui: &mut egui::Ui, app: &ManagerApp) {
+/// Page title, a one-sentence summary, and the page's actions.
+fn heading(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.label(
-                RichText::new("Machines")
+                RichText::new("All machines")
                     .size(24.0)
                     .color(theme::TEXT)
                     .strong(),
             );
-            ui.label(ui::dim(
-                "Start, install and care for your virtual computers.",
-            ));
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(summary(app))
+                    .size(13.5)
+                    .color(theme::TEXT_DIM),
+            );
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let active = app
-                .scan
-                .vms
-                .iter()
-                .filter(|vm| app.is_busy(&vm.name))
-                .count();
-            ui::chip(ui, &format!("{active} active"), theme::OK);
-            ui::chip(ui, &format!("{} total", app.scan.vms.len()), theme::CYAN);
+            if ui::primary_button(ui, "New machine").clicked() {
+                actions.push(Action::OpenWizard);
+            }
+            if ui::secondary_button(ui, "Import…", true)
+                .on_hover_text(
+                    "Bring in a machine profile (.toml) from another folder. It is \
+                     copied here with its paths made absolute; the files stay put. \
+                     Dropping a profile on the window does the same.",
+                )
+                .clicked()
+            {
+                actions.push(Action::PickPath(crate::picker::PickTarget::ImportProfile));
+            }
+            let (label, tint) = match app.refresh_state() {
+                crate::app::RefreshState::Idle => ("Refresh", theme::TEXT_DIM),
+                crate::app::RefreshState::Scanning => ("Refreshing…", theme::TEXT_FAINT),
+                crate::app::RefreshState::Complete => ("Up to date", theme::OK),
+            };
+            if ui::text_button(ui, label, tint)
+                .on_hover_text("Look in the machines folder again now")
+                .clicked()
+            {
+                actions.push(Action::Refresh);
+            }
         });
     });
+}
+
+/// "One running, one saved for later, one installing." — the page in words.
+fn summary(app: &ManagerApp) -> String {
+    let mut counts = [0usize; 4];
+    for vm in &app.scan.vms {
+        match app.status_of(&vm.name) {
+            Status::Running | Status::Stopping => counts[0] += 1,
+            Status::Suspended | Status::Suspending => counts[1] += 1,
+            Status::Installing => counts[2] += 1,
+            Status::Stopped => counts[3] += 1,
+        }
+    }
+    counts[2] += app
+        .pending
+        .iter()
+        .filter(|p| !app.scan.vms.iter().any(|vm| vm.name == p.name))
+        .count();
+    summarise(counts)
+}
+
+/// The sentence for `[running, saved, installing, off]`.
+fn summarise(counts: [usize; 4]) -> String {
+    let word = |n: usize| match n {
+        1 => "one".to_string(),
+        2 => "two".to_string(),
+        3 => "three".to_string(),
+        n => n.to_string(),
+    };
+    let labels = ["running", "saved for later", "installing", "off"];
+    let parts: Vec<String> = counts
+        .iter()
+        .zip(labels)
+        .filter(|(n, _)| **n > 0)
+        .map(|(n, label)| format!("{} {label}", word(*n)))
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    let sentence = parts.join(", ");
+    let mut chars = sentence.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}.", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+/// A running machine, large: its live screen, the numbers that matter right
+/// now and the controls you reach for while it runs.
+fn running_row(
+    ui: &mut egui::Ui,
+    app: &ManagerApp,
+    vm: &VmEntry,
+    time: f64,
+    actions: &mut Vec<Action>,
+) {
+    let width = ui.available_width();
+    let screen_w = (width * 0.42).clamp(280.0, 520.0);
+    let screen_h = screen_w * 9.0 / 16.0;
+    let height = screen_h.max(210.0);
+    let id = egui::Id::new(("running-row", &vm.name));
+    ui::card(ui, id, Vec2::new(width, height), |ui, _| {
+        let inner = ui.max_rect().expand(ui::CARD_PAD);
+        let screen = Rect::from_min_size(inner.min, Vec2::new(screen_w, height));
+        let open = ui.interact(screen, id.with("screen"), Sense::click());
+        screen_well(ui, app, &vm.name, Status::Running, screen, Corners::Left);
+        if open.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if open.on_hover_text("Open this machine's page").clicked() {
+            actions.push(Action::SwitchView(View::Machine(vm.name.clone())));
+        }
+
+        let info = Rect::from_min_max(
+            egui::pos2(screen.right() + 28.0, inner.top() + 22.0),
+            egui::pos2(inner.right() - 22.0, inner.bottom() - 20.0),
+        );
+        let mut ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(info)
+                .layout(Layout::top_down(Align::Min)),
+        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(&vm.name)
+                    .size(19.0)
+                    .color(theme::TEXT)
+                    .strong(),
+            );
+            ui.add_space(6.0);
+            ui::status_pill(ui, Status::Running, &ui::status_line(app, &vm.name), time);
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(spec_line(app, vm))
+                .size(13.0)
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(16.0);
+        live_numbers(&mut ui, app, vm);
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                running_controls(ui, app, vm, false, actions);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui::icon_button(ui, Icon::Chevron, "Open this machine's page").clicked() {
+                        actions.push(Action::SwitchView(View::Machine(vm.name.clone())));
+                    }
+                });
+            });
+        });
+    });
+}
+
+/// Pause and Shut down for a running machine. Only for a machine this manager
+/// started: the control channel is a pipe to a child, so a VM launched from a
+/// terminal has none and the buttons say so rather than lying.
+///
+/// Reads "Pause · Shut down" in either layout direction: `right_to_left` is
+/// for a caller laying out from the right edge.
+pub(crate) fn running_controls(
+    ui: &mut egui::Ui,
+    app: &ManagerApp,
+    vm: &VmEntry,
+    right_to_left: bool,
+    actions: &mut Vec<Action>,
+) {
+    let controllable = app.has_control(&vm.name);
+    let paused = app.is_paused(&vm.name);
+    let pause = |ui: &mut egui::Ui| {
+        ui::secondary_button(ui, if paused { "Continue" } else { "Pause" }, controllable)
+            .on_hover_text(if !controllable {
+                "This VM was not started from here"
+            } else if paused {
+                "Let the machine continue exactly where it stopped"
+            } else {
+                "Freeze the machine; nothing in it makes progress"
+            })
+            .clicked()
+    };
+    let shut_down = |ui: &mut egui::Ui| {
+        ui::secondary_button(ui, "Shut down", controllable)
+            .on_hover_text(if controllable {
+                "Press the machine's power button: it shuts itself down cleanly, the \
+                 way it would on real hardware. A desktop may ask first."
+            } else {
+                "This VM was not started from here"
+            })
+            .clicked()
+    };
+    let (paused_clicked, shut_clicked) = if right_to_left {
+        let shut = shut_down(ui);
+        (pause(ui), shut)
+    } else {
+        let pause = pause(ui);
+        (pause, shut_down(ui))
+    };
+    if paused_clicked {
+        actions.push(Action::TogglePause(vm.name.clone()));
+    }
+    if shut_clicked {
+        actions.push(Action::Shutdown(vm.name.clone()));
+    }
+}
+
+/// Processor, memory and disk as three labelled meters.
+pub(crate) fn live_numbers(ui: &mut egui::Ui, app: &ManagerApp, vm: &VmEntry) {
+    let stats = app.stats.vms.get(&vm.name);
+    let cpu = stats.and_then(|s| s.cpu_percent);
+    let rss = stats.and_then(|s| s.rss_bytes);
+    let memory = vm.memory_mib * 1024 * 1024;
+    let disk = vm.size_bytes();
+    let used = vm.allocated_bytes();
+    let width = ((ui.available_width() - 2.0 * 20.0) / 3.0).max(80.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 20.0;
+        meter_cell(
+            ui,
+            width,
+            "Processor",
+            cpu.map(|c| format!("{c:.0}%")),
+            cpu.map(|c| c / (100.0 * vm.vcpus.max(1) as f32)),
+        );
+        meter_cell(
+            ui,
+            width,
+            "Memory",
+            rss.map(|r| of(r, memory)),
+            rss.map(|r| r as f32 / memory.max(1) as f32),
+        );
+        meter_cell(
+            ui,
+            width,
+            "Disk",
+            used.map(|u| of(u, disk)),
+            used.map(|u| u as f32 / disk.max(1) as f32),
+        );
+    });
+}
+
+fn meter_cell(
+    ui: &mut egui::Ui,
+    width: f32,
+    label: &str,
+    value: Option<String>,
+    fraction: Option<f32>,
+) {
+    ui.allocate_ui_with_layout(Vec2::new(width, 52.0), Layout::top_down(Align::Min), |ui| {
+        ui.spacing_mut().item_spacing.y = 5.0;
+        ui.label(RichText::new(label).size(12.0).color(theme::TEXT_FAINT));
+        ui.label(
+            RichText::new(value.unwrap_or_else(|| "—".to_string()))
+                .size(14.0)
+                .color(theme::TEXT),
+        );
+        ui::meter(ui, fraction.unwrap_or(0.0), width, theme::ACCENT);
+    });
+}
+
+/// "5.3 of 8.0 GiB": a part of a whole, the unit said once.
+pub(crate) fn of(part: u64, whole: u64) -> String {
+    let whole_text = format_bytes(whole);
+    let part_text = format_bytes(part);
+    match (part_text.rsplit_once(' '), whole_text.rsplit_once(' ')) {
+        (Some((number, unit)), Some((_, whole_unit))) if unit == whole_unit => {
+            format!("{number} of {whole_text}")
+        }
+        _ => format!("{part_text} of {whole_text}"),
+    }
+}
+
+/// "4 vCPU · 8.0 GiB" — the short shape a tile has room for.
+fn short_spec(vm: &VmEntry) -> String {
+    format!(
+        "{} vCPU · {}",
+        vm.vcpus,
+        format_bytes(vm.memory_mib * 1024 * 1024)
+    )
+}
+
+/// "4 vCPU · 8.0 GiB · 1920×1080 · Windows (WHP)" — the machine's shape.
+pub(crate) fn spec_line(app: &ManagerApp, vm: &VmEntry) -> String {
+    let mut parts = vec![
+        format!("{} vCPU", vm.vcpus),
+        format_bytes(vm.memory_mib * 1024 * 1024),
+        format!("{}×{}", vm.display.0, vm.display.1),
+    ];
+    // Where it runs, but only where there is a choice to make — on Linux it
+    // would say the same thing for every machine, which is noise.
+    if crate::backend::Backend::Wsl.available_on_host() {
+        parts.push(app.backend_of(&vm.name).label().to_string());
+    }
+    parts.join(" · ")
+}
+
+/// The grid of everything that is not running, plus machines still being
+/// installed, plus a dashed "New machine" tile at the end.
+fn tile_grid(
+    ui: &mut egui::Ui,
+    app: &ManagerApp,
+    vms: &[&VmEntry],
+    pending: &[&crate::app::PendingInstall],
+    actions: &mut Vec<Action>,
+) {
+    let width = ui.available_width();
+    let columns = ((width + GAP) / (TILE_MIN_W + GAP)).floor().max(1.0);
+    let tile_w = ((width - GAP * (columns - 1.0)) / columns).floor();
+    ui.with_layout(
+        Layout::left_to_right(Align::Min).with_main_wrap(true),
+        |ui| {
+            ui.spacing_mut().item_spacing = Vec2::splat(GAP);
+            for vm in vms {
+                let status = app.status_of(&vm.name);
+                tile(ui, app, &vm.name, status, tile_w, Some(vm), actions);
+            }
+            for pending in pending {
+                tile(
+                    ui,
+                    app,
+                    &pending.name,
+                    Status::Installing,
+                    tile_w,
+                    None,
+                    actions,
+                );
+            }
+            new_tile(ui, tile_w, actions);
+        },
+    );
+}
+
+/// One machine at rest (or in transition): its screen as it was left, its name
+/// and state, and the one action it most likely needs.
+fn tile(
+    ui: &mut egui::Ui,
+    app: &ManagerApp,
+    name: &str,
+    status: Status,
+    width: f32,
+    vm: Option<&VmEntry>,
+    actions: &mut Vec<Action>,
+) {
+    let id = egui::Id::new(("tile", name));
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, TILE_H), Sense::hover());
+    let open = ui.interact(rect, id, Sense::click());
+    let t = theme::animate_bool(ui.ctx(), id.with("hover"), open.hovered(), 0.12);
+    let radius = egui::CornerRadius::same(theme::CARD_RADIUS);
+    ui.painter().rect_filled(rect, radius, theme::CARD);
+    let screen = Rect::from_min_size(rect.min, Vec2::new(width, TILE_SCREEN_H));
+    screen_well(ui, app, name, status, screen, Corners::Top);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0_f32, theme::mix(theme::STROKE, theme::STROKE_STRONG, t)),
+        egui::StrokeKind::Inside,
+    );
+    if open.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if open.clicked() {
+        actions.push(Action::SwitchView(View::Machine(name.to_string())));
+    }
+
+    let body = Rect::from_min_max(
+        egui::pos2(rect.left() + 16.0, screen.bottom() + 14.0),
+        egui::pos2(rect.right() - 14.0, rect.bottom() - 12.0),
+    );
+    let mut ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(body)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    ui.horizontal(|ui| {
+        let (dot, _) = ui.allocate_exact_size(Vec2::new(10.0, 22.0), Sense::hover());
+        ui::status_dot(ui.painter(), dot.center(), status);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            tile_action(ui, app, name, status, vm, actions);
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(name).size(15.0).color(theme::TEXT).strong())
+                        .selectable(false)
+                        .truncate(),
+                );
+            });
+        });
+    });
+    let line = match vm {
+        Some(vm) => format!("{} · {}", ui::status_line(app, name), short_spec(vm)),
+        None => "The installer is running".to_string(),
+    };
+    ui.add(
+        egui::Label::new(RichText::new(line).size(12.5).color(theme::TEXT_DIM))
+            .selectable(false)
+            .truncate(),
+    );
+}
+
+/// The one button a tile carries, when its state has an obvious next step.
+fn tile_action(
+    ui: &mut egui::Ui,
+    app: &ManagerApp,
+    name: &str,
+    status: Status,
+    vm: Option<&VmEntry>,
+    actions: &mut Vec<Action>,
+) {
+    let missing_disk = vm.is_some_and(|vm| vm.disks.iter().any(|d| !d.exists));
+    match status {
+        Status::Stopped if vm.is_some() && !missing_disk => {
+            if ui::secondary_button(ui, "Start", true).clicked() {
+                actions.push(Action::Start(name.to_string()));
+            }
+        }
+        Status::Suspended => {
+            let verdict = app
+                .snapshot_for(name)
+                .map(|row| app.snapshot_verdict(row))
+                .unwrap_or_default();
+            let response = ui::secondary_button(ui, "Resume", verdict.resumable());
+            let response = if verdict.resumable() {
+                response.on_hover_text("Put the machine back exactly as you left it")
+            } else {
+                response.on_hover_text(verdict.blocked.join("\n\n"))
+            };
+            if response.clicked() {
+                actions.push(Action::ResumeVm(name.to_string()));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The dashed tile at the end of the grid.
+fn new_tile(ui: &mut egui::Ui, width: f32, actions: &mut Vec<Action>) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, TILE_H), Sense::click());
+    let t = theme::animate_bool(
+        ui.ctx(),
+        response.id.with("hover"),
+        response.hovered(),
+        0.12,
+    );
+    let painter = ui.painter();
+    let stroke = egui::Stroke::new(
+        1.0_f32,
+        theme::mix(theme::STROKE_STRONG, theme::TEXT_FAINT, t),
+    );
+    // egui has no dashed rectangle: four dashed edges, stopping short of the
+    // corners so the outline reads as rounded.
+    let r = rect.shrink(0.5);
+    let k = theme::CARD_RADIUS as f32;
+    for (a, b) in [
+        (
+            r.left_top() + Vec2::new(k, 0.0),
+            r.right_top() - Vec2::new(k, 0.0),
+        ),
+        (
+            r.left_bottom() + Vec2::new(k, 0.0),
+            r.right_bottom() - Vec2::new(k, 0.0),
+        ),
+        (
+            r.left_top() + Vec2::new(0.0, k),
+            r.left_bottom() - Vec2::new(0.0, k),
+        ),
+        (
+            r.right_top() + Vec2::new(0.0, k),
+            r.right_bottom() - Vec2::new(0.0, k),
+        ),
+    ] {
+        painter.extend(egui::Shape::dashed_line(&[a, b], stroke, 6.0, 5.0));
+    }
+    let fg = theme::mix(theme::TEXT_DIM, theme::TEXT, t);
+    ui::paint_icon(
+        painter,
+        Rect::from_center_size(rect.center() - Vec2::new(0.0, 14.0), Vec2::splat(22.0)),
+        Icon::Plus,
+        fg,
+    );
+    painter.text(
+        rect.center() + Vec2::new(0.0, 16.0),
+        egui::Align2::CENTER_CENTER,
+        "New machine",
+        egui::FontId::proportional(13.5),
+        fg,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.clicked() {
+        actions.push(Action::OpenWizard);
+    }
+}
+
+/// Which corners of a screen well are rounded: the well sits at the top of a
+/// tile, at the left of a wide row, or alone.
+#[derive(Clone, Copy)]
+pub(crate) enum Corners {
+    Top,
+    Left,
+    All,
+}
+
+/// A machine's screen in `rect`: the live picture while it runs, the last one
+/// dimmed when it does not, or a quiet placeholder that says what state it is
+/// in.
+pub(crate) fn screen_well(
+    ui: &mut egui::Ui,
+    app: &ManagerApp,
+    name: &str,
+    status: Status,
+    rect: Rect,
+    corners: Corners,
+) {
+    let r = theme::CARD_RADIUS;
+    let radius = match corners {
+        Corners::Top => egui::CornerRadius {
+            nw: r,
+            ne: r,
+            sw: 0,
+            se: 0,
+        },
+        Corners::Left => egui::CornerRadius {
+            nw: r,
+            ne: 0,
+            sw: r,
+            se: 0,
+        },
+        Corners::All => egui::CornerRadius::same(r),
+    };
+    ui.painter().rect_filled(rect, radius, theme::INSET);
+    let live = status == Status::Running;
+    if let Some(texture) = app.thumbs.get(name) {
+        let size = texture.size_vec2();
+        if size.x > 0.0 && size.y > 0.0 {
+            // Cover the well, cropping what does not fit, so every tile in a
+            // row has the same shape whatever the guest's resolution.
+            let scale = (rect.width() / size.x).max(rect.height() / size.y);
+            let shown = size * scale;
+            let uv = Rect::from_center_size(
+                egui::pos2(0.5, 0.5),
+                Vec2::new(
+                    (rect.width() / shown.x).min(1.0),
+                    (rect.height() / shown.y).min(1.0),
+                ),
+            );
+            egui::Image::new(texture)
+                .uv(uv)
+                .corner_radius(radius)
+                .tint(if live {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::from_gray(96)
+                })
+                .paint_at(ui, rect);
+            return;
+        }
+    }
+    let words = match status {
+        Status::Running => "Waiting for the first picture",
+        Status::Stopped => "Off",
+        Status::Suspended => "Saved session",
+        Status::Suspending => "Saving…",
+        Status::Installing => "Installing",
+        Status::Stopping => "Shutting down",
+    };
+    let painter = ui.painter();
+    let mark = Rect::from_center_size(rect.center() - Vec2::new(0.0, 12.0), Vec2::splat(30.0));
+    crate::logo::paint_mark(painter, mark, theme::INSET);
+    // Dim the mark: a placeholder must not compete with real screens.
+    painter.rect_filled(
+        mark.expand(3.0),
+        egui::CornerRadius::ZERO,
+        theme::INSET.gamma_multiply(0.55),
+    );
+    painter.text(
+        rect.center() + Vec2::new(0.0, 18.0),
+        egui::Align2::CENTER_CENTER,
+        words,
+        egui::FontId::monospace(11.5),
+        theme::TEXT_FAINT,
+    );
+}
+
+/// The first-launch page: what this is, and the two systems to start with.
+fn welcome(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
+    let width = ui.available_width().min(720.0);
+    let top = ((ui.available_height() - 470.0) * 0.4).max(24.0);
+    ui.add_space(top);
+    ui.vertical_centered(|ui| {
+        ui.set_max_width(width);
+        let (mark, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+        crate::logo::paint_mark(ui.painter(), mark, theme::BG_DEEP);
+        ui.add_space(22.0);
+        ui.label(
+            RichText::new("Linux, right on your desktop")
+                .size(30.0)
+                .color(theme::TEXT)
+                .strong(),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(
+                "Pick a system and Entangled sets up the rest: the disk, the network \
+                 and a window at your monitor's resolution.",
+            )
+            .size(14.5)
+            .color(theme::TEXT_DIM),
+        );
+        ui.add_space(26.0);
+        let gap = 16.0;
+        let card_w = ((width - gap) / 2.0).floor();
+        ui.allocate_ui_with_layout(
+            Vec2::new(width, 150.0),
+            Layout::left_to_right(Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                let ubuntu_first = GuestFamily::default_for_host() == GuestFamily::Ubuntu;
+                for (family, title, text) in [
+                    (
+                        GuestFamily::Ubuntu,
+                        "Ubuntu desktop",
+                        "A full desktop with GPU acceleration. Installs offline from a \
+                         verified image.",
+                    ),
+                    (
+                        GuestFamily::Debian,
+                        "Debian",
+                        "A smaller system that downloads its packages while it installs.",
+                    ),
+                ] {
+                    let recommended = (family == GuestFamily::Ubuntu) == ubuntu_first;
+                    if choice_card(ui, card_w, title, text, recommended).clicked() {
+                        actions.push(Action::OpenWizardFor(family));
+                    }
+                }
+            },
+        );
+        ui.add_space(20.0);
+        ui.horizontal(|ui| {
+            ui.add_space((width * 0.5 - 140.0).max(0.0));
+            ui.label(
+                RichText::new("Already have one?")
+                    .size(13.0)
+                    .color(theme::TEXT_DIM),
+            );
+            if ui::text_button(ui, "Import a machine", theme::ACCENT).clicked() {
+                actions.push(Action::PickPath(crate::picker::PickTarget::ImportProfile));
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "Machines live in {}",
+                app.settings.vm_dir.display()
+            ))
+            .size(11.5)
+            .color(theme::TEXT_FAINT),
+        );
+    });
+}
+
+fn choice_card(
+    ui: &mut egui::Ui,
+    width: f32,
+    title: &str,
+    text: &str,
+    recommended: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 150.0), Sense::click());
+    let t = theme::animate_bool(
+        ui.ctx(),
+        response.id.with("hover"),
+        response.hovered(),
+        0.12,
+    );
+    let painter = ui.painter();
+    let radius = egui::CornerRadius::same(12);
+    painter.rect_filled(rect, radius, theme::MODAL);
+    let edge = if recommended {
+        theme::mix(theme::STROKE_STRONG, theme::ACCENT, 0.35 + 0.65 * t)
+    } else {
+        theme::mix(theme::STROKE, theme::ACCENT, t)
+    };
+    painter.rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0_f32, edge),
+        egui::StrokeKind::Inside,
+    );
+    let badge = Rect::from_min_size(rect.min + Vec2::new(22.0, 22.0), Vec2::splat(40.0));
+    painter.rect_filled(badge, egui::CornerRadius::same(10), theme::SELECTED);
+    let initial: String = title.chars().take(1).collect();
+    painter.text(
+        badge.center(),
+        egui::Align2::CENTER_CENTER,
+        initial,
+        egui::FontId::proportional(17.0),
+        theme::TEXT,
+    );
+    painter.text(
+        egui::pos2(badge.right() + 12.0, badge.top() + 1.0),
+        egui::Align2::LEFT_TOP,
+        title,
+        egui::FontId::proportional(16.0),
+        theme::TEXT,
+    );
+    painter.text(
+        egui::pos2(badge.right() + 12.0, badge.bottom() - 1.0),
+        egui::Align2::LEFT_BOTTOM,
+        if recommended {
+            "Recommended"
+        } else {
+            "Also available"
+        },
+        egui::FontId::proportional(12.0),
+        if recommended {
+            theme::ACCENT
+        } else {
+            theme::TEXT_FAINT
+        },
+    );
+    let galley = painter.layout(
+        text.to_owned(),
+        egui::FontId::proportional(13.0),
+        theme::TEXT_DIM,
+        width - 44.0,
+    );
+    painter.galley(
+        egui::pos2(rect.left() + 22.0, badge.bottom() + 16.0),
+        galley,
+        theme::TEXT_DIM,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
 }
 
 /// The persistent notices (update, startup warning, scan errors, missing CLI).
@@ -121,9 +862,9 @@ pub(crate) fn banners(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Act
     }
 }
 
-/// The non-intrusive "a newer version exists" notice (quantum theme): a card
-/// surface with the cyan→violet hairline, the version pair, one accent action
-/// and a quiet Skip. It never opens on its own and never blocks anything.
+/// The non-intrusive "a newer version exists" notice: a card surface with the
+/// version pair, one action and a quiet Skip. It never opens on its own and
+/// never blocks anything.
 fn update_banner(
     ui: &mut egui::Ui,
     app: &ManagerApp,
@@ -131,23 +872,11 @@ fn update_banner(
     actions: &mut Vec<Action>,
 ) {
     egui::Frame::new()
-        .fill(theme::mix(theme::CARD, theme::CYAN, 0.05))
+        .fill(theme::mix(theme::CARD, theme::ACCENT, 0.05))
         .stroke(egui::Stroke::new(1.0_f32, theme::STROKE_STRONG))
         .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
         .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
-            // The entanglement hairline along the top edge marks this as a
-            // product message, not an error.
-            let bar = egui::Rect::from_min_size(
-                ui.max_rect().left_top() - Vec2::new(0.0, 8.0),
-                Vec2::new(ui.available_width(), 2.0),
-            );
-            theme::gradient_rect(
-                ui.painter(),
-                bar,
-                theme::CYAN.gamma_multiply(0.8),
-                theme::VIOLET.gamma_multiply(0.8),
-            );
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.label(
@@ -161,8 +890,8 @@ fn update_banner(
                     crate::VERSION
                 )));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui::ghost_button(ui, "Skip", !app.update_downloading, theme::TEXT_DIM)
-                        .clicked()
+                    if ui::text_button(ui, "Skip", theme::TEXT_DIM).clicked()
+                        && !app.update_downloading
                     {
                         actions.push(Action::DismissUpdate);
                     }
@@ -173,7 +902,7 @@ fn update_banner(
                         } else {
                             "Download & install"
                         };
-                        if ui::ghost_button(ui, label, !app.update_downloading, theme::CYAN)
+                        if ui::secondary_button(ui, label, !app.update_downloading)
                             .on_hover_text(
                                 "Saves the installer to Downloads and starts it; \
                                  it upgrades this installation in place",
@@ -182,7 +911,7 @@ fn update_banner(
                         {
                             actions.push(Action::InstallUpdate);
                         }
-                    } else if ui::ghost_button(ui, "Release page", true, theme::CYAN).clicked() {
+                    } else if ui::secondary_button(ui, "Release page", true).clicked() {
                         actions.push(Action::OpenReleasePage);
                     }
                 });
@@ -190,751 +919,9 @@ fn update_banner(
         });
 }
 
-fn vm_card(
-    ui: &mut egui::Ui,
-    app: &ManagerApp,
-    vm: &VmEntry,
-    time: f64,
-    actions: &mut Vec<Action>,
-) {
-    let status = app.status_of(&vm.name);
-    let accent_at = accent_for(&vm.name);
-    let id = egui::Id::new(("vm-card", &vm.name));
-    let missing_disk = vm.disks.iter().any(|d| !d.exists);
-
-    ui::card(
-        ui,
-        id,
-        Vec2::new(theme::CARD_WIDTH, CARD_HEIGHT),
-        accent_at,
-        |ui, _hover| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(&vm.name)
-                        .size(17.0)
-                        .color(theme::TEXT)
-                        .strong(),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui::status_badge(ui, status, time);
-                });
-            });
-            ui.add_space(8.0);
-
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui::chip(ui, &format!("{} MiB", vm.memory_mib), theme::CYAN);
-                ui::chip(ui, &format!("{} vCPU", vm.vcpus), theme::VIOLET);
-                ui::chip(
-                    ui,
-                    &format!("{}×{}", vm.display.0, vm.display.1),
-                    theme::TEXT_DIM,
-                );
-                if let Some(interface) = &vm.network_interface {
-                    ui::chip(ui, interface, theme::OK);
-                }
-                // Where this machine runs, but only where there is a choice to
-                // make — on Linux the chip would say the same thing on every
-                // card, which is noise.
-                let backend = app.backend_of(&vm.name);
-                if crate::backend::Backend::Wsl.available_on_host() {
-                    ui::chip(ui, backend.label(), theme::accent(0.5));
-                }
-                if !vm.shares.is_empty() {
-                    let tags: Vec<&str> = vm.shares.iter().map(|s| s.tag.as_str()).collect();
-                    let label = if vm.shares.len() == 1 {
-                        format!("share {}", tags[0])
-                    } else {
-                        format!("{} shares", vm.shares.len())
-                    };
-                    ui.scope(|ui| ui::chip(ui, &label, theme::CYAN))
-                        .response
-                        .on_hover_text(format!(
-                            "Shared folders, mounted in the guest by tag: {}",
-                            tags.join(", ")
-                        ));
-                }
-                if !vm.forwards.is_empty() {
-                    let list: Vec<String> = vm.forwards.iter().map(|r| r.to_string()).collect();
-                    let label = if vm.forwards.len() == 1 {
-                        format!("fwd {}", list[0])
-                    } else {
-                        format!("{} forwards", vm.forwards.len())
-                    };
-                    ui.scope(|ui| ui::chip(ui, &label, theme::VIOLET))
-                        .response
-                        .on_hover_text(format!(
-                            "Port forwards, host port to guest port: {}",
-                            list.join(", ")
-                        ));
-                }
-            });
-            ui.add_space(8.0);
-
-            if missing_disk {
-                ui.label(
-                    RichText::new("disk image missing")
-                        .color(theme::ERR)
-                        .size(12.5),
-                );
-            } else {
-                let mut text = format!("Storage {}", format_bytes(vm.size_bytes()));
-                if let Some(allocated) = vm.allocated_bytes() {
-                    text.push_str(&format!(" · {} on disk", format_bytes(allocated)));
-                }
-                ui.label(ui::dim(text));
-            }
-            let path = vm.profile_path.display().to_string();
-            ui.label(ui::faint(shorten(&path, 46))).on_hover_text(&path);
-            let twins = app.name_count(&vm.name);
-            if twins > 1 {
-                ui.label(
-                    RichText::new(format!("{} profiles share this name — rename one", twins))
-                        .color(theme::WARN)
-                        .size(12.5),
-                )
-                .on_hover_text(
-                    "Status, logs, saved sessions and the screen picture all go by the \
-                     machine's name, so machines that share one get each other's. More → \
-                     Rename… gives this one its own.",
-                );
-            }
-            live_stats_line(ui, app, vm, status, accent_at);
-            suspend_line(ui, app, vm, status);
-            ui.add_space(6.0);
-
-            // The action strip sits on the card's bottom edge, so its height
-            // has to be known *before* it is laid out — a wrapped row inside a
-            // bottom-anchored space grows downward, straight through the
-            // border. egui only learns how many lines a `horizontal_wrapped`
-            // takes by laying it out, so it is laid out twice: once invisibly
-            // to be measured, once for real. Declaring a line count per state
-            // was the first attempt, and it was wrong for Suspended on the day
-            // that state was added — silently, because only a screenshot shows
-            // it.
-            let strip = measured_action_height(ui, app, vm, status, missing_disk, &path);
-            screen_picture(ui, app, vm, status, ui.available_height() - strip - 6.0);
-            ui.add_space((ui.available_height() - strip).max(0.0));
-            action_strip(ui, app, vm, status, missing_disk, &path, actions);
-        },
-    );
-}
-
-/// The machine's screen, in whatever room the card has left above its
-/// buttons: live (a few seconds old) while it runs, dimmed when it does not —
-/// the screen as it was left. Nothing at all when there is no picture or no
-/// room for a useful one.
-fn screen_picture(ui: &mut egui::Ui, app: &ManagerApp, vm: &VmEntry, status: Status, room: f32) {
-    let Some(texture) = app.thumbs.get(&vm.name) else {
-        return;
-    };
-    if room < 56.0 {
-        return;
-    }
-    let size = texture.size_vec2();
-    if size.x <= 0.0 || size.y <= 0.0 {
-        return;
-    }
-    let scale = (ui.available_width() / size.x).min(room / size.y);
-    let shown = size * scale;
-    ui.add_space(4.0);
-    let (row, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), shown.y),
-        egui::Sense::hover(),
-    );
-    let rect = egui::Rect::from_center_size(row.center(), shown);
-    let live = status == Status::Running;
-    let tint = if live {
-        egui::Color32::WHITE
-    } else {
-        egui::Color32::from_gray(110)
-    };
-    egui::Image::new(texture)
-        .corner_radius(6)
-        .tint(tint)
-        .paint_at(ui, rect);
-    ui.painter().rect_stroke(
-        rect,
-        egui::CornerRadius::same(6),
-        egui::Stroke::new(
-            1.0_f32,
-            theme::accent(accent_for(&vm.name)).gamma_multiply(0.5),
-        ),
-        egui::StrokeKind::Outside,
-    );
-    let response = ui.interact(
-        rect,
-        ui.id().with(("screen", &vm.name)),
-        egui::Sense::hover(),
-    );
-    response.on_hover_text(if live {
-        "The screen, a few seconds ago"
-    } else {
-        "The screen as it was when the machine last ran here"
-    });
-}
-
-/// Lays the action strip out once, invisibly, to learn how tall it will be.
-fn measured_action_height(
-    ui: &mut egui::Ui,
-    app: &ManagerApp,
-    vm: &VmEntry,
-    status: Status,
-    missing_disk: bool,
-    path: &str,
-) -> f32 {
-    let mut probe = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt("action-strip-sizing")
-            .max_rect(egui::Rect::from_min_size(
-                ui.cursor().min,
-                Vec2::new(ui.available_width(), 400.0),
-            ))
-            .layout(Layout::top_down(Align::Min))
-            .sizing_pass()
-            .invisible(),
-    );
-    // The throwaway action list is the point of the second pass being free of
-    // side effects: an invisible, disabled `Ui` reports no clicks, but a button
-    // that somehow did would push into a vector nobody reads.
-    action_strip(
-        &mut probe,
-        app,
-        vm,
-        status,
-        missing_disk,
-        path,
-        &mut Vec::new(),
-    );
-    probe.min_rect().height()
-}
-
-/// Every button a machine in this state offers, wrapped onto as many lines as
-/// [`theme::CARD_WIDTH`] needs.
-fn action_strip(
-    ui: &mut egui::Ui,
-    app: &ManagerApp,
-    vm: &VmEntry,
-    status: Status,
-    missing_disk: bool,
-    path: &str,
-    actions: &mut Vec<Action>,
-) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(7.0, ACTION_WRAP_GAP);
-        match status {
-            Status::Stopped => {
-                if !missing_disk && ui::primary_button(ui, "Start").clicked() {
-                    actions.push(Action::Start(vm.name.clone()));
-                }
-            }
-            // The third resting state (ADR-0006). Resume is the
-            // primary action, and it is only bright when the saved
-            // session could really go back — the reasons it could
-            // not are on the hover, not in a toast after the click.
-            Status::Suspended => {
-                let verdict = app
-                    .snapshot_for(&vm.name)
-                    .map(|row| app.snapshot_verdict(row))
-                    .unwrap_or_default();
-                let hover = if verdict.resumable() {
-                    "Put the machine back exactly as you left it — the same \
-                             programs, the same windows."
-                        .to_string()
-                } else {
-                    verdict.blocked.join("\n\n")
-                };
-                if verdict.resumable() {
-                    if ui::primary_button(ui, "Resume")
-                        .on_hover_text(hover)
-                        .clicked()
-                    {
-                        actions.push(Action::ResumeVm(vm.name.clone()));
-                    }
-                } else if ui::ghost_button(ui, "Resume", false, theme::VIOLET)
-                    .on_hover_text(hover)
-                    .clicked()
-                {
-                    // Unreachable while disabled; kept so the arm
-                    // stays one shape.
-                }
-                if ui::ghost_button(ui, "Start fresh…", !missing_disk, theme::WARN)
-                    .on_hover_text(
-                        "Boot the machine from scratch. The saved session cannot \
-                                 survive that — the guest writes to the disk it was \
-                                 pinned to — so it is thrown away first, and you are \
-                                 asked before anything happens.",
-                    )
-                    .clicked()
-                {
-                    actions.push(Action::AskDiscardSnapshot(vm.name.clone()));
-                }
-            }
-            // One-way, and nothing to press: the machine is being
-            // written to a file and will stop when it has.
-            Status::Suspending => {
-                if let Some(task) = app.supervisor.active_task(&vm.name) {
-                    if ui::ghost_button(ui, "View activity", true, theme::CYAN).clicked() {
-                        actions.push(Action::SelectLog(task.id));
-                    }
-                }
-            }
-            Status::Running => {
-                // Pause and Restart (ADR-0005). Only for a VM this
-                // manager started: the control channel is a pipe to
-                // a child, so a VM launched from a terminal has
-                // none and the buttons say so rather than lying.
-                let controllable = app.has_control(&vm.name);
-                // Shut down first: the clean way out, which the guest
-                // performs itself (its ACPI power button).
-                if ui::ghost_button(ui, "Shut down", controllable, theme::CYAN)
-                    .on_hover_text(if controllable {
-                        "Press the machine's power button: it shuts itself down \
-                         cleanly, the way it would on real hardware. A desktop may ask \
-                         first."
-                    } else {
-                        "This VM was not started from here"
-                    })
-                    .clicked()
-                {
-                    actions.push(Action::Shutdown(vm.name.clone()));
-                }
-                if ui::ghost_button(ui, "Stop", true, theme::WARN)
-                    .on_hover_text(
-                        "Power the machine off now, like pulling the plug. Anything \
-                         the guest had not written to disk is lost.",
-                    )
-                    .clicked()
-                {
-                    actions.push(Action::Stop(vm.name.clone()));
-                }
-                let paused = app.is_paused(&vm.name);
-                let label = if paused { "Resume" } else { "Pause" };
-                if ui::ghost_button(ui, label, controllable, theme::VIOLET)
-                    .on_hover_text(if !controllable {
-                        "This VM was not started from here"
-                    } else if paused {
-                        "Let the machine continue exactly where it stopped"
-                    } else {
-                        "Freeze the machine; nothing in it makes progress"
-                    })
-                    .clicked()
-                {
-                    actions.push(Action::TogglePause(vm.name.clone()));
-                }
-                if ui::ghost_button(ui, "Restart", controllable, theme::VIOLET)
-                    .on_hover_text(if controllable {
-                        "Reboot the machine in place, as the guest's own Restart does"
-                    } else {
-                        "This VM was not started from here"
-                    })
-                    .clicked()
-                {
-                    actions.push(Action::Reset(vm.name.clone()));
-                }
-                // Suspend (ADR-0006): close the lid. Sits beside
-                // Stop because that is the choice being made — this
-                // is the other way to stop a machine, and the one
-                // that keeps everything it was doing.
-                if ui::ghost_button(ui, "Suspend", controllable, theme::VIOLET)
-                    .on_hover_text(if controllable {
-                        "Write the whole machine to a file and stop it. Opening it \
-                                 again puts you back exactly here. A machine with 2 GiB of \
-                                 memory takes a few seconds; a desktop takes longer."
-                    } else {
-                        "This VM was not started from here"
-                    })
-                    .clicked()
-                {
-                    actions.push(Action::Suspend(vm.name.clone()));
-                }
-            }
-            Status::Stopping => {
-                if ui::ghost_button(ui, "Kill", true, theme::ERR)
-                    .on_hover_text("Shutdown was requested; force it")
-                    .clicked()
-                {
-                    actions.push(Action::Stop(vm.name.clone()));
-                }
-            }
-            Status::Installing => {
-                if ui::ghost_button(ui, "Abort", true, theme::ERR).clicked() {
-                    actions.push(Action::Stop(vm.name.clone()));
-                }
-            }
-        }
-        // A suspended machine can be configured — it is not
-        // running — but changing its hardware is exactly what makes
-        // the saved session unrestorable, so the hover says so
-        // instead of the refusal arriving at resume time.
-        let configurable = matches!(status, Status::Stopped | Status::Suspended);
-        if ui::ghost_button(ui, "Configure", configurable, theme::VIOLET)
-            .on_hover_text(match status {
-                Status::Stopped => "Memory, vCPUs, boot, network, disks, display",
-                Status::Suspended => {
-                    "Memory, vCPUs, boot, network, disks, display. Changing the \
-                             hardware makes the saved session unrestorable — a snapshot \
-                             only goes back onto the machine it came off."
-                }
-                _ => "Stop the machine first",
-            })
-            .clicked()
-        {
-            actions.push(Action::AskEditVm(vm.name.clone()));
-        }
-        ui.menu_button("More", |ui| {
-            if ui.button("Copy profile path").clicked() {
-                actions.push(Action::CopyProfilePath(path.to_string()));
-                ui.close();
-            }
-            let mut autostart = app.settings.autostart.contains(&vm.name);
-            if ui
-                .checkbox(&mut autostart, "Start when the manager opens")
-                .on_hover_text(
-                    "Boots this machine (or resumes its saved session) every time the \
-                     manager starts. A machine already running is left alone.",
-                )
-                .changed()
-            {
-                actions.push(Action::ToggleAutostart(vm.name.clone()));
-            }
-            if let Some(ssh) = vm.ssh_command() {
-                if ui
-                    .button("Copy SSH command")
-                    .on_hover_text(format!(
-                        "{ssh} — through the machine's port forward to port 22"
-                    ))
-                    .clicked()
-                {
-                    actions.push(Action::CopyProfilePath(ssh));
-                    ui.close();
-                }
-            }
-            for share in &vm.shares {
-                if ui
-                    .button(format!("Open shared folder '{}'", share.tag))
-                    .on_hover_text(share.path.display().to_string())
-                    .clicked()
-                {
-                    actions.push(Action::Reveal(share.path.clone()));
-                    ui.close();
-                }
-                if ui
-                    .button(format!("Copy mount command for '{}'", share.tag))
-                    .on_hover_text("What to run inside the guest to open the folder")
-                    .clicked()
-                {
-                    actions.push(Action::CopyProfilePath(format!(
-                        "sudo mkdir -p /mnt/{tag} && sudo mount -t 9p -o                          trans=virtio,version=9p2000.L,msize=524288 {tag} /mnt/{tag}",
-                        tag = share.tag
-                    )));
-                    ui.close();
-                }
-            }
-            if let Some(task) = app
-                .supervisor
-                .tasks()
-                .iter()
-                .rev()
-                .find(|t| t.vm == vm.name)
-            {
-                if ui.button("Open activity log").clicked() {
-                    actions.push(Action::SelectLog(task.id));
-                    ui.close();
-                }
-            }
-            ui.separator();
-            if app.snapshot_for(&vm.name).is_some()
-                && ui
-                    .add_enabled(
-                        status == Status::Suspended,
-                        egui::Button::new("Forget the saved session"),
-                    )
-                    .on_hover_text(
-                        "Delete the snapshot and leave the machine stopped. Its \
-                                 disks and settings are untouched.",
-                    )
-                    .clicked()
-            {
-                if let Some(row) = app.snapshot_for(&vm.name) {
-                    actions.push(Action::AskDeleteSnapshot(row.path.clone()));
-                }
-                ui.close();
-            }
-            if ui
-                .add_enabled(status == Status::Stopped, egui::Button::new("Rename…"))
-                .on_hover_text(
-                    "A new name for the machine, and for its profile and the disks \
-                     and UEFI store named after it.",
-                )
-                .clicked()
-            {
-                actions.push(Action::AskRenameVm(vm.profile_path.clone()));
-                ui.close();
-            }
-            if ui
-                .add_enabled(
-                    matches!(status, Status::Stopped | Status::Suspended),
-                    egui::Button::new("Clone…"),
-                )
-                .on_hover_text(
-                    "A second machine from this one: its disks copied (only the data \
-                     they hold), its UEFI boot entries, its settings, and a network \
-                     address of its own.",
-                )
-                .clicked()
-            {
-                actions.push(Action::AskCloneVm(vm.name.clone()));
-                ui.close();
-            }
-            if ui
-                .add_enabled(
-                    matches!(status, Status::Stopped | Status::Suspended),
-                    egui::Button::new("Delete machine"),
-                )
-                .clicked()
-            {
-                actions.push(Action::AskDelete(vm.name.clone()));
-                ui.close();
-            }
-        });
-    });
-}
-
-/// What a machine in one of the two snapshot states has to say for itself.
-///
-/// **Suspending** has no progress to report — the engine writes the memory in
-/// one pass and says nothing until it is done — so the honest thing is the time
-/// it has been going plus what to expect. A fake progress bar filling at a rate
-/// nobody measured would be worse than a number that is simply true.
-///
-/// **Suspended** says when, how big, and — when there is one — the first reason
-/// it could not go back, which is the thing the user most needs before they
-/// reach for the button.
-fn suspend_line(ui: &mut egui::Ui, app: &ManagerApp, vm: &VmEntry, status: Status) {
-    match status {
-        Status::Suspending => {
-            let elapsed = app
-                .supervisor
-                .active_task(&vm.name)
-                .and_then(|task| task.suspending_for())
-                .unwrap_or_default();
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new(format!(
-                    "writing memory to disk — {:.0} s",
-                    elapsed.as_secs_f32()
-                ))
-                .color(theme::VIOLET)
-                .size(12.0),
-            )
-            .on_hover_text(
-                "Only the pages the guest has actually touched are written, which is \
-                 usually about a quarter of its memory. A 2 GiB machine takes a few \
-                 seconds; a desktop-sized one longer.",
-            );
-        }
-        Status::Suspended => {
-            let Some(row) = app.snapshot_for(&vm.name) else {
-                return;
-            };
-            let verdict = app.snapshot_verdict(row);
-            let mut when = match &row.facts {
-                Ok(facts) => format!(
-                    "saved {}",
-                    vm_snapshot::meta::describe_age(
-                        facts.created_unix,
-                        vm_snapshot::meta::now_unix()
-                    )
-                ),
-                Err(_) => "saved session unreadable".to_string(),
-            };
-            when.push_str(&format!(" · {}", format_bytes(row.apparent_bytes)));
-            ui.add_space(2.0);
-            // One line either way, never two. A card whose height depends on
-            // whether its snapshot happens to be refusable is a card that
-            // overflows its own border on the day the refusal appears — and a
-            // truncated half-sentence was never the whole reason anyway: the
-            // full text is on this line's hover, on the greyed-out Resume
-            // button, and written out in the Snapshots view.
-            if verdict.resumable() {
-                ui.label(RichText::new(when).color(theme::VIOLET).size(12.0))
-                    .on_hover_text(row.path.display().to_string());
-            } else {
-                ui.label(
-                    RichText::new(format!("{when} · cannot resume here"))
-                        .color(theme::WARN)
-                        .size(12.0),
-                )
-                .on_hover_text(format!(
-                    "{}\n\n{}",
-                    row.path.display(),
-                    verdict.blocked.join("\n\n")
-                ));
-            }
-        }
-        _ => {}
-    }
-}
-
-/// One quiet line of live numbers for an active machine: uptime, CPU (of the
-/// `entangled run` child — the guest lives inside it), resident RAM, and a
-/// sparkline of the last minute and a half. Numbers the sampler cannot answer
-/// simply stay away.
-fn live_stats_line(
-    ui: &mut egui::Ui,
-    app: &ManagerApp,
-    vm: &VmEntry,
-    status: Status,
-    accent_at: f32,
-) {
-    if !matches!(
-        status,
-        Status::Running | Status::Installing | Status::Stopping
-    ) {
-        return;
-    }
-    let Some(task) = app.supervisor.active_task(&vm.name) else {
-        return;
-    };
-    let mut parts = vec![format!(
-        "up {}",
-        crate::metrics::format_uptime(task.started_at.elapsed())
-    )];
-    let stats = app.stats.vms.get(&vm.name);
-    if let Some(stats) = stats {
-        if let Some(cpu) = stats.cpu_percent {
-            parts.push(format!("CPU {cpu:.0}%"));
-        }
-        if let Some(rss) = stats.rss_bytes {
-            parts.push(format!("{} RAM", format_bytes(rss)));
-        }
-    }
-    ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(
-            RichText::new(parts.join(" · "))
-                .color(theme::accent(accent_at))
-                .size(12.0),
-        );
-        if let Some(stats) = stats {
-            if stats.history.len() >= 2 {
-                ui::sparkline(
-                    ui,
-                    &stats.history,
-                    Vec2::new(76.0, 15.0),
-                    theme::accent(accent_at),
-                );
-            }
-        }
-    });
-}
-
-fn pending_card(
-    ui: &mut egui::Ui,
-    app: &ManagerApp,
-    pending: &crate::app::PendingInstall,
-    time: f64,
-    actions: &mut Vec<Action>,
-) {
-    let id = egui::Id::new(("pending-card", &pending.name));
-    ui::card(
-        ui,
-        id,
-        Vec2::new(theme::CARD_WIDTH, CARD_HEIGHT),
-        accent_for(&pending.name),
-        |ui, _hover| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(&pending.name)
-                        .size(17.0)
-                        .color(theme::TEXT)
-                        .strong(),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui::status_badge(ui, Status::Installing, time);
-                });
-            });
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui::chip(
-                    ui,
-                    &format!("{} MiB", pending.machine.memory_mib),
-                    theme::CYAN,
-                );
-                ui::chip(
-                    ui,
-                    &format!("{} vCPU", pending.machine.vcpus),
-                    theme::VIOLET,
-                );
-                ui::chip(
-                    ui,
-                    &if pending.machine.disk_mode == crate::launcher::DiskMode::CreateNew {
-                        format!("{} GiB disk", pending.machine.disk_gib)
-                    } else {
-                        "existing disk".to_string()
-                    },
-                    theme::TEXT_DIM,
-                );
-                ui::chip(ui, pending.machine.family.label(), theme::OK);
-            });
-            ui.add_space(8.0);
-            ui.label(ui::dim(format!(
-                "{} installer is running — this card becomes a machine when it finishes",
-                pending.machine.family.label()
-            )));
-
-            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 7.0;
-                    let busy = app.supervisor.is_busy(&pending.name);
-                    if ui::ghost_button(ui, "Abort", busy, theme::ERR).clicked() {
-                        actions.push(Action::Stop(pending.name.clone()));
-                    }
-                    if let Some(task) = app
-                        .supervisor
-                        .tasks()
-                        .iter()
-                        .rev()
-                        .find(|t| t.vm == pending.name)
-                    {
-                        if ui::ghost_button(ui, "View activity", true, theme::CYAN).clicked() {
-                            actions.push(Action::SelectLog(task.id));
-                        }
-                    }
-                });
-            });
-        },
-    );
-}
-
-fn empty_state(ui: &mut egui::Ui, app: &ManagerApp, time: f64, actions: &mut Vec<Action>) {
-    ui.add_space(60.0);
-    ui.vertical_centered(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(180.0, 120.0), egui::Sense::hover());
-        crate::logo::paint_mark(ui.painter(), rect, time, 0.5);
-        ui.add_space(10.0);
-        ui.label(
-            RichText::new("No machines yet")
-                .size(19.0)
-                .color(theme::TEXT),
-        );
-        ui.label(ui::dim(format!(
-            "{} holds no VM profiles",
-            app.settings.vm_dir.display()
-        )));
-        ui.add_space(14.0);
-        if ui::primary_button(ui, "Create the first machine").clicked() {
-            actions.push(Action::OpenWizard);
-        }
-    });
-}
-
 fn problems(ui: &mut egui::Ui, app: &ManagerApp) {
-    ui.add_space(18.0);
-    ui.label(ui::dim("Profiles that could not be read"));
+    ui.add_space(28.0);
+    ui.label(ui::caption("Profiles that could not be read"));
     ui.add_space(4.0);
     for problem in &app.scan.problems {
         ui.label(ui::faint(format!(
@@ -949,49 +936,25 @@ fn problems(ui: &mut egui::Ui, app: &ManagerApp) {
     }
 }
 
-/// Stable per-VM position on the cyan→violet ramp, so each card keeps its own
-/// hue instead of the grid looking uniform.
-fn accent_for(name: &str) -> f32 {
-    let sum: u32 = name.bytes().map(u32::from).sum();
-    (sum % 100) as f32 / 100.0
-}
-
-/// Middle-ellipsis for long paths.
-fn shorten(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let tail: String = text
-        .chars()
-        .rev()
-        .take(max.saturating_sub(1))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("…{tail}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn accents_are_stable_and_in_range() {
-        for name in ["debian-demo", "a", "very-long-machine-name-1234"] {
-            let value = accent_for(name);
-            assert_eq!(value, accent_for(name));
-            assert!((0.0..1.0).contains(&value), "{name} → {value}");
-        }
+    fn a_part_of_a_whole_says_the_unit_once() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(of(5 * gib, 8 * gib), "5.0 of 8.0 GiB");
+        assert_eq!(of(512 * 1024 * 1024, 8 * gib), "512 MiB of 8.0 GiB");
     }
 
     #[test]
-    fn shorten_keeps_the_tail_of_a_path() {
-        assert_eq!(shorten("/vms/a.toml", 40), "/vms/a.toml");
-        let long = "/home/spider/entangled-vms/some-really-long-name.toml";
-        let short = shorten(long, 20);
-        assert_eq!(short.chars().count(), 20);
-        assert!(short.starts_with('…'));
-        assert!(short.ends_with("name.toml"));
+    fn the_summary_reads_as_a_sentence() {
+        assert_eq!(
+            summarise([1, 1, 1, 0]),
+            "One running, one saved for later, one installing."
+        );
+        assert_eq!(summarise([0, 0, 0, 4]), "4 off.");
+        assert_eq!(summarise([0, 2, 0, 1]), "Two saved for later, one off.");
+        assert_eq!(summarise([0, 0, 0, 0]), "");
     }
 }

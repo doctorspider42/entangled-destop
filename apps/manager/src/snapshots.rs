@@ -191,7 +191,7 @@ pub fn verdict(row: &SnapshotRow, backend: Backend, profile: Option<&VmEntry>) -
             // is not, and offering one would be a dead end.
             if Backend::Wsl.available_on_host() {
                 let fix = if facts.host == HostKind::KvmLinux {
-                    "WSL (KVM)"
+                    Backend::Wsl.label()
                 } else {
                     Backend::Native.label()
                 };

@@ -118,7 +118,7 @@ pub fn install_block(pin: &Pin<'_>) -> Option<String> {
         format!(
             "This build was not made by the release pipeline, so it carries no verified \
              digest for the Linux engine (version {}). Build the Linux engine yourself and \
-             put its path in the manager's Settings ▸ Linux engine — nothing here will \
+             put its path in the manager's Settings > Linux engine — nothing here will \
              download a binary it cannot check.",
             pin.version
         )
@@ -454,7 +454,7 @@ fn not_published_hint(pin: &Pin<'_>, error: &TransportError) -> String {
             "\n  release v{} carries no {ASSET} asset. Either this build was made from a \
              branch that never published one, or {URL_ENV} points somewhere that does not \
              serve it. Build the Linux engine yourself and name it in the manager's \
-             Settings ▸ Linux engine instead.",
+             Settings > Linux engine instead.",
             pin.version
         ),
         _ => String::new(),

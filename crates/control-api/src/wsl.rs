@@ -313,7 +313,7 @@ pub fn translate(line: &str) -> Option<String> {
         return Some(format!(
             "WSL could not run '{program}' inside the distribution: {detail}. The Windows \
              installer ships no Linux build of the engine — install it from Settings, or \
-             point Settings ▸ Linux engine at your own build."
+             point Settings > Linux engine at your own build."
         ));
     }
     if lower.contains("createprocessentrycommon") {
@@ -323,7 +323,7 @@ pub fn translate(line: &str) -> Option<String> {
     }
     if lower.contains("no distribution with the supplied name") {
         return Some(
-            "WSL has no distribution with that name. Check Settings ▸ WSL distro against \
+            "WSL has no distribution with that name. Check Settings > WSL distro against \
              `wsl --list`, or install one with `wsl --install -d Ubuntu`."
                 .to_string(),
         );
@@ -413,7 +413,7 @@ pub fn probe_with(
                 distros.join(", ")
             ),
             format!(
-                "Choose one of those under Settings ▸ WSL distro, or install it with \
+                "Choose one of those under Settings > WSL distro, or install it with \
                  `wsl --install -d {distro}`."
             ),
         ));
@@ -549,7 +549,7 @@ fn classify(
             Fault::NoDistro,
             format!("WSL has no distribution called '{distro}'"),
             format!(
-                "Check Settings ▸ WSL distro against `wsl --list`, or install it with \
+                "Check Settings > WSL distro against `wsl --list`, or install it with \
                  `wsl --install -d {distro}`."
             ),
         );
@@ -559,7 +559,7 @@ fn classify(
             Fault::EngineFailed,
             format!("'{command}' in {distro} is not a Linux program for this processor"),
             "Install the published Linux engine instead of the file that is there, or point \
-             Settings ▸ Linux engine at an x86-64 Linux build."
+             Settings > Linux engine at an x86-64 Linux build."
                 .to_string(),
         );
     }
@@ -583,7 +583,7 @@ fn classify(
                 "the engine in {distro} needs newer system libraries than {distro} has ({})",
                 first_line(&text)
             ),
-            "Upgrade the distribution, or build the engine inside it and point Settings ▸ \
+            "Upgrade the distribution, or build the engine inside it and point Settings > \
              Linux engine at your build."
                 .to_string(),
         );
@@ -602,7 +602,7 @@ fn classify(
                          `wsl -e` uses"
                 ),
                 format!(
-                    "Put {found} in Settings ▸ Linux engine — a launch runs no login shell, \
+                    "Put {found} in Settings > Linux engine — a launch runs no login shell, \
                      so ~/.profile's PATH does not apply to it."
                 ),
             );
@@ -621,7 +621,7 @@ fn classify(
             // a terminal and shown by the manager under a button, and "install
             // it here" was a lie in one of those two places.
             "The Windows installer ships no Linux build: let the manager install one \
-             (Settings ▸ Linux engine), or point that setting at your own build."
+             (Settings > Linux engine), or point that setting at your own build."
                 .to_string(),
         );
     }

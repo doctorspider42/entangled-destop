@@ -47,7 +47,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                         wizard_heading(
                             ui,
                             "Choose an operating system",
-                            "Pick a guided installer. Entangled prepares the boot path and keeps its console attached here.",
+                            "Everything the installer needs is downloaded and checked for you.",
                         );
                         ui.add_space(14.0);
                         // An installer this backend cannot run is greyed out
@@ -69,7 +69,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                 "Verified network or official installer media",
                                 state.machine.family == launcher::GuestFamily::Debian,
                                 true,
-                                theme::CYAN,
+                                theme::ACCENT,
                             );
                             if debian.clicked() {
                                 state.machine.family = launcher::GuestFamily::Debian;
@@ -81,7 +81,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                 "UEFI installer from cache or a local ISO",
                                 state.machine.family == launcher::GuestFamily::Ubuntu,
                                 true,
-                                theme::VIOLET,
+                                theme::ACCENT,
                             )
                             .clicked()
                             {
@@ -131,16 +131,22 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                         ui.add_space(16.0);
                         backend_row(ui, &mut state.machine.backend, wsl_engine);
                         if state.machine.backend == Backend::Wsl {
-                            wsl_engine_note(ui, wsl_engine, wsl_install_running, actions);
+                            wsl_setup_note(
+                                ui,
+                                wsl_engine,
+                                wsl_install_running,
+                                ui::FORM_LABEL_W,
+                                actions,
+                            );
                         }
                     }
                     1 => {
                         wizard_heading(
                             ui,
-                            "Name it and size the hardware",
-                            "Friendly defaults work well; you can tune everything again after installation.",
+                            "Name it and size it",
+                            "You can change all of this later from the machine's page.",
                         );
-                        ui.add_space(14.0);
+                        ui.add_space(18.0);
                         ui::form_row(
                             ui,
                             "NAME",
@@ -154,176 +160,83 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                 );
                             },
                         );
-                        ui.add_space(10.0);
-                        ui::form_row(
-                            ui,
-                            "MEMORY",
-                            "How much of this computer's RAM the machine may use while it runs. \
-                             It is taken from the host only while the machine is on.",
-                            |ui, field_w| {
-                                ui.spacing_mut().slider_width = field_w - 72.0;
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut state.machine.memory_mib,
-                                        512..=control_api::MAX_MEMORY_MIB,
-                                    )
-                                    .step_by(256.0)
-                                    .suffix(" MiB"),
-                                );
-                            },
-                        );
-                        ui::form_row(
-                            ui,
-                            "PROCESSORS",
-                            "How many processor cores the guest sees. More than this computer \
-                             physically has only makes the guest slower.",
-                            |ui, field_w| {
-                                ui.spacing_mut().slider_width = field_w - 72.0;
-                                ui.add(
-                                    egui::Slider::new(&mut state.machine.vcpus, 1..=16)
-                                        .suffix(" vCPU"),
-                                );
-                            },
-                        );
-                        ui.add_space(12.0);
-                        ui.checkbox(&mut state.machine.automated, "Install automatically")
-                            .on_hover_text("Uses Entangled's maintained unattended profile");
-                        ui.checkbox(
-                            &mut state.machine.headless,
-                            "Run installer without a window",
-                        )
-                        .on_hover_text("The serial console remains available in Activity");
-                    }
-                    2 => {
-                        wizard_heading(
-                            ui,
-                            "Choose storage",
-                            "Create a new sparse disk or install onto a RAW image already in your machine library.",
-                        );
-                        ui.add_space(14.0);
+                        ui.add_space(18.0);
+                        ui.label(RichText::new("Power").size(13.5).color(theme::TEXT));
+                        ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            let card_width =
-                                (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
-                            if option_card(
-                                ui,
-                                card_width,
-                                "Create a new disk",
-                                "Fast sparse RAW image; grows only as data is written",
-                                state.machine.disk_mode == launcher::DiskMode::CreateNew,
-                                true,
-                                theme::CYAN,
-                            )
-                            .clicked()
-                            {
-                                state.machine.disk_mode = launcher::DiskMode::CreateNew;
-                                state.machine.disk_path.clear();
-                            }
-                            if option_card(
-                                ui,
-                                card_width,
-                                "Use an existing disk",
-                                "Keep the data already present in a library image",
-                                state.machine.disk_mode == launcher::DiskMode::UseExisting,
-                                true,
-                                theme::VIOLET,
-                            )
-                            .clicked()
-                            {
-                                state.machine.disk_mode = launcher::DiskMode::UseExisting;
-                            }
-                        });
-                        ui.add_space(16.0);
-                        match state.machine.disk_mode {
-                            launcher::DiskMode::CreateNew => {
-                                ui::form_row(
+                            let gap = ui.spacing().item_spacing.x;
+                            let card_width = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
+                            for preset in POWER_PRESETS {
+                                let selected = state.machine.vcpus == preset.vcpus
+                                    && state.machine.memory_mib == preset.memory_mib;
+                                if option_card(
                                     ui,
-                                    "FILE NAME",
-                                    "The image file this machine's disk is stored in. It is \
-                                     created inside your machine folder; leave it empty and it \
-                                     is named after the machine.",
-                                    |ui, field_w| {
-                                        ui.add(
-                                            egui::TextEdit::singleline(
-                                                &mut state.machine.disk_path,
-                                            )
-                                            .desired_width(field_w)
-                                            .hint_text(format!("{}.raw", state.machine.name)),
-                                        );
-                                    },
-                                );
-                                ui::form_note(
-                                    ui,
-                                    ui::faint(format!("in {}", settings.vm_dir.display())),
-                                );
-                                ui.add_space(10.0);
-                                ui::form_row(
-                                    ui,
-                                    "CAPACITY",
-                                    "How large the disk looks to the guest. The file only grows \
-                                     as the guest actually writes, so a generous number costs \
-                                     nothing up front.",
-                                    |ui, field_w| {
-                                        ui.spacing_mut().slider_width = field_w - 64.0;
-                                        ui.add(
-                                            egui::Slider::new(&mut state.machine.disk_gib, 8..=512)
-                                                .step_by(2.0)
-                                                .suffix(" GiB"),
-                                        );
-                                    },
-                                );
-                            }
-                            launcher::DiskMode::UseExisting => {
-                                ui::form_row(
-                                    ui,
-                                    "PICK ONE",
-                                    "Images already in your machine folder. Whichever you pick \
-                                     is installed onto as-is — never recreated or emptied.",
-                                    |ui, field_w| {
-                                        egui::ComboBox::from_id_salt("existing-disk")
-                                            .selected_text(
-                                                if state.machine.disk_path.trim().is_empty() {
-                                                    "Choose a disk…".to_string()
-                                                } else {
-                                                    state.machine.disk_path.clone()
-                                                },
-                                            )
-                                            .width(ui::combo_width(field_w))
-                                            .show_ui(ui, |ui| {
-                                                for disk in scan.disks.iter().filter(|d| {
-                                                    d.exists
-                                                        && d.path.parent()
-                                                            == Some(settings.vm_dir.as_path())
-                                                }) {
-                                                    if let Some(name) = disk.path.file_name() {
-                                                        let name =
-                                                            name.to_string_lossy().into_owned();
-                                                        ui.selectable_value(
-                                                            &mut state.machine.disk_path,
-                                                            name.clone(),
-                                                            format!(
-                                                                "{}  ·  {}",
-                                                                name,
-                                                                format_bytes(disk.apparent_bytes)
-                                                            ),
-                                                        );
-                                                    }
-                                                }
-                                            });
-                                    },
-                                );
-                                if ui::path_row(
-                                    ui,
-                                    "OR BROWSE",
-                                    "Any RAW disk image on this computer. It must end up inside \
-                                     your machine folder, so that the profile the installer \
-                                     writes stays visible here.",
-                                    &mut state.machine.disk_path,
-                                    "existing.raw",
+                                    card_width,
+                                    preset.name,
+                                    &format!(
+                                        "{} cores · {} GiB · {}",
+                                        preset.vcpus,
+                                        preset.memory_mib / 1024,
+                                        preset.hint
+                                    ),
+                                    selected,
                                     true,
-                                ) {
-                                    actions.push(Action::PickPath(PickTarget::WizardDisk));
+                                    theme::ACCENT,
+                                )
+                                .clicked()
+                                {
+                                    state.machine.vcpus = preset.vcpus;
+                                    state.machine.memory_mib = preset.memory_mib;
                                 }
                             }
+                        });
+                        if !POWER_PRESETS.iter().any(|p| {
+                            p.vcpus == state.machine.vcpus
+                                && p.memory_mib == state.machine.memory_mib
+                        }) {
+                            ui.add_space(6.0);
+                            ui.label(ui::faint(format!(
+                                "Custom: {} cores · {} — set under More options",
+                                state.machine.vcpus,
+                                format_bytes(state.machine.memory_mib * 1024 * 1024)
+                            )));
+                        }
+                        if state.machine.disk_mode == launcher::DiskMode::CreateNew {
+                            ui.add_space(18.0);
+                            ui.label(RichText::new("Disk").size(13.5).color(theme::TEXT));
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                for gib in DISK_CHOICES_GIB {
+                                    if choice_chip(
+                                        ui,
+                                        &format!("{gib} GiB"),
+                                        state.machine.disk_gib == gib,
+                                    )
+                                    .clicked()
+                                    {
+                                        state.machine.disk_gib = gib;
+                                    }
+                                }
+                            });
+                            ui.add_space(6.0);
+                            ui.label(ui::faint(
+                                "Takes only what the guest writes — a fresh install uses a \
+                                 fraction of it.",
+                            ));
+                        }
+
+                        ui.add_space(18.0);
+                        let toggle = if state.more {
+                            "Fewer options"
+                        } else {
+                            "More options — every setting by hand"
+                        };
+                        if ui::text_button(ui, toggle, theme::ACCENT).clicked() {
+                            state.more = !state.more;
+                        }
+                        if state.more {
+                            ui.add_space(8.0);
+                            more_options(ui, state, settings, scan, actions);
                         }
                     }
                     _ => {
@@ -339,6 +252,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                             .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
                             .inner_margin(egui::Margin::same(16))
                             .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
                                 summary_row(ui, "Machine", &state.machine.name);
                                 summary_row(
                                     ui,
@@ -357,8 +271,9 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                     ui,
                                     "Hardware",
                                     &format!(
-                                        "{} MiB memory · {} vCPU",
-                                        state.machine.memory_mib, state.machine.vcpus
+                                        "{} cores · {} memory",
+                                        state.machine.vcpus,
+                                        format_bytes(state.machine.memory_mib * 1024 * 1024)
                                     ),
                                 );
                                 let disk = state.machine.disk_path(&settings.vm_dir);
@@ -390,20 +305,9 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                         },
                                     );
                                 }
-                                summary_row(
-                                    ui,
-                                    "Runs on",
-                                    &match (state.machine.backend, &*wsl_engine) {
-                                        (Backend::Wsl, wslengine::Status::Ready(found)) => {
-                                            format!(
-                                                "{} · {}",
-                                                state.machine.backend.label(),
-                                                found.summary()
-                                            )
-                                        }
-                                        _ => state.machine.backend.label().to_string(),
-                                    },
-                                );
+                                if Backend::Wsl.available_on_host() {
+                                    summary_row(ui, "Runs on", state.machine.backend.label());
+                                }
                             });
                         let runner = launcher::Runner::new(
                             state.machine.backend,
@@ -427,32 +331,10 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                         // The same refusal `ManagerApp::backend_block` gives the
                         // Start button, shown before the last click rather than
                         // after it, with the install offer attached.
-                        if state.machine.backend == Backend::Wsl {
-                            if let Some(refusal) = wsl_engine.refusal() {
-                                ui.add_space(10.0);
-                                ui.label(RichText::new(refusal).color(theme::ERR).size(12.5));
-                                ui.add_space(8.0);
-                                wsl_engine_buttons(
-                                    ui,
-                                    wsl_engine,
-                                    wsl_install_running,
-                                    0.0,
-                                    actions,
-                                );
-                            }
+                        if state.machine.backend == Backend::Wsl && wsl_engine.refusal().is_some() {
+                            ui.add_space(6.0);
+                            wsl_setup_note(ui, wsl_engine, wsl_install_running, 0.0, actions);
                         }
-                        ui.add_space(10.0);
-                        ui.collapsing("Advanced: command preview", |ui| {
-                            ui.label(
-                                RichText::new(match &preview {
-                                    Ok(spec) => spec.command_line(),
-                                    Err(_) => "—".to_string(),
-                                })
-                                .monospace()
-                                .size(11.5)
-                                .color(theme::TEXT_DIM),
-                            );
-                        });
                     }
                 }
 
@@ -461,40 +343,46 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                     ui.label(RichText::new(error).color(theme::ERR).size(12.5));
                 }
 
-                ui.add_space(20.0);
+                ui.add_space(24.0);
+                theme::rule(ui.painter(), ui.max_rect().x_range(), ui.cursor().top());
+                ui.add_space(16.0);
                 ui.horizontal(|ui| {
-                    if state.step > 0
-                        && ui::ghost_button(ui, "Back", true, theme::TEXT_DIM).clicked()
-                    {
-                        state.step -= 1;
-                        state.error = None;
-                    }
-                    if state.step < 3 {
-                        if ui::primary_button(ui, "Continue").clicked() {
-                            state.step += 1;
-                            state.error = None;
-                        }
-                    } else {
-                        // The last step's button is the one the whole
-                        // pre-flight protects: a machine that cannot start must
-                        // not be creatable, and the reason must be readable
-                        // without pressing it.
-                        let blocked = (state.machine.backend == Backend::Wsl)
-                            .then(|| wsl_engine.refusal())
-                            .flatten();
-                        let button =
-                            ui::primary_button_enabled(ui, "Create & install", blocked.is_none());
-                        match &blocked {
-                            Some(reason) => {
-                                button.on_hover_text(reason);
-                            }
-                            None if button.clicked() => actions.push(Action::SubmitWizard),
-                            None => {}
-                        }
-                    }
-                    if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+                    if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
                         actions.push(Action::CloseModal);
                     }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if state.step < 2 {
+                            if ui::primary_button(ui, "Continue").clicked() {
+                                state.step += 1;
+                                state.error = None;
+                            }
+                        } else {
+                            // The last step's button is the one the whole
+                            // pre-flight protects: a machine that cannot start
+                            // must not be creatable, and the reason must be
+                            // readable without pressing it.
+                            let blocked = (state.machine.backend == Backend::Wsl)
+                                .then(|| wsl_engine.refusal())
+                                .flatten();
+                            let button = ui::primary_button_enabled(
+                                ui,
+                                "Create and install",
+                                blocked.is_none(),
+                            );
+                            match &blocked {
+                                Some(reason) => {
+                                    button.on_hover_text(reason);
+                                }
+                                None if button.clicked() => actions.push(Action::SubmitWizard),
+                                None => {}
+                            }
+                        }
+                        if state.step > 0 && ui::secondary_button(ui, "Back", true).clicked() {
+                            state.step -= 1;
+                            state.error = None;
+                        }
+                        ui.label(ui::faint(format!("Step {} of 3", state.step + 1)));
+                    });
                 });
             })
         }
@@ -556,7 +444,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                         {
                             actions.push(Action::ConfirmDelete);
                         }
-                        if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+                        if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
                             actions.push(Action::CloseModal);
                         }
                     });
@@ -615,7 +503,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 if ui::primary_button(ui, "Create disk").clicked() {
                     actions.push(Action::SubmitCreateDisk);
                 }
-                if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+                if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
                     actions.push(Action::CloseModal);
                 }
             });
@@ -670,7 +558,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                     if ui::ghost_button(ui, "Delete permanently", deletable, theme::ERR).clicked() {
                         actions.push(Action::ConfirmDeleteDisk);
                     }
-                    if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+                    if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
                         actions.push(Action::CloseModal);
                     }
                 });
@@ -733,21 +621,15 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 let ready = state.selected.is_some() && !candidates.is_empty();
-                if ui::ghost_button(ui, "Attach", ready, theme::CYAN).clicked() {
+                if ui::ghost_button(ui, "Attach", ready, theme::TEXT).clicked() {
                     actions.push(Action::SubmitAttachDisk);
                 }
-                if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+                if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
                     actions.push(Action::CloseModal);
                 }
             });
         }),
-        Modal::EditVm(state) => frame(
-            ctx,
-            "edit-vm",
-            &format!("Edit {}", state.form.name),
-            760.0,
-            |ui| edit_vm_body(ui, state, wsl_engine, actions),
-        ),
+        Modal::EditVm(state) => edit_vm_drawer(ctx, state, wsl_engine, actions),
         Modal::MoveDisk(state) => frame(
             ctx,
             "move-disk",
@@ -817,14 +699,18 @@ fn settings_body(
     actions: &mut Vec<Action>,
 ) {
     ui::form_scope(ui);
-    engine_status(ui, engine, actions);
-    ui.add_space(16.0);
+    // Entangled is one application: the part that runs machines is found by
+    // itself and never shown — only when it is missing does the user hear
+    // about it, as a problem with a fix.
+    if engine.is_err() {
+        engine_problem(ui, actions);
+        ui.add_space(16.0);
+    }
 
     if ui::path_row(
         ui,
         "MACHINES IN",
-        "The folder your machines live in: their settings files and their disk images. \
-         Everything the Machines and Storage views show comes from here.",
+        "The folder your machines live in: their settings and their disks.",
         &mut form.vm_dir,
         "~/entangled-vms",
         true,
@@ -835,51 +721,47 @@ fn settings_body(
 
     backend_row(ui, &mut form.default_backend, wsl_engine);
     if Backend::Wsl.available_on_host() && form.default_backend == Backend::Wsl {
-        wsl_rows(ui, form);
-        wsl_engine_note(ui, wsl_engine, wsl_install_running, actions);
+        wsl_setup_note(
+            ui,
+            wsl_engine,
+            wsl_install_running,
+            ui::FORM_LABEL_W,
+            actions,
+        );
     }
     ui.add_space(14.0);
 
-    ui.checkbox(&mut form.headless_install, "Install without a window")
+    ui.checkbox(&mut form.headless_install, "Install in the background")
         .on_hover_text(
-            "The installer still runs and its console is still visible under Activity — it \
-             just does not open a window of its own.",
+            "The installer runs without a window of its own; follow it on the machine's \
+             page.",
         );
     ui.checkbox(
         &mut form.check_updates_on_startup,
         "Check for updates on startup",
     )
-    .on_hover_text(
-        "Asks the release server once when the manager opens, on a background thread. \
-         Being offline is silently fine.",
-    );
+    .on_hover_text("Asks once when Entangled opens. Being offline is fine.");
     ui.checkbox(&mut form.animations_enabled, "Interface motion")
-        .on_hover_text(
-            "Ambient scan, logo movement, status pulses and hover easing. Turning it off \
-             also drops the window to an event-driven redraw.",
-        );
+        .on_hover_text("Hover fades and the running pulse. Off saves a little power.");
 
     ui.add_space(14.0);
-    let advanced = egui::CollapsingHeader::new(
-        RichText::new("Advanced and diagnostics")
-            .size(12.5)
-            .color(theme::TEXT_DIM),
-    )
-    .id_salt("settings-advanced")
-    .default_open(form.advanced_open);
+    let advanced =
+        egui::CollapsingHeader::new(RichText::new("Advanced").size(12.5).color(theme::TEXT_DIM))
+            .id_salt("settings-advanced")
+            .default_open(form.advanced_open);
     advanced.show(ui, |ui| {
         ui.label(ui::faint(
-            "Entangled works these out for itself. Change them only if you are running a \
-             build from a source checkout.",
+            "Entangled works all of these out for itself. Change them only for a build of \
+             your own.",
         ));
         ui.add_space(10.0);
         if ui::path_row(
             ui,
-            "ENGINE",
-            "The program that actually runs a machine. Leave empty and Entangled uses the \
-             one installed beside this manager.",
+            "CUSTOM BUILD",
+            "Run machines with a build of Entangled from somewhere else — a source checkout, \
+             for instance. Leave empty to use the one that came with this installation.",
             &mut form.entangled_binary,
-            "found automatically",
+            "the installed one",
             true,
         ) {
             actions.push(Action::PickPath(PickTarget::EngineBinary));
@@ -888,103 +770,81 @@ fn settings_body(
         if ui::path_row(
             ui,
             "WORKING DIR",
-            "Machines started from here run in this folder, so any relative path inside a \
-             machine's settings — its firmware, its kernel — is resolved against it. Leave \
-             empty to use the manager's own folder.",
+            "The folder machines start in. Only matters for a machine whose settings name \
+             files by relative path.",
             &mut form.work_dir,
-            "the manager's own folder",
+            "Entangled's own folder",
             true,
         ) {
             actions.push(Action::PickPath(PickTarget::WorkDir));
         }
-        if Backend::Wsl.available_on_host() && form.default_backend != Backend::Wsl {
+        if Backend::Wsl.available_on_host() {
             ui.add_space(8.0);
             wsl_rows(ui, form);
-            wsl_engine_note(ui, wsl_engine, wsl_install_running, actions);
         }
     });
 
-    ui.add_space(16.0);
+    ui.add_space(20.0);
     ui.horizontal(|ui| {
         if ui::primary_button(ui, "Save").clicked() {
             actions.push(Action::SaveSettings);
         }
-        if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+        if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
             actions.push(Action::CloseModal);
         }
     });
 }
 
-/// The engine, as a fact rather than a question.
-fn engine_status(
-    ui: &mut egui::Ui,
-    engine: &Result<crate::launcher::Engine, String>,
-    actions: &mut Vec<Action>,
-) {
-    let tint = match engine {
-        Ok(_) => theme::OK,
-        Err(_) => theme::ERR,
-    };
+/// The one thing Settings says about the part of Entangled that runs
+/// machines: that it is missing, and what to do about it.
+fn engine_problem(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     egui::Frame::new()
-        .fill(theme::mix(theme::CARD, tint, 0.06))
-        .stroke(egui::Stroke::new(1.0_f32, tint.gamma_multiply(0.45)))
-        .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
-        .inner_margin(egui::Margin::symmetric(13, 10))
+        .fill(theme::mix(theme::MODAL, theme::ERR, 0.06))
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            theme::mix(theme::STROKE, theme::ERR, 0.35),
+        ))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            match engine {
-                Ok(engine) => {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 7.0;
-                        ui.label(
-                            RichText::new(format!("Engine: {}", engine.summary()))
-                                .size(13.0)
-                                .color(theme::TEXT),
-                        );
-                        ui::chip(ui, "ready", theme::OK);
-                    })
-                    .response
-                    .on_hover_text(engine.path.display().to_string());
-                }
-                Err(message) => {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 7.0;
-                        ui.label(RichText::new(message).size(13.0).color(theme::TEXT));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui::ghost_button(ui, "Locate it…", true, theme::ERR).clicked() {
-                                actions.push(Action::PickPath(PickTarget::EngineBinary));
-                            }
-                        });
-                    });
-                }
-            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(
+                        "Part of Entangled is missing, so machines cannot start. Reinstalling \
+                         Entangled Desktop fixes it.",
+                    )
+                    .size(13.0)
+                    .color(theme::TEXT),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui::text_button(ui, "Locate it…", theme::ACCENT)
+                        .on_hover_text("Point Entangled at a copy you already have")
+                        .clicked()
+                    {
+                        actions.push(Action::PickPath(PickTarget::EngineBinary));
+                    }
+                });
+            });
         });
 }
 
 /// The where-does-this-run row, shared by Settings (the default) and the wizard
-/// and editor (one machine). On a host with only one backend it degrades to a
-/// read-only line rather than a combo box with one entry.
+/// and editor (one machine). On a host with only one choice there is nothing
+/// to ask, so the row is not shown at all.
 fn backend_row(ui: &mut egui::Ui, value: &mut Backend, wsl_engine: &wslengine::Status) {
     let choices: Vec<Backend> = Backend::ALL
         .into_iter()
         .filter(|backend| backend.available_on_host())
         .collect();
     if choices.len() < 2 {
-        ui::form_row(ui, "RUNS ON", Backend::Native.tooltip(), |ui, _| {
-            ui.label(
-                RichText::new(Backend::Native.label())
-                    .size(13.0)
-                    .color(theme::TEXT),
-            );
-        });
         return;
     }
     ui::form_row(
         ui,
         "RUNS ON",
-        "Which hypervisor starts the machine. Windows runs it natively; WSL runs the Linux \
-         build inside your WSL distribution, which is the only way to get 3D acceleration \
-         and TAP networking today.",
+        "Where machines run. Windows is the usual choice. WSL (the Windows Subsystem for \
+         Linux) adds OpenGL 3D and bridged networking, after a one-time setup.",
         |ui, field_w| {
             egui::ComboBox::from_id_salt(("backend-choice", ui.id()))
                 .selected_text(entry_label(*value, wsl_engine))
@@ -992,139 +852,105 @@ fn backend_row(ui: &mut egui::Ui, value: &mut Backend, wsl_engine: &wslengine::S
                 .show_ui(ui, |ui| {
                     for backend in &choices {
                         ui.selectable_value(value, *backend, entry_label(*backend, wsl_engine))
-                            .on_hover_text(entry_tooltip(*backend, wsl_engine));
+                            .on_hover_text(backend.tooltip());
                     }
                 });
         },
     );
 }
 
-/// The name of one backend in the picker, with its problem attached.
-///
-/// A backend whose engine is missing stays **selectable** on purpose: the fix
-/// for "WSL has no engine" lives one row below, and a greyed-out entry is a
-/// door locked from the inside. What it must not do is look identical to the
-/// one that works, so the entry carries its own verdict and the tooltip carries
-/// the reason.
+/// The name of one choice in the picker, with whether it is ready yet. A
+/// choice that needs setting up stays **selectable**: the setup lives one row
+/// below, and a greyed-out entry would be a door locked from the inside.
 fn entry_label(backend: Backend, wsl_engine: &wslengine::Status) -> String {
     match (backend, wsl_engine) {
         (Backend::Wsl, wslengine::Status::Failed(_)) => {
-            format!("{} — no Linux engine yet", backend.label())
+            format!("{} — needs a one-time setup", backend.label())
         }
         (Backend::Wsl, wslengine::Status::Checking) => format!("{} — checking…", backend.label()),
         _ => backend.label().to_string(),
     }
 }
 
-fn entry_tooltip(backend: Backend, wsl_engine: &wslengine::Status) -> String {
-    match (backend, wsl_engine) {
-        (Backend::Wsl, wslengine::Status::Failed(fault)) => {
-            format!("{}\n\n{}\n\n{}", backend.tooltip(), fault.what, fault.fix)
-        }
-        (Backend::Wsl, wslengine::Status::Ready(found)) => {
-            format!("{}\n\nEngine: {}", backend.tooltip(), found.summary())
-        }
-        _ => backend.tooltip().to_string(),
-    }
-}
-
-/// The WSL engine's state under the row that selects it: one line of status
-/// and, when there is one, the button that fixes it.
-///
-/// This is the deliverable in one function. Before it, "your WSL has no
-/// `entangled`" was discovered by `wsl.exe` forty minutes into a wizard and
-/// reported as `execvpe entangled failed 2`.
-fn wsl_engine_note(
-    ui: &mut egui::Ui,
-    status: &wslengine::Status,
-    installing: bool,
-    actions: &mut Vec<Action>,
-) {
-    match status {
-        wslengine::Status::Unknown => {}
-        wslengine::Status::Checking => {
-            ui::form_note(
-                ui,
-                RichText::new("checking the WSL engine…")
-                    .color(theme::TEXT_DIM)
-                    .size(11.0),
-            );
-        }
-        wslengine::Status::Ready(found) => {
-            ui::form_note(
-                ui,
-                RichText::new(format!("engine ready — {}", found.summary()))
-                    .color(theme::OK)
-                    .size(11.0),
-            );
-        }
-        wslengine::Status::Failed(fault) => {
-            ui::form_note(ui, RichText::new(&fault.what).color(theme::ERR).size(11.5));
-            ui::form_note(
-                ui,
-                RichText::new(&fault.fix).color(theme::TEXT_DIM).size(11.0),
-            );
-            ui.add_space(6.0);
-            wsl_engine_buttons(ui, status, installing, ui::FORM_LABEL_W, actions);
-        }
-    }
-}
-
-/// The two buttons that belong to a refused WSL engine: install it, or ask
-/// again. Split out because the review step shows them under a paragraph rather
-/// than under a form row, and repeating the sentence there read as two faults.
-fn wsl_engine_buttons(
+/// Whether WSL can run machines yet, in one plain sentence, and the button
+/// that makes it able to. Before this, "your WSL has no `entangled`" was
+/// discovered by `wsl.exe` forty minutes into a wizard and reported as
+/// `execvpe entangled failed 2`; the fix is offered before anything starts.
+fn wsl_setup_note(
     ui: &mut egui::Ui,
     status: &wslengine::Status,
     installing: bool,
     indent: f32,
     actions: &mut Vec<Action>,
 ) {
+    let (text, color) = match status {
+        wslengine::Status::Unknown => return,
+        wslengine::Status::Checking => ("Checking WSL…".to_string(), theme::TEXT_DIM),
+        wslengine::Status::Ready(_) => ("WSL is set up and ready.".to_string(), theme::OK),
+        wslengine::Status::Failed(_) if installing => (
+            "Setting up WSL — downloading and checking the files…".to_string(),
+            theme::TEXT_DIM,
+        ),
+        wslengine::Status::Failed(_) if status.installable() => (
+            "WSL needs a one-time setup: Entangled copies the files it needs into your WSL \
+             system."
+                .to_string(),
+            theme::TEXT_DIM,
+        ),
+        // Something only the user can change — no WSL at all, no such system.
+        // Its own sentence says what.
+        wslengine::Status::Failed(fault) => (fault.what.clone(), theme::WARN),
+    };
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        ui.add(egui::Label::new(RichText::new(text).size(12.5).color(color)).wrap());
+    });
     if status.refusal().is_none() {
         return;
     }
+    ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(indent);
         if status.installable() {
             let block = wslengine::install_block();
-            let label = if installing {
-                "Installing the Linux engine…"
-            } else {
-                "Install the Linux engine"
-            };
             let enabled = !installing && block.is_none();
-            let button = ui::ghost_button(ui, label, enabled, theme::CYAN).on_hover_text(
-                block.unwrap_or_else(|| {
-                    format!(
-                        "Downloads the Linux build published with this exact version, \
-                                 checks it against the digest built into this program, copies \
-                                 it into the distribution as ~/{}, and re-runs this check.",
-                        control_api::wsl::HOME_ENGINE
-                    )
-                }),
-            );
+            let label = if installing {
+                "Setting up…"
+            } else {
+                "Set up WSL"
+            };
+            let button = ui::secondary_button(ui, label, enabled);
+            let button = match &block {
+                Some(reason) => button.on_hover_text(reason),
+                None => button.on_hover_text(
+                    "Downloads the Linux part of this exact version, checks it against the \
+                     fingerprint built into Entangled, and copies it into WSL.",
+                ),
+            };
             if enabled && button.clicked() {
                 actions.push(Action::InstallWslEngine);
             }
+        } else if let wslengine::Status::Failed(fault) = status {
+            ui.label(
+                RichText::new(&fault.fix)
+                    .size(12.0)
+                    .color(theme::TEXT_FAINT),
+            );
         }
-        if ui::ghost_button(ui, "Check again", !installing, theme::TEXT_DIM)
-            .on_hover_text("Ask WSL the same three questions again")
-            .clicked()
-            && !installing
-        {
+        if ui::text_button(ui, "Check again", theme::TEXT_DIM).clicked() && !installing {
             actions.push(Action::CheckWslEngine);
         }
     });
 }
 
-/// The two things the WSL backend cannot work out for itself.
+/// The two things WSL cannot work out for itself, under Advanced.
 fn wsl_rows(ui: &mut egui::Ui, form: &mut crate::app::SettingsForm) {
-    ui::form_scope(ui);
-    ui.add_space(8.0);
     ui::form_row(
         ui,
-        "WSL DISTRO",
-        "Which installed WSL system to run the machine in — the name shown by `wsl --list`.",
+        "WSL SYSTEM",
+        "Which of your WSL systems runs machines — a name from `wsl --list`. Ubuntu \
+         unless you have set up another.",
         |ui, field_w| {
             ui.add(
                 egui::TextEdit::singleline(&mut form.wsl_distro)
@@ -1136,16 +962,14 @@ fn wsl_rows(ui: &mut egui::Ui, form: &mut crate::app::SettingsForm) {
     ui.add_space(6.0);
     ui::form_row(
         ui,
-        "LINUX ENGINE",
-        "Where the Linux build of Entangled lives inside WSL — a Linux path such as \
-         /usr/bin/entangled. Leave it empty to use whatever `entangled` resolves to on the \
-         WSL PATH. A Windows installation does not include a Linux build, so this is \
-         normally a path into your own checkout.",
+        "WSL BUILD",
+        "A Linux build of Entangled of your own inside WSL, as a Linux path. Leave empty: \
+         the setup above installs the matching one for you.",
         |ui, field_w| {
             ui.add(
                 egui::TextEdit::singleline(&mut form.wsl_entangled)
                     .desired_width(field_w)
-                    .hint_text("/usr/bin/entangled"),
+                    .hint_text("set up automatically"),
             );
         },
     );
@@ -1154,194 +978,148 @@ fn wsl_rows(ui: &mut egui::Ui, form: &mut crate::app::SettingsForm) {
 /// The Edit-VM form body. The left-hand cards are intentionally navigation,
 /// not separate save boundaries: changing one area keeps all unsaved edits and
 /// Save validates and writes the complete profile.
-fn edit_vm_body(
-    ui: &mut egui::Ui,
+/// The machine editor as a drawer from the right edge: the machine's page
+/// stays visible behind it, dimmed, so the change being made sits beside the
+/// thing it changes. One section at a time, chosen by the tabs along the top
+/// (or by the setup tile that opened it); Save writes them all.
+fn edit_vm_drawer(
+    ctx: &egui::Context,
     state: &mut crate::app::EditVmState,
     wsl_engine: &wslengine::Status,
     actions: &mut Vec<Action>,
-) {
+) -> bool {
     use crate::app::EditVmSection;
 
-    let mut selected = state.section;
-    ui.horizontal_top(|ui| {
-        ui.vertical(|ui| {
-            ui.set_width(184.0);
-            ui.label(ui::faint("MACHINE SETTINGS"));
-            ui.add_space(7.0);
-            for (section, title, detail, tint) in [
-                (
-                    EditVmSection::Hardware,
-                    "Hardware",
-                    "Memory, processors, transport",
-                    theme::CYAN,
-                ),
-                (
-                    EditVmSection::BootMedia,
-                    "Boot & media",
-                    "UEFI, Linux kernel, ISO",
-                    theme::VIOLET,
-                ),
-                (
-                    EditVmSection::DisplayGpu,
-                    "Display & GPU",
-                    // One line at 184 px, which is what the card is: a second
-                    // line is clipped.
-                    "Screen, refresh, 3D, GPU limits",
-                    theme::accent(0.5),
-                ),
-                (
-                    EditVmSection::NetworkDevices,
-                    "Network & devices",
-                    "Network, sound, gamepad",
-                    theme::OK,
-                ),
-                (
-                    EditVmSection::Storage,
-                    "Storage",
-                    "Virtual disks and boot order",
-                    theme::WARN,
-                ),
-            ] {
-                if edit_section_card(ui, title, detail, selected == section, tint).clicked() {
-                    selected = section;
-                }
-                ui.add_space(8.0);
-            }
-        });
-
-        ui.add_space(10.0);
-        let (rule, _) = ui.allocate_exact_size(Vec2::new(1.0, 388.0), egui::Sense::hover());
-        ui.painter().vline(
-            rule.center().x,
-            rule.y_range(),
-            egui::Stroke::new(1.0_f32, theme::STROKE),
-        );
-        ui.add_space(10.0);
-
-        egui::Frame::new()
-            .fill(theme::mix(theme::CARD, theme::BG_PANEL, 0.38))
-            .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
-            .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
-            .inner_margin(egui::Margin::same(18))
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    // Frame::show inherits the surrounding horizontal layout;
-                    // this explicit column keeps fields vertical and bounded.
-                    ui.set_width(500.0);
-                    ui.set_min_height(352.0);
-                    match selected {
-                        EditVmSection::Hardware => edit_hardware(ui, &mut state.form, wsl_engine),
-                        EditVmSection::BootMedia => {
-                            edit_boot_media(ui, &mut state.form, actions);
-                        }
-                        EditVmSection::DisplayGpu => edit_display_gpu(ui, &mut state.form),
-                        EditVmSection::NetworkDevices => {
-                            edit_network_devices(ui, &mut state.form);
-                        }
-                        EditVmSection::Storage => edit_storage(ui, &mut state.form, actions),
-                    }
-                });
-            });
-    });
-    state.section = selected;
-
-    let preview = state.form.to_config();
-    if let Err(message) = &preview {
-        ui.add_space(8.0);
-        ui.label(RichText::new(message).color(theme::ERR).size(12.5));
-    } else if let Some(error) = &state.error {
-        ui.add_space(8.0);
-        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
-    }
-
-    ui.add_space(14.0);
-    ui.horizontal(|ui| {
-        let savable = preview.is_ok() && state.form.dirty();
-        if ui::ghost_button(ui, "Save changes", savable, theme::CYAN)
-            .on_hover_text("Validates and saves every section")
-            .clicked()
-        {
-            actions.push(Action::SubmitEditVm);
-        }
-        if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
-            actions.push(Action::CloseModal);
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(ui::faint("All sections are saved together"));
-        });
-    });
-}
-
-fn edit_section_card(
-    ui: &mut egui::Ui,
-    title: &str,
-    detail: &str,
-    selected: bool,
-    tint: egui::Color32,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(184.0, 58.0), egui::Sense::click());
-    let hover = theme::animate_bool(
-        ui.ctx(),
-        response.id.with("edit-section-hover"),
-        response.hovered(),
-        0.14,
-    );
-    let fill_strength = if selected { 0.14 } else { 0.025 + hover * 0.06 };
-    ui.painter().rect_filled(
-        rect,
-        egui::CornerRadius::same(theme::CONTROL_RADIUS),
-        theme::mix(theme::CARD, tint, fill_strength),
-    );
-    ui.painter().rect_stroke(
-        rect,
-        egui::CornerRadius::same(theme::CONTROL_RADIUS),
-        egui::Stroke::new(
-            if selected { 1.5_f32 } else { 1.0_f32 },
-            if selected {
-                tint.gamma_multiply(0.82)
-            } else {
-                theme::mix(theme::STROKE, tint, hover * 0.38)
-            },
-        ),
-        egui::StrokeKind::Inside,
-    );
-    if selected {
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(
-                rect.left_top() + Vec2::new(0.0, theme::CONTROL_RADIUS as f32),
-                Vec2::new(3.0, rect.height() - 2.0 * theme::CONTROL_RADIUS as f32),
-            ),
-            egui::CornerRadius::same(2),
-            tint,
-        );
-    }
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(rect.shrink2(Vec2::new(12.0, 9.0)))
-            .layout(Layout::top_down(Align::Min)),
-    );
-    child.add(
-        egui::Label::new(
-            RichText::new(title)
-                .size(13.5)
-                .color(if selected {
-                    theme::TEXT
-                } else {
-                    theme::TEXT_DIM
-                })
-                .strong(),
+    let screen = ctx.screen_rect();
+    let width = 620.0_f32.min(screen.width() - 40.0);
+    let id = egui::Id::new("edit-vm");
+    let area = egui::Modal::default_area(id).anchor(egui::Align2::RIGHT_TOP, Vec2::ZERO);
+    let response = egui::Modal::new(id)
+        .area(area)
+        .backdrop_color(egui::Color32::from_black_alpha(150))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::MODAL)
+                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE_STRONG))
+                .shadow(egui::Shadow {
+                    offset: [-24, 0],
+                    blur: 60,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(110),
+                }),
         )
-        .selectable(false),
-    );
-    child.add_space(2.0);
-    child.add(
-        egui::Label::new(RichText::new(detail).size(10.5).color(theme::TEXT_FAINT))
-            .selectable(false),
-    );
-    if ui.rect_contains_pointer(rect) {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            ui.set_height(screen.height());
+            let sections = [
+                (EditVmSection::Hardware, "Processor & memory"),
+                (EditVmSection::DisplayGpu, "Display"),
+                (EditVmSection::NetworkDevices, "Network & devices"),
+                (EditVmSection::Storage, "Storage"),
+                (EditVmSection::BootMedia, "Startup"),
+            ];
+
+            // Header: whose settings, which part, and a way out.
+            egui::Frame::new()
+                .inner_margin(egui::Margin {
+                    left: 28,
+                    right: 20,
+                    top: 22,
+                    bottom: 0,
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(ui::caption(&state.form.name));
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("Machine settings")
+                                    .size(20.0)
+                                    .color(theme::TEXT)
+                                    .strong(),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                            if ui::icon_button(ui, ui::Icon::Close, "Close without saving")
+                                .clicked()
+                            {
+                                actions.push(Action::CloseModal);
+                            }
+                        });
+                    });
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 20.0;
+                        for (section, label) in sections {
+                            if ui::page_tab(ui, label, state.section == section).clicked() {
+                                state.section = section;
+                            }
+                        }
+                    });
+                });
+            theme::rule(ui.painter(), ui.max_rect().x_range(), ui.cursor().top());
+
+            let preview = state.form.to_config();
+            let savable = preview.is_ok() && state.form.dirty();
+            egui::TopBottomPanel::bottom("edit-vm-footer")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::MODAL)
+                        .inner_margin(egui::Margin::symmetric(28, 16)),
+                )
+                .show_inside(ui, |ui| {
+                    if let Err(message) = &preview {
+                        ui.label(RichText::new(message).color(theme::ERR).size(12.5));
+                        ui.add_space(8.0);
+                    } else if let Some(error) = &state.error {
+                        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+                        ui.add_space(8.0);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(ui::faint(format!(
+                            "Applies when {} next starts",
+                            state.form.name
+                        )))
+                        .on_hover_text("All sections are saved together");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let save = ui::primary_button_enabled(ui, "Save", savable)
+                                .on_hover_text("Validates and saves every section");
+                            if save.clicked() && savable {
+                                actions.push(Action::SubmitEditVm);
+                            }
+                            if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
+                                actions.push(Action::CloseModal);
+                            }
+                        });
+                    });
+                });
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(28, 22)))
+                .show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            match state.section {
+                                EditVmSection::Hardware => {
+                                    edit_hardware(ui, &mut state.form, wsl_engine)
+                                }
+                                EditVmSection::BootMedia => {
+                                    edit_boot_media(ui, &mut state.form, actions);
+                                }
+                                EditVmSection::DisplayGpu => edit_display_gpu(ui, &mut state.form),
+                                EditVmSection::NetworkDevices => {
+                                    edit_network_devices(ui, &mut state.form);
+                                }
+                                EditVmSection::Storage => {
+                                    edit_storage(ui, &mut state.form, actions)
+                                }
+                            }
+                        });
+                });
+        });
+    response.should_close()
 }
 
 /// Every editor section opens with this, which is also where the section's
@@ -1363,9 +1141,36 @@ fn edit_hardware(
 
     edit_panel_heading(
         ui,
-        "Hardware",
-        "Choose the resources this machine may use on the host.",
+        "Processor & memory",
+        "How much of this computer the machine may use while it runs.",
     );
+    ui.horizontal(|ui| {
+        let gap = ui.spacing().item_spacing.x;
+        let card_width = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
+        for preset in POWER_PRESETS {
+            let selected = form.vcpus == preset.vcpus && form.memory_mib == preset.memory_mib;
+            if option_card(
+                ui,
+                card_width,
+                preset.name,
+                &format!(
+                    "{} cores · {} GiB · {}",
+                    preset.vcpus,
+                    preset.memory_mib / 1024,
+                    preset.hint
+                ),
+                selected,
+                true,
+                theme::ACCENT,
+            )
+            .clicked()
+            {
+                form.vcpus = preset.vcpus;
+                form.memory_mib = preset.memory_mib;
+            }
+        }
+    });
+    ui.add_space(18.0);
     ui::form_row(
         ui,
         "MEMORY",
@@ -1631,7 +1436,7 @@ fn fix_button(ui: &mut egui::Ui, label: &str) -> bool {
     let mut clicked = false;
     ui.horizontal(|ui| {
         ui.add_space(ui::FORM_LABEL_W + ui.spacing().item_spacing.x);
-        clicked = ui::ghost_button(ui, label, true, theme::CYAN)
+        clicked = ui::ghost_button(ui, label, true, theme::TEXT)
             .on_hover_text("Fills the field in with the value Entangled would use")
             .clicked();
     });
@@ -1707,7 +1512,7 @@ fn edit_display_gpu(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
                 ui,
                 &format!("Match monitor ({monitor} Hz)"),
                 form.refresh_hz != monitor,
-                theme::CYAN,
+                theme::ACCENT,
             )
             .on_hover_text(
                 "This computer's primary monitor, snapped to a standard rate and held to                  what the GPU desktop keeps up with.",
@@ -1927,7 +1732,7 @@ fn edit_network_devices(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
         };
         ui::form_row(ui, label, tip, |ui, _| {
             let full = form.forwards.len() >= control_api::MAX_PORT_FORWARDS;
-            if ui::ghost_button(ui, "+ Add a forward", !full, theme::CYAN).clicked() {
+            if ui::ghost_button(ui, "+ Add a forward", !full, theme::TEXT).clicked() {
                 form.forwards.push(String::new());
             }
         });
@@ -2110,7 +1915,7 @@ fn edit_storage(ui: &mut egui::Ui, form: &mut crate::editor::EditForm, actions: 
                             ui::chip(
                                 ui,
                                 &format!("vd{}", (b'a' + index as u8) as char),
-                                theme::VIOLET,
+                                theme::ACCENT,
                             );
                             let path = disk.path.display().to_string();
                             ui.label(RichText::new(&path).color(theme::TEXT).size(12.0))
@@ -2144,7 +1949,7 @@ fn edit_storage(ui: &mut egui::Ui, form: &mut crate::editor::EditForm, actions: 
     let path = form.add_disk.trim().to_string();
     ui.horizontal(|ui| {
         ui.add_space(ui::FORM_LABEL_W + ui.spacing().item_spacing.x);
-        if ui::ghost_button(ui, "Attach it", !path.is_empty(), theme::CYAN).clicked() {
+        if ui::ghost_button(ui, "Attach it", !path.is_empty(), theme::TEXT).clicked() {
             form.disks.push(control_api::DiskSection {
                 path: std::path::PathBuf::from(path),
                 writable: true,
@@ -2230,7 +2035,7 @@ fn edit_storage(ui: &mut egui::Ui, form: &mut crate::editor::EditForm, actions: 
     let path = form.add_share.trim().to_string();
     ui.horizontal(|ui| {
         ui.add_space(ui::FORM_LABEL_W + ui.spacing().item_spacing.x);
-        if ui::ghost_button(ui, "Share it", !path.is_empty() && !full, theme::CYAN).clicked() {
+        if ui::ghost_button(ui, "Share it", !path.is_empty() && !full, theme::TEXT).clicked() {
             let path = std::path::PathBuf::from(path);
             // A tag of its own: the folder's name, numbered if taken.
             let base = control_api::share_tag_for(&path);
@@ -2380,12 +2185,7 @@ fn move_disk_body(
                 rect.min,
                 Vec2::new(rect.width() * fraction, rect.height()),
             );
-            theme::gradient_rect(
-                painter,
-                fill,
-                theme::CYAN.gamma_multiply(0.9),
-                theme::VIOLET.gamma_multiply(0.9),
-            );
+            painter.rect_filled(fill, egui::CornerRadius::same(2), theme::ACCENT);
         }
         ui.label(ui::faint(format!(
             "copied {} / {}",
@@ -2403,7 +2203,7 @@ fn move_disk_body(
     ui.horizontal(|ui| {
         let ready = !state.running && !dest.is_empty();
         let label = if state.running { "Moving…" } else { "Move" };
-        if ui::ghost_button(ui, label, ready, theme::VIOLET).clicked() {
+        if ui::ghost_button(ui, label, ready, theme::TEXT).clicked() {
             actions.push(Action::SubmitMoveDisk);
         }
         if ui::ghost_button(ui, "Cancel", !state.running, theme::TEXT_DIM)
@@ -2453,10 +2253,10 @@ fn rename_vm_body(
     ui.add_space(16.0);
     ui.horizontal(|ui| {
         let ready = !state.name.trim().is_empty();
-        if ui::ghost_button(ui, "Rename", ready, theme::VIOLET).clicked() {
+        if ui::ghost_button(ui, "Rename", ready, theme::TEXT).clicked() {
             actions.push(Action::SubmitRenameVm);
         }
-        if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+        if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
             actions.push(Action::CloseModal);
         }
     });
@@ -2505,12 +2305,7 @@ fn clone_vm_body(
                 rect.min,
                 Vec2::new(rect.width() * fraction, rect.height()),
             );
-            theme::gradient_rect(
-                painter,
-                fill,
-                theme::CYAN.gamma_multiply(0.9),
-                theme::VIOLET.gamma_multiply(0.9),
-            );
+            painter.rect_filled(fill, egui::CornerRadius::same(2), theme::ACCENT);
         }
         ui.label(ui::faint(format!(
             "copied {} / {}",
@@ -2526,7 +2321,7 @@ fn clone_vm_body(
     ui.horizontal(|ui| {
         let ready = !state.running && !state.name.trim().is_empty();
         let label = if state.running { "Cloning…" } else { "Clone" };
-        if ui::ghost_button(ui, label, ready, theme::VIOLET).clicked() {
+        if ui::ghost_button(ui, label, ready, theme::TEXT).clicked() {
             actions.push(Action::SubmitCloneVm);
         }
         if ui::ghost_button(ui, "Cancel", !state.running, theme::TEXT_DIM)
@@ -2624,10 +2419,10 @@ fn resize_disk_body(
     ui.horizontal(|ui| {
         let ready = disk_image::parse_size(state.size.trim())
             .is_ok_and(|bytes| bytes >= state.row.apparent_bytes);
-        if ui::ghost_button(ui, "Grow the disk", ready, theme::CYAN).clicked() {
+        if ui::ghost_button(ui, "Grow the disk", ready, theme::TEXT).clicked() {
             actions.push(Action::SubmitResizeDisk);
         }
-        if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+        if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
             actions.push(Action::CloseModal);
         }
     });
@@ -2716,56 +2511,313 @@ fn discard_snapshot_body(
         if ui::ghost_button(ui, "Discard it and start", true, theme::WARN).clicked() {
             actions.push(Action::ConfirmDiscardSnapshot);
         }
-        if ui::ghost_button(ui, "Cancel", true, theme::TEXT_DIM).clicked() {
+        if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
             actions.push(Action::CloseModal);
         }
     });
 }
 
+/// The wizard's "More options": every setting the presets choose for you,
+/// by hand — exact cores and memory, how the installer runs, and where the
+/// disk comes from.
+fn more_options(
+    ui: &mut egui::Ui,
+    state: &mut crate::app::WizardState,
+    settings: &crate::settings::Settings,
+    scan: &crate::discovery::Scan,
+    actions: &mut Vec<Action>,
+) {
+    ui.label(ui::caption("Processor & memory"));
+    ui.add_space(6.0);
+    ui.add_space(10.0);
+    ui::form_row(
+        ui,
+        "MEMORY",
+        "How much of this computer's RAM the machine may use while it runs. \
+         It is taken from the host only while the machine is on.",
+        |ui, field_w| {
+            ui.spacing_mut().slider_width = field_w - 72.0;
+            ui.add(
+                egui::Slider::new(
+                    &mut state.machine.memory_mib,
+                    512..=control_api::MAX_MEMORY_MIB,
+                )
+                .step_by(256.0)
+                .suffix(" MiB"),
+            );
+        },
+    );
+    ui::form_row(
+        ui,
+        "PROCESSORS",
+        "How many processor cores the guest sees. More than this computer \
+         physically has only makes the guest slower.",
+        |ui, field_w| {
+            ui.spacing_mut().slider_width = field_w - 72.0;
+            ui.add(egui::Slider::new(&mut state.machine.vcpus, 1..=16).suffix(" vCPU"));
+        },
+    );
+    ui.add_space(12.0);
+    ui.checkbox(&mut state.machine.automated, "Install automatically")
+        .on_hover_text("Uses Entangled's maintained unattended profile");
+    ui.checkbox(
+        &mut state.machine.headless,
+        "Run installer without a window",
+    )
+    .on_hover_text("The serial console remains available in Activity");
+    ui.add_space(18.0);
+    ui.label(ui::caption("Storage"));
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        let card_width = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
+        if option_card(
+            ui,
+            card_width,
+            "Create a new disk",
+            "Fast sparse RAW image; grows only as data is written",
+            state.machine.disk_mode == launcher::DiskMode::CreateNew,
+            true,
+            theme::ACCENT,
+        )
+        .clicked()
+        {
+            state.machine.disk_mode = launcher::DiskMode::CreateNew;
+            state.machine.disk_path.clear();
+        }
+        if option_card(
+            ui,
+            card_width,
+            "Use an existing disk",
+            "Keep the data already present in a library image",
+            state.machine.disk_mode == launcher::DiskMode::UseExisting,
+            true,
+            theme::ACCENT,
+        )
+        .clicked()
+        {
+            state.machine.disk_mode = launcher::DiskMode::UseExisting;
+        }
+    });
+    ui.add_space(16.0);
+    match state.machine.disk_mode {
+        launcher::DiskMode::CreateNew => {
+            ui::form_row(
+                ui,
+                "FILE NAME",
+                "The image file this machine's disk is stored in. It is \
+                 created inside your machine folder; leave it empty and it \
+                 is named after the machine.",
+                |ui, field_w| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.machine.disk_path)
+                            .desired_width(field_w)
+                            .hint_text(format!("{}.raw", state.machine.name)),
+                    );
+                },
+            );
+            ui::form_note(ui, ui::faint(format!("in {}", settings.vm_dir.display())));
+            ui.add_space(10.0);
+            ui::form_row(
+                ui,
+                "CAPACITY",
+                "How large the disk looks to the guest. The file only grows \
+                 as the guest actually writes, so a generous number costs \
+                 nothing up front.",
+                |ui, field_w| {
+                    ui.spacing_mut().slider_width = field_w - 64.0;
+                    ui.add(
+                        egui::Slider::new(&mut state.machine.disk_gib, 8..=512)
+                            .step_by(2.0)
+                            .suffix(" GiB"),
+                    );
+                },
+            );
+        }
+        launcher::DiskMode::UseExisting => {
+            ui::form_row(
+                ui,
+                "PICK ONE",
+                "Images already in your machine folder. Whichever you pick \
+                 is installed onto as-is — never recreated or emptied.",
+                |ui, field_w| {
+                    egui::ComboBox::from_id_salt("existing-disk")
+                        .selected_text(if state.machine.disk_path.trim().is_empty() {
+                            "Choose a disk…".to_string()
+                        } else {
+                            state.machine.disk_path.clone()
+                        })
+                        .width(ui::combo_width(field_w))
+                        .show_ui(ui, |ui| {
+                            for disk in scan.disks.iter().filter(|d| {
+                                d.exists && d.path.parent() == Some(settings.vm_dir.as_path())
+                            }) {
+                                if let Some(name) = disk.path.file_name() {
+                                    let name = name.to_string_lossy().into_owned();
+                                    ui.selectable_value(
+                                        &mut state.machine.disk_path,
+                                        name.clone(),
+                                        format!(
+                                            "{}  ·  {}",
+                                            name,
+                                            format_bytes(disk.apparent_bytes)
+                                        ),
+                                    );
+                                }
+                            }
+                        });
+                },
+            );
+            if ui::path_row(
+                ui,
+                "OR BROWSE",
+                "Any RAW disk image on this computer. It must end up inside \
+                 your machine folder, so that the profile the installer \
+                 writes stays visible here.",
+                &mut state.machine.disk_path,
+                "existing.raw",
+                true,
+            ) {
+                actions.push(Action::PickPath(PickTarget::WizardDisk));
+            }
+        }
+    }
+}
+
+/// One click sizes a machine. The numbers are the ones a desktop guest is
+/// comfortable with at each step; "More options" sets any other pair.
+struct PowerPreset {
+    name: &'static str,
+    vcpus: u32,
+    memory_mib: u64,
+    hint: &'static str,
+}
+
+const POWER_PRESETS: [PowerPreset; 3] = [
+    PowerPreset {
+        name: "Light",
+        vcpus: 2,
+        memory_mib: 4096,
+        hint: "servers",
+    },
+    PowerPreset {
+        name: "Balanced",
+        vcpus: 4,
+        memory_mib: 8192,
+        hint: "a desktop",
+    },
+    PowerPreset {
+        name: "Performance",
+        vcpus: 8,
+        memory_mib: 16384,
+        hint: "builds",
+    },
+];
+
+/// The disk sizes offered as one-click chips.
+const DISK_CHOICES_GIB: [u64; 4] = [32, 64, 128, 256];
+
+/// A pill-shaped pick-one chip.
+fn choice_chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    let font = egui::FontId::proportional(13.0);
+    let fg = if selected {
+        theme::TEXT
+    } else {
+        theme::TEXT_DIM
+    };
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(galley.size().x + 28.0, 34.0),
+        egui::Sense::click(),
+    );
+    let hover = theme::animate_bool(ui.ctx(), response.id.with("hover"), response.hovered(), 0.1);
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(255),
+        if selected {
+            theme::SELECTED
+        } else {
+            theme::MODAL
+        },
+    );
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(255),
+        egui::Stroke::new(
+            1.0_f32,
+            if selected {
+                theme::ACCENT
+            } else {
+                theme::mix(theme::STROKE_STRONG, theme::TEXT_FAINT, hover)
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(
+        rect.center() - galley.size() * 0.5,
+        galley,
+        egui::Color32::TRANSPARENT,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// Where the wizard is: a check for each step done, a filled dot for this one,
+/// an open dot for the ones to come, joined by short rules.
 fn wizard_progress(ui: &mut egui::Ui, current: usize) {
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        for (index, label) in ["System", "Hardware", "Storage", "Review"]
-            .into_iter()
-            .enumerate()
-        {
-            let active = index == current;
-            let done = index < current;
-            let tint = if active {
-                theme::CYAN
-            } else if done {
-                theme::OK
+        ui.spacing_mut().item_spacing.x = 8.0;
+        for (index, label) in ["System", "Name & size", "Review"].into_iter().enumerate() {
+            let (dot, _) = ui.allocate_exact_size(Vec2::new(16.0, 20.0), egui::Sense::hover());
+            let c = dot.center();
+            let painter = ui.painter();
+            if index < current {
+                painter.add(egui::Shape::line(
+                    vec![
+                        c + Vec2::new(-4.5, 0.5),
+                        c + Vec2::new(-1.5, 3.5),
+                        c + Vec2::new(4.5, -3.0),
+                    ],
+                    egui::Stroke::new(1.8_f32, theme::OK),
+                ));
+            } else if index == current {
+                painter.circle_filled(c, 4.0, theme::ACCENT);
             } else {
-                theme::TEXT_FAINT
-            };
-            let marker = if done {
-                "OK".to_string()
-            } else {
-                format!("{:02}", index + 1)
-            };
-            ui.label(RichText::new(marker).monospace().color(tint).size(11.0));
+                painter.circle_stroke(c, 3.5, egui::Stroke::new(1.2_f32, theme::STROKE_STRONG));
+            }
             ui.label(
                 RichText::new(label)
-                    .color(if active { theme::TEXT } else { theme::TEXT_DIM })
-                    .strong(),
+                    .size(13.0)
+                    .color(match index.cmp(&current) {
+                        std::cmp::Ordering::Less => theme::TEXT_DIM,
+                        std::cmp::Ordering::Equal => theme::TEXT,
+                        std::cmp::Ordering::Greater => theme::TEXT_FAINT,
+                    }),
             );
-            if index < 3 {
-                ui.add_space(3.0);
-                ui.label(RichText::new("/").color(theme::STROKE_STRONG));
+            if index < 2 {
+                let (rule, _) = ui.allocate_exact_size(Vec2::new(28.0, 20.0), egui::Sense::hover());
+                ui.painter().hline(
+                    rule.x_range(),
+                    rule.center().y,
+                    egui::Stroke::new(1.0_f32, theme::STROKE_STRONG),
+                );
             }
         }
     });
 }
 
 fn wizard_heading(ui: &mut egui::Ui, title: &str, detail: &str) {
-    ui.label(RichText::new(title).size(21.0).color(theme::TEXT).strong());
-    ui.add_space(3.0);
-    ui.label(RichText::new(detail).size(13.0).color(theme::TEXT_DIM));
+    ui.label(RichText::new(title).size(22.0).color(theme::TEXT).strong());
+    ui.add_space(4.0);
+    ui.label(RichText::new(detail).size(13.5).color(theme::TEXT_DIM));
 }
 
-/// A big pick-one card. `enabled` is what a capability gate turns off: the card
-/// stays visible (the choice exists, it is just unavailable here) but stops
-/// responding, and the caller hangs the reason off the returned response.
+/// A big pick-one card: title, a line of detail, and a radio mark. `enabled`
+/// is what a capability gate turns off: the card stays visible (the choice
+/// exists, it is just unavailable here) but stops responding, and the caller
+/// hangs the reason off the returned response.
 fn option_card(
     ui: &mut egui::Ui,
     width: f32,
@@ -2781,56 +2833,71 @@ fn option_card(
         egui::Sense::hover()
     };
     let tint = if enabled { tint } else { theme::TEXT_FAINT };
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 78.0), sense);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 80.0), sense);
     let hover = theme::animate_bool(
         ui.ctx(),
         response.id.with("option-hover"),
         enabled && response.hovered(),
-        0.14,
+        0.12,
     );
-    let strength = if selected { 0.16 } else { 0.05 + hover * 0.06 };
-    ui.painter().rect_filled(
+    let radius = egui::CornerRadius::same(10);
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(
+            rect.expand(3.0),
+            egui::CornerRadius::same(13),
+            tint.gamma_multiply(0.10),
+        );
+    }
+    painter.rect_filled(
         rect,
-        egui::CornerRadius::same(theme::CONTROL_RADIUS),
-        theme::mix(theme::CARD, tint, strength),
+        radius,
+        if selected {
+            theme::CARD_HOVER
+        } else {
+            theme::mix(theme::CARD, theme::CARD_HOVER, hover)
+        },
     );
-    ui.painter().rect_stroke(
+    painter.rect_stroke(
         rect,
-        egui::CornerRadius::same(theme::CONTROL_RADIUS),
+        radius,
         egui::Stroke::new(
-            if selected { 1.5_f32 } else { 1.0_f32 },
+            1.0_f32,
             if selected {
-                tint.gamma_multiply(0.9)
+                tint
             } else {
-                theme::mix(theme::STROKE, tint, hover * 0.4)
+                theme::mix(theme::STROKE, theme::STROKE_STRONG, hover)
             },
         ),
         egui::StrokeKind::Inside,
     );
+    let mark = egui::pos2(rect.right() - 20.0, rect.top() + 22.0);
+    if selected {
+        painter.circle_filled(mark, 7.0, tint);
+        painter.circle_filled(mark, 3.0, theme::MODAL);
+    } else {
+        painter.circle_stroke(mark, 6.5, egui::Stroke::new(1.0_f32, theme::STROKE_STRONG));
+    }
     let mut child = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(rect.shrink(13.0))
+            .max_rect(rect.shrink2(Vec2::new(16.0, 14.0)))
             .layout(Layout::top_down(Align::Min)),
     );
-    child.horizontal(|ui| {
-        ui.label(
-            RichText::new(title)
-                .size(15.0)
-                .color(if enabled {
-                    theme::TEXT
-                } else {
-                    theme::TEXT_FAINT
-                })
-                .strong(),
-        );
-        if selected {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("SELECTED").monospace().size(10.0).color(tint));
-            });
-        }
-    });
-    child.add_space(5.0);
+    child.label(
+        RichText::new(title)
+            .size(14.5)
+            .color(if enabled {
+                theme::TEXT
+            } else {
+                theme::TEXT_FAINT
+            })
+            .strong(),
+    );
+    child.add_space(4.0);
     child.label(RichText::new(detail).size(12.0).color(theme::TEXT_DIM));
+    if enabled && response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     response
 }
 
@@ -2860,7 +2927,7 @@ fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
 // through `ui::form_row` / `ui::path_row`, which is what keeps the fields in one
 // straight column and the explanations in tooltips.
 
-/// Shared modal chrome: dimmed backdrop, panel surface, gradient title rule.
+/// Shared modal chrome: dimmed backdrop, dialog surface, a title over a rule.
 /// Returns true when the user dismissed it by clicking outside.
 fn frame<R>(
     ctx: &egui::Context,
@@ -2872,38 +2939,23 @@ fn frame<R>(
     let response = egui::Modal::new(egui::Id::new(id))
         .frame(
             egui::Frame::new()
-                .fill(theme::BG_PANEL)
+                .fill(theme::MODAL)
                 .stroke(egui::Stroke::new(1.0_f32, theme::STROKE_STRONG))
-                .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
+                .corner_radius(egui::CornerRadius::same(12))
                 .shadow(egui::Shadow {
-                    offset: [0, 18],
-                    blur: 40,
+                    offset: [0, 24],
+                    blur: 60,
                     spread: 0,
-                    color: egui::Color32::from_black_alpha(200),
+                    color: egui::Color32::from_black_alpha(150),
                 })
-                .inner_margin(egui::Margin::same(22)),
+                .inner_margin(egui::Margin::same(28)),
         )
         .show(ctx, |ui| {
             ui.set_width(width);
-            let time = theme::animation_time(ui.ctx());
-            ui.horizontal(|ui| {
-                let (mark, _) = ui.allocate_exact_size(Vec2::new(34.0, 30.0), egui::Sense::hover());
-                crate::logo::paint_mark(ui.painter(), mark, time, 0.85);
-                ui.add_space(4.0);
-                ui.label(RichText::new(title).size(19.0).color(theme::TEXT).strong());
-            });
-            ui.add_space(8.0);
-            let rule = egui::Rect::from_min_size(
-                ui.cursor().left_top(),
-                Vec2::new(ui.available_width(), 1.5),
-            );
-            theme::gradient_rect(
-                ui.painter(),
-                rule,
-                theme::CYAN.gamma_multiply(0.7),
-                theme::VIOLET.gamma_multiply(0.2),
-            );
-            ui.add_space(12.0);
+            ui.label(RichText::new(title).size(20.0).color(theme::TEXT).strong());
+            ui.add_space(10.0);
+            theme::rule(ui.painter(), ui.max_rect().x_range(), ui.cursor().top());
+            ui.add_space(18.0);
             add(ui);
         });
     response.should_close()

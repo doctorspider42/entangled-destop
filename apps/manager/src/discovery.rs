@@ -603,6 +603,14 @@ pub fn import_profile(source: &Path, vm_dir: &Path) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// The `name =` a profile declares, without importing it.
+pub fn profile_name(path: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read it: {e}"))?;
+    VmConfig::from_toml(&text)
+        .map(|cfg| cfg.name)
+        .map_err(|e| format!("not a machine profile: {e}"))
+}
+
 fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,

@@ -18,13 +18,12 @@ use crate::settings::Settings;
 
 #[derive(Debug, Error)]
 pub enum LaunchError {
-    #[error("the engine you chose in Settings is not there any more: {0}")]
+    #[error("the custom build chosen under Settings > Advanced is not there any more: {0}")]
     OverrideMissing(PathBuf),
 
     #[error(
-        "the Entangled engine is missing — it normally sits next to this manager. \
-         Reinstall Entangled Desktop, or locate the file yourself under \
-         Settings ▸ Advanced."
+        "Part of Entangled is missing, so machines cannot start. Reinstalling Entangled \
+         Desktop fixes it."
     )]
     NotFound,
 }
@@ -48,10 +47,11 @@ pub enum EngineOrigin {
 }
 
 impl EngineOrigin {
+    /// Where it came from, in the words Health's Technical details use.
     pub const fn label(self) -> &'static str {
         match self {
-            EngineOrigin::Chosen => "chosen in Settings",
-            EngineOrigin::BesideManager => "next to the manager",
+            EngineOrigin::Chosen => "custom build",
+            EngineOrigin::BesideManager => "installed with the app",
             EngineOrigin::OnPath => "found on PATH",
         }
     }
@@ -64,17 +64,6 @@ pub struct Engine {
     pub origin: EngineOrigin,
     /// Filled in by the background version probe; `None` until it answers.
     pub version: Option<String>,
-}
-
-impl Engine {
-    /// The one-line status: `"entangled 0.2.0 — next to the manager"`. The tick
-    /// is added by the view, which owns the colour.
-    pub fn summary(&self) -> String {
-        match &self.version {
-            Some(version) => format!("entangled {version} — {}", self.origin.label()),
-            None => format!("entangled — {}", self.origin.label()),
-        }
-    }
 }
 
 /// Resolution order: explicit setting, the manager's own directory (that is how
@@ -199,6 +188,12 @@ impl Runner {
     /// it is not a machine, it produces output and exits.
     pub fn doctor_command(&self, cwd: &Path) -> Result<(PathBuf, Vec<String>), String> {
         self.command(cwd, vec!["doctor".to_string()])
+    }
+
+    /// `(program, argv)` for `entangled fetch <what>`: the Health page's
+    /// Download buttons.
+    pub fn fetch_command(&self, cwd: &Path, what: &str) -> Result<(PathBuf, Vec<String>), String> {
+        self.command(cwd, vec!["fetch".to_string(), what.to_string()])
     }
 
     /// `(program, argv)` for an engine command line.
@@ -586,7 +581,7 @@ pub fn missing_install_artifact(cwd: &Path, family: GuestFamily) -> Option<Strin
                 cwd.join(BOOTSTRAP_KERNEL).display(),
                 if cfg!(windows) {
                     ", or copy an artifacts/bootstrap/ directory in from a Linux checkout and \
-                     point Settings ▸ Advanced ▸ working directory at it."
+                     point Settings > Advanced > working directory at it."
                 } else {
                     ", or build it with `bash guest/bootstrap-kernel/build.sh`."
                 }
@@ -1071,7 +1066,7 @@ mod tests {
         let engine = locate_engine(&settings).expect("located");
         assert_eq!(engine.path, here);
         assert_eq!(engine.origin, EngineOrigin::Chosen);
-        assert!(engine.summary().contains("chosen in Settings"));
+        assert_eq!(engine.origin.label(), "custom build");
     }
 
     #[test]

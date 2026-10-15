@@ -1,6 +1,6 @@
 ---
 name: gui-manager
-description: The native desktop manager (egui/eframe on wgpu) — quantum theme tokens, view architecture, child-process supervision of the entangled CLI, and how to run it under WSLg (backlog EPIC 16, crate apps/manager). Load before touching the GUI.
+description: The native desktop manager (egui/eframe on wgpu) — Deep Field theme tokens, the machine-centric layout, view architecture, child-process supervision of the entangled CLI, and how to run it under WSLg (backlog EPIC 16, crate apps/manager). Load before touching the GUI.
 ---
 
 # GUI manager (`entangled-manager`)
@@ -15,10 +15,12 @@ the GUI can do, and a GUI crash can never take a guest down.
 ```
 main.rs      CLI flags (--vm-dir, --entangled, --mock, --screenshot[-view]) + tracing
 app.rs       ManagerApp (eframe::App): state, Action loop, frame layout
-  ui/        views: top bar + side navigation, cards, guided wizard/dialogs,
-             Disks, Snapshots, Diagnostics, activity pane and toasts
+  ui/        views: the machine sidebar, All machines (cards.rs), one page
+             per machine (machine.rs), the wizard and dialogs with the
+             editor drawer, Storage (Disks + Snapshots), Health, the
+             activity pane and toasts
   theme.rs   every colour, radius and font size in the product
-  logo.rs    procedural mark + install spinner (egui painter, no assets)
+  logo.rs    the linked-pair mark, app icon and spinner (painter, no assets)
 settings.rs  ~/.config/entangled/manager.toml, typed load/save
 update.rs    startup update check (GitHub /releases/latest) + installer
              download/launch, both on background threads; banner in cards.rs
@@ -80,14 +82,34 @@ the banner's action opens the file picker directly and applies the answer
 immediately (`collect_picker` special-cases `EngineBinary` because there is no
 form open to hold it).
 
-## Diagnostics (`hostcheck.rs` + `ui/diagnostics.rs`)
+## Health (`hostcheck.rs` + `ui/diagnostics.rs`)
 
-The panel is `entangled doctor`, run on a worker thread and rendered: `MISSING`
-lines in the warning colour, the instruction that follows each one in the quiet
-one. It does **not** reimplement the checks — `doctor` already knows them per
-host, and two copies would drift. It also carries the engine card and the
-backend/capability summary. `--mock` shows `hostcheck::mock_report()` (a healthy
-host with one missing artifact) so screenshots are identical everywhere.
+**The user never meets the engine.** Entangled is one application: no
+"engine", "CLI", "next to the manager", program paths or commands in the
+ordinary UI. The part that runs machines is found by itself and only mentioned
+when it is missing — as "Part of Entangled is missing … Reinstalling fixes it",
+with *Locate it…* for whoever has a copy. Hypervisors are "Windows" and "WSL",
+not WHP/KVM. Anything technical lives under a collapsed **Advanced** (Settings)
+or **Technical details** (Health).
+
+Health is a checklist built by `diagnostics::checks(app)`: each line a plain
+sentence, a state (`Ok`, `Optional`, `Attention`, `Problem`, `Pending`) and, when
+there is a fix, a button. The facts still come from `entangled doctor`, run on a
+worker thread when the page opens (`SwitchView(Diagnostics)` starts it) — it does
+**not** reimplement the checks, `doctor` knows them per host and two copies
+would drift. What the view adds is translation: a `MISSING` line becomes a
+sentence, and `entangled fetch firmware` / `bootstrap-kernel` become a
+**Download** button (`Action::Fetch(FetchKind)`, `Runner::fetch_command`, run on
+its own thread, re-checking when it finishes). WSL is its own line from
+`app.wsl_engine` with **Set up WSL**; it is `Optional` unless a machine (or the
+default) runs there. The sidebar's "N to finish" is `diagnostics::to_fix`, the
+same list, so the two cannot disagree. The raw report, the program path and the
+command are under Technical details. `--mock` shows `hostcheck::mock_report()`
+so screenshots are identical everywhere.
+
+Form-row tooltips (`ui::form_label`) are painted, not laid out as widgets: egui
+hands the hover to the top-most widget, so a `Label` inside the cell swallowed
+it and the `?` never answered.
 
 ## Install flow (GUI-1602)
 
@@ -358,43 +380,104 @@ wrong account's WSL. Its exit codes are the installer's interface and are
 pinned by a test in `apps/entangled/src/wsl_engine.rs`; nothing it can do fails
 the installation.
 
-## Theme tokens (GUI-1606)
+## Theme tokens (GUI-1606, "Deep Field" since 2026-10-15)
 
-All in `theme.rs`; views never invent a colour.
+All in `theme.rs`; views never invent a colour. Graphite-navy ground,
+hairline borders, one ice accent; status colours carry meaning and nothing
+else glows. The cyan→violet ramp, `accent(t)` and `gradient_rect` are gone —
+do not bring a gradient back, it is what made the old look loud.
 
 | Token | Value | Use |
 |---|---|---|
-| `BG_DEEP` | `#080b16` | page background, `clear_color` |
-| `BG_PANEL` | `#0b1021` | header, log pane, modals |
-| `CARD` / `CARD_HOVER` | `#11182d` / `#17213d` | card surface, hover target |
-| `INSET` | `#060912` | console, text fields, code blocks |
-| `STROKE` / `STROKE_STRONG` | `#1d2a48` / `#2b3d63` | borders |
-| `TEXT` / `TEXT_DIM` / `TEXT_FAINT` | `#dde6f7` / `#8b9cbd` / `#5d6b8a` | body / caption / metadata |
-| `CYAN` … `VIOLET` | `#35e2f0` … `#a86bff` | the entanglement ramp, `accent(t)` |
-| `OK` / `WARN` / `ERR` | `#3ddc97` / `#ffb454` / `#ff5d73` | Running / Stopping / errors |
-| `CARD_RADIUS` / `CONTROL_RADIUS` | 14 / 9 | corners |
+| `BG_DEEP` | `#0a0d12` | page background, `clear_color` |
+| `BG_PANEL` | `#0d1117` | sidebar, activity pane |
+| `MODAL` | `#0f141b` | dialogs, the editor drawer |
+| `CARD` / `CARD_HOVER` | `#11161e` / `#151b24` | card surface; hover and the secondary button body |
+| `SELECTED` | `#161d27` | the current sidebar row, a picked chip |
+| `INSET` | `#070a0e` | console, text fields, the screen well |
+| `STROKE` / `STROKE_STRONG` / `DIVIDER` | `#1f2733` / `#2c3645` / `#1a212b` | borders / buttons, hover / rules between panels |
+| `TEXT` / `TEXT_DIM` / `TEXT_FAINT` | `#e4e8ee` / `#98a2b3` / `#7d8695` | body / caption / metadata |
+| `ACCENT` / `ACCENT_DEEP` | `#8cc8e0` / `#5aa9cc` | selection, focus, meters, links |
+| `PRIMARY` | `#dce6ef` | the primary button's fill (label in `BG_DEEP`) |
+| `OK` / `WARN` / `ERR` / `IDLE` | `#4fc38d` / `#e2a74f` / `#e7707a` / `#6b7586` | Running / Installing, warnings / errors / Stopped |
+| `CARD_RADIUS` / `CONTROL_RADIUS` | 10 / 6 | corners |
 
-- `accent(t)` positions anything on the cyan→violet ramp; each card picks a
-  stable `t` from its name so a grid does not look uniform.
-- `gradient_rect` is a two-triangle `Mesh` — egui has no gradient brush. Used
-  for the header hairline, card top edge and modal title rule (square corners
-  only; rounded gradients would need clipping).
-- Motion goes through `theme::animate_bool` / `theme::animation_time`: card
-  hover (180 ms fill/border lift), button hover (140 ms glow + accent slide),
-  the subtle grid scan and eight-node background field, a breathing halo on
-  Running, a blinking dot on Stopping, and the entangled-particle spinner while installing
-  (`logo::paint_particle_spinner`). The persisted **Interface motion** setting
-  disables all of it. Enabled mode repaints every 40 ms while the window is
-  focused; an unfocused or motion-disabled window uses a one-second heartbeat
-  for stats/toast expiry and otherwise remains event driven. Do not bypass
-  these theme helpers with direct egui animations.
-- `logo.rs` owns both the painter mark and `app_icon()`. The latter rasterises
-  the same two-loop geometry once at startup for the native window/taskbar
-  icon, avoiding platform-specific bitmap assets.
+- Status colours: Running `OK`, Installing `WARN`, Suspended `ACCENT`,
+  Suspending `ACCENT_DEEP`, Stopping `TEXT_DIM`, Stopped `IDLE` (a ring, not a
+  dot). `status_labels_and_colors_are_distinct` holds them apart.
+- `every_text_colour_reads_on_every_surface` pins 4.5:1 for all three text
+  colours on every surface. `TEXT_FAINT` was nudged up once to pass it on
+  `CARD_HOVER`; change a surface and that test tells you.
+- Buttons (`ui/mod.rs`): `primary_button` — at most **one** per view, the
+  brightest thing on it; `secondary_button` / `ghost_button(…, tint)` — the
+  quiet body, tinted only for Stop/Delete; `text_button` — Cancel and other
+  least-important actions; `icon_button(Icon, hover)` — square, the hover is
+  required because it has no label. All are `BUTTON_H` (34) tall.
+- Icons are `ui::Icon` + `ui::paint_icon`: painter strokes on a 16-unit grid,
+  no image assets. egui's bundled font has no `✕` or `→` — add an `Icon`.
+- Motion goes through `theme::animate_bool` / `theme::animation_time`, and
+  there is little of it: 100–120 ms fill/border fades on hover, a slow breath
+  on Running's dot, a blinking dot on Stopping, a turning arc
+  (`logo::paint_spinner`) for Installing and Suspending. The backdrop is nine
+  static one-pixel stars — no grid, no scan line, no node field. The persisted
+  **Interface motion** setting disables the rest. Enabled mode repaints every
+  40 ms while the window is focused; an unfocused or motion-disabled window
+  uses a one-second heartbeat for stats/toast expiry and otherwise remains
+  event driven. Do not bypass these theme helpers with direct egui animations.
+- `logo.rs` owns the mark — the **linked pair**: two rings, the left one over
+  at the top crossing and the right one over at the bottom, each over-arc drawn
+  on a knockout in the *background colour*, which is why `paint_mark` takes
+  one. Strokes thicken below 96 px so the gap reads at 16 px. `app_icon()`
+  rasterises the same geometry (4×4 supersampled, on a rounded `CARD` tile)
+  once at startup, avoiding platform-specific bitmap assets.
+- The **file** icon is a separate thing from the window's: Explorer, a pinned
+  taskbar button and the installer read the icon resource inside the exe.
+  `installer/entangled.ico` holds it (16–256 px, drawn by
+  `scripts/make-icon.ps1` from the same geometry — rerun it when the mark
+  changes), and `apps/manager/build.rs` compiles it with the SDK's `rc.exe`
+  and links the `.res` into `entangled-manager.exe` (no crate; without the
+  SDK the build warns and keeps the generic icon). Each over-arc is drawn a few
+  degrees longer than its knockout, in the script and in `paint_mark`: ends
+  that meet on one pixel leave an anti-aliasing seam across the ring.
 - Do **not** set `visuals.override_text_color`: it repaints hint text and
   disabled labels at full strength, which once made the delete dialog's
   placeholder look like typed input. Body colour comes from
   `widgets.noninteractive.fg_stroke`.
+
+## Information architecture (2026-10-15)
+
+The sidebar (`ui/sidebar.rs`) lists **the machines themselves**, each with a
+status dot and a few words (`ui::status_line`: "Running · 2 h", "Saved 3 hours
+ago", "Off"), under "All machines". Host-wide tools sit at its foot — Storage,
+Health, Activity, Settings — with one line of host numbers, the version and the
+`MOCK DATA` chip. There is no top header.
+
+- **All machines** (`ui/cards.rs`): running machines large (screen well, live
+  meters, Pause · Shut down), everything else as a fixed-height tile with at
+  most one action (Start or Resume), a dashed New-machine tile, and the
+  first-launch page (`welcome`) when there are no machines at all.
+- **The machine page** (`ui/machine.rs`, `View::Machine(name)`) owns every
+  lifecycle button: the state's buttons in the header, everything rarer under
+  the `…` menu (Restart, Suspend, Force stop, autostart, rename, clone,
+  delete), notices for a missing disk / a shared name / a saved session that
+  cannot resume, the screen with "Right now" and "Connect" panels, and setup
+  tiles. A tile opens the editor on its own section through
+  `Action::AskEditVmAt(name, section)`; tiles are disabled (with the reason on
+  hover) unless the machine is Stopped or Suspended.
+- **The editor is a drawer** (`dialogs::edit_vm_drawer`): a `Modal` whose area
+  is anchored `RIGHT_TOP`, full window height, section tabs (`ui::page_tab`)
+  along the top, a fixed footer with Save. Processor & memory opens with the
+  Light / Balanced / Performance presets (`POWER_PRESETS`, shared with the
+  wizard) above the sliders.
+- **The wizard** is three steps — System, Name & size, Review. Name & size is
+  the presets, disk-size chips and a "More options" toggle
+  (`WizardState::more`) that reveals every manual setting: exact memory and
+  cores, unattended / headless install, new vs existing disk.
+- **Storage** is Disks and Saved sessions behind one sidebar item, switched by
+  the tabs in `ui::storage_header`. **Health** is the old Diagnostics view.
+- A machine page whose name has gone (deleted, renamed, moved) says so with a
+  way back rather than falling over; a pending install has its own page until
+  its profile exists.
 
 ## Dependency notes
 
@@ -434,8 +517,8 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
 - `--mock` starts the complete UI with deterministic in-memory machines,
   disks, statuses and host metrics. It does not load saved settings, scan a VM
   directory, start the metrics worker or invoke `entangled`; mutating buttons
-  only update the fixture or show a toast. A `MOCK DATA` chip stays visible in
-  the header so screenshots cannot be confused with a real host. Use it for
+  only update the fixture or show a toast. A `MOCK DATA` chip stays visible at
+  the foot of the sidebar so screenshots cannot be confused with a real host. Use it for
   ordinary button/layout work instead of preparing profiles or launching a VM:
 
   ```powershell
@@ -453,7 +536,8 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
 - `--screenshot <png> [--screenshot-view <surface>]` renders a few frames, saves
   a PNG through `ViewportCommand::Screenshot` and exits — the quickest way to
   review a visual change without a human at the keyboard. Surfaces:
-  `main`, `wizard`, `wizard-wsl` (the backend step with WSL chosen and no
+  `main`, `machine` (the running machine's page), `wizard`, `wizard-wsl`
+  (the system step with WSL chosen and no
   Linux engine), `wizard-wsl-review` (the same machine on the review step,
   where Create is unavailable), `settings`, `disks`, `snapshots`,
   `snapshot-delete`, `snapshot-discard`, `diagnostics`, and one per editor
@@ -476,8 +560,9 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
 
 ## Pause and Restart: the control channel (ADR-0005)
 
-A running VM's card has **Pause/Resume** and **Restart** beside **Stop**. They
-are not a stop and a start: they reach the live VM.
+A running machine's page has **Pause** and **Shut down**, with **Restart**,
+**Suspend** and **Force stop** under its `…` menu. They are not a stop and a
+start: they reach the live VM.
 
 The mechanism is the child's stdin. `launcher::run_spec` now spawns
 `entangled run --control-stdin <profile>` and `TaskSpec::control` makes the
@@ -505,9 +590,9 @@ on this computer reaches port 22 in the guest", from
 writes no forwards (control-api refuses them there). egui's bundled font has
 no `✕` or `→`: write words.
 
-**Shut down** (2026-10-12) is the card's first button for a running machine:
+**Shut down** (2026-10-12) is the first button for a running machine:
 `Task::shutdown` writes `shutdown` (`control_api::control::CMD_SHUTDOWN`), the
-engine presses the guest's ACPI power button, and the card turns Stopped when
+engine presses the guest's ACPI power button, and the machine turns Stopped when
 the process ends — there is no state to set, because the guest decides (a
 desktop may show its own dialog). Stop stays beside it, labelled for what it is:
 pulling the plug.
@@ -572,8 +657,8 @@ Everything in this crate is keyed by the machine's **name** (`status_of`, the
 supervisor, `<name>-run.log`, the snapshot, the card picture, `vm_backends`),
 not by its profile path. Two profiles with the same `name =` therefore share
 all of it, which happens when profiles are copied by hand. `name_count` makes
-the card say so, and *More → Rename…* is the fix. `Action::AskRenameVm` carries
-the **profile path**, not the name, because the clicked card is the one to
+the machine page say so, and *… → Rename…* is the fix. `Action::AskRenameVm`
+carries the **profile path**, not the name, because the page's profile is the one to
 rename and its name is ambiguous by definition. The dialog suggests the
 profile's file stem.
 
@@ -611,26 +696,20 @@ success**, so the run log does not grow by one line every 3 s. The manager never
 sends a path: under WSL the engine sees the directory under another name, and
 both sides derive the same file from the profile. `Thumbs::refresh` stats the
 files once a second and decodes only those whose mtime changed.
-`cards::screen_picture` draws the picture in whatever height the card has left
-above the action strip (nothing below 56 px), dimmed when the machine is not
-running. `plan_delete` removes the file. `--mock` has no pictures, so
-screenshots stay identical.
+`cards::screen_well` draws the picture covering its well (cropped, never
+letterboxed, so every tile in a row has one shape), dimmed when the machine is
+not running, and a quiet placeholder with the state in words when there is no
+picture. Tiles, running rows and the machine page all use it. `plan_delete`
+removes the file. `--mock` has no pictures, so screenshots stay identical.
 
-### Cards that grow
+### Tiles do not grow
 
-`horizontal_wrapped` only reports how many lines it took **after** it has drawn
-them, and a card's action strip is bottom-anchored, so a wrapped second line
-grows straight through the border. Both places that hit this now measure instead
-of declaring: `cards::measured_action_height` and the Snapshots row lay their
-content out once in an `egui::UiBuilder::new().sizing_pass().invisible()` child
-and use the resulting height. Declaring a line count per state was the first
-attempt and it was wrong the day a state was added — silently, because only a
-screenshot shows it. When you add a button or a sentence to a card, take the
-screenshot and check the pixels; `CARD_HEIGHT` is still a fixed floor and the
-tallest state (Suspended: two chip rows, a "saved 3 hours ago" line and two
-button lines) is what sets it.
-
-Related: a suspended machine's extra line is **always exactly one**. When the
-snapshot cannot go back it reads "saved 3 hours ago · 1.1 GiB · cannot resume
-here" with the full reason on the hover, rather than adding a second line the
-card has no room for.
+All machines tiles are a fixed height because they carry at most one action;
+everything else a machine can do is on its page. The one row that still has to
+measure itself is a Snapshots row, whose refusal is a whole sentence that
+wraps: it lays its body out once in an
+`egui::UiBuilder::new().sizing_pass().invisible()` child and uses the result.
+Declaring a line count per state was tried first and was wrong the day a state
+was added — silently, because only a screenshot shows it. When you add a button
+or a sentence to any fixed-size surface, take the screenshot and check the
+pixels.

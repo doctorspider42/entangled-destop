@@ -43,23 +43,6 @@ pub struct Report {
     pub lines: Vec<Line>,
 }
 
-impl Report {
-    /// The one-line verdict for the panel heading.
-    pub fn headline(&self) -> String {
-        let missing = self
-            .lines
-            .iter()
-            .filter(|line| line.level == Level::Missing)
-            .count();
-        match (self.healthy, missing) {
-            (false, _) => "This host cannot run machines yet".to_string(),
-            (true, 0) => "Everything this host needs is in place".to_string(),
-            (true, 1) => "Machines can run; one thing is missing".to_string(),
-            (true, n) => format!("Machines can run; {n} things are missing"),
-        }
-    }
-}
-
 /// Splits captured output into rows. `MISSING` is `doctor`'s own marker for an
 /// artifact that is not there, and the line after it is the instruction — kept
 /// as `Info` so it does not read like a second problem.
@@ -174,7 +157,7 @@ pub fn mock_report() -> Report {
          \x20 engines         : windows  C:\\Program Files\\Entangled\\entangled.exe (0.2.0) — this program\n\
          \x20                   wsl      MISSING — Ubuntu has no Entangled engine ('entangled' is not there)\n\
          \x20                            The Windows installer ships no Linux build: let the manager\n\
-         \x20                            install one (Settings ▸ Linux engine).\n\
+         \x20                            install one (Settings > Linux engine).\n\
          \x20 install         : ubuntu — UEFI + verified ISO, offline (no mirror needed)\n\
          \x20                   debian — d-i on the bootstrap kernel, needs the network\n\
          \x20   firmware         artifacts/firmware/CLOUDHV.fd (4.0 MiB, from this installation)\n\
@@ -214,22 +197,6 @@ mod tests {
     fn a_failed_run_marks_its_error_line() {
         let lines = parse("entangled doctor\nerror: /dev/kvm not found", false);
         assert_eq!(lines[1].level, Level::Failure);
-    }
-
-    #[test]
-    fn the_headline_counts_what_is_missing() {
-        let mut report = mock_report();
-        // The fixture is missing two things: the bootstrap kernel and the Linux
-        // engine inside WSL.
-        assert_eq!(report.headline(), "Machines can run; 2 things are missing");
-        report.lines.retain(|line| !line.text.contains("wsl "));
-        assert_eq!(report.headline(), "Machines can run; one thing is missing");
-
-        report.lines.retain(|line| line.level != Level::Missing);
-        assert_eq!(report.headline(), "Everything this host needs is in place");
-
-        report.healthy = false;
-        assert_eq!(report.headline(), "This host cannot run machines yet");
     }
 
     /// Blank lines never become empty rows — the panel would show gaps that

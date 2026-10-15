@@ -50,12 +50,12 @@ impl Backend {
         match self {
             Backend::Native => {
                 if cfg!(windows) {
-                    "Windows (WHP)"
+                    "Windows"
                 } else {
-                    "Linux (KVM)"
+                    "This computer"
                 }
             }
-            Backend::Wsl => "WSL (KVM)",
+            Backend::Wsl => "WSL",
         }
     }
 
@@ -64,19 +64,17 @@ impl Backend {
         match self {
             Backend::Native => {
                 if cfg!(windows) {
-                    "Runs the machine on Windows itself, through the Windows Hypervisor \
-                     Platform. Its window is an ordinary Windows window. No 3D acceleration \
-                     and no TAP networking yet."
+                    "Runs the machine on Windows itself, in an ordinary window. The usual \
+                     choice; the GPU desktop works here."
                 } else {
-                    "Runs the machine on this Linux host through KVM. Everything Entangled \
-                     can do is available here."
+                    "Runs the machine on this computer. Everything Entangled can do is \
+                     available here."
                 }
             }
             Backend::Wsl => {
-                "Runs the Linux build of Entangled inside WSL, which has KVM. This is the \
-                 host that can do 3D acceleration and TAP networking — but the machine's \
-                 window is opened by WSLg, and the machine's files must live on a drive \
-                 WSL can reach."
+                "Runs the machine inside WSL, the Windows Subsystem for Linux. Choose it for \
+                 OpenGL 3D or bridged networking. Its window opens through WSL, and its \
+                 files must be on a drive WSL can reach."
             }
         }
     }

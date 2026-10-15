@@ -110,10 +110,14 @@ impl Toast {
 }
 
 /// Which main surface the central panel shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum View {
+    /// Every machine at a glance.
     #[default]
     Machines,
+    /// One machine's own page, by name: its screen, what it is doing now and
+    /// its setup.
+    Machine(String),
     Disks,
     /// Saved sessions: every `*.esnap` in the VM directory (ADR-0006).
     Snapshots,
@@ -132,6 +136,8 @@ pub enum RefreshState {
 pub struct WizardState {
     pub machine: NewMachine,
     pub step: usize,
+    /// "More options" is open: every setting the presets choose, by hand.
+    pub more: bool,
     pub error: Option<String>,
 }
 
@@ -299,11 +305,42 @@ impl Modal {
     }
 }
 
+/// A file Entangled can download for itself (`entangled fetch <what>`), offered
+/// as a button on the Health page instead of a command to type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchKind {
+    /// The UEFI firmware every PC-style machine starts from.
+    Firmware,
+    /// The kernel and initramfs the Debian installer boots.
+    BootstrapKernel,
+}
+
+impl FetchKind {
+    /// The `entangled fetch` argument.
+    pub const fn arg(self) -> &'static str {
+        match self {
+            FetchKind::Firmware => "firmware",
+            FetchKind::BootstrapKernel => "bootstrap-kernel",
+        }
+    }
+
+    /// What it is, for a toast.
+    pub const fn noun(self) -> &'static str {
+        match self {
+            FetchKind::Firmware => "The startup files",
+            FetchKind::BootstrapKernel => "The Debian installer files",
+        }
+    }
+}
+
 /// What the UI asks the application to do.
+#[derive(Clone)]
 pub enum Action {
     Refresh,
     CreateVmDir,
     OpenWizard,
+    /// The wizard, with the system already chosen (the first-launch page).
+    OpenWizardFor(launcher::GuestFamily),
     CloseModal,
     SubmitWizard,
     OpenSettings,
@@ -355,7 +392,9 @@ pub enum Action {
     /// Open the host file manager with the file selected (explorer/xdg-open).
     Reveal(PathBuf),
     // ---- VM editor ---------------------------------------------------------
-    AskEditVm(String),
+    /// The machine editor, opened on one section — a setup tile on the
+    /// machine page.
+    AskEditVmAt(String, EditVmSection),
     SubmitEditVm,
     /// Copy a stopped machine (disks, NVRAM, profile) under a new name.
     AskCloneVm(String),
@@ -383,6 +422,8 @@ pub enum Action {
     CheckWslEngine,
     /// Download the pinned Linux engine and copy it into the WSL distribution.
     InstallWslEngine,
+    /// Download one of the files Health found missing.
+    Fetch(FetchKind),
     // ---- Storage, the rest of the CLI's disk surface ---------------------------
     AskResizeDisk(PathBuf),
     SubmitResizeDisk,
@@ -492,6 +533,9 @@ pub struct ManagerApp {
     /// True while the pinned Linux engine is being downloaded and copied in.
     pub wsl_install_running: bool,
     wsl_install_rx: Option<mpsc::Receiver<Result<wslengine::Outcome, String>>>,
+    /// The download Health started, while it runs.
+    pub fetch_running: Option<FetchKind>,
+    fetch_rx: Option<mpsc::Receiver<Result<(), String>>>,
     /// The last `entangled doctor` answer, and whether one is in flight.
     pub doctor: Option<hostcheck::Report>,
     pub doctor_running: bool,
@@ -647,6 +691,8 @@ impl ManagerApp {
             wsl_engine_rx: None,
             wsl_install_running: false,
             wsl_install_rx: None,
+            fetch_running: None,
+            fetch_rx: None,
             doctor: mock_mode.then(hostcheck::mock_report),
             doctor_running: false,
             doctor_rx: None,
@@ -678,14 +724,22 @@ impl ManagerApp {
                 if let Modal::Wizard(state) = &mut app.modal {
                     state.machine.backend = Backend::Wsl;
                     if startup.screenshot_view == ScreenshotView::WizardWslReview {
-                        state.step = 3;
+                        state.step = 2;
                     }
                 }
             }
             ScreenshotView::Settings => app.open_settings(),
             ScreenshotView::Disks => app.view = View::Disks,
             ScreenshotView::Snapshots => app.view = View::Snapshots,
-            ScreenshotView::Diagnostics => app.view = View::Diagnostics,
+            ScreenshotView::Diagnostics => {
+                // The same arrival the sidebar gives it: the check runs.
+                app.view = View::Diagnostics;
+                if app.mock_mode {
+                    app.doctor = Some(crate::hostcheck::mock_report());
+                } else {
+                    app.run_diagnostics();
+                }
+            }
             ScreenshotView::SnapshotDelete => {
                 app.view = View::Snapshots;
             }
@@ -693,6 +747,7 @@ impl ManagerApp {
             // over the Machines grid it is opened from.
             ScreenshotView::SnapshotDiscard => app.view = View::Machines,
             ScreenshotView::Main
+            | ScreenshotView::Machine
             | ScreenshotView::Editor
             | ScreenshotView::EditorBoot
             | ScreenshotView::EditorDisplay
@@ -836,6 +891,7 @@ impl ManagerApp {
                 backend: self.preferred_backend(),
             },
             step: 0,
+            more: false,
             error: None,
         });
     }
@@ -845,11 +901,12 @@ impl ManagerApp {
     /// the disk, the profile and the hostname, so suggesting the wrong distro's
     /// name is a label that outlives the wizard.
     fn suggest_name(&self) -> String {
+        self.suggest_name_for(launcher::GuestFamily::default_for_host())
+    }
+
+    fn suggest_name_for(&self, family: launcher::GuestFamily) -> String {
         for n in 1..=99 {
-            let candidate = format!(
-                "{}-{n}",
-                launcher::GuestFamily::default_for_host().cli_name()
-            );
+            let candidate = format!("{}-{n}", family.cli_name());
             let taken = self.vm(&candidate).is_some()
                 || self.pending.iter().any(|p| p.name == candidate)
                 || self
@@ -861,10 +918,7 @@ impl ManagerApp {
                 return candidate;
             }
         }
-        format!(
-            "{}-new",
-            launcher::GuestFamily::default_for_host().cli_name()
-        )
+        format!("{}-new", family.cli_name())
     }
 
     /// Which distribution and Linux engine the WSL pre-flight is about.
@@ -1184,6 +1238,22 @@ impl ManagerApp {
             };
             self.screenshot_surface_opened = true;
             self.ask_discard_snapshot(&name);
+            return;
+        }
+        if self.screenshot_view == ScreenshotView::Machine {
+            // The running machine if there is one: it is the page with the
+            // most on it.
+            let Some(name) = self
+                .scan
+                .vms
+                .iter()
+                .map(|vm| vm.name.clone())
+                .max_by_key(|name| self.status_of(name) == Status::Running)
+            else {
+                return;
+            };
+            self.screenshot_surface_opened = true;
+            self.view = View::Machine(name);
             return;
         }
         let section = match self.screenshot_view {
@@ -1910,7 +1980,7 @@ impl ManagerApp {
         let Some(cli) = self.engine_path() else {
             if let Modal::Wizard(state) = &mut self.modal {
                 state.error = Some(
-                    "the Entangled engine could not be found — see Settings ▸ Advanced".into(),
+                    "the Entangled engine could not be found — see Settings > Advanced".into(),
                 );
             }
             return;
@@ -2074,10 +2144,7 @@ impl ManagerApp {
 
         match &self.settings_path {
             Some(path) => match self.settings.save_to(path) {
-                Ok(()) => self.toast(
-                    ToastLevel::Success,
-                    format!("settings saved to {}", path.display()),
-                ),
+                Ok(()) => self.toast(ToastLevel::Success, "Settings saved"),
                 Err(e) => self.toast(ToastLevel::Error, e.to_string()),
             },
             None => self.toast(
@@ -2087,6 +2154,14 @@ impl ManagerApp {
         }
         self.refresh_engine();
         self.ensure_wsl_check(false);
+        // Health answers for the settings just saved — where machines run,
+        // which folder, which build — so it checks again by itself. A check
+        // still running was asked about the old settings: its answer is
+        // dropped rather than shown.
+        self.doctor = None;
+        self.doctor_rx = None;
+        self.doctor_running = false;
+        self.run_diagnostics();
         self.modal = Modal::None;
         self.request_scan(true);
     }
@@ -2568,6 +2643,25 @@ impl ManagerApp {
                 format!("mock: would import {}", path.display()),
             );
             return;
+        }
+        // Everything here is keyed by the machine's name, so a second profile
+        // with a name already in use shares the first one's status, logs and
+        // saved session. `import_profile` only refuses an existing *file*
+        // `<name>.toml`; a machine of that name can live in a file called
+        // anything, so the name itself is checked against the library too.
+        if let Ok(name) = discovery::profile_name(path) {
+            if let Some(existing) = self.vm(&name) {
+                let file = existing.profile_path.display().to_string();
+                self.toast(
+                    ToastLevel::Error,
+                    format!(
+                        "cannot import {}: a machine named '{name}' is already here ({file}). \
+                         Rename one of them first.",
+                        path.display()
+                    ),
+                );
+                return;
+            }
         }
         match discovery::import_profile(path, &self.settings.vm_dir) {
             Ok(imported) => {
@@ -3085,6 +3179,74 @@ impl ManagerApp {
         ));
     }
 
+    /// Runs `entangled fetch <what>` on its own thread, on the default
+    /// backend — the same program and the same place the health check ran.
+    fn fetch(&mut self, kind: FetchKind) {
+        if self.fetch_running.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine.as_ref().ok().map(|e| e.path.clone()) else {
+            return;
+        };
+        let runner = Runner::new(self.settings.default_backend, engine, &self.settings);
+        let cwd = self.settings.child_cwd();
+        let (program, args) = match runner.fetch_command(&cwd, kind.arg()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.toast(
+                    ToastLevel::Error,
+                    format!("{} cannot be downloaded: {e}", kind.noun()),
+                );
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        let waker = Arc::clone(&self.waker);
+        let spawned = std::thread::Builder::new()
+            .name("fetch".to_string())
+            .spawn(move || {
+                let mut command = std::process::Command::new(&program);
+                command.args(&args).current_dir(&cwd);
+                crate::process::quiet_command(&mut command);
+                let result = match command.output() {
+                    Ok(output) if output.status.success() => Ok(()),
+                    Ok(output) => {
+                        let text = String::from_utf8_lossy(&output.stderr);
+                        let last = text.lines().rev().find(|l| !l.trim().is_empty());
+                        Err(last.unwrap_or("the download failed").trim().to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = tx.send(result);
+                waker();
+            });
+        match spawned {
+            Ok(_) => {
+                self.fetch_running = Some(kind);
+                self.fetch_rx = Some(rx);
+            }
+            Err(e) => self.toast(ToastLevel::Error, format!("cannot start the download: {e}")),
+        }
+    }
+
+    fn collect_fetch(&mut self) {
+        let Some(rx) = &self.fetch_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        let kind = self.fetch_running.take();
+        self.fetch_rx = None;
+        let noun = kind.map(FetchKind::noun).unwrap_or("The files");
+        match result {
+            Ok(()) => self.toast(ToastLevel::Success, format!("{noun} are downloaded")),
+            Err(e) => self.toast(
+                ToastLevel::Error,
+                format!("{noun} could not be downloaded: {e}"),
+            ),
+        }
+        // Health answers again with the files in place.
+        self.doctor = None;
+        self.run_diagnostics();
+    }
+
     fn collect_diagnostics(&mut self) {
         let Some(rx) = &self.doctor_rx else { return };
         if let Ok(report) = rx.try_recv() {
@@ -3376,6 +3538,16 @@ impl ManagerApp {
                     "Mock: the Linux engine would be downloaded, verified and installed",
                 );
             }
+            Action::Fetch(kind) => {
+                self.toast(
+                    ToastLevel::Success,
+                    format!("Mock: {} would be downloaded", kind.noun().to_lowercase()),
+                );
+            }
+            Action::SwitchView(View::Diagnostics) if self.doctor.is_none() => {
+                self.doctor = Some(crate::hostcheck::mock_report());
+                self.view = View::Diagnostics;
+            }
             Action::RunDiagnostics => {
                 // A canned report rather than a real `doctor`: mock mode never
                 // probes the host, and a screenshot must show the same panel
@@ -3430,6 +3602,16 @@ impl ManagerApp {
                 }
             }
             Action::OpenWizard => self.open_wizard(),
+            Action::OpenWizardFor(family) => {
+                self.open_wizard();
+                let name = self.suggest_name_for(family);
+                if let Modal::Wizard(state) = &mut self.modal {
+                    if state.machine.family != family {
+                        state.machine.family = family;
+                        state.machine.name = name;
+                    }
+                }
+            }
             Action::CloseModal => {
                 // A move in flight owns its modal: the copy is running on the
                 // worker and closing the dialog would orphan its progress.
@@ -3492,6 +3674,11 @@ impl ManagerApp {
                 self.update = None;
             }
             Action::SwitchView(view) => {
+                // Health answers on arrival: a page that opens empty and asks
+                // to be told to look is a page nobody reads.
+                if view == View::Diagnostics && self.doctor.is_none() {
+                    self.run_diagnostics();
+                }
                 self.view = view;
                 self.request_scan(true);
             }
@@ -3507,7 +3694,12 @@ impl ManagerApp {
                 declared,
             } => self.detach_disk(&vm, &profile, &declared),
             Action::Reveal(path) => self.reveal(&path),
-            Action::AskEditVm(name) => self.ask_edit_vm(&name),
+            Action::AskEditVmAt(name, section) => {
+                self.ask_edit_vm(&name);
+                if let Modal::EditVm(state) = &mut self.modal {
+                    state.section = section;
+                }
+            }
             Action::AskCloneVm(name) => self.ask_clone_vm(&name),
             Action::SubmitCloneVm => self.submit_clone_vm(),
             Action::AskRenameVm(profile) => self.ask_rename_vm(&profile),
@@ -3528,6 +3720,7 @@ impl ManagerApp {
             Action::SubmitMoveDisk => self.submit_move_disk(),
             Action::PickPath(target) => self.open_picker(target),
             Action::RunDiagnostics => self.run_diagnostics(),
+            Action::Fetch(kind) => self.fetch(kind),
             Action::CheckWslEngine => self.ensure_wsl_check(true),
             Action::InstallWslEngine => self.install_wsl_engine(),
             Action::AskResizeDisk(path) => self.ask_resize_disk(&path),
@@ -3622,11 +3815,12 @@ impl Status {
     pub fn color(self) -> egui::Color32 {
         match self {
             Status::Running => theme::OK,
-            Status::Stopping => theme::WARN,
-            Status::Installing => theme::CYAN,
-            Status::Suspending => theme::VIOLET_DEEP,
-            Status::Suspended => theme::VIOLET,
-            Status::Stopped => theme::TEXT_FAINT,
+            // On its way to Stopped: the at-rest grey, a step brighter.
+            Status::Stopping => theme::TEXT_DIM,
+            Status::Installing => theme::WARN,
+            Status::Suspending => theme::ACCENT_DEEP,
+            Status::Suspended => theme::ACCENT,
+            Status::Stopped => theme::IDLE,
         }
     }
 
@@ -3676,6 +3870,7 @@ impl eframe::App for ManagerApp {
         self.collect_engine_version();
         self.collect_picker();
         self.collect_diagnostics();
+        self.collect_fetch();
         self.supervisor.prune(12);
         self.ensure_log_selection();
         self.expire_toasts(ctx.input(|i| i.time));
@@ -3704,12 +3899,13 @@ impl eframe::App for ManagerApp {
         if !dropped.is_empty() {
             actions.push(Action::FilesDropped(dropped));
         }
-        ui::header::show(ctx, self, &mut actions);
+        ui::sidebar::show(ctx, self, &mut actions);
         if self.log_open {
             ui::logpane::show(ctx, self, &mut actions);
         }
-        match self.view {
+        match &self.view {
             View::Machines => ui::cards::show(ctx, self, &mut actions),
+            View::Machine(name) => ui::machine::show(ctx, self, name, &mut actions),
             View::Disks => ui::disks::show(ctx, self, &mut actions),
             View::Snapshots => ui::snapshots::show(ctx, self, &mut actions),
             View::Diagnostics => ui::diagnostics::show(ctx, self, &mut actions),

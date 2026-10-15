@@ -1,15 +1,17 @@
 # Renders the Entangled Desktop icon and packs it into installer/entangled.ico.
 #
-# The mark follows the manager's quantum theme (apps/manager/src/theme.rs):
-# a deep-space disc (BG_PANEL) carrying two entangled elliptical orbits, one
-# cyan (#35e2f0) and one violet (#a86bff), each with a particle on it — the
-# same idea `logo::paint_mark` draws procedurally inside the GUI.
+# The mark is the manager's "linked pair" (apps/manager/src/logo.rs): two rings
+# that pass over and under each other — the left one on top at the upper
+# crossing, the right one on top at the lower — on a rounded tile in the
+# Deep Field palette (apps/manager/src/theme.rs). Same geometry as
+# `logo::paint_mark` and `logo::app_icon`, so the file icon, the taskbar and
+# the window inside the app all show one mark.
 #
-# Windows-only build-time tooling (System.Drawing); the produced .ico is
-# committed, so nothing at build or run time depends on this script. Run it
-# again only when the mark changes:
+# The .ico is committed and is what both the installer and the manager's own
+# executable carry (apps/manager/build.rs embeds it), so nothing at build or
+# run time depends on this script. Run it again only when the mark changes:
 #
-#   pwsh -File scripts/make-icon.ps1
+#   powershell -File scripts/make-icon.ps1
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
@@ -19,70 +21,84 @@ $outIco = Join-Path $repo 'installer/entangled.ico'
 New-Item -ItemType Directory -Force (Split-Path -Parent $outIco) | Out-Null
 
 # Theme tokens.
-$bgPanel = [System.Drawing.Color]::FromArgb(255, 0x0b, 0x10, 0x21)
-$stroke  = [System.Drawing.Color]::FromArgb(255, 0x2b, 0x3d, 0x63)   # STROKE_STRONG
-$cyan    = [System.Drawing.Color]::FromArgb(255, 0x35, 0xe2, 0xf0)
-$violet  = [System.Drawing.Color]::FromArgb(255, 0xa8, 0x6b, 0xff)
+$tile   = [System.Drawing.Color]::FromArgb(255, 0x11, 0x16, 0x1e)   # CARD
+$border = [System.Drawing.Color]::FromArgb(255, 0x2c, 0x36, 0x45)   # STROKE_STRONG
+$light  = [System.Drawing.Color]::FromArgb(255, 0xe4, 0xe8, 0xee)   # TEXT
+$ice    = [System.Drawing.Color]::FromArgb(255, 0x8c, 0xc8, 0xe0)   # ACCENT
+
+# The mark's own units (logo.rs): a 48-unit square, rings of radius 12 whose
+# centres sit 5 units either side of the middle.
+$units = 48.0
+$radius = 12.0
+$offset = 5.0
+# Where the rings cross, seen from the left ring's centre (degrees, y down).
+$cross = [Math]::Atan2([Math]::Sqrt($radius * $radius - $offset * $offset), $offset) * 180.0 / [Math]::PI
+$arcHalf = 20.0
+# The coloured arc runs a little past its knockout at both ends, so the two
+# anti-aliased ends never meet on the same pixel and leave a seam.
+$overlap = 4.0
+
+function Stroke-Units([int]$size) {
+    # Heavier as it shrinks, so the over/under gap still reads at 16 px.
+    if ($size -ge 128) { return 3.6 }
+    if ($size -ge 48) { return 4.0 }
+    if ($size -ge 32) { return 4.6 }
+    return 5.2
+}
+
+function Rounded-Path([float]$x, [float]$y, [float]$w, [float]$h, [float]$r) {
+    $p = [System.Drawing.Drawing2D.GraphicsPath]::new()
+    $d = 2 * $r
+    $p.AddArc($x, $y, $d, $d, 180, 90)
+    $p.AddArc($x + $w - $d, $y, $d, $d, 270, 90)
+    $p.AddArc($x + $w - $d, $y + $h - $d, $d, $d, 0, 90)
+    $p.AddArc($x, $y + $h - $d, $d, $d, 90, 90)
+    $p.CloseFigure()
+    return $p
+}
 
 function Render-Png([int]$size) {
     $bmp = [System.Drawing.Bitmap]::new($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $g.Clear([System.Drawing.Color]::Transparent)
 
-    $s = $size / 256.0            # everything below is drawn in a 256-unit space
+    # The tile: rounded, 22% corners, a one-pixel border.
+    $edge = [Math]::Max(1.0, $size / 64.0)
+    $path = Rounded-Path ($edge / 2) ($edge / 2) ($size - $edge) ($size - $edge) ($size * 0.22)
+    $fill = [System.Drawing.SolidBrush]::new($tile)
+    $g.FillPath($fill, $path)
+    $pen = [System.Drawing.Pen]::new($border, [float]$edge)
+    $g.DrawPath($pen, $path)
+    $fill.Dispose(); $pen.Dispose(); $path.Dispose()
+
+    # The mark fills 72% of the tile.
+    $unit = $size * 0.72 / $units
     $c = $size / 2.0
+    $r = $radius * $unit
+    $width = (Stroke-Units $size) * $unit
+    $gap = 1.8 * $width / 3.4
+    $left = $c - $offset * $unit
+    $right = $c + $offset * $unit
 
-    # The deep-space disc with a faint themed rim.
-    $inset = 6 * $s
-    $discBrush = [System.Drawing.SolidBrush]::new($bgPanel)
-    $g.FillEllipse($discBrush, $inset, $inset, $size - 2 * $inset, $size - 2 * $inset)
-    $rimWidth = [Math]::Max(1.0, 6 * $s)
-    $rimPen = [System.Drawing.Pen]::new($stroke, [float]$rimWidth)
-    $g.DrawEllipse($rimPen, $inset + $rimWidth / 2, $inset + $rimWidth / 2,
-        $size - 2 * $inset - $rimWidth, $size - 2 * $inset - $rimWidth)
+    $lightPen = [System.Drawing.Pen]::new($light, [float]$width)
+    $icePen = [System.Drawing.Pen]::new($ice, [float]$width)
+    $knockout = [System.Drawing.Pen]::new($tile, [float]($width + 2 * $gap))
 
-    # Two entangled orbits: the same ellipse rotated +32 / -32 degrees.
-    $orbitW = 176 * $s
-    $orbitH = 78 * $s
-    $penWidth = [Math]::Max(1.0, 11 * $s)
-    foreach ($orbit in @(@{Angle = -32; Color = $cyan }, @{Angle = 32; Color = $violet })) {
-        $state = $g.Save()
-        $g.TranslateTransform($c, $c)
-        $g.RotateTransform($orbit.Angle)
-        # A soft glow pass under the crisp stroke (small sizes skip it).
-        if ($size -ge 48) {
-            $glowColor = [System.Drawing.Color]::FromArgb(70, $orbit.Color)
-            $glow = [System.Drawing.Pen]::new($glowColor, [float]($penWidth * 2.4))
-            $g.DrawEllipse($glow, -$orbitW / 2, -$orbitH / 2, $orbitW, $orbitH)
-            $glow.Dispose()
-        }
-        $pen = [System.Drawing.Pen]::new($orbit.Color, [float]$penWidth)
-        $g.DrawEllipse($pen, -$orbitW / 2, -$orbitH / 2, $orbitW, $orbitH)
-        $pen.Dispose()
-        $g.Restore($state)
-    }
-
-    # One particle per orbit, sitting on the ellipse (parametric point at t,
-    # rotated with the orbit) — the "entangled pair".
-    foreach ($p in @(
-            @{Angle = -32; Color = $cyan;   T = 0.62 },
-            @{Angle = 32;  Color = $violet; T = 3.76 })) {
-        $x = ($orbitW / 2) * [Math]::Cos($p.T)
-        $y = ($orbitH / 2) * [Math]::Sin($p.T)
-        $a = $p.Angle * [Math]::PI / 180.0
-        $rx = $c + $x * [Math]::Cos($a) - $y * [Math]::Sin($a)
-        $ry = $c + $x * [Math]::Sin($a) + $y * [Math]::Cos($a)
-        $r = [Math]::Max(1.5, 13 * $s)
-        if ($size -ge 48) {
-            $halo = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(60, $p.Color))
-            $g.FillEllipse($halo, $rx - 1.8 * $r, $ry - 1.8 * $r, 3.6 * $r, 3.6 * $r)
-            $halo.Dispose()
-        }
-        $dot = [System.Drawing.SolidBrush]::new($p.Color)
-        $g.FillEllipse($dot, $rx - $r, $ry - $r, 2 * $r, 2 * $r)
-        $dot.Dispose()
-    }
+    # The light ring drawn last is on top at both crossings…
+    $g.DrawEllipse($icePen, [float]($right - $r), [float]($c - $r), [float](2 * $r), [float](2 * $r))
+    $g.DrawEllipse($lightPen, [float]($left - $r), [float]($c - $r), [float](2 * $r), [float](2 * $r))
+    # …then each crossing gets the ring that belongs on top there, over a
+    # knockout in the tile colour: left over at the top, right over at the
+    # bottom. That is what makes them linked.
+    $topStart = -$cross - $arcHalf
+    $g.DrawArc($knockout, [float]($left - $r), [float]($c - $r), [float](2 * $r), [float](2 * $r), [float]$topStart, [float](2 * $arcHalf))
+    $g.DrawArc($lightPen, [float]($left - $r), [float]($c - $r), [float](2 * $r), [float](2 * $r), [float]($topStart - $overlap), [float](2 * $arcHalf + 2 * $overlap))
+    $bottomStart = 180.0 - $cross - $arcHalf
+    $g.DrawArc($knockout, [float]($right - $r), [float]($c - $r), [float](2 * $r), [float](2 * $r), [float]$bottomStart, [float](2 * $arcHalf))
+    $g.DrawArc($icePen, [float]($right - $r), [float]($c - $r), [float](2 * $r), [float](2 * $r), [float]($bottomStart - $overlap), [float](2 * $arcHalf + 2 * $overlap))
+    $lightPen.Dispose(); $icePen.Dispose(); $knockout.Dispose()
 
     $g.Dispose()
     $ms = [System.IO.MemoryStream]::new()
@@ -92,9 +108,9 @@ function Render-Png([int]$size) {
 }
 
 # Pack the PNG frames into a .ico. PNG-compressed entries are valid for every
-# size on Windows Vista and later; Explorer, the taskbar and Inno Setup all
-# read this layout.
-$sizes = 256, 128, 64, 48, 32, 16
+# size on Windows Vista and later; Explorer, the taskbar, the resource compiler
+# and Inno Setup all read this layout.
+$sizes = 256, 128, 64, 48, 32, 24, 16
 $frames = foreach ($size in $sizes) { , (Render-Png $size) }
 
 $ms = [System.IO.MemoryStream]::new()
@@ -102,7 +118,7 @@ $w = [System.IO.BinaryWriter]::new($ms)
 $w.Write([uint16]0)               # reserved
 $w.Write([uint16]1)               # type: icon
 $w.Write([uint16]$sizes.Count)
-$offset = 6 + 16 * $sizes.Count
+$offsetBytes = 6 + 16 * $sizes.Count
 for ($i = 0; $i -lt $sizes.Count; $i++) {
     $size = $sizes[$i]
     $bytes = $frames[$i]
@@ -113,8 +129,8 @@ for ($i = 0; $i -lt $sizes.Count; $i++) {
     $w.Write([uint16]1)           # planes
     $w.Write([uint16]32)          # bpp
     $w.Write([uint32]$bytes.Length)
-    $w.Write([uint32]$offset)
-    $offset += $bytes.Length
+    $w.Write([uint32]$offsetBytes)
+    $offsetBytes += $bytes.Length
 }
 foreach ($bytes in $frames) { $w.Write($bytes) }
 $w.Flush()
