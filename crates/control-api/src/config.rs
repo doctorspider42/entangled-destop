@@ -35,7 +35,7 @@ pub const MAX_MEMORY_MIB: u64 = 65536;
 /// host.
 pub const MIN_DEFAULT_VCPUS: u32 = 2;
 
-/// Most vCPUs [`default_vcpus`] gives a new machine. Not a machine limit (the
+/// Most vCPUs [`default_vcpus`] gives a new Linux/Windows machine. Not a machine limit (the
 /// MP table and the MADT describe up to 254, and a profile may say up to 64):
 /// 8 is the largest count measured (ADR-0004, "installed profiles"): the
 /// installed GNOME desktop and a test kernel on WHP, with the same boot
@@ -64,17 +64,30 @@ pub fn default_vcpus(host_logical_cpus: usize) -> u32 {
     half.clamp(MIN_DEFAULT_VCPUS, MAX_DEFAULT_VCPUS)
 }
 
-/// [`default_vcpus`] for the host this process runs on
-/// (`std::thread::available_parallelism`, which honours a CPU affinity mask
-/// and, inside WSL, is the WSL VM's processor count).
+/// Default for this host. Apple Silicon uses all available cores (up to the
+/// profile limit): measured M3 Pro parallel throughput improves at 12 vs 6.
+/// Other hosts retain the measured half-host policy in [`default_vcpus`].
+/// `available_parallelism` honours affinity and the WSL VM's processor count.
 pub fn host_default_vcpus() -> u32 {
-    default_vcpus(std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get))
+    let count = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        u32::try_from(count).unwrap_or(64).clamp(1, 64)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        default_vcpus(count)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VmConfig {
     pub name: String,
+    /// Guest CPU architecture. Legacy profiles are x86-64; ARM images must
+    /// opt in explicitly so another host cannot try to execute them as x86.
+    #[serde(default, skip_serializing_if = "GuestArchitecture::is_x86")]
+    pub architecture: GuestArchitecture,
     pub memory_mib: u64,
     pub vcpus: u32,
     /// Which virtio transport the VM's devices sit on. Defaults to `mmio`, so
@@ -112,6 +125,20 @@ pub struct VmConfig {
     /// and an existing machine keeps exactly the hardware it had.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reclaim_memory: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuestArchitecture {
+    #[default]
+    X86_64,
+    Aarch64,
+}
+
+impl GuestArchitecture {
+    pub fn is_x86(&self) -> bool {
+        *self == Self::X86_64
+    }
 }
 
 /// `[[share]]` — a host directory the guest mounts with
@@ -1213,6 +1240,22 @@ impl VmConfig {
 mod tests {
     use super::*;
 
+    #[test]
+    fn architecture_is_explicit_for_arm_and_legacy_x86_serializes_without_a_new_key() {
+        let old = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
+        assert_eq!(old.architecture, GuestArchitecture::X86_64);
+        assert!(!toml::to_string(&old).unwrap().contains("architecture"));
+        let arm =
+            VmConfig::from_toml(&format!("architecture = \"aarch64\"\n{BACKLOG_EXAMPLE}")).unwrap();
+        assert_eq!(arm.architecture, GuestArchitecture::Aarch64);
+        assert!(toml::to_string(&arm)
+            .unwrap()
+            .contains("architecture = \"aarch64\""));
+        assert!(
+            VmConfig::from_toml(&format!("architecture = \"unknown\"\n{BACKLOG_EXAMPLE}")).is_err()
+        );
+    }
+
     /// The example from the backlog (EPIC 12) must parse as-is.
     const BACKLOG_EXAMPLE: &str = r#"
 name = "debian-demo"
@@ -1281,9 +1324,12 @@ scale = 1.0
         assert_eq!(default_vcpus(usize::MAX), MAX_DEFAULT_VCPUS);
         // Whatever this host is, the answer is one a profile may carry.
         let here = host_default_vcpus();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert!((1..=64).contains(&here));
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         assert!((MIN_DEFAULT_VCPUS..=MAX_DEFAULT_VCPUS).contains(&here));
         let mut cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).expect("parses");
-        cfg.vcpus = MAX_DEFAULT_VCPUS;
+        cfg.vcpus = here;
         cfg.validate().expect("the ceiling is a valid profile");
     }
 

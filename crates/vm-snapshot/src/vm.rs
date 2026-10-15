@@ -240,9 +240,20 @@ impl Restored {
 pub fn restore<M: GuestMemory>(path: &Path, mem: &M, shape: &MachineShape) -> Result<Restored> {
     let started = Instant::now();
     let file = std::fs::File::open(path).map_err(SnapshotError::io("opening the snapshot"))?;
-    let mut reader = SnapshotReader::open(file)?;
+    let reader = SnapshotReader::open(file)?;
     reader.require_native()?;
+    restore_contents(reader, mem, shape, started)
+}
 
+// The public entry point checks the native host before this byte-level
+// decoder can touch RAM. Tests can exercise the decoder with a theoretical
+// x86 machine on development hosts that cannot run that machine.
+fn restore_contents<M: GuestMemory>(
+    mut reader: SnapshotReader<std::fs::File>,
+    mem: &M,
+    shape: &MachineShape,
+    started: Instant,
+) -> Result<Restored> {
     reader.require_version(SectionKind::Metadata, 0, crate::meta::METADATA_VERSION)?;
     let metadata = Metadata::decode(&reader.read_section(SectionKind::Metadata, 0)?)?;
     metadata.shape.check(shape)?;
@@ -533,6 +544,24 @@ mod tests {
         .expect("save")
     }
 
+    fn restore_fixture(
+        path: &Path,
+        mem: &GuestMemoryMmap,
+        shape: &MachineShape,
+    ) -> Result<Restored> {
+        if HostKind::current().is_some() {
+            return restore(path, mem, shape);
+        }
+        let file = std::fs::File::open(path).map_err(SnapshotError::io("opening the snapshot"))?;
+        let reader = SnapshotReader::open(file)?;
+        assert_eq!(
+            reader.host(),
+            HostKind::KvmLinux,
+            "the theoretical fixture host"
+        );
+        restore_contents(reader, mem, shape, Instant::now())
+    }
+
     fn memory(bytes: usize) -> GuestMemoryMmap {
         GuestMemoryMmap::from_ranges(&[(GuestAddress(0), bytes)]).unwrap()
     }
@@ -552,7 +581,7 @@ mod tests {
         assert!(report.memory.saved_bytes <= 4096, "{:?}", report.memory);
 
         let target = memory(4 << 20);
-        let restored = restore(&path, &target, &shape()).expect("restore");
+        let restored = restore_fixture(&path, &target, &shape()).expect("restore");
         assert_eq!(restored.machine.virtio.len(), 1);
         assert_eq!(restored.cpus.len(), 1);
         assert_eq!(restored.cpus[0].registers.rip, 0xffff_ffff_8100_0000);
@@ -589,7 +618,7 @@ mod tests {
         // Same VM, same everything — except that something wrote to the disk.
         std::fs::write(&disk, vec![0u8; 8192]).unwrap();
         let target = memory(4 << 20);
-        let err = restore(&path, &target, &shape()).unwrap_err();
+        let err = restore_fixture(&path, &target, &shape()).unwrap_err();
         assert!(
             matches!(&err, SnapshotError::DiskChanged { what: "size", .. }),
             "{err}"
@@ -612,7 +641,7 @@ mod tests {
         let target = memory(4 << 20);
         let mut grown = shape();
         grown.vcpus = 2;
-        let err = restore(&path, &target, &grown).unwrap_err();
+        let err = restore_fixture(&path, &target, &grown).unwrap_err();
         assert!(
             matches!(&err, SnapshotError::Mismatch { field, .. } if field == "vcpus"),
             "{err}"
@@ -625,7 +654,7 @@ mod tests {
             device_type: 16,
             slot: 0,
         }];
-        let err = restore(&path, &target, &moved).unwrap_err();
+        let err = restore_fixture(&path, &target, &moved).unwrap_err();
         assert!(
             matches!(&err, SnapshotError::Mismatch { field, .. } if field == "device 0"),
             "{err}"
@@ -651,7 +680,7 @@ mod tests {
         std::fs::write(&old, &bytes).unwrap();
 
         let target = memory(4 << 20);
-        let err = restore(&old, &target, &shape()).unwrap_err();
+        let err = restore_fixture(&old, &target, &shape()).unwrap_err();
         match &err {
             SnapshotError::SectionVersion {
                 section,
@@ -689,7 +718,7 @@ mod tests {
         std::fs::write(&newer, &bytes).unwrap();
 
         let target = memory(4 << 20);
-        let err = restore(&newer, &target, &shape()).unwrap_err();
+        let err = restore_fixture(&newer, &target, &shape()).unwrap_err();
         assert!(
             matches!(&err, SnapshotError::SectionVersion { section, .. } if *section == "cpu"),
             "{err}"
@@ -736,8 +765,34 @@ mod tests {
             .iter()
             .any(|s| s.kind == SectionKind::Cpu && s.instance == 0));
         assert!(info.sections.iter().any(|s| s.kind == SectionKind::Memory));
-        assert!(info.restorable_here, "{:?}", info.refusal);
+        assert_eq!(
+            info.restorable_here,
+            HostKind::current().is_some(),
+            "{:?}",
+            info.refusal
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
+    #[test]
+    fn native_restore_on_a_development_host_refuses_before_writing_ram() {
+        let dir = temp_dir("unsupported-host");
+        let path = dir.join("vm.esnap");
+        let source = memory(4 << 20);
+        write_sample(&path, &source, Vec::new());
+        let target = memory(4 << 20);
+        target
+            .write_slice(b"untouched", GuestAddress(0x2000))
+            .unwrap();
+        assert!(matches!(
+            restore(&path, &target, &shape()),
+            Err(SnapshotError::ForeignHost { .. })
+        ));
+        let mut bytes = [0; 9];
+        target.read_slice(&mut bytes, GuestAddress(0x2000)).unwrap();
+        assert_eq!(&bytes, b"untouched");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

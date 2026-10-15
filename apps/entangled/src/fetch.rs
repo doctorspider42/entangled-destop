@@ -24,6 +24,35 @@ pub const BOOTSTRAP_TARGET: &str = "bootstrap-kernel";
 pub const VIRGL_TARGET: &str = "virglrenderer";
 
 pub fn run(args: &FetchArgs) -> Result<(), String> {
+    if args.distro.eq_ignore_ascii_case("ubuntu-cloud") {
+        if !matches!(args.arch.as_str(), "arm64" | "aarch64") {
+            return Err("Ubuntu cloud provisioning requires --arch arm64".into());
+        }
+        let dir = crate::paths::cache_root()?
+            .join("ubuntu-cloud")
+            .join(debian_media::UBUNTU_CLOUD_VERSION);
+        let image = debian_media::fetch_ubuntu_cloud_with(
+            &debian_media::UreqTransport::new(),
+            &dir,
+            FetchOptions {
+                refresh: args.refresh,
+                offline: args.offline,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        println!(
+            "Ubuntu cloud {} [{}]",
+            image.manifest.version,
+            image.status.as_str()
+        );
+        println!(
+            "  signature : OK — Ubuntu cloud key {}",
+            image.manifest.signed_by.as_deref().unwrap_or("unknown")
+        );
+        println!("  sha256    : {}", image.manifest.sha512_hex);
+        println!("  archive   : {}", image.path.display());
+        return Ok(());
+    }
     if args.distro.eq_ignore_ascii_case(BOOTSTRAP_TARGET)
         || args.distro.eq_ignore_ascii_case("bootstrap")
     {

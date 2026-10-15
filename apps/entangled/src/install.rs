@@ -402,6 +402,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     // 4. The installer VM: target disk as /dev/vda, network, window unless
     //    --headless (MVP-1004/1005/1006).
     let cfg = VmConfig {
+        architecture: Default::default(),
         name: format!("{vm_name}-install"),
         memory_mib: args.memory_mib,
         vcpus: 2,
@@ -464,6 +465,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
 
     // 6. Write the runnable profile (MVP-1009).
     let profile = VmConfig {
+        architecture: Default::default(),
         name: vm_name.clone(),
         // An explicit --memory-mib above the old fixed 2048 carries through,
         // as it does for Ubuntu and Fedora; below it (clap's 1536 included)

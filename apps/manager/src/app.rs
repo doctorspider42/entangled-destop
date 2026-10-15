@@ -815,8 +815,20 @@ impl ManagerApp {
         self.modal = Modal::Wizard(WizardState {
             machine: NewMachine {
                 name,
-                memory_mib: self.settings.default_memory_mib,
-                vcpus: self.settings.wizard_vcpus(),
+                memory_mib: if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    self.settings.default_memory_mib.max(4096)
+                } else {
+                    self.settings.default_memory_mib
+                },
+                vcpus: if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    self.settings.wizard_vcpus().clamp(
+                        1,
+                        std::thread::available_parallelism()
+                            .map_or(1, |count| count.get().min(64) as u32),
+                    )
+                } else {
+                    self.settings.wizard_vcpus()
+                },
                 // The host monitor's rate, as `entangled install` derives it
                 // (ADR-0004, the high-refresh amendment); a mock session is
                 // a 60 Hz host on every machine, like its 8 threads.
@@ -1521,6 +1533,9 @@ impl ManagerApp {
     /// only work for a VM *this* manager started: a control channel is a pipe
     /// to a child, and a VM someone launched from a terminal has none.
     fn toggle_pause(&mut self, name: &str) {
+        if self.reject_unsupported_cpu_control(name) {
+            return;
+        }
         let Some(task) = self.supervisor.active_task(name) else {
             self.toast(ToastLevel::Warn, format!("'{name}' is not running"));
             return;
@@ -1582,6 +1597,9 @@ impl ManagerApp {
     }
 
     fn reset(&mut self, name: &str) {
+        if self.reject_unsupported_cpu_control(name) {
+            return;
+        }
         let Some(task) = self.supervisor.active_task(name) else {
             self.toast(ToastLevel::Warn, format!("'{name}' is not running"));
             return;
@@ -1612,6 +1630,9 @@ impl ManagerApp {
     /// the engine's own reply line, read out of the log as it goes past, is
     /// what ends the wait.
     fn suspend(&mut self, name: &str) {
+        if self.reject_unsupported_cpu_control(name) {
+            return;
+        }
         let Some(task) = self.supervisor.active_task(name) else {
             self.toast(ToastLevel::Warn, format!("'{name}' is not running"));
             return;
@@ -1827,6 +1848,15 @@ impl ManagerApp {
         self.supervisor
             .active_task(name)
             .is_some_and(|task| task.has_control())
+    }
+
+    fn reject_unsupported_cpu_control(&mut self, name: &str) -> bool {
+        if let Some(reason) = self.backend_of(name).cpu_lifecycle_block() {
+            self.toast(ToastLevel::Warn, reason);
+            true
+        } else {
+            false
+        }
     }
 
     fn submit_wizard(&mut self) {

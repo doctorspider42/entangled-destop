@@ -13,7 +13,9 @@ use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::monitor::MonitorHandle;
-use winit::window::{Cursor, CursorGrabMode, CustomCursor, Fullscreen, Window, WindowId};
+#[cfg(any(target_os = "linux", windows))]
+use winit::window::CustomCursor;
+use winit::window::{Cursor, CursorGrabMode, Fullscreen, Window, WindowId};
 
 use crate::boost::{BoostGate, BoostPolicy};
 use crate::handle::{HostEvent, Waker};
@@ -872,7 +874,9 @@ impl App {
         let Some(window) = self.window.as_ref() else {
             return;
         };
-        let mode = if grabbed {
+        // AppKit cannot confine a pointer. Keeping its absolute motion is
+        // necessary for the guest tablet; locking it would freeze that input.
+        let mode = if grabbed && !cfg!(target_os = "macos") {
             CursorGrabMode::Confined
         } else {
             CursorGrabMode::None

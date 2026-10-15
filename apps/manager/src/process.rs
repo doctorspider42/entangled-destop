@@ -798,6 +798,125 @@ mod tests {
         dir
     }
 
+    /// Real engine acceptance, through the same supervisor/control pipe the UI uses.
+    /// Requires a signed engine and an exclusively owned, installed ARM64 profile.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "needs signed native engine and disposable Ubuntu ARM64 profile"]
+    fn native_arm64_engine_thumbnail_and_orderly_shutdown() {
+        let engine = PathBuf::from(
+            std::env::var_os("ENTANGLED_NATIVE_ACCEPTANCE_ENGINE").expect("engine path"),
+        );
+        let profile = PathBuf::from(
+            std::env::var_os("ENTANGLED_NATIVE_ACCEPTANCE_PROFILE").expect("owned profile path"),
+        );
+        assert!(engine.is_absolute() && profile.is_absolute());
+        let dir = temp_dir("native-arm64-engine");
+        let log_path = dir.join("native-run.log");
+        let snapshot = dir.join("native.esnap");
+        let thumbnail = control_api::control::thumbnail_path(&dir, "native");
+        let mut supervisor = Supervisor::new(no_waker());
+        let id = supervisor
+            .spawn(TaskSpec {
+                kind: TaskKind::Run,
+                vm: "native".into(),
+                program: engine,
+                args: vec![
+                    "run".into(),
+                    "--control-stdin".into(),
+                    "--snapshot".into(),
+                    snapshot.display().to_string(),
+                    profile.display().to_string(),
+                ],
+                cwd: dir.clone(),
+                log_path: log_path.clone(),
+                control: true,
+            })
+            .expect("native engine spawn");
+        let task = supervisor.task(id).expect("spawned task");
+        struct Cleanup<'a>(&'a Task);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                if self.0.is_active() {
+                    self.0.request_stop();
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while self.0.is_active() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    if self.0.is_active() {
+                        self.0.request_kill();
+                    }
+                }
+            }
+        }
+        let _cleanup = Cleanup(task);
+        let transcript =
+            || String::from_utf8_lossy(&std::fs::read(&log_path).unwrap_or_default()).into_owned();
+        wait_until(|| transcript().contains("login:"), "Ubuntu userspace");
+        wait_until(
+            || {
+                assert!(task.request_thumbnail(), "thumbnail control pipe");
+                std::thread::sleep(Duration::from_millis(100));
+                std::fs::read(&thumbnail).is_ok_and(|bytes| {
+                    let Ok(mut reader) = png::Decoder::new(std::io::Cursor::new(bytes)).read_info()
+                    else {
+                        return false;
+                    };
+                    let Some(size) = reader
+                        .output_buffer_size()
+                        .filter(|size| *size <= 1024 * 1024)
+                    else {
+                        return false;
+                    };
+                    let mut pixels = vec![0; size];
+                    let Ok(info) = reader.next_frame(&mut pixels) else {
+                        return false;
+                    };
+                    if info.color_type != png::ColorType::Rgba || info.width != 480 {
+                        return false;
+                    }
+                    // Ubuntu's default graphical wallpaper is predominantly
+                    // coloured; a boot console with a few status colours is not
+                    // evidence that the desktop has started.
+                    let pixels = &pixels[..info.buffer_size()];
+                    let coloured = pixels
+                        .chunks_exact(4)
+                        .filter(|pixel| {
+                            let rgb = &pixel[..3];
+                            rgb.iter().max().unwrap() - rgb.iter().min().unwrap() > 16
+                        })
+                        .count();
+                    coloured > pixels.len() / 8
+                })
+            },
+            "native desktop thumbnail",
+        );
+        assert!(!transcript().contains("error thumbnail"));
+        assert!(task.shutdown(), "manager shutdown control pipe");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while task.is_active() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let TaskState::Finished(outcome) = task.state() else {
+            panic!("native engine did not exit after guest power button");
+        };
+        assert!(outcome.success && !outcome.stopped_by_user, "{outcome:?}");
+        let output = transcript();
+        assert!(
+            output.contains("reboot: Power down"),
+            "guest did not power off"
+        );
+        assert!(
+            !output.contains("grace period"),
+            "forced cancellation is not orderly shutdown"
+        );
+        println!(
+            "NATIVE_MANAGER_ACCEPTANCE_OK thumbnail={} log={}",
+            thumbnail.display(),
+            log_path.display()
+        );
+    }
+
     #[cfg(unix)]
     fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -1080,8 +1199,13 @@ mod tests {
         let dir = temp_dir("proc-drain");
         let mut sup = Supervisor::new(no_waker());
         for i in 0..3 {
-            sup.spawn(spec(&dir, &format!("quick{i}"), "/bin/true", &[]))
-                .expect("spawn");
+            sup.spawn(spec(
+                &dir,
+                &format!("quick{i}"),
+                "/bin/sh",
+                &["-c", "exit 0"],
+            ))
+            .expect("spawn");
         }
         wait_until(|| !sup.any_active(), "all children to exit");
 

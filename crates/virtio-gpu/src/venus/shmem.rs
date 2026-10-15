@@ -2790,7 +2790,7 @@ mod tests {
         assert_eq!(
             RingPages::for_memory(0x4_0001, 4096, &budget).map(|_| ()),
             Err(ShmemError::TooLarge {
-                size: 0x4_1000,
+                size: 0x4_0000 + page_size() as u64,
                 max: 0x4_0000
             })
         );
@@ -2815,9 +2815,10 @@ mod tests {
     #[test]
     fn a_prefix_publication_is_whole_pages_inside_the_allocation() {
         let budget = PageBudget::new(1 << 20);
-        let pages = Arc::new(RingPages::for_memory(0x2000, 4096, &budget).expect("fits"));
+        let size = 2 * page_size() as u64;
+        let pages = Arc::new(RingPages::for_memory(size, 4096, &budget).expect("fits"));
         let window = Window::host_mapped();
-        for len in [0, 0x800, 0x2001, 0x3000] {
+        for len in [0, 0x800, size + 1, size + MIN_PAGE_BYTES as u64] {
             assert!(
                 matches!(
                     pages.publish_len(Arc::clone(&window) as Arc<dyn ShmBacking>, 0, len),
@@ -2992,9 +2993,10 @@ mod tests {
     #[test]
     fn private_rows_past_the_resource_are_refused_and_leave_out_untouched() {
         let budget = PageBudget::new(1 << 20);
-        let (pages, pattern) = private_pattern(0x2000, &budget);
+        let requested = 2 * page_size() as u64;
+        let (pages, pattern) = private_pattern(requested, &budget);
         let size = pages.import_pages().resource_len();
-        assert_eq!(size, 0x2000);
+        assert_eq!(size, requested);
         let sentinel = vec![0xee; 7];
         let mut out = sentinel.clone();
 

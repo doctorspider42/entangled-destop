@@ -485,6 +485,8 @@ fn action_strip(
                 // a child, so a VM launched from a terminal has
                 // none and the buttons say so rather than lying.
                 let controllable = app.has_control(&vm.name);
+                let cpu_block = app.backend_of(&vm.name).cpu_lifecycle_block();
+                let cpu_controllable = controllable && cpu_block.is_none();
                 // Shut down first: the clean way out, which the guest
                 // performs itself (its ACPI power button).
                 if ui::ghost_button(ui, "Shut down", controllable, theme::CYAN)
@@ -510,8 +512,10 @@ fn action_strip(
                 }
                 let paused = app.is_paused(&vm.name);
                 let label = if paused { "Resume" } else { "Pause" };
-                if ui::ghost_button(ui, label, controllable, theme::VIOLET)
-                    .on_hover_text(if !controllable {
+                if ui::ghost_button(ui, label, cpu_controllable, theme::VIOLET)
+                    .on_hover_text(if let Some(reason) = cpu_block {
+                        reason
+                    } else if !controllable {
                         "This VM was not started from here"
                     } else if paused {
                         "Let the machine continue exactly where it stopped"
@@ -522,8 +526,10 @@ fn action_strip(
                 {
                     actions.push(Action::TogglePause(vm.name.clone()));
                 }
-                if ui::ghost_button(ui, "Restart", controllable, theme::VIOLET)
-                    .on_hover_text(if controllable {
+                if ui::ghost_button(ui, "Restart", cpu_controllable, theme::VIOLET)
+                    .on_hover_text(if let Some(reason) = cpu_block {
+                        reason
+                    } else if controllable {
                         "Reboot the machine in place, as the guest's own Restart does"
                     } else {
                         "This VM was not started from here"
@@ -536,8 +542,10 @@ fn action_strip(
                 // Stop because that is the choice being made — this
                 // is the other way to stop a machine, and the one
                 // that keeps everything it was doing.
-                if ui::ghost_button(ui, "Suspend", controllable, theme::VIOLET)
-                    .on_hover_text(if controllable {
+                if ui::ghost_button(ui, "Suspend", cpu_controllable, theme::VIOLET)
+                    .on_hover_text(if let Some(reason) = cpu_block {
+                        reason
+                    } else if controllable {
                         "Write the whole machine to a file and stop it. Opening it \
                                  again puts you back exactly here. A machine with 2 GiB of \
                                  memory takes a few seconds; a desktop takes longer."

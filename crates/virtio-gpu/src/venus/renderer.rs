@@ -2758,14 +2758,14 @@ impl<F> VenusRenderer<F> {
                 actual: blob.size,
             });
         }
-        // A ring blob shows all of its pages; a memory blob shows the span
-        // the device reserved for it, which its pages may run past (they are
-        // rounded to the driver's import alignment) — a prefix of our own
-        // allocation, so still nothing but ours. A handle blob has no pages:
+        // Both ring and memory blobs show exactly the span the device reserved.
+        // Host allocations may be rounded to 16 KiB pages or a larger import
+        // alignment, while the guest can place adjacent 4 KiB blobs. Publishing
+        // the whole allocation would overlap a neighbor's reserved mapping.
+        // A prefix of our own allocation is still every byte ours. A handle blob has no pages:
         // device-local memory the guest can never map (stage S1).
         let published = match (blob.kind, &blob.backing) {
-            (BlobKind::Shm, ExportedMemory::Pages(pages)) => pages.publish(window, offset),
-            (BlobKind::Memory, ExportedMemory::Pages(pages)) => {
+            (BlobKind::Shm | BlobKind::Memory, ExportedMemory::Pages(pages)) => {
                 pages.publish_len(window, offset, blob.size)
             }
             _ => return Err(VenusError::HandleBlobNotMappable(resource_id)),
@@ -5271,6 +5271,26 @@ mod tests {
     }
 
     // ------------------------------------------------------------ hostile blobs
+
+    #[test]
+    fn adjacent_guest_pages_do_not_publish_the_host_allocation_padding() {
+        let (mut rig, _tap) = tap_rig();
+        let budget = crate::venus::shmem::PageBudget::new(32768);
+        for (id, offset) in [(42, 0x40000), (43, 0x41000)] {
+            rig.renderer
+                .create_blob(CTX, &blob_args(id, 4096), &rig.mem, &[])
+                .unwrap();
+            // Model a 16 KiB host page on every test host, including Linux.
+            // The guest reserved exactly 4 KiB for each neighboring blob.
+            let pages = Arc::new(RingPages::for_memory(4096, 16384, &budget).unwrap());
+            assert_eq!(pages.mapped_len(), 16384);
+            rig.renderer.blobs.get_mut(&id).unwrap().backing = ExportedMemory::Pages(pages);
+            rig.renderer.map_blob(id, offset, 4096).unwrap();
+            assert!(
+                matches!(rig.window.events().last(), Some(Event::Map { offset: at, len: 4096, .. }) if *at == offset)
+            );
+        }
+    }
 
     #[test]
     fn a_blob_cannot_be_mapped_twice_and_only_its_own_offset_unmaps_it() {

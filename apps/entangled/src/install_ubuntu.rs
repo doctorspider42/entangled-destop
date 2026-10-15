@@ -222,6 +222,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     // 6. The installer VM. Disk order is device order and the autoinstall file
     //    names /dev/vda, so the target must be first.
     let cfg = VmConfig {
+        architecture: Default::default(),
         name: format!("{vm_name}-install"),
         memory_mib: args.memory_mib.max(INSTALLER_MEMORY_MIB),
         vcpus: 2,
@@ -443,6 +444,7 @@ fn installed_profile(
         INSTALLED_MEMORY_MIB
     };
     VmConfig {
+        architecture: Default::default(),
         name: vm_name.to_string(),
         memory_mib: args.memory_mib.max(installed_memory),
         vcpus,

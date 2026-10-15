@@ -1,11 +1,11 @@
 # Entangled Desktop
 
-Run Linux in a window, on Linux or on Windows, with a virtual machine monitor
-written from scratch in Rust.
+Run Linux in a window, on Linux or Windows, with an experimental native Apple
+Silicon backend, using a virtual machine monitor written from scratch in Rust.
 
 Entangled Desktop is a VMM: it builds a virtual machine on the hypervisor your
 system already has — **KVM** on Linux, the **Windows Hypervisor Platform** on
-Windows — gives it disks, a network card and a virtual GPU, and puts its screen
+Windows, or **Hypervisor.framework** on macOS — gives it disks, a network card and a virtual GPU, and puts its screen
 in a window. It installs Debian, Ubuntu and Fedora for you, unattended, from
 media it has verified against pinned signing keys.
 
@@ -24,7 +24,7 @@ sources by a script in this repository.
 | | |
 |---|---|
 | Guests | Debian, Ubuntu Server, Ubuntu Desktop, Fedora Workstation — installed unattended from verified media |
-| Hosts | Linux with `/dev/kvm`; Windows with the Windows Hypervisor Platform, natively (not inside WSL) |
+| Hosts | Linux with `/dev/kvm`; native Windows/WHP; experimental Apple Silicon/macOS (limits below) |
 | Boot | UEFI with a persistent variable store, or a direct Linux kernel boot with no firmware |
 | Graphics | 2D scanout in a resizable window (1920×1080 is the tested target); a GPU desktop on either host — Vulkan, and OpenGL through Zink, on the host GPU (`[display] venus = true`, `install ubuntu --venus`); OpenGL through VirGL on a Linux host |
 | Devices | virtio-blk, -net, -gpu, -input (keyboard, pointer, gamepad), -snd over virtio-mmio or virtio-pci with MSI-X |
@@ -38,7 +38,7 @@ sources by a script in this repository.
   Windows guests do not work.
 - **Not a container runtime.** These are full VMs with their own kernel.
 - **Not a server product.** No daemon, no API, no clustering, no live migration.
-- **Not signed.** The Windows binaries are unsigned and no checksums are
+- **Windows releases are unsigned.** The Windows binaries are unsigned and no checksums are
   published; SmartScreen will warn, and it is right to.
 - The GPU desktop needs a host Vulkan driver and a guest set up for it (the
   installer does that), there is no USB or PCI passthrough, and anti-cheat
@@ -46,6 +46,24 @@ sources by a script in this repository.
   [user guide](docs/user-guide.md#limits-in-one-place).
 
 ## Install
+
+**macOS preview** — Apple Silicon and macOS 26 or later. The native app bundle
+includes its Vulkan runtime; no global Vulkan SDK installation is needed.
+The manager's Create machine wizard downloads verified Ubuntu ARM64 media and
+installs GNOME with hardware graphics automatically. The equivalent CLI command
+is `entangled install ubuntu --auto --disk ubuntu.raw --size 8G --memory-mib 4096`.
+The current backend supports SMP (1–64 vCPUs within the host hypervisor limit),
+user-mode networking and direct Linux boot. New machines use all available
+Apple Silicon cores by default; choose fewer in the wizard or with `--vcpus`. Vulkan 1.3 and Zink OpenGL 2.1 are verified on Apple M3 Pro; presentation
+currently copies pixels. Audio, pause, reset, suspend and ARM ISO/UEFI boot are
+not connected. Longer stability testing is still in progress.
+
+The local drag-to-Applications preview is signed with Developer ID; the current
+preview is not notarized. Packaging instructions are in
+[installer/macos/README.md](installer/macos/README.md), with implementation and
+acceptance evidence in [ADR-0007](docs/adr/0007-macos-arm64.md). This preview is
+not yet a published GitHub release. The remaining table and installation paths
+describe the Linux and Windows implementations.
 
 **Windows** — download `entangled-desktop-<version>-setup.exe` from
 [Releases](https://github.com/doctorspider42/entangled-destop/releases) and run

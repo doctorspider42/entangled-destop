@@ -9,6 +9,7 @@ mod artifact;
 /// trustworthy. Portable — the pin, the digest check and the cache layout are
 /// byte logic, and the host that most needs them is the one that cannot build
 /// them.
+#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
 mod bootstrap;
 mod disk;
 mod doctor;
@@ -16,6 +17,7 @@ mod fetch;
 /// The UEFI firmware every UEFI guest boots through: the five places it can
 /// come from, in order, and what to tell a user who has none. Portable for the
 /// same reason — the host that cannot build EDK2 is the one that needs this.
+#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
 mod firmware;
 /// `install` and `run` exist wherever a hypervisor backend does (KVM or WHP);
 /// any other OS still gets config validation and a typed refusal. The installer
@@ -25,14 +27,29 @@ mod firmware;
 mod install;
 #[cfg(any(target_os = "linux", windows))]
 mod install_fedora;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod install_macos;
 #[cfg(any(target_os = "linux", windows))]
 mod install_ubuntu;
+#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
 mod paths;
+#[cfg(any(
+    target_os = "linux",
+    windows,
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+mod run_options;
 #[cfg(any(target_os = "linux", windows))]
+mod run_vm;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "run_vm_macos.rs"]
 mod run_vm;
 #[cfg(any(target_os = "linux", windows))]
 mod seed;
+#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
 mod snapshot;
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), test))]
+mod ubuntu_arm64_image;
 // The renderer is a Linux `.so` that only the Linux engine can `dlopen`, so the
 // module that finds and fetches it is Linux-only too. `fetch virglrenderer` on
 // Windows says where the artifact belongs rather than downloading bytes that
@@ -89,7 +106,7 @@ pub const DEFAULT_NETWORK: &str = "usernet";
 #[command(
     name = "entangled",
     version = VERSION,
-    about = "Entangled Desktop — a small VMM for x86-64 hosts (Linux/KVM and Windows/WHP)"
+    about = "Entangled Desktop — a native VMM for Linux/KVM, Windows/WHP and macOS/Apple Silicon"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -233,10 +250,11 @@ pub struct FetchArgs {
     /// UEFI firmware every UEFI guest boots — 4 MiB, EDK2 CloudHvX64),
     /// "bootstrap-kernel" (the guest kernel and initramfs `install debian`
     /// runs on, ~13 MiB) or "virglrenderer" (the host 3D renderer that serves
-    /// Venus, Linux only). All but the first are checked against a SHA-256
-    /// pinned in this build.
+    /// Venus, Linux only), or "ubuntu-cloud" (signed Ubuntu ARM64 rootfs for
+    /// native provisioning; requires --arch arm64). Guest bootstrap/firmware
+    /// and renderer artifacts use a SHA-256 pinned in this build.
     ///
-    /// The three options below describe Debian media only; the firmware, the
+    /// Channel/variant describe Debian media; the firmware, the
     /// bootstrap artifacts and the renderer are one pinned release each, so
     /// there is nothing to choose.
     distro: String,
@@ -457,7 +475,15 @@ fn run(command: Command) -> Result<(), String> {
             {
                 install::run(&args)
             }
-            #[cfg(not(any(target_os = "linux", windows)))]
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                install_macos::run(&args)
+            }
+            #[cfg(not(any(
+                target_os = "linux",
+                windows,
+                all(target_os = "macos", target_arch = "aarch64")
+            )))]
             {
                 Err(format!(
                     "install {} needs a Linux host with KVM or a Windows host with the \
@@ -505,7 +531,11 @@ fn run(command: Command) -> Result<(), String> {
                 }
                 cfg.set_cdrom(iso).map_err(|e| e.to_string())?;
             }
-            #[cfg(any(target_os = "linux", windows))]
+            #[cfg(any(
+                target_os = "linux",
+                windows,
+                all(target_os = "macos", target_arch = "aarch64")
+            ))]
             {
                 let shot = screenshot_after.map(|secs| run_vm::ScreenshotRequest {
                     after: std::time::Duration::from_secs(secs),
@@ -528,7 +558,11 @@ fn run(command: Command) -> Result<(), String> {
                     },
                 )
             }
-            #[cfg(not(any(target_os = "linux", windows)))]
+            #[cfg(not(any(
+                target_os = "linux",
+                windows,
+                all(target_os = "macos", target_arch = "aarch64")
+            )))]
             {
                 let _ = (
                     headless,

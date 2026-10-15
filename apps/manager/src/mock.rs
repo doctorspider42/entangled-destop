@@ -325,7 +325,12 @@ mod tests {
 
         let healthy = &scan.snapshots[0];
         let verdict = crate::snapshots::verdict(healthy, backend, find("aurora-lab"));
-        assert!(verdict.resumable(), "{:?}", verdict.blocked);
+        assert_eq!(
+            verdict.resumable(),
+            crate::snapshots::host_of(backend).is_some(),
+            "{:?}",
+            verdict.blocked
+        );
         // The card only shows Suspended when the snapshot sits exactly where a
         // bare `save` would have written it.
         assert_eq!(

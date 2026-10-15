@@ -7,8 +7,10 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod load;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use load::{load, LoadedKernel};
 
 /// What to boot and how (resolved from the VM config by `control-api`).

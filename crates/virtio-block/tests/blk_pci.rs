@@ -1163,6 +1163,11 @@ fn discard_and_write_zeroes_round_trip_over_pci() {
     for piece in 0..8u64 {
         assert_eq!(h.write_sectors(piece * 128, &payload), S_OK);
     }
+    // APFS reports dirty write allocation before its speculative extents are
+    // committed. Hole punching can commit those extents, so compare stable
+    // allocation by flushing through the guest-visible device first.
+    let (status, _) = h.run_request(T_FLUSH, 0, &[], BUF_BASE + 0x800);
+    assert_eq!(status, S_OK);
     let before = disk_image::allocated_bytes(&h.path).expect("allocated size");
 
     // One discard of the whole 1 MiB, one write-zeroes with unmap, and a

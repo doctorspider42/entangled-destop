@@ -248,7 +248,7 @@ impl GuestFamily {
     /// default — that is the MVP's target and what every existing profile there
     /// was installed with.
     pub const fn default_for_host() -> Self {
-        if cfg!(windows) {
+        if cfg!(windows) || cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             Self::Ubuntu
         } else {
             Self::Debian
@@ -342,6 +342,10 @@ pub fn install_spec(
         "--name".to_string(),
         machine.name.clone(),
     ];
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) && runner.backend == Backend::Native
+    {
+        args.extend(["--vcpus".to_string(), machine.vcpus.to_string()]);
+    }
     // `--variant` names a Debian netboot flavour. The Ubuntu path takes an ISO
     // instead and ignores the flag entirely, so passing it would put a setting
     // on the reviewed command line that does nothing — worse than absent.
@@ -564,6 +568,16 @@ fn install_firmware_dir() -> Option<PathBuf> {
 /// blocking it on a missing one (which is what the wizard used to do) makes the
 /// only installer that works on Windows unreachable there.
 pub fn missing_install_artifact(cwd: &Path, family: GuestFamily) -> Option<String> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return match family {
+            GuestFamily::Ubuntu => None,
+            GuestFamily::Debian => Some("This Mac currently provisions Ubuntu ARM64; the Debian ARM64 installer is not connected yet.".into()),
+        };
+    }
+    missing_install_artifact_x86(cwd, family)
+}
+
+fn missing_install_artifact_x86(cwd: &Path, family: GuestFamily) -> Option<String> {
     match family {
         GuestFamily::Ubuntu => {
             if locate_firmware(cwd).is_some() {
@@ -746,9 +760,12 @@ mod tests {
         // Firmware present, kernel absent: Ubuntu can go, Debian cannot — and
         // the refusal is a command, not a dead end. That sentence is the whole
         // difference this feature makes on Windows.
-        assert_eq!(missing_install_artifact(&dir, GuestFamily::Ubuntu), None);
+        assert_eq!(
+            missing_install_artifact_x86(&dir, GuestFamily::Ubuntu),
+            None
+        );
         let debian =
-            missing_install_artifact(&dir, GuestFamily::Debian).expect("no bootstrap kernel");
+            missing_install_artifact_x86(&dir, GuestFamily::Debian).expect("no bootstrap kernel");
         assert!(debian.contains(BOOTSTRAP_KERNEL), "{debian}");
         assert!(
             debian.contains("entangled fetch bootstrap-kernel"),
@@ -759,15 +776,18 @@ mod tests {
         // panic, which is a worse failure than this message.
         std::fs::create_dir_all(dir.join("artifacts/bootstrap")).unwrap();
         std::fs::write(dir.join(BOOTSTRAP_KERNEL), b"fake kernel").unwrap();
-        assert!(missing_install_artifact(&dir, GuestFamily::Debian).is_some());
+        assert!(missing_install_artifact_x86(&dir, GuestFamily::Debian).is_some());
         std::fs::write(dir.join(BOOTSTRAP_INITRD), b"fake initrd").unwrap();
 
         // And the other way round. The refusal must name a way out a person in
         // front of *this* computer has: the firmware ships with the program and
         // is downloadable, so "go and get a Linux checkout" is not it.
         std::fs::remove_file(dir.join(UEFI_FIRMWARE)).unwrap();
-        assert_eq!(missing_install_artifact(&dir, GuestFamily::Debian), None);
-        let ubuntu = missing_install_artifact(&dir, GuestFamily::Ubuntu).expect("no firmware");
+        assert_eq!(
+            missing_install_artifact_x86(&dir, GuestFamily::Debian),
+            None
+        );
+        let ubuntu = missing_install_artifact_x86(&dir, GuestFamily::Ubuntu).expect("no firmware");
         assert!(ubuntu.contains(FIRMWARE_FILE), "{ubuntu}");
         assert!(
             ubuntu.contains("entangled fetch firmware"),
@@ -783,7 +803,10 @@ mod tests {
         let tag = cache.join("firmware/firmware-edk2-stable202602-1");
         std::fs::create_dir_all(&tag).unwrap();
         std::fs::write(tag.join(FIRMWARE_FILE), b"fetched firmware").unwrap();
-        assert_eq!(missing_install_artifact(&dir, GuestFamily::Ubuntu), None);
+        assert_eq!(
+            missing_install_artifact_x86(&dir, GuestFamily::Ubuntu),
+            None
+        );
         assert_eq!(
             locate_firmware(&dir).map(|(_, origin)| origin),
             Some(FirmwareOrigin::Cache)
@@ -802,12 +825,12 @@ mod tests {
         std::fs::create_dir_all(&tag).unwrap();
         std::fs::write(tag.join("vmlinuz"), b"fetched kernel").unwrap();
         assert!(
-            missing_install_artifact(&elsewhere, GuestFamily::Debian).is_some(),
+            missing_install_artifact_x86(&elsewhere, GuestFamily::Debian).is_some(),
             "half a cached pair is not a pair"
         );
         std::fs::write(tag.join("initrd.img"), b"fetched initrd").unwrap();
         assert_eq!(
-            missing_install_artifact(&elsewhere, GuestFamily::Debian),
+            missing_install_artifact_x86(&elsewhere, GuestFamily::Debian),
             None
         );
 
@@ -851,7 +874,11 @@ mod tests {
         let default = GuestFamily::default_for_host();
         assert_eq!(
             default.cli_name(),
-            if cfg!(windows) { "ubuntu" } else { "debian" }
+            if cfg!(windows) || cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                "ubuntu"
+            } else {
+                "debian"
+            }
         );
         let mut m = machine();
         m.family = default;
@@ -866,6 +893,11 @@ mod tests {
         assert!(
             line.contains(&format!("install {}", default.cli_name())),
             "{line}"
+        );
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert!(
+            line.contains("--vcpus 4"),
+            "wizard CPU choice was lost: {line}"
         );
     }
 

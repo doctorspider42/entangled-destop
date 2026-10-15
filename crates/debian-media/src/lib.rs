@@ -38,6 +38,7 @@ mod release;
 mod rfc3339;
 mod source;
 mod sums;
+mod ubuntu_cloud;
 
 pub use cache::{
     cache_root, manifest_path, partial_path, purge, MediaCache, MANIFEST_SUFFIX, PARTIAL_SUFFIX,
@@ -50,7 +51,7 @@ pub use fetch::{
 pub use http::{Download, Transport, TransportError, UreqTransport, MAX_CONTROL_FILE_LEN};
 pub use keyring::{
     verify_detached, Keyring, PinnedKey, VerifiedBy, DEBIAN_ARCHIVE, DEBIAN_ARCHIVE_FINGERPRINTS,
-    DEBIAN_CD, DEBIAN_CD_FINGERPRINTS,
+    DEBIAN_CD, DEBIAN_CD_FINGERPRINTS, UBUNTU_CLOUD, UBUNTU_CLOUD_FINGERPRINT,
 };
 pub use manifest::Manifest;
 pub use release::{Release, ReleaseError};
@@ -59,6 +60,10 @@ pub use source::{Arch, DebianStableSource, InstallerVariant, MediaKind, MediaSou
 pub use sums::{
     find_entry, find_plain_netinst_iso, parse_sums, parse_sums_with, version_from_iso_name,
     SumsEntry, SumsError,
+};
+pub use ubuntu_cloud::{
+    fetch_ubuntu_cloud_with, UbuntuCloudArtifact, UBUNTU_CLOUD_ARCHIVE, UBUNTU_CLOUD_DIRECTORY,
+    UBUNTU_CLOUD_VERSION,
 };
 
 /// Convenience entry point for `entangled fetch debian` (MVP-1201).

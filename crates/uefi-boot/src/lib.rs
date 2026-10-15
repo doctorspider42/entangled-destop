@@ -25,8 +25,10 @@ pub mod image;
 pub mod pvh;
 pub mod rom;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod load;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use load::{load_pvh, PvhBoot};
 
 pub use image::{FirmwareImage, FirmwareKind};

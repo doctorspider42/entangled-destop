@@ -344,7 +344,36 @@ fn existing_ancestor(dir: &Path) -> Option<std::path::PathBuf> {
     dir.ancestors().find(|p| p.is_dir()).map(Path::to_path_buf)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn run() -> Result<(), String> {
+    println!("entangled doctor");
+    println!("  architecture    : Apple Silicon / ARM64 guests");
+    let max = vmm_core::hvf::HvfVm::max_vcpu_count().map_err(|e| e.to_string())?;
+    println!("  max vCPUs       : {} (profile limit 64)", max);
+    println!("  default vCPUs   : {}", control_api::host_default_vcpus());
+    println!("  smp             : native GICv3 + PSCI CPU_ON/OFF");
+    let memory = vmm_core::GuestMem::from_ranges(&[(vm_memory::GuestAddress(0x4000_0000), 16384)])
+        .map_err(|e| e.to_string())?;
+    let verdict = vmm_core::hvf::HvfVm::new(memory)
+        .map(drop)
+        .map_err(|e| e.to_string());
+    match &verdict {
+        Ok(()) => println!("  Hypervisor      : ready (Hypervisor.framework)"),
+        Err(e) => println!("  Hypervisor      : unavailable — {e}; sign the engine with com.apple.security.hypervisor"),
+    }
+    for line in venus_lines(&venus_host(), false) {
+        println!("  3D              : {line}");
+    }
+    println!("  boot            : direct Linux ARM64 Image + initramfs, virtio-mmio");
+    println!("  install         : ubuntu --auto — verified ARM64 download + accelerated GNOME");
+    verdict
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    windows,
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
 pub fn run() -> Result<(), String> {
     Err(
         "entangled needs a Linux host with KVM or a Windows host with the Windows \
@@ -507,8 +536,8 @@ fn venus_lines(found: &Result<Vec<VenusDevice>, String>, windows: bool) -> Vec<S
                 "                              buffers stay in software",
             ],
             (false, _) => [
-                "shared scanout memory         none on Linux hosts yet (ADR-0004 S1):",
-                "                              clients run on the GPU, GNOME's scanout stays dumb",
+                "shared scanout memory         none on this host yet; presentation uses copies",
+                "                              GPU rendering and shared presentation are separate capabilities",
             ],
         };
         lines.extend(export.iter().map(|l| format!("{VENUS_SUB}  {l}")));
@@ -582,7 +611,7 @@ mod tests {
         );
         let linux = venus_lines(&Ok(vec![rtx(false)]), false).join("\n");
         assert!(!linux.contains("win32"), "{linux}");
-        assert!(linux.contains("none on Linux hosts yet"), "{linux}");
+        assert!(linux.contains("none on this host yet"), "{linux}");
     }
 
     /// A host that cannot says what `run` would refuse with, wrapped into the

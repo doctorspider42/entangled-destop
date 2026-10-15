@@ -384,7 +384,7 @@ fn the_extension_features_and_properties_are_answered_from_the_host() {
 }
 
 #[test]
-fn a_non_nvidia_host_is_not_shown_the_dma_buf_pair() {
+fn a_non_nvidia_host_keeps_dma_buf_hidden_but_serves_mesa_enumeration_fd() {
     let mut device = fake::zink_gpu("AMD Radeon");
     device.info.properties.properties.vendor_id = 0x1002;
     for link in &mut device.info.properties.p_next {
@@ -397,7 +397,9 @@ fn a_non_nvidia_host_is_not_shown_the_dma_buf_pair() {
     boot(&mut h);
     let names = extension_names(&mut h);
     assert!(names.iter().all(|n| n != policy::EXTERNAL_MEMORY_DMA_BUF));
-    assert!(names.iter().all(|n| n != policy::EXTERNAL_MEMORY_FD));
+    // Mesa 25.2 needs the renderer declaration to enumerate this device.
+    // Native dma-buf capabilities remain absent and its vendor stays unchanged.
+    assert!(names.iter().any(|n| n == policy::EXTERNAL_MEMORY_FD));
     assert!(names.iter().any(|n| n == policy::EXTERNAL_SEMAPHORE_FD));
     assert!(names.iter().any(|n| n == "VK_EXT_transform_feedback"));
     let Command::GetPhysicalDeviceProperties(p) = h.call(&properties(PHYSICAL)).unwrap() else {

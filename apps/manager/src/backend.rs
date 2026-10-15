@@ -51,6 +51,8 @@ impl Backend {
             Backend::Native => {
                 if cfg!(windows) {
                     "Windows (WHP)"
+                } else if cfg!(target_os = "macos") {
+                    "macOS (Apple Silicon)"
                 } else {
                     "Linux (KVM)"
                 }
@@ -67,6 +69,8 @@ impl Backend {
                     "Runs the machine on Windows itself, through the Windows Hypervisor \
                      Platform. Its window is an ordinary Windows window. No 3D acceleration \
                      and no TAP networking yet."
+                } else if cfg!(target_os = "macos") {
+                    "Runs Ubuntu ARM64 natively on this Mac, with accelerated graphics through Venus."
                 } else {
                     "Runs the machine on this Linux host through KVM. Everything Entangled \
                      can do is available here."
@@ -87,6 +91,15 @@ impl Backend {
         match self {
             Backend::Native => true,
             Backend::Wsl => cfg!(windows),
+        }
+    }
+
+    /// CPU state controls require backend-specific pause, reset and snapshot support.
+    pub const fn cpu_lifecycle_block(self) -> Option<&'static str> {
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) && matches!(self, Self::Native) {
+            Some("Pause, restart and suspend are not yet available on the native ARM64 backend.")
+        } else {
+            None
         }
     }
 
@@ -433,7 +446,7 @@ mod tests {
         }
 
         assert_eq!(Backend::Native.is_linux_kvm(), cfg!(target_os = "linux"));
-        if cfg!(windows) {
+        if !cfg!(target_os = "linux") {
             let reason = Backend::Native.virgl_block().expect("blocked on WHP");
             assert!(reason.short.contains("Linux/KVM"), "{}", reason.short);
             // …and it names the renderer that does work here.
@@ -445,7 +458,7 @@ mod tests {
             // The inline line must stay short enough to sit under a field.
             assert!(reason.short.len() < 90, "{}", reason.short);
             assert!(Backend::Native.tap_block().is_some());
-            assert!(Backend::Wsl.available_on_host());
+            assert_eq!(Backend::Wsl.available_on_host(), cfg!(windows));
         } else {
             assert!(Backend::Native.virgl_block().is_none());
             assert!(!Backend::Wsl.available_on_host());

@@ -1,11 +1,12 @@
 //! Core VMM building blocks: the hypervisor handle, guest memory and the VM
 //! lifecycle state machine.
 //!
-//! Two hypervisor backends live here, each behind a target gate, both speaking
+//! Hypervisor backends live here behind target gates, speaking
 //! the neutral types in [`hv`] (ADR-0002):
 //!
 //! * `cfg(target_os = "linux")` — KVM ([`Hypervisor`], [`Vm`], [`Vcpu`]).
 //! * `cfg(windows)` — Windows Hypervisor Platform ([`whp`]).
+//! * macOS/ARM64 — Hypervisor.framework (`hvf`) and [`hv::arm64`] contracts.
 //!
 //! Guest memory ([`GuestMem`]), the exit-handler seam ([`ExitHandler`]), the
 //! run outcome ([`RunOutcome`]), the state machine and the errors are portable
@@ -29,6 +30,9 @@ mod vm;
 
 #[cfg(windows)]
 pub mod whp;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod hvf;
 
 pub use error::VmmError;
 pub use hv::{

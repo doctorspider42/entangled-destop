@@ -13,7 +13,7 @@ virtio-core.workspace = true
 virtio-queue.workspace = true
 vm-memory.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc.workspace = true
 
 # DiscardVirtualMemory, for the pages the guest reports free.
