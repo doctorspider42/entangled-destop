@@ -70,8 +70,8 @@ pub struct Settings {
     pub default_memory_mib: u64,
     /// The wizard's vCPU default. `None` — what a settings file says by
     /// leaving the key out — is the CLI's own rule for an installed profile,
-    /// [`control_api::host_default_vcpus`] (half this host's logical CPUs, 2
-    /// to 8), so a machine made here gets the number `entangled install`
+    /// [`control_api::host_default_vcpus`] (all Apple Silicon cores; half the
+    /// logical CPUs, 2 to 8, on other hosts), so it agrees with `entangled install`
     /// would have chosen; [`Self::wizard_vcpus`] resolves it. A number is a
     /// fixed choice. See [`STALE_VCPUS_DEFAULT`] for why a `2` is not one.
     #[serde(default, skip_serializing_if = "Option::is_none")]

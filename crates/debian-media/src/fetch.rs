@@ -658,129 +658,140 @@ impl<S: MediaSource, T: Transport> Fetcher<S, T> {
         expected: &str,
         algo: DigestAlgo,
     ) -> Result<FetchStatus, MediaError> {
-        let partial = cache::partial_path(path);
-        let existing = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
-
-        let mut download = match self.begin(url, existing) {
-            Ok(d) => d,
-            // 416 means the partial is at least as long as the resource; start over.
-            Err(MediaError::Transport {
-                source: crate::http::TransportError::Status(416),
-                ..
-            }) if existing > 0 => {
-                tracing::debug!(url, "server rejected the range; restarting from scratch");
-                self.begin(url, 0)?
-            }
-            Err(e) => return Err(e),
-        };
-
-        // Guard against a partial longer than the whole resource.
-        if download.resumed {
-            if let Some(total) = download.total_len {
-                if existing > total {
-                    tracing::debug!(
-                        url,
-                        existing,
-                        total,
-                        "partial is longer than the resource; restarting"
-                    );
-                    download = self.begin(url, 0)?;
-                }
-            }
-        }
-
-        let resumed = download.resumed && existing > 0;
-        let mut hasher = algo.hasher();
-        let mut file = if resumed {
-            // SHA-2 state cannot be persisted between runs, so the bytes we
-            // already have on disk are re-read and re-hashed here.
-            let mut f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&partial)
-                .map_err(|e| MediaError::io(&partial, e))?;
-            hash_into(&mut f, &mut hasher, &partial)?;
-            f.seek(SeekFrom::Start(existing))
-                .map_err(|e| MediaError::io(&partial, e))?;
-            tracing::info!(url, offset = existing, "resuming download");
-            f
-        } else {
-            File::create(&partial).map_err(|e| MediaError::io(&partial, e))?
-        };
-
-        let mut written = if resumed { existing } else { 0 };
-        {
-            let mut writer = BufWriter::with_capacity(COPY_CHUNK, &mut file);
-            let mut buf = vec![0u8; COPY_CHUNK];
-            loop {
-                let n = download
-                    .body
-                    .read(&mut buf)
-                    .map_err(|e| MediaError::Transport {
-                        url: url.to_string(),
-                        source: e.into(),
-                    })?;
-                if n == 0 {
-                    break;
-                }
-                written += n as u64;
-                if written > MAX_ARTIFACT_LEN {
-                    return Err(MediaError::TooLarge {
-                        url: url.to_string(),
-                        limit: MAX_ARTIFACT_LEN,
-                    });
-                }
-                hasher.update(&buf[..n]);
-                writer
-                    .write_all(&buf[..n])
-                    .map_err(|e| MediaError::io(&partial, e))?;
-            }
-            writer.flush().map_err(|e| MediaError::io(&partial, e))?;
-        }
-        file.sync_all().map_err(|e| MediaError::io(&partial, e))?;
-        drop(file);
-
-        // A transfer that stopped short is not a corrupt artifact: keep the
-        // partial so the next run resumes it instead of purging and restarting.
-        if let Some(total) = download.total_len {
-            if written < total {
-                return Err(MediaError::Interrupted {
-                    url: url.to_string(),
-                    received: written,
-                    expected: total,
-                });
-            }
-        }
-
-        let actual = hasher.finish_hex();
-        if !digests_match(&actual, expected) {
-            return Err(MediaError::DigestMismatch {
-                url: url.to_string(),
-                algo: algo.as_str(),
-                expected: expected.to_string(),
-                actual,
-            });
-        }
-
-        std::fs::rename(&partial, path).map_err(|e| MediaError::io(path, e))?;
-        Ok(if resumed {
-            FetchStatus::Resumed
-        } else {
-            FetchStatus::Downloaded
-        })
+        download_verified(&self.transport, url, path, expected, algo)
     }
+}
 
-    fn begin(&self, url: &str, offset: u64) -> Result<crate::http::Download, MediaError> {
-        self.transport
+/// Shared bounded, resumable transfer. The caller authenticates `expected`
+/// first and removes failed artifacts when `invalidates_cache()` is true.
+pub(crate) fn download_verified(
+    transport: &dyn Transport,
+    url: &str,
+    path: &Path,
+    expected: &str,
+    algo: DigestAlgo,
+) -> Result<FetchStatus, MediaError> {
+    let begin = |offset| {
+        transport
             .get_range(url, offset)
             .map_err(|source| MediaError::Transport {
                 url: url.to_string(),
                 source,
             })
+    };
+    let partial = cache::partial_path(path);
+    let existing = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+
+    let mut download = match begin(existing) {
+        Ok(d) => d,
+        // 416 means the partial is at least as long as the resource; start over.
+        Err(MediaError::Transport {
+            source: crate::http::TransportError::Status(416),
+            ..
+        }) if existing > 0 => {
+            tracing::debug!(url, "server rejected the range; restarting from scratch");
+            begin(0)?
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Guard against a partial longer than the whole resource.
+    if download.resumed {
+        if let Some(total) = download.total_len {
+            if existing > total {
+                tracing::debug!(
+                    url,
+                    existing,
+                    total,
+                    "partial is longer than the resource; restarting"
+                );
+                download = begin(0)?;
+            }
+        }
     }
+
+    let resumed = download.resumed && existing > 0;
+    let mut hasher = algo.hasher();
+    let mut file = if resumed {
+        // SHA-2 state cannot be persisted between runs, so the bytes we
+        // already have on disk are re-read and re-hashed here.
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&partial)
+            .map_err(|e| MediaError::io(&partial, e))?;
+        hash_into(&mut f, &mut hasher, &partial)?;
+        f.seek(SeekFrom::Start(existing))
+            .map_err(|e| MediaError::io(&partial, e))?;
+        tracing::info!(url, offset = existing, "resuming download");
+        f
+    } else {
+        File::create(&partial).map_err(|e| MediaError::io(&partial, e))?
+    };
+
+    let mut written = if resumed { existing } else { 0 };
+    {
+        let mut writer = BufWriter::with_capacity(COPY_CHUNK, &mut file);
+        let mut buf = vec![0u8; COPY_CHUNK];
+        loop {
+            let n = download
+                .body
+                .read(&mut buf)
+                .map_err(|e| MediaError::Transport {
+                    url: url.to_string(),
+                    source: e.into(),
+                })?;
+            if n == 0 {
+                break;
+            }
+            written += n as u64;
+            if written > MAX_ARTIFACT_LEN {
+                return Err(MediaError::TooLarge {
+                    url: url.to_string(),
+                    limit: MAX_ARTIFACT_LEN,
+                });
+            }
+            hasher.update(&buf[..n]);
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| MediaError::io(&partial, e))?;
+        }
+        writer.flush().map_err(|e| MediaError::io(&partial, e))?;
+    }
+    file.sync_all().map_err(|e| MediaError::io(&partial, e))?;
+    drop(file);
+
+    // A transfer that stopped short is not a corrupt artifact: keep the
+    // partial so the next run resumes it instead of purging and restarting.
+    if let Some(total) = download.total_len {
+        if written < total {
+            return Err(MediaError::Interrupted {
+                url: url.to_string(),
+                received: written,
+                expected: total,
+            });
+        }
+    }
+
+    let actual = hasher.finish_hex();
+    if !digests_match(&actual, expected) {
+        return Err(MediaError::DigestMismatch {
+            url: url.to_string(),
+            algo: algo.as_str(),
+            expected: expected.to_string(),
+            actual,
+        });
+    }
+
+    std::fs::rename(&partial, path).map_err(|e| MediaError::io(path, e))?;
+    Ok(if resumed {
+        FetchStatus::Resumed
+    } else {
+        FetchStatus::Downloaded
+    })
 }
 
-fn hash_reader(
+pub(crate) fn hash_reader(
     reader: &mut impl Read,
     algo: DigestAlgo,
     path: &Path,

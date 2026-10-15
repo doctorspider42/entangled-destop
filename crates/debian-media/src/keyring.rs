@@ -148,6 +148,21 @@ pub static DEBIAN_ARCHIVE: Keyring = Keyring {
     loaded: OnceLock::new(),
 };
 
+/// Canonical's cloud-image signing key, independently pinned from
+/// https://ubuntu.com/docs/public-images/public-images-how-to/verify-image-checksum/
+/// This differs from the Ubuntu CD-image key used by the ISO installer.
+pub const UBUNTU_CLOUD_FINGERPRINT: &str = "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81";
+static UBUNTU_CLOUD_KEYS: &[PinnedKey] = &[PinnedKey {
+    fingerprint: Cow::Borrowed(UBUNTU_CLOUD_FINGERPRINT),
+    label: Cow::Borrowed("UEC Image Automatic Signing Key"),
+    armored: Cow::Borrowed(include_str!("../keys/ubuntu-cloud-1A5D6C4C7DB87C81.asc")),
+}];
+pub static UBUNTU_CLOUD: Keyring = Keyring {
+    name: "Ubuntu cloud images",
+    keys: Cow::Borrowed(UBUNTU_CLOUD_KEYS),
+    loaded: OnceLock::new(),
+};
+
 impl Keyring {
     /// Parses the pinned key files once and checks every fingerprint.
     fn certs(&self) -> Result<&[SignedPublicKey], MediaError> {

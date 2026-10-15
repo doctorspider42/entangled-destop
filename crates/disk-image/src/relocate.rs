@@ -4,7 +4,7 @@
 //! Why not `std::fs::copy` / `rename`: a rename cannot cross filesystems, and
 //! a naive copy reads a 24 GiB-apparent / 7 GiB-allocated image back to
 //! 24 GiB of real clusters at the destination. This module copies only the
-//! **allocated ranges** (SEEK_DATA/SEEK_HOLE on Linux,
+//! **allocated ranges** (SEEK_DATA/SEEK_HOLE on Linux and macOS,
 //! `FSCTL_QUERY_ALLOCATED_RANGES` on NTFS, a zero-skipping full scan
 //! elsewhere) into a destination pre-marked sparse, so holes stay holes.
 //!
@@ -443,7 +443,7 @@ fn rewrite_profile(
 /// The file's allocated (data) ranges as `(offset, len)`, sorted. Falls back
 /// to "the whole file is one range" wherever the filesystem cannot answer —
 /// the zero-skip in [`sparse_copy`] then keeps the destination sparse anyway.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn data_ranges(file: &File, len: u64) -> Vec<(u64, u64)> {
     use std::os::unix::io::AsRawFd as _;
     if len == 0 {
@@ -541,7 +541,7 @@ fn data_ranges(file: &File, len: u64) -> Vec<(u64, u64)> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn data_ranges(_file: &File, len: u64) -> Vec<(u64, u64)> {
     if len == 0 {
         Vec::new()

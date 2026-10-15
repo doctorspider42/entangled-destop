@@ -201,12 +201,16 @@ pub fn verdict(row: &SnapshotRow, backend: Backend, profile: Option<&VmEntry>) -
             }
             verdict.blocked.push(message);
         }
+    } else {
+        verdict.blocked.push(
+            "Saved sessions cannot be resumed on this platform yet. Start the machine fresh."
+                .into(),
+        );
     }
 
     match profile {
         None => verdict.notes.push(format!(
-            "There is no machine profile named '{}' any more. Resuming still works — the \
-             snapshot carries its own copy of it.",
+            "There is no machine profile named '{}' any more. The snapshot carries its own copy of it.",
             facts.vm_name
         )),
         Some(vm) => {
@@ -395,6 +399,21 @@ mod tests {
         assert!(verdict.notes.is_empty(), "{:?}", verdict.notes);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_macos_cannot_resume_an_x86_snapshot() {
+        for host in [HostKind::KvmLinux, HostKind::WhpWindows] {
+            let mut snapshot = facts();
+            snapshot.host = host;
+            let refusal = verdict(&row(Ok(snapshot)), Backend::Native, None);
+            assert!(!refusal.resumable());
+            assert!(refusal
+                .blocked
+                .iter()
+                .any(|reason| reason.contains("cannot be resumed")));
+        }
+    }
+
     /// `inspect`'s own `restorable_here` answers for the manager's process.
     /// The manager is not the process that restores anything — on Windows the
     /// machine may be set to run under WSL, where a Linux snapshot is right.
@@ -520,11 +539,11 @@ mod tests {
         std::fs::write(&disk, [0u8; 128]).expect("grow");
 
         let mut with_disk = facts();
-        // Whatever this host could restore, so the disk refusal is the *only*
-        // one and the test does not accidentally assert the host check.
-        with_disk.host = host_of(Backend::Native).unwrap_or(HostKind::KvmLinux);
+        // A theoretical KVM engine isolates the disk check from platform
+        // support; native macOS cannot restore these x86 snapshots.
+        with_disk.host = HostKind::KvmLinux;
         with_disk.files = vec![taken];
-        let verdict = verdict(&row(Ok(with_disk)), Backend::Native, None);
+        let verdict = verdict(&row(Ok(with_disk)), Backend::Wsl, None);
         assert_eq!(verdict.blocked.len(), 1, "{:?}", verdict.blocked);
         let message = verdict.blocked.first().expect("refused");
         assert!(message.contains("root.raw"), "{message}");

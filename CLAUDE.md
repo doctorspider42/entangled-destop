@@ -5,6 +5,9 @@ No QEMU. MVP goal: install and run Debian stable in a 1920×1080 window with
 2D graphics (`virtio-gpu`), input and networking. Product backlog (in Polish,
 treat as guidance, not contract): [vmhost-mvp-backlog.md](vmhost-mvp-backlog.md).
 Architecture decisions: [docs/adr/0001-mvp-architecture.md](docs/adr/0001-mvp-architecture.md),
+[docs/adr/0007-macos-arm64.md](docs/adr/0007-macos-arm64.md) (experimental
+Apple Silicon backend, native Metal presentation, Venus graphics and automatic
+verified Ubuntu ARM64 installation; extended stability is being verified),
 [docs/adr/0002-linux-first-whp-ready.md](docs/adr/0002-linux-first-whp-ready.md)
 (portability rules that keep the native Windows/WHP port cheap, plus its
 amendments recording what the port has actually delivered — read before adding
@@ -88,7 +91,8 @@ kernel and initramfs artifacts, and self-skips without them.
 
 | Crate | Owns | Backlog |
 |---|---|---|
-| `crates/vmm-core` | Hypervisor backends (KVM, WHP), guest memory, vCPU lifecycle, VM state machine, the neutral whole-CPU state a snapshot carries | EPIC 1/17 |
+| `crates/vmm-core` | Hypervisor backends (KVM, WHP, experimental HVF), guest memory, vCPU lifecycle, VM state machine, the neutral whole-CPU state a snapshot carries | EPIC 1/17 |
+| `crates/machine-arm64` | Experimental Apple Silicon guest platform: ARM Linux boot, device tree, PL011, PSCI and virtio-mmio bus | ADR-0007 |
 | `crates/vm-snapshot` | The snapshot container: versioned format, per-section digests, VM/disk fingerprints and every refusal a restore makes (ADR-0006) | — |
 | `crates/machine-x86` | x86-64 machine model: memory layout, E820, CPUID, GDT, ACPI/MP tables, PCI root bus, and the userspace 8259/8254/IOAPIC for hosts whose hypervisor has none | EPIC 1/2/17/19 |
 | `crates/linux-boot` | Direct bzImage+initramfs boot, boot_params, cmdline | EPIC 2 |

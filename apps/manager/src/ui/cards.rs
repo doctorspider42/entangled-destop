@@ -259,17 +259,25 @@ pub(crate) fn running_controls(
     actions: &mut Vec<Action>,
 ) {
     let controllable = app.has_control(&vm.name);
+    // Pausing needs the backend to freeze the processors; not every one can.
+    let cpu_block = app.backend_of(&vm.name).cpu_lifecycle_block();
     let paused = app.is_paused(&vm.name);
     let pause = |ui: &mut egui::Ui| {
-        ui::secondary_button(ui, if paused { "Continue" } else { "Pause" }, controllable)
-            .on_hover_text(if !controllable {
-                "This VM was not started from here"
-            } else if paused {
-                "Let the machine continue exactly where it stopped"
-            } else {
-                "Freeze the machine; nothing in it makes progress"
-            })
-            .clicked()
+        ui::secondary_button(
+            ui,
+            if paused { "Continue" } else { "Pause" },
+            controllable && cpu_block.is_none(),
+        )
+        .on_hover_text(if let Some(reason) = cpu_block {
+            reason
+        } else if !controllable {
+            "This VM was not started from here"
+        } else if paused {
+            "Let the machine continue exactly where it stopped"
+        } else {
+            "Freeze the machine; nothing in it makes progress"
+        })
+        .clicked()
     };
     let shut_down = |ui: &mut egui::Ui| {
         ui::secondary_button(ui, "Shut down", controllable)

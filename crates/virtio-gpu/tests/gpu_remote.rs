@@ -332,7 +332,9 @@ fn a_helper_that_cannot_start_fails_the_spawn() {
         command.args(["/c", "exit"]);
         command
     } else {
-        Command::new("/bin/true")
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        command
     };
     // Its stdout is the test harness's, and `cmd /c exit` says nothing — but
     // keep the child quiet either way so a failure here is readable.

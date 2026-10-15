@@ -65,6 +65,9 @@ vm-snapshot.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "25", default-features = false, features = ["metal"] }
+
 # The metrics sampler's four Windows syscalls (process times, working set,
 # system times, memory status). Same crate and license the WHP backend uses.
 [target.'cfg(windows)'.dependencies]

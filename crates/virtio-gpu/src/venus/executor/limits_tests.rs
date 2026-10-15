@@ -558,7 +558,19 @@ fn lost_at(
     host.lose_at(call);
     match run(&mut h) {
         Err(head) => assert_eq!(head, h.tail(), "{call}: answered, then fatal"),
-        Ok(_) => panic!("{call}: the context went on after a lost device"),
+        Ok(_) => {
+            // The pump publishes the answered prefix's head before FATAL.
+            // A reader may observe that reply between the two stores.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !h.fatal() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{call}: no fatal after device loss"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(h.head(), h.tail(), "{call}: answered, then fatal");
+        }
     }
     assert!(host.device_lost(lost_device), "{call} reached the host");
     assert!(h.fatal(), "{call}");

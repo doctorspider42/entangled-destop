@@ -373,8 +373,38 @@ fn punch_hole_impl(file: &File, offset: u64, len: u64) -> io::Result<PunchOutcom
     }
 }
 
-/// No `fallocate` outside Linux; the caller's zero-fill fallback covers it.
-#[cfg(all(unix, not(target_os = "linux")))]
+/// APFS hole punching retains the file length and makes the range read zero.
+#[cfg(target_os = "macos")]
+fn punch_hole_impl(file: &File, offset: u64, len: u64) -> io::Result<PunchOutcome> {
+    use std::os::unix::io::AsRawFd as _;
+    let (Ok(fp_offset), Ok(fp_length)) =
+        (libc::off_t::try_from(offset), libc::off_t::try_from(len))
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "punch range does not fit an off_t",
+        ));
+    };
+    let range = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset,
+        fp_length,
+    };
+    // SAFETY: fd belongs to the borrowed File; F_PUNCHHOLE reads this live,
+    // fully initialized structure and deallocates only its checked byte range.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &range) } == 0 {
+        return Ok(PunchOutcome::Deallocated);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL) => Ok(PunchOutcome::Unsupported),
+        _ => Err(error),
+    }
+}
+
+/// Other Unix hosts use the caller's zero-fill fallback.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn punch_hole_impl(_file: &File, _offset: u64, _len: u64) -> io::Result<PunchOutcome> {
     Ok(PunchOutcome::Unsupported)
 }

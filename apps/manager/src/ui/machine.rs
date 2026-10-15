@@ -229,19 +229,28 @@ fn more_menu(
         ui.set_min_width(220.0);
         if status == Status::Running {
             let controllable = app.has_control(&vm.name);
+            // Restart and Suspend need the backend's own CPU state handling,
+            // which the native ARM64 backend does not have yet.
+            let cpu_block = app.backend_of(&vm.name).cpu_lifecycle_block();
+            let cpu_controllable = controllable && cpu_block.is_none();
             if ui
-                .add_enabled(controllable, egui::Button::new("Restart"))
-                .on_hover_text("Reboot the machine in place, as the guest's own Restart does")
+                .add_enabled(cpu_controllable, egui::Button::new("Restart"))
+                .on_hover_text(
+                    cpu_block
+                        .unwrap_or("Reboot the machine in place, as the guest's own Restart does"),
+                )
+                .on_disabled_hover_text(cpu_block.unwrap_or("This VM was not started from here"))
                 .clicked()
             {
                 actions.push(Action::Reset(vm.name.clone()));
             }
             if ui
-                .add_enabled(controllable, egui::Button::new("Suspend"))
+                .add_enabled(cpu_controllable, egui::Button::new("Suspend"))
                 .on_hover_text(
                     "Write the whole machine to a file and stop it. Opening it again \
                      puts you back exactly here.",
                 )
+                .on_disabled_hover_text(cpu_block.unwrap_or("This VM was not started from here"))
                 .clicked()
             {
                 actions.push(Action::Suspend(vm.name.clone()));

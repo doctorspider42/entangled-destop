@@ -8,9 +8,9 @@
 //! kernel since 5.7) does: once free blocks of at least a page block (2 MiB)
 //! have stayed free a moment, the balloon driver posts them on the reporting
 //! queue, and the device discards them — `madvise(MADV_DONTNEED)` on Linux,
-//! `DiscardVirtualMemory` on Windows. The guest may use a reported page again
+//! `MADV_FREE` on macOS, `DiscardVirtualMemory` on Windows. The guest may use a reported page again
 //! at any time; it reads as zeros (Linux) or as whatever the page held
-//! (Windows, where discarded contents are undefined), and a free page's
+//! (macOS/Windows, where discarded contents are undefined), and a free page's
 //! contents are not the guest's concern.
 //!
 //! Nothing else of the balloon is used: the host never asks the guest to
@@ -37,7 +37,11 @@ use vm_memory::{GuestAddress, GuestMemory};
 /// `VIRTIO_BALLOON_F_REPORTING`: the free page reporting queue exists.
 pub const VIRTIO_BALLOON_F_REPORTING: u64 = 1 << 5;
 /// The host page size discards are aligned to.
-pub const PAGE: u64 = 4096;
+pub const PAGE: u64 = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    16384
+} else {
+    4096
+};
 /// Chains served per kick on any queue.
 pub const CHAINS_PER_NOTIFY: usize = 4 * MAX_QUEUE_SIZE as usize;
 
@@ -175,7 +179,7 @@ fn discard(mem: &GuestMem, addr: u64, len: u64) -> Option<u64> {
     // RAM region, so `ptr..ptr + bytes` lies inside that region's own host
     // mapping (anonymous `mmap` / `VirtualAlloc(MEM_COMMIT)`), page-aligned at
     // both ends. Discarding it only changes what the pages read as — zeros on
-    // Linux, undefined on Windows — never whether they are mapped, so every
+    // Linux, undefined on macOS/Windows — never whether they are mapped, so every
     // other holder of a pointer into the region stays valid. The guest
     // reported these pages free; their contents are nobody's.
     host::discard(ptr, bytes).then_some(end - start)
@@ -204,7 +208,18 @@ mod host {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+mod host {
+    /// Darwin's lazy discard leaves the mapping accessible; contents may
+    /// survive until reclaimed. Reported free pages permit either outcome.
+    pub fn discard(ptr: *mut u8, len: usize) -> bool {
+        // SAFETY: the caller supplies whole host pages within a checked
+        // private anonymous guest RAM mapping. MADV_FREE does not unmap them.
+        unsafe { libc::madvise(ptr.cast(), len, libc::MADV_FREE) == 0 }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod host {
     pub fn discard(_: *mut u8, _: usize) -> bool {
         false
@@ -302,9 +317,21 @@ mod tests {
         let mem = mem();
         mem.write_slice(&[0xab; 8192], GuestAddress(1 << 20))
             .unwrap();
+        let far_edge = GuestAddress((1 << 20) + 3 * PAGE);
+        mem.write_obj(0xcd_u8, far_edge).unwrap();
         // A range with ragged ends gives back only its whole pages.
         let freed = discard(&mem, (1 << 20) + 100, 3 * PAGE).unwrap();
         assert_eq!(freed, 2 * PAGE);
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(1 << 20)).unwrap(),
+            0xab,
+            "rounding must preserve the partial first page"
+        );
+        assert_eq!(
+            mem.read_obj::<u8>(far_edge).unwrap(),
+            0xcd,
+            "rounding must preserve the partial last page"
+        );
         if cfg!(target_os = "linux") {
             let mut page = [0u8; 4096];
             mem.read_slice(&mut page, GuestAddress((1 << 20) + PAGE))

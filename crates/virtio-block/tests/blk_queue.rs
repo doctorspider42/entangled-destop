@@ -1168,6 +1168,10 @@ fn discard_reclaims_host_space_and_the_range_reads_back_as_zeros() {
     // 8 MiB image, 4 MiB of real data in the middle of it.
     let mut h = Harness::with_sectors(true, 16 * 1024);
     fill(&mut h, 2048, 8192, 0x5a);
+    // Measure committed allocation: APFS can commit speculative extents
+    // during hole punching, so dirty-write st_blocks is not a stable baseline.
+    let (status, _) = h.run_request(T_FLUSH, 0, &[], BUF_BASE + 0x800);
+    assert_eq!(status, S_OK);
     let before = disk_image::allocated_bytes(&h.path).expect("host reports allocated size");
     assert!(
         before >= 4 << 20,

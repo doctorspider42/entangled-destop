@@ -16,6 +16,8 @@
 
 use thiserror::Error;
 
+pub mod arm64;
+
 /// Hardware shape of a VM, independent of what it boots and of which
 /// hypervisor runs it.
 #[derive(Debug, Clone, Copy)]
@@ -297,6 +299,7 @@ pub trait VcpuRegisters {
 ///
 /// Portable on purpose: both backends report the same fields through
 /// [`VcpuRegisters`], so the two run loops print the same line.
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn fault_site<V: VcpuRegisters + ?Sized>(vcpu: &V) -> String {
     match (vcpu.get_registers(), vcpu.get_special_registers()) {
         (Ok(regs), Ok(sregs)) => {

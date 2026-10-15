@@ -193,7 +193,7 @@ pub const VISIBLE_VRAM_HEAP_BYTES: u64 = 512 << 20;
 pub const VISIBLE_VRAM_FLAGS: u32 =
     MEMORY_PROPERTY_DEVICE_LOCAL | MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_COHERENT;
 
-/// The one memory type the guest is shown that the host does not have
+/// A mappable memory type the guest is shown that the host does not have
 /// (ADR-0004, the 2026-09-26 amendment on Firefox): `DEVICE_LOCAL |
 /// HOST_VISIBLE | HOST_COHERENT`, in a `DEVICE_LOCAL` heap of its own, both
 /// appended after the host's — **our pages**, imported as the host type
@@ -219,16 +219,48 @@ pub const VISIBLE_VRAM_FLAGS: u32 =
 /// still finds VRAM first for device-local and the host's own types first
 /// for host-visible. Vulkan's ordering rule holds: no earlier type's flags
 /// are a strict superset of these.
+///
+/// On a single-type unified-memory GPU this same alias instead keeps the
+/// host's existing heap and flags. Its original index is exposed as native
+/// device-only memory so optimal images have a non-imported allocation path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VisibleVram {
     /// The guest's index of the type: the host's type count.
     pub type_index: u32,
-    /// The guest's index of its heap: the host's heap count.
+    /// The guest heap: a synthetic heap for discrete GPUs, the same host
+    /// heap for the single-type unified-memory split.
     pub heap_index: u32,
-    /// The host type its pages are imported as: the first type the guest
-    /// sees as `HOST_VISIBLE | HOST_COHERENT` (one the host imports our
-    /// pages for).
+    /// The host type its pages are imported as. On a discrete GPU it is
+    /// the first coherent importable type; on a single-type unified GPU
+    /// it is the sole host type, exposed separately for native allocations.
     pub backing: u32,
+}
+
+/// A single-type unified-memory GPU (such as KosmicKrisp on Apple Silicon)
+/// needs two guest views of its one host type. Ordinary optimal images cannot
+/// necessarily import host pages, even though their native allocation is
+/// host-visible. Keep native image allocations at index 0, and append the
+/// mappable view for imported buffers. Both views use the same physical heap;
+/// no extra capacity or host memory capability is invented.
+#[must_use]
+fn split_single_unified_type(memory: &mut VkPhysicalDeviceMemoryProperties) -> Option<VisibleVram> {
+    if memory.memory_type_count != 1 {
+        return None;
+    }
+    let original = memory.memory_types[0].clone();
+    if original.property_flags & VISIBLE_VRAM_FLAGS != VISIBLE_VRAM_FLAGS
+        || original.heap_index >= memory.memory_heap_count
+    {
+        return None;
+    }
+    memory.memory_types[0].property_flags &= !MEMORY_PROPERTY_HOST_ANY;
+    memory.memory_types[1] = original.clone();
+    memory.memory_type_count = 2;
+    Some(VisibleVram {
+        type_index: 1,
+        heap_index: original.heap_index,
+        backing: 0,
+    })
 }
 
 impl VisibleVram {
@@ -640,6 +672,10 @@ pub const EXTERNAL_MEMORY_DMA_BUF: &str = "VK_EXT_external_memory_dma_buf";
 /// (`vn_device.c:318-330`), so a device create naming it must be accepted,
 /// and it is stripped before the host sees it. It chains no structure the
 /// guest sends, and its two commands are Mesa's own.
+/// Mesa 25.2 also requires this renderer-side extension just to enumerate a
+/// device, even without dma-buf WSI. It does not enable guest fd exports unless
+/// EXT_external_memory_dma_buf supplies a renderer handle type. Thus this
+/// compatibility declaration is independent of native dma-buf support.
 pub const EXTERNAL_MEMORY_FD: &str = "VK_KHR_external_memory_fd";
 
 /// `VK_EXT_queue_family_foreign` (stage S1): **passed through** from the
@@ -959,7 +995,7 @@ pub fn advertised_extensions_on(
         let Some(known) = EXTENSIONS.iter().find(|e| e.name == *name && e.decodable) else {
             continue;
         };
-        if !dma_buf && (*name == EXTERNAL_MEMORY_DMA_BUF || *name == EXTERNAL_MEMORY_FD) {
+        if !dma_buf && *name == EXTERNAL_MEMORY_DMA_BUF {
             continue;
         }
         if !gnome_on_gpu && *name == IMAGE_DRM_FORMAT_MODIFIER {
@@ -1126,9 +1162,9 @@ pub struct GuestDevice {
     /// The guest WSI path the identity and the extensions were shaped for
     /// (stage S5).
     pub wsi: GuestWsi,
-    /// The `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` type appended to
-    /// [`Self::memory`], if one was ([`visible_vram`]). The only guest type
-    /// index that is not also the host's.
+    /// A mappable device-local type appended to [`Self::memory`], if one
+    /// was: visible VRAM on discrete GPUs, or a second view of a unified
+    /// GPU's single host type. The only guest index that is not the host's.
     pub visible_vram: Option<VisibleVram>,
 }
 
@@ -1395,7 +1431,7 @@ pub fn expose(info: HostDeviceInfo) -> Result<GuestDevice, Hidden> {
     if !has_coherent_host_type(&memory) {
         return Err(Hidden::NoCoherentHostMemory);
     }
-    let visible_vram = visible_vram(&mut memory);
+    let visible_vram = split_single_unified_type(&mut memory).or_else(|| visible_vram(&mut memory));
     let mut properties = info.properties;
     properties.properties.api_version =
         cap_minor(properties.properties.api_version, MAX_API_VERSION);
@@ -1842,6 +1878,63 @@ mod tests {
     }
 
     #[test]
+    fn a_single_unified_type_can_back_native_images_and_imported_buffers() {
+        let mut host = memory(&[0xf]);
+        host.memory_heap_count = 1;
+        host.memory_heaps[0] = VkMemoryHeap {
+            size: 16 << 30,
+            flags: MEMORY_HEAP_DEVICE_LOCAL,
+        };
+        let mut memory = guest_memory(&host, 1);
+        let alias = split_single_unified_type(&mut memory).expect("unified alias");
+        assert_eq!(memory.memory_type_count, 2);
+        assert_eq!(memory.memory_heap_count, host.memory_heap_count);
+        assert_eq!(memory.memory_heaps, host.memory_heaps);
+        assert_eq!(
+            memory.memory_types[0].property_flags,
+            MEMORY_PROPERTY_DEVICE_LOCAL
+        );
+        assert_eq!(memory.memory_types[1], host.memory_types[0]);
+        let device = GuestDevice {
+            properties: VkPhysicalDeviceProperties2::default(),
+            features: VkPhysicalDeviceFeatures2::default(),
+            queue_families: Vec::new(),
+            memory,
+            host_memory: host,
+            extensions: Vec::new(),
+            importable: 1,
+            import_alignment: 16384,
+            memory_export: false,
+            wsi: GuestWsi::Software,
+            visible_vram: Some(alias),
+        };
+        assert_eq!(device.host_type(1), 0);
+        assert_eq!(device.host_visible_types(), 2);
+        assert_eq!(
+            super::super::memory::guest_type_bits(&device, false, 1),
+            1,
+            "an optimal image still has native device-local memory"
+        );
+        assert_eq!(
+            super::super::memory::guest_type_bits(&device, true, 1),
+            3,
+            "an importable buffer has both allocation strategies"
+        );
+        let mut unchanged = guest_memory(&device.host_memory, 0);
+        assert_eq!(
+            split_single_unified_type(&mut unchanged),
+            None,
+            "no mappable alias if the host cannot import our pages"
+        );
+        let mut existing = guest_memory(&self::memory(&[0x1, 0xf]), 2);
+        assert_eq!(
+            split_single_unified_type(&mut existing),
+            None,
+            "leave an existing native-only type alone"
+        );
+    }
+
+    #[test]
     fn the_visible_vram_type_is_its_backing_type_to_the_host() {
         let device = GuestDevice {
             properties: VkPhysicalDeviceProperties2::default(),
@@ -2209,7 +2302,10 @@ mod tests {
         assert!(has_extension(&unshared, TRANSFORM_FEEDBACK));
         assert!(has_extension(&unshared, EXTERNAL_SEMAPHORE_FD));
         assert!(!has_extension(&unshared, EXTERNAL_MEMORY_DMA_BUF));
-        assert!(!has_extension(&unshared, EXTERNAL_MEMORY_FD));
+        assert!(
+            has_extension(&unshared, EXTERNAL_MEMORY_FD),
+            "Mesa 25.2 requires the renderer-side declaration for enumeration"
+        );
         assert!(
             !has_extension(&unshared, IMAGE_DRM_FORMAT_MODIFIER),
             "stage S1 goes with the dma-buf pair"

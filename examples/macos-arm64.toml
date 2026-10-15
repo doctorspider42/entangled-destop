@@ -1,0 +1,32 @@
+# Native Apple Silicon / Hypervisor.framework, macOS 26+ for the Venus 4 KiB
+# mapping path. Supply an Ubuntu ARM64 Image, matching initrd and a raw rootfs.
+# The kernel may be gzip-compressed. This is direct boot, not x86 UEFI.
+#
+#   entangled run examples/macos-arm64.toml
+#
+# The engine needs com.apple.security.hypervisor and a Vulkan-on-Metal driver
+# with host-pointer import support. The developer acceptance uses KosmicKrisp.
+# SMP uses native GICv3 and PSCI; ARM snapshots/reset are still in development.
+name = "ubuntu-arm64"
+architecture = "aarch64"
+memory_mib = 4096
+vcpus = 12 # M3 Pro; reduce for hosts with fewer cores
+transport = "mmio"
+
+[boot]
+mode = "direct-linux"
+kernel = "artifacts/ubuntu-arm64/vmlinuz"
+initramfs = "artifacts/ubuntu-arm64/initrd.img"
+cmdline = "console=tty0 console=ttyAMA0 earlycon=pl011,0x9000000 root=/dev/vda rw rootwait net.ifnames=0"
+
+[[disk]]
+path = "ubuntu-arm64.img"
+writable = true
+
+[network]
+backend = "usernet"
+
+[display]
+width = 1600
+height = 900
+venus = true

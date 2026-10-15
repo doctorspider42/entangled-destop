@@ -42,6 +42,11 @@ arboard = { version = "3.6", default-features = false }
 [target.'cfg(windows)'.dependencies]
 ash.workspace = true
 
+# macOS presentation uses the native Metal backend, independent of the
+# Vulkan-to-Metal driver used by the guest's Venus renderer.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { workspace = true, features = ["metal"] }
+
 [dev-dependencies]
 tracing-subscriber.workspace = true
 

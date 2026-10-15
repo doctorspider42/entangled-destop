@@ -23,6 +23,7 @@ control-api = { workspace = true, features = ["engine-install", "host-display"] 
 debian-media.workspace = true
 disk-image.workspace = true
 vmm-core.workspace = true
+vm-memory.workspace = true
 # The snapshot container (ADR-0006): the format, the fingerprints, the refusals.
 vm-snapshot.workspace = true
 
@@ -30,6 +31,7 @@ vm-snapshot.workspace = true
 # are its machine, device and presentation crates, every one of which builds
 # natively on Windows too (ADR-0002).
 machine-x86.workspace = true
+machine-arm64.workspace = true
 linux-boot.workspace = true
 uefi-boot.workspace = true
 virtio-core.workspace = true
@@ -46,6 +48,7 @@ display.workspace = true
 # TOML for the profile it writes — are pure byte logic and are needed on both
 # hosts since `install` stopped being Linux-only (EPIC 17 phase 5).
 flate2.workspace = true
+ext4-view = { version = "0.9.3", features = ["std"] }
 toml.workspace = true
 # Deserializes the compiled-in guest-artifact pins (bootstrap.rs, firmware.rs) -
 # four fields and a list each, but they decide which kernel and which firmware a
@@ -60,6 +63,11 @@ serde_json.workspace = true
 # `SetConsoleCtrlHandler` below.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSProcessInfo", "NSString", "NSObject"] }
 
 # Ctrl+C handling for the run path (`SetConsoleCtrlHandler`); same crate and
 # license the WHP backend already uses.

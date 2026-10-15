@@ -1,0 +1,31 @@
+[package]
+name = "machine-arm64"
+description = "ARM64 machine: Device Tree, PL011, PSCI and direct Linux boot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+vm-memory.workspace = true
+vmm-core.workspace = true
+virtio-core.workspace = true
+vm-fdt = "0.3"
+flate2.workspace = true
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+linux-loader = { workspace = true, features = ["pe"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+ext4-view = { version = "0.9.3", features = ["std"] }
+virtio-block.workspace = true
+virtio-net.workspace = true
+virtio-gpu.workspace = true
+display.workspace = true
+tracing-subscriber.workspace = true
+virtio-9p.workspace = true

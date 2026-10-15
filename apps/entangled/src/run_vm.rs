@@ -30,6 +30,8 @@
 //! is what a pause freezes and a reset puts back. Only the two rows above
 //! differ per host.
 
+pub use crate::run_options::{RunOptions, ScreenshotRequest};
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1340,25 +1342,6 @@ impl Drop for LifecycleSupervisor {
     }
 }
 
-/// A debug screenshot: write the scanout as PNG `after` this much VM runtime,
-/// then refresh the same file every [`SCREENSHOT_REFRESH`] until the VM stops
-/// — so a slow graphical boot can be watched from outside by re-reading one
-/// path.
-///
-/// Best effort by design — the timer thread is detached, so a VM that stops
-/// before the first write simply never produces the file. It exists to give an
-/// unattended run (`--headless` on a CI box, a GNOME boot someone wants
-/// evidence of) an artifact without instrumenting the guest.
-#[derive(Debug, Clone)]
-pub struct ScreenshotRequest {
-    pub after: Duration,
-    pub path: PathBuf,
-    /// `--screenshot-every`: write every this often, each to its own
-    /// numbered file ([`burst_path`]), instead of refreshing `path` every
-    /// [`SCREENSHOT_REFRESH`].
-    pub burst: Option<Duration>,
-}
-
 /// The `n`th file of a screenshot burst: `<stem>-<n:04>.<ext>` beside `path`.
 fn burst_path(path: &std::path::Path, n: u32) -> PathBuf {
     let stem = path
@@ -1373,29 +1356,7 @@ fn burst_path(path: &std::path::Path, n: u32) -> PathBuf {
 /// How often the debug screenshot is refreshed after its first write.
 const SCREENSHOT_REFRESH: Duration = Duration::from_secs(20);
 
-/// Everything about *how* to run a VM that is not the VM itself.
-///
-/// A struct rather than five more parameters: the run path has grown a
-/// lifecycle control channel, a debug screenshot and now a snapshot on either
-/// end of it, and a call site that reads `run_with(cfg, false, None, None,
-/// false, None, None)` tells the reader nothing.
-#[derive(Debug, Default)]
-pub struct RunOptions {
-    /// No window; the VM still runs with an off-screen scanout.
-    pub headless: bool,
-    /// Read lifecycle commands from this process's stdin (ADR-0005).
-    pub control_stdin: bool,
-    pub screenshot: Option<ScreenshotRequest>,
-    /// Where `Ctrl+Alt+S` and a bare `save` write this VM (ADR-0006).
-    pub snapshot: Option<PathBuf>,
-    /// Start this VM **from** a snapshot instead of from its boot images.
-    ///
-    /// The machine is assembled exactly as it would be for a cold boot — same
-    /// memory size, same devices in the same order — and then, instead of
-    /// loading a kernel or a firmware, the snapshot is loaded over it.
-    pub restore: Option<PathBuf>,
-}
-
+/// Run a configured VM with the requested host controls and capture options.
 pub fn run(cfg: VmConfig, options: RunOptions) -> Result<(), String> {
     run_with(cfg, None, options).map(|_| ())
 }
@@ -1406,6 +1367,9 @@ pub fn run_with(
     automation: Option<Automation>,
     options: RunOptions,
 ) -> Result<RunReport, String> {
+    if !cfg.architecture.is_x86() {
+        return Err("this backend requires an x86_64 guest profile".into());
+    }
     let mut cfg = cfg;
     let RunOptions {
         headless,

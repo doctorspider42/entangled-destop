@@ -195,6 +195,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     // 6. The installer VM. Disk order is device order and the kickstart names
     //    /dev/vda, so the target must be first.
     let cfg = VmConfig {
+        architecture: Default::default(),
         name: format!("{vm_name}-install"),
         memory_mib: args.memory_mib.max(INSTALLER_MEMORY_MIB),
         vcpus: 2,
@@ -324,6 +325,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     //    the bootloader wrote into the NVRAM store, which is why `nvram` is the
     //    key that makes this profile work more than once.
     let profile = VmConfig {
+        architecture: Default::default(),
         name: vm_name.clone(),
         memory_mib: args.memory_mib.max(INSTALLED_MEMORY_MIB),
         vcpus: installed_vcpus_here(args),

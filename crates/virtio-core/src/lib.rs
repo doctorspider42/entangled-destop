@@ -37,6 +37,7 @@
 
 pub mod chain;
 pub mod device;
+pub mod host_wake;
 pub mod interrupt;
 pub mod mmio;
 pub mod msix;

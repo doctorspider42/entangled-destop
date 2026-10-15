@@ -33,6 +33,11 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
     let closed = match modal {
         Modal::None => false,
         Modal::Wizard(state) => {
+            // The native Apple Silicon backend installs one thing — Ubuntu
+            // ARM64 from a verified cloud image, unattended — so the wizard
+            // offers exactly that there.
+            let native_arm = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                && state.machine.backend == Backend::Native;
             let cli_label = engine
                 .as_ref()
                 .map(|engine| engine.path.display().to_string())
@@ -68,7 +73,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                 "Debian",
                                 "Verified network or official installer media",
                                 state.machine.family == launcher::GuestFamily::Debian,
-                                true,
+                                !native_arm,
                                 theme::ACCENT,
                             );
                             if debian.clicked() {
@@ -78,7 +83,11 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                 ui,
                                 card_width,
                                 "Ubuntu",
-                                "UEFI installer from cache or a local ISO",
+                                if native_arm {
+                                    "Verified ARM64 download with accelerated GNOME"
+                                } else {
+                                    "UEFI installer from cache or a local ISO"
+                                },
                                 state.machine.family == launcher::GuestFamily::Ubuntu,
                                 true,
                                 theme::ACCENT,
@@ -114,7 +123,16 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                 );
                             }
                             launcher::GuestFamily::Ubuntu => {
-                                if ui::path_row(
+                                if native_arm {
+                                    ui.label(
+                                        RichText::new(
+                                            "Ubuntu ARM64 is downloaded and verified for you. \
+                                             Installing needs internet access.",
+                                        )
+                                        .size(13.0)
+                                        .color(theme::TEXT_DIM),
+                                    );
+                                } else if ui::path_row(
                                     ui,
                                     "INSTALLER",
                                     "The Ubuntu disc image to install from. Leave it empty and \
@@ -236,7 +254,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                         }
                         if state.more {
                             ui.add_space(8.0);
-                            more_options(ui, state, settings, scan, actions);
+                            more_options(ui, state, settings, scan, native_arm, actions);
                         }
                     }
                     _ => {
@@ -297,8 +315,10 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                 if state.machine.family == launcher::GuestFamily::Ubuntu {
                                     summary_row(
                                         ui,
-                                        "ISO",
-                                        if state.machine.iso_path.trim().is_empty() {
+                                        if native_arm { "Ubuntu" } else { "ISO" },
+                                        if native_arm {
+                                            "Verified ARM64 cloud image; GNOME with hardware 3D"
+                                        } else if state.machine.iso_path.trim().is_empty() {
                                             "Newest verified cached Ubuntu ISO"
                                         } else {
                                             state.machine.iso_path.trim()
@@ -2525,6 +2545,7 @@ fn more_options(
     state: &mut crate::app::WizardState,
     settings: &crate::settings::Settings,
     scan: &crate::discovery::Scan,
+    native_arm: bool,
     actions: &mut Vec<Action>,
 ) {
     ui.label(ui::caption("Processor & memory"));
@@ -2540,7 +2561,8 @@ fn more_options(
             ui.add(
                 egui::Slider::new(
                     &mut state.machine.memory_mib,
-                    512..=control_api::MAX_MEMORY_MIB,
+                    // The ARM64 desktop image needs 4 GiB to boot GNOME.
+                    if native_arm { 4096 } else { 512 }..=control_api::MAX_MEMORY_MIB,
                 )
                 .step_by(256.0)
                 .suffix(" MiB"),
@@ -2554,17 +2576,25 @@ fn more_options(
          physically has only makes the guest slower.",
         |ui, field_w| {
             ui.spacing_mut().slider_width = field_w - 72.0;
-            ui.add(egui::Slider::new(&mut state.machine.vcpus, 1..=16).suffix(" vCPU"));
+            let maximum = if native_arm {
+                std::thread::available_parallelism().map_or(1, |count| count.get().min(64) as u32)
+            } else {
+                16
+            };
+            ui.add(egui::Slider::new(&mut state.machine.vcpus, 1..=maximum).suffix(" vCPU"));
         },
     );
     ui.add_space(12.0);
-    ui.checkbox(&mut state.machine.automated, "Install automatically")
-        .on_hover_text("Uses Entangled's maintained unattended profile");
-    ui.checkbox(
-        &mut state.machine.headless,
-        "Run installer without a window",
-    )
-    .on_hover_text("The serial console remains available in Activity");
+    if native_arm {
+        ui.label(ui::dim(
+            "Ubuntu is installed automatically, in the background.",
+        ));
+    } else {
+        ui.checkbox(&mut state.machine.automated, "Install automatically")
+            .on_hover_text("Answers the installer's questions for you");
+        ui.checkbox(&mut state.machine.headless, "Install in the background")
+            .on_hover_text("No installer window; follow it on the machine's page");
+    }
     ui.add_space(18.0);
     ui.label(ui::caption("Storage"));
     ui.add_space(8.0);
@@ -2590,7 +2620,7 @@ fn more_options(
             "Use an existing disk",
             "Keep the data already present in a library image",
             state.machine.disk_mode == launcher::DiskMode::UseExisting,
-            true,
+            !native_arm,
             theme::ACCENT,
         )
         .clicked()
