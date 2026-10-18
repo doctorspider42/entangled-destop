@@ -228,11 +228,12 @@ jobs:
           python -m pip install 'Pillow==11.3.0' 'ds_store==1.3.1' 'mac_alias==2.2.2'
       - name: Fetch verified Vulkan runtime
         run: python scripts/fetch-macos-sdk.py --output "$RUNNER_TEMP/vulkan-sdk"
-      - name: Lint, test and build native binaries
-        run: |
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo test --workspace --locked
-          cargo build --release -p entangled -p entangled-manager --locked
+      - name: Lint native workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test native workspace
+        run: cargo test --workspace --locked
+      - name: Build native release binaries
+        run: cargo build --release -p entangled -p entangled-manager --locked
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about
@@ -309,8 +310,9 @@ jobs:
           name: macos-installer
           path: dist-macos/
           if-no-files-found: error
-      - name: Save build cache before cleanup
-        if: success() && steps.rust-cache.outputs.cache-hit != 'true'
+      - name: Save reusable build work before cleanup
+        if: always() && steps.rust-cache.outputs.cache-primary-key != '' && steps.rust-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: |

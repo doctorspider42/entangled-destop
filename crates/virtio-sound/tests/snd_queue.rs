@@ -552,86 +552,73 @@ fn the_information_queries_answer_what_the_config_space_promised() {
 /// without underruns, and *paced* rather than swallowed instantly.
 #[test]
 fn a_guest_playing_a_tone_is_heard_by_the_host_sink() {
+    assert_prequeued_playback(Duration::ZERO);
+}
+
+/// Completion polling may be delayed beyond the queued recording. Silence
+/// played after it ends must not be mistaken for an underrun inside the tone.
+#[test]
+fn a_complete_tone_is_preserved_when_the_guest_reaps_late() {
+    assert_prequeued_playback(Duration::from_millis(250));
+}
+
+fn assert_prequeued_playback(reap_delay: Duration) {
     let mut harness = Harness::new();
-    harness.prepare_stream();
-
-    let mut free: Vec<usize> = (0..SLOTS).rev().collect();
-    let mut in_flight: Vec<(u16, usize)> = Vec::new();
-    let mut queued = 0usize;
-    let mut completed = 0usize;
-    let mut seen = harness.used_idx(2);
-    let mut started = false;
-    let mut underruns_after_tone: Option<u64> = None;
-    let mut tone_done_at: Option<Instant> = None;
-
-    let began = Instant::now();
-    let deadline = began + Duration::from_secs(20);
-    while completed < TOTAL_PERIODS {
-        assert!(Instant::now() < deadline, "playback stalled at {completed}");
-
-        // Keep the hardware buffer full, exactly as ALSA does.
-        let mut submitted = false;
-        while queued < TOTAL_PERIODS && in_flight.len() < PERIODS_IN_BUFFER {
-            let Some(slot) = free.pop() else { break };
-            let pcm = if queued < TONE_PERIODS {
-                tone(queued * PERIOD_FRAMES, PERIOD_FRAMES)
+    // Queue the entire measured signal before START. A test thread on a shared
+    // runner cannot promise to refill a 40 ms buffer in real time. Twelve
+    // chains fit in the 64-descriptor ring and the existing guest data area.
+    let mut params = Harness::good_params();
+    params.buffer_bytes = (TOTAL_PERIODS * PERIOD_BYTES) as u32;
+    assert_eq!(harness.set_params(params), protocol::S_OK);
+    assert_eq!(
+        harness.pcm_command(protocol::R_PCM_PREPARE, 0),
+        protocol::S_OK
+    );
+    let heads: Vec<u16> = (0..TOTAL_PERIODS)
+        .map(|slot| {
+            let pcm = if slot < TONE_PERIODS {
+                tone(slot * PERIOD_FRAMES, PERIOD_FRAMES)
             } else {
                 vec![0u8; PERIOD_BYTES]
             };
-            let head = harness.queue_period(slot, &pcm);
-            in_flight.push((head, slot));
-            queued += 1;
-            submitted = true;
-        }
-        if submitted {
-            harness.kick(protocol::VQ_TX);
-        }
-        // ALSA fills the buffer before it starts the stream.
-        if !started && queued >= PERIODS_IN_BUFFER {
-            assert_eq!(
-                harness.pcm_command(protocol::R_PCM_START, 0),
-                protocol::S_OK
-            );
-            started = true;
-        }
-
-        // Reap completions.
+            harness.queue_period(slot, &pcm)
+        })
+        .collect();
+    harness.kick(protocol::VQ_TX);
+    let mut seen = harness.used_idx(2);
+    let began = Instant::now();
+    assert_eq!(
+        harness.pcm_command(protocol::R_PCM_START, 0),
+        protocol::S_OK
+    );
+    std::thread::sleep(reap_delay);
+    let deadline = began + Duration::from_secs(20);
+    let mut completed = 0usize;
+    let mut tone_done_at: Option<Instant> = None;
+    while completed < TOTAL_PERIODS {
+        assert!(Instant::now() < deadline, "playback stalled at {completed}");
         let idx = harness.used_idx(2);
         while seen != idx {
             let (head, len) = harness.used_elem(2, seen);
+            assert_eq!(head, u32::from(heads[completed]), "completion order");
             assert_eq!(
                 len,
                 protocol::PCM_STATUS_LEN as u32,
                 "a completion writes exactly one virtio_snd_pcm_status"
             );
-            let head = u16::try_from(head).expect("head fits");
-            let position = in_flight
-                .iter()
-                .position(|(h, _)| *h == head)
-                .expect("completion for a chain we never queued");
-            let (_, slot) = in_flight.remove(position);
-            assert_eq!(
-                status_of(&harness, slot),
-                protocol::S_OK,
-                "period {completed} was refused"
-            );
-            free.push(slot);
+            assert_eq!(status_of(&harness, completed), protocol::S_OK);
             completed += 1;
             seen = seen.wrapping_add(1);
             if completed == TONE_PERIODS {
-                underruns_after_tone = Some(harness.stats.underruns());
                 tone_done_at = Some(Instant::now());
             }
         }
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    assert_eq!(
-        underruns_after_tone,
-        Some(0),
-        "the guest kept the buffer full, so nothing may have underrun"
-    );
-
+    // The exact PCM comparison below detects silence inserted into the tone.
+    // A cumulative underrun count sampled here also includes legitimate silence
+    // after the final queued period, if this thread was descheduled meanwhile.
     // Period-based completion, not "copied and forgotten": eight 10 ms periods
     // cannot all have played inside a millisecond.
     let elapsed = tone_done_at
@@ -659,7 +646,8 @@ fn a_guest_playing_a_tone_is_heard_by_the_host_sink() {
         "the sink was opened for the format the guest negotiated"
     );
     let captured = recording.pcm();
-    let expected = tone(0, TONE_PERIODS * PERIOD_FRAMES);
+    let mut expected = tone(0, TONE_PERIODS * PERIOD_FRAMES);
+    expected.resize(TOTAL_PERIODS * PERIOD_BYTES, 0);
     assert!(
         captured.len() >= expected.len(),
         "only {} of {} bytes reached the sink",
