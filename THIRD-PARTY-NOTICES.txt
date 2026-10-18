@@ -94,3 +94,23 @@ LICENCE
   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
   POSSIBILITY OF SUCH DAMAGE.
 
+
+
+-------------------------------------------------------------------------
+2. Vulkan Loader and Mesa KosmicKrisp - macOS bundled Vulkan runtime
+-------------------------------------------------------------------------
+
+The macOS application bundles libvulkan.1.dylib (Vulkan Loader) and
+libvulkan_kosmickrisp.dylib (Mesa's Vulkan-on-Metal driver). They are copied
+from the verified LunarG Vulkan SDK pinned in installer/macos/vulkan-sdk.json.
+No global Vulkan installation is performed.
+
+Upstream license texts and the SDK component registry are preserved in:
+  installer/macos/licenses/Vulkan-Loader-LICENSE.txt
+  installer/macos/licenses/Mesa-MIT.txt
+  installer/macos/licenses/Vulkan-SDK-license-registry.html
+
+The macOS release includes these files, the SDK URL/version/SHA-256 provenance,
+this notice, the project's LICENSE and a generated Rust dependency license
+report inside Contents/Resources/ThirdPartyNotices. The application bundle's
+build-provenance.json additionally records the hashes of its runtime inputs.

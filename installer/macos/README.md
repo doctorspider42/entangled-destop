@@ -74,3 +74,41 @@ Automatic verified Ubuntu ARM64 installation is implemented; lifecycle,
 long-run stability and fast image sharing still have the gaps recorded in
 ADR-0007. The signed installer does not imply those gaps
 are complete. No release is uploaded or published by these scripts.
+
+
+## Automatic GitHub releases
+
+`.github/workflows/release.yml` builds the macOS app on an ARM64 `macos-26`
+runner for every push to `main`. Its version comes from the same workflow run
+as the Linux engine and Windows installer. The pinned Vulkan SDK archive is
+checked against `vulkan-sdk.json` before its installer executes; only its core
+package is installed in a task-owned directory, without global system changes.
+
+The repository requires the same six encrypted Actions secrets as ZenX:
+
+- `APPLE_DEVELOPER_ID_P12_BASE64`: Developer ID Application certificate and
+  private key, encoded as a password-protected PKCS#12 file in base64.
+- `APPLE_DEVELOPER_ID_P12_PASSWORD`: that file's password.
+- `APPLE_TEAM_ID`: the Developer ID team's identifier.
+- `APPLE_API_KEY_P8_BASE64`: base64 App Store Connect API private key.
+- `APPLE_API_KEY_ID` and `APPLE_API_ISSUER_ID`: its key and issuer identifiers.
+
+The signing identity is imported into a temporary keychain. The private API
+key is written with mode 0600 and removed even after a failed step. Key material
+never enters the source tree, release assets, diagnostics or build cache.
+The runtime license texts, SDK provenance and generated Rust dependency report
+are bundled in the app. Build output is cached before task-owned files are
+removed.
+
+Publication waits for all platform jobs. Apple must return `Accepted`; the
+workflow then staples and validates the ticket, checks signatures, Gatekeeper
+and DMG integrity, and calculates SHA-256 **after** stapling. A failed, timed-out
+or missing notarization prevents publication of the whole release. The public
+assets are `Entangled-<version>-macos-arm64.dmg` and `SHA256SUMS-macos.txt`.
+The request/report is retained as a separate Actions diagnostic artifact.
+
+For credential rotation, update the six repository secrets using GitHub's
+Actions settings or `gh secret set`, passing secret values through stdin rather
+than command-line arguments. Existing ZenX repository secrets cannot be read
+back or copied through the GitHub API; configure Entangled from the original
+local certificate and API key instead.

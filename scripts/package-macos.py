@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Package already-built native ARM64 binaries for local macOS acceptance.
+"""Package and sign already-built native ARM64 binaries.
 
-No downloads, builds or system installation. Public release signing,
-notarization and the complete third-party notice audit remain separate gates.
+No downloads, builds or system installation. The release workflow supplies
+runtime/Rust license notices and notarizes the resulting DMG before publishing.
 """
 import argparse
 import hashlib

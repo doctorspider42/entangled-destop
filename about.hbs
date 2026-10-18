@@ -6,7 +6,7 @@
 <h2>Redistributed binaries that are not Rust crates</h2>
 <p>
   <code>cargo about</code> reads the Cargo dependency graph, so it cannot see
-  anything we ship that is not a crate. Today that is exactly one thing:
+  the non-crate binaries shipped by the platform installers:
 </p>
 <ul>
   <li>
@@ -20,6 +20,12 @@
     <code>THIRD-PARTY-NOTICES.txt</code> at the root of this repository, which
     the installer both shows on its licence page and lays down beside the
     binaries.
+  </li>
+  <li>
+    <b>Vulkan Loader and Mesa KosmicKrisp</b> — bundled in the macOS app.
+    The pinned LunarG Vulkan SDK, upstream license texts and component registry
+    are recorded under <code>installer/macos/</code>. The macOS package carries
+    these notices alongside this Rust dependency report.
   </li>
 </ul>
 <p>

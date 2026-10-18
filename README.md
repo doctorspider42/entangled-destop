@@ -58,12 +58,17 @@ Apple Silicon cores by default; choose fewer in the wizard or with `--vcpus`. Vu
 currently copies pixels. Audio, pause, reset, suspend and ARM ISO/UEFI boot are
 not connected. Longer stability testing is still in progress.
 
-The local drag-to-Applications preview is signed with Developer ID; the current
-preview is not notarized. Packaging instructions are in
+The drag-to-Applications DMG is published alongside the Windows installer and
+Linux engine in [Releases](https://github.com/doctorspider42/entangled-destop/releases).
+The release workflow builds a fresh ARM64 app with the same release version,
+signs the app and DMG with Developer ID, submits the DMG to Apple, staples the
+accepted notarization ticket and verifies Gatekeeper before publication.
+A SHA-256 file accompanies the DMG. Earlier manually attached preview assets
+may be signed without notarization; their release notes identify this.
+Packaging and signing configuration are in
 [installer/macos/README.md](installer/macos/README.md), with implementation and
-acceptance evidence in [ADR-0007](docs/adr/0007-macos-arm64.md). This preview is
-not yet a published GitHub release. The remaining table and installation paths
-describe the Linux and Windows implementations.
+acceptance evidence in [ADR-0007](docs/adr/0007-macos-arm64.md). The remaining
+table and installation paths describe the Linux and Windows implementations.
 
 **Windows** — download `entangled-desktop-<version>-setup.exe` from
 [Releases](https://github.com/doctorspider42/entangled-destop/releases) and run

@@ -1,9 +1,9 @@
 # cargo-about configuration for generating THIRD_PARTY_LICENSES (MVP-006).
 #
 # SCOPE: this reads the Cargo dependency graph, and therefore covers Rust
-# crates and nothing else. It cannot see the one non-crate binary we
-# redistribute — the EDK2 UEFI firmware (BSD-2-Clause-Patent) that ships inside
-# the Windows installer — so that attribution is carried by hand in
+# crates and nothing else. It cannot see the non-crate binaries we
+# redistribute — the Windows EDK2 firmware and macOS Vulkan runtime — so
+# their attribution is carried by hand in
 # THIRD-PARTY-NOTICES.txt and named in about.hbs, which puts it at the top of
 # the generated report. Anything else we ever ship that is not a crate belongs
 # in those two files as well; adding a licence id here would not do it.
