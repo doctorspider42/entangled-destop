@@ -11,11 +11,13 @@ Build release binaries outside the checkout using the dev-environment rules:
 MACOSX_DEPLOYMENT_TARGET=15.0 cargo build --release -p entangled -p entangled-manager --locked
 ```
 
-Render the procedural Entangled icon and installer art with Python/Pillow,
+Render the procedural Entangled icon and the Deep Field DMG background
+(800×520 pt at 2×, laid out around the icon positions in `make-macos-dmg.py`;
+`--version` is optional) with Python/Pillow,
 then convert the iconset with Apple's `iconutil`:
 
 ```sh
-python3 scripts/macos-installer-art.py /path/to/art
+python3 scripts/macos-installer-art.py /path/to/art --version 0.3.0
 iconutil -c icns /path/to/art/Entangled.iconset -o /path/to/art/Entangled.icns
 ```
 

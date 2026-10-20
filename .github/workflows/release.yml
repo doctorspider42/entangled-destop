@@ -257,7 +257,7 @@ jobs:
           identity=$(security find-identity -v -p codesigning |
             sed -nE "s/.*\"(Developer ID Application: .*\($APPLE_TEAM_ID\))\"/\1/p" | head -1)
           test -n "$identity"
-          python scripts/macos-installer-art.py "$RUNNER_TEMP/art"
+          python scripts/macos-installer-art.py "$RUNNER_TEMP/art" --version "$ENTANGLED_VERSION"
           iconutil -c icns "$RUNNER_TEMP/art/Entangled.iconset" -o "$RUNNER_TEMP/art/Entangled.icns"
           python scripts/package-macos.py --bin-dir "$CARGO_TARGET_DIR/release" \
             --sdk "$RUNNER_TEMP/vulkan-sdk/macOS" --notices "$RUNNER_TEMP/notices" \
