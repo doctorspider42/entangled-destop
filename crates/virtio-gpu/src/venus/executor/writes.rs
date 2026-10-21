@@ -209,6 +209,21 @@ pub struct Claimed {
 #[derive(Debug, Default)]
 pub struct Payloads {
     map: Mutex<HashMap<usize, Payload>>,
+    #[cfg(test)]
+    on_wait: WaitHook,
+}
+
+/// What a test runs at the moment a claim starts to wait (see
+/// [`Payloads::when_a_claim_waits`]).
+#[cfg(test)]
+#[derive(Default)]
+struct WaitHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for WaitHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WaitHook")
+    }
 }
 
 impl Payloads {
@@ -279,11 +294,41 @@ impl Payloads {
                     .collect()
             };
             claimed.waited = true;
+            #[cfg(test)]
+            self.run_wait_hook();
             for (progress, serial) in running {
                 if !progress.wait(serial, deadline) {
                     break;
                 }
             }
+        }
+    }
+
+    /// Run `release` once, on the claiming thread, the next time a claim
+    /// finds another owner's touch running and is about to wait for it. A
+    /// test that has to end that touch *while* the claim waits does it here
+    /// rather than from a thread that sleeps first: on a loaded machine such
+    /// a thread can wake after [`SHARED_WAIT`], and the claim then times out
+    /// instead of seeing the release.
+    #[cfg(test)]
+    pub fn when_a_claim_waits(&self, release: impl FnOnce() + Send + 'static) {
+        *self
+            .on_wait
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(release));
+    }
+
+    #[cfg(test)]
+    fn run_wait_hook(&self) {
+        let release = self
+            .on_wait
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(release) = release {
+            release();
         }
     }
 

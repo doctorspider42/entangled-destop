@@ -245,9 +245,9 @@ fn work_that_did_not_touch_the_buffer_is_not_waited_for() {
         h.renderer.factory().payloads().running(&p).is_empty(),
         "nothing on record"
     );
-    let start = Instant::now();
+    // Not waited for either: the device is still stuck, so a read that waited
+    // would have run into the bound and failed.
     assert_eq!(read(&mut h, r).expect("not held back"), texels(r));
-    assert!(start.elapsed() < SCANOUT_WAIT, "and not waited for");
     host.release_device(device);
 }
 
@@ -325,18 +325,21 @@ fn a_submission_on_a_shared_image_waits_for_another_contexts_running_one() {
     // The compositor samples the buffer, on a GPU that is busy.
     host.stick_device(compositor);
     zink_batch(&mut h, IMPORTER);
-    // Its own next batch on it does not wait for it.
-    let start = Instant::now();
+    // Its own next batch on it does not wait for it. (The counters say so,
+    // not a clock: a loaded machine can take longer than the bound over a
+    // submission that never waited at all.)
     zink_batch(&mut h, IMPORTER);
-    assert!(start.elapsed() < SHARED_WAIT, "its own work is its own");
-    assert_eq!(waits(&h, 2), SharedWaits::default());
+    assert_eq!(
+        waits(&h, 2),
+        SharedWaits::default(),
+        "its own work is its own"
+    );
 
     // The client, meanwhile, touches something else: no wait.
     h.use_context(CTX);
-    let start = Instant::now();
     h.submit_recording(&[begin(CB), end(CB)]);
     h.send(&queue_submit(QUEUE, &[CB], 0)).unwrap();
-    assert!(start.elapsed() < SHARED_WAIT);
+    assert_eq!(waits(&h, CTX), SharedWaits::default());
 
     // The client renders into the buffer again: held until the bound.
     let start = Instant::now();
@@ -356,21 +359,22 @@ fn a_submission_on_a_shared_image_waits_for_another_contexts_running_one() {
     h.use_context(2);
     zink_batch(&mut h, IMPORTER);
     h.use_context(CTX);
+    // The release happens at the moment the claim starts waiting, not after
+    // a sleep on another thread, which a loaded machine can wake past the
+    // bound.
     let released = Arc::new(AtomicBool::new(false));
-    let releaser = {
+    {
         let (host, released) = (Arc::clone(&host), Arc::clone(&released));
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
+        h.renderer.factory().payloads().when_a_claim_waits(move || {
             released.store(true, Ordering::SeqCst);
             host.release_device(compositor);
-        })
-    };
+        });
+    }
     zink_batch(&mut h, EXPORTER);
     assert!(
         released.load(Ordering::SeqCst),
         "it did not go ahead before the compositor's work finished"
     );
-    releaser.join().unwrap();
     assert_eq!(
         waits(&h, CTX),
         SharedWaits {
@@ -543,28 +547,25 @@ fn a_shared_present_lease_is_the_presenters_claim_until_it_is_dropped() {
         "one shared image per accepted layout, not one per flip"
     );
     let released = Arc::new(AtomicBool::new(false));
-    let dropper = {
+    {
         let released = Arc::clone(&released);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
+        h.renderer.factory().payloads().when_a_claim_waits(move || {
             released.store(true, Ordering::SeqCst);
             drop(lease);
-        })
-    };
-    let start = Instant::now();
+        });
+    }
     zink_batch(&mut h, EXPORTER);
     assert!(
         released.load(Ordering::SeqCst),
         "it went ahead under the lease"
     );
-    assert!(start.elapsed() < SHARED_WAIT, "and no later than the drop");
-    dropper.join().unwrap();
     assert_eq!(
         waits(&h, CTX),
         SharedWaits {
             waited: 2,
             timed_out: 1
-        }
+        },
+        "and no later than the drop: the wait ended with it, not the bound"
     );
     let _ = host;
 }
