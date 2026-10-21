@@ -1,11 +1,10 @@
-//! Startup update check against the GitHub Releases API.
+//! Background update checks against the GitHub Releases API.
 //!
 //! Rules of the house apply: the check runs on its own thread and reports
 //! through a channel plus the [`crate::process::Waker`] — the frame loop never
 //! blocks on the network. Every failure mode (offline, rate-limited, malformed
-//! answer) is logged via `tracing` and swallowed; an update check must never
-//! produce an error popup. The check is opt-out-able through
-//! `Settings::check_updates_on_startup`.
+//! answer) is returned to Settings without an error popup. The startup check
+//! is opt-out-able through `Settings::check_updates_on_startup`.
 //!
 //! Nothing in this module touches the network in tests: the HTTP fetch is a
 //! thin function and everything interesting (semver comparison, response
@@ -168,31 +167,38 @@ fn get_capped(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>, Str
     Ok(buf)
 }
 
-/// Spawns the startup check. Sends at most one [`UpdateInfo`] (only when a
-/// newer version exists) and wakes the UI; any failure is a debug-level log
-/// line and silence.
-pub fn spawn_check(current: Version, waker: Waker) -> mpsc::Receiver<UpdateInfo> {
+/// The result shown in Settings, also shared by the automatic startup check.
+#[derive(Debug, Default)]
+pub enum CheckStatus {
+    #[default]
+    Idle,
+    Checking,
+    Current,
+    Available(Version),
+    Failed(String),
+}
+
+pub type CheckResult = Result<Option<UpdateInfo>, String>;
+
+/// Spawns a check and reports every outcome, including an up-to-date build or
+/// a failure. A disconnected worker is handled by the receiver in the UI.
+pub fn spawn_check(current: Version, waker: Waker) -> mpsc::Receiver<CheckResult> {
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("update-check".to_string())
         .spawn(move || {
-            let json = match get_capped(&agent(), &latest_release_url(), MAX_API_BYTES) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    tracing::debug!(error = %e, "update check: cannot reach the releases API");
-                    return;
-                }
-            };
-            let json = String::from_utf8_lossy(&json).into_owned();
-            match parse_latest(&json, current) {
-                Ok(Some(info)) => {
-                    tracing::info!(version = %info.version, "update check: newer release found");
-                    if tx.send(info).is_ok() {
-                        waker();
-                    }
-                }
-                Ok(None) => tracing::debug!("update check: this build is current"),
-                Err(e) => tracing::debug!(error = %e, "update check: unusable API answer"),
+            let config = ureq::Agent::config_builder()
+                .user_agent(concat!("entangled-manager/", env!("ENTANGLED_VERSION")))
+                .timeout_global(Some(std::time::Duration::from_secs(30)))
+                .build();
+            let agent = ureq::Agent::new_with_config(config);
+            let result = get_capped(&agent, &latest_release_url(), MAX_API_BYTES)
+                .and_then(|bytes| parse_latest(&String::from_utf8_lossy(&bytes), current));
+            if let Err(error) = &result {
+                tracing::debug!(%error, "update check failed");
+            }
+            if tx.send(result).is_ok() {
+                waker();
             }
         });
     if let Err(e) = spawned {

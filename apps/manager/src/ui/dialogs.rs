@@ -26,6 +26,7 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
         supervisor,
         wsl_engine,
         wsl_install_running,
+        update_check_status,
         ..
     } = app;
     let wsl_install_running = *wsl_install_running;
@@ -179,7 +180,15 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             )
         }
         Modal::Settings(form) => frame(ctx, "settings", "Settings", 600.0, |ui| {
-            settings_body(ui, form, engine, wsl_engine, wsl_install_running, actions)
+            settings_body(
+                ui,
+                form,
+                engine,
+                wsl_engine,
+                wsl_install_running,
+                update_check_status,
+                actions,
+            )
         }),
         Modal::CreateDisk(state) => frame(ctx, "create-disk", "New disk", 470.0, |ui| {
             ui.label(ui::dim(
@@ -423,6 +432,7 @@ fn settings_body(
     engine: &Result<crate::launcher::Engine, String>,
     wsl_engine: &wslengine::Status,
     wsl_install_running: bool,
+    update_check_status: &crate::update::CheckStatus,
     actions: &mut Vec<Action>,
 ) {
     ui::form_scope(ui);
@@ -470,6 +480,34 @@ fn settings_body(
     .on_hover_text("Asks once when Entangled opens. Being offline is fine.");
     ui.checkbox(&mut form.animations_enabled, "Interface motion")
         .on_hover_text("Hover fades and the running pulse. Off saves a little power.");
+
+    ui.add_space(14.0);
+    ui.label(ui::faint(format!("Entangled Desktop {}", crate::VERSION)));
+    ui.horizontal_wrapped(|ui| {
+        let checking = matches!(update_check_status, crate::update::CheckStatus::Checking);
+        if ui::ghost_button(ui, "Check for updates", !checking, theme::TEXT).clicked() {
+            actions.push(Action::CheckForUpdates);
+        }
+        match update_check_status {
+            crate::update::CheckStatus::Idle => {}
+            crate::update::CheckStatus::Checking => {
+                ui.label(ui::dim("Checking for updates…"));
+            }
+            crate::update::CheckStatus::Current => {
+                ui.label(ui::dim("You're up to date."));
+            }
+            crate::update::CheckStatus::Available(version) => {
+                ui.label(ui::dim(format!("Version {version} is available.")));
+                if ui::text_button(ui, "View release", theme::ACCENT).clicked() {
+                    actions.push(Action::OpenReleasePage);
+                }
+            }
+            crate::update::CheckStatus::Failed(error) => {
+                ui.label(ui::dim("Couldn't check for updates. Try again."))
+                    .on_hover_text(error);
+            }
+        }
+    });
 
     ui.add_space(14.0);
     let advanced =

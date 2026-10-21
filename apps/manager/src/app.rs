@@ -370,6 +370,8 @@ pub enum Action {
     SelectLog(TaskId),
     ToggleLogPane,
     DismissToast(usize),
+    /// Check for a newer release now, independently of the startup preference.
+    CheckForUpdates,
     /// Download the new installer and launch it (Windows).
     InstallUpdate,
     /// Open the release page in the browser (hosts without the installer).
@@ -518,7 +520,8 @@ pub struct ManagerApp {
     pub update: Option<UpdateInfo>,
     /// True while the installer asset is being downloaded on its thread.
     pub update_downloading: bool,
-    update_check: Option<mpsc::Receiver<UpdateInfo>>,
+    pub update_check_status: update::CheckStatus,
+    update_check: Option<mpsc::Receiver<update::CheckResult>>,
     update_download: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     /// The one open file dialog, if any.
     picker: Option<picker::Pending>,
@@ -676,6 +679,11 @@ impl ManagerApp {
             console_input: String::new(),
             update: None,
             update_downloading: false,
+            update_check_status: if update_check.is_some() {
+                update::CheckStatus::Checking
+            } else {
+                update::CheckStatus::Idle
+            },
             update_check,
             update_download: None,
             picker: None,
@@ -1097,9 +1105,27 @@ impl ManagerApp {
     /// deliver at most one message.
     fn collect_update_events(&mut self) {
         if let Some(rx) = &self.update_check {
-            if let Ok(info) = rx.try_recv() {
-                self.update = Some(info);
+            let result = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("The update check stopped. Please try again.".into()))
+                }
+            };
+            if let Some(result) = result {
                 self.update_check = None;
+                self.update_check_status = match result {
+                    Ok(Some(info)) => {
+                        let version = info.version;
+                        self.update = Some(info);
+                        update::CheckStatus::Available(version)
+                    }
+                    Ok(None) => {
+                        self.update = None;
+                        update::CheckStatus::Current
+                    }
+                    Err(error) => update::CheckStatus::Failed(error),
+                };
             }
         }
         if let Some(rx) = &self.update_download {
@@ -1121,6 +1147,20 @@ impl ManagerApp {
                 }
             }
         }
+    }
+
+    fn check_for_updates(&mut self) {
+        if self.update_check.is_some() {
+            return;
+        }
+        let Some(current) = update::Version::parse(crate::VERSION) else {
+            self.update_check_status = update::CheckStatus::Failed(
+                "The installed version could not be identified.".into(),
+            );
+            return;
+        };
+        self.update_check_status = update::CheckStatus::Checking;
+        self.update_check = Some(update::spawn_check(current, Arc::clone(&self.waker)));
     }
 
     fn install_update(&mut self) {
@@ -3585,6 +3625,9 @@ impl ManagerApp {
                 self.doctor = Some(crate::hostcheck::mock_report());
                 self.view = View::Diagnostics;
             }
+            Action::CheckForUpdates => {
+                self.update_check_status = update::CheckStatus::Current;
+            }
             Action::RunDiagnostics => {
                 // A canned report rather than a real `doctor`: mock mode never
                 // probes the host, and a screenshot must show the same panel
@@ -3698,6 +3741,7 @@ impl ManagerApp {
                     self.toasts.remove(index);
                 }
             }
+            Action::CheckForUpdates => self.check_for_updates(),
             Action::InstallUpdate => self.install_update(),
             Action::OpenReleasePage => {
                 if let Some(info) = &self.update {
@@ -3705,10 +3749,9 @@ impl ManagerApp {
                 }
             }
             Action::DismissUpdate => {
-                // For this session only: the check runs once per startup, so
-                // the banner returns on the next launch while the version is
-                // still newer.
+                // For this session, until the next manual check or launch.
                 self.update = None;
+                self.update_check_status = update::CheckStatus::Idle;
             }
             Action::SwitchView(view) => {
                 // Health answers on arrival: a page that opens empty and asks
@@ -4040,6 +4083,74 @@ fn save_png(path: &std::path::Path, image: &egui::ColorImage) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_checks_report_completion_and_allow_retry_after_worker_failure() {
+        let mut app = ManagerApp::new(
+            &egui::Context::default(),
+            Startup {
+                vm_dir: None,
+                entangled: None,
+                screenshot: None,
+                screenshot_view: ScreenshotView::Settings,
+                mock: true,
+            },
+        );
+        let version = update::Version::parse("9.0.0").expect("version");
+        let info = UpdateInfo {
+            version,
+            installer_url: None,
+            installer_name: None,
+            page_url: "https://example.invalid/release".into(),
+        };
+        for result in [Ok(Some(info)), Err("offline".into()), Ok(None)] {
+            let (tx, rx) = mpsc::channel();
+            app.update_check = Some(rx);
+            app.update_check_status = update::CheckStatus::Checking;
+            app.collect_update_events();
+            assert!(matches!(
+                app.update_check_status,
+                update::CheckStatus::Checking
+            ));
+            tx.send(result.clone()).expect("send result");
+            app.collect_update_events();
+            assert!(app.update_check.is_none());
+            match result {
+                Ok(Some(info)) => {
+                    assert!(
+                        matches!(app.update_check_status, update::CheckStatus::Available(v) if v == version)
+                    );
+                    assert_eq!(app.update, Some(info));
+                }
+                Ok(None) => {
+                    assert!(matches!(
+                        app.update_check_status,
+                        update::CheckStatus::Current
+                    ));
+                    assert!(app.update.is_none());
+                }
+                Err(_) => {
+                    assert!(matches!(
+                        app.update_check_status,
+                        update::CheckStatus::Failed(_)
+                    ));
+                    assert!(
+                        app.update.is_some(),
+                        "a failed recheck keeps the known release"
+                    );
+                }
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        app.update_check = Some(rx);
+        drop(tx);
+        app.collect_update_events();
+        assert!(app.update_check.is_none());
+        assert!(matches!(
+            app.update_check_status,
+            update::CheckStatus::Failed(_)
+        ));
+    }
 
     #[test]
     fn toast_lifetimes_favour_errors() {
