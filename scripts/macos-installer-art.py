@@ -5,9 +5,6 @@ import math
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-CYAN = (53, 226, 240)
-VIOLET = (168, 107, 255)
-
 # Deep Field, as named in apps/manager/src/theme.rs: the DMG window is the
 # first screen of the product, so it wears the manager's colours, not its own.
 BG_DEEP = (0x0a, 0x0d, 0x12)
@@ -35,38 +32,68 @@ FONT = "/System/Library/Fonts/SFNS.ttf"
 MONO = "/System/Library/Fonts/SFNSMono.ttf"
 
 
-def orbit(draw, center, radius, tilt, color, width):
-    points = []
-    for i in range(181):
-        t = i * 2 * math.pi / 180
-        x, y = radius * math.cos(t), radius * .40 * math.sin(t)
-        points.append((center[0] + x * math.cos(tilt) - y * math.sin(tilt),
-                       center[1] + x * math.sin(tilt) + y * math.cos(tilt)))
-    draw.line(points, fill=color, width=width, joint="curve")
+# The mark, as apps/manager/src/logo.rs draws it: two rings that pass over and
+# under each other, designed on a 48-unit square. Keep the numbers in step.
+UNITS = 48.0
+RING_RADIUS = 12.0
+RING_OFFSET = 5.0
+RING_GAP = 1.8
+ARC_HALF = math.degrees(.35)
+ARC_OVERLAP = math.degrees(.07)
 
 
-def mark(size):
-    image = Image.new("RGBA", (size, size))
+def ring_stroke(size):
+    """Stroke in units for a mark `size` pixels wide: heavier as it shrinks."""
+    return 3.4 if size >= 96 else 3.8 if size >= 40 else 4.4 if size >= 24 else 5.0
+
+
+def linked_mark(draw, cx, cy, size, background, seen=None):
+    """Draws the mark `size` pixels wide centred on (cx, cy). The gap where one
+    ring passes over the other is painted in `background`. `seen` is the width
+    it ends up at after supersampling, which is what picks the stroke."""
+    unit = size / UNITS
+    r, width = RING_RADIUS * unit, ring_stroke(seen or size) * unit
+    gap = RING_GAP * width / 3.4
+    left, right = (cx - RING_OFFSET * unit, cy), (cx + RING_OFFSET * unit, cy)
+
+    def ring(c, color):
+        h = r + width / 2
+        draw.ellipse((c[0] - h, c[1] - h, c[0] + h, c[1] + h), outline=color,
+                     width=round(width))
+
+    def arc(c, around, half, w, color):
+        h = r + w / 2
+        draw.arc((c[0] - h, c[1] - h, c[0] + h, c[1] + h), around - half,
+                 around + half, fill=color, width=round(w))
+
+    ring(right, ACCENT)
+    ring(left, TEXT)
+    # The left ring is on top at the upper crossing, the right one at the lower.
+    a = math.degrees(math.atan2(math.sqrt(RING_RADIUS**2 - RING_OFFSET**2), RING_OFFSET))
+    for c, around, color in ((left, -a, TEXT), (right, 180 - a, ACCENT)):
+        arc(c, around, ARC_HALF, width + 2 * gap, background)
+        arc(c, around, ARC_HALF + ARC_OVERLAP, width, color)
+
+
+def app_icon(size):
+    """The macOS icon: the mark on a Deep Field tile, on Apple's grid (an 824
+    tile on a 1024 canvas, with the shadow the template draws under it)."""
+    k = SUPERSAMPLE
+    n = size * k
+    image = Image.new("RGBA", (n, n))
+    tile = (n * 100 / 1024, n * 100 / 1024, n * 924 / 1024, n * 924 / 1024)
+    radius = n * 185 / 1024
+    shadow = Image.new("RGBA", (n, n))
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (tile[0], tile[1] + n * 12 / 1024, tile[2], tile[3] + n * 12 / 1024),
+        radius=radius, fill=(0, 0, 0, 120))
+    image = Image.alpha_composite(image, shadow.filter(ImageFilter.GaussianBlur(n * 14 / 1024)))
     d = ImageDraw.Draw(image)
-    m = size * .06
-    d.rounded_rectangle((m, m, size-m, size-m), radius=size*.20,
-                        fill=(7, 11, 24), outline=(38, 50, 78), width=max(1, size//100))
-    glow = Image.new("RGBA", image.size)
-    g = ImageDraw.Draw(glow)
-    for tilt, color in ((.52, CYAN), (-.52, VIOLET)):
-        orbit(g, (size/2, size/2), size*.35, tilt, color+(130,), max(2, size//24))
-    image = Image.alpha_composite(image, glow.filter(ImageFilter.GaussianBlur(size*.026)))
-    d = ImageDraw.Draw(image)
-    for tilt, color, phase in ((.52, CYAN, .62), (-.52, VIOLET, 3.76)):
-        orbit(d, (size/2, size/2), size*.35, tilt, color, max(2, size//40))
-        x, y = size*.35*math.cos(phase), size*.14*math.sin(phase)
-        cx = size/2 + x*math.cos(tilt)-y*math.sin(tilt)
-        cy = size/2 + x*math.sin(tilt)+y*math.cos(tilt)
-        r = size*.036
-        d.ellipse((cx-r, cy-r, cx+r, cy+r), fill=color)
-    c, r = size/2, size*.036
-    d.polygon(((c,c-r),(c+r,c),(c,c+r),(c-r,c)), fill=(219,237,255))
-    return image
+    d.rounded_rectangle(tile, radius=radius, fill=CARD,
+                        outline=STROKE_STRONG, width=max(k, round(n * 5 / 1024)))
+    mark_size = (tile[2] - tile[0]) * .72
+    linked_mark(d, n / 2, n / 2, mark_size, CARD, seen=mark_size / k)
+    return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
 class Canvas:
@@ -94,11 +121,6 @@ class Canvas:
 
     def dot(self, x, y, r, color):
         self.d.ellipse(self.box(x - r, y - r, x + r, y + r), fill=color)
-
-    def ring(self, cx, cy, r, width, color):
-        h = width / 2
-        self.d.ellipse(self.box(cx - r - h, cy - r - h, cx + r + h, cy + r + h),
-                       outline=color, width=self.px(width))
 
     def card(self, x0, y0, x1, y1, radius, fill, outline=None):
         self.d.rounded_rectangle(self.box(x0, y0, x1, y1), radius=self.px(radius),
@@ -142,8 +164,7 @@ def background(version=None):
         c.dot(x, y, r, STAR)
 
     # The linked-pair mark and the product name.
-    c.ring(61, 57, 8.5, 1.8, ACCENT)
-    c.ring(69, 57, 8.5, 1.8, PRIMARY)
+    linked_mark(c.d, c.px(65), c.px(57), c.px(40), BG_DEEP, seen=40 * RETINA)
     c.text(94, 38, "Entangled Desktop", c.font(19, weight=b"Semibold"), TEXT)
     c.text(94, 63, "Linux machines on your Mac, with 3D graphics.", c.font(13), TEXT_DIM)
     mono = c.font(11, MONO, b"Medium")
@@ -185,12 +206,12 @@ def main():
     background(args.version).save(args.output/"background.png", dpi=(72*RETINA, 72*RETINA))
     iconset = args.output/"Entangled.iconset"
     iconset.mkdir(exist_ok=True)
-    master = mark(1024)
-    for size in (16,32,128,256,512):
-        for scale in (1,2):
-            name = f"icon_{size}x{size}" + ("@2x" if scale==2 else "") + ".png"
-            master.resize((size*scale,size*scale),Image.Resampling.LANCZOS).save(iconset/name)
-    master.save(args.output/"icon-preview.png")
+    # Each size is drawn for itself, so the ring stroke can thicken as it shrinks.
+    for size in (16, 32, 128, 256, 512):
+        for scale in (1, 2):
+            name = f"icon_{size}x{size}" + ("@2x" if scale == 2 else "") + ".png"
+            app_icon(size * scale).save(iconset/name)
+    app_icon(1024).save(args.output/"icon-preview.png")
 
 
 if __name__ == "__main__":
