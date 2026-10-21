@@ -716,6 +716,13 @@ impl ManagerApp {
 
         match startup.screenshot_view {
             ScreenshotView::Wizard => app.open_wizard(),
+            ScreenshotView::WizardMore => {
+                app.open_wizard();
+                if let Modal::Wizard(state) = &mut app.modal {
+                    state.step = 1;
+                    state.more = true;
+                }
+            }
             // The two WSL surfaces open the wizard and then *choose* the
             // backend the pre-flight refuses — `preferred_backend` would not,
             // which is the point of it.

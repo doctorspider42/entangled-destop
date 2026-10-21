@@ -47,321 +47,28 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 wizard_progress(ui, state.step);
                 ui.add_space(18.0);
 
-                match state.step {
-                    0 => {
-                        wizard_heading(
+                // The step body scrolls, the progress bar above and the
+                // buttons below stay put: "More options" alone is taller than a
+                // laptop screen, and an egui modal never grows a scroll bar of
+                // its own — it would just run off the bottom of the window.
+                let body_max = (ctx.screen_rect().height() - WIZARD_CHROME_H).max(160.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("wizard-body")
+                    .max_height(body_max)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        wizard_step(
                             ui,
-                            "Choose an operating system",
-                            "Everything the installer needs is downloaded and checked for you.",
-                        );
-                        ui.add_space(14.0);
-                        // An installer this backend cannot run is greyed out
-                        // with the reason on hover, rather than failing forty
-                        // minutes later inside the engine.
-                        ui.horizontal(|ui| {
-                            let card_width =
-                                (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
-                            // Debian is offered on both hosts now: its bootstrap
-                            // kernel is downloaded rather than built where it
-                            // cannot be built. Whether *this* machine has it yet
-                            // is a pre-flight question with a command as its
-                            // answer (launcher::missing_install_artifact), not a
-                            // backend capability, so nothing is greyed out here.
-                            let debian = option_card(
-                                ui,
-                                card_width,
-                                "Debian",
-                                "Verified network or official installer media",
-                                state.machine.family == launcher::GuestFamily::Debian,
-                                !native_arm,
-                                theme::ACCENT,
-                            );
-                            if debian.clicked() {
-                                state.machine.family = launcher::GuestFamily::Debian;
-                            }
-                            if option_card(
-                                ui,
-                                card_width,
-                                "Ubuntu",
-                                if native_arm {
-                                    "Verified ARM64 download with accelerated GNOME"
-                                } else {
-                                    "UEFI installer from cache or a local ISO"
-                                },
-                                state.machine.family == launcher::GuestFamily::Ubuntu,
-                                true,
-                                theme::ACCENT,
-                            )
-                            .clicked()
-                            {
-                                state.machine.family = launcher::GuestFamily::Ubuntu;
-                            }
-                        });
-                        ui.add_space(16.0);
-                        match state.machine.family {
-                            launcher::GuestFamily::Debian => {
-                                ui::form_row(
-                                    ui,
-                                    "INSTALLER",
-                                    "Which Debian installer runs: the fast keyboard-driven one, \
-                                     the graphical one, or the official netinst disc image, \
-                                     downloaded and signature-checked for you.",
-                                    |ui, field_w| {
-                                        egui::ComboBox::from_id_salt("variant")
-                                            .selected_text(variant_label(&state.machine.variant))
-                                            .width(ui::combo_width(field_w))
-                                            .show_ui(ui, |ui| {
-                                                for variant in VARIANTS {
-                                                    ui.selectable_value(
-                                                        &mut state.machine.variant,
-                                                        variant.to_string(),
-                                                        variant_label(variant),
-                                                    );
-                                                }
-                                            });
-                                    },
-                                );
-                            }
-                            launcher::GuestFamily::Ubuntu => {
-                                if native_arm {
-                                    ui.label(
-                                        RichText::new(
-                                            "Ubuntu ARM64 is downloaded and verified for you. \
-                                             Installing needs internet access.",
-                                        )
-                                        .size(13.0)
-                                        .color(theme::TEXT_DIM),
-                                    );
-                                } else if ui::path_row(
-                                    ui,
-                                    "INSTALLER",
-                                    "The Ubuntu disc image to install from. Leave it empty and \
-                                     Entangled uses the newest one it has already downloaded and \
-                                     signature-checked.",
-                                    &mut state.machine.iso_path,
-                                    "newest verified download",
-                                    true,
-                                ) {
-                                    actions.push(Action::PickPath(PickTarget::WizardIso));
-                                }
-                            }
-                        }
-                        ui.add_space(16.0);
-                        backend_row(ui, &mut state.machine.backend, wsl_engine);
-                        if state.machine.backend == Backend::Wsl {
-                            wsl_setup_note(
-                                ui,
-                                wsl_engine,
-                                wsl_install_running,
-                                ui::FORM_LABEL_W,
-                                actions,
-                            );
-                        }
-                    }
-                    1 => {
-                        wizard_heading(
-                            ui,
-                            "Name it and size it",
-                            "You can change all of this later from the machine's page.",
-                        );
-                        ui.add_space(18.0);
-                        ui::form_row(
-                            ui,
-                            "NAME",
-                            "Names the machine, its disk file and the guest's own hostname, so \
-                             pick something you will recognise later.",
-                            |ui, field_w| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut state.machine.name)
-                                        .desired_width(field_w)
-                                        .hint_text("my-machine"),
-                                );
-                            },
-                        );
-                        ui.add_space(18.0);
-                        ui.label(RichText::new("Power").size(13.5).color(theme::TEXT));
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            let gap = ui.spacing().item_spacing.x;
-                            let card_width = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
-                            for preset in POWER_PRESETS {
-                                let selected = state.machine.vcpus == preset.vcpus
-                                    && state.machine.memory_mib == preset.memory_mib;
-                                if option_card(
-                                    ui,
-                                    card_width,
-                                    preset.name,
-                                    &format!(
-                                        "{} cores · {} GiB · {}",
-                                        preset.vcpus,
-                                        preset.memory_mib / 1024,
-                                        preset.hint
-                                    ),
-                                    selected,
-                                    true,
-                                    theme::ACCENT,
-                                )
-                                .clicked()
-                                {
-                                    state.machine.vcpus = preset.vcpus;
-                                    state.machine.memory_mib = preset.memory_mib;
-                                }
-                            }
-                        });
-                        if !POWER_PRESETS.iter().any(|p| {
-                            p.vcpus == state.machine.vcpus
-                                && p.memory_mib == state.machine.memory_mib
-                        }) {
-                            ui.add_space(6.0);
-                            ui.label(ui::faint(format!(
-                                "Custom: {} cores · {} — set under More options",
-                                state.machine.vcpus,
-                                format_bytes(state.machine.memory_mib * 1024 * 1024)
-                            )));
-                        }
-                        if state.machine.disk_mode == launcher::DiskMode::CreateNew {
-                            ui.add_space(18.0);
-                            ui.label(RichText::new("Disk").size(13.5).color(theme::TEXT));
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                for gib in DISK_CHOICES_GIB {
-                                    if choice_chip(
-                                        ui,
-                                        &format!("{gib} GiB"),
-                                        state.machine.disk_gib == gib,
-                                    )
-                                    .clicked()
-                                    {
-                                        state.machine.disk_gib = gib;
-                                    }
-                                }
-                            });
-                            ui.add_space(6.0);
-                            ui.label(ui::faint(
-                                "Takes only what the guest writes — a fresh install uses a \
-                                 fraction of it.",
-                            ));
-                        }
-
-                        ui.add_space(18.0);
-                        let toggle = if state.more {
-                            "Fewer options"
-                        } else {
-                            "More options — every setting by hand"
-                        };
-                        if ui::text_button(ui, toggle, theme::ACCENT).clicked() {
-                            state.more = !state.more;
-                        }
-                        if state.more {
-                            ui.add_space(8.0);
-                            more_options(ui, state, settings, scan, native_arm, actions);
-                        }
-                    }
-                    _ => {
-                        wizard_heading(
-                            ui,
-                            "Ready to build",
-                            "Review the plan. Nothing starts until you confirm.",
-                        );
-                        ui.add_space(14.0);
-                        egui::Frame::new()
-                            .fill(theme::CARD)
-                            .stroke(egui::Stroke::new(1.0_f32, theme::STROKE_STRONG))
-                            .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
-                            .inner_margin(egui::Margin::same(16))
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                summary_row(ui, "Machine", &state.machine.name);
-                                summary_row(
-                                    ui,
-                                    "Installer",
-                                    &format!(
-                                        "{} · {}",
-                                        state.machine.family.label(),
-                                        if state.machine.automated {
-                                            "automatic"
-                                        } else {
-                                            "interactive"
-                                        }
-                                    ),
-                                );
-                                summary_row(
-                                    ui,
-                                    "Hardware",
-                                    &format!(
-                                        "{} cores · {} memory",
-                                        state.machine.vcpus,
-                                        format_bytes(state.machine.memory_mib * 1024 * 1024)
-                                    ),
-                                );
-                                let disk = state.machine.disk_path(&settings.vm_dir);
-                                summary_row(
-                                    ui,
-                                    "Storage",
-                                    &format!(
-                                        "{} · {}",
-                                        disk.display(),
-                                        if state.machine.disk_mode == launcher::DiskMode::CreateNew
-                                        {
-                                            format!(
-                                                "new {} GiB sparse disk",
-                                                state.machine.disk_gib
-                                            )
-                                        } else {
-                                            "existing disk, preserved".to_string()
-                                        }
-                                    ),
-                                );
-                                if state.machine.family == launcher::GuestFamily::Ubuntu {
-                                    summary_row(
-                                        ui,
-                                        if native_arm { "Ubuntu" } else { "ISO" },
-                                        if native_arm {
-                                            "Verified ARM64 cloud image; GNOME with hardware 3D"
-                                        } else if state.machine.iso_path.trim().is_empty() {
-                                            "Newest verified cached Ubuntu ISO"
-                                        } else {
-                                            state.machine.iso_path.trim()
-                                        },
-                                    );
-                                }
-                                if Backend::Wsl.available_on_host() {
-                                    summary_row(ui, "Runs on", state.machine.backend.label());
-                                }
-                            });
-                        let runner = launcher::Runner::new(
-                            state.machine.backend,
-                            std::path::PathBuf::from(&cli_label),
+                            state,
                             settings,
+                            scan,
+                            wsl_engine,
+                            wsl_install_running,
+                            native_arm,
+                            &cli_label,
+                            actions,
                         );
-                        let preview = launcher::install_spec(
-                            &runner,
-                            &settings.vm_dir,
-                            settings.child_cwd(),
-                            &state.machine,
-                        );
-                        // A machine whose files the chosen backend cannot see
-                        // is refused here, on the review step, with the fix —
-                        // not after the button is pressed.
-                        if let Err(message) = &preview {
-                            ui.add_space(10.0);
-                            ui.label(RichText::new(message).color(theme::ERR).size(12.5));
-                        }
-                        // …and neither is a backend whose engine is not there.
-                        // The same refusal `ManagerApp::backend_block` gives the
-                        // Start button, shown before the last click rather than
-                        // after it, with the install offer attached.
-                        if state.machine.backend == Backend::Wsl && wsl_engine.refusal().is_some() {
-                            ui.add_space(6.0);
-                            wsl_setup_note(ui, wsl_engine, wsl_install_running, 0.0, actions);
-                        }
-                    }
-                }
-
-                if let Some(error) = &state.error {
-                    ui.add_space(10.0);
-                    ui.label(RichText::new(error).color(theme::ERR).size(12.5));
-                }
+                    });
 
                 ui.add_space(24.0);
                 theme::rule(ui.painter(), ui.max_rect().x_range(), ui.cursor().top());
@@ -2956,6 +2663,332 @@ fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
 // 78 px label column. They are gone: every labelled row in the product now goes
 // through `ui::form_row` / `ui::path_row`, which is what keeps the fields in one
 // straight column and the explanations in tooltips.
+
+/// Everything in the wizard that is not its scrolling step body: the modal's
+/// margins, title and rule, the progress bar, the footer with its buttons, and
+/// some air between the dialog and the window edge.
+const WIZARD_CHROME_H: f32 = 290.0;
+
+/// The current wizard step's content, between the progress bar and the footer.
+#[allow(clippy::too_many_arguments)]
+fn wizard_step(
+    ui: &mut egui::Ui,
+    state: &mut crate::app::WizardState,
+    settings: &crate::settings::Settings,
+    scan: &crate::discovery::Scan,
+    wsl_engine: &wslengine::Status,
+    wsl_install_running: bool,
+    native_arm: bool,
+    cli_label: &str,
+    actions: &mut Vec<Action>,
+) {
+    match state.step {
+        0 => {
+            wizard_heading(
+                ui,
+                "Choose an operating system",
+                "Everything the installer needs is downloaded and checked for you.",
+            );
+            ui.add_space(14.0);
+            // An installer this backend cannot run is greyed out
+            // with the reason on hover, rather than failing forty
+            // minutes later inside the engine.
+            ui.horizontal(|ui| {
+                let card_width = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
+                // Debian is offered on both hosts now: its bootstrap
+                // kernel is downloaded rather than built where it
+                // cannot be built. Whether *this* machine has it yet
+                // is a pre-flight question with a command as its
+                // answer (launcher::missing_install_artifact), not a
+                // backend capability, so nothing is greyed out here.
+                let debian = option_card(
+                    ui,
+                    card_width,
+                    "Debian",
+                    "Verified network or official installer media",
+                    state.machine.family == launcher::GuestFamily::Debian,
+                    !native_arm,
+                    theme::ACCENT,
+                );
+                if debian.clicked() {
+                    state.machine.family = launcher::GuestFamily::Debian;
+                }
+                if option_card(
+                    ui,
+                    card_width,
+                    "Ubuntu",
+                    if native_arm {
+                        "Verified ARM64 download with accelerated GNOME"
+                    } else {
+                        "UEFI installer from cache or a local ISO"
+                    },
+                    state.machine.family == launcher::GuestFamily::Ubuntu,
+                    true,
+                    theme::ACCENT,
+                )
+                .clicked()
+                {
+                    state.machine.family = launcher::GuestFamily::Ubuntu;
+                }
+            });
+            ui.add_space(16.0);
+            match state.machine.family {
+                launcher::GuestFamily::Debian => {
+                    ui::form_row(
+                        ui,
+                        "INSTALLER",
+                        "Which Debian installer runs: the fast keyboard-driven one, \
+                         the graphical one, or the official netinst disc image, \
+                         downloaded and signature-checked for you.",
+                        |ui, field_w| {
+                            egui::ComboBox::from_id_salt("variant")
+                                .selected_text(variant_label(&state.machine.variant))
+                                .width(ui::combo_width(field_w))
+                                .show_ui(ui, |ui| {
+                                    for variant in VARIANTS {
+                                        ui.selectable_value(
+                                            &mut state.machine.variant,
+                                            variant.to_string(),
+                                            variant_label(variant),
+                                        );
+                                    }
+                                });
+                        },
+                    );
+                }
+                launcher::GuestFamily::Ubuntu => {
+                    if native_arm {
+                        ui.label(
+                            RichText::new(
+                                "Ubuntu ARM64 is downloaded and verified for you. \
+                                 Installing needs internet access.",
+                            )
+                            .size(13.0)
+                            .color(theme::TEXT_DIM),
+                        );
+                    } else if ui::path_row(
+                        ui,
+                        "INSTALLER",
+                        "The Ubuntu disc image to install from. Leave it empty and \
+                         Entangled uses the newest one it has already downloaded and \
+                         signature-checked.",
+                        &mut state.machine.iso_path,
+                        "newest verified download",
+                        true,
+                    ) {
+                        actions.push(Action::PickPath(PickTarget::WizardIso));
+                    }
+                }
+            }
+            ui.add_space(16.0);
+            backend_row(ui, &mut state.machine.backend, wsl_engine);
+            if state.machine.backend == Backend::Wsl {
+                wsl_setup_note(
+                    ui,
+                    wsl_engine,
+                    wsl_install_running,
+                    ui::FORM_LABEL_W,
+                    actions,
+                );
+            }
+        }
+        1 => {
+            wizard_heading(
+                ui,
+                "Name it and size it",
+                "You can change all of this later from the machine's page.",
+            );
+            ui.add_space(18.0);
+            ui::form_row(
+                ui,
+                "NAME",
+                "Names the machine, its disk file and the guest's own hostname, so \
+                 pick something you will recognise later.",
+                |ui, field_w| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.machine.name)
+                            .desired_width(field_w)
+                            .hint_text("my-machine"),
+                    );
+                },
+            );
+            ui.add_space(18.0);
+            ui.label(RichText::new("Power").size(13.5).color(theme::TEXT));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let gap = ui.spacing().item_spacing.x;
+                let card_width = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
+                for preset in POWER_PRESETS {
+                    let selected = state.machine.vcpus == preset.vcpus
+                        && state.machine.memory_mib == preset.memory_mib;
+                    if option_card(
+                        ui,
+                        card_width,
+                        preset.name,
+                        &format!(
+                            "{} cores · {} GiB · {}",
+                            preset.vcpus,
+                            preset.memory_mib / 1024,
+                            preset.hint
+                        ),
+                        selected,
+                        true,
+                        theme::ACCENT,
+                    )
+                    .clicked()
+                    {
+                        state.machine.vcpus = preset.vcpus;
+                        state.machine.memory_mib = preset.memory_mib;
+                    }
+                }
+            });
+            if !POWER_PRESETS
+                .iter()
+                .any(|p| p.vcpus == state.machine.vcpus && p.memory_mib == state.machine.memory_mib)
+            {
+                ui.add_space(6.0);
+                ui.label(ui::faint(format!(
+                    "Custom: {} cores · {} — set under More options",
+                    state.machine.vcpus,
+                    format_bytes(state.machine.memory_mib * 1024 * 1024)
+                )));
+            }
+            if state.machine.disk_mode == launcher::DiskMode::CreateNew {
+                ui.add_space(18.0);
+                ui.label(RichText::new("Disk").size(13.5).color(theme::TEXT));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    for gib in DISK_CHOICES_GIB {
+                        if choice_chip(ui, &format!("{gib} GiB"), state.machine.disk_gib == gib)
+                            .clicked()
+                        {
+                            state.machine.disk_gib = gib;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(ui::faint(
+                    "Takes only what the guest writes — a fresh install uses a \
+                     fraction of it.",
+                ));
+            }
+
+            ui.add_space(18.0);
+            let toggle = if state.more {
+                "Fewer options"
+            } else {
+                "More options — every setting by hand"
+            };
+            if ui::text_button(ui, toggle, theme::ACCENT).clicked() {
+                state.more = !state.more;
+            }
+            if state.more {
+                ui.add_space(8.0);
+                more_options(ui, state, settings, scan, native_arm, actions);
+            }
+        }
+        _ => {
+            wizard_heading(
+                ui,
+                "Ready to build",
+                "Review the plan. Nothing starts until you confirm.",
+            );
+            ui.add_space(14.0);
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE_STRONG))
+                .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    summary_row(ui, "Machine", &state.machine.name);
+                    summary_row(
+                        ui,
+                        "Installer",
+                        &format!(
+                            "{} · {}",
+                            state.machine.family.label(),
+                            if state.machine.automated {
+                                "automatic"
+                            } else {
+                                "interactive"
+                            }
+                        ),
+                    );
+                    summary_row(
+                        ui,
+                        "Hardware",
+                        &format!(
+                            "{} cores · {} memory",
+                            state.machine.vcpus,
+                            format_bytes(state.machine.memory_mib * 1024 * 1024)
+                        ),
+                    );
+                    let disk = state.machine.disk_path(&settings.vm_dir);
+                    summary_row(
+                        ui,
+                        "Storage",
+                        &format!(
+                            "{} · {}",
+                            disk.display(),
+                            if state.machine.disk_mode == launcher::DiskMode::CreateNew {
+                                format!("new {} GiB sparse disk", state.machine.disk_gib)
+                            } else {
+                                "existing disk, preserved".to_string()
+                            }
+                        ),
+                    );
+                    if state.machine.family == launcher::GuestFamily::Ubuntu {
+                        summary_row(
+                            ui,
+                            if native_arm { "Ubuntu" } else { "ISO" },
+                            if native_arm {
+                                "Verified ARM64 cloud image; GNOME with hardware 3D"
+                            } else if state.machine.iso_path.trim().is_empty() {
+                                "Newest verified cached Ubuntu ISO"
+                            } else {
+                                state.machine.iso_path.trim()
+                            },
+                        );
+                    }
+                    if Backend::Wsl.available_on_host() {
+                        summary_row(ui, "Runs on", state.machine.backend.label());
+                    }
+                });
+            let runner = launcher::Runner::new(
+                state.machine.backend,
+                std::path::PathBuf::from(&cli_label),
+                settings,
+            );
+            let preview = launcher::install_spec(
+                &runner,
+                &settings.vm_dir,
+                settings.child_cwd(),
+                &state.machine,
+            );
+            // A machine whose files the chosen backend cannot see
+            // is refused here, on the review step, with the fix —
+            // not after the button is pressed.
+            if let Err(message) = &preview {
+                ui.add_space(10.0);
+                ui.label(RichText::new(message).color(theme::ERR).size(12.5));
+            }
+            // …and neither is a backend whose engine is not there.
+            // The same refusal `ManagerApp::backend_block` gives the
+            // Start button, shown before the last click rather than
+            // after it, with the install offer attached.
+            if state.machine.backend == Backend::Wsl && wsl_engine.refusal().is_some() {
+                ui.add_space(6.0);
+                wsl_setup_note(ui, wsl_engine, wsl_install_running, 0.0, actions);
+            }
+        }
+    }
+
+    if let Some(error) = &state.error {
+        ui.add_space(10.0);
+        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+    }
+}
 
 /// Shared modal chrome: dimmed backdrop, dialog surface, a title over a rule.
 /// Returns true when the user dismissed it by clicking outside.

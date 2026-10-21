@@ -76,6 +76,9 @@ enum ScreenshotView {
     /// One machine's own page (the running one, when there is one).
     Machine,
     Wizard,
+    /// The wizard's sizing step with "More options" open: taller than a laptop
+    /// screen, so it is the surface that shows the step body scrolling.
+    WizardMore,
     /// The wizard on the backend step with WSL chosen and no Linux engine
     /// installed: the state a fresh Windows install is in, and the one this
     /// pre-flight exists for.
