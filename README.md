@@ -1,145 +1,236 @@
-# Entangled Desktop
+<p align="center">
+  <img src="docs/media/banner.svg" alt="Entangled Desktop — Run Linux in a window. Your hypervisor. Our machine." width="100%">
+</p>
 
-Run Linux in a window, on Linux or Windows, with an experimental native Apple
-Silicon backend, using a virtual machine monitor written from scratch in Rust.
+<h1 align="center">Linux, in your orbit.</h1>
 
-Entangled Desktop is a VMM: it builds a virtual machine on the hypervisor your
-system already has — **KVM** on Linux, the **Windows Hypervisor Platform** on
-Windows, or **Hypervisor.framework** on macOS — gives it disks, a network card and a virtual GPU, and puts its screen
-in a window. It installs Debian, Ubuntu and Fedora for you, unattended, from
-media it has verified against pinned signing keys.
+<p align="center">
+  A desktop virtual machine monitor written in <strong>Rust</strong>.<br>
+  Native hypervisors. Our own device models.
+</p>
 
-**There is no QEMU anywhere in it** — not as a process, not as a library, not as
-a source of device models. The virtio devices, the interrupt controllers, the
-ACPI tables and the PCI bus are this project's own code. The one piece of
-outside firmware is an unmodified EDK2 `CloudHv` build, compiled from pinned
-sources by a script in this repository.
+<p align="center">
+  <a href="https://github.com/doctorspider42/entangled-destop/actions/workflows/ci.yml"><img src="https://github.com/doctorspider42/entangled-destop/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-8cc8e0?style=flat-square&amp;labelColor=11161e" alt="License: Apache-2.0"></a>
+  <a href="#hosts"><img src="https://img.shields.io/badge/hosts-Linux%20%C2%B7%20Windows-8cc8e0?style=flat-square&amp;labelColor=11161e" alt="Hosts: Linux and Windows"></a>
+  <a href="docs/adr/0007-macos-arm64.md"><img src="https://img.shields.io/badge/Apple%20Silicon-macOS-8cc8e0?style=flat-square&amp;labelColor=11161e" alt="Apple Silicon: macOS"></a>
+</p>
 
-- **[User guide](docs/user-guide.md)** — install, first VM, the GUI, the limits
-- **[Troubleshooting](docs/troubleshooting.md)** — the failures people actually hit
-- **[Architecture decisions](docs/adr/)** — why it is built this way
+<p align="center">
+  <a href="https://github.com/doctorspider42/entangled-destop/releases"><strong>Download</strong></a> ·
+  <a href="#get-started">Get started</a> ·
+  <a href="docs/user-guide.md">User guide</a> ·
+  <a href="docs/adr/">Architecture</a> ·
+  <a href="docs/troubleshooting.md">Troubleshooting</a>
+</p>
 
-## What it can do
+---
 
-| | |
-|---|---|
-| Guests | Debian, Ubuntu Server, Ubuntu Desktop, Fedora Workstation — installed unattended from verified media |
-| Hosts | Linux with `/dev/kvm`; native Windows/WHP; experimental Apple Silicon/macOS (limits below) |
-| Boot | UEFI with a persistent variable store, or a direct Linux kernel boot with no firmware |
-| Graphics | 2D scanout in a resizable window (1920×1080 is the tested target); a GPU desktop on either host — Vulkan, and OpenGL through Zink, on the host GPU (`[display] venus = true`, `install ubuntu --venus`); OpenGL through VirGL on a Linux host |
-| Devices | virtio-blk, -net, -gpu, -input (keyboard, pointer, gamepad), -snd over virtio-mmio or virtio-pci with MSI-X |
-| Network | a host TAP interface (Linux), or a user-mode NAT needing no administrator (both hosts) |
-| Lifecycle | pause and resume, reboot in place, suspend to a file and restore it later |
-| Interfaces | the `entangled` CLI and `entangled-manager`, a native desktop GUI |
+Entangled Desktop installs Linux, gives it a disk, network, graphics and input,
+and puts it in a window on your desktop. Use the native manager or drive the
+same machine from the CLI. Debian, Ubuntu and Fedora installations are
+unattended, using verified media; Apple Silicon installs Ubuntu ARM64.
 
-## What it is not
+Underneath is a VMM built on **KVM**, **Windows Hypervisor Platform**, and
+**Hypervisor.framework**. The virtio device implementations,
+x86 interrupt controllers, ACPI tables and PCI bus live here in Rust.
 
-- **Not a Windows-guest solution.** Linux guests are what is tested; assume
-  Windows guests do not work.
-- **Not a container runtime.** These are full VMs with their own kernel.
-- **Not a server product.** No daemon, no API, no clustering, no live migration.
-- **Windows releases are unsigned.** The Windows binaries are unsigned and no checksums are
-  published; SmartScreen will warn, and it is right to.
-- The GPU desktop needs a host Vulkan driver and a guest set up for it (the
-  installer does that), there is no USB or PCI passthrough, and anti-cheat
-  games will not run. The full list is in the
-  [user guide](docs/user-guide.md#limits-in-one-place).
+## A look inside
 
-## Install
+<a href="docs/media/manager.png"><img src="docs/media/manager.png" alt="Entangled Desktop native manager: machine list, resource meters and lifecycle controls. Captured with demo data." width="100%"></a>
 
-**macOS preview** — Apple Silicon and macOS 26 or later. The native app bundle
-includes its Vulkan runtime; no global Vulkan SDK installation is needed.
-The manager's Create machine wizard downloads verified Ubuntu ARM64 media and
-installs GNOME with hardware graphics automatically. The equivalent CLI command
-is `entangled install ubuntu --auto --disk ubuntu.raw --size 8G --memory-mib 4096`.
-The current backend supports SMP (1–64 vCPUs within the host hypervisor limit),
-user-mode networking and direct Linux boot. New machines use all available
-Apple Silicon cores by default; choose fewer in the wizard or with `--vcpus`. Vulkan 1.3 and Zink OpenGL 2.1 are verified on Apple M3 Pro; presentation
-currently copies pixels. Audio, pause, reset, suspend and ARM ISO/UEFI boot are
-not connected. Longer stability testing is still in progress.
+<p align="center"><sub>The actual native manager, captured on macOS. Machine states and resource meters are <strong>demo data</strong> from <code>--mock</code>; this image demonstrates the UI, not macOS lifecycle support.</sub></p>
 
-The drag-to-Applications DMG is published alongside the Windows installer and
-Linux engine in [Releases](https://github.com/doctorspider42/entangled-destop/releases).
-The release workflow builds a fresh ARM64 app with the same release version,
-signs the app and DMG with Developer ID, submits the DMG to Apple, staples the
-accepted notarization ticket and verifies Gatekeeper before publication.
-A SHA-256 file accompanies the DMG. Earlier manually attached preview assets
-may be signed without notarization; their release notes identify this.
-Packaging and signing configuration are in
-[installer/macos/README.md](installer/macos/README.md), with implementation and
-acceptance evidence in [ADR-0007](docs/adr/0007-macos-arm64.md). The remaining
-table and installation paths describe the Linux and Windows implementations.
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/media/create-machine.png"><img src="docs/media/create-machine.png" alt="Actual Create a machine wizard on macOS, with Ubuntu ARM64 selected; demo data." width="100%"></a>
+      <br><strong>Choose a system. Make it yours.</strong><br>
+      The native creation wizard handles downloads and verification. Actual UI, captured with demo data on macOS.
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/media/ubuntu-venus.png"><img src="docs/media/ubuntu-venus.png" alt="Real Ubuntu ARM64 GNOME guest showing glmark2 output identifying Apple M3 Pro through Zink and Venus." width="100%"></a>
+      <br><strong>A real guest, on real hardware.</strong><br>
+      Ubuntu ARM64 on Apple M3 Pro. Guest OpenGL through Zink/Venus; captured during a selected glmark2 scene test. OpenGL 2.1 limits apply.
+    </td>
+  </tr>
+</table>
 
-**Windows** — download `entangled-desktop-<version>-setup.exe` from
-[Releases](https://github.com/doctorspider42/entangled-destop/releases) and run
-it. It is unsigned, so SmartScreen shows "Windows protected your PC": *More
-info* → *Run anyway*, or build from source instead. You also need the *Windows
-Hypervisor Platform* optional feature (admin, one reboot).
+[Capture details and reproduction](docs/media/README.md) · [Apple Silicon implementation and acceptance evidence](docs/adr/0007-macos-arm64.md)
 
-**Linux** — build it:
+## Built for the whole desktop
+
+- **From verified media to a bootable machine.** Unattended Debian, Ubuntu Server,
+  Ubuntu Desktop and Fedora Workstation installs on Linux/Windows. Persistent
+  UEFI variables keep the guest's boot entry between runs.
+- **Graphics that reach the host GPU.** Vulkan through Venus, OpenGL through
+  Mesa Zink, and VirGL on Linux. The installer can configure the GPU desktop
+  with `--venus`; `entangled doctor` checks host requirements.
+- **A machine you can put down and pick up.** Pause, resume, reboot in place,
+  or suspend to a file and restore in a new process on Linux/Windows.
+- **Networking without the ceremony.** User-mode NAT needs no administrator
+  privileges or host network setup. Linux also supports TAP.
+- **Files you can understand.** TOML profiles, sparse RAW disks, explicit NVRAM
+  sidecars and a CLI for inspecting, growing and moving disks.
+- **One core, native hosts.** Shared device code behind a portable hypervisor
+  interface; a native egui/wgpu manager launches each VM as its own process.
+
+## Hosts
+
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| Host CPU | x86-64 | x86-64 | Apple Silicon |
+| Hypervisor | KVM | WHP, native | Hypervisor.framework |
+| Guest installation | Debian, Ubuntu, Fedora | Debian, Ubuntu, Fedora | Ubuntu ARM64 |
+| Boot | UEFI or direct Linux | UEFI or direct Linux | Direct Linux |
+| Graphics | 2D, Venus/Zink, VirGL | 2D, Venus/Zink | Venus/Zink |
+| Networking | User-mode NAT, TAP | User-mode NAT | User-mode NAT |
+| Audio playback | ALSA | WASAPI | Not connected |
+| Pause / reboot / suspend to file | Implemented | Implemented | Not connected |
+
+**Apple Silicon requires macOS 26+.**
+SMP supports 1–64 vCPUs within the host hypervisor limit. Vulkan 1.3 and Zink
+OpenGL 2.1 have been verified on Apple M3 Pro; presentation currently copies
+pixels. ARM ISO/UEFI boot is not connected and longer stability testing remains
+in progress. See [ADR-0007](docs/adr/0007-macos-arm64.md).
+
+## Get started
+
+### macOS · Apple Silicon
+
+Download the ARM64 **DMG** from [Releases](https://github.com/doctorspider42/entangled-destop/releases),
+drag **Entangled Desktop** into Applications, then open the manager and choose
+**New machine → Ubuntu**. The wizard downloads verified ARM64 media and installs
+GNOME with hardware graphics. The Vulkan runtime is bundled; no global SDK is needed.
+
+Current release packaging signs with Developer ID, notarizes the DMG and staples
+Apple's ticket; a SHA-256 file accompanies it. Earlier manually attached previews
+may be signed without notarization — check their release notes.
+[Packaging and signing details](installer/macos/README.md).
+
+<details>
+<summary>Prefer the CLI? Create an Ubuntu ARM64 machine.</summary>
+
+From a shell where `entangled` is available:
+
+```bash
+entangled doctor
+entangled install ubuntu --auto --disk ubuntu.raw --size 8G --memory-mib 4096
+entangled run ubuntu.toml
+```
+
+New Apple Silicon machines use all available host cores by default. Choose fewer
+with `--vcpus` or in the wizard. Leave more disk space for a machine you plan to keep.
+
+</details>
+
+### Windows · x86-64
+
+Download `entangled-desktop-<version>-setup.exe` from
+[Releases](https://github.com/doctorspider42/entangled-destop/releases).
+Enable the **Windows Hypervisor Platform** optional feature and reboot, then
+open the manager and choose **New machine**.
+
+**Windows releases are unsigned and have no published checksums.** SmartScreen
+will warn. You can build from source instead. The installer does not add the CLI
+to `PATH`; the manager finds it automatically.
+[Windows installation details](docs/user-guide.md#windows-the-installer-from-github-releases).
+
+### Linux · x86-64
+
+With a current stable Rust toolchain and this repository checked out:
 
 ```bash
 sudo apt-get install -y build-essential pkg-config curl
 cargo build --workspace --release
-entangled fetch firmware                  # the UEFI firmware, 4 MiB, digest checked
-sudo usermod -aG kvm "$USER"              # then log out and back in
+export PATH="$PWD/target/release:$PATH"
+entangled fetch firmware
+sudo usermod -aG kvm "$USER"  # log out and back in before running a VM
 ```
 
-`bash guest/firmware/build-cloudhv.sh` builds the same firmware locally instead
-(~2.5 min, Linux only). The Windows installer ships a copy next to the
-program, so a Windows installation needs neither. The
-[user guide](docs/user-guide.md#getting-the-software) has the optional packages
-(3D, sound, TAP networking) and the five places the firmware is looked for.
+If you set `CARGO_TARGET_DIR`, use its `release` directory in `PATH` instead.
+You need access to `/dev/kvm` and a graphical session for windowed VMs.
+Launch `entangled-manager` for the wizard, or use the CLI below.
+[Runtime and optional packages](docs/user-guide.md#getting-the-software).
 
-## First VM
+<details>
+<summary>CLI quickstart: an Ubuntu desktop on Linux</summary>
+
+Fetch the verified Desktop ISO, install, then boot the generated profile:
 
 ```bash
-entangled doctor                              # can this machine run VMs?
-bash scripts/fetch-ubuntu-iso.sh              # ~2.9 GiB, signature-checked
-entangled install ubuntu --disk ~/entangled-vms/ubuntu.raw --size 20G --auto --headless
-entangled run ~/entangled-vms/ubuntu.toml
+entangled doctor
+mkdir -p ~/entangled-vms
+iso=$(bash scripts/fetch-ubuntu-iso.sh desktop)
+entangled install ubuntu --iso "$iso" --disk ~/entangled-vms/desktop.raw \
+  --size 40G --memory-mib 4096 --auto --headless
+entangled run ~/entangled-vms/desktop.toml
 ```
 
-Three to five minutes for the install, which is unattended: it creates the disk,
-generates the answer file, drives the installer over the serial console and
-waits for the guest to power itself off. It leaves an `ubuntu.toml` profile, an
-`ubuntu.nvram` UEFI variable store (keep it — without it the machine has no boot
-entry) and the installer's own transcript.
+For hardware graphics, add `--venus` to the install command after `doctor`
+confirms your host GPU qualifies. Keep `desktop.nvram` beside the disk: it holds
+the UEFI boot entry. The built-in installer creates the demo login
+**`entangled` / `entangled`**; change the password with `passwd` for a VM you keep.
 
-Or press **+ Create machine** in `entangled-manager` and let the wizard do it.
+[Ubuntu and GPU setup](docs/user-guide.md#quickstart-ubuntu-server) ·
+[Fedora](docs/user-guide.md#quickstart-fedora-workstation) ·
+[Debian](docs/user-guide.md#quickstart-debian)
 
-Debian is the same two commands with one extra in front, on either host:
+</details>
 
-```bash
-entangled fetch bootstrap-kernel   # ~13 MiB: the Debian installer cannot run on
-                                   # Debian's own kernel here, so we ship one
-entangled install debian --disk ~/entangled-vms/debian.raw --size 32G --auto --headless
-```
+## Under the hood
 
-That kernel is upstream Linux, **GPL-2.0-only**, published with its corresponding
-source; it is checked against a SHA-256 pinned in the binary, which is a weaker
-guarantee than the pinned OpenPGP keys the ISOs get. Both facts are spelled out
-in the [user guide](docs/user-guide.md#the-guest-bootstrap-artifacts).
+<img src="docs/media/architecture.svg" alt="Native manager to CLI to shared machine and virtio devices, through the portable vmm-core interface to KVM, WHP or Hypervisor.framework." width="100%">
 
-## Development
+The core uses rust-vmm crates for checked guest-memory access and virtqueues.
+Devices are independent of their transport: the x86 platform offers virtio-mmio
+and virtio-pci with MSI-X; the ARM platform uses virtio-mmio. The x86 UEFI firmware
+is an unmodified EDK2 `CloudHv` build from pinned sources.
 
-This is also a working repository. [CLAUDE.md](CLAUDE.md) is the map: the
-workspace layout, the build and test commands for both hosts, and the rules that
-keep the core portable and the guest untrusted. The
-[ADRs](docs/adr/) record the decisions and what each one cost, and
-`.claude/skills/` holds a task-focused guide per subsystem.
+| Explore | Start here |
+|---|---|
+| Hypervisor abstraction and CPU lifecycle | [`vmm-core`](crates/vmm-core), [portability ADR](docs/adr/0002-linux-first-whp-ready.md) |
+| Machine platforms | [`machine-x86`](crates/machine-x86), [`machine-arm64`](crates/machine-arm64) |
+| Devices and graphics | [`virtio-core`](crates/virtio-core), [`virtio-gpu`](crates/virtio-gpu), [graphics ADR](docs/adr/0004-virtio-gpu-3d.md) |
+| Freeze, reset, save, restore | [Lifecycle ADR](docs/adr/0005-vm-lifecycle.md), [snapshot ADR](docs/adr/0006-suspend-restore.md) |
+| Native manager and CLI | [`apps/manager`](apps/manager), [`apps/entangled`](apps/entangled) |
+
+## Current boundaries
+
+Linux guests are the tested path; assume Windows guests do not work. There is
+no USB or PCI passthrough, live migration, clustering or server daemon.
+Anti-cheat games will not run. GPU support depends on the host driver and guest
+configuration; a successful selected graphics test is not a general game or
+performance guarantee. macOS has the additional gaps listed above.
+
+[All limits in one place](docs/user-guide.md#limits-in-one-place) ·
+[Known failures and fixes](docs/troubleshooting.md)
+
+## Build with us
+
+Start with [CLAUDE.md](CLAUDE.md) for the workspace map, architecture and hard
+rules, and [AGENTS.md](AGENTS.md) for Codex instructions. Subsystem guides live in
+[`.agents/skills/`](.agents/skills/) and [`.claude/skills/`](.claude/skills/).
+Load `dev-environment` before building or launching a demo VM.
 
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all
-cargo deny check                     # no GPL/AGPL/LGPL in host code
+cargo fmt --all --check
+cargo deny check
 ```
 
-The product backlog, in Polish, is
-[vmhost-mvp-backlog.md](vmhost-mvp-backlog.md).
+Hardware tests self-skip when the required hypervisor or guest artifacts are
+missing; a green CI run alone does not prove a guest booted. The architecture
+records and acceptance notes describe what was exercised on real hosts.
+
+Bug reports are most useful with the host OS, `entangled doctor` output and the
+relevant install/run log. Please remove credentials and private paths before
+sharing. The [product backlog](vmhost-mvp-backlog.md) is in Polish.
 
 ## License
 
-Apache-2.0. Host-side dependencies are audited in CI (`cargo deny`) to exclude
-copyleft licenses; guest-side content is unaffected.
+[Apache-2.0](LICENSE). Host dependencies are audited in CI with `cargo deny` to
+exclude GPL/AGPL/LGPL licenses. Guest-side components have their own licenses;
+the published Debian bootstrap kernel is GPL-2.0-only with corresponding source,
+and its download is checked against a SHA-256 pinned in the binary.

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="460" viewBox="0 0 1120 460" role="img" aria-labelledby="title desc">
+  <title id="title">Inside Entangled Desktop</title>
+  <desc id="desc">The native manager drives the CLI. The machine platform and shared virtio devices sit above the portable hypervisor interface: KVM on Linux, WHP on Windows, and HVF on Apple Silicon.</desc>
+  <rect width="1120" height="460" rx="16" fill="#0a0d12"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" text-anchor="middle">
+    <g fill="#11161e" stroke="#2c3645">
+      <rect x="32" y="32" width="330" height="68" rx="10"/><rect x="410" y="32" width="678" height="68" rx="10"/>
+      <rect x="32" y="140" width="1056" height="86" rx="10"/>
+      <rect x="32" y="266" width="1056" height="58" rx="10"/>
+      <rect x="32" y="364" width="330" height="64" rx="10"/><rect x="395" y="364" width="330" height="64" rx="10"/><rect x="758" y="364" width="330" height="64" rx="10"/>
+    </g>
+    <g fill="none" stroke="#8cc8e0" stroke-width="2"><path d="M362 66h48m-8-5 8 5-8 5M749 100v40m-5-8 5 8 5-8M560 226v40m-5-8 5 8 5-8M560 324v20H197v20m363-20v20m0-20h363v20"/></g>
+    <g fill="#e4e8ee" font-size="21" font-weight="600"><text x="197" y="62">Native manager</text><text x="749" y="62">entangled CLI</text><text x="560" y="174">Our machine model + shared virtio devices</text></g>
+    <g fill="#98a2b3" font-size="16"><text x="197" y="84">egui / wgpu</text><text x="749" y="84">install · run · doctor · disk · fetch</text><text x="560" y="204">x86-64 / ARM64 · disk · network · graphics · input · sound¹</text></g>
+    <text x="560" y="302" fill="#8cc8e0" font-size="20">vmm-core · portable hypervisor interface</text>
+    <g fill="#e4e8ee" font-size="20"><text x="197" y="393">KVM</text><text x="560" y="393">WHP</text><text x="923" y="393">Hypervisor.framework</text></g>
+    <g fill="#98a2b3" font-size="15"><text x="197" y="415">Linux · x86-64</text><text x="560" y="415">Windows · x86-64</text><text x="923" y="415">macOS · Apple Silicon</text></g>
+  </g>
+  <text x="32" y="450" fill="#7d8695" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="12">¹ Device and lifecycle availability varies by backend; see the host matrix in the README.</text>
+</svg>
