@@ -736,6 +736,16 @@ fn welcome(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
             },
         );
         ui.add_space(20.0);
+        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            ui.horizontal(|ui| {
+                for family in [GuestFamily::Fedora, GuestFamily::OtherLinux] {
+                    if ui::secondary_button(ui, family.label(), true).clicked() {
+                        actions.push(Action::OpenWizardFor(family));
+                    }
+                }
+            });
+            ui.add_space(12.0);
+        }
         ui.horizontal(|ui| {
             ui.add_space((width * 0.5 - 140.0).max(0.0));
             ui.label(

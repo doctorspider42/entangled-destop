@@ -802,6 +802,7 @@ mod tests {
 
     fn desktop_args(venus: bool) -> InstallArgs {
         InstallArgs {
+            control_stdin: false,
             distro: "ubuntu".into(),
             disk: Some(PathBuf::from("desktop.raw")),
             variant: "gtk-netboot".into(),

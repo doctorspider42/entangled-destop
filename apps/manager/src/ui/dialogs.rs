@@ -94,7 +94,11 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                 .flatten();
                             let button = ui::primary_button_enabled(
                                 ui,
-                                "Create and install",
+                                if state.machine.family == launcher::GuestFamily::OtherLinux {
+                                    "Create and boot ISO"
+                                } else {
+                                    "Create and install"
+                                },
                                 blocked.is_none(),
                             );
                             match &blocked {
@@ -1195,6 +1199,9 @@ fn edit_boot_media(
             }
             if !form.cdrom.trim().is_empty() {
                 ui::path_status_note(ui, &form.resolve(&form.cdrom.clone()), "");
+                if fix_button(ui, "Eject ISO") {
+                    form.cdrom.clear();
+                }
             }
         }
     }
@@ -2339,7 +2346,7 @@ fn more_options(
         ui.label(ui::dim(
             "Ubuntu is installed automatically, in the background.",
         ));
-    } else {
+    } else if state.machine.family != launcher::GuestFamily::OtherLinux {
         ui.checkbox(&mut state.machine.automated, "Install automatically")
             .on_hover_text("Answers the installer's questions for you");
         ui.checkbox(&mut state.machine.headless, "Install in the background")
@@ -2730,7 +2737,7 @@ fn wizard_step(
             wizard_heading(
                 ui,
                 "Choose an operating system",
-                "Everything the installer needs is downloaded and checked for you.",
+                "Choose a supported installer or install another Linux from your own ISO.",
             );
             ui.add_space(14.0);
             // An installer this backend cannot run is greyed out
@@ -2774,6 +2781,36 @@ fn wizard_step(
                     state.machine.family = launcher::GuestFamily::Ubuntu;
                 }
             });
+            if !native_arm {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let card_width = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
+                    for (family, detail) in [
+                        (
+                            launcher::GuestFamily::Fedora,
+                            "Workstation via network installer or a local ISO",
+                        ),
+                        (
+                            launcher::GuestFamily::OtherLinux,
+                            "Manual installation from a Linux x86-64 UEFI ISO",
+                        ),
+                    ] {
+                        if option_card(
+                            ui,
+                            card_width,
+                            family.label(),
+                            detail,
+                            state.machine.family == family,
+                            true,
+                            theme::ACCENT,
+                        )
+                        .clicked()
+                        {
+                            state.machine.family = family;
+                        }
+                    }
+                });
+            }
             ui.add_space(16.0);
             match state.machine.family {
                 launcher::GuestFamily::Debian => {
@@ -2820,6 +2857,30 @@ fn wizard_step(
                         true,
                     ) {
                         actions.push(Action::PickPath(PickTarget::WizardIso));
+                    }
+                }
+                launcher::GuestFamily::Fedora | launcher::GuestFamily::OtherLinux => {
+                    let manual = state.machine.family == launcher::GuestFamily::OtherLinux;
+                    if ui::path_row(
+                        ui,
+                        "INSTALLER",
+                        if manual {
+                            "Choose a Linux x86-64 ISO that supports UEFI and virtio devices. Complete installation in the guest window. Boot menus appear in the serial console. After installing, power off, open Settings > Startup and eject the ISO, then save. Compatibility depends on the distribution."
+                        } else {
+                            "For automatic installation use Fedora Everything netinst. Packages are downloaded over the network. Leave empty to use a previously verified cached netinst image; local images are used as supplied."
+                        },
+                        &mut state.machine.iso_path,
+                        if manual {
+                            "choose an installer ISO"
+                        } else {
+                            "newest verified Fedora netinst download"
+                        },
+                        true,
+                    ) {
+                        actions.push(Action::PickPath(PickTarget::WizardIso));
+                    }
+                    if manual {
+                        ui.label(ui::dim("Manual install. After installing, power off and eject the ISO under Settings > Startup."));
                     }
                 }
             }
@@ -2951,7 +3012,9 @@ fn wizard_step(
                         &format!(
                             "{} · {}",
                             state.machine.family.label(),
-                            if state.machine.automated {
+                            if state.machine.automated
+                                && state.machine.family != launcher::GuestFamily::OtherLinux
+                            {
                                 "automatic"
                             } else {
                                 "interactive"
@@ -2981,14 +3044,18 @@ fn wizard_step(
                             }
                         ),
                     );
-                    if state.machine.family == launcher::GuestFamily::Ubuntu {
+                    if state.machine.family != launcher::GuestFamily::Debian {
                         summary_row(
                             ui,
                             if native_arm { "Ubuntu" } else { "ISO" },
                             if native_arm {
                                 "Verified ARM64 cloud image; GNOME with hardware 3D"
                             } else if state.machine.iso_path.trim().is_empty() {
-                                "Newest verified cached Ubuntu ISO"
+                                if state.machine.family == launcher::GuestFamily::Fedora {
+                                    "Newest verified cached Fedora netinst ISO"
+                                } else {
+                                    "Newest verified cached Ubuntu ISO"
+                                }
                             } else {
                                 state.machine.iso_path.trim()
                             },

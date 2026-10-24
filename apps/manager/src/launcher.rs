@@ -217,6 +217,8 @@ pub const VARIANTS: [&str; 3] = ["text-netboot", "gtk-netboot", "netinst-iso"];
 pub enum GuestFamily {
     Debian,
     Ubuntu,
+    Fedora,
+    OtherLinux,
 }
 
 impl GuestFamily {
@@ -224,6 +226,8 @@ impl GuestFamily {
         match self {
             Self::Debian => "debian",
             Self::Ubuntu => "ubuntu",
+            Self::Fedora => "fedora",
+            Self::OtherLinux => "other",
         }
     }
 
@@ -231,6 +235,8 @@ impl GuestFamily {
         match self {
             Self::Debian => "Debian",
             Self::Ubuntu => "Ubuntu",
+            Self::Fedora => "Fedora",
+            Self::OtherLinux => "Other Linux / own ISO",
         }
     }
 
@@ -276,7 +282,7 @@ pub struct NewMachine {
     pub disk_path: String,
     pub disk_mode: DiskMode,
     pub family: GuestFamily,
-    /// Optional local Ubuntu installer ISO. Empty uses the verified cache.
+    /// Local ISO; required for Other Linux, otherwise empty uses the verified cache.
     pub iso_path: String,
     pub variant: String,
     pub automated: bool,
@@ -349,17 +355,29 @@ pub fn install_spec(
             args.push("--variant".to_string());
             args.push(machine.variant.clone());
         }
-        GuestFamily::Ubuntu => {
+        GuestFamily::Ubuntu | GuestFamily::Fedora | GuestFamily::OtherLinux => {
             if !machine.iso_path.trim().is_empty() {
                 args.push("--iso".to_string());
                 args.push(runner.path_arg(Path::new(machine.iso_path.trim()))?);
             }
         }
     }
-    if machine.automated {
+    if machine.family == GuestFamily::OtherLinux {
+        if machine.iso_path.trim().is_empty() {
+            return Err("Choose a Linux x86-64 UEFI installer ISO first.".into());
+        }
+        args.extend([
+            "--control-stdin".to_string(),
+            "--vcpus".to_string(),
+            machine.vcpus.to_string(),
+            "--refresh-hz".to_string(),
+            machine.refresh_hz.to_string(),
+        ]);
+    }
+    if machine.automated && machine.family != GuestFamily::OtherLinux {
         args.push("--auto".to_string());
     }
-    if machine.headless {
+    if machine.headless && machine.family != GuestFamily::OtherLinux {
         args.push("--headless".to_string());
     }
     args.push("--network".to_string());
@@ -367,13 +385,17 @@ pub fn install_spec(
 
     let (program, args) = runner.command(&cwd, args)?;
     Ok(TaskSpec {
-        kind: TaskKind::Install,
+        kind: if machine.family == GuestFamily::OtherLinux {
+            TaskKind::Run
+        } else {
+            TaskKind::Install
+        },
         vm: machine.name.clone(),
         program,
         args,
         cwd,
         log_path: vm_dir.join(format!("{}-install.log", machine.name)),
-        control: false,
+        control: machine.family == GuestFamily::OtherLinux,
     })
 }
 
@@ -566,7 +588,7 @@ pub fn missing_install_artifact(cwd: &Path, family: GuestFamily) -> Option<Strin
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         return match family {
             GuestFamily::Ubuntu => None,
-            GuestFamily::Debian => Some("This Mac currently provisions Ubuntu ARM64; the Debian ARM64 installer is not connected yet.".into()),
+            _ => Some("This Mac currently provisions Ubuntu ARM64; other installers are not connected yet.".into()),
         };
     }
     missing_install_artifact_x86(cwd, family)
@@ -574,7 +596,7 @@ pub fn missing_install_artifact(cwd: &Path, family: GuestFamily) -> Option<Strin
 
 fn missing_install_artifact_x86(cwd: &Path, family: GuestFamily) -> Option<String> {
     match family {
-        GuestFamily::Ubuntu => {
+        GuestFamily::Ubuntu | GuestFamily::Fedora | GuestFamily::OtherLinux => {
             if locate_firmware(cwd).is_some() {
                 return None;
             }
@@ -733,6 +755,48 @@ mod tests {
         );
         // The one default on both hosts, spelled out for an older engine.
         assert!(line.contains("--network usernet"), "{line}");
+    }
+
+    #[test]
+    fn fedora_uses_its_installer_and_manual_iso_keeps_a_control_channel() {
+        let mut m = machine();
+        m.family = GuestFamily::Fedora;
+        m.iso_path = "/isos/Fedora netinst.iso".into();
+        let spec = install_spec(
+            &native("entangled"),
+            Path::new("/vms"),
+            PathBuf::from("/srv"),
+            &m,
+        )
+        .unwrap();
+        assert_eq!(spec.kind, TaskKind::Install);
+        assert!(spec.args.windows(2).any(|w| w == ["install", "fedora"]));
+        assert!(spec.args.contains(&m.iso_path));
+        assert!(!spec.args.contains(&"--variant".into()));
+        m.family = GuestFamily::OtherLinux;
+        m.automated = true;
+        m.headless = true;
+        let spec = install_spec(
+            &native("entangled"),
+            Path::new("/vms"),
+            PathBuf::from("/srv"),
+            &m,
+        )
+        .unwrap();
+        assert_eq!(spec.kind, TaskKind::Run);
+        assert!(spec.control);
+        assert!(spec.args.windows(2).any(|w| w == ["install", "other"]));
+        assert!(spec.args.contains(&"--control-stdin".into()));
+        assert!(!spec.args.contains(&"--auto".into()));
+        assert!(!spec.args.contains(&"--headless".into()));
+        m.iso_path.clear();
+        assert!(install_spec(
+            &native("entangled"),
+            Path::new("/vms"),
+            PathBuf::from("/srv"),
+            &m
+        )
+        .is_err());
     }
 
     /// Which artifact blocks which installer. The Ubuntu path must not be gated

@@ -113,6 +113,19 @@ it and the `?` never answered.
 
 ## Install flow (GUI-1602)
 
+The x86-64 wizard also offers Fedora and **Other Linux / own ISO**. Fedora
+uses the existing `install fedora` path (Everything netinst, cached or local,
+Kickstart when automatic). Other Linux uses `install other --iso`, always
+interactive and windowed: the CLI creates a UEFI/PCI profile with a writable
+disk, persistent NVRAM, usernet and the read-only ISO, then starts it. The
+profile exists before boot and retains the ISO for interrupted installations.
+The manager tracks this child as `TaskKind::Run`, with a control pipe, not as
+a completed automatic installation; never stamp resources over its live profile.
+After powering off, the user ejects the ISO in Settings > Startup and saves.
+The console offers named `serial-key` controls (shared vocabulary in control-api)
+for the serial-only firmware/bootloader menus. ISO drag-and-drop selects this
+manual path; native Apple Silicon keeps its Ubuntu ARM64-only provisioning.
+
 The four-stage wizard collects system/media, name/resources, storage and a
 review before it launches anything. It supports Debian's verified variants and
 Ubuntu through the verified cache or an explicit local `--iso`. Storage is an

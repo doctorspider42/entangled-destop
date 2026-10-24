@@ -106,13 +106,30 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                             .hint_text("type on the serial console, then Enter"),
                     );
                     let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let send = ui::ghost_button(ui, "Send", !console_input.is_empty(), theme::TEXT)
-                        .clicked();
-                    if (enter || send) && !console_input.is_empty() {
+                    let send = ui::ghost_button(ui, "Send", true, theme::TEXT).clicked();
+                    if enter || send {
                         actions.push(Action::TypeOnSerial(task.id, std::mem::take(console_input)));
                         field.request_focus();
                     }
                 });
+                if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    ui.horizontal(|ui| {
+                        ui.label(ui::faint("Boot menu keys"));
+                        for (label, key) in [
+                            ("Up", "up"),
+                            ("Down", "down"),
+                            ("Left", "left"),
+                            ("Right", "right"),
+                            ("Esc", "escape"),
+                            ("Tab", "tab"),
+                            ("Enter", "enter"),
+                        ] {
+                            if ui::text_button(ui, label, theme::TEXT_DIM).clicked() {
+                                actions.push(Action::SerialKey(task.id, key));
+                            }
+                        }
+                    });
+                }
                 ui.add_space(6.0);
             }
 

@@ -933,6 +933,7 @@ pub const CONTROL_PREFIX: &str = control_api::control::PREFIX;
 /// | `reset` | reboot it in place |
 /// | `save [path]` | suspend to `path` (or the profile's default) and exit |
 /// | `type <text>` | type `<text>` and Enter on the guest's serial console |
+/// | `serial-key <name>` | send a named arrow, escape, tab or enter key on serial |
 /// | `status` | print the current [`RunState`](vmm_core::RunState) |
 /// | `thumbnail [path]` | write a small PNG of the screen (silent on success) |
 /// | `paste <text>` | type `<text>` on the guest's keyboard (`\n` is Enter) |
@@ -1107,6 +1108,15 @@ fn spawn_control_channel(
                         let mut bytes = argument.as_bytes().to_vec();
                         bytes.push(b'\r');
                         bus.push_serial_input(&bytes);
+                    }
+                    control_api::control::CMD_SERIAL_KEY => {
+                        if let Some(bytes) = control_api::control::serial_key_bytes(argument.trim())
+                        {
+                            bus.push_serial_input(bytes);
+                        } else {
+                            println!("{CONTROL_PREFIX} error unknown serial key");
+                            continue;
+                        }
                     }
                     CMD_STATUS => {
                         println!("{CONTROL_PREFIX} state={:?}", lifecycle.state());

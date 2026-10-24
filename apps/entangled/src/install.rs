@@ -298,6 +298,9 @@ pub fn target_disk(args: &InstallArgs) -> Result<PathBuf, String> {
 }
 
 pub fn run(args: &InstallArgs) -> Result<(), String> {
+    if args.distro.eq_ignore_ascii_case("other") {
+        return crate::install_other::run(args);
+    }
     if args.distro.eq_ignore_ascii_case("ubuntu") {
         return crate::install_ubuntu::run(args);
     }
@@ -320,7 +323,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     }
     if !args.distro.eq_ignore_ascii_case("debian") {
         return Err(format!(
-            "unknown distro '{}': expected debian, ubuntu or fedora",
+            "unknown distro '{}': expected debian, ubuntu, fedora or other",
             args.distro
         ));
     }
@@ -939,6 +942,7 @@ mod tests {
     #[test]
     fn names_and_default_paths_are_derived_the_way_the_manager_expects() {
         let args = |disk: Option<&str>, name: Option<&str>| InstallArgs {
+            control_stdin: false,
             distro: "Ubuntu".into(),
             disk: disk.map(PathBuf::from),
             variant: "gtk-netboot".into(),

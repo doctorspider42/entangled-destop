@@ -511,6 +511,12 @@ suspended while the guest holds GPU objects (which, with a desktop, is always):
 
 ## Quickstart: Fedora Workstation
 
+In the manager, choose **Fedora** when creating a machine. Select a local
+**Everything netinst** ISO or leave the installer field empty to use a verified
+netinst image already in the cache. Automatic installation needs internet access.
+Fedora Workstation Live media can instead be used with **Other Linux / own ISO**
+for manual installation.
+
 Same shape, one difference that matters: the Fedora netinst image installs *from
 the network*, so the installer VM needs one. The default, `--network usernet`,
 gives it a user-mode NAT that runs inside the `entangled` process — no TAP, no
@@ -537,6 +543,36 @@ entangled run --cdrom "$iso" examples/ubuntu-desktop-live.toml
 `--cdrom` attaches any ISO read-only as the last virtio-blk device and lets the
 firmware boot it. It requires `mode = "uefi"` and `transport = "pci"`, and says
 so rather than booting a machine that cannot find the media.
+
+## Manual installation: other Linux / own ISO
+
+On Linux and Windows, choose **Other Linux / own ISO** in the create-machine
+wizard, select a local **x86-64 UEFI** installer image, choose resources and
+storage, then press **Create and boot ISO**. Dropping an ISO onto the manager
+opens this same path. The image is used as supplied; obtain and verify it from
+the distribution's publisher before selecting it.
+
+Complete the installation in the guest window. Firmware and bootloader menus
+appear in the manager's **Console**, with serial input and boot-menu key buttons;
+the graphical window appears once Linux initialises virtio-gpu. This path requires
+UEFI and virtio support; compatibility with every distribution is not guaranteed.
+
+The disk, profile, ISO attachment and NVRAM are retained when the VM stops,
+including an interrupted installation. Start the machine again to continue.
+After installing, **power off** the guest, open its **Settings > Startup**, choose
+**Eject ISO**, save, and start it to boot the installed system. Removing the
+attachment leaves the ISO file, disk and NVRAM intact. No assumptions about the
+guest's root filesystem or installer automation are made.
+
+The equivalent CLI path is:
+
+```text
+entangled install other --iso /path/to/linux.iso --disk /path/to/linux.raw --size 32G --name linux --memory-mib 4096
+```
+
+The profile is saved before the VM starts. Use `entangled run <profile>` for
+subsequent starts; `install other` refuses to overwrite an existing profile or
+NVRAM store. Automation flags are unsupported for this manual path.
 
 ## Quickstart: Debian
 

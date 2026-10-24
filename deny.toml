@@ -68,6 +68,16 @@ ignore = [
     # RSA operations; debian-media only VERIFIES signatures with public keys —
     # no private-key RSA runs in this codebase. Revisit when rpgp bumps `rsa`.
     "RUSTSEC-2023-0071",
+    # Variable-time arithmetic in crypto-bigint (through rpgp's elliptic-curve
+    # dependencies). RUSTSEC-2026-0387 requires secret integer operands; our
+    # only production rpgp call site, debian-media/src/keyring.rs, verifies
+    # detached signatures with SignedPublicKey/SignedPublicSubKey. Keys,
+    # signatures and signed media indexes are public; there are no host
+    # signing, decryption or key-generation operations to leak secrets from.
+    # Secret-key generation/signing exists only in test fixtures. Revisit
+    # this exception if private-key operations are added or rpgp's dependency
+    # graph can move to the patched crypto-bigint >=0.7.6.
+    "RUSTSEC-2026-0387",
     # RUSTSEC-2026-0192 (`ttf-parser` unmaintained) was ignored here until
     # 2026-09-16, when `cargo deny` started reporting the entry itself as
     # `advisory-not-detected`. The crate has not left the graph — it is still

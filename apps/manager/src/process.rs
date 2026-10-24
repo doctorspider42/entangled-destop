@@ -306,6 +306,11 @@ impl Task {
         self.send_control(&format!("{} {text}", control_api::control::CMD_TYPE))
     }
 
+    pub fn serial_key(&self, key: &str) -> bool {
+        control_api::control::serial_key_bytes(key).is_some()
+            && self.send_control(&format!("{} {key}", control_api::control::CMD_SERIAL_KEY))
+    }
+
     /// Asks the engine for a new card picture (`thumbnail`, silent on
     /// success); see `crate::thumbs`.
     pub fn request_thumbnail(&self) -> bool {
