@@ -562,6 +562,10 @@ impl App {
         self.capture.set_window_size(window_size);
         self.capture.set_viewport(self.viewport);
         self.sync_cursor();
+        // Windows confinement is a screen-space rectangle. winit 0.30 does
+        // not refresh it on resize, so F11 would retain the old client area.
+        #[cfg(windows)]
+        self.sync_cursor_grab();
     }
 
     /// One redraw, and the guest frames it accounts for: every frame
@@ -871,12 +875,19 @@ impl App {
         self.grabbed = grabbed;
         self.update_title();
         self.sync_cursor();
+        self.sync_cursor_grab();
+        tracing::info!(grabbed, "pointer grab toggled");
+    }
+
+    /// Reapplies confinement to the current client rectangle, even when the
+    /// logical grab state is unchanged after moving or resizing the window.
+    fn sync_cursor_grab(&self) {
         let Some(window) = self.window.as_ref() else {
             return;
         };
         // AppKit cannot confine a pointer. Keeping its absolute motion is
         // necessary for the guest tablet; locking it would freeze that input.
-        let mode = if grabbed && !cfg!(target_os = "macos") {
+        let mode = if self.grabbed && !cfg!(target_os = "macos") {
             CursorGrabMode::Confined
         } else {
             CursorGrabMode::None
@@ -884,9 +895,8 @@ impl App {
         if let Err(err) = window.set_cursor_grab(mode) {
             // Wayland compositors may refuse confinement; the guest still gets
             // absolute positions, so this is a warning, not a failure.
-            tracing::warn!(%err, grabbed, "compositor refused the pointer grab");
+            tracing::warn!(%err, grabbed = self.grabbed, "compositor refused the pointer grab");
         }
-        tracing::info!(grabbed, "pointer grab toggled");
     }
 
     /// Mirrors the cursor policy onto the window (WIN-1501). Cheap enough to call
@@ -1189,6 +1199,10 @@ impl ApplicationHandler<HostEvent> for App {
                     window.request_redraw();
                 }
             }
+            // Confinement uses desktop coordinates, so moving a grabbed
+            // window (including between monitors) must update it as well.
+            #[cfg(windows)]
+            WindowEvent::Moved(_) => self.sync_cursor_grab(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // winit follows this with a Resized carrying physical pixels.
                 tracing::debug!(scale_factor, "window scale factor changed");

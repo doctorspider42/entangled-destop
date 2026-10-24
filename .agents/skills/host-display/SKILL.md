@@ -550,3 +550,21 @@ input**. `run_vm`'s pump drains the input queue and drops it while
 which is precisely what a pause forbids. Dropping rather than queueing is
 deliberate — the window is not grabbed while frozen, and a burst delivered on
 resume would be worse than nothing.
+
+### Windows fullscreen confinement (2026-10-24)
+
+A grabbed pointer must be confined to the current client rectangle in desktop
+coordinates. winit 0.30.13 refreshes that rectangle in `set_cursor_grab`, but
+its Windows `WM_SIZE` / `WM_WINDOWPOSCHANGED` handlers do not refresh it. Keeping
+only `App::grabbed` current leaves the old window's bounds active after F11:
+the guest image fills the screen but the pointer cannot reach its top/bottom.
+`App::sync_cursor_grab` reapplies the existing mode after viewport recomputation
+on Windows and on `WindowEvent::Moved`. Do not route this through `set_grab`'s
+unchanged-state early return, and do not release the logical grab or guest-held
+keys just to update geometry. Keep the transparent custom cursor: using winit's
+hidden flag with confinement would pin the pointer to the centre again.
+
+Manual regression: grab the image, F11 into fullscreen, reach all four edges,
+F11 back, and repeat after moving/resizing the window. `GetClipCursor` should
+match `GetClientRect` translated by `ClientToScreen` while the window is focused
+and grabbed. The display demo can check this without booting a guest.
