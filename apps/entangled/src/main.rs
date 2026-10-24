@@ -30,6 +30,8 @@ mod install_fedora;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod install_macos;
 #[cfg(any(target_os = "linux", windows))]
+mod install_other;
+#[cfg(any(target_os = "linux", windows))]
 mod install_ubuntu;
 #[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
 mod paths;
@@ -322,8 +324,12 @@ enum DiskCommand {
 pub struct InstallArgs {
     /// Distribution to install: "debian" (d-i, direct kernel boot), "ubuntu"
     /// (the live-server or Desktop ISO through UEFI, unattended autoinstall)
-    /// or "fedora" (Everything netinst through UEFI, unattended kickstart).
+    /// "fedora" (Everything netinst through UEFI, unattended kickstart), or
+    /// "other" (manual installation from a local x86-64 UEFI ISO).
     pub distro: String,
+    /// Enable lifecycle and serial-console input for a manual `install other` VM.
+    #[arg(long)]
+    pub control_stdin: bool,
     /// Target RAW disk image; created if missing. Defaults to
     /// <vm dir>/<name>.raw, where the VM directory is the manager's
     /// (~/entangled-vms, %USERPROFILE%\entangled-vms on Windows, or whatever
@@ -355,7 +361,8 @@ pub struct InstallArgs {
     /// (assets/kickstart/fedora-workstation.ks).
     #[arg(long, conflicts_with_all = ["preseed", "autoinstall"])]
     pub kickstart: Option<PathBuf>,
-    /// Installer ISO (Ubuntu and Fedora). Defaults to the newest release
+    /// Installer ISO (Ubuntu, Fedora, or other Linux). Required for other Linux;
+    /// for Ubuntu and Fedora defaults to the newest release
     /// verified into the cache by scripts/fetch-ubuntu-iso.sh or
     /// scripts/fetch-fedora-iso.sh.
     #[arg(long)]

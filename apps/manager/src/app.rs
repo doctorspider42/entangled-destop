@@ -408,6 +408,7 @@ pub enum Action {
     ToggleAutostart(String),
     /// Type a line on a running machine's serial console.
     TypeOnSerial(TaskId, String),
+    SerialKey(TaskId, &'static str),
     /// Files dropped on the window: an ISO opens the new-machine wizard, a
     /// profile is imported.
     FilesDropped(Vec<PathBuf>),
@@ -724,6 +725,26 @@ impl ManagerApp {
 
         match startup.screenshot_view {
             ScreenshotView::Wizard => app.open_wizard(),
+            ScreenshotView::WizardFedora
+            | ScreenshotView::WizardIso
+            | ScreenshotView::WizardIsoReview => {
+                app.open_wizard();
+                if let Modal::Wizard(state) = &mut app.modal {
+                    state.machine.family =
+                        if startup.screenshot_view == ScreenshotView::WizardFedora {
+                            launcher::GuestFamily::Fedora
+                        } else {
+                            launcher::GuestFamily::OtherLinux
+                        };
+                    state.machine.name = state.machine.family.cli_name().to_string();
+                    if startup.screenshot_view != ScreenshotView::WizardFedora {
+                        state.machine.iso_path = "C:\\Images\\linux-installer.iso".into();
+                    }
+                    if startup.screenshot_view == ScreenshotView::WizardIsoReview {
+                        state.step = 2;
+                    }
+                }
+            }
             ScreenshotView::WizardMore => {
                 app.open_wizard();
                 if let Modal::Wizard(state) = &mut app.modal {
@@ -2024,7 +2045,7 @@ impl ManagerApp {
             }
             _ => {}
         }
-        if machine.family == launcher::GuestFamily::Ubuntu
+        if machine.family != launcher::GuestFamily::Debian
             && !machine.iso_path.trim().is_empty()
             && !Path::new(machine.iso_path.trim()).is_file()
         {
@@ -2105,14 +2126,17 @@ impl ManagerApp {
             }
         };
         let chosen_backend = machine.backend;
+        let manual = machine.family == launcher::GuestFamily::OtherLinux;
         match self.supervisor.spawn(spec) {
             Ok(id) => {
-                self.pending.push(PendingInstall {
-                    name: trimmed.clone(),
-                    machine,
-                    profile_path,
-                    applied: false,
-                });
+                if !manual {
+                    self.pending.push(PendingInstall {
+                        name: trimmed.clone(),
+                        machine,
+                        profile_path,
+                        applied: false,
+                    });
+                }
                 self.log_selected = Some(id);
                 self.log_open = true;
                 self.modal = Modal::None;
@@ -2123,7 +2147,8 @@ impl ManagerApp {
                 self.persist_settings_quietly();
                 self.toast(
                     ToastLevel::Success,
-                    format!("installing '{trimmed}' — watch the log below"),
+                    if manual { format!("'{trimmed}' is starting — install in its window; boot messages appear in the console") }
+                    else { format!("installing '{trimmed}' — watch the log below") },
                 );
             }
             Err(e) => {
@@ -2692,6 +2717,13 @@ impl ManagerApp {
             );
             return;
         };
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            self.toast(
+                ToastLevel::Warn,
+                "This Mac currently installs Ubuntu ARM64; ISO installation is not supported yet.",
+            );
+            return;
+        }
         if !matches!(self.modal, Modal::Wizard(_)) {
             if self.modal.is_open() {
                 return;
@@ -2699,7 +2731,7 @@ impl ManagerApp {
             self.open_wizard();
         }
         if let Modal::Wizard(state) = &mut self.modal {
-            state.machine.family = launcher::GuestFamily::Ubuntu;
+            state.machine.family = launcher::GuestFamily::OtherLinux;
             state.machine.iso_path = iso.display().to_string();
         }
         self.toast(
@@ -3795,6 +3827,15 @@ impl ManagerApp {
                 }
             }
             Action::FilesDropped(paths) => self.files_dropped(paths),
+            Action::SerialKey(id, key) => {
+                let sent = self
+                    .supervisor
+                    .task(id)
+                    .is_some_and(|task| task.serial_key(key));
+                if !sent {
+                    self.toast(ToastLevel::Warn, "that machine has no console to type on");
+                }
+            }
             Action::SubmitEditVm => self.submit_edit_vm(),
             Action::AskMoveDisk(path) => self.ask_move_disk(&path),
             Action::SubmitMoveDisk => self.submit_move_disk(),

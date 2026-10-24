@@ -39,6 +39,21 @@ pub const CMD_SAVE: &str = "save";
 pub const CMD_STATUS: &str = "status";
 /// Type text and Enter on the guest's serial console.
 pub const CMD_TYPE: &str = "type";
+/// A named serial-console key, without an appended Enter.
+pub const CMD_SERIAL_KEY: &str = "serial-key";
+
+pub fn serial_key_bytes(key: &str) -> Option<&'static [u8]> {
+    Some(match key {
+        "up" => b"\x1b[A",
+        "down" => b"\x1b[B",
+        "left" => b"\x1b[D",
+        "right" => b"\x1b[C",
+        "escape" => b"\x1b",
+        "tab" => b"\t",
+        "enter" => b"\r",
+        _ => return None,
+    })
+}
 /// Press the guest's ACPI power button: ask it to shut down cleanly. The VM
 /// ends when the guest powers off — or not, if its policy says otherwise; a
 /// caller that must have it stopped follows up with its own deadline.
@@ -134,6 +149,15 @@ pub fn save_outcome(reply: &Reply) -> Option<Result<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_menu_keys_do_not_append_enter_or_accept_commands() {
+        assert_eq!(serial_key_bytes("up"), Some(&b"\x1b[A"[..]));
+        assert_eq!(serial_key_bytes("escape"), Some(&b"\x1b"[..]));
+        assert_eq!(serial_key_bytes("enter"), Some(&b"\r"[..]));
+        assert_eq!(serial_key_bytes("up\nreset"), None);
+        assert_eq!(serial_key_bytes("unknown"), None);
+    }
 
     #[test]
     fn a_line_without_the_prefix_is_not_a_reply() {

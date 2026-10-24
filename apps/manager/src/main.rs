@@ -76,6 +76,9 @@ enum ScreenshotView {
     /// One machine's own page (the running one, when there is one).
     Machine,
     Wizard,
+    WizardFedora,
+    WizardIso,
+    WizardIsoReview,
     /// The wizard's sizing step with "More options" open: taller than a laptop
     /// screen, so it is the surface that shows the step body scrolling.
     WizardMore,
