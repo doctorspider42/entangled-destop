@@ -15,12 +15,27 @@ pub use disk_image::format_bytes;
 
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
+    #[error("cannot create the VM directory {path}: {source}")]
+    CreateDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("cannot read the VM directory {path}: {source}")]
     ReadDir {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Prepare per-user storage without changing any existing machines. Used by
+/// both setup (as the original user) and the manager's background scanner.
+pub fn prepare_vm_directory(path: &Path) -> Result<(), DiscoveryError> {
+    std::fs::create_dir_all(path).map_err(|source| DiscoveryError::CreateDir {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[derive(Debug, Error)]

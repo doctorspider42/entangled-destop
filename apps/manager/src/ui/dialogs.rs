@@ -515,6 +515,7 @@ fn settings_body(
             .id_salt("settings-advanced")
             .default_open(form.advanced_open);
     advanced.show(ui, |ui| {
+        ui::form_scope(ui);
         ui.label(ui::faint(
             "Entangled works all of these out for itself. Change them only for a build of \
              your own.",
@@ -720,6 +721,8 @@ fn wsl_rows(ui: &mut egui::Ui, form: &mut crate::app::SettingsForm) {
             ui.add(
                 egui::TextEdit::singleline(&mut form.wsl_distro)
                     .desired_width(field_w)
+                    .min_size(egui::vec2(0.0, ui::BUTTON_H))
+                    .vertical_align(Align::Center)
                     .hint_text(crate::backend::DEFAULT_WSL_DISTRO),
             );
         },
@@ -734,6 +737,8 @@ fn wsl_rows(ui: &mut egui::Ui, form: &mut crate::app::SettingsForm) {
             ui.add(
                 egui::TextEdit::singleline(&mut form.wsl_entangled)
                     .desired_width(field_w)
+                    .min_size(egui::vec2(0.0, ui::BUTTON_H))
+                    .vertical_align(Align::Center)
                     .hint_text("set up automatically"),
             );
         },

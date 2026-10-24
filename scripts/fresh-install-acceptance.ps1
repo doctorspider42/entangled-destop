@@ -431,8 +431,7 @@ $StrangerProfile = @{
 }
 
 $Entangled = Join-Path $AppDir 'entangled.exe'
-# The manager is only ever checked for existence: it is an eframe GUI, and
-# starting it to ask its version would put a window on somebody's desktop.
+$Manager = Join-Path $AppDir 'entangled-manager.exe'
 $Firmware  = Join-Path $AppDir 'artifacts\firmware\CLOUDHV.fd'
 
 $order = @('download', 'install', 'tree', 'doctor', 'fetch', 'engine', 'guest')
@@ -617,6 +616,15 @@ if ($run['install']) {
 
 if ($run['tree']) {
     Write-Stage 'tree - what the installer actually shipped'
+
+    # Run the same windowless initialization setup runs as the original user,
+    # but with a scratch profile so acceptance never changes the user's VMs.
+    $userVmDir = Join-Path $ProfileDir 'entangled-vms'
+    $initialize = Invoke-Stranger -Exe $Manager -Arguments @('--initialize-user-data') `
+        -ProfileVars $StrangerProfile -WorkDir $CwdDir -TimeoutSec 30
+    Assert-Check -Name 'setup prepares the user VM directory without opening the manager' `
+        -Condition ($initialize.ExitCode -eq 0 -and (Test-Path -LiteralPath $userVmDir -PathType Container)) `
+        -Detail $initialize.Output | Out-Null
 
     foreach ($rel in @('entangled.exe', 'entangled-manager.exe', 'entangled.ico',
             'LICENSE', 'THIRD-PARTY-NOTICES.txt', 'README.md')) {

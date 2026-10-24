@@ -51,6 +51,9 @@ pub const VERSION: &str = env!("ENTANGLED_VERSION");
     about = "Entangled Desktop — native VM manager"
 )]
 struct Cli {
+    /// Prepare this user's VM directory without opening a window (used by setup).
+    #[arg(long, conflicts_with_all = ["mock", "screenshot", "entangled"])]
+    initialize_user_data: bool,
     /// Override the VM directory for this run (does not touch the saved
     /// settings).
     #[arg(long)]
@@ -87,6 +90,8 @@ enum ScreenshotView {
     /// Create button is unavailable.
     WizardWslReview,
     Settings,
+    /// Settings with the advanced path overrides expanded.
+    SettingsAdvanced,
     Disks,
     /// Saved sessions, and the two confirmations that throw one away — from
     /// the Snapshots list, and from a suspended machine's own card.
@@ -110,6 +115,24 @@ fn main() -> ExitCode {
     init_tracing(attach);
 
     let cli = Cli::parse();
+    if cli.initialize_user_data {
+        let result = (|| -> Result<(), String> {
+            let path = settings::config_path().map_err(|e| e.to_string())?;
+            let mut settings = settings::Settings::load_from(&path).map_err(|e| e.to_string())?;
+            if let Some(dir) = cli.vm_dir {
+                settings.vm_dir = dir;
+            }
+            discovery::prepare_vm_directory(&settings.vm_dir).map_err(|e| e.to_string())
+        })();
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot initialize user data");
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match app::launch(app::Startup {
         vm_dir: cli.vm_dir,
         entangled: cli.entangled,

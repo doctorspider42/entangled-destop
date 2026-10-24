@@ -149,6 +149,10 @@ Name: "{group}\Uninstall Entangled Desktop"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Entangled Desktop"; Filename: "{app}\entangled-manager.exe"; IconFilename: "{app}\entangled.ico"; Tasks: desktopicon
 
 [Run]
+; Per-user storage belongs to the person who launched setup, not the account
+; supplying UAC credentials. Do this even when "Launch" is unchecked or setup
+; is silent. Existing data is preserved and never owned by the uninstaller.
+Filename: "{app}\entangled-manager.exe"; Parameters: "--initialize-user-data"; Flags: runasoriginaluser waituntilterminated runhidden
 Filename: "{app}\entangled-manager.exe"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 ; ---------------------------------------------------------------------------
@@ -207,7 +211,16 @@ Filename: "{app}\entangled-manager.exe"; Description: "{cm:LaunchProgram,{#AppNa
 ; not in the mood, gets a complete, working Windows installation either way.
 
 [Code]
+{ Replacing an EXE/ICO at the same path does not invalidate Explorer's cached
+  taskbar image. Ask the Shell to rebuild its icon cache after installation;
+  no Explorer restart or deletion of the user's cache files is needed. }
+procedure SHChangeNotify(EventId: Integer; Flags: Cardinal; Item1, Item2: Integer);
+  external 'SHChangeNotify@shell32.dll stdcall';
+
 const
+  SHCNE_ASSOCCHANGED = $08000000;
+  SHCNF_IDLIST = $0000;
+  SHCNF_FLUSH = $1000;
   { The exit codes of `entangled wsl install-engine`
     (apps/entangled/src/wsl_engine.rs). This script cannot be compiled against
     the Rust enum, so the Rust side has a test that pins every one of these
@@ -320,8 +333,12 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if (CurStep = ssPostInstall) and WizardIsTaskSelected('wslengine') then
-    SetupWslEngine();
+  if CurStep = ssPostInstall then
+  begin
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST or SHCNF_FLUSH, 0, 0);
+    if WizardIsTaskSelected('wslengine') then
+      SetupWslEngine();
+  end;
 end;
 
 procedure CurPageChanged(CurPageID: Integer);

@@ -539,7 +539,7 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
   `main`, `machine` (the running machine's page), `wizard`, `wizard-wsl`
   (the system step with WSL chosen and no
   Linux engine), `wizard-wsl-review` (the same machine on the review step,
-  where Create is unavailable), `settings`, `disks`, `snapshots`,
+  where Create is unavailable), `settings`, `settings-advanced`, `disks`, `snapshots`,
   `snapshot-delete`, `snapshot-discard`, `diagnostics`, and one per editor
   section: `editor` (Hardware), `editor-boot`, `editor-display` (Display &
   GPU), `editor-network` (Network & devices), `editor-storage`. **Every new
@@ -547,7 +547,7 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
 - Alignment regressions do not survive a look at the pixels but do survive a
   glance at the window. When touching form layout, measure: crop the PNG and
   compare the right-hand edge of each field (PIL is available on this machine).
-- The UI itself has no automated tests. To exercise it end to end, drive the
+- The shared form help has an egui input regression test for immediate click-to-open and Escape-to-close. Other UI flows use visual QA. To exercise it end to end, drive the
   real window from the Windows side: `EnumWindows` for
   `"Entangled Desktop*"` (the title carries the injected version, e.g.
   "Entangled Desktop v0.2.17"), `SetCursorPos`+`mouse_event` for clicks at fractions
@@ -713,3 +713,21 @@ Declaring a line count per state was tried first and was wrong the day a state
 was added — silently, because only a screenshot shows it. When you add a button
 or a sentence to any fixed-size surface, take the screenshot and check the
 pixels.
+
+## First launch and form help (2026-10-24)
+
+The scanner prepares the VM directory with `discovery::prepare_vm_directory`
+on its worker before scanning, so a fresh profile opens on the welcome screen.
+The Windows installer calls `entangled-manager --initialize-user-data` without
+a window as the original user, even in silent setup or with Launch unchecked.
+Both paths preserve existing files and report real creation errors. Setup also
+sends `SHCNE_ASSOCCHANGED` to refresh Windows' cached taskbar icon after replacing
+the EXE/ICO at the same paths; do not delete icon caches or restart Explorer.
+
+`form_label` keeps the label and question mark as one painted interaction target.
+Hover shows a tooltip; clicking opens the same help immediately in a popup,
+closed by Escape or clicking away. Do not add a nested Label that steals input.
+Path fields and their Browse buttons share `BUTTON_H` (34 px). Allocate the
+button through the parent layout: a 22 px placeholder with a 34 px child painted
+outside it caused both vertical misalignment and drifting rows. Call
+`form_scope` again inside an indented/collapsing form such as Settings Advanced.

@@ -458,7 +458,8 @@ impl Scanner {
         let builder = std::thread::Builder::new().name("vm-scan".to_string());
         let spawned = builder.spawn(move || {
             while let Ok(req) = request_rx.recv() {
-                let result = discovery::scan(&req.vm_dir, req.work_dir.as_deref())
+                let result = discovery::prepare_vm_directory(&req.vm_dir)
+                    .and_then(|()| discovery::scan(&req.vm_dir, req.work_dir.as_deref()))
                     .map_err(|e| e.to_string());
                 if result_tx.send(result).is_err() {
                     return;
@@ -743,7 +744,13 @@ impl ManagerApp {
                     }
                 }
             }
-            ScreenshotView::Settings => app.open_settings(),
+            ScreenshotView::Settings | ScreenshotView::SettingsAdvanced => {
+                app.open_settings();
+                if let Modal::Settings(form) = &mut app.modal {
+                    form.advanced_open =
+                        startup.screenshot_view == ScreenshotView::SettingsAdvanced;
+                }
+            }
             ScreenshotView::Disks => app.view = View::Disks,
             ScreenshotView::Snapshots => app.view = View::Snapshots,
             ScreenshotView::Diagnostics => {
@@ -4083,6 +4090,56 @@ fn save_png(path: &std::path::Path, image: &egui::ColorImage) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanner_prepares_fresh_storage_preserves_data_and_reports_creation_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "entangled-manager-tests/first-launch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let vm_dir = root.join("fresh-profile/entangled-vms");
+        let scanner = Scanner::spawn(Arc::new(|| {}));
+        let scan = |path: &Path| {
+            scanner
+                .request
+                .send(ScanRequest {
+                    vm_dir: path.to_path_buf(),
+                    work_dir: None,
+                })
+                .expect("request");
+            scanner
+                .result
+                .recv_timeout(Duration::from_secs(10))
+                .expect("scanner answered")
+        };
+
+        let first = scan(&vm_dir).expect("fresh storage is prepared before scanning");
+        assert!(vm_dir.is_dir());
+        assert!(first.vms.is_empty());
+        assert!(first.problems.is_empty());
+        let disk = vm_dir.join("existing.raw");
+        std::fs::write(&disk, b"existing guest data").expect("disk");
+        scan(&vm_dir).expect("repeat scan");
+        assert_eq!(
+            std::fs::read(&disk).expect("disk kept"),
+            b"existing guest data"
+        );
+
+        let blocked = root.join("file-instead-of-directory");
+        std::fs::write(&blocked, b"keep this file").expect("obstruction");
+        let error = scan(&blocked).expect_err("creation failure stays visible");
+        assert!(error.contains("cannot create the VM directory"), "{error}");
+        assert_eq!(
+            std::fs::read(&blocked).expect("file kept"),
+            b"keep this file"
+        );
+        drop(scanner);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
 
     #[test]
     fn update_checks_report_completion_and_allow_retry_after_worker_failure() {

@@ -250,7 +250,7 @@ pub const FORM_LABEL_W: f32 = 112.0;
 /// even when a row has none — that is what keeps the field edges straight.
 pub const FORM_TRAIL_W: f32 = 84.0;
 /// Height of a row's label cell, so labels sit on the field's centre line.
-const FORM_ROW_H: f32 = 22.0;
+const FORM_ROW_H: f32 = BUTTON_H;
 /// The difference between the width a `ComboBox` is *given* and the width it
 /// then draws: it lays the arrow out inside that budget and comes back about
 /// eleven pixels narrower. Measured, not guessed — a combo and a text field in
@@ -318,14 +318,18 @@ pub fn form_row<R>(
 /// further right than the next. The label truncates instead.
 ///
 /// A tooltip nobody knows about is not documentation, so a row that has one
-/// shows a quiet `?` and the whole cell is the hover target.
+/// shows a quiet `?`. Hover explains it; clicking opens the same help at once.
 fn form_label(ui: &mut Ui, label: &str, tooltip: &str) {
     // Painted, not laid out as widgets: egui gives the hover to the top-most
     // widget under the pointer, so a `Label` inside the cell swallowed it and
     // the tooltip on the cell never appeared. With nothing interactive inside,
     // the whole cell — text and `?` alike — is the hover target.
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(FORM_LABEL_W, FORM_ROW_H), Sense::hover());
+    let sense = if tooltip.is_empty() {
+        Sense::hover()
+    } else {
+        Sense::click()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(FORM_LABEL_W, FORM_ROW_H), sense);
     let painter = ui.painter_at(rect);
     let mark_w = if tooltip.is_empty() { 0.0 } else { 18.0 };
     let galley = painter.layout_no_wrap(
@@ -373,7 +377,15 @@ fn form_label(ui: &mut Ui, label: &str, tooltip: &str) {
         if hovered {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Help);
         }
-        response.on_hover_text(tooltip);
+        let popup = egui::Popup::from_toggle_button_response(&response);
+        let open = popup.is_open();
+        popup.show(|ui| {
+            ui.set_max_width(320.0);
+            ui.label(RichText::new(tooltip).color(theme::TEXT).size(12.5));
+        });
+        if !open {
+            response.on_hover_text(tooltip);
+        }
     }
 }
 
@@ -395,17 +407,20 @@ pub fn path_row(
             enabled,
             egui::TextEdit::singleline(value)
                 .desired_width(field_w)
+                .min_size(Vec2::new(0.0, FORM_ROW_H))
+                .vertical_align(Align::Center)
                 .hint_text(RichText::new(hint).color(theme::TEXT_FAINT).italics()),
         );
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(FORM_TRAIL_W, FORM_ROW_H), Sense::hover());
-        let mut browse = ui.new_child(
-            UiBuilder::new()
-                .max_rect(rect)
-                .layout(Layout::left_to_right(Align::Center)),
-        );
-        ghost_button(&mut browse, "Browse…", enabled, theme::ACCENT)
-            .on_hover_text("Pick the file from your computer instead of typing its path")
-            .clicked()
+        ui.allocate_ui_with_layout(
+            Vec2::new(FORM_TRAIL_W, FORM_ROW_H),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ghost_button(ui, "Browse…", enabled, theme::ACCENT)
+                    .on_hover_text("Pick the file from your computer instead of typing its path")
+                    .clicked()
+            },
+        )
+        .inner
     })
 }
 
@@ -886,4 +901,65 @@ pub fn page_tab(ui: &mut Ui, label: &str, selected: bool) -> Response {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_opens_on_click_without_waiting_for_hover_and_closes_on_escape() {
+        let ctx = egui::Context::default();
+        let mut point = egui::Pos2::ZERO;
+        let mut frame = |time, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(500.0, 300.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        point = ui.cursor().min + Vec2::new(100.0, FORM_ROW_H * 0.5);
+                        form_label(ui, "CUSTOM BUILD", "Use your own build of Entangled.");
+                    });
+                },
+            );
+            point
+        };
+        let point = frame(0.0, vec![]);
+        for (time, pressed) in [(0.01, true), (0.02, false)] {
+            frame(
+                time,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(
+            egui::Popup::is_any_open(&ctx),
+            "click must show help immediately"
+        );
+        frame(
+            0.03,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!egui::Popup::is_any_open(&ctx));
+    }
 }
