@@ -1175,10 +1175,20 @@ mod tests {
                 &dir,
                 "stubborn",
                 "/bin/sh",
-                &["-c", "trap '' TERM; sleep 300"],
+                &["-c", "trap '' TERM; echo READY; exec sleep 300"],
             ))
             .expect("spawn");
-        wait_until(|| sup.is_busy("stubborn"), "running state");
+        // A spawned child is already "running" to the supervisor, but its
+        // shell may not have installed the trap yet. Signal only after that
+        // point is visible in its log. Exec also keeps the sleeping process
+        // as our direct child so a forced kill leaves no orphan behind.
+        wait_until(
+            || {
+                sup.task(id)
+                    .is_some_and(|task| task.log_tail(10).0.iter().any(|line| line == "READY"))
+            },
+            "the SIGTERM handler to be ready",
+        );
 
         let task = sup.task(id).expect("task");
         task.request_stop();

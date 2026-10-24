@@ -64,6 +64,10 @@ Two rules keep it honest:
   `Child::kill` on Windows, escalating to a kill after `STOP_GRACE` (20 s).
   Pressing Stop twice kills immediately.
 - Closing the manager leaves running VMs alone; `Child` is not reaped on drop.
+- Signal tests must wait for a child-emitted readiness marker after installing
+  its handler; the supervisor's Running state only means spawn succeeded.
+  A shell fixture should exec its sleeper so forcing the child down leaves no
+  orphan. The SIGTERM-ignore test raced on the macOS release runner otherwise.
   **Known gap:** a restarted manager does not adopt those orphans — the card
   shows Stopped while the VM runs, and Start then fails with the busy-TAP
   message. Adoption would need a pid file plus a portable liveness check.
