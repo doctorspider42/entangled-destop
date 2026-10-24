@@ -131,9 +131,9 @@ pub const IMAGE_ASPECT_MEMORY_PLANE_0: u32 = 0x80;
 pub const PITCH_ALIGNMENT: u64 = 256;
 
 /// The formats `DRM_FORMAT_MOD_LINEAR` is offered for, each with its
-/// sRGB/UNORM twin if it has one and its bytes per pixel: every single-plane
-/// colour format a Wayland client's swapchain can be made of
-/// (`wsi_wl_display_add_drm_format_modifier`, `wsi_common_wayland.c:406-619`).
+/// sRGB/UNORM twin if it has one and its bytes per pixel: single-plane colour
+/// formats used by Wayland swapchains and GBM pixmaps. A pixmap need not be a
+/// display scanout: Chromium also probes single- and dual-channel buffers.
 ///
 /// * `VK_FORMAT_R8G8B8A8_UNORM` / `_SRGB`, `VK_FORMAT_B8G8R8A8_UNORM` /
 ///   `_SRGB` (stage S1): `XRGB8888`/`ARGB8888` are `B8G8R8A8_UNORM` in
@@ -145,7 +145,10 @@ pub const PITCH_ALIGNMENT: u64 = 256;
 ///   `R16G16B16A16_SFLOAT` as its first surface format (measured), and
 ///   vkcube takes the first surface format it knows (`cube.c:4608-4625`);
 /// * (stage S5) the 16-bit packed formats `R5G6B5`, `B5G6R5`, `A1R5G5B5`,
-///   `R5G5B5A1`, `B5G5R5A1`, `R4G4B4A4`, `B4G4R4A4`.
+///   `R5G5B5A1`, `B5G5R5A1`, `R4G4B4A4`, `B4G4R4A4`;
+/// * `R8` and `R8G8`, UNORM/sRGB: Chromium's GBM probes (Steam CEF included).
+///   Without a modifier Zink can leave one optimal, then ask for its stride
+///   (`zink_resource_get_param`), an invalid layout query that ends the ring.
 ///
 /// A format a client can pick *without* LINEAR sends Mesa's WSI down its
 /// prime path (`wsi_drm_image_needs_buffer_blit`, `wsi_common_drm.c:893-904`),
@@ -157,6 +160,10 @@ pub const PITCH_ALIGNMENT: u64 = 256;
 /// `R16G16B16A16_SFLOAT`). So every format a swapchain can use is here, and
 /// the ones the host cannot make canonical are simply not offered.
 pub const SCANOUT_FORMATS: &[(i32, Option<i32>, u64)] = &[
+    (9, Some(15), 1),
+    (15, Some(9), 1),
+    (16, Some(22), 2),
+    (22, Some(16), 2),
     (37, Some(43), 4),
     (43, Some(37), 4),
     (44, Some(50), 4),
@@ -742,7 +749,7 @@ mod tests {
         assert_eq!(ModifierLayout::new(44, 500, 500).row_pitch, 2048);
         for (format, twin, bpp) in SCANOUT_FORMATS {
             assert!(policy::is_core_format(*format), "{format}");
-            assert!(matches!(bpp, 2 | 4 | 8), "{format}");
+            assert!(matches!(bpp, 1 | 2 | 4 | 8), "{format}");
             if let Some(twin) = twin {
                 assert_eq!(scanout_format(*twin), Some(Some(*format)));
             }

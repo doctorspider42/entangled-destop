@@ -588,6 +588,12 @@ pub struct ImageFacts {
     pub planes: u32,
     /// `extent.depth`: the layers a 2D view of a 3D image may address.
     pub depth: u32,
+    /// `extent.width`, for opaque GBM pixmap metadata.
+    pub width: u32,
+    /// `extent.height`.
+    pub height: u32,
+    /// `samples`.
+    pub samples: i32,
 }
 
 /// A `VkImage`.

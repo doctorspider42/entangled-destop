@@ -142,7 +142,7 @@ use super::context::{
     ImageRules, VulkanContext,
 };
 use super::host::{Dedicated, HostVulkan, ImageBind, MemoryRequest, ResourceMemory};
-use super::modifier::{self, IMAGE_ASPECT_MEMORY_PLANE_0};
+use super::modifier::{self, ModifierLayout, IMAGE_ASPECT_MEMORY_PLANE_0};
 use super::objects::{
     Binding, BufferObject, DedicatedTo, DeviceObject, ImageFacts, ImageObject, ImageScanout, Kind,
     MemoryHandle, MemoryObject, ViewObject,
@@ -2165,8 +2165,8 @@ impl<H: HostVulkan> VulkanContext<H> {
         Ok(())
     }
 
-    /// `vkGetImageSubresourceLayout`: a linear image, one aspect, a mip level
-    /// and a layer it has.
+    /// `vkGetImageSubresourceLayout`: a linear/modifier image, or the opaque
+    /// GBM pixmap metadata described by [`opaque_pixmap_layout`].
     pub(super) fn image_subresource_layout(
         &mut self,
         args: &mut GetImageSubresourceLayoutArgs,
@@ -2199,12 +2199,26 @@ impl<H: HostVulkan> VulkanContext<H> {
             }
             return Ok(());
         }
+        if let Some(layout) = opaque_pixmap_layout(&image.facts, sub) {
+            // Never ask the host driver for the layout of an optimal image.
+            if args.p_layout.is_some() {
+                args.p_layout = Some(layout.plane());
+            }
+            return Ok(());
+        }
         if image.facts.tiling != policy::IMAGE_TILING_LINEAR
             || !sub.aspect_mask.is_power_of_two()
             || sub.aspect_mask & !policy::IMAGE_ASPECT_VIEW != 0
             || sub.mip_level >= image.facts.mip_levels
             || sub.array_layer >= image.facts.array_layers
         {
+            tracing::warn!(
+                image = args.image.0,
+                facts = ?image.facts,
+                host_memory = image.host_memory,
+                subresource = ?sub,
+                "refusing an image subresource layout query"
+            );
             return Err(invalid(
                 NAME,
                 "a subresource of an optimal image, of several aspects, or past the image",
@@ -2339,6 +2353,39 @@ impl<H: HostVulkan> VulkanContext<H> {
     }
 }
 
+/// Zink's GBM `resource_get_param(STRIDE/OFFSET/LAYER_STRIDE)` can ask about
+/// a mutable optimal pixmap *before* it is rebuilt as a DRM-modifier image
+/// for export. Vulkan does not define a linear layout for that image. Give
+/// GBM the virtual plane metadata of the eventual LINEAR modifier instead,
+/// without forwarding invalid usage to the host or exposing its opaque layout.
+///
+/// Only the colour plane of a single-sample, single-level, single-layer 2D
+/// renderable pixmap of a known byte size qualifies. These are metadata,
+/// never a description of the host image's opaque pixel storage. Importing
+/// host-visible pages (possible for small optimal images) does not make its
+/// tiling linear, and is not a reason to forward this query to the driver.
+fn opaque_pixmap_layout(
+    facts: &ImageFacts,
+    sub: &crate::venus::protocol::VkImageSubresource,
+) -> Option<ModifierLayout> {
+    const SAMPLED_COLOR_ATTACHMENT: u32 = 0x4 | 0x10;
+    (facts.tiling == 0
+        && facts.flags == policy::IMAGE_CREATE_MUTABLE_FORMAT
+        && facts.image_type == 1
+        && facts.depth == 1
+        && facts.width != 0
+        && facts.height != 0
+        && facts.mip_levels == 1
+        && facts.array_layers == 1
+        && facts.samples == 1
+        && facts.usage & SAMPLED_COLOR_ATTACHMENT == SAMPLED_COLOR_ATTACHMENT
+        && super::modifier::scanout_format(facts.format).is_some()
+        && sub.aspect_mask == 1
+        && sub.mip_level == 0
+        && sub.array_layer == 0)
+        .then(|| ModifierLayout::new(facts.format, facts.width, facts.height))
+}
+
 /// A command Vulkan 1.3 made core (`vkGetDevice*MemoryRequirements`) is
 /// refused on a device that reports less: its host entry point may not
 /// exist, and `ash` answers a missing one with a panic.
@@ -2382,6 +2429,9 @@ pub(super) fn image_facts(info: &VkImageCreateInfo, planes: u32) -> ImageFacts {
         usage: info.usage,
         planes,
         depth: info.extent.depth,
+        width: info.extent.width,
+        height: info.extent.height,
+        samples: info.samples,
     }
 }
 

@@ -363,6 +363,7 @@ struct Live {
     by_kind: HashMap<&'static str, usize>,
     devices: Vec<(u64, DeviceRequest<usize>)>,
     images: usize,
+    image_layouts: usize,
     imports: Vec<Import>,
     allocations: Vec<(u32, u64, bool)>,
     buffer_binds: Vec<(u64, u64, u64)>,
@@ -500,6 +501,8 @@ pub struct FakeVulkan {
     /// default `true`). An sRGB format never may with storage usage, as on
     /// the RTX 2070.
     pub image_exports: AtomicBool,
+    /// Whether optimal images can import host-visible pages (default false).
+    pub optimal_image_imports: AtomicBool,
     /// Whether an image needs dedicated memory (stage S1, default `false`):
     /// what `requiresDedicatedAllocation` answers for images.
     pub image_requires_dedicated: AtomicBool,
@@ -571,6 +574,7 @@ impl FakeVulkan {
             queries_not_ready: AtomicBool::new(false),
             buffer_exports: AtomicBool::new(true),
             image_exports: AtomicBool::new(true),
+            optimal_image_imports: AtomicBool::new(false),
             image_requires_dedicated: AtomicBool::new(false),
             format_features: AtomicU32::new(0x1_d401),
             shared_live: Arc::new(AtomicUsize::new(0)),
@@ -859,6 +863,12 @@ impl FakeVulkan {
     #[must_use]
     pub fn image_requests(&self) -> usize {
         self.with(|live| live.images)
+    }
+
+    /// How many image-layout queries reached the host driver.
+    #[must_use]
+    pub fn image_layout_requests(&self) -> usize {
+        self.with(|live| live.image_layouts)
     }
 
     /// Every import of our pages the fake driver saw, oldest first.
@@ -1533,7 +1543,8 @@ impl HostVulkan for FakeVulkan {
         }
         for link in &mut out.p_next {
             if let VkImageFormatProperties2Next::VkExternalImageFormatProperties(p) = link {
-                let importable = external == Some(0x80) && info.tiling == 1;
+                let importable = external == Some(0x80)
+                    && (info.tiling == 1 || self.optimal_image_imports.load(Ordering::SeqCst));
                 let exportable = external == Some(0x2)
                     && info.tiling == 0
                     && self.image_exports.load(Ordering::SeqCst);
@@ -1615,8 +1626,7 @@ impl HostVulkan for FakeVulkan {
     }
 
     fn image_accepts_host_memory(&self, _device: &u64, info: &VkImageCreateInfo) -> bool {
-        // As a driver that imports host memory for linear images only.
-        info.tiling == 1
+        info.tiling == 1 || self.optimal_image_imports.load(Ordering::SeqCst)
     }
 
     fn create_image(
@@ -1685,6 +1695,7 @@ impl HostVulkan for FakeVulkan {
         _image: u64,
         subresource: &VkImageSubresource,
     ) -> VkSubresourceLayout {
+        self.with(|live| live.image_layouts += 1);
         VkSubresourceLayout {
             offset: u64::from(subresource.mip_level) * 0x1000,
             size: 0x1000,

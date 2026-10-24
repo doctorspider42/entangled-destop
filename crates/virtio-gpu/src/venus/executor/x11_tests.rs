@@ -193,6 +193,186 @@ fn xwaylands_glamor_probe_is_answered_linear_from_mutters_list() {
 }
 
 #[test]
+fn steams_r8_and_rg8_pixmaps_have_a_shareable_modifier_and_matching_plane_layouts() {
+    // Steam's Chromium/Zink startup queried the stride of an optimal R8_UNORM
+    // image (MUTABLE_FORMAT, usage 0x97) after finding no DRM modifier for it.
+    // Offer the modifier so GBM takes the canonical export/import path instead.
+    for (format, srgb, bytes_per_pixel) in [(9, 15, 1), (16, 22, 2)] {
+        let (mut h, host) = s1();
+        let (count, entries) = modifiers_of(&mut h, format, Some(128));
+        assert_eq!(count, 1, "format {format}: GBM must find LINEAR");
+        assert_eq!(entries[0].0, DRM_FORMAT_MOD_LINEAR);
+
+        let views = vec![format, srgb];
+        let query = image_query(
+            format,
+            GLAMOR_USAGE,
+            MUTABLE,
+            DRM_FORMAT_MOD_LINEAR,
+            vec![
+                VkPhysicalDeviceImageFormatInfo2Next::VkImageFormatListCreateInfo(
+                    VkImageFormatListCreateInfo {
+                        view_format_count: 2,
+                        p_view_formats: Some(views.clone()),
+                    },
+                ),
+            ],
+        );
+        assert_eq!(image_answer(&mut h, &query).0, VK_SUCCESS);
+        let export = glamor_image(
+            format,
+            Some(views.clone()),
+            MUTABLE,
+            GLAMOR_USAGE,
+            (257, 3),
+            vec![DRM_FORMAT_MOD_LINEAR, MOD_INVALID],
+        );
+        assert_eq!(create(&mut h, EXPORTER, export), VK_SUCCESS);
+        let plane = plane_of(&mut h, EXPORTER);
+        let pitch = (257u64 * bytes_per_pixel).next_multiple_of(modifier::PITCH_ALIGNMENT);
+        assert_eq!(
+            (plane.offset, plane.row_pitch, plane.size),
+            (0, pitch, pitch * 3)
+        );
+        let export_requirements = requirements(&mut h, EXPORTER);
+        assert!(export_requirements.size >= plane.size);
+
+        let mut import = modifier_info(
+            format,
+            USAGE_SAMPLED,
+            MUTABLE,
+            Some(views),
+            Named::Explicit(
+                DRM_FORMAT_MOD_LINEAR,
+                VkSubresourceLayout {
+                    offset: plane.offset,
+                    row_pitch: plane.row_pitch,
+                    ..Default::default()
+                },
+            ),
+        );
+        import.extent.width = 257;
+        import.extent.height = 3;
+        assert_eq!(create(&mut h, IMPORTER, import), VK_SUCCESS);
+        assert_eq!(plane_of(&mut h, IMPORTER), plane);
+        assert_eq!(requirements(&mut h, IMPORTER), export_requirements);
+        let infos = host.image_infos();
+        assert_eq!(infos.len(), 2);
+        assert_eq!(
+            infos[0], infos[1],
+            "the exporter and importer must agree on host layout"
+        );
+        assert_eq!(infos[0].memory, ResourceMemory::Handle);
+        assert!(!h.fatal());
+    }
+}
+
+fn opaque_pixmap(format: i32) -> VkImageCreateInfo<'static> {
+    VkImageCreateInfo {
+        format,
+        flags: MUTABLE,
+        usage: GLAMOR_USAGE,
+        extent: VkExtent3D {
+            width: 257,
+            height: 3,
+            depth: 1,
+        },
+        ..image_info()
+    }
+}
+
+fn colour_layout(image: u64, aspect: u32, mip: u32, layer: u32) -> Command<'static> {
+    Command::GetImageSubresourceLayout(GetImageSubresourceLayoutArgs {
+        device: VkDevice(DEVICE),
+        image: VkImage(image),
+        p_subresource: Some(VkImageSubresource {
+            aspect_mask: aspect,
+            mip_level: mip,
+            array_layer: layer,
+        }),
+        p_layout: Some(Default::default()),
+    })
+}
+
+#[test]
+fn steams_opaque_gbm_pixmap_queries_are_metadata_and_never_reach_the_host() {
+    // GBM queries stride before export, including for RGBA8 even when its
+    // modifier is supported. The old executor killed Steam's CEF context here.
+    for (format, pitch, importable) in [
+        (9, 512, false),
+        (16, 768, false),
+        (37, 1280, false),
+        (44, 1280, false),
+        (9, 512, true),
+        (16, 768, true),
+        (37, 1280, true),
+        (44, 1280, true),
+    ] {
+        let (mut h, host) = s1();
+        host.optimal_image_imports
+            .store(importable, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(create(&mut h, EXPORTER, opaque_pixmap(format)), VK_SUCCESS);
+        let Command::GetImageSubresourceLayout(reply) = h
+            .call(&colour_layout(EXPORTER, 1, 0, 0))
+            .expect("opaque pixmap metadata")
+        else {
+            panic!()
+        };
+        let plane = reply.p_layout.unwrap();
+        assert_eq!(
+            (plane.offset, plane.row_pitch, plane.size),
+            (0, pitch, pitch * 3)
+        );
+        assert_eq!(
+            host.image_layout_requests(),
+            0,
+            "no invalid Vulkan call reaches the host"
+        );
+        assert!(!h.fatal());
+    }
+}
+
+#[test]
+fn opaque_pixmap_metadata_does_not_admit_other_optimal_layout_queries() {
+    for case in 0..14 {
+        let (mut h, host) = s1();
+        let mut info = opaque_pixmap(37);
+        let (mut aspect, mut mip, mut layer) = (1, 0, 0);
+        match case {
+            0 => info.flags |= ALIAS,
+            1 => info.flags = 0,
+            2 => info.mip_levels = 2,
+            3 => info.array_layers = 2,
+            4 => info.samples = 4,
+            5 => {
+                info.image_type = 2;
+                info.extent.depth = 2;
+            }
+            6 => info.format = 100, // R32_SFLOAT: no virtual GBM plane here.
+            7 => aspect = 3,
+            8 => mip = 1,
+            9 => layer = 1,
+            10 => info.usage = USAGE_SAMPLED | USAGE_TRANSFER,
+            11 => aspect = 2,
+            12 => aspect = IMAGE_ASPECT_MEMORY_PLANE_0,
+            13 => aspect = 0,
+            _ => unreachable!(),
+        }
+        assert_eq!(create(&mut h, EXPORTER, info), VK_SUCCESS, "case {case}");
+        fatal_on(
+            &mut h,
+            &colour_layout(EXPORTER, aspect, mip, layer),
+            "not opaque pixmap metadata",
+        );
+        assert_eq!(
+            host.image_layout_requests(),
+            0,
+            "case {case}: never forward optimal tiling"
+        );
+    }
+}
+
+#[test]
 fn a_list_naming_linear_among_others_is_the_same_image_as_linear_alone() {
     let reference = {
         let (mut h, host) = s1();

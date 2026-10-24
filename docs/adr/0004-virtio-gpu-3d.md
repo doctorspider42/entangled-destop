@@ -7830,3 +7830,79 @@ to the new preferred mode. Measured on WHP with the installed Ubuntu desktop
 over the control channel's new `display WxH`: `GET_EDID width=1600
 height=900`, `events cleared clear=0x1`, and the next scanout set at
 1600×900 in the same second. `[display] follow_window = false` opts out.
+
+## Amendment, 2026-10-25 — Steam's GBM pixmap metadata queries
+
+Ubuntu 26.04.1, Mesa 26.0.8, Steam client 1792618285, WHP and the RTX 2070:
+Steam's CEF GPU process repeatedly exited with status 134 before the login
+window appeared. The executor ended its context on
+`vkGetImageSubresourceLayout`; diagnostics identified format 9 (`R8_UNORM`),
+flags `MUTABLE_FORMAT`, usage `0x97`, optimal tiling, and the colour aspect
+of level 0, layer 0. Once R8 was supported, the same failure followed for
+format 37 (`R8G8B8A8_UNORM`), already in the modifier table. Vulkan does not
+define a linear layout for such an optimal image. These queries must never
+be forwarded to the host driver.
+
+There were two gaps. The emulated DRM-modifier format table omitted `R8`
+and `R8G8` GBM pixmaps. Additionally, Zink's `zink_resource_get_param` queries
+STRIDE, OFFSET and LAYER_STRIDE of an optimal GBM pixmap before export
+rebuilds it as a modifier image. CEF probes these buffers during startup.
+A working GNOME desktop or `glxinfo -B` therefore did not establish
+compatibility with Steam's startup, and extending the format table alone
+did not fix it.
+
+The existing canonical-image path now includes `R8_UNORM`/`R8_SRGB` and
+`R8G8_UNORM`/`R8G8_SRGB`, at 1 and 2 bytes per pixel. LINEAR is still offered
+only when the host accepts the canonical exportable image; the same host
+create info and synthesized layout serve the exporter and importer.
+
+For the earlier opaque-pixmap query, the executor supplies the same virtual
+plane metadata without asking the host for an optimal image's linear
+layout. This compatibility case is confined to mutable, sampled colour
+attachment images of known byte size: 2D, one level, one layer, one sample,
+and colour aspect, level 0, layer 0. These metadata do not describe the
+host's opaque pixel storage and authorize no CPU indexing of it. A 2x2
+optimal RGBA8 image on the RTX 2070 can accept host-visible pages: that
+capability does not make the layout linear, and restricting the compatibility
+case to images that cannot import pages left Steam broken. No host layout,
+memory read or mapping is performed by this reply. Pixel access remains
+through the existing Vulkan/image-transfer paths; sharing an image as LINEAR
+still uses the modifier path. Other optimal layout queries remain fatal. Refusals log the image
+facts, importability and subresource to distinguish their grouped reasons.
+
+`executor::x11_tests::steams_r8_and_rg8_pixmaps_have_a_shareable_modifier_and_matching_plane_layouts`
+failed before the change because format 9 listed no modifier. It checks
+modifier discovery, the image-format query, mutable UNORM/sRGB views,
+selection of LINEAR from `[LINEAR, INVALID]`, and matching exporter/importer
+host create infos, memory requirements and plane layouts. Width 257 checks
+the per-format pitch across the 256-byte alignment boundary.
+`steams_opaque_gbm_pixmap_queries_are_metadata_and_never_reach_the_host`
+replays the pre-export colour-plane query and asserts zero host layout
+calls, both with and without host-page import capability.
+`opaque_pixmap_metadata_does_not_admit_other_optimal_layout_queries`
+checks extra/unmarked flags, non-renderable images, levels, layers,
+samples, 3D, unserved formats and invalid aspects/indices. Existing tests
+still reject an ordinary optimal image outside this GBM compatibility case.
+
+### Acceptance on the Windows development machine
+
+The release engine was rebuilt from this change and booted the same Ubuntu
+guest. Both `/usr/bin/steam` and a subsequent `gtk-launch steam` reached the
+login window. The menu and desktop entries compare byte-for-byte with the
+packaged `/usr/share/applications/steam.desktop`; the private compatibility
+launcher/runtime and its backup were removed. Neither Steam nor its web
+helper had `-cef-disable-gpu`, `--disable-gpu`, software-rendering variables,
+or `STEAM_RUNTIME_STEAMRT` overrides. The normal installed GPU-desktop setting
+`MESA_LOADER_DRIVER_OVERRIDE=zink` remained.
+
+CEF's reports at 01:03 and 01:06 on 2026-10-25 name the active renderer as
+`ANGLE (Mesa, zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070) ...))`
+and report `gpu_compositing: enabled`. The new VM log contains zero fatal
+Venus commands or refused image-layout queries across both starts. This
+acceptance covers startup to login, not authenticated games or Proton.
+
+Full workspace tests passed on Windows (2392 passed, 18 ignored) and Linux
+(2409 passed, 26 ignored), plus Clippy with warnings denied on both hosts,
+format checking and `cargo deny check`. Tests needing unavailable Linux KVM
+or absent guest artifacts self-skip as usual; the desktop acceptance above
+ran on native WHP and the real RTX 2070.
