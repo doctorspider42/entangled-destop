@@ -750,9 +750,9 @@ successfully while receiving a false warning. Native host firmware checks are
 not applied to WSL launches. Missing-file notices are brief user-facing text;
 paths, download commands and digest details belong in diagnostic output.
 
-Display & GPU has **Optimise mouse for games** (`EditForm::gaming_mouse`). It
-loads from `[display] relative_mouse == Some(true)`. On writes Some(true);
-off writes None unless preserving an existing explicit Some(false). This avoids
+Display & GPU has **Mouse mode: Desktop / Games** (`EditForm::gaming_mouse`). It
+loads from `[display] relative_mouse == Some(true)`. Games writes Some(true);
+Desktop writes None unless preserving an existing explicit Some(false). This avoids
 removing the automatic 3D PCI mouse just by changing the capture preference.
 The choice applies at next start. Ctrl+Alt+M no longer changes it or reserves
 that chord from the guest. Keep both skill copies valid UTF-8 and equivalent.

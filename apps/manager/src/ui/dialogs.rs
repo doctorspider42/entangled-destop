@@ -1250,11 +1250,21 @@ fn edit_display_gpu(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
     });
     ui::form_row(
         ui,
-        "MOUSE",
-        "Choose how the mouse behaves in this machine.",
-        |ui, _| {
-            ui.checkbox(&mut form.gaming_mouse, "Optimise mouse for games")
-            .on_hover_text("Use relative movement for free camera rotation in games. Ctrl+Alt releases the mouse. Turn off for desktop pointer integration.");
+        "MOUSE MODE",
+        "Desktop keeps the guest pointer aligned with your mouse. Games uses relative \
+         movement for unlimited camera rotation. Ctrl+Alt releases the mouse.",
+        |ui, field_w| {
+            egui::ComboBox::from_id_salt("edit-mouse-mode")
+                .selected_text(if form.gaming_mouse {
+                    "Games"
+                } else {
+                    "Desktop"
+                })
+                .width(ui::combo_width(field_w))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut form.gaming_mouse, false, "Desktop");
+                    ui.selectable_value(&mut form.gaming_mouse, true, "Games");
+                });
         },
     );
     ui.add_space(6.0);

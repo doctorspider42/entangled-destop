@@ -256,7 +256,7 @@ fullscreen mode switch without checking in-game mouse alignment.
 The accelerated PCI desktop includes a separate `RelativePointer` device.
 `[display] relative_mouse = true` additionally selects gaming capture on startup;
 absent keeps desktop tablet integration initially. The VM editor exposes this
-under Display & GPU as **Optimise mouse for games**, applied on the next start.
+under Display & GPU as **Mouse mode: Desktop / Games**, applied on the next start.
 Ctrl+Alt+M is not reserved and the title has no toggle hint. `false` omits the
 relative device; the editor preserves an existing explicit false. Turning gaming
 mode off normally writes None, preserving the automatic 3D PCI device. Legacy MMIO guests

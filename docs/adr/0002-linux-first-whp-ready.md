@@ -1260,7 +1260,7 @@ input-after-alt-tab.txt and input-after-release-alt-tab.txt. This supersedes the
 previous amendment's unconfirmed native keyboard acceptance.
 
 Ctrl+Alt+M and its title hint are removed. The per-VM Display & GPU preference
-Optimise mouse for games saves the existing relative_mouse field, applied at
+Mouse mode: Desktop / Games saves the existing relative_mouse field, applied at
 next start. Turning it off preserves automatic PCI device attachment and an
 existing explicit device-disable setting, rather than changing device topology
 unnecessarily. Shortcut forwarding and editor persistence are regression-tested.
